@@ -76,6 +76,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/runtime.cu
         src/cuda/tensor.cu
         src/cuda/gemm.cu
+        src/cuda/fp16_matmul.cu
         src/cuda/elementwise.cu
         src/cuda/softmax.cu
         src/cuda/layernorm.cu
