@@ -30,6 +30,7 @@ brotensor_add_test(brotensor_test_flash_attention test_flash_attention.cpp)
 brotensor_add_test(brotensor_test_resblock test_resblock.cpp)
 brotensor_add_test(brotensor_test_diffusion_primitives test_diffusion_primitives.cpp)
 brotensor_add_test(brotensor_test_transpose test_transpose.cpp)
+brotensor_add_test(brotensor_test_large_elementwise test_large_elementwise.cpp)
 
 # Diffusion micro-benchmark. Built but not added to ctest — invoke
 # manually from the build dir (./tests/Release/brotensor_bench_diffusion).

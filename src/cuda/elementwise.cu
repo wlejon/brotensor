@@ -266,15 +266,16 @@ __global__ void mul_inplace_fp16_kernel(__half* __restrict__ y,
 __global__ void geglu_forward_fp16_kernel(const __half* __restrict__ X,
                                           __half* __restrict__ Y,
                                           int B, int D) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = B * D;
-    if (idx >= total) return;
-    const int b = idx / D;
-    const int d = idx % D;
-    const int two_d = 2 * D;
-    const float a = __half2float(X[b * two_d + d]);
-    const float gv_raw = __half2float(X[b * two_d + D + d]);
-    Y[idx] = __float2half(a * gelu_tanh_scalar(gv_raw));
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a = __half2float(X[b * two_d + d]);
+        const float gv_raw = __half2float(X[b * two_d + D + d]);
+        Y[idx] = __float2half(a * gelu_tanh_scalar(gv_raw));
+    }
 }
 
 __global__ void silu_backward_fp32_kernel(const float* __restrict__ x,
@@ -341,15 +342,16 @@ __global__ void quick_gelu_backward_fp16_kernel(const __half* __restrict__ x,
 __global__ void geglu_forward_fp32_kernel(const float* __restrict__ X,
                                           float* __restrict__ Y,
                                           int B, int D) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = B * D;
-    if (idx >= total) return;
-    const int b = idx / D;
-    const int d = idx % D;
-    const int two_d = 2 * D;
-    const float a = X[b * two_d + d];
-    const float gv_raw = X[b * two_d + D + d];
-    Y[idx] = a * gelu_tanh_scalar(gv_raw);
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a = X[b * two_d + d];
+        const float gv_raw = X[b * two_d + D + d];
+        Y[idx] = a * gelu_tanh_scalar(gv_raw);
+    }
 }
 
 // dX(B, 2D): dA = dY * g; dB_half = dY * A * gelu'(B_half).
@@ -357,38 +359,40 @@ __global__ void geglu_backward_fp32_kernel(const float* __restrict__ X,
                                            const float* __restrict__ dY,
                                            float* __restrict__ dX,
                                            int B, int D) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = B * D;
-    if (idx >= total) return;
-    const int b = idx / D;
-    const int d = idx % D;
-    const int two_d = 2 * D;
-    const float a       = X[b * two_d + d];
-    const float bh      = X[b * two_d + D + d];
-    const float dy      = dY[idx];
-    const float g       = gelu_tanh_scalar(bh);
-    const float gprime  = gelu_tanh_grad_scalar(bh);
-    dX[b * two_d + d]     = dy * g;
-    dX[b * two_d + D + d] = dy * a * gprime;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a       = X[b * two_d + d];
+        const float bh      = X[b * two_d + D + d];
+        const float dy      = dY[idx];
+        const float g       = gelu_tanh_scalar(bh);
+        const float gprime  = gelu_tanh_grad_scalar(bh);
+        dX[b * two_d + d]     = dy * g;
+        dX[b * two_d + D + d] = dy * a * gprime;
+    }
 }
 
 __global__ void geglu_backward_fp16_kernel(const __half* __restrict__ X,
                                            const __half* __restrict__ dY,
                                            __half* __restrict__ dX,
                                            int B, int D) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = B * D;
-    if (idx >= total) return;
-    const int b = idx / D;
-    const int d = idx % D;
-    const int two_d = 2 * D;
-    const float a       = __half2float(X[b * two_d + d]);
-    const float bh      = __half2float(X[b * two_d + D + d]);
-    const float dy      = __half2float(dY[idx]);
-    const float g       = gelu_tanh_scalar(bh);
-    const float gprime  = gelu_tanh_grad_scalar(bh);
-    dX[b * two_d + d]     = __float2half(dy * g);
-    dX[b * two_d + D + d] = __float2half(dy * a * gprime);
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a       = __half2float(X[b * two_d + d]);
+        const float bh      = __half2float(X[b * two_d + D + d]);
+        const float dy      = __half2float(dY[idx]);
+        const float g       = gelu_tanh_scalar(bh);
+        const float gprime  = gelu_tanh_grad_scalar(bh);
+        dX[b * two_d + d]     = __float2half(dy * g);
+        dX[b * two_d + D + d] = __float2half(dy * a * gprime);
+    }
 }
 
 __global__ void gelu_exact_forward_fp32_kernel(const float* __restrict__ x,
@@ -430,67 +434,71 @@ __global__ void gelu_exact_backward_fp16_kernel(const __half* __restrict__ x,
 __global__ void geglu_exact_forward_fp32_kernel(const float* __restrict__ X,
                                                 float* __restrict__ Y,
                                                 int B, int D) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = B * D;
-    if (idx >= total) return;
-    const int b = idx / D;
-    const int d = idx % D;
-    const int two_d = 2 * D;
-    const float a = X[b * two_d + d];
-    const float gv_raw = X[b * two_d + D + d];
-    Y[idx] = a * gelu_exact_scalar(gv_raw);
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a = X[b * two_d + d];
+        const float gv_raw = X[b * two_d + D + d];
+        Y[idx] = a * gelu_exact_scalar(gv_raw);
+    }
 }
 
 __global__ void geglu_exact_forward_fp16_kernel(const __half* __restrict__ X,
                                                 __half* __restrict__ Y,
                                                 int B, int D) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = B * D;
-    if (idx >= total) return;
-    const int b = idx / D;
-    const int d = idx % D;
-    const int two_d = 2 * D;
-    const float a = __half2float(X[b * two_d + d]);
-    const float gv_raw = __half2float(X[b * two_d + D + d]);
-    Y[idx] = __float2half(a * gelu_exact_scalar(gv_raw));
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a = __half2float(X[b * two_d + d]);
+        const float gv_raw = __half2float(X[b * two_d + D + d]);
+        Y[idx] = __float2half(a * gelu_exact_scalar(gv_raw));
+    }
 }
 
 __global__ void geglu_exact_backward_fp32_kernel(const float* __restrict__ X,
                                                  const float* __restrict__ dY,
                                                  float* __restrict__ dX,
                                                  int B, int D) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = B * D;
-    if (idx >= total) return;
-    const int b = idx / D;
-    const int d = idx % D;
-    const int two_d = 2 * D;
-    const float a       = X[b * two_d + d];
-    const float bh      = X[b * two_d + D + d];
-    const float dy      = dY[idx];
-    const float g       = gelu_exact_scalar(bh);
-    const float gprime  = gelu_exact_grad_scalar(bh);
-    dX[b * two_d + d]     = dy * g;
-    dX[b * two_d + D + d] = dy * a * gprime;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a       = X[b * two_d + d];
+        const float bh      = X[b * two_d + D + d];
+        const float dy      = dY[idx];
+        const float g       = gelu_exact_scalar(bh);
+        const float gprime  = gelu_exact_grad_scalar(bh);
+        dX[b * two_d + d]     = dy * g;
+        dX[b * two_d + D + d] = dy * a * gprime;
+    }
 }
 
 __global__ void geglu_exact_backward_fp16_kernel(const __half* __restrict__ X,
                                                  const __half* __restrict__ dY,
                                                  __half* __restrict__ dX,
                                                  int B, int D) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = B * D;
-    if (idx >= total) return;
-    const int b = idx / D;
-    const int d = idx % D;
-    const int two_d = 2 * D;
-    const float a       = __half2float(X[b * two_d + d]);
-    const float bh      = __half2float(X[b * two_d + D + d]);
-    const float dy      = __half2float(dY[idx]);
-    const float g       = gelu_exact_scalar(bh);
-    const float gprime  = gelu_exact_grad_scalar(bh);
-    dX[b * two_d + d]     = __float2half(dy * g);
-    dX[b * two_d + D + d] = __float2half(dy * a * gprime);
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a       = __half2float(X[b * two_d + d]);
+        const float bh      = __half2float(X[b * two_d + D + d]);
+        const float dy      = __half2float(dY[idx]);
+        const float g       = gelu_exact_scalar(bh);
+        const float gprime  = gelu_exact_grad_scalar(bh);
+        dX[b * two_d + d]     = __float2half(dy * g);
+        dX[b * two_d + D + d] = __float2half(dy * a * gprime);
+    }
 }
 
 __global__ void causal_mask_row_kernel(float* __restrict__ mask, int L, int q) {
