@@ -9,7 +9,9 @@ namespace brotensor {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
+using metal_impl::compile_pipeline;
 using metal_impl::dispatch1d_sync;
+using metal_impl::new_command_buffer;
 
 namespace {
 
@@ -128,12 +130,101 @@ void build_slot_mask_gpu(const GpuTensor& x, int offset, int K, int stride,
     });
 }
 
-// Metal: TODO — silu/gelu kernels not yet ported.
-void silu_forward_gpu(const GpuTensor& /*x*/, GpuTensor& /*y*/) {
-    throw std::runtime_error("brotensor::silu_forward_gpu: Metal backend not yet implemented");
+namespace {
+
+NSString* const kActivationSrc = @R"msl(
+#include <metal_stdlib>
+using namespace metal;
+
+inline float silu_scalar(float v) {
+    return v / (1.0f + exp(-v));
 }
-void gelu_forward_gpu(const GpuTensor& /*x*/, GpuTensor& /*y*/) {
-    throw std::runtime_error("brotensor::gelu_forward_gpu: Metal backend not yet implemented");
+inline float gelu_tanh_scalar(float v) {
+    constexpr float kSqrt2OverPi = 0.7978845608f;
+    float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
+    return 0.5f * v * (1.0f + tanh(u));
+}
+
+kernel void k_silu_forward_fp32(device const float* x [[buffer(0)]],
+                                device float*       y [[buffer(1)]],
+                                constant uint& n      [[buffer(2)]],
+                                uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = silu_scalar(x[i]);
+}
+kernel void k_silu_forward_fp16(device const half* x [[buffer(0)]],
+                                device half*       y [[buffer(1)]],
+                                constant uint& n     [[buffer(2)]],
+                                uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = half(silu_scalar(float(x[i])));
+}
+kernel void k_gelu_forward_fp32(device const float* x [[buffer(0)]],
+                                device float*       y [[buffer(1)]],
+                                constant uint& n      [[buffer(2)]],
+                                uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = gelu_tanh_scalar(x[i]);
+}
+kernel void k_gelu_forward_fp16(device const half* x [[buffer(0)]],
+                                device half*       y [[buffer(1)]],
+                                constant uint& n     [[buffer(2)]],
+                                uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = half(gelu_tanh_scalar(float(x[i])));
+}
+)msl";
+
+#define DEF_PSO(NAME, FN) \
+    id<MTLComputePipelineState> NAME() { \
+        static dispatch_once_t once; \
+        static id<MTLComputePipelineState> pso; \
+        dispatch_once(&once, ^{ pso = compile_pipeline(kActivationSrc, FN); }); \
+        return pso; \
+    }
+DEF_PSO(pso_silu_fp32, @"k_silu_forward_fp32")
+DEF_PSO(pso_silu_fp16, @"k_silu_forward_fp16")
+DEF_PSO(pso_gelu_fp32, @"k_gelu_forward_fp32")
+DEF_PSO(pso_gelu_fp16, @"k_gelu_forward_fp16")
+#undef DEF_PSO
+
+void launch_activation_unary(id<MTLComputePipelineState> pso,
+                             const GpuTensor& x, GpuTensor& y) {
+    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
+        y.resize(x.rows, x.cols, x.dtype);
+    }
+    const uint32_t n = static_cast<uint32_t>(x.size());
+    if (n == 0) return;
+    id<MTLBuffer> bx = buffer_for(x);
+    id<MTLBuffer> by = buffer_for(y);
+    const NSUInteger ox = buffer_offset_for(x);
+    const NSUInteger oy = buffer_offset_for(y);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bx offset:ox atIndex:0];
+        [enc setBuffer:by offset:oy atIndex:1];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
+        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
+        if (tg > 256) tg = 256;
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+}
+
+} // namespace
+
+void silu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+    launch_activation_unary(x.dtype == Dtype::FP16 ? pso_silu_fp16() : pso_silu_fp32(),
+                            x, y);
+}
+void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+    launch_activation_unary(x.dtype == Dtype::FP16 ? pso_gelu_fp16() : pso_gelu_fp32(),
+                            x, y);
 }
 
 } // namespace brotensor
