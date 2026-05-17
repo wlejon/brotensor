@@ -301,12 +301,115 @@ void layernorm_forward_inference_batched_gpu(const GpuTensor& X_RD,
     }
 }
 
-void layernorm_forward_inference_batched_fp16_gpu(const GpuTensor& /*X_RD*/,
-                                                  const GpuTensor& /*gamma*/,
-                                                  const GpuTensor& /*beta*/,
-                                                  GpuTensor& /*Y_RD*/,
-                                                  float /*eps*/) {
-    throw std::runtime_error("brotensor::layernorm_forward_inference_batched_fp16_gpu: Metal backend not yet implemented");
+namespace {
+
+NSString* const kFp16Src = @R"msl(
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint LN_BLOCK = 256;
+
+kernel void k_ln_forward_inference_batched_fp16(
+        device const half* x      [[buffer(0)]],
+        device const half* gamma  [[buffer(1)]],
+        device const half* beta   [[buffer(2)]],
+        device half*       y      [[buffer(3)]],
+        constant uint& R          [[buffer(4)]],
+        constant uint& D          [[buffer(5)]],
+        constant float& eps       [[buffer(6)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tg_size [[threads_per_threadgroup]]) {
+    threadgroup float sdata[LN_BLOCK];
+    if (row >= R) return;
+    device const half* xrow = x + (ulong)row * D;
+    device       half* yrow = y + (ulong)row * D;
+    float local = 0.0f;
+    for (uint i = tid; i < D; i += tg_size) local += float(xrow[i]);
+    sdata[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = sdata[0] / float(D);
+
+    float local_v = 0.0f;
+    for (uint i = tid; i < D; i += tg_size) {
+        float d = float(xrow[i]) - mean;
+        local_v += d * d;
+    }
+    sdata[tid] = local_v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float var = sdata[0] / float(D);
+    float rstd = rsqrt(var + eps);
+    for (uint i = tid; i < D; i += tg_size) {
+        float xh = (float(xrow[i]) - mean) * rstd;
+        float g  = float(gamma[i]);
+        float b  = float(beta[i]);
+        yrow[i] = half(xh * g + b);
+    }
+}
+)msl";
+
+id<MTLComputePipelineState> pso_fw_inf_fp16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{
+        pso = compile_pipeline(kFp16Src, @"k_ln_forward_inference_batched_fp16");
+    });
+    return pso;
+}
+
+} // namespace
+
+void layernorm_forward_inference_batched_fp16_gpu(const GpuTensor& X_RD,
+                                                  const GpuTensor& gamma,
+                                                  const GpuTensor& beta,
+                                                  GpuTensor& Y_RD,
+                                                  float eps) {
+    if (X_RD.dtype != Dtype::FP16 || gamma.dtype != Dtype::FP16 ||
+        beta.dtype != Dtype::FP16) {
+        throw std::runtime_error("layernorm_forward_inference_batched_fp16_gpu: all tensors must be FP16");
+    }
+    const int R = X_RD.rows;
+    const int D = X_RD.cols;
+    if (Y_RD.rows != R || Y_RD.cols != D || Y_RD.dtype != Dtype::FP16) {
+        Y_RD.resize(R, D, Dtype::FP16);
+    }
+    if (R == 0 || D == 0) return;
+    id<MTLComputePipelineState> pso = pso_fw_inf_fp16();
+    id<MTLBuffer> bx = buffer_for(X_RD);
+    id<MTLBuffer> bg = buffer_for(gamma);
+    id<MTLBuffer> bb = buffer_for(beta);
+    id<MTLBuffer> by = buffer_for(Y_RD);
+    const NSUInteger ox = buffer_offset_for(X_RD);
+    const NSUInteger og = buffer_offset_for(gamma);
+    const NSUInteger ob = buffer_offset_for(beta);
+    const NSUInteger oy = buffer_offset_for(Y_RD);
+    const uint32_t Ru = static_cast<uint32_t>(R);
+    const uint32_t Du = static_cast<uint32_t>(D);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bx offset:ox atIndex:0];
+        [enc setBuffer:bg offset:og atIndex:1];
+        [enc setBuffer:bb offset:ob atIndex:2];
+        [enc setBuffer:by offset:oy atIndex:3];
+        [enc setBytes:&Ru length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&Du length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&eps length:sizeof(float) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(R, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(LN_BLOCK, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
 }
 
 } // namespace brotensor

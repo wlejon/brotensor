@@ -179,11 +179,130 @@ void linear_backward_gpu(const GpuTensor& W, const GpuTensor& x,
     }
 }
 
-void linear_forward_batched_fp16_gpu(const GpuTensor& /*W*/,
-                                     const GpuTensor* /*bias*/,
-                                     const GpuTensor& /*X_BD*/,
-                                     GpuTensor& /*Y_BD*/) {
-    throw std::runtime_error("brotensor::linear_forward_batched_fp16_gpu: Metal backend not yet implemented");
+namespace {
+
+NSString* const kFp16LinearSrc = @R"msl(
+#include <metal_stdlib>
+using namespace metal;
+
+// Y(B, out) = X(B, in) @ W(out, in)^T  →  Y[m, n] = Σ_k X[m, k] * W[n, k].
+kernel void k_matmul_abt_fp16(device const half* A [[buffer(0)]],
+                              device const half* B [[buffer(1)]],
+                              device half*       C [[buffer(2)]],
+                              constant uint& M     [[buffer(3)]],
+                              constant uint& N     [[buffer(4)]],
+                              constant uint& K     [[buffer(5)]],
+                              uint idx [[thread_position_in_grid]]) {
+    uint total = M * N;
+    if (idx >= total) return;
+    uint m = idx / N;
+    uint n = idx % N;
+    float acc = 0.0f;
+    for (uint k = 0; k < K; ++k) {
+        acc += float(A[m * K + k]) * float(B[n * K + k]);
+    }
+    C[idx] = half(acc);
+}
+
+kernel void k_fp16_bias_add(device half*       Y    [[buffer(0)]],
+                            device const half* bias [[buffer(1)]],
+                            constant uint& B        [[buffer(2)]],
+                            constant uint& out_dim  [[buffer(3)]],
+                            uint idx [[thread_position_in_grid]]) {
+    uint total = B * out_dim;
+    if (idx >= total) return;
+    uint j = idx % out_dim;
+    Y[idx] = half(float(Y[idx]) + float(bias[j]));
+}
+)msl";
+
+id<MTLComputePipelineState> pso_matmul_abt_lin() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kFp16LinearSrc, @"k_matmul_abt_fp16"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_bias_add() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kFp16LinearSrc, @"k_fp16_bias_add"); });
+    return pso;
+}
+
+void launch_1d(id<MTLComputePipelineState> pso, NSUInteger n,
+               void (^bind)(id<MTLComputeCommandEncoder>)) {
+    if (n == 0) return;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        bind(enc);
+        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
+        if (tg > 256) tg = 256;
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+}
+
+} // namespace
+
+void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
+                                     const GpuTensor& X_BD, GpuTensor& Y_BD) {
+    if (W.dtype != Dtype::FP16 || X_BD.dtype != Dtype::FP16) {
+        throw std::runtime_error("linear_forward_batched_fp16_gpu: W and X must be FP16");
+    }
+    if (bias && bias->dtype != Dtype::FP16) {
+        throw std::runtime_error("linear_forward_batched_fp16_gpu: bias must be FP16");
+    }
+    const int B       = X_BD.rows;
+    const int in_dim  = X_BD.cols;
+    const int out_dim = W.rows;
+    if (W.cols != in_dim) {
+        throw std::runtime_error("linear_forward_batched_fp16_gpu: shape mismatch (W.cols != X.cols)");
+    }
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
+        Y_BD.resize(B, out_dim, Dtype::FP16);
+    }
+    if (B == 0 || out_dim == 0) return;
+
+    const uint32_t total = static_cast<uint32_t>(B) * static_cast<uint32_t>(out_dim);
+    {
+        id<MTLBuffer> bA = buffer_for(X_BD);
+        id<MTLBuffer> bB = buffer_for(W);
+        id<MTLBuffer> bC = buffer_for(Y_BD);
+        const NSUInteger oA = buffer_offset_for(X_BD);
+        const NSUInteger oB = buffer_offset_for(W);
+        const NSUInteger oC = buffer_offset_for(Y_BD);
+        const uint32_t Mu = static_cast<uint32_t>(B);
+        const uint32_t Nu = static_cast<uint32_t>(out_dim);
+        const uint32_t Ku = static_cast<uint32_t>(in_dim);
+        launch_1d(pso_matmul_abt_lin(), total, ^(id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:bA offset:oA atIndex:0];
+            [enc setBuffer:bB offset:oB atIndex:1];
+            [enc setBuffer:bC offset:oC atIndex:2];
+            [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
+            [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
+        });
+    }
+
+    if (bias && bias->size() > 0) {
+        id<MTLBuffer> bY = buffer_for(Y_BD);
+        id<MTLBuffer> bb = buffer_for(*bias);
+        const NSUInteger oY = buffer_offset_for(Y_BD);
+        const NSUInteger ob = buffer_offset_for(*bias);
+        const uint32_t Bu = static_cast<uint32_t>(B);
+        const uint32_t Ou = static_cast<uint32_t>(out_dim);
+        launch_1d(pso_bias_add(), total, ^(id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:bY offset:oY atIndex:0];
+            [enc setBuffer:bb offset:ob atIndex:1];
+            [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:2];
+            [enc setBytes:&Ou length:sizeof(uint32_t) atIndex:3];
+        });
+    }
 }
 
 } // namespace brotensor

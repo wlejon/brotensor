@@ -31,4 +31,7 @@ brotensor_add_test(brotensor_test_resblock test_resblock.cpp)
 
 # Diffusion micro-benchmark. Built but not added to ctest — invoke
 # manually from the build dir (./tests/Release/brotensor_bench_diffusion).
-brotensor_add_executable(brotensor_bench_diffusion bench_diffusion.cpp)
+# CUDA-only: it uses cudaEvent_t for timing.
+if(BROTENSOR_WITH_CUDA)
+    brotensor_add_executable(brotensor_bench_diffusion bench_diffusion.cpp)
+endif()
