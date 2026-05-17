@@ -204,6 +204,107 @@ static void test_flash_causal() {
     CHECK(bad == 0);
 }
 
+static float gelu_ref(float v) {
+    constexpr float kSqrt2OverPi = 0.7978845608f;
+    const float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
+    return 0.5f * v * (1.0f + std::tanh(u));
+}
+static float gelu_grad_ref(float v) {
+    constexpr float kSqrt2OverPi = 0.7978845608f;
+    const float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
+    const float t = std::tanh(u);
+    const float dudx = kSqrt2OverPi * (1.0f + 3.0f * 0.044715f * v * v);
+    return 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * dudx;
+}
+
+static void test_geglu_fp32() {
+    std::printf("  geglu fp32 fwd+bwd\n");
+    const int B = 3, D = 9;
+    const int two_d = 2 * D;
+    std::mt19937 rng(0xCEFA);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+    std::vector<float> hx(B * two_d), hdy(B * D);
+    for (auto& v : hx)  v = dist(rng);
+    for (auto& v : hdy) v = dist(rng);
+
+    GpuTensor X, dY;
+    brotensor::upload(hx.data(),  B, two_d, X);
+    brotensor::upload(hdy.data(), B, D,    dY);
+
+    GpuTensor Y;
+    brotensor::geglu_forward_gpu(X, Y);
+    CHECK(Y.rows == B && Y.cols == D && Y.dtype == Dtype::FP32);
+    std::vector<float> gotY(B * D);
+    brotensor::download(Y, gotY.data());
+    brotensor::cuda_sync();
+    for (int b = 0; b < B; ++b) {
+        for (int d = 0; d < D; ++d) {
+            const float a  = hx[b * two_d + d];
+            const float bh = hx[b * two_d + D + d];
+            const float r  = a * gelu_ref(bh);
+            CHECK(std::fabs(gotY[b * D + d] - r) < 1e-5f + 1e-5f * std::fabs(r));
+        }
+    }
+
+    GpuTensor dX;
+    brotensor::geglu_backward_gpu(X, dY, dX);
+    CHECK(dX.rows == B && dX.cols == two_d && dX.dtype == Dtype::FP32);
+    std::vector<float> gotdX(B * two_d);
+    brotensor::download(dX, gotdX.data());
+    brotensor::cuda_sync();
+    for (int b = 0; b < B; ++b) {
+        for (int d = 0; d < D; ++d) {
+            const float a   = hx[b * two_d + d];
+            const float bh  = hx[b * two_d + D + d];
+            const float dy  = hdy[b * D + d];
+            const float dA  = dy * gelu_ref(bh);
+            const float dBh = dy * a * gelu_grad_ref(bh);
+            const float ga  = gotdX[b * two_d + d];
+            const float gb  = gotdX[b * two_d + D + d];
+            CHECK(std::fabs(ga - dA)  < 1e-5f + 1e-5f * std::fabs(dA));
+            CHECK(std::fabs(gb - dBh) < 1e-5f + 1e-5f * std::fabs(dBh));
+        }
+    }
+}
+
+static void test_geglu_fp16_bwd() {
+    std::printf("  geglu fp16 bwd\n");
+    const int B = 3, D = 9;
+    const int two_d = 2 * D;
+    std::mt19937 rng(0xCEFB);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+    std::vector<float> hx_f(B * two_d), hdy_f(B * D);
+    for (auto& v : hx_f)  v = dist(rng);
+    for (auto& v : hdy_f) v = dist(rng);
+    auto hx_h  = to_fp16(hx_f);
+    auto hdy_h = to_fp16(hdy_f);
+
+    GpuTensor X, dY;
+    brotensor::upload_fp16(hx_h.data(),  B, two_d, X);
+    brotensor::upload_fp16(hdy_h.data(), B, D,    dY);
+
+    GpuTensor dX;
+    brotensor::geglu_backward_gpu(X, dY, dX);
+    CHECK(dX.rows == B && dX.cols == two_d && dX.dtype == Dtype::FP16);
+    std::vector<uint16_t> got_h(B * two_d);
+    brotensor::download_fp16(dX, got_h.data());
+    brotensor::cuda_sync();
+
+    for (int b = 0; b < B; ++b) {
+        for (int d = 0; d < D; ++d) {
+            const float a   = brotensor::fp16_bits_to_fp32(hx_h[b * two_d + d]);
+            const float bh  = brotensor::fp16_bits_to_fp32(hx_h[b * two_d + D + d]);
+            const float dy  = brotensor::fp16_bits_to_fp32(hdy_h[b * D + d]);
+            const float dA  = dy * gelu_ref(bh);
+            const float dBh = dy * a * gelu_grad_ref(bh);
+            const float ga  = brotensor::fp16_bits_to_fp32(got_h[b * two_d + d]);
+            const float gb  = brotensor::fp16_bits_to_fp32(got_h[b * two_d + D + d]);
+            CHECK(std::fabs(ga - dA)  < 1e-2f + 1e-2f * std::fabs(dA));
+            CHECK(std::fabs(gb - dBh) < 1e-2f + 1e-2f * std::fabs(dBh));
+        }
+    }
+}
+
 int main() {
     try {
         brotensor::cuda_init();
@@ -218,6 +319,8 @@ int main() {
     test_add_scalar_fp16();
     test_embedding_fp16();
     test_flash_causal();
+    test_geglu_fp32();
+    test_geglu_fp16_bwd();
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);

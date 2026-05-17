@@ -491,11 +491,14 @@ void softmax_xent_fused_batched_gpu(const GpuTensor& logits_BL,
 // integer arguments. Output tensors are resized (and dtype-set) by the op.
 // No backward; downstream brodiff drives these for inference only.
 
-// 2D convolution, FP16 NCHW, groups = 1.
-//   X:      (N, C_in * H * W)        input,   FP16
-//   Wt:     (C_out, C_in * kH * kW)  weights, FP16, OIHW filter layout
-//   bias:   (C_out, 1)               optional FP16 bias, may be null
-//   Y:      (N, C_out * H_out * W_out)  output, FP16; resized as needed
+// 2D convolution, NCHW, groups = 1. Dispatched on X.dtype (FP32 or FP16);
+// Wt, bias (if non-null), and Y must all share X.dtype. Internal
+// accumulation in FP32 regardless of storage dtype.
+//   X:      (N, C_in * H * W)        input
+//   Wt:     (C_out, C_in * kH * kW)  weights, OIHW filter layout
+//   bias:   (C_out, 1)               optional bias, may be null
+//   Y:      (N, C_out * H_out * W_out)  output, resized AND dtype-set to
+//                                       match X if mis-shaped/-typed.
 // Output dims (standard PyTorch formula):
 //   H_out = (H + 2*pad_h - dil_h * (kH - 1) - 1) / stride_h + 1
 //   W_out = (W + 2*pad_w - dil_w * (kW - 1) - 1) / stride_w + 1
@@ -509,11 +512,84 @@ void conv2d_forward_gpu(const GpuTensor& X,
                         int dil_h, int dil_w,
                         GpuTensor& Y);
 
-// GroupNorm forward, FP16 NCHW.
-//   X:     (N, C * H * W)   input,  FP16
-//   gamma: (C, 1)           per-channel scale, FP16
-//   beta:  (C, 1)           per-channel shift, FP16
-//   Y:     (N, C * H * W)   output, FP16; resized as needed
+// 2D convolution backward w.r.t. input (dX). FP32 only this bundle. The
+// companion dW/dB backward is a separate op (forthcoming bundle).
+//
+// Gather form: one thread per input pixel, iterates the kernel positions
+// (kh, kw) and inverts the forward index relation to find which output
+// pixel (i_out, j_out) read this input pixel through this kernel tap:
+//   i_out = (i + pad_h - dil_h * kh) / stride_h
+//   j_out = (j + pad_w - dil_w * kw) / stride_w
+// Only valid when divisible by stride and in [0, H_out) × [0, W_out).
+// For each valid (kh, kw), accumulate sum over c_out of
+// dY[n, c_out, i_out, j_out] * Wt[c_out, c_in, kh, kw]. FP32 accumulator.
+// No atomics — each dX pixel is written by exactly one thread.
+//
+// All conv hyperparams (H, W, stride/pad/dil) match the forward call.
+//
+//   Wt:   (C_out, C_in * kH * kW)        forward filter, OIHW, FP32
+//   dY:   (N, C_out * H_out * W_out)     upstream gradient, FP32
+//   dX:   (N, C_in  * H * W)             output, *overwritten*. Resized
+//                                        AND dtype-set to FP32 if
+//                                        mis-shaped/-typed.
+void conv2d_backward_input_gpu(const GpuTensor& Wt,
+                               const GpuTensor& dY,
+                               int N, int C_in, int H, int W,
+                               int C_out, int kH, int kW,
+                               int stride_h, int stride_w,
+                               int pad_h, int pad_w,
+                               int dil_h, int dil_w,
+                               GpuTensor& dX);
+
+// 2D convolution backward w.r.t. weights (dW). FP32 only this bundle.
+//
+// One thread per (c_out, c_in, kh, kw) element of dWt. Each thread iterates
+// (n, i_out, j_out) over the output spatial extent + batch, looks up the
+// corresponding input pixel (skipping OOB reads — treat OOB as zero), and
+// accumulates into a single dWt slot. No atomics — each dWt element is owned
+// by exactly one thread. FP32 accumulator; the per-thread sum is *added* into
+// the caller's dWt (caller is responsible for zeroing first).
+//
+// Math:
+//   dWt[c_out, c_in, kh, kw] +=
+//     sum over (n, i_out, j_out) of
+//       dY[n, c_out, i_out, j_out] *
+//       X [n, c_in, stride_h*i_out - pad_h + dil_h*kh,
+//                    stride_w*j_out - pad_w + dil_w*kw]
+//
+//   X:    (N, C_in  * H * W)             forward input, FP32
+//   dY:   (N, C_out * H_out * W_out)     upstream gradient, FP32
+//   dWt:  (C_out, C_in * kH * kW)        *accumulated into* — caller zeros, FP32
+// All conv hyperparams match the forward call.
+void conv2d_backward_weight_gpu(const GpuTensor& X,
+                                const GpuTensor& dY,
+                                int N, int C_in, int H, int W,
+                                int C_out, int kH, int kW,
+                                int stride_h, int stride_w,
+                                int pad_h, int pad_w,
+                                int dil_h, int dil_w,
+                                GpuTensor& dWt);
+
+// 2D convolution backward w.r.t. bias (dB). FP32 only this bundle.
+//
+// One block per c_out, parallel reduction across (n, i_out, j_out). FP32
+// accumulator; the block-reduced partial sum is added into dB[c_out].
+//
+//   dB[c_out] += sum over (n, i_out, j_out) of dY[n, c_out, i_out, j_out].
+//
+//   dY:  (N, C_out * H_out * W_out)  upstream gradient, FP32
+//   dB:  (C_out, 1)                   *accumulated into* — caller zeros, FP32
+void conv2d_backward_bias_gpu(const GpuTensor& dY,
+                              int N, int C_out, int H_out, int W_out,
+                              GpuTensor& dB);
+
+// GroupNorm forward, NCHW. Dtype-dispatched on X.dtype (FP32 or FP16);
+// gamma, beta, and Y all share X.dtype. Internal accumulation in FP32.
+//   X:     (N, C * H * W)   input
+//   gamma: (C, 1)           per-channel scale (same dtype as X)
+//   beta:  (C, 1)           per-channel shift (same dtype as X)
+//   Y:     (N, C * H * W)   output, resized AND dtype-set to match X if
+//                           mis-shaped/-typed.
 //   num_groups must divide C. eps typically 1e-5f. Mean and variance are
 //   computed over (C/num_groups, H, W) within each (n, group) tile.
 void group_norm_forward_gpu(const GpuTensor& X,
@@ -524,14 +600,61 @@ void group_norm_forward_gpu(const GpuTensor& X,
                             float eps,
                             GpuTensor& Y);
 
+// GroupNorm backward, NCHW. Dtype-dispatched on X.dtype (FP32 or FP16);
+// gamma and dY share X.dtype. Internal accumulation in FP32 regardless of
+// storage dtype. Mean and rstd are recomputed per (n, group) tile inside the
+// kernel from X (no forward cache is required — GroupNorm tiles are small).
+//
+// For each (n, g) tile spanning M = (C/num_groups) * H * W elements:
+//   rstd = 1 / sqrt(var + eps),   x̂ = (x - mean) * rstd
+//   dx̂ = dY * γ_c
+//   sum1 = Σ dx̂   over tile
+//   sum2 = Σ dx̂ · x̂   over tile
+//   dX = rstd * (dx̂ - (sum1 + x̂ · sum2) / M)
+// Per-channel grads accumulated across the whole batch:
+//   dGamma_c += Σ_{n,h,w} dY * x̂
+//   dBeta_c  += Σ_{n,h,w} dY
+//
+//   X:      (N, C * H * W)   forward input (same dtype as gamma, dY)
+//   gamma:  (C, 1)           forward scale
+//   dY:     (N, C * H * W)   upstream gradient
+//   dX:     (N, C * H * W)   output, *overwritten*. Resized AND dtype-set to
+//                            match X if mis-shaped/-typed.
+//   dGamma: (C, 1)           *accumulated into* — caller zeros. Same dtype as X.
+//   dBeta:  (C, 1)           *accumulated into* — caller zeros. Same dtype as X.
+void group_norm_backward_gpu(const GpuTensor& X,
+                             const GpuTensor& gamma,
+                             const GpuTensor& dY,
+                             int N, int C, int H, int W,
+                             int num_groups,
+                             float eps,
+                             GpuTensor& dX,
+                             GpuTensor& dGamma,
+                             GpuTensor& dBeta);
+
 // SiLU / Swish: y = x * sigmoid(x). FP32 and FP16 variants. y resized to
 // match x.shape AND x.dtype if mis-shaped/mis-typed. x and y may alias.
 void silu_forward_gpu(const GpuTensor& x, GpuTensor& y);
+
+// SiLU backward. Reads the raw forward input x (NOT the forward output y).
+//   dX[i] = dY[i] * sigmoid(x[i]) * (1 + x[i] * (1 - sigmoid(x[i])))
+// FP32 and FP16 variants dispatched on x.dtype (FP16 accumulates in FP32).
+// dX is resized AND dtype-set to match x if mis-shaped/-typed. dX may alias dY.
+void silu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX);
 
 // GELU (tanh approximation, matching PyTorch's `approximate="tanh"`):
 //   y = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
 // FP32 and FP16 variants dispatched on x.dtype.
 void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y);
+
+// GELU backward (tanh approximation). Reads the raw forward input x.
+//   k = sqrt(2/pi); u = k * (x + 0.044715 * x^3); t = tanh(u)
+//   du/dx = k * (1 + 3 * 0.044715 * x^2)
+//   dy/dx = 0.5 * (1 + t) + 0.5 * x * (1 - t^2) * du/dx
+//   dX[i] = dY[i] * dy/dx
+// FP32 and FP16 dispatch on x.dtype (FP16 accumulates in FP32). dX resized AND
+// dtype-set to match x if mis-shaped/-typed. dX may alias dY.
+void gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX);
 
 // QuickGELU: y = x * sigmoid(1.702 * x). Matches OpenAI CLIP's activation
 // (used in SD1.5's CLIP ViT-L/14 text encoder). FP32 and FP16 variants
@@ -539,26 +662,81 @@ void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y);
 // mis-shaped/-typed. x and y may alias.
 void quick_gelu_forward_gpu(const GpuTensor& x, GpuTensor& y);
 
-// 2x nearest-neighbour upsample over the spatial dims of an NCHW FP16 tensor.
-//   X: (N, C * H * W) FP16
-//   Y: (N, C * 2H * 2W) FP16; resized.
+// QuickGELU backward. Reads the raw forward input x. Let s = sigmoid(1.702*x).
+//   dy/dx = s + x * 1.702 * s * (1 - s)
+//   dX[i] = dY[i] * dy/dx
+// FP32 and FP16 dispatch on x.dtype (FP16 accumulates in FP32). dX resized AND
+// dtype-set to match x if mis-shaped/-typed. dX may alias dY.
+void quick_gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
+                             GpuTensor& dX);
+
+// 2x nearest-neighbour upsample over the spatial dims of an NCHW tensor.
+// Dtype-dispatched on X.dtype (FP32 or FP16); Y resized AND dtype-set to
+// match X if mis-shaped/-typed.
+//   X: (N, C * H * W)
+//   Y: (N, C * 2H * 2W)
 // Each output pixel (i, j) reads X at (i/2, j/2).
 void upsample_nearest_2x_gpu(const GpuTensor& X,
                              int N, int C, int H, int W,
                              GpuTensor& Y);
 
 // 2x bilinear upsample with align_corners=False (PyTorch default for
-// interpolate(scale_factor=2)). NCHW FP16.
+// interpolate(scale_factor=2)). NCHW. Dtype-dispatched on X.dtype (FP32 or
+// FP16); Y resized AND dtype-set to match X if mis-shaped/-typed. Internal
+// math in FP32.
 void upsample_bilinear_2x_gpu(const GpuTensor& X,
                               int N, int C, int H, int W,
                               GpuTensor& Y);
 
-// 2x average-pool downsample over NCHW FP16. Stride 2, kernel 2, no padding.
+// 2x average-pool downsample over NCHW. Stride 2, kernel 2, no padding.
+// Dtype-dispatched on X.dtype (FP32 or FP16); Y resized AND dtype-set to
+// match X if mis-shaped/-typed. Internal math in FP32.
 //   X: (N, C * H * W);  H and W must be even.
 //   Y: (N, C * H/2 * W/2)
 void downsample_avg_2x_gpu(const GpuTensor& X,
                            int N, int C, int H, int W,
                            GpuTensor& Y);
+
+// Backward of upsample_nearest_2x. Each input pixel sums the 4 output-pixel
+// gradients that copied from it:
+//   dX[n,c,i,j] = sum_{a,b in {0,1}} dY[n,c, 2i+a, 2j+b]
+// Dispatched FP32/FP16 on dY.dtype; dX resized AND dtype-set to match dY if
+// mis-shaped/-typed. Internal accumulation in FP32. One thread per input
+// pixel — no atomics.
+//   dY: (N, C * 2H * 2W)  upstream gradient
+//   N, C, H, W: INPUT (pre-upsample) dims (so output dims are 2H, 2W)
+//   dX: (N, C * H * W)    output, *overwritten*
+void upsample_nearest_2x_backward_gpu(const GpuTensor& dY,
+                                      int N, int C, int H, int W,
+                                      GpuTensor& dX);
+
+// Backward of upsample_bilinear_2x (align_corners=False). Scatters each
+// dY[n,c,i_out,j_out] into the 4 input pixels it bilinear-sampled from,
+// weighted by the same bilinear weights (replaying the forward's
+// y_in=(i_out+0.5)/2-0.5, x_in=(j_out+0.5)/2-0.5 mapping with [0,H-1]x[0,W-1]
+// clamping). Dispatched FP32/FP16 on dY.dtype; dX resized AND dtype-set to
+// match dY if mis-shaped/-typed. Internal accumulation in FP32.
+// Implementation: one thread per output pixel, atomicAdd into dX. FP16 path
+// uses an FP32 scratch buffer + fold kernel (FP16 atomicAdd is not portable).
+//   dY: (N, C * 2H * 2W)  upstream gradient
+//   N, C, H, W: INPUT (pre-upsample) dims
+//   dX: (N, C * H * W)    output, *overwritten*
+void upsample_bilinear_2x_backward_gpu(const GpuTensor& dY,
+                                       int N, int C, int H, int W,
+                                       GpuTensor& dX);
+
+// Backward of downsample_avg_2x. Each input pixel receives 1/4 of the single
+// output pixel's gradient that averaged over it:
+//   dX[n,c,2*i_out+a, 2*j_out+b] = (1/4) * dY[n,c,i_out,j_out]
+// Dispatched FP32/FP16 on dY.dtype; dX resized AND dtype-set to match dY if
+// mis-shaped/-typed. Internal accumulation in FP32. One thread per input
+// pixel — no atomics. H, W (input dims) must be even.
+//   dY: (N, C * H/2 * W/2)  upstream gradient
+//   N, C, H, W: INPUT (pre-downsample) dims; H, W even
+//   dX: (N, C * H * W)      output, *overwritten*
+void downsample_avg_2x_backward_gpu(const GpuTensor& dY,
+                                    int N, int C, int H, int W,
+                                    GpuTensor& dX);
 
 // FP16 batched linear forward, inference-only. Mirrors
 // linear_forward_batched_gpu but with FP16 storage on X / W / bias / Y.
@@ -574,10 +752,21 @@ void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
 void mul_inplace_gpu(GpuTensor& y, const GpuTensor& x);
 
 // GEGLU activation: input (B, 2*D) is split along the last dim into halves
-// A=(B, D) and B=(B, D); output (B, D) = A * gelu(B). FP16.
-//   X:  (B, 2*D)  FP16
-//   Y:  (B, D)    FP16; resized as needed.
+// A=(B, D) and B_half=(B, D); output (B, D) = A * gelu(B_half). FP32 and FP16
+// variants dispatched on X.dtype (FP16 accumulates in FP32).
+//   X:  (B, 2*D)  input
+//   Y:  (B, D)    output, resized AND dtype-set to match X if mis-shaped/-typed.
 void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y);
+
+// GEGLU backward. Splits X along the last dim into halves A and B_half (each
+// (B, D)). Let g = gelu(B_half) (tanh-approx).
+//   dA      = dY * g
+//   dB_half = dY * A * gelu'(B_half)   (same derivative as gelu_backward)
+// dX = concat(dA, dB_half) along the last dim with layout matching the
+// forward (A then B_half). FP32 and FP16 dispatch on X.dtype (FP16 accumulates
+// in FP32). dX is resized AND dtype-set to match X if mis-shaped/-typed.
+void geglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
+                        GpuTensor& dX);
 
 // Causal mask helper for transformer self-attention. Produces an (L, L)
 // FP32 mask where mask[q*L + k] = (k <= q) ? 1.0f : 0.0f. The existing
@@ -592,18 +781,22 @@ void build_causal_mask_row_gpu(int L, int q, GpuTensor& mask);
 
 // Cross-attention: like mha_forward_gpu but K and V are projected from a
 // separate context tensor instead of from X. Used in diffusion U-Nets to
-// inject text conditioning. FP16 (X, Ctx, all weights, O).
+// inject text conditioning. Dispatched on X.dtype:
+//   * FP16: flash-attention path (inference). Caches are NOT exposed; if you
+//     want them, use cross_attention_forward_train_gpu (FP32 only).
+//   * FP32: training-aware path. Internally allocates scratch caches and
+//     calls cross_attention_forward_train_gpu; scratch is discarded.
 //
-//   X:    (Lq, D)  query input (image tokens)
-//   Ctx:  (Lk, D)  key/value input (text tokens). Lk may differ from Lq.
-//   Wq, Wk, Wv, Wo: each (D, D), FP16. Wq projects X; Wk,Wv project Ctx.
-//   d_mask: optional FP32 mask of length Lk (1 valid, 0 invalid). May be
-//           null. Same softmax-mask semantics as self-attention.
+//   X:    (Lq, D)      query input (image tokens)
+//   Ctx:  (Lk, D_ctx)  key/value input (text tokens). Lk and D_ctx may differ
+//                      from Lq and D respectively. Ctx.dtype must match X.dtype.
+//   Wq:   (D, D)       projects X → Q
+//   Wk:   (D, D_ctx)   projects Ctx → K  (rectangular for cross-attn)
+//   Wv:   (D, D_ctx)   projects Ctx → V
+//   Wo:   (D, D)       output projection
+//   d_mask: optional FP32 mask of length Lk (1 valid, 0 invalid). May be null.
 //   num_heads: must divide D.
-//   O:    (Lq, D) output, FP16. Resized if mis-shaped.
-//
-// Caches Qh/Kh/Vh/Attnh/Yconcat are *not* exposed — this is inference-only;
-// pass scratch GpuTensors if you want them surfaced.
+//   O:    (Lq, D) output, same dtype as X. Resized if mis-shaped.
 void cross_attention_forward_gpu(const GpuTensor& X,
                                  const GpuTensor& Ctx,
                                  const GpuTensor& Wq, const GpuTensor& Wk,
@@ -611,6 +804,104 @@ void cross_attention_forward_gpu(const GpuTensor& X,
                                  const float* d_mask,
                                  int num_heads,
                                  GpuTensor& O);
+
+// FP32 training-side self-attention forward. Thin wrapper over mha_forward_gpu
+// (signatures match exactly when D_ctx == D and Ctx == X).
+//   X:   (L, D) FP32
+//   Wq, Wk, Wv, Wo: each (D, D) FP32
+//   d_mask: optional length-L FP32 mask. May be null.
+//   num_heads: must divide D.
+//   Caches (resized if mis-shaped, written by op):
+//     Qh, Kh, Vh: (h*L, D/h)
+//     Attnh:      (h*L, L)
+//     Yconcat:    (L, D)
+//   O:   (L, D) FP32; resized if mis-shaped.
+void self_attention_forward_train_gpu(const GpuTensor& X,
+                                      const GpuTensor& Wq, const GpuTensor& Wk,
+                                      const GpuTensor& Wv, const GpuTensor& Wo,
+                                      const float* d_mask,
+                                      int num_heads,
+                                      GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
+                                      GpuTensor& Attnh, GpuTensor& Yconcat,
+                                      GpuTensor& O);
+
+// FP32 training-side self-attention backward. Thin wrapper over
+// mha_backward_gpu.
+//   dO: (L, D) upstream
+//   X, Qh, Kh, Vh, Attnh, Yconcat: forward caches
+//   Wq, Wk, Wv, Wo: forward weights (each (D, D))
+//   d_mask: same mask used in forward (or null)
+//   num_heads: must match forward
+//   dX: (L, D) output, *overwritten*
+//   dWq, dWk, dWv, dWo: (D, D) accumulated into — caller zeros.
+void self_attention_backward_gpu(const GpuTensor& dO,
+                                 const GpuTensor& X,
+                                 const GpuTensor& Qh, const GpuTensor& Kh,
+                                 const GpuTensor& Vh, const GpuTensor& Attnh,
+                                 const GpuTensor& Yconcat,
+                                 const GpuTensor& Wq, const GpuTensor& Wk,
+                                 const GpuTensor& Wv, const GpuTensor& Wo,
+                                 const float* d_mask,
+                                 int num_heads,
+                                 GpuTensor& dX,
+                                 GpuTensor& dWq, GpuTensor& dWk,
+                                 GpuTensor& dWv, GpuTensor& dWo);
+
+// FP32 training-side cross-attention forward. Mirrors mha_forward_gpu math
+// but accepts a separate Ctx tensor for K/V projection and rectangular
+// Wk/Wv: (D, D_ctx).
+//
+//   X:    (Lq, D)      FP32 query input
+//   Ctx:  (Lk, D_ctx)  FP32 key/value input
+//   Wq:   (D, D)       FP32 — projects X → Q
+//   Wk:   (D, D_ctx)   FP32 — projects Ctx → K
+//   Wv:   (D, D_ctx)   FP32 — projects Ctx → V
+//   Wo:   (D, D)       FP32 — output projection
+//   d_mask: optional length-Lk FP32 mask. May be null.
+//   num_heads: must divide D.
+//   Caches (resized if mis-shaped):
+//     Qh:    (h*Lq, D/h)
+//     Kh:    (h*Lk, D/h)
+//     Vh:    (h*Lk, D/h)
+//     Attnh: (h*Lq, Lk)
+//     Yconcat: (Lq, D)
+//   O:    (Lq, D) FP32; resized if mis-shaped.
+void cross_attention_forward_train_gpu(const GpuTensor& X,
+                                       const GpuTensor& Ctx,
+                                       const GpuTensor& Wq, const GpuTensor& Wk,
+                                       const GpuTensor& Wv, const GpuTensor& Wo,
+                                       const float* d_mask,
+                                       int num_heads,
+                                       GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
+                                       GpuTensor& Attnh, GpuTensor& Yconcat,
+                                       GpuTensor& O);
+
+// FP32 training-side cross-attention backward.
+//   dO: (Lq, D) upstream
+//   X, Ctx, Qh, Kh, Vh, Attnh, Yconcat: forward caches
+//   Wq: (D, D), Wk/Wv: (D, D_ctx), Wo: (D, D)
+//   d_mask: same mask used in forward (or null)
+//   num_heads: must match forward
+//   dX:   (Lq, D)     output, *overwritten*
+//   dCtx: (Lk, D_ctx) output, *overwritten*
+//   dWq:  (D, D)      accumulated into — caller zeros
+//   dWk:  (D, D_ctx)  accumulated into — caller zeros
+//   dWv:  (D, D_ctx)  accumulated into — caller zeros
+//   dWo:  (D, D)      accumulated into — caller zeros
+void cross_attention_backward_gpu(const GpuTensor& dO,
+                                  const GpuTensor& X,
+                                  const GpuTensor& Ctx,
+                                  const GpuTensor& Qh, const GpuTensor& Kh,
+                                  const GpuTensor& Vh, const GpuTensor& Attnh,
+                                  const GpuTensor& Yconcat,
+                                  const GpuTensor& Wq, const GpuTensor& Wk,
+                                  const GpuTensor& Wv, const GpuTensor& Wo,
+                                  const float* d_mask,
+                                  int num_heads,
+                                  GpuTensor& dX,
+                                  GpuTensor& dCtx,
+                                  GpuTensor& dWq, GpuTensor& dWk,
+                                  GpuTensor& dWv, GpuTensor& dWo);
 
 // FP16 LayerNorm forward, inference-only. Processes R independent rows of
 // length D in a single launch (one block per row). FP32 accumulation.

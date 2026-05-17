@@ -37,26 +37,26 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 |---|---|---|---|---|
 | linear | ✓ | ✓ | ✓ | dense; FP32 single + batched (fwd/bwd), FP16 batched-inference |
 | relu / tanh / sigmoid | ✓ | ✓ | — | elementwise; relu/tanh also have batched fwd+bwd |
-| silu / gelu | ✓ | — | ✓ | tanh-approx GELU; dtype-dispatched |
-| quick_gelu | ✓ | — | ✓ | `x * sigmoid(1.702*x)`, OpenAI CLIP activation |
-| geglu | — | — | ✓ | gated GELU (SD FFN) |
+| silu / gelu | ✓ | ✓ | ✓ | tanh-approx GELU; dtype-dispatched (FP16 bwd accumulates in FP32) |
+| quick_gelu | ✓ | ✓ | ✓ | `x * sigmoid(1.702*x)`, OpenAI CLIP activation |
+| geglu | ✓ | ✓ | ✓ | gated GELU (SD FFN); FP32+FP16 fwd/bwd, dtype-dispatched |
 | add / scale / mul_inplace | ✓ | n/a | ✓ | dtype-dispatched |
 | clamp | ✓ | n/a | ✓ | in-place min/max, dtype-dispatched (VAE epilogue) |
 | build_slot_mask | ✓ | n/a | — | device-side validity mask construction |
 | softmax | ✓ | ✓ | — | masked, numerically stable |
 | layernorm | ✓ | ✓ | ✓ | FP32 single + batched-infer; FP16 batched-infer |
-| group_norm | — | — | ✓ | NCHW, per-group stats |
+| group_norm | ✓ | ✓ | ✓ | NCHW, per-group stats; dtype-dispatched fwd+bwd (FP16 bwd accumulates in FP32) |
 | attention (single-head) | ✓ | ✓ | — | |
 | mha (multi-head) | ✓ | ✓ | — | |
-| self_attention | — | — | ✓ | FP16 wrapper over cross-attention |
-| cross_attention | — | — | ✓ | thin wrapper, FP16 inference |
+| self_attention | ✓ | ✓ | ✓ | FP32 = training (caches exposed via `_train`); FP16 = flash inference |
+| cross_attention | ✓ | ✓ | ✓ | FP32 = training (caches exposed via `_train`, rectangular Wk/Wv); FP16 = flash inference |
 | flash_attention | — | — | ✓ | tiled online-softmax, Lk-unbounded, optional causal |
 | flash_attention_qkvo | — | — | ✓ | fused Q/K/V/O projections + biases; rectangular Wk/Wv for cross-attn; optional causal |
 | resblock | — | — | ✓ | fused diffusion ResBlock (GN→SiLU→conv ×2 + skip) |
-| conv2d | — | — | ✓ | NCHW, groups=1, stride/pad/dil |
-| upsample_nearest_2x | — | — | ✓ | |
-| upsample_bilinear_2x | — | — | ✓ | align_corners=False |
-| downsample_avg_2x | — | — | ✓ | stride 2, kernel 2 |
+| conv2d | FP32 fwd ✓ | FP32 bwd ✓ | FP16 fwd ✓ | NCHW, groups=1, stride/pad/dil; FP32 backward (dX, dW, dB) |
+| upsample_nearest_2x | ✓ | ✓ | ✓ | backward dtype-dispatched (FP32+FP16) |
+| upsample_bilinear_2x | ✓ | ✓ | ✓ | align_corners=False; backward dtype-dispatched (FP32+FP16; FP16 uses FP32 scratch + fold) |
+| downsample_avg_2x | ✓ | ✓ | ✓ | stride 2, kernel 2; backward dtype-dispatched (FP32+FP16) |
 | nchw ↔ sequence transpose | ✓ | n/a | ✓ | gather/scatter between NCHW and (L,D) layouts |
 | embedding lookup | ✓ | ✓ | ✓ | FP32/FP16 table dispatch |
 | concat_rows / split_rows | ✓ | ✓ | ✓ | flat byte-aware concat (FP16 supported) |

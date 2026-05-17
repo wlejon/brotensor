@@ -23,6 +23,27 @@ __device__ inline float gelu_tanh_scalar(float v) {
     return 0.5f * v * (1.0f + tanhf(u));
 }
 
+__device__ inline float silu_grad_scalar(float v) {
+    // d/dx [x * sigmoid(x)] = sigmoid(x) * (1 + x * (1 - sigmoid(x))).
+    const float s = 1.0f / (1.0f + __expf(-v));
+    return s * (1.0f + v * (1.0f - s));
+}
+
+__device__ inline float gelu_tanh_grad_scalar(float v) {
+    // Derivative of gelu_tanh_scalar w.r.t. v.
+    constexpr float kSqrt2OverPi = 0.7978845608f;
+    const float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
+    const float t = tanhf(u);
+    const float dudx = kSqrt2OverPi * (1.0f + 3.0f * 0.044715f * v * v);
+    return 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * dudx;
+}
+
+__device__ inline float quick_gelu_grad_scalar(float v) {
+    // d/dx [x * sigmoid(1.702*x)] = s + x * 1.702 * s * (1 - s).
+    const float s = 1.0f / (1.0f + __expf(-1.702f * v));
+    return s + v * 1.702f * s * (1.0f - s);
+}
+
 __global__ void relu_forward_kernel(const float* __restrict__ x,
                                     float* __restrict__ y, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -239,6 +260,120 @@ __global__ void geglu_forward_fp16_kernel(const __half* __restrict__ X,
     Y[idx] = __float2half(a * gelu_tanh_scalar(gv_raw));
 }
 
+__global__ void silu_backward_fp32_kernel(const float* __restrict__ x,
+                                          const float* __restrict__ dY,
+                                          float* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        dX[i] = dY[i] * silu_grad_scalar(x[i]);
+    }
+}
+
+__global__ void silu_backward_fp16_kernel(const __half* __restrict__ x,
+                                          const __half* __restrict__ dY,
+                                          __half* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float xv  = __half2float(x[i]);
+        const float dyv = __half2float(dY[i]);
+        dX[i] = __float2half(dyv * silu_grad_scalar(xv));
+    }
+}
+
+__global__ void gelu_backward_fp32_kernel(const float* __restrict__ x,
+                                          const float* __restrict__ dY,
+                                          float* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        dX[i] = dY[i] * gelu_tanh_grad_scalar(x[i]);
+    }
+}
+
+__global__ void gelu_backward_fp16_kernel(const __half* __restrict__ x,
+                                          const __half* __restrict__ dY,
+                                          __half* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float xv  = __half2float(x[i]);
+        const float dyv = __half2float(dY[i]);
+        dX[i] = __float2half(dyv * gelu_tanh_grad_scalar(xv));
+    }
+}
+
+__global__ void quick_gelu_backward_fp32_kernel(const float* __restrict__ x,
+                                                const float* __restrict__ dY,
+                                                float* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        dX[i] = dY[i] * quick_gelu_grad_scalar(x[i]);
+    }
+}
+
+__global__ void quick_gelu_backward_fp16_kernel(const __half* __restrict__ x,
+                                                const __half* __restrict__ dY,
+                                                __half* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float xv  = __half2float(x[i]);
+        const float dyv = __half2float(dY[i]);
+        dX[i] = __float2half(dyv * quick_gelu_grad_scalar(xv));
+    }
+}
+
+// Y(B, D) = X_a(B, D) * gelu(X_b(B, D)), FP32 variant.
+__global__ void geglu_forward_fp32_kernel(const float* __restrict__ X,
+                                          float* __restrict__ Y,
+                                          int B, int D) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * D;
+    if (idx >= total) return;
+    const int b = idx / D;
+    const int d = idx % D;
+    const int two_d = 2 * D;
+    const float a = X[b * two_d + d];
+    const float gv_raw = X[b * two_d + D + d];
+    Y[idx] = a * gelu_tanh_scalar(gv_raw);
+}
+
+// dX(B, 2D): dA = dY * g; dB_half = dY * A * gelu'(B_half).
+__global__ void geglu_backward_fp32_kernel(const float* __restrict__ X,
+                                           const float* __restrict__ dY,
+                                           float* __restrict__ dX,
+                                           int B, int D) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * D;
+    if (idx >= total) return;
+    const int b = idx / D;
+    const int d = idx % D;
+    const int two_d = 2 * D;
+    const float a       = X[b * two_d + d];
+    const float bh      = X[b * two_d + D + d];
+    const float dy      = dY[idx];
+    const float g       = gelu_tanh_scalar(bh);
+    const float gprime  = gelu_tanh_grad_scalar(bh);
+    dX[b * two_d + d]     = dy * g;
+    dX[b * two_d + D + d] = dy * a * gprime;
+}
+
+__global__ void geglu_backward_fp16_kernel(const __half* __restrict__ X,
+                                           const __half* __restrict__ dY,
+                                           __half* __restrict__ dX,
+                                           int B, int D) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * D;
+    if (idx >= total) return;
+    const int b = idx / D;
+    const int d = idx % D;
+    const int two_d = 2 * D;
+    const float a       = __half2float(X[b * two_d + d]);
+    const float bh      = __half2float(X[b * two_d + D + d]);
+    const float dy      = __half2float(dY[idx]);
+    const float g       = gelu_tanh_scalar(bh);
+    const float gprime  = gelu_tanh_grad_scalar(bh);
+    dX[b * two_d + d]     = __float2half(dy * g);
+    dX[b * two_d + D + d] = __float2half(dy * a * gprime);
+}
+
 __global__ void causal_mask_row_kernel(float* __restrict__ mask, int L, int q) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= L) return;
@@ -418,24 +553,106 @@ void quick_gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
-    if (X.dtype != Dtype::FP16) {
-        throw std::runtime_error("geglu_forward_gpu: X must be FP16");
+void silu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX) {
+    if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
+        dX.resize(x.rows, x.cols, x.dtype);
     }
+    const int n = x.size();
+    if (n == 0) return;
+    if (x.dtype == Dtype::FP16) {
+        silu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<const __half*>(x.data_fp16()),
+            reinterpret_cast<const __half*>(dY.data_fp16()),
+            reinterpret_cast<__half*>(dX.data_fp16()), n);
+    } else {
+        silu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+            x.data, dY.data, dX.data, n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX) {
+    if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
+        dX.resize(x.rows, x.cols, x.dtype);
+    }
+    const int n = x.size();
+    if (n == 0) return;
+    if (x.dtype == Dtype::FP16) {
+        gelu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<const __half*>(x.data_fp16()),
+            reinterpret_cast<const __half*>(dY.data_fp16()),
+            reinterpret_cast<__half*>(dX.data_fp16()), n);
+    } else {
+        gelu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+            x.data, dY.data, dX.data, n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void quick_gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
+                             GpuTensor& dX) {
+    if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
+        dX.resize(x.rows, x.cols, x.dtype);
+    }
+    const int n = x.size();
+    if (n == 0) return;
+    if (x.dtype == Dtype::FP16) {
+        quick_gelu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<const __half*>(x.data_fp16()),
+            reinterpret_cast<const __half*>(dY.data_fp16()),
+            reinterpret_cast<__half*>(dX.data_fp16()), n);
+    } else {
+        quick_gelu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+            x.data, dY.data, dX.data, n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
     if (X.cols % 2 != 0) {
         throw std::runtime_error("geglu_forward_gpu: X.cols must be even (2*D)");
     }
     const int B = X.rows;
     const int D = X.cols / 2;
-    if (Y.rows != B || Y.cols != D || Y.dtype != Dtype::FP16) {
-        Y.resize(B, D, Dtype::FP16);
+    if (Y.rows != B || Y.cols != D || Y.dtype != X.dtype) {
+        Y.resize(B, D, X.dtype);
     }
     const int total = B * D;
     if (total == 0) return;
-    geglu_forward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
-        reinterpret_cast<const __half*>(X.data_fp16()),
-        reinterpret_cast<__half*>(Y.data_fp16()),
-        B, D);
+    if (X.dtype == Dtype::FP16) {
+        geglu_forward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
+            reinterpret_cast<const __half*>(X.data_fp16()),
+            reinterpret_cast<__half*>(Y.data_fp16()),
+            B, D);
+    } else {
+        geglu_forward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
+            X.data, Y.data, B, D);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void geglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
+                        GpuTensor& dX) {
+    if (X.cols % 2 != 0) {
+        throw std::runtime_error("geglu_backward_gpu: X.cols must be even (2*D)");
+    }
+    const int B = X.rows;
+    const int D = X.cols / 2;
+    if (dX.rows != B || dX.cols != 2 * D || dX.dtype != X.dtype) {
+        dX.resize(B, 2 * D, X.dtype);
+    }
+    const int total = B * D;
+    if (total == 0) return;
+    if (X.dtype == Dtype::FP16) {
+        geglu_backward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
+            reinterpret_cast<const __half*>(X.data_fp16()),
+            reinterpret_cast<const __half*>(dY.data_fp16()),
+            reinterpret_cast<__half*>(dX.data_fp16()),
+            B, D);
+    } else {
+        geglu_backward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
+            X.data, dY.data, dX.data, B, D);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
