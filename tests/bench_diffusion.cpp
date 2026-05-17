@@ -65,19 +65,8 @@ float time_loop_ms(int iters, const std::function<void()>& body) {
 // implementations. FP16 accumulation error compounds with K (softmax denom,
 // conv reduction over C_in*9, etc.), so we use a generous absolute floor +
 // 15% relative tolerance — enough to catch a garbage-fast kernel but not so
-// tight that an honest accumulation-order difference between dynamic-shmem
-// softmax and tiled online softmax trips a warning.
-// Sanity check: are the two FP16 outputs in the same numerical neighbourhood?
-// FP16 accumulation order differs between the dynamic-shmem softmax and the
-// online-rescaled tiled softmax, so we don't expect bit-exact equality.
-// We compare relative error normalised by the RMS of the reference output
-// — this stays well-behaved when individual elements are near zero.
-// Regression sanity for the fused output: check that values are finite and
-// bounded. We deliberately do NOT compare fused vs unfused element-by-element
-// here — at SD-scale shapes the legacy dynamic-shmem cross-attention has
-// FP16 accumulation issues that diverge from CPU-truth (well outside the
-// fused kernel's actual error envelope). Real correctness is owned by the
-// dedicated parity tests at parity-safe sizes; this is a cheap "did the
+// Sanity check that the fused kernel produced finite, bounded output. Element-
+// by-element parity belongs in the dedicated tests; this is just a "did the
 // kernel silently produce garbage" gate.
 bool sanity_finite(const GpuTensor& a, float abs_clip = 1e3f) {
     std::vector<uint16_t> ha(a.size());

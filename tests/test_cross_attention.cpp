@@ -195,6 +195,12 @@ int main() {
     run_one("multi-head",       6, 7, 16, 4, false);
     run_one("with mask",        4, 8, 16, 2, true);
     run_one("Lq=Lk",            8, 8, 32, 4, false);
+    run_one("SD-realistic D",   16, 32, 640, 10, false);
+    // Regression coverage. A prior hand-rolled core kernel failed silently at
+    // (Lq * num_heads) ≳ 400 with head_dim ≥ 64 on this architecture; the
+    // public op now delegates to the flash-attention path, which is correct
+    // at all SD-scale shapes including the largest U-Net cross-attn site.
+    run_one("SD bench shape",   64, 77, 1280, 20, false);
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);
