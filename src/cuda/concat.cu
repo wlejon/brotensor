@@ -40,17 +40,18 @@ void concat_rows_gpu(const std::vector<const GpuTensor*>& parts,
 
 void split_rows_gpu(const GpuTensor& in,
                     const std::vector<GpuTensor*>& parts) {
-    int off = 0;
+    const size_t elem = static_cast<size_t>(dtype_size_bytes(in.dtype));
+    const char* src_base = reinterpret_cast<const char*>(in.data);
+    size_t off_bytes = 0;
     for (auto* p : parts) {
         if (!p) continue;
         const int n = p->size();
         if (n == 0) continue;
-        BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(p->data, in.data + off,
-                                       sizeof(float) * n,
+        BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(p->data, src_base + off_bytes,
+                                       elem * static_cast<size_t>(n),
                                        cudaMemcpyDeviceToDevice));
-        off += n;
+        off_bytes += elem * static_cast<size_t>(n);
     }
-    (void)in;
 }
 
 // Batched column-block concat. Each part is (B, d_i) for the same B; out
@@ -98,10 +99,14 @@ void copy_d2d_gpu(const GpuTensor& src, int src_off,
                   GpuTensor& dst,       int dst_off,
                   int n) {
     if (n <= 0) return;
-    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(dst.data + dst_off,
-                                   src.data + src_off,
-                                   sizeof(float) * n,
-                                   cudaMemcpyDeviceToDevice));
+    const size_t elem = static_cast<size_t>(dtype_size_bytes(src.dtype));
+    const char* src_base = reinterpret_cast<const char*>(src.data);
+    char*       dst_base = reinterpret_cast<char*>(dst.data);
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(
+        dst_base + static_cast<size_t>(dst_off) * elem,
+        src_base + static_cast<size_t>(src_off) * elem,
+        elem * static_cast<size_t>(n),
+        cudaMemcpyDeviceToDevice));
 }
 
 } // namespace brotensor

@@ -187,6 +187,53 @@ static void test_concat_fp16() {
     check_fp16(gotB, RefB, "concat_batched_rows");
 }
 
+static void test_split_and_copy_d2d_fp16() {
+    std::printf("  split_rows / copy_d2d fp16\n");
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // split_rows_gpu inverse of concat_rows_gpu. Build a concatenated FP16
+    // tensor and split it back into three pieces; values must round-trip.
+    std::vector<float> P1(5), P2(11), P3(3);
+    for (auto& v : P1) v = dist(rng);
+    for (auto& v : P2) v = dist(rng);
+    for (auto& v : P3) v = dist(rng);
+    auto P1q = rq(P1), P2q = rq(P2), P3q = rq(P3);
+    GpuTensor G1, G2, G3, Cat;
+    auto P1h = to_fp16(P1), P2h = to_fp16(P2), P3h = to_fp16(P3);
+    brotensor::upload_fp16(P1h.data(), 5, 1, G1);
+    brotensor::upload_fp16(P2h.data(), 11, 1, G2);
+    brotensor::upload_fp16(P3h.data(), 3, 1, G3);
+    brotensor::concat_rows_gpu({&G1, &G2, &G3}, Cat);
+
+    GpuTensor S1(5, 1, Dtype::FP16), S2(11, 1, Dtype::FP16), S3(3, 1, Dtype::FP16);
+    brotensor::split_rows_gpu(Cat, {&S1, &S2, &S3});
+    std::vector<uint16_t> g1(5), g2(11), g3(3);
+    brotensor::download_fp16(S1, g1.data());
+    brotensor::download_fp16(S2, g2.data());
+    brotensor::download_fp16(S3, g3.data());
+    brotensor::cuda_sync();
+    check_fp16(g1, P1q, "split_rows[0]");
+    check_fp16(g2, P2q, "split_rows[1]");
+    check_fp16(g3, P3q, "split_rows[2]");
+
+    // copy_d2d_gpu: copy a 4-element slice starting at offset 3 of Cat into a
+    // fresh FP16 tensor at offset 1.
+    GpuTensor Dst(8, 1, Dtype::FP16);
+    Dst.zero();
+    brotensor::copy_d2d_gpu(Cat, /*src_off*/3, Dst, /*dst_off*/1, /*n*/4);
+    std::vector<uint16_t> got_dst(8);
+    brotensor::download_fp16(Dst, got_dst.data());
+    brotensor::cuda_sync();
+    std::vector<float> ref_dst(8, 0.0f);
+    // Cat[3..6] = (P1[3], P1[4], P2[0], P2[1])
+    ref_dst[1] = P1q[3];
+    ref_dst[2] = P1q[4];
+    ref_dst[3] = P2q[0];
+    ref_dst[4] = P2q[1];
+    check_fp16(got_dst, ref_dst, "copy_d2d");
+}
+
 static void test_layernorm_fp16() {
     std::printf("  layernorm_forward_inference_batched_fp16\n");
     const int R = 4, D = 32;
@@ -232,6 +279,7 @@ int main() {
     test_linear_fp16();
     test_elementwise_fp16();
     test_concat_fp16();
+    test_split_and_copy_d2d_fp16();
     test_layernorm_fp16();
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);
