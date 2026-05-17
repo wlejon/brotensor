@@ -667,6 +667,33 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
                                       bool causal,
                                       GpuTensor& O);
 
+// NCHW ↔ sequence layout transpose. Lets ops that expect a (L, D) token
+// layout (flash_attention_*, self/cross attention wrappers) consume tensors
+// produced by NCHW primitives (conv2d, group_norm, resblock). Per-element
+// gather/scatter — no math, no padding.
+//
+// FP32 and FP16 are both supported; dispatched on X.dtype. Y is resized AND
+// dtype-set to match X.dtype if mis-shaped/-typed. X and Y must not alias.
+//
+// nchw_to_sequence_gpu:
+//   X:  (N, C * H * W)        any dtype, treated as NCHW
+//   Y:  (N * H * W, C)        same dtype; Y[n*H*W + h*W + w, c] = X[n,c,h,w]
+//
+// sequence_to_nchw_gpu (inverse):
+//   X:  (N * H * W, C)        any dtype, sequence layout
+//   Y:  (N, C * H * W)        same dtype; Y[n,c,h,w] = X[n*H*W + h*W + w, c]
+//
+// For SD VAE mid-block self-attention (N=1) this gives the (H*W, C) token
+// layout the flash kernels want. For N>1, the sequence form is (N*H*W, C);
+// callers wanting a separate per-batch attention pass slice the rows.
+void nchw_to_sequence_gpu(const GpuTensor& X,
+                          int N, int C, int H, int W,
+                          GpuTensor& Y);
+
+void sequence_to_nchw_gpu(const GpuTensor& X,
+                          int N, int C, int H, int W,
+                          GpuTensor& Y);
+
 // Fused diffusion ResBlock (FP16, inference-only). Computes the standard
 // SD U-Net residual block in a single op:
 //
