@@ -267,6 +267,137 @@ static void test_geglu_fp32() {
     }
 }
 
+static float gelu_exact_ref(float v) {
+    return 0.5f * v * (1.0f + std::erf(v * 0.70710678118f));
+}
+static float gelu_exact_grad_ref(float v) {
+    return 0.5f * (1.0f + std::erf(v * 0.70710678118f))
+         + v * std::exp(-0.5f * v * v) * 0.39894228040f;
+}
+
+static void test_geglu_exact_fp32() {
+    std::printf("  geglu_exact fp32 fwd+bwd\n");
+    const int B = 3, D = 9;
+    const int two_d = 2 * D;
+    std::mt19937 rng(0xCEFC);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+    std::vector<float> hx(B * two_d), hdy(B * D);
+    for (auto& v : hx)  v = dist(rng);
+    for (auto& v : hdy) v = dist(rng);
+
+    GpuTensor X, dY;
+    brotensor::upload(hx.data(),  B, two_d, X);
+    brotensor::upload(hdy.data(), B, D,    dY);
+
+    GpuTensor Y;
+    brotensor::geglu_exact_forward_gpu(X, Y);
+    CHECK(Y.rows == B && Y.cols == D && Y.dtype == Dtype::FP32);
+    std::vector<float> gotY(B * D);
+    brotensor::download(Y, gotY.data());
+    brotensor::cuda_sync();
+    float max_err_fwd = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        for (int d = 0; d < D; ++d) {
+            const float a  = hx[b * two_d + d];
+            const float bh = hx[b * two_d + D + d];
+            const float r  = a * gelu_exact_ref(bh);
+            const float e  = std::fabs(gotY[b * D + d] - r);
+            if (e > max_err_fwd) max_err_fwd = e;
+            CHECK(e < 1e-5f + 1e-5f * std::fabs(r));
+        }
+    }
+    std::printf("    fwd max_err=%g\n", max_err_fwd);
+
+    GpuTensor dX;
+    brotensor::geglu_exact_backward_gpu(X, dY, dX);
+    CHECK(dX.rows == B && dX.cols == two_d && dX.dtype == Dtype::FP32);
+    std::vector<float> gotdX(B * two_d);
+    brotensor::download(dX, gotdX.data());
+    brotensor::cuda_sync();
+    float max_err_bwd = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        for (int d = 0; d < D; ++d) {
+            const float a   = hx[b * two_d + d];
+            const float bh  = hx[b * two_d + D + d];
+            const float dy  = hdy[b * D + d];
+            const float dA  = dy * gelu_exact_ref(bh);
+            const float dBh = dy * a * gelu_exact_grad_ref(bh);
+            const float ga  = gotdX[b * two_d + d];
+            const float gb  = gotdX[b * two_d + D + d];
+            const float ea  = std::fabs(ga - dA);
+            const float eb  = std::fabs(gb - dBh);
+            if (ea > max_err_bwd) max_err_bwd = ea;
+            if (eb > max_err_bwd) max_err_bwd = eb;
+            CHECK(ea < 1e-5f + 1e-5f * std::fabs(dA));
+            CHECK(eb < 1e-5f + 1e-5f * std::fabs(dBh));
+        }
+    }
+    std::printf("    bwd max_err=%g\n", max_err_bwd);
+}
+
+static void test_geglu_exact_fp16() {
+    std::printf("  geglu_exact fp16 fwd+bwd\n");
+    const int B = 3, D = 9;
+    const int two_d = 2 * D;
+    std::mt19937 rng(0xCEFD);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+    std::vector<float> hx_f(B * two_d), hdy_f(B * D);
+    for (auto& v : hx_f)  v = dist(rng);
+    for (auto& v : hdy_f) v = dist(rng);
+    auto hx_h  = to_fp16(hx_f);
+    auto hdy_h = to_fp16(hdy_f);
+
+    GpuTensor X, dY;
+    brotensor::upload_fp16(hx_h.data(),  B, two_d, X);
+    brotensor::upload_fp16(hdy_h.data(), B, D,    dY);
+
+    GpuTensor Y;
+    brotensor::geglu_exact_forward_gpu(X, Y);
+    CHECK(Y.rows == B && Y.cols == D && Y.dtype == Dtype::FP16);
+    std::vector<uint16_t> gotY_h(B * D);
+    brotensor::download_fp16(Y, gotY_h.data());
+    brotensor::cuda_sync();
+    float max_err_fwd = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        for (int d = 0; d < D; ++d) {
+            const float a  = brotensor::fp16_bits_to_fp32(hx_h[b * two_d + d]);
+            const float bh = brotensor::fp16_bits_to_fp32(hx_h[b * two_d + D + d]);
+            const float r  = a * gelu_exact_ref(bh);
+            const float g  = brotensor::fp16_bits_to_fp32(gotY_h[b * D + d]);
+            const float e  = std::fabs(g - r);
+            if (e > max_err_fwd) max_err_fwd = e;
+            CHECK(e < 1e-2f + 1e-2f * std::fabs(r));
+        }
+    }
+    std::printf("    fwd max_err=%g\n", max_err_fwd);
+
+    GpuTensor dX;
+    brotensor::geglu_exact_backward_gpu(X, dY, dX);
+    CHECK(dX.rows == B && dX.cols == two_d && dX.dtype == Dtype::FP16);
+    std::vector<uint16_t> got_h(B * two_d);
+    brotensor::download_fp16(dX, got_h.data());
+    brotensor::cuda_sync();
+    float max_err_bwd = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        for (int d = 0; d < D; ++d) {
+            const float a   = brotensor::fp16_bits_to_fp32(hx_h[b * two_d + d]);
+            const float bh  = brotensor::fp16_bits_to_fp32(hx_h[b * two_d + D + d]);
+            const float dy  = brotensor::fp16_bits_to_fp32(hdy_h[b * D + d]);
+            const float dA  = dy * gelu_exact_ref(bh);
+            const float dBh = dy * a * gelu_exact_grad_ref(bh);
+            const float ga  = brotensor::fp16_bits_to_fp32(got_h[b * two_d + d]);
+            const float gb  = brotensor::fp16_bits_to_fp32(got_h[b * two_d + D + d]);
+            const float ea  = std::fabs(ga - dA);
+            const float eb  = std::fabs(gb - dBh);
+            if (ea > max_err_bwd) max_err_bwd = ea;
+            if (eb > max_err_bwd) max_err_bwd = eb;
+            CHECK(ea < 1e-2f + 1e-2f * std::fabs(dA));
+            CHECK(eb < 1e-2f + 1e-2f * std::fabs(dBh));
+        }
+    }
+    std::printf("    bwd max_err=%g\n", max_err_bwd);
+}
+
 static void test_geglu_fp16_bwd() {
     std::printf("  geglu fp16 bwd\n");
     const int B = 3, D = 9;
@@ -321,6 +452,8 @@ int main() {
     test_flash_causal();
     test_geglu_fp32();
     test_geglu_fp16_bwd();
+    test_geglu_exact_fp32();
+    test_geglu_exact_fp16();
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);

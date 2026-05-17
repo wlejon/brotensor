@@ -656,6 +656,26 @@ void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y);
 // dtype-set to match x if mis-shaped/-typed. dX may alias dY.
 void gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX);
 
+// Exact GELU (erf formulation, matches PyTorch `torch.nn.functional.gelu`
+// with default `approximate="none"` and HuggingFace `diffusers`' default):
+//   y = 0.5 * x * (1 + erf(x / sqrt(2)))
+// This is the *exact* Gaussian-CDF GELU, distinct from the tanh-approximation
+// `gelu_forward_gpu`. Provided as a separate op so downstream call sites
+// (e.g. brodiffusion's UNet GEGLU FFNs) can swap activations without
+// disturbing the existing tanh-approx path. FP32 and FP16 variants dispatched
+// on x.dtype (FP16 accumulates in FP32). y resized AND dtype-set to match x
+// if mis-shaped/-typed. x and y may alias.
+void gelu_exact_forward_gpu(const GpuTensor& x, GpuTensor& y);
+
+// Exact-GELU backward. Reads the raw forward input x.
+//   dy/dx = 0.5 * (1 + erf(x/√2)) + (x / √(2π)) * exp(-x²/2)
+//         = 0.5 * (1 + erf(x/√2)) + x * φ(x)
+//   dX[i] = dY[i] * dy/dx
+// FP32 and FP16 dispatch on x.dtype (FP16 accumulates in FP32). dX resized AND
+// dtype-set to match x if mis-shaped/-typed. dX may alias dY.
+void gelu_exact_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
+                             GpuTensor& dX);
+
 // QuickGELU: y = x * sigmoid(1.702 * x). Matches OpenAI CLIP's activation
 // (used in SD1.5's CLIP ViT-L/14 text encoder). FP32 and FP16 variants
 // dispatched on x.dtype. y resized to match x.shape AND x.dtype if
@@ -767,6 +787,26 @@ void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y);
 // in FP32). dX is resized AND dtype-set to match X if mis-shaped/-typed.
 void geglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
                         GpuTensor& dX);
+
+// Exact-GELU GEGLU activation: same shape contract as `geglu_forward_gpu`
+// (input (B, 2*D) split along last dim into A=(B, D) and B_half=(B, D),
+// output (B, D) = A * gelu_exact(B_half)), but uses the exact erf-based
+// GELU instead of the tanh approximation. Matches HuggingFace `diffusers`'
+// default GEGLU. FP32 and FP16 dispatched on X.dtype (FP16 accumulates in
+// FP32).
+//   X:  (B, 2*D)  input
+//   Y:  (B, D)    output, resized AND dtype-set to match X if mis-shaped/-typed.
+void geglu_exact_forward_gpu(const GpuTensor& X, GpuTensor& Y);
+
+// Exact-GELU GEGLU backward. Splits X into A and B_half (each (B, D)). Let
+// g = gelu_exact(B_half).
+//   dA      = dY * g
+//   dB_half = dY * A * gelu_exact'(B_half)   (see gelu_exact_backward_gpu)
+// dX = concat(dA, dB_half) along the last dim, layout matches the forward
+// (A then B_half). FP32 and FP16 dispatch on X.dtype (FP16 accumulates in
+// FP32). dX is resized AND dtype-set to match X if mis-shaped/-typed.
+void geglu_exact_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
+                              GpuTensor& dX);
 
 // Causal mask helper for transformer self-attention. Produces an (L, L)
 // FP32 mask where mask[q*L + k] = (k <= q) ? 1.0f : 0.0f. The existing

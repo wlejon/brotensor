@@ -302,6 +302,152 @@ static void run_qkvo_rect_ctx(const char* label, int Lq, int Lk, int D,
     check_fp16(got, O_ref, label);
 }
 
+// Self-attention QKVO compared against a CPU reference (not against
+// cross_attention_forward_gpu, which itself dispatches to flash for FP16 —
+// that would be flash-vs-flash). Square weights, no context tensor.
+static void run_qkvo_self_cpu(const char* label, int Lq, int D, int nh) {
+    std::printf("  %s qkvo self-vs-cpu Lq=%d D=%d nh=%d\n", label, Lq, D, nh);
+    std::mt19937 rng(0xA5A5);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    std::vector<float> X(Lq*D);
+    std::vector<float> Wq(D*D), Wk(D*D), Wv(D*D), Wo(D*D);
+    auto fill = [&](std::vector<float>& v) { for (auto& x : v) x = dist(rng); };
+    fill(X); fill(Wq); fill(Wk); fill(Wv); fill(Wo);
+
+    auto Xq = rq(X);
+    auto Wqq = rq(Wq), Wkq = rq(Wk), Wvq = rq(Wv), Woq = rq(Wo);
+
+    auto proj = [](const std::vector<float>& A, const std::vector<float>& W,
+                   int M, int Kin, int Nout, std::vector<float>& Out) {
+        Out.assign(static_cast<size_t>(M) * Nout, 0.0f);
+        for (int m = 0; m < M; ++m)
+            for (int n = 0; n < Nout; ++n) {
+                double s = 0.0;
+                for (int k = 0; k < Kin; ++k)
+                    s += static_cast<double>(A[m*Kin + k]) * W[n*Kin + k];
+                Out[m*Nout + n] = static_cast<float>(s);
+            }
+    };
+    std::vector<float> Qp, Kp, Vp, Op, O_ref;
+    proj(Xq, Wqq, Lq, D, D, Qp);
+    proj(Xq, Wkq, Lq, D, D, Kp);
+    proj(Xq, Wvq, Lq, D, D, Vp);
+    attn_qkv_cpu(Qp, Kp, Vp, nullptr, Lq, Lq, D, nh, Op);
+    proj(Op, Woq, Lq, D, D, O_ref);
+
+    GpuTensor Xg, Wqg, Wkg, Wvg, Wog;
+    auto Xh = to_fp16(X);
+    auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
+    brotensor::upload_fp16(Xh.data(),  Lq, D, Xg);
+    brotensor::upload_fp16(Wqh.data(), D, D, Wqg);
+    brotensor::upload_fp16(Wkh.data(), D, D, Wkg);
+    brotensor::upload_fp16(Wvh.data(), D, D, Wvg);
+    brotensor::upload_fp16(Woh.data(), D, D, Wog);
+
+    GpuTensor Og;
+    brotensor::flash_attention_qkvo_forward_gpu(Xg, nullptr,
+                                                Wqg, nullptr, Wkg, nullptr,
+                                                Wvg, nullptr, Wog, nullptr,
+                                                nullptr, nh, /*causal=*/false, Og);
+    std::vector<uint16_t> got(Og.size());
+    brotensor::download_fp16(Og, got.data());
+    brotensor::cuda_sync();
+    check_fp16(got, O_ref, label);
+}
+
+// Causal self-attention with all four biases — CLIP text encoder shape.
+static void run_qkvo_causal(const char* label, int L, int D, int nh) {
+    std::printf("  %s qkvo causal+biases L=%d D=%d nh=%d\n", label, L, D, nh);
+    std::mt19937 rng(0xC11C);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    std::vector<float> X(L*D);
+    std::vector<float> Wq(D*D), Wk(D*D), Wv(D*D), Wo(D*D);
+    std::vector<float> bq(D), bk(D), bv(D), bo(D);
+    auto fill = [&](std::vector<float>& v) { for (auto& x : v) x = dist(rng); };
+    fill(X);
+    fill(Wq); fill(Wk); fill(Wv); fill(Wo);
+    fill(bq); fill(bk); fill(bv); fill(bo);
+
+    auto Xq = rq(X);
+    auto Wqq = rq(Wq), Wkq = rq(Wk), Wvq = rq(Wv), Woq = rq(Wo);
+    auto bqq = rq(bq), bkq = rq(bk), bvq = rq(bv), boq = rq(bo);
+
+    auto proj = [](const std::vector<float>& A, const std::vector<float>& W,
+                   const std::vector<float>& b, int M, int Dim,
+                   std::vector<float>& Out) {
+        Out.assign(static_cast<size_t>(M) * Dim, 0.0f);
+        for (int m = 0; m < M; ++m)
+            for (int n = 0; n < Dim; ++n) {
+                double s = b[n];
+                for (int k = 0; k < Dim; ++k)
+                    s += static_cast<double>(A[m*Dim + k]) * W[n*Dim + k];
+                Out[m*Dim + n] = static_cast<float>(s);
+            }
+    };
+    std::vector<float> Qp, Kp, Vp;
+    proj(Xq, Wqq, bqq, L, D, Qp);
+    proj(Xq, Wkq, bkq, L, D, Kp);
+    proj(Xq, Wvq, bvq, L, D, Vp);
+
+    // Causal attention CPU reference: same as attn_qkv_cpu but k > q is masked.
+    const int hd = D / nh;
+    const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
+    std::vector<float> Op(static_cast<size_t>(L) * D, 0.0f);
+    std::vector<float> scores(L);
+    for (int q = 0; q < L; ++q) {
+        for (int h = 0; h < nh; ++h) {
+            const int off = h * hd;
+            float maxv = -1e30f;
+            for (int k = 0; k <= q; ++k) {
+                double dot = 0.0;
+                for (int d = 0; d < hd; ++d)
+                    dot += static_cast<double>(Qp[q*D + off + d]) * Kp[k*D + off + d];
+                float s = static_cast<float>(dot) * inv_sqrt;
+                scores[k] = s;
+                if (s > maxv) maxv = s;
+            }
+            float sum = 0.0f;
+            for (int k = 0; k <= q; ++k) {
+                scores[k] = std::exp(scores[k] - maxv);
+                sum += scores[k];
+            }
+            const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+            for (int d = 0; d < hd; ++d) {
+                double a = 0.0;
+                for (int k = 0; k <= q; ++k)
+                    a += static_cast<double>(scores[k]) * inv * Vp[k*D + off + d];
+                Op[q*D + off + d] = static_cast<float>(a);
+            }
+        }
+    }
+    std::vector<float> O_ref;
+    proj(Op, Woq, boq, L, D, O_ref);
+
+    GpuTensor Xg, Wqg, Wkg, Wvg, Wog, bqg, bkg, bvg, bog;
+    auto Xh = to_fp16(X);
+    auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
+    auto bqh = to_fp16(bq), bkh = to_fp16(bk), bvh = to_fp16(bv), boh = to_fp16(bo);
+    brotensor::upload_fp16(Xh.data(),  L, D, Xg);
+    brotensor::upload_fp16(Wqh.data(), D, D, Wqg);
+    brotensor::upload_fp16(Wkh.data(), D, D, Wkg);
+    brotensor::upload_fp16(Wvh.data(), D, D, Wvg);
+    brotensor::upload_fp16(Woh.data(), D, D, Wog);
+    brotensor::upload_fp16(bqh.data(), D, 1, bqg);
+    brotensor::upload_fp16(bkh.data(), D, 1, bkg);
+    brotensor::upload_fp16(bvh.data(), D, 1, bvg);
+    brotensor::upload_fp16(boh.data(), D, 1, bog);
+
+    GpuTensor Og;
+    brotensor::flash_attention_qkvo_forward_gpu(Xg, nullptr,
+                                                Wqg, &bqg, Wkg, &bkg,
+                                                Wvg, &bvg, Wog, &bog,
+                                                nullptr, nh, /*causal=*/true, Og);
+    std::vector<uint16_t> got(Og.size());
+    brotensor::download_fp16(Og, got.data());
+    brotensor::cuda_sync();
+    check_fp16(got, O_ref, label);
+}
+
 static void run_stress() {
     // Lk = 8192 is too big for the dynamic-shmem cross-attention but fine for
     // flash. We can't compare against CPU full-precision reasonably at this
@@ -351,6 +497,20 @@ int main() {
     run_qkvo_with_biases("qkvo biases", 6, 7, 32, 4);
     run_qkvo_rect_ctx("qkvo rect-ctx",   8, 11, 32, 24, 4);
     run_qkvo_rect_ctx("qkvo SD1.5-like", 16, 77, 64, 48, 4);
+
+    // SD1.5 U-Net cross-attention (Lk=77 CLIP, D_ctx=768, nh=8).
+    run_qkvo_rect_ctx("SD1.5 xattn s1 hd40",  16, 77, 320,  768, 8);
+    run_qkvo_rect_ctx("SD1.5 xattn s2 hd80",  16, 77, 640,  768, 8);
+    run_qkvo_rect_ctx("SD1.5 xattn s3 hd160",  8, 77, 1280, 768, 8);
+
+    // SD1.5 U-Net self-attention (square, no Ctx) vs CPU reference.
+    run_qkvo_self_cpu("SD1.5 selfattn s1 hd40",  16, 320,  8);
+    run_qkvo_self_cpu("SD1.5 selfattn s2 hd80",  16, 640,  8);
+    run_qkvo_self_cpu("SD1.5 selfattn s3 hd160",  8, 1280, 8);
+
+    // CLIP text encoder: D=768, nh=12 → hd=64, causal, all four biases.
+    run_qkvo_causal("clip text", 77, 768, 12);
+
     run_stress();
 
     if (g_failures > 0) {

@@ -38,8 +38,10 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | linear | ✓ | ✓ | ✓ | dense; FP32 single + batched (fwd/bwd), FP16 batched-inference |
 | relu / tanh / sigmoid | ✓ | ✓ | — | elementwise; relu/tanh also have batched fwd+bwd |
 | silu / gelu | ✓ | ✓ | ✓ | tanh-approx GELU; dtype-dispatched (FP16 bwd accumulates in FP32) |
+| gelu_exact | ✓ | ✓ | ✓ | `0.5*x*(1+erf(x/√2))`, exact PyTorch/diffusers default |
 | quick_gelu | ✓ | ✓ | ✓ | `x * sigmoid(1.702*x)`, OpenAI CLIP activation |
 | geglu | ✓ | ✓ | ✓ | gated GELU (SD FFN); FP32+FP16 fwd/bwd, dtype-dispatched |
+| geglu_exact | ✓ | ✓ | ✓ | gated exact-GELU FFN, matches diffusers GEGLU |
 | add / scale / mul_inplace | ✓ | n/a | ✓ | dtype-dispatched |
 | clamp | ✓ | n/a | ✓ | in-place min/max, dtype-dispatched (VAE epilogue) |
 | build_slot_mask | ✓ | n/a | — | device-side validity mask construction |
@@ -51,7 +53,7 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | self_attention | ✓ | ✓ | ✓ | FP32 = training (caches exposed via `_train`); FP16 = flash inference |
 | cross_attention | ✓ | ✓ | ✓ | FP32 = training (caches exposed via `_train`, rectangular Wk/Wv); FP16 = flash inference |
 | flash_attention | — | — | ✓ | tiled online-softmax, Lk-unbounded, optional causal |
-| flash_attention_qkvo | — | — | ✓ | fused Q/K/V/O projections + biases; rectangular Wk/Wv for cross-attn; optional causal |
+| flash_attention_qkvo | — | — | ✓ | fused Q/K/V/O projections + biases; rectangular Wk/Wv for cross-attn; optional causal; verified at SD1.5 U-Net head_dims (40/80/160) and CLIP head_dim 64 |
 | resblock | — | — | ✓ | fused diffusion ResBlock (GN→SiLU→conv ×2 + skip) |
 | conv2d | FP32 fwd ✓ | FP32 bwd ✓ | FP16 fwd ✓ | NCHW, groups=1, stride/pad/dil; FP32 backward (dX, dW, dB) |
 | upsample_nearest_2x | ✓ | ✓ | ✓ | backward dtype-dispatched (FP32+FP16) |

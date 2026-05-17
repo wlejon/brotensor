@@ -30,6 +30,13 @@ static float gelu_ref(float v) {
     return 0.5f * v * (1.0f + std::tanh(u));
 }
 static float quick_gelu_ref(float v) { return v / (1.0f + std::exp(-1.702f * v)); }
+static float gelu_exact_ref(float v) {
+    return 0.5f * v * (1.0f + std::erf(v * 0.70710678118f));
+}
+static float gelu_exact_grad_ref(float v) {
+    return 0.5f * (1.0f + std::erf(v * 0.70710678118f))
+         + v * std::exp(-0.5f * v * v) * 0.39894228040f;
+}
 
 static float silu_grad_ref(float v) {
     const float s = 1.0f / (1.0f + std::exp(-v));
@@ -199,6 +206,8 @@ int main() {
     test_fp16(brotensor::gelu_forward_gpu, gelu_ref, "gelu");
     test_fp32(brotensor::quick_gelu_forward_gpu, quick_gelu_ref, "quick_gelu");
     test_fp16(brotensor::quick_gelu_forward_gpu, quick_gelu_ref, "quick_gelu");
+    test_fp32(brotensor::gelu_exact_forward_gpu, gelu_exact_ref, "gelu_exact");
+    test_fp16(brotensor::gelu_exact_forward_gpu, gelu_exact_ref, "gelu_exact");
 
     test_bwd_fp32(brotensor::silu_backward_gpu,       silu_grad_ref,       "silu");
     test_bwd_fp16(brotensor::silu_backward_gpu,       silu_grad_ref,       "silu");
@@ -206,6 +215,8 @@ int main() {
     test_bwd_fp16(brotensor::gelu_backward_gpu,       gelu_grad_ref,       "gelu");
     test_bwd_fp32(brotensor::quick_gelu_backward_gpu, quick_gelu_grad_ref, "quick_gelu");
     test_bwd_fp16(brotensor::quick_gelu_backward_gpu, quick_gelu_grad_ref, "quick_gelu");
+    test_bwd_fp32(brotensor::gelu_exact_backward_gpu, gelu_exact_grad_ref, "gelu_exact");
+    test_bwd_fp16(brotensor::gelu_exact_backward_gpu, gelu_exact_grad_ref, "gelu_exact");
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);
