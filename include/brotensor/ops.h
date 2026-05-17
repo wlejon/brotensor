@@ -457,4 +457,98 @@ void softmax_xent_fused_batched_gpu(const GpuTensor& logits_BL,
                                     GpuTensor& dLogits_BL,
                                     GpuTensor& loss_per_sample);
 
+// ─── Diffusion / vision ops (FP16, inference-only) ─────────────────────────
+//
+// These ops are the GPU primitives needed to run a diffusion U-Net + VAE
+// end-to-end. They take FP16 tensors (X.dtype == Dtype::FP16) and produce
+// FP16 outputs. Internal accumulation is in FP32. NCHW layout: the GpuTensor
+// is treated as a flat buffer; (N, C, H, W) dimensions are passed as
+// integer arguments. Output tensors are resized (and dtype-set) by the op.
+// No backward; downstream brodiff drives these for inference only.
+
+// 2D convolution, FP16 NCHW, groups = 1.
+//   X:      (N, C_in * H * W)        input,   FP16
+//   Wt:     (C_out, C_in * kH * kW)  weights, FP16, OIHW filter layout
+//   bias:   (C_out, 1)               optional FP16 bias, may be null
+//   Y:      (N, C_out * H_out * W_out)  output, FP16; resized as needed
+// Output dims (standard PyTorch formula):
+//   H_out = (H + 2*pad_h - dil_h * (kH - 1) - 1) / stride_h + 1
+//   W_out = (W + 2*pad_w - dil_w * (kW - 1) - 1) / stride_w + 1
+void conv2d_forward_gpu(const GpuTensor& X,
+                        const GpuTensor& Wt,
+                        const GpuTensor* bias,
+                        int N, int C_in, int H, int W,
+                        int C_out, int kH, int kW,
+                        int stride_h, int stride_w,
+                        int pad_h, int pad_w,
+                        int dil_h, int dil_w,
+                        GpuTensor& Y);
+
+// GroupNorm forward, FP16 NCHW.
+//   X:     (N, C * H * W)   input,  FP16
+//   gamma: (C, 1)           per-channel scale, FP16
+//   beta:  (C, 1)           per-channel shift, FP16
+//   Y:     (N, C * H * W)   output, FP16; resized as needed
+//   num_groups must divide C. eps typically 1e-5f. Mean and variance are
+//   computed over (C/num_groups, H, W) within each (n, group) tile.
+void group_norm_forward_gpu(const GpuTensor& X,
+                            const GpuTensor& gamma,
+                            const GpuTensor& beta,
+                            int N, int C, int H, int W,
+                            int num_groups,
+                            float eps,
+                            GpuTensor& Y);
+
+// SiLU / Swish: y = x * sigmoid(x). FP32 and FP16 variants. y resized to
+// match x.shape AND x.dtype if mis-shaped/mis-typed. x and y may alias.
+void silu_forward_gpu(const GpuTensor& x, GpuTensor& y);
+
+// GELU (tanh approximation, matching PyTorch's `approximate="tanh"`):
+//   y = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
+// FP32 and FP16 variants dispatched on x.dtype.
+void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y);
+
+// 2x nearest-neighbour upsample over the spatial dims of an NCHW FP16 tensor.
+//   X: (N, C * H * W) FP16
+//   Y: (N, C * 2H * 2W) FP16; resized.
+// Each output pixel (i, j) reads X at (i/2, j/2).
+void upsample_nearest_2x_gpu(const GpuTensor& X,
+                             int N, int C, int H, int W,
+                             GpuTensor& Y);
+
+// 2x bilinear upsample with align_corners=False (PyTorch default for
+// interpolate(scale_factor=2)). NCHW FP16.
+void upsample_bilinear_2x_gpu(const GpuTensor& X,
+                              int N, int C, int H, int W,
+                              GpuTensor& Y);
+
+// 2x average-pool downsample over NCHW FP16. Stride 2, kernel 2, no padding.
+//   X: (N, C * H * W);  H and W must be even.
+//   Y: (N, C * H/2 * W/2)
+void downsample_avg_2x_gpu(const GpuTensor& X,
+                           int N, int C, int H, int W,
+                           GpuTensor& Y);
+
+// Cross-attention: like mha_forward_gpu but K and V are projected from a
+// separate context tensor instead of from X. Used in diffusion U-Nets to
+// inject text conditioning. FP16 (X, Ctx, all weights, O).
+//
+//   X:    (Lq, D)  query input (image tokens)
+//   Ctx:  (Lk, D)  key/value input (text tokens). Lk may differ from Lq.
+//   Wq, Wk, Wv, Wo: each (D, D), FP16. Wq projects X; Wk,Wv project Ctx.
+//   d_mask: optional FP32 mask of length Lk (1 valid, 0 invalid). May be
+//           null. Same softmax-mask semantics as self-attention.
+//   num_heads: must divide D.
+//   O:    (Lq, D) output, FP16. Resized if mis-shaped.
+//
+// Caches Qh/Kh/Vh/Attnh/Yconcat are *not* exposed — this is inference-only;
+// pass scratch GpuTensors if you want them surfaced.
+void cross_attention_forward_gpu(const GpuTensor& X,
+                                 const GpuTensor& Ctx,
+                                 const GpuTensor& Wq, const GpuTensor& Wk,
+                                 const GpuTensor& Wv, const GpuTensor& Wo,
+                                 const float* d_mask,
+                                 int num_heads,
+                                 GpuTensor& O);
+
 } // namespace brotensor
