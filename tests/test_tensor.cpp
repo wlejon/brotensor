@@ -8,6 +8,7 @@
 #include <brotensor/ops.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -98,6 +99,77 @@ static void test_relu_smoke() {
     CHECK(host_out[4] == 7.0f);
 }
 
+static void test_fp16_host_conversion() {
+    std::printf("test_fp16_host_conversion\n");
+    // Exact representables.
+    CHECK(brotensor::fp32_to_fp16_bits(0.0f) == 0x0000);
+    CHECK(brotensor::fp32_to_fp16_bits(-0.0f) == 0x8000);
+    CHECK(brotensor::fp32_to_fp16_bits(1.0f) == 0x3C00);
+    CHECK(brotensor::fp32_to_fp16_bits(-1.0f) == 0xBC00);
+    CHECK(brotensor::fp32_to_fp16_bits(2.0f) == 0x4000);
+    CHECK(brotensor::fp16_bits_to_fp32(0x3C00) == 1.0f);
+    CHECK(brotensor::fp16_bits_to_fp32(0x4000) == 2.0f);
+    CHECK(brotensor::fp16_bits_to_fp32(0xBC00) == -1.0f);
+
+    // Round-trip a spread of values; FP16 has ~3 decimal digits.
+    const float samples[] = {0.5f, 0.25f, -3.5f, 12.5f, 100.0f, 0.001f};
+    for (float v : samples) {
+        const uint16_t bits = brotensor::fp32_to_fp16_bits(v);
+        const float back = brotensor::fp16_bits_to_fp32(bits);
+        const float relerr = std::fabs(back - v) / std::fabs(v);
+        CHECK(relerr < 1e-2f);
+    }
+}
+
+static void test_fp16_round_trip() {
+    std::printf("test_fp16_round_trip\n");
+    const float src_f32[] = {1.0f, -2.5f, 3.25f, 0.0f, 7.0f, -0.125f};
+    std::vector<uint16_t> host_in(6);
+    for (int i = 0; i < 6; ++i) {
+        host_in[i] = brotensor::fp32_to_fp16_bits(src_f32[i]);
+    }
+    GpuTensor g;
+    brotensor::upload_fp16(host_in.data(), 2, 3, g);
+    CHECK(g.rows == 2 && g.cols == 3);
+    CHECK(g.dtype == brotensor::Dtype::FP16);
+    CHECK(g.bytes() == 12);
+
+    std::vector<uint16_t> host_out(6, 0);
+    brotensor::download_fp16(g, host_out.data());
+    brotensor::cuda_sync();
+    for (int i = 0; i < 6; ++i) {
+        CHECK(host_in[i] == host_out[i]);
+    }
+
+    // Clone preserves dtype.
+    GpuTensor g2 = g.clone();
+    CHECK(g2.dtype == brotensor::Dtype::FP16);
+    CHECK(g2.bytes() == 12);
+    std::vector<uint16_t> host_out2(6, 0);
+    brotensor::download_fp16(g2, host_out2.data());
+    brotensor::cuda_sync();
+    for (int i = 0; i < 6; ++i) {
+        CHECK(host_in[i] == host_out2[i]);
+    }
+}
+
+static void test_fp16_resize_and_zero() {
+    std::printf("test_fp16_resize_and_zero\n");
+    GpuTensor g(4, 4, brotensor::Dtype::FP16);
+    CHECK(g.dtype == brotensor::Dtype::FP16);
+    CHECK(g.bytes() == 32);
+    g.zero();
+    std::vector<uint16_t> host_out(16, 0xFFFF);
+    brotensor::download_fp16(g, host_out.data());
+    brotensor::cuda_sync();
+    for (int i = 0; i < 16; ++i) CHECK(host_out[i] == 0);
+
+    // Switch dtype back to FP32 via resize.
+    g.resize(2, 2, brotensor::Dtype::FP32);
+    CHECK(g.dtype == brotensor::Dtype::FP32);
+    CHECK(g.bytes() == 16);
+}
+
 int main() {
     try {
         brotensor::cuda_init();
@@ -110,6 +182,9 @@ int main() {
     test_round_trip();
     test_clone();
     test_relu_smoke();
+    test_fp16_host_conversion();
+    test_fp16_round_trip();
+    test_fp16_resize_and_zero();
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);
