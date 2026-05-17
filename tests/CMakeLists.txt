@@ -17,3 +17,4 @@ endfunction()
 
 brotensor_add_test(brotensor_test test_tensor.cpp)
 brotensor_add_test(brotensor_test_conv2d test_conv2d.cpp)
+brotensor_add_test(brotensor_test_group_norm test_group_norm.cpp)
