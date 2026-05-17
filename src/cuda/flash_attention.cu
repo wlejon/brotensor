@@ -235,10 +235,10 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
         throw std::runtime_error("flash_attention_qkvo_forward_gpu: Ctx must be FP16");
     }
     const int Lk = kv_src.rows;
-    if (kv_src.cols != D ||
-        Wq.rows != D || Wq.cols != D ||
-        Wk.rows != D || Wk.cols != D ||
-        Wv.rows != D || Wv.cols != D ||
+    const int D_ctx = kv_src.cols;
+    if (Wq.rows != D || Wq.cols != D ||
+        Wk.rows != D || Wk.cols != D_ctx ||
+        Wv.rows != D || Wv.cols != D_ctx ||
         Wo.rows != D || Wo.cols != D) {
         throw std::runtime_error("flash_attention_qkvo_forward_gpu: shape mismatch");
     }

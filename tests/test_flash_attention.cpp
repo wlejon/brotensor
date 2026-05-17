@@ -244,6 +244,64 @@ static void run_qkvo_with_biases(const char* label, int Lq, int Lk, int D, int n
     check_fp16(got, O_ref, label);
 }
 
+// Cross-attention with rectangular Wk/Wv: Ctx has a different width than X
+// (the SD1.5 case — Q from image tokens at D, K/V from CLIP text tokens at
+// D_ctx=768). Verifies the shape-check relaxation accepts Wk/Wv as
+// (D, D_ctx) and the projection math matches a CPU reference.
+static void run_qkvo_rect_ctx(const char* label, int Lq, int Lk, int D,
+                              int D_ctx, int nh) {
+    std::printf("  %s qkvo rect-ctx Lq=%d Lk=%d D=%d D_ctx=%d nh=%d\n",
+                label, Lq, Lk, D, D_ctx, nh);
+    std::mt19937 rng(0xCAFEBABE);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    std::vector<float> X(Lq*D), Ctx(Lk*D_ctx);
+    std::vector<float> Wq(D*D), Wk(D*D_ctx), Wv(D*D_ctx), Wo(D*D);
+    auto fill = [&](std::vector<float>& v) { for (auto& x : v) x = dist(rng); };
+    fill(X); fill(Ctx); fill(Wq); fill(Wk); fill(Wv); fill(Wo);
+
+    auto Xq = rq(X), Ctxq = rq(Ctx);
+    auto Wqq = rq(Wq), Wkq = rq(Wk), Wvq = rq(Wv), Woq = rq(Wo);
+
+    // CPU reference: rectangular projection for K/V.
+    auto proj = [](const std::vector<float>& A, const std::vector<float>& W,
+                   int M, int Kin, int Nout, std::vector<float>& Out) {
+        Out.assign(static_cast<size_t>(M) * Nout, 0.0f);
+        for (int m = 0; m < M; ++m)
+            for (int n = 0; n < Nout; ++n) {
+                double s = 0.0;
+                for (int k = 0; k < Kin; ++k)
+                    s += static_cast<double>(A[m*Kin + k]) * W[n*Kin + k];
+                Out[m*Nout + n] = static_cast<float>(s);
+            }
+    };
+    std::vector<float> Qp, Kp, Vp, Op, O_ref;
+    proj(Xq,   Wqq, Lq, D,     D, Qp);
+    proj(Ctxq, Wkq, Lk, D_ctx, D, Kp);
+    proj(Ctxq, Wvq, Lk, D_ctx, D, Vp);
+    attn_qkv_cpu(Qp, Kp, Vp, nullptr, Lq, Lk, D, nh, Op);
+    proj(Op, Woq, Lq, D, D, O_ref);
+
+    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
+    auto Xh = to_fp16(X), Ch = to_fp16(Ctx);
+    auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
+    brotensor::upload_fp16(Xh.data(),  Lq, D,     Xg);
+    brotensor::upload_fp16(Ch.data(),  Lk, D_ctx, Cg);
+    brotensor::upload_fp16(Wqh.data(), D, D,     Wqg);
+    brotensor::upload_fp16(Wkh.data(), D, D_ctx, Wkg);
+    brotensor::upload_fp16(Wvh.data(), D, D_ctx, Wvg);
+    brotensor::upload_fp16(Woh.data(), D, D,     Wog);
+
+    GpuTensor Og;
+    brotensor::flash_attention_qkvo_forward_gpu(Xg, &Cg,
+                                                Wqg, nullptr, Wkg, nullptr,
+                                                Wvg, nullptr, Wog, nullptr,
+                                                nullptr, nh, /*causal=*/false, Og);
+    std::vector<uint16_t> got(Og.size());
+    brotensor::download_fp16(Og, got.data());
+    brotensor::cuda_sync();
+    check_fp16(got, O_ref, label);
+}
+
 static void run_stress() {
     // Lk = 8192 is too big for the dynamic-shmem cross-attention but fine for
     // flash. We can't compare against CPU full-precision reasonably at this
@@ -291,6 +349,8 @@ int main() {
     run_qkvo("qkvo small", 6, 7, 32, 4);
     run_qkvo("qkvo self",  8, 8, 32, 4);
     run_qkvo_with_biases("qkvo biases", 6, 7, 32, 4);
+    run_qkvo_rect_ctx("qkvo rect-ctx",   8, 11, 32, 24, 4);
+    run_qkvo_rect_ctx("qkvo SD1.5-like", 16, 77, 64, 48, 4);
     run_stress();
 
     if (g_failures > 0) {

@@ -669,10 +669,16 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
 // X → Q, Ctx → K, V (or X → Q,K,V when Ctx == nullptr), runs the tiled
 // attention core, then projects the output with Wo. FP16 throughout.
 //
-//   X:   (Lq, D)        FP16, query source
-//   Ctx: (Lk, D) or null  FP16, key/value source; null means self-attention
-//                          (Ctx ← X, Lk ← Lq).
-//   Wq, Wk, Wv, Wo: each (D, D)  FP16
+//   X:   (Lq, D)            FP16, query source
+//   Ctx: (Lk, D_ctx) or null  FP16, key/value source; null means
+//                              self-attention (Ctx ← X, Lk ← Lq, D_ctx ← D).
+//                              D_ctx may differ from D — e.g. SD1.5
+//                              cross-attention has D_ctx = 768 (CLIP) while
+//                              D varies per U-Net stage.
+//   Wq: (D, D)              FP16 — projects X → Q
+//   Wk: (D, D_ctx)          FP16 — projects Ctx → K
+//   Wv: (D, D_ctx)          FP16 — projects Ctx → V
+//   Wo: (D, D)              FP16 — projects attn output → O
 //   bq, bk, bv, bo: optional (D, 1) FP16 biases for the corresponding
 //                   projection. Pass nullptr to skip. SD1.5 CLIP attention
 //                   has all four; UNet/VAE attention typically has only bo.
