@@ -19,7 +19,7 @@ void cross_attention_forward_gpu(const GpuTensor& X,
                                  int num_heads,
                                  GpuTensor& O) {
     flash_attention_qkvo_forward_gpu(X, &Ctx, Wq, Wk, Wv, Wo,
-                                     d_mask, num_heads, O);
+                                     d_mask, num_heads, /*causal=*/false, O);
 }
 
 void self_attention_forward_gpu(const GpuTensor& X,
@@ -29,7 +29,7 @@ void self_attention_forward_gpu(const GpuTensor& X,
                                 int num_heads,
                                 GpuTensor& O) {
     flash_attention_qkvo_forward_gpu(X, nullptr, Wq, Wk, Wv, Wo,
-                                     d_mask, num_heads, O);
+                                     d_mask, num_heads, /*causal=*/false, O);
 }
 
 } // namespace brotensor
