@@ -76,82 +76,6 @@ __global__ void gn_silu_fused_kernel(const __half* __restrict__ X,
     }
 }
 
-// 3x3 same-padding conv. Matches the public conv2d kernel but with skip
-// added (optionally) in the epilogue. `skip_X` is either:
-//   - null     → plain conv (Y = conv(X, W, b))
-//   - non-null → Y = conv(X, W, b) + skip_X     (channelwise NCHW broadcast,
-//                                                 same shape as Y)
-// `t_shift_C` is an optional per-channel-or-(N,C) additive shift added before
-// the skip add (used only on the *first* conv of a ResBlock if we ever fold
-// the t-shift into the conv — currently we keep the t-shift fusion in a
-// separate kernel for clarity).
-__global__ void conv3x3_same_add_kernel(
-        const __half* __restrict__ X,
-        const __half* __restrict__ W,
-        const __half* __restrict__ bias,   // may be null
-        const __half* __restrict__ skip,   // may be null; shape == Y
-        __half* __restrict__ Y,
-        int N, int C_in, int C_out, int H, int Wd) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = N * C_out * H * Wd;
-    if (idx >= total) return;
-    const int ow = idx % Wd;
-    int t = idx / Wd;
-    const int oh = t % H;
-    t /= H;
-    const int oc = t % C_out;
-    const int n  = t / C_out;
-
-    float acc = 0.0f;
-    const int w_oc_base = oc * C_in * 9;
-    const int x_n_base  = n * C_in * H * Wd;
-    for (int ic = 0; ic < C_in; ++ic) {
-        const int w_ic_base = w_oc_base + ic * 9;
-        const int x_ic_base = x_n_base + ic * H * Wd;
-        #pragma unroll
-        for (int kh = 0; kh < 3; ++kh) {
-            const int in_h = oh + kh - 1;
-            if (in_h < 0 || in_h >= H) continue;
-            #pragma unroll
-            for (int kw = 0; kw < 3; ++kw) {
-                const int in_w = ow + kw - 1;
-                if (in_w < 0 || in_w >= Wd) continue;
-                const float xv = __half2float(X[x_ic_base + in_h * Wd + in_w]);
-                const float wv = __half2float(W[w_ic_base + kh * 3 + kw]);
-                acc += xv * wv;
-            }
-        }
-    }
-    if (bias) acc += __half2float(bias[oc]);
-    if (skip) acc += __half2float(skip[idx]);
-    Y[idx] = __float2half(acc);
-}
-
-// 1x1 conv for the skip path when C_in != C_out. One thread per output
-// element. Acts like a per-pixel linear layer.
-__global__ void conv1x1_kernel(const __half* __restrict__ X,
-                               const __half* __restrict__ W,
-                               const __half* __restrict__ bias, // may be null
-                               __half* __restrict__ Y,
-                               int N, int C_in, int C_out, int spatial) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = N * C_out * spatial;
-    if (idx >= total) return;
-    const int s  = idx % spatial;
-    int t = idx / spatial;
-    const int oc = t % C_out;
-    const int n  = t / C_out;
-    float acc = 0.0f;
-    const int w_base = oc * C_in;
-    const int x_n_base = n * C_in * spatial;
-    for (int ic = 0; ic < C_in; ++ic) {
-        acc += __half2float(X[x_n_base + ic * spatial + s]) *
-               __half2float(W[w_base + ic]);
-    }
-    if (bias) acc += __half2float(bias[oc]);
-    Y[idx] = __float2half(acc);
-}
-
 // Add a per-(N, C) or per-(C) shift to an NCHW activation in place.
 //   shift: (N, C) row-major if has_N == true, else (C,) broadcast across N.
 //   spatial: H*W.
@@ -224,19 +148,14 @@ void resblock_forward_gpu(const GpuTensor& X,
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    // Conv1: 3x3 same. No skip add in the epilogue (we still need to apply
-    // t-shift, then GN2+SiLU, then conv2 with skip).
-    {
-        const int total = N * C_out * spatial;
-        conv3x3_same_add_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK>>>(
-            reinterpret_cast<const __half*>(h1.data_fp16()),
-            reinterpret_cast<const __half*>(W1.data_fp16()),
-            b1 ? reinterpret_cast<const __half*>(b1->data_fp16()) : nullptr,
-            nullptr,
-            reinterpret_cast<__half*>(h2.data_fp16()),
-            N, C_in, C_out, H, Wd);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    }
+    // Conv1: 3x3 same. Dispatch through the public conv2d (WMMA path).
+    conv2d_forward_gpu(h1, W1, b1,
+                       N, C_in, H, Wd,
+                       C_out, 3, 3,
+                       /*stride*/1, 1,
+                       /*pad*/1, 1,
+                       /*dil*/1, 1,
+                       h2);
 
     // Optional t_emb shift: (N, C_out) or (C_out,) added channelwise.
     if (t_emb_shift) {
@@ -273,38 +192,35 @@ void resblock_forward_gpu(const GpuTensor& X,
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    // Prepare the skip tensor pointer for the conv2 epilogue.
+    // Prepare the skip tensor for the conv2 epilogue (post-conv2 add).
     GpuTensor skip_scratch;
-    const __half* skip_ptr = nullptr;
-    if (Wskip == nullptr) {
-        skip_ptr = reinterpret_cast<const __half*>(X.data_fp16());
-    } else {
+    if (Wskip != nullptr) {
         if (Wskip->dtype != Dtype::FP16) {
             throw std::runtime_error("resblock_forward_gpu: Wskip must be FP16");
         }
-        skip_scratch.resize(N, C_out * spatial, Dtype::FP16);
-        const int total = N * C_out * spatial;
-        conv1x1_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(Wskip->data_fp16()),
-            bskip ? reinterpret_cast<const __half*>(bskip->data_fp16()) : nullptr,
-            reinterpret_cast<__half*>(skip_scratch.data_fp16()),
-            N, C_in, C_out, spatial);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        skip_ptr = reinterpret_cast<const __half*>(skip_scratch.data_fp16());
+        // 1x1 conv through the public path (WMMA implicit-GEMM).
+        conv2d_forward_gpu(X, *Wskip, bskip,
+                           N, C_in, H, Wd,
+                           C_out, 1, 1,
+                           /*stride*/1, 1,
+                           /*pad*/0, 0,
+                           /*dil*/1, 1,
+                           skip_scratch);
     }
 
-    // Conv2 (3x3 same) with skip added in the epilogue.
-    {
-        const int total = N * C_out * spatial;
-        conv3x3_same_add_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK>>>(
-            reinterpret_cast<const __half*>(h3.data_fp16()),
-            reinterpret_cast<const __half*>(W2.data_fp16()),
-            b2 ? reinterpret_cast<const __half*>(b2->data_fp16()) : nullptr,
-            skip_ptr,
-            reinterpret_cast<__half*>(Y.data_fp16()),
-            N, C_out, C_out, H, Wd);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    // Conv2 (3x3 same) → Y, then fuse-in the skip via add_inplace_gpu.
+    conv2d_forward_gpu(h3, W2, b2,
+                       N, C_out, H, Wd,
+                       C_out, 3, 3,
+                       /*stride*/1, 1,
+                       /*pad*/1, 1,
+                       /*dil*/1, 1,
+                       Y);
+    if (Wskip == nullptr) {
+        // skip is X itself (C_in == C_out so shapes match).
+        add_inplace_gpu(Y, X);
+    } else {
+        add_inplace_gpu(Y, skip_scratch);
     }
 }
 
