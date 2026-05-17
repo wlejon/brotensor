@@ -8,6 +8,20 @@
 
 namespace brotensor {
 
+namespace conv2d_wmma_internal {
+// Defined in conv2d_wmma.cu. Returns true iff it consumed the call; returns
+// false if the shape isn't on the WMMA fast path and the caller should fall
+// back to the naive direct-conv kernel below.
+bool launch_conv2d_implicit_gemm_wmma(
+        const __half* X, const __half* Wt, const __half* bias, __half* Y,
+        int N, int C_in, int H, int W,
+        int C_out, int kH, int kW,
+        int stride_h, int stride_w,
+        int pad_h, int pad_w,
+        int dil_h, int dil_w,
+        int H_out, int W_out);
+}
+
 namespace {
 
 constexpr int CONV_BLOCK = 256;
@@ -244,6 +258,19 @@ void conv2d_forward_gpu(const GpuTensor& X,
         const __half* b_p  = bias ? reinterpret_cast<const __half*>(bias->data_fp16())
                                   : nullptr;
         __half* y_p        = reinterpret_cast<__half*>(Y.data_fp16());
+
+        // Try the WMMA implicit-GEMM path for the SD1.5-relevant shapes
+        // (3x3 s1 p1 d1, 1x1 s1 p0 d1, 3x3 s2 p1 d1). Falls through on
+        // failure (small problem / unsupported shape).
+        if (conv2d_wmma_internal::launch_conv2d_implicit_gemm_wmma(
+                x_p, w_p, b_p, y_p,
+                N, C_in, H, W, C_out, kH, kW,
+                stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                H_out, W_out)) {
+            BROTENSOR_CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+
         conv2d_forward_kernel<__half><<<blocks, CONV_BLOCK>>>(
             x_p, w_p, b_p, y_p,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,

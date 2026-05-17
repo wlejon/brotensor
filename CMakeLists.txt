@@ -90,6 +90,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/mha.cu
         src/cuda/batched_ops.cu
         src/cuda/conv2d.cu
+        src/cuda/conv2d_wmma.cu
         src/cuda/group_norm.cu
         src/cuda/resample.cu
         src/cuda/cross_attention.cu
