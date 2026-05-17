@@ -49,6 +49,7 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | cross_attention | — | — | ✓ | thin wrapper, FP16 inference |
 | flash_attention | — | — | ✓ | tiled online-softmax, Lk-unbounded |
 | flash_attention_qkvo | — | — | ✓ | fused projections + tiled core |
+| resblock | — | — | ✓ | fused diffusion ResBlock |
 | conv2d | — | — | ✓ | NCHW, groups=1, stride/pad/dil |
 | upsample_nearest_2x | — | — | ✓ | |
 | upsample_bilinear_2x | — | — | ✓ | align_corners=False |

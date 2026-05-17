@@ -93,6 +93,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/resample.cu
         src/cuda/cross_attention.cu
         src/cuda/flash_attention.cu
+        src/cuda/resblock.cu
     )
     target_link_libraries(brotensor PUBLIC CUDA::cudart)
     target_compile_definitions(brotensor PUBLIC BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
