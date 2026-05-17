@@ -1,6 +1,8 @@
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
+#include <stdexcept>
+
 #import "internal.h"
 
 namespace brotensor {
@@ -124,6 +126,14 @@ void build_slot_mask_gpu(const GpuTensor& x, int offset, int K, int stride,
         [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:3];
         [enc setBytes:&Su length:sizeof(uint32_t) atIndex:4];
     });
+}
+
+// Metal: TODO — silu/gelu kernels not yet ported.
+void silu_forward_gpu(const GpuTensor& /*x*/, GpuTensor& /*y*/) {
+    throw std::runtime_error("brotensor::silu_forward_gpu: Metal backend not yet implemented");
+}
+void gelu_forward_gpu(const GpuTensor& /*x*/, GpuTensor& /*y*/) {
+    throw std::runtime_error("brotensor::gelu_forward_gpu: Metal backend not yet implemented");
 }
 
 } // namespace brotensor

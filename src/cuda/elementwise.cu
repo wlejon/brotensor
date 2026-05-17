@@ -2,12 +2,26 @@
 #include <brotensor/runtime.h>
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+#include <stdexcept>
 
 namespace brotensor {
 
 namespace {
 
 constexpr int EW_BLOCK = 256;
+
+__device__ inline float silu_scalar(float v) {
+    return v / (1.0f + __expf(-v));
+}
+
+__device__ inline float gelu_tanh_scalar(float v) {
+    // GELU with tanh approximation (matches PyTorch's approximate="tanh").
+    constexpr float kSqrt2OverPi = 0.7978845608f;
+    const float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
+    return 0.5f * v * (1.0f + tanhf(u));
+}
 
 __global__ void relu_forward_kernel(const float* __restrict__ x,
                                     float* __restrict__ y, int n) {
@@ -94,6 +108,38 @@ __global__ void build_slot_mask_kernel(const float* __restrict__ x,
     mask[k] = v > 0.5f ? 1.0f : 0.0f;
 }
 
+__global__ void silu_forward_fp32_kernel(const float* __restrict__ x,
+                                         float* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = silu_scalar(x[i]);
+    }
+}
+
+__global__ void silu_forward_fp16_kernel(const __half* __restrict__ x,
+                                         __half* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2half(silu_scalar(__half2float(x[i])));
+    }
+}
+
+__global__ void gelu_forward_fp32_kernel(const float* __restrict__ x,
+                                         float* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = gelu_tanh_scalar(x[i]);
+    }
+}
+
+__global__ void gelu_forward_fp16_kernel(const __half* __restrict__ x,
+                                         __half* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2half(gelu_tanh_scalar(__half2float(x[i])));
+    }
+}
+
 inline int grid_for(int n) {
     int blocks = (n + EW_BLOCK - 1) / EW_BLOCK;
     if (blocks < 1) blocks = 1;
@@ -169,6 +215,38 @@ void scale_inplace_gpu(GpuTensor& y, float s) {
     const int n = y.size();
     if (n == 0) return;
     scale_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, s, n);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void silu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
+        y.resize(x.rows, x.cols, x.dtype);
+    }
+    const int n = x.size();
+    if (n == 0) return;
+    if (x.dtype == Dtype::FP16) {
+        silu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<const __half*>(x.data_fp16()),
+            reinterpret_cast<__half*>(y.data_fp16()), n);
+    } else {
+        silu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
+        y.resize(x.rows, x.cols, x.dtype);
+    }
+    const int n = x.size();
+    if (n == 0) return;
+    if (x.dtype == Dtype::FP16) {
+        gelu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<const __half*>(x.data_fp16()),
+            reinterpret_cast<__half*>(y.data_fp16()), n);
+    } else {
+        gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
