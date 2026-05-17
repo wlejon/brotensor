@@ -1,7 +1,12 @@
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
+#include "fp16_internal.cuh"
+
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+#include <stdexcept>
 
 namespace brotensor {
 
@@ -115,6 +120,61 @@ void linear_forward_gpu(const GpuTensor& W, const GpuTensor& b,
     linear_forward_kernel<<<blocks, LF_BLOCK>>>(W.data, b.data, x.data, y.data,
                                                 out_dim, in_dim);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+// FP16 batched linear forward: Y(B, out_dim) = X(B, in_dim) @ W(out_dim, in_dim)^T
+// + optional broadcast bias. Same matmul kernel as cross-attention's matmul_ABT
+// — X is the (M=B, K=in_dim) side, W is the (N=out_dim, K=in_dim) side. Bias
+// is added in a tiny epilogue kernel.
+namespace {
+__global__ void fp16_bias_add_kernel(__half* __restrict__ Y,
+                                     const __half* __restrict__ bias,
+                                     int B, int out_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * out_dim;
+    if (idx >= total) return;
+    const int j = idx % out_dim;
+    const float yv = __half2float(Y[idx]);
+    const float bv = __half2float(bias[j]);
+    Y[idx] = __float2half(yv + bv);
+}
+} // namespace
+
+void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
+                                     const GpuTensor& X_BD, GpuTensor& Y_BD) {
+    if (W.dtype != Dtype::FP16 || X_BD.dtype != Dtype::FP16) {
+        throw std::runtime_error("linear_forward_batched_fp16_gpu: W and X must be FP16");
+    }
+    if (bias && bias->dtype != Dtype::FP16) {
+        throw std::runtime_error("linear_forward_batched_fp16_gpu: bias must be FP16");
+    }
+    const int B       = X_BD.rows;
+    const int in_dim  = X_BD.cols;
+    const int out_dim = W.rows;
+    if (W.cols != in_dim) {
+        throw std::runtime_error("linear_forward_batched_fp16_gpu: shape mismatch (W.cols != X.cols)");
+    }
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
+        Y_BD.resize(B, out_dim, Dtype::FP16);
+    }
+    if (B == 0 || out_dim == 0) return;
+
+    fp16_internal::launch_matmul_ABT(
+        reinterpret_cast<const __half*>(X_BD.data_fp16()),
+        reinterpret_cast<const __half*>(W.data_fp16()),
+        reinterpret_cast<__half*>(Y_BD.data_fp16()),
+        B, out_dim, in_dim);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+
+    if (bias && bias->size() > 0) {
+        const int total = B * out_dim;
+        const int blocks = (total + 255) / 256;
+        fp16_bias_add_kernel<<<blocks, 256>>>(
+            reinterpret_cast<__half*>(Y_BD.data_fp16()),
+            reinterpret_cast<const __half*>(bias->data_fp16()),
+            B, out_dim);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 void linear_backward_gpu(const GpuTensor& W, const GpuTensor& x,

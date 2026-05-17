@@ -261,4 +261,13 @@ void cross_attention_forward_gpu(const GpuTensor& X,
     launch_matmul_abt(Op, Wo, O, Lq, D, D);
 }
 
+void self_attention_forward_gpu(const GpuTensor& /*X*/,
+                                const GpuTensor& /*Wq*/, const GpuTensor& /*Wk*/,
+                                const GpuTensor& /*Wv*/, const GpuTensor& /*Wo*/,
+                                const float* /*d_mask*/,
+                                int /*num_heads*/,
+                                GpuTensor& /*O*/) {
+    throw std::runtime_error("brotensor::self_attention_forward_gpu: Metal backend not yet implemented");
+}
+
 } // namespace brotensor

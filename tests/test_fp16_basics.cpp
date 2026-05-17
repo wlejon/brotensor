@@ -1,0 +1,242 @@
+// CPU↔GPU parity for the FP16-gap basic ops: linear_forward_batched_fp16,
+// add_inplace/scale_inplace/mul_inplace (FP16 dispatch), concat_rows /
+// concat_batched_rows (FP16), and layernorm_forward_inference_batched_fp16.
+
+#include <brotensor/ops.h>
+#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <random>
+#include <vector>
+
+using brotensor::GpuTensor;
+using brotensor::Dtype;
+
+static int g_failures = 0;
+
+#define CHECK(cond) do {                                                    \
+    if (!(cond)) {                                                          \
+        std::printf("  FAIL  %s:%d  %s\n", __FILE__, __LINE__, #cond);      \
+        ++g_failures;                                                       \
+    }                                                                       \
+} while (0)
+
+static std::vector<uint16_t> to_fp16(const std::vector<float>& v) {
+    std::vector<uint16_t> o(v.size());
+    for (size_t i = 0; i < v.size(); ++i) o[i] = brotensor::fp32_to_fp16_bits(v[i]);
+    return o;
+}
+static std::vector<float> rq(const std::vector<float>& v) {
+    std::vector<float> o(v.size());
+    for (size_t i = 0; i < v.size(); ++i)
+        o[i] = brotensor::fp16_bits_to_fp32(brotensor::fp32_to_fp16_bits(v[i]));
+    return o;
+}
+
+static void check_fp16(const std::vector<uint16_t>& got,
+                       const std::vector<float>& ref, const char* label) {
+    CHECK(got.size() == ref.size());
+    int bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const float g = brotensor::fp16_bits_to_fp32(got[i]);
+        const float e = std::fabs(g - ref[i]);
+        if (e > max_err) max_err = e;
+        if (e > 1e-2f + 1e-2f * std::fabs(ref[i])) {
+            if (bad < 3)
+                std::printf("    %s mismatch i=%zu got=%g ref=%g err=%g\n",
+                            label, i, g, ref[i], e);
+            ++bad;
+        }
+    }
+    std::printf("    %s max_err=%g bad=%d / %zu\n", label, max_err, bad, ref.size());
+    CHECK(bad == 0);
+}
+
+static void test_linear_fp16() {
+    std::printf("  linear_forward_batched_fp16\n");
+    const int B = 5, in_dim = 11, out_dim = 7;
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> Wf(out_dim * in_dim), Bf(out_dim), Xf(B * in_dim);
+    for (auto& v : Wf) v = dist(rng);
+    for (auto& v : Bf) v = dist(rng);
+    for (auto& v : Xf) v = dist(rng);
+
+    auto Wq = rq(Wf), Bq = rq(Bf), Xq = rq(Xf);
+    std::vector<float> Ref(B * out_dim, 0.0f);
+    for (int b = 0; b < B; ++b)
+        for (int o = 0; o < out_dim; ++o) {
+            double s = Bq[o];
+            for (int k = 0; k < in_dim; ++k) s += static_cast<double>(Xq[b*in_dim+k]) * Wq[o*in_dim+k];
+            Ref[b*out_dim+o] = static_cast<float>(s);
+        }
+
+    GpuTensor W, Bb, X, Y;
+    auto Wh = to_fp16(Wf), Bh = to_fp16(Bf), Xh = to_fp16(Xf);
+    brotensor::upload_fp16(Wh.data(), out_dim, in_dim, W);
+    brotensor::upload_fp16(Bh.data(), out_dim, 1, Bb);
+    brotensor::upload_fp16(Xh.data(), B, in_dim, X);
+    brotensor::linear_forward_batched_fp16_gpu(W, &Bb, X, Y);
+    CHECK(Y.rows == B && Y.cols == out_dim && Y.dtype == Dtype::FP16);
+    std::vector<uint16_t> got(Y.size());
+    brotensor::download_fp16(Y, got.data());
+    brotensor::cuda_sync();
+    check_fp16(got, Ref, "linear");
+
+    // No-bias variant.
+    GpuTensor Y2;
+    brotensor::linear_forward_batched_fp16_gpu(W, nullptr, X, Y2);
+    std::vector<uint16_t> got2(Y2.size());
+    brotensor::download_fp16(Y2, got2.data());
+    brotensor::cuda_sync();
+    std::vector<float> Ref2 = Ref;
+    for (int b = 0; b < B; ++b)
+        for (int o = 0; o < out_dim; ++o) Ref2[b*out_dim+o] -= Bq[o];
+    check_fp16(got2, Ref2, "linear-nobias");
+}
+
+static void test_elementwise_fp16() {
+    std::printf("  elementwise fp16 (add/scale/mul inplace)\n");
+    const int N = 128;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> A(N), Bv(N);
+    for (auto& v : A)  v = dist(rng);
+    for (auto& v : Bv) v = dist(rng);
+    auto Aq = rq(A), Bq = rq(Bv);
+
+    // add
+    GpuTensor Ag, Bg;
+    auto Ah = to_fp16(A), Bh = to_fp16(Bv);
+    brotensor::upload_fp16(Ah.data(), N, 1, Ag);
+    brotensor::upload_fp16(Bh.data(), N, 1, Bg);
+    brotensor::add_inplace_gpu(Ag, Bg);
+    std::vector<uint16_t> got(N);
+    brotensor::download_fp16(Ag, got.data());
+    brotensor::cuda_sync();
+    std::vector<float> Ref(N);
+    for (int i = 0; i < N; ++i) Ref[i] = Aq[i] + Bq[i];
+    check_fp16(got, Ref, "add_inplace");
+
+    // scale (re-upload)
+    brotensor::upload_fp16(Ah.data(), N, 1, Ag);
+    brotensor::scale_inplace_gpu(Ag, 0.25f);
+    brotensor::download_fp16(Ag, got.data());
+    brotensor::cuda_sync();
+    for (int i = 0; i < N; ++i) Ref[i] = Aq[i] * 0.25f;
+    check_fp16(got, Ref, "scale_inplace");
+
+    // mul
+    brotensor::upload_fp16(Ah.data(), N, 1, Ag);
+    brotensor::mul_inplace_gpu(Ag, Bg);
+    brotensor::download_fp16(Ag, got.data());
+    brotensor::cuda_sync();
+    for (int i = 0; i < N; ++i) Ref[i] = Aq[i] * Bq[i];
+    check_fp16(got, Ref, "mul_inplace");
+}
+
+static void test_concat_fp16() {
+    std::printf("  concat_rows / concat_batched_rows fp16\n");
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> P1(13), P2(7), P3(4);
+    for (auto& v : P1) v = dist(rng);
+    for (auto& v : P2) v = dist(rng);
+    for (auto& v : P3) v = dist(rng);
+    auto P1q = rq(P1), P2q = rq(P2), P3q = rq(P3);
+
+    GpuTensor G1, G2, G3, Out;
+    auto P1h = to_fp16(P1), P2h = to_fp16(P2), P3h = to_fp16(P3);
+    brotensor::upload_fp16(P1h.data(), 13, 1, G1);
+    brotensor::upload_fp16(P2h.data(), 7, 1, G2);
+    brotensor::upload_fp16(P3h.data(), 4, 1, G3);
+    brotensor::concat_rows_gpu({&G1, &G2, &G3}, Out);
+    CHECK(Out.rows == 24 && Out.dtype == Dtype::FP16);
+    std::vector<uint16_t> got(Out.size());
+    brotensor::download_fp16(Out, got.data());
+    brotensor::cuda_sync();
+    std::vector<float> Ref;
+    for (auto v : P1q) Ref.push_back(v);
+    for (auto v : P2q) Ref.push_back(v);
+    for (auto v : P3q) Ref.push_back(v);
+    check_fp16(got, Ref, "concat_rows");
+
+    // batched: (B=3, 4) and (B=3, 2)
+    std::vector<float> A(3*4), Bv(3*2);
+    for (auto& v : A) v = dist(rng);
+    for (auto& v : Bv) v = dist(rng);
+    auto Aq = rq(A), Bq = rq(Bv);
+    GpuTensor Ag, Bg, OutB;
+    auto Ah = to_fp16(A), Bh = to_fp16(Bv);
+    brotensor::upload_fp16(Ah.data(), 3, 4, Ag);
+    brotensor::upload_fp16(Bh.data(), 3, 2, Bg);
+    brotensor::concat_batched_rows_gpu({&Ag, &Bg}, OutB);
+    CHECK(OutB.rows == 3 && OutB.cols == 6 && OutB.dtype == Dtype::FP16);
+    std::vector<uint16_t> gotB(OutB.size());
+    brotensor::download_fp16(OutB, gotB.data());
+    brotensor::cuda_sync();
+    std::vector<float> RefB(3*6);
+    for (int b = 0; b < 3; ++b) {
+        for (int j = 0; j < 4; ++j) RefB[b*6+j]     = Aq[b*4+j];
+        for (int j = 0; j < 2; ++j) RefB[b*6+4+j]   = Bq[b*2+j];
+    }
+    check_fp16(gotB, RefB, "concat_batched_rows");
+}
+
+static void test_layernorm_fp16() {
+    std::printf("  layernorm_forward_inference_batched_fp16\n");
+    const int R = 4, D = 32;
+    std::mt19937 rng(99);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> X(R*D), G(D), B(D);
+    for (auto& v : X) v = dist(rng);
+    for (auto& v : G) v = 0.5f + 0.5f * dist(rng);
+    for (auto& v : B) v = dist(rng);
+    auto Xq = rq(X), Gq = rq(G), Bq = rq(B);
+    std::vector<float> Ref(R*D);
+    const float eps = 1e-5f;
+    for (int r = 0; r < R; ++r) {
+        double s = 0.0;
+        for (int j = 0; j < D; ++j) s += Xq[r*D+j];
+        const float mean = static_cast<float>(s / D);
+        double sv = 0.0;
+        for (int j = 0; j < D; ++j) { const double d = Xq[r*D+j] - mean; sv += d * d; }
+        const float rstd = 1.0f / std::sqrt(static_cast<float>(sv/D) + eps);
+        for (int j = 0; j < D; ++j) Ref[r*D+j] = (Xq[r*D+j] - mean) * rstd * Gq[j] + Bq[j];
+    }
+    GpuTensor Xg, Gg, Bg, Yg;
+    auto Xh = to_fp16(X), Gh = to_fp16(G), Bh = to_fp16(B);
+    brotensor::upload_fp16(Xh.data(), R, D, Xg);
+    brotensor::upload_fp16(Gh.data(), 1, D, Gg);
+    brotensor::upload_fp16(Bh.data(), 1, D, Bg);
+    brotensor::layernorm_forward_inference_batched_fp16_gpu(Xg, Gg, Bg, Yg, eps);
+    CHECK(Yg.rows == R && Yg.cols == D && Yg.dtype == Dtype::FP16);
+    std::vector<uint16_t> got(Yg.size());
+    brotensor::download_fp16(Yg, got.data());
+    brotensor::cuda_sync();
+    check_fp16(got, Ref, "layernorm");
+}
+
+int main() {
+    try {
+        brotensor::cuda_init();
+    } catch (const std::exception& e) {
+        std::printf("brotensor::cuda_init failed: %s\n", e.what());
+        return 1;
+    }
+    std::printf("test_fp16_basics\n");
+    test_linear_fp16();
+    test_elementwise_fp16();
+    test_concat_fp16();
+    test_layernorm_fp16();
+    if (g_failures > 0) {
+        std::printf("\nFAILED: %d check(s)\n", g_failures);
+        return 1;
+    }
+    std::printf("\nAll FP16-basics checks passed.\n");
+    return 0;
+}

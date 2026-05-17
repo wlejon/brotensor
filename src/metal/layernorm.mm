@@ -1,6 +1,8 @@
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
+#include <stdexcept>
+
 #import "internal.h"
 
 namespace brotensor {
@@ -297,6 +299,14 @@ void layernorm_forward_inference_batched_gpu(const GpuTensor& X_RD,
         [cmd commit];
         [cmd waitUntilCompleted];
     }
+}
+
+void layernorm_forward_inference_batched_fp16_gpu(const GpuTensor& /*X_RD*/,
+                                                  const GpuTensor& /*gamma*/,
+                                                  const GpuTensor& /*beta*/,
+                                                  GpuTensor& /*Y_RD*/,
+                                                  float /*eps*/) {
+    throw std::runtime_error("brotensor::layernorm_forward_inference_batched_fp16_gpu: Metal backend not yet implemented");
 }
 
 } // namespace brotensor

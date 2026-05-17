@@ -1,6 +1,8 @@
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
+#include <stdexcept>
+
 #import "internal.h"
 
 namespace brotensor {
@@ -175,6 +177,13 @@ void linear_backward_gpu(const GpuTensor& W, const GpuTensor& x,
             [enc setBytes:&out_u length:sizeof(uint32_t) atIndex:2];
         });
     }
+}
+
+void linear_forward_batched_fp16_gpu(const GpuTensor& /*W*/,
+                                     const GpuTensor* /*bias*/,
+                                     const GpuTensor& /*X_BD*/,
+                                     GpuTensor& /*Y_BD*/) {
+    throw std::runtime_error("brotensor::linear_forward_batched_fp16_gpu: Metal backend not yet implemented");
 }
 
 } // namespace brotensor

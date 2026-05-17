@@ -35,20 +35,24 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 
 | Op | FP32 fwd | FP32 bwd | FP16 fwd | Notes |
 |---|---|---|---|---|
-| linear | ✓ | ✓ | — | dense layer |
+| linear | ✓ | ✓ | ✓ | dense layer; FP16 = batched-inference |
 | relu / tanh / sigmoid | ✓ | ✓ | — | elementwise |
 | silu / gelu | ✓ | — | ✓ | tanh-approx GELU |
+| geglu | — | — | ✓ | gated GELU (SD FFN) |
+| add/scale/mul_inplace | ✓ | n/a | ✓ | dtype-dispatched |
 | softmax | ✓ | ✓ | — | masked, numerically stable |
-| layernorm | ✓ | ✓ | — | single-vec + batched-infer |
+| layernorm | ✓ | ✓ | ✓ | FP16 = batched-infer only |
 | group_norm | — | — | ✓ | NCHW, per-group stats |
 | attention (single-head) | ✓ | ✓ | — | |
 | mha (multi-head) | ✓ | ✓ | — | |
+| self_attention | — | — | ✓ | FP16 wrapper over cross-attention |
 | cross_attention | — | — | ✓ | thin wrapper, FP16 inference |
 | conv2d | — | — | ✓ | NCHW, groups=1, stride/pad/dil |
 | upsample_nearest_2x | — | — | ✓ | |
 | upsample_bilinear_2x | — | — | ✓ | align_corners=False |
 | downsample_avg_2x | — | — | ✓ | stride 2, kernel 2 |
 | embedding lookup | ✓ | ✓ | — | |
-| concat / split | ✓ | ✓ | — | |
+| concat / split | ✓ | ✓ | ✓ | concat byte-aware (FP16 supported) |
+| build_causal_mask_row | n/a | n/a | ✓ | length-L FP32 mask, CLIP text |
 | sgd / adam | ✓ | n/a | — | optimizer steps |
 | mse / softmax-xent | ✓ | ✓ | — | per-sample + batched |

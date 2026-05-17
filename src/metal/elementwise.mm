@@ -227,4 +227,14 @@ void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
                             x, y);
 }
 
+void mul_inplace_gpu(GpuTensor& /*y*/, const GpuTensor& /*x*/) {
+    throw std::runtime_error("brotensor::mul_inplace_gpu: Metal backend not yet implemented");
+}
+void geglu_forward_gpu(const GpuTensor& /*X*/, GpuTensor& /*Y*/) {
+    throw std::runtime_error("brotensor::geglu_forward_gpu: Metal backend not yet implemented");
+}
+void build_causal_mask_row_gpu(int /*L*/, int /*q*/, GpuTensor& /*mask*/) {
+    throw std::runtime_error("brotensor::build_causal_mask_row_gpu: Metal backend not yet implemented");
+}
+
 } // namespace brotensor

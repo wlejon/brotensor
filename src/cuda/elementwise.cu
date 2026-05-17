@@ -140,6 +140,63 @@ __global__ void gelu_forward_fp16_kernel(const __half* __restrict__ x,
     }
 }
 
+__global__ void add_inplace_fp16_kernel(__half* __restrict__ y,
+                                        const __half* __restrict__ x, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float a = __half2float(y[i]);
+        const float b = __half2float(x[i]);
+        y[i] = __float2half(a + b);
+    }
+}
+
+__global__ void scale_inplace_fp16_kernel(__half* __restrict__ y, float s, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2half(__half2float(y[i]) * s);
+    }
+}
+
+__global__ void mul_inplace_fp32_kernel(float* __restrict__ y,
+                                        const float* __restrict__ x, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] *= x[i];
+    }
+}
+
+__global__ void mul_inplace_fp16_kernel(__half* __restrict__ y,
+                                        const __half* __restrict__ x, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float a = __half2float(y[i]);
+        const float b = __half2float(x[i]);
+        y[i] = __float2half(a * b);
+    }
+}
+
+// Y(B, D) = X_a(B, D) * gelu(X_b(B, D)) where X is (B, 2D) — A is the first
+// half along the last dim, B is the second half.
+__global__ void geglu_forward_fp16_kernel(const __half* __restrict__ X,
+                                          __half* __restrict__ Y,
+                                          int B, int D) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * D;
+    if (idx >= total) return;
+    const int b = idx / D;
+    const int d = idx % D;
+    const int two_d = 2 * D;
+    const float a = __half2float(X[b * two_d + d]);
+    const float gv_raw = __half2float(X[b * two_d + D + d]);
+    Y[idx] = __float2half(a * gelu_tanh_scalar(gv_raw));
+}
+
+__global__ void causal_mask_row_kernel(float* __restrict__ mask, int L, int q) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= L) return;
+    mask[k] = (k <= q) ? 1.0f : 0.0f;
+}
+
 inline int grid_for(int n) {
     int blocks = (n + EW_BLOCK - 1) / EW_BLOCK;
     if (blocks < 1) blocks = 1;
@@ -200,7 +257,16 @@ void sigmoid_backward_gpu(const GpuTensor& y, const GpuTensor& dY, GpuTensor& dX
 void add_inplace_gpu(GpuTensor& y, const GpuTensor& x) {
     const int n = y.size();
     if (n == 0) return;
-    add_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, x.data, n);
+    if (y.dtype == Dtype::FP16) {
+        if (x.dtype != Dtype::FP16) {
+            throw std::runtime_error("add_inplace_gpu: dtype mismatch");
+        }
+        add_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<__half*>(y.data_fp16()),
+            reinterpret_cast<const __half*>(x.data_fp16()), n);
+    } else {
+        add_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, x.data, n);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -214,7 +280,28 @@ void add_scalar_inplace_gpu(GpuTensor& y, float s) {
 void scale_inplace_gpu(GpuTensor& y, float s) {
     const int n = y.size();
     if (n == 0) return;
-    scale_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, s, n);
+    if (y.dtype == Dtype::FP16) {
+        scale_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<__half*>(y.data_fp16()), s, n);
+    } else {
+        scale_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, s, n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void mul_inplace_gpu(GpuTensor& y, const GpuTensor& x) {
+    if (y.dtype != x.dtype || y.rows != x.rows || y.cols != x.cols) {
+        throw std::runtime_error("mul_inplace_gpu: shape/dtype mismatch");
+    }
+    const int n = y.size();
+    if (n == 0) return;
+    if (y.dtype == Dtype::FP16) {
+        mul_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<__half*>(y.data_fp16()),
+            reinterpret_cast<const __half*>(x.data_fp16()), n);
+    } else {
+        mul_inplace_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, x.data, n);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -247,6 +334,37 @@ void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
     } else {
         gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
     }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
+    if (X.dtype != Dtype::FP16) {
+        throw std::runtime_error("geglu_forward_gpu: X must be FP16");
+    }
+    if (X.cols % 2 != 0) {
+        throw std::runtime_error("geglu_forward_gpu: X.cols must be even (2*D)");
+    }
+    const int B = X.rows;
+    const int D = X.cols / 2;
+    if (Y.rows != B || Y.cols != D || Y.dtype != Dtype::FP16) {
+        Y.resize(B, D, Dtype::FP16);
+    }
+    const int total = B * D;
+    if (total == 0) return;
+    geglu_forward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
+        reinterpret_cast<const __half*>(X.data_fp16()),
+        reinterpret_cast<__half*>(Y.data_fp16()),
+        B, D);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void build_causal_mask_row_gpu(int L, int q, GpuTensor& mask) {
+    if (mask.rows != L || mask.cols != 1 || mask.dtype != Dtype::FP32) {
+        mask.resize(L, 1, Dtype::FP32);
+    }
+    if (L <= 0) return;
+    const int blocks = (L + EW_BLOCK - 1) / EW_BLOCK;
+    causal_mask_row_kernel<<<blocks, EW_BLOCK>>>(mask.data, L, q);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

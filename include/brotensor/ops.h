@@ -529,6 +529,36 @@ void downsample_avg_2x_gpu(const GpuTensor& X,
                            int N, int C, int H, int W,
                            GpuTensor& Y);
 
+// FP16 batched linear forward, inference-only. Mirrors
+// linear_forward_batched_gpu but with FP16 storage on X / W / bias / Y.
+//   W:    (out_dim, in_dim)  FP16
+//   bias: (out_dim, 1)       FP16; may be null for bias-free linears
+//   X_BD: (B, in_dim)        FP16
+//   Y_BD: (B, out_dim)       FP16; resized if mis-shaped/-typed.
+void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
+                                     const GpuTensor& X_BD, GpuTensor& Y_BD);
+
+// y[i] *= x[i]. Identical shape and dtype required. Dispatches FP32/FP16
+// on y.dtype. Used by GEGLU and by gating paths in transformer FFNs.
+void mul_inplace_gpu(GpuTensor& y, const GpuTensor& x);
+
+// GEGLU activation: input (B, 2*D) is split along the last dim into halves
+// A=(B, D) and B=(B, D); output (B, D) = A * gelu(B). FP16.
+//   X:  (B, 2*D)  FP16
+//   Y:  (B, D)    FP16; resized as needed.
+void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y);
+
+// Causal mask helper for transformer self-attention. Produces an (L, L)
+// FP32 mask where mask[q*L + k] = (k <= q) ? 1.0f : 0.0f. The existing
+// attention kernels consume a length-Lk mask per attention row; for fully
+// causal self-attention you launch the attention per query separately, so
+// in practice we expose the simpler diagonal-cumulative form below.
+//
+// build_causal_mask_row_gpu fills the length-L FP32 buffer for row q:
+//   mask[k] = (k <= q) ? 1.0f : 0.0f
+// Resized to (L, 1) if mis-shaped. Useful for CLIP-text-encoder masking.
+void build_causal_mask_row_gpu(int L, int q, GpuTensor& mask);
+
 // Cross-attention: like mha_forward_gpu but K and V are projected from a
 // separate context tensor instead of from X. Used in diffusion U-Nets to
 // inject text conditioning. FP16 (X, Ctx, all weights, O).
@@ -550,5 +580,113 @@ void cross_attention_forward_gpu(const GpuTensor& X,
                                  const float* d_mask,
                                  int num_heads,
                                  GpuTensor& O);
+
+// FP16 LayerNorm forward, inference-only. Processes R independent rows of
+// length D in a single launch (one block per row). FP32 accumulation.
+//   X_RD:  (R, D)  FP16
+//   gamma: (D,)    FP16 scale
+//   beta:  (D,)    FP16 shift
+//   Y_RD:  (R, D)  FP16; resized as needed.
+void layernorm_forward_inference_batched_fp16_gpu(const GpuTensor& X_RD,
+                                                  const GpuTensor& gamma,
+                                                  const GpuTensor& beta,
+                                                  GpuTensor& Y_RD,
+                                                  float eps);
+
+// FP16 self-attention. Thin wrapper over the cross-attention kernel with
+// Ctx = X (so Lk = Lq). Same shape/dtype conventions as
+// cross_attention_forward_gpu otherwise.
+//   X:   (L, D)  FP16
+//   Wq, Wk, Wv, Wo: each (D, D), FP16
+//   d_mask: optional FP32 mask of length L (1 valid, 0 invalid). May be
+//           null.
+//   num_heads: must divide D.
+//   O:   (L, D)  FP16; resized if mis-shaped.
+void self_attention_forward_gpu(const GpuTensor& X,
+                                const GpuTensor& Wq, const GpuTensor& Wk,
+                                const GpuTensor& Wv, const GpuTensor& Wo,
+                                const float* d_mask,
+                                int num_heads,
+                                GpuTensor& O);
+
+// Flash-attention-style fused attention (FP16, inference-only).
+//
+// Q, K, V are already projected (caller does the matmuls externally). Tiles
+// over Lk with online softmax — no Lk-long materialisation in shared mem;
+// works for Lq, Lk up to global-memory limits. FP32 accumulation throughout.
+//
+//   Q:  (Lq, D)   FP16
+//   K:  (Lk, D)   FP16
+//   V:  (Lk, D)   FP16
+//   d_mask: optional length-Lk FP32 mask (1 valid, 0 invalid). May be null.
+//   num_heads: must divide D.
+//   O:  (Lq, D)   FP16; resized as needed.
+void flash_attention_forward_gpu(const GpuTensor& Q,
+                                 const GpuTensor& K,
+                                 const GpuTensor& V,
+                                 const float* d_mask,
+                                 int num_heads,
+                                 GpuTensor& O);
+
+// Flash-attention with projections fused in at the boundary. Projects
+// X → Q, Ctx → K, V (or X → Q,K,V when Ctx == nullptr), runs the tiled
+// attention core, then projects the output with Wo. FP16 throughout.
+//
+//   X:   (Lq, D)        FP16, query source
+//   Ctx: (Lk, D) or null  FP16, key/value source; null means self-attention
+//                          (Ctx ← X, Lk ← Lq).
+//   Wq, Wk, Wv, Wo: each (D, D)  FP16
+//   d_mask: optional length-Lk FP32 mask.
+//   num_heads: must divide D.
+//   O:   (Lq, D)  FP16; resized as needed.
+void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
+                                      const GpuTensor* Ctx,
+                                      const GpuTensor& Wq, const GpuTensor& Wk,
+                                      const GpuTensor& Wv, const GpuTensor& Wo,
+                                      const float* d_mask,
+                                      int num_heads,
+                                      GpuTensor& O);
+
+// Fused diffusion ResBlock (FP16, inference-only). Computes the standard
+// SD U-Net residual block in a single op:
+//
+//   h = silu(group_norm(X, gamma1, beta1))
+//   h = conv2d_3x3_same(h, W1, b1)
+//   if t_emb_shift: h += broadcast(t_emb_shift, NCHW)   // (N, C_out) or (C_out,)
+//   h = silu(group_norm(h, gamma2, beta2))
+//   h = conv2d_3x3_same(h, W2, b2)
+//   if C_in == C_out and Wskip == nullptr:
+//       Y = h + X
+//   else:
+//       Y = h + conv2d_1x1(X, Wskip, bskip)
+//
+// All tensors FP16. Conv layout matches conv2d_forward_gpu (OIHW filter
+// layout). The two `GN → SiLU` legs are fused into single kernels; the
+// convs remain separate launches but the skip add is folded into the
+// second conv's epilogue when shapes permit.
+//
+//   X:       (N, C_in  * H * W)   FP16 input activation
+//   gamma1, beta1: (C_in,  1)     FP16 — applied to the first GN over C_in
+//   W1:      (C_out, C_in  * 9)   FP16 OIHW, kH=kW=3
+//   b1:      (C_out, 1) or null   FP16
+//   t_emb_shift: (N, C_out) or (C_out, 1) or null — additive shift between legs
+//   gamma2, beta2: (C_out, 1)     FP16 — applied to second GN over C_out
+//   W2:      (C_out, C_out * 9)   FP16 OIHW, kH=kW=3
+//   b2:      (C_out, 1) or null   FP16
+//   Wskip:   (C_out, C_in * 1)    FP16 OIHW 1x1, or null when C_in == C_out
+//   bskip:   (C_out, 1) or null
+//   Y:       (N, C_out * H * W)   FP16 output, resized as needed.
+//
+// num_groups must divide both C_in and C_out (typically 32). eps default 1e-5.
+void resblock_forward_gpu(const GpuTensor& X,
+                          const GpuTensor& gamma1, const GpuTensor& beta1,
+                          const GpuTensor& W1, const GpuTensor* b1,
+                          const GpuTensor* t_emb_shift,
+                          const GpuTensor& gamma2, const GpuTensor& beta2,
+                          const GpuTensor& W2, const GpuTensor* b2,
+                          const GpuTensor* Wskip, const GpuTensor* bskip,
+                          int N, int C_in, int C_out, int H, int W,
+                          int num_groups, float eps,
+                          GpuTensor& Y);
 
 } // namespace brotensor

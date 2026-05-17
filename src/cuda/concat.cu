@@ -12,19 +12,29 @@ namespace brotensor {
 void concat_rows_gpu(const std::vector<const GpuTensor*>& parts,
                      GpuTensor& out) {
     int total = 0;
-    for (const auto* p : parts) total += p ? p->size() : 0;
-    if (out.rows != total || out.cols != 1) out.resize(total, 1);
+    Dtype dt = Dtype::FP32;
+    bool seen = false;
+    for (const auto* p : parts) {
+        if (!p) continue;
+        total += p->size();
+        if (!seen) { dt = p->dtype; seen = true; }
+    }
+    if (out.rows != total || out.cols != 1 || out.dtype != dt) {
+        out.resize(total, 1, dt);
+    }
     if (total == 0) return;
 
-    int off = 0;
+    const size_t elem = static_cast<size_t>(dtype_size_bytes(dt));
+    char* dst_base = reinterpret_cast<char*>(out.data);
+    size_t off_bytes = 0;
     for (const auto* p : parts) {
         if (!p) continue;
         const int n = p->size();
         if (n == 0) continue;
-        BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(out.data + off, p->data,
-                                       sizeof(float) * n,
+        BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(dst_base + off_bytes, p->data,
+                                       elem * n,
                                        cudaMemcpyDeviceToDevice));
-        off += n;
+        off_bytes += elem * n;
     }
 }
 
@@ -52,26 +62,33 @@ void concat_batched_rows_gpu(const std::vector<const GpuTensor*>& parts,
     if (parts.empty()) { out.resize(0, 0); return; }
     int B = 0;
     int total_cols = 0;
+    Dtype dt = Dtype::FP32;
+    bool seen = false;
     for (const auto* p : parts) {
         if (!p) continue;
         if (B == 0) B = p->rows;
         total_cols += p->cols;
+        if (!seen) { dt = p->dtype; seen = true; }
     }
-    if (out.rows != B || out.cols != total_cols) out.resize(B, total_cols);
+    if (out.rows != B || out.cols != total_cols || out.dtype != dt) {
+        out.resize(B, total_cols, dt);
+    }
     if (B == 0 || total_cols == 0) return;
 
-    const size_t dst_pitch = sizeof(float) * total_cols;
-    int col_off = 0;
+    const size_t elem = static_cast<size_t>(dtype_size_bytes(dt));
+    const size_t dst_pitch = elem * total_cols;
+    char* dst_base = reinterpret_cast<char*>(out.data);
+    size_t col_off_bytes = 0;
     for (const auto* p : parts) {
         if (!p) continue;
         const int d = p->cols;
         if (d == 0) continue;
         BROTENSOR_CUDA_CHECK(cudaMemcpy2DAsync(
-            out.data + col_off, dst_pitch,
-            p->data,             sizeof(float) * d,
-            sizeof(float) * d,   B,
+            dst_base + col_off_bytes, dst_pitch,
+            p->data,                  elem * d,
+            elem * d,                 B,
             cudaMemcpyDeviceToDevice));
-        col_off += d;
+        col_off_bytes += elem * d;
     }
 }
 

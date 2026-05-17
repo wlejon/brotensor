@@ -2,6 +2,9 @@
 #include <brotensor/runtime.h>
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+#include <stdexcept>
 
 namespace brotensor {
 
@@ -208,6 +211,80 @@ __global__ void layernorm_forward_inference_batched_kernel(
     }
 }
 } // namespace
+
+namespace {
+__global__ void layernorm_forward_inference_batched_fp16_kernel(
+        const __half* __restrict__ x,
+        const __half* __restrict__ gamma,
+        const __half* __restrict__ beta,
+        __half* __restrict__ y,
+        int R, int D, float eps) {
+    extern __shared__ float sdata[];
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (row >= R) return;
+
+    const __half* xrow = x + static_cast<size_t>(row) * D;
+    __half*       yrow = y + static_cast<size_t>(row) * D;
+
+    float local = 0.0f;
+    for (int i = tid; i < D; i += blockDim.x) local += __half2float(xrow[i]);
+    sdata[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float mean = sdata[0] / static_cast<float>(D);
+
+    float local_v = 0.0f;
+    for (int i = tid; i < D; i += blockDim.x) {
+        const float d = __half2float(xrow[i]) - mean;
+        local_v += d * d;
+    }
+    sdata[tid] = local_v;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float var  = sdata[0] / static_cast<float>(D);
+    const float rstd = rsqrtf(var + eps);
+
+    for (int i = tid; i < D; i += blockDim.x) {
+        const float xh = (__half2float(xrow[i]) - mean) * rstd;
+        const float g  = __half2float(gamma[i]);
+        const float b  = __half2float(beta[i]);
+        yrow[i] = __float2half(xh * g + b);
+    }
+}
+} // namespace
+
+void layernorm_forward_inference_batched_fp16_gpu(const GpuTensor& X_RD,
+                                                  const GpuTensor& gamma,
+                                                  const GpuTensor& beta,
+                                                  GpuTensor& Y_RD,
+                                                  float eps) {
+    if (X_RD.dtype != Dtype::FP16 || gamma.dtype != Dtype::FP16 ||
+        beta.dtype != Dtype::FP16) {
+        throw std::runtime_error("layernorm_forward_inference_batched_fp16_gpu: all tensors must be FP16");
+    }
+    const int R = X_RD.rows;
+    const int D = X_RD.cols;
+    if (Y_RD.rows != R || Y_RD.cols != D || Y_RD.dtype != Dtype::FP16) {
+        Y_RD.resize(R, D, Dtype::FP16);
+    }
+    if (R == 0 || D == 0) return;
+    const int block = LN_BLOCK;
+    const size_t shmem = static_cast<size_t>(block) * sizeof(float);
+    layernorm_forward_inference_batched_fp16_kernel<<<R, block, shmem>>>(
+        reinterpret_cast<const __half*>(X_RD.data_fp16()),
+        reinterpret_cast<const __half*>(gamma.data_fp16()),
+        reinterpret_cast<const __half*>(beta.data_fp16()),
+        reinterpret_cast<__half*>(Y_RD.data_fp16()),
+        R, D, eps);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
 
 void layernorm_forward_inference_batched_gpu(const GpuTensor& X_RD,
                                               const GpuTensor& gamma,

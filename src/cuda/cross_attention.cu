@@ -1,6 +1,8 @@
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
+#include "fp16_internal.cuh"
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -11,27 +13,6 @@ namespace brotensor {
 namespace {
 
 constexpr int CA_BLOCK = 128;
-
-// C(M, N) = A(M, K) @ B(N, K)^T   (i.e. B is laid out row-major as if it
-// were the transpose). Equivalently C[m, n] = sum_k A[m, k] * B[n, k].
-// FP16 in/out, FP32 accumulator. One thread per output element — naive,
-// good enough for the projection sizes used in U-Net cross-attention
-// (D ≤ ~1024).
-__global__ void matmul_ABT_fp16_kernel(const __half* __restrict__ A,
-                                       const __half* __restrict__ B,
-                                       __half* __restrict__ C,
-                                       int M, int N, int K) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = M * N;
-    if (idx >= total) return;
-    const int m = idx / N;
-    const int n = idx % N;
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        acc += __half2float(A[m * K + k]) * __half2float(B[n * K + k]);
-    }
-    C[idx] = __float2half(acc);
-}
 
 // One CUDA block per (query, head) tile. Computes scores against all Lk
 // keys, applies numerically-stable softmax with optional mask, then writes
@@ -114,12 +95,6 @@ __global__ void cross_attention_core_kernel(
     }
 }
 
-inline int grid_for(int n) {
-    int b = (n + CA_BLOCK - 1) / CA_BLOCK;
-    if (b < 1) b = 1;
-    return b;
-}
-
 } // namespace
 
 void cross_attention_forward_gpu(const GpuTensor& X,
@@ -161,9 +136,7 @@ void cross_attention_forward_gpu(const GpuTensor& X,
 
     auto launch_matmul_ABT = [](const GpuTensor& A, const GpuTensor& B,
                                  GpuTensor& C, int M, int N, int K) {
-        const int total = M * N;
-        if (total == 0) return;
-        matmul_ABT_fp16_kernel<<<grid_for(total), CA_BLOCK>>>(
+        fp16_internal::launch_matmul_ABT(
             reinterpret_cast<const __half*>(A.data_fp16()),
             reinterpret_cast<const __half*>(B.data_fp16()),
             reinterpret_cast<__half*>(C.data_fp16()),
@@ -189,6 +162,21 @@ void cross_attention_forward_gpu(const GpuTensor& X,
 
     // Output projection: O = Op @ Wo^T.
     launch_matmul_ABT(Op, Wo, O, Lq, D, D);
+}
+
+// Self-attention: thin wrapper that aliases X as the context. We can't pass
+// the same GpuTensor twice as separate args without aliasing surprises, so
+// build a non-owning FP16 view over X.data and pass that in as Ctx.
+void self_attention_forward_gpu(const GpuTensor& X,
+                                const GpuTensor& Wq, const GpuTensor& Wk,
+                                const GpuTensor& Wv, const GpuTensor& Wo,
+                                const float* d_mask,
+                                int num_heads,
+                                GpuTensor& O) {
+    GpuTensor Ctx_view = GpuTensor::view_fp16(
+        const_cast<uint16_t*>(X.data_fp16()), X.rows, X.cols);
+    cross_attention_forward_gpu(X, Ctx_view, Wq, Wk, Wv, Wo,
+                                d_mask, num_heads, O);
 }
 
 } // namespace brotensor
