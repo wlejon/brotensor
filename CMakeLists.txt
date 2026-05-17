@@ -91,6 +91,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/conv2d.cu
         src/cuda/group_norm.cu
         src/cuda/resample.cu
+        src/cuda/cross_attention.cu
     )
     target_link_libraries(brotensor PUBLIC CUDA::cudart)
     target_compile_definitions(brotensor PUBLIC BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
@@ -123,6 +124,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/conv2d.mm
         src/metal/group_norm.mm
         src/metal/resample.mm
+        src/metal/cross_attention.mm
     )
     set_source_files_properties(
         src/metal/runtime.mm
@@ -145,6 +147,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/conv2d.mm
         src/metal/group_norm.mm
         src/metal/resample.mm
+        src/metal/cross_attention.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"
             LANGUAGE OBJCXX
