@@ -157,6 +157,54 @@ __global__ void scale_inplace_fp16_kernel(__half* __restrict__ y, float s, int n
     }
 }
 
+__global__ void add_scalar_inplace_fp16_kernel(__half* __restrict__ y, float s, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2half(__half2float(y[i]) + s);
+    }
+}
+
+__global__ void clamp_fp32_kernel(float* __restrict__ y, float lo, float hi, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        float v = y[i];
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        y[i] = v;
+    }
+}
+
+__global__ void clamp_fp16_kernel(__half* __restrict__ y, float lo, float hi, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        float v = __half2float(y[i]);
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        y[i] = __float2half(v);
+    }
+}
+
+__device__ inline float quick_gelu_scalar(float v) {
+    // OpenAI CLIP's QuickGELU: x * sigmoid(1.702 * x).
+    return v / (1.0f + __expf(-1.702f * v));
+}
+
+__global__ void quick_gelu_forward_fp32_kernel(const float* __restrict__ x,
+                                               float* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = quick_gelu_scalar(x[i]);
+    }
+}
+
+__global__ void quick_gelu_forward_fp16_kernel(const __half* __restrict__ x,
+                                               __half* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2half(quick_gelu_scalar(__half2float(x[i])));
+    }
+}
+
 __global__ void mul_inplace_fp32_kernel(float* __restrict__ y,
                                         const float* __restrict__ x, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -273,7 +321,24 @@ void add_inplace_gpu(GpuTensor& y, const GpuTensor& x) {
 void add_scalar_inplace_gpu(GpuTensor& y, float s) {
     const int n = y.size();
     if (n == 0) return;
-    add_scalar_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, s, n);
+    if (y.dtype == Dtype::FP16) {
+        add_scalar_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<__half*>(y.data_fp16()), s, n);
+    } else {
+        add_scalar_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, s, n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void clamp_gpu(GpuTensor& y, float lo, float hi) {
+    const int n = y.size();
+    if (n == 0) return;
+    if (y.dtype == Dtype::FP16) {
+        clamp_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<__half*>(y.data_fp16()), lo, hi, n);
+    } else {
+        clamp_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, lo, hi, n);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -333,6 +398,22 @@ void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
             reinterpret_cast<__half*>(y.data_fp16()), n);
     } else {
         gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void quick_gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
+        y.resize(x.rows, x.cols, x.dtype);
+    }
+    const int n = x.size();
+    if (n == 0) return;
+    if (x.dtype == Dtype::FP16) {
+        quick_gelu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            reinterpret_cast<const __half*>(x.data_fp16()),
+            reinterpret_cast<__half*>(y.data_fp16()), n);
+    } else {
+        quick_gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }

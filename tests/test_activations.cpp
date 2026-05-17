@@ -29,6 +29,7 @@ static float gelu_ref(float v) {
     const float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
     return 0.5f * v * (1.0f + std::tanh(u));
 }
+static float quick_gelu_ref(float v) { return v / (1.0f + std::exp(-1.702f * v)); }
 
 static void test_fp32(void (*op)(const GpuTensor&, GpuTensor&),
                       float (*ref)(float), const char* name) {
@@ -108,6 +109,8 @@ int main() {
     test_fp16(brotensor::silu_forward_gpu, silu_ref, "silu");
     test_fp32(brotensor::gelu_forward_gpu, gelu_ref, "gelu");
     test_fp16(brotensor::gelu_forward_gpu, gelu_ref, "gelu");
+    test_fp32(brotensor::quick_gelu_forward_gpu, quick_gelu_ref, "quick_gelu");
+    test_fp16(brotensor::quick_gelu_forward_gpu, quick_gelu_ref, "quick_gelu");
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);

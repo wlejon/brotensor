@@ -33,7 +33,8 @@ __global__ void flash_attention_kernel(
         const __half* __restrict__ V,    // (Lk, D)
         const float*  __restrict__ mask, // (Lk,) may be null
         __half* __restrict__ Out,        // (Lq, D)
-        int Lq, int Lk, int D, int head_dim) {
+        int Lq, int Lk, int D, int head_dim,
+        int causal) {
     extern __shared__ float s_smem[];
     // Layout: scores[FA_KTILE], red[blockDim.x]
     float* scores = s_smem;
@@ -69,7 +70,12 @@ __global__ void flash_attention_kernel(
     // 128) so Q is read directly from global.
 
     for (int k0 = 0; k0 < Lk; k0 += FA_KTILE) {
-        const int klen = (Lk - k0) < FA_KTILE ? (Lk - k0) : FA_KTILE;
+        // Causal: skip tiles entirely beyond the query's diagonal. For the
+        // boundary tile, shrink the effective klen so masked positions don't
+        // even enter the score loop.
+        if (causal && k0 > q) break;
+        int klen = (Lk - k0) < FA_KTILE ? (Lk - k0) : FA_KTILE;
+        if (causal && k0 + klen - 1 > q) klen = q - k0 + 1;
 
         // 1. Compute scores[t] for t in [0, klen). Each thread strides.
         for (int t = tid; t < klen; t += blockDim.x) {
@@ -166,6 +172,7 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
                                  const GpuTensor& V,
                                  const float* d_mask,
                                  int num_heads,
+                                 bool causal,
                                  GpuTensor& O) {
     if (Q.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 || V.dtype != Dtype::FP16) {
         throw std::runtime_error("flash_attention_forward_gpu: Q, K, V must be FP16");
@@ -178,6 +185,9 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
     }
     if (num_heads <= 0 || D % num_heads != 0) {
         throw std::runtime_error("flash_attention_forward_gpu: num_heads must divide D");
+    }
+    if (causal && Lq != Lk) {
+        throw std::runtime_error("flash_attention_forward_gpu: causal requires Lq == Lk");
     }
     const int head_dim = D / num_heads;
     // head_dim parallelisation in the kernel uses up to 8 d-slots/thread.
@@ -197,7 +207,8 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
         reinterpret_cast<const __half*>(V.data_fp16()),
         d_mask,
         reinterpret_cast<__half*>(O.data_fp16()),
-        Lq, Lk, D, head_dim);
+        Lq, Lk, D, head_dim,
+        causal ? 1 : 0);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -209,6 +220,7 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
                                       const GpuTensor& Wv, const GpuTensor& Wo,
                                       const float* d_mask,
                                       int num_heads,
+                                      bool causal,
                                       GpuTensor& O) {
     if (X.dtype != Dtype::FP16 || Wq.dtype != Dtype::FP16 ||
         Wk.dtype != Dtype::FP16 || Wv.dtype != Dtype::FP16 ||
@@ -256,7 +268,7 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
     mm(kv_src, Wk, Kp, Lk, D, D);
     mm(kv_src, Wv, Vp, Lk, D, D);
 
-    flash_attention_forward_gpu(Qp, Kp, Vp, d_mask, num_heads, Op);
+    flash_attention_forward_gpu(Qp, Kp, Vp, d_mask, num_heads, causal, Op);
 
     mm(Op, Wo, O, Lq, D, D);
 }

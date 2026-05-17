@@ -66,6 +66,7 @@ kernel void k_flash_attention(
         constant uint& D         [[buffer(7)]],
         constant uint& head_dim  [[buffer(8)]],
         constant uint& has_mask  [[buffer(9)]],
+        constant uint& causal    [[buffer(10)]],
         threadgroup float* scratch [[threadgroup(0)]],
         uint3 gid    [[threadgroup_position_in_grid]],
         uint3 tid3   [[thread_position_in_threadgroup]],
@@ -86,7 +87,9 @@ kernel void k_flash_attention(
     for (uint i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
 
     for (uint k0 = 0; k0 < Lk; k0 += FA_KTILE) {
+        if (causal != 0u && k0 > q) break;
         uint klen = (Lk - k0) < FA_KTILE ? (Lk - k0) : FA_KTILE;
+        if (causal != 0u && k0 + klen - 1u > q) klen = q - k0 + 1u;
 
         // 1. scores[t] = Q[q] · K[k0+t] * inv_sqrt
         for (uint t = tid; t < klen; t += tg_size) {
@@ -224,12 +227,16 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
                                  const GpuTensor& V,
                                  const float* d_mask,
                                  int num_heads,
+                                 bool causal,
                                  GpuTensor& O) {
     if (Q.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 || V.dtype != Dtype::FP16) {
         throw std::runtime_error("flash_attention_forward_gpu: Q, K, V must be FP16");
     }
     const int Lq = Q.rows;
     const int Lk = K.rows;
+    if (causal && Lq != Lk) {
+        throw std::runtime_error("flash_attention_forward_gpu: causal requires Lq == Lk");
+    }
     const int D  = Q.cols;
     if (K.cols != D || V.cols != D || V.rows != Lk) {
         throw std::runtime_error("flash_attention_forward_gpu: shape mismatch");
@@ -262,6 +269,7 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
 
     const uint32_t Lqu = Lq, Lku = Lk, Du = D, hdU = head_dim;
     const uint32_t has_mask = d_mask ? 1u : 0u;
+    const uint32_t causal_u = causal ? 1u : 0u;
     const NSUInteger shmem = (FA_KTILE + FA_BLOCK) * sizeof(float);
 
     @autoreleasepool {
@@ -278,6 +286,7 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
         [enc setBytes:&Du  length:sizeof(uint32_t) atIndex:7];
         [enc setBytes:&hdU length:sizeof(uint32_t) atIndex:8];
         [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:9];
+        [enc setBytes:&causal_u length:sizeof(uint32_t) atIndex:10];
         [enc setThreadgroupMemoryLength:shmem atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(Lq, num_heads, 1)
             threadsPerThreadgroup:MTLSizeMake(FA_BLOCK, 1, 1)];
@@ -293,6 +302,7 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
                                       const GpuTensor& Wv, const GpuTensor& Wo,
                                       const float* d_mask,
                                       int num_heads,
+                                      bool causal,
                                       GpuTensor& O) {
     if (X.dtype != Dtype::FP16 || Wq.dtype != Dtype::FP16 ||
         Wk.dtype != Dtype::FP16 || Wv.dtype != Dtype::FP16 ||
@@ -331,7 +341,7 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
     launch_matmul_abt(kv_src, Wk, Kp, Lk, D, D);
     launch_matmul_abt(kv_src, Wv, Vp, Lk, D, D);
 
-    flash_attention_forward_gpu(Qp, Kp, Vp, d_mask, num_heads, Op);
+    flash_attention_forward_gpu(Qp, Kp, Vp, d_mask, num_heads, causal, Op);
 
     launch_matmul_abt(Op, Wo, O, Lq, D, D);
 }

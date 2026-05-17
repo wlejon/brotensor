@@ -67,11 +67,15 @@ void sigmoid_backward_gpu(const GpuTensor& y, const GpuTensor& dY, GpuTensor& dX
 // y[i] += x[i]. y and x must have identical shape.
 void add_inplace_gpu(GpuTensor& y, const GpuTensor& x);
 
-// y[i] += s for all i.
+// y[i] += s for all i. Dispatches FP32/FP16 on y.dtype.
 void add_scalar_inplace_gpu(GpuTensor& y, float s);
 
-// y[i] *= s for all i.
+// y[i] *= s for all i. Dispatches FP32/FP16 on y.dtype.
 void scale_inplace_gpu(GpuTensor& y, float s);
+
+// y[i] = min(max(y[i], lo), hi). In-place. Dispatches FP32/FP16 on y.dtype.
+// Used for VAE output rescale-and-clamp and any saturating epilogue.
+void clamp_gpu(GpuTensor& y, float lo, float hi);
 
 // Build a slot-validity mask on-device. For k in [0, K):
 //   mask[k] = (x[offset + k*stride] > 0.5f) ? 1.0f : 0.0f
@@ -284,10 +288,11 @@ float softmax_xent_fused_gpu(const GpuTensor& logits, const GpuTensor& target,
                              GpuTensor& probs, GpuTensor& dLogits);
 
 // Embedding lookup forward.
-//   table:    (V, D) embedding matrix
+//   table:    (V, D) embedding matrix (FP32 or FP16).
 //   d_idx:    device pointer to B int32 indices, each in [0, V).
 //   B:        number of indices (== rows of `out`).
-//   out:      (B, D), resized if mis-shaped. out[b, :] = table[d_idx[b], :].
+//   out:      (B, D), resized AND dtype-set to match `table` if mis-shaped/typed.
+//             out[b, :] = table[d_idx[b], :].
 void embedding_lookup_forward_gpu(const GpuTensor& table,
                                   const int32_t* d_idx, int B,
                                   GpuTensor& out);
@@ -508,6 +513,12 @@ void silu_forward_gpu(const GpuTensor& x, GpuTensor& y);
 // FP32 and FP16 variants dispatched on x.dtype.
 void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y);
 
+// QuickGELU: y = x * sigmoid(1.702 * x). Matches OpenAI CLIP's activation
+// (used in SD1.5's CLIP ViT-L/14 text encoder). FP32 and FP16 variants
+// dispatched on x.dtype. y resized to match x.shape AND x.dtype if
+// mis-shaped/-typed. x and y may alias.
+void quick_gelu_forward_gpu(const GpuTensor& x, GpuTensor& y);
+
 // 2x nearest-neighbour upsample over the spatial dims of an NCHW FP16 tensor.
 //   X: (N, C * H * W) FP16
 //   Y: (N, C * 2H * 2W) FP16; resized.
@@ -620,12 +631,18 @@ void self_attention_forward_gpu(const GpuTensor& X,
 //   V:  (Lk, D)   FP16
 //   d_mask: optional length-Lk FP32 mask (1 valid, 0 invalid). May be null.
 //   num_heads: must divide D.
+//   causal: if true, apply autoregressive causal masking (key index k
+//           may only attend to query index q where k ≤ q). Requires Lq == Lk.
+//           Combines multiplicatively with d_mask when both supplied. The
+//           kernel skips fully-future tiles outright (one less full tile cost
+//           per row beyond the diagonal) and masks within the boundary tile.
 //   O:  (Lq, D)   FP16; resized as needed.
 void flash_attention_forward_gpu(const GpuTensor& Q,
                                  const GpuTensor& K,
                                  const GpuTensor& V,
                                  const float* d_mask,
                                  int num_heads,
+                                 bool causal,
                                  GpuTensor& O);
 
 // Flash-attention with projections fused in at the boundary. Projects
@@ -638,6 +655,8 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
 //   Wq, Wk, Wv, Wo: each (D, D)  FP16
 //   d_mask: optional length-Lk FP32 mask.
 //   num_heads: must divide D.
+//   causal: see flash_attention_forward_gpu. Typically paired with Ctx ==
+//           nullptr (causal self-attention, e.g. CLIP text encoder).
 //   O:   (Lq, D)  FP16; resized as needed.
 void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
                                       const GpuTensor* Ctx,
@@ -645,6 +664,7 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
                                       const GpuTensor& Wv, const GpuTensor& Wo,
                                       const float* d_mask,
                                       int num_heads,
+                                      bool causal,
                                       GpuTensor& O);
 
 // Fused diffusion ResBlock (FP16, inference-only). Computes the standard

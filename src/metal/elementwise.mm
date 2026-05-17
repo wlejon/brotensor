@@ -98,11 +98,46 @@ void add_inplace_gpu(GpuTensor& y, const GpuTensor& x) {
     });
 }
 
+// Forward decls for FP16 PSOs defined later in this TU.
+namespace {
+id<MTLComputePipelineState> pso_add_scalar_fp16();
+id<MTLComputePipelineState> pso_scale_fp16();
+id<MTLComputePipelineState> pso_clamp_fp32();
+id<MTLComputePipelineState> pso_clamp_fp16();
+}
+
+namespace {
+void dispatch_scalar_inplace(id<MTLComputePipelineState> pso,
+                             id<MTLBuffer> by, NSUInteger off,
+                             float s, uint32_t n) {
+    if (n == 0) return;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:by offset:off atIndex:0];
+        [enc setBytes:&s length:sizeof(float) atIndex:1];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
+        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
+        if (tg > 256) tg = 256;
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+}
+} // namespace
+
 void add_scalar_inplace_gpu(GpuTensor& y, float s) {
     const uint32_t n = static_cast<uint32_t>(y.size());
     if (n == 0) return;
     id<MTLBuffer> by = buffer_for(y);
     const NSUInteger off_y = buffer_offset_for(y);
+    if (y.dtype == Dtype::FP16) {
+        dispatch_scalar_inplace(pso_add_scalar_fp16(), by, off_y, s, n);
+        return;
+    }
     dispatch1d_sync(@"k_add_scalar_inplace", n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:by offset:off_y atIndex:0];
         [enc setBytes:&s length:sizeof(float) atIndex:1];
@@ -119,11 +154,40 @@ void scale_inplace_gpu(GpuTensor& y, float s) {
     }
     id<MTLBuffer> by = buffer_for(y);
     const NSUInteger off_y = buffer_offset_for(y);
+    if (y.dtype == Dtype::FP16) {
+        dispatch_scalar_inplace(pso_scale_fp16(), by, off_y, s, n);
+        return;
+    }
     dispatch1d_sync(@"k_scale_inplace", n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:by offset:off_y atIndex:0];
         [enc setBytes:&s length:sizeof(float) atIndex:1];
         [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
     });
+}
+
+void clamp_gpu(GpuTensor& y, float lo, float hi) {
+    const uint32_t n = static_cast<uint32_t>(y.size());
+    if (n == 0) return;
+    id<MTLBuffer> by = buffer_for(y);
+    const NSUInteger off_y = buffer_offset_for(y);
+    id<MTLComputePipelineState> pso =
+        (y.dtype == Dtype::FP16) ? pso_clamp_fp16() : pso_clamp_fp32();
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:by offset:off_y atIndex:0];
+        [enc setBytes:&lo length:sizeof(float) atIndex:1];
+        [enc setBytes:&hi length:sizeof(float) atIndex:2];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
+        if (tg > 256) tg = 256;
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
 }
 
 void build_slot_mask_gpu(const GpuTensor& x, int offset, int K, int stride,
@@ -160,6 +224,9 @@ inline float gelu_tanh_scalar(float v) {
     float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
     return 0.5f * v * (1.0f + tanh(u));
 }
+inline float quick_gelu_scalar(float v) {
+    return v / (1.0f + exp(-1.702f * v));
+}
 
 kernel void k_silu_forward_fp32(device const float* x [[buffer(0)]],
                                 device float*       y [[buffer(1)]],
@@ -189,6 +256,56 @@ kernel void k_gelu_forward_fp16(device const half* x [[buffer(0)]],
     if (i >= n) return;
     y[i] = half(gelu_tanh_scalar(float(x[i])));
 }
+kernel void k_quick_gelu_forward_fp32(device const float* x [[buffer(0)]],
+                                      device float*       y [[buffer(1)]],
+                                      constant uint& n      [[buffer(2)]],
+                                      uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = quick_gelu_scalar(x[i]);
+}
+kernel void k_quick_gelu_forward_fp16(device const half* x [[buffer(0)]],
+                                      device half*       y [[buffer(1)]],
+                                      constant uint& n     [[buffer(2)]],
+                                      uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = half(quick_gelu_scalar(float(x[i])));
+}
+kernel void k_add_scalar_inplace_fp16(device half* y [[buffer(0)]],
+                                      constant float& s [[buffer(1)]],
+                                      constant uint& n  [[buffer(2)]],
+                                      uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = half(float(y[i]) + s);
+}
+kernel void k_scale_inplace_fp16(device half* y [[buffer(0)]],
+                                 constant float& s [[buffer(1)]],
+                                 constant uint& n  [[buffer(2)]],
+                                 uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = half(float(y[i]) * s);
+}
+kernel void k_clamp_fp32(device float* y [[buffer(0)]],
+                         constant float& lo [[buffer(1)]],
+                         constant float& hi [[buffer(2)]],
+                         constant uint&  n  [[buffer(3)]],
+                         uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    float v = y[i];
+    v = max(v, lo);
+    v = min(v, hi);
+    y[i] = v;
+}
+kernel void k_clamp_fp16(device half* y [[buffer(0)]],
+                         constant float& lo [[buffer(1)]],
+                         constant float& hi [[buffer(2)]],
+                         constant uint&  n  [[buffer(3)]],
+                         uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    float v = float(y[i]);
+    v = max(v, lo);
+    v = min(v, hi);
+    y[i] = half(v);
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -202,6 +319,12 @@ DEF_PSO(pso_silu_fp32, @"k_silu_forward_fp32")
 DEF_PSO(pso_silu_fp16, @"k_silu_forward_fp16")
 DEF_PSO(pso_gelu_fp32, @"k_gelu_forward_fp32")
 DEF_PSO(pso_gelu_fp16, @"k_gelu_forward_fp16")
+DEF_PSO(pso_quick_gelu_fp32, @"k_quick_gelu_forward_fp32")
+DEF_PSO(pso_quick_gelu_fp16, @"k_quick_gelu_forward_fp16")
+DEF_PSO(pso_add_scalar_fp16,  @"k_add_scalar_inplace_fp16")
+DEF_PSO(pso_scale_fp16,       @"k_scale_inplace_fp16")
+DEF_PSO(pso_clamp_fp32,       @"k_clamp_fp32")
+DEF_PSO(pso_clamp_fp16,       @"k_clamp_fp16")
 #undef DEF_PSO
 
 void launch_activation_unary(id<MTLComputePipelineState> pso,
@@ -240,6 +363,10 @@ void silu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
 }
 void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
     launch_activation_unary(x.dtype == Dtype::FP16 ? pso_gelu_fp16() : pso_gelu_fp32(),
+                            x, y);
+}
+void quick_gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+    launch_activation_unary(x.dtype == Dtype::FP16 ? pso_quick_gelu_fp16() : pso_quick_gelu_fp32(),
                             x, y);
 }
 

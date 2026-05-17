@@ -129,7 +129,7 @@ static void run_one(const char* label, int Lq, int Lk, int D, int nh,
         brotensor::upload(mask_host.data(), Lk, 1, mg);
         d_mask = mg.data;
     }
-    brotensor::flash_attention_forward_gpu(Qg, Kg, Vg, d_mask, nh, Og);
+    brotensor::flash_attention_forward_gpu(Qg, Kg, Vg, d_mask, nh, /*causal=*/false, Og);
     CHECK(Og.rows == Lq && Og.cols == D && Og.dtype == Dtype::FP16);
     std::vector<uint16_t> got(Og.size());
     brotensor::download_fp16(Og, got.data());
@@ -165,7 +165,7 @@ static void run_qkvo(const char* label, int Lq, int Lk, int D, int nh) {
                                            nullptr, nh, O_ref_g);
     GpuTensor O_flash_g;
     brotensor::flash_attention_qkvo_forward_gpu(Xg, &Cg, Wqg, Wkg, Wvg, Wog,
-                                                nullptr, nh, O_flash_g);
+                                                nullptr, nh, /*causal=*/false, O_flash_g);
 
     std::vector<uint16_t> ref_h(O_ref_g.size()), flash_h(O_flash_g.size());
     brotensor::download_fp16(O_ref_g, ref_h.data());
@@ -194,7 +194,7 @@ static void run_stress() {
     brotensor::upload_fp16(Qh.data(), Lq, D, Qg);
     brotensor::upload_fp16(Kh.data(), Lk, D, Kg);
     brotensor::upload_fp16(Vh.data(), Lk, D, Vg);
-    brotensor::flash_attention_forward_gpu(Qg, Kg, Vg, nullptr, nh, Og);
+    brotensor::flash_attention_forward_gpu(Qg, Kg, Vg, nullptr, nh, /*causal=*/false, Og);
     std::vector<uint16_t> got(Og.size());
     brotensor::download_fp16(Og, got.data());
     brotensor::cuda_sync();

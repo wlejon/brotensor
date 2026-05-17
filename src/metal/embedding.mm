@@ -32,6 +32,20 @@ kernel void k_emb_fw(device const float* table [[buffer(0)]],
     out[t] = table[uint(row) * D + j];
 }
 
+kernel void k_emb_fw_fp16(device const half* table [[buffer(0)]],
+                          device const int*  idx   [[buffer(1)]],
+                          device half*       out   [[buffer(2)]],
+                          constant uint& B         [[buffer(3)]],
+                          constant uint& D         [[buffer(4)]],
+                          uint t [[thread_position_in_grid]]) {
+    uint total = B * D;
+    if (t >= total) return;
+    uint b = t / D;
+    uint j = t - b * D;
+    int row = idx[b];
+    out[t] = table[uint(row) * D + j];
+}
+
 kernel void k_emb_bw(device const float* dOut          [[buffer(0)]],
                      device const int*   idx           [[buffer(1)]],
                      device atomic_float* dTable        [[buffer(2)]],
@@ -52,6 +66,12 @@ id<MTLComputePipelineState> fw_pso() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_fw"); });
+    return pso;
+}
+id<MTLComputePipelineState> fw_pso_fp16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_fw_fp16"); });
     return pso;
 }
 id<MTLComputePipelineState> bw_pso() {
@@ -85,7 +105,9 @@ void embedding_lookup_forward_gpu(const GpuTensor& table,
                                   const int32_t* d_idx, int B,
                                   GpuTensor& out) {
     const int D = table.cols;
-    if (out.rows != B || out.cols != D) out.resize(B, D);
+    if (out.rows != B || out.cols != D || out.dtype != table.dtype) {
+        out.resize(B, D, table.dtype);
+    }
     const int total = B * D;
     if (total == 0) return;
     id<MTLBuffer> bT = buffer_for(table);
@@ -96,7 +118,9 @@ void embedding_lookup_forward_gpu(const GpuTensor& table,
     NSUInteger oI = pool_lookup_offset(d_idx);
     const uint32_t Bu = static_cast<uint32_t>(B);
     const uint32_t Du = static_cast<uint32_t>(D);
-    dispatch1d(fw_pso(), total, ^(id<MTLComputeCommandEncoder> enc) {
+    id<MTLComputePipelineState> pso =
+        (table.dtype == Dtype::FP16) ? fw_pso_fp16() : fw_pso();
+    dispatch1d(pso, total, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bT offset:oT atIndex:0];
         [enc setBuffer:bI offset:oI atIndex:1];
         [enc setBuffer:bO offset:oO atIndex:2];
