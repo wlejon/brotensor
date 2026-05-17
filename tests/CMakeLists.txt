@@ -1,7 +1,7 @@
 # Minimal smoke tests for brotensor. Deep CPU↔GPU parity coverage lives in
 # brogameagent's tests since those need a CPU reference implementation.
 
-function(brotensor_add_test name)
+function(brotensor_add_executable name)
     add_executable(${name} ${ARGN})
     target_link_libraries(${name} PRIVATE brotensor)
     if(BROTENSOR_WITH_CUDA)
@@ -12,6 +12,10 @@ function(brotensor_add_test name)
     else()
         target_compile_options(${name} PRIVATE -Wall -Wextra)
     endif()
+endfunction()
+
+function(brotensor_add_test name)
+    brotensor_add_executable(${name} ${ARGN})
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
@@ -24,3 +28,7 @@ brotensor_add_test(brotensor_test_cross_attention test_cross_attention.cpp)
 brotensor_add_test(brotensor_test_fp16_basics test_fp16_basics.cpp)
 brotensor_add_test(brotensor_test_flash_attention test_flash_attention.cpp)
 brotensor_add_test(brotensor_test_resblock test_resblock.cpp)
+
+# Diffusion micro-benchmark. Built but not added to ctest — invoke
+# manually from the build dir (./tests/Release/brotensor_bench_diffusion).
+brotensor_add_executable(brotensor_bench_diffusion bench_diffusion.cpp)
