@@ -47,6 +47,8 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | mha (multi-head) | ✓ | ✓ | — | |
 | self_attention | — | — | ✓ | FP16 wrapper over cross-attention |
 | cross_attention | — | — | ✓ | thin wrapper, FP16 inference |
+| flash_attention | — | — | ✓ | tiled online-softmax, Lk-unbounded |
+| flash_attention_qkvo | — | — | ✓ | fused projections + tiled core |
 | conv2d | — | — | ✓ | NCHW, groups=1, stride/pad/dil |
 | upsample_nearest_2x | — | — | ✓ | |
 | upsample_bilinear_2x | — | — | ✓ | align_corners=False |
