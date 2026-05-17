@@ -1,8 +1,6 @@
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
-#include "fp16_internal.cuh"
-
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -212,12 +210,15 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-// Variant that fuses Q/K/V/O projections at the boundary. Reuses the matmul
-// from fp16_internal.cuh. Ctx==nullptr means self-attention (Ctx = X).
+// Variant that fuses Q/K/V/O projections at the boundary. Delegates each
+// projection to linear_forward_batched_fp16_gpu so optional biases are
+// folded in. Ctx==nullptr means self-attention (Ctx = X).
 void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
                                       const GpuTensor* Ctx,
-                                      const GpuTensor& Wq, const GpuTensor& Wk,
-                                      const GpuTensor& Wv, const GpuTensor& Wo,
+                                      const GpuTensor& Wq, const GpuTensor* bq,
+                                      const GpuTensor& Wk, const GpuTensor* bk,
+                                      const GpuTensor& Wv, const GpuTensor* bv,
+                                      const GpuTensor& Wo, const GpuTensor* bo,
                                       const float* d_mask,
                                       int num_heads,
                                       bool causal,
@@ -255,22 +256,13 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
     GpuTensor Vp(Lk, D, Dtype::FP16);
     GpuTensor Op(Lq, D, Dtype::FP16);
 
-    auto mm = [](const GpuTensor& A, const GpuTensor& B, GpuTensor& C,
-                 int M, int N, int Kdim) {
-        fp16_internal::launch_matmul_ABT(
-            reinterpret_cast<const __half*>(A.data_fp16()),
-            reinterpret_cast<const __half*>(B.data_fp16()),
-            reinterpret_cast<__half*>(C.data_fp16()),
-            M, N, Kdim);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    };
-    mm(X,      Wq, Qp, Lq, D, D);
-    mm(kv_src, Wk, Kp, Lk, D, D);
-    mm(kv_src, Wv, Vp, Lk, D, D);
+    linear_forward_batched_fp16_gpu(Wq, bq, X,      Qp);
+    linear_forward_batched_fp16_gpu(Wk, bk, kv_src, Kp);
+    linear_forward_batched_fp16_gpu(Wv, bv, kv_src, Vp);
 
     flash_attention_forward_gpu(Qp, Kp, Vp, d_mask, num_heads, causal, Op);
 
-    mm(Op, Wo, O, Lq, D, D);
+    linear_forward_batched_fp16_gpu(Wo, bo, Op, O);
 }
 
 } // namespace brotensor

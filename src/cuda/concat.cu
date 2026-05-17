@@ -3,6 +3,8 @@
 
 #include <cuda_runtime.h>
 
+#include <stdexcept>
+
 namespace brotensor {
 
 // Concatenate flat tensors end-to-end. We use cudaMemcpyAsync per part on
@@ -90,6 +92,57 @@ void concat_batched_rows_gpu(const std::vector<const GpuTensor*>& parts,
             elem * d,                 B,
             cudaMemcpyDeviceToDevice));
         col_off_bytes += elem * d;
+    }
+}
+
+// Channel-axis concat for NCHW tensors. Each part is (N, C_i * H * W) flat
+// NCHW; output is (N, total_C * H * W) with per-sample channel blocks
+// regrouped. One cudaMemcpy2DAsync per part — src/dst pitches differ so the
+// kernel/copy unit handles the per-sample stride; no kernel launches.
+void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
+                              int N, int H, int W,
+                              const std::vector<int>& C_per_part,
+                              GpuTensor& out) {
+    if (parts.size() != C_per_part.size()) {
+        throw std::runtime_error("concat_nchw_channels_gpu: parts.size() != C_per_part.size()");
+    }
+    int total_C = 0;
+    Dtype dt = Dtype::FP32;
+    bool seen = false;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        const auto* p = parts[i];
+        const int Ci = C_per_part[i];
+        if (!p) throw std::runtime_error("concat_nchw_channels_gpu: null part");
+        if (!seen) { dt = p->dtype; seen = true; }
+        else if (p->dtype != dt) {
+            throw std::runtime_error("concat_nchw_channels_gpu: dtype mismatch across parts");
+        }
+        if (p->size() != static_cast<int>(static_cast<size_t>(N) * Ci * H * W)) {
+            throw std::runtime_error("concat_nchw_channels_gpu: part size mismatch (expected N*C_i*H*W)");
+        }
+        total_C += Ci;
+    }
+    const int total_cols = total_C * H * W;
+    if (out.rows != N || out.cols != total_cols || out.dtype != dt) {
+        out.resize(N, total_cols, dt);
+    }
+    if (N == 0 || total_cols == 0) return;
+
+    const size_t elem = static_cast<size_t>(dtype_size_bytes(dt));
+    const size_t HW = static_cast<size_t>(H) * static_cast<size_t>(W);
+    const size_t dst_pitch = elem * static_cast<size_t>(total_C) * HW;
+    char* dst_base = reinterpret_cast<char*>(out.data);
+    size_t c_off = 0;  // channel offset in destination
+    for (size_t i = 0; i < parts.size(); ++i) {
+        const int Ci = C_per_part[i];
+        if (Ci == 0) continue;
+        const size_t width_bytes = elem * static_cast<size_t>(Ci) * HW;
+        BROTENSOR_CUDA_CHECK(cudaMemcpy2DAsync(
+            dst_base + c_off * HW * elem, dst_pitch,
+            parts[i]->data,                width_bytes,
+            width_bytes,                   static_cast<size_t>(N),
+            cudaMemcpyDeviceToDevice));
+        c_off += static_cast<size_t>(Ci);
     }
 }
 

@@ -187,6 +187,53 @@ static void test_concat_fp16() {
     check_fp16(gotB, RefB, "concat_batched_rows");
 }
 
+static void test_concat_nchw_channels_fp16() {
+    // Verify the per-sample channel regrouping that distinguishes
+    // concat_nchw_channels_gpu from a flat byte concat. Use N=2 so the
+    // sample-interleaving bug in concat_rows_gpu would be visible.
+    std::printf("  concat_nchw_channels fp16\n");
+    const int N = 2, H = 2, W = 3;
+    const int C1 = 2, C2 = 3, C3 = 1;
+    const int total_C = C1 + C2 + C3;
+    const int HW = H * W;
+    std::mt19937 rng(0xC0CAC07A);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> P1(N*C1*HW), P2(N*C2*HW), P3(N*C3*HW);
+    for (auto& v : P1) v = dist(rng);
+    for (auto& v : P2) v = dist(rng);
+    for (auto& v : P3) v = dist(rng);
+    auto P1q = rq(P1), P2q = rq(P2), P3q = rq(P3);
+
+    GpuTensor G1, G2, G3, Out;
+    auto P1h = to_fp16(P1), P2h = to_fp16(P2), P3h = to_fp16(P3);
+    brotensor::upload_fp16(P1h.data(), N, C1*HW, G1);
+    brotensor::upload_fp16(P2h.data(), N, C2*HW, G2);
+    brotensor::upload_fp16(P3h.data(), N, C3*HW, G3);
+    brotensor::concat_nchw_channels_gpu({&G1, &G2, &G3}, N, H, W,
+                                        {C1, C2, C3}, Out);
+    CHECK(Out.rows == N && Out.cols == total_C*HW && Out.dtype == Dtype::FP16);
+    std::vector<uint16_t> got(Out.size());
+    brotensor::download_fp16(Out, got.data());
+    brotensor::cuda_sync();
+
+    // Reference: per-sample, lay channel blocks of P1 then P2 then P3.
+    std::vector<float> Ref(N*total_C*HW);
+    for (int n = 0; n < N; ++n) {
+        int c_off = 0;
+        auto copy_part = [&](const std::vector<float>& src, int Ci) {
+            for (int c = 0; c < Ci; ++c)
+                for (int p = 0; p < HW; ++p)
+                    Ref[n*total_C*HW + (c_off + c)*HW + p] =
+                        src[n*Ci*HW + c*HW + p];
+            c_off += Ci;
+        };
+        copy_part(P1q, C1);
+        copy_part(P2q, C2);
+        copy_part(P3q, C3);
+    }
+    check_fp16(got, Ref, "concat_nchw_channels");
+}
+
 static void test_split_and_copy_d2d_fp16() {
     std::printf("  split_rows / copy_d2d fp16\n");
     std::mt19937 rng(7);
@@ -279,6 +326,7 @@ int main() {
     test_linear_fp16();
     test_elementwise_fp16();
     test_concat_fp16();
+    test_concat_nchw_channels_fp16();
     test_split_and_copy_d2d_fp16();
     test_layernorm_fp16();
     if (g_failures > 0) {

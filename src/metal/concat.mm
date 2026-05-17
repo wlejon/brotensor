@@ -4,6 +4,7 @@
 #import "internal.h"
 
 #include <cstring>
+#include <stdexcept>
 
 namespace brotensor {
 
@@ -93,6 +94,54 @@ void concat_batched_rows_gpu(const std::vector<const GpuTensor*>& parts,
                        row_bytes);
         }
         col_off_bytes += row_bytes;
+    }
+}
+
+void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
+                              int N, int H, int W,
+                              const std::vector<int>& C_per_part,
+                              GpuTensor& out) {
+    if (parts.size() != C_per_part.size()) {
+        throw std::runtime_error("concat_nchw_channels_gpu: parts.size() != C_per_part.size()");
+    }
+    int total_C = 0;
+    Dtype dt = Dtype::FP32;
+    bool seen = false;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const auto* p = parts[i];
+        const int Ci = C_per_part[i];
+        if (!p) throw std::runtime_error("concat_nchw_channels_gpu: null part");
+        if (!seen) { dt = p->dtype; seen = true; }
+        else if (p->dtype != dt) {
+            throw std::runtime_error("concat_nchw_channels_gpu: dtype mismatch across parts");
+        }
+        if (p->size() != static_cast<int>(static_cast<std::size_t>(N) * Ci * H * W)) {
+            throw std::runtime_error("concat_nchw_channels_gpu: part size mismatch (expected N*C_i*H*W)");
+        }
+        total_C += Ci;
+    }
+    const int total_cols = total_C * H * W;
+    if (out.rows != N || out.cols != total_cols || out.dtype != dt) {
+        out.resize(N, total_cols, dt);
+    }
+    if (N == 0 || total_cols == 0) return;
+
+    const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(dt));
+    const std::size_t HW = static_cast<std::size_t>(H) * static_cast<std::size_t>(W);
+    const std::size_t dst_pitch = elem * static_cast<std::size_t>(total_C) * HW;
+    char* dst_base = reinterpret_cast<char*>(out.data);
+    std::size_t c_off = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const int Ci = C_per_part[i];
+        if (Ci == 0) continue;
+        const std::size_t width_bytes = elem * static_cast<std::size_t>(Ci) * HW;
+        const char* src = reinterpret_cast<const char*>(parts[i]->data);
+        for (int n = 0; n < N; ++n) {
+            copy_bytes(dst_base + static_cast<std::size_t>(n) * dst_pitch + c_off * HW * elem,
+                       src + static_cast<std::size_t>(n) * width_bytes,
+                       width_bytes);
+        }
+        c_off += static_cast<std::size_t>(Ci);
     }
 }
 

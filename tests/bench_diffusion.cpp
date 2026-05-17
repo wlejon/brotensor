@@ -103,7 +103,9 @@ void bench_self_attention(int Lq, int D, int nh, std::vector<Row>& rows) {
         });
     }
     float ms_fu = time_loop_ms(ITERS, [&] {
-        brotensor::flash_attention_qkvo_forward_gpu(X, nullptr, Wq, Wk, Wv, Wo,
+        brotensor::flash_attention_qkvo_forward_gpu(X, nullptr,
+                                                    Wq, nullptr, Wk, nullptr,
+                                                    Wv, nullptr, Wo, nullptr,
                                                     nullptr, nh, /*causal=*/false, O_b);
     });
     if (!sanity_finite(O_b))
@@ -127,7 +129,9 @@ void bench_cross_attention(int Lq, int Lk, int D, int nh, std::vector<Row>& rows
                                                nullptr, nh, O_a);
     });
     float ms_fu = time_loop_ms(ITERS, [&] {
-        brotensor::flash_attention_qkvo_forward_gpu(X, &Ctx, Wq, Wk, Wv, Wo,
+        brotensor::flash_attention_qkvo_forward_gpu(X, &Ctx,
+                                                    Wq, nullptr, Wk, nullptr,
+                                                    Wv, nullptr, Wo, nullptr,
                                                     nullptr, nh, /*causal=*/false, O_b);
     });
     if (!sanity_finite(O_b))

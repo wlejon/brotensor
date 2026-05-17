@@ -330,6 +330,26 @@ void split_rows_gpu(const GpuTensor& in,
 void concat_batched_rows_gpu(const std::vector<const GpuTensor*>& parts,
                              GpuTensor& out);
 
+// Channel-axis concat over NCHW tensors. Each part i is shape
+// (N, C_i * H * W) (flat NCHW); out becomes (N, sum_i C_i * H * W) with the
+// channel blocks regrouped per sample:
+//
+//   out[n, (off_i + c) * H*W + h*W + w] = parts[i][n, c * H*W + h*W + w]
+//
+// where off_i = sum_{j < i} C_j.
+//
+// Implemented via cudaMemcpy2DAsync per part — dtype-dispatched (FP16/FP32),
+// bandwidth-bound, no kernel launches. This is the correct U-Net skip-merge
+// concat for N >= 1; a flat byte concat (concat_rows_gpu) would interleave
+// samples incorrectly for N > 1.
+//
+// C_per_part.size() must equal parts.size(); part i must have size
+// N * C_per_part[i] * H * W. All parts share dtype.
+void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
+                              int N, int H, int W,
+                              const std::vector<int>& C_per_part,
+                              GpuTensor& out);
+
 // Single-stream device-to-device chunk copy. Copies `n` floats from
 // src.data + src_off into dst.data + dst_off. Both tensors are treated as
 // flat float buffers regardless of (rows, cols). Async on the default stream.
@@ -653,6 +673,9 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
 //   Ctx: (Lk, D) or null  FP16, key/value source; null means self-attention
 //                          (Ctx ← X, Lk ← Lq).
 //   Wq, Wk, Wv, Wo: each (D, D)  FP16
+//   bq, bk, bv, bo: optional (D, 1) FP16 biases for the corresponding
+//                   projection. Pass nullptr to skip. SD1.5 CLIP attention
+//                   has all four; UNet/VAE attention typically has only bo.
 //   d_mask: optional length-Lk FP32 mask.
 //   num_heads: must divide D.
 //   causal: see flash_attention_forward_gpu. Typically paired with Ctx ==
@@ -660,8 +683,10 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
 //   O:   (Lq, D)  FP16; resized as needed.
 void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
                                       const GpuTensor* Ctx,
-                                      const GpuTensor& Wq, const GpuTensor& Wk,
-                                      const GpuTensor& Wv, const GpuTensor& Wo,
+                                      const GpuTensor& Wq, const GpuTensor* bq,
+                                      const GpuTensor& Wk, const GpuTensor* bk,
+                                      const GpuTensor& Wv, const GpuTensor* bv,
+                                      const GpuTensor& Wo, const GpuTensor* bo,
                                       const float* d_mask,
                                       int num_heads,
                                       bool causal,

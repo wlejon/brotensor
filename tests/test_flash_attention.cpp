@@ -164,7 +164,9 @@ static void run_qkvo(const char* label, int Lq, int Lk, int D, int nh) {
     brotensor::cross_attention_forward_gpu(Xg, Cg, Wqg, Wkg, Wvg, Wog,
                                            nullptr, nh, O_ref_g);
     GpuTensor O_flash_g;
-    brotensor::flash_attention_qkvo_forward_gpu(Xg, &Cg, Wqg, Wkg, Wvg, Wog,
+    brotensor::flash_attention_qkvo_forward_gpu(Xg, &Cg,
+                                                Wqg, nullptr, Wkg, nullptr,
+                                                Wvg, nullptr, Wog, nullptr,
                                                 nullptr, nh, /*causal=*/false, O_flash_g);
 
     std::vector<uint16_t> ref_h(O_ref_g.size()), flash_h(O_flash_g.size());
@@ -174,6 +176,72 @@ static void run_qkvo(const char* label, int Lq, int Lk, int D, int nh) {
     std::vector<float> ref(ref_h.size());
     for (size_t i = 0; i < ref.size(); ++i) ref[i] = brotensor::fp16_bits_to_fp32(ref_h[i]);
     check_fp16(flash_h, ref, label);
+}
+
+// Verify the optional bias path of flash_attention_qkvo_forward_gpu against a
+// CPU reference. We project Q/K/V/O with explicit biases on the host and
+// compare to the GPU op called with all four biases. Tests the case
+// brodiffusion needs for CLIP attention (all biases present).
+static void run_qkvo_with_biases(const char* label, int Lq, int Lk, int D, int nh) {
+    std::printf("  %s qkvo+biases Lq=%d Lk=%d D=%d nh=%d\n", label, Lq, Lk, D, nh);
+    std::mt19937 rng(0xB1A5);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    std::vector<float> X(Lq*D), Ctx(Lk*D);
+    std::vector<float> Wq(D*D), Wk(D*D), Wv(D*D), Wo(D*D);
+    std::vector<float> bq(D), bk(D), bv(D), bo(D);
+    auto fill = [&](std::vector<float>& v) { for (auto& x : v) x = dist(rng); };
+    fill(X); fill(Ctx);
+    fill(Wq); fill(Wk); fill(Wv); fill(Wo);
+    fill(bq); fill(bk); fill(bv); fill(bo);
+
+    auto Xq = rq(X), Ctxq = rq(Ctx);
+    auto Wqq = rq(Wq), Wkq = rq(Wk), Wvq = rq(Wv), Woq = rq(Wo);
+    auto bqq = rq(bq), bkq = rq(bk), bvq = rq(bv), boq = rq(bo);
+
+    // CPU: project Q = X @ Wq^T + bq, etc., then attn, then O = Op @ Wo^T + bo.
+    auto proj = [](const std::vector<float>& A, const std::vector<float>& W,
+                   const std::vector<float>& b, int M, int Dim,
+                   std::vector<float>& Out) {
+        Out.assign(static_cast<size_t>(M) * Dim, 0.0f);
+        for (int m = 0; m < M; ++m)
+            for (int n = 0; n < Dim; ++n) {
+                double s = b[n];
+                for (int k = 0; k < Dim; ++k)
+                    s += static_cast<double>(A[m*Dim + k]) * W[n*Dim + k];
+                Out[m*Dim + n] = static_cast<float>(s);
+            }
+    };
+    std::vector<float> Qp, Kp, Vp, Op, O_ref;
+    proj(Xq,   Wqq, bqq, Lq, D, Qp);
+    proj(Ctxq, Wkq, bkq, Lk, D, Kp);
+    proj(Ctxq, Wvq, bvq, Lk, D, Vp);
+    attn_qkv_cpu(Qp, Kp, Vp, nullptr, Lq, Lk, D, nh, Op);
+    proj(Op, Woq, boq, Lq, D, O_ref);
+
+    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog, bqg, bkg, bvg, bog;
+    auto Xh = to_fp16(X), Ch = to_fp16(Ctx);
+    auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
+    auto bqh = to_fp16(bq), bkh = to_fp16(bk), bvh = to_fp16(bv), boh = to_fp16(bo);
+    brotensor::upload_fp16(Xh.data(),  Lq, D, Xg);
+    brotensor::upload_fp16(Ch.data(),  Lk, D, Cg);
+    brotensor::upload_fp16(Wqh.data(), D, D, Wqg);
+    brotensor::upload_fp16(Wkh.data(), D, D, Wkg);
+    brotensor::upload_fp16(Wvh.data(), D, D, Wvg);
+    brotensor::upload_fp16(Woh.data(), D, D, Wog);
+    brotensor::upload_fp16(bqh.data(), D, 1, bqg);
+    brotensor::upload_fp16(bkh.data(), D, 1, bkg);
+    brotensor::upload_fp16(bvh.data(), D, 1, bvg);
+    brotensor::upload_fp16(boh.data(), D, 1, bog);
+
+    GpuTensor Og;
+    brotensor::flash_attention_qkvo_forward_gpu(Xg, &Cg,
+                                                Wqg, &bqg, Wkg, &bkg,
+                                                Wvg, &bvg, Wog, &bog,
+                                                nullptr, nh, /*causal=*/false, Og);
+    std::vector<uint16_t> got(Og.size());
+    brotensor::download_fp16(Og, got.data());
+    brotensor::cuda_sync();
+    check_fp16(got, O_ref, label);
 }
 
 static void run_stress() {
@@ -222,6 +290,7 @@ int main() {
     run_one("ktile-cross", 4, 130, 32, 4, false);   // forces multiple Lk tiles
     run_qkvo("qkvo small", 6, 7, 32, 4);
     run_qkvo("qkvo self",  8, 8, 32, 4);
+    run_qkvo_with_biases("qkvo biases", 6, 7, 32, 4);
     run_stress();
 
     if (g_failures > 0) {

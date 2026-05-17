@@ -27,26 +27,6 @@ constant uint FA_BLOCK = 128;
 constant uint FA_KTILE = 64;
 constant uint MAX_HD_PER_THREAD = 8;
 
-// Naive FP16 matmul A·Bᵀ. Local to this MSL library; mirrored from
-// fp16_internal.cuh.
-kernel void k_matmul_abt_fp16(device const half* A [[buffer(0)]],
-                              device const half* B [[buffer(1)]],
-                              device half*       C [[buffer(2)]],
-                              constant uint& M     [[buffer(3)]],
-                              constant uint& N     [[buffer(4)]],
-                              constant uint& K     [[buffer(5)]],
-                              uint idx [[thread_position_in_grid]]) {
-    uint total = M * N;
-    if (idx >= total) return;
-    uint m = idx / N;
-    uint n = idx % N;
-    float acc = 0.0f;
-    for (uint k = 0; k < K; ++k) {
-        acc += float(A[m * K + k]) * float(B[n * K + k]);
-    }
-    C[idx] = half(acc);
-}
-
 // Flash-attention online-softmax kernel. One threadgroup per (q, head).
 // Tiles K/V along Lk (FA_KTILE = 64). Per-thread partial output kept in
 // registers (`partial[]`), strided over head_dim with up to MAX_HD_PER_THREAD
@@ -181,44 +161,6 @@ id<MTLComputePipelineState> pso_flash() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention"); });
     return pso;
 }
-id<MTLComputePipelineState> pso_matmul_abt() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_matmul_abt_fp16"); });
-    return pso;
-}
-
-void launch_matmul_abt(const GpuTensor& A, const GpuTensor& B, GpuTensor& C,
-                       int M, int N, int Kdim) {
-    const uint32_t total = static_cast<uint32_t>(M) * static_cast<uint32_t>(N);
-    if (total == 0) return;
-    id<MTLComputePipelineState> pso = pso_matmul_abt();
-    id<MTLBuffer> bA = buffer_for(A);
-    id<MTLBuffer> bB = buffer_for(B);
-    id<MTLBuffer> bC = buffer_for(C);
-    const NSUInteger oA = buffer_offset_for(A);
-    const NSUInteger oB = buffer_offset_for(B);
-    const NSUInteger oC = buffer_offset_for(C);
-    const uint32_t Mu = M, Nu = N, Ku = Kdim;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bA offset:oA atIndex:0];
-        [enc setBuffer:bB offset:oB atIndex:1];
-        [enc setBuffer:bC offset:oC atIndex:2];
-        [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
-        [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > 256) tg = 256;
-        [enc dispatchThreads:MTLSizeMake(total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
-    }
-}
 
 } // namespace
 
@@ -298,8 +240,10 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
 
 void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
                                       const GpuTensor* Ctx,
-                                      const GpuTensor& Wq, const GpuTensor& Wk,
-                                      const GpuTensor& Wv, const GpuTensor& Wo,
+                                      const GpuTensor& Wq, const GpuTensor* bq,
+                                      const GpuTensor& Wk, const GpuTensor* bk,
+                                      const GpuTensor& Wv, const GpuTensor* bv,
+                                      const GpuTensor& Wo, const GpuTensor* bo,
                                       const float* d_mask,
                                       int num_heads,
                                       bool causal,
@@ -337,13 +281,13 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
     GpuTensor Vp(Lk, D, Dtype::FP16);
     GpuTensor Op(Lq, D, Dtype::FP16);
 
-    launch_matmul_abt(X,      Wq, Qp, Lq, D, D);
-    launch_matmul_abt(kv_src, Wk, Kp, Lk, D, D);
-    launch_matmul_abt(kv_src, Wv, Vp, Lk, D, D);
+    linear_forward_batched_fp16_gpu(Wq, bq, X,      Qp);
+    linear_forward_batched_fp16_gpu(Wk, bk, kv_src, Kp);
+    linear_forward_batched_fp16_gpu(Wv, bv, kv_src, Vp);
 
     flash_attention_forward_gpu(Qp, Kp, Vp, d_mask, num_heads, causal, Op);
 
-    launch_matmul_abt(Op, Wo, O, Lq, D, D);
+    linear_forward_batched_fp16_gpu(Wo, bo, Op, O);
 }
 
 } // namespace brotensor
