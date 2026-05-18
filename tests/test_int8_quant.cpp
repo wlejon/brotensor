@@ -5,7 +5,18 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#if defined(BROTENSOR_HAS_CUDA)
 #include <cuda_runtime.h>
+#else
+#include <cstring>
+// On Metal the GpuTensor.data points to a host-shared MTLBuffer, so a plain
+// memcpy is equivalent to a H2D copy. Provide a tiny shim so the test body
+// stays backend-agnostic.
+static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
+    std::memcpy(dst, src, n);
+}
+#define cudaMemcpyHostToDevice 0
+#endif
 
 #include <cmath>
 #include <cstdint>
