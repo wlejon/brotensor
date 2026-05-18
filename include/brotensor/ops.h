@@ -1348,4 +1348,99 @@ void resblock_backward_gpu(const GpuTensor& X,
                            GpuTensor& dW2, GpuTensor* db2,
                            GpuTensor* dWskip, GpuTensor* dbskip);
 
+// ─── Llama-style transformer ops (forward + backward where noted) ──────────
+
+// Plain row-major matrix multiply with no bias:
+//   C(M, N) = A(M, K) @ B(K, N)
+// Dispatched on A.dtype; B and C must share A.dtype (C is resized AND
+// dtype-set to match A if mis-shaped/-typed). Internal accumulation is in
+// FP32 for both FP32 and FP16 paths.
+void matmul_gpu(const GpuTensor& A, const GpuTensor& B, GpuTensor& C);
+
+// RoPE (rotary position embedding) forward. Applied per head:
+//   x_{2i}   ← x_{2i} * cos(θ) - x_{2i+1} * sin(θ)
+//   x_{2i+1} ← x_{2i} * sin(θ) + x_{2i+1} * cos(θ)
+// where θ = pos * theta_base^{-2i/head_dim} for token position `pos` and
+// dimension pair index i in [0, head_dim/2). seq_offset shifts the position
+// of row 0 (KV-cache decode starts at the previous valid length).
+//
+//   X: (L, num_heads * head_dim)  — input
+//   Y: (L, num_heads * head_dim)  — output, resized AND dtype-set to match X
+// head_dim must be even. Dispatched on X.dtype (FP32 or FP16).
+void rope_forward_gpu(const GpuTensor& X, int head_dim, int num_heads,
+                     int seq_offset, float theta_base, GpuTensor& Y);
+
+// RoPE backward. Equivalent to applying the inverse (transpose) rotation to
+// dY pair-wise per head:
+//   dX_{2i}   ← dY_{2i} * cos(θ) + dY_{2i+1} * sin(θ)
+//   dX_{2i+1} ← -dY_{2i} * sin(θ) + dY_{2i+1} * cos(θ)
+//   dY: (L, num_heads * head_dim)
+//   dX: (L, num_heads * head_dim) — resized AND dtype-set to match dY.
+// Dispatched on dY.dtype.
+void rope_backward_gpu(const GpuTensor& dY, int head_dim, int num_heads,
+                      int seq_offset, float theta_base, GpuTensor& dX);
+
+// RMSNorm forward, per row:
+//   rms[b] = sqrt(mean_j x[b, j]^2 + eps)
+//   y[b, j] = x[b, j] * gamma[j] / rms[b]
+//   X:     (B, D) input
+//   gamma: (D, 1) scale (same dtype as X)
+//   Y:     (B, D) output, resized AND dtype-set to match X if mis-shaped/-typed.
+// Dispatched on X.dtype (FP32 or FP16). FP32 accumulation internally.
+void rms_norm_forward_gpu(const GpuTensor& X, const GpuTensor& gamma,
+                         float eps, GpuTensor& Y);
+
+// RMSNorm backward.
+//   X:      (B, D) forward input
+//   gamma:  (D, 1) forward scale
+//   dY:     (B, D) upstream gradient (same dtype as X)
+//   dX:     (B, D) overwritten (resized + dtype-set to match X if mis-shaped/-typed)
+//   dGamma: (D, 1) *accumulated* — caller zeros. Same dtype as X. For FP16
+//                  storage, an FP32 scratch + fold epilogue is used.
+void rms_norm_backward_gpu(const GpuTensor& X, const GpuTensor& gamma,
+                          const GpuTensor& dY, float eps,
+                          GpuTensor& dX, GpuTensor& dGamma);
+
+// SwiGLU (Llama FFN gate). Input (B, 2*D) is split along the last dim into
+// halves A=(B, D) and B_half=(B, D); output (B, D) = silu(A) * B_half.
+//   X:  (B, 2*D)  input
+//   Y:  (B, D)    output, resized AND dtype-set to match X if mis-shaped/-typed.
+// Dispatched on X.dtype (FP32 or FP16; FP16 accumulates in FP32).
+void swiglu_forward_gpu(const GpuTensor& X, GpuTensor& Y);
+
+// SwiGLU backward. Splits X into A and B_half. Let s = silu(A).
+//   dA      = dY * B_half * silu'(A)
+//   dB_half = dY * s
+// dX = concat(dA, dB_half) along the last dim with layout matching the
+// forward (A then B_half). Dispatched on X.dtype.
+void swiglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
+                        GpuTensor& dX);
+
+// KV-cache append (FP16). Copies K_new and V_new into rows
+// [cur_len, cur_len + L_new) of K_cache and V_cache respectively. Both new
+// tensors and both caches are FP16 with matching cols (== D). L_new + cur_len
+// must fit within K_cache.rows / V_cache.rows (caller pre-allocates).
+//   K_new, V_new:     (L_new, D)  FP16
+//   K_cache, V_cache: (L_max, D)  FP16 — must already be sized; not resized.
+void kv_cache_append_gpu(const GpuTensor& K_new, const GpuTensor& V_new,
+                       int cur_len, GpuTensor& K_cache, GpuTensor& V_cache);
+
+// Causal flash-attention against a partially-filled KV cache (FP16, fwd-only).
+// Runs the tiled attention core (same as flash_attention_forward_gpu) against
+// the first `valid_len` rows of K_cache and V_cache. Query position
+// p_q = seq_offset + i (with seq_offset = valid_len - L_q) attends to cache
+// positions [0, p_q]; entries with cache index > p_q are masked out
+// (causal mask).
+//
+//   Q:        (L_q, D)        FP16  — typically L_q == 1 for token-by-token
+//                                     decoding but L_q > 1 is supported.
+//   K_cache:  (L_max, D)      FP16  — only rows [0, valid_len) are read.
+//   V_cache:  (L_max, D)      FP16
+//   valid_len: number of valid cache rows (>= L_q).
+//   num_heads: must divide D.
+//   O:        (L_q, D)        FP16  — resized as needed.
+void flash_attention_decode_gpu(const GpuTensor& Q,
+                               const GpuTensor& K_cache, const GpuTensor& V_cache,
+                               int valid_len, int num_heads, GpuTensor& O);
+
 } // namespace brotensor

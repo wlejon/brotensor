@@ -31,6 +31,11 @@ brotensor_add_test(brotensor_test_resblock test_resblock.cpp)
 brotensor_add_test(brotensor_test_diffusion_primitives test_diffusion_primitives.cpp)
 brotensor_add_test(brotensor_test_transpose test_transpose.cpp)
 brotensor_add_test(brotensor_test_large_elementwise test_large_elementwise.cpp)
+brotensor_add_test(brotensor_test_matmul test_matmul.cpp)
+brotensor_add_test(brotensor_test_rope test_rope.cpp)
+brotensor_add_test(brotensor_test_rms_norm test_rms_norm.cpp)
+brotensor_add_test(brotensor_test_swiglu test_swiglu.cpp)
+brotensor_add_test(brotensor_test_kv_cache test_kv_cache.cpp)
 
 # Diffusion micro-benchmark. Built but not added to ctest — invoke
 # manually from the build dir (./tests/Release/brotensor_bench_diffusion).
