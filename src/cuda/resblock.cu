@@ -131,10 +131,16 @@ void resblock_forward_gpu(const GpuTensor& X,
     }
     if (N == 0 || spatial == 0) return;
 
-    // Scratch buffers.
-    GpuTensor h1(N, C_in  * spatial, Dtype::FP16);   // post-GN1+SiLU
-    GpuTensor h2(N, C_out * spatial, Dtype::FP16);   // post-conv1 (+t_shift)
-    GpuTensor h3(N, C_out * spatial, Dtype::FP16);   // post-GN2+SiLU
+    // Scratch buffers. thread_local static so that repeated calls at the
+    // same shapes reuse the underlying cudaMalloc'd storage (GpuTensor::resize
+    // is a no-op when shape+dtype match). Destruction at thread exit frees
+    // via cudaFree, which is fine.
+    thread_local static GpuTensor h1;  // post-GN1+SiLU
+    thread_local static GpuTensor h2;  // post-conv1 (+t_shift)
+    thread_local static GpuTensor h3;  // post-GN2+SiLU
+    h1.resize(N, C_in  * spatial, Dtype::FP16);
+    h2.resize(N, C_out * spatial, Dtype::FP16);
+    h3.resize(N, C_out * spatial, Dtype::FP16);
 
     // Leg 1: GN1 → SiLU, fused.
     {
@@ -193,7 +199,8 @@ void resblock_forward_gpu(const GpuTensor& X,
     }
 
     // Prepare the skip tensor for the conv2 epilogue (post-conv2 add).
-    GpuTensor skip_scratch;
+    // Reused across calls; conv2d_forward_gpu will resize as needed.
+    thread_local static GpuTensor skip_scratch;
     if (Wskip != nullptr) {
         if (Wskip->dtype != Dtype::FP16) {
             throw std::runtime_error("resblock_forward_gpu: Wskip must be FP16");
