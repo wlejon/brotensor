@@ -216,6 +216,22 @@ NSString* const kActivationSrc = @R"msl(
 #include <metal_stdlib>
 using namespace metal;
 
+// MSL has no built-in erf; Abramowitz & Stegun 7.1.26 (max abs err ~1.5e-7).
+inline float erf_approx(float x) {
+    const float a1 =  0.254829592f;
+    const float a2 = -0.284496736f;
+    const float a3 =  1.421413741f;
+    const float a4 = -1.453152027f;
+    const float a5 =  1.061405429f;
+    const float p  =  0.3275911f;
+    float sign_x = (x < 0.0f) ? -1.0f : 1.0f;
+    float ax = fabs(x);
+    float t  = 1.0f / (1.0f + p * ax);
+    float y  = 1.0f - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-ax * ax);
+    return sign_x * y;
+}
+#define erf(x) erf_approx(x)
+
 inline float silu_scalar(float v) {
     return v / (1.0f + exp(-v));
 }
@@ -550,6 +566,22 @@ namespace {
 NSString* const kFp16ExtSrc = @R"msl(
 #include <metal_stdlib>
 using namespace metal;
+
+// MSL has no built-in erf; Abramowitz & Stegun 7.1.26 (max abs err ~1.5e-7).
+inline float erf_approx(float x) {
+    const float a1 =  0.254829592f;
+    const float a2 = -0.284496736f;
+    const float a3 =  1.421413741f;
+    const float a4 = -1.453152027f;
+    const float a5 =  1.061405429f;
+    const float p  =  0.3275911f;
+    float sign_x = (x < 0.0f) ? -1.0f : 1.0f;
+    float ax = fabs(x);
+    float t  = 1.0f / (1.0f + p * ax);
+    float y  = 1.0f - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-ax * ax);
+    return sign_x * y;
+}
+#define erf(x) erf_approx(x)
 
 inline float gelu_tanh_scalar(float v) {
     constexpr float kSqrt2OverPi = 0.7978845608f;
