@@ -95,6 +95,8 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/group_norm.cu
         src/cuda/resample.cu
         src/cuda/cross_attention.cu
+        src/cuda/cross_attention_with_attn.cu
+        src/cuda/attention_moments.cu
         src/cuda/flash_attention.cu
         src/cuda/flash_attention_backward.cu
         src/cuda/resblock.cu

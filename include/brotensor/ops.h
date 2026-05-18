@@ -935,6 +935,38 @@ void cross_attention_forward_gpu(const GpuTensor& X,
                                  int num_heads,
                                  GpuTensor& O);
 
+// Cross-attention with explicit attention-map output and optional pre-softmax
+// logit bias. Same math as cross_attention_forward_gpu (FP16) but:
+//   * if `attn_logit_bias` is non-null it is added (FP32) to the scaled QKᵀ
+//     scores *before* softmax, broadcast across heads (shape (Lq, Lk));
+//   * after softmax the attention probabilities are averaged across heads
+//     and written to AttnAvg (FP16, shape (Lq, Lk)).
+// Designed for Cross-Attention Tree Search: the diffusion inference loop
+// inspects head-averaged attention maps and may inject VLM/CLIP-derived
+// logit biases. FP16 only, FP32 accumulation throughout. No backward.
+//
+//   X:    (Lq, D)      FP16 query input
+//   Ctx:  (Lk, D_ctx)  FP16 key/value input
+//   Wq:   (D, D)       FP16 — projects X → Q
+//   Wk:   (D, D_ctx)   FP16 — projects Ctx → K
+//   Wv:   (D, D_ctx)   FP16 — projects Ctx → V
+//   Wo:   (D, D)       FP16 — output projection
+//   d_mask: optional length-Lk FP32 mask (1 valid, 0 invalid). May be null.
+//   attn_logit_bias: optional (Lq, Lk) FP32 pre-softmax bias. May be null.
+//   num_heads: must divide D.
+//   O:       (Lq, D)  FP16 output, resized AND dtype-set if mis-shaped/-typed.
+//   AttnAvg: (Lq, Lk) FP16 head-averaged softmax, resized AND dtype-set
+//                     if mis-shaped/-typed.
+void cross_attention_forward_with_attn_gpu(const GpuTensor& X,
+                                           const GpuTensor& Ctx,
+                                           const GpuTensor& Wq, const GpuTensor& Wk,
+                                           const GpuTensor& Wv, const GpuTensor& Wo,
+                                           const float* d_mask,
+                                           const GpuTensor* attn_logit_bias,
+                                           int num_heads,
+                                           GpuTensor& O,
+                                           GpuTensor& AttnAvg);
+
 // FP32 training-side self-attention forward. Thin wrapper over mha_forward_gpu
 // (signatures match exactly when D_ctx == D and Ctx == X).
 //   X:   (L, D) FP32
@@ -976,6 +1008,23 @@ void self_attention_backward_gpu(const GpuTensor& dO,
                                  GpuTensor& dX,
                                  GpuTensor& dWq, GpuTensor& dWk,
                                  GpuTensor& dWv, GpuTensor& dWo);
+
+// Per-text-token spatial moments of a cross-attention map. Given an attention
+// matrix Attn(Lq, Lk) where Lq = h_lat * w_lat is a flattened image-token grid
+// in row-major (q = y * w_lat + x), compute for each text token k:
+//   mass[k]        = sum_q Attn[q, k]
+//   centroid[k, 0] = (sum_q y(q) * Attn[q, k]) / max(mass[k], 1e-8)
+//   centroid[k, 1] = (sum_q x(q) * Attn[q, k]) / max(mass[k], 1e-8)
+// When mass[k] is effectively zero the centroid is set to (0, 0). Used as a
+// MCTS reward primitive to check whether different text tokens attend to
+// physically separated latent regions. FP32 reductions over FP16 input.
+//   Attn:     (Lq, Lk) FP16, Lq = h_lat * w_lat
+//   mass:     (Lk, 1)  FP32, resized if mis-shaped
+//   centroid: (Lk, 2)  FP32, resized if mis-shaped, [y, x] per row
+void attention_token_moments_gpu(const GpuTensor& Attn,
+                                 int h_lat, int w_lat,
+                                 GpuTensor& mass,
+                                 GpuTensor& centroid);
 
 // FP32 training-side cross-attention forward. Mirrors mha_forward_gpu math
 // but accepts a separate Ctx tensor for K/V projection and rectangular
