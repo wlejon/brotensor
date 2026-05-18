@@ -6,9 +6,11 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -315,6 +317,188 @@ static void test_layernorm_fp16() {
     check_fp16(got, Ref, "layernorm");
 }
 
+static void test_linear_backward_batched_fp16() {
+    std::printf("  linear_backward_batched_fp16\n");
+    // Two shapes — small and larger — to exercise both paths.
+    for (auto shape : std::vector<std::array<int,3>>{ {3, 7, 5}, {8, 32, 16} }) {
+        const int B = shape[0], in_dim = shape[1], out_dim = shape[2];
+        std::mt19937 rng(static_cast<uint32_t>(B * 1009 + in_dim));
+        std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+        std::vector<float> Wf(out_dim * in_dim), Xf(B * in_dim), dYf(B * out_dim);
+        for (auto& v : Wf) v = dist(rng);
+        for (auto& v : Xf) v = dist(rng);
+        for (auto& v : dYf) v = dist(rng);
+        auto Wq = rq(Wf), Xq = rq(Xf), dYq = rq(dYf);
+
+        // CPU references in FP32.
+        std::vector<float> dX_ref(B * in_dim, 0.0f),
+                          dW_ref(out_dim * in_dim, 0.0f),
+                          dB_ref(out_dim, 0.0f);
+        for (int b = 0; b < B; ++b)
+            for (int j = 0; j < in_dim; ++j) {
+                double a = 0.0;
+                for (int i = 0; i < out_dim; ++i)
+                    a += static_cast<double>(Wq[i*in_dim+j]) * dYq[b*out_dim+i];
+                dX_ref[b*in_dim+j] = static_cast<float>(a);
+            }
+        for (int i = 0; i < out_dim; ++i)
+            for (int j = 0; j < in_dim; ++j) {
+                double a = 0.0;
+                for (int b = 0; b < B; ++b)
+                    a += static_cast<double>(dYq[b*out_dim+i]) * Xq[b*in_dim+j];
+                dW_ref[i*in_dim+j] = static_cast<float>(a);
+            }
+        for (int i = 0; i < out_dim; ++i) {
+            double a = 0.0;
+            for (int b = 0; b < B; ++b) a += dYq[b*out_dim+i];
+            dB_ref[i] = static_cast<float>(a);
+        }
+
+        GpuTensor Wg, Xg, dYg, dXg, dWg, dBg;
+        auto Wh = to_fp16(Wf), Xh = to_fp16(Xf), dYh = to_fp16(dYf);
+        brotensor::upload_fp16(Wh.data(), out_dim, in_dim, Wg);
+        brotensor::upload_fp16(Xh.data(), B, in_dim, Xg);
+        brotensor::upload_fp16(dYh.data(), B, out_dim, dYg);
+        std::vector<uint16_t> z_dw(out_dim * in_dim,
+                                   brotensor::fp32_to_fp16_bits(0.0f));
+        std::vector<uint16_t> z_db(out_dim,
+                                   brotensor::fp32_to_fp16_bits(0.0f));
+        brotensor::upload_fp16(z_dw.data(), out_dim, in_dim, dWg);
+        brotensor::upload_fp16(z_db.data(), out_dim, 1, dBg);
+
+        brotensor::linear_backward_batched_gpu(Wg, Xg, dYg, dXg, dWg, dBg);
+        CHECK(dXg.dtype == Dtype::FP16);
+        CHECK(dWg.dtype == Dtype::FP16);
+        CHECK(dBg.dtype == Dtype::FP16);
+
+        std::vector<uint16_t> dx_got(dXg.size()), dw_got(dWg.size()), db_got(dBg.size());
+        brotensor::download_fp16(dXg, dx_got.data());
+        brotensor::download_fp16(dWg, dw_got.data());
+        brotensor::download_fp16(dBg, db_got.data());
+        brotensor::cuda_sync();
+        std::printf("    shape B=%d in=%d out=%d\n", B, in_dim, out_dim);
+        check_fp16(dx_got, dX_ref, "linbwd-dX");
+        check_fp16(dw_got, dW_ref, "linbwd-dW");
+        check_fp16(db_got, dB_ref, "linbwd-dB");
+    }
+}
+
+static void test_layernorm_backward_fp16() {
+    std::printf("  layernorm_backward_fp16\n");
+    for (int n : {16, 64}) {
+        std::mt19937 rng(static_cast<uint32_t>(0xABCD + n));
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> X(n), G(n), Bf(n), dYf(n);
+        for (auto& v : X)  v = dist(rng);
+        for (auto& v : G)  v = 0.5f + 0.5f * dist(rng);
+        for (auto& v : Bf) v = dist(rng);
+        for (auto& v : dYf) v = dist(rng);
+        auto Xq = rq(X), Gq = rq(G), Bq = rq(Bf), dYq = rq(dYf);
+
+        // Forward in FP32 (round through fp16) to get xhat and rstd.
+        const float eps = 1e-5f;
+        double s = 0.0;
+        for (int i = 0; i < n; ++i) s += Xq[i];
+        const float mean = static_cast<float>(s / n);
+        double sv = 0.0;
+        for (int i = 0; i < n; ++i) { double d = Xq[i] - mean; sv += d*d; }
+        const float rstd = 1.0f / std::sqrt(static_cast<float>(sv/n) + eps);
+        std::vector<float> xhat_ref(n);
+        for (int i = 0; i < n; ++i) xhat_ref[i] = (Xq[i] - mean) * rstd;
+        auto xhat_q = rq(xhat_ref);  // FP16 round-trip
+
+        // CPU reference for backward (using FP16-rounded inputs).
+        double sum_dxh = 0.0, sum_dxh_xhat = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double dxh = static_cast<double>(dYq[i]) * Gq[i];
+            sum_dxh      += dxh;
+            sum_dxh_xhat += dxh * xhat_q[i];
+        }
+        std::vector<float> dX_ref(n), dG_ref(n), dB_ref(n);
+        const float nf = static_cast<float>(n);
+        const float scale = rstd / nf;
+        for (int i = 0; i < n; ++i) {
+            const float dxh = dYq[i] * Gq[i];
+            dX_ref[i] = scale * (nf * dxh
+                                  - static_cast<float>(sum_dxh)
+                                  - xhat_q[i] * static_cast<float>(sum_dxh_xhat));
+            dG_ref[i] = dYq[i] * xhat_q[i];
+            dB_ref[i] = dYq[i];
+        }
+
+        GpuTensor dYg, xhatg, Gg, dXg, dGg, dBg;
+        auto dYh = to_fp16(dYf), xh = to_fp16(xhat_ref), Gh = to_fp16(G);
+        brotensor::upload_fp16(dYh.data(), n, 1, dYg);
+        brotensor::upload_fp16(xh.data(), n, 1, xhatg);
+        brotensor::upload_fp16(Gh.data(), n, 1, Gg);
+        std::vector<uint16_t> zeros(n, brotensor::fp32_to_fp16_bits(0.0f));
+        brotensor::upload_fp16(zeros.data(), n, 1, dGg);
+        brotensor::upload_fp16(zeros.data(), n, 1, dBg);
+
+        brotensor::layernorm_backward_gpu(dYg, xhatg, Gg, rstd, dXg, dGg, dBg);
+        CHECK(dXg.dtype == Dtype::FP16);
+        CHECK(dGg.dtype == Dtype::FP16);
+        CHECK(dBg.dtype == Dtype::FP16);
+
+        std::vector<uint16_t> dx_got(n), dg_got(n), db_got(n);
+        brotensor::download_fp16(dXg, dx_got.data());
+        brotensor::download_fp16(dGg, dg_got.data());
+        brotensor::download_fp16(dBg, db_got.data());
+        brotensor::cuda_sync();
+        std::printf("    shape n=%d\n", n);
+        check_fp16(dx_got, dX_ref, "lnbwd-dX");
+        check_fp16(dg_got, dG_ref, "lnbwd-dGamma");
+        check_fp16(db_got, dB_ref, "lnbwd-dBeta");
+    }
+}
+
+static void test_embedding_backward_fp16() {
+    std::printf("  embedding_lookup_backward_fp16\n");
+    for (auto shape : std::vector<std::array<int,3>>{ {5, 4, 8}, {10, 16, 32} }) {
+        const int V = shape[0], B = shape[1], D = shape[2];
+        std::mt19937 rng(static_cast<uint32_t>(V*131 + B*17 + D));
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::uniform_int_distribution<int>    idx_dist(0, V - 1);
+        std::vector<int32_t> idx(B);
+        for (auto& v : idx) v = idx_dist(rng);
+        // Force at least one duplicate so the atomic-sum path exercises.
+        if (B >= 2) idx[1] = idx[0];
+        std::vector<float> dOut(B * D);
+        for (auto& v : dOut) v = dist(rng);
+        auto dOut_q = rq(dOut);
+
+        std::vector<float> dT_ref(V * D, 0.0f);
+        for (int b = 0; b < B; ++b)
+            for (int j = 0; j < D; ++j)
+                dT_ref[idx[b]*D + j] += dOut_q[b*D + j];
+
+        GpuTensor dOutg, dTg;
+        auto dOut_h = to_fp16(dOut);
+        brotensor::upload_fp16(dOut_h.data(), B, D, dOutg);
+        std::vector<uint16_t> zeros(V * D, brotensor::fp32_to_fp16_bits(0.0f));
+        brotensor::upload_fp16(zeros.data(), V, D, dTg);
+
+        // Upload idx into a device int32 buffer (bit-cast through FP32 upload).
+        GpuTensor idx_buf(B, 1, Dtype::FP32);
+        std::vector<float> idx_as_float(B);
+        for (int i = 0; i < B; ++i) {
+            int32_t v = idx[i];
+            std::memcpy(&idx_as_float[i], &v, sizeof(int32_t));
+        }
+        brotensor::upload(idx_as_float.data(), B, 1, idx_buf);
+
+        brotensor::embedding_lookup_backward_gpu(dOutg,
+                                                 reinterpret_cast<const int32_t*>(idx_buf.data),
+                                                 B, dTg);
+        CHECK(dTg.dtype == Dtype::FP16);
+        std::vector<uint16_t> got(V * D);
+        brotensor::download_fp16(dTg, got.data());
+        brotensor::cuda_sync();
+        std::printf("    shape V=%d B=%d D=%d\n", V, B, D);
+        check_fp16(got, dT_ref, "embbwd-dTable");
+    }
+}
+
 int main() {
     try {
         brotensor::cuda_init();
@@ -329,6 +513,9 @@ int main() {
     test_concat_nchw_channels_fp16();
     test_split_and_copy_d2d_fp16();
     test_layernorm_fp16();
+    test_linear_backward_batched_fp16();
+    test_layernorm_backward_fp16();
+    test_embedding_backward_fp16();
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);
         return 1;

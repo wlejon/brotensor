@@ -93,11 +93,12 @@ __global__ void conv2d_forward_kernel(
 }
 
 // One thread per input pixel. Gather form of backward-w.r.t.-input.
-// FP32 only. No atomics.
+// Templated on storage dtype T (FP16 or FP32); FP32 accumulator. No atomics.
+template <typename T>
 __global__ void conv2d_backward_input_kernel(
-        const float* __restrict__ Wt,
-        const float* __restrict__ dY,
-        float* __restrict__ dX,
+        const T* __restrict__ Wt,
+        const T* __restrict__ dY,
+        T* __restrict__ dX,
         int N, int C_in, int H, int W,
         int C_out, int kH, int kW,
         int H_out, int W_out,
@@ -138,19 +139,21 @@ __global__ void conv2d_backward_input_kernel(
             for (int c_out = 0; c_out < C_out; ++c_out) {
                 const int dy_idx = ((n * C_out + c_out) * H_out + i_out) * W_out + j_out;
                 const int w_idx  = ((c_out * C_in + c_in) * kH + kh) * kW + kw;
-                acc += dY[dy_idx] * Wt[w_idx];
+                acc += load_f32<T>(&dY[dy_idx]) * load_f32<T>(&Wt[w_idx]);
             }
         }
     }
-    dX[idx] = acc;
+    store_f32<T>(&dX[idx], acc);
 }
 
 // One thread per (c_out, c_in, kh, kw) element of dWt. Iterates (n, i_out,
-// j_out) and accumulates into a single dWt slot. FP32 only. No atomics.
+// j_out) and accumulates into an FP32 scratch slot. No atomics. The FP32
+// scratch is folded into the caller's dWt (storage-dtype-dispatched).
+template <typename T>
 __global__ void conv2d_backward_weight_kernel(
-        const float* __restrict__ X,
-        const float* __restrict__ dY,
-        float* __restrict__ dWt,
+        const T* __restrict__ X,
+        const T* __restrict__ dY,
+        float* __restrict__ dWt_scratch,    // FP32, size C_out*C_in*kH*kW
         int N, int C_in, int H, int W,
         int C_out, int kH, int kW,
         int H_out, int W_out,
@@ -179,22 +182,24 @@ __global__ void conv2d_backward_weight_kernel(
                 if (in_w < 0 || in_w >= W) continue;
                 const int x_idx  = ((n * C_in  + c_in)  * H     + in_h)  * W     + in_w;
                 const int dy_idx = ((n * C_out + c_out) * H_out + i_out) * W_out + j_out;
-                acc += dY[dy_idx] * X[x_idx];
+                acc += load_f32<T>(&dY[dy_idx]) * load_f32<T>(&X[x_idx]);
             }
         }
     }
-    // Accumulate into caller's dWt (caller zeros).
-    dWt[idx] += acc;
+    dWt_scratch[idx] = acc;
 }
 
 constexpr int BIAS_BLOCK = 256;
 
 // One block per c_out; threads stride-loop over (n, i_out, j_out) summing
 // dY[n, c_out, i_out, j_out] in FP32, then a shared-mem reduction folds the
-// per-thread partials and thread 0 adds into dB[c_out].
+// per-thread partials and thread 0 writes the per-channel sum into FP32
+// scratch (one entry per c_out). The scratch is then folded into the
+// caller's dB (storage-dtype-dispatched).
+template <typename T>
 __global__ void conv2d_backward_bias_kernel(
-        const float* __restrict__ dY,
-        float* __restrict__ dB,
+        const T* __restrict__ dY,
+        float* __restrict__ dB_scratch,
         int N, int C_out, int H_out, int W_out) {
     const int c_out = blockIdx.x;
     const int tid = threadIdx.x;
@@ -206,7 +211,7 @@ __global__ void conv2d_backward_bias_kernel(
         const int n  = idx / spatial;
         const int sp = idx - n * spatial;
         const int dy_idx = (n * C_out + c_out) * spatial + sp;
-        acc += dY[dy_idx];
+        acc += load_f32<T>(&dY[dy_idx]);
     }
 
     __shared__ float s_acc[BIAS_BLOCK];
@@ -216,7 +221,23 @@ __global__ void conv2d_backward_bias_kernel(
         if (tid < stride) s_acc[tid] += s_acc[tid + stride];
         __syncthreads();
     }
-    if (tid == 0) dB[c_out] += s_acc[0];
+    if (tid == 0) dB_scratch[c_out] = s_acc[0];
+}
+
+// Fold FP32 scratch into FP16/FP32 destination accumulators (add, not overwrite).
+__global__ void conv2d_add_fp32_into_fp16(const float* __restrict__ src,
+                                          __half* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float prev = __half2float(dst[i]);
+    dst[i] = __float2half(prev + src[i]);
+}
+
+__global__ void conv2d_add_fp32_into_fp32(const float* __restrict__ src,
+                                          float* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] += src[i];
 }
 
 } // namespace
@@ -293,8 +314,11 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
                                int pad_h, int pad_w,
                                int dil_h, int dil_w,
                                GpuTensor& dX) {
-    if (Wt.dtype != Dtype::FP32 || dY.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_input_gpu: Wt and dY must be FP32");
+    if (Wt.dtype != Dtype::FP16 && Wt.dtype != Dtype::FP32) {
+        throw std::runtime_error("conv2d_backward_input_gpu: Wt must be FP16 or FP32");
+    }
+    if (dY.dtype != Wt.dtype) {
+        throw std::runtime_error("conv2d_backward_input_gpu: dY dtype must match Wt");
     }
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
@@ -302,17 +326,26 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
         throw std::runtime_error("conv2d_backward_input_gpu: non-positive output shape");
     }
     const int in_cols = C_in * H * W;
-    if (dX.rows != N || dX.cols != in_cols || dX.dtype != Dtype::FP32) {
-        dX.resize(N, in_cols, Dtype::FP32);
+    if (dX.rows != N || dX.cols != in_cols || dX.dtype != Wt.dtype) {
+        dX.resize(N, in_cols, Wt.dtype);
     }
     const int total = N * in_cols;
     if (total == 0) return;
 
     const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
-    conv2d_backward_input_kernel<<<blocks, CONV_BLOCK>>>(
-        Wt.data, dY.data, dX.data,
-        N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-        stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+    if (Wt.dtype == Dtype::FP16) {
+        conv2d_backward_input_kernel<__half><<<blocks, CONV_BLOCK>>>(
+            reinterpret_cast<const __half*>(Wt.data_fp16()),
+            reinterpret_cast<const __half*>(dY.data_fp16()),
+            reinterpret_cast<__half*>(dX.data_fp16()),
+            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+    } else {
+        conv2d_backward_input_kernel<float><<<blocks, CONV_BLOCK>>>(
+            Wt.data, dY.data, dX.data,
+            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -324,8 +357,11 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
                                 int pad_h, int pad_w,
                                 int dil_h, int dil_w,
                                 GpuTensor& dWt) {
-    if (X.dtype != Dtype::FP32 || dY.dtype != Dtype::FP32 || dWt.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_weight_gpu: X, dY, dWt must be FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
+        throw std::runtime_error("conv2d_backward_weight_gpu: X must be FP16 or FP32");
+    }
+    if (dY.dtype != X.dtype || dWt.dtype != X.dtype) {
+        throw std::runtime_error("conv2d_backward_weight_gpu: X, dY, dWt dtype must match");
     }
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
@@ -338,28 +374,78 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
     const int total = C_out * C_in * kH * kW;
     if (total == 0) return;
 
+    // FP32 scratch for the per-element partial sum. We write it (overwrite)
+    // in the main kernel, then fold into the caller's accumulator (add).
+    float* d_scratch = nullptr;
+    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
+                                    total * sizeof(float)));
+
     const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
-    conv2d_backward_weight_kernel<<<blocks, CONV_BLOCK>>>(
-        X.data, dY.data, dWt.data,
-        N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-        stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+    if (X.dtype == Dtype::FP16) {
+        conv2d_backward_weight_kernel<__half><<<blocks, CONV_BLOCK>>>(
+            reinterpret_cast<const __half*>(X.data_fp16()),
+            reinterpret_cast<const __half*>(dY.data_fp16()),
+            d_scratch,
+            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+    } else {
+        conv2d_backward_weight_kernel<float><<<blocks, CONV_BLOCK>>>(
+            X.data, dY.data, d_scratch,
+            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
+
+    const int fold_blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
+    if (X.dtype == Dtype::FP16) {
+        conv2d_add_fp32_into_fp16<<<fold_blocks, CONV_BLOCK>>>(
+            d_scratch, reinterpret_cast<__half*>(dWt.data_fp16()), total);
+    } else {
+        conv2d_add_fp32_into_fp32<<<fold_blocks, CONV_BLOCK>>>(
+            d_scratch, dWt.data, total);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    cudaFree(d_scratch);
 }
 
 void conv2d_backward_bias_gpu(const GpuTensor& dY,
                               int N, int C_out, int H_out, int W_out,
                               GpuTensor& dB) {
-    if (dY.dtype != Dtype::FP32 || dB.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_bias_gpu: dY and dB must be FP32");
+    if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32) {
+        throw std::runtime_error("conv2d_backward_bias_gpu: dY must be FP16 or FP32");
+    }
+    if (dB.dtype != dY.dtype) {
+        throw std::runtime_error("conv2d_backward_bias_gpu: dB dtype must match dY");
     }
     if (dB.rows != C_out || dB.cols != 1) {
         throw std::runtime_error("conv2d_backward_bias_gpu: dB shape mismatch");
     }
     if (C_out == 0 || N == 0 || H_out == 0 || W_out == 0) return;
 
-    conv2d_backward_bias_kernel<<<C_out, BIAS_BLOCK>>>(
-        dY.data, dB.data, N, C_out, H_out, W_out);
+    float* d_scratch = nullptr;
+    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
+                                    C_out * sizeof(float)));
+
+    if (dY.dtype == Dtype::FP16) {
+        conv2d_backward_bias_kernel<__half><<<C_out, BIAS_BLOCK>>>(
+            reinterpret_cast<const __half*>(dY.data_fp16()),
+            d_scratch, N, C_out, H_out, W_out);
+    } else {
+        conv2d_backward_bias_kernel<float><<<C_out, BIAS_BLOCK>>>(
+            dY.data, d_scratch, N, C_out, H_out, W_out);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
+
+    const int fold_blocks = (C_out + 127) / 128;
+    if (dY.dtype == Dtype::FP16) {
+        conv2d_add_fp32_into_fp16<<<fold_blocks, 128>>>(
+            d_scratch, reinterpret_cast<__half*>(dB.data_fp16()), C_out);
+    } else {
+        conv2d_add_fp32_into_fp32<<<fold_blocks, 128>>>(
+            d_scratch, dB.data, C_out);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    cudaFree(d_scratch);
 }
 
 } // namespace brotensor

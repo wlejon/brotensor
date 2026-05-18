@@ -123,12 +123,14 @@ void layernorm_forward_gpu(const GpuTensor& x,
                            float& mean_out, float& rstd_out,
                            float eps);
 
-// LayerNorm backward.
+// LayerNorm backward. Dtype-dispatched (FP32 or FP16); all tensors share dtype.
+// Internal accumulation in FP32; for FP16, dGamma/dBeta use an FP32 scratch +
+// fold-back epilogue (Bundle 2 pattern) so atomic adds are safe.
 //   dY:     (N, 1) upstream
 //   xhat:   (N, 1) cached from forward
 //   gamma:  (N, 1) forward scale
 //   rstd:   scalar from forward
-//   dX:     (N, 1) output, overwritten
+//   dX:     (N, 1) output, overwritten (resized + dtype-set to match dY)
 //   dGamma: (N, 1) accumulated into — caller zeros
 //   dBeta:  (N, 1) accumulated into — caller zeros
 void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
@@ -297,7 +299,10 @@ void embedding_lookup_forward_gpu(const GpuTensor& table,
                                   const int32_t* d_idx, int B,
                                   GpuTensor& out);
 
-// Embedding lookup backward — scatter-accumulate.
+// Embedding lookup backward — scatter-accumulate. Dtype-dispatched (FP32 or
+// FP16); dOut and dTable share dtype. For FP16, an FP32 scratch buffer is
+// used for the atomicAdds (FP16 atomicAdd is not portable across CUDA
+// compute capabilities) and folded into dTable as an FP32-into-FP16 add.
 //   dOut:   (B, D) upstream
 //   d_idx:  same indices used in forward (length B)
 //   B:      number of indices
@@ -420,11 +425,14 @@ void add_inplace_batched_gpu(GpuTensor& Y_BD, const GpuTensor& X_BD);
 // Backward partners for the batched-train path used by GenericExItTrainer.
 // Match the math of the single-sample versions summed across B.
 
-// Linear backward over a B-row minibatch.
+// Linear backward over a B-row minibatch. Dtype-dispatched (FP32 or FP16);
+// all tensors share dtype. For FP16, internal accumulation is FP32 and
+// dW/dB use FP32 scratch + fold-back (Bundle 2 pattern).
 //   W:    (out_dim, in_dim) — read-only forward weights
 //   X_BD: (B, in_dim)       — forward input (cached by caller)
 //   dY_BD:(B, out_dim)      — upstream gradient
-//   dX_BD:(B, in_dim)       — output, *overwritten* (resized if mis-shaped)
+//   dX_BD:(B, in_dim)       — output, *overwritten* (resized + dtype-set if
+//                             mis-shaped/-typed)
 //   dW:   (out_dim, in_dim) — *accumulated*; caller zeros before the step
 //   dB:   (out_dim, 1)      — *accumulated*; caller zeros before the step
 // Math: dX[b] = W^T * dY[b], dW += sum_b dY[b] * X[b]^T, dB += sum_b dY[b].
@@ -524,13 +532,14 @@ void conv2d_forward_gpu(const GpuTensor& X,
 // For each valid (kh, kw), accumulate sum over c_out of
 // dY[n, c_out, i_out, j_out] * Wt[c_out, c_in, kh, kw]. FP32 accumulator.
 // No atomics — each dX pixel is written by exactly one thread.
+// Dtype-dispatched (FP32 or FP16); Wt and dY share dtype, dX matches.
 //
 // All conv hyperparams (H, W, stride/pad/dil) match the forward call.
 //
-//   Wt:   (C_out, C_in * kH * kW)        forward filter, OIHW, FP32
-//   dY:   (N, C_out * H_out * W_out)     upstream gradient, FP32
-//   dX:   (N, C_in  * H * W)             output, *overwritten*. Resized
-//                                        AND dtype-set to FP32 if
+//   Wt:   (C_out, C_in * kH * kW)        forward filter, OIHW
+//   dY:   (N, C_out * H_out * W_out)     upstream gradient
+//   dX:   (N, C_in  * H * W)             output, *overwritten*. Resized AND
+//                                        dtype-set to match dY if
 //                                        mis-shaped/-typed.
 void conv2d_backward_input_gpu(const GpuTensor& Wt,
                                const GpuTensor& dY,
@@ -541,14 +550,16 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
                                int dil_h, int dil_w,
                                GpuTensor& dX);
 
-// 2D convolution backward w.r.t. weights (dW). FP32 only this bundle.
+// 2D convolution backward w.r.t. weights (dW). Dtype-dispatched (FP32 or
+// FP16); X, dY, dWt all share dtype.
 //
 // One thread per (c_out, c_in, kh, kw) element of dWt. Each thread iterates
 // (n, i_out, j_out) over the output spatial extent + batch, looks up the
 // corresponding input pixel (skipping OOB reads — treat OOB as zero), and
 // accumulates into a single dWt slot. No atomics — each dWt element is owned
 // by exactly one thread. FP32 accumulator; the per-thread sum is *added* into
-// the caller's dWt (caller is responsible for zeroing first).
+// the caller's dWt (caller is responsible for zeroing first). For FP16
+// storage, an FP32 scratch + fold-back epilogue is used (Bundle 2 pattern).
 //
 // Math:
 //   dWt[c_out, c_in, kh, kw] +=
@@ -557,9 +568,9 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
 //       X [n, c_in, stride_h*i_out - pad_h + dil_h*kh,
 //                    stride_w*j_out - pad_w + dil_w*kw]
 //
-//   X:    (N, C_in  * H * W)             forward input, FP32
-//   dY:   (N, C_out * H_out * W_out)     upstream gradient, FP32
-//   dWt:  (C_out, C_in * kH * kW)        *accumulated into* — caller zeros, FP32
+//   X:    (N, C_in  * H * W)             forward input
+//   dY:   (N, C_out * H_out * W_out)     upstream gradient
+//   dWt:  (C_out, C_in * kH * kW)        *accumulated into* — caller zeros
 // All conv hyperparams match the forward call.
 void conv2d_backward_weight_gpu(const GpuTensor& X,
                                 const GpuTensor& dY,
@@ -570,15 +581,17 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
                                 int dil_h, int dil_w,
                                 GpuTensor& dWt);
 
-// 2D convolution backward w.r.t. bias (dB). FP32 only this bundle.
+// 2D convolution backward w.r.t. bias (dB). Dtype-dispatched (FP32 or FP16);
+// dY and dB share dtype.
 //
 // One block per c_out, parallel reduction across (n, i_out, j_out). FP32
-// accumulator; the block-reduced partial sum is added into dB[c_out].
+// accumulator; the block-reduced partial sum is added into dB[c_out]. For
+// FP16 storage, an FP32 scratch + fold-back epilogue is used.
 //
 //   dB[c_out] += sum over (n, i_out, j_out) of dY[n, c_out, i_out, j_out].
 //
-//   dY:  (N, C_out * H_out * W_out)  upstream gradient, FP32
-//   dB:  (C_out, 1)                   *accumulated into* — caller zeros, FP32
+//   dY:  (N, C_out * H_out * W_out)   upstream gradient
+//   dB:  (C_out, 1)                    *accumulated into* — caller zeros
 void conv2d_backward_bias_gpu(const GpuTensor& dY,
                               int N, int C_out, int H_out, int W_out,
                               GpuTensor& dB);

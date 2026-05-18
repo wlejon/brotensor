@@ -737,6 +737,146 @@ static void run_finite_diff_check() {
     CHECK(bad == 0);
 }
 
+// ─── FP16 backward parity helpers ────────────────────────────────────────
+static void check_fp16_against(const std::vector<uint16_t>& got,
+                               const std::vector<float>& ref,
+                               const char* label,
+                               int& bad_out, float& max_err_out) {
+    int bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const float g = brotensor::fp16_bits_to_fp32(got[i]);
+        const float err = std::fabs(g - ref[i]);
+        if (err > max_err) max_err = err;
+        const float tol = 1e-2f + 1e-2f * std::fabs(ref[i]);
+        if (err > tol) {
+            if (bad < 5)
+                std::printf("    %s mismatch i=%zu got=%g ref=%g err=%g\n",
+                            label, i, g, ref[i], err);
+            ++bad;
+        }
+    }
+    std::printf("    %s max_err=%g bad=%d / %zu\n", label, max_err, bad, ref.size());
+    CHECK(bad == 0);
+    bad_out = bad;
+    max_err_out = max_err;
+}
+
+static void run_one_bwd_input_fp16(const char* label,
+                                   int N, int C_in, int H, int W,
+                                   int C_out, int kH, int kW,
+                                   int stride_h, int stride_w,
+                                   int pad_h, int pad_w,
+                                   int dil_h, int dil_w) {
+    std::printf("  [fp16 bwd-input] %s  N=%d Cin=%d H=%d W=%d Cout=%d k=%dx%d\n",
+                label, N, C_in, H, W, C_out, kH, kW);
+    std::mt19937 rng(0x1234);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
+    const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
+    const int w_n = C_out * C_in * kH * kW;
+    const int dy_n = N * C_out * H_out * W_out;
+
+    std::vector<float> Wt(w_n), dY(dy_n);
+    for (auto& v : Wt) v = dist(rng);
+    for (auto& v : dY) v = dist(rng);
+    auto Wt_q = quantize_through_fp16(Wt);
+    auto dY_q = quantize_through_fp16(dY);
+
+    std::vector<float> dX_cpu;
+    conv2d_backward_input_cpu_fp32(Wt_q, dY_q, N, C_in, H, W, C_out, kH, kW,
+                                   stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                                   H_out, W_out, dX_cpu);
+
+    auto Wt_h = to_fp16(Wt);
+    auto dY_h = to_fp16(dY);
+    GpuTensor Wg, dYg, dXg;
+    brotensor::upload_fp16(Wt_h.data(), C_out, C_in * kH * kW, Wg);
+    brotensor::upload_fp16(dY_h.data(), N, C_out * H_out * W_out, dYg);
+    brotensor::conv2d_backward_input_gpu(Wg, dYg, N, C_in, H, W, C_out, kH, kW,
+                                         stride_h, stride_w, pad_h, pad_w,
+                                         dil_h, dil_w, dXg);
+    CHECK(dXg.dtype == Dtype::FP16);
+    std::vector<uint16_t> got(dXg.size());
+    brotensor::download_fp16(dXg, got.data());
+    brotensor::cuda_sync();
+    int bad; float me;
+    check_fp16_against(got, dX_cpu, "fp16-bwd-input", bad, me);
+}
+
+static void run_one_bwd_weight_fp16(const char* label,
+                                    int N, int C_in, int H, int W,
+                                    int C_out, int kH, int kW,
+                                    int stride_h, int stride_w,
+                                    int pad_h, int pad_w,
+                                    int dil_h, int dil_w) {
+    std::printf("  [fp16 bwd-weight] %s  N=%d Cin=%d H=%d W=%d Cout=%d k=%dx%d\n",
+                label, N, C_in, H, W, C_out, kH, kW);
+    std::mt19937 rng(0x5678);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
+    const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
+    const int x_n = N * C_in * H * W;
+    const int dy_n = N * C_out * H_out * W_out;
+    std::vector<float> X(x_n), dY(dy_n);
+    for (auto& v : X)  v = dist(rng);
+    for (auto& v : dY) v = dist(rng);
+    auto X_q = quantize_through_fp16(X);
+    auto dY_q = quantize_through_fp16(dY);
+
+    std::vector<float> dW_cpu;
+    conv2d_backward_weight_cpu_fp32(X_q, dY_q, N, C_in, H, W, C_out, kH, kW,
+                                    stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                                    H_out, W_out, dW_cpu);
+
+    auto X_h = to_fp16(X);
+    auto dY_h = to_fp16(dY);
+    GpuTensor Xg, dYg, dWg;
+    brotensor::upload_fp16(X_h.data(), N, C_in * H * W, Xg);
+    brotensor::upload_fp16(dY_h.data(), N, C_out * H_out * W_out, dYg);
+    std::vector<uint16_t> zeros_h(C_out * C_in * kH * kW,
+                                  brotensor::fp32_to_fp16_bits(0.0f));
+    brotensor::upload_fp16(zeros_h.data(), C_out, C_in * kH * kW, dWg);
+
+    brotensor::conv2d_backward_weight_gpu(Xg, dYg, N, C_in, H, W, C_out, kH, kW,
+                                          stride_h, stride_w, pad_h, pad_w,
+                                          dil_h, dil_w, dWg);
+    CHECK(dWg.dtype == Dtype::FP16);
+    std::vector<uint16_t> got(dWg.size());
+    brotensor::download_fp16(dWg, got.data());
+    brotensor::cuda_sync();
+    int bad; float me;
+    check_fp16_against(got, dW_cpu, "fp16-bwd-weight", bad, me);
+}
+
+static void run_one_bwd_bias_fp16(const char* label,
+                                  int N, int C_out, int H_out, int W_out) {
+    std::printf("  [fp16 bwd-bias] %s  N=%d Cout=%d Hout=%d Wout=%d\n",
+                label, N, C_out, H_out, W_out);
+    std::mt19937 rng(0x9ABC);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    const int dy_n = N * C_out * H_out * W_out;
+    std::vector<float> dY(dy_n);
+    for (auto& v : dY) v = dist(rng);
+    auto dY_q = quantize_through_fp16(dY);
+
+    std::vector<float> dB_cpu;
+    conv2d_backward_bias_cpu_fp32(dY_q, N, C_out, H_out, W_out, dB_cpu);
+
+    auto dY_h = to_fp16(dY);
+    GpuTensor dYg, dBg;
+    brotensor::upload_fp16(dY_h.data(), N, C_out * H_out * W_out, dYg);
+    std::vector<uint16_t> zeros_h(C_out, brotensor::fp32_to_fp16_bits(0.0f));
+    brotensor::upload_fp16(zeros_h.data(), C_out, 1, dBg);
+    brotensor::conv2d_backward_bias_gpu(dYg, N, C_out, H_out, W_out, dBg);
+    CHECK(dBg.dtype == Dtype::FP16);
+    std::vector<uint16_t> got(dBg.size());
+    brotensor::download_fp16(dBg, got.data());
+    brotensor::cuda_sync();
+    int bad; float me;
+    check_fp16_against(got, dB_cpu, "fp16-bwd-bias", bad, me);
+}
+
 int main() {
     try {
         brotensor::cuda_init();
@@ -818,6 +958,15 @@ int main() {
     run_one_bwd_bias("typical", 2, 4, 5, 5);
     run_one_bwd_bias("wide",    1, 8, 4, 4);
     run_one_bwd_bias("tall",    1, 2, 3, 3);
+
+    // ─── FP16 backward parity ────────────────────────────────────────────
+    // Two shapes per op to exercise both fast and scratch paths.
+    run_one_bwd_input_fp16("tiny", 1, 2, 4, 4, 2, 3, 3, 1, 1, 1, 1, 1, 1);
+    run_one_bwd_input_fp16("3x3 same-pad", 2, 3, 5, 5, 4, 3, 3, 1, 1, 1, 1, 1, 1);
+    run_one_bwd_weight_fp16("tiny", 1, 2, 4, 4, 2, 3, 3, 1, 1, 1, 1, 1, 1);
+    run_one_bwd_weight_fp16("3x3 same-pad", 2, 3, 5, 5, 4, 3, 3, 1, 1, 1, 1, 1, 1);
+    run_one_bwd_bias_fp16("tiny", 1, 2, 4, 4);
+    run_one_bwd_bias_fp16("typical", 2, 4, 5, 5);
 
     // ─── Gold-standard finite-difference check ───────────────────────────
     run_finite_diff_check();

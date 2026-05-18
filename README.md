@@ -35,7 +35,7 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 
 | Op | FP32 fwd | FP32 bwd | FP16 fwd | Notes |
 |---|---|---|---|---|
-| linear | ✓ | ✓ | ✓ | dense; FP32 single + batched (fwd/bwd), FP16 batched-inference |
+| linear | ✓ | ✓ | ✓ | dense; FP32 single + batched (fwd/bwd), FP16 batched-inference and batched-train backward (dtype-dispatched, FP32 scratch + fold) |
 | relu / tanh / sigmoid | ✓ | ✓ | — | elementwise; relu/tanh also have batched fwd+bwd |
 | silu / gelu | ✓ | ✓ | ✓ | tanh-approx GELU; dtype-dispatched (FP16 bwd accumulates in FP32) |
 | gelu_exact | ✓ | ✓ | ✓ | `0.5*x*(1+erf(x/√2))`, exact PyTorch/diffusers default |
@@ -46,7 +46,7 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | clamp | ✓ | n/a | ✓ | in-place min/max, dtype-dispatched (VAE epilogue) |
 | build_slot_mask | ✓ | n/a | — | device-side validity mask construction |
 | softmax | ✓ | ✓ | — | masked, numerically stable |
-| layernorm | ✓ | ✓ | ✓ | FP32 single + batched-infer; FP16 batched-infer |
+| layernorm | ✓ | ✓ | ✓ | FP32 single + batched-infer; FP16 batched-infer + backward (dtype-dispatched, FP32 scratch + fold for dGamma/dBeta) |
 | group_norm | ✓ | ✓ | ✓ | NCHW, per-group stats; dtype-dispatched fwd+bwd (FP16 bwd accumulates in FP32) |
 | attention (single-head) | ✓ | ✓ | — | |
 | mha (multi-head) | ✓ | ✓ | — | |
@@ -55,12 +55,12 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | flash_attention | — | — | ✓ | tiled online-softmax, Lk-unbounded, optional causal |
 | flash_attention_qkvo | — | — | ✓ | fused Q/K/V/O projections + biases; rectangular Wk/Wv for cross-attn; optional causal; verified at SD1.5 U-Net head_dims (40/80/160) and CLIP head_dim 64 |
 | resblock | — | — | ✓ | fused diffusion ResBlock (GN→SiLU→conv ×2 + skip) |
-| conv2d | FP32 fwd ✓ | FP32 bwd ✓ | FP16 fwd ✓ | NCHW, groups=1, stride/pad/dil; FP32 backward (dX, dW, dB) |
+| conv2d | ✓ | ✓ | ✓ | NCHW, groups=1, stride/pad/dil; backward (dX, dW, dB) dtype-dispatched (FP32+FP16; FP16 dW/dB use FP32 scratch + fold) |
 | upsample_nearest_2x | ✓ | ✓ | ✓ | backward dtype-dispatched (FP32+FP16) |
 | upsample_bilinear_2x | ✓ | ✓ | ✓ | align_corners=False; backward dtype-dispatched (FP32+FP16; FP16 uses FP32 scratch + fold) |
 | downsample_avg_2x | ✓ | ✓ | ✓ | stride 2, kernel 2; backward dtype-dispatched (FP32+FP16) |
 | nchw ↔ sequence transpose | ✓ | n/a | ✓ | gather/scatter between NCHW and (L,D) layouts |
-| embedding lookup | ✓ | ✓ | ✓ | FP32/FP16 table dispatch |
+| embedding lookup | ✓ | ✓ | ✓ | FP32/FP16 table dispatch; backward dtype-dispatched (FP16 uses FP32 scratch + fold for atomic-add safety) |
 | concat_rows / split_rows | ✓ | ✓ | ✓ | flat byte-aware concat (FP16 supported) |
 | concat_batched_rows | ✓ | n/a | ✓ | per-row column-block concat via 2D memcpy |
 | concat_nchw_channels | ✓ | n/a | ✓ | channel-axis concat for U-Net skip merges (N≥1) |

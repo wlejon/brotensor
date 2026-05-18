@@ -125,6 +125,71 @@ __global__ void layernorm_backward_kernel(const float* __restrict__ dY,
     }
 }
 
+// FP16 backward. Inputs/outputs in FP16 storage; FP32 reductions in shared
+// memory. dGamma/dBeta are written into FP32 scratch buffers (size n) which
+// the host then folds into the caller-owned FP16 accumulators.
+__global__ void layernorm_backward_kernel_fp16(const __half* __restrict__ dY,
+                                               const __half* __restrict__ xhat,
+                                               const __half* __restrict__ gamma,
+                                               float rstd,
+                                               __half* __restrict__ dX,
+                                               float* __restrict__ dGamma_scratch,
+                                               float* __restrict__ dBeta_scratch,
+                                               int n) {
+    __shared__ float sdata[LN_BLOCK];
+    const int tid = threadIdx.x;
+
+    // Per-feature dGamma/dBeta into FP32 scratch (single thread per feature
+    // — no concurrent writers to same i, so no atomics).
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float g  = __half2float(dY[i]);
+        const float xh = __half2float(xhat[i]);
+        dGamma_scratch[i] = g * xh;
+        dBeta_scratch[i]  = g;
+    }
+
+    // sum_dxh
+    float local = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        local += __half2float(dY[i]) * __half2float(gamma[i]);
+    }
+    sdata[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float sum_dxh = sdata[0];
+
+    // sum_dxh_xhat
+    float local2 = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        local2 += __half2float(dY[i]) * __half2float(gamma[i]) * __half2float(xhat[i]);
+    }
+    sdata[tid] = local2;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float sum_dxh_xhat = sdata[0];
+
+    const float nf = static_cast<float>(n);
+    const float scale = rstd / nf;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float dxh = __half2float(dY[i]) * __half2float(gamma[i]);
+        const float xh  = __half2float(xhat[i]);
+        dX[i] = __float2half(scale * (nf * dxh - sum_dxh - xh * sum_dxh_xhat));
+    }
+}
+
+__global__ void ln_add_fp32_into_fp16(const float* __restrict__ src,
+                                      __half* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2half(__half2float(dst[i]) + src[i]);
+}
+
 } // namespace
 
 void layernorm_forward_gpu(const GpuTensor& x,
@@ -306,14 +371,46 @@ void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
                             const GpuTensor& gamma, float rstd,
                             GpuTensor& dX,
                             GpuTensor& dGamma, GpuTensor& dBeta) {
+    if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32) {
+        throw std::runtime_error("layernorm_backward_gpu: dY must be FP16 or FP32");
+    }
+    if (xhat.dtype != dY.dtype || gamma.dtype != dY.dtype ||
+        dGamma.dtype != dY.dtype || dBeta.dtype != dY.dtype) {
+        throw std::runtime_error("layernorm_backward_gpu: all tensors must share dtype");
+    }
     const int n = dY.size();
-    if (dX.rows != dY.rows || dX.cols != dY.cols) dX.resize(dY.rows, dY.cols);
+    if (dX.rows != dY.rows || dX.cols != dY.cols || dX.dtype != dY.dtype) {
+        dX.resize(dY.rows, dY.cols, dY.dtype);
+    }
     if (n == 0) return;
 
-    layernorm_backward_kernel<<<1, LN_BLOCK>>>(dY.data, xhat.data, gamma.data,
-                                               rstd, dX.data,
-                                               dGamma.data, dBeta.data, n);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    if (dY.dtype == Dtype::FP32) {
+        layernorm_backward_kernel<<<1, LN_BLOCK>>>(dY.data, xhat.data, gamma.data,
+                                                   rstd, dX.data,
+                                                   dGamma.data, dBeta.data, n);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    } else {
+        float* d_dg = nullptr;
+        float* d_db = nullptr;
+        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg), n * sizeof(float)));
+        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db), n * sizeof(float)));
+        layernorm_backward_kernel_fp16<<<1, LN_BLOCK>>>(
+            reinterpret_cast<const __half*>(dY.data_fp16()),
+            reinterpret_cast<const __half*>(xhat.data_fp16()),
+            reinterpret_cast<const __half*>(gamma.data_fp16()),
+            rstd,
+            reinterpret_cast<__half*>(dX.data_fp16()),
+            d_dg, d_db, n);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        const int blocks = (n + 255) / 256;
+        ln_add_fp32_into_fp16<<<blocks, 256>>>(
+            d_dg, reinterpret_cast<__half*>(dGamma.data_fp16()), n);
+        ln_add_fp32_into_fp16<<<blocks, 256>>>(
+            d_db, reinterpret_cast<__half*>(dBeta.data_fp16()), n);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        cudaFree(d_dg);
+        cudaFree(d_db);
+    }
 }
 
 } // namespace brotensor

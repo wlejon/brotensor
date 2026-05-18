@@ -115,6 +115,66 @@ kernel void k_ln_backward(device const float* dY     [[buffer(0)]],
     }
 }
 
+// FP16 backward. dGamma/dBeta written to FP32 scratch; host folds into
+// caller-owned FP16 accumulators.
+kernel void k_ln_backward_fp16(device const half*  dY     [[buffer(0)]],
+                               device const half*  xhat   [[buffer(1)]],
+                               device const half*  gamma  [[buffer(2)]],
+                               constant float& rstd       [[buffer(3)]],
+                               device half*        dX     [[buffer(4)]],
+                               device float*       dGamma_scratch [[buffer(5)]],
+                               device float*       dBeta_scratch  [[buffer(6)]],
+                               constant uint& n           [[buffer(7)]],
+                               uint tid [[thread_position_in_threadgroup]],
+                               uint tg_size [[threads_per_threadgroup]]) {
+    threadgroup float sdata[LN_BLOCK];
+    for (uint i = tid; i < n; i += tg_size) {
+        float g  = float(dY[i]);
+        float xh = float(xhat[i]);
+        dGamma_scratch[i] = g * xh;
+        dBeta_scratch[i]  = g;
+    }
+    float local = 0.0f;
+    for (uint i = tid; i < n; i += tg_size) {
+        local += float(dY[i]) * float(gamma[i]);
+    }
+    sdata[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum_dxh = sdata[0];
+
+    float local2 = 0.0f;
+    for (uint i = tid; i < n; i += tg_size) {
+        local2 += float(dY[i]) * float(gamma[i]) * float(xhat[i]);
+    }
+    sdata[tid] = local2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum_dxh_xhat = sdata[0];
+
+    float nf = float(n);
+    float scale = rstd / nf;
+    for (uint i = tid; i < n; i += tg_size) {
+        float dxh = float(dY[i]) * float(gamma[i]);
+        float xh  = float(xhat[i]);
+        dX[i] = half(scale * (nf * dxh - sum_dxh - xh * sum_dxh_xhat));
+    }
+}
+
+kernel void k_ln_add_fp32_into_fp16(device const float* src [[buffer(0)]],
+                                    device half*        dst [[buffer(1)]],
+                                    constant uint& n        [[buffer(2)]],
+                                    uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = half(float(dst[i]) + src[i]);
+}
+
 kernel void k_ln_forward_inference_batched(device const float* x      [[buffer(0)]],
                                            device const float* gamma  [[buffer(1)]],
                                            device const float* beta   [[buffer(2)]],
@@ -168,6 +228,8 @@ kernel void k_ln_forward_inference_batched(device const float* x      [[buffer(0
     }
 DEF_PSO(pso_fw, @"k_ln_forward")
 DEF_PSO(pso_bw, @"k_ln_backward")
+DEF_PSO(pso_bw_fp16, @"k_ln_backward_fp16")
+DEF_PSO(pso_ln_add_fp16, @"k_ln_add_fp32_into_fp16")
 DEF_PSO(pso_fw_inf, @"k_ln_forward_inference_batched")
 #undef DEF_PSO
 
@@ -225,10 +287,19 @@ void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
                             const GpuTensor& gamma, float rstd,
                             GpuTensor& dX,
                             GpuTensor& dGamma, GpuTensor& dBeta) {
+    if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32) {
+        throw std::runtime_error("layernorm_backward_gpu: dY must be FP16 or FP32");
+    }
+    if (xhat.dtype != dY.dtype || gamma.dtype != dY.dtype ||
+        dGamma.dtype != dY.dtype || dBeta.dtype != dY.dtype) {
+        throw std::runtime_error("layernorm_backward_gpu: all tensors must share dtype");
+    }
     const int n = dY.size();
-    if (dX.rows != dY.rows || dX.cols != dY.cols) dX.resize(dY.rows, dY.cols);
+    if (dX.rows != dY.rows || dX.cols != dY.cols || dX.dtype != dY.dtype) {
+        dX.resize(dY.rows, dY.cols, dY.dtype);
+    }
     if (n == 0) return;
-    id<MTLComputePipelineState> pso = pso_bw();
+
     id<MTLBuffer> bdy = buffer_for(dY);
     NSUInteger ody = buffer_offset_for(dY);
     id<MTLBuffer> bxh = buffer_for(xhat);
@@ -242,23 +313,70 @@ void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
     id<MTLBuffer> bdb = buffer_for(dBeta);
     NSUInteger odb = buffer_offset_for(dBeta);
     const uint32_t nu = static_cast<uint32_t>(n);
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bdy offset:ody atIndex:0];
-        [enc setBuffer:bxh offset:oxh atIndex:1];
-        [enc setBuffer:bg offset:og atIndex:2];
-        [enc setBytes:&rstd length:sizeof(float) atIndex:3];
-        [enc setBuffer:bdx offset:odx atIndex:4];
-        [enc setBuffer:bdg offset:odg atIndex:5];
-        [enc setBuffer:bdb offset:odb atIndex:6];
-        [enc setBytes:&nu length:sizeof(uint32_t) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(LN_BLOCK, 1, 1)];
-        [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+
+    if (dY.dtype == Dtype::FP32) {
+        id<MTLComputePipelineState> pso = pso_bw();
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmd = new_command_buffer();
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:bdy offset:ody atIndex:0];
+            [enc setBuffer:bxh offset:oxh atIndex:1];
+            [enc setBuffer:bg offset:og atIndex:2];
+            [enc setBytes:&rstd length:sizeof(float) atIndex:3];
+            [enc setBuffer:bdx offset:odx atIndex:4];
+            [enc setBuffer:bdg offset:odg atIndex:5];
+            [enc setBuffer:bdb offset:odb atIndex:6];
+            [enc setBytes:&nu length:sizeof(uint32_t) atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(LN_BLOCK, 1, 1)];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    } else {
+        @autoreleasepool {
+            id<MTLBuffer> scratch_g = [metal_impl::device()
+                newBufferWithLength:n * sizeof(float)
+                            options:MTLResourceStorageModeShared];
+            id<MTLBuffer> scratch_b = [metal_impl::device()
+                newBufferWithLength:n * sizeof(float)
+                            options:MTLResourceStorageModeShared];
+            id<MTLComputePipelineState> pso = pso_bw_fp16();
+            id<MTLCommandBuffer> cmd = new_command_buffer();
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:bdy offset:ody atIndex:0];
+            [enc setBuffer:bxh offset:oxh atIndex:1];
+            [enc setBuffer:bg offset:og atIndex:2];
+            [enc setBytes:&rstd length:sizeof(float) atIndex:3];
+            [enc setBuffer:bdx offset:odx atIndex:4];
+            [enc setBuffer:scratch_g offset:0 atIndex:5];
+            [enc setBuffer:scratch_b offset:0 atIndex:6];
+            [enc setBytes:&nu length:sizeof(uint32_t) atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(LN_BLOCK, 1, 1)];
+
+            id<MTLComputePipelineState> add_pso = pso_ln_add_fp16();
+            [enc setComputePipelineState:add_pso];
+            [enc setBuffer:scratch_g offset:0 atIndex:0];
+            [enc setBuffer:bdg offset:odg atIndex:1];
+            [enc setBytes:&nu length:sizeof(uint32_t) atIndex:2];
+            NSUInteger tg = [add_pso maxTotalThreadsPerThreadgroup];
+            if (tg > 256) tg = 256;
+            [enc dispatchThreads:MTLSizeMake(nu, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+
+            [enc setBuffer:scratch_b offset:0 atIndex:0];
+            [enc setBuffer:bdb offset:odb atIndex:1];
+            [enc setBytes:&nu length:sizeof(uint32_t) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(nu, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
     }
 }
 
