@@ -290,4 +290,29 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
     linear_forward_batched_fp16_gpu(Wo, bo, Op, O);
 }
 
+// Metal backward stub. The CUDA implementation composes ~7 backward kernels
+// (per-head dP / dV / dS / dQ / dK plus a causal-aware softmax recompute and
+// FP16 in-place add). Porting them to MSL is mechanical but several hundred
+// LOC; brodiffusion training currently targets CUDA only, so this is deferred.
+// We declare the symbol so the link surface matches across backends and throw
+// at call time. When Metal training lands, replace the body with the MSL port
+// of the CUDA path in src/cuda/flash_attention.cu.
+void flash_attention_qkvo_backward_gpu(
+    const GpuTensor&, const GpuTensor*,
+    const GpuTensor&, const GpuTensor*,
+    const GpuTensor&, const GpuTensor*,
+    const GpuTensor&, const GpuTensor*,
+    const GpuTensor&, const GpuTensor*,
+    const float*,
+    int,
+    bool,
+    const GpuTensor&,
+    GpuTensor&, GpuTensor*,
+    GpuTensor&, GpuTensor*,
+    GpuTensor&, GpuTensor*,
+    GpuTensor&, GpuTensor*,
+    GpuTensor&, GpuTensor*) {
+    throw std::runtime_error("flash_attention_qkvo_backward_gpu: Metal backend not yet implemented");
+}
+
 } // namespace brotensor

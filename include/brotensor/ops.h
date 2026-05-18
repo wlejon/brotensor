@@ -1042,6 +1042,65 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
                                       bool causal,
                                       GpuTensor& O);
 
+// Backward partner of flash_attention_qkvo_forward_gpu. "Recompute-style":
+// no caches consumed from the forward call — backward re-runs the attention
+// math (Q,K,V projection + per-head softmax PV) from the inputs, then
+// reverses the math to produce gradients. This matches the xformers /
+// flash-attn upstream convention: no API change on the forward, no extra
+// per-call buffers saved by the caller.
+//
+// All FP16. Numerics: FP32 accumulation throughout the per-head sweep
+// (matmuls, softmax recompute, D_q reduction, dS, projection-bw scratch).
+//
+// All shape / dtype / Ctx-may-be-null / rectangular-Wk-Wv / causal /
+// optional-biases semantics exactly match flash_attention_qkvo_forward_gpu.
+//
+//   X, Ctx (or null), Wq, bq, Wk, bk, Wv, bv, Wo, bo, d_mask, num_heads,
+//   causal:        same as forward. Pass the same values used in the
+//                  forward call.
+//   dO:            (Lq, D)         FP16, upstream gradient of forward O.
+//   dX:            (Lq, D)         FP16, *overwritten*. For self-attn
+//                                  (Ctx == null) dX absorbs the K/V-projection
+//                                  gradients in addition to the Q-projection
+//                                  path: dX = dQ·Wq + dK·Wk + dV·Wv.
+//   dCtx:          (Lk, D_ctx)     FP16, *overwritten*. Must be nullptr iff
+//                                  Ctx is nullptr. For cross-attn
+//                                  (Ctx != null) dCtx = dK·Wk + dV·Wv.
+//   dWq:           (D, D)          FP16, *accumulated into* (caller zeros).
+//   dWk:           (D, D_ctx)      FP16, *accumulated*. Rectangular for cross.
+//   dWv:           (D, D_ctx)      FP16, *accumulated*. Rectangular for cross.
+//   dWo:           (D, D)          FP16, *accumulated*.
+//   dbq, dbk, dbv, dbo: (D, 1)     FP16, *accumulated* iff the corresponding
+//                                  forward bias was non-null. Pass nullptr
+//                                  for any whose forward bias was nullptr;
+//                                  passing a non-null grad alongside a null
+//                                  forward bias is rejected (the symmetry
+//                                  must be exact, matching what an autograd
+//                                  caller will naturally produce).
+//
+// Causal masking: as in the forward, position k > q contributes nothing to
+// the softmax — dV[k]/dK[k]/dQ[q]/dCtx[k] receive no contribution from those
+// (q, k) pairs.
+//
+// Mask: positions k with d_mask[k] <= 0.5 are dropped in the recompute
+// (probability 0), so they contribute nothing to dV/dK/dCtx and dQ/dX
+// degrades naturally.
+void flash_attention_qkvo_backward_gpu(
+    const GpuTensor& X, const GpuTensor* Ctx,
+    const GpuTensor& Wq, const GpuTensor* bq,
+    const GpuTensor& Wk, const GpuTensor* bk,
+    const GpuTensor& Wv, const GpuTensor* bv,
+    const GpuTensor& Wo, const GpuTensor* bo,
+    const float* d_mask,
+    int num_heads,
+    bool causal,
+    const GpuTensor& dO,
+    GpuTensor& dX, GpuTensor* dCtx,
+    GpuTensor& dWq, GpuTensor* dbq,
+    GpuTensor& dWk, GpuTensor* dbk,
+    GpuTensor& dWv, GpuTensor* dbv,
+    GpuTensor& dWo, GpuTensor* dbo);
+
 // Project a key/value context tensor through Wk/Wv (with optional biases),
 // producing the exact (Lk, D) FP16 buffers that flash_attention_forward_gpu
 // consumes. Used to pre-compute cross-attention K/V once per generate() in

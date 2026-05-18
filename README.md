@@ -53,7 +53,7 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | self_attention | ✓ | ✓ | ✓ | FP32 = training (caches exposed via `_train`); FP16 = flash inference |
 | cross_attention | ✓ | ✓ | ✓ | FP32 = training (caches exposed via `_train`, rectangular Wk/Wv); FP16 = flash inference |
 | flash_attention | — | — | ✓ | tiled online-softmax, Lk-unbounded, optional causal |
-| flash_attention_qkvo | — | — | ✓ | fused Q/K/V/O projections + biases; rectangular Wk/Wv for cross-attn; optional causal; verified at SD1.5 U-Net head_dims (40/80/160) and CLIP head_dim 64 |
+| flash_attention_qkvo | — | — | ✓ (fwd) / ✓ (bwd) | fused Q/K/V/O projections + biases; rectangular Wk/Wv for cross-attn; optional causal; verified at SD1.5 U-Net head_dims (40/80/160) and CLIP head_dim 64. FP16 backward via recompute (no fwd-time caches); CUDA only — Metal bwd throws |
 | resblock | — | — | ✓ | fused diffusion ResBlock (GN→SiLU→conv ×2 + skip) |
 | conv2d | ✓ | ✓ | ✓ | NCHW, groups=1, stride/pad/dil; backward (dX, dW, dB) dtype-dispatched (FP32+FP16; FP16 dW/dB use FP32 scratch + fold) |
 | upsample_nearest_2x | ✓ | ✓ | ✓ | backward dtype-dispatched (FP32+FP16) |
