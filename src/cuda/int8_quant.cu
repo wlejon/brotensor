@@ -20,6 +20,18 @@
 
 namespace brotensor {
 
+namespace conv2d_int8w_wmma_internal {
+bool launch_conv2d_int8w_implicit_gemm_wmma(
+        const __half* X, const int8_t* W_int8, const float* scales,
+        const __half* bias, __half* Y,
+        int N, int C_in, int H, int W,
+        int C_out, int kH, int kW,
+        int stride_h, int stride_w,
+        int pad_h, int pad_w,
+        int dil_h, int dil_w,
+        int H_out, int W_out);
+}
+
 // ─── Host quantiser ────────────────────────────────────────────────────────
 
 void quantize_int8_per_row_host(const uint16_t* W_fp16,
@@ -358,11 +370,28 @@ void conv2d_int8w_fp16_forward_gpu(const GpuTensor& X,
     const int total = N * out_cols;
     if (total == 0) return;
 
-    constexpr int CONV_BLOCK = 256;
-    const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     const __half* b_p = bias ? reinterpret_cast<const __half*>(bias->data_fp16())
                              : nullptr;
+
+    // Try the WMMA implicit-GEMM fast path (3x3 s1 p1 d1, 1x1 s1 p0 d1,
+    // 3x3 s2 p1 d1, groups=1). Falls through to the naive kernel otherwise.
+    if (groups == 1 && dil_h == 1 && dil_w == 1 &&
+        conv2d_int8w_wmma_internal::launch_conv2d_int8w_implicit_gemm_wmma(
+            reinterpret_cast<const __half*>(X.data_fp16()),
+            reinterpret_cast<const int8_t*>(W_int8.data),
+            scales.data,
+            b_p,
+            reinterpret_cast<__half*>(Y.data_fp16()),
+            N, C_in, H, W, C_out, kH, kW,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            H_out, W_out)) {
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    constexpr int CONV_BLOCK = 256;
+    const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
     conv2d_int8w_fp16_forward_kernel<<<blocks, CONV_BLOCK, 0, stream>>>(
         reinterpret_cast<const __half*>(X.data_fp16()),
         reinterpret_cast<const int8_t*>(W_int8.data),

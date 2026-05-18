@@ -68,7 +68,7 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | rope | ✓ | ✓ | ✓ | rotary position embedding; pair-wise rotation per head_dim chunk, `seq_offset` for KV-cache decode |
 | resblock | — | ✓ (bwd) | ✓ | fused diffusion ResBlock (GN→SiLU→conv ×2 + skip); FP16 backward via composition of public ops (recomputes h1/h2/h3; no fwd-time caches) |
 | conv2d | ✓ | ✓ | ✓ | NCHW, stride/pad/dil; FP32 fwd ✓ \| FP32 bwd ✓ \| FP16 fwd/bwd ✓ \| groups ≥ 1 (depthwise supported); backward (dX, dW, dB) dtype-dispatched (FP32+FP16; FP16 dW/dB use FP32 scratch + fold) |
-| conv2d_int8w_fp16 | — | — | ✓ | W8A16 weight-only conv2d; INT8 OIHW filter + per-output-channel FP32 scales, FP16 acts |
+| conv2d_int8w_fp16 | — | — | ✓ | W8A16 weight-only conv2d; INT8 OIHW filter + per-output-channel FP32 scales, FP16 acts; CUDA WMMA fast path for 3x3 s1, 1x1 s1, 3x3 s2 (groups=1, dil=1) — naive fallback otherwise |
 | upsample_nearest_2x | ✓ | ✓ | ✓ | backward dtype-dispatched (FP32+FP16) |
 | upsample_bilinear_2x | ✓ | ✓ | ✓ | align_corners=False; backward dtype-dispatched (FP32+FP16; FP16 uses FP32 scratch + fold) |
 | downsample_avg_2x | ✓ | ✓ | ✓ | stride 2, kernel 2; backward dtype-dispatched (FP32+FP16) |
