@@ -1,9 +1,12 @@
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
+#include "fp16_internal.cuh"
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <cmath>
 #include <stdexcept>
 
 namespace brotensor {
@@ -12,6 +15,116 @@ namespace {
 
 constexpr int FA_BLOCK = 128;
 constexpr int FA_KTILE = 64;
+
+// ─── Per-head extract / pack-back kernels ──────────────────────────────────
+//
+// Source X laid out as (L, D) with D = num_heads * head_dim and the head
+// dimension contiguous within each row: X[l, h*head_dim + d]. The WMMA
+// matmul path wants a contiguous (L, head_dim) view per head.
+
+__global__ void extract_head_LD_kernel(const __half* __restrict__ X,
+                                       __half* __restrict__ Y,
+                                       int L, int D, int head_off, int head_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = L * head_dim;
+    if (idx >= total) return;
+    const int l = idx / head_dim;
+    const int d = idx % head_dim;
+    Y[l * head_dim + d] = X[l * D + head_off + d];
+}
+
+// Extract a single head and TRANSPOSE on the way in: Y has layout
+// (head_dim, L) so element (d, l) = X[l, head_off + d]. Used to produce a
+// (head_dim, L) "B"-style operand for the second GEMM via launch_matmul_ABT.
+__global__ void extract_head_DL_kernel(const __half* __restrict__ X,
+                                       __half* __restrict__ Y,
+                                       int L, int D, int head_off, int head_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = L * head_dim;
+    if (idx >= total) return;
+    // Cooperatively write Y[d * L + l] = X[l * D + head_off + d]. Choose
+    // mapping that gives coalesced loads of X (d innermost in source) and
+    // strided writes to Y — strided writes are fine for fp16 throughput here.
+    const int l = idx / head_dim;
+    const int d = idx % head_dim;
+    Y[d * L + l] = X[l * D + head_off + d];
+}
+
+// Inverse of extract_head_LD: write a per-head (Lq, head_dim) block back
+// into the (Lq, D) output at column slot [head_off, head_off+head_dim).
+__global__ void pack_head_LD_kernel(const __half* __restrict__ Y,
+                                    __half* __restrict__ Out,
+                                    int L, int D, int head_off, int head_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = L * head_dim;
+    if (idx >= total) return;
+    const int l = idx / head_dim;
+    const int d = idx % head_dim;
+    Out[l * D + head_off + d] = Y[l * head_dim + d];
+}
+
+// Row-wise softmax over S(Lq, Lk) with a scalar scale (1/sqrt(head_dim))
+// and optional Lk-shaped float mask: positions with mask[k] <= 0.5 are
+// dropped (score forced to -inf). One block per query row, blockDim
+// chosen by the launcher.
+__global__ void scale_mask_softmax_rows_kernel(__half* __restrict__ S,
+                                               int Lq, int Lk,
+                                               float scale,
+                                               const float* __restrict__ mask) {
+    extern __shared__ float ssm[];  // size = blockDim.x
+    const int q = blockIdx.x;
+    const int tid = threadIdx.x;
+    __half* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+
+    // 1. find row max (with scale and mask applied).
+    float local_max = -1e30f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        float v = __half2float(row[k]) * scale;
+        if (mask && mask[k] <= 0.5f) v = -1e30f;
+        if (v > local_max) local_max = v;
+    }
+    ssm[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float o = ssm[tid + s];
+            if (o > ssm[tid]) ssm[tid] = o;
+        }
+        __syncthreads();
+    }
+    const float rmax = ssm[0];
+    const bool empty = (rmax <= -1e29f);
+
+    // 2. exponentiate, accumulate sum.
+    float local_sum = 0.0f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        float v = __half2float(row[k]) * scale;
+        if (mask && mask[k] <= 0.5f) v = -1e30f;
+        const float e = empty ? 0.0f : __expf(v - rmax);
+        row[k] = __float2half(e);
+        local_sum += e;
+    }
+    ssm[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) ssm[tid] += ssm[tid + s];
+        __syncthreads();
+    }
+    const float rsum = ssm[0];
+    const float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
+
+    // 3. normalise.
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        const float e = __half2float(row[k]);
+        row[k] = __float2half(e * inv);
+    }
+}
+
+inline int grid_for(int n, int block) {
+    int b = (n + block - 1) / block;
+    if (b < 1) b = 1;
+    return b;
+}
 
 // Flash-attention-style online-softmax kernel. One block per (q, head) tile.
 // Tiles over Lk so the scores row never lives in shared/global memory in full
@@ -188,25 +301,103 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
         throw std::runtime_error("flash_attention_forward_gpu: causal requires Lq == Lk");
     }
     const int head_dim = D / num_heads;
-    // head_dim parallelisation in the kernel uses up to 8 d-slots/thread.
-    if ((head_dim + FA_BLOCK - 1) / FA_BLOCK > 8) {
-        throw std::runtime_error("flash_attention_forward_gpu: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
-    }
     if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
         O.resize(Lq, D, Dtype::FP16);
     }
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
-    const size_t shmem = (static_cast<size_t>(FA_KTILE) + FA_BLOCK) * sizeof(float);
-    dim3 grid(Lq, num_heads, 1);
-    flash_attention_kernel<<<grid, FA_BLOCK, shmem>>>(
-        reinterpret_cast<const __half*>(Q.data_fp16()),
-        reinterpret_cast<const __half*>(K.data_fp16()),
-        reinterpret_cast<const __half*>(V.data_fp16()),
-        d_mask,
-        reinterpret_cast<__half*>(O.data_fp16()),
-        Lq, Lk, D, head_dim,
-        causal ? 1 : 0);
+    // Causal masking is not yet supported by the WMMA path; fall through to
+    // the original online-softmax flash kernel for that case. SD1.5 does
+    // not use causal here, so the fast path covers our production workload.
+    if (causal) {
+        const size_t shmem = (static_cast<size_t>(FA_KTILE) + FA_BLOCK) * sizeof(float);
+        // head_dim parallelisation in the kernel uses up to 8 d-slots/thread.
+        if ((head_dim + FA_BLOCK - 1) / FA_BLOCK > 8) {
+            throw std::runtime_error("flash_attention_forward_gpu: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
+        }
+        dim3 grid(Lq, num_heads, 1);
+        flash_attention_kernel<<<grid, FA_BLOCK, shmem>>>(
+            reinterpret_cast<const __half*>(Q.data_fp16()),
+            reinterpret_cast<const __half*>(K.data_fp16()),
+            reinterpret_cast<const __half*>(V.data_fp16()),
+            d_mask,
+            reinterpret_cast<__half*>(O.data_fp16()),
+            Lq, Lk, D, head_dim,
+            1);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // ── WMMA per-head path ────────────────────────────────────────────────
+    // For each head h:
+    //   1. Extract Qh(Lq, head_dim), Kh(Lk, head_dim), Vth(head_dim, Lk).
+    //   2. S(Lq, Lk) = Qh @ Kh^T               via launch_matmul_ABT.
+    //   3. S = softmax_row(S * inv_sqrt_hd, mask).
+    //   4. Oh(Lq, head_dim) = S @ Vth^T        via launch_matmul_ABT.
+    //   5. Pack Oh back into O at slot [h*hd .. (h+1)*hd).
+    //
+    // Scratch tensors are scoped local; for SD1.5 worst-case (Lq=Lk=4096,
+    // head_dim=40) the S buffer is 32 MB and the per-head buffers a few
+    // hundred KB. Allocator reuse makes subsequent calls effectively free.
+    GpuTensor Qh(Lq, head_dim, Dtype::FP16);
+    GpuTensor Kh(Lk, head_dim, Dtype::FP16);
+    GpuTensor Vth(head_dim, Lk, Dtype::FP16);
+    GpuTensor S(Lq, Lk, Dtype::FP16);
+    GpuTensor Oh(Lq, head_dim, Dtype::FP16);
+
+    const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+    constexpr int CP_BLOCK = 256;
+    // softmax block: scale with Lk but cap to keep shared/reduction sane.
+    int sm_block = 32;
+    while (sm_block < Lk && sm_block < 1024) sm_block *= 2;
+    if (sm_block > 1024) sm_block = 1024;
+
+    for (int h = 0; h < num_heads; ++h) {
+        const int head_off = h * head_dim;
+
+        // 1. Extract per-head buffers.
+        const int total_q = Lq * head_dim;
+        const int total_k = Lk * head_dim;
+        extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+            reinterpret_cast<const __half*>(Q.data_fp16()),
+            reinterpret_cast<__half*>(Qh.data_fp16()),
+            Lq, D, head_off, head_dim);
+        extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+            reinterpret_cast<const __half*>(K.data_fp16()),
+            reinterpret_cast<__half*>(Kh.data_fp16()),
+            Lk, D, head_off, head_dim);
+        extract_head_DL_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+            reinterpret_cast<const __half*>(V.data_fp16()),
+            reinterpret_cast<__half*>(Vth.data_fp16()),
+            Lk, D, head_off, head_dim);
+
+        // 2. S(Lq, Lk) = Qh(Lq, hd) @ Kh(Lk, hd)^T.
+        fp16_internal::launch_matmul_ABT(
+            reinterpret_cast<const __half*>(Qh.data_fp16()),
+            reinterpret_cast<const __half*>(Kh.data_fp16()),
+            reinterpret_cast<__half*>(S.data_fp16()),
+            Lq, Lk, head_dim);
+
+        // 3. Row-wise softmax (scaled, optionally masked).
+        const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
+        scale_mask_softmax_rows_kernel<<<Lq, sm_block, shmem>>>(
+            reinterpret_cast<__half*>(S.data_fp16()),
+            Lq, Lk, inv_sqrt, d_mask);
+
+        // 4. Oh(Lq, hd) = S(Lq, Lk) @ Vth(hd, Lk)^T  — Vth is already (hd, Lk).
+        fp16_internal::launch_matmul_ABT(
+            reinterpret_cast<const __half*>(S.data_fp16()),
+            reinterpret_cast<const __half*>(Vth.data_fp16()),
+            reinterpret_cast<__half*>(Oh.data_fp16()),
+            Lq, head_dim, Lk);
+
+        // 5. Pack back into the per-head slot of O.
+        pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+            reinterpret_cast<const __half*>(Oh.data_fp16()),
+            reinterpret_cast<__half*>(O.data_fp16()),
+            Lq, D, head_off, head_dim);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

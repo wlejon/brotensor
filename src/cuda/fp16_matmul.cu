@@ -261,8 +261,14 @@ void launch_matmul_ABT_impl(const __half* A, const __half* B, __half* C,
         return;
     }
 
-    // Use naive for very tiny problems.
-    if (size_t(M) * size_t(N) < 256) {
+    // Use naive for very tiny problems, when K is too small for the WMMA
+    // kernel's tile shape (BK=32, WMMA_K=16), or when K/N is not a multiple
+    // of 8: the WMMA path's vectorised int4 loads of A/B and int4 stores of
+    // C require an 8-half-aligned row stride along K (for A and B) and N
+    // (for C); the kernel does not currently emit a scalar-aligned-store
+    // fallback for those cases.
+    if (size_t(M) * size_t(N) < 256 || K < 16 ||
+        (K & 7) != 0 || (N & 7) != 0) {
         const int total = M * N;
         const int block = 128;
         const int grid  = (total + block - 1) / block;
