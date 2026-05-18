@@ -90,80 +90,6 @@ kernel void k_gn_silu_fused(
     }
 }
 
-struct ConvParams {
-    uint N, C_in, C_out, H, Wd;
-    uint has_bias, has_skip;
-    uint total;
-};
-
-// 3x3 same-padding conv with optional bias and optional skip-add epilogue.
-kernel void k_conv3x3_same_add(
-        device const half* X    [[buffer(0)]],
-        device const half* W    [[buffer(1)]],
-        device const half* bias [[buffer(2)]],   // dummy when has_bias==0
-        device const half* skip [[buffer(3)]],   // dummy when has_skip==0
-        device half*       Y    [[buffer(4)]],
-        constant ConvParams& p  [[buffer(5)]],
-        uint idx [[thread_position_in_grid]]) {
-    if (idx >= p.total) return;
-    uint ow = idx % p.Wd;
-    uint t  = idx / p.Wd;
-    uint oh = t % p.H;
-    t /= p.H;
-    uint oc = t % p.C_out;
-    uint n  = t / p.C_out;
-
-    float acc = 0.0f;
-    uint w_oc_base = oc * p.C_in * 9u;
-    uint x_n_base  = n * p.C_in * p.H * p.Wd;
-    for (uint ic = 0; ic < p.C_in; ++ic) {
-        uint w_ic_base = w_oc_base + ic * 9u;
-        uint x_ic_base = x_n_base  + ic * p.H * p.Wd;
-        for (uint kh = 0; kh < 3; ++kh) {
-            int in_h = int(oh) + int(kh) - 1;
-            if (in_h < 0 || in_h >= int(p.H)) continue;
-            for (uint kw = 0; kw < 3; ++kw) {
-                int in_w = int(ow) + int(kw) - 1;
-                if (in_w < 0 || in_w >= int(p.Wd)) continue;
-                float xv = float(X[x_ic_base + uint(in_h) * p.Wd + uint(in_w)]);
-                float wv = float(W[w_ic_base + kh * 3u + kw]);
-                acc += xv * wv;
-            }
-        }
-    }
-    if (p.has_bias != 0u) acc += float(bias[oc]);
-    if (p.has_skip != 0u) acc += float(skip[idx]);
-    Y[idx] = half(acc);
-}
-
-struct Conv1x1Params {
-    uint N, C_in, C_out, spatial;
-    uint has_bias;
-    uint total;
-};
-
-kernel void k_conv1x1(device const half* X    [[buffer(0)]],
-                      device const half* W    [[buffer(1)]],
-                      device const half* bias [[buffer(2)]],
-                      device half*       Y    [[buffer(3)]],
-                      constant Conv1x1Params& p [[buffer(4)]],
-                      uint idx [[thread_position_in_grid]]) {
-    if (idx >= p.total) return;
-    uint s  = idx % p.spatial;
-    uint t  = idx / p.spatial;
-    uint oc = t % p.C_out;
-    uint n  = t / p.C_out;
-    float acc = 0.0f;
-    uint w_base    = oc * p.C_in;
-    uint x_n_base  = n  * p.C_in * p.spatial;
-    for (uint ic = 0; ic < p.C_in; ++ic) {
-        acc += float(X[x_n_base + ic * p.spatial + s]) *
-               float(W[w_base + ic]);
-    }
-    if (p.has_bias != 0u) acc += float(bias[oc]);
-    Y[idx] = half(acc);
-}
-
 struct ShiftParams {
     uint N, C, spatial, has_N, total;
 };
@@ -220,18 +146,6 @@ id<MTLComputePipelineState> pso_gn_silu() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_gn_silu_fused"); });
     return pso;
 }
-id<MTLComputePipelineState> pso_conv3x3() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_conv3x3_same_add"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_conv1x1_pso() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_conv1x1"); });
-    return pso;
-}
 id<MTLComputePipelineState> pso_add_shift() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -245,16 +159,6 @@ id<MTLComputePipelineState> pso_sum_hw_per_NC() {
     return pso;
 }
 
-struct ConvParams {
-    uint32_t N, C_in, C_out, H, Wd;
-    uint32_t has_bias, has_skip;
-    uint32_t total;
-};
-struct Conv1x1Params {
-    uint32_t N, C_in, C_out, spatial;
-    uint32_t has_bias;
-    uint32_t total;
-};
 struct ShiftParams {
     uint32_t N, C, spatial, has_N, total;
 };
@@ -291,90 +195,6 @@ void launch_gn_silu(const GpuTensor& X,
         [enc setBytes:&eps length:sizeof(float)    atIndex:7];
         [enc dispatchThreadgroups:MTLSizeMake(num_groups, N, 1)
             threadsPerThreadgroup:MTLSizeMake(RB_GN_BLOCK, 1, 1)];
-        [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
-    }
-}
-
-void launch_conv3x3(const GpuTensor& X, const GpuTensor& W,
-                    const GpuTensor* bias, const GpuTensor* skip,
-                    GpuTensor& Y,
-                    int N, int C_in, int C_out, int H, int Wd) {
-    id<MTLComputePipelineState> pso = pso_conv3x3();
-    id<MTLBuffer> bx = buffer_for(X);
-    id<MTLBuffer> bw = buffer_for(W);
-    id<MTLBuffer> by = buffer_for(Y);
-    id<MTLBuffer> bb = bias ? buffer_for(*bias) : bx;
-    id<MTLBuffer> bs = skip ? buffer_for(*skip) : bx;
-    const NSUInteger ox = buffer_offset_for(X);
-    const NSUInteger ow_ = buffer_offset_for(W);
-    const NSUInteger oy = buffer_offset_for(Y);
-    const NSUInteger ob = bias ? buffer_offset_for(*bias) : 0;
-    const NSUInteger os = skip ? buffer_offset_for(*skip) : 0;
-
-    ConvParams p{};
-    p.N = N; p.C_in = C_in; p.C_out = C_out; p.H = H; p.Wd = Wd;
-    p.has_bias = bias ? 1u : 0u;
-    p.has_skip = skip ? 1u : 0u;
-    p.total = static_cast<uint32_t>(N) * static_cast<uint32_t>(C_out) *
-              static_cast<uint32_t>(H) * static_cast<uint32_t>(Wd);
-    if (p.total == 0) return;
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bx offset:ox atIndex:0];
-        [enc setBuffer:bw offset:ow_ atIndex:1];
-        [enc setBuffer:bb offset:ob atIndex:2];
-        [enc setBuffer:bs offset:os atIndex:3];
-        [enc setBuffer:by offset:oy atIndex:4];
-        [enc setBytes:&p length:sizeof(ConvParams) atIndex:5];
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > RB_CONV_BLOCK) tg = RB_CONV_BLOCK;
-        [enc dispatchThreads:MTLSizeMake(p.total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
-    }
-}
-
-void launch_conv1x1(const GpuTensor& X, const GpuTensor& W,
-                    const GpuTensor* bias,
-                    GpuTensor& Y,
-                    int N, int C_in, int C_out, int spatial) {
-    id<MTLComputePipelineState> pso = pso_conv1x1_pso();
-    id<MTLBuffer> bx = buffer_for(X);
-    id<MTLBuffer> bw = buffer_for(W);
-    id<MTLBuffer> by = buffer_for(Y);
-    id<MTLBuffer> bb = bias ? buffer_for(*bias) : bx;
-    const NSUInteger ox = buffer_offset_for(X);
-    const NSUInteger ow_ = buffer_offset_for(W);
-    const NSUInteger oy = buffer_offset_for(Y);
-    const NSUInteger ob = bias ? buffer_offset_for(*bias) : 0;
-
-    Conv1x1Params p{};
-    p.N = N; p.C_in = C_in; p.C_out = C_out; p.spatial = spatial;
-    p.has_bias = bias ? 1u : 0u;
-    p.total = static_cast<uint32_t>(N) * static_cast<uint32_t>(C_out) *
-              static_cast<uint32_t>(spatial);
-    if (p.total == 0) return;
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bx offset:ox atIndex:0];
-        [enc setBuffer:bw offset:ow_ atIndex:1];
-        [enc setBuffer:bb offset:ob atIndex:2];
-        [enc setBuffer:by offset:oy atIndex:3];
-        [enc setBytes:&p length:sizeof(Conv1x1Params) atIndex:4];
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > RB_CONV_BLOCK) tg = RB_CONV_BLOCK;
-        [enc dispatchThreads:MTLSizeMake(p.total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
@@ -483,7 +303,15 @@ void resblock_forward_gpu(const GpuTensor& X,
 
     launch_gn_silu(X, gamma1, beta1, h1, N, C_in, spatial,
                    C_in / num_groups, eps);
-    launch_conv3x3(h1, W1, b1, nullptr, h2, N, C_in, C_out, H, Wd);
+
+    // Conv1: 3x3 same. Dispatch through the public conv2d (simdgroup fast path).
+    conv2d_forward_gpu(h1, W1, b1,
+                       N, C_in, H, Wd,
+                       C_out, 3, 3,
+                       /*stride*/1, 1,
+                       /*pad*/1, 1,
+                       /*dil*/1, 1,
+                       h2);
 
     if (t_emb_shift) {
         if (t_emb_shift->dtype != Dtype::FP16) {
@@ -505,20 +333,36 @@ void resblock_forward_gpu(const GpuTensor& X,
     launch_gn_silu(h2, gamma2, beta2, h3, N, C_out, spatial,
                    C_out / num_groups, eps);
 
+    // Prepare the skip tensor for the conv2 epilogue (post-conv2 add).
     thread_local GpuTensor skip_scratch;
-    const GpuTensor* skip_ptr = nullptr;
-    if (Wskip == nullptr) {
-        skip_ptr = &X;
-    } else {
+    if (Wskip != nullptr) {
         if (Wskip->dtype != Dtype::FP16) {
             throw std::runtime_error("resblock_forward_gpu: Wskip must be FP16");
         }
-        skip_scratch.resize(N, C_out * spatial, Dtype::FP16);
-        launch_conv1x1(X, *Wskip, bskip, skip_scratch, N, C_in, C_out, spatial);
-        skip_ptr = &skip_scratch;
+        // 1x1 conv through the public path.
+        conv2d_forward_gpu(X, *Wskip, bskip,
+                           N, C_in, H, Wd,
+                           C_out, 1, 1,
+                           /*stride*/1, 1,
+                           /*pad*/0, 0,
+                           /*dil*/1, 1,
+                           skip_scratch);
     }
 
-    launch_conv3x3(h3, W2, b2, skip_ptr, Y, N, C_out, C_out, H, Wd);
+    // Conv2 (3x3 same) → Y, then fuse-in the skip via add_inplace_gpu.
+    conv2d_forward_gpu(h3, W2, b2,
+                       N, C_out, H, Wd,
+                       C_out, 3, 3,
+                       /*stride*/1, 1,
+                       /*pad*/1, 1,
+                       /*dil*/1, 1,
+                       Y);
+    if (Wskip == nullptr) {
+        // skip is X itself (C_in == C_out so shapes match).
+        add_inplace_gpu(Y, X);
+    } else {
+        add_inplace_gpu(Y, skip_scratch);
+    }
 }
 
 void resblock_backward_gpu(const GpuTensor& X,
