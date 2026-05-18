@@ -146,6 +146,56 @@ void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
     }
 }
 
+// Inverse of concat_nchw_channels_gpu: scatter channel slices of dY back
+// into per-source gradient buffers. Each parts[i] is *overwritten* with the
+// corresponding channel block of dY. Same 2D memcpy pattern as the forward,
+// with src/dst pitches swapped.
+void concat_nchw_channels_backward_gpu(const GpuTensor& dY,
+                                       int N, int H, int W,
+                                       const std::vector<int>& C_per_part,
+                                       const std::vector<GpuTensor*>& parts) {
+    if (parts.size() != C_per_part.size()) {
+        throw std::runtime_error("concat_nchw_channels_backward_gpu: parts.size() != C_per_part.size()");
+    }
+    int total_C = 0;
+    for (int Ci : C_per_part) total_C += Ci;
+    const int expected_cols = total_C * H * W;
+    if (dY.rows != N || dY.cols != expected_cols) {
+        throw std::runtime_error("concat_nchw_channels_backward_gpu: dY shape mismatch (expected N x total_C*H*W)");
+    }
+    const Dtype dt = dY.dtype;
+    if (dt != Dtype::FP32 && dt != Dtype::FP16) {
+        throw std::runtime_error("concat_nchw_channels_backward_gpu: dY dtype must be FP16 or FP32");
+    }
+
+    const size_t elem = static_cast<size_t>(dtype_size_bytes(dt));
+    const size_t HW = static_cast<size_t>(H) * static_cast<size_t>(W);
+    const size_t src_pitch = elem * static_cast<size_t>(total_C) * HW;
+    const char* src_base = reinterpret_cast<const char*>(dY.data);
+
+    size_t c_off = 0;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        GpuTensor* p = parts[i];
+        const int Ci = C_per_part[i];
+        if (!p) throw std::runtime_error("concat_nchw_channels_backward_gpu: null part");
+        const int cols = Ci * H * W;
+        if (p->rows != N || p->cols != cols || p->dtype != dt) {
+            p->resize(N, cols, dt);
+        }
+        if (Ci == 0 || N == 0 || HW == 0) {
+            c_off += static_cast<size_t>(Ci);
+            continue;
+        }
+        const size_t width_bytes = elem * static_cast<size_t>(Ci) * HW;
+        BROTENSOR_CUDA_CHECK(cudaMemcpy2DAsync(
+            p->data,                          width_bytes,
+            src_base + c_off * HW * elem,     src_pitch,
+            width_bytes,                       static_cast<size_t>(N),
+            cudaMemcpyDeviceToDevice));
+        c_off += static_cast<size_t>(Ci);
+    }
+}
+
 // Single-stream device-to-device chunk copy. Copies `n` floats from
 // src.data + src_off into dst.data + dst_off. No bounds checking.
 void copy_d2d_gpu(const GpuTensor& src, int src_off,

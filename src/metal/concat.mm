@@ -145,6 +145,53 @@ void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
     }
 }
 
+void concat_nchw_channels_backward_gpu(const GpuTensor& dY,
+                                       int N, int H, int W,
+                                       const std::vector<int>& C_per_part,
+                                       const std::vector<GpuTensor*>& parts) {
+    if (parts.size() != C_per_part.size()) {
+        throw std::runtime_error("concat_nchw_channels_backward_gpu: parts.size() != C_per_part.size()");
+    }
+    int total_C = 0;
+    for (int Ci : C_per_part) total_C += Ci;
+    const int expected_cols = total_C * H * W;
+    if (dY.rows != N || dY.cols != expected_cols) {
+        throw std::runtime_error("concat_nchw_channels_backward_gpu: dY shape mismatch (expected N x total_C*H*W)");
+    }
+    const Dtype dt = dY.dtype;
+    if (dt != Dtype::FP32 && dt != Dtype::FP16) {
+        throw std::runtime_error("concat_nchw_channels_backward_gpu: dY dtype must be FP16 or FP32");
+    }
+
+    const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(dt));
+    const std::size_t HW = static_cast<std::size_t>(H) * static_cast<std::size_t>(W);
+    const std::size_t src_pitch = elem * static_cast<std::size_t>(total_C) * HW;
+    const char* src_base = reinterpret_cast<const char*>(dY.data);
+
+    std::size_t c_off = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        GpuTensor* p = parts[i];
+        const int Ci = C_per_part[i];
+        if (!p) throw std::runtime_error("concat_nchw_channels_backward_gpu: null part");
+        const int cols = Ci * H * W;
+        if (p->rows != N || p->cols != cols || p->dtype != dt) {
+            p->resize(N, cols, dt);
+        }
+        if (Ci == 0 || N == 0 || HW == 0) {
+            c_off += static_cast<std::size_t>(Ci);
+            continue;
+        }
+        const std::size_t width_bytes = elem * static_cast<std::size_t>(Ci) * HW;
+        char* dst = reinterpret_cast<char*>(p->data);
+        for (int n = 0; n < N; ++n) {
+            copy_bytes(dst + static_cast<std::size_t>(n) * width_bytes,
+                       src_base + static_cast<std::size_t>(n) * src_pitch + c_off * HW * elem,
+                       width_bytes);
+        }
+        c_off += static_cast<std::size_t>(Ci);
+    }
+}
+
 void copy_d2d_gpu(const GpuTensor& src, int src_off,
                   GpuTensor& dst,       int dst_off,
                   int n) {

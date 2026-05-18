@@ -54,7 +54,7 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | cross_attention | ✓ | ✓ | ✓ | FP32 = training (caches exposed via `_train`, rectangular Wk/Wv); FP16 = flash inference |
 | flash_attention | — | — | ✓ | tiled online-softmax, Lk-unbounded, optional causal |
 | flash_attention_qkvo | — | — | ✓ (fwd) / ✓ (bwd) | fused Q/K/V/O projections + biases; rectangular Wk/Wv for cross-attn; optional causal; verified at SD1.5 U-Net head_dims (40/80/160) and CLIP head_dim 64. FP16 backward via recompute (no fwd-time caches); CUDA only — Metal bwd throws |
-| resblock | — | — | ✓ | fused diffusion ResBlock (GN→SiLU→conv ×2 + skip) |
+| resblock | — | ✓ (bwd) | ✓ | fused diffusion ResBlock (GN→SiLU→conv ×2 + skip); FP16 backward via composition of public ops (recomputes h1/h2/h3; no fwd-time caches) |
 | conv2d | ✓ | ✓ | ✓ | NCHW, groups=1, stride/pad/dil; backward (dX, dW, dB) dtype-dispatched (FP32+FP16; FP16 dW/dB use FP32 scratch + fold) |
 | upsample_nearest_2x | ✓ | ✓ | ✓ | backward dtype-dispatched (FP32+FP16) |
 | upsample_bilinear_2x | ✓ | ✓ | ✓ | align_corners=False; backward dtype-dispatched (FP32+FP16; FP16 uses FP32 scratch + fold) |
@@ -63,7 +63,7 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | embedding lookup | ✓ | ✓ | ✓ | FP32/FP16 table dispatch; backward dtype-dispatched (FP16 uses FP32 scratch + fold for atomic-add safety) |
 | concat_rows / split_rows | ✓ | ✓ | ✓ | flat byte-aware concat (FP16 supported) |
 | concat_batched_rows | ✓ | n/a | ✓ | per-row column-block concat via 2D memcpy |
-| concat_nchw_channels | ✓ | n/a | ✓ | channel-axis concat for U-Net skip merges (N≥1) |
+| concat_nchw_channels | ✓ | ✓ | ✓ | channel-axis concat for U-Net skip merges (N≥1); backward is per-part scatter (overwrites parts) |
 | masked_mean_pool | ✓ | ✓ | — | row-wise mean over valid mask |
 | copy_d2d | ✓ | n/a | ✓ | flat-buffer device-to-device chunk copy |
 | build_causal_mask_row | n/a | n/a | ✓ | length-L FP32 mask, CLIP text |

@@ -355,6 +355,23 @@ void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
                               const std::vector<int>& C_per_part,
                               GpuTensor& out);
 
+// Inverse of concat_nchw_channels_gpu: copy disjoint channel-axis slices of
+// dY back into per-source gradient buffers. Each parts[i] is *overwritten*
+// (not accumulated) with the channels [off_i, off_i + C_per_part[i]) of dY,
+// where off_i = sum_{j < i} C_per_part[j].
+//
+//   dY[n, (off_i + c) * H*W + h*W + w] -> parts[i][n, c * H*W + h*W + w]
+//
+// Dtype-dispatched (FP32 + FP16); all parts are resized AND dtype-set to
+// match dY.dtype if mis-shaped/-typed. Implemented via cudaMemcpy2DAsync per
+// part — pure bandwidth, no kernel launches.
+//
+// C_per_part.size() must equal parts.size(); dY.cols must be N * sum(C_per_part) * H * W.
+void concat_nchw_channels_backward_gpu(const GpuTensor& dY,
+                                       int N, int H, int W,
+                                       const std::vector<int>& C_per_part,
+                                       const std::vector<GpuTensor*>& parts);
+
 // Single-stream device-to-device chunk copy. Copies `n` floats from
 // src.data + src_off into dst.data + dst_off. Both tensors are treated as
 // flat float buffers regardless of (rows, cols). Async on the default stream.
@@ -1218,5 +1235,57 @@ void resblock_forward_gpu(const GpuTensor& X,
                           int N, int C_in, int C_out, int H, int W,
                           int num_groups, float eps,
                           GpuTensor& Y);
+
+// Composite backward of resblock_forward_gpu. All tensors FP16. Implemented
+// purely by composition of the existing public ops (group_norm forward+
+// backward, silu forward+backward, conv2d forward+backward_input/weight/bias,
+// add_inplace). The forward intermediates are NOT cached by the forward op,
+// so the backward recomputes them from X and the cached parameter tensors:
+//
+//   h1_pre_silu = group_norm_forward(X, gamma1, beta1)
+//   h1          = silu(h1_pre_silu)
+//   h2_pre_t    = conv2d_3x3_same(h1, W1, b1)
+//   h2          = h2_pre_t + broadcast(t_emb_shift)  (if t_emb_shift)
+//   h3_pre_silu = group_norm_forward(h2, gamma2, beta2)
+//   h3          = silu(h3_pre_silu)
+//
+// then routes dY back through SiLU/GN/conv1/conv2/t_emb_shift, summing with
+// the residual gradient (identity-skip or conv1x1-skip).
+//
+// Argument semantics:
+//   X, gamma1, beta1, W1, b1, t_emb_shift, gamma2, beta2, W2, b2,
+//   Wskip, bskip:                   forward inputs (read-only).
+//   dY:    (N, C_out * H * W)       upstream gradient (FP16).
+//   dX:    (N, C_in  * H * W)       *overwritten* (resized/retyped as needed).
+//   dGamma1, dBeta1: (C_in,  1)     *accumulated* — caller zeros.
+//   dW1:   (C_out, C_in * 9)        *accumulated* — caller zeros.
+//   db1:   (C_out, 1) or null       *accumulated* if non-null and b1 was used.
+//   dt_emb_shift: same shape as     *accumulated* if non-null and t_emb_shift
+//                 t_emb_shift, or null. was used.
+//   dGamma2, dBeta2: (C_out, 1)     *accumulated* — caller zeros.
+//   dW2:   (C_out, C_out * 9)       *accumulated* — caller zeros.
+//   db2:   (C_out, 1) or null       *accumulated* if non-null and b2 was used.
+//   dWskip: (C_out, C_in * 1) or    *accumulated* if non-null and Wskip was
+//           null.                   used (i.e. C_in != C_out path).
+//   dbskip: (C_out, 1) or null      *accumulated* if non-null and bskip was used.
+//
+// num_groups/eps must match the forward call. All FP16.
+void resblock_backward_gpu(const GpuTensor& X,
+                           const GpuTensor& gamma1, const GpuTensor& beta1,
+                           const GpuTensor& W1, const GpuTensor* b1,
+                           const GpuTensor* t_emb_shift,
+                           const GpuTensor& gamma2, const GpuTensor& beta2,
+                           const GpuTensor& W2, const GpuTensor* b2,
+                           const GpuTensor* Wskip, const GpuTensor* bskip,
+                           int N, int C_in, int C_out, int H, int W,
+                           int num_groups, float eps,
+                           const GpuTensor& dY,
+                           GpuTensor& dX,
+                           GpuTensor& dGamma1, GpuTensor& dBeta1,
+                           GpuTensor& dW1, GpuTensor* db1,
+                           GpuTensor* dt_emb_shift,
+                           GpuTensor& dGamma2, GpuTensor& dBeta2,
+                           GpuTensor& dW2, GpuTensor* db2,
+                           GpuTensor* dWskip, GpuTensor* dbskip);
 
 } // namespace brotensor

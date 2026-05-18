@@ -179,6 +179,39 @@ kernel void k_add_NC_shift(device half*       Y     [[buffer(0)]],
     uint sidx = (p.has_N != 0u) ? (n * p.C + c) : c;
     Y[idx] = half(float(Y[idx]) + float(shift[sidx]));
 }
+
+// Per-(n, c) HW reduction of an NCHW FP16 tensor, accumulated (folded) into
+// d_shift[n, c]. One threadgroup per (n, c); RB_GN_BLOCK threads reduce.
+struct ReduceNCParams { uint N, C, spatial; };
+
+kernel void k_sum_hw_per_NC(
+        device const half* dh2     [[buffer(0)]],
+        device half*       d_shift [[buffer(1)]],
+        constant ReduceNCParams& p [[buffer(2)]],
+        uint3 gid  [[threadgroup_position_in_grid]],
+        uint3 tid3 [[thread_position_in_threadgroup]],
+        uint3 tgs3 [[threads_per_threadgroup]]) {
+    threadgroup float s_buf[RB_GN_BLOCK];
+    uint nc = gid.x;
+    if (nc >= p.N * p.C) return;
+    uint tid = tid3.x;
+    uint tg_size = tgs3.x;
+    device const half* row = dh2 + nc * p.spatial;
+    float acc = 0.0f;
+    for (uint i = tid; i < p.spatial; i += tg_size) {
+        acc += float(row[i]);
+    }
+    s_buf[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) s_buf[tid] += s_buf[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float prev = float(d_shift[nc]);
+        d_shift[nc] = half(prev + s_buf[0]);
+    }
+}
 )msl";
 
 id<MTLComputePipelineState> pso_gn_silu() {
@@ -205,6 +238,12 @@ id<MTLComputePipelineState> pso_add_shift() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_add_NC_shift"); });
     return pso;
 }
+id<MTLComputePipelineState> pso_sum_hw_per_NC() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_sum_hw_per_NC"); });
+    return pso;
+}
 
 struct ConvParams {
     uint32_t N, C_in, C_out, H, Wd;
@@ -218,6 +257,9 @@ struct Conv1x1Params {
 };
 struct ShiftParams {
     uint32_t N, C, spatial, has_N, total;
+};
+struct ReduceNCParams {
+    uint32_t N, C, spatial;
 };
 
 void launch_gn_silu(const GpuTensor& X,
@@ -371,6 +413,34 @@ void launch_add_shift(GpuTensor& Y, const GpuTensor& shift,
     }
 }
 
+void launch_sum_hw_per_NC(const GpuTensor& dh2, GpuTensor& d_shift,
+                          int N, int C, int spatial) {
+    id<MTLComputePipelineState> pso = pso_sum_hw_per_NC();
+    id<MTLBuffer> bx = buffer_for(dh2);
+    id<MTLBuffer> bs = buffer_for(d_shift);
+    const NSUInteger ox = buffer_offset_for(dh2);
+    const NSUInteger os = buffer_offset_for(d_shift);
+
+    ReduceNCParams p{};
+    p.N = N; p.C = C; p.spatial = spatial;
+    const uint32_t blocks = static_cast<uint32_t>(N) * static_cast<uint32_t>(C);
+    if (blocks == 0 || spatial == 0) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bx offset:ox atIndex:0];
+        [enc setBuffer:bs offset:os atIndex:1];
+        [enc setBytes:&p length:sizeof(ReduceNCParams) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(blocks, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(RB_GN_BLOCK, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+}
+
 } // namespace
 
 void resblock_forward_gpu(const GpuTensor& X,
@@ -444,6 +514,144 @@ void resblock_forward_gpu(const GpuTensor& X,
     }
 
     launch_conv3x3(h3, W2, b2, skip_ptr, Y, N, C_out, C_out, H, Wd);
+}
+
+void resblock_backward_gpu(const GpuTensor& X,
+                           const GpuTensor& gamma1, const GpuTensor& beta1,
+                           const GpuTensor& W1, const GpuTensor* b1,
+                           const GpuTensor* t_emb_shift,
+                           const GpuTensor& gamma2, const GpuTensor& beta2,
+                           const GpuTensor& W2, const GpuTensor* b2,
+                           const GpuTensor* Wskip, const GpuTensor* bskip,
+                           int N, int C_in, int C_out, int H, int Wd,
+                           int num_groups, float eps,
+                           const GpuTensor& dY,
+                           GpuTensor& dX,
+                           GpuTensor& dGamma1, GpuTensor& dBeta1,
+                           GpuTensor& dW1, GpuTensor* db1,
+                           GpuTensor* dt_emb_shift,
+                           GpuTensor& dGamma2, GpuTensor& dBeta2,
+                           GpuTensor& dW2, GpuTensor* db2,
+                           GpuTensor* dWskip, GpuTensor* dbskip) {
+    if (X.dtype != Dtype::FP16 || dY.dtype != Dtype::FP16 ||
+        gamma1.dtype != Dtype::FP16 || beta1.dtype != Dtype::FP16 ||
+        W1.dtype != Dtype::FP16 ||
+        gamma2.dtype != Dtype::FP16 || beta2.dtype != Dtype::FP16 ||
+        W2.dtype != Dtype::FP16) {
+        throw std::runtime_error("resblock_backward_gpu: all required tensors must be FP16");
+    }
+    if (Wskip == nullptr && C_in != C_out) {
+        throw std::runtime_error("resblock_backward_gpu: Wskip required when C_in != C_out");
+    }
+    const int spatial = H * Wd;
+    if (dY.rows != N || dY.cols != C_out * spatial) {
+        throw std::runtime_error("resblock_backward_gpu: dY shape mismatch");
+    }
+    if (dX.rows != N || dX.cols != C_in * spatial || dX.dtype != Dtype::FP16) {
+        dX.resize(N, C_in * spatial, Dtype::FP16);
+    }
+    if (N == 0 || spatial == 0) return;
+
+    // Recompute forward intermediates via public ops.
+    GpuTensor h1_pre_silu, h1;
+    group_norm_forward_gpu(X, gamma1, beta1, N, C_in, H, Wd, num_groups, eps,
+                           h1_pre_silu);
+    silu_forward_gpu(h1_pre_silu, h1);
+
+    GpuTensor h2;
+    conv2d_forward_gpu(h1, W1, b1, N, C_in, H, Wd,
+                       C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2);
+    if (t_emb_shift) {
+        if (t_emb_shift->dtype != Dtype::FP16) {
+            throw std::runtime_error("resblock_backward_gpu: t_emb_shift must be FP16");
+        }
+        int has_N = 0;
+        if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
+            has_N = 1;
+        } else if ((t_emb_shift->rows == C_out && t_emb_shift->cols == 1) ||
+                   (t_emb_shift->rows == 1 && t_emb_shift->cols == C_out) ||
+                   t_emb_shift->size() == C_out) {
+            has_N = 0;
+        } else {
+            throw std::runtime_error("resblock_backward_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
+        }
+        launch_add_shift(h2, *t_emb_shift, N, C_out, spatial, has_N);
+    }
+
+    GpuTensor h3_pre_silu, h3;
+    group_norm_forward_gpu(h2, gamma2, beta2, N, C_out, H, Wd, num_groups, eps,
+                           h3_pre_silu);
+    silu_forward_gpu(h3_pre_silu, h3);
+
+    // Conv2 backward.
+    GpuTensor dh3(N, C_out * spatial, Dtype::FP16);
+    conv2d_backward_input_gpu(W2, dY, N, C_out, H, Wd,
+                              C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh3);
+    conv2d_backward_weight_gpu(h3, dY, N, C_out, H, Wd,
+                               C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW2);
+    if (db2) {
+        conv2d_backward_bias_gpu(dY, N, C_out, H, Wd, *db2);
+    }
+
+    // SiLU2 backward.
+    GpuTensor dh3_pre_silu;
+    silu_backward_gpu(h3_pre_silu, dh3, dh3_pre_silu);
+
+    // GN2 backward.
+    GpuTensor dh2;
+    group_norm_backward_gpu(h2, gamma2, dh3_pre_silu, N, C_out, H, Wd,
+                            num_groups, eps, dh2, dGamma2, dBeta2);
+
+    // t_emb_shift backward.
+    if (t_emb_shift && dt_emb_shift) {
+        if (dt_emb_shift->dtype != Dtype::FP16) {
+            throw std::runtime_error("resblock_backward_gpu: dt_emb_shift must be FP16");
+        }
+        const bool has_N = (t_emb_shift->rows == N && t_emb_shift->cols == C_out);
+        if (has_N) {
+            launch_sum_hw_per_NC(dh2, *dt_emb_shift, N, C_out, spatial);
+        } else {
+            conv2d_backward_bias_gpu(dh2, N, C_out, H, Wd, *dt_emb_shift);
+        }
+    }
+
+    // Conv1 backward.
+    GpuTensor dh1(N, C_in * spatial, Dtype::FP16);
+    conv2d_backward_input_gpu(W1, dh2, N, C_in, H, Wd,
+                              C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh1);
+    conv2d_backward_weight_gpu(h1, dh2, N, C_in, H, Wd,
+                               C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW1);
+    if (db1) {
+        conv2d_backward_bias_gpu(dh2, N, C_out, H, Wd, *db1);
+    }
+
+    // SiLU1 backward.
+    GpuTensor dh1_pre_silu;
+    silu_backward_gpu(h1_pre_silu, dh1, dh1_pre_silu);
+
+    // GN1 backward (writes dX).
+    group_norm_backward_gpu(X, gamma1, dh1_pre_silu, N, C_in, H, Wd,
+                            num_groups, eps, dX, dGamma1, dBeta1);
+
+    // Skip path backward, then sum into dX.
+    if (Wskip == nullptr) {
+        add_inplace_gpu(dX, dY);
+    } else {
+        if (Wskip->dtype != Dtype::FP16) {
+            throw std::runtime_error("resblock_backward_gpu: Wskip must be FP16");
+        }
+        GpuTensor dX_skip(N, C_in * spatial, Dtype::FP16);
+        conv2d_backward_input_gpu(*Wskip, dY, N, C_in, H, Wd,
+                                  C_out, 1, 1, 1, 1, 0, 0, 1, 1, dX_skip);
+        if (dWskip) {
+            conv2d_backward_weight_gpu(X, dY, N, C_in, H, Wd,
+                                       C_out, 1, 1, 1, 1, 0, 0, 1, 1, *dWskip);
+        }
+        if (dbskip) {
+            conv2d_backward_bias_gpu(dY, N, C_out, H, Wd, *dbskip);
+        }
+        add_inplace_gpu(dX, dX_skip);
+    }
 }
 
 } // namespace brotensor

@@ -236,6 +236,73 @@ static void test_concat_nchw_channels_fp16() {
     check_fp16(got, Ref, "concat_nchw_channels");
 }
 
+static void test_concat_nchw_channels_backward_fp16() {
+    // Inverse round-trip: build a concatenated tensor (forward), upload a
+    // random dY of matching shape, scatter via backward, verify each part
+    // equals the channel slice of dY.
+    std::printf("  concat_nchw_channels_backward fp16\n");
+    const int N = 2, H = 3, W = 2;
+    const int C1 = 1, C2 = 4, C3 = 2;
+    const int total_C = C1 + C2 + C3;
+    const int HW = H * W;
+    std::mt19937 rng(0xDEADBEEFu);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> dY_host(N * total_C * HW);
+    for (auto& v : dY_host) v = dist(rng);
+    auto dY_q = rq(dY_host);
+    auto dY_h = to_fp16(dY_host);
+    GpuTensor dY;
+    brotensor::upload_fp16(dY_h.data(), N, total_C * HW, dY);
+
+    GpuTensor dP1, dP2, dP3;
+    brotensor::concat_nchw_channels_backward_gpu(
+        dY, N, H, W, {C1, C2, C3}, {&dP1, &dP2, &dP3});
+    CHECK(dP1.rows == N && dP1.cols == C1 * HW && dP1.dtype == Dtype::FP16);
+    CHECK(dP2.rows == N && dP2.cols == C2 * HW && dP2.dtype == Dtype::FP16);
+    CHECK(dP3.rows == N && dP3.cols == C3 * HW && dP3.dtype == Dtype::FP16);
+
+    auto download = [&](const GpuTensor& g) {
+        std::vector<uint16_t> h(g.size());
+        brotensor::download_fp16(g, h.data());
+        return h;
+    };
+    auto got1 = download(dP1);
+    auto got2 = download(dP2);
+    auto got3 = download(dP3);
+    brotensor::cuda_sync();
+
+    auto build_ref = [&](int c_off, int Ci) {
+        std::vector<float> ref(N * Ci * HW);
+        for (int n = 0; n < N; ++n)
+            for (int c = 0; c < Ci; ++c)
+                for (int p = 0; p < HW; ++p)
+                    ref[n * Ci * HW + c * HW + p] =
+                        dY_q[n * total_C * HW + (c_off + c) * HW + p];
+        return ref;
+    };
+    check_fp16(got1, build_ref(0,        C1), "concat_bwd part1");
+    check_fp16(got2, build_ref(C1,       C2), "concat_bwd part2");
+    check_fp16(got3, build_ref(C1 + C2,  C3), "concat_bwd part3");
+
+    // Second shape: single big part (N=1, C=8, H=W=4).
+    {
+        const int N2 = 1, H2 = 4, W2 = 4, C = 8;
+        std::vector<float> dy(N2 * C * H2 * W2);
+        for (auto& v : dy) v = dist(rng);
+        auto dyh = to_fp16(dy);
+        GpuTensor DY;
+        brotensor::upload_fp16(dyh.data(), N2, C * H2 * W2, DY);
+        GpuTensor P;
+        brotensor::concat_nchw_channels_backward_gpu(
+            DY, N2, H2, W2, {C}, {&P});
+        CHECK(P.rows == N2 && P.cols == C * H2 * W2);
+        auto got = download(P);
+        brotensor::cuda_sync();
+        auto ref = rq(dy);
+        check_fp16(got, ref, "concat_bwd single");
+    }
+}
+
 static void test_split_and_copy_d2d_fp16() {
     std::printf("  split_rows / copy_d2d fp16\n");
     std::mt19937 rng(7);
@@ -511,6 +578,7 @@ int main() {
     test_elementwise_fp16();
     test_concat_fp16();
     test_concat_nchw_channels_fp16();
+    test_concat_nchw_channels_backward_fp16();
     test_split_and_copy_d2d_fp16();
     test_layernorm_fp16();
     test_linear_backward_batched_fp16();

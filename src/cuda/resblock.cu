@@ -231,4 +231,194 @@ void resblock_forward_gpu(const GpuTensor& X,
     }
 }
 
+namespace {
+
+// Accumulate per-(n, c) HW sum of an NCHW FP16 tensor into a (N, C_out) FP16
+// shift-gradient. Each block owns one (n, c); threads reduce HW elements.
+// FP32 accumulation; result is added (folded) into d_shift[n, c].
+__global__ void rb_sum_hw_per_NC_fp16(const __half* __restrict__ dh2,
+                                      __half* __restrict__ d_shift,
+                                      int N, int C, int spatial) {
+    const int nc = blockIdx.x;
+    if (nc >= N * C) return;
+    const int n = nc / C;
+    const int c = nc - n * C;
+    const __half* row = dh2 + (n * C + c) * spatial;
+
+    __shared__ float s_buf[RB_GN_BLOCK];
+    const int tid = threadIdx.x;
+    float acc = 0.0f;
+    for (int i = tid; i < spatial; i += blockDim.x) {
+        acc += __half2float(row[i]);
+    }
+    s_buf[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_buf[tid] += s_buf[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const float prev = __half2float(d_shift[nc]);
+        d_shift[nc] = __float2half(prev + s_buf[0]);
+    }
+}
+
+} // namespace
+
+void resblock_backward_gpu(const GpuTensor& X,
+                           const GpuTensor& gamma1, const GpuTensor& beta1,
+                           const GpuTensor& W1, const GpuTensor* b1,
+                           const GpuTensor* t_emb_shift,
+                           const GpuTensor& gamma2, const GpuTensor& beta2,
+                           const GpuTensor& W2, const GpuTensor* b2,
+                           const GpuTensor* Wskip, const GpuTensor* bskip,
+                           int N, int C_in, int C_out, int H, int Wd,
+                           int num_groups, float eps,
+                           const GpuTensor& dY,
+                           GpuTensor& dX,
+                           GpuTensor& dGamma1, GpuTensor& dBeta1,
+                           GpuTensor& dW1, GpuTensor* db1,
+                           GpuTensor* dt_emb_shift,
+                           GpuTensor& dGamma2, GpuTensor& dBeta2,
+                           GpuTensor& dW2, GpuTensor* db2,
+                           GpuTensor* dWskip, GpuTensor* dbskip) {
+    if (X.dtype != Dtype::FP16 || dY.dtype != Dtype::FP16 ||
+        gamma1.dtype != Dtype::FP16 || beta1.dtype != Dtype::FP16 ||
+        W1.dtype != Dtype::FP16 ||
+        gamma2.dtype != Dtype::FP16 || beta2.dtype != Dtype::FP16 ||
+        W2.dtype != Dtype::FP16) {
+        throw std::runtime_error("resblock_backward_gpu: all required tensors must be FP16");
+    }
+    if (Wskip == nullptr && C_in != C_out) {
+        throw std::runtime_error("resblock_backward_gpu: Wskip required when C_in != C_out");
+    }
+    const int spatial = H * Wd;
+    if (dY.rows != N || dY.cols != C_out * spatial) {
+        throw std::runtime_error("resblock_backward_gpu: dY shape mismatch");
+    }
+    if (dX.rows != N || dX.cols != C_in * spatial || dX.dtype != Dtype::FP16) {
+        dX.resize(N, C_in * spatial, Dtype::FP16);
+    }
+    if (N == 0 || spatial == 0) return;
+
+    // ── Recompute forward intermediates we need:
+    //   h1_pre_silu = GN1(X);  h1 = SiLU(h1_pre_silu)
+    //   h2_pre_t    = conv1(h1, W1, b1)
+    //   h2          = h2_pre_t + broadcast(t_emb_shift)   (if t_emb_shift)
+    //   h3_pre_silu = GN2(h2); h3 = SiLU(h3_pre_silu)
+    GpuTensor h1_pre_silu, h1;
+    group_norm_forward_gpu(X, gamma1, beta1, N, C_in, H, Wd, num_groups, eps,
+                           h1_pre_silu);
+    silu_forward_gpu(h1_pre_silu, h1);
+
+    GpuTensor h2;
+    conv2d_forward_gpu(h1, W1, b1, N, C_in, H, Wd,
+                       C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2);
+    if (t_emb_shift) {
+        if (t_emb_shift->dtype != Dtype::FP16) {
+            throw std::runtime_error("resblock_backward_gpu: t_emb_shift must be FP16");
+        }
+        int has_N = 0;
+        if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
+            has_N = 1;
+        } else if ((t_emb_shift->rows == C_out && t_emb_shift->cols == 1) ||
+                   (t_emb_shift->rows == 1 && t_emb_shift->cols == C_out) ||
+                   t_emb_shift->size() == C_out) {
+            has_N = 0;
+        } else {
+            throw std::runtime_error("resblock_backward_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
+        }
+        const int total = N * C_out * spatial;
+        add_NC_shift_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK>>>(
+            reinterpret_cast<__half*>(h2.data_fp16()),
+            reinterpret_cast<const __half*>(t_emb_shift->data_fp16()),
+            N, C_out, spatial, has_N);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+
+    GpuTensor h3_pre_silu, h3;
+    group_norm_forward_gpu(h2, gamma2, beta2, N, C_out, H, Wd, num_groups, eps,
+                           h3_pre_silu);
+    silu_forward_gpu(h3_pre_silu, h3);
+
+    // ── Conv2 backward: dh3 (input grad), dW2 += grad, db2 += grad.
+    GpuTensor dh3(N, C_out * spatial, Dtype::FP16);
+    conv2d_backward_input_gpu(W2, dY, N, C_out, H, Wd,
+                              C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh3);
+    conv2d_backward_weight_gpu(h3, dY, N, C_out, H, Wd,
+                               C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW2);
+    if (db2) {
+        conv2d_backward_bias_gpu(dY, N, C_out, H, Wd, *db2);
+    }
+
+    // ── SiLU2 backward over h3_pre_silu.
+    GpuTensor dh3_pre_silu;
+    silu_backward_gpu(h3_pre_silu, dh3, dh3_pre_silu);
+
+    // ── GN2 backward: writes dh2 (overwritten), accumulates dGamma2, dBeta2.
+    GpuTensor dh2;
+    group_norm_backward_gpu(h2, gamma2, dh3_pre_silu, N, C_out, H, Wd,
+                            num_groups, eps, dh2, dGamma2, dBeta2);
+
+    // ── t_emb_shift backward: channel-axis reduction of dh2.
+    if (t_emb_shift && dt_emb_shift) {
+        if (dt_emb_shift->dtype != Dtype::FP16) {
+            throw std::runtime_error("resblock_backward_gpu: dt_emb_shift must be FP16");
+        }
+        const bool has_N = (t_emb_shift->rows == N && t_emb_shift->cols == C_out);
+        if (has_N) {
+            // (N, C_out) — sum over HW per (n, c), accumulate into dt_emb_shift.
+            const int blocks = N * C_out;
+            rb_sum_hw_per_NC_fp16<<<blocks, RB_GN_BLOCK>>>(
+                reinterpret_cast<const __half*>(dh2.data_fp16()),
+                reinterpret_cast<__half*>(dt_emb_shift->data_fp16()),
+                N, C_out, spatial);
+            BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        } else {
+            // (C_out,) — sum over (N, H, W) per channel. Reuse conv bias bwd.
+            conv2d_backward_bias_gpu(dh2, N, C_out, H, Wd, *dt_emb_shift);
+        }
+    }
+
+    // ── Conv1 backward: dh1, dW1 +=, db1 +=.
+    GpuTensor dh1(N, C_in * spatial, Dtype::FP16);
+    conv2d_backward_input_gpu(W1, dh2, N, C_in, H, Wd,
+                              C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh1);
+    conv2d_backward_weight_gpu(h1, dh2, N, C_in, H, Wd,
+                               C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW1);
+    if (db1) {
+        conv2d_backward_bias_gpu(dh2, N, C_out, H, Wd, *db1);
+    }
+
+    // ── SiLU1 backward over h1_pre_silu.
+    GpuTensor dh1_pre_silu;
+    silu_backward_gpu(h1_pre_silu, dh1, dh1_pre_silu);
+
+    // ── GN1 backward: writes dX (overwritten = dX_from_main_path),
+    //                  accumulates dGamma1, dBeta1.
+    group_norm_backward_gpu(X, gamma1, dh1_pre_silu, N, C_in, H, Wd,
+                            num_groups, eps, dX, dGamma1, dBeta1);
+
+    // ── Skip path backward, then sum into dX.
+    if (Wskip == nullptr) {
+        // identity: dX += dY (shapes already match since C_in == C_out).
+        add_inplace_gpu(dX, dY);
+    } else {
+        if (Wskip->dtype != Dtype::FP16) {
+            throw std::runtime_error("resblock_backward_gpu: Wskip must be FP16");
+        }
+        GpuTensor dX_skip(N, C_in * spatial, Dtype::FP16);
+        conv2d_backward_input_gpu(*Wskip, dY, N, C_in, H, Wd,
+                                  C_out, 1, 1, 1, 1, 0, 0, 1, 1, dX_skip);
+        if (dWskip) {
+            conv2d_backward_weight_gpu(X, dY, N, C_in, H, Wd,
+                                       C_out, 1, 1, 1, 1, 0, 0, 1, 1, *dWskip);
+        }
+        if (dbskip) {
+            conv2d_backward_bias_gpu(dY, N, C_out, H, Wd, *dbskip);
+        }
+        add_inplace_gpu(dX, dX_skip);
+    }
+}
+
 } // namespace brotensor
