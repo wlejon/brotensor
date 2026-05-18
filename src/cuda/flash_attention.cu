@@ -401,6 +401,77 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+// Project (ctx → K, ctx → V) using the same linear_forward_batched_fp16_gpu
+// call as flash_attention_qkvo_forward_gpu, producing (Lk, D) FP16 buffers
+// in the exact layout flash_attention_forward_gpu consumes.
+void flash_attention_project_kv_gpu(const GpuTensor& ctx,
+                                    const GpuTensor& Wk, const GpuTensor* bk,
+                                    const GpuTensor& Wv, const GpuTensor* bv,
+                                    GpuTensor& K_out,
+                                    GpuTensor& V_out) {
+    if (ctx.dtype != Dtype::FP16 || Wk.dtype != Dtype::FP16 ||
+        Wv.dtype != Dtype::FP16) {
+        throw std::runtime_error("flash_attention_project_kv_gpu: all tensors must be FP16");
+    }
+    const int Lk = ctx.rows;
+    const int D_ctx = ctx.cols;
+    const int D = Wk.rows;
+    if (Wk.cols != D_ctx || Wv.rows != D || Wv.cols != D_ctx) {
+        throw std::runtime_error("flash_attention_project_kv_gpu: Wk/Wv shape mismatch");
+    }
+    if (K_out.rows != Lk || K_out.cols != D || K_out.dtype != Dtype::FP16) {
+        K_out.resize(Lk, D, Dtype::FP16);
+    }
+    if (V_out.rows != Lk || V_out.cols != D || V_out.dtype != Dtype::FP16) {
+        V_out.resize(Lk, D, Dtype::FP16);
+    }
+    if (Lk == 0 || D == 0) return;
+    linear_forward_batched_fp16_gpu(Wk, bk, ctx, K_out);
+    linear_forward_batched_fp16_gpu(Wv, bv, ctx, V_out);
+}
+
+// Core attention with caller-supplied K/V (pre-projected). Projects X → Q
+// with Wq/bq, runs the tiled attention core, then applies Wo/bo. This is
+// the same composition flash_attention_qkvo_forward_gpu uses on its cached
+// path; both entry points delegate here so numerics are bitwise-identical.
+void flash_attention_q_with_kv_cached_forward_gpu(const GpuTensor& X,
+                                                  const GpuTensor& K,
+                                                  const GpuTensor& V,
+                                                  const GpuTensor& Wq, const GpuTensor* bq,
+                                                  const GpuTensor& Wo, const GpuTensor* bo,
+                                                  const float* d_mask,
+                                                  int num_heads,
+                                                  bool causal,
+                                                  GpuTensor& O) {
+    if (X.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 || V.dtype != Dtype::FP16 ||
+        Wq.dtype != Dtype::FP16 || Wo.dtype != Dtype::FP16) {
+        throw std::runtime_error("flash_attention_q_with_kv_cached_forward_gpu: all tensors must be FP16");
+    }
+    const int Lq = X.rows;
+    const int D  = X.cols;
+    const int Lk = K.rows;
+    if (K.cols != D || V.rows != Lk || V.cols != D) {
+        throw std::runtime_error("flash_attention_q_with_kv_cached_forward_gpu: K/V shape mismatch");
+    }
+    if (Wq.rows != D || Wq.cols != D || Wo.rows != D || Wo.cols != D) {
+        throw std::runtime_error("flash_attention_q_with_kv_cached_forward_gpu: Wq/Wo shape mismatch");
+    }
+    if (num_heads <= 0 || D % num_heads != 0) {
+        throw std::runtime_error("flash_attention_q_with_kv_cached_forward_gpu: num_heads must divide D");
+    }
+    if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
+        O.resize(Lq, D, Dtype::FP16);
+    }
+    if (Lq == 0 || Lk == 0 || D == 0) return;
+
+    GpuTensor Qp(Lq, D, Dtype::FP16);
+    GpuTensor Op(Lq, D, Dtype::FP16);
+
+    linear_forward_batched_fp16_gpu(Wq, bq, X, Qp);
+    flash_attention_forward_gpu(Qp, K, V, d_mask, num_heads, causal, Op);
+    linear_forward_batched_fp16_gpu(Wo, bo, Op, O);
+}
+
 // Variant that fuses Q/K/V/O projections at the boundary. Delegates each
 // projection to linear_forward_batched_fp16_gpu so optional biases are
 // folded in. Ctx==nullptr means self-attention (Ctx = X).
@@ -442,18 +513,15 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
     }
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
-    GpuTensor Qp(Lq, D, Dtype::FP16);
+    // Compose via the two new helpers — keeps the order of CUDA ops identical
+    // to the pre-refactor code (linear_Wk, linear_Wv, linear_Wq, attention,
+    // linear_Wo would actually be reordered; we mirror that by inlining Q+attn
+    // into the cached helper and projecting K/V here first).
     GpuTensor Kp(Lk, D, Dtype::FP16);
     GpuTensor Vp(Lk, D, Dtype::FP16);
-    GpuTensor Op(Lq, D, Dtype::FP16);
-
-    linear_forward_batched_fp16_gpu(Wq, bq, X,      Qp);
-    linear_forward_batched_fp16_gpu(Wk, bk, kv_src, Kp);
-    linear_forward_batched_fp16_gpu(Wv, bv, kv_src, Vp);
-
-    flash_attention_forward_gpu(Qp, Kp, Vp, d_mask, num_heads, causal, Op);
-
-    linear_forward_batched_fp16_gpu(Wo, bo, Op, O);
+    flash_attention_project_kv_gpu(kv_src, Wk, bk, Wv, bv, Kp, Vp);
+    flash_attention_q_with_kv_cached_forward_gpu(
+        X, Kp, Vp, Wq, bq, Wo, bo, d_mask, num_heads, causal, O);
 }
 
 } // namespace brotensor

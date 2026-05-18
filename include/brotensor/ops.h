@@ -1029,6 +1029,55 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
                                       bool causal,
                                       GpuTensor& O);
 
+// Project a key/value context tensor through Wk/Wv (with optional biases),
+// producing the exact (Lk, D) FP16 buffers that flash_attention_forward_gpu
+// consumes. Used to pre-compute cross-attention K/V once per generate() in
+// diffusion U-Nets — the text context is fixed across all denoising steps so
+// these projections are otherwise pure waste.
+//
+// Numerically identical to the K/V projection stage inside
+// flash_attention_qkvo_forward_gpu (same linear_forward_batched_fp16_gpu call).
+//
+//   ctx:    (Lk, D_ctx)  FP16
+//   Wk:     (D, D_ctx)   FP16 — projects ctx → K
+//   bk:     (D, 1)       FP16, optional (nullptr to skip)
+//   Wv:     (D, D_ctx)   FP16 — projects ctx → V
+//   bv:     (D, 1)       FP16, optional
+//   K_out:  (Lk, D)      FP16; resized as needed
+//   V_out:  (Lk, D)      FP16; resized as needed
+void flash_attention_project_kv_gpu(const GpuTensor& ctx,
+                                    const GpuTensor& Wk, const GpuTensor* bk,
+                                    const GpuTensor& Wv, const GpuTensor* bv,
+                                    GpuTensor& K_out,
+                                    GpuTensor& V_out);
+
+// Like flash_attention_qkvo_forward_gpu but K and V are already projected by
+// the caller (typically via flash_attention_project_kv_gpu). Projects X → Q
+// with Wq/bq, runs the tiled attention core against the supplied K/V, then
+// applies Wo/bo. Equivalent (bitwise) to the cached path of
+// flash_attention_qkvo_forward_gpu.
+//
+//   X:      (Lq, D)     FP16, query source
+//   K:      (Lk, D)     FP16, pre-projected keys (layout = flash_attention_forward_gpu's K arg)
+//   V:      (Lk, D)     FP16, pre-projected values
+//   Wq:     (D, D)      FP16
+//   bq:     optional FP16 (D, 1)
+//   Wo:     (D, D)      FP16
+//   bo:     optional FP16 (D, 1)
+//   d_mask: optional length-Lk FP32 mask
+//   num_heads: must divide D
+//   causal: see flash_attention_forward_gpu (false for diffusion cross-attn)
+//   O:      (Lq, D)     FP16; resized as needed
+void flash_attention_q_with_kv_cached_forward_gpu(const GpuTensor& X,
+                                                  const GpuTensor& K,
+                                                  const GpuTensor& V,
+                                                  const GpuTensor& Wq, const GpuTensor* bq,
+                                                  const GpuTensor& Wo, const GpuTensor* bo,
+                                                  const float* d_mask,
+                                                  int num_heads,
+                                                  bool causal,
+                                                  GpuTensor& O);
+
 // NCHW ↔ sequence layout transpose. Lets ops that expect a (L, D) token
 // layout (flash_attention_*, self/cross attention wrappers) consume tensors
 // produced by NCHW primitives (conv2d, group_norm, resblock). Per-element
