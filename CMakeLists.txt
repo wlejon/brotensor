@@ -95,9 +95,11 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/resample.cu
         src/cuda/cross_attention.cu
         src/cuda/flash_attention.cu
+        src/cuda/flash_attention_backward.cu
         src/cuda/resblock.cu
         src/cuda/transpose.cu
         src/cuda/matmul.cu
+        src/cuda/matmul_backward.cu
         src/cuda/rope.cu
         src/cuda/rms_norm.cu
         src/cuda/swiglu.cu
@@ -141,9 +143,11 @@ if(BROTENSOR_WITH_METAL)
         src/metal/resample.mm
         src/metal/cross_attention.mm
         src/metal/flash_attention.mm
+        src/metal/flash_attention_backward.mm
         src/metal/resblock.mm
         src/metal/transpose.mm
         src/metal/matmul.mm
+        src/metal/matmul_backward.mm
         src/metal/rope.mm
         src/metal/rms_norm.mm
         src/metal/swiglu.mm
@@ -177,9 +181,11 @@ if(BROTENSOR_WITH_METAL)
         src/metal/resample.mm
         src/metal/cross_attention.mm
         src/metal/flash_attention.mm
+        src/metal/flash_attention_backward.mm
         src/metal/resblock.mm
         src/metal/transpose.mm
         src/metal/matmul.mm
+        src/metal/matmul_backward.mm
         src/metal/rope.mm
         src/metal/rms_norm.mm
         src/metal/swiglu.mm

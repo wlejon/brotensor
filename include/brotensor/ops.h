@@ -1178,6 +1178,52 @@ void flash_attention_qkvo_backward_gpu(
     GpuTensor& dWv, GpuTensor* dbv,
     GpuTensor& dWo, GpuTensor* dbo);
 
+// Backward of flash_attention_forward_gpu — bare attention core, no
+// projection weights. Recompute-based: reproduces the per-head softmax to
+// obtain P, then runs the standard FlashAttention-2 backward to produce
+// dQ / dK / dV. The "bare" variant is what LoRA-style adapters need —
+// projections are wrapped externally (typically via matmul_gpu /
+// matmul_backward_gpu) so adapter parameters can be folded in without
+// disturbing the attention core.
+//
+// All tensors FP16. Numerics: FP32 accumulation throughout the per-head
+// sweep (recompute matmuls, softmax, D_q reduction, dS, dQ/dK/dV).
+//
+//   Q:        (Lq, D)         FP16  — pre-projected queries (forward input).
+//   K:        (Lk, D)         FP16  — pre-projected keys.
+//   V:        (Lk, D)         FP16  — pre-projected values.
+//   O:        (Lq, D)         FP16  — forward output. Currently unused by the
+//                                     recompute path but retained in the API
+//                                     for symmetry with standard flash-attn
+//                                     bwd signatures (and to allow a future
+//                                     cache-based shortcut).
+//   dO:       (Lq, D)         FP16  — upstream gradient of O.
+//   d_mask:   optional length-Lk FP32 mask (nullptr for unmasked). Same
+//             semantics as flash_attention_forward_gpu's d_mask: positions
+//             with mask[k] <= 0.5 are dropped (probability 0); they
+//             contribute nothing to dV / dK and the corresponding rows of
+//             dQ degrade naturally.
+//   num_heads: must divide D.
+//   causal:   match the forward's causal flag. Causal masking: position
+//             k > q contributes nothing to the softmax — dV[k] / dK[k] /
+//             dQ[q] receive no contribution from those (q, k) pairs.
+//             Requires Lq == Lk when true.
+//   dQ:       (Lq, D)         FP16, *overwritten* (resized + dtype-set if
+//                                    mis-shaped).
+//   dK:       (Lk, D)         FP16, *overwritten*.
+//   dV:       (Lk, D)         FP16, *overwritten*.
+void flash_attention_backward_gpu(const GpuTensor& Q,
+                                  const GpuTensor& K,
+                                  const GpuTensor& V,
+                                  const GpuTensor& O,
+                                  const GpuTensor& dO,
+                                  const float* d_mask,
+                                  int num_heads,
+                                  bool causal,
+                                  GpuTensor& dQ,
+                                  GpuTensor& dK,
+                                  GpuTensor& dV);
+
 // Project a key/value context tensor through Wk/Wv (with optional biases),
 // producing the exact (Lk, D) FP16 buffers that flash_attention_forward_gpu
 // consumes. Used to pre-compute cross-attention K/V once per generate() in
@@ -1356,6 +1402,30 @@ void resblock_backward_gpu(const GpuTensor& X,
 // dtype-set to match A if mis-shaped/-typed). Internal accumulation is in
 // FP32 for both FP32 and FP16 paths.
 void matmul_gpu(const GpuTensor& A, const GpuTensor& B, GpuTensor& C);
+
+// Backward of matmul_gpu. Row-major, no bias.
+//   forward: C(M, N) = A(M, K) @ B(K, N)
+//   dA(M, K) += dC(M, N) @ B^T(N, K)
+//   dB(K, N) += A^T(K, M) @ dC(M, N)
+//
+// Dtype-dispatched FP32 + FP16. All five tensors must share the same dtype.
+// FP16 dA/dB accumulators use FP32 scratch + fold (atomic-add into FP16 is
+// unsafe across blocks). Caller-zeros-and-passes-presized, op-accumulates-into
+// convention (mirrors linear_backward_gpu): dA must be (M, K) and dB must be
+// (K, N), both pre-allocated and pre-zeroed by the caller; this op adds its
+// contribution to whatever's already there. dC is read-only and must be
+// (M, N).
+//
+//   A:   (M, K)   forward input
+//   B:   (K, N)   forward weight
+//   dC:  (M, N)   upstream gradient
+//   dA:  (M, K)   *accumulated into*
+//   dB:  (K, N)   *accumulated into*
+void matmul_backward_gpu(const GpuTensor& A,
+                         const GpuTensor& B,
+                         const GpuTensor& dC,
+                         GpuTensor& dA,
+                         GpuTensor& dB);
 
 // RoPE (rotary position embedding) forward. Applied per head:
 //   x_{2i}   ← x_{2i} * cos(θ) - x_{2i+1} * sin(θ)
