@@ -1642,4 +1642,66 @@ void conv2d_int8w_fp16_forward_gpu(const GpuTensor& X,
                                    int dil_h, int dil_w, int groups,
                                    GpuTensor& Y);
 
+// W8A16 batched linear: Y(B, out) = X(B, in) @ dequant(W_int8(out, in))^T + b.
+// Mirrors linear_forward_batched_fp16_gpu's shape contract — the (B, in) →
+// (B, out) layout used by the fused flash-attention projection wrappers and
+// any transformer FFN. Per-output-row symmetric scales; FP16 activations
+// and bias. FP32 accumulation inside the kernel.
+//
+//   W_int8: (out, in)  Dtype::INT8
+//   scales: (out, 1)   FP32 — per-output-row dequant scales
+//   bias:   FP16 (out, 1) or (1, out), optional (nullptr to skip)
+//   X_BD:   (B, in)    FP16
+//   Y_BD:   (B, out)   FP16 — resized as needed
+void linear_forward_batched_int8w_fp16_gpu(const GpuTensor& W_int8,
+                                           const GpuTensor& scales,
+                                           const GpuTensor* bias,
+                                           const GpuTensor& X_BD,
+                                           GpuTensor& Y_BD);
+
+// ─── W8A16 variants of the three fused flash-attention ops ─────────────────
+//
+// Same composition as flash_attention_project_kv_gpu /
+// flash_attention_q_with_kv_cached_forward_gpu / flash_attention_qkvo_forward_gpu,
+// but every linear projection consumes an INT8 weight + per-output-row FP32
+// scale tensor instead of an FP16 weight. The attention core itself stays
+// FP16 — activations are never quantised. Each W*_int8 has shape (D, in_dim)
+// with its own scales tensor of shape (D, 1); biases remain FP16 (D, 1) and
+// optional. Semantics, masks, causal flag, and num_heads are identical to the
+// FP16 versions.
+void flash_attention_project_kv_int8w_fp16_gpu(const GpuTensor& ctx,
+                                               const GpuTensor& Wk_int8,
+                                               const GpuTensor& sk,
+                                               const GpuTensor* bk,
+                                               const GpuTensor& Wv_int8,
+                                               const GpuTensor& sv,
+                                               const GpuTensor* bv,
+                                               GpuTensor& K_out,
+                                               GpuTensor& V_out);
+
+void flash_attention_q_with_kv_cached_int8w_fp16_gpu(const GpuTensor& X,
+                                                     const GpuTensor& K,
+                                                     const GpuTensor& V,
+                                                     const GpuTensor& Wq_int8,
+                                                     const GpuTensor& sq,
+                                                     const GpuTensor* bq,
+                                                     const GpuTensor& Wo_int8,
+                                                     const GpuTensor& so,
+                                                     const GpuTensor* bo,
+                                                     const float* d_mask,
+                                                     int num_heads,
+                                                     bool causal,
+                                                     GpuTensor& O);
+
+void flash_attention_qkvo_int8w_fp16_gpu(const GpuTensor& X,
+                                         const GpuTensor* Ctx,
+                                         const GpuTensor& Wq_int8, const GpuTensor& sq, const GpuTensor* bq,
+                                         const GpuTensor& Wk_int8, const GpuTensor& sk, const GpuTensor* bk,
+                                         const GpuTensor& Wv_int8, const GpuTensor& sv, const GpuTensor* bv,
+                                         const GpuTensor& Wo_int8, const GpuTensor& so, const GpuTensor* bo,
+                                         const float* d_mask,
+                                         int num_heads,
+                                         bool causal,
+                                         GpuTensor& O);
+
 } // namespace brotensor

@@ -113,6 +113,58 @@ kernel void k_matmul_int8w_fp16(device const char*  W      [[buffer(0)]],
     }
 }
 
+// Y(B, out) = X_fp16(B, K) @ (W_int8(out, K) * scale[out])^T + bias[out].
+// (B,in) → (B,out) layout — mirrors linear_forward_batched_fp16_gpu.
+kernel void k_linear_batched_int8w_fp16(device const half*  X      [[buffer(0)]],
+                                        device const char*  W      [[buffer(1)]],
+                                        device const float* scales [[buffer(2)]],
+                                        device const half*  bias   [[buffer(3)]],
+                                        device half*        Y      [[buffer(4)]],
+                                        constant uint& B           [[buffer(5)]],
+                                        constant uint& M           [[buffer(6)]],
+                                        constant uint& K           [[buffer(7)]],
+                                        constant uint& has_bias    [[buffer(8)]],
+                                        threadgroup float* smem    [[threadgroup(0)]],
+                                        uint2 tg [[threadgroup_position_in_grid]],
+                                        uint2 li [[thread_position_in_threadgroup]]) {
+    threadgroup float* Xs = smem;                       // MM_TILE * MM_TILE
+    threadgroup float* Ws = smem + MM_TILE * MM_TILE;   // MM_TILE * MM_TILE
+
+    uint b = tg.y * MM_TILE + li.y;
+    uint m = tg.x * MM_TILE + li.x;
+    float m_scale = (m < M) ? scales[m] : 0.0f;
+
+    float acc = 0.0f;
+    uint n_tiles = (K + MM_TILE - 1u) / MM_TILE;
+    for (uint t = 0; t < n_tiles; ++t) {
+        uint x_k = t * MM_TILE + li.x;
+        uint w_k = t * MM_TILE + li.y;
+
+        float x_val = 0.0f;
+        if (b < B && x_k < K) {
+            x_val = float(X[b * K + x_k]);
+        }
+        Xs[li.y * MM_TILE + li.x] = x_val;
+
+        float w_val = 0.0f;
+        if (m < M && w_k < K) {
+            int8_t wi = ((device const int8_t*)W)[m * K + w_k];
+            w_val = float(wi) * m_scale;
+        }
+        Ws[li.y * MM_TILE + li.x] = w_val;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < MM_TILE; ++k) {
+            acc += Xs[li.y * MM_TILE + k] * Ws[k * MM_TILE + li.x];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (b < B && m < M) {
+        if (has_bias != 0u) acc += float(bias[m]);
+        Y[b * M + m] = half(acc);
+    }
+}
+
 struct ConvI8Params {
     uint N, C_in, H, W;
     uint C_out, kH, kW;
@@ -189,6 +241,13 @@ id<MTLComputePipelineState> pso_conv() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_conv2d_int8w_fp16_forward"); });
+    return pso;
+}
+
+id<MTLComputePipelineState> pso_linear_batched() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_linear_batched_int8w_fp16"); });
     return pso;
 }
 
@@ -362,6 +421,80 @@ void conv2d_int8w_fp16_forward_gpu(const GpuTensor& X,
         if (tg > 256) tg = 256;
         [enc dispatchThreads:MTLSizeMake(total, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+}
+
+void linear_forward_batched_int8w_fp16_gpu(const GpuTensor& W_int8,
+                                           const GpuTensor& scales,
+                                           const GpuTensor* bias,
+                                           const GpuTensor& X_BD,
+                                           GpuTensor& Y_BD) {
+    if (W_int8.dtype != Dtype::INT8) {
+        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: W must be INT8");
+    }
+    if (scales.dtype != Dtype::FP32) {
+        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: scales must be FP32");
+    }
+    if (X_BD.dtype != Dtype::FP16) {
+        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: X must be FP16");
+    }
+    if (bias && bias->dtype != Dtype::FP16) {
+        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: bias must be FP16");
+    }
+    const int B   = X_BD.rows;
+    const int in_dim  = X_BD.cols;
+    const int out_dim = W_int8.rows;
+    if (W_int8.cols != in_dim) {
+        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: shape mismatch (W.cols != X.cols)");
+    }
+    if (scales.rows != out_dim || scales.cols != 1) {
+        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: scales shape must be (out, 1)");
+    }
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
+        Y_BD.resize(B, out_dim, Dtype::FP16);
+    }
+    if (B == 0 || out_dim == 0) return;
+    if (in_dim == 0) { Y_BD.zero(); return; }
+
+    id<MTLComputePipelineState> pso = pso_linear_batched();
+    id<MTLBuffer> bx = buffer_for(X_BD);
+    id<MTLBuffer> bw = buffer_for(W_int8);
+    id<MTLBuffer> bs = buffer_for(scales);
+    id<MTLBuffer> by = buffer_for(Y_BD);
+    id<MTLBuffer> bb = (bias && bias->size() > 0) ? buffer_for(*bias) : bx;
+    const NSUInteger ox = buffer_offset_for(X_BD);
+    const NSUInteger ow_ = buffer_offset_for(W_int8);
+    const NSUInteger os = buffer_offset_for(scales);
+    const NSUInteger oy = buffer_offset_for(Y_BD);
+    const NSUInteger ob = (bias && bias->size() > 0) ? buffer_offset_for(*bias) : 0;
+
+    const uint32_t uB = static_cast<uint32_t>(B);
+    const uint32_t uM = static_cast<uint32_t>(out_dim);
+    const uint32_t uK = static_cast<uint32_t>(in_dim);
+    const uint32_t uHas = (bias && bias->size() > 0) ? 1u : 0u;
+
+    const NSUInteger shmem = 2 * MM_TILE * MM_TILE * sizeof(float);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bx offset:ox atIndex:0];
+        [enc setBuffer:bw offset:ow_ atIndex:1];
+        [enc setBuffer:bs offset:os atIndex:2];
+        [enc setBuffer:bb offset:ob atIndex:3];
+        [enc setBuffer:by offset:oy atIndex:4];
+        [enc setBytes:&uB   length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&uM   length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&uK   length:sizeof(uint32_t) atIndex:7];
+        [enc setBytes:&uHas length:sizeof(uint32_t) atIndex:8];
+        [enc setThreadgroupMemoryLength:shmem atIndex:0];
+        NSUInteger grid_x = (static_cast<NSUInteger>(out_dim) + MM_TILE - 1) / MM_TILE;
+        NSUInteger grid_y = (static_cast<NSUInteger>(B)       + MM_TILE - 1) / MM_TILE;
+        [enc dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
+            threadsPerThreadgroup:MTLSizeMake(MM_TILE, MM_TILE, 1)];
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
