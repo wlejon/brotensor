@@ -1391,6 +1391,43 @@ void resblock_forward_gpu(const GpuTensor& X,
                           int num_groups, float eps,
                           GpuTensor& Y);
 
+// W8A16 variant of resblock_forward_gpu (inference-only). Identical math to
+// the FP16 op, but conv1, conv2, and the optional 1x1 skip conv consume INT8
+// weights with per-output-row symmetric FP32 scales (matching the W8A16
+// contract used by conv2d_int8w_fp16_forward_gpu). Activations, GN params,
+// biases, and the t_emb shift stay FP16. No backward — quantised weights are
+// frozen at inference time.
+//
+//   X:           (N, C_in  * H * W)   FP16 input activation
+//   gamma1, beta1: (C_in,  1)         FP16
+//   W1_int8:     (C_out, C_in  * 9)   INT8 OIHW, kH=kW=3
+//   s1:          (C_out, 1)           FP32 — per-output-row dequant scales for W1
+//   b1:          (C_out, 1) or null   FP16
+//   t_emb_shift: (N, C_out) or (C_out, 1) or null  FP16
+//   gamma2, beta2: (C_out, 1)         FP16
+//   W2_int8:     (C_out, C_out * 9)   INT8 OIHW, kH=kW=3
+//   s2:          (C_out, 1)           FP32 — per-output-row dequant scales for W2
+//   b2:          (C_out, 1) or null   FP16
+//   Wskip_int8:  (C_out, C_in * 1)    INT8 OIHW 1x1, or null when C_in == C_out
+//   sskip:       (C_out, 1)           FP32 — required iff Wskip_int8 != null
+//   bskip:       (C_out, 1) or null   FP16
+//   Y:           (N, C_out * H * W)   FP16 output, resized as needed.
+//
+// num_groups must divide both C_in and C_out (typically 32). eps default 1e-5.
+void resblock_forward_int8w_fp16_gpu(const GpuTensor& X,
+                                     const GpuTensor& gamma1, const GpuTensor& beta1,
+                                     const GpuTensor& W1_int8, const GpuTensor& s1,
+                                     const GpuTensor* b1,
+                                     const GpuTensor* t_emb_shift,
+                                     const GpuTensor& gamma2, const GpuTensor& beta2,
+                                     const GpuTensor& W2_int8, const GpuTensor& s2,
+                                     const GpuTensor* b2,
+                                     const GpuTensor* Wskip_int8, const GpuTensor* sskip,
+                                     const GpuTensor* bskip,
+                                     int N, int C_in, int C_out, int H, int W,
+                                     int num_groups, float eps,
+                                     GpuTensor& Y);
+
 // Composite backward of resblock_forward_gpu. All tensors FP16. Implemented
 // purely by composition of the existing public ops (group_norm forward+
 // backward, silu forward+backward, conv2d forward+backward_input/weight/bias,
