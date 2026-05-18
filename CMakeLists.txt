@@ -115,6 +115,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/kernels.mm
         src/metal/gemm.mm
         src/metal/elementwise.mm
+        src/metal/fp16_matmul.mm
         src/metal/softmax.mm
         src/metal/layernorm.mm
         src/metal/attention.mm
@@ -127,6 +128,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/concat.mm
         src/metal/batched_ops.mm
         src/metal/conv2d.mm
+        src/metal/conv2d_wmma.mm
         src/metal/group_norm.mm
         src/metal/resample.mm
         src/metal/cross_attention.mm
@@ -141,6 +143,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/kernels.mm
         src/metal/gemm.mm
         src/metal/elementwise.mm
+        src/metal/fp16_matmul.mm
         src/metal/softmax.mm
         src/metal/layernorm.mm
         src/metal/attention.mm
@@ -153,6 +156,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/concat.mm
         src/metal/batched_ops.mm
         src/metal/conv2d.mm
+        src/metal/conv2d_wmma.mm
         src/metal/group_norm.mm
         src/metal/resample.mm
         src/metal/cross_attention.mm

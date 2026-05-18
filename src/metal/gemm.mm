@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #import "internal.h"
+#import "fp16_matmul.h"
 
 namespace brotensor {
 
@@ -185,25 +186,6 @@ NSString* const kFp16LinearSrc = @R"msl(
 #include <metal_stdlib>
 using namespace metal;
 
-// Y(B, out) = X(B, in) @ W(out, in)^T  →  Y[m, n] = Σ_k X[m, k] * W[n, k].
-kernel void k_matmul_abt_fp16(device const half* A [[buffer(0)]],
-                              device const half* B [[buffer(1)]],
-                              device half*       C [[buffer(2)]],
-                              constant uint& M     [[buffer(3)]],
-                              constant uint& N     [[buffer(4)]],
-                              constant uint& K     [[buffer(5)]],
-                              uint idx [[thread_position_in_grid]]) {
-    uint total = M * N;
-    if (idx >= total) return;
-    uint m = idx / N;
-    uint n = idx % N;
-    float acc = 0.0f;
-    for (uint k = 0; k < K; ++k) {
-        acc += float(A[m * K + k]) * float(B[n * K + k]);
-    }
-    C[idx] = half(acc);
-}
-
 kernel void k_fp16_bias_add(device half*       Y    [[buffer(0)]],
                             device const half* bias [[buffer(1)]],
                             constant uint& B        [[buffer(2)]],
@@ -216,12 +198,6 @@ kernel void k_fp16_bias_add(device half*       Y    [[buffer(0)]],
 }
 )msl";
 
-id<MTLComputePipelineState> pso_matmul_abt_lin() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kFp16LinearSrc, @"k_matmul_abt_fp16"); });
-    return pso;
-}
 id<MTLComputePipelineState> pso_bias_add() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -269,25 +245,10 @@ void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
     if (B == 0 || out_dim == 0) return;
 
     const uint32_t total = static_cast<uint32_t>(B) * static_cast<uint32_t>(out_dim);
-    {
-        id<MTLBuffer> bA = buffer_for(X_BD);
-        id<MTLBuffer> bB = buffer_for(W);
-        id<MTLBuffer> bC = buffer_for(Y_BD);
-        const NSUInteger oA = buffer_offset_for(X_BD);
-        const NSUInteger oB = buffer_offset_for(W);
-        const NSUInteger oC = buffer_offset_for(Y_BD);
-        const uint32_t Mu = static_cast<uint32_t>(B);
-        const uint32_t Nu = static_cast<uint32_t>(out_dim);
-        const uint32_t Ku = static_cast<uint32_t>(in_dim);
-        launch_1d(pso_matmul_abt_lin(), total, ^(id<MTLComputeCommandEncoder> enc) {
-            [enc setBuffer:bA offset:oA atIndex:0];
-            [enc setBuffer:bB offset:oB atIndex:1];
-            [enc setBuffer:bC offset:oC atIndex:2];
-            [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
-        });
-    }
+    metal_impl::launch_matmul_abt_fp16(buffer_for(X_BD), buffer_offset_for(X_BD),
+                                       buffer_for(W),    buffer_offset_for(W),
+                                       buffer_for(Y_BD), buffer_offset_for(Y_BD),
+                                       B, out_dim, in_dim);
 
     if (bias && bias->size() > 0) {
         id<MTLBuffer> bY = buffer_for(Y_BD);

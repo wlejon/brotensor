@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #import "internal.h"
+#import "conv2d_wmma.h"
 
 namespace brotensor {
 
@@ -566,8 +567,6 @@ void conv2d_forward_gpu(const GpuTensor& X,
     p.Cg_in = static_cast<uint32_t>(Cg_in);
     p.Cg_out = static_cast<uint32_t>(Cg_out);
 
-    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_conv_fp16()
-                                                               : pso_conv_fp32();
     id<MTLBuffer> bx = buffer_for(X);
     id<MTLBuffer> bw = buffer_for(Wt);
     id<MTLBuffer> by = buffer_for(Y);
@@ -576,6 +575,24 @@ void conv2d_forward_gpu(const GpuTensor& X,
     const NSUInteger ow_ = buffer_offset_for(Wt);
     const NSUInteger oy = buffer_offset_for(Y);
     const NSUInteger ob = bias ? buffer_offset_for(*bias) : 0;
+
+    // Fast path: tiled simdgroup-matrix implicit-GEMM for FP16 SD1.5 shapes.
+    if (X.dtype == Dtype::FP16) {
+        if (conv2d_wmma_internal::launch_conv2d_implicit_gemm_simdgroup(
+                bx, ox, bw, ow_, bb, ob, bias != nullptr,
+                by, oy,
+                N, C_in, H, W,
+                C_out, kH, kW,
+                stride_h, stride_w,
+                pad_h, pad_w,
+                dil_h, dil_w,
+                H_out, W_out)) {
+            return;
+        }
+    }
+
+    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_conv_fp16()
+                                                               : pso_conv_fp32();
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = new_command_buffer();
