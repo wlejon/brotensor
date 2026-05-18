@@ -497,7 +497,8 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
             throw std::runtime_error("flash_attention_forward_gpu: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
         }
         dim3 grid(Lq, num_heads, 1);
-        flash_attention_kernel<<<grid, FA_BLOCK, shmem>>>(
+        cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+        flash_attention_kernel<<<grid, FA_BLOCK, shmem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_fp16()),
             reinterpret_cast<const __half*>(K.data_fp16()),
             reinterpret_cast<const __half*>(V.data_fp16()),

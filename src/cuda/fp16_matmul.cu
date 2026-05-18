@@ -10,6 +10,8 @@
 // Warp tile: WM x WN, built from 16x16x16 wmma fragments.
 //   BM=64, BN=64, BK=32, 4 warps per CTA (128 threads), WM=WN=32 (2x2 fragments / warp).
 
+#include <brotensor/runtime.h>
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -256,8 +258,9 @@ __global__ void matmul_ABT_naive_kernel(const __half* __restrict__ A,
 void launch_matmul_ABT_impl(const __half* A, const __half* B, __half* C,
                             int M, int N, int K) {
     if (M == 0 || N == 0) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     if (K == 0) {
-        cudaMemsetAsync(C, 0, sizeof(__half) * size_t(M) * size_t(N));
+        cudaMemsetAsync(C, 0, sizeof(__half) * size_t(M) * size_t(N), stream);
         return;
     }
 
@@ -272,13 +275,13 @@ void launch_matmul_ABT_impl(const __half* A, const __half* B, __half* C,
         const int total = M * N;
         const int block = 128;
         const int grid  = (total + block - 1) / block;
-        matmul_ABT_naive_kernel<<<grid, block>>>(A, B, C, M, N, K);
+        matmul_ABT_naive_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
         return;
     }
 
     dim3 block(THREADS_PER_CTA);
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    matmul_ABT_wmma_kernel<<<grid, block>>>(A, B, C, M, N, K);
+    matmul_ABT_wmma_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
 }
 
 } // namespace fp16_internal

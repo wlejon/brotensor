@@ -21,6 +21,25 @@ void cuda_init();
 // Wraps cudaDeviceSynchronize(). Throws std::runtime_error on failure.
 void cuda_sync();
 
+// ─── CUDA streams ──────────────────────────────────────────────────────────
+//
+// Thread-local "current stream" used by the hot compute ops (matmul, fp16
+// matmul, conv2d, flash_attention forward) for their kernel launches.
+// Setting the stream is purely additive — ops that don't query the current
+// stream stay on the default (null) stream. `cudaStream_t` is an opaque
+// pointer; the public header accepts `void*` to avoid pulling in
+// <cuda_runtime.h>. Internally the implementations cast back to cudaStream_t.
+// On Metal these are no-ops; Metal has its own queue model.
+//
+// Passing nullptr to cuda_set_stream restores the default (null) stream.
+void  cuda_set_stream(void* stream);
+void* cuda_current_stream();
+
+// Wait for a single stream to drain (cudaStreamSynchronize). Throws on
+// error. Pass nullptr to sync the default stream. On Metal this is a
+// no-op (ops are submitted synchronously per command buffer).
+void  cuda_stream_sync(void* stream);
+
 // Implementation hook for BROTENSOR_CUDA_CHECK — translates a cudaError_t (passed
 // in as int because we don't include cuda_runtime.h here) into a human
 // readable error message and throws std::runtime_error if non-zero.

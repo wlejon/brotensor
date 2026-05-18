@@ -12,15 +12,23 @@ namespace brotensor {
 // single raw device pointer (`data`); FP16 ops reinterpret it as half* on
 // the device side.
 //
-// Element sizes are fixed: FP32 = 4 bytes, FP16 = 2 bytes. Allocation,
-// clone, zero, and resize all use dtype-aware byte counts.
+// Element sizes are fixed: FP32 = 4 bytes, FP16 = 2 bytes, INT8 = 1 byte.
+// Allocation, clone, zero, and resize all use dtype-aware byte counts.
+// INT8 is currently only carried by weight-only quantised ops (W8A16
+// matmul/conv2d); arithmetic ops only dispatch on FP32/FP16.
 enum class Dtype : int {
     FP32 = 0,
     FP16 = 1,
+    INT8 = 2,
 };
 
 inline int dtype_size_bytes(Dtype dt) {
-    return dt == Dtype::FP16 ? 2 : 4;
+    switch (dt) {
+        case Dtype::FP32: return 4;
+        case Dtype::FP16: return 2;
+        case Dtype::INT8: return 1;
+    }
+    return 4;
 }
 
 // ─── GpuTensor ─────────────────────────────────────────────────────────────

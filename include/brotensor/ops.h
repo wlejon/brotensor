@@ -1443,4 +1443,80 @@ void flash_attention_decode_gpu(const GpuTensor& Q,
                                const GpuTensor& K_cache, const GpuTensor& V_cache,
                                int valid_len, int num_heads, GpuTensor& O);
 
+// ─── Public reductions ─────────────────────────────────────────────────────
+
+// Row-wise sum: Y[m, 0] = sum_n X[m, n].
+//   X: (M, N)  FP32 or FP16
+//   Y: (M, 1)  same dtype as X — resized as needed.
+void sum_rows_gpu(const GpuTensor& X, GpuTensor& Y);
+
+// Column-wise sum: Y[0, n] = sum_m X[m, n].
+//   X: (M, N)  FP32 or FP16
+//   Y: (1, N)  same dtype as X — resized as needed.
+void sum_cols_gpu(const GpuTensor& X, GpuTensor& Y);
+
+// Row-wise argmax: Idx[m, 0] = argmax_n X[m, n], stored as FP32 holding the
+// integer index cast to float (keeps the type system uniform).
+//   X:   (M, N)  FP32 or FP16
+//   Idx: (M, 1)  FP32 — resized as needed.
+void argmax_rows_gpu(const GpuTensor& X, GpuTensor& Idx);
+
+// ─── Fused DDIM step (FP16) ────────────────────────────────────────────────
+//
+// One-shot DDIM update applied element-wise to a noisy latent:
+//   x0_pred = (x_t - sqrt(1 - alpha_t) * eps_pred) / sqrt(alpha_t)
+//   dir     = sqrt(1 - alpha_prev - sigma_t^2) * eps_pred
+//   x_prev  = sqrt(alpha_prev) * x0_pred + dir
+// sigma_t = 0 yields deterministic DDIM; the formula still holds. FP16
+// inputs and outputs; FP32 internal math. x_t and eps_pred must share shape;
+// x_prev is resized to match.
+void ddim_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
+                   float alpha_t, float alpha_prev, float sigma_t,
+                   GpuTensor& x_prev);
+
+// ─── INT8 weight-only quantisation (W8A16) ─────────────────────────────────
+
+// Host helper: quantise an FP16 weight matrix to per-output-row symmetric
+// INT8.
+//   W_fp16:      (out, in) FP16 host buffer (uint16_t bit pattern)
+//   out, in:     dimensions
+//   W_int8_out:  filled with out*in int8_t values, row-major (out, in)
+//   scales_out:  filled with `out` FP32 scales (one per output row).
+// Scale per row = max(|w|) / 127 (or 0 if the row is all zero); quantised
+// value = clamp(round(w / scale), -127, 127).
+void quantize_int8_per_row_host(const uint16_t* W_fp16,
+                                int out, int in,
+                                int8_t* W_int8_out,
+                                float* scales_out);
+
+// W8A16 matmul: Y = dequant(W_int8, scales) @ X.
+//   W_int8: (out, in) Dtype::INT8 — quantised weights, per-row scales.
+//   scales: (out, 1) FP32 — per-row dequant scales.
+//   X:      (in, B)  FP16 — activations.
+//   Y:      (out, B) FP16 — resized as needed.
+// Matches the shape convention of matmul_gpu (plain (M,K)@(K,N) without
+// transpose); callsites can substitute one for the other.
+void matmul_int8w_fp16_gpu(const GpuTensor& W_int8,
+                           const GpuTensor& scales,
+                           const GpuTensor& X,
+                           GpuTensor& Y);
+
+// W8A16 conv2d forward. Mirrors conv2d_forward_gpu's signature; only the
+// weight dtype differs.
+//   W_int8: (C_out, C_in/groups * kH * kW) Dtype::INT8 — OIHW filter,
+//           quantised per output channel.
+//   scales: (C_out, 1) FP32 — per-output-channel dequant scales.
+//   bias:   FP16 (C_out, 1) or nullptr.
+//   X, Y:   FP16, same layout as conv2d_forward_gpu.
+void conv2d_int8w_fp16_forward_gpu(const GpuTensor& X,
+                                   const GpuTensor& W_int8,
+                                   const GpuTensor& scales,
+                                   const GpuTensor* bias,
+                                   int N, int C_in, int H, int W,
+                                   int C_out, int kH, int kW,
+                                   int stride_h, int stride_w,
+                                   int pad_h, int pad_w,
+                                   int dil_h, int dil_w, int groups,
+                                   GpuTensor& Y);
+
 } // namespace brotensor

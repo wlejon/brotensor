@@ -36,6 +36,12 @@ brotensor_add_test(brotensor_test_rope test_rope.cpp)
 brotensor_add_test(brotensor_test_rms_norm test_rms_norm.cpp)
 brotensor_add_test(brotensor_test_swiglu test_swiglu.cpp)
 brotensor_add_test(brotensor_test_kv_cache test_kv_cache.cpp)
+brotensor_add_test(brotensor_test_public_reductions test_public_reductions.cpp)
+brotensor_add_test(brotensor_test_ddim_step test_ddim_step.cpp)
+brotensor_add_test(brotensor_test_int8_quant test_int8_quant.cpp)
+if(BROTENSOR_WITH_CUDA)
+    brotensor_add_test(brotensor_test_streams test_streams.cpp)
+endif()
 
 # Diffusion micro-benchmark. Built but not added to ctest — invoke
 # manually from the build dir (./tests/Release/brotensor_bench_diffusion).

@@ -114,14 +114,16 @@ void matmul_gpu(const GpuTensor& A, const GpuTensor& B, GpuTensor& C) {
 
     dim3 block(MM_TILE, MM_TILE);
     dim3 grid((N + MM_TILE - 1) / MM_TILE, (M + MM_TILE - 1) / MM_TILE);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     if (A.dtype == Dtype::FP16) {
-        matmul_fp16_kernel<<<grid, block>>>(
+        matmul_fp16_kernel<<<grid, block, 0, stream>>>(
             reinterpret_cast<const __half*>(A.data_fp16()),
             reinterpret_cast<const __half*>(B.data_fp16()),
             reinterpret_cast<__half*>(C.data_fp16()),
             M, N, K);
     } else {
-        matmul_fp32_kernel<<<grid, block>>>(A.data, B.data, C.data, M, N, K);
+        matmul_fp32_kernel<<<grid, block, 0, stream>>>(
+            A.data, B.data, C.data, M, N, K);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }

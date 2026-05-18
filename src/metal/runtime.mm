@@ -57,6 +57,25 @@ void cuda_sync() {
     // asynchronously we'd flush here by waiting on a sentinel buffer.
 }
 
+// Metal has its own queue model and no per-thread stream concept; these are
+// no-ops so source compiles across backends. We keep the same thread_local
+// scaffolding so cuda_current_stream() round-trips whatever was set.
+namespace {
+thread_local void* g_current_stream_metal = nullptr;
+} // namespace
+
+void cuda_set_stream(void* stream) {
+    g_current_stream_metal = stream;
+}
+
+void* cuda_current_stream() {
+    return g_current_stream_metal;
+}
+
+void cuda_stream_sync(void* /*stream*/) {
+    // No-op: ops submit synchronously per command buffer.
+}
+
 void cuda_check_throw(int err, const char* expr_text, const char* file, int line) {
     if (err == 0) return;
     char buf[1024];

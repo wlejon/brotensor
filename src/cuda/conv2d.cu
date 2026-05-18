@@ -300,6 +300,7 @@ void conv2d_forward_gpu(const GpuTensor& X,
     if (total == 0) return;
 
     const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     if (X.dtype == Dtype::FP16) {
         const __half* x_p  = reinterpret_cast<const __half*>(X.data_fp16());
         const __half* w_p  = reinterpret_cast<const __half*>(Wt.data_fp16());
@@ -320,14 +321,14 @@ void conv2d_forward_gpu(const GpuTensor& X,
             return;
         }
 
-        conv2d_forward_kernel<__half><<<blocks, CONV_BLOCK>>>(
+        conv2d_forward_kernel<__half><<<blocks, CONV_BLOCK, 0, stream>>>(
             x_p, w_p, b_p, y_p,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
     } else {
         const float* b_p = bias ? bias->data : nullptr;
-        conv2d_forward_kernel<float><<<blocks, CONV_BLOCK>>>(
+        conv2d_forward_kernel<float><<<blocks, CONV_BLOCK, 0, stream>>>(
             X.data, Wt.data, b_p, Y.data,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,

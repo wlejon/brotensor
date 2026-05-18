@@ -47,6 +47,25 @@ void cuda_sync() {
     BROTENSOR_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+namespace {
+// Thread-local "current stream" used by select hot ops (matmul, fp16 matmul,
+// conv2d, flash_attention fwd). nullptr ⇒ default stream.
+thread_local cudaStream_t g_current_stream = nullptr;
+} // namespace
+
+void cuda_set_stream(void* stream) {
+    g_current_stream = reinterpret_cast<cudaStream_t>(stream);
+}
+
+void* cuda_current_stream() {
+    return reinterpret_cast<void*>(g_current_stream);
+}
+
+void cuda_stream_sync(void* stream) {
+    BROTENSOR_CUDA_CHECK(
+        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)));
+}
+
 void cuda_check_throw(int err, const char* expr_text, const char* file, int line) {
     if (err == 0) return;
     const char* es = cudaGetErrorString(static_cast<cudaError_t>(err));
