@@ -50,6 +50,7 @@ __global__ void conv2d_forward_kernel(
         int stride_h, int stride_w,
         int pad_h, int pad_w,
         int dil_h, int dil_w,
+        int groups, int Cg_in, int Cg_out,
         int total) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -66,13 +67,18 @@ __global__ void conv2d_forward_kernel(
     const int in_w_origin = ow * stride_w - pad_w;
 
     float acc = 0.0f;
-    // Weight base for this output channel: (oc, 0, 0, 0) in OIHW.
-    const int w_oc_base = oc * C_in * kH * kW;
+    // Group this output channel belongs to.
+    const int g_out = oc / Cg_out;
+    const int ic_abs_base = g_out * Cg_in;
+    // Weight base for this output channel: (oc, 0, 0, 0) in OIHW, with the
+    // I-dim sized as Cg_in for grouped conv.
+    const int w_oc_base = oc * Cg_in * kH * kW;
     // Input base for this sample.
     const int x_n_base = n * C_in * H * W;
 
-    for (int ic = 0; ic < C_in; ++ic) {
-        const int w_ic_base = w_oc_base + ic * kH * kW;
+    for (int ic_local = 0; ic_local < Cg_in; ++ic_local) {
+        const int ic = ic_abs_base + ic_local;
+        const int w_ic_base = w_oc_base + ic_local * kH * kW;
         const int x_ic_base = x_n_base + ic * H * W;
         for (int kh = 0; kh < kH; ++kh) {
             const int in_h = in_h_origin + kh * dil_h;
@@ -105,6 +111,7 @@ __global__ void conv2d_backward_input_kernel(
         int stride_h, int stride_w,
         int pad_h, int pad_w,
         int dil_h, int dil_w,
+        int groups, int Cg_in, int Cg_out,
         int total) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -116,6 +123,12 @@ __global__ void conv2d_backward_input_kernel(
     t /= H;
     const int c_in = t % C_in;
     const int n    = t / C_in;
+
+    // Which group does c_in belong to, and its local index within that group?
+    const int g = c_in / Cg_in;
+    const int c_in_local = c_in - g * Cg_in;
+    const int oc_lo = g * Cg_out;
+    const int oc_hi = oc_lo + Cg_out;
 
     float acc = 0.0f;
 
@@ -135,10 +148,11 @@ __global__ void conv2d_backward_input_kernel(
             const int j_out = num_w / stride_w;
             if (j_out < 0 || j_out >= W_out) continue;
 
-            // Sum over c_out of dY[n, c_out, i_out, j_out] * Wt[c_out, c_in, kh, kw].
-            for (int c_out = 0; c_out < C_out; ++c_out) {
+            // Sum over c_out in this group of
+            //   dY[n, c_out, i_out, j_out] * Wt[c_out, c_in_local, kh, kw].
+            for (int c_out = oc_lo; c_out < oc_hi; ++c_out) {
                 const int dy_idx = ((n * C_out + c_out) * H_out + i_out) * W_out + j_out;
-                const int w_idx  = ((c_out * C_in + c_in) * kH + kh) * kW + kw;
+                const int w_idx  = ((c_out * Cg_in + c_in_local) * kH + kh) * kW + kw;
                 acc += load_f32<T>(&dY[dy_idx]) * load_f32<T>(&Wt[w_idx]);
             }
         }
@@ -153,24 +167,30 @@ template <typename T>
 __global__ void conv2d_backward_weight_kernel(
         const T* __restrict__ X,
         const T* __restrict__ dY,
-        float* __restrict__ dWt_scratch,    // FP32, size C_out*C_in*kH*kW
+        float* __restrict__ dWt_scratch,    // FP32, size C_out*Cg_in*kH*kW
         int N, int C_in, int H, int W,
         int C_out, int kH, int kW,
         int H_out, int W_out,
         int stride_h, int stride_w,
         int pad_h, int pad_w,
         int dil_h, int dil_w,
+        int groups, int Cg_in, int Cg_out,
         int total) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
-    // Unflatten idx → (c_out, c_in, kh, kw) in OIHW layout.
+    // Unflatten idx → (c_out, c_in_local, kh, kw) in OIHW layout
+    // (I-dim sized as Cg_in for grouped conv).
     const int kw = idx % kW;
     int t = idx / kW;
     const int kh = t % kH;
     t /= kH;
-    const int c_in  = t % C_in;
-    const int c_out = t / C_in;
+    const int c_in_local = t % Cg_in;
+    const int c_out      = t / Cg_in;
+
+    // Absolute input channel for this (c_out, c_in_local).
+    const int g = c_out / Cg_out;
+    const int c_in = g * Cg_in + c_in_local;
 
     float acc = 0.0f;
     for (int n = 0; n < N; ++n) {
@@ -250,6 +270,7 @@ void conv2d_forward_gpu(const GpuTensor& X,
                         int stride_h, int stride_w,
                         int pad_h, int pad_w,
                         int dil_h, int dil_w,
+                        int groups,
                         GpuTensor& Y) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
         throw std::runtime_error("conv2d_forward_gpu: X must be FP16 or FP32");
@@ -260,6 +281,12 @@ void conv2d_forward_gpu(const GpuTensor& X,
     if (bias && bias->dtype != X.dtype) {
         throw std::runtime_error("conv2d_forward_gpu: bias dtype must match X");
     }
+    if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
+        throw std::runtime_error(
+            "conv2d_forward_gpu: groups must be >=1 and divide both C_in and C_out");
+    }
+    const int Cg_in  = C_in  / groups;
+    const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
@@ -281,9 +308,10 @@ void conv2d_forward_gpu(const GpuTensor& X,
         __half* y_p        = reinterpret_cast<__half*>(Y.data_fp16());
 
         // Try the WMMA implicit-GEMM path for the SD1.5-relevant shapes
-        // (3x3 s1 p1 d1, 1x1 s1 p0 d1, 3x3 s2 p1 d1). Falls through on
-        // failure (small problem / unsupported shape).
-        if (conv2d_wmma_internal::launch_conv2d_implicit_gemm_wmma(
+        // (3x3 s1 p1 d1, 1x1 s1 p0 d1, 3x3 s2 p1 d1). The WMMA path assumes
+        // full convolution (groups=1) — bypass it for grouped conv.
+        if (groups == 1 &&
+            conv2d_wmma_internal::launch_conv2d_implicit_gemm_wmma(
                 x_p, w_p, b_p, y_p,
                 N, C_in, H, W, C_out, kH, kW,
                 stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
@@ -295,13 +323,15 @@ void conv2d_forward_gpu(const GpuTensor& X,
         conv2d_forward_kernel<__half><<<blocks, CONV_BLOCK>>>(
             x_p, w_p, b_p, y_p,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            groups, Cg_in, Cg_out, total);
     } else {
         const float* b_p = bias ? bias->data : nullptr;
         conv2d_forward_kernel<float><<<blocks, CONV_BLOCK>>>(
             X.data, Wt.data, b_p, Y.data,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            groups, Cg_in, Cg_out, total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -313,6 +343,7 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
                                int stride_h, int stride_w,
                                int pad_h, int pad_w,
                                int dil_h, int dil_w,
+                               int groups,
                                GpuTensor& dX) {
     if (Wt.dtype != Dtype::FP16 && Wt.dtype != Dtype::FP32) {
         throw std::runtime_error("conv2d_backward_input_gpu: Wt must be FP16 or FP32");
@@ -320,6 +351,12 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
     if (dY.dtype != Wt.dtype) {
         throw std::runtime_error("conv2d_backward_input_gpu: dY dtype must match Wt");
     }
+    if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
+        throw std::runtime_error(
+            "conv2d_backward_input_gpu: groups must be >=1 and divide both C_in and C_out");
+    }
+    const int Cg_in  = C_in  / groups;
+    const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
@@ -339,12 +376,14 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
             reinterpret_cast<const __half*>(dY.data_fp16()),
             reinterpret_cast<__half*>(dX.data_fp16()),
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            groups, Cg_in, Cg_out, total);
     } else {
         conv2d_backward_input_kernel<float><<<blocks, CONV_BLOCK>>>(
             Wt.data, dY.data, dX.data,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            groups, Cg_in, Cg_out, total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -356,6 +395,7 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
                                 int stride_h, int stride_w,
                                 int pad_h, int pad_w,
                                 int dil_h, int dil_w,
+                                int groups,
                                 GpuTensor& dWt) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
         throw std::runtime_error("conv2d_backward_weight_gpu: X must be FP16 or FP32");
@@ -363,15 +403,21 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
     if (dY.dtype != X.dtype || dWt.dtype != X.dtype) {
         throw std::runtime_error("conv2d_backward_weight_gpu: X, dY, dWt dtype must match");
     }
+    if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
+        throw std::runtime_error(
+            "conv2d_backward_weight_gpu: groups must be >=1 and divide both C_in and C_out");
+    }
+    const int Cg_in  = C_in  / groups;
+    const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
         throw std::runtime_error("conv2d_backward_weight_gpu: non-positive output shape");
     }
-    if (dWt.rows != C_out || dWt.cols != C_in * kH * kW) {
+    if (dWt.rows != C_out || dWt.cols != Cg_in * kH * kW) {
         throw std::runtime_error("conv2d_backward_weight_gpu: dWt shape mismatch");
     }
-    const int total = C_out * C_in * kH * kW;
+    const int total = C_out * Cg_in * kH * kW;
     if (total == 0) return;
 
     // FP32 scratch for the per-element partial sum. We write it (overwrite)
@@ -387,12 +433,14 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
             reinterpret_cast<const __half*>(dY.data_fp16()),
             d_scratch,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            groups, Cg_in, Cg_out, total);
     } else {
         conv2d_backward_weight_kernel<float><<<blocks, CONV_BLOCK>>>(
             X.data, dY.data, d_scratch,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, total);
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            groups, Cg_in, Cg_out, total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 

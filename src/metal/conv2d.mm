@@ -27,6 +27,9 @@ struct ConvParams {
     int  dil_h, dil_w;
     uint has_bias;
     uint total;
+    uint groups;
+    uint Cg_in;
+    uint Cg_out;
 };
 
 // One thread per output element. Direct conv, FP32 accumulator, FP16 IO.
@@ -48,11 +51,14 @@ kernel void k_conv2d_forward_fp16(device const half* X    [[buffer(0)]],
     int in_w_origin = int(ow) * p.stride_w - p.pad_w;
 
     float acc = 0.0f;
-    uint w_oc_base = oc * p.C_in * p.kH * p.kW;
+    uint g_out = oc / p.Cg_out;
+    uint ic_abs_base = g_out * p.Cg_in;
+    uint w_oc_base = oc * p.Cg_in * p.kH * p.kW;
     uint x_n_base  = n * p.C_in * p.H * p.W;
 
-    for (uint ic = 0; ic < p.C_in; ++ic) {
-        uint w_ic_base = w_oc_base + ic * p.kH * p.kW;
+    for (uint ic_local = 0; ic_local < p.Cg_in; ++ic_local) {
+        uint ic = ic_abs_base + ic_local;
+        uint w_ic_base = w_oc_base + ic_local * p.kH * p.kW;
         uint x_ic_base = x_n_base  + ic * p.H * p.W;
         for (uint kh = 0; kh < p.kH; ++kh) {
             int in_h = in_h_origin + int(kh) * p.dil_h;
@@ -91,11 +97,14 @@ kernel void k_conv2d_forward_fp32(device const float* X    [[buffer(0)]],
     int in_w_origin = int(ow) * p.stride_w - p.pad_w;
 
     float acc = 0.0f;
-    uint w_oc_base = oc * p.C_in * p.kH * p.kW;
+    uint g_out = oc / p.Cg_out;
+    uint ic_abs_base = g_out * p.Cg_in;
+    uint w_oc_base = oc * p.Cg_in * p.kH * p.kW;
     uint x_n_base  = n * p.C_in * p.H * p.W;
 
-    for (uint ic = 0; ic < p.C_in; ++ic) {
-        uint w_ic_base = w_oc_base + ic * p.kH * p.kW;
+    for (uint ic_local = 0; ic_local < p.Cg_in; ++ic_local) {
+        uint ic = ic_abs_base + ic_local;
+        uint w_ic_base = w_oc_base + ic_local * p.kH * p.kW;
         uint x_ic_base = x_n_base  + ic * p.H * p.W;
         for (uint kh = 0; kh < p.kH; ++kh) {
             int in_h = in_h_origin + int(kh) * p.dil_h;
@@ -130,6 +139,11 @@ kernel void k_conv2d_backward_input_fp16(device const half* Wt [[buffer(0)]],
     uint c_in = t % p.C_in;
     uint n    = t / p.C_in;
 
+    uint g = c_in / p.Cg_in;
+    uint c_in_local = c_in - g * p.Cg_in;
+    uint oc_lo = g * p.Cg_out;
+    uint oc_hi = oc_lo + p.Cg_out;
+
     float acc = 0.0f;
     for (uint kh = 0; kh < p.kH; ++kh) {
         int num_h = int(i) + p.pad_h - p.dil_h * int(kh);
@@ -144,9 +158,9 @@ kernel void k_conv2d_backward_input_fp16(device const half* Wt [[buffer(0)]],
             int j_out = num_w / p.stride_w;
             if (j_out < 0 || j_out >= int(p.W_out)) continue;
 
-            for (uint c_out = 0; c_out < p.C_out; ++c_out) {
+            for (uint c_out = oc_lo; c_out < oc_hi; ++c_out) {
                 uint dy_idx = ((n * p.C_out + c_out) * p.H_out + uint(i_out)) * p.W_out + uint(j_out);
-                uint w_idx  = ((c_out * p.C_in + c_in) * p.kH + kh) * p.kW + kw;
+                uint w_idx  = ((c_out * p.Cg_in + c_in_local) * p.kH + kh) * p.kW + kw;
                 acc += float(dY[dy_idx]) * float(Wt[w_idx]);
             }
         }
@@ -165,8 +179,11 @@ kernel void k_conv2d_backward_weight_fp16(device const half*  X   [[buffer(0)]],
     uint t  = idx / p.kW;
     uint kh = t % p.kH;
     t /= p.kH;
-    uint c_in  = t % p.C_in;
-    uint c_out = t / p.C_in;
+    uint c_in_local = t % p.Cg_in;
+    uint c_out      = t / p.Cg_in;
+
+    uint g = c_out / p.Cg_out;
+    uint c_in = g * p.Cg_in + c_in_local;
 
     float acc = 0.0f;
     for (uint n = 0; n < p.N; ++n) {
@@ -197,8 +214,11 @@ kernel void k_conv2d_backward_weight_fp32_to_scratch(
     uint t  = idx / p.kW;
     uint kh = t % p.kH;
     t /= p.kH;
-    uint c_in  = t % p.C_in;
-    uint c_out = t / p.C_in;
+    uint c_in_local = t % p.Cg_in;
+    uint c_out      = t / p.Cg_in;
+
+    uint g = c_out / p.Cg_out;
+    uint c_in = g * p.Cg_in + c_in_local;
 
     float acc = 0.0f;
     for (uint n = 0; n < p.N; ++n) {
@@ -305,6 +325,11 @@ kernel void k_conv2d_backward_input_fp32(device const float* Wt [[buffer(0)]],
     uint c_in = t % p.C_in;
     uint n    = t / p.C_in;
 
+    uint g = c_in / p.Cg_in;
+    uint c_in_local = c_in - g * p.Cg_in;
+    uint oc_lo = g * p.Cg_out;
+    uint oc_hi = oc_lo + p.Cg_out;
+
     float acc = 0.0f;
     for (uint kh = 0; kh < p.kH; ++kh) {
         int num_h = int(i) + p.pad_h - p.dil_h * int(kh);
@@ -319,9 +344,9 @@ kernel void k_conv2d_backward_input_fp32(device const float* Wt [[buffer(0)]],
             int j_out = num_w / p.stride_w;
             if (j_out < 0 || j_out >= int(p.W_out)) continue;
 
-            for (uint c_out = 0; c_out < p.C_out; ++c_out) {
+            for (uint c_out = oc_lo; c_out < oc_hi; ++c_out) {
                 uint dy_idx = ((n * p.C_out + c_out) * p.H_out + uint(i_out)) * p.W_out + uint(j_out);
-                uint w_idx  = ((c_out * p.C_in + c_in) * p.kH + kh) * p.kW + kw;
+                uint w_idx  = ((c_out * p.Cg_in + c_in_local) * p.kH + kh) * p.kW + kw;
                 acc += dY[dy_idx] * Wt[w_idx];
             }
         }
@@ -338,13 +363,17 @@ kernel void k_conv2d_backward_weight_fp32(device const float* X   [[buffer(0)]],
                                           constant ConvParams& p  [[buffer(3)]],
                                           uint idx [[thread_position_in_grid]]) {
     if (idx >= p.total) return;
-    // Unflatten idx → (c_out, c_in, kh, kw) in OIHW.
+    // Unflatten idx → (c_out, c_in_local, kh, kw) in OIHW (I-dim sized as Cg_in
+    // for grouped conv).
     uint kw = idx % p.kW;
     uint t  = idx / p.kW;
     uint kh = t % p.kH;
     t /= p.kH;
-    uint c_in  = t % p.C_in;
-    uint c_out = t / p.C_in;
+    uint c_in_local = t % p.Cg_in;
+    uint c_out      = t / p.Cg_in;
+
+    uint g = c_out / p.Cg_out;
+    uint c_in = g * p.Cg_in + c_in_local;
 
     float acc = 0.0f;
     for (uint n = 0; n < p.N; ++n) {
@@ -480,6 +509,9 @@ struct ConvParams {
     int32_t  dil_h, dil_w;
     uint32_t has_bias;
     uint32_t total;
+    uint32_t groups;
+    uint32_t Cg_in;
+    uint32_t Cg_out;
 };
 
 } // namespace
@@ -492,6 +524,7 @@ void conv2d_forward_gpu(const GpuTensor& X,
                         int stride_h, int stride_w,
                         int pad_h, int pad_w,
                         int dil_h, int dil_w,
+                        int groups,
                         GpuTensor& Y) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
         throw std::runtime_error("conv2d_forward_gpu: X must be FP16 or FP32");
@@ -502,6 +535,12 @@ void conv2d_forward_gpu(const GpuTensor& X,
     if (bias && bias->dtype != X.dtype) {
         throw std::runtime_error("conv2d_forward_gpu: bias dtype must match X");
     }
+    if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
+        throw std::runtime_error(
+            "conv2d_forward_gpu: groups must be >=1 and divide both C_in and C_out");
+    }
+    const int Cg_in  = C_in  / groups;
+    const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
@@ -523,6 +562,9 @@ void conv2d_forward_gpu(const GpuTensor& X,
     p.dil_h = dil_h; p.dil_w = dil_w;
     p.has_bias = bias ? 1u : 0u;
     p.total = total;
+    p.groups = static_cast<uint32_t>(groups);
+    p.Cg_in = static_cast<uint32_t>(Cg_in);
+    p.Cg_out = static_cast<uint32_t>(Cg_out);
 
     id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_conv_fp16()
                                                                : pso_conv_fp32();
@@ -561,6 +603,7 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
                                int stride_h, int stride_w,
                                int pad_h, int pad_w,
                                int dil_h, int dil_w,
+                               int groups,
                                GpuTensor& dX) {
     if (Wt.dtype != Dtype::FP16 && Wt.dtype != Dtype::FP32) {
         throw std::runtime_error("conv2d_backward_input_gpu: Wt must be FP16 or FP32");
@@ -568,6 +611,12 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
     if (dY.dtype != Wt.dtype) {
         throw std::runtime_error("conv2d_backward_input_gpu: dY dtype must match Wt");
     }
+    if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
+        throw std::runtime_error(
+            "conv2d_backward_input_gpu: groups must be >=1 and divide both C_in and C_out");
+    }
+    const int Cg_in  = C_in  / groups;
+    const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
@@ -589,6 +638,9 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
     p.dil_h = dil_h; p.dil_w = dil_w;
     p.has_bias = 0u;
     p.total = total;
+    p.groups = static_cast<uint32_t>(groups);
+    p.Cg_in = static_cast<uint32_t>(Cg_in);
+    p.Cg_out = static_cast<uint32_t>(Cg_out);
 
     id<MTLComputePipelineState> pso = (Wt.dtype == Dtype::FP16)
         ? pso_conv_bwd_input_fp16() : pso_conv_bwd_input_fp32();
@@ -624,6 +676,7 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
                                 int stride_h, int stride_w,
                                 int pad_h, int pad_w,
                                 int dil_h, int dil_w,
+                                int groups,
                                 GpuTensor& dWt) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
         throw std::runtime_error("conv2d_backward_weight_gpu: X must be FP16 or FP32");
@@ -631,15 +684,21 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
     if (dY.dtype != X.dtype || dWt.dtype != X.dtype) {
         throw std::runtime_error("conv2d_backward_weight_gpu: X, dY, dWt dtype must match");
     }
+    if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
+        throw std::runtime_error(
+            "conv2d_backward_weight_gpu: groups must be >=1 and divide both C_in and C_out");
+    }
+    const int Cg_in  = C_in  / groups;
+    const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
         throw std::runtime_error("conv2d_backward_weight_gpu: non-positive output shape");
     }
-    if (dWt.rows != C_out || dWt.cols != C_in * kH * kW) {
+    if (dWt.rows != C_out || dWt.cols != Cg_in * kH * kW) {
         throw std::runtime_error("conv2d_backward_weight_gpu: dWt shape mismatch");
     }
-    const uint32_t total = static_cast<uint32_t>(C_out) * C_in * kH * kW;
+    const uint32_t total = static_cast<uint32_t>(C_out) * Cg_in * kH * kW;
     if (total == 0) return;
 
     ConvParams p{};
@@ -651,6 +710,9 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
     p.dil_h = dil_h; p.dil_w = dil_w;
     p.has_bias = 0u;
     p.total = total;
+    p.groups = static_cast<uint32_t>(groups);
+    p.Cg_in = static_cast<uint32_t>(Cg_in);
+    p.Cg_out = static_cast<uint32_t>(Cg_out);
 
     const bool is_fp16 = (X.dtype == Dtype::FP16);
     id<MTLComputePipelineState> pso = is_fp16

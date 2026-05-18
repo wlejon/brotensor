@@ -516,14 +516,21 @@ void softmax_xent_fused_batched_gpu(const GpuTensor& logits_BL,
 // integer arguments. Output tensors are resized (and dtype-set) by the op.
 // No backward; downstream brodiff drives these for inference only.
 
-// 2D convolution, NCHW, groups = 1. Dispatched on X.dtype (FP32 or FP16);
+// 2D convolution, NCHW. Dispatched on X.dtype (FP32 or FP16);
 // Wt, bias (if non-null), and Y must all share X.dtype. Internal
 // accumulation in FP32 regardless of storage dtype.
 //   X:      (N, C_in * H * W)        input
-//   Wt:     (C_out, C_in * kH * kW)  weights, OIHW filter layout
+//   Wt:     (C_out, (C_in/groups) * kH * kW)  weights, OIHW filter layout
 //   bias:   (C_out, 1)               optional bias, may be null
 //   Y:      (N, C_out * H_out * W_out)  output, resized AND dtype-set to
 //                                       match X if mis-shaped/-typed.
+//   groups: must divide both C_in and C_out. Default 1 (standard conv).
+//           Wt shape becomes (C_out, (C_in/groups) * kH * kW). Output channel
+//           c_out belongs to group g = c_out / (C_out / groups), and reads
+//           only input channels [g*(C_in/groups), (g+1)*(C_in/groups)).
+//           groups=1 reduces to the original full-channel convolution.
+//           Depthwise is groups == C_in == C_out (Wt shape (C_out, kH*kW),
+//           one filter per channel).
 // Output dims (standard PyTorch formula):
 //   H_out = (H + 2*pad_h - dil_h * (kH - 1) - 1) / stride_h + 1
 //   W_out = (W + 2*pad_w - dil_w * (kW - 1) - 1) / stride_w + 1
@@ -535,10 +542,27 @@ void conv2d_forward_gpu(const GpuTensor& X,
                         int stride_h, int stride_w,
                         int pad_h, int pad_w,
                         int dil_h, int dil_w,
+                        int groups,
                         GpuTensor& Y);
+// Convenience overload: groups defaults to 1 (full convolution).
+inline void conv2d_forward_gpu(const GpuTensor& X,
+                               const GpuTensor& Wt,
+                               const GpuTensor* bias,
+                               int N, int C_in, int H, int W,
+                               int C_out, int kH, int kW,
+                               int stride_h, int stride_w,
+                               int pad_h, int pad_w,
+                               int dil_h, int dil_w,
+                               GpuTensor& Y) {
+    conv2d_forward_gpu(X, Wt, bias, N, C_in, H, W, C_out, kH, kW,
+                       stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                       /*groups=*/1, Y);
+}
 
-// 2D convolution backward w.r.t. input (dX). FP32 only this bundle. The
-// companion dW/dB backward is a separate op (forthcoming bundle).
+// 2D convolution backward w.r.t. input (dX). Mirrors conv2d_forward_gpu's
+// groups parameter: input channel c_in only sees output channels in its
+// own group g = c_in / (C_in / groups). At groups=1 the math reduces to a
+// full sum over c_out.
 //
 // Gather form: one thread per input pixel, iterates the kernel positions
 // (kh, kw) and inverts the forward index relation to find which output
@@ -546,18 +570,20 @@ void conv2d_forward_gpu(const GpuTensor& X,
 //   i_out = (i + pad_h - dil_h * kh) / stride_h
 //   j_out = (j + pad_w - dil_w * kw) / stride_w
 // Only valid when divisible by stride and in [0, H_out) × [0, W_out).
-// For each valid (kh, kw), accumulate sum over c_out of
-// dY[n, c_out, i_out, j_out] * Wt[c_out, c_in, kh, kw]. FP32 accumulator.
+// For each valid (kh, kw), accumulate sum over c_out in c_in's group of
+// dY[n, c_out, i_out, j_out] * Wt[c_out, c_in_local, kh, kw], where
+// c_in_local = c_in - g * (C_in / groups). FP32 accumulator.
 // No atomics — each dX pixel is written by exactly one thread.
 // Dtype-dispatched (FP32 or FP16); Wt and dY share dtype, dX matches.
 //
-// All conv hyperparams (H, W, stride/pad/dil) match the forward call.
+// All conv hyperparams (H, W, stride/pad/dil, groups) match the forward call.
 //
-//   Wt:   (C_out, C_in * kH * kW)        forward filter, OIHW
-//   dY:   (N, C_out * H_out * W_out)     upstream gradient
-//   dX:   (N, C_in  * H * W)             output, *overwritten*. Resized AND
-//                                        dtype-set to match dY if
-//                                        mis-shaped/-typed.
+//   Wt:   (C_out, (C_in/groups) * kH * kW)  forward filter, OIHW
+//   dY:   (N, C_out * H_out * W_out)        upstream gradient
+//   dX:   (N, C_in  * H * W)                output, *overwritten*. Resized AND
+//                                           dtype-set to match dY if
+//                                           mis-shaped/-typed.
+//   groups: must divide both C_in and C_out. Depthwise is groups == C_in == C_out.
 void conv2d_backward_input_gpu(const GpuTensor& Wt,
                                const GpuTensor& dY,
                                int N, int C_in, int H, int W,
@@ -565,29 +591,48 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
                                int stride_h, int stride_w,
                                int pad_h, int pad_w,
                                int dil_h, int dil_w,
+                               int groups,
                                GpuTensor& dX);
+// Convenience overload: groups defaults to 1.
+inline void conv2d_backward_input_gpu(const GpuTensor& Wt,
+                                      const GpuTensor& dY,
+                                      int N, int C_in, int H, int W,
+                                      int C_out, int kH, int kW,
+                                      int stride_h, int stride_w,
+                                      int pad_h, int pad_w,
+                                      int dil_h, int dil_w,
+                                      GpuTensor& dX) {
+    conv2d_backward_input_gpu(Wt, dY, N, C_in, H, W, C_out, kH, kW,
+                              stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                              /*groups=*/1, dX);
+}
 
 // 2D convolution backward w.r.t. weights (dW). Dtype-dispatched (FP32 or
-// FP16); X, dY, dWt all share dtype.
+// FP16); X, dY, dWt all share dtype. Mirrors conv2d_forward_gpu's groups
+// parameter; for groups > 1 the filter has shape (C_out, (C_in/groups) * kH * kW)
+// and each output channel only sees the inputs in its own group.
 //
-// One thread per (c_out, c_in, kh, kw) element of dWt. Each thread iterates
+// One thread per (c_out, c_in_local, kh, kw) element of dWt. Each thread iterates
 // (n, i_out, j_out) over the output spatial extent + batch, looks up the
-// corresponding input pixel (skipping OOB reads — treat OOB as zero), and
-// accumulates into a single dWt slot. No atomics — each dWt element is owned
-// by exactly one thread. FP32 accumulator; the per-thread sum is *added* into
-// the caller's dWt (caller is responsible for zeroing first). For FP16
-// storage, an FP32 scratch + fold-back epilogue is used (Bundle 2 pattern).
+// corresponding input pixel from group g = c_out / (C_out/groups) at absolute
+// channel c_in = g * (C_in/groups) + c_in_local (skipping OOB reads — treat OOB
+// as zero), and accumulates into a single dWt slot. No atomics — each dWt
+// element is owned by exactly one thread. FP32 accumulator; the per-thread sum
+// is *added* into the caller's dWt (caller is responsible for zeroing first).
+// For FP16 storage, an FP32 scratch + fold-back epilogue is used.
 //
-// Math:
-//   dWt[c_out, c_in, kh, kw] +=
+// Math (Cg_in = C_in/groups, Cg_out = C_out/groups,
+//       g = c_out / Cg_out, c_in = g * Cg_in + c_in_local):
+//   dWt[c_out, c_in_local, kh, kw] +=
 //     sum over (n, i_out, j_out) of
 //       dY[n, c_out, i_out, j_out] *
 //       X [n, c_in, stride_h*i_out - pad_h + dil_h*kh,
 //                    stride_w*j_out - pad_w + dil_w*kw]
 //
-//   X:    (N, C_in  * H * W)             forward input
-//   dY:   (N, C_out * H_out * W_out)     upstream gradient
-//   dWt:  (C_out, C_in * kH * kW)        *accumulated into* — caller zeros
+//   X:    (N, C_in  * H * W)                 forward input
+//   dY:   (N, C_out * H_out * W_out)         upstream gradient
+//   dWt:  (C_out, (C_in/groups) * kH * kW)   *accumulated into* — caller zeros
+//   groups: must divide both C_in and C_out.
 // All conv hyperparams match the forward call.
 void conv2d_backward_weight_gpu(const GpuTensor& X,
                                 const GpuTensor& dY,
@@ -596,10 +641,25 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
                                 int stride_h, int stride_w,
                                 int pad_h, int pad_w,
                                 int dil_h, int dil_w,
+                                int groups,
                                 GpuTensor& dWt);
+// Convenience overload: groups defaults to 1.
+inline void conv2d_backward_weight_gpu(const GpuTensor& X,
+                                       const GpuTensor& dY,
+                                       int N, int C_in, int H, int W,
+                                       int C_out, int kH, int kW,
+                                       int stride_h, int stride_w,
+                                       int pad_h, int pad_w,
+                                       int dil_h, int dil_w,
+                                       GpuTensor& dWt) {
+    conv2d_backward_weight_gpu(X, dY, N, C_in, H, W, C_out, kH, kW,
+                               stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                               /*groups=*/1, dWt);
+}
 
 // 2D convolution backward w.r.t. bias (dB). Dtype-dispatched (FP32 or FP16);
-// dY and dB share dtype.
+// dY and dB share dtype. No groups parameter — bias is per-output-channel
+// and the dB math is identical regardless of how the spatial conv is grouped.
 //
 // One block per c_out, parallel reduction across (n, i_out, j_out). FP32
 // accumulator; the block-reduced partial sum is added into dB[c_out]. For
