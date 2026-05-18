@@ -106,6 +106,9 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/kv_cache.cu
         src/cuda/public_reductions.cu
         src/cuda/ddim_step.cu
+        src/cuda/euler_step.cu
+        src/cuda/dpmpp_2m_step.cu
+        src/cuda/timestep_embedding.cu
         src/cuda/int8_quant.cu
     )
     target_link_libraries(brotensor PUBLIC CUDA::cudart)
@@ -154,6 +157,9 @@ if(BROTENSOR_WITH_METAL)
         src/metal/kv_cache.mm
         src/metal/public_reductions.mm
         src/metal/ddim_step.mm
+        src/metal/euler_step.mm
+        src/metal/dpmpp_2m_step.mm
+        src/metal/timestep_embedding.mm
         src/metal/int8_quant.mm
     )
     set_source_files_properties(
@@ -192,6 +198,9 @@ if(BROTENSOR_WITH_METAL)
         src/metal/kv_cache.mm
         src/metal/public_reductions.mm
         src/metal/ddim_step.mm
+        src/metal/euler_step.mm
+        src/metal/dpmpp_2m_step.mm
+        src/metal/timestep_embedding.mm
         src/metal/int8_quant.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"

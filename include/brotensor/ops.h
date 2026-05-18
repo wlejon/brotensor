@@ -1544,6 +1544,59 @@ void ddim_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
                    float alpha_t, float alpha_prev, float sigma_t,
                    GpuTensor& x_prev);
 
+// ─── Fused Euler-discrete sampler step (FP16) ──────────────────────────────
+//
+// ε-prediction, σ convention matching diffusers' EulerDiscreteScheduler:
+//   x_prev = x_t + (sigma_prev - sigma_t) * eps_pred
+// FP16 inputs and outputs; FP32 internal math. x_t and eps_pred must share
+// shape; x_prev is resized to match.
+void euler_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
+                    float sigma_t, float sigma_prev,
+                    GpuTensor& x_prev);
+
+// ─── Fused DPM-Solver++ 2M sampler step (FP16) ─────────────────────────────
+//
+// Multistep, ε-prediction. The caller maintains a running x0 cache and
+// computes the three linear-combination coefficients host-side from the
+// scheduler's σ / log-SNR schedule. The kernel reconstructs
+//   x0_t   = x_t - sigma_t * eps_pred
+//   x_prev = c_xt * x_t + c_x0t * x0_t + c_x0prev * x0_prev
+//   x0_out = x0_t            (caller copies into x0_prev for the next step)
+//
+// Coefficient derivation (k-diffusion / DPM++ 2M, ε-prediction, α≡1):
+//   h_last = lambda_t - lambda_last,  h = lambda_next - lambda_t,  r = h_last/h
+//   D_t    = (1 + 1/(2r)) * x0_t - (1/(2r)) * x0_prev
+//   x_prev = (sigma_next/sigma_t) * x_t - (exp(-h) - 1) * D_t
+// →  c_xt     = sigma_next / sigma_t
+//    c_x0t    = -(exp(-h) - 1) * (1 + 1/(2r))
+//    c_x0prev = -(exp(-h) - 1) * (-1/(2r))
+//
+// First step (no x0_prev cached): use euler_step_gpu instead.
+// All tensors FP16, same shape; x_prev and x0_out resized to match.
+void dpmpp_2m_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
+                       const GpuTensor& x0_prev,
+                       float sigma_t,
+                       float c_xt, float c_x0t, float c_x0prev,
+                       GpuTensor& x_prev, GpuTensor& x0_out);
+
+// ─── Sinusoidal timestep embedding (FP32) ──────────────────────────────────
+//
+// Matches diffusers' get_timestep_embedding with flip_sin_to_cos=True,
+// downscale_freq_shift=0 — the SD / SDXL default.
+//   half      = dim / 2
+//   freqs[j]  = exp(-log(max_period) * j / half)        for j in [0, half)
+//   Y[i, 0:half]      = cos(timesteps[i] * freqs[:])
+//   Y[i, half:2*half] = sin(timesteps[i] * freqs[:])
+//   if dim is odd: Y[i, dim-1] = 0
+// Used for the diffusion timestep itself and for SDXL's added-cond
+// micro-conditioning vector (original_size / crop_top_left / target_size).
+//
+//   timesteps: (N, 1) FP32
+//   Y:         (N, dim) FP32 — resized as needed.
+void timestep_embedding_gpu(const GpuTensor& timesteps,
+                            int dim, float max_period,
+                            GpuTensor& Y);
+
 // ─── INT8 weight-only quantisation (W8A16) ─────────────────────────────────
 
 // Host helper: quantise an FP16 weight matrix to per-output-row symmetric

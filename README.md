@@ -2,7 +2,7 @@
 
 GPU tensor + ops library. CUDA and Metal backends, identical op signatures, flat `brotensor::` namespace.
 
-Forward + backward primitives for dense layers, elementwise activations, softmax, layernorm/RMSNorm, attention (single + multi-head + flash), embedding lookup, concat/split, SGD + Adam, MSE + cross-entropy, plus batched inference variants. FP16 storage tag on `GpuTensor` plus a diffusion-oriented op set (conv2d, GroupNorm, SiLU/GELU, 2x up/downsample, cross-attention, fused DDIM step) for downstream brodiff inference, and LLM-oriented primitives (RoPE, RMSNorm, SwiGLU, KV-cache append + causal flash-decode) for autoregressive inference. INT8 weight-only matmul/conv2d (W8A16) for memory-bound deployment, and thread-local CUDA stream control for pipelined inference.
+Forward + backward primitives for dense layers, elementwise activations, softmax, layernorm/RMSNorm, attention (single + multi-head + flash), embedding lookup, concat/split, SGD + Adam, MSE + cross-entropy, plus batched inference variants. FP16 storage tag on `GpuTensor` plus a diffusion-oriented op set (conv2d, GroupNorm, SiLU/GELU, 2x up/downsample, cross-attention, fused DDIM/Euler/DPM++ 2M sampler steps, sinusoidal timestep embedding) for downstream brodiff inference (SD 1.5 + SDXL), and LLM-oriented primitives (RoPE, RMSNorm, SwiGLU, KV-cache append + causal flash-decode) for autoregressive inference. INT8 weight-only matmul/conv2d (W8A16) for memory-bound deployment, and thread-local CUDA stream control for pipelined inference.
 
 Built as a standalone sibling so multiple downstream projects (brogameagent, future brodiff, …) share one GPU layer.
 
@@ -80,6 +80,9 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 | sum_rows / sum_cols | ✓ | n/a | ✓ | reductions along rows/cols; dtype-dispatched FP32 + FP16 |
 | argmax_rows | ✓ | n/a | ✓ | per-row argmax; FP32/FP16 input, FP32 indices |
 | ddim_step | — | n/a | ✓ | fused DDIM sampler step over FP16 latents; FP32 internal math |
+| euler_step | — | n/a | ✓ | fused Euler-discrete step (ε-prediction, σ convention; matches diffusers `EulerDiscreteScheduler`) |
+| dpmpp_2m_step | — | n/a | ✓ | fused DPM-Solver++ 2M multistep update; caller supplies linear-combo coefficients and x0 cache. First step falls back to `euler_step` |
+| timestep_embedding | ✓ | n/a | — | sinusoidal embedding (FP32) for diffusion timesteps and SDXL added-cond micro-conditioning; diffusers default (flip_sin_to_cos=True) |
 | copy_d2d | ✓ | n/a | ✓ | flat-buffer device-to-device chunk copy |
 | build_causal_mask_row | n/a | n/a | ✓ | length-L FP32 mask, CLIP text |
 | sgd / adam | ✓ | n/a | — | optimizer steps |
