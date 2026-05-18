@@ -20,6 +20,13 @@
 
 namespace brotensor {
 
+namespace linear_int8w_wmma_internal {
+bool launch_linear_int8w_fp16_wmma(
+        const __half* X, const int8_t* W, const float* scales,
+        const __half* bias, __half* Y,
+        int B, int M, int K);
+}
+
 namespace conv2d_int8w_wmma_internal {
 bool launch_conv2d_int8w_implicit_gemm_wmma(
         const __half* X, const int8_t* W_int8, const float* scales,
@@ -311,6 +318,18 @@ void linear_forward_batched_int8w_fp16_gpu(const GpuTensor& W_int8,
     const __half* b_p = (bias && bias->size() > 0)
         ? reinterpret_cast<const __half*>(bias->data_fp16())
         : nullptr;
+
+    // WMMA fast path; falls through to the tiled kernel on miss.
+    if (linear_int8w_wmma_internal::launch_linear_int8w_fp16_wmma(
+            reinterpret_cast<const __half*>(X_BD.data_fp16()),
+            reinterpret_cast<const int8_t*>(W_int8.data),
+            scales.data,
+            b_p,
+            reinterpret_cast<__half*>(Y_BD.data_fp16()),
+            B, out_dim, in_dim)) {
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     dim3 block(MM_TILE, MM_TILE);
     dim3 grid((out_dim + MM_TILE - 1) / MM_TILE, (B + MM_TILE - 1) / MM_TILE);

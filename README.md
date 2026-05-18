@@ -39,7 +39,7 @@ Exactly one backend must be selected at configure time; they are mutually exclus
 |---|---|---|---|---|
 | matmul | ✓ | ✓ | ✓ | plain row-major `A @ B` (no bias); dtype-dispatched FP32 + FP16 (FP32 accumulation); backward returns dA/dB (caller zeros, op accumulates; FP16 uses FP32 scratch + fold) |
 | matmul_int8w_fp16 | — | — | ✓ | W8A16 weight-only matmul; INT8 weights + per-row FP32 scales, FP16 acts, FP32 accum |
-| linear_batched_int8w_fp16 | — | — | ✓ | W8A16 batched linear in (B,in)→(B,out) layout; fused FP16 bias add; mirrors `linear_forward_batched_fp16_gpu` shape contract |
+| linear_batched_int8w_fp16 | — | — | ✓ | W8A16 batched linear in (B,in)→(B,out) layout; fused FP16 bias add; mirrors `linear_forward_batched_fp16_gpu` shape contract; WMMA fast path for K%8==0 (FP16 tensor cores with INT8→FP16 dequant on shared-mem load), tiled fallback otherwise |
 | linear | ✓ | ✓ | ✓ | dense; FP32 single + batched (fwd/bwd), FP16 batched-inference and batched-train backward (dtype-dispatched, FP32 scratch + fold) |
 | relu / tanh / sigmoid | ✓ | ✓ | — | elementwise; relu/tanh also have batched fwd+bwd |
 | silu / gelu | ✓ | ✓ | ✓ | tanh-approx GELU; dtype-dispatched (FP16 bwd accumulates in FP32) |
