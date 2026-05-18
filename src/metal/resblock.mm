@@ -472,9 +472,14 @@ void resblock_forward_gpu(const GpuTensor& X,
     }
     if (N == 0 || spatial == 0) return;
 
-    GpuTensor h1(N, C_in  * spatial, Dtype::FP16);
-    GpuTensor h2(N, C_out * spatial, Dtype::FP16);
-    GpuTensor h3(N, C_out * spatial, Dtype::FP16);
+    // Reuse scratch across calls. SD1.5 invokes ~30 resblocks per UNet step,
+    // so a fresh allocation per call burns Metal heap traffic; GpuTensor::resize
+    // is a no-op when shape/dtype already match (tensor.mm:180). Inference is
+    // single-threaded against the device, so thread_local lifetime is fine.
+    thread_local GpuTensor h1, h2, h3;
+    h1.resize(N, C_in  * spatial, Dtype::FP16);
+    h2.resize(N, C_out * spatial, Dtype::FP16);
+    h3.resize(N, C_out * spatial, Dtype::FP16);
 
     launch_gn_silu(X, gamma1, beta1, h1, N, C_in, spatial,
                    C_in / num_groups, eps);
@@ -500,7 +505,7 @@ void resblock_forward_gpu(const GpuTensor& X,
     launch_gn_silu(h2, gamma2, beta2, h3, N, C_out, spatial,
                    C_out / num_groups, eps);
 
-    GpuTensor skip_scratch;
+    thread_local GpuTensor skip_scratch;
     const GpuTensor* skip_ptr = nullptr;
     if (Wskip == nullptr) {
         skip_ptr = &X;
