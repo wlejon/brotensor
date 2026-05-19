@@ -1,5 +1,10 @@
-# Minimal smoke tests for brotensor. Deep CPU↔GPU parity coverage lives in
-# brogameagent's tests since those need a CPU reference implementation.
+# Test layout:
+#   * test_cpu_ops.cpp        — standalone CPU op coverage. Always built.
+#   * test_cpu_gpu_parity.cpp — CPU↔GPU parity. Only built when a GPU backend
+#                                is enabled.
+#   * everything else         — GPU smoke tests over CUDA / Metal kernels;
+#                                they instantiate GpuTensor / call *_gpu ops
+#                                and only build when a GPU backend is on.
 
 function(brotensor_add_executable name)
     add_executable(${name} ${ARGN})
@@ -19,42 +24,56 @@ function(brotensor_add_test name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-brotensor_add_test(brotensor_test test_tensor.cpp)
-brotensor_add_test(brotensor_test_conv2d test_conv2d.cpp)
-brotensor_add_test(brotensor_test_group_norm test_group_norm.cpp)
-brotensor_add_test(brotensor_test_activations test_activations.cpp)
-brotensor_add_test(brotensor_test_resample test_resample.cpp)
-brotensor_add_test(brotensor_test_cross_attention test_cross_attention.cpp)
-brotensor_add_test(brotensor_test_cross_attention_with_attn test_cross_attention_with_attn.cpp)
-brotensor_add_test(brotensor_test_attention_moments test_attention_moments.cpp)
-brotensor_add_test(brotensor_test_fp16_basics test_fp16_basics.cpp)
-brotensor_add_test(brotensor_test_flash_attention test_flash_attention.cpp)
-brotensor_add_test(brotensor_test_resblock test_resblock.cpp)
-brotensor_add_test(brotensor_test_resblock_int8w test_resblock_int8w.cpp)
-brotensor_add_test(brotensor_test_diffusion_primitives test_diffusion_primitives.cpp)
-brotensor_add_test(brotensor_test_transpose test_transpose.cpp)
-brotensor_add_test(brotensor_test_large_elementwise test_large_elementwise.cpp)
-brotensor_add_test(brotensor_test_matmul test_matmul.cpp)
-brotensor_add_test(brotensor_test_matmul_backward test_matmul_backward.cpp)
-brotensor_add_test(brotensor_test_flash_attention_backward test_flash_attention_backward.cpp)
-brotensor_add_test(brotensor_test_rope test_rope.cpp)
-brotensor_add_test(brotensor_test_rms_norm test_rms_norm.cpp)
-brotensor_add_test(brotensor_test_swiglu test_swiglu.cpp)
-brotensor_add_test(brotensor_test_kv_cache test_kv_cache.cpp)
-brotensor_add_test(brotensor_test_public_reductions test_public_reductions.cpp)
-brotensor_add_test(brotensor_test_ddim_step test_ddim_step.cpp)
-brotensor_add_test(brotensor_test_sdxl_schedulers test_sdxl_schedulers.cpp)
-brotensor_add_test(brotensor_test_int8_quant test_int8_quant.cpp)
-brotensor_add_test(brotensor_test_int8_conv_wmma test_int8_conv_wmma.cpp)
-brotensor_add_test(brotensor_test_int8_linear_wmma test_int8_linear_wmma.cpp)
-brotensor_add_test(brotensor_test_int8_attention test_int8_attention.cpp)
-if(BROTENSOR_WITH_CUDA)
-    brotensor_add_test(brotensor_test_streams test_streams.cpp)
+# --- CPU tests (always built) ---
+brotensor_add_test(brotensor_test_cpu_ops test_cpu_ops.cpp)
+
+# --- GPU tests (CUDA or Metal) ---
+set(BROTENSOR_HAS_GPU OFF)
+if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL)
+    set(BROTENSOR_HAS_GPU ON)
 endif()
 
-# Diffusion micro-benchmark. Built but not added to ctest — invoke
-# manually from the build dir (./tests/Release/brotensor_bench_diffusion).
-# CUDA-only: it uses cudaEvent_t for timing.
-if(BROTENSOR_WITH_CUDA)
-    brotensor_add_executable(brotensor_bench_diffusion bench_diffusion.cpp)
+if(BROTENSOR_HAS_GPU)
+    brotensor_add_test(brotensor_test test_tensor.cpp)
+    brotensor_add_test(brotensor_test_conv2d test_conv2d.cpp)
+    brotensor_add_test(brotensor_test_group_norm test_group_norm.cpp)
+    brotensor_add_test(brotensor_test_activations test_activations.cpp)
+    brotensor_add_test(brotensor_test_resample test_resample.cpp)
+    brotensor_add_test(brotensor_test_cross_attention test_cross_attention.cpp)
+    brotensor_add_test(brotensor_test_cross_attention_with_attn test_cross_attention_with_attn.cpp)
+    brotensor_add_test(brotensor_test_attention_moments test_attention_moments.cpp)
+    brotensor_add_test(brotensor_test_fp16_basics test_fp16_basics.cpp)
+    brotensor_add_test(brotensor_test_flash_attention test_flash_attention.cpp)
+    brotensor_add_test(brotensor_test_resblock test_resblock.cpp)
+    brotensor_add_test(brotensor_test_resblock_int8w test_resblock_int8w.cpp)
+    brotensor_add_test(brotensor_test_diffusion_primitives test_diffusion_primitives.cpp)
+    brotensor_add_test(brotensor_test_transpose test_transpose.cpp)
+    brotensor_add_test(brotensor_test_large_elementwise test_large_elementwise.cpp)
+    brotensor_add_test(brotensor_test_matmul test_matmul.cpp)
+    brotensor_add_test(brotensor_test_matmul_backward test_matmul_backward.cpp)
+    brotensor_add_test(brotensor_test_flash_attention_backward test_flash_attention_backward.cpp)
+    brotensor_add_test(brotensor_test_rope test_rope.cpp)
+    brotensor_add_test(brotensor_test_rms_norm test_rms_norm.cpp)
+    brotensor_add_test(brotensor_test_swiglu test_swiglu.cpp)
+    brotensor_add_test(brotensor_test_kv_cache test_kv_cache.cpp)
+    brotensor_add_test(brotensor_test_public_reductions test_public_reductions.cpp)
+    brotensor_add_test(brotensor_test_ddim_step test_ddim_step.cpp)
+    brotensor_add_test(brotensor_test_sdxl_schedulers test_sdxl_schedulers.cpp)
+    brotensor_add_test(brotensor_test_int8_quant test_int8_quant.cpp)
+    brotensor_add_test(brotensor_test_int8_conv_wmma test_int8_conv_wmma.cpp)
+    brotensor_add_test(brotensor_test_int8_linear_wmma test_int8_linear_wmma.cpp)
+    brotensor_add_test(brotensor_test_int8_attention test_int8_attention.cpp)
+    if(BROTENSOR_WITH_CUDA)
+        brotensor_add_test(brotensor_test_streams test_streams.cpp)
+    endif()
+
+    # CPU↔GPU parity (GPU-only).
+    brotensor_add_test(brotensor_test_cpu_gpu_parity test_cpu_gpu_parity.cpp)
+
+    # Diffusion micro-benchmark. Built but not added to ctest — invoke
+    # manually from the build dir (./tests/Release/brotensor_bench_diffusion).
+    # CUDA-only: it uses cudaEvent_t for timing.
+    if(BROTENSOR_WITH_CUDA)
+        brotensor_add_executable(brotensor_bench_diffusion bench_diffusion.cpp)
+    endif()
 endif()
