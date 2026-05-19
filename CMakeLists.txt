@@ -149,6 +149,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/group_norm.mm
         src/metal/resample.mm
         src/metal/cross_attention.mm
+        src/metal/cross_attention_with_attn.mm
+        src/metal/attention_moments.mm
         src/metal/flash_attention.mm
         src/metal/flash_attention_backward.mm
         src/metal/resblock.mm
@@ -190,6 +192,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/group_norm.mm
         src/metal/resample.mm
         src/metal/cross_attention.mm
+        src/metal/cross_attention_with_attn.mm
+        src/metal/attention_moments.mm
         src/metal/flash_attention.mm
         src/metal/flash_attention_backward.mm
         src/metal/resblock.mm

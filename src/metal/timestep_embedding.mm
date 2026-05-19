@@ -35,9 +35,9 @@ kernel void k_timestep_embedding(device const float* ts [[buffer(0)]],
     uint j = gid - i * dim;
     if (j >= 2u * half_d) { Y[gid] = 0.0f; return; }
     uint k = j < half_d ? j : (j - half_d);
-    float freq = exp(-log_mp * float(k) / float(half_d));
+    float freq = precise::exp(-log_mp * float(k) / float(half_d));
     float arg  = ts[i] * freq;
-    Y[gid] = j < half_d ? cos(arg) : sin(arg);
+    Y[gid] = j < half_d ? precise::cos(arg) : precise::sin(arg);
 }
 )msl";
 
