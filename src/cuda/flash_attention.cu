@@ -94,6 +94,11 @@ __global__ void scale_mask_softmax_rows_kernel(__half* __restrict__ S,
     }
     const float rmax = ssm[0];
     const bool empty = (rmax <= -1e29f);
+    // All threads must finish reading ssm[0] before any thread writes ssm[tid]
+    // below; otherwise warps that race ahead clobber ssm[0] with local_sum
+    // before slower warps load rmax (caught by compute-sanitizer racecheck,
+    // manifested as cross-process non-determinism in cross-attn outputs).
+    __syncthreads();
 
     // 2. exponentiate, accumulate sum.
     float local_sum = 0.0f;
