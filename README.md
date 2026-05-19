@@ -1,39 +1,63 @@
 # brotensor
 
-GPU tensor + ops library. CUDA and Metal backends, identical op signatures, flat `brotensor::` namespace.
+Tensor + ops library. CPU backend always built; CUDA and Metal are optional, additive GPU backends with identical op signatures and a flat `brotensor::` namespace.
 
 Forward + backward primitives for dense layers, elementwise activations, softmax, layernorm/RMSNorm, attention (single + multi-head + flash), embedding lookup, concat/split, SGD + Adam, MSE + cross-entropy, plus batched inference variants. FP16 storage tag on `GpuTensor` plus a diffusion-oriented op set (conv2d, GroupNorm, SiLU/GELU, 2x up/downsample, cross-attention, fused DDIM/Euler/DPM++ 2M sampler steps, sinusoidal timestep embedding) for downstream brodiff inference (SD 1.5 + SDXL), and LLM-oriented primitives (RoPE, RMSNorm, SwiGLU, KV-cache append + causal flash-decode) for autoregressive inference. INT8 weight-only matmul/conv2d (W8A16) for memory-bound deployment, and thread-local CUDA stream control for pipelined inference.
 
-Built as a standalone sibling so multiple downstream projects (brogameagent, future brodiff, …) share one GPU layer.
+CPU coverage is the dense / activation / loss subset — what `brogameagent`'s hand-crafted ExIt circuits use as a default code path. CPU ops are FP32-only, scalar / autovectorize-friendly loops, declared in `<brotensor/ops_cpu.h>` with a `_cpu` suffix; GPU ops are declared in `<brotensor/ops.h>` with a `_gpu` suffix. The host `brotensor::Tensor` and the device `brotensor::GpuTensor` are two distinct types — overload-free dispatch, no runtime device tag on the tensor itself.
+
+Built as a standalone sibling so multiple downstream projects (brogameagent, future brodiff, …) share one tensor layer.
 
 ## Build
 
 ```bash
-# CUDA (NVIDIA, any OS)
+# CPU-only (any OS)
+cmake -B build
+cmake --build build --config Release
+
+# CPU + CUDA (NVIDIA, any OS)
 cmake -B build -DBROTENSOR_WITH_CUDA=ON
 cmake --build build --config Release
 
-# Metal (Apple)
+# CPU + Metal (Apple)
 cmake -B build -DBROTENSOR_WITH_METAL=ON
 cmake --build build --config Release
 ```
 
-Exactly one backend must be selected at configure time; they are mutually exclusive.
+CPU is always built. CUDA and Metal are additive and mutually exclusive — at most one GPU backend at a time.
 
 ## Namespace + defines
 
 | Symbol | Meaning |
 |---|---|
-| `brotensor::GpuTensor` | Device-resident (rows, cols) float32 tensor, move-only |
+| `brotensor::Tensor` | Host (rows, cols) float32 tensor — `std::vector<float>`-backed |
+| `brotensor::GpuTensor` | Device-resident (rows, cols) tensor with FP32/FP16/INT8 dtype tag, move-only |
+| `brotensor::Device { CPU, GPU }` + `device_require_gpu()` | Device enum for backend-aware layers; `device_require_gpu` throws on a CPU-only build |
 | `brotensor::cuda_init()` / `cuda_sync()` | Backend init / synchronise |
 | `brotensor::cuda_set_stream()` / `cuda_current_stream()` / `cuda_stream_sync()` | Thread-local stream control; hot ops (matmul, fp16 matmul, flash_attention causal, conv2d_forward direct) launch on the current stream. Metal: no-op for source compat. |
-| `brotensor::Dtype::FP32 / FP16 / INT8` | Tensor dtype tag; INT8 used for W8A16 weight-only quant |
-| `brotensor::*_forward_gpu` / `*_backward_gpu` | Op primitives (see `include/brotensor/ops.h`) |
-| `BROTENSOR_HAS_CUDA` / `BROTENSOR_HAS_METAL` | Backend identifier defines |
-| `BROTENSOR_HAS_GPU` | Umbrella define (true if either backend is on) |
+| `brotensor::Dtype::FP32 / FP16 / INT8` | GpuTensor dtype tag; INT8 used for W8A16 weight-only quant |
+| `brotensor::*_forward_cpu` / `*_backward_cpu` | CPU op primitives over `Tensor` (see `include/brotensor/ops_cpu.h`) |
+| `brotensor::*_forward_gpu` / `*_backward_gpu` | GPU op primitives over `GpuTensor` (see `include/brotensor/ops.h`) |
+| `brotensor::upload(t, gt)` / `download(gt, t)` | Host↔device transfer overloads; raw `(float*, rows, cols)` form also available |
+| `BROTENSOR_HAS_CUDA` / `BROTENSOR_HAS_METAL` | GPU backend identifier defines |
+| `BROTENSOR_HAS_GPU` | Umbrella define (true if either GPU backend is on) |
 | `BROTENSOR_CUDA_CHECK(expr)` | Error-check macro for CUDA calls |
 
-## Op coverage
+## CPU op coverage
+
+Scalar FP32 over `brotensor::Tensor`, declared in `<brotensor/ops_cpu.h>`. Suffixed `_cpu`. No FP16 / INT8 / batched variants on the CPU side — the GPU surface is the place for those.
+
+| Op | fwd | bwd | Notes |
+|---|---|---|---|
+| `linear` | ✓ | ✓ | `y = W x + b` (W: out×in, x: in, b: out); backward accumulates dW/dB (caller zeros) |
+| `relu` / `tanh` / `sigmoid` | ✓ | ✓ | elementwise; tanh/sigmoid backward takes cached `y` |
+| `softmax` | ✓ | ✓ | numerically-stable, optional legal-action mask |
+| `softmax_xent` / `softmax_xent_segment` | ✓ | n/a | fused softmax + cross-entropy; gradient collapses to `(p − t)`; segment variant takes raw pointers for slicing larger logit buffers |
+| `mse_scalar` | ✓ | n/a | scalar value-head loss |
+| `add_inplace` / `add_scalar_inplace` | ✓ | n/a | elementwise / broadcast scalar |
+| `xavier_init` | n/a | n/a | deterministic uniform init via splitmix64 RNG state |
+
+## GPU op coverage
 
 | Op | FP32 fwd | FP32 bwd | FP16 fwd | Notes |
 |---|---|---|---|---|
