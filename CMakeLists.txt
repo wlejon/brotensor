@@ -16,21 +16,19 @@ if(MSVC)
     endif()
 endif()
 
-# --- GPU backends (mutually exclusive) ---
+# --- Backends ---
 #
-# brotensor is a GPU-only tensor + ops library. Exactly one backend must be
-# selected; flat brotensor:: namespace and identical op signatures across
-# backends. Consumer code keys off the umbrella BROTENSOR_HAS_GPU define;
-# backend-specific impl keys off BROTENSOR_HAS_CUDA / BROTENSOR_HAS_METAL.
+# brotensor builds a CPU backend unconditionally. A GPU backend is optional
+# and additive; the two GPU backends (CUDA, Metal) are mutually exclusive.
+# Consumer code keys off the umbrella BROTENSOR_HAS_GPU define; backend-
+# specific impl keys off BROTENSOR_HAS_CUDA / BROTENSOR_HAS_METAL. CPU is
+# always available — no opt-out — and is the natural fallback / default
+# code path for downstream libraries.
 option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
 option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
 if(BROTENSOR_WITH_CUDA AND BROTENSOR_WITH_METAL)
     message(FATAL_ERROR
         "BROTENSOR_WITH_CUDA and BROTENSOR_WITH_METAL are mutually exclusive.")
-endif()
-if(NOT BROTENSOR_WITH_CUDA AND NOT BROTENSOR_WITH_METAL)
-    message(FATAL_ERROR
-        "brotensor requires one of: -DBROTENSOR_WITH_CUDA=ON or -DBROTENSOR_WITH_METAL=ON")
 endif()
 
 if(BROTENSOR_WITH_CUDA)
@@ -70,6 +68,11 @@ else()
         $<$<COMPILE_LANGUAGE:CXX>:-Wall>
         $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
 endif()
+
+# --- CPU backend (always built) ---
+target_sources(brotensor PRIVATE
+    src/cpu/ops.cpp
+)
 
 if(BROTENSOR_WITH_CUDA)
     target_sources(brotensor PRIVATE
