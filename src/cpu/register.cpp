@@ -150,6 +150,45 @@ void softmax_xent_fused_batched(const ::brotensor::Tensor& logits_BL,
                                 ::brotensor::Tensor& dLogits_BL,
                                 ::brotensor::Tensor& loss_per_sample);
 
+// ── CHUNK 1 — elementwise.cpp / loss.cpp / embedding.cpp / concat.cpp /
+//    public_reductions.cpp / layernorm_inference.cpp ──
+void clamp(::brotensor::Tensor& y, float lo, float hi);
+void mul_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x);
+float mse_vec_forward(const ::brotensor::Tensor& pred,
+                      const ::brotensor::Tensor& target);
+void mse_vec_backward(const ::brotensor::Tensor& pred,
+                      const ::brotensor::Tensor& target,
+                      ::brotensor::Tensor& dPred);
+float softmax_xent_fused(const ::brotensor::Tensor& logits,
+                         const ::brotensor::Tensor& target,
+                         const float* d_mask,
+                         ::brotensor::Tensor& probs,
+                         ::brotensor::Tensor& dLogits);
+void embedding_lookup_forward(const ::brotensor::Tensor& table,
+                              const int32_t* d_idx, int B,
+                              ::brotensor::Tensor& out);
+void embedding_lookup_backward(const ::brotensor::Tensor& dOut,
+                               const int32_t* d_idx, int B,
+                               ::brotensor::Tensor& dTable);
+void concat_batched_rows(const std::vector<const ::brotensor::Tensor*>& parts,
+                         ::brotensor::Tensor& out);
+void concat_nchw_channels(const std::vector<const ::brotensor::Tensor*>& parts,
+                          int N, int H, int W,
+                          const std::vector<int>& C_per_part,
+                          ::brotensor::Tensor& out);
+void concat_nchw_channels_backward(const ::brotensor::Tensor& dY,
+                                   int N, int H, int W,
+                                   const std::vector<int>& C_per_part,
+                                   const std::vector<::brotensor::Tensor*>& parts);
+void sum_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
+void sum_cols(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
+void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx);
+void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
+                                         const ::brotensor::Tensor& gamma,
+                                         const ::brotensor::Tensor& beta,
+                                         ::brotensor::Tensor& Y_RD, float eps);
+void build_causal_mask_row(int L, int q, ::brotensor::Tensor& mask);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -202,6 +241,25 @@ struct CpuStaticRegistrar {
         ops.masked_mean_pool_backward = &detail::cpu::masked_mean_pool_backward;
         ops.build_slot_mask           = &detail::cpu::build_slot_mask;
         ops.copy_d2d                  = &detail::cpu::copy_d2d;
+
+        // ── CHUNK 1 ──
+        ops.clamp                      = &detail::cpu::clamp;
+        ops.mul_inplace                = &detail::cpu::mul_inplace;
+        ops.mse_vec_forward            = &detail::cpu::mse_vec_forward;
+        ops.mse_vec_backward           = &detail::cpu::mse_vec_backward;
+        ops.softmax_xent_fused         = &detail::cpu::softmax_xent_fused;
+        ops.embedding_lookup_forward   = &detail::cpu::embedding_lookup_forward;
+        ops.embedding_lookup_backward  = &detail::cpu::embedding_lookup_backward;
+        ops.concat_batched_rows        = &detail::cpu::concat_batched_rows;
+        ops.concat_nchw_channels       = &detail::cpu::concat_nchw_channels;
+        ops.concat_nchw_channels_backward
+                                       = &detail::cpu::concat_nchw_channels_backward;
+        ops.sum_rows                   = &detail::cpu::sum_rows;
+        ops.sum_cols                   = &detail::cpu::sum_cols;
+        ops.argmax_rows                = &detail::cpu::argmax_rows;
+        ops.layernorm_forward_inference_batched
+                                       = &detail::cpu::layernorm_forward_inference_batched;
+        ops.build_causal_mask_row      = &detail::cpu::build_causal_mask_row;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());
