@@ -189,6 +189,49 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
                                          ::brotensor::Tensor& Y_RD, float eps);
 void build_causal_mask_row(int L, int q, ::brotensor::Tensor& mask);
 
+// ── CHUNK 2 — activations.cpp / geglu.cpp / swiglu.cpp / matmul.cpp /
+//    rope.cpp / rms_norm.cpp ──
+void silu_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void silu_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
+                   ::brotensor::Tensor& dX);
+void gelu_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void gelu_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
+                   ::brotensor::Tensor& dX);
+void gelu_exact_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void gelu_exact_backward(const ::brotensor::Tensor& x,
+                         const ::brotensor::Tensor& dY,
+                         ::brotensor::Tensor& dX);
+void quick_gelu_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void quick_gelu_backward(const ::brotensor::Tensor& x,
+                         const ::brotensor::Tensor& dY,
+                         ::brotensor::Tensor& dX);
+void geglu_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
+void geglu_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& dY,
+                    ::brotensor::Tensor& dX);
+void geglu_exact_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
+void geglu_exact_backward(const ::brotensor::Tensor& X,
+                          const ::brotensor::Tensor& dY,
+                          ::brotensor::Tensor& dX);
+void swiglu_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
+void swiglu_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& dY,
+                     ::brotensor::Tensor& dX);
+void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
+            ::brotensor::Tensor& C);
+void matmul_backward(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
+                     const ::brotensor::Tensor& dC,
+                     ::brotensor::Tensor& dA, ::brotensor::Tensor& dB);
+void rope_forward(const ::brotensor::Tensor& X, int head_dim, int num_heads,
+                  int seq_offset, float theta_base, ::brotensor::Tensor& Y);
+void rope_backward(const ::brotensor::Tensor& dY, int head_dim, int num_heads,
+                   int seq_offset, float theta_base, ::brotensor::Tensor& dX);
+void rms_norm_forward(const ::brotensor::Tensor& X,
+                      const ::brotensor::Tensor& gamma,
+                      float eps, ::brotensor::Tensor& Y);
+void rms_norm_backward(const ::brotensor::Tensor& X,
+                       const ::brotensor::Tensor& gamma,
+                       const ::brotensor::Tensor& dY, float eps,
+                       ::brotensor::Tensor& dX, ::brotensor::Tensor& dGamma);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -260,6 +303,28 @@ struct CpuStaticRegistrar {
         ops.layernorm_forward_inference_batched
                                        = &detail::cpu::layernorm_forward_inference_batched;
         ops.build_causal_mask_row      = &detail::cpu::build_causal_mask_row;
+
+        // ── CHUNK 2 ──
+        ops.silu_forward               = &detail::cpu::silu_forward;
+        ops.silu_backward              = &detail::cpu::silu_backward;
+        ops.gelu_forward               = &detail::cpu::gelu_forward;
+        ops.gelu_backward              = &detail::cpu::gelu_backward;
+        ops.gelu_exact_forward         = &detail::cpu::gelu_exact_forward;
+        ops.gelu_exact_backward        = &detail::cpu::gelu_exact_backward;
+        ops.quick_gelu_forward         = &detail::cpu::quick_gelu_forward;
+        ops.quick_gelu_backward        = &detail::cpu::quick_gelu_backward;
+        ops.geglu_forward              = &detail::cpu::geglu_forward;
+        ops.geglu_backward             = &detail::cpu::geglu_backward;
+        ops.geglu_exact_forward        = &detail::cpu::geglu_exact_forward;
+        ops.geglu_exact_backward       = &detail::cpu::geglu_exact_backward;
+        ops.swiglu_forward             = &detail::cpu::swiglu_forward;
+        ops.swiglu_backward            = &detail::cpu::swiglu_backward;
+        ops.matmul                     = &detail::cpu::matmul;
+        ops.matmul_backward            = &detail::cpu::matmul_backward;
+        ops.rope_forward               = &detail::cpu::rope_forward;
+        ops.rope_backward              = &detail::cpu::rope_backward;
+        ops.rms_norm_forward           = &detail::cpu::rms_norm_forward;
+        ops.rms_norm_backward          = &detail::cpu::rms_norm_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

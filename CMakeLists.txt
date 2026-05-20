@@ -82,6 +82,12 @@ add_library(brotensor_cpu STATIC
     src/cpu/concat.cpp
     src/cpu/public_reductions.cpp
     src/cpu/layernorm_inference.cpp
+    src/cpu/activations.cpp
+    src/cpu/geglu.cpp
+    src/cpu/swiglu.cpp
+    src/cpu/matmul.cpp
+    src/cpu/rope.cpp
+    src/cpu/rms_norm.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)
