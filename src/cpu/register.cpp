@@ -400,6 +400,123 @@ void cross_attention_backward(const ::brotensor::Tensor& dO,
                               ::brotensor::Tensor& dWv,
                               ::brotensor::Tensor& dWo);
 
+// ── CHUNK 6 — flash_attention.cpp / self_attention_inference.cpp /
+//    resblock.cpp ──
+void flash_attention_forward(const ::brotensor::Tensor& Q,
+                             const ::brotensor::Tensor& K,
+                             const ::brotensor::Tensor& V,
+                             const float* d_mask, int num_heads, bool causal,
+                             ::brotensor::Tensor& O);
+void flash_attention_qkvo_forward(const ::brotensor::Tensor& X,
+                                  const ::brotensor::Tensor* Ctx,
+                                  const ::brotensor::Tensor& Wq,
+                                  const ::brotensor::Tensor* bq,
+                                  const ::brotensor::Tensor& Wk,
+                                  const ::brotensor::Tensor* bk,
+                                  const ::brotensor::Tensor& Wv,
+                                  const ::brotensor::Tensor* bv,
+                                  const ::brotensor::Tensor& Wo,
+                                  const ::brotensor::Tensor* bo,
+                                  const float* d_mask, int num_heads,
+                                  bool causal, ::brotensor::Tensor& O);
+void flash_attention_qkvo_backward(const ::brotensor::Tensor& X,
+                                   const ::brotensor::Tensor* Ctx,
+                                   const ::brotensor::Tensor& Wq,
+                                   const ::brotensor::Tensor* bq,
+                                   const ::brotensor::Tensor& Wk,
+                                   const ::brotensor::Tensor* bk,
+                                   const ::brotensor::Tensor& Wv,
+                                   const ::brotensor::Tensor* bv,
+                                   const ::brotensor::Tensor& Wo,
+                                   const ::brotensor::Tensor* bo,
+                                   const float* d_mask, int num_heads,
+                                   bool causal,
+                                   const ::brotensor::Tensor& dO,
+                                   ::brotensor::Tensor& dX,
+                                   ::brotensor::Tensor* dCtx,
+                                   ::brotensor::Tensor& dWq,
+                                   ::brotensor::Tensor* dbq,
+                                   ::brotensor::Tensor& dWk,
+                                   ::brotensor::Tensor* dbk,
+                                   ::brotensor::Tensor& dWv,
+                                   ::brotensor::Tensor* dbv,
+                                   ::brotensor::Tensor& dWo,
+                                   ::brotensor::Tensor* dbo);
+void flash_attention_backward(const ::brotensor::Tensor& Q,
+                              const ::brotensor::Tensor& K,
+                              const ::brotensor::Tensor& V,
+                              const ::brotensor::Tensor& O,
+                              const ::brotensor::Tensor& dO,
+                              const float* d_mask, int num_heads, bool causal,
+                              ::brotensor::Tensor& dQ,
+                              ::brotensor::Tensor& dK,
+                              ::brotensor::Tensor& dV);
+void flash_attention_project_kv(const ::brotensor::Tensor& ctx,
+                                const ::brotensor::Tensor& Wk,
+                                const ::brotensor::Tensor* bk,
+                                const ::brotensor::Tensor& Wv,
+                                const ::brotensor::Tensor* bv,
+                                ::brotensor::Tensor& K_out,
+                                ::brotensor::Tensor& V_out);
+void flash_attention_q_with_kv_cached_forward(const ::brotensor::Tensor& X,
+                                              const ::brotensor::Tensor& K,
+                                              const ::brotensor::Tensor& V,
+                                              const ::brotensor::Tensor& Wq,
+                                              const ::brotensor::Tensor* bq,
+                                              const ::brotensor::Tensor& Wo,
+                                              const ::brotensor::Tensor* bo,
+                                              const float* d_mask,
+                                              int num_heads, bool causal,
+                                              ::brotensor::Tensor& O);
+void self_attention_forward(const ::brotensor::Tensor& X,
+                            const ::brotensor::Tensor& Wq,
+                            const ::brotensor::Tensor& Wk,
+                            const ::brotensor::Tensor& Wv,
+                            const ::brotensor::Tensor& Wo,
+                            const float* d_mask, int num_heads,
+                            ::brotensor::Tensor& O);
+void resblock_forward(const ::brotensor::Tensor& X,
+                      const ::brotensor::Tensor& gamma1,
+                      const ::brotensor::Tensor& beta1,
+                      const ::brotensor::Tensor& W1,
+                      const ::brotensor::Tensor* b1,
+                      const ::brotensor::Tensor* t_emb_shift,
+                      const ::brotensor::Tensor& gamma2,
+                      const ::brotensor::Tensor& beta2,
+                      const ::brotensor::Tensor& W2,
+                      const ::brotensor::Tensor* b2,
+                      const ::brotensor::Tensor* Wskip,
+                      const ::brotensor::Tensor* bskip,
+                      int N, int C_in, int C_out, int H, int W,
+                      int num_groups, float eps, ::brotensor::Tensor& Y);
+void resblock_backward(const ::brotensor::Tensor& X,
+                       const ::brotensor::Tensor& gamma1,
+                       const ::brotensor::Tensor& beta1,
+                       const ::brotensor::Tensor& W1,
+                       const ::brotensor::Tensor* b1,
+                       const ::brotensor::Tensor* t_emb_shift,
+                       const ::brotensor::Tensor& gamma2,
+                       const ::brotensor::Tensor& beta2,
+                       const ::brotensor::Tensor& W2,
+                       const ::brotensor::Tensor* b2,
+                       const ::brotensor::Tensor* Wskip,
+                       const ::brotensor::Tensor* bskip,
+                       int N, int C_in, int C_out, int H, int W,
+                       int num_groups, float eps,
+                       const ::brotensor::Tensor& dY,
+                       ::brotensor::Tensor& dX,
+                       ::brotensor::Tensor& dGamma1,
+                       ::brotensor::Tensor& dBeta1,
+                       ::brotensor::Tensor& dW1,
+                       ::brotensor::Tensor* db1,
+                       ::brotensor::Tensor* dt_emb_shift,
+                       ::brotensor::Tensor& dGamma2,
+                       ::brotensor::Tensor& dBeta2,
+                       ::brotensor::Tensor& dW2,
+                       ::brotensor::Tensor* db2,
+                       ::brotensor::Tensor* dWskip,
+                       ::brotensor::Tensor* dbskip);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -529,6 +646,19 @@ struct CpuStaticRegistrar {
         ops.cross_attention_forward_train
                                          = &detail::cpu::cross_attention_forward_train;
         ops.cross_attention_backward     = &detail::cpu::cross_attention_backward;
+
+        // ── CHUNK 6 ──
+        ops.flash_attention_forward      = &detail::cpu::flash_attention_forward;
+        ops.flash_attention_qkvo_forward = &detail::cpu::flash_attention_qkvo_forward;
+        ops.flash_attention_qkvo_backward
+                                         = &detail::cpu::flash_attention_qkvo_backward;
+        ops.flash_attention_backward     = &detail::cpu::flash_attention_backward;
+        ops.flash_attention_project_kv   = &detail::cpu::flash_attention_project_kv;
+        ops.flash_attention_q_with_kv_cached_forward
+                                         = &detail::cpu::flash_attention_q_with_kv_cached_forward;
+        ops.self_attention_forward       = &detail::cpu::self_attention_forward;
+        ops.resblock_forward             = &detail::cpu::resblock_forward;
+        ops.resblock_backward            = &detail::cpu::resblock_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

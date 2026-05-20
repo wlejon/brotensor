@@ -97,6 +97,9 @@ add_library(brotensor_cpu STATIC
     src/cpu/cross_attention.cpp
     src/cpu/self_attention.cpp
     src/cpu/attention_moments.cpp
+    src/cpu/flash_attention.cpp
+    src/cpu/self_attention_inference.cpp
+    src/cpu/resblock.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)
