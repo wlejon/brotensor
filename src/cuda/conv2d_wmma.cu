@@ -28,6 +28,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #include <cstdint>
 
@@ -35,6 +36,20 @@ namespace brotensor {
 namespace conv2d_wmma_internal {
 
 using namespace nvcuda;
+
+// Element-type traits so the WMMA kernel can be a single template over both
+// __half and __nv_bfloat16. RTX 4090 (sm_89) supports BF16 WMMA fragments;
+// load_matrix_sync / mma_sync / store_matrix_sync are identical — only the
+// fragment element type and the host-side conversions differ.
+template <typename T> struct wmma_traits;
+template <> struct wmma_traits<__half> {
+    __device__ static __half from_f32(float v)  { return __float2half(v); }
+    __device__ static float   to_f32(__half v)  { return __half2float(v); }
+};
+template <> struct wmma_traits<__nv_bfloat16> {
+    __device__ static __nv_bfloat16 from_f32(float v)         { return __float2bfloat16(v); }
+    __device__ static float         to_f32(__nv_bfloat16 v)   { return __bfloat162float(v); }
+};
 
 static constexpr int WMMA_M = 16;
 static constexpr int WMMA_N = 16;
@@ -58,19 +73,21 @@ static constexpr int LDB_SMEM = BK + 8;
 // kH * kW must be a compile-time constant for index unrolling, so the kernel
 // is templated on (KH, KW, PAD, STRIDE).  For SD1.5 we instantiate KH=KW=3,
 // PAD=1, STRIDE=1 and KH=KW=1, PAD=0, STRIDE=1.
-template <int KH, int KW, int PAD_H, int PAD_W, int STRIDE_H, int STRIDE_W>
+template <typename T,
+          int KH, int KW, int PAD_H, int PAD_W, int STRIDE_H, int STRIDE_W>
 __launch_bounds__(THREADS_PER_CTA)
 __global__ void conv2d_implicit_gemm_wmma_kernel(
-        const __half* __restrict__ X,
-        const __half* __restrict__ Wt,
-        const __half* __restrict__ bias,   // may be null
-        __half* __restrict__ Y,
+        const T* __restrict__ X,
+        const T* __restrict__ Wt,
+        const T* __restrict__ bias,   // may be null
+        T* __restrict__ Y,
         int N, int C_in, int H, int W,
         int C_out, int H_out, int W_out) {
     constexpr int KHW = KH * KW;
+    using TR = wmma_traits<T>;
 
-    __shared__ __half As[BM][LDA_SMEM];
-    __shared__ __half Bs[BN][LDB_SMEM];
+    __shared__ T As[BM][LDA_SMEM];
+    __shared__ T Bs[BN][LDB_SMEM];
 
     const int tid     = threadIdx.x;
     const int warp_id = tid >> 5;
@@ -115,7 +132,7 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
                 const int gk  = k0 + col;                 // global K index
                 const int m_g = block_m + row;            // global output-pixel index
 
-                __half v = __float2half(0.0f);
+                T v = TR::from_f32(0.0f);
                 if (m_g < N * HW_out && gk < K_total) {
                     // Decompose m_g -> (n, oh, ow).
                     const int n     = m_g / HW_out;
@@ -144,9 +161,10 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
         // The int4 fast path requires both K_total and the per-thread gk to be
         // 8-aligned; for conv2d K = C_in*KH*KW which is often NOT a multiple of
         // 8 (e.g. C_in=4, K=4 or C_in=3, KHW=9 → K=27). Pick per-element fallback
-        // unless K_total is 8-aligned.
+        // unless K_total is 8-aligned. int4 carries 8 16-bit elements for both
+        // __half and __nv_bfloat16.
         {
-            constexpr int kHalvesPerLoad = 8;  // int4 = 8 __half
+            constexpr int kHalvesPerLoad = 8;  // int4 = 8 16-bit elements
             constexpr int kTotalHalves   = BN * BK;
             constexpr int kLoadsTotal    = kTotalHalves / kHalvesPerLoad;  // 256
             constexpr int kLoadsPerThr   = kLoadsTotal / THREADS_PER_CTA;  // 2
@@ -162,7 +180,7 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
                 const int grow = block_n + row;                  // oc
                 const int gk   = k0 + gcol;
 
-                __half tmp[kHalvesPerLoad];
+                T tmp[kHalvesPerLoad];
                 if (k_aligned8 && grow < C_out && gk + kHalvesPerLoad <= K_total) {
                     const int4* src = reinterpret_cast<const int4*>(&Wt[grow * K_total + gk]);
                     *reinterpret_cast<int4*>(tmp) = *src;
@@ -173,7 +191,7 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
                         if (grow < C_out && gk_q < K_total) {
                             tmp[q] = Wt[grow * K_total + gk_q];
                         } else {
-                            tmp[q] = __float2half(0.0f);
+                            tmp[q] = TR::from_f32(0.0f);
                         }
                     }
                 }
@@ -186,17 +204,17 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
         // ---- WMMA compute on shared-mem tiles ----
         #pragma unroll
         for (int kk = 0; kk < BK; kk += WMMA_K) {
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag[FRAGS_M];
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::col_major> b_frag[FRAGS_N];
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, T, wmma::row_major> a_frag[FRAGS_M];
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, T, wmma::col_major> b_frag[FRAGS_N];
 
             #pragma unroll
             for (int i = 0; i < FRAGS_M; ++i) {
-                const __half* a_ptr = &As[warp_m * WM + i * WMMA_M][kk];
+                const T* a_ptr = &As[warp_m * WM + i * WMMA_M][kk];
                 wmma::load_matrix_sync(a_frag[i], a_ptr, LDA_SMEM);
             }
             #pragma unroll
             for (int j = 0; j < FRAGS_N; ++j) {
-                const __half* b_ptr = &Bs[warp_n * WN + j * WMMA_N][kk];
+                const T* b_ptr = &Bs[warp_n * WN + j * WMMA_N][kk];
                 wmma::load_matrix_sync(b_frag[j], b_ptr, LDB_SMEM);
             }
             #pragma unroll
@@ -212,19 +230,18 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
     }
 
     // ---- Store C tile through shared mem, with bias epilogue ----
-    __shared__ __half Cs[BM][BN + 8];
+    // The accumulator is FP32; store it as FP32 in shared memory (WMMA has no
+    // BF16 accumulator fragment, and an FP32 staging tile is numerically exact
+    // for both the FP16 and BF16 storage paths — the final narrowing happens in
+    // the scatter epilogue below).
+    __shared__ float Cs[BM][BN + 8];
 
     #pragma unroll
     for (int i = 0; i < FRAGS_M; ++i) {
         #pragma unroll
         for (int j = 0; j < FRAGS_N; ++j) {
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __half> c_h;
-            #pragma unroll
-            for (int e = 0; e < c_frag[i][j].num_elements; ++e) {
-                c_h.x[e] = __float2half(c_frag[i][j].x[e]);
-            }
-            __half* c_ptr = &Cs[warp_m * WM + i * WMMA_M][warp_n * WN + j * WMMA_N];
-            wmma::store_matrix_sync(c_ptr, c_h, BN + 8, wmma::mem_row_major);
+            float* c_ptr = &Cs[warp_m * WM + i * WMMA_M][warp_n * WN + j * WMMA_N];
+            wmma::store_matrix_sync(c_ptr, c_frag[i][j], BN + 8, wmma::mem_row_major);
         }
     }
 
@@ -254,17 +271,17 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
             const int n   = m_g / HW_out;
             const int sp  = m_g - n * HW_out;
             // sp = oh * W_out + ow, so Y index = ((n * C_out + oc) * HW_out + sp).
-            float v = __half2float(Cs[row][col]);
-            if (bias) v += __half2float(bias[oc]);
-            Y[(n * C_out + oc) * HW_out + sp] = __float2half(v);
+            float v = Cs[row][col];
+            if (bias) v += TR::to_f32(bias[oc]);
+            Y[(n * C_out + oc) * HW_out + sp] = TR::from_f32(v);
         }
     }
 }
 
-// Entry point invoked from conv2d.cu's dispatch helper. Returns true if the
-// WMMA path was used (caller skips the naive fallback in that case).
-bool launch_conv2d_implicit_gemm_wmma(
-        const __half* X, const __half* Wt, const __half* bias, __half* Y,
+// Element-type-generic dispatcher shared by the FP16 and BF16 entry points.
+template <typename T>
+static bool launch_conv2d_implicit_gemm_wmma_impl(
+        const T* X, const T* Wt, const T* bias, T* Y,
         int N, int C_in, int H, int W,
         int C_out, int kH, int kW,
         int stride_h, int stride_w,
@@ -283,21 +300,52 @@ bool launch_conv2d_implicit_gemm_wmma(
     dim3 grid((C_out + BN - 1) / BN, (M + BM - 1) / BM);
 
     if (kH == 3 && kW == 3 && pad_h == 1 && pad_w == 1 && stride_h == 1 && stride_w == 1) {
-        conv2d_implicit_gemm_wmma_kernel<3, 3, 1, 1, 1, 1>
+        conv2d_implicit_gemm_wmma_kernel<T, 3, 3, 1, 1, 1, 1>
             <<<grid, block>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
         return true;
     }
     if (kH == 1 && kW == 1 && pad_h == 0 && pad_w == 0 && stride_h == 1 && stride_w == 1) {
-        conv2d_implicit_gemm_wmma_kernel<1, 1, 0, 0, 1, 1>
+        conv2d_implicit_gemm_wmma_kernel<T, 1, 1, 0, 0, 1, 1>
             <<<grid, block>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
         return true;
     }
     if (kH == 3 && kW == 3 && pad_h == 1 && pad_w == 1 && stride_h == 2 && stride_w == 2) {
-        conv2d_implicit_gemm_wmma_kernel<3, 3, 1, 1, 2, 2>
+        conv2d_implicit_gemm_wmma_kernel<T, 3, 3, 1, 1, 2, 2>
             <<<grid, block>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
         return true;
     }
     return false;
+}
+
+// Entry point invoked from conv2d.cu's dispatch helper. Returns true if the
+// WMMA path was used (caller skips the naive fallback in that case).
+bool launch_conv2d_implicit_gemm_wmma(
+        const __half* X, const __half* Wt, const __half* bias, __half* Y,
+        int N, int C_in, int H, int W,
+        int C_out, int kH, int kW,
+        int stride_h, int stride_w,
+        int pad_h, int pad_w,
+        int dil_h, int dil_w,
+        int H_out, int W_out) {
+    return launch_conv2d_implicit_gemm_wmma_impl<__half>(
+        X, Wt, bias, Y, N, C_in, H, W, C_out, kH, kW,
+        stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, H_out, W_out);
+}
+
+// BF16 twin. RTX 4090 (sm_89) supports BF16 WMMA fragments; the kernel is the
+// same template instantiated with __nv_bfloat16.
+bool launch_conv2d_implicit_gemm_wmma_bf16(
+        const __nv_bfloat16* X, const __nv_bfloat16* Wt,
+        const __nv_bfloat16* bias, __nv_bfloat16* Y,
+        int N, int C_in, int H, int W,
+        int C_out, int kH, int kW,
+        int stride_h, int stride_w,
+        int pad_h, int pad_w,
+        int dil_h, int dil_w,
+        int H_out, int W_out) {
+    return launch_conv2d_implicit_gemm_wmma_impl<__nv_bfloat16>(
+        X, Wt, bias, Y, N, C_in, H, W, C_out, kH, kW,
+        stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, H_out, W_out);
 }
 
 } // namespace conv2d_wmma_internal

@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -28,6 +29,17 @@ bool launch_conv2d_implicit_gemm_wmma(
         int pad_h, int pad_w,
         int dil_h, int dil_w,
         int H_out, int W_out);
+// BF16 twin of the WMMA forward path. RTX 4090 (sm_89) supports BF16 WMMA
+// fragments; same shape gating as the FP16 entry point.
+bool launch_conv2d_implicit_gemm_wmma_bf16(
+        const __nv_bfloat16* X, const __nv_bfloat16* Wt,
+        const __nv_bfloat16* bias, __nv_bfloat16* Y,
+        int N, int C_in, int H, int W,
+        int C_out, int kH, int kW,
+        int stride_h, int stride_w,
+        int pad_h, int pad_w,
+        int dil_h, int dil_w,
+        int H_out, int W_out);
 }
 
 namespace {
@@ -38,11 +50,13 @@ template <typename T>
 __device__ inline float load_f32(const T* p);
 template <> __device__ inline float load_f32<float>(const float* p)   { return *p; }
 template <> __device__ inline float load_f32<__half>(const __half* p) { return __half2float(*p); }
+template <> __device__ inline float load_f32<__nv_bfloat16>(const __nv_bfloat16* p) { return __bfloat162float(*p); }
 
 template <typename T>
 __device__ inline void store_f32(T* p, float v);
 template <> __device__ inline void store_f32<float>(float* p, float v)   { *p = v; }
 template <> __device__ inline void store_f32<__half>(__half* p, float v) { *p = __float2half(v); }
+template <> __device__ inline void store_f32<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
 // One thread per output element. Naive direct-conv reduction over
 // (C_in, kH, kW). FP32 accumulator; storage dtype T (FP16 or FP32).
@@ -268,6 +282,14 @@ __global__ void conv2d_add_fp32_into_fp32(const float* __restrict__ src,
     dst[i] += src[i];
 }
 
+__global__ void conv2d_add_fp32_into_bf16(const float* __restrict__ src,
+                                          __nv_bfloat16* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float prev = __bfloat162float(dst[i]);
+    dst[i] = __float2bfloat16(prev + src[i]);
+}
+
 } // namespace
 
 namespace detail::cuda {
@@ -282,8 +304,9 @@ void conv2d_forward(const ::brotensor::Tensor& X,
                     int dil_h, int dil_w,
                     int groups,
                     ::brotensor::Tensor& Y) {
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_forward: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 &&
+        X.dtype != Dtype::BF16) {
+        throw std::runtime_error("conv2d_forward: X must be FP16, BF16 or FP32");
     }
     if (Wt.dtype != X.dtype) {
         throw std::runtime_error("conv2d_forward: Wt dtype must match X");
@@ -336,6 +359,29 @@ void conv2d_forward(const ::brotensor::Tensor& X,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
+    } else if (X.dtype == Dtype::BF16) {
+        const __nv_bfloat16* x_p = static_cast<const __nv_bfloat16*>(X.data);
+        const __nv_bfloat16* w_p = static_cast<const __nv_bfloat16*>(Wt.data);
+        const __nv_bfloat16* b_p = bias ? static_cast<const __nv_bfloat16*>(bias->data)
+                                        : nullptr;
+        __nv_bfloat16* y_p       = static_cast<__nv_bfloat16*>(Y.data);
+
+        // BF16 WMMA implicit-GEMM fast path — same shape gating as FP16.
+        if (groups == 1 &&
+            conv2d_wmma_internal::launch_conv2d_implicit_gemm_wmma_bf16(
+                x_p, w_p, b_p, y_p,
+                N, C_in, H, W, C_out, kH, kW,
+                stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                H_out, W_out)) {
+            BROTENSOR_CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+
+        conv2d_forward_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK, 0, stream>>>(
+            x_p, w_p, b_p, y_p,
+            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            groups, Cg_in, Cg_out, total);
     } else {
         const float* x_p = static_cast<const float*>(X.data);
         const float* w_p = static_cast<const float*>(Wt.data);
@@ -359,8 +405,9 @@ void conv2d_backward_input(const ::brotensor::Tensor& Wt,
                            int dil_h, int dil_w,
                            int groups,
                            ::brotensor::Tensor& dX) {
-    if (Wt.dtype != Dtype::FP16 && Wt.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_input: Wt must be FP16 or FP32");
+    if (Wt.dtype != Dtype::FP16 && Wt.dtype != Dtype::FP32 &&
+        Wt.dtype != Dtype::BF16) {
+        throw std::runtime_error("conv2d_backward_input: Wt must be FP16, BF16 or FP32");
     }
     if (dY.dtype != Wt.dtype) {
         throw std::runtime_error("conv2d_backward_input: dY dtype must match Wt");
@@ -392,6 +439,14 @@ void conv2d_backward_input(const ::brotensor::Tensor& Wt,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
+    } else if (Wt.dtype == Dtype::BF16) {
+        conv2d_backward_input_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(Wt.data),
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data),
+            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            groups, Cg_in, Cg_out, total);
     } else {
         conv2d_backward_input_kernel<float><<<blocks, CONV_BLOCK>>>(
             static_cast<const float*>(Wt.data),
@@ -413,8 +468,9 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
                             int dil_h, int dil_w,
                             int groups,
                             ::brotensor::Tensor& dWt) {
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_weight: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 &&
+        X.dtype != Dtype::BF16) {
+        throw std::runtime_error("conv2d_backward_weight: X must be FP16, BF16 or FP32");
     }
     if (dY.dtype != X.dtype || dWt.dtype != X.dtype) {
         throw std::runtime_error("conv2d_backward_weight: X, dY, dWt dtype must match");
@@ -451,6 +507,14 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
+    } else if (X.dtype == Dtype::BF16) {
+        conv2d_backward_weight_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<const __nv_bfloat16*>(dY.data),
+            d_scratch,
+            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            groups, Cg_in, Cg_out, total);
     } else {
         conv2d_backward_weight_kernel<float><<<blocks, CONV_BLOCK>>>(
             static_cast<const float*>(X.data),
@@ -466,6 +530,9 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
     if (X.dtype == Dtype::FP16) {
         conv2d_add_fp32_into_fp16<<<fold_blocks, CONV_BLOCK>>>(
             d_scratch, static_cast<__half*>(dWt.data), total);
+    } else if (X.dtype == Dtype::BF16) {
+        conv2d_add_fp32_into_bf16<<<fold_blocks, CONV_BLOCK>>>(
+            d_scratch, static_cast<__nv_bfloat16*>(dWt.data), total);
     } else {
         conv2d_add_fp32_into_fp32<<<fold_blocks, CONV_BLOCK>>>(
             d_scratch, static_cast<float*>(dWt.data), total);
@@ -477,8 +544,9 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
 void conv2d_backward_bias(const ::brotensor::Tensor& dY,
                           int N, int C_out, int H_out, int W_out,
                           ::brotensor::Tensor& dB) {
-    if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_bias: dY must be FP16 or FP32");
+    if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32 &&
+        dY.dtype != Dtype::BF16) {
+        throw std::runtime_error("conv2d_backward_bias: dY must be FP16, BF16 or FP32");
     }
     if (dB.dtype != dY.dtype) {
         throw std::runtime_error("conv2d_backward_bias: dB dtype must match dY");
@@ -496,6 +564,10 @@ void conv2d_backward_bias(const ::brotensor::Tensor& dY,
         conv2d_backward_bias_kernel<__half><<<C_out, BIAS_BLOCK>>>(
             static_cast<const __half*>(dY.data),
             d_scratch, N, C_out, H_out, W_out);
+    } else if (dY.dtype == Dtype::BF16) {
+        conv2d_backward_bias_kernel<__nv_bfloat16><<<C_out, BIAS_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(dY.data),
+            d_scratch, N, C_out, H_out, W_out);
     } else {
         conv2d_backward_bias_kernel<float><<<C_out, BIAS_BLOCK>>>(
             static_cast<const float*>(dY.data),
@@ -507,6 +579,9 @@ void conv2d_backward_bias(const ::brotensor::Tensor& dY,
     if (dY.dtype == Dtype::FP16) {
         conv2d_add_fp32_into_fp16<<<fold_blocks, 128>>>(
             d_scratch, static_cast<__half*>(dB.data), C_out);
+    } else if (dY.dtype == Dtype::BF16) {
+        conv2d_add_fp32_into_bf16<<<fold_blocks, 128>>>(
+            d_scratch, static_cast<__nv_bfloat16*>(dB.data), C_out);
     } else {
         conv2d_add_fp32_into_fp32<<<fold_blocks, 128>>>(
             d_scratch, static_cast<float*>(dB.data), C_out);

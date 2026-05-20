@@ -148,6 +148,122 @@ void run_bwd_bias(int N, int C_out, int H_out, int W_out, uint64_t seed) {
                     1e-4f, 1e-3f);
 }
 
+// ─── BF16 forward (BF16-on-CUDA vs FP32 CPU reference) ──────────────────────
+void run_fwd_bf16(const ConvCfg& c, bool has_bias, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int Cg_in = c.C_in / c.groups;
+    Tensor X = Tensor::mat(c.N, c.C_in * c.H * c.W);
+    Tensor Wt = Tensor::mat(c.C_out, Cg_in * c.kH * c.kW);
+    fill_random(X, rng, 0.5f);
+    fill_random(Wt, rng, 0.5f);
+    Tensor B;
+    Tensor* Bp = nullptr;
+    if (has_bias) {
+        B = Tensor::vec(c.C_out);
+        fill_random(B, rng, 0.5f);
+        Bp = &B;
+    }
+
+    Tensor cpu_Y;
+    brotensor::conv2d_forward(X, Wt, Bp, c.N, c.C_in, c.H, c.W, c.C_out,
+                              c.kH, c.kW, c.stride_h, c.stride_w,
+                              c.pad_h, c.pad_w, c.dil_h, c.dil_w, c.groups,
+                              cpu_Y);
+
+    Tensor gX = to_bf16_cuda(X);
+    Tensor gW = to_bf16_cuda(Wt);
+    Tensor gB;
+    Tensor* gBp = nullptr;
+    if (has_bias) { gB = to_bf16_cuda(B); gBp = &gB; }
+    Tensor gpu_Y;
+    brotensor::conv2d_forward(gX, gW, gBp, c.N, c.C_in, c.H, c.W, c.C_out,
+                              c.kH, c.kW, c.stride_h, c.stride_w,
+                              c.pad_h, c.pad_w, c.dil_h, c.dil_w, c.groups,
+                              gpu_Y);
+
+    Tensor gpu_host = bf16_host_to_f32(download_to_host(gpu_Y));
+    compare_tensors(cpu_Y, gpu_host, "conv2d_fwd_bf16", 5e-2f, 5e-2f);
+}
+
+// ─── BF16 backward input ────────────────────────────────────────────────────
+void run_bwd_input_bf16(const ConvCfg& c, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int Cg_in = c.C_in / c.groups;
+    const int H_out = out_dim(c.H, c.pad_h, c.dil_h, c.kH, c.stride_h);
+    const int W_out = out_dim(c.W, c.pad_w, c.dil_w, c.kW, c.stride_w);
+    Tensor Wt = Tensor::mat(c.C_out, Cg_in * c.kH * c.kW);
+    Tensor dY = Tensor::mat(c.N, c.C_out * H_out * W_out);
+    fill_random(Wt, rng, 0.5f);
+    fill_random(dY, rng, 0.5f);
+
+    Tensor cpu_dX;
+    brotensor::conv2d_backward_input(Wt, dY, c.N, c.C_in, c.H, c.W, c.C_out,
+                                     c.kH, c.kW, c.stride_h, c.stride_w,
+                                     c.pad_h, c.pad_w, c.dil_h, c.dil_w,
+                                     c.groups, cpu_dX);
+
+    Tensor gW = to_bf16_cuda(Wt);
+    Tensor gdY = to_bf16_cuda(dY);
+    Tensor gpu_dX;
+    brotensor::conv2d_backward_input(gW, gdY, c.N, c.C_in, c.H, c.W, c.C_out,
+                                     c.kH, c.kW, c.stride_h, c.stride_w,
+                                     c.pad_h, c.pad_w, c.dil_h, c.dil_w,
+                                     c.groups, gpu_dX);
+
+    Tensor gpu_host = bf16_host_to_f32(download_to_host(gpu_dX));
+    compare_tensors(cpu_dX, gpu_host, "conv2d_bwd_dX_bf16", 8e-2f, 8e-2f);
+}
+
+// ─── BF16 backward weight (accumulate) ──────────────────────────────────────
+void run_bwd_weight_bf16(const ConvCfg& c, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int Cg_in = c.C_in / c.groups;
+    const int H_out = out_dim(c.H, c.pad_h, c.dil_h, c.kH, c.stride_h);
+    const int W_out = out_dim(c.W, c.pad_w, c.dil_w, c.kW, c.stride_w);
+    Tensor X = Tensor::mat(c.N, c.C_in * c.H * c.W);
+    Tensor dY = Tensor::mat(c.N, c.C_out * H_out * W_out);
+    Tensor dW0 = Tensor::mat(c.C_out, Cg_in * c.kH * c.kW);
+    fill_random(X, rng, 0.5f);
+    fill_random(dY, rng, 0.5f);
+    fill_random(dW0, rng, 0.5f);
+
+    Tensor cpu_dW = dW0;
+    brotensor::conv2d_backward_weight(X, dY, c.N, c.C_in, c.H, c.W, c.C_out,
+                                      c.kH, c.kW, c.stride_h, c.stride_w,
+                                      c.pad_h, c.pad_w, c.dil_h, c.dil_w,
+                                      c.groups, cpu_dW);
+
+    Tensor gX = to_bf16_cuda(X);
+    Tensor gdY = to_bf16_cuda(dY);
+    Tensor gpu_dW = to_bf16_cuda(dW0);
+    brotensor::conv2d_backward_weight(gX, gdY, c.N, c.C_in, c.H, c.W, c.C_out,
+                                      c.kH, c.kW, c.stride_h, c.stride_w,
+                                      c.pad_h, c.pad_w, c.dil_h, c.dil_w,
+                                      c.groups, gpu_dW);
+
+    Tensor gpu_host = bf16_host_to_f32(download_to_host(gpu_dW));
+    compare_tensors(cpu_dW, gpu_host, "conv2d_bwd_dW_bf16", 8e-2f, 8e-2f);
+}
+
+// ─── BF16 backward bias (accumulate) ────────────────────────────────────────
+void run_bwd_bias_bf16(int N, int C_out, int H_out, int W_out, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor dY = Tensor::mat(N, C_out * H_out * W_out);
+    Tensor dB0 = Tensor::vec(C_out);
+    fill_random(dY, rng, 0.5f);
+    fill_random(dB0, rng, 0.5f);
+
+    Tensor cpu_dB = dB0;
+    brotensor::conv2d_backward_bias(dY, N, C_out, H_out, W_out, cpu_dB);
+
+    Tensor gdY = to_bf16_cuda(dY);
+    Tensor gpu_dB = to_bf16_cuda(dB0);
+    brotensor::conv2d_backward_bias(gdY, N, C_out, H_out, W_out, gpu_dB);
+
+    Tensor gpu_host = bf16_host_to_f32(download_to_host(gpu_dB));
+    compare_tensors(cpu_dB, gpu_host, "conv2d_bwd_dB_bf16", 8e-2f, 8e-2f);
+}
+
 // Standard config bank — { N,Cin,H,W, Cout,kH,kW, sh,sw,ph,pw,dh,dw,groups }.
 const ConvCfg k1x1     {2, 6, 7, 7,   8, 1, 1,  1,1, 0,0, 1,1, 1};
 const ConvCfg k3x3_s1p1{2, 4, 8, 8,   6, 3, 3,  1,1, 1,1, 1,1, 1};
@@ -190,5 +306,29 @@ BT_PARITY_TEST(conv2d_bwd_weight_depthw)  { run_bwd_weight(kDepthw,   0x6025ull)
 BT_PARITY_TEST(conv2d_bwd_bias_small)  { run_bwd_bias(2, 8, 4, 4, 0x6030ull); }
 BT_PARITY_TEST(conv2d_bwd_bias_single) { run_bwd_bias(1, 5, 9, 9, 0x6031ull); }
 BT_PARITY_TEST(conv2d_bwd_bias_wide)   { run_bwd_bias(3, 16, 5, 7, 0x6032ull); }
+
+// ─── BF16 forward (BF16-on-CUDA vs FP32 CPU reference) ──────────────────────
+BT_PARITY_TEST(conv2d_fwd_bf16_1x1_bias)   { run_fwd_bf16(k1x1,      true,  0x6100ull); }
+BT_PARITY_TEST(conv2d_fwd_bf16_3x3_s1p1)   { run_fwd_bf16(k3x3_s1p1, true,  0x6101ull); }
+BT_PARITY_TEST(conv2d_fwd_bf16_3x3_s2)     { run_fwd_bf16(k3x3_s2,   true,  0x6102ull); }
+BT_PARITY_TEST(conv2d_fwd_bf16_dilated)    { run_fwd_bf16(kDilated,  false, 0x6103ull); }
+BT_PARITY_TEST(conv2d_fwd_bf16_grouped)    { run_fwd_bf16(kGrouped,  true,  0x6104ull); }
+BT_PARITY_TEST(conv2d_fwd_bf16_depthwise)  { run_fwd_bf16(kDepthw,   true,  0x6105ull); }
+BT_PARITY_TEST(conv2d_fwd_bf16_asym)       { run_fwd_bf16(kAsym,     false, 0x6106ull); }
+
+// ─── BF16 backward input ────────────────────────────────────────────────────
+BT_PARITY_TEST(conv2d_bwd_input_bf16_1x1)     { run_bwd_input_bf16(k1x1,      0x6110ull); }
+BT_PARITY_TEST(conv2d_bwd_input_bf16_3x3)     { run_bwd_input_bf16(k3x3_s1p1, 0x6111ull); }
+BT_PARITY_TEST(conv2d_bwd_input_bf16_s2)      { run_bwd_input_bf16(k3x3_s2,   0x6112ull); }
+BT_PARITY_TEST(conv2d_bwd_input_bf16_grouped) { run_bwd_input_bf16(kGrouped,  0x6113ull); }
+
+// ─── BF16 backward weight (accumulate) ──────────────────────────────────────
+BT_PARITY_TEST(conv2d_bwd_weight_bf16_1x1) { run_bwd_weight_bf16(k1x1,      0x6120ull); }
+BT_PARITY_TEST(conv2d_bwd_weight_bf16_3x3) { run_bwd_weight_bf16(k3x3_s1p1, 0x6121ull); }
+BT_PARITY_TEST(conv2d_bwd_weight_bf16_grp) { run_bwd_weight_bf16(kGrouped,  0x6122ull); }
+
+// ─── BF16 backward bias (accumulate) ────────────────────────────────────────
+BT_PARITY_TEST(conv2d_bwd_bias_bf16_small) { run_bwd_bias_bf16(2, 8, 4, 4, 0x6130ull); }
+BT_PARITY_TEST(conv2d_bwd_bias_bf16_wide)  { run_bwd_bias_bf16(3, 16, 5, 7, 0x6131ull); }
 
 int main() { return run_all("conv2d cpu/gpu parity"); }

@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -210,10 +211,129 @@ __global__ void add_NC_shift_kernel(__half* __restrict__ Y,
     Y[idx] = __float2half(yv + sv);
 }
 
+// ─── BF16 kernel twins (verbatim copies of the FP16 kernels above, with ──────
+//     __half→__nv_bfloat16 / __half2float→__bfloat162float /
+//     __float2half→__float2bfloat16). All math stays in float. ───────────────
+
+__global__ void gn_silu_fused_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                                          const __nv_bfloat16* __restrict__ gamma,
+                                          const __nv_bfloat16* __restrict__ beta,
+                                          __nv_bfloat16* __restrict__ Y,
+                                          int C, int spatial,
+                                          int channels_per_group,
+                                          float eps) {
+    const int n = blockIdx.y;
+    const int g = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int tile_size = channels_per_group * spatial;
+    const int chan_base = g * channels_per_group;
+    const int sample_stride = C * spatial;
+    const __nv_bfloat16* x_tile = X + n * sample_stride + chan_base * spatial;
+    __nv_bfloat16*       y_tile = Y + n * sample_stride + chan_base * spatial;
+
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const float v = __bfloat162float(x_tile[i]);
+        sum   += v;
+        sumsq += v * v;
+    }
+    __shared__ float s_sum[RB_GN_BLOCK];
+    __shared__ float s_sumsq[RB_GN_BLOCK];
+    s_sum[tid]   = sum;
+    s_sumsq[tid] = sumsq;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sum[tid]   += s_sum[tid + stride];
+            s_sumsq[tid] += s_sumsq[tid + stride];
+        }
+        __syncthreads();
+    }
+    __shared__ float s_mean;
+    __shared__ float s_rstd;
+    if (tid == 0) {
+        const float inv_n = 1.0f / static_cast<float>(tile_size);
+        const float mean  = s_sum[0] * inv_n;
+        const float var   = s_sumsq[0] * inv_n - mean * mean;
+        s_mean = mean;
+        s_rstd = rsqrtf(var + eps);
+    }
+    __syncthreads();
+    const float mean = s_mean;
+    const float rstd = s_rstd;
+
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const int local_c = i / spatial;
+        const int channel = chan_base + local_c;
+        const float gv = __bfloat162float(gamma[channel]);
+        const float bv = __bfloat162float(beta[channel]);
+        const float v  = __bfloat162float(x_tile[i]);
+        const float yn = (v - mean) * rstd * gv + bv;
+        const float silu = yn / (1.0f + __expf(-yn));
+        y_tile[i] = __float2bfloat16(silu);
+    }
+}
+
+__global__ void add_NC_shift_bf16_kernel(__nv_bfloat16* __restrict__ Y,
+                                         const __nv_bfloat16* __restrict__ shift,
+                                         int N, int C, int spatial, int has_N) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = N * C * spatial;
+    if (idx >= total) return;
+    int t = idx / spatial;
+    const int c = t % C;
+    const int n = t / C;
+    const int sidx = has_N ? (n * C + c) : c;
+    const float yv = __bfloat162float(Y[idx]);
+    const float sv = __bfloat162float(shift[sidx]);
+    Y[idx] = __float2bfloat16(yv + sv);
+}
+
 inline int grid_for(int n, int block) {
     int b = (n + block - 1) / block;
     if (b < 1) b = 1;
     return b;
+}
+
+// Launch the fused GroupNorm+SiLU kernel for the runtime activation dtype.
+inline void launch_gn_silu_fused(bool is_bf16, dim3 grid,
+                                 const void* X, const void* gamma,
+                                 const void* beta, void* Y,
+                                 int C, int spatial, int channels_per_group,
+                                 float eps) {
+    if (is_bf16) {
+        gn_silu_fused_bf16_kernel<<<grid, RB_GN_BLOCK>>>(
+            reinterpret_cast<const __nv_bfloat16*>(X),
+            reinterpret_cast<const __nv_bfloat16*>(gamma),
+            reinterpret_cast<const __nv_bfloat16*>(beta),
+            reinterpret_cast<__nv_bfloat16*>(Y),
+            C, spatial, channels_per_group, eps);
+    } else {
+        gn_silu_fused_kernel<<<grid, RB_GN_BLOCK>>>(
+            reinterpret_cast<const __half*>(X),
+            reinterpret_cast<const __half*>(gamma),
+            reinterpret_cast<const __half*>(beta),
+            reinterpret_cast<__half*>(Y),
+            C, spatial, channels_per_group, eps);
+    }
+}
+
+// Launch the per-(N,C)/(C) channel-shift add for the runtime activation dtype.
+inline void launch_add_NC_shift(bool is_bf16, int blocks, int block,
+                                void* Y, const void* shift,
+                                int N, int C, int spatial, int has_N) {
+    if (is_bf16) {
+        add_NC_shift_bf16_kernel<<<blocks, block>>>(
+            reinterpret_cast<__nv_bfloat16*>(Y),
+            reinterpret_cast<const __nv_bfloat16*>(shift),
+            N, C, spatial, has_N);
+    } else {
+        add_NC_shift_kernel<<<blocks, block>>>(
+            reinterpret_cast<__half*>(Y),
+            reinterpret_cast<const __half*>(shift),
+            N, C, spatial, has_N);
+    }
 }
 
 } // namespace
@@ -230,12 +350,18 @@ void resblock_forward(const ::brotensor::Tensor& X,
                       ::brotensor::Tensor& Y) {
     using ::brotensor::Dtype;
     using ::brotensor::Tensor;
-    if (X.dtype != Dtype::FP16 || gamma1.dtype != Dtype::FP16 ||
-        beta1.dtype != Dtype::FP16 || W1.dtype != Dtype::FP16 ||
-        gamma2.dtype != Dtype::FP16 || beta2.dtype != Dtype::FP16 ||
-        W2.dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_forward: all required tensors must be FP16");
+    // Runtime activation dtype: FP16 or BF16. All participating activation /
+    // parameter tensors share one dtype. FP16 behaviour is byte-identical to
+    // the prior fixed-FP16 implementation.
+    const Dtype dt = X.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("resblock_forward: X must be FP16 or BF16");
     }
+    if (gamma1.dtype != dt || beta1.dtype != dt || W1.dtype != dt ||
+        gamma2.dtype != dt || beta2.dtype != dt || W2.dtype != dt) {
+        throw std::runtime_error("resblock_forward: all required tensors must share X's dtype (FP16 or BF16)");
+    }
+    const bool is_bf16 = (dt == Dtype::BF16);
     if (num_groups <= 0 || C_in % num_groups != 0 || C_out % num_groups != 0) {
         throw std::runtime_error("resblock_forward: num_groups must divide C_in and C_out");
     }
@@ -244,8 +370,8 @@ void resblock_forward(const ::brotensor::Tensor& X,
     }
     const int spatial = H * Wd;
     const int out_cols = C_out * spatial;
-    if (Y.rows != N || Y.cols != out_cols || Y.dtype != Dtype::FP16) {
-        Y.resize(N, out_cols, Dtype::FP16);
+    if (Y.rows != N || Y.cols != out_cols || Y.dtype != dt) {
+        Y.resize(N, out_cols, dt);
     }
     if (N == 0 || spatial == 0) return;
 
@@ -257,19 +383,15 @@ void resblock_forward(const ::brotensor::Tensor& X,
     thread_local static Tensor h2;  // post-conv1 (+t_shift)
     thread_local static Tensor h3;  // post-GN2+SiLU
     ensure_cuda(h1); ensure_cuda(h2); ensure_cuda(h3);
-    h1.resize(N, C_in  * spatial, Dtype::FP16);
-    h2.resize(N, C_out * spatial, Dtype::FP16);
-    h3.resize(N, C_out * spatial, Dtype::FP16);
+    h1.resize(N, C_in  * spatial, dt);
+    h2.resize(N, C_out * spatial, dt);
+    h3.resize(N, C_out * spatial, dt);
 
     // Leg 1: GN1 → SiLU, fused.
     {
         dim3 grid(num_groups, N, 1);
-        gn_silu_fused_kernel<<<grid, RB_GN_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data),
-            reinterpret_cast<const __half*>(gamma1.data),
-            reinterpret_cast<const __half*>(beta1.data),
-            reinterpret_cast<__half*>(h1.data),
-            C_in, spatial, C_in / num_groups, eps);
+        launch_gn_silu_fused(is_bf16, grid, X.data, gamma1.data, beta1.data,
+                             h1.data, C_in, spatial, C_in / num_groups, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
@@ -284,8 +406,8 @@ void resblock_forward(const ::brotensor::Tensor& X,
 
     // Optional t_emb shift: (N, C_out) or (C_out,) added channelwise.
     if (t_emb_shift) {
-        if (t_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_forward: t_emb_shift must be FP16");
+        if (t_emb_shift->dtype != dt) {
+            throw std::runtime_error("resblock_forward: t_emb_shift dtype must match X");
         }
         int has_N = 0;
         if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
@@ -298,22 +420,16 @@ void resblock_forward(const ::brotensor::Tensor& X,
             throw std::runtime_error("resblock_forward: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
         const int total = N * C_out * spatial;
-        add_NC_shift_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK>>>(
-            reinterpret_cast<__half*>(h2.data),
-            reinterpret_cast<const __half*>(t_emb_shift->data),
-            N, C_out, spatial, has_N);
+        launch_add_NC_shift(is_bf16, grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK,
+                            h2.data, t_emb_shift->data, N, C_out, spatial, has_N);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // Leg 2: GN2 → SiLU, fused.
     {
         dim3 grid(num_groups, N, 1);
-        gn_silu_fused_kernel<<<grid, RB_GN_BLOCK>>>(
-            reinterpret_cast<const __half*>(h2.data),
-            reinterpret_cast<const __half*>(gamma2.data),
-            reinterpret_cast<const __half*>(beta2.data),
-            reinterpret_cast<__half*>(h3.data),
-            C_out, spatial, C_out / num_groups, eps);
+        launch_gn_silu_fused(is_bf16, grid, h2.data, gamma2.data, beta2.data,
+                             h3.data, C_out, spatial, C_out / num_groups, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
@@ -322,8 +438,8 @@ void resblock_forward(const ::brotensor::Tensor& X,
     thread_local static Tensor skip_scratch;
     ensure_cuda(skip_scratch);
     if (Wskip != nullptr) {
-        if (Wskip->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_forward: Wskip must be FP16");
+        if (Wskip->dtype != dt) {
+            throw std::runtime_error("resblock_forward: Wskip dtype must match X");
         }
         // 1x1 conv through the public path (WMMA implicit-GEMM).
         conv2d_forward(X, *Wskip, bskip,
@@ -536,6 +652,34 @@ __global__ void rb_sum_hw_per_NC_fp16(const __half* __restrict__ dh2,
     }
 }
 
+// BF16 twin of rb_sum_hw_per_NC_fp16.
+__global__ void rb_sum_hw_per_NC_bf16(const __nv_bfloat16* __restrict__ dh2,
+                                      __nv_bfloat16* __restrict__ d_shift,
+                                      int N, int C, int spatial) {
+    const int nc = blockIdx.x;
+    if (nc >= N * C) return;
+    const int n = nc / C;
+    const int c = nc - n * C;
+    const __nv_bfloat16* row = dh2 + (n * C + c) * spatial;
+
+    __shared__ float s_buf[RB_GN_BLOCK];
+    const int tid = threadIdx.x;
+    float acc = 0.0f;
+    for (int i = tid; i < spatial; i += blockDim.x) {
+        acc += __bfloat162float(row[i]);
+    }
+    s_buf[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_buf[tid] += s_buf[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const float prev = __bfloat162float(d_shift[nc]);
+        d_shift[nc] = __float2bfloat16(prev + s_buf[0]);
+    }
+}
+
 } // namespace
 
 void resblock_backward(const ::brotensor::Tensor& X,
@@ -559,13 +703,17 @@ void resblock_backward(const ::brotensor::Tensor& X,
     using ::brotensor::Dtype;
     using ::brotensor::Tensor;
     using ::brotensor::Device;
-    if (X.dtype != Dtype::FP16 || dY.dtype != Dtype::FP16 ||
-        gamma1.dtype != Dtype::FP16 || beta1.dtype != Dtype::FP16 ||
-        W1.dtype != Dtype::FP16 ||
-        gamma2.dtype != Dtype::FP16 || beta2.dtype != Dtype::FP16 ||
-        W2.dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_backward: all required tensors must be FP16");
+    // Runtime activation dtype: FP16 or BF16. FP16 behaviour byte-identical.
+    const Dtype dt = X.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("resblock_backward: X must be FP16 or BF16");
     }
+    if (dY.dtype != dt || gamma1.dtype != dt || beta1.dtype != dt ||
+        W1.dtype != dt || gamma2.dtype != dt || beta2.dtype != dt ||
+        W2.dtype != dt) {
+        throw std::runtime_error("resblock_backward: all required tensors must share X's dtype (FP16 or BF16)");
+    }
+    const bool is_bf16 = (dt == Dtype::BF16);
     if (Wskip == nullptr && C_in != C_out) {
         throw std::runtime_error("resblock_backward: Wskip required when C_in != C_out");
     }
@@ -573,8 +721,8 @@ void resblock_backward(const ::brotensor::Tensor& X,
     if (dY.rows != N || dY.cols != C_out * spatial) {
         throw std::runtime_error("resblock_backward: dY shape mismatch");
     }
-    if (dX.rows != N || dX.cols != C_in * spatial || dX.dtype != Dtype::FP16) {
-        dX.resize(N, C_in * spatial, Dtype::FP16);
+    if (dX.rows != N || dX.cols != C_in * spatial || dX.dtype != dt) {
+        dX.resize(N, C_in * spatial, dt);
     }
     if (N == 0 || spatial == 0) return;
 
@@ -594,8 +742,8 @@ void resblock_backward(const ::brotensor::Tensor& X,
     conv2d_forward(h1, W1, b1, N, C_in, H, Wd,
                    C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2);
     if (t_emb_shift) {
-        if (t_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_backward: t_emb_shift must be FP16");
+        if (t_emb_shift->dtype != dt) {
+            throw std::runtime_error("resblock_backward: t_emb_shift dtype must match X");
         }
         int has_N = 0;
         if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
@@ -608,10 +756,8 @@ void resblock_backward(const ::brotensor::Tensor& X,
             throw std::runtime_error("resblock_backward: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
         const int total = N * C_out * spatial;
-        add_NC_shift_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK>>>(
-            reinterpret_cast<__half*>(h2.data),
-            reinterpret_cast<const __half*>(t_emb_shift->data),
-            N, C_out, spatial, has_N);
+        launch_add_NC_shift(is_bf16, grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK,
+                            h2.data, t_emb_shift->data, N, C_out, spatial, has_N);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
@@ -622,7 +768,7 @@ void resblock_backward(const ::brotensor::Tensor& X,
     silu_forward(h3_pre_silu, h3);
 
     // ── Conv2 backward: dh3 (input grad), dW2 += grad, db2 += grad.
-    Tensor dh3 = Tensor::empty_on(Device::CUDA, N, C_out * spatial, Dtype::FP16);
+    Tensor dh3 = Tensor::empty_on(Device::CUDA, N, C_out * spatial, dt);
     conv2d_backward_input(W2, dY, N, C_out, H, Wd,
                           C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh3);
     conv2d_backward_weight(h3, dY, N, C_out, H, Wd,
@@ -644,17 +790,24 @@ void resblock_backward(const ::brotensor::Tensor& X,
 
     // ── t_emb_shift backward: channel-axis reduction of dh2.
     if (t_emb_shift && dt_emb_shift) {
-        if (dt_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_backward: dt_emb_shift must be FP16");
+        if (dt_emb_shift->dtype != dt) {
+            throw std::runtime_error("resblock_backward: dt_emb_shift dtype must match X");
         }
         const bool has_N = (t_emb_shift->rows == N && t_emb_shift->cols == C_out);
         if (has_N) {
             // (N, C_out) — sum over HW per (n, c), accumulate into dt_emb_shift.
             const int blocks = N * C_out;
-            rb_sum_hw_per_NC_fp16<<<blocks, RB_GN_BLOCK>>>(
-                reinterpret_cast<const __half*>(dh2.data),
-                reinterpret_cast<__half*>(dt_emb_shift->data),
-                N, C_out, spatial);
+            if (is_bf16) {
+                rb_sum_hw_per_NC_bf16<<<blocks, RB_GN_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(dh2.data),
+                    reinterpret_cast<__nv_bfloat16*>(dt_emb_shift->data),
+                    N, C_out, spatial);
+            } else {
+                rb_sum_hw_per_NC_fp16<<<blocks, RB_GN_BLOCK>>>(
+                    reinterpret_cast<const __half*>(dh2.data),
+                    reinterpret_cast<__half*>(dt_emb_shift->data),
+                    N, C_out, spatial);
+            }
             BROTENSOR_CUDA_CHECK(cudaGetLastError());
         } else {
             // (C_out,) — sum over (N, H, W) per channel. Reuse conv bias bwd.
@@ -663,7 +816,7 @@ void resblock_backward(const ::brotensor::Tensor& X,
     }
 
     // ── Conv1 backward: dh1, dW1 +=, db1 +=.
-    Tensor dh1 = Tensor::empty_on(Device::CUDA, N, C_in * spatial, Dtype::FP16);
+    Tensor dh1 = Tensor::empty_on(Device::CUDA, N, C_in * spatial, dt);
     conv2d_backward_input(W1, dh2, N, C_in, H, Wd,
                           C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh1);
     conv2d_backward_weight(h1, dh2, N, C_in, H, Wd,
@@ -687,10 +840,10 @@ void resblock_backward(const ::brotensor::Tensor& X,
         // identity: dX += dY (shapes already match since C_in == C_out).
         add_inplace(dX, dY);
     } else {
-        if (Wskip->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_backward: Wskip must be FP16");
+        if (Wskip->dtype != dt) {
+            throw std::runtime_error("resblock_backward: Wskip dtype must match X");
         }
-        Tensor dX_skip = Tensor::empty_on(Device::CUDA, N, C_in * spatial, Dtype::FP16);
+        Tensor dX_skip = Tensor::empty_on(Device::CUDA, N, C_in * spatial, dt);
         conv2d_backward_input(*Wskip, dY, N, C_in, H, Wd,
                               C_out, 1, 1, 1, 1, 0, 0, 1, 1, dX_skip);
         if (dWskip) {
