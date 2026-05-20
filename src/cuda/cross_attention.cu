@@ -736,6 +736,17 @@ void cross_attention_forward(const ::brotensor::Tensor& X,
                                      d_mask, num_heads, /*causal=*/false, O);
         return;
     }
+    if (X.dtype == Dtype::BF16) {
+        // BF16 inference: delegate to the flash path exactly as FP16 does.
+        if (Ctx.dtype != Dtype::BF16) {
+            throw std::runtime_error("cross_attention_forward: Ctx dtype must match X dtype");
+        }
+        flash_attention_qkvo_forward(X, &Ctx,
+                                     Wq, nullptr, Wk, nullptr,
+                                     Wv, nullptr, Wo, nullptr,
+                                     d_mask, num_heads, /*causal=*/false, O);
+        return;
+    }
     if (Ctx.dtype != Dtype::FP32) {
         throw std::runtime_error("cross_attention_forward: Ctx dtype must match X dtype");
     }
@@ -757,7 +768,9 @@ void self_attention_forward(const ::brotensor::Tensor& X,
                             ::brotensor::Tensor& O) {
     using ::brotensor::Tensor;
     using ::brotensor::Dtype;
-    if (X.dtype == Dtype::FP16) {
+    if (X.dtype == Dtype::FP16 || X.dtype == Dtype::BF16) {
+        // FP16/BF16 inference: delegate to the flash path (self-attention =
+        // Ctx == nullptr). BF16 routes through the same call as FP16.
         flash_attention_qkvo_forward(X, nullptr,
                                      Wq, nullptr, Wk, nullptr,
                                      Wv, nullptr, Wo, nullptr,

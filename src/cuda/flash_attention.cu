@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <cmath>
 #include <stdexcept>
@@ -485,9 +486,555 @@ __global__ void fa_fp16_add_inplace_kernel(__half* __restrict__ dst,
     dst[i] = __float2half(__half2float(dst[i]) + __half2float(src[i]));
 }
 
+// ─── BF16 kernels (verbatim copies of the FP16 kernels above, with ──────────
+//     __half→__nv_bfloat16 / __half2float→__bfloat162float /
+//     __float2half→__float2bfloat16). All real math stays in float. ──────────
+//
+// The non-causal forward/backward WMMA path uses fp16_internal::launch_matmul_ABT,
+// which is FP16-only (tensor cores). BF16 cannot use that kernel, so this file
+// carries its own self-contained naive BF16 matmul (matmul_ABT_bf16_kernel)
+// with FP32 accumulation — numerically equivalent to the FP16 naive fallback.
+
+__global__ void extract_head_LD_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                                            __nv_bfloat16* __restrict__ Y,
+                                            int L, int D, int head_off, int head_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = L * head_dim;
+    if (idx >= total) return;
+    const int l = idx / head_dim;
+    const int d = idx % head_dim;
+    Y[l * head_dim + d] = X[l * D + head_off + d];
+}
+
+__global__ void extract_head_DL_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                                            __nv_bfloat16* __restrict__ Y,
+                                            int L, int D, int head_off, int head_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = L * head_dim;
+    if (idx >= total) return;
+    const int l = idx / head_dim;
+    const int d = idx % head_dim;
+    Y[d * L + l] = X[l * D + head_off + d];
+}
+
+__global__ void pack_head_LD_bf16_kernel(const __nv_bfloat16* __restrict__ Y,
+                                         __nv_bfloat16* __restrict__ Out,
+                                         int L, int D, int head_off, int head_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = L * head_dim;
+    if (idx >= total) return;
+    const int l = idx / head_dim;
+    const int d = idx % head_dim;
+    Out[l * D + head_off + d] = Y[l * head_dim + d];
+}
+
+// Naive BF16 matmul: C(M, N) = A(M, K) @ B(N, K)^T, FP32 accumulation.
+// Same contract as fp16_internal::launch_matmul_ABT; one thread per output.
+__global__ void matmul_ABT_bf16_kernel(const __nv_bfloat16* __restrict__ A,
+                                       const __nv_bfloat16* __restrict__ B,
+                                       __nv_bfloat16* __restrict__ C,
+                                       int M, int N, int K) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * N;
+    if (idx >= total) return;
+    const int m = idx / N;
+    const int n = idx % N;
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        acc += __bfloat162float(A[m * K + k]) * __bfloat162float(B[n * K + k]);
+    }
+    C[idx] = __float2bfloat16(acc);
+}
+
+inline void launch_matmul_ABT_bf16(const __nv_bfloat16* A,
+                                   const __nv_bfloat16* B,
+                                   __nv_bfloat16* C, int M, int N, int K) {
+    if (M == 0 || N == 0) return;
+    const int total = M * N;
+    const int block = 128;
+    const int grid  = (total + block - 1) / block;
+    matmul_ABT_bf16_kernel<<<grid, block>>>(A, B, C, M, N, K);
+}
+
+__global__ void scale_mask_softmax_rows_bf16_kernel(__nv_bfloat16* __restrict__ S,
+                                                    int Lq, int Lk,
+                                                    float scale,
+                                                    const float* __restrict__ mask) {
+    extern __shared__ float ssm[];  // size = blockDim.x
+    const int q = blockIdx.x;
+    const int tid = threadIdx.x;
+    __nv_bfloat16* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+
+    float local_max = -1e30f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        float v = __bfloat162float(row[k]) * scale;
+        if (mask && mask[k] <= 0.5f) v = -1e30f;
+        if (v > local_max) local_max = v;
+    }
+    ssm[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float o = ssm[tid + s];
+            if (o > ssm[tid]) ssm[tid] = o;
+        }
+        __syncthreads();
+    }
+    const float rmax = ssm[0];
+    const bool empty = (rmax <= -1e29f);
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        float v = __bfloat162float(row[k]) * scale;
+        if (mask && mask[k] <= 0.5f) v = -1e30f;
+        const float e = empty ? 0.0f : __expf(v - rmax);
+        row[k] = __float2bfloat16(e);
+        local_sum += e;
+    }
+    ssm[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) ssm[tid] += ssm[tid + s];
+        __syncthreads();
+    }
+    const float rsum = ssm[0];
+    const float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
+
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        const float e = __bfloat162float(row[k]);
+        row[k] = __float2bfloat16(e * inv);
+    }
+}
+
+__global__ void flash_attention_bf16_kernel(
+        const __nv_bfloat16* __restrict__ Q,    // (Lq, D)
+        const __nv_bfloat16* __restrict__ K,    // (Lk, D)
+        const __nv_bfloat16* __restrict__ V,    // (Lk, D)
+        const float*  __restrict__ mask, // (Lk,) may be null
+        __nv_bfloat16* __restrict__ Out,        // (Lq, D)
+        int Lq, int Lk, int D, int head_dim,
+        int causal) {
+    extern __shared__ float s_smem[];
+    float* scores = s_smem;
+    float* red    = s_smem + FA_KTILE;
+
+    const int q = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int head_off = h * head_dim;
+    const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
+
+    float run_max = -1e30f;
+    float run_sum = 0.0f;
+
+    constexpr int MAX_HD_PER_THREAD = 8;
+    float partial[MAX_HD_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
+
+    for (int k0 = 0; k0 < Lk; k0 += FA_KTILE) {
+        if (causal && k0 > q) break;
+        int klen = (Lk - k0) < FA_KTILE ? (Lk - k0) : FA_KTILE;
+        if (causal && k0 + klen - 1 > q) klen = q - k0 + 1;
+
+        for (int t = tid; t < klen; t += blockDim.x) {
+            const int kg = k0 + t;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += __bfloat162float(Q[q * D + head_off + d]) *
+                       __bfloat162float(K[kg * D + head_off + d]);
+            }
+            float s = dot * inv_sqrt;
+            if (mask && mask[kg] <= 0.5f) s = -1e30f;
+            scores[t] = s;
+        }
+        __syncthreads();
+
+        float local_max = -1e30f;
+        for (int t = tid; t < klen; t += blockDim.x) {
+            if (scores[t] > local_max) local_max = scores[t];
+        }
+        red[tid] = local_max;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                const float other = red[tid + stride];
+                if (other > red[tid]) red[tid] = other;
+            }
+            __syncthreads();
+        }
+        const float tile_max = red[0];
+        const float m_new = (tile_max > run_max) ? tile_max : run_max;
+
+        const bool tile_empty = (m_new <= -1e29f);
+        for (int t = tid; t < klen; t += blockDim.x) {
+            const float e = tile_empty ? 0.0f : __expf(scores[t] - m_new);
+            scores[t] = e;
+        }
+        __syncthreads();
+        float local_sum = 0.0f;
+        for (int t = tid; t < klen; t += blockDim.x) local_sum += scores[t];
+        red[tid] = local_sum;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) red[tid] += red[tid + stride];
+            __syncthreads();
+        }
+        const float tile_sum = red[0];
+
+        float alpha;
+        if (run_max <= -1e29f) {
+            alpha = 0.0f;
+        } else {
+            alpha = __expf(run_max - m_new);
+        }
+
+        int slot = 0;
+        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+            if (slot >= MAX_HD_PER_THREAD) break;
+            float acc = alpha * partial[slot];
+            for (int t = 0; t < klen; ++t) {
+                acc += scores[t] *
+                       __bfloat162float(V[(k0 + t) * D + head_off + d]);
+            }
+            partial[slot] = acc;
+        }
+
+        run_max = m_new;
+        run_sum = alpha * run_sum + tile_sum;
+
+        __syncthreads();
+    }
+
+    const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
+    int slot = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+        if (slot >= MAX_HD_PER_THREAD) break;
+        Out[q * D + head_off + d] = __float2bfloat16(partial[slot] * inv);
+    }
+}
+
+__global__ void fa_scale_mask_causal_softmax_rows_bf16_kernel(
+        __nv_bfloat16* __restrict__ S,
+        int Lq, int Lk,
+        float scale,
+        const float* __restrict__ mask,
+        int causal) {
+    extern __shared__ float ssm[];
+    const int q = blockIdx.x;
+    const int tid = threadIdx.x;
+    __nv_bfloat16* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+
+    float local_max = -1e30f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        float v = __bfloat162float(row[k]) * scale;
+        if (mask && mask[k] <= 0.5f) v = -1e30f;
+        if (causal && k > q) v = -1e30f;
+        if (v > local_max) local_max = v;
+    }
+    ssm[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float o = ssm[tid + s];
+            if (o > ssm[tid]) ssm[tid] = o;
+        }
+        __syncthreads();
+    }
+    const float rmax = ssm[0];
+    const bool empty = (rmax <= -1e29f);
+
+    float local_sum = 0.0f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        float v = __bfloat162float(row[k]) * scale;
+        if (mask && mask[k] <= 0.5f) v = -1e30f;
+        if (causal && k > q) v = -1e30f;
+        const float e = empty ? 0.0f : __expf(v - rmax);
+        row[k] = __float2bfloat16(e);
+        local_sum += e;
+    }
+    ssm[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) ssm[tid] += ssm[tid + s];
+        __syncthreads();
+    }
+    const float rsum = ssm[0];
+    const float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
+
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        const float e = __bfloat162float(row[k]);
+        row[k] = __float2bfloat16(e * inv);
+    }
+}
+
+__global__ void fa_dP_bf16_kernel(const __nv_bfloat16* __restrict__ dOh,
+                                  const __nv_bfloat16* __restrict__ Vh,
+                                  __nv_bfloat16* __restrict__ dP,
+                                  int Lq, int Lk, int hd) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    const int q = blockIdx.y * blockDim.y + threadIdx.y;
+    if (q >= Lq || k >= Lk) return;
+    float acc = 0.0f;
+    for (int d = 0; d < hd; ++d) {
+        acc += __bfloat162float(dOh[q * hd + d]) *
+               __bfloat162float(Vh[k * hd + d]);
+    }
+    dP[q * Lk + k] = __float2bfloat16(acc);
+}
+
+__global__ void fa_dS_from_P_dP_bf16_kernel(__nv_bfloat16* __restrict__ P_dS,
+                                            const __nv_bfloat16* __restrict__ dP,
+                                            int Lq, int Lk,
+                                            float scale) {
+    extern __shared__ float ssm[];
+    const int q = blockIdx.x;
+    const int tid = threadIdx.x;
+    __nv_bfloat16* prow = P_dS + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+    const __nv_bfloat16* dprow = dP + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+
+    float local = 0.0f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        local += __bfloat162float(prow[k]) * __bfloat162float(dprow[k]);
+    }
+    ssm[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) ssm[tid] += ssm[tid + s];
+        __syncthreads();
+    }
+    const float Dq = ssm[0];
+
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        const float p  = __bfloat162float(prow[k]);
+        const float dp = __bfloat162float(dprow[k]);
+        prow[k] = __float2bfloat16(p * (dp - Dq) * scale);
+    }
+}
+
+__global__ void fa_dVh_bf16_kernel(const __nv_bfloat16* __restrict__ P,
+                                   const __nv_bfloat16* __restrict__ dOh,
+                                   __nv_bfloat16* __restrict__ dVh,
+                                   int Lq, int Lk, int hd) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = blockIdx.y * blockDim.y + threadIdx.y;
+    if (k >= Lk || d >= hd) return;
+    float acc = 0.0f;
+    for (int q = 0; q < Lq; ++q) {
+        acc += __bfloat162float(P[q * Lk + k]) * __bfloat162float(dOh[q * hd + d]);
+    }
+    dVh[k * hd + d] = __float2bfloat16(acc);
+}
+
+__global__ void fa_dQh_bf16_kernel(const __nv_bfloat16* __restrict__ dS,
+                                   const __nv_bfloat16* __restrict__ Kh,
+                                   __nv_bfloat16* __restrict__ dQh,
+                                   int Lq, int Lk, int hd) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int q = blockIdx.y * blockDim.y + threadIdx.y;
+    if (q >= Lq || d >= hd) return;
+    float acc = 0.0f;
+    for (int k = 0; k < Lk; ++k) {
+        acc += __bfloat162float(dS[q * Lk + k]) * __bfloat162float(Kh[k * hd + d]);
+    }
+    dQh[q * hd + d] = __float2bfloat16(acc);
+}
+
+__global__ void fa_dKh_bf16_kernel(const __nv_bfloat16* __restrict__ dS,
+                                   const __nv_bfloat16* __restrict__ Qh,
+                                   __nv_bfloat16* __restrict__ dKh,
+                                   int Lq, int Lk, int hd) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = blockIdx.y * blockDim.y + threadIdx.y;
+    if (k >= Lk || d >= hd) return;
+    float acc = 0.0f;
+    for (int q = 0; q < Lq; ++q) {
+        acc += __bfloat162float(dS[q * Lk + k]) * __bfloat162float(Qh[q * hd + d]);
+    }
+    dKh[k * hd + d] = __float2bfloat16(acc);
+}
+
+// BF16 in-place add: dst[i] += src[i] (FP32 sum, written back as BF16).
+__global__ void fa_bf16_add_inplace_kernel(__nv_bfloat16* __restrict__ dst,
+                                           const __nv_bfloat16* __restrict__ src,
+                                           int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2bfloat16(__bfloat162float(dst[i]) + __bfloat162float(src[i]));
+}
+
+// ─── BF16 batched-linear helpers ────────────────────────────────────────────
+//
+// linear_forward_batched_fp16 / linear_backward_batched (gemm.cu / batched_ops.cu)
+// are fixed-FP16 / FP16-or-FP32 and out of this chunk's scope. The flash qkvo
+// ops need a BF16 projection path, so flash_attention.cu carries its own
+// self-contained BF16 batched-linear forward + backward — same contracts:
+//   forward:  Y_BD(B, out) = X_BD(B, in) @ W(out, in)^T + bias
+//   backward: dX_BD = dY·W ; dW += dY^T·X (FP32 scratch) ; dB += colsum(dY).
+
+__global__ void fa_bf16_bias_add_kernel(__nv_bfloat16* __restrict__ Y,
+                                        const __nv_bfloat16* __restrict__ bias,
+                                        int B, int out_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = B * out_dim;
+    if (idx >= total) return;
+    const int j = idx % out_dim;
+    const float yv = __bfloat162float(Y[idx]);
+    const float bv = __bfloat162float(bias[j]);
+    Y[idx] = __float2bfloat16(yv + bv);
+}
+
+__global__ void fa_lbb_dx_bf16_kernel(const __nv_bfloat16* __restrict__ W,
+                                      const __nv_bfloat16* __restrict__ dY,
+                                      __nv_bfloat16* __restrict__ dX,
+                                      int B, int out_dim, int in_dim) {
+    const int b = blockIdx.y;
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B || j >= in_dim) return;
+    const __nv_bfloat16* dY_row = dY + static_cast<size_t>(b) * out_dim;
+    float acc = 0.0f;
+    for (int i = 0; i < out_dim; ++i) {
+        acc += __bfloat162float(W[static_cast<size_t>(i) * in_dim + j]) *
+               __bfloat162float(dY_row[i]);
+    }
+    dX[static_cast<size_t>(b) * in_dim + j] = __float2bfloat16(acc);
+}
+
+__global__ void fa_lbb_dw_bf16_kernel(const __nv_bfloat16* __restrict__ dY,
+                                      const __nv_bfloat16* __restrict__ X,
+                                      float* __restrict__ dW_scratch,
+                                      int B, int out_dim, int in_dim) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= out_dim || j >= in_dim) return;
+    float acc = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        acc += __bfloat162float(dY[static_cast<size_t>(b) * out_dim + i]) *
+               __bfloat162float(X [static_cast<size_t>(b) * in_dim  + j]);
+    }
+    dW_scratch[static_cast<size_t>(i) * in_dim + j] = acc;
+}
+
+__global__ void fa_lbb_db_bf16_kernel(const __nv_bfloat16* __restrict__ dY,
+                                      float* __restrict__ dB_scratch,
+                                      int B, int out_dim) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_dim) return;
+    float acc = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        acc += __bfloat162float(dY[static_cast<size_t>(b) * out_dim + i]);
+    }
+    dB_scratch[i] = acc;
+}
+
+__global__ void fa_add_fp32_into_bf16_kernel(const float* __restrict__ src,
+                                             __nv_bfloat16* __restrict__ dst,
+                                             int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2bfloat16(__bfloat162float(dst[i]) + src[i]);
+}
+
 } // namespace
 
 namespace detail::cuda {
+
+// ─── BF16 batched-linear host wrappers (file-local) ─────────────────────────
+//
+// BF16 twins of linear_forward_batched_fp16 / linear_backward_batched, built
+// on the file-local naive BF16 matmul + FP32-scratch fold kernels above. Used
+// by the BF16 path of the qkvo flash-attention ops.
+
+namespace {
+
+void fa_linear_forward_batched_bf16(const Tensor& W, const Tensor* bias,
+                                    const Tensor& X_BD, Tensor& Y_BD) {
+    const int B       = X_BD.rows;
+    const int in_dim  = X_BD.cols;
+    const int out_dim = W.rows;
+    if (W.cols != in_dim) {
+        throw std::runtime_error("fa_linear_forward_batched_bf16: shape mismatch");
+    }
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::BF16) {
+        Y_BD.resize(B, out_dim, Dtype::BF16);
+    }
+    if (B == 0 || out_dim == 0) return;
+    launch_matmul_ABT_bf16(
+        static_cast<const __nv_bfloat16*>(X_BD.data),
+        static_cast<const __nv_bfloat16*>(W.data),
+        static_cast<__nv_bfloat16*>(Y_BD.data),
+        B, out_dim, in_dim);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    if (bias && bias->size() > 0) {
+        const int total = B * out_dim;
+        const int blocks = (total + 255) / 256;
+        fa_bf16_bias_add_kernel<<<blocks, 256>>>(
+            static_cast<__nv_bfloat16*>(Y_BD.data),
+            static_cast<const __nv_bfloat16*>(bias->data),
+            B, out_dim);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+// dX_BD overwritten; dW / dB accumulate (+=), matching linear_backward_batched.
+void fa_linear_backward_batched_bf16(const Tensor& W, const Tensor& X_BD,
+                                     const Tensor& dY_BD,
+                                     Tensor& dX_BD, Tensor& dW, Tensor& dB) {
+    const int out_dim = W.rows;
+    const int in_dim  = W.cols;
+    const int B       = X_BD.rows;
+    if (dX_BD.rows != B || dX_BD.cols != in_dim || dX_BD.dtype != Dtype::BF16) {
+        dX_BD.resize(B, in_dim, Dtype::BF16);
+    }
+    if (B == 0) return;
+
+    if (in_dim > 0 && out_dim > 0) {
+        dim3 block(64, 1);
+        dim3 grid((in_dim + 63) / 64, B);
+        fa_lbb_dx_bf16_kernel<<<grid, block>>>(
+            static_cast<const __nv_bfloat16*>(W.data),
+            static_cast<const __nv_bfloat16*>(dY_BD.data),
+            static_cast<__nv_bfloat16*>(dX_BD.data),
+            B, out_dim, in_dim);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+    if (out_dim > 0 && in_dim > 0) {
+        const int dw_n = out_dim * in_dim;
+        float* d_dw_scratch = nullptr;
+        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dw_scratch),
+                                        dw_n * sizeof(float)));
+        dim3 block(16, 16);
+        dim3 grid((in_dim + 15) / 16, (out_dim + 15) / 16);
+        fa_lbb_dw_bf16_kernel<<<grid, block>>>(
+            static_cast<const __nv_bfloat16*>(dY_BD.data),
+            static_cast<const __nv_bfloat16*>(X_BD.data),
+            d_dw_scratch, B, out_dim, in_dim);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        const int blocks_fold = (dw_n + 255) / 256;
+        fa_add_fp32_into_bf16_kernel<<<blocks_fold, 256>>>(
+            d_dw_scratch, static_cast<__nv_bfloat16*>(dW.data), dw_n);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        cudaFree(d_dw_scratch);
+    }
+    if (out_dim > 0) {
+        float* d_db_scratch = nullptr;
+        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db_scratch),
+                                        out_dim * sizeof(float)));
+        const int blocks = (out_dim + 255) / 256;
+        fa_lbb_db_bf16_kernel<<<blocks, 256>>>(
+            static_cast<const __nv_bfloat16*>(dY_BD.data),
+            d_db_scratch, B, out_dim);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        const int blocks_fold = (out_dim + 255) / 256;
+        fa_add_fp32_into_bf16_kernel<<<blocks_fold, 256>>>(
+            d_db_scratch, static_cast<__nv_bfloat16*>(dB.data), out_dim);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        cudaFree(d_db_scratch);
+    }
+}
+
+} // namespace
 
 void flash_attention_forward(const Tensor& Q,
                              const Tensor& K,
@@ -496,9 +1043,17 @@ void flash_attention_forward(const Tensor& Q,
                              int num_heads,
                              bool causal,
                              Tensor& O) {
-    if (Q.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 || V.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_forward: Q, K, V must be FP16");
+    // Dtype-dispatched: FP16 or BF16. All Q/K/V (and O) must share one dtype.
+    // BF16 exists so brodiffusion can run bf16 attention; FP16 behaviour is
+    // kept byte-identical.
+    const Dtype dt = Q.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("flash_attention_forward: Q, K, V must be FP16 or BF16");
     }
+    if (K.dtype != dt || V.dtype != dt) {
+        throw std::runtime_error("flash_attention_forward: Q, K, V dtype must match");
+    }
+    const bool bf16 = (dt == Dtype::BF16);
     const int Lq = Q.rows;
     const int Lk = K.rows;
     const int D  = Q.cols;
@@ -512,8 +1067,8 @@ void flash_attention_forward(const Tensor& Q,
         throw std::runtime_error("flash_attention_forward: causal requires Lq == Lk");
     }
     const int head_dim = D / num_heads;
-    if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
-        O.resize(Lq, D, Dtype::FP16);
+    if (O.rows != Lq || O.cols != D || O.dtype != dt) {
+        O.resize(Lq, D, dt);
     }
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
@@ -528,14 +1083,25 @@ void flash_attention_forward(const Tensor& Q,
         }
         dim3 grid(Lq, num_heads, 1);
         cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
-        flash_attention_kernel<<<grid, FA_BLOCK, shmem, stream>>>(
-            reinterpret_cast<const __half*>(Q.data),
-            reinterpret_cast<const __half*>(K.data),
-            reinterpret_cast<const __half*>(V.data),
-            d_mask,
-            reinterpret_cast<__half*>(O.data),
-            Lq, Lk, D, head_dim,
-            1);
+        if (bf16) {
+            flash_attention_bf16_kernel<<<grid, FA_BLOCK, shmem, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(Q.data),
+                reinterpret_cast<const __nv_bfloat16*>(K.data),
+                reinterpret_cast<const __nv_bfloat16*>(V.data),
+                d_mask,
+                reinterpret_cast<__nv_bfloat16*>(O.data),
+                Lq, Lk, D, head_dim,
+                1);
+        } else {
+            flash_attention_kernel<<<grid, FA_BLOCK, shmem, stream>>>(
+                reinterpret_cast<const __half*>(Q.data),
+                reinterpret_cast<const __half*>(K.data),
+                reinterpret_cast<const __half*>(V.data),
+                d_mask,
+                reinterpret_cast<__half*>(O.data),
+                Lq, Lk, D, head_dim,
+                1);
+        }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -548,14 +1114,18 @@ void flash_attention_forward(const Tensor& Q,
     //   4. Oh(Lq, head_dim) = S @ Vth^T        via launch_matmul_ABT.
     //   5. Pack Oh back into O at slot [h*hd .. (h+1)*hd).
     //
+    // BF16 cannot use the FP16 WMMA matmul (tensor cores are FP16/TF32 here);
+    // it routes through the file-local naive BF16 matmul instead. The per-head
+    // pipeline is otherwise identical.
+    //
     // Scratch tensors are scoped local; for SD1.5 worst-case (Lq=Lk=4096,
     // head_dim=40) the S buffer is 32 MB and the per-head buffers a few
     // hundred KB. Allocator reuse makes subsequent calls effectively free.
-    Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, head_dim, Dtype::FP16);
-    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk, head_dim, Dtype::FP16);
-    Tensor Vth = Tensor::empty_on(Device::CUDA, head_dim, Lk, Dtype::FP16);
-    Tensor S = Tensor::empty_on(Device::CUDA, Lq, Lk, Dtype::FP16);
-    Tensor Oh = Tensor::empty_on(Device::CUDA, Lq, head_dim, Dtype::FP16);
+    Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, head_dim, dt);
+    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk, head_dim, dt);
+    Tensor Vth = Tensor::empty_on(Device::CUDA, head_dim, Lk, dt);
+    Tensor S = Tensor::empty_on(Device::CUDA, Lq, Lk, dt);
+    Tensor Oh = Tensor::empty_on(Device::CUDA, Lq, head_dim, dt);
 
     const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(head_dim));
 
@@ -567,10 +1137,44 @@ void flash_attention_forward(const Tensor& Q,
 
     for (int h = 0; h < num_heads; ++h) {
         const int head_off = h * head_dim;
-
-        // 1. Extract per-head buffers.
         const int total_q = Lq * head_dim;
         const int total_k = Lk * head_dim;
+        const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
+
+        if (bf16) {
+            extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                reinterpret_cast<const __nv_bfloat16*>(Q.data),
+                reinterpret_cast<__nv_bfloat16*>(Qh.data),
+                Lq, D, head_off, head_dim);
+            extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                reinterpret_cast<const __nv_bfloat16*>(K.data),
+                reinterpret_cast<__nv_bfloat16*>(Kh.data),
+                Lk, D, head_off, head_dim);
+            extract_head_DL_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                reinterpret_cast<const __nv_bfloat16*>(V.data),
+                reinterpret_cast<__nv_bfloat16*>(Vth.data),
+                Lk, D, head_off, head_dim);
+            launch_matmul_ABT_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(Qh.data),
+                reinterpret_cast<const __nv_bfloat16*>(Kh.data),
+                reinterpret_cast<__nv_bfloat16*>(S.data),
+                Lq, Lk, head_dim);
+            scale_mask_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem>>>(
+                reinterpret_cast<__nv_bfloat16*>(S.data),
+                Lq, Lk, inv_sqrt, d_mask);
+            launch_matmul_ABT_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(S.data),
+                reinterpret_cast<const __nv_bfloat16*>(Vth.data),
+                reinterpret_cast<__nv_bfloat16*>(Oh.data),
+                Lq, head_dim, Lk);
+            pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                reinterpret_cast<const __nv_bfloat16*>(Oh.data),
+                reinterpret_cast<__nv_bfloat16*>(O.data),
+                Lq, D, head_off, head_dim);
+            continue;
+        }
+
+        // 1. Extract per-head buffers.
         extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
             reinterpret_cast<const __half*>(Q.data),
             reinterpret_cast<__half*>(Qh.data),
@@ -592,7 +1196,6 @@ void flash_attention_forward(const Tensor& Q,
             Lq, Lk, head_dim);
 
         // 3. Row-wise softmax (scaled, optionally masked).
-        const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
         scale_mask_softmax_rows_kernel<<<Lq, sm_block, shmem>>>(
             reinterpret_cast<__half*>(S.data),
             Lq, Lk, inv_sqrt, d_mask);
@@ -621,25 +1224,35 @@ void flash_attention_project_kv(const Tensor& ctx,
                                     const Tensor& Wv, const Tensor* bv,
                                     Tensor& K_out,
                                     Tensor& V_out) {
-    if (ctx.dtype != Dtype::FP16 || Wk.dtype != Dtype::FP16 ||
-        Wv.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_project_kv: all tensors must be FP16");
+    const Dtype dt = ctx.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("flash_attention_project_kv: tensors must be FP16 or BF16");
     }
+    if (Wk.dtype != dt || Wv.dtype != dt ||
+        (bk && bk->dtype != dt) || (bv && bv->dtype != dt)) {
+        throw std::runtime_error("flash_attention_project_kv: dtype mismatch");
+    }
+    const bool bf16 = (dt == Dtype::BF16);
     const int Lk = ctx.rows;
     const int D_ctx = ctx.cols;
     const int D = Wk.rows;
     if (Wk.cols != D_ctx || Wv.rows != D || Wv.cols != D_ctx) {
         throw std::runtime_error("flash_attention_project_kv: Wk/Wv shape mismatch");
     }
-    if (K_out.rows != Lk || K_out.cols != D || K_out.dtype != Dtype::FP16) {
-        K_out.resize(Lk, D, Dtype::FP16);
+    if (K_out.rows != Lk || K_out.cols != D || K_out.dtype != dt) {
+        K_out.resize(Lk, D, dt);
     }
-    if (V_out.rows != Lk || V_out.cols != D || V_out.dtype != Dtype::FP16) {
-        V_out.resize(Lk, D, Dtype::FP16);
+    if (V_out.rows != Lk || V_out.cols != D || V_out.dtype != dt) {
+        V_out.resize(Lk, D, dt);
     }
     if (Lk == 0 || D == 0) return;
-    linear_forward_batched_fp16(Wk, bk, ctx, K_out);
-    linear_forward_batched_fp16(Wv, bv, ctx, V_out);
+    if (bf16) {
+        fa_linear_forward_batched_bf16(Wk, bk, ctx, K_out);
+        fa_linear_forward_batched_bf16(Wv, bv, ctx, V_out);
+    } else {
+        linear_forward_batched_fp16(Wk, bk, ctx, K_out);
+        linear_forward_batched_fp16(Wv, bv, ctx, V_out);
+    }
 }
 
 // Core attention with caller-supplied K/V (pre-projected). Projects X → Q
@@ -655,10 +1268,15 @@ void flash_attention_q_with_kv_cached_forward(const Tensor& X,
                                                   int num_heads,
                                                   bool causal,
                                                   Tensor& O) {
-    if (X.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 || V.dtype != Dtype::FP16 ||
-        Wq.dtype != Dtype::FP16 || Wo.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_q_with_kv_cached_forward: all tensors must be FP16");
+    const Dtype dt = X.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("flash_attention_q_with_kv_cached_forward: tensors must be FP16 or BF16");
     }
+    if (K.dtype != dt || V.dtype != dt || Wq.dtype != dt || Wo.dtype != dt ||
+        (bq && bq->dtype != dt) || (bo && bo->dtype != dt)) {
+        throw std::runtime_error("flash_attention_q_with_kv_cached_forward: dtype mismatch");
+    }
+    const bool bf16 = (dt == Dtype::BF16);
     const int Lq = X.rows;
     const int D  = X.cols;
     const int Lk = K.rows;
@@ -671,17 +1289,23 @@ void flash_attention_q_with_kv_cached_forward(const Tensor& X,
     if (num_heads <= 0 || D % num_heads != 0) {
         throw std::runtime_error("flash_attention_q_with_kv_cached_forward: num_heads must divide D");
     }
-    if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
-        O.resize(Lq, D, Dtype::FP16);
+    if (O.rows != Lq || O.cols != D || O.dtype != dt) {
+        O.resize(Lq, D, dt);
     }
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
-    Tensor Qp = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
-    Tensor Op = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
+    Tensor Qp = Tensor::empty_on(Device::CUDA, Lq, D, dt);
+    Tensor Op = Tensor::empty_on(Device::CUDA, Lq, D, dt);
 
-    linear_forward_batched_fp16(Wq, bq, X, Qp);
-    flash_attention_forward(Qp, K, V, d_mask, num_heads, causal, Op);
-    linear_forward_batched_fp16(Wo, bo, Op, O);
+    if (bf16) {
+        fa_linear_forward_batched_bf16(Wq, bq, X, Qp);
+        flash_attention_forward(Qp, K, V, d_mask, num_heads, causal, Op);
+        fa_linear_forward_batched_bf16(Wo, bo, Op, O);
+    } else {
+        linear_forward_batched_fp16(Wq, bq, X, Qp);
+        flash_attention_forward(Qp, K, V, d_mask, num_heads, causal, Op);
+        linear_forward_batched_fp16(Wo, bo, Op, O);
+    }
 }
 
 // Variant that fuses Q/K/V/O projections at the boundary. Delegates each
@@ -697,16 +1321,18 @@ void flash_attention_qkvo_forward(const Tensor& X,
                                       int num_heads,
                                       bool causal,
                                       Tensor& O) {
-    if (X.dtype != Dtype::FP16 || Wq.dtype != Dtype::FP16 ||
-        Wk.dtype != Dtype::FP16 || Wv.dtype != Dtype::FP16 ||
-        Wo.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_qkvo_forward: all tensors must be FP16");
+    const Dtype dt = X.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("flash_attention_qkvo_forward: tensors must be FP16 or BF16");
+    }
+    if (Wq.dtype != dt || Wk.dtype != dt || Wv.dtype != dt || Wo.dtype != dt) {
+        throw std::runtime_error("flash_attention_qkvo_forward: weight dtype must match X");
     }
     const int Lq = X.rows;
     const int D  = X.cols;
     const Tensor& kv_src = Ctx ? *Ctx : X;
-    if (Ctx && Ctx->dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_qkvo_forward: Ctx must be FP16");
+    if (Ctx && Ctx->dtype != dt) {
+        throw std::runtime_error("flash_attention_qkvo_forward: Ctx dtype must match X");
     }
     const int Lk = kv_src.rows;
     const int D_ctx = kv_src.cols;
@@ -720,17 +1346,18 @@ void flash_attention_qkvo_forward(const Tensor& X,
         throw std::runtime_error("flash_attention_qkvo_forward: num_heads must divide D");
     }
 
-    if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
-        O.resize(Lq, D, Dtype::FP16);
+    if (O.rows != Lq || O.cols != D || O.dtype != dt) {
+        O.resize(Lq, D, dt);
     }
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
     // Compose via the two new helpers — keeps the order of CUDA ops identical
     // to the pre-refactor code (linear_Wk, linear_Wv, linear_Wq, attention,
     // linear_Wo would actually be reordered; we mirror that by inlining Q+attn
-    // into the cached helper and projecting K/V here first).
-    Tensor Kp = Tensor::empty_on(Device::CUDA, Lk, D, Dtype::FP16);
-    Tensor Vp = Tensor::empty_on(Device::CUDA, Lk, D, Dtype::FP16);
+    // into the cached helper and projecting K/V here first). Both helpers are
+    // dtype-dispatched, so BF16 flows through transparently.
+    Tensor Kp = Tensor::empty_on(Device::CUDA, Lk, D, dt);
+    Tensor Vp = Tensor::empty_on(Device::CUDA, Lk, D, dt);
     flash_attention_project_kv(kv_src, Wk, bk, Wv, bv, Kp, Vp);
     flash_attention_q_with_kv_cached_forward(
         X, Kp, Vp, Wq, bq, Wo, bo, d_mask, num_heads, causal, O);
@@ -906,14 +1533,19 @@ void flash_attention_qkvo_backward(
     Tensor& dWo, Tensor* dbo) {
 
     // ── Argument validation (matches forward; backward adds dO/grads). ────
-    if (X.dtype != Dtype::FP16 || dO.dtype != Dtype::FP16 ||
-        Wq.dtype != Dtype::FP16 || Wk.dtype != Dtype::FP16 ||
-        Wv.dtype != Dtype::FP16 || Wo.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_qkvo_backward: all tensors must be FP16");
+    // Dtype-dispatched: FP16 or BF16; every participating tensor shares it.
+    const Dtype dt = X.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("flash_attention_qkvo_backward: tensors must be FP16 or BF16");
     }
-    if (Ctx && Ctx->dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_qkvo_backward: Ctx must be FP16");
+    if (dO.dtype != dt || Wq.dtype != dt || Wk.dtype != dt ||
+        Wv.dtype != dt || Wo.dtype != dt) {
+        throw std::runtime_error("flash_attention_qkvo_backward: all tensors must share dtype");
     }
+    if (Ctx && Ctx->dtype != dt) {
+        throw std::runtime_error("flash_attention_qkvo_backward: Ctx dtype must match X");
+    }
+    const bool bf16 = (dt == Dtype::BF16);
     const bool self_attn = (Ctx == nullptr);
     if (self_attn) {
         if (dCtx != nullptr) {
@@ -957,12 +1589,12 @@ void flash_attention_qkvo_backward(
     }
     const int hd = D / num_heads;
 
-    if (dX.rows != Lq || dX.cols != D || dX.dtype != Dtype::FP16) {
-        dX.resize(Lq, D, Dtype::FP16);
+    if (dX.rows != Lq || dX.cols != D || dX.dtype != dt) {
+        dX.resize(Lq, D, dt);
     }
     if (!self_attn) {
-        if (dCtx->rows != Lk || dCtx->cols != D_ctx || dCtx->dtype != Dtype::FP16) {
-            dCtx->resize(Lk, D_ctx, Dtype::FP16);
+        if (dCtx->rows != Lk || dCtx->cols != D_ctx || dCtx->dtype != dt) {
+            dCtx->resize(Lk, D_ctx, dt);
         }
         dCtx->zero();
     }
@@ -971,20 +1603,26 @@ void flash_attention_qkvo_backward(
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
     // ── 1. Recompute forward projections (same call as forward). ──────────
-    Tensor Q = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
-    Tensor K = Tensor::empty_on(Device::CUDA, Lk, D, Dtype::FP16);
-    Tensor V = Tensor::empty_on(Device::CUDA, Lk, D, Dtype::FP16);
-    linear_forward_batched_fp16(Wq, bq, X,      Q);
-    linear_forward_batched_fp16(Wk, bk, kv_src, K);
-    linear_forward_batched_fp16(Wv, bv, kv_src, V);
+    Tensor Q = Tensor::empty_on(Device::CUDA, Lq, D, dt);
+    Tensor K = Tensor::empty_on(Device::CUDA, Lk, D, dt);
+    Tensor V = Tensor::empty_on(Device::CUDA, Lk, D, dt);
+    if (bf16) {
+        fa_linear_forward_batched_bf16(Wq, bq, X,      Q);
+        fa_linear_forward_batched_bf16(Wk, bk, kv_src, K);
+        fa_linear_forward_batched_bf16(Wv, bv, kv_src, V);
+    } else {
+        linear_forward_batched_fp16(Wq, bq, X,      Q);
+        linear_forward_batched_fp16(Wk, bk, kv_src, K);
+        linear_forward_batched_fp16(Wv, bv, kv_src, V);
+    }
 
     // ── 2. Per-head recompute of P and O_attn (Lq, D). ────────────────────
-    Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, hd, Dtype::FP16);
-    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
-    Tensor Vh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
-    Tensor Vth = Tensor::empty_on(Device::CUDA, hd, Lk, Dtype::FP16);   // V transposed for matmul_ABT in O_attn step
-    Tensor P_main = Tensor::empty_on(Device::CUDA, Lq, Lk, Dtype::FP16); // P during main bwd sweep (per head)
-    Tensor O_attn = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);  // full (Lq, D) post-attn pre-Wo
+    Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
+    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
+    Tensor Vh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
+    Tensor Vth = Tensor::empty_on(Device::CUDA, hd, Lk, dt);   // V transposed for matmul_ABT in O_attn step
+    Tensor P_main = Tensor::empty_on(Device::CUDA, Lq, Lk, dt); // P during main bwd sweep (per head)
+    Tensor O_attn = Tensor::empty_on(Device::CUDA, Lq, D, dt);  // full (Lq, D) post-attn pre-Wo
 
     constexpr int CP_BLOCK = 256;
     int sm_block = 32;
@@ -993,14 +1631,48 @@ void flash_attention_qkvo_backward(
     const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(hd));
 
     // Recompute pass 1: fill O_attn so we can run Wo backward against it.
-    // We use launch_matmul_ABT for both matmuls — mirror forward's WMMA path.
+    // We use launch_matmul_ABT for both matmuls — mirror forward's WMMA path
+    // (the file-local naive BF16 matmul for the BF16 dtype).
     {
-        Tensor S = Tensor::empty_on(Device::CUDA, Lq, Lk, Dtype::FP16);
-        Tensor Oh = Tensor::empty_on(Device::CUDA, Lq, hd, Dtype::FP16);
+        Tensor S = Tensor::empty_on(Device::CUDA, Lq, Lk, dt);
+        Tensor Oh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
         for (int h = 0; h < num_heads; ++h) {
             const int head_off = h * hd;
             const int total_q = Lq * hd;
             const int total_k = Lk * hd;
+            const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
+            if (bf16) {
+                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(Q.data),
+                    reinterpret_cast<__nv_bfloat16*>(Qh.data),
+                    Lq, D, head_off, hd);
+                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(K.data),
+                    reinterpret_cast<__nv_bfloat16*>(Kh.data),
+                    Lk, D, head_off, hd);
+                extract_head_DL_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(V.data),
+                    reinterpret_cast<__nv_bfloat16*>(Vth.data),
+                    Lk, D, head_off, hd);
+                launch_matmul_ABT_bf16(
+                    reinterpret_cast<const __nv_bfloat16*>(Qh.data),
+                    reinterpret_cast<const __nv_bfloat16*>(Kh.data),
+                    reinterpret_cast<__nv_bfloat16*>(S.data),
+                    Lq, Lk, hd);
+                fa_scale_mask_causal_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem>>>(
+                    reinterpret_cast<__nv_bfloat16*>(S.data),
+                    Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
+                launch_matmul_ABT_bf16(
+                    reinterpret_cast<const __nv_bfloat16*>(S.data),
+                    reinterpret_cast<const __nv_bfloat16*>(Vth.data),
+                    reinterpret_cast<__nv_bfloat16*>(Oh.data),
+                    Lq, hd, Lk);
+                pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(Oh.data),
+                    reinterpret_cast<__nv_bfloat16*>(O_attn.data),
+                    Lq, D, head_off, hd);
+                continue;
+            }
             extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
                 reinterpret_cast<const __half*>(Q.data),
                 reinterpret_cast<__half*>(Qh.data),
@@ -1020,7 +1692,6 @@ void flash_attention_qkvo_backward(
                 reinterpret_cast<__half*>(S.data),
                 Lq, Lk, hd);
 
-            const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
             fa_scale_mask_causal_softmax_rows_kernel<<<Lq, sm_block, shmem>>>(
                 reinterpret_cast<__half*>(S.data),
                 Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
@@ -1045,35 +1716,125 @@ void flash_attention_qkvo_backward(
     //     dO_attn(Lq, D) = dO @ Wo  (linear_backward_batched's dX_BD)
     //     dWo(D, D)     += dO^T @ O_attn
     //     dbo           += colsum(dO)
-    Tensor dO_attn = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
+    Tensor dO_attn = Tensor::empty_on(Device::CUDA, Lq, D, dt);
     {
         // linear_backward_batched needs a non-null dB even when bias isn't
         // present in the forward. We always have dWo; for bo absent we feed a
         // scratch dB tensor and discard.
-        Tensor scratch_db = Tensor::empty_on(Device::CUDA, 0, 0, Dtype::FP16);
+        Tensor scratch_db = Tensor::empty_on(Device::CUDA, 0, 0, dt);
         const bool has_bo = (bo != nullptr);
         if (!has_bo) {
-            scratch_db.resize(D, 1, Dtype::FP16);
+            scratch_db.resize(D, 1, dt);
             scratch_db.zero();
         }
-        linear_backward_batched(Wo, O_attn, dO, dO_attn, dWo,
-                                    has_bo ? *dbo : scratch_db);
+        if (bf16) {
+            fa_linear_backward_batched_bf16(Wo, O_attn, dO, dO_attn, dWo,
+                                            has_bo ? *dbo : scratch_db);
+        } else {
+            linear_backward_batched(Wo, O_attn, dO, dO_attn, dWo,
+                                        has_bo ? *dbo : scratch_db);
+        }
     }
 
     // ── 4. Per-head backward sweep. ───────────────────────────────────────
-    Tensor dQ = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16); dQ.zero();
-    Tensor dK = Tensor::empty_on(Device::CUDA, Lk, D, Dtype::FP16); dK.zero();
-    Tensor dV = Tensor::empty_on(Device::CUDA, Lk, D, Dtype::FP16); dV.zero();
+    Tensor dQ = Tensor::empty_on(Device::CUDA, Lq, D, dt); dQ.zero();
+    Tensor dK = Tensor::empty_on(Device::CUDA, Lk, D, dt); dK.zero();
+    Tensor dV = Tensor::empty_on(Device::CUDA, Lk, D, dt); dV.zero();
     {
-        Tensor dOh = Tensor::empty_on(Device::CUDA, Lq, hd, Dtype::FP16);
-        Tensor dP = Tensor::empty_on(Device::CUDA, Lq, Lk, Dtype::FP16);
-        Tensor dQh = Tensor::empty_on(Device::CUDA, Lq, hd, Dtype::FP16);
-        Tensor dKh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
-        Tensor dVh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
+        Tensor dOh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
+        Tensor dP = Tensor::empty_on(Device::CUDA, Lq, Lk, dt);
+        Tensor dQh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
+        Tensor dKh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
+        Tensor dVh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
         for (int h = 0; h < num_heads; ++h) {
             const int head_off = h * hd;
             const int total_q = Lq * hd;
             const int total_k = Lk * hd;
+            const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
+
+            if (bf16) {
+                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(Q.data),
+                    reinterpret_cast<__nv_bfloat16*>(Qh.data),
+                    Lq, D, head_off, hd);
+                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(K.data),
+                    reinterpret_cast<__nv_bfloat16*>(Kh.data),
+                    Lk, D, head_off, hd);
+                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(V.data),
+                    reinterpret_cast<__nv_bfloat16*>(Vh.data),
+                    Lk, D, head_off, hd);
+                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(dO_attn.data),
+                    reinterpret_cast<__nv_bfloat16*>(dOh.data),
+                    Lq, D, head_off, hd);
+
+                launch_matmul_ABT_bf16(
+                    reinterpret_cast<const __nv_bfloat16*>(Qh.data),
+                    reinterpret_cast<const __nv_bfloat16*>(Kh.data),
+                    reinterpret_cast<__nv_bfloat16*>(P_main.data),
+                    Lq, Lk, hd);
+                fa_scale_mask_causal_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem>>>(
+                    reinterpret_cast<__nv_bfloat16*>(P_main.data),
+                    Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
+
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
+                    fa_dVh_bf16_kernel<<<grid, block>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(P_main.data),
+                        reinterpret_cast<const __nv_bfloat16*>(dOh.data),
+                        reinterpret_cast<__nv_bfloat16*>(dVh.data),
+                        Lq, Lk, hd);
+                }
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
+                    fa_dP_bf16_kernel<<<grid, block>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(dOh.data),
+                        reinterpret_cast<const __nv_bfloat16*>(Vh.data),
+                        reinterpret_cast<__nv_bfloat16*>(dP.data),
+                        Lq, Lk, hd);
+                }
+                {
+                    fa_dS_from_P_dP_bf16_kernel<<<Lq, sm_block, shmem>>>(
+                        reinterpret_cast<__nv_bfloat16*>(P_main.data),
+                        reinterpret_cast<const __nv_bfloat16*>(dP.data),
+                        Lq, Lk, inv_sqrt);
+                }
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
+                    fa_dQh_bf16_kernel<<<grid, block>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(P_main.data),
+                        reinterpret_cast<const __nv_bfloat16*>(Kh.data),
+                        reinterpret_cast<__nv_bfloat16*>(dQh.data),
+                        Lq, Lk, hd);
+                }
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
+                    fa_dKh_bf16_kernel<<<grid, block>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(P_main.data),
+                        reinterpret_cast<const __nv_bfloat16*>(Qh.data),
+                        reinterpret_cast<__nv_bfloat16*>(dKh.data),
+                        Lq, Lk, hd);
+                }
+                pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(dQh.data),
+                    reinterpret_cast<__nv_bfloat16*>(dQ.data),
+                    Lq, D, head_off, hd);
+                pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(dKh.data),
+                    reinterpret_cast<__nv_bfloat16*>(dK.data),
+                    Lk, D, head_off, hd);
+                pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(dVh.data),
+                    reinterpret_cast<__nv_bfloat16*>(dV.data),
+                    Lk, D, head_off, hd);
+                continue;
+            }
 
             extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
                 reinterpret_cast<const __half*>(Q.data),
@@ -1098,7 +1859,6 @@ void flash_attention_qkvo_backward(
                 reinterpret_cast<const __half*>(Kh.data),
                 reinterpret_cast<__half*>(P_main.data),
                 Lq, Lk, hd);
-            const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
             fa_scale_mask_causal_softmax_rows_kernel<<<Lq, sm_block, shmem>>>(
                 reinterpret_cast<__half*>(P_main.data),
                 Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
@@ -1127,8 +1887,7 @@ void flash_attention_qkvo_backward(
 
             // dS = P * (dP - D_q) * inv_sqrt — written in-place over P_main.
             {
-                const size_t shmem2 = static_cast<size_t>(sm_block) * sizeof(float);
-                fa_dS_from_P_dP_kernel<<<Lq, sm_block, shmem2>>>(
+                fa_dS_from_P_dP_kernel<<<Lq, sm_block, shmem>>>(
                     reinterpret_cast<__half*>(P_main.data),
                     reinterpret_cast<const __half*>(dP.data),
                     Lq, Lk, inv_sqrt);
@@ -1180,19 +1939,24 @@ void flash_attention_qkvo_backward(
                              const Tensor& dOut, Tensor& dIn_out,
                              Tensor& dW_acc, const Tensor* b_fwd,
                              Tensor* db_acc) {
-        Tensor scratch_db = Tensor::empty_on(Device::CUDA, 0, 0, Dtype::FP16);
+        Tensor scratch_db = Tensor::empty_on(Device::CUDA, 0, 0, dt);
         bool has_b = (b_fwd != nullptr);
         if (!has_b) {
-            scratch_db.resize(W.rows, 1, Dtype::FP16);
+            scratch_db.resize(W.rows, 1, dt);
             scratch_db.zero();
         }
-        linear_backward_batched(W, In, dOut, dIn_out, dW_acc,
-                                    has_b ? *db_acc : scratch_db);
+        if (bf16) {
+            fa_linear_backward_batched_bf16(W, In, dOut, dIn_out, dW_acc,
+                                            has_b ? *db_acc : scratch_db);
+        } else {
+            linear_backward_batched(W, In, dOut, dIn_out, dW_acc,
+                                        has_b ? *db_acc : scratch_db);
+        }
     };
 
-    Tensor dX_from_Q = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
-    Tensor dX_from_K = Tensor::empty_on(Device::CUDA, Lk, D_ctx, Dtype::FP16);
-    Tensor dX_from_V = Tensor::empty_on(Device::CUDA, Lk, D_ctx, Dtype::FP16);
+    Tensor dX_from_Q = Tensor::empty_on(Device::CUDA, Lq, D, dt);
+    Tensor dX_from_K = Tensor::empty_on(Device::CUDA, Lk, D_ctx, dt);
+    Tensor dX_from_V = Tensor::empty_on(Device::CUDA, Lk, D_ctx, dt);
 
     run_proj_back(Wq, X,      dQ, dX_from_Q, dWq, bq, dbq);
     run_proj_back(Wk, kv_src, dK, dX_from_K, dWk, bk, dbk);
@@ -1201,34 +1965,25 @@ void flash_attention_qkvo_backward(
     // ── 6. Accumulate dX / dCtx. ───────────────────────────────────────────
     // Self-attn: dX = dQ-path + dK-path + dV-path (all share input X).
     // Cross-attn: dX = dQ-path; dCtx = dK-path + dV-path (kv_src side).
-    {
-        const int blocks = (Lq * D + 255) / 256;
-        // dX <- dX_from_Q.
-        fa_fp16_add_inplace_kernel<<<blocks, 256>>>(
-            reinterpret_cast<__half*>(dX.data),
-            reinterpret_cast<const __half*>(dX_from_Q.data),
-            Lq * D);
-    }
+    auto add_into = [&](Tensor& dst, const Tensor& src, int n) {
+        const int blocks = (n + 255) / 256;
+        if (bf16) {
+            fa_bf16_add_inplace_kernel<<<blocks, 256>>>(
+                reinterpret_cast<__nv_bfloat16*>(dst.data),
+                reinterpret_cast<const __nv_bfloat16*>(src.data), n);
+        } else {
+            fa_fp16_add_inplace_kernel<<<blocks, 256>>>(
+                reinterpret_cast<__half*>(dst.data),
+                reinterpret_cast<const __half*>(src.data), n);
+        }
+    };
+    add_into(dX, dX_from_Q, Lq * D);
     if (self_attn) {
-        const int blocks = (Lq * D + 255) / 256;
-        fa_fp16_add_inplace_kernel<<<blocks, 256>>>(
-            reinterpret_cast<__half*>(dX.data),
-            reinterpret_cast<const __half*>(dX_from_K.data),
-            Lq * D);
-        fa_fp16_add_inplace_kernel<<<blocks, 256>>>(
-            reinterpret_cast<__half*>(dX.data),
-            reinterpret_cast<const __half*>(dX_from_V.data),
-            Lq * D);
+        add_into(dX, dX_from_K, Lq * D);
+        add_into(dX, dX_from_V, Lq * D);
     } else {
-        const int blocks = (Lk * D_ctx + 255) / 256;
-        fa_fp16_add_inplace_kernel<<<blocks, 256>>>(
-            reinterpret_cast<__half*>(dCtx->data),
-            reinterpret_cast<const __half*>(dX_from_K.data),
-            Lk * D_ctx);
-        fa_fp16_add_inplace_kernel<<<blocks, 256>>>(
-            reinterpret_cast<__half*>(dCtx->data),
-            reinterpret_cast<const __half*>(dX_from_V.data),
-            Lk * D_ctx);
+        add_into(*dCtx, dX_from_K, Lk * D_ctx);
+        add_into(*dCtx, dX_from_V, Lk * D_ctx);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }

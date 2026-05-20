@@ -43,6 +43,18 @@ static std::vector<float> rq(const std::vector<float>& v) {
         o[i] = brotensor::fp16_bits_to_fp32(brotensor::fp32_to_fp16_bits(v[i]));
     return o;
 }
+// BF16 equivalents (BF16-on-CUDA vs FP32 CPU reference).
+static std::vector<uint16_t> to_bf16(const std::vector<float>& v) {
+    std::vector<uint16_t> o(v.size());
+    for (size_t i = 0; i < v.size(); ++i) o[i] = brotensor::fp32_to_bf16_bits(v[i]);
+    return o;
+}
+static std::vector<float> rqbf(const std::vector<float>& v) {
+    std::vector<float> o(v.size());
+    for (size_t i = 0; i < v.size(); ++i)
+        o[i] = brotensor::bf16_bits_to_fp32(brotensor::fp32_to_bf16_bits(v[i]));
+    return o;
+}
 
 // CPU forward + backward, fp32 math throughout. Inputs are already
 // FP16-rounded values (rq above) to remove the dtype round-trip from the
@@ -182,6 +194,27 @@ static void check_fp16(const std::vector<uint16_t>& got,
     CHECK(bad == 0);
 }
 
+static void check_bf16(const std::vector<uint16_t>& got,
+                       const std::vector<float>& ref,
+                       const char* label,
+                       float atol = 1e-1f, float rtol = 1.5e-1f) {
+    int bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const float g = brotensor::bf16_bits_to_fp32(got[i]);
+        const float e = std::fabs(g - ref[i]);
+        if (e > max_err) max_err = e;
+        if (e > atol + rtol * std::fabs(ref[i])) {
+            if (bad < 3)
+                std::printf("    %s mismatch i=%zu got=%g ref=%g err=%g\n",
+                            label, i, g, ref[i], e);
+            ++bad;
+        }
+    }
+    std::printf("    %s max_err=%g bad=%d / %zu\n", label, max_err, bad, ref.size());
+    CHECK(bad == 0);
+}
+
 static void run_case(const char* label, int Lq, int Lk, int D, int nh,
                      bool use_mask, bool causal) {
     std::printf("  %s Lq=%d Lk=%d D=%d nh=%d mask=%d causal=%d\n",
@@ -249,6 +282,70 @@ static void run_case(const char* label, int Lq, int Lk, int D, int nh,
     check_fp16(dV_got, dV_ref, "dV");
 }
 
+// BF16 variant: BF16-on-CUDA vs the FP32 analytic CPU reference. BF16 carries
+// ~8 mantissa bits, so backward dQ/dK/dV use the loose 1e-1 / 1.5e-1 envelope.
+static void run_case_bf16(const char* label, int Lq, int Lk, int D, int nh,
+                          bool use_mask, bool causal) {
+    std::printf("  %s(bf16) Lq=%d Lk=%d D=%d nh=%d mask=%d causal=%d\n",
+                label, Lq, Lk, D, nh, (int)use_mask, (int)causal);
+    std::mt19937 rng(0xBADD1u + static_cast<unsigned>(Lq*131 + Lk*17 + D + nh + use_mask + (causal?7:0)));
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    std::vector<float> Q(Lq*D), K(Lk*D), V(Lk*D), dO(Lq*D);
+    for (auto& v : Q)  v = dist(rng);
+    for (auto& v : K)  v = dist(rng);
+    for (auto& v : V)  v = dist(rng);
+    for (auto& v : dO) v = dist(rng);
+    auto Qq = rqbf(Q), Kq = rqbf(K), Vq = rqbf(V), dOq = rqbf(dO);
+
+    std::vector<float> mask_host;
+    const std::vector<float>* mask_ptr = nullptr;
+    if (use_mask) {
+        mask_host.assign(Lk, 1.0f);
+        for (int k = 3*Lk/4; k < Lk; ++k) mask_host[k] = 0.0f;
+        mask_ptr = &mask_host;
+    }
+
+    std::vector<float> dQ_ref, dK_ref, dV_ref, O_ref;
+    cpu_attn_backward(Qq, Kq, Vq, dOq, mask_ptr, causal,
+                      Lq, Lk, D, nh,
+                      dQ_ref, dK_ref, dV_ref, &O_ref);
+
+    auto Qh = to_bf16(Q), Kh = to_bf16(K), Vh = to_bf16(V), dOh = to_bf16(dO);
+    Tensor Og;
+    Tensor Qg  = Tensor::from_host_bf16_on(Device::CUDA, Qh.data(),  Lq, D);
+    Tensor Kg  = Tensor::from_host_bf16_on(Device::CUDA, Kh.data(),  Lk, D);
+    Tensor Vg  = Tensor::from_host_bf16_on(Device::CUDA, Vh.data(),  Lk, D);
+    Tensor dOg = Tensor::from_host_bf16_on(Device::CUDA, dOh.data(), Lq, D);
+
+    brotensor::flash_attention_forward(Qg, Kg, Vg, nullptr, nh, causal, Og);
+
+    Tensor mg;
+    const float* d_mask = nullptr;
+    if (use_mask) {
+        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        d_mask = static_cast<const float*>(mg.data);
+    }
+    brotensor::flash_attention_forward(Qg, Kg, Vg, d_mask, nh, causal, Og);
+
+    Tensor dQg, dKg, dVg;
+    brotensor::flash_attention_backward(Qg, Kg, Vg, Og, dOg,
+                                        d_mask, nh, causal,
+                                        dQg, dKg, dVg);
+    CHECK(dQg.rows == Lq && dQg.cols == D && dQg.dtype == Dtype::BF16);
+    CHECK(dKg.rows == Lk && dKg.cols == D && dKg.dtype == Dtype::BF16);
+    CHECK(dVg.rows == Lk && dVg.cols == D && dVg.dtype == Dtype::BF16);
+
+    std::vector<uint16_t> dQ_got(Lq*D), dK_got(Lk*D), dV_got(Lk*D);
+    brotensor::sync_all();
+    dQg.copy_to_host_bf16(dQ_got.data());
+    dKg.copy_to_host_bf16(dK_got.data());
+    dVg.copy_to_host_bf16(dV_got.data());
+
+    check_bf16(dQ_got, dQ_ref, "dQ");
+    check_bf16(dK_got, dK_ref, "dK");
+    check_bf16(dV_got, dV_ref, "dV");
+}
+
 int main() {
     brotensor::init();
     if (!brotensor::is_available(brotensor::Device::CUDA)) {
@@ -266,6 +363,15 @@ int main() {
     run_case("causal-nh1",   8, 8, 8, 1, false, true);
     run_case("causal-nh2",   8, 8, 16, 2, false, true);
     run_case("causal-masked",8, 8, 16, 2, true,  true);
+    // BF16 (GPU-only): BF16-on-CUDA vs FP32 analytic reference.
+    run_case_bf16("basic-nh1",    4, 4, 8, 1, false, false);
+    run_case_bf16("basic-nh2",    4, 4, 8, 2, false, false);
+    run_case_bf16("masked-nh2",   8, 8, 16, 2, true,  false);
+    run_case_bf16("rect-nh2",     6, 10, 16, 2, false, false);
+    run_case_bf16("rect-masked",  6, 10, 16, 2, true,  false);
+    run_case_bf16("causal-nh1",   8, 8, 8, 1, false, true);
+    run_case_bf16("causal-nh2",   8, 8, 16, 2, false, true);
+    run_case_bf16("causal-masked",8, 8, 16, 2, true,  true);
     std::printf("%s (%d failures)\n",
                 g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;

@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <cmath>
 #include <stdexcept>
@@ -218,6 +219,200 @@ __global__ void fab_dKh_kernel(const __half* __restrict__ dS,
     dKh[k * hd + d] = __float2half(acc);
 }
 
+// ─── BF16 kernels (verbatim copies of the FP16 kernels above, with ──────────
+//     __half→__nv_bfloat16 / __half2float→__bfloat162float /
+//     __float2half→__float2bfloat16). All real math stays in float. ──────────
+//
+// fp16_internal::launch_matmul_ABT is FP16-only (tensor cores), so the BF16
+// path uses a self-contained naive BF16 matmul (FP32 accumulation) instead.
+
+__global__ void fab_extract_head_LD_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                                                __nv_bfloat16* __restrict__ Y,
+                                                int L, int D, int head_off, int head_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = L * head_dim;
+    if (idx >= total) return;
+    const int l = idx / head_dim;
+    const int d = idx % head_dim;
+    Y[l * head_dim + d] = X[l * D + head_off + d];
+}
+
+__global__ void fab_pack_head_LD_bf16_kernel(const __nv_bfloat16* __restrict__ Y,
+                                             __nv_bfloat16* __restrict__ Out,
+                                             int L, int D, int head_off, int head_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = L * head_dim;
+    if (idx >= total) return;
+    const int l = idx / head_dim;
+    const int d = idx % head_dim;
+    Out[l * D + head_off + d] = Y[l * head_dim + d];
+}
+
+// Naive BF16 matmul: C(M, N) = A(M, K) @ B(N, K)^T, FP32 accumulation.
+__global__ void fab_matmul_ABT_bf16_kernel(const __nv_bfloat16* __restrict__ A,
+                                           const __nv_bfloat16* __restrict__ B,
+                                           __nv_bfloat16* __restrict__ C,
+                                           int M, int N, int K) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * N;
+    if (idx >= total) return;
+    const int m = idx / N;
+    const int n = idx % N;
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        acc += __bfloat162float(A[m * K + k]) * __bfloat162float(B[n * K + k]);
+    }
+    C[idx] = __float2bfloat16(acc);
+}
+
+inline void launch_matmul_ABT_bf16(const __nv_bfloat16* A,
+                                   const __nv_bfloat16* B,
+                                   __nv_bfloat16* C, int M, int N, int K,
+                                   cudaStream_t stream) {
+    if (M == 0 || N == 0) return;
+    const int total = M * N;
+    const int block = 128;
+    const int grid  = (total + block - 1) / block;
+    fab_matmul_ABT_bf16_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
+}
+
+__global__ void fab_softmax_rows_bf16_kernel(__nv_bfloat16* __restrict__ S,
+                                             int Lq, int Lk,
+                                             float scale,
+                                             const float* __restrict__ mask,
+                                             int causal) {
+    extern __shared__ float ssm[];
+    const int q = blockIdx.x;
+    const int tid = threadIdx.x;
+    __nv_bfloat16* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+
+    float local_max = -1e30f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        float v = __bfloat162float(row[k]) * scale;
+        if (mask && mask[k] <= 0.5f) v = -1e30f;
+        if (causal && k > q) v = -1e30f;
+        if (v > local_max) local_max = v;
+    }
+    ssm[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float o = ssm[tid + s];
+            if (o > ssm[tid]) ssm[tid] = o;
+        }
+        __syncthreads();
+    }
+    const float rmax = ssm[0];
+    const bool empty = (rmax <= -1e29f);
+
+    float local_sum = 0.0f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        float v = __bfloat162float(row[k]) * scale;
+        if (mask && mask[k] <= 0.5f) v = -1e30f;
+        if (causal && k > q) v = -1e30f;
+        const float e = empty ? 0.0f : __expf(v - rmax);
+        row[k] = __float2bfloat16(e);
+        local_sum += e;
+    }
+    ssm[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) ssm[tid] += ssm[tid + s];
+        __syncthreads();
+    }
+    const float rsum = ssm[0];
+    const float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        const float e = __bfloat162float(row[k]);
+        row[k] = __float2bfloat16(e * inv);
+    }
+}
+
+__global__ void fab_dP_bf16_kernel(const __nv_bfloat16* __restrict__ dOh,
+                                   const __nv_bfloat16* __restrict__ Vh,
+                                   __nv_bfloat16* __restrict__ dP,
+                                   int Lq, int Lk, int hd) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    const int q = blockIdx.y * blockDim.y + threadIdx.y;
+    if (q >= Lq || k >= Lk) return;
+    float acc = 0.0f;
+    for (int d = 0; d < hd; ++d) {
+        acc += __bfloat162float(dOh[q * hd + d]) * __bfloat162float(Vh[k * hd + d]);
+    }
+    dP[q * Lk + k] = __float2bfloat16(acc);
+}
+
+__global__ void fab_dS_from_P_dP_bf16_kernel(__nv_bfloat16* __restrict__ P_dS,
+                                             const __nv_bfloat16* __restrict__ dP,
+                                             int Lq, int Lk,
+                                             float scale) {
+    extern __shared__ float ssm[];
+    const int q = blockIdx.x;
+    const int tid = threadIdx.x;
+    __nv_bfloat16* prow = P_dS + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+    const __nv_bfloat16* dprow = dP + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+
+    float local = 0.0f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        local += __bfloat162float(prow[k]) * __bfloat162float(dprow[k]);
+    }
+    ssm[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) ssm[tid] += ssm[tid + s];
+        __syncthreads();
+    }
+    const float Dq = ssm[0];
+
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        const float p  = __bfloat162float(prow[k]);
+        const float dp = __bfloat162float(dprow[k]);
+        prow[k] = __float2bfloat16(p * (dp - Dq) * scale);
+    }
+}
+
+__global__ void fab_dVh_bf16_kernel(const __nv_bfloat16* __restrict__ P,
+                                    const __nv_bfloat16* __restrict__ dOh,
+                                    __nv_bfloat16* __restrict__ dVh,
+                                    int Lq, int Lk, int hd) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = blockIdx.y * blockDim.y + threadIdx.y;
+    if (k >= Lk || d >= hd) return;
+    float acc = 0.0f;
+    for (int q = 0; q < Lq; ++q) {
+        acc += __bfloat162float(P[q * Lk + k]) * __bfloat162float(dOh[q * hd + d]);
+    }
+    dVh[k * hd + d] = __float2bfloat16(acc);
+}
+
+__global__ void fab_dQh_bf16_kernel(const __nv_bfloat16* __restrict__ dS,
+                                    const __nv_bfloat16* __restrict__ Kh,
+                                    __nv_bfloat16* __restrict__ dQh,
+                                    int Lq, int Lk, int hd) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int q = blockIdx.y * blockDim.y + threadIdx.y;
+    if (q >= Lq || d >= hd) return;
+    float acc = 0.0f;
+    for (int k = 0; k < Lk; ++k) {
+        acc += __bfloat162float(dS[q * Lk + k]) * __bfloat162float(Kh[k * hd + d]);
+    }
+    dQh[q * hd + d] = __float2bfloat16(acc);
+}
+
+__global__ void fab_dKh_bf16_kernel(const __nv_bfloat16* __restrict__ dS,
+                                    const __nv_bfloat16* __restrict__ Qh,
+                                    __nv_bfloat16* __restrict__ dKh,
+                                    int Lq, int Lk, int hd) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = blockIdx.y * blockDim.y + threadIdx.y;
+    if (k >= Lk || d >= hd) return;
+    float acc = 0.0f;
+    for (int q = 0; q < Lq; ++q) {
+        acc += __bfloat162float(dS[q * Lk + k]) * __bfloat162float(Qh[q * hd + d]);
+    }
+    dKh[k * hd + d] = __float2bfloat16(acc);
+}
+
 } // namespace
 
 namespace detail::cuda {
@@ -240,10 +435,15 @@ void flash_attention_backward(const Tensor& Q,
                               Tensor& dV) {
     (void)O;  // recompute-based; O retained in API for symmetry.
 
-    if (Q.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 ||
-        V.dtype != Dtype::FP16 || dO.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_backward: Q, K, V, dO must be FP16");
+    // Dtype-dispatched: FP16 or BF16; Q/K/V/dO (and dQ/dK/dV) share one dtype.
+    const Dtype dt = Q.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("flash_attention_backward: Q, K, V, dO must be FP16 or BF16");
     }
+    if (K.dtype != dt || V.dtype != dt || dO.dtype != dt) {
+        throw std::runtime_error("flash_attention_backward: Q, K, V, dO dtype must match");
+    }
+    const bool bf16 = (dt == Dtype::BF16);
     const int Lq = Q.rows;
     const int Lk = K.rows;
     const int D  = Q.cols;
@@ -261,14 +461,14 @@ void flash_attention_backward(const Tensor& Q,
     }
     const int hd = D / num_heads;
 
-    if (dQ.rows != Lq || dQ.cols != D || dQ.dtype != Dtype::FP16) {
-        dQ.resize(Lq, D, Dtype::FP16);
+    if (dQ.rows != Lq || dQ.cols != D || dQ.dtype != dt) {
+        dQ.resize(Lq, D, dt);
     }
-    if (dK.rows != Lk || dK.cols != D || dK.dtype != Dtype::FP16) {
-        dK.resize(Lk, D, Dtype::FP16);
+    if (dK.rows != Lk || dK.cols != D || dK.dtype != dt) {
+        dK.resize(Lk, D, dt);
     }
-    if (dV.rows != Lk || dV.cols != D || dV.dtype != Dtype::FP16) {
-        dV.resize(Lk, D, Dtype::FP16);
+    if (dV.rows != Lk || dV.cols != D || dV.dtype != dt) {
+        dV.resize(Lk, D, dt);
     }
     dQ.zero();
     dK.zero();
@@ -282,15 +482,15 @@ void flash_attention_backward(const Tensor& Q,
     if (sm_block > 1024) sm_block = 1024;
     const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(hd));
 
-    Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, hd, Dtype::FP16);
-    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
-    Tensor Vh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
-    Tensor dOh = Tensor::empty_on(Device::CUDA, Lq, hd, Dtype::FP16);
-    Tensor P = Tensor::empty_on(Device::CUDA, Lq, Lk, Dtype::FP16);
-    Tensor dP = Tensor::empty_on(Device::CUDA, Lq, Lk, Dtype::FP16);
-    Tensor dQh = Tensor::empty_on(Device::CUDA, Lq, hd, Dtype::FP16);
-    Tensor dKh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
-    Tensor dVh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
+    Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
+    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
+    Tensor Vh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
+    Tensor dOh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
+    Tensor P = Tensor::empty_on(Device::CUDA, Lq, Lk, dt);
+    Tensor dP = Tensor::empty_on(Device::CUDA, Lq, Lk, dt);
+    Tensor dQh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
+    Tensor dKh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
+    Tensor dVh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     (void)FAB_BLOCK;
@@ -299,6 +499,93 @@ void flash_attention_backward(const Tensor& Q,
         const int head_off = h * hd;
         const int total_q = Lq * hd;
         const int total_k = Lk * hd;
+        const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
+
+        if (bf16) {
+            // BF16 path — fp16_internal::launch_matmul_ABT is FP16-only, so
+            // use the file-local naive BF16 matmul. Math stays in float.
+            fab_extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(Q.data),
+                reinterpret_cast<__nv_bfloat16*>(Qh.data),
+                Lq, D, head_off, hd);
+            fab_extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(K.data),
+                reinterpret_cast<__nv_bfloat16*>(Kh.data),
+                Lk, D, head_off, hd);
+            fab_extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(V.data),
+                reinterpret_cast<__nv_bfloat16*>(Vh.data),
+                Lk, D, head_off, hd);
+            fab_extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(dO.data),
+                reinterpret_cast<__nv_bfloat16*>(dOh.data),
+                Lq, D, head_off, hd);
+
+            launch_matmul_ABT_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(Qh.data),
+                reinterpret_cast<const __nv_bfloat16*>(Kh.data),
+                reinterpret_cast<__nv_bfloat16*>(P.data),
+                Lq, Lk, hd, stream);
+            fab_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
+                reinterpret_cast<__nv_bfloat16*>(P.data),
+                Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
+
+            {
+                dim3 block(16, 16);
+                dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
+                fab_dVh_bf16_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(P.data),
+                    reinterpret_cast<const __nv_bfloat16*>(dOh.data),
+                    reinterpret_cast<__nv_bfloat16*>(dVh.data),
+                    Lq, Lk, hd);
+            }
+            {
+                dim3 block(16, 16);
+                dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
+                fab_dP_bf16_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(dOh.data),
+                    reinterpret_cast<const __nv_bfloat16*>(Vh.data),
+                    reinterpret_cast<__nv_bfloat16*>(dP.data),
+                    Lq, Lk, hd);
+            }
+            {
+                fab_dS_from_P_dP_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
+                    reinterpret_cast<__nv_bfloat16*>(P.data),
+                    reinterpret_cast<const __nv_bfloat16*>(dP.data),
+                    Lq, Lk, inv_sqrt);
+            }
+            {
+                dim3 block(16, 16);
+                dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
+                fab_dQh_bf16_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(P.data),
+                    reinterpret_cast<const __nv_bfloat16*>(Kh.data),
+                    reinterpret_cast<__nv_bfloat16*>(dQh.data),
+                    Lq, Lk, hd);
+            }
+            {
+                dim3 block(16, 16);
+                dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
+                fab_dKh_bf16_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(P.data),
+                    reinterpret_cast<const __nv_bfloat16*>(Qh.data),
+                    reinterpret_cast<__nv_bfloat16*>(dKh.data),
+                    Lq, Lk, hd);
+            }
+            fab_pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(dQh.data),
+                reinterpret_cast<__nv_bfloat16*>(dQ.data),
+                Lq, D, head_off, hd);
+            fab_pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(dKh.data),
+                reinterpret_cast<__nv_bfloat16*>(dK.data),
+                Lk, D, head_off, hd);
+            fab_pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(dVh.data),
+                reinterpret_cast<__nv_bfloat16*>(dV.data),
+                Lk, D, head_off, hd);
+            continue;
+        }
 
         // Extract per-head buffers (Q_h, K_h, V_h, dO_h).
         fab_extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
@@ -325,7 +612,6 @@ void flash_attention_backward(const Tensor& Q,
             reinterpret_cast<__half*>(P.data),
             Lq, Lk, hd);
         {
-            const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
             fab_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
                 reinterpret_cast<__half*>(P.data),
                 Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
@@ -355,7 +641,6 @@ void flash_attention_backward(const Tensor& Q,
 
         // dS = P * (dP - D_q) * inv_sqrt  (in-place over P)
         {
-            const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
             fab_dS_from_P_dP_kernel<<<Lq, sm_block, shmem, stream>>>(
                 reinterpret_cast<__half*>(P.data),
                 reinterpret_cast<const __half*>(dP.data),

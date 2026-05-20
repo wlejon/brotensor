@@ -71,6 +71,34 @@ std::vector<float> key_mask(int Lk) {
     return m;
 }
 
+// ─── BF16 helpers (GPU-only: BF16-on-CUDA vs FP32 CPU reference) ───────────
+
+inline float qbf(float v) {
+    return brotensor::bf16_bits_to_fp32(brotensor::fp32_to_bf16_bits(v));
+}
+
+Tensor make_qbf_cpu(int rows, int cols, SplitMix64& rng, float scale) {
+    Tensor t = Tensor::mat(rows, cols);
+    for (int i = 0; i < t.size(); ++i) t.ptr()[i] = qbf(rng.next_unit() * scale);
+    return t;
+}
+
+Tensor to_bf16_cuda_t(const Tensor& cpu) {
+    const int n = cpu.size();
+    std::vector<uint16_t> h(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_bf16_bits(cpu[i]);
+    return Tensor::from_host_bf16_on(Device::CUDA, h.data(), cpu.rows, cpu.cols);
+}
+
+Tensor bf16_cuda_to_cpu(const Tensor& g) {
+    brotensor::sync_all();
+    std::vector<uint16_t> h = g.to_host_vector_bf16();
+    Tensor out = Tensor::mat(g.rows, g.cols);
+    for (int i = 0; i < out.size(); ++i)
+        out.ptr()[i] = brotensor::bf16_bits_to_fp32(h[i]);
+    return out;
+}
+
 // ─── FP32 train forward + backward parity ─────────────────────────────────
 
 void run_cross_train(int Lq, int Lk, int D, int Dctx, int num_heads,
@@ -254,6 +282,47 @@ void run_cross_forward_with_attn(int Lq, int Lk, int D, int num_heads,
                     "cross_attn.AttnAvg", 5e-3f, 3e-2f);
 }
 
+// ─── BF16-inference forward parity (CPU FP32 vs GPU BF16) ─────────────────
+
+void run_cross_forward_bf16(int Lq, int Lk, int D, int num_heads,
+                            uint64_t seed, bool use_mask) {
+    SplitMix64 rng(seed);
+
+    Tensor X   = make_qbf_cpu(Lq, D, rng, 0.3f);
+    Tensor Ctx = make_qbf_cpu(Lk, D, rng, 0.3f);
+    Tensor Wq  = make_qbf_cpu(D, D, rng, 0.3f);
+    Tensor Wk  = make_qbf_cpu(D, D, rng, 0.3f);
+    Tensor Wv  = make_qbf_cpu(D, D, rng, 0.3f);
+    Tensor Wo  = make_qbf_cpu(D, D, rng, 0.3f);
+
+    std::vector<float> mask_host;
+    const float* host_mask = nullptr;
+    if (use_mask) { mask_host = key_mask(Lk); host_mask = mask_host.data(); }
+
+    // CPU FP32 path.
+    Tensor O_c;
+    brotensor::cross_attention_forward(
+        X, Ctx, Wq, Wk, Wv, Wo, host_mask, num_heads, O_c);
+
+    // GPU BF16 path — cross_attention_forward delegates to the flash path.
+    Tensor gX  = to_bf16_cuda_t(X);
+    Tensor gCtx = to_bf16_cuda_t(Ctx);
+    Tensor gWq = to_bf16_cuda_t(Wq), gWk = to_bf16_cuda_t(Wk),
+           gWv = to_bf16_cuda_t(Wv), gWo = to_bf16_cuda_t(Wo);
+
+    Tensor mg;
+    const float* d_mask = nullptr;
+    if (use_mask) {
+        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        d_mask = static_cast<const float*>(mg.data);
+    }
+    Tensor gO;
+    brotensor::cross_attention_forward(
+        gX, gCtx, gWq, gWk, gWv, gWo, d_mask, num_heads, gO);
+
+    compare_tensors(O_c, bf16_cuda_to_cpu(gO), "cross_fwd.O.bf16", 8e-2f, 8e-2f);
+}
+
 } // namespace
 
 // FP32 train forward + backward (Lq != Lk and Lq == Lk).
@@ -290,6 +359,14 @@ BT_PARITY_TEST(cross_attn_4x8_D16_h2_mask)   { run_cross_forward_with_attn(4, 8,
 BT_PARITY_TEST(cross_attn_6x10_D48_h6_bias)  { run_cross_forward_with_attn(6, 10, 48, 6, 0x623ull, false, true); }
 BT_PARITY_TEST(cross_attn_6x10_D48_h6_mask_bias) {
     run_cross_forward_with_attn(6, 10, 48, 6, 0x624ull, true, true);
+}
+
+// BF16 inference forward (CPU FP32 vs GPU BF16).
+BT_PARITY_TEST(cross_fwd_bf16_4x5_D8_h1)   { run_cross_forward_bf16(4,  5,  8,  1, 0x6A0ull, false); }
+BT_PARITY_TEST(cross_fwd_bf16_6x7_D16_h4)  { run_cross_forward_bf16(6,  7,  16, 4, 0x6A1ull, false); }
+BT_PARITY_TEST(cross_fwd_bf16_8x8_D32_h4)  { run_cross_forward_bf16(8,  8,  32, 4, 0x6A2ull, false); }
+BT_PARITY_TEST(cross_fwd_bf16_4x8_D16_h2_mask) {
+    run_cross_forward_bf16(4, 8, 16, 2, 0x6A3ull, true);
 }
 
 int main() { return run_all("cross_attention cpu/gpu parity"); }

@@ -101,6 +101,71 @@ std::vector<float> partial_mask(int n) {
     return m;
 }
 
+// ─── BF16 self_attention_forward parity (GPU-only) ────────────────────────
+//
+// self_attention_forward_train / _backward are FP32-only (mha path), so they
+// have no BF16 twin. self_attention_forward, however, is dtype-dispatched:
+// its BF16 path delegates to the flash route. BF16 is GPU-only, so we compare
+// BF16-on-CUDA against the FP32 flash composition (flash_attention_qkvo_forward
+// drives the CPU reference — same keys-only masking the flash path uses).
+
+inline float qbf(float v) {
+    return brotensor::bf16_bits_to_fp32(brotensor::fp32_to_bf16_bits(v));
+}
+
+Tensor make_qbf_cpu(int rows, int cols, SplitMix64& rng, float scale) {
+    Tensor t = Tensor::mat(rows, cols);
+    for (int i = 0; i < t.size(); ++i) t.ptr()[i] = qbf(rng.next_unit() * scale);
+    return t;
+}
+
+Tensor to_bf16_cuda_t(const Tensor& cpu) {
+    const int n = cpu.size();
+    std::vector<uint16_t> h(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_bf16_bits(cpu[i]);
+    return Tensor::from_host_bf16_on(brotensor::Device::CUDA, h.data(),
+                                     cpu.rows, cpu.cols);
+}
+
+Tensor bf16_cuda_to_cpu(const Tensor& g) {
+    brotensor::sync_all();
+    std::vector<uint16_t> h = g.to_host_vector_bf16();
+    Tensor out = Tensor::mat(g.rows, g.cols);
+    for (int i = 0; i < out.size(); ++i)
+        out.ptr()[i] = brotensor::bf16_bits_to_fp32(h[i]);
+    return out;
+}
+
+void run_self_attn_forward_bf16(int L, int D, int num_heads, uint64_t seed,
+                                const std::vector<float>* mask) {
+    SplitMix64 rng(seed);
+    Tensor X  = make_qbf_cpu(L, D, rng, 0.3f);
+    Tensor Wq = make_qbf_cpu(D, D, rng, 0.3f);
+    Tensor Wk = make_qbf_cpu(D, D, rng, 0.3f);
+    Tensor Wv = make_qbf_cpu(D, D, rng, 0.3f);
+    Tensor Wo = make_qbf_cpu(D, D, rng, 0.3f);
+
+    const float* host_mask = mask ? mask->data() : nullptr;
+
+    Tensor O_c;
+    brotensor::flash_attention_qkvo_forward(
+        X, nullptr, Wq, nullptr, Wk, nullptr, Wv, nullptr, Wo, nullptr,
+        host_mask, num_heads, /*causal=*/false, O_c);
+
+    Tensor gX  = to_bf16_cuda_t(X);
+    Tensor gWq = to_bf16_cuda_t(Wq), gWk = to_bf16_cuda_t(Wk),
+           gWv = to_bf16_cuda_t(Wv), gWo = to_bf16_cuda_t(Wo);
+    Tensor d_mask_buf = upload_mask(mask);
+    const float* d_mask = static_cast<const float*>(d_mask_buf.data);
+
+    Tensor gO;
+    brotensor::self_attention_forward(gX, gWq, gWk, gWv, gWo, d_mask,
+                                      num_heads, gO);
+
+    compare_tensors(O_c, bf16_cuda_to_cpu(gO), "self_attn_fwd.O.bf16",
+                    8e-2f, 8e-2f);
+}
+
 } // namespace
 
 BT_PARITY_TEST(self_attn_L4_D16_h1)  { run_self_attn(4,  16, 1, 0x500ull, nullptr); }
@@ -114,6 +179,13 @@ BT_PARITY_TEST(self_attn_L8_D32_h4_mask) {
 }
 BT_PARITY_TEST(self_attn_L16_D64_h8_mask) {
     auto m = partial_mask(16); run_self_attn(16, 64, 8, 0x511ull, &m);
+}
+
+// BF16 self_attention_forward (GPU BF16 vs FP32 flash reference).
+BT_PARITY_TEST(self_attn_fwd_bf16_L8_D32_h4)  { run_self_attn_forward_bf16(8,  32, 4, 0x520ull, nullptr); }
+BT_PARITY_TEST(self_attn_fwd_bf16_L12_D64_h8) { run_self_attn_forward_bf16(12, 64, 8, 0x521ull, nullptr); }
+BT_PARITY_TEST(self_attn_fwd_bf16_L8_D32_h4_mask) {
+    auto m = partial_mask(8); run_self_attn_forward_bf16(8, 32, 4, 0x522ull, &m);
 }
 
 int main() { return run_all("self_attention cpu/gpu parity"); }
