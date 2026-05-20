@@ -267,6 +267,52 @@ void group_norm_backward(const ::brotensor::Tensor& X,
                          ::brotensor::Tensor& dX, ::brotensor::Tensor& dGamma,
                          ::brotensor::Tensor& dBeta);
 
+// ── CHUNK 4 — resample.cpp / transpose.cpp / diffusion_samplers.cpp /
+//    kv_cache.cpp ──
+void upsample_nearest_2x(const ::brotensor::Tensor& X,
+                         int N, int C, int H, int W, ::brotensor::Tensor& Y);
+void upsample_bilinear_2x(const ::brotensor::Tensor& X,
+                          int N, int C, int H, int W, ::brotensor::Tensor& Y);
+void downsample_avg_2x(const ::brotensor::Tensor& X,
+                       int N, int C, int H, int W, ::brotensor::Tensor& Y);
+void upsample_nearest_2x_backward(const ::brotensor::Tensor& dY,
+                                  int N, int C, int H, int W,
+                                  ::brotensor::Tensor& dX);
+void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
+                                   int N, int C, int H, int W,
+                                   ::brotensor::Tensor& dX);
+void downsample_avg_2x_backward(const ::brotensor::Tensor& dY,
+                                int N, int C, int H, int W,
+                                ::brotensor::Tensor& dX);
+void nchw_to_sequence(const ::brotensor::Tensor& X,
+                      int N, int C, int H, int W, ::brotensor::Tensor& Y);
+void sequence_to_nchw(const ::brotensor::Tensor& X,
+                      int N, int C, int H, int W, ::brotensor::Tensor& Y);
+void ddim_step(const ::brotensor::Tensor& x_t,
+               const ::brotensor::Tensor& eps_pred,
+               float alpha_t, float alpha_prev, float sigma_t,
+               ::brotensor::Tensor& x_prev);
+void euler_step(const ::brotensor::Tensor& x_t,
+                const ::brotensor::Tensor& eps_pred,
+                float sigma_t, float sigma_prev,
+                ::brotensor::Tensor& x_prev);
+void dpmpp_2m_step(const ::brotensor::Tensor& x_t,
+                   const ::brotensor::Tensor& eps_pred,
+                   const ::brotensor::Tensor& x0_prev,
+                   float sigma_t,
+                   float c_xt, float c_x0t, float c_x0prev,
+                   ::brotensor::Tensor& x_prev, ::brotensor::Tensor& x0_out);
+void timestep_embedding(const ::brotensor::Tensor& timesteps,
+                        int dim, float max_period, ::brotensor::Tensor& Y);
+void kv_cache_append(const ::brotensor::Tensor& K_new,
+                     const ::brotensor::Tensor& V_new, int cur_len,
+                     ::brotensor::Tensor& K_cache, ::brotensor::Tensor& V_cache);
+void flash_attention_decode(const ::brotensor::Tensor& Q,
+                            const ::brotensor::Tensor& K_cache,
+                            const ::brotensor::Tensor& V_cache,
+                            int valid_len, int num_heads,
+                            ::brotensor::Tensor& O);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -368,6 +414,23 @@ struct CpuStaticRegistrar {
         ops.conv2d_backward_bias       = &detail::cpu::conv2d_backward_bias;
         ops.group_norm_forward         = &detail::cpu::group_norm_forward;
         ops.group_norm_backward        = &detail::cpu::group_norm_backward;
+
+        // ── CHUNK 4 ──
+        ops.upsample_nearest_2x          = &detail::cpu::upsample_nearest_2x;
+        ops.upsample_bilinear_2x         = &detail::cpu::upsample_bilinear_2x;
+        ops.downsample_avg_2x            = &detail::cpu::downsample_avg_2x;
+        ops.upsample_nearest_2x_backward = &detail::cpu::upsample_nearest_2x_backward;
+        ops.upsample_bilinear_2x_backward
+                                         = &detail::cpu::upsample_bilinear_2x_backward;
+        ops.downsample_avg_2x_backward   = &detail::cpu::downsample_avg_2x_backward;
+        ops.nchw_to_sequence             = &detail::cpu::nchw_to_sequence;
+        ops.sequence_to_nchw             = &detail::cpu::sequence_to_nchw;
+        ops.ddim_step                    = &detail::cpu::ddim_step;
+        ops.euler_step                   = &detail::cpu::euler_step;
+        ops.dpmpp_2m_step                = &detail::cpu::dpmpp_2m_step;
+        ops.timestep_embedding           = &detail::cpu::timestep_embedding;
+        ops.kv_cache_append              = &detail::cpu::kv_cache_append;
+        ops.flash_attention_decode       = &detail::cpu::flash_attention_decode;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

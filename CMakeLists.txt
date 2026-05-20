@@ -90,6 +90,10 @@ add_library(brotensor_cpu STATIC
     src/cpu/rms_norm.cpp
     src/cpu/conv2d.cpp
     src/cpu/group_norm.cpp
+    src/cpu/resample.cpp
+    src/cpu/transpose.cpp
+    src/cpu/diffusion_samplers.cpp
+    src/cpu/kv_cache.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)
