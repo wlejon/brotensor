@@ -120,6 +120,18 @@ void check_host(const Tensor& t, const char* who) {
     }
 }
 
+// Guard against negative dimensions before they are cast to std::size_t in
+// bytes() — an unchecked (size_t)(-1) underflows to an astronomical count
+// that sails past the bytes==0 short-circuits and reaches backend_alloc.
+void check_dims(int r, int c, const char* who) {
+    if (r < 0 || c < 0) {
+        std::string m = "brotensor: ";
+        m += who;
+        m += ": negative dimension";
+        throw_msg(m);
+    }
+}
+
 void check_dtype(const Tensor& t, Dtype expected, const char* who) {
     if (t.dtype != expected) {
         std::string m = "brotensor: ";
@@ -209,6 +221,7 @@ std::size_t Tensor::bytes() const {
 // ─── Factories ─────────────────────────────────────────────────────────────
 
 Tensor Tensor::empty_on(Device d, int r, int c, Dtype dt) {
+    check_dims(r, c, "empty_on");
     Tensor t;
     t.device = d;
     t.dtype  = dt;
@@ -318,11 +331,22 @@ void Tensor::zero() {
 }
 
 void Tensor::resize(int r, int c, Dtype dt) {
+    check_dims(r, c, "resize");
     const std::size_t new_bytes =
         static_cast<std::size_t>(r) * static_cast<std::size_t>(c)
         * static_cast<std::size_t>(dtype_size_bytes(dt));
     const std::size_t cur_bytes = bytes();
     if (r == rows && c == cols && dt == dtype && data != nullptr) return;
+    // A non-owning view over real storage cannot be reshaped: reallocating
+    // would silently allocate fresh owned memory and sever the view, leaving
+    // callers with a tensor that no longer aliases what they passed to
+    // view(). Reject it explicitly rather than converting it in place.
+    // (A default-constructed / released tensor — owns_ == false but
+    // data == nullptr — is not a view and resizes normally.)
+    if (!owns_ && data != nullptr) {
+        throw_msg("brotensor: resize: cannot reshape a non-owning view; "
+                  "allocate a fresh tensor or re-view() with the new shape");
+    }
     if (new_bytes != cur_bytes || !owns_) {
         release_();
         data = backend_alloc(device, new_bytes);

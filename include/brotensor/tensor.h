@@ -46,11 +46,15 @@ const char* device_name(Device);
 // backend's alloc vtable (see detail/dispatch.h); the destructor frees via
 // the same vtable. Rank is fixed at 2 (matrix) or 1 (vector — cols == 1).
 //
-// Move-only — copying device buffers must be explicit (clone()). The CPU
-// backend allocates plain host memory through the same vtable interface so
-// the storage layout is uniform across devices; for CPU tensors the typed
-// host accessors (host_f32, host_fp16, at, to_host_vector) give ergonomic
-// access without a device sync.
+// Copyable and movable: the copy ctor / copy assignment perform a
+// device-aware deep copy (identical to clone()); move transfers ownership
+// of the underlying buffer. Copying a GPU-resident tensor therefore
+// allocates and copies on-device — pass by reference on hot paths and use
+// clone() where the copy should be explicit. The CPU backend allocates
+// plain host memory through the same vtable interface so the storage layout
+// is uniform across devices; for CPU tensors the typed host accessors
+// (host_f32, host_fp16, at, to_host_vector) give ergonomic access without a
+// device sync.
 struct Tensor {
     void*  data   = nullptr;
     int    rows   = 0;     // rank-1 tensors: rows = N, cols = 1
@@ -129,7 +133,10 @@ struct Tensor {
 
     // Reallocates if (r, c, dt) differs from current shape/dtype; leaves
     // contents undefined (call zero() afterwards if needed). Device is
-    // preserved. Existing storage is freed.
+    // preserved. Existing owned storage is freed. A no-op if the shape and
+    // dtype already match. Throws std::runtime_error on a negative dimension,
+    // or if called on a non-owning view (a tensor from view()) — reshaping a
+    // view would silently sever it, so allocate a fresh tensor instead.
     void resize(int r, int c, Dtype dt = Dtype::FP32);
 
     // ─── Accessors ─────────────────────────────────────────────────────────

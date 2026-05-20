@@ -9,16 +9,22 @@
 #include <brotensor/tensor.h>
 
 #include <array>
+#include <cstddef>
 #include <cstring>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace brotensor::detail {
 
 namespace {
 
 constexpr int kNumDevices = 3; // CPU, CUDA, Metal
+
+// Upper bound on operands a single dispatch call inspects. The widest op is
+// resblock_backward (25 operands); 32 leaves headroom. dispatch_with_opts
+// throws if a future op ever exceeds this rather than silently truncating.
+constexpr std::size_t kMaxOperands = 32;
 
 struct Slot {
     OpsVTable   ops{};
@@ -86,6 +92,40 @@ const OpsVTable& dispatch_v(std::initializer_list<const Tensor*> ts) {
         ++idx;
     }
     return ops_for(dev);
+}
+
+// Same resolution rule as dispatch_v, over a plain operand array — used by the
+// optional-operand dispatch path so it needs no heap allocation. Null entries
+// (skipped optional operands) are tolerated.
+const OpsVTable& resolve_over(const Tensor* const* all, std::size_t count) {
+    Device dev = Device::CPU;
+    bool found = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (all[i] && committed(*all[i])) {
+            dev = all[i]->device;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        // No committed operand — adopt the first non-null operand's tag.
+        for (std::size_t i = 0; i < count; ++i) {
+            if (all[i]) { dev = all[i]->device; break; }
+        }
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (all[i] && committed(*all[i]) && all[i]->device != dev) {
+            throw_device_mismatch(dev, static_cast<int>(i), all[i]->device);
+        }
+    }
+    return ops_for(dev);
+}
+
+[[noreturn]] void throw_too_many_operands(std::size_t n) {
+    throw std::runtime_error(
+        "brotensor: dispatch: operand count " + std::to_string(n) +
+        " exceeds the fixed dispatch buffer (" +
+        std::to_string(kMaxOperands) + ")");
 }
 
 } // namespace
@@ -159,48 +199,25 @@ const OpsVTable& dispatch(const Tensor& a, const Tensor& b, const Tensor& c,
 
 const OpsVTable& dispatch_with_opts(const Tensor& a,
                                     std::initializer_list<const Tensor*> opts) {
-    std::vector<const Tensor*> all;
-    all.reserve(1 + opts.size());
-    all.push_back(&a);
-    for (const Tensor* p : opts) all.push_back(p);
-    // dispatch_v takes an initializer_list; reuse its logic over the vector.
-    Device dev = Device::CPU;
-    bool found = false;
-    for (const Tensor* t : all) {
-        if (t && t->data != nullptr) { dev = t->device; found = true; break; }
-    }
-    if (!found) dev = a.device;
-    int idx = 0;
-    for (const Tensor* t : all) {
-        if (t && t->data != nullptr && t->device != dev) {
-            throw_device_mismatch(dev, idx, t->device);
-        }
-        ++idx;
-    }
-    return ops_for(dev);
+    const std::size_t count = 1 + opts.size();
+    if (count > kMaxOperands) throw_too_many_operands(count);
+    const Tensor* all[kMaxOperands];
+    std::size_t n = 0;
+    all[n++] = &a;
+    for (const Tensor* p : opts) all[n++] = p;
+    return resolve_over(all, n);
 }
 
 const OpsVTable& dispatch_with_opts(const Tensor& a, const Tensor& b,
                                     std::initializer_list<const Tensor*> opts) {
-    std::vector<const Tensor*> all;
-    all.reserve(2 + opts.size());
-    all.push_back(&a);
-    all.push_back(&b);
-    for (const Tensor* p : opts) all.push_back(p);
-    Device dev = Device::CPU;
-    bool found = false;
-    for (const Tensor* t : all) {
-        if (t && t->data != nullptr) { dev = t->device; found = true; break; }
-    }
-    if (!found) dev = a.device;
-    int idx = 0;
-    for (const Tensor* t : all) {
-        if (t && t->data != nullptr && t->device != dev) {
-            throw_device_mismatch(dev, idx, t->device);
-        }
-        ++idx;
-    }
-    return ops_for(dev);
+    const std::size_t count = 2 + opts.size();
+    if (count > kMaxOperands) throw_too_many_operands(count);
+    const Tensor* all[kMaxOperands];
+    std::size_t n = 0;
+    all[n++] = &a;
+    all[n++] = &b;
+    for (const Tensor* p : opts) all[n++] = p;
+    return resolve_over(all, n);
 }
 
 // ─── output adoption ───────────────────────────────────────────────────────
