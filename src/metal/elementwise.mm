@@ -990,4 +990,86 @@ void build_causal_mask_row(int L, int q, Tensor& mask) {
     });
 }
 
+// ─── cast: FP32 <-> FP16 dtype conversion ──────────────────────────────────
+
+namespace {
+
+NSString* const kCastSrc = @R"msl(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void k_cast_f2h(device const float* s [[buffer(0)]],
+                       device half*        d [[buffer(1)]],
+                       constant uint&      n [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    d[i] = half(s[i]);
+}
+
+kernel void k_cast_h2f(device const half* s [[buffer(0)]],
+                       device float*      d [[buffer(1)]],
+                       constant uint&     n [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    d[i] = float(s[i]);
+}
+)msl";
+
+id<MTLComputePipelineState> pso_cast_f2h() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kCastSrc, @"k_cast_f2h"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_cast_h2f() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kCastSrc, @"k_cast_h2f"); });
+    return pso;
+}
+
+} // namespace
+
+void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
+    if (dst.rows != src.rows || dst.cols != src.cols ||
+        dst.dtype != out_dtype) {
+        dst.resize(src.rows, src.cols, out_dtype);
+    }
+    const uint32_t n = static_cast<uint32_t>(src.size());
+    if (n == 0) return;
+    id<MTLBuffer> bs = buffer_for(src);
+    id<MTLBuffer> bd = buffer_for(dst);
+    const NSUInteger os = buffer_offset_for(src);
+    const NSUInteger od = buffer_offset_for(dst);
+
+    if (src.dtype == out_dtype) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmd = new_command_buffer();
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            [blit copyFromBuffer:bs sourceOffset:os
+                        toBuffer:bd destinationOffset:od
+                            size:src.bytes()];
+            [blit endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+        return;
+    }
+
+    id<MTLComputePipelineState> pso;
+    if (src.dtype == Dtype::FP32 && out_dtype == Dtype::FP16) {
+        pso = pso_cast_f2h();
+    } else if (src.dtype == Dtype::FP16 && out_dtype == Dtype::FP32) {
+        pso = pso_cast_h2f();
+    } else {
+        throw std::runtime_error(
+            "cast: unsupported dtype pair (Metal supports FP32<->FP16)");
+    }
+    launch_1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bs offset:os atIndex:0];
+        [enc setBuffer:bd offset:od atIndex:1];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
+    });
+}
+
 } // namespace brotensor::detail::metal

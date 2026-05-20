@@ -515,6 +515,22 @@ inline int grid_for(int n) {
     return blocks;
 }
 
+__global__ void cast_f2h_kernel(const float* __restrict__ s,
+                                __half* __restrict__ d, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        d[i] = __float2half(s[i]);
+    }
+}
+
+__global__ void cast_h2f_kernel(const __half* __restrict__ s,
+                                float* __restrict__ d, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        d[i] = __half2float(s[i]);
+    }
+}
+
 } // anonymous namespace
 
 using ::brotensor::Tensor;
@@ -597,6 +613,33 @@ void add_inplace(Tensor& y, const Tensor& x) {
         add_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<float*>(y.data),
             static_cast<const float*>(x.data), n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
+    if (dst.rows != src.rows || dst.cols != src.cols ||
+        dst.dtype != out_dtype) {
+        dst.resize(src.rows, src.cols, out_dtype);
+    }
+    const int n = src.size();
+    if (n == 0) return;
+    if (src.dtype == out_dtype) {
+        BROTENSOR_CUDA_CHECK(cudaMemcpy(dst.data, src.data, src.bytes(),
+                                        cudaMemcpyDeviceToDevice));
+        return;
+    }
+    if (src.dtype == Dtype::FP32 && out_dtype == Dtype::FP16) {
+        cast_f2h_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(src.data),
+            static_cast<__half*>(dst.data), n);
+    } else if (src.dtype == Dtype::FP16 && out_dtype == Dtype::FP32) {
+        cast_h2f_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __half*>(src.data),
+            static_cast<float*>(dst.data), n);
+    } else {
+        throw std::runtime_error(
+            "cast: unsupported dtype pair (CUDA supports FP32<->FP16)");
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -952,6 +995,7 @@ void fill_cuda_vtable_elementwise(::brotensor::detail::OpsVTable& v) {
     v.sigmoid_backward        = &sigmoid_backward;
     v.add_inplace             = &add_inplace;
     v.add_scalar_inplace      = &add_scalar_inplace;
+    v.cast                    = &cast;
     v.scale_inplace           = &scale_inplace;
     v.mul_inplace             = &mul_inplace;
     v.clamp                   = &clamp;

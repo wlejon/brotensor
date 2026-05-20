@@ -457,6 +457,13 @@ void copy_d2d(const Tensor& src, int src_off, Tensor& dst, int dst_off, int n) {
     v.copy_d2d(src, src_off, dst, dst_off, n);
 }
 
+void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
+    const auto& v = detail::dispatch(src, dst);
+    if (!v.cast) detail::throw_not_implemented("cast", src.device);
+    detail::adopt_output(dst, src.device);
+    v.cast(src, dst, out_dtype);
+}
+
 // ─── Inference batched + optim ─────────────────────────────────────────────
 
 void layernorm_forward_inference_batched(const Tensor& X_RD,

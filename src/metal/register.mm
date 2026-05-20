@@ -60,6 +60,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.attention_token_moments                     = &dm::attention_token_moments;
     ops.build_causal_mask_row                       = &dm::build_causal_mask_row;
     ops.build_slot_mask                             = &dm::build_slot_mask;
+    ops.cast                                        = &dm::cast;
     ops.clamp                                       = &dm::clamp;
     ops.concat_batched_rows                         = &dm::concat_batched_rows;
     ops.concat_nchw_channels                        = &dm::concat_nchw_channels;
