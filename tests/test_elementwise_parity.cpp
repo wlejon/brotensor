@@ -87,6 +87,21 @@ void test_add_inplace(int n, uint64_t seed) {
     compare_tensors(y_cpu, download_to_host(gy), "add_inplace");
 }
 
+void test_add_inplace_bf16(int n, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor y = Tensor::vec(n), x = Tensor::vec(n);
+    fill_random(y, rng);
+    fill_random(x, rng);
+
+    Tensor y_ref = y;
+    brotensor::add_inplace(y_ref, x);
+
+    Tensor gy = to_bf16_cuda(y), gx = to_bf16_cuda(x);
+    brotensor::add_inplace(gy, gx);
+
+    compare_tensors(y_ref, bf16_host_to_f32(download_to_host(gy)), "add_inplace_bf16", 2e-2f, 2e-2f);
+}
+
 void test_add_scalar_inplace(int n, uint64_t seed) {
     SplitMix64 rng(seed);
     Tensor y = Tensor::vec(n);
@@ -100,6 +115,21 @@ void test_add_scalar_inplace(int n, uint64_t seed) {
     brotensor::add_scalar_inplace(gy, s);
 
     compare_tensors(y_cpu, download_to_host(gy), "add_scalar_inplace");
+}
+
+void test_add_scalar_inplace_bf16(int n, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor y = Tensor::vec(n);
+    fill_random(y, rng);
+    const float s = 0.375f;
+
+    Tensor y_ref = y;
+    brotensor::add_scalar_inplace(y_ref, s);
+
+    Tensor gy = to_bf16_cuda(y);
+    brotensor::add_scalar_inplace(gy, s);
+
+    compare_tensors(y_ref, bf16_host_to_f32(download_to_host(gy)), "add_scalar_inplace_bf16", 2e-2f, 2e-2f);
 }
 
 } // namespace
@@ -128,5 +158,12 @@ BT_PARITY_TEST(add_scalar_n1)    { test_add_scalar_inplace(1, 0x50ull); }
 BT_PARITY_TEST(add_scalar_n7)    { test_add_scalar_inplace(7, 0x51ull); }
 BT_PARITY_TEST(add_scalar_n256)  { test_add_scalar_inplace(256, 0x52ull); }
 BT_PARITY_TEST(add_scalar_n1024) { test_add_scalar_inplace(1024, 0x53ull); }
+
+// ─── BF16 parity tests ─────────────────────────────────────────────────────
+BT_PARITY_TEST(add_inplace_bf16_n256)  { test_add_inplace_bf16(256, 0x60ull); }
+BT_PARITY_TEST(add_inplace_bf16_n1024) { test_add_inplace_bf16(1024, 0x61ull); }
+
+BT_PARITY_TEST(add_scalar_bf16_n256)  { test_add_scalar_inplace_bf16(256, 0x62ull); }
+BT_PARITY_TEST(add_scalar_bf16_n1024) { test_add_scalar_inplace_bf16(1024, 0x63ull); }
 
 int main() { return run_all("elementwise cpu/gpu parity"); }

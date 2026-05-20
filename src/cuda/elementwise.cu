@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -502,6 +503,214 @@ __global__ void geglu_exact_backward_fp16_kernel(const __half* __restrict__ X,
     }
 }
 
+// ─── BF16 kernels (verbatim copies of FP16, with __half→__nv_bfloat16) ───────
+
+__global__ void silu_forward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                         __nv_bfloat16* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2bfloat16(silu_scalar(__bfloat162float(x[i])));
+    }
+}
+
+__global__ void gelu_forward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                         __nv_bfloat16* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2bfloat16(gelu_tanh_scalar(__bfloat162float(x[i])));
+    }
+}
+
+__global__ void add_inplace_bf16_kernel(__nv_bfloat16* __restrict__ y,
+                                        const __nv_bfloat16* __restrict__ x, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float a = __bfloat162float(y[i]);
+        const float b = __bfloat162float(x[i]);
+        y[i] = __float2bfloat16(a + b);
+    }
+}
+
+__global__ void scale_inplace_bf16_kernel(__nv_bfloat16* __restrict__ y, float s, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2bfloat16(__bfloat162float(y[i]) * s);
+    }
+}
+
+__global__ void add_scalar_inplace_bf16_kernel(__nv_bfloat16* __restrict__ y, float s, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2bfloat16(__bfloat162float(y[i]) + s);
+    }
+}
+
+__global__ void clamp_bf16_kernel(__nv_bfloat16* __restrict__ y, float lo, float hi, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        float v = __bfloat162float(y[i]);
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        y[i] = __float2bfloat16(v);
+    }
+}
+
+__global__ void quick_gelu_forward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                               __nv_bfloat16* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2bfloat16(quick_gelu_scalar(__bfloat162float(x[i])));
+    }
+}
+
+__global__ void mul_inplace_bf16_kernel(__nv_bfloat16* __restrict__ y,
+                                        const __nv_bfloat16* __restrict__ x, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float a = __bfloat162float(y[i]);
+        const float b = __bfloat162float(x[i]);
+        y[i] = __float2bfloat16(a * b);
+    }
+}
+
+__global__ void geglu_forward_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                                          __nv_bfloat16* __restrict__ Y,
+                                          int B, int D) {
+    const int total = B * D;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a = __bfloat162float(X[b * two_d + d]);
+        const float gv_raw = __bfloat162float(X[b * two_d + D + d]);
+        Y[idx] = __float2bfloat16(a * gelu_tanh_scalar(gv_raw));
+    }
+}
+
+__global__ void silu_backward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                          const __nv_bfloat16* __restrict__ dY,
+                                          __nv_bfloat16* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float xv  = __bfloat162float(x[i]);
+        const float dyv = __bfloat162float(dY[i]);
+        dX[i] = __float2bfloat16(dyv * silu_grad_scalar(xv));
+    }
+}
+
+__global__ void gelu_backward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                          const __nv_bfloat16* __restrict__ dY,
+                                          __nv_bfloat16* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float xv  = __bfloat162float(x[i]);
+        const float dyv = __bfloat162float(dY[i]);
+        dX[i] = __float2bfloat16(dyv * gelu_tanh_grad_scalar(xv));
+    }
+}
+
+__global__ void quick_gelu_backward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                                const __nv_bfloat16* __restrict__ dY,
+                                                __nv_bfloat16* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float xv  = __bfloat162float(x[i]);
+        const float dyv = __bfloat162float(dY[i]);
+        dX[i] = __float2bfloat16(dyv * quick_gelu_grad_scalar(xv));
+    }
+}
+
+__global__ void geglu_backward_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                                           const __nv_bfloat16* __restrict__ dY,
+                                           __nv_bfloat16* __restrict__ dX,
+                                           int B, int D) {
+    const int total = B * D;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a       = __bfloat162float(X[b * two_d + d]);
+        const float bh      = __bfloat162float(X[b * two_d + D + d]);
+        const float dy      = __bfloat162float(dY[idx]);
+        const float g       = gelu_tanh_scalar(bh);
+        const float gprime  = gelu_tanh_grad_scalar(bh);
+        dX[b * two_d + d]     = __float2bfloat16(dy * g);
+        dX[b * two_d + D + d] = __float2bfloat16(dy * a * gprime);
+    }
+}
+
+__global__ void gelu_exact_forward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                               __nv_bfloat16* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2bfloat16(gelu_exact_scalar(__bfloat162float(x[i])));
+    }
+}
+
+__global__ void gelu_exact_backward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                                const __nv_bfloat16* __restrict__ dY,
+                                                __nv_bfloat16* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float xv  = __bfloat162float(x[i]);
+        const float dyv = __bfloat162float(dY[i]);
+        dX[i] = __float2bfloat16(dyv * gelu_exact_grad_scalar(xv));
+    }
+}
+
+__global__ void geglu_exact_forward_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                                                __nv_bfloat16* __restrict__ Y,
+                                                int B, int D) {
+    const int total = B * D;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a = __bfloat162float(X[b * two_d + d]);
+        const float gv_raw = __bfloat162float(X[b * two_d + D + d]);
+        Y[idx] = __float2bfloat16(a * gelu_exact_scalar(gv_raw));
+    }
+}
+
+__global__ void geglu_exact_backward_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                                                 const __nv_bfloat16* __restrict__ dY,
+                                                 __nv_bfloat16* __restrict__ dX,
+                                                 int B, int D) {
+    const int total = B * D;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int b = idx / D;
+        const int d = idx % D;
+        const int two_d = 2 * D;
+        const float a       = __bfloat162float(X[b * two_d + d]);
+        const float bh      = __bfloat162float(X[b * two_d + D + d]);
+        const float dy      = __bfloat162float(dY[idx]);
+        const float g       = gelu_exact_scalar(bh);
+        const float gprime  = gelu_exact_grad_scalar(bh);
+        dX[b * two_d + d]     = __float2bfloat16(dy * g);
+        dX[b * two_d + D + d] = __float2bfloat16(dy * a * gprime);
+    }
+}
+
+__global__ void cast_f2bf_kernel(const float* __restrict__ s,
+                                 __nv_bfloat16* __restrict__ d, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        d[i] = __float2bfloat16(s[i]);
+    }
+}
+
+__global__ void cast_bf2f_kernel(const __nv_bfloat16* __restrict__ s,
+                                 float* __restrict__ d, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        d[i] = __bfloat162float(s[i]);
+    }
+}
+
 __global__ void causal_mask_row_kernel(float* __restrict__ mask, int L, int q) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= L) return;
@@ -609,6 +818,13 @@ void add_inplace(Tensor& y, const Tensor& x) {
         add_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<__half*>(y.data),
             static_cast<const __half*>(x.data), n);
+    } else if (y.dtype == Dtype::BF16) {
+        if (x.dtype != Dtype::BF16) {
+            throw std::runtime_error("add_inplace: dtype mismatch");
+        }
+        add_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<__nv_bfloat16*>(y.data),
+            static_cast<const __nv_bfloat16*>(x.data), n);
     } else {
         add_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<float*>(y.data),
@@ -637,9 +853,17 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
         cast_h2f_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const __half*>(src.data),
             static_cast<float*>(dst.data), n);
+    } else if (src.dtype == Dtype::FP32 && out_dtype == Dtype::BF16) {
+        cast_f2bf_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(src.data),
+            static_cast<__nv_bfloat16*>(dst.data), n);
+    } else if (src.dtype == Dtype::BF16 && out_dtype == Dtype::FP32) {
+        cast_bf2f_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(src.data),
+            static_cast<float*>(dst.data), n);
     } else {
         throw std::runtime_error(
-            "cast: unsupported dtype pair (CUDA supports FP32<->FP16)");
+            "cast: unsupported dtype pair (CUDA supports FP32<->FP16 and FP32<->BF16)");
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -650,6 +874,9 @@ void add_scalar_inplace(Tensor& y, float s) {
     if (y.dtype == Dtype::FP16) {
         add_scalar_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<__half*>(y.data), s, n);
+    } else if (y.dtype == Dtype::BF16) {
+        add_scalar_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<__nv_bfloat16*>(y.data), s, n);
     } else {
         add_scalar_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<float*>(y.data), s, n);
@@ -663,6 +890,9 @@ void clamp(Tensor& y, float lo, float hi) {
     if (y.dtype == Dtype::FP16) {
         clamp_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<__half*>(y.data), lo, hi, n);
+    } else if (y.dtype == Dtype::BF16) {
+        clamp_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<__nv_bfloat16*>(y.data), lo, hi, n);
     } else {
         clamp_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<float*>(y.data), lo, hi, n);
@@ -676,6 +906,9 @@ void scale_inplace(Tensor& y, float s) {
     if (y.dtype == Dtype::FP16) {
         scale_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<__half*>(y.data), s, n);
+    } else if (y.dtype == Dtype::BF16) {
+        scale_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<__nv_bfloat16*>(y.data), s, n);
     } else {
         scale_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<float*>(y.data), s, n);
@@ -693,6 +926,10 @@ void mul_inplace(Tensor& y, const Tensor& x) {
         mul_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<__half*>(y.data),
             static_cast<const __half*>(x.data), n);
+    } else if (y.dtype == Dtype::BF16) {
+        mul_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<__nv_bfloat16*>(y.data),
+            static_cast<const __nv_bfloat16*>(x.data), n);
     } else {
         mul_inplace_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<float*>(y.data),
@@ -711,6 +948,10 @@ void silu_forward(const Tensor& x, Tensor& y) {
         silu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
+    } else if (x.dtype == Dtype::BF16) {
+        silu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<__nv_bfloat16*>(y.data), n);
     } else {
         silu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const float*>(x.data),
@@ -729,6 +970,10 @@ void gelu_forward(const Tensor& x, Tensor& y) {
         gelu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
+    } else if (x.dtype == Dtype::BF16) {
+        gelu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<__nv_bfloat16*>(y.data), n);
     } else {
         gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const float*>(x.data),
@@ -747,6 +992,10 @@ void quick_gelu_forward(const Tensor& x, Tensor& y) {
         quick_gelu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
+    } else if (x.dtype == Dtype::BF16) {
+        quick_gelu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<__nv_bfloat16*>(y.data), n);
     } else {
         quick_gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const float*>(x.data),
@@ -766,6 +1015,11 @@ void silu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
+    } else if (x.dtype == Dtype::BF16) {
+        silu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
         silu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const float*>(x.data),
@@ -786,6 +1040,11 @@ void gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
+    } else if (x.dtype == Dtype::BF16) {
+        gelu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
         gelu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const float*>(x.data),
@@ -806,6 +1065,11 @@ void quick_gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
+    } else if (x.dtype == Dtype::BF16) {
+        quick_gelu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
         quick_gelu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const float*>(x.data),
@@ -830,6 +1094,11 @@ void geglu_forward(const Tensor& X, Tensor& Y) {
         geglu_forward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
+            B, D);
+    } else if (X.dtype == Dtype::BF16) {
+        geglu_forward_bf16_kernel<<<grid_for(total), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
             B, D);
     } else {
         geglu_forward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
@@ -856,6 +1125,12 @@ void geglu_backward(const Tensor& X, const Tensor& dY, Tensor& dX) {
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
             B, D);
+    } else if (X.dtype == Dtype::BF16) {
+        geglu_backward_bf16_kernel<<<grid_for(total), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data),
+            B, D);
     } else {
         geglu_backward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
             static_cast<const float*>(X.data),
@@ -875,6 +1150,10 @@ void gelu_exact_forward(const Tensor& x, Tensor& y) {
         gelu_exact_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
+    } else if (x.dtype == Dtype::BF16) {
+        gelu_exact_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<__nv_bfloat16*>(y.data), n);
     } else {
         gelu_exact_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const float*>(x.data),
@@ -894,6 +1173,11 @@ void gelu_exact_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
+    } else if (x.dtype == Dtype::BF16) {
+        gelu_exact_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
         gelu_exact_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
             static_cast<const float*>(x.data),
@@ -919,6 +1203,11 @@ void geglu_exact_forward(const Tensor& X, Tensor& Y) {
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             B, D);
+    } else if (X.dtype == Dtype::BF16) {
+        geglu_exact_forward_bf16_kernel<<<grid_for(total), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            B, D);
     } else {
         geglu_exact_forward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
             static_cast<const float*>(X.data),
@@ -943,6 +1232,12 @@ void geglu_exact_backward(const Tensor& X, const Tensor& dY, Tensor& dX) {
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
+            B, D);
+    } else if (X.dtype == Dtype::BF16) {
+        geglu_exact_backward_bf16_kernel<<<grid_for(total), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data),
             B, D);
     } else {
         geglu_exact_backward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
