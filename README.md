@@ -136,3 +136,8 @@ This is the code path `brogameagent`'s hand-crafted ExIt circuits use by default
 | build_causal_mask_row | n/a | n/a | ✓ | length-L FP32 mask, CLIP text |
 | sgd / adam | ✓ | n/a | — | optimizer steps |
 | mse / softmax-xent | ✓ | ✓ | — | per-sample + batched |
+
+
+## License
+
+[MIT](LICENSE)
