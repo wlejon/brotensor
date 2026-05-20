@@ -85,6 +85,7 @@ if(BROTENSOR_HAS_GPU)
         activations geglu swiglu matmul rope rmsnorm
         conv2d group_norm
         resample transpose diffusion kv_cache
+        cross_attention self_attention attention_moments
     )
     foreach(_name IN LISTS _brotensor_parity_tests)
         brotensor_add_test(brotensor_test_${_name}_parity test_${_name}_parity.cpp)

@@ -94,6 +94,9 @@ add_library(brotensor_cpu STATIC
     src/cpu/transpose.cpp
     src/cpu/diffusion_samplers.cpp
     src/cpu/kv_cache.cpp
+    src/cpu/cross_attention.cpp
+    src/cpu/self_attention.cpp
+    src/cpu/attention_moments.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)

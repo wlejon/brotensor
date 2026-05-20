@@ -313,6 +313,93 @@ void flash_attention_decode(const ::brotensor::Tensor& Q,
                             int valid_len, int num_heads,
                             ::brotensor::Tensor& O);
 
+// ── CHUNK 5 — cross_attention.cpp / self_attention.cpp /
+//    attention_moments.cpp ──
+void cross_attention_forward(const ::brotensor::Tensor& X,
+                             const ::brotensor::Tensor& Ctx,
+                             const ::brotensor::Tensor& Wq,
+                             const ::brotensor::Tensor& Wk,
+                             const ::brotensor::Tensor& Wv,
+                             const ::brotensor::Tensor& Wo,
+                             const float* d_mask, int num_heads,
+                             ::brotensor::Tensor& O);
+void cross_attention_forward_with_attn(const ::brotensor::Tensor& X,
+                                       const ::brotensor::Tensor& Ctx,
+                                       const ::brotensor::Tensor& Wq,
+                                       const ::brotensor::Tensor& Wk,
+                                       const ::brotensor::Tensor& Wv,
+                                       const ::brotensor::Tensor& Wo,
+                                       const float* d_mask,
+                                       const ::brotensor::Tensor* attn_logit_bias,
+                                       int num_heads,
+                                       ::brotensor::Tensor& O,
+                                       ::brotensor::Tensor& AttnAvg);
+void self_attention_forward_train(const ::brotensor::Tensor& X,
+                                  const ::brotensor::Tensor& Wq,
+                                  const ::brotensor::Tensor& Wk,
+                                  const ::brotensor::Tensor& Wv,
+                                  const ::brotensor::Tensor& Wo,
+                                  const float* d_mask, int num_heads,
+                                  ::brotensor::Tensor& Qh,
+                                  ::brotensor::Tensor& Kh,
+                                  ::brotensor::Tensor& Vh,
+                                  ::brotensor::Tensor& Attnh,
+                                  ::brotensor::Tensor& Yconcat,
+                                  ::brotensor::Tensor& O);
+void self_attention_backward(const ::brotensor::Tensor& dO,
+                             const ::brotensor::Tensor& X,
+                             const ::brotensor::Tensor& Qh,
+                             const ::brotensor::Tensor& Kh,
+                             const ::brotensor::Tensor& Vh,
+                             const ::brotensor::Tensor& Attnh,
+                             const ::brotensor::Tensor& Yconcat,
+                             const ::brotensor::Tensor& Wq,
+                             const ::brotensor::Tensor& Wk,
+                             const ::brotensor::Tensor& Wv,
+                             const ::brotensor::Tensor& Wo,
+                             const float* d_mask, int num_heads,
+                             ::brotensor::Tensor& dX,
+                             ::brotensor::Tensor& dWq,
+                             ::brotensor::Tensor& dWk,
+                             ::brotensor::Tensor& dWv,
+                             ::brotensor::Tensor& dWo);
+void attention_token_moments(const ::brotensor::Tensor& Attn,
+                             int h_lat, int w_lat,
+                             ::brotensor::Tensor& mass,
+                             ::brotensor::Tensor& centroid);
+void cross_attention_forward_train(const ::brotensor::Tensor& X,
+                                   const ::brotensor::Tensor& Ctx,
+                                   const ::brotensor::Tensor& Wq,
+                                   const ::brotensor::Tensor& Wk,
+                                   const ::brotensor::Tensor& Wv,
+                                   const ::brotensor::Tensor& Wo,
+                                   const float* d_mask, int num_heads,
+                                   ::brotensor::Tensor& Qh,
+                                   ::brotensor::Tensor& Kh,
+                                   ::brotensor::Tensor& Vh,
+                                   ::brotensor::Tensor& Attnh,
+                                   ::brotensor::Tensor& Yconcat,
+                                   ::brotensor::Tensor& O);
+void cross_attention_backward(const ::brotensor::Tensor& dO,
+                              const ::brotensor::Tensor& X,
+                              const ::brotensor::Tensor& Ctx,
+                              const ::brotensor::Tensor& Qh,
+                              const ::brotensor::Tensor& Kh,
+                              const ::brotensor::Tensor& Vh,
+                              const ::brotensor::Tensor& Attnh,
+                              const ::brotensor::Tensor& Yconcat,
+                              const ::brotensor::Tensor& Wq,
+                              const ::brotensor::Tensor& Wk,
+                              const ::brotensor::Tensor& Wv,
+                              const ::brotensor::Tensor& Wo,
+                              const float* d_mask, int num_heads,
+                              ::brotensor::Tensor& dX,
+                              ::brotensor::Tensor& dCtx,
+                              ::brotensor::Tensor& dWq,
+                              ::brotensor::Tensor& dWk,
+                              ::brotensor::Tensor& dWv,
+                              ::brotensor::Tensor& dWo);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -431,6 +518,17 @@ struct CpuStaticRegistrar {
         ops.timestep_embedding           = &detail::cpu::timestep_embedding;
         ops.kv_cache_append              = &detail::cpu::kv_cache_append;
         ops.flash_attention_decode       = &detail::cpu::flash_attention_decode;
+
+        // ── CHUNK 5 ──
+        ops.cross_attention_forward      = &detail::cpu::cross_attention_forward;
+        ops.cross_attention_forward_with_attn
+                                         = &detail::cpu::cross_attention_forward_with_attn;
+        ops.self_attention_forward_train = &detail::cpu::self_attention_forward_train;
+        ops.self_attention_backward      = &detail::cpu::self_attention_backward;
+        ops.attention_token_moments      = &detail::cpu::attention_token_moments;
+        ops.cross_attention_forward_train
+                                         = &detail::cpu::cross_attention_forward_train;
+        ops.cross_attention_backward     = &detail::cpu::cross_attention_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());
