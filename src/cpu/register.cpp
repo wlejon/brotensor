@@ -232,6 +232,41 @@ void rms_norm_backward(const ::brotensor::Tensor& X,
                        const ::brotensor::Tensor& dY, float eps,
                        ::brotensor::Tensor& dX, ::brotensor::Tensor& dGamma);
 
+// ── CHUNK 3 — conv2d.cpp / group_norm.cpp ──
+void conv2d_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wt,
+                    const ::brotensor::Tensor* bias,
+                    int N, int C_in, int H, int W, int C_out, int kH, int kW,
+                    int stride_h, int stride_w, int pad_h, int pad_w,
+                    int dil_h, int dil_w, int groups, ::brotensor::Tensor& Y);
+void conv2d_backward_input(const ::brotensor::Tensor& Wt,
+                           const ::brotensor::Tensor& dY,
+                           int N, int C_in, int H, int W,
+                           int C_out, int kH, int kW,
+                           int stride_h, int stride_w, int pad_h, int pad_w,
+                           int dil_h, int dil_w, int groups,
+                           ::brotensor::Tensor& dX);
+void conv2d_backward_weight(const ::brotensor::Tensor& X,
+                            const ::brotensor::Tensor& dY,
+                            int N, int C_in, int H, int W,
+                            int C_out, int kH, int kW,
+                            int stride_h, int stride_w, int pad_h, int pad_w,
+                            int dil_h, int dil_w, int groups,
+                            ::brotensor::Tensor& dWt);
+void conv2d_backward_bias(const ::brotensor::Tensor& dY,
+                          int N, int C_out, int H_out, int W_out,
+                          ::brotensor::Tensor& dB);
+void group_norm_forward(const ::brotensor::Tensor& X,
+                        const ::brotensor::Tensor& gamma,
+                        const ::brotensor::Tensor& beta,
+                        int N, int C, int H, int W, int num_groups,
+                        float eps, ::brotensor::Tensor& Y);
+void group_norm_backward(const ::brotensor::Tensor& X,
+                         const ::brotensor::Tensor& gamma,
+                         const ::brotensor::Tensor& dY,
+                         int N, int C, int H, int W, int num_groups, float eps,
+                         ::brotensor::Tensor& dX, ::brotensor::Tensor& dGamma,
+                         ::brotensor::Tensor& dBeta);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -325,6 +360,14 @@ struct CpuStaticRegistrar {
         ops.rope_backward              = &detail::cpu::rope_backward;
         ops.rms_norm_forward           = &detail::cpu::rms_norm_forward;
         ops.rms_norm_backward          = &detail::cpu::rms_norm_backward;
+
+        // ── CHUNK 3 ──
+        ops.conv2d_forward             = &detail::cpu::conv2d_forward;
+        ops.conv2d_backward_input      = &detail::cpu::conv2d_backward_input;
+        ops.conv2d_backward_weight     = &detail::cpu::conv2d_backward_weight;
+        ops.conv2d_backward_bias       = &detail::cpu::conv2d_backward_bias;
+        ops.group_norm_forward         = &detail::cpu::group_norm_forward;
+        ops.group_norm_backward        = &detail::cpu::group_norm_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

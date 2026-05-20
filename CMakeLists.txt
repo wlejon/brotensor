@@ -88,6 +88,8 @@ add_library(brotensor_cpu STATIC
     src/cpu/matmul.cpp
     src/cpu/rope.cpp
     src/cpu/rms_norm.cpp
+    src/cpu/conv2d.cpp
+    src/cpu/group_norm.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)

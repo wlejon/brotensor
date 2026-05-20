@@ -83,6 +83,7 @@ if(BROTENSOR_HAS_GPU)
         elementwise_extra loss_fused embedding_extra concat_extra
         reduce_extra layernorm_inference
         activations geglu swiglu matmul rope rmsnorm
+        conv2d group_norm
     )
     foreach(_name IN LISTS _brotensor_parity_tests)
         brotensor_add_test(brotensor_test_${_name}_parity test_${_name}_parity.cpp)
