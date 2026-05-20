@@ -107,6 +107,20 @@ static void test_to_migration() {
     for (int i = 0; i < 4; ++i) CHECK(back[i] == host_in[i]);
 }
 
+static void test_view_non_owning() {
+    std::printf("test_view_non_owning\n");
+    Tensor owner = Tensor::zeros_on(Device::CUDA, 3, 3);
+    owner.zero();
+    {
+        Tensor v = Tensor::view(Device::CUDA, owner.data, 3, 3);
+        CHECK(v.data == owner.data);
+        // v goes out of scope here without freeing owner.data.
+    }
+    // Sanity: owner is still usable after the non-owning view is destroyed.
+    owner.zero();
+    CHECK(owner.data != nullptr);
+}
+
 static void test_relu_smoke() {
     std::printf("test_relu_smoke\n");
     std::vector<float> host_in = {-3.0f, -0.5f, 0.0f, 0.25f, 7.0f};
@@ -199,6 +213,7 @@ int main() {
     test_round_trip();
     test_clone();
     test_to_migration();
+    test_view_non_owning();
     test_relu_smoke();
     test_fp16_host_conversion();
     test_fp16_round_trip();

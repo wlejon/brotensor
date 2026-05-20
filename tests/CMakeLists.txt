@@ -74,6 +74,17 @@ if(BROTENSOR_HAS_GPU)
     # CPU↔GPU parity (GPU-only).
     brotensor_add_test(brotensor_test_cpu_gpu_parity test_cpu_gpu_parity.cpp)
 
+    # Per-op CPU↔GPU parity suite — one executable per op group so ctest
+    # surfaces failures individually. Complements the monolithic
+    # test_cpu_gpu_parity.cpp above; parity_helpers.h is the shared harness.
+    set(_brotensor_parity_tests
+        linear elementwise softmax layernorm attention optim adam
+        reduce loss embedding concat mha batched
+    )
+    foreach(_name IN LISTS _brotensor_parity_tests)
+        brotensor_add_test(brotensor_test_${_name}_parity test_${_name}_parity.cpp)
+    endforeach()
+
     # Diffusion micro-benchmark. Built but not added to ctest — invoke
     # manually from the build dir (./tests/Release/brotensor_bench_diffusion).
     # CUDA-only: it uses cudaEvent_t for timing.
