@@ -21,9 +21,10 @@ namespace brotensor {
 
 int dtype_size_bytes(Dtype dt) {
     switch (dt) {
-        case Dtype::FP32: return 4;
-        case Dtype::FP16: return 2;
-        case Dtype::INT8: return 1;
+        case Dtype::FP32:  return 4;
+        case Dtype::FP16:  return 2;
+        case Dtype::INT8:  return 1;
+        case Dtype::INT32: return 4;
     }
     return 0;
 }
@@ -185,6 +186,18 @@ Tensor& Tensor::operator=(Tensor&& o) noexcept {
         o.cols  = 0;
         o.owns_ = false;
     }
+    return *this;
+}
+
+// Copy ctor / assignment: device-aware deep copy via clone(). Implemented in
+// terms of the move assignment so all the ownership bookkeeping lives in one
+// place.
+Tensor::Tensor(const Tensor& o) {
+    *this = o.clone();
+}
+
+Tensor& Tensor::operator=(const Tensor& o) {
+    if (this != &o) *this = o.clone();
     return *this;
 }
 

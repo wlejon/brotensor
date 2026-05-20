@@ -157,7 +157,6 @@ if(BROTENSOR_WITH_METAL)
     add_library(brotensor_metal STATIC
         src/metal/runtime.mm
         src/metal/tensor.mm
-        src/metal/device_buffer.mm
         src/metal/kernels.mm
         src/metal/gemm.mm
         src/metal/elementwise.mm
@@ -201,7 +200,6 @@ if(BROTENSOR_WITH_METAL)
     set_source_files_properties(
         src/metal/runtime.mm
         src/metal/tensor.mm
-        src/metal/device_buffer.mm
         src/metal/kernels.mm
         src/metal/gemm.mm
         src/metal/elementwise.mm

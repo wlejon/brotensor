@@ -1,6 +1,5 @@
 #include <brotensor/tensor.h>
 #include <brotensor/runtime.h>
-#include <brotensor/device_buffer.h>
 
 #import "internal.h"
 

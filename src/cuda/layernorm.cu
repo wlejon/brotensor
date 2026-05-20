@@ -497,6 +497,13 @@ void group_norm_backward(const ::brotensor::Tensor& X,
                          ::brotensor::Tensor& dGamma,
                          ::brotensor::Tensor& dBeta);
 
+// Masked mean-pool lives in reduce.cu (same brotensor::detail::cuda
+// namespace); registered here so the norms/reduce slots are filled.
+void masked_mean_pool_forward(const ::brotensor::Tensor& X, const float* d_mask,
+                              ::brotensor::Tensor& y);
+void masked_mean_pool_backward(const ::brotensor::Tensor& dY, const float* d_mask,
+                               int K, ::brotensor::Tensor& dX);
+
 void fill_cuda_vtable_norms(::brotensor::detail::OpsVTable& v) {
     v.layernorm_forward                              = &layernorm_forward;
     v.layernorm_backward                             = &layernorm_backward;
@@ -507,6 +514,8 @@ void fill_cuda_vtable_norms(::brotensor::detail::OpsVTable& v) {
     v.resblock_forward                               = &resblock_forward;
     v.resblock_backward                              = &resblock_backward;
     v.resblock_forward_int8w_fp16                    = &resblock_forward_int8w_fp16;
+    v.masked_mean_pool_forward                       = &masked_mean_pool_forward;
+    v.masked_mean_pool_backward                      = &masked_mean_pool_backward;
 }
 
 } // namespace brotensor::detail::cuda

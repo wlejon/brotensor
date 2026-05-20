@@ -13,14 +13,18 @@ namespace brotensor {
 // single raw `void*` (`data`); typed access is via the host_f32 / host_fp16
 // accessors. GPU backends reinterpret the same allocation for FP16 / INT8.
 //
-// Element sizes are fixed: FP32 = 4 bytes, FP16 = 2 bytes, INT8 = 1 byte.
-// Allocation, clone, zero, and resize all use dtype-aware byte counts.
-// INT8 is currently only carried by weight-only quantised ops (W8A16
-// matmul/conv2d); arithmetic ops only dispatch on FP32/FP16.
+// Element sizes are fixed: FP32 = 4 bytes, FP16 = 2 bytes, INT8 = 1 byte,
+// INT32 = 4 bytes. Allocation, clone, zero, and resize all use dtype-aware
+// byte counts. INT8 is currently only carried by weight-only quantised ops
+// (W8A16 matmul/conv2d); arithmetic ops only dispatch on FP32/FP16. INT32 is
+// likewise a pure storage carrier — used for device-resident index/offset
+// buffers (e.g. per-head offset tables for softmax_xent_fused_batched); no
+// arithmetic op dispatches on it.
 enum class Dtype : int {
-    FP32 = 0,
-    FP16 = 1,
-    INT8 = 2,
+    FP32  = 0,
+    FP16  = 1,
+    INT8  = 2,
+    INT32 = 3,
 };
 
 int dtype_size_bytes(Dtype);
@@ -57,9 +61,13 @@ struct Tensor {
     Tensor() = default;
     ~Tensor();
 
-    // Move-only.
-    Tensor(const Tensor&) = delete;
-    Tensor& operator=(const Tensor&) = delete;
+    // Copyable + movable. The copy ctor / copy assignment perform a
+    // device-aware deep copy — identical to clone() — so a Tensor can be
+    // used with value semantics (caches, std::vector storage, by-value
+    // params). clone() remains for call sites that want the copy to be
+    // explicit. Copying a GPU-resident tensor allocates + copies on-device.
+    Tensor(const Tensor&);
+    Tensor& operator=(const Tensor&);
     Tensor(Tensor&&) noexcept;
     Tensor& operator=(Tensor&&) noexcept;
 
@@ -77,6 +85,14 @@ struct Tensor {
     // to a specific backend regardless of caller policy.
     static Tensor zeros_on(Device, int r, int c, Dtype dt = Dtype::FP32);
     static Tensor empty_on(Device, int r, int c, Dtype dt = Dtype::FP32);
+
+    // Host (CPU) FP32 factories. Always allocate zero-filled storage pinned
+    // to Device::CPU regardless of the current default device — a parameter-
+    // bearing layer builds its weights on the host, then migrates the whole
+    // layer with to(Device). `mat` is a (rows, cols) matrix; `vec` is a
+    // rank-1 (n, 1) column vector.
+    static Tensor mat(int r, int c) { return zeros_on(Device::CPU, r, c); }
+    static Tensor vec(int n)        { return zeros_on(Device::CPU, n, 1); }
 
     // Host bootstrap. Allocates on the current default device and uploads
     // `r * c` floats (FP32) or uint16_t bit patterns (FP16) from `src`.
@@ -137,6 +153,17 @@ struct Tensor {
     // Throw if device != CPU or dtype != FP32 or indices out of range.
     float& at(int r, int c);
     float  at(int r, int c) const;
+
+    // Host (CPU) FP32 convenience accessors. Thin aliases over the typed
+    // host accessors above — they throw via the same checks if device != CPU
+    // or dtype != FP32. `ptr` is the raw row-major base pointer; operator()
+    // is bounds-checked (r, c) access; operator[] is flat element access.
+    float*       ptr()       { return host_f32_mut(); }
+    const float* ptr() const { return host_f32(); }
+    float& operator()(int r, int c)       { return at(r, c); }
+    float  operator()(int r, int c) const { return at(r, c); }
+    float& operator[](int i)       { return host_f32_mut()[i]; }
+    float  operator[](int i) const { return host_f32()[i]; }
 
     // ─── Host roundtrip helpers ────────────────────────────────────────────
     //
