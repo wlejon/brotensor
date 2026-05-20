@@ -1,4 +1,3 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
@@ -6,7 +5,7 @@
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -94,7 +93,7 @@ DEF_PSO(pso_seq_to_nchw_fp16, @"k_seq_to_nchw_fp16")
 #undef DEF_PSO
 
 void launch_transpose(id<MTLComputePipelineState> pso,
-                      const GpuTensor& X, GpuTensor& Y,
+                      const Tensor& X, Tensor& Y,
                       int N, int C, int HW, uint32_t total) {
     if (total == 0) return;
     const uint32_t Nu = static_cast<uint32_t>(N);
@@ -132,9 +131,9 @@ void check_dims(const char* op, int N, int C, int H, int W) {
 
 } // namespace
 
-void nchw_to_sequence_gpu(const GpuTensor& X,
-                          int N, int C, int H, int W,
-                          GpuTensor& Y) {
+void nchw_to_sequence(const Tensor& X,
+                      int N, int C, int H, int W,
+                      Tensor& Y) {
     check_dims("nchw_to_sequence_gpu", N, C, H, W);
     const int HW = H * W;
     const int rows = N * HW;
@@ -147,9 +146,9 @@ void nchw_to_sequence_gpu(const GpuTensor& X,
     launch_transpose(pso, X, Y, N, C, HW, total);
 }
 
-void sequence_to_nchw_gpu(const GpuTensor& X,
-                          int N, int C, int H, int W,
-                          GpuTensor& Y) {
+void sequence_to_nchw(const Tensor& X,
+                      int N, int C, int H, int W,
+                      Tensor& Y) {
     check_dims("sequence_to_nchw_gpu", N, C, H, W);
     const int HW = H * W;
     const int cols = C * HW;
@@ -162,4 +161,4 @@ void sequence_to_nchw_gpu(const GpuTensor& X,
     launch_transpose(pso, X, Y, N, C, HW, total);
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

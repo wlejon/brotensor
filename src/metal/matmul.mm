@@ -2,14 +2,13 @@
 // FP32 + FP16 dispatch; FP32 accumulation throughout. Naive tiled GEMM,
 // mirroring src/cuda/matmul.cu.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -102,7 +101,7 @@ id<MTLComputePipelineState> pso_fp16() {
 
 } // namespace
 
-void matmul_gpu(const GpuTensor& A, const GpuTensor& B, GpuTensor& C) {
+void matmul(const Tensor& A, const Tensor& B, Tensor& C) {
     if (A.dtype != B.dtype) {
         throw std::runtime_error("matmul_gpu: A and B must share dtype");
     }
@@ -155,4 +154,4 @@ void matmul_gpu(const GpuTensor& A, const GpuTensor& B, GpuTensor& C) {
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

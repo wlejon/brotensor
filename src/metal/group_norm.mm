@@ -1,4 +1,3 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <cstring>
@@ -6,7 +5,7 @@
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -406,21 +405,21 @@ DEF_PSO(pso_add_fp32,    @"k_add_fp32_into_fp32")
 
 } // namespace
 
-void group_norm_forward_gpu(const GpuTensor& X,
-                            const GpuTensor& gamma,
-                            const GpuTensor& beta,
-                            int N, int C, int H, int W,
-                            int num_groups,
-                            float eps,
-                            GpuTensor& Y) {
+void group_norm_forward(const Tensor& X,
+                        const Tensor& gamma,
+                        const Tensor& beta,
+                        int N, int C, int H, int W,
+                        int num_groups,
+                        float eps,
+                        Tensor& Y) {
     if (gamma.dtype != X.dtype || beta.dtype != X.dtype) {
-        throw std::runtime_error("group_norm_forward_gpu: gamma/beta dtype must match X");
+        throw std::runtime_error("group_norm_forward: gamma/beta dtype must match X");
     }
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("group_norm_forward_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("group_norm_forward: X must be FP16 or FP32");
     }
     if (num_groups <= 0 || C % num_groups != 0) {
-        throw std::runtime_error("group_norm_forward_gpu: num_groups must divide C");
+        throw std::runtime_error("group_norm_forward: num_groups must divide C");
     }
     const int spatial = H * W;
     const int cols = C * spatial;
@@ -464,30 +463,30 @@ void group_norm_forward_gpu(const GpuTensor& X,
     }
 }
 
-void group_norm_backward_gpu(const GpuTensor& X,
-                             const GpuTensor& gamma,
-                             const GpuTensor& dY,
-                             int N, int C, int H, int W,
-                             int num_groups,
-                             float eps,
-                             GpuTensor& dX,
-                             GpuTensor& dGamma,
-                             GpuTensor& dBeta) {
+void group_norm_backward(const Tensor& X,
+                         const Tensor& gamma,
+                         const Tensor& dY,
+                         int N, int C, int H, int W,
+                         int num_groups,
+                         float eps,
+                         Tensor& dX,
+                         Tensor& dGamma,
+                         Tensor& dBeta) {
     if (gamma.dtype != X.dtype || dY.dtype != X.dtype) {
-        throw std::runtime_error("group_norm_backward_gpu: gamma/dY dtype must match X");
+        throw std::runtime_error("group_norm_backward: gamma/dY dtype must match X");
     }
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("group_norm_backward_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("group_norm_backward: X must be FP16 or FP32");
     }
     if (num_groups <= 0 || C % num_groups != 0) {
-        throw std::runtime_error("group_norm_backward_gpu: num_groups must divide C");
+        throw std::runtime_error("group_norm_backward: num_groups must divide C");
     }
     if (dGamma.dtype != X.dtype || dBeta.dtype != X.dtype) {
-        throw std::runtime_error("group_norm_backward_gpu: dGamma/dBeta dtype must match X");
+        throw std::runtime_error("group_norm_backward: dGamma/dBeta dtype must match X");
     }
     if (dGamma.rows != C || dGamma.cols != 1 ||
         dBeta.rows  != C || dBeta.cols  != 1) {
-        throw std::runtime_error("group_norm_backward_gpu: dGamma/dBeta must be (C,1)");
+        throw std::runtime_error("group_norm_backward: dGamma/dBeta must be (C,1)");
     }
     const int spatial = H * W;
     const int cols = C * spatial;
@@ -568,4 +567,4 @@ void group_norm_backward_gpu(const GpuTensor& X,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

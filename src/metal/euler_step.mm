@@ -1,14 +1,13 @@
 // Fused Euler-discrete sampler step (Metal, FP16). ε-prediction.
 //   x_prev = x_t + (sigma_prev - sigma_t) * eps_pred
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -43,9 +42,9 @@ id<MTLComputePipelineState> pso() {
 
 } // namespace
 
-void euler_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
-                    float sigma_t, float sigma_prev,
-                    GpuTensor& x_prev) {
+void euler_step(const Tensor& x_t, const Tensor& eps_pred,
+                float sigma_t, float sigma_prev,
+                Tensor& x_prev) {
     if (x_t.dtype != Dtype::FP16 || eps_pred.dtype != Dtype::FP16) {
         throw std::runtime_error("euler_step_gpu: x_t and eps_pred must be FP16");
     }
@@ -88,4 +87,4 @@ void euler_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

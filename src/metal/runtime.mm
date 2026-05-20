@@ -1,5 +1,3 @@
-#include <brotensor/runtime.h>
-
 #import "internal.h"
 
 #include <atomic>

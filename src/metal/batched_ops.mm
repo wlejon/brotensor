@@ -1,11 +1,10 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -286,8 +285,8 @@ void dispatch2d(id<MTLComputePipelineState> pso, NSUInteger nx, NSUInteger ny,
 
 } // namespace
 
-void linear_forward_batched_gpu(const GpuTensor& W, const GpuTensor& bias,
-                                const GpuTensor& X_BD, GpuTensor& Y_BD) {
+void linear_forward_batched(const Tensor& W, const Tensor& bias,
+                            const Tensor& X_BD, Tensor& Y_BD) {
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
     const int B       = X_BD.rows;
@@ -315,7 +314,7 @@ void linear_forward_batched_gpu(const GpuTensor& W, const GpuTensor& bias,
     });
 }
 
-void relu_forward_batched_gpu(const GpuTensor& X_BD, GpuTensor& Y_BD) {
+void relu_forward_batched(const Tensor& X_BD, Tensor& Y_BD) {
     if (Y_BD.rows != X_BD.rows || Y_BD.cols != X_BD.cols)
         Y_BD.resize(X_BD.rows, X_BD.cols);
     const uint32_t n = static_cast<uint32_t>(X_BD.size());
@@ -331,7 +330,7 @@ void relu_forward_batched_gpu(const GpuTensor& X_BD, GpuTensor& Y_BD) {
     });
 }
 
-void tanh_forward_batched_gpu(const GpuTensor& X_BD, GpuTensor& Y_BD) {
+void tanh_forward_batched(const Tensor& X_BD, Tensor& Y_BD) {
     if (Y_BD.rows != X_BD.rows || Y_BD.cols != X_BD.cols)
         Y_BD.resize(X_BD.rows, X_BD.cols);
     const uint32_t n = static_cast<uint32_t>(X_BD.size());
@@ -347,7 +346,7 @@ void tanh_forward_batched_gpu(const GpuTensor& X_BD, GpuTensor& Y_BD) {
     });
 }
 
-void add_inplace_batched_gpu(GpuTensor& Y_BD, const GpuTensor& X_BD) {
+void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD) {
     const uint32_t n = static_cast<uint32_t>(Y_BD.size());
     if (n == 0) return;
     id<MTLBuffer> by = buffer_for(Y_BD);
@@ -361,8 +360,8 @@ void add_inplace_batched_gpu(GpuTensor& Y_BD, const GpuTensor& X_BD) {
     });
 }
 
-void relu_backward_batched_gpu(const GpuTensor& X_BD, const GpuTensor& dY_BD,
-                               GpuTensor& dX_BD) {
+void relu_backward_batched(const Tensor& X_BD, const Tensor& dY_BD,
+                           Tensor& dX_BD) {
     if (dX_BD.rows != X_BD.rows || dX_BD.cols != X_BD.cols)
         dX_BD.resize(X_BD.rows, X_BD.cols);
     const uint32_t n = static_cast<uint32_t>(X_BD.size());
@@ -381,8 +380,8 @@ void relu_backward_batched_gpu(const GpuTensor& X_BD, const GpuTensor& dY_BD,
     });
 }
 
-void tanh_backward_batched_gpu(const GpuTensor& Y_BD, const GpuTensor& dY_BD,
-                               GpuTensor& dX_BD) {
+void tanh_backward_batched(const Tensor& Y_BD, const Tensor& dY_BD,
+                           Tensor& dX_BD) {
     if (dX_BD.rows != Y_BD.rows || dX_BD.cols != Y_BD.cols)
         dX_BD.resize(Y_BD.rows, Y_BD.cols);
     const uint32_t n = static_cast<uint32_t>(Y_BD.size());
@@ -401,16 +400,16 @@ void tanh_backward_batched_gpu(const GpuTensor& Y_BD, const GpuTensor& dY_BD,
     });
 }
 
-void linear_backward_batched_gpu(const GpuTensor& W, const GpuTensor& X_BD,
-                                 const GpuTensor& dY_BD,
-                                 GpuTensor& dX_BD,
-                                 GpuTensor& dW, GpuTensor& dB) {
+void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
+                             const Tensor& dY_BD,
+                             Tensor& dX_BD,
+                             Tensor& dW, Tensor& dB) {
     if (W.dtype != Dtype::FP16 && W.dtype != Dtype::FP32) {
-        throw std::runtime_error("linear_backward_batched_gpu: W must be FP16 or FP32");
+        throw std::runtime_error("linear_backward_batched: W must be FP16 or FP32");
     }
     if (X_BD.dtype != W.dtype || dY_BD.dtype != W.dtype ||
         dW.dtype != W.dtype || dB.dtype != W.dtype) {
-        throw std::runtime_error("linear_backward_batched_gpu: all tensors must share dtype");
+        throw std::runtime_error("linear_backward_batched: all tensors must share dtype");
     }
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
@@ -500,4 +499,4 @@ void linear_backward_batched_gpu(const GpuTensor& W, const GpuTensor& X_BD,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

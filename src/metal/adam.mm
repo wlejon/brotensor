@@ -1,11 +1,10 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #import "internal.h"
 
 #include <cmath>
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -52,9 +51,9 @@ id<MTLComputePipelineState> adam_pipeline() {
 
 } // namespace
 
-void adam_step_gpu(GpuTensor& param, const GpuTensor& grad,
-                   GpuTensor& m, GpuTensor& v,
-                   float lr, float beta1, float beta2, float eps, int step) {
+void adam_step(Tensor& param, const Tensor& grad,
+               Tensor& m, Tensor& v,
+               float lr, float beta1, float beta2, float eps, int step) {
     const uint32_t n = static_cast<uint32_t>(param.size());
     if (n == 0) return;
     const float bc1 = 1.0f - std::pow(beta1, static_cast<float>(step));
@@ -95,4 +94,4 @@ void adam_step_gpu(GpuTensor& param, const GpuTensor& grad,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

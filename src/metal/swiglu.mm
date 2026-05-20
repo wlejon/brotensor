@@ -1,13 +1,12 @@
 // SwiGLU forward + backward (Metal). FP32 + FP16; FP32 internal math.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -112,7 +111,7 @@ DEF_PSO(pso_bw_fp16, @"k_swiglu_bw_fp16")
 
 } // namespace
 
-void swiglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
+void swiglu_forward(const Tensor& X, Tensor& Y) {
     if (X.cols % 2 != 0) {
         throw std::runtime_error("swiglu_forward_gpu: X.cols must be even (2*D)");
     }
@@ -148,8 +147,8 @@ void swiglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
     }
 }
 
-void swiglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
-                        GpuTensor& dX) {
+void swiglu_backward(const Tensor& X, const Tensor& dY,
+                     Tensor& dX) {
     if (X.cols % 2 != 0) {
         throw std::runtime_error("swiglu_backward_gpu: X.cols must be even (2*D)");
     }
@@ -188,4 +187,4 @@ void swiglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

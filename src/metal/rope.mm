@@ -1,13 +1,12 @@
 // RoPE forward + backward (Metal). One thread per (row, head, pair).
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -170,8 +169,8 @@ void launch(id<MTLComputePipelineState> pso, NSUInteger total,
 
 } // namespace
 
-void rope_forward_gpu(const GpuTensor& X, int head_dim, int num_heads,
-                     int seq_offset, float theta_base, GpuTensor& Y) {
+void rope_forward(const Tensor& X, int head_dim, int num_heads,
+                  int seq_offset, float theta_base, Tensor& Y) {
     if (head_dim <= 0 || (head_dim & 1) != 0) {
         throw std::runtime_error("rope_forward_gpu: head_dim must be a positive even integer");
     }
@@ -194,8 +193,8 @@ void rope_forward_gpu(const GpuTensor& X, int head_dim, int num_heads,
            (int32_t)seq_offset, theta_base);
 }
 
-void rope_backward_gpu(const GpuTensor& dY, int head_dim, int num_heads,
-                      int seq_offset, float theta_base, GpuTensor& dX) {
+void rope_backward(const Tensor& dY, int head_dim, int num_heads,
+                   int seq_offset, float theta_base, Tensor& dX) {
     if (head_dim <= 0 || (head_dim & 1) != 0) {
         throw std::runtime_error("rope_backward_gpu: head_dim must be a positive even integer");
     }
@@ -218,4 +217,4 @@ void rope_backward_gpu(const GpuTensor& dY, int head_dim, int num_heads,
            (int32_t)seq_offset, theta_base);
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

@@ -1,11 +1,10 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -235,11 +234,11 @@ DEF_PSO(pso_fw_inf, @"k_ln_forward_inference_batched")
 
 } // namespace
 
-void layernorm_forward_gpu(const GpuTensor& x,
-                           const GpuTensor& gamma, const GpuTensor& beta,
-                           GpuTensor& y, GpuTensor& xhat,
-                           float& mean_out, float& rstd_out,
-                           float eps) {
+void layernorm_forward(const Tensor& x,
+                       const Tensor& gamma, const Tensor& beta,
+                       Tensor& y, Tensor& xhat,
+                       float& mean_out, float& rstd_out,
+                       float eps) {
     const int n = x.size();
     if (y.rows != x.rows || y.cols != x.cols) y.resize(x.rows, x.cols);
     if (xhat.rows != x.rows || xhat.cols != x.cols) xhat.resize(x.rows, x.cols);
@@ -283,16 +282,16 @@ void layernorm_forward_gpu(const GpuTensor& x,
     }
 }
 
-void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
-                            const GpuTensor& gamma, float rstd,
-                            GpuTensor& dX,
-                            GpuTensor& dGamma, GpuTensor& dBeta) {
+void layernorm_backward(const Tensor& dY, const Tensor& xhat,
+                        const Tensor& gamma, float rstd,
+                        Tensor& dX,
+                        Tensor& dGamma, Tensor& dBeta) {
     if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32) {
-        throw std::runtime_error("layernorm_backward_gpu: dY must be FP16 or FP32");
+        throw std::runtime_error("layernorm_backward: dY must be FP16 or FP32");
     }
     if (xhat.dtype != dY.dtype || gamma.dtype != dY.dtype ||
         dGamma.dtype != dY.dtype || dBeta.dtype != dY.dtype) {
-        throw std::runtime_error("layernorm_backward_gpu: all tensors must share dtype");
+        throw std::runtime_error("layernorm_backward: all tensors must share dtype");
     }
     const int n = dY.size();
     if (dX.rows != dY.rows || dX.cols != dY.cols || dX.dtype != dY.dtype) {
@@ -380,11 +379,11 @@ void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
     }
 }
 
-void layernorm_forward_inference_batched_gpu(const GpuTensor& X_RD,
-                                             const GpuTensor& gamma,
-                                             const GpuTensor& beta,
-                                             GpuTensor& Y_RD,
-                                             float eps) {
+void layernorm_forward_inference_batched(const Tensor& X_RD,
+                                         const Tensor& gamma,
+                                         const Tensor& beta,
+                                         Tensor& Y_RD,
+                                         float eps) {
     const int R = X_RD.rows;
     const int D = X_RD.cols;
     if (Y_RD.rows != R || Y_RD.cols != D) Y_RD.resize(R, D);
@@ -485,14 +484,14 @@ id<MTLComputePipelineState> pso_fw_inf_fp16() {
 
 } // namespace
 
-void layernorm_forward_inference_batched_fp16_gpu(const GpuTensor& X_RD,
-                                                  const GpuTensor& gamma,
-                                                  const GpuTensor& beta,
-                                                  GpuTensor& Y_RD,
-                                                  float eps) {
+void layernorm_forward_inference_batched_fp16(const Tensor& X_RD,
+                                              const Tensor& gamma,
+                                              const Tensor& beta,
+                                              Tensor& Y_RD,
+                                              float eps) {
     if (X_RD.dtype != Dtype::FP16 || gamma.dtype != Dtype::FP16 ||
         beta.dtype != Dtype::FP16) {
-        throw std::runtime_error("layernorm_forward_inference_batched_fp16_gpu: all tensors must be FP16");
+        throw std::runtime_error("layernorm_forward_inference_batched_fp16: all tensors must be FP16");
     }
     const int R = X_RD.rows;
     const int D = X_RD.cols;
@@ -530,4 +529,4 @@ void layernorm_forward_inference_batched_fp16_gpu(const GpuTensor& X_RD,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

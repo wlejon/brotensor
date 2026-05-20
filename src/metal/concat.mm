@@ -1,4 +1,3 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #import "internal.h"
@@ -6,7 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 
@@ -19,8 +18,8 @@ inline void copy_bytes(void* dst, const void* src, std::size_t bytes) {
 
 } // namespace
 
-void concat_rows_gpu(const std::vector<const GpuTensor*>& parts,
-                     GpuTensor& out) {
+void concat_rows(const std::vector<const Tensor*>& parts,
+                 Tensor& out) {
     int total = 0;
     Dtype dt = Dtype::FP32;
     bool seen = false;
@@ -46,8 +45,8 @@ void concat_rows_gpu(const std::vector<const GpuTensor*>& parts,
     }
 }
 
-void split_rows_gpu(const GpuTensor& in,
-                    const std::vector<GpuTensor*>& parts) {
+void split_rows(const Tensor& in,
+                const std::vector<Tensor*>& parts) {
     const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(in.dtype));
     const char* src_base = reinterpret_cast<const char*>(in.data);
     std::size_t off_bytes = 0;
@@ -60,8 +59,8 @@ void split_rows_gpu(const GpuTensor& in,
     }
 }
 
-void concat_batched_rows_gpu(const std::vector<const GpuTensor*>& parts,
-                             GpuTensor& out) {
+void concat_batched_rows(const std::vector<const Tensor*>& parts,
+                         Tensor& out) {
     if (parts.empty()) { out.resize(0, 0); return; }
     int B = 0;
     int total_cols = 0;
@@ -97,12 +96,12 @@ void concat_batched_rows_gpu(const std::vector<const GpuTensor*>& parts,
     }
 }
 
-void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
-                              int N, int H, int W,
-                              const std::vector<int>& C_per_part,
-                              GpuTensor& out) {
+void concat_nchw_channels(const std::vector<const Tensor*>& parts,
+                          int N, int H, int W,
+                          const std::vector<int>& C_per_part,
+                          Tensor& out) {
     if (parts.size() != C_per_part.size()) {
-        throw std::runtime_error("concat_nchw_channels_gpu: parts.size() != C_per_part.size()");
+        throw std::runtime_error("concat_nchw_channels: parts.size() != C_per_part.size()");
     }
     int total_C = 0;
     Dtype dt = Dtype::FP32;
@@ -110,13 +109,13 @@ void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
     for (std::size_t i = 0; i < parts.size(); ++i) {
         const auto* p = parts[i];
         const int Ci = C_per_part[i];
-        if (!p) throw std::runtime_error("concat_nchw_channels_gpu: null part");
+        if (!p) throw std::runtime_error("concat_nchw_channels: null part");
         if (!seen) { dt = p->dtype; seen = true; }
         else if (p->dtype != dt) {
-            throw std::runtime_error("concat_nchw_channels_gpu: dtype mismatch across parts");
+            throw std::runtime_error("concat_nchw_channels: dtype mismatch across parts");
         }
         if (p->size() != static_cast<int>(static_cast<std::size_t>(N) * Ci * H * W)) {
-            throw std::runtime_error("concat_nchw_channels_gpu: part size mismatch (expected N*C_i*H*W)");
+            throw std::runtime_error("concat_nchw_channels: part size mismatch (expected N*C_i*H*W)");
         }
         total_C += Ci;
     }
@@ -145,22 +144,22 @@ void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
     }
 }
 
-void concat_nchw_channels_backward_gpu(const GpuTensor& dY,
-                                       int N, int H, int W,
-                                       const std::vector<int>& C_per_part,
-                                       const std::vector<GpuTensor*>& parts) {
+void concat_nchw_channels_backward(const Tensor& dY,
+                                   int N, int H, int W,
+                                   const std::vector<int>& C_per_part,
+                                   const std::vector<Tensor*>& parts) {
     if (parts.size() != C_per_part.size()) {
-        throw std::runtime_error("concat_nchw_channels_backward_gpu: parts.size() != C_per_part.size()");
+        throw std::runtime_error("concat_nchw_channels_backward: parts.size() != C_per_part.size()");
     }
     int total_C = 0;
     for (int Ci : C_per_part) total_C += Ci;
     const int expected_cols = total_C * H * W;
     if (dY.rows != N || dY.cols != expected_cols) {
-        throw std::runtime_error("concat_nchw_channels_backward_gpu: dY shape mismatch (expected N x total_C*H*W)");
+        throw std::runtime_error("concat_nchw_channels_backward: dY shape mismatch (expected N x total_C*H*W)");
     }
     const Dtype dt = dY.dtype;
     if (dt != Dtype::FP32 && dt != Dtype::FP16) {
-        throw std::runtime_error("concat_nchw_channels_backward_gpu: dY dtype must be FP16 or FP32");
+        throw std::runtime_error("concat_nchw_channels_backward: dY dtype must be FP16 or FP32");
     }
 
     const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(dt));
@@ -170,9 +169,9 @@ void concat_nchw_channels_backward_gpu(const GpuTensor& dY,
 
     std::size_t c_off = 0;
     for (std::size_t i = 0; i < parts.size(); ++i) {
-        GpuTensor* p = parts[i];
+        Tensor* p = parts[i];
         const int Ci = C_per_part[i];
-        if (!p) throw std::runtime_error("concat_nchw_channels_backward_gpu: null part");
+        if (!p) throw std::runtime_error("concat_nchw_channels_backward: null part");
         const int cols = Ci * H * W;
         if (p->rows != N || p->cols != cols || p->dtype != dt) {
             p->resize(N, cols, dt);
@@ -192,9 +191,9 @@ void concat_nchw_channels_backward_gpu(const GpuTensor& dY,
     }
 }
 
-void copy_d2d_gpu(const GpuTensor& src, int src_off,
-                  GpuTensor& dst,       int dst_off,
-                  int n) {
+void copy_d2d(const Tensor& src, int src_off,
+              Tensor& dst,       int dst_off,
+              int n) {
     if (n <= 0) return;
     const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(src.dtype));
     const char* src_base = reinterpret_cast<const char*>(src.data);
@@ -204,4 +203,4 @@ void copy_d2d_gpu(const GpuTensor& src, int src_off,
                elem * static_cast<std::size_t>(n));
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

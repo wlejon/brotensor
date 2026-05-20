@@ -2,7 +2,6 @@
 // Mirrors src/cuda/int8_quant.cu. The host quantiser is portable; only the two
 // device ops dispatch Metal kernels.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
@@ -13,7 +12,7 @@
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -267,26 +266,26 @@ struct ConvI8Params {
 
 } // namespace
 
-void matmul_int8w_fp16_gpu(const GpuTensor& W_int8,
-                           const GpuTensor& scales,
-                           const GpuTensor& X,
-                           GpuTensor& Y) {
+void matmul_int8w_fp16(const Tensor& W_int8,
+                       const Tensor& scales,
+                       const Tensor& X,
+                       Tensor& Y) {
     if (W_int8.dtype != Dtype::INT8) {
-        throw std::runtime_error("matmul_int8w_fp16_gpu: W_int8 must be INT8");
+        throw std::runtime_error("matmul_int8w_fp16: W_int8 must be INT8");
     }
     if (scales.dtype != Dtype::FP32) {
-        throw std::runtime_error("matmul_int8w_fp16_gpu: scales must be FP32");
+        throw std::runtime_error("matmul_int8w_fp16: scales must be FP32");
     }
     if (X.dtype != Dtype::FP16) {
-        throw std::runtime_error("matmul_int8w_fp16_gpu: X must be FP16");
+        throw std::runtime_error("matmul_int8w_fp16: X must be FP16");
     }
     const int M = W_int8.rows;
     const int K = W_int8.cols;
     if (X.rows != K) {
-        throw std::runtime_error("matmul_int8w_fp16_gpu: K mismatch (W.cols != X.rows)");
+        throw std::runtime_error("matmul_int8w_fp16: K mismatch (W.cols != X.rows)");
     }
     if (scales.rows != M || scales.cols != 1) {
-        throw std::runtime_error("matmul_int8w_fp16_gpu: scales shape must be (out, 1)");
+        throw std::runtime_error("matmul_int8w_fp16: scales shape must be (out, 1)");
     }
     const int Nb = X.cols;
     if (Y.rows != M || Y.cols != Nb || Y.dtype != Dtype::FP16) {
@@ -336,44 +335,44 @@ void matmul_int8w_fp16_gpu(const GpuTensor& W_int8,
     }
 }
 
-void conv2d_int8w_fp16_forward_gpu(const GpuTensor& X,
-                                   const GpuTensor& W_int8,
-                                   const GpuTensor& scales,
-                                   const GpuTensor* bias,
+void conv2d_int8w_fp16_forward(const Tensor& X,
+                               const Tensor& W_int8,
+                               const Tensor& scales,
+                               const Tensor* bias,
                                    int N, int C_in, int H, int W,
                                    int C_out, int kH, int kW,
                                    int stride_h, int stride_w,
                                    int pad_h, int pad_w,
-                                   int dil_h, int dil_w, int groups,
-                                   GpuTensor& Y) {
+                               int dil_h, int dil_w, int groups,
+                               Tensor& Y) {
     if (X.dtype != Dtype::FP16) {
-        throw std::runtime_error("conv2d_int8w_fp16_forward_gpu: X must be FP16");
+        throw std::runtime_error("conv2d_int8w_fp16_forward: X must be FP16");
     }
     if (W_int8.dtype != Dtype::INT8) {
-        throw std::runtime_error("conv2d_int8w_fp16_forward_gpu: W must be INT8");
+        throw std::runtime_error("conv2d_int8w_fp16_forward: W must be INT8");
     }
     if (scales.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_int8w_fp16_forward_gpu: scales must be FP32");
+        throw std::runtime_error("conv2d_int8w_fp16_forward: scales must be FP32");
     }
     if (bias && bias->dtype != Dtype::FP16) {
-        throw std::runtime_error("conv2d_int8w_fp16_forward_gpu: bias must be FP16");
+        throw std::runtime_error("conv2d_int8w_fp16_forward: bias must be FP16");
     }
     if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
         throw std::runtime_error(
-            "conv2d_int8w_fp16_forward_gpu: groups must be >=1 and divide both C_in and C_out");
+            "conv2d_int8w_fp16_forward: groups must be >=1 and divide both C_in and C_out");
     }
     const int Cg_in  = C_in  / groups;
     const int Cg_out = C_out / groups;
     if (W_int8.rows != C_out || W_int8.cols != Cg_in * kH * kW) {
-        throw std::runtime_error("conv2d_int8w_fp16_forward_gpu: W shape mismatch");
+        throw std::runtime_error("conv2d_int8w_fp16_forward: W shape mismatch");
     }
     if (scales.rows != C_out || scales.cols != 1) {
-        throw std::runtime_error("conv2d_int8w_fp16_forward_gpu: scales shape mismatch");
+        throw std::runtime_error("conv2d_int8w_fp16_forward: scales shape mismatch");
     }
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
-        throw std::runtime_error("conv2d_int8w_fp16_forward_gpu: non-positive output shape");
+        throw std::runtime_error("conv2d_int8w_fp16_forward: non-positive output shape");
     }
     const int out_cols = C_out * H_out * W_out;
     if (Y.rows != N || Y.cols != out_cols || Y.dtype != Dtype::FP16) {
@@ -427,31 +426,31 @@ void conv2d_int8w_fp16_forward_gpu(const GpuTensor& X,
     }
 }
 
-void linear_forward_batched_int8w_fp16_gpu(const GpuTensor& W_int8,
-                                           const GpuTensor& scales,
-                                           const GpuTensor* bias,
-                                           const GpuTensor& X_BD,
-                                           GpuTensor& Y_BD) {
+void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
+                                       const Tensor& scales,
+                                       const Tensor* bias,
+                                       const Tensor& X_BD,
+                                       Tensor& Y_BD) {
     if (W_int8.dtype != Dtype::INT8) {
-        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: W must be INT8");
+        throw std::runtime_error("linear_forward_batched_int8w_fp16: W must be INT8");
     }
     if (scales.dtype != Dtype::FP32) {
-        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: scales must be FP32");
+        throw std::runtime_error("linear_forward_batched_int8w_fp16: scales must be FP32");
     }
     if (X_BD.dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: X must be FP16");
+        throw std::runtime_error("linear_forward_batched_int8w_fp16: X must be FP16");
     }
     if (bias && bias->dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: bias must be FP16");
+        throw std::runtime_error("linear_forward_batched_int8w_fp16: bias must be FP16");
     }
     const int B   = X_BD.rows;
     const int in_dim  = X_BD.cols;
     const int out_dim = W_int8.rows;
     if (W_int8.cols != in_dim) {
-        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: shape mismatch (W.cols != X.cols)");
+        throw std::runtime_error("linear_forward_batched_int8w_fp16: shape mismatch (W.cols != X.cols)");
     }
     if (scales.rows != out_dim || scales.cols != 1) {
-        throw std::runtime_error("linear_forward_batched_int8w_fp16_gpu: scales shape must be (out, 1)");
+        throw std::runtime_error("linear_forward_batched_int8w_fp16: scales shape must be (out, 1)");
     }
     if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
         Y_BD.resize(B, out_dim, Dtype::FP16);
@@ -501,4 +500,4 @@ void linear_forward_batched_int8w_fp16_gpu(const GpuTensor& W_int8,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

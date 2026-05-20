@@ -2,7 +2,6 @@
 // and accepts an optional pre-softmax logit bias. Materialised per-head FP32
 // score matrix; structurally mirrors src/cuda/cross_attention_with_attn.cu.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <cmath>
@@ -10,7 +9,7 @@
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -249,7 +248,7 @@ id<MTLComputePipelineState> pso_out_proj() {
     return pso;
 }
 
-inline void check_fp16(const GpuTensor& t, const char* name) {
+inline void check_fp16(const Tensor& t, const char* name) {
     if (t.dtype != Dtype::FP16) {
         throw std::runtime_error(
             std::string("cross_attention_forward_with_attn_gpu requires FP16 ") + name);
@@ -280,15 +279,15 @@ void dispatch3d(id<MTLComputePipelineState> pso,
 
 } // namespace
 
-void cross_attention_forward_with_attn_gpu(const GpuTensor& X,
-                                           const GpuTensor& Ctx,
-                                           const GpuTensor& Wq, const GpuTensor& Wk,
-                                           const GpuTensor& Wv, const GpuTensor& Wo,
-                                           const float* d_mask,
-                                           const GpuTensor* attn_logit_bias,
-                                           int num_heads,
-                                           GpuTensor& O,
-                                           GpuTensor& AttnAvg) {
+void cross_attention_forward_with_attn(const Tensor& X,
+                                       const Tensor& Ctx,
+                                       const Tensor& Wq, const Tensor& Wk,
+                                       const Tensor& Wv, const Tensor& Wo,
+                                       const float* d_mask,
+                                       const Tensor* attn_logit_bias,
+                                       int num_heads,
+                                       Tensor& O,
+                                       Tensor& AttnAvg) {
     check_fp16(X, "X");
     check_fp16(Ctx, "Ctx");
     check_fp16(Wq, "Wq"); check_fp16(Wk, "Wk");
@@ -322,12 +321,12 @@ void cross_attention_forward_with_attn_gpu(const GpuTensor& X,
         }
     }
 
-    GpuTensor Qh(H * Lq, dh, Dtype::FP32);
-    GpuTensor Kh(H * Lk, dh, Dtype::FP32);
-    GpuTensor Vh(H * Lk, dh, Dtype::FP32);
-    GpuTensor scores(H * Lq, Lk, Dtype::FP32);
-    GpuTensor Attnh(H * Lq, Lk, Dtype::FP32);
-    GpuTensor Yconcat(Lq, D, Dtype::FP32);
+    Tensor Qh      = Tensor::empty_on(Device::Metal, H * Lq, dh, Dtype::FP32);
+    Tensor Kh      = Tensor::empty_on(Device::Metal, H * Lk, dh, Dtype::FP32);
+    Tensor Vh      = Tensor::empty_on(Device::Metal, H * Lk, dh, Dtype::FP32);
+    Tensor scores  = Tensor::empty_on(Device::Metal, H * Lq, Lk, Dtype::FP32);
+    Tensor Attnh   = Tensor::empty_on(Device::Metal, H * Lq, Lk, Dtype::FP32);
+    Tensor Yconcat = Tensor::empty_on(Device::Metal, Lq, D, Dtype::FP32);
 
     id<MTLBuffer> bX   = buffer_for(X);    const NSUInteger oX   = buffer_offset_for(X);
     id<MTLBuffer> bCtx = buffer_for(Ctx);  const NSUInteger oCtx = buffer_offset_for(Ctx);
@@ -450,4 +449,4 @@ void cross_attention_forward_with_attn_gpu(const GpuTensor& X,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

@@ -1,9 +1,8 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -247,7 +246,7 @@ DEF_PSO(pso_xent_batched, @"k_softmax_xent_fused_batched")
 
 } // namespace
 
-float mse_vec_forward_gpu(const GpuTensor& pred, const GpuTensor& target) {
+float mse_vec_forward(const Tensor& pred, const Tensor& target) {
     const int n = pred.size();
     if (n == 0) return 0.0f;
     @autoreleasepool {
@@ -278,8 +277,8 @@ float mse_vec_forward_gpu(const GpuTensor& pred, const GpuTensor& target) {
     }
 }
 
-void mse_vec_backward_gpu(const GpuTensor& pred, const GpuTensor& target,
-                          GpuTensor& dPred) {
+void mse_vec_backward(const Tensor& pred, const Tensor& target,
+                      Tensor& dPred) {
     const int n = pred.size();
     if (dPred.rows != pred.rows || dPred.cols != pred.cols) {
         dPred.resize(pred.rows, pred.cols);
@@ -313,9 +312,9 @@ void mse_vec_backward_gpu(const GpuTensor& pred, const GpuTensor& target,
     }
 }
 
-float softmax_xent_fused_gpu(const GpuTensor& logits, const GpuTensor& target,
-                             const float* d_mask,
-                             GpuTensor& probs, GpuTensor& dLogits) {
+float softmax_xent_fused(const Tensor& logits, const Tensor& target,
+                         const float* d_mask,
+                         Tensor& probs, Tensor& dLogits) {
     const int n = logits.size();
     if (probs.rows != logits.rows || probs.cols != logits.cols) {
         probs.resize(logits.rows, logits.cols);
@@ -365,8 +364,8 @@ float softmax_xent_fused_gpu(const GpuTensor& logits, const GpuTensor& target,
     }
 }
 
-void mse_vec_per_sample_gpu(const GpuTensor& pred, const GpuTensor& target,
-                            GpuTensor& dPred, GpuTensor& loss_per_sample) {
+void mse_vec_per_sample(const Tensor& pred, const Tensor& target,
+                        Tensor& dPred, Tensor& loss_per_sample) {
     const int B = pred.size();
     if (dPred.rows != pred.rows || dPred.cols != pred.cols)
         dPred.resize(pred.rows, pred.cols);
@@ -402,14 +401,14 @@ void mse_vec_per_sample_gpu(const GpuTensor& pred, const GpuTensor& target,
     }
 }
 
-void softmax_xent_fused_batched_gpu(const GpuTensor& logits_BL,
-                                    const GpuTensor& target_BL,
-                                    const float* d_mask_BL,
-                                    const int* d_head_offsets,
-                                    int n_heads,
-                                    GpuTensor& probs_BL,
-                                    GpuTensor& dLogits_BL,
-                                    GpuTensor& loss_per_sample) {
+void softmax_xent_fused_batched(const Tensor& logits_BL,
+                                const Tensor& target_BL,
+                                const float* d_mask_BL,
+                                const int* d_head_offsets,
+                                int n_heads,
+                                Tensor& probs_BL,
+                                Tensor& dLogits_BL,
+                                Tensor& loss_per_sample) {
     const int B     = logits_BL.rows;
     const int n_act = logits_BL.cols;
     if (probs_BL.rows != B || probs_BL.cols != n_act)
@@ -421,7 +420,8 @@ void softmax_xent_fused_batched_gpu(const GpuTensor& logits_BL,
     if (B == 0 || n_act == 0 || n_heads <= 0) return;
 
     // Zero loss accumulator (unified memory).
-    for (int b = 0; b < B; ++b) loss_per_sample.data[b] = 0.0f;
+    for (int b = 0; b < B; ++b)
+        static_cast<float*>(loss_per_sample.data)[b] = 0.0f;
 
     id<MTLComputePipelineState> pso = pso_xent_batched();
     id<MTLBuffer> bL = buffer_for(logits_BL);
@@ -465,4 +465,4 @@ void softmax_xent_fused_batched_gpu(const GpuTensor& logits_BL,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

@@ -1,4 +1,3 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
@@ -6,7 +5,7 @@
 #import "internal.h"
 #import "fp16_matmul.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -82,8 +81,8 @@ void run1d(id<MTLComputePipelineState> pso, NSUInteger n,
 
 } // namespace
 
-void linear_forward_gpu(const GpuTensor& W, const GpuTensor& b,
-                        const GpuTensor& x, GpuTensor& y) {
+void linear_forward(const Tensor& W, const Tensor& b,
+                    const Tensor& x, Tensor& y) {
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
     if (y.rows != out_dim || y.cols != 1) y.resize(out_dim, 1);
@@ -110,9 +109,9 @@ void linear_forward_gpu(const GpuTensor& W, const GpuTensor& b,
     });
 }
 
-void linear_backward_gpu(const GpuTensor& W, const GpuTensor& x,
-                         const GpuTensor& dY,
-                         GpuTensor& dX, GpuTensor& dW, GpuTensor& dB) {
+void linear_backward(const Tensor& W, const Tensor& x,
+                     const Tensor& dY,
+                     Tensor& dX, Tensor& dW, Tensor& dB) {
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
     if (dX.rows != in_dim || dX.cols != 1) dX.resize(in_dim, 1);
@@ -225,19 +224,19 @@ void launch_1d(id<MTLComputePipelineState> pso, NSUInteger n,
 
 } // namespace
 
-void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
-                                     const GpuTensor& X_BD, GpuTensor& Y_BD) {
+void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
+                                 const Tensor& X_BD, Tensor& Y_BD) {
     if (W.dtype != Dtype::FP16 || X_BD.dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_fp16_gpu: W and X must be FP16");
+        throw std::runtime_error("linear_forward_batched_fp16: W and X must be FP16");
     }
     if (bias && bias->dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_fp16_gpu: bias must be FP16");
+        throw std::runtime_error("linear_forward_batched_fp16: bias must be FP16");
     }
     const int B       = X_BD.rows;
     const int in_dim  = X_BD.cols;
     const int out_dim = W.rows;
     if (W.cols != in_dim) {
-        throw std::runtime_error("linear_forward_batched_fp16_gpu: shape mismatch (W.cols != X.cols)");
+        throw std::runtime_error("linear_forward_batched_fp16: shape mismatch (W.cols != X.cols)");
     }
     if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
         Y_BD.resize(B, out_dim, Dtype::FP16);
@@ -266,4 +265,4 @@ void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

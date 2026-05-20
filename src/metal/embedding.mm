@@ -1,4 +1,3 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <cstring>
@@ -6,7 +5,7 @@
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -140,9 +139,9 @@ void dispatch1d(id<MTLComputePipelineState> pso, NSUInteger n,
 
 } // namespace
 
-void embedding_lookup_forward_gpu(const GpuTensor& table,
-                                  const int32_t* d_idx, int B,
-                                  GpuTensor& out) {
+void embedding_lookup_forward(const Tensor& table,
+                              const int32_t* d_idx, int B,
+                              Tensor& out) {
     const int D = table.cols;
     if (out.rows != B || out.cols != D || out.dtype != table.dtype) {
         out.resize(B, D, table.dtype);
@@ -168,9 +167,9 @@ void embedding_lookup_forward_gpu(const GpuTensor& table,
     });
 }
 
-void embedding_lookup_backward_gpu(const GpuTensor& dOut,
-                                   const int32_t* d_idx, int B,
-                                   GpuTensor& dTable) {
+void embedding_lookup_backward(const Tensor& dOut,
+                               const int32_t* d_idx, int B,
+                               Tensor& dTable) {
     if (dTable.dtype != Dtype::FP16 && dTable.dtype != Dtype::FP32) {
         throw std::runtime_error("embedding_lookup_backward_gpu: dTable must be FP16 or FP32");
     }
@@ -221,4 +220,4 @@ void embedding_lookup_backward_gpu(const GpuTensor& dOut,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

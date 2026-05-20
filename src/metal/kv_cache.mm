@@ -1,14 +1,13 @@
 // Metal implementation of KV-cache append + causal flash-attention decode.
 // Mirrors src/cuda/kv_cache.cu.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -195,8 +194,8 @@ void run_copy(id<MTLBuffer> src_buf, NSUInteger src_off_bytes,
 
 } // namespace
 
-void kv_cache_append_gpu(const GpuTensor& K_new, const GpuTensor& V_new,
-                         int cur_len, GpuTensor& K_cache, GpuTensor& V_cache) {
+void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
+                     int cur_len, Tensor& K_cache, Tensor& V_cache) {
     if (K_new.dtype != Dtype::FP16 || V_new.dtype != Dtype::FP16 ||
         K_cache.dtype != Dtype::FP16 || V_cache.dtype != Dtype::FP16) {
         throw std::runtime_error("kv_cache_append_gpu: all tensors must be FP16");
@@ -235,9 +234,9 @@ void kv_cache_append_gpu(const GpuTensor& K_new, const GpuTensor& V_new,
     run_copy(bV_new, oV_new, bV_c, oV_c, n_halves, dst_extra_halves);
 }
 
-void flash_attention_decode_gpu(const GpuTensor& Q,
-                                const GpuTensor& K_cache, const GpuTensor& V_cache,
-                                int valid_len, int num_heads, GpuTensor& O) {
+void flash_attention_decode(const Tensor& Q,
+                            const Tensor& K_cache, const Tensor& V_cache,
+                            int valid_len, int num_heads, Tensor& O) {
     if (Q.dtype != Dtype::FP16 || K_cache.dtype != Dtype::FP16 ||
         V_cache.dtype != Dtype::FP16) {
         throw std::runtime_error("flash_attention_decode_gpu: all tensors must be FP16");
@@ -306,4 +305,4 @@ void flash_attention_decode_gpu(const GpuTensor& Q,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

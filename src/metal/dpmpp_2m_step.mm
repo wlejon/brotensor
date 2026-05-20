@@ -1,14 +1,13 @@
 // Fused DPM-Solver++ 2M sampler step (Metal, FP16). Multistep, ε-prediction.
 // See src/cuda/dpmpp_2m_step.cu for derivation.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -51,11 +50,11 @@ id<MTLComputePipelineState> pso() {
 
 } // namespace
 
-void dpmpp_2m_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
-                       const GpuTensor& x0_prev,
-                       float sigma_t,
-                       float c_xt, float c_x0t, float c_x0prev,
-                       GpuTensor& x_prev, GpuTensor& x0_out) {
+void dpmpp_2m_step(const Tensor& x_t, const Tensor& eps_pred,
+                   const Tensor& x0_prev,
+                   float sigma_t,
+                   float c_xt, float c_x0t, float c_x0prev,
+                   Tensor& x_prev, Tensor& x0_out) {
     if (x_t.dtype != Dtype::FP16 || eps_pred.dtype != Dtype::FP16 ||
         x0_prev.dtype != Dtype::FP16) {
         throw std::runtime_error("dpmpp_2m_step_gpu: all inputs must be FP16");
@@ -111,4 +110,4 @@ void dpmpp_2m_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

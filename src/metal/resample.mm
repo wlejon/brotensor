@@ -1,4 +1,3 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <cstring>
@@ -6,7 +5,7 @@
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -420,7 +419,7 @@ DEF_PSO(pso_down_avg_bwd_fp16,    @"k_downsample_avg_2x_backward_fp16")
 DEF_PSO(pso_down_avg_bwd_fp32,    @"k_downsample_avg_2x_backward_fp32")
 #undef DEF_PSO
 
-inline void check_dtype_fp(const GpuTensor& t, const char* op, const char* name) {
+inline void check_dtype_fp(const Tensor& t, const char* op, const char* name) {
     if (t.dtype != Dtype::FP16 && t.dtype != Dtype::FP32) {
         throw std::runtime_error(std::string(op) + ": " + name + " must be FP16 or FP32");
     }
@@ -428,7 +427,7 @@ inline void check_dtype_fp(const GpuTensor& t, const char* op, const char* name)
 
 void launch_resample_fwd(id<MTLComputePipelineState> pso_fp16,
                          id<MTLComputePipelineState> pso_fp32,
-                         const GpuTensor& X, GpuTensor& Y,
+                         const Tensor& X, Tensor& Y,
                          int N, int C, int H, int W,
                          int H_out, int W_out) {
     const int cols = C * H_out * W_out;
@@ -474,7 +473,7 @@ void launch_resample_fwd(id<MTLComputePipelineState> pso_fp16,
 // Launch a simple one-thread-per-input-pixel backward kernel (nearest, avg).
 void launch_resample_bwd_simple(id<MTLComputePipelineState> pso_fp16,
                                 id<MTLComputePipelineState> pso_fp32,
-                                const GpuTensor& dY, GpuTensor& dX,
+                                const Tensor& dY, Tensor& dX,
                                 int N, int C, int H, int W,
                                 int H_out, int W_out) {
     const int cols_in = C * H * W;
@@ -521,25 +520,25 @@ void launch_resample_bwd_simple(id<MTLComputePipelineState> pso_fp16,
 
 // ─── Forward ───────────────────────────────────────────────────────────────
 
-void upsample_nearest_2x_gpu(const GpuTensor& X, int N, int C, int H, int W,
-                             GpuTensor& Y) {
-    check_dtype_fp(X, "upsample_nearest_2x_gpu", "X");
+void upsample_nearest_2x(const Tensor& X, int N, int C, int H, int W,
+                         Tensor& Y) {
+    check_dtype_fp(X, "upsample_nearest_2x", "X");
     launch_resample_fwd(pso_up_nearest_fp16(), pso_up_nearest_fp32(),
                         X, Y, N, C, H, W, 2 * H, 2 * W);
 }
 
-void upsample_bilinear_2x_gpu(const GpuTensor& X, int N, int C, int H, int W,
-                              GpuTensor& Y) {
-    check_dtype_fp(X, "upsample_bilinear_2x_gpu", "X");
+void upsample_bilinear_2x(const Tensor& X, int N, int C, int H, int W,
+                          Tensor& Y) {
+    check_dtype_fp(X, "upsample_bilinear_2x", "X");
     launch_resample_fwd(pso_up_bilinear_fp16(), pso_up_bilinear_fp32(),
                         X, Y, N, C, H, W, 2 * H, 2 * W);
 }
 
-void downsample_avg_2x_gpu(const GpuTensor& X, int N, int C, int H, int W,
-                           GpuTensor& Y) {
-    check_dtype_fp(X, "downsample_avg_2x_gpu", "X");
+void downsample_avg_2x(const Tensor& X, int N, int C, int H, int W,
+                       Tensor& Y) {
+    check_dtype_fp(X, "downsample_avg_2x", "X");
     if ((H & 1) || (W & 1)) {
-        throw std::runtime_error("downsample_avg_2x_gpu: H and W must be even");
+        throw std::runtime_error("downsample_avg_2x: H and W must be even");
     }
     launch_resample_fwd(pso_down_avg_fp16(), pso_down_avg_fp32(),
                         X, Y, N, C, H, W, H / 2, W / 2);
@@ -547,31 +546,31 @@ void downsample_avg_2x_gpu(const GpuTensor& X, int N, int C, int H, int W,
 
 // ─── Backward ──────────────────────────────────────────────────────────────
 
-void upsample_nearest_2x_backward_gpu(const GpuTensor& dY,
-                                      int N, int C, int H, int W,
-                                      GpuTensor& dX) {
-    check_dtype_fp(dY, "upsample_nearest_2x_backward_gpu", "dY");
+void upsample_nearest_2x_backward(const Tensor& dY,
+                                  int N, int C, int H, int W,
+                                  Tensor& dX) {
+    check_dtype_fp(dY, "upsample_nearest_2x_backward", "dY");
     launch_resample_bwd_simple(pso_up_nearest_bwd_fp16(),
                                pso_up_nearest_bwd_fp32(),
                                dY, dX, N, C, H, W, 2 * H, 2 * W);
 }
 
-void downsample_avg_2x_backward_gpu(const GpuTensor& dY,
-                                    int N, int C, int H, int W,
-                                    GpuTensor& dX) {
-    check_dtype_fp(dY, "downsample_avg_2x_backward_gpu", "dY");
+void downsample_avg_2x_backward(const Tensor& dY,
+                                int N, int C, int H, int W,
+                                Tensor& dX) {
+    check_dtype_fp(dY, "downsample_avg_2x_backward", "dY");
     if ((H & 1) || (W & 1)) {
-        throw std::runtime_error("downsample_avg_2x_backward_gpu: H and W must be even");
+        throw std::runtime_error("downsample_avg_2x_backward: H and W must be even");
     }
     launch_resample_bwd_simple(pso_down_avg_bwd_fp16(),
                                pso_down_avg_bwd_fp32(),
                                dY, dX, N, C, H, W, H / 2, W / 2);
 }
 
-void upsample_bilinear_2x_backward_gpu(const GpuTensor& dY,
-                                       int N, int C, int H, int W,
-                                       GpuTensor& dX) {
-    check_dtype_fp(dY, "upsample_bilinear_2x_backward_gpu", "dY");
+void upsample_bilinear_2x_backward(const Tensor& dY,
+                                   int N, int C, int H, int W,
+                                   Tensor& dX) {
+    check_dtype_fp(dY, "upsample_bilinear_2x_backward", "dY");
     const int H_out = 2 * H, W_out = 2 * W;
     const int cols_in = C * H * W;
     const int cols_out = C * H_out * W_out;
@@ -650,4 +649,4 @@ void upsample_bilinear_2x_backward_gpu(const GpuTensor& dY,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

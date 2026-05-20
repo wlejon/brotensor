@@ -1,9 +1,8 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -130,8 +129,8 @@ void run_single_block(id<MTLComputePipelineState> pso,
 
 } // namespace
 
-void softmax_forward_gpu(const GpuTensor& logits, GpuTensor& probs,
-                         const float* d_mask) {
+void softmax_forward(const Tensor& logits, Tensor& probs,
+                     const float* d_mask) {
     const int n = logits.size();
     if (probs.rows != logits.rows || probs.cols != logits.cols) {
         probs.resize(logits.rows, logits.cols);
@@ -156,8 +155,8 @@ void softmax_forward_gpu(const GpuTensor& logits, GpuTensor& probs,
     });
 }
 
-void softmax_backward_gpu(const GpuTensor& probs, const GpuTensor& dProbs,
-                          GpuTensor& dLogits) {
+void softmax_backward(const Tensor& probs, const Tensor& dProbs,
+                      Tensor& dLogits) {
     const int n = probs.size();
     if (dLogits.rows != probs.rows || dLogits.cols != probs.cols) {
         dLogits.resize(probs.rows, probs.cols);
@@ -178,4 +177,4 @@ void softmax_backward_gpu(const GpuTensor& probs, const GpuTensor& dProbs,
     });
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

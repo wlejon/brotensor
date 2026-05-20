@@ -1,12 +1,19 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include <brotensor/detail/op_table.h>
 
 #include <stdexcept>
+#include <vector>
 
 #import "internal.h"
 #import "fp16_matmul.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
+
+// Forward declarations of sibling Metal ops implemented in other TUs (and of
+// ops defined later in this file). Generated from the canonical op table.
+#define BROTENSOR_METAL_DECL(name, ret, params) ret name params;
+BROTENSOR_FOR_EACH_OP(BROTENSOR_METAL_DECL)
+#undef BROTENSOR_METAL_DECL
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -511,15 +518,15 @@ id<MTLComputePipelineState> pso_fa_dKh() {
     return pso;
 }
 
-void run_causal_flash(const GpuTensor& Q,
-                      const GpuTensor& K,
-                      const GpuTensor& V,
+void run_causal_flash(const Tensor& Q,
+                      const Tensor& K,
+                      const Tensor& V,
                       const float* d_mask,
                       int num_heads,
-                      GpuTensor& O,
+                      Tensor& O,
                       int Lq, int Lk, int D, int head_dim) {
     if ((head_dim + (int)FA_BLOCK - 1) / (int)FA_BLOCK > 8) {
-        throw std::runtime_error("flash_attention_forward_gpu: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
+        throw std::runtime_error("flash_attention_forward: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
     }
     id<MTLComputePipelineState> pso = pso_flash();
     id<MTLBuffer> bQ = buffer_for(Q);
@@ -586,27 +593,27 @@ void encode_per_elem(id<MTLComputeCommandEncoder> enc,
 
 } // namespace
 
-void flash_attention_forward_gpu(const GpuTensor& Q,
-                                 const GpuTensor& K,
-                                 const GpuTensor& V,
-                                 const float* d_mask,
-                                 int num_heads,
-                                 bool causal,
-                                 GpuTensor& O) {
+void flash_attention_forward(const Tensor& Q,
+                             const Tensor& K,
+                             const Tensor& V,
+                             const float* d_mask,
+                             int num_heads,
+                             bool causal,
+                             Tensor& O) {
     if (Q.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 || V.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_forward_gpu: Q, K, V must be FP16");
+        throw std::runtime_error("flash_attention_forward: Q, K, V must be FP16");
     }
     const int Lq = Q.rows;
     const int Lk = K.rows;
     if (causal && Lq != Lk) {
-        throw std::runtime_error("flash_attention_forward_gpu: causal requires Lq == Lk");
+        throw std::runtime_error("flash_attention_forward: causal requires Lq == Lk");
     }
     const int D  = Q.cols;
     if (K.cols != D || V.cols != D || V.rows != Lk) {
-        throw std::runtime_error("flash_attention_forward_gpu: shape mismatch");
+        throw std::runtime_error("flash_attention_forward: shape mismatch");
     }
     if (num_heads <= 0 || D % num_heads != 0) {
-        throw std::runtime_error("flash_attention_forward_gpu: num_heads must divide D");
+        throw std::runtime_error("flash_attention_forward: num_heads must divide D");
     }
     const int head_dim = D / num_heads;
     if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
@@ -624,11 +631,11 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
     // ---- Per-head matmul pipeline (mirror cuda 35f72b0) ----
     // Reuse scratch tensors across calls to keep allocator pressure flat.
     // SD1.5 worst-case S buffer is 32 MB (Lq=Lk=4096, fp16).
-    thread_local static GpuTensor Qh;
-    thread_local static GpuTensor Kh;
-    thread_local static GpuTensor Vth;
-    thread_local static GpuTensor S;
-    thread_local static GpuTensor Oh;
+    thread_local static Tensor Qh = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor Kh = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor Vth = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor S = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor Oh = Tensor::empty_on(Device::Metal, 0, 0);
     if (Qh.rows != Lq  || Qh.cols != head_dim || Qh.dtype != Dtype::FP16) Qh.resize(Lq, head_dim, Dtype::FP16);
     if (Kh.rows != Lk  || Kh.cols != head_dim || Kh.dtype != Dtype::FP16) Kh.resize(Lk, head_dim, Dtype::FP16);
     if (Vth.rows != head_dim || Vth.cols != Lk || Vth.dtype != Dtype::FP16) Vth.resize(head_dim, Lk, Dtype::FP16);
@@ -718,26 +725,26 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
     }
 }
 
-void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
-                                      const GpuTensor* Ctx,
-                                      const GpuTensor& Wq, const GpuTensor* bq,
-                                      const GpuTensor& Wk, const GpuTensor* bk,
-                                      const GpuTensor& Wv, const GpuTensor* bv,
-                                      const GpuTensor& Wo, const GpuTensor* bo,
-                                      const float* d_mask,
-                                      int num_heads,
-                                      bool causal,
-                                      GpuTensor& O) {
+void flash_attention_qkvo_forward(const Tensor& X,
+                                  const Tensor* Ctx,
+                                  const Tensor& Wq, const Tensor* bq,
+                                  const Tensor& Wk, const Tensor* bk,
+                                  const Tensor& Wv, const Tensor* bv,
+                                  const Tensor& Wo, const Tensor* bo,
+                                  const float* d_mask,
+                                  int num_heads,
+                                  bool causal,
+                                  Tensor& O) {
     if (X.dtype != Dtype::FP16 || Wq.dtype != Dtype::FP16 ||
         Wk.dtype != Dtype::FP16 || Wv.dtype != Dtype::FP16 ||
         Wo.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_qkvo_forward_gpu: all tensors must be FP16");
+        throw std::runtime_error("flash_attention_qkvo_forward: all tensors must be FP16");
     }
     const int Lq = X.rows;
     const int D  = X.cols;
-    const GpuTensor& kv_src = Ctx ? *Ctx : X;
+    const Tensor& kv_src = Ctx ? *Ctx : X;
     if (Ctx && Ctx->dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_qkvo_forward_gpu: Ctx must be FP16");
+        throw std::runtime_error("flash_attention_qkvo_forward: Ctx must be FP16");
     }
     const int Lk = kv_src.rows;
     const int D_ctx = kv_src.cols;
@@ -745,10 +752,10 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
         Wk.rows != D || Wk.cols != D_ctx ||
         Wv.rows != D || Wv.cols != D_ctx ||
         Wo.rows != D || Wo.cols != D) {
-        throw std::runtime_error("flash_attention_qkvo_forward_gpu: shape mismatch");
+        throw std::runtime_error("flash_attention_qkvo_forward: shape mismatch");
     }
     if (num_heads <= 0 || D % num_heads != 0) {
-        throw std::runtime_error("flash_attention_qkvo_forward_gpu: num_heads must divide D");
+        throw std::runtime_error("flash_attention_qkvo_forward: num_heads must divide D");
     }
 
     if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
@@ -756,28 +763,28 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
     }
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
-    GpuTensor Kp(Lk, D, Dtype::FP16);
-    GpuTensor Vp(Lk, D, Dtype::FP16);
+    Tensor Kp = Tensor::empty_on(Device::Metal, Lk, D, Dtype::FP16);
+    Tensor Vp = Tensor::empty_on(Device::Metal, Lk, D, Dtype::FP16);
 
-    flash_attention_project_kv_gpu(kv_src, Wk, bk, Wv, bv, Kp, Vp);
-    flash_attention_q_with_kv_cached_forward_gpu(
+    flash_attention_project_kv(kv_src, Wk, bk, Wv, bv, Kp, Vp);
+    flash_attention_q_with_kv_cached_forward(
         X, Kp, Vp, Wq, bq, Wo, bo, d_mask, num_heads, causal, O);
 }
 
-void flash_attention_project_kv_gpu(const GpuTensor& ctx,
-                                    const GpuTensor& Wk, const GpuTensor* bk,
-                                    const GpuTensor& Wv, const GpuTensor* bv,
-                                    GpuTensor& K_out,
-                                    GpuTensor& V_out) {
+void flash_attention_project_kv(const Tensor& ctx,
+                                const Tensor& Wk, const Tensor* bk,
+                                const Tensor& Wv, const Tensor* bv,
+                                Tensor& K_out,
+                                Tensor& V_out) {
     if (ctx.dtype != Dtype::FP16 || Wk.dtype != Dtype::FP16 ||
         Wv.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_project_kv_gpu: all tensors must be FP16");
+        throw std::runtime_error("flash_attention_project_kv: all tensors must be FP16");
     }
     const int Lk = ctx.rows;
     const int D_ctx = ctx.cols;
     const int D = Wk.rows;
     if (Wk.cols != D_ctx || Wv.rows != D || Wv.cols != D_ctx) {
-        throw std::runtime_error("flash_attention_project_kv_gpu: Wk/Wv shape mismatch");
+        throw std::runtime_error("flash_attention_project_kv: Wk/Wv shape mismatch");
     }
     if (K_out.rows != Lk || K_out.cols != D || K_out.dtype != Dtype::FP16) {
         K_out.resize(Lk, D, Dtype::FP16);
@@ -786,71 +793,71 @@ void flash_attention_project_kv_gpu(const GpuTensor& ctx,
         V_out.resize(Lk, D, Dtype::FP16);
     }
     if (Lk == 0 || D == 0) return;
-    linear_forward_batched_fp16_gpu(Wk, bk, ctx, K_out);
-    linear_forward_batched_fp16_gpu(Wv, bv, ctx, V_out);
+    linear_forward_batched_fp16(Wk, bk, ctx, K_out);
+    linear_forward_batched_fp16(Wv, bv, ctx, V_out);
 }
 
-void flash_attention_q_with_kv_cached_forward_gpu(const GpuTensor& X,
-                                                  const GpuTensor& K,
-                                                  const GpuTensor& V,
-                                                  const GpuTensor& Wq, const GpuTensor* bq,
-                                                  const GpuTensor& Wo, const GpuTensor* bo,
-                                                  const float* d_mask,
-                                                  int num_heads,
-                                                  bool causal,
-                                                  GpuTensor& O) {
+void flash_attention_q_with_kv_cached_forward(const Tensor& X,
+                                              const Tensor& K,
+                                              const Tensor& V,
+                                              const Tensor& Wq, const Tensor* bq,
+                                              const Tensor& Wo, const Tensor* bo,
+                                              const float* d_mask,
+                                              int num_heads,
+                                              bool causal,
+                                              Tensor& O) {
     if (X.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 || V.dtype != Dtype::FP16 ||
         Wq.dtype != Dtype::FP16 || Wo.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_q_with_kv_cached_forward_gpu: all tensors must be FP16");
+        throw std::runtime_error("flash_attention_q_with_kv_cached_forward: all tensors must be FP16");
     }
     const int Lq = X.rows;
     const int D  = X.cols;
     const int Lk = K.rows;
     if (K.cols != D || V.rows != Lk || V.cols != D) {
-        throw std::runtime_error("flash_attention_q_with_kv_cached_forward_gpu: K/V shape mismatch");
+        throw std::runtime_error("flash_attention_q_with_kv_cached_forward: K/V shape mismatch");
     }
     if (Wq.rows != D || Wq.cols != D || Wo.rows != D || Wo.cols != D) {
-        throw std::runtime_error("flash_attention_q_with_kv_cached_forward_gpu: Wq/Wo shape mismatch");
+        throw std::runtime_error("flash_attention_q_with_kv_cached_forward: Wq/Wo shape mismatch");
     }
     if (num_heads <= 0 || D % num_heads != 0) {
-        throw std::runtime_error("flash_attention_q_with_kv_cached_forward_gpu: num_heads must divide D");
+        throw std::runtime_error("flash_attention_q_with_kv_cached_forward: num_heads must divide D");
     }
     if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
         O.resize(Lq, D, Dtype::FP16);
     }
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
-    GpuTensor Qp(Lq, D, Dtype::FP16);
-    GpuTensor Op(Lq, D, Dtype::FP16);
+    Tensor Qp = Tensor::empty_on(Device::Metal, Lq, D, Dtype::FP16);
+    Tensor Op = Tensor::empty_on(Device::Metal, Lq, D, Dtype::FP16);
 
-    linear_forward_batched_fp16_gpu(Wq, bq, X, Qp);
-    flash_attention_forward_gpu(Qp, K, V, d_mask, num_heads, causal, Op);
-    linear_forward_batched_fp16_gpu(Wo, bo, Op, O);
+    linear_forward_batched_fp16(Wq, bq, X, Qp);
+    flash_attention_forward(Qp, K, V, d_mask, num_heads, causal, Op);
+    linear_forward_batched_fp16(Wo, bo, Op, O);
 }
 
 // ─── W8A16 variants of the three fused flash-attention ops ─────────────────
 // See src/cuda/flash_attention.cu for documentation.
 
-void flash_attention_project_kv_int8w_fp16_gpu(const GpuTensor& ctx,
-                                               const GpuTensor& Wk_int8,
-                                               const GpuTensor& sk,
-                                               const GpuTensor* bk,
-                                               const GpuTensor& Wv_int8,
-                                               const GpuTensor& sv,
-                                               const GpuTensor* bv,
-                                               GpuTensor& K_out,
-                                               GpuTensor& V_out) {
+void flash_attention_project_kv_int8w_fp16(const Tensor& ctx,
+                                           const Tensor& Wk_int8,
+                                           const Tensor& sk,
+                                           const Tensor* bk,
+                                           const Tensor& Wv_int8,
+                                           const Tensor& sv,
+                                           const Tensor* bv,
+                                           Tensor& K_out,
+                                           Tensor& V_out) {
     if (ctx.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_project_kv_int8w_fp16_gpu: ctx must be FP16");
+        throw std::runtime_error("flash_attention_project_kv_int8w_fp16: ctx must be FP16");
     }
     if (Wk_int8.dtype != Dtype::INT8 || Wv_int8.dtype != Dtype::INT8) {
-        throw std::runtime_error("flash_attention_project_kv_int8w_fp16_gpu: Wk/Wv must be INT8");
+        throw std::runtime_error("flash_attention_project_kv_int8w_fp16: Wk/Wv must be INT8");
     }
     const int Lk = ctx.rows;
     const int D_ctx = ctx.cols;
     const int D = Wk_int8.rows;
     if (Wk_int8.cols != D_ctx || Wv_int8.rows != D || Wv_int8.cols != D_ctx) {
-        throw std::runtime_error("flash_attention_project_kv_int8w_fp16_gpu: Wk/Wv shape mismatch");
+        throw std::runtime_error("flash_attention_project_kv_int8w_fp16: Wk/Wv shape mismatch");
     }
     if (K_out.rows != Lk || K_out.cols != D || K_out.dtype != Dtype::FP16) {
         K_out.resize(Lk, D, Dtype::FP16);
@@ -859,101 +866,101 @@ void flash_attention_project_kv_int8w_fp16_gpu(const GpuTensor& ctx,
         V_out.resize(Lk, D, Dtype::FP16);
     }
     if (Lk == 0 || D == 0) return;
-    linear_forward_batched_int8w_fp16_gpu(Wk_int8, sk, bk, ctx, K_out);
-    linear_forward_batched_int8w_fp16_gpu(Wv_int8, sv, bv, ctx, V_out);
+    linear_forward_batched_int8w_fp16(Wk_int8, sk, bk, ctx, K_out);
+    linear_forward_batched_int8w_fp16(Wv_int8, sv, bv, ctx, V_out);
 }
 
-void flash_attention_q_with_kv_cached_int8w_fp16_gpu(const GpuTensor& X,
-                                                     const GpuTensor& K,
-                                                     const GpuTensor& V,
-                                                     const GpuTensor& Wq_int8,
-                                                     const GpuTensor& sq,
-                                                     const GpuTensor* bq,
-                                                     const GpuTensor& Wo_int8,
-                                                     const GpuTensor& so,
-                                                     const GpuTensor* bo,
-                                                     const float* d_mask,
-                                                     int num_heads,
-                                                     bool causal,
-                                                     GpuTensor& O) {
+void flash_attention_q_with_kv_cached_int8w_fp16(const Tensor& X,
+                                                 const Tensor& K,
+                                                 const Tensor& V,
+                                                 const Tensor& Wq_int8,
+                                                 const Tensor& sq,
+                                                 const Tensor* bq,
+                                                 const Tensor& Wo_int8,
+                                                 const Tensor& so,
+                                                 const Tensor* bo,
+                                                 const float* d_mask,
+                                                 int num_heads,
+                                                 bool causal,
+                                                 Tensor& O) {
     if (X.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 || V.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_q_with_kv_cached_int8w_fp16_gpu: X/K/V must be FP16");
+        throw std::runtime_error("flash_attention_q_with_kv_cached_int8w_fp16: X/K/V must be FP16");
     }
     if (Wq_int8.dtype != Dtype::INT8 || Wo_int8.dtype != Dtype::INT8) {
-        throw std::runtime_error("flash_attention_q_with_kv_cached_int8w_fp16_gpu: Wq/Wo must be INT8");
+        throw std::runtime_error("flash_attention_q_with_kv_cached_int8w_fp16: Wq/Wo must be INT8");
     }
     const int Lq = X.rows;
     const int D  = X.cols;
     const int Lk = K.rows;
     if (K.cols != D || V.rows != Lk || V.cols != D) {
-        throw std::runtime_error("flash_attention_q_with_kv_cached_int8w_fp16_gpu: K/V shape mismatch");
+        throw std::runtime_error("flash_attention_q_with_kv_cached_int8w_fp16: K/V shape mismatch");
     }
     if (Wq_int8.rows != D || Wq_int8.cols != D ||
         Wo_int8.rows != D || Wo_int8.cols != D) {
-        throw std::runtime_error("flash_attention_q_with_kv_cached_int8w_fp16_gpu: Wq/Wo shape mismatch");
+        throw std::runtime_error("flash_attention_q_with_kv_cached_int8w_fp16: Wq/Wo shape mismatch");
     }
     if (num_heads <= 0 || D % num_heads != 0) {
-        throw std::runtime_error("flash_attention_q_with_kv_cached_int8w_fp16_gpu: num_heads must divide D");
+        throw std::runtime_error("flash_attention_q_with_kv_cached_int8w_fp16: num_heads must divide D");
     }
     if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
         O.resize(Lq, D, Dtype::FP16);
     }
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
-    GpuTensor Qp(Lq, D, Dtype::FP16);
-    GpuTensor Op(Lq, D, Dtype::FP16);
+    Tensor Qp = Tensor::empty_on(Device::Metal, Lq, D, Dtype::FP16);
+    Tensor Op = Tensor::empty_on(Device::Metal, Lq, D, Dtype::FP16);
 
-    linear_forward_batched_int8w_fp16_gpu(Wq_int8, sq, bq, X, Qp);
-    flash_attention_forward_gpu(Qp, K, V, d_mask, num_heads, causal, Op);
-    linear_forward_batched_int8w_fp16_gpu(Wo_int8, so, bo, Op, O);
+    linear_forward_batched_int8w_fp16(Wq_int8, sq, bq, X, Qp);
+    flash_attention_forward(Qp, K, V, d_mask, num_heads, causal, Op);
+    linear_forward_batched_int8w_fp16(Wo_int8, so, bo, Op, O);
 }
 
-void flash_attention_qkvo_int8w_fp16_gpu(const GpuTensor& X,
-                                         const GpuTensor* Ctx,
-                                         const GpuTensor& Wq_int8, const GpuTensor& sq, const GpuTensor* bq,
-                                         const GpuTensor& Wk_int8, const GpuTensor& sk, const GpuTensor* bk,
-                                         const GpuTensor& Wv_int8, const GpuTensor& sv, const GpuTensor* bv,
-                                         const GpuTensor& Wo_int8, const GpuTensor& so, const GpuTensor* bo,
-                                         const float* d_mask,
-                                         int num_heads,
-                                         bool causal,
-                                         GpuTensor& O) {
+void flash_attention_qkvo_int8w_fp16(const Tensor& X,
+                                     const Tensor* Ctx,
+                                     const Tensor& Wq_int8, const Tensor& sq, const Tensor* bq,
+                                     const Tensor& Wk_int8, const Tensor& sk, const Tensor* bk,
+                                     const Tensor& Wv_int8, const Tensor& sv, const Tensor* bv,
+                                     const Tensor& Wo_int8, const Tensor& so, const Tensor* bo,
+                                     const float* d_mask,
+                                     int num_heads,
+                                     bool causal,
+                                     Tensor& O) {
     if (X.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_qkvo_int8w_fp16_gpu: X must be FP16");
+        throw std::runtime_error("flash_attention_qkvo_int8w_fp16: X must be FP16");
     }
     if (Ctx && Ctx->dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_qkvo_int8w_fp16_gpu: Ctx must be FP16");
+        throw std::runtime_error("flash_attention_qkvo_int8w_fp16: Ctx must be FP16");
     }
     if (Wq_int8.dtype != Dtype::INT8 || Wk_int8.dtype != Dtype::INT8 ||
         Wv_int8.dtype != Dtype::INT8 || Wo_int8.dtype != Dtype::INT8) {
-        throw std::runtime_error("flash_attention_qkvo_int8w_fp16_gpu: all weights must be INT8");
+        throw std::runtime_error("flash_attention_qkvo_int8w_fp16: all weights must be INT8");
     }
     const int Lq = X.rows;
     const int D  = X.cols;
-    const GpuTensor& kv_src = Ctx ? *Ctx : X;
+    const Tensor& kv_src = Ctx ? *Ctx : X;
     const int Lk = kv_src.rows;
     const int D_ctx = kv_src.cols;
     if (Wq_int8.rows != D || Wq_int8.cols != D ||
         Wk_int8.rows != D || Wk_int8.cols != D_ctx ||
         Wv_int8.rows != D || Wv_int8.cols != D_ctx ||
         Wo_int8.rows != D || Wo_int8.cols != D) {
-        throw std::runtime_error("flash_attention_qkvo_int8w_fp16_gpu: shape mismatch");
+        throw std::runtime_error("flash_attention_qkvo_int8w_fp16: shape mismatch");
     }
     if (num_heads <= 0 || D % num_heads != 0) {
-        throw std::runtime_error("flash_attention_qkvo_int8w_fp16_gpu: num_heads must divide D");
+        throw std::runtime_error("flash_attention_qkvo_int8w_fp16: num_heads must divide D");
     }
     if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
         O.resize(Lq, D, Dtype::FP16);
     }
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
-    GpuTensor Kp(Lk, D, Dtype::FP16);
-    GpuTensor Vp(Lk, D, Dtype::FP16);
-    flash_attention_project_kv_int8w_fp16_gpu(kv_src,
-                                              Wk_int8, sk, bk,
-                                              Wv_int8, sv, bv,
-                                              Kp, Vp);
-    flash_attention_q_with_kv_cached_int8w_fp16_gpu(
+    Tensor Kp = Tensor::empty_on(Device::Metal, Lk, D, Dtype::FP16);
+    Tensor Vp = Tensor::empty_on(Device::Metal, Lk, D, Dtype::FP16);
+    flash_attention_project_kv_int8w_fp16(kv_src,
+                                          Wk_int8, sk, bk,
+                                          Wv_int8, sv, bv,
+                                          Kp, Vp);
+    flash_attention_q_with_kv_cached_int8w_fp16(
         X, Kp, Vp,
         Wq_int8, sq, bq,
         Wo_int8, so, bo,
@@ -969,68 +976,68 @@ void flash_attention_qkvo_int8w_fp16_gpu(const GpuTensor& X,
 //                dS = P*(dP-D_q)*inv_sqrt (in-place over P); dQh = dS·Kh;
 //                dKh = dS^T·Qh; pack dQ/dK/dV.
 //   5. Linear backward for Q/K/V projections, accumulate into dX (and dCtx).
-void flash_attention_qkvo_backward_gpu(
-    const GpuTensor& X, const GpuTensor* Ctx,
-    const GpuTensor& Wq, const GpuTensor* bq,
-    const GpuTensor& Wk, const GpuTensor* bk,
-    const GpuTensor& Wv, const GpuTensor* bv,
-    const GpuTensor& Wo, const GpuTensor* bo,
+void flash_attention_qkvo_backward(
+    const Tensor& X, const Tensor* Ctx,
+    const Tensor& Wq, const Tensor* bq,
+    const Tensor& Wk, const Tensor* bk,
+    const Tensor& Wv, const Tensor* bv,
+    const Tensor& Wo, const Tensor* bo,
     const float* d_mask,
     int num_heads,
     bool causal,
-    const GpuTensor& dO,
-    GpuTensor& dX, GpuTensor* dCtx,
-    GpuTensor& dWq, GpuTensor* dbq,
-    GpuTensor& dWk, GpuTensor* dbk,
-    GpuTensor& dWv, GpuTensor* dbv,
-    GpuTensor& dWo, GpuTensor* dbo) {
+    const Tensor& dO,
+    Tensor& dX, Tensor* dCtx,
+    Tensor& dWq, Tensor* dbq,
+    Tensor& dWk, Tensor* dbk,
+    Tensor& dWv, Tensor* dbv,
+    Tensor& dWo, Tensor* dbo) {
 
     // ── Argument validation ──────────────────────────────────────────────
     if (X.dtype != Dtype::FP16 || dO.dtype != Dtype::FP16 ||
         Wq.dtype != Dtype::FP16 || Wk.dtype != Dtype::FP16 ||
         Wv.dtype != Dtype::FP16 || Wo.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_qkvo_backward_gpu: all tensors must be FP16");
+        throw std::runtime_error("flash_attention_qkvo_backward: all tensors must be FP16");
     }
     if (Ctx && Ctx->dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_qkvo_backward_gpu: Ctx must be FP16");
+        throw std::runtime_error("flash_attention_qkvo_backward: Ctx must be FP16");
     }
     const bool self_attn = (Ctx == nullptr);
     if (self_attn) {
         if (dCtx != nullptr) {
-            throw std::runtime_error("flash_attention_qkvo_backward_gpu: dCtx must be null when Ctx is null");
+            throw std::runtime_error("flash_attention_qkvo_backward: dCtx must be null when Ctx is null");
         }
     } else {
         if (dCtx == nullptr) {
-            throw std::runtime_error("flash_attention_qkvo_backward_gpu: dCtx must be non-null when Ctx is non-null");
+            throw std::runtime_error("flash_attention_qkvo_backward: dCtx must be non-null when Ctx is non-null");
         }
     }
-    auto bias_pair_ok = [](const GpuTensor* b, const GpuTensor* db) {
+    auto bias_pair_ok = [](const Tensor* b, const Tensor* db) {
         return static_cast<bool>(b) == static_cast<bool>(db);
     };
     if (!bias_pair_ok(bq, dbq) || !bias_pair_ok(bk, dbk) ||
         !bias_pair_ok(bv, dbv) || !bias_pair_ok(bo, dbo)) {
-        throw std::runtime_error("flash_attention_qkvo_backward_gpu: bias/grad-bias presence mismatch");
+        throw std::runtime_error("flash_attention_qkvo_backward: bias/grad-bias presence mismatch");
     }
 
     const int Lq = X.rows;
     const int D  = X.cols;
-    const GpuTensor& kv_src = Ctx ? *Ctx : X;
+    const Tensor& kv_src = Ctx ? *Ctx : X;
     const int Lk = kv_src.rows;
     const int D_ctx = kv_src.cols;
     if (Wq.rows != D || Wq.cols != D ||
         Wk.rows != D || Wk.cols != D_ctx ||
         Wv.rows != D || Wv.cols != D_ctx ||
         Wo.rows != D || Wo.cols != D) {
-        throw std::runtime_error("flash_attention_qkvo_backward_gpu: shape mismatch");
+        throw std::runtime_error("flash_attention_qkvo_backward: shape mismatch");
     }
     if (dO.rows != Lq || dO.cols != D) {
-        throw std::runtime_error("flash_attention_qkvo_backward_gpu: dO shape mismatch");
+        throw std::runtime_error("flash_attention_qkvo_backward: dO shape mismatch");
     }
     if (num_heads <= 0 || D % num_heads != 0) {
-        throw std::runtime_error("flash_attention_qkvo_backward_gpu: num_heads must divide D");
+        throw std::runtime_error("flash_attention_qkvo_backward: num_heads must divide D");
     }
     if (causal && Lq != Lk) {
-        throw std::runtime_error("flash_attention_qkvo_backward_gpu: causal requires Lq == Lk");
+        throw std::runtime_error("flash_attention_qkvo_backward: causal requires Lq == Lk");
     }
     const int hd = D / num_heads;
 
@@ -1048,17 +1055,32 @@ void flash_attention_qkvo_backward_gpu(
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
     // ── Scratch tensors (reused across calls). ────────────────────────────
-    thread_local static GpuTensor Qp, Kp, Vp;
-    thread_local static GpuTensor Qh, Kh, Vh, Vth, dOh;
-    thread_local static GpuTensor S, P_main, dP;
-    thread_local static GpuTensor Oh_scratch;
-    thread_local static GpuTensor O_attn, dO_attn;
-    thread_local static GpuTensor dQh, dKh, dVh;
-    thread_local static GpuTensor dQ, dK, dV;
-    thread_local static GpuTensor dX_from_Q, dX_from_K, dX_from_V;
-    thread_local static GpuTensor scratch_db;
+    thread_local static Tensor Qp = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor Kp = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor Vp = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor Qh = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor Kh = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor Vh = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor Vth = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dOh = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor S = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor P_main = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dP = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor Oh_scratch = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor O_attn = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dO_attn = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dQh = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dKh = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dVh = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dQ = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dK = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dV = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dX_from_Q = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dX_from_K = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor dX_from_V = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor scratch_db = Tensor::empty_on(Device::Metal, 0, 0);
 
-    auto ensure = [](GpuTensor& t, int r, int c) {
+    auto ensure = [](Tensor& t, int r, int c) {
         if (t.rows != r || t.cols != c || t.dtype != Dtype::FP16) {
             t.resize(r, c, Dtype::FP16);
         }
@@ -1097,9 +1119,9 @@ void flash_attention_qkvo_backward_gpu(
     dV.zero();
 
     // ── 1. Recompute forward projections. ─────────────────────────────────
-    linear_forward_batched_fp16_gpu(Wq, bq, X,      Qp);
-    linear_forward_batched_fp16_gpu(Wk, bk, kv_src, Kp);
-    linear_forward_batched_fp16_gpu(Wv, bv, kv_src, Vp);
+    linear_forward_batched_fp16(Wq, bq, X,      Qp);
+    linear_forward_batched_fp16(Wk, bk, kv_src, Kp);
+    linear_forward_batched_fp16(Wv, bv, kv_src, Vp);
 
     // Common encode plumbing.
     id<MTLComputePipelineState> p_ext_LD = pso_extract_LD();
@@ -1209,8 +1231,8 @@ void flash_attention_qkvo_backward_gpu(
             }
             scratch_db.zero();
         }
-        linear_backward_batched_gpu(Wo, O_attn, dO, dO_attn, dWo,
-                                    has_bo ? *dbo : scratch_db);
+        linear_backward_batched(Wo, O_attn, dO, dO_attn, dWo,
+                                has_bo ? *dbo : scratch_db);
     }
 
     // ── 4. Per-head backward sweep. ───────────────────────────────────────
@@ -1358,10 +1380,10 @@ void flash_attention_qkvo_backward_gpu(
     }
 
     // ── 5. Q / K / V projection backward. ─────────────────────────────────
-    auto run_proj_back = [&](const GpuTensor& W, const GpuTensor& In,
-                             const GpuTensor& dOut, GpuTensor& dIn_out,
-                             GpuTensor& dW_acc, const GpuTensor* b_fwd,
-                             GpuTensor* db_acc) {
+    auto run_proj_back = [&](const Tensor& W, const Tensor& In,
+                             const Tensor& dOut, Tensor& dIn_out,
+                             Tensor& dW_acc, const Tensor* b_fwd,
+                             Tensor* db_acc) {
         const bool has_b = (b_fwd != nullptr);
         if (!has_b) {
             if (scratch_db.rows != W.rows || scratch_db.cols != 1 ||
@@ -1370,8 +1392,8 @@ void flash_attention_qkvo_backward_gpu(
             }
             scratch_db.zero();
         }
-        linear_backward_batched_gpu(W, In, dOut, dIn_out, dW_acc,
-                                    has_b ? *db_acc : scratch_db);
+        linear_backward_batched(W, In, dOut, dIn_out, dW_acc,
+                                has_b ? *db_acc : scratch_db);
     };
 
     run_proj_back(Wq, X,      dQ, dX_from_Q, dWq, bq, dbq);
@@ -1379,14 +1401,14 @@ void flash_attention_qkvo_backward_gpu(
     run_proj_back(Wv, kv_src, dV, dX_from_V, dWv, bv, dbv);
 
     // ── 6. Accumulate into dX / dCtx. ─────────────────────────────────────
-    add_inplace_gpu(dX, dX_from_Q);
+    add_inplace(dX, dX_from_Q);
     if (self_attn) {
-        add_inplace_gpu(dX, dX_from_K);
-        add_inplace_gpu(dX, dX_from_V);
+        add_inplace(dX, dX_from_K);
+        add_inplace(dX, dX_from_V);
     } else {
-        add_inplace_gpu(*dCtx, dX_from_K);
-        add_inplace_gpu(*dCtx, dX_from_V);
+        add_inplace(*dCtx, dX_from_K);
+        add_inplace(*dCtx, dX_from_V);
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

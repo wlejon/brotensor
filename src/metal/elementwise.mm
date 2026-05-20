@@ -1,11 +1,10 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -16,7 +15,7 @@ using metal_impl::new_command_buffer;
 namespace {
 
 void launch_unary(NSString* name,
-                  const GpuTensor& in, GpuTensor& out) {
+                  const Tensor& in, Tensor& out) {
     if (out.rows != in.rows || out.cols != in.cols) out.resize(in.rows, in.cols);
     const uint32_t n = static_cast<uint32_t>(in.size());
     if (n == 0) return;
@@ -32,8 +31,8 @@ void launch_unary(NSString* name,
 }
 
 void launch_binary_back(NSString* name,
-                        const GpuTensor& a, const GpuTensor& dY,
-                        GpuTensor& dX, int rows, int cols) {
+                        const Tensor& a, const Tensor& dY,
+                        Tensor& dX, int rows, int cols) {
     if (dX.rows != rows || dX.cols != cols) dX.resize(rows, cols);
     const uint32_t n = static_cast<uint32_t>(rows * cols);
     if (n == 0) return;
@@ -53,31 +52,31 @@ void launch_binary_back(NSString* name,
 
 } // namespace
 
-void relu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void relu_forward(const Tensor& x, Tensor& y) {
     launch_unary(@"k_relu_forward", x, y);
 }
-void relu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX) {
+void relu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     launch_binary_back(@"k_relu_backward", x, dY, dX, x.rows, x.cols);
 }
-void tanh_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void tanh_forward(const Tensor& x, Tensor& y) {
     launch_unary(@"k_tanh_forward", x, y);
 }
-void tanh_backward_gpu(const GpuTensor& y, const GpuTensor& dY, GpuTensor& dX) {
+void tanh_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
     launch_binary_back(@"k_tanh_backward", y, dY, dX, y.rows, y.cols);
 }
-void sigmoid_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void sigmoid_forward(const Tensor& x, Tensor& y) {
     launch_unary(@"k_sigmoid_forward", x, y);
 }
-void sigmoid_backward_gpu(const GpuTensor& y, const GpuTensor& dY, GpuTensor& dX) {
+void sigmoid_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
     launch_binary_back(@"k_sigmoid_backward", y, dY, dX, y.rows, y.cols);
 }
 
 // add_inplace forward decls (FP16 dispatcher lives further down with the
 // other FP16-extension kernels).
-namespace { void launch_fp16_add_inplace(GpuTensor&, const GpuTensor&, uint32_t);
-             void launch_fp16_scale_inplace(GpuTensor&, float, uint32_t); }
+namespace { void launch_fp16_add_inplace(Tensor&, const Tensor&, uint32_t);
+             void launch_fp16_scale_inplace(Tensor&, float, uint32_t); }
 
-void add_inplace_gpu(GpuTensor& y, const GpuTensor& x) {
+void add_inplace(Tensor& y, const Tensor& x) {
     const uint32_t n = static_cast<uint32_t>(y.size());
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
@@ -129,7 +128,7 @@ void dispatch_scalar_inplace(id<MTLComputePipelineState> pso,
 }
 } // namespace
 
-void add_scalar_inplace_gpu(GpuTensor& y, float s) {
+void add_scalar_inplace(Tensor& y, float s) {
     const uint32_t n = static_cast<uint32_t>(y.size());
     if (n == 0) return;
     id<MTLBuffer> by = buffer_for(y);
@@ -145,7 +144,7 @@ void add_scalar_inplace_gpu(GpuTensor& y, float s) {
     });
 }
 
-void scale_inplace_gpu(GpuTensor& y, float s) {
+void scale_inplace(Tensor& y, float s) {
     const uint32_t n = static_cast<uint32_t>(y.size());
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
@@ -165,7 +164,7 @@ void scale_inplace_gpu(GpuTensor& y, float s) {
     });
 }
 
-void clamp_gpu(GpuTensor& y, float lo, float hi) {
+void clamp(Tensor& y, float lo, float hi) {
     const uint32_t n = static_cast<uint32_t>(y.size());
     if (n == 0) return;
     id<MTLBuffer> by = buffer_for(y);
@@ -190,8 +189,8 @@ void clamp_gpu(GpuTensor& y, float lo, float hi) {
     }
 }
 
-void build_slot_mask_gpu(const GpuTensor& x, int offset, int K, int stride,
-                         GpuTensor& mask) {
+void build_slot_mask(const Tensor& x, int offset, int K, int stride,
+                     Tensor& mask) {
     if (mask.rows != K || mask.cols != 1) mask.resize(K, 1);
     if (K <= 0) return;
     id<MTLBuffer> bx = buffer_for(x);
@@ -459,7 +458,7 @@ DEF_PSO(pso_clamp_fp16,       @"k_clamp_fp16")
 #undef DEF_PSO
 
 void launch_activation_unary(id<MTLComputePipelineState> pso,
-                             const GpuTensor& x, GpuTensor& y) {
+                             const Tensor& x, Tensor& y) {
     if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
         y.resize(x.rows, x.cols, x.dtype);
     }
@@ -488,23 +487,23 @@ void launch_activation_unary(id<MTLComputePipelineState> pso,
 
 } // namespace
 
-void silu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void silu_forward(const Tensor& x, Tensor& y) {
     launch_activation_unary(x.dtype == Dtype::FP16 ? pso_silu_fp16() : pso_silu_fp32(),
                             x, y);
 }
-void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void gelu_forward(const Tensor& x, Tensor& y) {
     launch_activation_unary(x.dtype == Dtype::FP16 ? pso_gelu_fp16() : pso_gelu_fp32(),
                             x, y);
 }
-void quick_gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void quick_gelu_forward(const Tensor& x, Tensor& y) {
     launch_activation_unary(x.dtype == Dtype::FP16 ? pso_quick_gelu_fp16() : pso_quick_gelu_fp32(),
                             x, y);
 }
 
 namespace {
 void launch_activation_bwd(id<MTLComputePipelineState> pso,
-                           const GpuTensor& x, const GpuTensor& dY,
-                           GpuTensor& dX) {
+                           const Tensor& x, const Tensor& dY,
+                           Tensor& dX) {
     if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
         dX.resize(x.rows, x.cols, x.dtype);
     }
@@ -535,27 +534,27 @@ void launch_activation_bwd(id<MTLComputePipelineState> pso,
 }
 } // namespace
 
-void silu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX) {
+void silu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     launch_activation_bwd(x.dtype == Dtype::FP16 ? pso_silu_bwd_fp16() : pso_silu_bwd_fp32(),
                           x, dY, dX);
 }
-void gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX) {
+void gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     launch_activation_bwd(x.dtype == Dtype::FP16 ? pso_gelu_bwd_fp16() : pso_gelu_bwd_fp32(),
                           x, dY, dX);
 }
-void quick_gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
-                             GpuTensor& dX) {
+void quick_gelu_backward(const Tensor& x, const Tensor& dY,
+                         Tensor& dX) {
     launch_activation_bwd(x.dtype == Dtype::FP16 ? pso_quick_gelu_bwd_fp16()
                                                   : pso_quick_gelu_bwd_fp32(),
                           x, dY, dX);
 }
-void gelu_exact_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void gelu_exact_forward(const Tensor& x, Tensor& y) {
     launch_activation_unary(x.dtype == Dtype::FP16 ? pso_gelu_exact_fp16()
                                                     : pso_gelu_exact_fp32(),
                             x, y);
 }
-void gelu_exact_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
-                             GpuTensor& dX) {
+void gelu_exact_backward(const Tensor& x, const Tensor& dY,
+                         Tensor& dX) {
     launch_activation_bwd(x.dtype == Dtype::FP16 ? pso_gelu_exact_bwd_fp16()
                                                   : pso_gelu_exact_bwd_fp32(),
                           x, dY, dX);
@@ -820,7 +819,7 @@ void launch_1d(id<MTLComputePipelineState> pso, NSUInteger n,
     }
 }
 
-void launch_fp16_add_inplace(GpuTensor& y, const GpuTensor& x, uint32_t n) {
+void launch_fp16_add_inplace(Tensor& y, const Tensor& x, uint32_t n) {
     id<MTLBuffer> by = buffer_for(y);
     id<MTLBuffer> bx = buffer_for(x);
     const NSUInteger oy = buffer_offset_for(y);
@@ -832,7 +831,7 @@ void launch_fp16_add_inplace(GpuTensor& y, const GpuTensor& x, uint32_t n) {
     });
 }
 
-void launch_fp16_scale_inplace(GpuTensor& y, float s, uint32_t n) {
+void launch_fp16_scale_inplace(Tensor& y, float s, uint32_t n) {
     id<MTLBuffer> by = buffer_for(y);
     const NSUInteger oy = buffer_offset_for(y);
     launch_1d(pso_scale_inplace_fp16(), n, ^(id<MTLComputeCommandEncoder> enc) {
@@ -844,7 +843,7 @@ void launch_fp16_scale_inplace(GpuTensor& y, float s, uint32_t n) {
 
 } // namespace
 
-void mul_inplace_gpu(GpuTensor& y, const GpuTensor& x) {
+void mul_inplace(Tensor& y, const Tensor& x) {
     if (y.dtype != x.dtype || y.rows != x.rows || y.cols != x.cols) {
         throw std::runtime_error("mul_inplace_gpu: shape/dtype mismatch");
     }
@@ -863,7 +862,7 @@ void mul_inplace_gpu(GpuTensor& y, const GpuTensor& x) {
     });
 }
 
-void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
+void geglu_forward(const Tensor& X, Tensor& Y) {
     if (X.cols % 2 != 0) {
         throw std::runtime_error("geglu_forward_gpu: X.cols must be even (2*D)");
     }
@@ -889,8 +888,8 @@ void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
     });
 }
 
-void geglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
-                        GpuTensor& dX) {
+void geglu_backward(const Tensor& X, const Tensor& dY,
+                    Tensor& dX) {
     if (X.cols % 2 != 0) {
         throw std::runtime_error("geglu_backward_gpu: X.cols must be even (2*D)");
     }
@@ -919,7 +918,7 @@ void geglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
     });
 }
 
-void geglu_exact_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
+void geglu_exact_forward(const Tensor& X, Tensor& Y) {
     if (X.cols % 2 != 0) {
         throw std::runtime_error("geglu_exact_forward_gpu: X.cols must be even (2*D)");
     }
@@ -945,8 +944,8 @@ void geglu_exact_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
     });
 }
 
-void geglu_exact_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
-                              GpuTensor& dX) {
+void geglu_exact_backward(const Tensor& X, const Tensor& dY,
+                          Tensor& dX) {
     if (X.cols % 2 != 0) {
         throw std::runtime_error("geglu_exact_backward_gpu: X.cols must be even (2*D)");
     }
@@ -975,7 +974,7 @@ void geglu_exact_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
     });
 }
 
-void build_causal_mask_row_gpu(int L, int q, GpuTensor& mask) {
+void build_causal_mask_row(int L, int q, Tensor& mask) {
     if (mask.rows != L || mask.cols != 1 || mask.dtype != Dtype::FP32) {
         mask.resize(L, 1, Dtype::FP32);
     }
@@ -991,4 +990,4 @@ void build_causal_mask_row_gpu(int L, int q, GpuTensor& mask) {
     });
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

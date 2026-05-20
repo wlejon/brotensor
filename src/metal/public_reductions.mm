@@ -1,14 +1,13 @@
 // Public reductions (Metal): sum_rows, sum_cols, argmax_rows.
 // FP32 + FP16 input. argmax always writes FP32 indices.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -207,7 +206,7 @@ void run_per_col(id<MTLComputePipelineState> pso, uint32_t M, uint32_t N,
 
 } // namespace
 
-void sum_rows_gpu(const GpuTensor& X, GpuTensor& Y) {
+void sum_rows(const Tensor& X, Tensor& Y) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
         throw std::runtime_error("sum_rows_gpu: X must be FP16 or FP32");
     }
@@ -225,7 +224,7 @@ void sum_rows_gpu(const GpuTensor& X, GpuTensor& Y) {
                 buffer_for(Y), buffer_offset_for(Y));
 }
 
-void sum_cols_gpu(const GpuTensor& X, GpuTensor& Y) {
+void sum_cols(const Tensor& X, Tensor& Y) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
         throw std::runtime_error("sum_cols_gpu: X must be FP16 or FP32");
     }
@@ -243,7 +242,7 @@ void sum_cols_gpu(const GpuTensor& X, GpuTensor& Y) {
                 buffer_for(Y), buffer_offset_for(Y));
 }
 
-void argmax_rows_gpu(const GpuTensor& X, GpuTensor& Idx) {
+void argmax_rows(const Tensor& X, Tensor& Idx) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
         throw std::runtime_error("argmax_rows_gpu: X must be FP16 or FP32");
     }
@@ -261,4 +260,4 @@ void argmax_rows_gpu(const GpuTensor& X, GpuTensor& Idx) {
                 buffer_for(Idx), buffer_offset_for(Idx));
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

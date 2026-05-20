@@ -11,48 +11,63 @@
 
 #include <cstddef>
 
+namespace brotensor {
+
+// ─── Metal backend runtime (internal) ──────────────────────────────────────
+//
+// The public runtime surface (init / sync / DeviceScope) lives in
+// <brotensor/runtime.h> and src/init.cpp. These are the Metal backend's own
+// private lifecycle hooks, kept under the historical `cuda_*` names for
+// source continuity with the op .mm files. Declared here (not in any public
+// header) so the op TUs can call cuda_init() lazily.
+void  cuda_init();
+void  cuda_sync();
+void  cuda_set_stream(void* stream);
+void* cuda_current_stream();
+void  cuda_stream_sync(void* stream);
+void  cuda_check_throw(int err, const char* expr_text,
+                       const char* file, int line);
+
+} // namespace brotensor
+
 namespace brotensor::metal_impl {
 
-// Process-singleton accessors. Lazily initialized by cuda_init() (yes —
-// kept that name for source compatibility with consumers; on Metal it
-// initializes the MTLDevice + command queue + executor).
+// Process-singleton accessors. Lazily initialized by cuda_init() (on Metal it
+// initializes the MTLDevice + command queue + the precompiled MSL pipelines).
 id<MTLDevice>       device();
 id<MTLCommandQueue> queue();
 
-// MPSGraph executor reused for graph runs. Each op constructs its own
-// transient MPSGraph; this executor is the bridge to MTLBuffer-backed
-// MPSGraphTensorData feeds.
-//
 // Returns a fresh MPSCommandBuffer wrapping a new MTLCommandBuffer drawn
 // from queue(). Callers are responsible for committing.
 id<MTLCommandBuffer> new_command_buffer();
 
-// Pool of MTLBuffers keyed by (data_ptr → buffer). GpuTensor stores only
-// `float* data`; on Metal that pointer is the contents of an MTLBuffer
-// allocated with MTLResourceStorageModeShared (unified memory). The pool
-// owns the MTLBuffer reference for the lifetime of the GpuTensor.
+// Pool of MTLBuffers keyed by (data_ptr → buffer). brotensor::Tensor stores
+// only an opaque `void* data`; on Metal that pointer is the contents of an
+// MTLBuffer allocated with MTLResourceStorageModeShared (unified memory). The
+// pool owns the MTLBuffer reference for the lifetime of the Tensor.
 //
-// Internal — used exclusively by tensor.mm and device_buffer.mm.
+// Internal — used by tensor.mm (the Metal AllocVTable) and the buffer_for /
+// set_tensor helpers below.
 void  pool_register(void* data_ptr, id<MTLBuffer> buf);
 id<MTLBuffer> pool_lookup(const void* data_ptr);
 NSUInteger pool_lookup_offset(const void* data_ptr);
 void  pool_release(void* data_ptr);
 
-// Convenience: get the MTLBuffer backing a GpuTensor's data pointer.
+// Convenience: get the MTLBuffer backing a Tensor's data pointer.
 // Returns nil if the tensor is empty.
-inline id<MTLBuffer> buffer_for(const GpuTensor& t) {
+inline id<MTLBuffer> buffer_for(const ::brotensor::Tensor& t) {
     if (t.data == nullptr) return nil;
     return pool_lookup(t.data);
 }
-inline NSUInteger buffer_offset_for(const GpuTensor& t) {
+inline NSUInteger buffer_offset_for(const ::brotensor::Tensor& t) {
     if (t.data == nullptr) return 0;
     return pool_lookup_offset(t.data);
 }
 
-// Bind a GpuTensor (resolves base buffer + view offset) to a compute encoder
+// Bind a Tensor (resolves base buffer + view offset) to a compute encoder
 // at the given buffer index.
 inline void set_tensor(id<MTLComputeCommandEncoder> enc,
-                       const GpuTensor& t,
+                       const ::brotensor::Tensor& t,
                        NSUInteger index) {
     [enc setBuffer:buffer_for(t) offset:buffer_offset_for(t) atIndex:index];
 }

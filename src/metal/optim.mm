@@ -1,9 +1,8 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -40,8 +39,8 @@ id<MTLComputePipelineState> sgd_pipeline() {
 
 } // namespace
 
-void sgd_step_gpu(GpuTensor& param, GpuTensor& grad, GpuTensor& velocity,
-                  float lr, float momentum) {
+void sgd_step(Tensor& param, Tensor& grad, Tensor& velocity,
+              float lr, float momentum) {
     const uint32_t n = static_cast<uint32_t>(param.size());
     if (n == 0) return;
     id<MTLComputePipelineState> pso = sgd_pipeline();
@@ -71,4 +70,4 @@ void sgd_step_gpu(GpuTensor& param, GpuTensor& grad, GpuTensor& velocity,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

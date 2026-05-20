@@ -18,7 +18,6 @@
 // dQ / dK / dV are overwritten (zero-initialized before the head loop, then
 // each head writes into its column slot via the pack kernel).
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <cmath>
@@ -27,7 +26,7 @@
 #import "internal.h"
 #import "fp16_matmul.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -413,37 +412,37 @@ void run_dS(id<MTLBuffer> bP, NSUInteger oP,
 
 } // namespace
 
-void flash_attention_backward_gpu(const GpuTensor& Q,
-                                  const GpuTensor& K,
-                                  const GpuTensor& V,
-                                  const GpuTensor& O,
-                                  const GpuTensor& dO,
-                                  const float* d_mask,
-                                  int num_heads,
-                                  bool causal,
-                                  GpuTensor& dQ,
-                                  GpuTensor& dK,
-                                  GpuTensor& dV) {
+void flash_attention_backward(const Tensor& Q,
+                              const Tensor& K,
+                              const Tensor& V,
+                              const Tensor& O,
+                              const Tensor& dO,
+                              const float* d_mask,
+                              int num_heads,
+                              bool causal,
+                              Tensor& dQ,
+                              Tensor& dK,
+                              Tensor& dV) {
     (void)O;  // recompute-based; O retained in API for symmetry with CUDA.
 
     if (Q.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 ||
         V.dtype != Dtype::FP16 || dO.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_backward_gpu: Q, K, V, dO must be FP16");
+        throw std::runtime_error("flash_attention_backward: Q, K, V, dO must be FP16");
     }
     const int Lq = Q.rows;
     const int Lk = K.rows;
     const int D  = Q.cols;
     if (K.cols != D || V.cols != D || V.rows != Lk) {
-        throw std::runtime_error("flash_attention_backward_gpu: Q/K/V shape mismatch");
+        throw std::runtime_error("flash_attention_backward: Q/K/V shape mismatch");
     }
     if (dO.rows != Lq || dO.cols != D) {
-        throw std::runtime_error("flash_attention_backward_gpu: dO shape mismatch");
+        throw std::runtime_error("flash_attention_backward: dO shape mismatch");
     }
     if (num_heads <= 0 || D % num_heads != 0) {
-        throw std::runtime_error("flash_attention_backward_gpu: num_heads must divide D");
+        throw std::runtime_error("flash_attention_backward: num_heads must divide D");
     }
     if (causal && Lq != Lk) {
-        throw std::runtime_error("flash_attention_backward_gpu: causal requires Lq == Lk");
+        throw std::runtime_error("flash_attention_backward: causal requires Lq == Lk");
     }
     const int hd = D / num_heads;
 
@@ -464,15 +463,15 @@ void flash_attention_backward_gpu(const GpuTensor& Q,
 
     const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
 
-    GpuTensor Qh(Lq, hd, Dtype::FP16);
-    GpuTensor Kh(Lk, hd, Dtype::FP16);
-    GpuTensor Vh(Lk, hd, Dtype::FP16);
-    GpuTensor dOh(Lq, hd, Dtype::FP16);
-    GpuTensor P(Lq, Lk, Dtype::FP16);
-    GpuTensor dP(Lq, Lk, Dtype::FP16);
-    GpuTensor dQh(Lq, hd, Dtype::FP16);
-    GpuTensor dKh(Lk, hd, Dtype::FP16);
-    GpuTensor dVh(Lk, hd, Dtype::FP16);
+    Tensor Qh = Tensor::empty_on(Device::Metal, Lq, hd, Dtype::FP16);
+    Tensor Kh = Tensor::empty_on(Device::Metal, Lk, hd, Dtype::FP16);
+    Tensor Vh = Tensor::empty_on(Device::Metal, Lk, hd, Dtype::FP16);
+    Tensor dOh = Tensor::empty_on(Device::Metal, Lq, hd, Dtype::FP16);
+    Tensor P = Tensor::empty_on(Device::Metal, Lq, Lk, Dtype::FP16);
+    Tensor dP = Tensor::empty_on(Device::Metal, Lq, Lk, Dtype::FP16);
+    Tensor dQh = Tensor::empty_on(Device::Metal, Lq, hd, Dtype::FP16);
+    Tensor dKh = Tensor::empty_on(Device::Metal, Lk, hd, Dtype::FP16);
+    Tensor dVh = Tensor::empty_on(Device::Metal, Lk, hd, Dtype::FP16);
 
     id<MTLBuffer> bQ  = buffer_for(Q);   NSUInteger oQ_  = buffer_offset_for(Q);
     id<MTLBuffer> bK  = buffer_for(K);   NSUInteger oK_  = buffer_offset_for(K);
@@ -538,4 +537,4 @@ void flash_attention_backward_gpu(const GpuTensor& Q,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

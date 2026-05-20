@@ -1,4 +1,3 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
@@ -6,7 +5,7 @@
 #import "internal.h"
 #import "conv2d_wmma.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -517,35 +516,35 @@ struct ConvParams {
 
 } // namespace
 
-void conv2d_forward_gpu(const GpuTensor& X,
-                        const GpuTensor& Wt,
-                        const GpuTensor* bias,
+void conv2d_forward(const Tensor& X,
+                    const Tensor& Wt,
+                    const Tensor* bias,
                         int N, int C_in, int H, int W,
                         int C_out, int kH, int kW,
                         int stride_h, int stride_w,
                         int pad_h, int pad_w,
                         int dil_h, int dil_w,
                         int groups,
-                        GpuTensor& Y) {
+                        Tensor& Y) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_forward_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("conv2d_forward: X must be FP16 or FP32");
     }
     if (Wt.dtype != X.dtype) {
-        throw std::runtime_error("conv2d_forward_gpu: Wt dtype must match X");
+        throw std::runtime_error("conv2d_forward: Wt dtype must match X");
     }
     if (bias && bias->dtype != X.dtype) {
-        throw std::runtime_error("conv2d_forward_gpu: bias dtype must match X");
+        throw std::runtime_error("conv2d_forward: bias dtype must match X");
     }
     if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
         throw std::runtime_error(
-            "conv2d_forward_gpu: groups must be >=1 and divide both C_in and C_out");
+            "conv2d_forward: groups must be >=1 and divide both C_in and C_out");
     }
     const int Cg_in  = C_in  / groups;
     const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
-        throw std::runtime_error("conv2d_forward_gpu: non-positive output shape");
+        throw std::runtime_error("conv2d_forward: non-positive output shape");
     }
     const int out_cols = C_out * H_out * W_out;
     if (Y.rows != N || Y.cols != out_cols || Y.dtype != X.dtype) {
@@ -613,31 +612,31 @@ void conv2d_forward_gpu(const GpuTensor& X,
     }
 }
 
-void conv2d_backward_input_gpu(const GpuTensor& Wt,
-                               const GpuTensor& dY,
+void conv2d_backward_input(const Tensor& Wt,
+                           const Tensor& dY,
                                int N, int C_in, int H, int W,
                                int C_out, int kH, int kW,
                                int stride_h, int stride_w,
                                int pad_h, int pad_w,
                                int dil_h, int dil_w,
-                               int groups,
-                               GpuTensor& dX) {
+                           int groups,
+                           Tensor& dX) {
     if (Wt.dtype != Dtype::FP16 && Wt.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_input_gpu: Wt must be FP16 or FP32");
+        throw std::runtime_error("conv2d_backward_input: Wt must be FP16 or FP32");
     }
     if (dY.dtype != Wt.dtype) {
-        throw std::runtime_error("conv2d_backward_input_gpu: dY dtype must match Wt");
+        throw std::runtime_error("conv2d_backward_input: dY dtype must match Wt");
     }
     if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
         throw std::runtime_error(
-            "conv2d_backward_input_gpu: groups must be >=1 and divide both C_in and C_out");
+            "conv2d_backward_input: groups must be >=1 and divide both C_in and C_out");
     }
     const int Cg_in  = C_in  / groups;
     const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
-        throw std::runtime_error("conv2d_backward_input_gpu: non-positive output shape");
+        throw std::runtime_error("conv2d_backward_input: non-positive output shape");
     }
     const int in_cols = C_in * H * W;
     if (dX.rows != N || dX.cols != in_cols || dX.dtype != Wt.dtype) {
@@ -686,34 +685,34 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
     }
 }
 
-void conv2d_backward_weight_gpu(const GpuTensor& X,
-                                const GpuTensor& dY,
+void conv2d_backward_weight(const Tensor& X,
+                            const Tensor& dY,
                                 int N, int C_in, int H, int W,
                                 int C_out, int kH, int kW,
                                 int stride_h, int stride_w,
                                 int pad_h, int pad_w,
                                 int dil_h, int dil_w,
-                                int groups,
-                                GpuTensor& dWt) {
+                            int groups,
+                            Tensor& dWt) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_weight_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("conv2d_backward_weight: X must be FP16 or FP32");
     }
     if (dY.dtype != X.dtype || dWt.dtype != X.dtype) {
-        throw std::runtime_error("conv2d_backward_weight_gpu: X, dY, dWt dtype must match");
+        throw std::runtime_error("conv2d_backward_weight: X, dY, dWt dtype must match");
     }
     if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
         throw std::runtime_error(
-            "conv2d_backward_weight_gpu: groups must be >=1 and divide both C_in and C_out");
+            "conv2d_backward_weight: groups must be >=1 and divide both C_in and C_out");
     }
     const int Cg_in  = C_in  / groups;
     const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
-        throw std::runtime_error("conv2d_backward_weight_gpu: non-positive output shape");
+        throw std::runtime_error("conv2d_backward_weight: non-positive output shape");
     }
     if (dWt.rows != C_out || dWt.cols != Cg_in * kH * kW) {
-        throw std::runtime_error("conv2d_backward_weight_gpu: dWt shape mismatch");
+        throw std::runtime_error("conv2d_backward_weight: dWt shape mismatch");
     }
     const uint32_t total = static_cast<uint32_t>(C_out) * Cg_in * kH * kW;
     if (total == 0) return;
@@ -775,17 +774,17 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
     }
 }
 
-void conv2d_backward_bias_gpu(const GpuTensor& dY,
-                              int N, int C_out, int H_out, int W_out,
-                              GpuTensor& dB) {
+void conv2d_backward_bias(const Tensor& dY,
+                          int N, int C_out, int H_out, int W_out,
+                          Tensor& dB) {
     if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_bias_gpu: dY must be FP16 or FP32");
+        throw std::runtime_error("conv2d_backward_bias: dY must be FP16 or FP32");
     }
     if (dB.dtype != dY.dtype) {
-        throw std::runtime_error("conv2d_backward_bias_gpu: dB dtype must match dY");
+        throw std::runtime_error("conv2d_backward_bias: dB dtype must match dY");
     }
     if (dB.rows != C_out || dB.cols != 1) {
-        throw std::runtime_error("conv2d_backward_bias_gpu: dB shape mismatch");
+        throw std::runtime_error("conv2d_backward_bias: dB shape mismatch");
     }
     if (C_out == 0 || N == 0 || H_out == 0 || W_out == 0) return;
 
@@ -841,4 +840,4 @@ void conv2d_backward_bias_gpu(const GpuTensor& dY,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

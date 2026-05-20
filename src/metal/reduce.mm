@@ -1,9 +1,8 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -95,8 +94,8 @@ void dispatch1d(id<MTLComputePipelineState> pso, NSUInteger n,
 
 } // namespace
 
-void masked_mean_pool_forward_gpu(const GpuTensor& X, const float* d_mask,
-                                  GpuTensor& y) {
+void masked_mean_pool_forward(const Tensor& X, const float* d_mask,
+                              Tensor& y) {
     const int K = X.rows;
     const int D = X.cols;
     if (y.rows != D || y.cols != 1) y.resize(D, 1);
@@ -123,8 +122,8 @@ void masked_mean_pool_forward_gpu(const GpuTensor& X, const float* d_mask,
     });
 }
 
-void masked_mean_pool_backward_gpu(const GpuTensor& dY, const float* d_mask,
-                                   int K, GpuTensor& dX) {
+void masked_mean_pool_backward(const Tensor& dY, const float* d_mask,
+                               int K, Tensor& dX) {
     const int D = dY.size();
     if (dX.rows != K || dX.cols != D) dX.resize(K, D);
     const int total = K * D;
@@ -159,4 +158,4 @@ void masked_mean_pool_backward_gpu(const GpuTensor& dY, const float* d_mask,
     });
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

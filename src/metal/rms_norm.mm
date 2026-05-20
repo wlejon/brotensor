@@ -2,7 +2,6 @@
 // FP16 dGamma accumulates into an FP32 scratch (atomic_float), then a fold
 // kernel adds into the caller-owned FP16 dGamma.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <cstring>
@@ -10,7 +9,7 @@
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -220,8 +219,8 @@ DEF_PSO(pso_fold,    @"k_rms_fold_fp16")
 
 } // namespace
 
-void rms_norm_forward_gpu(const GpuTensor& X, const GpuTensor& gamma,
-                         float eps, GpuTensor& Y) {
+void rms_norm_forward(const Tensor& X, const Tensor& gamma,
+                      float eps, Tensor& Y) {
     if (gamma.dtype != X.dtype) {
         throw std::runtime_error("rms_norm_forward_gpu: gamma.dtype must match X.dtype");
     }
@@ -263,9 +262,9 @@ void rms_norm_forward_gpu(const GpuTensor& X, const GpuTensor& gamma,
     }
 }
 
-void rms_norm_backward_gpu(const GpuTensor& X, const GpuTensor& gamma,
-                          const GpuTensor& dY, float eps,
-                          GpuTensor& dX, GpuTensor& dGamma) {
+void rms_norm_backward(const Tensor& X, const Tensor& gamma,
+                       const Tensor& dY, float eps,
+                       Tensor& dX, Tensor& dGamma) {
     if (gamma.dtype != X.dtype || dY.dtype != X.dtype || dGamma.dtype != X.dtype) {
         throw std::runtime_error("rms_norm_backward_gpu: dtypes must match");
     }
@@ -352,4 +351,4 @@ void rms_norm_backward_gpu(const GpuTensor& X, const GpuTensor& gamma,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

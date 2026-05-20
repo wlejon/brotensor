@@ -219,7 +219,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/dpmpp_2m_step.mm
         src/metal/timestep_embedding.mm
         src/metal/int8_quant.mm
-        # src/metal/register.mm                      # TODO Phase 3: backend registration
+        src/metal/register.mm
     )
     set_source_files_properties(
         src/metal/runtime.mm
@@ -262,6 +262,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/dpmpp_2m_step.mm
         src/metal/timestep_embedding.mm
         src/metal/int8_quant.mm
+        src/metal/register.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"
             LANGUAGE OBJCXX
@@ -285,7 +286,8 @@ endif()
 # Consumers (brogameagent, brodiffusion, tests) link this one target.
 #
 # The backend static libs register themselves into the dispatcher from
-# static-init objects (src/cpu/register.cpp, src/cuda/register.cu). Those
+# static-init objects (src/cpu/register.cpp) or via the extern "C" probe hook
+# (src/cuda/register.cu, src/metal/register.mm). Those
 # translation units export no symbol that the rest of the program references,
 # so a normal static-library link drops their object files entirely and the
 # backend is never registered. WHOLE_ARCHIVE forces every object file of the

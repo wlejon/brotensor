@@ -1,12 +1,19 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include <brotensor/detail/op_table.h>
 
 #import "internal.h"
 
 #include <cmath>
 #include <stdexcept>
+#include <vector>
 
-namespace brotensor {
+namespace brotensor::detail::metal {
+
+// Forward declarations of sibling Metal ops implemented in other TUs (and of
+// ops defined later in this file). Generated from the canonical op table.
+#define BROTENSOR_METAL_DECL(name, ret, params) ret name params;
+BROTENSOR_FOR_EACH_OP(BROTENSOR_METAL_DECL)
+#undef BROTENSOR_METAL_DECL
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -451,21 +458,21 @@ void run_rows(id<MTLComputePipelineState> pso, NSUInteger rows,
     }
 }
 
-inline void check_fp32(const GpuTensor& t, const char* name) {
+inline void check_fp32(const Tensor& t, const char* name) {
     if (t.dtype != Dtype::FP32) {
         throw std::runtime_error(std::string("cross_attention training path requires FP32 ") + name);
     }
 }
 
-void cross_attention_forward_train_core(const GpuTensor& X,
-                                        const GpuTensor& Ctx,
-                                        const GpuTensor& Wq, const GpuTensor& Wk,
-                                        const GpuTensor& Wv, const GpuTensor& Wo,
+void cross_attention_forward_train_core(const Tensor& X,
+                                        const Tensor& Ctx,
+                                        const Tensor& Wq, const Tensor& Wk,
+                                        const Tensor& Wv, const Tensor& Wo,
                                         const float* d_mask,
                                         int num_heads,
-                                        GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
-                                        GpuTensor& Attnh, GpuTensor& Yconcat,
-                                        GpuTensor& O) {
+                                        Tensor& Qh, Tensor& Kh, Tensor& Vh,
+                                        Tensor& Attnh, Tensor& Yconcat,
+                                        Tensor& O) {
     check_fp32(X, "X"); check_fp32(Ctx, "Ctx");
     check_fp32(Wq, "Wq"); check_fp32(Wk, "Wk");
     check_fp32(Wv, "Wv"); check_fp32(Wo, "Wo");
@@ -534,7 +541,7 @@ void cross_attention_forward_train_core(const GpuTensor& X,
     proj_ctx(bWk, oWk, bKh, oKh);
     proj_ctx(bWv, oWv, bVh, oVh);
 
-    GpuTensor scores(H * Lq, Lk);
+    Tensor scores = Tensor::empty_on(Device::Metal, H * Lq, Lk);
     id<MTLBuffer> bS = buffer_for(scores); NSUInteger oS = buffer_offset_for(scores);
     run3d(pso_cx_scores(), Lk, Lq, H, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bQh offset:oQh atIndex:0];
@@ -580,63 +587,63 @@ void cross_attention_forward_train_core(const GpuTensor& X,
 
 } // namespace
 
-void self_attention_forward_train_gpu(const GpuTensor& X,
-                                      const GpuTensor& Wq, const GpuTensor& Wk,
-                                      const GpuTensor& Wv, const GpuTensor& Wo,
+void self_attention_forward_train(const Tensor& X,
+                                      const Tensor& Wq, const Tensor& Wk,
+                                      const Tensor& Wv, const Tensor& Wo,
                                       const float* d_mask,
                                       int num_heads,
-                                      GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
-                                      GpuTensor& Attnh, GpuTensor& Yconcat,
-                                      GpuTensor& O) {
-    mha_forward_gpu(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
+                                      Tensor& Qh, Tensor& Kh, Tensor& Vh,
+                                      Tensor& Attnh, Tensor& Yconcat,
+                                      Tensor& O) {
+    mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
                     Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 
-void self_attention_backward_gpu(const GpuTensor& dO,
-                                 const GpuTensor& X,
-                                 const GpuTensor& Qh, const GpuTensor& Kh,
-                                 const GpuTensor& Vh, const GpuTensor& Attnh,
-                                 const GpuTensor& Yconcat,
-                                 const GpuTensor& Wq, const GpuTensor& Wk,
-                                 const GpuTensor& Wv, const GpuTensor& Wo,
+void self_attention_backward(const Tensor& dO,
+                                 const Tensor& X,
+                                 const Tensor& Qh, const Tensor& Kh,
+                                 const Tensor& Vh, const Tensor& Attnh,
+                                 const Tensor& Yconcat,
+                                 const Tensor& Wq, const Tensor& Wk,
+                                 const Tensor& Wv, const Tensor& Wo,
                                  const float* d_mask,
                                  int num_heads,
-                                 GpuTensor& dX,
-                                 GpuTensor& dWq, GpuTensor& dWk,
-                                 GpuTensor& dWv, GpuTensor& dWo) {
-    mha_backward_gpu(dO, X, Qh, Kh, Vh, Attnh, Yconcat,
+                                 Tensor& dX,
+                                 Tensor& dWq, Tensor& dWk,
+                                 Tensor& dWv, Tensor& dWo) {
+    mha_backward(dO, X, Qh, Kh, Vh, Attnh, Yconcat,
                      Wq, Wk, Wv, Wo, d_mask, num_heads,
                      dX, dWq, dWk, dWv, dWo);
 }
 
-void cross_attention_forward_train_gpu(const GpuTensor& X,
-                                       const GpuTensor& Ctx,
-                                       const GpuTensor& Wq, const GpuTensor& Wk,
-                                       const GpuTensor& Wv, const GpuTensor& Wo,
+void cross_attention_forward_train(const Tensor& X,
+                                       const Tensor& Ctx,
+                                       const Tensor& Wq, const Tensor& Wk,
+                                       const Tensor& Wv, const Tensor& Wo,
                                        const float* d_mask,
                                        int num_heads,
-                                       GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
-                                       GpuTensor& Attnh, GpuTensor& Yconcat,
-                                       GpuTensor& O) {
+                                       Tensor& Qh, Tensor& Kh, Tensor& Vh,
+                                       Tensor& Attnh, Tensor& Yconcat,
+                                       Tensor& O) {
     cross_attention_forward_train_core(X, Ctx, Wq, Wk, Wv, Wo, d_mask,
                                        num_heads, Qh, Kh, Vh, Attnh,
                                        Yconcat, O);
 }
 
-void cross_attention_backward_gpu(const GpuTensor& dO,
-                                  const GpuTensor& X,
-                                  const GpuTensor& Ctx,
-                                  const GpuTensor& Qh, const GpuTensor& Kh,
-                                  const GpuTensor& Vh, const GpuTensor& Attnh,
-                                  const GpuTensor& Yconcat,
-                                  const GpuTensor& Wq, const GpuTensor& Wk,
-                                  const GpuTensor& Wv, const GpuTensor& Wo,
+void cross_attention_backward(const Tensor& dO,
+                                  const Tensor& X,
+                                  const Tensor& Ctx,
+                                  const Tensor& Qh, const Tensor& Kh,
+                                  const Tensor& Vh, const Tensor& Attnh,
+                                  const Tensor& Yconcat,
+                                  const Tensor& Wq, const Tensor& Wk,
+                                  const Tensor& Wv, const Tensor& Wo,
                                   const float* d_mask,
                                   int num_heads,
-                                  GpuTensor& dX,
-                                  GpuTensor& dCtx,
-                                  GpuTensor& dWq, GpuTensor& dWk,
-                                  GpuTensor& dWv, GpuTensor& dWo) {
+                                  Tensor& dX,
+                                  Tensor& dCtx,
+                                  Tensor& dWq, Tensor& dWk,
+                                  Tensor& dWv, Tensor& dWo) {
     check_fp32(dO, "dO"); check_fp32(X, "X"); check_fp32(Ctx, "Ctx");
 
     const int Lq   = X.rows;
@@ -682,7 +689,7 @@ void cross_attention_backward_gpu(const GpuTensor& dO,
     id<MTLBuffer> bM_arg = bM ? bM : bX;
     NSUInteger oM_arg = bM ? oM : oX;
 
-    GpuTensor dYconcat(Lq, D);
+    Tensor dYconcat = Tensor::empty_on(Device::Metal, Lq, D);
     id<MTLBuffer> bdY = buffer_for(dYconcat); NSUInteger odY = buffer_offset_for(dYconcat);
     run2d(pso_cx_wodY(), D, Lq, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bdO offset:odO atIndex:0];
@@ -705,8 +712,8 @@ void cross_attention_backward_gpu(const GpuTensor& dO,
         [enc setBytes:&Du length:sizeof(uint32_t) atIndex:7];
     });
 
-    GpuTensor dAttn(H * Lq, Lk);
-    GpuTensor dVh(H * Lk, dh);
+    Tensor dAttn = Tensor::empty_on(Device::Metal, H * Lq, Lk);
+    Tensor dVh = Tensor::empty_on(Device::Metal, H * Lk, dh);
     id<MTLBuffer> bdA = buffer_for(dAttn); NSUInteger odA = buffer_offset_for(dAttn);
     id<MTLBuffer> bdVh = buffer_for(dVh); NSUInteger odVh = buffer_offset_for(dVh);
     run3d(pso_cx_dAttn(), Lk, Lq, H, ^(id<MTLComputeCommandEncoder> enc) {
@@ -728,7 +735,7 @@ void cross_attention_backward_gpu(const GpuTensor& dO,
         [enc setBytes:&Du length:sizeof(uint32_t) atIndex:6];
     });
 
-    GpuTensor dScores(H * Lq, Lk);
+    Tensor dScores = Tensor::empty_on(Device::Metal, H * Lq, Lk);
     id<MTLBuffer> bdS = buffer_for(dScores); NSUInteger odS = buffer_offset_for(dScores);
     run_rows(pso_cx_rsmb(), H * Lq, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bAh offset:oAh atIndex:0];
@@ -742,7 +749,8 @@ void cross_attention_backward_gpu(const GpuTensor& dO,
         [enc setBytes:&inv_sqrtdh length:sizeof(float) atIndex:8];
     });
 
-    GpuTensor dQh(H * Lq, dh), dKh(H * Lk, dh);
+    Tensor dQh = Tensor::empty_on(Device::Metal, H * Lq, dh);
+    Tensor dKh = Tensor::empty_on(Device::Metal, H * Lk, dh);
     id<MTLBuffer> bdQh = buffer_for(dQh); NSUInteger odQh = buffer_offset_for(dQh);
     id<MTLBuffer> bdKh = buffer_for(dKh); NSUInteger odKh = buffer_offset_for(dKh);
     run3d(pso_cx_dQ(), dh, Lq, H, ^(id<MTLComputeCommandEncoder> enc) {
@@ -815,18 +823,18 @@ void cross_attention_backward_gpu(const GpuTensor& dO,
     });
 }
 
-void cross_attention_forward_gpu(const GpuTensor& X,
-                                 const GpuTensor& Ctx,
-                                 const GpuTensor& Wq, const GpuTensor& Wk,
-                                 const GpuTensor& Wv, const GpuTensor& Wo,
+void cross_attention_forward(const Tensor& X,
+                                 const Tensor& Ctx,
+                                 const Tensor& Wq, const Tensor& Wk,
+                                 const Tensor& Wv, const Tensor& Wo,
                                  const float* d_mask,
                                  int num_heads,
-                                 GpuTensor& O) {
+                                 Tensor& O) {
     if (X.dtype == Dtype::FP16) {
         if (Ctx.dtype != Dtype::FP16) {
             throw std::runtime_error("cross_attention_forward_gpu: Ctx dtype must match X dtype");
         }
-        flash_attention_qkvo_forward_gpu(X, &Ctx,
+        flash_attention_qkvo_forward(X, &Ctx,
                                          Wq, nullptr, Wk, nullptr,
                                          Wv, nullptr, Wo, nullptr,
                                          d_mask, num_heads, /*causal=*/false, O);
@@ -835,28 +843,28 @@ void cross_attention_forward_gpu(const GpuTensor& X,
     if (Ctx.dtype != Dtype::FP32) {
         throw std::runtime_error("cross_attention_forward_gpu: Ctx dtype must match X dtype");
     }
-    GpuTensor Qh, Kh, Vh, Attnh, Yconcat;
+    Tensor Qh, Kh, Vh, Attnh, Yconcat;
     cross_attention_forward_train_core(X, Ctx, Wq, Wk, Wv, Wo, d_mask,
                                        num_heads, Qh, Kh, Vh, Attnh,
                                        Yconcat, O);
 }
 
-void self_attention_forward_gpu(const GpuTensor& X,
-                                const GpuTensor& Wq, const GpuTensor& Wk,
-                                const GpuTensor& Wv, const GpuTensor& Wo,
+void self_attention_forward(const Tensor& X,
+                                const Tensor& Wq, const Tensor& Wk,
+                                const Tensor& Wv, const Tensor& Wo,
                                 const float* d_mask,
                                 int num_heads,
-                                GpuTensor& O) {
+                                Tensor& O) {
     if (X.dtype == Dtype::FP16) {
-        flash_attention_qkvo_forward_gpu(X, nullptr,
+        flash_attention_qkvo_forward(X, nullptr,
                                          Wq, nullptr, Wk, nullptr,
                                          Wv, nullptr, Wo, nullptr,
                                          d_mask, num_heads, /*causal=*/false, O);
         return;
     }
-    GpuTensor Qh, Kh, Vh, Attnh, Yconcat;
-    mha_forward_gpu(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
+    Tensor Qh, Kh, Vh, Attnh, Yconcat;
+    mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
                     Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

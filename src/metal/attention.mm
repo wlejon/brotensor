@@ -1,11 +1,10 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #import "internal.h"
 
 #include <cmath>
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -395,13 +394,13 @@ void run_rows(id<MTLComputePipelineState> pso, NSUInteger rows,
 
 } // namespace
 
-void attention_forward_gpu(const GpuTensor& X,
-                           const GpuTensor& Wq, const GpuTensor& Wk,
-                           const GpuTensor& Wv, const GpuTensor& Wo,
-                           const float* d_mask,
-                           GpuTensor& Q, GpuTensor& K, GpuTensor& V,
-                           GpuTensor& Attn, GpuTensor& Y_pre_Wo,
-                           GpuTensor& O) {
+void attention_forward(const Tensor& X,
+                       const Tensor& Wq, const Tensor& Wk,
+                       const Tensor& Wv, const Tensor& Wo,
+                       const float* d_mask,
+                       Tensor& Q, Tensor& K, Tensor& V,
+                       Tensor& Attn, Tensor& Y_pre_Wo,
+                       Tensor& O) {
     const int N = X.rows;
     const int D = X.cols;
     if (Q.rows != N || Q.cols != D) Q.resize(N, D);
@@ -459,7 +458,7 @@ void attention_forward_gpu(const GpuTensor& X,
     proj(bWv, oWv, bV, oV);
 
     // Scores → temp buffer.
-    GpuTensor scores(N, N);
+    Tensor scores = Tensor::empty_on(Device::Metal, N, N);
     id<MTLBuffer> bS = buffer_for(scores);
     NSUInteger oS = buffer_offset_for(scores);
     run2d(pso_scores(), N, N, ^(id<MTLComputeCommandEncoder> enc) {
@@ -501,17 +500,17 @@ void attention_forward_gpu(const GpuTensor& X,
     });
 }
 
-void attention_backward_gpu(const GpuTensor& dO,
-                            const GpuTensor& X,
-                            const GpuTensor& Q, const GpuTensor& K,
-                            const GpuTensor& V, const GpuTensor& Attn,
-                            const GpuTensor& Y_pre_Wo,
-                            const GpuTensor& Wq, const GpuTensor& Wk,
-                            const GpuTensor& Wv, const GpuTensor& Wo,
-                            const float* d_mask,
-                            GpuTensor& dX,
-                            GpuTensor& dWq, GpuTensor& dWk,
-                            GpuTensor& dWv, GpuTensor& dWo) {
+void attention_backward(const Tensor& dO,
+                        const Tensor& X,
+                        const Tensor& Q, const Tensor& K,
+                        const Tensor& V, const Tensor& Attn,
+                        const Tensor& Y_pre_Wo,
+                        const Tensor& Wq, const Tensor& Wk,
+                        const Tensor& Wv, const Tensor& Wo,
+                        const float* d_mask,
+                        Tensor& dX,
+                        Tensor& dWq, Tensor& dWk,
+                        Tensor& dWv, Tensor& dWo) {
     const int N = X.rows;
     const int D = X.cols;
     if (dX.rows != N || dX.cols != D) dX.resize(N, D);
@@ -558,7 +557,7 @@ void attention_backward_gpu(const GpuTensor& dO,
     id<MTLBuffer> bM_arg = bM ? bM : bX;
     NSUInteger oM_arg = bM ? oM : buffer_offset_for(X);
 
-    GpuTensor dY(N, D);
+    Tensor dY = Tensor::empty_on(Device::Metal, N, D);
     id<MTLBuffer> bdY = buffer_for(dY);
     NSUInteger odY = buffer_offset_for(dY);
     run2d(pso_wodY(), D, N, ^(id<MTLComputeCommandEncoder> enc) {
@@ -580,8 +579,8 @@ void attention_backward_gpu(const GpuTensor& dO,
         [enc setBytes:&Du length:sizeof(uint32_t) atIndex:6];
     });
 
-    GpuTensor dAttn(N, N);
-    GpuTensor dV(N, D);
+    Tensor dAttn = Tensor::empty_on(Device::Metal, N, N);
+    Tensor dV = Tensor::empty_on(Device::Metal, N, D);
     id<MTLBuffer> bdA = buffer_for(dAttn);
     NSUInteger odA = buffer_offset_for(dAttn);
     id<MTLBuffer> bdV = buffer_for(dV);
@@ -601,7 +600,7 @@ void attention_backward_gpu(const GpuTensor& dO,
         [enc setBytes:&Du length:sizeof(uint32_t) atIndex:4];
     });
 
-    GpuTensor dScores(N, N);
+    Tensor dScores = Tensor::empty_on(Device::Metal, N, N);
     id<MTLBuffer> bdS = buffer_for(dScores);
     NSUInteger odS = buffer_offset_for(dScores);
     run_rows(pso_rsmb(), N, ^(id<MTLComputeCommandEncoder> enc) {
@@ -614,7 +613,8 @@ void attention_backward_gpu(const GpuTensor& dO,
         [enc setBytes:&inv_sqrtd length:sizeof(float) atIndex:6];
     });
 
-    GpuTensor dQ(N, D), dK(N, D);
+    Tensor dQ = Tensor::empty_on(Device::Metal, N, D);
+    Tensor dK = Tensor::empty_on(Device::Metal, N, D);
     id<MTLBuffer> bdQ = buffer_for(dQ);
     NSUInteger odQ = buffer_offset_for(dQ);
     id<MTLBuffer> bdK = buffer_for(dK);
@@ -658,4 +658,4 @@ void attention_backward_gpu(const GpuTensor& dO,
     });
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

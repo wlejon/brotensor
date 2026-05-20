@@ -2,7 +2,6 @@
 // directly into dA / dB. FP16 path accumulates into FP32 scratch then folds
 // into the caller-owned FP16 dA / dB (accumulating semantics).
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <cstring>
@@ -10,7 +9,7 @@
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -165,11 +164,11 @@ DEF_PSO(pso_fold,    @"k_mmb_fold_fp16")
 
 } // namespace
 
-void matmul_backward_gpu(const GpuTensor& A,
-                         const GpuTensor& B,
-                         const GpuTensor& dC,
-                         GpuTensor& dA,
-                         GpuTensor& dB) {
+void matmul_backward(const Tensor& A,
+                     const Tensor& B,
+                     const Tensor& dC,
+                     Tensor& dA,
+                     Tensor& dB) {
     if (A.dtype != B.dtype || A.dtype != dC.dtype ||
         A.dtype != dA.dtype || A.dtype != dB.dtype) {
         throw std::runtime_error("matmul_backward_gpu: dtype mismatch");
@@ -306,4 +305,4 @@ void matmul_backward_gpu(const GpuTensor& A,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

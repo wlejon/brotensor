@@ -3,14 +3,13 @@
 // reduce three running sums (mass, y-mass, x-mass) in threadgroup memory.
 // Thread 0 divides and writes (mass, centroid_y, centroid_x).
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -100,20 +99,20 @@ id<MTLComputePipelineState> pso_moments() {
 
 } // namespace
 
-void attention_token_moments_gpu(const GpuTensor& Attn,
-                                 int h_lat, int w_lat,
-                                 GpuTensor& mass,
-                                 GpuTensor& centroid) {
+void attention_token_moments(const Tensor& Attn,
+                             int h_lat, int w_lat,
+                             Tensor& mass,
+                             Tensor& centroid) {
     if (Attn.dtype != Dtype::FP16) {
-        throw std::runtime_error("attention_token_moments_gpu: Attn must be FP16");
+        throw std::runtime_error("attention_token_moments: Attn must be FP16");
     }
     if (h_lat <= 0 || w_lat <= 0) {
-        throw std::runtime_error("attention_token_moments_gpu: h_lat and w_lat must be positive");
+        throw std::runtime_error("attention_token_moments: h_lat and w_lat must be positive");
     }
     const int Lq = h_lat * w_lat;
     const int Lk = Attn.cols;
     if (Attn.rows != Lq) {
-        throw std::runtime_error("attention_token_moments_gpu: Attn.rows must equal h_lat * w_lat");
+        throw std::runtime_error("attention_token_moments: Attn.rows must equal h_lat * w_lat");
     }
     if (mass.rows != Lk || mass.cols != 1 || mass.dtype != Dtype::FP32) {
         mass.resize(Lk, 1, Dtype::FP32);
@@ -153,4 +152,4 @@ void attention_token_moments_gpu(const GpuTensor& Attn,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

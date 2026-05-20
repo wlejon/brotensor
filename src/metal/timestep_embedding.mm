@@ -1,7 +1,6 @@
 // Sinusoidal timestep embedding (Metal, FP32). Diffusers default for SD/SDXL:
 // flip_sin_to_cos=True, downscale_freq_shift=0 → output [cos, sin].
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <cmath>
@@ -9,7 +8,7 @@
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -50,9 +49,9 @@ id<MTLComputePipelineState> pso() {
 
 } // namespace
 
-void timestep_embedding_gpu(const GpuTensor& timesteps,
-                            int dim, float max_period,
-                            GpuTensor& Y) {
+void timestep_embedding(const Tensor& timesteps,
+                        int dim, float max_period,
+                        Tensor& Y) {
     if (timesteps.dtype != Dtype::FP32) {
         throw std::runtime_error("timestep_embedding_gpu: timesteps must be FP32");
     }
@@ -99,4 +98,4 @@ void timestep_embedding_gpu(const GpuTensor& timesteps,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal

@@ -1,6 +1,5 @@
 // Fused DDIM update (Metal, FP16). FP32 internal math.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include <algorithm>
@@ -9,7 +8,7 @@
 
 #import "internal.h"
 
-namespace brotensor {
+namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
@@ -49,9 +48,9 @@ id<MTLComputePipelineState> pso() {
 
 } // namespace
 
-void ddim_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
-                   float alpha_t, float alpha_prev, float sigma_t,
-                   GpuTensor& x_prev) {
+void ddim_step(const Tensor& x_t, const Tensor& eps_pred,
+               float alpha_t, float alpha_prev, float sigma_t,
+               Tensor& x_prev) {
     if (x_t.dtype != Dtype::FP16 || eps_pred.dtype != Dtype::FP16) {
         throw std::runtime_error("ddim_step_gpu: x_t and eps_pred must be FP16");
     }
@@ -102,4 +101,4 @@ void ddim_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::metal
