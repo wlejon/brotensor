@@ -22,7 +22,7 @@ void run_fwd(int B, int D, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::swiglu_forward(X, cpu_Y);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gpu_Y;
     brotensor::swiglu_forward(gX, gpu_Y);
 
@@ -39,8 +39,8 @@ void run_bwd(int B, int D, uint64_t seed) {
     Tensor cpu_dX;
     brotensor::swiglu_backward(X, dY, cpu_dX);
 
-    Tensor gX  = X.to(Device::CUDA);
-    Tensor gdY = dY.to(Device::CUDA);
+    Tensor gX  = X.to(gpu_device());
+    Tensor gdY = dY.to(gpu_device());
     Tensor gpu_dX;
     brotensor::swiglu_backward(gX, gdY, gpu_dX);
 

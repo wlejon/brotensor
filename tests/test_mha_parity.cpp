@@ -58,16 +58,16 @@ void run_mha(int K, int D, int H, uint64_t seed, const std::vector<float>* mask)
         dX_cpu, dWq_cpu, dWk_cpu, dWv_cpu, dWo_cpu);
 
     // GPU path — the same ops on CUDA-resident tensors.
-    Tensor gX = X.to(Device::CUDA);
-    Tensor gWq = Wq.to(Device::CUDA), gWk = Wk.to(Device::CUDA),
-           gWv = Wv.to(Device::CUDA), gWo = Wo.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
+    Tensor gWq = Wq.to(gpu_device()), gWk = Wk.to(gpu_device()),
+           gWv = Wv.to(gpu_device()), gWo = Wo.to(gpu_device());
 
-    Tensor gQh = Tensor::zeros_on(Device::CUDA, H * K, dh);
-    Tensor gKh = Tensor::zeros_on(Device::CUDA, H * K, dh);
-    Tensor gVh = Tensor::zeros_on(Device::CUDA, H * K, dh);
-    Tensor gAttnh = Tensor::zeros_on(Device::CUDA, H * K, K);
-    Tensor gYconcat = Tensor::zeros_on(Device::CUDA, K, D);
-    Tensor gO = Tensor::zeros_on(Device::CUDA, K, D);
+    Tensor gQh = Tensor::zeros_on(gpu_device(), H * K, dh);
+    Tensor gKh = Tensor::zeros_on(gpu_device(), H * K, dh);
+    Tensor gVh = Tensor::zeros_on(gpu_device(), H * K, dh);
+    Tensor gAttnh = Tensor::zeros_on(gpu_device(), H * K, K);
+    Tensor gYconcat = Tensor::zeros_on(gpu_device(), K, D);
+    Tensor gO = Tensor::zeros_on(gpu_device(), K, D);
 
     Tensor d_mask_buf = upload_mask(mask);
     const float* d_mask = static_cast<const float*>(d_mask_buf.data);
@@ -77,12 +77,12 @@ void run_mha(int K, int D, int H, uint64_t seed, const std::vector<float>* mask)
 
     Tensor O_gpu = download_to_host(gO);
 
-    Tensor gdO = dO.to(Device::CUDA);
-    Tensor gdX = Tensor::zeros_on(Device::CUDA, K, D);
-    Tensor gdWq = dWq_init.to(Device::CUDA);
-    Tensor gdWk = dWk_init.to(Device::CUDA);
-    Tensor gdWv = dWv_init.to(Device::CUDA);
-    Tensor gdWo = dWo_init.to(Device::CUDA);
+    Tensor gdO = dO.to(gpu_device());
+    Tensor gdX = Tensor::zeros_on(gpu_device(), K, D);
+    Tensor gdWq = dWq_init.to(gpu_device());
+    Tensor gdWk = dWk_init.to(gpu_device());
+    Tensor gdWv = dWv_init.to(gpu_device());
+    Tensor gdWo = dWo_init.to(gpu_device());
 
     brotensor::mha_backward(
         gdO, gX, gQh, gKh, gVh, gAttnh, gYconcat,

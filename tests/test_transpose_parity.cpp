@@ -28,7 +28,7 @@ void run_fwd(const Shape& s, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::nchw_to_sequence(X, s.N, s.C, s.H, s.W, cpu_Y);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gpu_Y;
     brotensor::nchw_to_sequence(gX, s.N, s.C, s.H, s.W, gpu_Y);
 
@@ -45,7 +45,7 @@ void run_inv(const Shape& s, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::sequence_to_nchw(X, s.N, s.C, s.H, s.W, cpu_Y);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gpu_Y;
     brotensor::sequence_to_nchw(gX, s.N, s.C, s.H, s.W, gpu_Y);
 

@@ -23,7 +23,7 @@ void run_sum_rows(int M, int N, uint64_t seed) {
     Tensor y_cpu;
     brotensor::sum_rows(X, y_cpu);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gy;
     brotensor::sum_rows(gX, gy);
     Tensor y_gpu = download_to_host(gy);
@@ -38,7 +38,7 @@ void run_sum_cols(int M, int N, uint64_t seed) {
     Tensor y_cpu;
     brotensor::sum_cols(X, y_cpu);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gy;
     brotensor::sum_cols(gX, gy);
     Tensor y_gpu = download_to_host(gy);
@@ -53,7 +53,7 @@ void run_argmax(int M, int N, uint64_t seed) {
     Tensor idx_cpu;
     brotensor::argmax_rows(X, idx_cpu);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gidx;
     brotensor::argmax_rows(gX, gidx);
     Tensor idx_gpu = download_to_host(gidx);

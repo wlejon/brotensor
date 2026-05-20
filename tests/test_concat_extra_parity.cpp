@@ -36,7 +36,7 @@ void run_batched_rows(int B, const std::vector<int>& cols, uint64_t seed) {
     std::vector<Tensor> parts_gpu(cols.size());
     std::vector<const Tensor*> gpu_ptr;
     for (size_t i = 0; i < cols.size(); ++i) {
-        parts_gpu[i] = parts_cpu[i].to(Device::CUDA);
+        parts_gpu[i] = parts_cpu[i].to(gpu_device());
         gpu_ptr.push_back(&parts_gpu[i]);
     }
     Tensor out_gpu;
@@ -67,7 +67,7 @@ void run_nchw(int N, int H, int W, const std::vector<int>& C_per_part,
     std::vector<Tensor> parts_gpu(C_per_part.size());
     std::vector<const Tensor*> gpu_ptr;
     for (size_t i = 0; i < C_per_part.size(); ++i) {
-        parts_gpu[i] = parts_cpu[i].to(Device::CUDA);
+        parts_gpu[i] = parts_cpu[i].to(gpu_device());
         gpu_ptr.push_back(&parts_gpu[i]);
     }
     Tensor out_gpu;

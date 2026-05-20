@@ -37,7 +37,7 @@ void run_up_nearest(const Shape& s, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::upsample_nearest_2x(X, s.N, s.C, s.H, s.W, cpu_Y);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gpu_Y;
     brotensor::upsample_nearest_2x(gX, s.N, s.C, s.H, s.W, gpu_Y);
 
@@ -52,7 +52,7 @@ void run_up_bilinear(const Shape& s, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::upsample_bilinear_2x(X, s.N, s.C, s.H, s.W, cpu_Y);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gpu_Y;
     brotensor::upsample_bilinear_2x(gX, s.N, s.C, s.H, s.W, gpu_Y);
 
@@ -67,7 +67,7 @@ void run_down_avg(const Shape& s, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::downsample_avg_2x(X, s.N, s.C, s.H, s.W, cpu_Y);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gpu_Y;
     brotensor::downsample_avg_2x(gX, s.N, s.C, s.H, s.W, gpu_Y);
 
@@ -83,7 +83,7 @@ void run_up_nearest_bwd(const Shape& s, uint64_t seed) {
     Tensor cpu_dX;
     brotensor::upsample_nearest_2x_backward(dY, s.N, s.C, s.H, s.W, cpu_dX);
 
-    Tensor gdY = dY.to(Device::CUDA);
+    Tensor gdY = dY.to(gpu_device());
     Tensor gpu_dX;
     brotensor::upsample_nearest_2x_backward(gdY, s.N, s.C, s.H, s.W, gpu_dX);
 
@@ -99,7 +99,7 @@ void run_up_bilinear_bwd(const Shape& s, uint64_t seed) {
     Tensor cpu_dX;
     brotensor::upsample_bilinear_2x_backward(dY, s.N, s.C, s.H, s.W, cpu_dX);
 
-    Tensor gdY = dY.to(Device::CUDA);
+    Tensor gdY = dY.to(gpu_device());
     Tensor gpu_dX;
     brotensor::upsample_bilinear_2x_backward(gdY, s.N, s.C, s.H, s.W, gpu_dX);
 
@@ -116,7 +116,7 @@ void run_down_avg_bwd(const Shape& s, uint64_t seed) {
     Tensor cpu_dX;
     brotensor::downsample_avg_2x_backward(dY, s.N, s.C, s.H, s.W, cpu_dX);
 
-    Tensor gdY = dY.to(Device::CUDA);
+    Tensor gdY = dY.to(gpu_device());
     Tensor gpu_dX;
     brotensor::downsample_avg_2x_backward(gdY, s.N, s.C, s.H, s.W, gpu_dX);
 

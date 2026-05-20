@@ -20,9 +20,9 @@ void test_relu(int n, uint64_t seed) {
     brotensor::relu_forward(x, y_cpu);
     brotensor::relu_backward(x, dY, dX_cpu);
 
-    Tensor gx = x.to(Device::CUDA), gdY = dY.to(Device::CUDA);
-    Tensor gy = Tensor::zeros_on(Device::CUDA, n, 1);
-    Tensor gdX = Tensor::zeros_on(Device::CUDA, n, 1);
+    Tensor gx = x.to(gpu_device()), gdY = dY.to(gpu_device());
+    Tensor gy = Tensor::zeros_on(gpu_device(), n, 1);
+    Tensor gdX = Tensor::zeros_on(gpu_device(), n, 1);
     brotensor::relu_forward(gx, gy);
     brotensor::relu_backward(gx, gdY, gdX);
 
@@ -40,9 +40,9 @@ void test_tanh(int n, uint64_t seed) {
     brotensor::tanh_forward(x, y_cpu);
     brotensor::tanh_backward(y_cpu, dY, dX_cpu);
 
-    Tensor gx = x.to(Device::CUDA), gdY = dY.to(Device::CUDA);
-    Tensor gy = Tensor::zeros_on(Device::CUDA, n, 1);
-    Tensor gdX = Tensor::zeros_on(Device::CUDA, n, 1);
+    Tensor gx = x.to(gpu_device()), gdY = dY.to(gpu_device());
+    Tensor gy = Tensor::zeros_on(gpu_device(), n, 1);
+    Tensor gdX = Tensor::zeros_on(gpu_device(), n, 1);
     brotensor::tanh_forward(gx, gy);
     Tensor y_gpu = download_to_host(gy);
     brotensor::tanh_backward(gy, gdY, gdX);
@@ -61,9 +61,9 @@ void test_sigmoid(int n, uint64_t seed) {
     brotensor::sigmoid_forward(x, y_cpu);
     brotensor::sigmoid_backward(y_cpu, dY, dX_cpu);
 
-    Tensor gx = x.to(Device::CUDA), gdY = dY.to(Device::CUDA);
-    Tensor gy = Tensor::zeros_on(Device::CUDA, n, 1);
-    Tensor gdX = Tensor::zeros_on(Device::CUDA, n, 1);
+    Tensor gx = x.to(gpu_device()), gdY = dY.to(gpu_device());
+    Tensor gy = Tensor::zeros_on(gpu_device(), n, 1);
+    Tensor gdX = Tensor::zeros_on(gpu_device(), n, 1);
     brotensor::sigmoid_forward(gx, gy);
     Tensor y_gpu = download_to_host(gy);
     brotensor::sigmoid_backward(gy, gdY, gdX);
@@ -81,7 +81,7 @@ void test_add_inplace(int n, uint64_t seed) {
     Tensor y_cpu = y;
     brotensor::add_inplace(y_cpu, x);
 
-    Tensor gy = y.to(Device::CUDA), gx = x.to(Device::CUDA);
+    Tensor gy = y.to(gpu_device()), gx = x.to(gpu_device());
     brotensor::add_inplace(gy, gx);
 
     compare_tensors(y_cpu, download_to_host(gy), "add_inplace");
@@ -96,7 +96,7 @@ void test_add_scalar_inplace(int n, uint64_t seed) {
     Tensor y_cpu = y;
     brotensor::add_scalar_inplace(y_cpu, s);
 
-    Tensor gy = y.to(Device::CUDA);
+    Tensor gy = y.to(gpu_device());
     brotensor::add_scalar_inplace(gy, s);
 
     compare_tensors(y_cpu, download_to_host(gy), "add_scalar_inplace");

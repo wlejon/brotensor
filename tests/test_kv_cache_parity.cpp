@@ -46,7 +46,7 @@ Tensor to_fp16_cuda(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_fp16_bits(cpu[i]);
-    return Tensor::from_host_fp16_on(Device::CUDA, h.data(),
+    return Tensor::from_host_fp16_on(gpu_device(), h.data(),
                                      cpu.rows, cpu.cols);
 }
 
@@ -79,8 +79,8 @@ void run_append(int L_max, int D, int len0, int len1, uint64_t seed) {
     brotensor::kv_cache_append(K1, V1, len0, cpu_Kc, cpu_Vc);
 
     // GPU: FP16 caches zero-initialised.
-    Tensor gpu_Kc = Tensor::zeros_on(Device::CUDA, L_max, D, Dtype::FP16);
-    Tensor gpu_Vc = Tensor::zeros_on(Device::CUDA, L_max, D, Dtype::FP16);
+    Tensor gpu_Kc = Tensor::zeros_on(gpu_device(), L_max, D, Dtype::FP16);
+    Tensor gpu_Vc = Tensor::zeros_on(gpu_device(), L_max, D, Dtype::FP16);
     Tensor gK0 = to_fp16_cuda(K0), gV0 = to_fp16_cuda(V0);
     Tensor gK1 = to_fp16_cuda(K1), gV1 = to_fp16_cuda(V1);
     brotensor::kv_cache_append(gK0, gV0, 0,    gpu_Kc, gpu_Vc);

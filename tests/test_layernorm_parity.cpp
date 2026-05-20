@@ -42,15 +42,15 @@ void run_layernorm(int n, uint64_t seed) {
         dY, xhat_cpu, gamma, rstd_cpu, dX_cpu, dGamma_cpu, dBeta_cpu);
 
     // GPU path — the same ops on CUDA-resident tensors.
-    Tensor gx = x.to(Device::CUDA);
-    Tensor ggamma = gamma.to(Device::CUDA);
-    Tensor gbeta = beta.to(Device::CUDA);
-    Tensor gdY = dY.to(Device::CUDA);
-    Tensor gy = Tensor::zeros_on(Device::CUDA, n, 1);
-    Tensor gxhat = Tensor::zeros_on(Device::CUDA, n, 1);
-    Tensor gdX = Tensor::zeros_on(Device::CUDA, n, 1);
-    Tensor gdGamma = dGamma_init.to(Device::CUDA);
-    Tensor gdBeta = dBeta_init.to(Device::CUDA);
+    Tensor gx = x.to(gpu_device());
+    Tensor ggamma = gamma.to(gpu_device());
+    Tensor gbeta = beta.to(gpu_device());
+    Tensor gdY = dY.to(gpu_device());
+    Tensor gy = Tensor::zeros_on(gpu_device(), n, 1);
+    Tensor gxhat = Tensor::zeros_on(gpu_device(), n, 1);
+    Tensor gdX = Tensor::zeros_on(gpu_device(), n, 1);
+    Tensor gdGamma = dGamma_init.to(gpu_device());
+    Tensor gdBeta = dBeta_init.to(gpu_device());
     float mean_gpu = 0.0f, rstd_gpu = 0.0f;
     brotensor::layernorm_forward(
         gx, ggamma, gbeta, gy, gxhat, mean_gpu, rstd_gpu, 1e-5f);

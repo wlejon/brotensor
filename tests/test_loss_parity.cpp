@@ -29,9 +29,9 @@ void run_mse(int n, uint64_t seed) {
     }
     loss_cpu /= static_cast<float>(n);
 
-    Tensor gpred = pred.to(Device::CUDA);
-    Tensor gtarget = target.to(Device::CUDA);
-    Tensor gdPred = Tensor::zeros_on(Device::CUDA, n, 1);
+    Tensor gpred = pred.to(gpu_device());
+    Tensor gtarget = target.to(gpu_device());
+    Tensor gdPred = Tensor::zeros_on(gpu_device(), n, 1);
 
     const float loss_gpu = brotensor::mse_vec_forward(gpred, gtarget);
     brotensor::mse_vec_backward(gpred, gtarget, gdPred);
@@ -65,10 +65,10 @@ void run_xent(int n, uint64_t seed, const std::vector<float>* mask) {
         probs_cpu.ptr(), dLogits_cpu.ptr(),
         n, mask ? mask->data() : nullptr);
 
-    Tensor glogits = logits.to(Device::CUDA);
-    Tensor gtarget = target.to(Device::CUDA);
-    Tensor gprobs = Tensor::zeros_on(Device::CUDA, n, 1);
-    Tensor gdLogits = Tensor::zeros_on(Device::CUDA, n, 1);
+    Tensor glogits = logits.to(gpu_device());
+    Tensor gtarget = target.to(gpu_device());
+    Tensor gprobs = Tensor::zeros_on(gpu_device(), n, 1);
+    Tensor gdLogits = Tensor::zeros_on(gpu_device(), n, 1);
 
     Tensor d_mask_buf = upload_mask(mask);
     const float* d_mask = static_cast<const float*>(d_mask_buf.data);

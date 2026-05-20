@@ -52,7 +52,7 @@ Tensor to_fp16_cuda(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_fp16_bits(cpu[i]);
-    return Tensor::from_host_fp16_on(Device::CUDA, h.data(),
+    return Tensor::from_host_fp16_on(gpu_device(), h.data(),
                                      cpu.rows, cpu.cols);
 }
 
@@ -138,7 +138,7 @@ void run_timestep(int N, int dim, float max_period, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::timestep_embedding(ts, dim, max_period, cpu_Y);
 
-    Tensor gts = ts.to(Device::CUDA);
+    Tensor gts = ts.to(gpu_device());
     Tensor gpu_Y;
     brotensor::timestep_embedding(gts, dim, max_period, gpu_Y);
 

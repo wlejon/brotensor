@@ -271,8 +271,8 @@ float mse_vec_forward(const Tensor& pred, const Tensor& target) {
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(LOSS_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        // `cmd` is the shared batched buffer — flush() commits + drains it.
+        metal_impl::flush();
         return sptr[0] / static_cast<float>(n);
     }
 }
@@ -307,8 +307,8 @@ void mse_vec_backward(const Tensor& pred, const Tensor& target,
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        // `cmd` is the shared batched buffer — flush() commits + drains it.
+        metal_impl::flush();
     }
 }
 
@@ -358,8 +358,8 @@ float softmax_xent_fused(const Tensor& logits, const Tensor& target,
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(LOSS_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        // `cmd` is the shared batched buffer — flush() commits + drains it.
+        metal_impl::flush();
         return sptr[0];
     }
 }
@@ -396,8 +396,8 @@ void mse_vec_per_sample(const Tensor& pred, const Tensor& target,
         [enc dispatchThreads:MTLSizeMake(B, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        // `cmd` is the shared batched buffer — flush() commits + drains it.
+        metal_impl::flush();
     }
 }
 
@@ -460,8 +460,8 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, B, 1)
             threadsPerThreadgroup:MTLSizeMake(LOSS_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        // `cmd` is the shared batched buffer — flush() commits + drains it.
+        metal_impl::flush();
     }
 }
 

@@ -22,10 +22,10 @@ void run_softmax(int n, uint64_t seed, const std::vector<float>* mask) {
     brotensor::softmax_backward(probs_cpu, dProbs, dLogits_cpu);
 
     // GPU.
-    Tensor glogits = logits.to(Device::CUDA);
-    Tensor gdProbs = dProbs.to(Device::CUDA);
-    Tensor gprobs = Tensor::zeros_on(Device::CUDA, n, 1);
-    Tensor gdLogits = Tensor::zeros_on(Device::CUDA, n, 1);
+    Tensor glogits = logits.to(gpu_device());
+    Tensor gdProbs = dProbs.to(gpu_device());
+    Tensor gprobs = Tensor::zeros_on(gpu_device(), n, 1);
+    Tensor gdLogits = Tensor::zeros_on(gpu_device(), n, 1);
 
     Tensor d_mask_buf = upload_mask(mask);
     const float* d_mask = static_cast<const float*>(d_mask_buf.data);

@@ -19,9 +19,9 @@ static void run_linear_forward(int in_dim, int out_dim, uint64_t seed) {
     Tensor y_cpu = Tensor::vec(out_dim);
     brotensor::linear_forward(W, b, x, y_cpu);
 
-    Tensor gW = W.to(Device::CUDA), gb = b.to(Device::CUDA),
-           gx = x.to(Device::CUDA);
-    Tensor gy = Tensor::zeros_on(Device::CUDA, out_dim, 1);
+    Tensor gW = W.to(gpu_device()), gb = b.to(gpu_device()),
+           gx = x.to(gpu_device());
+    Tensor gy = Tensor::zeros_on(gpu_device(), out_dim, 1);
     brotensor::linear_forward(gW, gb, gx, gy);
     Tensor y_gpu = download_to_host(gy);
 
@@ -52,11 +52,11 @@ static void run_linear_backward(int in_dim, int out_dim, uint64_t seed) {
     brotensor::linear_backward(W, x, dY, dX_cpu, dW_cpu, dB_cpu);
 
     // GPU path with the same starting accumulators.
-    Tensor gW = W.to(Device::CUDA), gx = x.to(Device::CUDA),
-           gdY = dY.to(Device::CUDA);
-    Tensor gdX = Tensor::zeros_on(Device::CUDA, in_dim, 1);
-    Tensor gdW = dW_init.to(Device::CUDA);
-    Tensor gdB = dB_init.to(Device::CUDA);
+    Tensor gW = W.to(gpu_device()), gx = x.to(gpu_device()),
+           gdY = dY.to(gpu_device());
+    Tensor gdX = Tensor::zeros_on(gpu_device(), in_dim, 1);
+    Tensor gdW = dW_init.to(gpu_device());
+    Tensor gdB = dB_init.to(gpu_device());
     brotensor::linear_backward(gW, gx, gdY, gdX, gdW, gdB);
 
     Tensor dX_gpu = download_to_host(gdX);

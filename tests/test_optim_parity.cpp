@@ -31,9 +31,9 @@ void run_sgd(int n, uint64_t seed, float lr, float momentum) {
     Tensor vel_cpu   = vel;
     cpu_sgd_step(param_cpu, vel_cpu, grad, lr, momentum);
 
-    Tensor gparam = param.to(Device::CUDA);
-    Tensor ggrad = grad.to(Device::CUDA);
-    Tensor gvel = vel.to(Device::CUDA);
+    Tensor gparam = param.to(gpu_device());
+    Tensor ggrad = grad.to(gpu_device());
+    Tensor gvel = vel.to(gpu_device());
     brotensor::sgd_step(gparam, ggrad, gvel, lr, momentum);
 
     compare_tensors(param_cpu, download_to_host(gparam), "sgd.param");

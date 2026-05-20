@@ -53,7 +53,7 @@ Tensor to_fp16_cuda(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_fp16_bits(cpu[i]);
-    return Tensor::from_host_fp16_on(Device::CUDA, h.data(), cpu.rows, cpu.cols);
+    return Tensor::from_host_fp16_on(gpu_device(), h.data(), cpu.rows, cpu.cols);
 }
 
 Tensor fp16_cuda_to_cpu(const Tensor& g) {
@@ -196,7 +196,7 @@ void run_backward(int N, int C_in, int C_out, int H, int W, int num_groups,
     const Tensor* gWsk_p  = need_skip ? &gWsk : nullptr;
     const Tensor* gbsk_p  = need_skip ? &gbsk : nullptr;
 
-    Tensor gdX  = Tensor::empty_on(Device::CUDA, N, C_in * spatial, Dtype::FP16);
+    Tensor gdX  = Tensor::empty_on(gpu_device(), N, C_in * spatial, Dtype::FP16);
     Tensor gdG1 = to_fp16_cuda(dG1_i), gdB1 = to_fp16_cuda(dB1_i);
     Tensor gdW1 = to_fp16_cuda(dW1_i), gdb1 = to_fp16_cuda(db1_i);
     Tensor gdG2 = to_fp16_cuda(dG2_i), gdB2 = to_fp16_cuda(dB2_i);

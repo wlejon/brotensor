@@ -24,6 +24,10 @@ using brotensor::Tensor;
 
 static int g_failures = 0;
 
+// GPU backend this binary was built against (CUDA preferred, else Metal).
+// Assigned in main() after brotensor::init(); Device::CPU == no GPU backend.
+static Device g_gpu = Device::CPU;
+
 static bool near_(float a, float b, float abs_eps, float rel_eps) {
     const float d = std::fabs(a - b);
     if (d <= abs_eps) return true;
@@ -93,12 +97,12 @@ static void parity_linear() {
     brotensor::linear_forward(W, b, x, yCpu);
 
     // GPU forward — CUDA-resident copies of the same data.
-    Tensor Wg = W.to(Device::CUDA);
-    Tensor bg = b.to(Device::CUDA);
-    Tensor xg = x.to(Device::CUDA);
-    Tensor yg = Tensor::empty_on(Device::CUDA, OUT, 1);
+    Tensor Wg = W.to(g_gpu);
+    Tensor bg = b.to(g_gpu);
+    Tensor xg = x.to(g_gpu);
+    Tensor yg = Tensor::empty_on(g_gpu, OUT, 1);
     brotensor::linear_forward(Wg, bg, xg, yg);
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(g_gpu);
 
     compare("linear_forward", yCpu.to_host_vector(), yg.to_host_vector(),
             1e-5f, 1e-5f);
@@ -112,12 +116,12 @@ static void parity_linear() {
     Tensor dBCpu = Tensor::zeros_on(Device::CPU, OUT, 1);
     brotensor::linear_backward(W, x, dY, dXCpu, dWCpu, dBCpu);
 
-    Tensor dYg = dY.to(Device::CUDA);
-    Tensor dXg = Tensor::empty_on(Device::CUDA, IN, 1);
-    Tensor dWg = Tensor::zeros_on(Device::CUDA, OUT, IN);
-    Tensor dBg = Tensor::zeros_on(Device::CUDA, OUT, 1);
+    Tensor dYg = dY.to(g_gpu);
+    Tensor dXg = Tensor::empty_on(g_gpu, IN, 1);
+    Tensor dWg = Tensor::zeros_on(g_gpu, OUT, IN);
+    Tensor dBg = Tensor::zeros_on(g_gpu, OUT, 1);
     brotensor::linear_backward(Wg, xg, dYg, dXg, dWg, dBg);
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(g_gpu);
 
     compare("linear_backward/dX", dXCpu.to_host_vector(), dXg.to_host_vector(),
             1e-4f, 1e-5f);
@@ -139,8 +143,8 @@ static void parity_elementwise_act() {
     fill_random(x,  rng, -3.0f, 3.0f);
     fill_random(dY, rng, -1.0f, 1.0f);
 
-    Tensor xg  = x.to(Device::CUDA);
-    Tensor dYg = dY.to(Device::CUDA);
+    Tensor xg  = x.to(g_gpu);
+    Tensor dYg = dY.to(g_gpu);
 
     // ReLU
     {
@@ -149,11 +153,11 @@ static void parity_elementwise_act() {
         brotensor::relu_forward(x, yCpu);
         brotensor::relu_backward(x, dY, dXCpu);
 
-        Tensor yg = Tensor::empty_on(Device::CUDA, N, 1);
-        Tensor dXg = Tensor::empty_on(Device::CUDA, N, 1);
+        Tensor yg = Tensor::empty_on(g_gpu, N, 1);
+        Tensor dXg = Tensor::empty_on(g_gpu, N, 1);
         brotensor::relu_forward(xg, yg);
         brotensor::relu_backward(xg, dYg, dXg);
-        brotensor::sync(Device::CUDA);
+        brotensor::sync(g_gpu);
         compare("relu_forward",  yCpu.to_host_vector(),  yg.to_host_vector(),  1e-6f, 1e-6f);
         compare("relu_backward", dXCpu.to_host_vector(), dXg.to_host_vector(), 1e-6f, 1e-6f);
     }
@@ -165,11 +169,11 @@ static void parity_elementwise_act() {
         brotensor::tanh_forward(x, yCpu);
         brotensor::tanh_backward(yCpu, dY, dXCpu);
 
-        Tensor yg = Tensor::empty_on(Device::CUDA, N, 1);
-        Tensor dXg = Tensor::empty_on(Device::CUDA, N, 1);
+        Tensor yg = Tensor::empty_on(g_gpu, N, 1);
+        Tensor dXg = Tensor::empty_on(g_gpu, N, 1);
         brotensor::tanh_forward(xg, yg);
         brotensor::tanh_backward(yg, dYg, dXg);
-        brotensor::sync(Device::CUDA);
+        brotensor::sync(g_gpu);
         compare("tanh_forward",  yCpu.to_host_vector(),  yg.to_host_vector(),  1e-5f, 1e-5f);
         compare("tanh_backward", dXCpu.to_host_vector(), dXg.to_host_vector(), 1e-4f, 1e-5f);
     }
@@ -181,11 +185,11 @@ static void parity_elementwise_act() {
         brotensor::sigmoid_forward(x, yCpu);
         brotensor::sigmoid_backward(yCpu, dY, dXCpu);
 
-        Tensor yg = Tensor::empty_on(Device::CUDA, N, 1);
-        Tensor dXg = Tensor::empty_on(Device::CUDA, N, 1);
+        Tensor yg = Tensor::empty_on(g_gpu, N, 1);
+        Tensor dXg = Tensor::empty_on(g_gpu, N, 1);
         brotensor::sigmoid_forward(xg, yg);
         brotensor::sigmoid_backward(yg, dYg, dXg);
-        brotensor::sync(Device::CUDA);
+        brotensor::sync(g_gpu);
         compare("sigmoid_forward",  yCpu.to_host_vector(),  yg.to_host_vector(),  1e-5f, 1e-5f);
         compare("sigmoid_backward", dXCpu.to_host_vector(), dXg.to_host_vector(), 1e-4f, 1e-5f);
     }
@@ -200,16 +204,16 @@ static void parity_softmax() {
 
     Tensor lg = Tensor::zeros_on(Device::CPU, N, 1);
     fill_random(lg, rng, -2.0f, 2.0f);
-    Tensor lgg = lg.to(Device::CUDA);
+    Tensor lgg = lg.to(g_gpu);
 
     // Unmasked forward + backward.
     {
         Tensor pCpu = Tensor::zeros_on(Device::CPU, N, 1);
         brotensor::softmax_forward(lg, pCpu);
 
-        Tensor pg = Tensor::empty_on(Device::CUDA, N, 1);
+        Tensor pg = Tensor::empty_on(g_gpu, N, 1);
         brotensor::softmax_forward(lgg, pg, nullptr);
-        brotensor::sync(Device::CUDA);
+        brotensor::sync(g_gpu);
         compare("softmax_forward(unmasked)", pCpu.to_host_vector(), pg.to_host_vector(),
                 1e-5f, 1e-5f);
 
@@ -218,10 +222,10 @@ static void parity_softmax() {
         Tensor dZCpu = Tensor::zeros_on(Device::CPU, N, 1);
         brotensor::softmax_backward(pCpu, dP, dZCpu);
 
-        Tensor dPg = dP.to(Device::CUDA);
-        Tensor dZg = Tensor::empty_on(Device::CUDA, N, 1);
+        Tensor dPg = dP.to(g_gpu);
+        Tensor dZg = Tensor::empty_on(g_gpu, N, 1);
         brotensor::softmax_backward(pg, dPg, dZg);
-        brotensor::sync(Device::CUDA);
+        brotensor::sync(g_gpu);
         compare("softmax_backward", dZCpu.to_host_vector(), dZg.to_host_vector(),
                 1e-4f, 1e-5f);
     }
@@ -242,11 +246,11 @@ static void parity_softmax() {
         brotensor::softmax_forward(lg, pCpu, mask.data());
 
         // GPU op: the mask must be a CUDA-resident buffer too.
-        Tensor maskg = Tensor::from_host_on(Device::CUDA, mask.data(), N, 1);
-        Tensor pg = Tensor::empty_on(Device::CUDA, N, 1);
+        Tensor maskg = Tensor::from_host_on(g_gpu, mask.data(), N, 1);
+        Tensor pg = Tensor::empty_on(g_gpu, N, 1);
         brotensor::softmax_forward(lgg, pg,
                                    static_cast<const float*>(maskg.data));
-        brotensor::sync(Device::CUDA);
+        brotensor::sync(g_gpu);
         compare("softmax_forward(masked)", pCpu.to_host_vector(), pg.to_host_vector(),
                 1e-5f, 1e-5f);
     }
@@ -267,10 +271,10 @@ static void parity_add() {
     Tensor yCpu = y.clone();
     brotensor::add_inplace(yCpu, x);
 
-    Tensor yg = y.to(Device::CUDA);
-    Tensor xg = x.to(Device::CUDA);
+    Tensor yg = y.to(g_gpu);
+    Tensor xg = x.to(g_gpu);
     brotensor::add_inplace(yg, xg);
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(g_gpu);
     compare("add_inplace", yCpu.to_host_vector(), yg.to_host_vector(), 1e-6f, 1e-6f);
 
     // Scalar.
@@ -280,9 +284,9 @@ static void parity_add() {
     const float s = 0.375f;
     brotensor::add_scalar_inplace(zCpu, s);
 
-    Tensor zg = z.to(Device::CUDA);
+    Tensor zg = z.to(g_gpu);
     brotensor::add_scalar_inplace(zg, s);
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(g_gpu);
     compare("add_scalar_inplace", zCpu.to_host_vector(), zg.to_host_vector(), 1e-6f, 1e-6f);
 }
 
@@ -301,8 +305,10 @@ static void parity_add() {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping\n");
+    if (brotensor::is_available(Device::CUDA))       g_gpu = Device::CUDA;
+    else if (brotensor::is_available(Device::Metal)) g_gpu = Device::Metal;
+    if (g_gpu == Device::CPU) {
+        std::printf("no GPU backend available - skipping\n");
         return 0;
     }
     std::printf("test_cpu_gpu_parity\n");

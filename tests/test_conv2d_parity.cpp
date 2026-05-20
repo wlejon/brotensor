@@ -55,11 +55,11 @@ void run_fwd(const ConvCfg& c, bool has_bias, uint64_t seed) {
                               c.pad_h, c.pad_w, c.dil_h, c.dil_w, c.groups,
                               cpu_Y);
 
-    Tensor gX = X.to(Device::CUDA);
-    Tensor gW = Wt.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
+    Tensor gW = Wt.to(gpu_device());
     Tensor gB;
     Tensor* gBp = nullptr;
-    if (has_bias) { gB = B.to(Device::CUDA); gBp = &gB; }
+    if (has_bias) { gB = B.to(gpu_device()); gBp = &gB; }
     Tensor gpu_Y;
     brotensor::conv2d_forward(gX, gW, gBp, c.N, c.C_in, c.H, c.W, c.C_out,
                               c.kH, c.kW, c.stride_h, c.stride_w,
@@ -86,8 +86,8 @@ void run_bwd_input(const ConvCfg& c, uint64_t seed) {
                                      c.pad_h, c.pad_w, c.dil_h, c.dil_w,
                                      c.groups, cpu_dX);
 
-    Tensor gW = Wt.to(Device::CUDA);
-    Tensor gdY = dY.to(Device::CUDA);
+    Tensor gW = Wt.to(gpu_device());
+    Tensor gdY = dY.to(gpu_device());
     Tensor gpu_dX;
     brotensor::conv2d_backward_input(gW, gdY, c.N, c.C_in, c.H, c.W, c.C_out,
                                      c.kH, c.kW, c.stride_h, c.stride_w,
@@ -117,9 +117,9 @@ void run_bwd_weight(const ConvCfg& c, uint64_t seed) {
                                       c.pad_h, c.pad_w, c.dil_h, c.dil_w,
                                       c.groups, cpu_dW);
 
-    Tensor gX = X.to(Device::CUDA);
-    Tensor gdY = dY.to(Device::CUDA);
-    Tensor gpu_dW = dW0.to(Device::CUDA);   // same baseline on GPU
+    Tensor gX = X.to(gpu_device());
+    Tensor gdY = dY.to(gpu_device());
+    Tensor gpu_dW = dW0.to(gpu_device());   // same baseline on GPU
     brotensor::conv2d_backward_weight(gX, gdY, c.N, c.C_in, c.H, c.W, c.C_out,
                                       c.kH, c.kW, c.stride_h, c.stride_w,
                                       c.pad_h, c.pad_w, c.dil_h, c.dil_w,
@@ -140,8 +140,8 @@ void run_bwd_bias(int N, int C_out, int H_out, int W_out, uint64_t seed) {
     Tensor cpu_dB = dB0;           // deep copy
     brotensor::conv2d_backward_bias(dY, N, C_out, H_out, W_out, cpu_dB);
 
-    Tensor gdY = dY.to(Device::CUDA);
-    Tensor gpu_dB = dB0.to(Device::CUDA);   // same baseline on GPU
+    Tensor gdY = dY.to(gpu_device());
+    Tensor gpu_dB = dB0.to(gpu_device());   // same baseline on GPU
     brotensor::conv2d_backward_bias(gdY, N, C_out, H_out, W_out, gpu_dB);
 
     compare_tensors(cpu_dB, download_to_host(gpu_dB), "conv2d_bwd_dB",

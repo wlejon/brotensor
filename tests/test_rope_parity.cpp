@@ -23,7 +23,7 @@ void run_fwd(int L, int num_heads, int head_dim, int seq_offset,
     Tensor cpu_Y;
     brotensor::rope_forward(X, head_dim, num_heads, seq_offset, theta_base, cpu_Y);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gpu_Y;
     brotensor::rope_forward(gX, head_dim, num_heads, seq_offset, theta_base, gpu_Y);
 
@@ -39,7 +39,7 @@ void run_bwd(int L, int num_heads, int head_dim, int seq_offset,
     Tensor cpu_dX;
     brotensor::rope_backward(dY, head_dim, num_heads, seq_offset, theta_base, cpu_dX);
 
-    Tensor gdY = dY.to(Device::CUDA);
+    Tensor gdY = dY.to(gpu_device());
     Tensor gpu_dX;
     brotensor::rope_backward(gdY, head_dim, num_heads, seq_offset, theta_base, gpu_dX);
 

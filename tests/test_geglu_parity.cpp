@@ -23,7 +23,7 @@ void run_fwd(Fwd fwd, const char* tag, int B, int D, uint64_t seed) {
     Tensor cpu_Y;
     fwd(X, cpu_Y);
 
-    Tensor gX = X.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
     Tensor gpu_Y;
     fwd(gX, gpu_Y);
 
@@ -41,8 +41,8 @@ void run_bwd(Bwd bwd, const char* tag, int B, int D, uint64_t seed) {
     Tensor cpu_dX;
     bwd(X, dY, cpu_dX);
 
-    Tensor gX  = X.to(Device::CUDA);
-    Tensor gdY = dY.to(Device::CUDA);
+    Tensor gX  = X.to(gpu_device());
+    Tensor gdY = dY.to(gpu_device());
     Tensor gpu_dX;
     bwd(gX, gdY, gpu_dX);
 

@@ -36,7 +36,7 @@ void run_concat(const std::vector<int>& sizes, uint64_t seed) {
     std::vector<Tensor> g_parts(sizes.size());
     std::vector<const Tensor*> g_parts_ptr;
     for (size_t i = 0; i < sizes.size(); ++i) {
-        g_parts[i] = parts_cpu[i].to(Device::CUDA);
+        g_parts[i] = parts_cpu[i].to(gpu_device());
         g_parts_ptr.push_back(&g_parts[i]);
     }
     Tensor gcat;
@@ -51,7 +51,7 @@ void run_concat(const std::vector<int>& sizes, uint64_t seed) {
     std::vector<Tensor> g_split(sizes.size());
     std::vector<Tensor*> g_split_ptr;
     for (size_t i = 0; i < sizes.size(); ++i) {
-        g_split[i] = Tensor::zeros_on(Device::CUDA, sizes[i], 1);
+        g_split[i] = Tensor::zeros_on(gpu_device(), sizes[i], 1);
         g_split_ptr.push_back(&g_split[i]);
     }
     brotensor::split_rows(gcat, g_split_ptr);

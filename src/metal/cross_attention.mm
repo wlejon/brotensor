@@ -840,7 +840,15 @@ void cross_attention_forward(const Tensor& X,
     if (Ctx.dtype != Dtype::FP32) {
         throw std::runtime_error("cross_attention_forward_gpu: Ctx dtype must match X dtype");
     }
-    Tensor Qh, Kh, Vh, Attnh, Yconcat;
+    // Scratch caches must live on the GPU: a default-constructed Tensor is
+    // CPU-resident, and resize() preserves device, so buffer_for() would
+    // return nil and the kernels would read/write nothing. Match the CUDA
+    // backend, which allocates these on-device up front.
+    Tensor Qh      = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
+    Tensor Kh      = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
+    Tensor Vh      = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
+    Tensor Attnh   = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
+    Tensor Yconcat = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
     cross_attention_forward_train_core(X, Ctx, Wq, Wk, Wv, Wo, d_mask,
                                        num_heads, Qh, Kh, Vh, Attnh,
                                        Yconcat, O);
@@ -859,7 +867,15 @@ void self_attention_forward(const Tensor& X,
                                          d_mask, num_heads, /*causal=*/false, O);
         return;
     }
-    Tensor Qh, Kh, Vh, Attnh, Yconcat;
+    // Scratch caches must live on the GPU: a default-constructed Tensor is
+    // CPU-resident, and resize() preserves device, so buffer_for() would
+    // return nil and the kernels would read/write nothing. Match the CUDA
+    // backend, which allocates these on-device up front.
+    Tensor Qh      = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
+    Tensor Kh      = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
+    Tensor Vh      = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
+    Tensor Attnh   = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
+    Tensor Yconcat = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
     mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
                     Qh, Kh, Vh, Attnh, Yconcat, O);
 }

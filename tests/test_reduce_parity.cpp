@@ -57,18 +57,18 @@ void run_pool(int K, int D, uint64_t seed, const std::vector<float>& mask) {
     masked_mean_pool_cpu(X, mask, y_cpu);
     masked_mean_pool_backward_cpu(dY, mask, dX_cpu);
 
-    Tensor gX = X.to(Device::CUDA);
-    Tensor gdY = dY.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
+    Tensor gdY = dY.to(gpu_device());
 
     Tensor d_mask_buf = upload_mask(&mask);
     const float* d_mask = static_cast<const float*>(d_mask_buf.data);
 
-    Tensor gy = Tensor::zeros_on(Device::CUDA, D, 1);
+    Tensor gy = Tensor::zeros_on(gpu_device(), D, 1);
 
     // Pre-fill dX with garbage to confirm overwrite semantics.
     Tensor dX_garbage = Tensor::mat(K, D);
     fill_random(dX_garbage, rng);
-    Tensor gdX = dX_garbage.to(Device::CUDA);
+    Tensor gdX = dX_garbage.to(gpu_device());
 
     brotensor::masked_mean_pool_forward(gX, d_mask, gy);
     brotensor::masked_mean_pool_backward(gdY, d_mask, K, gdX);

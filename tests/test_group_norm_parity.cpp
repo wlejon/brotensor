@@ -44,9 +44,9 @@ void run_fwd(const GnCfg& c, uint64_t seed) {
     brotensor::group_norm_forward(X, gamma, beta, c.N, c.C, c.H, c.W,
                                   c.num_groups, kEps, cpu_Y);
 
-    Tensor gX = X.to(Device::CUDA);
-    Tensor gG = gamma.to(Device::CUDA);
-    Tensor gB = beta.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
+    Tensor gG = gamma.to(gpu_device());
+    Tensor gB = beta.to(gpu_device());
     Tensor gpu_Y;
     brotensor::group_norm_forward(gX, gG, gB, c.N, c.C, c.H, c.W,
                                   c.num_groups, kEps, gpu_Y);
@@ -77,12 +77,12 @@ void run_bwd(const GnCfg& c, uint64_t seed) {
                                    c.num_groups, kEps,
                                    cpu_dX, cpu_dG, cpu_dB);
 
-    Tensor gX = X.to(Device::CUDA);
-    Tensor gG = gamma.to(Device::CUDA);
-    Tensor gdY = dY.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
+    Tensor gG = gamma.to(gpu_device());
+    Tensor gdY = dY.to(gpu_device());
     Tensor gpu_dX;
-    Tensor gpu_dG = dG0.to(Device::CUDA);   // same baseline on GPU
-    Tensor gpu_dB = dB0.to(Device::CUDA);
+    Tensor gpu_dG = dG0.to(gpu_device());   // same baseline on GPU
+    Tensor gpu_dB = dB0.to(gpu_device());
     brotensor::group_norm_backward(gX, gG, gdY, c.N, c.C, c.H, c.W,
                                    c.num_groups, kEps,
                                    gpu_dX, gpu_dG, gpu_dB);

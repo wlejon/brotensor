@@ -22,6 +22,25 @@ namespace bt_parity {
 
 using brotensor::Tensor;
 
+// ─── GPU backend selection ─────────────────────────────────────────────────
+//
+// The parity suite is backend-neutral: it runs the same device-neutral op on
+// the CPU and on whichever GPU backend this binary was built with. Prefer
+// CUDA when present, else Metal. Returns Device::CPU as a sentinel meaning
+// "no GPU backend" — run_all() checks this up front and skips the suite.
+//
+// First call must happen after brotensor::init() (run_all guarantees this);
+// the result is cached.
+inline brotensor::Device gpu_device() {
+    using brotensor::Device;
+    static const Device d = [] {
+        if (brotensor::is_available(Device::CUDA))  return Device::CUDA;
+        if (brotensor::is_available(Device::Metal)) return Device::Metal;
+        return Device::CPU;
+    }();
+    return d;
+}
+
 // ─── Test registry ─────────────────────────────────────────────────────────
 
 struct TestEntry {
@@ -113,7 +132,7 @@ inline Tensor download_to_host(const Tensor& g) {
 
 // ─── Backend-neutral mask / index buffer helpers ──────────────────────────
 
-// Build a CUDA-resident float mask buffer from a host float mask vector. If
+// Build a GPU-resident float mask buffer from a host float mask vector. If
 // `mask` is null, returns a default-constructed (empty) Tensor whose `.data`
 // is null — matches the "no mask" sentinel used by the op APIs.
 inline Tensor upload_mask(const std::vector<float>* mask) {
@@ -121,18 +140,18 @@ inline Tensor upload_mask(const std::vector<float>* mask) {
     const int n = static_cast<int>(mask->size());
     Tensor h = Tensor::vec(n);
     for (int i = 0; i < n; ++i) h.ptr()[i] = (*mask)[i];
-    return h.to(brotensor::Device::CUDA);
+    return h.to(gpu_device());
 }
 
 // Same for an int32 index vector (embedding lookup tests). Returns a
-// CUDA-resident INT32 tensor.
+// GPU-resident INT32 tensor.
 inline Tensor upload_indices(const std::vector<int32_t>& idx) {
     const int n = static_cast<int>(idx.size());
     Tensor h = Tensor::zeros_on(brotensor::Device::CPU, n, 1,
                                 brotensor::Dtype::INT32);
     auto* p = static_cast<int32_t*>(h.host_raw_mut());
     for (int i = 0; i < n; ++i) p[i] = idx[i];
-    return h.to(brotensor::Device::CUDA);
+    return h.to(gpu_device());
 }
 
 // Same for an int offsets array (head_offsets in batched softmax-xent).
@@ -142,7 +161,7 @@ inline Tensor upload_offsets(const std::vector<int>& off) {
                                 brotensor::Dtype::INT32);
     auto* p = static_cast<int32_t*>(h.host_raw_mut());
     for (int i = 0; i < n; ++i) p[i] = static_cast<int32_t>(off[i]);
-    return h.to(brotensor::Device::CUDA);
+    return h.to(gpu_device());
 }
 
 // ─── Test runner ──────────────────────────────────────────────────────────
@@ -153,8 +172,8 @@ inline int run_all(const char* banner) {
     std::putchar('\n');
 
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping\n");
+    if (gpu_device() == brotensor::Device::CPU) {
+        std::printf("no GPU backend available - skipping\n");
         return 0;
     }
 

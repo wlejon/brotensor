@@ -275,8 +275,9 @@ void layernorm_forward(const Tensor& x,
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(LN_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        // `cmd` is the shared batched buffer; flush() commits it (after the
+        // prior batch) and drains the GPU so the scratch readback is valid.
+        metal_impl::flush();
         mean_out = sptr[0];
         rstd_out = sptr[1];
     }
@@ -330,8 +331,8 @@ void layernorm_backward(const Tensor& dY, const Tensor& xhat,
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(LN_BLOCK, 1, 1)];
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            // `cmd` is the shared batched buffer — flush() commits + drains it.
+            metal_impl::flush();
         }
     } else {
         @autoreleasepool {
@@ -373,8 +374,8 @@ void layernorm_backward(const Tensor& dY, const Tensor& xhat,
                 threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            // `cmd` is the shared batched buffer — flush() commits + drains it.
+            metal_impl::flush();
         }
     }
 }

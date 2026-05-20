@@ -56,7 +56,7 @@ Tensor to_fp16_cuda(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_fp16_bits(cpu[i]);
-    return Tensor::from_host_fp16_on(Device::CUDA, h.data(), cpu.rows, cpu.cols);
+    return Tensor::from_host_fp16_on(gpu_device(), h.data(), cpu.rows, cpu.cols);
 }
 
 // Download an FP16 CUDA tensor into a CPU FP32 tensor.
@@ -96,7 +96,7 @@ void run_flash_forward(int Lq, int Lk, int D, int num_heads, uint64_t seed,
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO;
@@ -156,7 +156,7 @@ void run_qkvo_forward(int Lq, int Lk, int D, int D_ctx, int num_heads,
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
     const Tensor* gCx_p = cross ? &gCx : nullptr;
@@ -240,7 +240,7 @@ void run_q_cached(int Lq, int Lk, int D, int num_heads, uint64_t seed,
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO;
@@ -275,16 +275,16 @@ void run_self_attention(int L, int D, int num_heads, uint64_t seed,
     // query rows), whereas the FP16 path takes the flash route that masks
     // keys only. The FP32-only CPU op delegates to mha_forward, so parity is
     // compared FP32<->FP32 — both backends then run the identical mha path.
-    Tensor gX = X.to(Device::CUDA);
-    Tensor gWq = Wq.to(Device::CUDA), gWk = Wk.to(Device::CUDA),
-           gWv = Wv.to(Device::CUDA), gWo = Wo.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
+    Tensor gWq = Wq.to(gpu_device()), gWk = Wk.to(gpu_device()),
+           gWv = Wv.to(gpu_device()), gWo = Wo.to(gpu_device());
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), L, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), L, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
-    Tensor gO;
+    Tensor gO = Tensor::zeros_on(gpu_device(), L, D);
     brotensor::self_attention_forward(gX, gWq, gWk, gWv, gWo, d_mask,
                                       num_heads, gO);
 
@@ -314,16 +314,16 @@ void run_flash_backward(int Lq, int Lk, int D, int num_heads, uint64_t seed,
     // GPU path.
     Tensor gQ = to_fp16_cuda(Q), gK = to_fp16_cuda(K), gV = to_fp16_cuda(V);
     Tensor gdO = to_fp16_cuda(dO);
-    Tensor gO_dummy = Tensor::empty_on(Device::CUDA, 0, 0, Dtype::FP16);
+    Tensor gO_dummy = Tensor::empty_on(gpu_device(), 0, 0, Dtype::FP16);
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
-    Tensor gdQ = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
-    Tensor gdK = Tensor::empty_on(Device::CUDA, Lk, D, Dtype::FP16);
-    Tensor gdV = Tensor::empty_on(Device::CUDA, Lk, D, Dtype::FP16);
+    Tensor gdQ = Tensor::empty_on(gpu_device(), Lq, D, Dtype::FP16);
+    Tensor gdK = Tensor::empty_on(gpu_device(), Lk, D, Dtype::FP16);
+    Tensor gdV = Tensor::empty_on(gpu_device(), Lk, D, Dtype::FP16);
     brotensor::flash_attention_backward(gQ, gK, gV, gO_dummy, gdO, d_mask,
                                         num_heads, causal, gdQ, gdK, gdV);
 
@@ -418,14 +418,14 @@ void run_qkvo_backward(int Lq, int Lk, int D, int D_ctx, int num_heads,
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
-    Tensor gdX = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
+    Tensor gdX = Tensor::empty_on(gpu_device(), Lq, D, Dtype::FP16);
     Tensor gdCtx;
     Tensor* gdCtx_p = nullptr;
     if (cross) {
-        gdCtx = Tensor::empty_on(Device::CUDA, Lk, D_ctx, Dtype::FP16);
+        gdCtx = Tensor::empty_on(gpu_device(), Lk, D_ctx, Dtype::FP16);
         gdCtx_p = &gdCtx;
     }
     Tensor gdWq = to_fp16_cuda(dWq_init);

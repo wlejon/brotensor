@@ -28,10 +28,10 @@ void run_adam(int n, uint64_t seed, float lr, float beta1, float beta2,
     Tensor m_cpu = m;
     Tensor v_cpu = v;
 
-    Tensor gparam = param.to(Device::CUDA);
-    Tensor ggrad = grad.to(Device::CUDA);
-    Tensor gm = m.to(Device::CUDA);
-    Tensor gv = v.to(Device::CUDA);
+    Tensor gparam = param.to(gpu_device());
+    Tensor ggrad = grad.to(gpu_device());
+    Tensor gm = m.to(gpu_device());
+    Tensor gv = v.to(gpu_device());
 
     // Run K steps with the same gradient each step (sufficient to surface
     // any bias-correction or moment-update mismatch).

@@ -51,7 +51,7 @@ Tensor to_fp16_cuda(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_fp16_bits(cpu[i]);
-    return Tensor::from_host_fp16_on(Device::CUDA, h.data(),
+    return Tensor::from_host_fp16_on(gpu_device(), h.data(),
                                      cpu.rows, cpu.cols);
 }
 
@@ -116,10 +116,10 @@ void run_cross_train(int Lq, int Lk, int D, int Dctx, int num_heads,
         dX_c, dCtx_c, dWq_c, dWk_c, dWv_c, dWo_c);
 
     // GPU path.
-    Tensor gX   = X.to(Device::CUDA);
-    Tensor gCtx = Ctx.to(Device::CUDA);
-    Tensor gWq  = Wq.to(Device::CUDA), gWk = Wk.to(Device::CUDA),
-           gWv  = Wv.to(Device::CUDA), gWo = Wo.to(Device::CUDA);
+    Tensor gX   = X.to(gpu_device());
+    Tensor gCtx = Ctx.to(gpu_device());
+    Tensor gWq  = Wq.to(gpu_device()), gWk = Wk.to(gpu_device()),
+           gWv  = Wv.to(gpu_device()), gWo = Wo.to(gpu_device());
 
     Tensor d_mask_buf = upload_mask(mask);
     const float* d_mask = static_cast<const float*>(d_mask_buf.data);
@@ -129,13 +129,13 @@ void run_cross_train(int Lq, int Lk, int D, int Dctx, int num_heads,
         gX, gCtx, gWq, gWk, gWv, gWo, d_mask, num_heads,
         gQh, gKh, gVh, gAttnh, gYconcat, gO);
 
-    Tensor gdO   = dO.to(Device::CUDA);
-    Tensor gdX   = Tensor::zeros_on(Device::CUDA, Lq, D);
-    Tensor gdCtx = Tensor::zeros_on(Device::CUDA, Lk, Dctx);
-    Tensor gdWq  = dWq_init.to(Device::CUDA);
-    Tensor gdWk  = dWk_init.to(Device::CUDA);
-    Tensor gdWv  = dWv_init.to(Device::CUDA);
-    Tensor gdWo  = dWo_init.to(Device::CUDA);
+    Tensor gdO   = dO.to(gpu_device());
+    Tensor gdX   = Tensor::zeros_on(gpu_device(), Lq, D);
+    Tensor gdCtx = Tensor::zeros_on(gpu_device(), Lk, Dctx);
+    Tensor gdWq  = dWq_init.to(gpu_device());
+    Tensor gdWk  = dWk_init.to(gpu_device());
+    Tensor gdWv  = dWv_init.to(gpu_device());
+    Tensor gdWo  = dWo_init.to(gpu_device());
     brotensor::cross_attention_backward(
         gdO, gX, gCtx, gQh, gKh, gVh, gAttnh, gYconcat,
         gWq, gWk, gWv, gWo, d_mask, num_heads,
@@ -183,7 +183,7 @@ void run_cross_forward(int Lq, int Lk, int D, int num_heads,
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO;
@@ -220,7 +220,7 @@ void run_cross_forward_with_attn(int Lq, int Lk, int D, int num_heads,
         bias_cpu = Tensor::mat(Lq, Lk);
         fill_random(bias_cpu, rng, 0.2f);
         bias_cpu_ptr = &bias_cpu;
-        bias_gpu = bias_cpu.to(Device::CUDA);
+        bias_gpu = bias_cpu.to(gpu_device());
         bias_gpu_ptr = &bias_gpu;
     }
 
@@ -239,7 +239,7 @@ void run_cross_forward_with_attn(int Lq, int Lk, int D, int num_heads,
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO, gAttnAvg;

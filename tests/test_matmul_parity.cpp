@@ -26,8 +26,8 @@ void run_matmul(int M, int K, int N, uint64_t seed) {
     Tensor cpu_C;
     brotensor::matmul(A, B, cpu_C);
 
-    Tensor gA = A.to(Device::CUDA);
-    Tensor gB = B.to(Device::CUDA);
+    Tensor gA = A.to(gpu_device());
+    Tensor gB = B.to(gpu_device());
     Tensor gpu_C;
     brotensor::matmul(gA, gB, gpu_C);
 
@@ -49,11 +49,11 @@ void run_matmul_bwd(int M, int K, int N, uint64_t seed) {
     Tensor cpu_dB = Tensor::mat(K, N);
     brotensor::matmul_backward(A, B, dC, cpu_dA, cpu_dB);
 
-    Tensor gA  = A.to(Device::CUDA);
-    Tensor gB  = B.to(Device::CUDA);
-    Tensor gdC = dC.to(Device::CUDA);
-    Tensor gpu_dA = Tensor::zeros_on(Device::CUDA, M, K);
-    Tensor gpu_dB = Tensor::zeros_on(Device::CUDA, K, N);
+    Tensor gA  = A.to(gpu_device());
+    Tensor gB  = B.to(gpu_device());
+    Tensor gdC = dC.to(gpu_device());
+    Tensor gpu_dA = Tensor::zeros_on(gpu_device(), M, K);
+    Tensor gpu_dB = Tensor::zeros_on(gpu_device(), K, N);
     brotensor::matmul_backward(gA, gB, gdC, gpu_dA, gpu_dB);
 
     compare_tensors(cpu_dA, download_to_host(gpu_dA), "matmul_bwd_dA", 1e-4f, 1e-3f);
@@ -79,11 +79,11 @@ void run_matmul_bwd_accum(int M, int K, int N, uint64_t seed) {
     Tensor cpu_dB = dB0;
     brotensor::matmul_backward(A, B, dC, cpu_dA, cpu_dB);
 
-    Tensor gA  = A.to(Device::CUDA);
-    Tensor gB  = B.to(Device::CUDA);
-    Tensor gdC = dC.to(Device::CUDA);
-    Tensor gpu_dA = dA0.to(Device::CUDA);  // same baseline on GPU
-    Tensor gpu_dB = dB0.to(Device::CUDA);
+    Tensor gA  = A.to(gpu_device());
+    Tensor gB  = B.to(gpu_device());
+    Tensor gdC = dC.to(gpu_device());
+    Tensor gpu_dA = dA0.to(gpu_device());  // same baseline on GPU
+    Tensor gpu_dB = dB0.to(gpu_device());
     brotensor::matmul_backward(gA, gB, gdC, gpu_dA, gpu_dB);
 
     compare_tensors(cpu_dA, download_to_host(gpu_dA), "matmul_bwd_accum_dA", 1e-4f, 1e-3f);

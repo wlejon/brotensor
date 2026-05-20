@@ -26,15 +26,15 @@ static void run_linear_batched(int B, int in_dim, int out_dim, uint64_t seed) {
     fill_random(X_BD, rng);
 
     // Reference: B sequential single-sample GPU calls into a (B, out_dim) buffer.
-    Tensor gW = W.to(Device::CUDA), gb = b.to(Device::CUDA),
-           gX_BD = X_BD.to(Device::CUDA);
+    Tensor gW = W.to(gpu_device()), gb = b.to(gpu_device()),
+           gX_BD = X_BD.to(gpu_device());
     Tensor Y_ref = Tensor::mat(B, out_dim);
     for (int i = 0; i < B; ++i) {
         Tensor xi = Tensor::vec(in_dim);
         for (int j = 0; j < in_dim; ++j)
             xi[j] = X_BD[static_cast<size_t>(i) * in_dim + j];
-        Tensor gxi = xi.to(Device::CUDA);
-        Tensor gyi = Tensor::zeros_on(Device::CUDA, out_dim, 1);
+        Tensor gxi = xi.to(gpu_device());
+        Tensor gyi = Tensor::zeros_on(gpu_device(), out_dim, 1);
         brotensor::linear_forward(gW, gb, gxi, gyi);
         Tensor yi = download_to_host(gyi);
         for (int j = 0; j < out_dim; ++j)
@@ -68,15 +68,15 @@ static void run_relu_batched(int B, int D, uint64_t seed) {
         Tensor xi = Tensor::vec(D);
         for (int j = 0; j < D; ++j)
             xi[j] = X_BD[static_cast<size_t>(i) * D + j];
-        Tensor gxi = xi.to(Device::CUDA);
-        Tensor gyi = Tensor::zeros_on(Device::CUDA, D, 1);
+        Tensor gxi = xi.to(gpu_device());
+        Tensor gyi = Tensor::zeros_on(gpu_device(), D, 1);
         brotensor::relu_forward(gxi, gyi);
         Tensor yi = download_to_host(gyi);
         for (int j = 0; j < D; ++j)
             Y_ref[static_cast<size_t>(i) * D + j] = yi[j];
     }
 
-    Tensor gX = X_BD.to(Device::CUDA);
+    Tensor gX = X_BD.to(gpu_device());
     Tensor gY;
     brotensor::relu_forward_batched(gX, gY);
     Tensor Y_batched = download_to_host(gY);
@@ -99,15 +99,15 @@ static void run_tanh_batched(int B, int D, uint64_t seed) {
         Tensor xi = Tensor::vec(D);
         for (int j = 0; j < D; ++j)
             xi[j] = X_BD[static_cast<size_t>(i) * D + j];
-        Tensor gxi = xi.to(Device::CUDA);
-        Tensor gyi = Tensor::zeros_on(Device::CUDA, D, 1);
+        Tensor gxi = xi.to(gpu_device());
+        Tensor gyi = Tensor::zeros_on(gpu_device(), D, 1);
         brotensor::tanh_forward(gxi, gyi);
         Tensor yi = download_to_host(gyi);
         for (int j = 0; j < D; ++j)
             Y_ref[static_cast<size_t>(i) * D + j] = yi[j];
     }
 
-    Tensor gX = X_BD.to(Device::CUDA);
+    Tensor gX = X_BD.to(gpu_device());
     Tensor gY;
     brotensor::tanh_forward_batched(gX, gY);
     Tensor Y_batched = download_to_host(gY);
@@ -134,14 +134,14 @@ static void run_add_batched(int B, int D, uint64_t seed) {
             yi[j] = Y_ref[static_cast<size_t>(i) * D + j];
             xi[j] = X[static_cast<size_t>(i) * D + j];
         }
-        Tensor gyi = yi.to(Device::CUDA), gxi = xi.to(Device::CUDA);
+        Tensor gyi = yi.to(gpu_device()), gxi = xi.to(gpu_device());
         brotensor::add_inplace(gyi, gxi);
         Tensor out = download_to_host(gyi);
         for (int j = 0; j < D; ++j)
             Y_ref[static_cast<size_t>(i) * D + j] = out[j];
     }
 
-    Tensor gY = Y_init.to(Device::CUDA), gX = X.to(Device::CUDA);
+    Tensor gY = Y_init.to(gpu_device()), gX = X.to(gpu_device());
     brotensor::add_inplace_batched(gY, gX);
     Tensor Y_batched = download_to_host(gY);
     compare_tensors(Y_ref, Y_batched, "add_inplace_batched");

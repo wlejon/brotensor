@@ -26,9 +26,9 @@ void run_ln_inf(int R, int D, float eps, uint64_t seed) {
     Tensor y_cpu;
     brotensor::layernorm_forward_inference_batched(X, gamma, beta, y_cpu, eps);
 
-    Tensor gX = X.to(Device::CUDA);
-    Tensor ggamma = gamma.to(Device::CUDA);
-    Tensor gbeta = beta.to(Device::CUDA);
+    Tensor gX = X.to(gpu_device());
+    Tensor ggamma = gamma.to(gpu_device());
+    Tensor gbeta = beta.to(gpu_device());
     Tensor gy;
     brotensor::layernorm_forward_inference_batched(gX, ggamma, gbeta, gy, eps);
 
@@ -43,7 +43,7 @@ void run_causal_mask(int L, int q) {
     Tensor m_gpu;
     // Pin the output to CUDA so the op dispatches to the GPU backend; its
     // sole Tensor operand is the output mask.
-    m_gpu = Tensor::zeros_on(Device::CUDA, L, 1);
+    m_gpu = Tensor::zeros_on(gpu_device(), L, 1);
     brotensor::build_causal_mask_row(L, q, m_gpu);
 
     Tensor m_gpu_h = download_to_host(m_gpu);

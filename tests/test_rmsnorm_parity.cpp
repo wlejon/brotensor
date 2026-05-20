@@ -25,8 +25,8 @@ void run_fwd(int B, int D, float eps, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::rms_norm_forward(X, gamma, eps, cpu_Y);
 
-    Tensor gX     = X.to(Device::CUDA);
-    Tensor ggamma = gamma.to(Device::CUDA);
+    Tensor gX     = X.to(gpu_device());
+    Tensor ggamma = gamma.to(gpu_device());
     Tensor gpu_Y;
     brotensor::rms_norm_forward(gX, ggamma, eps, gpu_Y);
 
@@ -46,11 +46,11 @@ void run_bwd(int B, int D, float eps, uint64_t seed) {
     Tensor cpu_dGamma = Tensor::vec(D);  // zero-initialised
     brotensor::rms_norm_backward(X, gamma, dY, eps, cpu_dX, cpu_dGamma);
 
-    Tensor gX     = X.to(Device::CUDA);
-    Tensor ggamma = gamma.to(Device::CUDA);
-    Tensor gdY    = dY.to(Device::CUDA);
+    Tensor gX     = X.to(gpu_device());
+    Tensor ggamma = gamma.to(gpu_device());
+    Tensor gdY    = dY.to(gpu_device());
     Tensor gpu_dX;
-    Tensor gpu_dGamma = Tensor::zeros_on(Device::CUDA, D, 1);
+    Tensor gpu_dGamma = Tensor::zeros_on(gpu_device(), D, 1);
     brotensor::rms_norm_backward(gX, ggamma, gdY, eps, gpu_dX, gpu_dGamma);
 
     compare_tensors(cpu_dX, download_to_host(gpu_dX), "rms_norm_bwd_dX", 1e-4f, 1e-3f);
@@ -74,11 +74,11 @@ void run_bwd_accum(int B, int D, float eps, uint64_t seed) {
     Tensor cpu_dGamma = dG0;            // deep copy of baseline (CPU)
     brotensor::rms_norm_backward(X, gamma, dY, eps, cpu_dX, cpu_dGamma);
 
-    Tensor gX     = X.to(Device::CUDA);
-    Tensor ggamma = gamma.to(Device::CUDA);
-    Tensor gdY    = dY.to(Device::CUDA);
+    Tensor gX     = X.to(gpu_device());
+    Tensor ggamma = gamma.to(gpu_device());
+    Tensor gdY    = dY.to(gpu_device());
     Tensor gpu_dX;
-    Tensor gpu_dGamma = dG0.to(Device::CUDA);  // same baseline on GPU
+    Tensor gpu_dGamma = dG0.to(gpu_device());  // same baseline on GPU
     brotensor::rms_norm_backward(gX, ggamma, gdY, eps, gpu_dX, gpu_dGamma);
 
     compare_tensors(cpu_dX, download_to_host(gpu_dX),

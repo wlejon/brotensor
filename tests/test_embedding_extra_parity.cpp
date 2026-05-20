@@ -38,10 +38,10 @@ void run_embedding(int V, int D, const std::vector<int32_t>& idx,
     brotensor::embedding_lookup_backward(dOut, idx.data(), B, dTable_cpu);
 
     // GPU backend run.
-    Tensor gtable = table.to(Device::CUDA);
-    Tensor gdOut = dOut.to(Device::CUDA);
-    Tensor gout = Tensor::zeros_on(Device::CUDA, B, D);
-    Tensor gdTable = dTable_init.to(Device::CUDA);
+    Tensor gtable = table.to(gpu_device());
+    Tensor gdOut = dOut.to(gpu_device());
+    Tensor gout = Tensor::zeros_on(gpu_device(), B, D);
+    Tensor gdTable = dTable_init.to(gpu_device());
     Tensor d_idx_buf = upload_indices(idx);
     const int32_t* d_idx = static_cast<const int32_t*>(d_idx_buf.data);
     brotensor::embedding_lookup_forward(gtable, d_idx, B, gout);

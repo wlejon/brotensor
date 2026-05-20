@@ -22,7 +22,7 @@ void run_clamp(int r, int c, float lo, float hi, uint64_t seed) {
     Tensor cpu = base;             // deep copy (CPU)
     brotensor::clamp(cpu, lo, hi);
 
-    Tensor gpu = base.to(Device::CUDA);
+    Tensor gpu = base.to(gpu_device());
     brotensor::clamp(gpu, lo, hi);
 
     Tensor gpu_h = download_to_host(gpu);
@@ -38,8 +38,8 @@ void run_mul(int r, int c, uint64_t seed) {
     Tensor cpu = a;                // deep copy (CPU)
     brotensor::mul_inplace(cpu, b);
 
-    Tensor ga = a.to(Device::CUDA);
-    Tensor gb = b.to(Device::CUDA);
+    Tensor ga = a.to(gpu_device());
+    Tensor gb = b.to(gpu_device());
     brotensor::mul_inplace(ga, gb);
 
     Tensor gpu_h = download_to_host(ga);
