@@ -122,4 +122,96 @@ BT_PARITY_TEST(group_norm_bwd_groupsC)   { run_bwd(kGroupsC,  0x7013ull); }
 BT_PARITY_TEST(group_norm_bwd_sdish)     { run_bwd(kSDish,    0x7014ull); }
 BT_PARITY_TEST(group_norm_bwd_rect)      { run_bwd(kRect,     0x7015ull); }
 
+// ─── BF16 forward + backward parity ─────────────────────────────────────────
+// BF16 is GPU-only. Round FP32 inputs to BF16, run on CUDA, widen back and
+// compare against the FP32 CPU reference with loose tolerances.
+
+namespace {
+
+void run_fwd_bf16(const GnCfg& c, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int spatial = c.H * c.W;
+    Tensor X_f32 = Tensor::mat(c.N, c.C * spatial);
+    Tensor gamma_f32 = Tensor::vec(c.C);
+    Tensor beta_f32 = Tensor::vec(c.C);
+    fill_random(X_f32, rng);
+    for (int i = 0; i < gamma_f32.size(); ++i) gamma_f32[i] = 0.5f + rng.next_unit() * 0.5f;
+    for (int i = 0; i < beta_f32.size(); ++i)  beta_f32[i]  = rng.next_unit() * 0.2f;
+
+    // CPU FP32 reference.
+    Tensor cpu_Y;
+    brotensor::group_norm_forward(X_f32, gamma_f32, beta_f32, c.N, c.C, c.H, c.W,
+                                  c.num_groups, kEps, cpu_Y);
+
+    // BF16 GPU path.
+    Tensor gX     = to_bf16_cuda(X_f32);
+    Tensor gGamma = to_bf16_cuda(gamma_f32);
+    Tensor gBeta  = to_bf16_cuda(beta_f32);
+    Tensor gpu_Y;
+    brotensor::group_norm_forward(gX, gGamma, gBeta, c.N, c.C, c.H, c.W,
+                                  c.num_groups, kEps, gpu_Y);
+    brotensor::sync_all();
+
+    Tensor Y_h = bf16_host_to_f32(download_to_host(gpu_Y));
+    compare_tensors(cpu_Y, Y_h, "group_norm_bf16_fwd", 3e-2f, 3e-2f);
+}
+
+void run_bwd_bf16(const GnCfg& c, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int spatial = c.H * c.W;
+    Tensor X_f32 = Tensor::mat(c.N, c.C * spatial);
+    Tensor gamma_f32 = Tensor::vec(c.C);
+    Tensor dY_f32 = Tensor::mat(c.N, c.C * spatial);
+    Tensor dG0_f32 = Tensor::vec(c.C);
+    Tensor dB0_f32 = Tensor::vec(c.C);
+    fill_random(X_f32, rng);
+    fill_random(dY_f32, rng);
+    for (int i = 0; i < gamma_f32.size(); ++i) gamma_f32[i] = 0.5f + rng.next_unit() * 0.5f;
+    fill_random(dG0_f32, rng, 0.5f);
+    fill_random(dB0_f32, rng, 0.5f);
+
+    // CPU FP32 reference.
+    Tensor cpu_dX;
+    Tensor cpu_dG = dG0_f32;
+    Tensor cpu_dB = dB0_f32;
+    brotensor::group_norm_backward(X_f32, gamma_f32, dY_f32, c.N, c.C, c.H, c.W,
+                                   c.num_groups, kEps, cpu_dX, cpu_dG, cpu_dB);
+
+    // BF16 GPU path.
+    Tensor gX     = to_bf16_cuda(X_f32);
+    Tensor gG     = to_bf16_cuda(gamma_f32);
+    Tensor gdY    = to_bf16_cuda(dY_f32);
+    Tensor gpu_dX;
+    Tensor gpu_dG = Tensor::zeros_on(Device::CUDA, c.C, 1, brotensor::Dtype::BF16);
+    Tensor gpu_dB = Tensor::zeros_on(Device::CUDA, c.C, 1, brotensor::Dtype::BF16);
+    // Pre-load the non-zero baseline into BF16 accumulator buffers.
+    {
+        Tensor dG0_bf16 = to_bf16_cuda(dG0_f32);
+        Tensor dB0_bf16 = to_bf16_cuda(dB0_f32);
+        gpu_dG = dG0_bf16;
+        gpu_dB = dB0_bf16;
+    }
+    brotensor::group_norm_backward(gX, gG, gdY, c.N, c.C, c.H, c.W,
+                                   c.num_groups, kEps, gpu_dX, gpu_dG, gpu_dB);
+    brotensor::sync_all();
+
+    Tensor dX_h = bf16_host_to_f32(download_to_host(gpu_dX));
+    Tensor dG_h = bf16_host_to_f32(download_to_host(gpu_dG));
+    Tensor dB_h = bf16_host_to_f32(download_to_host(gpu_dB));
+
+    compare_tensors(cpu_dX, dX_h, "group_norm_bf16_bwd_dX",     3e-2f, 3e-2f);
+    compare_tensors(cpu_dG, dG_h, "group_norm_bf16_bwd_dGamma", 6e-2f, 6e-2f);
+    compare_tensors(cpu_dB, dB_h, "group_norm_bf16_bwd_dBeta",  6e-2f, 6e-2f);
+}
+
+} // namespace (BF16 helpers)
+
+BT_PARITY_TEST(group_norm_bf16_fwd_tiny)     { run_fwd_bf16(kTiny,     0x7080ull); }
+BT_PARITY_TEST(group_norm_bf16_fwd_standard) { run_fwd_bf16(kStandard, 0x7081ull); }
+BT_PARITY_TEST(group_norm_bf16_fwd_sdish)    { run_fwd_bf16(kSDish,    0x7082ull); }
+
+BT_PARITY_TEST(group_norm_bf16_bwd_tiny)     { run_bwd_bf16(kTiny,     0x7090ull); }
+BT_PARITY_TEST(group_norm_bf16_bwd_standard) { run_bwd_bf16(kStandard, 0x7091ull); }
+BT_PARITY_TEST(group_norm_bf16_bwd_sdish)    { run_bwd_bf16(kSDish,    0x7092ull); }
+
 int main() { return run_all("group_norm cpu/gpu parity"); }

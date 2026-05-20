@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -349,7 +350,169 @@ __global__ void group_norm_backward_kernel_fp32(
     }
 }
 
-// Add FP32 scratch into FP16/FP32 dGamma/dBeta accumulators (caller-owned,
+// ─── BF16 kernels (verbatim copies of FP16 with __half→__nv_bfloat16) ────────
+
+__global__ void group_norm_forward_kernel_bf16(
+        const __nv_bfloat16* __restrict__ X,
+        const __nv_bfloat16* __restrict__ gamma,
+        const __nv_bfloat16* __restrict__ beta,
+        __nv_bfloat16* __restrict__ Y,
+        int C, int spatial,
+        int channels_per_group,
+        float eps) {
+    const int n = blockIdx.y;
+    const int g = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const int tile_channels = channels_per_group;
+    const int tile_size = tile_channels * spatial;
+    const int chan_base = g * channels_per_group;
+    const int sample_stride = C * spatial;
+    const __nv_bfloat16* x_tile = X + n * sample_stride + chan_base * spatial;
+    __nv_bfloat16*       y_tile = Y + n * sample_stride + chan_base * spatial;
+
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const float v = __bfloat162float(x_tile[i]);
+        sum   += v;
+        sumsq += v * v;
+    }
+
+    __shared__ float s_sum[GN_BLOCK];
+    __shared__ float s_sumsq[GN_BLOCK];
+    s_sum[tid]   = sum;
+    s_sumsq[tid] = sumsq;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sum[tid]   += s_sum[tid + stride];
+            s_sumsq[tid] += s_sumsq[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float s_mean;
+    __shared__ float s_rstd;
+    if (tid == 0) {
+        const float inv_n = 1.0f / static_cast<float>(tile_size);
+        const float mean  = s_sum[0] * inv_n;
+        const float var   = s_sumsq[0] * inv_n - mean * mean;
+        s_mean = mean;
+        s_rstd = rsqrtf(var + eps);
+    }
+    __syncthreads();
+    const float mean = s_mean;
+    const float rstd = s_rstd;
+
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const int local_c = i / spatial;
+        const int channel = chan_base + local_c;
+        const float gv = __bfloat162float(gamma[channel]);
+        const float bv = __bfloat162float(beta[channel]);
+        const float v  = __bfloat162float(x_tile[i]);
+        const float yn = (v - mean) * rstd;
+        y_tile[i] = __float2bfloat16(yn * gv + bv);
+    }
+}
+
+__global__ void group_norm_backward_kernel_bf16(
+        const __nv_bfloat16* __restrict__ X,
+        const __nv_bfloat16* __restrict__ gamma,
+        const __nv_bfloat16* __restrict__ dY,
+        __nv_bfloat16* __restrict__ dX,
+        float* __restrict__ dGamma_acc,
+        float* __restrict__ dBeta_acc,
+        int C, int spatial,
+        int channels_per_group,
+        float eps) {
+    const int n = blockIdx.y;
+    const int g = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const int tile_size = channels_per_group * spatial;
+    const int chan_base = g * channels_per_group;
+    const int sample_stride = C * spatial;
+    const __nv_bfloat16* x_tile  = X  + n * sample_stride + chan_base * spatial;
+    const __nv_bfloat16* dy_tile = dY + n * sample_stride + chan_base * spatial;
+    __nv_bfloat16*       dx_tile = dX + n * sample_stride + chan_base * spatial;
+
+    // Pass 1: mean, var.
+    float sum = 0.0f, sumsq = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const float v = __bfloat162float(x_tile[i]);
+        sum   += v;
+        sumsq += v * v;
+    }
+    __shared__ float s_a[GN_BLOCK];
+    __shared__ float s_b[GN_BLOCK];
+    s_a[tid] = sum; s_b[tid] = sumsq;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_a[tid] += s_a[tid + stride];
+            s_b[tid] += s_b[tid + stride];
+        }
+        __syncthreads();
+    }
+    __shared__ float s_mean, s_rstd;
+    if (tid == 0) {
+        const float inv_n = 1.0f / static_cast<float>(tile_size);
+        const float mean = s_a[0] * inv_n;
+        const float var  = s_b[0] * inv_n - mean * mean;
+        s_mean = mean;
+        s_rstd = rsqrtf(var + eps);
+    }
+    __syncthreads();
+    const float mean = s_mean;
+    const float rstd = s_rstd;
+
+    // Pass 2: sum1 = Σ dx̂, sum2 = Σ dx̂ * x̂.
+    float sum1 = 0.0f, sum2 = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const int local_c = i / spatial;
+        const int channel = chan_base + local_c;
+        const float gv  = __bfloat162float(gamma[channel]);
+        const float dyv = __bfloat162float(dy_tile[i]);
+        const float xv  = __bfloat162float(x_tile[i]);
+        const float xh  = (xv - mean) * rstd;
+        const float dxh = dyv * gv;
+        sum1 += dxh;
+        sum2 += dxh * xh;
+        atomicAdd(&dGamma_acc[channel], dyv * xh);
+        atomicAdd(&dBeta_acc[channel],  dyv);
+    }
+    s_a[tid] = sum1; s_b[tid] = sum2;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_a[tid] += s_a[tid + stride];
+            s_b[tid] += s_b[tid + stride];
+        }
+        __syncthreads();
+    }
+    __shared__ float s_sum1, s_sum2;
+    if (tid == 0) { s_sum1 = s_a[0]; s_sum2 = s_b[0]; }
+    __syncthreads();
+    const float sum1_t = s_sum1;
+    const float sum2_t = s_sum2;
+    const float inv_M = 1.0f / static_cast<float>(tile_size);
+
+    // Pass 3: dX = rstd * (dx̂ - (sum1 + x̂ * sum2) / M).
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const int local_c = i / spatial;
+        const int channel = chan_base + local_c;
+        const float gv  = __bfloat162float(gamma[channel]);
+        const float dyv = __bfloat162float(dy_tile[i]);
+        const float xv  = __bfloat162float(x_tile[i]);
+        const float xh  = (xv - mean) * rstd;
+        const float dxh = dyv * gv;
+        const float dx  = rstd * (dxh - (sum1_t + xh * sum2_t) * inv_M);
+        dx_tile[i] = __float2bfloat16(dx);
+    }
+}
+
+// Add FP32 scratch into FP16/FP32/BF16 dGamma/dBeta accumulators (caller-owned,
 // previously zeroed). Storage dtype dispatched.
 __global__ void add_fp32_into_fp16(const float* __restrict__ src,
                                    __half* __restrict__ dst, int n) {
@@ -357,6 +520,13 @@ __global__ void add_fp32_into_fp16(const float* __restrict__ src,
     if (i >= n) return;
     const float prev = __half2float(dst[i]);
     dst[i] = __float2half(prev + src[i]);
+}
+
+__global__ void add_fp32_into_bf16(const float* __restrict__ src,
+                                   __nv_bfloat16* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2bfloat16(__bfloat162float(dst[i]) + src[i]);
 }
 
 __global__ void add_fp32_into_fp32(const float* __restrict__ src,
@@ -379,8 +549,8 @@ void group_norm_forward(const ::brotensor::Tensor& X,
     if (gamma.dtype != X.dtype || beta.dtype != X.dtype) {
         throw std::runtime_error("group_norm_forward: gamma/beta dtype must match X");
     }
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("group_norm_forward: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("group_norm_forward: X must be FP16, BF16, or FP32");
     }
     if (num_groups <= 0 || C % num_groups != 0) {
         throw std::runtime_error("group_norm_forward: num_groups must divide C");
@@ -400,6 +570,13 @@ void group_norm_forward(const ::brotensor::Tensor& X,
             reinterpret_cast<const __half*>(gamma.data),
             reinterpret_cast<const __half*>(beta.data),
             reinterpret_cast<__half*>(Y.data),
+            C, spatial, channels_per_group, eps);
+    } else if (X.dtype == Dtype::BF16) {
+        group_norm_forward_kernel_bf16<<<grid, GN_BLOCK>>>(
+            reinterpret_cast<const __nv_bfloat16*>(X.data),
+            reinterpret_cast<const __nv_bfloat16*>(gamma.data),
+            reinterpret_cast<const __nv_bfloat16*>(beta.data),
+            reinterpret_cast<__nv_bfloat16*>(Y.data),
             C, spatial, channels_per_group, eps);
     } else {
         group_norm_forward_kernel_fp32<<<grid, GN_BLOCK>>>(
@@ -425,8 +602,8 @@ void group_norm_backward(const ::brotensor::Tensor& X,
     if (gamma.dtype != X.dtype || dY.dtype != X.dtype) {
         throw std::runtime_error("group_norm_backward: gamma/dY dtype must match X");
     }
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("group_norm_backward: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("group_norm_backward: X must be FP16, BF16, or FP32");
     }
     if (num_groups <= 0 || C % num_groups != 0) {
         throw std::runtime_error("group_norm_backward: num_groups must divide C");
@@ -464,6 +641,14 @@ void group_norm_backward(const ::brotensor::Tensor& X,
             reinterpret_cast<__half*>(dX.data),
             d_dG, d_dB,
             C, spatial, channels_per_group, eps);
+    } else if (X.dtype == Dtype::BF16) {
+        group_norm_backward_kernel_bf16<<<grid, GN_BLOCK>>>(
+            reinterpret_cast<const __nv_bfloat16*>(X.data),
+            reinterpret_cast<const __nv_bfloat16*>(gamma.data),
+            reinterpret_cast<const __nv_bfloat16*>(dY.data),
+            reinterpret_cast<__nv_bfloat16*>(dX.data),
+            d_dG, d_dB,
+            C, spatial, channels_per_group, eps);
     } else {
         group_norm_backward_kernel_fp32<<<grid, GN_BLOCK>>>(
             reinterpret_cast<const float*>(X.data),
@@ -482,6 +667,11 @@ void group_norm_backward(const ::brotensor::Tensor& X,
             d_dG, reinterpret_cast<__half*>(dGamma.data), C);
         add_fp32_into_fp16<<<gridc, block>>>(
             d_dB, reinterpret_cast<__half*>(dBeta.data),  C);
+    } else if (X.dtype == Dtype::BF16) {
+        add_fp32_into_bf16<<<gridc, block>>>(
+            d_dG, reinterpret_cast<__nv_bfloat16*>(dGamma.data), C);
+        add_fp32_into_bf16<<<gridc, block>>>(
+            d_dB, reinterpret_cast<__nv_bfloat16*>(dBeta.data),  C);
     } else {
         add_fp32_into_fp32<<<gridc, block>>>(d_dG, reinterpret_cast<float*>(dGamma.data), C);
         add_fp32_into_fp32<<<gridc, block>>>(d_dB, reinterpret_cast<float*>(dBeta.data),  C);

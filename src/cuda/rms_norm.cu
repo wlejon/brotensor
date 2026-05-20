@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -181,6 +182,82 @@ __global__ void rms_fp32_into_fp16_kernel(const float* __restrict__ src,
     dst[i] = __float2half(__half2float(dst[i]) + src[i]);
 }
 
+// ─── BF16 kernels (verbatim copies of FP16 with __half→__nv_bfloat16) ────────
+
+__global__ void rms_forward_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                                        const __nv_bfloat16* __restrict__ gamma,
+                                        __nv_bfloat16* __restrict__ Y,
+                                        int B, int D, float eps) {
+    extern __shared__ float sdata[];
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* xrow = X + static_cast<size_t>(b) * D;
+    __nv_bfloat16*       yrow = Y + static_cast<size_t>(b) * D;
+
+    float local = 0.0f;
+    for (int j = tid; j < D; j += blockDim.x) {
+        const float v = __bfloat162float(xrow[j]);
+        local += v * v;
+    }
+    const float sum = block_sum(local, sdata);
+    const float rrms = rsqrtf(sum / static_cast<float>(D) + eps);
+
+    for (int j = tid; j < D; j += blockDim.x) {
+        const float xv = __bfloat162float(xrow[j]);
+        const float gv = __bfloat162float(gamma[j]);
+        yrow[j] = __float2bfloat16(xv * gv * rrms);
+    }
+}
+
+__global__ void rms_backward_bf16_kernel(const __nv_bfloat16* __restrict__ X,
+                                         const __nv_bfloat16* __restrict__ gamma,
+                                         const __nv_bfloat16* __restrict__ dY,
+                                         __nv_bfloat16* __restrict__ dX,
+                                         float* __restrict__ dGamma_scratch,
+                                         int B, int D, float eps) {
+    extern __shared__ float sdata[];
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    const int tid = threadIdx.x;
+    const __nv_bfloat16* xrow  = X  + static_cast<size_t>(b) * D;
+    const __nv_bfloat16* dyrow = dY + static_cast<size_t>(b) * D;
+    __nv_bfloat16*       dxrow = dX + static_cast<size_t>(b) * D;
+
+    float local = 0.0f;
+    for (int j = tid; j < D; j += blockDim.x) {
+        const float v = __bfloat162float(xrow[j]);
+        local += v * v;
+    }
+    const float sum_xx = block_sum(local, sdata);
+    const float rrms = rsqrtf(sum_xx / static_cast<float>(D) + eps);
+
+    float local2 = 0.0f;
+    for (int j = tid; j < D; j += blockDim.x) {
+        local2 += __bfloat162float(xrow[j]) * __bfloat162float(dyrow[j]) *
+                  __bfloat162float(gamma[j]);
+    }
+    const float sum_xdy = block_sum(local2, sdata);
+
+    const float inv_D = 1.0f / static_cast<float>(D);
+    const float coeff = inv_D * rrms * rrms * sum_xdy;
+
+    for (int j = tid; j < D; j += blockDim.x) {
+        const float g  = __bfloat162float(gamma[j]);
+        const float dy = __bfloat162float(dyrow[j]);
+        const float x  = __bfloat162float(xrow[j]);
+        dxrow[j] = __float2bfloat16(rrms * (g * dy - x * coeff));
+        atomicAdd(&dGamma_scratch[j], dy * x * rrms);
+    }
+}
+
+__global__ void rms_fp32_into_bf16_kernel(const float* __restrict__ src,
+                                          __nv_bfloat16* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2bfloat16(__bfloat162float(dst[i]) + src[i]);
+}
+
 } // namespace
 
 void rms_norm_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& gamma,
@@ -204,6 +281,12 @@ void rms_norm_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& g
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(gamma.data),
             static_cast<__half*>(Y.data),
+            B, D, eps);
+    } else if (X.dtype == ::brotensor::Dtype::BF16) {
+        rms_forward_bf16_kernel<<<B, block, shmem>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<const __nv_bfloat16*>(gamma.data),
+            static_cast<__nv_bfloat16*>(Y.data),
             B, D, eps);
     } else {
         rms_forward_fp32_kernel<<<B, block, shmem>>>(
@@ -244,6 +327,23 @@ void rms_norm_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& 
             static_cast<float*>(dGamma.data),
             B, D, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    } else if (X.dtype == ::brotensor::Dtype::BF16) {
+        float* d_dg = nullptr;
+        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg),
+                                        D * sizeof(float)));
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dg, 0, D * sizeof(float)));
+        rms_backward_bf16_kernel<<<B, block, shmem>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<const __nv_bfloat16*>(gamma.data),
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data),
+            d_dg, B, D, eps);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        const int blocks = (D + 255) / 256;
+        rms_fp32_into_bf16_kernel<<<blocks, 256>>>(
+            d_dg, static_cast<__nv_bfloat16*>(dGamma.data), D);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        cudaFree(d_dg);
     } else {
         float* d_dg = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg),

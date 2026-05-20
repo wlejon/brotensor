@@ -69,4 +69,59 @@ BT_PARITY_TEST(layernorm_n16)  { run_layernorm(16,  0x200ull); }
 BT_PARITY_TEST(layernorm_n64)  { run_layernorm(64,  0x201ull); }
 BT_PARITY_TEST(layernorm_n256) { run_layernorm(256, 0x202ull); }
 
+// ─── BF16 backward parity ────────────────────────────────────────────────────
+// BF16 is GPU-only. We run the FP32 CPU reference, convert inputs to BF16,
+// run on CUDA, widen back to FP32, and compare with loose tolerances.
+// layernorm_forward is FP32-only (no FP16/BF16 forward path), so only the
+// backward path is tested here.
+namespace {
+
+void run_layernorm_bf16_bwd(int n, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor dY_f32 = Tensor::vec(n), xhat_f32 = Tensor::vec(n);
+    Tensor gamma_f32 = Tensor::vec(n), beta_f32 = Tensor::vec(n);
+    Tensor dGamma_init_f32 = Tensor::vec(n), dBeta_init_f32 = Tensor::vec(n);
+    fill_random(dY_f32, rng);
+    fill_random(xhat_f32, rng);
+    for (int i = 0; i < n; ++i) {
+        gamma_f32[i] = 0.5f + 0.5f * rng.next_f01();
+        beta_f32[i]  = rng.next_unit() * 0.25f;
+    }
+    fill_random(dGamma_init_f32, rng, 0.25f);
+    fill_random(dBeta_init_f32,  rng, 0.25f);
+
+    // CPU FP32 reference backward (pre-fill dGamma/dBeta).
+    const float rstd = 0.5f + rng.next_f01() * 0.5f;  // synthetic rstd ~[0.5, 1.0)
+    Tensor cpu_dX = Tensor::vec(n);
+    Tensor cpu_dGamma = dGamma_init_f32, cpu_dBeta = dBeta_init_f32;
+    brotensor::layernorm_backward(dY_f32, xhat_f32, gamma_f32, rstd,
+                                  cpu_dX, cpu_dGamma, cpu_dBeta);
+
+    // BF16 GPU path.
+    Tensor gdY    = to_bf16_cuda(dY_f32);
+    Tensor gxhat  = to_bf16_cuda(xhat_f32);
+    Tensor ggamma = to_bf16_cuda(gamma_f32);
+    Tensor gpu_dX = Tensor::zeros_on(Device::CUDA, n, 1, brotensor::Dtype::BF16);
+    Tensor gpu_dGamma = to_bf16_cuda(dGamma_init_f32);
+    Tensor gpu_dBeta  = to_bf16_cuda(dBeta_init_f32);
+    brotensor::layernorm_backward(gdY, gxhat, ggamma, rstd,
+                                  gpu_dX, gpu_dGamma, gpu_dBeta);
+    brotensor::sync_all();
+
+    // Widen BF16 results back to FP32 for comparison.
+    Tensor dX_h    = bf16_host_to_f32(download_to_host(gpu_dX));
+    Tensor dGamma_h = bf16_host_to_f32(download_to_host(gpu_dGamma));
+    Tensor dBeta_h  = bf16_host_to_f32(download_to_host(gpu_dBeta));
+
+    compare_tensors(cpu_dX,     dX_h,     "layernorm_bf16_bwd.dX",     3e-2f, 3e-2f);
+    compare_tensors(cpu_dGamma, dGamma_h, "layernorm_bf16_bwd.dGamma", 6e-2f, 6e-2f);
+    compare_tensors(cpu_dBeta,  dBeta_h,  "layernorm_bf16_bwd.dBeta",  6e-2f, 6e-2f);
+}
+
+} // namespace
+
+BT_PARITY_TEST(layernorm_bf16_bwd_n16)  { run_layernorm_bf16_bwd(16,  0x280ull); }
+BT_PARITY_TEST(layernorm_bf16_bwd_n64)  { run_layernorm_bf16_bwd(64,  0x281ull); }
+BT_PARITY_TEST(layernorm_bf16_bwd_n256) { run_layernorm_bf16_bwd(256, 0x282ull); }
+
 int main() { return run_all("layernorm cpu/gpu parity"); }

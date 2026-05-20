@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -191,6 +192,67 @@ __global__ void ln_add_fp32_into_fp16(const float* __restrict__ src,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     dst[i] = __float2half(__half2float(dst[i]) + src[i]);
+}
+
+// BF16 backward — verbatim copy of layernorm_backward_kernel_fp16 with
+// __half → __nv_bfloat16, __half2float → __bfloat162float, __float2half →
+// __float2bfloat16. FP32 scratch/fold pattern mirrored exactly.
+__global__ void layernorm_backward_kernel_bf16(const __nv_bfloat16* __restrict__ dY,
+                                               const __nv_bfloat16* __restrict__ xhat,
+                                               const __nv_bfloat16* __restrict__ gamma,
+                                               float rstd,
+                                               __nv_bfloat16* __restrict__ dX,
+                                               float* __restrict__ dGamma_scratch,
+                                               float* __restrict__ dBeta_scratch,
+                                               int n) {
+    __shared__ float sdata[LN_BLOCK];
+    const int tid = threadIdx.x;
+
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float g  = __bfloat162float(dY[i]);
+        const float xh = __bfloat162float(xhat[i]);
+        dGamma_scratch[i] = g * xh;
+        dBeta_scratch[i]  = g;
+    }
+
+    float local = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        local += __bfloat162float(dY[i]) * __bfloat162float(gamma[i]);
+    }
+    sdata[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float sum_dxh = sdata[0];
+
+    float local2 = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        local2 += __bfloat162float(dY[i]) * __bfloat162float(gamma[i]) * __bfloat162float(xhat[i]);
+    }
+    sdata[tid] = local2;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float sum_dxh_xhat = sdata[0];
+
+    const float nf = static_cast<float>(n);
+    const float scale = rstd / nf;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float dxh = __bfloat162float(dY[i]) * __bfloat162float(gamma[i]);
+        const float xh  = __bfloat162float(xhat[i]);
+        dX[i] = __float2bfloat16(scale * (nf * dxh - sum_dxh - xh * sum_dxh_xhat));
+    }
+}
+
+__global__ void ln_add_fp32_into_bf16(const float* __restrict__ src,
+                                      __nv_bfloat16* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2bfloat16(__bfloat162float(dst[i]) + src[i]);
 }
 
 } // namespace
@@ -385,8 +447,8 @@ void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
                         ::brotensor::Tensor& dX,
                         ::brotensor::Tensor& dGamma, ::brotensor::Tensor& dBeta) {
     using ::brotensor::Dtype;
-    if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32) {
-        throw std::runtime_error("layernorm_backward: dY must be FP16 or FP32");
+    if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32 && dY.dtype != Dtype::BF16) {
+        throw std::runtime_error("layernorm_backward: dY must be FP16, BF16, or FP32");
     }
     if (xhat.dtype != dY.dtype || gamma.dtype != dY.dtype ||
         dGamma.dtype != dY.dtype || dBeta.dtype != dY.dtype) {
@@ -409,6 +471,27 @@ void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
             reinterpret_cast<float*>(dBeta.data),
             n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    } else if (dY.dtype == Dtype::BF16) {
+        float* d_dg = nullptr;
+        float* d_db = nullptr;
+        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg), n * sizeof(float)));
+        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db), n * sizeof(float)));
+        layernorm_backward_kernel_bf16<<<1, LN_BLOCK>>>(
+            reinterpret_cast<const __nv_bfloat16*>(dY.data),
+            reinterpret_cast<const __nv_bfloat16*>(xhat.data),
+            reinterpret_cast<const __nv_bfloat16*>(gamma.data),
+            rstd,
+            reinterpret_cast<__nv_bfloat16*>(dX.data),
+            d_dg, d_db, n);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        const int blocks = (n + 255) / 256;
+        ln_add_fp32_into_bf16<<<blocks, 256>>>(
+            d_dg, reinterpret_cast<__nv_bfloat16*>(dGamma.data), n);
+        ln_add_fp32_into_bf16<<<blocks, 256>>>(
+            d_db, reinterpret_cast<__nv_bfloat16*>(dBeta.data), n);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        cudaFree(d_dg);
+        cudaFree(d_db);
     } else {
         float* d_dg = nullptr;
         float* d_db = nullptr;
