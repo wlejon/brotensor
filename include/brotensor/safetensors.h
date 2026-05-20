@@ -98,9 +98,10 @@ private:
 // consuming op expects.
 //
 // Requirements:
-//   - view.dtype must be F32 or F16
+//   - view.dtype must be F32, F16, or BF16
 //   - rows * cols * dtype_size_bytes(view.dtype) == view.nbytes
 //   - dst is resized to (rows, cols) at the matching brotensor::Dtype
+//     (a BF16 view produces a brotensor::Dtype::BF16 tensor, zero-converted)
 //
 // Throws std::runtime_error if the byte count or dtype is wrong.
 void upload(const TensorView& view, int rows, int cols, brotensor::Tensor& dst);

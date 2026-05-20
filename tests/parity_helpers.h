@@ -130,6 +130,39 @@ inline Tensor download_to_host(const Tensor& g) {
     return g.to(brotensor::Device::CPU);
 }
 
+// ─── BF16 parity helpers ───────────────────────────────────────────────────
+//
+// BF16 ops are GPU-only (the CPU backend is FP32-only). A BF16 parity test
+// rounds its FP32 inputs to BF16, runs the op on CUDA, widens the BF16 result
+// back to FP32, and compares against the FP32 CPU reference with a loose
+// tolerance — BF16 carries only 8 mantissa bits (~2-3 decimal digits), so use
+// atol/rtol around 2e-2 (looser still for long reductions: matmul, attention).
+
+// Round an FP32 host tensor to a BF16 host tensor (same shape, Device::CPU).
+inline Tensor to_bf16_host(const Tensor& f32cpu) {
+    Tensor out = Tensor::zeros_on(brotensor::Device::CPU, f32cpu.rows,
+                                  f32cpu.cols, brotensor::Dtype::BF16);
+    const float* s = f32cpu.host_f32();
+    uint16_t* d = out.host_bf16_mut();
+    for (int i = 0; i < f32cpu.size(); ++i) d[i] = brotensor::fp32_to_bf16_bits(s[i]);
+    return out;
+}
+
+// Widen a BF16 host tensor back to an FP32 host tensor for compare_tensors().
+inline Tensor bf16_host_to_f32(const Tensor& bf16cpu) {
+    Tensor out = Tensor::zeros_on(brotensor::Device::CPU, bf16cpu.rows,
+                                  bf16cpu.cols, brotensor::Dtype::FP32);
+    const uint16_t* s = bf16cpu.host_bf16();
+    float* d = out.host_f32_mut();
+    for (int i = 0; i < bf16cpu.size(); ++i) d[i] = brotensor::bf16_bits_to_fp32(s[i]);
+    return out;
+}
+
+// Convenience: round an FP32 host tensor to BF16 and place it on CUDA.
+inline Tensor to_bf16_cuda(const Tensor& f32cpu) {
+    return to_bf16_host(f32cpu).to(brotensor::Device::CUDA);
+}
+
 // ─── Backend-neutral mask / index buffer helpers ──────────────────────────
 
 // Build a GPU-resident float mask buffer from a host float mask vector. If

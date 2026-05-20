@@ -434,6 +434,9 @@ void upload(const TensorView& view, int rows, int cols, brotensor::Tensor& dst) 
     } else if (view.dtype == Dtype::F16) {
         dst = brotensor::Tensor::from_host_fp16(
             reinterpret_cast<const uint16_t*>(view.data), rows, cols);
+    } else if (view.dtype == Dtype::BF16) {
+        dst = brotensor::Tensor::from_host_bf16(
+            reinterpret_cast<const uint16_t*>(view.data), rows, cols);
     } else {
         throw std::runtime_error(
             std::string("safetensors::upload: unsupported dtype ") +

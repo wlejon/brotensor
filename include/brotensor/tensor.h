@@ -13,18 +13,21 @@ namespace brotensor {
 // single raw `void*` (`data`); typed access is via the host_f32 / host_fp16
 // accessors. GPU backends reinterpret the same allocation for FP16 / INT8.
 //
-// Element sizes are fixed: FP32 = 4 bytes, FP16 = 2 bytes, INT8 = 1 byte,
-// INT32 = 4 bytes. Allocation, clone, zero, and resize all use dtype-aware
-// byte counts. INT8 is currently only carried by weight-only quantised ops
-// (W8A16 matmul/conv2d); arithmetic ops only dispatch on FP32/FP16. INT32 is
-// likewise a pure storage carrier — used for device-resident index/offset
-// buffers (e.g. per-head offset tables for softmax_xent_fused_batched); no
-// arithmetic op dispatches on it.
+// Element sizes are fixed: FP32 = 4 bytes, FP16 = 2 bytes, BF16 = 2 bytes,
+// INT8 = 1 byte, INT32 = 4 bytes. Allocation, clone, zero, and resize all use
+// dtype-aware byte counts. BF16 (IEEE 754 bfloat16 — the high 16 bits of an
+// FP32) is an arithmetic dtype carried only by the GPU backends; like FP16 it
+// is stored as a uint16_t bit pattern on the host. Arithmetic ops dispatch on
+// FP32/FP16/BF16. INT8 is currently only carried by weight-only quantised ops
+// (W8A16 matmul/conv2d). INT32 is likewise a pure storage carrier — used for
+// device-resident index/offset buffers (e.g. per-head offset tables for
+// softmax_xent_fused_batched); no arithmetic op dispatches on it.
 enum class Dtype : int {
     FP32  = 0,
     FP16  = 1,
     INT8  = 2,
     INT32 = 3,
+    BF16  = 4,
 };
 
 int dtype_size_bytes(Dtype);
@@ -104,10 +107,12 @@ struct Tensor {
     // backend's memcpy_h2d hook; for the CPU default it's a plain memcpy.
     static Tensor from_host(const float* src, int r, int c);
     static Tensor from_host_fp16(const uint16_t* src, int r, int c);
+    static Tensor from_host_bf16(const uint16_t* src, int r, int c);
 
     // Variant that pins to a specific device, bypassing the default.
     static Tensor from_host_on(Device, const float* src, int r, int c);
     static Tensor from_host_fp16_on(Device, const uint16_t* src, int r, int c);
+    static Tensor from_host_bf16_on(Device, const uint16_t* src, int r, int c);
 
     // Non-owning view over an existing backend-resident pointer. The
     // returned tensor's destructor will NOT free `data`. Caller is
@@ -153,6 +158,8 @@ struct Tensor {
     const float* host_f32() const;
     uint16_t*       host_fp16_mut();
     const uint16_t* host_fp16() const;
+    uint16_t*       host_bf16_mut();
+    const uint16_t* host_bf16() const;
     void*        host_raw_mut();
     const void*  host_raw() const;
 
@@ -180,20 +187,25 @@ struct Tensor {
     // of at least size() elements.
     std::vector<float>    to_host_vector() const;          // FP32 only
     std::vector<uint16_t> to_host_vector_fp16() const;     // FP16 only
+    std::vector<uint16_t> to_host_vector_bf16() const;     // BF16 only
     void copy_to_host(float* dst) const;                   // FP32 only
     void copy_to_host_fp16(uint16_t* dst) const;           // FP16 only
+    void copy_to_host_bf16(uint16_t* dst) const;           // BF16 only
 
 private:
     bool owns_ = false;
     void release_();
 };
 
-// ─── FP16 ↔ FP32 host-side conversion helpers ──────────────────────────────
+// ─── FP16 / BF16 ↔ FP32 host-side conversion helpers ───────────────────────
 //
-// Pure-CPU IEEE 754 binary16 conversion. Useful for tests and small
-// preprocessing where a GPU roundtrip would be wasteful. Not intended for
-// hot loops.
+// Pure-CPU conversion. `fp16` is IEEE 754 binary16; `bf16` is bfloat16 — the
+// high 16 bits of an FP32 with round-to-nearest-even. Useful for tests and
+// small preprocessing where a GPU roundtrip would be wasteful. Not intended
+// for hot loops.
 uint16_t fp32_to_fp16_bits(float v);
 float    fp16_bits_to_fp32(uint16_t bits);
+uint16_t fp32_to_bf16_bits(float v);
+float    bf16_bits_to_fp32(uint16_t bits);
 
 } // namespace brotensor

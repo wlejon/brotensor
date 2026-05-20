@@ -23,6 +23,7 @@ int dtype_size_bytes(Dtype dt) {
     switch (dt) {
         case Dtype::FP32:  return 4;
         case Dtype::FP16:  return 2;
+        case Dtype::BF16:  return 2;
         case Dtype::INT8:  return 1;
         case Dtype::INT32: return 4;
     }
@@ -98,6 +99,29 @@ float fp16_bits_to_fp32(uint16_t bits) {
     }
     float f;
     std::memcpy(&f, &out, 4);
+    return f;
+}
+
+// ─── BF16 ↔ FP32 conversion (host-side bfloat16) ───────────────────────────
+
+uint16_t fp32_to_bf16_bits(float v) {
+    uint32_t x;
+    std::memcpy(&x, &v, 4);
+    // NaN: keep it a NaN (the rounding add below could otherwise carry a
+    // NaN's mantissa into the exponent and produce an infinity).
+    if (((x >> 23) & 0xFFu) == 0xFFu && (x & 0x7FFFFFu) != 0) {
+        return static_cast<uint16_t>((x >> 16) | 0x0040u);
+    }
+    // Round to nearest, ties to even: add 0x7FFF + LSB-of-result.
+    const uint32_t rounding_bias = 0x7FFFu + ((x >> 16) & 1u);
+    x += rounding_bias;
+    return static_cast<uint16_t>(x >> 16);
+}
+
+float bf16_bits_to_fp32(uint16_t bits) {
+    const uint32_t x = static_cast<uint32_t>(bits) << 16;
+    float f;
+    std::memcpy(&f, &x, 4);
     return f;
 }
 
@@ -270,12 +294,28 @@ Tensor Tensor::from_host_fp16_on(Device d, const uint16_t* src, int r, int c) {
     return t;
 }
 
+Tensor Tensor::from_host_bf16_on(Device d, const uint16_t* src, int r, int c) {
+    Tensor t = empty_on(d, r, c, Dtype::BF16);
+    const std::size_t n = t.bytes();
+    if (n == 0) return t;
+    if (d == Device::CPU) {
+        std::memcpy(t.data, src, n);
+    } else {
+        detail::alloc_for(d).memcpy_h2d(t.data, src, n);
+    }
+    return t;
+}
+
 Tensor Tensor::from_host(const float* src, int r, int c) {
     return from_host_on(default_device(), src, r, c);
 }
 
 Tensor Tensor::from_host_fp16(const uint16_t* src, int r, int c) {
     return from_host_fp16_on(default_device(), src, r, c);
+}
+
+Tensor Tensor::from_host_bf16(const uint16_t* src, int r, int c) {
+    return from_host_bf16_on(default_device(), src, r, c);
 }
 
 Tensor Tensor::view(Device d, void* data, int r, int c, Dtype dt) {
@@ -381,6 +421,17 @@ const uint16_t* Tensor::host_fp16() const {
     return static_cast<const uint16_t*>(data);
 }
 
+uint16_t* Tensor::host_bf16_mut() {
+    check_host(*this, "host_bf16_mut");
+    check_dtype(*this, Dtype::BF16, "host_bf16_mut");
+    return static_cast<uint16_t*>(data);
+}
+const uint16_t* Tensor::host_bf16() const {
+    check_host(*this, "host_bf16");
+    check_dtype(*this, Dtype::BF16, "host_bf16");
+    return static_cast<const uint16_t*>(data);
+}
+
 void* Tensor::host_raw_mut() {
     check_host(*this, "host_raw_mut");
     return data;
@@ -440,6 +491,21 @@ std::vector<uint16_t> Tensor::to_host_vector_fp16() const {
     return out;
 }
 
+std::vector<uint16_t> Tensor::to_host_vector_bf16() const {
+    if (dtype != Dtype::BF16) {
+        throw_msg("brotensor: to_host_vector_bf16: dtype not BF16");
+    }
+    std::vector<uint16_t> out(static_cast<std::size_t>(rows) * cols);
+    const std::size_t n = bytes();
+    if (n == 0) return out;
+    if (device == Device::CPU) {
+        std::memcpy(out.data(), data, n);
+    } else {
+        detail::alloc_for(device).memcpy_d2h(out.data(), data, n);
+    }
+    return out;
+}
+
 void Tensor::copy_to_host(float* dst) const {
     if (dtype != Dtype::FP32) {
         throw_msg("brotensor: copy_to_host: dtype not FP32");
@@ -456,6 +522,19 @@ void Tensor::copy_to_host(float* dst) const {
 void Tensor::copy_to_host_fp16(uint16_t* dst) const {
     if (dtype != Dtype::FP16) {
         throw_msg("brotensor: copy_to_host_fp16: dtype not FP16");
+    }
+    const std::size_t n = bytes();
+    if (n == 0) return;
+    if (device == Device::CPU) {
+        std::memcpy(dst, data, n);
+    } else {
+        detail::alloc_for(device).memcpy_d2h(dst, data, n);
+    }
+}
+
+void Tensor::copy_to_host_bf16(uint16_t* dst) const {
+    if (dtype != Dtype::BF16) {
+        throw_msg("brotensor: copy_to_host_bf16: dtype not BF16");
     }
     const std::size_t n = bytes();
     if (n == 0) return;

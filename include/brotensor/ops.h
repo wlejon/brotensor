@@ -416,9 +416,10 @@ void copy_d2d(const Tensor& src, int src_off,
 
 // Dtype cast: dst = src converted to out_dtype. dst is resized to
 // (src.rows, src.cols, out_dtype) and ends up on src's device. Supports the
-// FP32 <-> FP16 pair (and a same-dtype passthrough copy); other pairs throw.
-// Device-polymorphic — the standard mixed-precision primitive (FP16 weight
-// <-> FP32 master copy) for optimizers built on brotensor.
+// FP32 <-> FP16 and FP32 <-> BF16 pairs (and a same-dtype passthrough copy);
+// other pairs throw. Device-polymorphic — the standard mixed-precision
+// primitive (low-precision weight <-> FP32 master copy) for optimizers built
+// on brotensor.
 void cast(const Tensor& src, Tensor& dst, Dtype out_dtype);
 
 // Inference-only batched LayerNorm forward. Processes R independent rows
