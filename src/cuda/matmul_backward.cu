@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -178,6 +179,81 @@ __global__ void mmb_fold_fp16_kernel(__half* __restrict__ dst,
     dst[i] = __float2half(cur + scratch[i]);
 }
 
+// ───────────── BF16 path: same tiled GEMMs into FP32 scratch ───────────────
+
+__global__ void mmb_dA_bf16_kernel(const __nv_bfloat16* __restrict__ dC,
+                                   const __nv_bfloat16* __restrict__ B,
+                                   float* __restrict__ dA_scratch,
+                                   int M, int N, int K) {
+    __shared__ float dCs[MMB_TILE][MMB_TILE];
+    __shared__ float Bts[MMB_TILE][MMB_TILE];
+
+    const int row = blockIdx.y * MMB_TILE + threadIdx.y;  // m
+    const int col = blockIdx.x * MMB_TILE + threadIdx.x;  // k
+
+    float acc = 0.0f;
+    const int n_tiles = (N + MMB_TILE - 1) / MMB_TILE;
+    for (int t = 0; t < n_tiles; ++t) {
+        const int dc_col = t * MMB_TILE + threadIdx.x;
+        const int bt_row = t * MMB_TILE + threadIdx.y;
+        dCs[threadIdx.y][threadIdx.x] =
+            (row < M && dc_col < N) ? __bfloat162float(dC[row * N + dc_col]) : 0.0f;
+        Bts[threadIdx.y][threadIdx.x] =
+            (col < K && bt_row < N) ? __bfloat162float(B[col * N + bt_row]) : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int n = 0; n < MMB_TILE; ++n) {
+            acc += dCs[threadIdx.y][n] * Bts[n][threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < K) {
+        atomicAdd(&dA_scratch[row * K + col], acc);
+    }
+}
+
+__global__ void mmb_dB_bf16_kernel(const __nv_bfloat16* __restrict__ A,
+                                   const __nv_bfloat16* __restrict__ dC,
+                                   float* __restrict__ dB_scratch,
+                                   int M, int N, int K) {
+    __shared__ float Ats[MMB_TILE][MMB_TILE];
+    __shared__ float dCs[MMB_TILE][MMB_TILE];
+
+    const int row = blockIdx.y * MMB_TILE + threadIdx.y;  // k
+    const int col = blockIdx.x * MMB_TILE + threadIdx.x;  // n
+
+    float acc = 0.0f;
+    const int n_tiles = (M + MMB_TILE - 1) / MMB_TILE;
+    for (int t = 0; t < n_tiles; ++t) {
+        const int a_row  = t * MMB_TILE + threadIdx.x;
+        const int dc_row = t * MMB_TILE + threadIdx.y;
+        Ats[threadIdx.y][threadIdx.x] =
+            (row < K && a_row < M) ? __bfloat162float(A[a_row * K + row]) : 0.0f;
+        dCs[threadIdx.y][threadIdx.x] =
+            (dc_row < M && col < N) ? __bfloat162float(dC[dc_row * N + col]) : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int m = 0; m < MMB_TILE; ++m) {
+            acc += Ats[threadIdx.y][m] * dCs[m][threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    if (row < K && col < N) {
+        atomicAdd(&dB_scratch[row * N + col], acc);
+    }
+}
+
+__global__ void mmb_fold_bf16_kernel(__nv_bfloat16* __restrict__ dst,
+                                     const float* __restrict__ scratch,
+                                     int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const float cur = __bfloat162float(dst[i]);
+    dst[i] = __float2bfloat16(cur + scratch[i]);
+}
+
 } // namespace
 
 void matmul_backward(const ::brotensor::Tensor& A,
@@ -189,8 +265,9 @@ void matmul_backward(const ::brotensor::Tensor& A,
         A.dtype != dA.dtype || A.dtype != dB.dtype) {
         throw std::runtime_error("matmul_backward: dtype mismatch");
     }
-    if (A.dtype != Dtype::FP32 && A.dtype != Dtype::FP16) {
-        throw std::runtime_error("matmul_backward: only FP32/FP16 supported");
+    if (A.dtype != Dtype::FP32 && A.dtype != Dtype::FP16 &&
+        A.dtype != Dtype::BF16) {
+        throw std::runtime_error("matmul_backward: only FP32/FP16/BF16 supported");
     }
     const int M = A.rows;
     const int K = A.cols;
@@ -232,6 +309,49 @@ void matmul_backward(const ::brotensor::Tensor& A,
                 static_cast<const float*>(A.data),
                 static_cast<const float*>(dC.data),
                 static_cast<float*>(dB.data), M, N, K);
+        }
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (A.dtype == Dtype::BF16) {
+        // BF16 path: FP32 scratch + fold (FP16-pattern twin).
+        ::brotensor::Tensor dA_scratch =
+            ::brotensor::Tensor::zeros_on(::brotensor::Device::CUDA, M, K, Dtype::FP32);
+        ::brotensor::Tensor dB_scratch =
+            ::brotensor::Tensor::zeros_on(::brotensor::Device::CUDA, K, N, Dtype::FP32);
+
+        {
+            dim3 block(MMB_TILE, MMB_TILE);
+            dim3 grid((K + MMB_TILE - 1) / MMB_TILE,
+                      (M + MMB_TILE - 1) / MMB_TILE);
+            mmb_dA_bf16_kernel<<<grid, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(dC.data),
+                static_cast<const __nv_bfloat16*>(B.data),
+                static_cast<float*>(dA_scratch.data), M, N, K);
+        }
+        {
+            dim3 block(MMB_TILE, MMB_TILE);
+            dim3 grid((N + MMB_TILE - 1) / MMB_TILE,
+                      (K + MMB_TILE - 1) / MMB_TILE);
+            mmb_dB_bf16_kernel<<<grid, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(A.data),
+                static_cast<const __nv_bfloat16*>(dC.data),
+                static_cast<float*>(dB_scratch.data), M, N, K);
+        }
+        {
+            const int total = M * K;
+            const int blocks = (total + 255) / 256;
+            mmb_fold_bf16_kernel<<<blocks, 256, 0, stream>>>(
+                static_cast<__nv_bfloat16*>(dA.data),
+                static_cast<const float*>(dA_scratch.data), total);
+        }
+        {
+            const int total = K * N;
+            const int blocks = (total + 255) / 256;
+            mmb_fold_bf16_kernel<<<blocks, 256, 0, stream>>>(
+                static_cast<__nv_bfloat16*>(dB.data),
+                static_cast<const float*>(dB_scratch.data), total);
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         return;

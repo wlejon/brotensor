@@ -90,6 +90,55 @@ void run_matmul_bwd_accum(int M, int K, int N, uint64_t seed) {
     compare_tensors(cpu_dB, download_to_host(gpu_dB), "matmul_bwd_accum_dB", 1e-4f, 1e-3f);
 }
 
+// ─── BF16 parity (GPU-only): BF16-on-CUDA vs FP32 CPU reference ─────────────
+
+void run_matmul_bf16(int M, int K, int N, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor A = Tensor::mat(M, K);
+    Tensor B = Tensor::mat(K, N);
+    fill_random(A, rng);
+    fill_random(B, rng);
+
+    Tensor cpu_C;
+    brotensor::matmul(A, B, cpu_C);
+
+    Tensor gA = to_bf16_cuda(A);
+    Tensor gB = to_bf16_cuda(B);
+    Tensor gpu_C;
+    brotensor::matmul(gA, gB, gpu_C);
+
+    // BF16: 8 mantissa bits over a K-length reduction — loose tolerance.
+    compare_tensors(cpu_C, bf16_host_to_f32(download_to_host(gpu_C)),
+                    "matmul_bf16", 5e-2f, 5e-2f);
+}
+
+void run_matmul_bwd_bf16(int M, int K, int N, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor A  = Tensor::mat(M, K);
+    Tensor B  = Tensor::mat(K, N);
+    Tensor dC = Tensor::mat(M, N);
+    fill_random(A, rng);
+    fill_random(B, rng);
+    fill_random(dC, rng);
+
+    Tensor cpu_dA = Tensor::mat(M, K);  // zero-initialised
+    Tensor cpu_dB = Tensor::mat(K, N);
+    brotensor::matmul_backward(A, B, dC, cpu_dA, cpu_dB);
+
+    Tensor gA  = to_bf16_cuda(A);
+    Tensor gB  = to_bf16_cuda(B);
+    Tensor gdC = to_bf16_cuda(dC);
+    Tensor gpu_dA = Tensor::zeros_on(Device::CUDA, M, K, brotensor::Dtype::BF16);
+    Tensor gpu_dB = Tensor::zeros_on(Device::CUDA, K, N, brotensor::Dtype::BF16);
+    brotensor::matmul_backward(gA, gB, gdC, gpu_dA, gpu_dB);
+
+    // Backward over a reduction — keep K modest and tolerance loose.
+    compare_tensors(cpu_dA, bf16_host_to_f32(download_to_host(gpu_dA)),
+                    "matmul_bwd_bf16_dA", 1e-1f, 1e-1f);
+    compare_tensors(cpu_dB, bf16_host_to_f32(download_to_host(gpu_dB)),
+                    "matmul_bwd_bf16_dB", 1e-1f, 1e-1f);
+}
+
 } // namespace
 
 // ─── forward ───────────────────────────────────────────────────────────────
@@ -105,5 +154,13 @@ BT_PARITY_TEST(matmul_bwd_1x1x1)     { run_matmul_bwd(1, 1, 1, 0x5010ull); }
 BT_PARITY_TEST(matmul_bwd_square)    { run_matmul_bwd(16, 16, 16, 0x5011ull); }
 BT_PARITY_TEST(matmul_bwd_nonsquare) { run_matmul_bwd(7, 19, 11, 0x5012ull); }
 BT_PARITY_TEST(matmul_bwd_accum)     { run_matmul_bwd_accum(9, 13, 5, 0x5013ull); }
+
+// ─── BF16 parity ─────────────────────────────────────────────────────────────
+BT_PARITY_TEST(matmul_bf16_square)    { run_matmul_bf16(16, 16, 16, 0x5020ull); }
+BT_PARITY_TEST(matmul_bf16_nonsquare) { run_matmul_bf16(7, 19, 11, 0x5021ull); }
+BT_PARITY_TEST(matmul_bf16_rowvec)    { run_matmul_bf16(1, 13, 9, 0x5022ull); }
+
+BT_PARITY_TEST(matmul_bwd_bf16_square)    { run_matmul_bwd_bf16(16, 16, 16, 0x5030ull); }
+BT_PARITY_TEST(matmul_bwd_bf16_nonsquare) { run_matmul_bwd_bf16(7, 19, 11, 0x5031ull); }
 
 int main() { return run_all("matmul/matmul_backward cpu/gpu parity"); }

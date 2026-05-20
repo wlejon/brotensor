@@ -13,6 +13,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -97,6 +98,40 @@ __global__ void matmul_fp16_kernel(const __half* __restrict__ A,
     }
 }
 
+__global__ void matmul_bf16_kernel(const __nv_bfloat16* __restrict__ A,
+                                   const __nv_bfloat16* __restrict__ B,
+                                   __nv_bfloat16* __restrict__ C,
+                                   int M, int N, int K) {
+    __shared__ float As[MM_TILE][MM_TILE];
+    __shared__ float Bs[MM_TILE][MM_TILE];
+
+    const int row = blockIdx.y * MM_TILE + threadIdx.y;
+    const int col = blockIdx.x * MM_TILE + threadIdx.x;
+
+    float acc = 0.0f;
+    const int n_tiles = (K + MM_TILE - 1) / MM_TILE;
+    for (int t = 0; t < n_tiles; ++t) {
+        const int a_col = t * MM_TILE + threadIdx.x;
+        const int b_row = t * MM_TILE + threadIdx.y;
+
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && a_col < K) ? __bfloat162float(A[row * K + a_col]) : 0.0f;
+        Bs[threadIdx.y][threadIdx.x] =
+            (b_row < K && col < N) ? __bfloat162float(B[b_row * N + col]) : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < MM_TILE; ++k) {
+            acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = __float2bfloat16(acc);
+    }
+}
+
 } // namespace
 
 void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
@@ -128,6 +163,12 @@ void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
             static_cast<const __half*>(A.data),
             static_cast<const __half*>(B.data),
             static_cast<__half*>(C.data),
+            M, N, K);
+    } else if (A.dtype == Dtype::BF16) {
+        matmul_bf16_kernel<<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(A.data),
+            static_cast<const __nv_bfloat16*>(B.data),
+            static_cast<__nv_bfloat16*>(C.data),
             M, N, K);
     } else {
         matmul_fp32_kernel<<<grid, block, 0, stream>>>(
