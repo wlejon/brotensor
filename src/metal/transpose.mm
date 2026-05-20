@@ -118,8 +118,7 @@ void launch_transpose(id<MTLComputePipelineState> pso,
         [enc dispatchThreads:MTLSizeMake(total, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

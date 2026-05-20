@@ -458,8 +458,7 @@ void group_norm_forward(const Tensor& X,
         [enc dispatchThreadgroups:MTLSizeMake(num_groups, N, 1)
             threadsPerThreadgroup:MTLSizeMake(GN_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -562,8 +561,7 @@ void group_norm_backward(const Tensor& X,
             threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
 
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

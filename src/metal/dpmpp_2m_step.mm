@@ -105,8 +105,7 @@ void dpmpp_2m_step(const Tensor& x_t, const Tensor& eps_pred,
         [enc dispatchThreads:MTLSizeMake(total, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

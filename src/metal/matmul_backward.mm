@@ -236,8 +236,7 @@ void matmul_backward(const Tensor& A,
             [enc dispatchThreadgroups:gridB threadsPerThreadgroup:tg];
 
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
         return;
     }
@@ -300,8 +299,7 @@ void matmul_backward(const Tensor& A,
             threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
 
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

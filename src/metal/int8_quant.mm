@@ -330,8 +330,7 @@ void matmul_int8w_fp16(const Tensor& W_int8,
         [enc dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
             threadsPerThreadgroup:MTLSizeMake(MM_TILE, MM_TILE, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -421,8 +420,7 @@ void conv2d_int8w_fp16_forward(const Tensor& X,
         [enc dispatchThreads:MTLSizeMake(total, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -495,8 +493,7 @@ void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
         [enc dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
             threadsPerThreadgroup:MTLSizeMake(MM_TILE, MM_TILE, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

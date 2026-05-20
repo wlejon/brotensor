@@ -229,8 +229,7 @@ void launch_gn_silu(const Tensor& X,
         [enc dispatchThreadgroups:MTLSizeMake(num_groups, N, 1)
             threadsPerThreadgroup:MTLSizeMake(RB_GN_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -261,8 +260,7 @@ void launch_add_shift(Tensor& Y, const Tensor& shift,
         [enc dispatchThreads:MTLSizeMake(p.total, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -289,8 +287,7 @@ void launch_sum_hw_per_NC(const Tensor& dh2, Tensor& d_shift,
         [enc dispatchThreadgroups:MTLSizeMake(blocks, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(RB_GN_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

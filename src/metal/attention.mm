@@ -371,8 +371,7 @@ void run2d(id<MTLComputePipelineState> pso, NSUInteger nx, NSUInteger ny,
         bind(enc);
         enc2d(enc, pso, nx, ny);
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -387,8 +386,7 @@ void run_rows(id<MTLComputePipelineState> pso, NSUInteger rows,
         [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(ROW_SM_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

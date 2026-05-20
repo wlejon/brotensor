@@ -607,8 +607,7 @@ void conv2d_forward(const Tensor& X,
         [enc dispatchThreads:MTLSizeMake(total, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -680,8 +679,7 @@ void conv2d_backward_input(const Tensor& Wt,
         [enc dispatchThreads:MTLSizeMake(total, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -769,8 +767,7 @@ void conv2d_backward_weight(const Tensor& X,
             threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
 
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -835,8 +832,7 @@ void conv2d_backward_bias(const Tensor& dY,
             threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
 
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

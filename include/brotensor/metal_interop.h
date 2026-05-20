@@ -37,9 +37,33 @@ namespace brotensor::metal_impl {
 id<MTLDevice>       device();
 id<MTLCommandQueue> queue();
 
-// A fresh MTLCommandBuffer drawn from queue(). The caller encodes, commits,
-// and (if synchronous) waits.
+// A fresh MTLCommandBuffer drawn from queue(). The caller encodes it, then
+// hands it to submit() (asynchronous — preferred) or commits + waits by hand.
 id<MTLCommandBuffer> new_command_buffer();
+
+// ─── Asynchronous command submission ───────────────────────────────────────
+//
+// submit() commits a finished command buffer and returns immediately, without
+// blocking on waitUntilCompleted. It records the buffer as the calling
+// thread's "pending" one so flush() can later wait on it. The GPU drains the
+// shared queue() while the CPU races ahead encoding the next op — for a
+// workload of many small kernels (e.g. a diffusion U-Net forward) this
+// removes the per-op CPU<->GPU round-trip that otherwise dominates wall time.
+//
+// Correctness: every command buffer on queue() executes in submission order,
+// so a kernel always observes the writes of every kernel submitted before it
+// without an explicit wait. brotensor calls flush() before every
+// device->host transfer and inside sync(), so host-visible reads are always
+// up to date. submit() also auto-flushes periodically to bound the number of
+// in-flight command buffers.
+//
+// A custom-kernel author should prefer submit() over a manual commit, and
+// call flush() before reading an MTLBuffer's contents directly on the host.
+void submit(id<MTLCommandBuffer> cmd);
+
+// Block until the calling thread's pending submitted command buffer — and
+// therefore every command buffer committed before it — has completed.
+void flush();
 
 // ─── Tensor -> MTLBuffer resolution ────────────────────────────────────────
 //

@@ -74,8 +74,7 @@ void run1d(id<MTLComputePipelineState> pso, NSUInteger n,
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -158,8 +157,7 @@ void linear_backward(const Tensor& W, const Tensor& x,
             MTLSize tg   = MTLSizeMake(w, h, 1);
             [enc dispatchThreads:grid threadsPerThreadgroup:tg];
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
     }
 
@@ -217,8 +215,7 @@ void launch_1d(id<MTLComputePipelineState> pso, NSUInteger n,
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

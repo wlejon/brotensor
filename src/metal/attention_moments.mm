@@ -147,8 +147,7 @@ void attention_token_moments(const Tensor& Attn,
         [enc dispatchThreadgroups:MTLSizeMake(Lk, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(MOM_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

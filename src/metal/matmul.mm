@@ -149,8 +149,7 @@ void matmul(const Tensor& A, const Tensor& B, Tensor& C) {
         MTLSize tg = MTLSizeMake(MM_TILE, MM_TILE, 1);
         [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

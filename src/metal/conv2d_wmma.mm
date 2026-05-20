@@ -359,8 +359,7 @@ bool launch_conv2d_implicit_gemm_simdgroup(
         [enc dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
              threadsPerThreadgroup:MTLSizeMake(THREADS_PER_TG, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
     return true;
 }

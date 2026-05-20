@@ -251,8 +251,7 @@ void launch_matmul_abt_fp16(id<MTLBuffer> A, NSUInteger ofs_A,
             [enc dispatchThreads:MTLSizeMake(total, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
         return;
     }
@@ -296,8 +295,7 @@ void launch_matmul_abt_fp16(id<MTLBuffer> A, NSUInteger ofs_A,
         }
 
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

@@ -260,8 +260,7 @@ void dispatch1d(id<MTLComputePipelineState> pso, NSUInteger n,
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -278,8 +277,7 @@ void dispatch2d(id<MTLComputePipelineState> pso, NSUInteger nx, NSUInteger ny,
         [enc dispatchThreads:MTLSizeMake(nx, ny, 1)
         threadsPerThreadgroup:MTLSizeMake(w, h, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

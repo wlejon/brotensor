@@ -65,8 +65,7 @@ void sgd_step(Tensor& param, Tensor& grad, Tensor& velocity,
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

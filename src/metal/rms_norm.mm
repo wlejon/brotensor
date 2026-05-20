@@ -257,8 +257,7 @@ void rms_norm_forward(const Tensor& X, const Tensor& gamma,
         [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(RMS_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -310,8 +309,7 @@ void rms_norm_backward(const Tensor& X, const Tensor& gamma,
             [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(RMS_BLOCK, 1, 1)];
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
         return;
     }
@@ -346,8 +344,7 @@ void rms_norm_backward(const Tensor& X, const Tensor& gamma,
         [enc dispatchThreadgroups:MTLSizeMake((D + tpt - 1) / tpt, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

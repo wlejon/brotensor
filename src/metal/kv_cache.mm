@@ -187,8 +187,7 @@ void run_copy(id<MTLBuffer> src_buf, NSUInteger src_off_bytes,
         [enc dispatchThreads:MTLSizeMake(n_halves, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -300,8 +299,7 @@ void flash_attention_decode(const Tensor& Q,
                                               static_cast<NSUInteger>(num_heads), 1)
             threadsPerThreadgroup:MTLSizeMake(FAD_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

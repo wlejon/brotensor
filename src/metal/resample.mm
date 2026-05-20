@@ -465,8 +465,7 @@ void launch_resample_fwd(id<MTLComputePipelineState> pso_fp16,
         [enc dispatchThreads:MTLSizeMake(total, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -511,8 +510,7 @@ void launch_resample_bwd_simple(id<MTLComputePipelineState> pso_fp16,
         [enc dispatchThreads:MTLSizeMake(total_in, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -644,8 +642,7 @@ void upsample_bilinear_2x_backward(const Tensor& dY,
         }
 
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

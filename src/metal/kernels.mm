@@ -205,8 +205,7 @@ void dispatch1d_sync(NSString* pipeline_name,
         MTLSize tgsize = MTLSizeMake(tg, 1, 1);
         [enc dispatchThreads:grid threadsPerThreadgroup:tgsize];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

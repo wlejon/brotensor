@@ -316,8 +316,7 @@ void run_pack_or_extract(id<MTLComputePipelineState> pso,
         [enc dispatchThreads:MTLSizeMake(grid, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -352,8 +351,7 @@ void run_softmax_rows(id<MTLBuffer> bS, NSUInteger oS,
         [enc dispatchThreadgroups:MTLSizeMake(Lq, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -380,8 +378,7 @@ void run_2d_kernel(id<MTLComputePipelineState> pso,
         [enc dispatchThreads:MTLSizeMake(gx, gy, 1)
           threadsPerThreadgroup:MTLSizeMake(tgx, tgy, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -405,8 +402,7 @@ void run_dS(id<MTLBuffer> bP, NSUInteger oP,
         [enc dispatchThreadgroups:MTLSizeMake(Lq, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

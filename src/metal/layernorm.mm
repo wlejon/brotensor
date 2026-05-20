@@ -413,8 +413,7 @@ void layernorm_forward_inference_batched(const Tensor& X_RD,
         [enc dispatchThreadgroups:MTLSizeMake(R, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(LN_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -524,8 +523,7 @@ void layernorm_forward_inference_batched_fp16(const Tensor& X_RD,
         [enc dispatchThreadgroups:MTLSizeMake(R, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(LN_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

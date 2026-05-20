@@ -122,8 +122,7 @@ void dispatch_scalar_inplace(id<MTLComputePipelineState> pso,
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 } // namespace
@@ -184,8 +183,7 @@ void clamp(Tensor& y, float lo, float hi) {
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -480,8 +478,7 @@ void launch_activation_unary(id<MTLComputePipelineState> pso,
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -528,8 +525,7 @@ void launch_activation_bwd(id<MTLComputePipelineState> pso,
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 } // namespace
@@ -814,8 +810,7 @@ void launch_1d(id<MTLComputePipelineState> pso, NSUInteger n,
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -1050,8 +1045,7 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
                         toBuffer:bd destinationOffset:od
                             size:src.bytes()];
             [blit endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
         return;
     }

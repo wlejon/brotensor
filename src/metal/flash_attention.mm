@@ -566,8 +566,7 @@ void run_causal_flash(const Tensor& Q,
         [enc dispatchThreadgroups:MTLSizeMake(Lq, num_heads, 1)
             threadsPerThreadgroup:MTLSizeMake(FA_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -684,8 +683,7 @@ void flash_attention_forward(const Tensor& Q,
             encode_per_elem(enc, p_ext_LD, bK, oK, bKh, oKh, Lku, Du, head_off, hdU);
             encode_per_elem(enc, p_ext_DL, bV, oV, bVt, oVt, Lku, Du, head_off, hdU);
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
 
         // 2. S(Lq, Lk) = Qh(Lq, hd) @ Kh(Lk, hd)^T  — A @ B^T.
@@ -706,8 +704,7 @@ void flash_attention_forward(const Tensor& Q,
             [enc dispatchThreadgroups:MTLSizeMake(Lq, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(sm_tg, 1, 1)];
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
 
         // 4. Oh(Lq, hd) = S(Lq, Lk) @ Vth(hd, Lk)^T  — Vth as B (N=hd, K=Lk).
@@ -719,8 +716,7 @@ void flash_attention_forward(const Tensor& Q,
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             encode_per_elem(enc, p_pack, bOh, oOh, bO, oO, Lqu, Du, head_off, hdU);
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
     }
 }
@@ -1181,8 +1177,7 @@ void flash_attention_qkvo_backward(
             encode_per_elem(enc, p_ext_LD, bKp, oKp, bKh, oKh, Lku, Du, head_off, hdU);
             encode_per_elem(enc, p_ext_DL, bVp, oVp, bVt, oVt, Lku, Du, head_off, hdU);
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
 
         // S = Qh @ Kh^T
@@ -1204,8 +1199,7 @@ void flash_attention_qkvo_backward(
             [enc dispatchThreadgroups:MTLSizeMake(Lq, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(sm_tg, 1, 1)];
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
 
         // Oh = S @ Vth^T  (N = hd, K = Lk)
@@ -1217,8 +1211,7 @@ void flash_attention_qkvo_backward(
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             encode_per_elem(enc, p_pack, bOh, oOh, bOA, oOA, Lqu, Du, head_off, hdU);
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
     }
 
@@ -1247,8 +1240,7 @@ void flash_attention_qkvo_backward(
             encode_per_elem(enc, p_ext_LD, bVp, oVp, bVh, oVh, Lku, Du, head_off, hdU);
             encode_per_elem(enc, p_ext_LD, bdOA, odOA, bdOh, odOh, Lqu, Du, head_off, hdU);
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
 
         // Recompute P = softmax(scale * Qh@Kh^T, mask, causal).
@@ -1268,8 +1260,7 @@ void flash_attention_qkvo_backward(
             [enc dispatchThreadgroups:MTLSizeMake(Lq, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(sm_tg, 1, 1)];
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
 
         // dVh, dP — independent, can share one command buffer.
@@ -1307,8 +1298,7 @@ void flash_attention_qkvo_backward(
                   threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
             }
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
 
         // dS = P * (dP - D_q) * inv_sqrt  (in-place over P).
@@ -1325,8 +1315,7 @@ void flash_attention_qkvo_backward(
             [enc dispatchThreadgroups:MTLSizeMake(Lq, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(sm_tg, 1, 1)];
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
 
         // dQh, dKh.
@@ -1362,8 +1351,7 @@ void flash_attention_qkvo_backward(
                   threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
             }
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
 
         // Pack dQh / dKh / dVh back into per-batch dQ / dK / dV.
@@ -1374,8 +1362,7 @@ void flash_attention_qkvo_backward(
             encode_per_elem(enc, p_pack, bdKh, odKh, bdK, odK, Lku, Du, head_off, hdU);
             encode_per_elem(enc, p_pack, bdVh, odVh, bdV, odV, Lku, Du, head_off, hdU);
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
     }
 

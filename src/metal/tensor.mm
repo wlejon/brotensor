@@ -138,24 +138,35 @@ void metal_free(void* ptr) {
 }
 
 // Apple Silicon unified memory: an MTLBuffer's contents pointer is directly
-// host-addressable, so every transfer direction is a plain memcpy.
+// host-addressable, so every transfer direction is a plain memcpy. Ops submit
+// command buffers asynchronously (see metal_impl::submit), so each transfer
+// flushes first: a device->host read must observe completed GPU writes, and a
+// host write must not race a kernel still reading or writing the same buffer.
 void metal_memcpy_h2d(void* dst, const void* src, std::size_t n) {
-    if (n) std::memcpy(dst, src, n);
+    if (!n) return;
+    metal_impl::flush();
+    std::memcpy(dst, src, n);
 }
 void metal_memcpy_d2h(void* dst, const void* src, std::size_t n) {
-    if (n) std::memcpy(dst, src, n);
+    if (!n) return;
+    metal_impl::flush();
+    std::memcpy(dst, src, n);
 }
 void metal_memcpy_d2d(void* dst, const void* src, std::size_t n) {
-    if (n) std::memcpy(dst, src, n);
+    if (!n) return;
+    metal_impl::flush();
+    std::memcpy(dst, src, n);
 }
 
 void metal_memset_zero(void* dst, std::size_t n) {
-    if (n) std::memset(dst, 0, n);
+    if (!n) return;
+    metal_impl::flush();
+    std::memset(dst, 0, n);
 }
 
-// Ops submit their own command buffers and wait on them before returning, so
-// by the time control reaches here the GPU is already caught up.
-void metal_sync() {}
+// Drain the asynchronous submission queue — wait on the most recent pending
+// command buffer, which (serial queue) implies all earlier ones are done.
+void metal_sync() { metal_impl::flush(); }
 
 const ::brotensor::detail::AllocVTable& metal_alloc_table() {
     static const ::brotensor::detail::AllocVTable t = {

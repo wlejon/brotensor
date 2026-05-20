@@ -178,8 +178,7 @@ void run_per_row(id<MTLComputePipelineState> pso, uint32_t M, uint32_t N,
         [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(RED_BLOCK, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -199,8 +198,7 @@ void run_per_col(id<MTLComputePipelineState> pso, uint32_t M, uint32_t N,
         [enc dispatchThreads:MTLSizeMake(N, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 

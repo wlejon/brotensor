@@ -272,8 +272,7 @@ void dispatch3d(id<MTLComputePipelineState> pso,
         MTLSize tg   = MTLSizeMake(w, h, 1);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -408,8 +407,7 @@ void cross_attention_forward_with_attn(const Tensor& X,
             [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(ROW_SM_BLOCK, 1, 1)];
             [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
+            ::brotensor::metal_impl::submit(cmd);
         }
     }
 
