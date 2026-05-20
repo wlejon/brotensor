@@ -1,5 +1,5 @@
 // CPU↔GPU parity for the SDXL-prep ops:
-//   euler_step_gpu, dpmpp_2m_step_gpu, timestep_embedding_gpu.
+//   euler_step, dpmpp_2m_step, timestep_embedding.
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -11,8 +11,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++g_failures; } } while(0)
@@ -30,7 +31,7 @@ static std::vector<float> rq(const std::vector<float>& v) {
 }
 
 static void test_euler_step() {
-    std::printf("  euler_step_gpu\n");
+    std::printf("  euler_step\n");
     const int R = 7, C = 13;
     const float sigma_t    = 1.5f;
     const float sigma_prev = 1.1f;
@@ -45,15 +46,15 @@ static void test_euler_step() {
     std::vector<float> ref(R * C);
     for (int i = 0; i < R * C; ++i) ref[i] = xtq[i] + dsigma * epsq[i];
 
-    GpuTensor Xt, Eps, Xp;
     auto xth = to_fp16(xt), eh = to_fp16(eps);
-    brotensor::upload_fp16(xth.data(), R, C, Xt);
-    brotensor::upload_fp16(eh.data(),  R, C, Eps);
-    brotensor::euler_step_gpu(Xt, Eps, sigma_t, sigma_prev, Xp);
+    Tensor Xt  = Tensor::from_host_fp16_on(Device::CUDA, xth.data(), R, C);
+    Tensor Eps = Tensor::from_host_fp16_on(Device::CUDA, eh.data(),  R, C);
+    Tensor Xp;
+    brotensor::euler_step(Xt, Eps, sigma_t, sigma_prev, Xp);
     CHECK(Xp.dtype == Dtype::FP16 && Xp.rows == R && Xp.cols == C);
     std::vector<uint16_t> got(R * C);
-    brotensor::download_fp16(Xp, got.data());
-    brotensor::cuda_sync();
+    Xp.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
 
     float max_err = 0.0f;
     int bad = 0;
@@ -68,7 +69,7 @@ static void test_euler_step() {
 }
 
 static void test_dpmpp_2m_step() {
-    std::printf("  dpmpp_2m_step_gpu\n");
+    std::printf("  dpmpp_2m_step\n");
     const int R = 9, C = 17;
     const float sigma_t  = 1.4f;
     const float c_xt     = 0.78f;     // sigma_next / sigma_t
@@ -89,18 +90,18 @@ static void test_dpmpp_2m_step() {
         ref_xp[i] = c_xt * xtq[i] + c_x0t * x0t + c_x0prev * x0pq[i];
     }
 
-    GpuTensor Xt, Eps, X0p, Xp, X0o;
     auto xth = to_fp16(xt), eh = to_fp16(eps), x0ph = to_fp16(x0p);
-    brotensor::upload_fp16(xth.data(),  R, C, Xt);
-    brotensor::upload_fp16(eh.data(),   R, C, Eps);
-    brotensor::upload_fp16(x0ph.data(), R, C, X0p);
-    brotensor::dpmpp_2m_step_gpu(Xt, Eps, X0p, sigma_t, c_xt, c_x0t, c_x0prev, Xp, X0o);
+    Tensor Xt  = Tensor::from_host_fp16_on(Device::CUDA, xth.data(),  R, C);
+    Tensor Eps = Tensor::from_host_fp16_on(Device::CUDA, eh.data(),   R, C);
+    Tensor X0p = Tensor::from_host_fp16_on(Device::CUDA, x0ph.data(), R, C);
+    Tensor Xp, X0o;
+    brotensor::dpmpp_2m_step(Xt, Eps, X0p, sigma_t, c_xt, c_x0t, c_x0prev, Xp, X0o);
     CHECK(Xp.dtype == Dtype::FP16 && Xp.rows == R && Xp.cols == C);
     CHECK(X0o.dtype == Dtype::FP16 && X0o.rows == R && X0o.cols == C);
     std::vector<uint16_t> got_xp(R * C), got_x0(R * C);
-    brotensor::download_fp16(Xp,  got_xp.data());
-    brotensor::download_fp16(X0o, got_x0.data());
-    brotensor::cuda_sync();
+    Xp.copy_to_host_fp16(got_xp.data());
+    X0o.copy_to_host_fp16(got_x0.data());
+    brotensor::sync_all();
 
     float max_err_xp = 0.0f, max_err_x0 = 0.0f;
     int bad = 0;
@@ -120,7 +121,7 @@ static void test_dpmpp_2m_step() {
 }
 
 static void test_timestep_embedding() {
-    std::printf("  timestep_embedding_gpu\n");
+    std::printf("  timestep_embedding\n");
     // Test both even and odd dim to exercise the tail-zero path.
     for (int dim : {16, 320, 17}) {
         const int N = 4;
@@ -140,13 +141,13 @@ static void test_timestep_embedding() {
             }
         }
 
-        GpuTensor T, Y;
-        brotensor::upload(ts.data(), N, 1, T);
-        brotensor::timestep_embedding_gpu(T, dim, max_period, Y);
+        Tensor T = Tensor::from_host_on(Device::CUDA, ts.data(), N, 1);
+        Tensor Y;
+        brotensor::timestep_embedding(T, dim, max_period, Y);
         CHECK(Y.dtype == Dtype::FP32 && Y.rows == N && Y.cols == dim);
         std::vector<float> got(N * dim);
-        brotensor::download(Y, got.data());
-        brotensor::cuda_sync();
+        Y.copy_to_host(got.data());
+        brotensor::sync_all();
 
         float max_err = 0.0f;
         int bad = 0;
@@ -161,7 +162,11 @@ static void test_timestep_embedding() {
 }
 
 int main() {
-    brotensor::cuda_init();
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     std::printf("test_sdxl_schedulers\n");
     test_euler_step();
     test_dpmpp_2m_step();

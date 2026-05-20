@@ -19,8 +19,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Device;
 using brotensor::Dtype;
+using brotensor::Tensor;
 
 static int g_failures = 0;
 
@@ -209,39 +210,39 @@ static void run_case(const char* label, int Lq, int Lk, int D, int nh,
 
     // Upload everything.
     auto Qh = to_fp16(Q), Kh = to_fp16(K), Vh = to_fp16(V), dOh = to_fp16(dO);
-    GpuTensor Qg, Kg, Vg, dOg, Og;
-    brotensor::upload_fp16(Qh.data(),  Lq, D, Qg);
-    brotensor::upload_fp16(Kh.data(),  Lk, D, Kg);
-    brotensor::upload_fp16(Vh.data(),  Lk, D, Vg);
-    brotensor::upload_fp16(dOh.data(), Lq, D, dOg);
+    Tensor Og;
+    Tensor Qg  = Tensor::from_host_fp16_on(Device::CUDA, Qh.data(),  Lq, D);
+    Tensor Kg  = Tensor::from_host_fp16_on(Device::CUDA, Kh.data(),  Lk, D);
+    Tensor Vg  = Tensor::from_host_fp16_on(Device::CUDA, Vh.data(),  Lk, D);
+    Tensor dOg = Tensor::from_host_fp16_on(Device::CUDA, dOh.data(), Lq, D);
 
     // Run forward to produce O (unused by current bwd impl but part of API).
-    brotensor::flash_attention_forward_gpu(Qg, Kg, Vg,
-                                           use_mask ? nullptr : nullptr, // placeholder
-                                           nh, causal, Og);
+    brotensor::flash_attention_forward(Qg, Kg, Vg,
+                                       nullptr, // placeholder
+                                       nh, causal, Og);
     // (We re-run with mask below; first call without is just to size Og.)
 
-    GpuTensor mg;
+    Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        brotensor::upload(mask_host.data(), Lk, 1, mg);
-        d_mask = mg.data;
+        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        d_mask = static_cast<const float*>(mg.data);
     }
-    brotensor::flash_attention_forward_gpu(Qg, Kg, Vg, d_mask, nh, causal, Og);
+    brotensor::flash_attention_forward(Qg, Kg, Vg, d_mask, nh, causal, Og);
 
-    GpuTensor dQg, dKg, dVg;
-    brotensor::flash_attention_backward_gpu(Qg, Kg, Vg, Og, dOg,
-                                            d_mask, nh, causal,
-                                            dQg, dKg, dVg);
+    Tensor dQg, dKg, dVg;
+    brotensor::flash_attention_backward(Qg, Kg, Vg, Og, dOg,
+                                        d_mask, nh, causal,
+                                        dQg, dKg, dVg);
     CHECK(dQg.rows == Lq && dQg.cols == D && dQg.dtype == Dtype::FP16);
     CHECK(dKg.rows == Lk && dKg.cols == D && dKg.dtype == Dtype::FP16);
     CHECK(dVg.rows == Lk && dVg.cols == D && dVg.dtype == Dtype::FP16);
 
     std::vector<uint16_t> dQ_got(Lq*D), dK_got(Lk*D), dV_got(Lk*D);
-    brotensor::download_fp16(dQg, dQ_got.data());
-    brotensor::download_fp16(dKg, dK_got.data());
-    brotensor::download_fp16(dVg, dV_got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    dQg.copy_to_host_fp16(dQ_got.data());
+    dKg.copy_to_host_fp16(dK_got.data());
+    dVg.copy_to_host_fp16(dV_got.data());
 
     check_fp16(dQ_got, dQ_ref, "dQ");
     check_fp16(dK_got, dK_ref, "dK");
@@ -249,7 +250,11 @@ static void run_case(const char* label, int Lq, int Lk, int D, int nh,
 }
 
 int main() {
-    brotensor::cuda_init();
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     std::printf("test_flash_attention_backward\n");
     // unmasked / masked, causal off, nh in {1, 2}
     run_case("basic-nh1",    4, 4, 8, 1, false, false);

@@ -10,8 +10,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Device;
 using brotensor::Dtype;
+using brotensor::Tensor;
 
 static int g_failures = 0;
 #define CHECK(cond) do {                                                    \
@@ -83,27 +84,27 @@ static void test_fp32() {
     rms_cpu_fwd(X, gamma, Yref, B, D, eps);
     rms_cpu_bwd(X, gamma, dY, dXref, dGref, B, D, eps);
 
-    GpuTensor Xg, Gg, Yg, dYg, dXg, dGg;
-    brotensor::upload(X.data(), B, D, Xg);
-    brotensor::upload(gamma.data(), D, 1, Gg);
-    brotensor::rms_norm_forward_gpu(Xg, Gg, eps, Yg);
+    Tensor Yg, dXg;
+    Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), B, D);
+    Tensor Gg = Tensor::from_host_on(Device::CUDA, gamma.data(), D, 1);
+    brotensor::rms_norm_forward(Xg, Gg, eps, Yg);
     std::vector<float> got(Yg.size());
-    brotensor::download(Yg, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    Yg.copy_to_host(got.data());
     float me = 0.0f;
     for (size_t i = 0; i < got.size(); ++i)
         me = std::max(me, std::fabs(got[i] - Yref[i]));
     std::printf("    fwd max_err=%g\n", me);
     CHECK(me < 1e-4f);
 
-    brotensor::upload(dY.data(), B, D, dYg);
-    dGg.resize(D, 1);
+    Tensor dYg = Tensor::from_host_on(Device::CUDA, dY.data(), B, D);
+    Tensor dGg = Tensor::zeros_on(Device::CUDA, D, 1);
     dGg.zero();
-    brotensor::rms_norm_backward_gpu(Xg, Gg, dYg, eps, dXg, dGg);
+    brotensor::rms_norm_backward(Xg, Gg, dYg, eps, dXg, dGg);
     std::vector<float> got_dx(dXg.size()), got_dg(dGg.size());
-    brotensor::download(dXg, got_dx.data());
-    brotensor::download(dGg, got_dg.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    dXg.copy_to_host(got_dx.data());
+    dGg.copy_to_host(got_dg.data());
     float me_x = 0.0f, me_g = 0.0f;
     for (size_t i = 0; i < got_dx.size(); ++i)
         me_x = std::max(me_x, std::fabs(got_dx[i] - dXref[i]));
@@ -129,14 +130,14 @@ static void test_fp16() {
     rms_cpu_fwd(X, gamma, Yref, B, D, eps);
     rms_cpu_bwd(X, gamma, dY, dXref, dGref, B, D, eps);
 
-    GpuTensor Xg, Gg, Yg, dYg, dXg, dGg;
+    Tensor Yg, dXg;
     auto Xh = to_fp16(X), Gh = to_fp16(gamma), dYh = to_fp16(dY);
-    brotensor::upload_fp16(Xh.data(), B, D, Xg);
-    brotensor::upload_fp16(Gh.data(), D, 1, Gg);
-    brotensor::rms_norm_forward_gpu(Xg, Gg, eps, Yg);
+    Tensor Xg = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), B, D);
+    Tensor Gg = Tensor::from_host_fp16_on(Device::CUDA, Gh.data(), D, 1);
+    brotensor::rms_norm_forward(Xg, Gg, eps, Yg);
     std::vector<uint16_t> got(Yg.size());
-    brotensor::download_fp16(Yg, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    Yg.copy_to_host_fp16(got.data());
     float me = 0.0f;
     for (size_t i = 0; i < got.size(); ++i) {
         const float g = brotensor::fp16_bits_to_fp32(got[i]);
@@ -145,14 +146,14 @@ static void test_fp16() {
     std::printf("    fwd fp16 max_err=%g\n", me);
     CHECK(me < 2e-2f);
 
-    brotensor::upload_fp16(dYh.data(), B, D, dYg);
-    dGg.resize(D, 1, Dtype::FP16);
+    Tensor dYg = Tensor::from_host_fp16_on(Device::CUDA, dYh.data(), B, D);
+    Tensor dGg = Tensor::zeros_on(Device::CUDA, D, 1, Dtype::FP16);
     dGg.zero();
-    brotensor::rms_norm_backward_gpu(Xg, Gg, dYg, eps, dXg, dGg);
+    brotensor::rms_norm_backward(Xg, Gg, dYg, eps, dXg, dGg);
     std::vector<uint16_t> got_dx(dXg.size()), got_dg(dGg.size());
-    brotensor::download_fp16(dXg, got_dx.data());
-    brotensor::download_fp16(dGg, got_dg.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    dXg.copy_to_host_fp16(got_dx.data());
+    dGg.copy_to_host_fp16(got_dg.data());
     float me_x = 0.0f, me_g = 0.0f;
     for (size_t i = 0; i < got_dx.size(); ++i) {
         const float g = brotensor::fp16_bits_to_fp32(got_dx[i]);
@@ -168,7 +169,11 @@ static void test_fp16() {
 }
 
 int main() {
-    brotensor::cuda_init();
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     std::printf("test_rms_norm\n");
     test_fp32();
     test_fp16();

@@ -1,5 +1,5 @@
-// Parity for flash_attention_forward_gpu (tiled, online-softmax) against the
-// classic cross_attention_forward_gpu impl at small sizes, plus a stress
+// Parity for flash_attention_forward (tiled, online-softmax) against the
+// classic cross_attention_forward impl at small sizes, plus a stress
 // shape (Lk=8192) that the dynamic-shared-mem cross-attn cannot run.
 
 #include <brotensor/ops.h>
@@ -12,8 +12,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 
@@ -118,22 +119,22 @@ static void run_one(const char* label, int Lq, int Lk, int D, int nh,
     std::vector<float> O_ref;
     attn_qkv_cpu(Qq, Kq, Vq, mask_ptr, Lq, Lk, D, nh, O_ref);
 
-    GpuTensor Qg, Kg, Vg, Og;
     auto Qh = to_fp16(Q), Kh = to_fp16(K), Vh = to_fp16(V);
-    brotensor::upload_fp16(Qh.data(), Lq, D, Qg);
-    brotensor::upload_fp16(Kh.data(), Lk, D, Kg);
-    brotensor::upload_fp16(Vh.data(), Lk, D, Vg);
-    GpuTensor mg;
+    Tensor Qg = Tensor::from_host_fp16_on(Device::CUDA, Qh.data(), Lq, D);
+    Tensor Kg = Tensor::from_host_fp16_on(Device::CUDA, Kh.data(), Lk, D);
+    Tensor Vg = Tensor::from_host_fp16_on(Device::CUDA, Vh.data(), Lk, D);
+    Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        brotensor::upload(mask_host.data(), Lk, 1, mg);
-        d_mask = mg.data;
+        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        d_mask = static_cast<const float*>(mg.data);
     }
-    brotensor::flash_attention_forward_gpu(Qg, Kg, Vg, d_mask, nh, /*causal=*/false, Og);
+    Tensor Og;
+    brotensor::flash_attention_forward(Qg, Kg, Vg, d_mask, nh, /*causal=*/false, Og);
     CHECK(Og.rows == Lq && Og.cols == D && Og.dtype == Dtype::FP16);
     std::vector<uint16_t> got(Og.size());
-    brotensor::download_fp16(Og, got.data());
-    brotensor::cuda_sync();
+    Og.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     check_fp16(got, O_ref, label);
 }
 
@@ -150,35 +151,34 @@ static void run_qkvo(const char* label, int Lq, int Lk, int D, int nh) {
     for (auto& v : Wv)  v = dist(rng);
     for (auto& v : Wo)  v = dist(rng);
 
-    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
     auto Xh = to_fp16(X), Ch = to_fp16(Ctx);
     auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
-    brotensor::upload_fp16(Xh.data(), Lq, D, Xg);
-    brotensor::upload_fp16(Ch.data(), Lk, D, Cg);
-    brotensor::upload_fp16(Wqh.data(), D, D, Wqg);
-    brotensor::upload_fp16(Wkh.data(), D, D, Wkg);
-    brotensor::upload_fp16(Wvh.data(), D, D, Wvg);
-    brotensor::upload_fp16(Woh.data(), D, D, Wog);
+    Tensor Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), Lq, D);
+    Tensor Cg  = Tensor::from_host_fp16_on(Device::CUDA, Ch.data(), Lk, D);
+    Tensor Wqg = Tensor::from_host_fp16_on(Device::CUDA, Wqh.data(), D, D);
+    Tensor Wkg = Tensor::from_host_fp16_on(Device::CUDA, Wkh.data(), D, D);
+    Tensor Wvg = Tensor::from_host_fp16_on(Device::CUDA, Wvh.data(), D, D);
+    Tensor Wog = Tensor::from_host_fp16_on(Device::CUDA, Woh.data(), D, D);
 
-    GpuTensor O_ref_g;
-    brotensor::cross_attention_forward_gpu(Xg, Cg, Wqg, Wkg, Wvg, Wog,
-                                           nullptr, nh, O_ref_g);
-    GpuTensor O_flash_g;
-    brotensor::flash_attention_qkvo_forward_gpu(Xg, &Cg,
-                                                Wqg, nullptr, Wkg, nullptr,
-                                                Wvg, nullptr, Wog, nullptr,
-                                                nullptr, nh, /*causal=*/false, O_flash_g);
+    Tensor O_ref_g;
+    brotensor::cross_attention_forward(Xg, Cg, Wqg, Wkg, Wvg, Wog,
+                                       nullptr, nh, O_ref_g);
+    Tensor O_flash_g;
+    brotensor::flash_attention_qkvo_forward(Xg, &Cg,
+                                            Wqg, nullptr, Wkg, nullptr,
+                                            Wvg, nullptr, Wog, nullptr,
+                                            nullptr, nh, /*causal=*/false, O_flash_g);
 
     std::vector<uint16_t> ref_h(O_ref_g.size()), flash_h(O_flash_g.size());
-    brotensor::download_fp16(O_ref_g, ref_h.data());
-    brotensor::download_fp16(O_flash_g, flash_h.data());
-    brotensor::cuda_sync();
+    O_ref_g.copy_to_host_fp16(ref_h.data());
+    O_flash_g.copy_to_host_fp16(flash_h.data());
+    brotensor::sync_all();
     std::vector<float> ref(ref_h.size());
     for (size_t i = 0; i < ref.size(); ++i) ref[i] = brotensor::fp16_bits_to_fp32(ref_h[i]);
     check_fp16(flash_h, ref, label);
 }
 
-// Verify the optional bias path of flash_attention_qkvo_forward_gpu against a
+// Verify the optional bias path of flash_attention_qkvo_forward against a
 // CPU reference. We project Q/K/V/O with explicit biases on the host and
 // compare to the GPU op called with all four biases. Tests the case
 // brodiffusion needs for CLIP attention (all biases present).
@@ -218,29 +218,28 @@ static void run_qkvo_with_biases(const char* label, int Lq, int Lk, int D, int n
     attn_qkv_cpu(Qp, Kp, Vp, nullptr, Lq, Lk, D, nh, Op);
     proj(Op, Woq, boq, Lq, D, O_ref);
 
-    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog, bqg, bkg, bvg, bog;
     auto Xh = to_fp16(X), Ch = to_fp16(Ctx);
     auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
     auto bqh = to_fp16(bq), bkh = to_fp16(bk), bvh = to_fp16(bv), boh = to_fp16(bo);
-    brotensor::upload_fp16(Xh.data(),  Lq, D, Xg);
-    brotensor::upload_fp16(Ch.data(),  Lk, D, Cg);
-    brotensor::upload_fp16(Wqh.data(), D, D, Wqg);
-    brotensor::upload_fp16(Wkh.data(), D, D, Wkg);
-    brotensor::upload_fp16(Wvh.data(), D, D, Wvg);
-    brotensor::upload_fp16(Woh.data(), D, D, Wog);
-    brotensor::upload_fp16(bqh.data(), D, 1, bqg);
-    brotensor::upload_fp16(bkh.data(), D, 1, bkg);
-    brotensor::upload_fp16(bvh.data(), D, 1, bvg);
-    brotensor::upload_fp16(boh.data(), D, 1, bog);
+    Tensor Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),  Lq, D);
+    Tensor Cg  = Tensor::from_host_fp16_on(Device::CUDA, Ch.data(),  Lk, D);
+    Tensor Wqg = Tensor::from_host_fp16_on(Device::CUDA, Wqh.data(), D, D);
+    Tensor Wkg = Tensor::from_host_fp16_on(Device::CUDA, Wkh.data(), D, D);
+    Tensor Wvg = Tensor::from_host_fp16_on(Device::CUDA, Wvh.data(), D, D);
+    Tensor Wog = Tensor::from_host_fp16_on(Device::CUDA, Woh.data(), D, D);
+    Tensor bqg = Tensor::from_host_fp16_on(Device::CUDA, bqh.data(), D, 1);
+    Tensor bkg = Tensor::from_host_fp16_on(Device::CUDA, bkh.data(), D, 1);
+    Tensor bvg = Tensor::from_host_fp16_on(Device::CUDA, bvh.data(), D, 1);
+    Tensor bog = Tensor::from_host_fp16_on(Device::CUDA, boh.data(), D, 1);
 
-    GpuTensor Og;
-    brotensor::flash_attention_qkvo_forward_gpu(Xg, &Cg,
-                                                Wqg, &bqg, Wkg, &bkg,
-                                                Wvg, &bvg, Wog, &bog,
-                                                nullptr, nh, /*causal=*/false, Og);
+    Tensor Og;
+    brotensor::flash_attention_qkvo_forward(Xg, &Cg,
+                                            Wqg, &bqg, Wkg, &bkg,
+                                            Wvg, &bvg, Wog, &bog,
+                                            nullptr, nh, /*causal=*/false, Og);
     std::vector<uint16_t> got(Og.size());
-    brotensor::download_fp16(Og, got.data());
-    brotensor::cuda_sync();
+    Og.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     check_fp16(got, O_ref, label);
 }
 
@@ -281,29 +280,28 @@ static void run_qkvo_rect_ctx(const char* label, int Lq, int Lk, int D,
     attn_qkv_cpu(Qp, Kp, Vp, nullptr, Lq, Lk, D, nh, Op);
     proj(Op, Woq, Lq, D, D, O_ref);
 
-    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
     auto Xh = to_fp16(X), Ch = to_fp16(Ctx);
     auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
-    brotensor::upload_fp16(Xh.data(),  Lq, D,     Xg);
-    brotensor::upload_fp16(Ch.data(),  Lk, D_ctx, Cg);
-    brotensor::upload_fp16(Wqh.data(), D, D,     Wqg);
-    brotensor::upload_fp16(Wkh.data(), D, D_ctx, Wkg);
-    brotensor::upload_fp16(Wvh.data(), D, D_ctx, Wvg);
-    brotensor::upload_fp16(Woh.data(), D, D,     Wog);
+    Tensor Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),  Lq, D);
+    Tensor Cg  = Tensor::from_host_fp16_on(Device::CUDA, Ch.data(),  Lk, D_ctx);
+    Tensor Wqg = Tensor::from_host_fp16_on(Device::CUDA, Wqh.data(), D, D);
+    Tensor Wkg = Tensor::from_host_fp16_on(Device::CUDA, Wkh.data(), D, D_ctx);
+    Tensor Wvg = Tensor::from_host_fp16_on(Device::CUDA, Wvh.data(), D, D_ctx);
+    Tensor Wog = Tensor::from_host_fp16_on(Device::CUDA, Woh.data(), D, D);
 
-    GpuTensor Og;
-    brotensor::flash_attention_qkvo_forward_gpu(Xg, &Cg,
-                                                Wqg, nullptr, Wkg, nullptr,
-                                                Wvg, nullptr, Wog, nullptr,
-                                                nullptr, nh, /*causal=*/false, Og);
+    Tensor Og;
+    brotensor::flash_attention_qkvo_forward(Xg, &Cg,
+                                            Wqg, nullptr, Wkg, nullptr,
+                                            Wvg, nullptr, Wog, nullptr,
+                                            nullptr, nh, /*causal=*/false, Og);
     std::vector<uint16_t> got(Og.size());
-    brotensor::download_fp16(Og, got.data());
-    brotensor::cuda_sync();
+    Og.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     check_fp16(got, O_ref, label);
 }
 
 // Self-attention QKVO compared against a CPU reference (not against
-// cross_attention_forward_gpu, which itself dispatches to flash for FP16 —
+// cross_attention_forward, which itself dispatches to flash for FP16 —
 // that would be flash-vs-flash). Square weights, no context tensor.
 static void run_qkvo_self_cpu(const char* label, int Lq, int D, int nh) {
     std::printf("  %s qkvo self-vs-cpu Lq=%d D=%d nh=%d\n", label, Lq, D, nh);
@@ -335,23 +333,22 @@ static void run_qkvo_self_cpu(const char* label, int Lq, int D, int nh) {
     attn_qkv_cpu(Qp, Kp, Vp, nullptr, Lq, Lq, D, nh, Op);
     proj(Op, Woq, Lq, D, D, O_ref);
 
-    GpuTensor Xg, Wqg, Wkg, Wvg, Wog;
     auto Xh = to_fp16(X);
     auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
-    brotensor::upload_fp16(Xh.data(),  Lq, D, Xg);
-    brotensor::upload_fp16(Wqh.data(), D, D, Wqg);
-    brotensor::upload_fp16(Wkh.data(), D, D, Wkg);
-    brotensor::upload_fp16(Wvh.data(), D, D, Wvg);
-    brotensor::upload_fp16(Woh.data(), D, D, Wog);
+    Tensor Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),  Lq, D);
+    Tensor Wqg = Tensor::from_host_fp16_on(Device::CUDA, Wqh.data(), D, D);
+    Tensor Wkg = Tensor::from_host_fp16_on(Device::CUDA, Wkh.data(), D, D);
+    Tensor Wvg = Tensor::from_host_fp16_on(Device::CUDA, Wvh.data(), D, D);
+    Tensor Wog = Tensor::from_host_fp16_on(Device::CUDA, Woh.data(), D, D);
 
-    GpuTensor Og;
-    brotensor::flash_attention_qkvo_forward_gpu(Xg, nullptr,
-                                                Wqg, nullptr, Wkg, nullptr,
-                                                Wvg, nullptr, Wog, nullptr,
-                                                nullptr, nh, /*causal=*/false, Og);
+    Tensor Og;
+    brotensor::flash_attention_qkvo_forward(Xg, nullptr,
+                                            Wqg, nullptr, Wkg, nullptr,
+                                            Wvg, nullptr, Wog, nullptr,
+                                            nullptr, nh, /*causal=*/false, Og);
     std::vector<uint16_t> got(Og.size());
-    brotensor::download_fp16(Og, got.data());
-    brotensor::cuda_sync();
+    Og.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     check_fp16(got, O_ref, label);
 }
 
@@ -423,34 +420,33 @@ static void run_qkvo_causal(const char* label, int L, int D, int nh) {
     std::vector<float> O_ref;
     proj(Op, Woq, boq, L, D, O_ref);
 
-    GpuTensor Xg, Wqg, Wkg, Wvg, Wog, bqg, bkg, bvg, bog;
     auto Xh = to_fp16(X);
     auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
     auto bqh = to_fp16(bq), bkh = to_fp16(bk), bvh = to_fp16(bv), boh = to_fp16(bo);
-    brotensor::upload_fp16(Xh.data(),  L, D, Xg);
-    brotensor::upload_fp16(Wqh.data(), D, D, Wqg);
-    brotensor::upload_fp16(Wkh.data(), D, D, Wkg);
-    brotensor::upload_fp16(Wvh.data(), D, D, Wvg);
-    brotensor::upload_fp16(Woh.data(), D, D, Wog);
-    brotensor::upload_fp16(bqh.data(), D, 1, bqg);
-    brotensor::upload_fp16(bkh.data(), D, 1, bkg);
-    brotensor::upload_fp16(bvh.data(), D, 1, bvg);
-    brotensor::upload_fp16(boh.data(), D, 1, bog);
+    Tensor Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),  L, D);
+    Tensor Wqg = Tensor::from_host_fp16_on(Device::CUDA, Wqh.data(), D, D);
+    Tensor Wkg = Tensor::from_host_fp16_on(Device::CUDA, Wkh.data(), D, D);
+    Tensor Wvg = Tensor::from_host_fp16_on(Device::CUDA, Wvh.data(), D, D);
+    Tensor Wog = Tensor::from_host_fp16_on(Device::CUDA, Woh.data(), D, D);
+    Tensor bqg = Tensor::from_host_fp16_on(Device::CUDA, bqh.data(), D, 1);
+    Tensor bkg = Tensor::from_host_fp16_on(Device::CUDA, bkh.data(), D, 1);
+    Tensor bvg = Tensor::from_host_fp16_on(Device::CUDA, bvh.data(), D, 1);
+    Tensor bog = Tensor::from_host_fp16_on(Device::CUDA, boh.data(), D, 1);
 
-    GpuTensor Og;
-    brotensor::flash_attention_qkvo_forward_gpu(Xg, nullptr,
-                                                Wqg, &bqg, Wkg, &bkg,
-                                                Wvg, &bvg, Wog, &bog,
-                                                nullptr, nh, /*causal=*/true, Og);
+    Tensor Og;
+    brotensor::flash_attention_qkvo_forward(Xg, nullptr,
+                                            Wqg, &bqg, Wkg, &bkg,
+                                            Wvg, &bvg, Wog, &bog,
+                                            nullptr, nh, /*causal=*/true, Og);
     std::vector<uint16_t> got(Og.size());
-    brotensor::download_fp16(Og, got.data());
-    brotensor::cuda_sync();
+    Og.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     check_fp16(got, O_ref, label);
 }
 
 // ─── Backward tests ────────────────────────────────────────────────────────
 
-// Self-attention backward parity with mha_backward_gpu (FP32 reference).
+// Self-attention backward parity with mha_backward (FP32 reference).
 // Build identical X / Wq/Wk/Wv/Wo (no biases — mha has no bias path) and
 // random dO; run FP32 mha fwd+bwd to get the reference grads; run flash
 // FP16 bwd on the same inputs; compare element-wise with FP16 tolerance.
@@ -468,51 +464,51 @@ static void run_bwd_self_vs_mha(const char* label, int L, int D, int nh) {
     auto Wqq = rq(Wq), Wkq = rq(Wk), Wvq = rq(Wv), Woq = rq(Wo);
     auto dOq = rq(dO);
 
-    GpuTensor X_f32, Wq_f32, Wk_f32, Wv_f32, Wo_f32, dO_f32;
-    brotensor::upload(Xq.data(),   L, D, X_f32);
-    brotensor::upload(Wqq.data(),  D, D, Wq_f32);
-    brotensor::upload(Wkq.data(),  D, D, Wk_f32);
-    brotensor::upload(Wvq.data(),  D, D, Wv_f32);
-    brotensor::upload(Woq.data(),  D, D, Wo_f32);
-    brotensor::upload(dOq.data(),  L, D, dO_f32);
+    Tensor X_f32  = Tensor::from_host_on(Device::CUDA, Xq.data(),  L, D);
+    Tensor Wq_f32 = Tensor::from_host_on(Device::CUDA, Wqq.data(), D, D);
+    Tensor Wk_f32 = Tensor::from_host_on(Device::CUDA, Wkq.data(), D, D);
+    Tensor Wv_f32 = Tensor::from_host_on(Device::CUDA, Wvq.data(), D, D);
+    Tensor Wo_f32 = Tensor::from_host_on(Device::CUDA, Woq.data(), D, D);
+    Tensor dO_f32 = Tensor::from_host_on(Device::CUDA, dOq.data(), L, D);
 
-    GpuTensor Qh, Kh, Vh, Attnh, Yconcat, O_ref;
-    brotensor::mha_forward_gpu(X_f32, Wq_f32, Wk_f32, Wv_f32, Wo_f32,
-                               nullptr, nh, Qh, Kh, Vh, Attnh, Yconcat, O_ref);
+    Tensor Qh, Kh, Vh, Attnh, Yconcat, O_ref;
+    brotensor::mha_forward(X_f32, Wq_f32, Wk_f32, Wv_f32, Wo_f32,
+                           nullptr, nh, Qh, Kh, Vh, Attnh, Yconcat, O_ref);
 
-    GpuTensor dX_ref(L, D), dWq_ref(D, D), dWk_ref(D, D),
-              dWv_ref(D, D), dWo_ref(D, D);
-    dWq_ref.zero(); dWk_ref.zero(); dWv_ref.zero(); dWo_ref.zero();
-    brotensor::mha_backward_gpu(dO_f32, X_f32, Qh, Kh, Vh, Attnh, Yconcat,
-                                Wq_f32, Wk_f32, Wv_f32, Wo_f32, nullptr, nh,
-                                dX_ref, dWq_ref, dWk_ref, dWv_ref, dWo_ref);
+    Tensor dX_ref  = Tensor::zeros_on(Device::CUDA, L, D);
+    Tensor dWq_ref = Tensor::zeros_on(Device::CUDA, D, D);
+    Tensor dWk_ref = Tensor::zeros_on(Device::CUDA, D, D);
+    Tensor dWv_ref = Tensor::zeros_on(Device::CUDA, D, D);
+    Tensor dWo_ref = Tensor::zeros_on(Device::CUDA, D, D);
+    brotensor::mha_backward(dO_f32, X_f32, Qh, Kh, Vh, Attnh, Yconcat,
+                            Wq_f32, Wk_f32, Wv_f32, Wo_f32, nullptr, nh,
+                            dX_ref, dWq_ref, dWk_ref, dWv_ref, dWo_ref);
     std::vector<float> dX_ref_h(L*D), dWq_ref_h(D*D), dWk_ref_h(D*D),
                        dWv_ref_h(D*D), dWo_ref_h(D*D);
-    brotensor::download(dX_ref,  dX_ref_h.data());
-    brotensor::download(dWq_ref, dWq_ref_h.data());
-    brotensor::download(dWk_ref, dWk_ref_h.data());
-    brotensor::download(dWv_ref, dWv_ref_h.data());
-    brotensor::download(dWo_ref, dWo_ref_h.data());
-    brotensor::cuda_sync();
+    dX_ref.copy_to_host(dX_ref_h.data());
+    dWq_ref.copy_to_host(dWq_ref_h.data());
+    dWk_ref.copy_to_host(dWk_ref_h.data());
+    dWv_ref.copy_to_host(dWv_ref_h.data());
+    dWo_ref.copy_to_host(dWo_ref_h.data());
+    brotensor::sync_all();
 
     // Flash FP16 bwd path.
-    GpuTensor Xg, Wqg, Wkg, Wvg, Wog, dOg;
     auto Xh = to_fp16(X), Wqh = to_fp16(Wq), Wkh = to_fp16(Wk),
          Wvh = to_fp16(Wv), Woh = to_fp16(Wo), dOh = to_fp16(dO);
-    brotensor::upload_fp16(Xh.data(),  L, D, Xg);
-    brotensor::upload_fp16(Wqh.data(), D, D, Wqg);
-    brotensor::upload_fp16(Wkh.data(), D, D, Wkg);
-    brotensor::upload_fp16(Wvh.data(), D, D, Wvg);
-    brotensor::upload_fp16(Woh.data(), D, D, Wog);
-    brotensor::upload_fp16(dOh.data(), L, D, dOg);
+    Tensor Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),  L, D);
+    Tensor Wqg = Tensor::from_host_fp16_on(Device::CUDA, Wqh.data(), D, D);
+    Tensor Wkg = Tensor::from_host_fp16_on(Device::CUDA, Wkh.data(), D, D);
+    Tensor Wvg = Tensor::from_host_fp16_on(Device::CUDA, Wvh.data(), D, D);
+    Tensor Wog = Tensor::from_host_fp16_on(Device::CUDA, Woh.data(), D, D);
+    Tensor dOg = Tensor::from_host_fp16_on(Device::CUDA, dOh.data(), L, D);
 
-    GpuTensor dXg(L, D, Dtype::FP16);
-    GpuTensor dWqg(D, D, Dtype::FP16); dWqg.zero();
-    GpuTensor dWkg(D, D, Dtype::FP16); dWkg.zero();
-    GpuTensor dWvg(D, D, Dtype::FP16); dWvg.zero();
-    GpuTensor dWog(D, D, Dtype::FP16); dWog.zero();
+    Tensor dXg  = Tensor::empty_on(Device::CUDA, L, D, Dtype::FP16);
+    Tensor dWqg = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
+    Tensor dWkg = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
+    Tensor dWvg = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
+    Tensor dWog = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
 
-    brotensor::flash_attention_qkvo_backward_gpu(
+    brotensor::flash_attention_qkvo_backward(
         Xg, /*Ctx=*/nullptr,
         Wqg, /*bq=*/nullptr,
         Wkg, /*bk=*/nullptr,
@@ -528,12 +524,12 @@ static void run_bwd_self_vs_mha(const char* label, int L, int D, int nh) {
 
     std::vector<uint16_t> dX_got(L*D), dWq_got(D*D), dWk_got(D*D),
                           dWv_got(D*D), dWo_got(D*D);
-    brotensor::download_fp16(dXg,  dX_got.data());
-    brotensor::download_fp16(dWqg, dWq_got.data());
-    brotensor::download_fp16(dWkg, dWk_got.data());
-    brotensor::download_fp16(dWvg, dWv_got.data());
-    brotensor::download_fp16(dWog, dWo_got.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host_fp16(dX_got.data());
+    dWqg.copy_to_host_fp16(dWq_got.data());
+    dWkg.copy_to_host_fp16(dWk_got.data());
+    dWvg.copy_to_host_fp16(dWv_got.data());
+    dWog.copy_to_host_fp16(dWo_got.data());
+    brotensor::sync_all();
 
     check_fp16(dX_got,  dX_ref_h,  "self-bwd dX");
     check_fp16(dWq_got, dWq_ref_h, "self-bwd dWq");
@@ -542,7 +538,7 @@ static void run_bwd_self_vs_mha(const char* label, int L, int D, int nh) {
     check_fp16(dWo_got, dWo_ref_h, "self-bwd dWo");
 }
 
-// Cross-attention backward parity vs cross_attention_backward_gpu (FP32),
+// Cross-attention backward parity vs cross_attention_backward (FP32),
 // with rectangular Wk/Wv (D_ctx != D).
 static void run_bwd_cross_vs_cx(const char* label, int Lq, int Lk, int D,
                                 int D_ctx, int nh) {
@@ -560,25 +556,26 @@ static void run_bwd_cross_vs_cx(const char* label, int Lq, int Lk, int D,
     auto Wqq = rq(Wq), Wkq = rq(Wk), Wvq = rq(Wv), Woq = rq(Wo);
     auto dOq = rq(dO);
 
-    GpuTensor X_f32, Ctx_f32, Wq_f32, Wk_f32, Wv_f32, Wo_f32, dO_f32;
-    brotensor::upload(Xq.data(),   Lq, D,     X_f32);
-    brotensor::upload(Ctxq.data(), Lk, D_ctx, Ctx_f32);
-    brotensor::upload(Wqq.data(),  D, D,      Wq_f32);
-    brotensor::upload(Wkq.data(),  D, D_ctx,  Wk_f32);
-    brotensor::upload(Wvq.data(),  D, D_ctx,  Wv_f32);
-    brotensor::upload(Woq.data(),  D, D,      Wo_f32);
-    brotensor::upload(dOq.data(),  Lq, D,     dO_f32);
+    Tensor X_f32   = Tensor::from_host_on(Device::CUDA, Xq.data(),   Lq, D);
+    Tensor Ctx_f32 = Tensor::from_host_on(Device::CUDA, Ctxq.data(), Lk, D_ctx);
+    Tensor Wq_f32  = Tensor::from_host_on(Device::CUDA, Wqq.data(),  D, D);
+    Tensor Wk_f32  = Tensor::from_host_on(Device::CUDA, Wkq.data(),  D, D_ctx);
+    Tensor Wv_f32  = Tensor::from_host_on(Device::CUDA, Wvq.data(),  D, D_ctx);
+    Tensor Wo_f32  = Tensor::from_host_on(Device::CUDA, Woq.data(),  D, D);
+    Tensor dO_f32  = Tensor::from_host_on(Device::CUDA, dOq.data(),  Lq, D);
 
-    GpuTensor Qh, Kh, Vh, Attnh, Yconcat, O_ref;
-    brotensor::cross_attention_forward_train_gpu(
+    Tensor Qh, Kh, Vh, Attnh, Yconcat, O_ref;
+    brotensor::cross_attention_forward_train(
         X_f32, Ctx_f32, Wq_f32, Wk_f32, Wv_f32, Wo_f32,
         nullptr, nh, Qh, Kh, Vh, Attnh, Yconcat, O_ref);
 
-    GpuTensor dX_ref(Lq, D), dCtx_ref(Lk, D_ctx);
-    GpuTensor dWq_ref(D, D), dWk_ref(D, D_ctx),
-              dWv_ref(D, D_ctx), dWo_ref(D, D);
-    dWq_ref.zero(); dWk_ref.zero(); dWv_ref.zero(); dWo_ref.zero();
-    brotensor::cross_attention_backward_gpu(
+    Tensor dX_ref   = Tensor::zeros_on(Device::CUDA, Lq, D);
+    Tensor dCtx_ref = Tensor::zeros_on(Device::CUDA, Lk, D_ctx);
+    Tensor dWq_ref  = Tensor::zeros_on(Device::CUDA, D, D);
+    Tensor dWk_ref  = Tensor::zeros_on(Device::CUDA, D, D_ctx);
+    Tensor dWv_ref  = Tensor::zeros_on(Device::CUDA, D, D_ctx);
+    Tensor dWo_ref  = Tensor::zeros_on(Device::CUDA, D, D);
+    brotensor::cross_attention_backward(
         dO_f32, X_f32, Ctx_f32, Qh, Kh, Vh, Attnh, Yconcat,
         Wq_f32, Wk_f32, Wv_f32, Wo_f32, nullptr, nh,
         dX_ref, dCtx_ref, dWq_ref, dWk_ref, dWv_ref, dWo_ref);
@@ -586,34 +583,33 @@ static void run_bwd_cross_vs_cx(const char* label, int Lq, int Lk, int D,
     std::vector<float> dX_ref_h(Lq*D), dCtx_ref_h(Lk*D_ctx);
     std::vector<float> dWq_ref_h(D*D), dWk_ref_h(D*D_ctx),
                        dWv_ref_h(D*D_ctx), dWo_ref_h(D*D);
-    brotensor::download(dX_ref,   dX_ref_h.data());
-    brotensor::download(dCtx_ref, dCtx_ref_h.data());
-    brotensor::download(dWq_ref,  dWq_ref_h.data());
-    brotensor::download(dWk_ref,  dWk_ref_h.data());
-    brotensor::download(dWv_ref,  dWv_ref_h.data());
-    brotensor::download(dWo_ref,  dWo_ref_h.data());
-    brotensor::cuda_sync();
+    dX_ref.copy_to_host(dX_ref_h.data());
+    dCtx_ref.copy_to_host(dCtx_ref_h.data());
+    dWq_ref.copy_to_host(dWq_ref_h.data());
+    dWk_ref.copy_to_host(dWk_ref_h.data());
+    dWv_ref.copy_to_host(dWv_ref_h.data());
+    dWo_ref.copy_to_host(dWo_ref_h.data());
+    brotensor::sync_all();
 
-    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog, dOg;
     auto Xh = to_fp16(X), Ch = to_fp16(Ctx);
     auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
     auto dOh = to_fp16(dO);
-    brotensor::upload_fp16(Xh.data(),  Lq, D,     Xg);
-    brotensor::upload_fp16(Ch.data(),  Lk, D_ctx, Cg);
-    brotensor::upload_fp16(Wqh.data(), D, D,      Wqg);
-    brotensor::upload_fp16(Wkh.data(), D, D_ctx,  Wkg);
-    brotensor::upload_fp16(Wvh.data(), D, D_ctx,  Wvg);
-    brotensor::upload_fp16(Woh.data(), D, D,      Wog);
-    brotensor::upload_fp16(dOh.data(), Lq, D,     dOg);
+    Tensor Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),  Lq, D);
+    Tensor Cg  = Tensor::from_host_fp16_on(Device::CUDA, Ch.data(),  Lk, D_ctx);
+    Tensor Wqg = Tensor::from_host_fp16_on(Device::CUDA, Wqh.data(), D, D);
+    Tensor Wkg = Tensor::from_host_fp16_on(Device::CUDA, Wkh.data(), D, D_ctx);
+    Tensor Wvg = Tensor::from_host_fp16_on(Device::CUDA, Wvh.data(), D, D_ctx);
+    Tensor Wog = Tensor::from_host_fp16_on(Device::CUDA, Woh.data(), D, D);
+    Tensor dOg = Tensor::from_host_fp16_on(Device::CUDA, dOh.data(), Lq, D);
 
-    GpuTensor dXg(Lq, D, Dtype::FP16);
-    GpuTensor dCtxg(Lk, D_ctx, Dtype::FP16);
-    GpuTensor dWqg(D, D, Dtype::FP16);         dWqg.zero();
-    GpuTensor dWkg(D, D_ctx, Dtype::FP16);     dWkg.zero();
-    GpuTensor dWvg(D, D_ctx, Dtype::FP16);     dWvg.zero();
-    GpuTensor dWog(D, D, Dtype::FP16);         dWog.zero();
+    Tensor dXg   = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
+    Tensor dCtxg = Tensor::empty_on(Device::CUDA, Lk, D_ctx, Dtype::FP16);
+    Tensor dWqg  = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
+    Tensor dWkg  = Tensor::zeros_on(Device::CUDA, D, D_ctx, Dtype::FP16);
+    Tensor dWvg  = Tensor::zeros_on(Device::CUDA, D, D_ctx, Dtype::FP16);
+    Tensor dWog  = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
 
-    brotensor::flash_attention_qkvo_backward_gpu(
+    brotensor::flash_attention_qkvo_backward(
         Xg, &Cg,
         Wqg, nullptr, Wkg, nullptr, Wvg, nullptr, Wog, nullptr,
         nullptr, nh, /*causal=*/false,
@@ -624,13 +620,13 @@ static void run_bwd_cross_vs_cx(const char* label, int Lq, int Lk, int D,
     std::vector<uint16_t> dX_got(Lq*D), dCtx_got(Lk*D_ctx);
     std::vector<uint16_t> dWq_got(D*D), dWk_got(D*D_ctx),
                           dWv_got(D*D_ctx), dWo_got(D*D);
-    brotensor::download_fp16(dXg,   dX_got.data());
-    brotensor::download_fp16(dCtxg, dCtx_got.data());
-    brotensor::download_fp16(dWqg,  dWq_got.data());
-    brotensor::download_fp16(dWkg,  dWk_got.data());
-    brotensor::download_fp16(dWvg,  dWv_got.data());
-    brotensor::download_fp16(dWog,  dWo_got.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host_fp16(dX_got.data());
+    dCtxg.copy_to_host_fp16(dCtx_got.data());
+    dWqg.copy_to_host_fp16(dWq_got.data());
+    dWkg.copy_to_host_fp16(dWk_got.data());
+    dWvg.copy_to_host_fp16(dWv_got.data());
+    dWog.copy_to_host_fp16(dWo_got.data());
+    brotensor::sync_all();
 
     check_fp16(dX_got,   dX_ref_h,   "cross-bwd dX");
     check_fp16(dCtx_got, dCtx_ref_h, "cross-bwd dCtx");
@@ -816,35 +812,34 @@ static void run_bwd_cross_with_biases_cpu(const char* label, int Lq, int Lk,
     proj_bwd_full(Ctxq, Lk, D_ctx, Wvq, dV, dCtx, dWv, dbv);
 
     // GPU side: flash bwd with biases.
-    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog, bqg, bkg, bvg, bog, dOg;
     auto Xh = to_fp16(X), Ch = to_fp16(Ctx);
     auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
     auto bqh = to_fp16(bq), bkh = to_fp16(bk), bvh = to_fp16(bv), boh = to_fp16(bo);
     auto dOh = to_fp16(dO);
-    brotensor::upload_fp16(Xh.data(),  Lq, D,     Xg);
-    brotensor::upload_fp16(Ch.data(),  Lk, D_ctx, Cg);
-    brotensor::upload_fp16(Wqh.data(), D, D,      Wqg);
-    brotensor::upload_fp16(Wkh.data(), D, D_ctx,  Wkg);
-    brotensor::upload_fp16(Wvh.data(), D, D_ctx,  Wvg);
-    brotensor::upload_fp16(Woh.data(), D, D,      Wog);
-    brotensor::upload_fp16(bqh.data(), D, 1,      bqg);
-    brotensor::upload_fp16(bkh.data(), D, 1,      bkg);
-    brotensor::upload_fp16(bvh.data(), D, 1,      bvg);
-    brotensor::upload_fp16(boh.data(), D, 1,      bog);
-    brotensor::upload_fp16(dOh.data(), Lq, D,     dOg);
+    Tensor Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),  Lq, D);
+    Tensor Cg  = Tensor::from_host_fp16_on(Device::CUDA, Ch.data(),  Lk, D_ctx);
+    Tensor Wqg = Tensor::from_host_fp16_on(Device::CUDA, Wqh.data(), D, D);
+    Tensor Wkg = Tensor::from_host_fp16_on(Device::CUDA, Wkh.data(), D, D_ctx);
+    Tensor Wvg = Tensor::from_host_fp16_on(Device::CUDA, Wvh.data(), D, D_ctx);
+    Tensor Wog = Tensor::from_host_fp16_on(Device::CUDA, Woh.data(), D, D);
+    Tensor bqg = Tensor::from_host_fp16_on(Device::CUDA, bqh.data(), D, 1);
+    Tensor bkg = Tensor::from_host_fp16_on(Device::CUDA, bkh.data(), D, 1);
+    Tensor bvg = Tensor::from_host_fp16_on(Device::CUDA, bvh.data(), D, 1);
+    Tensor bog = Tensor::from_host_fp16_on(Device::CUDA, boh.data(), D, 1);
+    Tensor dOg = Tensor::from_host_fp16_on(Device::CUDA, dOh.data(), Lq, D);
 
-    GpuTensor dXg(Lq, D, Dtype::FP16);
-    GpuTensor dCtxg(Lk, D_ctx, Dtype::FP16);
-    GpuTensor dWqg(D, D, Dtype::FP16);         dWqg.zero();
-    GpuTensor dWkg(D, D_ctx, Dtype::FP16);     dWkg.zero();
-    GpuTensor dWvg(D, D_ctx, Dtype::FP16);     dWvg.zero();
-    GpuTensor dWog(D, D, Dtype::FP16);         dWog.zero();
-    GpuTensor dbqg(D, 1, Dtype::FP16);         dbqg.zero();
-    GpuTensor dbkg(D, 1, Dtype::FP16);         dbkg.zero();
-    GpuTensor dbvg(D, 1, Dtype::FP16);         dbvg.zero();
-    GpuTensor dbog(D, 1, Dtype::FP16);         dbog.zero();
+    Tensor dXg   = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
+    Tensor dCtxg = Tensor::empty_on(Device::CUDA, Lk, D_ctx, Dtype::FP16);
+    Tensor dWqg  = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
+    Tensor dWkg  = Tensor::zeros_on(Device::CUDA, D, D_ctx, Dtype::FP16);
+    Tensor dWvg  = Tensor::zeros_on(Device::CUDA, D, D_ctx, Dtype::FP16);
+    Tensor dWog  = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
+    Tensor dbqg  = Tensor::zeros_on(Device::CUDA, D, 1, Dtype::FP16);
+    Tensor dbkg  = Tensor::zeros_on(Device::CUDA, D, 1, Dtype::FP16);
+    Tensor dbvg  = Tensor::zeros_on(Device::CUDA, D, 1, Dtype::FP16);
+    Tensor dbog  = Tensor::zeros_on(Device::CUDA, D, 1, Dtype::FP16);
 
-    brotensor::flash_attention_qkvo_backward_gpu(
+    brotensor::flash_attention_qkvo_backward(
         Xg, &Cg,
         Wqg, &bqg, Wkg, &bkg, Wvg, &bvg, Wog, &bog,
         nullptr, nh, /*causal=*/false,
@@ -856,17 +851,17 @@ static void run_bwd_cross_with_biases_cpu(const char* label, int Lq, int Lk,
     std::vector<uint16_t> dWq_got(D*D), dWk_got(D*D_ctx),
                           dWv_got(D*D_ctx), dWo_got(D*D);
     std::vector<uint16_t> dbq_got(D), dbk_got(D), dbv_got(D), dbo_got(D);
-    brotensor::download_fp16(dXg,   dX_got.data());
-    brotensor::download_fp16(dCtxg, dCtx_got.data());
-    brotensor::download_fp16(dWqg,  dWq_got.data());
-    brotensor::download_fp16(dWkg,  dWk_got.data());
-    brotensor::download_fp16(dWvg,  dWv_got.data());
-    brotensor::download_fp16(dWog,  dWo_got.data());
-    brotensor::download_fp16(dbqg,  dbq_got.data());
-    brotensor::download_fp16(dbkg,  dbk_got.data());
-    brotensor::download_fp16(dbvg,  dbv_got.data());
-    brotensor::download_fp16(dbog,  dbo_got.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host_fp16(dX_got.data());
+    dCtxg.copy_to_host_fp16(dCtx_got.data());
+    dWqg.copy_to_host_fp16(dWq_got.data());
+    dWkg.copy_to_host_fp16(dWk_got.data());
+    dWvg.copy_to_host_fp16(dWv_got.data());
+    dWog.copy_to_host_fp16(dWo_got.data());
+    dbqg.copy_to_host_fp16(dbq_got.data());
+    dbkg.copy_to_host_fp16(dbk_got.data());
+    dbvg.copy_to_host_fp16(dbv_got.data());
+    dbog.copy_to_host_fp16(dbo_got.data());
+    brotensor::sync_all();
 
     check_fp16(dX_got,   dX,   "cross-bwd+b dX");
     check_fp16(dCtx_got, dCtx, "cross-bwd+b dCtx");
@@ -1037,33 +1032,32 @@ static void run_bwd_causal_cpu(const char* label, int L, int D, int nh) {
     proj_bwd_self(Wvq, dV, dWv, dbv);
 
     // GPU side.
-    GpuTensor Xg, Wqg, Wkg, Wvg, Wog, bqg, bkg, bvg, bog, dOg;
     auto Xh = to_fp16(X);
     auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk), Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
     auto bqh = to_fp16(bq), bkh = to_fp16(bk), bvh = to_fp16(bv), boh = to_fp16(bo);
     auto dOh = to_fp16(dO);
-    brotensor::upload_fp16(Xh.data(),  L, D, Xg);
-    brotensor::upload_fp16(Wqh.data(), D, D, Wqg);
-    brotensor::upload_fp16(Wkh.data(), D, D, Wkg);
-    brotensor::upload_fp16(Wvh.data(), D, D, Wvg);
-    brotensor::upload_fp16(Woh.data(), D, D, Wog);
-    brotensor::upload_fp16(bqh.data(), D, 1, bqg);
-    brotensor::upload_fp16(bkh.data(), D, 1, bkg);
-    brotensor::upload_fp16(bvh.data(), D, 1, bvg);
-    brotensor::upload_fp16(boh.data(), D, 1, bog);
-    brotensor::upload_fp16(dOh.data(), L, D, dOg);
+    Tensor Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),  L, D);
+    Tensor Wqg = Tensor::from_host_fp16_on(Device::CUDA, Wqh.data(), D, D);
+    Tensor Wkg = Tensor::from_host_fp16_on(Device::CUDA, Wkh.data(), D, D);
+    Tensor Wvg = Tensor::from_host_fp16_on(Device::CUDA, Wvh.data(), D, D);
+    Tensor Wog = Tensor::from_host_fp16_on(Device::CUDA, Woh.data(), D, D);
+    Tensor bqg = Tensor::from_host_fp16_on(Device::CUDA, bqh.data(), D, 1);
+    Tensor bkg = Tensor::from_host_fp16_on(Device::CUDA, bkh.data(), D, 1);
+    Tensor bvg = Tensor::from_host_fp16_on(Device::CUDA, bvh.data(), D, 1);
+    Tensor bog = Tensor::from_host_fp16_on(Device::CUDA, boh.data(), D, 1);
+    Tensor dOg = Tensor::from_host_fp16_on(Device::CUDA, dOh.data(), L, D);
 
-    GpuTensor dXg(L, D, Dtype::FP16);
-    GpuTensor dWqg(D, D, Dtype::FP16); dWqg.zero();
-    GpuTensor dWkg(D, D, Dtype::FP16); dWkg.zero();
-    GpuTensor dWvg(D, D, Dtype::FP16); dWvg.zero();
-    GpuTensor dWog(D, D, Dtype::FP16); dWog.zero();
-    GpuTensor dbqg(D, 1, Dtype::FP16); dbqg.zero();
-    GpuTensor dbkg(D, 1, Dtype::FP16); dbkg.zero();
-    GpuTensor dbvg(D, 1, Dtype::FP16); dbvg.zero();
-    GpuTensor dbog(D, 1, Dtype::FP16); dbog.zero();
+    Tensor dXg  = Tensor::empty_on(Device::CUDA, L, D, Dtype::FP16);
+    Tensor dWqg = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
+    Tensor dWkg = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
+    Tensor dWvg = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
+    Tensor dWog = Tensor::zeros_on(Device::CUDA, D, D, Dtype::FP16);
+    Tensor dbqg = Tensor::zeros_on(Device::CUDA, D, 1, Dtype::FP16);
+    Tensor dbkg = Tensor::zeros_on(Device::CUDA, D, 1, Dtype::FP16);
+    Tensor dbvg = Tensor::zeros_on(Device::CUDA, D, 1, Dtype::FP16);
+    Tensor dbog = Tensor::zeros_on(Device::CUDA, D, 1, Dtype::FP16);
 
-    brotensor::flash_attention_qkvo_backward_gpu(
+    brotensor::flash_attention_qkvo_backward(
         Xg, nullptr,
         Wqg, &bqg, Wkg, &bkg, Wvg, &bvg, Wog, &bog,
         nullptr, nh, /*causal=*/true,
@@ -1074,16 +1068,16 @@ static void run_bwd_causal_cpu(const char* label, int L, int D, int nh) {
     std::vector<uint16_t> dX_got(L*D), dWq_got(D*D), dWk_got(D*D),
                           dWv_got(D*D), dWo_got(D*D);
     std::vector<uint16_t> dbq_got(D), dbk_got(D), dbv_got(D), dbo_got(D);
-    brotensor::download_fp16(dXg,  dX_got.data());
-    brotensor::download_fp16(dWqg, dWq_got.data());
-    brotensor::download_fp16(dWkg, dWk_got.data());
-    brotensor::download_fp16(dWvg, dWv_got.data());
-    brotensor::download_fp16(dWog, dWo_got.data());
-    brotensor::download_fp16(dbqg, dbq_got.data());
-    brotensor::download_fp16(dbkg, dbk_got.data());
-    brotensor::download_fp16(dbvg, dbv_got.data());
-    brotensor::download_fp16(dbog, dbo_got.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host_fp16(dX_got.data());
+    dWqg.copy_to_host_fp16(dWq_got.data());
+    dWkg.copy_to_host_fp16(dWk_got.data());
+    dWvg.copy_to_host_fp16(dWv_got.data());
+    dWog.copy_to_host_fp16(dWo_got.data());
+    dbqg.copy_to_host_fp16(dbq_got.data());
+    dbkg.copy_to_host_fp16(dbk_got.data());
+    dbvg.copy_to_host_fp16(dbv_got.data());
+    dbog.copy_to_host_fp16(dbo_got.data());
+    brotensor::sync_all();
 
     // Tolerance: dWq/dWk/dWv accumulate over (L * D) terms each ≈ 0.05 magnitude,
     // and the dO scale is ~0.3 * 0.3 = 0.1; for L=77 D=768 we expect grads up to
@@ -1112,15 +1106,15 @@ static void run_stress() {
     for (auto& v : Q) v = dist(rng);
     for (auto& v : K) v = dist(rng);
     for (auto& v : V) v = dist(rng);
-    GpuTensor Qg, Kg, Vg, Og;
     auto Qh = to_fp16(Q), Kh = to_fp16(K), Vh = to_fp16(V);
-    brotensor::upload_fp16(Qh.data(), Lq, D, Qg);
-    brotensor::upload_fp16(Kh.data(), Lk, D, Kg);
-    brotensor::upload_fp16(Vh.data(), Lk, D, Vg);
-    brotensor::flash_attention_forward_gpu(Qg, Kg, Vg, nullptr, nh, /*causal=*/false, Og);
+    Tensor Qg = Tensor::from_host_fp16_on(Device::CUDA, Qh.data(), Lq, D);
+    Tensor Kg = Tensor::from_host_fp16_on(Device::CUDA, Kh.data(), Lk, D);
+    Tensor Vg = Tensor::from_host_fp16_on(Device::CUDA, Vh.data(), Lk, D);
+    Tensor Og;
+    brotensor::flash_attention_forward(Qg, Kg, Vg, nullptr, nh, /*causal=*/false, Og);
     std::vector<uint16_t> got(Og.size());
-    brotensor::download_fp16(Og, got.data());
-    brotensor::cuda_sync();
+    Og.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     int finite = 0;
     for (auto h : got) {
         const float f = brotensor::fp16_bits_to_fp32(h);
@@ -1131,11 +1125,10 @@ static void run_stress() {
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_flash_attention\n");
 

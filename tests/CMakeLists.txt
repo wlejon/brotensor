@@ -1,10 +1,13 @@
 # Test layout:
 #   * test_cpu_ops.cpp        — standalone CPU op coverage. Always built.
+#   * test_dispatch.cpp       — runtime backend dispatch / registration /
+#                                DeviceScope coverage. Always built.
 #   * test_cpu_gpu_parity.cpp — CPU↔GPU parity. Only built when a GPU backend
 #                                is enabled.
-#   * everything else         — GPU smoke tests over CUDA / Metal kernels;
-#                                they instantiate GpuTensor / call *_gpu ops
-#                                and only build when a GPU backend is on.
+#   * everything else         — GPU smoke tests over the unified Tensor API;
+#                                they construct CUDA-resident tensors and call
+#                                device-neutral ops, and only build when a GPU
+#                                backend is on. Each guards on is_available().
 
 function(brotensor_add_executable name)
     add_executable(${name} ${ARGN})
@@ -26,6 +29,7 @@ endfunction()
 
 # --- CPU tests (always built) ---
 brotensor_add_test(brotensor_test_cpu_ops test_cpu_ops.cpp)
+brotensor_add_test(brotensor_test_dispatch test_dispatch.cpp)
 
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)

@@ -20,7 +20,7 @@
 #include <stdexcept>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
 
 static int g_failures = 0;
@@ -105,14 +105,14 @@ static void test_geglu_forward_fp16_big() {
     for (int i = 0; i < in_n; ++i) x_f[i] = pattern_val(i);
     auto x_h = to_fp16(x_f);
 
-    GpuTensor X;
-    brotensor::upload_fp16(x_h.data(), kBigB, two_d, X);
-    GpuTensor Y;
-    brotensor::geglu_forward_gpu(X, Y);
+    Tensor X = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                         x_h.data(), kBigB, two_d);
+    Tensor Y;
+    brotensor::geglu_forward(X, Y);
 
     std::vector<uint16_t> y_h(out_n);
-    brotensor::download_fp16(Y, y_h.data());
-    brotensor::cuda_sync();
+    Y.copy_to_host_fp16(y_h.data());
+    brotensor::sync_all();
 
     std::vector<float> got(out_n), ref(out_n);
     for (int b = 0; b < kBigB; ++b) {
@@ -153,14 +153,14 @@ static void test_geglu_exact_forward_fp16_big() {
     for (int i = 0; i < in_n; ++i) x_f[i] = pattern_val(i);
     auto x_h = to_fp16(x_f);
 
-    GpuTensor X;
-    brotensor::upload_fp16(x_h.data(), kBigB, two_d, X);
-    GpuTensor Y;
-    brotensor::geglu_exact_forward_gpu(X, Y);
+    Tensor X = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                         x_h.data(), kBigB, two_d);
+    Tensor Y;
+    brotensor::geglu_exact_forward(X, Y);
 
     std::vector<uint16_t> y_h(out_n);
-    brotensor::download_fp16(Y, y_h.data());
-    brotensor::cuda_sync();
+    Y.copy_to_host_fp16(y_h.data());
+    brotensor::sync_all();
 
     std::vector<float> got(out_n), ref(out_n);
     for (int b = 0; b < kBigB; ++b) {
@@ -205,15 +205,16 @@ static void test_geglu_exact_backward_fp16_big() {
     for (int i = 0; i < out_n; ++i) dy_f[i] = pattern_val(in_n + i);
     auto dy_h = to_fp16(dy_f);
 
-    GpuTensor X, dY;
-    brotensor::upload_fp16(x_h.data(),  kBigB, two_d, X);
-    brotensor::upload_fp16(dy_h.data(), kBigB, kBigD, dY);
-    GpuTensor dX;
-    brotensor::geglu_exact_backward_gpu(X, dY, dX);
+    Tensor X = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                         x_h.data(), kBigB, two_d);
+    Tensor dY = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                          dy_h.data(), kBigB, kBigD);
+    Tensor dX;
+    brotensor::geglu_exact_backward(X, dY, dX);
 
     std::vector<uint16_t> dx_h(in_n);
-    brotensor::download_fp16(dX, dx_h.data());
-    brotensor::cuda_sync();
+    dX.copy_to_host_fp16(dx_h.data());
+    brotensor::sync_all();
 
     // dX has shape (B, 2D). dA = dy * g; dB_half = dy * a * gelu'(b).
     std::vector<float> got_a(out_n), ref_a(out_n);
@@ -256,6 +257,11 @@ static void test_geglu_exact_backward_fp16_big() {
 
 int main() {
     std::printf("test_large_elementwise: exercising kernels at >1M elements\n");
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     try {
         test_geglu_forward_fp16_big();
         test_geglu_exact_forward_fp16_big();

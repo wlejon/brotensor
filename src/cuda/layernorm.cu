@@ -1,17 +1,20 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+#include <brotensor/detail/dispatch.h>
+
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include <stdexcept>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
 
 // NOTE on signature: per Subagent 1's spec, mean_out/rstd_out are host-side
 // floats. We honour that: the kernel writes the two scalars to a tiny device
 // scratch buffer, and we cudaMemcpy them back synchronously at the end of
-// layernorm_forward_gpu. Backward consumes rstd as a host float (same).
+// layernorm_forward. Backward consumes rstd as a host float (same).
 // gamma/beta/xhat are device tensors as declared.
 
 namespace {
@@ -192,11 +195,11 @@ __global__ void ln_add_fp32_into_fp16(const float* __restrict__ src,
 
 } // namespace
 
-void layernorm_forward_gpu(const GpuTensor& x,
-                           const GpuTensor& gamma, const GpuTensor& beta,
-                           GpuTensor& y, GpuTensor& xhat,
-                           float& mean_out, float& rstd_out,
-                           float eps) {
+void layernorm_forward(const ::brotensor::Tensor& x,
+                       const ::brotensor::Tensor& gamma, const ::brotensor::Tensor& beta,
+                       ::brotensor::Tensor& y, ::brotensor::Tensor& xhat,
+                       float& mean_out, float& rstd_out,
+                       float eps) {
     const int n = x.size();
     if (y.rows != x.rows || y.cols != x.cols) y.resize(x.rows, x.cols);
     if (xhat.rows != x.rows || xhat.cols != x.cols) xhat.resize(x.rows, x.cols);
@@ -211,9 +214,14 @@ void layernorm_forward_gpu(const GpuTensor& x,
     BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
                               2 * sizeof(float)));
 
-    layernorm_forward_kernel<<<1, LN_BLOCK>>>(x.data, gamma.data, beta.data,
-                                              y.data, xhat.data, d_scratch,
-                                              n, eps);
+    layernorm_forward_kernel<<<1, LN_BLOCK>>>(
+        reinterpret_cast<const float*>(x.data),
+        reinterpret_cast<const float*>(gamma.data),
+        reinterpret_cast<const float*>(beta.data),
+        reinterpret_cast<float*>(y.data),
+        reinterpret_cast<float*>(xhat.data),
+        d_scratch,
+        n, eps);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     float h[2] = {0.0f, 0.0f};
@@ -325,14 +333,15 @@ __global__ void layernorm_forward_inference_batched_fp16_kernel(
 }
 } // namespace
 
-void layernorm_forward_inference_batched_fp16_gpu(const GpuTensor& X_RD,
-                                                  const GpuTensor& gamma,
-                                                  const GpuTensor& beta,
-                                                  GpuTensor& Y_RD,
-                                                  float eps) {
+void layernorm_forward_inference_batched_fp16(const ::brotensor::Tensor& X_RD,
+                                              const ::brotensor::Tensor& gamma,
+                                              const ::brotensor::Tensor& beta,
+                                              ::brotensor::Tensor& Y_RD,
+                                              float eps) {
+    using ::brotensor::Dtype;
     if (X_RD.dtype != Dtype::FP16 || gamma.dtype != Dtype::FP16 ||
         beta.dtype != Dtype::FP16) {
-        throw std::runtime_error("layernorm_forward_inference_batched_fp16_gpu: all tensors must be FP16");
+        throw std::runtime_error("layernorm_forward_inference_batched_fp16: all tensors must be FP16");
     }
     const int R = X_RD.rows;
     const int D = X_RD.cols;
@@ -343,19 +352,19 @@ void layernorm_forward_inference_batched_fp16_gpu(const GpuTensor& X_RD,
     const int block = LN_BLOCK;
     const size_t shmem = static_cast<size_t>(block) * sizeof(float);
     layernorm_forward_inference_batched_fp16_kernel<<<R, block, shmem>>>(
-        reinterpret_cast<const __half*>(X_RD.data_fp16()),
-        reinterpret_cast<const __half*>(gamma.data_fp16()),
-        reinterpret_cast<const __half*>(beta.data_fp16()),
-        reinterpret_cast<__half*>(Y_RD.data_fp16()),
+        reinterpret_cast<const __half*>(X_RD.data),
+        reinterpret_cast<const __half*>(gamma.data),
+        reinterpret_cast<const __half*>(beta.data),
+        reinterpret_cast<__half*>(Y_RD.data),
         R, D, eps);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void layernorm_forward_inference_batched_gpu(const GpuTensor& X_RD,
-                                              const GpuTensor& gamma,
-                                              const GpuTensor& beta,
-                                              GpuTensor& Y_RD,
-                                              float eps) {
+void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
+                                         const ::brotensor::Tensor& gamma,
+                                         const ::brotensor::Tensor& beta,
+                                         ::brotensor::Tensor& Y_RD,
+                                         float eps) {
     const int R = X_RD.rows;
     const int D = X_RD.cols;
     if (Y_RD.rows != R || Y_RD.cols != D) Y_RD.resize(R, D);
@@ -363,20 +372,25 @@ void layernorm_forward_inference_batched_gpu(const GpuTensor& X_RD,
     const int block = LN_BLOCK;
     const size_t shmem = static_cast<size_t>(block) * sizeof(float);
     layernorm_forward_inference_batched_kernel<<<R, block, shmem>>>(
-        X_RD.data, gamma.data, beta.data, Y_RD.data, R, D, eps);
+        reinterpret_cast<const float*>(X_RD.data),
+        reinterpret_cast<const float*>(gamma.data),
+        reinterpret_cast<const float*>(beta.data),
+        reinterpret_cast<float*>(Y_RD.data),
+        R, D, eps);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
-                            const GpuTensor& gamma, float rstd,
-                            GpuTensor& dX,
-                            GpuTensor& dGamma, GpuTensor& dBeta) {
+void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor& xhat,
+                        const ::brotensor::Tensor& gamma, float rstd,
+                        ::brotensor::Tensor& dX,
+                        ::brotensor::Tensor& dGamma, ::brotensor::Tensor& dBeta) {
+    using ::brotensor::Dtype;
     if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32) {
-        throw std::runtime_error("layernorm_backward_gpu: dY must be FP16 or FP32");
+        throw std::runtime_error("layernorm_backward: dY must be FP16 or FP32");
     }
     if (xhat.dtype != dY.dtype || gamma.dtype != dY.dtype ||
         dGamma.dtype != dY.dtype || dBeta.dtype != dY.dtype) {
-        throw std::runtime_error("layernorm_backward_gpu: all tensors must share dtype");
+        throw std::runtime_error("layernorm_backward: all tensors must share dtype");
     }
     const int n = dY.size();
     if (dX.rows != dY.rows || dX.cols != dY.cols || dX.dtype != dY.dtype) {
@@ -385,9 +399,15 @@ void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
     if (n == 0) return;
 
     if (dY.dtype == Dtype::FP32) {
-        layernorm_backward_kernel<<<1, LN_BLOCK>>>(dY.data, xhat.data, gamma.data,
-                                                   rstd, dX.data,
-                                                   dGamma.data, dBeta.data, n);
+        layernorm_backward_kernel<<<1, LN_BLOCK>>>(
+            reinterpret_cast<const float*>(dY.data),
+            reinterpret_cast<const float*>(xhat.data),
+            reinterpret_cast<const float*>(gamma.data),
+            rstd,
+            reinterpret_cast<float*>(dX.data),
+            reinterpret_cast<float*>(dGamma.data),
+            reinterpret_cast<float*>(dBeta.data),
+            n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     } else {
         float* d_dg = nullptr;
@@ -395,22 +415,98 @@ void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg), n * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db), n * sizeof(float)));
         layernorm_backward_kernel_fp16<<<1, LN_BLOCK>>>(
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<const __half*>(xhat.data_fp16()),
-            reinterpret_cast<const __half*>(gamma.data_fp16()),
+            reinterpret_cast<const __half*>(dY.data),
+            reinterpret_cast<const __half*>(xhat.data),
+            reinterpret_cast<const __half*>(gamma.data),
             rstd,
-            reinterpret_cast<__half*>(dX.data_fp16()),
+            reinterpret_cast<__half*>(dX.data),
             d_dg, d_db, n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         const int blocks = (n + 255) / 256;
         ln_add_fp32_into_fp16<<<blocks, 256>>>(
-            d_dg, reinterpret_cast<__half*>(dGamma.data_fp16()), n);
+            d_dg, reinterpret_cast<__half*>(dGamma.data), n);
         ln_add_fp32_into_fp16<<<blocks, 256>>>(
-            d_db, reinterpret_cast<__half*>(dBeta.data_fp16()), n);
+            d_db, reinterpret_cast<__half*>(dBeta.data), n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_dg);
         cudaFree(d_db);
     }
 }
 
-} // namespace brotensor
+// ─── Vtable contribution ──────────────────────────────────────────────────
+//
+// Fills the GroupNorm + ResBlock + LayerNorm slots. Called by the CUDA
+// backend's per-cluster vtable assembler.
+
+void resblock_forward(const ::brotensor::Tensor& X,
+                      const ::brotensor::Tensor& gamma1, const ::brotensor::Tensor& beta1,
+                      const ::brotensor::Tensor& W1, const ::brotensor::Tensor* b1,
+                      const ::brotensor::Tensor* t_emb_shift,
+                      const ::brotensor::Tensor& gamma2, const ::brotensor::Tensor& beta2,
+                      const ::brotensor::Tensor& W2, const ::brotensor::Tensor* b2,
+                      const ::brotensor::Tensor* Wskip, const ::brotensor::Tensor* bskip,
+                      int N, int C_in, int C_out, int H, int Wd,
+                      int num_groups, float eps,
+                      ::brotensor::Tensor& Y);
+
+void resblock_forward_int8w_fp16(const ::brotensor::Tensor& X,
+                                 const ::brotensor::Tensor& gamma1, const ::brotensor::Tensor& beta1,
+                                 const ::brotensor::Tensor& W1_int8, const ::brotensor::Tensor& s1,
+                                 const ::brotensor::Tensor* b1,
+                                 const ::brotensor::Tensor* t_emb_shift,
+                                 const ::brotensor::Tensor& gamma2, const ::brotensor::Tensor& beta2,
+                                 const ::brotensor::Tensor& W2_int8, const ::brotensor::Tensor& s2,
+                                 const ::brotensor::Tensor* b2,
+                                 const ::brotensor::Tensor* Wskip_int8, const ::brotensor::Tensor* sskip,
+                                 const ::brotensor::Tensor* bskip,
+                                 int N, int C_in, int C_out, int H, int Wd,
+                                 int num_groups, float eps,
+                                 ::brotensor::Tensor& Y);
+
+void resblock_backward(const ::brotensor::Tensor& X,
+                       const ::brotensor::Tensor& gamma1, const ::brotensor::Tensor& beta1,
+                       const ::brotensor::Tensor& W1, const ::brotensor::Tensor* b1,
+                       const ::brotensor::Tensor* t_emb_shift,
+                       const ::brotensor::Tensor& gamma2, const ::brotensor::Tensor& beta2,
+                       const ::brotensor::Tensor& W2, const ::brotensor::Tensor* b2,
+                       const ::brotensor::Tensor* Wskip, const ::brotensor::Tensor* bskip,
+                       int N, int C_in, int C_out, int H, int Wd,
+                       int num_groups, float eps,
+                       const ::brotensor::Tensor& dY,
+                       ::brotensor::Tensor& dX,
+                       ::brotensor::Tensor& dGamma1, ::brotensor::Tensor& dBeta1,
+                       ::brotensor::Tensor& dW1, ::brotensor::Tensor* db1,
+                       ::brotensor::Tensor* dt_emb_shift,
+                       ::brotensor::Tensor& dGamma2, ::brotensor::Tensor& dBeta2,
+                       ::brotensor::Tensor& dW2, ::brotensor::Tensor* db2,
+                       ::brotensor::Tensor* dWskip, ::brotensor::Tensor* dbskip);
+
+// Forward decls from sibling group_norm.cu (this cluster, Phase 2E).
+void group_norm_forward(const ::brotensor::Tensor& X,
+                        const ::brotensor::Tensor& gamma,
+                        const ::brotensor::Tensor& beta,
+                        int N, int C, int H, int W,
+                        int num_groups, float eps,
+                        ::brotensor::Tensor& Y);
+void group_norm_backward(const ::brotensor::Tensor& X,
+                         const ::brotensor::Tensor& gamma,
+                         const ::brotensor::Tensor& dY,
+                         int N, int C, int H, int W,
+                         int num_groups, float eps,
+                         ::brotensor::Tensor& dX,
+                         ::brotensor::Tensor& dGamma,
+                         ::brotensor::Tensor& dBeta);
+
+void fill_cuda_vtable_norms(::brotensor::detail::OpsVTable& v) {
+    v.layernorm_forward                              = &layernorm_forward;
+    v.layernorm_backward                             = &layernorm_backward;
+    v.layernorm_forward_inference_batched            = &layernorm_forward_inference_batched;
+    v.layernorm_forward_inference_batched_fp16       = &layernorm_forward_inference_batched_fp16;
+    v.group_norm_forward                             = &group_norm_forward;
+    v.group_norm_backward                            = &group_norm_backward;
+    v.resblock_forward                               = &resblock_forward;
+    v.resblock_backward                              = &resblock_backward;
+    v.resblock_forward_int8w_fp16                    = &resblock_forward_int8w_fp16;
+}
+
+} // namespace brotensor::detail::cuda

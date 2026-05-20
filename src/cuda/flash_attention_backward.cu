@@ -14,10 +14,10 @@
 // to keep this file self-contained, we re-define equivalent helpers in our
 // own anonymous namespace.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 
 #include "fp16_internal.cuh"
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -26,6 +26,8 @@
 #include <stdexcept>
 
 namespace brotensor {
+
+void* cuda_current_stream();
 
 namespace {
 
@@ -218,42 +220,44 @@ __global__ void fab_dKh_kernel(const __half* __restrict__ dS,
 
 } // namespace
 
+namespace detail::cuda {
+
 // O is consumed by the qkvo backward only via Wo backward; here we don't have
 // Wo. O is not actually needed for the recompute path — we re-derive P from
 // (Q, K) + softmax. We accept O in the signature to mirror standard
 // flash-attn backward APIs and to allow a future caller-supplied-cache path,
 // but the parameter is currently unused.
-void flash_attention_backward_gpu(const GpuTensor& Q,
-                                  const GpuTensor& K,
-                                  const GpuTensor& V,
-                                  const GpuTensor& O,
-                                  const GpuTensor& dO,
-                                  const float* d_mask,
-                                  int num_heads,
-                                  bool causal,
-                                  GpuTensor& dQ,
-                                  GpuTensor& dK,
-                                  GpuTensor& dV) {
+void flash_attention_backward(const Tensor& Q,
+                              const Tensor& K,
+                              const Tensor& V,
+                              const Tensor& O,
+                              const Tensor& dO,
+                              const float* d_mask,
+                              int num_heads,
+                              bool causal,
+                              Tensor& dQ,
+                              Tensor& dK,
+                              Tensor& dV) {
     (void)O;  // recompute-based; O retained in API for symmetry.
 
     if (Q.dtype != Dtype::FP16 || K.dtype != Dtype::FP16 ||
         V.dtype != Dtype::FP16 || dO.dtype != Dtype::FP16) {
-        throw std::runtime_error("flash_attention_backward_gpu: Q, K, V, dO must be FP16");
+        throw std::runtime_error("flash_attention_backward: Q, K, V, dO must be FP16");
     }
     const int Lq = Q.rows;
     const int Lk = K.rows;
     const int D  = Q.cols;
     if (K.cols != D || V.cols != D || V.rows != Lk) {
-        throw std::runtime_error("flash_attention_backward_gpu: Q/K/V shape mismatch");
+        throw std::runtime_error("flash_attention_backward: Q/K/V shape mismatch");
     }
     if (dO.rows != Lq || dO.cols != D) {
-        throw std::runtime_error("flash_attention_backward_gpu: dO shape mismatch");
+        throw std::runtime_error("flash_attention_backward: dO shape mismatch");
     }
     if (num_heads <= 0 || D % num_heads != 0) {
-        throw std::runtime_error("flash_attention_backward_gpu: num_heads must divide D");
+        throw std::runtime_error("flash_attention_backward: num_heads must divide D");
     }
     if (causal && Lq != Lk) {
-        throw std::runtime_error("flash_attention_backward_gpu: causal requires Lq == Lk");
+        throw std::runtime_error("flash_attention_backward: causal requires Lq == Lk");
     }
     const int hd = D / num_heads;
 
@@ -278,15 +282,15 @@ void flash_attention_backward_gpu(const GpuTensor& Q,
     if (sm_block > 1024) sm_block = 1024;
     const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(hd));
 
-    GpuTensor Qh(Lq, hd, Dtype::FP16);
-    GpuTensor Kh(Lk, hd, Dtype::FP16);
-    GpuTensor Vh(Lk, hd, Dtype::FP16);
-    GpuTensor dOh(Lq, hd, Dtype::FP16);
-    GpuTensor P(Lq, Lk, Dtype::FP16);
-    GpuTensor dP(Lq, Lk, Dtype::FP16);
-    GpuTensor dQh(Lq, hd, Dtype::FP16);
-    GpuTensor dKh(Lk, hd, Dtype::FP16);
-    GpuTensor dVh(Lk, hd, Dtype::FP16);
+    Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, hd, Dtype::FP16);
+    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
+    Tensor Vh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
+    Tensor dOh = Tensor::empty_on(Device::CUDA, Lq, hd, Dtype::FP16);
+    Tensor P = Tensor::empty_on(Device::CUDA, Lq, Lk, Dtype::FP16);
+    Tensor dP = Tensor::empty_on(Device::CUDA, Lq, Lk, Dtype::FP16);
+    Tensor dQh = Tensor::empty_on(Device::CUDA, Lq, hd, Dtype::FP16);
+    Tensor dKh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
+    Tensor dVh = Tensor::empty_on(Device::CUDA, Lk, hd, Dtype::FP16);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     (void)FAB_BLOCK;
@@ -298,32 +302,32 @@ void flash_attention_backward_gpu(const GpuTensor& Q,
 
         // Extract per-head buffers (Q_h, K_h, V_h, dO_h).
         fab_extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(Q.data_fp16()),
-            reinterpret_cast<__half*>(Qh.data_fp16()),
+            reinterpret_cast<const __half*>(Q.data),
+            reinterpret_cast<__half*>(Qh.data),
             Lq, D, head_off, hd);
         fab_extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(K.data_fp16()),
-            reinterpret_cast<__half*>(Kh.data_fp16()),
+            reinterpret_cast<const __half*>(K.data),
+            reinterpret_cast<__half*>(Kh.data),
             Lk, D, head_off, hd);
         fab_extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(V.data_fp16()),
-            reinterpret_cast<__half*>(Vh.data_fp16()),
+            reinterpret_cast<const __half*>(V.data),
+            reinterpret_cast<__half*>(Vh.data),
             Lk, D, head_off, hd);
         fab_extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(dO.data_fp16()),
-            reinterpret_cast<__half*>(dOh.data_fp16()),
+            reinterpret_cast<const __half*>(dO.data),
+            reinterpret_cast<__half*>(dOh.data),
             Lq, D, head_off, hd);
 
         // Recompute P: S(Lq, Lk) = Qh · Kh^T then row-softmax(scale, mask, causal).
         fp16_internal::launch_matmul_ABT(
-            reinterpret_cast<const __half*>(Qh.data_fp16()),
-            reinterpret_cast<const __half*>(Kh.data_fp16()),
-            reinterpret_cast<__half*>(P.data_fp16()),
+            reinterpret_cast<const __half*>(Qh.data),
+            reinterpret_cast<const __half*>(Kh.data),
+            reinterpret_cast<__half*>(P.data),
             Lq, Lk, hd);
         {
             const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
             fab_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
-                reinterpret_cast<__half*>(P.data_fp16()),
+                reinterpret_cast<__half*>(P.data),
                 Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
         }
 
@@ -332,9 +336,9 @@ void flash_attention_backward_gpu(const GpuTensor& Q,
             dim3 block(16, 16);
             dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
             fab_dVh_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __half*>(P.data_fp16()),
-                reinterpret_cast<const __half*>(dOh.data_fp16()),
-                reinterpret_cast<__half*>(dVh.data_fp16()),
+                reinterpret_cast<const __half*>(P.data),
+                reinterpret_cast<const __half*>(dOh.data),
+                reinterpret_cast<__half*>(dVh.data),
                 Lq, Lk, hd);
         }
 
@@ -343,9 +347,9 @@ void flash_attention_backward_gpu(const GpuTensor& Q,
             dim3 block(16, 16);
             dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
             fab_dP_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __half*>(dOh.data_fp16()),
-                reinterpret_cast<const __half*>(Vh.data_fp16()),
-                reinterpret_cast<__half*>(dP.data_fp16()),
+                reinterpret_cast<const __half*>(dOh.data),
+                reinterpret_cast<const __half*>(Vh.data),
+                reinterpret_cast<__half*>(dP.data),
                 Lq, Lk, hd);
         }
 
@@ -353,8 +357,8 @@ void flash_attention_backward_gpu(const GpuTensor& Q,
         {
             const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
             fab_dS_from_P_dP_kernel<<<Lq, sm_block, shmem, stream>>>(
-                reinterpret_cast<__half*>(P.data_fp16()),
-                reinterpret_cast<const __half*>(dP.data_fp16()),
+                reinterpret_cast<__half*>(P.data),
+                reinterpret_cast<const __half*>(dP.data),
                 Lq, Lk, inv_sqrt);
         }
 
@@ -363,9 +367,9 @@ void flash_attention_backward_gpu(const GpuTensor& Q,
             dim3 block(16, 16);
             dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
             fab_dQh_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __half*>(P.data_fp16()),
-                reinterpret_cast<const __half*>(Kh.data_fp16()),
-                reinterpret_cast<__half*>(dQh.data_fp16()),
+                reinterpret_cast<const __half*>(P.data),
+                reinterpret_cast<const __half*>(Kh.data),
+                reinterpret_cast<__half*>(dQh.data),
                 Lq, Lk, hd);
         }
 
@@ -374,27 +378,29 @@ void flash_attention_backward_gpu(const GpuTensor& Q,
             dim3 block(16, 16);
             dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
             fab_dKh_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __half*>(P.data_fp16()),
-                reinterpret_cast<const __half*>(Qh.data_fp16()),
-                reinterpret_cast<__half*>(dKh.data_fp16()),
+                reinterpret_cast<const __half*>(P.data),
+                reinterpret_cast<const __half*>(Qh.data),
+                reinterpret_cast<__half*>(dKh.data),
                 Lq, Lk, hd);
         }
 
         // Pack per-head grads back into the (L, D) slot for this head.
         fab_pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(dQh.data_fp16()),
-            reinterpret_cast<__half*>(dQ.data_fp16()),
+            reinterpret_cast<const __half*>(dQh.data),
+            reinterpret_cast<__half*>(dQ.data),
             Lq, D, head_off, hd);
         fab_pack_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(dKh.data_fp16()),
-            reinterpret_cast<__half*>(dK.data_fp16()),
+            reinterpret_cast<const __half*>(dKh.data),
+            reinterpret_cast<__half*>(dK.data),
             Lk, D, head_off, hd);
         fab_pack_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(dVh.data_fp16()),
-            reinterpret_cast<__half*>(dV.data_fp16()),
+            reinterpret_cast<const __half*>(dVh.data),
+            reinterpret_cast<__half*>(dV.data),
             Lk, D, head_off, hd);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
+
+} // namespace detail::cuda
 
 } // namespace brotensor

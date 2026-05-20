@@ -14,8 +14,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 
@@ -77,24 +78,24 @@ static void test_linear_fp16() {
             Ref[b*out_dim+o] = static_cast<float>(s);
         }
 
-    GpuTensor W, Bb, X, Y;
+    Tensor W, Bb, X, Y;
     auto Wh = to_fp16(Wf), Bh = to_fp16(Bf), Xh = to_fp16(Xf);
-    brotensor::upload_fp16(Wh.data(), out_dim, in_dim, W);
-    brotensor::upload_fp16(Bh.data(), out_dim, 1, Bb);
-    brotensor::upload_fp16(Xh.data(), B, in_dim, X);
-    brotensor::linear_forward_batched_fp16_gpu(W, &Bb, X, Y);
+    W  = Tensor::from_host_fp16_on(Device::CUDA, Wh.data(), out_dim, in_dim);
+    Bb = Tensor::from_host_fp16_on(Device::CUDA, Bh.data(), out_dim, 1);
+    X  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), B, in_dim);
+    brotensor::linear_forward_batched_fp16(W, &Bb, X, Y);
     CHECK(Y.rows == B && Y.cols == out_dim && Y.dtype == Dtype::FP16);
     std::vector<uint16_t> got(Y.size());
-    brotensor::download_fp16(Y, got.data());
-    brotensor::cuda_sync();
+    Y.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     check_fp16(got, Ref, "linear");
 
     // No-bias variant.
-    GpuTensor Y2;
-    brotensor::linear_forward_batched_fp16_gpu(W, nullptr, X, Y2);
+    Tensor Y2;
+    brotensor::linear_forward_batched_fp16(W, nullptr, X, Y2);
     std::vector<uint16_t> got2(Y2.size());
-    brotensor::download_fp16(Y2, got2.data());
-    brotensor::cuda_sync();
+    Y2.copy_to_host_fp16(got2.data());
+    brotensor::sync_all();
     std::vector<float> Ref2 = Ref;
     for (int b = 0; b < B; ++b)
         for (int o = 0; o < out_dim; ++o) Ref2[b*out_dim+o] -= Bq[o];
@@ -112,31 +113,31 @@ static void test_elementwise_fp16() {
     auto Aq = rq(A), Bq = rq(Bv);
 
     // add
-    GpuTensor Ag, Bg;
+    Tensor Ag, Bg;
     auto Ah = to_fp16(A), Bh = to_fp16(Bv);
-    brotensor::upload_fp16(Ah.data(), N, 1, Ag);
-    brotensor::upload_fp16(Bh.data(), N, 1, Bg);
-    brotensor::add_inplace_gpu(Ag, Bg);
+    Ag = Tensor::from_host_fp16_on(Device::CUDA, Ah.data(), N, 1);
+    Bg = Tensor::from_host_fp16_on(Device::CUDA, Bh.data(), N, 1);
+    brotensor::add_inplace(Ag, Bg);
     std::vector<uint16_t> got(N);
-    brotensor::download_fp16(Ag, got.data());
-    brotensor::cuda_sync();
+    Ag.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     std::vector<float> Ref(N);
     for (int i = 0; i < N; ++i) Ref[i] = Aq[i] + Bq[i];
     check_fp16(got, Ref, "add_inplace");
 
     // scale (re-upload)
-    brotensor::upload_fp16(Ah.data(), N, 1, Ag);
-    brotensor::scale_inplace_gpu(Ag, 0.25f);
-    brotensor::download_fp16(Ag, got.data());
-    brotensor::cuda_sync();
+    Ag = Tensor::from_host_fp16_on(Device::CUDA, Ah.data(), N, 1);
+    brotensor::scale_inplace(Ag, 0.25f);
+    Ag.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     for (int i = 0; i < N; ++i) Ref[i] = Aq[i] * 0.25f;
     check_fp16(got, Ref, "scale_inplace");
 
     // mul
-    brotensor::upload_fp16(Ah.data(), N, 1, Ag);
-    brotensor::mul_inplace_gpu(Ag, Bg);
-    brotensor::download_fp16(Ag, got.data());
-    brotensor::cuda_sync();
+    Ag = Tensor::from_host_fp16_on(Device::CUDA, Ah.data(), N, 1);
+    brotensor::mul_inplace(Ag, Bg);
+    Ag.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     for (int i = 0; i < N; ++i) Ref[i] = Aq[i] * Bq[i];
     check_fp16(got, Ref, "mul_inplace");
 }
@@ -151,16 +152,16 @@ static void test_concat_fp16() {
     for (auto& v : P3) v = dist(rng);
     auto P1q = rq(P1), P2q = rq(P2), P3q = rq(P3);
 
-    GpuTensor G1, G2, G3, Out;
+    Tensor G1, G2, G3, Out;
     auto P1h = to_fp16(P1), P2h = to_fp16(P2), P3h = to_fp16(P3);
-    brotensor::upload_fp16(P1h.data(), 13, 1, G1);
-    brotensor::upload_fp16(P2h.data(), 7, 1, G2);
-    brotensor::upload_fp16(P3h.data(), 4, 1, G3);
-    brotensor::concat_rows_gpu({&G1, &G2, &G3}, Out);
+    G1 = Tensor::from_host_fp16_on(Device::CUDA, P1h.data(), 13, 1);
+    G2 = Tensor::from_host_fp16_on(Device::CUDA, P2h.data(), 7, 1);
+    G3 = Tensor::from_host_fp16_on(Device::CUDA, P3h.data(), 4, 1);
+    brotensor::concat_rows({&G1, &G2, &G3}, Out);
     CHECK(Out.rows == 24 && Out.dtype == Dtype::FP16);
     std::vector<uint16_t> got(Out.size());
-    brotensor::download_fp16(Out, got.data());
-    brotensor::cuda_sync();
+    Out.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     std::vector<float> Ref;
     for (auto v : P1q) Ref.push_back(v);
     for (auto v : P2q) Ref.push_back(v);
@@ -172,15 +173,15 @@ static void test_concat_fp16() {
     for (auto& v : A) v = dist(rng);
     for (auto& v : Bv) v = dist(rng);
     auto Aq = rq(A), Bq = rq(Bv);
-    GpuTensor Ag, Bg, OutB;
+    Tensor Ag, Bg, OutB;
     auto Ah = to_fp16(A), Bh = to_fp16(Bv);
-    brotensor::upload_fp16(Ah.data(), 3, 4, Ag);
-    brotensor::upload_fp16(Bh.data(), 3, 2, Bg);
-    brotensor::concat_batched_rows_gpu({&Ag, &Bg}, OutB);
+    Ag = Tensor::from_host_fp16_on(Device::CUDA, Ah.data(), 3, 4);
+    Bg = Tensor::from_host_fp16_on(Device::CUDA, Bh.data(), 3, 2);
+    brotensor::concat_batched_rows({&Ag, &Bg}, OutB);
     CHECK(OutB.rows == 3 && OutB.cols == 6 && OutB.dtype == Dtype::FP16);
     std::vector<uint16_t> gotB(OutB.size());
-    brotensor::download_fp16(OutB, gotB.data());
-    brotensor::cuda_sync();
+    OutB.copy_to_host_fp16(gotB.data());
+    brotensor::sync_all();
     std::vector<float> RefB(3*6);
     for (int b = 0; b < 3; ++b) {
         for (int j = 0; j < 4; ++j) RefB[b*6+j]     = Aq[b*4+j];
@@ -206,17 +207,17 @@ static void test_concat_nchw_channels_fp16() {
     for (auto& v : P3) v = dist(rng);
     auto P1q = rq(P1), P2q = rq(P2), P3q = rq(P3);
 
-    GpuTensor G1, G2, G3, Out;
+    Tensor G1, G2, G3, Out;
     auto P1h = to_fp16(P1), P2h = to_fp16(P2), P3h = to_fp16(P3);
-    brotensor::upload_fp16(P1h.data(), N, C1*HW, G1);
-    brotensor::upload_fp16(P2h.data(), N, C2*HW, G2);
-    brotensor::upload_fp16(P3h.data(), N, C3*HW, G3);
-    brotensor::concat_nchw_channels_gpu({&G1, &G2, &G3}, N, H, W,
-                                        {C1, C2, C3}, Out);
+    G1 = Tensor::from_host_fp16_on(Device::CUDA, P1h.data(), N, C1*HW);
+    G2 = Tensor::from_host_fp16_on(Device::CUDA, P2h.data(), N, C2*HW);
+    G3 = Tensor::from_host_fp16_on(Device::CUDA, P3h.data(), N, C3*HW);
+    brotensor::concat_nchw_channels({&G1, &G2, &G3}, N, H, W,
+                                    {C1, C2, C3}, Out);
     CHECK(Out.rows == N && Out.cols == total_C*HW && Out.dtype == Dtype::FP16);
     std::vector<uint16_t> got(Out.size());
-    brotensor::download_fp16(Out, got.data());
-    brotensor::cuda_sync();
+    Out.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
 
     // Reference: per-sample, lay channel blocks of P1 then P2 then P3.
     std::vector<float> Ref(N*total_C*HW);
@@ -251,25 +252,23 @@ static void test_concat_nchw_channels_backward_fp16() {
     for (auto& v : dY_host) v = dist(rng);
     auto dY_q = rq(dY_host);
     auto dY_h = to_fp16(dY_host);
-    GpuTensor dY;
-    brotensor::upload_fp16(dY_h.data(), N, total_C * HW, dY);
+    Tensor dY;
+    dY = Tensor::from_host_fp16_on(Device::CUDA, dY_h.data(), N, total_C * HW);
 
-    GpuTensor dP1, dP2, dP3;
-    brotensor::concat_nchw_channels_backward_gpu(
+    Tensor dP1, dP2, dP3;
+    brotensor::concat_nchw_channels_backward(
         dY, N, H, W, {C1, C2, C3}, {&dP1, &dP2, &dP3});
     CHECK(dP1.rows == N && dP1.cols == C1 * HW && dP1.dtype == Dtype::FP16);
     CHECK(dP2.rows == N && dP2.cols == C2 * HW && dP2.dtype == Dtype::FP16);
     CHECK(dP3.rows == N && dP3.cols == C3 * HW && dP3.dtype == Dtype::FP16);
 
-    auto download = [&](const GpuTensor& g) {
-        std::vector<uint16_t> h(g.size());
-        brotensor::download_fp16(g, h.data());
-        return h;
+    auto download = [&](const Tensor& g) {
+        return g.to_host_vector_fp16();
     };
     auto got1 = download(dP1);
     auto got2 = download(dP2);
     auto got3 = download(dP3);
-    brotensor::cuda_sync();
+    brotensor::sync_all();
 
     auto build_ref = [&](int c_off, int Ci) {
         std::vector<float> ref(N * Ci * HW);
@@ -290,14 +289,14 @@ static void test_concat_nchw_channels_backward_fp16() {
         std::vector<float> dy(N2 * C * H2 * W2);
         for (auto& v : dy) v = dist(rng);
         auto dyh = to_fp16(dy);
-        GpuTensor DY;
-        brotensor::upload_fp16(dyh.data(), N2, C * H2 * W2, DY);
-        GpuTensor P;
-        brotensor::concat_nchw_channels_backward_gpu(
+        Tensor DY;
+        DY = Tensor::from_host_fp16_on(Device::CUDA, dyh.data(), N2, C * H2 * W2);
+        Tensor P;
+        brotensor::concat_nchw_channels_backward(
             DY, N2, H2, W2, {C}, {&P});
         CHECK(P.rows == N2 && P.cols == C * H2 * W2);
         auto got = download(P);
-        brotensor::cuda_sync();
+        brotensor::sync_all();
         auto ref = rq(dy);
         check_fp16(got, ref, "concat_bwd single");
     }
@@ -315,32 +314,34 @@ static void test_split_and_copy_d2d_fp16() {
     for (auto& v : P2) v = dist(rng);
     for (auto& v : P3) v = dist(rng);
     auto P1q = rq(P1), P2q = rq(P2), P3q = rq(P3);
-    GpuTensor G1, G2, G3, Cat;
+    Tensor G1, G2, G3, Cat;
     auto P1h = to_fp16(P1), P2h = to_fp16(P2), P3h = to_fp16(P3);
-    brotensor::upload_fp16(P1h.data(), 5, 1, G1);
-    brotensor::upload_fp16(P2h.data(), 11, 1, G2);
-    brotensor::upload_fp16(P3h.data(), 3, 1, G3);
-    brotensor::concat_rows_gpu({&G1, &G2, &G3}, Cat);
+    G1 = Tensor::from_host_fp16_on(Device::CUDA, P1h.data(), 5, 1);
+    G2 = Tensor::from_host_fp16_on(Device::CUDA, P2h.data(), 11, 1);
+    G3 = Tensor::from_host_fp16_on(Device::CUDA, P3h.data(), 3, 1);
+    brotensor::concat_rows({&G1, &G2, &G3}, Cat);
 
-    GpuTensor S1(5, 1, Dtype::FP16), S2(11, 1, Dtype::FP16), S3(3, 1, Dtype::FP16);
-    brotensor::split_rows_gpu(Cat, {&S1, &S2, &S3});
+    Tensor S1 = Tensor::zeros_on(Device::CUDA, 5, 1, Dtype::FP16);
+    Tensor S2 = Tensor::zeros_on(Device::CUDA, 11, 1, Dtype::FP16);
+    Tensor S3 = Tensor::zeros_on(Device::CUDA, 3, 1, Dtype::FP16);
+    brotensor::split_rows(Cat, {&S1, &S2, &S3});
     std::vector<uint16_t> g1(5), g2(11), g3(3);
-    brotensor::download_fp16(S1, g1.data());
-    brotensor::download_fp16(S2, g2.data());
-    brotensor::download_fp16(S3, g3.data());
-    brotensor::cuda_sync();
+    S1.copy_to_host_fp16(g1.data());
+    S2.copy_to_host_fp16(g2.data());
+    S3.copy_to_host_fp16(g3.data());
+    brotensor::sync_all();
     check_fp16(g1, P1q, "split_rows[0]");
     check_fp16(g2, P2q, "split_rows[1]");
     check_fp16(g3, P3q, "split_rows[2]");
 
-    // copy_d2d_gpu: copy a 4-element slice starting at offset 3 of Cat into a
+    // copy_d2d: copy a 4-element slice starting at offset 3 of Cat into a
     // fresh FP16 tensor at offset 1.
-    GpuTensor Dst(8, 1, Dtype::FP16);
+    Tensor Dst = Tensor::zeros_on(Device::CUDA, 8, 1, Dtype::FP16);
     Dst.zero();
-    brotensor::copy_d2d_gpu(Cat, /*src_off*/3, Dst, /*dst_off*/1, /*n*/4);
+    brotensor::copy_d2d(Cat, /*src_off*/3, Dst, /*dst_off*/1, /*n*/4);
     std::vector<uint16_t> got_dst(8);
-    brotensor::download_fp16(Dst, got_dst.data());
-    brotensor::cuda_sync();
+    Dst.copy_to_host_fp16(got_dst.data());
+    brotensor::sync_all();
     std::vector<float> ref_dst(8, 0.0f);
     // Cat[3..6] = (P1[3], P1[4], P2[0], P2[1])
     ref_dst[1] = P1q[3];
@@ -371,16 +372,16 @@ static void test_layernorm_fp16() {
         const float rstd = 1.0f / std::sqrt(static_cast<float>(sv/D) + eps);
         for (int j = 0; j < D; ++j) Ref[r*D+j] = (Xq[r*D+j] - mean) * rstd * Gq[j] + Bq[j];
     }
-    GpuTensor Xg, Gg, Bg, Yg;
+    Tensor Xg, Gg, Bg, Yg;
     auto Xh = to_fp16(X), Gh = to_fp16(G), Bh = to_fp16(B);
-    brotensor::upload_fp16(Xh.data(), R, D, Xg);
-    brotensor::upload_fp16(Gh.data(), 1, D, Gg);
-    brotensor::upload_fp16(Bh.data(), 1, D, Bg);
-    brotensor::layernorm_forward_inference_batched_fp16_gpu(Xg, Gg, Bg, Yg, eps);
+    Xg = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), R, D);
+    Gg = Tensor::from_host_fp16_on(Device::CUDA, Gh.data(), 1, D);
+    Bg = Tensor::from_host_fp16_on(Device::CUDA, Bh.data(), 1, D);
+    brotensor::layernorm_forward_inference_batched_fp16(Xg, Gg, Bg, Yg, eps);
     CHECK(Yg.rows == R && Yg.cols == D && Yg.dtype == Dtype::FP16);
     std::vector<uint16_t> got(Yg.size());
-    brotensor::download_fp16(Yg, got.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     check_fp16(got, Ref, "layernorm");
 }
 
@@ -421,28 +422,28 @@ static void test_linear_backward_batched_fp16() {
             dB_ref[i] = static_cast<float>(a);
         }
 
-        GpuTensor Wg, Xg, dYg, dXg, dWg, dBg;
+        Tensor Wg, Xg, dYg, dXg, dWg, dBg;
         auto Wh = to_fp16(Wf), Xh = to_fp16(Xf), dYh = to_fp16(dYf);
-        brotensor::upload_fp16(Wh.data(), out_dim, in_dim, Wg);
-        brotensor::upload_fp16(Xh.data(), B, in_dim, Xg);
-        brotensor::upload_fp16(dYh.data(), B, out_dim, dYg);
+        Wg  = Tensor::from_host_fp16_on(Device::CUDA, Wh.data(), out_dim, in_dim);
+        Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), B, in_dim);
+        dYg = Tensor::from_host_fp16_on(Device::CUDA, dYh.data(), B, out_dim);
         std::vector<uint16_t> z_dw(out_dim * in_dim,
                                    brotensor::fp32_to_fp16_bits(0.0f));
         std::vector<uint16_t> z_db(out_dim,
                                    brotensor::fp32_to_fp16_bits(0.0f));
-        brotensor::upload_fp16(z_dw.data(), out_dim, in_dim, dWg);
-        brotensor::upload_fp16(z_db.data(), out_dim, 1, dBg);
+        dWg = Tensor::from_host_fp16_on(Device::CUDA, z_dw.data(), out_dim, in_dim);
+        dBg = Tensor::from_host_fp16_on(Device::CUDA, z_db.data(), out_dim, 1);
 
-        brotensor::linear_backward_batched_gpu(Wg, Xg, dYg, dXg, dWg, dBg);
+        brotensor::linear_backward_batched(Wg, Xg, dYg, dXg, dWg, dBg);
         CHECK(dXg.dtype == Dtype::FP16);
         CHECK(dWg.dtype == Dtype::FP16);
         CHECK(dBg.dtype == Dtype::FP16);
 
         std::vector<uint16_t> dx_got(dXg.size()), dw_got(dWg.size()), db_got(dBg.size());
-        brotensor::download_fp16(dXg, dx_got.data());
-        brotensor::download_fp16(dWg, dw_got.data());
-        brotensor::download_fp16(dBg, db_got.data());
-        brotensor::cuda_sync();
+        dXg.copy_to_host_fp16(dx_got.data());
+        dWg.copy_to_host_fp16(dw_got.data());
+        dBg.copy_to_host_fp16(db_got.data());
+        brotensor::sync_all();
         std::printf("    shape B=%d in=%d out=%d\n", B, in_dim, out_dim);
         check_fp16(dx_got, dX_ref, "linbwd-dX");
         check_fp16(dw_got, dW_ref, "linbwd-dW");
@@ -493,25 +494,25 @@ static void test_layernorm_backward_fp16() {
             dB_ref[i] = dYq[i];
         }
 
-        GpuTensor dYg, xhatg, Gg, dXg, dGg, dBg;
+        Tensor dYg, xhatg, Gg, dXg, dGg, dBg;
         auto dYh = to_fp16(dYf), xh = to_fp16(xhat_ref), Gh = to_fp16(G);
-        brotensor::upload_fp16(dYh.data(), n, 1, dYg);
-        brotensor::upload_fp16(xh.data(), n, 1, xhatg);
-        brotensor::upload_fp16(Gh.data(), n, 1, Gg);
+        dYg   = Tensor::from_host_fp16_on(Device::CUDA, dYh.data(), n, 1);
+        xhatg = Tensor::from_host_fp16_on(Device::CUDA, xh.data(), n, 1);
+        Gg    = Tensor::from_host_fp16_on(Device::CUDA, Gh.data(), n, 1);
         std::vector<uint16_t> zeros(n, brotensor::fp32_to_fp16_bits(0.0f));
-        brotensor::upload_fp16(zeros.data(), n, 1, dGg);
-        brotensor::upload_fp16(zeros.data(), n, 1, dBg);
+        dGg = Tensor::from_host_fp16_on(Device::CUDA, zeros.data(), n, 1);
+        dBg = Tensor::from_host_fp16_on(Device::CUDA, zeros.data(), n, 1);
 
-        brotensor::layernorm_backward_gpu(dYg, xhatg, Gg, rstd, dXg, dGg, dBg);
+        brotensor::layernorm_backward(dYg, xhatg, Gg, rstd, dXg, dGg, dBg);
         CHECK(dXg.dtype == Dtype::FP16);
         CHECK(dGg.dtype == Dtype::FP16);
         CHECK(dBg.dtype == Dtype::FP16);
 
         std::vector<uint16_t> dx_got(n), dg_got(n), db_got(n);
-        brotensor::download_fp16(dXg, dx_got.data());
-        brotensor::download_fp16(dGg, dg_got.data());
-        brotensor::download_fp16(dBg, db_got.data());
-        brotensor::cuda_sync();
+        dXg.copy_to_host_fp16(dx_got.data());
+        dGg.copy_to_host_fp16(dg_got.data());
+        dBg.copy_to_host_fp16(db_got.data());
+        brotensor::sync_all();
         std::printf("    shape n=%d\n", n);
         check_fp16(dx_got, dX_ref, "lnbwd-dX");
         check_fp16(dg_got, dG_ref, "lnbwd-dGamma");
@@ -539,39 +540,39 @@ static void test_embedding_backward_fp16() {
             for (int j = 0; j < D; ++j)
                 dT_ref[idx[b]*D + j] += dOut_q[b*D + j];
 
-        GpuTensor dOutg, dTg;
+        Tensor dOutg, dTg;
         auto dOut_h = to_fp16(dOut);
-        brotensor::upload_fp16(dOut_h.data(), B, D, dOutg);
+        dOutg = Tensor::from_host_fp16_on(Device::CUDA, dOut_h.data(), B, D);
         std::vector<uint16_t> zeros(V * D, brotensor::fp32_to_fp16_bits(0.0f));
-        brotensor::upload_fp16(zeros.data(), V, D, dTg);
+        dTg = Tensor::from_host_fp16_on(Device::CUDA, zeros.data(), V, D);
 
         // Upload idx into a device int32 buffer (bit-cast through FP32 upload).
-        GpuTensor idx_buf(B, 1, Dtype::FP32);
         std::vector<float> idx_as_float(B);
         for (int i = 0; i < B; ++i) {
             int32_t v = idx[i];
             std::memcpy(&idx_as_float[i], &v, sizeof(int32_t));
         }
-        brotensor::upload(idx_as_float.data(), B, 1, idx_buf);
+        Tensor idx_buf =
+            Tensor::from_host_on(Device::CUDA, idx_as_float.data(), B, 1);
 
-        brotensor::embedding_lookup_backward_gpu(dOutg,
-                                                 reinterpret_cast<const int32_t*>(idx_buf.data),
-                                                 B, dTg);
+        brotensor::embedding_lookup_backward(
+            dOutg,
+            reinterpret_cast<const int32_t*>(idx_buf.data),
+            B, dTg);
         CHECK(dTg.dtype == Dtype::FP16);
         std::vector<uint16_t> got(V * D);
-        brotensor::download_fp16(dTg, got.data());
-        brotensor::cuda_sync();
+        dTg.copy_to_host_fp16(got.data());
+        brotensor::sync_all();
         std::printf("    shape V=%d B=%d D=%d\n", V, B, D);
         check_fp16(got, dT_ref, "embbwd-dTable");
     }
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_fp16_basics\n");
     test_linear_fp16();

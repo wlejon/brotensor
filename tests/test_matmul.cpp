@@ -10,8 +10,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Device;
 using brotensor::Dtype;
+using brotensor::Tensor;
 
 static int g_failures = 0;
 
@@ -62,14 +63,14 @@ static void test_fp32() {
     for (auto& v : B) v = dist(rng);
     cpu_matmul(A, B, ref, M, N, K);
 
-    GpuTensor Ag, Bg, Cg;
-    brotensor::upload(A.data(), M, K, Ag);
-    brotensor::upload(B.data(), K, N, Bg);
-    brotensor::matmul_gpu(Ag, Bg, Cg);
+    Tensor Cg;
+    Tensor Ag = Tensor::from_host_on(Device::CUDA, A.data(), M, K);
+    Tensor Bg = Tensor::from_host_on(Device::CUDA, B.data(), K, N);
+    brotensor::matmul(Ag, Bg, Cg);
     CHECK(Cg.rows == M && Cg.cols == N && Cg.dtype == Dtype::FP32);
     std::vector<float> got(Cg.size());
-    brotensor::download(Cg, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    Cg.copy_to_host(got.data());
 
     float max_err = 0.0f;
     int bad = 0;
@@ -94,15 +95,15 @@ static void test_fp16() {
     std::vector<float> ref;
     cpu_matmul(Aq, Bq, ref, M, N, K);
 
-    GpuTensor Ag, Bg, Cg;
+    Tensor Cg;
     auto Ah = to_fp16(A), Bh = to_fp16(B);
-    brotensor::upload_fp16(Ah.data(), M, K, Ag);
-    brotensor::upload_fp16(Bh.data(), K, N, Bg);
-    brotensor::matmul_gpu(Ag, Bg, Cg);
+    Tensor Ag = Tensor::from_host_fp16_on(Device::CUDA, Ah.data(), M, K);
+    Tensor Bg = Tensor::from_host_fp16_on(Device::CUDA, Bh.data(), K, N);
+    brotensor::matmul(Ag, Bg, Cg);
     CHECK(Cg.rows == M && Cg.cols == N && Cg.dtype == Dtype::FP16);
     std::vector<uint16_t> got(Cg.size());
-    brotensor::download_fp16(Cg, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    Cg.copy_to_host_fp16(got.data());
 
     float max_err = 0.0f;
     int bad = 0;
@@ -117,7 +118,11 @@ static void test_fp16() {
 }
 
 int main() {
-    brotensor::cuda_init();
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     std::printf("test_matmul\n");
     test_fp32();
     test_fp16();

@@ -19,10 +19,10 @@
 //    c_x0t    = -(exp(-h) - 1) * (1 + 1/(2r))
 //    c_x0prev = -(exp(-h) - 1) * (-1/(2r))
 //
-// First step (no x0_prev): use euler_step_gpu instead.
+// First step (no x0_prev): use euler_step instead.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -30,6 +30,10 @@
 #include <stdexcept>
 
 namespace brotensor {
+
+void* cuda_current_stream();
+
+namespace detail::cuda {
 
 namespace {
 
@@ -56,18 +60,20 @@ __global__ void dpmpp_2m_step_kernel(const __half* __restrict__ x_t,
 
 } // namespace
 
-void dpmpp_2m_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
-                       const GpuTensor& x0_prev,
-                       float sigma_t,
-                       float c_xt, float c_x0t, float c_x0prev,
-                       GpuTensor& x_prev, GpuTensor& x0_out) {
+void dpmpp_2m_step(const ::brotensor::Tensor& x_t,
+                   const ::brotensor::Tensor& eps_pred,
+                   const ::brotensor::Tensor& x0_prev,
+                   float sigma_t,
+                   float c_xt, float c_x0t, float c_x0prev,
+                   ::brotensor::Tensor& x_prev,
+                   ::brotensor::Tensor& x0_out) {
     if (x_t.dtype != Dtype::FP16 || eps_pred.dtype != Dtype::FP16 ||
         x0_prev.dtype != Dtype::FP16) {
-        throw std::runtime_error("dpmpp_2m_step_gpu: all inputs must be FP16");
+        throw std::runtime_error("dpmpp_2m_step: all inputs must be FP16");
     }
     if (x_t.rows != eps_pred.rows || x_t.cols != eps_pred.cols ||
         x_t.rows != x0_prev.rows  || x_t.cols != x0_prev.cols) {
-        throw std::runtime_error("dpmpp_2m_step_gpu: shape mismatch");
+        throw std::runtime_error("dpmpp_2m_step: shape mismatch");
     }
     if (x_prev.rows != x_t.rows || x_prev.cols != x_t.cols || x_prev.dtype != Dtype::FP16) {
         x_prev.resize(x_t.rows, x_t.cols, Dtype::FP16);
@@ -79,15 +85,17 @@ void dpmpp_2m_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
     if (total == 0) return;
 
     const int blocks = (total + DPMPP_BLOCK - 1) / DPMPP_BLOCK;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    cudaStream_t stream =
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     dpmpp_2m_step_kernel<<<blocks, DPMPP_BLOCK, 0, stream>>>(
-        reinterpret_cast<const __half*>(x_t.data_fp16()),
-        reinterpret_cast<const __half*>(eps_pred.data_fp16()),
-        reinterpret_cast<const __half*>(x0_prev.data_fp16()),
-        reinterpret_cast<__half*>(x_prev.data_fp16()),
-        reinterpret_cast<__half*>(x0_out.data_fp16()),
+        static_cast<const __half*>(x_t.data),
+        static_cast<const __half*>(eps_pred.data),
+        static_cast<const __half*>(x0_prev.data),
+        static_cast<__half*>(x_prev.data),
+        static_cast<__half*>(x0_out.data),
         sigma_t, c_xt, c_x0t, c_x0prev, total);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

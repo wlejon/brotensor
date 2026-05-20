@@ -11,8 +11,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Device;
 using brotensor::Dtype;
+using brotensor::Tensor;
 
 static int g_failures = 0;
 
@@ -74,18 +75,19 @@ static void test_fp32() {
     std::vector<float> dA_ref, dB_ref;
     cpu_matmul_backward(A, B, dC, dA_ref, dB_ref, M, N, K);
 
-    GpuTensor Ag, Bg, dCg, dAg(M, K, Dtype::FP32), dBg(K, N, Dtype::FP32);
-    brotensor::upload(A.data(),  M, K, Ag);
-    brotensor::upload(B.data(),  K, N, Bg);
-    brotensor::upload(dC.data(), M, N, dCg);
+    Tensor Ag = Tensor::from_host_on(Device::CUDA, A.data(),  M, K);
+    Tensor Bg = Tensor::from_host_on(Device::CUDA, B.data(),  K, N);
+    Tensor dCg = Tensor::from_host_on(Device::CUDA, dC.data(), M, N);
+    Tensor dAg = Tensor::zeros_on(Device::CUDA, M, K, Dtype::FP32);
+    Tensor dBg = Tensor::zeros_on(Device::CUDA, K, N, Dtype::FP32);
     dAg.zero();
     dBg.zero();
-    brotensor::matmul_backward_gpu(Ag, Bg, dCg, dAg, dBg);
+    brotensor::matmul_backward(Ag, Bg, dCg, dAg, dBg);
 
     std::vector<float> dA_got(M*K), dB_got(K*N);
-    brotensor::download(dAg, dA_got.data());
-    brotensor::download(dBg, dB_got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    dAg.copy_to_host(dA_got.data());
+    dBg.copy_to_host(dB_got.data());
 
     float maxA = 0.0f, maxB = 0.0f;
     int badA = 0, badB = 0;
@@ -105,10 +107,10 @@ static void test_fp32() {
     CHECK(badB == 0);
 
     // Accumulate semantics: second call doubles the result.
-    brotensor::matmul_backward_gpu(Ag, Bg, dCg, dAg, dBg);
-    brotensor::download(dAg, dA_got.data());
-    brotensor::download(dBg, dB_got.data());
-    brotensor::cuda_sync();
+    brotensor::matmul_backward(Ag, Bg, dCg, dAg, dBg);
+    brotensor::sync_all();
+    dAg.copy_to_host(dA_got.data());
+    dBg.copy_to_host(dB_got.data());
     float maxA2 = 0.0f, maxB2 = 0.0f;
     int badA2 = 0, badB2 = 0;
     for (size_t i = 0; i < dA_ref.size(); ++i) {
@@ -141,18 +143,19 @@ static void test_fp16() {
     cpu_matmul_backward(Aq, Bq, dCq, dA_ref, dB_ref, M, N, K);
 
     auto Ah = to_fp16(A), Bh = to_fp16(B), dCh = to_fp16(dC);
-    GpuTensor Ag, Bg, dCg, dAg(M, K, Dtype::FP16), dBg(K, N, Dtype::FP16);
-    brotensor::upload_fp16(Ah.data(),  M, K, Ag);
-    brotensor::upload_fp16(Bh.data(),  K, N, Bg);
-    brotensor::upload_fp16(dCh.data(), M, N, dCg);
+    Tensor Ag = Tensor::from_host_fp16_on(Device::CUDA, Ah.data(),  M, K);
+    Tensor Bg = Tensor::from_host_fp16_on(Device::CUDA, Bh.data(),  K, N);
+    Tensor dCg = Tensor::from_host_fp16_on(Device::CUDA, dCh.data(), M, N);
+    Tensor dAg = Tensor::zeros_on(Device::CUDA, M, K, Dtype::FP16);
+    Tensor dBg = Tensor::zeros_on(Device::CUDA, K, N, Dtype::FP16);
     dAg.zero();
     dBg.zero();
-    brotensor::matmul_backward_gpu(Ag, Bg, dCg, dAg, dBg);
+    brotensor::matmul_backward(Ag, Bg, dCg, dAg, dBg);
 
     std::vector<uint16_t> dA_got_h(M*K), dB_got_h(K*N);
-    brotensor::download_fp16(dAg, dA_got_h.data());
-    brotensor::download_fp16(dBg, dB_got_h.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    dAg.copy_to_host_fp16(dA_got_h.data());
+    dBg.copy_to_host_fp16(dB_got_h.data());
 
     float maxA = 0.0f, maxB = 0.0f;
     int badA = 0, badB = 0;
@@ -174,10 +177,10 @@ static void test_fp16() {
     CHECK(badB == 0);
 
     // Accumulate-into: second call doubles.
-    brotensor::matmul_backward_gpu(Ag, Bg, dCg, dAg, dBg);
-    brotensor::download_fp16(dAg, dA_got_h.data());
-    brotensor::download_fp16(dBg, dB_got_h.data());
-    brotensor::cuda_sync();
+    brotensor::matmul_backward(Ag, Bg, dCg, dAg, dBg);
+    brotensor::sync_all();
+    dAg.copy_to_host_fp16(dA_got_h.data());
+    dBg.copy_to_host_fp16(dB_got_h.data());
     int badA2 = 0, badB2 = 0;
     float maxA2 = 0.0f, maxB2 = 0.0f;
     for (size_t i = 0; i < dA_ref.size(); ++i) {
@@ -199,7 +202,11 @@ static void test_fp16() {
 }
 
 int main() {
-    brotensor::cuda_init();
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     std::printf("test_matmul_backward\n");
     test_fp32();
     test_fp16();

@@ -3,15 +3,15 @@
 //   Y(B, D) = silu(A) * B_half = (A * sigmoid(A)) * B_half.
 // Mirrors elementwise.cu's geglu pattern exactly.
 
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include <stdexcept>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
 
 namespace {
 
@@ -99,9 +99,9 @@ inline int grid_for(int n) { return (n + SG_BLOCK - 1) / SG_BLOCK; }
 
 } // namespace
 
-void swiglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
+void swiglu_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
     if (X.cols % 2 != 0) {
-        throw std::runtime_error("swiglu_forward_gpu: X.cols must be even (2*D)");
+        throw std::runtime_error("swiglu_forward: X.cols must be even (2*D)");
     }
     const int B = X.rows;
     const int D = X.cols / 2;
@@ -110,22 +110,23 @@ void swiglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
     }
     const int total = B * D;
     if (total == 0) return;
-    if (X.dtype == Dtype::FP16) {
+    if (X.dtype == ::brotensor::Dtype::FP16) {
         swiglu_forward_fp16_kernel<<<grid_for(total), SG_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             B, D);
     } else {
         swiglu_forward_fp32_kernel<<<grid_for(total), SG_BLOCK>>>(
-            X.data, Y.data, B, D);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data), B, D);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void swiglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
-                        GpuTensor& dX) {
+void swiglu_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& dY,
+                     ::brotensor::Tensor& dX) {
     if (X.cols % 2 != 0) {
-        throw std::runtime_error("swiglu_backward_gpu: X.cols must be even (2*D)");
+        throw std::runtime_error("swiglu_backward: X.cols must be even (2*D)");
     }
     const int B = X.rows;
     const int D = X.cols / 2;
@@ -134,17 +135,19 @@ void swiglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
     }
     const int total = B * D;
     if (total == 0) return;
-    if (X.dtype == Dtype::FP16) {
+    if (X.dtype == ::brotensor::Dtype::FP16) {
         swiglu_backward_fp16_kernel<<<grid_for(total), SG_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data),
             B, D);
     } else {
         swiglu_backward_fp32_kernel<<<grid_for(total), SG_BLOCK>>>(
-            X.data, dY.data, dX.data, B, D);
+            static_cast<const float*>(X.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data), B, D);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::cuda

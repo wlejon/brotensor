@@ -5,8 +5,8 @@
 //
 // One elementwise kernel; FP32 internal math.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -14,6 +14,10 @@
 #include <stdexcept>
 
 namespace brotensor {
+
+void* cuda_current_stream();
+
+namespace detail::cuda {
 
 namespace {
 
@@ -33,14 +37,15 @@ __global__ void euler_step_kernel(const __half* __restrict__ x_t,
 
 } // namespace
 
-void euler_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
-                    float sigma_t, float sigma_prev,
-                    GpuTensor& x_prev) {
+void euler_step(const ::brotensor::Tensor& x_t,
+                const ::brotensor::Tensor& eps_pred,
+                float sigma_t, float sigma_prev,
+                ::brotensor::Tensor& x_prev) {
     if (x_t.dtype != Dtype::FP16 || eps_pred.dtype != Dtype::FP16) {
-        throw std::runtime_error("euler_step_gpu: x_t and eps_pred must be FP16");
+        throw std::runtime_error("euler_step: x_t and eps_pred must be FP16");
     }
     if (x_t.rows != eps_pred.rows || x_t.cols != eps_pred.cols) {
-        throw std::runtime_error("euler_step_gpu: shape mismatch between x_t and eps_pred");
+        throw std::runtime_error("euler_step: shape mismatch between x_t and eps_pred");
     }
     if (x_prev.rows != x_t.rows || x_prev.cols != x_t.cols || x_prev.dtype != Dtype::FP16) {
         x_prev.resize(x_t.rows, x_t.cols, Dtype::FP16);
@@ -51,13 +56,15 @@ void euler_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
     const float dsigma = sigma_prev - sigma_t;
 
     const int blocks = (total + EULER_BLOCK - 1) / EULER_BLOCK;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    cudaStream_t stream =
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     euler_step_kernel<<<blocks, EULER_BLOCK, 0, stream>>>(
-        reinterpret_cast<const __half*>(x_t.data_fp16()),
-        reinterpret_cast<const __half*>(eps_pred.data_fp16()),
-        reinterpret_cast<__half*>(x_prev.data_fp16()),
+        static_cast<const __half*>(x_t.data),
+        static_cast<const __half*>(eps_pred.data),
+        static_cast<__half*>(x_prev.data),
         dsigma, total);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

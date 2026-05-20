@@ -1,9 +1,10 @@
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
 
 // Naive correctness-first kernels mirroring src/nn/attention.cpp.
 //
@@ -351,55 +352,71 @@ inline dim3 grid2d(int x, int y, dim3 block) {
 
 } // namespace
 
-void attention_forward_gpu(const GpuTensor& X,
-                           const GpuTensor& Wq, const GpuTensor& Wk,
-                           const GpuTensor& Wv, const GpuTensor& Wo,
-                           const float* d_mask,
-                           GpuTensor& Q, GpuTensor& K, GpuTensor& V,
-                           GpuTensor& Attn, GpuTensor& Y_pre_Wo,
-                           GpuTensor& O) {
+void attention_forward(const ::brotensor::Tensor& X,
+                       const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                       const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                       const float* d_mask,
+                       ::brotensor::Tensor& Q, ::brotensor::Tensor& K, ::brotensor::Tensor& V,
+                       ::brotensor::Tensor& Attn, ::brotensor::Tensor& Y_pre_Wo,
+                       ::brotensor::Tensor& O) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    using ::brotensor::Dtype;
     const int N = X.rows;
     const int D = X.cols;
-    if (Q.rows != N || Q.cols != D) Q.resize(N, D);
-    if (K.rows != N || K.cols != D) K.resize(N, D);
-    if (V.rows != N || V.cols != D) V.resize(N, D);
-    if (Attn.rows != N || Attn.cols != N) Attn.resize(N, N);
-    if (Y_pre_Wo.rows != N || Y_pre_Wo.cols != D) Y_pre_Wo.resize(N, D);
-    if (O.rows != N || O.cols != D) O.resize(N, D);
+    if (Q.rows != N || Q.cols != D) Q.resize(N, D, Dtype::FP32);
+    if (K.rows != N || K.cols != D) K.resize(N, D, Dtype::FP32);
+    if (V.rows != N || V.cols != D) V.resize(N, D, Dtype::FP32);
+    if (Attn.rows != N || Attn.cols != N) Attn.resize(N, N, Dtype::FP32);
+    if (Y_pre_Wo.rows != N || Y_pre_Wo.cols != D) Y_pre_Wo.resize(N, D, Dtype::FP32);
+    if (O.rows != N || O.cols != D) O.resize(N, D, Dtype::FP32);
     if (N == 0 || D == 0) return;
 
     const dim3 block_nd(16, 16);
     const dim3 block_nn(16, 16);
     const dim3 block_dd(16, 16);
 
+    const float* X_p   = static_cast<const float*>(X.data);
+    const float* Wq_p  = static_cast<const float*>(Wq.data);
+    const float* Wk_p  = static_cast<const float*>(Wk.data);
+    const float* Wv_p  = static_cast<const float*>(Wv.data);
+    const float* Wo_p  = static_cast<const float*>(Wo.data);
+    float* Q_p         = static_cast<float*>(Q.data);
+    float* K_p         = static_cast<float*>(K.data);
+    float* V_p         = static_cast<float*>(V.data);
+    float* Attn_p      = static_cast<float*>(Attn.data);
+    float* Y_p         = static_cast<float*>(Y_pre_Wo.data);
+    float* O_p         = static_cast<float*>(O.data);
+
     // Q, K, V projections.
     {
         dim3 grid = grid2d(D, N, block_nd);
-        matmul_xwT_kernel<<<grid, block_nd>>>(X.data, Wq.data, Q.data, N, D, D);
-        matmul_xwT_kernel<<<grid, block_nd>>>(X.data, Wk.data, K.data, N, D, D);
-        matmul_xwT_kernel<<<grid, block_nd>>>(X.data, Wv.data, V.data, N, D, D);
+        matmul_xwT_kernel<<<grid, block_nd>>>(X_p, Wq_p, Q_p, N, D, D);
+        matmul_xwT_kernel<<<grid, block_nd>>>(X_p, Wk_p, K_p, N, D, D);
+        matmul_xwT_kernel<<<grid, block_nd>>>(X_p, Wv_p, V_p, N, D, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // Scores (N, N).
-    GpuTensor scores(N, N);
+    Tensor scores = Tensor::empty_on(Device::CUDA, N, N, Dtype::FP32);
+    float* scores_p = static_cast<float*>(scores.data);
     {
         const float inv_sqrtd = 1.0f / sqrtf(static_cast<float>(D));
         dim3 grid = grid2d(N, N, block_nn);
-        scores_kernel<<<grid, block_nn>>>(Q.data, K.data, scores.data,
+        scores_kernel<<<grid, block_nn>>>(Q_p, K_p, scores_p,
                                           N, D, inv_sqrtd);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // Row-masked softmax → Attn.
-    row_masked_softmax_kernel<<<N, ROW_SM_BLOCK>>>(scores.data, Attn.data,
+    row_masked_softmax_kernel<<<N, ROW_SM_BLOCK>>>(scores_p, Attn_p,
                                                    d_mask, N);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     // Y_pre_Wo = Attn @ V.
     {
         dim3 grid = grid2d(D, N, block_nd);
-        attn_apply_v_kernel<<<grid, block_nd>>>(Attn.data, V.data, Y_pre_Wo.data,
+        attn_apply_v_kernel<<<grid, block_nd>>>(Attn_p, V_p, Y_p,
                                                 N, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -407,27 +424,30 @@ void attention_forward_gpu(const GpuTensor& X,
     // O = Y @ Wo^T (with row mask zeroing).
     {
         dim3 grid = grid2d(D, N, block_nd);
-        output_proj_kernel<<<grid, block_nd>>>(Y_pre_Wo.data, Wo.data, d_mask,
-                                               O.data, N, D);
+        output_proj_kernel<<<grid, block_nd>>>(Y_p, Wo_p, d_mask,
+                                               O_p, N, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     (void)block_dd;
 }
 
-void attention_backward_gpu(const GpuTensor& dO,
-                            const GpuTensor& X,
-                            const GpuTensor& Q, const GpuTensor& K,
-                            const GpuTensor& V, const GpuTensor& Attn,
-                            const GpuTensor& Y_pre_Wo,
-                            const GpuTensor& Wq, const GpuTensor& Wk,
-                            const GpuTensor& Wv, const GpuTensor& Wo,
-                            const float* d_mask,
-                            GpuTensor& dX,
-                            GpuTensor& dWq, GpuTensor& dWk,
-                            GpuTensor& dWv, GpuTensor& dWo) {
+void attention_backward(const ::brotensor::Tensor& dO,
+                        const ::brotensor::Tensor& X,
+                        const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K,
+                        const ::brotensor::Tensor& V, const ::brotensor::Tensor& Attn,
+                        const ::brotensor::Tensor& Y_pre_Wo,
+                        const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                        const float* d_mask,
+                        ::brotensor::Tensor& dX,
+                        ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
+                        ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    using ::brotensor::Dtype;
     const int N = X.rows;
     const int D = X.cols;
-    if (dX.rows != N || dX.cols != D) dX.resize(N, D);
+    if (dX.rows != N || dX.cols != D) dX.resize(N, D, Dtype::FP32);
     if (N == 0 || D == 0) return;
 
     const float inv_sqrtd = 1.0f / sqrtf(static_cast<float>(D));
@@ -435,65 +455,88 @@ void attention_backward_gpu(const GpuTensor& dO,
     const dim3 block_nn(16, 16);
     const dim3 block_dd(16, 16);
 
+    const float* dO_p   = static_cast<const float*>(dO.data);
+    const float* X_p    = static_cast<const float*>(X.data);
+    const float* Q_p    = static_cast<const float*>(Q.data);
+    const float* K_p    = static_cast<const float*>(K.data);
+    const float* V_p    = static_cast<const float*>(V.data);
+    const float* Attn_p = static_cast<const float*>(Attn.data);
+    const float* Y_p    = static_cast<const float*>(Y_pre_Wo.data);
+    const float* Wq_p   = static_cast<const float*>(Wq.data);
+    const float* Wk_p   = static_cast<const float*>(Wk.data);
+    const float* Wv_p   = static_cast<const float*>(Wv.data);
+    const float* Wo_p   = static_cast<const float*>(Wo.data);
+    float* dX_p         = static_cast<float*>(dX.data);
+    float* dWq_p        = static_cast<float*>(dWq.data);
+    float* dWk_p        = static_cast<float*>(dWk.data);
+    float* dWv_p        = static_cast<float*>(dWv.data);
+    float* dWo_p        = static_cast<float*>(dWo.data);
+
     // dY (N, D) and dWo accumulation.
-    GpuTensor dY(N, D);
+    Tensor dY = Tensor::empty_on(Device::CUDA, N, D, Dtype::FP32);
+    float* dY_p = static_cast<float*>(dY.data);
     {
         dim3 grid = grid2d(D, N, block_nd);
-        wo_back_dY_kernel<<<grid, block_nd>>>(dO.data, Wo.data, d_mask,
-                                              dY.data, N, D);
+        wo_back_dY_kernel<<<grid, block_nd>>>(dO_p, Wo_p, d_mask,
+                                              dY_p, N, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid = grid2d(D, D, block_dd);
-        wo_back_dW_kernel<<<grid, block_dd>>>(dO.data, Y_pre_Wo.data, d_mask,
-                                              dWo.data, N, D);
+        wo_back_dW_kernel<<<grid, block_dd>>>(dO_p, Y_p, d_mask,
+                                              dWo_p, N, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // dAttn (N, N), dV (N, D).
-    GpuTensor dAttn(N, N);
-    GpuTensor dV(N, D);
+    Tensor dAttn = Tensor::empty_on(Device::CUDA, N, N, Dtype::FP32);
+    Tensor dV    = Tensor::empty_on(Device::CUDA, N, D, Dtype::FP32);
+    float* dAttn_p = static_cast<float*>(dAttn.data);
+    float* dV_p    = static_cast<float*>(dV.data);
     {
         dim3 grid = grid2d(N, N, block_nn);
-        dAttn_kernel<<<grid, block_nn>>>(dY.data, V.data, dAttn.data, N, D);
+        dAttn_kernel<<<grid, block_nn>>>(dY_p, V_p, dAttn_p, N, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid = grid2d(D, N, block_nd);
-        dV_kernel<<<grid, block_nd>>>(Attn.data, dY.data, dV.data, N, D);
+        dV_kernel<<<grid, block_nd>>>(Attn_p, dY_p, dV_p, N, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // dScores via per-row softmax backward, scaled by inv_sqrtd.
-    GpuTensor dScores(N, N);
-    row_softmax_back_kernel<<<N, ROW_SM_BLOCK>>>(Attn.data, dAttn.data, d_mask,
-                                                 dScores.data, N, inv_sqrtd);
+    Tensor dScores = Tensor::empty_on(Device::CUDA, N, N, Dtype::FP32);
+    float* dScores_p = static_cast<float*>(dScores.data);
+    row_softmax_back_kernel<<<N, ROW_SM_BLOCK>>>(Attn_p, dAttn_p, d_mask,
+                                                 dScores_p, N, inv_sqrtd);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     // dQ, dK.
-    GpuTensor dQ(N, D);
-    GpuTensor dK(N, D);
+    Tensor dQ = Tensor::empty_on(Device::CUDA, N, D, Dtype::FP32);
+    Tensor dK = Tensor::empty_on(Device::CUDA, N, D, Dtype::FP32);
+    float* dQ_p = static_cast<float*>(dQ.data);
+    float* dK_p = static_cast<float*>(dK.data);
     {
         dim3 grid = grid2d(D, N, block_nd);
-        dQ_kernel<<<grid, block_nd>>>(dScores.data, K.data, dQ.data, N, D);
-        dK_kernel<<<grid, block_nd>>>(dScores.data, Q.data, dK.data, N, D);
+        dQ_kernel<<<grid, block_nd>>>(dScores_p, K_p, dQ_p, N, D);
+        dK_kernel<<<grid, block_nd>>>(dScores_p, Q_p, dK_p, N, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // dWq/dWk/dWv accumulation and dX.
     {
         dim3 grid = grid2d(D, D, block_dd);
-        dWqkv_kernel<<<grid, block_dd>>>(dQ.data, dK.data, dV.data, X.data,
-                                         dWq.data, dWk.data, dWv.data, N, D);
+        dWqkv_kernel<<<grid, block_dd>>>(dQ_p, dK_p, dV_p, X_p,
+                                         dWq_p, dWk_p, dWv_p, N, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid = grid2d(D, N, block_nd);
-        dX_proj_kernel<<<grid, block_nd>>>(dQ.data, dK.data, dV.data,
-                                           Wq.data, Wk.data, Wv.data,
-                                           dX.data, N, D);
+        dX_proj_kernel<<<grid, block_nd>>>(dQ_p, dK_p, dV_p,
+                                           Wq_p, Wk_p, Wv_p,
+                                           dX_p, N, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::cuda

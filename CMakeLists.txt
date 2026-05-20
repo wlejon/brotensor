@@ -18,18 +18,15 @@ endif()
 
 # --- Backends ---
 #
-# brotensor builds a CPU backend unconditionally. A GPU backend is optional
-# and additive; the two GPU backends (CUDA, Metal) are mutually exclusive.
-# Consumer code keys off the umbrella BROTENSOR_HAS_GPU define; backend-
-# specific impl keys off BROTENSOR_HAS_CUDA / BROTENSOR_HAS_METAL. CPU is
-# always available — no opt-out — and is the natural fallback / default
-# code path for downstream libraries.
+# brotensor is layered: a core dispatcher + always-on CPU backend, plus
+# optional GPU backends (CUDA, Metal) that compile as independent static
+# libraries and register themselves into the dispatcher at static-init.
+# Multiple GPU backends are no longer prohibited at the CMake level — they
+# remain mutually exclusive in practice because their toolchains do not
+# coexist on the same host (nvcc on Linux/Windows; Apple toolchain on Mac).
+# CPU has no opt-out.
 option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
 option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
-if(BROTENSOR_WITH_CUDA AND BROTENSOR_WITH_METAL)
-    message(FATAL_ERROR
-        "BROTENSOR_WITH_CUDA and BROTENSOR_WITH_METAL are mutually exclusive.")
-endif()
 
 if(BROTENSOR_WITH_CUDA)
     if(NOT CMAKE_CUDA_ARCHITECTURES)
@@ -50,32 +47,49 @@ if(BROTENSOR_WITH_METAL)
     enable_language(OBJCXX)
 endif()
 
-# --- brotensor library ---
+# --- brotensor_core: dispatcher + public op wrappers + Tensor + runtime ---
+# Always built. Sources produced by Phase 1A.
 
-add_library(brotensor STATIC)
-add_library(brotensor::brotensor ALIAS brotensor)
-
-target_include_directories(brotensor PUBLIC
+add_library(brotensor_core STATIC
+    src/tensor.cpp
+    src/dispatch.cpp
+    src/init.cpp
+    src/ops.cpp
+)
+target_include_directories(brotensor_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-target_compile_features(brotensor PUBLIC cxx_std_20)
-
+target_compile_features(brotensor_core PUBLIC cxx_std_20)
 if(MSVC)
-    target_compile_options(brotensor PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+    target_compile_options(brotensor_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 else()
-    target_compile_options(brotensor PRIVATE
+    target_compile_options(brotensor_core PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-Wall>
         $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
 endif()
 
-# --- CPU backend (always built) ---
-target_sources(brotensor PRIVATE
-    src/cpu/ops.cpp
+# --- brotensor_cpu: CPU backend (always built) ---
+# Sources produced by Phase 1B.
+
+add_library(brotensor_cpu STATIC
+    src/cpu/alloc.cpp
+    src/cpu/ops_impl.cpp
+    src/cpu/register.cpp
 )
+target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
+if(MSVC)
+    target_compile_options(brotensor_cpu PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+else()
+    target_compile_options(brotensor_cpu PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
+endif()
+
+# --- brotensor_cuda: CUDA backend (optional) ---
 
 if(BROTENSOR_WITH_CUDA)
-    target_sources(brotensor PRIVATE
+    add_library(brotensor_cuda STATIC
         src/cuda/runtime.cu
         src/cuda/tensor.cu
         src/cuda/gemm.cu
@@ -117,18 +131,30 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/dpmpp_2m_step.cu
         src/cuda/timestep_embedding.cu
         src/cuda/int8_quant.cu
+        src/cuda/register.cu
     )
-    target_link_libraries(brotensor PUBLIC CUDA::cudart)
-    target_compile_definitions(brotensor PUBLIC BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
-    set_target_properties(brotensor PROPERTIES
+    target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)
+    target_compile_definitions(brotensor_cuda PUBLIC
+        BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
+    # brotensor_core's init.cpp must know whether to probe + register CUDA.
+    target_compile_definitions(brotensor_core PRIVATE
+        BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
+    set_target_properties(brotensor_cuda PROPERTIES
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON
-        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_SEPARABLE_COMPILATION ON
+        # Run the CUDA device link when the static lib is built so that pure
+        # C++ consumers (tests, brogameagent, brodiffusion) do not need to
+        # invoke nvlink themselves — without this they fail to resolve
+        # __cudaRegisterLinkedBinary_* from the relocatable device code.
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )
 endif()
 
+# --- brotensor_metal: Metal backend (optional) ---
+
 if(BROTENSOR_WITH_METAL)
-    target_sources(brotensor PRIVATE
+    add_library(brotensor_metal STATIC
         src/metal/runtime.mm
         src/metal/tensor.mm
         src/metal/device_buffer.mm
@@ -170,6 +196,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/dpmpp_2m_step.mm
         src/metal/timestep_embedding.mm
         src/metal/int8_quant.mm
+        # src/metal/register.mm                      # TODO Phase 3: backend registration
     )
     set_source_files_properties(
         src/metal/runtime.mm
@@ -217,14 +244,41 @@ if(BROTENSOR_WITH_METAL)
             COMPILE_FLAGS "-fobjc-arc"
             LANGUAGE OBJCXX
     )
-    target_link_libraries(brotensor PUBLIC
+    target_link_libraries(brotensor_metal PUBLIC
+        brotensor_core
         "-framework Foundation"
         "-framework Metal"
         "-framework MetalPerformanceShaders"
         "-framework MetalPerformanceShadersGraph"
     )
-    target_compile_definitions(brotensor PUBLIC BROTENSOR_HAS_METAL=1 BROTENSOR_HAS_GPU=1)
+    target_compile_definitions(brotensor_metal PUBLIC
+        BROTENSOR_HAS_METAL=1 BROTENSOR_HAS_GPU=1)
+    # brotensor_core's init.cpp must know whether to probe + register Metal.
+    target_compile_definitions(brotensor_core PRIVATE
+        BROTENSOR_HAS_METAL=1 BROTENSOR_HAS_GPU=1)
 endif()
+
+# --- brotensor: final consumed target (INTERFACE) ---
+# Links the core + always-on CPU backend + whichever GPU backends are enabled.
+# Consumers (brogameagent, brodiffusion, tests) link this one target.
+#
+# The backend static libs register themselves into the dispatcher from
+# static-init objects (src/cpu/register.cpp, src/cuda/register.cu). Those
+# translation units export no symbol that the rest of the program references,
+# so a normal static-library link drops their object files entirely and the
+# backend is never registered. WHOLE_ARCHIVE forces every object file of the
+# backend libs into the link so the registrars run. (CUDA's registrar is also
+# reached via the extern "C" probe hook, but whole-archiving keeps the per-
+# cluster fill_cuda_vtable_* objects in regardless of cross-TU reachability.)
+
+add_library(brotensor INTERFACE)
+add_library(brotensor::brotensor ALIAS brotensor)
+target_link_libraries(brotensor INTERFACE
+    brotensor_core
+    "$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_cpu>"
+    "$<$<BOOL:${BROTENSOR_WITH_CUDA}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_cuda>>"
+    "$<$<BOOL:${BROTENSOR_WITH_METAL}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_metal>>"
+)
 
 # --- Install / export ---
 option(BROTENSOR_INSTALL "Generate install targets for brotensor" ${PROJECT_IS_TOP_LEVEL})
@@ -232,7 +286,15 @@ if(BROTENSOR_INSTALL)
     include(GNUInstallDirs)
     include(CMakePackageConfigHelpers)
 
-    install(TARGETS brotensor
+    set(_brotensor_install_targets brotensor brotensor_core brotensor_cpu)
+    if(BROTENSOR_WITH_CUDA)
+        list(APPEND _brotensor_install_targets brotensor_cuda)
+    endif()
+    if(BROTENSOR_WITH_METAL)
+        list(APPEND _brotensor_install_targets brotensor_metal)
+    endif()
+
+    install(TARGETS ${_brotensor_install_targets}
         EXPORT brotensorTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -266,3 +328,13 @@ if(BROTENSOR_TESTS AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# --- Configure-time summary ---
+set(_brotensor_backends "CPU")
+if(BROTENSOR_WITH_CUDA)
+    set(_brotensor_backends "${_brotensor_backends} + CUDA")
+endif()
+if(BROTENSOR_WITH_METAL)
+    set(_brotensor_backends "${_brotensor_backends} + Metal")
+endif()
+message(STATUS "brotensor: building with backends: ${_brotensor_backends}")

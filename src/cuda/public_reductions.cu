@@ -1,9 +1,9 @@
-// Public reductions: sum_rows_gpu, sum_cols_gpu, argmax_rows_gpu.
+// Public reductions: sum_rows, sum_cols, argmax_rows.
 // FP32 + FP16 dispatch for the sums; argmax accepts FP32/FP16 input and
 // writes integer indices into an FP32 output tensor.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -11,6 +11,10 @@
 #include <stdexcept>
 
 namespace brotensor {
+
+void* cuda_current_stream();
+
+namespace detail::cuda {
 
 namespace {
 
@@ -90,9 +94,9 @@ __global__ void argmax_rows_kernel(const T* __restrict__ X,
 
 } // namespace
 
-void sum_rows_gpu(const GpuTensor& X, GpuTensor& Y) {
+void sum_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("sum_rows_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("sum_rows: X must be FP16 or FP32");
     }
     const int M = X.rows;
     const int N = X.cols;
@@ -101,22 +105,24 @@ void sum_rows_gpu(const GpuTensor& X, GpuTensor& Y) {
     }
     if (M == 0) return;
     if (N == 0) { Y.zero(); return; }
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    cudaStream_t stream =
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     if (X.dtype == Dtype::FP16) {
         sum_rows_kernel<__half><<<M, RED_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             M, N);
     } else {
         sum_rows_kernel<float><<<M, RED_BLOCK, 0, stream>>>(
-            X.data, Y.data, M, N);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data), M, N);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void sum_cols_gpu(const GpuTensor& X, GpuTensor& Y) {
+void sum_cols(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("sum_cols_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("sum_cols: X must be FP16 or FP32");
     }
     const int M = X.rows;
     const int N = X.cols;
@@ -126,22 +132,24 @@ void sum_cols_gpu(const GpuTensor& X, GpuTensor& Y) {
     if (N == 0) return;
     if (M == 0) { Y.zero(); return; }
     const int blocks = (N + RED_BLOCK - 1) / RED_BLOCK;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    cudaStream_t stream =
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     if (X.dtype == Dtype::FP16) {
         sum_cols_kernel<__half><<<blocks, RED_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             M, N);
     } else {
         sum_cols_kernel<float><<<blocks, RED_BLOCK, 0, stream>>>(
-            X.data, Y.data, M, N);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data), M, N);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void argmax_rows_gpu(const GpuTensor& X, GpuTensor& Idx) {
+void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("argmax_rows_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("argmax_rows: X must be FP16 or FP32");
     }
     const int M = X.rows;
     const int N = X.cols;
@@ -150,16 +158,19 @@ void argmax_rows_gpu(const GpuTensor& X, GpuTensor& Idx) {
     }
     if (M == 0) return;
     if (N == 0) { Idx.zero(); return; }
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    cudaStream_t stream =
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     if (X.dtype == Dtype::FP16) {
         argmax_rows_kernel<__half><<<M, RED_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            Idx.data, M, N);
+            static_cast<const __half*>(X.data),
+            static_cast<float*>(Idx.data), M, N);
     } else {
         argmax_rows_kernel<float><<<M, RED_BLOCK, 0, stream>>>(
-            X.data, Idx.data, M, N);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Idx.data), M, N);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

@@ -12,8 +12,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 
@@ -211,31 +212,31 @@ static void run_fwd_fp16(int N, int C, int H, int W) {
     auto X_q = requantize(X);
     auto X_h = to_fp16(X);
 
-    GpuTensor Xg, Yg;
-    brotensor::upload_fp16(X_h.data(), N, C * H * W, Xg);
+    Tensor Xg = Tensor::from_host_fp16_on(Device::CUDA, X_h.data(), N, C * H * W);
+    Tensor Yg;
 
     std::vector<float> Yref;
     upsample_nearest_cpu(X_q, N, C, H, W, Yref);
-    brotensor::upsample_nearest_2x_gpu(Xg, N, C, H, W, Yg);
+    brotensor::upsample_nearest_2x(Xg, N, C, H, W, Yg);
     CHECK(Yg.rows == N && Yg.cols == C * 4 * H * W && Yg.dtype == Dtype::FP16);
     std::vector<uint16_t> Y_h(static_cast<size_t>(Yg.size()), 0);
-    brotensor::download_fp16(Yg, Y_h.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host_fp16(Y_h.data());
+    brotensor::sync_all();
     compare_fp16(Yref, Y_h, "nearest_2x", 1e-2f, 1e-2f);
 
     upsample_bilinear_cpu(X_q, N, C, H, W, Yref);
-    brotensor::upsample_bilinear_2x_gpu(Xg, N, C, H, W, Yg);
+    brotensor::upsample_bilinear_2x(Xg, N, C, H, W, Yg);
     Y_h.assign(static_cast<size_t>(Yg.size()), 0);
-    brotensor::download_fp16(Yg, Y_h.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host_fp16(Y_h.data());
+    brotensor::sync_all();
     compare_fp16(Yref, Y_h, "bilinear_2x", 1e-2f, 1e-2f);
 
     downsample_avg_cpu(X_q, N, C, H, W, Yref);
-    brotensor::downsample_avg_2x_gpu(Xg, N, C, H, W, Yg);
+    brotensor::downsample_avg_2x(Xg, N, C, H, W, Yg);
     CHECK(Yg.rows == N && Yg.cols == C * (H / 2) * (W / 2));
     Y_h.assign(static_cast<size_t>(Yg.size()), 0);
-    brotensor::download_fp16(Yg, Y_h.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host_fp16(Y_h.data());
+    brotensor::sync_all();
     compare_fp16(Yref, Y_h, "downsample_avg_2x", 1e-2f, 1e-2f);
 }
 
@@ -246,30 +247,30 @@ static void run_fwd_fp32(int N, int C, int H, int W) {
     std::vector<float> X(static_cast<size_t>(N) * C * H * W);
     for (auto& v : X) v = dist(rng);
 
-    GpuTensor Xg, Yg;
-    brotensor::upload(X.data(), N, C * H * W, Xg);
+    Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), N, C * H * W);
+    Tensor Yg;
 
     std::vector<float> Yref;
     upsample_nearest_cpu(X, N, C, H, W, Yref);
-    brotensor::upsample_nearest_2x_gpu(Xg, N, C, H, W, Yg);
+    brotensor::upsample_nearest_2x(Xg, N, C, H, W, Yg);
     CHECK(Yg.rows == N && Yg.cols == C * 4 * H * W && Yg.dtype == Dtype::FP32);
     std::vector<float> Y_got(static_cast<size_t>(Yg.size()), 0.0f);
-    brotensor::download(Yg, Y_got.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host(Y_got.data());
+    brotensor::sync_all();
     compare_fp32(Yref, Y_got, "nearest_2x", 1e-5f, 1e-5f);
 
     upsample_bilinear_cpu(X, N, C, H, W, Yref);
-    brotensor::upsample_bilinear_2x_gpu(Xg, N, C, H, W, Yg);
+    brotensor::upsample_bilinear_2x(Xg, N, C, H, W, Yg);
     Y_got.assign(static_cast<size_t>(Yg.size()), 0.0f);
-    brotensor::download(Yg, Y_got.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host(Y_got.data());
+    brotensor::sync_all();
     compare_fp32(Yref, Y_got, "bilinear_2x", 1e-5f, 1e-5f);
 
     downsample_avg_cpu(X, N, C, H, W, Yref);
-    brotensor::downsample_avg_2x_gpu(Xg, N, C, H, W, Yg);
+    brotensor::downsample_avg_2x(Xg, N, C, H, W, Yg);
     Y_got.assign(static_cast<size_t>(Yg.size()), 0.0f);
-    brotensor::download(Yg, Y_got.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host(Y_got.data());
+    brotensor::sync_all();
     compare_fp32(Yref, Y_got, "downsample_avg_2x", 1e-5f, 1e-5f);
 }
 
@@ -287,13 +288,13 @@ static void run_bwd_fp32(int N, int C, int H, int W) {
         std::vector<float> dX_ref;
         upsample_nearest_backward_cpu(dY, N, C, H, W, dX_ref);
 
-        GpuTensor dYg, dXg;
-        brotensor::upload(dY.data(), N, C * Hout2 * Wout2, dYg);
-        brotensor::upsample_nearest_2x_backward_gpu(dYg, N, C, H, W, dXg);
+        Tensor dYg = Tensor::from_host_on(Device::CUDA, dY.data(), N, C * Hout2 * Wout2);
+        Tensor dXg;
+        brotensor::upsample_nearest_2x_backward(dYg, N, C, H, W, dXg);
         CHECK(dXg.rows == N && dXg.cols == C * H * W && dXg.dtype == Dtype::FP32);
         std::vector<float> dX_got(static_cast<size_t>(dXg.size()), 0.0f);
-        brotensor::download(dXg, dX_got.data());
-        brotensor::cuda_sync();
+        dXg.copy_to_host(dX_got.data());
+        brotensor::sync_all();
         compare_fp32(dX_ref, dX_got, "nearest_bwd", 1e-5f, 1e-5f);
     }
     // Bilinear 2x upsample backward.
@@ -303,13 +304,13 @@ static void run_bwd_fp32(int N, int C, int H, int W) {
         std::vector<float> dX_ref;
         upsample_bilinear_backward_cpu(dY, N, C, H, W, dX_ref);
 
-        GpuTensor dYg, dXg;
-        brotensor::upload(dY.data(), N, C * Hout2 * Wout2, dYg);
-        brotensor::upsample_bilinear_2x_backward_gpu(dYg, N, C, H, W, dXg);
+        Tensor dYg = Tensor::from_host_on(Device::CUDA, dY.data(), N, C * Hout2 * Wout2);
+        Tensor dXg;
+        brotensor::upsample_bilinear_2x_backward(dYg, N, C, H, W, dXg);
         CHECK(dXg.rows == N && dXg.cols == C * H * W && dXg.dtype == Dtype::FP32);
         std::vector<float> dX_got(static_cast<size_t>(dXg.size()), 0.0f);
-        brotensor::download(dXg, dX_got.data());
-        brotensor::cuda_sync();
+        dXg.copy_to_host(dX_got.data());
+        brotensor::sync_all();
         // Looser tol due to atomic-add summation order.
         compare_fp32(dX_ref, dX_got, "bilinear_bwd", 1e-4f, 1e-4f);
     }
@@ -320,13 +321,13 @@ static void run_bwd_fp32(int N, int C, int H, int W) {
         std::vector<float> dX_ref;
         downsample_avg_backward_cpu(dY, N, C, H, W, dX_ref);
 
-        GpuTensor dYg, dXg;
-        brotensor::upload(dY.data(), N, C * Hdn * Wdn, dYg);
-        brotensor::downsample_avg_2x_backward_gpu(dYg, N, C, H, W, dXg);
+        Tensor dYg = Tensor::from_host_on(Device::CUDA, dY.data(), N, C * Hdn * Wdn);
+        Tensor dXg;
+        brotensor::downsample_avg_2x_backward(dYg, N, C, H, W, dXg);
         CHECK(dXg.rows == N && dXg.cols == C * H * W && dXg.dtype == Dtype::FP32);
         std::vector<float> dX_got(static_cast<size_t>(dXg.size()), 0.0f);
-        brotensor::download(dXg, dX_got.data());
-        brotensor::cuda_sync();
+        dXg.copy_to_host(dX_got.data());
+        brotensor::sync_all();
         compare_fp32(dX_ref, dX_got, "downsample_avg_bwd", 1e-5f, 1e-5f);
     }
 }
@@ -347,13 +348,13 @@ static void run_bwd_fp16(int N, int C, int H, int W) {
         upsample_nearest_backward_cpu(dY_q, N, C, H, W, dX_ref);
 
         auto dY_h = to_fp16(dY);
-        GpuTensor dYg, dXg;
-        brotensor::upload_fp16(dY_h.data(), N, C * Hout2 * Wout2, dYg);
-        brotensor::upsample_nearest_2x_backward_gpu(dYg, N, C, H, W, dXg);
+        Tensor dYg = Tensor::from_host_fp16_on(Device::CUDA, dY_h.data(), N, C * Hout2 * Wout2);
+        Tensor dXg;
+        brotensor::upsample_nearest_2x_backward(dYg, N, C, H, W, dXg);
         CHECK(dXg.rows == N && dXg.cols == C * H * W && dXg.dtype == Dtype::FP16);
         std::vector<uint16_t> dX_got_h(static_cast<size_t>(dXg.size()), 0);
-        brotensor::download_fp16(dXg, dX_got_h.data());
-        brotensor::cuda_sync();
+        dXg.copy_to_host_fp16(dX_got_h.data());
+        brotensor::sync_all();
         compare_fp16(dX_ref, dX_got_h, "nearest_bwd", 1e-2f, 1e-2f);
     }
     // Bilinear.
@@ -365,13 +366,13 @@ static void run_bwd_fp16(int N, int C, int H, int W) {
         upsample_bilinear_backward_cpu(dY_q, N, C, H, W, dX_ref);
 
         auto dY_h = to_fp16(dY);
-        GpuTensor dYg, dXg;
-        brotensor::upload_fp16(dY_h.data(), N, C * Hout2 * Wout2, dYg);
-        brotensor::upsample_bilinear_2x_backward_gpu(dYg, N, C, H, W, dXg);
+        Tensor dYg = Tensor::from_host_fp16_on(Device::CUDA, dY_h.data(), N, C * Hout2 * Wout2);
+        Tensor dXg;
+        brotensor::upsample_bilinear_2x_backward(dYg, N, C, H, W, dXg);
         CHECK(dXg.rows == N && dXg.cols == C * H * W && dXg.dtype == Dtype::FP16);
         std::vector<uint16_t> dX_got_h(static_cast<size_t>(dXg.size()), 0);
-        brotensor::download_fp16(dXg, dX_got_h.data());
-        brotensor::cuda_sync();
+        dXg.copy_to_host_fp16(dX_got_h.data());
+        brotensor::sync_all();
         compare_fp16(dX_ref, dX_got_h, "bilinear_bwd", 2e-2f, 2e-2f);
     }
     // Avg.
@@ -383,23 +384,22 @@ static void run_bwd_fp16(int N, int C, int H, int W) {
         downsample_avg_backward_cpu(dY_q, N, C, H, W, dX_ref);
 
         auto dY_h = to_fp16(dY);
-        GpuTensor dYg, dXg;
-        brotensor::upload_fp16(dY_h.data(), N, C * Hdn * Wdn, dYg);
-        brotensor::downsample_avg_2x_backward_gpu(dYg, N, C, H, W, dXg);
+        Tensor dYg = Tensor::from_host_fp16_on(Device::CUDA, dY_h.data(), N, C * Hdn * Wdn);
+        Tensor dXg;
+        brotensor::downsample_avg_2x_backward(dYg, N, C, H, W, dXg);
         CHECK(dXg.rows == N && dXg.cols == C * H * W && dXg.dtype == Dtype::FP16);
         std::vector<uint16_t> dX_got_h(static_cast<size_t>(dXg.size()), 0);
-        brotensor::download_fp16(dXg, dX_got_h.data());
-        brotensor::cuda_sync();
+        dXg.copy_to_host_fp16(dX_got_h.data());
+        brotensor::sync_all();
         compare_fp16(dX_ref, dX_got_h, "downsample_avg_bwd", 1e-2f, 1e-2f);
     }
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_resample\n");
 

@@ -3,8 +3,9 @@
 // running sums (mass, y-mass, x-mass) in shared memory; thread 0 divides and
 // writes the (mass, centroid_y, centroid_x) outputs.
 
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -12,6 +13,13 @@
 #include <stdexcept>
 
 namespace brotensor {
+
+// Forward declaration of the CUDA-internal stream getter. Defined in
+// src/cuda/runtime.cu — kept out of the public header so non-GPU consumers
+// don't pull cuda_runtime.h transitively.
+void* cuda_current_stream();
+
+namespace detail::cuda {
 
 namespace {
 
@@ -68,20 +76,21 @@ __global__ void attention_token_moments_kernel(const __half* __restrict__ Attn,
 
 } // namespace
 
-void attention_token_moments_gpu(const GpuTensor& Attn,
-                                 int h_lat, int w_lat,
-                                 GpuTensor& mass,
-                                 GpuTensor& centroid) {
+void attention_token_moments(const ::brotensor::Tensor& Attn,
+                             int h_lat, int w_lat,
+                             ::brotensor::Tensor& mass,
+                             ::brotensor::Tensor& centroid) {
+    using ::brotensor::Dtype;
     if (Attn.dtype != Dtype::FP16) {
-        throw std::runtime_error("attention_token_moments_gpu: Attn must be FP16");
+        throw std::runtime_error("attention_token_moments: Attn must be FP16");
     }
     if (h_lat <= 0 || w_lat <= 0) {
-        throw std::runtime_error("attention_token_moments_gpu: h_lat and w_lat must be positive");
+        throw std::runtime_error("attention_token_moments: h_lat and w_lat must be positive");
     }
     const int Lq = h_lat * w_lat;
     const int Lk = Attn.cols;
     if (Attn.rows != Lq) {
-        throw std::runtime_error("attention_token_moments_gpu: Attn.rows must equal h_lat * w_lat");
+        throw std::runtime_error("attention_token_moments: Attn.rows must equal h_lat * w_lat");
     }
     if (mass.rows != Lk || mass.cols != 1 || mass.dtype != Dtype::FP32) {
         mass.resize(Lk, 1, Dtype::FP32);
@@ -91,12 +100,14 @@ void attention_token_moments_gpu(const GpuTensor& Attn,
     }
     if (Lk == 0) return;
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     attention_token_moments_kernel<<<Lk, MOM_BLOCK, 0, stream>>>(
-        reinterpret_cast<const __half*>(Attn.data_fp16()),
+        static_cast<const __half*>(Attn.data),
         Lq, Lk, h_lat, w_lat,
-        mass.data, centroid.data);
+        static_cast<float*>(mass.data),
+        static_cast<float*>(centroid.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

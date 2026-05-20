@@ -10,8 +10,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 #define CHECK(cond) do {                                                    \
@@ -87,12 +88,12 @@ static void test_fp32() {
     rope_cpu_fwd(X, Yref, L, nh, hd, seq_offset, base);
     rope_cpu_bwd(dY, dXref, L, nh, hd, seq_offset, base);
 
-    GpuTensor Xg, Yg, dYg, dXg;
-    brotensor::upload(X.data(), L, nh * hd, Xg);
-    brotensor::rope_forward_gpu(Xg, hd, nh, seq_offset, base, Yg);
+    Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), L, nh * hd);
+    Tensor Yg, dYg, dXg;
+    brotensor::rope_forward(Xg, hd, nh, seq_offset, base, Yg);
     std::vector<float> got(Yg.size());
-    brotensor::download(Yg, got.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host(got.data());
+    brotensor::sync_all();
     float max_err = 0.0f;
     for (size_t i = 0; i < got.size(); ++i) {
         max_err = std::max(max_err, std::fabs(got[i] - Yref[i]));
@@ -100,11 +101,11 @@ static void test_fp32() {
     std::printf("    fwd fp32 max_err=%g\n", max_err);
     CHECK(max_err < 1e-4f);
 
-    brotensor::upload(dY.data(), L, nh * hd, dYg);
-    brotensor::rope_backward_gpu(dYg, hd, nh, seq_offset, base, dXg);
+    dYg = Tensor::from_host_on(Device::CUDA, dY.data(), L, nh * hd);
+    brotensor::rope_backward(dYg, hd, nh, seq_offset, base, dXg);
     std::vector<float> got_dx(dXg.size());
-    brotensor::download(dXg, got_dx.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host(got_dx.data());
+    brotensor::sync_all();
     float max_err_b = 0.0f;
     for (size_t i = 0; i < got_dx.size(); ++i) {
         max_err_b = std::max(max_err_b, std::fabs(got_dx[i] - dXref[i]));
@@ -128,13 +129,13 @@ static void test_fp16() {
     rope_cpu_fwd(X, Yref, L, nh, hd, seq_offset, base);
     rope_cpu_bwd(dY, dXref, L, nh, hd, seq_offset, base);
 
-    GpuTensor Xg, Yg, dYg, dXg;
     auto Xh = to_fp16(X);
-    brotensor::upload_fp16(Xh.data(), L, nh * hd, Xg);
-    brotensor::rope_forward_gpu(Xg, hd, nh, seq_offset, base, Yg);
+    Tensor Xg = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), L, nh * hd);
+    Tensor Yg, dYg, dXg;
+    brotensor::rope_forward(Xg, hd, nh, seq_offset, base, Yg);
     std::vector<uint16_t> got(Yg.size());
-    brotensor::download_fp16(Yg, got.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     float max_err = 0.0f;
     for (size_t i = 0; i < got.size(); ++i) {
         const float g = brotensor::fp16_bits_to_fp32(got[i]);
@@ -144,11 +145,11 @@ static void test_fp16() {
     CHECK(max_err < 3e-2f);
 
     auto dYh = to_fp16(dY);
-    brotensor::upload_fp16(dYh.data(), L, nh * hd, dYg);
-    brotensor::rope_backward_gpu(dYg, hd, nh, seq_offset, base, dXg);
+    dYg = Tensor::from_host_fp16_on(Device::CUDA, dYh.data(), L, nh * hd);
+    brotensor::rope_backward(dYg, hd, nh, seq_offset, base, dXg);
     std::vector<uint16_t> got_dx(dXg.size());
-    brotensor::download_fp16(dXg, got_dx.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host_fp16(got_dx.data());
+    brotensor::sync_all();
     float max_err_b = 0.0f;
     for (size_t i = 0; i < got_dx.size(); ++i) {
         const float g = brotensor::fp16_bits_to_fp32(got_dx[i]);
@@ -159,7 +160,11 @@ static void test_fp16() {
 }
 
 int main() {
-    brotensor::cuda_init();
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     std::printf("test_rope\n");
     test_fp32();
     test_fp16();

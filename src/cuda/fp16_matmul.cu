@@ -10,14 +10,13 @@
 // Warp tile: WM x WN, built from 16x16x16 wmma fragments.
 //   BM=64, BN=64, BK=32, 4 warps per CTA (128 threads), WM=WN=32 (2x2 fragments / warp).
 
-#include <brotensor/runtime.h>
-
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cstdint>
 
 namespace brotensor {
+void* cuda_current_stream();      // shim defined in runtime.cu
 namespace fp16_internal {
 
 using namespace nvcuda;

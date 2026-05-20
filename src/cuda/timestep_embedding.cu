@@ -12,8 +12,8 @@
 // Used for the diffusion timestep itself and for SDXL's added-cond
 // micro-conditioning vector (original_size / crop / target_size).
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 
@@ -21,6 +21,10 @@
 #include <stdexcept>
 
 namespace brotensor {
+
+void* cuda_current_stream();
+
+namespace detail::cuda {
 
 namespace {
 
@@ -48,17 +52,17 @@ __global__ void timestep_embedding_kernel(const float* __restrict__ ts,
 
 } // namespace
 
-void timestep_embedding_gpu(const GpuTensor& timesteps,
-                            int dim, float max_period,
-                            GpuTensor& Y) {
+void timestep_embedding(const ::brotensor::Tensor& timesteps,
+                        int dim, float max_period,
+                        ::brotensor::Tensor& Y) {
     if (timesteps.dtype != Dtype::FP32) {
-        throw std::runtime_error("timestep_embedding_gpu: timesteps must be FP32");
+        throw std::runtime_error("timestep_embedding: timesteps must be FP32");
     }
     if (timesteps.cols != 1) {
-        throw std::runtime_error("timestep_embedding_gpu: timesteps must be (N,1)");
+        throw std::runtime_error("timestep_embedding: timesteps must be (N,1)");
     }
     if (dim <= 0) {
-        throw std::runtime_error("timestep_embedding_gpu: dim must be positive");
+        throw std::runtime_error("timestep_embedding: dim must be positive");
     }
     const int N = timesteps.rows;
     if (Y.rows != N || Y.cols != dim || Y.dtype != Dtype::FP32) {
@@ -70,10 +74,13 @@ void timestep_embedding_gpu(const GpuTensor& timesteps,
     const float log_max_period = std::log(max_period);
     const int total = N * dim;
     const int blocks = (total + TE_BLOCK - 1) / TE_BLOCK;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    cudaStream_t stream =
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     timestep_embedding_kernel<<<blocks, TE_BLOCK, 0, stream>>>(
-        timesteps.data, Y.data, N, dim, half, log_max_period);
+        static_cast<const float*>(timesteps.data),
+        static_cast<float*>(Y.data), N, dim, half, log_max_period);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

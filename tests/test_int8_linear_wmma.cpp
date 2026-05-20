@@ -23,8 +23,9 @@ static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Device;
 using brotensor::Dtype;
+using brotensor::Tensor;
 
 static int g_failures = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++g_failures; } } while(0)
@@ -66,28 +67,28 @@ static void run_case(const char* label, int B, int M, int K, bool with_bias,
         }
     }
 
-    GpuTensor Xg, Wdeq_g, Bg, Y_ref_g;
-    brotensor::upload_fp16(Xh.data(),   B, K, Xg);
-    brotensor::upload_fp16(Wdeq.data(), M, K, Wdeq_g);
-    if (with_bias) brotensor::upload_fp16(Bh.data(), M, 1, Bg);
-    brotensor::linear_forward_batched_fp16_gpu(
+    Tensor Bg, Y_ref_g;
+    Tensor Xg     = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),   B, K);
+    Tensor Wdeq_g = Tensor::from_host_fp16_on(Device::CUDA, Wdeq.data(), M, K);
+    if (with_bias) Bg = Tensor::from_host_fp16_on(Device::CUDA, Bh.data(), M, 1);
+    brotensor::linear_forward_batched_fp16(
         Wdeq_g, with_bias ? &Bg : nullptr, Xg, Y_ref_g);
     std::vector<uint16_t> ref(Y_ref_g.size());
-    brotensor::download_fp16(Y_ref_g, ref.data());
+    Y_ref_g.copy_to_host_fp16(ref.data());
 
     // INT8W path.
-    GpuTensor W_int8_g(M, K, Dtype::INT8);
-    GpuTensor S_g, Y_g;
+    Tensor W_int8_g = Tensor::empty_on(Device::CUDA, M, K, Dtype::INT8);
+    Tensor Y_g;
     cudaMemcpy(W_int8_g.data, Wq.data(),
                static_cast<size_t>(M) * K * sizeof(int8_t),
                cudaMemcpyHostToDevice);
-    brotensor::upload(scales.data(), M, 1, S_g);
-    brotensor::linear_forward_batched_int8w_fp16_gpu(
+    Tensor S_g = Tensor::from_host_on(Device::CUDA, scales.data(), M, 1);
+    brotensor::linear_forward_batched_int8w_fp16(
         W_int8_g, S_g, with_bias ? &Bg : nullptr, Xg, Y_g);
     CHECK(Y_g.dtype == Dtype::FP16 && Y_g.rows == B && Y_g.cols == M);
     std::vector<uint16_t> got(Y_g.size());
-    brotensor::download_fp16(Y_g, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    Y_g.copy_to_host_fp16(got.data());
 
     float max_err = 0.0f;
     int bad = 0;
@@ -103,7 +104,11 @@ static void run_case(const char* label, int B, int M, int K, bool with_bias,
 }
 
 int main() {
-    brotensor::cuda_init();
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     std::printf("test_int8_linear_wmma\n");
 
     // SDXL Q/K/V/O projections at three head-channel widths.

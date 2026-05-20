@@ -1,12 +1,13 @@
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+#include <brotensor/detail/dispatch.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include <stdexcept>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
 
 namespace {
 
@@ -516,123 +517,148 @@ inline int grid_for(int n) {
 
 } // anonymous namespace
 
-void relu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+using ::brotensor::Tensor;
+using ::brotensor::Dtype;
+
+void relu_forward(const Tensor& x, Tensor& y) {
     if (y.rows != x.rows || y.cols != x.cols) y.resize(x.rows, x.cols);
     const int n = x.size();
     if (n == 0) return;
-    relu_forward_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
+    relu_forward_kernel<<<grid_for(n), EW_BLOCK>>>(
+        static_cast<const float*>(x.data),
+        static_cast<float*>(y.data), n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void relu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX) {
+void relu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     if (dX.rows != x.rows || dX.cols != x.cols) dX.resize(x.rows, x.cols);
     const int n = x.size();
     if (n == 0) return;
-    relu_backward_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, dY.data, dX.data, n);
+    relu_backward_kernel<<<grid_for(n), EW_BLOCK>>>(
+        static_cast<const float*>(x.data),
+        static_cast<const float*>(dY.data),
+        static_cast<float*>(dX.data), n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void tanh_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void tanh_forward(const Tensor& x, Tensor& y) {
     if (y.rows != x.rows || y.cols != x.cols) y.resize(x.rows, x.cols);
     const int n = x.size();
     if (n == 0) return;
-    tanh_forward_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
+    tanh_forward_kernel<<<grid_for(n), EW_BLOCK>>>(
+        static_cast<const float*>(x.data),
+        static_cast<float*>(y.data), n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void tanh_backward_gpu(const GpuTensor& y, const GpuTensor& dY, GpuTensor& dX) {
+void tanh_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
     if (dX.rows != y.rows || dX.cols != y.cols) dX.resize(y.rows, y.cols);
     const int n = y.size();
     if (n == 0) return;
-    tanh_backward_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, dY.data, dX.data, n);
+    tanh_backward_kernel<<<grid_for(n), EW_BLOCK>>>(
+        static_cast<const float*>(y.data),
+        static_cast<const float*>(dY.data),
+        static_cast<float*>(dX.data), n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void sigmoid_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void sigmoid_forward(const Tensor& x, Tensor& y) {
     if (y.rows != x.rows || y.cols != x.cols) y.resize(x.rows, x.cols);
     const int n = x.size();
     if (n == 0) return;
-    sigmoid_forward_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
+    sigmoid_forward_kernel<<<grid_for(n), EW_BLOCK>>>(
+        static_cast<const float*>(x.data),
+        static_cast<float*>(y.data), n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void sigmoid_backward_gpu(const GpuTensor& y, const GpuTensor& dY, GpuTensor& dX) {
+void sigmoid_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
     if (dX.rows != y.rows || dX.cols != y.cols) dX.resize(y.rows, y.cols);
     const int n = y.size();
     if (n == 0) return;
-    sigmoid_backward_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, dY.data, dX.data, n);
+    sigmoid_backward_kernel<<<grid_for(n), EW_BLOCK>>>(
+        static_cast<const float*>(y.data),
+        static_cast<const float*>(dY.data),
+        static_cast<float*>(dX.data), n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void add_inplace_gpu(GpuTensor& y, const GpuTensor& x) {
+void add_inplace(Tensor& y, const Tensor& x) {
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
         if (x.dtype != Dtype::FP16) {
-            throw std::runtime_error("add_inplace_gpu: dtype mismatch");
+            throw std::runtime_error("add_inplace: dtype mismatch");
         }
         add_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<__half*>(y.data_fp16()),
-            reinterpret_cast<const __half*>(x.data_fp16()), n);
+            static_cast<__half*>(y.data),
+            static_cast<const __half*>(x.data), n);
     } else {
-        add_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, x.data, n);
+        add_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<float*>(y.data),
+            static_cast<const float*>(x.data), n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void add_scalar_inplace_gpu(GpuTensor& y, float s) {
+void add_scalar_inplace(Tensor& y, float s) {
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
         add_scalar_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<__half*>(y.data_fp16()), s, n);
+            static_cast<__half*>(y.data), s, n);
     } else {
-        add_scalar_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, s, n);
+        add_scalar_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<float*>(y.data), s, n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void clamp_gpu(GpuTensor& y, float lo, float hi) {
+void clamp(Tensor& y, float lo, float hi) {
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
         clamp_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<__half*>(y.data_fp16()), lo, hi, n);
+            static_cast<__half*>(y.data), lo, hi, n);
     } else {
-        clamp_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, lo, hi, n);
+        clamp_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<float*>(y.data), lo, hi, n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void scale_inplace_gpu(GpuTensor& y, float s) {
+void scale_inplace(Tensor& y, float s) {
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
         scale_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<__half*>(y.data_fp16()), s, n);
+            static_cast<__half*>(y.data), s, n);
     } else {
-        scale_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, s, n);
+        scale_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<float*>(y.data), s, n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void mul_inplace_gpu(GpuTensor& y, const GpuTensor& x) {
+void mul_inplace(Tensor& y, const Tensor& x) {
     if (y.dtype != x.dtype || y.rows != x.rows || y.cols != x.cols) {
-        throw std::runtime_error("mul_inplace_gpu: shape/dtype mismatch");
+        throw std::runtime_error("mul_inplace: shape/dtype mismatch");
     }
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
         mul_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<__half*>(y.data_fp16()),
-            reinterpret_cast<const __half*>(x.data_fp16()), n);
+            static_cast<__half*>(y.data),
+            static_cast<const __half*>(x.data), n);
     } else {
-        mul_inplace_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(y.data, x.data, n);
+        mul_inplace_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<float*>(y.data),
+            static_cast<const float*>(x.data), n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void silu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void silu_forward(const Tensor& x, Tensor& y) {
     if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
         y.resize(x.rows, x.cols, x.dtype);
     }
@@ -640,15 +666,17 @@ void silu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
         silu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(x.data_fp16()),
-            reinterpret_cast<__half*>(y.data_fp16()), n);
+            static_cast<const __half*>(x.data),
+            static_cast<__half*>(y.data), n);
     } else {
-        silu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
+        silu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(x.data),
+            static_cast<float*>(y.data), n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void gelu_forward(const Tensor& x, Tensor& y) {
     if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
         y.resize(x.rows, x.cols, x.dtype);
     }
@@ -656,15 +684,17 @@ void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
         gelu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(x.data_fp16()),
-            reinterpret_cast<__half*>(y.data_fp16()), n);
+            static_cast<const __half*>(x.data),
+            static_cast<__half*>(y.data), n);
     } else {
-        gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
+        gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(x.data),
+            static_cast<float*>(y.data), n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void quick_gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void quick_gelu_forward(const Tensor& x, Tensor& y) {
     if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
         y.resize(x.rows, x.cols, x.dtype);
     }
@@ -672,15 +702,17 @@ void quick_gelu_forward_gpu(const GpuTensor& x, GpuTensor& y) {
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
         quick_gelu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(x.data_fp16()),
-            reinterpret_cast<__half*>(y.data_fp16()), n);
+            static_cast<const __half*>(x.data),
+            static_cast<__half*>(y.data), n);
     } else {
-        quick_gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
+        quick_gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(x.data),
+            static_cast<float*>(y.data), n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void silu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX) {
+void silu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
         dX.resize(x.rows, x.cols, x.dtype);
     }
@@ -688,17 +720,19 @@ void silu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX) {
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
         silu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(x.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()), n);
+            static_cast<const __half*>(x.data),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data), n);
     } else {
         silu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
-            x.data, dY.data, dX.data, n);
+            static_cast<const float*>(x.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data), n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX) {
+void gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
         dX.resize(x.rows, x.cols, x.dtype);
     }
@@ -706,18 +740,19 @@ void gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX) {
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
         gelu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(x.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()), n);
+            static_cast<const __half*>(x.data),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data), n);
     } else {
         gelu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
-            x.data, dY.data, dX.data, n);
+            static_cast<const float*>(x.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data), n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void quick_gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
-                             GpuTensor& dX) {
+void quick_gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
         dX.resize(x.rows, x.cols, x.dtype);
     }
@@ -725,19 +760,21 @@ void quick_gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
         quick_gelu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(x.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()), n);
+            static_cast<const __half*>(x.data),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data), n);
     } else {
         quick_gelu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
-            x.data, dY.data, dX.data, n);
+            static_cast<const float*>(x.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data), n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
+void geglu_forward(const Tensor& X, Tensor& Y) {
     if (X.cols % 2 != 0) {
-        throw std::runtime_error("geglu_forward_gpu: X.cols must be even (2*D)");
+        throw std::runtime_error("geglu_forward: X.cols must be even (2*D)");
     }
     const int B = X.rows;
     const int D = X.cols / 2;
@@ -748,20 +785,20 @@ void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
         geglu_forward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             B, D);
     } else {
         geglu_forward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
-            X.data, Y.data, B, D);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data), B, D);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void geglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
-                        GpuTensor& dX) {
+void geglu_backward(const Tensor& X, const Tensor& dY, Tensor& dX) {
     if (X.cols % 2 != 0) {
-        throw std::runtime_error("geglu_backward_gpu: X.cols must be even (2*D)");
+        throw std::runtime_error("geglu_backward: X.cols must be even (2*D)");
     }
     const int B = X.rows;
     const int D = X.cols / 2;
@@ -772,18 +809,20 @@ void geglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
         geglu_backward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data),
             B, D);
     } else {
         geglu_backward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
-            X.data, dY.data, dX.data, B, D);
+            static_cast<const float*>(X.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data), B, D);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void gelu_exact_forward_gpu(const GpuTensor& x, GpuTensor& y) {
+void gelu_exact_forward(const Tensor& x, Tensor& y) {
     if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
         y.resize(x.rows, x.cols, x.dtype);
     }
@@ -791,16 +830,17 @@ void gelu_exact_forward_gpu(const GpuTensor& x, GpuTensor& y) {
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
         gelu_exact_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(x.data_fp16()),
-            reinterpret_cast<__half*>(y.data_fp16()), n);
+            static_cast<const __half*>(x.data),
+            static_cast<__half*>(y.data), n);
     } else {
-        gelu_exact_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(x.data, y.data, n);
+        gelu_exact_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(x.data),
+            static_cast<float*>(y.data), n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void gelu_exact_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
-                             GpuTensor& dX) {
+void gelu_exact_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
         dX.resize(x.rows, x.cols, x.dtype);
     }
@@ -808,19 +848,21 @@ void gelu_exact_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
         gelu_exact_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(x.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()), n);
+            static_cast<const __half*>(x.data),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data), n);
     } else {
         gelu_exact_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
-            x.data, dY.data, dX.data, n);
+            static_cast<const float*>(x.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data), n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void geglu_exact_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
+void geglu_exact_forward(const Tensor& X, Tensor& Y) {
     if (X.cols % 2 != 0) {
-        throw std::runtime_error("geglu_exact_forward_gpu: X.cols must be even (2*D)");
+        throw std::runtime_error("geglu_exact_forward: X.cols must be even (2*D)");
     }
     const int B = X.rows;
     const int D = X.cols / 2;
@@ -831,20 +873,20 @@ void geglu_exact_forward_gpu(const GpuTensor& X, GpuTensor& Y) {
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
         geglu_exact_forward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             B, D);
     } else {
         geglu_exact_forward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
-            X.data, Y.data, B, D);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data), B, D);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void geglu_exact_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
-                              GpuTensor& dX) {
+void geglu_exact_backward(const Tensor& X, const Tensor& dY, Tensor& dX) {
     if (X.cols % 2 != 0) {
-        throw std::runtime_error("geglu_exact_backward_gpu: X.cols must be even (2*D)");
+        throw std::runtime_error("geglu_exact_backward: X.cols must be even (2*D)");
     }
     const int B = X.rows;
     const int D = X.cols / 2;
@@ -855,35 +897,82 @@ void geglu_exact_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
         geglu_exact_backward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data),
             B, D);
     } else {
         geglu_exact_backward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
-            X.data, dY.data, dX.data, B, D);
+            static_cast<const float*>(X.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data), B, D);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void build_causal_mask_row_gpu(int L, int q, GpuTensor& mask) {
+void build_causal_mask_row(int L, int q, Tensor& mask) {
     if (mask.rows != L || mask.cols != 1 || mask.dtype != Dtype::FP32) {
         mask.resize(L, 1, Dtype::FP32);
     }
     if (L <= 0) return;
     const int blocks = (L + EW_BLOCK - 1) / EW_BLOCK;
-    causal_mask_row_kernel<<<blocks, EW_BLOCK>>>(mask.data, L, q);
+    causal_mask_row_kernel<<<blocks, EW_BLOCK>>>(
+        static_cast<float*>(mask.data), L, q);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void build_slot_mask_gpu(const GpuTensor& x, int offset, int K, int stride,
-                         GpuTensor& mask) {
+void build_slot_mask(const Tensor& x, int offset, int K, int stride,
+                     Tensor& mask) {
     if (mask.rows != K || mask.cols != 1) mask.resize(K, 1);
     if (K <= 0) return;
     const int blocks = (K + EW_BLOCK - 1) / EW_BLOCK;
-    build_slot_mask_kernel<<<blocks, EW_BLOCK>>>(x.data, mask.data,
-                                                 offset, K, stride);
+    build_slot_mask_kernel<<<blocks, EW_BLOCK>>>(
+        static_cast<const float*>(x.data),
+        static_cast<float*>(mask.data),
+        offset, K, stride);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace brotensor
+// ─── Vtable contribution ───────────────────────────────────────────────────
+//
+// Forward decls for ops registered here whose implementations live in sibling
+// .cu files in this cluster (rms_norm.cu, swiglu.cu).
+void rms_norm_forward(const Tensor& X, const Tensor& gamma, float eps, Tensor& Y);
+void rms_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& dY,
+                       float eps, Tensor& dX, Tensor& dGamma);
+void swiglu_forward(const Tensor& X, Tensor& Y);
+void swiglu_backward(const Tensor& X, const Tensor& dY, Tensor& dX);
+
+void fill_cuda_vtable_elementwise(::brotensor::detail::OpsVTable& v) {
+    v.relu_forward            = &relu_forward;
+    v.relu_backward           = &relu_backward;
+    v.tanh_forward            = &tanh_forward;
+    v.tanh_backward           = &tanh_backward;
+    v.sigmoid_forward         = &sigmoid_forward;
+    v.sigmoid_backward        = &sigmoid_backward;
+    v.add_inplace             = &add_inplace;
+    v.add_scalar_inplace      = &add_scalar_inplace;
+    v.scale_inplace           = &scale_inplace;
+    v.mul_inplace             = &mul_inplace;
+    v.clamp                   = &clamp;
+    v.silu_forward            = &silu_forward;
+    v.silu_backward           = &silu_backward;
+    v.gelu_forward            = &gelu_forward;
+    v.gelu_backward           = &gelu_backward;
+    v.gelu_exact_forward      = &gelu_exact_forward;
+    v.gelu_exact_backward     = &gelu_exact_backward;
+    v.quick_gelu_forward      = &quick_gelu_forward;
+    v.quick_gelu_backward     = &quick_gelu_backward;
+    v.geglu_forward           = &geglu_forward;
+    v.geglu_backward          = &geglu_backward;
+    v.geglu_exact_forward     = &geglu_exact_forward;
+    v.geglu_exact_backward    = &geglu_exact_backward;
+    v.build_slot_mask         = &build_slot_mask;
+    v.build_causal_mask_row   = &build_causal_mask_row;
+    v.rms_norm_forward        = &rms_norm_forward;
+    v.rms_norm_backward       = &rms_norm_backward;
+    v.swiglu_forward          = &swiglu_forward;
+    v.swiglu_backward         = &swiglu_backward;
+}
+
+} // namespace brotensor::detail::cuda

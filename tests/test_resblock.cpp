@@ -11,8 +11,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { std::printf("  FAIL  %s:%d  %s\n", __FILE__, __LINE__, #cond); ++g_failures; } } while (0)
@@ -23,39 +24,38 @@ static std::vector<uint16_t> to_fp16(const std::vector<float>& v) {
     return o;
 }
 
-static void download_to_f(const GpuTensor& g, std::vector<float>& out) {
+static void download_to_f(const Tensor& g, std::vector<float>& out) {
     std::vector<uint16_t> tmp(g.size());
-    brotensor::download_fp16(g, tmp.data());
-    brotensor::cuda_sync();
+    g.copy_to_host_fp16(tmp.data());
+    brotensor::sync_all();
     out.resize(tmp.size());
     for (size_t i = 0; i < tmp.size(); ++i) out[i] = brotensor::fp16_bits_to_fp32(tmp[i]);
 }
 
 // Reference path: compose the resblock from existing primitives, all FP16.
-static void compose_ref(const GpuTensor& X,
-                        const GpuTensor& g1, const GpuTensor& b1_,
-                        const GpuTensor& W1, const GpuTensor* bcv1,
-                        const GpuTensor* t_emb,
-                        const GpuTensor& g2, const GpuTensor& b2_,
-                        const GpuTensor& W2, const GpuTensor* bcv2,
-                        const GpuTensor* Wskip, const GpuTensor* bskip,
+static void compose_ref(const Tensor& X,
+                        const Tensor& g1, const Tensor& b1_,
+                        const Tensor& W1, const Tensor* bcv1,
+                        const Tensor* t_emb,
+                        const Tensor& g2, const Tensor& b2_,
+                        const Tensor& W2, const Tensor* bcv2,
+                        const Tensor* Wskip, const Tensor* bskip,
                         int N, int C_in, int C_out, int H, int Wd,
                         int num_groups, float eps,
-                        GpuTensor& Y_out) {
-    GpuTensor a;
-    brotensor::group_norm_forward_gpu(X, g1, b1_, N, C_in, H, Wd, num_groups, eps, a);
-    brotensor::silu_forward_gpu(a, a);
-    GpuTensor c1;
-    brotensor::conv2d_forward_gpu(a, W1, bcv1, N, C_in, H, Wd,
-                                  C_out, 3, 3, 1, 1, 1, 1, 1, 1, c1);
+                        Tensor& Y_out) {
+    Tensor a;
+    brotensor::group_norm_forward(X, g1, b1_, N, C_in, H, Wd, num_groups, eps, a);
+    brotensor::silu_forward(a, a);
+    Tensor c1;
+    brotensor::conv2d_forward(a, W1, bcv1, N, C_in, H, Wd,
+                              C_out, 3, 3, 1, 1, 1, 1, 1, 1, c1);
     if (t_emb) {
         // Broadcast t_emb (N, C_out) or (C_out,) across HxW. We do this on
         // host because there's no broadcast-add primitive — only need to
         // produce a tensor of the same shape as c1.
         const int total = N * C_out * H * Wd;
-        std::vector<uint16_t> emb_h(t_emb->size());
-        brotensor::download_fp16(*t_emb, emb_h.data());
-        brotensor::cuda_sync();
+        std::vector<uint16_t> emb_h = t_emb->to_host_vector_fp16();
+        brotensor::sync_all();
         std::vector<float> emb_f(emb_h.size());
         for (size_t i = 0; i < emb_h.size(); ++i) emb_f[i] = brotensor::fp16_bits_to_fp32(emb_h[i]);
         const bool has_N = (t_emb->rows == N && t_emb->cols == C_out);
@@ -67,26 +67,26 @@ static void compose_ref(const GpuTensor& X,
                     broadcast[(n*C_out+oc)*H*Wd + p] = v;
             }
         auto bh = to_fp16(broadcast);
-        GpuTensor bg;
-        brotensor::upload_fp16(bh.data(), N, C_out*H*Wd, bg);
-        brotensor::add_inplace_gpu(c1, bg);
+        Tensor bg =
+            Tensor::from_host_fp16_on(Device::CUDA, bh.data(), N, C_out*H*Wd);
+        brotensor::add_inplace(c1, bg);
     }
-    GpuTensor d;
-    brotensor::group_norm_forward_gpu(c1, g2, b2_, N, C_out, H, Wd, num_groups, eps, d);
-    brotensor::silu_forward_gpu(d, d);
-    GpuTensor c2;
-    brotensor::conv2d_forward_gpu(d, W2, bcv2, N, C_out, H, Wd,
-                                  C_out, 3, 3, 1, 1, 1, 1, 1, 1, c2);
+    Tensor d;
+    brotensor::group_norm_forward(c1, g2, b2_, N, C_out, H, Wd, num_groups, eps, d);
+    brotensor::silu_forward(d, d);
+    Tensor c2;
+    brotensor::conv2d_forward(d, W2, bcv2, N, C_out, H, Wd,
+                              C_out, 3, 3, 1, 1, 1, 1, 1, 1, c2);
     // Skip path.
     if (Wskip == nullptr) {
         // c2 += X (same shape since C_in==C_out)
-        brotensor::add_inplace_gpu(c2, X);
+        brotensor::add_inplace(c2, X);
     } else {
-        GpuTensor s;
-        brotensor::conv2d_forward_gpu(X, *Wskip, bskip,
-                                      N, C_in, H, Wd, C_out, 1, 1,
-                                      1, 1, 0, 0, 1, 1, s);
-        brotensor::add_inplace_gpu(c2, s);
+        Tensor s;
+        brotensor::conv2d_forward(X, *Wskip, bskip,
+                                  N, C_in, H, Wd, C_out, 1, 1,
+                                  1, 1, 0, 0, 1, 1, s);
+        brotensor::add_inplace(c2, s);
     }
     // Move c2 into Y_out.
     Y_out = std::move(c2);
@@ -117,11 +117,11 @@ static void run_one(const char* label,
     auto bsk = need_skip_conv ? rand(C_out) : std::vector<float>{};
     auto temb = with_temb ? rand(N * C_out) : std::vector<float>{};
 
-    auto up = [&](const std::vector<float>& v, int r, int c, GpuTensor& g) {
+    auto up = [&](const std::vector<float>& v, int r, int c, Tensor& g) {
         auto h = to_fp16(v);
-        brotensor::upload_fp16(h.data(), r, c, g);
+        g = Tensor::from_host_fp16_on(Device::CUDA, h.data(), r, c);
     };
-    GpuTensor Xg, g1g, b1g, W1g, bcv1g, g2g, b2g, W2g, bcv2g, Wskg, bskg, tembg;
+    Tensor Xg, g1g, b1g, W1g, bcv1g, g2g, b2g, W2g, bcv2g, Wskg, bskg, tembg;
     up(X, N, C_in*spatial, Xg);
     up(g1, C_in, 1, g1g); up(b1, C_in, 1, b1g);
     up(W1, C_out, C_in*9, W1g); up(bcv1, C_out, 1, bcv1g);
@@ -130,7 +130,7 @@ static void run_one(const char* label,
     if (need_skip_conv) { up(Wsk, C_out, C_in, Wskg); up(bsk, C_out, 1, bskg); }
     if (with_temb) up(temb, N, C_out, tembg);
 
-    GpuTensor Y_ref;
+    Tensor Y_ref;
     compose_ref(Xg, g1g, b1g, W1g, &bcv1g,
                 with_temb ? &tembg : nullptr,
                 g2g, b2g, W2g, &bcv2g,
@@ -138,13 +138,13 @@ static void run_one(const char* label,
                 need_skip_conv ? &bskg : nullptr,
                 N, C_in, C_out, H, Wd, num_groups, 1e-5f, Y_ref);
 
-    GpuTensor Y_fused;
-    brotensor::resblock_forward_gpu(Xg, g1g, b1g, W1g, &bcv1g,
-                                    with_temb ? &tembg : nullptr,
-                                    g2g, b2g, W2g, &bcv2g,
-                                    need_skip_conv ? &Wskg : nullptr,
-                                    need_skip_conv ? &bskg : nullptr,
-                                    N, C_in, C_out, H, Wd, num_groups, 1e-5f, Y_fused);
+    Tensor Y_fused;
+    brotensor::resblock_forward(Xg, g1g, b1g, W1g, &bcv1g,
+                                with_temb ? &tembg : nullptr,
+                                g2g, b2g, W2g, &bcv2g,
+                                need_skip_conv ? &Wskg : nullptr,
+                                need_skip_conv ? &bskg : nullptr,
+                                N, C_in, C_out, H, Wd, num_groups, 1e-5f, Y_fused);
 
     CHECK(Y_fused.rows == N && Y_fused.cols == C_out*spatial && Y_fused.dtype == Dtype::FP16);
     std::vector<float> ref, fused;
@@ -172,38 +172,37 @@ static void run_one(const char* label,
 // gradient matches within FP16 tolerance.
 
 static void compose_ref_backward(
-        const GpuTensor& X,
-        const GpuTensor& g1, const GpuTensor& b1_,
-        const GpuTensor& W1, const GpuTensor* bcv1,
-        const GpuTensor* t_emb,
-        const GpuTensor& g2, const GpuTensor& b2_,
-        const GpuTensor& W2, const GpuTensor* bcv2,
-        const GpuTensor* Wskip, const GpuTensor* bskip,
+        const Tensor& X,
+        const Tensor& g1, const Tensor& b1_,
+        const Tensor& W1, const Tensor* bcv1,
+        const Tensor* t_emb,
+        const Tensor& g2, const Tensor& b2_,
+        const Tensor& W2, const Tensor* bcv2,
+        const Tensor* Wskip, const Tensor* bskip,
         int N, int C_in, int C_out, int H, int Wd,
         int num_groups, float eps,
-        const GpuTensor& dY,
-        GpuTensor& dX,
-        GpuTensor& dGamma1, GpuTensor& dBeta1,
-        GpuTensor& dW1, GpuTensor* db1,
-        GpuTensor* dt_emb,
-        GpuTensor& dGamma2, GpuTensor& dBeta2,
-        GpuTensor& dW2, GpuTensor* db2,
-        GpuTensor* dWskip, GpuTensor* dbskip) {
+        const Tensor& dY,
+        Tensor& dX,
+        Tensor& dGamma1, Tensor& dBeta1,
+        Tensor& dW1, Tensor* db1,
+        Tensor* dt_emb,
+        Tensor& dGamma2, Tensor& dBeta2,
+        Tensor& dW2, Tensor* db2,
+        Tensor* dWskip, Tensor* dbskip) {
     const int spatial = H * Wd;
 
     // Forward recompute.
-    GpuTensor h1_pre_silu, h1, h2_pre_t, h2, h3_pre_silu, h3;
-    brotensor::group_norm_forward_gpu(X, g1, b1_, N, C_in, H, Wd, num_groups, eps, h1_pre_silu);
-    brotensor::silu_forward_gpu(h1_pre_silu, h1);
-    brotensor::conv2d_forward_gpu(h1, W1, bcv1, N, C_in, H, Wd,
-                                  C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2_pre_t);
+    Tensor h1_pre_silu, h1, h2_pre_t, h2, h3_pre_silu, h3;
+    brotensor::group_norm_forward(X, g1, b1_, N, C_in, H, Wd, num_groups, eps, h1_pre_silu);
+    brotensor::silu_forward(h1_pre_silu, h1);
+    brotensor::conv2d_forward(h1, W1, bcv1, N, C_in, H, Wd,
+                              C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2_pre_t);
     // h2 = h2_pre_t + broadcast(t_emb)
     h2 = std::move(h2_pre_t);
     if (t_emb) {
         // Broadcast on host (same as forward test path).
-        std::vector<uint16_t> emb_h(t_emb->size());
-        brotensor::download_fp16(*t_emb, emb_h.data());
-        brotensor::cuda_sync();
+        std::vector<uint16_t> emb_h = t_emb->to_host_vector_fp16();
+        brotensor::sync_all();
         std::vector<float> emb_f(emb_h.size());
         for (size_t i = 0; i < emb_h.size(); ++i) emb_f[i] = brotensor::fp16_bits_to_fp32(emb_h[i]);
         const bool has_N = (t_emb->rows == N && t_emb->cols == C_out);
@@ -215,43 +214,41 @@ static void compose_ref_backward(
                     broadcast[(n*C_out+oc)*spatial + p] = v;
             }
         auto bh = to_fp16(broadcast);
-        GpuTensor bg;
-        brotensor::upload_fp16(bh.data(), N, C_out*spatial, bg);
-        brotensor::add_inplace_gpu(h2, bg);
+        Tensor bg =
+            Tensor::from_host_fp16_on(Device::CUDA, bh.data(), N, C_out*spatial);
+        brotensor::add_inplace(h2, bg);
     }
-    brotensor::group_norm_forward_gpu(h2, g2, b2_, N, C_out, H, Wd, num_groups, eps, h3_pre_silu);
-    brotensor::silu_forward_gpu(h3_pre_silu, h3);
+    brotensor::group_norm_forward(h2, g2, b2_, N, C_out, H, Wd, num_groups, eps, h3_pre_silu);
+    brotensor::silu_forward(h3_pre_silu, h3);
 
     // Backward.
     // Conv2.
-    GpuTensor dh3(N, C_out * spatial, brotensor::Dtype::FP16);
-    brotensor::conv2d_backward_input_gpu(W2, dY, N, C_out, H, Wd,
-                                         C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh3);
-    brotensor::conv2d_backward_weight_gpu(h3, dY, N, C_out, H, Wd,
-                                          C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW2);
+    Tensor dh3 = Tensor::zeros_on(Device::CUDA, N, C_out * spatial, brotensor::Dtype::FP16);
+    brotensor::conv2d_backward_input(W2, dY, N, C_out, H, Wd,
+                                     C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh3);
+    brotensor::conv2d_backward_weight(h3, dY, N, C_out, H, Wd,
+                                      C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW2);
     if (db2) {
-        brotensor::conv2d_backward_bias_gpu(dY, N, C_out, H, Wd, *db2);
+        brotensor::conv2d_backward_bias(dY, N, C_out, H, Wd, *db2);
     }
     // SiLU2.
-    GpuTensor dh3_pre;
-    brotensor::silu_backward_gpu(h3_pre_silu, dh3, dh3_pre);
+    Tensor dh3_pre;
+    brotensor::silu_backward(h3_pre_silu, dh3, dh3_pre);
     // GN2.
-    GpuTensor dh2;
-    brotensor::group_norm_backward_gpu(h2, g2, dh3_pre, N, C_out, H, Wd,
-                                       num_groups, eps, dh2, dGamma2, dBeta2);
+    Tensor dh2;
+    brotensor::group_norm_backward(h2, g2, dh3_pre, N, C_out, H, Wd,
+                                   num_groups, eps, dh2, dGamma2, dBeta2);
 
     // dt_emb: per-(n,c) HW sum (or per-c NHW sum).
     if (t_emb && dt_emb) {
-        std::vector<uint16_t> dh2_h(dh2.size());
-        brotensor::download_fp16(dh2, dh2_h.data());
-        brotensor::cuda_sync();
+        std::vector<uint16_t> dh2_h = dh2.to_host_vector_fp16();
+        brotensor::sync_all();
         std::vector<float> dh2_f(dh2_h.size());
         for (size_t i = 0; i < dh2_h.size(); ++i) dh2_f[i] = brotensor::fp16_bits_to_fp32(dh2_h[i]);
         const bool has_N = (t_emb->rows == N && t_emb->cols == C_out);
         // Download current dt_emb (it's accumulated into).
-        std::vector<uint16_t> cur_h(dt_emb->size());
-        brotensor::download_fp16(*dt_emb, cur_h.data());
-        brotensor::cuda_sync();
+        std::vector<uint16_t> cur_h = dt_emb->to_host_vector_fp16();
+        brotensor::sync_all();
         std::vector<float> cur_f(cur_h.size());
         for (size_t i = 0; i < cur_h.size(); ++i) cur_f[i] = brotensor::fp16_bits_to_fp32(cur_h[i]);
         if (has_N) {
@@ -271,44 +268,45 @@ static void compose_ref_backward(
             }
         }
         auto out_h = to_fp16(cur_f);
-        brotensor::upload_fp16(out_h.data(), dt_emb->rows, dt_emb->cols, *dt_emb);
+        *dt_emb = Tensor::from_host_fp16_on(Device::CUDA, out_h.data(),
+                                            dt_emb->rows, dt_emb->cols);
     }
 
     // Conv1.
-    GpuTensor dh1(N, C_in * spatial, brotensor::Dtype::FP16);
-    brotensor::conv2d_backward_input_gpu(W1, dh2, N, C_in, H, Wd,
-                                         C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh1);
-    brotensor::conv2d_backward_weight_gpu(h1, dh2, N, C_in, H, Wd,
-                                          C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW1);
+    Tensor dh1 = Tensor::zeros_on(Device::CUDA, N, C_in * spatial, brotensor::Dtype::FP16);
+    brotensor::conv2d_backward_input(W1, dh2, N, C_in, H, Wd,
+                                     C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh1);
+    brotensor::conv2d_backward_weight(h1, dh2, N, C_in, H, Wd,
+                                      C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW1);
     if (db1) {
-        brotensor::conv2d_backward_bias_gpu(dh2, N, C_out, H, Wd, *db1);
+        brotensor::conv2d_backward_bias(dh2, N, C_out, H, Wd, *db1);
     }
     // SiLU1.
-    GpuTensor dh1_pre;
-    brotensor::silu_backward_gpu(h1_pre_silu, dh1, dh1_pre);
+    Tensor dh1_pre;
+    brotensor::silu_backward(h1_pre_silu, dh1, dh1_pre);
     // GN1 → dX.
-    brotensor::group_norm_backward_gpu(X, g1, dh1_pre, N, C_in, H, Wd,
-                                       num_groups, eps, dX, dGamma1, dBeta1);
+    brotensor::group_norm_backward(X, g1, dh1_pre, N, C_in, H, Wd,
+                                   num_groups, eps, dX, dGamma1, dBeta1);
 
     // Skip.
     if (Wskip == nullptr) {
-        brotensor::add_inplace_gpu(dX, dY);
+        brotensor::add_inplace(dX, dY);
     } else {
-        GpuTensor dX_skip(N, C_in * spatial, brotensor::Dtype::FP16);
-        brotensor::conv2d_backward_input_gpu(*Wskip, dY, N, C_in, H, Wd,
-                                             C_out, 1, 1, 1, 1, 0, 0, 1, 1, dX_skip);
+        Tensor dX_skip = Tensor::zeros_on(Device::CUDA, N, C_in * spatial, brotensor::Dtype::FP16);
+        brotensor::conv2d_backward_input(*Wskip, dY, N, C_in, H, Wd,
+                                         C_out, 1, 1, 1, 1, 0, 0, 1, 1, dX_skip);
         if (dWskip) {
-            brotensor::conv2d_backward_weight_gpu(X, dY, N, C_in, H, Wd,
-                                                  C_out, 1, 1, 1, 1, 0, 0, 1, 1, *dWskip);
+            brotensor::conv2d_backward_weight(X, dY, N, C_in, H, Wd,
+                                              C_out, 1, 1, 1, 1, 0, 0, 1, 1, *dWskip);
         }
         if (dbskip) {
-            brotensor::conv2d_backward_bias_gpu(dY, N, C_out, H, Wd, *dbskip);
+            brotensor::conv2d_backward_bias(dY, N, C_out, H, Wd, *dbskip);
         }
-        brotensor::add_inplace_gpu(dX, dX_skip);
+        brotensor::add_inplace(dX, dX_skip);
     }
 }
 
-static void compare_fp16(const GpuTensor& got, const GpuTensor& ref,
+static void compare_fp16(const Tensor& got, const Tensor& ref,
                          const char* label, float atol = 1e-2f, float rtol = 1e-2f) {
     CHECK(got.size() == ref.size());
     std::vector<float> g, r;
@@ -329,9 +327,8 @@ static void compare_fp16(const GpuTensor& got, const GpuTensor& ref,
     CHECK(bad == 0);
 }
 
-static void zero_fp16_like(GpuTensor& g, int rows, int cols) {
-    g.resize(rows, cols, Dtype::FP16);
-    g.zero();
+static void zero_fp16_like(Tensor& g, int rows, int cols) {
+    g = Tensor::zeros_on(Device::CUDA, rows, cols, Dtype::FP16);
 }
 
 static void run_backward_one(const char* label,
@@ -360,11 +357,11 @@ static void run_backward_one(const char* label,
     auto temb = with_temb ? rand(N * C_out) : std::vector<float>{};
     auto dY = rand(N * C_out * spatial);
 
-    auto up = [&](const std::vector<float>& v, int r, int c, GpuTensor& g) {
+    auto up = [&](const std::vector<float>& v, int r, int c, Tensor& g) {
         auto h = to_fp16(v);
-        brotensor::upload_fp16(h.data(), r, c, g);
+        g = Tensor::from_host_fp16_on(Device::CUDA, h.data(), r, c);
     };
-    GpuTensor Xg, g1g, b1g, W1g, bcv1g, g2g, b2g, W2g, bcv2g, Wskg, bskg, tembg, dYg;
+    Tensor Xg, g1g, b1g, W1g, bcv1g, g2g, b2g, W2g, bcv2g, Wskg, bskg, tembg, dYg;
     up(X, N, C_in*spatial, Xg);
     up(g1, C_in, 1, g1g); up(b1v, C_in, 1, b1g);
     up(W1, C_out, C_in*9, W1g); up(bcv1, C_out, 1, bcv1g);
@@ -375,8 +372,8 @@ static void run_backward_one(const char* label,
     up(dY, N, C_out*spatial, dYg);
 
     // Reference grads (caller-zeroed; backward accumulates).
-    GpuTensor dX_ref, dG1_ref, dB1_ref, dW1_ref, db1_ref, dt_ref;
-    GpuTensor dG2_ref, dB2_ref, dW2_ref, db2_ref, dWsk_ref, dbsk_ref;
+    Tensor dX_ref, dG1_ref, dB1_ref, dW1_ref, db1_ref, dt_ref;
+    Tensor dG2_ref, dB2_ref, dW2_ref, db2_ref, dWsk_ref, dbsk_ref;
     zero_fp16_like(dG1_ref, C_in, 1);   zero_fp16_like(dB1_ref, C_in, 1);
     zero_fp16_like(dW1_ref, C_out, C_in * 9);
     zero_fp16_like(db1_ref, C_out, 1);
@@ -403,8 +400,8 @@ static void run_backward_one(const char* label,
                          need_skip_conv ? &dbsk_ref : nullptr);
 
     // Tested grads.
-    GpuTensor dX_got, dG1_got, dB1_got, dW1_got, db1_got, dt_got;
-    GpuTensor dG2_got, dB2_got, dW2_got, db2_got, dWsk_got, dbsk_got;
+    Tensor dX_got, dG1_got, dB1_got, dW1_got, db1_got, dt_got;
+    Tensor dG2_got, dB2_got, dW2_got, db2_got, dWsk_got, dbsk_got;
     zero_fp16_like(dG1_got, C_in, 1);   zero_fp16_like(dB1_got, C_in, 1);
     zero_fp16_like(dW1_got, C_out, C_in * 9);
     zero_fp16_like(db1_got, C_out, 1);
@@ -416,7 +413,7 @@ static void run_backward_one(const char* label,
         zero_fp16_like(dWsk_got, C_out, C_in);
         zero_fp16_like(dbsk_got, C_out, 1);
     }
-    brotensor::resblock_backward_gpu(
+    brotensor::resblock_backward(
         Xg, g1g, b1g, W1g, &bcv1g,
         with_temb ? &tembg : nullptr,
         g2g, b2g, W2g, &bcv2g,
@@ -448,10 +445,10 @@ static void run_backward_one(const char* label,
 }
 
 int main() {
-    try { brotensor::cuda_init(); }
-    catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_resblock\n");
 

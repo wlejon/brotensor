@@ -10,8 +10,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Device;
 using brotensor::Dtype;
+using brotensor::Tensor;
 
 static int g_failures = 0;
 
@@ -46,13 +47,13 @@ static void test_sum_rows_fp32() {
     for (int m = 0; m < M; ++m)
         for (int n = 0; n < N; ++n) ref[m] += X[m * N + n];
 
-    GpuTensor Xg, Yg;
-    brotensor::upload(X.data(), M, N, Xg);
-    brotensor::sum_rows_gpu(Xg, Yg);
+    Tensor Yg;
+    Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), M, N);
+    brotensor::sum_rows(Xg, Yg);
     CHECK(Yg.rows == M && Yg.cols == 1 && Yg.dtype == Dtype::FP32);
     std::vector<float> got(M);
-    brotensor::download(Yg, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    Yg.copy_to_host(got.data());
     float max_err = 0.0f;
     for (int m = 0; m < M; ++m)
         max_err = std::max(max_err, std::fabs(got[m] - ref[m]));
@@ -72,14 +73,14 @@ static void test_sum_rows_fp16() {
     for (int m = 0; m < M; ++m)
         for (int n = 0; n < N; ++n) ref[m] += Xq[m * N + n];
 
-    GpuTensor Xg, Yg;
+    Tensor Yg;
     auto Xh = to_fp16(X);
-    brotensor::upload_fp16(Xh.data(), M, N, Xg);
-    brotensor::sum_rows_gpu(Xg, Yg);
+    Tensor Xg = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), M, N);
+    brotensor::sum_rows(Xg, Yg);
     CHECK(Yg.dtype == Dtype::FP16 && Yg.rows == M && Yg.cols == 1);
     std::vector<uint16_t> got(M);
-    brotensor::download_fp16(Yg, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    Yg.copy_to_host_fp16(got.data());
     float max_err = 0.0f;
     for (int m = 0; m < M; ++m) {
         const float g = brotensor::fp16_bits_to_fp32(got[m]);
@@ -99,13 +100,13 @@ static void test_sum_cols_fp32() {
     std::vector<float> ref(N, 0.0f);
     for (int m = 0; m < M; ++m)
         for (int n = 0; n < N; ++n) ref[n] += X[m * N + n];
-    GpuTensor Xg, Yg;
-    brotensor::upload(X.data(), M, N, Xg);
-    brotensor::sum_cols_gpu(Xg, Yg);
+    Tensor Yg;
+    Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), M, N);
+    brotensor::sum_cols(Xg, Yg);
     CHECK(Yg.rows == 1 && Yg.cols == N && Yg.dtype == Dtype::FP32);
     std::vector<float> got(N);
-    brotensor::download(Yg, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    Yg.copy_to_host(got.data());
     float max_err = 0.0f;
     for (int n = 0; n < N; ++n)
         max_err = std::max(max_err, std::fabs(got[n] - ref[n]));
@@ -131,31 +132,35 @@ static void test_argmax_rows() {
     }
     // FP32
     {
-        GpuTensor Xg, Ig;
-        brotensor::upload(X.data(), M, N, Xg);
-        brotensor::argmax_rows_gpu(Xg, Ig);
+        Tensor Ig;
+        Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), M, N);
+        brotensor::argmax_rows(Xg, Ig);
         CHECK(Ig.dtype == Dtype::FP32 && Ig.rows == M && Ig.cols == 1);
         std::vector<float> got(M);
-        brotensor::download(Ig, got.data());
-        brotensor::cuda_sync();
+        brotensor::sync_all();
+        Ig.copy_to_host(got.data());
         for (int m = 0; m < M; ++m) CHECK(static_cast<int>(got[m]) == ref[m]);
     }
     // FP16
     {
-        GpuTensor Xg, Ig;
+        Tensor Ig;
         auto Xh = to_fp16(X);
-        brotensor::upload_fp16(Xh.data(), M, N, Xg);
-        brotensor::argmax_rows_gpu(Xg, Ig);
+        Tensor Xg = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), M, N);
+        brotensor::argmax_rows(Xg, Ig);
         CHECK(Ig.dtype == Dtype::FP32);
         std::vector<float> got(M);
-        brotensor::download(Ig, got.data());
-        brotensor::cuda_sync();
+        brotensor::sync_all();
+        Ig.copy_to_host(got.data());
         for (int m = 0; m < M; ++m) CHECK(static_cast<int>(got[m]) == ref[m]);
     }
 }
 
 int main() {
-    brotensor::cuda_init();
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     std::printf("test_public_reductions\n");
     test_sum_rows_fp32();
     test_sum_rows_fp16();

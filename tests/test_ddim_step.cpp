@@ -1,4 +1,4 @@
-// CPU↔GPU parity for ddim_step_gpu (FP16).
+// CPU↔GPU parity for ddim_step (FP16) on the CUDA backend.
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -10,8 +10,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++g_failures; } } while(0)
@@ -29,7 +30,7 @@ static std::vector<float> rq(const std::vector<float>& v) {
 }
 
 static void test_basic() {
-    std::printf("  ddim_step_gpu basic\n");
+    std::printf("  ddim_step basic\n");
     const int R = 9, C = 17;
     const float alpha_t    = 0.6f;
     const float alpha_prev = 0.7f;
@@ -51,15 +52,15 @@ static void test_basic() {
         ref[i] = sqrt_ap * x0 + dir_coef * epsq[i];
     }
 
-    GpuTensor Xt, Eps, Xp;
     auto xth = to_fp16(xt), eh = to_fp16(eps);
-    brotensor::upload_fp16(xth.data(), R, C, Xt);
-    brotensor::upload_fp16(eh.data(),  R, C, Eps);
-    brotensor::ddim_step_gpu(Xt, Eps, alpha_t, alpha_prev, sigma_t, Xp);
+    Tensor Xt = Tensor::from_host_fp16_on(Device::CUDA, xth.data(), R, C);
+    Tensor Eps = Tensor::from_host_fp16_on(Device::CUDA, eh.data(), R, C);
+    Tensor Xp;
+    brotensor::ddim_step(Xt, Eps, alpha_t, alpha_prev, sigma_t, Xp);
     CHECK(Xp.dtype == Dtype::FP16 && Xp.rows == R && Xp.cols == C);
     std::vector<uint16_t> got(R * C);
-    brotensor::download_fp16(Xp, got.data());
-    brotensor::cuda_sync();
+    Xp.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
 
     float max_err = 0.0f;
     int bad = 0;
@@ -74,7 +75,11 @@ static void test_basic() {
 }
 
 int main() {
-    brotensor::cuda_init();
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     std::printf("test_ddim_step\n");
     test_basic();
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);

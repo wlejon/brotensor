@@ -10,8 +10,9 @@
 #include <random>
 #include <vector>
 
+using brotensor::Device;
 using brotensor::Dtype;
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 
 static int g_failures = 0;
 
@@ -44,11 +45,10 @@ static void nchw_to_seq_cpu(const std::vector<float>& X,
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_transpose\n");
 
@@ -75,15 +75,15 @@ int main() {
         nchw_to_seq_cpu(X, N, C, H, W, Y_ref);
 
         // ─── FP32 path ─────────────────────────────────────────────────
-        GpuTensor Xg, Yg, Rg;
-        brotensor::upload(X.data(), N, C * HW, Xg);
-        brotensor::nchw_to_sequence_gpu(Xg, N, C, H, W, Yg);
+        Tensor Yg, Rg;
+        Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), N, C * HW);
+        brotensor::nchw_to_sequence(Xg, N, C, H, W, Yg);
         CHECK(Yg.rows == N * HW);
         CHECK(Yg.cols == C);
         CHECK(Yg.dtype == Dtype::FP32);
         std::vector<float> Y_h(static_cast<size_t>(Yg.size()), 0.0f);
-        brotensor::download(Yg, Y_h.data());
-        brotensor::cuda_sync();
+        brotensor::sync_all();
+        Yg.copy_to_host(Y_h.data());
         for (size_t i = 0; i < Y_ref.size(); ++i) {
             if (Y_h[i] != Y_ref[i]) {
                 std::printf("  FP32 mismatch at %zu shape=(%d,%d,%d,%d): got %g want %g\n",
@@ -94,12 +94,12 @@ int main() {
         }
 
         // Round-trip: sequence_to_nchw should recover X exactly.
-        brotensor::sequence_to_nchw_gpu(Yg, N, C, H, W, Rg);
+        brotensor::sequence_to_nchw(Yg, N, C, H, W, Rg);
         CHECK(Rg.rows == N);
         CHECK(Rg.cols == C * HW);
         std::vector<float> R_h(static_cast<size_t>(Rg.size()), 0.0f);
-        brotensor::download(Rg, R_h.data());
-        brotensor::cuda_sync();
+        brotensor::sync_all();
+        Rg.copy_to_host(R_h.data());
         for (size_t i = 0; i < X.size(); ++i) {
             if (R_h[i] != X[i]) {
                 std::printf("  FP32 round-trip mismatch at %zu shape=(%d,%d,%d,%d)\n",
@@ -111,15 +111,15 @@ int main() {
 
         // ─── FP16 path ─────────────────────────────────────────────────
         auto X_h16 = to_fp16(X);
-        GpuTensor Xg16, Yg16, Rg16;
-        brotensor::upload_fp16(X_h16.data(), N, C * HW, Xg16);
-        brotensor::nchw_to_sequence_gpu(Xg16, N, C, H, W, Yg16);
+        Tensor Yg16, Rg16;
+        Tensor Xg16 = Tensor::from_host_fp16_on(Device::CUDA, X_h16.data(), N, C * HW);
+        brotensor::nchw_to_sequence(Xg16, N, C, H, W, Yg16);
         CHECK(Yg16.rows == N * HW);
         CHECK(Yg16.cols == C);
         CHECK(Yg16.dtype == Dtype::FP16);
         std::vector<uint16_t> Y_h16(static_cast<size_t>(Yg16.size()), 0);
-        brotensor::download_fp16(Yg16, Y_h16.data());
-        brotensor::cuda_sync();
+        brotensor::sync_all();
+        Yg16.copy_to_host_fp16(Y_h16.data());
         // Compare bit-for-bit against the FP16-of-Y_ref (transpose is a pure
         // gather — no rounding introduced).
         auto Y_ref16 = to_fp16(Y_ref);
@@ -132,10 +132,10 @@ int main() {
             }
         }
 
-        brotensor::sequence_to_nchw_gpu(Yg16, N, C, H, W, Rg16);
+        brotensor::sequence_to_nchw(Yg16, N, C, H, W, Rg16);
         std::vector<uint16_t> R_h16(static_cast<size_t>(Rg16.size()), 0);
-        brotensor::download_fp16(Rg16, R_h16.data());
-        brotensor::cuda_sync();
+        brotensor::sync_all();
+        Rg16.copy_to_host_fp16(R_h16.data());
         for (size_t i = 0; i < X_h16.size(); ++i) {
             if (R_h16[i] != X_h16[i]) {
                 std::printf("  FP16 round-trip mismatch at %zu shape=(%d,%d,%d,%d)\n",
@@ -157,12 +157,12 @@ int main() {
         std::vector<float> X = {1, 2, 3, 4,   5, 6, 7, 8};
         const std::vector<float> expected = {1, 5,  2, 6,  3, 7,  4, 8};
 
-        GpuTensor Xg, Yg;
-        brotensor::upload(X.data(), N, C * H * W, Xg);
-        brotensor::nchw_to_sequence_gpu(Xg, N, C, H, W, Yg);
+        Tensor Yg;
+        Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), N, C * H * W);
+        brotensor::nchw_to_sequence(Xg, N, C, H, W, Yg);
         std::vector<float> Y_h(static_cast<size_t>(Yg.size()), 0.0f);
-        brotensor::download(Yg, Y_h.data());
-        brotensor::cuda_sync();
+        brotensor::sync_all();
+        Yg.copy_to_host(Y_h.data());
         for (size_t i = 0; i < expected.size(); ++i) {
             if (Y_h[i] != expected[i]) {
                 std::printf("  hand-check fail at %zu: got %g want %g\n",

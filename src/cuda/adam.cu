@@ -1,10 +1,11 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <math.h>
 
 namespace brotensor {
+namespace detail::cuda {
 
 namespace {
 
@@ -35,9 +36,9 @@ __global__ void adam_step_kernel(float* __restrict__ param,
 
 } // namespace
 
-void adam_step_gpu(GpuTensor& param, const GpuTensor& grad,
-                   GpuTensor& m, GpuTensor& v,
-                   float lr, float beta1, float beta2, float eps, int step) {
+void adam_step(::brotensor::Tensor& param, const ::brotensor::Tensor& grad,
+               ::brotensor::Tensor& m, ::brotensor::Tensor& v,
+               float lr, float beta1, float beta2, float eps, int step) {
     const int n = param.size();
     if (n == 0) return;
     const float bc1 = 1.0f - powf(beta1, static_cast<float>(step));
@@ -46,10 +47,15 @@ void adam_step_gpu(GpuTensor& param, const GpuTensor& grad,
     const float inv_bc2 = 1.0f / bc2;
     constexpr int BLOCK = 256;
     const int blocks = (n + BLOCK - 1) / BLOCK;
-    adam_step_kernel<<<blocks, BLOCK>>>(param.data, grad.data, m.data, v.data,
-                                        lr, beta1, beta2, eps,
-                                        inv_bc1, inv_bc2, n);
+    adam_step_kernel<<<blocks, BLOCK>>>(
+        static_cast<float*>(param.data),
+        static_cast<const float*>(grad.data),
+        static_cast<float*>(m.data),
+        static_cast<float*>(v.data),
+        lr, beta1, beta2, eps,
+        inv_bc1, inv_bc2, n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

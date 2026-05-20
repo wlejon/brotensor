@@ -7,8 +7,9 @@
 // the softmax probs into AttnAvg instead of returning per-head, and an
 // inlined bias add inside the score kernel.
 
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+
+#include "detail/cuda_check.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -16,7 +17,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
 
 namespace {
 
@@ -161,24 +162,27 @@ __global__ void cxa_head_average_kernel(const float* __restrict__ Attnh,
     AttnAvg[static_cast<size_t>(i) * Lk + j] = __float2half(acc / static_cast<float>(H));
 }
 
-inline void check_fp16(const GpuTensor& t, const char* name) {
-    if (t.dtype != Dtype::FP16) {
+inline void check_fp16(const ::brotensor::Tensor& t, const char* name) {
+    if (t.dtype != ::brotensor::Dtype::FP16) {
         throw std::runtime_error(
-            std::string("cross_attention_forward_with_attn_gpu requires FP16 ") + name);
+            std::string("cross_attention_forward_with_attn requires FP16 ") + name);
     }
 }
 
 } // namespace
 
-void cross_attention_forward_with_attn_gpu(const GpuTensor& X,
-                                           const GpuTensor& Ctx,
-                                           const GpuTensor& Wq, const GpuTensor& Wk,
-                                           const GpuTensor& Wv, const GpuTensor& Wo,
-                                           const float* d_mask,
-                                           const GpuTensor* attn_logit_bias,
-                                           int num_heads,
-                                           GpuTensor& O,
-                                           GpuTensor& AttnAvg) {
+void cross_attention_forward_with_attn(const ::brotensor::Tensor& X,
+                                       const ::brotensor::Tensor& Ctx,
+                                       const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                                       const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                                       const float* d_mask,
+                                       const ::brotensor::Tensor* attn_logit_bias,
+                                       int num_heads,
+                                       ::brotensor::Tensor& O,
+                                       ::brotensor::Tensor& AttnAvg) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    using ::brotensor::Dtype;
     check_fp16(X, "X");
     check_fp16(Ctx, "Ctx");
     check_fp16(Wq, "Wq"); check_fp16(Wk, "Wk");
@@ -191,7 +195,7 @@ void cross_attention_forward_with_attn_gpu(const GpuTensor& X,
     const int H    = num_heads;
     const int dh   = (H > 0) ? D / H : 0;
     if (H <= 0 || dh * H != D) {
-        throw std::runtime_error("cross_attention_forward_with_attn_gpu: num_heads must divide D");
+        throw std::runtime_error("cross_attention_forward_with_attn: num_heads must divide D");
     }
     if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP16) {
         O.resize(Lq, D, Dtype::FP16);
@@ -204,81 +208,89 @@ void cross_attention_forward_with_attn_gpu(const GpuTensor& X,
     if (attn_logit_bias) {
         if (attn_logit_bias->dtype != Dtype::FP32) {
             throw std::runtime_error(
-                "cross_attention_forward_with_attn_gpu: attn_logit_bias must be FP32");
+                "cross_attention_forward_with_attn: attn_logit_bias must be FP32");
         }
         if (attn_logit_bias->rows != Lq || attn_logit_bias->cols != Lk) {
             throw std::runtime_error(
-                "cross_attention_forward_with_attn_gpu: attn_logit_bias must be (Lq, Lk)");
+                "cross_attention_forward_with_attn: attn_logit_bias must be (Lq, Lk)");
         }
     }
 
-    const __half* X_h   = reinterpret_cast<const __half*>(X.data);
-    const __half* Ctx_h = reinterpret_cast<const __half*>(Ctx.data);
-    const __half* Wq_h  = reinterpret_cast<const __half*>(Wq.data);
-    const __half* Wk_h  = reinterpret_cast<const __half*>(Wk.data);
-    const __half* Wv_h  = reinterpret_cast<const __half*>(Wv.data);
-    const __half* Wo_h  = reinterpret_cast<const __half*>(Wo.data);
-    __half* O_h        = reinterpret_cast<__half*>(O.data);
-    __half* AttnAvg_h  = reinterpret_cast<__half*>(AttnAvg.data);
+    const __half* X_h   = static_cast<const __half*>(X.data);
+    const __half* Ctx_h = static_cast<const __half*>(Ctx.data);
+    const __half* Wq_h  = static_cast<const __half*>(Wq.data);
+    const __half* Wk_h  = static_cast<const __half*>(Wk.data);
+    const __half* Wv_h  = static_cast<const __half*>(Wv.data);
+    const __half* Wo_h  = static_cast<const __half*>(Wo.data);
+    __half* O_h         = static_cast<__half*>(O.data);
+    __half* AttnAvg_h   = static_cast<__half*>(AttnAvg.data);
 
-    GpuTensor Qh(H * Lq, dh, Dtype::FP32);
-    GpuTensor Kh(H * Lk, dh, Dtype::FP32);
-    GpuTensor Vh(H * Lk, dh, Dtype::FP32);
-    GpuTensor scores(H * Lq, Lk, Dtype::FP32);
-    GpuTensor Attnh(H * Lq, Lk, Dtype::FP32);
-    GpuTensor Yconcat(Lq, D, Dtype::FP32);
+    Tensor Qh      = Tensor::empty_on(Device::CUDA, H * Lq, dh, Dtype::FP32);
+    Tensor Kh      = Tensor::empty_on(Device::CUDA, H * Lk, dh, Dtype::FP32);
+    Tensor Vh      = Tensor::empty_on(Device::CUDA, H * Lk, dh, Dtype::FP32);
+    Tensor scores  = Tensor::empty_on(Device::CUDA, H * Lq, Lk, Dtype::FP32);
+    Tensor Attnh   = Tensor::empty_on(Device::CUDA, H * Lq, Lk, Dtype::FP32);
+    Tensor Yconcat = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP32);
+
+    float* Qh_p      = static_cast<float*>(Qh.data);
+    float* Kh_p      = static_cast<float*>(Kh.data);
+    float* Vh_p      = static_cast<float*>(Vh.data);
+    float* scores_p  = static_cast<float*>(scores.data);
+    float* Attnh_p   = static_cast<float*>(Attnh.data);
+    float* Yconcat_p = static_cast<float*>(Yconcat.data);
 
     const dim3 block(16, 16);
 
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cxa_proj_kernel<<<grid, block>>>(X_h, Wq_h, Qh.data, Lq, D, dh);
+        cxa_proj_kernel<<<grid, block>>>(X_h, Wq_h, Qh_p, Lq, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lk + block.y - 1) / block.y, H);
-        cxa_proj_kernel<<<grid, block>>>(Ctx_h, Wk_h, Kh.data, Lk, Dctx, dh);
-        cxa_proj_kernel<<<grid, block>>>(Ctx_h, Wv_h, Vh.data, Lk, Dctx, dh);
+        cxa_proj_kernel<<<grid, block>>>(Ctx_h, Wk_h, Kh_p, Lk, Dctx, dh);
+        cxa_proj_kernel<<<grid, block>>>(Ctx_h, Wv_h, Vh_p, Lk, Dctx, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     {
         const float inv_sqrtdh = 1.0f / std::sqrt(static_cast<float>(dh));
-        const float* bias_ptr = attn_logit_bias ? attn_logit_bias->data : nullptr;
+        const float* bias_ptr = attn_logit_bias
+            ? static_cast<const float*>(attn_logit_bias->data) : nullptr;
         dim3 grid((Lk + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cxa_scores_kernel<<<grid, block>>>(Qh.data, Kh.data, bias_ptr,
-                                           scores.data, Lq, Lk, dh, inv_sqrtdh);
+        cxa_scores_kernel<<<grid, block>>>(Qh_p, Kh_p, bias_ptr,
+                                           scores_p, Lq, Lk, dh, inv_sqrtdh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    cxa_row_softmax_kernel<<<H * Lq, ROW_SM_BLOCK>>>(scores.data, Attnh.data,
+    cxa_row_softmax_kernel<<<H * Lq, ROW_SM_BLOCK>>>(scores_p, Attnh_p,
                                                      d_mask, Lk);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     {
         dim3 grid((Lk + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y);
-        cxa_head_average_kernel<<<grid, block>>>(Attnh.data, AttnAvg_h, Lq, Lk, H);
+        cxa_head_average_kernel<<<grid, block>>>(Attnh_p, AttnAvg_h, Lq, Lk, H);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cxa_attn_apply_v_kernel<<<grid, block>>>(Attnh.data, Vh.data,
-                                                 Yconcat.data, Lq, Lk, dh, D);
+        cxa_attn_apply_v_kernel<<<grid, block>>>(Attnh_p, Vh_p,
+                                                 Yconcat_p, Lq, Lk, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     {
         dim3 grid((D  + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y);
-        cxa_output_proj_kernel<<<grid, block>>>(Yconcat.data, Wo_h, O_h, Lq, D);
+        cxa_output_proj_kernel<<<grid, block>>>(Yconcat_p, Wo_h, O_h, Lq, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::cuda

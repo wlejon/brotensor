@@ -1,10 +1,12 @@
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include <stdexcept>
+#include <string>
+
+#include "detail/cuda_check.h"
 
 namespace brotensor {
 
@@ -249,7 +251,8 @@ inline int grid_for(int n) {
     return b;
 }
 
-inline void check_dtype_fp(const GpuTensor& t, const char* op, const char* name) {
+inline void check_dtype_fp(const ::brotensor::Tensor& t,
+                           const char* op, const char* name) {
     if (t.dtype != Dtype::FP16 && t.dtype != Dtype::FP32) {
         throw std::runtime_error(std::string(op) + ": " + name + " must be FP16 or FP32");
     }
@@ -257,12 +260,14 @@ inline void check_dtype_fp(const GpuTensor& t, const char* op, const char* name)
 
 } // namespace
 
+namespace detail::cuda {
+
 // ─── Forward ───────────────────────────────────────────────────────────────
 
-void upsample_nearest_2x_gpu(const GpuTensor& X,
-                             int N, int C, int H, int W,
-                             GpuTensor& Y) {
-    check_dtype_fp(X, "upsample_nearest_2x_gpu", "X");
+void upsample_nearest_2x(const ::brotensor::Tensor& X,
+                         int N, int C, int H, int W,
+                         ::brotensor::Tensor& Y) {
+    check_dtype_fp(X, "upsample_nearest_2x", "X");
     const int H_out = 2 * H, W_out = 2 * W;
     const int cols = C * H_out * W_out;
     if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) {
@@ -272,20 +277,22 @@ void upsample_nearest_2x_gpu(const GpuTensor& X,
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
         upsample_nearest_2x_kernel<__half><<<grid_for(total), RS_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             N, C, H, W, H_out, W_out, total);
     } else {
         upsample_nearest_2x_kernel<float><<<grid_for(total), RS_BLOCK>>>(
-            X.data, Y.data, N, C, H, W, H_out, W_out, total);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data),
+            N, C, H, W, H_out, W_out, total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void upsample_bilinear_2x_gpu(const GpuTensor& X,
-                              int N, int C, int H, int W,
-                              GpuTensor& Y) {
-    check_dtype_fp(X, "upsample_bilinear_2x_gpu", "X");
+void upsample_bilinear_2x(const ::brotensor::Tensor& X,
+                          int N, int C, int H, int W,
+                          ::brotensor::Tensor& Y) {
+    check_dtype_fp(X, "upsample_bilinear_2x", "X");
     const int H_out = 2 * H, W_out = 2 * W;
     const int cols = C * H_out * W_out;
     if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) {
@@ -295,22 +302,24 @@ void upsample_bilinear_2x_gpu(const GpuTensor& X,
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
         upsample_bilinear_2x_kernel<__half><<<grid_for(total), RS_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             N, C, H, W, H_out, W_out, total);
     } else {
         upsample_bilinear_2x_kernel<float><<<grid_for(total), RS_BLOCK>>>(
-            X.data, Y.data, N, C, H, W, H_out, W_out, total);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data),
+            N, C, H, W, H_out, W_out, total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void downsample_avg_2x_gpu(const GpuTensor& X,
-                           int N, int C, int H, int W,
-                           GpuTensor& Y) {
-    check_dtype_fp(X, "downsample_avg_2x_gpu", "X");
+void downsample_avg_2x(const ::brotensor::Tensor& X,
+                       int N, int C, int H, int W,
+                       ::brotensor::Tensor& Y) {
+    check_dtype_fp(X, "downsample_avg_2x", "X");
     if ((H & 1) || (W & 1)) {
-        throw std::runtime_error("downsample_avg_2x_gpu: H and W must be even");
+        throw std::runtime_error("downsample_avg_2x: H and W must be even");
     }
     const int H_out = H / 2, W_out = W / 2;
     const int cols = C * H_out * W_out;
@@ -321,22 +330,24 @@ void downsample_avg_2x_gpu(const GpuTensor& X,
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
         downsample_avg_2x_kernel<__half><<<grid_for(total), RS_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             N, C, H, W, H_out, W_out, total);
     } else {
         downsample_avg_2x_kernel<float><<<grid_for(total), RS_BLOCK>>>(
-            X.data, Y.data, N, C, H, W, H_out, W_out, total);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data),
+            N, C, H, W, H_out, W_out, total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
 // ─── Backward ──────────────────────────────────────────────────────────────
 
-void upsample_nearest_2x_backward_gpu(const GpuTensor& dY,
-                                      int N, int C, int H, int W,
-                                      GpuTensor& dX) {
-    check_dtype_fp(dY, "upsample_nearest_2x_backward_gpu", "dY");
+void upsample_nearest_2x_backward(const ::brotensor::Tensor& dY,
+                                  int N, int C, int H, int W,
+                                  ::brotensor::Tensor& dX) {
+    check_dtype_fp(dY, "upsample_nearest_2x_backward", "dY");
     const int H_out = 2 * H, W_out = 2 * W;
     const int cols_in = C * H * W;
     if (dX.rows != N || dX.cols != cols_in || dX.dtype != dY.dtype) {
@@ -346,20 +357,22 @@ void upsample_nearest_2x_backward_gpu(const GpuTensor& dY,
     if (total_in == 0) return;
     if (dY.dtype == Dtype::FP16) {
         upsample_nearest_2x_backward_kernel<__half><<<grid_for(total_in), RS_BLOCK>>>(
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data),
             N, C, H, W, H_out, W_out, total_in);
     } else {
         upsample_nearest_2x_backward_kernel<float><<<grid_for(total_in), RS_BLOCK>>>(
-            dY.data, dX.data, N, C, H, W, H_out, W_out, total_in);
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data),
+            N, C, H, W, H_out, W_out, total_in);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void upsample_bilinear_2x_backward_gpu(const GpuTensor& dY,
-                                       int N, int C, int H, int W,
-                                       GpuTensor& dX) {
-    check_dtype_fp(dY, "upsample_bilinear_2x_backward_gpu", "dY");
+void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
+                                   int N, int C, int H, int W,
+                                   ::brotensor::Tensor& dX) {
+    check_dtype_fp(dY, "upsample_bilinear_2x_backward", "dY");
     const int H_out = 2 * H, W_out = 2 * W;
     const int cols_in = C * H * W;
     const int cols_out = C * H_out * W_out;
@@ -374,7 +387,9 @@ void upsample_bilinear_2x_backward_gpu(const GpuTensor& dY,
         // Zero dX, then atomic-scatter directly.
         BROTENSOR_CUDA_CHECK(cudaMemset(dX.data, 0, total_in * sizeof(float)));
         upsample_bilinear_2x_backward_scatter_fp32<<<grid_for(total_out), RS_BLOCK>>>(
-            dY.data, dX.data, N, C, H, W, H_out, W_out, total_out);
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data),
+            N, C, H, W, H_out, W_out, total_out);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     } else {
         // FP16 storage: allocate FP32 scratch, scatter into it, fold back.
@@ -383,22 +398,22 @@ void upsample_bilinear_2x_backward_gpu(const GpuTensor& dY,
                                         total_in * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMemset(d_scratch, 0, total_in * sizeof(float)));
         upsample_bilinear_2x_backward_scatter_fp16<<<grid_for(total_out), RS_BLOCK>>>(
-            reinterpret_cast<const __half*>(dY.data_fp16()),
+            static_cast<const __half*>(dY.data),
             d_scratch, N, C, H, W, H_out, W_out, total_out);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         copy_fp32_to_fp16<<<grid_for(total_in), RS_BLOCK>>>(
-            d_scratch, reinterpret_cast<__half*>(dX.data_fp16()), total_in);
+            d_scratch, static_cast<__half*>(dX.data), total_in);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_scratch);
     }
 }
 
-void downsample_avg_2x_backward_gpu(const GpuTensor& dY,
-                                    int N, int C, int H, int W,
-                                    GpuTensor& dX) {
-    check_dtype_fp(dY, "downsample_avg_2x_backward_gpu", "dY");
+void downsample_avg_2x_backward(const ::brotensor::Tensor& dY,
+                                int N, int C, int H, int W,
+                                ::brotensor::Tensor& dX) {
+    check_dtype_fp(dY, "downsample_avg_2x_backward", "dY");
     if ((H & 1) || (W & 1)) {
-        throw std::runtime_error("downsample_avg_2x_backward_gpu: H and W must be even");
+        throw std::runtime_error("downsample_avg_2x_backward: H and W must be even");
     }
     const int H_out = H / 2, W_out = W / 2;
     const int cols_in = C * H * W;
@@ -409,14 +424,18 @@ void downsample_avg_2x_backward_gpu(const GpuTensor& dY,
     if (total_in == 0) return;
     if (dY.dtype == Dtype::FP16) {
         downsample_avg_2x_backward_kernel<__half><<<grid_for(total_in), RS_BLOCK>>>(
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data),
             N, C, H, W, H_out, W_out, total_in);
     } else {
         downsample_avg_2x_backward_kernel<float><<<grid_for(total_in), RS_BLOCK>>>(
-            dY.data, dX.data, N, C, H, W, H_out, W_out, total_in);
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data),
+            N, C, H, W, H_out, W_out, total_in);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
+
+} // namespace detail::cuda
 
 } // namespace brotensor

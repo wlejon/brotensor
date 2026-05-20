@@ -1,5 +1,5 @@
-// Parity for resblock_forward_int8w_fp16_gpu against the FP16 fused
-// resblock_forward_gpu using host-dequantised weights as the reference.
+// Parity for resblock_forward_int8w_fp16 against the FP16 fused
+// resblock_forward using host-dequantised weights as the reference.
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -21,8 +21,9 @@ static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { std::printf("  FAIL  %s:%d  %s\n", __FILE__, __LINE__, #cond); ++g_failures; } } while (0)
@@ -33,10 +34,10 @@ static std::vector<uint16_t> to_fp16(const std::vector<float>& v) {
     return o;
 }
 
-static void download_to_f(const GpuTensor& g, std::vector<float>& out) {
+static void download_to_f(const Tensor& g, std::vector<float>& out) {
     std::vector<uint16_t> tmp(g.size());
-    brotensor::download_fp16(g, tmp.data());
-    brotensor::cuda_sync();
+    g.copy_to_host_fp16(tmp.data());
+    brotensor::sync_all();
     out.resize(tmp.size());
     for (size_t i = 0; i < tmp.size(); ++i) out[i] = brotensor::fp16_bits_to_fp32(tmp[i]);
 }
@@ -130,70 +131,68 @@ static float run_case(const Case& tc) {
         quantize_and_dequant(Wskh, C_out, C_in, Wskq, sskv, Wskdeq);
     }
 
-    auto up_fp16 = [&](const std::vector<uint16_t>& v, int r, int c, GpuTensor& g) {
-        brotensor::upload_fp16(v.data(), r, c, g);
+    auto up_fp16 = [&](const std::vector<uint16_t>& v, int r, int c) {
+        return Tensor::from_host_fp16_on(Device::CUDA, v.data(), r, c);
     };
 
-    GpuTensor Xg, g1g, b1g, g2g, b2g;
-    up_fp16(Xh,  N,    C_in*spatial,  Xg);
-    up_fp16(g1h, C_in, 1, g1g);
-    up_fp16(b1h, C_in, 1, b1g);
-    up_fp16(g2h, C_out,1, g2g);
-    up_fp16(b2h, C_out,1, b2g);
+    Tensor Xg  = up_fp16(Xh,  N,    C_in*spatial);
+    Tensor g1g = up_fp16(g1h, C_in, 1);
+    Tensor b1g = up_fp16(b1h, C_in, 1);
+    Tensor g2g = up_fp16(g2h, C_out,1);
+    Tensor b2g = up_fp16(b2h, C_out,1);
 
-    GpuTensor bc1g, bc2g, bskg, tembg;
+    Tensor bc1g, bc2g, bskg, tembg;
     if (!tc.no_bias_convs) {
-        up_fp16(bc1h, C_out, 1, bc1g);
-        up_fp16(bc2h, C_out, 1, bc2g);
+        bc1g = up_fp16(bc1h, C_out, 1);
+        bc2g = up_fp16(bc2h, C_out, 1);
     }
-    if (tc.need_skip_conv) up_fp16(bskh, C_out, 1, bskg);
-    if (tc.with_temb) up_fp16(tembh, temb_rows, temb_cols, tembg);
+    if (tc.need_skip_conv) bskg = up_fp16(bskh, C_out, 1);
+    if (tc.with_temb) tembg = up_fp16(tembh, temb_rows, temb_cols);
 
     // FP16 dequant tensors for reference op.
-    GpuTensor W1deq_g, W2deq_g, Wskdeq_g;
-    up_fp16(W1deq, C_out, C_in * 9, W1deq_g);
-    up_fp16(W2deq, C_out, C_out * 9, W2deq_g);
-    if (tc.need_skip_conv) up_fp16(Wskdeq, C_out, C_in, Wskdeq_g);
+    Tensor W1deq_g = up_fp16(W1deq, C_out, C_in * 9);
+    Tensor W2deq_g = up_fp16(W2deq, C_out, C_out * 9);
+    Tensor Wskdeq_g;
+    if (tc.need_skip_conv) Wskdeq_g = up_fp16(Wskdeq, C_out, C_in);
 
     // INT8 weight + FP32 scale tensors for the new op.
-    GpuTensor W1int8_g(C_out, C_in * 9, Dtype::INT8);
-    GpuTensor W2int8_g(C_out, C_out * 9, Dtype::INT8);
+    Tensor W1int8_g = Tensor::zeros_on(Device::CUDA, C_out, C_in * 9, Dtype::INT8);
+    Tensor W2int8_g = Tensor::zeros_on(Device::CUDA, C_out, C_out * 9, Dtype::INT8);
     cudaMemcpy(W1int8_g.data, W1q.data(), W1q.size() * sizeof(int8_t),
                cudaMemcpyHostToDevice);
     cudaMemcpy(W2int8_g.data, W2q.data(), W2q.size() * sizeof(int8_t),
                cudaMemcpyHostToDevice);
-    GpuTensor s1g, s2g;
-    brotensor::upload(s1v.data(), C_out, 1, s1g);
-    brotensor::upload(s2v.data(), C_out, 1, s2g);
+    Tensor s1g = Tensor::from_host_on(Device::CUDA, s1v.data(), C_out, 1);
+    Tensor s2g = Tensor::from_host_on(Device::CUDA, s2v.data(), C_out, 1);
 
-    GpuTensor Wskint8_g, sskg;
+    Tensor Wskint8_g, sskg;
     if (tc.need_skip_conv) {
-        Wskint8_g.resize(C_out, C_in, Dtype::INT8);
+        Wskint8_g = Tensor::zeros_on(Device::CUDA, C_out, C_in, Dtype::INT8);
         cudaMemcpy(Wskint8_g.data, Wskq.data(), Wskq.size() * sizeof(int8_t),
                    cudaMemcpyHostToDevice);
-        brotensor::upload(sskv.data(), C_out, 1, sskg);
+        sskg = Tensor::from_host_on(Device::CUDA, sskv.data(), C_out, 1);
     }
 
-    const GpuTensor* b1p = tc.no_bias_convs ? nullptr : &bc1g;
-    const GpuTensor* b2p = tc.no_bias_convs ? nullptr : &bc2g;
-    const GpuTensor* tembp = tc.with_temb ? &tembg : nullptr;
-    const GpuTensor* Wskdeq_p = tc.need_skip_conv ? &Wskdeq_g : nullptr;
-    const GpuTensor* Wskint8_p = tc.need_skip_conv ? &Wskint8_g : nullptr;
-    const GpuTensor* sskp = tc.need_skip_conv ? &sskg : nullptr;
-    const GpuTensor* bskp = tc.need_skip_conv ? &bskg : nullptr;
+    const Tensor* b1p = tc.no_bias_convs ? nullptr : &bc1g;
+    const Tensor* b2p = tc.no_bias_convs ? nullptr : &bc2g;
+    const Tensor* tembp = tc.with_temb ? &tembg : nullptr;
+    const Tensor* Wskdeq_p = tc.need_skip_conv ? &Wskdeq_g : nullptr;
+    const Tensor* Wskint8_p = tc.need_skip_conv ? &Wskint8_g : nullptr;
+    const Tensor* sskp = tc.need_skip_conv ? &sskg : nullptr;
+    const Tensor* bskp = tc.need_skip_conv ? &bskg : nullptr;
 
     // Reference: FP16 fused op with dequantised weights.
-    GpuTensor Y_ref;
-    brotensor::resblock_forward_gpu(Xg, g1g, b1g, W1deq_g, b1p,
-                                    tembp,
-                                    g2g, b2g, W2deq_g, b2p,
-                                    Wskdeq_p, bskp,
-                                    N, C_in, C_out, H, Wd,
-                                    tc.num_groups, 1e-5f, Y_ref);
+    Tensor Y_ref;
+    brotensor::resblock_forward(Xg, g1g, b1g, W1deq_g, b1p,
+                                tembp,
+                                g2g, b2g, W2deq_g, b2p,
+                                Wskdeq_p, bskp,
+                                N, C_in, C_out, H, Wd,
+                                tc.num_groups, 1e-5f, Y_ref);
 
     // INT8W path.
-    GpuTensor Y_int8w;
-    brotensor::resblock_forward_int8w_fp16_gpu(
+    Tensor Y_int8w;
+    brotensor::resblock_forward_int8w_fp16(
         Xg, g1g, b1g, W1int8_g, s1g, b1p,
         tembp,
         g2g, b2g, W2int8_g, s2g, b2p,
@@ -224,10 +223,10 @@ static float run_case(const Case& tc) {
 }
 
 int main() {
-    try { brotensor::cuda_init(); }
-    catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_resblock_int8w\n");
 

@@ -1,70 +1,29 @@
-#include <brotensor/runtime.h>
+// CUDA backend runtime helpers. Phase 2G.
+//
+// After Phase 2 the public `cuda_init` / `cuda_set_stream` / etc. API is gone
+// (replaced by `brotensor::init()` / `brotensor::sync()`). What remains here
+// are CUDA-internal helpers:
+//
+//   * `cuda_check_throw` — backs the BROTENSOR_CUDA_CHECK macro defined in
+//                          `src/cuda/detail/cuda_check.h`. Every CUDA TU
+//                          reaches it through that header.
+//   * `cuda_current_stream` — thread-local current stream used by hot ops
+//                             (matmul, fp16 matmul, conv2d, flash attention
+//                             fwd, int8w paths). Preserved verbatim from the
+//                             pre-refactor runtime.cu so the hot-path stream
+//                             behaviour does not regress. CUDA-internal now;
+//                             not part of the public API.
+
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 
-#include <atomic>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <stdexcept>
-#include <string>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
 
-namespace {
-std::atomic<bool> g_initialized{false};
-
-int parse_device_from_env() {
-    const char* v = std::getenv("BROTENSOR_CUDA_DEVICE");
-    if (!v || !*v) return 0;
-    char* end = nullptr;
-    long n = std::strtol(v, &end, 10);
-    if (end == v) return 0;
-    if (n < 0) return 0;
-    return static_cast<int>(n);
-}
-} // namespace
-
-void cuda_init() {
-    if (g_initialized.load(std::memory_order_acquire)) return;
-
-    int count = 0;
-    BROTENSOR_CUDA_CHECK(cudaGetDeviceCount(&count));
-    if (count <= 0) {
-        throw std::runtime_error("brotensor::cuda_init: no CUDA devices found");
-    }
-    int dev = parse_device_from_env();
-    if (dev >= count) dev = 0;
-    BROTENSOR_CUDA_CHECK(cudaSetDevice(dev));
-
-    // Touch the device to force lazy context creation up-front.
-    BROTENSOR_CUDA_CHECK(cudaFree(nullptr));
-
-    g_initialized.store(true, std::memory_order_release);
-}
-
-void cuda_sync() {
-    BROTENSOR_CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-namespace {
-// Thread-local "current stream" used by select hot ops (matmul, fp16 matmul,
-// conv2d, flash_attention fwd). nullptr ⇒ default stream.
-thread_local cudaStream_t g_current_stream = nullptr;
-} // namespace
-
-void cuda_set_stream(void* stream) {
-    g_current_stream = reinterpret_cast<cudaStream_t>(stream);
-}
-
-void* cuda_current_stream() {
-    return reinterpret_cast<void*>(g_current_stream);
-}
-
-void cuda_stream_sync(void* stream) {
-    BROTENSOR_CUDA_CHECK(
-        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)));
-}
+// ─── Error check throw ─────────────────────────────────────────────────────
 
 void cuda_check_throw(int err, const char* expr_text, const char* file, int line) {
     if (err == 0) return;
@@ -77,4 +36,25 @@ void cuda_check_throw(int err, const char* expr_text, const char* file, int line
     throw std::runtime_error(buf);
 }
 
-} // namespace brotensor
+// ─── Current stream (CUDA-internal) ────────────────────────────────────────
+
+namespace {
+thread_local cudaStream_t g_current_stream = nullptr;
+} // namespace
+
+void* cuda_current_stream() {
+    return reinterpret_cast<void*>(g_current_stream);
+}
+
+void cuda_set_stream(void* stream) {
+    g_current_stream = reinterpret_cast<cudaStream_t>(stream);
+}
+
+} // namespace brotensor::detail::cuda
+
+// Compatibility shim: many CUDA TUs forward-declare cuda_current_stream() in
+// namespace brotensor and call it from there. Keep that name resolvable so
+// each individual file doesn't have to re-qualify its forward decl.
+namespace brotensor {
+void* cuda_current_stream() { return ::brotensor::detail::cuda::cuda_current_stream(); }
+}

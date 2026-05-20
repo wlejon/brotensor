@@ -1,12 +1,13 @@
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 
 #include <cmath>
 #include <stdexcept>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
 
 // FP16 inference path (unchanged from prior bundle): cross_attention and
 // self_attention public forwards delegate to the flash-attention kernel. A
@@ -15,10 +16,40 @@ namespace brotensor {
 // online-softmax path is numerically robust at every shape exercised by
 // the U-Net / cross-attn pipeline.
 //
-// FP32 training path (this bundle): the *_train_gpu functions below mirror
+// FP32 training path (this bundle): the *_train functions below mirror
 // the mha math but accept a separate Ctx tensor for K/V projection and
 // rectangular Wk/Wv: (D, D_ctx). Self-attention training is a thin wrapper
-// over mha_forward_gpu / mha_backward_gpu (Lq == Lk, D_ctx == D, X == Ctx).
+// over mha_forward / mha_backward (Lq == Lk, D_ctx == D, X == Ctx).
+
+// ─── Sibling-cluster forward decls (Phase 2A / same cluster) ──────────────
+void mha_forward(const ::brotensor::Tensor& X,
+                 const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                 const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                 const float* d_mask,
+                 int num_heads,
+                 ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,
+                 ::brotensor::Tensor& Attnh, ::brotensor::Tensor& Yconcat,
+                 ::brotensor::Tensor& O);
+void mha_backward(const ::brotensor::Tensor& dO,
+                  const ::brotensor::Tensor& X,
+                  const ::brotensor::Tensor& Qh, const ::brotensor::Tensor& Kh,
+                  const ::brotensor::Tensor& Vh, const ::brotensor::Tensor& Attnh,
+                  const ::brotensor::Tensor& Yconcat,
+                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                  const float* d_mask,
+                  int num_heads,
+                  ::brotensor::Tensor& dX,
+                  ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
+                  ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo);
+void flash_attention_qkvo_forward(const ::brotensor::Tensor& X,
+                                  const ::brotensor::Tensor* Ctx,
+                                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor* bq,
+                                  const ::brotensor::Tensor& Wk, const ::brotensor::Tensor* bk,
+                                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor* bv,
+                                  const ::brotensor::Tensor& Wo, const ::brotensor::Tensor* bo,
+                                  const float* d_mask, int num_heads, bool causal,
+                                  ::brotensor::Tensor& O);
 
 namespace {
 
@@ -380,21 +411,24 @@ __global__ void cx_dCtx_kernel(const float* __restrict__ dKh,
     dCtx[static_cast<size_t>(j) * Dctx + k] = acc;
 }
 
-inline void check_fp32(const GpuTensor& t, const char* name) {
-    if (t.dtype != Dtype::FP32) {
+inline void check_fp32(const ::brotensor::Tensor& t, const char* name) {
+    if (t.dtype != ::brotensor::Dtype::FP32) {
         throw std::runtime_error(std::string("cross_attention training path requires FP32 ") + name);
     }
 }
 
-void cross_attention_forward_train_core(const GpuTensor& X,
-                                        const GpuTensor& Ctx,
-                                        const GpuTensor& Wq, const GpuTensor& Wk,
-                                        const GpuTensor& Wv, const GpuTensor& Wo,
+void cross_attention_forward_train_core(const ::brotensor::Tensor& X,
+                                        const ::brotensor::Tensor& Ctx,
+                                        const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                                        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
                                         const float* d_mask,
                                         int num_heads,
-                                        GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
-                                        GpuTensor& Attnh, GpuTensor& Yconcat,
-                                        GpuTensor& O) {
+                                        ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,
+                                        ::brotensor::Tensor& Attnh, ::brotensor::Tensor& Yconcat,
+                                        ::brotensor::Tensor& O) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    using ::brotensor::Dtype;
     check_fp32(X, "X");
     check_fp32(Ctx, "Ctx");
     check_fp32(Wq, "Wq"); check_fp32(Wk, "Wk");
@@ -406,60 +440,74 @@ void cross_attention_forward_train_core(const GpuTensor& X,
     const int Dctx = Ctx.cols;
     const int H    = num_heads;
     const int dh   = (H > 0) ? D / H : 0;
-    if (Qh.rows != H * Lq || Qh.cols != dh) Qh.resize(H * Lq, dh);
-    if (Kh.rows != H * Lk || Kh.cols != dh) Kh.resize(H * Lk, dh);
-    if (Vh.rows != H * Lk || Vh.cols != dh) Vh.resize(H * Lk, dh);
-    if (Attnh.rows != H * Lq || Attnh.cols != Lk) Attnh.resize(H * Lq, Lk);
-    if (Yconcat.rows != Lq || Yconcat.cols != D) Yconcat.resize(Lq, D);
-    if (O.rows != Lq || O.cols != D) O.resize(Lq, D);
+    if (Qh.rows != H * Lq || Qh.cols != dh) Qh.resize(H * Lq, dh, Dtype::FP32);
+    if (Kh.rows != H * Lk || Kh.cols != dh) Kh.resize(H * Lk, dh, Dtype::FP32);
+    if (Vh.rows != H * Lk || Vh.cols != dh) Vh.resize(H * Lk, dh, Dtype::FP32);
+    if (Attnh.rows != H * Lq || Attnh.cols != Lk) Attnh.resize(H * Lq, Lk, Dtype::FP32);
+    if (Yconcat.rows != Lq || Yconcat.cols != D) Yconcat.resize(Lq, D, Dtype::FP32);
+    if (O.rows != Lq || O.cols != D) O.resize(Lq, D, Dtype::FP32);
     if (Lq == 0 || Lk == 0 || D == 0 || H == 0) return;
 
     const int gate_query = (Lq == Lk) ? 1 : 0;
     const dim3 block(16, 16);
 
+    const float* X_p   = static_cast<const float*>(X.data);
+    const float* Ctx_p = static_cast<const float*>(Ctx.data);
+    const float* Wq_p  = static_cast<const float*>(Wq.data);
+    const float* Wk_p  = static_cast<const float*>(Wk.data);
+    const float* Wv_p  = static_cast<const float*>(Wv.data);
+    const float* Wo_p  = static_cast<const float*>(Wo.data);
+    float* Qh_p        = static_cast<float*>(Qh.data);
+    float* Kh_p        = static_cast<float*>(Kh.data);
+    float* Vh_p        = static_cast<float*>(Vh.data);
+    float* Attnh_p     = static_cast<float*>(Attnh.data);
+    float* Yconcat_p   = static_cast<float*>(Yconcat.data);
+    float* O_p         = static_cast<float*>(O.data);
+
     // Q projection from X (D, D).
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cx_proj_kernel<<<grid, block>>>(X.data, Wq.data, Qh.data, Lq, D, dh);
+        cx_proj_kernel<<<grid, block>>>(X_p, Wq_p, Qh_p, Lq, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     // K and V projections from Ctx (D, D_ctx).
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lk + block.y - 1) / block.y, H);
-        cx_proj_kernel<<<grid, block>>>(Ctx.data, Wk.data, Kh.data, Lk, Dctx, dh);
-        cx_proj_kernel<<<grid, block>>>(Ctx.data, Wv.data, Vh.data, Lk, Dctx, dh);
+        cx_proj_kernel<<<grid, block>>>(Ctx_p, Wk_p, Kh_p, Lk, Dctx, dh);
+        cx_proj_kernel<<<grid, block>>>(Ctx_p, Wv_p, Vh_p, Lk, Dctx, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    GpuTensor scores(H * Lq, Lk);
+    Tensor scores = Tensor::empty_on(Device::CUDA, H * Lq, Lk, Dtype::FP32);
+    float* scores_p = static_cast<float*>(scores.data);
     {
         const float inv_sqrtdh = 1.0f / std::sqrt(static_cast<float>(dh));
         dim3 grid((Lk + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cx_scores_kernel<<<grid, block>>>(Qh.data, Kh.data, scores.data,
+        cx_scores_kernel<<<grid, block>>>(Qh_p, Kh_p, scores_p,
                                           Lq, Lk, dh, inv_sqrtdh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    cx_row_softmax_kernel<<<H * Lq, ROW_SM_BLOCK>>>(scores.data, Attnh.data,
+    cx_row_softmax_kernel<<<H * Lq, ROW_SM_BLOCK>>>(scores_p, Attnh_p,
                                                     d_mask, Lq, Lk, gate_query);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cx_attn_apply_v_kernel<<<grid, block>>>(Attnh.data, Vh.data,
-                                                Yconcat.data, Lq, Lk, dh, D);
+        cx_attn_apply_v_kernel<<<grid, block>>>(Attnh_p, Vh_p,
+                                                Yconcat_p, Lq, Lk, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     {
         dim3 grid((D  + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y);
-        cx_output_proj_kernel<<<grid, block>>>(Yconcat.data, Wo.data, d_mask,
-                                               gate_query, O.data, Lq, D);
+        cx_output_proj_kernel<<<grid, block>>>(Yconcat_p, Wo_p, d_mask,
+                                               gate_query, O_p, Lq, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -468,65 +516,68 @@ void cross_attention_forward_train_core(const GpuTensor& X,
 
 // ─── FP32 self-attention training wrappers ────────────────────────────────
 
-void self_attention_forward_train_gpu(const GpuTensor& X,
-                                      const GpuTensor& Wq, const GpuTensor& Wk,
-                                      const GpuTensor& Wv, const GpuTensor& Wo,
-                                      const float* d_mask,
-                                      int num_heads,
-                                      GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
-                                      GpuTensor& Attnh, GpuTensor& Yconcat,
-                                      GpuTensor& O) {
-    mha_forward_gpu(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
-                    Qh, Kh, Vh, Attnh, Yconcat, O);
+void self_attention_forward_train(const ::brotensor::Tensor& X,
+                                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                                  const float* d_mask,
+                                  int num_heads,
+                                  ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,
+                                  ::brotensor::Tensor& Attnh, ::brotensor::Tensor& Yconcat,
+                                  ::brotensor::Tensor& O) {
+    mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
+                Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 
-void self_attention_backward_gpu(const GpuTensor& dO,
-                                 const GpuTensor& X,
-                                 const GpuTensor& Qh, const GpuTensor& Kh,
-                                 const GpuTensor& Vh, const GpuTensor& Attnh,
-                                 const GpuTensor& Yconcat,
-                                 const GpuTensor& Wq, const GpuTensor& Wk,
-                                 const GpuTensor& Wv, const GpuTensor& Wo,
-                                 const float* d_mask,
-                                 int num_heads,
-                                 GpuTensor& dX,
-                                 GpuTensor& dWq, GpuTensor& dWk,
-                                 GpuTensor& dWv, GpuTensor& dWo) {
-    mha_backward_gpu(dO, X, Qh, Kh, Vh, Attnh, Yconcat,
-                     Wq, Wk, Wv, Wo, d_mask, num_heads,
-                     dX, dWq, dWk, dWv, dWo);
+void self_attention_backward(const ::brotensor::Tensor& dO,
+                             const ::brotensor::Tensor& X,
+                             const ::brotensor::Tensor& Qh, const ::brotensor::Tensor& Kh,
+                             const ::brotensor::Tensor& Vh, const ::brotensor::Tensor& Attnh,
+                             const ::brotensor::Tensor& Yconcat,
+                             const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                             const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                             const float* d_mask,
+                             int num_heads,
+                             ::brotensor::Tensor& dX,
+                             ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
+                             ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo) {
+    mha_backward(dO, X, Qh, Kh, Vh, Attnh, Yconcat,
+                 Wq, Wk, Wv, Wo, d_mask, num_heads,
+                 dX, dWq, dWk, dWv, dWo);
 }
 
 // ─── FP32 cross-attention training ────────────────────────────────────────
 
-void cross_attention_forward_train_gpu(const GpuTensor& X,
-                                       const GpuTensor& Ctx,
-                                       const GpuTensor& Wq, const GpuTensor& Wk,
-                                       const GpuTensor& Wv, const GpuTensor& Wo,
-                                       const float* d_mask,
-                                       int num_heads,
-                                       GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
-                                       GpuTensor& Attnh, GpuTensor& Yconcat,
-                                       GpuTensor& O) {
+void cross_attention_forward_train(const ::brotensor::Tensor& X,
+                                   const ::brotensor::Tensor& Ctx,
+                                   const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                                   const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                                   const float* d_mask,
+                                   int num_heads,
+                                   ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,
+                                   ::brotensor::Tensor& Attnh, ::brotensor::Tensor& Yconcat,
+                                   ::brotensor::Tensor& O) {
     cross_attention_forward_train_core(X, Ctx, Wq, Wk, Wv, Wo, d_mask,
                                        num_heads, Qh, Kh, Vh, Attnh,
                                        Yconcat, O);
 }
 
-void cross_attention_backward_gpu(const GpuTensor& dO,
-                                  const GpuTensor& X,
-                                  const GpuTensor& Ctx,
-                                  const GpuTensor& Qh, const GpuTensor& Kh,
-                                  const GpuTensor& Vh, const GpuTensor& Attnh,
-                                  const GpuTensor& Yconcat,
-                                  const GpuTensor& Wq, const GpuTensor& Wk,
-                                  const GpuTensor& Wv, const GpuTensor& Wo,
-                                  const float* d_mask,
-                                  int num_heads,
-                                  GpuTensor& dX,
-                                  GpuTensor& dCtx,
-                                  GpuTensor& dWq, GpuTensor& dWk,
-                                  GpuTensor& dWv, GpuTensor& dWo) {
+void cross_attention_backward(const ::brotensor::Tensor& dO,
+                              const ::brotensor::Tensor& X,
+                              const ::brotensor::Tensor& Ctx,
+                              const ::brotensor::Tensor& Qh, const ::brotensor::Tensor& Kh,
+                              const ::brotensor::Tensor& Vh, const ::brotensor::Tensor& Attnh,
+                              const ::brotensor::Tensor& Yconcat,
+                              const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                              const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                              const float* d_mask,
+                              int num_heads,
+                              ::brotensor::Tensor& dX,
+                              ::brotensor::Tensor& dCtx,
+                              ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
+                              ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    using ::brotensor::Dtype;
     check_fp32(dO, "dO"); check_fp32(X, "X"); check_fp32(Ctx, "Ctx");
 
     const int Lq   = X.rows;
@@ -535,70 +586,95 @@ void cross_attention_backward_gpu(const GpuTensor& dO,
     const int Dctx = Ctx.cols;
     const int H    = num_heads;
     const int dh   = (H > 0) ? D / H : 0;
-    if (dX.rows != Lq || dX.cols != D) dX.resize(Lq, D);
-    if (dCtx.rows != Lk || dCtx.cols != Dctx) dCtx.resize(Lk, Dctx);
+    if (dX.rows != Lq || dX.cols != D) dX.resize(Lq, D, Dtype::FP32);
+    if (dCtx.rows != Lk || dCtx.cols != Dctx) dCtx.resize(Lk, Dctx, Dtype::FP32);
     if (Lq == 0 || Lk == 0 || D == 0 || H == 0) return;
 
     const int gate_query = (Lq == Lk) ? 1 : 0;
     const float inv_sqrtdh = 1.0f / std::sqrt(static_cast<float>(dh));
     const dim3 block(16, 16);
 
+    const float* dO_p      = static_cast<const float*>(dO.data);
+    const float* X_p       = static_cast<const float*>(X.data);
+    const float* Ctx_p     = static_cast<const float*>(Ctx.data);
+    const float* Qh_p      = static_cast<const float*>(Qh.data);
+    const float* Kh_p      = static_cast<const float*>(Kh.data);
+    const float* Vh_p      = static_cast<const float*>(Vh.data);
+    const float* Attnh_p   = static_cast<const float*>(Attnh.data);
+    const float* Yconcat_p = static_cast<const float*>(Yconcat.data);
+    const float* Wq_p      = static_cast<const float*>(Wq.data);
+    const float* Wk_p      = static_cast<const float*>(Wk.data);
+    const float* Wv_p      = static_cast<const float*>(Wv.data);
+    const float* Wo_p      = static_cast<const float*>(Wo.data);
+    float* dX_p            = static_cast<float*>(dX.data);
+    float* dCtx_p          = static_cast<float*>(dCtx.data);
+    float* dWq_p           = static_cast<float*>(dWq.data);
+    float* dWk_p           = static_cast<float*>(dWk.data);
+    float* dWv_p           = static_cast<float*>(dWv.data);
+    float* dWo_p           = static_cast<float*>(dWo.data);
+
     // dYconcat = dO @ Wo (gated by query mask). Accumulate dWo.
-    GpuTensor dYconcat(Lq, D);
+    Tensor dYconcat = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP32);
+    float* dYconcat_p = static_cast<float*>(dYconcat.data);
     {
         dim3 grid((D  + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y);
-        cx_wo_back_dY_kernel<<<grid, block>>>(dO.data, Wo.data, d_mask,
-                                              gate_query, dYconcat.data, Lq, D);
+        cx_wo_back_dY_kernel<<<grid, block>>>(dO_p, Wo_p, d_mask,
+                                              gate_query, dYconcat_p, Lq, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((D + block.x - 1) / block.x,
                   (D + block.y - 1) / block.y);
-        cx_wo_back_dW_kernel<<<grid, block>>>(dO.data, Yconcat.data, d_mask,
-                                              gate_query, dWo.data, Lq, D);
+        cx_wo_back_dW_kernel<<<grid, block>>>(dO_p, Yconcat_p, d_mask,
+                                              gate_query, dWo_p, Lq, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // dAttn (H*Lq, Lk), dVh (H*Lk, dh).
-    GpuTensor dAttn(H * Lq, Lk);
-    GpuTensor dVh(H * Lk, dh);
+    Tensor dAttn = Tensor::empty_on(Device::CUDA, H * Lq, Lk, Dtype::FP32);
+    Tensor dVh   = Tensor::empty_on(Device::CUDA, H * Lk, dh, Dtype::FP32);
+    float* dAttn_p = static_cast<float*>(dAttn.data);
+    float* dVh_p   = static_cast<float*>(dVh.data);
     {
         dim3 grid((Lk + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cx_dAttn_kernel<<<grid, block>>>(dYconcat.data, Vh.data, dAttn.data,
+        cx_dAttn_kernel<<<grid, block>>>(dYconcat_p, Vh_p, dAttn_p,
                                          Lq, Lk, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lk + block.y - 1) / block.y, H);
-        cx_dV_kernel<<<grid, block>>>(Attnh.data, dYconcat.data, dVh.data,
+        cx_dV_kernel<<<grid, block>>>(Attnh_p, dYconcat_p, dVh_p,
                                       Lq, Lk, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // dScores via row softmax backward.
-    GpuTensor dScores(H * Lq, Lk);
+    Tensor dScores = Tensor::empty_on(Device::CUDA, H * Lq, Lk, Dtype::FP32);
+    float* dScores_p = static_cast<float*>(dScores.data);
     cx_row_softmax_back_kernel<<<H * Lq, ROW_SM_BLOCK>>>(
-            Attnh.data, dAttn.data, d_mask, gate_query,
-            dScores.data, Lq, Lk, inv_sqrtdh);
+            Attnh_p, dAttn_p, d_mask, gate_query,
+            dScores_p, Lq, Lk, inv_sqrtdh);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     // dQh, dKh.
-    GpuTensor dQh(H * Lq, dh);
-    GpuTensor dKh(H * Lk, dh);
+    Tensor dQh = Tensor::empty_on(Device::CUDA, H * Lq, dh, Dtype::FP32);
+    Tensor dKh = Tensor::empty_on(Device::CUDA, H * Lk, dh, Dtype::FP32);
+    float* dQh_p = static_cast<float*>(dQh.data);
+    float* dKh_p = static_cast<float*>(dKh.data);
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cx_dQ_kernel<<<grid, block>>>(dScores.data, Kh.data, dQh.data,
+        cx_dQ_kernel<<<grid, block>>>(dScores_p, Kh_p, dQh_p,
                                       Lq, Lk, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lk + block.y - 1) / block.y, H);
-        cx_dK_kernel<<<grid, block>>>(dScores.data, Qh.data, dKh.data,
+        cx_dK_kernel<<<grid, block>>>(dScores_p, Qh_p, dKh_p,
                                       Lq, Lk, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -607,7 +683,7 @@ void cross_attention_backward_gpu(const GpuTensor& dO,
     {
         dim3 grid((D + block.x - 1) / block.x,
                   (D + block.y - 1) / block.y);
-        cx_dW_proj_kernel<<<grid, block>>>(dQh.data, X.data, dWq.data,
+        cx_dW_proj_kernel<<<grid, block>>>(dQh_p, X_p, dWq_p,
                                            Lq, D, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -615,9 +691,9 @@ void cross_attention_backward_gpu(const GpuTensor& dO,
     {
         dim3 grid((Dctx + block.x - 1) / block.x,
                   (D    + block.y - 1) / block.y);
-        cx_dW_proj_kernel<<<grid, block>>>(dKh.data, Ctx.data, dWk.data,
+        cx_dW_proj_kernel<<<grid, block>>>(dKh_p, Ctx_p, dWk_p,
                                            Lk, D, Dctx, dh);
-        cx_dW_proj_kernel<<<grid, block>>>(dVh.data, Ctx.data, dWv.data,
+        cx_dW_proj_kernel<<<grid, block>>>(dVh_p, Ctx_p, dWv_p,
                                            Lk, D, Dctx, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -626,63 +702,75 @@ void cross_attention_backward_gpu(const GpuTensor& dO,
     {
         dim3 grid((D  + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y);
-        cx_dX_kernel<<<grid, block>>>(dQh.data, Wq.data, dX.data,
+        cx_dX_kernel<<<grid, block>>>(dQh_p, Wq_p, dX_p,
                                       Lq, D, dh, H);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((Dctx + block.x - 1) / block.x,
                   (Lk   + block.y - 1) / block.y);
-        cx_dCtx_kernel<<<grid, block>>>(dKh.data, dVh.data, Wk.data, Wv.data,
-                                        dCtx.data, Lk, D, Dctx, dh, H);
+        cx_dCtx_kernel<<<grid, block>>>(dKh_p, dVh_p, Wk_p, Wv_p,
+                                        dCtx_p, Lk, D, Dctx, dh, H);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 }
 
 // ─── Public forward dispatch ──────────────────────────────────────────────
 
-void cross_attention_forward_gpu(const GpuTensor& X,
-                                 const GpuTensor& Ctx,
-                                 const GpuTensor& Wq, const GpuTensor& Wk,
-                                 const GpuTensor& Wv, const GpuTensor& Wo,
-                                 const float* d_mask,
-                                 int num_heads,
-                                 GpuTensor& O) {
+void cross_attention_forward(const ::brotensor::Tensor& X,
+                             const ::brotensor::Tensor& Ctx,
+                             const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                             const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                             const float* d_mask,
+                             int num_heads,
+                             ::brotensor::Tensor& O) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Dtype;
     if (X.dtype == Dtype::FP16) {
         if (Ctx.dtype != Dtype::FP16) {
-            throw std::runtime_error("cross_attention_forward_gpu: Ctx dtype must match X dtype");
+            throw std::runtime_error("cross_attention_forward: Ctx dtype must match X dtype");
         }
-        flash_attention_qkvo_forward_gpu(X, &Ctx,
-                                         Wq, nullptr, Wk, nullptr,
-                                         Wv, nullptr, Wo, nullptr,
-                                         d_mask, num_heads, /*causal=*/false, O);
+        flash_attention_qkvo_forward(X, &Ctx,
+                                     Wq, nullptr, Wk, nullptr,
+                                     Wv, nullptr, Wo, nullptr,
+                                     d_mask, num_heads, /*causal=*/false, O);
         return;
     }
     if (Ctx.dtype != Dtype::FP32) {
-        throw std::runtime_error("cross_attention_forward_gpu: Ctx dtype must match X dtype");
+        throw std::runtime_error("cross_attention_forward: Ctx dtype must match X dtype");
     }
-    GpuTensor Qh, Kh, Vh, Attnh, Yconcat;
+    Tensor Qh      = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
+    Tensor Kh      = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
+    Tensor Vh      = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
+    Tensor Attnh   = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
+    Tensor Yconcat = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
     cross_attention_forward_train_core(X, Ctx, Wq, Wk, Wv, Wo, d_mask,
                                        num_heads, Qh, Kh, Vh, Attnh,
                                        Yconcat, O);
 }
 
-void self_attention_forward_gpu(const GpuTensor& X,
-                                const GpuTensor& Wq, const GpuTensor& Wk,
-                                const GpuTensor& Wv, const GpuTensor& Wo,
-                                const float* d_mask,
-                                int num_heads,
-                                GpuTensor& O) {
+void self_attention_forward(const ::brotensor::Tensor& X,
+                            const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                            const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                            const float* d_mask,
+                            int num_heads,
+                            ::brotensor::Tensor& O) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Dtype;
     if (X.dtype == Dtype::FP16) {
-        flash_attention_qkvo_forward_gpu(X, nullptr,
-                                         Wq, nullptr, Wk, nullptr,
-                                         Wv, nullptr, Wo, nullptr,
-                                         d_mask, num_heads, /*causal=*/false, O);
+        flash_attention_qkvo_forward(X, nullptr,
+                                     Wq, nullptr, Wk, nullptr,
+                                     Wv, nullptr, Wo, nullptr,
+                                     d_mask, num_heads, /*causal=*/false, O);
         return;
     }
-    GpuTensor Qh, Kh, Vh, Attnh, Yconcat;
-    mha_forward_gpu(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
-                    Qh, Kh, Vh, Attnh, Yconcat, O);
+    Tensor Qh      = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
+    Tensor Kh      = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
+    Tensor Vh      = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
+    Tensor Attnh   = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
+    Tensor Yconcat = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
+    mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
+                Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::cuda

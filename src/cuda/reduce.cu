@@ -1,9 +1,12 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 
+#include <vector>
+
 namespace brotensor {
+namespace detail::cuda {
 
 namespace {
 
@@ -63,19 +66,20 @@ inline int grid_for(int n, int block) {
 
 } // namespace
 
-void masked_mean_pool_forward_gpu(const GpuTensor& X, const float* d_mask,
-                                  GpuTensor& y) {
+void masked_mean_pool_forward(const ::brotensor::Tensor& X, const float* d_mask,
+                              ::brotensor::Tensor& y) {
     const int K = X.rows;
     const int D = X.cols;
     if (y.rows != D || y.cols != 1) y.resize(D, 1);
     if (D == 0) return;
     masked_mean_pool_forward_kernel<<<grid_for(D, RED_BLOCK), RED_BLOCK>>>(
-        X.data, d_mask, y.data, K, D);
+        static_cast<const float*>(X.data), d_mask,
+        static_cast<float*>(y.data), K, D);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void masked_mean_pool_backward_gpu(const GpuTensor& dY, const float* d_mask,
-                                   int K, GpuTensor& dX) {
+void masked_mean_pool_backward(const ::brotensor::Tensor& dY, const float* d_mask,
+                               int K, ::brotensor::Tensor& dX) {
     const int D = dY.size();
     if (dX.rows != K || dX.cols != D) dX.resize(K, D);
     const int total = K * D;
@@ -94,8 +98,10 @@ void masked_mean_pool_backward_gpu(const GpuTensor& dY, const float* d_mask,
     }
 
     masked_mean_pool_backward_kernel<<<grid_for(total, RED_BLOCK), RED_BLOCK>>>(
-        dY.data, d_mask, dX.data, K, D, num_valid);
+        static_cast<const float*>(dY.data), d_mask,
+        static_cast<float*>(dX.data), K, D, num_valid);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

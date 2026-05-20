@@ -1,12 +1,20 @@
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+#include <brotensor/detail/dispatch.h>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include <stdexcept>
 
+// Phase 2G stashes the BROTENSOR_CUDA_CHECK macro here.
+#include "detail/cuda_check.h"
+
 namespace brotensor {
+
+// Defined in runtime.cu (Phase 2E). Thread-local current CUDA stream as opaque
+// void*. Kept as a forward declaration here so this TU does not need a public
+// header for it.
+void* cuda_current_stream();
 
 namespace conv2d_wmma_internal {
 // Defined in conv2d_wmma.cu. Returns true iff it consumed the call; returns
@@ -262,35 +270,37 @@ __global__ void conv2d_add_fp32_into_fp32(const float* __restrict__ src,
 
 } // namespace
 
-void conv2d_forward_gpu(const GpuTensor& X,
-                        const GpuTensor& Wt,
-                        const GpuTensor* bias,
-                        int N, int C_in, int H, int W,
-                        int C_out, int kH, int kW,
-                        int stride_h, int stride_w,
-                        int pad_h, int pad_w,
-                        int dil_h, int dil_w,
-                        int groups,
-                        GpuTensor& Y) {
+namespace detail::cuda {
+
+void conv2d_forward(const ::brotensor::Tensor& X,
+                    const ::brotensor::Tensor& Wt,
+                    const ::brotensor::Tensor* bias,
+                    int N, int C_in, int H, int W,
+                    int C_out, int kH, int kW,
+                    int stride_h, int stride_w,
+                    int pad_h, int pad_w,
+                    int dil_h, int dil_w,
+                    int groups,
+                    ::brotensor::Tensor& Y) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_forward_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("conv2d_forward: X must be FP16 or FP32");
     }
     if (Wt.dtype != X.dtype) {
-        throw std::runtime_error("conv2d_forward_gpu: Wt dtype must match X");
+        throw std::runtime_error("conv2d_forward: Wt dtype must match X");
     }
     if (bias && bias->dtype != X.dtype) {
-        throw std::runtime_error("conv2d_forward_gpu: bias dtype must match X");
+        throw std::runtime_error("conv2d_forward: bias dtype must match X");
     }
     if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
         throw std::runtime_error(
-            "conv2d_forward_gpu: groups must be >=1 and divide both C_in and C_out");
+            "conv2d_forward: groups must be >=1 and divide both C_in and C_out");
     }
     const int Cg_in  = C_in  / groups;
     const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
-        throw std::runtime_error("conv2d_forward_gpu: non-positive output shape");
+        throw std::runtime_error("conv2d_forward: non-positive output shape");
     }
     const int out_cols = C_out * H_out * W_out;
     if (Y.rows != N || Y.cols != out_cols || Y.dtype != X.dtype) {
@@ -302,11 +312,11 @@ void conv2d_forward_gpu(const GpuTensor& X,
     const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     if (X.dtype == Dtype::FP16) {
-        const __half* x_p  = reinterpret_cast<const __half*>(X.data_fp16());
-        const __half* w_p  = reinterpret_cast<const __half*>(Wt.data_fp16());
-        const __half* b_p  = bias ? reinterpret_cast<const __half*>(bias->data_fp16())
+        const __half* x_p  = static_cast<const __half*>(X.data);
+        const __half* w_p  = static_cast<const __half*>(Wt.data);
+        const __half* b_p  = bias ? static_cast<const __half*>(bias->data)
                                   : nullptr;
-        __half* y_p        = reinterpret_cast<__half*>(Y.data_fp16());
+        __half* y_p        = static_cast<__half*>(Y.data);
 
         // Try the WMMA implicit-GEMM path for the SD1.5-relevant shapes
         // (3x3 s1 p1 d1, 1x1 s1 p0 d1, 3x3 s2 p1 d1). The WMMA path assumes
@@ -327,9 +337,12 @@ void conv2d_forward_gpu(const GpuTensor& X,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
     } else {
-        const float* b_p = bias ? bias->data : nullptr;
+        const float* x_p = static_cast<const float*>(X.data);
+        const float* w_p = static_cast<const float*>(Wt.data);
+        const float* b_p = bias ? static_cast<const float*>(bias->data) : nullptr;
+        float* y_p       = static_cast<float*>(Y.data);
         conv2d_forward_kernel<float><<<blocks, CONV_BLOCK, 0, stream>>>(
-            X.data, Wt.data, b_p, Y.data,
+            x_p, w_p, b_p, y_p,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
@@ -337,31 +350,31 @@ void conv2d_forward_gpu(const GpuTensor& X,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void conv2d_backward_input_gpu(const GpuTensor& Wt,
-                               const GpuTensor& dY,
-                               int N, int C_in, int H, int W,
-                               int C_out, int kH, int kW,
-                               int stride_h, int stride_w,
-                               int pad_h, int pad_w,
-                               int dil_h, int dil_w,
-                               int groups,
-                               GpuTensor& dX) {
+void conv2d_backward_input(const ::brotensor::Tensor& Wt,
+                           const ::brotensor::Tensor& dY,
+                           int N, int C_in, int H, int W,
+                           int C_out, int kH, int kW,
+                           int stride_h, int stride_w,
+                           int pad_h, int pad_w,
+                           int dil_h, int dil_w,
+                           int groups,
+                           ::brotensor::Tensor& dX) {
     if (Wt.dtype != Dtype::FP16 && Wt.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_input_gpu: Wt must be FP16 or FP32");
+        throw std::runtime_error("conv2d_backward_input: Wt must be FP16 or FP32");
     }
     if (dY.dtype != Wt.dtype) {
-        throw std::runtime_error("conv2d_backward_input_gpu: dY dtype must match Wt");
+        throw std::runtime_error("conv2d_backward_input: dY dtype must match Wt");
     }
     if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
         throw std::runtime_error(
-            "conv2d_backward_input_gpu: groups must be >=1 and divide both C_in and C_out");
+            "conv2d_backward_input: groups must be >=1 and divide both C_in and C_out");
     }
     const int Cg_in  = C_in  / groups;
     const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
-        throw std::runtime_error("conv2d_backward_input_gpu: non-positive output shape");
+        throw std::runtime_error("conv2d_backward_input: non-positive output shape");
     }
     const int in_cols = C_in * H * W;
     if (dX.rows != N || dX.cols != in_cols || dX.dtype != Wt.dtype) {
@@ -373,15 +386,17 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
     const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
     if (Wt.dtype == Dtype::FP16) {
         conv2d_backward_input_kernel<__half><<<blocks, CONV_BLOCK>>>(
-            reinterpret_cast<const __half*>(Wt.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()),
+            static_cast<const __half*>(Wt.data),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data),
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
     } else {
         conv2d_backward_input_kernel<float><<<blocks, CONV_BLOCK>>>(
-            Wt.data, dY.data, dX.data,
+            static_cast<const float*>(Wt.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data),
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
@@ -389,34 +404,34 @@ void conv2d_backward_input_gpu(const GpuTensor& Wt,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void conv2d_backward_weight_gpu(const GpuTensor& X,
-                                const GpuTensor& dY,
-                                int N, int C_in, int H, int W,
-                                int C_out, int kH, int kW,
-                                int stride_h, int stride_w,
-                                int pad_h, int pad_w,
-                                int dil_h, int dil_w,
-                                int groups,
-                                GpuTensor& dWt) {
+void conv2d_backward_weight(const ::brotensor::Tensor& X,
+                            const ::brotensor::Tensor& dY,
+                            int N, int C_in, int H, int W,
+                            int C_out, int kH, int kW,
+                            int stride_h, int stride_w,
+                            int pad_h, int pad_w,
+                            int dil_h, int dil_w,
+                            int groups,
+                            ::brotensor::Tensor& dWt) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_weight_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("conv2d_backward_weight: X must be FP16 or FP32");
     }
     if (dY.dtype != X.dtype || dWt.dtype != X.dtype) {
-        throw std::runtime_error("conv2d_backward_weight_gpu: X, dY, dWt dtype must match");
+        throw std::runtime_error("conv2d_backward_weight: X, dY, dWt dtype must match");
     }
     if (groups < 1 || C_in % groups != 0 || C_out % groups != 0) {
         throw std::runtime_error(
-            "conv2d_backward_weight_gpu: groups must be >=1 and divide both C_in and C_out");
+            "conv2d_backward_weight: groups must be >=1 and divide both C_in and C_out");
     }
     const int Cg_in  = C_in  / groups;
     const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
-        throw std::runtime_error("conv2d_backward_weight_gpu: non-positive output shape");
+        throw std::runtime_error("conv2d_backward_weight: non-positive output shape");
     }
     if (dWt.rows != C_out || dWt.cols != Cg_in * kH * kW) {
-        throw std::runtime_error("conv2d_backward_weight_gpu: dWt shape mismatch");
+        throw std::runtime_error("conv2d_backward_weight: dWt shape mismatch");
     }
     const int total = C_out * Cg_in * kH * kW;
     if (total == 0) return;
@@ -430,15 +445,17 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
     const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
     if (X.dtype == Dtype::FP16) {
         conv2d_backward_weight_kernel<__half><<<blocks, CONV_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<const __half*>(dY.data),
             d_scratch,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
     } else {
         conv2d_backward_weight_kernel<float><<<blocks, CONV_BLOCK>>>(
-            X.data, dY.data, d_scratch,
+            static_cast<const float*>(X.data),
+            static_cast<const float*>(dY.data),
+            d_scratch,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
@@ -448,26 +465,26 @@ void conv2d_backward_weight_gpu(const GpuTensor& X,
     const int fold_blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
     if (X.dtype == Dtype::FP16) {
         conv2d_add_fp32_into_fp16<<<fold_blocks, CONV_BLOCK>>>(
-            d_scratch, reinterpret_cast<__half*>(dWt.data_fp16()), total);
+            d_scratch, static_cast<__half*>(dWt.data), total);
     } else {
         conv2d_add_fp32_into_fp32<<<fold_blocks, CONV_BLOCK>>>(
-            d_scratch, dWt.data, total);
+            d_scratch, static_cast<float*>(dWt.data), total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
     cudaFree(d_scratch);
 }
 
-void conv2d_backward_bias_gpu(const GpuTensor& dY,
-                              int N, int C_out, int H_out, int W_out,
-                              GpuTensor& dB) {
+void conv2d_backward_bias(const ::brotensor::Tensor& dY,
+                          int N, int C_out, int H_out, int W_out,
+                          ::brotensor::Tensor& dB) {
     if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_bias_gpu: dY must be FP16 or FP32");
+        throw std::runtime_error("conv2d_backward_bias: dY must be FP16 or FP32");
     }
     if (dB.dtype != dY.dtype) {
-        throw std::runtime_error("conv2d_backward_bias_gpu: dB dtype must match dY");
+        throw std::runtime_error("conv2d_backward_bias: dB dtype must match dY");
     }
     if (dB.rows != C_out || dB.cols != 1) {
-        throw std::runtime_error("conv2d_backward_bias_gpu: dB shape mismatch");
+        throw std::runtime_error("conv2d_backward_bias: dB shape mismatch");
     }
     if (C_out == 0 || N == 0 || H_out == 0 || W_out == 0) return;
 
@@ -477,24 +494,65 @@ void conv2d_backward_bias_gpu(const GpuTensor& dY,
 
     if (dY.dtype == Dtype::FP16) {
         conv2d_backward_bias_kernel<__half><<<C_out, BIAS_BLOCK>>>(
-            reinterpret_cast<const __half*>(dY.data_fp16()),
+            static_cast<const __half*>(dY.data),
             d_scratch, N, C_out, H_out, W_out);
     } else {
         conv2d_backward_bias_kernel<float><<<C_out, BIAS_BLOCK>>>(
-            dY.data, d_scratch, N, C_out, H_out, W_out);
+            static_cast<const float*>(dY.data),
+            d_scratch, N, C_out, H_out, W_out);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     const int fold_blocks = (C_out + 127) / 128;
     if (dY.dtype == Dtype::FP16) {
         conv2d_add_fp32_into_fp16<<<fold_blocks, 128>>>(
-            d_scratch, reinterpret_cast<__half*>(dB.data_fp16()), C_out);
+            d_scratch, static_cast<__half*>(dB.data), C_out);
     } else {
         conv2d_add_fp32_into_fp32<<<fold_blocks, 128>>>(
-            d_scratch, dB.data, C_out);
+            d_scratch, static_cast<float*>(dB.data), C_out);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
     cudaFree(d_scratch);
 }
+
+} // namespace detail::cuda
+
+namespace detail::cuda {
+
+// Forward declarations of the resample ops defined in resample.cu — the
+// linker resolves these at link time, allowing fill_cuda_vtable_conv below
+// to wire them into the vtable without a public header.
+void upsample_nearest_2x(const ::brotensor::Tensor& X,
+                         int N, int C, int H, int W, ::brotensor::Tensor& Y);
+void upsample_bilinear_2x(const ::brotensor::Tensor& X,
+                          int N, int C, int H, int W, ::brotensor::Tensor& Y);
+void downsample_avg_2x(const ::brotensor::Tensor& X,
+                       int N, int C, int H, int W, ::brotensor::Tensor& Y);
+void upsample_nearest_2x_backward(const ::brotensor::Tensor& dY,
+                                  int N, int C, int H, int W, ::brotensor::Tensor& dX);
+void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
+                                   int N, int C, int H, int W, ::brotensor::Tensor& dX);
+void downsample_avg_2x_backward(const ::brotensor::Tensor& dY,
+                                int N, int C, int H, int W, ::brotensor::Tensor& dX);
+
+// Per-cluster vtable contribution. Called from the Phase 2G aggregator that
+// stitches together each cluster's slots into the CUDA OpsVTable and hands
+// it to register_backend(Device::CUDA, ...).
+void fill_cuda_vtable_conv(::brotensor::detail::OpsVTable& v) {
+    v.conv2d_forward                = &conv2d_forward;
+    v.conv2d_backward_input         = &conv2d_backward_input;
+    v.conv2d_backward_weight        = &conv2d_backward_weight;
+    v.conv2d_backward_bias          = &conv2d_backward_bias;
+    // conv2d_int8w_fp16_forward lives in int8_quant.cu (Phase 2F cluster);
+    // its slot is filled by that cluster's register helper, not here.
+    v.upsample_nearest_2x           = &upsample_nearest_2x;
+    v.upsample_bilinear_2x          = &upsample_bilinear_2x;
+    v.downsample_avg_2x             = &downsample_avg_2x;
+    v.upsample_nearest_2x_backward  = &upsample_nearest_2x_backward;
+    v.upsample_bilinear_2x_backward = &upsample_bilinear_2x_backward;
+    v.downsample_avg_2x_backward    = &downsample_avg_2x_backward;
+}
+
+} // namespace detail::cuda
 
 } // namespace brotensor

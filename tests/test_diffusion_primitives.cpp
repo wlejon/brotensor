@@ -1,8 +1,8 @@
 // Coverage for the diffusion-targeted additions:
-//   - clamp_gpu (FP32 + FP16)
-//   - add_scalar_inplace_gpu FP16 dispatch
-//   - embedding_lookup_forward_gpu FP16
-//   - flash_attention_forward_gpu with causal=true (compared vs causal mask)
+//   - clamp (FP32 + FP16)
+//   - add_scalar_inplace FP16 dispatch
+//   - embedding_lookup_forward FP16
+//   - flash_attention_forward with causal=true (compared vs causal mask)
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -11,12 +11,14 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 
@@ -42,13 +44,12 @@ static void test_clamp_fp32() {
     std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
     for (auto& v : host) v = dist(rng);
 
-    GpuTensor y;
-    brotensor::upload(host.data(), N, 1, y);
-    brotensor::clamp_gpu(y, -1.0f, 1.0f);
+    Tensor y = Tensor::from_host_on(Device::CUDA, host.data(), N, 1);
+    brotensor::clamp(y, -1.0f, 1.0f);
 
     std::vector<float> got(N);
-    brotensor::download(y, got.data());
-    brotensor::cuda_sync();
+    y.copy_to_host(got.data());
+    brotensor::sync_all();
 
     for (int i = 0; i < N; ++i) {
         float r = host[i];
@@ -67,13 +68,12 @@ static void test_clamp_fp16() {
     for (auto& v : host_f) v = dist(rng);
     auto host_h = to_fp16(host_f);
 
-    GpuTensor y;
-    brotensor::upload_fp16(host_h.data(), N, 1, y);
-    brotensor::clamp_gpu(y, -1.0f, 1.0f);
+    Tensor y = Tensor::from_host_fp16_on(Device::CUDA, host_h.data(), N, 1);
+    brotensor::clamp(y, -1.0f, 1.0f);
 
     std::vector<uint16_t> got_h(N);
-    brotensor::download_fp16(y, got_h.data());
-    brotensor::cuda_sync();
+    y.copy_to_host_fp16(got_h.data());
+    brotensor::sync_all();
 
     for (int i = 0; i < N; ++i) {
         float r = brotensor::fp16_bits_to_fp32(host_h[i]);
@@ -91,13 +91,12 @@ static void test_add_scalar_fp16() {
     for (int i = 0; i < N; ++i) host_f[i] = static_cast<float>(i) * 0.1f;
     auto host_h = to_fp16(host_f);
 
-    GpuTensor y;
-    brotensor::upload_fp16(host_h.data(), N, 1, y);
-    brotensor::add_scalar_inplace_gpu(y, 3.5f);
+    Tensor y = Tensor::from_host_fp16_on(Device::CUDA, host_h.data(), N, 1);
+    brotensor::add_scalar_inplace(y, 3.5f);
 
     std::vector<uint16_t> got_h(N);
-    brotensor::download_fp16(y, got_h.data());
-    brotensor::cuda_sync();
+    y.copy_to_host_fp16(got_h.data());
+    brotensor::sync_all();
 
     for (int i = 0; i < N; ++i) {
         const float r = host_f[i] + 3.5f;
@@ -112,29 +111,27 @@ static void test_embedding_fp16() {
     std::vector<float> table_f(V * D);
     for (int i = 0; i < V * D; ++i) table_f[i] = 0.01f * static_cast<float>(i);
     auto table_h = to_fp16(table_f);
-    GpuTensor table;
-    brotensor::upload_fp16(table_h.data(), V, D, table);
+    Tensor table = Tensor::from_host_fp16_on(Device::CUDA, table_h.data(), V, D);
 
     std::vector<int32_t> idx_host = {0, 3, 1, 6};
-    // Stage indices on device via a tiny upload using upload(..) into FP32 tensor
-    // for storage, then reinterpret. Since GpuTensor is float*, we treat a B*1
-    // FP32 buffer as B int32s by writing them with bit_cast at upload time.
-    GpuTensor idx_buf(B, 1, Dtype::FP32);
+    // Stage indices on device via a tiny upload using a B*1 FP32 tensor as
+    // storage, reinterpreting the float buffer as B int32s by writing them
+    // with memcpy at upload time.
     std::vector<float> idx_as_float(B);
     for (int i = 0; i < B; ++i) {
         int32_t v = idx_host[i];
         std::memcpy(&idx_as_float[i], &v, sizeof(int32_t));
     }
-    brotensor::upload(idx_as_float.data(), B, 1, idx_buf);
+    Tensor idx_buf = Tensor::from_host_on(Device::CUDA, idx_as_float.data(), B, 1);
 
-    GpuTensor out;
-    brotensor::embedding_lookup_forward_gpu(
+    Tensor out;
+    brotensor::embedding_lookup_forward(
         table, reinterpret_cast<const int32_t*>(idx_buf.data), B, out);
     CHECK(out.rows == B && out.cols == D && out.dtype == Dtype::FP16);
 
     std::vector<uint16_t> got_h(out.size());
-    brotensor::download_fp16(out, got_h.data());
-    brotensor::cuda_sync();
+    out.copy_to_host_fp16(got_h.data());
+    brotensor::sync_all();
 
     for (int b = 0; b < B; ++b) {
         for (int j = 0; j < D; ++j) {
@@ -145,7 +142,7 @@ static void test_embedding_fp16() {
     }
 }
 
-// Reference attention with explicit causal mask via build_causal_mask_row_gpu
+// Reference attention with explicit causal mask via build_causal_mask_row
 // per query — slow but reuses an already-tested path.
 static void test_flash_causal() {
     std::printf("  flash_attention causal\n");
@@ -157,37 +154,37 @@ static void test_flash_causal() {
     for (auto& v : K) v = dist(rng);
     for (auto& v : V) v = dist(rng);
     auto Qh = to_fp16(Q), Kh = to_fp16(K), Vh = to_fp16(V);
-    GpuTensor Qg, Kg, Vg;
-    brotensor::upload_fp16(Qh.data(), L, D, Qg);
-    brotensor::upload_fp16(Kh.data(), L, D, Kg);
-    brotensor::upload_fp16(Vh.data(), L, D, Vg);
+    Tensor Qg = Tensor::from_host_fp16_on(Device::CUDA, Qh.data(), L, D);
+    Tensor Kg = Tensor::from_host_fp16_on(Device::CUDA, Kh.data(), L, D);
+    Tensor Vg = Tensor::from_host_fp16_on(Device::CUDA, Vh.data(), L, D);
 
     // causal=true path.
-    GpuTensor O_causal;
-    brotensor::flash_attention_forward_gpu(Qg, Kg, Vg, nullptr, nh,
-                                           /*causal=*/true, O_causal);
+    Tensor O_causal;
+    brotensor::flash_attention_forward(Qg, Kg, Vg, nullptr, nh,
+                                       /*causal=*/true, O_causal);
     std::vector<uint16_t> got_h(O_causal.size());
-    brotensor::download_fp16(O_causal, got_h.data());
+    O_causal.copy_to_host_fp16(got_h.data());
 
     // Reference: same flash kernel but with a per-query mask, run one query at
     // a time by zeroing rows of K/V outside the causal window via a mask
     // tensor. The mask path is shared logic from the non-causal kernel.
-    GpuTensor O_ref(L, D, Dtype::FP16);
+    Tensor O_ref = Tensor::zeros_on(Device::CUDA, L, D, Dtype::FP16);
     for (int q = 0; q < L; ++q) {
-        GpuTensor Qrow(1, D, Dtype::FP16);
-        brotensor::copy_d2d_gpu(Qg, q * D, Qrow, 0, D);
+        Tensor Qrow = Tensor::zeros_on(Device::CUDA, 1, D, Dtype::FP16);
+        brotensor::copy_d2d(Qg, q * D, Qrow, 0, D);
 
-        GpuTensor mask;
-        brotensor::build_causal_mask_row_gpu(L, q, mask);
+        Tensor mask = Tensor::zeros_on(Device::CUDA, L, 1);
+        brotensor::build_causal_mask_row(L, q, mask);
 
-        GpuTensor Orow;
-        brotensor::flash_attention_forward_gpu(Qrow, Kg, Vg, mask.data, nh,
-                                               /*causal=*/false, Orow);
-        brotensor::copy_d2d_gpu(Orow, 0, O_ref, q * D, D);
+        Tensor Orow;
+        brotensor::flash_attention_forward(
+            Qrow, Kg, Vg, static_cast<const float*>(mask.data), nh,
+            /*causal=*/false, Orow);
+        brotensor::copy_d2d(Orow, 0, O_ref, q * D, D);
     }
     std::vector<uint16_t> ref_h(O_ref.size());
-    brotensor::download_fp16(O_ref, ref_h.data());
-    brotensor::cuda_sync();
+    O_ref.copy_to_host_fp16(ref_h.data());
+    brotensor::sync_all();
 
     float max_err = 0.0f;
     int bad = 0;
@@ -227,16 +224,15 @@ static void test_geglu_fp32() {
     for (auto& v : hx)  v = dist(rng);
     for (auto& v : hdy) v = dist(rng);
 
-    GpuTensor X, dY;
-    brotensor::upload(hx.data(),  B, two_d, X);
-    brotensor::upload(hdy.data(), B, D,    dY);
+    Tensor X  = Tensor::from_host_on(Device::CUDA, hx.data(),  B, two_d);
+    Tensor dY = Tensor::from_host_on(Device::CUDA, hdy.data(), B, D);
 
-    GpuTensor Y;
-    brotensor::geglu_forward_gpu(X, Y);
+    Tensor Y;
+    brotensor::geglu_forward(X, Y);
     CHECK(Y.rows == B && Y.cols == D && Y.dtype == Dtype::FP32);
     std::vector<float> gotY(B * D);
-    brotensor::download(Y, gotY.data());
-    brotensor::cuda_sync();
+    Y.copy_to_host(gotY.data());
+    brotensor::sync_all();
     for (int b = 0; b < B; ++b) {
         for (int d = 0; d < D; ++d) {
             const float a  = hx[b * two_d + d];
@@ -246,12 +242,12 @@ static void test_geglu_fp32() {
         }
     }
 
-    GpuTensor dX;
-    brotensor::geglu_backward_gpu(X, dY, dX);
+    Tensor dX;
+    brotensor::geglu_backward(X, dY, dX);
     CHECK(dX.rows == B && dX.cols == two_d && dX.dtype == Dtype::FP32);
     std::vector<float> gotdX(B * two_d);
-    brotensor::download(dX, gotdX.data());
-    brotensor::cuda_sync();
+    dX.copy_to_host(gotdX.data());
+    brotensor::sync_all();
     for (int b = 0; b < B; ++b) {
         for (int d = 0; d < D; ++d) {
             const float a   = hx[b * two_d + d];
@@ -285,16 +281,15 @@ static void test_geglu_exact_fp32() {
     for (auto& v : hx)  v = dist(rng);
     for (auto& v : hdy) v = dist(rng);
 
-    GpuTensor X, dY;
-    brotensor::upload(hx.data(),  B, two_d, X);
-    brotensor::upload(hdy.data(), B, D,    dY);
+    Tensor X  = Tensor::from_host_on(Device::CUDA, hx.data(),  B, two_d);
+    Tensor dY = Tensor::from_host_on(Device::CUDA, hdy.data(), B, D);
 
-    GpuTensor Y;
-    brotensor::geglu_exact_forward_gpu(X, Y);
+    Tensor Y;
+    brotensor::geglu_exact_forward(X, Y);
     CHECK(Y.rows == B && Y.cols == D && Y.dtype == Dtype::FP32);
     std::vector<float> gotY(B * D);
-    brotensor::download(Y, gotY.data());
-    brotensor::cuda_sync();
+    Y.copy_to_host(gotY.data());
+    brotensor::sync_all();
     float max_err_fwd = 0.0f;
     for (int b = 0; b < B; ++b) {
         for (int d = 0; d < D; ++d) {
@@ -308,12 +303,12 @@ static void test_geglu_exact_fp32() {
     }
     std::printf("    fwd max_err=%g\n", max_err_fwd);
 
-    GpuTensor dX;
-    brotensor::geglu_exact_backward_gpu(X, dY, dX);
+    Tensor dX;
+    brotensor::geglu_exact_backward(X, dY, dX);
     CHECK(dX.rows == B && dX.cols == two_d && dX.dtype == Dtype::FP32);
     std::vector<float> gotdX(B * two_d);
-    brotensor::download(dX, gotdX.data());
-    brotensor::cuda_sync();
+    dX.copy_to_host(gotdX.data());
+    brotensor::sync_all();
     float max_err_bwd = 0.0f;
     for (int b = 0; b < B; ++b) {
         for (int d = 0; d < D; ++d) {
@@ -347,16 +342,15 @@ static void test_geglu_exact_fp16() {
     auto hx_h  = to_fp16(hx_f);
     auto hdy_h = to_fp16(hdy_f);
 
-    GpuTensor X, dY;
-    brotensor::upload_fp16(hx_h.data(),  B, two_d, X);
-    brotensor::upload_fp16(hdy_h.data(), B, D,    dY);
+    Tensor X  = Tensor::from_host_fp16_on(Device::CUDA, hx_h.data(),  B, two_d);
+    Tensor dY = Tensor::from_host_fp16_on(Device::CUDA, hdy_h.data(), B, D);
 
-    GpuTensor Y;
-    brotensor::geglu_exact_forward_gpu(X, Y);
+    Tensor Y;
+    brotensor::geglu_exact_forward(X, Y);
     CHECK(Y.rows == B && Y.cols == D && Y.dtype == Dtype::FP16);
     std::vector<uint16_t> gotY_h(B * D);
-    brotensor::download_fp16(Y, gotY_h.data());
-    brotensor::cuda_sync();
+    Y.copy_to_host_fp16(gotY_h.data());
+    brotensor::sync_all();
     float max_err_fwd = 0.0f;
     for (int b = 0; b < B; ++b) {
         for (int d = 0; d < D; ++d) {
@@ -371,12 +365,12 @@ static void test_geglu_exact_fp16() {
     }
     std::printf("    fwd max_err=%g\n", max_err_fwd);
 
-    GpuTensor dX;
-    brotensor::geglu_exact_backward_gpu(X, dY, dX);
+    Tensor dX;
+    brotensor::geglu_exact_backward(X, dY, dX);
     CHECK(dX.rows == B && dX.cols == two_d && dX.dtype == Dtype::FP16);
     std::vector<uint16_t> got_h(B * two_d);
-    brotensor::download_fp16(dX, got_h.data());
-    brotensor::cuda_sync();
+    dX.copy_to_host_fp16(got_h.data());
+    brotensor::sync_all();
     float max_err_bwd = 0.0f;
     for (int b = 0; b < B; ++b) {
         for (int d = 0; d < D; ++d) {
@@ -410,16 +404,15 @@ static void test_geglu_fp16_bwd() {
     auto hx_h  = to_fp16(hx_f);
     auto hdy_h = to_fp16(hdy_f);
 
-    GpuTensor X, dY;
-    brotensor::upload_fp16(hx_h.data(),  B, two_d, X);
-    brotensor::upload_fp16(hdy_h.data(), B, D,    dY);
+    Tensor X  = Tensor::from_host_fp16_on(Device::CUDA, hx_h.data(),  B, two_d);
+    Tensor dY = Tensor::from_host_fp16_on(Device::CUDA, hdy_h.data(), B, D);
 
-    GpuTensor dX;
-    brotensor::geglu_backward_gpu(X, dY, dX);
+    Tensor dX;
+    brotensor::geglu_backward(X, dY, dX);
     CHECK(dX.rows == B && dX.cols == two_d && dX.dtype == Dtype::FP16);
     std::vector<uint16_t> got_h(B * two_d);
-    brotensor::download_fp16(dX, got_h.data());
-    brotensor::cuda_sync();
+    dX.copy_to_host_fp16(got_h.data());
+    brotensor::sync_all();
 
     for (int b = 0; b < B; ++b) {
         for (int d = 0; d < D; ++d) {
@@ -437,11 +430,10 @@ static void test_geglu_fp16_bwd() {
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_diffusion_primitives\n");
 

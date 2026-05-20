@@ -1,17 +1,19 @@
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+// CUDA loss kernels. Phase 2G port — kernel bodies unchanged.
+
+#include "detail/cuda_check.h"
+
+#include <brotensor/tensor.h>
 
 #include <cuda_runtime.h>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
+
+using ::brotensor::Tensor;
 
 namespace {
 
 constexpr int LOSS_BLOCK = 256;
 
-// Block-reduce sum over a flat length-N buffer of (pred-target)^2.
-// Single-block launch — N ≤ a few thousand for our use cases. Threads stride
-// over the buffer.
 __global__ void mse_forward_kernel(const float* __restrict__ pred,
                                    const float* __restrict__ target,
                                    float* __restrict__ out_sum, int n) {
@@ -41,10 +43,6 @@ __global__ void mse_backward_kernel(const float* __restrict__ pred,
     }
 }
 
-// Fused softmax + cross-entropy. Single block, length-N vector.
-//   probs[i]   = softmax(logits)[i]   (0 on masked)
-//   dLogits[i] = probs[i] - target[i] (0 on masked)
-//   loss       = -sum_{valid i} target[i] * log(max(probs[i], 1e-12))
 __global__ void softmax_xent_fused_kernel(const float* __restrict__ logits,
                                           const float* __restrict__ target,
                                           const float* __restrict__ mask,
@@ -55,7 +53,6 @@ __global__ void softmax_xent_fused_kernel(const float* __restrict__ logits,
     __shared__ float sdata[LOSS_BLOCK];
     const int tid = threadIdx.x;
 
-    // Phase 1: max over valid.
     float local_max = -1e30f;
     for (int i = tid; i < n; i += blockDim.x) {
         if (mask && mask[i] < 0.5f) continue;
@@ -74,7 +71,6 @@ __global__ void softmax_xent_fused_kernel(const float* __restrict__ logits,
     }
     const float m = sdata[0];
 
-    // Phase 2: exp(x - m) into probs (zero on masked), accumulate sum.
     float local_sum = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
         if (mask && mask[i] < 0.5f) {
@@ -94,7 +90,6 @@ __global__ void softmax_xent_fused_kernel(const float* __restrict__ logits,
     const float sum = sdata[0];
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
 
-    // Phase 3: normalise probs, compute loss + dLogits.
     float local_loss = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
         if (mask && mask[i] < 0.5f) {
@@ -126,9 +121,6 @@ inline int grid_for(int n, int block) {
     return b;
 }
 
-// Per-sample MSE matching CPU `mse_scalar` semantics:
-//   loss[b]  = 0.5 * (pred[b] - target[b])^2
-//   dPred[b] = pred[b] - target[b]
 __global__ void mse_per_sample_kernel(const float* __restrict__ pred,
                                       const float* __restrict__ target,
                                       float* __restrict__ dPred,
@@ -141,10 +133,6 @@ __global__ void mse_per_sample_kernel(const float* __restrict__ pred,
     }
 }
 
-// One block per (sample, head) tile. Reuses the single-sample fused softmax-
-// xent logic over a per-(b, h) slice. loss_per_sample[b] is overwritten on
-// h==0 and atomicAdd'd thereafter so the result is the per-sample sum across
-// all heads (caller mean-reduces).
 __global__ void softmax_xent_fused_batched_kernel(
         const float* __restrict__ logits,
         const float* __restrict__ target,
@@ -173,7 +161,6 @@ __global__ void softmax_xent_fused_batched_kernel(
 
     const int tid = threadIdx.x;
 
-    // Phase 1: max over valid.
     float local_max = -1e30f;
     for (int i = tid; i < len; i += blockDim.x) {
         if (mask_row && mask_row[i] == 0.0f) continue;
@@ -192,7 +179,6 @@ __global__ void softmax_xent_fused_batched_kernel(
     }
     const float m = sdata[0];
 
-    // Phase 2: exp(x - m); store partial in probs_row, accumulate sum.
     float local_sum = 0.0f;
     for (int i = tid; i < len; i += blockDim.x) {
         if (mask_row && mask_row[i] == 0.0f) {
@@ -212,7 +198,6 @@ __global__ void softmax_xent_fused_batched_kernel(
     const float sum = sdata[0];
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
 
-    // Phase 3: normalise + loss + dLogits.
     float local_loss = 0.0f;
     for (int i = tid; i < len; i += blockDim.x) {
         if (mask_row && mask_row[i] == 0.0f) {
@@ -239,12 +224,15 @@ __global__ void softmax_xent_fused_batched_kernel(
 
 } // namespace
 
-float mse_vec_forward_gpu(const GpuTensor& pred, const GpuTensor& target) {
+float mse_vec_forward(const Tensor& pred, const Tensor& target) {
     const int n = pred.size();
     if (n == 0) return 0.0f;
     float* d_sum = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(&d_sum, sizeof(float)));
-    mse_forward_kernel<<<1, LOSS_BLOCK>>>(pred.data, target.data, d_sum, n);
+    mse_forward_kernel<<<1, LOSS_BLOCK>>>(
+        static_cast<const float*>(pred.data),
+        static_cast<const float*>(target.data),
+        d_sum, n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
     float h_sum = 0.0f;
     BROTENSOR_CUDA_CHECK(cudaMemcpy(&h_sum, d_sum, sizeof(float),
@@ -253,8 +241,8 @@ float mse_vec_forward_gpu(const GpuTensor& pred, const GpuTensor& target) {
     return h_sum / static_cast<float>(n);
 }
 
-void mse_vec_backward_gpu(const GpuTensor& pred, const GpuTensor& target,
-                          GpuTensor& dPred) {
+void mse_vec_backward(const Tensor& pred, const Tensor& target,
+                      Tensor& dPred) {
     const int n = pred.size();
     if (dPred.rows != pred.rows || dPred.cols != pred.cols) {
         dPred.resize(pred.rows, pred.cols);
@@ -262,12 +250,14 @@ void mse_vec_backward_gpu(const GpuTensor& pred, const GpuTensor& target,
     if (n == 0) return;
     const float scale = 2.0f / static_cast<float>(n);
     mse_backward_kernel<<<grid_for(n, LOSS_BLOCK), LOSS_BLOCK>>>(
-        pred.data, target.data, dPred.data, n, scale);
+        static_cast<const float*>(pred.data),
+        static_cast<const float*>(target.data),
+        static_cast<float*>(dPred.data), n, scale);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void mse_vec_per_sample_gpu(const GpuTensor& pred, const GpuTensor& target,
-                            GpuTensor& dPred, GpuTensor& loss_per_sample) {
+void mse_vec_per_sample(const Tensor& pred, const Tensor& target,
+                        Tensor& dPred, Tensor& loss_per_sample) {
     const int B = pred.size();
     if (dPred.rows != pred.rows || dPred.cols != pred.cols)
         dPred.resize(pred.rows, pred.cols);
@@ -275,18 +265,21 @@ void mse_vec_per_sample_gpu(const GpuTensor& pred, const GpuTensor& target,
         loss_per_sample.resize(B, 1);
     if (B == 0) return;
     mse_per_sample_kernel<<<grid_for(B, LOSS_BLOCK), LOSS_BLOCK>>>(
-        pred.data, target.data, dPred.data, loss_per_sample.data, B);
+        static_cast<const float*>(pred.data),
+        static_cast<const float*>(target.data),
+        static_cast<float*>(dPred.data),
+        static_cast<float*>(loss_per_sample.data), B);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void softmax_xent_fused_batched_gpu(const GpuTensor& logits_BL,
-                                    const GpuTensor& target_BL,
-                                    const float* d_mask_BL,
-                                    const int* d_head_offsets,
-                                    int n_heads,
-                                    GpuTensor& probs_BL,
-                                    GpuTensor& dLogits_BL,
-                                    GpuTensor& loss_per_sample) {
+void softmax_xent_fused_batched(const Tensor& logits_BL,
+                                const Tensor& target_BL,
+                                const float* d_mask_BL,
+                                const int* d_head_offsets,
+                                int n_heads,
+                                Tensor& probs_BL,
+                                Tensor& dLogits_BL,
+                                Tensor& loss_per_sample) {
     const int B     = logits_BL.rows;
     const int n_act = logits_BL.cols;
     if (probs_BL.rows != B || probs_BL.cols != n_act)
@@ -297,21 +290,24 @@ void softmax_xent_fused_batched_gpu(const GpuTensor& logits_BL,
         loss_per_sample.resize(B, 1);
     if (B == 0 || n_act == 0 || n_heads <= 0) return;
 
-    // Zero loss accumulator before per-head atomicAdds.
     BROTENSOR_CUDA_CHECK(cudaMemsetAsync(loss_per_sample.data, 0,
                                    sizeof(float) * B));
 
     dim3 grid(n_heads, B);
     softmax_xent_fused_batched_kernel<<<grid, LOSS_BLOCK>>>(
-        logits_BL.data, target_BL.data, d_mask_BL, d_head_offsets,
-        probs_BL.data, dLogits_BL.data, loss_per_sample.data,
+        static_cast<const float*>(logits_BL.data),
+        static_cast<const float*>(target_BL.data),
+        d_mask_BL, d_head_offsets,
+        static_cast<float*>(probs_BL.data),
+        static_cast<float*>(dLogits_BL.data),
+        static_cast<float*>(loss_per_sample.data),
         B, n_heads, n_act);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-float softmax_xent_fused_gpu(const GpuTensor& logits, const GpuTensor& target,
-                             const float* d_mask,
-                             GpuTensor& probs, GpuTensor& dLogits) {
+float softmax_xent_fused(const Tensor& logits, const Tensor& target,
+                         const float* d_mask,
+                         Tensor& probs, Tensor& dLogits) {
     const int n = logits.size();
     if (probs.rows != logits.rows || probs.cols != logits.cols) {
         probs.resize(logits.rows, logits.cols);
@@ -324,8 +320,12 @@ float softmax_xent_fused_gpu(const GpuTensor& logits, const GpuTensor& target,
     float* d_loss = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(&d_loss, sizeof(float)));
     softmax_xent_fused_kernel<<<1, LOSS_BLOCK>>>(
-        logits.data, target.data, d_mask,
-        probs.data, dLogits.data, d_loss, n);
+        static_cast<const float*>(logits.data),
+        static_cast<const float*>(target.data),
+        d_mask,
+        static_cast<float*>(probs.data),
+        static_cast<float*>(dLogits.data),
+        d_loss, n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     float h_loss = 0.0f;
@@ -335,4 +335,4 @@ float softmax_xent_fused_gpu(const GpuTensor& logits, const GpuTensor& target,
     return h_loss;
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::cuda

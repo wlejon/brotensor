@@ -1,5 +1,5 @@
-// W8A16 parity: matmul_int8w_fp16_gpu vs matmul_gpu(dequant_as_fp16, X), and
-// conv2d_int8w_fp16_forward_gpu vs conv2d_forward_gpu(X, dequant_as_fp16).
+// W8A16 parity: matmul_int8w_fp16 vs matmul(dequant_as_fp16, X), and
+// conv2d_int8w_fp16_forward vs conv2d_forward(X, dequant_as_fp16).
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -9,9 +9,9 @@
 #include <cuda_runtime.h>
 #else
 #include <cstring>
-// On Metal the GpuTensor.data points to a host-shared MTLBuffer, so a plain
-// memcpy is equivalent to a H2D copy. Provide a tiny shim so the test body
-// stays backend-agnostic.
+// On Metal a device Tensor's .data points to a host-shared MTLBuffer, so a
+// plain memcpy is equivalent to a H2D copy. Provide a tiny shim so the test
+// body stays backend-agnostic.
 static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
     std::memcpy(dst, src, n);
 }
@@ -24,8 +24,9 @@ static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Device;
 using brotensor::Dtype;
+using brotensor::Tensor;
 
 static int g_failures = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++g_failures; } } while(0)
@@ -61,24 +62,24 @@ static void test_matmul_int8w() {
         }
     }
 
-    GpuTensor W_deq_g, X_g, Y_ref_g;
-    brotensor::upload_fp16(Wdeq.data(), OUT, IN, W_deq_g);
-    brotensor::upload_fp16(Xh.data(),   IN,  B, X_g);
-    brotensor::matmul_gpu(W_deq_g, X_g, Y_ref_g);
+    Tensor Y_ref_g;
+    Tensor W_deq_g = Tensor::from_host_fp16_on(Device::CUDA, Wdeq.data(), OUT, IN);
+    Tensor X_g     = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),   IN,  B);
+    brotensor::matmul(W_deq_g, X_g, Y_ref_g);
     std::vector<uint16_t> ref(OUT * B);
-    brotensor::download_fp16(Y_ref_g, ref.data());
+    Y_ref_g.copy_to_host_fp16(ref.data());
 
     // W8A16 path.
-    GpuTensor W_int8_g(OUT, IN, Dtype::INT8);
-    GpuTensor S_g, Y_g;
+    Tensor W_int8_g = Tensor::empty_on(Device::CUDA, OUT, IN, Dtype::INT8);
+    Tensor Y_g;
     cudaMemcpy(W_int8_g.data, Wq.data(), OUT * IN * sizeof(int8_t),
                cudaMemcpyHostToDevice);
-    brotensor::upload(scales.data(), OUT, 1, S_g);
-    brotensor::matmul_int8w_fp16_gpu(W_int8_g, S_g, X_g, Y_g);
+    Tensor S_g = Tensor::from_host_on(Device::CUDA, scales.data(), OUT, 1);
+    brotensor::matmul_int8w_fp16(W_int8_g, S_g, X_g, Y_g);
     CHECK(Y_g.dtype == Dtype::FP16 && Y_g.rows == OUT && Y_g.cols == B);
     std::vector<uint16_t> got(OUT * B);
-    brotensor::download_fp16(Y_g, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    Y_g.copy_to_host_fp16(got.data());
 
     float max_err = 0.0f;
     int bad = 0;
@@ -122,30 +123,30 @@ static void test_conv2d_int8w() {
         }
     }
 
-    GpuTensor Xg, Wdeq_g, Y_ref_g;
-    brotensor::upload_fp16(Xh.data(),   N, C_in * H * W, Xg);
-    brotensor::upload_fp16(Wdeq.data(), C_out, win,      Wdeq_g);
-    brotensor::conv2d_forward_gpu(Xg, Wdeq_g, nullptr,
-                                  N, C_in, H, W, C_out, kH, kW,
-                                  stride, stride, pad, pad, dil, dil,
-                                  groups, Y_ref_g);
+    Tensor Y_ref_g;
+    Tensor Xg     = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),   N, C_in * H * W);
+    Tensor Wdeq_g = Tensor::from_host_fp16_on(Device::CUDA, Wdeq.data(), C_out, win);
+    brotensor::conv2d_forward(Xg, Wdeq_g, nullptr,
+                              N, C_in, H, W, C_out, kH, kW,
+                              stride, stride, pad, pad, dil, dil,
+                              groups, Y_ref_g);
     std::vector<uint16_t> ref(Y_ref_g.size());
-    brotensor::download_fp16(Y_ref_g, ref.data());
+    Y_ref_g.copy_to_host_fp16(ref.data());
 
     // W8A16 path.
-    GpuTensor W_int8_g(C_out, win, Dtype::INT8);
-    GpuTensor S_g, Y_g;
+    Tensor W_int8_g = Tensor::empty_on(Device::CUDA, C_out, win, Dtype::INT8);
+    Tensor Y_g;
     cudaMemcpy(W_int8_g.data, Wq.data(), C_out * win * sizeof(int8_t),
                cudaMemcpyHostToDevice);
-    brotensor::upload(scales.data(), C_out, 1, S_g);
-    brotensor::conv2d_int8w_fp16_forward_gpu(Xg, W_int8_g, S_g, nullptr,
-                                             N, C_in, H, W, C_out, kH, kW,
-                                             stride, stride, pad, pad, dil, dil,
-                                             groups, Y_g);
+    Tensor S_g = Tensor::from_host_on(Device::CUDA, scales.data(), C_out, 1);
+    brotensor::conv2d_int8w_fp16_forward(Xg, W_int8_g, S_g, nullptr,
+                                         N, C_in, H, W, C_out, kH, kW,
+                                         stride, stride, pad, pad, dil, dil,
+                                         groups, Y_g);
     CHECK(Y_g.size() == Y_ref_g.size() && Y_g.dtype == Dtype::FP16);
     std::vector<uint16_t> got(Y_g.size());
-    brotensor::download_fp16(Y_g, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync_all();
+    Y_g.copy_to_host_fp16(got.data());
 
     float max_err = 0.0f;
     int bad = 0;
@@ -161,7 +162,11 @@ static void test_conv2d_int8w() {
 }
 
 int main() {
-    brotensor::cuda_init();
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
+    }
     std::printf("test_int8_quant\n");
     test_matmul_int8w();
     test_conv2d_int8w();

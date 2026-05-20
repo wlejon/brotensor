@@ -1,5 +1,5 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include "fp16_internal.cuh"
 
@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 namespace brotensor {
+namespace detail::cuda {
 
 namespace {
 
@@ -109,16 +110,20 @@ __global__ void linear_backward_db_kernel(const float* __restrict__ dY,
 
 } // anonymous namespace
 
-void linear_forward_gpu(const GpuTensor& W, const GpuTensor& b,
-                        const GpuTensor& x, GpuTensor& y) {
+void linear_forward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& b,
+                    const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
     if (y.rows != out_dim || y.cols != 1) y.resize(out_dim, 1);
     if (out_dim == 0) return;
 
     const int blocks = (out_dim + LF_BLOCK - 1) / LF_BLOCK;
-    linear_forward_kernel<<<blocks, LF_BLOCK>>>(W.data, b.data, x.data, y.data,
-                                                out_dim, in_dim);
+    linear_forward_kernel<<<blocks, LF_BLOCK>>>(
+        static_cast<const float*>(W.data),
+        static_cast<const float*>(b.data),
+        static_cast<const float*>(x.data),
+        static_cast<float*>(y.data),
+        out_dim, in_dim);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -140,19 +145,21 @@ __global__ void fp16_bias_add_kernel(__half* __restrict__ Y,
 }
 } // namespace
 
-void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
-                                     const GpuTensor& X_BD, GpuTensor& Y_BD) {
+void linear_forward_batched_fp16(const ::brotensor::Tensor& W,
+                                 const ::brotensor::Tensor* bias,
+                                 const ::brotensor::Tensor& X_BD,
+                                 ::brotensor::Tensor& Y_BD) {
     if (W.dtype != Dtype::FP16 || X_BD.dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_fp16_gpu: W and X must be FP16");
+        throw std::runtime_error("linear_forward_batched_fp16: W and X must be FP16");
     }
     if (bias && bias->dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_fp16_gpu: bias must be FP16");
+        throw std::runtime_error("linear_forward_batched_fp16: bias must be FP16");
     }
     const int B       = X_BD.rows;
     const int in_dim  = X_BD.cols;
     const int out_dim = W.rows;
     if (W.cols != in_dim) {
-        throw std::runtime_error("linear_forward_batched_fp16_gpu: shape mismatch (W.cols != X.cols)");
+        throw std::runtime_error("linear_forward_batched_fp16: shape mismatch (W.cols != X.cols)");
     }
     if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
         Y_BD.resize(B, out_dim, Dtype::FP16);
@@ -160,9 +167,9 @@ void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
     if (B == 0 || out_dim == 0) return;
 
     fp16_internal::launch_matmul_ABT(
-        reinterpret_cast<const __half*>(X_BD.data_fp16()),
-        reinterpret_cast<const __half*>(W.data_fp16()),
-        reinterpret_cast<__half*>(Y_BD.data_fp16()),
+        static_cast<const __half*>(X_BD.data),
+        static_cast<const __half*>(W.data),
+        static_cast<__half*>(Y_BD.data),
         B, out_dim, in_dim);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
@@ -170,16 +177,17 @@ void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
         const int total = B * out_dim;
         const int blocks = (total + 255) / 256;
         fp16_bias_add_kernel<<<blocks, 256>>>(
-            reinterpret_cast<__half*>(Y_BD.data_fp16()),
-            reinterpret_cast<const __half*>(bias->data_fp16()),
+            static_cast<__half*>(Y_BD.data),
+            static_cast<const __half*>(bias->data),
             B, out_dim);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 }
 
-void linear_backward_gpu(const GpuTensor& W, const GpuTensor& x,
-                         const GpuTensor& dY,
-                         GpuTensor& dX, GpuTensor& dW, GpuTensor& dB) {
+void linear_backward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& x,
+                     const ::brotensor::Tensor& dY,
+                     ::brotensor::Tensor& dX, ::brotensor::Tensor& dW,
+                     ::brotensor::Tensor& dB) {
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
 
@@ -189,7 +197,10 @@ void linear_backward_gpu(const GpuTensor& W, const GpuTensor& x,
     if (in_dim > 0) {
         const int blocks = (in_dim + LB_DX_BLOCK - 1) / LB_DX_BLOCK;
         linear_backward_dx_kernel<<<blocks, LB_DX_BLOCK>>>(
-            W.data, dY.data, dX.data, out_dim, in_dim);
+            static_cast<const float*>(W.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data),
+            out_dim, in_dim);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
@@ -198,16 +209,23 @@ void linear_backward_gpu(const GpuTensor& W, const GpuTensor& x,
         dim3 block(16, 16);
         dim3 grid((in_dim + 15) / 16, (out_dim + 15) / 16);
         linear_backward_dw_kernel<<<grid, block>>>(
-            dY.data, x.data, dW.data, out_dim, in_dim);
+            static_cast<const float*>(dY.data),
+            static_cast<const float*>(x.data),
+            static_cast<float*>(dW.data),
+            out_dim, in_dim);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // dB += dY
     if (out_dim > 0) {
         const int blocks = (out_dim + 255) / 256;
-        linear_backward_db_kernel<<<blocks, 256>>>(dY.data, dB.data, out_dim);
+        linear_backward_db_kernel<<<blocks, 256>>>(
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dB.data),
+            out_dim);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

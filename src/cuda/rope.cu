@@ -1,8 +1,8 @@
 // Rotary position embedding (RoPE) forward + backward.
 // Per-head: rotate pairs (x_{2i}, x_{2i+1}) by angle theta = pos * base^{-2i/hd}.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 namespace brotensor {
+namespace detail::cuda {
 
 namespace {
 
@@ -128,16 +129,16 @@ inline int grid_for(int n) { return (n + RP_BLOCK - 1) / RP_BLOCK; }
 
 } // namespace
 
-void rope_forward_gpu(const GpuTensor& X, int head_dim, int num_heads,
-                     int seq_offset, float theta_base, GpuTensor& Y) {
+void rope_forward(const ::brotensor::Tensor& X, int head_dim, int num_heads,
+                  int seq_offset, float theta_base, ::brotensor::Tensor& Y) {
     if (head_dim <= 0 || (head_dim & 1) != 0) {
-        throw std::runtime_error("rope_forward_gpu: head_dim must be a positive even integer");
+        throw std::runtime_error("rope_forward: head_dim must be a positive even integer");
     }
     if (num_heads <= 0) {
-        throw std::runtime_error("rope_forward_gpu: num_heads must be positive");
+        throw std::runtime_error("rope_forward: num_heads must be positive");
     }
     if (X.cols != num_heads * head_dim) {
-        throw std::runtime_error("rope_forward_gpu: X.cols != num_heads * head_dim");
+        throw std::runtime_error("rope_forward: X.cols != num_heads * head_dim");
     }
     const int L = X.rows;
     if (Y.rows != L || Y.cols != X.cols || Y.dtype != X.dtype) {
@@ -148,26 +149,28 @@ void rope_forward_gpu(const GpuTensor& X, int head_dim, int num_heads,
     const int blocks = grid_for(total);
     if (X.dtype == Dtype::FP16) {
         rope_forward_fp16_kernel<<<blocks, RP_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             L, num_heads, head_dim, seq_offset, theta_base);
     } else {
         rope_forward_fp32_kernel<<<blocks, RP_BLOCK>>>(
-            X.data, Y.data, L, num_heads, head_dim, seq_offset, theta_base);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data),
+            L, num_heads, head_dim, seq_offset, theta_base);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void rope_backward_gpu(const GpuTensor& dY, int head_dim, int num_heads,
-                      int seq_offset, float theta_base, GpuTensor& dX) {
+void rope_backward(const ::brotensor::Tensor& dY, int head_dim, int num_heads,
+                   int seq_offset, float theta_base, ::brotensor::Tensor& dX) {
     if (head_dim <= 0 || (head_dim & 1) != 0) {
-        throw std::runtime_error("rope_backward_gpu: head_dim must be a positive even integer");
+        throw std::runtime_error("rope_backward: head_dim must be a positive even integer");
     }
     if (num_heads <= 0) {
-        throw std::runtime_error("rope_backward_gpu: num_heads must be positive");
+        throw std::runtime_error("rope_backward: num_heads must be positive");
     }
     if (dY.cols != num_heads * head_dim) {
-        throw std::runtime_error("rope_backward_gpu: dY.cols != num_heads * head_dim");
+        throw std::runtime_error("rope_backward: dY.cols != num_heads * head_dim");
     }
     const int L = dY.rows;
     if (dX.rows != L || dX.cols != dY.cols || dX.dtype != dY.dtype) {
@@ -178,14 +181,17 @@ void rope_backward_gpu(const GpuTensor& dY, int head_dim, int num_heads,
     const int blocks = grid_for(total);
     if (dY.dtype == Dtype::FP16) {
         rope_backward_fp16_kernel<<<blocks, RP_BLOCK>>>(
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data),
             L, num_heads, head_dim, seq_offset, theta_base);
     } else {
         rope_backward_fp32_kernel<<<blocks, RP_BLOCK>>>(
-            dY.data, dX.data, L, num_heads, head_dim, seq_offset, theta_base);
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data),
+            L, num_heads, head_dim, seq_offset, theta_base);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

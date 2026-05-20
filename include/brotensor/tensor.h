@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <vector>
 
 namespace brotensor {
@@ -11,8 +10,8 @@ namespace brotensor {
 //
 // brotensor's tensor type carries a dtype tag so ops can pick the right
 // kernel without a parallel tensor type per precision. Storage stays as a
-// single raw device pointer (`data`); FP16 ops reinterpret it as half* on
-// the device side.
+// single raw `void*` (`data`); typed access is via the host_f32 / host_fp16
+// accessors. GPU backends reinterpret the same allocation for FP16 / INT8.
 //
 // Element sizes are fixed: FP32 = 4 bytes, FP16 = 2 bytes, INT8 = 1 byte.
 // Allocation, clone, zero, and resize all use dtype-aware byte counts.
@@ -24,151 +23,136 @@ enum class Dtype : int {
     INT8 = 2,
 };
 
-inline int dtype_size_bytes(Dtype dt) {
-    switch (dt) {
-        case Dtype::FP32: return 4;
-        case Dtype::FP16: return 2;
-        case Dtype::INT8: return 1;
-    }
-    return 4;
-}
+int dtype_size_bytes(Dtype);
 
-// ─── Tensor (host) ─────────────────────────────────────────────────────────
+// ─── Device ────────────────────────────────────────────────────────────────
 //
-// Plain owned float buffer + shape on the CPU. No broadcasting, no views, no
-// strides beyond row-major. Rank is fixed at 2 (matrix) or 1 (vector) —
-// anything higher would imply we want a real tensor framework, which we
-// don't. Batch dims go into dim 0 of a 2D tensor.
-//
-// Shape conventions:
-//   Vector: shape = (N)        ; data[i]
-//   Matrix: shape = (rows,cols); data[r*cols + c]
-//
-// Memory is std::vector<float>. CPU ops live in <brotensor/ops_cpu.h> and
-// take Tensor by reference; GPU ops live in <brotensor/ops.h> and take
-// GpuTensor.
+// Runtime backend tag carried on every Tensor. CPU is always available;
+// CUDA / Metal are registered at runtime by `brotensor::init()` if the
+// corresponding backend was compiled into this binary. Multi-GPU within a
+// single backend is deliberately out of scope for now (no Device::CUDA(idx)).
+enum class Device { CPU, CUDA, Metal };
 
+const char* device_name(Device);
+
+// ─── Tensor ────────────────────────────────────────────────────────────────
+//
+// Unified tensor: a row-major (rows, cols) buffer tagged with both a Dtype
+// and a Device. Storage is a single opaque `void*` allocated through the
+// backend's alloc vtable (see detail/dispatch.h); the destructor frees via
+// the same vtable. Rank is fixed at 2 (matrix) or 1 (vector — cols == 1).
+//
+// Move-only — copying device buffers must be explicit (clone()). The CPU
+// backend allocates plain host memory through the same vtable interface so
+// the storage layout is uniform across devices; for CPU tensors the typed
+// host accessors (host_f32, host_fp16, at, to_host_vector) give ergonomic
+// access without a device sync.
 struct Tensor {
-    std::vector<float> data;
-    int rows = 0;   // rank-1 tensors: rows = N, cols = 1
-    int cols = 0;
+    void*  data   = nullptr;
+    int    rows   = 0;     // rank-1 tensors: rows = N, cols = 1
+    int    cols   = 0;
+    Dtype  dtype  = Dtype::FP32;
+    Device device = Device::CPU;
 
     Tensor() = default;
-    Tensor(int r, int c) : data(static_cast<size_t>(r) * c, 0.0f), rows(r), cols(c) {}
-
-    static Tensor vec(int n) { return Tensor(n, 1); }
-    static Tensor mat(int r, int c) { return Tensor(r, c); }
-
-    int size() const { return rows * cols; }
-    float*       ptr()       { return data.data(); }
-    const float* ptr() const { return data.data(); }
-
-    float&       operator()(int r, int c)       { return data[static_cast<size_t>(r) * cols + c]; }
-    float        operator()(int r, int c) const { return data[static_cast<size_t>(r) * cols + c]; }
-    float&       operator[](int i)       { return data[i]; }
-    float        operator[](int i) const { return data[i]; }
-
-    void zero() { std::memset(data.data(), 0, data.size() * sizeof(float)); }
-    void resize(int r, int c) { rows = r; cols = c; data.assign(static_cast<size_t>(r) * c, 0.0f); }
-};
-
-// ─── GpuTensor ─────────────────────────────────────────────────────────────
-//
-// Device-resident tensor with row-major (rows, cols) shape. Storage is a raw
-// device pointer (cudaMalloc on CUDA / MTLBuffer contents on Metal), freed
-// by the matching device free on destruction when owning. Move-only —
-// copying device buffers must be explicit (clone()).
-//
-// `data` is typed as `float*` for ABI continuity with existing FP32 ops; for
-// FP16 it aliases the same allocation and ops reinterpret it as half* on the
-// device side. Use `data_fp16()` for the typed FP16 pointer on the host
-// side. This header is safe to include from non-CUDA TUs.
-
-struct GpuTensor {
-    float* data = nullptr;
-    int rows = 0;
-    int cols = 0;
-    Dtype dtype = Dtype::FP32;
-
-    GpuTensor() = default;
-    explicit GpuTensor(int r, int c, Dtype dt = Dtype::FP32);
-    ~GpuTensor();
+    ~Tensor();
 
     // Move-only.
-    GpuTensor(const GpuTensor&) = delete;
-    GpuTensor& operator=(const GpuTensor&) = delete;
-    GpuTensor(GpuTensor&& other) noexcept;
-    GpuTensor& operator=(GpuTensor&& other) noexcept;
+    Tensor(const Tensor&) = delete;
+    Tensor& operator=(const Tensor&) = delete;
+    Tensor(Tensor&&) noexcept;
+    Tensor& operator=(Tensor&&) noexcept;
 
-    int  size() const { return rows * cols; }
-    std::size_t bytes() const {
-        return static_cast<std::size_t>(size()) *
-               static_cast<std::size_t>(dtype_size_bytes(dtype));
-    }
-    void zero();                                // memset to 0 over bytes()
-    // Reallocates if (r, c, dt) differs from the current shape/dtype; leaves
-    // contents undefined (caller should zero() if needed). Existing storage
-    // is freed. dt defaults to FP32 — pass explicitly for FP16 tensors.
+    // ─── Factories ─────────────────────────────────────────────────────────
+    //
+    // zeros / empty allocate on the current default device (see runtime.h —
+    // controlled by set_default_device() / DeviceScope, or the
+    // BROTENSOR_DEFAULT_DEVICE env var). `zeros` memset-zeros the buffer
+    // via the backend's memset_zero hook; `empty` leaves contents undefined.
+    static Tensor zeros(int r, int c, Dtype dt = Dtype::FP32);
+    static Tensor empty(int r, int c, Dtype dt = Dtype::FP32);
+
+    // Explicit-device variants — bypass the thread-local default. Useful for
+    // tests, multi-device pipelines, and any code that wants to pin storage
+    // to a specific backend regardless of caller policy.
+    static Tensor zeros_on(Device, int r, int c, Dtype dt = Dtype::FP32);
+    static Tensor empty_on(Device, int r, int c, Dtype dt = Dtype::FP32);
+
+    // Host bootstrap. Allocates on the current default device and uploads
+    // `r * c` floats (FP32) or uint16_t bit patterns (FP16) from `src`.
+    // For non-CPU defaults this performs a host→device copy via the
+    // backend's memcpy_h2d hook; for the CPU default it's a plain memcpy.
+    static Tensor from_host(const float* src, int r, int c);
+    static Tensor from_host_fp16(const uint16_t* src, int r, int c);
+
+    // Variant that pins to a specific device, bypassing the default.
+    static Tensor from_host_on(Device, const float* src, int r, int c);
+    static Tensor from_host_fp16_on(Device, const uint16_t* src, int r, int c);
+
+    // Non-owning view over an existing backend-resident pointer. The
+    // returned tensor's destructor will NOT free `data`. Caller is
+    // responsible for lifetime. Mirrors the legacy GpuTensor::view pattern.
+    static Tensor view(Device, void* data, int rows, int cols, Dtype = Dtype::FP32);
+
+    // ─── Migration ─────────────────────────────────────────────────────────
+
+    // Returns a fresh tensor on `target` with the same shape/dtype/contents
+    // as `*this`. No-op clone() if already on the target device. The source
+    // tensor is unchanged. Uses the backend pair's memcpy_h2d / memcpy_d2h /
+    // memcpy_d2d hooks as appropriate.
+    Tensor to(Device target) const;
+
+    // Device-preserving deep copy.
+    Tensor clone() const;
+
+    // ─── Mutators ──────────────────────────────────────────────────────────
+
+    // memset-zero the buffer over bytes(). Dispatches through the backend's
+    // memset_zero hook.
+    void zero();
+
+    // Reallocates if (r, c, dt) differs from current shape/dtype; leaves
+    // contents undefined (call zero() afterwards if needed). Device is
+    // preserved. Existing storage is freed.
     void resize(int r, int c, Dtype dt = Dtype::FP32);
 
-    // Device→device copy producing an owning duplicate (same dtype).
-    GpuTensor clone() const;
+    // ─── Accessors ─────────────────────────────────────────────────────────
 
-    // Typed FP16 pointer alias for `data`. Caller is responsible for using
-    // this only on FP16 tensors.
-    uint16_t*       data_fp16()       { return reinterpret_cast<uint16_t*>(data); }
-    const uint16_t* data_fp16() const { return reinterpret_cast<const uint16_t*>(data); }
+    int          size()  const { return rows * cols; }
+    std::size_t  bytes() const;
+    bool         is_host() const { return device == Device::CPU; }
+    bool         empty() const   { return data == nullptr || size() == 0; }
 
-    // Non-owning view over an existing device pointer. The returned tensor's
-    // destructor will NOT free `data`. Caller is responsible for lifetime.
-    static GpuTensor view(float* data, int rows, int cols);
-    static GpuTensor view_fp16(uint16_t* data, int rows, int cols);
+    // Host-side typed accessors. Throw std::runtime_error if device != CPU.
+    // `host_f32` additionally throws if dtype != FP32; `host_fp16` if
+    // dtype != FP16. `host_raw` is dtype-agnostic.
+    float*       host_f32_mut();
+    const float* host_f32() const;
+    uint16_t*       host_fp16_mut();
+    const uint16_t* host_fp16() const;
+    void*        host_raw_mut();
+    const void*  host_raw() const;
+
+    // Element access helpers (host-only, FP32-only — convenience for tests).
+    // Throw if device != CPU or dtype != FP32 or indices out of range.
+    float& at(int r, int c);
+    float  at(int r, int c) const;
+
+    // ─── Host roundtrip helpers ────────────────────────────────────────────
+    //
+    // `to_host_vector*` downloads (if on a GPU backend) and returns a
+    // std::vector containing the buffer's contents in the matching scalar
+    // type. The copy_to_host variants write into a caller-supplied buffer
+    // of at least size() elements.
+    std::vector<float>    to_host_vector() const;          // FP32 only
+    std::vector<uint16_t> to_host_vector_fp16() const;     // FP16 only
+    void copy_to_host(float* dst) const;                   // FP32 only
+    void copy_to_host_fp16(uint16_t* dst) const;           // FP16 only
 
 private:
     bool owns_ = false;
     void release_();
 };
-
-// ─── Host ↔ device transfers ───────────────────────────────────────────────
-//
-// brotensor doesn't own a host-tensor type. Callers pass raw buffers and the
-// source shape; for upload, `dst` is resized to match (rows, cols) and the
-// destination dtype. Downstream libraries that have their own CPU tensor
-// type provide thin inline glue at their own boundary.
-
-// Host→device, FP32. dst is resized to (rows, cols, FP32). host must point
-// to rows*cols floats.
-void upload(const float* host, int rows, int cols, GpuTensor& dst);
-
-// Device→host, FP32. host must point to at least src.size() floats.
-// src.dtype must be FP32.
-void download(const GpuTensor& src, float* host);
-
-// Host→device, FP16. dst is resized to (rows, cols, FP16). host must point
-// to rows*cols half-precision values, encoded as uint16_t (IEEE 754 binary16
-// bit pattern).
-void upload_fp16(const uint16_t* host, int rows, int cols, GpuTensor& dst);
-
-// Device→host, FP16. host must point to at least src.size() uint16_t slots.
-// src.dtype must be FP16.
-void download_fp16(const GpuTensor& src, uint16_t* host);
-
-// ─── Tensor (host) ↔ device convenience overloads ──────────────────────────
-//
-// Inline wrappers so callers holding a brotensor::Tensor can transfer without
-// pulling out (ptr, rows, cols) by hand. Only compiled when a GPU backend is
-// enabled; the raw-pointer overloads above are the underlying definitions.
-#ifdef BROTENSOR_HAS_GPU
-inline void upload(const Tensor& src, GpuTensor& dst) {
-    upload(src.data.data(), src.rows, src.cols, dst);
-}
-inline void download(const GpuTensor& src, Tensor& dst) {
-    if (dst.rows != src.rows || dst.cols != src.cols) {
-        dst.resize(src.rows, src.cols);
-    }
-    download(src, dst.data.data());
-}
-#endif
 
 // ─── FP16 ↔ FP32 host-side conversion helpers ──────────────────────────────
 //

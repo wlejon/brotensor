@@ -1,20 +1,23 @@
-// Minimal smoke test for brotensor GpuTensor lifecycle + upload/download
-// round-trip + one hand-checked op (relu_forward_gpu). Deep CPU↔GPU parity
-// coverage lives in brogameagent's tests since those need brogameagent's CPU
-// reference impls.
+// Smoke test for the unified brotensor::Tensor: lifecycle, host↔device
+// round-trip, clone, a hand-checked op (relu_forward), and FP16
+// host-conversion + round-trip. CUDA-only — guarded out on a CPU-only build
+// since the round-trip / op coverage here exercises a GPU backend.
 
+#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
-#include <brotensor/ops.h>
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Device;
+using brotensor::Dtype;
+using brotensor::Tensor;
 
 static int g_failures = 0;
 
@@ -27,71 +30,92 @@ static int g_failures = 0;
 
 static void test_lifecycle() {
     std::printf("test_lifecycle\n");
-    GpuTensor a(4, 8);
+    Tensor a = Tensor::zeros_on(Device::CUDA, 4, 8);
     CHECK(a.rows == 4);
     CHECK(a.cols == 8);
     CHECK(a.size() == 32);
     CHECK(a.data != nullptr);
+    CHECK(a.device == Device::CUDA);
     a.zero();
 
     a.resize(2, 3);
     CHECK(a.rows == 2);
     CHECK(a.cols == 3);
     CHECK(a.size() == 6);
+    CHECK(a.device == Device::CUDA);  // resize preserves device
 
     // Move ctor / move assign.
-    GpuTensor b = std::move(a);
+    Tensor b = std::move(a);
     CHECK(b.rows == 2 && b.cols == 3);
     CHECK(a.data == nullptr);
-    GpuTensor c;
+    Tensor c;
     c = std::move(b);
     CHECK(c.rows == 2 && c.cols == 3);
+    CHECK(c.device == Device::CUDA);
 }
 
 static void test_round_trip() {
     std::printf("test_round_trip\n");
     std::vector<float> host_in = {1.0f, -2.5f, 3.25f, 0.0f, 7.0f, -0.125f};
-    GpuTensor g;
-    brotensor::upload(host_in.data(), 2, 3, g);
+    Tensor g = Tensor::from_host_on(Device::CUDA, host_in.data(), 2, 3);
     CHECK(g.rows == 2 && g.cols == 3);
+    CHECK(g.device == Device::CUDA);
 
-    std::vector<float> host_out(g.size(), 0.0f);
-    brotensor::download(g, host_out.data());
-    brotensor::cuda_sync();
+    std::vector<float> host_out = g.to_host_vector();
+    CHECK(host_out.size() == host_in.size());
     for (size_t i = 0; i < host_in.size(); ++i) {
         CHECK(host_in[i] == host_out[i]);
+    }
+
+    // copy_to_host into a caller-supplied buffer.
+    std::vector<float> host_out2(g.size(), 0.0f);
+    g.copy_to_host(host_out2.data());
+    for (size_t i = 0; i < host_in.size(); ++i) {
+        CHECK(host_in[i] == host_out2[i]);
     }
 }
 
 static void test_clone() {
     std::printf("test_clone\n");
     std::vector<float> host_in = {5.0f, -1.0f, 2.0f, 4.0f};
-    GpuTensor a;
-    brotensor::upload(host_in.data(), 2, 2, a);
-    GpuTensor b = a.clone();
+    Tensor a = Tensor::from_host_on(Device::CUDA, host_in.data(), 2, 2);
+    Tensor b = a.clone();
     CHECK(b.rows == 2 && b.cols == 2);
+    CHECK(b.device == Device::CUDA);
     CHECK(b.data != a.data);
 
-    std::vector<float> host_out(4, 0.0f);
-    brotensor::download(b, host_out.data());
-    brotensor::cuda_sync();
+    std::vector<float> host_out = b.to_host_vector();
     for (size_t i = 0; i < host_in.size(); ++i) {
         CHECK(host_in[i] == host_out[i]);
     }
 }
 
+static void test_to_migration() {
+    std::printf("test_to_migration\n");
+    std::vector<float> host_in = {1.5f, -2.0f, 0.0f, 9.0f};
+    Tensor g = Tensor::from_host_on(Device::CUDA, host_in.data(), 2, 2);
+
+    // Device → host migration.
+    Tensor h = g.to(Device::CPU);
+    CHECK(h.device == Device::CPU);
+    for (int i = 0; i < 4; ++i) CHECK(h.host_f32()[i] == host_in[i]);
+
+    // Host → device round-trips back to the same values.
+    Tensor g2 = h.to(Device::CUDA);
+    CHECK(g2.device == Device::CUDA);
+    std::vector<float> back = g2.to_host_vector();
+    for (int i = 0; i < 4; ++i) CHECK(back[i] == host_in[i]);
+}
+
 static void test_relu_smoke() {
     std::printf("test_relu_smoke\n");
     std::vector<float> host_in = {-3.0f, -0.5f, 0.0f, 0.25f, 7.0f};
-    GpuTensor x, y;
-    brotensor::upload(host_in.data(), 5, 1, x);
-    y.resize(5, 1);
-    brotensor::relu_forward_gpu(x, y);
+    Tensor x = Tensor::from_host_on(Device::CUDA, host_in.data(), 5, 1);
+    Tensor y = Tensor::empty_on(Device::CUDA, 5, 1);
+    brotensor::relu_forward(x, y);
+    brotensor::sync(Device::CUDA);
 
-    std::vector<float> host_out(5, 0.0f);
-    brotensor::download(y, host_out.data());
-    brotensor::cuda_sync();
-
+    std::vector<float> host_out = y.to_host_vector();
     CHECK(host_out[0] == 0.0f);
     CHECK(host_out[1] == 0.0f);
     CHECK(host_out[2] == 0.0f);
@@ -128,26 +152,22 @@ static void test_fp16_round_trip() {
     for (int i = 0; i < 6; ++i) {
         host_in[i] = brotensor::fp32_to_fp16_bits(src_f32[i]);
     }
-    GpuTensor g;
-    brotensor::upload_fp16(host_in.data(), 2, 3, g);
+    Tensor g = Tensor::from_host_fp16_on(Device::CUDA, host_in.data(), 2, 3);
     CHECK(g.rows == 2 && g.cols == 3);
-    CHECK(g.dtype == brotensor::Dtype::FP16);
+    CHECK(g.dtype == Dtype::FP16);
     CHECK(g.bytes() == 12);
 
-    std::vector<uint16_t> host_out(6, 0);
-    brotensor::download_fp16(g, host_out.data());
-    brotensor::cuda_sync();
+    std::vector<uint16_t> host_out = g.to_host_vector_fp16();
+    CHECK(host_out.size() == host_in.size());
     for (int i = 0; i < 6; ++i) {
         CHECK(host_in[i] == host_out[i]);
     }
 
     // Clone preserves dtype.
-    GpuTensor g2 = g.clone();
-    CHECK(g2.dtype == brotensor::Dtype::FP16);
+    Tensor g2 = g.clone();
+    CHECK(g2.dtype == Dtype::FP16);
     CHECK(g2.bytes() == 12);
-    std::vector<uint16_t> host_out2(6, 0);
-    brotensor::download_fp16(g2, host_out2.data());
-    brotensor::cuda_sync();
+    std::vector<uint16_t> host_out2 = g2.to_host_vector_fp16();
     for (int i = 0; i < 6; ++i) {
         CHECK(host_in[i] == host_out2[i]);
     }
@@ -155,32 +175,30 @@ static void test_fp16_round_trip() {
 
 static void test_fp16_resize_and_zero() {
     std::printf("test_fp16_resize_and_zero\n");
-    GpuTensor g(4, 4, brotensor::Dtype::FP16);
-    CHECK(g.dtype == brotensor::Dtype::FP16);
+    Tensor g = Tensor::zeros_on(Device::CUDA, 4, 4, Dtype::FP16);
+    CHECK(g.dtype == Dtype::FP16);
     CHECK(g.bytes() == 32);
     g.zero();
-    std::vector<uint16_t> host_out(16, 0xFFFF);
-    brotensor::download_fp16(g, host_out.data());
-    brotensor::cuda_sync();
+    std::vector<uint16_t> host_out = g.to_host_vector_fp16();
     for (int i = 0; i < 16; ++i) CHECK(host_out[i] == 0);
 
     // Switch dtype back to FP32 via resize.
-    g.resize(2, 2, brotensor::Dtype::FP32);
-    CHECK(g.dtype == brotensor::Dtype::FP32);
+    g.resize(2, 2, Dtype::FP32);
+    CHECK(g.dtype == Dtype::FP32);
     CHECK(g.bytes() == 16);
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
 
     test_lifecycle();
     test_round_trip();
     test_clone();
+    test_to_migration();
     test_relu_smoke();
     test_fp16_host_conversion();
     test_fp16_round_trip();

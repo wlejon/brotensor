@@ -1,18 +1,24 @@
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+// CUDA embedding lookup. Phase 2G port — kernel bodies unchanged.
+
+#include "detail/cuda_check.h"
+
+#include <brotensor/tensor.h>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <cstdint>
 #include <stdexcept>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
+
+using ::brotensor::Tensor;
+using ::brotensor::Dtype;
 
 namespace {
 
 constexpr int EMB_BLOCK = 256;
 
-// One thread per (b, j). Gather row d_idx[b] of `table` into out[b, :].
 __global__ void embedding_lookup_forward_kernel(const float* __restrict__ table,
                                                 const int* __restrict__ idx,
                                                 float* __restrict__ out,
@@ -41,7 +47,6 @@ __global__ void embedding_lookup_forward_fp16_kernel(const __half* __restrict__ 
     }
 }
 
-// Scatter-accumulate via atomicAdd. Multiple lookups of the same row sum.
 __global__ void embedding_lookup_backward_kernel(const float* __restrict__ dOut,
                                                  const int* __restrict__ idx,
                                                  float* __restrict__ dTable,
@@ -56,8 +61,6 @@ __global__ void embedding_lookup_backward_kernel(const float* __restrict__ dOut,
     }
 }
 
-// FP16 input variant: scatter into FP32 scratch via atomicAdd (FP16 atomicAdd
-// is not portable across CUDA compute capabilities).
 __global__ void embedding_lookup_backward_kernel_fp16(
         const __half* __restrict__ dOut,
         const int* __restrict__ idx,
@@ -89,9 +92,9 @@ inline int grid_for(int n, int block) {
 
 } // namespace
 
-void embedding_lookup_forward_gpu(const GpuTensor& table,
-                                  const int32_t* d_idx, int B,
-                                  GpuTensor& out) {
+void embedding_lookup_forward(const Tensor& table,
+                              const int32_t* d_idx, int B,
+                              Tensor& out) {
     const int D = table.cols;
     if (out.rows != B || out.cols != D || out.dtype != table.dtype) {
         out.resize(B, D, table.dtype);
@@ -100,25 +103,27 @@ void embedding_lookup_forward_gpu(const GpuTensor& table,
     if (total == 0) return;
     if (table.dtype == Dtype::FP16) {
         embedding_lookup_forward_fp16_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK>>>(
-            reinterpret_cast<const __half*>(table.data_fp16()),
+            static_cast<const __half*>(table.data),
             reinterpret_cast<const int*>(d_idx),
-            reinterpret_cast<__half*>(out.data_fp16()),
+            static_cast<__half*>(out.data),
             B, D);
     } else {
         embedding_lookup_forward_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK>>>(
-            table.data, reinterpret_cast<const int*>(d_idx), out.data, B, D);
+            static_cast<const float*>(table.data),
+            reinterpret_cast<const int*>(d_idx),
+            static_cast<float*>(out.data), B, D);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void embedding_lookup_backward_gpu(const GpuTensor& dOut,
-                                   const int32_t* d_idx, int B,
-                                   GpuTensor& dTable) {
+void embedding_lookup_backward(const Tensor& dOut,
+                               const int32_t* d_idx, int B,
+                               Tensor& dTable) {
     if (dTable.dtype != Dtype::FP16 && dTable.dtype != Dtype::FP32) {
-        throw std::runtime_error("embedding_lookup_backward_gpu: dTable must be FP16 or FP32");
+        throw std::runtime_error("embedding_lookup_backward: dTable must be FP16 or FP32");
     }
     if (dOut.dtype != dTable.dtype) {
-        throw std::runtime_error("embedding_lookup_backward_gpu: dOut/dTable dtype must match");
+        throw std::runtime_error("embedding_lookup_backward: dOut/dTable dtype must match");
     }
     const int D = dTable.cols;
     const int total = B * D;
@@ -126,7 +131,9 @@ void embedding_lookup_backward_gpu(const GpuTensor& dOut,
 
     if (dTable.dtype == Dtype::FP32) {
         embedding_lookup_backward_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK>>>(
-            dOut.data, reinterpret_cast<const int*>(d_idx), dTable.data, B, D);
+            static_cast<const float*>(dOut.data),
+            reinterpret_cast<const int*>(d_idx),
+            static_cast<float*>(dTable.data), B, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     } else {
         const int V = dTable.rows;
@@ -136,15 +143,15 @@ void embedding_lookup_backward_gpu(const GpuTensor& dOut,
                                         table_n * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMemset(d_scratch, 0, table_n * sizeof(float)));
         embedding_lookup_backward_kernel_fp16<<<grid_for(total, EMB_BLOCK), EMB_BLOCK>>>(
-            reinterpret_cast<const __half*>(dOut.data_fp16()),
+            static_cast<const __half*>(dOut.data),
             reinterpret_cast<const int*>(d_idx),
             d_scratch, B, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         emb_add_fp32_into_fp16<<<grid_for(table_n, EMB_BLOCK), EMB_BLOCK>>>(
-            d_scratch, reinterpret_cast<__half*>(dTable.data_fp16()), table_n);
+            d_scratch, static_cast<__half*>(dTable.data), table_n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_scratch);
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::cuda

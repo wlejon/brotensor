@@ -1,5 +1,5 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -8,6 +8,7 @@
 #include <string>
 
 namespace brotensor {
+namespace detail::cuda {
 
 namespace {
 
@@ -60,10 +61,10 @@ void check_dims(const char* op, int N, int C, int H, int W) {
 
 } // namespace
 
-void nchw_to_sequence_gpu(const GpuTensor& X,
-                          int N, int C, int H, int W,
-                          GpuTensor& Y) {
-    check_dims("nchw_to_sequence_gpu", N, C, H, W);
+void nchw_to_sequence(const ::brotensor::Tensor& X,
+                      int N, int C, int H, int W,
+                      ::brotensor::Tensor& Y) {
+    check_dims("nchw_to_sequence", N, C, H, W);
     const int HW = H * W;
     const int rows = N * HW;
     if (Y.rows != rows || Y.cols != C || Y.dtype != X.dtype) {
@@ -73,20 +74,22 @@ void nchw_to_sequence_gpu(const GpuTensor& X,
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
         nchw_to_seq_kernel<__half><<<grid_for(total), TR_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             N, C, H, W, HW, total);
     } else {
         nchw_to_seq_kernel<float><<<grid_for(total), TR_BLOCK>>>(
-            X.data, Y.data, N, C, H, W, HW, total);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data),
+            N, C, H, W, HW, total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void sequence_to_nchw_gpu(const GpuTensor& X,
-                          int N, int C, int H, int W,
-                          GpuTensor& Y) {
-    check_dims("sequence_to_nchw_gpu", N, C, H, W);
+void sequence_to_nchw(const ::brotensor::Tensor& X,
+                      int N, int C, int H, int W,
+                      ::brotensor::Tensor& Y) {
+    check_dims("sequence_to_nchw", N, C, H, W);
     const int HW = H * W;
     const int cols = C * HW;
     if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) {
@@ -96,14 +99,17 @@ void sequence_to_nchw_gpu(const GpuTensor& X,
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
         seq_to_nchw_kernel<__half><<<grid_for(total), TR_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
             N, C, H, W, HW, total);
     } else {
         seq_to_nchw_kernel<float><<<grid_for(total), TR_BLOCK>>>(
-            X.data, Y.data, N, C, H, W, HW, total);
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data),
+            N, C, H, W, HW, total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

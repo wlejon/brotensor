@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
 
 namespace {
@@ -35,13 +35,13 @@ std::vector<uint16_t> to_fp16(const std::vector<float>& v) {
     return o;
 }
 
-void upload_rand_fp16(int rows, int cols, GpuTensor& g,
+void upload_rand_fp16(int rows, int cols, Tensor& g,
                       std::mt19937& rng, float scale = 0.3f) {
     std::uniform_real_distribution<float> d(-scale, scale);
     std::vector<float> v(static_cast<size_t>(rows) * cols);
     for (auto& x : v) x = d(rng);
     auto h = to_fp16(v);
-    brotensor::upload_fp16(h.data(), rows, cols, g);
+    g = Tensor::from_host_fp16_on(brotensor::Device::CUDA, h.data(), rows, cols);
 }
 
 float time_loop_ms(int iters, const std::function<void()>& body) {
@@ -68,10 +68,10 @@ float time_loop_ms(int iters, const std::function<void()>& body) {
 // Sanity check that the fused kernel produced finite, bounded output. Element-
 // by-element parity belongs in the dedicated tests; this is just a "did the
 // kernel silently produce garbage" gate.
-bool sanity_finite(const GpuTensor& a, float abs_clip = 1e3f) {
+bool sanity_finite(const Tensor& a, float abs_clip = 1e3f) {
     std::vector<uint16_t> ha(a.size());
-    brotensor::download_fp16(a, ha.data());
-    brotensor::cuda_sync();
+    a.copy_to_host_fp16(ha.data());
+    brotensor::sync_all();
     // Spot-check 32 elements.
     const int n = static_cast<int>(ha.size());
     const int step = n > 32 ? n / 32 : 1;
@@ -86,7 +86,7 @@ struct Row { std::string op, shape; float unfused; float fused; };
 
 void bench_self_attention(int Lq, int D, int nh, std::vector<Row>& rows) {
     std::mt19937 rng(42);
-    GpuTensor X, Wq, Wk, Wv, Wo, O_a, O_b;
+    Tensor X, Wq, Wk, Wv, Wo, O_a, O_b;
     upload_rand_fp16(Lq, D, X, rng);
     upload_rand_fp16(D, D, Wq, rng);
     upload_rand_fp16(D, D, Wk, rng);
@@ -99,14 +99,14 @@ void bench_self_attention(int Lq, int D, int nh, std::vector<Row>& rows) {
     float ms_un = 0.0f;
     if (unfused_ok) {
         ms_un = time_loop_ms(ITERS, [&] {
-            brotensor::self_attention_forward_gpu(X, Wq, Wk, Wv, Wo, nullptr, nh, O_a);
+            brotensor::self_attention_forward(X, Wq, Wk, Wv, Wo, nullptr, nh, O_a);
         });
     }
     float ms_fu = time_loop_ms(ITERS, [&] {
-        brotensor::flash_attention_qkvo_forward_gpu(X, nullptr,
-                                                    Wq, nullptr, Wk, nullptr,
-                                                    Wv, nullptr, Wo, nullptr,
-                                                    nullptr, nh, /*causal=*/false, O_b);
+        brotensor::flash_attention_qkvo_forward(X, nullptr,
+                                                Wq, nullptr, Wk, nullptr,
+                                                Wv, nullptr, Wo, nullptr,
+                                                nullptr, nh, /*causal=*/false, O_b);
     });
     if (!sanity_finite(O_b))
         std::printf("  !! self-attn fused output non-finite L=%d D=%d\n", Lq, D);
@@ -117,7 +117,7 @@ void bench_self_attention(int Lq, int D, int nh, std::vector<Row>& rows) {
 
 void bench_cross_attention(int Lq, int Lk, int D, int nh, std::vector<Row>& rows) {
     std::mt19937 rng(43);
-    GpuTensor X, Ctx, Wq, Wk, Wv, Wo, O_a, O_b;
+    Tensor X, Ctx, Wq, Wk, Wv, Wo, O_a, O_b;
     upload_rand_fp16(Lq, D, X, rng);
     upload_rand_fp16(Lk, D, Ctx, rng);
     upload_rand_fp16(D, D, Wq, rng);
@@ -125,14 +125,14 @@ void bench_cross_attention(int Lq, int Lk, int D, int nh, std::vector<Row>& rows
     upload_rand_fp16(D, D, Wv, rng);
     upload_rand_fp16(D, D, Wo, rng);
     float ms_un = time_loop_ms(ITERS, [&] {
-        brotensor::cross_attention_forward_gpu(X, Ctx, Wq, Wk, Wv, Wo,
-                                               nullptr, nh, O_a);
+        brotensor::cross_attention_forward(X, Ctx, Wq, Wk, Wv, Wo,
+                                           nullptr, nh, O_a);
     });
     float ms_fu = time_loop_ms(ITERS, [&] {
-        brotensor::flash_attention_qkvo_forward_gpu(X, &Ctx,
-                                                    Wq, nullptr, Wk, nullptr,
-                                                    Wv, nullptr, Wo, nullptr,
-                                                    nullptr, nh, /*causal=*/false, O_b);
+        brotensor::flash_attention_qkvo_forward(X, &Ctx,
+                                                Wq, nullptr, Wk, nullptr,
+                                                Wv, nullptr, Wo, nullptr,
+                                                nullptr, nh, /*causal=*/false, O_b);
     });
     if (!sanity_finite(O_b))
         std::printf("  !! cross-attn fused output non-finite Lq=%d Lk=%d D=%d\n",
@@ -142,33 +142,33 @@ void bench_cross_attention(int Lq, int Lk, int D, int nh, std::vector<Row>& rows
     rows.push_back({"cross_attn", buf, ms_un, ms_fu});
 }
 
-void resblock_unfused(const GpuTensor& X,
-                      const GpuTensor& g1, const GpuTensor& b1,
-                      const GpuTensor& W1, const GpuTensor& bcv1,
-                      const GpuTensor& g2, const GpuTensor& b2,
-                      const GpuTensor& W2, const GpuTensor& bcv2,
+void resblock_unfused(const Tensor& X,
+                      const Tensor& g1, const Tensor& b1,
+                      const Tensor& W1, const Tensor& bcv1,
+                      const Tensor& g2, const Tensor& b2,
+                      const Tensor& W2, const Tensor& bcv2,
                       int N, int C, int H, int Wd, int groups,
-                      GpuTensor& Y) {
-    GpuTensor a;
-    brotensor::group_norm_forward_gpu(X, g1, b1, N, C, H, Wd, groups, 1e-5f, a);
-    brotensor::silu_forward_gpu(a, a);
-    GpuTensor c1;
-    brotensor::conv2d_forward_gpu(a, W1, &bcv1, N, C, H, Wd, C, 3, 3,
-                                  1, 1, 1, 1, 1, 1, c1);
-    GpuTensor d;
-    brotensor::group_norm_forward_gpu(c1, g2, b2, N, C, H, Wd, groups, 1e-5f, d);
-    brotensor::silu_forward_gpu(d, d);
-    GpuTensor c2;
-    brotensor::conv2d_forward_gpu(d, W2, &bcv2, N, C, H, Wd, C, 3, 3,
-                                  1, 1, 1, 1, 1, 1, c2);
-    brotensor::add_inplace_gpu(c2, X);
+                      Tensor& Y) {
+    Tensor a;
+    brotensor::group_norm_forward(X, g1, b1, N, C, H, Wd, groups, 1e-5f, a);
+    brotensor::silu_forward(a, a);
+    Tensor c1;
+    brotensor::conv2d_forward(a, W1, &bcv1, N, C, H, Wd, C, 3, 3,
+                              1, 1, 1, 1, 1, 1, c1);
+    Tensor d;
+    brotensor::group_norm_forward(c1, g2, b2, N, C, H, Wd, groups, 1e-5f, d);
+    brotensor::silu_forward(d, d);
+    Tensor c2;
+    brotensor::conv2d_forward(d, W2, &bcv2, N, C, H, Wd, C, 3, 3,
+                              1, 1, 1, 1, 1, 1, c2);
+    brotensor::add_inplace(c2, X);
     Y = std::move(c2);
 }
 
 void bench_resblock(int N, int C, int H, int Wd, std::vector<Row>& rows) {
     std::mt19937 rng(44 + C);
     const int spatial = H * Wd;
-    GpuTensor X, g1, b1, W1, bcv1, g2, b2, W2, bcv2;
+    Tensor X, g1, b1, W1, bcv1, g2, b2, W2, bcv2;
     upload_rand_fp16(N, C * spatial, X, rng);
     upload_rand_fp16(C, 1, g1, rng);
     upload_rand_fp16(C, 1, b1, rng);
@@ -178,15 +178,15 @@ void bench_resblock(int N, int C, int H, int Wd, std::vector<Row>& rows) {
     upload_rand_fp16(C, 1, b2, rng);
     upload_rand_fp16(C, C * 9, W2, rng);
     upload_rand_fp16(C, 1, bcv2, rng);
-    GpuTensor Y_un, Y_fu;
+    Tensor Y_un, Y_fu;
     float ms_un = time_loop_ms(ITERS, [&] {
         resblock_unfused(X, g1, b1, W1, bcv1, g2, b2, W2, bcv2,
                          N, C, H, Wd, 32, Y_un);
     });
     float ms_fu = time_loop_ms(ITERS, [&] {
-        brotensor::resblock_forward_gpu(X, g1, b1, W1, &bcv1, nullptr,
-                                        g2, b2, W2, &bcv2, nullptr, nullptr,
-                                        N, C, C, H, Wd, 32, 1e-5f, Y_fu);
+        brotensor::resblock_forward(X, g1, b1, W1, &bcv1, nullptr,
+                                    g2, b2, W2, &bcv2, nullptr, nullptr,
+                                    N, C, C, H, Wd, 32, 1e-5f, Y_fu);
     });
     if (!sanity_finite(Y_fu))
         std::printf("  !! resblock fused output non-finite C=%d H=%d\n", C, H);
@@ -220,10 +220,10 @@ void print_table(const std::vector<Row>& rows) {
 } // namespace
 
 int main() {
-    try { brotensor::cuda_init(); }
-    catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("brotensor_bench_diffusion  (warmup=%d, iters=%d)\n",
                 WARMUP, ITERS);

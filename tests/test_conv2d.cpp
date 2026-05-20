@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
 
 static int g_failures = 0;
@@ -127,27 +127,31 @@ static void run_one(const char* label,
     auto Wt_h16 = to_fp16(Wt);
     auto B_h16  = to_fp16(bias);
 
-    GpuTensor Xg, Wg, Bg, Yg;
-    brotensor::upload_fp16(X_h16.data(),  N,     C_in * H * W,  Xg);
-    brotensor::upload_fp16(Wt_h16.data(), C_out, C_in * kH * kW, Wg);
-    GpuTensor* Bptr = nullptr;
+    Tensor Yg;
+    Tensor Xg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                          X_h16.data(), N, C_in * H * W);
+    Tensor Wg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                          Wt_h16.data(), C_out, C_in * kH * kW);
+    Tensor Bg;
+    Tensor* Bptr = nullptr;
     if (has_bias) {
-        brotensor::upload_fp16(B_h16.data(), C_out, 1, Bg);
+        Bg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                       B_h16.data(), C_out, 1);
         Bptr = &Bg;
     }
 
-    brotensor::conv2d_forward_gpu(Xg, Wg, Bptr,
-                                  N, C_in, H, W, C_out, kH, kW,
-                                  stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                                  Yg);
+    brotensor::conv2d_forward(Xg, Wg, Bptr,
+                              N, C_in, H, W, C_out, kH, kW,
+                              stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                              Yg);
 
     CHECK(Yg.rows == N);
     CHECK(Yg.cols == C_out * H_out * W_out);
     CHECK(Yg.dtype == Dtype::FP16);
 
     std::vector<uint16_t> Y_h16(static_cast<size_t>(Yg.size()), 0);
-    brotensor::download_fp16(Yg, Y_h16.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host_fp16(Y_h16.data());
+    brotensor::sync_all();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -248,27 +252,31 @@ static void run_one_fp32(const char* label,
                     stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
                     H_out, W_out, Y_cpu);
 
-    GpuTensor Xg, Wg, Bg, Yg;
-    brotensor::upload(X.data(),  N,     C_in * H * W,   Xg);
-    brotensor::upload(Wt.data(), C_out, C_in * kH * kW, Wg);
-    GpuTensor* Bptr = nullptr;
+    Tensor Yg;
+    Tensor Xg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     X.data(), N, C_in * H * W);
+    Tensor Wg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     Wt.data(), C_out, C_in * kH * kW);
+    Tensor Bg;
+    Tensor* Bptr = nullptr;
     if (has_bias) {
-        brotensor::upload(bias.data(), C_out, 1, Bg);
+        Bg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                  bias.data(), C_out, 1);
         Bptr = &Bg;
     }
 
-    brotensor::conv2d_forward_gpu(Xg, Wg, Bptr,
-                                  N, C_in, H, W, C_out, kH, kW,
-                                  stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                                  Yg);
+    brotensor::conv2d_forward(Xg, Wg, Bptr,
+                              N, C_in, H, W, C_out, kH, kW,
+                              stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                              Yg);
 
     CHECK(Yg.rows == N);
     CHECK(Yg.cols == C_out * H_out * W_out);
     CHECK(Yg.dtype == Dtype::FP32);
 
     std::vector<float> Y_gpu(static_cast<size_t>(Yg.size()), 0.0f);
-    brotensor::download(Yg, Y_gpu.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host(Y_gpu.data());
+    brotensor::sync_all();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -319,22 +327,24 @@ static void run_one_bwd_input(const char* label,
                                    stride_h, stride_w, pad_h, pad_w,
                                    dil_h, dil_w, H_out, W_out, dX_cpu);
 
-    GpuTensor Wg, dYg, dXg;
-    brotensor::upload(Wt.data(), C_out, C_in * kH * kW, Wg);
-    brotensor::upload(dY.data(), N, C_out * H_out * W_out, dYg);
+    Tensor dXg;
+    Tensor Wg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     Wt.data(), C_out, C_in * kH * kW);
+    Tensor dYg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                      dY.data(), N, C_out * H_out * W_out);
 
-    brotensor::conv2d_backward_input_gpu(Wg, dYg,
-                                         N, C_in, H, W, C_out, kH, kW,
-                                         stride_h, stride_w, pad_h, pad_w,
-                                         dil_h, dil_w, dXg);
+    brotensor::conv2d_backward_input(Wg, dYg,
+                                     N, C_in, H, W, C_out, kH, kW,
+                                     stride_h, stride_w, pad_h, pad_w,
+                                     dil_h, dil_w, dXg);
 
     CHECK(dXg.rows == N);
     CHECK(dXg.cols == C_in * H * W);
     CHECK(dXg.dtype == Dtype::FP32);
 
     std::vector<float> dX_gpu(static_cast<size_t>(dXg.size()), 0.0f);
-    brotensor::download(dXg, dX_gpu.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host(dX_gpu.data());
+    brotensor::sync_all();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -447,25 +457,26 @@ static void run_one_bwd_weight(const char* label,
                                     stride_h, stride_w, pad_h, pad_w,
                                     dil_h, dil_w, H_out, W_out, dW_cpu);
 
-    GpuTensor Xg, dYg, dWg;
-    brotensor::upload(X.data(),  N, C_in * H * W, Xg);
-    brotensor::upload(dY.data(), N, C_out * H_out * W_out, dYg);
+    Tensor Xg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     X.data(), N, C_in * H * W);
+    Tensor dYg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                      dY.data(), N, C_out * H_out * W_out);
     // Pre-allocate dWg shape (C_out, C_in*kH*kW), zeroed — op accumulates.
-    std::vector<float> zeros(C_out * C_in * kH * kW, 0.0f);
-    brotensor::upload(zeros.data(), C_out, C_in * kH * kW, dWg);
+    Tensor dWg = Tensor::zeros_on(brotensor::Device::CUDA,
+                                  C_out, C_in * kH * kW);
 
-    brotensor::conv2d_backward_weight_gpu(Xg, dYg,
-                                          N, C_in, H, W, C_out, kH, kW,
-                                          stride_h, stride_w, pad_h, pad_w,
-                                          dil_h, dil_w, dWg);
+    brotensor::conv2d_backward_weight(Xg, dYg,
+                                      N, C_in, H, W, C_out, kH, kW,
+                                      stride_h, stride_w, pad_h, pad_w,
+                                      dil_h, dil_w, dWg);
 
     CHECK(dWg.rows == C_out);
     CHECK(dWg.cols == C_in * kH * kW);
     CHECK(dWg.dtype == Dtype::FP32);
 
     std::vector<float> dW_gpu(static_cast<size_t>(dWg.size()), 0.0f);
-    brotensor::download(dWg, dW_gpu.data());
-    brotensor::cuda_sync();
+    dWg.copy_to_host(dW_gpu.data());
+    brotensor::sync_all();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -503,20 +514,19 @@ static void run_one_bwd_bias(const char* label,
     std::vector<float> dB_cpu;
     conv2d_backward_bias_cpu_fp32(dY, N, C_out, H_out, W_out, dB_cpu);
 
-    GpuTensor dYg, dBg;
-    brotensor::upload(dY.data(), N, C_out * H_out * W_out, dYg);
-    std::vector<float> zeros(C_out, 0.0f);
-    brotensor::upload(zeros.data(), C_out, 1, dBg);
+    Tensor dYg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                      dY.data(), N, C_out * H_out * W_out);
+    Tensor dBg = Tensor::zeros_on(brotensor::Device::CUDA, C_out, 1);
 
-    brotensor::conv2d_backward_bias_gpu(dYg, N, C_out, H_out, W_out, dBg);
+    brotensor::conv2d_backward_bias(dYg, N, C_out, H_out, W_out, dBg);
 
     CHECK(dBg.rows == C_out);
     CHECK(dBg.cols == 1);
     CHECK(dBg.dtype == Dtype::FP32);
 
     std::vector<float> dB_gpu(static_cast<size_t>(dBg.size()), 0.0f);
-    brotensor::download(dBg, dB_gpu.data());
-    brotensor::cuda_sync();
+    dBg.copy_to_host(dB_gpu.data());
+    brotensor::sync_all();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -561,19 +571,20 @@ static void run_finite_diff_check_weight() {
     for (auto& v : dY) v = dist(rng);
 
     // Analytic dW from the GPU (zero dWg first, op accumulates).
-    GpuTensor Xg, dYg, dWg;
-    brotensor::upload(X.data(),  N, C_in * H * W, Xg);
-    brotensor::upload(dY.data(), N, C_out * H_out * W_out, dYg);
-    std::vector<float> zeros(w_n, 0.0f);
-    brotensor::upload(zeros.data(), C_out, C_in * kH * kW, dWg);
+    Tensor Xg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     X.data(), N, C_in * H * W);
+    Tensor dYg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                      dY.data(), N, C_out * H_out * W_out);
+    Tensor dWg = Tensor::zeros_on(brotensor::Device::CUDA,
+                                  C_out, C_in * kH * kW);
 
-    brotensor::conv2d_backward_weight_gpu(Xg, dYg,
-                                          N, C_in, H, W, C_out, kH, kW,
-                                          stride_h, stride_w, pad_h, pad_w,
-                                          dil_h, dil_w, dWg);
+    brotensor::conv2d_backward_weight(Xg, dYg,
+                                      N, C_in, H, W, C_out, kH, kW,
+                                      stride_h, stride_w, pad_h, pad_w,
+                                      dil_h, dil_w, dWg);
     std::vector<float> dW_gpu(static_cast<size_t>(dWg.size()), 0.0f);
-    brotensor::download(dWg, dW_gpu.data());
-    brotensor::cuda_sync();
+    dWg.copy_to_host(dW_gpu.data());
+    brotensor::sync_all();
 
     auto loss_for_W = [&](const std::vector<float>& W_pert) {
         std::vector<float> Y;
@@ -630,14 +641,13 @@ static void run_finite_diff_check_bias() {
     for (auto& v : bias) v = dist(rng);
 
     // Analytic dB from the GPU (does not depend on bias).
-    GpuTensor dYg, dBg;
-    brotensor::upload(dY.data(), N, C_out * H_out * W_out, dYg);
-    std::vector<float> zeros(C_out, 0.0f);
-    brotensor::upload(zeros.data(), C_out, 1, dBg);
-    brotensor::conv2d_backward_bias_gpu(dYg, N, C_out, H_out, W_out, dBg);
+    Tensor dYg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                      dY.data(), N, C_out * H_out * W_out);
+    Tensor dBg = Tensor::zeros_on(brotensor::Device::CUDA, C_out, 1);
+    brotensor::conv2d_backward_bias(dYg, N, C_out, H_out, W_out, dBg);
     std::vector<float> dB_gpu(static_cast<size_t>(dBg.size()), 0.0f);
-    brotensor::download(dBg, dB_gpu.data());
-    brotensor::cuda_sync();
+    dBg.copy_to_host(dB_gpu.data());
+    brotensor::sync_all();
 
     // For bias FD: forward Y depends on bias additively per channel, so the
     // analytic gradient equals sum_{n,i,j} dY[n,c,i,j], independent of X/W.
@@ -707,16 +717,18 @@ static void run_finite_diff_check() {
     for (auto& v : dY) v = dist(rng);
 
     // Analytic dX from the GPU.
-    GpuTensor Wg, dYg, dXg;
-    brotensor::upload(Wt.data(), C_out, C_in * kH * kW, Wg);
-    brotensor::upload(dY.data(), N, C_out * H_out * W_out, dYg);
-    brotensor::conv2d_backward_input_gpu(Wg, dYg,
-                                         N, C_in, H, W, C_out, kH, kW,
-                                         stride_h, stride_w, pad_h, pad_w,
-                                         dil_h, dil_w, dXg);
+    Tensor dXg;
+    Tensor Wg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     Wt.data(), C_out, C_in * kH * kW);
+    Tensor dYg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                      dY.data(), N, C_out * H_out * W_out);
+    brotensor::conv2d_backward_input(Wg, dYg,
+                                     N, C_in, H, W, C_out, kH, kW,
+                                     stride_h, stride_w, pad_h, pad_w,
+                                     dil_h, dil_w, dXg);
     std::vector<float> dX_gpu(static_cast<size_t>(dXg.size()), 0.0f);
-    brotensor::download(dXg, dX_gpu.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host(dX_gpu.data());
+    brotensor::sync_all();
 
     // CPU forward closure: returns sum(dY * Y(X_perturbed)).
     auto loss_for_X = [&](const std::vector<float>& X_pert) {
@@ -808,16 +820,18 @@ static void run_one_bwd_input_fp16(const char* label,
 
     auto Wt_h = to_fp16(Wt);
     auto dY_h = to_fp16(dY);
-    GpuTensor Wg, dYg, dXg;
-    brotensor::upload_fp16(Wt_h.data(), C_out, C_in * kH * kW, Wg);
-    brotensor::upload_fp16(dY_h.data(), N, C_out * H_out * W_out, dYg);
-    brotensor::conv2d_backward_input_gpu(Wg, dYg, N, C_in, H, W, C_out, kH, kW,
-                                         stride_h, stride_w, pad_h, pad_w,
-                                         dil_h, dil_w, dXg);
+    Tensor dXg;
+    Tensor Wg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                          Wt_h.data(), C_out, C_in * kH * kW);
+    Tensor dYg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                           dY_h.data(), N, C_out * H_out * W_out);
+    brotensor::conv2d_backward_input(Wg, dYg, N, C_in, H, W, C_out, kH, kW,
+                                     stride_h, stride_w, pad_h, pad_w,
+                                     dil_h, dil_w, dXg);
     CHECK(dXg.dtype == Dtype::FP16);
     std::vector<uint16_t> got(dXg.size());
-    brotensor::download_fp16(dXg, got.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     int bad; float me;
     check_fp16_against(got, dX_cpu, "fp16-bwd-input", bad, me);
 }
@@ -849,20 +863,22 @@ static void run_one_bwd_weight_fp16(const char* label,
 
     auto X_h = to_fp16(X);
     auto dY_h = to_fp16(dY);
-    GpuTensor Xg, dYg, dWg;
-    brotensor::upload_fp16(X_h.data(), N, C_in * H * W, Xg);
-    brotensor::upload_fp16(dY_h.data(), N, C_out * H_out * W_out, dYg);
+    Tensor Xg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                          X_h.data(), N, C_in * H * W);
+    Tensor dYg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                           dY_h.data(), N, C_out * H_out * W_out);
     std::vector<uint16_t> zeros_h(C_out * C_in * kH * kW,
                                   brotensor::fp32_to_fp16_bits(0.0f));
-    brotensor::upload_fp16(zeros_h.data(), C_out, C_in * kH * kW, dWg);
+    Tensor dWg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                           zeros_h.data(), C_out, C_in * kH * kW);
 
-    brotensor::conv2d_backward_weight_gpu(Xg, dYg, N, C_in, H, W, C_out, kH, kW,
-                                          stride_h, stride_w, pad_h, pad_w,
-                                          dil_h, dil_w, dWg);
+    brotensor::conv2d_backward_weight(Xg, dYg, N, C_in, H, W, C_out, kH, kW,
+                                      stride_h, stride_w, pad_h, pad_w,
+                                      dil_h, dil_w, dWg);
     CHECK(dWg.dtype == Dtype::FP16);
     std::vector<uint16_t> got(dWg.size());
-    brotensor::download_fp16(dWg, got.data());
-    brotensor::cuda_sync();
+    dWg.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     int bad; float me;
     check_fp16_against(got, dW_cpu, "fp16-bwd-weight", bad, me);
 }
@@ -882,15 +898,16 @@ static void run_one_bwd_bias_fp16(const char* label,
     conv2d_backward_bias_cpu_fp32(dY_q, N, C_out, H_out, W_out, dB_cpu);
 
     auto dY_h = to_fp16(dY);
-    GpuTensor dYg, dBg;
-    brotensor::upload_fp16(dY_h.data(), N, C_out * H_out * W_out, dYg);
+    Tensor dYg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                           dY_h.data(), N, C_out * H_out * W_out);
     std::vector<uint16_t> zeros_h(C_out, brotensor::fp32_to_fp16_bits(0.0f));
-    brotensor::upload_fp16(zeros_h.data(), C_out, 1, dBg);
-    brotensor::conv2d_backward_bias_gpu(dYg, N, C_out, H_out, W_out, dBg);
+    Tensor dBg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                           zeros_h.data(), C_out, 1);
+    brotensor::conv2d_backward_bias(dYg, N, C_out, H_out, W_out, dBg);
     CHECK(dBg.dtype == Dtype::FP16);
     std::vector<uint16_t> got(dBg.size());
-    brotensor::download_fp16(dBg, got.data());
-    brotensor::cuda_sync();
+    dBg.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
     int bad; float me;
     check_fp16_against(got, dB_cpu, "fp16-bwd-bias", bad, me);
 }
@@ -929,17 +946,20 @@ static void run_grouped_fp32(const char* label,
                     stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
                     H_out, W_out, Y_cpu, groups);
 
-    GpuTensor Xg, Wg, Bg, Yg;
-    brotensor::upload(X.data(),    N, C_in * H * W, Xg);
-    brotensor::upload(Wt.data(),   C_out, Cg_in * kH * kW, Wg);
-    brotensor::upload(bias.data(), C_out, 1, Bg);
-    brotensor::conv2d_forward_gpu(Xg, Wg, &Bg,
-                                  N, C_in, H, W, C_out, kH, kW,
-                                  stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                                  groups, Yg);
+    Tensor Yg;
+    Tensor Xg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     X.data(), N, C_in * H * W);
+    Tensor Wg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     Wt.data(), C_out, Cg_in * kH * kW);
+    Tensor Bg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     bias.data(), C_out, 1);
+    brotensor::conv2d_forward(Xg, Wg, &Bg,
+                              N, C_in, H, W, C_out, kH, kW,
+                              stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                              groups, Yg);
     CHECK(Yg.cols == C_out * H_out * W_out);
     std::vector<float> Y_gpu(static_cast<size_t>(Yg.size()), 0.0f);
-    brotensor::download(Yg, Y_gpu.data()); brotensor::cuda_sync();
+    Yg.copy_to_host(Y_gpu.data()); brotensor::sync_all();
     {
         int bad = 0; float me = 0.0f;
         for (size_t i = 0; i < Y_cpu.size(); ++i) {
@@ -957,13 +977,14 @@ static void run_grouped_fp32(const char* label,
     conv2d_backward_input_cpu_fp32(Wt, dY, N, C_in, H, W, C_out, kH, kW,
                                    stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
                                    H_out, W_out, dX_cpu, groups);
-    GpuTensor dYg, dXg;
-    brotensor::upload(dY.data(), N, C_out * H_out * W_out, dYg);
-    brotensor::conv2d_backward_input_gpu(Wg, dYg, N, C_in, H, W, C_out, kH, kW,
-                                         stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                                         groups, dXg);
+    Tensor dXg;
+    Tensor dYg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                      dY.data(), N, C_out * H_out * W_out);
+    brotensor::conv2d_backward_input(Wg, dYg, N, C_in, H, W, C_out, kH, kW,
+                                     stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                                     groups, dXg);
     std::vector<float> dX_gpu(static_cast<size_t>(dXg.size()), 0.0f);
-    brotensor::download(dXg, dX_gpu.data()); brotensor::cuda_sync();
+    dXg.copy_to_host(dX_gpu.data()); brotensor::sync_all();
     {
         int bad = 0; float me = 0.0f;
         for (size_t i = 0; i < dX_cpu.size(); ++i) {
@@ -981,14 +1002,13 @@ static void run_grouped_fp32(const char* label,
     conv2d_backward_weight_cpu_fp32(X, dY, N, C_in, H, W, C_out, kH, kW,
                                     stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
                                     H_out, W_out, dW_cpu, groups);
-    GpuTensor dWg;
-    std::vector<float> zeros_w(w_n, 0.0f);
-    brotensor::upload(zeros_w.data(), C_out, Cg_in * kH * kW, dWg);
-    brotensor::conv2d_backward_weight_gpu(Xg, dYg, N, C_in, H, W, C_out, kH, kW,
-                                          stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                                          groups, dWg);
+    Tensor dWg = Tensor::zeros_on(brotensor::Device::CUDA,
+                                  C_out, Cg_in * kH * kW);
+    brotensor::conv2d_backward_weight(Xg, dYg, N, C_in, H, W, C_out, kH, kW,
+                                      stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                                      groups, dWg);
     std::vector<float> dW_gpu(static_cast<size_t>(dWg.size()), 0.0f);
-    brotensor::download(dWg, dW_gpu.data()); brotensor::cuda_sync();
+    dWg.copy_to_host(dW_gpu.data()); brotensor::sync_all();
     {
         int bad = 0; float me = 0.0f;
         for (size_t i = 0; i < dW_cpu.size(); ++i) {
@@ -1004,12 +1024,10 @@ static void run_grouped_fp32(const char* label,
     // dB (no groups argument by spec).
     std::vector<float> dB_cpu;
     conv2d_backward_bias_cpu_fp32(dY, N, C_out, H_out, W_out, dB_cpu);
-    GpuTensor dBg;
-    std::vector<float> zeros_b(C_out, 0.0f);
-    brotensor::upload(zeros_b.data(), C_out, 1, dBg);
-    brotensor::conv2d_backward_bias_gpu(dYg, N, C_out, H_out, W_out, dBg);
+    Tensor dBg = Tensor::zeros_on(brotensor::Device::CUDA, C_out, 1);
+    brotensor::conv2d_backward_bias(dYg, N, C_out, H_out, W_out, dBg);
     std::vector<float> dB_gpu(static_cast<size_t>(dBg.size()), 0.0f);
-    brotensor::download(dBg, dB_gpu.data()); brotensor::cuda_sync();
+    dBg.copy_to_host(dB_gpu.data()); brotensor::sync_all();
     {
         int bad = 0; float me = 0.0f;
         for (int c = 0; c < C_out; ++c) {
@@ -1071,45 +1089,51 @@ static void run_grouped_fp16(const char* label,
     auto Wt_h = to_fp16(Wt);
     auto B_h  = to_fp16(bias);
     auto dY_h = to_fp16(dY);
-    GpuTensor Xg, Wg, Bg, dYg, Yg, dXg, dWg, dBg;
-    brotensor::upload_fp16(X_h.data(),  N, C_in * H * W, Xg);
-    brotensor::upload_fp16(Wt_h.data(), C_out, Cg_in * kH * kW, Wg);
-    brotensor::upload_fp16(B_h.data(),  C_out, 1, Bg);
-    brotensor::upload_fp16(dY_h.data(), N, C_out * H_out * W_out, dYg);
+    Tensor Yg, dXg;
+    Tensor Xg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                          X_h.data(), N, C_in * H * W);
+    Tensor Wg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                          Wt_h.data(), C_out, Cg_in * kH * kW);
+    Tensor Bg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                          B_h.data(), C_out, 1);
+    Tensor dYg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                           dY_h.data(), N, C_out * H_out * W_out);
 
     // fwd
-    brotensor::conv2d_forward_gpu(Xg, Wg, &Bg,
-                                  N, C_in, H, W, C_out, kH, kW,
-                                  stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                                  groups, Yg);
-    std::vector<uint16_t> Y_h(Yg.size()); brotensor::download_fp16(Yg, Y_h.data());
-    brotensor::cuda_sync();
+    brotensor::conv2d_forward(Xg, Wg, &Bg,
+                              N, C_in, H, W, C_out, kH, kW,
+                              stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                              groups, Yg);
+    std::vector<uint16_t> Y_h(Yg.size()); Yg.copy_to_host_fp16(Y_h.data());
+    brotensor::sync_all();
     { int bad; float me; check_fp16_against(Y_h, Y_cpu, "fp16-grouped-fwd", bad, me); }
 
     // dX
-    brotensor::conv2d_backward_input_gpu(Wg, dYg, N, C_in, H, W, C_out, kH, kW,
-                                         stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                                         groups, dXg);
-    std::vector<uint16_t> dX_h(dXg.size()); brotensor::download_fp16(dXg, dX_h.data());
-    brotensor::cuda_sync();
+    brotensor::conv2d_backward_input(Wg, dYg, N, C_in, H, W, C_out, kH, kW,
+                                     stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                                     groups, dXg);
+    std::vector<uint16_t> dX_h(dXg.size()); dXg.copy_to_host_fp16(dX_h.data());
+    brotensor::sync_all();
     { int bad; float me; check_fp16_against(dX_h, dX_cpu, "fp16-grouped-dX", bad, me); }
 
     // dW (caller zeros)
     std::vector<uint16_t> zeros_w(w_n, brotensor::fp32_to_fp16_bits(0.0f));
-    brotensor::upload_fp16(zeros_w.data(), C_out, Cg_in * kH * kW, dWg);
-    brotensor::conv2d_backward_weight_gpu(Xg, dYg, N, C_in, H, W, C_out, kH, kW,
-                                          stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                                          groups, dWg);
-    std::vector<uint16_t> dW_h(dWg.size()); brotensor::download_fp16(dWg, dW_h.data());
-    brotensor::cuda_sync();
+    Tensor dWg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                           zeros_w.data(), C_out, Cg_in * kH * kW);
+    brotensor::conv2d_backward_weight(Xg, dYg, N, C_in, H, W, C_out, kH, kW,
+                                      stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                                      groups, dWg);
+    std::vector<uint16_t> dW_h(dWg.size()); dWg.copy_to_host_fp16(dW_h.data());
+    brotensor::sync_all();
     { int bad; float me; check_fp16_against(dW_h, dW_cpu, "fp16-grouped-dW", bad, me); }
 
     // dB
     std::vector<uint16_t> zeros_b(C_out, brotensor::fp32_to_fp16_bits(0.0f));
-    brotensor::upload_fp16(zeros_b.data(), C_out, 1, dBg);
-    brotensor::conv2d_backward_bias_gpu(dYg, N, C_out, H_out, W_out, dBg);
-    std::vector<uint16_t> dB_h(dBg.size()); brotensor::download_fp16(dBg, dB_h.data());
-    brotensor::cuda_sync();
+    Tensor dBg = Tensor::from_host_fp16_on(brotensor::Device::CUDA,
+                                           zeros_b.data(), C_out, 1);
+    brotensor::conv2d_backward_bias(dYg, N, C_out, H_out, W_out, dBg);
+    std::vector<uint16_t> dB_h(dBg.size()); dBg.copy_to_host_fp16(dB_h.data());
+    brotensor::sync_all();
     { int bad; float me; check_fp16_against(dB_h, dB_cpu, "fp16-grouped-dB", bad, me); }
 }
 
@@ -1137,26 +1161,29 @@ static void run_depthwise_finite_diff() {
     for (auto& v : dY) v = dist(rng);
 
     // Analytic dX and dW from GPU.
-    GpuTensor Xg, Wg, dYg, dXg, dWg;
-    brotensor::upload(X.data(),  N, C_in * H * W, Xg);
-    brotensor::upload(Wt.data(), C_out, Cg_in * kH * kW, Wg);
-    brotensor::upload(dY.data(), N, C_out * H_out * W_out, dYg);
+    Tensor dXg;
+    Tensor Xg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     X.data(), N, C_in * H * W);
+    Tensor Wg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                     Wt.data(), C_out, Cg_in * kH * kW);
+    Tensor dYg = Tensor::from_host_on(brotensor::Device::CUDA,
+                                      dY.data(), N, C_out * H_out * W_out);
 
-    brotensor::conv2d_backward_input_gpu(Wg, dYg,
-                                         N, C_in, H, W, C_out, kH, kW,
-                                         stride_h, stride_w, pad_h, pad_w,
-                                         dil_h, dil_w, groups, dXg);
+    brotensor::conv2d_backward_input(Wg, dYg,
+                                     N, C_in, H, W, C_out, kH, kW,
+                                     stride_h, stride_w, pad_h, pad_w,
+                                     dil_h, dil_w, groups, dXg);
     std::vector<float> dX_gpu(static_cast<size_t>(dXg.size()), 0.0f);
-    brotensor::download(dXg, dX_gpu.data()); brotensor::cuda_sync();
+    dXg.copy_to_host(dX_gpu.data()); brotensor::sync_all();
 
-    std::vector<float> zeros_w(w_n, 0.0f);
-    brotensor::upload(zeros_w.data(), C_out, Cg_in * kH * kW, dWg);
-    brotensor::conv2d_backward_weight_gpu(Xg, dYg,
-                                          N, C_in, H, W, C_out, kH, kW,
-                                          stride_h, stride_w, pad_h, pad_w,
-                                          dil_h, dil_w, groups, dWg);
+    Tensor dWg = Tensor::zeros_on(brotensor::Device::CUDA,
+                                  C_out, Cg_in * kH * kW);
+    brotensor::conv2d_backward_weight(Xg, dYg,
+                                      N, C_in, H, W, C_out, kH, kW,
+                                      stride_h, stride_w, pad_h, pad_w,
+                                      dil_h, dil_w, groups, dWg);
     std::vector<float> dW_gpu(static_cast<size_t>(dWg.size()), 0.0f);
-    brotensor::download(dWg, dW_gpu.data()); brotensor::cuda_sync();
+    dWg.copy_to_host(dW_gpu.data()); brotensor::sync_all();
 
     auto loss_for_X = [&](const std::vector<float>& X_pert) {
         std::vector<float> Y;
@@ -1221,11 +1248,10 @@ static void run_depthwise_finite_diff() {
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_conv2d\n");
 

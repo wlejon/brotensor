@@ -1,9 +1,10 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 
 namespace brotensor {
+namespace detail::cuda {
 
 namespace {
 
@@ -23,15 +24,19 @@ __global__ void sgd_step_kernel(float* __restrict__ param,
 
 } // namespace
 
-void sgd_step_gpu(GpuTensor& param, GpuTensor& grad, GpuTensor& velocity,
-                  float lr, float momentum) {
+void sgd_step(::brotensor::Tensor& param, ::brotensor::Tensor& grad,
+              ::brotensor::Tensor& velocity, float lr, float momentum) {
     const int n = param.size();
     if (n == 0) return;
     constexpr int BLOCK = 256;
     const int blocks = (n + BLOCK - 1) / BLOCK;
-    sgd_step_kernel<<<blocks, BLOCK>>>(param.data, grad.data, velocity.data,
-                                       lr, momentum, n);
+    sgd_step_kernel<<<blocks, BLOCK>>>(
+        static_cast<float*>(param.data),
+        static_cast<const float*>(grad.data),
+        static_cast<float*>(velocity.data),
+        lr, momentum, n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

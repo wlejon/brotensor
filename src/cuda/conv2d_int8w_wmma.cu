@@ -13,6 +13,8 @@
 #include <cstdint>
 
 namespace brotensor {
+namespace detail {
+namespace cuda {
 namespace conv2d_int8w_wmma_internal {
 
 using namespace nvcuda;
@@ -270,4 +272,6 @@ bool launch_conv2d_int8w_implicit_gemm_wmma(
 }
 
 } // namespace conv2d_int8w_wmma_internal
+} // namespace cuda
+} // namespace detail
 } // namespace brotensor

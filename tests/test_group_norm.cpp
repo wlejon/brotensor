@@ -12,8 +12,9 @@
 #include <stdexcept>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 
@@ -169,21 +170,21 @@ static void run_fwd_fp16(const char* label,
     auto gamma_h16 = to_fp16(gamma);
     auto beta_h16  = to_fp16(beta);
 
-    GpuTensor Xg, Gg, Bg, Yg;
-    brotensor::upload_fp16(X_h16.data(),     N, C * spatial, Xg);
-    brotensor::upload_fp16(gamma_h16.data(), C, 1,           Gg);
-    brotensor::upload_fp16(beta_h16.data(),  C, 1,           Bg);
+    Tensor Xg, Gg, Bg, Yg;
+    Xg = Tensor::from_host_fp16_on(Device::CUDA, X_h16.data(),     N, C * spatial);
+    Gg = Tensor::from_host_fp16_on(Device::CUDA, gamma_h16.data(), C, 1);
+    Bg = Tensor::from_host_fp16_on(Device::CUDA, beta_h16.data(),  C, 1);
 
-    brotensor::group_norm_forward_gpu(Xg, Gg, Bg, N, C, H, W,
-                                      num_groups, 1e-5f, Yg);
+    brotensor::group_norm_forward(Xg, Gg, Bg, N, C, H, W,
+                                  num_groups, 1e-5f, Yg);
 
     CHECK(Yg.rows == N);
     CHECK(Yg.cols == C * spatial);
     CHECK(Yg.dtype == Dtype::FP16);
 
     std::vector<uint16_t> Y_h16(static_cast<size_t>(Yg.size()), 0);
-    brotensor::download_fp16(Yg, Y_h16.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host_fp16(Y_h16.data());
+    brotensor::sync_all();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -223,21 +224,21 @@ static void run_fwd_fp32(const char* label,
     std::vector<float> Y_cpu;
     group_norm_cpu(X, gamma, beta, N, C, H, W, num_groups, 1e-5f, Y_cpu);
 
-    GpuTensor Xg, Gg, Bg, Yg;
-    brotensor::upload(X.data(),     N, C * spatial, Xg);
-    brotensor::upload(gamma.data(), C, 1,           Gg);
-    brotensor::upload(beta.data(),  C, 1,           Bg);
+    Tensor Xg, Gg, Bg, Yg;
+    Xg = Tensor::from_host_on(Device::CUDA, X.data(),     N, C * spatial);
+    Gg = Tensor::from_host_on(Device::CUDA, gamma.data(), C, 1);
+    Bg = Tensor::from_host_on(Device::CUDA, beta.data(),  C, 1);
 
-    brotensor::group_norm_forward_gpu(Xg, Gg, Bg, N, C, H, W,
-                                      num_groups, 1e-5f, Yg);
+    brotensor::group_norm_forward(Xg, Gg, Bg, N, C, H, W,
+                                  num_groups, 1e-5f, Yg);
 
     CHECK(Yg.rows == N);
     CHECK(Yg.cols == C * spatial);
     CHECK(Yg.dtype == Dtype::FP32);
 
     std::vector<float> got(static_cast<size_t>(Yg.size()), 0.0f);
-    brotensor::download(Yg, got.data());
-    brotensor::cuda_sync();
+    Yg.copy_to_host(got.data());
+    brotensor::sync_all();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -277,18 +278,18 @@ static void run_bwd_fp32(const char* label,
     group_norm_backward_cpu(X, gamma, dY, N, C, H, W, num_groups, 1e-5f,
                             dX_cpu, dG_cpu, dB_cpu);
 
-    GpuTensor Xg, Gg, dYg, dXg, dGg, dBg;
-    brotensor::upload(X.data(),     N, C * spatial, Xg);
-    brotensor::upload(gamma.data(), C, 1,           Gg);
-    brotensor::upload(dY.data(),    N, C * spatial, dYg);
+    Tensor Xg, Gg, dYg, dXg, dGg, dBg;
+    Xg  = Tensor::from_host_on(Device::CUDA, X.data(),     N, C * spatial);
+    Gg  = Tensor::from_host_on(Device::CUDA, gamma.data(), C, 1);
+    dYg = Tensor::from_host_on(Device::CUDA, dY.data(),    N, C * spatial);
     // Zero-initialize accumulators (caller responsibility).
     std::vector<float> zeros(C, 0.0f);
-    brotensor::upload(zeros.data(), C, 1, dGg);
-    brotensor::upload(zeros.data(), C, 1, dBg);
+    dGg = Tensor::from_host_on(Device::CUDA, zeros.data(), C, 1);
+    dBg = Tensor::from_host_on(Device::CUDA, zeros.data(), C, 1);
 
-    brotensor::group_norm_backward_gpu(Xg, Gg, dYg, N, C, H, W,
-                                       num_groups, 1e-5f,
-                                       dXg, dGg, dBg);
+    brotensor::group_norm_backward(Xg, Gg, dYg, N, C, H, W,
+                                   num_groups, 1e-5f,
+                                   dXg, dGg, dBg);
 
     CHECK(dXg.rows == N);
     CHECK(dXg.cols == C * spatial);
@@ -296,10 +297,10 @@ static void run_bwd_fp32(const char* label,
 
     std::vector<float> dX_got(static_cast<size_t>(dXg.size()), 0.0f);
     std::vector<float> dG_got(C, 0.0f), dB_got(C, 0.0f);
-    brotensor::download(dXg, dX_got.data());
-    brotensor::download(dGg, dG_got.data());
-    brotensor::download(dBg, dB_got.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host(dX_got.data());
+    dGg.copy_to_host(dG_got.data());
+    dBg.copy_to_host(dB_got.data());
+    brotensor::sync_all();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -366,17 +367,17 @@ static void run_bwd_fp16(const char* label,
     auto gamma_h16 = to_fp16(gamma);
     auto dY_h16    = to_fp16(dY);
 
-    GpuTensor Xg, Gg, dYg, dXg, dGg, dBg;
-    brotensor::upload_fp16(X_h16.data(),     N, C * spatial, Xg);
-    brotensor::upload_fp16(gamma_h16.data(), C, 1,           Gg);
-    brotensor::upload_fp16(dY_h16.data(),    N, C * spatial, dYg);
+    Tensor Xg, Gg, dYg, dXg, dGg, dBg;
+    Xg  = Tensor::from_host_fp16_on(Device::CUDA, X_h16.data(),     N, C * spatial);
+    Gg  = Tensor::from_host_fp16_on(Device::CUDA, gamma_h16.data(), C, 1);
+    dYg = Tensor::from_host_fp16_on(Device::CUDA, dY_h16.data(),    N, C * spatial);
     std::vector<uint16_t> zeros_h(C, brotensor::fp32_to_fp16_bits(0.0f));
-    brotensor::upload_fp16(zeros_h.data(), C, 1, dGg);
-    brotensor::upload_fp16(zeros_h.data(), C, 1, dBg);
+    dGg = Tensor::from_host_fp16_on(Device::CUDA, zeros_h.data(), C, 1);
+    dBg = Tensor::from_host_fp16_on(Device::CUDA, zeros_h.data(), C, 1);
 
-    brotensor::group_norm_backward_gpu(Xg, Gg, dYg, N, C, H, W,
-                                       num_groups, 1e-5f,
-                                       dXg, dGg, dBg);
+    brotensor::group_norm_backward(Xg, Gg, dYg, N, C, H, W,
+                                   num_groups, 1e-5f,
+                                   dXg, dGg, dBg);
 
     CHECK(dXg.rows == N);
     CHECK(dXg.cols == C * spatial);
@@ -384,10 +385,10 @@ static void run_bwd_fp16(const char* label,
 
     std::vector<uint16_t> dX_got_h(static_cast<size_t>(dXg.size()), 0);
     std::vector<uint16_t> dG_got_h(C, 0), dB_got_h(C, 0);
-    brotensor::download_fp16(dXg, dX_got_h.data());
-    brotensor::download_fp16(dGg, dG_got_h.data());
-    brotensor::download_fp16(dBg, dB_got_h.data());
-    brotensor::cuda_sync();
+    dXg.copy_to_host_fp16(dX_got_h.data());
+    dGg.copy_to_host_fp16(dG_got_h.data());
+    dBg.copy_to_host_fp16(dB_got_h.data());
+    brotensor::sync_all();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -430,11 +431,10 @@ static void run_bwd_fp16(const char* label,
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_group_norm\n");
 

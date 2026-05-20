@@ -1,9 +1,11 @@
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+#include <brotensor/detail/dispatch.h>
+#include <brotensor/tensor.h>
+
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
 
 // Naive correctness-first kernels mirroring src/nn/multi_head_attention.cpp.
 // Heads are stored stacked along rows:
@@ -368,24 +370,27 @@ __global__ void mha_dX_proj_kernel(const float* __restrict__ dQh,
 
 } // namespace
 
-void mha_forward_gpu(const GpuTensor& X,
-                     const GpuTensor& Wq, const GpuTensor& Wk,
-                     const GpuTensor& Wv, const GpuTensor& Wo,
-                     const float* d_mask,
-                     int num_heads,
-                     GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
-                     GpuTensor& Attnh, GpuTensor& Yconcat,
-                     GpuTensor& O) {
+void mha_forward(const ::brotensor::Tensor& X,
+                 const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                 const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                 const float* d_mask,
+                 int num_heads,
+                 ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,
+                 ::brotensor::Tensor& Attnh, ::brotensor::Tensor& Yconcat,
+                 ::brotensor::Tensor& O) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    using ::brotensor::Dtype;
     const int K = X.rows;
     const int D = X.cols;
     const int H = num_heads;
     const int dh = D / H;
-    if (Qh.rows != H * K || Qh.cols != dh) Qh.resize(H * K, dh);
-    if (Kh.rows != H * K || Kh.cols != dh) Kh.resize(H * K, dh);
-    if (Vh.rows != H * K || Vh.cols != dh) Vh.resize(H * K, dh);
-    if (Attnh.rows != H * K || Attnh.cols != K) Attnh.resize(H * K, K);
-    if (Yconcat.rows != K || Yconcat.cols != D) Yconcat.resize(K, D);
-    if (O.rows != K || O.cols != D) O.resize(K, D);
+    if (Qh.rows != H * K || Qh.cols != dh) Qh.resize(H * K, dh, Dtype::FP32);
+    if (Kh.rows != H * K || Kh.cols != dh) Kh.resize(H * K, dh, Dtype::FP32);
+    if (Vh.rows != H * K || Vh.cols != dh) Vh.resize(H * K, dh, Dtype::FP32);
+    if (Attnh.rows != H * K || Attnh.cols != K) Attnh.resize(H * K, K, Dtype::FP32);
+    if (Yconcat.rows != K || Yconcat.cols != D) Yconcat.resize(K, D, Dtype::FP32);
+    if (O.rows != K || O.cols != D) O.resize(K, D, Dtype::FP32);
     if (K == 0 || D == 0 || H == 0) return;
 
     const dim3 block_kdh(16, 16);
@@ -393,31 +398,44 @@ void mha_forward_gpu(const GpuTensor& X,
     const dim3 block_kd(16, 16);
     const dim3 block_dd(16, 16);
 
+    const float* X_p   = static_cast<const float*>(X.data);
+    const float* Wq_p  = static_cast<const float*>(Wq.data);
+    const float* Wk_p  = static_cast<const float*>(Wk.data);
+    const float* Wv_p  = static_cast<const float*>(Wv.data);
+    const float* Wo_p  = static_cast<const float*>(Wo.data);
+    float* Qh_p        = static_cast<float*>(Qh.data);
+    float* Kh_p        = static_cast<float*>(Kh.data);
+    float* Vh_p        = static_cast<float*>(Vh.data);
+    float* Attnh_p     = static_cast<float*>(Attnh.data);
+    float* Yconcat_p   = static_cast<float*>(Yconcat.data);
+    float* O_p         = static_cast<float*>(O.data);
+
     // Q/K/V projections.
     {
         dim3 grid(((dh) + block_kdh.x - 1) / block_kdh.x,
                   ((K)  + block_kdh.y - 1) / block_kdh.y,
                   H);
-        mha_proj_kernel<<<grid, block_kdh>>>(X.data, Wq.data, Qh.data, K, D, dh);
-        mha_proj_kernel<<<grid, block_kdh>>>(X.data, Wk.data, Kh.data, K, D, dh);
-        mha_proj_kernel<<<grid, block_kdh>>>(X.data, Wv.data, Vh.data, K, D, dh);
+        mha_proj_kernel<<<grid, block_kdh>>>(X_p, Wq_p, Qh_p, K, D, dh);
+        mha_proj_kernel<<<grid, block_kdh>>>(X_p, Wk_p, Kh_p, K, D, dh);
+        mha_proj_kernel<<<grid, block_kdh>>>(X_p, Wv_p, Vh_p, K, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // Scores → reuse Attnh storage temporarily for raw scores.
-    GpuTensor scores(H * K, K);
+    Tensor scores = Tensor::empty_on(Device::CUDA, H * K, K, Dtype::FP32);
+    float* scores_p = static_cast<float*>(scores.data);
     {
         const float inv_sqrtdh = 1.0f / sqrtf(static_cast<float>(dh));
         dim3 grid(((K) + block_kk.x - 1) / block_kk.x,
                   ((K) + block_kk.y - 1) / block_kk.y,
                   H);
-        mha_scores_kernel<<<grid, block_kk>>>(Qh.data, Kh.data, scores.data,
+        mha_scores_kernel<<<grid, block_kk>>>(Qh_p, Kh_p, scores_p,
                                               K, dh, inv_sqrtdh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // Row-masked softmax across all H*K rows.
-    mha_row_softmax_kernel<<<H * K, ROW_SM_BLOCK>>>(scores.data, Attnh.data,
+    mha_row_softmax_kernel<<<H * K, ROW_SM_BLOCK>>>(scores_p, Attnh_p,
                                                     d_mask, K);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
@@ -426,8 +444,8 @@ void mha_forward_gpu(const GpuTensor& X,
         dim3 grid(((dh) + block_kdh.x - 1) / block_kdh.x,
                   ((K)  + block_kdh.y - 1) / block_kdh.y,
                   H);
-        mha_attn_apply_v_kernel<<<grid, block_kdh>>>(Attnh.data, Vh.data,
-                                                     Yconcat.data, K, dh, D);
+        mha_attn_apply_v_kernel<<<grid, block_kdh>>>(Attnh_p, Vh_p,
+                                                     Yconcat_p, K, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
@@ -435,30 +453,34 @@ void mha_forward_gpu(const GpuTensor& X,
     {
         dim3 grid(((D) + block_kd.x - 1) / block_kd.x,
                   ((K) + block_kd.y - 1) / block_kd.y);
-        mha_output_proj_kernel<<<grid, block_kd>>>(Yconcat.data, Wo.data, d_mask,
-                                                   O.data, K, D);
+        mha_output_proj_kernel<<<grid, block_kd>>>(Yconcat_p, Wo_p, d_mask,
+                                                   O_p, K, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     (void)block_dd;
+    (void)grid2d;
 }
 
-void mha_backward_gpu(const GpuTensor& dO,
-                      const GpuTensor& X,
-                      const GpuTensor& Qh, const GpuTensor& Kh,
-                      const GpuTensor& Vh, const GpuTensor& Attnh,
-                      const GpuTensor& Yconcat,
-                      const GpuTensor& Wq, const GpuTensor& Wk,
-                      const GpuTensor& Wv, const GpuTensor& Wo,
-                      const float* d_mask,
-                      int num_heads,
-                      GpuTensor& dX,
-                      GpuTensor& dWq, GpuTensor& dWk,
-                      GpuTensor& dWv, GpuTensor& dWo) {
+void mha_backward(const ::brotensor::Tensor& dO,
+                  const ::brotensor::Tensor& X,
+                  const ::brotensor::Tensor& Qh, const ::brotensor::Tensor& Kh,
+                  const ::brotensor::Tensor& Vh, const ::brotensor::Tensor& Attnh,
+                  const ::brotensor::Tensor& Yconcat,
+                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                  const float* d_mask,
+                  int num_heads,
+                  ::brotensor::Tensor& dX,
+                  ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
+                  ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    using ::brotensor::Dtype;
     const int K = X.rows;
     const int D = X.cols;
     const int H = num_heads;
     const int dh = D / H;
-    if (dX.rows != K || dX.cols != D) dX.resize(K, D);
+    if (dX.rows != K || dX.cols != D) dX.resize(K, D, Dtype::FP32);
     if (K == 0 || D == 0 || H == 0) return;
 
     const float inv_sqrtdh = 1.0f / sqrtf(static_cast<float>(dh));
@@ -467,31 +489,51 @@ void mha_backward_gpu(const GpuTensor& dO,
     const dim3 block_dd(16, 16);
     const dim3 block_kdh(16, 16);
 
+    const float* dO_p     = static_cast<const float*>(dO.data);
+    const float* X_p      = static_cast<const float*>(X.data);
+    const float* Qh_p     = static_cast<const float*>(Qh.data);
+    const float* Kh_p     = static_cast<const float*>(Kh.data);
+    const float* Vh_p     = static_cast<const float*>(Vh.data);
+    const float* Attnh_p  = static_cast<const float*>(Attnh.data);
+    const float* Yconcat_p = static_cast<const float*>(Yconcat.data);
+    const float* Wq_p     = static_cast<const float*>(Wq.data);
+    const float* Wk_p     = static_cast<const float*>(Wk.data);
+    const float* Wv_p     = static_cast<const float*>(Wv.data);
+    const float* Wo_p     = static_cast<const float*>(Wo.data);
+    float* dX_p           = static_cast<float*>(dX.data);
+    float* dWq_p          = static_cast<float*>(dWq.data);
+    float* dWk_p          = static_cast<float*>(dWk.data);
+    float* dWv_p          = static_cast<float*>(dWv.data);
+    float* dWo_p          = static_cast<float*>(dWo.data);
+
     // dYconcat (K, D) and dWo accumulation.
-    GpuTensor dYconcat(K, D);
+    Tensor dYconcat = Tensor::empty_on(Device::CUDA, K, D, Dtype::FP32);
+    float* dYconcat_p = static_cast<float*>(dYconcat.data);
     {
         dim3 grid(((D) + block_kd.x - 1) / block_kd.x,
                   ((K) + block_kd.y - 1) / block_kd.y);
-        mha_wo_back_dY_kernel<<<grid, block_kd>>>(dO.data, Wo.data, d_mask,
-                                                  dYconcat.data, K, D);
+        mha_wo_back_dY_kernel<<<grid, block_kd>>>(dO_p, Wo_p, d_mask,
+                                                  dYconcat_p, K, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid(((D) + block_dd.x - 1) / block_dd.x,
                   ((D) + block_dd.y - 1) / block_dd.y);
-        mha_wo_back_dW_kernel<<<grid, block_dd>>>(dO.data, Yconcat.data, d_mask,
-                                                  dWo.data, K, D);
+        mha_wo_back_dW_kernel<<<grid, block_dd>>>(dO_p, Yconcat_p, d_mask,
+                                                  dWo_p, K, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // dAttn (H*K, K), dVh (H*K, dh).
-    GpuTensor dAttn(H * K, K);
-    GpuTensor dVh(H * K, dh);
+    Tensor dAttn = Tensor::empty_on(Device::CUDA, H * K, K, Dtype::FP32);
+    Tensor dVh   = Tensor::empty_on(Device::CUDA, H * K, dh, Dtype::FP32);
+    float* dAttn_p = static_cast<float*>(dAttn.data);
+    float* dVh_p   = static_cast<float*>(dVh.data);
     {
         dim3 grid(((K) + block_kk.x - 1) / block_kk.x,
                   ((K) + block_kk.y - 1) / block_kk.y,
                   H);
-        mha_dAttn_kernel<<<grid, block_kk>>>(dYconcat.data, Vh.data, dAttn.data,
+        mha_dAttn_kernel<<<grid, block_kk>>>(dYconcat_p, Vh_p, dAttn_p,
                                              K, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -499,28 +541,31 @@ void mha_backward_gpu(const GpuTensor& dO,
         dim3 grid(((dh) + block_kdh.x - 1) / block_kdh.x,
                   ((K)  + block_kdh.y - 1) / block_kdh.y,
                   H);
-        mha_dV_kernel<<<grid, block_kdh>>>(Attnh.data, dYconcat.data, dVh.data,
+        mha_dV_kernel<<<grid, block_kdh>>>(Attnh_p, dYconcat_p, dVh_p,
                                            K, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // dScores (H*K, K) via per-row softmax backward.
-    GpuTensor dScores(H * K, K);
-    mha_row_softmax_back_kernel<<<H * K, ROW_SM_BLOCK>>>(Attnh.data, dAttn.data,
-                                                         d_mask, dScores.data,
+    Tensor dScores = Tensor::empty_on(Device::CUDA, H * K, K, Dtype::FP32);
+    float* dScores_p = static_cast<float*>(dScores.data);
+    mha_row_softmax_back_kernel<<<H * K, ROW_SM_BLOCK>>>(Attnh_p, dAttn_p,
+                                                         d_mask, dScores_p,
                                                          K, inv_sqrtdh);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     // dQh, dKh.
-    GpuTensor dQh(H * K, dh);
-    GpuTensor dKh(H * K, dh);
+    Tensor dQh = Tensor::empty_on(Device::CUDA, H * K, dh, Dtype::FP32);
+    Tensor dKh = Tensor::empty_on(Device::CUDA, H * K, dh, Dtype::FP32);
+    float* dQh_p = static_cast<float*>(dQh.data);
+    float* dKh_p = static_cast<float*>(dKh.data);
     {
         dim3 grid(((dh) + block_kdh.x - 1) / block_kdh.x,
                   ((K)  + block_kdh.y - 1) / block_kdh.y,
                   H);
-        mha_dQ_kernel<<<grid, block_kdh>>>(dScores.data, Kh.data, dQh.data,
+        mha_dQ_kernel<<<grid, block_kdh>>>(dScores_p, Kh_p, dQh_p,
                                            K, dh);
-        mha_dK_kernel<<<grid, block_kdh>>>(dScores.data, Qh.data, dKh.data,
+        mha_dK_kernel<<<grid, block_kdh>>>(dScores_p, Qh_p, dKh_p,
                                            K, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -529,19 +574,121 @@ void mha_backward_gpu(const GpuTensor& dO,
     {
         dim3 grid(((D) + block_dd.x - 1) / block_dd.x,
                   ((D) + block_dd.y - 1) / block_dd.y);
-        mha_dWqkv_kernel<<<grid, block_dd>>>(dQh.data, dKh.data, dVh.data, X.data,
-                                             dWq.data, dWk.data, dWv.data,
+        mha_dWqkv_kernel<<<grid, block_dd>>>(dQh_p, dKh_p, dVh_p, X_p,
+                                             dWq_p, dWk_p, dWv_p,
                                              K, D, dh, H);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid(((D) + block_kd.x - 1) / block_kd.x,
                   ((K) + block_kd.y - 1) / block_kd.y);
-        mha_dX_proj_kernel<<<grid, block_kd>>>(dQh.data, dKh.data, dVh.data,
-                                               Wq.data, Wk.data, Wv.data,
-                                               dX.data, K, D, dh, H);
+        mha_dX_proj_kernel<<<grid, block_kd>>>(dQh_p, dKh_p, dVh_p,
+                                               Wq_p, Wk_p, Wv_p,
+                                               dX_p, K, D, dh, H);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 }
 
-} // namespace brotensor
+// ─── Forward declarations of sibling-file ops (for vtable fill) ────────────
+
+void attention_forward(const ::brotensor::Tensor& X,
+                       const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                       const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                       const float* d_mask,
+                       ::brotensor::Tensor& Q, ::brotensor::Tensor& K, ::brotensor::Tensor& V,
+                       ::brotensor::Tensor& Attn, ::brotensor::Tensor& Y_pre_Wo,
+                       ::brotensor::Tensor& O);
+void attention_backward(const ::brotensor::Tensor& dO,
+                        const ::brotensor::Tensor& X,
+                        const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K,
+                        const ::brotensor::Tensor& V, const ::brotensor::Tensor& Attn,
+                        const ::brotensor::Tensor& Y_pre_Wo,
+                        const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                        const float* d_mask,
+                        ::brotensor::Tensor& dX,
+                        ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
+                        ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo);
+void cross_attention_forward(const ::brotensor::Tensor& X,
+                             const ::brotensor::Tensor& Ctx,
+                             const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                             const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                             const float* d_mask,
+                             int num_heads,
+                             ::brotensor::Tensor& O);
+void cross_attention_forward_train(const ::brotensor::Tensor& X,
+                                   const ::brotensor::Tensor& Ctx,
+                                   const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                                   const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                                   const float* d_mask,
+                                   int num_heads,
+                                   ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,
+                                   ::brotensor::Tensor& Attnh, ::brotensor::Tensor& Yconcat,
+                                   ::brotensor::Tensor& O);
+void cross_attention_backward(const ::brotensor::Tensor& dO,
+                              const ::brotensor::Tensor& X,
+                              const ::brotensor::Tensor& Ctx,
+                              const ::brotensor::Tensor& Qh, const ::brotensor::Tensor& Kh,
+                              const ::brotensor::Tensor& Vh, const ::brotensor::Tensor& Attnh,
+                              const ::brotensor::Tensor& Yconcat,
+                              const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                              const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                              const float* d_mask,
+                              int num_heads,
+                              ::brotensor::Tensor& dX,
+                              ::brotensor::Tensor& dCtx,
+                              ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
+                              ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo);
+void cross_attention_forward_with_attn(const ::brotensor::Tensor& X,
+                                       const ::brotensor::Tensor& Ctx,
+                                       const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                                       const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                                       const float* d_mask,
+                                       const ::brotensor::Tensor* attn_logit_bias,
+                                       int num_heads,
+                                       ::brotensor::Tensor& O,
+                                       ::brotensor::Tensor& AttnAvg);
+void self_attention_forward(const ::brotensor::Tensor& X,
+                            const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                            const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                            const float* d_mask, int num_heads,
+                            ::brotensor::Tensor& O);
+void self_attention_forward_train(const ::brotensor::Tensor& X,
+                                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                                  const float* d_mask, int num_heads,
+                                  ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,
+                                  ::brotensor::Tensor& Attnh, ::brotensor::Tensor& Yconcat,
+                                  ::brotensor::Tensor& O);
+void self_attention_backward(const ::brotensor::Tensor& dO,
+                             const ::brotensor::Tensor& X,
+                             const ::brotensor::Tensor& Qh, const ::brotensor::Tensor& Kh,
+                             const ::brotensor::Tensor& Vh, const ::brotensor::Tensor& Attnh,
+                             const ::brotensor::Tensor& Yconcat,
+                             const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
+                             const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                             const float* d_mask, int num_heads,
+                             ::brotensor::Tensor& dX,
+                             ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
+                             ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo);
+void attention_token_moments(const ::brotensor::Tensor& Attn,
+                             int h_lat, int w_lat,
+                             ::brotensor::Tensor& mass,
+                             ::brotensor::Tensor& centroid);
+
+void fill_cuda_vtable_attention(::brotensor::detail::OpsVTable& v) {
+    v.mha_forward                            = &mha_forward;
+    v.mha_backward                           = &mha_backward;
+    v.attention_forward                      = &attention_forward;
+    v.attention_backward                     = &attention_backward;
+    v.cross_attention_forward                = &cross_attention_forward;
+    v.cross_attention_forward_train          = &cross_attention_forward_train;
+    v.cross_attention_backward               = &cross_attention_backward;
+    v.cross_attention_forward_with_attn      = &cross_attention_forward_with_attn;
+    v.self_attention_forward                 = &self_attention_forward;
+    v.self_attention_forward_train           = &self_attention_forward_train;
+    v.self_attention_backward                = &self_attention_backward;
+    v.attention_token_moments                = &attention_token_moments;
+}
+
+} // namespace brotensor::detail::cuda

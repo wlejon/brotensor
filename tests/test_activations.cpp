@@ -1,4 +1,7 @@
-// CPU↔GPU parity for silu_forward_gpu and gelu_forward_gpu (FP32 + FP16).
+// Activation-op coverage for silu / gelu / quick_gelu / gelu_exact
+// (forward + backward, FP32 + FP16). Each op is run on CUDA-resident tensors
+// and checked against a host reference. CUDA-only — guarded out on a
+// CPU-only build since the FP16 paths live on the GPU backend.
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -11,8 +14,9 @@
 #include <stdexcept>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Device;
 using brotensor::Dtype;
+using brotensor::Tensor;
 
 static int g_failures = 0;
 
@@ -54,7 +58,9 @@ static float quick_gelu_grad_ref(float v) {
     return s + v * 1.702f * s * (1.0f - s);
 }
 
-using BwdOp = void (*)(const GpuTensor&, const GpuTensor&, GpuTensor&);
+// Device-neutral op signatures. Dispatch decides FP32 vs FP16 internally.
+using FwdOp = void (*)(const Tensor&, Tensor&);
+using BwdOp = void (*)(const Tensor&, const Tensor&, Tensor&);
 
 static void test_bwd_fp32(BwdOp op, float (*grad_ref)(float), const char* name) {
     std::printf("  %s_backward fp32\n", name);
@@ -65,15 +71,14 @@ static void test_bwd_fp32(BwdOp op, float (*grad_ref)(float), const char* name) 
     std::vector<float> hx(N), hdy(N);
     for (int i = 0; i < N; ++i) { hx[i] = dist(rng); hdy[i] = dydist(rng); }
 
-    GpuTensor x, dY, dX;
-    brotensor::upload(hx.data(),  N, 1, x);
-    brotensor::upload(hdy.data(), N, 1, dY);
+    Tensor x  = Tensor::from_host_on(Device::CUDA, hx.data(),  N, 1);
+    Tensor dY = Tensor::from_host_on(Device::CUDA, hdy.data(), N, 1);
+    Tensor dX = Tensor::empty_on(Device::CUDA, N, 1);
     op(x, dY, dX);
     CHECK(dX.rows == N && dX.cols == 1 && dX.dtype == Dtype::FP32);
 
-    std::vector<float> got(N);
-    brotensor::download(dX, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync(Device::CUDA);
+    std::vector<float> got = dX.to_host_vector();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -101,15 +106,14 @@ static void test_bwd_fp16(BwdOp op, float (*grad_ref)(float), const char* name) 
         hx_h[i]  = brotensor::fp32_to_fp16_bits(hx_f[i]);
         hdy_h[i] = brotensor::fp32_to_fp16_bits(hdy_f[i]);
     }
-    GpuTensor x, dY, dX;
-    brotensor::upload_fp16(hx_h.data(),  N, 1, x);
-    brotensor::upload_fp16(hdy_h.data(), N, 1, dY);
+    Tensor x  = Tensor::from_host_fp16_on(Device::CUDA, hx_h.data(),  N, 1);
+    Tensor dY = Tensor::from_host_fp16_on(Device::CUDA, hdy_h.data(), N, 1);
+    Tensor dX = Tensor::empty_on(Device::CUDA, N, 1, Dtype::FP16);
     op(x, dY, dX);
     CHECK(dX.rows == N && dX.cols == 1 && dX.dtype == Dtype::FP16);
 
-    std::vector<uint16_t> got_h(N);
-    brotensor::download_fp16(dX, got_h.data());
-    brotensor::cuda_sync();
+    brotensor::sync(Device::CUDA);
+    std::vector<uint16_t> got_h = dX.to_host_vector_fp16();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -126,8 +130,7 @@ static void test_bwd_fp16(BwdOp op, float (*grad_ref)(float), const char* name) 
     CHECK(bad == 0);
 }
 
-static void test_fp32(void (*op)(const GpuTensor&, GpuTensor&),
-                      float (*ref)(float), const char* name) {
+static void test_fp32(FwdOp op, float (*ref)(float), const char* name) {
     std::printf("  %s fp32\n", name);
     std::mt19937 rng(0xACE0);
     std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
@@ -135,14 +138,13 @@ static void test_fp32(void (*op)(const GpuTensor&, GpuTensor&),
     std::vector<float> host(N);
     for (auto& v : host) v = dist(rng);
 
-    GpuTensor x, y;
-    brotensor::upload(host.data(), N, 1, x);
+    Tensor x = Tensor::from_host_on(Device::CUDA, host.data(), N, 1);
+    Tensor y = Tensor::empty_on(Device::CUDA, N, 1);
     op(x, y);
     CHECK(y.rows == N && y.cols == 1 && y.dtype == Dtype::FP32);
 
-    std::vector<float> got(N);
-    brotensor::download(y, got.data());
-    brotensor::cuda_sync();
+    brotensor::sync(Device::CUDA);
+    std::vector<float> got = y.to_host_vector();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -156,8 +158,7 @@ static void test_fp32(void (*op)(const GpuTensor&, GpuTensor&),
     CHECK(bad == 0);
 }
 
-static void test_fp16(void (*op)(const GpuTensor&, GpuTensor&),
-                      float (*ref)(float), const char* name) {
+static void test_fp16(FwdOp op, float (*ref)(float), const char* name) {
     std::printf("  %s fp16\n", name);
     std::mt19937 rng(0xACE1);
     std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
@@ -168,14 +169,13 @@ static void test_fp16(void (*op)(const GpuTensor&, GpuTensor&),
         host_f[i] = dist(rng);
         host_h[i] = brotensor::fp32_to_fp16_bits(host_f[i]);
     }
-    GpuTensor x, y;
-    brotensor::upload_fp16(host_h.data(), N, 1, x);
+    Tensor x = Tensor::from_host_fp16_on(Device::CUDA, host_h.data(), N, 1);
+    Tensor y = Tensor::empty_on(Device::CUDA, N, 1, Dtype::FP16);
     op(x, y);
     CHECK(y.rows == N && y.cols == 1 && y.dtype == Dtype::FP16);
 
-    std::vector<uint16_t> got_h(N);
-    brotensor::download_fp16(y, got_h.data());
-    brotensor::cuda_sync();
+    brotensor::sync(Device::CUDA);
+    std::vector<uint16_t> got_h = y.to_host_vector_fp16();
 
     int bad = 0;
     float max_err = 0.0f;
@@ -192,31 +192,30 @@ static void test_fp16(void (*op)(const GpuTensor&, GpuTensor&),
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_activations\n");
 
-    test_fp32(brotensor::silu_forward_gpu, silu_ref, "silu");
-    test_fp16(brotensor::silu_forward_gpu, silu_ref, "silu");
-    test_fp32(brotensor::gelu_forward_gpu, gelu_ref, "gelu");
-    test_fp16(brotensor::gelu_forward_gpu, gelu_ref, "gelu");
-    test_fp32(brotensor::quick_gelu_forward_gpu, quick_gelu_ref, "quick_gelu");
-    test_fp16(brotensor::quick_gelu_forward_gpu, quick_gelu_ref, "quick_gelu");
-    test_fp32(brotensor::gelu_exact_forward_gpu, gelu_exact_ref, "gelu_exact");
-    test_fp16(brotensor::gelu_exact_forward_gpu, gelu_exact_ref, "gelu_exact");
+    test_fp32(brotensor::silu_forward, silu_ref, "silu");
+    test_fp16(brotensor::silu_forward, silu_ref, "silu");
+    test_fp32(brotensor::gelu_forward, gelu_ref, "gelu");
+    test_fp16(brotensor::gelu_forward, gelu_ref, "gelu");
+    test_fp32(brotensor::quick_gelu_forward, quick_gelu_ref, "quick_gelu");
+    test_fp16(brotensor::quick_gelu_forward, quick_gelu_ref, "quick_gelu");
+    test_fp32(brotensor::gelu_exact_forward, gelu_exact_ref, "gelu_exact");
+    test_fp16(brotensor::gelu_exact_forward, gelu_exact_ref, "gelu_exact");
 
-    test_bwd_fp32(brotensor::silu_backward_gpu,       silu_grad_ref,       "silu");
-    test_bwd_fp16(brotensor::silu_backward_gpu,       silu_grad_ref,       "silu");
-    test_bwd_fp32(brotensor::gelu_backward_gpu,       gelu_grad_ref,       "gelu");
-    test_bwd_fp16(brotensor::gelu_backward_gpu,       gelu_grad_ref,       "gelu");
-    test_bwd_fp32(brotensor::quick_gelu_backward_gpu, quick_gelu_grad_ref, "quick_gelu");
-    test_bwd_fp16(brotensor::quick_gelu_backward_gpu, quick_gelu_grad_ref, "quick_gelu");
-    test_bwd_fp32(brotensor::gelu_exact_backward_gpu, gelu_exact_grad_ref, "gelu_exact");
-    test_bwd_fp16(brotensor::gelu_exact_backward_gpu, gelu_exact_grad_ref, "gelu_exact");
+    test_bwd_fp32(brotensor::silu_backward,       silu_grad_ref,       "silu");
+    test_bwd_fp16(brotensor::silu_backward,       silu_grad_ref,       "silu");
+    test_bwd_fp32(brotensor::gelu_backward,       gelu_grad_ref,       "gelu");
+    test_bwd_fp16(brotensor::gelu_backward,       gelu_grad_ref,       "gelu");
+    test_bwd_fp32(brotensor::quick_gelu_backward, quick_gelu_grad_ref, "quick_gelu");
+    test_bwd_fp16(brotensor::quick_gelu_backward, quick_gelu_grad_ref, "quick_gelu");
+    test_bwd_fp32(brotensor::gelu_exact_backward, gelu_exact_grad_ref, "gelu_exact");
+    test_bwd_fp16(brotensor::gelu_exact_backward, gelu_exact_grad_ref, "gelu_exact");
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);

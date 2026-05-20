@@ -1,4 +1,4 @@
-// Tests for cross_attention_forward_with_attn_gpu: FP16 cross-attention with
+// Tests for cross_attention_forward_with_attn: FP16 cross-attention with
 // head-averaged attention map output and optional pre-softmax logit bias.
 
 #include <brotensor/ops.h>
@@ -11,8 +11,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 
@@ -43,10 +44,10 @@ static float max_abs_err(const std::vector<float>& a, const std::vector<float>& 
     return m;
 }
 
-// Helper: download an FP16 GpuTensor to float vector.
-static std::vector<float> dl_fp16(const GpuTensor& g) {
+// Helper: download an FP16 Tensor to float vector.
+static std::vector<float> dl_fp16(const Tensor& g) {
     std::vector<uint16_t> v(static_cast<size_t>(g.size()), 0);
-    brotensor::download_fp16(g, v.data());
+    g.copy_to_host_fp16(v.data());
     return from_fp16(v);
 }
 
@@ -78,36 +79,36 @@ static AttnInputs make_inputs(int Lq, int Lk, int D, int nh, uint32_t seed) {
 }
 
 static void upload_inputs(const AttnInputs& in,
-                          GpuTensor& Xg, GpuTensor& Cg,
-                          GpuTensor& Wqg, GpuTensor& Wkg,
-                          GpuTensor& Wvg, GpuTensor& Wog) {
-    brotensor::upload_fp16(in.X.data(),   in.Lq, in.D, Xg);
-    brotensor::upload_fp16(in.Ctx.data(), in.Lk, in.D, Cg);
-    brotensor::upload_fp16(in.Wq.data(),  in.D,  in.D, Wqg);
-    brotensor::upload_fp16(in.Wk.data(),  in.D,  in.D, Wkg);
-    brotensor::upload_fp16(in.Wv.data(),  in.D,  in.D, Wvg);
-    brotensor::upload_fp16(in.Wo.data(),  in.D,  in.D, Wog);
+                          Tensor& Xg, Tensor& Cg,
+                          Tensor& Wqg, Tensor& Wkg,
+                          Tensor& Wvg, Tensor& Wog) {
+    Xg  = Tensor::from_host_fp16_on(Device::CUDA, in.X.data(),   in.Lq, in.D);
+    Cg  = Tensor::from_host_fp16_on(Device::CUDA, in.Ctx.data(), in.Lk, in.D);
+    Wqg = Tensor::from_host_fp16_on(Device::CUDA, in.Wq.data(),  in.D,  in.D);
+    Wkg = Tensor::from_host_fp16_on(Device::CUDA, in.Wk.data(),  in.D,  in.D);
+    Wvg = Tensor::from_host_fp16_on(Device::CUDA, in.Wv.data(),  in.D,  in.D);
+    Wog = Tensor::from_host_fp16_on(Device::CUDA, in.Wo.data(),  in.D,  in.D);
 }
 
-// Test 1: parity vs existing FP16 cross_attention_forward_gpu (no bias, no mask).
+// Test 1: parity vs existing FP16 cross_attention_forward (no bias, no mask).
 static void test_parity_no_bias_no_mask() {
     const int Lq = 64, Lk = 16, D = 64, nh = 4;
-    std::printf("  parity vs cross_attention_forward_gpu  Lq=%d Lk=%d D=%d nh=%d\n",
+    std::printf("  parity vs cross_attention_forward  Lq=%d Lk=%d D=%d nh=%d\n",
                 Lq, Lk, D, nh);
     auto in = make_inputs(Lq, Lk, D, nh, 0xC0DEu);
 
-    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
+    Tensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
     upload_inputs(in, Xg, Cg, Wqg, Wkg, Wvg, Wog);
 
-    GpuTensor O_ref;
-    brotensor::cross_attention_forward_gpu(Xg, Cg, Wqg, Wkg, Wvg, Wog,
-                                           nullptr, nh, O_ref);
+    Tensor O_ref;
+    brotensor::cross_attention_forward(Xg, Cg, Wqg, Wkg, Wvg, Wog,
+                                       nullptr, nh, O_ref);
 
-    GpuTensor O, AttnAvg;
-    brotensor::cross_attention_forward_with_attn_gpu(Xg, Cg, Wqg, Wkg, Wvg, Wog,
-                                                     nullptr, nullptr, nh,
-                                                     O, AttnAvg);
-    brotensor::cuda_sync();
+    Tensor O, AttnAvg;
+    brotensor::cross_attention_forward_with_attn(Xg, Cg, Wqg, Wkg, Wvg, Wog,
+                                                 nullptr, nullptr, nh,
+                                                 O, AttnAvg);
+    brotensor::sync_all();
 
     CHECK(O.rows == Lq && O.cols == D && O.dtype == Dtype::FP16);
     CHECK(AttnAvg.rows == Lq && AttnAvg.cols == Lk && AttnAvg.dtype == Dtype::FP16);
@@ -204,19 +205,19 @@ static void test_attn_avg_correctness() {
     auto Xh  = to_fp16(X), Ch = to_fp16(Ctx);
     auto Wqh = to_fp16(Wq), Wkh = to_fp16(Wk),
          Wvh = to_fp16(Wv), Woh = to_fp16(Wo);
-    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
-    brotensor::upload_fp16(Xh.data(),  Lq, D, Xg);
-    brotensor::upload_fp16(Ch.data(),  Lk, D, Cg);
-    brotensor::upload_fp16(Wqh.data(), D,  D, Wqg);
-    brotensor::upload_fp16(Wkh.data(), D,  D, Wkg);
-    brotensor::upload_fp16(Wvh.data(), D,  D, Wvg);
-    brotensor::upload_fp16(Woh.data(), D,  D, Wog);
+    Tensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
+    Xg  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),  Lq, D);
+    Cg  = Tensor::from_host_fp16_on(Device::CUDA, Ch.data(),  Lk, D);
+    Wqg = Tensor::from_host_fp16_on(Device::CUDA, Wqh.data(), D,  D);
+    Wkg = Tensor::from_host_fp16_on(Device::CUDA, Wkh.data(), D,  D);
+    Wvg = Tensor::from_host_fp16_on(Device::CUDA, Wvh.data(), D,  D);
+    Wog = Tensor::from_host_fp16_on(Device::CUDA, Woh.data(), D,  D);
 
-    GpuTensor O, AttnAvg;
-    brotensor::cross_attention_forward_with_attn_gpu(Xg, Cg, Wqg, Wkg, Wvg, Wog,
-                                                     nullptr, nullptr, nh,
-                                                     O, AttnAvg);
-    brotensor::cuda_sync();
+    Tensor O, AttnAvg;
+    brotensor::cross_attention_forward_with_attn(Xg, Cg, Wqg, Wkg, Wvg, Wog,
+                                                 nullptr, nullptr, nh,
+                                                 O, AttnAvg);
+    brotensor::sync_all();
     auto got = dl_fp16(AttnAvg);
     const float me = max_abs_err(got, AttnAvg_ref);
     std::printf("    AttnAvg max_err=%g\n", me);
@@ -228,19 +229,18 @@ static void test_bias_injection() {
     std::printf("  bias injection (masks token 0)  Lq=%d Lk=%d D=%d nh=%d\n",
                 Lq, Lk, D, nh);
     auto in = make_inputs(Lq, Lk, D, nh, 0xFEEDu);
-    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
+    Tensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
     upload_inputs(in, Xg, Cg, Wqg, Wkg, Wvg, Wog);
 
     std::vector<float> bias(Lq * Lk, 0.0f);
     for (int q = 0; q < Lq; ++q) bias[q * Lk + 0] = -1e4f;  // suppress key 0
-    GpuTensor bias_g;
-    brotensor::upload(bias.data(), Lq, Lk, bias_g);
+    Tensor bias_g = Tensor::from_host_on(Device::CUDA, bias.data(), Lq, Lk);
 
-    GpuTensor O, AttnAvg;
-    brotensor::cross_attention_forward_with_attn_gpu(Xg, Cg, Wqg, Wkg, Wvg, Wog,
-                                                     nullptr, &bias_g, nh,
-                                                     O, AttnAvg);
-    brotensor::cuda_sync();
+    Tensor O, AttnAvg;
+    brotensor::cross_attention_forward_with_attn(Xg, Cg, Wqg, Wkg, Wvg, Wog,
+                                                 nullptr, &bias_g, nh,
+                                                 O, AttnAvg);
+    brotensor::sync_all();
     auto a = dl_fp16(AttnAvg);
 
     float max_col0 = 0.0f;
@@ -264,19 +264,19 @@ static void test_mask_compat() {
     std::printf("  d_mask compat (masks last key)  Lq=%d Lk=%d D=%d nh=%d\n",
                 Lq, Lk, D, nh);
     auto in = make_inputs(Lq, Lk, D, nh, 0xACE1u);
-    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
+    Tensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
     upload_inputs(in, Xg, Cg, Wqg, Wkg, Wvg, Wog);
 
     std::vector<float> mask(Lk, 1.0f);
     mask[Lk - 1] = 0.0f;
-    GpuTensor mg;
-    brotensor::upload(mask.data(), Lk, 1, mg);
+    Tensor mg = Tensor::from_host_on(Device::CUDA, mask.data(), Lk, 1);
 
-    GpuTensor O, AttnAvg;
-    brotensor::cross_attention_forward_with_attn_gpu(Xg, Cg, Wqg, Wkg, Wvg, Wog,
-                                                     mg.data, nullptr, nh,
-                                                     O, AttnAvg);
-    brotensor::cuda_sync();
+    Tensor O, AttnAvg;
+    brotensor::cross_attention_forward_with_attn(Xg, Cg, Wqg, Wkg, Wvg, Wog,
+                                                 static_cast<const float*>(mg.data),
+                                                 nullptr, nh,
+                                                 O, AttnAvg);
+    brotensor::sync_all();
     auto a = dl_fp16(AttnAvg);
 
     float max_last = 0.0f;
@@ -293,14 +293,14 @@ static void test_sdxl_shape_runs() {
     std::printf("  SDXL-realistic shape  Lq=%d Lk=%d D=%d nh=%d\n",
                 Lq, Lk, D, nh);
     auto in = make_inputs(Lq, Lk, D, nh, 0xBEEFu);
-    GpuTensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
+    Tensor Xg, Cg, Wqg, Wkg, Wvg, Wog;
     upload_inputs(in, Xg, Cg, Wqg, Wkg, Wvg, Wog);
 
-    GpuTensor O, AttnAvg;
-    brotensor::cross_attention_forward_with_attn_gpu(Xg, Cg, Wqg, Wkg, Wvg, Wog,
-                                                     nullptr, nullptr, nh,
-                                                     O, AttnAvg);
-    brotensor::cuda_sync();
+    Tensor O, AttnAvg;
+    brotensor::cross_attention_forward_with_attn(Xg, Cg, Wqg, Wkg, Wvg, Wog,
+                                                 nullptr, nullptr, nh,
+                                                 O, AttnAvg);
+    brotensor::sync_all();
     CHECK(O.rows == Lq && O.cols == D && O.dtype == Dtype::FP16);
     CHECK(AttnAvg.rows == Lq && AttnAvg.cols == Lk && AttnAvg.dtype == Dtype::FP16);
 
@@ -327,11 +327,10 @@ static void test_sdxl_shape_runs() {
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_cross_attention_with_attn\n");
 

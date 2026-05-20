@@ -1,4 +1,4 @@
-// Backward of matmul_gpu. Row-major. No bias.
+// Backward of matmul. Row-major. No bias.
 //   forward: C(M, N) = A(M, K) @ B(K, N)
 //   dA(M, K) += dC(M, N) @ B^T(N, K)
 //   dB(K, N) += A^T(K, M) @ dC(M, N)
@@ -12,8 +12,8 @@
 // FP16 atomic-adds are unsafe across blocks at small sub-normals and would
 // silently swallow gradient.
 
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -21,6 +21,10 @@
 #include <stdexcept>
 
 namespace brotensor {
+
+void* cuda_current_stream();
+
+namespace detail::cuda {
 
 namespace {
 
@@ -176,36 +180,37 @@ __global__ void mmb_fold_fp16_kernel(__half* __restrict__ dst,
 
 } // namespace
 
-void matmul_backward_gpu(const GpuTensor& A,
-                         const GpuTensor& B,
-                         const GpuTensor& dC,
-                         GpuTensor& dA,
-                         GpuTensor& dB) {
+void matmul_backward(const ::brotensor::Tensor& A,
+                     const ::brotensor::Tensor& B,
+                     const ::brotensor::Tensor& dC,
+                     ::brotensor::Tensor& dA,
+                     ::brotensor::Tensor& dB) {
     if (A.dtype != B.dtype || A.dtype != dC.dtype ||
         A.dtype != dA.dtype || A.dtype != dB.dtype) {
-        throw std::runtime_error("matmul_backward_gpu: dtype mismatch");
+        throw std::runtime_error("matmul_backward: dtype mismatch");
     }
     if (A.dtype != Dtype::FP32 && A.dtype != Dtype::FP16) {
-        throw std::runtime_error("matmul_backward_gpu: only FP32/FP16 supported");
+        throw std::runtime_error("matmul_backward: only FP32/FP16 supported");
     }
     const int M = A.rows;
     const int K = A.cols;
     if (B.rows != K) {
-        throw std::runtime_error("matmul_backward_gpu: shape mismatch (A.cols != B.rows)");
+        throw std::runtime_error("matmul_backward: shape mismatch (A.cols != B.rows)");
     }
     const int N = B.cols;
     if (dC.rows != M || dC.cols != N) {
-        throw std::runtime_error("matmul_backward_gpu: dC shape mismatch");
+        throw std::runtime_error("matmul_backward: dC shape mismatch");
     }
     if (dA.rows != M || dA.cols != K) {
-        throw std::runtime_error("matmul_backward_gpu: dA must be pre-sized to (M, K)");
+        throw std::runtime_error("matmul_backward: dA must be pre-sized to (M, K)");
     }
     if (dB.rows != K || dB.cols != N) {
-        throw std::runtime_error("matmul_backward_gpu: dB must be pre-sized to (K, N)");
+        throw std::runtime_error("matmul_backward: dB must be pre-sized to (K, N)");
     }
     if (M == 0 || N == 0 || K == 0) return;
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    cudaStream_t stream =
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
 
     if (A.dtype == Dtype::FP32) {
         // dA(M, K) += dC(M, N) · B^T(N, K)
@@ -214,7 +219,9 @@ void matmul_backward_gpu(const GpuTensor& A,
             dim3 grid((K + MMB_TILE - 1) / MMB_TILE,
                       (M + MMB_TILE - 1) / MMB_TILE);
             mmb_dA_fp32_kernel<<<grid, block, 0, stream>>>(
-                dC.data, B.data, dA.data, M, N, K);
+                static_cast<const float*>(dC.data),
+                static_cast<const float*>(B.data),
+                static_cast<float*>(dA.data), M, N, K);
         }
         // dB(K, N) += A^T(K, M) · dC(M, N)
         {
@@ -222,51 +229,54 @@ void matmul_backward_gpu(const GpuTensor& A,
             dim3 grid((N + MMB_TILE - 1) / MMB_TILE,
                       (K + MMB_TILE - 1) / MMB_TILE);
             mmb_dB_fp32_kernel<<<grid, block, 0, stream>>>(
-                A.data, dC.data, dB.data, M, N, K);
+                static_cast<const float*>(A.data),
+                static_cast<const float*>(dC.data),
+                static_cast<float*>(dB.data), M, N, K);
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         return;
     }
 
     // FP16 path: FP32 scratch + fold.
-    GpuTensor dA_scratch(M, K, Dtype::FP32);
-    GpuTensor dB_scratch(K, N, Dtype::FP32);
-    dA_scratch.zero();
-    dB_scratch.zero();
+    ::brotensor::Tensor dA_scratch =
+        ::brotensor::Tensor::zeros_on(::brotensor::Device::CUDA, M, K, Dtype::FP32);
+    ::brotensor::Tensor dB_scratch =
+        ::brotensor::Tensor::zeros_on(::brotensor::Device::CUDA, K, N, Dtype::FP32);
 
     {
         dim3 block(MMB_TILE, MMB_TILE);
         dim3 grid((K + MMB_TILE - 1) / MMB_TILE,
                   (M + MMB_TILE - 1) / MMB_TILE);
         mmb_dA_fp16_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __half*>(dC.data_fp16()),
-            reinterpret_cast<const __half*>(B.data_fp16()),
-            dA_scratch.data, M, N, K);
+            static_cast<const __half*>(dC.data),
+            static_cast<const __half*>(B.data),
+            static_cast<float*>(dA_scratch.data), M, N, K);
     }
     {
         dim3 block(MMB_TILE, MMB_TILE);
         dim3 grid((N + MMB_TILE - 1) / MMB_TILE,
                   (K + MMB_TILE - 1) / MMB_TILE);
         mmb_dB_fp16_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __half*>(A.data_fp16()),
-            reinterpret_cast<const __half*>(dC.data_fp16()),
-            dB_scratch.data, M, N, K);
+            static_cast<const __half*>(A.data),
+            static_cast<const __half*>(dC.data),
+            static_cast<float*>(dB_scratch.data), M, N, K);
     }
     {
         const int total = M * K;
         const int blocks = (total + 255) / 256;
         mmb_fold_fp16_kernel<<<blocks, 256, 0, stream>>>(
-            reinterpret_cast<__half*>(dA.data_fp16()),
-            dA_scratch.data, total);
+            static_cast<__half*>(dA.data),
+            static_cast<const float*>(dA_scratch.data), total);
     }
     {
         const int total = K * N;
         const int blocks = (total + 255) / 256;
         mmb_fold_fp16_kernel<<<blocks, 256, 0, stream>>>(
-            reinterpret_cast<__half*>(dB.data_fp16()),
-            dB_scratch.data, total);
+            static_cast<__half*>(dB.data),
+            static_cast<const float*>(dB_scratch.data), total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

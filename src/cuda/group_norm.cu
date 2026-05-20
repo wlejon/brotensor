@@ -1,12 +1,14 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include <stdexcept>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
 
 namespace {
 
@@ -366,21 +368,22 @@ __global__ void add_fp32_into_fp32(const float* __restrict__ src,
 
 } // namespace
 
-void group_norm_forward_gpu(const GpuTensor& X,
-                            const GpuTensor& gamma,
-                            const GpuTensor& beta,
-                            int N, int C, int H, int W,
-                            int num_groups,
-                            float eps,
-                            GpuTensor& Y) {
+void group_norm_forward(const ::brotensor::Tensor& X,
+                        const ::brotensor::Tensor& gamma,
+                        const ::brotensor::Tensor& beta,
+                        int N, int C, int H, int W,
+                        int num_groups,
+                        float eps,
+                        ::brotensor::Tensor& Y) {
+    using ::brotensor::Dtype;
     if (gamma.dtype != X.dtype || beta.dtype != X.dtype) {
-        throw std::runtime_error("group_norm_forward_gpu: gamma/beta dtype must match X");
+        throw std::runtime_error("group_norm_forward: gamma/beta dtype must match X");
     }
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("group_norm_forward_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("group_norm_forward: X must be FP16 or FP32");
     }
     if (num_groups <= 0 || C % num_groups != 0) {
-        throw std::runtime_error("group_norm_forward_gpu: num_groups must divide C");
+        throw std::runtime_error("group_norm_forward: num_groups must divide C");
     }
     const int spatial = H * W;
     const int cols = C * spatial;
@@ -393,43 +396,47 @@ void group_norm_forward_gpu(const GpuTensor& X,
     dim3 grid(num_groups, N, 1);
     if (X.dtype == Dtype::FP16) {
         group_norm_forward_kernel_fp16<<<grid, GN_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(gamma.data_fp16()),
-            reinterpret_cast<const __half*>(beta.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            reinterpret_cast<const __half*>(X.data),
+            reinterpret_cast<const __half*>(gamma.data),
+            reinterpret_cast<const __half*>(beta.data),
+            reinterpret_cast<__half*>(Y.data),
             C, spatial, channels_per_group, eps);
     } else {
         group_norm_forward_kernel_fp32<<<grid, GN_BLOCK>>>(
-            X.data, gamma.data, beta.data, Y.data,
+            reinterpret_cast<const float*>(X.data),
+            reinterpret_cast<const float*>(gamma.data),
+            reinterpret_cast<const float*>(beta.data),
+            reinterpret_cast<float*>(Y.data),
             C, spatial, channels_per_group, eps);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void group_norm_backward_gpu(const GpuTensor& X,
-                             const GpuTensor& gamma,
-                             const GpuTensor& dY,
-                             int N, int C, int H, int W,
-                             int num_groups,
-                             float eps,
-                             GpuTensor& dX,
-                             GpuTensor& dGamma,
-                             GpuTensor& dBeta) {
+void group_norm_backward(const ::brotensor::Tensor& X,
+                         const ::brotensor::Tensor& gamma,
+                         const ::brotensor::Tensor& dY,
+                         int N, int C, int H, int W,
+                         int num_groups,
+                         float eps,
+                         ::brotensor::Tensor& dX,
+                         ::brotensor::Tensor& dGamma,
+                         ::brotensor::Tensor& dBeta) {
+    using ::brotensor::Dtype;
     if (gamma.dtype != X.dtype || dY.dtype != X.dtype) {
-        throw std::runtime_error("group_norm_backward_gpu: gamma/dY dtype must match X");
+        throw std::runtime_error("group_norm_backward: gamma/dY dtype must match X");
     }
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("group_norm_backward_gpu: X must be FP16 or FP32");
+        throw std::runtime_error("group_norm_backward: X must be FP16 or FP32");
     }
     if (num_groups <= 0 || C % num_groups != 0) {
-        throw std::runtime_error("group_norm_backward_gpu: num_groups must divide C");
+        throw std::runtime_error("group_norm_backward: num_groups must divide C");
     }
     if (dGamma.dtype != X.dtype || dBeta.dtype != X.dtype) {
-        throw std::runtime_error("group_norm_backward_gpu: dGamma/dBeta dtype must match X");
+        throw std::runtime_error("group_norm_backward: dGamma/dBeta dtype must match X");
     }
     if (dGamma.rows != C || dGamma.cols != 1 ||
         dBeta.rows  != C || dBeta.cols  != 1) {
-        throw std::runtime_error("group_norm_backward_gpu: dGamma/dBeta must be (C,1)");
+        throw std::runtime_error("group_norm_backward: dGamma/dBeta must be (C,1)");
     }
     const int spatial = H * W;
     const int cols = C * spatial;
@@ -451,15 +458,18 @@ void group_norm_backward_gpu(const GpuTensor& X,
     dim3 grid(num_groups, N, 1);
     if (X.dtype == Dtype::FP16) {
         group_norm_backward_kernel_fp16<<<grid, GN_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(gamma.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()),
+            reinterpret_cast<const __half*>(X.data),
+            reinterpret_cast<const __half*>(gamma.data),
+            reinterpret_cast<const __half*>(dY.data),
+            reinterpret_cast<__half*>(dX.data),
             d_dG, d_dB,
             C, spatial, channels_per_group, eps);
     } else {
         group_norm_backward_kernel_fp32<<<grid, GN_BLOCK>>>(
-            X.data, gamma.data, dY.data, dX.data,
+            reinterpret_cast<const float*>(X.data),
+            reinterpret_cast<const float*>(gamma.data),
+            reinterpret_cast<const float*>(dY.data),
+            reinterpret_cast<float*>(dX.data),
             d_dG, d_dB,
             C, spatial, channels_per_group, eps);
     }
@@ -469,16 +479,16 @@ void group_norm_backward_gpu(const GpuTensor& X,
     const int gridc = (C + block - 1) / block;
     if (X.dtype == Dtype::FP16) {
         add_fp32_into_fp16<<<gridc, block>>>(
-            d_dG, reinterpret_cast<__half*>(dGamma.data_fp16()), C);
+            d_dG, reinterpret_cast<__half*>(dGamma.data), C);
         add_fp32_into_fp16<<<gridc, block>>>(
-            d_dB, reinterpret_cast<__half*>(dBeta.data_fp16()),  C);
+            d_dB, reinterpret_cast<__half*>(dBeta.data),  C);
     } else {
-        add_fp32_into_fp32<<<gridc, block>>>(d_dG, dGamma.data, C);
-        add_fp32_into_fp32<<<gridc, block>>>(d_dB, dBeta.data,  C);
+        add_fp32_into_fp32<<<gridc, block>>>(d_dG, reinterpret_cast<float*>(dGamma.data), C);
+        add_fp32_into_fp32<<<gridc, block>>>(d_dB, reinterpret_cast<float*>(dBeta.data),  C);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
     cudaFree(d_dG);
     cudaFree(d_dB);
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::cuda

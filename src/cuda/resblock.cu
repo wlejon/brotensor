@@ -1,17 +1,133 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include <stdexcept>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
+
+// Forward declarations of intra-backend ops we compose with. They live in the
+// same namespace but in sibling .cu files; declaring them here keeps this
+// file standalone-readable.
+
+void conv2d_forward(const ::brotensor::Tensor& X,
+                    const ::brotensor::Tensor& Wt,
+                    const ::brotensor::Tensor* bias,
+                    int N, int C_in, int H, int W,
+                    int C_out, int kH, int kW,
+                    int stride_h, int stride_w,
+                    int pad_h, int pad_w,
+                    int dil_h, int dil_w,
+                    int groups,
+                    ::brotensor::Tensor& Y);
+inline void conv2d_forward(const ::brotensor::Tensor& X,
+                           const ::brotensor::Tensor& Wt,
+                           const ::brotensor::Tensor* bias,
+                           int N, int C_in, int H, int W,
+                           int C_out, int kH, int kW,
+                           int stride_h, int stride_w,
+                           int pad_h, int pad_w,
+                           int dil_h, int dil_w,
+                           ::brotensor::Tensor& Y) {
+    conv2d_forward(X, Wt, bias, N, C_in, H, W, C_out, kH, kW,
+                   stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, 1, Y);
+}
+
+void conv2d_backward_input(const ::brotensor::Tensor& Wt,
+                           const ::brotensor::Tensor& dY,
+                           int N, int C_in, int H, int W,
+                           int C_out, int kH, int kW,
+                           int stride_h, int stride_w,
+                           int pad_h, int pad_w,
+                           int dil_h, int dil_w,
+                           int groups,
+                           ::brotensor::Tensor& dX);
+inline void conv2d_backward_input(const ::brotensor::Tensor& Wt,
+                                  const ::brotensor::Tensor& dY,
+                                  int N, int C_in, int H, int W,
+                                  int C_out, int kH, int kW,
+                                  int stride_h, int stride_w,
+                                  int pad_h, int pad_w,
+                                  int dil_h, int dil_w,
+                                  ::brotensor::Tensor& dX) {
+    conv2d_backward_input(Wt, dY, N, C_in, H, W, C_out, kH, kW,
+                          stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, 1, dX);
+}
+
+void conv2d_backward_weight(const ::brotensor::Tensor& X,
+                            const ::brotensor::Tensor& dY,
+                            int N, int C_in, int H, int W,
+                            int C_out, int kH, int kW,
+                            int stride_h, int stride_w,
+                            int pad_h, int pad_w,
+                            int dil_h, int dil_w,
+                            int groups,
+                            ::brotensor::Tensor& dWt);
+inline void conv2d_backward_weight(const ::brotensor::Tensor& X,
+                                   const ::brotensor::Tensor& dY,
+                                   int N, int C_in, int H, int W,
+                                   int C_out, int kH, int kW,
+                                   int stride_h, int stride_w,
+                                   int pad_h, int pad_w,
+                                   int dil_h, int dil_w,
+                                   ::brotensor::Tensor& dWt) {
+    conv2d_backward_weight(X, dY, N, C_in, H, W, C_out, kH, kW,
+                           stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, 1, dWt);
+}
+
+void conv2d_backward_bias(const ::brotensor::Tensor& dY,
+                          int N, int C_out, int H_out, int W_out,
+                          ::brotensor::Tensor& dB);
+
+void conv2d_int8w_fp16_forward(const ::brotensor::Tensor& X,
+                               const ::brotensor::Tensor& W_int8,
+                               const ::brotensor::Tensor& scales,
+                               const ::brotensor::Tensor* bias,
+                               int N, int C_in, int H, int W,
+                               int C_out, int kH, int kW,
+                               int stride_h, int stride_w,
+                               int pad_h, int pad_w,
+                               int dil_h, int dil_w,
+                               int groups,
+                               ::brotensor::Tensor& Y);
+
+void add_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x);
+void silu_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void silu_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
+                   ::brotensor::Tensor& dX);
+void group_norm_forward(const ::brotensor::Tensor& X,
+                        const ::brotensor::Tensor& gamma,
+                        const ::brotensor::Tensor& beta,
+                        int N, int C, int H, int W,
+                        int num_groups, float eps,
+                        ::brotensor::Tensor& Y);
+void group_norm_backward(const ::brotensor::Tensor& X,
+                         const ::brotensor::Tensor& gamma,
+                         const ::brotensor::Tensor& dY,
+                         int N, int C, int H, int W,
+                         int num_groups, float eps,
+                         ::brotensor::Tensor& dX,
+                         ::brotensor::Tensor& dGamma,
+                         ::brotensor::Tensor& dBeta);
 
 namespace {
 
 constexpr int RB_GN_BLOCK = 256;
 constexpr int RB_CONV_BLOCK = 256;
+
+// Helper: ensure a (possibly default-constructed) Tensor lives on CUDA before
+// the first resize, so resize allocates CUDA storage rather than host. Safe to
+// call on a tensor that already has data — the device assignment is a no-op
+// if data is null and ignored otherwise.
+inline void ensure_cuda(::brotensor::Tensor& t) {
+    if (t.data == nullptr) {
+        t.device = ::brotensor::Device::CUDA;
+    }
+}
 
 // Fused GroupNorm + SiLU (optional in-place into Y). One block per
 // (sample, group); same partitioning as group_norm. Writes
@@ -102,27 +218,29 @@ inline int grid_for(int n, int block) {
 
 } // namespace
 
-void resblock_forward_gpu(const GpuTensor& X,
-                          const GpuTensor& gamma1, const GpuTensor& beta1,
-                          const GpuTensor& W1, const GpuTensor* b1,
-                          const GpuTensor* t_emb_shift,
-                          const GpuTensor& gamma2, const GpuTensor& beta2,
-                          const GpuTensor& W2, const GpuTensor* b2,
-                          const GpuTensor* Wskip, const GpuTensor* bskip,
-                          int N, int C_in, int C_out, int H, int Wd,
-                          int num_groups, float eps,
-                          GpuTensor& Y) {
+void resblock_forward(const ::brotensor::Tensor& X,
+                      const ::brotensor::Tensor& gamma1, const ::brotensor::Tensor& beta1,
+                      const ::brotensor::Tensor& W1, const ::brotensor::Tensor* b1,
+                      const ::brotensor::Tensor* t_emb_shift,
+                      const ::brotensor::Tensor& gamma2, const ::brotensor::Tensor& beta2,
+                      const ::brotensor::Tensor& W2, const ::brotensor::Tensor* b2,
+                      const ::brotensor::Tensor* Wskip, const ::brotensor::Tensor* bskip,
+                      int N, int C_in, int C_out, int H, int Wd,
+                      int num_groups, float eps,
+                      ::brotensor::Tensor& Y) {
+    using ::brotensor::Dtype;
+    using ::brotensor::Tensor;
     if (X.dtype != Dtype::FP16 || gamma1.dtype != Dtype::FP16 ||
         beta1.dtype != Dtype::FP16 || W1.dtype != Dtype::FP16 ||
         gamma2.dtype != Dtype::FP16 || beta2.dtype != Dtype::FP16 ||
         W2.dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_forward_gpu: all required tensors must be FP16");
+        throw std::runtime_error("resblock_forward: all required tensors must be FP16");
     }
     if (num_groups <= 0 || C_in % num_groups != 0 || C_out % num_groups != 0) {
-        throw std::runtime_error("resblock_forward_gpu: num_groups must divide C_in and C_out");
+        throw std::runtime_error("resblock_forward: num_groups must divide C_in and C_out");
     }
     if (Wskip == nullptr && C_in != C_out) {
-        throw std::runtime_error("resblock_forward_gpu: Wskip required when C_in != C_out");
+        throw std::runtime_error("resblock_forward: Wskip required when C_in != C_out");
     }
     const int spatial = H * Wd;
     const int out_cols = C_out * spatial;
@@ -132,12 +250,13 @@ void resblock_forward_gpu(const GpuTensor& X,
     if (N == 0 || spatial == 0) return;
 
     // Scratch buffers. thread_local static so that repeated calls at the
-    // same shapes reuse the underlying cudaMalloc'd storage (GpuTensor::resize
+    // same shapes reuse the underlying cudaMalloc'd storage (Tensor::resize
     // is a no-op when shape+dtype match). Destruction at thread exit frees
-    // via cudaFree, which is fine.
-    thread_local static GpuTensor h1;  // post-GN1+SiLU
-    thread_local static GpuTensor h2;  // post-conv1 (+t_shift)
-    thread_local static GpuTensor h3;  // post-GN2+SiLU
+    // via the backend's free hook, which is fine.
+    thread_local static Tensor h1;  // post-GN1+SiLU
+    thread_local static Tensor h2;  // post-conv1 (+t_shift)
+    thread_local static Tensor h3;  // post-GN2+SiLU
+    ensure_cuda(h1); ensure_cuda(h2); ensure_cuda(h3);
     h1.resize(N, C_in  * spatial, Dtype::FP16);
     h2.resize(N, C_out * spatial, Dtype::FP16);
     h3.resize(N, C_out * spatial, Dtype::FP16);
@@ -146,27 +265,27 @@ void resblock_forward_gpu(const GpuTensor& X,
     {
         dim3 grid(num_groups, N, 1);
         gn_silu_fused_kernel<<<grid, RB_GN_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(gamma1.data_fp16()),
-            reinterpret_cast<const __half*>(beta1.data_fp16()),
-            reinterpret_cast<__half*>(h1.data_fp16()),
+            reinterpret_cast<const __half*>(X.data),
+            reinterpret_cast<const __half*>(gamma1.data),
+            reinterpret_cast<const __half*>(beta1.data),
+            reinterpret_cast<__half*>(h1.data),
             C_in, spatial, C_in / num_groups, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // Conv1: 3x3 same. Dispatch through the public conv2d (WMMA path).
-    conv2d_forward_gpu(h1, W1, b1,
-                       N, C_in, H, Wd,
-                       C_out, 3, 3,
-                       /*stride*/1, 1,
-                       /*pad*/1, 1,
-                       /*dil*/1, 1,
-                       h2);
+    conv2d_forward(h1, W1, b1,
+                   N, C_in, H, Wd,
+                   C_out, 3, 3,
+                   /*stride*/1, 1,
+                   /*pad*/1, 1,
+                   /*dil*/1, 1,
+                   h2);
 
     // Optional t_emb shift: (N, C_out) or (C_out,) added channelwise.
     if (t_emb_shift) {
         if (t_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_forward_gpu: t_emb_shift must be FP16");
+            throw std::runtime_error("resblock_forward: t_emb_shift must be FP16");
         }
         int has_N = 0;
         if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
@@ -176,12 +295,12 @@ void resblock_forward_gpu(const GpuTensor& X,
                    t_emb_shift->size() == C_out) {
             has_N = 0;
         } else {
-            throw std::runtime_error("resblock_forward_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
+            throw std::runtime_error("resblock_forward: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
         const int total = N * C_out * spatial;
         add_NC_shift_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK>>>(
-            reinterpret_cast<__half*>(h2.data_fp16()),
-            reinterpret_cast<const __half*>(t_emb_shift->data_fp16()),
+            reinterpret_cast<__half*>(h2.data),
+            reinterpret_cast<const __half*>(t_emb_shift->data),
             N, C_out, spatial, has_N);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -190,106 +309,109 @@ void resblock_forward_gpu(const GpuTensor& X,
     {
         dim3 grid(num_groups, N, 1);
         gn_silu_fused_kernel<<<grid, RB_GN_BLOCK>>>(
-            reinterpret_cast<const __half*>(h2.data_fp16()),
-            reinterpret_cast<const __half*>(gamma2.data_fp16()),
-            reinterpret_cast<const __half*>(beta2.data_fp16()),
-            reinterpret_cast<__half*>(h3.data_fp16()),
+            reinterpret_cast<const __half*>(h2.data),
+            reinterpret_cast<const __half*>(gamma2.data),
+            reinterpret_cast<const __half*>(beta2.data),
+            reinterpret_cast<__half*>(h3.data),
             C_out, spatial, C_out / num_groups, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // Prepare the skip tensor for the conv2 epilogue (post-conv2 add).
-    // Reused across calls; conv2d_forward_gpu will resize as needed.
-    thread_local static GpuTensor skip_scratch;
+    // Reused across calls; conv2d_forward will resize as needed.
+    thread_local static Tensor skip_scratch;
+    ensure_cuda(skip_scratch);
     if (Wskip != nullptr) {
         if (Wskip->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_forward_gpu: Wskip must be FP16");
+            throw std::runtime_error("resblock_forward: Wskip must be FP16");
         }
         // 1x1 conv through the public path (WMMA implicit-GEMM).
-        conv2d_forward_gpu(X, *Wskip, bskip,
-                           N, C_in, H, Wd,
-                           C_out, 1, 1,
-                           /*stride*/1, 1,
-                           /*pad*/0, 0,
-                           /*dil*/1, 1,
-                           skip_scratch);
+        conv2d_forward(X, *Wskip, bskip,
+                       N, C_in, H, Wd,
+                       C_out, 1, 1,
+                       /*stride*/1, 1,
+                       /*pad*/0, 0,
+                       /*dil*/1, 1,
+                       skip_scratch);
     }
 
-    // Conv2 (3x3 same) → Y, then fuse-in the skip via add_inplace_gpu.
-    conv2d_forward_gpu(h3, W2, b2,
-                       N, C_out, H, Wd,
-                       C_out, 3, 3,
-                       /*stride*/1, 1,
-                       /*pad*/1, 1,
-                       /*dil*/1, 1,
-                       Y);
+    // Conv2 (3x3 same) → Y, then fuse-in the skip via add_inplace.
+    conv2d_forward(h3, W2, b2,
+                   N, C_out, H, Wd,
+                   C_out, 3, 3,
+                   /*stride*/1, 1,
+                   /*pad*/1, 1,
+                   /*dil*/1, 1,
+                   Y);
     if (Wskip == nullptr) {
         // skip is X itself (C_in == C_out so shapes match).
-        add_inplace_gpu(Y, X);
+        add_inplace(Y, X);
     } else {
-        add_inplace_gpu(Y, skip_scratch);
+        add_inplace(Y, skip_scratch);
     }
 }
 
-void resblock_forward_int8w_fp16_gpu(const GpuTensor& X,
-                                     const GpuTensor& gamma1, const GpuTensor& beta1,
-                                     const GpuTensor& W1_int8, const GpuTensor& s1,
-                                     const GpuTensor* b1,
-                                     const GpuTensor* t_emb_shift,
-                                     const GpuTensor& gamma2, const GpuTensor& beta2,
-                                     const GpuTensor& W2_int8, const GpuTensor& s2,
-                                     const GpuTensor* b2,
-                                     const GpuTensor* Wskip_int8, const GpuTensor* sskip,
-                                     const GpuTensor* bskip,
-                                     int N, int C_in, int C_out, int H, int Wd,
-                                     int num_groups, float eps,
-                                     GpuTensor& Y) {
+void resblock_forward_int8w_fp16(const ::brotensor::Tensor& X,
+                                 const ::brotensor::Tensor& gamma1, const ::brotensor::Tensor& beta1,
+                                 const ::brotensor::Tensor& W1_int8, const ::brotensor::Tensor& s1,
+                                 const ::brotensor::Tensor* b1,
+                                 const ::brotensor::Tensor* t_emb_shift,
+                                 const ::brotensor::Tensor& gamma2, const ::brotensor::Tensor& beta2,
+                                 const ::brotensor::Tensor& W2_int8, const ::brotensor::Tensor& s2,
+                                 const ::brotensor::Tensor* b2,
+                                 const ::brotensor::Tensor* Wskip_int8, const ::brotensor::Tensor* sskip,
+                                 const ::brotensor::Tensor* bskip,
+                                 int N, int C_in, int C_out, int H, int Wd,
+                                 int num_groups, float eps,
+                                 ::brotensor::Tensor& Y) {
+    using ::brotensor::Dtype;
+    using ::brotensor::Tensor;
     if (X.dtype != Dtype::FP16 || gamma1.dtype != Dtype::FP16 ||
         beta1.dtype != Dtype::FP16 || gamma2.dtype != Dtype::FP16 ||
         beta2.dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: activation/norm tensors must be FP16");
+        throw std::runtime_error("resblock_forward_int8w_fp16: activation/norm tensors must be FP16");
     }
     if (W1_int8.dtype != Dtype::INT8 || W2_int8.dtype != Dtype::INT8) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: W1/W2 must be INT8");
+        throw std::runtime_error("resblock_forward_int8w_fp16: W1/W2 must be INT8");
     }
     if (s1.dtype != Dtype::FP32 || s2.dtype != Dtype::FP32) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: scales s1/s2 must be FP32");
+        throw std::runtime_error("resblock_forward_int8w_fp16: scales s1/s2 must be FP32");
     }
     if (num_groups <= 0 || C_in % num_groups != 0 || C_out % num_groups != 0) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: num_groups must divide C_in and C_out");
+        throw std::runtime_error("resblock_forward_int8w_fp16: num_groups must divide C_in and C_out");
     }
     if (W1_int8.rows != C_out || W1_int8.cols != C_in * 9) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: W1_int8 shape mismatch");
+        throw std::runtime_error("resblock_forward_int8w_fp16: W1_int8 shape mismatch");
     }
     if (W2_int8.rows != C_out || W2_int8.cols != C_out * 9) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: W2_int8 shape mismatch");
+        throw std::runtime_error("resblock_forward_int8w_fp16: W2_int8 shape mismatch");
     }
     if (s1.rows != C_out || s1.cols != 1 || s2.rows != C_out || s2.cols != 1) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: s1/s2 must be (C_out, 1)");
+        throw std::runtime_error("resblock_forward_int8w_fp16: s1/s2 must be (C_out, 1)");
     }
     if (b1 && b1->dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: b1 must be FP16");
+        throw std::runtime_error("resblock_forward_int8w_fp16: b1 must be FP16");
     }
     if (b2 && b2->dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: b2 must be FP16");
+        throw std::runtime_error("resblock_forward_int8w_fp16: b2 must be FP16");
     }
     if (Wskip_int8 == nullptr) {
         if (C_in != C_out) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: Wskip required when C_in != C_out");
+            throw std::runtime_error("resblock_forward_int8w_fp16: Wskip required when C_in != C_out");
         }
     } else {
         if (Wskip_int8->dtype != Dtype::INT8) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: Wskip_int8 must be INT8");
+            throw std::runtime_error("resblock_forward_int8w_fp16: Wskip_int8 must be INT8");
         }
         if (Wskip_int8->rows != C_out || Wskip_int8->cols != C_in) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: Wskip_int8 shape mismatch");
+            throw std::runtime_error("resblock_forward_int8w_fp16: Wskip_int8 shape mismatch");
         }
         if (sskip == nullptr || sskip->dtype != Dtype::FP32 ||
             sskip->rows != C_out || sskip->cols != 1) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: sskip must be FP32 (C_out, 1)");
+            throw std::runtime_error("resblock_forward_int8w_fp16: sskip must be FP32 (C_out, 1)");
         }
         if (bskip && bskip->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: bskip must be FP16");
+            throw std::runtime_error("resblock_forward_int8w_fp16: bskip must be FP16");
         }
     }
     const int spatial = H * Wd;
@@ -299,9 +421,10 @@ void resblock_forward_int8w_fp16_gpu(const GpuTensor& X,
     }
     if (N == 0 || spatial == 0) return;
 
-    thread_local static GpuTensor h1;
-    thread_local static GpuTensor h2;
-    thread_local static GpuTensor h3;
+    thread_local static Tensor h1;
+    thread_local static Tensor h2;
+    thread_local static Tensor h3;
+    ensure_cuda(h1); ensure_cuda(h2); ensure_cuda(h3);
     h1.resize(N, C_in  * spatial, Dtype::FP16);
     h2.resize(N, C_out * spatial, Dtype::FP16);
     h3.resize(N, C_out * spatial, Dtype::FP16);
@@ -310,24 +433,24 @@ void resblock_forward_int8w_fp16_gpu(const GpuTensor& X,
     {
         dim3 grid(num_groups, N, 1);
         gn_silu_fused_kernel<<<grid, RB_GN_BLOCK>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(gamma1.data_fp16()),
-            reinterpret_cast<const __half*>(beta1.data_fp16()),
-            reinterpret_cast<__half*>(h1.data_fp16()),
+            reinterpret_cast<const __half*>(X.data),
+            reinterpret_cast<const __half*>(gamma1.data),
+            reinterpret_cast<const __half*>(beta1.data),
+            reinterpret_cast<__half*>(h1.data),
             C_in, spatial, C_in / num_groups, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // Conv1: 3x3 same, INT8 weights.
-    conv2d_int8w_fp16_forward_gpu(h1, W1_int8, s1, b1,
-                                  N, C_in, H, Wd,
-                                  C_out, 3, 3,
-                                  1, 1, 1, 1, 1, 1, /*groups*/1,
-                                  h2);
+    conv2d_int8w_fp16_forward(h1, W1_int8, s1, b1,
+                              N, C_in, H, Wd,
+                              C_out, 3, 3,
+                              1, 1, 1, 1, 1, 1, /*groups*/1,
+                              h2);
 
     if (t_emb_shift) {
         if (t_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: t_emb_shift must be FP16");
+            throw std::runtime_error("resblock_forward_int8w_fp16: t_emb_shift must be FP16");
         }
         int has_N = 0;
         if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
@@ -337,12 +460,12 @@ void resblock_forward_int8w_fp16_gpu(const GpuTensor& X,
                    t_emb_shift->size() == C_out) {
             has_N = 0;
         } else {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
+            throw std::runtime_error("resblock_forward_int8w_fp16: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
         const int total = N * C_out * spatial;
         add_NC_shift_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK>>>(
-            reinterpret_cast<__half*>(h2.data_fp16()),
-            reinterpret_cast<const __half*>(t_emb_shift->data_fp16()),
+            reinterpret_cast<__half*>(h2.data),
+            reinterpret_cast<const __half*>(t_emb_shift->data),
             N, C_out, spatial, has_N);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -351,32 +474,33 @@ void resblock_forward_int8w_fp16_gpu(const GpuTensor& X,
     {
         dim3 grid(num_groups, N, 1);
         gn_silu_fused_kernel<<<grid, RB_GN_BLOCK>>>(
-            reinterpret_cast<const __half*>(h2.data_fp16()),
-            reinterpret_cast<const __half*>(gamma2.data_fp16()),
-            reinterpret_cast<const __half*>(beta2.data_fp16()),
-            reinterpret_cast<__half*>(h3.data_fp16()),
+            reinterpret_cast<const __half*>(h2.data),
+            reinterpret_cast<const __half*>(gamma2.data),
+            reinterpret_cast<const __half*>(beta2.data),
+            reinterpret_cast<__half*>(h3.data),
             C_out, spatial, C_out / num_groups, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    thread_local static GpuTensor skip_scratch;
+    thread_local static Tensor skip_scratch;
+    ensure_cuda(skip_scratch);
     if (Wskip_int8 != nullptr) {
-        conv2d_int8w_fp16_forward_gpu(X, *Wskip_int8, *sskip, bskip,
-                                      N, C_in, H, Wd,
-                                      C_out, 1, 1,
-                                      1, 1, 0, 0, 1, 1, /*groups*/1,
-                                      skip_scratch);
+        conv2d_int8w_fp16_forward(X, *Wskip_int8, *sskip, bskip,
+                                  N, C_in, H, Wd,
+                                  C_out, 1, 1,
+                                  1, 1, 0, 0, 1, 1, /*groups*/1,
+                                  skip_scratch);
     }
 
-    conv2d_int8w_fp16_forward_gpu(h3, W2_int8, s2, b2,
-                                  N, C_out, H, Wd,
-                                  C_out, 3, 3,
-                                  1, 1, 1, 1, 1, 1, /*groups*/1,
-                                  Y);
+    conv2d_int8w_fp16_forward(h3, W2_int8, s2, b2,
+                              N, C_out, H, Wd,
+                              C_out, 3, 3,
+                              1, 1, 1, 1, 1, 1, /*groups*/1,
+                              Y);
     if (Wskip_int8 == nullptr) {
-        add_inplace_gpu(Y, X);
+        add_inplace(Y, X);
     } else {
-        add_inplace_gpu(Y, skip_scratch);
+        add_inplace(Y, skip_scratch);
     }
 }
 
@@ -414,36 +538,40 @@ __global__ void rb_sum_hw_per_NC_fp16(const __half* __restrict__ dh2,
 
 } // namespace
 
-void resblock_backward_gpu(const GpuTensor& X,
-                           const GpuTensor& gamma1, const GpuTensor& beta1,
-                           const GpuTensor& W1, const GpuTensor* b1,
-                           const GpuTensor* t_emb_shift,
-                           const GpuTensor& gamma2, const GpuTensor& beta2,
-                           const GpuTensor& W2, const GpuTensor* b2,
-                           const GpuTensor* Wskip, const GpuTensor* bskip,
-                           int N, int C_in, int C_out, int H, int Wd,
-                           int num_groups, float eps,
-                           const GpuTensor& dY,
-                           GpuTensor& dX,
-                           GpuTensor& dGamma1, GpuTensor& dBeta1,
-                           GpuTensor& dW1, GpuTensor* db1,
-                           GpuTensor* dt_emb_shift,
-                           GpuTensor& dGamma2, GpuTensor& dBeta2,
-                           GpuTensor& dW2, GpuTensor* db2,
-                           GpuTensor* dWskip, GpuTensor* dbskip) {
+void resblock_backward(const ::brotensor::Tensor& X,
+                       const ::brotensor::Tensor& gamma1, const ::brotensor::Tensor& beta1,
+                       const ::brotensor::Tensor& W1, const ::brotensor::Tensor* b1,
+                       const ::brotensor::Tensor* t_emb_shift,
+                       const ::brotensor::Tensor& gamma2, const ::brotensor::Tensor& beta2,
+                       const ::brotensor::Tensor& W2, const ::brotensor::Tensor* b2,
+                       const ::brotensor::Tensor* Wskip, const ::brotensor::Tensor* bskip,
+                       int N, int C_in, int C_out, int H, int Wd,
+                       int num_groups, float eps,
+                       const ::brotensor::Tensor& dY,
+                       ::brotensor::Tensor& dX,
+                       ::brotensor::Tensor& dGamma1, ::brotensor::Tensor& dBeta1,
+                       ::brotensor::Tensor& dW1, ::brotensor::Tensor* db1,
+                       ::brotensor::Tensor* dt_emb_shift,
+                       ::brotensor::Tensor& dGamma2, ::brotensor::Tensor& dBeta2,
+                       ::brotensor::Tensor& dW2, ::brotensor::Tensor* db2,
+                       ::brotensor::Tensor* dWskip, ::brotensor::Tensor* dbskip) {
+    (void)bskip;
+    using ::brotensor::Dtype;
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
     if (X.dtype != Dtype::FP16 || dY.dtype != Dtype::FP16 ||
         gamma1.dtype != Dtype::FP16 || beta1.dtype != Dtype::FP16 ||
         W1.dtype != Dtype::FP16 ||
         gamma2.dtype != Dtype::FP16 || beta2.dtype != Dtype::FP16 ||
         W2.dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_backward_gpu: all required tensors must be FP16");
+        throw std::runtime_error("resblock_backward: all required tensors must be FP16");
     }
     if (Wskip == nullptr && C_in != C_out) {
-        throw std::runtime_error("resblock_backward_gpu: Wskip required when C_in != C_out");
+        throw std::runtime_error("resblock_backward: Wskip required when C_in != C_out");
     }
     const int spatial = H * Wd;
     if (dY.rows != N || dY.cols != C_out * spatial) {
-        throw std::runtime_error("resblock_backward_gpu: dY shape mismatch");
+        throw std::runtime_error("resblock_backward: dY shape mismatch");
     }
     if (dX.rows != N || dX.cols != C_in * spatial || dX.dtype != Dtype::FP16) {
         dX.resize(N, C_in * spatial, Dtype::FP16);
@@ -455,17 +583,19 @@ void resblock_backward_gpu(const GpuTensor& X,
     //   h2_pre_t    = conv1(h1, W1, b1)
     //   h2          = h2_pre_t + broadcast(t_emb_shift)   (if t_emb_shift)
     //   h3_pre_silu = GN2(h2); h3 = SiLU(h3_pre_silu)
-    GpuTensor h1_pre_silu, h1;
-    group_norm_forward_gpu(X, gamma1, beta1, N, C_in, H, Wd, num_groups, eps,
-                           h1_pre_silu);
-    silu_forward_gpu(h1_pre_silu, h1);
+    Tensor h1_pre_silu, h1;
+    ensure_cuda(h1_pre_silu); ensure_cuda(h1);
+    group_norm_forward(X, gamma1, beta1, N, C_in, H, Wd, num_groups, eps,
+                       h1_pre_silu);
+    silu_forward(h1_pre_silu, h1);
 
-    GpuTensor h2;
-    conv2d_forward_gpu(h1, W1, b1, N, C_in, H, Wd,
-                       C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2);
+    Tensor h2;
+    ensure_cuda(h2);
+    conv2d_forward(h1, W1, b1, N, C_in, H, Wd,
+                   C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2);
     if (t_emb_shift) {
         if (t_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_backward_gpu: t_emb_shift must be FP16");
+            throw std::runtime_error("resblock_backward: t_emb_shift must be FP16");
         }
         int has_N = 0;
         if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
@@ -475,99 +605,103 @@ void resblock_backward_gpu(const GpuTensor& X,
                    t_emb_shift->size() == C_out) {
             has_N = 0;
         } else {
-            throw std::runtime_error("resblock_backward_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
+            throw std::runtime_error("resblock_backward: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
         const int total = N * C_out * spatial;
         add_NC_shift_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK>>>(
-            reinterpret_cast<__half*>(h2.data_fp16()),
-            reinterpret_cast<const __half*>(t_emb_shift->data_fp16()),
+            reinterpret_cast<__half*>(h2.data),
+            reinterpret_cast<const __half*>(t_emb_shift->data),
             N, C_out, spatial, has_N);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    GpuTensor h3_pre_silu, h3;
-    group_norm_forward_gpu(h2, gamma2, beta2, N, C_out, H, Wd, num_groups, eps,
-                           h3_pre_silu);
-    silu_forward_gpu(h3_pre_silu, h3);
+    Tensor h3_pre_silu, h3;
+    ensure_cuda(h3_pre_silu); ensure_cuda(h3);
+    group_norm_forward(h2, gamma2, beta2, N, C_out, H, Wd, num_groups, eps,
+                       h3_pre_silu);
+    silu_forward(h3_pre_silu, h3);
 
     // ── Conv2 backward: dh3 (input grad), dW2 += grad, db2 += grad.
-    GpuTensor dh3(N, C_out * spatial, Dtype::FP16);
-    conv2d_backward_input_gpu(W2, dY, N, C_out, H, Wd,
-                              C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh3);
-    conv2d_backward_weight_gpu(h3, dY, N, C_out, H, Wd,
-                               C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW2);
+    Tensor dh3 = Tensor::empty_on(Device::CUDA, N, C_out * spatial, Dtype::FP16);
+    conv2d_backward_input(W2, dY, N, C_out, H, Wd,
+                          C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh3);
+    conv2d_backward_weight(h3, dY, N, C_out, H, Wd,
+                           C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW2);
     if (db2) {
-        conv2d_backward_bias_gpu(dY, N, C_out, H, Wd, *db2);
+        conv2d_backward_bias(dY, N, C_out, H, Wd, *db2);
     }
 
     // ── SiLU2 backward over h3_pre_silu.
-    GpuTensor dh3_pre_silu;
-    silu_backward_gpu(h3_pre_silu, dh3, dh3_pre_silu);
+    Tensor dh3_pre_silu;
+    ensure_cuda(dh3_pre_silu);
+    silu_backward(h3_pre_silu, dh3, dh3_pre_silu);
 
     // ── GN2 backward: writes dh2 (overwritten), accumulates dGamma2, dBeta2.
-    GpuTensor dh2;
-    group_norm_backward_gpu(h2, gamma2, dh3_pre_silu, N, C_out, H, Wd,
-                            num_groups, eps, dh2, dGamma2, dBeta2);
+    Tensor dh2;
+    ensure_cuda(dh2);
+    group_norm_backward(h2, gamma2, dh3_pre_silu, N, C_out, H, Wd,
+                        num_groups, eps, dh2, dGamma2, dBeta2);
 
     // ── t_emb_shift backward: channel-axis reduction of dh2.
     if (t_emb_shift && dt_emb_shift) {
         if (dt_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_backward_gpu: dt_emb_shift must be FP16");
+            throw std::runtime_error("resblock_backward: dt_emb_shift must be FP16");
         }
         const bool has_N = (t_emb_shift->rows == N && t_emb_shift->cols == C_out);
         if (has_N) {
             // (N, C_out) — sum over HW per (n, c), accumulate into dt_emb_shift.
             const int blocks = N * C_out;
             rb_sum_hw_per_NC_fp16<<<blocks, RB_GN_BLOCK>>>(
-                reinterpret_cast<const __half*>(dh2.data_fp16()),
-                reinterpret_cast<__half*>(dt_emb_shift->data_fp16()),
+                reinterpret_cast<const __half*>(dh2.data),
+                reinterpret_cast<__half*>(dt_emb_shift->data),
                 N, C_out, spatial);
             BROTENSOR_CUDA_CHECK(cudaGetLastError());
         } else {
             // (C_out,) — sum over (N, H, W) per channel. Reuse conv bias bwd.
-            conv2d_backward_bias_gpu(dh2, N, C_out, H, Wd, *dt_emb_shift);
+            conv2d_backward_bias(dh2, N, C_out, H, Wd, *dt_emb_shift);
         }
     }
 
     // ── Conv1 backward: dh1, dW1 +=, db1 +=.
-    GpuTensor dh1(N, C_in * spatial, Dtype::FP16);
-    conv2d_backward_input_gpu(W1, dh2, N, C_in, H, Wd,
-                              C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh1);
-    conv2d_backward_weight_gpu(h1, dh2, N, C_in, H, Wd,
-                               C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW1);
+    Tensor dh1 = Tensor::empty_on(Device::CUDA, N, C_in * spatial, Dtype::FP16);
+    conv2d_backward_input(W1, dh2, N, C_in, H, Wd,
+                          C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh1);
+    conv2d_backward_weight(h1, dh2, N, C_in, H, Wd,
+                           C_out, 3, 3, 1, 1, 1, 1, 1, 1, dW1);
     if (db1) {
-        conv2d_backward_bias_gpu(dh2, N, C_out, H, Wd, *db1);
+        conv2d_backward_bias(dh2, N, C_out, H, Wd, *db1);
     }
 
     // ── SiLU1 backward over h1_pre_silu.
-    GpuTensor dh1_pre_silu;
-    silu_backward_gpu(h1_pre_silu, dh1, dh1_pre_silu);
+    Tensor dh1_pre_silu;
+    ensure_cuda(dh1_pre_silu);
+    silu_backward(h1_pre_silu, dh1, dh1_pre_silu);
 
     // ── GN1 backward: writes dX (overwritten = dX_from_main_path),
     //                  accumulates dGamma1, dBeta1.
-    group_norm_backward_gpu(X, gamma1, dh1_pre_silu, N, C_in, H, Wd,
-                            num_groups, eps, dX, dGamma1, dBeta1);
+    group_norm_backward(X, gamma1, dh1_pre_silu, N, C_in, H, Wd,
+                        num_groups, eps, dX, dGamma1, dBeta1);
 
     // ── Skip path backward, then sum into dX.
     if (Wskip == nullptr) {
         // identity: dX += dY (shapes already match since C_in == C_out).
-        add_inplace_gpu(dX, dY);
+        add_inplace(dX, dY);
     } else {
         if (Wskip->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_backward_gpu: Wskip must be FP16");
+            throw std::runtime_error("resblock_backward: Wskip must be FP16");
         }
-        GpuTensor dX_skip(N, C_in * spatial, Dtype::FP16);
-        conv2d_backward_input_gpu(*Wskip, dY, N, C_in, H, Wd,
-                                  C_out, 1, 1, 1, 1, 0, 0, 1, 1, dX_skip);
+        Tensor dX_skip = Tensor::empty_on(Device::CUDA, N, C_in * spatial, Dtype::FP16);
+        conv2d_backward_input(*Wskip, dY, N, C_in, H, Wd,
+                              C_out, 1, 1, 1, 1, 0, 0, 1, 1, dX_skip);
         if (dWskip) {
-            conv2d_backward_weight_gpu(X, dY, N, C_in, H, Wd,
-                                       C_out, 1, 1, 1, 1, 0, 0, 1, 1, *dWskip);
+            conv2d_backward_weight(X, dY, N, C_in, H, Wd,
+                                   C_out, 1, 1, 1, 1, 0, 0, 1, 1, *dWskip);
         }
         if (dbskip) {
-            conv2d_backward_bias_gpu(dY, N, C_out, H, Wd, *dbskip);
+            conv2d_backward_bias(dY, N, C_out, H, Wd, *dbskip);
         }
-        add_inplace_gpu(dX, dX_skip);
+        add_inplace(dX, dX_skip);
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::cuda

@@ -1,9 +1,10 @@
-#include <brotensor/ops.h>
 #include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 
 namespace brotensor {
+namespace detail::cuda {
 
 namespace {
 
@@ -90,27 +91,34 @@ __global__ void softmax_backward_kernel(const float* __restrict__ probs,
 
 } // namespace
 
-void softmax_forward_gpu(const GpuTensor& logits, GpuTensor& probs,
-                         const float* d_mask) {
+void softmax_forward(const ::brotensor::Tensor& logits,
+                     ::brotensor::Tensor& probs,
+                     const float* d_mask) {
     const int n = logits.size();
     if (probs.rows != logits.rows || probs.cols != logits.cols) {
         probs.resize(logits.rows, logits.cols);
     }
     if (n == 0) return;
-    softmax_forward_kernel<<<1, SM_BLOCK>>>(logits.data, probs.data, d_mask, n);
+    softmax_forward_kernel<<<1, SM_BLOCK>>>(
+        static_cast<const float*>(logits.data),
+        static_cast<float*>(probs.data), d_mask, n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void softmax_backward_gpu(const GpuTensor& probs, const GpuTensor& dProbs,
-                          GpuTensor& dLogits) {
+void softmax_backward(const ::brotensor::Tensor& probs,
+                      const ::brotensor::Tensor& dProbs,
+                      ::brotensor::Tensor& dLogits) {
     const int n = probs.size();
     if (dLogits.rows != probs.rows || dLogits.cols != probs.cols) {
         dLogits.resize(probs.rows, probs.cols);
     }
     if (n == 0) return;
-    softmax_backward_kernel<<<1, SM_BLOCK>>>(probs.data, dProbs.data,
-                                             dLogits.data, n);
+    softmax_backward_kernel<<<1, SM_BLOCK>>>(
+        static_cast<const float*>(probs.data),
+        static_cast<const float*>(dProbs.data),
+        static_cast<float*>(dLogits.data), n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace detail::cuda
 } // namespace brotensor

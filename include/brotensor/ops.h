@@ -7,22 +7,24 @@
 
 namespace brotensor {
 
-// ─── GPU primitive ops (declarations only) ─────────────────────────────────
+// ─── brotensor ops (declarations only) ─────────────────────────────────────
 //
-// One-to-one mirror of brogameagent::nn::ops over GpuTensor. Shape contracts
-// match the CPU versions verbatim — see include/brogameagent/nn/ops.h for the
-// authoritative semantics. These are the contracts subagents 2 and 3 will
-// implement; the doc comments below are the spec.
+// Every op is declared once. Backend dispatch is runtime: each op forwards
+// to the registered backend (CPU / CUDA / Metal) for the device its operand
+// tensors live on. Shape contracts, accumulation semantics for backward
+// (caller zeros dW/dB; op accumulates), and dtype-dispatch rules are
+// documented per-op below — they are the contract every backend must honour.
 //
-// All tensors are float32, row-major, on the same CUDA device (device 0
-// unless cuda_init was steered via BROTENSOR_CUDA_DEVICE). Output tensors are
-// resized by the implementation if their shape doesn't match the expected
+// Tensors are row-major (rows, cols) and carry both a Dtype and a Device.
+// Output tensors are resized (and dtype-set, where the contract calls for
+// that) by the implementation if their shape doesn't match the expected
 // output shape — except for accumulation outputs (dW, dB) which the caller
 // must size and zero appropriately.
 //
-// Streams: every op is implicitly on the default (null) stream for now.
-// Synchronisation is the caller's responsibility; use cuda_sync() before
-// reading results back to host.
+// Synchronisation: every op is implicitly on its backend's default queue /
+// stream. Synchronisation is the caller's responsibility; use
+// `brotensor::sync(device)` before reading results back to host. CPU ops are
+// synchronous.
 
 // ─── Subagent 2: dense layers + elementwise activations ────────────────────
 
@@ -31,8 +33,8 @@ namespace brotensor {
 //   b: (out_dim, 1)         (vector; cols == 1)
 //   x: (in_dim, 1)
 //   y: (out_dim, 1)         (resized if mis-shaped)
-void linear_forward_gpu(const GpuTensor& W, const GpuTensor& b,
-                        const GpuTensor& x, GpuTensor& y);
+void linear_forward(const Tensor& W, const Tensor& b,
+                    const Tensor& x, Tensor& y);
 
 // Backward of linear_forward.
 //   W:   (out_dim, in_dim)   (forward weights, read-only)
@@ -41,48 +43,48 @@ void linear_forward_gpu(const GpuTensor& W, const GpuTensor& b,
 //   dX:  (in_dim, 1)         (output, *overwritten*)
 //   dW:  (out_dim, in_dim)   (output, *accumulated into* — caller zeros)
 //   dB:  (out_dim, 1)        (output, *accumulated into* — caller zeros)
-void linear_backward_gpu(const GpuTensor& W, const GpuTensor& x,
-                         const GpuTensor& dY,
-                         GpuTensor& dX, GpuTensor& dW, GpuTensor& dB);
+void linear_backward(const Tensor& W, const Tensor& x,
+                     const Tensor& dY,
+                     Tensor& dX, Tensor& dW, Tensor& dB);
 
 // y = max(x, 0). x and y may alias (same buffer) for in-place ReLU.
 // Shapes match exactly; y resized if mis-shaped.
-void relu_forward_gpu(const GpuTensor& x, GpuTensor& y);
+void relu_forward(const Tensor& x, Tensor& y);
 
 // dX = dY * (x > 0). dX resized to match x if mis-shaped. dX may alias dY.
-void relu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX);
+void relu_backward(const Tensor& x, const Tensor& dY, Tensor& dX);
 
 // y = tanh(x). y resized to match x if mis-shaped.
-void tanh_forward_gpu(const GpuTensor& x, GpuTensor& y);
+void tanh_forward(const Tensor& x, Tensor& y);
 
 // dX = dY * (1 - y*y). `y` is the cached forward output (NOT raw x).
-void tanh_backward_gpu(const GpuTensor& y, const GpuTensor& dY, GpuTensor& dX);
+void tanh_backward(const Tensor& y, const Tensor& dY, Tensor& dX);
 
 // y = 1 / (1 + exp(-x)).
-void sigmoid_forward_gpu(const GpuTensor& x, GpuTensor& y);
+void sigmoid_forward(const Tensor& x, Tensor& y);
 
 // dX = dY * y * (1 - y). `y` is the cached forward output.
-void sigmoid_backward_gpu(const GpuTensor& y, const GpuTensor& dY, GpuTensor& dX);
+void sigmoid_backward(const Tensor& y, const Tensor& dY, Tensor& dX);
 
 // y[i] += x[i]. y and x must have identical shape.
-void add_inplace_gpu(GpuTensor& y, const GpuTensor& x);
+void add_inplace(Tensor& y, const Tensor& x);
 
 // y[i] += s for all i. Dispatches FP32/FP16 on y.dtype.
-void add_scalar_inplace_gpu(GpuTensor& y, float s);
+void add_scalar_inplace(Tensor& y, float s);
 
 // y[i] *= s for all i. Dispatches FP32/FP16 on y.dtype.
-void scale_inplace_gpu(GpuTensor& y, float s);
+void scale_inplace(Tensor& y, float s);
 
 // y[i] = min(max(y[i], lo), hi). In-place. Dispatches FP32/FP16 on y.dtype.
 // Used for VAE output rescale-and-clamp and any saturating epilogue.
-void clamp_gpu(GpuTensor& y, float lo, float hi);
+void clamp(Tensor& y, float lo, float hi);
 
 // Build a slot-validity mask on-device. For k in [0, K):
 //   mask[k] = (x[offset + k*stride] > 0.5f) ? 1.0f : 0.0f
 // `mask` is resized to (K, 1). Used by DeepSetsEncoder to avoid a host sync
 // when constructing per-slot validity masks for masked_mean_pool_*.
-void build_slot_mask_gpu(const GpuTensor& x, int offset, int K, int stride,
-                         GpuTensor& mask);
+void build_slot_mask(const Tensor& x, int offset, int K, int stride,
+                     Tensor& mask);
 
 // ─── Subagent 3: reductions, norm, attention, optimiser ────────────────────
 
@@ -90,18 +92,18 @@ void build_slot_mask_gpu(const GpuTensor& x, int offset, int K, int stride,
 //
 //   logits: (N, 1) or (1, N) — treated as flat length-N buffer.
 //   probs:  same shape as logits; resized if mis-shaped.
-//   d_mask: optional device pointer to N floats (1 valid, 0 invalid). May be
+//   mask:   optional device pointer to N floats (1 valid, 0 invalid). May be
 //           null. Invalid positions contribute 0 to the normaliser AND
 //           receive 0 in `probs`. Caller guarantees at least one valid entry
 //           when masking — the kernel does not check.
-void softmax_forward_gpu(const GpuTensor& logits, GpuTensor& probs,
-                         const float* d_mask);
+void softmax_forward(const Tensor& logits, Tensor& probs,
+                     const float* mask = nullptr);
 
 // Full Jacobian softmax backward:
 //   dLogits[i] = sum_j dProbs[j] * probs[j] * (delta_ij - probs[i]).
 // All tensors length-N; dLogits resized to match if mis-shaped.
-void softmax_backward_gpu(const GpuTensor& probs, const GpuTensor& dProbs,
-                          GpuTensor& dLogits);
+void softmax_backward(const Tensor& probs, const Tensor& dProbs,
+                      Tensor& dLogits);
 
 // LayerNorm forward (single-vector, matches CPU LayerNorm).
 //   x:     (N, 1)            input vector
@@ -115,13 +117,13 @@ void softmax_backward_gpu(const GpuTensor& probs, const GpuTensor& dProbs,
 //
 // The backward consumes (xhat, gamma, mean, rstd) — the signature here is
 // intentionally rich so backward needs no recomputation. Subagent 3 may
-// revise these caches (e.g. promote mean/rstd to a tiny GpuTensor) if it's
+// revise these caches (e.g. promote mean/rstd to a tiny Tensor) if it's
 // cleaner; document any change here.
-void layernorm_forward_gpu(const GpuTensor& x,
-                           const GpuTensor& gamma, const GpuTensor& beta,
-                           GpuTensor& y, GpuTensor& xhat,
-                           float& mean_out, float& rstd_out,
-                           float eps);
+void layernorm_forward(const Tensor& x,
+                       const Tensor& gamma, const Tensor& beta,
+                       Tensor& y, Tensor& xhat,
+                       float& mean_out, float& rstd_out,
+                       float eps);
 
 // LayerNorm backward. Dtype-dispatched (FP32 or FP16); all tensors share dtype.
 // Internal accumulation in FP32; for FP16, dGamma/dBeta use an FP32 scratch +
@@ -133,10 +135,10 @@ void layernorm_forward_gpu(const GpuTensor& x,
 //   dX:     (N, 1) output, overwritten (resized + dtype-set to match dY)
 //   dGamma: (N, 1) accumulated into — caller zeros
 //   dBeta:  (N, 1) accumulated into — caller zeros
-void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
-                            const GpuTensor& gamma, float rstd,
-                            GpuTensor& dX,
-                            GpuTensor& dGamma, GpuTensor& dBeta);
+void layernorm_backward(const Tensor& dY, const Tensor& xhat,
+                        const Tensor& gamma, float rstd,
+                        Tensor& dX,
+                        Tensor& dGamma, Tensor& dBeta);
 
 // Single-head scaled dot-product self-attention (mirrors CPU
 // ScaledDotProductAttention). All projections are square (D, D), no biases.
@@ -155,13 +157,13 @@ void layernorm_backward_gpu(const GpuTensor& dY, const GpuTensor& xhat,
 //   Attn:   (N, N)  post-softmax weights
 //   Y_pre_Wo: (N, D)  Attn @ V (before output projection)
 // Pass these as out-parameters so backward can consume them.
-void attention_forward_gpu(const GpuTensor& X,
-                           const GpuTensor& Wq, const GpuTensor& Wk,
-                           const GpuTensor& Wv, const GpuTensor& Wo,
-                           const float* d_mask,
-                           GpuTensor& Q, GpuTensor& K, GpuTensor& V,
-                           GpuTensor& Attn, GpuTensor& Y_pre_Wo,
-                           GpuTensor& O);
+void attention_forward(const Tensor& X,
+                       const Tensor& Wq, const Tensor& Wk,
+                       const Tensor& Wv, const Tensor& Wo,
+                       const float* d_mask,
+                       Tensor& Q, Tensor& K, Tensor& V,
+                       Tensor& Attn, Tensor& Y_pre_Wo,
+                       Tensor& O);
 
 // Attention backward.
 //   dO: (N, D) upstream
@@ -170,17 +172,17 @@ void attention_forward_gpu(const GpuTensor& X,
 //   d_mask: same mask used in forward (or null)
 //   dX: (N, D) output, overwritten
 //   dWq, dWk, dWv, dWo: (D, D) accumulated into — caller zeros
-void attention_backward_gpu(const GpuTensor& dO,
-                            const GpuTensor& X,
-                            const GpuTensor& Q, const GpuTensor& K,
-                            const GpuTensor& V, const GpuTensor& Attn,
-                            const GpuTensor& Y_pre_Wo,
-                            const GpuTensor& Wq, const GpuTensor& Wk,
-                            const GpuTensor& Wv, const GpuTensor& Wo,
-                            const float* d_mask,
-                            GpuTensor& dX,
-                            GpuTensor& dWq, GpuTensor& dWk,
-                            GpuTensor& dWv, GpuTensor& dWo);
+void attention_backward(const Tensor& dO,
+                        const Tensor& X,
+                        const Tensor& Q, const Tensor& K,
+                        const Tensor& V, const Tensor& Attn,
+                        const Tensor& Y_pre_Wo,
+                        const Tensor& Wq, const Tensor& Wk,
+                        const Tensor& Wv, const Tensor& Wo,
+                        const float* d_mask,
+                        Tensor& dX,
+                        Tensor& dWq, Tensor& dWk,
+                        Tensor& dWv, Tensor& dWo);
 
 // ─── Subagent A: multi-head self-attention ─────────────────────────────────
 
@@ -203,14 +205,14 @@ void attention_backward_gpu(const GpuTensor& dO,
 //   Vh:    (h * K, head_dim)
 //   Attnh: (h * K, K)        — per-head softmax weights, same row partition
 //   Yconcat: (K, D)          — pre-Wo concat of per-head outputs
-void mha_forward_gpu(const GpuTensor& X,
-                     const GpuTensor& Wq, const GpuTensor& Wk,
-                     const GpuTensor& Wv, const GpuTensor& Wo,
-                     const float* d_mask,
-                     int num_heads,
-                     GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
-                     GpuTensor& Attnh, GpuTensor& Yconcat,
-                     GpuTensor& O);
+void mha_forward(const Tensor& X,
+                 const Tensor& Wq, const Tensor& Wk,
+                 const Tensor& Wv, const Tensor& Wo,
+                 const float* d_mask,
+                 int num_heads,
+                 Tensor& Qh, Tensor& Kh, Tensor& Vh,
+                 Tensor& Attnh, Tensor& Yconcat,
+                 Tensor& O);
 
 // Multi-head attention backward.
 //   dO: (K, D) upstream
@@ -220,18 +222,18 @@ void mha_forward_gpu(const GpuTensor& X,
 //   num_heads: must match forward
 //   dX: (K, D) output, *overwritten*
 //   dWq, dWk, dWv, dWo: (D, D) accumulated into — caller zeros
-void mha_backward_gpu(const GpuTensor& dO,
-                      const GpuTensor& X,
-                      const GpuTensor& Qh, const GpuTensor& Kh,
-                      const GpuTensor& Vh, const GpuTensor& Attnh,
-                      const GpuTensor& Yconcat,
-                      const GpuTensor& Wq, const GpuTensor& Wk,
-                      const GpuTensor& Wv, const GpuTensor& Wo,
-                      const float* d_mask,
-                      int num_heads,
-                      GpuTensor& dX,
-                      GpuTensor& dWq, GpuTensor& dWk,
-                      GpuTensor& dWv, GpuTensor& dWo);
+void mha_backward(const Tensor& dO,
+                  const Tensor& X,
+                  const Tensor& Qh, const Tensor& Kh,
+                  const Tensor& Vh, const Tensor& Attnh,
+                  const Tensor& Yconcat,
+                  const Tensor& Wq, const Tensor& Wk,
+                  const Tensor& Wv, const Tensor& Wo,
+                  const float* d_mask,
+                  int num_heads,
+                  Tensor& dX,
+                  Tensor& dWq, Tensor& dWk,
+                  Tensor& dWv, Tensor& dWo);
 
 // ─── Subagent C: pooling, losses, embedding, concat ────────────────────────
 
@@ -245,8 +247,8 @@ void mha_backward_gpu(const GpuTensor& dO,
 // If num_valid == 0 the output is filled with zeros (matching how
 // `DeepSetsEncoder` and `SetTransformerEncoder` skip the *= inv step when
 // the count is zero).
-void masked_mean_pool_forward_gpu(const GpuTensor& X, const float* d_mask,
-                                  GpuTensor& y);
+void masked_mean_pool_forward(const Tensor& X, const float* d_mask,
+                              Tensor& y);
 
 // Masked mean-pool backward.
 //   dY:   (D, 1) upstream gradient
@@ -255,24 +257,57 @@ void masked_mean_pool_forward_gpu(const GpuTensor& X, const float* d_mask,
 //   dX:   (K, D) output, *overwritten* (NOT accumulated). Invalid rows are
 //         set to exactly zero. Valid rows receive dY / num_valid.
 //         If num_valid == 0, dX is zeroed entirely.
-void masked_mean_pool_backward_gpu(const GpuTensor& dY, const float* d_mask,
-                                   int K, GpuTensor& dX);
+void masked_mean_pool_backward(const Tensor& dY, const float* d_mask,
+                               int K, Tensor& dX);
 
 // Vector MSE forward.
 //   pred, target: length-N flat tensors (any 2D shape with N elements).
 // Returns: scalar loss = mean((pred - target)^2) = (1/N) * sum (p - t)^2.
-// (Note: CPU `mse_scalar` is per-scalar 0.5*d^2 with grad = d. We adopt
+// (Note: scalar `mse_scalar` is per-scalar 0.5*d^2 with grad = d. We adopt
 // MEAN-of-squared-diffs for the vector form because that's the standard
 // autoencoder reconstruction loss and decouples the gradient magnitude from
 // N. The backward gradient is dPred = (2 / N) * (pred - target).)
-float mse_vec_forward_gpu(const GpuTensor& pred, const GpuTensor& target);
+float mse_vec_forward(const Tensor& pred, const Tensor& target);
 
 // Vector MSE backward.
 //   pred, target: forward inputs
 //   dPred: same shape as pred, *overwritten*
 //   dPred[i] = (2 / N) * (pred[i] - target[i]).
-void mse_vec_backward_gpu(const GpuTensor& pred, const GpuTensor& target,
-                          GpuTensor& dPred);
+void mse_vec_backward(const Tensor& pred, const Tensor& target,
+                      Tensor& dPred);
+
+// Mean-squared error for scalar value head. pred and target are both size 1.
+// Returns 0.5 * (pred - target)^2; dPred = (pred - target).
+//
+// CPU-only — used by single-sample value-head losses; GPU paths use
+// mse_vec_per_sample on (B, 1) tensors instead.
+float mse_scalar(float pred, float target, float& dPred);
+
+// Combined softmax + cross-entropy backward for a one-hot or soft target.
+// Convenient because the gradient collapses to (p - target). Mask is the
+// same legal-action mask — illegal entries are set to 0 in `probs` and the
+// gradient ignores them.
+//
+// Returns scalar loss = -sum_i target_i * log(p_i) (illegal ignored).
+//
+// CPU-style ordering (logits, target, probs, dLogits, mask). For the
+// GPU-style ordering with separate `d_mask` parameter and fused on-device
+// loss reduction, see `softmax_xent_fused`.
+float softmax_xent(const Tensor& logits, const Tensor& target,
+                   Tensor& probs, Tensor& dLogits,
+                   const float* mask = nullptr);
+
+// Pointer/length form of softmax_xent. Operates on n contiguous floats
+// starting at the supplied pointers. Used by callers that want to apply
+// xent to a segment of a larger logit/target buffer (e.g. the per-head
+// policy loss in GenericExItTrainer) without copying through temporary
+// Tensors. Same return value semantics as softmax_xent.
+//
+// CPU-only. Callers operating on host pointers should always be on the CPU
+// backend; GPU backends throw "not implemented".
+float softmax_xent_segment(const float* logits, const float* target,
+                           float* probs, float* dLogits,
+                           int n, const float* mask = nullptr);
 
 // Fused softmax + cross-entropy, mirroring CPU `softmax_xent_segment`.
 //   logits:  length-N
@@ -285,9 +320,9 @@ void mse_vec_backward_gpu(const GpuTensor& pred, const GpuTensor& target,
 //            Resized if mis-shaped.
 // Returns: scalar loss = -sum_i (mask[i] ? target[i] * log(max(probs[i],
 // 1e-12)) : 0). Caller guarantees at least one valid entry under mask.
-float softmax_xent_fused_gpu(const GpuTensor& logits, const GpuTensor& target,
-                             const float* d_mask,
-                             GpuTensor& probs, GpuTensor& dLogits);
+float softmax_xent_fused(const Tensor& logits, const Tensor& target,
+                         const float* d_mask,
+                         Tensor& probs, Tensor& dLogits);
 
 // Embedding lookup forward.
 //   table:    (V, D) embedding matrix (FP32 or FP16).
@@ -295,9 +330,9 @@ float softmax_xent_fused_gpu(const GpuTensor& logits, const GpuTensor& target,
 //   B:        number of indices (== rows of `out`).
 //   out:      (B, D), resized AND dtype-set to match `table` if mis-shaped/typed.
 //             out[b, :] = table[d_idx[b], :].
-void embedding_lookup_forward_gpu(const GpuTensor& table,
-                                  const int32_t* d_idx, int B,
-                                  GpuTensor& out);
+void embedding_lookup_forward(const Tensor& table,
+                              const int32_t* d_idx, int B,
+                              Tensor& out);
 
 // Embedding lookup backward — scatter-accumulate. Dtype-dispatched (FP32 or
 // FP16); dOut and dTable share dtype. For FP16, an FP32 scratch buffer is
@@ -308,32 +343,32 @@ void embedding_lookup_forward_gpu(const GpuTensor& table,
 //   B:      number of indices
 //   dTable: (V, D), accumulated into (caller zeros). Multiple lookups of the
 //           same row sum their grads via atomicAdd.
-void embedding_lookup_backward_gpu(const GpuTensor& dOut,
-                                   const int32_t* d_idx, int B,
-                                   GpuTensor& dTable);
+void embedding_lookup_backward(const Tensor& dOut,
+                               const int32_t* d_idx, int B,
+                               Tensor& dTable);
 
 // Concatenate flat tensors end-to-end.
 //   parts: list of tensors, each treated as a flat buffer of size parts[i]->size().
 //   out:   resized to (total, 1) where total = sum of part sizes.
 // Layout: out[off_i .. off_i + size_i) = parts[i] flattened.
-void concat_rows_gpu(const std::vector<const GpuTensor*>& parts,
-                     GpuTensor& out);
+void concat_rows(const std::vector<const Tensor*>& parts,
+                 Tensor& out);
 
-// Inverse of concat_rows_gpu: copy disjoint segments of `in` back into the
+// Inverse of concat_rows: copy disjoint segments of `in` back into the
 // flat buffers of `parts`. Each parts[i] is *overwritten* (not accumulated)
 // with the corresponding segment of `in`. Sizes of `parts` must be unchanged
 // from the concat call. The function assumes parts[i]->size() segments laid
 // end-to-end starting at offset 0 in `in`.
-void split_rows_gpu(const GpuTensor& in,
-                    const std::vector<GpuTensor*>& parts);
+void split_rows(const Tensor& in,
+                const std::vector<Tensor*>& parts);
 
 // Batched column-block concat. Each part is shape (B, d_i) for the same B;
 // out becomes (B, sum_i d_i) with parts laid as column blocks per row:
 //   out[b, off_i + j] = parts[i][b, j].
 // Implemented via cudaMemcpy2DAsync per part — bandwidth-bound, no kernel
 // launches. Use for batched per-row concat in inference.
-void concat_batched_rows_gpu(const std::vector<const GpuTensor*>& parts,
-                             GpuTensor& out);
+void concat_batched_rows(const std::vector<const Tensor*>& parts,
+                         Tensor& out);
 
 // Channel-axis concat over NCHW tensors. Each part i is shape
 // (N, C_i * H * W) (flat NCHW); out becomes (N, sum_i C_i * H * W) with the
@@ -345,17 +380,17 @@ void concat_batched_rows_gpu(const std::vector<const GpuTensor*>& parts,
 //
 // Implemented via cudaMemcpy2DAsync per part — dtype-dispatched (FP16/FP32),
 // bandwidth-bound, no kernel launches. This is the correct U-Net skip-merge
-// concat for N >= 1; a flat byte concat (concat_rows_gpu) would interleave
+// concat for N >= 1; a flat byte concat (concat_rows) would interleave
 // samples incorrectly for N > 1.
 //
 // C_per_part.size() must equal parts.size(); part i must have size
 // N * C_per_part[i] * H * W. All parts share dtype.
-void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
-                              int N, int H, int W,
-                              const std::vector<int>& C_per_part,
-                              GpuTensor& out);
+void concat_nchw_channels(const std::vector<const Tensor*>& parts,
+                          int N, int H, int W,
+                          const std::vector<int>& C_per_part,
+                          Tensor& out);
 
-// Inverse of concat_nchw_channels_gpu: copy disjoint channel-axis slices of
+// Inverse of concat_nchw_channels: copy disjoint channel-axis slices of
 // dY back into per-source gradient buffers. Each parts[i] is *overwritten*
 // (not accumulated) with the channels [off_i, off_i + C_per_part[i]) of dY,
 // where off_i = sum_{j < i} C_per_part[j].
@@ -367,39 +402,39 @@ void concat_nchw_channels_gpu(const std::vector<const GpuTensor*>& parts,
 // part — pure bandwidth, no kernel launches.
 //
 // C_per_part.size() must equal parts.size(); dY.cols must be N * sum(C_per_part) * H * W.
-void concat_nchw_channels_backward_gpu(const GpuTensor& dY,
-                                       int N, int H, int W,
-                                       const std::vector<int>& C_per_part,
-                                       const std::vector<GpuTensor*>& parts);
+void concat_nchw_channels_backward(const Tensor& dY,
+                                   int N, int H, int W,
+                                   const std::vector<int>& C_per_part,
+                                   const std::vector<Tensor*>& parts);
 
 // Single-stream device-to-device chunk copy. Copies `n` floats from
 // src.data + src_off into dst.data + dst_off. Both tensors are treated as
 // flat float buffers regardless of (rows, cols). Async on the default stream.
-void copy_d2d_gpu(const GpuTensor& src, int src_off,
-                  GpuTensor& dst,       int dst_off,
-                  int n);
+void copy_d2d(const Tensor& src, int src_off,
+              Tensor& dst,       int dst_off,
+              int n);
 
 // Inference-only batched LayerNorm forward. Processes R independent rows
 // of length D in a single launch (one block per row). Does not cache xhat
 // or read mean/rstd back to host — no syncs. Use when backward isn't
-// needed; the existing layernorm_forward_gpu remains for training.
+// needed; the existing layernorm_forward remains for training.
 //   X_RD:   (R, D) input
 //   gamma:  (D,) scale
 //   beta:   (D,) shift
 //   Y_RD:   (R, D), resized if mis-shaped
-void layernorm_forward_inference_batched_gpu(const GpuTensor& X_RD,
-                                              const GpuTensor& gamma,
-                                              const GpuTensor& beta,
-                                              GpuTensor& Y_RD,
-                                              float eps);
+void layernorm_forward_inference_batched(const Tensor& X_RD,
+                                         const Tensor& gamma,
+                                         const Tensor& beta,
+                                         Tensor& Y_RD,
+                                         float eps);
 
 // SGD with momentum, in-place:
 //   velocity = momentum * velocity + grad
 //   param   -= lr * velocity
 // All three tensors must have identical shape. velocity is updated in place;
 // caller is responsible for grad zeroing between batches.
-void sgd_step_gpu(GpuTensor& param, GpuTensor& grad, GpuTensor& velocity,
-                  float lr, float momentum);
+void sgd_step(Tensor& param, Tensor& grad, Tensor& velocity,
+              float lr, float momentum);
 
 // Adam optimizer step, in-place. Mirrors adam_step_cpu in circuits.h:
 //   m = beta1 * m + (1 - beta1) * g
@@ -407,9 +442,17 @@ void sgd_step_gpu(GpuTensor& param, GpuTensor& grad, GpuTensor& velocity,
 //   param -= lr * (m / (1 - beta1^step)) / (sqrt(v / (1 - beta2^step)) + eps)
 // `step` is a 1-based step counter for bias correction. All four tensors must
 // have identical shape.
-void adam_step_gpu(GpuTensor& param, const GpuTensor& grad,
-                   GpuTensor& m, GpuTensor& v,
-                   float lr, float beta1, float beta2, float eps, int step);
+void adam_step(Tensor& param, const Tensor& grad,
+               Tensor& m, Tensor& v,
+               float lr, float beta1, float beta2, float eps, int step);
+
+// Deterministic xavier-uniform init for a Linear weight matrix.
+// rng_state is a 64-bit splitmix state advanced in place.
+//
+// CPU-only — weight initialisation happens before training begins, while
+// weights still live on the host. Move them to a GPU backend with `to()`
+// afterward.
+void xavier_init(Tensor& W, uint64_t& rng_state);
 
 // ─── Batched (inference-only) variants ─────────────────────────────────────
 //
@@ -426,16 +469,16 @@ void adam_step_gpu(GpuTensor& param, const GpuTensor& grad,
 //   bias: (out_dim, 1)
 //   X_BD: (B, in_dim)
 //   Y_BD: (B, out_dim) — resized if mis-shaped.
-void linear_forward_batched_gpu(const GpuTensor& W, const GpuTensor& bias,
-                                const GpuTensor& X_BD, GpuTensor& Y_BD);
+void linear_forward_batched(const Tensor& W, const Tensor& bias,
+                            const Tensor& X_BD, Tensor& Y_BD);
 
 // Elementwise ReLU/Tanh over (B, D). Y resized to match X if mis-shaped.
 // X and Y may alias.
-void relu_forward_batched_gpu(const GpuTensor& X_BD, GpuTensor& Y_BD);
-void tanh_forward_batched_gpu(const GpuTensor& X_BD, GpuTensor& Y_BD);
+void relu_forward_batched(const Tensor& X_BD, Tensor& Y_BD);
+void tanh_forward_batched(const Tensor& X_BD, Tensor& Y_BD);
 
 // Y[i] += X[i] over (B, D). Identical shape required.
-void add_inplace_batched_gpu(GpuTensor& Y_BD, const GpuTensor& X_BD);
+void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD);
 
 // ─── Batched (training) backward variants ──────────────────────────────────
 //
@@ -453,18 +496,18 @@ void add_inplace_batched_gpu(GpuTensor& Y_BD, const GpuTensor& X_BD);
 //   dW:   (out_dim, in_dim) — *accumulated*; caller zeros before the step
 //   dB:   (out_dim, 1)      — *accumulated*; caller zeros before the step
 // Math: dX[b] = W^T * dY[b], dW += sum_b dY[b] * X[b]^T, dB += sum_b dY[b].
-void linear_backward_batched_gpu(const GpuTensor& W, const GpuTensor& X_BD,
-                                 const GpuTensor& dY_BD,
-                                 GpuTensor& dX_BD,
-                                 GpuTensor& dW, GpuTensor& dB);
+void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
+                             const Tensor& dY_BD,
+                             Tensor& dX_BD,
+                             Tensor& dW, Tensor& dB);
 
 // Elementwise ReLU/Tanh backward over (B, D). Same shapes throughout.
 //   relu:  dX = dY * (X > 0); reads X_BD (the forward input).
 //   tanh:  dX = dY * (1 - Y*Y); reads Y_BD (the forward output).
-void relu_backward_batched_gpu(const GpuTensor& X_BD, const GpuTensor& dY_BD,
-                               GpuTensor& dX_BD);
-void tanh_backward_batched_gpu(const GpuTensor& Y_BD, const GpuTensor& dY_BD,
-                               GpuTensor& dX_BD);
+void relu_backward_batched(const Tensor& X_BD, const Tensor& dY_BD,
+                           Tensor& dX_BD);
+void tanh_backward_batched(const Tensor& Y_BD, const Tensor& dY_BD,
+                           Tensor& dX_BD);
 
 // ─── Batched per-sample loss kernels (training) ────────────────────────────
 //
@@ -476,8 +519,8 @@ void tanh_backward_batched_gpu(const GpuTensor& Y_BD, const GpuTensor& dY_BD,
 //   target: (B, 1)
 //   dPred:  (B, 1) — overwritten with (pred - target)
 //   loss_per_sample: (B, 1) — overwritten with 0.5 * (pred - target)^2
-void mse_vec_per_sample_gpu(const GpuTensor& pred, const GpuTensor& target,
-                            GpuTensor& dPred, GpuTensor& loss_per_sample);
+void mse_vec_per_sample(const Tensor& pred, const Tensor& target,
+                        Tensor& dPred, Tensor& loss_per_sample);
 
 // Batched fused softmax + cross-entropy across (sample, head) tiles.
 //
@@ -497,21 +540,21 @@ void mse_vec_per_sample_gpu(const GpuTensor& pred, const GpuTensor& target,
 //
 // The caller is responsible for any mean-over-heads reduction on the loss
 // (CPU formulation divides by n_heads). The kernel does not scale dLogits
-// by 1/n_heads either — the caller applies that with scale_inplace_gpu.
-void softmax_xent_fused_batched_gpu(const GpuTensor& logits_BL,
-                                    const GpuTensor& target_BL,
-                                    const float* d_mask_BL,
-                                    const int* d_head_offsets,
-                                    int n_heads,
-                                    GpuTensor& probs_BL,
-                                    GpuTensor& dLogits_BL,
-                                    GpuTensor& loss_per_sample);
+// by 1/n_heads either — the caller applies that with scale_inplace.
+void softmax_xent_fused_batched(const Tensor& logits_BL,
+                                const Tensor& target_BL,
+                                const float* d_mask_BL,
+                                const int* d_head_offsets,
+                                int n_heads,
+                                Tensor& probs_BL,
+                                Tensor& dLogits_BL,
+                                Tensor& loss_per_sample);
 
 // ─── Diffusion / vision ops (FP16, inference-only) ─────────────────────────
 //
 // These ops are the GPU primitives needed to run a diffusion U-Net + VAE
 // end-to-end. They take FP16 tensors (X.dtype == Dtype::FP16) and produce
-// FP16 outputs. Internal accumulation is in FP32. NCHW layout: the GpuTensor
+// FP16 outputs. Internal accumulation is in FP32. NCHW layout: the Tensor
 // is treated as a flat buffer; (N, C, H, W) dimensions are passed as
 // integer arguments. Output tensors are resized (and dtype-set) by the op.
 // No backward; downstream brodiff drives these for inference only.
@@ -534,32 +577,32 @@ void softmax_xent_fused_batched_gpu(const GpuTensor& logits_BL,
 // Output dims (standard PyTorch formula):
 //   H_out = (H + 2*pad_h - dil_h * (kH - 1) - 1) / stride_h + 1
 //   W_out = (W + 2*pad_w - dil_w * (kW - 1) - 1) / stride_w + 1
-void conv2d_forward_gpu(const GpuTensor& X,
-                        const GpuTensor& Wt,
-                        const GpuTensor* bias,
-                        int N, int C_in, int H, int W,
-                        int C_out, int kH, int kW,
-                        int stride_h, int stride_w,
-                        int pad_h, int pad_w,
-                        int dil_h, int dil_w,
-                        int groups,
-                        GpuTensor& Y);
+void conv2d_forward(const Tensor& X,
+                    const Tensor& Wt,
+                    const Tensor* bias,
+                    int N, int C_in, int H, int W,
+                    int C_out, int kH, int kW,
+                    int stride_h, int stride_w,
+                    int pad_h, int pad_w,
+                    int dil_h, int dil_w,
+                    int groups,
+                    Tensor& Y);
 // Convenience overload: groups defaults to 1 (full convolution).
-inline void conv2d_forward_gpu(const GpuTensor& X,
-                               const GpuTensor& Wt,
-                               const GpuTensor* bias,
-                               int N, int C_in, int H, int W,
-                               int C_out, int kH, int kW,
-                               int stride_h, int stride_w,
-                               int pad_h, int pad_w,
-                               int dil_h, int dil_w,
-                               GpuTensor& Y) {
-    conv2d_forward_gpu(X, Wt, bias, N, C_in, H, W, C_out, kH, kW,
-                       stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                       /*groups=*/1, Y);
+inline void conv2d_forward(const Tensor& X,
+                           const Tensor& Wt,
+                           const Tensor* bias,
+                           int N, int C_in, int H, int W,
+                           int C_out, int kH, int kW,
+                           int stride_h, int stride_w,
+                           int pad_h, int pad_w,
+                           int dil_h, int dil_w,
+                           Tensor& Y) {
+    conv2d_forward(X, Wt, bias, N, C_in, H, W, C_out, kH, kW,
+                   stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                   /*groups=*/1, Y);
 }
 
-// 2D convolution backward w.r.t. input (dX). Mirrors conv2d_forward_gpu's
+// 2D convolution backward w.r.t. input (dX). Mirrors conv2d_forward's
 // groups parameter: input channel c_in only sees output channels in its
 // own group g = c_in / (C_in / groups). At groups=1 the math reduces to a
 // full sum over c_out.
@@ -584,31 +627,31 @@ inline void conv2d_forward_gpu(const GpuTensor& X,
 //                                           dtype-set to match dY if
 //                                           mis-shaped/-typed.
 //   groups: must divide both C_in and C_out. Depthwise is groups == C_in == C_out.
-void conv2d_backward_input_gpu(const GpuTensor& Wt,
-                               const GpuTensor& dY,
-                               int N, int C_in, int H, int W,
-                               int C_out, int kH, int kW,
-                               int stride_h, int stride_w,
-                               int pad_h, int pad_w,
-                               int dil_h, int dil_w,
-                               int groups,
-                               GpuTensor& dX);
+void conv2d_backward_input(const Tensor& Wt,
+                           const Tensor& dY,
+                           int N, int C_in, int H, int W,
+                           int C_out, int kH, int kW,
+                           int stride_h, int stride_w,
+                           int pad_h, int pad_w,
+                           int dil_h, int dil_w,
+                           int groups,
+                           Tensor& dX);
 // Convenience overload: groups defaults to 1.
-inline void conv2d_backward_input_gpu(const GpuTensor& Wt,
-                                      const GpuTensor& dY,
-                                      int N, int C_in, int H, int W,
-                                      int C_out, int kH, int kW,
-                                      int stride_h, int stride_w,
-                                      int pad_h, int pad_w,
-                                      int dil_h, int dil_w,
-                                      GpuTensor& dX) {
-    conv2d_backward_input_gpu(Wt, dY, N, C_in, H, W, C_out, kH, kW,
-                              stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                              /*groups=*/1, dX);
+inline void conv2d_backward_input(const Tensor& Wt,
+                                  const Tensor& dY,
+                                  int N, int C_in, int H, int W,
+                                  int C_out, int kH, int kW,
+                                  int stride_h, int stride_w,
+                                  int pad_h, int pad_w,
+                                  int dil_h, int dil_w,
+                                  Tensor& dX) {
+    conv2d_backward_input(Wt, dY, N, C_in, H, W, C_out, kH, kW,
+                          stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                          /*groups=*/1, dX);
 }
 
 // 2D convolution backward w.r.t. weights (dW). Dtype-dispatched (FP32 or
-// FP16); X, dY, dWt all share dtype. Mirrors conv2d_forward_gpu's groups
+// FP16); X, dY, dWt all share dtype. Mirrors conv2d_forward's groups
 // parameter; for groups > 1 the filter has shape (C_out, (C_in/groups) * kH * kW)
 // and each output channel only sees the inputs in its own group.
 //
@@ -634,27 +677,27 @@ inline void conv2d_backward_input_gpu(const GpuTensor& Wt,
 //   dWt:  (C_out, (C_in/groups) * kH * kW)   *accumulated into* — caller zeros
 //   groups: must divide both C_in and C_out.
 // All conv hyperparams match the forward call.
-void conv2d_backward_weight_gpu(const GpuTensor& X,
-                                const GpuTensor& dY,
-                                int N, int C_in, int H, int W,
-                                int C_out, int kH, int kW,
-                                int stride_h, int stride_w,
-                                int pad_h, int pad_w,
-                                int dil_h, int dil_w,
-                                int groups,
-                                GpuTensor& dWt);
+void conv2d_backward_weight(const Tensor& X,
+                            const Tensor& dY,
+                            int N, int C_in, int H, int W,
+                            int C_out, int kH, int kW,
+                            int stride_h, int stride_w,
+                            int pad_h, int pad_w,
+                            int dil_h, int dil_w,
+                            int groups,
+                            Tensor& dWt);
 // Convenience overload: groups defaults to 1.
-inline void conv2d_backward_weight_gpu(const GpuTensor& X,
-                                       const GpuTensor& dY,
-                                       int N, int C_in, int H, int W,
-                                       int C_out, int kH, int kW,
-                                       int stride_h, int stride_w,
-                                       int pad_h, int pad_w,
-                                       int dil_h, int dil_w,
-                                       GpuTensor& dWt) {
-    conv2d_backward_weight_gpu(X, dY, N, C_in, H, W, C_out, kH, kW,
-                               stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-                               /*groups=*/1, dWt);
+inline void conv2d_backward_weight(const Tensor& X,
+                                   const Tensor& dY,
+                                   int N, int C_in, int H, int W,
+                                   int C_out, int kH, int kW,
+                                   int stride_h, int stride_w,
+                                   int pad_h, int pad_w,
+                                   int dil_h, int dil_w,
+                                   Tensor& dWt) {
+    conv2d_backward_weight(X, dY, N, C_in, H, W, C_out, kH, kW,
+                           stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                           /*groups=*/1, dWt);
 }
 
 // 2D convolution backward w.r.t. bias (dB). Dtype-dispatched (FP32 or FP16);
@@ -669,9 +712,9 @@ inline void conv2d_backward_weight_gpu(const GpuTensor& X,
 //
 //   dY:  (N, C_out * H_out * W_out)   upstream gradient
 //   dB:  (C_out, 1)                    *accumulated into* — caller zeros
-void conv2d_backward_bias_gpu(const GpuTensor& dY,
-                              int N, int C_out, int H_out, int W_out,
-                              GpuTensor& dB);
+void conv2d_backward_bias(const Tensor& dY,
+                          int N, int C_out, int H_out, int W_out,
+                          Tensor& dB);
 
 // GroupNorm forward, NCHW. Dtype-dispatched on X.dtype (FP32 or FP16);
 // gamma, beta, and Y all share X.dtype. Internal accumulation in FP32.
@@ -682,13 +725,13 @@ void conv2d_backward_bias_gpu(const GpuTensor& dY,
 //                           mis-shaped/-typed.
 //   num_groups must divide C. eps typically 1e-5f. Mean and variance are
 //   computed over (C/num_groups, H, W) within each (n, group) tile.
-void group_norm_forward_gpu(const GpuTensor& X,
-                            const GpuTensor& gamma,
-                            const GpuTensor& beta,
-                            int N, int C, int H, int W,
-                            int num_groups,
-                            float eps,
-                            GpuTensor& Y);
+void group_norm_forward(const Tensor& X,
+                        const Tensor& gamma,
+                        const Tensor& beta,
+                        int N, int C, int H, int W,
+                        int num_groups,
+                        float eps,
+                        Tensor& Y);
 
 // GroupNorm backward, NCHW. Dtype-dispatched on X.dtype (FP32 or FP16);
 // gamma and dY share X.dtype. Internal accumulation in FP32 regardless of
@@ -712,30 +755,30 @@ void group_norm_forward_gpu(const GpuTensor& X,
 //                            match X if mis-shaped/-typed.
 //   dGamma: (C, 1)           *accumulated into* — caller zeros. Same dtype as X.
 //   dBeta:  (C, 1)           *accumulated into* — caller zeros. Same dtype as X.
-void group_norm_backward_gpu(const GpuTensor& X,
-                             const GpuTensor& gamma,
-                             const GpuTensor& dY,
-                             int N, int C, int H, int W,
-                             int num_groups,
-                             float eps,
-                             GpuTensor& dX,
-                             GpuTensor& dGamma,
-                             GpuTensor& dBeta);
+void group_norm_backward(const Tensor& X,
+                         const Tensor& gamma,
+                         const Tensor& dY,
+                         int N, int C, int H, int W,
+                         int num_groups,
+                         float eps,
+                         Tensor& dX,
+                         Tensor& dGamma,
+                         Tensor& dBeta);
 
 // SiLU / Swish: y = x * sigmoid(x). FP32 and FP16 variants. y resized to
 // match x.shape AND x.dtype if mis-shaped/mis-typed. x and y may alias.
-void silu_forward_gpu(const GpuTensor& x, GpuTensor& y);
+void silu_forward(const Tensor& x, Tensor& y);
 
 // SiLU backward. Reads the raw forward input x (NOT the forward output y).
 //   dX[i] = dY[i] * sigmoid(x[i]) * (1 + x[i] * (1 - sigmoid(x[i])))
 // FP32 and FP16 variants dispatched on x.dtype (FP16 accumulates in FP32).
 // dX is resized AND dtype-set to match x if mis-shaped/-typed. dX may alias dY.
-void silu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX);
+void silu_backward(const Tensor& x, const Tensor& dY, Tensor& dX);
 
 // GELU (tanh approximation, matching PyTorch's `approximate="tanh"`):
 //   y = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
 // FP32 and FP16 variants dispatched on x.dtype.
-void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y);
+void gelu_forward(const Tensor& x, Tensor& y);
 
 // GELU backward (tanh approximation). Reads the raw forward input x.
 //   k = sqrt(2/pi); u = k * (x + 0.044715 * x^3); t = tanh(u)
@@ -744,18 +787,18 @@ void gelu_forward_gpu(const GpuTensor& x, GpuTensor& y);
 //   dX[i] = dY[i] * dy/dx
 // FP32 and FP16 dispatch on x.dtype (FP16 accumulates in FP32). dX resized AND
 // dtype-set to match x if mis-shaped/-typed. dX may alias dY.
-void gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY, GpuTensor& dX);
+void gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX);
 
 // Exact GELU (erf formulation, matches PyTorch `torch.nn.functional.gelu`
 // with default `approximate="none"` and HuggingFace `diffusers`' default):
 //   y = 0.5 * x * (1 + erf(x / sqrt(2)))
 // This is the *exact* Gaussian-CDF GELU, distinct from the tanh-approximation
-// `gelu_forward_gpu`. Provided as a separate op so downstream call sites
+// `gelu_forward`. Provided as a separate op so downstream call sites
 // (e.g. brodiffusion's UNet GEGLU FFNs) can swap activations without
 // disturbing the existing tanh-approx path. FP32 and FP16 variants dispatched
 // on x.dtype (FP16 accumulates in FP32). y resized AND dtype-set to match x
 // if mis-shaped/-typed. x and y may alias.
-void gelu_exact_forward_gpu(const GpuTensor& x, GpuTensor& y);
+void gelu_exact_forward(const Tensor& x, Tensor& y);
 
 // Exact-GELU backward. Reads the raw forward input x.
 //   dy/dx = 0.5 * (1 + erf(x/√2)) + (x / √(2π)) * exp(-x²/2)
@@ -763,22 +806,22 @@ void gelu_exact_forward_gpu(const GpuTensor& x, GpuTensor& y);
 //   dX[i] = dY[i] * dy/dx
 // FP32 and FP16 dispatch on x.dtype (FP16 accumulates in FP32). dX resized AND
 // dtype-set to match x if mis-shaped/-typed. dX may alias dY.
-void gelu_exact_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
-                             GpuTensor& dX);
+void gelu_exact_backward(const Tensor& x, const Tensor& dY,
+                         Tensor& dX);
 
 // QuickGELU: y = x * sigmoid(1.702 * x). Matches OpenAI CLIP's activation
 // (used in SD1.5's CLIP ViT-L/14 text encoder). FP32 and FP16 variants
 // dispatched on x.dtype. y resized to match x.shape AND x.dtype if
 // mis-shaped/-typed. x and y may alias.
-void quick_gelu_forward_gpu(const GpuTensor& x, GpuTensor& y);
+void quick_gelu_forward(const Tensor& x, Tensor& y);
 
 // QuickGELU backward. Reads the raw forward input x. Let s = sigmoid(1.702*x).
 //   dy/dx = s + x * 1.702 * s * (1 - s)
 //   dX[i] = dY[i] * dy/dx
 // FP32 and FP16 dispatch on x.dtype (FP16 accumulates in FP32). dX resized AND
 // dtype-set to match x if mis-shaped/-typed. dX may alias dY.
-void quick_gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
-                             GpuTensor& dX);
+void quick_gelu_backward(const Tensor& x, const Tensor& dY,
+                         Tensor& dX);
 
 // 2x nearest-neighbour upsample over the spatial dims of an NCHW tensor.
 // Dtype-dispatched on X.dtype (FP32 or FP16); Y resized AND dtype-set to
@@ -786,26 +829,26 @@ void quick_gelu_backward_gpu(const GpuTensor& x, const GpuTensor& dY,
 //   X: (N, C * H * W)
 //   Y: (N, C * 2H * 2W)
 // Each output pixel (i, j) reads X at (i/2, j/2).
-void upsample_nearest_2x_gpu(const GpuTensor& X,
-                             int N, int C, int H, int W,
-                             GpuTensor& Y);
+void upsample_nearest_2x(const Tensor& X,
+                         int N, int C, int H, int W,
+                         Tensor& Y);
 
 // 2x bilinear upsample with align_corners=False (PyTorch default for
 // interpolate(scale_factor=2)). NCHW. Dtype-dispatched on X.dtype (FP32 or
 // FP16); Y resized AND dtype-set to match X if mis-shaped/-typed. Internal
 // math in FP32.
-void upsample_bilinear_2x_gpu(const GpuTensor& X,
-                              int N, int C, int H, int W,
-                              GpuTensor& Y);
+void upsample_bilinear_2x(const Tensor& X,
+                          int N, int C, int H, int W,
+                          Tensor& Y);
 
 // 2x average-pool downsample over NCHW. Stride 2, kernel 2, no padding.
 // Dtype-dispatched on X.dtype (FP32 or FP16); Y resized AND dtype-set to
 // match X if mis-shaped/-typed. Internal math in FP32.
 //   X: (N, C * H * W);  H and W must be even.
 //   Y: (N, C * H/2 * W/2)
-void downsample_avg_2x_gpu(const GpuTensor& X,
-                           int N, int C, int H, int W,
-                           GpuTensor& Y);
+void downsample_avg_2x(const Tensor& X,
+                       int N, int C, int H, int W,
+                       Tensor& Y);
 
 // Backward of upsample_nearest_2x. Each input pixel sums the 4 output-pixel
 // gradients that copied from it:
@@ -816,9 +859,9 @@ void downsample_avg_2x_gpu(const GpuTensor& X,
 //   dY: (N, C * 2H * 2W)  upstream gradient
 //   N, C, H, W: INPUT (pre-upsample) dims (so output dims are 2H, 2W)
 //   dX: (N, C * H * W)    output, *overwritten*
-void upsample_nearest_2x_backward_gpu(const GpuTensor& dY,
-                                      int N, int C, int H, int W,
-                                      GpuTensor& dX);
+void upsample_nearest_2x_backward(const Tensor& dY,
+                                  int N, int C, int H, int W,
+                                  Tensor& dX);
 
 // Backward of upsample_bilinear_2x (align_corners=False). Scatters each
 // dY[n,c,i_out,j_out] into the 4 input pixels it bilinear-sampled from,
@@ -831,9 +874,9 @@ void upsample_nearest_2x_backward_gpu(const GpuTensor& dY,
 //   dY: (N, C * 2H * 2W)  upstream gradient
 //   N, C, H, W: INPUT (pre-upsample) dims
 //   dX: (N, C * H * W)    output, *overwritten*
-void upsample_bilinear_2x_backward_gpu(const GpuTensor& dY,
-                                       int N, int C, int H, int W,
-                                       GpuTensor& dX);
+void upsample_bilinear_2x_backward(const Tensor& dY,
+                                   int N, int C, int H, int W,
+                                   Tensor& dX);
 
 // Backward of downsample_avg_2x. Each input pixel receives 1/4 of the single
 // output pixel's gradient that averaged over it:
@@ -844,29 +887,29 @@ void upsample_bilinear_2x_backward_gpu(const GpuTensor& dY,
 //   dY: (N, C * H/2 * W/2)  upstream gradient
 //   N, C, H, W: INPUT (pre-downsample) dims; H, W even
 //   dX: (N, C * H * W)      output, *overwritten*
-void downsample_avg_2x_backward_gpu(const GpuTensor& dY,
-                                    int N, int C, int H, int W,
-                                    GpuTensor& dX);
+void downsample_avg_2x_backward(const Tensor& dY,
+                                int N, int C, int H, int W,
+                                Tensor& dX);
 
 // FP16 batched linear forward, inference-only. Mirrors
-// linear_forward_batched_gpu but with FP16 storage on X / W / bias / Y.
+// linear_forward_batched but with FP16 storage on X / W / bias / Y.
 //   W:    (out_dim, in_dim)  FP16
 //   bias: (out_dim, 1)       FP16; may be null for bias-free linears
 //   X_BD: (B, in_dim)        FP16
 //   Y_BD: (B, out_dim)       FP16; resized if mis-shaped/-typed.
-void linear_forward_batched_fp16_gpu(const GpuTensor& W, const GpuTensor* bias,
-                                     const GpuTensor& X_BD, GpuTensor& Y_BD);
+void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
+                                 const Tensor& X_BD, Tensor& Y_BD);
 
 // y[i] *= x[i]. Identical shape and dtype required. Dispatches FP32/FP16
 // on y.dtype. Used by GEGLU and by gating paths in transformer FFNs.
-void mul_inplace_gpu(GpuTensor& y, const GpuTensor& x);
+void mul_inplace(Tensor& y, const Tensor& x);
 
 // GEGLU activation: input (B, 2*D) is split along the last dim into halves
 // A=(B, D) and B_half=(B, D); output (B, D) = A * gelu(B_half). FP32 and FP16
 // variants dispatched on X.dtype (FP16 accumulates in FP32).
 //   X:  (B, 2*D)  input
 //   Y:  (B, D)    output, resized AND dtype-set to match X if mis-shaped/-typed.
-void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y);
+void geglu_forward(const Tensor& X, Tensor& Y);
 
 // GEGLU backward. Splits X along the last dim into halves A and B_half (each
 // (B, D)). Let g = gelu(B_half) (tanh-approx).
@@ -875,10 +918,10 @@ void geglu_forward_gpu(const GpuTensor& X, GpuTensor& Y);
 // dX = concat(dA, dB_half) along the last dim with layout matching the
 // forward (A then B_half). FP32 and FP16 dispatch on X.dtype (FP16 accumulates
 // in FP32). dX is resized AND dtype-set to match X if mis-shaped/-typed.
-void geglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
-                        GpuTensor& dX);
+void geglu_backward(const Tensor& X, const Tensor& dY,
+                    Tensor& dX);
 
-// Exact-GELU GEGLU activation: same shape contract as `geglu_forward_gpu`
+// Exact-GELU GEGLU activation: same shape contract as `geglu_forward`
 // (input (B, 2*D) split along last dim into A=(B, D) and B_half=(B, D),
 // output (B, D) = A * gelu_exact(B_half)), but uses the exact erf-based
 // GELU instead of the tanh approximation. Matches HuggingFace `diffusers`'
@@ -886,17 +929,17 @@ void geglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
 // FP32).
 //   X:  (B, 2*D)  input
 //   Y:  (B, D)    output, resized AND dtype-set to match X if mis-shaped/-typed.
-void geglu_exact_forward_gpu(const GpuTensor& X, GpuTensor& Y);
+void geglu_exact_forward(const Tensor& X, Tensor& Y);
 
 // Exact-GELU GEGLU backward. Splits X into A and B_half (each (B, D)). Let
 // g = gelu_exact(B_half).
 //   dA      = dY * g
-//   dB_half = dY * A * gelu_exact'(B_half)   (see gelu_exact_backward_gpu)
+//   dB_half = dY * A * gelu_exact'(B_half)   (see gelu_exact_backward)
 // dX = concat(dA, dB_half) along the last dim, layout matches the forward
 // (A then B_half). FP32 and FP16 dispatch on X.dtype (FP16 accumulates in
 // FP32). dX is resized AND dtype-set to match X if mis-shaped/-typed.
-void geglu_exact_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
-                              GpuTensor& dX);
+void geglu_exact_backward(const Tensor& X, const Tensor& dY,
+                          Tensor& dX);
 
 // Causal mask helper for transformer self-attention. Produces an (L, L)
 // FP32 mask where mask[q*L + k] = (k <= q) ? 1.0f : 0.0f. The existing
@@ -904,18 +947,18 @@ void geglu_exact_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
 // causal self-attention you launch the attention per query separately, so
 // in practice we expose the simpler diagonal-cumulative form below.
 //
-// build_causal_mask_row_gpu fills the length-L FP32 buffer for row q:
+// build_causal_mask_row fills the length-L FP32 buffer for row q:
 //   mask[k] = (k <= q) ? 1.0f : 0.0f
 // Resized to (L, 1) if mis-shaped. Useful for CLIP-text-encoder masking.
-void build_causal_mask_row_gpu(int L, int q, GpuTensor& mask);
+void build_causal_mask_row(int L, int q, Tensor& mask);
 
-// Cross-attention: like mha_forward_gpu but K and V are projected from a
+// Cross-attention: like mha_forward but K and V are projected from a
 // separate context tensor instead of from X. Used in diffusion U-Nets to
 // inject text conditioning. Dispatched on X.dtype:
 //   * FP16: flash-attention path (inference). Caches are NOT exposed; if you
-//     want them, use cross_attention_forward_train_gpu (FP32 only).
+//     want them, use cross_attention_forward_train (FP32 only).
 //   * FP32: training-aware path. Internally allocates scratch caches and
-//     calls cross_attention_forward_train_gpu; scratch is discarded.
+//     calls cross_attention_forward_train; scratch is discarded.
 //
 //   X:    (Lq, D)      query input (image tokens)
 //   Ctx:  (Lk, D_ctx)  key/value input (text tokens). Lk and D_ctx may differ
@@ -927,16 +970,16 @@ void build_causal_mask_row_gpu(int L, int q, GpuTensor& mask);
 //   d_mask: optional FP32 mask of length Lk (1 valid, 0 invalid). May be null.
 //   num_heads: must divide D.
 //   O:    (Lq, D) output, same dtype as X. Resized if mis-shaped.
-void cross_attention_forward_gpu(const GpuTensor& X,
-                                 const GpuTensor& Ctx,
-                                 const GpuTensor& Wq, const GpuTensor& Wk,
-                                 const GpuTensor& Wv, const GpuTensor& Wo,
-                                 const float* d_mask,
-                                 int num_heads,
-                                 GpuTensor& O);
+void cross_attention_forward(const Tensor& X,
+                             const Tensor& Ctx,
+                             const Tensor& Wq, const Tensor& Wk,
+                             const Tensor& Wv, const Tensor& Wo,
+                             const float* d_mask,
+                             int num_heads,
+                             Tensor& O);
 
 // Cross-attention with explicit attention-map output and optional pre-softmax
-// logit bias. Same math as cross_attention_forward_gpu (FP16) but:
+// logit bias. Same math as cross_attention_forward (FP16) but:
 //   * if `attn_logit_bias` is non-null it is added (FP32) to the scaled QKᵀ
 //     scores *before* softmax, broadcast across heads (shape (Lq, Lk));
 //   * after softmax the attention probabilities are averaged across heads
@@ -957,17 +1000,17 @@ void cross_attention_forward_gpu(const GpuTensor& X,
 //   O:       (Lq, D)  FP16 output, resized AND dtype-set if mis-shaped/-typed.
 //   AttnAvg: (Lq, Lk) FP16 head-averaged softmax, resized AND dtype-set
 //                     if mis-shaped/-typed.
-void cross_attention_forward_with_attn_gpu(const GpuTensor& X,
-                                           const GpuTensor& Ctx,
-                                           const GpuTensor& Wq, const GpuTensor& Wk,
-                                           const GpuTensor& Wv, const GpuTensor& Wo,
-                                           const float* d_mask,
-                                           const GpuTensor* attn_logit_bias,
-                                           int num_heads,
-                                           GpuTensor& O,
-                                           GpuTensor& AttnAvg);
+void cross_attention_forward_with_attn(const Tensor& X,
+                                       const Tensor& Ctx,
+                                       const Tensor& Wq, const Tensor& Wk,
+                                       const Tensor& Wv, const Tensor& Wo,
+                                       const float* d_mask,
+                                       const Tensor* attn_logit_bias,
+                                       int num_heads,
+                                       Tensor& O,
+                                       Tensor& AttnAvg);
 
-// FP32 training-side self-attention forward. Thin wrapper over mha_forward_gpu
+// FP32 training-side self-attention forward. Thin wrapper over mha_forward
 // (signatures match exactly when D_ctx == D and Ctx == X).
 //   X:   (L, D) FP32
 //   Wq, Wk, Wv, Wo: each (D, D) FP32
@@ -978,17 +1021,17 @@ void cross_attention_forward_with_attn_gpu(const GpuTensor& X,
 //     Attnh:      (h*L, L)
 //     Yconcat:    (L, D)
 //   O:   (L, D) FP32; resized if mis-shaped.
-void self_attention_forward_train_gpu(const GpuTensor& X,
-                                      const GpuTensor& Wq, const GpuTensor& Wk,
-                                      const GpuTensor& Wv, const GpuTensor& Wo,
-                                      const float* d_mask,
-                                      int num_heads,
-                                      GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
-                                      GpuTensor& Attnh, GpuTensor& Yconcat,
-                                      GpuTensor& O);
+void self_attention_forward_train(const Tensor& X,
+                                  const Tensor& Wq, const Tensor& Wk,
+                                  const Tensor& Wv, const Tensor& Wo,
+                                  const float* d_mask,
+                                  int num_heads,
+                                  Tensor& Qh, Tensor& Kh, Tensor& Vh,
+                                  Tensor& Attnh, Tensor& Yconcat,
+                                  Tensor& O);
 
 // FP32 training-side self-attention backward. Thin wrapper over
-// mha_backward_gpu.
+// mha_backward.
 //   dO: (L, D) upstream
 //   X, Qh, Kh, Vh, Attnh, Yconcat: forward caches
 //   Wq, Wk, Wv, Wo: forward weights (each (D, D))
@@ -996,18 +1039,18 @@ void self_attention_forward_train_gpu(const GpuTensor& X,
 //   num_heads: must match forward
 //   dX: (L, D) output, *overwritten*
 //   dWq, dWk, dWv, dWo: (D, D) accumulated into — caller zeros.
-void self_attention_backward_gpu(const GpuTensor& dO,
-                                 const GpuTensor& X,
-                                 const GpuTensor& Qh, const GpuTensor& Kh,
-                                 const GpuTensor& Vh, const GpuTensor& Attnh,
-                                 const GpuTensor& Yconcat,
-                                 const GpuTensor& Wq, const GpuTensor& Wk,
-                                 const GpuTensor& Wv, const GpuTensor& Wo,
-                                 const float* d_mask,
-                                 int num_heads,
-                                 GpuTensor& dX,
-                                 GpuTensor& dWq, GpuTensor& dWk,
-                                 GpuTensor& dWv, GpuTensor& dWo);
+void self_attention_backward(const Tensor& dO,
+                             const Tensor& X,
+                             const Tensor& Qh, const Tensor& Kh,
+                             const Tensor& Vh, const Tensor& Attnh,
+                             const Tensor& Yconcat,
+                             const Tensor& Wq, const Tensor& Wk,
+                             const Tensor& Wv, const Tensor& Wo,
+                             const float* d_mask,
+                             int num_heads,
+                             Tensor& dX,
+                             Tensor& dWq, Tensor& dWk,
+                             Tensor& dWv, Tensor& dWo);
 
 // Per-text-token spatial moments of a cross-attention map. Given an attention
 // matrix Attn(Lq, Lk) where Lq = h_lat * w_lat is a flattened image-token grid
@@ -1021,12 +1064,12 @@ void self_attention_backward_gpu(const GpuTensor& dO,
 //   Attn:     (Lq, Lk) FP16, Lq = h_lat * w_lat
 //   mass:     (Lk, 1)  FP32, resized if mis-shaped
 //   centroid: (Lk, 2)  FP32, resized if mis-shaped, [y, x] per row
-void attention_token_moments_gpu(const GpuTensor& Attn,
-                                 int h_lat, int w_lat,
-                                 GpuTensor& mass,
-                                 GpuTensor& centroid);
+void attention_token_moments(const Tensor& Attn,
+                             int h_lat, int w_lat,
+                             Tensor& mass,
+                             Tensor& centroid);
 
-// FP32 training-side cross-attention forward. Mirrors mha_forward_gpu math
+// FP32 training-side cross-attention forward. Mirrors mha_forward math
 // but accepts a separate Ctx tensor for K/V projection and rectangular
 // Wk/Wv: (D, D_ctx).
 //
@@ -1045,15 +1088,15 @@ void attention_token_moments_gpu(const GpuTensor& Attn,
 //     Attnh: (h*Lq, Lk)
 //     Yconcat: (Lq, D)
 //   O:    (Lq, D) FP32; resized if mis-shaped.
-void cross_attention_forward_train_gpu(const GpuTensor& X,
-                                       const GpuTensor& Ctx,
-                                       const GpuTensor& Wq, const GpuTensor& Wk,
-                                       const GpuTensor& Wv, const GpuTensor& Wo,
-                                       const float* d_mask,
-                                       int num_heads,
-                                       GpuTensor& Qh, GpuTensor& Kh, GpuTensor& Vh,
-                                       GpuTensor& Attnh, GpuTensor& Yconcat,
-                                       GpuTensor& O);
+void cross_attention_forward_train(const Tensor& X,
+                                   const Tensor& Ctx,
+                                   const Tensor& Wq, const Tensor& Wk,
+                                   const Tensor& Wv, const Tensor& Wo,
+                                   const float* d_mask,
+                                   int num_heads,
+                                   Tensor& Qh, Tensor& Kh, Tensor& Vh,
+                                   Tensor& Attnh, Tensor& Yconcat,
+                                   Tensor& O);
 
 // FP32 training-side cross-attention backward.
 //   dO: (Lq, D) upstream
@@ -1067,20 +1110,20 @@ void cross_attention_forward_train_gpu(const GpuTensor& X,
 //   dWk:  (D, D_ctx)  accumulated into — caller zeros
 //   dWv:  (D, D_ctx)  accumulated into — caller zeros
 //   dWo:  (D, D)      accumulated into — caller zeros
-void cross_attention_backward_gpu(const GpuTensor& dO,
-                                  const GpuTensor& X,
-                                  const GpuTensor& Ctx,
-                                  const GpuTensor& Qh, const GpuTensor& Kh,
-                                  const GpuTensor& Vh, const GpuTensor& Attnh,
-                                  const GpuTensor& Yconcat,
-                                  const GpuTensor& Wq, const GpuTensor& Wk,
-                                  const GpuTensor& Wv, const GpuTensor& Wo,
-                                  const float* d_mask,
-                                  int num_heads,
-                                  GpuTensor& dX,
-                                  GpuTensor& dCtx,
-                                  GpuTensor& dWq, GpuTensor& dWk,
-                                  GpuTensor& dWv, GpuTensor& dWo);
+void cross_attention_backward(const Tensor& dO,
+                              const Tensor& X,
+                              const Tensor& Ctx,
+                              const Tensor& Qh, const Tensor& Kh,
+                              const Tensor& Vh, const Tensor& Attnh,
+                              const Tensor& Yconcat,
+                              const Tensor& Wq, const Tensor& Wk,
+                              const Tensor& Wv, const Tensor& Wo,
+                              const float* d_mask,
+                              int num_heads,
+                              Tensor& dX,
+                              Tensor& dCtx,
+                              Tensor& dWq, Tensor& dWk,
+                              Tensor& dWv, Tensor& dWo);
 
 // FP16 LayerNorm forward, inference-only. Processes R independent rows of
 // length D in a single launch (one block per row). FP32 accumulation.
@@ -1088,27 +1131,27 @@ void cross_attention_backward_gpu(const GpuTensor& dO,
 //   gamma: (D,)    FP16 scale
 //   beta:  (D,)    FP16 shift
 //   Y_RD:  (R, D)  FP16; resized as needed.
-void layernorm_forward_inference_batched_fp16_gpu(const GpuTensor& X_RD,
-                                                  const GpuTensor& gamma,
-                                                  const GpuTensor& beta,
-                                                  GpuTensor& Y_RD,
-                                                  float eps);
+void layernorm_forward_inference_batched_fp16(const Tensor& X_RD,
+                                              const Tensor& gamma,
+                                              const Tensor& beta,
+                                              Tensor& Y_RD,
+                                              float eps);
 
 // FP16 self-attention. Thin wrapper over the cross-attention kernel with
 // Ctx = X (so Lk = Lq). Same shape/dtype conventions as
-// cross_attention_forward_gpu otherwise.
+// cross_attention_forward otherwise.
 //   X:   (L, D)  FP16
 //   Wq, Wk, Wv, Wo: each (D, D), FP16
 //   d_mask: optional FP32 mask of length L (1 valid, 0 invalid). May be
 //           null.
 //   num_heads: must divide D.
 //   O:   (L, D)  FP16; resized if mis-shaped.
-void self_attention_forward_gpu(const GpuTensor& X,
-                                const GpuTensor& Wq, const GpuTensor& Wk,
-                                const GpuTensor& Wv, const GpuTensor& Wo,
-                                const float* d_mask,
-                                int num_heads,
-                                GpuTensor& O);
+void self_attention_forward(const Tensor& X,
+                            const Tensor& Wq, const Tensor& Wk,
+                            const Tensor& Wv, const Tensor& Wo,
+                            const float* d_mask,
+                            int num_heads,
+                            Tensor& O);
 
 // Flash-attention-style fused attention (FP16, inference-only).
 //
@@ -1127,13 +1170,13 @@ void self_attention_forward_gpu(const GpuTensor& X,
 //           kernel skips fully-future tiles outright (one less full tile cost
 //           per row beyond the diagonal) and masks within the boundary tile.
 //   O:  (Lq, D)   FP16; resized as needed.
-void flash_attention_forward_gpu(const GpuTensor& Q,
-                                 const GpuTensor& K,
-                                 const GpuTensor& V,
-                                 const float* d_mask,
-                                 int num_heads,
-                                 bool causal,
-                                 GpuTensor& O);
+void flash_attention_forward(const Tensor& Q,
+                             const Tensor& K,
+                             const Tensor& V,
+                             const float* d_mask,
+                             int num_heads,
+                             bool causal,
+                             Tensor& O);
 
 // Flash-attention with projections fused in at the boundary. Projects
 // X → Q, Ctx → K, V (or X → Q,K,V when Ctx == nullptr), runs the tiled
@@ -1154,21 +1197,21 @@ void flash_attention_forward_gpu(const GpuTensor& Q,
 //                   has all four; UNet/VAE attention typically has only bo.
 //   d_mask: optional length-Lk FP32 mask.
 //   num_heads: must divide D.
-//   causal: see flash_attention_forward_gpu. Typically paired with Ctx ==
+//   causal: see flash_attention_forward. Typically paired with Ctx ==
 //           nullptr (causal self-attention, e.g. CLIP text encoder).
 //   O:   (Lq, D)  FP16; resized as needed.
-void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
-                                      const GpuTensor* Ctx,
-                                      const GpuTensor& Wq, const GpuTensor* bq,
-                                      const GpuTensor& Wk, const GpuTensor* bk,
-                                      const GpuTensor& Wv, const GpuTensor* bv,
-                                      const GpuTensor& Wo, const GpuTensor* bo,
-                                      const float* d_mask,
-                                      int num_heads,
-                                      bool causal,
-                                      GpuTensor& O);
+void flash_attention_qkvo_forward(const Tensor& X,
+                                  const Tensor* Ctx,
+                                  const Tensor& Wq, const Tensor* bq,
+                                  const Tensor& Wk, const Tensor* bk,
+                                  const Tensor& Wv, const Tensor* bv,
+                                  const Tensor& Wo, const Tensor* bo,
+                                  const float* d_mask,
+                                  int num_heads,
+                                  bool causal,
+                                  Tensor& O);
 
-// Backward partner of flash_attention_qkvo_forward_gpu. "Recompute-style":
+// Backward partner of flash_attention_qkvo_forward. "Recompute-style":
 // no caches consumed from the forward call — backward re-runs the attention
 // math (Q,K,V projection + per-head softmax PV) from the inputs, then
 // reverses the math to produce gradients. This matches the xformers /
@@ -1179,7 +1222,7 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
 // (matmuls, softmax recompute, D_q reduction, dS, projection-bw scratch).
 //
 // All shape / dtype / Ctx-may-be-null / rectangular-Wk-Wv / causal /
-// optional-biases semantics exactly match flash_attention_qkvo_forward_gpu.
+// optional-biases semantics exactly match flash_attention_qkvo_forward.
 //
 //   X, Ctx (or null), Wq, bq, Wk, bk, Wv, bv, Wo, bo, d_mask, num_heads,
 //   causal:        same as forward. Pass the same values used in the
@@ -1211,28 +1254,28 @@ void flash_attention_qkvo_forward_gpu(const GpuTensor& X,
 // Mask: positions k with d_mask[k] <= 0.5 are dropped in the recompute
 // (probability 0), so they contribute nothing to dV/dK/dCtx and dQ/dX
 // degrades naturally.
-void flash_attention_qkvo_backward_gpu(
-    const GpuTensor& X, const GpuTensor* Ctx,
-    const GpuTensor& Wq, const GpuTensor* bq,
-    const GpuTensor& Wk, const GpuTensor* bk,
-    const GpuTensor& Wv, const GpuTensor* bv,
-    const GpuTensor& Wo, const GpuTensor* bo,
+void flash_attention_qkvo_backward(
+    const Tensor& X, const Tensor* Ctx,
+    const Tensor& Wq, const Tensor* bq,
+    const Tensor& Wk, const Tensor* bk,
+    const Tensor& Wv, const Tensor* bv,
+    const Tensor& Wo, const Tensor* bo,
     const float* d_mask,
     int num_heads,
     bool causal,
-    const GpuTensor& dO,
-    GpuTensor& dX, GpuTensor* dCtx,
-    GpuTensor& dWq, GpuTensor* dbq,
-    GpuTensor& dWk, GpuTensor* dbk,
-    GpuTensor& dWv, GpuTensor* dbv,
-    GpuTensor& dWo, GpuTensor* dbo);
+    const Tensor& dO,
+    Tensor& dX, Tensor* dCtx,
+    Tensor& dWq, Tensor* dbq,
+    Tensor& dWk, Tensor* dbk,
+    Tensor& dWv, Tensor* dbv,
+    Tensor& dWo, Tensor* dbo);
 
-// Backward of flash_attention_forward_gpu — bare attention core, no
+// Backward of flash_attention_forward — bare attention core, no
 // projection weights. Recompute-based: reproduces the per-head softmax to
 // obtain P, then runs the standard FlashAttention-2 backward to produce
 // dQ / dK / dV. The "bare" variant is what LoRA-style adapters need —
-// projections are wrapped externally (typically via matmul_gpu /
-// matmul_backward_gpu) so adapter parameters can be folded in without
+// projections are wrapped externally (typically via matmul /
+// matmul_backward) so adapter parameters can be folded in without
 // disturbing the attention core.
 //
 // All tensors FP16. Numerics: FP32 accumulation throughout the per-head
@@ -1248,7 +1291,7 @@ void flash_attention_qkvo_backward_gpu(
 //                                     cache-based shortcut).
 //   dO:       (Lq, D)         FP16  — upstream gradient of O.
 //   d_mask:   optional length-Lk FP32 mask (nullptr for unmasked). Same
-//             semantics as flash_attention_forward_gpu's d_mask: positions
+//             semantics as flash_attention_forward's d_mask: positions
 //             with mask[k] <= 0.5 are dropped (probability 0); they
 //             contribute nothing to dV / dK and the corresponding rows of
 //             dQ degrade naturally.
@@ -1261,26 +1304,26 @@ void flash_attention_qkvo_backward_gpu(
 //                                    mis-shaped).
 //   dK:       (Lk, D)         FP16, *overwritten*.
 //   dV:       (Lk, D)         FP16, *overwritten*.
-void flash_attention_backward_gpu(const GpuTensor& Q,
-                                  const GpuTensor& K,
-                                  const GpuTensor& V,
-                                  const GpuTensor& O,
-                                  const GpuTensor& dO,
-                                  const float* d_mask,
-                                  int num_heads,
-                                  bool causal,
-                                  GpuTensor& dQ,
-                                  GpuTensor& dK,
-                                  GpuTensor& dV);
+void flash_attention_backward(const Tensor& Q,
+                              const Tensor& K,
+                              const Tensor& V,
+                              const Tensor& O,
+                              const Tensor& dO,
+                              const float* d_mask,
+                              int num_heads,
+                              bool causal,
+                              Tensor& dQ,
+                              Tensor& dK,
+                              Tensor& dV);
 
 // Project a key/value context tensor through Wk/Wv (with optional biases),
-// producing the exact (Lk, D) FP16 buffers that flash_attention_forward_gpu
+// producing the exact (Lk, D) FP16 buffers that flash_attention_forward
 // consumes. Used to pre-compute cross-attention K/V once per generate() in
 // diffusion U-Nets — the text context is fixed across all denoising steps so
 // these projections are otherwise pure waste.
 //
 // Numerically identical to the K/V projection stage inside
-// flash_attention_qkvo_forward_gpu (same linear_forward_batched_fp16_gpu call).
+// flash_attention_qkvo_forward (same linear_forward_batched_fp16 call).
 //
 //   ctx:    (Lk, D_ctx)  FP16
 //   Wk:     (D, D_ctx)   FP16 — projects ctx → K
@@ -1289,20 +1332,20 @@ void flash_attention_backward_gpu(const GpuTensor& Q,
 //   bv:     (D, 1)       FP16, optional
 //   K_out:  (Lk, D)      FP16; resized as needed
 //   V_out:  (Lk, D)      FP16; resized as needed
-void flash_attention_project_kv_gpu(const GpuTensor& ctx,
-                                    const GpuTensor& Wk, const GpuTensor* bk,
-                                    const GpuTensor& Wv, const GpuTensor* bv,
-                                    GpuTensor& K_out,
-                                    GpuTensor& V_out);
+void flash_attention_project_kv(const Tensor& ctx,
+                                const Tensor& Wk, const Tensor* bk,
+                                const Tensor& Wv, const Tensor* bv,
+                                Tensor& K_out,
+                                Tensor& V_out);
 
-// Like flash_attention_qkvo_forward_gpu but K and V are already projected by
-// the caller (typically via flash_attention_project_kv_gpu). Projects X → Q
+// Like flash_attention_qkvo_forward but K and V are already projected by
+// the caller (typically via flash_attention_project_kv). Projects X → Q
 // with Wq/bq, runs the tiled attention core against the supplied K/V, then
 // applies Wo/bo. Equivalent (bitwise) to the cached path of
-// flash_attention_qkvo_forward_gpu.
+// flash_attention_qkvo_forward.
 //
 //   X:      (Lq, D)     FP16, query source
-//   K:      (Lk, D)     FP16, pre-projected keys (layout = flash_attention_forward_gpu's K arg)
+//   K:      (Lk, D)     FP16, pre-projected keys (layout = flash_attention_forward's K arg)
 //   V:      (Lk, D)     FP16, pre-projected values
 //   Wq:     (D, D)      FP16
 //   bq:     optional FP16 (D, 1)
@@ -1310,17 +1353,17 @@ void flash_attention_project_kv_gpu(const GpuTensor& ctx,
 //   bo:     optional FP16 (D, 1)
 //   d_mask: optional length-Lk FP32 mask
 //   num_heads: must divide D
-//   causal: see flash_attention_forward_gpu (false for diffusion cross-attn)
+//   causal: see flash_attention_forward (false for diffusion cross-attn)
 //   O:      (Lq, D)     FP16; resized as needed
-void flash_attention_q_with_kv_cached_forward_gpu(const GpuTensor& X,
-                                                  const GpuTensor& K,
-                                                  const GpuTensor& V,
-                                                  const GpuTensor& Wq, const GpuTensor* bq,
-                                                  const GpuTensor& Wo, const GpuTensor* bo,
-                                                  const float* d_mask,
-                                                  int num_heads,
-                                                  bool causal,
-                                                  GpuTensor& O);
+void flash_attention_q_with_kv_cached_forward(const Tensor& X,
+                                              const Tensor& K,
+                                              const Tensor& V,
+                                              const Tensor& Wq, const Tensor* bq,
+                                              const Tensor& Wo, const Tensor* bo,
+                                              const float* d_mask,
+                                              int num_heads,
+                                              bool causal,
+                                              Tensor& O);
 
 // NCHW ↔ sequence layout transpose. Lets ops that expect a (L, D) token
 // layout (flash_attention_*, self/cross attention wrappers) consume tensors
@@ -1330,24 +1373,24 @@ void flash_attention_q_with_kv_cached_forward_gpu(const GpuTensor& X,
 // FP32 and FP16 are both supported; dispatched on X.dtype. Y is resized AND
 // dtype-set to match X.dtype if mis-shaped/-typed. X and Y must not alias.
 //
-// nchw_to_sequence_gpu:
+// nchw_to_sequence:
 //   X:  (N, C * H * W)        any dtype, treated as NCHW
 //   Y:  (N * H * W, C)        same dtype; Y[n*H*W + h*W + w, c] = X[n,c,h,w]
 //
-// sequence_to_nchw_gpu (inverse):
+// sequence_to_nchw (inverse):
 //   X:  (N * H * W, C)        any dtype, sequence layout
 //   Y:  (N, C * H * W)        same dtype; Y[n,c,h,w] = X[n*H*W + h*W + w, c]
 //
 // For SD VAE mid-block self-attention (N=1) this gives the (H*W, C) token
 // layout the flash kernels want. For N>1, the sequence form is (N*H*W, C);
 // callers wanting a separate per-batch attention pass slice the rows.
-void nchw_to_sequence_gpu(const GpuTensor& X,
-                          int N, int C, int H, int W,
-                          GpuTensor& Y);
+void nchw_to_sequence(const Tensor& X,
+                      int N, int C, int H, int W,
+                      Tensor& Y);
 
-void sequence_to_nchw_gpu(const GpuTensor& X,
-                          int N, int C, int H, int W,
-                          GpuTensor& Y);
+void sequence_to_nchw(const Tensor& X,
+                      int N, int C, int H, int W,
+                      Tensor& Y);
 
 // Fused diffusion ResBlock (FP16, inference-only). Computes the standard
 // SD U-Net residual block in a single op:
@@ -1362,7 +1405,7 @@ void sequence_to_nchw_gpu(const GpuTensor& X,
 //   else:
 //       Y = h + conv2d_1x1(X, Wskip, bskip)
 //
-// All tensors FP16. Conv layout matches conv2d_forward_gpu (OIHW filter
+// All tensors FP16. Conv layout matches conv2d_forward (OIHW filter
 // layout). The two `GN → SiLU` legs are fused into single kernels; the
 // convs remain separate launches but the skip add is folded into the
 // second conv's epilogue when shapes permit.
@@ -1380,21 +1423,21 @@ void sequence_to_nchw_gpu(const GpuTensor& X,
 //   Y:       (N, C_out * H * W)   FP16 output, resized as needed.
 //
 // num_groups must divide both C_in and C_out (typically 32). eps default 1e-5.
-void resblock_forward_gpu(const GpuTensor& X,
-                          const GpuTensor& gamma1, const GpuTensor& beta1,
-                          const GpuTensor& W1, const GpuTensor* b1,
-                          const GpuTensor* t_emb_shift,
-                          const GpuTensor& gamma2, const GpuTensor& beta2,
-                          const GpuTensor& W2, const GpuTensor* b2,
-                          const GpuTensor* Wskip, const GpuTensor* bskip,
-                          int N, int C_in, int C_out, int H, int W,
-                          int num_groups, float eps,
-                          GpuTensor& Y);
+void resblock_forward(const Tensor& X,
+                      const Tensor& gamma1, const Tensor& beta1,
+                      const Tensor& W1, const Tensor* b1,
+                      const Tensor* t_emb_shift,
+                      const Tensor& gamma2, const Tensor& beta2,
+                      const Tensor& W2, const Tensor* b2,
+                      const Tensor* Wskip, const Tensor* bskip,
+                      int N, int C_in, int C_out, int H, int W,
+                      int num_groups, float eps,
+                      Tensor& Y);
 
-// W8A16 variant of resblock_forward_gpu (inference-only). Identical math to
+// W8A16 variant of resblock_forward (inference-only). Identical math to
 // the FP16 op, but conv1, conv2, and the optional 1x1 skip conv consume INT8
 // weights with per-output-row symmetric FP32 scales (matching the W8A16
-// contract used by conv2d_int8w_fp16_forward_gpu). Activations, GN params,
+// contract used by conv2d_int8w_fp16_forward). Activations, GN params,
 // biases, and the t_emb shift stay FP16. No backward — quantised weights are
 // frozen at inference time.
 //
@@ -1414,21 +1457,21 @@ void resblock_forward_gpu(const GpuTensor& X,
 //   Y:           (N, C_out * H * W)   FP16 output, resized as needed.
 //
 // num_groups must divide both C_in and C_out (typically 32). eps default 1e-5.
-void resblock_forward_int8w_fp16_gpu(const GpuTensor& X,
-                                     const GpuTensor& gamma1, const GpuTensor& beta1,
-                                     const GpuTensor& W1_int8, const GpuTensor& s1,
-                                     const GpuTensor* b1,
-                                     const GpuTensor* t_emb_shift,
-                                     const GpuTensor& gamma2, const GpuTensor& beta2,
-                                     const GpuTensor& W2_int8, const GpuTensor& s2,
-                                     const GpuTensor* b2,
-                                     const GpuTensor* Wskip_int8, const GpuTensor* sskip,
-                                     const GpuTensor* bskip,
-                                     int N, int C_in, int C_out, int H, int W,
-                                     int num_groups, float eps,
-                                     GpuTensor& Y);
+void resblock_forward_int8w_fp16(const Tensor& X,
+                                 const Tensor& gamma1, const Tensor& beta1,
+                                 const Tensor& W1_int8, const Tensor& s1,
+                                 const Tensor* b1,
+                                 const Tensor* t_emb_shift,
+                                 const Tensor& gamma2, const Tensor& beta2,
+                                 const Tensor& W2_int8, const Tensor& s2,
+                                 const Tensor* b2,
+                                 const Tensor* Wskip_int8, const Tensor* sskip,
+                                 const Tensor* bskip,
+                                 int N, int C_in, int C_out, int H, int W,
+                                 int num_groups, float eps,
+                                 Tensor& Y);
 
-// Composite backward of resblock_forward_gpu. All tensors FP16. Implemented
+// Composite backward of resblock_forward. All tensors FP16. Implemented
 // purely by composition of the existing public ops (group_norm forward+
 // backward, silu forward+backward, conv2d forward+backward_input/weight/bias,
 // add_inplace). The forward intermediates are NOT cached by the forward op,
@@ -1462,23 +1505,23 @@ void resblock_forward_int8w_fp16_gpu(const GpuTensor& X,
 //   dbskip: (C_out, 1) or null      *accumulated* if non-null and bskip was used.
 //
 // num_groups/eps must match the forward call. All FP16.
-void resblock_backward_gpu(const GpuTensor& X,
-                           const GpuTensor& gamma1, const GpuTensor& beta1,
-                           const GpuTensor& W1, const GpuTensor* b1,
-                           const GpuTensor* t_emb_shift,
-                           const GpuTensor& gamma2, const GpuTensor& beta2,
-                           const GpuTensor& W2, const GpuTensor* b2,
-                           const GpuTensor* Wskip, const GpuTensor* bskip,
-                           int N, int C_in, int C_out, int H, int W,
-                           int num_groups, float eps,
-                           const GpuTensor& dY,
-                           GpuTensor& dX,
-                           GpuTensor& dGamma1, GpuTensor& dBeta1,
-                           GpuTensor& dW1, GpuTensor* db1,
-                           GpuTensor* dt_emb_shift,
-                           GpuTensor& dGamma2, GpuTensor& dBeta2,
-                           GpuTensor& dW2, GpuTensor* db2,
-                           GpuTensor* dWskip, GpuTensor* dbskip);
+void resblock_backward(const Tensor& X,
+                       const Tensor& gamma1, const Tensor& beta1,
+                       const Tensor& W1, const Tensor* b1,
+                       const Tensor* t_emb_shift,
+                       const Tensor& gamma2, const Tensor& beta2,
+                       const Tensor& W2, const Tensor* b2,
+                       const Tensor* Wskip, const Tensor* bskip,
+                       int N, int C_in, int C_out, int H, int W,
+                       int num_groups, float eps,
+                       const Tensor& dY,
+                       Tensor& dX,
+                       Tensor& dGamma1, Tensor& dBeta1,
+                       Tensor& dW1, Tensor* db1,
+                       Tensor* dt_emb_shift,
+                       Tensor& dGamma2, Tensor& dBeta2,
+                       Tensor& dW2, Tensor* db2,
+                       Tensor* dWskip, Tensor* dbskip);
 
 // ─── Llama-style transformer ops (forward + backward where noted) ──────────
 
@@ -1487,9 +1530,9 @@ void resblock_backward_gpu(const GpuTensor& X,
 // Dispatched on A.dtype; B and C must share A.dtype (C is resized AND
 // dtype-set to match A if mis-shaped/-typed). Internal accumulation is in
 // FP32 for both FP32 and FP16 paths.
-void matmul_gpu(const GpuTensor& A, const GpuTensor& B, GpuTensor& C);
+void matmul(const Tensor& A, const Tensor& B, Tensor& C);
 
-// Backward of matmul_gpu. Row-major, no bias.
+// Backward of matmul. Row-major, no bias.
 //   forward: C(M, N) = A(M, K) @ B(K, N)
 //   dA(M, K) += dC(M, N) @ B^T(N, K)
 //   dB(K, N) += A^T(K, M) @ dC(M, N)
@@ -1497,7 +1540,7 @@ void matmul_gpu(const GpuTensor& A, const GpuTensor& B, GpuTensor& C);
 // Dtype-dispatched FP32 + FP16. All five tensors must share the same dtype.
 // FP16 dA/dB accumulators use FP32 scratch + fold (atomic-add into FP16 is
 // unsafe across blocks). Caller-zeros-and-passes-presized, op-accumulates-into
-// convention (mirrors linear_backward_gpu): dA must be (M, K) and dB must be
+// convention (mirrors linear_backward): dA must be (M, K) and dB must be
 // (K, N), both pre-allocated and pre-zeroed by the caller; this op adds its
 // contribution to whatever's already there. dC is read-only and must be
 // (M, N).
@@ -1507,11 +1550,11 @@ void matmul_gpu(const GpuTensor& A, const GpuTensor& B, GpuTensor& C);
 //   dC:  (M, N)   upstream gradient
 //   dA:  (M, K)   *accumulated into*
 //   dB:  (K, N)   *accumulated into*
-void matmul_backward_gpu(const GpuTensor& A,
-                         const GpuTensor& B,
-                         const GpuTensor& dC,
-                         GpuTensor& dA,
-                         GpuTensor& dB);
+void matmul_backward(const Tensor& A,
+                     const Tensor& B,
+                     const Tensor& dC,
+                     Tensor& dA,
+                     Tensor& dB);
 
 // RoPE (rotary position embedding) forward. Applied per head:
 //   x_{2i}   ← x_{2i} * cos(θ) - x_{2i+1} * sin(θ)
@@ -1523,8 +1566,8 @@ void matmul_backward_gpu(const GpuTensor& A,
 //   X: (L, num_heads * head_dim)  — input
 //   Y: (L, num_heads * head_dim)  — output, resized AND dtype-set to match X
 // head_dim must be even. Dispatched on X.dtype (FP32 or FP16).
-void rope_forward_gpu(const GpuTensor& X, int head_dim, int num_heads,
-                     int seq_offset, float theta_base, GpuTensor& Y);
+void rope_forward(const Tensor& X, int head_dim, int num_heads,
+                 int seq_offset, float theta_base, Tensor& Y);
 
 // RoPE backward. Equivalent to applying the inverse (transpose) rotation to
 // dY pair-wise per head:
@@ -1533,8 +1576,8 @@ void rope_forward_gpu(const GpuTensor& X, int head_dim, int num_heads,
 //   dY: (L, num_heads * head_dim)
 //   dX: (L, num_heads * head_dim) — resized AND dtype-set to match dY.
 // Dispatched on dY.dtype.
-void rope_backward_gpu(const GpuTensor& dY, int head_dim, int num_heads,
-                      int seq_offset, float theta_base, GpuTensor& dX);
+void rope_backward(const Tensor& dY, int head_dim, int num_heads,
+                  int seq_offset, float theta_base, Tensor& dX);
 
 // RMSNorm forward, per row:
 //   rms[b] = sqrt(mean_j x[b, j]^2 + eps)
@@ -1543,8 +1586,8 @@ void rope_backward_gpu(const GpuTensor& dY, int head_dim, int num_heads,
 //   gamma: (D, 1) scale (same dtype as X)
 //   Y:     (B, D) output, resized AND dtype-set to match X if mis-shaped/-typed.
 // Dispatched on X.dtype (FP32 or FP16). FP32 accumulation internally.
-void rms_norm_forward_gpu(const GpuTensor& X, const GpuTensor& gamma,
-                         float eps, GpuTensor& Y);
+void rms_norm_forward(const Tensor& X, const Tensor& gamma,
+                     float eps, Tensor& Y);
 
 // RMSNorm backward.
 //   X:      (B, D) forward input
@@ -1553,24 +1596,24 @@ void rms_norm_forward_gpu(const GpuTensor& X, const GpuTensor& gamma,
 //   dX:     (B, D) overwritten (resized + dtype-set to match X if mis-shaped/-typed)
 //   dGamma: (D, 1) *accumulated* — caller zeros. Same dtype as X. For FP16
 //                  storage, an FP32 scratch + fold epilogue is used.
-void rms_norm_backward_gpu(const GpuTensor& X, const GpuTensor& gamma,
-                          const GpuTensor& dY, float eps,
-                          GpuTensor& dX, GpuTensor& dGamma);
+void rms_norm_backward(const Tensor& X, const Tensor& gamma,
+                      const Tensor& dY, float eps,
+                      Tensor& dX, Tensor& dGamma);
 
 // SwiGLU (Llama FFN gate). Input (B, 2*D) is split along the last dim into
 // halves A=(B, D) and B_half=(B, D); output (B, D) = silu(A) * B_half.
 //   X:  (B, 2*D)  input
 //   Y:  (B, D)    output, resized AND dtype-set to match X if mis-shaped/-typed.
 // Dispatched on X.dtype (FP32 or FP16; FP16 accumulates in FP32).
-void swiglu_forward_gpu(const GpuTensor& X, GpuTensor& Y);
+void swiglu_forward(const Tensor& X, Tensor& Y);
 
 // SwiGLU backward. Splits X into A and B_half. Let s = silu(A).
 //   dA      = dY * B_half * silu'(A)
 //   dB_half = dY * s
 // dX = concat(dA, dB_half) along the last dim with layout matching the
 // forward (A then B_half). Dispatched on X.dtype.
-void swiglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
-                        GpuTensor& dX);
+void swiglu_backward(const Tensor& X, const Tensor& dY,
+                    Tensor& dX);
 
 // KV-cache append (FP16). Copies K_new and V_new into rows
 // [cur_len, cur_len + L_new) of K_cache and V_cache respectively. Both new
@@ -1578,11 +1621,11 @@ void swiglu_backward_gpu(const GpuTensor& X, const GpuTensor& dY,
 // must fit within K_cache.rows / V_cache.rows (caller pre-allocates).
 //   K_new, V_new:     (L_new, D)  FP16
 //   K_cache, V_cache: (L_max, D)  FP16 — must already be sized; not resized.
-void kv_cache_append_gpu(const GpuTensor& K_new, const GpuTensor& V_new,
-                       int cur_len, GpuTensor& K_cache, GpuTensor& V_cache);
+void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
+                     int cur_len, Tensor& K_cache, Tensor& V_cache);
 
 // Causal flash-attention against a partially-filled KV cache (FP16, fwd-only).
-// Runs the tiled attention core (same as flash_attention_forward_gpu) against
+// Runs the tiled attention core (same as flash_attention_forward) against
 // the first `valid_len` rows of K_cache and V_cache. Query position
 // p_q = seq_offset + i (with seq_offset = valid_len - L_q) attends to cache
 // positions [0, p_q]; entries with cache index > p_q are masked out
@@ -1595,27 +1638,27 @@ void kv_cache_append_gpu(const GpuTensor& K_new, const GpuTensor& V_new,
 //   valid_len: number of valid cache rows (>= L_q).
 //   num_heads: must divide D.
 //   O:        (L_q, D)        FP16  — resized as needed.
-void flash_attention_decode_gpu(const GpuTensor& Q,
-                               const GpuTensor& K_cache, const GpuTensor& V_cache,
-                               int valid_len, int num_heads, GpuTensor& O);
+void flash_attention_decode(const Tensor& Q,
+                           const Tensor& K_cache, const Tensor& V_cache,
+                           int valid_len, int num_heads, Tensor& O);
 
 // ─── Public reductions ─────────────────────────────────────────────────────
 
 // Row-wise sum: Y[m, 0] = sum_n X[m, n].
 //   X: (M, N)  FP32 or FP16
 //   Y: (M, 1)  same dtype as X — resized as needed.
-void sum_rows_gpu(const GpuTensor& X, GpuTensor& Y);
+void sum_rows(const Tensor& X, Tensor& Y);
 
 // Column-wise sum: Y[0, n] = sum_m X[m, n].
 //   X: (M, N)  FP32 or FP16
 //   Y: (1, N)  same dtype as X — resized as needed.
-void sum_cols_gpu(const GpuTensor& X, GpuTensor& Y);
+void sum_cols(const Tensor& X, Tensor& Y);
 
 // Row-wise argmax: Idx[m, 0] = argmax_n X[m, n], stored as FP32 holding the
 // integer index cast to float (keeps the type system uniform).
 //   X:   (M, N)  FP32 or FP16
 //   Idx: (M, 1)  FP32 — resized as needed.
-void argmax_rows_gpu(const GpuTensor& X, GpuTensor& Idx);
+void argmax_rows(const Tensor& X, Tensor& Idx);
 
 // ─── Fused DDIM step (FP16) ────────────────────────────────────────────────
 //
@@ -1626,9 +1669,9 @@ void argmax_rows_gpu(const GpuTensor& X, GpuTensor& Idx);
 // sigma_t = 0 yields deterministic DDIM; the formula still holds. FP16
 // inputs and outputs; FP32 internal math. x_t and eps_pred must share shape;
 // x_prev is resized to match.
-void ddim_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
-                   float alpha_t, float alpha_prev, float sigma_t,
-                   GpuTensor& x_prev);
+void ddim_step(const Tensor& x_t, const Tensor& eps_pred,
+               float alpha_t, float alpha_prev, float sigma_t,
+               Tensor& x_prev);
 
 // ─── Fused Euler-discrete sampler step (FP16) ──────────────────────────────
 //
@@ -1636,9 +1679,9 @@ void ddim_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
 //   x_prev = x_t + (sigma_prev - sigma_t) * eps_pred
 // FP16 inputs and outputs; FP32 internal math. x_t and eps_pred must share
 // shape; x_prev is resized to match.
-void euler_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
-                    float sigma_t, float sigma_prev,
-                    GpuTensor& x_prev);
+void euler_step(const Tensor& x_t, const Tensor& eps_pred,
+                float sigma_t, float sigma_prev,
+                Tensor& x_prev);
 
 // ─── Fused DPM-Solver++ 2M sampler step (FP16) ─────────────────────────────
 //
@@ -1657,13 +1700,13 @@ void euler_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
 //    c_x0t    = -(exp(-h) - 1) * (1 + 1/(2r))
 //    c_x0prev = -(exp(-h) - 1) * (-1/(2r))
 //
-// First step (no x0_prev cached): use euler_step_gpu instead.
+// First step (no x0_prev cached): use euler_step instead.
 // All tensors FP16, same shape; x_prev and x0_out resized to match.
-void dpmpp_2m_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
-                       const GpuTensor& x0_prev,
-                       float sigma_t,
-                       float c_xt, float c_x0t, float c_x0prev,
-                       GpuTensor& x_prev, GpuTensor& x0_out);
+void dpmpp_2m_step(const Tensor& x_t, const Tensor& eps_pred,
+                   const Tensor& x0_prev,
+                   float sigma_t,
+                   float c_xt, float c_x0t, float c_x0prev,
+                   Tensor& x_prev, Tensor& x0_out);
 
 // ─── Sinusoidal timestep embedding (FP32) ──────────────────────────────────
 //
@@ -1679,9 +1722,9 @@ void dpmpp_2m_step_gpu(const GpuTensor& x_t, const GpuTensor& eps_pred,
 //
 //   timesteps: (N, 1) FP32
 //   Y:         (N, dim) FP32 — resized as needed.
-void timestep_embedding_gpu(const GpuTensor& timesteps,
-                            int dim, float max_period,
-                            GpuTensor& Y);
+void timestep_embedding(const Tensor& timesteps,
+                        int dim, float max_period,
+                        Tensor& Y);
 
 // ─── INT8 weight-only quantisation (W8A16) ─────────────────────────────────
 
@@ -1693,6 +1736,9 @@ void timestep_embedding_gpu(const GpuTensor& timesteps,
 //   scales_out:  filled with `out` FP32 scales (one per output row).
 // Scale per row = max(|w|) / 127 (or 0 if the row is all zero); quantised
 // value = clamp(round(w / scale), -127, 127).
+//
+// Host-only helper, not dispatched per device — operates on plain host
+// buffers passed by the caller. Backend-independent.
 void quantize_int8_per_row_host(const uint16_t* W_fp16,
                                 int out, int in,
                                 int8_t* W_int8_out,
@@ -1703,33 +1749,33 @@ void quantize_int8_per_row_host(const uint16_t* W_fp16,
 //   scales: (out, 1) FP32 — per-row dequant scales.
 //   X:      (in, B)  FP16 — activations.
 //   Y:      (out, B) FP16 — resized as needed.
-// Matches the shape convention of matmul_gpu (plain (M,K)@(K,N) without
+// Matches the shape convention of matmul (plain (M,K)@(K,N) without
 // transpose); callsites can substitute one for the other.
-void matmul_int8w_fp16_gpu(const GpuTensor& W_int8,
-                           const GpuTensor& scales,
-                           const GpuTensor& X,
-                           GpuTensor& Y);
+void matmul_int8w_fp16(const Tensor& W_int8,
+                       const Tensor& scales,
+                       const Tensor& X,
+                       Tensor& Y);
 
-// W8A16 conv2d forward. Mirrors conv2d_forward_gpu's signature; only the
+// W8A16 conv2d forward. Mirrors conv2d_forward's signature; only the
 // weight dtype differs.
 //   W_int8: (C_out, C_in/groups * kH * kW) Dtype::INT8 — OIHW filter,
 //           quantised per output channel.
 //   scales: (C_out, 1) FP32 — per-output-channel dequant scales.
 //   bias:   FP16 (C_out, 1) or nullptr.
-//   X, Y:   FP16, same layout as conv2d_forward_gpu.
-void conv2d_int8w_fp16_forward_gpu(const GpuTensor& X,
-                                   const GpuTensor& W_int8,
-                                   const GpuTensor& scales,
-                                   const GpuTensor* bias,
-                                   int N, int C_in, int H, int W,
-                                   int C_out, int kH, int kW,
-                                   int stride_h, int stride_w,
-                                   int pad_h, int pad_w,
-                                   int dil_h, int dil_w, int groups,
-                                   GpuTensor& Y);
+//   X, Y:   FP16, same layout as conv2d_forward.
+void conv2d_int8w_fp16_forward(const Tensor& X,
+                               const Tensor& W_int8,
+                               const Tensor& scales,
+                               const Tensor* bias,
+                               int N, int C_in, int H, int W,
+                               int C_out, int kH, int kW,
+                               int stride_h, int stride_w,
+                               int pad_h, int pad_w,
+                               int dil_h, int dil_w, int groups,
+                               Tensor& Y);
 
 // W8A16 batched linear: Y(B, out) = X(B, in) @ dequant(W_int8(out, in))^T + b.
-// Mirrors linear_forward_batched_fp16_gpu's shape contract — the (B, in) →
+// Mirrors linear_forward_batched_fp16's shape contract — the (B, in) →
 // (B, out) layout used by the fused flash-attention projection wrappers and
 // any transformer FFN. Per-output-row symmetric scales; FP16 activations
 // and bias. FP32 accumulation inside the kernel.
@@ -1739,55 +1785,55 @@ void conv2d_int8w_fp16_forward_gpu(const GpuTensor& X,
 //   bias:   FP16 (out, 1) or (1, out), optional (nullptr to skip)
 //   X_BD:   (B, in)    FP16
 //   Y_BD:   (B, out)   FP16 — resized as needed
-void linear_forward_batched_int8w_fp16_gpu(const GpuTensor& W_int8,
-                                           const GpuTensor& scales,
-                                           const GpuTensor* bias,
-                                           const GpuTensor& X_BD,
-                                           GpuTensor& Y_BD);
+void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
+                                       const Tensor& scales,
+                                       const Tensor* bias,
+                                       const Tensor& X_BD,
+                                       Tensor& Y_BD);
 
 // ─── W8A16 variants of the three fused flash-attention ops ─────────────────
 //
-// Same composition as flash_attention_project_kv_gpu /
-// flash_attention_q_with_kv_cached_forward_gpu / flash_attention_qkvo_forward_gpu,
+// Same composition as flash_attention_project_kv /
+// flash_attention_q_with_kv_cached_forward / flash_attention_qkvo_forward,
 // but every linear projection consumes an INT8 weight + per-output-row FP32
 // scale tensor instead of an FP16 weight. The attention core itself stays
 // FP16 — activations are never quantised. Each W*_int8 has shape (D, in_dim)
 // with its own scales tensor of shape (D, 1); biases remain FP16 (D, 1) and
 // optional. Semantics, masks, causal flag, and num_heads are identical to the
 // FP16 versions.
-void flash_attention_project_kv_int8w_fp16_gpu(const GpuTensor& ctx,
-                                               const GpuTensor& Wk_int8,
-                                               const GpuTensor& sk,
-                                               const GpuTensor* bk,
-                                               const GpuTensor& Wv_int8,
-                                               const GpuTensor& sv,
-                                               const GpuTensor* bv,
-                                               GpuTensor& K_out,
-                                               GpuTensor& V_out);
+void flash_attention_project_kv_int8w_fp16(const Tensor& ctx,
+                                           const Tensor& Wk_int8,
+                                           const Tensor& sk,
+                                           const Tensor* bk,
+                                           const Tensor& Wv_int8,
+                                           const Tensor& sv,
+                                           const Tensor* bv,
+                                           Tensor& K_out,
+                                           Tensor& V_out);
 
-void flash_attention_q_with_kv_cached_int8w_fp16_gpu(const GpuTensor& X,
-                                                     const GpuTensor& K,
-                                                     const GpuTensor& V,
-                                                     const GpuTensor& Wq_int8,
-                                                     const GpuTensor& sq,
-                                                     const GpuTensor* bq,
-                                                     const GpuTensor& Wo_int8,
-                                                     const GpuTensor& so,
-                                                     const GpuTensor* bo,
-                                                     const float* d_mask,
-                                                     int num_heads,
-                                                     bool causal,
-                                                     GpuTensor& O);
+void flash_attention_q_with_kv_cached_int8w_fp16(const Tensor& X,
+                                                 const Tensor& K,
+                                                 const Tensor& V,
+                                                 const Tensor& Wq_int8,
+                                                 const Tensor& sq,
+                                                 const Tensor* bq,
+                                                 const Tensor& Wo_int8,
+                                                 const Tensor& so,
+                                                 const Tensor* bo,
+                                                 const float* d_mask,
+                                                 int num_heads,
+                                                 bool causal,
+                                                 Tensor& O);
 
-void flash_attention_qkvo_int8w_fp16_gpu(const GpuTensor& X,
-                                         const GpuTensor* Ctx,
-                                         const GpuTensor& Wq_int8, const GpuTensor& sq, const GpuTensor* bq,
-                                         const GpuTensor& Wk_int8, const GpuTensor& sk, const GpuTensor* bk,
-                                         const GpuTensor& Wv_int8, const GpuTensor& sv, const GpuTensor* bv,
-                                         const GpuTensor& Wo_int8, const GpuTensor& so, const GpuTensor* bo,
-                                         const float* d_mask,
-                                         int num_heads,
-                                         bool causal,
-                                         GpuTensor& O);
+void flash_attention_qkvo_int8w_fp16(const Tensor& X,
+                                     const Tensor* Ctx,
+                                     const Tensor& Wq_int8, const Tensor& sq, const Tensor* bq,
+                                     const Tensor& Wk_int8, const Tensor& sk, const Tensor* bk,
+                                     const Tensor& Wv_int8, const Tensor& sv, const Tensor* bv,
+                                     const Tensor& Wo_int8, const Tensor& so, const Tensor* bo,
+                                     const float* d_mask,
+                                     int num_heads,
+                                     bool causal,
+                                     Tensor& O);
 
 } // namespace brotensor

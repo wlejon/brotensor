@@ -1,4 +1,4 @@
-// CPU<->GPU parity for attention_token_moments_gpu.
+// CPU<->GPU parity for attention_token_moments.
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -11,8 +11,9 @@
 #include <random>
 #include <vector>
 
-using brotensor::GpuTensor;
+using brotensor::Tensor;
 using brotensor::Dtype;
+using brotensor::Device;
 
 static int g_failures = 0;
 
@@ -37,18 +38,18 @@ static void run_case(const char* label,
     std::printf("  %s  h=%d w=%d Lk=%d\n", label, h_lat, w_lat, Lk);
 
     auto Attn_fp16 = to_fp16(Attn_host);
-    GpuTensor Ag, Mg, Cg;
-    brotensor::upload_fp16(Attn_fp16.data(), Lq, Lk, Ag);
+    Tensor Ag = Tensor::from_host_fp16_on(Device::CUDA, Attn_fp16.data(), Lq, Lk);
+    Tensor Mg, Cg;
 
-    brotensor::attention_token_moments_gpu(Ag, h_lat, w_lat, Mg, Cg);
+    brotensor::attention_token_moments(Ag, h_lat, w_lat, Mg, Cg);
     CHECK(Mg.rows == Lk && Mg.cols == 1 && Mg.dtype == Dtype::FP32);
     CHECK(Cg.rows == Lk && Cg.cols == 2 && Cg.dtype == Dtype::FP32);
 
     std::vector<float> mass_gpu(static_cast<size_t>(Lk), 0.0f);
     std::vector<float> cent_gpu(static_cast<size_t>(Lk) * 2, 0.0f);
-    brotensor::download(Mg, mass_gpu.data());
-    brotensor::download(Cg, cent_gpu.data());
-    brotensor::cuda_sync();
+    Mg.copy_to_host(mass_gpu.data());
+    Cg.copy_to_host(cent_gpu.data());
+    brotensor::sync_all();
 
     // CPU reference using FP16-rounded inputs (parity with GPU).
     std::vector<float> mass_ref(Lk, 0.0f);
@@ -109,13 +110,13 @@ static void test_uniform_single_token() {
     for (int q = 0; q < Lq; ++q) A[q * Lk + 0] = u;
 
     auto Afp16 = to_fp16(A);
-    GpuTensor Ag, Mg, Cg;
-    brotensor::upload_fp16(Afp16.data(), Lq, Lk, Ag);
-    brotensor::attention_token_moments_gpu(Ag, h_lat, w_lat, Mg, Cg);
+    Tensor Ag = Tensor::from_host_fp16_on(Device::CUDA, Afp16.data(), Lq, Lk);
+    Tensor Mg, Cg;
+    brotensor::attention_token_moments(Ag, h_lat, w_lat, Mg, Cg);
     std::vector<float> mg(Lk), cg(Lk * 2);
-    brotensor::download(Mg, mg.data());
-    brotensor::download(Cg, cg.data());
-    brotensor::cuda_sync();
+    Mg.copy_to_host(mg.data());
+    Cg.copy_to_host(cg.data());
+    brotensor::sync_all();
 
     std::printf("  uniform-single-token\n");
     CHECK(std::fabs(mg[0] - 1.0f) < 1e-3f);
@@ -141,13 +142,13 @@ static void test_point_mass() {
     A[q_star * Lk + k_star] = 1.0f;
 
     auto Afp16 = to_fp16(A);
-    GpuTensor Ag, Mg, Cg;
-    brotensor::upload_fp16(Afp16.data(), Lq, Lk, Ag);
-    brotensor::attention_token_moments_gpu(Ag, h_lat, w_lat, Mg, Cg);
+    Tensor Ag = Tensor::from_host_fp16_on(Device::CUDA, Afp16.data(), Lq, Lk);
+    Tensor Mg, Cg;
+    brotensor::attention_token_moments(Ag, h_lat, w_lat, Mg, Cg);
     std::vector<float> mg(Lk), cg(Lk * 2);
-    brotensor::download(Mg, mg.data());
-    brotensor::download(Cg, cg.data());
-    brotensor::cuda_sync();
+    Mg.copy_to_host(mg.data());
+    Cg.copy_to_host(cg.data());
+    brotensor::sync_all();
 
     std::printf("  point-mass  y*=%d x*=%d k*=%d\n", y_star, x_star, k_star);
     CHECK(std::fabs(mg[k_star] - 1.0f) < 1e-3f);
@@ -181,13 +182,13 @@ static void test_two_token_separation() {
         }
 
     auto Afp16 = to_fp16(A);
-    GpuTensor Ag, Mg, Cg;
-    brotensor::upload_fp16(Afp16.data(), Lq, Lk, Ag);
-    brotensor::attention_token_moments_gpu(Ag, h_lat, w_lat, Mg, Cg);
+    Tensor Ag = Tensor::from_host_fp16_on(Device::CUDA, Afp16.data(), Lq, Lk);
+    Tensor Mg, Cg;
+    brotensor::attention_token_moments(Ag, h_lat, w_lat, Mg, Cg);
     std::vector<float> mg(Lk), cg(Lk * 2);
-    brotensor::download(Mg, mg.data());
-    brotensor::download(Cg, cg.data());
-    brotensor::cuda_sync();
+    Mg.copy_to_host(mg.data());
+    Cg.copy_to_host(cg.data());
+    brotensor::sync_all();
 
     std::printf("  two-token-separation  c0=(%g,%g) c1=(%g,%g)\n",
                 cg[0], cg[1], cg[2], cg[3]);
@@ -206,13 +207,13 @@ static void test_zero_mass_token() {
     A[(2 * w_lat + 1) * Lk + 2] = 0.5f;
 
     auto Afp16 = to_fp16(A);
-    GpuTensor Ag, Mg, Cg;
-    brotensor::upload_fp16(Afp16.data(), Lq, Lk, Ag);
-    brotensor::attention_token_moments_gpu(Ag, h_lat, w_lat, Mg, Cg);
+    Tensor Ag = Tensor::from_host_fp16_on(Device::CUDA, Afp16.data(), Lq, Lk);
+    Tensor Mg, Cg;
+    brotensor::attention_token_moments(Ag, h_lat, w_lat, Mg, Cg);
     std::vector<float> mg(Lk), cg(Lk * 2);
-    brotensor::download(Mg, mg.data());
-    brotensor::download(Cg, cg.data());
-    brotensor::cuda_sync();
+    Mg.copy_to_host(mg.data());
+    Cg.copy_to_host(cg.data());
+    brotensor::sync_all();
 
     std::printf("  zero-mass-token  mass=(%g,%g,%g)\n", mg[0], mg[1], mg[2]);
     CHECK(std::fabs(mg[1]) < 1e-6f);
@@ -249,13 +250,13 @@ static void test_realistic_random() {
 
     // Additional finiteness sweep.
     auto Afp16 = to_fp16(A);
-    GpuTensor Ag, Mg, Cg;
-    brotensor::upload_fp16(Afp16.data(), Lq, Lk, Ag);
-    brotensor::attention_token_moments_gpu(Ag, h_lat, w_lat, Mg, Cg);
+    Tensor Ag = Tensor::from_host_fp16_on(Device::CUDA, Afp16.data(), Lq, Lk);
+    Tensor Mg, Cg;
+    brotensor::attention_token_moments(Ag, h_lat, w_lat, Mg, Cg);
     std::vector<float> mg(Lk), cg(Lk * 2);
-    brotensor::download(Mg, mg.data());
-    brotensor::download(Cg, cg.data());
-    brotensor::cuda_sync();
+    Mg.copy_to_host(mg.data());
+    Cg.copy_to_host(cg.data());
+    brotensor::sync_all();
     for (int k = 0; k < Lk; ++k) {
         CHECK(std::isfinite(mg[k]));
         CHECK(std::isfinite(cg[k * 2 + 0]));
@@ -264,11 +265,10 @@ static void test_realistic_random() {
 }
 
 int main() {
-    try {
-        brotensor::cuda_init();
-    } catch (const std::exception& e) {
-        std::printf("brotensor::cuda_init failed: %s\n", e.what());
-        return 1;
+    brotensor::init();
+    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+        std::printf("CUDA not available - skipping\n");
+        return 0;
     }
     std::printf("test_attention_moments\n");
 

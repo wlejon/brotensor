@@ -3,15 +3,15 @@
 //   y[b, j] = x[b, j] * gamma[j] / rms[b]
 // Per-row reductions inside a block; one block per row.
 
-#include <brotensor/ops.h>
-#include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
+#include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include <stdexcept>
 
-namespace brotensor {
+namespace brotensor::detail::cuda {
 
 namespace {
 
@@ -183,15 +183,15 @@ __global__ void rms_fp32_into_fp16_kernel(const float* __restrict__ src,
 
 } // namespace
 
-void rms_norm_forward_gpu(const GpuTensor& X, const GpuTensor& gamma,
-                         float eps, GpuTensor& Y) {
+void rms_norm_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& gamma,
+                      float eps, ::brotensor::Tensor& Y) {
     if (gamma.dtype != X.dtype) {
-        throw std::runtime_error("rms_norm_forward_gpu: gamma.dtype must match X.dtype");
+        throw std::runtime_error("rms_norm_forward: gamma.dtype must match X.dtype");
     }
     const int B = X.rows;
     const int D = X.cols;
     if (gamma.size() != D) {
-        throw std::runtime_error("rms_norm_forward_gpu: gamma must have D elements");
+        throw std::runtime_error("rms_norm_forward: gamma must have D elements");
     }
     if (Y.rows != B || Y.cols != D || Y.dtype != X.dtype) {
         Y.resize(B, D, X.dtype);
@@ -199,33 +199,35 @@ void rms_norm_forward_gpu(const GpuTensor& X, const GpuTensor& gamma,
     if (B == 0 || D == 0) return;
     const int block = RMS_BLOCK;
     const size_t shmem = block * sizeof(float);
-    if (X.dtype == Dtype::FP16) {
+    if (X.dtype == ::brotensor::Dtype::FP16) {
         rms_forward_fp16_kernel<<<B, block, shmem>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(gamma.data_fp16()),
-            reinterpret_cast<__half*>(Y.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<const __half*>(gamma.data),
+            static_cast<__half*>(Y.data),
             B, D, eps);
     } else {
         rms_forward_fp32_kernel<<<B, block, shmem>>>(
-            X.data, gamma.data, Y.data, B, D, eps);
+            static_cast<const float*>(X.data),
+            static_cast<const float*>(gamma.data),
+            static_cast<float*>(Y.data), B, D, eps);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-void rms_norm_backward_gpu(const GpuTensor& X, const GpuTensor& gamma,
-                          const GpuTensor& dY, float eps,
-                          GpuTensor& dX, GpuTensor& dGamma) {
+void rms_norm_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& gamma,
+                       const ::brotensor::Tensor& dY, float eps,
+                       ::brotensor::Tensor& dX, ::brotensor::Tensor& dGamma) {
     if (gamma.dtype != X.dtype || dY.dtype != X.dtype ||
         dGamma.dtype != X.dtype) {
-        throw std::runtime_error("rms_norm_backward_gpu: dtypes must match");
+        throw std::runtime_error("rms_norm_backward: dtypes must match");
     }
     const int B = X.rows;
     const int D = X.cols;
     if (dY.rows != B || dY.cols != D) {
-        throw std::runtime_error("rms_norm_backward_gpu: dY shape mismatch");
+        throw std::runtime_error("rms_norm_backward: dY shape mismatch");
     }
     if (gamma.size() != D || dGamma.size() != D) {
-        throw std::runtime_error("rms_norm_backward_gpu: gamma/dGamma size mismatch");
+        throw std::runtime_error("rms_norm_backward: gamma/dGamma size mismatch");
     }
     if (dX.rows != B || dX.cols != D || dX.dtype != X.dtype) {
         dX.resize(B, D, X.dtype);
@@ -233,9 +235,13 @@ void rms_norm_backward_gpu(const GpuTensor& X, const GpuTensor& gamma,
     if (B == 0 || D == 0) return;
     const int block = RMS_BLOCK;
     const size_t shmem = block * sizeof(float);
-    if (X.dtype == Dtype::FP32) {
+    if (X.dtype == ::brotensor::Dtype::FP32) {
         rms_backward_fp32_kernel<<<B, block, shmem>>>(
-            X.data, gamma.data, dY.data, dX.data, dGamma.data,
+            static_cast<const float*>(X.data),
+            static_cast<const float*>(gamma.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data),
+            static_cast<float*>(dGamma.data),
             B, D, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     } else {
@@ -244,18 +250,18 @@ void rms_norm_backward_gpu(const GpuTensor& X, const GpuTensor& gamma,
                                         D * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dg, 0, D * sizeof(float)));
         rms_backward_fp16_kernel<<<B, block, shmem>>>(
-            reinterpret_cast<const __half*>(X.data_fp16()),
-            reinterpret_cast<const __half*>(gamma.data_fp16()),
-            reinterpret_cast<const __half*>(dY.data_fp16()),
-            reinterpret_cast<__half*>(dX.data_fp16()),
+            static_cast<const __half*>(X.data),
+            static_cast<const __half*>(gamma.data),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data),
             d_dg, B, D, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         const int blocks = (D + 255) / 256;
         rms_fp32_into_fp16_kernel<<<blocks, 256>>>(
-            d_dg, reinterpret_cast<__half*>(dGamma.data_fp16()), D);
+            d_dg, static_cast<__half*>(dGamma.data), D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_dg);
     }
 }
 
-} // namespace brotensor
+} // namespace brotensor::detail::cuda
