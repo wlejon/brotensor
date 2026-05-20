@@ -9,7 +9,10 @@ include/brotensor/
   tensor.h          Tensor (unified host+device) + Dtype + Device + factories,
                     migration (to/clone), mutators, host accessors
   ops.h             Public op declarations — one per op, runtime-dispatched
-  runtime.h         init() / default-device policy / DeviceScope / sync
+  runtime.h         init() / default-device policy / compute_dtype() /
+                    DeviceScope / sync
+  safetensors.h     safetensors reader + writer — File/TensorView + upload* +
+                    write_file. Tensor-container format; output type is Tensor
   metal_interop.h   Public Metal custom-kernel surface (Obj-C++ / .mm only)
   detail/op_table.h  X-macro: the single canonical op list
   detail/dispatch.h  OpsVTable / AllocVTable + register_backend + dispatch()
@@ -19,6 +22,7 @@ src/
   dispatch.cpp      Backend registry + per-operand device resolution
   init.cpp          Runtime: init(), default device, DeviceScope, sync
   ops.cpp           One thin wrapper per op — resolve device, forward to vtable
+  safetensors.cpp   safetensors mmap reader + JSON header parser + writer
   cpu/              *.cpp — scalar FP32 backend (always compiled)
   cuda/             *.cu  — CUDA backend (gated on BROTENSOR_WITH_CUDA)
   metal/            *.mm  — Metal backend (gated on BROTENSOR_WITH_METAL)

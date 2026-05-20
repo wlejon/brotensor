@@ -55,6 +55,7 @@ add_library(brotensor_core STATIC
     src/dispatch.cpp
     src/init.cpp
     src/ops.cpp
+    src/safetensors.cpp
 )
 target_include_directories(brotensor_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

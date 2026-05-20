@@ -35,6 +35,15 @@ void set_default_device(Device d);
 std::vector<Device> available_devices();
 bool is_available(Device);
 
+// ─── Compute-precision policy ──────────────────────────────────────────────
+//
+// The dtype a backend computes in: FP32 on the CPU backend (CPU is FP32-only
+// by design), FP16 on a GPU backend (where the half-precision kernels pay for
+// themselves). Derived from default_device(), so it tracks set_default_device()
+// and any active DeviceScope. This is the single decision point a model loader
+// uses to pick the dtype it uploads weights at.
+Dtype compute_dtype();
+
 // Thread-local scope override. Default device for tensor construction
 // inside the scope is `d`. Restored on destruction. Throws on construction
 // if `d` is not currently registered.

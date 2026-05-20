@@ -127,6 +127,10 @@ Device default_device() {
     return global_default().load(std::memory_order_acquire);
 }
 
+Dtype compute_dtype() {
+    return default_device() == Device::CPU ? Dtype::FP32 : Dtype::FP16;
+}
+
 void set_default_device(Device d) {
     if (!detail::is_registered(d)) {
         std::string m = "brotensor: set_default_device: backend ";
