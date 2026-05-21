@@ -166,6 +166,110 @@ void run_self_attn_forward_bf16(int L, int D, int num_heads, uint64_t seed,
                     8e-2f, 8e-2f);
 }
 
+// ─── self_attention_bias_forward parity ───────────────────────────────────
+//
+// Materialised multi-head self-attention with an optional per-head (L,L)
+// additive pre-softmax bias. FP32 CPU<->CUDA parity (with/without bias, mask,
+// and at scale = 1/sqrt(dh) and scale = 1.0 for the T5 path); plus a cross-
+// check that the no-bias scale=1/sqrt(dh) case matches self_attention_forward
+// _train; plus BF16-on-CUDA vs the FP32 CPU reference.
+
+void run_sab(int L, int D, int num_heads, float scale, bool with_bias,
+             const std::vector<float>* mask, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X  = Tensor::mat(L, D);
+    Tensor Wq = Tensor::mat(D, D), Wk = Tensor::mat(D, D),
+           Wv = Tensor::mat(D, D), Wo = Tensor::mat(D, D);
+    fill_random(X, rng, 0.5f);
+    fill_random(Wq, rng, 0.3f); fill_random(Wk, rng, 0.3f);
+    fill_random(Wv, rng, 0.3f); fill_random(Wo, rng, 0.3f);
+
+    Tensor bias;
+    if (with_bias) {
+        bias = Tensor::mat(num_heads * L, L);
+        fill_random(bias, rng, 0.5f);
+    }
+    const Tensor* bias_cpu = with_bias ? &bias : nullptr;
+    const float* host_mask = mask ? mask->data() : nullptr;
+
+    Tensor O_c;
+    brotensor::self_attention_bias_forward(X, Wq, Wk, Wv, Wo, host_mask,
+                                           bias_cpu, num_heads, scale, O_c);
+
+    Tensor gX  = X.to(gpu_device());
+    Tensor gWq = Wq.to(gpu_device()), gWk = Wk.to(gpu_device()),
+           gWv = Wv.to(gpu_device()), gWo = Wo.to(gpu_device());
+    Tensor gbias;
+    const Tensor* bias_gpu = nullptr;
+    if (with_bias) { gbias = bias.to(gpu_device()); bias_gpu = &gbias; }
+    Tensor d_mask_buf = upload_mask(mask);
+    const float* d_mask = static_cast<const float*>(d_mask_buf.data);
+
+    Tensor gO;
+    brotensor::self_attention_bias_forward(gX, gWq, gWk, gWv, gWo, d_mask,
+                                           bias_gpu, num_heads, scale, gO);
+
+    compare_tensors(O_c, download_to_host(gO), "sab.O", 1e-4f, 1e-3f);
+}
+
+// No-bias, scale = 1/sqrt(dh) must reproduce ordinary self-attention.
+void run_sab_vs_mha(int L, int D, int num_heads, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X  = Tensor::mat(L, D);
+    Tensor Wq = Tensor::mat(D, D), Wk = Tensor::mat(D, D),
+           Wv = Tensor::mat(D, D), Wo = Tensor::mat(D, D);
+    fill_random(X, rng, 0.5f);
+    fill_random(Wq, rng, 0.3f); fill_random(Wk, rng, 0.3f);
+    fill_random(Wv, rng, 0.3f); fill_random(Wo, rng, 0.3f);
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D / num_heads));
+
+    Tensor O_sab;
+    brotensor::self_attention_bias_forward(X, Wq, Wk, Wv, Wo, nullptr,
+                                           nullptr, num_heads, scale, O_sab);
+
+    Tensor Qh, Kh, Vh, Attnh, Yconcat, O_mha;
+    brotensor::self_attention_forward_train(
+        X, Wq, Wk, Wv, Wo, nullptr, num_heads,
+        Qh, Kh, Vh, Attnh, Yconcat, O_mha);
+
+    compare_tensors(O_mha, O_sab, "sab_vs_mha", 1e-4f, 1e-3f);
+}
+
+void run_sab_bf16(int L, int D, int num_heads, float scale, bool with_bias,
+                  uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X  = make_qbf_cpu(L, D, rng, 0.3f);
+    Tensor Wq = make_qbf_cpu(D, D, rng, 0.3f);
+    Tensor Wk = make_qbf_cpu(D, D, rng, 0.3f);
+    Tensor Wv = make_qbf_cpu(D, D, rng, 0.3f);
+    Tensor Wo = make_qbf_cpu(D, D, rng, 0.3f);
+
+    Tensor bias;
+    if (with_bias) {
+        bias = Tensor::mat(num_heads * L, L);
+        fill_random(bias, rng, 0.5f);
+    }
+    const Tensor* bias_cpu = with_bias ? &bias : nullptr;
+
+    Tensor O_c;
+    brotensor::self_attention_bias_forward(X, Wq, Wk, Wv, Wo, nullptr,
+                                           bias_cpu, num_heads, scale, O_c);
+
+    Tensor gX  = to_bf16_cuda_t(X);
+    Tensor gWq = to_bf16_cuda_t(Wq), gWk = to_bf16_cuda_t(Wk),
+           gWv = to_bf16_cuda_t(Wv), gWo = to_bf16_cuda_t(Wo);
+    Tensor gbias;
+    const Tensor* bias_gpu = nullptr;
+    if (with_bias) { gbias = bias.to(Device::CUDA); bias_gpu = &gbias; }
+
+    Tensor gO;
+    brotensor::self_attention_bias_forward(gX, gWq, gWk, gWv, gWo, nullptr,
+                                           bias_gpu, num_heads, scale, gO);
+
+    compare_tensors(O_c, bf16_cuda_to_cpu(gO), "sab.O.bf16", 8e-2f, 8e-2f);
+}
+
 } // namespace
 
 BT_PARITY_TEST(self_attn_L4_D16_h1)  { run_self_attn(4,  16, 1, 0x500ull, nullptr); }
@@ -186,6 +290,43 @@ BT_PARITY_TEST(self_attn_fwd_bf16_L8_D32_h4)  { run_self_attn_forward_bf16(8,  3
 BT_PARITY_TEST(self_attn_fwd_bf16_L12_D64_h8) { run_self_attn_forward_bf16(12, 64, 8, 0x521ull, nullptr); }
 BT_PARITY_TEST(self_attn_fwd_bf16_L8_D32_h4_mask) {
     auto m = partial_mask(8); run_self_attn_forward_bf16(8, 32, 4, 0x522ull, &m);
+}
+
+// ─── self_attention_bias_forward (FP32 CPU<->CUDA parity) ──────────────────
+BT_PARITY_TEST(sab_L8_D32_h4_nobias) {
+    run_sab(8, 32, 4, 0.176776695f, false, nullptr, 0x600ull);
+}
+BT_PARITY_TEST(sab_L8_D32_h4_bias) {
+    run_sab(8, 32, 4, 0.176776695f, true, nullptr, 0x601ull);
+}
+BT_PARITY_TEST(sab_L16_D64_h8_bias) {
+    run_sab(16, 64, 8, 0.125f, true, nullptr, 0x602ull);
+}
+BT_PARITY_TEST(sab_L6_D48_h6_bias_t5scale) {
+    run_sab(6, 48, 6, 1.0f, true, nullptr, 0x603ull);  // T5: unscaled scores
+}
+BT_PARITY_TEST(sab_L8_D32_h4_bias_mask) {
+    auto m = partial_mask(8);
+    run_sab(8, 32, 4, 0.176776695f, true, &m, 0x604ull);
+}
+BT_PARITY_TEST(sab_L16_D64_h8_bias_mask) {
+    auto m = partial_mask(16);
+    run_sab(16, 64, 8, 0.125f, true, &m, 0x605ull);
+}
+
+// No-bias scale=1/sqrt(dh) reproduces ordinary self-attention.
+BT_PARITY_TEST(sab_vs_mha_L8_D32_h4)  { run_sab_vs_mha(8, 32, 4, 0x610ull); }
+BT_PARITY_TEST(sab_vs_mha_L12_D48_h6) { run_sab_vs_mha(12, 48, 6, 0x611ull); }
+
+// BF16 on CUDA vs FP32 CPU reference.
+BT_PARITY_TEST(sab_bf16_L8_D32_h4_bias) {
+    run_sab_bf16(8, 32, 4, 0.176776695f, true, 0x620ull);
+}
+BT_PARITY_TEST(sab_bf16_L12_D64_h8_bias) {
+    run_sab_bf16(12, 64, 8, 0.125f, true, 0x621ull);
+}
+BT_PARITY_TEST(sab_bf16_L8_D32_h4_t5scale) {
+    run_sab_bf16(8, 32, 4, 1.0f, true, 0x622ull);
 }
 
 int main() { return run_all("self_attention cpu/gpu parity"); }

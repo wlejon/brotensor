@@ -959,6 +959,20 @@ void self_attention_forward(const Tensor& X,
     v.self_attention_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads, O);
 }
 
+void self_attention_bias_forward(const Tensor& X,
+                                 const Tensor& Wq, const Tensor& Wk,
+                                 const Tensor& Wv, const Tensor& Wo,
+                                 const float* d_mask,
+                                 const Tensor* attn_bias,
+                                 int num_heads, float scale, Tensor& O) {
+    const auto& v = detail::dispatch_with_opts(X, Wq, {&Wk, &Wv, &Wo, attn_bias, &O});
+    if (!v.self_attention_bias_forward)
+        detail::throw_not_implemented("self_attention_bias_forward", X.device);
+    detail::adopt_output(O, X.device);
+    v.self_attention_bias_forward(X, Wq, Wk, Wv, Wo, d_mask, attn_bias,
+                                  num_heads, scale, O);
+}
+
 // ─── Flash attention family ────────────────────────────────────────────────
 
 void flash_attention_forward(const Tensor& Q, const Tensor& K, const Tensor& V,

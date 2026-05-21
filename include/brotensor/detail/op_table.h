@@ -340,4 +340,4 @@
                                                        const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads, ::brotensor::Tensor& dX))                        \
     X(self_attention_bias_forward,             void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,                        \
                                                        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo, const float* d_mask,                                \
-                                                       const ::brotensor::Tensor* attn_bias, int num_heads, ::brotensor::Tensor& O))
+                                                       const ::brotensor::Tensor* attn_bias, int num_heads, float scale, ::brotensor::Tensor& O))

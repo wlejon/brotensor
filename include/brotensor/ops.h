@@ -1189,6 +1189,39 @@ void self_attention_forward(const Tensor& X,
                             int num_heads,
                             Tensor& O);
 
+// Multi-head self-attention with an optional additive pre-softmax bias.
+//
+// Computes, per head h:
+//   S[q,k] = scale * (Q_h[q] . K_h[k]) + attn_bias[h*L + q, k]
+//   O      = (softmax_k S) @ V_h , concatenated over heads, projected by Wo
+//
+// The additive bias is the general primitive behind T5's relative-position
+// bias (a per-head (L,L) term added pre-softmax) and any ALiBi-style bias.
+// `scale` is applied to the raw dot product *before* the bias: pass
+// 1/sqrt(head_dim) for standard scaled attention, or 1.0 for T5 (whose
+// position bias is defined against unscaled scores).
+//
+//   X:         (L, D)            token activations
+//   Wq,Wk,Wv,Wo: each (D, D)     projection weights, same dtype as X
+//   d_mask:    optional length-L FP32 key-validity mask (1 valid, 0 invalid);
+//              also gates padded query rows. May be null.
+//   attn_bias: optional (num_heads*L, L) FP32 tensor — row h*L+q holds the
+//              length-L bias added to head h's query q. May be null (then
+//              this is plain scaled self-attention).
+//   num_heads: must divide D.
+//   scale:     multiplier on the QK dot product, applied before the bias.
+//   O:         (L, D) output, resized AND dtype-set to match X.
+// Dispatched on X.dtype (FP32 / FP16 / BF16); FP32 internal math. The bias
+// tensor is FP32 on every backend. Scores are materialised (L,L) per head —
+// intended for encoder-length sequences (T5 ≤ 512).
+void self_attention_bias_forward(const Tensor& X,
+                                 const Tensor& Wq, const Tensor& Wk,
+                                 const Tensor& Wv, const Tensor& Wo,
+                                 const float* d_mask,
+                                 const Tensor* attn_bias,
+                                 int num_heads, float scale,
+                                 Tensor& O);
+
 // Flash-attention-style fused attention (FP16, inference-only).
 //
 // Q, K, V are already projected (caller does the matmuls externally). Tiles

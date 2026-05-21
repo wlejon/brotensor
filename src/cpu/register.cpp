@@ -534,6 +534,17 @@ void rope_apply_backward(const ::brotensor::Tensor& dY,
                          const ::brotensor::Tensor& sin_tbl,
                          int head_dim, int num_heads, ::brotensor::Tensor& dX);
 
+// ── Self-attention with additive bias — self_attention_bias.cpp ──
+void self_attention_bias_forward(const ::brotensor::Tensor& X,
+                                 const ::brotensor::Tensor& Wq,
+                                 const ::brotensor::Tensor& Wk,
+                                 const ::brotensor::Tensor& Wv,
+                                 const ::brotensor::Tensor& Wo,
+                                 const float* d_mask,
+                                 const ::brotensor::Tensor* attn_bias,
+                                 int num_heads, float scale,
+                                 ::brotensor::Tensor& O);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -683,6 +694,7 @@ struct CpuStaticRegistrar {
         ops.broadcast_mul                = &detail::cpu::broadcast_mul;
         ops.rope_apply                   = &detail::cpu::rope_apply;
         ops.rope_apply_backward          = &detail::cpu::rope_apply_backward;
+        ops.self_attention_bias_forward  = &detail::cpu::self_attention_bias_forward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());
