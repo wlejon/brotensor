@@ -685,6 +685,19 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
                                  const ::brotensor::Tensor* attn_bias,
                                  int num_heads, float scale,
                                  ::brotensor::Tensor& O);
+void self_attention_bias_int8w_fp16(const ::brotensor::Tensor& X,
+                                    const ::brotensor::Tensor& Wq_int8,
+                                    const ::brotensor::Tensor& sq,
+                                    const ::brotensor::Tensor& Wk_int8,
+                                    const ::brotensor::Tensor& sk,
+                                    const ::brotensor::Tensor& Wv_int8,
+                                    const ::brotensor::Tensor& sv,
+                                    const ::brotensor::Tensor& Wo_int8,
+                                    const ::brotensor::Tensor& so,
+                                    const float* d_mask,
+                                    const ::brotensor::Tensor* attn_bias,
+                                    int num_heads, float scale,
+                                    ::brotensor::Tensor& O);
 
 void fill_cuda_vtable_attention(::brotensor::detail::OpsVTable& v) {
     v.mha_forward                            = &mha_forward;
@@ -697,6 +710,7 @@ void fill_cuda_vtable_attention(::brotensor::detail::OpsVTable& v) {
     v.cross_attention_forward_with_attn      = &cross_attention_forward_with_attn;
     v.self_attention_forward                 = &self_attention_forward;
     v.self_attention_bias_forward            = &self_attention_bias_forward;
+    v.self_attention_bias_int8w_fp16         = &self_attention_bias_int8w_fp16;
     v.self_attention_forward_train           = &self_attention_forward_train;
     v.self_attention_backward                = &self_attention_backward;
     v.attention_token_moments                = &attention_token_moments;

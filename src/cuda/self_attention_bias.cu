@@ -22,6 +22,7 @@
 #include <cuda_bf16.h>
 
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -232,6 +233,122 @@ void run_sab(const ::brotensor::Tensor& X,
     }
 }
 
+// ── INT8 weight-only (W8A16) projection / output kernels ───────────────────
+//
+// Same dot products as sab_proj_kernel / sab_output_kernel, but the weight is
+// an INT8 (D, Din) matrix paired with an FP32 per-output-row dequant scale.
+// The row `wrow` accumulates against int8 weights, then the whole sum is
+// multiplied by scales[wrow] — equivalent to dequantising the row first,
+// since one scale covers the entire row.
+template <typename T>
+__global__ void sab_proj_kernel_int8(const T* __restrict__ In,
+                                     const int8_t* __restrict__ W,
+                                     const float* __restrict__ scales,
+                                     float* __restrict__ Out,
+                                     int L, int Din, int dh) {
+    const int j  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int hh = blockIdx.z;
+    if (i >= L || j >= dh) return;
+    const int wrow = hh * dh + j;
+    const T* xr = In + static_cast<size_t>(i) * Din;
+    const int8_t* wr = W + static_cast<size_t>(wrow) * Din;
+    float acc = 0.0f;
+    for (int k = 0; k < Din; ++k) acc += sab_ld(xr[k]) * static_cast<float>(wr[k]);
+    Out[(static_cast<size_t>(hh) * L + i) * dh + j] = acc * scales[wrow];
+}
+
+template <typename T>
+__global__ void sab_output_kernel_int8(const float* __restrict__ Y,
+                                       const int8_t* __restrict__ Wo,
+                                       const float* __restrict__ scales,
+                                       const float* __restrict__ mask,
+                                       T* __restrict__ O, int L, int D) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= L || c >= D) return;
+    if (mask && mask[i] < 0.5f) { sab_st(O[static_cast<size_t>(i) * D + c], 0.0f); return; }
+    const float* yr = Y + static_cast<size_t>(i) * D;
+    const int8_t* wr = Wo + static_cast<size_t>(c) * D;
+    float acc = 0.0f;
+    for (int k = 0; k < D; ++k) acc += yr[k] * static_cast<float>(wr[k]);
+    sab_st(O[static_cast<size_t>(i) * D + c], acc * scales[c]);
+}
+
+// INT8-weight variant of run_sab: the four projection matmuls consume INT8
+// weights + FP32 per-row scales; the attention core (scores / softmax / PV)
+// is byte-identical to the FP16 path.
+template <typename T>
+void run_sab_int8(const ::brotensor::Tensor& X,
+                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& sq,
+                  const ::brotensor::Tensor& Wk, const ::brotensor::Tensor& sk,
+                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& sv,
+                  const ::brotensor::Tensor& Wo, const ::brotensor::Tensor& so,
+                  const float* d_mask, const float* bias_p,
+                  int num_heads, float scale, ::brotensor::Tensor& O) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    using ::brotensor::Dtype;
+    const int L  = X.rows;
+    const int D  = X.cols;
+    const int H  = num_heads;
+    const int dh = D / H;
+
+    Tensor Qh = Tensor::empty_on(Device::CUDA, H * L, dh, Dtype::FP32);
+    Tensor Kh = Tensor::empty_on(Device::CUDA, H * L, dh, Dtype::FP32);
+    Tensor Vh = Tensor::empty_on(Device::CUDA, H * L, dh, Dtype::FP32);
+    Tensor S  = Tensor::empty_on(Device::CUDA, H * L, L,  Dtype::FP32);
+    Tensor A  = Tensor::empty_on(Device::CUDA, H * L, L,  Dtype::FP32);
+    Tensor Yc = Tensor::empty_on(Device::CUDA, L, D, Dtype::FP32);
+
+    const T* X_p  = static_cast<const T*>(X.data);
+    const int8_t* Wq_p = static_cast<const int8_t*>(Wq.data);
+    const int8_t* Wk_p = static_cast<const int8_t*>(Wk.data);
+    const int8_t* Wv_p = static_cast<const int8_t*>(Wv.data);
+    const int8_t* Wo_p = static_cast<const int8_t*>(Wo.data);
+    const float* sq_p = static_cast<const float*>(sq.data);
+    const float* sk_p = static_cast<const float*>(sk.data);
+    const float* sv_p = static_cast<const float*>(sv.data);
+    const float* so_p = static_cast<const float*>(so.data);
+    float* Qh_p = static_cast<float*>(Qh.data);
+    float* Kh_p = static_cast<float*>(Kh.data);
+    float* Vh_p = static_cast<float*>(Vh.data);
+    float* S_p  = static_cast<float*>(S.data);
+    float* A_p  = static_cast<float*>(A.data);
+    float* Yc_p = static_cast<float*>(Yc.data);
+
+    const dim3 block(16, 16);
+    {
+        dim3 grid((dh + block.x - 1) / block.x,
+                  (L  + block.y - 1) / block.y, H);
+        sab_proj_kernel_int8<T><<<grid, block>>>(X_p, Wq_p, sq_p, Qh_p, L, D, dh);
+        sab_proj_kernel_int8<T><<<grid, block>>>(X_p, Wk_p, sk_p, Kh_p, L, D, dh);
+        sab_proj_kernel_int8<T><<<grid, block>>>(X_p, Wv_p, sv_p, Vh_p, L, D, dh);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        dim3 grid((L + block.x - 1) / block.x,
+                  (L + block.y - 1) / block.y, H);
+        sab_scores_kernel<<<grid, block>>>(Qh_p, Kh_p, bias_p, S_p, L, dh, scale);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+    sab_softmax_kernel<<<H * L, SAB_SM_BLOCK>>>(S_p, A_p, d_mask, L);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    {
+        dim3 grid((dh + block.x - 1) / block.x,
+                  (L  + block.y - 1) / block.y, H);
+        sab_apply_v_kernel<<<grid, block>>>(A_p, Vh_p, Yc_p, L, dh, D);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        dim3 grid((D + block.x - 1) / block.x,
+                  (L + block.y - 1) / block.y);
+        sab_output_kernel_int8<T><<<grid, block>>>(Yc_p, Wo_p, so_p, d_mask,
+                                                   static_cast<T*>(O.data), L, D);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 } // namespace
 
 void self_attention_bias_forward(const ::brotensor::Tensor& X,
@@ -286,6 +403,71 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
         run_sab<__nv_bfloat16>(X, Wq, Wk, Wv, Wo, d_mask, bias_p, num_heads, scale, O);
         break;
     }
+}
+
+void self_attention_bias_int8w_fp16(const ::brotensor::Tensor& X,
+                                    const ::brotensor::Tensor& Wq_int8,
+                                    const ::brotensor::Tensor& sq,
+                                    const ::brotensor::Tensor& Wk_int8,
+                                    const ::brotensor::Tensor& sk,
+                                    const ::brotensor::Tensor& Wv_int8,
+                                    const ::brotensor::Tensor& sv,
+                                    const ::brotensor::Tensor& Wo_int8,
+                                    const ::brotensor::Tensor& so,
+                                    const float* d_mask,
+                                    const ::brotensor::Tensor* attn_bias,
+                                    int num_heads, float scale,
+                                    ::brotensor::Tensor& O) {
+    using ::brotensor::Dtype;
+    if (X.dtype != Dtype::FP16) {
+        throw std::runtime_error("self_attention_bias_int8w_fp16: X must be FP16");
+    }
+    if (Wq_int8.dtype != Dtype::INT8 || Wk_int8.dtype != Dtype::INT8 ||
+        Wv_int8.dtype != Dtype::INT8 || Wo_int8.dtype != Dtype::INT8) {
+        throw std::runtime_error(
+            "self_attention_bias_int8w_fp16: Wq/Wk/Wv/Wo must be INT8");
+    }
+    if (sq.dtype != Dtype::FP32 || sk.dtype != Dtype::FP32 ||
+        sv.dtype != Dtype::FP32 || so.dtype != Dtype::FP32) {
+        throw std::runtime_error(
+            "self_attention_bias_int8w_fp16: scales must be FP32");
+    }
+    const int L = X.rows;
+    const int D = X.cols;
+    if (num_heads <= 0 || D % num_heads != 0) {
+        throw std::runtime_error(
+            "self_attention_bias_int8w_fp16: num_heads must divide D");
+    }
+    if (Wq_int8.rows != D || Wq_int8.cols != D ||
+        Wk_int8.rows != D || Wk_int8.cols != D ||
+        Wv_int8.rows != D || Wv_int8.cols != D ||
+        Wo_int8.rows != D || Wo_int8.cols != D) {
+        throw std::runtime_error(
+            "self_attention_bias_int8w_fp16: Wq/Wk/Wv/Wo must be (D, D)");
+    }
+    if (sq.size() != D || sk.size() != D || sv.size() != D || so.size() != D) {
+        throw std::runtime_error(
+            "self_attention_bias_int8w_fp16: each scale tensor must have D entries");
+    }
+    const float* bias_p = nullptr;
+    if (attn_bias && attn_bias->data) {
+        if (attn_bias->dtype != Dtype::FP32) {
+            throw std::runtime_error(
+                "self_attention_bias_int8w_fp16: attn_bias must be FP32");
+        }
+        if (attn_bias->size() != num_heads * L * L) {
+            throw std::runtime_error(
+                "self_attention_bias_int8w_fp16: attn_bias must be (num_heads*L, L)");
+        }
+        bias_p = static_cast<const float*>(attn_bias->data);
+    }
+    if (O.rows != L || O.cols != D || O.dtype != Dtype::FP16) {
+        O.resize(L, D, Dtype::FP16);
+    }
+    if (L == 0 || D == 0) return;
+
+    run_sab_int8<__half>(X, Wq_int8, sq, Wk_int8, sk, Wv_int8, sv, Wo_int8, so,
+                         d_mask, bias_p, num_heads, scale, O);
 }
 
 } // namespace detail::cuda

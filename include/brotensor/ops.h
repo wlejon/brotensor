@@ -1222,6 +1222,34 @@ void self_attention_bias_forward(const Tensor& X,
                                  int num_heads, float scale,
                                  Tensor& O);
 
+// W8A16 INT8 weight-only variant of self_attention_bias_forward — the
+// quantised T5-bias attention behind brodiffusion's INT8 T5 encoder.
+//
+// Identical math and semantics to self_attention_bias_forward, but each of
+// the four projection weights is an INT8 (D, D) matrix paired with an FP32
+// (D, 1) per-output-row dequant scale (the convention of
+// quantize_int8_per_row_host). Activations stay FP16; the attention core
+// (scores + bias + softmax + PV) is FP32 internally, exactly as in the
+// FP16 op. GPU-only — no CPU/Metal fallback.
+//
+//   X:        (L, D)  FP16 — token activations
+//   Wq/Wk/Wv/Wo_int8: (D, D)  Dtype::INT8 — quantised projection weights
+//   sq/sk/sv/so:      (D, 1)  FP32 — matching per-output-row scales
+//   d_mask:    optional length-L FP32 key-validity mask. May be null.
+//   attn_bias: optional (num_heads*L, L) FP32 bias. May be null.
+//   num_heads: must divide D.
+//   scale:     multiplier on the QK dot product, applied before the bias.
+//   O:         (L, D) FP16 output, resized as needed.
+void self_attention_bias_int8w_fp16(const Tensor& X,
+                                    const Tensor& Wq_int8, const Tensor& sq,
+                                    const Tensor& Wk_int8, const Tensor& sk,
+                                    const Tensor& Wv_int8, const Tensor& sv,
+                                    const Tensor& Wo_int8, const Tensor& so,
+                                    const float* d_mask,
+                                    const Tensor* attn_bias,
+                                    int num_heads, float scale,
+                                    Tensor& O);
+
 // Flash-attention-style fused attention (FP16, inference-only).
 //
 // Q, K, V are already projected (caller does the matmuls externally). Tiles
