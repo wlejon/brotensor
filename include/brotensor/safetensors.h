@@ -113,13 +113,15 @@ void upload_fp16(const TensorView& view, int rows, int cols, brotensor::Tensor& 
 
 // Upload a weight at brotensor's compute dtype — FP32 on the CPU backend,
 // FP16 on a GPU backend (see brotensor::compute_dtype()). The source view
-// (F16 or F32) is converted host-side as needed, so a single checkpoint
-// serves either backend.
+// (F16, F32, or BF16) is converted host-side as needed, so a single
+// checkpoint serves either backend. BF16 is the on-disk dtype of Flux-family
+// weights; it is widened to FP32 on the CPU backend (which has no BF16
+// arithmetic) and narrowed to FP16 on a GPU backend.
 void upload_compute(const TensorView& view, int rows, int cols,
                     brotensor::Tensor& dst);
 
 // Like upload_compute(), but first validates the view: its dtype must be
-// F16 or F32 and its element count must equal rows*cols. Throws
+// F16, F32, or BF16 and its element count must equal rows*cols. Throws
 // std::runtime_error tagged with `name` (a caller-supplied label) and the
 // safetensors key on mismatch — the loader entry point a model component
 // uses so a malformed checkpoint fails with a clear message.

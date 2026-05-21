@@ -29,18 +29,20 @@ static int g_failures = 0;
     } \
 } while (0)
 
-// Build a minimal safetensors file with two tensors:
-//   "alpha" : F32, shape [2,3], 24 bytes
-//   "beta"  : F16, shape [4],   8 bytes
+// Build a minimal safetensors file with three tensors:
+//   "alpha" : F32,  shape [2,3], 24 bytes
+//   "beta"  : F16,  shape [4],   8 bytes
+//   "delta" : BF16, shape [4],   8 bytes
 static std::filesystem::path write_fixture() {
     auto path = std::filesystem::temp_directory_path() / "brotensor_st_test.safetensors";
 
     const std::string header =
         "{\"__metadata__\":{\"framework\":\"test\"},"
         "\"alpha\":{\"dtype\":\"F32\",\"shape\":[2,3],\"data_offsets\":[0,24]},"
-        "\"beta\":{\"dtype\":\"F16\",\"shape\":[4],\"data_offsets\":[24,32]}}";
+        "\"beta\":{\"dtype\":\"F16\",\"shape\":[4],\"data_offsets\":[24,32]},"
+        "\"delta\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[32,40]}}";
 
-    std::vector<uint8_t> payload(32, 0);
+    std::vector<uint8_t> payload(40, 0);
     // alpha: 6 floats 1.0..6.0
     for (int i = 0; i < 6; ++i) {
         float v = static_cast<float>(i + 1);
@@ -49,6 +51,10 @@ static std::filesystem::path write_fixture() {
     // beta: 4 fp16 bit patterns (1.0, 2.0, 3.0, 4.0)
     uint16_t halves[4] = {0x3c00, 0x4000, 0x4200, 0x4400};
     std::memcpy(payload.data() + 24, halves, 8);
+    // delta: 4 bf16 bit patterns (1.0, 2.0, 3.0, 4.0) — the high 16 bits of
+    // each FP32 value.
+    uint16_t bhalves[4] = {0x3f80, 0x4000, 0x4040, 0x4080};
+    std::memcpy(payload.data() + 32, bhalves, 8);
 
     uint64_t hdr_size = header.size();
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -66,7 +72,7 @@ int main() {
     // backing file. Windows refuses to remove a file with an open mapping.
     {
         auto file = st::File::open(path.string());
-        CHECK(file.size() == 2);
+        CHECK(file.size() == 3);
 
         const auto* alpha = file.find("alpha");
         CHECK(alpha != nullptr);
@@ -103,6 +109,27 @@ int main() {
             CHECK(t.rows == 4 && t.cols == 1);
             CHECK(t.dtype == brotensor::Dtype::FP32);
             CHECK(t.at(0, 0) == 1.0f && t.at(3, 0) == 4.0f);
+        }
+
+        const auto* delta = file.find("delta");
+        CHECK(delta != nullptr);
+        if (delta) {
+            CHECK(delta->dtype == st::Dtype::BF16);
+            CHECK(delta->shape.size() == 1 && delta->shape[0] == 4);
+            CHECK(delta->nbytes == 8);
+            // upload_compute widens the BF16 view to FP32 on the CPU backend
+            // (the path Flux-family checkpoints take). The values 1..4 are
+            // exactly representable, so the widening is lossless here.
+            brotensor::Tensor t;
+            st::upload_compute(*delta, 4, 1, t);
+            CHECK(t.rows == 4 && t.cols == 1);
+            CHECK(t.dtype == brotensor::Dtype::FP32);
+            CHECK(t.at(0, 0) == 1.0f && t.at(3, 0) == 4.0f);
+            // upload_compute_checked accepts BF16 too.
+            brotensor::Tensor t2;
+            st::upload_compute_checked(*delta, 4, 1, t2, "delta");
+            CHECK(t2.dtype == brotensor::Dtype::FP32);
+            CHECK(t2.at(1, 0) == 2.0f && t2.at(2, 0) == 3.0f);
         }
 
         CHECK(file.find("nope") == nullptr);
