@@ -101,6 +101,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/flash_attention.cpp
     src/cpu/self_attention_inference.cpp
     src/cpu/resblock.cpp
+    src/cpu/modulate.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)
@@ -156,6 +157,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/dpmpp_2m_step.cu
         src/cuda/timestep_embedding.cu
         src/cuda/int8_quant.cu
+        src/cuda/modulate.cu
         src/cuda/register.cu
     )
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)

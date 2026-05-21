@@ -329,4 +329,8 @@
                                                        const ::brotensor::Tensor& Wk_int8, const ::brotensor::Tensor& sk, const ::brotensor::Tensor* bk,                \
                                                        const ::brotensor::Tensor& Wv_int8, const ::brotensor::Tensor& sv, const ::brotensor::Tensor* bv,                \
                                                        const ::brotensor::Tensor& Wo_int8, const ::brotensor::Tensor& so, const ::brotensor::Tensor* bo,                \
-                                                       const float* d_mask, int num_heads, bool causal, ::brotensor::Tensor& O))
+                                                       const float* d_mask, int num_heads, bool causal, ::brotensor::Tensor& O))                                        \
+    /* ─── DiT / diffusion extras: AdaLN modulation, axial RoPE, T5-bias attention ─── */                                                                               \
+    X(modulate,                                void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& scale,                                                   \
+                                                       const ::brotensor::Tensor& shift, ::brotensor::Tensor& Y))                                                        \
+    X(broadcast_mul,                           void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& v, ::brotensor::Tensor& Y))

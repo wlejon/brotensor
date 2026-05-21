@@ -185,6 +185,21 @@ void mul_inplace(Tensor& y, const Tensor& x) {
     v.mul_inplace(y, x);
 }
 
+void modulate(const Tensor& X, const Tensor& scale, const Tensor& shift,
+              Tensor& Y) {
+    const auto& v = detail::dispatch(X, scale, shift, Y);
+    if (!v.modulate) detail::throw_not_implemented("modulate", X.device);
+    detail::adopt_output(Y, X.device);
+    v.modulate(X, scale, shift, Y);
+}
+
+void broadcast_mul(const Tensor& X, const Tensor& vv, Tensor& Y) {
+    const auto& v = detail::dispatch(X, vv, Y);
+    if (!v.broadcast_mul) detail::throw_not_implemented("broadcast_mul", X.device);
+    detail::adopt_output(Y, X.device);
+    v.broadcast_mul(X, vv, Y);
+}
+
 void build_slot_mask(const Tensor& x, int offset, int K, int stride, Tensor& mask) {
     const auto& v = detail::dispatch(x, mask);
     if (!v.build_slot_mask) detail::throw_not_implemented("build_slot_mask", x.device);

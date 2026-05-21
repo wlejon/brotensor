@@ -1281,8 +1281,16 @@ void rms_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& dY,
 void swiglu_forward(const Tensor& X, Tensor& Y);
 void swiglu_backward(const Tensor& X, const Tensor& dY, Tensor& dX);
 
+// Defined in modulate.cu.
+void modulate(const ::brotensor::Tensor& X, const ::brotensor::Tensor& scale,
+              const ::brotensor::Tensor& shift, ::brotensor::Tensor& Y);
+void broadcast_mul(const ::brotensor::Tensor& X, const ::brotensor::Tensor& v,
+                   ::brotensor::Tensor& Y);
+
 void fill_cuda_vtable_elementwise(::brotensor::detail::OpsVTable& v) {
     v.relu_forward            = &relu_forward;
+    v.modulate                = &modulate;
+    v.broadcast_mul           = &broadcast_mul;
     v.relu_backward           = &relu_backward;
     v.tanh_forward            = &tanh_forward;
     v.tanh_backward           = &tanh_backward;

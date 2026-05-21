@@ -519,6 +519,12 @@ void resblock_backward(const ::brotensor::Tensor& X,
                        ::brotensor::Tensor* dWskip,
                        ::brotensor::Tensor* dbskip);
 
+// ── DiT / diffusion extras — modulate.cpp ──
+void modulate(const ::brotensor::Tensor& X, const ::brotensor::Tensor& scale,
+              const ::brotensor::Tensor& shift, ::brotensor::Tensor& Y);
+void broadcast_mul(const ::brotensor::Tensor& X, const ::brotensor::Tensor& v,
+                   ::brotensor::Tensor& Y);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -662,6 +668,10 @@ struct CpuStaticRegistrar {
         ops.self_attention_forward       = &detail::cpu::self_attention_forward;
         ops.resblock_forward             = &detail::cpu::resblock_forward;
         ops.resblock_backward            = &detail::cpu::resblock_backward;
+
+        // ── DiT / diffusion extras ──
+        ops.modulate                     = &detail::cpu::modulate;
+        ops.broadcast_mul                = &detail::cpu::broadcast_mul;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

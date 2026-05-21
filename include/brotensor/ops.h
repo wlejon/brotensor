@@ -912,6 +912,34 @@ void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
 // on y.dtype. Used by GEGLU and by gating paths in transformer FFNs.
 void mul_inplace(Tensor& y, const Tensor& x);
 
+// ─── AdaLN modulation (DiT / SD3 / Flux) ───────────────────────────────────
+//
+// Broadcast affine modulation: Y = X * (1 + scale) + shift, with the
+// per-channel scale / shift broadcast across every token row. This is the
+// adaptive-LayerNorm modulation every DiT block applies after norm():
+//   modulate(norm(x), scale, shift)  ≡  x_hat * (1 + scale) + shift
+//
+//   X:     (L, D)   token activations
+//   scale: a length-D vector ((1,D) or (D,1)) — modulation scale
+//   shift: a length-D vector ((1,D) or (D,1)) — modulation shift
+//   Y:     (L, D)   output, resized AND dtype-set to match X if mis-shaped.
+// scale / shift must share X's dtype and device. Dispatched on X.dtype
+// (FP32 / FP16 / BF16); FP32 internal math.
+void modulate(const Tensor& X, const Tensor& scale, const Tensor& shift,
+              Tensor& Y);
+
+// Broadcast channel-wise multiply: Y[l, d] = X[l, d] * v[d], with the
+// length-D vector v broadcast across every token row. This is the DiT
+// residual gate — `x = x + broadcast_mul(sublayer_out, gate)` — and any
+// per-channel rescale.
+//
+//   X: (L, D)   token activations
+//   v: a length-D vector ((1,D) or (D,1)) — per-channel multiplier
+//   Y: (L, D)   output, resized AND dtype-set to match X if mis-shaped.
+// v must share X's dtype and device. Dispatched on X.dtype
+// (FP32 / FP16 / BF16); FP32 internal math.
+void broadcast_mul(const Tensor& X, const Tensor& v, Tensor& Y);
+
 // GEGLU activation: input (B, 2*D) is split along the last dim into halves
 // A=(B, D) and B_half=(B, D); output (B, D) = A * gelu(B_half). FP32 and FP16
 // variants dispatched on X.dtype (FP16 accumulates in FP32).
