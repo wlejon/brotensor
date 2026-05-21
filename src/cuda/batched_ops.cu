@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -107,9 +108,11 @@ constexpr int LBB_DX_BLOCK = 64;
 template <typename T> __device__ inline float lbb_load(const T* p);
 template <> __device__ inline float lbb_load<float>(const float* p)  { return *p; }
 template <> __device__ inline float lbb_load<__half>(const __half* p){ return __half2float(*p); }
+template <> __device__ inline float lbb_load<__nv_bfloat16>(const __nv_bfloat16* p){ return __bfloat162float(*p); }
 template <typename T> __device__ inline void lbb_store(T* p, float v);
 template <> __device__ inline void lbb_store<float>(float* p, float v) { *p = v; }
 template <> __device__ inline void lbb_store<__half>(__half* p, float v) { *p = __float2half(v); }
+template <> __device__ inline void lbb_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
 template <typename T>
 __global__ void linear_backward_batched_dx_kernel(const T* __restrict__ W,
@@ -168,6 +171,12 @@ __global__ void lbb_add_fp32_into_fp32(const float* __restrict__ src,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     dst[i] += src[i];
+}
+__global__ void lbb_add_fp32_into_bf16(const float* __restrict__ src,
+                                       __nv_bfloat16* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2bfloat16(__bfloat162float(dst[i]) + src[i]);
 }
 
 inline int grid_for(int n) {
@@ -259,8 +268,8 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
                              const Tensor& dY_BD,
                              Tensor& dX_BD,
                              Tensor& dW, Tensor& dB) {
-    if (W.dtype != Dtype::FP16 && W.dtype != Dtype::FP32) {
-        throw std::runtime_error("linear_backward_batched: W must be FP16 or FP32");
+    if (W.dtype != Dtype::FP16 && W.dtype != Dtype::FP32 && W.dtype != Dtype::BF16) {
+        throw std::runtime_error("linear_backward_batched: W must be FP16, BF16, or FP32");
     }
     if (X_BD.dtype != W.dtype || dY_BD.dtype != W.dtype ||
         dW.dtype != W.dtype || dB.dtype != W.dtype) {
@@ -276,6 +285,7 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
     if (B == 0) return;
 
     const bool is_fp16 = (W.dtype == Dtype::FP16);
+    const bool is_bf16 = (W.dtype == Dtype::BF16);
 
     if (in_dim > 0 && out_dim > 0) {
         dim3 block(LBB_DX_BLOCK, 1);
@@ -285,6 +295,12 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
                 static_cast<const __half*>(W.data),
                 static_cast<const __half*>(dY_BD.data),
                 static_cast<__half*>(dX_BD.data),
+                B, out_dim, in_dim);
+        } else if (is_bf16) {
+            linear_backward_batched_dx_kernel<__nv_bfloat16><<<grid, block>>>(
+                static_cast<const __nv_bfloat16*>(W.data),
+                static_cast<const __nv_bfloat16*>(dY_BD.data),
+                static_cast<__nv_bfloat16*>(dX_BD.data),
                 B, out_dim, in_dim);
         } else {
             linear_backward_batched_dx_kernel<float><<<grid, block>>>(
@@ -308,6 +324,11 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
                 static_cast<const __half*>(dY_BD.data),
                 static_cast<const __half*>(X_BD.data),
                 d_dw_scratch, B, out_dim, in_dim);
+        } else if (is_bf16) {
+            linear_backward_batched_dw_kernel<__nv_bfloat16><<<grid, block>>>(
+                static_cast<const __nv_bfloat16*>(dY_BD.data),
+                static_cast<const __nv_bfloat16*>(X_BD.data),
+                d_dw_scratch, B, out_dim, in_dim);
         } else {
             linear_backward_batched_dw_kernel<float><<<grid, block>>>(
                 static_cast<const float*>(dY_BD.data),
@@ -319,6 +340,9 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
         if (is_fp16) {
             lbb_add_fp32_into_fp16<<<blocks_fold, 256>>>(
                 d_dw_scratch, static_cast<__half*>(dW.data), dw_n);
+        } else if (is_bf16) {
+            lbb_add_fp32_into_bf16<<<blocks_fold, 256>>>(
+                d_dw_scratch, static_cast<__nv_bfloat16*>(dW.data), dw_n);
         } else {
             lbb_add_fp32_into_fp32<<<blocks_fold, 256>>>(
                 d_dw_scratch, static_cast<float*>(dW.data), dw_n);
@@ -336,6 +360,10 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
             linear_backward_batched_db_kernel<__half><<<blocks, 256>>>(
                 static_cast<const __half*>(dY_BD.data),
                 d_db_scratch, B, out_dim);
+        } else if (is_bf16) {
+            linear_backward_batched_db_kernel<__nv_bfloat16><<<blocks, 256>>>(
+                static_cast<const __nv_bfloat16*>(dY_BD.data),
+                d_db_scratch, B, out_dim);
         } else {
             linear_backward_batched_db_kernel<float><<<blocks, 256>>>(
                 static_cast<const float*>(dY_BD.data),
@@ -346,6 +374,9 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
         if (is_fp16) {
             lbb_add_fp32_into_fp16<<<blocks_fold, 256>>>(
                 d_db_scratch, static_cast<__half*>(dB.data), out_dim);
+        } else if (is_bf16) {
+            lbb_add_fp32_into_bf16<<<blocks_fold, 256>>>(
+                d_db_scratch, static_cast<__nv_bfloat16*>(dB.data), out_dim);
         } else {
             lbb_add_fp32_into_fp32<<<blocks_fold, 256>>>(
                 d_db_scratch, static_cast<float*>(dB.data), out_dim);

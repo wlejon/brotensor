@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -24,11 +25,13 @@ template <typename T>
 __device__ inline float load_f32(const T* p);
 template <> __device__ inline float load_f32<float>(const float* p)   { return *p; }
 template <> __device__ inline float load_f32<__half>(const __half* p) { return __half2float(*p); }
+template <> __device__ inline float load_f32<__nv_bfloat16>(const __nv_bfloat16* p) { return __bfloat162float(*p); }
 
 template <typename T>
 __device__ inline void store_f32(T* p, float v);
 template <> __device__ inline void store_f32<float>(float* p, float v)   { *p = v; }
 template <> __device__ inline void store_f32<__half>(__half* p, float v) { *p = __float2half(v); }
+template <> __device__ inline void store_f32<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
 // One block per row, threads stride-loop over N then shared-mem reduce.
 template <typename T>
@@ -95,8 +98,8 @@ __global__ void argmax_rows_kernel(const T* __restrict__ X,
 } // namespace
 
 void sum_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("sum_rows: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("sum_rows: X must be FP16, BF16, or FP32");
     }
     const int M = X.rows;
     const int N = X.cols;
@@ -112,6 +115,11 @@ void sum_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             M, N);
+    } else if (X.dtype == Dtype::BF16) {
+        sum_rows_kernel<__nv_bfloat16><<<M, RED_BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            M, N);
     } else {
         sum_rows_kernel<float><<<M, RED_BLOCK, 0, stream>>>(
             static_cast<const float*>(X.data),
@@ -121,8 +129,8 @@ void sum_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
 }
 
 void sum_cols(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("sum_cols: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("sum_cols: X must be FP16, BF16, or FP32");
     }
     const int M = X.rows;
     const int N = X.cols;
@@ -139,6 +147,11 @@ void sum_cols(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             M, N);
+    } else if (X.dtype == Dtype::BF16) {
+        sum_cols_kernel<__nv_bfloat16><<<blocks, RED_BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            M, N);
     } else {
         sum_cols_kernel<float><<<blocks, RED_BLOCK, 0, stream>>>(
             static_cast<const float*>(X.data),
@@ -148,8 +161,8 @@ void sum_cols(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
 }
 
 void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx) {
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("argmax_rows: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("argmax_rows: X must be FP16, BF16, or FP32");
     }
     const int M = X.rows;
     const int N = X.cols;
@@ -163,6 +176,10 @@ void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx) {
     if (X.dtype == Dtype::FP16) {
         argmax_rows_kernel<__half><<<M, RED_BLOCK, 0, stream>>>(
             static_cast<const __half*>(X.data),
+            static_cast<float*>(Idx.data), M, N);
+    } else if (X.dtype == Dtype::BF16) {
+        argmax_rows_kernel<__nv_bfloat16><<<M, RED_BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
             static_cast<float*>(Idx.data), M, N);
     } else {
         argmax_rows_kernel<float><<<M, RED_BLOCK, 0, stream>>>(

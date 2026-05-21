@@ -12,6 +12,7 @@
 using namespace bt_parity;
 using brotensor::Tensor;
 using brotensor::Device;
+using brotensor::Dtype;
 
 // ─── linear_forward_batched ────────────────────────────────────────────────
 
@@ -150,5 +151,70 @@ static void run_add_batched(int B, int D, uint64_t seed) {
 BT_PARITY_TEST(add_batched_B1)  { run_add_batched(1, 8, 0xF1ull); }
 BT_PARITY_TEST(add_batched_B4)  { run_add_batched(4, 16, 0xF2ull); }
 BT_PARITY_TEST(add_batched_B64) { run_add_batched(64, 32, 0xF3ull); }
+
+// ─── linear_backward_batched BF16 ─────────────────────────────────────────
+
+static void run_linear_backward_batched_bf16(int B, int in_dim, int out_dim,
+                                             uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor W_f32  = Tensor::mat(out_dim, in_dim);
+    Tensor X_f32  = Tensor::mat(B, in_dim);
+    Tensor dY_f32 = Tensor::mat(B, out_dim);
+    fill_random(W_f32, rng);
+    fill_random(X_f32, rng);
+    fill_random(dY_f32, rng);
+
+    // CPU FP32 reference for dX, dW, dB.
+    Tensor dX_ref = Tensor::mat(B, in_dim);
+    Tensor dW_ref = Tensor::mat(out_dim, in_dim);
+    Tensor dB_ref = Tensor::vec(out_dim);
+    dX_ref.zero(); dW_ref.zero(); dB_ref.zero();
+    for (int b = 0; b < B; ++b)
+        for (int j = 0; j < in_dim; ++j) {
+            float a = 0.0f;
+            for (int i = 0; i < out_dim; ++i)
+                a += W_f32[static_cast<size_t>(i)*in_dim+j] *
+                     dY_f32[static_cast<size_t>(b)*out_dim+i];
+            dX_ref[static_cast<size_t>(b)*in_dim+j] = a;
+        }
+    for (int i = 0; i < out_dim; ++i)
+        for (int j = 0; j < in_dim; ++j) {
+            float a = 0.0f;
+            for (int b = 0; b < B; ++b)
+                a += dY_f32[static_cast<size_t>(b)*out_dim+i] *
+                     X_f32 [static_cast<size_t>(b)*in_dim +j];
+            dW_ref[static_cast<size_t>(i)*in_dim+j] = a;
+        }
+    for (int i = 0; i < out_dim; ++i) {
+        float a = 0.0f;
+        for (int b = 0; b < B; ++b) a += dY_f32[static_cast<size_t>(b)*out_dim+i];
+        dB_ref[i] = a;
+    }
+
+    // BF16 GPU run.
+    Tensor gW  = to_bf16_cuda(W_f32);
+    Tensor gX  = to_bf16_cuda(X_f32);
+    Tensor gdY = to_bf16_cuda(dY_f32);
+    Tensor gdX;
+    Tensor gdW  = Tensor::zeros_on(Device::CUDA, out_dim, in_dim, Dtype::BF16);
+    Tensor gdB  = Tensor::zeros_on(Device::CUDA, out_dim, 1,      Dtype::BF16);
+
+    brotensor::linear_backward_batched(gW, gX, gdY, gdX, gdW, gdB);
+    BT_CHECK(gdX.dtype == Dtype::BF16);
+    BT_CHECK(gdW.dtype == Dtype::BF16);
+    BT_CHECK(gdB.dtype == Dtype::BF16);
+
+    Tensor dX_gpu = bf16_host_to_f32(download_to_host(gdX));
+    Tensor dW_gpu = bf16_host_to_f32(download_to_host(gdW));
+    Tensor dB_gpu = bf16_host_to_f32(download_to_host(gdB));
+
+    compare_tensors(dX_ref, dX_gpu, "linear_bwd_batched_bf16.dX", 3e-2f, 3e-2f);
+    compare_tensors(dW_ref, dW_gpu, "linear_bwd_batched_bf16.dW", 3e-2f, 3e-2f);
+    compare_tensors(dB_ref, dB_gpu, "linear_bwd_batched_bf16.dB", 3e-2f, 3e-2f);
+}
+
+BT_PARITY_TEST(linear_bwd_batched_bf16_B3_7_5)  { run_linear_backward_batched_bf16(3,  7,  5,  0xBF01ull); }
+BT_PARITY_TEST(linear_bwd_batched_bf16_B8_32_16){ run_linear_backward_batched_bf16(8,  32, 16, 0xBF02ull); }
+BT_PARITY_TEST(linear_bwd_batched_bf16_B16_64_32){ run_linear_backward_batched_bf16(16, 64, 32, 0xBF03ull); }
 
 int main() { return run_all("batched ops cpu/gpu parity"); }
