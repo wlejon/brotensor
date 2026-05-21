@@ -5,6 +5,20 @@
 #include <cstring>
 #include <stdexcept>
 
+// The concat / split / copy ops below are implemented as host-side memcpy on
+// the unified-memory MTLBuffer contents rather than as compute kernels. That
+// is correct on Apple Silicon — shared-storage buffers are host-addressable —
+// but a host memcpy is NOT ordered against the Metal command queue. If a
+// source tensor is the still-pending output of an earlier GPU kernel, the
+// memcpy races that kernel and reads stale data.
+//
+// Every function here therefore drains the queue (cuda_sync) before touching
+// buffer memory. A single sync covers both sides: it completes any pending
+// writes to the inputs AND any pending writes to the (possibly reused) output
+// buffer, so the subsequent host memcpy is race-free. Host writes that finish
+// before the next command buffer is committed are visible to that command
+// buffer, so no post-sync is needed.
+
 namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
@@ -33,6 +47,8 @@ void concat_rows(const std::vector<const Tensor*>& parts,
     }
     if (total == 0) return;
 
+    cuda_sync();  // drain pending GPU writes before the host memcpy
+
     const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(dt));
     char* dst_base = reinterpret_cast<char*>(out.data);
     std::size_t off_bytes = 0;
@@ -47,6 +63,7 @@ void concat_rows(const std::vector<const Tensor*>& parts,
 
 void split_rows(const Tensor& in,
                 const std::vector<Tensor*>& parts) {
+    cuda_sync();  // drain pending GPU writes before the host memcpy
     const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(in.dtype));
     const char* src_base = reinterpret_cast<const char*>(in.data);
     std::size_t off_bytes = 0;
@@ -76,6 +93,8 @@ void concat_batched_rows(const std::vector<const Tensor*>& parts,
         out.resize(B, total_cols, dt);
     }
     if (B == 0 || total_cols == 0) return;
+
+    cuda_sync();  // drain pending GPU writes before the host memcpy
 
     const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(dt));
     const std::size_t dst_pitch = elem * static_cast<std::size_t>(total_cols);
@@ -125,6 +144,8 @@ void concat_nchw_channels(const std::vector<const Tensor*>& parts,
     }
     if (N == 0 || total_cols == 0) return;
 
+    cuda_sync();  // drain pending GPU writes before the host memcpy
+
     const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(dt));
     const std::size_t HW = static_cast<std::size_t>(H) * static_cast<std::size_t>(W);
     const std::size_t dst_pitch = elem * static_cast<std::size_t>(total_C) * HW;
@@ -162,6 +183,8 @@ void concat_nchw_channels_backward(const Tensor& dY,
         throw std::runtime_error("concat_nchw_channels_backward: dY dtype must be FP16 or FP32");
     }
 
+    cuda_sync();  // drain pending GPU writes before the host memcpy
+
     const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(dt));
     const std::size_t HW = static_cast<std::size_t>(H) * static_cast<std::size_t>(W);
     const std::size_t src_pitch = elem * static_cast<std::size_t>(total_C) * HW;
@@ -195,6 +218,7 @@ void copy_d2d(const Tensor& src, int src_off,
               Tensor& dst,       int dst_off,
               int n) {
     if (n <= 0) return;
+    cuda_sync();  // drain pending GPU writes before the host memcpy
     const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(src.dtype));
     const char* src_base = reinterpret_cast<const char*>(src.data);
     char*       dst_base = reinterpret_cast<char*>(dst.data);
