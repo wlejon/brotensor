@@ -270,6 +270,106 @@ void run_sab_bf16(int L, int D, int num_heads, float scale, bool with_bias,
     compare_tensors(O_c, bf16_cuda_to_cpu(gO), "sab.O.bf16", 8e-2f, 8e-2f);
 }
 
+// ─── self_attention_bias_int8w_fp16 (W8A16) parity ─────────────────────────
+//
+// INT8 weight-only T5-bias attention. The reference is the FP16 path fed the
+// dequantised weights (int8 * per-row scale, rounded to FP16) — the same
+// quantise/dequantise reference pattern as test_int8_attention.cpp. Both run
+// on the GPU backend and share an identical attention core; they differ only
+// in the projection / output matmul, so the tolerance just covers the FP16
+// weight-rounding gap.
+
+// Widen an FP16 device tensor back to an FP32 host tensor.
+Tensor fp16_gpu_to_cpu(const Tensor& g) {
+    brotensor::sync_all();
+    std::vector<uint16_t> h(static_cast<size_t>(g.size()));
+    g.copy_to_host_fp16(h.data());
+    Tensor out = Tensor::mat(g.rows, g.cols);
+    for (int i = 0; i < out.size(); ++i)
+        out.ptr()[i] = brotensor::fp16_bits_to_fp32(h[i]);
+    return out;
+}
+
+// Quantise an FP32 (out, in) host weight to INT8 + per-row scales. Returns the
+// device INT8 weight, the device FP32 scales, and the device FP16 dequant
+// reference (int8 * scale rounded to FP16).
+void quantize_w(const Tensor& W, Tensor& W_int8, Tensor& scales,
+                Tensor& W_deq) {
+    const int out = W.rows, in = W.cols;
+    const size_t n = static_cast<size_t>(out) * in;
+    std::vector<uint16_t> Wh(n);
+    for (int i = 0; i < W.size(); ++i)
+        Wh[i] = brotensor::fp32_to_fp16_bits(W[i]);
+
+    std::vector<int8_t> Wq(n);
+    std::vector<float>  sc(out);
+    brotensor::quantize_int8_per_row_host(Wh.data(), out, in,
+                                          Wq.data(), sc.data());
+
+    std::vector<uint16_t> Wdeq(n);
+    for (int r = 0; r < out; ++r)
+        for (int c = 0; c < in; ++c)
+            Wdeq[r * in + c] = brotensor::fp32_to_fp16_bits(
+                static_cast<float>(Wq[r * in + c]) * sc[r]);
+
+    Tensor cpu_i8 = Tensor::zeros_on(Device::CPU, out, in,
+                                     brotensor::Dtype::INT8);
+    std::memcpy(cpu_i8.host_raw_mut(), Wq.data(), n);
+    W_int8 = cpu_i8.to(gpu_device());
+    scales = Tensor::from_host_on(gpu_device(), sc.data(), out, 1);
+    W_deq  = Tensor::from_host_fp16_on(gpu_device(), Wdeq.data(), out, in);
+}
+
+void run_sab_int8(int L, int D, int num_heads, float scale, bool with_bias,
+                  const std::vector<float>* mask, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X  = Tensor::mat(L, D);
+    Tensor Wq = Tensor::mat(D, D), Wk = Tensor::mat(D, D),
+           Wv = Tensor::mat(D, D), Wo = Tensor::mat(D, D);
+    fill_random(X, rng, 0.5f);
+    fill_random(Wq, rng, 0.3f); fill_random(Wk, rng, 0.3f);
+    fill_random(Wv, rng, 0.3f); fill_random(Wo, rng, 0.3f);
+
+    Tensor bias;
+    if (with_bias) {
+        bias = Tensor::mat(num_heads * L, L);
+        fill_random(bias, rng, 0.5f);
+    }
+    Tensor gbias;
+    const Tensor* bias_gpu = nullptr;
+    if (with_bias) { gbias = bias.to(gpu_device()); bias_gpu = &gbias; }
+
+    // X uploaded as FP16 — the activation dtype the W8A16 op requires.
+    std::vector<uint16_t> Xh(static_cast<size_t>(L) * D);
+    for (int i = 0; i < X.size(); ++i)
+        Xh[i] = brotensor::fp32_to_fp16_bits(X[i]);
+    Tensor gX = Tensor::from_host_fp16_on(gpu_device(), Xh.data(), L, D);
+
+    Tensor qWq, sWq, dWq, qWk, sWk, dWk, qWv, sWv, dWv, qWo, sWo, dWo;
+    quantize_w(Wq, qWq, sWq, dWq);
+    quantize_w(Wk, qWk, sWk, dWk);
+    quantize_w(Wv, qWv, sWv, dWv);
+    quantize_w(Wo, qWo, sWo, dWo);
+
+    Tensor d_mask_buf = upload_mask(mask);
+    const float* d_mask =
+        mask ? static_cast<const float*>(d_mask_buf.data) : nullptr;
+
+    // Reference: the FP16 path fed the dequantised weights.
+    Tensor O_ref;
+    brotensor::self_attention_bias_forward(gX, dWq, dWk, dWv, dWo, d_mask,
+                                           bias_gpu, num_heads, scale, O_ref);
+
+    // Candidate: the INT8 weight-only kernel.
+    Tensor O_int8;
+    brotensor::self_attention_bias_int8w_fp16(
+        gX, qWq, sWq, qWk, sWk, qWv, sWv, qWo, sWo,
+        d_mask, bias_gpu, num_heads, scale, O_int8);
+
+    compare_tensors(fp16_gpu_to_cpu(O_ref), fp16_gpu_to_cpu(O_int8),
+                    "sab.O.int8w", 2e-2f, 2e-2f);
+}
+
 } // namespace
 
 BT_PARITY_TEST(self_attn_L4_D16_h1)  { run_self_attn(4,  16, 1, 0x500ull, nullptr); }
@@ -327,6 +427,24 @@ BT_PARITY_TEST(sab_bf16_L12_D64_h8_bias) {
 }
 BT_PARITY_TEST(sab_bf16_L8_D32_h4_t5scale) {
     run_sab_bf16(8, 32, 4, 1.0f, true, 0x622ull);
+}
+
+// W8A16 INT8 weight-only T5-bias attention vs the FP16 dequant reference.
+BT_PARITY_TEST(sab_int8_L8_D32_h4_nobias) {
+    run_sab_int8(8, 32, 4, 0.176776695f, false, nullptr, 0x630ull);
+}
+BT_PARITY_TEST(sab_int8_L8_D32_h4_bias) {
+    run_sab_int8(8, 32, 4, 0.176776695f, true, nullptr, 0x631ull);
+}
+BT_PARITY_TEST(sab_int8_L16_D64_h8_bias) {
+    run_sab_int8(16, 64, 8, 0.125f, true, nullptr, 0x632ull);
+}
+BT_PARITY_TEST(sab_int8_L6_D48_h6_bias_t5scale) {
+    run_sab_int8(6, 48, 6, 1.0f, true, nullptr, 0x633ull);  // T5: unscaled
+}
+BT_PARITY_TEST(sab_int8_L8_D32_h4_bias_mask) {
+    auto m = partial_mask(8);
+    run_sab_int8(8, 32, 4, 0.176776695f, true, &m, 0x634ull);
 }
 
 int main() { return run_all("self_attention cpu/gpu parity"); }

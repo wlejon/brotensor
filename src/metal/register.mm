@@ -146,6 +146,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.scale_inplace                               = &dm::scale_inplace;
     ops.self_attention_backward                     = &dm::self_attention_backward;
     ops.self_attention_bias_forward                 = &dm::self_attention_bias_forward;
+    ops.self_attention_bias_int8w_fp16              = &dm::self_attention_bias_int8w_fp16;
     ops.self_attention_forward                      = &dm::self_attention_forward;
     ops.self_attention_forward_train                = &dm::self_attention_forward_train;
     ops.sequence_to_nchw                            = &dm::sequence_to_nchw;

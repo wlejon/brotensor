@@ -179,6 +179,53 @@ kernel void NAME(device const float* Y    [[buffer(0)]],                      \
 SAB_OUTPUT_KERNEL(k_sab_output_fp32, float)
 SAB_OUTPUT_KERNEL(k_sab_output_fp16, half)
 SAB_OUTPUT_KERNEL(k_sab_output_bf16, bfloat)
+
+// ── W8A16 (INT8 weight, FP16 activation) projection / output ───────────────
+//
+// Same dot products as k_sab_proj_fp16 / k_sab_output_fp16, but the weight is
+// an INT8 (D, Din) matrix paired with an FP32 per-output-row dequant scale.
+// The row accumulates against int8 weights, then the whole sum is multiplied
+// by scales[wrow] — one scale covers the entire row, so this equals
+// dequantising the row first.
+
+// Out[(hh*L+i), j] = scales[wrow] * sum_k In[i,k] * W[wrow,k];  wrow = hh*dh+j.
+kernel void k_sab_proj_int8(device const half*  In     [[buffer(0)]],
+                            device const char*  W      [[buffer(1)]],
+                            device const float* scales [[buffer(2)]],
+                            device float*       Out    [[buffer(3)]],
+                            constant uint& L   [[buffer(4)]],
+                            constant uint& Din [[buffer(5)]],
+                            constant uint& dh  [[buffer(6)]],
+                            uint3 gid [[thread_position_in_grid]]) {
+    uint j = gid.x, i = gid.y, hh = gid.z;
+    if (i >= L || j >= dh) return;
+    uint wrow = hh * dh + j;
+    device const half*   xr = In + (ulong)i * Din;
+    device const int8_t* wr = (device const int8_t*)W + (ulong)wrow * Din;
+    float acc = 0.0f;
+    for (uint k = 0; k < Din; ++k) acc += float(xr[k]) * float(wr[k]);
+    Out[((ulong)hh * L + i) * dh + j] = acc * scales[wrow];
+}
+
+// O[i, c] = mask[i] ? scales[c] * sum_k Yconcat[i,k] * Wo[c,k] : 0.
+kernel void k_sab_output_int8(device const float* Y      [[buffer(0)]],
+                              device const char*  Wo     [[buffer(1)]],
+                              device const float* scales [[buffer(2)]],
+                              device const float* mask   [[buffer(3)]],
+                              constant uint& has_mask    [[buffer(4)]],
+                              device half*        O      [[buffer(5)]],
+                              constant uint& L [[buffer(6)]],
+                              constant uint& D [[buffer(7)]],
+                              uint3 gid [[thread_position_in_grid]]) {
+    uint c = gid.x, i = gid.y;
+    if (i >= L || c >= D) return;
+    if (has_mask && mask[i] < 0.5f) { O[(ulong)i * D + c] = half(0.0f); return; }
+    device const float*  yr = Y + (ulong)i * D;
+    device const int8_t* wr = (device const int8_t*)Wo + (ulong)c * D;
+    float acc = 0.0f;
+    for (uint k = 0; k < D; ++k) acc += yr[k] * float(wr[k]);
+    O[(ulong)i * D + c] = half(acc * scales[c]);
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -197,6 +244,8 @@ DEF_PSO(pso_apply_v,     @"k_sab_apply_v")
 DEF_PSO(pso_output_fp32, @"k_sab_output_fp32")
 DEF_PSO(pso_output_fp16, @"k_sab_output_fp16")
 DEF_PSO(pso_output_bf16, @"k_sab_output_bf16")
+DEF_PSO(pso_proj_int8,   @"k_sab_proj_int8")
+DEF_PSO(pso_output_int8, @"k_sab_output_int8")
 #undef DEF_PSO
 
 // Dispatch a 3-D thread grid (nx, ny, nz), threadgroup capped at 256 threads.
@@ -376,6 +425,171 @@ void self_attention_bias_forward(const Tensor& X, const Tensor& Wq,
         [enc setBuffer:bO     offset:oO     atIndex:4];
         [enc setBytes:&Lu     length:sizeof(uint32_t) atIndex:5];
         [enc setBytes:&Du     length:sizeof(uint32_t) atIndex:6];
+    });
+}
+
+// W8A16 INT8 weight-only variant. The four projection weights are INT8 (D, D)
+// matrices paired with FP32 (D, 1) per-output-row dequant scales; activations
+// stay FP16. The attention core (scores / softmax / Attn@V) is byte-identical
+// to the FP16 path above — only the projection and output matmuls differ.
+void self_attention_bias_int8w_fp16(const Tensor& X,
+                                    const Tensor& Wq_int8, const Tensor& sq,
+                                    const Tensor& Wk_int8, const Tensor& sk,
+                                    const Tensor& Wv_int8, const Tensor& sv,
+                                    const Tensor& Wo_int8, const Tensor& so,
+                                    const float* d_mask,
+                                    const Tensor* attn_bias, int num_heads,
+                                    float scale, Tensor& O) {
+    if (X.dtype != Dtype::FP16) {
+        throw std::runtime_error("self_attention_bias_int8w_fp16: X must be FP16");
+    }
+    if (Wq_int8.dtype != Dtype::INT8 || Wk_int8.dtype != Dtype::INT8 ||
+        Wv_int8.dtype != Dtype::INT8 || Wo_int8.dtype != Dtype::INT8) {
+        throw std::runtime_error(
+            "self_attention_bias_int8w_fp16: Wq/Wk/Wv/Wo must be INT8");
+    }
+    if (sq.dtype != Dtype::FP32 || sk.dtype != Dtype::FP32 ||
+        sv.dtype != Dtype::FP32 || so.dtype != Dtype::FP32) {
+        throw std::runtime_error(
+            "self_attention_bias_int8w_fp16: scales must be FP32");
+    }
+    const int L = X.rows;
+    const int D = X.cols;
+    const int H = num_heads;
+    if (H <= 0 || D % H != 0) {
+        throw std::runtime_error(
+            "self_attention_bias_int8w_fp16: num_heads must divide D");
+    }
+    if (Wq_int8.rows != D || Wq_int8.cols != D ||
+        Wk_int8.rows != D || Wk_int8.cols != D ||
+        Wv_int8.rows != D || Wv_int8.cols != D ||
+        Wo_int8.rows != D || Wo_int8.cols != D) {
+        throw std::runtime_error(
+            "self_attention_bias_int8w_fp16: Wq/Wk/Wv/Wo must be (D, D)");
+    }
+    if (sq.size() != D || sk.size() != D || sv.size() != D || so.size() != D) {
+        throw std::runtime_error(
+            "self_attention_bias_int8w_fp16: each scale tensor must have D entries");
+    }
+    const int dh = D / H;
+
+    bool has_bias = false;
+    if (attn_bias && attn_bias->data) {
+        if (attn_bias->dtype != Dtype::FP32) {
+            throw std::runtime_error(
+                "self_attention_bias_int8w_fp16: attn_bias must be FP32");
+        }
+        if (attn_bias->size() != H * L * L) {
+            throw std::runtime_error(
+                "self_attention_bias_int8w_fp16: attn_bias must be (num_heads*L, L)");
+        }
+        has_bias = true;
+    }
+    if (O.rows != L || O.cols != D || O.dtype != Dtype::FP16) {
+        O.resize(L, D, Dtype::FP16);
+    }
+    if (L == 0 || D == 0) return;
+
+    // FP32 scratch for every intermediate.
+    Tensor Qh = Tensor::empty_on(Device::Metal, H * L, dh, Dtype::FP32);
+    Tensor Kh = Tensor::empty_on(Device::Metal, H * L, dh, Dtype::FP32);
+    Tensor Vh = Tensor::empty_on(Device::Metal, H * L, dh, Dtype::FP32);
+    Tensor S  = Tensor::empty_on(Device::Metal, H * L, L,  Dtype::FP32);
+    Tensor A  = Tensor::empty_on(Device::Metal, H * L, L,  Dtype::FP32);
+    Tensor Yc = Tensor::empty_on(Device::Metal, L, D, Dtype::FP32);
+
+    id<MTLBuffer> bX = buffer_for(X);   NSUInteger oX = buffer_offset_for(X);
+    id<MTLBuffer> bO = buffer_for(O);   NSUInteger oO = buffer_offset_for(O);
+    id<MTLBuffer> bQh = buffer_for(Qh); NSUInteger oQh = buffer_offset_for(Qh);
+    id<MTLBuffer> bKh = buffer_for(Kh); NSUInteger oKh = buffer_offset_for(Kh);
+    id<MTLBuffer> bVh = buffer_for(Vh); NSUInteger oVh = buffer_offset_for(Vh);
+    id<MTLBuffer> bS  = buffer_for(S);  NSUInteger oS  = buffer_offset_for(S);
+    id<MTLBuffer> bA  = buffer_for(A);  NSUInteger oA  = buffer_offset_for(A);
+    id<MTLBuffer> bYc = buffer_for(Yc); NSUInteger oYc = buffer_offset_for(Yc);
+
+    id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
+    NSUInteger oM = d_mask ? pool_lookup_offset(d_mask) : 0;
+    id<MTLBuffer> bM_arg = bM ? bM : bX;
+    NSUInteger oM_arg = bM ? oM : oX;
+    const uint32_t has_mask = (bM != nil) ? 1u : 0u;
+
+    id<MTLBuffer> bB = has_bias ? buffer_for(*attn_bias) : nil;
+    NSUInteger oB = has_bias ? buffer_offset_for(*attn_bias) : 0;
+    id<MTLBuffer> bB_arg = bB ? bB : bX;
+    NSUInteger oB_arg = bB ? oB : oX;
+    const uint32_t has_bias_u = has_bias ? 1u : 0u;
+
+    const uint32_t Lu = static_cast<uint32_t>(L);
+    const uint32_t Du = static_cast<uint32_t>(D);
+    const uint32_t dhu = static_cast<uint32_t>(dh);
+
+    // Q / K / V per-head INT8 projections.
+    auto proj = ^(id<MTLBuffer> bW, NSUInteger oW,
+                  id<MTLBuffer> bSc, NSUInteger oSc,
+                  id<MTLBuffer> bOut, NSUInteger oOut) {
+        run3d(pso_proj_int8(), dhu, Lu, H, ^(id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:bX   offset:oX   atIndex:0];
+            [enc setBuffer:bW   offset:oW   atIndex:1];
+            [enc setBuffer:bSc  offset:oSc  atIndex:2];
+            [enc setBuffer:bOut offset:oOut atIndex:3];
+            [enc setBytes:&Lu  length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&Du  length:sizeof(uint32_t) atIndex:5];
+            [enc setBytes:&dhu length:sizeof(uint32_t) atIndex:6];
+        });
+    };
+    proj(buffer_for(Wq_int8), buffer_offset_for(Wq_int8),
+         buffer_for(sq), buffer_offset_for(sq), bQh, oQh);
+    proj(buffer_for(Wk_int8), buffer_offset_for(Wk_int8),
+         buffer_for(sk), buffer_offset_for(sk), bKh, oKh);
+    proj(buffer_for(Wv_int8), buffer_offset_for(Wv_int8),
+         buffer_for(sv), buffer_offset_for(sv), bVh, oVh);
+
+    // Scores: scale * (Q.K) + bias.
+    run3d(pso_scores(), Lu, Lu, H, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bQh   offset:oQh   atIndex:0];
+        [enc setBuffer:bKh   offset:oKh   atIndex:1];
+        [enc setBuffer:bB_arg offset:oB_arg atIndex:2];
+        [enc setBytes:&has_bias_u length:sizeof(uint32_t) atIndex:3];
+        [enc setBuffer:bS    offset:oS    atIndex:4];
+        [enc setBytes:&Lu    length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&dhu   length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&scale length:sizeof(float)    atIndex:7];
+    });
+
+    // Row-wise masked softmax.
+    run_rows(pso_softmax(), static_cast<NSUInteger>(H) * L,
+             ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bS     offset:oS     atIndex:0];
+        [enc setBuffer:bA     offset:oA     atIndex:1];
+        [enc setBuffer:bM_arg offset:oM_arg atIndex:2];
+        [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&Lu       length:sizeof(uint32_t) atIndex:4];
+    });
+
+    // Attn @ V → Yconcat.
+    run3d(pso_apply_v(), dhu, Lu, H, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bA  offset:oA  atIndex:0];
+        [enc setBuffer:bVh offset:oVh atIndex:1];
+        [enc setBuffer:bYc offset:oYc atIndex:2];
+        [enc setBytes:&Lu  length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&dhu length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&Du  length:sizeof(uint32_t) atIndex:5];
+    });
+
+    // INT8 output projection by Wo.
+    id<MTLBuffer> bWo = buffer_for(Wo_int8);
+    NSUInteger oWo = buffer_offset_for(Wo_int8);
+    id<MTLBuffer> bSo = buffer_for(so);
+    NSUInteger oSo = buffer_offset_for(so);
+    run3d(pso_output_int8(), Du, Lu, 1, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bYc    offset:oYc    atIndex:0];
+        [enc setBuffer:bWo    offset:oWo    atIndex:1];
+        [enc setBuffer:bSo    offset:oSo    atIndex:2];
+        [enc setBuffer:bM_arg offset:oM_arg atIndex:3];
+        [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:4];
+        [enc setBuffer:bO     offset:oO     atIndex:5];
+        [enc setBytes:&Lu     length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&Du     length:sizeof(uint32_t) atIndex:7];
     });
 }
 
