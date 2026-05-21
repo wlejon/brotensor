@@ -5,15 +5,15 @@
 //   dpmpp_2m_step       — x_prev + x0_out OVERWRITTEN.
 //   timestep_embedding  — Y OVERWRITTEN.
 //
-// DTYPE NOTE: the GPU sampler kernels (ddim/euler/dpmpp_2m) run FP16 — their
-// tensors MUST be FP16. The CPU backend is FP32-only. So for these three ops
-// the parity harness:
-//   * quantises the random inputs through FP16 (so CPU and GPU see the SAME
-//     input values),
-//   * feeds FP16 tensors to the GPU and FP32 tensors to the CPU,
-//   * compares with a loose FP16-driven tolerance (atol/rtol 1e-2).
+// DTYPE NOTE: the GPU sampler kernels (ddim/euler/dpmpp_2m) run FP16 or BF16 —
+// their tensors MUST be FP16 or BF16. The CPU backend is FP32-only. So for
+// these three ops the parity harness:
+//   * quantises the random inputs through the target dtype (so CPU and GPU see
+//     the SAME input values),
+//   * feeds typed tensors to the GPU and FP32 tensors to the CPU,
+//   * compares with a loose tolerance (atol/rtol 1e-2 for FP16; 3e-2 for BF16).
 // The internal arithmetic is identical FP32 math on both backends; the gap is
-// purely FP16 input/output rounding on the GPU side.
+// purely input/output rounding on the GPU side.
 //
 // timestep_embedding is FP32 on BOTH backends, so it gets a tighter tolerance
 // (relaxed only slightly for the exp/sin/cos fast-math intrinsics).
@@ -63,6 +63,39 @@ Tensor fp16_cuda_to_cpu(const Tensor& g) {
     Tensor out = Tensor::mat(g.rows, g.cols);
     for (int i = 0; i < out.size(); ++i)
         out.ptr()[i] = brotensor::fp16_bits_to_fp32(h[i]);
+    return out;
+}
+
+// ─── BF16 helpers ─────────────────────────────────────────────────────────
+
+// Quantise a value through BF16.
+inline float qbf(float v) {
+    return brotensor::bf16_bits_to_fp32(brotensor::fp32_to_bf16_bits(v));
+}
+
+// Build a CPU FP32 tensor whose values are BF16-quantised randoms.
+Tensor make_qbf_cpu(int rows, int cols, SplitMix64& rng, float scale) {
+    Tensor t = Tensor::mat(rows, cols);
+    for (int i = 0; i < t.size(); ++i) t.ptr()[i] = qbf(rng.next_unit() * scale);
+    return t;
+}
+
+// Upload a CPU FP32 tensor's values as a BF16 CUDA tensor of the same shape.
+Tensor to_bf16_cuda_local(const Tensor& cpu) {
+    const int n = cpu.size();
+    std::vector<uint16_t> h(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_bf16_bits(cpu[i]);
+    return Tensor::from_host_bf16_on(Device::CUDA, h.data(),
+                                     cpu.rows, cpu.cols);
+}
+
+// Download a BF16 CUDA tensor into a CPU FP32 tensor.
+Tensor bf16_cuda_to_cpu(const Tensor& g) {
+    brotensor::sync_all();
+    std::vector<uint16_t> h = g.to_host_vector_bf16();
+    Tensor out = Tensor::mat(g.rows, g.cols);
+    for (int i = 0; i < out.size(); ++i)
+        out.ptr()[i] = brotensor::bf16_bits_to_fp32(h[i]);
     return out;
 }
 
@@ -127,6 +160,68 @@ void run_dpmpp(int rows, int cols, float sigma_t,
                     1e-2f, 1e-2f);
     compare_tensors(cpu_x0, fp16_cuda_to_cpu(gpu_x0), "dpmpp_x0_out",
                     1e-2f, 1e-2f);
+}
+
+// ─── BF16 runners (BF16-on-CUDA vs FP32 CPU reference, atol/rtol 3e-2) ────
+
+void run_ddim_bf16(int rows, int cols, float alpha_t, float alpha_prev,
+                   float sigma_t, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor x_t = make_qbf_cpu(rows, cols, rng, 1.0f);
+    Tensor eps = make_qbf_cpu(rows, cols, rng, 1.0f);
+
+    Tensor cpu_xp;
+    brotensor::ddim_step(x_t, eps, alpha_t, alpha_prev, sigma_t, cpu_xp);
+
+    Tensor gx = to_bf16_cuda_local(x_t);
+    Tensor ge = to_bf16_cuda_local(eps);
+    Tensor gpu_xp;
+    brotensor::ddim_step(gx, ge, alpha_t, alpha_prev, sigma_t, gpu_xp);
+
+    compare_tensors(cpu_xp, bf16_cuda_to_cpu(gpu_xp), "ddim_step_bf16",
+                    3e-2f, 3e-2f);
+}
+
+void run_euler_bf16(int rows, int cols, float sigma_t, float sigma_prev,
+                    uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor x_t = make_qbf_cpu(rows, cols, rng, 1.0f);
+    Tensor eps = make_qbf_cpu(rows, cols, rng, 1.0f);
+
+    Tensor cpu_xp;
+    brotensor::euler_step(x_t, eps, sigma_t, sigma_prev, cpu_xp);
+
+    Tensor gx = to_bf16_cuda_local(x_t);
+    Tensor ge = to_bf16_cuda_local(eps);
+    Tensor gpu_xp;
+    brotensor::euler_step(gx, ge, sigma_t, sigma_prev, gpu_xp);
+
+    compare_tensors(cpu_xp, bf16_cuda_to_cpu(gpu_xp), "euler_step_bf16",
+                    3e-2f, 3e-2f);
+}
+
+void run_dpmpp_bf16(int rows, int cols, float sigma_t,
+                    float c_xt, float c_x0t, float c_x0prev, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor x_t = make_qbf_cpu(rows, cols, rng, 1.0f);
+    Tensor eps = make_qbf_cpu(rows, cols, rng, 1.0f);
+    Tensor x0p = make_qbf_cpu(rows, cols, rng, 1.0f);
+
+    Tensor cpu_xp, cpu_x0;
+    brotensor::dpmpp_2m_step(x_t, eps, x0p, sigma_t,
+                             c_xt, c_x0t, c_x0prev, cpu_xp, cpu_x0);
+
+    Tensor gx  = to_bf16_cuda_local(x_t);
+    Tensor ge  = to_bf16_cuda_local(eps);
+    Tensor gx0 = to_bf16_cuda_local(x0p);
+    Tensor gpu_xp, gpu_x0;
+    brotensor::dpmpp_2m_step(gx, ge, gx0, sigma_t,
+                             c_xt, c_x0t, c_x0prev, gpu_xp, gpu_x0);
+
+    compare_tensors(cpu_xp, bf16_cuda_to_cpu(gpu_xp), "dpmpp_x_prev_bf16",
+                    3e-2f, 3e-2f);
+    compare_tensors(cpu_x0, bf16_cuda_to_cpu(gpu_x0), "dpmpp_x0_out_bf16",
+                    3e-2f, 3e-2f);
 }
 
 // ─── timestep_embedding — FP32 on both backends ────────────────────────────
@@ -197,6 +292,39 @@ BT_PARITY_TEST(diffusion_timestep_odd) {
 }
 BT_PARITY_TEST(diffusion_timestep_single) {
     run_timestep(1, 256, 10000.0f, 0x7233ull);
+}
+
+// ─── BF16 ddim_step ────────────────────────────────────────────────────────
+BT_PARITY_TEST(diffusion_ddim_bf16_small) {
+    run_ddim_bf16(4, 8, 0.7f, 0.85f, 0.1f, 0x8200ull);
+}
+BT_PARITY_TEST(diffusion_ddim_bf16_wide) {
+    run_ddim_bf16(2, 64, 0.45f, 0.6f, 0.2f, 0x8201ull);
+}
+BT_PARITY_TEST(diffusion_ddim_bf16_zero_sigma) {
+    run_ddim_bf16(3, 16, 0.9f, 0.95f, 0.0f, 0x8202ull);
+}
+
+// ─── BF16 euler_step ───────────────────────────────────────────────────────
+BT_PARITY_TEST(diffusion_euler_bf16_small) {
+    run_euler_bf16(4, 8, 5.0f, 3.0f, 0x8210ull);
+}
+BT_PARITY_TEST(diffusion_euler_bf16_wide) {
+    run_euler_bf16(2, 64, 10.0f, 7.5f, 0x8211ull);
+}
+BT_PARITY_TEST(diffusion_euler_bf16_final) {
+    run_euler_bf16(3, 16, 1.0f, 0.0f, 0x8212ull);
+}
+
+// ─── BF16 dpmpp_2m_step ────────────────────────────────────────────────────
+BT_PARITY_TEST(diffusion_dpmpp_bf16_small) {
+    run_dpmpp_bf16(4, 8, 4.0f, 0.6f, 0.5f, -0.1f, 0x8220ull);
+}
+BT_PARITY_TEST(diffusion_dpmpp_bf16_wide) {
+    run_dpmpp_bf16(2, 64, 8.0f, 0.5f, 0.7f, -0.2f, 0x8221ull);
+}
+BT_PARITY_TEST(diffusion_dpmpp_bf16_neg_coef) {
+    run_dpmpp_bf16(3, 32, 2.5f, 0.55f, 0.65f, -0.2f, 0x8222ull);
 }
 
 int main() { return run_all("diffusion sampler cpu/gpu parity"); }

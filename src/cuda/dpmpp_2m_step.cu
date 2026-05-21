@@ -1,4 +1,4 @@
-// Fused DPM-Solver++ 2M sampler step (FP16). Multistep, ε-prediction.
+// Fused DPM-Solver++ 2M sampler step (FP16 / BF16). Multistep, ε-prediction.
 //
 // The caller maintains a running x0 cache. On step t the caller passes:
 //   x_t       : current latent
@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -58,6 +59,25 @@ __global__ void dpmpp_2m_step_kernel(const __half* __restrict__ x_t,
     x0_out[i] = __float2half(x0t);
 }
 
+__global__ void dpmpp_2m_step_bf16_kernel(const __nv_bfloat16* __restrict__ x_t,
+                                          const __nv_bfloat16* __restrict__ eps_pred,
+                                          const __nv_bfloat16* __restrict__ x0_prev,
+                                          __nv_bfloat16* __restrict__ x_prev,
+                                          __nv_bfloat16* __restrict__ x0_out,
+                                          float sigma_t,
+                                          float c_xt, float c_x0t, float c_x0prev,
+                                          int total) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const float xt   = __bfloat162float(x_t[i]);
+    const float eps  = __bfloat162float(eps_pred[i]);
+    const float x0p  = __bfloat162float(x0_prev[i]);
+    const float x0t  = xt - sigma_t * eps;
+    const float xp   = c_xt * xt + c_x0t * x0t + c_x0prev * x0p;
+    x_prev[i] = __float2bfloat16(xp);
+    x0_out[i] = __float2bfloat16(x0t);
+}
+
 } // namespace
 
 void dpmpp_2m_step(const ::brotensor::Tensor& x_t,
@@ -67,19 +87,22 @@ void dpmpp_2m_step(const ::brotensor::Tensor& x_t,
                    float c_xt, float c_x0t, float c_x0prev,
                    ::brotensor::Tensor& x_prev,
                    ::brotensor::Tensor& x0_out) {
-    if (x_t.dtype != Dtype::FP16 || eps_pred.dtype != Dtype::FP16 ||
-        x0_prev.dtype != Dtype::FP16) {
-        throw std::runtime_error("dpmpp_2m_step: all inputs must be FP16");
+    const Dtype dtype = x_t.dtype;
+    if (dtype != Dtype::FP16 && dtype != Dtype::BF16) {
+        throw std::runtime_error("dpmpp_2m_step: all inputs must be FP16 or BF16");
+    }
+    if (eps_pred.dtype != dtype || x0_prev.dtype != dtype) {
+        throw std::runtime_error("dpmpp_2m_step: all inputs must have the same dtype");
     }
     if (x_t.rows != eps_pred.rows || x_t.cols != eps_pred.cols ||
         x_t.rows != x0_prev.rows  || x_t.cols != x0_prev.cols) {
         throw std::runtime_error("dpmpp_2m_step: shape mismatch");
     }
-    if (x_prev.rows != x_t.rows || x_prev.cols != x_t.cols || x_prev.dtype != Dtype::FP16) {
-        x_prev.resize(x_t.rows, x_t.cols, Dtype::FP16);
+    if (x_prev.rows != x_t.rows || x_prev.cols != x_t.cols || x_prev.dtype != dtype) {
+        x_prev.resize(x_t.rows, x_t.cols, dtype);
     }
-    if (x0_out.rows != x_t.rows || x0_out.cols != x_t.cols || x0_out.dtype != Dtype::FP16) {
-        x0_out.resize(x_t.rows, x_t.cols, Dtype::FP16);
+    if (x0_out.rows != x_t.rows || x0_out.cols != x_t.cols || x0_out.dtype != dtype) {
+        x0_out.resize(x_t.rows, x_t.cols, dtype);
     }
     const int total = x_t.size();
     if (total == 0) return;
@@ -87,13 +110,23 @@ void dpmpp_2m_step(const ::brotensor::Tensor& x_t,
     const int blocks = (total + DPMPP_BLOCK - 1) / DPMPP_BLOCK;
     cudaStream_t stream =
         reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
-    dpmpp_2m_step_kernel<<<blocks, DPMPP_BLOCK, 0, stream>>>(
-        static_cast<const __half*>(x_t.data),
-        static_cast<const __half*>(eps_pred.data),
-        static_cast<const __half*>(x0_prev.data),
-        static_cast<__half*>(x_prev.data),
-        static_cast<__half*>(x0_out.data),
-        sigma_t, c_xt, c_x0t, c_x0prev, total);
+    if (dtype == Dtype::FP16) {
+        dpmpp_2m_step_kernel<<<blocks, DPMPP_BLOCK, 0, stream>>>(
+            static_cast<const __half*>(x_t.data),
+            static_cast<const __half*>(eps_pred.data),
+            static_cast<const __half*>(x0_prev.data),
+            static_cast<__half*>(x_prev.data),
+            static_cast<__half*>(x0_out.data),
+            sigma_t, c_xt, c_x0t, c_x0prev, total);
+    } else {
+        dpmpp_2m_step_bf16_kernel<<<blocks, DPMPP_BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x_t.data),
+            static_cast<const __nv_bfloat16*>(eps_pred.data),
+            static_cast<const __nv_bfloat16*>(x0_prev.data),
+            static_cast<__nv_bfloat16*>(x_prev.data),
+            static_cast<__nv_bfloat16*>(x0_out.data),
+            sigma_t, c_xt, c_x0t, c_x0prev, total);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
