@@ -108,11 +108,15 @@ struct Tensor {
     static Tensor from_host(const float* src, int r, int c);
     static Tensor from_host_fp16(const uint16_t* src, int r, int c);
     static Tensor from_host_bf16(const uint16_t* src, int r, int c);
+    // INT8 weights (W8A16): `r * c` int8_t values, e.g. the output of
+    // quantize_int8_per_row_host paired with FP32 per-row dequant scales.
+    static Tensor from_host_int8(const int8_t* src, int r, int c);
 
     // Variant that pins to a specific device, bypassing the default.
     static Tensor from_host_on(Device, const float* src, int r, int c);
     static Tensor from_host_fp16_on(Device, const uint16_t* src, int r, int c);
     static Tensor from_host_bf16_on(Device, const uint16_t* src, int r, int c);
+    static Tensor from_host_int8_on(Device, const int8_t* src, int r, int c);
 
     // Non-owning view over an existing backend-resident pointer. The
     // returned tensor's destructor will NOT free `data`. Caller is

@@ -306,6 +306,18 @@ Tensor Tensor::from_host_bf16_on(Device d, const uint16_t* src, int r, int c) {
     return t;
 }
 
+Tensor Tensor::from_host_int8_on(Device d, const int8_t* src, int r, int c) {
+    Tensor t = empty_on(d, r, c, Dtype::INT8);
+    const std::size_t n = t.bytes();
+    if (n == 0) return t;
+    if (d == Device::CPU) {
+        std::memcpy(t.data, src, n);
+    } else {
+        detail::alloc_for(d).memcpy_h2d(t.data, src, n);
+    }
+    return t;
+}
+
 Tensor Tensor::from_host(const float* src, int r, int c) {
     return from_host_on(default_device(), src, r, c);
 }
@@ -316,6 +328,10 @@ Tensor Tensor::from_host_fp16(const uint16_t* src, int r, int c) {
 
 Tensor Tensor::from_host_bf16(const uint16_t* src, int r, int c) {
     return from_host_bf16_on(default_device(), src, r, c);
+}
+
+Tensor Tensor::from_host_int8(const int8_t* src, int r, int c) {
+    return from_host_int8_on(default_device(), src, r, c);
 }
 
 Tensor Tensor::view(Device d, void* data, int r, int c, Dtype dt) {
