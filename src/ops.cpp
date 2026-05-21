@@ -1196,6 +1196,24 @@ void rope_backward(const Tensor& dY, int head_dim, int num_heads,
     v.rope_backward(dY, head_dim, num_heads, seq_offset, theta_base, dX);
 }
 
+void rope_apply(const Tensor& X, const Tensor& cos_tbl, const Tensor& sin_tbl,
+                int head_dim, int num_heads, Tensor& Y) {
+    const auto& v = detail::dispatch(X, cos_tbl, sin_tbl, Y);
+    if (!v.rope_apply) detail::throw_not_implemented("rope_apply", X.device);
+    detail::adopt_output(Y, X.device);
+    v.rope_apply(X, cos_tbl, sin_tbl, head_dim, num_heads, Y);
+}
+
+void rope_apply_backward(const Tensor& dY, const Tensor& cos_tbl,
+                         const Tensor& sin_tbl, int head_dim, int num_heads,
+                         Tensor& dX) {
+    const auto& v = detail::dispatch(dY, cos_tbl, sin_tbl, dX);
+    if (!v.rope_apply_backward)
+        detail::throw_not_implemented("rope_apply_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.rope_apply_backward(dY, cos_tbl, sin_tbl, head_dim, num_heads, dX);
+}
+
 void rms_norm_forward(const Tensor& X, const Tensor& gamma, float eps, Tensor& Y) {
     const auto& v = detail::dispatch(X, gamma, Y);
     if (!v.rms_norm_forward) detail::throw_not_implemented("rms_norm_forward", X.device);

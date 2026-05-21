@@ -525,6 +525,15 @@ void modulate(const ::brotensor::Tensor& X, const ::brotensor::Tensor& scale,
 void broadcast_mul(const ::brotensor::Tensor& X, const ::brotensor::Tensor& v,
                    ::brotensor::Tensor& Y);
 
+// ── RoPE with explicit cos/sin tables — rope.cpp ──
+void rope_apply(const ::brotensor::Tensor& X, const ::brotensor::Tensor& cos_tbl,
+                const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads,
+                ::brotensor::Tensor& Y);
+void rope_apply_backward(const ::brotensor::Tensor& dY,
+                         const ::brotensor::Tensor& cos_tbl,
+                         const ::brotensor::Tensor& sin_tbl,
+                         int head_dim, int num_heads, ::brotensor::Tensor& dX);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -672,6 +681,8 @@ struct CpuStaticRegistrar {
         // ── DiT / diffusion extras ──
         ops.modulate                     = &detail::cpu::modulate;
         ops.broadcast_mul                = &detail::cpu::broadcast_mul;
+        ops.rope_apply                   = &detail::cpu::rope_apply;
+        ops.rope_apply_backward          = &detail::cpu::rope_apply_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

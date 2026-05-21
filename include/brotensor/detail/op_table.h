@@ -333,4 +333,11 @@
     /* ─── DiT / diffusion extras: AdaLN modulation, axial RoPE, T5-bias attention ─── */                                                                               \
     X(modulate,                                void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& scale,                                                   \
                                                        const ::brotensor::Tensor& shift, ::brotensor::Tensor& Y))                                                        \
-    X(broadcast_mul,                           void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& v, ::brotensor::Tensor& Y))
+    X(broadcast_mul,                           void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& v, ::brotensor::Tensor& Y))         \
+    X(rope_apply,                              void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& cos_tbl,                                                  \
+                                                       const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads, ::brotensor::Tensor& Y))                         \
+    X(rope_apply_backward,                     void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& cos_tbl,                                                 \
+                                                       const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads, ::brotensor::Tensor& dX))                        \
+    X(self_attention_bias_forward,             void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,                        \
+                                                       const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo, const float* d_mask,                                \
+                                                       const ::brotensor::Tensor* attn_bias, int num_heads, ::brotensor::Tensor& O))

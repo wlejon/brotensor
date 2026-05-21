@@ -1615,6 +1615,38 @@ void rope_forward(const Tensor& X, int head_dim, int num_heads,
 void rope_backward(const Tensor& dY, int head_dim, int num_heads,
                   int seq_offset, float theta_base, Tensor& dX);
 
+// RoPE with explicit, caller-supplied cos / sin rotation tables.
+//
+// Unlike rope_forward — which derives the angle from row index + seq_offset —
+// this variant takes a precomputed per-(row, pair) table, so the caller owns
+// all position semantics. It handles arbitrary explicit position ids and,
+// crucially, 2D axial RoPE (Flux / SD3): the caller assigns each frequency
+// pair to a height / width / text axis and bakes the resulting angle into the
+// table. brotensor stays layout-agnostic; the kernel just applies the rotation.
+//
+//   x_{2i}   ← x_{2i} * cos_tbl[row,i] - x_{2i+1} * sin_tbl[row,i]
+//   x_{2i+1} ← x_{2i} * sin_tbl[row,i] + x_{2i+1} * cos_tbl[row,i]
+//
+//   X:       (L, num_heads * head_dim)  input
+//   cos_tbl: (L, head_dim/2)  FP32 — cos of the rotation angle per (row, pair)
+//   sin_tbl: (L, head_dim/2)  FP32 — sin of the rotation angle per (row, pair)
+//   Y:       (L, num_heads * head_dim)  output, resized + dtype-set to match X
+// The same cos/sin row is shared across all heads. head_dim must be even.
+// cos_tbl / sin_tbl are FP32 on any backend; X / Y dispatch on X.dtype
+// (FP32 / FP16 / BF16). FP32 internal math.
+void rope_apply(const Tensor& X, const Tensor& cos_tbl, const Tensor& sin_tbl,
+                int head_dim, int num_heads, Tensor& Y);
+
+// RoPE-with-tables backward — applies the inverse (transpose) rotation:
+//   dX_{2i}   ←  dY_{2i} * cos_tbl[row,i] + dY_{2i+1} * sin_tbl[row,i]
+//   dX_{2i+1} ← -dY_{2i} * sin_tbl[row,i] + dY_{2i+1} * cos_tbl[row,i]
+//   dY: (L, num_heads * head_dim)
+//   dX: (L, num_heads * head_dim) — resized + dtype-set to match dY.
+// cos_tbl / sin_tbl as in rope_apply. Dispatched on dY.dtype.
+void rope_apply_backward(const Tensor& dY, const Tensor& cos_tbl,
+                         const Tensor& sin_tbl, int head_dim, int num_heads,
+                         Tensor& dX);
+
 // RMSNorm forward, per row:
 //   rms[b] = sqrt(mean_j x[b, j]^2 + eps)
 //   y[b, j] = x[b, j] * gamma[j] / rms[b]

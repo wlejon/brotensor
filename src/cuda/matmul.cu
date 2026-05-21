@@ -230,6 +230,13 @@ void rope_forward(const ::brotensor::Tensor& X, int head_dim, int num_heads,
                   int seq_offset, float theta_base, ::brotensor::Tensor& Y);
 void rope_backward(const ::brotensor::Tensor& dY, int head_dim, int num_heads,
                    int seq_offset, float theta_base, ::brotensor::Tensor& dX);
+void rope_apply(const ::brotensor::Tensor& X, const ::brotensor::Tensor& cos_tbl,
+                const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads,
+                ::brotensor::Tensor& Y);
+void rope_apply_backward(const ::brotensor::Tensor& dY,
+                         const ::brotensor::Tensor& cos_tbl,
+                         const ::brotensor::Tensor& sin_tbl,
+                         int head_dim, int num_heads, ::brotensor::Tensor& dX);
 void softmax_forward(const ::brotensor::Tensor& logits,
                      ::brotensor::Tensor& probs, const float* mask);
 void softmax_backward(const ::brotensor::Tensor& probs,
@@ -277,6 +284,8 @@ void fill_cuda_vtable_utils(::brotensor::detail::OpsVTable& v) {
     v.matmul_int8w_fp16                   = &matmul_int8w_fp16;
     v.rope_forward                        = &rope_forward;
     v.rope_backward                       = &rope_backward;
+    v.rope_apply                          = &rope_apply;
+    v.rope_apply_backward                 = &rope_apply_backward;
     v.softmax_forward                     = &softmax_forward;
     v.softmax_backward                    = &softmax_backward;
     v.sgd_step                            = &sgd_step;
