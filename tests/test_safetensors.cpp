@@ -140,6 +140,12 @@ int main() {
 
     // Writer round-trip: write_file() then read it back.
     auto rt_path = std::filesystem::temp_directory_path() / "brotensor_st_roundtrip.safetensors";
+    // BF16 payload: round 1..4 to BF16 bit patterns (each exactly
+    // representable, so the round-trip is lossless).
+    uint16_t delta_bf16[4];
+    for (int i = 0; i < 4; ++i) {
+        delta_bf16[i] = brotensor::fp32_to_bf16_bits(static_cast<float>(i + 1));
+    }
     {
         float gamma[6] = {10.f, 20.f, 30.f, 40.f, 50.f, 60.f};
         std::vector<st::WriteEntry> entries;
@@ -150,11 +156,20 @@ int main() {
         e.host_data = gamma;
         e.bytes = sizeof(gamma);
         entries.push_back(e);
+
+        st::WriteEntry d;
+        d.name = "delta";
+        d.dtype = st::Dtype::BF16;
+        d.shape = {4};
+        d.host_data = delta_bf16;
+        d.bytes = sizeof(delta_bf16);
+        entries.push_back(d);
+
         st::write_file(rt_path.string(), entries);
     }
     {
         auto file = st::File::open(rt_path.string());
-        CHECK(file.size() == 1);
+        CHECK(file.size() == 2);
         const auto* g = file.find("gamma");
         CHECK(g != nullptr);
         if (g) {
@@ -162,6 +177,21 @@ int main() {
             CHECK(g->shape.size() == 2 && g->shape[0] == 3 && g->shape[1] == 2);
             const float* fp = reinterpret_cast<const float*>(g->data);
             CHECK(fp[0] == 10.f && fp[5] == 60.f);
+        }
+        const auto* d = file.find("delta");
+        CHECK(d != nullptr);
+        if (d) {
+            CHECK(d->dtype == st::Dtype::BF16);
+            CHECK(d->shape.size() == 1 && d->shape[0] == 4);
+            CHECK(d->nbytes == 8);
+            // Raw BF16 bit patterns survive the write/read unchanged.
+            const uint16_t* hp = reinterpret_cast<const uint16_t*>(d->data);
+            for (int i = 0; i < 4; ++i) CHECK(hp[i] == delta_bf16[i]);
+            // upload_compute widens the BF16 view back to FP32.
+            brotensor::Tensor t;
+            st::upload_compute(*d, 4, 1, t);
+            CHECK(t.dtype == brotensor::Dtype::FP32);
+            CHECK(t.at(0, 0) == 1.0f && t.at(3, 0) == 4.0f);
         }
     }
 

@@ -58,6 +58,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.attention_backward                          = &dm::attention_backward;
     ops.attention_forward                           = &dm::attention_forward;
     ops.attention_token_moments                     = &dm::attention_token_moments;
+    ops.broadcast_mul                               = &dm::broadcast_mul;
     ops.build_causal_mask_row                       = &dm::build_causal_mask_row;
     ops.build_slot_mask                             = &dm::build_slot_mask;
     ops.cast                                        = &dm::cast;
@@ -121,6 +122,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.matmul_int8w_fp16                           = &dm::matmul_int8w_fp16;
     ops.mha_backward                                = &dm::mha_backward;
     ops.mha_forward                                 = &dm::mha_forward;
+    ops.modulate                                    = &dm::modulate;
     ops.mse_vec_backward                            = &dm::mse_vec_backward;
     ops.mse_vec_forward                             = &dm::mse_vec_forward;
     ops.mse_vec_per_sample                          = &dm::mse_vec_per_sample;
@@ -137,10 +139,13 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.resblock_forward_int8w_fp16                 = &dm::resblock_forward_int8w_fp16;
     ops.rms_norm_backward                           = &dm::rms_norm_backward;
     ops.rms_norm_forward                            = &dm::rms_norm_forward;
+    ops.rope_apply                                  = &dm::rope_apply;
+    ops.rope_apply_backward                         = &dm::rope_apply_backward;
     ops.rope_backward                               = &dm::rope_backward;
     ops.rope_forward                                = &dm::rope_forward;
     ops.scale_inplace                               = &dm::scale_inplace;
     ops.self_attention_backward                     = &dm::self_attention_backward;
+    ops.self_attention_bias_forward                 = &dm::self_attention_bias_forward;
     ops.self_attention_forward                      = &dm::self_attention_forward;
     ops.self_attention_forward_train                = &dm::self_attention_forward_train;
     ops.sequence_to_nchw                            = &dm::sequence_to_nchw;

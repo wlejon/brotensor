@@ -31,6 +31,7 @@ endfunction()
 brotensor_add_test(brotensor_test_cpu_ops test_cpu_ops.cpp)
 brotensor_add_test(brotensor_test_dispatch test_dispatch.cpp)
 brotensor_add_test(brotensor_test_safetensors test_safetensors.cpp)
+brotensor_add_test(brotensor_test_bf16_basics test_bf16_basics.cpp)
 
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)

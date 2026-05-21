@@ -224,6 +224,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/dpmpp_2m_step.mm
         src/metal/timestep_embedding.mm
         src/metal/int8_quant.mm
+        src/metal/modulate.mm
+        src/metal/self_attention_bias.mm
         src/metal/register.mm
     )
     set_source_files_properties(
@@ -267,6 +269,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/dpmpp_2m_step.mm
         src/metal/timestep_embedding.mm
         src/metal/int8_quant.mm
+        src/metal/modulate.mm
+        src/metal/self_attention_bias.mm
         src/metal/register.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"

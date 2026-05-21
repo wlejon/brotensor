@@ -106,6 +106,53 @@ void run_cast_passthrough(int r, int c, uint64_t seed) {
     compare_tensors(dst_cpu, download_to_host(gdst), "cast.passthrough");
 }
 
+void run_cast_fp32_to_bf16(int r, int c, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor src = Tensor::mat(r, c);
+    fill_random(src, rng);
+
+    Tensor dst_cpu;
+    brotensor::cast(src, dst_cpu, Dtype::BF16);
+    BT_CHECK(dst_cpu.dtype == Dtype::BF16);
+    BT_CHECK(dst_cpu.rows == r && dst_cpu.cols == c);
+
+    Tensor gsrc = src.to(gpu_device());
+    Tensor gdst;
+    brotensor::cast(gsrc, gdst, Dtype::BF16);
+    BT_CHECK(gdst.dtype == Dtype::BF16);
+
+    // CPU and GPU both round the same FP32 source to BF16 with round-to-
+    // nearest-even, so the bit patterns must match exactly.
+    std::vector<uint16_t> cpu_bits = dst_cpu.to_host_vector_bf16();
+    std::vector<uint16_t> gpu_bits = gdst.to_host_vector_bf16();
+    BT_CHECK(cpu_bits.size() == gpu_bits.size());
+    for (size_t i = 0; i < cpu_bits.size(); ++i) {
+        BT_CHECK(cpu_bits[i] == gpu_bits[i]);
+    }
+}
+
+void run_cast_bf16_to_fp32(int r, int c, uint64_t seed) {
+    SplitMix64 rng(seed);
+    // Build a BF16 source by casting a random FP32 tensor down first.
+    Tensor src_fp32 = Tensor::mat(r, c);
+    fill_random(src_fp32, rng);
+    Tensor src_bf16;
+    brotensor::cast(src_fp32, src_bf16, Dtype::BF16);
+
+    Tensor dst_cpu;
+    brotensor::cast(src_bf16, dst_cpu, Dtype::FP32);
+    BT_CHECK(dst_cpu.dtype == Dtype::FP32);
+
+    Tensor gsrc = src_bf16.to(gpu_device());
+    Tensor gdst;
+    brotensor::cast(gsrc, gdst, Dtype::FP32);
+    BT_CHECK(gdst.dtype == Dtype::FP32);
+
+    // BF16->FP32 widening is lossless: CPU and GPU must agree exactly.
+    compare_tensors(dst_cpu, download_to_host(gdst), "cast.bf16_to_fp32",
+                    0.0f, 0.0f);
+}
+
 // ─── copy_d2d ──────────────────────────────────────────────────────────────
 //
 // Flat-buffer sub-range copy. Verify a partial copy leaves the untouched
@@ -186,6 +233,10 @@ BT_PARITY_TEST(cast_fp16_to_fp32_small)  { run_cast_fp16_to_fp32(4, 8, 0x212ull)
 BT_PARITY_TEST(cast_fp16_to_fp32_medium) { run_cast_fp16_to_fp32(16, 64, 0x213ull); }
 BT_PARITY_TEST(cast_passthrough_small)   { run_cast_passthrough(4, 8, 0x214ull); }
 BT_PARITY_TEST(cast_passthrough_medium)  { run_cast_passthrough(32, 32, 0x215ull); }
+BT_PARITY_TEST(cast_fp32_to_bf16_small)  { run_cast_fp32_to_bf16(4, 8, 0x216ull); }
+BT_PARITY_TEST(cast_fp32_to_bf16_medium) { run_cast_fp32_to_bf16(16, 64, 0x217ull); }
+BT_PARITY_TEST(cast_bf16_to_fp32_small)  { run_cast_bf16_to_fp32(4, 8, 0x218ull); }
+BT_PARITY_TEST(cast_bf16_to_fp32_medium) { run_cast_bf16_to_fp32(16, 64, 0x219ull); }
 
 // ─── copy_d2d ──────────────────────────────────────────────────────────────
 BT_PARITY_TEST(copy_d2d_partial)  { run_copy_d2d(16, 16, 3, 5, 6, 0x220ull); }
