@@ -1,8 +1,11 @@
-// Fused Euler-discrete sampler step (FP16 / BF16). ε-prediction; σ convention
-// matching diffusers' EulerDiscreteScheduler.
+// Fused first-order Euler sampler step (FP16 / BF16).
 //
 //   x_prev = x_t + (sigma_prev - sigma_t) * eps_pred
 //
+// The kernel never interprets `eps_pred` — it covers both ε / k-diffusion
+// EulerDiscreteScheduler (pass the derivative) and flow-matching / rectified-
+// flow velocity prediction (pass the velocity v; the update x += dσ·v is the
+// same formula). See the euler_step doc in <brotensor/ops.h>.
 // One elementwise kernel; FP32 internal math.
 
 #include <brotensor/runtime.h>

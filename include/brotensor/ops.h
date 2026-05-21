@@ -1774,10 +1774,22 @@ void ddim_step(const Tensor& x_t, const Tensor& eps_pred,
                float alpha_t, float alpha_prev, float sigma_t,
                Tensor& x_prev);
 
-// ─── Fused Euler-discrete sampler step (FP16) ──────────────────────────────
+// ─── Fused first-order Euler sampler step (FP16) ───────────────────────────
 //
-// ε-prediction, σ convention matching diffusers' EulerDiscreteScheduler:
+// One first-order Euler update, applied element-wise:
 //   x_prev = x_t + (sigma_prev - sigma_t) * eps_pred
+//
+// This is the generic Euler step and covers BOTH common prediction
+// parameterisations — the kernel never interprets `eps_pred`, it only scales
+// it by the σ step:
+//   • ε / k-diffusion EulerDiscreteScheduler: pass the model's derivative
+//     d = (x - denoised)/sigma as `eps_pred`, the σ schedule as sigma_t /
+//     sigma_prev.
+//   • Flow-matching / rectified-flow (Flux, SD3): the model predicts the
+//     velocity v directly and the update is x += (sigma_next - sigma_t) * v —
+//     identical to the formula above. Pass the velocity v as `eps_pred` and
+//     the flow-match σ schedule as sigma_t (current) / sigma_prev (next).
+//
 // FP16 inputs and outputs; FP32 internal math. x_t and eps_pred must share
 // shape; x_prev is resized to match.
 void euler_step(const Tensor& x_t, const Tensor& eps_pred,
