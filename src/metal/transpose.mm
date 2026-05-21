@@ -77,6 +77,36 @@ kernel void k_seq_to_nchw_fp16(device const half*  X [[buffer(0)]],
     uint n = t / C;
     Y[idx] = X[(n * HW + p) * C + c];
 }
+
+kernel void k_nchw_to_seq_bf16(device const bfloat* X [[buffer(0)]],
+                               device bfloat*        Y [[buffer(1)]],
+                               constant uint& N        [[buffer(2)]],
+                               constant uint& C        [[buffer(3)]],
+                               constant uint& HW       [[buffer(4)]],
+                               constant uint& total    [[buffer(5)]],
+                               uint idx [[thread_position_in_grid]]) {
+    if (idx >= total) return;
+    uint c = idx % C;
+    uint t = idx / C;
+    uint p = t % HW;
+    uint n = t / HW;
+    Y[idx] = X[(n * C + c) * HW + p];
+}
+
+kernel void k_seq_to_nchw_bf16(device const bfloat* X [[buffer(0)]],
+                               device bfloat*        Y [[buffer(1)]],
+                               constant uint& N        [[buffer(2)]],
+                               constant uint& C        [[buffer(3)]],
+                               constant uint& HW       [[buffer(4)]],
+                               constant uint& total    [[buffer(5)]],
+                               uint idx [[thread_position_in_grid]]) {
+    if (idx >= total) return;
+    uint p = idx % HW;
+    uint t = idx / HW;
+    uint c = t % C;
+    uint n = t / C;
+    Y[idx] = X[(n * HW + p) * C + c];
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -88,8 +118,10 @@ kernel void k_seq_to_nchw_fp16(device const half*  X [[buffer(0)]],
     }
 DEF_PSO(pso_nchw_to_seq_fp32, @"k_nchw_to_seq_fp32")
 DEF_PSO(pso_nchw_to_seq_fp16, @"k_nchw_to_seq_fp16")
+DEF_PSO(pso_nchw_to_seq_bf16, @"k_nchw_to_seq_bf16")
 DEF_PSO(pso_seq_to_nchw_fp32, @"k_seq_to_nchw_fp32")
 DEF_PSO(pso_seq_to_nchw_fp16, @"k_seq_to_nchw_fp16")
+DEF_PSO(pso_seq_to_nchw_bf16, @"k_seq_to_nchw_bf16")
 #undef DEF_PSO
 
 void launch_transpose(id<MTLComputePipelineState> pso,
@@ -141,7 +173,9 @@ void nchw_to_sequence(const Tensor& X,
     }
     const uint32_t total = static_cast<uint32_t>(rows) * static_cast<uint32_t>(C);
     id<MTLComputePipelineState> pso =
-        (X.dtype == Dtype::FP16) ? pso_nchw_to_seq_fp16() : pso_nchw_to_seq_fp32();
+        (X.dtype == Dtype::FP16) ? pso_nchw_to_seq_fp16()
+      : (X.dtype == Dtype::BF16) ? pso_nchw_to_seq_bf16()
+      : pso_nchw_to_seq_fp32();
     launch_transpose(pso, X, Y, N, C, HW, total);
 }
 
@@ -156,7 +190,9 @@ void sequence_to_nchw(const Tensor& X,
     }
     const uint32_t total = static_cast<uint32_t>(N) * static_cast<uint32_t>(cols);
     id<MTLComputePipelineState> pso =
-        (X.dtype == Dtype::FP16) ? pso_seq_to_nchw_fp16() : pso_seq_to_nchw_fp32();
+        (X.dtype == Dtype::FP16) ? pso_seq_to_nchw_fp16()
+      : (X.dtype == Dtype::BF16) ? pso_seq_to_nchw_bf16()
+      : pso_seq_to_nchw_fp32();
     launch_transpose(pso, X, Y, N, C, HW, total);
 }
 

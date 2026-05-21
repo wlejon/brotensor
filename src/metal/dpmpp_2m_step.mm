@@ -39,12 +39,38 @@ kernel void k_dpmpp_2m_step(device const half* x_t      [[buffer(0)]],
     x_prev[gid] = half(c_xt * xt + c_x0t * x0t + c_x0prev * x0p);
     x0_out[gid] = half(x0t);
 }
+
+kernel void k_dpmpp_2m_step_bf16(device const bfloat* x_t      [[buffer(0)]],
+                                 device const bfloat* eps_pred [[buffer(1)]],
+                                 device const bfloat* x0_prev  [[buffer(2)]],
+                                 device bfloat*       x_prev   [[buffer(3)]],
+                                 device bfloat*       x0_out   [[buffer(4)]],
+                                 constant float& sigma_t       [[buffer(5)]],
+                                 constant float& c_xt          [[buffer(6)]],
+                                 constant float& c_x0t         [[buffer(7)]],
+                                 constant float& c_x0prev      [[buffer(8)]],
+                                 constant uint&  total         [[buffer(9)]],
+                                 uint gid [[thread_position_in_grid]]) {
+    if (gid >= total) return;
+    float xt  = float(x_t[gid]);
+    float eps = float(eps_pred[gid]);
+    float x0p = float(x0_prev[gid]);
+    float x0t = xt - sigma_t * eps;
+    x_prev[gid] = bfloat(c_xt * xt + c_x0t * x0t + c_x0prev * x0p);
+    x0_out[gid] = bfloat(x0t);
+}
 )msl";
 
 id<MTLComputePipelineState> pso() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> p;
     dispatch_once(&once, ^{ p = compile_pipeline(kSrc, @"k_dpmpp_2m_step"); });
+    return p;
+}
+id<MTLComputePipelineState> pso_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> p;
+    dispatch_once(&once, ^{ p = compile_pipeline(kSrc, @"k_dpmpp_2m_step_bf16"); });
     return p;
 }
 
@@ -55,26 +81,26 @@ void dpmpp_2m_step(const Tensor& x_t, const Tensor& eps_pred,
                    float sigma_t,
                    float c_xt, float c_x0t, float c_x0prev,
                    Tensor& x_prev, Tensor& x0_out) {
-    if (x_t.dtype != Dtype::FP16 || eps_pred.dtype != Dtype::FP16 ||
-        x0_prev.dtype != Dtype::FP16) {
-        throw std::runtime_error("dpmpp_2m_step_gpu: all inputs must be FP16");
+    if ((x_t.dtype != Dtype::FP16 && x_t.dtype != Dtype::BF16) ||
+        eps_pred.dtype != x_t.dtype || x0_prev.dtype != x_t.dtype) {
+        throw std::runtime_error("dpmpp_2m_step_gpu: all inputs must be FP16 or all BF16");
     }
     if (x_t.rows != eps_pred.rows || x_t.cols != eps_pred.cols ||
         x_t.rows != x0_prev.rows  || x_t.cols != x0_prev.cols) {
         throw std::runtime_error("dpmpp_2m_step_gpu: shape mismatch");
     }
     if (x_prev.rows != x_t.rows || x_prev.cols != x_t.cols ||
-        x_prev.dtype != Dtype::FP16) {
-        x_prev.resize(x_t.rows, x_t.cols, Dtype::FP16);
+        x_prev.dtype != x_t.dtype) {
+        x_prev.resize(x_t.rows, x_t.cols, x_t.dtype);
     }
     if (x0_out.rows != x_t.rows || x0_out.cols != x_t.cols ||
-        x0_out.dtype != Dtype::FP16) {
-        x0_out.resize(x_t.rows, x_t.cols, Dtype::FP16);
+        x0_out.dtype != x_t.dtype) {
+        x0_out.resize(x_t.rows, x_t.cols, x_t.dtype);
     }
     const NSUInteger total = static_cast<NSUInteger>(x_t.size());
     if (total == 0) return;
 
-    id<MTLComputePipelineState> p = pso();
+    id<MTLComputePipelineState> p = (x_t.dtype == Dtype::BF16) ? pso_bf16() : pso();
     id<MTLBuffer> bXt = buffer_for(x_t);
     id<MTLBuffer> bE  = buffer_for(eps_pred);
     id<MTLBuffer> bX0p= buffer_for(x0_prev);

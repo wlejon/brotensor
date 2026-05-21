@@ -294,7 +294,7 @@ kernel void k_conv2d_backward_bias_fp32_to_scratch(
     if (tid == 0) dB_scratch[c_out] = s_acc[0];
 }
 
-// Fold FP32 scratch into FP16/FP32 destination (add).
+// Fold FP32 scratch into FP16/FP32/BF16 destination (add).
 kernel void k_conv2d_add_fp32_into_fp16(device const float* src [[buffer(0)]],
                                         device half*        dst [[buffer(1)]],
                                         constant uint& n        [[buffer(2)]],
@@ -308,6 +308,163 @@ kernel void k_conv2d_add_fp32_into_fp32(device const float* src [[buffer(0)]],
                                         uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
     dst[i] += src[i];
+}
+kernel void k_conv2d_add_fp32_into_bf16(device const float* src [[buffer(0)]],
+                                        device bfloat*      dst [[buffer(1)]],
+                                        constant uint& n        [[buffer(2)]],
+                                        uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = bfloat(float(dst[i]) + src[i]);
+}
+
+// ─── BF16 variants (verbatim copies of FP16 kernels with half→bfloat) ───────
+
+// One thread per output element. Direct conv, FP32 accumulator, BF16 IO.
+kernel void k_conv2d_forward_bf16(device const bfloat* X    [[buffer(0)]],
+                                  device const bfloat* Wt   [[buffer(1)]],
+                                  device const bfloat* bias [[buffer(2)]],
+                                  device bfloat*       Y    [[buffer(3)]],
+                                  constant ConvParams& p    [[buffer(4)]],
+                                  uint idx [[thread_position_in_grid]]) {
+    if (idx >= p.total) return;
+    uint ow = idx % p.W_out;
+    uint t  = idx / p.W_out;
+    uint oh = t % p.H_out;
+    t /= p.H_out;
+    uint oc = t % p.C_out;
+    uint n  = t / p.C_out;
+
+    int in_h_origin = int(oh) * p.stride_h - p.pad_h;
+    int in_w_origin = int(ow) * p.stride_w - p.pad_w;
+
+    float acc = 0.0f;
+    uint g_out = oc / p.Cg_out;
+    uint ic_abs_base = g_out * p.Cg_in;
+    uint w_oc_base = oc * p.Cg_in * p.kH * p.kW;
+    uint x_n_base  = n * p.C_in * p.H * p.W;
+
+    for (uint ic_local = 0; ic_local < p.Cg_in; ++ic_local) {
+        uint ic = ic_abs_base + ic_local;
+        uint w_ic_base = w_oc_base + ic_local * p.kH * p.kW;
+        uint x_ic_base = x_n_base  + ic * p.H * p.W;
+        for (uint kh = 0; kh < p.kH; ++kh) {
+            int in_h = in_h_origin + int(kh) * p.dil_h;
+            if (in_h < 0 || in_h >= int(p.H)) continue;
+            for (uint kw = 0; kw < p.kW; ++kw) {
+                int in_w = in_w_origin + int(kw) * p.dil_w;
+                if (in_w < 0 || in_w >= int(p.W)) continue;
+                float x_v = float(X[x_ic_base + uint(in_h) * p.W + uint(in_w)]);
+                float w_v = float(Wt[w_ic_base + kh * p.kW + kw]);
+                acc += x_v * w_v;
+            }
+        }
+    }
+    if (p.has_bias != 0u) {
+        acc += float(bias[oc]);
+    }
+    Y[idx] = bfloat(acc);
+}
+
+kernel void k_conv2d_backward_input_bf16(device const bfloat* Wt [[buffer(0)]],
+                                         device const bfloat* dY [[buffer(1)]],
+                                         device bfloat*       dX [[buffer(2)]],
+                                         constant ConvParams& p  [[buffer(3)]],
+                                         uint idx [[thread_position_in_grid]]) {
+    if (idx >= p.total) return;
+    uint j = idx % p.W;
+    uint t = idx / p.W;
+    uint i = t % p.H;
+    t /= p.H;
+    uint c_in = t % p.C_in;
+    uint n    = t / p.C_in;
+
+    uint g = c_in / p.Cg_in;
+    uint c_in_local = c_in - g * p.Cg_in;
+    uint oc_lo = g * p.Cg_out;
+    uint oc_hi = oc_lo + p.Cg_out;
+
+    float acc = 0.0f;
+    for (uint kh = 0; kh < p.kH; ++kh) {
+        int num_h = int(i) + p.pad_h - p.dil_h * int(kh);
+        if (num_h < 0) continue;
+        if (num_h % p.stride_h != 0) continue;
+        int i_out = num_h / p.stride_h;
+        if (i_out < 0 || i_out >= int(p.H_out)) continue;
+        for (uint kw = 0; kw < p.kW; ++kw) {
+            int num_w = int(j) + p.pad_w - p.dil_w * int(kw);
+            if (num_w < 0) continue;
+            if (num_w % p.stride_w != 0) continue;
+            int j_out = num_w / p.stride_w;
+            if (j_out < 0 || j_out >= int(p.W_out)) continue;
+
+            for (uint c_out = oc_lo; c_out < oc_hi; ++c_out) {
+                uint dy_idx = ((n * p.C_out + c_out) * p.H_out + uint(i_out)) * p.W_out + uint(j_out);
+                uint w_idx  = ((c_out * p.Cg_in + c_in_local) * p.kH + kh) * p.kW + kw;
+                acc += float(dY[dy_idx]) * float(Wt[w_idx]);
+            }
+        }
+    }
+    dX[idx] = bfloat(acc);
+}
+
+kernel void k_conv2d_backward_weight_bf16(device const bfloat* X   [[buffer(0)]],
+                                          device const bfloat* dY  [[buffer(1)]],
+                                          device float*        dWt_scratch [[buffer(2)]],
+                                          constant ConvParams& p   [[buffer(3)]],
+                                          uint idx [[thread_position_in_grid]]) {
+    if (idx >= p.total) return;
+    uint kw = idx % p.kW;
+    uint t  = idx / p.kW;
+    uint kh = t % p.kH;
+    t /= p.kH;
+    uint c_in_local = t % p.Cg_in;
+    uint c_out      = t / p.Cg_in;
+
+    uint g = c_out / p.Cg_out;
+    uint c_in = g * p.Cg_in + c_in_local;
+
+    float acc = 0.0f;
+    for (uint n = 0; n < p.N; ++n) {
+        for (uint i_out = 0; i_out < p.H_out; ++i_out) {
+            int in_h = int(i_out) * p.stride_h - p.pad_h + int(kh) * p.dil_h;
+            if (in_h < 0 || in_h >= int(p.H)) continue;
+            for (uint j_out = 0; j_out < p.W_out; ++j_out) {
+                int in_w = int(j_out) * p.stride_w - p.pad_w + int(kw) * p.dil_w;
+                if (in_w < 0 || in_w >= int(p.W)) continue;
+                uint x_idx  = ((n * p.C_in  + c_in)  * p.H     + uint(in_h))  * p.W     + uint(in_w);
+                uint dy_idx = ((n * p.C_out + c_out) * p.H_out + i_out) * p.W_out + j_out;
+                acc += float(dY[dy_idx]) * float(X[x_idx]);
+            }
+        }
+    }
+    dWt_scratch[idx] = acc;
+}
+
+kernel void k_conv2d_backward_bias_bf16(device const bfloat* dY [[buffer(0)]],
+                                        device float*        dB_scratch [[buffer(1)]],
+                                        constant ConvParams& p  [[buffer(2)]],
+                                        uint  tid    [[thread_position_in_threadgroup]],
+                                        uint  tg_sz  [[threads_per_threadgroup]],
+                                        uint  gid    [[threadgroup_position_in_grid]]) {
+    threadgroup float s_acc[256];
+    const uint c_out = gid;
+    const uint spatial = p.H_out * p.W_out;
+    const uint total_per_chan = p.N * spatial;
+
+    float acc = 0.0f;
+    for (uint i = tid; i < total_per_chan; i += tg_sz) {
+        uint n  = i / spatial;
+        uint sp = i - n * spatial;
+        uint dy_idx = (n * p.C_out + c_out) * spatial + sp;
+        acc += float(dY[dy_idx]);
+    }
+    s_acc[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_sz / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_acc[tid] += s_acc[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) dB_scratch[c_out] = s_acc[0];
 }
 
 // Backward-w.r.t.-input. One thread per input pixel; gather form, no atomics.
@@ -499,6 +656,36 @@ id<MTLComputePipelineState> pso_conv_add_fp32() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_conv2d_add_fp32_into_fp32"); });
     return pso;
 }
+id<MTLComputePipelineState> pso_conv_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_conv2d_forward_bf16"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_conv_bwd_input_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_conv2d_backward_input_bf16"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_conv_bwd_weight_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_conv2d_backward_weight_bf16"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_conv_bwd_bias_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_conv2d_backward_bias_bf16"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_conv_add_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_conv2d_add_fp32_into_bf16"); });
+    return pso;
+}
 
 struct ConvParams {
     uint32_t N, C_in, H, W;
@@ -526,8 +713,8 @@ void conv2d_forward(const Tensor& X,
                         int dil_h, int dil_w,
                         int groups,
                         Tensor& Y) {
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_forward: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("conv2d_forward: X must be FP16, BF16, or FP32");
     }
     if (Wt.dtype != X.dtype) {
         throw std::runtime_error("conv2d_forward: Wt dtype must match X");
@@ -576,6 +763,7 @@ void conv2d_forward(const Tensor& X,
     const NSUInteger ob = bias ? buffer_offset_for(*bias) : 0;
 
     // Fast path: tiled simdgroup-matrix implicit-GEMM for FP16 SD1.5 shapes.
+    // BF16 uses the naive direct-conv path (no simdgroup fast path for BF16).
     if (X.dtype == Dtype::FP16) {
         if (conv2d_wmma_internal::launch_conv2d_implicit_gemm_simdgroup(
                 bx, ox, bw, ow_, bb, ob, bias != nullptr,
@@ -591,6 +779,7 @@ void conv2d_forward(const Tensor& X,
     }
 
     id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_conv_fp16()
+                                   : (X.dtype == Dtype::BF16) ? pso_conv_bf16()
                                                                : pso_conv_fp32();
 
     @autoreleasepool {
@@ -620,8 +809,8 @@ void conv2d_backward_input(const Tensor& Wt,
                                int dil_h, int dil_w,
                            int groups,
                            Tensor& dX) {
-    if (Wt.dtype != Dtype::FP16 && Wt.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_input: Wt must be FP16 or FP32");
+    if (Wt.dtype != Dtype::FP16 && Wt.dtype != Dtype::FP32 && Wt.dtype != Dtype::BF16) {
+        throw std::runtime_error("conv2d_backward_input: Wt must be FP16, BF16, or FP32");
     }
     if (dY.dtype != Wt.dtype) {
         throw std::runtime_error("conv2d_backward_input: dY dtype must match Wt");
@@ -657,8 +846,9 @@ void conv2d_backward_input(const Tensor& Wt,
     p.Cg_in = static_cast<uint32_t>(Cg_in);
     p.Cg_out = static_cast<uint32_t>(Cg_out);
 
-    id<MTLComputePipelineState> pso = (Wt.dtype == Dtype::FP16)
-        ? pso_conv_bwd_input_fp16() : pso_conv_bwd_input_fp32();
+    id<MTLComputePipelineState> pso = (Wt.dtype == Dtype::FP16) ? pso_conv_bwd_input_fp16()
+                                   : (Wt.dtype == Dtype::BF16) ? pso_conv_bwd_input_bf16()
+                                                                : pso_conv_bwd_input_fp32();
     id<MTLBuffer> bw  = buffer_for(Wt);
     id<MTLBuffer> bdy = buffer_for(dY);
     id<MTLBuffer> bdx = buffer_for(dX);
@@ -692,8 +882,8 @@ void conv2d_backward_weight(const Tensor& X,
                                 int dil_h, int dil_w,
                             int groups,
                             Tensor& dWt) {
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_weight: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("conv2d_backward_weight: X must be FP16, BF16, or FP32");
     }
     if (dY.dtype != X.dtype || dWt.dtype != X.dtype) {
         throw std::runtime_error("conv2d_backward_weight: X, dY, dWt dtype must match");
@@ -729,8 +919,10 @@ void conv2d_backward_weight(const Tensor& X,
     p.Cg_out = static_cast<uint32_t>(Cg_out);
 
     const bool is_fp16 = (X.dtype == Dtype::FP16);
-    id<MTLComputePipelineState> pso = is_fp16
-        ? pso_conv_bwd_weight_fp16() : pso_conv_bwd_weight_fp32_scratch();
+    const bool is_bf16 = (X.dtype == Dtype::BF16);
+    id<MTLComputePipelineState> pso = is_fp16 ? pso_conv_bwd_weight_fp16()
+                                   : is_bf16  ? pso_conv_bwd_weight_bf16()
+                                              : pso_conv_bwd_weight_fp32_scratch();
     id<MTLBuffer> bx   = buffer_for(X);
     id<MTLBuffer> bdy  = buffer_for(dY);
     id<MTLBuffer> bdwt = buffer_for(dWt);
@@ -755,8 +947,9 @@ void conv2d_backward_weight(const Tensor& X,
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 
         // Fold scratch into dWt.
-        id<MTLComputePipelineState> add_pso = is_fp16
-            ? pso_conv_add_fp16() : pso_conv_add_fp32();
+        id<MTLComputePipelineState> add_pso = is_fp16 ? pso_conv_add_fp16()
+                                            : is_bf16  ? pso_conv_add_bf16()
+                                                       : pso_conv_add_fp32();
         [enc setComputePipelineState:add_pso];
         [enc setBuffer:scratch offset:0 atIndex:0];
         [enc setBuffer:bdwt offset:odwt atIndex:1];
@@ -774,8 +967,8 @@ void conv2d_backward_weight(const Tensor& X,
 void conv2d_backward_bias(const Tensor& dY,
                           int N, int C_out, int H_out, int W_out,
                           Tensor& dB) {
-    if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32) {
-        throw std::runtime_error("conv2d_backward_bias: dY must be FP16 or FP32");
+    if (dY.dtype != Dtype::FP16 && dY.dtype != Dtype::FP32 && dY.dtype != Dtype::BF16) {
+        throw std::runtime_error("conv2d_backward_bias: dY must be FP16, BF16, or FP32");
     }
     if (dB.dtype != dY.dtype) {
         throw std::runtime_error("conv2d_backward_bias: dB dtype must match dY");
@@ -796,8 +989,10 @@ void conv2d_backward_bias(const Tensor& dY,
     p.total = 0u;
 
     const bool is_fp16 = (dY.dtype == Dtype::FP16);
-    id<MTLComputePipelineState> pso = is_fp16
-        ? pso_conv_bwd_bias_fp16() : pso_conv_bwd_bias_fp32_scratch();
+    const bool is_bf16 = (dY.dtype == Dtype::BF16);
+    id<MTLComputePipelineState> pso = is_fp16 ? pso_conv_bwd_bias_fp16()
+                                   : is_bf16  ? pso_conv_bwd_bias_bf16()
+                                              : pso_conv_bwd_bias_fp32_scratch();
     id<MTLBuffer> bdy = buffer_for(dY);
     id<MTLBuffer> bdb = buffer_for(dB);
     const NSUInteger ody = buffer_offset_for(dY);
@@ -819,8 +1014,9 @@ void conv2d_backward_bias(const Tensor& dY,
         [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(C_out), 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
 
-        id<MTLComputePipelineState> add_pso = is_fp16
-            ? pso_conv_add_fp16() : pso_conv_add_fp32();
+        id<MTLComputePipelineState> add_pso = is_fp16 ? pso_conv_add_fp16()
+                                            : is_bf16  ? pso_conv_add_bf16()
+                                                       : pso_conv_add_fp32();
         const uint32_t Cn = static_cast<uint32_t>(C_out);
         [enc setComputePipelineState:add_pso];
         [enc setBuffer:scratch offset:0 atIndex:0];

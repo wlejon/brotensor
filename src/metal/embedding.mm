@@ -86,6 +86,44 @@ kernel void k_emb_add_fp32_into_fp16(device const float* src [[buffer(0)]],
     if (i >= n) return;
     dst[i] = half(float(dst[i]) + src[i]);
 }
+
+kernel void k_emb_fw_bf16(device const bfloat* table [[buffer(0)]],
+                          device const int*    idx   [[buffer(1)]],
+                          device bfloat*       out   [[buffer(2)]],
+                          constant uint& B            [[buffer(3)]],
+                          constant uint& D            [[buffer(4)]],
+                          uint t [[thread_position_in_grid]]) {
+    uint total = B * D;
+    if (t >= total) return;
+    uint b = t / D;
+    uint j = t - b * D;
+    int row = idx[b];
+    out[t] = table[uint(row) * D + j];
+}
+
+// BF16 input: atomic-add into FP32 scratch (atomic on bfloat is not portable).
+kernel void k_emb_bw_bf16(device const bfloat* dOut            [[buffer(0)]],
+                          device const int*    idx             [[buffer(1)]],
+                          device atomic_float* dTable_scratch  [[buffer(2)]],
+                          constant uint& B                     [[buffer(3)]],
+                          constant uint& D                     [[buffer(4)]],
+                          uint t [[thread_position_in_grid]]) {
+    uint total = B * D;
+    if (t >= total) return;
+    uint b = t / D;
+    uint j = t - b * D;
+    int row = idx[b];
+    atomic_fetch_add_explicit(&dTable_scratch[uint(row) * D + j],
+                              float(dOut[t]), memory_order_relaxed);
+}
+
+kernel void k_emb_add_fp32_into_bf16(device const float* src [[buffer(0)]],
+                                     device bfloat*      dst [[buffer(1)]],
+                                     constant uint& n        [[buffer(2)]],
+                                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = bfloat(float(dst[i]) + src[i]);
+}
 )msl";
 
 id<MTLComputePipelineState> fw_pso() {
@@ -116,6 +154,24 @@ id<MTLComputePipelineState> add_pso_fp16() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_add_fp32_into_fp16"); });
+    return pso;
+}
+id<MTLComputePipelineState> fw_pso_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_fw_bf16"); });
+    return pso;
+}
+id<MTLComputePipelineState> bw_pso_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_bw_bf16"); });
+    return pso;
+}
+id<MTLComputePipelineState> add_pso_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_add_fp32_into_bf16"); });
     return pso;
 }
 
@@ -156,7 +212,9 @@ void embedding_lookup_forward(const Tensor& table,
     const uint32_t Bu = static_cast<uint32_t>(B);
     const uint32_t Du = static_cast<uint32_t>(D);
     id<MTLComputePipelineState> pso =
-        (table.dtype == Dtype::FP16) ? fw_pso_fp16() : fw_pso();
+        (table.dtype == Dtype::FP16) ? fw_pso_fp16()
+      : (table.dtype == Dtype::BF16) ? fw_pso_bf16()
+      : fw_pso();
     dispatch1d(pso, total, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bT offset:oT atIndex:0];
         [enc setBuffer:bI offset:oI atIndex:1];
@@ -169,8 +227,9 @@ void embedding_lookup_forward(const Tensor& table,
 void embedding_lookup_backward(const Tensor& dOut,
                                const int32_t* d_idx, int B,
                                Tensor& dTable) {
-    if (dTable.dtype != Dtype::FP16 && dTable.dtype != Dtype::FP32) {
-        throw std::runtime_error("embedding_lookup_backward_gpu: dTable must be FP16 or FP32");
+    if (dTable.dtype != Dtype::FP16 && dTable.dtype != Dtype::FP32 &&
+        dTable.dtype != Dtype::BF16) {
+        throw std::runtime_error("embedding_lookup_backward_gpu: dTable must be FP16, BF16, or FP32");
     }
     if (dOut.dtype != dTable.dtype) {
         throw std::runtime_error("embedding_lookup_backward_gpu: dOut/dTable dtype must match");
@@ -196,13 +255,15 @@ void embedding_lookup_backward(const Tensor& dOut,
             [enc setBytes:&Du length:sizeof(uint32_t) atIndex:4];
         });
     } else {
+        const bool is_bf16 = (dTable.dtype == Dtype::BF16);
         const NSUInteger table_n = static_cast<NSUInteger>(dTable.rows) * D;
         @autoreleasepool {
             id<MTLBuffer> scratch = [metal_impl::device()
                 newBufferWithLength:table_n * sizeof(float)
                             options:MTLResourceStorageModeShared];
             std::memset([scratch contents], 0, table_n * sizeof(float));
-            dispatch1d(bw_pso_fp16(), total, ^(id<MTLComputeCommandEncoder> enc) {
+            id<MTLComputePipelineState> scatter_pso = is_bf16 ? bw_pso_bf16() : bw_pso_fp16();
+            dispatch1d(scatter_pso, total, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:bdO offset:odO atIndex:0];
                 [enc setBuffer:bI  offset:oI atIndex:1];
                 [enc setBuffer:scratch offset:0 atIndex:2];
@@ -210,7 +271,8 @@ void embedding_lookup_backward(const Tensor& dOut,
                 [enc setBytes:&Du length:sizeof(uint32_t) atIndex:4];
             });
             const uint32_t n = static_cast<uint32_t>(table_n);
-            dispatch1d(add_pso_fp16(), n, ^(id<MTLComputeCommandEncoder> enc) {
+            id<MTLComputePipelineState> add_pso = is_bf16 ? add_pso_bf16() : add_pso_fp16();
+            dispatch1d(add_pso, n, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:scratch offset:0 atIndex:0];
                 [enc setBuffer:bdT offset:odT atIndex:1];
                 [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];

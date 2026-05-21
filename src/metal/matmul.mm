@@ -84,6 +84,36 @@ kernel void k_matmul_fp16(device const half* A [[buffer(0)]],
     }
     if (row < M && col < N) C[row * N + col] = half(acc);
 }
+
+kernel void k_matmul_bf16(device const bfloat* A [[buffer(0)]],
+                          device const bfloat* B [[buffer(1)]],
+                          device bfloat*       C [[buffer(2)]],
+                          constant uint& M [[buffer(3)]],
+                          constant uint& N [[buffer(4)]],
+                          constant uint& K [[buffer(5)]],
+                          uint2 tg  [[threadgroup_position_in_grid]],
+                          uint2 lid [[thread_position_in_threadgroup]]) {
+    threadgroup float As[MM_TILE][MM_TILE];
+    threadgroup float Bs[MM_TILE][MM_TILE];
+
+    uint row = tg.y * MM_TILE + lid.y;
+    uint col = tg.x * MM_TILE + lid.x;
+
+    float acc = 0.0f;
+    uint n_tiles = (K + MM_TILE - 1) / MM_TILE;
+    for (uint t = 0; t < n_tiles; ++t) {
+        uint a_col = t * MM_TILE + lid.x;
+        uint b_row = t * MM_TILE + lid.y;
+        As[lid.y][lid.x] = (row < M && a_col < K) ? float(A[row * K + a_col]) : 0.0f;
+        Bs[lid.y][lid.x] = (b_row < K && col < N) ? float(B[b_row * N + col]) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < MM_TILE; ++k) {
+            acc += As[lid.y][k] * Bs[k][lid.x];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < M && col < N) C[row * N + col] = bfloat(acc);
+}
 )msl";
 
 id<MTLComputePipelineState> pso_fp32() {
@@ -96,6 +126,12 @@ id<MTLComputePipelineState> pso_fp16() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_matmul_fp16"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_matmul_bf16"); });
     return pso;
 }
 
@@ -119,11 +155,13 @@ void matmul(const Tensor& A, const Tensor& B, Tensor& C) {
         C.zero();
         return;
     }
-    if (A.dtype != Dtype::FP32 && A.dtype != Dtype::FP16) {
-        throw std::runtime_error("matmul_gpu: only FP32/FP16 supported");
+    if (A.dtype != Dtype::FP32 && A.dtype != Dtype::FP16 && A.dtype != Dtype::BF16) {
+        throw std::runtime_error("matmul_gpu: only FP32/FP16/BF16 supported");
     }
 
-    id<MTLComputePipelineState> pso = (A.dtype == Dtype::FP16) ? pso_fp16() : pso_fp32();
+    id<MTLComputePipelineState> pso = (A.dtype == Dtype::FP16) ? pso_fp16()
+                                    : (A.dtype == Dtype::BF16) ? pso_bf16()
+                                    : pso_fp32();
     id<MTLBuffer> bA = buffer_for(A);
     id<MTLBuffer> bB = buffer_for(B);
     id<MTLBuffer> bC = buffer_for(C);

@@ -220,6 +220,62 @@ kernel void k_lbb_add_fp32_into_fp32(device const float* src [[buffer(0)]],
     if (i >= n) return;
     dst[i] += src[i];
 }
+
+// ─── BF16 variants ────────────────────────────────────────────────────────
+
+kernel void k_linear_bw_batched_dx_bf16(device const bfloat* W   [[buffer(0)]],
+                                        device const bfloat* dY  [[buffer(1)]],
+                                        device bfloat*       dX  [[buffer(2)]],
+                                        constant uint& B         [[buffer(3)]],
+                                        constant uint& out_dim   [[buffer(4)]],
+                                        constant uint& in_dim    [[buffer(5)]],
+                                        uint2 gid [[thread_position_in_grid]]) {
+    uint j = gid.x;
+    uint b = gid.y;
+    if (b >= B || j >= in_dim) return;
+    device const bfloat* dY_row = dY + b * out_dim;
+    float acc = 0.0f;
+    for (uint i = 0; i < out_dim; ++i)
+        acc += float(W[i * in_dim + j]) * float(dY_row[i]);
+    dX[b * in_dim + j] = bfloat(acc);
+}
+
+// dW_scratch[i, j] = sum_b dY[b, i] * X[b, j] (FP32 scratch)
+kernel void k_linear_bw_batched_dw_bf16(device const bfloat* dY [[buffer(0)]],
+                                        device const bfloat* X  [[buffer(1)]],
+                                        device float*       dW_scratch [[buffer(2)]],
+                                        constant uint& B        [[buffer(3)]],
+                                        constant uint& out_dim  [[buffer(4)]],
+                                        constant uint& in_dim   [[buffer(5)]],
+                                        uint2 gid [[thread_position_in_grid]]) {
+    uint j = gid.x;
+    uint i = gid.y;
+    if (i >= out_dim || j >= in_dim) return;
+    float acc = 0.0f;
+    for (uint b = 0; b < B; ++b) {
+        acc += float(dY[b * out_dim + i]) * float(X[b * in_dim + j]);
+    }
+    dW_scratch[i * in_dim + j] = acc;
+}
+
+kernel void k_linear_bw_batched_db_bf16(device const bfloat* dY [[buffer(0)]],
+                                        device float*       dB_scratch [[buffer(1)]],
+                                        constant uint& B        [[buffer(2)]],
+                                        constant uint& out_dim  [[buffer(3)]],
+                                        uint i [[thread_position_in_grid]]) {
+    if (i >= out_dim) return;
+    float acc = 0.0f;
+    for (uint b = 0; b < B; ++b) acc += float(dY[b * out_dim + i]);
+    dB_scratch[i] = acc;
+}
+
+kernel void k_lbb_add_fp32_into_bf16(device const float* src [[buffer(0)]],
+                                     device bfloat*      dst [[buffer(1)]],
+                                     constant uint& n        [[buffer(2)]],
+                                     uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dst[i] = bfloat(float(dst[i]) + src[i]);
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -238,13 +294,17 @@ DEF_PSO(pso_tanh_bw, @"k_tanh_bw_batched")
 DEF_PSO(pso_lin_bw_dx, @"k_linear_bw_batched_dx")
 DEF_PSO(pso_lin_bw_dw, @"k_linear_bw_batched_dw")
 DEF_PSO(pso_lin_bw_db, @"k_linear_bw_batched_db")
-DEF_PSO(pso_lin_bw_dx_fp16, @"k_linear_bw_batched_dx_fp16")
-DEF_PSO(pso_lin_bw_dw_fp16, @"k_linear_bw_batched_dw_fp16")
+DEF_PSO(pso_lin_bw_dx_fp16,  @"k_linear_bw_batched_dx_fp16")
+DEF_PSO(pso_lin_bw_dw_fp16,  @"k_linear_bw_batched_dw_fp16")
 DEF_PSO(pso_lin_bw_dw_fp32_scratch, @"k_linear_bw_batched_dw_fp32_to_scratch")
-DEF_PSO(pso_lin_bw_db_fp16, @"k_linear_bw_batched_db_fp16")
+DEF_PSO(pso_lin_bw_db_fp16,  @"k_linear_bw_batched_db_fp16")
 DEF_PSO(pso_lin_bw_db_fp32_scratch, @"k_linear_bw_batched_db_fp32_to_scratch")
-DEF_PSO(pso_lbb_add_fp16, @"k_lbb_add_fp32_into_fp16")
-DEF_PSO(pso_lbb_add_fp32, @"k_lbb_add_fp32_into_fp32")
+DEF_PSO(pso_lbb_add_fp16,    @"k_lbb_add_fp32_into_fp16")
+DEF_PSO(pso_lbb_add_fp32,    @"k_lbb_add_fp32_into_fp32")
+DEF_PSO(pso_lin_bw_dx_bf16,  @"k_linear_bw_batched_dx_bf16")
+DEF_PSO(pso_lin_bw_dw_bf16,  @"k_linear_bw_batched_dw_bf16")
+DEF_PSO(pso_lin_bw_db_bf16,  @"k_linear_bw_batched_db_bf16")
+DEF_PSO(pso_lbb_add_bf16,    @"k_lbb_add_fp32_into_bf16")
 #undef DEF_PSO
 
 void dispatch1d(id<MTLComputePipelineState> pso, NSUInteger n,
@@ -402,8 +462,8 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
                              const Tensor& dY_BD,
                              Tensor& dX_BD,
                              Tensor& dW, Tensor& dB) {
-    if (W.dtype != Dtype::FP16 && W.dtype != Dtype::FP32) {
-        throw std::runtime_error("linear_backward_batched: W must be FP16 or FP32");
+    if (W.dtype != Dtype::FP16 && W.dtype != Dtype::FP32 && W.dtype != Dtype::BF16) {
+        throw std::runtime_error("linear_backward_batched: W must be FP16, BF16, or FP32");
     }
     if (X_BD.dtype != W.dtype || dY_BD.dtype != W.dtype ||
         dW.dtype != W.dtype || dB.dtype != W.dtype) {
@@ -417,6 +477,7 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
     }
     if (B == 0) return;
     const bool is_fp16 = (W.dtype == Dtype::FP16);
+    const bool is_bf16 = (W.dtype == Dtype::BF16);
 
     id<MTLBuffer> bw  = buffer_for(W);
     NSUInteger ow = buffer_offset_for(W);
@@ -435,8 +496,9 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
     const uint32_t Iu = static_cast<uint32_t>(in_dim);
 
     if (in_dim > 0 && out_dim > 0) {
-        id<MTLComputePipelineState> pso = is_fp16
-            ? pso_lin_bw_dx_fp16() : pso_lin_bw_dx();
+        id<MTLComputePipelineState> pso = is_fp16 ? pso_lin_bw_dx_fp16()
+                                        : is_bf16 ? pso_lin_bw_dx_bf16()
+                                        : pso_lin_bw_dx();
         dispatch2d(pso, in_dim, B, ^(id<MTLComputeCommandEncoder> enc) {
             [enc setBuffer:bw offset:ow atIndex:0];
             [enc setBuffer:bdy offset:ody atIndex:1];
@@ -453,7 +515,8 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
                 newBufferWithLength:dw_n * sizeof(float)
                             options:MTLResourceStorageModeShared];
             id<MTLComputePipelineState> pso = is_fp16
-                ? pso_lin_bw_dw_fp16() : pso_lin_bw_dw_fp32_scratch();
+                ? pso_lin_bw_dw_fp16()
+                : is_bf16 ? pso_lin_bw_dw_bf16() : pso_lin_bw_dw_fp32_scratch();
             dispatch2d(pso, in_dim, out_dim, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:bdy offset:ody atIndex:0];
                 [enc setBuffer:bx offset:ox atIndex:1];
@@ -464,7 +527,8 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
             });
             const uint32_t n = static_cast<uint32_t>(dw_n);
             id<MTLComputePipelineState> add_pso = is_fp16
-                ? pso_lbb_add_fp16() : pso_lbb_add_fp32();
+                ? pso_lbb_add_fp16()
+                : is_bf16 ? pso_lbb_add_bf16() : pso_lbb_add_fp32();
             dispatch1d(add_pso, n, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:scratch offset:0 atIndex:0];
                 [enc setBuffer:bdw offset:odw atIndex:1];
@@ -478,7 +542,8 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
                 newBufferWithLength:out_dim * sizeof(float)
                             options:MTLResourceStorageModeShared];
             id<MTLComputePipelineState> pso = is_fp16
-                ? pso_lin_bw_db_fp16() : pso_lin_bw_db_fp32_scratch();
+                ? pso_lin_bw_db_fp16()
+                : is_bf16 ? pso_lin_bw_db_bf16() : pso_lin_bw_db_fp32_scratch();
             dispatch1d(pso, out_dim, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:bdy offset:ody atIndex:0];
                 [enc setBuffer:scratch offset:0 atIndex:1];
@@ -487,7 +552,8 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
             });
             const uint32_t n = static_cast<uint32_t>(out_dim);
             id<MTLComputePipelineState> add_pso = is_fp16
-                ? pso_lbb_add_fp16() : pso_lbb_add_fp32();
+                ? pso_lbb_add_fp16()
+                : is_bf16 ? pso_lbb_add_bf16() : pso_lbb_add_fp32();
             dispatch1d(add_pso, n, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:scratch offset:0 atIndex:0];
                 [enc setBuffer:bdb offset:odb atIndex:1];

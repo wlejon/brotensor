@@ -369,7 +369,7 @@ kernel void k_group_norm_backward_fp32(
     }
 }
 
-// Add FP32 scratch into FP16/FP32 dGamma/dBeta accumulators.
+// Add FP32 scratch into FP16/FP32/BF16 dGamma/dBeta accumulators.
 kernel void k_add_fp32_into_fp16(device const float* src [[buffer(0)]],
                                  device half*        dst [[buffer(1)]],
                                  constant uint& n        [[buffer(2)]],
@@ -386,6 +386,189 @@ kernel void k_add_fp32_into_fp32(device const float* src [[buffer(0)]],
     if (gid >= n) return;
     dst[gid] += src[gid];
 }
+
+kernel void k_add_fp32_into_bf16(device const float* src [[buffer(0)]],
+                                 device bfloat*      dst [[buffer(1)]],
+                                 constant uint& n        [[buffer(2)]],
+                                 uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    dst[gid] = bfloat(float(dst[gid]) + src[gid]);
+}
+
+// ─── BF16 kernels (verbatim copies of FP16 with half→bfloat) ──────────────
+
+kernel void k_group_norm_forward_bf16(
+        device const bfloat* X     [[buffer(0)]],
+        device const bfloat* gamma [[buffer(1)]],
+        device const bfloat* beta  [[buffer(2)]],
+        device bfloat*       Y     [[buffer(3)]],
+        constant uint& C                  [[buffer(4)]],
+        constant uint& spatial            [[buffer(5)]],
+        constant uint& channels_per_group [[buffer(6)]],
+        constant float& eps               [[buffer(7)]],
+        uint3 gid    [[threadgroup_position_in_grid]],
+        uint3 tid3   [[thread_position_in_threadgroup]],
+        uint3 tgs3   [[threads_per_threadgroup]]) {
+    uint tid = tid3.x;
+    uint tg_size = tgs3.x;
+    threadgroup float s_sum[GN_BLOCK];
+    threadgroup float s_sumsq[GN_BLOCK];
+    threadgroup float s_mean;
+    threadgroup float s_rstd;
+
+    const uint g = gid.x;
+    const uint n = gid.y;
+    const uint tile_size = channels_per_group * spatial;
+    const uint chan_base = g * channels_per_group;
+    const uint sample_stride = C * spatial;
+
+    device const bfloat* x_tile = X + n * sample_stride + chan_base * spatial;
+    device       bfloat* y_tile = Y + n * sample_stride + chan_base * spatial;
+
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    for (uint i = tid; i < tile_size; i += tg_size) {
+        float v = float(x_tile[i]);
+        sum   += v;
+        sumsq += v * v;
+    }
+    s_sum[tid]   = sum;
+    s_sumsq[tid] = sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid]   += s_sum[tid + s];
+            s_sumsq[tid] += s_sumsq[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float inv_n = 1.0f / float(tile_size);
+        float mean = s_sum[0] * inv_n;
+        float var  = s_sumsq[0] * inv_n - mean * mean;
+        s_mean = mean;
+        s_rstd = rsqrt(var + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = s_mean;
+    float rstd = s_rstd;
+
+    for (uint i = tid; i < tile_size; i += tg_size) {
+        uint local_c = i / spatial;
+        uint channel = chan_base + local_c;
+        float gv = float(gamma[channel]);
+        float bv = float(beta[channel]);
+        float v  = float(x_tile[i]);
+        float yn = (v - mean) * rstd;
+        y_tile[i] = bfloat(yn * gv + bv);
+    }
+}
+
+kernel void k_group_norm_backward_bf16(
+        device const bfloat* X     [[buffer(0)]],
+        device const bfloat* gamma [[buffer(1)]],
+        device const bfloat* dY    [[buffer(2)]],
+        device bfloat*       dX    [[buffer(3)]],
+        device atomic_float* dGamma_acc [[buffer(4)]],
+        device atomic_float* dBeta_acc  [[buffer(5)]],
+        constant uint& C                  [[buffer(6)]],
+        constant uint& spatial            [[buffer(7)]],
+        constant uint& channels_per_group [[buffer(8)]],
+        constant float& eps               [[buffer(9)]],
+        uint3 gid    [[threadgroup_position_in_grid]],
+        uint3 tid3   [[thread_position_in_threadgroup]],
+        uint3 tgs3   [[threads_per_threadgroup]]) {
+    uint tid = tid3.x;
+    uint tg_size = tgs3.x;
+    threadgroup float s_a[GN_BLOCK];
+    threadgroup float s_b[GN_BLOCK];
+    threadgroup float s_mean;
+    threadgroup float s_rstd;
+    threadgroup float s_sum1;
+    threadgroup float s_sum2;
+
+    const uint g = gid.x;
+    const uint n = gid.y;
+    const uint tile_size = channels_per_group * spatial;
+    const uint chan_base = g * channels_per_group;
+    const uint sample_stride = C * spatial;
+
+    device const bfloat* x_tile  = X  + n * sample_stride + chan_base * spatial;
+    device const bfloat* dy_tile = dY + n * sample_stride + chan_base * spatial;
+    device       bfloat* dx_tile = dX + n * sample_stride + chan_base * spatial;
+
+    // Pass 1: mean, var.
+    float sum = 0.0f, sumsq = 0.0f;
+    for (uint i = tid; i < tile_size; i += tg_size) {
+        float v = float(x_tile[i]);
+        sum   += v;
+        sumsq += v * v;
+    }
+    s_a[tid] = sum; s_b[tid] = sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_a[tid] += s_a[tid + s];
+            s_b[tid] += s_b[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float inv_n = 1.0f / float(tile_size);
+        float mean = s_a[0] * inv_n;
+        float var  = s_b[0] * inv_n - mean * mean;
+        s_mean = mean;
+        s_rstd = rsqrt(var + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = s_mean;
+    float rstd = s_rstd;
+
+    // Pass 2: sum1, sum2; also atomic dGamma/dBeta per channel.
+    float sum1 = 0.0f, sum2 = 0.0f;
+    for (uint i = tid; i < tile_size; i += tg_size) {
+        uint local_c = i / spatial;
+        uint channel = chan_base + local_c;
+        float gv  = float(gamma[channel]);
+        float dyv = float(dy_tile[i]);
+        float xv  = float(x_tile[i]);
+        float xh  = (xv - mean) * rstd;
+        float dxh = dyv * gv;
+        sum1 += dxh;
+        sum2 += dxh * xh;
+        atomic_fetch_add_explicit(&dGamma_acc[channel], dyv * xh,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&dBeta_acc[channel],  dyv,
+                                  memory_order_relaxed);
+    }
+    s_a[tid] = sum1; s_b[tid] = sum2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_a[tid] += s_a[tid + s];
+            s_b[tid] += s_b[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) { s_sum1 = s_a[0]; s_sum2 = s_b[0]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum1_t = s_sum1;
+    float sum2_t = s_sum2;
+    float inv_M  = 1.0f / float(tile_size);
+
+    // Pass 3.
+    for (uint i = tid; i < tile_size; i += tg_size) {
+        uint local_c = i / spatial;
+        uint channel = chan_base + local_c;
+        float gv  = float(gamma[channel]);
+        float dyv = float(dy_tile[i]);
+        float xv  = float(x_tile[i]);
+        float xh  = (xv - mean) * rstd;
+        float dxh = dyv * gv;
+        float dx  = rstd * (dxh - (sum1_t + xh * sum2_t) * inv_M);
+        dx_tile[i] = bfloat(dx);
+    }
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -401,6 +584,9 @@ DEF_PSO(pso_gn_bwd_fp16, @"k_group_norm_backward_fp16")
 DEF_PSO(pso_gn_bwd_fp32, @"k_group_norm_backward_fp32")
 DEF_PSO(pso_add_fp16,    @"k_add_fp32_into_fp16")
 DEF_PSO(pso_add_fp32,    @"k_add_fp32_into_fp32")
+DEF_PSO(pso_gn_fwd_bf16, @"k_group_norm_forward_bf16")
+DEF_PSO(pso_gn_bwd_bf16, @"k_group_norm_backward_bf16")
+DEF_PSO(pso_add_bf16,    @"k_add_fp32_into_bf16")
 #undef DEF_PSO
 
 } // namespace
@@ -415,8 +601,8 @@ void group_norm_forward(const Tensor& X,
     if (gamma.dtype != X.dtype || beta.dtype != X.dtype) {
         throw std::runtime_error("group_norm_forward: gamma/beta dtype must match X");
     }
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("group_norm_forward: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("group_norm_forward: X must be FP16, BF16, or FP32");
     }
     if (num_groups <= 0 || C % num_groups != 0) {
         throw std::runtime_error("group_norm_forward: num_groups must divide C");
@@ -432,8 +618,9 @@ void group_norm_forward(const Tensor& X,
     const uint32_t Cu = static_cast<uint32_t>(C);
     const uint32_t Su = static_cast<uint32_t>(spatial);
 
-    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16)
-        ? pso_gn_fwd_fp16() : pso_gn_fwd_fp32();
+    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_gn_fwd_fp16()
+                                   : (X.dtype == Dtype::BF16) ? pso_gn_fwd_bf16()
+                                                               : pso_gn_fwd_fp32();
     id<MTLBuffer> bx = buffer_for(X);
     id<MTLBuffer> bg = buffer_for(gamma);
     id<MTLBuffer> bb = buffer_for(beta);
@@ -474,8 +661,8 @@ void group_norm_backward(const Tensor& X,
     if (gamma.dtype != X.dtype || dY.dtype != X.dtype) {
         throw std::runtime_error("group_norm_backward: gamma/dY dtype must match X");
     }
-    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32) {
-        throw std::runtime_error("group_norm_backward: X must be FP16 or FP32");
+    if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("group_norm_backward: X must be FP16, BF16, or FP32");
     }
     if (num_groups <= 0 || C % num_groups != 0) {
         throw std::runtime_error("group_norm_backward: num_groups must divide C");
@@ -498,8 +685,9 @@ void group_norm_backward(const Tensor& X,
     const uint32_t Cu = static_cast<uint32_t>(C);
     const uint32_t Su = static_cast<uint32_t>(spatial);
 
-    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16)
-        ? pso_gn_bwd_fp16() : pso_gn_bwd_fp32();
+    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_gn_bwd_fp16()
+                                   : (X.dtype == Dtype::BF16) ? pso_gn_bwd_bf16()
+                                                               : pso_gn_bwd_fp32();
 
     id<MTLBuffer> bx  = buffer_for(X);
     id<MTLBuffer> bg  = buffer_for(gamma);
@@ -542,8 +730,9 @@ void group_norm_backward(const Tensor& X,
             threadsPerThreadgroup:MTLSizeMake(GN_BLOCK, 1, 1)];
 
         // Fold FP32 scratch into caller-owned accumulators.
-        id<MTLComputePipelineState> add_pso = (X.dtype == Dtype::FP16)
-            ? pso_add_fp16() : pso_add_fp32();
+        id<MTLComputePipelineState> add_pso = (X.dtype == Dtype::FP16) ? pso_add_fp16()
+                                            : (X.dtype == Dtype::BF16) ? pso_add_bf16()
+                                                                        : pso_add_fp32();
         const uint32_t Cn = static_cast<uint32_t>(C);
         const NSUInteger tpt = 64;
         const NSUInteger ngroups = (C + tpt - 1) / tpt;

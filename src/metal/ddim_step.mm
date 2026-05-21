@@ -37,6 +37,23 @@ kernel void k_ddim_step(device const half* x_t      [[buffer(0)]],
     float dir = dir_coef * eps;
     x_prev[gid] = half(sqrt_alpha_prev * x0_pred + dir);
 }
+
+kernel void k_ddim_step_bf16(device const bfloat* x_t      [[buffer(0)]],
+                             device const bfloat* eps_pred [[buffer(1)]],
+                             device bfloat*       x_prev   [[buffer(2)]],
+                             constant float& inv_sqrt_alpha_t      [[buffer(3)]],
+                             constant float& sqrt_one_minus_alpha_t [[buffer(4)]],
+                             constant float& sqrt_alpha_prev       [[buffer(5)]],
+                             constant float& dir_coef              [[buffer(6)]],
+                             constant uint&  total                 [[buffer(7)]],
+                             uint gid [[thread_position_in_grid]]) {
+    if (gid >= total) return;
+    float xt = float(x_t[gid]);
+    float eps = float(eps_pred[gid]);
+    float x0_pred = (xt - sqrt_one_minus_alpha_t * eps) * inv_sqrt_alpha_t;
+    float dir = dir_coef * eps;
+    x_prev[gid] = bfloat(sqrt_alpha_prev * x0_pred + dir);
+}
 )msl";
 
 id<MTLComputePipelineState> pso() {
@@ -45,21 +62,28 @@ id<MTLComputePipelineState> pso() {
     dispatch_once(&once, ^{ p = compile_pipeline(kSrc, @"k_ddim_step"); });
     return p;
 }
+id<MTLComputePipelineState> pso_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> p;
+    dispatch_once(&once, ^{ p = compile_pipeline(kSrc, @"k_ddim_step_bf16"); });
+    return p;
+}
 
 } // namespace
 
 void ddim_step(const Tensor& x_t, const Tensor& eps_pred,
                float alpha_t, float alpha_prev, float sigma_t,
                Tensor& x_prev) {
-    if (x_t.dtype != Dtype::FP16 || eps_pred.dtype != Dtype::FP16) {
-        throw std::runtime_error("ddim_step_gpu: x_t and eps_pred must be FP16");
+    if ((x_t.dtype != Dtype::FP16 && x_t.dtype != Dtype::BF16) ||
+        eps_pred.dtype != x_t.dtype) {
+        throw std::runtime_error("ddim_step_gpu: x_t and eps_pred must be FP16 or BF16 (matching)");
     }
     if (x_t.rows != eps_pred.rows || x_t.cols != eps_pred.cols) {
         throw std::runtime_error("ddim_step_gpu: shape mismatch between x_t and eps_pred");
     }
     if (x_prev.rows != x_t.rows || x_prev.cols != x_t.cols ||
-        x_prev.dtype != Dtype::FP16) {
-        x_prev.resize(x_t.rows, x_t.cols, Dtype::FP16);
+        x_prev.dtype != x_t.dtype) {
+        x_prev.resize(x_t.rows, x_t.cols, x_t.dtype);
     }
     const NSUInteger total = static_cast<NSUInteger>(x_t.size());
     if (total == 0) return;
@@ -71,7 +95,7 @@ void ddim_step(const Tensor& x_t, const Tensor& eps_pred,
     const float dir_inner         = 1.0f - alpha_prev - sigma_t * sigma_t;
     const float dir_coef          = std::sqrt(std::max(0.0f, dir_inner));
 
-    id<MTLComputePipelineState> p = pso();
+    id<MTLComputePipelineState> p = (x_t.dtype == Dtype::BF16) ? pso_bf16() : pso();
     id<MTLBuffer> bX = buffer_for(x_t);
     id<MTLBuffer> bE = buffer_for(eps_pred);
     id<MTLBuffer> bP = buffer_for(x_prev);

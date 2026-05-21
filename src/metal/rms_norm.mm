@@ -201,6 +201,101 @@ kernel void k_rms_fold_fp16(device half*        dst [[buffer(0)]],
     if (gid >= n) return;
     dst[gid] = half(float(dst[gid]) + src[gid]);
 }
+
+// ─── BF16 kernels (verbatim copies of FP16 with half→bfloat) ─────────────
+
+kernel void k_rms_fw_bf16(device const bfloat* X     [[buffer(0)]],
+                          device const bfloat* gamma [[buffer(1)]],
+                          device bfloat*       Y     [[buffer(2)]],
+                          constant uint& B   [[buffer(3)]],
+                          constant uint& D   [[buffer(4)]],
+                          constant float& eps [[buffer(5)]],
+                          uint b   [[threadgroup_position_in_grid]],
+                          uint tid [[thread_position_in_threadgroup]],
+                          uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float sdata[RMS_BLOCK];
+    if (b >= B) return;
+    device const bfloat* xrow = X + b * D;
+    device       bfloat* yrow = Y + b * D;
+    float local = 0.0f;
+    for (uint j = tid; j < D; j += tgs) {
+        float v = float(xrow[j]);
+        local += v * v;
+    }
+    sdata[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rrms = rsqrt(sdata[0] / float(D) + eps);
+    for (uint j = tid; j < D; j += tgs) {
+        float xv = float(xrow[j]);
+        float gv = float(gamma[j]);
+        yrow[j] = bfloat(xv * gv * rrms);
+    }
+}
+
+kernel void k_rms_bw_bf16(device const bfloat* X     [[buffer(0)]],
+                          device const bfloat* gamma [[buffer(1)]],
+                          device const bfloat* dY    [[buffer(2)]],
+                          device bfloat*       dX    [[buffer(3)]],
+                          device atomic_float* dGamma_scratch [[buffer(4)]],
+                          constant uint& B   [[buffer(5)]],
+                          constant uint& D   [[buffer(6)]],
+                          constant float& eps [[buffer(7)]],
+                          uint b   [[threadgroup_position_in_grid]],
+                          uint tid [[thread_position_in_threadgroup]],
+                          uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float sdata[RMS_BLOCK];
+    if (b >= B) return;
+    device const bfloat* xrow  = X  + b * D;
+    device const bfloat* dyrow = dY + b * D;
+    device       bfloat* dxrow = dX + b * D;
+
+    float local = 0.0f;
+    for (uint j = tid; j < D; j += tgs) {
+        float v = float(xrow[j]);
+        local += v * v;
+    }
+    sdata[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rrms = rsqrt(sdata[0] / float(D) + eps);
+
+    float local2 = 0.0f;
+    for (uint j = tid; j < D; j += tgs) {
+        local2 += float(xrow[j]) * float(dyrow[j]) * float(gamma[j]);
+    }
+    sdata[tid] = local2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum_xdy = sdata[0];
+    float inv_D = 1.0f / float(D);
+    float coeff = inv_D * rrms * rrms * sum_xdy;
+
+    for (uint j = tid; j < D; j += tgs) {
+        float g  = float(gamma[j]);
+        float dy = float(dyrow[j]);
+        float x  = float(xrow[j]);
+        dxrow[j] = bfloat(rrms * (g * dy - x * coeff));
+        atomic_fetch_add_explicit(&dGamma_scratch[j], dy * x * rrms, memory_order_relaxed);
+    }
+}
+
+kernel void k_rms_fold_bf16(device bfloat*      dst [[buffer(0)]],
+                            device const float* src [[buffer(1)]],
+                            constant uint& n        [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    dst[gid] = bfloat(float(dst[gid]) + src[gid]);
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -215,6 +310,9 @@ DEF_PSO(pso_fw_fp16, @"k_rms_fw_fp16")
 DEF_PSO(pso_bw_fp32, @"k_rms_bw_fp32")
 DEF_PSO(pso_bw_fp16, @"k_rms_bw_fp16")
 DEF_PSO(pso_fold,    @"k_rms_fold_fp16")
+DEF_PSO(pso_fw_bf16, @"k_rms_fw_bf16")
+DEF_PSO(pso_bw_bf16, @"k_rms_bw_bf16")
+DEF_PSO(pso_fold_bf16, @"k_rms_fold_bf16")
 #undef DEF_PSO
 
 } // namespace
@@ -234,7 +332,9 @@ void rms_norm_forward(const Tensor& X, const Tensor& gamma,
     }
     if (B == 0 || D == 0) return;
 
-    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_fw_fp16() : pso_fw_fp32();
+    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_fw_fp16()
+                                   : (X.dtype == Dtype::BF16) ? pso_fw_bf16()
+                                                               : pso_fw_fp32();
     id<MTLBuffer> bX = buffer_for(X);
     id<MTLBuffer> bG = buffer_for(gamma);
     id<MTLBuffer> bY = buffer_for(Y);
@@ -308,6 +408,42 @@ void rms_norm_backward(const Tensor& X, const Tensor& gamma,
             [enc setBytes:&eps length:sizeof(float) atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(RMS_BLOCK, 1, 1)];
+            [enc endEncoding];
+            ::brotensor::metal_impl::submit(cmd);
+        }
+        return;
+    }
+
+    if (X.dtype == Dtype::BF16) {
+        // BF16: scratch + fold, mirroring the FP16 path.
+        @autoreleasepool {
+            id<MTLBuffer> scratch = [metal_impl::device()
+                newBufferWithLength:D * sizeof(float)
+                            options:MTLResourceStorageModeShared];
+            std::memset([scratch contents], 0, D * sizeof(float));
+
+            id<MTLCommandBuffer> cmd = new_command_buffer();
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+            [enc setComputePipelineState:pso_bw_bf16()];
+            [enc setBuffer:bX  offset:oX  atIndex:0];
+            [enc setBuffer:bG  offset:oG  atIndex:1];
+            [enc setBuffer:bdY offset:odY atIndex:2];
+            [enc setBuffer:bdX offset:odX atIndex:3];
+            [enc setBuffer:scratch offset:0 atIndex:4];
+            [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:5];
+            [enc setBytes:&Du length:sizeof(uint32_t) atIndex:6];
+            [enc setBytes:&eps length:sizeof(float) atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(RMS_BLOCK, 1, 1)];
+
+            [enc setComputePipelineState:pso_fold_bf16()];
+            const uint32_t Dn = static_cast<uint32_t>(D);
+            const NSUInteger tpt = 64;
+            [enc setBuffer:bdG offset:odG atIndex:0];
+            [enc setBuffer:scratch offset:0 atIndex:1];
+            [enc setBytes:&Dn length:sizeof(uint32_t) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((D + tpt - 1) / tpt, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
             [enc endEncoding];
             ::brotensor::metal_impl::submit(cmd);
         }

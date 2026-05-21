@@ -94,6 +94,41 @@ kernel void k_swiglu_bw_fp16(device const half* X  [[buffer(0)]],
     dX[b * two_d + d]     = half(dy * bh * sp);
     dX[b * two_d + D + d] = half(dy * s);
 }
+
+kernel void k_swiglu_fw_bf16(device const bfloat* X [[buffer(0)]],
+                              device bfloat*       Y [[buffer(1)]],
+                              constant uint& B [[buffer(2)]],
+                              constant uint& D [[buffer(3)]],
+                              uint gid [[thread_position_in_grid]]) {
+    uint total = B * D;
+    if (gid >= total) return;
+    uint b = gid / D;
+    uint d = gid % D;
+    uint two_d = 2u * D;
+    float a  = float(X[b * two_d + d]);
+    float bh = float(X[b * two_d + D + d]);
+    Y[gid] = bfloat(silu_scalar(a) * bh);
+}
+
+kernel void k_swiglu_bw_bf16(device const bfloat* X  [[buffer(0)]],
+                              device const bfloat* dY [[buffer(1)]],
+                              device bfloat*       dX [[buffer(2)]],
+                              constant uint& B [[buffer(3)]],
+                              constant uint& D [[buffer(4)]],
+                              uint gid [[thread_position_in_grid]]) {
+    uint total = B * D;
+    if (gid >= total) return;
+    uint b = gid / D;
+    uint d = gid % D;
+    uint two_d = 2u * D;
+    float a  = float(X[b * two_d + d]);
+    float bh = float(X[b * two_d + D + d]);
+    float dy = float(dY[gid]);
+    float s  = silu_scalar(a);
+    float sp = silu_grad_scalar(a);
+    dX[b * two_d + d]     = bfloat(dy * bh * sp);
+    dX[b * two_d + D + d] = bfloat(dy * s);
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -103,10 +138,12 @@ kernel void k_swiglu_bw_fp16(device const half* X  [[buffer(0)]],
         dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, FN); }); \
         return pso; \
     }
-DEF_PSO(pso_fw_fp32, @"k_swiglu_fw_fp32")
-DEF_PSO(pso_fw_fp16, @"k_swiglu_fw_fp16")
-DEF_PSO(pso_bw_fp32, @"k_swiglu_bw_fp32")
-DEF_PSO(pso_bw_fp16, @"k_swiglu_bw_fp16")
+DEF_PSO(pso_fw_fp32,  @"k_swiglu_fw_fp32")
+DEF_PSO(pso_fw_fp16,  @"k_swiglu_fw_fp16")
+DEF_PSO(pso_fw_bf16,  @"k_swiglu_fw_bf16")
+DEF_PSO(pso_bw_fp32,  @"k_swiglu_bw_fp32")
+DEF_PSO(pso_bw_fp16,  @"k_swiglu_bw_fp16")
+DEF_PSO(pso_bw_bf16,  @"k_swiglu_bw_bf16")
 #undef DEF_PSO
 
 } // namespace
@@ -122,7 +159,9 @@ void swiglu_forward(const Tensor& X, Tensor& Y) {
     }
     const NSUInteger total = static_cast<NSUInteger>(B) * D;
     if (total == 0) return;
-    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_fw_fp16() : pso_fw_fp32();
+    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_fw_fp16()
+                                   : (X.dtype == Dtype::BF16) ? pso_fw_bf16()
+                                   : pso_fw_fp32();
     id<MTLBuffer> bX = buffer_for(X);
     id<MTLBuffer> bY = buffer_for(Y);
     const NSUInteger oX = buffer_offset_for(X);
@@ -158,7 +197,9 @@ void swiglu_backward(const Tensor& X, const Tensor& dY,
     }
     const NSUInteger total = static_cast<NSUInteger>(B) * D;
     if (total == 0) return;
-    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_bw_fp16() : pso_bw_fp32();
+    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_bw_fp16()
+                                   : (X.dtype == Dtype::BF16) ? pso_bw_bf16()
+                                   : pso_bw_fp32();
     id<MTLBuffer> bX  = buffer_for(X);
     id<MTLBuffer> bdY = buffer_for(dY);
     id<MTLBuffer> bdX = buffer_for(dX);

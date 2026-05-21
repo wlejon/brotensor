@@ -237,7 +237,7 @@ id<MTLComputePipelineState> build_pso(const PsoKey& k) {
     @autoreleasepool {
         NSError* err = nil;
         MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-        opts.languageVersion = MTLLanguageVersion3_0;
+        opts.languageVersion = MTLLanguageVersion3_1;
         id<MTLLibrary> lib = [device() newLibraryWithSource:kSrc
                                                     options:opts
                                                       error:&err];

@@ -160,7 +160,7 @@ id<MTLComputePipelineState> compile_pipeline(NSString* msl_source,
     @autoreleasepool {
         NSError* err = nil;
         MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-        opts.languageVersion = MTLLanguageVersion3_0;
+        opts.languageVersion = MTLLanguageVersion3_1;
         id<MTLLibrary> lib = [device() newLibraryWithSource:msl_source
                                                     options:opts
                                                       error:&err];
@@ -220,7 +220,7 @@ void metal_build_pipelines_() {
     @autoreleasepool {
         NSError* err = nil;
         MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-        opts.languageVersion = MTLLanguageVersion3_0;
+        opts.languageVersion = MTLLanguageVersion3_1;
         id<MTLLibrary> lib = [device() newLibraryWithSource:kKernelsMSL
                                                     options:opts
                                                       error:&err];

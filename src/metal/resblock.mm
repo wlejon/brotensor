@@ -171,6 +171,117 @@ kernel void k_sum_hw_per_NC(
         d_shift[nc] = half(prev + s_buf[0]);
     }
 }
+
+// ─── BF16 kernel twins (verbatim copies of the FP16 kernels above, with ──────
+//     half→bfloat). All math stays in float. ─────────────────────────────────
+
+kernel void k_gn_silu_fused_bf16(
+        device const bfloat* X     [[buffer(0)]],
+        device const bfloat* gamma [[buffer(1)]],
+        device const bfloat* beta  [[buffer(2)]],
+        device bfloat*       Y     [[buffer(3)]],
+        constant uint& C                  [[buffer(4)]],
+        constant uint& spatial            [[buffer(5)]],
+        constant uint& channels_per_group [[buffer(6)]],
+        constant float& eps               [[buffer(7)]],
+        uint3 gid    [[threadgroup_position_in_grid]],
+        uint3 tid3   [[thread_position_in_threadgroup]],
+        uint3 tgs3   [[threads_per_threadgroup]]) {
+    threadgroup float s_sum[RB_GN_BLOCK];
+    threadgroup float s_sumsq[RB_GN_BLOCK];
+    threadgroup float s_mean;
+    threadgroup float s_rstd;
+    uint tid = tid3.x;
+    uint tg_size = tgs3.x;
+    uint g = gid.x;
+    uint n = gid.y;
+    uint tile_size = channels_per_group * spatial;
+    uint chan_base = g * channels_per_group;
+    uint sample_stride = C * spatial;
+    device const bfloat* x_tile = X + n * sample_stride + chan_base * spatial;
+    device       bfloat* y_tile = Y + n * sample_stride + chan_base * spatial;
+
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    for (uint i = tid; i < tile_size; i += tg_size) {
+        float v = float(x_tile[i]);
+        sum   += v;
+        sumsq += v * v;
+    }
+    s_sum[tid]   = sum;
+    s_sumsq[tid] = sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid]   += s_sum[tid + s];
+            s_sumsq[tid] += s_sumsq[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float inv_n = 1.0f / float(tile_size);
+        float mean = s_sum[0] * inv_n;
+        float var  = s_sumsq[0] * inv_n - mean * mean;
+        s_mean = mean;
+        s_rstd = rsqrt(var + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = s_mean;
+    float rstd = s_rstd;
+
+    for (uint i = tid; i < tile_size; i += tg_size) {
+        uint local_c = i / spatial;
+        uint channel = chan_base + local_c;
+        float gv = float(gamma[channel]);
+        float bv = float(beta[channel]);
+        float v  = float(x_tile[i]);
+        float yn = (v - mean) * rstd * gv + bv;
+        float silu = yn / (1.0f + exp(-yn));
+        y_tile[i] = bfloat(silu);
+    }
+}
+
+kernel void k_add_NC_shift_bf16(device bfloat*       Y     [[buffer(0)]],
+                                device const bfloat* shift [[buffer(1)]],
+                                constant ShiftParams& p    [[buffer(2)]],
+                                uint idx [[thread_position_in_grid]]) {
+    if (idx >= p.total) return;
+    uint t = idx / p.spatial;
+    uint c = t % p.C;
+    uint n = t / p.C;
+    uint sidx = (p.has_N != 0u) ? (n * p.C + c) : c;
+    Y[idx] = bfloat(float(Y[idx]) + float(shift[sidx]));
+}
+
+// BF16 twin of k_sum_hw_per_NC.
+kernel void k_sum_hw_per_NC_bf16(
+        device const bfloat* dh2   [[buffer(0)]],
+        device bfloat*     d_shift [[buffer(1)]],
+        constant ReduceNCParams& p [[buffer(2)]],
+        uint3 gid  [[threadgroup_position_in_grid]],
+        uint3 tid3 [[thread_position_in_threadgroup]],
+        uint3 tgs3 [[threads_per_threadgroup]]) {
+    threadgroup float s_buf[RB_GN_BLOCK];
+    uint nc = gid.x;
+    if (nc >= p.N * p.C) return;
+    uint tid = tid3.x;
+    uint tg_size = tgs3.x;
+    device const bfloat* row = dh2 + nc * p.spatial;
+    float acc = 0.0f;
+    for (uint i = tid; i < p.spatial; i += tg_size) {
+        acc += float(row[i]);
+    }
+    s_buf[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) s_buf[tid] += s_buf[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float prev = float(d_shift[nc]);
+        d_shift[nc] = bfloat(prev + s_buf[0]);
+    }
+}
 )msl";
 
 id<MTLComputePipelineState> pso_gn_silu() {
@@ -191,6 +302,24 @@ id<MTLComputePipelineState> pso_sum_hw_per_NC() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_sum_hw_per_NC"); });
     return pso;
 }
+id<MTLComputePipelineState> pso_gn_silu_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_gn_silu_fused_bf16"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_add_shift_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_add_NC_shift_bf16"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_sum_hw_per_NC_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_sum_hw_per_NC_bf16"); });
+    return pso;
+}
 
 struct ShiftParams {
     uint32_t N, C, spatial, has_N, total;
@@ -199,11 +328,12 @@ struct ReduceNCParams {
     uint32_t N, C, spatial;
 };
 
-void launch_gn_silu(const Tensor& X,
+void launch_gn_silu(bool is_bf16,
+                    const Tensor& X,
                     const Tensor& gamma, const Tensor& beta,
                     Tensor& Y,
                     int N, int C, int spatial, int channels_per_group, float eps) {
-    id<MTLComputePipelineState> pso = pso_gn_silu();
+    id<MTLComputePipelineState> pso = is_bf16 ? pso_gn_silu_bf16() : pso_gn_silu();
     id<MTLBuffer> bx = buffer_for(X);
     id<MTLBuffer> bg = buffer_for(gamma);
     id<MTLBuffer> bb = buffer_for(beta);
@@ -233,9 +363,9 @@ void launch_gn_silu(const Tensor& X,
     }
 }
 
-void launch_add_shift(Tensor& Y, const Tensor& shift,
+void launch_add_shift(bool is_bf16, Tensor& Y, const Tensor& shift,
                       int N, int C, int spatial, int has_N) {
-    id<MTLComputePipelineState> pso = pso_add_shift();
+    id<MTLComputePipelineState> pso = is_bf16 ? pso_add_shift_bf16() : pso_add_shift();
     id<MTLBuffer> by = buffer_for(Y);
     id<MTLBuffer> bs = buffer_for(shift);
     const NSUInteger oy = buffer_offset_for(Y);
@@ -264,9 +394,9 @@ void launch_add_shift(Tensor& Y, const Tensor& shift,
     }
 }
 
-void launch_sum_hw_per_NC(const Tensor& dh2, Tensor& d_shift,
+void launch_sum_hw_per_NC(bool is_bf16, const Tensor& dh2, Tensor& d_shift,
                           int N, int C, int spatial) {
-    id<MTLComputePipelineState> pso = pso_sum_hw_per_NC();
+    id<MTLComputePipelineState> pso = is_bf16 ? pso_sum_hw_per_NC_bf16() : pso_sum_hw_per_NC();
     id<MTLBuffer> bx = buffer_for(dh2);
     id<MTLBuffer> bs = buffer_for(d_shift);
     const NSUInteger ox = buffer_offset_for(dh2);
@@ -303,12 +433,15 @@ void resblock_forward(const Tensor& X,
                           int N, int C_in, int C_out, int H, int Wd,
                           int num_groups, float eps,
                           Tensor& Y) {
-    if (X.dtype != Dtype::FP16 || gamma1.dtype != Dtype::FP16 ||
-        beta1.dtype != Dtype::FP16 || W1.dtype != Dtype::FP16 ||
-        gamma2.dtype != Dtype::FP16 || beta2.dtype != Dtype::FP16 ||
-        W2.dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_forward_gpu: all required tensors must be FP16");
+    const Dtype dt = X.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("resblock_forward_gpu: X must be FP16 or BF16");
     }
+    if (gamma1.dtype != dt || beta1.dtype != dt || W1.dtype != dt ||
+        gamma2.dtype != dt || beta2.dtype != dt || W2.dtype != dt) {
+        throw std::runtime_error("resblock_forward_gpu: all required tensors must share X's dtype (FP16 or BF16)");
+    }
+    const bool is_bf16 = (dt == Dtype::BF16);
     if (num_groups <= 0 || C_in % num_groups != 0 || C_out % num_groups != 0) {
         throw std::runtime_error("resblock_forward_gpu: num_groups must divide C_in and C_out");
     }
@@ -317,8 +450,8 @@ void resblock_forward(const Tensor& X,
     }
     const int spatial = H * Wd;
     const int out_cols = C_out * spatial;
-    if (Y.rows != N || Y.cols != out_cols || Y.dtype != Dtype::FP16) {
-        Y.resize(N, out_cols, Dtype::FP16);
+    if (Y.rows != N || Y.cols != out_cols || Y.dtype != dt) {
+        Y.resize(N, out_cols, dt);
     }
     if (N == 0 || spatial == 0) return;
 
@@ -329,11 +462,11 @@ void resblock_forward(const Tensor& X,
     thread_local Tensor h1 = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local Tensor h2 = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local Tensor h3 = Tensor::empty_on(Device::Metal, 0, 0);
-    h1.resize(N, C_in  * spatial, Dtype::FP16);
-    h2.resize(N, C_out * spatial, Dtype::FP16);
-    h3.resize(N, C_out * spatial, Dtype::FP16);
+    h1.resize(N, C_in  * spatial, dt);
+    h2.resize(N, C_out * spatial, dt);
+    h3.resize(N, C_out * spatial, dt);
 
-    launch_gn_silu(X, gamma1, beta1, h1, N, C_in, spatial,
+    launch_gn_silu(is_bf16, X, gamma1, beta1, h1, N, C_in, spatial,
                    C_in / num_groups, eps);
 
     // Conv1: 3x3 same. Dispatch through the public conv2d (simdgroup fast path).
@@ -346,8 +479,8 @@ void resblock_forward(const Tensor& X,
                        h2);
 
     if (t_emb_shift) {
-        if (t_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_forward_gpu: t_emb_shift must be FP16");
+        if (t_emb_shift->dtype != dt) {
+            throw std::runtime_error("resblock_forward_gpu: t_emb_shift dtype must match X");
         }
         int has_N = 0;
         if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
@@ -359,17 +492,17 @@ void resblock_forward(const Tensor& X,
         } else {
             throw std::runtime_error("resblock_forward_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
-        launch_add_shift(h2, *t_emb_shift, N, C_out, spatial, has_N);
+        launch_add_shift(is_bf16, h2, *t_emb_shift, N, C_out, spatial, has_N);
     }
 
-    launch_gn_silu(h2, gamma2, beta2, h3, N, C_out, spatial,
+    launch_gn_silu(is_bf16, h2, gamma2, beta2, h3, N, C_out, spatial,
                    C_out / num_groups, eps);
 
     // Prepare the skip tensor for the conv2 epilogue (post-conv2 add).
     thread_local Tensor skip_scratch = Tensor::empty_on(Device::Metal, 0, 0);
     if (Wskip != nullptr) {
-        if (Wskip->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_forward_gpu: Wskip must be FP16");
+        if (Wskip->dtype != dt) {
+            throw std::runtime_error("resblock_forward_gpu: Wskip dtype must match X");
         }
         // 1x1 conv through the public path.
         conv2d_forward(X, *Wskip, bskip,
@@ -472,7 +605,7 @@ void resblock_forward_int8w_fp16(const Tensor& X,
     h2.resize(N, C_out * spatial, Dtype::FP16);
     h3.resize(N, C_out * spatial, Dtype::FP16);
 
-    launch_gn_silu(X, gamma1, beta1, h1, N, C_in, spatial,
+    launch_gn_silu(/*is_bf16*/false, X, gamma1, beta1, h1, N, C_in, spatial,
                    C_in / num_groups, eps);
 
     conv2d_int8w_fp16_forward(h1, W1_int8, s1, b1,
@@ -495,10 +628,10 @@ void resblock_forward_int8w_fp16(const Tensor& X,
         } else {
             throw std::runtime_error("resblock_forward_int8w_fp16_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
-        launch_add_shift(h2, *t_emb_shift, N, C_out, spatial, has_N);
+        launch_add_shift(/*is_bf16*/false, h2, *t_emb_shift, N, C_out, spatial, has_N);
     }
 
-    launch_gn_silu(h2, gamma2, beta2, h3, N, C_out, spatial,
+    launch_gn_silu(/*is_bf16*/false, h2, gamma2, beta2, h3, N, C_out, spatial,
                    C_out / num_groups, eps);
 
     thread_local Tensor skip_scratch = Tensor::empty_on(Device::Metal, 0, 0);
@@ -539,13 +672,16 @@ void resblock_backward(const Tensor& X,
                            Tensor& dGamma2, Tensor& dBeta2,
                            Tensor& dW2, Tensor* db2,
                            Tensor* dWskip, Tensor* dbskip) {
-    if (X.dtype != Dtype::FP16 || dY.dtype != Dtype::FP16 ||
-        gamma1.dtype != Dtype::FP16 || beta1.dtype != Dtype::FP16 ||
-        W1.dtype != Dtype::FP16 ||
-        gamma2.dtype != Dtype::FP16 || beta2.dtype != Dtype::FP16 ||
-        W2.dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_backward_gpu: all required tensors must be FP16");
+    const Dtype dt = X.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("resblock_backward_gpu: X must be FP16 or BF16");
     }
+    if (dY.dtype != dt || gamma1.dtype != dt || beta1.dtype != dt ||
+        W1.dtype != dt || gamma2.dtype != dt || beta2.dtype != dt ||
+        W2.dtype != dt) {
+        throw std::runtime_error("resblock_backward_gpu: all required tensors must share X's dtype (FP16 or BF16)");
+    }
+    const bool is_bf16 = (dt == Dtype::BF16);
     if (Wskip == nullptr && C_in != C_out) {
         throw std::runtime_error("resblock_backward_gpu: Wskip required when C_in != C_out");
     }
@@ -553,8 +689,8 @@ void resblock_backward(const Tensor& X,
     if (dY.rows != N || dY.cols != C_out * spatial) {
         throw std::runtime_error("resblock_backward_gpu: dY shape mismatch");
     }
-    if (dX.rows != N || dX.cols != C_in * spatial || dX.dtype != Dtype::FP16) {
-        dX.resize(N, C_in * spatial, Dtype::FP16);
+    if (dX.rows != N || dX.cols != C_in * spatial || dX.dtype != dt) {
+        dX.resize(N, C_in * spatial, dt);
     }
     if (N == 0 || spatial == 0) return;
 
@@ -569,8 +705,8 @@ void resblock_backward(const Tensor& X,
     conv2d_forward(h1, W1, b1, N, C_in, H, Wd,
                        C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2);
     if (t_emb_shift) {
-        if (t_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_backward_gpu: t_emb_shift must be FP16");
+        if (t_emb_shift->dtype != dt) {
+            throw std::runtime_error("resblock_backward_gpu: t_emb_shift dtype must match X");
         }
         int has_N = 0;
         if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
@@ -582,7 +718,7 @@ void resblock_backward(const Tensor& X,
         } else {
             throw std::runtime_error("resblock_backward_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
-        launch_add_shift(h2, *t_emb_shift, N, C_out, spatial, has_N);
+        launch_add_shift(is_bf16, h2, *t_emb_shift, N, C_out, spatial, has_N);
     }
 
     Tensor h3_pre_silu = Tensor::empty_on(Device::Metal, 0, 0);
@@ -592,7 +728,7 @@ void resblock_backward(const Tensor& X,
     silu_forward(h3_pre_silu, h3);
 
     // Conv2 backward.
-    Tensor dh3 = Tensor::empty_on(Device::Metal, N, C_out * spatial, Dtype::FP16);
+    Tensor dh3 = Tensor::empty_on(Device::Metal, N, C_out * spatial, dt);
     conv2d_backward_input(W2, dY, N, C_out, H, Wd,
                               C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh3);
     conv2d_backward_weight(h3, dY, N, C_out, H, Wd,
@@ -612,19 +748,19 @@ void resblock_backward(const Tensor& X,
 
     // t_emb_shift backward.
     if (t_emb_shift && dt_emb_shift) {
-        if (dt_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_backward_gpu: dt_emb_shift must be FP16");
+        if (dt_emb_shift->dtype != dt) {
+            throw std::runtime_error("resblock_backward_gpu: dt_emb_shift dtype must match X");
         }
         const bool has_N = (t_emb_shift->rows == N && t_emb_shift->cols == C_out);
         if (has_N) {
-            launch_sum_hw_per_NC(dh2, *dt_emb_shift, N, C_out, spatial);
+            launch_sum_hw_per_NC(is_bf16, dh2, *dt_emb_shift, N, C_out, spatial);
         } else {
             conv2d_backward_bias(dh2, N, C_out, H, Wd, *dt_emb_shift);
         }
     }
 
     // Conv1 backward.
-    Tensor dh1 = Tensor::empty_on(Device::Metal, N, C_in * spatial, Dtype::FP16);
+    Tensor dh1 = Tensor::empty_on(Device::Metal, N, C_in * spatial, dt);
     conv2d_backward_input(W1, dh2, N, C_in, H, Wd,
                               C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh1);
     conv2d_backward_weight(h1, dh2, N, C_in, H, Wd,
@@ -645,10 +781,10 @@ void resblock_backward(const Tensor& X,
     if (Wskip == nullptr) {
         add_inplace(dX, dY);
     } else {
-        if (Wskip->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_backward_gpu: Wskip must be FP16");
+        if (Wskip->dtype != dt) {
+            throw std::runtime_error("resblock_backward_gpu: Wskip dtype must match X");
         }
-        Tensor dX_skip = Tensor::empty_on(Device::Metal, N, C_in * spatial, Dtype::FP16);
+        Tensor dX_skip = Tensor::empty_on(Device::Metal, N, C_in * spatial, dt);
         conv2d_backward_input(*Wskip, dY, N, C_in, H, Wd,
                                   C_out, 1, 1, 1, 1, 0, 0, 1, 1, dX_skip);
         if (dWskip) {

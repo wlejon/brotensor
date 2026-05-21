@@ -827,8 +827,8 @@ void cross_attention_forward(const Tensor& X,
                                  const float* d_mask,
                                  int num_heads,
                                  Tensor& O) {
-    if (X.dtype == Dtype::FP16) {
-        if (Ctx.dtype != Dtype::FP16) {
+    if (X.dtype == Dtype::FP16 || X.dtype == Dtype::BF16) {
+        if (Ctx.dtype != X.dtype) {
             throw std::runtime_error("cross_attention_forward_gpu: Ctx dtype must match X dtype");
         }
         flash_attention_qkvo_forward(X, &Ctx,
@@ -860,7 +860,7 @@ void self_attention_forward(const Tensor& X,
                                 const float* d_mask,
                                 int num_heads,
                                 Tensor& O) {
-    if (X.dtype == Dtype::FP16) {
+    if (X.dtype == Dtype::FP16 || X.dtype == Dtype::BF16) {
         flash_attention_qkvo_forward(X, nullptr,
                                          Wq, nullptr, Wk, nullptr,
                                          Wv, nullptr, Wo, nullptr,

@@ -74,7 +74,9 @@ void sigmoid_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
 // add_inplace forward decls (FP16 dispatcher lives further down with the
 // other FP16-extension kernels).
 namespace { void launch_fp16_add_inplace(Tensor&, const Tensor&, uint32_t);
-             void launch_fp16_scale_inplace(Tensor&, float, uint32_t); }
+             void launch_fp16_scale_inplace(Tensor&, float, uint32_t);
+             void launch_bf16_add_inplace(Tensor&, const Tensor&, uint32_t);
+             void launch_bf16_scale_inplace(Tensor&, float, uint32_t); }
 
 void add_inplace(Tensor& y, const Tensor& x) {
     const uint32_t n = static_cast<uint32_t>(y.size());
@@ -84,6 +86,13 @@ void add_inplace(Tensor& y, const Tensor& x) {
             throw std::runtime_error("add_inplace_gpu: dtype mismatch");
         }
         launch_fp16_add_inplace(y, x, n);
+        return;
+    }
+    if (y.dtype == Dtype::BF16) {
+        if (x.dtype != Dtype::BF16) {
+            throw std::runtime_error("add_inplace_gpu: dtype mismatch");
+        }
+        launch_bf16_add_inplace(y, x, n);
         return;
     }
     id<MTLBuffer> by = buffer_for(y);
@@ -97,12 +106,14 @@ void add_inplace(Tensor& y, const Tensor& x) {
     });
 }
 
-// Forward decls for FP16 PSOs defined later in this TU.
+// Forward decls for FP16/BF16 PSOs defined later in this TU.
 namespace {
 id<MTLComputePipelineState> pso_add_scalar_fp16();
+id<MTLComputePipelineState> pso_add_scalar_bf16();
 id<MTLComputePipelineState> pso_scale_fp16();
 id<MTLComputePipelineState> pso_clamp_fp32();
 id<MTLComputePipelineState> pso_clamp_fp16();
+id<MTLComputePipelineState> pso_clamp_bf16();
 }
 
 namespace {
@@ -136,6 +147,10 @@ void add_scalar_inplace(Tensor& y, float s) {
         dispatch_scalar_inplace(pso_add_scalar_fp16(), by, off_y, s, n);
         return;
     }
+    if (y.dtype == Dtype::BF16) {
+        dispatch_scalar_inplace(pso_add_scalar_bf16(), by, off_y, s, n);
+        return;
+    }
     dispatch1d_sync(@"k_add_scalar_inplace", n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:by offset:off_y atIndex:0];
         [enc setBytes:&s length:sizeof(float) atIndex:1];
@@ -148,6 +163,10 @@ void scale_inplace(Tensor& y, float s) {
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
         launch_fp16_scale_inplace(y, s, n);
+        return;
+    }
+    if (y.dtype == Dtype::BF16) {
+        launch_bf16_scale_inplace(y, s, n);
         return;
     }
     id<MTLBuffer> by = buffer_for(y);
@@ -169,7 +188,9 @@ void clamp(Tensor& y, float lo, float hi) {
     id<MTLBuffer> by = buffer_for(y);
     const NSUInteger off_y = buffer_offset_for(y);
     id<MTLComputePipelineState> pso =
-        (y.dtype == Dtype::FP16) ? pso_clamp_fp16() : pso_clamp_fp32();
+        (y.dtype == Dtype::BF16) ? pso_clamp_bf16()
+      : (y.dtype == Dtype::FP16) ? pso_clamp_fp16()
+      : pso_clamp_fp32();
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = new_command_buffer();
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -283,6 +304,14 @@ kernel void k_silu_backward_fp16(device const half* x  [[buffer(0)]],
     if (i >= n) return;
     dX[i] = half(float(dY[i]) * silu_grad_scalar(float(x[i])));
 }
+kernel void k_silu_backward_bf16(device const bfloat* x  [[buffer(0)]],
+                                 device const bfloat* dY [[buffer(1)]],
+                                 device bfloat*       dX [[buffer(2)]],
+                                 constant uint& n        [[buffer(3)]],
+                                 uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dX[i] = bfloat(float(dY[i]) * silu_grad_scalar(float(x[i])));
+}
 kernel void k_gelu_backward_fp32(device const float* x  [[buffer(0)]],
                                  device const float* dY [[buffer(1)]],
                                  device float*       dX [[buffer(2)]],
@@ -298,6 +327,14 @@ kernel void k_gelu_backward_fp16(device const half* x  [[buffer(0)]],
                                  uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
     dX[i] = half(float(dY[i]) * gelu_tanh_grad_scalar(float(x[i])));
+}
+kernel void k_gelu_backward_bf16(device const bfloat* x  [[buffer(0)]],
+                                 device const bfloat* dY [[buffer(1)]],
+                                 device bfloat*       dX [[buffer(2)]],
+                                 constant uint& n        [[buffer(3)]],
+                                 uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dX[i] = bfloat(float(dY[i]) * gelu_tanh_grad_scalar(float(x[i])));
 }
 kernel void k_quick_gelu_backward_fp32(device const float* x  [[buffer(0)]],
                                        device const float* dY [[buffer(1)]],
@@ -315,6 +352,14 @@ kernel void k_quick_gelu_backward_fp16(device const half* x  [[buffer(0)]],
     if (i >= n) return;
     dX[i] = half(float(dY[i]) * quick_gelu_grad_scalar(float(x[i])));
 }
+kernel void k_quick_gelu_backward_bf16(device const bfloat* x  [[buffer(0)]],
+                                       device const bfloat* dY [[buffer(1)]],
+                                       device bfloat*       dX [[buffer(2)]],
+                                       constant uint& n        [[buffer(3)]],
+                                       uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dX[i] = bfloat(float(dY[i]) * quick_gelu_grad_scalar(float(x[i])));
+}
 kernel void k_gelu_exact_forward_fp32(device const float* x [[buffer(0)]],
                                       device float*       y [[buffer(1)]],
                                       constant uint& n      [[buffer(2)]],
@@ -328,6 +373,13 @@ kernel void k_gelu_exact_forward_fp16(device const half* x [[buffer(0)]],
                                       uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
     y[i] = half(gelu_exact_scalar(float(x[i])));
+}
+kernel void k_gelu_exact_forward_bf16(device const bfloat* x [[buffer(0)]],
+                                      device bfloat*       y [[buffer(1)]],
+                                      constant uint& n       [[buffer(2)]],
+                                      uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(gelu_exact_scalar(float(x[i])));
 }
 kernel void k_gelu_exact_backward_fp32(device const float* x  [[buffer(0)]],
                                        device const float* dY [[buffer(1)]],
@@ -345,6 +397,14 @@ kernel void k_gelu_exact_backward_fp16(device const half* x  [[buffer(0)]],
     if (i >= n) return;
     dX[i] = half(float(dY[i]) * gelu_exact_grad_scalar(float(x[i])));
 }
+kernel void k_gelu_exact_backward_bf16(device const bfloat* x  [[buffer(0)]],
+                                       device const bfloat* dY [[buffer(1)]],
+                                       device bfloat*       dX [[buffer(2)]],
+                                       constant uint& n        [[buffer(3)]],
+                                       uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    dX[i] = bfloat(float(dY[i]) * gelu_exact_grad_scalar(float(x[i])));
+}
 
 kernel void k_silu_forward_fp32(device const float* x [[buffer(0)]],
                                 device float*       y [[buffer(1)]],
@@ -360,6 +420,13 @@ kernel void k_silu_forward_fp16(device const half* x [[buffer(0)]],
     if (i >= n) return;
     y[i] = half(silu_scalar(float(x[i])));
 }
+kernel void k_silu_forward_bf16(device const bfloat* x [[buffer(0)]],
+                                device bfloat*       y [[buffer(1)]],
+                                constant uint& n       [[buffer(2)]],
+                                uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(silu_scalar(float(x[i])));
+}
 kernel void k_gelu_forward_fp32(device const float* x [[buffer(0)]],
                                 device float*       y [[buffer(1)]],
                                 constant uint& n      [[buffer(2)]],
@@ -373,6 +440,13 @@ kernel void k_gelu_forward_fp16(device const half* x [[buffer(0)]],
                                 uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
     y[i] = half(gelu_tanh_scalar(float(x[i])));
+}
+kernel void k_gelu_forward_bf16(device const bfloat* x [[buffer(0)]],
+                                device bfloat*       y [[buffer(1)]],
+                                constant uint& n       [[buffer(2)]],
+                                uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(gelu_tanh_scalar(float(x[i])));
 }
 kernel void k_quick_gelu_forward_fp32(device const float* x [[buffer(0)]],
                                       device float*       y [[buffer(1)]],
@@ -388,12 +462,26 @@ kernel void k_quick_gelu_forward_fp16(device const half* x [[buffer(0)]],
     if (i >= n) return;
     y[i] = half(quick_gelu_scalar(float(x[i])));
 }
+kernel void k_quick_gelu_forward_bf16(device const bfloat* x [[buffer(0)]],
+                                      device bfloat*       y [[buffer(1)]],
+                                      constant uint& n       [[buffer(2)]],
+                                      uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(quick_gelu_scalar(float(x[i])));
+}
 kernel void k_add_scalar_inplace_fp16(device half* y [[buffer(0)]],
                                       constant float& s [[buffer(1)]],
                                       constant uint& n  [[buffer(2)]],
                                       uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
     y[i] = half(float(y[i]) + s);
+}
+kernel void k_add_scalar_inplace_bf16(device bfloat* y [[buffer(0)]],
+                                      constant float& s [[buffer(1)]],
+                                      constant uint& n  [[buffer(2)]],
+                                      uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(float(y[i]) + s);
 }
 kernel void k_scale_inplace_fp16(device half* y [[buffer(0)]],
                                  constant float& s [[buffer(1)]],
@@ -424,6 +512,17 @@ kernel void k_clamp_fp16(device half* y [[buffer(0)]],
     v = min(v, hi);
     y[i] = half(v);
 }
+kernel void k_clamp_bf16(device bfloat* y [[buffer(0)]],
+                         constant float& lo [[buffer(1)]],
+                         constant float& hi [[buffer(2)]],
+                         constant uint&  n  [[buffer(3)]],
+                         uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    float v = float(y[i]);
+    v = max(v, lo);
+    v = min(v, hi);
+    y[i] = bfloat(v);
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -435,24 +534,34 @@ kernel void k_clamp_fp16(device half* y [[buffer(0)]],
     }
 DEF_PSO(pso_silu_fp32, @"k_silu_forward_fp32")
 DEF_PSO(pso_silu_fp16, @"k_silu_forward_fp16")
+DEF_PSO(pso_silu_bf16, @"k_silu_forward_bf16")
 DEF_PSO(pso_gelu_fp32, @"k_gelu_forward_fp32")
 DEF_PSO(pso_gelu_fp16, @"k_gelu_forward_fp16")
+DEF_PSO(pso_gelu_bf16, @"k_gelu_forward_bf16")
 DEF_PSO(pso_quick_gelu_fp32, @"k_quick_gelu_forward_fp32")
 DEF_PSO(pso_quick_gelu_fp16, @"k_quick_gelu_forward_fp16")
+DEF_PSO(pso_quick_gelu_bf16, @"k_quick_gelu_forward_bf16")
 DEF_PSO(pso_silu_bwd_fp32,       @"k_silu_backward_fp32")
 DEF_PSO(pso_silu_bwd_fp16,       @"k_silu_backward_fp16")
+DEF_PSO(pso_silu_bwd_bf16,       @"k_silu_backward_bf16")
 DEF_PSO(pso_gelu_bwd_fp32,       @"k_gelu_backward_fp32")
 DEF_PSO(pso_gelu_bwd_fp16,       @"k_gelu_backward_fp16")
+DEF_PSO(pso_gelu_bwd_bf16,       @"k_gelu_backward_bf16")
 DEF_PSO(pso_quick_gelu_bwd_fp32, @"k_quick_gelu_backward_fp32")
 DEF_PSO(pso_quick_gelu_bwd_fp16, @"k_quick_gelu_backward_fp16")
+DEF_PSO(pso_quick_gelu_bwd_bf16, @"k_quick_gelu_backward_bf16")
 DEF_PSO(pso_gelu_exact_fp32,     @"k_gelu_exact_forward_fp32")
 DEF_PSO(pso_gelu_exact_fp16,     @"k_gelu_exact_forward_fp16")
+DEF_PSO(pso_gelu_exact_bf16,     @"k_gelu_exact_forward_bf16")
 DEF_PSO(pso_gelu_exact_bwd_fp32, @"k_gelu_exact_backward_fp32")
 DEF_PSO(pso_gelu_exact_bwd_fp16, @"k_gelu_exact_backward_fp16")
+DEF_PSO(pso_gelu_exact_bwd_bf16, @"k_gelu_exact_backward_bf16")
 DEF_PSO(pso_add_scalar_fp16,  @"k_add_scalar_inplace_fp16")
+DEF_PSO(pso_add_scalar_bf16,  @"k_add_scalar_inplace_bf16")
 DEF_PSO(pso_scale_fp16,       @"k_scale_inplace_fp16")
 DEF_PSO(pso_clamp_fp32,       @"k_clamp_fp32")
 DEF_PSO(pso_clamp_fp16,       @"k_clamp_fp16")
+DEF_PSO(pso_clamp_bf16,       @"k_clamp_bf16")
 #undef DEF_PSO
 
 void launch_activation_unary(id<MTLComputePipelineState> pso,
@@ -485,16 +594,22 @@ void launch_activation_unary(id<MTLComputePipelineState> pso,
 } // namespace
 
 void silu_forward(const Tensor& x, Tensor& y) {
-    launch_activation_unary(x.dtype == Dtype::FP16 ? pso_silu_fp16() : pso_silu_fp32(),
-                            x, y);
+    launch_activation_unary(
+        x.dtype == Dtype::FP16 ? pso_silu_fp16()
+      : x.dtype == Dtype::BF16 ? pso_silu_bf16()
+      : pso_silu_fp32(), x, y);
 }
 void gelu_forward(const Tensor& x, Tensor& y) {
-    launch_activation_unary(x.dtype == Dtype::FP16 ? pso_gelu_fp16() : pso_gelu_fp32(),
-                            x, y);
+    launch_activation_unary(
+        x.dtype == Dtype::FP16 ? pso_gelu_fp16()
+      : x.dtype == Dtype::BF16 ? pso_gelu_bf16()
+      : pso_gelu_fp32(), x, y);
 }
 void quick_gelu_forward(const Tensor& x, Tensor& y) {
-    launch_activation_unary(x.dtype == Dtype::FP16 ? pso_quick_gelu_fp16() : pso_quick_gelu_fp32(),
-                            x, y);
+    launch_activation_unary(
+        x.dtype == Dtype::FP16 ? pso_quick_gelu_fp16()
+      : x.dtype == Dtype::BF16 ? pso_quick_gelu_bf16()
+      : pso_quick_gelu_fp32(), x, y);
 }
 
 namespace {
@@ -531,29 +646,36 @@ void launch_activation_bwd(id<MTLComputePipelineState> pso,
 } // namespace
 
 void silu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
-    launch_activation_bwd(x.dtype == Dtype::FP16 ? pso_silu_bwd_fp16() : pso_silu_bwd_fp32(),
-                          x, dY, dX);
+    launch_activation_bwd(
+        x.dtype == Dtype::FP16 ? pso_silu_bwd_fp16()
+      : x.dtype == Dtype::BF16 ? pso_silu_bwd_bf16()
+      : pso_silu_bwd_fp32(), x, dY, dX);
 }
 void gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
-    launch_activation_bwd(x.dtype == Dtype::FP16 ? pso_gelu_bwd_fp16() : pso_gelu_bwd_fp32(),
-                          x, dY, dX);
+    launch_activation_bwd(
+        x.dtype == Dtype::FP16 ? pso_gelu_bwd_fp16()
+      : x.dtype == Dtype::BF16 ? pso_gelu_bwd_bf16()
+      : pso_gelu_bwd_fp32(), x, dY, dX);
 }
 void quick_gelu_backward(const Tensor& x, const Tensor& dY,
                          Tensor& dX) {
-    launch_activation_bwd(x.dtype == Dtype::FP16 ? pso_quick_gelu_bwd_fp16()
-                                                  : pso_quick_gelu_bwd_fp32(),
-                          x, dY, dX);
+    launch_activation_bwd(
+        x.dtype == Dtype::FP16 ? pso_quick_gelu_bwd_fp16()
+      : x.dtype == Dtype::BF16 ? pso_quick_gelu_bwd_bf16()
+      : pso_quick_gelu_bwd_fp32(), x, dY, dX);
 }
 void gelu_exact_forward(const Tensor& x, Tensor& y) {
-    launch_activation_unary(x.dtype == Dtype::FP16 ? pso_gelu_exact_fp16()
-                                                    : pso_gelu_exact_fp32(),
-                            x, y);
+    launch_activation_unary(
+        x.dtype == Dtype::FP16 ? pso_gelu_exact_fp16()
+      : x.dtype == Dtype::BF16 ? pso_gelu_exact_bf16()
+      : pso_gelu_exact_fp32(), x, y);
 }
 void gelu_exact_backward(const Tensor& x, const Tensor& dY,
                          Tensor& dX) {
-    launch_activation_bwd(x.dtype == Dtype::FP16 ? pso_gelu_exact_bwd_fp16()
-                                                  : pso_gelu_exact_bwd_fp32(),
-                          x, dY, dX);
+    launch_activation_bwd(
+        x.dtype == Dtype::FP16 ? pso_gelu_exact_bwd_fp16()
+      : x.dtype == Dtype::BF16 ? pso_gelu_exact_bwd_bf16()
+      : pso_gelu_exact_bwd_fp32(), x, dY, dX);
 }
 
 namespace {
@@ -609,12 +731,26 @@ kernel void k_add_inplace_fp16(device half*       y [[buffer(0)]],
     if (i >= n) return;
     y[i] = half(float(y[i]) + float(x[i]));
 }
+kernel void k_add_inplace_bf16(device bfloat*       y [[buffer(0)]],
+                               device const bfloat* x [[buffer(1)]],
+                               constant uint& n       [[buffer(2)]],
+                               uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(float(y[i]) + float(x[i]));
+}
 kernel void k_scale_inplace_fp16(device half*       y [[buffer(0)]],
                                  constant float& s    [[buffer(1)]],
                                  constant uint& n     [[buffer(2)]],
                                  uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
     y[i] = half(float(y[i]) * s);
+}
+kernel void k_scale_inplace_bf16(device bfloat*       y [[buffer(0)]],
+                                 constant float& s      [[buffer(1)]],
+                                 constant uint& n       [[buffer(2)]],
+                                 uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(float(y[i]) * s);
 }
 kernel void k_mul_inplace_fp32(device float*       y [[buffer(0)]],
                                device const float* x [[buffer(1)]],
@@ -629,6 +765,13 @@ kernel void k_mul_inplace_fp16(device half*       y [[buffer(0)]],
                                uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
     y[i] = half(float(y[i]) * float(x[i]));
+}
+kernel void k_mul_inplace_bf16(device bfloat*       y [[buffer(0)]],
+                               device const bfloat* x [[buffer(1)]],
+                               constant uint& n       [[buffer(2)]],
+                               uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(float(y[i]) * float(x[i]));
 }
 
 // Y(B, D) = X_a(B, D) * gelu(X_b(B, D)) over X(B, 2D).
@@ -698,6 +841,39 @@ kernel void k_geglu_backward_fp16(device const half* X  [[buffer(0)]],
     dX[b * two_d + d]     = half(dy * g);
     dX[b * two_d + D + d] = half(dy * a * gprime);
 }
+kernel void k_geglu_forward_bf16(device const bfloat* X [[buffer(0)]],
+                                 device bfloat*       Y [[buffer(1)]],
+                                 constant uint& B       [[buffer(2)]],
+                                 constant uint& D       [[buffer(3)]],
+                                 uint idx [[thread_position_in_grid]]) {
+    uint total = B * D;
+    if (idx >= total) return;
+    uint b = idx / D;
+    uint d = idx % D;
+    uint two_d = 2u * D;
+    float a = float(X[b * two_d + d]);
+    float gv_raw = float(X[b * two_d + D + d]);
+    Y[idx] = bfloat(a * gelu_tanh_scalar(gv_raw));
+}
+kernel void k_geglu_backward_bf16(device const bfloat* X  [[buffer(0)]],
+                                  device const bfloat* dY [[buffer(1)]],
+                                  device bfloat*       dX [[buffer(2)]],
+                                  constant uint& B        [[buffer(3)]],
+                                  constant uint& D        [[buffer(4)]],
+                                  uint idx [[thread_position_in_grid]]) {
+    uint total = B * D;
+    if (idx >= total) return;
+    uint b = idx / D;
+    uint d = idx % D;
+    uint two_d = 2u * D;
+    float a       = float(X[b * two_d + d]);
+    float bh      = float(X[b * two_d + D + d]);
+    float dy      = float(dY[idx]);
+    float g       = gelu_tanh_scalar(bh);
+    float gprime  = gelu_tanh_grad_scalar(bh);
+    dX[b * two_d + d]     = bfloat(dy * g);
+    dX[b * two_d + D + d] = bfloat(dy * a * gprime);
+}
 
 kernel void k_geglu_exact_forward_fp32(device const float* X [[buffer(0)]],
                                        device float*       Y [[buffer(1)]],
@@ -765,6 +941,39 @@ kernel void k_geglu_exact_backward_fp16(device const half* X  [[buffer(0)]],
     dX[b * two_d + d]     = half(dy * g);
     dX[b * two_d + D + d] = half(dy * a * gprime);
 }
+kernel void k_geglu_exact_forward_bf16(device const bfloat* X [[buffer(0)]],
+                                       device bfloat*       Y [[buffer(1)]],
+                                       constant uint& B       [[buffer(2)]],
+                                       constant uint& D       [[buffer(3)]],
+                                       uint idx [[thread_position_in_grid]]) {
+    uint total = B * D;
+    if (idx >= total) return;
+    uint b = idx / D;
+    uint d = idx % D;
+    uint two_d = 2u * D;
+    float a = float(X[b * two_d + d]);
+    float gv_raw = float(X[b * two_d + D + d]);
+    Y[idx] = bfloat(a * gelu_exact_scalar(gv_raw));
+}
+kernel void k_geglu_exact_backward_bf16(device const bfloat* X  [[buffer(0)]],
+                                        device const bfloat* dY [[buffer(1)]],
+                                        device bfloat*       dX [[buffer(2)]],
+                                        constant uint& B        [[buffer(3)]],
+                                        constant uint& D        [[buffer(4)]],
+                                        uint idx [[thread_position_in_grid]]) {
+    uint total = B * D;
+    if (idx >= total) return;
+    uint b = idx / D;
+    uint d = idx % D;
+    uint two_d = 2u * D;
+    float a       = float(X[b * two_d + d]);
+    float bh      = float(X[b * two_d + D + d]);
+    float dy      = float(dY[idx]);
+    float g       = gelu_exact_scalar(bh);
+    float gprime  = gelu_exact_grad_scalar(bh);
+    dX[b * two_d + d]     = bfloat(dy * g);
+    dX[b * two_d + D + d] = bfloat(dy * a * gprime);
+}
 
 kernel void k_causal_mask_row(device float* mask  [[buffer(0)]],
                               constant uint& L    [[buffer(1)]],
@@ -783,17 +992,24 @@ kernel void k_causal_mask_row(device float* mask  [[buffer(0)]],
         return pso; \
     }
 DEF_PSO(pso_add_inplace_fp16,   @"k_add_inplace_fp16")
+DEF_PSO(pso_add_inplace_bf16,   @"k_add_inplace_bf16")
 DEF_PSO(pso_scale_inplace_fp16, @"k_scale_inplace_fp16")
+DEF_PSO(pso_scale_inplace_bf16, @"k_scale_inplace_bf16")
 DEF_PSO(pso_mul_inplace_fp32,   @"k_mul_inplace_fp32")
 DEF_PSO(pso_mul_inplace_fp16,   @"k_mul_inplace_fp16")
+DEF_PSO(pso_mul_inplace_bf16,   @"k_mul_inplace_bf16")
 DEF_PSO(pso_geglu_fp16,         @"k_geglu_forward_fp16")
 DEF_PSO(pso_geglu_fp32,         @"k_geglu_forward_fp32")
+DEF_PSO(pso_geglu_bf16,         @"k_geglu_forward_bf16")
 DEF_PSO(pso_geglu_bwd_fp32,     @"k_geglu_backward_fp32")
 DEF_PSO(pso_geglu_bwd_fp16,     @"k_geglu_backward_fp16")
+DEF_PSO(pso_geglu_bwd_bf16,     @"k_geglu_backward_bf16")
 DEF_PSO(pso_geglu_exact_fp32,     @"k_geglu_exact_forward_fp32")
 DEF_PSO(pso_geglu_exact_fp16,     @"k_geglu_exact_forward_fp16")
+DEF_PSO(pso_geglu_exact_bf16,     @"k_geglu_exact_forward_bf16")
 DEF_PSO(pso_geglu_exact_bwd_fp32, @"k_geglu_exact_backward_fp32")
 DEF_PSO(pso_geglu_exact_bwd_fp16, @"k_geglu_exact_backward_fp16")
+DEF_PSO(pso_geglu_exact_bwd_bf16, @"k_geglu_exact_backward_bf16")
 DEF_PSO(pso_causal_mask_row,    @"k_causal_mask_row")
 #undef DEF_PSO
 
@@ -826,10 +1042,32 @@ void launch_fp16_add_inplace(Tensor& y, const Tensor& x, uint32_t n) {
     });
 }
 
+void launch_bf16_add_inplace(Tensor& y, const Tensor& x, uint32_t n) {
+    id<MTLBuffer> by = buffer_for(y);
+    id<MTLBuffer> bx = buffer_for(x);
+    const NSUInteger oy = buffer_offset_for(y);
+    const NSUInteger ox = buffer_offset_for(x);
+    launch_1d(pso_add_inplace_bf16(), n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:by offset:oy atIndex:0];
+        [enc setBuffer:bx offset:ox atIndex:1];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
+    });
+}
+
 void launch_fp16_scale_inplace(Tensor& y, float s, uint32_t n) {
     id<MTLBuffer> by = buffer_for(y);
     const NSUInteger oy = buffer_offset_for(y);
     launch_1d(pso_scale_inplace_fp16(), n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:by offset:oy atIndex:0];
+        [enc setBytes:&s length:sizeof(float) atIndex:1];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
+    });
+}
+
+void launch_bf16_scale_inplace(Tensor& y, float s, uint32_t n) {
+    id<MTLBuffer> by = buffer_for(y);
+    const NSUInteger oy = buffer_offset_for(y);
+    launch_1d(pso_scale_inplace_bf16(), n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:by offset:oy atIndex:0];
         [enc setBytes:&s length:sizeof(float) atIndex:1];
         [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
@@ -844,8 +1082,10 @@ void mul_inplace(Tensor& y, const Tensor& x) {
     }
     const uint32_t n = static_cast<uint32_t>(y.size());
     if (n == 0) return;
-    id<MTLComputePipelineState> pso = (y.dtype == Dtype::FP16) ?
-        pso_mul_inplace_fp16() : pso_mul_inplace_fp32();
+    id<MTLComputePipelineState> pso =
+        (y.dtype == Dtype::FP16) ? pso_mul_inplace_fp16()
+      : (y.dtype == Dtype::BF16) ? pso_mul_inplace_bf16()
+      : pso_mul_inplace_fp32();
     id<MTLBuffer> by = buffer_for(y);
     id<MTLBuffer> bx = buffer_for(x);
     const NSUInteger oy = buffer_offset_for(y);
@@ -874,7 +1114,9 @@ void geglu_forward(const Tensor& X, Tensor& Y) {
     const NSUInteger oy = buffer_offset_for(Y);
     const uint32_t Bu = B, Du = D;
     id<MTLComputePipelineState> pso =
-        (X.dtype == Dtype::FP16) ? pso_geglu_fp16() : pso_geglu_fp32();
+        (X.dtype == Dtype::FP16) ? pso_geglu_fp16()
+      : (X.dtype == Dtype::BF16) ? pso_geglu_bf16()
+      : pso_geglu_fp32();
     launch_1d(pso, total, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bx offset:ox atIndex:0];
         [enc setBuffer:by offset:oy atIndex:1];
@@ -903,7 +1145,9 @@ void geglu_backward(const Tensor& X, const Tensor& dY,
     const NSUInteger odx = buffer_offset_for(dX);
     const uint32_t Bu = B, Du = D;
     id<MTLComputePipelineState> pso =
-        (X.dtype == Dtype::FP16) ? pso_geglu_bwd_fp16() : pso_geglu_bwd_fp32();
+        (X.dtype == Dtype::FP16) ? pso_geglu_bwd_fp16()
+      : (X.dtype == Dtype::BF16) ? pso_geglu_bwd_bf16()
+      : pso_geglu_bwd_fp32();
     launch_1d(pso, total, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bx  offset:ox  atIndex:0];
         [enc setBuffer:bdy offset:ody atIndex:1];
@@ -930,7 +1174,9 @@ void geglu_exact_forward(const Tensor& X, Tensor& Y) {
     const NSUInteger oy = buffer_offset_for(Y);
     const uint32_t Bu = B, Du = D;
     id<MTLComputePipelineState> pso =
-        (X.dtype == Dtype::FP16) ? pso_geglu_exact_fp16() : pso_geglu_exact_fp32();
+        (X.dtype == Dtype::FP16) ? pso_geglu_exact_fp16()
+      : (X.dtype == Dtype::BF16) ? pso_geglu_exact_bf16()
+      : pso_geglu_exact_fp32();
     launch_1d(pso, total, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bx offset:ox atIndex:0];
         [enc setBuffer:by offset:oy atIndex:1];
@@ -959,7 +1205,9 @@ void geglu_exact_backward(const Tensor& X, const Tensor& dY,
     const NSUInteger odx = buffer_offset_for(dX);
     const uint32_t Bu = B, Du = D;
     id<MTLComputePipelineState> pso =
-        (X.dtype == Dtype::FP16) ? pso_geglu_exact_bwd_fp16() : pso_geglu_exact_bwd_fp32();
+        (X.dtype == Dtype::FP16) ? pso_geglu_exact_bwd_fp16()
+      : (X.dtype == Dtype::BF16) ? pso_geglu_exact_bwd_bf16()
+      : pso_geglu_exact_bwd_fp32();
     launch_1d(pso, total, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bx  offset:ox  atIndex:0];
         [enc setBuffer:bdy offset:ody atIndex:1];
@@ -1008,6 +1256,22 @@ kernel void k_cast_h2f(device const half* s [[buffer(0)]],
     if (i >= n) return;
     d[i] = float(s[i]);
 }
+
+kernel void k_cast_f2b(device const float* s [[buffer(0)]],
+                       device bfloat*      d [[buffer(1)]],
+                       constant uint&      n [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    d[i] = bfloat(s[i]);
+}
+
+kernel void k_cast_b2f(device const bfloat* s [[buffer(0)]],
+                       device float*        d [[buffer(1)]],
+                       constant uint&       n [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    d[i] = float(s[i]);
+}
 )msl";
 
 id<MTLComputePipelineState> pso_cast_f2h() {
@@ -1020,6 +1284,18 @@ id<MTLComputePipelineState> pso_cast_h2f() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kCastSrc, @"k_cast_h2f"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_cast_f2b() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kCastSrc, @"k_cast_f2b"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_cast_b2f() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kCastSrc, @"k_cast_b2f"); });
     return pso;
 }
 
@@ -1037,6 +1313,7 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
     const NSUInteger os = buffer_offset_for(src);
     const NSUInteger od = buffer_offset_for(dst);
 
+    // Ensure BF16 is handled properly (src.bytes() uses dtype_size_bytes).
     if (src.dtype == out_dtype) {
         @autoreleasepool {
             id<MTLCommandBuffer> cmd = new_command_buffer();
@@ -1055,9 +1332,13 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
         pso = pso_cast_f2h();
     } else if (src.dtype == Dtype::FP16 && out_dtype == Dtype::FP32) {
         pso = pso_cast_h2f();
+    } else if (src.dtype == Dtype::FP32 && out_dtype == Dtype::BF16) {
+        pso = pso_cast_f2b();
+    } else if (src.dtype == Dtype::BF16 && out_dtype == Dtype::FP32) {
+        pso = pso_cast_b2f();
     } else {
         throw std::runtime_error(
-            "cast: unsupported dtype pair (Metal supports FP32<->FP16)");
+            "cast: unsupported dtype pair (Metal supports FP32<->FP16, FP32<->BF16)");
     }
     launch_1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bs offset:os atIndex:0];
