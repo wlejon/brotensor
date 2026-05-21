@@ -96,7 +96,7 @@ void test_add_inplace_bf16(int n, uint64_t seed) {
     Tensor y_ref = y;
     brotensor::add_inplace(y_ref, x);
 
-    Tensor gy = to_bf16_cuda(y), gx = to_bf16_cuda(x);
+    Tensor gy = to_bf16_gpu(y), gx = to_bf16_gpu(x);
     brotensor::add_inplace(gy, gx);
 
     compare_tensors(y_ref, bf16_host_to_f32(download_to_host(gy)), "add_inplace_bf16", 2e-2f, 2e-2f);
@@ -126,7 +126,7 @@ void test_add_scalar_inplace_bf16(int n, uint64_t seed) {
     Tensor y_ref = y;
     brotensor::add_scalar_inplace(y_ref, s);
 
-    Tensor gy = to_bf16_cuda(y);
+    Tensor gy = to_bf16_gpu(y);
     brotensor::add_scalar_inplace(gy, s);
 
     compare_tensors(y_ref, bf16_host_to_f32(download_to_host(gy)), "add_scalar_inplace_bf16", 2e-2f, 2e-2f);

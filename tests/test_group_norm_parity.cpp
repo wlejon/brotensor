@@ -144,9 +144,9 @@ void run_fwd_bf16(const GnCfg& c, uint64_t seed) {
                                   c.num_groups, kEps, cpu_Y);
 
     // BF16 GPU path.
-    Tensor gX     = to_bf16_cuda(X_f32);
-    Tensor gGamma = to_bf16_cuda(gamma_f32);
-    Tensor gBeta  = to_bf16_cuda(beta_f32);
+    Tensor gX     = to_bf16_gpu(X_f32);
+    Tensor gGamma = to_bf16_gpu(gamma_f32);
+    Tensor gBeta  = to_bf16_gpu(beta_f32);
     Tensor gpu_Y;
     brotensor::group_norm_forward(gX, gGamma, gBeta, c.N, c.C, c.H, c.W,
                                   c.num_groups, kEps, gpu_Y);
@@ -178,16 +178,16 @@ void run_bwd_bf16(const GnCfg& c, uint64_t seed) {
                                    c.num_groups, kEps, cpu_dX, cpu_dG, cpu_dB);
 
     // BF16 GPU path.
-    Tensor gX     = to_bf16_cuda(X_f32);
-    Tensor gG     = to_bf16_cuda(gamma_f32);
-    Tensor gdY    = to_bf16_cuda(dY_f32);
+    Tensor gX     = to_bf16_gpu(X_f32);
+    Tensor gG     = to_bf16_gpu(gamma_f32);
+    Tensor gdY    = to_bf16_gpu(dY_f32);
     Tensor gpu_dX;
-    Tensor gpu_dG = Tensor::zeros_on(Device::CUDA, c.C, 1, brotensor::Dtype::BF16);
-    Tensor gpu_dB = Tensor::zeros_on(Device::CUDA, c.C, 1, brotensor::Dtype::BF16);
+    Tensor gpu_dG = Tensor::zeros_on(gpu_device(), c.C, 1, brotensor::Dtype::BF16);
+    Tensor gpu_dB = Tensor::zeros_on(gpu_device(), c.C, 1, brotensor::Dtype::BF16);
     // Pre-load the non-zero baseline into BF16 accumulator buffers.
     {
-        Tensor dG0_bf16 = to_bf16_cuda(dG0_f32);
-        Tensor dB0_bf16 = to_bf16_cuda(dB0_f32);
+        Tensor dG0_bf16 = to_bf16_gpu(dG0_f32);
+        Tensor dB0_bf16 = to_bf16_gpu(dB0_f32);
         gpu_dG = dG0_bf16;
         gpu_dB = dB0_bf16;
     }

@@ -119,8 +119,8 @@ void run_fwd_bf16(int B, int D, float eps, uint64_t seed) {
     brotensor::rms_norm_forward(X_f32, gamma_f32, eps, cpu_Y);
 
     // BF16 GPU path.
-    Tensor gX     = to_bf16_cuda(X_f32);
-    Tensor ggamma = to_bf16_cuda(gamma_f32);
+    Tensor gX     = to_bf16_gpu(X_f32);
+    Tensor ggamma = to_bf16_gpu(gamma_f32);
     Tensor gpu_Y;
     brotensor::rms_norm_forward(gX, ggamma, eps, gpu_Y);
     brotensor::sync_all();
@@ -144,11 +144,11 @@ void run_bwd_bf16(int B, int D, float eps, uint64_t seed) {
     brotensor::rms_norm_backward(X_f32, gamma_f32, dY_f32, eps, cpu_dX, cpu_dGamma);
 
     // BF16 GPU path.
-    Tensor gX     = to_bf16_cuda(X_f32);
-    Tensor ggamma = to_bf16_cuda(gamma_f32);
-    Tensor gdY    = to_bf16_cuda(dY_f32);
+    Tensor gX     = to_bf16_gpu(X_f32);
+    Tensor ggamma = to_bf16_gpu(gamma_f32);
+    Tensor gdY    = to_bf16_gpu(dY_f32);
     Tensor gpu_dX;
-    Tensor gpu_dGamma = Tensor::zeros_on(Device::CUDA, D, 1, brotensor::Dtype::BF16);
+    Tensor gpu_dGamma = Tensor::zeros_on(gpu_device(), D, 1, brotensor::Dtype::BF16);
     brotensor::rms_norm_backward(gX, ggamma, gdY, eps, gpu_dX, gpu_dGamma);
     brotensor::sync_all();
 

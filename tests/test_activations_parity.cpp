@@ -61,7 +61,7 @@ void run_fwd_bf16(Fwd fwd, const char* tag, int r, int c, uint64_t seed) {
     Tensor cpu_y;
     fwd(x, cpu_y);  // FP32 CPU reference
 
-    Tensor gx = to_bf16_cuda(x);
+    Tensor gx = to_bf16_gpu(x);
     Tensor gpu_y;
     fwd(gx, gpu_y);
 
@@ -80,8 +80,8 @@ void run_bwd_bf16(Bwd bwd, const char* tag, int r, int c, uint64_t seed) {
     Tensor cpu_dX;
     bwd(x, dY, cpu_dX);  // FP32 CPU reference
 
-    Tensor gx  = to_bf16_cuda(x);
-    Tensor gdY = to_bf16_cuda(dY);
+    Tensor gx  = to_bf16_gpu(x);
+    Tensor gdY = to_bf16_gpu(dY);
     Tensor gpu_dX;
     bwd(gx, gdY, gpu_dX);
 

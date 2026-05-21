@@ -14,6 +14,17 @@ using brotensor::Device;
 using brotensor::Dtype;
 using brotensor::Tensor;
 
+// GPU backend selection: prefer CUDA when present, else Metal. Cached after
+// the first call (which must happen after brotensor::init()).
+static Device gpu_device() {
+    static const Device d = [] {
+        if (brotensor::is_available(Device::CUDA))  return Device::CUDA;
+        if (brotensor::is_available(Device::Metal)) return Device::Metal;
+        return Device::CPU;
+    }();
+    return d;
+}
+
 // BF16 host helpers (mirrors parity_helpers.h inline versions).
 static std::vector<uint16_t> to_bf16_vec(const std::vector<float>& v) {
     std::vector<uint16_t> o(v.size());
@@ -57,7 +68,7 @@ static void test_sum_rows_fp32() {
         for (int n = 0; n < N; ++n) ref[m] += X[m * N + n];
 
     Tensor Yg;
-    Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), M, N);
+    Tensor Xg = Tensor::from_host_on(gpu_device(), X.data(), M, N);
     brotensor::sum_rows(Xg, Yg);
     CHECK(Yg.rows == M && Yg.cols == 1 && Yg.dtype == Dtype::FP32);
     std::vector<float> got(M);
@@ -84,7 +95,7 @@ static void test_sum_rows_fp16() {
 
     Tensor Yg;
     auto Xh = to_fp16(X);
-    Tensor Xg = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), M, N);
+    Tensor Xg = Tensor::from_host_fp16_on(gpu_device(), Xh.data(), M, N);
     brotensor::sum_rows(Xg, Yg);
     CHECK(Yg.dtype == Dtype::FP16 && Yg.rows == M && Yg.cols == 1);
     std::vector<uint16_t> got(M);
@@ -110,7 +121,7 @@ static void test_sum_cols_fp32() {
     for (int m = 0; m < M; ++m)
         for (int n = 0; n < N; ++n) ref[n] += X[m * N + n];
     Tensor Yg;
-    Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), M, N);
+    Tensor Xg = Tensor::from_host_on(gpu_device(), X.data(), M, N);
     brotensor::sum_cols(Xg, Yg);
     CHECK(Yg.rows == 1 && Yg.cols == N && Yg.dtype == Dtype::FP32);
     std::vector<float> got(N);
@@ -142,7 +153,7 @@ static void test_argmax_rows() {
     // FP32
     {
         Tensor Ig;
-        Tensor Xg = Tensor::from_host_on(Device::CUDA, X.data(), M, N);
+        Tensor Xg = Tensor::from_host_on(gpu_device(), X.data(), M, N);
         brotensor::argmax_rows(Xg, Ig);
         CHECK(Ig.dtype == Dtype::FP32 && Ig.rows == M && Ig.cols == 1);
         std::vector<float> got(M);
@@ -154,7 +165,7 @@ static void test_argmax_rows() {
     {
         Tensor Ig;
         auto Xh = to_fp16(X);
-        Tensor Xg = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), M, N);
+        Tensor Xg = Tensor::from_host_fp16_on(gpu_device(), Xh.data(), M, N);
         brotensor::argmax_rows(Xg, Ig);
         CHECK(Ig.dtype == Dtype::FP32);
         std::vector<float> got(M);
@@ -179,7 +190,7 @@ static void test_sum_rows_bf16() {
             ref[m] += bf16_to_f32(Xb[m * N + n]);
 
     Tensor Yg;
-    Tensor Xg = Tensor::from_host_bf16_on(Device::CUDA, Xb.data(), M, N);
+    Tensor Xg = Tensor::from_host_bf16_on(gpu_device(), Xb.data(), M, N);
     brotensor::sum_rows(Xg, Yg);
     CHECK(Yg.dtype == Dtype::BF16 && Yg.rows == M && Yg.cols == 1);
     std::vector<uint16_t> got(M);
@@ -208,7 +219,7 @@ static void test_sum_cols_bf16() {
             ref[n] += bf16_to_f32(Xb[m * N + n]);
 
     Tensor Yg;
-    Tensor Xg = Tensor::from_host_bf16_on(Device::CUDA, Xb.data(), M, N);
+    Tensor Xg = Tensor::from_host_bf16_on(gpu_device(), Xb.data(), M, N);
     brotensor::sum_cols(Xg, Yg);
     CHECK(Yg.dtype == Dtype::BF16 && Yg.rows == 1 && Yg.cols == N);
     std::vector<uint16_t> got(N);
@@ -242,7 +253,7 @@ static void test_argmax_rows_bf16() {
 
     auto Xb = to_bf16_vec(X);
     Tensor Ig;
-    Tensor Xg = Tensor::from_host_bf16_on(Device::CUDA, Xb.data(), M, N);
+    Tensor Xg = Tensor::from_host_bf16_on(gpu_device(), Xb.data(), M, N);
     brotensor::argmax_rows(Xg, Ig);
     CHECK(Ig.dtype == Dtype::FP32 && Ig.rows == M && Ig.cols == 1);
     std::vector<float> got(M);
@@ -253,7 +264,7 @@ static void test_argmax_rows_bf16() {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
+    if (!brotensor::is_available(gpu_device())) {
         std::printf("CUDA not available - skipping\n");
         return 0;
     }

@@ -90,11 +90,11 @@ Tensor make_qbf_cpu(int rows, int cols, SplitMix64& rng, float scale) {
 }
 
 // Upload a CPU FP32 tensor as a BF16 CUDA tensor of the same shape.
-Tensor to_bf16_cuda_t(const Tensor& cpu) {
+Tensor to_bf16_gpu_t(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_bf16_bits(cpu[i]);
-    return Tensor::from_host_bf16_on(Device::CUDA, h.data(), cpu.rows, cpu.cols);
+    return Tensor::from_host_bf16_on(gpu_device(), h.data(), cpu.rows, cpu.cols);
 }
 
 // Download a BF16 CUDA tensor into a CPU FP32 tensor.
@@ -516,11 +516,11 @@ void run_flash_forward_bf16(int Lq, int Lk, int D, int num_heads, uint64_t seed,
     brotensor::flash_attention_forward(Q, K, V, host_mask, num_heads, causal,
                                        O_c);
 
-    Tensor gQ = to_bf16_cuda_t(Q), gK = to_bf16_cuda_t(K), gV = to_bf16_cuda_t(V);
+    Tensor gQ = to_bf16_gpu_t(Q), gK = to_bf16_gpu_t(K), gV = to_bf16_gpu_t(V);
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO;
@@ -564,19 +564,19 @@ void run_qkvo_forward_bf16(int Lq, int Lk, int D, int D_ctx, int num_heads,
         X, Cx_c, Wq, bq_c, Wk, bk_c, Wv, bv_c, Wo, bo_c,
         host_mask, num_heads, causal, O_c);
 
-    Tensor gX = to_bf16_cuda_t(X);
-    Tensor gCx; if (cross) gCx = to_bf16_cuda_t(Cx);
-    Tensor gWq = to_bf16_cuda_t(Wq), gWk = to_bf16_cuda_t(Wk),
-           gWv = to_bf16_cuda_t(Wv), gWo = to_bf16_cuda_t(Wo);
+    Tensor gX = to_bf16_gpu_t(X);
+    Tensor gCx; if (cross) gCx = to_bf16_gpu_t(Cx);
+    Tensor gWq = to_bf16_gpu_t(Wq), gWk = to_bf16_gpu_t(Wk),
+           gWv = to_bf16_gpu_t(Wv), gWo = to_bf16_gpu_t(Wo);
     Tensor gbq, gbk, gbv, gbo;
     if (use_bias) {
-        gbq = to_bf16_cuda_t(bq); gbk = to_bf16_cuda_t(bk);
-        gbv = to_bf16_cuda_t(bv); gbo = to_bf16_cuda_t(bo);
+        gbq = to_bf16_gpu_t(bq); gbk = to_bf16_gpu_t(bk);
+        gbv = to_bf16_gpu_t(bv); gbo = to_bf16_gpu_t(bo);
     }
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
     const Tensor* gCx_p = cross ? &gCx : nullptr;
@@ -608,10 +608,10 @@ void run_project_kv_bf16(int Lk, int D, int D_ctx, uint64_t seed, bool use_bias)
     Tensor K_c, V_c;
     brotensor::flash_attention_project_kv(ctx, Wk, bk_c, Wv, bv_c, K_c, V_c);
 
-    Tensor gctx = to_bf16_cuda_t(ctx);
-    Tensor gWk = to_bf16_cuda_t(Wk), gWv = to_bf16_cuda_t(Wv);
+    Tensor gctx = to_bf16_gpu_t(ctx);
+    Tensor gWk = to_bf16_gpu_t(Wk), gWv = to_bf16_gpu_t(Wv);
     Tensor gbk, gbv;
-    if (use_bias) { gbk = to_bf16_cuda_t(bk); gbv = to_bf16_cuda_t(bv); }
+    if (use_bias) { gbk = to_bf16_gpu_t(bk); gbv = to_bf16_gpu_t(bv); }
     const Tensor* gbk_p = use_bias ? &gbk : nullptr;
     const Tensor* gbv_p = use_bias ? &gbv : nullptr;
     Tensor gK, gV;
@@ -647,16 +647,16 @@ void run_q_cached_bf16(int Lq, int Lk, int D, int num_heads, uint64_t seed,
         X, K, V, Wq, bq_c, Wo, bo_c, host_mask, num_heads,
         /*causal=*/false, O_c);
 
-    Tensor gX = to_bf16_cuda_t(X), gK = to_bf16_cuda_t(K), gV = to_bf16_cuda_t(V);
-    Tensor gWq = to_bf16_cuda_t(Wq), gWo = to_bf16_cuda_t(Wo);
+    Tensor gX = to_bf16_gpu_t(X), gK = to_bf16_gpu_t(K), gV = to_bf16_gpu_t(V);
+    Tensor gWq = to_bf16_gpu_t(Wq), gWo = to_bf16_gpu_t(Wo);
     Tensor gbq, gbo;
-    if (use_bias) { gbq = to_bf16_cuda_t(bq); gbo = to_bf16_cuda_t(bo); }
+    if (use_bias) { gbq = to_bf16_gpu_t(bq); gbo = to_bf16_gpu_t(bo); }
     const Tensor* gbq_p = use_bias ? &gbq : nullptr;
     const Tensor* gbo_p = use_bias ? &gbo : nullptr;
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO;
@@ -689,13 +689,13 @@ void run_self_attention_bf16(int L, int D, int num_heads, uint64_t seed,
         X, nullptr, Wq, nullptr, Wk, nullptr, Wv, nullptr, Wo, nullptr,
         host_mask, num_heads, /*causal=*/false, O_c);
 
-    Tensor gX = to_bf16_cuda_t(X);
-    Tensor gWq = to_bf16_cuda_t(Wq), gWk = to_bf16_cuda_t(Wk),
-           gWv = to_bf16_cuda_t(Wv), gWo = to_bf16_cuda_t(Wo);
+    Tensor gX = to_bf16_gpu_t(X);
+    Tensor gWq = to_bf16_gpu_t(Wq), gWk = to_bf16_gpu_t(Wk),
+           gWv = to_bf16_gpu_t(Wv), gWo = to_bf16_gpu_t(Wo);
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), L, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), L, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO;
@@ -722,18 +722,18 @@ void run_flash_backward_bf16(int Lq, int Lk, int D, int num_heads, uint64_t seed
     brotensor::flash_attention_backward(Q, K, V, O_dummy, dO, host_mask,
                                         num_heads, causal, dQ_c, dK_c, dV_c);
 
-    Tensor gQ = to_bf16_cuda_t(Q), gK = to_bf16_cuda_t(K), gV = to_bf16_cuda_t(V);
-    Tensor gdO = to_bf16_cuda_t(dO);
-    Tensor gO_dummy = Tensor::empty_on(Device::CUDA, 0, 0, Dtype::BF16);
+    Tensor gQ = to_bf16_gpu_t(Q), gK = to_bf16_gpu_t(K), gV = to_bf16_gpu_t(V);
+    Tensor gdO = to_bf16_gpu_t(dO);
+    Tensor gO_dummy = Tensor::empty_on(gpu_device(), 0, 0, Dtype::BF16);
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
-    Tensor gdQ = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::BF16);
-    Tensor gdK = Tensor::empty_on(Device::CUDA, Lk, D, Dtype::BF16);
-    Tensor gdV = Tensor::empty_on(Device::CUDA, Lk, D, Dtype::BF16);
+    Tensor gdQ = Tensor::empty_on(gpu_device(), Lq, D, Dtype::BF16);
+    Tensor gdK = Tensor::empty_on(gpu_device(), Lk, D, Dtype::BF16);
+    Tensor gdV = Tensor::empty_on(gpu_device(), Lk, D, Dtype::BF16);
     brotensor::flash_attention_backward(gQ, gK, gV, gO_dummy, gdO, d_mask,
                                         num_heads, causal, gdQ, gdK, gdV);
 
@@ -807,15 +807,15 @@ void run_qkvo_backward_bf16(int Lq, int Lk, int D, int D_ctx, int num_heads,
         dWq_c, dbq_cp, dWk_c, dbk_cp, dWv_c, dbv_cp, dWo_c, dbo_cp);
 
     // GPU BF16 path.
-    Tensor gX = to_bf16_cuda_t(X);
-    Tensor gCx; if (cross) gCx = to_bf16_cuda_t(Cx);
-    Tensor gWq = to_bf16_cuda_t(Wq), gWk = to_bf16_cuda_t(Wk),
-           gWv = to_bf16_cuda_t(Wv), gWo = to_bf16_cuda_t(Wo);
-    Tensor gdO = to_bf16_cuda_t(dO);
+    Tensor gX = to_bf16_gpu_t(X);
+    Tensor gCx; if (cross) gCx = to_bf16_gpu_t(Cx);
+    Tensor gWq = to_bf16_gpu_t(Wq), gWk = to_bf16_gpu_t(Wk),
+           gWv = to_bf16_gpu_t(Wv), gWo = to_bf16_gpu_t(Wo);
+    Tensor gdO = to_bf16_gpu_t(dO);
     Tensor gbq, gbk, gbv, gbo;
     if (use_bias) {
-        gbq = to_bf16_cuda_t(bq); gbk = to_bf16_cuda_t(bk);
-        gbv = to_bf16_cuda_t(bv); gbo = to_bf16_cuda_t(bo);
+        gbq = to_bf16_gpu_t(bq); gbk = to_bf16_gpu_t(bk);
+        gbv = to_bf16_gpu_t(bv); gbo = to_bf16_gpu_t(bo);
     }
     const Tensor* gCx_p = cross ? &gCx : nullptr;
     const Tensor* gbq_p = use_bias ? &gbq : nullptr;
@@ -825,26 +825,26 @@ void run_qkvo_backward_bf16(int Lq, int Lk, int D, int D_ctx, int num_heads,
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
-    Tensor gdX = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::BF16);
+    Tensor gdX = Tensor::empty_on(gpu_device(), Lq, D, Dtype::BF16);
     Tensor gdCtx;
     Tensor* gdCtx_p = nullptr;
     if (cross) {
-        gdCtx = Tensor::empty_on(Device::CUDA, Lk, D_ctx, Dtype::BF16);
+        gdCtx = Tensor::empty_on(gpu_device(), Lk, D_ctx, Dtype::BF16);
         gdCtx_p = &gdCtx;
     }
-    Tensor gdWq = to_bf16_cuda_t(dWq_init);
-    Tensor gdWk = to_bf16_cuda_t(dWk_init);
-    Tensor gdWv = to_bf16_cuda_t(dWv_init);
-    Tensor gdWo = to_bf16_cuda_t(dWo_init);
+    Tensor gdWq = to_bf16_gpu_t(dWq_init);
+    Tensor gdWk = to_bf16_gpu_t(dWk_init);
+    Tensor gdWv = to_bf16_gpu_t(dWv_init);
+    Tensor gdWo = to_bf16_gpu_t(dWo_init);
     Tensor gdbq, gdbk, gdbv, gdbo;
     Tensor *gdbq_p = nullptr, *gdbk_p = nullptr,
            *gdbv_p = nullptr, *gdbo_p = nullptr;
     if (use_bias) {
-        gdbq = to_bf16_cuda_t(dbq_init); gdbk = to_bf16_cuda_t(dbk_init);
-        gdbv = to_bf16_cuda_t(dbv_init); gdbo = to_bf16_cuda_t(dbo_init);
+        gdbq = to_bf16_gpu_t(dbq_init); gdbk = to_bf16_gpu_t(dbk_init);
+        gdbv = to_bf16_gpu_t(dbv_init); gdbo = to_bf16_gpu_t(dbo_init);
         gdbq_p = &gdbq; gdbk_p = &gdbk; gdbv_p = &gdbv; gdbo_p = &gdbo;
     }
     brotensor::flash_attention_qkvo_backward(

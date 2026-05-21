@@ -83,11 +83,11 @@ Tensor make_qbf_cpu(int rows, int cols, SplitMix64& rng, float scale) {
     return t;
 }
 
-Tensor to_bf16_cuda_t(const Tensor& cpu) {
+Tensor to_bf16_gpu_t(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_bf16_bits(cpu[i]);
-    return Tensor::from_host_bf16_on(Device::CUDA, h.data(), cpu.rows, cpu.cols);
+    return Tensor::from_host_bf16_on(gpu_device(), h.data(), cpu.rows, cpu.cols);
 }
 
 Tensor bf16_cuda_to_cpu(const Tensor& g) {
@@ -305,15 +305,15 @@ void run_cross_forward_bf16(int Lq, int Lk, int D, int num_heads,
         X, Ctx, Wq, Wk, Wv, Wo, host_mask, num_heads, O_c);
 
     // GPU BF16 path — cross_attention_forward delegates to the flash path.
-    Tensor gX  = to_bf16_cuda_t(X);
-    Tensor gCtx = to_bf16_cuda_t(Ctx);
-    Tensor gWq = to_bf16_cuda_t(Wq), gWk = to_bf16_cuda_t(Wk),
-           gWv = to_bf16_cuda_t(Wv), gWo = to_bf16_cuda_t(Wo);
+    Tensor gX  = to_bf16_gpu_t(X);
+    Tensor gCtx = to_bf16_gpu_t(Ctx);
+    Tensor gWq = to_bf16_gpu_t(Wq), gWk = to_bf16_gpu_t(Wk),
+           gWv = to_bf16_gpu_t(Wv), gWo = to_bf16_gpu_t(Wo);
 
     Tensor mg;
     const float* d_mask = nullptr;
     if (use_mask) {
-        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        mg = Tensor::from_host_on(gpu_device(), mask_host.data(), Lk, 1);
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO;

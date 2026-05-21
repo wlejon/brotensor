@@ -55,7 +55,7 @@ void run_fwd_bf16(int B, int D, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::swiglu_forward(X, cpu_Y);  // FP32 CPU reference
 
-    Tensor gX = to_bf16_cuda(X);
+    Tensor gX = to_bf16_gpu(X);
     Tensor gpu_Y;
     brotensor::swiglu_forward(gX, gpu_Y);
 
@@ -72,8 +72,8 @@ void run_bwd_bf16(int B, int D, uint64_t seed) {
     Tensor cpu_dX;
     brotensor::swiglu_backward(X, dY, cpu_dX);  // FP32 CPU reference
 
-    Tensor gX  = to_bf16_cuda(X);
-    Tensor gdY = to_bf16_cuda(dY);
+    Tensor gX  = to_bf16_gpu(X);
+    Tensor gdY = to_bf16_gpu(dY);
     Tensor gpu_dX;
     brotensor::swiglu_backward(gX, gdY, gpu_dX);
 

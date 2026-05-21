@@ -149,8 +149,8 @@ Tensor make_q_bf16_cpu(int rows, int cols, SplitMix64& rng, float scale) {
     return t;
 }
 
-Tensor to_bf16_cuda_from_cpu(const Tensor& cpu) {
-    return to_bf16_cuda(cpu);
+Tensor to_bf16_gpu_from_cpu(const Tensor& cpu) {
+    return to_bf16_gpu(cpu);
 }
 
 Tensor bf16_cuda_to_cpu(const Tensor& g) {
@@ -175,10 +175,10 @@ void run_append_bf16(int L_max, int D, int len0, int len1, uint64_t seed) {
     brotensor::kv_cache_append(K1, V1, len0, cpu_Kc, cpu_Vc);
 
     // GPU: BF16 caches.
-    Tensor gpu_Kc = Tensor::zeros_on(Device::CUDA, L_max, D, Dtype::BF16);
-    Tensor gpu_Vc = Tensor::zeros_on(Device::CUDA, L_max, D, Dtype::BF16);
-    Tensor gK0 = to_bf16_cuda_from_cpu(K0), gV0 = to_bf16_cuda_from_cpu(V0);
-    Tensor gK1 = to_bf16_cuda_from_cpu(K1), gV1 = to_bf16_cuda_from_cpu(V1);
+    Tensor gpu_Kc = Tensor::zeros_on(gpu_device(), L_max, D, Dtype::BF16);
+    Tensor gpu_Vc = Tensor::zeros_on(gpu_device(), L_max, D, Dtype::BF16);
+    Tensor gK0 = to_bf16_gpu_from_cpu(K0), gV0 = to_bf16_gpu_from_cpu(V0);
+    Tensor gK1 = to_bf16_gpu_from_cpu(K1), gV1 = to_bf16_gpu_from_cpu(V1);
     brotensor::kv_cache_append(gK0, gV0, 0,    gpu_Kc, gpu_Vc);
     brotensor::kv_cache_append(gK1, gV1, len0, gpu_Kc, gpu_Vc);
 
@@ -198,9 +198,9 @@ void run_decode_bf16(int valid_len, int Lq, int D, int num_heads,
     Tensor cpu_O;
     brotensor::flash_attention_decode(Q, Kc, Vc, valid_len, num_heads, cpu_O);
 
-    Tensor gQ  = to_bf16_cuda_from_cpu(Q);
-    Tensor gKc = to_bf16_cuda_from_cpu(Kc);
-    Tensor gVc = to_bf16_cuda_from_cpu(Vc);
+    Tensor gQ  = to_bf16_gpu_from_cpu(Q);
+    Tensor gKc = to_bf16_gpu_from_cpu(Kc);
+    Tensor gVc = to_bf16_gpu_from_cpu(Vc);
     Tensor gpu_O;
     brotensor::flash_attention_decode(gQ, gKc, gVc, valid_len, num_heads,
                                       gpu_O);

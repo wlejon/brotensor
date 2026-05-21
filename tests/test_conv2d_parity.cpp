@@ -170,11 +170,11 @@ void run_fwd_bf16(const ConvCfg& c, bool has_bias, uint64_t seed) {
                               c.pad_h, c.pad_w, c.dil_h, c.dil_w, c.groups,
                               cpu_Y);
 
-    Tensor gX = to_bf16_cuda(X);
-    Tensor gW = to_bf16_cuda(Wt);
+    Tensor gX = to_bf16_gpu(X);
+    Tensor gW = to_bf16_gpu(Wt);
     Tensor gB;
     Tensor* gBp = nullptr;
-    if (has_bias) { gB = to_bf16_cuda(B); gBp = &gB; }
+    if (has_bias) { gB = to_bf16_gpu(B); gBp = &gB; }
     Tensor gpu_Y;
     brotensor::conv2d_forward(gX, gW, gBp, c.N, c.C_in, c.H, c.W, c.C_out,
                               c.kH, c.kW, c.stride_h, c.stride_w,
@@ -202,8 +202,8 @@ void run_bwd_input_bf16(const ConvCfg& c, uint64_t seed) {
                                      c.pad_h, c.pad_w, c.dil_h, c.dil_w,
                                      c.groups, cpu_dX);
 
-    Tensor gW = to_bf16_cuda(Wt);
-    Tensor gdY = to_bf16_cuda(dY);
+    Tensor gW = to_bf16_gpu(Wt);
+    Tensor gdY = to_bf16_gpu(dY);
     Tensor gpu_dX;
     brotensor::conv2d_backward_input(gW, gdY, c.N, c.C_in, c.H, c.W, c.C_out,
                                      c.kH, c.kW, c.stride_h, c.stride_w,
@@ -233,9 +233,9 @@ void run_bwd_weight_bf16(const ConvCfg& c, uint64_t seed) {
                                       c.pad_h, c.pad_w, c.dil_h, c.dil_w,
                                       c.groups, cpu_dW);
 
-    Tensor gX = to_bf16_cuda(X);
-    Tensor gdY = to_bf16_cuda(dY);
-    Tensor gpu_dW = to_bf16_cuda(dW0);
+    Tensor gX = to_bf16_gpu(X);
+    Tensor gdY = to_bf16_gpu(dY);
+    Tensor gpu_dW = to_bf16_gpu(dW0);
     brotensor::conv2d_backward_weight(gX, gdY, c.N, c.C_in, c.H, c.W, c.C_out,
                                       c.kH, c.kW, c.stride_h, c.stride_w,
                                       c.pad_h, c.pad_w, c.dil_h, c.dil_w,
@@ -256,8 +256,8 @@ void run_bwd_bias_bf16(int N, int C_out, int H_out, int W_out, uint64_t seed) {
     Tensor cpu_dB = dB0;
     brotensor::conv2d_backward_bias(dY, N, C_out, H_out, W_out, cpu_dB);
 
-    Tensor gdY = to_bf16_cuda(dY);
-    Tensor gpu_dB = to_bf16_cuda(dB0);
+    Tensor gdY = to_bf16_gpu(dY);
+    Tensor gpu_dB = to_bf16_gpu(dB0);
     brotensor::conv2d_backward_bias(gdY, N, C_out, H_out, W_out, gpu_dB);
 
     Tensor gpu_host = bf16_host_to_f32(download_to_host(gpu_dB));

@@ -175,7 +175,7 @@ void run_up_nearest_bf16(const Shape& s, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::upsample_nearest_2x(X, s.N, s.C, s.H, s.W, cpu_Y);
 
-    Tensor gX = to_bf16_cuda(X);
+    Tensor gX = to_bf16_gpu(X);
     Tensor gpu_Y_bf16;
     brotensor::upsample_nearest_2x(gX, s.N, s.C, s.H, s.W, gpu_Y_bf16);
     Tensor gpu_Y = bf16_host_to_f32(download_to_host(gpu_Y_bf16));
@@ -191,7 +191,7 @@ void run_up_bilinear_bf16(const Shape& s, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::upsample_bilinear_2x(X, s.N, s.C, s.H, s.W, cpu_Y);
 
-    Tensor gX = to_bf16_cuda(X);
+    Tensor gX = to_bf16_gpu(X);
     Tensor gpu_Y_bf16;
     brotensor::upsample_bilinear_2x(gX, s.N, s.C, s.H, s.W, gpu_Y_bf16);
     Tensor gpu_Y = bf16_host_to_f32(download_to_host(gpu_Y_bf16));
@@ -207,7 +207,7 @@ void run_down_avg_bf16(const Shape& s, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::downsample_avg_2x(X, s.N, s.C, s.H, s.W, cpu_Y);
 
-    Tensor gX = to_bf16_cuda(X);
+    Tensor gX = to_bf16_gpu(X);
     Tensor gpu_Y_bf16;
     brotensor::downsample_avg_2x(gX, s.N, s.C, s.H, s.W, gpu_Y_bf16);
     Tensor gpu_Y = bf16_host_to_f32(download_to_host(gpu_Y_bf16));
@@ -223,7 +223,7 @@ void run_up_nearest_bwd_bf16(const Shape& s, uint64_t seed) {
     Tensor cpu_dX;
     brotensor::upsample_nearest_2x_backward(dY, s.N, s.C, s.H, s.W, cpu_dX);
 
-    Tensor gdY = to_bf16_cuda(dY);
+    Tensor gdY = to_bf16_gpu(dY);
     Tensor gpu_dX_bf16;
     brotensor::upsample_nearest_2x_backward(gdY, s.N, s.C, s.H, s.W, gpu_dX_bf16);
     Tensor gpu_dX = bf16_host_to_f32(download_to_host(gpu_dX_bf16));
@@ -239,7 +239,7 @@ void run_up_bilinear_bwd_bf16(const Shape& s, uint64_t seed) {
     Tensor cpu_dX;
     brotensor::upsample_bilinear_2x_backward(dY, s.N, s.C, s.H, s.W, cpu_dX);
 
-    Tensor gdY = to_bf16_cuda(dY);
+    Tensor gdY = to_bf16_gpu(dY);
     Tensor gpu_dX_bf16;
     brotensor::upsample_bilinear_2x_backward(gdY, s.N, s.C, s.H, s.W, gpu_dX_bf16);
     Tensor gpu_dX = bf16_host_to_f32(download_to_host(gpu_dX_bf16));
@@ -256,7 +256,7 @@ void run_down_avg_bwd_bf16(const Shape& s, uint64_t seed) {
     Tensor cpu_dX;
     brotensor::downsample_avg_2x_backward(dY, s.N, s.C, s.H, s.W, cpu_dX);
 
-    Tensor gdY = to_bf16_cuda(dY);
+    Tensor gdY = to_bf16_gpu(dY);
     Tensor gpu_dX_bf16;
     brotensor::downsample_avg_2x_backward(gdY, s.N, s.C, s.H, s.W, gpu_dX_bf16);
     Tensor gpu_dX = bf16_host_to_f32(download_to_host(gpu_dX_bf16));

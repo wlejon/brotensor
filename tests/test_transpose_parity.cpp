@@ -101,7 +101,7 @@ void run_fwd_bf16(const Shape& s, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::nchw_to_sequence(X, s.N, s.C, s.H, s.W, cpu_Y);
 
-    Tensor gX = to_bf16_cuda(X);
+    Tensor gX = to_bf16_gpu(X);
     Tensor gpu_Y_bf16;
     brotensor::nchw_to_sequence(gX, s.N, s.C, s.H, s.W, gpu_Y_bf16);
     Tensor gpu_Y = bf16_host_to_f32(download_to_host(gpu_Y_bf16));
@@ -118,7 +118,7 @@ void run_inv_bf16(const Shape& s, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::sequence_to_nchw(X, s.N, s.C, s.H, s.W, cpu_Y);
 
-    Tensor gX = to_bf16_cuda(X);
+    Tensor gX = to_bf16_gpu(X);
     Tensor gpu_Y_bf16;
     brotensor::sequence_to_nchw(gX, s.N, s.C, s.H, s.W, gpu_Y_bf16);
     Tensor gpu_Y = bf16_host_to_f32(download_to_host(gpu_Y_bf16));

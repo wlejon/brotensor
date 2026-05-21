@@ -98,12 +98,12 @@ void run_layernorm_bf16_bwd(int n, uint64_t seed) {
                                   cpu_dX, cpu_dGamma, cpu_dBeta);
 
     // BF16 GPU path.
-    Tensor gdY    = to_bf16_cuda(dY_f32);
-    Tensor gxhat  = to_bf16_cuda(xhat_f32);
-    Tensor ggamma = to_bf16_cuda(gamma_f32);
-    Tensor gpu_dX = Tensor::zeros_on(Device::CUDA, n, 1, brotensor::Dtype::BF16);
-    Tensor gpu_dGamma = to_bf16_cuda(dGamma_init_f32);
-    Tensor gpu_dBeta  = to_bf16_cuda(dBeta_init_f32);
+    Tensor gdY    = to_bf16_gpu(dY_f32);
+    Tensor gxhat  = to_bf16_gpu(xhat_f32);
+    Tensor ggamma = to_bf16_gpu(gamma_f32);
+    Tensor gpu_dX = Tensor::zeros_on(gpu_device(), n, 1, brotensor::Dtype::BF16);
+    Tensor gpu_dGamma = to_bf16_gpu(dGamma_init_f32);
+    Tensor gpu_dBeta  = to_bf16_gpu(dBeta_init_f32);
     brotensor::layernorm_backward(gdY, gxhat, ggamma, rstd,
                                   gpu_dX, gpu_dGamma, gpu_dBeta);
     brotensor::sync_all();

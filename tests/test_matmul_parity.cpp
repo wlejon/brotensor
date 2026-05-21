@@ -102,8 +102,8 @@ void run_matmul_bf16(int M, int K, int N, uint64_t seed) {
     Tensor cpu_C;
     brotensor::matmul(A, B, cpu_C);
 
-    Tensor gA = to_bf16_cuda(A);
-    Tensor gB = to_bf16_cuda(B);
+    Tensor gA = to_bf16_gpu(A);
+    Tensor gB = to_bf16_gpu(B);
     Tensor gpu_C;
     brotensor::matmul(gA, gB, gpu_C);
 
@@ -125,11 +125,11 @@ void run_matmul_bwd_bf16(int M, int K, int N, uint64_t seed) {
     Tensor cpu_dB = Tensor::mat(K, N);
     brotensor::matmul_backward(A, B, dC, cpu_dA, cpu_dB);
 
-    Tensor gA  = to_bf16_cuda(A);
-    Tensor gB  = to_bf16_cuda(B);
-    Tensor gdC = to_bf16_cuda(dC);
-    Tensor gpu_dA = Tensor::zeros_on(Device::CUDA, M, K, brotensor::Dtype::BF16);
-    Tensor gpu_dB = Tensor::zeros_on(Device::CUDA, K, N, brotensor::Dtype::BF16);
+    Tensor gA  = to_bf16_gpu(A);
+    Tensor gB  = to_bf16_gpu(B);
+    Tensor gdC = to_bf16_gpu(dC);
+    Tensor gpu_dA = Tensor::zeros_on(gpu_device(), M, K, brotensor::Dtype::BF16);
+    Tensor gpu_dB = Tensor::zeros_on(gpu_device(), K, N, brotensor::Dtype::BF16);
     brotensor::matmul_backward(gA, gB, gdC, gpu_dA, gpu_dB);
 
     // Backward over a reduction — keep K modest and tolerance loose.

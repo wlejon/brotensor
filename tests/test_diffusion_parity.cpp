@@ -81,11 +81,11 @@ Tensor make_qbf_cpu(int rows, int cols, SplitMix64& rng, float scale) {
 }
 
 // Upload a CPU FP32 tensor's values as a BF16 CUDA tensor of the same shape.
-Tensor to_bf16_cuda_local(const Tensor& cpu) {
+Tensor to_bf16_gpu_local(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_bf16_bits(cpu[i]);
-    return Tensor::from_host_bf16_on(Device::CUDA, h.data(),
+    return Tensor::from_host_bf16_on(gpu_device(), h.data(),
                                      cpu.rows, cpu.cols);
 }
 
@@ -173,8 +173,8 @@ void run_ddim_bf16(int rows, int cols, float alpha_t, float alpha_prev,
     Tensor cpu_xp;
     brotensor::ddim_step(x_t, eps, alpha_t, alpha_prev, sigma_t, cpu_xp);
 
-    Tensor gx = to_bf16_cuda_local(x_t);
-    Tensor ge = to_bf16_cuda_local(eps);
+    Tensor gx = to_bf16_gpu_local(x_t);
+    Tensor ge = to_bf16_gpu_local(eps);
     Tensor gpu_xp;
     brotensor::ddim_step(gx, ge, alpha_t, alpha_prev, sigma_t, gpu_xp);
 
@@ -191,8 +191,8 @@ void run_euler_bf16(int rows, int cols, float sigma_t, float sigma_prev,
     Tensor cpu_xp;
     brotensor::euler_step(x_t, eps, sigma_t, sigma_prev, cpu_xp);
 
-    Tensor gx = to_bf16_cuda_local(x_t);
-    Tensor ge = to_bf16_cuda_local(eps);
+    Tensor gx = to_bf16_gpu_local(x_t);
+    Tensor ge = to_bf16_gpu_local(eps);
     Tensor gpu_xp;
     brotensor::euler_step(gx, ge, sigma_t, sigma_prev, gpu_xp);
 
@@ -211,9 +211,9 @@ void run_dpmpp_bf16(int rows, int cols, float sigma_t,
     brotensor::dpmpp_2m_step(x_t, eps, x0p, sigma_t,
                              c_xt, c_x0t, c_x0prev, cpu_xp, cpu_x0);
 
-    Tensor gx  = to_bf16_cuda_local(x_t);
-    Tensor ge  = to_bf16_cuda_local(eps);
-    Tensor gx0 = to_bf16_cuda_local(x0p);
+    Tensor gx  = to_bf16_gpu_local(x_t);
+    Tensor ge  = to_bf16_gpu_local(eps);
+    Tensor gx0 = to_bf16_gpu_local(x0p);
     Tensor gpu_xp, gpu_x0;
     brotensor::dpmpp_2m_step(gx, ge, gx0, sigma_t,
                              c_xt, c_x0t, c_x0prev, gpu_xp, gpu_x0);

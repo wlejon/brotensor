@@ -97,11 +97,11 @@ void run_embedding_bf16(int V, int D, const std::vector<int32_t>& idx,
     brotensor::embedding_lookup_backward(dOut_f32, idx.data(), B, dTable_cpu);
 
     // GPU: BF16 tensors. dTable starts as zero (CPU pre-fill not comparable).
-    Tensor gtable  = to_bf16_cuda(table_f32);
-    Tensor gdOut   = to_bf16_cuda(dOut_f32);
-    Tensor gout    = Tensor::zeros_on(Device::CUDA, B, D,
+    Tensor gtable  = to_bf16_gpu(table_f32);
+    Tensor gdOut   = to_bf16_gpu(dOut_f32);
+    Tensor gout    = Tensor::zeros_on(gpu_device(), B, D,
                                       brotensor::Dtype::BF16);
-    Tensor gdTable = Tensor::zeros_on(Device::CUDA, V, D,
+    Tensor gdTable = Tensor::zeros_on(gpu_device(), V, D,
                                       brotensor::Dtype::BF16);
 
     Tensor d_idx_buf = upload_indices(idx);

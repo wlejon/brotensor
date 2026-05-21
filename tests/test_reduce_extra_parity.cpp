@@ -90,7 +90,7 @@ void run_sum_rows_bf16(int M, int N, uint64_t seed) {
     brotensor::sum_rows(X_f32, y_cpu);
 
     // BF16 GPU.
-    Tensor gX = to_bf16_cuda(X_f32);
+    Tensor gX = to_bf16_gpu(X_f32);
     Tensor gy;
     brotensor::sum_rows(gX, gy);
     BT_CHECK(gy.dtype == Dtype::BF16);
@@ -108,7 +108,7 @@ void run_sum_cols_bf16(int M, int N, uint64_t seed) {
     Tensor y_cpu;
     brotensor::sum_cols(X_f32, y_cpu);
 
-    Tensor gX = to_bf16_cuda(X_f32);
+    Tensor gX = to_bf16_gpu(X_f32);
     Tensor gy;
     brotensor::sum_cols(gX, gy);
     BT_CHECK(gy.dtype == Dtype::BF16);
@@ -128,7 +128,7 @@ void run_argmax_bf16(int M, int N, uint64_t seed) {
     Tensor idx_cpu;
     brotensor::argmax_rows(X_f32, idx_cpu);
 
-    Tensor gX = to_bf16_cuda(X_f32);
+    Tensor gX = to_bf16_gpu(X_f32);
     Tensor gidx;
     brotensor::argmax_rows(gX, gidx);
     BT_CHECK(gidx.dtype == Dtype::FP32);

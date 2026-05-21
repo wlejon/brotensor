@@ -242,7 +242,7 @@ void run_batched_rows_bf16(int B, const std::vector<int>& cols, uint64_t seed) {
     std::vector<Tensor> parts_gpu(cols.size());
     std::vector<const Tensor*> gpu_ptr;
     for (size_t i = 0; i < cols.size(); ++i) {
-        parts_gpu[i] = to_bf16_cuda(parts_cpu[i]);
+        parts_gpu[i] = to_bf16_gpu(parts_cpu[i]);
         gpu_ptr.push_back(&parts_gpu[i]);
     }
     Tensor out_gpu_bf16;
@@ -276,7 +276,7 @@ void run_nchw_bf16(int N, int H, int W, const std::vector<int>& C_per_part,
     std::vector<Tensor> parts_gpu(C_per_part.size());
     std::vector<const Tensor*> gpu_ptr;
     for (size_t i = 0; i < C_per_part.size(); ++i) {
-        parts_gpu[i] = to_bf16_cuda(parts_cpu[i]);
+        parts_gpu[i] = to_bf16_gpu(parts_cpu[i]);
         gpu_ptr.push_back(&parts_gpu[i]);
     }
     Tensor out_gpu_bf16;

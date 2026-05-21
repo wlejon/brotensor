@@ -192,12 +192,12 @@ static void run_linear_backward_batched_bf16(int B, int in_dim, int out_dim,
     }
 
     // BF16 GPU run.
-    Tensor gW  = to_bf16_cuda(W_f32);
-    Tensor gX  = to_bf16_cuda(X_f32);
-    Tensor gdY = to_bf16_cuda(dY_f32);
+    Tensor gW  = to_bf16_gpu(W_f32);
+    Tensor gX  = to_bf16_gpu(X_f32);
+    Tensor gdY = to_bf16_gpu(dY_f32);
     Tensor gdX;
-    Tensor gdW  = Tensor::zeros_on(Device::CUDA, out_dim, in_dim, Dtype::BF16);
-    Tensor gdB  = Tensor::zeros_on(Device::CUDA, out_dim, 1,      Dtype::BF16);
+    Tensor gdW  = Tensor::zeros_on(gpu_device(), out_dim, in_dim, Dtype::BF16);
+    Tensor gdB  = Tensor::zeros_on(gpu_device(), out_dim, 1,      Dtype::BF16);
 
     brotensor::linear_backward_batched(gW, gX, gdY, gdX, gdW, gdB);
     BT_CHECK(gdX.dtype == Dtype::BF16);

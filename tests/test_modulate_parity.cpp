@@ -70,9 +70,9 @@ void run_modulate_bf16(int L, int D, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::modulate(X, scale, shift, cpu_Y);
 
-    Tensor gX     = to_bf16_cuda(X);
-    Tensor gscale = to_bf16_cuda(scale);
-    Tensor gshift = to_bf16_cuda(shift);
+    Tensor gX     = to_bf16_gpu(X);
+    Tensor gscale = to_bf16_gpu(scale);
+    Tensor gshift = to_bf16_gpu(shift);
     Tensor gpu_Y;
     brotensor::modulate(gX, gscale, gshift, gpu_Y);
     brotensor::sync_all();
@@ -91,8 +91,8 @@ void run_broadcast_mul_bf16(int L, int D, uint64_t seed) {
     Tensor cpu_Y;
     brotensor::broadcast_mul(X, v, cpu_Y);
 
-    Tensor gX = to_bf16_cuda(X);
-    Tensor gv = to_bf16_cuda(v);
+    Tensor gX = to_bf16_gpu(X);
+    Tensor gv = to_bf16_gpu(v);
     Tensor gpu_Y;
     brotensor::broadcast_mul(gX, gv, gpu_Y);
     brotensor::sync_all();

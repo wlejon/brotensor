@@ -133,8 +133,9 @@ inline Tensor download_to_host(const Tensor& g) {
 // ─── BF16 parity helpers ───────────────────────────────────────────────────
 //
 // BF16 ops are GPU-only (the CPU backend is FP32-only). A BF16 parity test
-// rounds its FP32 inputs to BF16, runs the op on CUDA, widens the BF16 result
-// back to FP32, and compares against the FP32 CPU reference with a loose
+// rounds its FP32 inputs to BF16, runs the op on the GPU backend (CUDA or
+// Metal), widens the BF16 result back to FP32, and compares against the FP32
+// CPU reference with a loose
 // tolerance — BF16 carries only 8 mantissa bits (~2-3 decimal digits), so use
 // atol/rtol around 2e-2 (looser still for long reductions: matmul, attention).
 
@@ -158,9 +159,10 @@ inline Tensor bf16_host_to_f32(const Tensor& bf16cpu) {
     return out;
 }
 
-// Convenience: round an FP32 host tensor to BF16 and place it on CUDA.
-inline Tensor to_bf16_cuda(const Tensor& f32cpu) {
-    return to_bf16_host(f32cpu).to(brotensor::Device::CUDA);
+// Convenience: round an FP32 host tensor to BF16 and place it on the GPU
+// backend this binary was built with (CUDA when present, else Metal).
+inline Tensor to_bf16_gpu(const Tensor& f32cpu) {
+    return to_bf16_host(f32cpu).to(gpu_device());
 }
 
 // ─── Backend-neutral mask / index buffer helpers ──────────────────────────

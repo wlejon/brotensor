@@ -37,7 +37,7 @@ void run_clamp_bf16(int r, int c, float lo, float hi, uint64_t seed) {
     Tensor cpu = base;
     brotensor::clamp(cpu, lo, hi);  // FP32 CPU reference
 
-    Tensor gpu = to_bf16_cuda(base);
+    Tensor gpu = to_bf16_gpu(base);
     brotensor::clamp(gpu, lo, hi);
 
     compare_tensors(cpu, bf16_host_to_f32(download_to_host(gpu)), "clamp_bf16", 2e-2f, 2e-2f);
@@ -69,8 +69,8 @@ void run_mul_bf16(int r, int c, uint64_t seed) {
     Tensor cpu = a;
     brotensor::mul_inplace(cpu, b);  // FP32 CPU reference
 
-    Tensor ga = to_bf16_cuda(a);
-    Tensor gb = to_bf16_cuda(b);
+    Tensor ga = to_bf16_gpu(a);
+    Tensor gb = to_bf16_gpu(b);
     brotensor::mul_inplace(ga, gb);
 
     compare_tensors(cpu, bf16_host_to_f32(download_to_host(ga)), "mul_inplace_bf16", 2e-2f, 2e-2f);

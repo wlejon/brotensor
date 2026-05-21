@@ -119,11 +119,11 @@ Tensor make_qbf_cpu(int rows, int cols, SplitMix64& rng, float scale) {
     return t;
 }
 
-Tensor to_bf16_cuda_t(const Tensor& cpu) {
+Tensor to_bf16_gpu_t(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) h[i] = brotensor::fp32_to_bf16_bits(cpu[i]);
-    return Tensor::from_host_bf16_on(brotensor::Device::CUDA, h.data(),
+    return Tensor::from_host_bf16_on(gpu_device(), h.data(),
                                      cpu.rows, cpu.cols);
 }
 
@@ -152,9 +152,9 @@ void run_self_attn_forward_bf16(int L, int D, int num_heads, uint64_t seed,
         X, nullptr, Wq, nullptr, Wk, nullptr, Wv, nullptr, Wo, nullptr,
         host_mask, num_heads, /*causal=*/false, O_c);
 
-    Tensor gX  = to_bf16_cuda_t(X);
-    Tensor gWq = to_bf16_cuda_t(Wq), gWk = to_bf16_cuda_t(Wk),
-           gWv = to_bf16_cuda_t(Wv), gWo = to_bf16_cuda_t(Wo);
+    Tensor gX  = to_bf16_gpu_t(X);
+    Tensor gWq = to_bf16_gpu_t(Wq), gWk = to_bf16_gpu_t(Wk),
+           gWv = to_bf16_gpu_t(Wv), gWo = to_bf16_gpu_t(Wo);
     Tensor d_mask_buf = upload_mask(mask);
     const float* d_mask = static_cast<const float*>(d_mask_buf.data);
 
@@ -256,12 +256,12 @@ void run_sab_bf16(int L, int D, int num_heads, float scale, bool with_bias,
     brotensor::self_attention_bias_forward(X, Wq, Wk, Wv, Wo, nullptr,
                                            bias_cpu, num_heads, scale, O_c);
 
-    Tensor gX  = to_bf16_cuda_t(X);
-    Tensor gWq = to_bf16_cuda_t(Wq), gWk = to_bf16_cuda_t(Wk),
-           gWv = to_bf16_cuda_t(Wv), gWo = to_bf16_cuda_t(Wo);
+    Tensor gX  = to_bf16_gpu_t(X);
+    Tensor gWq = to_bf16_gpu_t(Wq), gWk = to_bf16_gpu_t(Wk),
+           gWv = to_bf16_gpu_t(Wv), gWo = to_bf16_gpu_t(Wo);
     Tensor gbias;
     const Tensor* bias_gpu = nullptr;
-    if (with_bias) { gbias = bias.to(Device::CUDA); bias_gpu = &gbias; }
+    if (with_bias) { gbias = bias.to(gpu_device()); bias_gpu = &gbias; }
 
     Tensor gO;
     brotensor::self_attention_bias_forward(gX, gWq, gWk, gWv, gWo, nullptr,

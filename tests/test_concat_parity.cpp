@@ -92,7 +92,7 @@ void run_concat_bf16(const std::vector<int>& sizes, uint64_t seed) {
     std::vector<Tensor> g_parts(sizes.size());
     std::vector<const Tensor*> g_parts_ptr;
     for (size_t i = 0; i < sizes.size(); ++i) {
-        g_parts[i] = to_bf16_cuda(parts_cpu[i]);
+        g_parts[i] = to_bf16_gpu(parts_cpu[i]);
         g_parts_ptr.push_back(&g_parts[i]);
     }
     Tensor gcat;
@@ -106,7 +106,7 @@ void run_concat_bf16(const std::vector<int>& sizes, uint64_t seed) {
     std::vector<Tensor> g_split(sizes.size());
     std::vector<Tensor*> g_split_ptr;
     for (size_t i = 0; i < sizes.size(); ++i) {
-        g_split[i] = Tensor::zeros_on(Device::CUDA, sizes[i], 1, Dtype::BF16);
+        g_split[i] = Tensor::zeros_on(gpu_device(), sizes[i], 1, Dtype::BF16);
         g_split_ptr.push_back(&g_split[i]);
     }
     brotensor::split_rows(gcat, g_split_ptr);

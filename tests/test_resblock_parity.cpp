@@ -284,14 +284,14 @@ void run_forward_bf16(int N, int C_in, int C_out, int H, int W, int num_groups,
                                 N, C_in, C_out, H, W, num_groups, eps, Y_c);
 
     // GPU BF16 path.
-    Tensor gX  = to_bf16_cuda(X);
-    Tensor gg1 = to_bf16_cuda(g1), gb1 = to_bf16_cuda(b1);
-    Tensor gW1 = to_bf16_cuda(W1), gbc1 = to_bf16_cuda(bc1);
-    Tensor gg2 = to_bf16_cuda(g2), gb2 = to_bf16_cuda(b2);
-    Tensor gW2 = to_bf16_cuda(W2), gbc2 = to_bf16_cuda(bc2);
+    Tensor gX  = to_bf16_gpu(X);
+    Tensor gg1 = to_bf16_gpu(g1), gb1 = to_bf16_gpu(b1);
+    Tensor gW1 = to_bf16_gpu(W1), gbc1 = to_bf16_gpu(bc1);
+    Tensor gg2 = to_bf16_gpu(g2), gb2 = to_bf16_gpu(b2);
+    Tensor gW2 = to_bf16_gpu(W2), gbc2 = to_bf16_gpu(bc2);
     Tensor gWsk, gbsk, gtemb;
-    if (need_skip) { gWsk = to_bf16_cuda(Wsk); gbsk = to_bf16_cuda(bsk); }
-    if (with_temb) gtemb = to_bf16_cuda(temb);
+    if (need_skip) { gWsk = to_bf16_gpu(Wsk); gbsk = to_bf16_gpu(bsk); }
+    if (with_temb) gtemb = to_bf16_gpu(temb);
     const Tensor* gtemb_p = with_temb ? &gtemb : nullptr;
     const Tensor* gWsk_p  = need_skip ? &gWsk : nullptr;
     const Tensor* gbsk_p  = need_skip ? &gbsk : nullptr;
@@ -367,29 +367,29 @@ void run_backward_bf16(int N, int C_in, int C_out, int H, int W, int num_groups,
         dG2_c, dB2_c, dW2_c, &db2_c, dWsk_cp, dbsk_cp);
 
     // GPU BF16 path.
-    Tensor gX  = to_bf16_cuda(X);
-    Tensor gg1 = to_bf16_cuda(g1), gb1 = to_bf16_cuda(b1);
-    Tensor gW1 = to_bf16_cuda(W1), gbc1 = to_bf16_cuda(bc1);
-    Tensor gg2 = to_bf16_cuda(g2), gb2 = to_bf16_cuda(b2);
-    Tensor gW2 = to_bf16_cuda(W2), gbc2 = to_bf16_cuda(bc2);
-    Tensor gdY = to_bf16_cuda(dY);
+    Tensor gX  = to_bf16_gpu(X);
+    Tensor gg1 = to_bf16_gpu(g1), gb1 = to_bf16_gpu(b1);
+    Tensor gW1 = to_bf16_gpu(W1), gbc1 = to_bf16_gpu(bc1);
+    Tensor gg2 = to_bf16_gpu(g2), gb2 = to_bf16_gpu(b2);
+    Tensor gW2 = to_bf16_gpu(W2), gbc2 = to_bf16_gpu(bc2);
+    Tensor gdY = to_bf16_gpu(dY);
     Tensor gWsk, gbsk, gtemb;
-    if (need_skip) { gWsk = to_bf16_cuda(Wsk); gbsk = to_bf16_cuda(bsk); }
-    if (with_temb) gtemb = to_bf16_cuda(temb);
+    if (need_skip) { gWsk = to_bf16_gpu(Wsk); gbsk = to_bf16_gpu(bsk); }
+    if (with_temb) gtemb = to_bf16_gpu(temb);
     const Tensor* gtemb_p = with_temb ? &gtemb : nullptr;
     const Tensor* gWsk_p  = need_skip ? &gWsk : nullptr;
     const Tensor* gbsk_p  = need_skip ? &gbsk : nullptr;
 
-    Tensor gdX  = Tensor::empty_on(Device::CUDA, N, C_in * spatial, Dtype::BF16);
-    Tensor gdG1 = to_bf16_cuda(dG1_i), gdB1 = to_bf16_cuda(dB1_i);
-    Tensor gdW1 = to_bf16_cuda(dW1_i), gdb1 = to_bf16_cuda(db1_i);
-    Tensor gdG2 = to_bf16_cuda(dG2_i), gdB2 = to_bf16_cuda(dB2_i);
-    Tensor gdW2 = to_bf16_cuda(dW2_i), gdb2 = to_bf16_cuda(db2_i);
+    Tensor gdX  = Tensor::empty_on(gpu_device(), N, C_in * spatial, Dtype::BF16);
+    Tensor gdG1 = to_bf16_gpu(dG1_i), gdB1 = to_bf16_gpu(dB1_i);
+    Tensor gdW1 = to_bf16_gpu(dW1_i), gdb1 = to_bf16_gpu(db1_i);
+    Tensor gdG2 = to_bf16_gpu(dG2_i), gdB2 = to_bf16_gpu(dB2_i);
+    Tensor gdW2 = to_bf16_gpu(dW2_i), gdb2 = to_bf16_gpu(db2_i);
     Tensor gdt, gdWsk, gdbsk;
     Tensor *gdt_p = nullptr, *gdWsk_p = nullptr, *gdbsk_p = nullptr;
-    if (with_temb) { gdt = to_bf16_cuda(dt_i); gdt_p = &gdt; }
+    if (with_temb) { gdt = to_bf16_gpu(dt_i); gdt_p = &gdt; }
     if (need_skip) {
-        gdWsk = to_bf16_cuda(dWsk_i); gdbsk = to_bf16_cuda(dbsk_i);
+        gdWsk = to_bf16_gpu(dWsk_i); gdbsk = to_bf16_gpu(dbsk_i);
         gdWsk_p = &gdWsk; gdbsk_p = &gdbsk;
     }
     brotensor::resblock_backward(

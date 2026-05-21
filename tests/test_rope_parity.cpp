@@ -125,9 +125,9 @@ void run_apply_fwd_bf16(int L, int num_heads, int head_dim, int seq_offset,
     brotensor::rope_apply(X, cos_tbl, sin_tbl, head_dim, num_heads, cpu_Y);
 
     // BF16 X; cos/sin tables stay FP32 on the GPU.
-    Tensor gX = to_bf16_cuda(X);
-    Tensor gC = cos_tbl.to(Device::CUDA);
-    Tensor gS = sin_tbl.to(Device::CUDA);
+    Tensor gX = to_bf16_gpu(X);
+    Tensor gC = cos_tbl.to(gpu_device());
+    Tensor gS = sin_tbl.to(gpu_device());
     Tensor gpu_Y;
     brotensor::rope_apply(gX, gC, gS, head_dim, num_heads, gpu_Y);
     brotensor::sync_all();
