@@ -87,4 +87,55 @@ BT_PARITY_TEST(transpose_roundtrip_tiny)   { run_roundtrip(kTiny,   0x7120ull); 
 BT_PARITY_TEST(transpose_roundtrip_batch)  { run_roundtrip(kBatch,  0x7121ull); }
 BT_PARITY_TEST(transpose_roundtrip_big)    { run_roundtrip(kBig,    0x7122ull); }
 
+// ─── BF16: BF16-on-CUDA vs FP32 CPU reference ─────────────────────────────
+// Both ops are pure gathers — atol/rtol=2e-2 absorbs BF16 rounding on input.
+
+namespace {
+
+void run_fwd_bf16(const Shape& s, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int HW = s.H * s.W;
+    Tensor X = Tensor::mat(s.N, s.C * HW);
+    fill_random(X, rng);
+
+    Tensor cpu_Y;
+    brotensor::nchw_to_sequence(X, s.N, s.C, s.H, s.W, cpu_Y);
+
+    Tensor gX = to_bf16_cuda(X);
+    Tensor gpu_Y_bf16;
+    brotensor::nchw_to_sequence(gX, s.N, s.C, s.H, s.W, gpu_Y_bf16);
+    Tensor gpu_Y = bf16_host_to_f32(download_to_host(gpu_Y_bf16));
+
+    compare_tensors(cpu_Y, gpu_Y, "nchw_to_seq_bf16", 2e-2f, 2e-2f);
+}
+
+void run_inv_bf16(const Shape& s, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int HW = s.H * s.W;
+    Tensor X = Tensor::mat(s.N * HW, s.C);
+    fill_random(X, rng);
+
+    Tensor cpu_Y;
+    brotensor::sequence_to_nchw(X, s.N, s.C, s.H, s.W, cpu_Y);
+
+    Tensor gX = to_bf16_cuda(X);
+    Tensor gpu_Y_bf16;
+    brotensor::sequence_to_nchw(gX, s.N, s.C, s.H, s.W, gpu_Y_bf16);
+    Tensor gpu_Y = bf16_host_to_f32(download_to_host(gpu_Y_bf16));
+
+    compare_tensors(cpu_Y, gpu_Y, "seq_to_nchw_bf16", 2e-2f, 2e-2f);
+}
+
+} // namespace (bf16 helpers)
+
+BT_PARITY_TEST(transpose_bf16_nchw_to_seq_tiny)   { run_fwd_bf16(kTiny,   0x7130ull); }
+BT_PARITY_TEST(transpose_bf16_nchw_to_seq_square) { run_fwd_bf16(kSquare, 0x7131ull); }
+BT_PARITY_TEST(transpose_bf16_nchw_to_seq_batch)  { run_fwd_bf16(kBatch,  0x7132ull); }
+BT_PARITY_TEST(transpose_bf16_nchw_to_seq_big)    { run_fwd_bf16(kBig,    0x7133ull); }
+
+BT_PARITY_TEST(transpose_bf16_seq_to_nchw_tiny)   { run_inv_bf16(kTiny,   0x7140ull); }
+BT_PARITY_TEST(transpose_bf16_seq_to_nchw_square) { run_inv_bf16(kSquare, 0x7141ull); }
+BT_PARITY_TEST(transpose_bf16_seq_to_nchw_batch)  { run_inv_bf16(kBatch,  0x7142ull); }
+BT_PARITY_TEST(transpose_bf16_seq_to_nchw_big)    { run_inv_bf16(kBig,    0x7143ull); }
+
 int main() { return run_all("transpose cpu/gpu parity"); }

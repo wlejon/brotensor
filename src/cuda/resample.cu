@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 #include <string>
@@ -20,11 +21,13 @@ template <typename T>
 __device__ inline float to_f32(T v);
 template <> __device__ inline float to_f32<float>(float v)   { return v; }
 template <> __device__ inline float to_f32<__half>(__half v) { return __half2float(v); }
+template <> __device__ inline float to_f32<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
 
 template <typename T>
 __device__ inline T from_f32(float v);
 template <> __device__ inline float  from_f32<float>(float v)  { return v; }
 template <> __device__ inline __half from_f32<__half>(float v) { return __float2half(v); }
+template <> __device__ inline __nv_bfloat16 from_f32<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
 
 template <typename T>
 __global__ void upsample_nearest_2x_kernel(const T* __restrict__ X,
@@ -216,12 +219,60 @@ __global__ void upsample_bilinear_2x_backward_scatter_fp16(
     atomicAdd(&dX_f32[(base + y1c) * W + x1c], w11 * g);
 }
 
+// BF16-source variant: verbatim copy of fp16 scatter with __nv_bfloat16.
+__global__ void upsample_bilinear_2x_backward_scatter_bf16(
+        const __nv_bfloat16* __restrict__ dY,
+        float* __restrict__ dX_f32,
+        int N, int C, int H, int W,
+        int H_out, int W_out,
+        int total_out) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_out) return;
+    const int ow = idx % W_out;
+    int t = idx / W_out;
+    const int oh = t % H_out;
+    t /= H_out;
+    const int c  = t % C;
+    const int n  = t / C;
+
+    const float src_y = (oh + 0.5f) * 0.5f - 0.5f;
+    const float src_x = (ow + 0.5f) * 0.5f - 0.5f;
+    const int y0 = static_cast<int>(floorf(src_y));
+    const int x0 = static_cast<int>(floorf(src_x));
+    const float fy = src_y - y0;
+    const float fx = src_x - x0;
+    const int y0c = y0 < 0 ? 0 : (y0 >= H ? H - 1 : y0);
+    const int x0c = x0 < 0 ? 0 : (x0 >= W ? W - 1 : x0);
+    const int y1c = (y0 + 1) < 0 ? 0 : ((y0 + 1) >= H ? H - 1 : (y0 + 1));
+    const int x1c = (x0 + 1) < 0 ? 0 : ((x0 + 1) >= W ? W - 1 : (x0 + 1));
+
+    const float w00 = (1.0f - fy) * (1.0f - fx);
+    const float w01 = (1.0f - fy) * fx;
+    const float w10 = fy * (1.0f - fx);
+    const float w11 = fy * fx;
+    const float g = __bfloat162float(dY[idx]);
+
+    const int base = (n * C + c) * H;
+    atomicAdd(&dX_f32[(base + y0c) * W + x0c], w00 * g);
+    atomicAdd(&dX_f32[(base + y0c) * W + x1c], w01 * g);
+    atomicAdd(&dX_f32[(base + y1c) * W + x0c], w10 * g);
+    atomicAdd(&dX_f32[(base + y1c) * W + x1c], w11 * g);
+}
+
 // Fold an FP32 buffer into FP16 storage (overwrite).
 __global__ void copy_fp32_to_fp16(const float* __restrict__ src,
                                   __half* __restrict__ dst, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     dst[i] = __float2half(src[i]);
+}
+
+// Fold an FP32 buffer into BF16 storage (overwrite).
+__global__ void copy_fp32_to_bf16(const float* __restrict__ src,
+                                  __nv_bfloat16* __restrict__ dst, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __float2bfloat16(src[i]);
 }
 
 // One thread per INPUT pixel; reads its single output-pixel grad, scales 1/4.
@@ -253,8 +304,8 @@ inline int grid_for(int n) {
 
 inline void check_dtype_fp(const ::brotensor::Tensor& t,
                            const char* op, const char* name) {
-    if (t.dtype != Dtype::FP16 && t.dtype != Dtype::FP32) {
-        throw std::runtime_error(std::string(op) + ": " + name + " must be FP16 or FP32");
+    if (t.dtype != Dtype::FP16 && t.dtype != Dtype::FP32 && t.dtype != Dtype::BF16) {
+        throw std::runtime_error(std::string(op) + ": " + name + " must be FP16, BF16, or FP32");
     }
 }
 
@@ -280,6 +331,11 @@ void upsample_nearest_2x(const ::brotensor::Tensor& X,
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             N, C, H, W, H_out, W_out, total);
+    } else if (X.dtype == Dtype::BF16) {
+        upsample_nearest_2x_kernel<__nv_bfloat16><<<grid_for(total), RS_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            N, C, H, W, H_out, W_out, total);
     } else {
         upsample_nearest_2x_kernel<float><<<grid_for(total), RS_BLOCK>>>(
             static_cast<const float*>(X.data),
@@ -304,6 +360,11 @@ void upsample_bilinear_2x(const ::brotensor::Tensor& X,
         upsample_bilinear_2x_kernel<__half><<<grid_for(total), RS_BLOCK>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
+            N, C, H, W, H_out, W_out, total);
+    } else if (X.dtype == Dtype::BF16) {
+        upsample_bilinear_2x_kernel<__nv_bfloat16><<<grid_for(total), RS_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
             N, C, H, W, H_out, W_out, total);
     } else {
         upsample_bilinear_2x_kernel<float><<<grid_for(total), RS_BLOCK>>>(
@@ -333,6 +394,11 @@ void downsample_avg_2x(const ::brotensor::Tensor& X,
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             N, C, H, W, H_out, W_out, total);
+    } else if (X.dtype == Dtype::BF16) {
+        downsample_avg_2x_kernel<__nv_bfloat16><<<grid_for(total), RS_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            N, C, H, W, H_out, W_out, total);
     } else {
         downsample_avg_2x_kernel<float><<<grid_for(total), RS_BLOCK>>>(
             static_cast<const float*>(X.data),
@@ -359,6 +425,11 @@ void upsample_nearest_2x_backward(const ::brotensor::Tensor& dY,
         upsample_nearest_2x_backward_kernel<__half><<<grid_for(total_in), RS_BLOCK>>>(
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
+            N, C, H, W, H_out, W_out, total_in);
+    } else if (dY.dtype == Dtype::BF16) {
+        upsample_nearest_2x_backward_kernel<__nv_bfloat16><<<grid_for(total_in), RS_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data),
             N, C, H, W, H_out, W_out, total_in);
     } else {
         upsample_nearest_2x_backward_kernel<float><<<grid_for(total_in), RS_BLOCK>>>(
@@ -391,7 +462,7 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
             static_cast<float*>(dX.data),
             N, C, H, W, H_out, W_out, total_out);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    } else {
+    } else if (dY.dtype == Dtype::FP16) {
         // FP16 storage: allocate FP32 scratch, scatter into it, fold back.
         float* d_scratch = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
@@ -403,6 +474,20 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         copy_fp32_to_fp16<<<grid_for(total_in), RS_BLOCK>>>(
             d_scratch, static_cast<__half*>(dX.data), total_in);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        cudaFree(d_scratch);
+    } else {
+        // BF16 storage: same FP32-scratch pattern as FP16.
+        float* d_scratch = nullptr;
+        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
+                                        total_in * sizeof(float)));
+        BROTENSOR_CUDA_CHECK(cudaMemset(d_scratch, 0, total_in * sizeof(float)));
+        upsample_bilinear_2x_backward_scatter_bf16<<<grid_for(total_out), RS_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(dY.data),
+            d_scratch, N, C, H, W, H_out, W_out, total_out);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        copy_fp32_to_bf16<<<grid_for(total_in), RS_BLOCK>>>(
+            d_scratch, static_cast<__nv_bfloat16*>(dX.data), total_in);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_scratch);
     }
@@ -426,6 +511,11 @@ void downsample_avg_2x_backward(const ::brotensor::Tensor& dY,
         downsample_avg_2x_backward_kernel<__half><<<grid_for(total_in), RS_BLOCK>>>(
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
+            N, C, H, W, H_out, W_out, total_in);
+    } else if (dY.dtype == Dtype::BF16) {
+        downsample_avg_2x_backward_kernel<__nv_bfloat16><<<grid_for(total_in), RS_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data),
             N, C, H, W, H_out, W_out, total_in);
     } else {
         downsample_avg_2x_backward_kernel<float><<<grid_for(total_in), RS_BLOCK>>>(

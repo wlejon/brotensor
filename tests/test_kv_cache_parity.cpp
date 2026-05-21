@@ -132,4 +132,92 @@ BT_PARITY_TEST(kv_decode_one_head)     { run_decode(10, 2, 8,  1, 0x7312ull); }
 BT_PARITY_TEST(kv_decode_full_prefill) { run_decode(8,  8, 32, 4, 0x7313ull); }
 BT_PARITY_TEST(kv_decode_wide_head)    { run_decode(20, 2, 64, 1, 0x7314ull); }
 
+// ─── BF16: BF16-on-CUDA vs FP32 CPU reference ─────────────────────────────
+// Same harness as FP16 but quantise through BF16 (7-bit mantissa).
+// kv_cache_append is a pure copy — atol/rtol=2e-2 is ample.
+// flash_attention_decode accumulates via softmax — use 5e-2 like the FP16 case.
+
+namespace {
+
+inline float q_bf16(float v) {
+    return brotensor::bf16_bits_to_fp32(brotensor::fp32_to_bf16_bits(v));
+}
+
+Tensor make_q_bf16_cpu(int rows, int cols, SplitMix64& rng, float scale) {
+    Tensor t = Tensor::mat(rows, cols);
+    for (int i = 0; i < t.size(); ++i) t.ptr()[i] = q_bf16(rng.next_unit() * scale);
+    return t;
+}
+
+Tensor to_bf16_cuda_from_cpu(const Tensor& cpu) {
+    return to_bf16_cuda(cpu);
+}
+
+Tensor bf16_cuda_to_cpu(const Tensor& g) {
+    brotensor::sync_all();
+    return bf16_host_to_f32(download_to_host(g));
+}
+
+void run_append_bf16(int L_max, int D, int len0, int len1, uint64_t seed) {
+    SplitMix64 rng(seed);
+
+    Tensor K0 = make_q_bf16_cpu(len0, D, rng, 1.0f);
+    Tensor V0 = make_q_bf16_cpu(len0, D, rng, 1.0f);
+    Tensor K1 = make_q_bf16_cpu(len1, D, rng, 1.0f);
+    Tensor V1 = make_q_bf16_cpu(len1, D, rng, 1.0f);
+
+    // CPU: FP32 reference caches.
+    Tensor cpu_Kc = Tensor::mat(L_max, D);
+    Tensor cpu_Vc = Tensor::mat(L_max, D);
+    cpu_Kc.zero();
+    cpu_Vc.zero();
+    brotensor::kv_cache_append(K0, V0, 0,    cpu_Kc, cpu_Vc);
+    brotensor::kv_cache_append(K1, V1, len0, cpu_Kc, cpu_Vc);
+
+    // GPU: BF16 caches.
+    Tensor gpu_Kc = Tensor::zeros_on(Device::CUDA, L_max, D, Dtype::BF16);
+    Tensor gpu_Vc = Tensor::zeros_on(Device::CUDA, L_max, D, Dtype::BF16);
+    Tensor gK0 = to_bf16_cuda_from_cpu(K0), gV0 = to_bf16_cuda_from_cpu(V0);
+    Tensor gK1 = to_bf16_cuda_from_cpu(K1), gV1 = to_bf16_cuda_from_cpu(V1);
+    brotensor::kv_cache_append(gK0, gV0, 0,    gpu_Kc, gpu_Vc);
+    brotensor::kv_cache_append(gK1, gV1, len0, gpu_Kc, gpu_Vc);
+
+    compare_tensors(cpu_Kc, bf16_cuda_to_cpu(gpu_Kc), "kv_append_bf16_K",
+                    2e-2f, 2e-2f);
+    compare_tensors(cpu_Vc, bf16_cuda_to_cpu(gpu_Vc), "kv_append_bf16_V",
+                    2e-2f, 2e-2f);
+}
+
+void run_decode_bf16(int valid_len, int Lq, int D, int num_heads,
+                     uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor Q  = make_q_bf16_cpu(Lq, D, rng, 0.4f);
+    Tensor Kc = make_q_bf16_cpu(valid_len, D, rng, 0.4f);
+    Tensor Vc = make_q_bf16_cpu(valid_len, D, rng, 0.4f);
+
+    Tensor cpu_O;
+    brotensor::flash_attention_decode(Q, Kc, Vc, valid_len, num_heads, cpu_O);
+
+    Tensor gQ  = to_bf16_cuda_from_cpu(Q);
+    Tensor gKc = to_bf16_cuda_from_cpu(Kc);
+    Tensor gVc = to_bf16_cuda_from_cpu(Vc);
+    Tensor gpu_O;
+    brotensor::flash_attention_decode(gQ, gKc, gVc, valid_len, num_heads,
+                                      gpu_O);
+
+    compare_tensors(cpu_O, bf16_cuda_to_cpu(gpu_O), "flash_decode_bf16",
+                    5e-2f, 5e-2f);
+}
+
+} // namespace (bf16 helpers)
+
+BT_PARITY_TEST(kv_cache_bf16_append_small)  { run_append_bf16(8,  4,  3, 2, 0x7320ull); }
+BT_PARITY_TEST(kv_cache_bf16_append_wide)   { run_append_bf16(16, 32, 5, 4, 0x7321ull); }
+BT_PARITY_TEST(kv_cache_bf16_append_full)   { run_append_bf16(10, 8,  6, 4, 0x7322ull); }
+
+BT_PARITY_TEST(kv_decode_bf16_single_query) { run_decode_bf16(12, 1, 16, 2, 0x7330ull); }
+BT_PARITY_TEST(kv_decode_bf16_tail)         { run_decode_bf16(12, 3, 16, 2, 0x7331ull); }
+BT_PARITY_TEST(kv_decode_bf16_one_head)     { run_decode_bf16(10, 2, 8,  1, 0x7332ull); }
+BT_PARITY_TEST(kv_decode_bf16_full_prefill) { run_decode_bf16(8,  8, 32, 4, 0x7333ull); }
+
 int main() { return run_all("kv-cache cpu/gpu parity"); }

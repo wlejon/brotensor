@@ -10,6 +10,7 @@
 using namespace bt_parity;
 using brotensor::Tensor;
 using brotensor::Device;
+using brotensor::Dtype;
 
 namespace {
 
@@ -63,6 +64,64 @@ void run_concat(const std::vector<int>& sizes, uint64_t seed) {
     }
 }
 
+// BF16: upload parts as BF16, concat/split on CUDA, widen result back to FP32,
+// compare against the FP32 CPU reference rounded through BF16.
+void run_concat_bf16(const std::vector<int>& sizes, uint64_t seed) {
+    SplitMix64 rng(seed);
+
+    std::vector<Tensor> parts_cpu;
+    int total = 0;
+    for (int s : sizes) {
+        Tensor t = Tensor::vec(s);
+        fill_random(t, rng);
+        total += s;
+        parts_cpu.push_back(std::move(t));
+    }
+
+    // Build BF16-rounded CPU reference.
+    Tensor cat_ref = Tensor::vec(total);
+    int off = 0;
+    for (const auto& p : parts_cpu) {
+        Tensor p_bf16 = to_bf16_host(p);
+        Tensor p_f32  = bf16_host_to_f32(p_bf16);
+        for (int i = 0; i < p_f32.size(); ++i) cat_ref[off + i] = p_f32[i];
+        off += p_f32.size();
+    }
+
+    // Upload BF16 parts to CUDA.
+    std::vector<Tensor> g_parts(sizes.size());
+    std::vector<const Tensor*> g_parts_ptr;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        g_parts[i] = to_bf16_cuda(parts_cpu[i]);
+        g_parts_ptr.push_back(&g_parts[i]);
+    }
+    Tensor gcat;
+    brotensor::concat_rows(g_parts_ptr, gcat);
+    brotensor::sync_all();
+
+    Tensor cat_gpu = bf16_host_to_f32(download_to_host(gcat));
+    compare_tensors(cat_ref, cat_gpu, "concat_bf16", 2e-2f, 2e-2f);
+
+    // Round-trip split.
+    std::vector<Tensor> g_split(sizes.size());
+    std::vector<Tensor*> g_split_ptr;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        g_split[i] = Tensor::zeros_on(Device::CUDA, sizes[i], 1, Dtype::BF16);
+        g_split_ptr.push_back(&g_split[i]);
+    }
+    brotensor::split_rows(gcat, g_split_ptr);
+    brotensor::sync_all();
+
+    off = 0;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        Tensor seg = bf16_host_to_f32(download_to_host(g_split[i]));
+        Tensor ref_i = Tensor::vec(sizes[i]);
+        for (int j = 0; j < sizes[i]; ++j) ref_i[j] = cat_ref[off + j];
+        off += sizes[i];
+        compare_tensors(ref_i, seg, "split_bf16.seg", 2e-2f, 2e-2f);
+    }
+}
+
 } // namespace
 
 BT_PARITY_TEST(concat_three_equal)   { run_concat({16, 16, 16}, 0x600ull); }
@@ -70,5 +129,11 @@ BT_PARITY_TEST(concat_varying_sizes) { run_concat({4, 17, 33, 8}, 0x601ull); }
 BT_PARITY_TEST(concat_two_segments)  { run_concat({64, 32}, 0x602ull); }
 BT_PARITY_TEST(concat_single_seg)    { run_concat({128}, 0x603ull); }
 BT_PARITY_TEST(concat_many_small)    { run_concat({1, 2, 3, 5, 7, 11, 13}, 0x604ull); }
+
+// ─── BF16 ──────────────────────────────────────────────────────────────────
+BT_PARITY_TEST(concat_bf16_three_equal)   { run_concat_bf16({16, 16, 16}, 0x610ull); }
+BT_PARITY_TEST(concat_bf16_varying_sizes) { run_concat_bf16({4, 17, 33, 8}, 0x611ull); }
+BT_PARITY_TEST(concat_bf16_two_segments)  { run_concat_bf16({64, 32}, 0x612ull); }
+BT_PARITY_TEST(concat_bf16_many_small)    { run_concat_bf16({1, 2, 3, 5, 7, 11, 13}, 0x613ull); }
 
 int main() { return run_all("concat/split cpu/gpu parity"); }

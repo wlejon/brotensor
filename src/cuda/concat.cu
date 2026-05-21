@@ -159,8 +159,8 @@ void concat_nchw_channels_backward(const Tensor& dY,
         throw std::runtime_error("concat_nchw_channels_backward: dY shape mismatch (expected N x total_C*H*W)");
     }
     const Dtype dt = dY.dtype;
-    if (dt != Dtype::FP32 && dt != Dtype::FP16) {
-        throw std::runtime_error("concat_nchw_channels_backward: dY dtype must be FP16 or FP32");
+    if (dt != Dtype::FP32 && dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("concat_nchw_channels_backward: dY dtype must be FP16, BF16, or FP32");
     }
 
     const size_t elem = static_cast<size_t>(dtype_size_bytes(dt));

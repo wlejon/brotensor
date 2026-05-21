@@ -72,4 +72,69 @@ BT_PARITY_TEST(emb_extra_random) {
     run_embedding(32, 8, idx, 0x903ull);
 }
 
+// ─── BF16: BF16-on-CUDA vs FP32 CPU ops ───────────────────────────────────
+// Run the actual CPU backend on both sides with BF16-rounded values, compare
+// GPU BF16 result against CPU FP32 reference. Use 4e-2 for backward
+// (scatter accumulates: FP32 scratch + fold-back into BF16).
+
+namespace {
+
+void run_embedding_bf16(int V, int D, const std::vector<int32_t>& idx,
+                        uint64_t seed) {
+    const int B = static_cast<int>(idx.size());
+    SplitMix64 rng(seed);
+
+    Tensor table_f32 = Tensor::mat(V, D), dOut_f32 = Tensor::mat(B, D);
+    fill_random(table_f32, rng);
+    fill_random(dOut_f32, rng);
+    Tensor dTable_init = Tensor::mat(V, D);
+    fill_random(dTable_init, rng, 0.25f);
+
+    // CPU backend: run with FP32 tables (CPU is FP32-only).
+    Tensor out_cpu = Tensor::mat(B, D);
+    brotensor::embedding_lookup_forward(table_f32, idx.data(), B, out_cpu);
+    Tensor dTable_cpu = dTable_init;
+    brotensor::embedding_lookup_backward(dOut_f32, idx.data(), B, dTable_cpu);
+
+    // GPU: BF16 tensors. dTable starts as zero (CPU pre-fill not comparable).
+    Tensor gtable  = to_bf16_cuda(table_f32);
+    Tensor gdOut   = to_bf16_cuda(dOut_f32);
+    Tensor gout    = Tensor::zeros_on(Device::CUDA, B, D,
+                                      brotensor::Dtype::BF16);
+    Tensor gdTable = Tensor::zeros_on(Device::CUDA, V, D,
+                                      brotensor::Dtype::BF16);
+
+    Tensor d_idx_buf = upload_indices(idx);
+    const int32_t* d_idx = static_cast<const int32_t*>(d_idx_buf.data);
+    brotensor::embedding_lookup_forward(gtable, d_idx, B, gout);
+    brotensor::embedding_lookup_backward(gdOut, d_idx, B, gdTable);
+
+    Tensor out_gpu    = bf16_host_to_f32(download_to_host(gout));
+    Tensor dTable_gpu = bf16_host_to_f32(download_to_host(gdTable));
+
+    compare_tensors(out_cpu, out_gpu, "emb_extra_bf16.out", 2e-2f, 2e-2f);
+
+    // For dTable: re-run CPU with zero init to match GPU zero-init baseline.
+    Tensor dTable_cpu_zero = Tensor::mat(V, D);
+    dTable_cpu_zero.zero();
+    brotensor::embedding_lookup_backward(dOut_f32, idx.data(), B, dTable_cpu_zero);
+    compare_tensors(dTable_cpu_zero, dTable_gpu, "emb_extra_bf16.dTable", 4e-2f, 4e-2f);
+}
+
+} // namespace (bf16 helpers)
+
+BT_PARITY_TEST(emb_extra_bf16_distinct) {
+    run_embedding_bf16(8, 4, {0, 1, 2, 3, 4, 5, 6, 7}, 0x910ull);
+}
+BT_PARITY_TEST(emb_extra_bf16_repeats) {
+    run_embedding_bf16(16, 32, {3, 3, 3, 7, 7, 1, 0, 15, 15, 15}, 0x911ull);
+}
+BT_PARITY_TEST(emb_extra_bf16_random) {
+    std::vector<int32_t> idx;
+    SplitMix64 rng(0x912ull);
+    for (int i = 0; i < 24; ++i)
+        idx.push_back(static_cast<int32_t>(rng.next_u64() % 32));
+    run_embedding_bf16(32, 8, idx, 0x912ull);
+}
+
 int main() { return run_all("embedding-extra cpu/gpu parity"); }

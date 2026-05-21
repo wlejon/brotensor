@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 #include <string>
@@ -77,6 +78,11 @@ void nchw_to_sequence(const ::brotensor::Tensor& X,
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             N, C, H, W, HW, total);
+    } else if (X.dtype == Dtype::BF16) {
+        nchw_to_seq_kernel<__nv_bfloat16><<<grid_for(total), TR_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            N, C, H, W, HW, total);
     } else {
         nchw_to_seq_kernel<float><<<grid_for(total), TR_BLOCK>>>(
             static_cast<const float*>(X.data),
@@ -101,6 +107,11 @@ void sequence_to_nchw(const ::brotensor::Tensor& X,
         seq_to_nchw_kernel<__half><<<grid_for(total), TR_BLOCK>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
+            N, C, H, W, HW, total);
+    } else if (X.dtype == Dtype::BF16) {
+        seq_to_nchw_kernel<__nv_bfloat16><<<grid_for(total), TR_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
             N, C, H, W, HW, total);
     } else {
         seq_to_nchw_kernel<float><<<grid_for(total), TR_BLOCK>>>(
