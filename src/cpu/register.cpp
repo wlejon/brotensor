@@ -568,6 +568,24 @@ void rfft_backward(const ::brotensor::Tensor& dY, int L,
                    ::brotensor::Tensor& dX);
 void irfft_backward(const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX);
 
+// ── STFT / iSTFT (brosoundml) — stft.cpp ──
+void stft(const ::brotensor::Tensor& signal, const ::brotensor::Tensor& window,
+          int N, int n_fft, int hop_length, int win_length,
+          bool center, bool normalized, ::brotensor::Tensor& spec);
+void stft_backward(const ::brotensor::Tensor& dSpec,
+                   const ::brotensor::Tensor& window,
+                   int N, int signal_len, int n_fft, int hop_length,
+                   int win_length, bool center, bool normalized,
+                   ::brotensor::Tensor& dSignal);
+void istft(const ::brotensor::Tensor& spec, const ::brotensor::Tensor& window,
+           int N, int signal_len, int n_fft, int hop_length, int win_length,
+           bool center, bool normalized, ::brotensor::Tensor& signal);
+void istft_backward(const ::brotensor::Tensor& dSignal,
+                    const ::brotensor::Tensor& window,
+                    int N, int signal_len, int n_fft, int hop_length,
+                    int win_length, bool center, bool normalized,
+                    ::brotensor::Tensor& dSpec);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -732,6 +750,12 @@ struct CpuStaticRegistrar {
         ops.irfft                        = &detail::cpu::irfft;
         ops.rfft_backward                = &detail::cpu::rfft_backward;
         ops.irfft_backward               = &detail::cpu::irfft_backward;
+
+        // ── STFT / iSTFT (brosoundml) ──
+        ops.stft                         = &detail::cpu::stft;
+        ops.stft_backward                = &detail::cpu::stft_backward;
+        ops.istft                        = &detail::cpu::istft;
+        ops.istft_backward               = &detail::cpu::istft_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

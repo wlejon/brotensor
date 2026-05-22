@@ -2120,4 +2120,107 @@ void rfft_backward(const Tensor& dY, int L, Tensor& dX);
 // it is the transpose of rfft_backward.
 void irfft_backward(const Tensor& dY, Tensor& dX);
 
+// ─── STFT / iSTFT (brosoundml) ─────────────────────────────────────────────
+//
+// Short-time Fourier transform and its inverse — the front/back end of every
+// Whisper / TTS / neural-codec / vocoder pipeline. CPU, FP32-only.
+//
+// ── Shapes / batching ──────────────────────────────────────────────────────
+// Tensors stay rank-2. A length-L real signal is one row of an (N, L) real
+// tensor — N batched signals, the NCHW-style "fold the batch into rows"
+// convention, with N passed as an explicit int arg. The complex spectrogram
+// is (N*frames, 2*bins) interleaved-complex: each frame is one row, the N
+// signals' frame blocks stacked in order (signal 0's `frames` rows, then
+// signal 1's, ...). bins = n_fft/2+1; `frames` is derived from the padding
+// rule below.
+//
+// ── Frame / padding model ──────────────────────────────────────────────────
+// Each frame takes `win_length` samples of the signal, multiplies them by the
+// caller-supplied `window` (a real (1, win_length) tensor), zero-pads/centres
+// them inside an n_fft buffer (win_length <= n_fft; the window is centred in
+// the n_fft buffer with (n_fft-win_length)/2 zeros each side), and runs rfft.
+// Frame f starts at sample  f*hop_length - (center ? n_fft/2 : 0).
+//   * center == false: frames = 1 + (L - n_fft) / hop_length. Requires
+//                       L >= n_fft.
+//   * center == true:  the signal is reflect-padded by n_fft/2 on each side
+//                       (matching torch.stft(center=True)); frames are then
+//                       1 + L / hop_length, computed on the padded length
+//                       L + n_fft. Reflect padding needs L >= n_fft/2 + 1.
+//
+// ── Normalisation ──────────────────────────────────────────────────────────
+// FFT uses the "backward" convention (forward unscaled). `normalized == true`
+// additionally scales the forward transform by 1/sqrt(n_fft) (and istft by
+// the reciprocal), matching torch's `normalized` flag.
+//
+// ── istft / COLA ───────────────────────────────────────────────────────────
+// istft is windowed overlap-add: each frame is irfft'd, multiplied by the
+// window again, and accumulated into the output; the accumulator is then
+// divided per-sample by the overlap-added squared window (the COLA envelope).
+// With a COLA-satisfying window+hop (e.g. Hann, hop = n_fft/4) this makes
+// istft(stft(x)) == x. Samples whose COLA envelope is ~0 (signal edges with
+// no frame coverage) are left at 0. `signal_len` is passed explicitly so the
+// output length is unambiguous (the centre-padding is stripped when
+// center == true).
+//
+// ── Gradient design (the backward op set) ──────────────────────────────────
+// stft and istft are both linear maps, but — exactly as with rfft / irfft in
+// the FFT core — they are NOT mutual adjoints once the window and the COLA
+// normalisation are folded in:
+//   * stft's adjoint is  rfft_backward -> window-multiply -> plain overlap-add
+//     (no COLA division). That is structurally different from istft, which
+//     carries the COLA division and the 1/sqrt scaling. So stft's gradient
+//     does not reduce to `istft` up to a scalar.
+//   * istft's adjoint must transpose the COLA division too. It is likewise
+//     not `stft` up to a scalar.
+// Getting either weighting wrong is a silent training bug in the
+// multi-resolution STFT loss (the standard vocoder/codec objective), so both
+// adjoints are explicit ops — `stft_backward` and `istft_backward` — rather
+// than something callers reconstruct. They are the minimal correct set: each
+// is the exact transpose of its forward linear map.
+
+// Short-time Fourier transform: real signal -> complex spectrogram.
+//   signal: REAL (N, signal_len) — N batched signals, one per row.
+//   window: REAL (1, win_length) — caller-supplied analysis window.
+//   spec:   interleaved-complex (N*frames, 2*(n_fft/2+1)) — resized if
+//           mis-shaped. Frame rows are grouped per signal (see header above).
+// win_length <= n_fft; the window is centred inside the n_fft FFT buffer.
+void stft(const Tensor& signal, const Tensor& window,
+          int N, int n_fft, int hop_length, int win_length,
+          bool center, bool normalized, Tensor& spec);
+
+// Backward of stft (its adjoint). Maps the spectrogram gradient back to the
+// signal gradient.
+//   dSpec:   interleaved-complex (N*frames, 2*(n_fft/2+1)) — upstream grad.
+//   window:  REAL (1, win_length) — the same analysis window as the forward.
+//   dSignal: REAL (N, signal_len) — *overwritten* (resized if mis-shaped).
+// signal_len / N / the frame params must match the forward call exactly.
+void stft_backward(const Tensor& dSpec, const Tensor& window,
+                   int N, int signal_len, int n_fft, int hop_length,
+                   int win_length, bool center, bool normalized,
+                   Tensor& dSignal);
+
+// Inverse STFT: complex spectrogram -> real signal via windowed overlap-add
+// with the COLA / squared-window normalisation.
+//   spec:   interleaved-complex (N*frames, 2*(n_fft/2+1)) — input spectrogram.
+//   window: REAL (1, win_length) — caller-supplied synthesis window (use the
+//           same window as the forward stft for a clean round trip).
+//   signal: REAL (N, signal_len) — resized if mis-shaped. Centre-padding is
+//           stripped when center == true.
+// With a COLA-satisfying window+hop, istft(stft(x)) reproduces x.
+void istft(const Tensor& spec, const Tensor& window,
+           int N, int signal_len, int n_fft, int hop_length, int win_length,
+           bool center, bool normalized, Tensor& signal);
+
+// Backward of istft (its adjoint). Maps the signal gradient back to the
+// spectrogram gradient. Transposes the COLA division as well as the windowed
+// overlap-add and the irfft, so it is the exact adjoint of istft — not stft.
+//   dSignal: REAL (N, signal_len) — upstream gradient on the reconstruction.
+//   window:  REAL (1, win_length) — the same window as the forward istft.
+//   dSpec:   interleaved-complex (N*frames, 2*(n_fft/2+1)) — *overwritten*
+//            (resized if mis-shaped).
+void istft_backward(const Tensor& dSignal, const Tensor& window,
+                    int N, int signal_len, int n_fft, int hop_length,
+                    int win_length, bool center, bool normalized,
+                    Tensor& dSpec);
+
 } // namespace brotensor

@@ -1563,4 +1563,45 @@ void irfft_backward(const Tensor& dY, Tensor& dX) {
     v.irfft_backward(dY, dX);
 }
 
+void stft(const Tensor& signal, const Tensor& window,
+          int N, int n_fft, int hop_length, int win_length,
+          bool center, bool normalized, Tensor& spec) {
+    const auto& v = detail::dispatch(signal, window, spec);
+    if (!v.stft) detail::throw_not_implemented("stft", signal.device);
+    detail::adopt_output(spec, signal.device);
+    v.stft(signal, window, N, n_fft, hop_length, win_length,
+           center, normalized, spec);
+}
+void stft_backward(const Tensor& dSpec, const Tensor& window,
+                   int N, int signal_len, int n_fft, int hop_length,
+                   int win_length, bool center, bool normalized,
+                   Tensor& dSignal) {
+    const auto& v = detail::dispatch(dSpec, window, dSignal);
+    if (!v.stft_backward)
+        detail::throw_not_implemented("stft_backward", dSpec.device);
+    detail::adopt_output(dSignal, dSpec.device);
+    v.stft_backward(dSpec, window, N, signal_len, n_fft, hop_length,
+                    win_length, center, normalized, dSignal);
+}
+void istft(const Tensor& spec, const Tensor& window,
+           int N, int signal_len, int n_fft, int hop_length, int win_length,
+           bool center, bool normalized, Tensor& signal) {
+    const auto& v = detail::dispatch(spec, window, signal);
+    if (!v.istft) detail::throw_not_implemented("istft", spec.device);
+    detail::adopt_output(signal, spec.device);
+    v.istft(spec, window, N, signal_len, n_fft, hop_length, win_length,
+            center, normalized, signal);
+}
+void istft_backward(const Tensor& dSignal, const Tensor& window,
+                    int N, int signal_len, int n_fft, int hop_length,
+                    int win_length, bool center, bool normalized,
+                    Tensor& dSpec) {
+    const auto& v = detail::dispatch(dSignal, window, dSpec);
+    if (!v.istft_backward)
+        detail::throw_not_implemented("istft_backward", dSignal.device);
+    detail::adopt_output(dSpec, dSignal.device);
+    v.istft_backward(dSignal, window, N, signal_len, n_fft, hop_length,
+                     win_length, center, normalized, dSpec);
+}
+
 } // namespace brotensor

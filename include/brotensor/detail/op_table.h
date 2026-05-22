@@ -360,4 +360,17 @@
     X(rfft,                                    void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                                             \
     X(irfft,                                   void,  (const ::brotensor::Tensor& x, int L, ::brotensor::Tensor& y))                                                      \
     X(rfft_backward,                           void,  (const ::brotensor::Tensor& dY, int L, ::brotensor::Tensor& dX))                                                    \
-    X(irfft_backward,                          void,  (const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))
+    X(irfft_backward,                          void,  (const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))                                                           \
+    /* ─── STFT / iSTFT (brosoundml) ─── */                                                                                                                              \
+    X(stft,                                    void,  (const ::brotensor::Tensor& signal, const ::brotensor::Tensor& window,                                              \
+                                                       int N, int n_fft, int hop_length, int win_length,                                                                 \
+                                                       bool center, bool normalized, ::brotensor::Tensor& spec))                                                         \
+    X(stft_backward,                           void,  (const ::brotensor::Tensor& dSpec, const ::brotensor::Tensor& window,                                               \
+                                                       int N, int signal_len, int n_fft, int hop_length, int win_length,                                                 \
+                                                       bool center, bool normalized, ::brotensor::Tensor& dSignal))                                                      \
+    X(istft,                                   void,  (const ::brotensor::Tensor& spec, const ::brotensor::Tensor& window,                                                \
+                                                       int N, int signal_len, int n_fft, int hop_length, int win_length,                                                 \
+                                                       bool center, bool normalized, ::brotensor::Tensor& signal))                                                       \
+    X(istft_backward,                          void,  (const ::brotensor::Tensor& dSignal, const ::brotensor::Tensor& window,                                             \
+                                                       int N, int signal_len, int n_fft, int hop_length, int win_length,                                                 \
+                                                       bool center, bool normalized, ::brotensor::Tensor& dSpec))
