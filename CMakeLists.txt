@@ -171,6 +171,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/vocoder_activations.cu
         src/cuda/log_exp_round.cu
         src/cuda/fft.cu
+        src/cuda/stft.cu
         src/cuda/register.cu
     )
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)
