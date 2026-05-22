@@ -1846,4 +1846,15 @@ void round_backward(const Tensor& dY, Tensor& dX) {
     v.round_backward(dY, dX);
 }
 
+// ─── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ───────────
+
+void sample_logits(const Tensor& logits, float temperature, int top_k,
+                   float top_p, uint64_t key, uint64_t counter,
+                   Tensor& indices) {
+    const auto& v = detail::dispatch(logits, indices);
+    if (!v.sample_logits) detail::throw_not_implemented("sample_logits", logits.device);
+    detail::adopt_output(indices, logits.device);
+    v.sample_logits(logits, temperature, top_k, top_p, key, counter, indices);
+}
+
 } // namespace brotensor

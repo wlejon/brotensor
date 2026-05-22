@@ -2808,4 +2808,68 @@ void round_forward(const Tensor& x, Tensor& y);
 //                     dX may alias dY.
 void round_backward(const Tensor& dY, Tensor& dX);
 
+// ─── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ───────────
+//
+// CPU FP32-only. The GPU vtable slot stays null for this op. This is the
+// next-token sampler shared by autoregressive generation loops — brosoundml's
+// codec-LM decoding (MusicGen / VibeVoice-style acoustic-token generation) and
+// the brolm language-model project both call it. It is a general LLM / codec-LM
+// sampler, not audio-specific.
+//
+// Per row of an (N, V) logit matrix (N independent rows, V = vocabulary size)
+// it draws one token id, applying, in order:
+//
+//   1. temperature scaling   logit_v <- logit_v / temperature
+//   2. softmax               p_v = softmax(logit)_v
+//   3. top-k filter          (if top_k > 0) keep only the top_k highest-p
+//                            tokens; the rest get probability 0.
+//   4. top-p / nucleus       (if top_p < 1.0) keep the smallest set of
+//                            highest-p tokens whose cumulative probability is
+//                            >= top_p; the rest get probability 0. Applied to
+//                            whatever survived step 3 — i.e. top-k first, then
+//                            top-p on the survivors.
+//   5. renormalize           the kept probabilities are rescaled to sum to 1.
+//   6. draw                  one index is sampled by inverse-CDF lookup of a
+//                            uniform u in [0, 1).
+//
+// Greedy mode: temperature == 0 means deterministic argmax — steps 2-6 are
+// skipped entirely (no RNG is consumed) and the highest-logit token is
+// returned. On ties the lowest index wins (matches argmax_rows).
+//
+// top_k == 1 is also effectively deterministic: after the top-1 filter only the
+// argmax survives, so it is always returned regardless of the RNG draw.
+//
+// ── Philox (key, counter) RNG ABI ───────────────────────────────────────────
+//   The RNG is the standard counter-based Philox 4x32-10 generator (the same
+//   construction PyTorch and JAX use). It is seeded by two plain scalar args
+//   (NOT tensors, so dispatch resolves on the `logits` tensor):
+//
+//     key     — the 64-bit seed. Used as the Philox key (split into two
+//               uint32 words: low word, then high word).
+//     counter — the 64-bit base counter offset.
+//
+//   Row n draws from a per-row-distinct, deterministic substream: Philox is
+//   invoked with the 128-bit counter block {ctr_lo, ctr_hi, 0, 0} where
+//   (ctr_lo, ctr_hi) is the 64-bit value `counter + n` (low word, high word).
+//   One Philox invocation yields four uint32s; the first is consumed and
+//   converted to a uniform in [0, 1) via the top 24 bits / 2^24. Results are
+//   therefore reproducible and independent of N and of row order: row n's draw
+//   depends only on (key, counter + n), never on the other rows.
+//
+//   A brolm / codec-LM caller that wants to match this op bit-for-bit should
+//   advance `counter` by the number of rows sampled so far (typically by the
+//   sequence length already generated) so each decode step uses a fresh,
+//   non-overlapping counter range, and keep `key` fixed as the run seed.
+//
+//   logits:  (N, V)  FP32   input logits, one row per independent stream.
+//   indices: (N, 1)  INT32  *output* — the sampled token id per row. Resized
+//                           AND dtype-set to INT32 if mis-shaped.
+//
+// Errors (all throw std::runtime_error "brotensor: sample_logits: <reason>"):
+//   temperature < 0, top_k < 0, top_p < 0, V == 0 while N > 0.
+// No backward — sampling is non-differentiable.
+void sample_logits(const Tensor& logits, float temperature, int top_k,
+                   float top_p, uint64_t key, uint64_t counter,
+                   Tensor& indices);
+
 } // namespace brotensor

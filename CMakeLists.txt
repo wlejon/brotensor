@@ -110,6 +110,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/codec_quant.cpp
     src/cpu/resample1d.cpp
     src/cpu/log_exp_round.cpp
+    src/cpu/sample_logits.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)

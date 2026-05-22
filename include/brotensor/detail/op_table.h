@@ -425,4 +425,7 @@
     X(exp_forward,                             void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                  \
     X(exp_backward,                            void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))  \
     X(round_forward,                           void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                  \
-    X(round_backward,                          void,  (const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))
+    X(round_backward,                          void,  (const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))                               \
+    /* ─── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ─── */                                                                \
+    X(sample_logits,                           void,  (const ::brotensor::Tensor& logits, float temperature, int top_k, float top_p,          \
+                                                       uint64_t key, uint64_t counter, ::brotensor::Tensor& indices))

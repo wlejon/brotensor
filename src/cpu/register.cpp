@@ -675,6 +675,12 @@ void exp_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
 void round_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
 void round_backward(const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX);
 
+// ── Autoregressive logit sampling (brosoundml CHUNK 7, family F)
+//    — sample_logits.cpp ──
+void sample_logits(const ::brotensor::Tensor& logits, float temperature,
+                   int top_k, float top_p, uint64_t key, uint64_t counter,
+                   ::brotensor::Tensor& indices);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -883,6 +889,9 @@ struct CpuStaticRegistrar {
         ops.exp_backward                 = &detail::cpu::exp_backward;
         ops.round_forward                = &detail::cpu::round_forward;
         ops.round_backward               = &detail::cpu::round_backward;
+
+        // ── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ──
+        ops.sample_logits                = &detail::cpu::sample_logits;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());
