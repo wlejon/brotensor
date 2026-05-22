@@ -1366,8 +1366,8 @@ void flash_attention_qkvo_int8w_fp16(const Tensor& X,
 
 // ─── Spectral / FFT core (audio) ───────────────────────────────────────────
 //
-// Audio primitives for STT / TTS / neural-codec models. CPU and Metal
-// backends, FP32-only (CUDA leaves these slots null); ops throw
+// Audio primitives for STT / TTS / neural-codec models. Implemented on all
+// three backends (CPU / CUDA / Metal), FP32 on every backend; ops throw
 // "brotensor: <op>: <reason>" for a non-FP32 or wrong-device tensor.
 //
 // Complex layout: there is no complex Dtype. A complex tensor is an FP32
@@ -1457,7 +1457,7 @@ void irfft_backward(const Tensor& dY, Tensor& dX);
 
 // ─── STFT / iSTFT (audio) ──────────────────────────────────────────────────
 //
-// Short-time Fourier transform and its inverse. CPU and Metal, FP32-only.
+// Short-time Fourier transform and its inverse. CPU / CUDA / Metal, FP32-only.
 //
 // Shapes: a length-L real signal is one row of an (N, L) real tensor (N
 // batched signals, N passed as an int). The complex spectrogram is
@@ -1533,7 +1533,7 @@ void istft_backward(const Tensor& dSignal, const Tensor& window,
 // therefore throws on the CPU backend (conv2d_int8w is a null CPU slot).
 // causal_conv1d is likewise a wrapper (left-pad, then a valid conv1d).
 // pad1d, conv_transpose1d, and causal_conv1d_update are genuinely new ops with
-// their own vtable rows and CPU implementations.
+// their own vtable rows, implemented on all three backends (CPU / CUDA / Metal).
 
 // Pad the length axis of an NCL tensor by pad_left / pad_right samples — the
 // temporal analogue of an image pad (causal-conv left padding, "same" padding,
@@ -1753,9 +1753,9 @@ void causal_conv1d_update(const Tensor& X, const Tensor& Wt, const Tensor* bias,
 
 // ─── Vocoder / codec activations (audio) ───────────────────────────────────
 //
-// FP32-only on CPU and Metal (CUDA leaves these slots null). NCL layout — the
-// (N,C,L) dims are passed as int args; element (n,c,l) is at flat index
-// (n*C+c)*L + l.
+// FP32-only, implemented on all three backends (CPU / CUDA / Metal). NCL
+// layout — the (N,C,L) dims are passed as int args; element (n,c,l) is at flat
+// index (n*C+c)*L + l.
 
 // Snake activation (BigVGAN / DAC vocoder), per-channel learnable alpha (and
 // optional beta):
@@ -1811,8 +1811,9 @@ void leaky_relu_backward(const Tensor& x, const Tensor& dY,
 
 // ─── Codec quantization (audio) ────────────────────────────────────────────
 //
-// FP32-only on CPU and Metal (CUDA leaves these slots null). The quantization
-// bottlenecks of neural audio codecs (EnCodec/DAC residual-VQ, NanoCodec FSQ).
+// FP32-only, implemented on all three backends (CPU / CUDA / Metal). The
+// quantization bottlenecks of neural audio codecs (EnCodec/DAC residual-VQ,
+// NanoCodec FSQ).
 
 // Vector-quantization encode. For each row x[n], picks the codeword k
 // minimising ||x[n] - codebook[k]||^2, emits the index, and copies that
@@ -1856,9 +1857,9 @@ void fsq_quantize_backward(const Tensor& dQuantized, Tensor& dX);
 
 // ─── 1D resampling (audio) ─────────────────────────────────────────────────
 //
-// FP32-only on CPU and Metal (CUDA leaves these slots null). Arbitrary-scale
-// resampling along the length axis of an NCL tensor — for sample-rate
-// conversion in STT / TTS / codec front-ends.
+// FP32-only, implemented on all three backends (CPU / CUDA / Metal).
+// Arbitrary-scale resampling along the length axis of an NCL tensor — for
+// sample-rate conversion in STT / TTS / codec front-ends.
 
 // 1D resample along the length axis: N and C pass through, the length axis is
 // rescaled from L_in to any positive L_out. PyTorch align_corners=False
@@ -1883,9 +1884,10 @@ void resample1d_backward(const Tensor& dY, int N, int C, int L_in, int L_out,
 
 // ─── log / exp / round elementwise (audio) ─────────────────────────────────
 //
-// FP32-only on CPU and Metal (CUDA leaves these slots null). Elementwise
-// scalar maps; outputs resized + dtype-set to match the input; x/y and dX/dY
-// may alias. None has learnable parameters, so every backward overwrites dX.
+// FP32-only, implemented on all three backends (CPU / CUDA / Metal).
+// Elementwise scalar maps; outputs resized + dtype-set to match the input; x/y
+// and dX/dY may alias. None has learnable parameters, so every backward
+// overwrites dX.
 
 // Natural logarithm: y = log(x), elementwise (log-mel spectrograms, log-domain
 // losses). The caller owns the x > 0 precondition — this op does NOT guard the
@@ -1919,9 +1921,9 @@ void round_backward(const Tensor& dY, Tensor& dX);
 
 // ─── Autoregressive logit sampling ─────────────────────────────────────────
 //
-// FP32-only on CPU and Metal (CUDA leaves this slot null). The next-token
-// sampler for autoregressive generation loops — a general LLM / codec-LM
-// sampler, not audio-specific.
+// FP32-only, implemented on all three backends (CPU / CUDA / Metal). The
+// next-token sampler for autoregressive generation loops — a general LLM /
+// codec-LM sampler, not audio-specific.
 
 // Draw one token id per row of an (N, V) logit matrix (N independent streams,
 // V = vocabulary size), applying, in order:

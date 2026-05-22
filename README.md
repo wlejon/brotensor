@@ -4,6 +4,8 @@ Tensor + ops library. One tensor type, one flat `brotensor::` namespace, three b
 
 Forward + backward primitives for dense layers, elementwise activations, softmax, layernorm/RMSNorm, attention (single + multi-head + flash), embedding lookup, concat/split, SGD + Adam, MSE + cross-entropy, plus batched inference variants. The GPU backends add an FP16 precision path, a diffusion-oriented op set (conv2d, GroupNorm, SiLU/GELU, 2× up/downsample, cross-attention, fused DDIM/Euler/DPM++ 2M sampler steps, sinusoidal timestep embedding) for downstream `brodiffusion` inference (SD 1.5 + SDXL), LLM-oriented primitives (RoPE, RMSNorm, SwiGLU, KV-cache append + causal flash-decode) for autoregressive inference, and INT8 weight-only matmul/conv2d (W8A16) for memory-bound deployment.
 
+An FP32 **audio-ML op family** — FFT/STFT spectral core, 1D convolution (incl. transposed + streaming), vocoder/codec activations, codec quantization, resampling, and an autoregressive logit sampler — runs on all three backends for downstream `brosoundml` (TTS / STT / neural-codec) inference.
+
 Built as a standalone sibling so multiple downstream projects (`brogameagent`, `brodiffusion`, …) share one tensor layer. Both vendor it in as an `add_subdirectory` dependency — no system deps, no release process.
 
 ## Model
@@ -63,7 +65,7 @@ Backends throw plain `std::runtime_error` (`"brotensor: <op>: <reason>"`) for pr
 
 ## Op coverage
 
-All ops live in `<brotensor/ops.h>` and are device-neutral. The **CPU backend** implements the dense / attention / loss / optimizer subset that drives autograd-free training (FP32 only). The **CUDA and Metal backends** additionally implement the FP16 / INT8 precision paths, batched-inference variants, and the diffusion / LLM kernel set.
+All ops live in `<brotensor/ops.h>` and are device-neutral. The **CPU backend** implements the dense / attention / loss / optimizer subset that drives autograd-free training (FP32 only). The **CUDA and Metal backends** additionally implement the FP16 / INT8 precision paths, batched-inference variants, and the diffusion / LLM kernel set. A separate FP32 [audio op family](#audio-op-family) is implemented on **all three** backends.
 
 ### CPU backend
 
@@ -137,6 +139,22 @@ This is the code path `brogameagent`'s hand-crafted ExIt circuits use by default
 | sgd / adam | ✓ | n/a | — | optimizer steps |
 | mse / softmax-xent | ✓ | ✓ | — | per-sample + batched |
 
+### Audio op family
+
+An FP32 op family for TTS / STT / neural-codec inference, consumed by the `brosoundml` sibling. Unlike the FP16 / INT8 / diffusion / LLM kernels, these are implemented on **all three backends** — CPU, CUDA, and Metal — FP32 throughout, with per-family CPU↔GPU parity tests.
+
+| Group | Ops |
+|---|---|
+| Spectral core | `fft` / `ifft`, `rfft` / `irfft` (+ backward), `complex_mul` / `complex_abs` / `complex_angle` / `complex_from_polar` — interleaved-complex FP32, mixed-radix + Bluestein |
+| STFT | `stft` / `istft` (+ backward) — windowed, COLA-normalised overlap-add |
+| 1D convolution | `conv1d` (+ 3 backward halves), `pad1d`, `causal_conv1d`, `conv_transpose1d` (vocoder upsampling), `causal_conv1d_update` (streaming state) |
+| Vocoder / codec activations | `snake` / snakebeta (BigVGAN/DAC), `elu` (EnCodec), `leaky_relu` (HiFi-GAN) |
+| Codec quantization | `vq_encode` (RVQ codeword search), `fsq_quantize` (NanoCodec FSQ) — straight-through backward |
+| Resampling | `resample1d` — arbitrary-scale length resample, nearest / linear (+ backward) |
+| Elementwise | `log` / `exp` / `round` (+ backward) — log-mel domain maps |
+| Sampling | `sample_logits` — temperature / top-k / top-p autoregressive sampler, counter-based Philox RNG |
+
+The conv1d family is header-only wrappers over the conv2d ops (a 1D conv is a 2D conv with `H=kH=1`); `pad1d`, `conv_transpose1d`, and `causal_conv1d_update` are genuine per-backend kernels. The lone exception to the FP32-everywhere rule is `conv1d_int8w_fp16`, a W8A16 wrapper that is GPU-only like its `conv2d_int8w_fp16` parent.
 
 ## License
 
