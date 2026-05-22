@@ -232,6 +232,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/self_attention_bias.mm
         src/metal/fft.mm
         src/metal/stft.mm
+        src/metal/conv1d.mm
+        src/metal/vocoder_activations.mm
         src/metal/register.mm
     )
     set_source_files_properties(
@@ -279,6 +281,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/self_attention_bias.mm
         src/metal/fft.mm
         src/metal/stft.mm
+        src/metal/conv1d.mm
+        src/metal/vocoder_activations.mm
         src/metal/register.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"

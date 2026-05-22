@@ -62,6 +62,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.build_causal_mask_row                       = &dm::build_causal_mask_row;
     ops.build_slot_mask                             = &dm::build_slot_mask;
     ops.cast                                        = &dm::cast;
+    ops.causal_conv1d_update                        = &dm::causal_conv1d_update;
     ops.clamp                                       = &dm::clamp;
     ops.complex_abs                                 = &dm::complex_abs;
     ops.complex_abs_backward                        = &dm::complex_abs_backward;
@@ -78,6 +79,10 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.conv2d_backward_weight                      = &dm::conv2d_backward_weight;
     ops.conv2d_forward                              = &dm::conv2d_forward;
     ops.conv2d_int8w_fp16_forward                   = &dm::conv2d_int8w_fp16_forward;
+    ops.conv_transpose1d_backward_bias              = &dm::conv_transpose1d_backward_bias;
+    ops.conv_transpose1d_backward_input             = &dm::conv_transpose1d_backward_input;
+    ops.conv_transpose1d_backward_weight            = &dm::conv_transpose1d_backward_weight;
+    ops.conv_transpose1d_forward                    = &dm::conv_transpose1d_forward;
     ops.copy_d2d                                    = &dm::copy_d2d;
     ops.cross_attention_backward                    = &dm::cross_attention_backward;
     ops.cross_attention_forward                     = &dm::cross_attention_forward;
@@ -87,6 +92,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.downsample_avg_2x                           = &dm::downsample_avg_2x;
     ops.downsample_avg_2x_backward                  = &dm::downsample_avg_2x_backward;
     ops.dpmpp_2m_step                               = &dm::dpmpp_2m_step;
+    ops.elu_backward                                = &dm::elu_backward;
+    ops.elu_forward                                 = &dm::elu_forward;
     ops.embedding_lookup_backward                   = &dm::embedding_lookup_backward;
     ops.embedding_lookup_forward                    = &dm::embedding_lookup_forward;
     ops.euler_step                                  = &dm::euler_step;
@@ -121,6 +128,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.layernorm_forward                           = &dm::layernorm_forward;
     ops.layernorm_forward_inference_batched         = &dm::layernorm_forward_inference_batched;
     ops.layernorm_forward_inference_batched_fp16    = &dm::layernorm_forward_inference_batched_fp16;
+    ops.leaky_relu_backward                         = &dm::leaky_relu_backward;
+    ops.leaky_relu_forward                          = &dm::leaky_relu_forward;
     ops.linear_backward                             = &dm::linear_backward;
     ops.linear_backward_batched                     = &dm::linear_backward_batched;
     ops.linear_forward                              = &dm::linear_forward;
@@ -140,6 +149,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.mse_vec_per_sample                          = &dm::mse_vec_per_sample;
     ops.mul_inplace                                 = &dm::mul_inplace;
     ops.nchw_to_sequence                            = &dm::nchw_to_sequence;
+    ops.pad1d_backward                              = &dm::pad1d_backward;
+    ops.pad1d_forward                               = &dm::pad1d_forward;
     ops.quick_gelu_backward                         = &dm::quick_gelu_backward;
     ops.quick_gelu_forward                          = &dm::quick_gelu_forward;
     ops.relu_backward                               = &dm::relu_backward;
@@ -169,6 +180,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.sigmoid_forward                             = &dm::sigmoid_forward;
     ops.silu_backward                               = &dm::silu_backward;
     ops.silu_forward                                = &dm::silu_forward;
+    ops.snake_backward                              = &dm::snake_backward;
+    ops.snake_forward                               = &dm::snake_forward;
     ops.softmax_backward                            = &dm::softmax_backward;
     ops.softmax_forward                             = &dm::softmax_forward;
     ops.softmax_xent_fused                          = &dm::softmax_xent_fused;
