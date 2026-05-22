@@ -2618,4 +2618,84 @@ void leaky_relu_forward(const Tensor& x, float negative_slope, Tensor& y);
 void leaky_relu_backward(const Tensor& x, const Tensor& dY,
                          float negative_slope, Tensor& dX);
 
+// ─── Codec quantization (brosoundml CHUNK 5, family D) ─────────────────────
+//
+// CPU FP32-only. The GPU vtable slots stay null for these ops. These are the
+// quantization bottlenecks of neural audio codecs (EnCodec/DAC residual-VQ,
+// NanoCodec finite-scalar quantization).
+
+// Vector-quantization encode (the encode step of a VQ-VAE codec bottleneck).
+// For each input row x[n], picks the codeword k minimizing the squared L2
+// distance ||x[n] - codebook[k]||^2, emits that index, and copies the chosen
+// codeword back out as the quantized vector.
+//
+//   x:         (N, D) FP32   input vectors, one per row.
+//   codebook:  (K, D) FP32   the K codewords (the learned codebook).
+//   indices:   (N, 1) INT32  *output* — the L2-nearest codeword index per row.
+//                            Resized AND dtype-set to INT32 if mis-shaped.
+//   quantized: (N, D) FP32   *output* — codebook[indices[n], :] per row.
+//                            Resized + dtype-set to FP32 if mis-shaped.
+//
+// Ties (two codewords equidistant from a row) keep the lowest index — strict
+// `<` comparison while scanning, matching argmax_rows' tie convention.
+//
+// Decoding indices back to vectors is the existing embedding_lookup_forward:
+// `indices.data` is a raw int32 buffer usable directly as its `d_idx` arg.
+// Residual VQ (RVQ) is composed caller-side as a loop of vq_encode_forward
+// followed by `x -= quantized`; there is deliberately no rvq op.
+void vq_encode_forward(const Tensor& x, const Tensor& codebook,
+                       Tensor& indices, Tensor& quantized);
+
+// Vector-quantization encode backward — the straight-through estimator (STE).
+// The argmin that selects a codeword is non-differentiable, so backward simply
+// copies the upstream gradient straight through the encoder:
+//
+//   dX = dQuantized      (identity passthrough, *overwritten* — NOT accumulated)
+//
+// This is purely the encoder STE path. vq_encode_backward does NOT produce a
+// codebook gradient: in a VQ-VAE the codebook loss and the commitment loss are
+// separate caller-side MSE terms (computed with mse_vec_forward/backward), so
+// the codebook is trained by those, not by this op.
+//
+//   dQuantized: (N, D) FP32   upstream gradient w.r.t. the quantized output.
+//   dX:         (N, D) FP32   *output*, overwritten. Resized + dtype-set to
+//                             match dQuantized. dX may alias dQuantized.
+void vq_encode_backward(const Tensor& dQuantized, Tensor& dX);
+
+// Finite Scalar Quantization (FSQ — the NanoCodec quantizer). Each coordinate
+// of each row is independently snapped to one of L_d evenly spaced levels.
+//
+// Convention (the standard FSQ-paper / NanoCodec bounding+rounding): the input
+// x is assumed already bounded into [-1, 1] by a caller-side tanh. For a
+// dimension d with L_d levels and half-width  h = (L_d - 1) / 2 :
+//   1. clamp:      v = clamp(x, -1, 1)
+//   2. to index:   i = round( (v + 1) / 2 * (L_d - 1) ) , i in [0, L_d - 1]
+//   3. dequantize: quantized = i / h - 1            (back into [-1, 1])
+// A coordinate already sitting exactly on a level round-trips to itself.
+// The per-dimension integer index i_d is then packed into one mixed-radix
+// integer with the level counts as the radix:
+//   packed = i_0 + L_0 * (i_1 + L_1 * (i_2 + L_2 * ( ... )))
+// i.e. dimension 0 is the least-significant digit. The caller recovers the
+// per-dim tuple by repeated divmod against the same level sequence.
+//
+//   x:              (N, D) FP32   input, assumed pre-bounded into [-1, 1].
+//   levels:         (D, 1) INT32  per-dimension level count L_d (each >= 2).
+//   quantized:      (N, D) FP32   *output* — dequantized values in [-1, 1].
+//                                 Resized + dtype-set to FP32 if mis-shaped.
+//   packed_indices: (N, 1) INT32  *output* — the mixed-radix packed code per
+//                                 row. Resized AND dtype-set to INT32.
+void fsq_quantize_forward(const Tensor& x, const Tensor& levels,
+                          Tensor& quantized, Tensor& packed_indices);
+
+// FSQ backward — the straight-through estimator (STE). The round in the
+// forward is non-differentiable, so backward copies the upstream gradient
+// straight through:
+//
+//   dX = dQuantized      (identity passthrough, *overwritten* — NOT accumulated)
+//
+//   dQuantized: (N, D) FP32   upstream gradient w.r.t. the quantized output.
+//   dX:         (N, D) FP32   *output*, overwritten. Resized + dtype-set to
+//                             match dQuantized. dX may alias dQuantized.
+void fsq_quantize_backward(const Tensor& dQuantized, Tensor& dX);
+
 } // namespace brotensor

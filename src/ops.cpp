@@ -1744,4 +1744,42 @@ void leaky_relu_backward(const Tensor& x, const Tensor& dY,
     v.leaky_relu_backward(x, dY, negative_slope, dX);
 }
 
+// ─── Codec quantization (brosoundml) ───────────────────────────────────────
+
+void vq_encode_forward(const Tensor& x, const Tensor& codebook,
+                       Tensor& indices, Tensor& quantized) {
+    const auto& v = detail::dispatch(x, codebook, indices, quantized);
+    if (!v.vq_encode_forward)
+        detail::throw_not_implemented("vq_encode_forward", x.device);
+    detail::adopt_output(indices, x.device);
+    detail::adopt_output(quantized, x.device);
+    v.vq_encode_forward(x, codebook, indices, quantized);
+}
+
+void vq_encode_backward(const Tensor& dQuantized, Tensor& dX) {
+    const auto& v = detail::dispatch(dQuantized, dX);
+    if (!v.vq_encode_backward)
+        detail::throw_not_implemented("vq_encode_backward", dQuantized.device);
+    detail::adopt_output(dX, dQuantized.device);
+    v.vq_encode_backward(dQuantized, dX);
+}
+
+void fsq_quantize_forward(const Tensor& x, const Tensor& levels,
+                          Tensor& quantized, Tensor& packed_indices) {
+    const auto& v = detail::dispatch(x, levels, quantized, packed_indices);
+    if (!v.fsq_quantize_forward)
+        detail::throw_not_implemented("fsq_quantize_forward", x.device);
+    detail::adopt_output(quantized, x.device);
+    detail::adopt_output(packed_indices, x.device);
+    v.fsq_quantize_forward(x, levels, quantized, packed_indices);
+}
+
+void fsq_quantize_backward(const Tensor& dQuantized, Tensor& dX) {
+    const auto& v = detail::dispatch(dQuantized, dX);
+    if (!v.fsq_quantize_backward)
+        detail::throw_not_implemented("fsq_quantize_backward", dQuantized.device);
+    detail::adopt_output(dX, dQuantized.device);
+    v.fsq_quantize_backward(dQuantized, dX);
+}
+
 } // namespace brotensor

@@ -406,4 +406,11 @@
     X(elu_backward,                            void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY, float alpha, ::brotensor::Tensor& dX))                   \
     X(leaky_relu_forward,                      void,  (const ::brotensor::Tensor& x, float negative_slope, ::brotensor::Tensor& y))                                          \
     X(leaky_relu_backward,                     void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY, float negative_slope,                                    \
-                                                       ::brotensor::Tensor& dX))
+                                                       ::brotensor::Tensor& dX))                                                                                          \
+    /* ─── Codec quantization (brosoundml CHUNK 5, family D) ─── */                                                                                                        \
+    X(vq_encode_forward,                       void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& codebook,                                                   \
+                                                       ::brotensor::Tensor& indices, ::brotensor::Tensor& quantized))                                                      \
+    X(vq_encode_backward,                      void,  (const ::brotensor::Tensor& dQuantized, ::brotensor::Tensor& dX))                                                     \
+    X(fsq_quantize_forward,                    void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& levels,                                                     \
+                                                       ::brotensor::Tensor& quantized, ::brotensor::Tensor& packed_indices))                                               \
+    X(fsq_quantize_backward,                   void,  (const ::brotensor::Tensor& dQuantized, ::brotensor::Tensor& dX))

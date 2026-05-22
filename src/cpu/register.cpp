@@ -642,6 +642,20 @@ void leaky_relu_backward(const ::brotensor::Tensor& x,
                          const ::brotensor::Tensor& dY,
                          float negative_slope, ::brotensor::Tensor& dX);
 
+// ── Codec quantization (brosoundml CHUNK 5, family D) — codec_quant.cpp ──
+void vq_encode_forward(const ::brotensor::Tensor& x,
+                       const ::brotensor::Tensor& codebook,
+                       ::brotensor::Tensor& indices,
+                       ::brotensor::Tensor& quantized);
+void vq_encode_backward(const ::brotensor::Tensor& dQuantized,
+                        ::brotensor::Tensor& dX);
+void fsq_quantize_forward(const ::brotensor::Tensor& x,
+                          const ::brotensor::Tensor& levels,
+                          ::brotensor::Tensor& quantized,
+                          ::brotensor::Tensor& packed_indices);
+void fsq_quantize_backward(const ::brotensor::Tensor& dQuantized,
+                           ::brotensor::Tensor& dX);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -832,6 +846,12 @@ struct CpuStaticRegistrar {
         ops.elu_backward                 = &detail::cpu::elu_backward;
         ops.leaky_relu_forward           = &detail::cpu::leaky_relu_forward;
         ops.leaky_relu_backward          = &detail::cpu::leaky_relu_backward;
+
+        // ── Codec quantization (brosoundml) ──
+        ops.vq_encode_forward            = &detail::cpu::vq_encode_forward;
+        ops.vq_encode_backward           = &detail::cpu::vq_encode_backward;
+        ops.fsq_quantize_forward         = &detail::cpu::fsq_quantize_forward;
+        ops.fsq_quantize_backward        = &detail::cpu::fsq_quantize_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());
