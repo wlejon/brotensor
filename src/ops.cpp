@@ -1482,4 +1482,85 @@ void flash_attention_qkvo_int8w_fp16(const Tensor& X, const Tensor* Ctx,
                                       d_mask, num_heads, causal, O);
 }
 
+// ─── Spectral / FFT core (brosoundml) ──────────────────────────────────────
+
+void complex_mul(const Tensor& a, const Tensor& b, Tensor& y) {
+    const auto& v = detail::dispatch(a, b, y);
+    if (!v.complex_mul) detail::throw_not_implemented("complex_mul", a.device);
+    detail::adopt_output(y, a.device);
+    v.complex_mul(a, b, y);
+}
+void complex_mul_backward(const Tensor& a, const Tensor& b, const Tensor& dY,
+                          Tensor& dA, Tensor& dB) {
+    const auto& v = detail::dispatch(a, b, dY, dA, dB);
+    if (!v.complex_mul_backward)
+        detail::throw_not_implemented("complex_mul_backward", a.device);
+    detail::adopt_output(dA, a.device);
+    detail::adopt_output(dB, a.device);
+    v.complex_mul_backward(a, b, dY, dA, dB);
+}
+void complex_abs(const Tensor& z, Tensor& y) {
+    const auto& v = detail::dispatch(z, y);
+    if (!v.complex_abs) detail::throw_not_implemented("complex_abs", z.device);
+    detail::adopt_output(y, z.device);
+    v.complex_abs(z, y);
+}
+void complex_abs_backward(const Tensor& z, const Tensor& dY, Tensor& dZ) {
+    const auto& v = detail::dispatch(z, dY, dZ);
+    if (!v.complex_abs_backward)
+        detail::throw_not_implemented("complex_abs_backward", z.device);
+    detail::adopt_output(dZ, z.device);
+    v.complex_abs_backward(z, dY, dZ);
+}
+void complex_angle(const Tensor& z, Tensor& y) {
+    const auto& v = detail::dispatch(z, y);
+    if (!v.complex_angle) detail::throw_not_implemented("complex_angle", z.device);
+    detail::adopt_output(y, z.device);
+    v.complex_angle(z, y);
+}
+void complex_from_polar(const Tensor& mag, const Tensor& phase, Tensor& y) {
+    const auto& v = detail::dispatch(mag, phase, y);
+    if (!v.complex_from_polar)
+        detail::throw_not_implemented("complex_from_polar", mag.device);
+    detail::adopt_output(y, mag.device);
+    v.complex_from_polar(mag, phase, y);
+}
+void fft(const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.fft) detail::throw_not_implemented("fft", x.device);
+    detail::adopt_output(y, x.device);
+    v.fft(x, y);
+}
+void ifft(const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.ifft) detail::throw_not_implemented("ifft", x.device);
+    detail::adopt_output(y, x.device);
+    v.ifft(x, y);
+}
+void rfft(const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.rfft) detail::throw_not_implemented("rfft", x.device);
+    detail::adopt_output(y, x.device);
+    v.rfft(x, y);
+}
+void irfft(const Tensor& x, int L, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.irfft) detail::throw_not_implemented("irfft", x.device);
+    detail::adopt_output(y, x.device);
+    v.irfft(x, L, y);
+}
+void rfft_backward(const Tensor& dY, int L, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, dX);
+    if (!v.rfft_backward) detail::throw_not_implemented("rfft_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.rfft_backward(dY, L, dX);
+}
+void irfft_backward(const Tensor& dY, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, dX);
+    if (!v.irfft_backward)
+        detail::throw_not_implemented("irfft_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.irfft_backward(dY, dX);
+}
+
 } // namespace brotensor

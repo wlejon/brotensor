@@ -545,6 +545,29 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
                                  int num_heads, float scale,
                                  ::brotensor::Tensor& O);
 
+// ── Spectral / FFT core (brosoundml) — fft.cpp ──
+void complex_mul(const ::brotensor::Tensor& a, const ::brotensor::Tensor& b,
+                 ::brotensor::Tensor& y);
+void complex_mul_backward(const ::brotensor::Tensor& a,
+                          const ::brotensor::Tensor& b,
+                          const ::brotensor::Tensor& dY,
+                          ::brotensor::Tensor& dA, ::brotensor::Tensor& dB);
+void complex_abs(const ::brotensor::Tensor& z, ::brotensor::Tensor& y);
+void complex_abs_backward(const ::brotensor::Tensor& z,
+                          const ::brotensor::Tensor& dY,
+                          ::brotensor::Tensor& dZ);
+void complex_angle(const ::brotensor::Tensor& z, ::brotensor::Tensor& y);
+void complex_from_polar(const ::brotensor::Tensor& mag,
+                        const ::brotensor::Tensor& phase,
+                        ::brotensor::Tensor& y);
+void fft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void ifft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void rfft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void irfft(const ::brotensor::Tensor& x, int L, ::brotensor::Tensor& y);
+void rfft_backward(const ::brotensor::Tensor& dY, int L,
+                   ::brotensor::Tensor& dX);
+void irfft_backward(const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -695,6 +718,20 @@ struct CpuStaticRegistrar {
         ops.rope_apply                   = &detail::cpu::rope_apply;
         ops.rope_apply_backward          = &detail::cpu::rope_apply_backward;
         ops.self_attention_bias_forward  = &detail::cpu::self_attention_bias_forward;
+
+        // ── Spectral / FFT core (brosoundml) ──
+        ops.complex_mul                  = &detail::cpu::complex_mul;
+        ops.complex_mul_backward         = &detail::cpu::complex_mul_backward;
+        ops.complex_abs                  = &detail::cpu::complex_abs;
+        ops.complex_abs_backward         = &detail::cpu::complex_abs_backward;
+        ops.complex_angle                = &detail::cpu::complex_angle;
+        ops.complex_from_polar           = &detail::cpu::complex_from_polar;
+        ops.fft                          = &detail::cpu::fft;
+        ops.ifft                         = &detail::cpu::ifft;
+        ops.rfft                         = &detail::cpu::rfft;
+        ops.irfft                        = &detail::cpu::irfft;
+        ops.rfft_backward                = &detail::cpu::rfft_backward;
+        ops.irfft_backward               = &detail::cpu::irfft_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

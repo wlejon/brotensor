@@ -1977,4 +1977,147 @@ void flash_attention_qkvo_int8w_fp16(const Tensor& X,
                                      bool causal,
                                      Tensor& O);
 
+// ─── Spectral / FFT core (brosoundml audio ops) ────────────────────────────
+//
+// Audio primitives for Whisper / STT, TTS, and neural-codec models. CPU
+// backend, FP32-only — consistent with brotensor's "CPU is the simple correct
+// fallback" rule.
+//
+// ── Complex tensor layout ──────────────────────────────────────────────────
+// There is NO new Dtype for complex numbers. A complex tensor is an ordinary
+// FP32 Tensor with the bin axis stored *interleaved* as [re, im, re, im, ...].
+// A complex spectrum of C bins over R rows is an (R, 2*C) FP32 tensor; row r,
+// bin c occupies columns [2*c] (real) and [2*c+1] (imaginary). Real tensors
+// keep the natural (R, C) shape. This mirrors conv2d's convention of carrying
+// logical structure in plain rank-2 storage.
+//
+// ── FFT algorithm ──────────────────────────────────────────────────────────
+// Hand-rolled, no external library. A mixed-radix Cooley-Tukey core (radices
+// 2/3/5/7) handles every size whose prime factors are all small — including
+// Whisper's n_fft = 400 (= 2^4 * 5^2). Any size with a large or prime factor
+// (e.g. 401, 53) is handled by a Bluestein chirp-z fallback, so the transforms
+// are correct for *all* lengths >= 1.
+//
+// ── Normalisation ──────────────────────────────────────────────────────────
+// "backward" convention (numpy default): the forward transform (fft / rfft)
+// is UNSCALED; the inverse transform (ifft / irfft) is scaled by 1/N.
+//
+// ── Gradients (linear-transform adjoints) ──────────────────────────────────
+// fft, ifft, rfft, irfft are all linear, so each backward is the adjoint of
+// the forward. The vtable is kept minimal:
+//
+//   * fft / ifft have NO explicit backward op. The adjoint of the length-N
+//     DFT matrix F is F^H = N * F^{-1}, so the gradients are simply an
+//     existing transform plus a scalar:
+//         grad_x for y = fft(x):   grad_x = ifft(grad_y); scale_inplace(grad_x, N)
+//         grad_x for y = ifft(x):  grad_x = fft(grad_y);  scale_inplace(grad_x, 1/N)
+//     Adding fft_backward / ifft_backward would be a redundant vtable row.
+//
+//   * rfft / irfft DO have explicit backward ops. rfft drops the redundant
+//     negative-frequency half; irfft additionally applies the 1/L scaling and
+//     folds the Hermitian half back in. `rfft_backward` is the plain adjoint
+//     of the truncated DFT matrix (no bin weighting — rfft does no folding).
+//     `irfft_backward` carries the 1/L scaling AND a 1/2-style bin weighting
+//     for the interior bins, because irfft's forward folds each stored bin
+//     into a conjugate pair. They are NOT mutual transposes, and the bin
+//     weighting is easy to get wrong by hand, so both are provided explicitly
+//     rather than left for callers to reconstruct.
+//
+// All spectral ops require CPU FP32 tensors and throw
+// "brotensor: <op>: <reason>" otherwise. Output tensors are resized (real vs.
+// interleaved-complex shape as documented per op) when mis-shaped, except
+// complex_mul_backward's dA/dB which accumulate and must be pre-sized + zeroed.
+
+// Complex elementwise multiply: y = a * b per bin.
+//   a, b, y: interleaved-complex (R, 2*C). a and b must share shape.
+//   y is resized to a's shape if mis-shaped.
+// (a.re + i*a.im) * (b.re + i*b.im) computed per complex element.
+void complex_mul(const Tensor& a, const Tensor& b, Tensor& y);
+
+// Backward of complex_mul. For y = a * b:
+//   dA = dY * conj(b),   dB = dY * conj(a).
+//   a, b, dY, dA, dB: interleaved-complex (R, 2*C), all the same shape.
+//   dA, dB are *accumulated into* — the caller pre-sizes and zeros them
+//   (same contract as linear_backward / matmul_backward).
+void complex_mul_backward(const Tensor& a, const Tensor& b, const Tensor& dY,
+                          Tensor& dA, Tensor& dB);
+
+// Complex magnitude: y = |z| per bin.
+//   z: interleaved-complex (R, 2*C).
+//   y: REAL (R, C) — resized if mis-shaped.
+// y[r,c] = sqrt(z.re^2 + z.im^2).
+void complex_abs(const Tensor& z, Tensor& y);
+
+// Backward of complex_abs. With r = |z|:
+//   dZ.re = dY * z.re / r,   dZ.im = dY * z.im / r.
+//   z:  interleaved-complex (R, 2*C) — forward input.
+//   dY: REAL (R, C) — upstream gradient on the magnitudes.
+//   dZ: interleaved-complex (R, 2*C) — *overwritten* (resized if mis-shaped).
+// At r == 0 (non-differentiable point) the gradient is set to 0.
+void complex_abs_backward(const Tensor& z, const Tensor& dY, Tensor& dZ);
+
+// Complex phase: y = atan2(z.im, z.re) per bin, in radians (-pi, pi].
+//   z: interleaved-complex (R, 2*C).
+//   y: REAL (R, C) — resized if mis-shaped.
+// No backward — phase is rarely used inside a differentiable loss and atan2
+// is non-differentiable at the origin.
+void complex_angle(const Tensor& z, Tensor& y);
+
+// Build a complex tensor from polar components: y = mag * exp(i*phase).
+//   mag, phase: REAL (R, C), same shape.
+//   y: interleaved-complex (R, 2*C) — resized if mis-shaped.
+// y.re = mag*cos(phase), y.im = mag*sin(phase). Inverse of (complex_abs,
+// complex_angle) taken together.
+void complex_from_polar(const Tensor& mag, const Tensor& phase, Tensor& y);
+
+// Forward FFT (complex -> complex), one signal per tensor row.
+//   x, y: interleaved-complex (R, 2*N). y resized to x's shape if mis-shaped.
+// "backward" normalisation — the forward transform is unscaled.
+// Linear; for the gradient of y = fft(x) use ifft + scale by N (see the
+// header note above) — there is intentionally no fft_backward.
+void fft(const Tensor& x, Tensor& y);
+
+// Inverse FFT (complex -> complex), one signal per tensor row.
+//   x, y: interleaved-complex (R, 2*N). y resized to x's shape if mis-shaped.
+// "backward" normalisation — the inverse transform is scaled by 1/N.
+// Linear; for the gradient of y = ifft(x) use fft + scale by 1/N — there is
+// intentionally no ifft_backward.
+void ifft(const Tensor& x, Tensor& y);
+
+// Real-input FFT: real signal -> non-redundant half-spectrum.
+//   x: REAL (R, L)  — one length-L signal per row.
+//   y: interleaved-complex (R, 2*(L/2+1)) — bins 0..L/2 only (the rest follow
+//      from Hermitian symmetry). Resized if mis-shaped.
+// "backward" normalisation — unscaled. Backward is rfft_backward.
+void rfft(const Tensor& x, Tensor& y);
+
+// Inverse real FFT: half-spectrum -> real signal.
+//   x: interleaved-complex (R, 2*(L/2+1)) — a non-redundant half-spectrum.
+//   L: the output signal length. Must be passed explicitly because a C-bin
+//      half-spectrum is ambiguous between L = 2*(C-1) and L = 2*C-1; the op
+//      throws unless C == L/2+1.
+//   y: REAL (R, L) — resized if mis-shaped.
+// The full Hermitian-symmetric spectrum is rebuilt internally before the
+// inverse transform. "backward" normalisation — scaled by 1/L. Backward is
+// irfft_backward.
+void irfft(const Tensor& x, int L, Tensor& y);
+
+// Backward of rfft (its adjoint). Maps the half-spectrum gradient back to the
+// real signal gradient.
+//   dY: interleaved-complex (R, 2*(L/2+1)) — upstream gradient on the spectrum.
+//   L:  the original real signal length (must satisfy dY.cols/2 == L/2+1).
+//   dX: REAL (R, L) — *overwritten* (resized if mis-shaped).
+// Interior bins (every bin except DC, and except Nyquist when L is even) are
+// weighted by 2 because each stored bin stands for a conjugate pair.
+void rfft_backward(const Tensor& dY, int L, Tensor& dX);
+
+// Backward of irfft (its adjoint). Maps the real-signal gradient back to the
+// half-spectrum gradient.
+//   dY: REAL (R, L) — upstream gradient on the reconstructed signal.
+//   dX: interleaved-complex (R, 2*(L/2+1)) — *overwritten* (resized if
+//       mis-shaped). L is inferred from dY.cols.
+// Carries the 1/L scaling and the same 1/2 bin weighting as irfft's forward;
+// it is the transpose of rfft_backward.
+void irfft_backward(const Tensor& dY, Tensor& dX);
+
 } // namespace brotensor

@@ -346,4 +346,18 @@
                                                        const ::brotensor::Tensor& Wv_int8, const ::brotensor::Tensor& sv,                                                 \
                                                        const ::brotensor::Tensor& Wo_int8, const ::brotensor::Tensor& so,                                                 \
                                                        const float* d_mask, const ::brotensor::Tensor* attn_bias,                                                         \
-                                                       int num_heads, float scale, ::brotensor::Tensor& O))
+                                                       int num_heads, float scale, ::brotensor::Tensor& O))                                                               \
+    /* ─── Spectral / FFT core (brosoundml) ─── */                                                                                                                        \
+    X(complex_mul,                             void,  (const ::brotensor::Tensor& a, const ::brotensor::Tensor& b, ::brotensor::Tensor& y))                               \
+    X(complex_mul_backward,                    void,  (const ::brotensor::Tensor& a, const ::brotensor::Tensor& b, const ::brotensor::Tensor& dY,                         \
+                                                       ::brotensor::Tensor& dA, ::brotensor::Tensor& dB))                                                                 \
+    X(complex_abs,                             void,  (const ::brotensor::Tensor& z, ::brotensor::Tensor& y))                                                             \
+    X(complex_abs_backward,                    void,  (const ::brotensor::Tensor& z, const ::brotensor::Tensor& dY, ::brotensor::Tensor& dZ))                             \
+    X(complex_angle,                           void,  (const ::brotensor::Tensor& z, ::brotensor::Tensor& y))                                                             \
+    X(complex_from_polar,                      void,  (const ::brotensor::Tensor& mag, const ::brotensor::Tensor& phase, ::brotensor::Tensor& y))                         \
+    X(fft,                                     void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                                             \
+    X(ifft,                                    void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                                             \
+    X(rfft,                                    void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                                             \
+    X(irfft,                                   void,  (const ::brotensor::Tensor& x, int L, ::brotensor::Tensor& y))                                                      \
+    X(rfft_backward,                           void,  (const ::brotensor::Tensor& dY, int L, ::brotensor::Tensor& dX))                                                    \
+    X(irfft_backward,                          void,  (const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))

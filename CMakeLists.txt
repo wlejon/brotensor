@@ -103,6 +103,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/resblock.cpp
     src/cpu/modulate.cpp
     src/cpu/self_attention_bias.cpp
+    src/cpu/fft.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)
