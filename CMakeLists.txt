@@ -170,6 +170,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/self_attention_bias.cu
         src/cuda/vocoder_activations.cu
         src/cuda/log_exp_round.cu
+        src/cuda/fft.cu
         src/cuda/register.cu
     )
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)
