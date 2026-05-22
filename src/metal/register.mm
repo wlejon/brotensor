@@ -63,6 +63,12 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.build_slot_mask                             = &dm::build_slot_mask;
     ops.cast                                        = &dm::cast;
     ops.clamp                                       = &dm::clamp;
+    ops.complex_abs                                 = &dm::complex_abs;
+    ops.complex_abs_backward                        = &dm::complex_abs_backward;
+    ops.complex_angle                               = &dm::complex_angle;
+    ops.complex_from_polar                          = &dm::complex_from_polar;
+    ops.complex_mul                                 = &dm::complex_mul;
+    ops.complex_mul_backward                        = &dm::complex_mul_backward;
     ops.concat_batched_rows                         = &dm::concat_batched_rows;
     ops.concat_nchw_channels                        = &dm::concat_nchw_channels;
     ops.concat_nchw_channels_backward               = &dm::concat_nchw_channels_backward;
@@ -84,6 +90,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.embedding_lookup_backward                   = &dm::embedding_lookup_backward;
     ops.embedding_lookup_forward                    = &dm::embedding_lookup_forward;
     ops.euler_step                                  = &dm::euler_step;
+    ops.fft                                         = &dm::fft;
     ops.flash_attention_backward                    = &dm::flash_attention_backward;
     ops.flash_attention_decode                      = &dm::flash_attention_decode;
     ops.flash_attention_forward                     = &dm::flash_attention_forward;
@@ -104,6 +111,11 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.gelu_forward                                = &dm::gelu_forward;
     ops.group_norm_backward                         = &dm::group_norm_backward;
     ops.group_norm_forward                          = &dm::group_norm_forward;
+    ops.ifft                                        = &dm::ifft;
+    ops.irfft                                       = &dm::irfft;
+    ops.irfft_backward                              = &dm::irfft_backward;
+    ops.istft                                       = &dm::istft;
+    ops.istft_backward                              = &dm::istft_backward;
     ops.kv_cache_append                             = &dm::kv_cache_append;
     ops.layernorm_backward                          = &dm::layernorm_backward;
     ops.layernorm_forward                           = &dm::layernorm_forward;
@@ -137,6 +149,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.resblock_backward                           = &dm::resblock_backward;
     ops.resblock_forward                            = &dm::resblock_forward;
     ops.resblock_forward_int8w_fp16                 = &dm::resblock_forward_int8w_fp16;
+    ops.rfft                                        = &dm::rfft;
+    ops.rfft_backward                               = &dm::rfft_backward;
     ops.rms_norm_backward                           = &dm::rms_norm_backward;
     ops.rms_norm_forward                            = &dm::rms_norm_forward;
     ops.rope_apply                                  = &dm::rope_apply;
@@ -160,6 +174,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.softmax_xent_fused                          = &dm::softmax_xent_fused;
     ops.softmax_xent_fused_batched                  = &dm::softmax_xent_fused_batched;
     ops.split_rows                                  = &dm::split_rows;
+    ops.stft                                        = &dm::stft;
+    ops.stft_backward                               = &dm::stft_backward;
     ops.sum_cols                                    = &dm::sum_cols;
     ops.sum_rows                                    = &dm::sum_rows;
     ops.swiglu_backward                             = &dm::swiglu_backward;

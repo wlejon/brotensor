@@ -95,6 +95,7 @@ if(BROTENSOR_HAS_GPU)
         flash_attention resblock
         batched_backward tensor_ops
         modulate
+        fft stft
     )
     foreach(_name IN LISTS _brotensor_parity_tests)
         brotensor_add_test(brotensor_test_${_name}_parity test_${_name}_parity.cpp)
