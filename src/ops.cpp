@@ -1689,4 +1689,59 @@ void pad1d_backward(const Tensor& dY, int N, int C, int L,
     v.pad1d_backward(dY, N, C, L, pad_left, pad_right, mode, dX);
 }
 
+// ─── Vocoder / codec activations (brosoundml) ──────────────────────────────
+
+void snake_forward(const Tensor& X, const Tensor& alpha, const Tensor* beta,
+                   int N, int C, int L, Tensor& Y) {
+    const auto& v = detail::dispatch_with_opts(X, alpha, {beta, &Y});
+    if (!v.snake_forward)
+        detail::throw_not_implemented("snake_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.snake_forward(X, alpha, beta, N, C, L, Y);
+}
+
+void snake_backward(const Tensor& X, const Tensor& alpha, const Tensor* beta,
+                    const Tensor& dY, int N, int C, int L,
+                    Tensor& dX, Tensor& dAlpha, Tensor* dBeta) {
+    const auto& v = detail::dispatch_with_opts(
+        X, alpha, {beta, &dY, &dX, &dAlpha, dBeta});
+    if (!v.snake_backward)
+        detail::throw_not_implemented("snake_backward", X.device);
+    detail::adopt_output(dX, X.device);
+    detail::adopt_output(dAlpha, X.device);
+    if (dBeta) detail::adopt_output(*dBeta, X.device);
+    v.snake_backward(X, alpha, beta, dY, N, C, L, dX, dAlpha, dBeta);
+}
+
+void elu_forward(const Tensor& x, float alpha, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.elu_forward) detail::throw_not_implemented("elu_forward", x.device);
+    detail::adopt_output(y, x.device);
+    v.elu_forward(x, alpha, y);
+}
+
+void elu_backward(const Tensor& x, const Tensor& dY, float alpha, Tensor& dX) {
+    const auto& v = detail::dispatch(x, dY, dX);
+    if (!v.elu_backward) detail::throw_not_implemented("elu_backward", x.device);
+    detail::adopt_output(dX, x.device);
+    v.elu_backward(x, dY, alpha, dX);
+}
+
+void leaky_relu_forward(const Tensor& x, float negative_slope, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.leaky_relu_forward)
+        detail::throw_not_implemented("leaky_relu_forward", x.device);
+    detail::adopt_output(y, x.device);
+    v.leaky_relu_forward(x, negative_slope, y);
+}
+
+void leaky_relu_backward(const Tensor& x, const Tensor& dY,
+                         float negative_slope, Tensor& dX) {
+    const auto& v = detail::dispatch(x, dY, dX);
+    if (!v.leaky_relu_backward)
+        detail::throw_not_implemented("leaky_relu_backward", x.device);
+    detail::adopt_output(dX, x.device);
+    v.leaky_relu_backward(x, dY, negative_slope, dX);
+}
+
 } // namespace brotensor

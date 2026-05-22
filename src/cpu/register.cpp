@@ -620,6 +620,28 @@ void pad1d_backward(const ::brotensor::Tensor& dY, int N, int C, int L,
                     int pad_left, int pad_right, int mode,
                     ::brotensor::Tensor& dX);
 
+// ── Vocoder / codec activations (brosoundml) — vocoder_activations.cpp ──
+void snake_forward(const ::brotensor::Tensor& X,
+                   const ::brotensor::Tensor& alpha,
+                   const ::brotensor::Tensor* beta,
+                   int N, int C, int L, ::brotensor::Tensor& Y);
+void snake_backward(const ::brotensor::Tensor& X,
+                    const ::brotensor::Tensor& alpha,
+                    const ::brotensor::Tensor* beta,
+                    const ::brotensor::Tensor& dY,
+                    int N, int C, int L,
+                    ::brotensor::Tensor& dX, ::brotensor::Tensor& dAlpha,
+                    ::brotensor::Tensor* dBeta);
+void elu_forward(const ::brotensor::Tensor& x, float alpha,
+                 ::brotensor::Tensor& y);
+void elu_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
+                  float alpha, ::brotensor::Tensor& dX);
+void leaky_relu_forward(const ::brotensor::Tensor& x, float negative_slope,
+                        ::brotensor::Tensor& y);
+void leaky_relu_backward(const ::brotensor::Tensor& x,
+                         const ::brotensor::Tensor& dY,
+                         float negative_slope, ::brotensor::Tensor& dX);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -802,6 +824,14 @@ struct CpuStaticRegistrar {
         ops.causal_conv1d_update         = &detail::cpu::causal_conv1d_update;
         ops.pad1d_forward                = &detail::cpu::pad1d_forward;
         ops.pad1d_backward               = &detail::cpu::pad1d_backward;
+
+        // ── Vocoder / codec activations (brosoundml) ──
+        ops.snake_forward                = &detail::cpu::snake_forward;
+        ops.snake_backward               = &detail::cpu::snake_backward;
+        ops.elu_forward                  = &detail::cpu::elu_forward;
+        ops.elu_backward                 = &detail::cpu::elu_backward;
+        ops.leaky_relu_forward           = &detail::cpu::leaky_relu_forward;
+        ops.leaky_relu_backward          = &detail::cpu::leaky_relu_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

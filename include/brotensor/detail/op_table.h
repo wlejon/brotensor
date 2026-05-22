@@ -394,4 +394,16 @@
     X(pad1d_forward,                           void,  (const ::brotensor::Tensor& X, int N, int C, int L,                                                                  \
                                                        int pad_left, int pad_right, int mode, ::brotensor::Tensor& Y))                                                     \
     X(pad1d_backward,                          void,  (const ::brotensor::Tensor& dY, int N, int C, int L,                                                                 \
-                                                       int pad_left, int pad_right, int mode, ::brotensor::Tensor& dX))
+                                                       int pad_left, int pad_right, int mode, ::brotensor::Tensor& dX))                                                     \
+    /* ─── Vocoder / codec activations (brosoundml) ─── */                                                                                                                  \
+    X(snake_forward,                           void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& alpha,                                                       \
+                                                       const ::brotensor::Tensor* beta, int N, int C, int L, ::brotensor::Tensor& Y))                                       \
+    X(snake_backward,                          void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& alpha,                                                       \
+                                                       const ::brotensor::Tensor* beta, const ::brotensor::Tensor& dY,                                                      \
+                                                       int N, int C, int L,                                                                                                 \
+                                                       ::brotensor::Tensor& dX, ::brotensor::Tensor& dAlpha, ::brotensor::Tensor* dBeta))                                    \
+    X(elu_forward,                             void,  (const ::brotensor::Tensor& x, float alpha, ::brotensor::Tensor& y))                                                   \
+    X(elu_backward,                            void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY, float alpha, ::brotensor::Tensor& dX))                   \
+    X(leaky_relu_forward,                      void,  (const ::brotensor::Tensor& x, float negative_slope, ::brotensor::Tensor& y))                                          \
+    X(leaky_relu_backward,                     void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY, float negative_slope,                                    \
+                                                       ::brotensor::Tensor& dX))

@@ -106,6 +106,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/fft.cpp
     src/cpu/stft.cpp
     src/cpu/conv1d.cpp
+    src/cpu/vocoder_activations.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)

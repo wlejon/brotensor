@@ -2534,4 +2534,88 @@ void causal_conv1d_update(const Tensor& X, const Tensor& Wt, const Tensor* bias,
                           int N, int C, int L_step, int kL, int dilation,
                           Tensor& state, Tensor& Y);
 
+// ─── Vocoder / codec activations (brosoundml CHUNK 4, family C) ─────────────
+//
+// CPU FP32-only. The GPU vtable slots stay null for these ops. NCL layout:
+// the Tensor is a flat (rows, cols) buffer; the logical (N, C, L) dims are
+// passed as int args, exactly like conv1d's NCL / group_norm's NCHW
+// convention. Element (n, c, l) sits at flat index (n*C + c)*L + l.
+
+// Snake activation (BigVGAN / DAC vocoder; the "anti-aliased" periodic
+// activation). Per-channel learnable alpha (and optionally beta):
+//
+//   plain snake  (beta == nullptr):  y = x + (1/alpha_c) * sin^2(alpha_c * x)
+//   snakebeta    (beta != nullptr):  y = x + (1/beta_c)  * sin^2(alpha_c * x)
+//
+// alpha / beta are per-channel — one scalar per channel c, broadcast across
+// the whole (n, l) plane, exactly like group_norm's per-channel gamma/beta.
+// The reciprocal coefficient is guarded against division by a near-zero
+// alpha/beta: a denominator with magnitude below 1e-9 is floored to +/-1e-9
+// (sign preserved), so a zero parameter degrades gracefully instead of
+// producing NaN/Inf.
+//
+//   X:     (N, C * L)   input activations
+//   alpha: (C, 1) or (1, C)  per-channel frequency parameter
+//   beta:  per-channel reciprocal-amplitude parameter; null => plain snake
+//          (the beta == alpha case). When non-null, shape (C, 1) or (1, C).
+//   Y:     (N, C * L)   output, resized + dtype-set to match X if mis-shaped.
+// X and Y may alias. alpha / beta must be FP32 and CPU-resident.
+void snake_forward(const Tensor& X, const Tensor& alpha, const Tensor* beta,
+                   int N, int C, int L, Tensor& Y);
+
+// Snake backward. Reads the raw forward input X. With
+//   s = sin(a*x), c = cos(a*x), a = alpha_c, denom = (beta ? beta_c : a),
+//   and r = 1/denom (sign-guarded as in the forward):
+//   dy/dx       = 1 + 2 * a * r * s * c            (= 1 + a*r*sin(2 a x))
+//   dy/dalpha   = 2 * r * x * s * c                (= r*x*sin(2 a x))
+//   dy/dbeta    = -r^2 * s^2          (snakebeta only)
+//   plain snake : dy/dalpha additionally gets the -r^2*s^2 term, because
+//                 denom == alpha there (chain rule through both occurrences).
+//
+//   dX:     (N, C * L)   output, *overwritten*. Resized + dtype-set to match X.
+//   dAlpha: (C, 1)       *accumulated into* — caller zeros first.
+//   dBeta:  (C, 1)       *accumulated into* — caller zeros first. Pass null
+//           for plain snake (no separate beta); must be non-null exactly when
+//           `beta` is non-null.
+// Accumulation matches the group_norm_backward contract verbatim.
+void snake_backward(const Tensor& X, const Tensor& alpha, const Tensor* beta,
+                    const Tensor& dY, int N, int C, int L,
+                    Tensor& dX, Tensor& dAlpha, Tensor* dBeta);
+
+// ELU (EnCodec activation): elementwise
+//   y = x                      if x > 0
+//   y = alpha * (exp(x) - 1)   otherwise
+// `alpha` is a scalar (default 1.0). y resized to match x.shape if
+// mis-shaped. x and y may alias. CPU FP32-only.
+void elu_forward(const Tensor& x, float alpha, Tensor& y);
+inline void elu_forward(const Tensor& x, Tensor& y) {
+    elu_forward(x, /*alpha=*/1.0f, y);
+}
+
+// ELU backward. Reads the raw forward input x.
+//   dy/dx = 1                  if x > 0
+//   dy/dx = alpha * exp(x)     otherwise   (= y + alpha at x <= 0)
+//   dX[i] = dY[i] * dy/dx
+// dX resized to match x if mis-shaped; *overwritten* (not accumulated).
+// dX may alias dY. CPU FP32-only.
+void elu_backward(const Tensor& x, const Tensor& dY, float alpha, Tensor& dX);
+inline void elu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
+    elu_backward(x, dY, /*alpha=*/1.0f, dX);
+}
+
+// Leaky ReLU (HiFi-GAN activation): elementwise
+//   y = x                       if x > 0
+//   y = negative_slope * x      otherwise
+// y resized to match x.shape if mis-shaped. x and y may alias. CPU FP32-only.
+void leaky_relu_forward(const Tensor& x, float negative_slope, Tensor& y);
+
+// Leaky ReLU backward. Reads the raw forward input x.
+//   dy/dx = 1                   if x > 0
+//   dy/dx = negative_slope      otherwise
+//   dX[i] = dY[i] * dy/dx
+// dX resized to match x if mis-shaped; *overwritten* (not accumulated).
+// dX may alias dY. CPU FP32-only.
+void leaky_relu_backward(const Tensor& x, const Tensor& dY,
+                         float negative_slope, Tensor& dX);
+
 } // namespace brotensor
