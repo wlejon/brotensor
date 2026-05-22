@@ -35,6 +35,7 @@ void fill_cuda_vtable_stft           (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_conv1d         (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_codec_quant    (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_resample1d     (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_sample_logits  (::brotensor::detail::OpsVTable&);
 
 // ── alloc table (defined in tensor.cu) ──
 const ::brotensor::detail::AllocVTable& cuda_alloc_table();
@@ -76,6 +77,7 @@ extern "C" void brotensor_probe_and_register_cuda() {
     dc::fill_cuda_vtable_conv1d(ops);
     dc::fill_cuda_vtable_codec_quant(ops);
     dc::fill_cuda_vtable_resample1d(ops);
+    dc::fill_cuda_vtable_sample_logits(ops);
 
     ::brotensor::detail::register_backend(Device::CUDA, ops, dc::cuda_alloc_table());
 }
