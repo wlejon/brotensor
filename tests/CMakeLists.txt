@@ -101,7 +101,7 @@ if(BROTENSOR_HAS_GPU)
         modulate
         fft stft
         conv1d vocoder
-        log_exp_round
+        codec_quant resample1d log_exp_round sample_logits
     )
     foreach(_name IN LISTS _brotensor_parity_tests)
         brotensor_add_test(brotensor_test_${_name}_parity test_${_name}_parity.cpp)

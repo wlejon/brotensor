@@ -1,5 +1,6 @@
 build/
 build_*/
+build-*/
 out/
 *.user
 .vs/

@@ -2536,10 +2536,11 @@ void causal_conv1d_update(const Tensor& X, const Tensor& Wt, const Tensor* bias,
 
 // ─── Vocoder / codec activations (brosoundml CHUNK 4, family C) ─────────────
 //
-// CPU FP32-only. The GPU vtable slots stay null for these ops. NCL layout:
-// the Tensor is a flat (rows, cols) buffer; the logical (N, C, L) dims are
-// passed as int args, exactly like conv1d's NCL / group_norm's NCHW
-// convention. Element (n, c, l) sits at flat index (n*C + c)*L + l.
+// FP32-only on every backend (CPU and Metal; CUDA leaves these slots null —
+// brosoundml runs on the CPU/Metal pair). NCL layout: the Tensor is a flat
+// (rows, cols) buffer; the logical (N, C, L) dims are passed as int args,
+// exactly like conv1d's NCL / group_norm's NCHW convention. Element (n, c, l)
+// sits at flat index (n*C + c)*L + l.
 
 // Snake activation (BigVGAN / DAC vocoder; the "anti-aliased" periodic
 // activation). Per-channel learnable alpha (and optionally beta):
@@ -2620,9 +2621,9 @@ void leaky_relu_backward(const Tensor& x, const Tensor& dY,
 
 // ─── Codec quantization (brosoundml CHUNK 5, family D) ─────────────────────
 //
-// CPU FP32-only. The GPU vtable slots stay null for these ops. These are the
-// quantization bottlenecks of neural audio codecs (EnCodec/DAC residual-VQ,
-// NanoCodec finite-scalar quantization).
+// FP32-only on every backend (CPU and Metal; CUDA leaves these slots null).
+// These are the quantization bottlenecks of neural audio codecs (EnCodec/DAC
+// residual-VQ, NanoCodec finite-scalar quantization).
 
 // Vector-quantization encode (the encode step of a VQ-VAE codec bottleneck).
 // For each input row x[n], picks the codeword k minimizing the squared L2
@@ -2700,10 +2701,10 @@ void fsq_quantize_backward(const Tensor& dQuantized, Tensor& dX);
 
 // ─── 1D resampling (brosoundml CHUNK 6, family E) ──────────────────────────
 //
-// CPU FP32-only. The GPU vtable slots stay null for these ops. Arbitrary-scale
-// resampling along the length axis of an NCL audio tensor — the 1D analogue of
-// the fixed-2x NCHW resample ops above. Used for sample-rate conversion in
-// STT / TTS / codec front-ends (e.g. 24 kHz <-> 16 kHz).
+// FP32-only on every backend (CPU and Metal; CUDA leaves these slots null).
+// Arbitrary-scale resampling along the length axis of an NCL audio tensor — the
+// 1D analogue of the fixed-2x NCHW resample ops above. Used for sample-rate
+// conversion in STT / TTS / codec front-ends (e.g. 24 kHz <-> 16 kHz).
 
 // 1D resample along the length axis. N and C are carried through unchanged;
 // only the length axis is rescaled from L_in to the caller-supplied L_out
@@ -2745,9 +2746,10 @@ void resample1d_backward(const Tensor& dY, int N, int C, int L_in, int L_out,
 
 // ─── log / exp / round elementwise (brosoundml CHUNK 6, family G) ──────────
 //
-// CPU FP32-only. The GPU vtable slots stay null for these ops. Elementwise
-// scalar maps; output resized + dtype-set to match x. x/y and dX/dY may alias.
-// None has learnable parameters, so every backward *overwrites* dX.
+// FP32-only on every backend (CPU and Metal; CUDA leaves these slots null).
+// Elementwise scalar maps; output resized + dtype-set to match x. x/y and
+// dX/dY may alias. None has learnable parameters, so every backward
+// *overwrites* dX.
 
 // Natural logarithm: y = log(x), elementwise. Used for log-mel spectrograms
 // and log-domain loss terms.
@@ -2810,11 +2812,16 @@ void round_backward(const Tensor& dY, Tensor& dX);
 
 // ─── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ───────────
 //
-// CPU FP32-only. The GPU vtable slot stays null for this op. This is the
-// next-token sampler shared by autoregressive generation loops — brosoundml's
-// codec-LM decoding (MusicGen / VibeVoice-style acoustic-token generation) and
-// the brolm language-model project both call it. It is a general LLM / codec-LM
-// sampler, not audio-specific.
+// FP32-only on every backend (CPU and Metal; CUDA leaves this slot null). This
+// is the next-token sampler shared by autoregressive generation loops —
+// brosoundml's codec-LM decoding (MusicGen / VibeVoice-style acoustic-token
+// generation) and the brolm language-model project both call it. It is a
+// general LLM / codec-LM sampler, not audio-specific.
+//
+// Metal runs the per-row pipeline one thread per row; its FP32 reductions are
+// not bit-identical to the CPU op's FP64 accumulators, so a draw whose Philox
+// uniform lands within a few ulp of a CDF-bucket boundary may pick a different
+// token. With well-separated logits the two backends agree.
 //
 // Per row of an (N, V) logit matrix (N independent rows, V = vocabulary size)
 // it draws one token id, applying, in order:

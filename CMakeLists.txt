@@ -243,6 +243,10 @@ if(BROTENSOR_WITH_METAL)
         src/metal/stft.mm
         src/metal/conv1d.mm
         src/metal/vocoder_activations.mm
+        src/metal/codec_quant.mm
+        src/metal/resample1d.mm
+        src/metal/log_exp_round.mm
+        src/metal/sample_logits.mm
         src/metal/register.mm
     )
     set_source_files_properties(
@@ -292,6 +296,10 @@ if(BROTENSOR_WITH_METAL)
         src/metal/stft.mm
         src/metal/conv1d.mm
         src/metal/vocoder_activations.mm
+        src/metal/codec_quant.mm
+        src/metal/resample1d.mm
+        src/metal/log_exp_round.mm
+        src/metal/sample_logits.mm
         src/metal/register.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"

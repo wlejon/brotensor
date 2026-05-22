@@ -97,6 +97,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.embedding_lookup_backward                   = &dm::embedding_lookup_backward;
     ops.embedding_lookup_forward                    = &dm::embedding_lookup_forward;
     ops.euler_step                                  = &dm::euler_step;
+    ops.exp_backward                                = &dm::exp_backward;
+    ops.exp_forward                                 = &dm::exp_forward;
     ops.fft                                         = &dm::fft;
     ops.flash_attention_backward                    = &dm::flash_attention_backward;
     ops.flash_attention_decode                      = &dm::flash_attention_decode;
@@ -108,6 +110,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.flash_attention_qkvo_backward               = &dm::flash_attention_qkvo_backward;
     ops.flash_attention_qkvo_forward                = &dm::flash_attention_qkvo_forward;
     ops.flash_attention_qkvo_int8w_fp16             = &dm::flash_attention_qkvo_int8w_fp16;
+    ops.fsq_quantize_backward                       = &dm::fsq_quantize_backward;
+    ops.fsq_quantize_forward                        = &dm::fsq_quantize_forward;
     ops.geglu_backward                              = &dm::geglu_backward;
     ops.geglu_exact_backward                        = &dm::geglu_exact_backward;
     ops.geglu_exact_forward                         = &dm::geglu_exact_forward;
@@ -136,6 +140,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.linear_forward_batched                      = &dm::linear_forward_batched;
     ops.linear_forward_batched_fp16                 = &dm::linear_forward_batched_fp16;
     ops.linear_forward_batched_int8w_fp16           = &dm::linear_forward_batched_int8w_fp16;
+    ops.log_backward                                = &dm::log_backward;
+    ops.log_forward                                 = &dm::log_forward;
     ops.masked_mean_pool_backward                   = &dm::masked_mean_pool_backward;
     ops.masked_mean_pool_forward                    = &dm::masked_mean_pool_forward;
     ops.matmul                                      = &dm::matmul;
@@ -157,6 +163,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.relu_backward_batched                       = &dm::relu_backward_batched;
     ops.relu_forward                                = &dm::relu_forward;
     ops.relu_forward_batched                        = &dm::relu_forward_batched;
+    ops.resample1d_backward                         = &dm::resample1d_backward;
+    ops.resample1d_forward                          = &dm::resample1d_forward;
     ops.resblock_backward                           = &dm::resblock_backward;
     ops.resblock_forward                            = &dm::resblock_forward;
     ops.resblock_forward_int8w_fp16                 = &dm::resblock_forward_int8w_fp16;
@@ -168,6 +176,9 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.rope_apply_backward                         = &dm::rope_apply_backward;
     ops.rope_backward                               = &dm::rope_backward;
     ops.rope_forward                                = &dm::rope_forward;
+    ops.round_backward                              = &dm::round_backward;
+    ops.round_forward                               = &dm::round_forward;
+    ops.sample_logits                               = &dm::sample_logits;
     ops.scale_inplace                               = &dm::scale_inplace;
     ops.self_attention_backward                     = &dm::self_attention_backward;
     ops.self_attention_bias_forward                 = &dm::self_attention_bias_forward;
@@ -202,6 +213,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.upsample_bilinear_2x_backward               = &dm::upsample_bilinear_2x_backward;
     ops.upsample_nearest_2x                         = &dm::upsample_nearest_2x;
     ops.upsample_nearest_2x_backward                = &dm::upsample_nearest_2x_backward;
+    ops.vq_encode_backward                          = &dm::vq_encode_backward;
+    ops.vq_encode_forward                           = &dm::vq_encode_forward;
 
     ::brotensor::detail::register_backend(Device::Metal, ops,
                                           dm::metal_alloc_table());
