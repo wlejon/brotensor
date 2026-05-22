@@ -373,4 +373,25 @@
                                                        bool center, bool normalized, ::brotensor::Tensor& signal))                                                       \
     X(istft_backward,                          void,  (const ::brotensor::Tensor& dSignal, const ::brotensor::Tensor& window,                                             \
                                                        int N, int signal_len, int n_fft, int hop_length, int win_length,                                                 \
-                                                       bool center, bool normalized, ::brotensor::Tensor& dSpec))
+                                                       bool center, bool normalized, ::brotensor::Tensor& dSpec))                                                        \
+    /* ─── 1D convolution family (brosoundml) ─── */                                                                                                                      \
+    X(conv_transpose1d_forward,                void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wt, const ::brotensor::Tensor* bias,                       \
+                                                       int N, int C_in, int L, int C_out, int kL,                                                                         \
+                                                       int stride, int padding, int output_padding, int dilation, int groups,                                             \
+                                                       ::brotensor::Tensor& Y))                                                                                           \
+    X(conv_transpose1d_backward_input,         void,  (const ::brotensor::Tensor& Wt, const ::brotensor::Tensor& dY,                                                       \
+                                                       int N, int C_in, int L, int C_out, int kL,                                                                         \
+                                                       int stride, int padding, int output_padding, int dilation, int groups,                                             \
+                                                       ::brotensor::Tensor& dX))                                                                                          \
+    X(conv_transpose1d_backward_weight,        void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& dY,                                                        \
+                                                       int N, int C_in, int L, int C_out, int kL,                                                                         \
+                                                       int stride, int padding, int output_padding, int dilation, int groups,                                             \
+                                                       ::brotensor::Tensor& dWt))                                                                                         \
+    X(conv_transpose1d_backward_bias,          void,  (const ::brotensor::Tensor& dY, int N, int C_out, int L_out, ::brotensor::Tensor& dB))                               \
+    X(causal_conv1d_update,                    void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wt, const ::brotensor::Tensor* bias,                       \
+                                                       int N, int C, int L_step, int kL, int dilation,                                                                    \
+                                                       ::brotensor::Tensor& state, ::brotensor::Tensor& Y))                                                               \
+    X(pad1d_forward,                           void,  (const ::brotensor::Tensor& X, int N, int C, int L,                                                                  \
+                                                       int pad_left, int pad_right, int mode, ::brotensor::Tensor& Y))                                                     \
+    X(pad1d_backward,                          void,  (const ::brotensor::Tensor& dY, int N, int C, int L,                                                                 \
+                                                       int pad_left, int pad_right, int mode, ::brotensor::Tensor& dX))

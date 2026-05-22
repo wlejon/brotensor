@@ -2223,4 +2223,315 @@ void istft_backward(const Tensor& dSignal, const Tensor& window,
                     int win_length, bool center, bool normalized,
                     Tensor& dSpec);
 
+// ─── 1D convolution family (brosoundml) ────────────────────────────────────
+//
+// The audio counterpart of the conv2d family. Whisper / TTS / neural-codec /
+// vocoder stacks are built almost entirely from 1D convs: causal dilated
+// stacks (WaveNet / streaming codecs), depthwise temporal convs (Conformer),
+// and transposed convs for the upsampling vocoder back-end. CPU, FP32-only.
+//
+// ── Layout (NCL) ────────────────────────────────────────────────────────────
+// Tensors stay rank-2. A 1D-conv activation is shape (N, C * L): N batched
+// signals folded into rows, each row a flat C-major / L-minor buffer —
+//   X[(n*C + c) * L + l]
+// — exactly the NCHW convention with the height axis dropped. N, C, L are
+// passed as explicit int args. Weights are OIL: a length-(kL) filter per
+// (out-channel, in-channel) pair, laid out
+//   Wt[(c_out * (C_in/groups) + c_in_local) * kL + kl].
+//
+// ── conv1d as a conv2d wrapper ──────────────────────────────────────────────
+// Plain conv1d, its three backward halves, and the W8A16 conv1d are NOT new
+// kernels — a 1D conv is exactly a 2D conv with the height axis collapsed
+// (H = 1, kH = 1, stride_h = 1, pad_h = 0, dil_h = 1). They are provided here
+// as header-only inline wrappers that forward to the conv2d ops, so every
+// backend that implements conv2d gets conv1d for free. `conv1d_int8w_fp16`
+// therefore throws "not implemented" on the CPU backend (conv2d_int8w is a
+// null CPU slot) — correct and consistent; the wrapper still exists for the
+// GPU backends. `causal_conv1d` is likewise a wrapper: left-pad by
+// dilation*(kernel-1) then run a valid (pad = 0) conv1d.
+//
+// conv_transpose1d, causal_conv1d_update, and pad1d ARE genuinely new ops with
+// their own vtable rows and CPU implementations below.
+
+// ── pad1d — genuinely new length-axis padding op ────────────────────────────
+//
+// Pads the length axis of an NCL tensor by `pad_left` / `pad_right` samples.
+// The temporal analogue of an image pad; needed for causal-conv left padding,
+// "same" padding, and reflect padding in vocoder front-ends. New vtable rows,
+// CPU FP32-only. Forward + backward. (Declared here, ahead of the conv1d
+// wrappers, because `causal_conv1d` below calls `pad1d_forward`.)
+//
+// `mode` selects the boundary rule (an int so the vtable signature stays
+// trivially portable):
+//   mode == 0  zero       — padded samples are 0.
+//   mode == 1  reflect    — mirror without repeating the edge sample
+//                           (numpy 'reflect'); requires pad < L.
+//   mode == 2  replicate  — clamp to the edge sample (numpy 'edge').
+//
+//   X: (N, C * L)                          input
+//   Y: (N, C * (L + pad_left + pad_right))  output, resized + dtype-set to X.
+//   Y[n, c, p] = X[n, c, src(p)] (or 0), src() per the mode above.
+void pad1d_forward(const Tensor& X, int N, int C, int L,
+                   int pad_left, int pad_right, int mode, Tensor& Y);
+
+// Backward of pad1d (its adjoint). Each input sample sums the gradient of
+// every output sample that read it (one for zero/replicate-interior, several
+// where reflect/replicate fold multiple outputs onto one input). dX is
+// *overwritten*. Resized + dtype-set to match dY.
+//   dY: (N, C * (L + pad_left + pad_right))  upstream gradient
+//   dX: (N, C * L)                            output
+// N, C, L and the pad / mode args match the forward call.
+void pad1d_backward(const Tensor& dY, int N, int C, int L,
+                    int pad_left, int pad_right, int mode, Tensor& dX);
+
+// 1D convolution, NCL. Header-only wrapper over conv2d_forward with the height
+// axis collapsed (H = 1, kH = 1, stride_h = 1, pad_h = 0, dil_h = 1).
+//   X:    (N, C_in * L)                input
+//   Wt:   (C_out, (C_in/groups) * kL)  weights, OIL layout
+//   bias: (C_out, 1)                   optional, may be null
+//   Y:    (N, C_out * L_out)           output, resized as conv2d_forward does.
+//   L_out = (L + 2*padding - dilation*(kL-1) - 1) / stride + 1.
+inline void conv1d(const Tensor& X, const Tensor& Wt, const Tensor* bias,
+                   int N, int C_in, int L, int C_out, int kL,
+                   int stride, int padding, int dilation, int groups,
+                   Tensor& Y) {
+    conv2d_forward(X, Wt, bias, N, C_in, /*H=*/1, /*W=*/L, C_out,
+                   /*kH=*/1, /*kW=*/kL, /*stride_h=*/1, /*stride_w=*/stride,
+                   /*pad_h=*/0, /*pad_w=*/padding, /*dil_h=*/1, /*dil_w=*/dilation,
+                   groups, Y);
+}
+// Convenience overload: groups defaults to 1.
+inline void conv1d(const Tensor& X, const Tensor& Wt, const Tensor* bias,
+                   int N, int C_in, int L, int C_out, int kL,
+                   int stride, int padding, int dilation, Tensor& Y) {
+    conv1d(X, Wt, bias, N, C_in, L, C_out, kL, stride, padding, dilation,
+           /*groups=*/1, Y);
+}
+
+// conv1d backward w.r.t. input. Header-only wrapper over conv2d_backward_input
+// (height axis collapsed). dX is *overwritten*.
+inline void conv1d_backward_input(const Tensor& Wt, const Tensor& dY,
+                                  int N, int C_in, int L, int C_out, int kL,
+                                  int stride, int padding, int dilation,
+                                  int groups, Tensor& dX) {
+    conv2d_backward_input(Wt, dY, N, C_in, /*H=*/1, /*W=*/L, C_out,
+                          /*kH=*/1, /*kW=*/kL, 1, stride, 0, padding,
+                          1, dilation, groups, dX);
+}
+inline void conv1d_backward_input(const Tensor& Wt, const Tensor& dY,
+                                  int N, int C_in, int L, int C_out, int kL,
+                                  int stride, int padding, int dilation,
+                                  Tensor& dX) {
+    conv1d_backward_input(Wt, dY, N, C_in, L, C_out, kL, stride, padding,
+                          dilation, /*groups=*/1, dX);
+}
+
+// conv1d backward w.r.t. weight. Header-only wrapper over
+// conv2d_backward_weight. dWt is *accumulated into* — caller zeros it first.
+inline void conv1d_backward_weight(const Tensor& X, const Tensor& dY,
+                                   int N, int C_in, int L, int C_out, int kL,
+                                   int stride, int padding, int dilation,
+                                   int groups, Tensor& dWt) {
+    conv2d_backward_weight(X, dY, N, C_in, /*H=*/1, /*W=*/L, C_out,
+                           /*kH=*/1, /*kW=*/kL, 1, stride, 0, padding,
+                           1, dilation, groups, dWt);
+}
+inline void conv1d_backward_weight(const Tensor& X, const Tensor& dY,
+                                   int N, int C_in, int L, int C_out, int kL,
+                                   int stride, int padding, int dilation,
+                                   Tensor& dWt) {
+    conv1d_backward_weight(X, dY, N, C_in, L, C_out, kL, stride, padding,
+                           dilation, /*groups=*/1, dWt);
+}
+
+// conv1d backward w.r.t. bias. Header-only wrapper over conv2d_backward_bias.
+// dB is *accumulated into* — caller zeros it first.
+inline void conv1d_backward_bias(const Tensor& dY, int N, int C_out, int L_out,
+                                 Tensor& dB) {
+    conv2d_backward_bias(dY, N, C_out, /*H_out=*/1, /*W_out=*/L_out, dB);
+}
+
+// W8A16 1D convolution. Header-only wrapper over conv2d_int8w_fp16_forward
+// (height axis collapsed). FP16 activations, INT8 per-output-row-quantised
+// weights. Throws "not implemented" on the CPU backend (CPU has no W8A16
+// conv slot) — kept here for the GPU backends.
+//   X:      (N, C_in * L)               FP16
+//   W_int8: (C_out, (C_in/groups) * kL) INT8 OIL
+//   scales: (C_out, 1)                  FP32 per-output-row dequant scales
+//   bias:   (C_out, 1)                  optional FP16, may be null
+//   Y:      (N, C_out * L_out)          FP16 output
+inline void conv1d_int8w_fp16(const Tensor& X, const Tensor& W_int8,
+                              const Tensor& scales, const Tensor* bias,
+                              int N, int C_in, int L, int C_out, int kL,
+                              int stride, int padding, int dilation, int groups,
+                              Tensor& Y) {
+    conv2d_int8w_fp16_forward(X, W_int8, scales, bias, N, C_in, /*H=*/1,
+                              /*W=*/L, C_out, /*kH=*/1, /*kW=*/kL,
+                              /*stride_h=*/1, /*stride_w=*/stride,
+                              /*pad_h=*/0, /*pad_w=*/padding,
+                              /*dil_h=*/1, /*dil_w=*/dilation, groups, Y);
+}
+inline void conv1d_int8w_fp16(const Tensor& X, const Tensor& W_int8,
+                              const Tensor& scales, const Tensor* bias,
+                              int N, int C_in, int L, int C_out, int kL,
+                              int stride, int padding, int dilation, Tensor& Y) {
+    conv1d_int8w_fp16(X, W_int8, scales, bias, N, C_in, L, C_out, kL, stride,
+                      padding, dilation, /*groups=*/1, Y);
+}
+
+// Causal 1D convolution. Header-only wrapper: left-pad the length axis by
+// dilation*(kL-1) (zero pad), right-pad by 0, then run a valid (pad = 0)
+// conv1d. The output keeps the input length L when stride == 1, and every
+// output sample depends only on input samples at or before its position —
+// the standard streaming/autoregressive temporal conv.
+//   X:     (N, C_in * L)
+//   Wt:    (C_out, (C_in/groups) * kL)  OIL weights
+//   bias:  (C_out, 1)                   optional, may be null
+//   scratch: a caller-owned Tensor used to hold the left-padded input; it is
+//            resized to (N, C_in * (L + dilation*(kL-1))) and overwritten.
+//            Passing it in keeps the wrapper allocation-free across calls.
+//   Y:     (N, C_out * L_out)           output, resized by conv1d.
+inline void causal_conv1d(const Tensor& X, const Tensor& Wt, const Tensor* bias,
+                          int N, int C_in, int L, int C_out, int kL,
+                          int stride, int dilation, int groups,
+                          Tensor& scratch, Tensor& Y) {
+    const int pad_left = dilation * (kL - 1);
+    pad1d_forward(X, N, C_in, L, pad_left, /*pad_right=*/0, /*mode=*/0,
+                  scratch);
+    conv1d(scratch, Wt, bias, N, C_in, L + pad_left, C_out, kL, stride,
+           /*padding=*/0, dilation, groups, Y);
+}
+inline void causal_conv1d(const Tensor& X, const Tensor& Wt, const Tensor* bias,
+                          int N, int C_in, int L, int C_out, int kL,
+                          int stride, int dilation, Tensor& scratch, Tensor& Y) {
+    causal_conv1d(X, Wt, bias, N, C_in, L, C_out, kL, stride, dilation,
+                  /*groups=*/1, scratch, Y);
+}
+
+// ── conv_transpose1d — genuinely new op (transposed / "deconv" 1D) ──────────
+//
+// 1D transposed convolution, NCL — the gradient-of-conv map run as a forward
+// op. This is the upsampling primitive of every neural vocoder (HiFi-GAN,
+// EnCodec / DAC decoders): a transposed conv with stride s expands the time
+// axis by ~s. brotensor has no transposed convolution of any kind, so this is
+// a fresh kernel + vtable rows, CPU FP32-only.
+//
+// Output length:
+//   L_out = (L - 1) * stride - 2*padding + dilation*(kL - 1) + output_padding + 1
+// `output_padding` (< stride) disambiguates the L_out values that map to the
+// same L under a strided forward conv — exactly torch's ConvTranspose1d arg.
+//
+// Weight layout is the transposed-conv convention (input-channel major):
+//   Wt: (C_in, (C_out/groups) * kL)
+//       Wt[(c_in * (C_out/groups) + c_out_local) * kL + kl]
+// groups >= 1 must divide both C_in and C_out; input channel c_in belongs to
+// group g = c_in / (C_in/groups) and contributes only to that group's output
+// channels. groups == C_in == C_out is the depthwise transposed conv.
+//
+// Forward (scatter form): each input sample X[n, c_in, l] is scattered, for
+// every kernel tap kl, into output position
+//   l_out = l*stride - padding + kl*dilation
+// (skipped when out of [0, L_out)), accumulating Wt * X plus the per-output-
+// channel bias.
+//
+//   X:    (N, C_in  * L)                input
+//   Wt:   (C_in, (C_out/groups) * kL)   weights (input-channel-major)
+//   bias: (C_out, 1)                    optional, may be null
+//   Y:    (N, C_out * L_out)            output, resized + dtype-set to match X.
+void conv_transpose1d_forward(const Tensor& X, const Tensor& Wt,
+                              const Tensor* bias,
+                              int N, int C_in, int L, int C_out, int kL,
+                              int stride, int padding, int output_padding,
+                              int dilation, int groups, Tensor& Y);
+// Convenience overload: groups defaults to 1.
+inline void conv_transpose1d_forward(const Tensor& X, const Tensor& Wt,
+                                     const Tensor* bias,
+                                     int N, int C_in, int L, int C_out, int kL,
+                                     int stride, int padding,
+                                     int output_padding, int dilation,
+                                     Tensor& Y) {
+    conv_transpose1d_forward(X, Wt, bias, N, C_in, L, C_out, kL, stride,
+                             padding, output_padding, dilation, /*groups=*/1, Y);
+}
+
+// conv_transpose1d backward w.r.t. input. The adjoint of the transposed-conv
+// forward is a plain (gather) conv: dX[n, c_in, l] gathers, over every kernel
+// tap and the group's output channels, dY at l_out = l*stride - padding +
+// kl*dilation. dX is *overwritten*. Resized + dtype-set to match dY.
+// All hyperparameters match the forward call.
+void conv_transpose1d_backward_input(const Tensor& Wt, const Tensor& dY,
+                                     int N, int C_in, int L, int C_out, int kL,
+                                     int stride, int padding,
+                                     int output_padding, int dilation,
+                                     int groups, Tensor& dX);
+inline void conv_transpose1d_backward_input(const Tensor& Wt, const Tensor& dY,
+                                            int N, int C_in, int L, int C_out,
+                                            int kL, int stride, int padding,
+                                            int output_padding, int dilation,
+                                            Tensor& dX) {
+    conv_transpose1d_backward_input(Wt, dY, N, C_in, L, C_out, kL, stride,
+                                    padding, output_padding, dilation,
+                                    /*groups=*/1, dX);
+}
+
+// conv_transpose1d backward w.r.t. weight. One accumulation per weight element
+//   dWt[c_in, c_out_local, kl] += sum_{n,l} X[n,c_in,l] * dY[n,c_out,l_out]
+// with l_out = l*stride - padding + kl*dilation (skipped when OOB). dWt is
+// *accumulated into* — caller zeros it first (matches the conv2d contract).
+// All hyperparameters match the forward call.
+void conv_transpose1d_backward_weight(const Tensor& X, const Tensor& dY,
+                                      int N, int C_in, int L, int C_out, int kL,
+                                      int stride, int padding,
+                                      int output_padding, int dilation,
+                                      int groups, Tensor& dWt);
+inline void conv_transpose1d_backward_weight(const Tensor& X, const Tensor& dY,
+                                             int N, int C_in, int L, int C_out,
+                                             int kL, int stride, int padding,
+                                             int output_padding, int dilation,
+                                             Tensor& dWt) {
+    conv_transpose1d_backward_weight(X, dY, N, C_in, L, C_out, kL, stride,
+                                     padding, output_padding, dilation,
+                                     /*groups=*/1, dWt);
+}
+
+// conv_transpose1d backward w.r.t. bias. The bias is per-output-channel, so
+//   dB[c_out] += sum_{n,l_out} dY[n, c_out, l_out].
+// Identical to the conv1d bias backward — kept as its own op for symmetry.
+// dB is *accumulated into* — caller zeros it first.
+void conv_transpose1d_backward_bias(const Tensor& dY, int N, int C_out,
+                                    int L_out, Tensor& dB);
+
+// ── causal_conv1d_update — genuinely new streaming forward-only op ──────────
+//
+// One streaming step of a causal depthwise-style 1D conv against a rolling
+// state cache, in the spirit of `kv_cache_append`. An autoregressive decoder
+// (streaming Whisper, a real-time vocoder, Mamba's short conv) keeps a
+// (kL-1)-sample history per channel; each step feeds L_step new samples,
+// convolves the [state ++ new] window, and rolls the state forward so the
+// next step continues seamlessly. Forward only — streaming inference has no
+// backward. New vtable row, CPU FP32-only.
+//
+// The conv is per-channel (depthwise): C input channels, C output channels,
+// one length-kL filter per channel — the standard streaming-conv shape. With
+// L_step new samples the op produces L_step outputs:
+//   Y[n, c, t] = bias[c] + sum_{kl=0..kL-1}
+//                 W[c, kl] * buf[n, c, t + kl*dilation]
+// where buf = state[n, c, :] ++ X[n, c, :] is the (kL-1)*dilation + L_step
+// sample window. Output sample t is causal — it sees `state` history plus new
+// samples up to position t only.
+//
+// The state cache is updated IN PLACE to the last (kL-1)*dilation samples of
+// buf, so a sequence of single-/multi-step calls reproduces one full
+// causal_conv1d over the concatenated input (with a zero-initialised state).
+//
+//   X:     (N, C * L_step)              new input samples this step
+//   Wt:    (C, kL)                      depthwise filter, one row per channel
+//   bias:  (C, 1)                       optional, may be null
+//   state: (N, C * (kL-1)*dilation)     rolling history — read AND overwritten.
+//          Caller zero-initialises it before the first step.
+//   Y:     (N, C * L_step)              output, resized + dtype-set to match X.
+void causal_conv1d_update(const Tensor& X, const Tensor& Wt, const Tensor* bias,
+                          int N, int C, int L_step, int kL, int dilation,
+                          Tensor& state, Tensor& Y);
+
 } // namespace brotensor

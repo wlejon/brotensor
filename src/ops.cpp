@@ -1604,4 +1604,89 @@ void istft_backward(const Tensor& dSignal, const Tensor& window,
                      win_length, center, normalized, dSpec);
 }
 
+// ─── 1D convolution family (brosoundml) ────────────────────────────────────
+//
+// conv1d / conv1d backward / conv1d_int8w_fp16 / causal_conv1d are header-only
+// inline wrappers in ops.h (they forward to the conv2d ops); only the three
+// genuinely new ops below have dispatcher wrappers.
+
+void conv_transpose1d_forward(const Tensor& X, const Tensor& Wt,
+                              const Tensor* bias,
+                              int N, int C_in, int L, int C_out, int kL,
+                              int stride, int padding, int output_padding,
+                              int dilation, int groups, Tensor& Y) {
+    const auto& v = detail::dispatch_with_opts(X, Wt, {bias, &Y});
+    if (!v.conv_transpose1d_forward)
+        detail::throw_not_implemented("conv_transpose1d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.conv_transpose1d_forward(X, Wt, bias, N, C_in, L, C_out, kL, stride,
+                               padding, output_padding, dilation, groups, Y);
+}
+
+void conv_transpose1d_backward_input(const Tensor& Wt, const Tensor& dY,
+                                     int N, int C_in, int L, int C_out, int kL,
+                                     int stride, int padding,
+                                     int output_padding, int dilation,
+                                     int groups, Tensor& dX) {
+    const auto& v = detail::dispatch(Wt, dY, dX);
+    if (!v.conv_transpose1d_backward_input)
+        detail::throw_not_implemented("conv_transpose1d_backward_input", Wt.device);
+    detail::adopt_output(dX, Wt.device);
+    v.conv_transpose1d_backward_input(Wt, dY, N, C_in, L, C_out, kL, stride,
+                                      padding, output_padding, dilation,
+                                      groups, dX);
+}
+
+void conv_transpose1d_backward_weight(const Tensor& X, const Tensor& dY,
+                                      int N, int C_in, int L, int C_out, int kL,
+                                      int stride, int padding,
+                                      int output_padding, int dilation,
+                                      int groups, Tensor& dWt) {
+    const auto& v = detail::dispatch(X, dY, dWt);
+    if (!v.conv_transpose1d_backward_weight)
+        detail::throw_not_implemented("conv_transpose1d_backward_weight", X.device);
+    detail::adopt_output(dWt, X.device);
+    v.conv_transpose1d_backward_weight(X, dY, N, C_in, L, C_out, kL, stride,
+                                       padding, output_padding, dilation,
+                                       groups, dWt);
+}
+
+void conv_transpose1d_backward_bias(const Tensor& dY, int N, int C_out,
+                                    int L_out, Tensor& dB) {
+    const auto& v = detail::dispatch(dY, dB);
+    if (!v.conv_transpose1d_backward_bias)
+        detail::throw_not_implemented("conv_transpose1d_backward_bias", dY.device);
+    detail::adopt_output(dB, dY.device);
+    v.conv_transpose1d_backward_bias(dY, N, C_out, L_out, dB);
+}
+
+void causal_conv1d_update(const Tensor& X, const Tensor& Wt, const Tensor* bias,
+                          int N, int C, int L_step, int kL, int dilation,
+                          Tensor& state, Tensor& Y) {
+    const auto& v = detail::dispatch_with_opts(X, Wt, {bias, &state, &Y});
+    if (!v.causal_conv1d_update)
+        detail::throw_not_implemented("causal_conv1d_update", X.device);
+    detail::adopt_output(state, X.device);
+    detail::adopt_output(Y, X.device);
+    v.causal_conv1d_update(X, Wt, bias, N, C, L_step, kL, dilation, state, Y);
+}
+
+void pad1d_forward(const Tensor& X, int N, int C, int L,
+                   int pad_left, int pad_right, int mode, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.pad1d_forward)
+        detail::throw_not_implemented("pad1d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.pad1d_forward(X, N, C, L, pad_left, pad_right, mode, Y);
+}
+
+void pad1d_backward(const Tensor& dY, int N, int C, int L,
+                    int pad_left, int pad_right, int mode, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, dX);
+    if (!v.pad1d_backward)
+        detail::throw_not_implemented("pad1d_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.pad1d_backward(dY, N, C, L, pad_left, pad_right, mode, dX);
+}
+
 } // namespace brotensor

@@ -586,6 +586,40 @@ void istft_backward(const ::brotensor::Tensor& dSignal,
                     int win_length, bool center, bool normalized,
                     ::brotensor::Tensor& dSpec);
 
+// ── 1D convolution family (brosoundml) — conv1d.cpp ──
+void conv_transpose1d_forward(const ::brotensor::Tensor& X,
+                              const ::brotensor::Tensor& Wt,
+                              const ::brotensor::Tensor* bias,
+                              int N, int C_in, int L, int C_out, int kL,
+                              int stride, int padding, int output_padding,
+                              int dilation, int groups, ::brotensor::Tensor& Y);
+void conv_transpose1d_backward_input(const ::brotensor::Tensor& Wt,
+                                     const ::brotensor::Tensor& dY,
+                                     int N, int C_in, int L, int C_out, int kL,
+                                     int stride, int padding,
+                                     int output_padding, int dilation,
+                                     int groups, ::brotensor::Tensor& dX);
+void conv_transpose1d_backward_weight(const ::brotensor::Tensor& X,
+                                      const ::brotensor::Tensor& dY,
+                                      int N, int C_in, int L, int C_out, int kL,
+                                      int stride, int padding,
+                                      int output_padding, int dilation,
+                                      int groups, ::brotensor::Tensor& dWt);
+void conv_transpose1d_backward_bias(const ::brotensor::Tensor& dY,
+                                    int N, int C_out, int L_out,
+                                    ::brotensor::Tensor& dB);
+void causal_conv1d_update(const ::brotensor::Tensor& X,
+                          const ::brotensor::Tensor& Wt,
+                          const ::brotensor::Tensor* bias,
+                          int N, int C, int L_step, int kL, int dilation,
+                          ::brotensor::Tensor& state, ::brotensor::Tensor& Y);
+void pad1d_forward(const ::brotensor::Tensor& X, int N, int C, int L,
+                   int pad_left, int pad_right, int mode,
+                   ::brotensor::Tensor& Y);
+void pad1d_backward(const ::brotensor::Tensor& dY, int N, int C, int L,
+                    int pad_left, int pad_right, int mode,
+                    ::brotensor::Tensor& dX);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -756,6 +790,18 @@ struct CpuStaticRegistrar {
         ops.stft_backward                = &detail::cpu::stft_backward;
         ops.istft                        = &detail::cpu::istft;
         ops.istft_backward               = &detail::cpu::istft_backward;
+
+        // ── 1D convolution family (brosoundml) ──
+        ops.conv_transpose1d_forward     = &detail::cpu::conv_transpose1d_forward;
+        ops.conv_transpose1d_backward_input
+                                         = &detail::cpu::conv_transpose1d_backward_input;
+        ops.conv_transpose1d_backward_weight
+                                         = &detail::cpu::conv_transpose1d_backward_weight;
+        ops.conv_transpose1d_backward_bias
+                                         = &detail::cpu::conv_transpose1d_backward_bias;
+        ops.causal_conv1d_update         = &detail::cpu::causal_conv1d_update;
+        ops.pad1d_forward                = &detail::cpu::pad1d_forward;
+        ops.pad1d_backward               = &detail::cpu::pad1d_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());
