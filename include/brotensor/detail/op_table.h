@@ -413,4 +413,16 @@
     X(vq_encode_backward,                      void,  (const ::brotensor::Tensor& dQuantized, ::brotensor::Tensor& dX))                                                     \
     X(fsq_quantize_forward,                    void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& levels,                                                     \
                                                        ::brotensor::Tensor& quantized, ::brotensor::Tensor& packed_indices))                                               \
-    X(fsq_quantize_backward,                   void,  (const ::brotensor::Tensor& dQuantized, ::brotensor::Tensor& dX))
+    X(fsq_quantize_backward,                   void,  (const ::brotensor::Tensor& dQuantized, ::brotensor::Tensor& dX))                        \
+    /* ─── 1D resampling (brosoundml CHUNK 6, family E) ─── */                                                                                 \
+    X(resample1d_forward,                      void,  (const ::brotensor::Tensor& X, int N, int C, int L_in, int L_out, int mode,              \
+                                                       ::brotensor::Tensor& Y))                                                                \
+    X(resample1d_backward,                     void,  (const ::brotensor::Tensor& dY, int N, int C, int L_in, int L_out, int mode,             \
+                                                       ::brotensor::Tensor& dX))                                                               \
+    /* ─── log / exp / round elementwise (brosoundml CHUNK 6, family G) ─── */                                                                 \
+    X(log_forward,                             void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                  \
+    X(log_backward,                            void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))  \
+    X(exp_forward,                             void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                  \
+    X(exp_backward,                            void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))  \
+    X(round_forward,                           void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                  \
+    X(round_backward,                          void,  (const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))

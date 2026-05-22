@@ -656,6 +656,25 @@ void fsq_quantize_forward(const ::brotensor::Tensor& x,
 void fsq_quantize_backward(const ::brotensor::Tensor& dQuantized,
                            ::brotensor::Tensor& dX);
 
+// ── 1D resampling (brosoundml CHUNK 6, family E) — resample1d.cpp ──
+void resample1d_forward(const ::brotensor::Tensor& X,
+                        int N, int C, int L_in, int L_out, int mode,
+                        ::brotensor::Tensor& Y);
+void resample1d_backward(const ::brotensor::Tensor& dY,
+                         int N, int C, int L_in, int L_out, int mode,
+                         ::brotensor::Tensor& dX);
+
+// ── log / exp / round elementwise (brosoundml CHUNK 6, family G)
+//    — log_exp_round.cpp ──
+void log_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void log_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
+                  ::brotensor::Tensor& dX);
+void exp_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void exp_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
+                  ::brotensor::Tensor& dX);
+void round_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void round_backward(const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -852,6 +871,18 @@ struct CpuStaticRegistrar {
         ops.vq_encode_backward           = &detail::cpu::vq_encode_backward;
         ops.fsq_quantize_forward         = &detail::cpu::fsq_quantize_forward;
         ops.fsq_quantize_backward        = &detail::cpu::fsq_quantize_backward;
+
+        // ── 1D resampling (brosoundml CHUNK 6, family E) ──
+        ops.resample1d_forward           = &detail::cpu::resample1d_forward;
+        ops.resample1d_backward          = &detail::cpu::resample1d_backward;
+
+        // ── log / exp / round elementwise (brosoundml CHUNK 6, family G) ──
+        ops.log_forward                  = &detail::cpu::log_forward;
+        ops.log_backward                 = &detail::cpu::log_backward;
+        ops.exp_forward                  = &detail::cpu::exp_forward;
+        ops.exp_backward                 = &detail::cpu::exp_backward;
+        ops.round_forward                = &detail::cpu::round_forward;
+        ops.round_backward               = &detail::cpu::round_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

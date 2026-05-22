@@ -2698,4 +2698,114 @@ void fsq_quantize_forward(const Tensor& x, const Tensor& levels,
 //                             match dQuantized. dX may alias dQuantized.
 void fsq_quantize_backward(const Tensor& dQuantized, Tensor& dX);
 
+// ─── 1D resampling (brosoundml CHUNK 6, family E) ──────────────────────────
+//
+// CPU FP32-only. The GPU vtable slots stay null for these ops. Arbitrary-scale
+// resampling along the length axis of an NCL audio tensor — the 1D analogue of
+// the fixed-2x NCHW resample ops above. Used for sample-rate conversion in
+// STT / TTS / codec front-ends (e.g. 24 kHz <-> 16 kHz).
+
+// 1D resample along the length axis. N and C are carried through unchanged;
+// only the length axis is rescaled from L_in to the caller-supplied L_out
+// (any positive target length — not restricted to an integer ratio).
+//
+// Sampling uses the PyTorch align_corners=False convention: for an output
+// position `dst` the source coordinate is
+//   src = (dst + 0.5) * (L_in / L_out) - 0.5
+//
+//   mode == 0  nearest — Y[dst] = X[ clamp(round_half_to_even(src), 0, L_in-1) ].
+//   mode == 1  linear  — let s = clamp(src, 0, L_in-1),
+//                        x0 = floor(s), x1 = min(x0+1, L_in-1), f = s - x0;
+//                        Y[dst] = (1-f) * X[x0] + f * X[x1].
+// Clamping `src` into [0, L_in-1] BEFORE splitting into taps reproduces the
+// edge-clamped border behaviour PyTorch uses for out-of-range coordinates.
+//
+//   X:    (N, C * L_in)   input
+//   Y:    (N, C * L_out)  output, resized AND dtype-set to FP32 if mis-shaped.
+// If L_out == L_in the op is the identity (both modes return X exactly).
+// `mode` is passed as an int so the vtable signature stays trivially portable
+// (0 = nearest, 1 = linear); any other value throws.
+void resample1d_forward(const Tensor& X, int N, int C, int L_in, int L_out,
+                        int mode, Tensor& Y);
+
+// Backward of resample1d_forward — its exact adjoint. Each output position's
+// gradient is scattered back onto the input position(s) it sampled, weighted
+// by the same interpolation weights as the forward pass:
+//   nearest: dX[ round(src) ] += dY[dst]
+//   linear:  dX[x0] += (1-f) * dY[dst];  dX[x1] += f * dY[dst]
+// (with the same clamping as the forward).
+//
+//   dY:   (N, C * L_out)  upstream gradient
+//   N, C, L_in, L_out, mode: same args as the forward call being adjointed.
+//   dX:   (N, C * L_in)   *output*, overwritten (NOT accumulated; resampling
+//                         has no learnable parameters). Resized + dtype-set
+//                         to FP32 if mis-shaped.
+void resample1d_backward(const Tensor& dY, int N, int C, int L_in, int L_out,
+                         int mode, Tensor& dX);
+
+// ─── log / exp / round elementwise (brosoundml CHUNK 6, family G) ──────────
+//
+// CPU FP32-only. The GPU vtable slots stay null for these ops. Elementwise
+// scalar maps; output resized + dtype-set to match x. x/y and dX/dY may alias.
+// None has learnable parameters, so every backward *overwrites* dX.
+
+// Natural logarithm: y = log(x), elementwise. Used for log-mel spectrograms
+// and log-domain loss terms.
+//
+// The caller is responsible for ensuring x > 0 (the standard pattern is a
+// caller-side clamp / small floor before calling, e.g. log(clamp(mel, 1e-5))).
+// This op does NOT silently guard the input: for x <= 0 it returns the IEEE
+// result (log(0) = -inf, log(negative) = NaN) so a mis-clamped pipeline fails
+// loudly rather than masking a bug.
+//
+//   x: (R, C) FP32   input, expected positive.
+//   y: (R, C) FP32   *output* = log(x). Resized + dtype-set to match x.
+void log_forward(const Tensor& x, Tensor& y);
+
+// Natural-log backward. Reads the raw forward input x.
+//   dy/dx = 1 / x
+//   dX[i] = dY[i] / x[i]
+// As in the forward, the caller owns the x > 0 precondition; no guard here.
+// dX resized + dtype-set to match x; *overwritten* (not accumulated). dX may
+// alias dY.
+void log_backward(const Tensor& x, const Tensor& dY, Tensor& dX);
+
+// Natural exponential: y = exp(x), elementwise. The inverse of log_forward
+// (used to leave the log-domain).
+//
+//   x: (R, C) FP32   input.
+//   y: (R, C) FP32   *output* = exp(x). Resized + dtype-set to match x.
+void exp_forward(const Tensor& x, Tensor& y);
+
+// Exponential backward. Reads the raw forward input x.
+//   dy/dx = exp(x)
+//   dX[i] = dY[i] * exp(x[i])
+// dX resized + dtype-set to match x; *overwritten* (not accumulated). dX may
+// alias dY.
+void exp_backward(const Tensor& x, const Tensor& dY, Tensor& dX);
+
+// Round-half-to-even: y = nearest integer to x, ties rounded to the even
+// integer (banker's rounding). Matches torch.round / numpy.round / IEEE-754
+// roundTiesToEven, and std::nearbyint under the default FE_TONEAREST mode
+// (so 0.5 -> 0, 1.5 -> 2, 2.5 -> 2, -2.5 -> -2).
+//
+//   x: (R, C) FP32   input.
+//   y: (R, C) FP32   *output* = round(x). Resized + dtype-set to match x.
+void round_forward(const Tensor& x, Tensor& y);
+
+// Round backward — the straight-through estimator (STE). round() has a zero
+// derivative almost everywhere and is non-differentiable at the half-integers,
+// so backward passes the upstream gradient straight through as the identity:
+//
+//   dX = dY      (identity passthrough, *overwritten* — NOT accumulated)
+//
+// This is the standard STE used so that a round() in a quantization path does
+// not block gradient flow. Because the map is the identity, round_backward
+// needs only dY (the raw forward input x is irrelevant).
+//
+//   dY: (R, C) FP32   upstream gradient w.r.t. the rounded output.
+//   dX: (R, C) FP32   *output*, overwritten. Resized + dtype-set to match dY.
+//                     dX may alias dY.
+void round_backward(const Tensor& dY, Tensor& dX);
+
 } // namespace brotensor

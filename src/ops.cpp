@@ -1782,4 +1782,68 @@ void fsq_quantize_backward(const Tensor& dQuantized, Tensor& dX) {
     v.fsq_quantize_backward(dQuantized, dX);
 }
 
+// ─── 1D resampling (brosoundml) ────────────────────────────────────────────
+
+void resample1d_forward(const Tensor& X, int N, int C, int L_in, int L_out,
+                        int mode, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.resample1d_forward)
+        detail::throw_not_implemented("resample1d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.resample1d_forward(X, N, C, L_in, L_out, mode, Y);
+}
+
+void resample1d_backward(const Tensor& dY, int N, int C, int L_in, int L_out,
+                         int mode, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, dX);
+    if (!v.resample1d_backward)
+        detail::throw_not_implemented("resample1d_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.resample1d_backward(dY, N, C, L_in, L_out, mode, dX);
+}
+
+// ─── log / exp / round elementwise (brosoundml) ────────────────────────────
+
+void log_forward(const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.log_forward) detail::throw_not_implemented("log_forward", x.device);
+    detail::adopt_output(y, x.device);
+    v.log_forward(x, y);
+}
+
+void log_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
+    const auto& v = detail::dispatch(x, dY, dX);
+    if (!v.log_backward) detail::throw_not_implemented("log_backward", x.device);
+    detail::adopt_output(dX, x.device);
+    v.log_backward(x, dY, dX);
+}
+
+void exp_forward(const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.exp_forward) detail::throw_not_implemented("exp_forward", x.device);
+    detail::adopt_output(y, x.device);
+    v.exp_forward(x, y);
+}
+
+void exp_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
+    const auto& v = detail::dispatch(x, dY, dX);
+    if (!v.exp_backward) detail::throw_not_implemented("exp_backward", x.device);
+    detail::adopt_output(dX, x.device);
+    v.exp_backward(x, dY, dX);
+}
+
+void round_forward(const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.round_forward) detail::throw_not_implemented("round_forward", x.device);
+    detail::adopt_output(y, x.device);
+    v.round_forward(x, y);
+}
+
+void round_backward(const Tensor& dY, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, dX);
+    if (!v.round_backward) detail::throw_not_implemented("round_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.round_backward(dY, dX);
+}
+
 } // namespace brotensor
