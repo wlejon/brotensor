@@ -2005,8 +2005,222 @@ void flash_attention_backward(const ::brotensor::Tensor& Q,
                               ::brotensor::Tensor& dK,
                               ::brotensor::Tensor& dV);
 
+// ─── flash_attention_varlen_forward ────────────────────────────────────────
+//
+// Packed variable-length flash attention (Qwen3-VL window attention). Q/K/V
+// are one big (total_tokens, num_heads*head_dim) tensor each. cu_seqlens_q/k
+// are length B+1 INT32 prefix sums on the same device as Q/K/V (no host
+// pointer; same convention as `const float* d_mask`).
+//
+// One CUDA block per (q_global, head). Each block locates its sequence with
+// a linear scan over cu_seqlens (B is small for visual workloads — a few
+// dozen at most) and bounds its K-tile loop to the sequence's K range. The
+// online-softmax math is byte-identical to flash_attention_kernel; only the
+// K-row bounds and the causal diagonal (relative to the per-sequence Q
+// origin) change.
+
+template <typename T>
+__global__ void flash_attention_varlen_kernel(
+        const T* __restrict__ Q,             // (total_q, D)
+        const T* __restrict__ K,             // (total_k, D)
+        const T* __restrict__ V,             // (total_k, D)
+        const int* __restrict__ cu_q,        // (B+1)
+        const int* __restrict__ cu_k,        // (B+1)
+        T* __restrict__ Out,                 // (total_q, D)
+        int B, int D, int head_dim,
+        int causal) {
+    extern __shared__ float s_smem[];
+    float* scores = s_smem;
+    float* red    = s_smem + FA_KTILE;
+
+    const int q_global = blockIdx.x;
+    const int h        = blockIdx.y;
+    const int tid      = threadIdx.x;
+    const int head_off = h * head_dim;
+    const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
+
+    // Locate sequence b such that cu_q[b] <= q_global < cu_q[b+1].
+    int b = 0;
+    while (b < B && cu_q[b + 1] <= q_global) ++b;
+    if (b >= B) return;
+    const int q_beg = cu_q[b];
+    const int k_beg = cu_k[b];
+    const int k_end = cu_k[b + 1];
+    const int Lk    = k_end - k_beg;
+    if (Lk <= 0) {
+        // No keys — write zeros for this query row.
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            Out[q_global * D + head_off + d] = T(0.0f);
+        }
+        return;
+    }
+    const int q_local = q_global - q_beg;
+
+    float run_max = -1e30f;
+    float run_sum = 0.0f;
+    constexpr int MAX_HD_PER_THREAD = 8;
+    float partial[MAX_HD_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
+
+    for (int k0 = 0; k0 < Lk; k0 += FA_KTILE) {
+        if (causal && k0 > q_local) break;
+        int klen = (Lk - k0) < FA_KTILE ? (Lk - k0) : FA_KTILE;
+        if (causal && k0 + klen - 1 > q_local) klen = q_local - k0 + 1;
+
+        // 1. Scores.
+        for (int t = tid; t < klen; t += blockDim.x) {
+            const int kg = k_beg + k0 + t;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += static_cast<float>(Q[q_global * D + head_off + d]) *
+                       static_cast<float>(K[kg * D + head_off + d]);
+            }
+            scores[t] = dot * inv_sqrt;
+        }
+        __syncthreads();
+
+        // 2. Tile max.
+        float local_max = -1e30f;
+        for (int t = tid; t < klen; t += blockDim.x) {
+            if (scores[t] > local_max) local_max = scores[t];
+        }
+        red[tid] = local_max;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                const float other = red[tid + stride];
+                if (other > red[tid]) red[tid] = other;
+            }
+            __syncthreads();
+        }
+        const float tile_max = red[0];
+        const float m_new = (tile_max > run_max) ? tile_max : run_max;
+
+        // 3. Exponentiate, sum.
+        const bool tile_empty = (m_new <= -1e29f);
+        for (int t = tid; t < klen; t += blockDim.x) {
+            const float e = tile_empty ? 0.0f : __expf(scores[t] - m_new);
+            scores[t] = e;
+        }
+        __syncthreads();
+        float local_sum = 0.0f;
+        for (int t = tid; t < klen; t += blockDim.x) local_sum += scores[t];
+        red[tid] = local_sum;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) red[tid] += red[tid + stride];
+            __syncthreads();
+        }
+        const float tile_sum = red[0];
+
+        // 4. Rescale.
+        float alpha;
+        if (run_max <= -1e29f) {
+            alpha = 0.0f;
+        } else {
+            alpha = __expf(run_max - m_new);
+        }
+
+        // 5. Update partial output.
+        int slot = 0;
+        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+            if (slot >= MAX_HD_PER_THREAD) break;
+            float acc = alpha * partial[slot];
+            for (int t = 0; t < klen; ++t) {
+                acc += scores[t] *
+                       static_cast<float>(V[(k_beg + k0 + t) * D + head_off + d]);
+            }
+            partial[slot] = acc;
+        }
+
+        run_max = m_new;
+        run_sum = alpha * run_sum + tile_sum;
+        __syncthreads();
+    }
+
+    const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
+    int slot = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+        if (slot >= MAX_HD_PER_THREAD) break;
+        Out[q_global * D + head_off + d] = T(partial[slot] * inv);
+    }
+}
+
+void flash_attention_varlen_forward(const Tensor& Q,
+                                    const Tensor& K,
+                                    const Tensor& V,
+                                    const int32_t* cu_seqlens_q,
+                                    const int32_t* cu_seqlens_k,
+                                    int batch_size,
+                                    int max_seqlen_q,
+                                    int max_seqlen_k,
+                                    int num_heads,
+                                    int head_dim,
+                                    bool causal,
+                                    Tensor& O) {
+    const Dtype dt = Q.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("flash_attention_varlen_forward: Q, K, V must be FP16 or BF16");
+    }
+    if (K.dtype != dt || V.dtype != dt) {
+        throw std::runtime_error("flash_attention_varlen_forward: Q, K, V dtype must match");
+    }
+    if (num_heads <= 0 || head_dim <= 0) {
+        throw std::runtime_error("flash_attention_varlen_forward: num_heads/head_dim must be positive");
+    }
+    const int D = num_heads * head_dim;
+    const int total_q = Q.rows;
+    const int total_k = K.rows;
+    if (Q.cols != D || K.cols != D || V.cols != D || V.rows != total_k) {
+        throw std::runtime_error("flash_attention_varlen_forward: shape mismatch");
+    }
+    if (batch_size < 0) {
+        throw std::runtime_error("flash_attention_varlen_forward: batch_size must be non-negative");
+    }
+    if (batch_size > 0 && (!cu_seqlens_q || !cu_seqlens_k)) {
+        throw std::runtime_error("flash_attention_varlen_forward: cu_seqlens_q/k required when batch_size > 0");
+    }
+    if (max_seqlen_q < 0 || max_seqlen_k < 0) {
+        throw std::runtime_error("flash_attention_varlen_forward: max_seqlen_q/k must be non-negative");
+    }
+    if ((head_dim + FA_BLOCK - 1) / FA_BLOCK > 8) {
+        throw std::runtime_error("flash_attention_varlen_forward: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
+    }
+    if (O.rows != total_q || O.cols != D || O.dtype != dt) {
+        O.resize(total_q, D, dt);
+    }
+    if (total_q == 0 || D == 0 || batch_size == 0) return;
+    (void)max_seqlen_q; (void)max_seqlen_k;
+
+    const size_t shmem = (static_cast<size_t>(FA_KTILE) + FA_BLOCK) * sizeof(float);
+    dim3 grid(total_q, num_heads, 1);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    if (dt == Dtype::BF16) {
+        flash_attention_varlen_kernel<__nv_bfloat16><<<grid, FA_BLOCK, shmem, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(Q.data),
+            reinterpret_cast<const __nv_bfloat16*>(K.data),
+            reinterpret_cast<const __nv_bfloat16*>(V.data),
+            reinterpret_cast<const int*>(cu_seqlens_q),
+            reinterpret_cast<const int*>(cu_seqlens_k),
+            reinterpret_cast<__nv_bfloat16*>(O.data),
+            batch_size, D, head_dim, causal ? 1 : 0);
+    } else {
+        flash_attention_varlen_kernel<__half><<<grid, FA_BLOCK, shmem, stream>>>(
+            reinterpret_cast<const __half*>(Q.data),
+            reinterpret_cast<const __half*>(K.data),
+            reinterpret_cast<const __half*>(V.data),
+            reinterpret_cast<const int*>(cu_seqlens_q),
+            reinterpret_cast<const int*>(cu_seqlens_k),
+            reinterpret_cast<__half*>(O.data),
+            batch_size, D, head_dim, causal ? 1 : 0);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 void fill_cuda_vtable_flash_attention(::brotensor::detail::OpsVTable& v) {
     v.flash_attention_forward                       = &flash_attention_forward;
+    v.flash_attention_varlen_forward                = &flash_attention_varlen_forward;
     v.flash_attention_qkvo_forward                  = &flash_attention_qkvo_forward;
     v.flash_attention_qkvo_backward                 = &flash_attention_qkvo_backward;
     v.flash_attention_backward                      = &flash_attention_backward;

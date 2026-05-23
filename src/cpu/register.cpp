@@ -418,6 +418,14 @@ void flash_attention_forward(const ::brotensor::Tensor& Q,
                              const ::brotensor::Tensor& V,
                              const float* d_mask, int num_heads, bool causal,
                              ::brotensor::Tensor& O);
+void flash_attention_varlen_forward(const ::brotensor::Tensor& Q,
+                                    const ::brotensor::Tensor& K,
+                                    const ::brotensor::Tensor& V,
+                                    const int32_t* cu_seqlens_q,
+                                    const int32_t* cu_seqlens_k,
+                                    int batch_size, int max_seqlen_q, int max_seqlen_k,
+                                    int num_heads, int head_dim, bool causal,
+                                    ::brotensor::Tensor& O);
 void flash_attention_qkvo_forward(const ::brotensor::Tensor& X,
                                   const ::brotensor::Tensor* Ctx,
                                   const ::brotensor::Tensor& Wq,
@@ -853,6 +861,8 @@ struct CpuStaticRegistrar {
 
         // ── CHUNK 6 ──
         ops.flash_attention_forward      = &detail::cpu::flash_attention_forward;
+        ops.flash_attention_varlen_forward
+                                         = &detail::cpu::flash_attention_varlen_forward;
         ops.flash_attention_qkvo_forward = &detail::cpu::flash_attention_qkvo_forward;
         ops.flash_attention_qkvo_backward
                                          = &detail::cpu::flash_attention_qkvo_backward;

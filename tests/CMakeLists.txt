@@ -42,6 +42,7 @@ brotensor_add_test(brotensor_test_log_exp_round test_log_exp_round.cpp)
 brotensor_add_test(brotensor_test_sample_logits test_sample_logits.cpp)
 brotensor_add_test(brotensor_test_gated_delta_rule test_gated_delta_rule.cpp)
 brotensor_add_test(brotensor_test_conv3d test_conv3d.cpp)
+brotensor_add_test(brotensor_test_flash_attention_varlen test_flash_attention_varlen.cpp)
 
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)
@@ -98,7 +99,7 @@ if(BROTENSOR_HAS_GPU)
         conv2d conv3d group_norm
         resample transpose diffusion kv_cache
         cross_attention self_attention attention_moments
-        flash_attention resblock
+        flash_attention flash_attention_varlen resblock
         batched_backward tensor_ops
         modulate
         fft stft

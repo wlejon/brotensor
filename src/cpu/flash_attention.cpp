@@ -294,6 +294,86 @@ void flash_attention_forward(const ::brotensor::Tensor& Q,
                    Lq, Lk, D, num_heads, causal, O.host_f32_mut(), nullptr);
 }
 
+// ─── flash_attention_varlen_forward ────────────────────────────────────────
+//
+// Packed variable-length attention (Qwen3-VL window attention). Q/K/V are one
+// big (total_tokens, num_heads*head_dim) tensor each; cu_seqlens_q/k are
+// length B+1 INT32 prefix sums delimiting per-sequence row ranges. Sequence b
+// runs attention_core over its own Q[Lq_b, D] and K/V[Lk_b, D] slice — no
+// cross-sequence attention.
+//
+// On CPU cu_seqlens_q/k are raw host pointers (matches the existing d_mask
+// convention: device pointer on GPU, host pointer on CPU). max_seqlen_q/k are
+// only used by the GPU kernel for block sizing and are ignored here.
+void flash_attention_varlen_forward(const ::brotensor::Tensor& Q,
+                                    const ::brotensor::Tensor& K,
+                                    const ::brotensor::Tensor& V,
+                                    const int32_t* cu_seqlens_q,
+                                    const int32_t* cu_seqlens_k,
+                                    int batch_size,
+                                    int /*max_seqlen_q*/,
+                                    int /*max_seqlen_k*/,
+                                    int num_heads,
+                                    int head_dim,
+                                    bool causal,
+                                    ::brotensor::Tensor& O) {
+    const int total_q = Q.rows;
+    const int total_k = K.rows;
+    const int D = num_heads * head_dim;
+    if (Q.cols != D || K.cols != D || V.cols != D || V.rows != total_k)
+        throw std::runtime_error("flash_attention_varlen_forward: shape mismatch");
+    if (num_heads <= 0 || head_dim <= 0)
+        throw std::runtime_error("flash_attention_varlen_forward: num_heads/head_dim must be positive");
+    if (batch_size < 0)
+        throw std::runtime_error("flash_attention_varlen_forward: batch_size must be non-negative");
+    if (batch_size > 0 && (!cu_seqlens_q || !cu_seqlens_k))
+        throw std::runtime_error("flash_attention_varlen_forward: cu_seqlens_q/k required when batch_size > 0");
+    ensure_f32(O, total_q, D);
+    if (total_q == 0 || D == 0) return;
+    if (cu_seqlens_q && cu_seqlens_q[0] != 0)
+        throw std::runtime_error("flash_attention_varlen_forward: cu_seqlens_q[0] must be 0");
+    if (cu_seqlens_k && cu_seqlens_k[0] != 0)
+        throw std::runtime_error("flash_attention_varlen_forward: cu_seqlens_k[0] must be 0");
+    if (batch_size > 0) {
+        if (cu_seqlens_q[batch_size] != total_q)
+            throw std::runtime_error("flash_attention_varlen_forward: cu_seqlens_q[B] != total_tokens_q");
+        if (cu_seqlens_k[batch_size] != total_k)
+            throw std::runtime_error("flash_attention_varlen_forward: cu_seqlens_k[B] != total_tokens_k");
+    }
+
+    const float* Qp = Q.host_f32();
+    const float* Kp = K.host_f32();
+    const float* Vp = V.host_f32();
+    float* Op = O.host_f32_mut();
+
+    for (int b = 0; b < batch_size; ++b) {
+        const int q_beg = cu_seqlens_q[b];
+        const int q_end = cu_seqlens_q[b + 1];
+        const int k_beg = cu_seqlens_k[b];
+        const int k_end = cu_seqlens_k[b + 1];
+        const int Lq = q_end - q_beg;
+        const int Lk = k_end - k_beg;
+        if (Lq < 0 || Lk < 0)
+            throw std::runtime_error("flash_attention_varlen_forward: cu_seqlens must be non-decreasing");
+        if (causal && Lq != Lk)
+            throw std::runtime_error("flash_attention_varlen_forward: causal requires per-sequence Lq == Lk");
+        if (Lq == 0) continue;
+        if (Lk == 0) {
+            // Fully empty K range — output rows are zero (no keys to attend to).
+            for (std::size_t i = 0; i < static_cast<std::size_t>(Lq) * D; ++i)
+                Op[static_cast<std::size_t>(q_beg) * D + i] = 0.0f;
+            continue;
+        }
+        attention_core(Qp + static_cast<std::size_t>(q_beg) * D,
+                       Kp + static_cast<std::size_t>(k_beg) * D,
+                       Vp + static_cast<std::size_t>(k_beg) * D,
+                       /*mask=*/nullptr,
+                       Lq, Lk, D, num_heads, causal,
+                       Op + static_cast<std::size_t>(q_beg) * D,
+                       /*P=*/nullptr);
+    }
+}
+
 // ─── flash_attention_project_kv ────────────────────────────────────────────
 
 void flash_attention_project_kv(const ::brotensor::Tensor& ctx,

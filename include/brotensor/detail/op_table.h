@@ -221,6 +221,11 @@
     /* ─── Flash attention family ─── */                                                                                                                                \
     X(flash_attention_forward,                 void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
                                                        const float* d_mask, int num_heads, bool causal, ::brotensor::Tensor& O))                                        \
+    X(flash_attention_varlen_forward,          void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
+                                                       const int32_t* cu_seqlens_q, const int32_t* cu_seqlens_k,                                                        \
+                                                       int batch_size, int max_seqlen_q, int max_seqlen_k,                                                              \
+                                                       int num_heads, int head_dim, bool causal,                                                                        \
+                                                       ::brotensor::Tensor& O))                                                                                         \
     X(flash_attention_qkvo_forward,            void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor* Ctx,                                                    \
                                                        const ::brotensor::Tensor& Wq, const ::brotensor::Tensor* bq,                                                    \
                                                        const ::brotensor::Tensor& Wk, const ::brotensor::Tensor* bk,                                                    \

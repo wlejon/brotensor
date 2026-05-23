@@ -983,6 +983,39 @@ void flash_attention_forward(const Tensor& Q,
                              bool causal,
                              Tensor& O);
 
+// Packed variable-length multi-head attention, forward only (Qwen3-VL window
+// attention). All sequences in a batch live contiguously in one packed tensor;
+// per-sequence boundaries come from `cu_seqlens_*` INT32 prefix-sum buffers of
+// length `batch_size + 1`. Sequence b covers Q rows
+// [cu_seqlens_q[b], cu_seqlens_q[b+1]) and attends to K/V rows
+// [cu_seqlens_k[b], cu_seqlens_k[b+1]); no cross-sequence attention. Mirrors
+// flash_attn_varlen_func semantics.
+//   Q: (total_tokens_q, num_heads * head_dim) — FP16 (GPU) / FP32 (CPU).
+//   K, V: (total_tokens_k, num_heads * head_dim) — same packing, num_heads
+//         matches Q (no GQA — that's a future cleanup).
+//   cu_seqlens_q, cu_seqlens_k: DEVICE pointers (CUDA/Metal device, raw host
+//         pointers on CPU), length batch_size + 1, INT32 prefix sums. Same
+//         convention as `const float* d_mask` elsewhere — caller owns the
+//         buffer; the op does not allocate or copy.
+//   max_seqlen_q, max_seqlen_k: bound the longest sequence's length — used by
+//         the GPU kernel for block sizing; the CPU impl ignores them.
+//   causal: if true, key k in sequence b attends to query q only when
+//         (k - cu_seqlens_k[b]) <= (q - cu_seqlens_q[b]); only meaningful when
+//         the per-sequence Q and K lengths match.
+//   O: (total_tokens_q, num_heads * head_dim) — overwritten, resized + dtype-set.
+void flash_attention_varlen_forward(const Tensor& Q,
+                                    const Tensor& K,
+                                    const Tensor& V,
+                                    const int32_t* cu_seqlens_q,
+                                    const int32_t* cu_seqlens_k,
+                                    int batch_size,
+                                    int max_seqlen_q,
+                                    int max_seqlen_k,
+                                    int num_heads,
+                                    int head_dim,
+                                    bool causal,
+                                    Tensor& O);
+
 // Flash-attention with QKV and output projections fused at the boundary.
 // Projects X->Q, Ctx->K,V (or X->Q,K,V when Ctx is null), runs the tiled core,
 // then projects with Wo. FP16 throughout.

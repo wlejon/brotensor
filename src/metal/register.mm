@@ -112,6 +112,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.flash_attention_qkvo_backward               = &dm::flash_attention_qkvo_backward;
     ops.flash_attention_qkvo_forward                = &dm::flash_attention_qkvo_forward;
     ops.flash_attention_qkvo_int8w_fp16             = &dm::flash_attention_qkvo_int8w_fp16;
+    ops.flash_attention_varlen_forward              = &dm::flash_attention_varlen_forward;
     ops.fsq_quantize_backward                       = &dm::fsq_quantize_backward;
     ops.fsq_quantize_forward                        = &dm::fsq_quantize_forward;
     ops.gated_delta_rule_chunked                    = &dm::gated_delta_rule_chunked;
