@@ -242,7 +242,8 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
                      int cur_len, Tensor& K_cache, Tensor& V_cache);
 void flash_attention_decode(const Tensor& Q,
                             const Tensor& K_cache, const Tensor& V_cache,
-                            int valid_len, int num_heads, Tensor& O);
+                            int valid_len, int num_q_heads, int num_kv_heads,
+                            Tensor& O);
 
 void matmul_int8w_fp16(const Tensor& W_int8, const Tensor& scales,
                        const Tensor& X, Tensor& Y);

@@ -371,7 +371,15 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
 
 void flash_attention_decode(const Tensor& Q,
                             const Tensor& K_cache, const Tensor& V_cache,
-                            int valid_len, int num_heads, Tensor& O) {
+                            int valid_len, int num_q_heads, int num_kv_heads,
+                            Tensor& O) {
+    if (num_kv_heads != num_q_heads) {
+        // Qwen3-Next GQA decode lives only on the CPU backend for now.
+        throw std::runtime_error("brotensor: flash_attention_decode: GQA "
+                                 "(num_kv_heads != num_q_heads) not yet "
+                                 "implemented on Metal backend");
+    }
+    const int num_heads = num_q_heads;
     const bool is_bf16 = (Q.dtype == Dtype::BF16);
     if ((Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) ||
         K_cache.dtype != Q.dtype || V_cache.dtype != Q.dtype) {

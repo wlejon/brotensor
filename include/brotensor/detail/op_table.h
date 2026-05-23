@@ -291,7 +291,7 @@
     X(kv_cache_append,                         void,  (const ::brotensor::Tensor& K_new, const ::brotensor::Tensor& V_new, int cur_len,                                 \
                                                        ::brotensor::Tensor& K_cache, ::brotensor::Tensor& V_cache))                                                     \
     X(flash_attention_decode,                  void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K_cache, const ::brotensor::Tensor& V_cache,            \
-                                                       int valid_len, int num_heads, ::brotensor::Tensor& O))                                                           \
+                                                       int valid_len, int num_q_heads, int num_kv_heads, ::brotensor::Tensor& O))                                       \
     /* ─── Public reductions ─── */                                                                                                                                     \
     X(sum_rows,                                void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y))                                                           \
     X(sum_cols,                                void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y))                                                           \
@@ -428,4 +428,19 @@
     X(round_backward,                          void,  (const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))                               \
     /* ─── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ─── */                                                                \
     X(sample_logits,                           void,  (const ::brotensor::Tensor& logits, float temperature, int top_k, float top_p,          \
-                                                       uint64_t key, uint64_t counter, ::brotensor::Tensor& indices))
+                                                       uint64_t key, uint64_t counter, ::brotensor::Tensor& indices))                          \
+    /* ─── L2 norm + Gated Delta Rule (brolm Qwen3-Next) ─── */                                                                                \
+    X(l2_norm_forward,                         void,  (const ::brotensor::Tensor& X, int head_dim, int num_heads, float eps,                   \
+                                                       ::brotensor::Tensor& Y))                                                                \
+    X(l2_norm_backward,                        void,  (const ::brotensor::Tensor& X, int head_dim, int num_heads, float eps,                   \
+                                                       const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))                                \
+    X(gated_delta_rule_chunked,                void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,\
+                                                       const ::brotensor::Tensor& a_raw, const ::brotensor::Tensor& beta,                      \
+                                                       const ::brotensor::Tensor& log_A,                                                       \
+                                                       int num_heads, int d_k, int d_v,                                                        \
+                                                       ::brotensor::Tensor& state, ::brotensor::Tensor& O))                                    \
+    X(gated_delta_rule_step,                   void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,\
+                                                       const ::brotensor::Tensor& a_raw, const ::brotensor::Tensor& beta,                      \
+                                                       const ::brotensor::Tensor& log_A,                                                       \
+                                                       int num_heads, int d_k, int d_v,                                                        \
+                                                       ::brotensor::Tensor& state, ::brotensor::Tensor& O))

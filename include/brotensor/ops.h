@@ -1198,12 +1198,30 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
 // Causal flash-attention against a partially-filled KV cache (FP16, fwd-only).
 // Runs the tiled core against rows [0, valid_len) of the caches. Query position
 // p_q = (valid_len - L_q) + i attends to cache positions [0, p_q].
-//   Q: (L_q,D) FP16 — L_q == 1 for token-by-token decode, L_q > 1 supported.
-//   K_cache, V_cache: (L_max,D) FP16 — only rows [0, valid_len) are read.
-//   valid_len >= L_q.  num_heads divides D.  O: (L_q,D) FP16, resized as needed.
+//   Q: (L_q, num_q_heads*head_dim) FP16 — L_q == 1 for token-by-token decode,
+//       L_q > 1 supported.
+//   K_cache, V_cache: (L_max, num_kv_heads*head_dim) FP16 — only rows
+//       [0, valid_len) are read.
+//   valid_len >= L_q.  num_kv_heads must divide num_q_heads (GQA); each KV head
+//       serves num_q_heads/num_kv_heads consecutive query heads. num_kv_heads ==
+//       num_q_heads is plain MHA. head_dim = Q.cols/num_q_heads must equal
+//       K_cache.cols/num_kv_heads.
+//   O: (L_q, num_q_heads*head_dim) FP16, resized as needed.
+// CUDA and Metal currently support num_kv_heads == num_q_heads only and throw
+// "brotensor: flash_attention_decode: GQA not yet implemented on <backend>"
+// otherwise; CPU supports GQA fully.
 void flash_attention_decode(const Tensor& Q,
                            const Tensor& K_cache, const Tensor& V_cache,
-                           int valid_len, int num_heads, Tensor& O);
+                           int valid_len, int num_q_heads, int num_kv_heads,
+                           Tensor& O);
+
+// Back-compat overload: num_kv_heads defaults to num_heads (plain MHA).
+inline void flash_attention_decode(const Tensor& Q,
+                                   const Tensor& K_cache, const Tensor& V_cache,
+                                   int valid_len, int num_heads, Tensor& O) {
+    flash_attention_decode(Q, K_cache, V_cache, valid_len,
+                           num_heads, /*num_kv_heads=*/num_heads, O);
+}
 
 // ─── Public reductions ─────────────────────────────────────────────────────
 
@@ -1958,5 +1976,73 @@ void round_backward(const Tensor& dY, Tensor& dX);
 void sample_logits(const Tensor& logits, float temperature, int top_k,
                    float top_p, uint64_t key, uint64_t counter,
                    Tensor& indices);
+
+// ─── L2 norm + Gated Delta Rule (brolm Qwen3-Next text path) ───────────────
+//
+// Building blocks for the Gated DeltaNet text layers of Qwen3-Next / Qwen3.5.
+// The recurrence acts on (L, num_heads*d) sequence-major tensors using the
+// same head-contiguous layout as rope_forward / rms_norm.
+
+// L2-normalize each head row over its head_dim slice, with epsilon:
+//   y[r, h*head_dim + d] = x[r, h*head_dim + d] /
+//                          sqrt(sum_d x[r, h*head_dim + d]^2 + eps)
+// Distinct from rms_norm — sum (not mean) of squares, no learnable gamma, no
+// sqrt(d) factor; used to normalise q/k per head in Gated DeltaNet.
+//   X, Y: (L, num_heads*head_dim).  head_dim and num_heads partition the cols
+//         exactly as rope_forward; head_dim must be positive.
+//   Y resized + dtype-set to match X.  X and Y may alias.
+// Dispatched on X.dtype (FP32/FP16); FP32 accumulation. CPU is FP32-only.
+void l2_norm_forward(const Tensor& X, int head_dim, int num_heads,
+                     float eps, Tensor& Y);
+
+// L2-norm backward. With s_r = sum_d x_d^2 + eps, n_r = 1/sqrt(s_r):
+//   dX_d = n_r * (dY_d - x_d * n_r^2 * sum_{d'} (x_{d'} * dY_{d'}))
+//   X, dY, dX: (L, num_heads*head_dim), same dtype.
+//   dX overwritten (resized + dtype-set to match X). FP32 accumulation.
+void l2_norm_backward(const Tensor& X, int head_dim, int num_heads,
+                      float eps, const Tensor& dY, Tensor& dX);
+
+// Gated Delta Rule — chunked prefill. Runs the matrix-valued recurrence
+//   alpha_t = exp(-softplus(a_raw_t) * exp(log_A))      (per token, per head)
+//   beta_t  = sigmoid(beta_raw_t)
+//   S_t     = alpha_t * S_{t-1}
+//           + beta_t * (v_t - S_{t-1} k_t) k_t^T
+//   o_t     = S_t q_t                                  (per head)
+// over L tokens, sequentially within each head. The chunked WY/UT-transform
+// is an internal optimisation — the contract is exactly the per-token rule.
+//   Q, K: (L, num_heads*d_k).      V: (L, num_heads*d_v).
+//         Heads contiguous within each row, exactly as rope_forward / rms_norm.
+//   a_raw, beta: (L, num_heads) FP32 — per-token gate / write inputs (raw).
+//                softplus / sigmoid are applied inside the op.
+//   log_A: (num_heads, 1) FP32 — per-head learnable decay scale.
+//   state: (num_heads, d_v*d_k) FP32 — initial S per head (caller zero-fills
+//          for a fresh sequence; row h is S_h[v, k] = state[h, v*d_k + k]).
+//          Read AND updated in place; on return holds S after token L-1.
+//   O: (L, num_heads*d_v) — output, resized + dtype-set to match Q.
+// Q/K/V/O are dispatched on Q.dtype (FP32 on CPU; FP16 or FP32 on GPU). state,
+// a_raw, beta, log_A are FP32 on every backend (accumulator + gate precision).
+// num_heads*d_k must equal Q.cols and K.cols; num_heads*d_v must equal V.cols
+// and O.cols. d_k and d_v may differ. FP32 accumulation. Forward-only.
+void gated_delta_rule_chunked(const Tensor& Q, const Tensor& K, const Tensor& V,
+                              const Tensor& a_raw, const Tensor& beta,
+                              const Tensor& log_A,
+                              int num_heads, int d_k, int d_v,
+                              Tensor& state, Tensor& O);
+
+// Gated Delta Rule — streaming step. Same math as gated_delta_rule_chunked
+// but for L_step new tokens against an existing state. With L_step == 1 this
+// is the per-step recurrence; with L_step > 1 it's a plain non-chunked scan
+// (correct, just without the WY/UT speedup).
+//   Q, K: (L_step, num_heads*d_k).    V: (L_step, num_heads*d_v).
+//   a_raw, beta: (L_step, num_heads) FP32.   log_A: (num_heads, 1) FP32.
+//   state: (num_heads, d_v*d_k) FP32 — read AND overwritten with S after the
+//          last new token, ready for the next call.
+//   O: (L_step, num_heads*d_v), resized + dtype-set to match Q.
+// Dtype rules identical to gated_delta_rule_chunked.
+void gated_delta_rule_step(const Tensor& Q, const Tensor& K, const Tensor& V,
+                           const Tensor& a_raw, const Tensor& beta,
+                           const Tensor& log_A,
+                           int num_heads, int d_k, int d_v,
+                           Tensor& state, Tensor& O);
 
 } // namespace brotensor

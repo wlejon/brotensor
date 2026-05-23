@@ -1287,11 +1287,13 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new, int cur_len,
 
 void flash_attention_decode(const Tensor& Q,
                             const Tensor& K_cache, const Tensor& V_cache,
-                            int valid_len, int num_heads, Tensor& O) {
+                            int valid_len, int num_q_heads, int num_kv_heads,
+                            Tensor& O) {
     const auto& v = detail::dispatch(Q, K_cache, V_cache, O);
     if (!v.flash_attention_decode) detail::throw_not_implemented("flash_attention_decode", Q.device);
     detail::adopt_output(O, Q.device);
-    v.flash_attention_decode(Q, K_cache, V_cache, valid_len, num_heads, O);
+    v.flash_attention_decode(Q, K_cache, V_cache, valid_len,
+                             num_q_heads, num_kv_heads, O);
 }
 
 // ─── Public reductions ─────────────────────────────────────────────────────
@@ -1855,6 +1857,52 @@ void sample_logits(const Tensor& logits, float temperature, int top_k,
     if (!v.sample_logits) detail::throw_not_implemented("sample_logits", logits.device);
     detail::adopt_output(indices, logits.device);
     v.sample_logits(logits, temperature, top_k, top_p, key, counter, indices);
+}
+
+// ─── L2 norm + Gated Delta Rule (brolm Qwen3-Next text path) ───────────────
+
+void l2_norm_forward(const Tensor& X, int head_dim, int num_heads,
+                     float eps, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.l2_norm_forward) detail::throw_not_implemented("l2_norm_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.l2_norm_forward(X, head_dim, num_heads, eps, Y);
+}
+
+void l2_norm_backward(const Tensor& X, int head_dim, int num_heads,
+                      float eps, const Tensor& dY, Tensor& dX) {
+    const auto& v = detail::dispatch(X, dY, dX);
+    if (!v.l2_norm_backward) detail::throw_not_implemented("l2_norm_backward", X.device);
+    detail::adopt_output(dX, X.device);
+    v.l2_norm_backward(X, head_dim, num_heads, eps, dY, dX);
+}
+
+void gated_delta_rule_chunked(const Tensor& Q, const Tensor& K, const Tensor& V,
+                              const Tensor& a_raw, const Tensor& beta,
+                              const Tensor& log_A,
+                              int num_heads, int d_k, int d_v,
+                              Tensor& state, Tensor& O) {
+    const auto& v = detail::dispatch(Q, K, V, a_raw, beta, log_A, state, O);
+    if (!v.gated_delta_rule_chunked)
+        detail::throw_not_implemented("gated_delta_rule_chunked", Q.device);
+    detail::adopt_output(state, Q.device);
+    detail::adopt_output(O, Q.device);
+    v.gated_delta_rule_chunked(Q, K, V, a_raw, beta, log_A,
+                               num_heads, d_k, d_v, state, O);
+}
+
+void gated_delta_rule_step(const Tensor& Q, const Tensor& K, const Tensor& V,
+                           const Tensor& a_raw, const Tensor& beta,
+                           const Tensor& log_A,
+                           int num_heads, int d_k, int d_v,
+                           Tensor& state, Tensor& O) {
+    const auto& v = detail::dispatch(Q, K, V, a_raw, beta, log_A, state, O);
+    if (!v.gated_delta_rule_step)
+        detail::throw_not_implemented("gated_delta_rule_step", Q.device);
+    detail::adopt_output(state, Q.device);
+    detail::adopt_output(O, Q.device);
+    v.gated_delta_rule_step(Q, K, V, a_raw, beta, log_A,
+                            num_heads, d_k, d_v, state, O);
 }
 
 } // namespace brotensor

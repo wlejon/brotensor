@@ -40,6 +40,7 @@ brotensor_add_test(brotensor_test_codec_quant test_codec_quant.cpp)
 brotensor_add_test(brotensor_test_resample1d test_resample1d.cpp)
 brotensor_add_test(brotensor_test_log_exp_round test_log_exp_round.cpp)
 brotensor_add_test(brotensor_test_sample_logits test_sample_logits.cpp)
+brotensor_add_test(brotensor_test_gated_delta_rule test_gated_delta_rule.cpp)
 
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)

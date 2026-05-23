@@ -312,7 +312,8 @@ void kv_cache_append(const ::brotensor::Tensor& K_new,
 void flash_attention_decode(const ::brotensor::Tensor& Q,
                             const ::brotensor::Tensor& K_cache,
                             const ::brotensor::Tensor& V_cache,
-                            int valid_len, int num_heads,
+                            int valid_len,
+                            int num_q_heads, int num_kv_heads,
                             ::brotensor::Tensor& O);
 
 // ── CHUNK 5 — cross_attention.cpp / self_attention.cpp /
@@ -681,6 +682,34 @@ void sample_logits(const ::brotensor::Tensor& logits, float temperature,
                    int top_k, float top_p, uint64_t key, uint64_t counter,
                    ::brotensor::Tensor& indices);
 
+// ── L2 norm + Gated Delta Rule (brolm Qwen3-Next) ──
+//    l2_norm.cpp, gated_delta_rule.cpp
+void l2_norm_forward(const ::brotensor::Tensor& X,
+                     int head_dim, int num_heads, float eps,
+                     ::brotensor::Tensor& Y);
+void l2_norm_backward(const ::brotensor::Tensor& X,
+                      int head_dim, int num_heads, float eps,
+                      const ::brotensor::Tensor& dY,
+                      ::brotensor::Tensor& dX);
+void gated_delta_rule_chunked(const ::brotensor::Tensor& Q,
+                              const ::brotensor::Tensor& K,
+                              const ::brotensor::Tensor& V,
+                              const ::brotensor::Tensor& a_raw,
+                              const ::brotensor::Tensor& beta,
+                              const ::brotensor::Tensor& log_A,
+                              int num_heads, int d_k, int d_v,
+                              ::brotensor::Tensor& state,
+                              ::brotensor::Tensor& O);
+void gated_delta_rule_step(const ::brotensor::Tensor& Q,
+                           const ::brotensor::Tensor& K,
+                           const ::brotensor::Tensor& V,
+                           const ::brotensor::Tensor& a_raw,
+                           const ::brotensor::Tensor& beta,
+                           const ::brotensor::Tensor& log_A,
+                           int num_heads, int d_k, int d_v,
+                           ::brotensor::Tensor& state,
+                           ::brotensor::Tensor& O);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -892,6 +921,12 @@ struct CpuStaticRegistrar {
 
         // ── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ──
         ops.sample_logits                = &detail::cpu::sample_logits;
+
+        // ── L2 norm + Gated Delta Rule (brolm Qwen3-Next) ──
+        ops.l2_norm_forward              = &detail::cpu::l2_norm_forward;
+        ops.l2_norm_backward             = &detail::cpu::l2_norm_backward;
+        ops.gated_delta_rule_chunked     = &detail::cpu::gated_delta_rule_chunked;
+        ops.gated_delta_rule_step        = &detail::cpu::gated_delta_rule_step;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

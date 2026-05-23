@@ -82,15 +82,17 @@ void kv_cache_append(const ::brotensor::Tensor& K_new,
 void flash_attention_decode(const ::brotensor::Tensor& Q,
                             const ::brotensor::Tensor& K_cache,
                             const ::brotensor::Tensor& V_cache,
-                            int valid_len, int num_heads,
+                            int valid_len,
+                            int num_q_heads, int num_kv_heads,
                             ::brotensor::Tensor& O) {
     check_fp32(Q,       "flash_attention_decode", "Q");
     check_fp32(K_cache, "flash_attention_decode", "K_cache");
     check_fp32(V_cache, "flash_attention_decode", "V_cache");
-    const int Lq = Q.rows;
-    const int D  = Q.cols;
-    if (K_cache.cols != D || V_cache.cols != D) {
-        throw std::runtime_error("flash_attention_decode: K/V cache cols must match Q.cols");
+    const int Lq  = Q.rows;
+    const int Dq  = Q.cols;
+    const int Dkv = K_cache.cols;
+    if (V_cache.cols != Dkv) {
+        throw std::runtime_error("flash_attention_decode: K_cache.cols != V_cache.cols");
     }
     if (valid_len < 0 || valid_len > K_cache.rows || valid_len > V_cache.rows) {
         throw std::runtime_error("flash_attention_decode: invalid valid_len");
@@ -98,14 +100,24 @@ void flash_attention_decode(const ::brotensor::Tensor& Q,
     if (valid_len < Lq) {
         throw std::runtime_error("flash_attention_decode: valid_len must be >= Lq");
     }
-    if (num_heads <= 0 || D % num_heads != 0) {
-        throw std::runtime_error("flash_attention_decode: num_heads must divide D");
+    if (num_q_heads <= 0 || num_kv_heads <= 0) {
+        throw std::runtime_error("flash_attention_decode: num_q_heads / num_kv_heads must be positive");
     }
-    const int head_dim = D / num_heads;
-    if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP32) {
-        O.resize(Lq, D, Dtype::FP32);
+    if (num_q_heads % num_kv_heads != 0) {
+        throw std::runtime_error("flash_attention_decode: num_kv_heads must divide num_q_heads");
     }
-    if (Lq == 0 || D == 0 || valid_len == 0) return;
+    if (Dq % num_q_heads != 0 || Dkv % num_kv_heads != 0) {
+        throw std::runtime_error("flash_attention_decode: head_dim does not divide cols cleanly");
+    }
+    const int head_dim = Dq / num_q_heads;
+    if (Dkv / num_kv_heads != head_dim) {
+        throw std::runtime_error("flash_attention_decode: head_dim mismatch between Q and K/V");
+    }
+    const int q_per_kv = num_q_heads / num_kv_heads;
+    if (O.rows != Lq || O.cols != Dq || O.dtype != Dtype::FP32) {
+        O.resize(Lq, Dq, Dtype::FP32);
+    }
+    if (Lq == 0 || Dq == 0 || valid_len == 0) return;
 
     const int seq_offset = valid_len - Lq;
     const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -119,15 +131,17 @@ void flash_attention_decode(const ::brotensor::Tensor& Q,
     for (int q = 0; q < Lq; ++q) {
         const int p_q = seq_offset + q;
         const int klen = p_q + 1;   // causal: keys 0..p_q inclusive
-        for (int h = 0; h < num_heads; ++h) {
-            const int head_off = h * head_dim;
-            const float* qrow = Qp + q * D + head_off;
+        for (int hq = 0; hq < num_q_heads; ++hq) {
+            const int hkv = hq / q_per_kv;
+            const int q_head_off  = hq  * head_dim;
+            const int kv_head_off = hkv * head_dim;
+            const float* qrow = Qp + q * Dq + q_head_off;
 
             // Scores against the valid causal keys.
             scores.assign(klen, 0.0f);
             float run_max = -1e30f;
             for (int kg = 0; kg < klen; ++kg) {
-                const float* krow = Kp + kg * D + head_off;
+                const float* krow = Kp + kg * Dkv + kv_head_off;
                 float dot = 0.0f;
                 for (int d = 0; d < head_dim; ++d) dot += qrow[d] * krow[d];
                 const float s = dot * inv_sqrt;
@@ -142,12 +156,12 @@ void flash_attention_decode(const ::brotensor::Tensor& Q,
                 sum += e;
             }
             const float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
-            // Weighted sum of V.
-            float* orow = Op + q * D + head_off;
+            // Weighted sum of V (KV head's V).
+            float* orow = Op + q * Dq + q_head_off;
             for (int d = 0; d < head_dim; ++d) {
                 float acc = 0.0f;
                 for (int kg = 0; kg < klen; ++kg) {
-                    acc += scores[kg] * Vp[kg * D + head_off + d];
+                    acc += scores[kg] * Vp[kg * Dkv + kv_head_off + d];
                 }
                 orow[d] = acc * inv;
             }

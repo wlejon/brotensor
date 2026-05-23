@@ -111,6 +111,8 @@ add_library(brotensor_cpu STATIC
     src/cpu/resample1d.cpp
     src/cpu/log_exp_round.cpp
     src/cpu/sample_logits.cpp
+    src/cpu/l2_norm.cpp
+    src/cpu/gated_delta_rule.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)
