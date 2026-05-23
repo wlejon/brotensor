@@ -178,6 +178,8 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/codec_quant.cu
         src/cuda/resample1d.cu
         src/cuda/sample_logits.cu
+        src/cuda/l2_norm.cu
+        src/cuda/gated_delta_rule.cu
         src/cuda/register.cu
     )
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)

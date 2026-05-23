@@ -36,6 +36,9 @@ void fill_cuda_vtable_conv1d         (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_codec_quant    (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_resample1d     (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_sample_logits  (::brotensor::detail::OpsVTable&);
+// ── brolm Qwen3-Next text-path clusters ──
+void fill_cuda_vtable_l2_norm        (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_gated_delta_rule(::brotensor::detail::OpsVTable&);
 
 // ── alloc table (defined in tensor.cu) ──
 const ::brotensor::detail::AllocVTable& cuda_alloc_table();
@@ -78,6 +81,8 @@ extern "C" void brotensor_probe_and_register_cuda() {
     dc::fill_cuda_vtable_codec_quant(ops);
     dc::fill_cuda_vtable_resample1d(ops);
     dc::fill_cuda_vtable_sample_logits(ops);
+    dc::fill_cuda_vtable_l2_norm(ops);
+    dc::fill_cuda_vtable_gated_delta_rule(ops);
 
     ::brotensor::detail::register_backend(Device::CUDA, ops, dc::cuda_alloc_table());
 }
