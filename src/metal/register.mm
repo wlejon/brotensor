@@ -112,6 +112,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.flash_attention_qkvo_int8w_fp16             = &dm::flash_attention_qkvo_int8w_fp16;
     ops.fsq_quantize_backward                       = &dm::fsq_quantize_backward;
     ops.fsq_quantize_forward                        = &dm::fsq_quantize_forward;
+    ops.gated_delta_rule_chunked                    = &dm::gated_delta_rule_chunked;
+    ops.gated_delta_rule_step                       = &dm::gated_delta_rule_step;
     ops.geglu_backward                              = &dm::geglu_backward;
     ops.geglu_exact_backward                        = &dm::geglu_exact_backward;
     ops.geglu_exact_forward                         = &dm::geglu_exact_forward;
@@ -128,6 +130,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.istft                                       = &dm::istft;
     ops.istft_backward                              = &dm::istft_backward;
     ops.kv_cache_append                             = &dm::kv_cache_append;
+    ops.l2_norm_backward                            = &dm::l2_norm_backward;
+    ops.l2_norm_forward                             = &dm::l2_norm_forward;
     ops.layernorm_backward                          = &dm::layernorm_backward;
     ops.layernorm_forward                           = &dm::layernorm_forward;
     ops.layernorm_forward_inference_batched         = &dm::layernorm_forward_inference_batched;
