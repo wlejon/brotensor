@@ -520,6 +520,81 @@ void conv2d_backward_bias(const Tensor& dY,
                           int N, int C_out, int H_out, int W_out,
                           Tensor& dB);
 
+// 3D convolution, NCTHW (forward only). Dispatched on X.dtype (FP32/FP16/BF16
+// on GPU; CPU is FP32-only). FP32 accumulation.
+//   X:    (N, C_in*T*H*W).
+//   Wt:   (C_out, (C_in/groups)*kT*kH*kW)  OICTHW filter layout (grouped).
+//   bias: (C_out,1) or null.
+//   Y:    (N, C_out*T_out*H_out*W_out), resized + dtype-set to match X.
+//   Per-axis stride/pad/dilation: (_t, _h, _w). `groups` divides C_in and C_out
+//   exactly as in conv2d (output channel c_out belongs to group
+//   c_out/(C_out/groups); reads input channels of that group only).
+//   T_out = (T + 2*pad_t - dil_t*(kT-1) - 1)/stride_t + 1   (H_out, W_out analogous).
+// Y is OVERWRITTEN (the kernel stores acc directly), matching conv2d_forward.
+void conv3d_forward(const Tensor& X,
+                    const Tensor& Wt,
+                    const Tensor* bias,
+                    int N, int C_in, int T, int H, int W,
+                    int C_out, int kT, int kH, int kW,
+                    int stride_t, int stride_h, int stride_w,
+                    int pad_t, int pad_h, int pad_w,
+                    int dil_t, int dil_h, int dil_w,
+                    int groups,
+                    Tensor& Y);
+// Convenience overload: groups defaults to 1 (full convolution).
+inline void conv3d_forward(const Tensor& X,
+                           const Tensor& Wt,
+                           const Tensor* bias,
+                           int N, int C_in, int T, int H, int W,
+                           int C_out, int kT, int kH, int kW,
+                           int stride_t, int stride_h, int stride_w,
+                           int pad_t, int pad_h, int pad_w,
+                           int dil_t, int dil_h, int dil_w,
+                           Tensor& Y) {
+    conv3d_forward(X, Wt, bias, N, C_in, T, H, W, C_out, kT, kH, kW,
+                   stride_t, stride_h, stride_w, pad_t, pad_h, pad_w,
+                   dil_t, dil_h, dil_w, /*groups=*/1, Y);
+}
+
+// W8A16 3D convolution forward — the Qwen3-VL patch-embed variant of
+// conv3d_forward. Same NCTHW / OICTHW layout, same per-axis stride/pad/dilation
+// and groups semantics; X / bias FP16, W_int8 INT8 with per-output-row FP32
+// dequant scales (analogous to conv2d_int8w_fp16_forward). GPU-only — the CPU
+// vtable slot is left null and the dispatcher throws "not implemented on CPU".
+//   X:        (N, C_in*T*H*W) FP16.
+//   W_int8:   (C_out, (C_in/groups)*kT*kH*kW) INT8.
+//   scales:   (C_out, 1) FP32.
+//   bias:     (C_out, 1) FP16 or null.
+//   Y:        (N, C_out*T_out*H_out*W_out) FP16, resized + dtype-set as needed.
+void conv3d_int8w_fp16_forward(const Tensor& X,
+                               const Tensor& W_int8,
+                               const Tensor& scales,
+                               const Tensor* bias,
+                               int N, int C_in, int T, int H, int W,
+                               int C_out, int kT, int kH, int kW,
+                               int stride_t, int stride_h, int stride_w,
+                               int pad_t, int pad_h, int pad_w,
+                               int dil_t, int dil_h, int dil_w,
+                               int groups,
+                               Tensor& Y);
+// Convenience overload: groups defaults to 1.
+inline void conv3d_int8w_fp16_forward(const Tensor& X,
+                                      const Tensor& W_int8,
+                                      const Tensor& scales,
+                                      const Tensor* bias,
+                                      int N, int C_in, int T, int H, int W,
+                                      int C_out, int kT, int kH, int kW,
+                                      int stride_t, int stride_h, int stride_w,
+                                      int pad_t, int pad_h, int pad_w,
+                                      int dil_t, int dil_h, int dil_w,
+                                      Tensor& Y) {
+    conv3d_int8w_fp16_forward(X, W_int8, scales, bias,
+                              N, C_in, T, H, W, C_out, kT, kH, kW,
+                              stride_t, stride_h, stride_w,
+                              pad_t, pad_h, pad_w,
+                              dil_t, dil_h, dil_w, /*groups=*/1, Y);
+}
+
 // GroupNorm forward, NCHW. Dispatched on X.dtype (FP32/FP16); gamma, beta, Y
 // share it. FP32 accumulation.
 //   X, Y: (N, C*H*W).  gamma, beta: (C,1) per-channel scale / shift.

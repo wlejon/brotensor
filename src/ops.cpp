@@ -658,6 +658,43 @@ void conv2d_backward_bias(const Tensor& dY,
     v.conv2d_backward_bias(dY, N, C_out, H_out, W_out, dB);
 }
 
+// ─── Conv3d ────────────────────────────────────────────────────────────────
+
+void conv3d_forward(const Tensor& X, const Tensor& Wt, const Tensor* bias,
+                    int N, int C_in, int T, int H, int W,
+                    int C_out, int kT, int kH, int kW,
+                    int stride_t, int stride_h, int stride_w,
+                    int pad_t, int pad_h, int pad_w,
+                    int dil_t, int dil_h, int dil_w,
+                    int groups, Tensor& Y) {
+    const auto& v = detail::dispatch_with_opts(X, Wt, {bias, &Y});
+    if (!v.conv3d_forward) detail::throw_not_implemented("conv3d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.conv3d_forward(X, Wt, bias, N, C_in, T, H, W, C_out, kT, kH, kW,
+                     stride_t, stride_h, stride_w,
+                     pad_t, pad_h, pad_w,
+                     dil_t, dil_h, dil_w, groups, Y);
+}
+
+void conv3d_int8w_fp16_forward(const Tensor& X, const Tensor& W_int8,
+                               const Tensor& scales, const Tensor* bias,
+                               int N, int C_in, int T, int H, int W,
+                               int C_out, int kT, int kH, int kW,
+                               int stride_t, int stride_h, int stride_w,
+                               int pad_t, int pad_h, int pad_w,
+                               int dil_t, int dil_h, int dil_w,
+                               int groups, Tensor& Y) {
+    const auto& v = detail::dispatch_with_opts(X, W_int8, {&scales, bias, &Y});
+    if (!v.conv3d_int8w_fp16_forward)
+        detail::throw_not_implemented("conv3d_int8w_fp16_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.conv3d_int8w_fp16_forward(X, W_int8, scales, bias,
+                                N, C_in, T, H, W, C_out, kT, kH, kW,
+                                stride_t, stride_h, stride_w,
+                                pad_t, pad_h, pad_w,
+                                dil_t, dil_h, dil_w, groups, Y);
+}
+
 // ─── GroupNorm ─────────────────────────────────────────────────────────────
 
 void group_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta,

@@ -79,6 +79,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.conv2d_backward_weight                      = &dm::conv2d_backward_weight;
     ops.conv2d_forward                              = &dm::conv2d_forward;
     ops.conv2d_int8w_fp16_forward                   = &dm::conv2d_int8w_fp16_forward;
+    ops.conv3d_forward                              = &dm::conv3d_forward;
+    ops.conv3d_int8w_fp16_forward                   = &dm::conv3d_int8w_fp16_forward;
     ops.conv_transpose1d_backward_bias              = &dm::conv_transpose1d_backward_bias;
     ops.conv_transpose1d_backward_input             = &dm::conv_transpose1d_backward_input;
     ops.conv_transpose1d_backward_weight            = &dm::conv_transpose1d_backward_weight;

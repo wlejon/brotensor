@@ -90,6 +90,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/rope.cpp
     src/cpu/rms_norm.cpp
     src/cpu/conv2d.cpp
+    src/cpu/conv3d.cpp
     src/cpu/group_norm.cpp
     src/cpu/resample.cpp
     src/cpu/transpose.cpp
@@ -145,6 +146,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/batched_ops.cu
         src/cuda/conv2d.cu
         src/cuda/conv2d_wmma.cu
+        src/cuda/conv3d.cu
         src/cuda/conv2d_int8w_wmma.cu
         src/cuda/linear_int8w_wmma.cu
         src/cuda/group_norm.cu
@@ -223,6 +225,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/batched_ops.mm
         src/metal/conv2d.mm
         src/metal/conv2d_wmma.mm
+        src/metal/conv3d.mm
         src/metal/group_norm.mm
         src/metal/resample.mm
         src/metal/cross_attention.mm
@@ -278,6 +281,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/batched_ops.mm
         src/metal/conv2d.mm
         src/metal/conv2d_wmma.mm
+        src/metal/conv3d.mm
         src/metal/group_norm.mm
         src/metal/resample.mm
         src/metal/cross_attention.mm

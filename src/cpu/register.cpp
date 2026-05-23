@@ -257,6 +257,14 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
 void conv2d_backward_bias(const ::brotensor::Tensor& dY,
                           int N, int C_out, int H_out, int W_out,
                           ::brotensor::Tensor& dB);
+void conv3d_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wt,
+                    const ::brotensor::Tensor* bias,
+                    int N, int C_in, int T, int H, int W,
+                    int C_out, int kT, int kH, int kW,
+                    int stride_t, int stride_h, int stride_w,
+                    int pad_t, int pad_h, int pad_w,
+                    int dil_t, int dil_h, int dil_w, int groups,
+                    ::brotensor::Tensor& Y);
 void group_norm_forward(const ::brotensor::Tensor& X,
                         const ::brotensor::Tensor& gamma,
                         const ::brotensor::Tensor& beta,
@@ -810,6 +818,8 @@ struct CpuStaticRegistrar {
         ops.conv2d_backward_input      = &detail::cpu::conv2d_backward_input;
         ops.conv2d_backward_weight     = &detail::cpu::conv2d_backward_weight;
         ops.conv2d_backward_bias       = &detail::cpu::conv2d_backward_bias;
+        ops.conv3d_forward             = &detail::cpu::conv3d_forward;
+        // conv3d_int8w_fp16_forward is GPU-only; CPU slot left null.
         ops.group_norm_forward         = &detail::cpu::group_norm_forward;
         ops.group_norm_backward        = &detail::cpu::group_norm_backward;
 

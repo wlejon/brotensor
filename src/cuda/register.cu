@@ -23,6 +23,7 @@ namespace brotensor::detail::cuda {
 void fill_cuda_vtable_flash_attention(::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_attention      (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_conv           (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_conv3d         (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_elementwise    (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_norms          (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_utils          (::brotensor::detail::OpsVTable&);
@@ -69,6 +70,7 @@ extern "C" void brotensor_probe_and_register_cuda() {
     dc::fill_cuda_vtable_flash_attention(ops);
     dc::fill_cuda_vtable_attention(ops);
     dc::fill_cuda_vtable_conv(ops);
+    dc::fill_cuda_vtable_conv3d(ops);
     dc::fill_cuda_vtable_elementwise(ops);
     dc::fill_cuda_vtable_norms(ops);
     dc::fill_cuda_vtable_utils(ops);

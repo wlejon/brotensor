@@ -132,6 +132,18 @@
                                                        int stride_h, int stride_w, int pad_h, int pad_w, int dil_h, int dil_w, int groups,                              \
                                                        ::brotensor::Tensor& dWt))                                                                                       \
     X(conv2d_backward_bias,                    void,  (const ::brotensor::Tensor& dY, int N, int C_out, int H_out, int W_out, ::brotensor::Tensor& dB))                 \
+    /* ─── Conv3d (forward + W8A16 variant for Qwen3-VL patch embed) ─── */                                                                                              \
+    X(conv3d_forward,                          void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wt, const ::brotensor::Tensor* bias,                    \
+                                                       int N, int C_in, int T, int H, int W, int C_out, int kT, int kH, int kW,                                          \
+                                                       int stride_t, int stride_h, int stride_w, int pad_t, int pad_h, int pad_w,                                        \
+                                                       int dil_t, int dil_h, int dil_w, int groups,                                                                      \
+                                                       ::brotensor::Tensor& Y))                                                                                          \
+    X(conv3d_int8w_fp16_forward,               void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& W_int8, const ::brotensor::Tensor& scales,              \
+                                                       const ::brotensor::Tensor* bias,                                                                                  \
+                                                       int N, int C_in, int T, int H, int W, int C_out, int kT, int kH, int kW,                                          \
+                                                       int stride_t, int stride_h, int stride_w, int pad_t, int pad_h, int pad_w,                                        \
+                                                       int dil_t, int dil_h, int dil_w, int groups,                                                                      \
+                                                       ::brotensor::Tensor& Y))                                                                                          \
     /* ─── GroupNorm ─── */                                                                                                                                             \
     X(group_norm_forward,                      void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& gamma, const ::brotensor::Tensor& beta,                 \
                                                        int N, int C, int H, int W, int num_groups, float eps, ::brotensor::Tensor& Y))                                  \
