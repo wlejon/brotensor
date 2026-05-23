@@ -1,0 +1,107 @@
+// CUDA spatial 2x2 patch merger (Qwen3-VL).
+//
+// Pure gather: (N, C, H, W) -> (N, 4*C, H/2, W/2), stacking each 2x2 block
+// into the channel axis. Supports FP32 / FP16 / BF16; one thread per output
+// element. Registered through fill_cuda_vtable_qwen3_vl_polish (rope_mrope.cu).
+
+#include <brotensor/runtime.h>
+#include "detail/cuda_check.h"
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+#include <stdexcept>
+
+namespace brotensor {
+
+void* cuda_current_stream();
+
+namespace detail::cuda {
+
+namespace {
+
+constexpr int SM_BLOCK = 256;
+
+template <typename T>
+__global__ void spatial_merge_2x2_kernel(const T* __restrict__ X,
+                                         T* __restrict__ Y,
+                                         int N, int C, int H, int W,
+                                         int H_out, int W_out,
+                                         int total) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    // Output NCHW walk: idx = ((n*C_out + c_out)*H_out + h_out)*W_out + w_out.
+    const int C_out = 4 * C;
+    const int w_out = idx % W_out;
+    int t           = idx / W_out;
+    const int h_out = t % H_out;
+    t              /= H_out;
+    const int c_out = t % C_out;
+    const int n     = t / C_out;
+    const int block = c_out / C;          // dh*2 + dw
+    const int c_in  = c_out - block * C;
+    const int dh    = block >> 1;
+    const int dw    = block & 1;
+    const int h_in  = 2 * h_out + dh;
+    const int w_in  = 2 * w_out + dw;
+    const int HW    = H * W;
+    const int x_idx = (n * C + c_in) * HW + h_in * W + w_in;
+    Y[idx] = X[x_idx];
+    (void)N;
+}
+
+inline int grid_for(int n) { return (n + SM_BLOCK - 1) / SM_BLOCK; }
+
+} // namespace
+
+void spatial_merge_2x2_forward(const ::brotensor::Tensor& X,
+                               int N, int C, int H, int W,
+                               ::brotensor::Tensor& Y) {
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 &&
+        X.dtype != Dtype::BF16) {
+        throw std::runtime_error("spatial_merge_2x2_forward: X must be FP32, "
+                                 "FP16, or BF16");
+    }
+    if (N < 0 || C < 0 || H < 0 || W < 0) {
+        throw std::runtime_error("spatial_merge_2x2_forward: negative dimension");
+    }
+    if ((H & 1) != 0 || (W & 1) != 0) {
+        throw std::runtime_error("spatial_merge_2x2_forward: H and W must be even");
+    }
+    const int H_out = H / 2;
+    const int W_out = W / 2;
+    const int C_out = 4 * C;
+    const int cols  = C_out * H_out * W_out;
+    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) {
+        Y.resize(N, cols, X.dtype);
+    }
+    const int total = N * cols;
+    if (total == 0) return;
+    const int blocks = grid_for(total);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+    switch (X.dtype) {
+    case Dtype::FP16:
+        spatial_merge_2x2_kernel<__half><<<blocks, SM_BLOCK, 0, stream>>>(
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
+            N, C, H, W, H_out, W_out, total);
+        break;
+    case Dtype::BF16:
+        spatial_merge_2x2_kernel<__nv_bfloat16><<<blocks, SM_BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            N, C, H, W, H_out, W_out, total);
+        break;
+    default:  // FP32
+        spatial_merge_2x2_kernel<float><<<blocks, SM_BLOCK, 0, stream>>>(
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data),
+            N, C, H, W, H_out, W_out, total);
+        break;
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace detail::cuda
+} // namespace brotensor

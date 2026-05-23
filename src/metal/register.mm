@@ -181,6 +181,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.rms_norm_forward                            = &dm::rms_norm_forward;
     ops.rope_apply                                  = &dm::rope_apply;
     ops.rope_apply_backward                         = &dm::rope_apply_backward;
+    ops.rope_apply_mrope                            = &dm::rope_apply_mrope;
     ops.rope_backward                               = &dm::rope_backward;
     ops.rope_forward                                = &dm::rope_forward;
     ops.round_backward                              = &dm::round_backward;
@@ -193,6 +194,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.self_attention_forward                      = &dm::self_attention_forward;
     ops.self_attention_forward_train                = &dm::self_attention_forward_train;
     ops.sequence_to_nchw                            = &dm::sequence_to_nchw;
+    ops.spatial_merge_2x2_forward                   = &dm::spatial_merge_2x2_forward;
     ops.sgd_step                                    = &dm::sgd_step;
     ops.sigmoid_backward                            = &dm::sigmoid_backward;
     ops.sigmoid_forward                             = &dm::sigmoid_forward;

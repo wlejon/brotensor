@@ -1160,6 +1160,15 @@ void sequence_to_nchw(const Tensor& X, int N, int C, int H, int W, Tensor& Y) {
     v.sequence_to_nchw(X, N, C, H, W, Y);
 }
 
+void spatial_merge_2x2_forward(const Tensor& X, int N, int C, int H, int W,
+                               Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.spatial_merge_2x2_forward)
+        detail::throw_not_implemented("spatial_merge_2x2_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.spatial_merge_2x2_forward(X, N, C, H, W, Y);
+}
+
 // ─── ResBlock ──────────────────────────────────────────────────────────────
 
 void resblock_forward(const Tensor& X,
@@ -1297,6 +1306,25 @@ void rope_apply_backward(const Tensor& dY, const Tensor& cos_tbl,
         detail::throw_not_implemented("rope_apply_backward", dY.device);
     detail::adopt_output(dX, dY.device);
     v.rope_apply_backward(dY, cos_tbl, sin_tbl, head_dim, num_heads, dX);
+}
+
+void rope_apply_mrope(const Tensor& X,
+                      const Tensor& cos_t, const Tensor& sin_t,
+                      const Tensor& cos_h, const Tensor& sin_h,
+                      const Tensor& cos_w, const Tensor& sin_w,
+                      const int32_t* pos_t, const int32_t* pos_h,
+                      const int32_t* pos_w,
+                      int head_dim, int num_heads,
+                      int d_t, int d_h, int d_w,
+                      Tensor& Y) {
+    const auto& v = detail::dispatch(X, cos_t, sin_t, cos_h, sin_h, cos_w,
+                                     sin_w, Y);
+    if (!v.rope_apply_mrope)
+        detail::throw_not_implemented("rope_apply_mrope", X.device);
+    detail::adopt_output(Y, X.device);
+    v.rope_apply_mrope(X, cos_t, sin_t, cos_h, sin_h, cos_w, sin_w,
+                       pos_t, pos_h, pos_w, head_dim, num_heads,
+                       d_t, d_h, d_w, Y);
 }
 
 void rms_norm_forward(const Tensor& X, const Tensor& gamma, float eps, Tensor& Y) {

@@ -726,6 +726,24 @@ void gated_delta_rule_step(const ::brotensor::Tensor& Q,
                            ::brotensor::Tensor& state,
                            ::brotensor::Tensor& O);
 
+// ── Qwen3-VL polish: spatial_merge_2x2 + M-RoPE — spatial_merge.cpp /
+//    rope_mrope.cpp ──
+void spatial_merge_2x2_forward(const ::brotensor::Tensor& X,
+                               int N, int C, int H, int W,
+                               ::brotensor::Tensor& Y);
+void rope_apply_mrope(const ::brotensor::Tensor& X,
+                      const ::brotensor::Tensor& cos_t,
+                      const ::brotensor::Tensor& sin_t,
+                      const ::brotensor::Tensor& cos_h,
+                      const ::brotensor::Tensor& sin_h,
+                      const ::brotensor::Tensor& cos_w,
+                      const ::brotensor::Tensor& sin_w,
+                      const int32_t* pos_t, const int32_t* pos_h,
+                      const int32_t* pos_w,
+                      int head_dim, int num_heads,
+                      int d_t, int d_h, int d_w,
+                      ::brotensor::Tensor& Y);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -947,6 +965,10 @@ struct CpuStaticRegistrar {
         ops.l2_norm_backward             = &detail::cpu::l2_norm_backward;
         ops.gated_delta_rule_chunked     = &detail::cpu::gated_delta_rule_chunked;
         ops.gated_delta_rule_step        = &detail::cpu::gated_delta_rule_step;
+
+        // ── Qwen3-VL polish: spatial_merge_2x2 + M-RoPE ──
+        ops.spatial_merge_2x2_forward    = &detail::cpu::spatial_merge_2x2_forward;
+        ops.rope_apply_mrope             = &detail::cpu::rope_apply_mrope;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

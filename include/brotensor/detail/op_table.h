@@ -258,6 +258,8 @@
     /* ─── NCHW <-> sequence transposes ─── */                                                                                                                          \
     X(nchw_to_sequence,                        void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, ::brotensor::Tensor& Y))                               \
     X(sequence_to_nchw,                        void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, ::brotensor::Tensor& Y))                               \
+    /* ─── Qwen3-VL patch merger: (N,C,H,W) -> (N,4C,H/2,W/2) ─── */                                                                                                    \
+    X(spatial_merge_2x2_forward,               void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, ::brotensor::Tensor& Y))                               \
     /* ─── Diffusion ResBlock (forward + W8A16 + backward) ─── */                                                                                                       \
     X(resblock_forward,                        void,  (const ::brotensor::Tensor& X,                                                                                    \
                                                        const ::brotensor::Tensor& gamma1, const ::brotensor::Tensor& beta1,                                             \
@@ -355,6 +357,13 @@
                                                        const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads, ::brotensor::Tensor& Y))                         \
     X(rope_apply_backward,                     void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& cos_tbl,                                                 \
                                                        const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads, ::brotensor::Tensor& dX))                        \
+    X(rope_apply_mrope,                        void,  (const ::brotensor::Tensor& X,                                                                                       \
+                                                       const ::brotensor::Tensor& cos_t, const ::brotensor::Tensor& sin_t,                                                 \
+                                                       const ::brotensor::Tensor& cos_h, const ::brotensor::Tensor& sin_h,                                                 \
+                                                       const ::brotensor::Tensor& cos_w, const ::brotensor::Tensor& sin_w,                                                 \
+                                                       const int32_t* pos_t, const int32_t* pos_h, const int32_t* pos_w,                                                   \
+                                                       int head_dim, int num_heads, int d_t, int d_h, int d_w,                                                             \
+                                                       ::brotensor::Tensor& Y))                                                                                            \
     X(self_attention_bias_forward,             void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,                        \
                                                        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo, const float* d_mask,                                \
                                                        const ::brotensor::Tensor* attn_bias, int num_heads, float scale, ::brotensor::Tensor& O))                         \

@@ -1136,6 +1136,23 @@ void sequence_to_nchw(const Tensor& X,
                       int N, int C, int H, int W,
                       Tensor& Y);
 
+// ─── Spatial 2x2 patch merger (Qwen2.5-VL / Qwen3-VL) ──────────────────────
+//
+// Patch merger used before the vision -> LLM projector. Stacks each 2x2 spatial
+// block of X into the channel axis, producing 4x as many channels and half the
+// spatial extent in each direction:
+//   X: (N, C*H*W) — NCHW; H and W must both be even.
+//   Y: (N, 4*C*(H/2)*(W/2)) — NCHW with (C_out, H_out, W_out) =
+//                              (4*C, H/2, W/2). Resized + dtype-set to X.
+// Layout:
+//   c_out = (dh*2 + dw)*C + c_in,    dh in {0,1}, dw in {0,1}, c_in in [0,C).
+//   (h_out, w_out) maps to (h_in = 2*h_out + dh, w_in = 2*w_out + dw).
+// Pure gather — no arithmetic. Inference-only (no backward).
+// Dispatched on X.dtype (FP32/FP16/BF16 on GPU; FP32 only on CPU).
+void spatial_merge_2x2_forward(const Tensor& X,
+                               int N, int C, int H, int W,
+                               Tensor& Y);
+
 // ─── Diffusion ResBlock ────────────────────────────────────────────────────
 
 // Fused diffusion ResBlock (FP16, inference-only). Computes the SD U-Net
@@ -1268,6 +1285,33 @@ void rope_apply(const Tensor& X, const Tensor& cos_tbl, const Tensor& sin_tbl,
 void rope_apply_backward(const Tensor& dY, const Tensor& cos_tbl,
                          const Tensor& sin_tbl, int head_dim, int num_heads,
                          Tensor& dX);
+
+// M-RoPE (Qwen2.5-VL / Qwen3-VL): three independent per-axis position streams
+// (t, h, w) rotating disjoint sub-ranges of each head_dim. head_dim is split
+// into three contiguous scalar sub-ranges of widths 2*d_t, 2*d_h, 2*d_w (in
+// order t, h, w) with 2*(d_t + d_h + d_w) == head_dim. Within sub-range a the
+// op rotates pairs (x[2*i], x[2*i+1]) by angle
+//   theta = cos_a[pos_a[row], i_local], sin_a[pos_a[row], i_local]
+// where i_local is the pair index within sub-range a (0..d_a-1).
+//   X, Y: (L, num_heads*head_dim).
+//   cos_a, sin_a: (max_pos_a, d_a) FP32, shared across heads.
+//   pos_t / pos_h / pos_w: length-L INT32 position-ID streams.
+//     CPU backend: host pointers. CUDA/Metal: device pointers (mirrors
+//     flash_attention_varlen_forward's cu_seqlens convention).
+//   Y resized + dtype-set to X. Dispatched on X.dtype (FP32/FP16/BF16); FP32
+//   math. Inference-only (no backward).
+//
+// Degenerate case: with d_h == d_w == 0 and pos_t = {0,1,2,...,L-1}, this
+// reproduces rope_apply exactly.
+void rope_apply_mrope(const Tensor& X,
+                      const Tensor& cos_t, const Tensor& sin_t,
+                      const Tensor& cos_h, const Tensor& sin_h,
+                      const Tensor& cos_w, const Tensor& sin_w,
+                      const int32_t* pos_t, const int32_t* pos_h,
+                      const int32_t* pos_w,
+                      int head_dim, int num_heads,
+                      int d_t, int d_h, int d_w,
+                      Tensor& Y);
 
 // RMSNorm forward, per row:
 //   rms[b] = sqrt(mean_j x[b,j]^2 + eps);  y[b,j] = x[b,j]*gamma[j]/rms[b].

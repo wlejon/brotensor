@@ -114,6 +114,8 @@ add_library(brotensor_cpu STATIC
     src/cpu/sample_logits.cpp
     src/cpu/l2_norm.cpp
     src/cpu/gated_delta_rule.cpp
+    src/cpu/spatial_merge.cpp
+    src/cpu/rope_mrope.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)
@@ -182,6 +184,8 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/sample_logits.cu
         src/cuda/l2_norm.cu
         src/cuda/gated_delta_rule.cu
+        src/cuda/spatial_merge.cu
+        src/cuda/rope_mrope.cu
         src/cuda/register.cu
     )
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)
@@ -259,6 +263,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/sample_logits.mm
         src/metal/l2_norm.mm
         src/metal/gated_delta_rule.mm
+        src/metal/spatial_merge.mm
+        src/metal/rope_mrope.mm
         src/metal/register.mm
     )
     set_source_files_properties(
@@ -315,6 +321,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/sample_logits.mm
         src/metal/l2_norm.mm
         src/metal/gated_delta_rule.mm
+        src/metal/spatial_merge.mm
+        src/metal/rope_mrope.mm
         src/metal/register.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"
