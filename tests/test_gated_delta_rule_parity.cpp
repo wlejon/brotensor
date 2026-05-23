@@ -1,4 +1,4 @@
-// CPU↔GPU parity tests for the Qwen3-Next gated delta rule (FP32).
+// CPU↔GPU parity tests for the gated delta rule (FP32).
 //
 // Shapes follow src/cpu/gated_delta_rule.cpp:
 //   Q, K     : (L, num_heads * d_k)

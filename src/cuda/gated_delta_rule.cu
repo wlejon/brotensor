@@ -1,4 +1,4 @@
-// ─── CUDA Gated Delta Rule (Qwen3-Next text path) ──────────────────────────
+// ─── CUDA Gated Delta Rule ─────────────────────────────────────────────────
 //
 // Mirrors src/cpu/gated_delta_rule.cpp. Per token t, per head h:
 //   alpha_t = exp(-softplus(a_raw_t) * exp(log_A_h))     ∈ (0, 1]

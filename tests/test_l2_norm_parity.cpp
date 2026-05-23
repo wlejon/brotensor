@@ -1,7 +1,7 @@
 // CPU↔GPU parity tests for brotensor::l2_norm_forward / l2_norm_backward.
 //
-// Per-head, last-dim L2 normalisation used by the Qwen3-Next text path. Layout
-// is (L, num_heads * head_dim). FP32-only on both sides.
+// Per-head, last-dim L2 normalisation used by the gated delta-rule text path.
+// Layout is (L, num_heads * head_dim). FP32-only on both sides.
 
 #include "parity_helpers.h"
 

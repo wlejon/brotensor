@@ -429,7 +429,7 @@
     /* ─── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ─── */                                                                \
     X(sample_logits,                           void,  (const ::brotensor::Tensor& logits, float temperature, int top_k, float top_p,          \
                                                        uint64_t key, uint64_t counter, ::brotensor::Tensor& indices))                          \
-    /* ─── L2 norm + Gated Delta Rule (brolm Qwen3-Next) ─── */                                                                                \
+    /* ─── L2 norm + Gated Delta Rule (linear-attention text path) ─── */                                                                      \
     X(l2_norm_forward,                         void,  (const ::brotensor::Tensor& X, int head_dim, int num_heads, float eps,                   \
                                                        ::brotensor::Tensor& Y))                                                                \
     X(l2_norm_backward,                        void,  (const ::brotensor::Tensor& X, int head_dim, int num_heads, float eps,                   \

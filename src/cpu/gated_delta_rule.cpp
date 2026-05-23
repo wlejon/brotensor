@@ -1,8 +1,8 @@
-// ─── CPU Gated Delta Rule (Qwen3-Next text path) ───────────────────────────
+// ─── CPU Gated Delta Rule ──────────────────────────────────────────────────
 //
 // FP32-only host implementation of the Gated DeltaNet matrix-valued recurrence
-// used by Qwen3-Next / Qwen3.5 text layers (3-of-4 layers; the remaining 1-of-4
-// is standard gated attention, handled via flash_attention_decode).
+// used by hybrid linear-attention text decoders (the linear-attention layers
+// alternate with standard gated attention, handled via flash_attention_decode).
 //
 // Per token t, per head h:
 //   alpha_t = exp(-softplus(a_raw_t) * exp(log_A_h))      (decay gate, in (0,1])
@@ -144,7 +144,7 @@ void run_scan(const ::brotensor::Tensor& Q,
             // u = S * k  (shape d_v).  S row v stride d_k.
             // We hold u on-stack via direct accumulation into the update;
             // for clarity and to allow the (v - u) compute, materialise it.
-            // d_v is typically <= 256 for Qwen heads, so a stack-sized array
+            // d_v is typically <= 256 in practice, so a stack-sized array
             // would suffice, but we use a small local heap buffer to avoid
             // VLA portability concerns.
             //

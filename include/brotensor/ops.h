@@ -1977,11 +1977,12 @@ void sample_logits(const Tensor& logits, float temperature, int top_k,
                    float top_p, uint64_t key, uint64_t counter,
                    Tensor& indices);
 
-// ─── L2 norm + Gated Delta Rule (brolm Qwen3-Next text path) ───────────────
+// ─── L2 norm + Gated Delta Rule ────────────────────────────────────────────
 //
-// Building blocks for the Gated DeltaNet text layers of Qwen3-Next / Qwen3.5.
-// The recurrence acts on (L, num_heads*d) sequence-major tensors using the
-// same head-contiguous layout as rope_forward / rms_norm.
+// Building blocks for Gated DeltaNet linear-attention text layers (the
+// recurrence-based half of hybrid linear/standard attention decoders). Acts on
+// (L, num_heads*d) sequence-major tensors using the same head-contiguous
+// layout as rope_forward / rms_norm.
 
 // L2-normalize each head row over its head_dim slice, with epsilon:
 //   y[r, h*head_dim + d] = x[r, h*head_dim + d] /

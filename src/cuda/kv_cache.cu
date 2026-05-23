@@ -279,7 +279,7 @@ void flash_attention_decode(const Tensor& Q,
                             int valid_len, int num_q_heads, int num_kv_heads,
                             Tensor& O) {
     if (num_kv_heads != num_q_heads) {
-        // Qwen3-Next GQA decode lives only on the CPU backend for now.
+        // GQA flash-decode (num_kv_heads != num_q_heads) lives only on CPU for now.
         throw std::runtime_error("brotensor: flash_attention_decode: GQA "
                                  "(num_kv_heads != num_q_heads) not yet "
                                  "implemented on CUDA backend");

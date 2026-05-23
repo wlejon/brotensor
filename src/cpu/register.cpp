@@ -682,7 +682,7 @@ void sample_logits(const ::brotensor::Tensor& logits, float temperature,
                    int top_k, float top_p, uint64_t key, uint64_t counter,
                    ::brotensor::Tensor& indices);
 
-// ── L2 norm + Gated Delta Rule (brolm Qwen3-Next) ──
+// ── L2 norm + Gated Delta Rule (linear-attention text path) ──
 //    l2_norm.cpp, gated_delta_rule.cpp
 void l2_norm_forward(const ::brotensor::Tensor& X,
                      int head_dim, int num_heads, float eps,
@@ -922,7 +922,7 @@ struct CpuStaticRegistrar {
         // ── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ──
         ops.sample_logits                = &detail::cpu::sample_logits;
 
-        // ── L2 norm + Gated Delta Rule (brolm Qwen3-Next) ──
+        // ── L2 norm + Gated Delta Rule (linear-attention text path) ──
         ops.l2_norm_forward              = &detail::cpu::l2_norm_forward;
         ops.l2_norm_backward             = &detail::cpu::l2_norm_backward;
         ops.gated_delta_rule_chunked     = &detail::cpu::gated_delta_rule_chunked;

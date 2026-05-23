@@ -36,7 +36,7 @@ void fill_cuda_vtable_conv1d         (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_codec_quant    (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_resample1d     (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_sample_logits  (::brotensor::detail::OpsVTable&);
-// ── brolm Qwen3-Next text-path clusters ──
+// ── linear-attention text-path clusters ──
 void fill_cuda_vtable_l2_norm        (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_gated_delta_rule(::brotensor::detail::OpsVTable&);
 

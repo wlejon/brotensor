@@ -1,8 +1,8 @@
 // Gated Delta Rule (Metal). Mirrors src/cpu/gated_delta_rule.cpp.
 //
-// Qwen3-Next text-path matrix-valued recurrence (3-of-4 layers; the 1-of-4
-// gated attention layer goes through flash_attention_decode). Per head h,
-// per token t:
+// Matrix-valued recurrence for hybrid linear-attention text decoders (the
+// linear-attention layers alternate with standard gated attention, which goes
+// through flash_attention_decode). Per head h, per token t:
 //   alpha_t = exp(-softplus(a_raw_t) * exp(log_A_h))      (decay gate, in (0,1])
 //   beta_t  = sigmoid(beta_raw_t)
 //   u_t     = S_{t-1} k_t

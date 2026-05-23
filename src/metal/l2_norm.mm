@@ -3,8 +3,8 @@
 // Layout: (L, num_heads * head_dim), row-major. Head h occupies columns
 // [h*head_dim, (h+1)*head_dim) on each row, same convention as rope/rms_norm.
 //
-// FP32-only — matches the CPU contract (CPU backend is FP32-only and the
-// brolm Qwen3-Next text path uses FP32 for these per-token reductions).
+// FP32-only — matches the CPU contract (CPU backend is FP32-only, and the
+// gated delta-rule consumers run FP32 for these per-token reductions).
 //
 // One threadgroup per (row, head). 256 threads per group with a power-of-two
 // shared-memory reduction; head_dim < 256 is fine because the over-range

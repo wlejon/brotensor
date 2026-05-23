@@ -1859,7 +1859,7 @@ void sample_logits(const Tensor& logits, float temperature, int top_k,
     v.sample_logits(logits, temperature, top_k, top_p, key, counter, indices);
 }
 
-// ─── L2 norm + Gated Delta Rule (brolm Qwen3-Next text path) ───────────────
+// ─── L2 norm + Gated Delta Rule (linear-attention text path) ───────────────
 
 void l2_norm_forward(const Tensor& X, int head_dim, int num_heads,
                      float eps, Tensor& Y) {

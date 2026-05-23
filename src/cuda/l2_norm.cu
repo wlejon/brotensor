@@ -1,13 +1,11 @@
 // ─── CUDA L2-norm (per-head, last-dim) ─────────────────────────────────────
 //
 // Mirrors src/cpu/l2_norm.cpp. Layout: (L, num_heads * head_dim), row-major;
-// head h occupies columns [h*head_dim, (h+1)*head_dim). Used by the
-// Qwen3-Next text path to L2-normalise q and k per head before the gated
-// delta-rule recurrence.
+// head h occupies columns [h*head_dim, (h+1)*head_dim). Used to L2-normalise
+// q and k per head before the gated delta-rule recurrence.
 //
-// FP32-only. brolm's Qwen3-Next text path runs FP32 here per the public
-// contract; if we ever need FP16/BF16 paths we'd extend along the same lines
-// as rms_norm.cu.
+// FP32-only per the public contract; if we ever need FP16/BF16 paths we'd
+// extend along the same lines as rms_norm.cu.
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>

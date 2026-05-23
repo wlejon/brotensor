@@ -1,4 +1,4 @@
-// Standalone CPU coverage for the brolm Qwen3-Next text-path ops:
+// Standalone CPU coverage for the linear-attention text-path ops:
 //   * l2_norm_forward / l2_norm_backward          (per-head L2 normalisation)
 //   * gated_delta_rule_chunked / gated_delta_rule_step
 //   * flash_attention_decode GQA (num_kv_heads < num_q_heads)
