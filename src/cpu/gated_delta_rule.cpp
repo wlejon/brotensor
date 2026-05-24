@@ -4,12 +4,14 @@
 // used by hybrid linear-attention text decoders (the linear-attention layers
 // alternate with standard gated attention, handled via flash_attention_decode).
 //
-// Per token t, per head h:
-//   alpha_t = exp(-softplus(a_raw_t) * exp(log_A_h))      (decay gate, in (0,1])
-//   beta_t  = sigmoid(beta_raw_t)                          (write strength)
-//   u_t     = S_{t-1} k_t                                  (predicted v from old S)
-//   S_t     = alpha_t * S_{t-1} + beta_t * (v_t - u_t) k_t^T
-//   o_t     = S_t q_t
+// Per token t, per head h (FLA / HF Qwen3.5 ordering — decay applied BEFORE
+// the delta read, so u_t is computed against the decayed state):
+//   alpha_t  = exp(-softplus(a_raw_t) * exp(log_A_h))     (decay gate, in (0,1])
+//   beta_t   = sigmoid(beta_raw_t)                         (write strength)
+//   S_pre_t  = alpha_t * S_{t-1}                           (decayed state)
+//   u_t      = S_pre_t k_t                                 (predicted v)
+//   S_t      = S_pre_t + beta_t * (v_t - u_t) k_t^T
+//   o_t      = S_t q_t
 // per-head state S has shape (d_v, d_k); o_t in R^{d_v}, q_t/k_t in R^{d_k},
 // v_t in R^{d_v}.
 //
@@ -163,9 +165,19 @@ void run_scan(const ::brotensor::Tensor& Q,
             // For d_v that fits on stack we could VLA, but a local static
             // std::vector is allocated once per call.
 
-            // pass A — compute delta and update S
-            // (heap alloc avoided by keeping delta in O[t,h] briefly:
-            //  we write delta into orow first, then overwrite it in pass B.)
+            // FLA / HF Qwen3.5 ordering: decay S FIRST, then compute u against
+            // the decayed S, then add the delta-write. Without this ordering,
+            // brotensor's recurrence diverges from HF's `torch_recurrent_gated
+            // _delta_rule` at every token after the first by a factor that
+            // depends on alpha, producing percent-level logit drift in
+            // Qwen3.5-VL.
+            //
+            // pass A1 — decay S in place
+            for (int v = 0; v < d_v; ++v) {
+                float* Sv = S + v * d_k;
+                for (int k = 0; k < d_k; ++k) Sv[k] *= alpha;
+            }
+            // pass A2 — compute u against the decayed S; stash delta in orow.
             float* orow = Op + t * Dv + h * d_v;
             for (int v = 0; v < d_v; ++v) {
                 const float* Sv = S + v * d_k;
@@ -173,11 +185,12 @@ void run_scan(const ::brotensor::Tensor& Q,
                 for (int k = 0; k < d_k; ++k) u_v += Sv[k] * kt[k];
                 orow[v] = vt[v] - u_v;       // stash delta in orow
             }
+            // pass A3 — add the delta-write: S += beta * delta_v * k_t.
             for (int v = 0; v < d_v; ++v) {
                 float* Sv = S + v * d_k;
                 const float scale_v = beta_t * orow[v]; // beta * delta_v
                 for (int k = 0; k < d_k; ++k) {
-                    Sv[k] = alpha * Sv[k] + scale_v * kt[k];
+                    Sv[k] += scale_v * kt[k];
                 }
             }
             // pass B — o = S @ q (overwrites the stashed delta)

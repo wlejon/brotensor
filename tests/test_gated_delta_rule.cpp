@@ -184,6 +184,10 @@ static Tensor ref_gated_delta_rule(const Tensor& Q, const Tensor& K,
             const float alpha = std::exp(-softplus(a_raw_t) * std::exp(logA[h]));
             float* S = Sp + h * d_v * d_k;
 
+            // FLA / HF Qwen3.5 ordering: decay first, then read u, then write.
+            for (int v = 0; v < d_v; ++v)
+                for (int k = 0; k < d_k; ++k)
+                    S[v * d_k + k] *= alpha;
             std::vector<float> u(d_v, 0.0f);
             for (int v = 0; v < d_v; ++v)
                 for (int k = 0; k < d_k; ++k)
@@ -192,7 +196,7 @@ static Tensor ref_gated_delta_rule(const Tensor& Q, const Tensor& K,
                 const float delta = vt[v] - u[v];
                 const float scale = beta_t * delta;
                 for (int k = 0; k < d_k; ++k)
-                    S[v * d_k + k] = alpha * S[v * d_k + k] + scale * kt[k];
+                    S[v * d_k + k] += scale * kt[k];
             }
             float* orow = Op + t * Dv + h * d_v;
             for (int v = 0; v < d_v; ++v) {

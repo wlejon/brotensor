@@ -2393,10 +2393,11 @@ void l2_norm_backward(const Tensor& X, int head_dim, int num_heads,
                       float eps, const Tensor& dY, Tensor& dX);
 
 // Gated Delta Rule — chunked prefill. Runs the matrix-valued recurrence
+// (FLA / HF Qwen3.5 ordering: decay BEFORE the delta read):
 //   alpha_t = exp(-softplus(a_raw_t) * exp(log_A))      (per token, per head)
 //   beta_t  = sigmoid(beta_raw_t)
-//   S_t     = alpha_t * S_{t-1}
-//           + beta_t * (v_t - S_{t-1} k_t) k_t^T
+//   S_pre_t = alpha_t * S_{t-1}
+//   S_t     = S_pre_t + beta_t * (v_t - S_pre_t k_t) k_t^T
 //   o_t     = S_t q_t                                  (per head)
 // over L tokens, sequentially within each head. The chunked WY/UT-transform
 // is an internal optimisation — the contract is exactly the per-token rule.

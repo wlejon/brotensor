@@ -3,10 +3,13 @@
 // Matrix-valued recurrence for hybrid linear-attention text decoders (the
 // linear-attention layers alternate with standard gated attention, which goes
 // through flash_attention_decode). Per head h, per token t:
+// FLA / HF Qwen3.5 ordering — decay BEFORE the delta read.
 //   alpha_t = exp(-softplus(a_raw_t) * exp(log_A_h))      (decay gate, in (0,1])
 //   beta_t  = sigmoid(beta_raw_t)
 //   u_t     = S_{t-1} k_t
-//   S_t     = alpha_t * S_{t-1} + beta_t * (v_t - u_t) k_t^T
+//   S_pre_t = alpha_t * S_{t-1}
+//   u_t     = S_pre_t k_t
+//   S_t     = S_pre_t + beta_t * (v_t - u_t) k_t^T
 //   o_t     = S_t q_t
 // State S is (d_v, d_k) per head, laid out as state[h, v*d_k + k].
 //
@@ -78,18 +81,21 @@ kernel void k_gdr_fp32(device const float* Q     [[buffer(0)]],
 
         device float* orow = O + t * D_v + h * d_v;
 
-        // Each thread owns a disjoint set of v rows. For every owned v:
-        //   u_v = sum_k S[v,k] * k[k]      (pass A — read S row v)
-        //   S[v,k] = alpha*S[v,k] + beta*(v[v]-u_v)*k[k]   (update — write S row v)
-        //   o_v = sum_k S[v,k] * q[k]      (pass B — read updated S row v)
-        // No inter-thread dependency: row v is touched only by its owning thread.
+        // FLA / HF Qwen3.5 ordering: decay S FIRST, then read u against the
+        // decayed state, then add the delta-write. Each thread owns a disjoint
+        // set of v rows so no inter-thread sync is needed within the row block:
+        //   S[v,k] *= alpha                 (decay)
+        //   u_v = sum_k S[v,k] * k[k]       (read against decayed S)
+        //   S[v,k] += beta*(v[v]-u_v)*k[k]  (delta-write)
+        //   o_v = sum_k S[v,k] * q[k]       (output)
         for (uint v = tid; v < d_v; v += tgs) {
             device float* Sv = Sh + v * d_k;
+            for (uint kk = 0; kk < d_k; ++kk) Sv[kk] *= alpha;
             float u = 0.0f;
             for (uint kk = 0; kk < d_k; ++kk) u += Sv[kk] * kt[kk];
             float scale = beta_t * (vt[v] - u);
             for (uint kk = 0; kk < d_k; ++kk) {
-                Sv[kk] = alpha * Sv[kk] + scale * kt[kk];
+                Sv[kk] += scale * kt[kk];
             }
             float o = 0.0f;
             for (uint kk = 0; kk < d_k; ++kk) o += Sv[kk] * qt[kk];

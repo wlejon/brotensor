@@ -1,19 +1,22 @@
 // ─── CUDA Gated Delta Rule ─────────────────────────────────────────────────
 //
-// Mirrors src/cpu/gated_delta_rule.cpp. Per token t, per head h:
-//   alpha_t = exp(-softplus(a_raw_t) * exp(log_A_h))     ∈ (0, 1]
-//   beta_t  = sigmoid(beta_raw_t)
-//   u_t     = S_{t-1} k_t                                (predicted v)
-//   S_t     = alpha_t * S_{t-1} + beta_t * (v_t - u_t) k_t^T
-//   o_t     = S_t q_t
+// Mirrors src/cpu/gated_delta_rule.cpp (FLA / HF Qwen3.5 ordering — decay
+// BEFORE the delta read). Per token t, per head h:
+//   alpha_t  = exp(-softplus(a_raw_t) * exp(log_A_h))    ∈ (0, 1]
+//   beta_t   = sigmoid(beta_raw_t)
+//   S_pre_t  = alpha_t * S_{t-1}
+//   u_t      = S_pre_t k_t                               (predicted v)
+//   S_t      = S_pre_t + beta_t * (v_t - u_t) k_t^T
+//   o_t      = S_t q_t
 // per-head state S has shape (d_v, d_k); o_t in R^{d_v}, q_t/k_t in R^{d_k},
 // v_t in R^{d_v}.
 //
 // One CUDA block per head. The token loop stays sequential inside the block
 // (the recurrence is fundamentally serial in t); threads parallelise the
 // (d_v, d_k) state. Each token sees three passes:
-//   A1) compute delta_v = v[v] - sum_k S[v,k] * k[k]    (parallel over v)
-//   A2) S[v,k] = alpha * S[v,k] + beta * delta[v] * k[k] (parallel over v*k)
+//   A0) S[v,k] *= alpha                                 (decay, parallel over v*k)
+//   A1) compute delta_v = v[v] - sum_k S_decayed[v,k] * k[k] (parallel over v)
+//   A2) S[v,k] += beta * delta[v] * k[k]                (parallel over v*k)
 //   B)  o_v   = sum_k S[v,k] * q[k]                     (parallel over v)
 // delta lives in shared memory of size d_v. Both chunked and step share the
 // same kernel — see CPU note: the chunked WY/UT transform is a GPU-throughput
@@ -83,7 +86,14 @@ __global__ void gated_delta_rule_kernel(const float* __restrict__ Q,
         const float beta_t  = gdr_sigmoid(b_raw_t);
         const float alpha   = __expf(-gdr_softplus(a_raw_t) * exp_A);
 
-        // Pass A1: delta[v] = v[v] - sum_k S[v,k] * k[k]
+        // FLA / HF ordering: decay S in place BEFORE computing the u read.
+        // Pass A0: S[v,k] *= alpha
+        for (int idx = tid; idx < VK; idx += bdim) {
+            S[idx] *= alpha;
+        }
+        __syncthreads();
+
+        // Pass A1: delta[v] = v[v] - sum_k S_decayed[v,k] * k[k]
         for (int v = tid; v < d_v; v += bdim) {
             const float* Sv = S + v * d_k;
             float u = 0.0f;
@@ -92,11 +102,11 @@ __global__ void gated_delta_rule_kernel(const float* __restrict__ Q,
         }
         __syncthreads();
 
-        // Pass A2: S[v,k] = alpha * S[v,k] + beta * delta[v] * k[k]
+        // Pass A2: S[v,k] += beta * delta[v] * k[k]
         for (int idx = tid; idx < VK; idx += bdim) {
             const int v = idx / d_k;
             const int k = idx - v * d_k;
-            S[idx] = alpha * S[idx] + beta_t * sdelta[v] * kt[k];
+            S[idx] += beta_t * sdelta[v] * kt[k];
         }
         __syncthreads();
 
