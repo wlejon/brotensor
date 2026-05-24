@@ -825,6 +825,23 @@ void interp2d_backward(const Tensor& dY,
     v.interp2d_backward(dY, N, C, H_in, W_in, H_out, W_out, mode, dX);
 }
 
+void pad2d_forward(const Tensor& X, int N, int C, int H, int W,
+                   int pad_top, int pad_bottom, int pad_left, int pad_right,
+                   int mode, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.pad2d_forward) detail::throw_not_implemented("pad2d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.pad2d_forward(X, N, C, H, W, pad_top, pad_bottom, pad_left, pad_right, mode, Y);
+}
+void pad2d_backward(const Tensor& dY, int N, int C, int H, int W,
+                    int pad_top, int pad_bottom, int pad_left, int pad_right,
+                    int mode, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, dX);
+    if (!v.pad2d_backward) detail::throw_not_implemented("pad2d_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.pad2d_backward(dY, N, C, H, W, pad_top, pad_bottom, pad_left, pad_right, mode, dX);
+}
+
 // ─── FP16 linear + GEGLU ───────────────────────────────────────────────────
 
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,

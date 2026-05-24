@@ -171,6 +171,13 @@
                                                        ::brotensor::Tensor& Y))                                                                                         \
     X(interp2d_backward,                       void,  (const ::brotensor::Tensor& dY, int N, int C, int H_in, int W_in, int H_out, int W_out, int mode,                \
                                                        ::brotensor::Tensor& dX))                                                                                        \
+    /* ─── 2D padding (zero / reflect / replicate) — NCHW ─── */                                                                                                        \
+    X(pad2d_forward,                           void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W,                                                       \
+                                                       int pad_top, int pad_bottom, int pad_left, int pad_right, int mode,                                             \
+                                                       ::brotensor::Tensor& Y))                                                                                         \
+    X(pad2d_backward,                          void,  (const ::brotensor::Tensor& dY, int N, int C, int H, int W,                                                      \
+                                                       int pad_top, int pad_bottom, int pad_left, int pad_right, int mode,                                             \
+                                                       ::brotensor::Tensor& dX))                                                                                        \
     /* ─── FP16 linear (inference-only) + GEGLU family ─── */                                                                                                           \
     X(linear_forward_batched_fp16,             void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
                                                        ::brotensor::Tensor& Y_BD))                                                                                      \

@@ -750,6 +750,28 @@ void interp2d_backward(const Tensor& dY,
                        int N, int C, int H_in, int W_in, int H_out, int W_out,
                        int mode, Tensor& dX);
 
+// 2D pad on the H and W axes of an NCHW tensor (image padding — same role as
+// torch.nn.functional.pad with a 4-element pad). `mode`: 0 zero, 1 reflect
+// (mirror without repeating the edge sample; requires pad_top/pad_bottom < H
+// and pad_left/pad_right < W), 2 replicate (clamp to the edge sample). The
+// 2D counterpart to pad1d, with H/W independently padded.
+//   X: (N, C*H*W).  Y: (N, C*(H+pt+pb)*(W+pl+pr)), resized + dtype-set to X.
+// CPU is FP32-only. GPU dispatch follows the registered backend's dtype
+// support (CUDA + Metal TBD — null slots until those follow-ups land).
+void pad2d_forward(const Tensor& X, int N, int C, int H, int W,
+                   int pad_top, int pad_bottom, int pad_left, int pad_right,
+                   int mode, Tensor& Y);
+
+// Backward (adjoint) of pad2d_forward: each input pixel sums the gradients
+// of the output pixels that read it (reflect / replicate may collapse
+// several output positions into one input — those gradients are summed).
+// dX overwritten, resized + dtype-set to dY.
+//   dY: (N, C*(H+pt+pb)*(W+pl+pr)).  dX: (N, C*H*W).
+// All shape / pad / mode args match the forward call.
+void pad2d_backward(const Tensor& dY, int N, int C, int H, int W,
+                    int pad_top, int pad_bottom, int pad_left, int pad_right,
+                    int mode, Tensor& dX);
+
 // FP16 batched linear forward, inference-only. Like linear_forward_batched but
 // FP16 storage throughout.
 //   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.
