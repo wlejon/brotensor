@@ -219,6 +219,9 @@
                                                        int dil_h, int dil_w, int groups,                                                                                \
                                                        ::brotensor::Tensor& dWt))                                                                                       \
     X(conv_transpose2d_backward_bias,          void,  (const ::brotensor::Tensor& dY, int N, int C_out, int H_out, int W_out, ::brotensor::Tensor& dB))                 \
+    /* ─── SAM-style window partition / reverse (NCHW <-> windowed batch) ─── */                                                                                        \
+    X(window_partition_forward,                void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, int window, ::brotensor::Tensor& Y))                  \
+    X(window_reverse_forward,                  void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, int window, ::brotensor::Tensor& Y))                  \
     /* ─── FP16 linear (inference-only) + GEGLU family ─── */                                                                                                           \
     X(linear_forward_batched_fp16,             void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
                                                        ::brotensor::Tensor& Y_BD))                                                                                      \

@@ -978,6 +978,23 @@ void conv_transpose2d_backward_bias(const Tensor& dY, int N, int C_out,
     v.conv_transpose2d_backward_bias(dY, N, C_out, H_out, W_out, dB);
 }
 
+void window_partition_forward(const Tensor& X, int N, int C, int H, int W,
+                              int window, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.window_partition_forward)
+        detail::throw_not_implemented("window_partition_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.window_partition_forward(X, N, C, H, W, window, Y);
+}
+void window_reverse_forward(const Tensor& X, int N, int C, int H, int W,
+                            int window, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.window_reverse_forward)
+        detail::throw_not_implemented("window_reverse_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.window_reverse_forward(X, N, C, H, W, window, Y);
+}
+
 // ─── FP16 linear + GEGLU ───────────────────────────────────────────────────
 
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,

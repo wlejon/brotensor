@@ -374,6 +374,12 @@ void conv_transpose2d_backward_weight(const ::brotensor::Tensor& X,
 void conv_transpose2d_backward_bias(const ::brotensor::Tensor& dY,
                                     int N, int C_out, int H_out, int W_out,
                                     ::brotensor::Tensor& dB);
+void window_partition_forward(const ::brotensor::Tensor& X,
+                              int N, int C, int H, int W, int window,
+                              ::brotensor::Tensor& Y);
+void window_reverse_forward(const ::brotensor::Tensor& X,
+                            int N, int C, int H, int W, int window,
+                            ::brotensor::Tensor& Y);
 void nchw_to_sequence(const ::brotensor::Tensor& X,
                       int N, int C, int H, int W, ::brotensor::Tensor& Y);
 void sequence_to_nchw(const ::brotensor::Tensor& X,
@@ -957,6 +963,8 @@ struct CpuStaticRegistrar {
                                          = &detail::cpu::conv_transpose2d_backward_weight;
         ops.conv_transpose2d_backward_bias
                                          = &detail::cpu::conv_transpose2d_backward_bias;
+        ops.window_partition_forward     = &detail::cpu::window_partition_forward;
+        ops.window_reverse_forward       = &detail::cpu::window_reverse_forward;
         ops.nchw_to_sequence             = &detail::cpu::nchw_to_sequence;
         ops.sequence_to_nchw             = &detail::cpu::sequence_to_nchw;
         ops.ddim_step                    = &detail::cpu::ddim_step;

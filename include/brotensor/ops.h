@@ -930,6 +930,29 @@ void conv_transpose2d_backward_weight(const Tensor& X, const Tensor& dY,
 void conv_transpose2d_backward_bias(const Tensor& dY, int N, int C_out,
                                     int H_out, int W_out, Tensor& dB);
 
+// SAM-style window partition. Splits the (H, W) spatial plane of an NCHW
+// tensor into (H/window) * (W/window) non-overlapping window-sized tiles
+// and stacks them as a longer batch dimension. H and W must be multiples
+// of `window` (caller handles any padding via pad2d).
+//   X: (N, C*H*W).
+//   Y: (N * nw_h * nw_w, C * window * window), with nw_h = H/window,
+//      nw_w = W/window. Row index = n*nw_h*nw_w + nh*nw_w + nw, within-row
+//      layout is (C, window, window) flat.
+// No backward op — window_reverse_forward IS the adjoint (and exactly the
+// inverse). Use it to map gradients back from the windowed batch to NCHW.
+void window_partition_forward(const Tensor& X, int N, int C, int H, int W,
+                              int window, Tensor& Y);
+
+// Inverse of window_partition_forward. Takes the windowed batch
+// (N * nw_h * nw_w, C * window * window) and reassembles it into
+// (N, C * H * W). H, W must be multiples of window (and consistent with
+// the input's first-axis row count).
+//   X: (N * nw_h * nw_w, C * window * window).
+//   Y: (N, C*H*W).
+// No backward op — window_partition_forward IS the adjoint.
+void window_reverse_forward(const Tensor& X, int N, int C, int H, int W,
+                            int window, Tensor& Y);
+
 // FP16 batched linear forward, inference-only. Like linear_forward_batched but
 // FP16 storage throughout.
 //   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.
