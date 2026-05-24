@@ -784,6 +784,14 @@ void sample_logits(const ::brotensor::Tensor& logits, float temperature,
                    int top_k, float top_p, uint64_t key, uint64_t counter,
                    ::brotensor::Tensor& indices);
 
+// ── Counter-based noise generation (Philox 4x32-10) — noise.cpp ──
+void randn(uint64_t key, uint64_t counter, ::brotensor::Tensor& Y);
+void rand_uniform(uint64_t key, uint64_t counter, ::brotensor::Tensor& Y);
+void rand_bernoulli(float p, uint64_t key, uint64_t counter,
+                    ::brotensor::Tensor& Y);
+void randn_truncated(float lo, float hi, uint64_t key, uint64_t counter,
+                     ::brotensor::Tensor& Y);
+
 // ── L2 norm + Gated Delta Rule (linear-attention text path) ──
 //    l2_norm.cpp, gated_delta_rule.cpp
 void l2_norm_forward(const ::brotensor::Tensor& X,
@@ -1107,6 +1115,12 @@ struct CpuStaticRegistrar {
 
         // ── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ──
         ops.sample_logits                = &detail::cpu::sample_logits;
+
+        // ── Counter-based noise generation (Philox 4x32-10) ──
+        ops.randn                        = &detail::cpu::randn;
+        ops.rand_uniform                 = &detail::cpu::rand_uniform;
+        ops.rand_bernoulli               = &detail::cpu::rand_bernoulli;
+        ops.randn_truncated              = &detail::cpu::randn_truncated;
 
         // ── L2 norm + Gated Delta Rule (linear-attention text path) ──
         ops.l2_norm_forward              = &detail::cpu::l2_norm_forward;

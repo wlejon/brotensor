@@ -2255,4 +2255,35 @@ void image_u8_to_f32_nhwc_to_nchw(const uint8_t* src,
     v.image_u8_to_f32_nhwc_to_nchw(src, N, H, W, C, scale, bias, Y);
 }
 
+// ─── Counter-based noise generation (Philox 4x32-10) ───────────────────────
+
+void randn(uint64_t key, uint64_t counter, Tensor& Y) {
+    const auto& v = detail::dispatch(Y);
+    if (!v.randn) detail::throw_not_implemented("randn", Y.device);
+    detail::adopt_output(Y, Y.device);
+    v.randn(key, counter, Y);
+}
+
+void rand_uniform(uint64_t key, uint64_t counter, Tensor& Y) {
+    const auto& v = detail::dispatch(Y);
+    if (!v.rand_uniform) detail::throw_not_implemented("rand_uniform", Y.device);
+    detail::adopt_output(Y, Y.device);
+    v.rand_uniform(key, counter, Y);
+}
+
+void rand_bernoulli(float p, uint64_t key, uint64_t counter, Tensor& Y) {
+    const auto& v = detail::dispatch(Y);
+    if (!v.rand_bernoulli) detail::throw_not_implemented("rand_bernoulli", Y.device);
+    detail::adopt_output(Y, Y.device);
+    v.rand_bernoulli(p, key, counter, Y);
+}
+
+void randn_truncated(float lo, float hi, uint64_t key, uint64_t counter,
+                     Tensor& Y) {
+    const auto& v = detail::dispatch(Y);
+    if (!v.randn_truncated) detail::throw_not_implemented("randn_truncated", Y.device);
+    detail::adopt_output(Y, Y.device);
+    v.randn_truncated(lo, hi, key, counter, Y);
+}
+
 } // namespace brotensor

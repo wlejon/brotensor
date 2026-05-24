@@ -2527,4 +2527,39 @@ void image_u8_to_f32_nhwc_to_nchw(const uint8_t* src,
                                   float scale, float bias,
                                   Tensor& Y);
 
+// ─── Counter-based noise generation (Philox 4x32-10) ───────────────────────
+//
+// PyTorch/JAX-compatible Philox 4x32-10 stream. (key, counter) seeds the
+// stream; element i (row-major linear index) is drawn from substream
+// (counter + i), so the result is reproducible and parallel-safe across
+// backends. The CPU, CUDA and Metal implementations all use the same
+// Philox construction byte-for-byte (see src/cpu/sample_logits.cpp).
+//
+// All four ops require Y FP32 and pre-sized to the desired (rows, cols);
+// no resize is performed.
+
+// Standard normal N(0, 1). One Philox call per element: ctr[0]/ctr[1] form
+// (u1, u2) for one Box-Muller pair; ctr[2..3] are discarded so the per-
+// element substream mapping stays trivial. Use `counter += rows*cols` to
+// advance the stream past a generated tensor.
+void randn(uint64_t key, uint64_t counter, Tensor& Y);
+
+// Uniform U[0, 1). Top 24 bits of ctr[0] / 2^24 — identical to the uniform
+// used inside randn / sample_logits.
+void rand_uniform(uint64_t key, uint64_t counter, Tensor& Y);
+
+// Bernoulli mask: Y[i] = (uniform < p) ? 1.0 : 0.0. p must be in [0, 1].
+// Useful for dropout / stochastic-depth masks.
+void rand_bernoulli(float p, uint64_t key, uint64_t counter, Tensor& Y);
+
+// Truncated standard normal in [lo, hi] (lo < hi required). Rejection
+// sampling on top of Box-Muller; per element, retries advance the substream
+// by rows*cols (so each element's retry stream is independent of every
+// other element's). Capped at 64 retries — for any interval covering at
+// least a couple percent of mass that's failure prob ~10^-50; the final
+// sample is clamped to [lo, hi] as a last-resort safety net.
+void randn_truncated(float lo, float hi,
+                     uint64_t key, uint64_t counter,
+                     Tensor& Y);
+
 } // namespace brotensor

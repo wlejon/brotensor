@@ -547,4 +547,9 @@
                                                        const ::brotensor::Tensor& std_, int N, int C, int H, int W,                             \
                                                        ::brotensor::Tensor& Y))                                                                 \
     X(image_u8_to_f32_nhwc_to_nchw,            void,  (const uint8_t* src, int N, int H, int W, int C,                                          \
-                                                       float scale, float bias, ::brotensor::Tensor& Y))
+                                                       float scale, float bias, ::brotensor::Tensor& Y))                                          \
+    /* ─── Counter-based noise generation (Philox 4x32-10) ─── */                                                                                 \
+    X(randn,                                   void,  (uint64_t key, uint64_t counter, ::brotensor::Tensor& Y))                                   \
+    X(rand_uniform,                            void,  (uint64_t key, uint64_t counter, ::brotensor::Tensor& Y))                                   \
+    X(rand_bernoulli,                          void,  (float p, uint64_t key, uint64_t counter, ::brotensor::Tensor& Y))                          \
+    X(randn_truncated,                         void,  (float lo, float hi, uint64_t key, uint64_t counter, ::brotensor::Tensor& Y))

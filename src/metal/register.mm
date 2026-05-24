@@ -184,6 +184,10 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.pad2d_forward                               = &dm::pad2d_forward;
     ops.quick_gelu_backward                         = &dm::quick_gelu_backward;
     ops.quick_gelu_forward                          = &dm::quick_gelu_forward;
+    ops.rand_bernoulli                              = &dm::rand_bernoulli;
+    ops.rand_uniform                                = &dm::rand_uniform;
+    ops.randn                                       = &dm::randn;
+    ops.randn_truncated                             = &dm::randn_truncated;
     ops.relu_backward                               = &dm::relu_backward;
     ops.relu_backward_batched                       = &dm::relu_backward_batched;
     ops.relu_forward                                = &dm::relu_forward;

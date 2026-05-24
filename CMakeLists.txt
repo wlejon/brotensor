@@ -120,6 +120,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/resample1d.cpp
     src/cpu/log_exp_round.cpp
     src/cpu/sample_logits.cpp
+    src/cpu/noise.cpp
     src/cpu/l2_norm.cpp
     src/cpu/gated_delta_rule.cpp
     src/cpu/spatial_merge.cpp
@@ -200,6 +201,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/codec_quant.cu
         src/cuda/resample1d.cu
         src/cuda/sample_logits.cu
+        src/cuda/noise.cu
         src/cuda/l2_norm.cu
         src/cuda/gated_delta_rule.cu
         src/cuda/spatial_merge.cu
@@ -284,6 +286,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/resample1d.mm
         src/metal/log_exp_round.mm
         src/metal/sample_logits.mm
+        src/metal/noise.mm
         src/metal/l2_norm.mm
         src/metal/gated_delta_rule.mm
         src/metal/spatial_merge.mm
@@ -352,6 +355,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/resample1d.mm
         src/metal/log_exp_round.mm
         src/metal/sample_logits.mm
+        src/metal/noise.mm
         src/metal/l2_norm.mm
         src/metal/gated_delta_rule.mm
         src/metal/spatial_merge.mm
