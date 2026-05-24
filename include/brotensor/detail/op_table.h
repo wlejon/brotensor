@@ -196,6 +196,9 @@
                                                        ::brotensor::Tensor& Y, ::brotensor::Tensor& Idx))                                                               \
     X(max_pool2d_backward,                     void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& Idx,                                                  \
                                                        int N, int C, int H, int W, int H_out, int W_out, ::brotensor::Tensor& dX))                                     \
+    /* ─── Row gather / scatter-add (general 2D — superset of embedding_lookup) ─── */                                                                                  \
+    X(gather_rows,                             void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Idx, ::brotensor::Tensor& Y))                          \
+    X(scatter_rows_add,                        void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& Idx, int R, ::brotensor::Tensor& dX))                 \
     /* ─── FP16 linear (inference-only) + GEGLU family ─── */                                                                                                           \
     X(linear_forward_batched_fp16,             void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
                                                        ::brotensor::Tensor& Y_BD))                                                                                      \

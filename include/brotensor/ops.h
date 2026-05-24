@@ -851,6 +851,31 @@ void max_pool2d_backward(const Tensor& dY, const Tensor& Idx,
                          int N, int C, int H, int W, int H_out, int W_out,
                          Tensor& dX);
 
+// Gather rows of X by index (the general "look up these rows of this 2D
+// tensor" op). Same compute as embedding_lookup_forward but takes Idx as
+// a Tensor instead of a raw pointer + length, so it routes through the
+// normal dispatcher and is usable on any backend. Used by SAM's prompt
+// encoder (point indices → positional embeddings), DETR object queries,
+// per-row attention reorderings, etc.
+//   X:   (R, C) FP32.
+//   Idx: (M, 1) INT32 with values in [0, R).
+//   Y:   (M, C) FP32, resized + dtype-set.
+// An OOB Idx value triggers undefined behavior — caller owns the bounds.
+// (Validating each index on the CPU would dominate the run time and the
+// GPU port can't afford it; aligns with embedding_lookup's contract.)
+void gather_rows(const Tensor& X, const Tensor& Idx, Tensor& Y);
+
+// Adjoint of gather_rows: scatter-add each dY row into the dX row named by
+// Idx. dX is OVERWRITTEN — it's zeroed first, then dY rows are summed onto
+// their dX[Idx[m]] target. Duplicate indices in Idx accumulate (the same
+// behavior as embedding_lookup_backward). R is the output's row count
+// (i.e. the original X.rows from the forward call — not derivable from
+// dY or Idx alone).
+//   dY:  (M, C) FP32.
+//   Idx: (M, 1) INT32.
+//   dX:  (R, C) FP32, resized + dtype-set.
+void scatter_rows_add(const Tensor& dY, const Tensor& Idx, int R, Tensor& dX);
+
 // FP16 batched linear forward, inference-only. Like linear_forward_batched but
 // FP16 storage throughout.
 //   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.

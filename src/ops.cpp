@@ -903,6 +903,20 @@ void max_pool2d_backward(const Tensor& dY, const Tensor& Idx,
     v.max_pool2d_backward(dY, Idx, N, C, H, W, H_out, W_out, dX);
 }
 
+void gather_rows(const Tensor& X, const Tensor& Idx, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Idx, Y);
+    if (!v.gather_rows) detail::throw_not_implemented("gather_rows", X.device);
+    detail::adopt_output(Y, X.device);
+    v.gather_rows(X, Idx, Y);
+}
+void scatter_rows_add(const Tensor& dY, const Tensor& Idx, int R, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, Idx, dX);
+    if (!v.scatter_rows_add)
+        detail::throw_not_implemented("scatter_rows_add", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.scatter_rows_add(dY, Idx, R, dX);
+}
+
 // ─── FP16 linear + GEGLU ───────────────────────────────────────────────────
 
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,

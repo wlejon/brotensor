@@ -337,6 +337,12 @@ void max_pool2d_backward(const ::brotensor::Tensor& dY,
                          const ::brotensor::Tensor& Idx,
                          int N, int C, int H, int W, int H_out, int W_out,
                          ::brotensor::Tensor& dX);
+void gather_rows(const ::brotensor::Tensor& X,
+                 const ::brotensor::Tensor& Idx,
+                 ::brotensor::Tensor& Y);
+void scatter_rows_add(const ::brotensor::Tensor& dY,
+                      const ::brotensor::Tensor& Idx, int R,
+                      ::brotensor::Tensor& dX);
 void nchw_to_sequence(const ::brotensor::Tensor& X,
                       int N, int C, int H, int W, ::brotensor::Tensor& Y);
 void sequence_to_nchw(const ::brotensor::Tensor& X,
@@ -911,6 +917,8 @@ struct CpuStaticRegistrar {
         ops.adaptive_avg_pool2d_backward = &detail::cpu::adaptive_avg_pool2d_backward;
         ops.max_pool2d_forward           = &detail::cpu::max_pool2d_forward;
         ops.max_pool2d_backward          = &detail::cpu::max_pool2d_backward;
+        ops.gather_rows                  = &detail::cpu::gather_rows;
+        ops.scatter_rows_add             = &detail::cpu::scatter_rows_add;
         ops.nchw_to_sequence             = &detail::cpu::nchw_to_sequence;
         ops.sequence_to_nchw             = &detail::cpu::sequence_to_nchw;
         ops.ddim_step                    = &detail::cpu::ddim_step;
