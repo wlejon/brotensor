@@ -183,6 +183,8 @@
                                                        int h0, int w0, int H_out, int W_out, ::brotensor::Tensor& Y))                                                  \
     X(slice2d_backward,                        void,  (const ::brotensor::Tensor& dY, int N, int C, int H, int W,                                                      \
                                                        int h0, int w0, int H_out, int W_out, ::brotensor::Tensor& dX))                                                 \
+    /* ─── Per-row top-k (descending values + int32 indices) ─── */                                                                                                     \
+    X(top_k_rows,                              void,  (const ::brotensor::Tensor& X, int k, ::brotensor::Tensor& Vals, ::brotensor::Tensor& Idx))                       \
     /* ─── FP16 linear (inference-only) + GEGLU family ─── */                                                                                                           \
     X(linear_forward_batched_fp16,             void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
                                                        ::brotensor::Tensor& Y_BD))                                                                                      \

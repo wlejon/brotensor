@@ -792,6 +792,16 @@ void slice2d_forward(const Tensor& X, int N, int C, int H, int W,
 void slice2d_backward(const Tensor& dY, int N, int C, int H, int W,
                       int h0, int w0, int H_out, int W_out, Tensor& dX);
 
+// Per-row top-k. For each row of X: select the k largest values, returning
+// them in descending order in `Vals` with their column indices in `Idx`.
+// Ties broken by smaller column index. The companion to argmax_rows for
+// classification heads (top-5), NMS pre-filter, and beam-search candidates.
+//   X:    (R, C) FP32.
+//   Vals: (R, k) FP32 (resized + dtype-set).
+//   Idx:  (R, k) INT32 (resized + dtype-set).
+// k > C or k < 1 throws. Not differentiable — no backward.
+void top_k_rows(const Tensor& X, int k, Tensor& Vals, Tensor& Idx);
+
 // FP16 batched linear forward, inference-only. Like linear_forward_batched but
 // FP16 storage throughout.
 //   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.

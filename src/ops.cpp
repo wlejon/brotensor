@@ -857,6 +857,14 @@ void slice2d_backward(const Tensor& dY, int N, int C, int H, int W,
     v.slice2d_backward(dY, N, C, H, W, h0, w0, H_out, W_out, dX);
 }
 
+void top_k_rows(const Tensor& X, int k, Tensor& Vals, Tensor& Idx) {
+    const auto& v = detail::dispatch(X, Vals, Idx);
+    if (!v.top_k_rows) detail::throw_not_implemented("top_k_rows", X.device);
+    detail::adopt_output(Vals, X.device);
+    detail::adopt_output(Idx, X.device);
+    v.top_k_rows(X, k, Vals, Idx);
+}
+
 // ─── FP16 linear + GEGLU ───────────────────────────────────────────────────
 
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
