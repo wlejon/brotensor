@@ -164,6 +164,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/group_norm.cu
         src/cuda/resample.cu
         src/cuda/interp2d.cu
+        src/cuda/pool2d.cu
         src/cuda/cross_attention.cu
         src/cuda/cross_attention_with_attn.cu
         src/cuda/attention_moments.cu
