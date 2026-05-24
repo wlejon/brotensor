@@ -99,11 +99,31 @@ __global__ void tanh_backward_kernel(const float* __restrict__ y,
     }
 }
 
-__global__ void sigmoid_forward_kernel(const float* __restrict__ x,
-                                       float* __restrict__ y, int n) {
+__device__ inline float sigmoid_scalar(float v) {
+    return 1.0f / (1.0f + expf(-v));
+}
+
+__global__ void sigmoid_forward_fp32_kernel(const float* __restrict__ x,
+                                            float* __restrict__ y, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += blockDim.x * gridDim.x) {
-        y[i] = 1.0f / (1.0f + expf(-x[i]));
+        y[i] = sigmoid_scalar(x[i]);
+    }
+}
+
+__global__ void sigmoid_forward_fp16_kernel(const __half* __restrict__ x,
+                                            __half* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2half(sigmoid_scalar(__half2float(x[i])));
+    }
+}
+
+__global__ void sigmoid_forward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                            __nv_bfloat16* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2bfloat16(sigmoid_scalar(__bfloat162float(x[i])));
     }
 }
 
@@ -788,12 +808,24 @@ void tanh_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
 }
 
 void sigmoid_forward(const Tensor& x, Tensor& y) {
-    if (y.rows != x.rows || y.cols != x.cols) y.resize(x.rows, x.cols);
+    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
+        y.resize(x.rows, x.cols, x.dtype);
+    }
     const int n = x.size();
     if (n == 0) return;
-    sigmoid_forward_kernel<<<grid_for(n), EW_BLOCK>>>(
-        static_cast<const float*>(x.data),
-        static_cast<float*>(y.data), n);
+    if (x.dtype == Dtype::FP16) {
+        sigmoid_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __half*>(x.data),
+            static_cast<__half*>(y.data), n);
+    } else if (x.dtype == Dtype::BF16) {
+        sigmoid_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<__nv_bfloat16*>(y.data), n);
+    } else {
+        sigmoid_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(x.data),
+            static_cast<float*>(y.data), n);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
