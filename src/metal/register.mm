@@ -132,6 +132,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.irfft_backward                              = &dm::irfft_backward;
     ops.istft                                       = &dm::istft;
     ops.istft_backward                              = &dm::istft_backward;
+    ops.interp2d_backward                           = &dm::interp2d_backward;
+    ops.interp2d_forward                            = &dm::interp2d_forward;
     ops.kv_cache_append                             = &dm::kv_cache_append;
     ops.l2_norm_backward                            = &dm::l2_norm_backward;
     ops.l2_norm_forward                             = &dm::l2_norm_forward;

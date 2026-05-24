@@ -42,6 +42,8 @@ void fill_cuda_vtable_l2_norm        (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_gated_delta_rule(::brotensor::detail::OpsVTable&);
 // ── Qwen3-VL polish (spatial_merge_2x2 + M-RoPE) — rope_mrope.cu ──
 void fill_cuda_vtable_qwen3_vl_polish(::brotensor::detail::OpsVTable&);
+// ── Vision-encoder arbitrary-scale 2D resample (SAM / DPT / depth) ──
+void fill_cuda_vtable_interp2d       (::brotensor::detail::OpsVTable&);
 
 // ── alloc table (defined in tensor.cu) ──
 const ::brotensor::detail::AllocVTable& cuda_alloc_table();
@@ -88,6 +90,7 @@ extern "C" void brotensor_probe_and_register_cuda() {
     dc::fill_cuda_vtable_l2_norm(ops);
     dc::fill_cuda_vtable_gated_delta_rule(ops);
     dc::fill_cuda_vtable_qwen3_vl_polish(ops);
+    dc::fill_cuda_vtable_interp2d(ops);
 
     ::brotensor::detail::register_backend(Device::CUDA, ops, dc::cuda_alloc_table());
 }

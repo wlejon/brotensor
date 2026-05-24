@@ -716,6 +716,40 @@ void downsample_avg_2x_backward(const Tensor& dY,
                                 int N, int C, int H, int W,
                                 Tensor& dX);
 
+// Arbitrary-scale 2D spatial resample, NCHW, align_corners=False (half-pixel).
+// The general counterpart to the fixed-2x upsample_*_2x family — use those
+// when scale is exactly 2 (they're cheaper); use this for anything else
+// (SAM 1024->64, DPT 4x upsample, depth-anything head, etc.).
+//
+// For output position (oh, ow) the source coordinate is
+//   src_y = (oh + 0.5) * (H_in / H_out) - 0.5
+//   src_x = (ow + 0.5) * (W_in / W_out) - 0.5
+//   mode == 0  nearest  — round_half_to_even then clamp to border.
+//   mode == 1  bilinear — 2x2 tap weighted blend with border-clamped indices.
+//   mode == 2  bicubic  — 4x4 Catmull-Rom (a = -0.5) tap, border-clamped.
+//
+// H_in / W_in / H_out / W_out may be any non-negative ints; H_out==H_in and
+// W_out==W_in is the identity. Modes other than 0/1/2 throw. Dispatched
+// FP32/FP16 on X.dtype where the backend supports it (CPU is FP32-only);
+// Y resized + dtype-set to match X.
+//   X: (N, C*H_in*W_in).  Y: (N, C*H_out*W_out).
+void interp2d_forward(const Tensor& X,
+                      int N, int C, int H_in, int W_in, int H_out, int W_out,
+                      int mode, Tensor& Y);
+
+// Backward (adjoint) of interp2d_forward. Scatters each dY pixel onto the
+// input position(s) it sampled, with the forward's weights:
+//   nearest:  dX[round_src] += dY[dst]
+//   bilinear: 4 taps with the 2x2 bilinear weights
+// dX is OVERWRITTEN (zero-then-scatter — resampling has no learnable params).
+// mode == 2 (bicubic) is not supported for backward and throws "not
+// implemented" — bicubic upsamplers are inference-only in practice.
+// N, C, H_in, W_in, H_out, W_out, mode match the forward call.
+//   dY: (N, C*H_out*W_out).  dX: (N, C*H_in*W_in), resized + dtype-set to dY.
+void interp2d_backward(const Tensor& dY,
+                       int N, int C, int H_in, int W_in, int H_out, int W_out,
+                       int mode, Tensor& dX);
+
 // FP16 batched linear forward, inference-only. Like linear_forward_batched but
 // FP16 storage throughout.
 //   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.

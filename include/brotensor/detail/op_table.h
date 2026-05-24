@@ -166,6 +166,11 @@
     X(upsample_nearest_2x_backward,            void,  (const ::brotensor::Tensor& dY, int N, int C, int H, int W, ::brotensor::Tensor& dX))                             \
     X(upsample_bilinear_2x_backward,           void,  (const ::brotensor::Tensor& dY, int N, int C, int H, int W, ::brotensor::Tensor& dX))                             \
     X(downsample_avg_2x_backward,              void,  (const ::brotensor::Tensor& dY, int N, int C, int H, int W, ::brotensor::Tensor& dX))                             \
+    /* ─── Arbitrary-scale 2D resample (nearest / bilinear / bicubic) ─── */                                                                                            \
+    X(interp2d_forward,                        void,  (const ::brotensor::Tensor& X, int N, int C, int H_in, int W_in, int H_out, int W_out, int mode,                 \
+                                                       ::brotensor::Tensor& Y))                                                                                         \
+    X(interp2d_backward,                       void,  (const ::brotensor::Tensor& dY, int N, int C, int H_in, int W_in, int H_out, int W_out, int mode,                \
+                                                       ::brotensor::Tensor& dX))                                                                                        \
     /* ─── FP16 linear (inference-only) + GEGLU family ─── */                                                                                                           \
     X(linear_forward_batched_fp16,             void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
                                                        ::brotensor::Tensor& Y_BD))                                                                                      \

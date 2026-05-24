@@ -808,6 +808,23 @@ void downsample_avg_2x_backward(const Tensor& dY, int N, int C, int H, int W, Te
     v.downsample_avg_2x_backward(dY, N, C, H, W, dX);
 }
 
+void interp2d_forward(const Tensor& X,
+                      int N, int C, int H_in, int W_in, int H_out, int W_out,
+                      int mode, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.interp2d_forward) detail::throw_not_implemented("interp2d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.interp2d_forward(X, N, C, H_in, W_in, H_out, W_out, mode, Y);
+}
+void interp2d_backward(const Tensor& dY,
+                       int N, int C, int H_in, int W_in, int H_out, int W_out,
+                       int mode, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, dX);
+    if (!v.interp2d_backward) detail::throw_not_implemented("interp2d_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.interp2d_backward(dY, N, C, H_in, W_in, H_out, W_out, mode, dX);
+}
+
 // ─── FP16 linear + GEGLU ───────────────────────────────────────────────────
 
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,

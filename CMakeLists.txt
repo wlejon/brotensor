@@ -93,6 +93,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/conv3d.cpp
     src/cpu/group_norm.cpp
     src/cpu/resample.cpp
+    src/cpu/interp2d.cpp
     src/cpu/transpose.cpp
     src/cpu/diffusion_samplers.cpp
     src/cpu/kv_cache.cpp
@@ -153,6 +154,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/linear_int8w_wmma.cu
         src/cuda/group_norm.cu
         src/cuda/resample.cu
+        src/cuda/interp2d.cu
         src/cuda/cross_attention.cu
         src/cuda/cross_attention_with_attn.cu
         src/cuda/attention_moments.cu
@@ -232,6 +234,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/conv3d.mm
         src/metal/group_norm.mm
         src/metal/resample.mm
+        src/metal/interp2d.mm
         src/metal/cross_attention.mm
         src/metal/cross_attention_with_attn.mm
         src/metal/attention_moments.mm
@@ -290,6 +293,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/conv3d.mm
         src/metal/group_norm.mm
         src/metal/resample.mm
+        src/metal/interp2d.mm
         src/metal/cross_attention.mm
         src/metal/cross_attention_with_attn.mm
         src/metal/attention_moments.mm

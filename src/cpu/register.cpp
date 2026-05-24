@@ -294,6 +294,14 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
 void downsample_avg_2x_backward(const ::brotensor::Tensor& dY,
                                 int N, int C, int H, int W,
                                 ::brotensor::Tensor& dX);
+void interp2d_forward(const ::brotensor::Tensor& X,
+                      int N, int C, int H_in, int W_in,
+                      int H_out, int W_out, int mode,
+                      ::brotensor::Tensor& Y);
+void interp2d_backward(const ::brotensor::Tensor& dY,
+                       int N, int C, int H_in, int W_in,
+                       int H_out, int W_out, int mode,
+                       ::brotensor::Tensor& dX);
 void nchw_to_sequence(const ::brotensor::Tensor& X,
                       int N, int C, int H, int W, ::brotensor::Tensor& Y);
 void sequence_to_nchw(const ::brotensor::Tensor& X,
@@ -857,6 +865,8 @@ struct CpuStaticRegistrar {
         ops.upsample_bilinear_2x_backward
                                          = &detail::cpu::upsample_bilinear_2x_backward;
         ops.downsample_avg_2x_backward   = &detail::cpu::downsample_avg_2x_backward;
+        ops.interp2d_forward             = &detail::cpu::interp2d_forward;
+        ops.interp2d_backward            = &detail::cpu::interp2d_backward;
         ops.nchw_to_sequence             = &detail::cpu::nchw_to_sequence;
         ops.sequence_to_nchw             = &detail::cpu::sequence_to_nchw;
         ops.ddim_step                    = &detail::cpu::ddim_step;

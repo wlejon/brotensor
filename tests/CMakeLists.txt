@@ -45,6 +45,7 @@ brotensor_add_test(brotensor_test_conv3d test_conv3d.cpp)
 brotensor_add_test(brotensor_test_flash_attention_varlen test_flash_attention_varlen.cpp)
 brotensor_add_test(brotensor_test_spatial_merge test_spatial_merge.cpp)
 brotensor_add_test(brotensor_test_rope_mrope test_rope_mrope.cpp)
+brotensor_add_test(brotensor_test_interp2d test_interp2d.cpp)
 
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)
@@ -108,6 +109,7 @@ if(BROTENSOR_HAS_GPU)
         fft stft
         conv1d vocoder
         codec_quant resample1d log_exp_round sample_logits
+        interp2d
         l2_norm gated_delta_rule
     )
     foreach(_name IN LISTS _brotensor_parity_tests)
