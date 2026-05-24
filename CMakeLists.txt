@@ -158,6 +158,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/batched_ops.cu
         src/cuda/conv2d.cu
         src/cuda/conv2d_wmma.cu
+        src/cuda/conv_transpose2d.cu
         src/cuda/conv3d.cu
         src/cuda/conv2d_int8w_wmma.cu
         src/cuda/linear_int8w_wmma.cu
