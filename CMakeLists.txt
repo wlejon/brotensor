@@ -295,6 +295,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/gather_rows.mm
         src/metal/conv_transpose2d.mm
         src/metal/window_partition.mm
+        src/metal/batch_norm.mm
+        src/metal/image_preproc.mm
         src/metal/register.mm
     )
     set_source_files_properties(
@@ -361,6 +363,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/gather_rows.mm
         src/metal/conv_transpose2d.mm
         src/metal/window_partition.mm
+        src/metal/batch_norm.mm
+        src/metal/image_preproc.mm
         src/metal/register.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"

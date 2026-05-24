@@ -52,6 +52,9 @@ extern "C" void brotensor_probe_and_register_metal() {
 
     ops.adam_step                                   = &dm::adam_step;
     ops.adaptive_avg_pool2d_backward                = &dm::adaptive_avg_pool2d_backward;
+    ops.batch_norm_backward                         = &dm::batch_norm_backward;
+    ops.batch_norm_forward                          = &dm::batch_norm_forward;
+    ops.batch_norm_inference                        = &dm::batch_norm_inference;
     ops.adaptive_avg_pool2d_forward                 = &dm::adaptive_avg_pool2d_forward;
     ops.add_inplace                                 = &dm::add_inplace;
     ops.add_inplace_batched                         = &dm::add_inplace_batched;
@@ -135,6 +138,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.group_norm_backward                         = &dm::group_norm_backward;
     ops.group_norm_forward                          = &dm::group_norm_forward;
     ops.ifft                                        = &dm::ifft;
+    ops.image_normalize                             = &dm::image_normalize;
+    ops.image_u8_to_f32_nhwc_to_nchw                = &dm::image_u8_to_f32_nhwc_to_nchw;
     ops.irfft                                       = &dm::irfft;
     ops.irfft_backward                              = &dm::irfft_backward;
     ops.istft                                       = &dm::istft;
