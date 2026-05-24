@@ -876,6 +876,60 @@ void gather_rows(const Tensor& X, const Tensor& Idx, Tensor& Y);
 //   dX:  (R, C) FP32, resized + dtype-set.
 void scatter_rows_add(const Tensor& dY, const Tensor& Idx, int R, Tensor& dX);
 
+// 2D transposed convolution, NCHW. The 2D counterpart of conv_transpose1d,
+// generalising independently across H and W. Used by SAM's mask decoder
+// (4x upsampler), DPT depth heads, and any segmentation decoder that
+// learns the upsample. Output spatial dims (torch ConvTranspose2d formula):
+//   H_out = (H - 1)*stride_h - 2*pad_h + dilation_h*(kH-1) + output_padding_h + 1
+//   W_out = (W - 1)*stride_w - 2*pad_w + dilation_w*(kW-1) + output_padding_w + 1
+// Weight layout is input-channel-major (transposed-conv convention):
+//   Wt: (C_in, (C_out/groups)*kH*kW) with index
+//       (c_in*(Cg_out*kH*kW) + (oc_local*kH + kh)*kW + kw)
+// bias may be null. groups must divide both C_in and C_out (default 1).
+// output_padding must be < stride or < dilation on each axis (matches torch).
+//   X: (N, C_in*H*W).  Y: (N, C_out*H_out*W_out), resized + dtype-set.
+// CPU FP32-only first chunk; GPU follow-ups TBD.
+void conv_transpose2d_forward(const Tensor& X, const Tensor& Wt,
+                              const Tensor* bias,
+                              int N, int C_in, int H, int W,
+                              int C_out, int kH, int kW,
+                              int stride_h, int stride_w,
+                              int pad_h, int pad_w,
+                              int output_padding_h, int output_padding_w,
+                              int dil_h, int dil_w, int groups,
+                              Tensor& Y);
+
+// Backward to the input. dX OVERWRITTEN — the adjoint of the forward
+// scatter is a plain gather conv (cross-correlation in disguise).
+//   Wt: (C_in, (C_out/groups)*kH*kW).  dY: (N, C_out*H_out*W_out).
+//   dX: (N, C_in*H*W), resized + dtype-set.
+void conv_transpose2d_backward_input(const Tensor& Wt, const Tensor& dY,
+                                     int N, int C_in, int H, int W,
+                                     int C_out, int kH, int kW,
+                                     int stride_h, int stride_w,
+                                     int pad_h, int pad_w,
+                                     int output_padding_h, int output_padding_w,
+                                     int dil_h, int dil_w, int groups,
+                                     Tensor& dX);
+
+// Backward to the weights. dWt ACCUMULATES (+=) — caller zeros it first
+// (matches the conv2d contract).
+//   X: (N, C_in*H*W).  dY: (N, C_out*H_out*W_out).
+//   dWt: (C_in, (C_out/groups)*kH*kW), pre-zeroed by caller.
+void conv_transpose2d_backward_weight(const Tensor& X, const Tensor& dY,
+                                      int N, int C_in, int H, int W,
+                                      int C_out, int kH, int kW,
+                                      int stride_h, int stride_w,
+                                      int pad_h, int pad_w,
+                                      int output_padding_h, int output_padding_w,
+                                      int dil_h, int dil_w, int groups,
+                                      Tensor& dWt);
+
+// Backward to the bias. dB ACCUMULATES (+=) — caller zeros first.
+//   dY: (N, C_out*H_out*W_out).  dB: (C_out, 1).
+void conv_transpose2d_backward_bias(const Tensor& dY, int N, int C_out,
+                                    int H_out, int W_out, Tensor& dB);
+
 // FP16 batched linear forward, inference-only. Like linear_forward_batched but
 // FP16 storage throughout.
 //   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.

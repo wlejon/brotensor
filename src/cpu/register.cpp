@@ -343,6 +343,37 @@ void gather_rows(const ::brotensor::Tensor& X,
 void scatter_rows_add(const ::brotensor::Tensor& dY,
                       const ::brotensor::Tensor& Idx, int R,
                       ::brotensor::Tensor& dX);
+void conv_transpose2d_forward(const ::brotensor::Tensor& X,
+                              const ::brotensor::Tensor& Wt,
+                              const ::brotensor::Tensor* bias,
+                              int N, int C_in, int H, int W,
+                              int C_out, int kH, int kW,
+                              int stride_h, int stride_w,
+                              int pad_h, int pad_w,
+                              int output_padding_h, int output_padding_w,
+                              int dil_h, int dil_w, int groups,
+                              ::brotensor::Tensor& Y);
+void conv_transpose2d_backward_input(const ::brotensor::Tensor& Wt,
+                                     const ::brotensor::Tensor& dY,
+                                     int N, int C_in, int H, int W,
+                                     int C_out, int kH, int kW,
+                                     int stride_h, int stride_w,
+                                     int pad_h, int pad_w,
+                                     int output_padding_h, int output_padding_w,
+                                     int dil_h, int dil_w, int groups,
+                                     ::brotensor::Tensor& dX);
+void conv_transpose2d_backward_weight(const ::brotensor::Tensor& X,
+                                      const ::brotensor::Tensor& dY,
+                                      int N, int C_in, int H, int W,
+                                      int C_out, int kH, int kW,
+                                      int stride_h, int stride_w,
+                                      int pad_h, int pad_w,
+                                      int output_padding_h, int output_padding_w,
+                                      int dil_h, int dil_w, int groups,
+                                      ::brotensor::Tensor& dWt);
+void conv_transpose2d_backward_bias(const ::brotensor::Tensor& dY,
+                                    int N, int C_out, int H_out, int W_out,
+                                    ::brotensor::Tensor& dB);
 void nchw_to_sequence(const ::brotensor::Tensor& X,
                       int N, int C, int H, int W, ::brotensor::Tensor& Y);
 void sequence_to_nchw(const ::brotensor::Tensor& X,
@@ -919,6 +950,13 @@ struct CpuStaticRegistrar {
         ops.max_pool2d_backward          = &detail::cpu::max_pool2d_backward;
         ops.gather_rows                  = &detail::cpu::gather_rows;
         ops.scatter_rows_add             = &detail::cpu::scatter_rows_add;
+        ops.conv_transpose2d_forward     = &detail::cpu::conv_transpose2d_forward;
+        ops.conv_transpose2d_backward_input
+                                         = &detail::cpu::conv_transpose2d_backward_input;
+        ops.conv_transpose2d_backward_weight
+                                         = &detail::cpu::conv_transpose2d_backward_weight;
+        ops.conv_transpose2d_backward_bias
+                                         = &detail::cpu::conv_transpose2d_backward_bias;
         ops.nchw_to_sequence             = &detail::cpu::nchw_to_sequence;
         ops.sequence_to_nchw             = &detail::cpu::sequence_to_nchw;
         ops.ddim_step                    = &detail::cpu::ddim_step;

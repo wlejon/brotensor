@@ -917,6 +917,67 @@ void scatter_rows_add(const Tensor& dY, const Tensor& Idx, int R, Tensor& dX) {
     v.scatter_rows_add(dY, Idx, R, dX);
 }
 
+void conv_transpose2d_forward(const Tensor& X, const Tensor& Wt,
+                              const Tensor* bias,
+                              int N, int C_in, int H, int W,
+                              int C_out, int kH, int kW,
+                              int stride_h, int stride_w,
+                              int pad_h, int pad_w,
+                              int output_padding_h, int output_padding_w,
+                              int dil_h, int dil_w, int groups,
+                              Tensor& Y) {
+    const auto& v = detail::dispatch(X, Wt, Y);
+    if (!v.conv_transpose2d_forward)
+        detail::throw_not_implemented("conv_transpose2d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.conv_transpose2d_forward(X, Wt, bias, N, C_in, H, W, C_out, kH, kW,
+                               stride_h, stride_w, pad_h, pad_w,
+                               output_padding_h, output_padding_w,
+                               dil_h, dil_w, groups, Y);
+}
+void conv_transpose2d_backward_input(const Tensor& Wt, const Tensor& dY,
+                                     int N, int C_in, int H, int W,
+                                     int C_out, int kH, int kW,
+                                     int stride_h, int stride_w,
+                                     int pad_h, int pad_w,
+                                     int output_padding_h, int output_padding_w,
+                                     int dil_h, int dil_w, int groups,
+                                     Tensor& dX) {
+    const auto& v = detail::dispatch(Wt, dY, dX);
+    if (!v.conv_transpose2d_backward_input)
+        detail::throw_not_implemented("conv_transpose2d_backward_input", Wt.device);
+    detail::adopt_output(dX, Wt.device);
+    v.conv_transpose2d_backward_input(Wt, dY, N, C_in, H, W, C_out, kH, kW,
+                                      stride_h, stride_w, pad_h, pad_w,
+                                      output_padding_h, output_padding_w,
+                                      dil_h, dil_w, groups, dX);
+}
+void conv_transpose2d_backward_weight(const Tensor& X, const Tensor& dY,
+                                      int N, int C_in, int H, int W,
+                                      int C_out, int kH, int kW,
+                                      int stride_h, int stride_w,
+                                      int pad_h, int pad_w,
+                                      int output_padding_h, int output_padding_w,
+                                      int dil_h, int dil_w, int groups,
+                                      Tensor& dWt) {
+    const auto& v = detail::dispatch(X, dY, dWt);
+    if (!v.conv_transpose2d_backward_weight)
+        detail::throw_not_implemented("conv_transpose2d_backward_weight", X.device);
+    detail::adopt_output(dWt, X.device);
+    v.conv_transpose2d_backward_weight(X, dY, N, C_in, H, W, C_out, kH, kW,
+                                       stride_h, stride_w, pad_h, pad_w,
+                                       output_padding_h, output_padding_w,
+                                       dil_h, dil_w, groups, dWt);
+}
+void conv_transpose2d_backward_bias(const Tensor& dY, int N, int C_out,
+                                    int H_out, int W_out, Tensor& dB) {
+    const auto& v = detail::dispatch(dY, dB);
+    if (!v.conv_transpose2d_backward_bias)
+        detail::throw_not_implemented("conv_transpose2d_backward_bias", dY.device);
+    detail::adopt_output(dB, dY.device);
+    v.conv_transpose2d_backward_bias(dY, N, C_out, H_out, W_out, dB);
+}
+
 // ─── FP16 linear + GEGLU ───────────────────────────────────────────────────
 
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,

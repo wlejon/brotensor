@@ -199,6 +199,26 @@
     /* ─── Row gather / scatter-add (general 2D — superset of embedding_lookup) ─── */                                                                                  \
     X(gather_rows,                             void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Idx, ::brotensor::Tensor& Y))                          \
     X(scatter_rows_add,                        void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& Idx, int R, ::brotensor::Tensor& dX))                 \
+    /* ─── 2D transposed convolution (NCHW) — forward + three backwards ─── */                                                                                          \
+    X(conv_transpose2d_forward,                void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wt, const ::brotensor::Tensor* bias,                    \
+                                                       int N, int C_in, int H, int W, int C_out, int kH, int kW,                                                        \
+                                                       int stride_h, int stride_w, int pad_h, int pad_w,                                                                \
+                                                       int output_padding_h, int output_padding_w,                                                                      \
+                                                       int dil_h, int dil_w, int groups,                                                                                \
+                                                       ::brotensor::Tensor& Y))                                                                                         \
+    X(conv_transpose2d_backward_input,         void,  (const ::brotensor::Tensor& Wt, const ::brotensor::Tensor& dY,                                                    \
+                                                       int N, int C_in, int H, int W, int C_out, int kH, int kW,                                                        \
+                                                       int stride_h, int stride_w, int pad_h, int pad_w,                                                                \
+                                                       int output_padding_h, int output_padding_w,                                                                      \
+                                                       int dil_h, int dil_w, int groups,                                                                                \
+                                                       ::brotensor::Tensor& dX))                                                                                        \
+    X(conv_transpose2d_backward_weight,        void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& dY,                                                     \
+                                                       int N, int C_in, int H, int W, int C_out, int kH, int kW,                                                        \
+                                                       int stride_h, int stride_w, int pad_h, int pad_w,                                                                \
+                                                       int output_padding_h, int output_padding_w,                                                                      \
+                                                       int dil_h, int dil_w, int groups,                                                                                \
+                                                       ::brotensor::Tensor& dWt))                                                                                       \
+    X(conv_transpose2d_backward_bias,          void,  (const ::brotensor::Tensor& dY, int N, int C_out, int H_out, int W_out, ::brotensor::Tensor& dB))                 \
     /* ─── FP16 linear (inference-only) + GEGLU family ─── */                                                                                                           \
     X(linear_forward_batched_fp16,             void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
                                                        ::brotensor::Tensor& Y_BD))                                                                                      \

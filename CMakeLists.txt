@@ -99,6 +99,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/top_k.cpp
     src/cpu/pool2d.cpp
     src/cpu/gather_rows.cpp
+    src/cpu/conv_transpose2d.cpp
     src/cpu/transpose.cpp
     src/cpu/diffusion_samplers.cpp
     src/cpu/kv_cache.cpp
