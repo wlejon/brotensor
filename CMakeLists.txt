@@ -167,6 +167,9 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/pool2d.cu
         src/cuda/pad2d.cu
         src/cuda/slice2d.cu
+        src/cuda/gather_scatter.cu
+        src/cuda/top_k.cu
+        src/cuda/window_partition.cu
         src/cuda/cross_attention.cu
         src/cuda/cross_attention_with_attn.cu
         src/cuda/attention_moments.cu
