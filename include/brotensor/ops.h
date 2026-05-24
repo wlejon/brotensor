@@ -802,6 +802,55 @@ void slice2d_backward(const Tensor& dY, int N, int C, int H, int W,
 // k > C or k < 1 throws. Not differentiable — no backward.
 void top_k_rows(const Tensor& X, int k, Tensor& Vals, Tensor& Idx);
 
+// Adaptive 2D average pool, NCHW. Each output pixel averages the input
+// region defined by PyTorch's adaptive-pool formula:
+//   start_h(oh) = floor(oh     * H / H_out)
+//   end_h(oh)   = ceil ((oh+1) * H / H_out)
+// (and same for W). The region size varies across output pixels when the
+// spatial dims don't divide evenly. Used by SegFormer / Mask2Former
+// decoder-side aggregation and detection-head global pooling.
+//   X: (N, C*H*W).  Y: (N, C*H_out*W_out), resized + dtype-set to X.
+// CPU FP32-only first chunk; GPU follow-ups TBD.
+void adaptive_avg_pool2d_forward(const Tensor& X, int N, int C, int H, int W,
+                                 int H_out, int W_out, Tensor& Y);
+
+// Backward (adjoint) of adaptive_avg_pool2d: each input pixel accumulates
+// (dY[oh, ow] / region_size(oh, ow)) for every output region that contained
+// it. dX OVERWRITTEN (zeroed first, then scatter-added).
+//   dY: (N, C*H_out*W_out).  dX: (N, C*H*W).
+void adaptive_avg_pool2d_backward(const Tensor& dY, int N, int C, int H, int W,
+                                  int H_out, int W_out, Tensor& dX);
+
+// 2D max pool, NCHW. Standard CV pooling with kernel, stride, and padding.
+// Padding pixels are treated as -inf so they never win the max (no special
+// case downstream). Output spatial size:
+//   H_out = (H + 2*pad_h - kH) / stride_h + 1
+//   W_out = (W + 2*pad_w - kW) / stride_w + 1
+// Returns Y AND a per-output INT32 index into the per-channel flat input
+// spatial plane (Idx[n, c, oh, ow] == in_h * W + in_w of the winning pixel),
+// so max_pool2d_backward can scatter dY without re-scanning the kernel.
+//   X:   (N, C*H*W) FP32.
+//   Y:   (N, C*H_out*W_out) FP32.
+//   Idx: (N, C*H_out*W_out) INT32. -1 means "all kernel positions were
+//        padding" (shouldn't happen with kH/kW <= H/W + 2*pad, but signals
+//        a degenerate case cleanly).
+void max_pool2d_forward(const Tensor& X, int N, int C, int H, int W,
+                        int kH, int kW, int stride_h, int stride_w,
+                        int pad_h, int pad_w, Tensor& Y, Tensor& Idx);
+
+// Backward of max_pool2d: each input pixel accumulates dY from every output
+// pixel that selected it (the per-output Idx returned by the forward).
+// dX OVERWRITTEN (zeroed, then scatter-added — overlapping kernels with
+// stride < kernel size collide on the same input pixel and sum).
+//   dY:  (N, C*H_out*W_out) FP32.
+//   Idx: (N, C*H_out*W_out) INT32 from the forward call.
+//   dX:  (N, C*H*W) FP32, resized + dtype-set.
+// H_out and W_out are the post-pool spatial dims (caller passes them back —
+// they're cheaper to forward than to re-derive).
+void max_pool2d_backward(const Tensor& dY, const Tensor& Idx,
+                         int N, int C, int H, int W, int H_out, int W_out,
+                         Tensor& dX);
+
 // FP16 batched linear forward, inference-only. Like linear_forward_batched but
 // FP16 storage throughout.
 //   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.

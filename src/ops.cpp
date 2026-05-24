@@ -865,6 +865,44 @@ void top_k_rows(const Tensor& X, int k, Tensor& Vals, Tensor& Idx) {
     v.top_k_rows(X, k, Vals, Idx);
 }
 
+void adaptive_avg_pool2d_forward(const Tensor& X, int N, int C, int H, int W,
+                                 int H_out, int W_out, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.adaptive_avg_pool2d_forward)
+        detail::throw_not_implemented("adaptive_avg_pool2d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.adaptive_avg_pool2d_forward(X, N, C, H, W, H_out, W_out, Y);
+}
+void adaptive_avg_pool2d_backward(const Tensor& dY, int N, int C, int H, int W,
+                                  int H_out, int W_out, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, dX);
+    if (!v.adaptive_avg_pool2d_backward)
+        detail::throw_not_implemented("adaptive_avg_pool2d_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.adaptive_avg_pool2d_backward(dY, N, C, H, W, H_out, W_out, dX);
+}
+
+void max_pool2d_forward(const Tensor& X, int N, int C, int H, int W,
+                        int kH, int kW, int stride_h, int stride_w,
+                        int pad_h, int pad_w, Tensor& Y, Tensor& Idx) {
+    const auto& v = detail::dispatch(X, Y, Idx);
+    if (!v.max_pool2d_forward)
+        detail::throw_not_implemented("max_pool2d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    detail::adopt_output(Idx, X.device);
+    v.max_pool2d_forward(X, N, C, H, W, kH, kW, stride_h, stride_w,
+                         pad_h, pad_w, Y, Idx);
+}
+void max_pool2d_backward(const Tensor& dY, const Tensor& Idx,
+                         int N, int C, int H, int W, int H_out, int W_out,
+                         Tensor& dX) {
+    const auto& v = detail::dispatch(dY, Idx, dX);
+    if (!v.max_pool2d_backward)
+        detail::throw_not_implemented("max_pool2d_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.max_pool2d_backward(dY, Idx, N, C, H, W, H_out, W_out, dX);
+}
+
 // ─── FP16 linear + GEGLU ───────────────────────────────────────────────────
 
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,

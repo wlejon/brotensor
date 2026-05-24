@@ -185,6 +185,17 @@
                                                        int h0, int w0, int H_out, int W_out, ::brotensor::Tensor& dX))                                                 \
     /* ─── Per-row top-k (descending values + int32 indices) ─── */                                                                                                     \
     X(top_k_rows,                              void,  (const ::brotensor::Tensor& X, int k, ::brotensor::Tensor& Vals, ::brotensor::Tensor& Idx))                       \
+    /* ─── Adaptive avg pool 2D (NCHW), arbitrary output spatial size ─── */                                                                                            \
+    X(adaptive_avg_pool2d_forward,             void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, int H_out, int W_out,                                 \
+                                                       ::brotensor::Tensor& Y))                                                                                         \
+    X(adaptive_avg_pool2d_backward,            void,  (const ::brotensor::Tensor& dY, int N, int C, int H, int W, int H_out, int W_out,                                \
+                                                       ::brotensor::Tensor& dX))                                                                                        \
+    /* ─── Max pool 2D (NCHW): forward returns Y + int32 flat-spatial Idx ─── */                                                                                        \
+    X(max_pool2d_forward,                      void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W,                                                       \
+                                                       int kH, int kW, int stride_h, int stride_w, int pad_h, int pad_w,                                                \
+                                                       ::brotensor::Tensor& Y, ::brotensor::Tensor& Idx))                                                               \
+    X(max_pool2d_backward,                     void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& Idx,                                                  \
+                                                       int N, int C, int H, int W, int H_out, int W_out, ::brotensor::Tensor& dX))                                     \
     /* ─── FP16 linear (inference-only) + GEGLU family ─── */                                                                                                           \
     X(linear_forward_batched_fp16,             void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
                                                        ::brotensor::Tensor& Y_BD))                                                                                      \

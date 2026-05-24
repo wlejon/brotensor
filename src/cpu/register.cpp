@@ -320,6 +320,23 @@ void slice2d_backward(const ::brotensor::Tensor& dY,
                       ::brotensor::Tensor& dX);
 void top_k_rows(const ::brotensor::Tensor& X, int k,
                 ::brotensor::Tensor& Vals, ::brotensor::Tensor& Idx);
+void adaptive_avg_pool2d_forward(const ::brotensor::Tensor& X,
+                                 int N, int C, int H, int W,
+                                 int H_out, int W_out,
+                                 ::brotensor::Tensor& Y);
+void adaptive_avg_pool2d_backward(const ::brotensor::Tensor& dY,
+                                  int N, int C, int H, int W,
+                                  int H_out, int W_out,
+                                  ::brotensor::Tensor& dX);
+void max_pool2d_forward(const ::brotensor::Tensor& X,
+                        int N, int C, int H, int W,
+                        int kH, int kW, int stride_h, int stride_w,
+                        int pad_h, int pad_w,
+                        ::brotensor::Tensor& Y, ::brotensor::Tensor& Idx);
+void max_pool2d_backward(const ::brotensor::Tensor& dY,
+                         const ::brotensor::Tensor& Idx,
+                         int N, int C, int H, int W, int H_out, int W_out,
+                         ::brotensor::Tensor& dX);
 void nchw_to_sequence(const ::brotensor::Tensor& X,
                       int N, int C, int H, int W, ::brotensor::Tensor& Y);
 void sequence_to_nchw(const ::brotensor::Tensor& X,
@@ -890,6 +907,10 @@ struct CpuStaticRegistrar {
         ops.slice2d_forward              = &detail::cpu::slice2d_forward;
         ops.slice2d_backward             = &detail::cpu::slice2d_backward;
         ops.top_k_rows                   = &detail::cpu::top_k_rows;
+        ops.adaptive_avg_pool2d_forward  = &detail::cpu::adaptive_avg_pool2d_forward;
+        ops.adaptive_avg_pool2d_backward = &detail::cpu::adaptive_avg_pool2d_backward;
+        ops.max_pool2d_forward           = &detail::cpu::max_pool2d_forward;
+        ops.max_pool2d_backward          = &detail::cpu::max_pool2d_backward;
         ops.nchw_to_sequence             = &detail::cpu::nchw_to_sequence;
         ops.sequence_to_nchw             = &detail::cpu::sequence_to_nchw;
         ops.ddim_step                    = &detail::cpu::ddim_step;
