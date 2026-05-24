@@ -122,6 +122,7 @@ if(BROTENSOR_HAS_GPU)
         l2_norm gated_delta_rule
         pad2d slice2d top_k pool2d gather_rows
         conv_transpose2d window_partition
+        batch_norm image_preproc
     )
     foreach(_name IN LISTS _brotensor_parity_tests)
         brotensor_add_test(brotensor_test_${_name}_parity test_${_name}_parity.cpp)

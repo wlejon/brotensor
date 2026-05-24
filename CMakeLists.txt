@@ -206,6 +206,8 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/rope_mrope.cu
         src/cuda/loss_legacy.cu
         src/cuda/xavier_init.cu
+        src/cuda/batch_norm.cu
+        src/cuda/image_preproc.cu
         src/cuda/register.cu
     )
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)
