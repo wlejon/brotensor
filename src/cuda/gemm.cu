@@ -5,23 +5,35 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
+#include <string>
 
 namespace brotensor {
 namespace detail::cuda {
 
 namespace {
 
+template <typename T> __device__ inline float g_load(const T* p);
+template <> __device__ inline float g_load<float>(const float* p) { return *p; }
+template <> __device__ inline float g_load<__half>(const __half* p) { return __half2float(*p); }
+template <> __device__ inline float g_load<__nv_bfloat16>(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+template <typename T> __device__ inline void g_store(T* p, float v);
+template <> __device__ inline void g_store<float>(float* p, float v) { *p = v; }
+template <> __device__ inline void g_store<__half>(__half* p, float v) { *p = __float2half(v); }
+template <> __device__ inline void g_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+
 // y[i] = b[i] + sum_j W[i, j] * x[j]
-// One thread per output row. Uses shared memory to cache tiles of x.
+// One thread per output row. Uses shared memory to cache tiles of x (in FP32).
 constexpr int LF_BLOCK = 128;
 constexpr int LF_TILE  = 128;
 
-__global__ void linear_forward_kernel(const float* __restrict__ W,
-                                      const float* __restrict__ b,
-                                      const float* __restrict__ x,
-                                      float* __restrict__ y,
+template <typename T>
+__global__ void linear_forward_kernel(const T* __restrict__ W,
+                                      const T* __restrict__ b,
+                                      const T* __restrict__ x,
+                                      T* __restrict__ y,
                                       int out_dim, int in_dim) {
     __shared__ float xtile[LF_TILE];
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -33,33 +45,34 @@ __global__ void linear_forward_kernel(const float* __restrict__ W,
 
         // Cooperatively load tile of x into shared memory.
         for (int k = tid; k < t_len; k += blockDim.x) {
-            xtile[k] = x[t0 + k];
+            xtile[k] = g_load<T>(&x[t0 + k]);
         }
         __syncthreads();
 
         if (row < out_dim) {
-            const float* wrow = W + static_cast<size_t>(row) * in_dim + t0;
+            const T* wrow = W + static_cast<size_t>(row) * in_dim + t0;
             #pragma unroll 8
             for (int k = 0; k < t_len; ++k) {
-                acc += wrow[k] * xtile[k];
+                acc += g_load<T>(&wrow[k]) * xtile[k];
             }
         }
         __syncthreads();
     }
 
     if (row < out_dim) {
-        y[row] = b[row] + acc;
+        g_store<T>(&y[row], g_load<T>(&b[row]) + acc);
     }
 }
 
 // dX[j] = sum_i W[i, j] * dY[i]
-// One thread per input column. Uses shared memory to cache tiles of dY.
+// One thread per input column. Uses shared memory to cache tiles of dY (FP32).
 constexpr int LB_DX_BLOCK = 128;
 constexpr int LB_DX_TILE  = 128;
 
-__global__ void linear_backward_dx_kernel(const float* __restrict__ W,
-                                          const float* __restrict__ dY,
-                                          float* __restrict__ dX,
+template <typename T>
+__global__ void linear_backward_dx_kernel(const T* __restrict__ W,
+                                          const T* __restrict__ dY,
+                                          T* __restrict__ dX,
                                           int out_dim, int in_dim) {
     __shared__ float dytile[LB_DX_TILE];
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -70,60 +83,104 @@ __global__ void linear_backward_dx_kernel(const float* __restrict__ W,
         const int t_len = (out_dim - t0) < LB_DX_TILE ? (out_dim - t0) : LB_DX_TILE;
 
         for (int k = tid; k < t_len; k += blockDim.x) {
-            dytile[k] = dY[t0 + k];
+            dytile[k] = g_load<T>(&dY[t0 + k]);
         }
         __syncthreads();
 
         if (col < in_dim) {
             #pragma unroll 8
             for (int k = 0; k < t_len; ++k) {
-                acc += W[static_cast<size_t>(t0 + k) * in_dim + col] * dytile[k];
+                acc += g_load<T>(&W[static_cast<size_t>(t0 + k) * in_dim + col]) * dytile[k];
             }
         }
         __syncthreads();
     }
 
     if (col < in_dim) {
-        dX[col] = acc;
+        g_store<T>(&dX[col], acc);
     }
 }
 
 // dW[i, j] += dY[i] * x[j]. 2D grid: each thread one (i, j).
-__global__ void linear_backward_dw_kernel(const float* __restrict__ dY,
-                                          const float* __restrict__ x,
-                                          float* __restrict__ dW,
+template <typename T>
+__global__ void linear_backward_dw_kernel(const T* __restrict__ dY,
+                                          const T* __restrict__ x,
+                                          T* __restrict__ dW,
                                           int out_dim, int in_dim) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     const int i = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= out_dim || j >= in_dim) return;
-    dW[static_cast<size_t>(i) * in_dim + j] += dY[i] * x[j];
+    const size_t off = static_cast<size_t>(i) * in_dim + j;
+    const float prev = g_load<T>(&dW[off]);
+    const float upd  = g_load<T>(&dY[i]) * g_load<T>(&x[j]);
+    g_store<T>(&dW[off], prev + upd);
 }
 
 // dB[i] += dY[i].
-__global__ void linear_backward_db_kernel(const float* __restrict__ dY,
-                                          float* __restrict__ dB,
+template <typename T>
+__global__ void linear_backward_db_kernel(const T* __restrict__ dY,
+                                          T* __restrict__ dB,
                                           int out_dim) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= out_dim) return;
-    dB[i] += dY[i];
+    g_store<T>(&dB[i], g_load<T>(&dB[i]) + g_load<T>(&dY[i]));
+}
+
+inline void require_fp(const ::brotensor::Tensor& t,
+                       const char* op, const char* name) {
+    if (t.dtype != ::brotensor::Dtype::FP32 &&
+        t.dtype != ::brotensor::Dtype::FP16 &&
+        t.dtype != ::brotensor::Dtype::BF16) {
+        throw std::runtime_error(std::string("brotensor: ") + op + ": " + name +
+                                 " must be FP32/FP16/BF16");
+    }
+}
+
+inline void require_same_dtype(const ::brotensor::Tensor& a, const ::brotensor::Tensor& b,
+                               const char* op) {
+    if (a.dtype != b.dtype) {
+        throw std::runtime_error(std::string("brotensor: ") + op +
+                                 ": all FP operand dtypes must match");
+    }
 }
 
 } // anonymous namespace
 
 void linear_forward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& b,
                     const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
+    require_fp(W, "linear_forward", "W");
+    require_same_dtype(W, b, "linear_forward");
+    require_same_dtype(W, x, "linear_forward");
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
-    if (y.rows != out_dim || y.cols != 1) y.resize(out_dim, 1);
+    if (y.rows != out_dim || y.cols != 1 || y.dtype != W.dtype) {
+        y.resize(out_dim, 1, W.dtype);
+    }
     if (out_dim == 0) return;
 
     const int blocks = (out_dim + LF_BLOCK - 1) / LF_BLOCK;
-    linear_forward_kernel<<<blocks, LF_BLOCK>>>(
-        static_cast<const float*>(W.data),
-        static_cast<const float*>(b.data),
-        static_cast<const float*>(x.data),
-        static_cast<float*>(y.data),
-        out_dim, in_dim);
+    if (W.dtype == Dtype::FP16) {
+        linear_forward_kernel<__half><<<blocks, LF_BLOCK>>>(
+            static_cast<const __half*>(W.data),
+            static_cast<const __half*>(b.data),
+            static_cast<const __half*>(x.data),
+            static_cast<__half*>(y.data),
+            out_dim, in_dim);
+    } else if (W.dtype == Dtype::BF16) {
+        linear_forward_kernel<__nv_bfloat16><<<blocks, LF_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(W.data),
+            static_cast<const __nv_bfloat16*>(b.data),
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<__nv_bfloat16*>(y.data),
+            out_dim, in_dim);
+    } else {
+        linear_forward_kernel<float><<<blocks, LF_BLOCK>>>(
+            static_cast<const float*>(W.data),
+            static_cast<const float*>(b.data),
+            static_cast<const float*>(x.data),
+            static_cast<float*>(y.data),
+            out_dim, in_dim);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -188,41 +245,83 @@ void linear_backward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& x,
                      const ::brotensor::Tensor& dY,
                      ::brotensor::Tensor& dX, ::brotensor::Tensor& dW,
                      ::brotensor::Tensor& dB) {
+    require_fp(W, "linear_backward", "W");
+    require_same_dtype(W, x,  "linear_backward");
+    require_same_dtype(W, dY, "linear_backward");
+    require_same_dtype(W, dW, "linear_backward");
+    require_same_dtype(W, dB, "linear_backward");
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
 
-    if (dX.rows != in_dim || dX.cols != 1) dX.resize(in_dim, 1);
+    if (dX.rows != in_dim || dX.cols != 1 || dX.dtype != W.dtype) {
+        dX.resize(in_dim, 1, W.dtype);
+    }
 
     // dX = W^T * dY (overwrite)
     if (in_dim > 0) {
         const int blocks = (in_dim + LB_DX_BLOCK - 1) / LB_DX_BLOCK;
-        linear_backward_dx_kernel<<<blocks, LB_DX_BLOCK>>>(
-            static_cast<const float*>(W.data),
-            static_cast<const float*>(dY.data),
-            static_cast<float*>(dX.data),
-            out_dim, in_dim);
+        if (W.dtype == Dtype::FP16) {
+            linear_backward_dx_kernel<__half><<<blocks, LB_DX_BLOCK>>>(
+                static_cast<const __half*>(W.data),
+                static_cast<const __half*>(dY.data),
+                static_cast<__half*>(dX.data),
+                out_dim, in_dim);
+        } else if (W.dtype == Dtype::BF16) {
+            linear_backward_dx_kernel<__nv_bfloat16><<<blocks, LB_DX_BLOCK>>>(
+                static_cast<const __nv_bfloat16*>(W.data),
+                static_cast<const __nv_bfloat16*>(dY.data),
+                static_cast<__nv_bfloat16*>(dX.data),
+                out_dim, in_dim);
+        } else {
+            linear_backward_dx_kernel<float><<<blocks, LB_DX_BLOCK>>>(
+                static_cast<const float*>(W.data),
+                static_cast<const float*>(dY.data),
+                static_cast<float*>(dX.data),
+                out_dim, in_dim);
+        }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
-
     // dW += dY * x^T
     if (out_dim > 0 && in_dim > 0) {
         dim3 block(16, 16);
         dim3 grid((in_dim + 15) / 16, (out_dim + 15) / 16);
-        linear_backward_dw_kernel<<<grid, block>>>(
-            static_cast<const float*>(dY.data),
-            static_cast<const float*>(x.data),
-            static_cast<float*>(dW.data),
-            out_dim, in_dim);
+        if (W.dtype == Dtype::FP16) {
+            linear_backward_dw_kernel<__half><<<grid, block>>>(
+                static_cast<const __half*>(dY.data),
+                static_cast<const __half*>(x.data),
+                static_cast<__half*>(dW.data),
+                out_dim, in_dim);
+        } else if (W.dtype == Dtype::BF16) {
+            linear_backward_dw_kernel<__nv_bfloat16><<<grid, block>>>(
+                static_cast<const __nv_bfloat16*>(dY.data),
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<__nv_bfloat16*>(dW.data),
+                out_dim, in_dim);
+        } else {
+            linear_backward_dw_kernel<float><<<grid, block>>>(
+                static_cast<const float*>(dY.data),
+                static_cast<const float*>(x.data),
+                static_cast<float*>(dW.data),
+                out_dim, in_dim);
+        }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
-
     // dB += dY
     if (out_dim > 0) {
         const int blocks = (out_dim + 255) / 256;
-        linear_backward_db_kernel<<<blocks, 256>>>(
-            static_cast<const float*>(dY.data),
-            static_cast<float*>(dB.data),
-            out_dim);
+        if (W.dtype == Dtype::FP16) {
+            linear_backward_db_kernel<__half><<<blocks, 256>>>(
+                static_cast<const __half*>(dY.data),
+                static_cast<__half*>(dB.data), out_dim);
+        } else if (W.dtype == Dtype::BF16) {
+            linear_backward_db_kernel<__nv_bfloat16><<<blocks, 256>>>(
+                static_cast<const __nv_bfloat16*>(dY.data),
+                static_cast<__nv_bfloat16*>(dB.data), out_dim);
+        } else {
+            linear_backward_db_kernel<float><<<blocks, 256>>>(
+                static_cast<const float*>(dY.data),
+                static_cast<float*>(dB.data), out_dim);
+        }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 }

@@ -4,14 +4,16 @@
 // head h occupies columns [h*head_dim, (h+1)*head_dim). Used to L2-normalise
 // q and k per head before the gated delta-rule recurrence.
 //
-// FP32-only per the public contract; if we ever need FP16/BF16 paths we'd
-// extend along the same lines as rms_norm.cu.
+// Supports FP32 / FP16 / BF16 — math in FP32, loads/stores cast at the
+// boundary so mixed-precision callers don't get silently coerced to FP32.
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 #include <string>
@@ -21,6 +23,16 @@ namespace brotensor::detail::cuda {
 namespace {
 
 constexpr int L2_BLOCK = 128;
+
+template <typename T> __device__ inline float l2_load(const T* p);
+template <> __device__ inline float l2_load<float>(const float* p)  { return *p; }
+template <> __device__ inline float l2_load<__half>(const __half* p){ return __half2float(*p); }
+template <> __device__ inline float l2_load<__nv_bfloat16>(const __nv_bfloat16* p){ return __bfloat162float(*p); }
+
+template <typename T> __device__ inline void l2_store(T* p, float v);
+template <> __device__ inline void l2_store<float>(float* p, float v) { *p = v; }
+template <> __device__ inline void l2_store<__half>(__half* p, float v) { *p = __float2half(v); }
+template <> __device__ inline void l2_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
 // In-block reduction over `blockDim.x` threads using shared memory. Returns
 // the sum from thread 0; other threads see the final value in sdata[0].
@@ -37,8 +49,9 @@ __device__ inline float block_sum(float v, float* sdata) {
 
 // One block per (row, head). blockDim.x = L2_BLOCK threads cooperate over
 // head_dim. Shared memory: L2_BLOCK floats (single reduction scratch).
-__global__ void l2_norm_forward_kernel(const float* __restrict__ X,
-                                       float* __restrict__ Y,
+template <typename T>
+__global__ void l2_norm_forward_kernel(const T* __restrict__ X,
+                                       T* __restrict__ Y,
                                        int L, int num_heads, int head_dim,
                                        float eps) {
     extern __shared__ float sdata[];
@@ -49,19 +62,19 @@ __global__ void l2_norm_forward_kernel(const float* __restrict__ X,
     const int tid = threadIdx.x;
     const int D   = num_heads * head_dim;
     const int off = r * D + h * head_dim;
-    const float* xrow = X + off;
-    float*       yrow = Y + off;
+    const T* xrow = X + off;
+    T*       yrow = Y + off;
 
     float local = 0.0f;
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        const float v = xrow[d];
+        const float v = l2_load<T>(&xrow[d]);
         local += v * v;
     }
     const float sumsq = block_sum(local, sdata);
     const float inv   = rsqrtf(sumsq + eps);
 
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        yrow[d] = xrow[d] * inv;
+        l2_store<T>(&yrow[d], l2_load<T>(&xrow[d]) * inv);
     }
 }
 
@@ -69,9 +82,10 @@ __global__ void l2_norm_forward_kernel(const float* __restrict__ X,
 // for sumsq, one for dot(x, dY).
 //
 // dX_d = n * (dY_d - x_d * n^2 * dot(x, dY)), with n = 1 / sqrt(sumsq + eps).
-__global__ void l2_norm_backward_kernel(const float* __restrict__ X,
-                                        const float* __restrict__ dY,
-                                        float* __restrict__ dX,
+template <typename T>
+__global__ void l2_norm_backward_kernel(const T* __restrict__ X,
+                                        const T* __restrict__ dY,
+                                        T* __restrict__ dX,
                                         int L, int num_heads, int head_dim,
                                         float eps) {
     extern __shared__ float sdata[];
@@ -85,15 +99,15 @@ __global__ void l2_norm_backward_kernel(const float* __restrict__ X,
     const int tid = threadIdx.x;
     const int D   = num_heads * head_dim;
     const int off = r * D + h * head_dim;
-    const float* xrow = X  + off;
-    const float* grow = dY + off;
-    float*       drow = dX + off;
+    const T* xrow = X  + off;
+    const T* grow = dY + off;
+    T*       drow = dX + off;
 
     float l_sumsq = 0.0f;
     float l_dot   = 0.0f;
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        const float v  = xrow[d];
-        const float gv = grow[d];
+        const float v  = l2_load<T>(&xrow[d]);
+        const float gv = l2_load<T>(&grow[d]);
         l_sumsq += v * v;
         l_dot   += v * gv;
     }
@@ -114,15 +128,19 @@ __global__ void l2_norm_backward_kernel(const float* __restrict__ X,
     const float c     = dot * n2;
 
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        drow[d] = n * (grow[d] - xrow[d] * c);
+        const float gv = l2_load<T>(&grow[d]);
+        const float xv = l2_load<T>(&xrow[d]);
+        l2_store<T>(&drow[d], n * (gv - xv * c));
     }
 }
 
-inline void check_fp32(const ::brotensor::Tensor& t,
-                       const char* op, const char* name) {
-    if (t.dtype != ::brotensor::Dtype::FP32) {
+inline void check_fp(const ::brotensor::Tensor& t,
+                     const char* op, const char* name) {
+    if (t.dtype != ::brotensor::Dtype::FP32 &&
+        t.dtype != ::brotensor::Dtype::FP16 &&
+        t.dtype != ::brotensor::Dtype::BF16) {
         throw std::runtime_error(std::string(op) + ": " + name +
-                                 " must be FP32 (CUDA l2_norm is FP32-only)");
+                                 " must be FP32/FP16/BF16");
     }
 }
 
@@ -146,22 +164,34 @@ inline void check_shape(const ::brotensor::Tensor& t,
 void l2_norm_forward(const ::brotensor::Tensor& X,
                      int head_dim, int num_heads, float eps,
                      ::brotensor::Tensor& Y) {
-    check_fp32(X, "l2_norm_forward", "X");
+    check_fp(X, "l2_norm_forward", "X");
     check_shape(X, head_dim, num_heads, "l2_norm_forward", "X");
     const int L = X.rows;
     const int D = X.cols;
-    if (Y.rows != L || Y.cols != D || Y.dtype != ::brotensor::Dtype::FP32) {
-        Y.resize(L, D, ::brotensor::Dtype::FP32);
+    if (Y.rows != L || Y.cols != D || Y.dtype != X.dtype) {
+        Y.resize(L, D, X.dtype);
     }
     if (L == 0 || D == 0) return;
 
     const int blocks = L * num_heads;
     const int block  = L2_BLOCK;
     const size_t shmem = block * sizeof(float);
-    l2_norm_forward_kernel<<<blocks, block, shmem>>>(
-        static_cast<const float*>(X.data),
-        static_cast<float*>(Y.data),
-        L, num_heads, head_dim, eps);
+    if (X.dtype == ::brotensor::Dtype::FP16) {
+        l2_norm_forward_kernel<__half><<<blocks, block, shmem>>>(
+            static_cast<const __half*>(X.data),
+            static_cast<__half*>(Y.data),
+            L, num_heads, head_dim, eps);
+    } else if (X.dtype == ::brotensor::Dtype::BF16) {
+        l2_norm_forward_kernel<__nv_bfloat16><<<blocks, block, shmem>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            L, num_heads, head_dim, eps);
+    } else {
+        l2_norm_forward_kernel<float><<<blocks, block, shmem>>>(
+            static_cast<const float*>(X.data),
+            static_cast<float*>(Y.data),
+            L, num_heads, head_dim, eps);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -169,8 +199,11 @@ void l2_norm_backward(const ::brotensor::Tensor& X,
                       int head_dim, int num_heads, float eps,
                       const ::brotensor::Tensor& dY,
                       ::brotensor::Tensor& dX) {
-    check_fp32(X,  "l2_norm_backward", "X");
-    check_fp32(dY, "l2_norm_backward", "dY");
+    check_fp(X,  "l2_norm_backward", "X");
+    check_fp(dY, "l2_norm_backward", "dY");
+    if (dY.dtype != X.dtype) {
+        throw std::runtime_error("l2_norm_backward: dY.dtype must match X.dtype");
+    }
     check_shape(X,  head_dim, num_heads, "l2_norm_backward", "X");
     check_shape(dY, head_dim, num_heads, "l2_norm_backward", "dY");
     if (dY.rows != X.rows) {
@@ -178,19 +211,33 @@ void l2_norm_backward(const ::brotensor::Tensor& X,
     }
     const int L = X.rows;
     const int D = X.cols;
-    if (dX.rows != L || dX.cols != D || dX.dtype != ::brotensor::Dtype::FP32) {
-        dX.resize(L, D, ::brotensor::Dtype::FP32);
+    if (dX.rows != L || dX.cols != D || dX.dtype != X.dtype) {
+        dX.resize(L, D, X.dtype);
     }
     if (L == 0 || D == 0) return;
 
     const int blocks = L * num_heads;
     const int block  = L2_BLOCK;
     const size_t shmem = 2 * block * sizeof(float);
-    l2_norm_backward_kernel<<<blocks, block, shmem>>>(
-        static_cast<const float*>(X.data),
-        static_cast<const float*>(dY.data),
-        static_cast<float*>(dX.data),
-        L, num_heads, head_dim, eps);
+    if (X.dtype == ::brotensor::Dtype::FP16) {
+        l2_norm_backward_kernel<__half><<<blocks, block, shmem>>>(
+            static_cast<const __half*>(X.data),
+            static_cast<const __half*>(dY.data),
+            static_cast<__half*>(dX.data),
+            L, num_heads, head_dim, eps);
+    } else if (X.dtype == ::brotensor::Dtype::BF16) {
+        l2_norm_backward_kernel<__nv_bfloat16><<<blocks, block, shmem>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<const __nv_bfloat16*>(dY.data),
+            static_cast<__nv_bfloat16*>(dX.data),
+            L, num_heads, head_dim, eps);
+    } else {
+        l2_norm_backward_kernel<float><<<blocks, block, shmem>>>(
+            static_cast<const float*>(X.data),
+            static_cast<const float*>(dY.data),
+            static_cast<float*>(dX.data),
+            L, num_heads, head_dim, eps);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

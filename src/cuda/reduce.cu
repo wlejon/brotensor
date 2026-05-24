@@ -2,7 +2,11 @@
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace brotensor {
@@ -12,17 +16,25 @@ namespace {
 
 constexpr int RED_BLOCK = 256;
 
+template <typename T> __device__ inline float r_load(const T* p);
+template <> __device__ inline float r_load<float>(const float* p) { return *p; }
+template <> __device__ inline float r_load<__half>(const __half* p) { return __half2float(*p); }
+template <> __device__ inline float r_load<__nv_bfloat16>(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+template <typename T> __device__ inline void r_store(T* p, float v);
+template <> __device__ inline void r_store<float>(float* p, float v) { *p = v; }
+template <> __device__ inline void r_store<__half>(__half* p, float v) { *p = __float2half(v); }
+template <> __device__ inline void r_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+
 // One thread per output column. Each thread sums its column over valid rows
 // and divides by num_valid. If num_valid == 0, writes 0.
-__global__ void masked_mean_pool_forward_kernel(const float* __restrict__ X,
+template <typename T>
+__global__ void masked_mean_pool_forward_kernel(const T* __restrict__ X,
                                                 const float* __restrict__ mask,
-                                                float* __restrict__ y,
+                                                T* __restrict__ y,
                                                 int K, int D) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= D) return;
 
-    // Count num_valid (cheap; D threads each redundantly count K — fine for
-    // the K we care about; if K grows large we'd hoist this).
     int num_valid = 0;
     if (mask) {
         for (int k = 0; k < K; ++k) num_valid += (mask[k] != 0.0f);
@@ -30,20 +42,21 @@ __global__ void masked_mean_pool_forward_kernel(const float* __restrict__ X,
         num_valid = K;
     }
 
-    if (num_valid == 0) { y[j] = 0.0f; return; }
+    if (num_valid == 0) { r_store<T>(&y[j], 0.0f); return; }
 
     float acc = 0.0f;
     for (int k = 0; k < K; ++k) {
         const float m = mask ? mask[k] : 1.0f;
-        if (m != 0.0f) acc += X[k * D + j];
+        if (m != 0.0f) acc += r_load<T>(&X[k * D + j]);
     }
-    y[j] = acc / static_cast<float>(num_valid);
+    r_store<T>(&y[j], acc / static_cast<float>(num_valid));
 }
 
 // Distribute dY/num_valid to valid rows; zero invalid rows.
-__global__ void masked_mean_pool_backward_kernel(const float* __restrict__ dY,
+template <typename T>
+__global__ void masked_mean_pool_backward_kernel(const T* __restrict__ dY,
                                                  const float* __restrict__ mask,
-                                                 float* __restrict__ dX,
+                                                 T* __restrict__ dX,
                                                  int K, int D, int num_valid) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = K * D;
@@ -52,9 +65,9 @@ __global__ void masked_mean_pool_backward_kernel(const float* __restrict__ dY,
     const int j = idx - k * D;
     const float m = mask ? mask[k] : 1.0f;
     if (num_valid == 0 || m == 0.0f) {
-        dX[idx] = 0.0f;
+        r_store<T>(&dX[idx], 0.0f);
     } else {
-        dX[idx] = dY[j] / static_cast<float>(num_valid);
+        r_store<T>(&dX[idx], r_load<T>(&dY[j]) / static_cast<float>(num_valid));
     }
 }
 
@@ -64,29 +77,54 @@ inline int grid_for(int n, int block) {
     return b;
 }
 
+inline void require_fp(const ::brotensor::Tensor& t,
+                       const char* op, const char* name) {
+    if (t.dtype != ::brotensor::Dtype::FP32 &&
+        t.dtype != ::brotensor::Dtype::FP16 &&
+        t.dtype != ::brotensor::Dtype::BF16) {
+        throw std::runtime_error(std::string("brotensor: ") + op + ": " + name +
+                                 " must be FP32/FP16/BF16");
+    }
+}
+
 } // namespace
 
 void masked_mean_pool_forward(const ::brotensor::Tensor& X, const float* d_mask,
                               ::brotensor::Tensor& y) {
+    require_fp(X, "masked_mean_pool_forward", "X");
     const int K = X.rows;
     const int D = X.cols;
-    if (y.rows != D || y.cols != 1) y.resize(D, 1);
+    if (y.rows != D || y.cols != 1 || y.dtype != X.dtype) {
+        y.resize(D, 1, X.dtype);
+    }
     if (D == 0) return;
-    masked_mean_pool_forward_kernel<<<grid_for(D, RED_BLOCK), RED_BLOCK>>>(
-        static_cast<const float*>(X.data), d_mask,
-        static_cast<float*>(y.data), K, D);
+    if (X.dtype == ::brotensor::Dtype::FP16) {
+        masked_mean_pool_forward_kernel<__half><<<grid_for(D, RED_BLOCK), RED_BLOCK>>>(
+            static_cast<const __half*>(X.data), d_mask,
+            static_cast<__half*>(y.data), K, D);
+    } else if (X.dtype == ::brotensor::Dtype::BF16) {
+        masked_mean_pool_forward_kernel<__nv_bfloat16><<<grid_for(D, RED_BLOCK), RED_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data), d_mask,
+            static_cast<__nv_bfloat16*>(y.data), K, D);
+    } else {
+        masked_mean_pool_forward_kernel<float><<<grid_for(D, RED_BLOCK), RED_BLOCK>>>(
+            static_cast<const float*>(X.data), d_mask,
+            static_cast<float*>(y.data), K, D);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
 void masked_mean_pool_backward(const ::brotensor::Tensor& dY, const float* d_mask,
                                int K, ::brotensor::Tensor& dX) {
+    require_fp(dY, "masked_mean_pool_backward", "dY");
     const int D = dY.size();
-    if (dX.rows != K || dX.cols != D) dX.resize(K, D);
+    if (dX.rows != K || dX.cols != D || dX.dtype != dY.dtype) {
+        dX.resize(K, D, dY.dtype);
+    }
     const int total = K * D;
     if (total == 0) return;
 
-    // Need num_valid on host for the divisor. We could reduce on device, but
-    // K is small (slot counts of a few dozen) — just download the mask.
+    // Need num_valid on host for the divisor. K is small — just download mask.
     int num_valid = 0;
     if (d_mask) {
         std::vector<float> hmask(K);
@@ -97,9 +135,19 @@ void masked_mean_pool_backward(const ::brotensor::Tensor& dY, const float* d_mas
         num_valid = K;
     }
 
-    masked_mean_pool_backward_kernel<<<grid_for(total, RED_BLOCK), RED_BLOCK>>>(
-        static_cast<const float*>(dY.data), d_mask,
-        static_cast<float*>(dX.data), K, D, num_valid);
+    if (dY.dtype == ::brotensor::Dtype::FP16) {
+        masked_mean_pool_backward_kernel<__half><<<grid_for(total, RED_BLOCK), RED_BLOCK>>>(
+            static_cast<const __half*>(dY.data), d_mask,
+            static_cast<__half*>(dX.data), K, D, num_valid);
+    } else if (dY.dtype == ::brotensor::Dtype::BF16) {
+        masked_mean_pool_backward_kernel<__nv_bfloat16><<<grid_for(total, RED_BLOCK), RED_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(dY.data), d_mask,
+            static_cast<__nv_bfloat16*>(dX.data), K, D, num_valid);
+    } else {
+        masked_mean_pool_backward_kernel<float><<<grid_for(total, RED_BLOCK), RED_BLOCK>>>(
+            static_cast<const float*>(dY.data), d_mask,
+            static_cast<float*>(dX.data), K, D, num_valid);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

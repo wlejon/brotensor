@@ -1,4 +1,10 @@
 // CUDA loss kernels. Phase 2G port — kernel bodies unchanged.
+//
+// Losses are FP32-by-design: even in mixed-precision pipelines, logits feeding
+// xent and prediction/target feeding mse are conventionally upcast to FP32 to
+// preserve numerical headroom. We enforce FP32 explicitly on every operand and
+// pass FP32 explicitly to every resize() so a stale committed-output dtype
+// can't silently flip our reinterpret-casts to garbage.
 
 #include "detail/cuda_check.h"
 
@@ -6,11 +12,31 @@
 
 #include <cuda_runtime.h>
 
+#include <stdexcept>
+#include <string>
+
 namespace brotensor::detail::cuda {
 
 using ::brotensor::Tensor;
 
 namespace {
+
+[[noreturn]] inline void fail(const char* op, const std::string& reason) {
+    throw std::runtime_error(std::string("brotensor: ") + op + ": " + reason);
+}
+
+inline void require_fp32(const Tensor& t, const char* op, const char* name) {
+    if (t.dtype != ::brotensor::Dtype::FP32) {
+        fail(op, std::string(name) + " must be FP32 (loss ops are FP32-by-design)");
+    }
+}
+
+inline void require_fp32_out(const Tensor& t, const char* op, const char* name) {
+    if (t.data != nullptr && t.dtype != ::brotensor::Dtype::FP32) {
+        fail(op, std::string(name) + " must be FP32 (loss ops are FP32-by-design)");
+    }
+}
+
 
 constexpr int LOSS_BLOCK = 256;
 
@@ -225,6 +251,8 @@ __global__ void softmax_xent_fused_batched_kernel(
 } // namespace
 
 float mse_vec_forward(const Tensor& pred, const Tensor& target) {
+    require_fp32(pred,   "mse_vec_forward", "pred");
+    require_fp32(target, "mse_vec_forward", "target");
     const int n = pred.size();
     if (n == 0) return 0.0f;
     float* d_sum = nullptr;
@@ -243,9 +271,13 @@ float mse_vec_forward(const Tensor& pred, const Tensor& target) {
 
 void mse_vec_backward(const Tensor& pred, const Tensor& target,
                       Tensor& dPred) {
+    require_fp32(pred,   "mse_vec_backward", "pred");
+    require_fp32(target, "mse_vec_backward", "target");
+    require_fp32_out(dPred, "mse_vec_backward", "dPred");
     const int n = pred.size();
-    if (dPred.rows != pred.rows || dPred.cols != pred.cols) {
-        dPred.resize(pred.rows, pred.cols);
+    if (dPred.rows != pred.rows || dPred.cols != pred.cols ||
+        dPred.dtype != ::brotensor::Dtype::FP32) {
+        dPred.resize(pred.rows, pred.cols, ::brotensor::Dtype::FP32);
     }
     if (n == 0) return;
     const float scale = 2.0f / static_cast<float>(n);
@@ -258,11 +290,17 @@ void mse_vec_backward(const Tensor& pred, const Tensor& target,
 
 void mse_vec_per_sample(const Tensor& pred, const Tensor& target,
                         Tensor& dPred, Tensor& loss_per_sample) {
+    require_fp32(pred,   "mse_vec_per_sample", "pred");
+    require_fp32(target, "mse_vec_per_sample", "target");
+    require_fp32_out(dPred,           "mse_vec_per_sample", "dPred");
+    require_fp32_out(loss_per_sample, "mse_vec_per_sample", "loss_per_sample");
     const int B = pred.size();
-    if (dPred.rows != pred.rows || dPred.cols != pred.cols)
-        dPred.resize(pred.rows, pred.cols);
-    if (loss_per_sample.rows != B || loss_per_sample.cols != 1)
-        loss_per_sample.resize(B, 1);
+    if (dPred.rows != pred.rows || dPred.cols != pred.cols ||
+        dPred.dtype != ::brotensor::Dtype::FP32)
+        dPred.resize(pred.rows, pred.cols, ::brotensor::Dtype::FP32);
+    if (loss_per_sample.rows != B || loss_per_sample.cols != 1 ||
+        loss_per_sample.dtype != ::brotensor::Dtype::FP32)
+        loss_per_sample.resize(B, 1, ::brotensor::Dtype::FP32);
     if (B == 0) return;
     mse_per_sample_kernel<<<grid_for(B, LOSS_BLOCK), LOSS_BLOCK>>>(
         static_cast<const float*>(pred.data),
@@ -280,14 +318,22 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
                                 Tensor& probs_BL,
                                 Tensor& dLogits_BL,
                                 Tensor& loss_per_sample) {
+    require_fp32(logits_BL, "softmax_xent_fused_batched", "logits_BL");
+    require_fp32(target_BL, "softmax_xent_fused_batched", "target_BL");
+    require_fp32_out(probs_BL,        "softmax_xent_fused_batched", "probs_BL");
+    require_fp32_out(dLogits_BL,      "softmax_xent_fused_batched", "dLogits_BL");
+    require_fp32_out(loss_per_sample, "softmax_xent_fused_batched", "loss_per_sample");
     const int B     = logits_BL.rows;
     const int n_act = logits_BL.cols;
-    if (probs_BL.rows != B || probs_BL.cols != n_act)
-        probs_BL.resize(B, n_act);
-    if (dLogits_BL.rows != B || dLogits_BL.cols != n_act)
-        dLogits_BL.resize(B, n_act);
-    if (loss_per_sample.rows != B || loss_per_sample.cols != 1)
-        loss_per_sample.resize(B, 1);
+    if (probs_BL.rows != B || probs_BL.cols != n_act ||
+        probs_BL.dtype != ::brotensor::Dtype::FP32)
+        probs_BL.resize(B, n_act, ::brotensor::Dtype::FP32);
+    if (dLogits_BL.rows != B || dLogits_BL.cols != n_act ||
+        dLogits_BL.dtype != ::brotensor::Dtype::FP32)
+        dLogits_BL.resize(B, n_act, ::brotensor::Dtype::FP32);
+    if (loss_per_sample.rows != B || loss_per_sample.cols != 1 ||
+        loss_per_sample.dtype != ::brotensor::Dtype::FP32)
+        loss_per_sample.resize(B, 1, ::brotensor::Dtype::FP32);
     if (B == 0 || n_act == 0 || n_heads <= 0) return;
 
     BROTENSOR_CUDA_CHECK(cudaMemsetAsync(loss_per_sample.data, 0,
@@ -308,12 +354,18 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
 float softmax_xent_fused(const Tensor& logits, const Tensor& target,
                          const float* d_mask,
                          Tensor& probs, Tensor& dLogits) {
+    require_fp32(logits, "softmax_xent_fused", "logits");
+    require_fp32(target, "softmax_xent_fused", "target");
+    require_fp32_out(probs,   "softmax_xent_fused", "probs");
+    require_fp32_out(dLogits, "softmax_xent_fused", "dLogits");
     const int n = logits.size();
-    if (probs.rows != logits.rows || probs.cols != logits.cols) {
-        probs.resize(logits.rows, logits.cols);
+    if (probs.rows != logits.rows || probs.cols != logits.cols ||
+        probs.dtype != ::brotensor::Dtype::FP32) {
+        probs.resize(logits.rows, logits.cols, ::brotensor::Dtype::FP32);
     }
-    if (dLogits.rows != logits.rows || dLogits.cols != logits.cols) {
-        dLogits.resize(logits.rows, logits.cols);
+    if (dLogits.rows != logits.rows || dLogits.cols != logits.cols ||
+        dLogits.dtype != ::brotensor::Dtype::FP32) {
+        dLogits.resize(logits.rows, logits.cols, ::brotensor::Dtype::FP32);
     }
     if (n == 0) return 0.0f;
 

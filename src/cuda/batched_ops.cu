@@ -59,50 +59,6 @@ __global__ void linear_forward_batched_kernel(const float* __restrict__ W,
 
 constexpr int EW_BLOCK = 256;
 
-__global__ void relu_forward_batched_kernel(const float* __restrict__ x,
-                                            float* __restrict__ y, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        const float v = x[i];
-        y[i] = v > 0.0f ? v : 0.0f;
-    }
-}
-
-__global__ void tanh_forward_batched_kernel(const float* __restrict__ x,
-                                            float* __restrict__ y, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        y[i] = tanhf(x[i]);
-    }
-}
-
-__global__ void add_inplace_batched_kernel(float* __restrict__ y,
-                                           const float* __restrict__ x, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        y[i] += x[i];
-    }
-}
-
-__global__ void relu_backward_batched_kernel(const float* __restrict__ x,
-                                             const float* __restrict__ dY,
-                                             float* __restrict__ dX, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        dX[i] = x[i] > 0.0f ? dY[i] : 0.0f;
-    }
-}
-
-__global__ void tanh_backward_batched_kernel(const float* __restrict__ y,
-                                             const float* __restrict__ dY,
-                                             float* __restrict__ dX, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        const float yv = y[i];
-        dX[i] = dY[i] * (1.0f - yv * yv);
-    }
-}
-
 constexpr int LBB_DX_BLOCK = 64;
 
 template <typename T> __device__ inline float lbb_load(const T* p);
@@ -113,6 +69,58 @@ template <typename T> __device__ inline void lbb_store(T* p, float v);
 template <> __device__ inline void lbb_store<float>(float* p, float v) { *p = v; }
 template <> __device__ inline void lbb_store<__half>(__half* p, float v) { *p = __float2half(v); }
 template <> __device__ inline void lbb_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+
+template <typename T>
+__global__ void relu_forward_batched_kernel(const T* __restrict__ x,
+                                            T* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float v = lbb_load<T>(&x[i]);
+        lbb_store<T>(&y[i], v > 0.0f ? v : 0.0f);
+    }
+}
+
+template <typename T>
+__global__ void tanh_forward_batched_kernel(const T* __restrict__ x,
+                                            T* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        lbb_store<T>(&y[i], tanhf(lbb_load<T>(&x[i])));
+    }
+}
+
+template <typename T>
+__global__ void add_inplace_batched_kernel(T* __restrict__ y,
+                                           const T* __restrict__ x, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        lbb_store<T>(&y[i], lbb_load<T>(&y[i]) + lbb_load<T>(&x[i]));
+    }
+}
+
+template <typename T>
+__global__ void relu_backward_batched_kernel(const T* __restrict__ x,
+                                             const T* __restrict__ dY,
+                                             T* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float xv  = lbb_load<T>(&x[i]);
+        const float dyv = lbb_load<T>(&dY[i]);
+        lbb_store<T>(&dX[i], xv > 0.0f ? dyv : 0.0f);
+    }
+}
+
+template <typename T>
+__global__ void tanh_backward_batched_kernel(const T* __restrict__ y,
+                                             const T* __restrict__ dY,
+                                             T* __restrict__ dX, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        const float yv  = lbb_load<T>(&y[i]);
+        const float dyv = lbb_load<T>(&dY[i]);
+        lbb_store<T>(&dX[i], dyv * (1.0f - yv * yv));
+    }
+}
 
 template <typename T>
 __global__ void linear_backward_batched_dx_kernel(const T* __restrict__ W,
@@ -216,59 +224,124 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
 }
 
 void relu_forward_batched(const Tensor& X_BD, Tensor& Y_BD) {
-    if (Y_BD.rows != X_BD.rows || Y_BD.cols != X_BD.cols)
-        Y_BD.resize(X_BD.rows, X_BD.cols);
+    if (Y_BD.rows != X_BD.rows || Y_BD.cols != X_BD.cols ||
+        Y_BD.dtype != X_BD.dtype) {
+        Y_BD.resize(X_BD.rows, X_BD.cols, X_BD.dtype);
+    }
     const int n = X_BD.size();
     if (n == 0) return;
-    relu_forward_batched_kernel<<<grid_for(n), EW_BLOCK>>>(
-        static_cast<const float*>(X_BD.data),
-        static_cast<float*>(Y_BD.data), n);
+    if (X_BD.dtype == Dtype::FP16) {
+        relu_forward_batched_kernel<__half><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __half*>(X_BD.data),
+            static_cast<__half*>(Y_BD.data), n);
+    } else if (X_BD.dtype == Dtype::BF16) {
+        relu_forward_batched_kernel<__nv_bfloat16><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X_BD.data),
+            static_cast<__nv_bfloat16*>(Y_BD.data), n);
+    } else {
+        relu_forward_batched_kernel<float><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(X_BD.data),
+            static_cast<float*>(Y_BD.data), n);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
 void tanh_forward_batched(const Tensor& X_BD, Tensor& Y_BD) {
-    if (Y_BD.rows != X_BD.rows || Y_BD.cols != X_BD.cols)
-        Y_BD.resize(X_BD.rows, X_BD.cols);
+    if (Y_BD.rows != X_BD.rows || Y_BD.cols != X_BD.cols ||
+        Y_BD.dtype != X_BD.dtype) {
+        Y_BD.resize(X_BD.rows, X_BD.cols, X_BD.dtype);
+    }
     const int n = X_BD.size();
     if (n == 0) return;
-    tanh_forward_batched_kernel<<<grid_for(n), EW_BLOCK>>>(
-        static_cast<const float*>(X_BD.data),
-        static_cast<float*>(Y_BD.data), n);
+    if (X_BD.dtype == Dtype::FP16) {
+        tanh_forward_batched_kernel<__half><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __half*>(X_BD.data),
+            static_cast<__half*>(Y_BD.data), n);
+    } else if (X_BD.dtype == Dtype::BF16) {
+        tanh_forward_batched_kernel<__nv_bfloat16><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X_BD.data),
+            static_cast<__nv_bfloat16*>(Y_BD.data), n);
+    } else {
+        tanh_forward_batched_kernel<float><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(X_BD.data),
+            static_cast<float*>(Y_BD.data), n);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
 void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD) {
+    if (Y_BD.dtype != X_BD.dtype) {
+        throw std::runtime_error("add_inplace_batched: dtype mismatch");
+    }
     const int n = Y_BD.size();
     if (n == 0) return;
-    add_inplace_batched_kernel<<<grid_for(n), EW_BLOCK>>>(
-        static_cast<float*>(Y_BD.data),
-        static_cast<const float*>(X_BD.data), n);
+    if (Y_BD.dtype == Dtype::FP16) {
+        add_inplace_batched_kernel<__half><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<__half*>(Y_BD.data),
+            static_cast<const __half*>(X_BD.data), n);
+    } else if (Y_BD.dtype == Dtype::BF16) {
+        add_inplace_batched_kernel<__nv_bfloat16><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<__nv_bfloat16*>(Y_BD.data),
+            static_cast<const __nv_bfloat16*>(X_BD.data), n);
+    } else {
+        add_inplace_batched_kernel<float><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<float*>(Y_BD.data),
+            static_cast<const float*>(X_BD.data), n);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
 void relu_backward_batched(const Tensor& X_BD, const Tensor& dY_BD,
                            Tensor& dX_BD) {
-    if (dX_BD.rows != X_BD.rows || dX_BD.cols != X_BD.cols)
-        dX_BD.resize(X_BD.rows, X_BD.cols);
+    if (dX_BD.rows != X_BD.rows || dX_BD.cols != X_BD.cols ||
+        dX_BD.dtype != X_BD.dtype) {
+        dX_BD.resize(X_BD.rows, X_BD.cols, X_BD.dtype);
+    }
     const int n = X_BD.size();
     if (n == 0) return;
-    relu_backward_batched_kernel<<<grid_for(n), EW_BLOCK>>>(
-        static_cast<const float*>(X_BD.data),
-        static_cast<const float*>(dY_BD.data),
-        static_cast<float*>(dX_BD.data), n);
+    if (X_BD.dtype == Dtype::FP16) {
+        relu_backward_batched_kernel<__half><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __half*>(X_BD.data),
+            static_cast<const __half*>(dY_BD.data),
+            static_cast<__half*>(dX_BD.data), n);
+    } else if (X_BD.dtype == Dtype::BF16) {
+        relu_backward_batched_kernel<__nv_bfloat16><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X_BD.data),
+            static_cast<const __nv_bfloat16*>(dY_BD.data),
+            static_cast<__nv_bfloat16*>(dX_BD.data), n);
+    } else {
+        relu_backward_batched_kernel<float><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(X_BD.data),
+            static_cast<const float*>(dY_BD.data),
+            static_cast<float*>(dX_BD.data), n);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
 void tanh_backward_batched(const Tensor& Y_BD, const Tensor& dY_BD,
                            Tensor& dX_BD) {
-    if (dX_BD.rows != Y_BD.rows || dX_BD.cols != Y_BD.cols)
-        dX_BD.resize(Y_BD.rows, Y_BD.cols);
+    if (dX_BD.rows != Y_BD.rows || dX_BD.cols != Y_BD.cols ||
+        dX_BD.dtype != Y_BD.dtype) {
+        dX_BD.resize(Y_BD.rows, Y_BD.cols, Y_BD.dtype);
+    }
     const int n = Y_BD.size();
     if (n == 0) return;
-    tanh_backward_batched_kernel<<<grid_for(n), EW_BLOCK>>>(
-        static_cast<const float*>(Y_BD.data),
-        static_cast<const float*>(dY_BD.data),
-        static_cast<float*>(dX_BD.data), n);
+    if (Y_BD.dtype == Dtype::FP16) {
+        tanh_backward_batched_kernel<__half><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __half*>(Y_BD.data),
+            static_cast<const __half*>(dY_BD.data),
+            static_cast<__half*>(dX_BD.data), n);
+    } else if (Y_BD.dtype == Dtype::BF16) {
+        tanh_backward_batched_kernel<__nv_bfloat16><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(Y_BD.data),
+            static_cast<const __nv_bfloat16*>(dY_BD.data),
+            static_cast<__nv_bfloat16*>(dX_BD.data), n);
+    } else {
+        tanh_backward_batched_kernel<float><<<grid_for(n), EW_BLOCK>>>(
+            static_cast<const float*>(Y_BD.data),
+            static_cast<const float*>(dY_BD.data),
+            static_cast<float*>(dX_BD.data), n);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

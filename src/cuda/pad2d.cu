@@ -1,6 +1,6 @@
 // ─── CUDA 2D padding: pad2d_forward + pad2d_backward ──────────────────────
 //
-// FP32-only port of src/cpu/pad2d.cpp. Contracts mirror CPU exactly:
+// CUDA port of src/cpu/pad2d.cpp. Contracts:
 //   * NCHW flat layout (rows = N, cols = C*H*W for X / dX; cols = C*H_pad*W_pad
 //     for Y / dY).
 //   * Modes: 0 = zero, 1 = reflect (no edge repeat; requires pad < H/W on that
@@ -8,13 +8,19 @@
 //   * Forward overwrites Y. Backward overwrites dX (zero-then-scatter). For
 //     reflect/replicate multiple output positions may collapse onto the same
 //     input pixel — use atomicAdd. Zero mode has no overlap but we still use
-//     atomicAdd for uniformity / correctness when pads are 0 (trivial).
+//     atomicAdd for uniformity.
+//
+// CPU is FP32-only; CUDA additionally supports FP16/BF16 — forward casts at
+// load/store, backward accumulates into FP32 scratch (no native fp16/bf16
+// atomicAdd across all arches) then casts into dX.
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 #include <string>
@@ -36,12 +42,23 @@ inline int pd_grid(long long n) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + reason);
 }
 
-inline void check_fp32(const ::brotensor::Tensor& t,
-                       const char* op, const char* name) {
-    if (t.dtype != ::brotensor::Dtype::FP32) {
-        fail(op, std::string(name) + " must be FP32");
+inline void check_fp(const ::brotensor::Tensor& t,
+                     const char* op, const char* name) {
+    if (t.dtype != ::brotensor::Dtype::FP32 &&
+        t.dtype != ::brotensor::Dtype::FP16 &&
+        t.dtype != ::brotensor::Dtype::BF16) {
+        fail(op, std::string(name) + " must be FP32/FP16/BF16");
     }
 }
+
+template <typename T> __device__ inline float pd_load(const T* p);
+template <> __device__ inline float pd_load<float>(const float* p) { return *p; }
+template <> __device__ inline float pd_load<__half>(const __half* p) { return __half2float(*p); }
+template <> __device__ inline float pd_load<__nv_bfloat16>(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+template <typename T> __device__ inline void pd_store(T* p, float v);
+template <> __device__ inline void pd_store<float>(float* p, float v) { *p = v; }
+template <> __device__ inline void pd_store<__half>(__half* p, float v) { *p = __float2half(v); }
+template <> __device__ inline void pd_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
 inline void check_args(const char* op,
                        int N, int C, int H, int W,
@@ -78,8 +95,9 @@ __device__ inline int pad_src_d(int p, int L, int pad_left, int mode) {
 }
 
 // ── pad2d_forward kernel — one thread per output pixel ────────────────────
-__global__ void pad2d_forward_kernel(const float* __restrict__ X,
-                                     float* __restrict__ Y,
+template <typename T>
+__global__ void pad2d_forward_kernel(const T* __restrict__ X,
+                                     T* __restrict__ Y,
                                      int N, int C, int H, int W,
                                      int pad_top, int pad_left, int mode,
                                      int H_pad, int W_pad) {
@@ -97,15 +115,16 @@ __global__ void pad2d_forward_kernel(const float* __restrict__ X,
         float v = 0.0f;
         if (src_h >= 0 && src_w >= 0) {
             const long long xbase = ((long long)n * C + c) * H * W;
-            v = X[xbase + (long long)src_h * W + src_w];
+            v = pd_load<T>(&X[xbase + (long long)src_h * W + src_w]);
         }
-        Y[idx] = v;
+        pd_store<T>(&Y[idx], v);
     }
 }
 
-// ── pad2d_backward kernel — scatter via atomicAdd ─────────────────────────
-__global__ void pad2d_backward_kernel(const float* __restrict__ dY,
-                                      float* __restrict__ dX,
+// ── pad2d_backward kernel — scatter via atomicAdd (FP32 dst) ──────────────
+template <typename T>
+__global__ void pad2d_backward_kernel(const T* __restrict__ dY,
+                                      float* __restrict__ dX_fp32,
                                       int N, int C, int H, int W,
                                       int pad_top, int pad_left, int mode,
                                       int H_pad, int W_pad) {
@@ -123,7 +142,17 @@ __global__ void pad2d_backward_kernel(const float* __restrict__ dY,
         const int src_w = pad_src_d(ow, W, pad_left, mode);
         if (src_w < 0) continue;
         const long long xbase = ((long long)n * C + c) * H * W;
-        atomicAdd(&dX[xbase + (long long)src_h * W + src_w], dY[idx]);
+        atomicAdd(&dX_fp32[xbase + (long long)src_h * W + src_w],
+                  pd_load<T>(&dY[idx]));
+    }
+}
+
+template <typename T>
+__global__ void pad2d_cast_fp32_to_T(const float* __restrict__ src,
+                                     T* __restrict__ dst, long long n) {
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         i < n; i += (long long)blockDim.x * gridDim.x) {
+        pd_store<T>(&dst[i], src[i]);
     }
 }
 
@@ -137,7 +166,7 @@ void pad2d_forward(const ::brotensor::Tensor& X,
                    int pad_left, int pad_right, int mode,
                    ::brotensor::Tensor& Y) {
     const char* op = "pad2d_forward";
-    check_fp32(X, op, "X");
+    check_fp(X, op, "X");
     check_args(op, N, C, H, W, pad_top, pad_bottom, pad_left, pad_right, mode);
     if (X.rows != N || X.cols != C * H * W)
         fail(op, "X shape must be (N, C*H*W)");
@@ -145,16 +174,25 @@ void pad2d_forward(const ::brotensor::Tensor& X,
     const int H_pad = H + pad_top + pad_bottom;
     const int W_pad = W + pad_left + pad_right;
     const int cols_out = C * H_pad * W_pad;
-    if (Y.rows != N || Y.cols != cols_out ||
-        Y.dtype != ::brotensor::Dtype::FP32) {
-        Y.resize(N, cols_out, ::brotensor::Dtype::FP32);
+    if (Y.rows != N || Y.cols != cols_out || Y.dtype != X.dtype) {
+        Y.resize(N, cols_out, X.dtype);
     }
     if (N == 0 || C == 0) return;
 
     const long long total = (long long)N * cols_out;
-    pad2d_forward_kernel<<<pd_grid(total), PD_BLOCK>>>(
-        static_cast<const float*>(X.data), static_cast<float*>(Y.data),
-        N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
+    if (X.dtype == ::brotensor::Dtype::FP16) {
+        pad2d_forward_kernel<__half><<<pd_grid(total), PD_BLOCK>>>(
+            static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
+            N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
+    } else if (X.dtype == ::brotensor::Dtype::BF16) {
+        pad2d_forward_kernel<__nv_bfloat16><<<pd_grid(total), PD_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data), static_cast<__nv_bfloat16*>(Y.data),
+            N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
+    } else {
+        pad2d_forward_kernel<float><<<pd_grid(total), PD_BLOCK>>>(
+            static_cast<const float*>(X.data), static_cast<float*>(Y.data),
+            N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -164,7 +202,7 @@ void pad2d_backward(const ::brotensor::Tensor& dY,
                     int pad_left, int pad_right, int mode,
                     ::brotensor::Tensor& dX) {
     const char* op = "pad2d_backward";
-    check_fp32(dY, op, "dY");
+    check_fp(dY, op, "dY");
     check_args(op, N, C, H, W, pad_top, pad_bottom, pad_left, pad_right, mode);
     const int H_pad = H + pad_top + pad_bottom;
     const int W_pad = W + pad_left + pad_right;
@@ -172,22 +210,54 @@ void pad2d_backward(const ::brotensor::Tensor& dY,
         fail(op, "dY shape must be (N, C*(H+pt+pb)*(W+pl+pr))");
 
     const int cols_in = C * H * W;
-    if (dX.rows != N || dX.cols != cols_in ||
-        dX.dtype != ::brotensor::Dtype::FP32) {
-        dX.resize(N, cols_in, ::brotensor::Dtype::FP32);
+    if (dX.rows != N || dX.cols != cols_in || dX.dtype != dY.dtype) {
+        dX.resize(N, cols_in, dY.dtype);
     }
     if (N == 0 || C == 0) return;
 
-    const long long total_in = (long long)N * cols_in;
-    BROTENSOR_CUDA_CHECK(cudaMemset(
-        dX.data, 0, static_cast<size_t>(total_in) * sizeof(float)));
-
+    const long long total_in  = (long long)N * cols_in;
     const long long total_out = (long long)N * C * H_pad * W_pad;
-    if (total_out == 0) return;
-    pad2d_backward_kernel<<<pd_grid(total_out), PD_BLOCK>>>(
-        static_cast<const float*>(dY.data), static_cast<float*>(dX.data),
-        N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+
+    if (dY.dtype == ::brotensor::Dtype::FP32) {
+        BROTENSOR_CUDA_CHECK(cudaMemset(
+            dX.data, 0, static_cast<size_t>(total_in) * sizeof(float)));
+        if (total_out == 0) return;
+        pad2d_backward_kernel<float><<<pd_grid(total_out), PD_BLOCK>>>(
+            static_cast<const float*>(dY.data), static_cast<float*>(dX.data),
+            N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // FP16/BF16: scatter-accumulate into FP32 scratch, then cast into dX.
+    float* d_scratch = nullptr;
+    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
+                                    static_cast<size_t>(total_in) * sizeof(float)));
+    BROTENSOR_CUDA_CHECK(cudaMemset(d_scratch, 0,
+                                    static_cast<size_t>(total_in) * sizeof(float)));
+    if (total_out > 0) {
+        if (dY.dtype == ::brotensor::Dtype::FP16) {
+            pad2d_backward_kernel<__half><<<pd_grid(total_out), PD_BLOCK>>>(
+                static_cast<const __half*>(dY.data), d_scratch,
+                N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
+        } else {
+            pad2d_backward_kernel<__nv_bfloat16><<<pd_grid(total_out), PD_BLOCK>>>(
+                static_cast<const __nv_bfloat16*>(dY.data), d_scratch,
+                N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
+        }
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+    if (total_in > 0) {
+        if (dY.dtype == ::brotensor::Dtype::FP16) {
+            pad2d_cast_fp32_to_T<__half><<<pd_grid(total_in), PD_BLOCK>>>(
+                d_scratch, static_cast<__half*>(dX.data), total_in);
+        } else {
+            pad2d_cast_fp32_to_T<__nv_bfloat16><<<pd_grid(total_in), PD_BLOCK>>>(
+                d_scratch, static_cast<__nv_bfloat16*>(dX.data), total_in);
+        }
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+    cudaFree(d_scratch);
 }
 
 // ─── vtable registration ────────────────────────────────────────────────────

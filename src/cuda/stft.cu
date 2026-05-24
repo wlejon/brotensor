@@ -54,6 +54,16 @@ inline void require_fp32(const char* op, const ::brotensor::Tensor& t,
     }
 }
 
+// Reject a committed (data != nullptr) output that is not FP32. Uncommitted
+// outputs get their dtype pinned by the explicit FP32 resize below.
+inline void require_fp32_out(const char* op, const ::brotensor::Tensor& t,
+                             const char* name) {
+    if (t.data != nullptr && t.dtype != ::brotensor::Dtype::FP32) {
+        fail(op, std::string(name) +
+             " must be FP32 (audio ops are FP32-only)");
+    }
+}
+
 // Common parameter validation + derived sizes — mirrors the CPU StftGeom.
 struct StftGeom {
     int bins = 0;        // n_fft/2 + 1
@@ -314,8 +324,10 @@ void stft(const ::brotensor::Tensor& signal, const ::brotensor::Tensor& window,
                                   win_length, center);
     const int out_rows = N * g.frames;
     const int out_cols = 2 * g.bins;
-    if (spec.rows != out_rows || spec.cols != out_cols) {
-        spec.resize(out_rows, out_cols);
+    require_fp32_out("stft", spec, "spec");
+    if (spec.rows != out_rows || spec.cols != out_cols ||
+        spec.dtype != ::brotensor::Dtype::FP32) {
+        spec.resize(out_rows, out_cols, ::brotensor::Dtype::FP32);
     }
     if (out_rows == 0) return;
     const double norm = normalized
@@ -348,8 +360,10 @@ void stft_backward(const ::brotensor::Tensor& dSpec,
     if (dSpec.rows != exp_rows || dSpec.cols != exp_cols) {
         fail("stft_backward", "dSpec shape must match the stft output shape");
     }
-    if (dSignal.rows != N || dSignal.cols != signal_len) {
-        dSignal.resize(N, signal_len);
+    require_fp32_out("stft_backward", dSignal, "dSignal");
+    if (dSignal.rows != N || dSignal.cols != signal_len ||
+        dSignal.dtype != ::brotensor::Dtype::FP32) {
+        dSignal.resize(N, signal_len, ::brotensor::Dtype::FP32);
     }
     if (dSignal.size() != 0) {
         BROTENSOR_CUDA_CHECK(cudaMemset(
@@ -385,8 +399,10 @@ void istft(const ::brotensor::Tensor& spec, const ::brotensor::Tensor& window,
     if (spec.rows != exp_rows || spec.cols != exp_cols) {
         fail("istft", "spec shape must match the stft output shape");
     }
-    if (signal.rows != N || signal.cols != signal_len) {
-        signal.resize(N, signal_len);
+    require_fp32_out("istft", signal, "signal");
+    if (signal.rows != N || signal.cols != signal_len ||
+        signal.dtype != ::brotensor::Dtype::FP32) {
+        signal.resize(N, signal_len, ::brotensor::Dtype::FP32);
     }
     if (exp_rows == 0) return;
     const double norm = normalized ? std::sqrt(static_cast<double>(n_fft))
@@ -429,8 +445,10 @@ void istft_backward(const ::brotensor::Tensor& dSignal,
                                   hop_length, win_length, center);
     const int out_rows = N * g.frames;
     const int out_cols = 2 * g.bins;
-    if (dSpec.rows != out_rows || dSpec.cols != out_cols) {
-        dSpec.resize(out_rows, out_cols);
+    require_fp32_out("istft_backward", dSpec, "dSpec");
+    if (dSpec.rows != out_rows || dSpec.cols != out_cols ||
+        dSpec.dtype != ::brotensor::Dtype::FP32) {
+        dSpec.resize(out_rows, out_cols, ::brotensor::Dtype::FP32);
     }
     if (out_rows == 0) return;
     const double norm = normalized ? std::sqrt(static_cast<double>(n_fft))

@@ -137,12 +137,25 @@ float softmax_xent_segment(const float* logits, const float* target,
 
 float softmax_xent(const Tensor& logits, const Tensor& target,
                    Tensor& probs, Tensor& dLogits, const float* mask) {
+    // FP32-by-design: logits/target/probs/dLogits must all be FP32 (mixed-
+    // precision pipelines upcast logits before xent). Reject any non-FP32
+    // operand so reinterpret-casts to float* are always sound.
+    if (logits.dtype != ::brotensor::Dtype::FP32)
+        fail("softmax_xent", "logits must be FP32 (loss ops are FP32-by-design)");
+    if (target.dtype != ::brotensor::Dtype::FP32)
+        fail("softmax_xent", "target must be FP32 (loss ops are FP32-by-design)");
+    if (probs.data != nullptr && probs.dtype != ::brotensor::Dtype::FP32)
+        fail("softmax_xent", "probs must be FP32 (loss ops are FP32-by-design)");
+    if (dLogits.data != nullptr && dLogits.dtype != ::brotensor::Dtype::FP32)
+        fail("softmax_xent", "dLogits must be FP32 (loss ops are FP32-by-design)");
     const int n = logits.size();
-    if (probs.rows != logits.rows || probs.cols != logits.cols) {
-        probs.resize(logits.rows, logits.cols);
+    if (probs.rows != logits.rows || probs.cols != logits.cols ||
+        probs.dtype != ::brotensor::Dtype::FP32) {
+        probs.resize(logits.rows, logits.cols, ::brotensor::Dtype::FP32);
     }
-    if (dLogits.rows != logits.rows || dLogits.cols != logits.cols) {
-        dLogits.resize(logits.rows, logits.cols);
+    if (dLogits.rows != logits.rows || dLogits.cols != logits.cols ||
+        dLogits.dtype != ::brotensor::Dtype::FP32) {
+        dLogits.resize(logits.rows, logits.cols, ::brotensor::Dtype::FP32);
     }
     if (target.size() != n) fail("softmax_xent", "target size mismatch");
     return run_softmax_xent_segment(

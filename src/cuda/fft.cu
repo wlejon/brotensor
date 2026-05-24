@@ -59,6 +59,17 @@ inline void require_fp32(const char* op, const ::brotensor::Tensor& t,
     }
 }
 
+// Validate a committed output tensor is FP32. An uncommitted output (data==nullptr)
+// gets its dtype pinned by the resize() below; only committed outputs can carry
+// a stale non-FP32 dtype that would survive a same-shape resize() no-op.
+inline void require_fp32_out(const char* op, const ::brotensor::Tensor& t,
+                             const char* name) {
+    if (t.data != nullptr && t.dtype != ::brotensor::Dtype::FP32) {
+        fail(op, std::string(name) +
+             " must be FP32 (audio ops are FP32-only)");
+    }
+}
+
 // ─── complex elementwise kernels ────────────────────────────────────────────
 
 // y = a * b, complex elementwise. One thread per complex pair.
@@ -302,7 +313,9 @@ void complex_mul(const ::brotensor::Tensor& a, const ::brotensor::Tensor& b,
     if (a.cols % 2 != 0) {
         fail("complex_mul", "cols must be even (interleaved [re,im] layout)");
     }
-    if (y.rows != a.rows || y.cols != a.cols) y.resize(a.rows, a.cols);
+    require_fp32_out("complex_mul", y, "y");
+    if (y.rows != a.rows || y.cols != a.cols || y.dtype != ::brotensor::Dtype::FP32)
+        y.resize(a.rows, a.cols, ::brotensor::Dtype::FP32);
     const long long pairs = static_cast<long long>(a.size()) / 2;
     if (pairs == 0) return;
     complex_mul_kernel<<<fft_grid(pairs), FFT_BLOCK>>>(
@@ -347,7 +360,9 @@ void complex_abs(const ::brotensor::Tensor& z, ::brotensor::Tensor& y) {
         fail("complex_abs", "z.cols must be even (interleaved [re,im] layout)");
     }
     const int C = z.cols / 2;
-    if (y.rows != z.rows || y.cols != C) y.resize(z.rows, C);
+    require_fp32_out("complex_abs", y, "y");
+    if (y.rows != z.rows || y.cols != C || y.dtype != ::brotensor::Dtype::FP32)
+        y.resize(z.rows, C, ::brotensor::Dtype::FP32);
     const long long bins = static_cast<long long>(z.rows) * C;
     if (bins == 0) return;
     complex_abs_kernel<<<fft_grid(bins), FFT_BLOCK>>>(
@@ -368,7 +383,9 @@ void complex_abs_backward(const ::brotensor::Tensor& z,
     if (dY.rows != z.rows || dY.cols != C) {
         fail("complex_abs_backward", "dY must be the real (R, C) magnitude grad");
     }
-    if (dZ.rows != z.rows || dZ.cols != z.cols) dZ.resize(z.rows, z.cols);
+    require_fp32_out("complex_abs_backward", dZ, "dZ");
+    if (dZ.rows != z.rows || dZ.cols != z.cols || dZ.dtype != ::brotensor::Dtype::FP32)
+        dZ.resize(z.rows, z.cols, ::brotensor::Dtype::FP32);
     const long long bins = static_cast<long long>(z.rows) * C;
     if (bins == 0) return;
     complex_abs_backward_kernel<<<fft_grid(bins), FFT_BLOCK>>>(
@@ -383,7 +400,9 @@ void complex_angle(const ::brotensor::Tensor& z, ::brotensor::Tensor& y) {
         fail("complex_angle", "z.cols must be even (interleaved [re,im] layout)");
     }
     const int C = z.cols / 2;
-    if (y.rows != z.rows || y.cols != C) y.resize(z.rows, C);
+    require_fp32_out("complex_angle", y, "y");
+    if (y.rows != z.rows || y.cols != C || y.dtype != ::brotensor::Dtype::FP32)
+        y.resize(z.rows, C, ::brotensor::Dtype::FP32);
     const long long bins = static_cast<long long>(z.rows) * C;
     if (bins == 0) return;
     complex_angle_kernel<<<fft_grid(bins), FFT_BLOCK>>>(
@@ -400,7 +419,9 @@ void complex_from_polar(const ::brotensor::Tensor& mag,
         fail("complex_from_polar", "mag and phase must have identical shape");
     }
     const int C = mag.cols;
-    if (y.rows != mag.rows || y.cols != 2 * C) y.resize(mag.rows, 2 * C);
+    require_fp32_out("complex_from_polar", y, "y");
+    if (y.rows != mag.rows || y.cols != 2 * C || y.dtype != ::brotensor::Dtype::FP32)
+        y.resize(mag.rows, 2 * C, ::brotensor::Dtype::FP32);
     const long long bins = static_cast<long long>(mag.rows) * C;
     if (bins == 0) return;
     complex_from_polar_kernel<<<fft_grid(bins), FFT_BLOCK>>>(
@@ -416,8 +437,10 @@ void complex_from_polar(const ::brotensor::Tensor& mag,
 
 void fft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     require_fp32("fft", x, "x");
+    require_fp32_out("fft", y, "y");
     if (x.cols % 2 != 0) fail("fft", "x.cols must be even (interleaved [re,im])");
-    if (y.rows != x.rows || y.cols != x.cols) y.resize(x.rows, x.cols);
+    if (y.rows != x.rows || y.cols != x.cols || y.dtype != ::brotensor::Dtype::FP32)
+        y.resize(x.rows, x.cols, ::brotensor::Dtype::FP32);
     if (x.size() == 0) return;
     const int N = x.cols / 2;
     dft_complex_kernel<<<fft_grid((long long)x.rows * N), FFT_BLOCK>>>(
@@ -428,8 +451,10 @@ void fft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
 
 void ifft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     require_fp32("ifft", x, "x");
+    require_fp32_out("ifft", y, "y");
     if (x.cols % 2 != 0) fail("ifft", "x.cols must be even (interleaved [re,im])");
-    if (y.rows != x.rows || y.cols != x.cols) y.resize(x.rows, x.cols);
+    if (y.rows != x.rows || y.cols != x.cols || y.dtype != ::brotensor::Dtype::FP32)
+        y.resize(x.rows, x.cols, ::brotensor::Dtype::FP32);
     if (x.size() == 0) return;
     const int N = x.cols / 2;
     const double inv = (N > 0) ? 1.0 / static_cast<double>(N) : 1.0;
@@ -441,10 +466,12 @@ void ifft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
 
 void rfft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     require_fp32("rfft", x, "x");
+    require_fp32_out("rfft", y, "y");
     const int L = x.cols;
     if (L == 0) fail("rfft", "signal length L (x.cols) must be >= 1");
     const int C = L / 2 + 1;
-    if (y.rows != x.rows || y.cols != 2 * C) y.resize(x.rows, 2 * C);
+    if (y.rows != x.rows || y.cols != 2 * C || y.dtype != ::brotensor::Dtype::FP32)
+        y.resize(x.rows, 2 * C, ::brotensor::Dtype::FP32);
     if (x.size() == 0) return;
     rfft_kernel<<<fft_grid((long long)x.rows * C), FFT_BLOCK>>>(
         static_cast<const float*>(x.data), static_cast<float*>(y.data),
@@ -454,13 +481,15 @@ void rfft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
 
 void irfft(const ::brotensor::Tensor& x, int L, ::brotensor::Tensor& y) {
     require_fp32("irfft", x, "x");
+    require_fp32_out("irfft", y, "y");
     if (x.cols % 2 != 0) {
         fail("irfft", "x.cols must be even (interleaved [re,im] layout)");
     }
     const int C = x.cols / 2;
     if (L <= 0) fail("irfft", "output length L must be >= 1");
     if (C != L / 2 + 1) fail("irfft", "half-spectrum bin count must equal L/2+1");
-    if (y.rows != x.rows || y.cols != L) y.resize(x.rows, L);
+    if (y.rows != x.rows || y.cols != L || y.dtype != ::brotensor::Dtype::FP32)
+        y.resize(x.rows, L, ::brotensor::Dtype::FP32);
     if (x.size() == 0) return;
     irfft_kernel<<<fft_grid((long long)x.rows * L), FFT_BLOCK>>>(
         static_cast<const float*>(x.data), static_cast<float*>(y.data),
@@ -477,7 +506,9 @@ void rfft_backward(const ::brotensor::Tensor& dY, int L,
     const int C = dY.cols / 2;
     if (L <= 0) fail("rfft_backward", "signal length L must be >= 1");
     if (C != L / 2 + 1) fail("rfft_backward", "dY bin count must equal L/2+1");
-    if (dX.rows != dY.rows || dX.cols != L) dX.resize(dY.rows, L);
+    require_fp32_out("rfft_backward", dX, "dX");
+    if (dX.rows != dY.rows || dX.cols != L || dX.dtype != ::brotensor::Dtype::FP32)
+        dX.resize(dY.rows, L, ::brotensor::Dtype::FP32);
     if (dY.size() == 0) return;
     rfft_backward_kernel<<<fft_grid((long long)dY.rows * L), FFT_BLOCK>>>(
         static_cast<const float*>(dY.data), static_cast<float*>(dX.data),
@@ -490,7 +521,9 @@ void irfft_backward(const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX) {
     const int L = dY.cols;
     if (L == 0) fail("irfft_backward", "dY length L (dY.cols) must be >= 1");
     const int C = L / 2 + 1;
-    if (dX.rows != dY.rows || dX.cols != 2 * C) dX.resize(dY.rows, 2 * C);
+    require_fp32_out("irfft_backward", dX, "dX");
+    if (dX.rows != dY.rows || dX.cols != 2 * C || dX.dtype != ::brotensor::Dtype::FP32)
+        dX.resize(dY.rows, 2 * C, ::brotensor::Dtype::FP32);
     if (dY.size() == 0) return;
     irfft_backward_kernel<<<fft_grid((long long)dY.rows * C), FFT_BLOCK>>>(
         static_cast<const float*>(dY.data), static_cast<float*>(dX.data),

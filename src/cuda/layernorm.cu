@@ -194,6 +194,107 @@ __global__ void ln_add_fp32_into_fp16(const float* __restrict__ src,
     dst[i] = __float2half(__half2float(dst[i]) + src[i]);
 }
 
+// FP16 forward. Loads/stores in FP16; mean/variance reductions in FP32.
+// Writes xhat in FP16 to round-trip with layernorm_backward (which dispatches
+// on dY.dtype and requires xhat.dtype == dY.dtype).
+__global__ void layernorm_forward_kernel_fp16(const __half* __restrict__ x,
+                                              const __half* __restrict__ gamma,
+                                              const __half* __restrict__ beta,
+                                              __half* __restrict__ y,
+                                              __half* __restrict__ xhat,
+                                              float* __restrict__ scratch, // [mean, rstd]
+                                              int n, float eps) {
+    __shared__ float sdata[LN_BLOCK];
+    const int tid = threadIdx.x;
+
+    // Mean.
+    float local = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) local += __half2float(x[i]);
+    sdata[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float mean = sdata[0] / static_cast<float>(n);
+
+    // Variance.
+    float local_v = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float d = __half2float(x[i]) - mean;
+        local_v += d * d;
+    }
+    sdata[tid] = local_v;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float var  = sdata[0] / static_cast<float>(n);
+    const float rstd = rsqrtf(var + eps);
+
+    if (tid == 0) {
+        scratch[0] = mean;
+        scratch[1] = rstd;
+    }
+
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float xh = (__half2float(x[i]) - mean) * rstd;
+        xhat[i] = __float2half(xh);
+        const float g = __half2float(gamma[i]);
+        const float b = __half2float(beta[i]);
+        y[i] = __float2half(g * xh + b);
+    }
+}
+
+__global__ void layernorm_forward_kernel_bf16(const __nv_bfloat16* __restrict__ x,
+                                              const __nv_bfloat16* __restrict__ gamma,
+                                              const __nv_bfloat16* __restrict__ beta,
+                                              __nv_bfloat16* __restrict__ y,
+                                              __nv_bfloat16* __restrict__ xhat,
+                                              float* __restrict__ scratch, // [mean, rstd]
+                                              int n, float eps) {
+    __shared__ float sdata[LN_BLOCK];
+    const int tid = threadIdx.x;
+
+    float local = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) local += __bfloat162float(x[i]);
+    sdata[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float mean = sdata[0] / static_cast<float>(n);
+
+    float local_v = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float d = __bfloat162float(x[i]) - mean;
+        local_v += d * d;
+    }
+    sdata[tid] = local_v;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float var  = sdata[0] / static_cast<float>(n);
+    const float rstd = rsqrtf(var + eps);
+
+    if (tid == 0) {
+        scratch[0] = mean;
+        scratch[1] = rstd;
+    }
+
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float xh = (__bfloat162float(x[i]) - mean) * rstd;
+        xhat[i] = __float2bfloat16(xh);
+        const float g = __bfloat162float(gamma[i]);
+        const float b = __bfloat162float(beta[i]);
+        y[i] = __float2bfloat16(g * xh + b);
+    }
+}
+
 // BF16 backward — verbatim copy of layernorm_backward_kernel_fp16 with
 // __half → __nv_bfloat16, __half2float → __bfloat162float, __float2half →
 // __float2bfloat16. FP32 scratch/fold pattern mirrored exactly.
@@ -262,9 +363,20 @@ void layernorm_forward(const ::brotensor::Tensor& x,
                        ::brotensor::Tensor& y, ::brotensor::Tensor& xhat,
                        float& mean_out, float& rstd_out,
                        float eps) {
+    using ::brotensor::Dtype;
+    if (x.dtype != Dtype::FP16 && x.dtype != Dtype::BF16 && x.dtype != Dtype::FP32) {
+        throw std::runtime_error("layernorm_forward: x must be FP16, BF16, or FP32");
+    }
+    if (gamma.dtype != x.dtype || beta.dtype != x.dtype) {
+        throw std::runtime_error("layernorm_forward: gamma/beta dtype must match x.dtype");
+    }
     const int n = x.size();
-    if (y.rows != x.rows || y.cols != x.cols) y.resize(x.rows, x.cols);
-    if (xhat.rows != x.rows || xhat.cols != x.cols) xhat.resize(x.rows, x.cols);
+    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
+        y.resize(x.rows, x.cols, x.dtype);
+    }
+    if (xhat.rows != x.rows || xhat.cols != x.cols || xhat.dtype != x.dtype) {
+        xhat.resize(x.rows, x.cols, x.dtype);
+    }
     if (n == 0) {
         mean_out = 0.0f;
         rstd_out = 0.0f;
@@ -276,14 +388,31 @@ void layernorm_forward(const ::brotensor::Tensor& x,
     BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
                               2 * sizeof(float)));
 
-    layernorm_forward_kernel<<<1, LN_BLOCK>>>(
-        reinterpret_cast<const float*>(x.data),
-        reinterpret_cast<const float*>(gamma.data),
-        reinterpret_cast<const float*>(beta.data),
-        reinterpret_cast<float*>(y.data),
-        reinterpret_cast<float*>(xhat.data),
-        d_scratch,
-        n, eps);
+    if (x.dtype == Dtype::FP16) {
+        layernorm_forward_kernel_fp16<<<1, LN_BLOCK>>>(
+            reinterpret_cast<const __half*>(x.data),
+            reinterpret_cast<const __half*>(gamma.data),
+            reinterpret_cast<const __half*>(beta.data),
+            reinterpret_cast<__half*>(y.data),
+            reinterpret_cast<__half*>(xhat.data),
+            d_scratch, n, eps);
+    } else if (x.dtype == Dtype::BF16) {
+        layernorm_forward_kernel_bf16<<<1, LN_BLOCK>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x.data),
+            reinterpret_cast<const __nv_bfloat16*>(gamma.data),
+            reinterpret_cast<const __nv_bfloat16*>(beta.data),
+            reinterpret_cast<__nv_bfloat16*>(y.data),
+            reinterpret_cast<__nv_bfloat16*>(xhat.data),
+            d_scratch, n, eps);
+    } else {
+        layernorm_forward_kernel<<<1, LN_BLOCK>>>(
+            reinterpret_cast<const float*>(x.data),
+            reinterpret_cast<const float*>(gamma.data),
+            reinterpret_cast<const float*>(beta.data),
+            reinterpret_cast<float*>(y.data),
+            reinterpret_cast<float*>(xhat.data),
+            d_scratch, n, eps);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     float h[2] = {0.0f, 0.0f};
@@ -395,6 +524,54 @@ __global__ void layernorm_forward_inference_batched_fp16_kernel(
 }
 } // namespace
 
+namespace {
+__global__ void layernorm_forward_inference_batched_bf16_kernel(
+        const __nv_bfloat16* __restrict__ x,
+        const __nv_bfloat16* __restrict__ gamma,
+        const __nv_bfloat16* __restrict__ beta,
+        __nv_bfloat16* __restrict__ y,
+        int R, int D, float eps) {
+    extern __shared__ float sdata[];
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (row >= R) return;
+
+    const __nv_bfloat16* xrow = x + static_cast<size_t>(row) * D;
+    __nv_bfloat16*       yrow = y + static_cast<size_t>(row) * D;
+
+    float local = 0.0f;
+    for (int i = tid; i < D; i += blockDim.x) local += __bfloat162float(xrow[i]);
+    sdata[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float mean = sdata[0] / static_cast<float>(D);
+
+    float local_v = 0.0f;
+    for (int i = tid; i < D; i += blockDim.x) {
+        const float d = __bfloat162float(xrow[i]) - mean;
+        local_v += d * d;
+    }
+    sdata[tid] = local_v;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float var  = sdata[0] / static_cast<float>(D);
+    const float rstd = rsqrtf(var + eps);
+
+    for (int i = tid; i < D; i += blockDim.x) {
+        const float xh = (__bfloat162float(xrow[i]) - mean) * rstd;
+        const float g  = __bfloat162float(gamma[i]);
+        const float b  = __bfloat162float(beta[i]);
+        yrow[i] = __float2bfloat16(xh * g + b);
+    }
+}
+} // namespace
+
 void layernorm_forward_inference_batched_fp16(const ::brotensor::Tensor& X_RD,
                                               const ::brotensor::Tensor& gamma,
                                               const ::brotensor::Tensor& beta,
@@ -427,18 +604,44 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
                                          const ::brotensor::Tensor& beta,
                                          ::brotensor::Tensor& Y_RD,
                                          float eps) {
+    using ::brotensor::Dtype;
+    if (X_RD.dtype != Dtype::FP16 && X_RD.dtype != Dtype::BF16 &&
+        X_RD.dtype != Dtype::FP32) {
+        throw std::runtime_error("layernorm_forward_inference_batched: X must be FP16, BF16, or FP32");
+    }
+    if (gamma.dtype != X_RD.dtype || beta.dtype != X_RD.dtype) {
+        throw std::runtime_error("layernorm_forward_inference_batched: gamma/beta dtype must match X.dtype");
+    }
     const int R = X_RD.rows;
     const int D = X_RD.cols;
-    if (Y_RD.rows != R || Y_RD.cols != D) Y_RD.resize(R, D);
+    if (Y_RD.rows != R || Y_RD.cols != D || Y_RD.dtype != X_RD.dtype) {
+        Y_RD.resize(R, D, X_RD.dtype);
+    }
     if (R == 0 || D == 0) return;
     const int block = LN_BLOCK;
     const size_t shmem = static_cast<size_t>(block) * sizeof(float);
-    layernorm_forward_inference_batched_kernel<<<R, block, shmem>>>(
-        reinterpret_cast<const float*>(X_RD.data),
-        reinterpret_cast<const float*>(gamma.data),
-        reinterpret_cast<const float*>(beta.data),
-        reinterpret_cast<float*>(Y_RD.data),
-        R, D, eps);
+    if (X_RD.dtype == Dtype::FP16) {
+        layernorm_forward_inference_batched_fp16_kernel<<<R, block, shmem>>>(
+            reinterpret_cast<const __half*>(X_RD.data),
+            reinterpret_cast<const __half*>(gamma.data),
+            reinterpret_cast<const __half*>(beta.data),
+            reinterpret_cast<__half*>(Y_RD.data),
+            R, D, eps);
+    } else if (X_RD.dtype == Dtype::BF16) {
+        layernorm_forward_inference_batched_bf16_kernel<<<R, block, shmem>>>(
+            reinterpret_cast<const __nv_bfloat16*>(X_RD.data),
+            reinterpret_cast<const __nv_bfloat16*>(gamma.data),
+            reinterpret_cast<const __nv_bfloat16*>(beta.data),
+            reinterpret_cast<__nv_bfloat16*>(Y_RD.data),
+            R, D, eps);
+    } else {
+        layernorm_forward_inference_batched_kernel<<<R, block, shmem>>>(
+            reinterpret_cast<const float*>(X_RD.data),
+            reinterpret_cast<const float*>(gamma.data),
+            reinterpret_cast<const float*>(beta.data),
+            reinterpret_cast<float*>(Y_RD.data),
+            R, D, eps);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
