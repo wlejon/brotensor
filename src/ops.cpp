@@ -2172,4 +2172,87 @@ void gated_delta_rule_step(const Tensor& Q, const Tensor& K, const Tensor& V,
                             num_heads, d_k, d_v, state, O);
 }
 
+// ─── BatchNorm ─────────────────────────────────────────────────────────────
+
+void batch_norm_forward(const Tensor& X,
+                        const Tensor& gamma, const Tensor& beta,
+                        Tensor& running_mean, Tensor& running_var,
+                        int N, int C, int H, int W,
+                        float eps, float momentum,
+                        Tensor& Y,
+                        Tensor& saved_mean, Tensor& saved_rstd) {
+    const auto& v = detail::dispatch(X, gamma, beta, running_mean, running_var,
+                                     Y, saved_mean, saved_rstd);
+    if (!v.batch_norm_forward)
+        detail::throw_not_implemented("batch_norm_forward", X.device);
+    detail::adopt_output(running_mean, X.device);
+    detail::adopt_output(running_var,  X.device);
+    detail::adopt_output(Y,            X.device);
+    detail::adopt_output(saved_mean,   X.device);
+    detail::adopt_output(saved_rstd,   X.device);
+    v.batch_norm_forward(X, gamma, beta, running_mean, running_var,
+                         N, C, H, W, eps, momentum,
+                         Y, saved_mean, saved_rstd);
+}
+
+void batch_norm_inference(const Tensor& X,
+                          const Tensor& gamma, const Tensor& beta,
+                          const Tensor& running_mean,
+                          const Tensor& running_var,
+                          int N, int C, int H, int W,
+                          float eps,
+                          Tensor& Y) {
+    const auto& v = detail::dispatch(X, gamma, beta, running_mean, running_var, Y);
+    if (!v.batch_norm_inference)
+        detail::throw_not_implemented("batch_norm_inference", X.device);
+    detail::adopt_output(Y, X.device);
+    v.batch_norm_inference(X, gamma, beta, running_mean, running_var,
+                           N, C, H, W, eps, Y);
+}
+
+void batch_norm_backward(const Tensor& X,
+                         const Tensor& gamma,
+                         const Tensor& saved_mean,
+                         const Tensor& saved_rstd,
+                         const Tensor& dY,
+                         int N, int C, int H, int W,
+                         Tensor& dX,
+                         Tensor& dGamma, Tensor& dBeta) {
+    const auto& v = detail::dispatch(X, gamma, saved_mean, saved_rstd, dY,
+                                     dX, dGamma, dBeta);
+    if (!v.batch_norm_backward)
+        detail::throw_not_implemented("batch_norm_backward", X.device);
+    detail::adopt_output(dX,     X.device);
+    detail::adopt_output(dGamma, X.device);
+    detail::adopt_output(dBeta,  X.device);
+    v.batch_norm_backward(X, gamma, saved_mean, saved_rstd, dY,
+                          N, C, H, W, dX, dGamma, dBeta);
+}
+
+// ─── Image preprocessing helpers ───────────────────────────────────────────
+
+void image_normalize(const Tensor& X,
+                     const Tensor& mean, const Tensor& std_,
+                     int N, int C, int H, int W,
+                     Tensor& Y) {
+    const auto& v = detail::dispatch(X, mean, std_, Y);
+    if (!v.image_normalize)
+        detail::throw_not_implemented("image_normalize", X.device);
+    detail::adopt_output(Y, X.device);
+    v.image_normalize(X, mean, std_, N, C, H, W, Y);
+}
+
+void image_u8_to_f32_nhwc_to_nchw(const uint8_t* src,
+                                  int N, int H, int W, int C,
+                                  float scale, float bias,
+                                  Tensor& Y) {
+    // No tensor inputs to dispatch on — Y is the only one. adopt_output
+    // pins an uncommitted Y to the default device before lookup.
+    const auto& v = detail::dispatch(Y);
+    if (!v.image_u8_to_f32_nhwc_to_nchw)
+        detail::throw_not_implemented("image_u8_to_f32_nhwc_to_nchw", Y.device);
+    detail::adopt_output(Y, Y.device);
+    v.image_u8_to_f32_nhwc_to_nchw(src, N, H, W, C, scale, bias, Y);
+}
+
 } // namespace brotensor

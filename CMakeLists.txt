@@ -124,6 +124,8 @@ add_library(brotensor_cpu STATIC
     src/cpu/gated_delta_rule.cpp
     src/cpu/spatial_merge.cpp
     src/cpu/rope_mrope.cpp
+    src/cpu/batch_norm.cpp
+    src/cpu/image_preproc.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)

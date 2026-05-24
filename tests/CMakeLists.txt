@@ -53,6 +53,8 @@ brotensor_add_test(brotensor_test_pool2d test_pool2d.cpp)
 brotensor_add_test(brotensor_test_gather_rows test_gather_rows.cpp)
 brotensor_add_test(brotensor_test_conv_transpose2d test_conv_transpose2d.cpp)
 brotensor_add_test(brotensor_test_window_partition test_window_partition.cpp)
+brotensor_add_test(brotensor_test_batch_norm test_batch_norm.cpp)
+brotensor_add_test(brotensor_test_image_preproc test_image_preproc.cpp)
 
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)

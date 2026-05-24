@@ -830,6 +830,46 @@ void rope_apply_mrope(const ::brotensor::Tensor& X,
                       int d_t, int d_h, int d_w,
                       ::brotensor::Tensor& Y);
 
+// ── BatchNorm — batch_norm.cpp ──
+void batch_norm_forward(const ::brotensor::Tensor& X,
+                        const ::brotensor::Tensor& gamma,
+                        const ::brotensor::Tensor& beta,
+                        ::brotensor::Tensor& running_mean,
+                        ::brotensor::Tensor& running_var,
+                        int N, int C, int H, int W,
+                        float eps, float momentum,
+                        ::brotensor::Tensor& Y,
+                        ::brotensor::Tensor& saved_mean,
+                        ::brotensor::Tensor& saved_rstd);
+void batch_norm_inference(const ::brotensor::Tensor& X,
+                          const ::brotensor::Tensor& gamma,
+                          const ::brotensor::Tensor& beta,
+                          const ::brotensor::Tensor& running_mean,
+                          const ::brotensor::Tensor& running_var,
+                          int N, int C, int H, int W,
+                          float eps,
+                          ::brotensor::Tensor& Y);
+void batch_norm_backward(const ::brotensor::Tensor& X,
+                         const ::brotensor::Tensor& gamma,
+                         const ::brotensor::Tensor& saved_mean,
+                         const ::brotensor::Tensor& saved_rstd,
+                         const ::brotensor::Tensor& dY,
+                         int N, int C, int H, int W,
+                         ::brotensor::Tensor& dX,
+                         ::brotensor::Tensor& dGamma,
+                         ::brotensor::Tensor& dBeta);
+
+// ── Image preprocessing helpers — image_preproc.cpp ──
+void image_normalize(const ::brotensor::Tensor& X,
+                     const ::brotensor::Tensor& mean,
+                     const ::brotensor::Tensor& std_,
+                     int N, int C, int H, int W,
+                     ::brotensor::Tensor& Y);
+void image_u8_to_f32_nhwc_to_nchw(const uint8_t* src,
+                                  int N, int H, int W, int C,
+                                  float scale, float bias,
+                                  ::brotensor::Tensor& Y);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -1077,6 +1117,15 @@ struct CpuStaticRegistrar {
         // ── Qwen3-VL polish: spatial_merge_2x2 + M-RoPE ──
         ops.spatial_merge_2x2_forward    = &detail::cpu::spatial_merge_2x2_forward;
         ops.rope_apply_mrope             = &detail::cpu::rope_apply_mrope;
+
+        // ── BatchNorm (vision backbones) ──
+        ops.batch_norm_forward           = &detail::cpu::batch_norm_forward;
+        ops.batch_norm_inference         = &detail::cpu::batch_norm_inference;
+        ops.batch_norm_backward          = &detail::cpu::batch_norm_backward;
+
+        // ── Image preprocessing helpers ──
+        ops.image_normalize              = &detail::cpu::image_normalize;
+        ops.image_u8_to_f32_nhwc_to_nchw = &detail::cpu::image_u8_to_f32_nhwc_to_nchw;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

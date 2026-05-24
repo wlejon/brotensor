@@ -2436,4 +2436,95 @@ void gated_delta_rule_step(const Tensor& Q, const Tensor& K, const Tensor& V,
                            int num_heads, int d_k, int d_v,
                            Tensor& state, Tensor& O);
 
+// ─── BatchNorm (NCHW) ──────────────────────────────────────────────────────
+//
+// Standard BatchNorm: statistics are reduced over (N, H, W) per channel —
+// the variant pretrained ResNet / DETR-ResNet50 / classic Mask2Former
+// backbones use, and distinct from GroupNorm (which reduces within a single
+// sample). Three slots: training forward, inference forward, and backward.
+// CPU is FP32-only; GPU may add FP16 paths later (slots dispatched on X.dtype).
+
+// BatchNorm training forward.
+//   X, Y:                (N, C*H*W).
+//   gamma, beta:         (C,1) per-channel scale / shift.
+//   running_mean,
+//   running_var:         (C,1) — read AND updated in place via
+//                          running = (1 - momentum) * running + momentum * batch
+//                        (PyTorch nn.BatchNorm2d convention). running_var is
+//                        updated using the *unbiased* batch variance estimator.
+//   saved_mean,
+//   saved_rstd:          (C,1) — written, fed to batch_norm_backward.
+//                        rstd = 1 / sqrt(biased_var + eps).
+//   eps:                 typically 1e-5f.
+//   momentum:            PyTorch convention, typically 0.1f.
+void batch_norm_forward(const Tensor& X,
+                        const Tensor& gamma, const Tensor& beta,
+                        Tensor& running_mean, Tensor& running_var,
+                        int N, int C, int H, int W,
+                        float eps, float momentum,
+                        Tensor& Y,
+                        Tensor& saved_mean, Tensor& saved_rstd);
+
+// BatchNorm inference forward. Uses running_mean / running_var; no state
+// mutation, no saved tensors. This is the path loaded pretrained
+// checkpoints want at inference time.
+//   X, Y:               (N, C*H*W).
+//   gamma, beta, running_mean, running_var: (C,1).
+void batch_norm_inference(const Tensor& X,
+                          const Tensor& gamma, const Tensor& beta,
+                          const Tensor& running_mean,
+                          const Tensor& running_var,
+                          int N, int C, int H, int W,
+                          float eps,
+                          Tensor& Y);
+
+// BatchNorm backward, given saved batch mean/rstd from the training forward.
+//   X, dY, dX: (N, C*H*W). dX overwritten (resized + dtype-set to X).
+//   gamma:               (C,1) forward scale.
+//   saved_mean,
+//   saved_rstd:          (C,1) from forward.
+//   dGamma, dBeta:       (C,1) accumulated — caller zeros.
+// Math per channel (M = N*H*W):
+//   xhat = (x - mean) * rstd
+//   dxhat = dY * gamma
+//   dX = rstd * (dxhat - (sum dxhat + xhat * sum(dxhat*xhat)) / M)
+//   dGamma_c += sum dY*xhat ; dBeta_c += sum dY.
+void batch_norm_backward(const Tensor& X,
+                         const Tensor& gamma,
+                         const Tensor& saved_mean,
+                         const Tensor& saved_rstd,
+                         const Tensor& dY,
+                         int N, int C, int H, int W,
+                         Tensor& dX,
+                         Tensor& dGamma, Tensor& dBeta);
+
+// ─── Image preprocessing helpers ───────────────────────────────────────────
+//
+// Tiny ops every vision model wants. Live in brotensor so brogameagent /
+// brodiffusion / future vision projects share one canonical path instead of
+// re-implementing them in each caller.
+
+// Per-channel (X - mean[c]) / std[c] on NCHW. The ImageNet / CLIP / SAM
+// preprocess. X, Y: (N, C*H*W). mean, std: (C,1). std[c] must be non-zero.
+void image_normalize(const Tensor& X,
+                     const Tensor& mean, const Tensor& std_,
+                     int N, int C, int H, int W,
+                     Tensor& Y);
+
+// Convert a packed uint8 HWC image buffer (decoder output) into a FP32 NCHW
+// tensor, applying a single scale+bias pass:
+//     Y[n,c,h,w] = src[n*H*W*C + (h*W+w)*C + c] * scale + bias.
+// Covers the standard scaling conventions:
+//     [0,255] -> [0,1]   : scale = 1.0f / 255.0f,        bias = 0.0f
+//     [0,255] -> [-1,1]  : scale = 2.0f / 255.0f,        bias = -1.0f
+// Y resized to (N, C*H*W) FP32. src is a raw host pointer of length
+// N*H*W*C bytes (CPU backend) — image bytes essentially always originate
+// host-side, and there's no UINT8 dtype to wrap them in. GPU backends are
+// expected to either take a device pointer or upload internally; the
+// signature here matches `embedding_lookup_forward(const int32_t*)`.
+void image_u8_to_f32_nhwc_to_nchw(const uint8_t* src,
+                                  int N, int H, int W, int C,
+                                  float scale, float bias,
+                                  Tensor& Y);
+
 } // namespace brotensor

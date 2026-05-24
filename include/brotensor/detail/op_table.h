@@ -525,4 +525,26 @@
                                                        const ::brotensor::Tensor& a_raw, const ::brotensor::Tensor& beta,                      \
                                                        const ::brotensor::Tensor& log_A,                                                       \
                                                        int num_heads, int d_k, int d_v,                                                        \
-                                                       ::brotensor::Tensor& state, ::brotensor::Tensor& O))
+                                                       ::brotensor::Tensor& state, ::brotensor::Tensor& O))                                    \
+    /* ─── BatchNorm (vision backbones: ResNet, DETR-R50, classic Mask2Former) ─── */                                                          \
+    X(batch_norm_forward,                      void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& gamma,                          \
+                                                       const ::brotensor::Tensor& beta,                                                         \
+                                                       ::brotensor::Tensor& running_mean, ::brotensor::Tensor& running_var,                     \
+                                                       int N, int C, int H, int W, float eps, float momentum,                                  \
+                                                       ::brotensor::Tensor& Y,                                                                  \
+                                                       ::brotensor::Tensor& saved_mean, ::brotensor::Tensor& saved_rstd))                       \
+    X(batch_norm_inference,                    void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& gamma,                          \
+                                                       const ::brotensor::Tensor& beta,                                                         \
+                                                       const ::brotensor::Tensor& running_mean, const ::brotensor::Tensor& running_var,         \
+                                                       int N, int C, int H, int W, float eps, ::brotensor::Tensor& Y))                          \
+    X(batch_norm_backward,                     void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& gamma,                          \
+                                                       const ::brotensor::Tensor& saved_mean, const ::brotensor::Tensor& saved_rstd,            \
+                                                       const ::brotensor::Tensor& dY,                                                           \
+                                                       int N, int C, int H, int W,                                                              \
+                                                       ::brotensor::Tensor& dX, ::brotensor::Tensor& dGamma, ::brotensor::Tensor& dBeta))       \
+    /* ─── Image preprocessing helpers (vision-model inference) ─── */                                                                          \
+    X(image_normalize,                         void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& mean,                           \
+                                                       const ::brotensor::Tensor& std_, int N, int C, int H, int W,                             \
+                                                       ::brotensor::Tensor& Y))                                                                 \
+    X(image_u8_to_f32_nhwc_to_nchw,            void,  (const uint8_t* src, int N, int H, int W, int C,                                          \
+                                                       float scale, float bias, ::brotensor::Tensor& Y))
