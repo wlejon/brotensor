@@ -204,6 +204,8 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/gated_delta_rule.cu
         src/cuda/spatial_merge.cu
         src/cuda/rope_mrope.cu
+        src/cuda/loss_legacy.cu
+        src/cuda/xavier_init.cu
         src/cuda/register.cu
     )
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)
