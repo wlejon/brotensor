@@ -51,6 +51,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     OpsVTable ops{};   // zero-init: every slot starts as nullptr
 
     ops.adam_step                                   = &dm::adam_step;
+    ops.adaptive_avg_pool2d_backward                = &dm::adaptive_avg_pool2d_backward;
+    ops.adaptive_avg_pool2d_forward                 = &dm::adaptive_avg_pool2d_forward;
     ops.add_inplace                                 = &dm::add_inplace;
     ops.add_inplace_batched                         = &dm::add_inplace_batched;
     ops.add_scalar_inplace                          = &dm::add_scalar_inplace;
@@ -85,6 +87,10 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.conv_transpose1d_backward_input             = &dm::conv_transpose1d_backward_input;
     ops.conv_transpose1d_backward_weight            = &dm::conv_transpose1d_backward_weight;
     ops.conv_transpose1d_forward                    = &dm::conv_transpose1d_forward;
+    ops.conv_transpose2d_backward_bias              = &dm::conv_transpose2d_backward_bias;
+    ops.conv_transpose2d_backward_input             = &dm::conv_transpose2d_backward_input;
+    ops.conv_transpose2d_backward_weight            = &dm::conv_transpose2d_backward_weight;
+    ops.conv_transpose2d_forward                    = &dm::conv_transpose2d_forward;
     ops.copy_d2d                                    = &dm::copy_d2d;
     ops.cross_attention_backward                    = &dm::cross_attention_backward;
     ops.cross_attention_forward                     = &dm::cross_attention_forward;
@@ -115,6 +121,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.flash_attention_varlen_forward              = &dm::flash_attention_varlen_forward;
     ops.fsq_quantize_backward                       = &dm::fsq_quantize_backward;
     ops.fsq_quantize_forward                        = &dm::fsq_quantize_forward;
+    ops.gather_rows                                 = &dm::gather_rows;
     ops.gated_delta_rule_chunked                    = &dm::gated_delta_rule_chunked;
     ops.gated_delta_rule_step                       = &dm::gated_delta_rule_step;
     ops.geglu_backward                              = &dm::geglu_backward;
@@ -156,6 +163,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.matmul                                      = &dm::matmul;
     ops.matmul_backward                             = &dm::matmul_backward;
     ops.matmul_int8w_fp16                           = &dm::matmul_int8w_fp16;
+    ops.max_pool2d_backward                         = &dm::max_pool2d_backward;
+    ops.max_pool2d_forward                          = &dm::max_pool2d_forward;
     ops.mha_backward                                = &dm::mha_backward;
     ops.mha_forward                                 = &dm::mha_forward;
     ops.modulate                                    = &dm::modulate;
@@ -166,6 +175,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.nchw_to_sequence                            = &dm::nchw_to_sequence;
     ops.pad1d_backward                              = &dm::pad1d_backward;
     ops.pad1d_forward                               = &dm::pad1d_forward;
+    ops.pad2d_backward                              = &dm::pad2d_backward;
+    ops.pad2d_forward                               = &dm::pad2d_forward;
     ops.quick_gelu_backward                         = &dm::quick_gelu_backward;
     ops.quick_gelu_forward                          = &dm::quick_gelu_forward;
     ops.relu_backward                               = &dm::relu_backward;
@@ -190,6 +201,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.round_forward                               = &dm::round_forward;
     ops.sample_logits                               = &dm::sample_logits;
     ops.scale_inplace                               = &dm::scale_inplace;
+    ops.scatter_rows_add                            = &dm::scatter_rows_add;
     ops.self_attention_backward                     = &dm::self_attention_backward;
     ops.self_attention_bias_forward                 = &dm::self_attention_bias_forward;
     ops.self_attention_bias_int8w_fp16              = &dm::self_attention_bias_int8w_fp16;
@@ -199,6 +211,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.spatial_merge_2x2_forward                   = &dm::spatial_merge_2x2_forward;
     ops.sgd_step                                    = &dm::sgd_step;
     ops.sigmoid_backward                            = &dm::sigmoid_backward;
+    ops.slice2d_backward                            = &dm::slice2d_backward;
+    ops.slice2d_forward                             = &dm::slice2d_forward;
     ops.sigmoid_forward                             = &dm::sigmoid_forward;
     ops.silu_backward                               = &dm::silu_backward;
     ops.silu_forward                                = &dm::silu_forward;
@@ -220,12 +234,15 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.tanh_forward                                = &dm::tanh_forward;
     ops.tanh_forward_batched                        = &dm::tanh_forward_batched;
     ops.timestep_embedding                          = &dm::timestep_embedding;
+    ops.top_k_rows                                  = &dm::top_k_rows;
     ops.upsample_bilinear_2x                        = &dm::upsample_bilinear_2x;
     ops.upsample_bilinear_2x_backward               = &dm::upsample_bilinear_2x_backward;
     ops.upsample_nearest_2x                         = &dm::upsample_nearest_2x;
     ops.upsample_nearest_2x_backward                = &dm::upsample_nearest_2x_backward;
     ops.vq_encode_backward                          = &dm::vq_encode_backward;
     ops.vq_encode_forward                           = &dm::vq_encode_forward;
+    ops.window_partition_forward                    = &dm::window_partition_forward;
+    ops.window_reverse_forward                      = &dm::window_reverse_forward;
 
     ::brotensor::detail::register_backend(Device::Metal, ops,
                                           dm::metal_alloc_table());

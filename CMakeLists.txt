@@ -275,6 +275,13 @@ if(BROTENSOR_WITH_METAL)
         src/metal/gated_delta_rule.mm
         src/metal/spatial_merge.mm
         src/metal/rope_mrope.mm
+        src/metal/pad2d.mm
+        src/metal/slice2d.mm
+        src/metal/top_k.mm
+        src/metal/pool2d.mm
+        src/metal/gather_rows.mm
+        src/metal/conv_transpose2d.mm
+        src/metal/window_partition.mm
         src/metal/register.mm
     )
     set_source_files_properties(
@@ -334,6 +341,13 @@ if(BROTENSOR_WITH_METAL)
         src/metal/gated_delta_rule.mm
         src/metal/spatial_merge.mm
         src/metal/rope_mrope.mm
+        src/metal/pad2d.mm
+        src/metal/slice2d.mm
+        src/metal/top_k.mm
+        src/metal/pool2d.mm
+        src/metal/gather_rows.mm
+        src/metal/conv_transpose2d.mm
+        src/metal/window_partition.mm
         src/metal/register.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"
