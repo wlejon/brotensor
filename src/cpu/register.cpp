@@ -310,6 +310,14 @@ void pad2d_backward(const ::brotensor::Tensor& dY,
                     int N, int C, int H, int W,
                     int pad_top, int pad_bottom, int pad_left, int pad_right,
                     int mode, ::brotensor::Tensor& dX);
+void slice2d_forward(const ::brotensor::Tensor& X,
+                     int N, int C, int H, int W,
+                     int h0, int w0, int H_out, int W_out,
+                     ::brotensor::Tensor& Y);
+void slice2d_backward(const ::brotensor::Tensor& dY,
+                      int N, int C, int H, int W,
+                      int h0, int w0, int H_out, int W_out,
+                      ::brotensor::Tensor& dX);
 void nchw_to_sequence(const ::brotensor::Tensor& X,
                       int N, int C, int H, int W, ::brotensor::Tensor& Y);
 void sequence_to_nchw(const ::brotensor::Tensor& X,
@@ -877,6 +885,8 @@ struct CpuStaticRegistrar {
         ops.interp2d_backward            = &detail::cpu::interp2d_backward;
         ops.pad2d_forward                = &detail::cpu::pad2d_forward;
         ops.pad2d_backward               = &detail::cpu::pad2d_backward;
+        ops.slice2d_forward              = &detail::cpu::slice2d_forward;
+        ops.slice2d_backward             = &detail::cpu::slice2d_backward;
         ops.nchw_to_sequence             = &detail::cpu::nchw_to_sequence;
         ops.sequence_to_nchw             = &detail::cpu::sequence_to_nchw;
         ops.ddim_step                    = &detail::cpu::ddim_step;

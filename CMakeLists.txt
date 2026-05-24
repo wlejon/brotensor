@@ -95,6 +95,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/resample.cpp
     src/cpu/interp2d.cpp
     src/cpu/pad2d.cpp
+    src/cpu/slice2d.cpp
     src/cpu/transpose.cpp
     src/cpu/diffusion_samplers.cpp
     src/cpu/kv_cache.cpp

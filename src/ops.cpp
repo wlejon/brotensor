@@ -842,6 +842,21 @@ void pad2d_backward(const Tensor& dY, int N, int C, int H, int W,
     v.pad2d_backward(dY, N, C, H, W, pad_top, pad_bottom, pad_left, pad_right, mode, dX);
 }
 
+void slice2d_forward(const Tensor& X, int N, int C, int H, int W,
+                     int h0, int w0, int H_out, int W_out, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.slice2d_forward) detail::throw_not_implemented("slice2d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.slice2d_forward(X, N, C, H, W, h0, w0, H_out, W_out, Y);
+}
+void slice2d_backward(const Tensor& dY, int N, int C, int H, int W,
+                      int h0, int w0, int H_out, int W_out, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, dX);
+    if (!v.slice2d_backward) detail::throw_not_implemented("slice2d_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.slice2d_backward(dY, N, C, H, W, h0, w0, H_out, W_out, dX);
+}
+
 // ─── FP16 linear + GEGLU ───────────────────────────────────────────────────
 
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,

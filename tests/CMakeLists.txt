@@ -47,6 +47,7 @@ brotensor_add_test(brotensor_test_spatial_merge test_spatial_merge.cpp)
 brotensor_add_test(brotensor_test_rope_mrope test_rope_mrope.cpp)
 brotensor_add_test(brotensor_test_interp2d test_interp2d.cpp)
 brotensor_add_test(brotensor_test_pad2d test_pad2d.cpp)
+brotensor_add_test(brotensor_test_slice2d test_slice2d.cpp)
 
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)

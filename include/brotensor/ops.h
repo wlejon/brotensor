@@ -772,6 +772,26 @@ void pad2d_backward(const Tensor& dY, int N, int C, int H, int W,
                     int pad_top, int pad_bottom, int pad_left, int pad_right,
                     int mode, Tensor& dX);
 
+// 2D spatial slice / crop on NCHW. Extracts the (H_out, W_out) sub-region
+// starting at (h0, w0); N and C pass through unchanged. Used for RoI
+// extraction, prompt-region cropping, window-attention partitioning, and
+// generally as the inverse of pad2d's zero mode.
+// Preconditions (throws on violation):
+//   h0 >= 0,  w0 >= 0,  H_out >= 0,  W_out >= 0,
+//   h0 + H_out <= H,    w0 + W_out <= W.
+// h0 == 0 && w0 == 0 && H_out == H && W_out == W is the identity copy.
+//   X: (N, C*H*W).  Y: (N, C*H_out*W_out), resized + dtype-set to X.
+void slice2d_forward(const Tensor& X, int N, int C, int H, int W,
+                     int h0, int w0, int H_out, int W_out, Tensor& Y);
+
+// Backward (adjoint) of slice2d_forward: dX is zeroed, then dY is copied
+// into the same (h0, w0)+(H_out, W_out) sub-region. Pixels outside the
+// slice contribute zero.
+//   dY: (N, C*H_out*W_out).  dX: (N, C*H*W), resized + dtype-set to dY.
+// All shape / offset args match the forward call.
+void slice2d_backward(const Tensor& dY, int N, int C, int H, int W,
+                      int h0, int w0, int H_out, int W_out, Tensor& dX);
+
 // FP16 batched linear forward, inference-only. Like linear_forward_batched but
 // FP16 storage throughout.
 //   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.
