@@ -190,10 +190,18 @@ inline int grid_for(int n) {
 
 void linear_forward_batched(const Tensor& W, const Tensor& bias,
                             const Tensor& X_BD, Tensor& Y_BD) {
+    if (W.dtype != Dtype::FP32 || X_BD.dtype != Dtype::FP32 ||
+        bias.dtype != Dtype::FP32) {
+        throw std::runtime_error(
+            "linear_forward_batched: W, X, bias must be FP32 "
+            "(use linear_forward_batched_fp16 for FP16)");
+    }
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
     const int B       = X_BD.rows;
-    if (Y_BD.rows != B || Y_BD.cols != out_dim) Y_BD.resize(B, out_dim);
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP32) {
+        Y_BD.resize(B, out_dim, Dtype::FP32);
+    }
     if (B == 0 || out_dim == 0) return;
 
     dim3 block(BL_ROWS_PER_BLOCK, 1);
