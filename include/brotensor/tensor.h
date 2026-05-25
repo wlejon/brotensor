@@ -28,9 +28,43 @@ enum class Dtype : int {
     INT8  = 2,
     INT32 = 3,
     BF16  = 4,
+    F64   = 5,
+    // GGUF legacy quants — 32-element blocks, opaque storage carriers only.
+    Q4_0  = 10,
+    Q4_1  = 11,
+    Q5_0  = 12,
+    Q5_1  = 13,
+    Q8_0  = 14,
+    Q8_1  = 15,
+    // GGUF K-quants — 256-element superblocks, opaque storage carriers only.
+    Q2_K  = 20,
+    Q3_K  = 21,
+    Q4_K  = 22,
+    Q5_K  = 23,
+    Q6_K  = 24,
+    Q8_K  = 25,
 };
 
+// Bytes per scalar element. Returns 0 for quant dtypes (they aren't
+// element-addressable — use dtype_storage_bytes() instead).
 int dtype_size_bytes(Dtype);
+
+// Elements per block. 1 for non-quant types; 32 for the legacy GGUF quants
+// (Q4_0..Q8_1); 256 for the K-quants.
+int dtype_block_size(Dtype);
+
+// Bytes per block. Equals dtype_size_bytes(d) for non-quant dtypes; for quant
+// dtypes it's the on-disk block size (e.g. Q4_K = 144).
+int dtype_block_bytes(Dtype);
+
+// Byte count for a tensor of `numel` elements stored as `d`. For non-quant
+// types it's numel * dtype_size_bytes(d). For quant types `numel` must be a
+// multiple of dtype_block_size(d) (throws std::runtime_error otherwise) and
+// the result is (numel / block_size) * block_bytes.
+std::size_t dtype_storage_bytes(Dtype d, std::int64_t numel);
+
+// True iff `d` is a quant block carrier (Q*_*).
+bool dtype_is_quant(Dtype);
 
 // ─── Device ────────────────────────────────────────────────────────────────
 //

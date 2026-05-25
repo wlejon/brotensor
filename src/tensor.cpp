@@ -26,8 +26,82 @@ int dtype_size_bytes(Dtype dt) {
         case Dtype::BF16:  return 2;
         case Dtype::INT8:  return 1;
         case Dtype::INT32: return 4;
+        case Dtype::F64:   return 8;
+        // Quant dtypes are block-addressed; no per-element size.
+        case Dtype::Q4_0: case Dtype::Q4_1:
+        case Dtype::Q5_0: case Dtype::Q5_1:
+        case Dtype::Q8_0: case Dtype::Q8_1:
+        case Dtype::Q2_K: case Dtype::Q3_K:
+        case Dtype::Q4_K: case Dtype::Q5_K:
+        case Dtype::Q6_K: case Dtype::Q8_K:
+            return 0;
     }
     return 0;
+}
+
+bool dtype_is_quant(Dtype dt) {
+    switch (dt) {
+        case Dtype::Q4_0: case Dtype::Q4_1:
+        case Dtype::Q5_0: case Dtype::Q5_1:
+        case Dtype::Q8_0: case Dtype::Q8_1:
+        case Dtype::Q2_K: case Dtype::Q3_K:
+        case Dtype::Q4_K: case Dtype::Q5_K:
+        case Dtype::Q6_K: case Dtype::Q8_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+int dtype_block_size(Dtype dt) {
+    switch (dt) {
+        case Dtype::Q4_0: case Dtype::Q4_1:
+        case Dtype::Q5_0: case Dtype::Q5_1:
+        case Dtype::Q8_0: case Dtype::Q8_1:
+            return 32;
+        case Dtype::Q2_K: case Dtype::Q3_K:
+        case Dtype::Q4_K: case Dtype::Q5_K:
+        case Dtype::Q6_K: case Dtype::Q8_K:
+            return 256;
+        default:
+            return 1;
+    }
+}
+
+int dtype_block_bytes(Dtype dt) {
+    switch (dt) {
+        case Dtype::Q4_0: return 18;
+        case Dtype::Q4_1: return 20;
+        case Dtype::Q5_0: return 22;
+        case Dtype::Q5_1: return 24;
+        case Dtype::Q8_0: return 34;
+        case Dtype::Q8_1: return 36;
+        case Dtype::Q2_K: return 82;
+        case Dtype::Q3_K: return 110;
+        case Dtype::Q4_K: return 144;
+        case Dtype::Q5_K: return 176;
+        case Dtype::Q6_K: return 210;
+        case Dtype::Q8_K: return 292;
+        default:          return dtype_size_bytes(dt);
+    }
+}
+
+std::size_t dtype_storage_bytes(Dtype d, std::int64_t numel) {
+    if (numel < 0) {
+        throw std::runtime_error("brotensor: dtype_storage_bytes: negative numel");
+    }
+    if (!dtype_is_quant(d)) {
+        return static_cast<std::size_t>(numel) *
+               static_cast<std::size_t>(dtype_size_bytes(d));
+    }
+    const int bs = dtype_block_size(d);
+    const int bb = dtype_block_bytes(d);
+    if (numel % bs != 0) {
+        throw std::runtime_error(
+            "brotensor: dtype_storage_bytes: numel not a multiple of block size");
+    }
+    return (static_cast<std::size_t>(numel) / static_cast<std::size_t>(bs)) *
+           static_cast<std::size_t>(bb);
 }
 
 const char* device_name(Device d) {
@@ -238,8 +312,9 @@ Tensor& Tensor::operator=(const Tensor& o) {
 }
 
 std::size_t Tensor::bytes() const {
-    return static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols)
-         * static_cast<std::size_t>(dtype_size_bytes(dtype));
+    return dtype_storage_bytes(
+        dtype,
+        static_cast<std::int64_t>(rows) * static_cast<std::int64_t>(cols));
 }
 
 // ─── Factories ─────────────────────────────────────────────────────────────
@@ -388,9 +463,9 @@ void Tensor::zero() {
 
 void Tensor::resize(int r, int c, Dtype dt) {
     check_dims(r, c, "resize");
-    const std::size_t new_bytes =
-        static_cast<std::size_t>(r) * static_cast<std::size_t>(c)
-        * static_cast<std::size_t>(dtype_size_bytes(dt));
+    const std::size_t new_bytes = dtype_storage_bytes(
+        dt,
+        static_cast<std::int64_t>(r) * static_cast<std::int64_t>(c));
     const std::size_t cur_bytes = bytes();
     if (r == rows && c == cols && dt == dtype && data != nullptr) return;
     // A non-owning view over real storage cannot be reshaped: reallocating
