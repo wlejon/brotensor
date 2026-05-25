@@ -1727,6 +1727,32 @@ void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
                                        const Tensor& X_BD,
                                        Tensor& Y_BD);
 
+// ─── GGUF Q4_K (W4A16) ─────────────────────────────────────────────────────
+//
+// Q4_K is a 256-element block quantization: 144 bytes per block, with
+// per-block FP16 scale + min and eight 6-bit sub-block scales / mins, each
+// element a 4-bit nibble. Cols must be a multiple of 256 (the block runs
+// along the inner / contiguous axis).
+
+// W_q4k: (out, in) Dtype::Q4_K. W_fp16: (out, in) Dtype::FP16, resized.
+// Pure dequantization — useful for tests and for callers who want a one-shot
+// dequant before reusing the FP16 weight across many matmuls.
+void dequant_q4k_to_fp16(const Tensor& W_q4k, Tensor& W_fp16);
+
+// GEMV: y(out, 1) = W_q4k(out, in) @ x(in, 1) + bias(out, 1)?
+// x and y are FP16 (Dtype::FP16). bias is optional. FP32 accumulation. The
+// kernel fuses the Q4_K dequant into the matmul — no temporary FP16 weight
+// is materialized.
+void linear_forward_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
+                             const Tensor& x, Tensor& y);
+
+// Batched form: Y(B, out) = X(B, in) @ W_q4k(out, in)^T + bias(out)? Same
+// (B, in) -> (B, out) row layout as linear_forward_batched_fp16. For
+// chunk 2 the kernel is GEMV-optimized; B>1 is accepted but currently
+// implemented as a simple loop over rows of X (slower than a fused GEMM).
+void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
+                                     const Tensor& X_BD, Tensor& Y_BD);
+
 // ─── W8A16 flash-attention variants ────────────────────────────────────────
 //
 // Same composition as flash_attention_project_kv /

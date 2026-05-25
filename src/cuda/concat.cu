@@ -259,6 +259,12 @@ void conv2d_int8w_fp16_forward(const Tensor& X, const Tensor& W_int8,
                                int dil_h, int dil_w, int groups,
                                Tensor& Y);
 
+void dequant_q4k_to_fp16(const Tensor& W_q4k, Tensor& W_fp16);
+void linear_forward_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
+                             const Tensor& x, Tensor& y);
+void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
+                                     const Tensor& X_BD, Tensor& Y_BD);
+
 // ─── Master vtable fill ────────────────────────────────────────────────────
 
 void fill_cuda_vtable_specialised(::brotensor::detail::OpsVTable& v) {
@@ -298,6 +304,11 @@ void fill_cuda_vtable_specialised(::brotensor::detail::OpsVTable& v) {
     v.matmul_int8w_fp16                 = &matmul_int8w_fp16;
     v.linear_forward_batched_int8w_fp16 = &linear_forward_batched_int8w_fp16;
     v.conv2d_int8w_fp16_forward         = &conv2d_int8w_fp16_forward;
+
+    // GGUF Q4_K (W4A16) paths
+    v.dequant_q4k_to_fp16              = &dequant_q4k_to_fp16;
+    v.linear_forward_q4k_fp16          = &linear_forward_q4k_fp16;
+    v.linear_forward_batched_q4k_fp16  = &linear_forward_batched_q4k_fp16;
 }
 
 } // namespace brotensor::detail::cuda

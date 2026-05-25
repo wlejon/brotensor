@@ -391,6 +391,11 @@
                                                        ::brotensor::Tensor& Y))                                                                                         \
     X(linear_forward_batched_int8w_fp16,       void,  (const ::brotensor::Tensor& W_int8, const ::brotensor::Tensor& scales,                                            \
                                                        const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD, ::brotensor::Tensor& Y_BD))                    \
+    X(dequant_q4k_to_fp16,                     void,  (const ::brotensor::Tensor& W_q4k, ::brotensor::Tensor& W_fp16))                                                  \
+    X(linear_forward_q4k_fp16,                 void,  (const ::brotensor::Tensor& W_q4k, const ::brotensor::Tensor* bias,                                               \
+                                                       const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                                           \
+    X(linear_forward_batched_q4k_fp16,         void,  (const ::brotensor::Tensor& W_q4k, const ::brotensor::Tensor* bias,                                               \
+                                                       const ::brotensor::Tensor& X_BD, ::brotensor::Tensor& Y_BD))                                                     \
     X(flash_attention_project_kv_int8w_fp16,   void,  (const ::brotensor::Tensor& ctx,                                                                                  \
                                                        const ::brotensor::Tensor& Wk_int8, const ::brotensor::Tensor& sk, const ::brotensor::Tensor* bk,                \
                                                        const ::brotensor::Tensor& Wv_int8, const ::brotensor::Tensor& sv, const ::brotensor::Tensor* bv,                \
