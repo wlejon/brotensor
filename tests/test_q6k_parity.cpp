@@ -1,4 +1,7 @@
-// Q6_K dequant + GEMV + GEMM parity vs a host reference. GPU-only.
+// Q6_K dequant + GEMV + GEMM parity vs a host reference. GPU-only (runs on
+// whichever GPU is available: CUDA preferred, Metal fallback). The fused
+// WMMA call-count assertions only run on CUDA — Metal has no equivalent
+// fused GEMM today and uses the per-row GEMV path for every batch size.
 // Q6_K layout (210 bytes / 256 elems):
 //   ql[128] (low 4 bits), qh[64] (high 2 bits), scales[16] int8, fp16 d.
 // Per-sub-block scale sc[is] (is in 0..15) for 16 elements; super-block d.
@@ -159,11 +162,17 @@ static std::vector<uint16_t> to_fp16_vec(const std::vector<float>& v) {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping\n");
+    Device dev;
+    if (brotensor::is_available(brotensor::Device::CUDA)) {
+        dev = Device::CUDA;
+    } else if (brotensor::is_available(brotensor::Device::Metal)) {
+        dev = Device::Metal;
+    } else {
+        std::printf("no GPU backend available - skipping\n");
         return 0;
     }
-    std::printf("test_q6k_parity\n");
+    std::printf("test_q6k_parity (device=%s)\n",
+                dev == Device::CUDA ? "CUDA" : "Metal");
 
     constexpr int OUT = 64;
     constexpr int IN  = 256;
@@ -184,7 +193,7 @@ int main() {
     }
     auto Wd_fp16 = to_fp16_vec(Wd);
 
-    Tensor W_q6k_g = Tensor::empty_on(Device::CUDA, OUT, IN, Dtype::Q6_K);
+    Tensor W_q6k_g = Tensor::empty_on(dev, OUT, IN, Dtype::Q6_K);
     cudaMemcpy(W_q6k_g.data, Wq.data(),
                static_cast<size_t>(OUT) * BPR * Q6K_BYTES,
                cudaMemcpyHostToDevice);
@@ -226,7 +235,7 @@ int main() {
         y_ref[r] = s;
     }
     {
-        Tensor x_g = Tensor::from_host_fp16_on(Device::CUDA, xh.data(), IN, 1);
+        Tensor x_g = Tensor::from_host_fp16_on(dev, xh.data(), IN, 1);
         Tensor y_g;
         brotensor::linear_forward_q6k_fp16(W_q6k_g, nullptr, x_g, y_g);
         CHECK(y_g.dtype == Dtype::FP16 && y_g.rows == OUT && y_g.cols == 1);
@@ -249,8 +258,8 @@ int main() {
     for (auto& v : bf) v = db(rng);
     auto bh = to_fp16_vec(bf);
     {
-        Tensor x_g    = Tensor::from_host_fp16_on(Device::CUDA, xh.data(), IN, 1);
-        Tensor bias_g = Tensor::from_host_fp16_on(Device::CUDA, bh.data(), OUT, 1);
+        Tensor x_g    = Tensor::from_host_fp16_on(dev, xh.data(), IN, 1);
+        Tensor bias_g = Tensor::from_host_fp16_on(dev, bh.data(), OUT, 1);
         Tensor y_g;
         brotensor::linear_forward_q6k_fp16(W_q6k_g, &bias_g, x_g, y_g);
         brotensor::sync_all();
@@ -281,7 +290,7 @@ int main() {
         }
     }
     {
-        Tensor X_g = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), B, IN);
+        Tensor X_g = Tensor::from_host_fp16_on(dev, Xh.data(), B, IN);
         Tensor Y_g;
         brotensor::linear_forward_batched_q6k_fp16(W_q6k_g, nullptr, X_g, Y_g);
         CHECK(Y_g.dtype == Dtype::FP16 && Y_g.rows == B && Y_g.cols == OUT);
@@ -318,7 +327,7 @@ int main() {
                 dequant_q6k_block(Wq2[r * BPR2 + sb], &Wd2[r * IN2 + sb * Q6K_BLOCK]);
             }
         }
-        Tensor Wg2 = Tensor::empty_on(Device::CUDA, OUT2, IN2, Dtype::Q6_K);
+        Tensor Wg2 = Tensor::empty_on(dev, OUT2, IN2, Dtype::Q6_K);
         cudaMemcpy(Wg2.data, Wq2.data(),
                    static_cast<size_t>(OUT2) * BPR2 * Q6K_BYTES,
                    cudaMemcpyHostToDevice);
@@ -335,7 +344,7 @@ int main() {
             }
         }
 
-        Tensor Xg2 = Tensor::from_host_fp16_on(Device::CUDA, Xh2.data(), B2, IN2);
+        Tensor Xg2 = Tensor::from_host_fp16_on(dev, Xh2.data(), B2, IN2);
         Tensor Yg2;
         brotensor::sync_all();
         (void)brotensor_q6k_wmma_calls_consume();

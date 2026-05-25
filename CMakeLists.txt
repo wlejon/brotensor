@@ -307,6 +307,9 @@ if(BROTENSOR_WITH_METAL)
         src/metal/window_partition.mm
         src/metal/batch_norm.mm
         src/metal/image_preproc.mm
+        src/metal/q4k.mm
+        src/metal/q6k.mm
+        src/metal/q8_0.mm
         src/metal/register.mm
     )
     set_source_files_properties(
@@ -376,6 +379,9 @@ if(BROTENSOR_WITH_METAL)
         src/metal/window_partition.mm
         src/metal/batch_norm.mm
         src/metal/image_preproc.mm
+        src/metal/q4k.mm
+        src/metal/q6k.mm
+        src/metal/q8_0.mm
         src/metal/register.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"

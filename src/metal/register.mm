@@ -7,9 +7,10 @@
 // with the Metal AllocVTable, and hands the pair to the dispatcher.
 //
 // A null slot in the vtable means "this op is not implemented on Metal" — the
-// dispatcher throws on null lookups. Metal does not implement the host-scalar
-// ops `mse_scalar`, `softmax_xent`, `softmax_xent_segment`, or `xavier_init`;
-// those slots stay null.
+// dispatcher throws on null lookups. Metal does not implement the four host-
+// scalar / host-RNG ops `mse_scalar`, `softmax_xent`, `softmax_xent_segment`,
+// and `xavier_init`; those slots stay null. Every other op in the X-macro is
+// implemented.
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/detail/op_table.h>
@@ -21,8 +22,9 @@ namespace brotensor::detail::metal {
 
 // Forward-declare every public op in the Metal backend namespace. The op
 // table is the single source of truth for the signatures; the implementations
-// live one-per-cluster across the Metal .mm TUs. (The four ops Metal does not
-// implement are declared here too but never defined or referenced — harmless.)
+// live one-per-cluster across the Metal .mm TUs. (The four host-scalar /
+// host-RNG ops Metal does not implement are declared here too but never
+// defined or referenced — harmless.)
 #define BROTENSOR_METAL_DECL(name, ret, params) ret name params;
 BROTENSOR_FOR_EACH_OP(BROTENSOR_METAL_DECL)
 #undef BROTENSOR_METAL_DECL
@@ -102,6 +104,9 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.ddim_step                                   = &dm::ddim_step;
     ops.downsample_avg_2x                           = &dm::downsample_avg_2x;
     ops.downsample_avg_2x_backward                  = &dm::downsample_avg_2x_backward;
+    ops.dequant_q4k_to_fp16                         = &dm::dequant_q4k_to_fp16;
+    ops.dequant_q6k_to_fp16                         = &dm::dequant_q6k_to_fp16;
+    ops.dequant_q8_0_to_fp16                        = &dm::dequant_q8_0_to_fp16;
     ops.dpmpp_2m_step                               = &dm::dpmpp_2m_step;
     ops.elu_backward                                = &dm::elu_backward;
     ops.elu_forward                                 = &dm::elu_forward;
@@ -161,6 +166,12 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.linear_forward_batched                      = &dm::linear_forward_batched;
     ops.linear_forward_batched_fp16                 = &dm::linear_forward_batched_fp16;
     ops.linear_forward_batched_int8w_fp16           = &dm::linear_forward_batched_int8w_fp16;
+    ops.linear_forward_batched_q4k_fp16             = &dm::linear_forward_batched_q4k_fp16;
+    ops.linear_forward_batched_q6k_fp16             = &dm::linear_forward_batched_q6k_fp16;
+    ops.linear_forward_batched_q8_0_fp16            = &dm::linear_forward_batched_q8_0_fp16;
+    ops.linear_forward_q4k_fp16                     = &dm::linear_forward_q4k_fp16;
+    ops.linear_forward_q6k_fp16                     = &dm::linear_forward_q6k_fp16;
+    ops.linear_forward_q8_0_fp16                    = &dm::linear_forward_q8_0_fp16;
     ops.log_backward                                = &dm::log_backward;
     ops.log_forward                                 = &dm::log_forward;
     ops.masked_mean_pool_backward                   = &dm::masked_mean_pool_backward;
