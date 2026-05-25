@@ -1753,6 +1753,49 @@ void linear_forward_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
 void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
                                      const Tensor& X_BD, Tensor& Y_BD);
 
+// ─── GGUF Q8_0 (W8A16-style) ───────────────────────────────────────────────
+//
+// Q8_0 is a 32-element block quantization: 34 bytes per block, with one FP16
+// scale `d` and 32 int8 quants per block. Decoded value is just d * qs[i] —
+// no offset, no nested sub-scales. Cols must be a multiple of 32 (the block
+// runs along the inner / contiguous axis).
+
+// W_q8: (out, in) Dtype::Q8_0. W_fp16: (out, in) Dtype::FP16, resized.
+void dequant_q8_0_to_fp16(const Tensor& W_q8, Tensor& W_fp16);
+
+// GEMV: y(out, 1) = W_q8(out, in) @ x(in, 1) + bias(out, 1)?
+// x and y are FP16. bias is optional. FP32 accumulation. The kernel fuses the
+// Q8_0 dequant into the matmul — no temporary FP16 weight is materialized.
+void linear_forward_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
+                              const Tensor& x, Tensor& y);
+
+// Batched form: Y(B, out) = X(B, in) @ W_q8(out, in)^T + bias(out)?. The
+// kernel uses a fused WMMA tensor-core GEMM when B >= 4 and K is aligned;
+// smaller B falls back to a per-row GEMV loop.
+void linear_forward_batched_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
+                                      const Tensor& X_BD, Tensor& Y_BD);
+
+// ─── GGUF Q6_K (W6A16) ─────────────────────────────────────────────────────
+//
+// Q6_K is a 256-element block quantization: 210 bytes per block, with one
+// FP16 super-block scale `d`, sixteen signed int8 sub-block scales, and each
+// element a 6-bit signed value packed across ql[128] (low 4 bits) and qh[64]
+// (high 2 bits). Cols must be a multiple of 256 (the block runs along the
+// inner / contiguous axis).
+
+// W_q6k: (out, in) Dtype::Q6_K. W_fp16: (out, in) Dtype::FP16, resized.
+void dequant_q6k_to_fp16(const Tensor& W_q6k, Tensor& W_fp16);
+
+// GEMV: y(out, 1) = W_q6k(out, in) @ x(in, 1) + bias(out, 1)?
+// x and y are FP16. bias is optional. FP32 accumulation, fused dequant.
+void linear_forward_q6k_fp16(const Tensor& W_q6k, const Tensor* bias,
+                             const Tensor& x, Tensor& y);
+
+// Batched form. WMMA path when B >= 4 and K is aligned; GEMV-loop fallback
+// otherwise. Same (B, in) -> (B, out) layout as the FP16 batched linear.
+void linear_forward_batched_q6k_fp16(const Tensor& W_q6k, const Tensor* bias,
+                                     const Tensor& X_BD, Tensor& Y_BD);
+
 // ─── W8A16 flash-attention variants ────────────────────────────────────────
 //
 // Same composition as flash_attention_project_kv /

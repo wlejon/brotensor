@@ -1719,6 +1719,58 @@ void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
     v.linear_forward_batched_q4k_fp16(W_q4k, bias, X_BD, Y_BD);
 }
 
+void dequant_q8_0_to_fp16(const Tensor& W_q8, Tensor& W_fp16) {
+    const auto& v = detail::dispatch(W_q8, W_fp16);
+    if (!v.dequant_q8_0_to_fp16)
+        detail::throw_not_implemented("dequant_q8_0_to_fp16", W_q8.device);
+    detail::adopt_output(W_fp16, W_q8.device);
+    v.dequant_q8_0_to_fp16(W_q8, W_fp16);
+}
+
+void linear_forward_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
+                              const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch_with_opts(W_q8, {bias, &x, &y});
+    if (!v.linear_forward_q8_0_fp16)
+        detail::throw_not_implemented("linear_forward_q8_0_fp16", W_q8.device);
+    detail::adopt_output(y, W_q8.device);
+    v.linear_forward_q8_0_fp16(W_q8, bias, x, y);
+}
+
+void linear_forward_batched_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
+                                      const Tensor& X_BD, Tensor& Y_BD) {
+    const auto& v = detail::dispatch_with_opts(W_q8, {bias, &X_BD, &Y_BD});
+    if (!v.linear_forward_batched_q8_0_fp16)
+        detail::throw_not_implemented("linear_forward_batched_q8_0_fp16", W_q8.device);
+    detail::adopt_output(Y_BD, W_q8.device);
+    v.linear_forward_batched_q8_0_fp16(W_q8, bias, X_BD, Y_BD);
+}
+
+void dequant_q6k_to_fp16(const Tensor& W_q6k, Tensor& W_fp16) {
+    const auto& v = detail::dispatch(W_q6k, W_fp16);
+    if (!v.dequant_q6k_to_fp16)
+        detail::throw_not_implemented("dequant_q6k_to_fp16", W_q6k.device);
+    detail::adopt_output(W_fp16, W_q6k.device);
+    v.dequant_q6k_to_fp16(W_q6k, W_fp16);
+}
+
+void linear_forward_q6k_fp16(const Tensor& W_q6k, const Tensor* bias,
+                             const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch_with_opts(W_q6k, {bias, &x, &y});
+    if (!v.linear_forward_q6k_fp16)
+        detail::throw_not_implemented("linear_forward_q6k_fp16", W_q6k.device);
+    detail::adopt_output(y, W_q6k.device);
+    v.linear_forward_q6k_fp16(W_q6k, bias, x, y);
+}
+
+void linear_forward_batched_q6k_fp16(const Tensor& W_q6k, const Tensor* bias,
+                                     const Tensor& X_BD, Tensor& Y_BD) {
+    const auto& v = detail::dispatch_with_opts(W_q6k, {bias, &X_BD, &Y_BD});
+    if (!v.linear_forward_batched_q6k_fp16)
+        detail::throw_not_implemented("linear_forward_batched_q6k_fp16", W_q6k.device);
+    detail::adopt_output(Y_BD, W_q6k.device);
+    v.linear_forward_batched_q6k_fp16(W_q6k, bias, X_BD, Y_BD);
+}
+
 void flash_attention_project_kv_int8w_fp16(const Tensor& ctx,
                                            const Tensor& Wk_int8,
                                            const Tensor& sk,

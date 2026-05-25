@@ -396,6 +396,16 @@
                                                        const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                                           \
     X(linear_forward_batched_q4k_fp16,         void,  (const ::brotensor::Tensor& W_q4k, const ::brotensor::Tensor* bias,                                               \
                                                        const ::brotensor::Tensor& X_BD, ::brotensor::Tensor& Y_BD))                                                     \
+    X(dequant_q8_0_to_fp16,                    void,  (const ::brotensor::Tensor& W_q8, ::brotensor::Tensor& W_fp16))                                                   \
+    X(linear_forward_q8_0_fp16,                void,  (const ::brotensor::Tensor& W_q8, const ::brotensor::Tensor* bias,                                                \
+                                                       const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                                           \
+    X(linear_forward_batched_q8_0_fp16,        void,  (const ::brotensor::Tensor& W_q8, const ::brotensor::Tensor* bias,                                                \
+                                                       const ::brotensor::Tensor& X_BD, ::brotensor::Tensor& Y_BD))                                                     \
+    X(dequant_q6k_to_fp16,                     void,  (const ::brotensor::Tensor& W_q6k, ::brotensor::Tensor& W_fp16))                                                  \
+    X(linear_forward_q6k_fp16,                 void,  (const ::brotensor::Tensor& W_q6k, const ::brotensor::Tensor* bias,                                               \
+                                                       const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                                           \
+    X(linear_forward_batched_q6k_fp16,         void,  (const ::brotensor::Tensor& W_q6k, const ::brotensor::Tensor* bias,                                               \
+                                                       const ::brotensor::Tensor& X_BD, ::brotensor::Tensor& Y_BD))                                                     \
     X(flash_attention_project_kv_int8w_fp16,   void,  (const ::brotensor::Tensor& ctx,                                                                                  \
                                                        const ::brotensor::Tensor& Wk_int8, const ::brotensor::Tensor& sk, const ::brotensor::Tensor* bk,                \
                                                        const ::brotensor::Tensor& Wv_int8, const ::brotensor::Tensor& sv, const ::brotensor::Tensor* bv,                \

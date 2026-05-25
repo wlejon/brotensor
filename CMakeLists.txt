@@ -166,6 +166,10 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/linear_int8w_wmma.cu
         src/cuda/q4k.cu
         src/cuda/q4k_wmma.cu
+        src/cuda/q8_0.cu
+        src/cuda/q8_0_wmma.cu
+        src/cuda/q6k.cu
+        src/cuda/q6k_wmma.cu
         src/cuda/group_norm.cu
         src/cuda/resample.cu
         src/cuda/interp2d.cu
