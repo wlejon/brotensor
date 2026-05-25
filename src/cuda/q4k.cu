@@ -7,6 +7,7 @@
 //   a super-block); cross-warp reduction via shared memory.
 
 #include "detail/cuda_check.h"
+#include "q4k_internal.cuh"
 
 #include <brotensor/tensor.h>
 
@@ -24,22 +25,24 @@ using ::brotensor::Dtype;
 // Current stream helper (defined in runtime.cu).
 void* cuda_current_stream();
 
+// Forward decl of fused WMMA launcher implemented in q4k_wmma.cu.
+namespace q4k_wmma_internal {
+bool launch_linear_q4k_fp16_wmma(const __half* X, const uint8_t* W_q4k,
+                                 const __half* bias, __half* Y,
+                                 int B, int M, int K, cudaStream_t stream);
+}  // namespace q4k_wmma_internal
+
 namespace {
 
-constexpr int Q4K_BLOCK_ELEMS = 256;
-constexpr int Q4K_BLOCK_BYTES = 144;
+constexpr int Q4K_BLOCK_ELEMS = q4k::kBlockElems;
+constexpr int Q4K_BLOCK_BYTES = q4k::kBlockBytes;
 
-// Recover the j-th (sc, m) pair (0 <= j < 8) from the 12-byte scales array.
-// Mirrors llama.cpp's get_scale_min_k4 — re-expressed.
 __device__ __forceinline__ void q4k_unpack_sc_m(int j, const uint8_t* s,
                                                 uint8_t* sc, uint8_t* m) {
-    if (j < 4) {
-        *sc = s[j]     & 0x3F;
-        *m  = s[j + 4] & 0x3F;
-    } else {
-        *sc = (s[j + 4] & 0x0F) | ((s[j - 4] >> 6) << 4);
-        *m  = (s[j + 4] >> 4)   | ((s[j - 0] >> 6) << 4);
-    }
+    uint8_t sc_v, m_v;
+    q4k::unpack_sc_m(j, s, sc_v, m_v);
+    *sc = sc_v;
+    *m  = m_v;
 }
 
 // One CTA per (out_row, super_block). 256 threads, one per element.
@@ -284,7 +287,19 @@ void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
         ? static_cast<const __half*>(bias->data)
         : nullptr;
 
-    // Chunk 2: per-row GEMV loop. Chunk 3 will fuse into a real GEMM.
+    // Chunk 3: try the fused WMMA GEMM first. It returns false for shapes
+    // outside its supported envelope (small B, K%256 != 0, etc), in which
+    // case we fall back to the chunk-2 per-row GEMV loop.
+    if (q4k_wmma_internal::launch_linear_q4k_fp16_wmma(
+            static_cast<const __half*>(X_BD.data),
+            static_cast<const uint8_t*>(W_q4k.data),
+            b_p,
+            static_cast<__half*>(Y_BD.data),
+            B, out, K, stream)) {
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     for (int b = 0; b < B; ++b) {
         const __half* x_p = static_cast<const __half*>(X_BD.data) + static_cast<size_t>(b) * K;
         __half*       y_p = static_cast<__half*>(Y_BD.data)       + static_cast<size_t>(b) * out;

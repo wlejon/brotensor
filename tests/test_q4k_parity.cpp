@@ -176,6 +176,10 @@ static void dequant_q4k_block(const Q4KBlock& blk, float* dst) {
     }
 }
 
+#if defined(BROTENSOR_HAS_CUDA)
+extern "C" unsigned long long brotensor_q4k_wmma_calls_consume();
+#endif
+
 static std::vector<uint16_t> to_fp16_vec(const std::vector<float>& v) {
     std::vector<uint16_t> o(v.size());
     for (size_t i = 0; i < v.size(); ++i) o[i] = brotensor::fp32_to_fp16_bits(v[i]);
@@ -339,6 +343,95 @@ int main() {
         std::printf("  D: batched max_abs=%g\n", max_abs);
         CHECK(max_abs < 5e-2f);
     }
+
+    // ─── Tests E/F/G: fused WMMA GEMM path ────────────────────────────────
+#if defined(BROTENSOR_HAS_CUDA)
+    // Drain any stray counter from earlier work.
+    brotensor::sync_all();
+    (void)brotensor_q4k_wmma_calls_consume();
+
+    // Helper: build a fresh Q4_K weight + host dequant reference for a given
+    // (OUT2, IN2) shape and run a batched parity check.
+    auto run_gemm_case = [&](int OUT2, int IN2, int B2, bool expect_wmma,
+                             const char* label, float tol) {
+        const int BPR = IN2 / Q4K_BLOCK;
+        std::uniform_real_distribution<float> dw2(-0.5f, 0.5f);
+        std::uniform_real_distribution<float> dx2(-0.3f, 0.3f);
+
+        std::vector<float> Wf2(static_cast<size_t>(OUT2) * IN2);
+        for (auto& v : Wf2) v = dw2(rng);
+
+        std::vector<Q4KBlock> Wq2(static_cast<size_t>(OUT2) * BPR);
+        std::vector<float>    Wd2(static_cast<size_t>(OUT2) * IN2);
+        for (int r = 0; r < OUT2; ++r) {
+            for (int sb = 0; sb < BPR; ++sb) {
+                quantize_q4k_block(&Wf2[r * IN2 + sb * Q4K_BLOCK],
+                                   Wq2[r * BPR + sb]);
+                dequant_q4k_block(Wq2[r * BPR + sb],
+                                  &Wd2[r * IN2 + sb * Q4K_BLOCK]);
+            }
+        }
+
+        Tensor Wg2 = Tensor::empty_on(Device::CUDA, OUT2, IN2, Dtype::Q4_K);
+        cudaMemcpy(Wg2.data, Wq2.data(),
+                   static_cast<size_t>(OUT2) * BPR * Q4K_BYTES,
+                   cudaMemcpyHostToDevice);
+
+        std::vector<float> Xf2(static_cast<size_t>(B2) * IN2);
+        for (auto& v : Xf2) v = dx2(rng);
+        auto Xh2 = to_fp16_vec(Xf2);
+
+        std::vector<float> Yref(static_cast<size_t>(B2) * OUT2, 0.0f);
+        for (int b = 0; b < B2; ++b) {
+            for (int r = 0; r < OUT2; ++r) {
+                float s = 0.0f;
+                for (int k = 0; k < IN2; ++k) {
+                    s += Wd2[r * IN2 + k] * Xf2[b * IN2 + k];
+                }
+                Yref[b * OUT2 + r] = s;
+            }
+        }
+
+        Tensor Xg2 = Tensor::from_host_fp16_on(Device::CUDA, Xh2.data(), B2, IN2);
+        Tensor Yg2;
+        // Drain the counter just before the call we want to attribute.
+        brotensor::sync_all();
+        (void)brotensor_q4k_wmma_calls_consume();
+
+        brotensor::linear_forward_batched_q4k_fp16(Wg2, nullptr, Xg2, Yg2);
+        CHECK(Yg2.dtype == Dtype::FP16 && Yg2.rows == B2 && Yg2.cols == OUT2);
+        brotensor::sync_all();
+
+        const unsigned long long calls = brotensor_q4k_wmma_calls_consume();
+        std::vector<uint16_t> got(static_cast<size_t>(B2) * OUT2);
+        Yg2.copy_to_host_fp16(got.data());
+
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const float g = brotensor::fp16_bits_to_fp32(got[i]);
+            const float e = std::fabs(g - Yref[i]);
+            if (e > max_abs) max_abs = e;
+        }
+        std::printf("  %s: B=%d M=%d K=%d wmma_calls=%llu max_abs=%g\n",
+                    label, B2, OUT2, IN2, calls, max_abs);
+        CHECK(max_abs < tol);
+        if (expect_wmma) {
+            CHECK(calls > 0);
+        } else {
+            CHECK(calls == 0);
+        }
+    };
+
+    // Test E: WMMA path on an aligned shape.
+    run_gemm_case(/*OUT*/64, /*IN*/512, /*B*/16, /*expect_wmma*/true, "E",
+                  /*tol*/5e-2f);
+    // Test F: small B forces the GEMV-loop fallback.
+    run_gemm_case(/*OUT*/64, /*IN*/512, /*B*/2,  /*expect_wmma*/false, "F",
+                  /*tol*/5e-2f);
+    // Test G: larger shape — error stays bounded.
+    run_gemm_case(/*OUT*/128, /*IN*/1024, /*B*/32, /*expect_wmma*/true, "G",
+                  /*tol*/1e-1f);
+#endif
 
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;
