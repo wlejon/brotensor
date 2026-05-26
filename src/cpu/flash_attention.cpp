@@ -519,6 +519,106 @@ void flash_attention_backward(const ::brotensor::Tensor& Q,
                             dV.host_f32_mut());
 }
 
+// ─── flash_attention_varlen_backward ───────────────────────────────────────
+//
+// Per-sequence backward over the packed (total_tokens, D) layout. Same
+// recompute math as flash_attention_backward (attention_core_backward) run
+// once per sequence on its [cu_seqlens_q[b], cu_seqlens_q[b+1]) Q slice and
+// [cu_seqlens_k[b], cu_seqlens_k[b+1]) K/V slice. dQ/dK/dV are OVERWRITTEN —
+// attention_core_backward zeros its per-call output region, and rows outside
+// any sequence's range (which can't happen for a well-formed cu_seqlens) plus
+// rows whose K range is empty are explicitly zeroed here so the contract
+// holds globally.
+void flash_attention_varlen_backward(const ::brotensor::Tensor& Q,
+                                     const ::brotensor::Tensor& K,
+                                     const ::brotensor::Tensor& V,
+                                     const ::brotensor::Tensor& O,
+                                     const ::brotensor::Tensor& dO,
+                                     const int32_t* cu_seqlens_q,
+                                     const int32_t* cu_seqlens_k,
+                                     int batch_size,
+                                     int /*max_seqlen_q*/,
+                                     int /*max_seqlen_k*/,
+                                     int num_heads,
+                                     int head_dim,
+                                     bool causal,
+                                     ::brotensor::Tensor& dQ,
+                                     ::brotensor::Tensor& dK,
+                                     ::brotensor::Tensor& dV) {
+    (void)O;  // recompute-based; O retained in API for symmetry.
+    const int total_q = Q.rows;
+    const int total_k = K.rows;
+    const int D = num_heads * head_dim;
+    if (Q.cols != D || K.cols != D || V.cols != D || V.rows != total_k)
+        throw std::runtime_error("flash_attention_varlen_backward: Q/K/V shape mismatch");
+    if (dO.rows != total_q || dO.cols != D)
+        throw std::runtime_error("flash_attention_varlen_backward: dO shape mismatch");
+    if (num_heads <= 0 || head_dim <= 0)
+        throw std::runtime_error("flash_attention_varlen_backward: num_heads/head_dim must be positive");
+    if (batch_size < 0)
+        throw std::runtime_error("flash_attention_varlen_backward: batch_size must be non-negative");
+    if (batch_size > 0 && (!cu_seqlens_q || !cu_seqlens_k))
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q/k required when batch_size > 0");
+    ensure_f32(dQ, total_q, D);
+    ensure_f32(dK, total_k, D);
+    ensure_f32(dV, total_k, D);
+    if (total_q == 0 && total_k == 0) return;
+    if (D == 0) return;
+    if (cu_seqlens_q && cu_seqlens_q[0] != 0)
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q[0] must be 0");
+    if (cu_seqlens_k && cu_seqlens_k[0] != 0)
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_k[0] must be 0");
+    if (batch_size > 0) {
+        if (cu_seqlens_q[batch_size] != total_q)
+            throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q[B] != total_tokens_q");
+        if (cu_seqlens_k[batch_size] != total_k)
+            throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_k[B] != total_tokens_k");
+    }
+
+    // Zero all grads upfront so any rows not covered by a sequence (or covered
+    // by an empty-K sequence) end up at exactly 0.0f without depending on the
+    // per-sequence path to touch them.
+    float* dQp = dQ.host_f32_mut();
+    float* dKp = dK.host_f32_mut();
+    float* dVp = dV.host_f32_mut();
+    for (std::size_t i = 0; i < static_cast<std::size_t>(total_q) * D; ++i) dQp[i] = 0.0f;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(total_k) * D; ++i) {
+        dKp[i] = 0.0f;
+        dVp[i] = 0.0f;
+    }
+    if (batch_size == 0) return;
+
+    const float* Qp  = Q.host_f32();
+    const float* Kp  = K.host_f32();
+    const float* Vp  = V.host_f32();
+    const float* dOp = dO.host_f32();
+
+    for (int b = 0; b < batch_size; ++b) {
+        const int q_beg = cu_seqlens_q[b];
+        const int q_end = cu_seqlens_q[b + 1];
+        const int k_beg = cu_seqlens_k[b];
+        const int k_end = cu_seqlens_k[b + 1];
+        const int Lq = q_end - q_beg;
+        const int Lk = k_end - k_beg;
+        if (Lq < 0 || Lk < 0)
+            throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens must be non-decreasing");
+        if (causal && Lq != Lk)
+            throw std::runtime_error("flash_attention_varlen_backward: causal requires per-sequence Lq == Lk");
+        if (Lq == 0 || Lk == 0) continue;  // grad rows already zero.
+
+        attention_core_backward(
+            Qp  + static_cast<std::size_t>(q_beg) * D,
+            Kp  + static_cast<std::size_t>(k_beg) * D,
+            Vp  + static_cast<std::size_t>(k_beg) * D,
+            dOp + static_cast<std::size_t>(q_beg) * D,
+            /*mask=*/nullptr,
+            Lq, Lk, D, num_heads, causal,
+            dQp + static_cast<std::size_t>(q_beg) * D,
+            dKp + static_cast<std::size_t>(k_beg) * D,
+            dVp + static_cast<std::size_t>(k_beg) * D);
+    }
+}
+
 // ─── flash_attention_qkvo_backward ─────────────────────────────────────────
 
 void flash_attention_qkvo_backward(const ::brotensor::Tensor& X,

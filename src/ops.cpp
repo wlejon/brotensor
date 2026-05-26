@@ -1286,6 +1286,26 @@ void flash_attention_varlen_forward(const Tensor& Q, const Tensor& K, const Tens
                                      num_heads, head_dim, causal, O);
 }
 
+void flash_attention_varlen_backward(const Tensor& Q, const Tensor& K, const Tensor& V,
+                                     const Tensor& O, const Tensor& dO,
+                                     const int32_t* cu_seqlens_q,
+                                     const int32_t* cu_seqlens_k,
+                                     int batch_size, int max_seqlen_q, int max_seqlen_k,
+                                     int num_heads, int head_dim, bool causal,
+                                     Tensor& dQ, Tensor& dK, Tensor& dV) {
+    const auto& v = detail::dispatch(Q, K, V, O, dO, dQ, dK, dV);
+    if (!v.flash_attention_varlen_backward)
+        detail::throw_not_implemented("flash_attention_varlen_backward", Q.device);
+    detail::adopt_output(dQ, Q.device);
+    detail::adopt_output(dK, Q.device);
+    detail::adopt_output(dV, Q.device);
+    v.flash_attention_varlen_backward(Q, K, V, O, dO,
+                                      cu_seqlens_q, cu_seqlens_k,
+                                      batch_size, max_seqlen_q, max_seqlen_k,
+                                      num_heads, head_dim, causal,
+                                      dQ, dK, dV);
+}
+
 void flash_attention_qkvo_forward(const Tensor& X, const Tensor* Ctx,
                                   const Tensor& Wq, const Tensor* bq,
                                   const Tensor& Wk, const Tensor* bk,

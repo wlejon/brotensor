@@ -293,6 +293,12 @@
                                                        int batch_size, int max_seqlen_q, int max_seqlen_k,                                                              \
                                                        int num_heads, int head_dim, bool causal,                                                                        \
                                                        ::brotensor::Tensor& O))                                                                                         \
+    X(flash_attention_varlen_backward,         void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
+                                                       const ::brotensor::Tensor& O, const ::brotensor::Tensor& dO,                                                     \
+                                                       const int32_t* cu_seqlens_q, const int32_t* cu_seqlens_k,                                                        \
+                                                       int batch_size, int max_seqlen_q, int max_seqlen_k,                                                              \
+                                                       int num_heads, int head_dim, bool causal,                                                                        \
+                                                       ::brotensor::Tensor& dQ, ::brotensor::Tensor& dK, ::brotensor::Tensor& dV))                                      \
     X(flash_attention_qkvo_forward,            void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor* Ctx,                                                    \
                                                        const ::brotensor::Tensor& Wq, const ::brotensor::Tensor* bq,                                                    \
                                                        const ::brotensor::Tensor& Wk, const ::brotensor::Tensor* bk,                                                    \
