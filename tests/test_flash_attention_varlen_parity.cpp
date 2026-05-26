@@ -115,6 +115,66 @@ BT_PARITY_TEST(varlen_larger_head_dim) {
     run_varlen({16, 16}, {16, 16}, 4, 16, false, 0xA7);
 }
 
+// ─── FP32 path (CPU and GPU both FP32 — tight tolerance) ──────────────────
+
+void run_varlen_fp32(const std::vector<int>& seq_lens_q,
+                     const std::vector<int>& seq_lens_k,
+                     int num_heads, int head_dim, bool causal,
+                     uint64_t seed) {
+    const int B = static_cast<int>(seq_lens_q.size());
+    std::vector<int32_t> cq(B + 1, 0), ck(B + 1, 0);
+    int max_q = 0, max_k = 0;
+    for (int b = 0; b < B; ++b) {
+        cq[b + 1] = cq[b] + seq_lens_q[b];
+        ck[b + 1] = ck[b] + seq_lens_k[b];
+        if (seq_lens_q[b] > max_q) max_q = seq_lens_q[b];
+        if (seq_lens_k[b] > max_k) max_k = seq_lens_k[b];
+    }
+    const int total_q = cq.back();
+    const int total_k = ck.back();
+    const int D = num_heads * head_dim;
+
+    SplitMix64 rng(seed);
+    Tensor Q = Tensor::mat(total_q, D);
+    Tensor K = Tensor::mat(total_k, D);
+    Tensor V = Tensor::mat(total_k, D);
+    for (int i = 0; i < Q.size(); ++i) Q.ptr()[i] = rng.next_unit() * 0.3f;
+    for (int i = 0; i < K.size(); ++i) K.ptr()[i] = rng.next_unit() * 0.3f;
+    for (int i = 0; i < V.size(); ++i) V.ptr()[i] = rng.next_unit() * 0.3f;
+
+    Tensor O_c;
+    brotensor::flash_attention_varlen_forward(
+        Q, K, V, cq.data(), ck.data(),
+        B, max_q, max_k, num_heads, head_dim, causal, O_c);
+
+    Tensor gQ = Q.to(gpu_device());
+    Tensor gK = K.to(gpu_device());
+    Tensor gV = V.to(gpu_device());
+    Tensor gCQ = upload_indices(std::vector<int32_t>(cq.begin(), cq.end()));
+    Tensor gCK = upload_indices(std::vector<int32_t>(ck.begin(), ck.end()));
+    const int32_t* d_cq = static_cast<const int32_t*>(gCQ.data);
+    const int32_t* d_ck = static_cast<const int32_t*>(gCK.data);
+
+    Tensor gO;
+    brotensor::flash_attention_varlen_forward(
+        gQ, gK, gV, d_cq, d_ck,
+        B, max_q, max_k, num_heads, head_dim, causal, gO);
+
+    brotensor::sync_all();
+    compare_tensors(O_c, gO.to(brotensor::Device::CPU), "varlen_fp32.O",
+                    5e-5f, 5e-5f);
+}
+
+BT_PARITY_TEST(varlen_fp32_one_seq_noncausal) {
+    run_varlen_fp32({7}, {7}, 2, 4, false, 0xA8);
+}
+BT_PARITY_TEST(varlen_fp32_three_seq_varying_causal) {
+    run_varlen_fp32({3, 9, 4}, {3, 9, 4}, 2, 4, true, 0xA9);
+}
+BT_PARITY_TEST(varlen_fp32_larger_head_dim) {
+    run_varlen_fp32({16, 16}, {16, 16}, 4, 16, false, 0xAA);
+}
+
 } // namespace
 
 int main() {

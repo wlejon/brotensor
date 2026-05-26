@@ -124,6 +124,78 @@ BT_PARITY_TEST(varlen_bwd_larger_head_dim) {
     run_varlen_backward({16, 16}, {16, 16}, 4, 16, false, 0xB7);
 }
 
+// ─── FP32 path (CPU and GPU both FP32 — tight tolerance) ──────────────────
+
+void run_varlen_backward_fp32(const std::vector<int>& seq_lens_q,
+                              const std::vector<int>& seq_lens_k,
+                              int num_heads, int head_dim, bool causal,
+                              uint64_t seed) {
+    const int B = static_cast<int>(seq_lens_q.size());
+    std::vector<int32_t> cq(B + 1, 0), ck(B + 1, 0);
+    int max_q = 0, max_k = 0;
+    for (int b = 0; b < B; ++b) {
+        cq[b + 1] = cq[b] + seq_lens_q[b];
+        ck[b + 1] = ck[b] + seq_lens_k[b];
+        if (seq_lens_q[b] > max_q) max_q = seq_lens_q[b];
+        if (seq_lens_k[b] > max_k) max_k = seq_lens_k[b];
+    }
+    const int total_q = cq.back();
+    const int total_k = ck.back();
+    const int D = num_heads * head_dim;
+
+    SplitMix64 rng(seed);
+    auto rand_mat = [&](int r, int c) {
+        Tensor t = Tensor::mat(r, c);
+        for (int i = 0; i < t.size(); ++i) t.ptr()[i] = rng.next_unit() * 0.3f;
+        return t;
+    };
+    Tensor Q  = rand_mat(total_q, D);
+    Tensor K  = rand_mat(total_k, D);
+    Tensor V  = rand_mat(total_k, D);
+    Tensor dO = rand_mat(total_q, D);
+    Tensor O  = rand_mat(total_q, D);  // unused by recompute backward
+
+    Tensor dQ_c, dK_c, dV_c;
+    brotensor::flash_attention_varlen_backward(
+        Q, K, V, O, dO, cq.data(), ck.data(),
+        B, max_q, max_k, num_heads, head_dim, causal,
+        dQ_c, dK_c, dV_c);
+
+    Tensor gQ  = Q.to(gpu_device());
+    Tensor gK  = K.to(gpu_device());
+    Tensor gV  = V.to(gpu_device());
+    Tensor gO  = O.to(gpu_device());
+    Tensor gdO = dO.to(gpu_device());
+    Tensor gCQ = upload_indices(std::vector<int32_t>(cq.begin(), cq.end()));
+    Tensor gCK = upload_indices(std::vector<int32_t>(ck.begin(), ck.end()));
+    const int32_t* d_cq = static_cast<const int32_t*>(gCQ.data);
+    const int32_t* d_ck = static_cast<const int32_t*>(gCK.data);
+
+    Tensor gdQ, gdK, gdV;
+    brotensor::flash_attention_varlen_backward(
+        gQ, gK, gV, gO, gdO, d_cq, d_ck,
+        B, max_q, max_k, num_heads, head_dim, causal,
+        gdQ, gdK, gdV);
+
+    brotensor::sync_all();
+    compare_tensors(dQ_c, gdQ.to(brotensor::Device::CPU),
+                    "varlen_bwd_fp32.dQ", 5e-5f, 5e-5f);
+    compare_tensors(dK_c, gdK.to(brotensor::Device::CPU),
+                    "varlen_bwd_fp32.dK", 5e-5f, 5e-5f);
+    compare_tensors(dV_c, gdV.to(brotensor::Device::CPU),
+                    "varlen_bwd_fp32.dV", 5e-5f, 5e-5f);
+}
+
+BT_PARITY_TEST(varlen_bwd_fp32_one_seq_noncausal) {
+    run_varlen_backward_fp32({7}, {7}, 2, 4, false, 0xB8);
+}
+BT_PARITY_TEST(varlen_bwd_fp32_three_seq_varying_causal) {
+    run_varlen_backward_fp32({3, 9, 4}, {3, 9, 4}, 2, 4, true, 0xB9);
+}
+BT_PARITY_TEST(varlen_bwd_fp32_larger_head_dim) {
+    run_varlen_backward_fp32({16, 16}, {16, 16}, 4, 16, false, 0xBA);
+}
+
 } // namespace
 
 int main() {

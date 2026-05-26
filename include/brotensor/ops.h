@@ -1284,7 +1284,7 @@ void flash_attention_forward(const Tensor& Q,
 // [cu_seqlens_q[b], cu_seqlens_q[b+1]) and attends to K/V rows
 // [cu_seqlens_k[b], cu_seqlens_k[b+1]); no cross-sequence attention. Mirrors
 // flash_attn_varlen_func semantics.
-//   Q: (total_tokens_q, num_heads * head_dim) — FP16 (GPU) / FP32 (CPU).
+//   Q: (total_tokens_q, num_heads * head_dim) — FP16/BF16/FP32 (GPU) / FP32 (CPU).
 //   K, V: (total_tokens_k, num_heads * head_dim) — same packing, num_heads
 //         matches Q (no GQA — that's a future cleanup).
 //   cu_seqlens_q, cu_seqlens_k: DEVICE pointers (CUDA/Metal device, raw host
@@ -1316,11 +1316,11 @@ void flash_attention_varlen_forward(const Tensor& Q,
 // Recompute-based: consumes no forward caches, re-runs the per-sequence
 // softmax then reverses it. Matches flash_attention_backward's per-sequence
 // math; only the cu_seqlens scatter/gather and per-sequence causal differ.
-//   Q: (total_tokens_q, num_heads*head_dim) — FP16/BF16 (GPU) / FP32 (CPU).
+//   Q: (total_tokens_q, num_heads*head_dim) — FP16/BF16/FP32 (GPU) / FP32 (CPU).
 //   K, V: (total_tokens_k, num_heads*head_dim) — same dtype, same packing.
 //   O:  (total_tokens_q, ...) forward output — currently unused (kept for API
 //       symmetry with flash_attention_backward).
-//   dO: (total_tokens_q, ...) FP16/BF16/FP32 upstream gradient.
+//   dO: (total_tokens_q, ...) upstream gradient, same dtype as Q/K/V.
 //   cu_seqlens_q, cu_seqlens_k: DEVICE pointers on GPU, host pointers on CPU,
 //       length batch_size + 1, INT32 prefix sums. Same convention as the
 //       forward.

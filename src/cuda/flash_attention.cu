@@ -2177,8 +2177,8 @@ void flash_attention_varlen_forward(const Tensor& Q,
                                     bool causal,
                                     Tensor& O) {
     const Dtype dt = Q.dtype;
-    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
-        throw std::runtime_error("flash_attention_varlen_forward: Q, K, V must be FP16 or BF16");
+    if (dt != Dtype::FP16 && dt != Dtype::BF16 && dt != Dtype::FP32) {
+        throw std::runtime_error("flash_attention_varlen_forward: Q, K, V must be FP16, BF16, or FP32");
     }
     if (K.dtype != dt || V.dtype != dt) {
         throw std::runtime_error("flash_attention_varlen_forward: Q, K, V dtype must match");
@@ -2221,6 +2221,15 @@ void flash_attention_varlen_forward(const Tensor& Q,
             reinterpret_cast<const int*>(cu_seqlens_q),
             reinterpret_cast<const int*>(cu_seqlens_k),
             reinterpret_cast<__nv_bfloat16*>(O.data),
+            batch_size, D, head_dim, causal ? 1 : 0);
+    } else if (dt == Dtype::FP32) {
+        flash_attention_varlen_kernel<float><<<grid, FA_BLOCK, shmem, stream>>>(
+            reinterpret_cast<const float*>(Q.data),
+            reinterpret_cast<const float*>(K.data),
+            reinterpret_cast<const float*>(V.data),
+            reinterpret_cast<const int*>(cu_seqlens_q),
+            reinterpret_cast<const int*>(cu_seqlens_k),
+            reinterpret_cast<float*>(O.data),
             batch_size, D, head_dim, causal ? 1 : 0);
     } else {
         flash_attention_varlen_kernel<__half><<<grid, FA_BLOCK, shmem, stream>>>(

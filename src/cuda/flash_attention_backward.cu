@@ -417,6 +417,195 @@ __global__ void fab_dKh_bf16_kernel(const __nv_bfloat16* __restrict__ dS,
     dKh[k * hd + d] = __float2bfloat16(acc);
 }
 
+// ─── FP32 kernels (mirror the BF16 block with no half↔float conversions) ───
+//
+// Used only by flash_attention_varlen_backward's FP32 path. Naive matmuls,
+// scalar softmax — slower than the FP16 tensor-core route but eliminates the
+// cast hop for FP32 trainers (per brosoundml's profiling, the cast pairs
+// around varlen calls were a measurable cost). FP32 storage throughout.
+
+__global__ void fab_extract_head_LD_fp32_kernel(const float* __restrict__ X,
+                                                float* __restrict__ Y,
+                                                int L, int D, int head_off, int head_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = L * head_dim;
+    if (idx >= total) return;
+    const int l = idx / head_dim;
+    const int d = idx % head_dim;
+    Y[l * head_dim + d] = X[l * D + head_off + d];
+}
+
+__global__ void fab_pack_head_LD_fp32_kernel(const float* __restrict__ Y,
+                                             float* __restrict__ Out,
+                                             int L, int D, int head_off, int head_dim) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = L * head_dim;
+    if (idx >= total) return;
+    const int l = idx / head_dim;
+    const int d = idx % head_dim;
+    Out[l * D + head_off + d] = Y[l * head_dim + d];
+}
+
+// Naive FP32 matmul: C(M, N) = A(M, K) @ B(N, K)^T.
+__global__ void fab_matmul_ABT_fp32_kernel(const float* __restrict__ A,
+                                           const float* __restrict__ B,
+                                           float* __restrict__ C,
+                                           int M, int N, int K) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * N;
+    if (idx >= total) return;
+    const int m = idx / N;
+    const int n = idx % N;
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        acc += A[m * K + k] * B[n * K + k];
+    }
+    C[idx] = acc;
+}
+
+inline void launch_matmul_ABT_fp32(const float* A, const float* B, float* C,
+                                   int M, int N, int K, cudaStream_t stream) {
+    if (M == 0 || N == 0) return;
+    const int total = M * N;
+    const int block = 128;
+    const int grid  = (total + block - 1) / block;
+    fab_matmul_ABT_fp32_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
+}
+
+__global__ void fab_softmax_rows_fp32_kernel(float* __restrict__ S,
+                                             int Lq, int Lk,
+                                             float scale,
+                                             const float* __restrict__ mask,
+                                             int causal) {
+    extern __shared__ float ssm[];
+    const int q = blockIdx.x;
+    const int tid = threadIdx.x;
+    float* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+
+    float local_max = -1e30f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        float v = row[k] * scale;
+        if (mask && mask[k] <= 0.5f) v = -1e30f;
+        if (causal && k > q) v = -1e30f;
+        if (v > local_max) local_max = v;
+    }
+    ssm[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float o = ssm[tid + s];
+            if (o > ssm[tid]) ssm[tid] = o;
+        }
+        __syncthreads();
+    }
+    const float rmax = ssm[0];
+    const bool empty = (rmax <= -1e29f);
+
+    float local_sum = 0.0f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        float v = row[k] * scale;
+        if (mask && mask[k] <= 0.5f) v = -1e30f;
+        if (causal && k > q) v = -1e30f;
+        const float e = empty ? 0.0f : __expf(v - rmax);
+        row[k] = e;
+        local_sum += e;
+    }
+    ssm[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) ssm[tid] += ssm[tid + s];
+        __syncthreads();
+    }
+    const float rsum = ssm[0];
+    const float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        row[k] *= inv;
+    }
+}
+
+__global__ void fab_dP_fp32_kernel(const float* __restrict__ dOh,
+                                   const float* __restrict__ Vh,
+                                   float* __restrict__ dP,
+                                   int Lq, int Lk, int hd) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    const int q = blockIdx.y * blockDim.y + threadIdx.y;
+    if (q >= Lq || k >= Lk) return;
+    float acc = 0.0f;
+    for (int d = 0; d < hd; ++d) {
+        acc += dOh[q * hd + d] * Vh[k * hd + d];
+    }
+    dP[q * Lk + k] = acc;
+}
+
+__global__ void fab_dS_from_P_dP_fp32_kernel(float* __restrict__ P_dS,
+                                             const float* __restrict__ dP,
+                                             int Lq, int Lk,
+                                             float scale) {
+    extern __shared__ float ssm[];
+    const int q = blockIdx.x;
+    const int tid = threadIdx.x;
+    float* prow = P_dS + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+    const float* dprow = dP + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+
+    float local = 0.0f;
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        local += prow[k] * dprow[k];
+    }
+    ssm[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) ssm[tid] += ssm[tid + s];
+        __syncthreads();
+    }
+    const float Dq = ssm[0];
+
+    for (int k = tid; k < Lk; k += blockDim.x) {
+        prow[k] = prow[k] * (dprow[k] - Dq) * scale;
+    }
+}
+
+__global__ void fab_dVh_fp32_kernel(const float* __restrict__ P,
+                                    const float* __restrict__ dOh,
+                                    float* __restrict__ dVh,
+                                    int Lq, int Lk, int hd) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = blockIdx.y * blockDim.y + threadIdx.y;
+    if (k >= Lk || d >= hd) return;
+    float acc = 0.0f;
+    for (int q = 0; q < Lq; ++q) {
+        acc += P[q * Lk + k] * dOh[q * hd + d];
+    }
+    dVh[k * hd + d] = acc;
+}
+
+__global__ void fab_dQh_fp32_kernel(const float* __restrict__ dS,
+                                    const float* __restrict__ Kh,
+                                    float* __restrict__ dQh,
+                                    int Lq, int Lk, int hd) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int q = blockIdx.y * blockDim.y + threadIdx.y;
+    if (q >= Lq || d >= hd) return;
+    float acc = 0.0f;
+    for (int k = 0; k < Lk; ++k) {
+        acc += dS[q * Lk + k] * Kh[k * hd + d];
+    }
+    dQh[q * hd + d] = acc;
+}
+
+__global__ void fab_dKh_fp32_kernel(const float* __restrict__ dS,
+                                    const float* __restrict__ Qh,
+                                    float* __restrict__ dKh,
+                                    int Lq, int Lk, int hd) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = blockIdx.y * blockDim.y + threadIdx.y;
+    if (k >= Lk || d >= hd) return;
+    float acc = 0.0f;
+    for (int q = 0; q < Lq; ++q) {
+        acc += dS[q * Lk + k] * Qh[q * hd + d];
+    }
+    dKh[k * hd + d] = acc;
+}
+
 } // namespace
 
 namespace detail::cuda {
@@ -726,13 +915,14 @@ void flash_attention_varlen_backward(const Tensor& Q,
     (void)O;  // recompute-based; O retained in API for symmetry.
 
     const Dtype dt = Q.dtype;
-    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
-        throw std::runtime_error("flash_attention_varlen_backward: Q, K, V, dO must be FP16 or BF16");
+    if (dt != Dtype::FP16 && dt != Dtype::BF16 && dt != Dtype::FP32) {
+        throw std::runtime_error("flash_attention_varlen_backward: Q, K, V, dO must be FP16, BF16, or FP32");
     }
     if (K.dtype != dt || V.dtype != dt || dO.dtype != dt) {
         throw std::runtime_error("flash_attention_varlen_backward: Q, K, V, dO dtype must match");
     }
     const bool bf16 = (dt == Dtype::BF16);
+    const bool fp32 = (dt == Dtype::FP32);
     const int total_q = Q.rows;
     const int total_k = K.rows;
     const int D = num_heads * head_dim;
@@ -926,6 +1116,88 @@ void flash_attention_varlen_backward(const Tensor& Q,
                 fab_pack_head_LD_bf16_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(dVh.data),
                     reinterpret_cast<__nv_bfloat16*>(dVp_b),
+                    Lk, D, head_off, hd);
+                continue;
+            }
+
+            if (fp32) {
+                fab_extract_head_LD_fp32_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const float*>(Qp_b),
+                    reinterpret_cast<float*>(Qh.data),
+                    Lq, D, head_off, hd);
+                fab_extract_head_LD_fp32_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const float*>(Kp_b),
+                    reinterpret_cast<float*>(Kh.data),
+                    Lk, D, head_off, hd);
+                fab_extract_head_LD_fp32_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const float*>(Vp_b),
+                    reinterpret_cast<float*>(Vh.data),
+                    Lk, D, head_off, hd);
+                fab_extract_head_LD_fp32_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const float*>(dOp_b),
+                    reinterpret_cast<float*>(dOh.data),
+                    Lq, D, head_off, hd);
+
+                launch_matmul_ABT_fp32(
+                    reinterpret_cast<const float*>(Qh.data),
+                    reinterpret_cast<const float*>(Kh.data),
+                    reinterpret_cast<float*>(P.data),
+                    Lq, Lk, hd, stream);
+                fab_softmax_rows_fp32_kernel<<<Lq, sm_block, shmem, stream>>>(
+                    reinterpret_cast<float*>(P.data),
+                    Lq, Lk, inv_sqrt, /*mask=*/nullptr, causal ? 1 : 0);
+
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
+                    fab_dVh_fp32_kernel<<<grid, block, 0, stream>>>(
+                        reinterpret_cast<const float*>(P.data),
+                        reinterpret_cast<const float*>(dOh.data),
+                        reinterpret_cast<float*>(dVh.data),
+                        Lq, Lk, hd);
+                }
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
+                    fab_dP_fp32_kernel<<<grid, block, 0, stream>>>(
+                        reinterpret_cast<const float*>(dOh.data),
+                        reinterpret_cast<const float*>(Vh.data),
+                        reinterpret_cast<float*>(dP.data),
+                        Lq, Lk, hd);
+                }
+                fab_dS_from_P_dP_fp32_kernel<<<Lq, sm_block, shmem, stream>>>(
+                    reinterpret_cast<float*>(P.data),
+                    reinterpret_cast<const float*>(dP.data),
+                    Lq, Lk, inv_sqrt);
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
+                    fab_dQh_fp32_kernel<<<grid, block, 0, stream>>>(
+                        reinterpret_cast<const float*>(P.data),
+                        reinterpret_cast<const float*>(Kh.data),
+                        reinterpret_cast<float*>(dQh.data),
+                        Lq, Lk, hd);
+                }
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
+                    fab_dKh_fp32_kernel<<<grid, block, 0, stream>>>(
+                        reinterpret_cast<const float*>(P.data),
+                        reinterpret_cast<const float*>(Qh.data),
+                        reinterpret_cast<float*>(dKh.data),
+                        Lq, Lk, hd);
+                }
+                fab_pack_head_LD_fp32_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const float*>(dQh.data),
+                    reinterpret_cast<float*>(dQp_b),
+                    Lq, D, head_off, hd);
+                fab_pack_head_LD_fp32_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const float*>(dKh.data),
+                    reinterpret_cast<float*>(dKp_b),
+                    Lk, D, head_off, hd);
+                fab_pack_head_LD_fp32_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const float*>(dVh.data),
+                    reinterpret_cast<float*>(dVp_b),
                     Lk, D, head_off, hd);
                 continue;
             }
