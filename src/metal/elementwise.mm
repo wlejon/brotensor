@@ -253,10 +253,14 @@ inline float erf_approx(float x) {
 inline float silu_scalar(float v) {
     return v / (1.0f + exp(-v));
 }
+// Metal's builtin tanh() returns NaN for x ≳ 45 (it computes exp(2x)/(exp(2x)+1)
+// internally and exp(2x) overflows FP32). Clamp to ±9 where tanh saturates to
+// ±1 within FP32 epsilon. Used by every tanh site below.
+inline float safe_tanh(float x) { return tanh(clamp(x, -9.0f, 9.0f)); }
 inline float gelu_tanh_scalar(float v) {
     constexpr float kSqrt2OverPi = 0.7978845608f;
     float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
-    return 0.5f * v * (1.0f + tanh(u));
+    return 0.5f * v * (1.0f + safe_tanh(u));
 }
 inline float quick_gelu_scalar(float v) {
     return v / (1.0f + exp(-1.702f * v));
@@ -268,7 +272,7 @@ inline float silu_grad_scalar(float v) {
 inline float gelu_tanh_grad_scalar(float v) {
     constexpr float kSqrt2OverPi = 0.7978845608f;
     float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
-    float t = tanh(u);
+    float t = safe_tanh(u);
     float dudx = kSqrt2OverPi * (1.0f + 3.0f * 0.044715f * v * v);
     return 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * dudx;
 }
@@ -700,15 +704,19 @@ inline float erf_approx(float x) {
 }
 #define erf(x) erf_approx(x)
 
+// Metal's builtin tanh() returns NaN for x ≳ 45 (it computes exp(2x)/(exp(2x)+1)
+// internally and exp(2x) overflows FP32). Clamp to ±9 where tanh saturates to
+// ±1 within FP32 epsilon. Used by every tanh site below.
+inline float safe_tanh(float x) { return tanh(clamp(x, -9.0f, 9.0f)); }
 inline float gelu_tanh_scalar(float v) {
     constexpr float kSqrt2OverPi = 0.7978845608f;
     float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
-    return 0.5f * v * (1.0f + tanh(u));
+    return 0.5f * v * (1.0f + safe_tanh(u));
 }
 inline float gelu_tanh_grad_scalar(float v) {
     constexpr float kSqrt2OverPi = 0.7978845608f;
     float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
-    float t = tanh(u);
+    float t = safe_tanh(u);
     float dudx = kSqrt2OverPi * (1.0f + 3.0f * 0.044715f * v * v);
     return 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * dudx;
 }

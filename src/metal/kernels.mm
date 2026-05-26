@@ -40,7 +40,9 @@ kernel void k_tanh_forward(device const float* x [[buffer(0)]],
                            constant uint& n      [[buffer(2)]],
                            uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
-    y[i] = tanh(x[i]);
+    // Metal's tanh() can return NaN for x ≳ 45 (exp(2x) overflows). Clamp to
+    // ±9 where tanh saturates to ±1 within FP32 epsilon.
+    y[i] = tanh(clamp(x[i], -9.0f, 9.0f));
 }
 
 kernel void k_tanh_backward(device const float* y  [[buffer(0)]],

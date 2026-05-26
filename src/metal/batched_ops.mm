@@ -50,7 +50,8 @@ kernel void k_tanh_fw_batched(device const float* x [[buffer(0)]],
                               constant uint& n      [[buffer(2)]],
                               uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
-    y[i] = tanh(x[i]);
+    // See kernels.mm k_tanh_forward — Metal's tanh overflows for x ≳ 45.
+    y[i] = tanh(clamp(x[i], -9.0f, 9.0f));
 }
 
 kernel void k_add_inplace_batched(device float*       y [[buffer(0)]],

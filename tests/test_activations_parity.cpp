@@ -97,9 +97,28 @@ BT_PARITY_TEST(silu_fwd_vec)   { run_fwd(brotensor::silu_forward, "silu_fwd", 64
 BT_PARITY_TEST(silu_bwd_1x1)   { run_bwd(brotensor::silu_backward, "silu_bwd", 1, 1, 0x2003ull); }
 BT_PARITY_TEST(silu_bwd_8x32)  { run_bwd(brotensor::silu_backward, "silu_bwd", 8, 32, 0x2004ull); }
 
+// Forward driver with a configurable input amplitude — for exercising
+// activation tails (Metal's tanh overflows past ~45 if not clamped).
+template <typename Fwd>
+void run_fwd_amp(Fwd fwd, const char* tag, int r, int c, float amp, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor x = Tensor::mat(r, c);
+    fill_random(x, rng, amp);
+    Tensor cpu_y;  fwd(x, cpu_y);
+    Tensor gx = x.to(gpu_device());
+    Tensor gpu_y; fwd(gx, gpu_y);
+    compare_tensors(cpu_y, download_to_host(gpu_y), tag);
+}
+
 // ─── gelu (tanh-approx) ────────────────────────────────────────────────────
 BT_PARITY_TEST(gelu_fwd_1x1)   { run_fwd(brotensor::gelu_forward, "gelu_fwd", 1, 1, 0x2010ull); }
 BT_PARITY_TEST(gelu_fwd_8x32)  { run_fwd(brotensor::gelu_forward, "gelu_fwd", 8, 32, 0x2011ull); }
+// Large-amplitude regression: Metal's tanh() returns NaN past ~45, which made
+// gelu (and any direct tanh call) blow up once activations got large — e.g.
+// plBERT layer ~5 inside brosoundml's Kokoro pipeline. Clamping in MSL keeps
+// CPU/Metal parity on inputs that reach the saturating tail.
+BT_PARITY_TEST(gelu_fwd_amp30) { run_fwd_amp(brotensor::gelu_forward, "gelu_fwd_amp30", 8, 64, 30.0f, 0x2014ull); }
+BT_PARITY_TEST(tanh_fwd_amp30) { run_fwd_amp(brotensor::tanh_forward, "tanh_fwd_amp30", 8, 64, 30.0f, 0x2015ull); }
 BT_PARITY_TEST(gelu_bwd_1x1)   { run_bwd(brotensor::gelu_backward, "gelu_bwd", 1, 1, 0x2012ull); }
 BT_PARITY_TEST(gelu_bwd_8x32)  { run_bwd(brotensor::gelu_backward, "gelu_bwd", 8, 32, 0x2013ull); }
 
