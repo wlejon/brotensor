@@ -2005,6 +2005,23 @@ void flash_attention_backward(const ::brotensor::Tensor& Q,
                               ::brotensor::Tensor& dK,
                               ::brotensor::Tensor& dV);
 
+void flash_attention_varlen_backward(const ::brotensor::Tensor& Q,
+                                     const ::brotensor::Tensor& K,
+                                     const ::brotensor::Tensor& V,
+                                     const ::brotensor::Tensor& O,
+                                     const ::brotensor::Tensor& dO,
+                                     const int32_t* cu_seqlens_q,
+                                     const int32_t* cu_seqlens_k,
+                                     int batch_size,
+                                     int max_seqlen_q,
+                                     int max_seqlen_k,
+                                     int num_heads,
+                                     int head_dim,
+                                     bool causal,
+                                     ::brotensor::Tensor& dQ,
+                                     ::brotensor::Tensor& dK,
+                                     ::brotensor::Tensor& dV);
+
 // ─── flash_attention_varlen_forward ────────────────────────────────────────
 //
 // Packed variable-length flash attention (Qwen3-VL window attention). Q/K/V
@@ -2224,6 +2241,7 @@ void fill_cuda_vtable_flash_attention(::brotensor::detail::OpsVTable& v) {
     v.flash_attention_qkvo_forward                  = &flash_attention_qkvo_forward;
     v.flash_attention_qkvo_backward                 = &flash_attention_qkvo_backward;
     v.flash_attention_backward                      = &flash_attention_backward;
+    v.flash_attention_varlen_backward               = &flash_attention_varlen_backward;
     v.flash_attention_project_kv                    = &flash_attention_project_kv;
     v.flash_attention_q_with_kv_cached_forward      = &flash_attention_q_with_kv_cached_forward;
     v.flash_attention_qkvo_int8w_fp16               = &flash_attention_qkvo_int8w_fp16;

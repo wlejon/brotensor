@@ -15,6 +15,7 @@
 // own anonymous namespace.
 
 #include <brotensor/runtime.h>
+#include <brotensor/tensor.h>
 
 #include "fp16_internal.cuh"
 #include "detail/cuda_check.h"
@@ -24,7 +25,10 @@
 #include <cuda_bf16.h>
 
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 namespace brotensor {
 
@@ -682,6 +686,330 @@ void flash_attention_backward(const Tensor& Q,
             reinterpret_cast<const __half*>(dVh.data),
             reinterpret_cast<__half*>(dV.data),
             Lk, D, head_off, hd);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+// ─── flash_attention_varlen_backward ────────────────────────────────────────
+//
+// Packed variable-length backward. Per-sequence offset arithmetic into the
+// (total_tokens, D) Q/K/V/dO/dQ/dK/dV buffers, then the same 8-kernel
+// per-head sweep as `flash_attention_backward` above (extract → matmul →
+// row-softmax → dV, dP, dS, dQ_h, dK_h → pack).
+//
+// cu_seqlens_q/k are DEVICE pointers (matching the varlen forward); we copy
+// them host-side once per call (B+1 INT32s) so the host can drive the
+// per-sequence loop. B is small for visual / token workloads — a few dozen
+// at most — so the D→H copy + B kernel-launch tier overhead is negligible
+// next to the per-sequence kernel work.
+//
+// Scratch (Qh/Kh/Vh/dOh/dQh/dKh/dVh + P + dP) is sized to the observed
+// max-per-sequence dims and reused across sequences. The kernels take
+// explicit (Lq, Lk) bounds so the unused tail of each scratch buffer is
+// never read.
+void flash_attention_varlen_backward(const Tensor& Q,
+                                     const Tensor& K,
+                                     const Tensor& V,
+                                     const Tensor& O,
+                                     const Tensor& dO,
+                                     const int32_t* cu_seqlens_q,
+                                     const int32_t* cu_seqlens_k,
+                                     int batch_size,
+                                     int max_seqlen_q,
+                                     int max_seqlen_k,
+                                     int num_heads,
+                                     int head_dim,
+                                     bool causal,
+                                     Tensor& dQ,
+                                     Tensor& dK,
+                                     Tensor& dV) {
+    (void)O;  // recompute-based; O retained in API for symmetry.
+
+    const Dtype dt = Q.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("flash_attention_varlen_backward: Q, K, V, dO must be FP16 or BF16");
+    }
+    if (K.dtype != dt || V.dtype != dt || dO.dtype != dt) {
+        throw std::runtime_error("flash_attention_varlen_backward: Q, K, V, dO dtype must match");
+    }
+    const bool bf16 = (dt == Dtype::BF16);
+    const int total_q = Q.rows;
+    const int total_k = K.rows;
+    const int D = num_heads * head_dim;
+    if (Q.cols != D || K.cols != D || V.cols != D || V.rows != total_k) {
+        throw std::runtime_error("flash_attention_varlen_backward: shape mismatch");
+    }
+    if (dO.rows != total_q || dO.cols != D) {
+        throw std::runtime_error("flash_attention_varlen_backward: dO shape mismatch");
+    }
+    if (num_heads <= 0 || head_dim <= 0) {
+        throw std::runtime_error("flash_attention_varlen_backward: num_heads/head_dim must be positive");
+    }
+    if (batch_size < 0) {
+        throw std::runtime_error("flash_attention_varlen_backward: batch_size must be non-negative");
+    }
+    if (batch_size > 0 && (!cu_seqlens_q || !cu_seqlens_k)) {
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q/k required when batch_size > 0");
+    }
+    if (max_seqlen_q < 0 || max_seqlen_k < 0) {
+        throw std::runtime_error("flash_attention_varlen_backward: max_seqlen_q/k must be non-negative");
+    }
+
+    if (dQ.rows != total_q || dQ.cols != D || dQ.dtype != dt) dQ.resize(total_q, D, dt);
+    if (dK.rows != total_k || dK.cols != D || dK.dtype != dt) dK.resize(total_k, D, dt);
+    if (dV.rows != total_k || dV.cols != D || dV.dtype != dt) dV.resize(total_k, D, dt);
+    dQ.zero();
+    dK.zero();
+    dV.zero();
+
+    if (D == 0 || batch_size == 0) return;
+    if (total_q == 0 && total_k == 0) return;
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+
+    // Copy cu_seqlens device→host once. (batch_size+1)*4 bytes — negligible.
+    std::vector<int32_t> cq(batch_size + 1);
+    std::vector<int32_t> ck(batch_size + 1);
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(cq.data(), cu_seqlens_q,
+                                         sizeof(int32_t) * (batch_size + 1),
+                                         cudaMemcpyDeviceToHost, stream));
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(ck.data(), cu_seqlens_k,
+                                         sizeof(int32_t) * (batch_size + 1),
+                                         cudaMemcpyDeviceToHost, stream));
+    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (cq[0] != 0)
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q[0] must be 0");
+    if (ck[0] != 0)
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_k[0] must be 0");
+    if (cq[batch_size] != total_q)
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q[B] != total_tokens_q");
+    if (ck[batch_size] != total_k)
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_k[B] != total_tokens_k");
+
+    // Determine effective max-per-sequence for scratch allocation. The caller's
+    // max_seqlen_* are advisory; we honour the observed maximum so an
+    // under-reported max doesn't cause out-of-bounds writes.
+    int max_lq = max_seqlen_q, max_lk = max_seqlen_k;
+    for (int b = 0; b < batch_size; ++b) {
+        const int Lq_b = cq[b + 1] - cq[b];
+        const int Lk_b = ck[b + 1] - ck[b];
+        if (Lq_b < 0 || Lk_b < 0)
+            throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens must be non-decreasing");
+        if (causal && Lq_b != Lk_b)
+            throw std::runtime_error("flash_attention_varlen_backward: causal requires per-sequence Lq == Lk");
+        if (Lq_b > max_lq) max_lq = Lq_b;
+        if (Lk_b > max_lk) max_lk = Lk_b;
+    }
+    if (max_lq <= 0 || max_lk <= 0) return;  // every sequence empty.
+
+    const int hd = head_dim;
+    const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(hd));
+    constexpr int CP_BLOCK = 256;
+    int sm_block = 32;
+    while (sm_block < max_lk && sm_block < 1024) sm_block *= 2;
+    if (sm_block > 1024) sm_block = 1024;
+
+    // Per-head scratch, max-sized once.
+    Tensor Qh  = Tensor::empty_on(Device::CUDA, max_lq, hd, dt);
+    Tensor Kh  = Tensor::empty_on(Device::CUDA, max_lk, hd, dt);
+    Tensor Vh  = Tensor::empty_on(Device::CUDA, max_lk, hd, dt);
+    Tensor dOh = Tensor::empty_on(Device::CUDA, max_lq, hd, dt);
+    Tensor P   = Tensor::empty_on(Device::CUDA, max_lq, max_lk, dt);
+    Tensor dP  = Tensor::empty_on(Device::CUDA, max_lq, max_lk, dt);
+    Tensor dQh = Tensor::empty_on(Device::CUDA, max_lq, hd, dt);
+    Tensor dKh = Tensor::empty_on(Device::CUDA, max_lk, hd, dt);
+    Tensor dVh = Tensor::empty_on(Device::CUDA, max_lk, hd, dt);
+
+    const std::size_t dtsz = static_cast<std::size_t>(dtype_size_bytes(dt));
+
+    for (int b = 0; b < batch_size; ++b) {
+        const int q_beg = cq[b];
+        const int k_beg = ck[b];
+        const int Lq    = cq[b + 1] - q_beg;
+        const int Lk    = ck[b + 1] - k_beg;
+        if (Lq == 0 || Lk == 0) continue;  // grad rows already zero.
+
+        const std::size_t q_off = static_cast<std::size_t>(q_beg) * D * dtsz;
+        const std::size_t k_off = static_cast<std::size_t>(k_beg) * D * dtsz;
+
+        const void* Qp_b  = static_cast<const char*>(Q.data)  + q_off;
+        const void* Kp_b  = static_cast<const char*>(K.data)  + k_off;
+        const void* Vp_b  = static_cast<const char*>(V.data)  + k_off;
+        const void* dOp_b = static_cast<const char*>(dO.data) + q_off;
+        void* dQp_b = static_cast<char*>(dQ.data) + q_off;
+        void* dKp_b = static_cast<char*>(dK.data) + k_off;
+        void* dVp_b = static_cast<char*>(dV.data) + k_off;
+
+        const std::size_t shmem = static_cast<std::size_t>(sm_block) * sizeof(float);
+        const int total_qh = Lq * hd;
+        const int total_kh = Lk * hd;
+
+        for (int h = 0; h < num_heads; ++h) {
+            const int head_off = h * hd;
+
+            if (bf16) {
+                fab_extract_head_LD_bf16_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(Qp_b),
+                    reinterpret_cast<__nv_bfloat16*>(Qh.data),
+                    Lq, D, head_off, hd);
+                fab_extract_head_LD_bf16_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(Kp_b),
+                    reinterpret_cast<__nv_bfloat16*>(Kh.data),
+                    Lk, D, head_off, hd);
+                fab_extract_head_LD_bf16_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(Vp_b),
+                    reinterpret_cast<__nv_bfloat16*>(Vh.data),
+                    Lk, D, head_off, hd);
+                fab_extract_head_LD_bf16_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(dOp_b),
+                    reinterpret_cast<__nv_bfloat16*>(dOh.data),
+                    Lq, D, head_off, hd);
+
+                launch_matmul_ABT_bf16(
+                    reinterpret_cast<const __nv_bfloat16*>(Qh.data),
+                    reinterpret_cast<const __nv_bfloat16*>(Kh.data),
+                    reinterpret_cast<__nv_bfloat16*>(P.data),
+                    Lq, Lk, hd, stream);
+                fab_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
+                    reinterpret_cast<__nv_bfloat16*>(P.data),
+                    Lq, Lk, inv_sqrt, /*mask=*/nullptr, causal ? 1 : 0);
+
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
+                    fab_dVh_bf16_kernel<<<grid, block, 0, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(P.data),
+                        reinterpret_cast<const __nv_bfloat16*>(dOh.data),
+                        reinterpret_cast<__nv_bfloat16*>(dVh.data),
+                        Lq, Lk, hd);
+                }
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
+                    fab_dP_bf16_kernel<<<grid, block, 0, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(dOh.data),
+                        reinterpret_cast<const __nv_bfloat16*>(Vh.data),
+                        reinterpret_cast<__nv_bfloat16*>(dP.data),
+                        Lq, Lk, hd);
+                }
+                fab_dS_from_P_dP_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
+                    reinterpret_cast<__nv_bfloat16*>(P.data),
+                    reinterpret_cast<const __nv_bfloat16*>(dP.data),
+                    Lq, Lk, inv_sqrt);
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
+                    fab_dQh_bf16_kernel<<<grid, block, 0, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(P.data),
+                        reinterpret_cast<const __nv_bfloat16*>(Kh.data),
+                        reinterpret_cast<__nv_bfloat16*>(dQh.data),
+                        Lq, Lk, hd);
+                }
+                {
+                    dim3 block(16, 16);
+                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
+                    fab_dKh_bf16_kernel<<<grid, block, 0, stream>>>(
+                        reinterpret_cast<const __nv_bfloat16*>(P.data),
+                        reinterpret_cast<const __nv_bfloat16*>(Qh.data),
+                        reinterpret_cast<__nv_bfloat16*>(dKh.data),
+                        Lq, Lk, hd);
+                }
+                fab_pack_head_LD_bf16_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(dQh.data),
+                    reinterpret_cast<__nv_bfloat16*>(dQp_b),
+                    Lq, D, head_off, hd);
+                fab_pack_head_LD_bf16_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(dKh.data),
+                    reinterpret_cast<__nv_bfloat16*>(dKp_b),
+                    Lk, D, head_off, hd);
+                fab_pack_head_LD_bf16_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                    reinterpret_cast<const __nv_bfloat16*>(dVh.data),
+                    reinterpret_cast<__nv_bfloat16*>(dVp_b),
+                    Lk, D, head_off, hd);
+                continue;
+            }
+
+            // FP16 path
+            fab_extract_head_LD_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __half*>(Qp_b),
+                reinterpret_cast<__half*>(Qh.data),
+                Lq, D, head_off, hd);
+            fab_extract_head_LD_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __half*>(Kp_b),
+                reinterpret_cast<__half*>(Kh.data),
+                Lk, D, head_off, hd);
+            fab_extract_head_LD_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __half*>(Vp_b),
+                reinterpret_cast<__half*>(Vh.data),
+                Lk, D, head_off, hd);
+            fab_extract_head_LD_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __half*>(dOp_b),
+                reinterpret_cast<__half*>(dOh.data),
+                Lq, D, head_off, hd);
+
+            fp16_internal::launch_matmul_ABT(
+                reinterpret_cast<const __half*>(Qh.data),
+                reinterpret_cast<const __half*>(Kh.data),
+                reinterpret_cast<__half*>(P.data),
+                Lq, Lk, hd);
+            fab_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
+                reinterpret_cast<__half*>(P.data),
+                Lq, Lk, inv_sqrt, /*mask=*/nullptr, causal ? 1 : 0);
+
+            {
+                dim3 block(16, 16);
+                dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
+                fab_dVh_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<const __half*>(P.data),
+                    reinterpret_cast<const __half*>(dOh.data),
+                    reinterpret_cast<__half*>(dVh.data),
+                    Lq, Lk, hd);
+            }
+            {
+                dim3 block(16, 16);
+                dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
+                fab_dP_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<const __half*>(dOh.data),
+                    reinterpret_cast<const __half*>(Vh.data),
+                    reinterpret_cast<__half*>(dP.data),
+                    Lq, Lk, hd);
+            }
+            fab_dS_from_P_dP_kernel<<<Lq, sm_block, shmem, stream>>>(
+                reinterpret_cast<__half*>(P.data),
+                reinterpret_cast<const __half*>(dP.data),
+                Lq, Lk, inv_sqrt);
+            {
+                dim3 block(16, 16);
+                dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
+                fab_dQh_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<const __half*>(P.data),
+                    reinterpret_cast<const __half*>(Kh.data),
+                    reinterpret_cast<__half*>(dQh.data),
+                    Lq, Lk, hd);
+            }
+            {
+                dim3 block(16, 16);
+                dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
+                fab_dKh_kernel<<<grid, block, 0, stream>>>(
+                    reinterpret_cast<const __half*>(P.data),
+                    reinterpret_cast<const __half*>(Qh.data),
+                    reinterpret_cast<__half*>(dKh.data),
+                    Lq, Lk, hd);
+            }
+            fab_pack_head_LD_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __half*>(dQh.data),
+                reinterpret_cast<__half*>(dQp_b),
+                Lq, D, head_off, hd);
+            fab_pack_head_LD_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __half*>(dKh.data),
+                reinterpret_cast<__half*>(dKp_b),
+                Lk, D, head_off, hd);
+            fab_pack_head_LD_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
+                reinterpret_cast<const __half*>(dVh.data),
+                reinterpret_cast<__half*>(dVp_b),
+                Lk, D, head_off, hd);
+        }
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
