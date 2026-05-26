@@ -8,6 +8,8 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <stdexcept>
+
 #include <cstdint>
 #include <stdexcept>
 
@@ -132,6 +134,12 @@ inline int grid_for(int n, int block) {
 void embedding_lookup_forward(const Tensor& table,
                               const int32_t* d_idx, int B,
                               Tensor& out) {
+    if (table.dtype != Dtype::FP32 && table.dtype != Dtype::FP16 &&
+        table.dtype != Dtype::BF16) {
+        throw std::runtime_error(
+            "brotensor: embedding_lookup_forward: table dtype must be "
+            "FP32, FP16, or BF16 (quantized tables must be dequantized first)");
+    }
     const int D = table.cols;
     if (out.rows != B || out.cols != D || out.dtype != table.dtype) {
         out.resize(B, D, table.dtype);

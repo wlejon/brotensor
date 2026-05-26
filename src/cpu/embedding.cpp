@@ -14,12 +14,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace brotensor::detail::cpu {
 
 void embedding_lookup_forward(const ::brotensor::Tensor& table,
                               const int32_t* d_idx, int B,
                               ::brotensor::Tensor& out) {
+    if (table.dtype != ::brotensor::Dtype::FP32) {
+        throw std::runtime_error(
+            "brotensor: embedding_lookup_forward: CPU backend requires "
+            "FP32 table (quantized tables must be dequantized first)");
+    }
     const int D = table.cols;
     if (out.rows != B || out.cols != D ||
         out.dtype != ::brotensor::Dtype::FP32) {

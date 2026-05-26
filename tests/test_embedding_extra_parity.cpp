@@ -10,6 +10,7 @@
 #include <brotensor/tensor.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 using namespace bt_parity;
@@ -135,6 +136,30 @@ BT_PARITY_TEST(emb_extra_bf16_random) {
     for (int i = 0; i < 24; ++i)
         idx.push_back(static_cast<int32_t>(rng.next_u64() % 32));
     run_embedding_bf16(32, 8, idx, 0x912ull);
+}
+
+// Regression: embedding_lookup_forward must reject unsupported table dtypes
+// (e.g. Q8_0) with a clear throw rather than silently reading the bytes as
+// floats. Earlier behavior fell through to the FP32 kernel and produced a
+// garbage output tagged with the quant dtype, which then surfaced far
+// downstream as an unrelated "dtype mismatch" error in the first rms_norm
+// of a model loaded straight from a Q8_0 gguf.
+BT_PARITY_TEST(emb_rejects_q8_0_table) {
+    using brotensor::Dtype;
+    // Empty allocation is enough — the dtype guard fires before any data read,
+    // so neither the table bytes nor the index pointer are dereferenced.
+    Tensor table = Tensor::empty_on(gpu_device(), /*rows=*/8, /*cols=*/32,
+                                    Dtype::Q8_0);
+    std::vector<int32_t> idx = {0, 1, 2};
+    Tensor out;
+    bool threw = false;
+    try {
+        brotensor::embedding_lookup_forward(table, idx.data(),
+                                            static_cast<int>(idx.size()), out);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    BT_CHECK(threw);
 }
 
 int main() { return run_all("embedding-extra cpu/gpu parity"); }
