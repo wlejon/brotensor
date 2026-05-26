@@ -111,7 +111,7 @@ if(BROTENSOR_HAS_GPU)
         linear elementwise softmax layernorm attention optim adam
         reduce loss embedding concat mha batched
         elementwise_extra loss_fused embedding_extra concat_extra
-        reduce_extra layernorm_inference
+        reduce_extra layernorm_inference layernorm_batched_caches
         activations geglu swiglu matmul rope rmsnorm
         conv2d conv3d group_norm
         resample transpose diffusion kv_cache

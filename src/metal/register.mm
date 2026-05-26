@@ -158,6 +158,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.layernorm_forward                           = &dm::layernorm_forward;
     ops.layernorm_forward_inference_batched         = &dm::layernorm_forward_inference_batched;
     ops.layernorm_forward_inference_batched_fp16    = &dm::layernorm_forward_inference_batched_fp16;
+    ops.layernorm_forward_batched_with_caches       = &dm::layernorm_forward_batched_with_caches;
+    ops.layernorm_backward_batched_with_caches      = &dm::layernorm_backward_batched_with_caches;
     ops.leaky_relu_backward                         = &dm::leaky_relu_backward;
     ops.leaky_relu_forward                          = &dm::leaky_relu_forward;
     ops.linear_backward                             = &dm::linear_backward;

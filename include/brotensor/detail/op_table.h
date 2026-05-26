@@ -102,6 +102,12 @@
     /* ─── Inference batched + optim ─── */                                                                                                                             \
     X(layernorm_forward_inference_batched,     void,  (const ::brotensor::Tensor& X_RD, const ::brotensor::Tensor& gamma, const ::brotensor::Tensor& beta,              \
                                                        ::brotensor::Tensor& Y_RD, float eps))                                                                           \
+    X(layernorm_forward_batched_with_caches,   void,  (const ::brotensor::Tensor& X_RD, const ::brotensor::Tensor& gamma, const ::brotensor::Tensor& beta,              \
+                                                       ::brotensor::Tensor& Y_RD, ::brotensor::Tensor& Xhat_RD,                                                         \
+                                                       ::brotensor::Tensor& Mean_R, ::brotensor::Tensor& Rstd_R, float eps))                                            \
+    X(layernorm_backward_batched_with_caches,  void,  (const ::brotensor::Tensor& dY_RD, const ::brotensor::Tensor& Xhat_RD,                                            \
+                                                       const ::brotensor::Tensor& gamma, const ::brotensor::Tensor& Rstd_R,                                             \
+                                                       ::brotensor::Tensor& dX_RD, ::brotensor::Tensor& dGamma, ::brotensor::Tensor& dBeta))                            \
     X(sgd_step,                                void,  (::brotensor::Tensor& param, ::brotensor::Tensor& grad, ::brotensor::Tensor& velocity, float lr, float momentum)) \
     X(adam_step,                               void,  (::brotensor::Tensor& param, const ::brotensor::Tensor& grad, ::brotensor::Tensor& m, ::brotensor::Tensor& v,     \
                                                        float lr, float beta1, float beta2, float eps, int step))                                                        \

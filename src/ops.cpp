@@ -503,6 +503,39 @@ void layernorm_forward_inference_batched(const Tensor& X_RD,
     v.layernorm_forward_inference_batched(X_RD, gamma, beta, Y_RD, eps);
 }
 
+void layernorm_forward_batched_with_caches(const Tensor& X_RD,
+                                           const Tensor& gamma,
+                                           const Tensor& beta,
+                                           Tensor& Y_RD, Tensor& Xhat_RD,
+                                           Tensor& Mean_R, Tensor& Rstd_R,
+                                           float eps) {
+    const auto& v = detail::dispatch(X_RD, gamma, beta, Y_RD, Xhat_RD, Mean_R, Rstd_R);
+    if (!v.layernorm_forward_batched_with_caches)
+        detail::throw_not_implemented("layernorm_forward_batched_with_caches", X_RD.device);
+    detail::adopt_output(Y_RD, X_RD.device);
+    detail::adopt_output(Xhat_RD, X_RD.device);
+    detail::adopt_output(Mean_R, X_RD.device);
+    detail::adopt_output(Rstd_R, X_RD.device);
+    v.layernorm_forward_batched_with_caches(X_RD, gamma, beta, Y_RD, Xhat_RD,
+                                            Mean_R, Rstd_R, eps);
+}
+
+void layernorm_backward_batched_with_caches(const Tensor& dY_RD,
+                                            const Tensor& Xhat_RD,
+                                            const Tensor& gamma,
+                                            const Tensor& Rstd_R,
+                                            Tensor& dX_RD,
+                                            Tensor& dGamma, Tensor& dBeta) {
+    const auto& v = detail::dispatch(dY_RD, Xhat_RD, gamma, Rstd_R, dX_RD, dGamma, dBeta);
+    if (!v.layernorm_backward_batched_with_caches)
+        detail::throw_not_implemented("layernorm_backward_batched_with_caches", dY_RD.device);
+    detail::adopt_output(dX_RD, dY_RD.device);
+    detail::adopt_output(dGamma, dY_RD.device);
+    detail::adopt_output(dBeta, dY_RD.device);
+    v.layernorm_backward_batched_with_caches(dY_RD, Xhat_RD, gamma, Rstd_R,
+                                             dX_RD, dGamma, dBeta);
+}
+
 void sgd_step(Tensor& param, Tensor& grad, Tensor& velocity,
               float lr, float momentum) {
     const auto& v = detail::dispatch(param, grad, velocity);

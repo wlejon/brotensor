@@ -193,6 +193,21 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
                                          const ::brotensor::Tensor& gamma,
                                          const ::brotensor::Tensor& beta,
                                          ::brotensor::Tensor& Y_RD, float eps);
+void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
+                                           const ::brotensor::Tensor& gamma,
+                                           const ::brotensor::Tensor& beta,
+                                           ::brotensor::Tensor& Y_RD,
+                                           ::brotensor::Tensor& Xhat_RD,
+                                           ::brotensor::Tensor& Mean_R,
+                                           ::brotensor::Tensor& Rstd_R,
+                                           float eps);
+void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
+                                            const ::brotensor::Tensor& Xhat_RD,
+                                            const ::brotensor::Tensor& gamma,
+                                            const ::brotensor::Tensor& Rstd_R,
+                                            ::brotensor::Tensor& dX_RD,
+                                            ::brotensor::Tensor& dGamma,
+                                            ::brotensor::Tensor& dBeta);
 void build_causal_mask_row(int L, int q, ::brotensor::Tensor& mask);
 
 // ── CHUNK 2 — activations.cpp / geglu.cpp / swiglu.cpp / matmul.cpp /
@@ -953,6 +968,10 @@ struct CpuStaticRegistrar {
         ops.argmax_rows                = &detail::cpu::argmax_rows;
         ops.layernorm_forward_inference_batched
                                        = &detail::cpu::layernorm_forward_inference_batched;
+        ops.layernorm_forward_batched_with_caches
+                                       = &detail::cpu::layernorm_forward_batched_with_caches;
+        ops.layernorm_backward_batched_with_caches
+                                       = &detail::cpu::layernorm_backward_batched_with_caches;
         ops.build_causal_mask_row      = &detail::cpu::build_causal_mask_row;
 
         // ── CHUNK 2 ──

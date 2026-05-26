@@ -342,6 +342,33 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype);
 // Inference-only batched LayerNorm: R independent rows of length D, no caches,
 // no host syncs. Use layernorm_forward when backward is needed.
 //   X_RD: (R,D).  gamma, beta: (D,).  Y_RD: (R,D), resized if mis-shaped.
+// Training-mode batched LayerNorm: R rows of length D, with caches needed by
+// the backward.
+//   X_RD: (R,D).  gamma, beta: (D,).
+//   Y_RD, Xhat_RD: (R,D), resized/dtype-set to match X_RD.
+//   Mean_R, Rstd_R: (R,1) FP32 regardless of X_RD.dtype — resized/dtyped here.
+//   eps: variance epsilon.
+// GPU backends accept FP32 / FP16 / BF16 for X (gamma/beta/Y/Xhat share dtype).
+// CPU is FP32-only. Caches are always FP32 so backward can dispatch identically.
+void layernorm_forward_batched_with_caches(const Tensor& X_RD,
+                                           const Tensor& gamma,
+                                           const Tensor& beta,
+                                           Tensor& Y_RD, Tensor& Xhat_RD,
+                                           Tensor& Mean_R, Tensor& Rstd_R,
+                                           float eps);
+
+// Training-mode batched LayerNorm backward, consuming the forward caches.
+//   dY_RD, Xhat_RD: (R,D).  gamma: (D,).  Rstd_R: (R,1) FP32 from forward.
+//   dX_RD: (R,D) overwritten (resized + dtype-set to match dY_RD).
+//   dGamma, dBeta: (D,) accumulated — caller zeros (project convention).
+// Dtype rules mirror the forward: GPU FP32/FP16/BF16, CPU FP32 only.
+void layernorm_backward_batched_with_caches(const Tensor& dY_RD,
+                                            const Tensor& Xhat_RD,
+                                            const Tensor& gamma,
+                                            const Tensor& Rstd_R,
+                                            Tensor& dX_RD,
+                                            Tensor& dGamma, Tensor& dBeta);
+
 void layernorm_forward_inference_batched(const Tensor& X_RD,
                                          const Tensor& gamma,
                                          const Tensor& beta,
