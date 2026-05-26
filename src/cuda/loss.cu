@@ -339,15 +339,26 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
     BROTENSOR_CUDA_CHECK(cudaMemsetAsync(loss_per_sample.data, 0,
                                    sizeof(float) * B));
 
-    dim3 grid(n_heads, B);
-    softmax_xent_fused_batched_kernel<<<grid, LOSS_BLOCK>>>(
-        static_cast<const float*>(logits_BL.data),
-        static_cast<const float*>(target_BL.data),
-        d_mask_BL, d_head_offsets,
-        static_cast<float*>(probs_BL.data),
-        static_cast<float*>(dLogits_BL.data),
-        static_cast<float*>(loss_per_sample.data),
-        B, n_heads, n_act);
+    // CUDA caps gridDim.y at 65535; chunk B to stay within the limit.
+    constexpr int kMaxGridY = 65535;
+    const auto* logits_p  = static_cast<const float*>(logits_BL.data);
+    const auto* target_p  = static_cast<const float*>(target_BL.data);
+    auto*       probs_p   = static_cast<float*>(probs_BL.data);
+    auto*       dLogits_p = static_cast<float*>(dLogits_BL.data);
+    auto*       loss_p    = static_cast<float*>(loss_per_sample.data);
+    for (int b0 = 0; b0 < B; b0 += kMaxGridY) {
+        const int b_chunk = (B - b0) < kMaxGridY ? (B - b0) : kMaxGridY;
+        dim3 grid(n_heads, b_chunk);
+        softmax_xent_fused_batched_kernel<<<grid, LOSS_BLOCK>>>(
+            logits_p  + static_cast<size_t>(b0) * n_act,
+            target_p  + static_cast<size_t>(b0) * n_act,
+            d_mask_BL ? (d_mask_BL + static_cast<size_t>(b0) * n_act) : nullptr,
+            d_head_offsets,
+            probs_p   + static_cast<size_t>(b0) * n_act,
+            dLogits_p + static_cast<size_t>(b0) * n_act,
+            loss_p    + b0,
+            b_chunk, n_heads, n_act);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

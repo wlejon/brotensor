@@ -991,12 +991,20 @@ void fa_linear_backward_batched_bf16(const Tensor& W, const Tensor& X_BD,
 
     if (in_dim > 0 && out_dim > 0) {
         dim3 block(64, 1);
-        dim3 grid((in_dim + 63) / 64, B);
-        fa_lbb_dx_bf16_kernel<<<grid, block>>>(
-            static_cast<const __nv_bfloat16*>(W.data),
-            static_cast<const __nv_bfloat16*>(dY_BD.data),
-            static_cast<__nv_bfloat16*>(dX_BD.data),
-            B, out_dim, in_dim);
+        // CUDA caps gridDim.y at 65535; chunk B to stay within the limit.
+        constexpr int kMaxGridY = 65535;
+        const int grid_x = (in_dim + 63) / 64;
+        const auto* dY_p = static_cast<const __nv_bfloat16*>(dY_BD.data);
+        auto*       dX_p = static_cast<__nv_bfloat16*>(dX_BD.data);
+        for (int b0 = 0; b0 < B; b0 += kMaxGridY) {
+            const int b_chunk = (B - b0) < kMaxGridY ? (B - b0) : kMaxGridY;
+            dim3 grid(grid_x, b_chunk);
+            fa_lbb_dx_bf16_kernel<<<grid, block>>>(
+                static_cast<const __nv_bfloat16*>(W.data),
+                dY_p + static_cast<size_t>(b0) * out_dim,
+                dX_p + static_cast<size_t>(b0) * in_dim,
+                b_chunk, out_dim, in_dim);
+        }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     if (out_dim > 0 && in_dim > 0) {
