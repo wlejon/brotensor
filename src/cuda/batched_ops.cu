@@ -194,6 +194,9 @@ inline int grid_for(int n) {
     return blocks;
 }
 
+// CUDA per-launch limit for gridDim.y / gridDim.z on every supported arch.
+constexpr int LBB_MAX_GRID_Y = 65535;
+
 } // anonymous namespace
 
 void linear_forward_batched(const Tensor& W, const Tensor& bias,
@@ -213,13 +216,20 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
     if (B == 0 || out_dim == 0) return;
 
     dim3 block(BL_ROWS_PER_BLOCK, 1);
-    dim3 grid((out_dim + BL_ROWS_PER_BLOCK - 1) / BL_ROWS_PER_BLOCK, B);
-    linear_forward_batched_kernel<<<grid, block>>>(
-        static_cast<const float*>(W.data),
-        static_cast<const float*>(bias.data),
-        static_cast<const float*>(X_BD.data),
-        static_cast<float*>(Y_BD.data),
-        B, out_dim, in_dim);
+    const int grid_x = (out_dim + BL_ROWS_PER_BLOCK - 1) / BL_ROWS_PER_BLOCK;
+    const float* W_p    = static_cast<const float*>(W.data);
+    const float* bias_p = static_cast<const float*>(bias.data);
+    const float* X_p    = static_cast<const float*>(X_BD.data);
+    float*       Y_p    = static_cast<float*>(Y_BD.data);
+    for (int b0 = 0; b0 < B; b0 += LBB_MAX_GRID_Y) {
+        const int b_chunk = (B - b0) < LBB_MAX_GRID_Y ? (B - b0) : LBB_MAX_GRID_Y;
+        dim3 grid(grid_x, b_chunk);
+        linear_forward_batched_kernel<<<grid, block>>>(
+            W_p, bias_p,
+            X_p + static_cast<size_t>(b0) * in_dim,
+            Y_p + static_cast<size_t>(b0) * out_dim,
+            b_chunk, out_dim, in_dim);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -370,25 +380,35 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
 
     if (in_dim > 0 && out_dim > 0) {
         dim3 block(LBB_DX_BLOCK, 1);
-        dim3 grid((in_dim + LBB_DX_BLOCK - 1) / LBB_DX_BLOCK, B);
-        if (is_fp16) {
-            linear_backward_batched_dx_kernel<__half><<<grid, block>>>(
-                static_cast<const __half*>(W.data),
-                static_cast<const __half*>(dY_BD.data),
-                static_cast<__half*>(dX_BD.data),
-                B, out_dim, in_dim);
-        } else if (is_bf16) {
-            linear_backward_batched_dx_kernel<__nv_bfloat16><<<grid, block>>>(
-                static_cast<const __nv_bfloat16*>(W.data),
-                static_cast<const __nv_bfloat16*>(dY_BD.data),
-                static_cast<__nv_bfloat16*>(dX_BD.data),
-                B, out_dim, in_dim);
-        } else {
-            linear_backward_batched_dx_kernel<float><<<grid, block>>>(
-                static_cast<const float*>(W.data),
-                static_cast<const float*>(dY_BD.data),
-                static_cast<float*>(dX_BD.data),
-                B, out_dim, in_dim);
+        const int grid_x = (in_dim + LBB_DX_BLOCK - 1) / LBB_DX_BLOCK;
+        for (int b0 = 0; b0 < B; b0 += LBB_MAX_GRID_Y) {
+            const int b_chunk = (B - b0) < LBB_MAX_GRID_Y ? (B - b0) : LBB_MAX_GRID_Y;
+            dim3 grid(grid_x, b_chunk);
+            if (is_fp16) {
+                linear_backward_batched_dx_kernel<__half><<<grid, block>>>(
+                    static_cast<const __half*>(W.data),
+                    static_cast<const __half*>(dY_BD.data)
+                        + static_cast<size_t>(b0) * out_dim,
+                    static_cast<__half*>(dX_BD.data)
+                        + static_cast<size_t>(b0) * in_dim,
+                    b_chunk, out_dim, in_dim);
+            } else if (is_bf16) {
+                linear_backward_batched_dx_kernel<__nv_bfloat16><<<grid, block>>>(
+                    static_cast<const __nv_bfloat16*>(W.data),
+                    static_cast<const __nv_bfloat16*>(dY_BD.data)
+                        + static_cast<size_t>(b0) * out_dim,
+                    static_cast<__nv_bfloat16*>(dX_BD.data)
+                        + static_cast<size_t>(b0) * in_dim,
+                    b_chunk, out_dim, in_dim);
+            } else {
+                linear_backward_batched_dx_kernel<float><<<grid, block>>>(
+                    static_cast<const float*>(W.data),
+                    static_cast<const float*>(dY_BD.data)
+                        + static_cast<size_t>(b0) * out_dim,
+                    static_cast<float*>(dX_BD.data)
+                        + static_cast<size_t>(b0) * in_dim,
+                    b_chunk, out_dim, in_dim);
+            }
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }

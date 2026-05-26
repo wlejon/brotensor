@@ -217,4 +217,67 @@ BT_PARITY_TEST(linear_bwd_batched_bf16_B3_7_5)  { run_linear_backward_batched_bf
 BT_PARITY_TEST(linear_bwd_batched_bf16_B8_32_16){ run_linear_backward_batched_bf16(8,  32, 16, 0xBF02ull); }
 BT_PARITY_TEST(linear_bwd_batched_bf16_B16_64_32){ run_linear_backward_batched_bf16(16, 64, 32, 0xBF03ull); }
 
+// ─── linear_forward_batched large-B (grid.y > 65535) ──────────────────────
+//
+// Regression for the Kokoro CUDA error 9: linear_forward_batched mapped the
+// batch dim onto gridDim.y, which CUDA caps at 65535. Anything that flattens
+// long sequences into B (TTS vocoder frame batches, etc.) hit invalid-launch.
+// The launcher now chunks B; this test exercises the boundary by running a
+// large-B input as one call and comparing against two half-B calls of the
+// same op — equivalence implies chunking is correct, without needing a
+// per-row scalar reference.
+static void run_linear_batched_large_B(int B, int in_dim, int out_dim,
+                                       uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor W = Tensor::mat(out_dim, in_dim), b = Tensor::vec(out_dim);
+    fill_random(W, rng);
+    fill_random(b, rng);
+    Tensor X_BD = Tensor::mat(B, in_dim);
+    fill_random(X_BD, rng);
+
+    Tensor gW = W.to(gpu_device()), gb = b.to(gpu_device()),
+           gX_BD = X_BD.to(gpu_device());
+
+    // One big batched call — must not raise CUDA error 9.
+    Tensor gY_full;
+    brotensor::linear_forward_batched(gW, gb, gX_BD, gY_full);
+    Tensor Y_full = download_to_host(gY_full);
+    BT_CHECK(Y_full.rows == B);
+    BT_CHECK(Y_full.cols == out_dim);
+
+    // Reference: split X into two halves, run batched on each, concatenate.
+    const int B0 = B / 2;
+    const int B1 = B - B0;
+    Tensor X0 = Tensor::mat(B0, in_dim);
+    Tensor X1 = Tensor::mat(B1, in_dim);
+    std::memcpy(X0.data, X_BD.data,
+                static_cast<size_t>(B0) * in_dim * sizeof(float));
+    std::memcpy(X1.data,
+                static_cast<float*>(X_BD.data)
+                    + static_cast<size_t>(B0) * in_dim,
+                static_cast<size_t>(B1) * in_dim * sizeof(float));
+    Tensor gX0 = X0.to(gpu_device()), gX1 = X1.to(gpu_device());
+    Tensor gY0, gY1;
+    brotensor::linear_forward_batched(gW, gb, gX0, gY0);
+    brotensor::linear_forward_batched(gW, gb, gX1, gY1);
+    Tensor Y0 = download_to_host(gY0), Y1 = download_to_host(gY1);
+
+    Tensor Y_ref = Tensor::mat(B, out_dim);
+    std::memcpy(Y_ref.data, Y0.data,
+                static_cast<size_t>(B0) * out_dim * sizeof(float));
+    std::memcpy(static_cast<float*>(Y_ref.data)
+                    + static_cast<size_t>(B0) * out_dim,
+                Y1.data,
+                static_cast<size_t>(B1) * out_dim * sizeof(float));
+
+    compare_tensors(Y_ref, Y_full, "linear_forward_batched_largeB");
+}
+
+BT_PARITY_TEST(linear_batched_B_just_over_65535) {
+    run_linear_batched_large_B(65536, 8, 4, 0xC101ull);
+}
+BT_PARITY_TEST(linear_batched_B_multi_chunk) {
+    run_linear_batched_large_B(130000, 8, 4, 0xC102ull);
+}
+
 int main() { return run_all("batched ops cpu/gpu parity"); }
