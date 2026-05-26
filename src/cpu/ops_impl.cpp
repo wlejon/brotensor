@@ -684,6 +684,8 @@ void attention_backward(const ::brotensor::Tensor& dO,
 void mha_forward(const ::brotensor::Tensor& X,
                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                 const ::brotensor::Tensor* bq, const ::brotensor::Tensor* bk,
+                 const ::brotensor::Tensor* bv, const ::brotensor::Tensor* bo,
                  const float* d_mask, int num_heads,
                  ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh,
                  ::brotensor::Tensor& Vh, ::brotensor::Tensor& Attnh,
@@ -713,7 +715,14 @@ void mha_forward(const ::brotensor::Tensor& X,
     float* Yp = Yconcat.host_f32_mut();
     float* Op = O.host_f32_mut();
 
-    // Per-head Q/K/V projection: out(hh,i,j) = sum_k X(i,k) * W(hh*dh+j, k).
+    const float* bqp = bq ? bq->host_f32() : nullptr;
+    const float* bkp = bk ? bk->host_f32() : nullptr;
+    const float* bvp = bv ? bv->host_f32() : nullptr;
+    const float* bop = bo ? bo->host_f32() : nullptr;
+
+    // Per-head Q/K/V projection: out(hh,i,j) = sum_k X(i,k) * W(hh*dh+j, k)
+    // + (b ? b[hh*dh+j] : 0). Biases are flat length-D vectors indexed by
+    // the full output column (hh*dh+j).
     for (int hh = 0; hh < H; ++hh) {
         const int row_off = hh * dh;
         for (int i = 0; i < K; ++i) {
@@ -721,15 +730,19 @@ void mha_forward(const ::brotensor::Tensor& X,
             const std::size_t out_row =
                 (static_cast<std::size_t>(hh) * K + i) * dh;
             for (int j = 0; j < dh; ++j) {
-                const float* wq = Wqp + static_cast<std::size_t>(row_off + j) * D;
-                const float* wk = Wkp + static_cast<std::size_t>(row_off + j) * D;
-                const float* wv = Wvp + static_cast<std::size_t>(row_off + j) * D;
+                const int wrow = row_off + j;
+                const float* wq = Wqp + static_cast<std::size_t>(wrow) * D;
+                const float* wk = Wkp + static_cast<std::size_t>(wrow) * D;
+                const float* wv = Wvp + static_cast<std::size_t>(wrow) * D;
                 float aq = 0.0f, ak = 0.0f, av = 0.0f;
                 for (int k = 0; k < D; ++k) {
                     aq += xr[k] * wq[k];
                     ak += xr[k] * wk[k];
                     av += xr[k] * wv[k];
                 }
+                if (bqp) aq += bqp[wrow];
+                if (bkp) ak += bkp[wrow];
+                if (bvp) av += bvp[wrow];
                 Qp[out_row + j] = aq;
                 Kp[out_row + j] = ak;
                 Vp[out_row + j] = av;
@@ -785,7 +798,7 @@ void mha_forward(const ::brotensor::Tensor& X,
         }
     }
 
-    // Output projection O = Yconcat @ Wo^T, zero invalid query rows.
+    // Output projection O = Yconcat @ Wo^T + bo, zero invalid query rows.
     for (int i = 0; i < K; ++i) {
         float* orow = Op + static_cast<std::size_t>(i) * D;
         if (d_mask && d_mask[i] < 0.5f) {
@@ -797,6 +810,7 @@ void mha_forward(const ::brotensor::Tensor& X,
             const float* wr = Wop + static_cast<std::size_t>(c) * D;
             float acc = 0.0f;
             for (int k = 0; k < D; ++k) acc += yr[k] * wr[k];
+            if (bop) acc += bop[c];
             orow[c] = acc;
         }
     }
@@ -812,7 +826,9 @@ void mha_backward(const ::brotensor::Tensor& dO,
                   const float* d_mask, int num_heads,
                   ::brotensor::Tensor& dX,
                   ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
-                  ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo) {
+                  ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo,
+                  ::brotensor::Tensor* dbq, ::brotensor::Tensor* dbk,
+                  ::brotensor::Tensor* dbv, ::brotensor::Tensor* dbo) {
     using ::brotensor::Dtype;
     const int K = X.rows;
     const int D = X.cols;
@@ -871,6 +887,19 @@ void mha_backward(const ::brotensor::Tensor& dO,
                        Yp[static_cast<std::size_t>(i) * D + k];
             }
             dWop[static_cast<std::size_t>(c) * D + k] += acc;
+        }
+    }
+
+    // dbo[c] += sum over valid rows of dO[i,c] (caller zeros).
+    if (dbo) {
+        float* dbop = dbo->host_f32_mut();
+        for (int c = 0; c < D; ++c) {
+            float acc = 0.0f;
+            for (int i = 0; i < K; ++i) {
+                if (d_mask && d_mask[i] < 0.5f) continue;
+                acc += dOp[static_cast<std::size_t>(i) * D + c];
+            }
+            dbop[c] += acc;
         }
     }
 
@@ -941,6 +970,30 @@ void mha_backward(const ::brotensor::Tensor& dO,
                     acc += ds * qq;
                 }
                 dKh[(static_cast<std::size_t>(hh) * K + j) * dh + k] = acc;
+            }
+        }
+    }
+
+    // dbq/dbk/dbv accumulate: db[hh*dh+j] += sum_i dQh/dKh/dVh(hh,i,j).
+    // Caller zeros. Skipped when the matching pointer is null.
+    if (dbq || dbk || dbv) {
+        float* dbqp = dbq ? dbq->host_f32_mut() : nullptr;
+        float* dbkp = dbk ? dbk->host_f32_mut() : nullptr;
+        float* dbvp = dbv ? dbv->host_f32_mut() : nullptr;
+        for (int hh = 0; hh < H; ++hh) {
+            for (int j = 0; j < dh; ++j) {
+                const int r = hh * dh + j;
+                float aq = 0.0f, ak = 0.0f, av = 0.0f;
+                for (int i = 0; i < K; ++i) {
+                    const std::size_t idx =
+                        (static_cast<std::size_t>(hh) * K + i) * dh + j;
+                    if (dbqp) aq += dQh[idx];
+                    if (dbkp) ak += dKh[idx];
+                    if (dbvp) av += dVh[idx];
+                }
+                if (dbqp) dbqp[r] += aq;
+                if (dbkp) dbkp[r] += ak;
+                if (dbvp) dbvp[r] += av;
             }
         }
     }

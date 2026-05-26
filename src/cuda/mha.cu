@@ -140,9 +140,10 @@ __global__ void mha_attn_apply_v_kernel(const float* __restrict__ Attnh,
     Yconcat[static_cast<size_t>(i) * D + (hh * dh + k)] = acc;
 }
 
-// O(i, c) = mask[i] ? sum_k Yconcat(i, k) * Wo(c, k) : 0.
+// O(i, c) = mask[i] ? sum_k Yconcat(i, k) * Wo(c, k) + (bo ? bo[c] : 0) : 0.
 __global__ void mha_output_proj_kernel(const float* __restrict__ Y,
                                        const float* __restrict__ Wo,
+                                       const float* __restrict__ bo,
                                        const float* __restrict__ mask,
                                        float* __restrict__ O,
                                        int K, int D) {
@@ -157,7 +158,20 @@ __global__ void mha_output_proj_kernel(const float* __restrict__ Y,
     const float* wr = Wo + static_cast<size_t>(c) * D;
     float acc = 0.0f;
     for (int k = 0; k < D; ++k) acc += yr[k] * wr[k];
+    if (bo) acc += bo[c];
     O[static_cast<size_t>(i) * D + c] = acc;
+}
+
+// Add bias[hh*dh + j] to a (H*K, dh) tensor in-place. One thread per (hh, i, j).
+__global__ void mha_proj_bias_add_kernel(float* __restrict__ Out,
+                                         const float* __restrict__ bias,
+                                         int K, int dh) {
+    const int j  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int hh = blockIdx.z;
+    if (i >= K || j >= dh) return;
+    const size_t row = static_cast<size_t>(hh) * K + i;
+    Out[row * dh + j] += bias[hh * dh + j];
 }
 
 // ─── Backward kernels ─────────────────────────────────────────────────────
@@ -342,6 +356,36 @@ __global__ void mha_dWqkv_kernel(const float* __restrict__ dQh,
     dWv[idx] += av;
 }
 
+// dbo[c] += sum_{valid i} dO[i, c]. One thread per c, reduces over K.
+__global__ void mha_dbo_kernel(const float* __restrict__ dO,
+                               const float* __restrict__ mask,
+                               float* __restrict__ dbo,
+                               int K, int D) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= D) return;
+    float acc = 0.0f;
+    for (int i = 0; i < K; ++i) {
+        if (mask && mask[i] < 0.5f) continue;
+        acc += dO[static_cast<size_t>(i) * D + c];
+    }
+    dbo[c] += acc;
+}
+
+// db[hh*dh + j] += sum_i dProjH[(hh*K + i)*dh + j]. One thread per row of D.
+__global__ void mha_dbqkv_kernel(const float* __restrict__ dProjH,
+                                 float* __restrict__ db,
+                                 int K, int D, int dh) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= D) return;
+    const int hh = r / dh;
+    const int j  = r % dh;
+    float acc = 0.0f;
+    for (int i = 0; i < K; ++i) {
+        acc += dProjH[(static_cast<size_t>(hh) * K + i) * dh + j];
+    }
+    db[r] += acc;
+}
+
 // dX(i, k) = sum over heads, j: dQh*Wq + dKh*Wk + dVh*Wv at (hh*dh+j, k).
 __global__ void mha_dX_proj_kernel(const float* __restrict__ dQh,
                                    const float* __restrict__ dKh,
@@ -373,6 +417,8 @@ __global__ void mha_dX_proj_kernel(const float* __restrict__ dQh,
 void mha_forward(const ::brotensor::Tensor& X,
                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                 const ::brotensor::Tensor* bq, const ::brotensor::Tensor* bk,
+                 const ::brotensor::Tensor* bv, const ::brotensor::Tensor* bo,
                  const float* d_mask,
                  int num_heads,
                  ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,
@@ -419,6 +465,21 @@ void mha_forward(const ::brotensor::Tensor& X,
         mha_proj_kernel<<<grid, block_kdh>>>(X_p, Wk_p, Kh_p, K, D, dh);
         mha_proj_kernel<<<grid, block_kdh>>>(X_p, Wv_p, Vh_p, K, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
+
+        // Optional Q/K/V bias adds.
+        if (bq) {
+            mha_proj_bias_add_kernel<<<grid, block_kdh>>>(
+                Qh_p, static_cast<const float*>(bq->data), K, dh);
+        }
+        if (bk) {
+            mha_proj_bias_add_kernel<<<grid, block_kdh>>>(
+                Kh_p, static_cast<const float*>(bk->data), K, dh);
+        }
+        if (bv) {
+            mha_proj_bias_add_kernel<<<grid, block_kdh>>>(
+                Vh_p, static_cast<const float*>(bv->data), K, dh);
+        }
+        if (bq || bk || bv) BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // Scores → reuse Attnh storage temporarily for raw scores.
@@ -449,12 +510,13 @@ void mha_forward(const ::brotensor::Tensor& X,
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    // Output projection.
+    // Output projection (with optional bo).
     {
+        const float* bo_p = bo ? static_cast<const float*>(bo->data) : nullptr;
         dim3 grid(((D) + block_kd.x - 1) / block_kd.x,
                   ((K) + block_kd.y - 1) / block_kd.y);
-        mha_output_proj_kernel<<<grid, block_kd>>>(Yconcat_p, Wo_p, d_mask,
-                                                   O_p, K, D);
+        mha_output_proj_kernel<<<grid, block_kd>>>(Yconcat_p, Wo_p, bo_p,
+                                                   d_mask, O_p, K, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     (void)block_dd;
@@ -472,7 +534,9 @@ void mha_backward(const ::brotensor::Tensor& dO,
                   int num_heads,
                   ::brotensor::Tensor& dX,
                   ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
-                  ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo) {
+                  ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo,
+                  ::brotensor::Tensor* dbq, ::brotensor::Tensor* dbk,
+                  ::brotensor::Tensor* dbv, ::brotensor::Tensor* dbo) {
     using ::brotensor::Tensor;
     using ::brotensor::Device;
     using ::brotensor::Dtype;
@@ -524,6 +588,16 @@ void mha_backward(const ::brotensor::Tensor& dO,
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
+    // Optional dbo (= sum over valid rows of dO[:, c]).
+    if (dbo) {
+        const int block = 256;
+        const int grid_x = (D + block - 1) / block;
+        mha_dbo_kernel<<<grid_x, block>>>(dO_p, d_mask,
+                                          static_cast<float*>(dbo->data),
+                                          K, D);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+
     // dAttn (H*K, K), dVh (H*K, dh).
     Tensor dAttn = Tensor::empty_on(Device::CUDA, H * K, K, Dtype::FP32);
     Tensor dVh   = Tensor::empty_on(Device::CUDA, H * K, dh, Dtype::FP32);
@@ -567,6 +641,25 @@ void mha_backward(const ::brotensor::Tensor& dO,
                                            K, dh);
         mha_dK_kernel<<<grid, block_kdh>>>(dScores_p, Qh_p, dKh_p,
                                            K, dh);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Optional dbq/dbk/dbv (column-reduce of dQh/dKh/dVh into length-D vectors).
+    if (dbq || dbk || dbv) {
+        const int block = 256;
+        const int grid_x = (D + block - 1) / block;
+        if (dbq) {
+            mha_dbqkv_kernel<<<grid_x, block>>>(
+                dQh_p, static_cast<float*>(dbq->data), K, D, dh);
+        }
+        if (dbk) {
+            mha_dbqkv_kernel<<<grid_x, block>>>(
+                dKh_p, static_cast<float*>(dbk->data), K, D, dh);
+        }
+        if (dbv) {
+            mha_dbqkv_kernel<<<grid_x, block>>>(
+                dVh_p, static_cast<float*>(dbv->data), K, D, dh);
+        }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 

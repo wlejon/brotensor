@@ -27,6 +27,8 @@ namespace brotensor::detail::cpu {
 void mha_forward(const ::brotensor::Tensor& X,
                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                 const ::brotensor::Tensor* bq, const ::brotensor::Tensor* bk,
+                 const ::brotensor::Tensor* bv, const ::brotensor::Tensor* bo,
                  const float* d_mask, int num_heads,
                  ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh,
                  ::brotensor::Tensor& Vh, ::brotensor::Tensor& Attnh,
@@ -41,7 +43,9 @@ void mha_backward(const ::brotensor::Tensor& dO,
                   const float* d_mask, int num_heads,
                   ::brotensor::Tensor& dX,
                   ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
-                  ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo);
+                  ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo,
+                  ::brotensor::Tensor* dbq, ::brotensor::Tensor* dbk,
+                  ::brotensor::Tensor* dbv, ::brotensor::Tensor* dbo);
 
 void self_attention_forward_train(const ::brotensor::Tensor& X,
                                   const ::brotensor::Tensor& Wq,
@@ -56,7 +60,9 @@ void self_attention_forward_train(const ::brotensor::Tensor& X,
                                   ::brotensor::Tensor& Attnh,
                                   ::brotensor::Tensor& Yconcat,
                                   ::brotensor::Tensor& O) {
-    mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
+    mha_forward(X, Wq, Wk, Wv, Wo,
+                nullptr, nullptr, nullptr, nullptr,
+                d_mask, num_heads,
                 Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 
@@ -80,7 +86,8 @@ void self_attention_backward(const ::brotensor::Tensor& dO,
                              ::brotensor::Tensor& dWo) {
     mha_backward(dO, X, Qh, Kh, Vh, Attnh, Yconcat,
                  Wq, Wk, Wv, Wo, d_mask, num_heads,
-                 dX, dWq, dWk, dWv, dWo);
+                 dX, dWq, dWk, dWv, dWo,
+                 nullptr, nullptr, nullptr, nullptr);
 }
 
 } // namespace brotensor::detail::cpu

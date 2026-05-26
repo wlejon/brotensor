@@ -3,6 +3,7 @@
 #import "internal.h"
 
 #include <cmath>
+#include <stdexcept>
 
 namespace brotensor::detail::metal {
 
@@ -435,11 +436,17 @@ void run_rows(id<MTLComputePipelineState> pso, NSUInteger rows,
 void mha_forward(const Tensor& X,
                  const Tensor& Wq, const Tensor& Wk,
                  const Tensor& Wv, const Tensor& Wo,
+                 const Tensor* bq, const Tensor* bk,
+                 const Tensor* bv, const Tensor* bo,
                  const float* d_mask,
                  int num_heads,
                  Tensor& Qh, Tensor& Kh, Tensor& Vh,
                  Tensor& Attnh, Tensor& Yconcat,
                  Tensor& O) {
+    if (bq || bk || bv || bo) {
+        throw std::runtime_error("brotensor: mha_forward: Q/K/V/O biases "
+                                 "not yet implemented on Metal");
+    }
     const int K = X.rows;
     const int D = X.cols;
     const int H = num_heads;
@@ -550,7 +557,13 @@ void mha_backward(const Tensor& dO,
                   int num_heads,
                   Tensor& dX,
                   Tensor& dWq, Tensor& dWk,
-                  Tensor& dWv, Tensor& dWo) {
+                  Tensor& dWv, Tensor& dWo,
+                  Tensor* dbq, Tensor* dbk,
+                  Tensor* dbv, Tensor* dbo) {
+    if (dbq || dbk || dbv || dbo) {
+        throw std::runtime_error("brotensor: mha_backward: Q/K/V/O bias "
+                                 "gradients not yet implemented on Metal");
+    }
     const int K = X.rows;
     const int D = X.cols;
     const int H = num_heads;

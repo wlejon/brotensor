@@ -150,26 +150,54 @@ void attention_backward(const Tensor& dO,
 // split into num_heads heads of head_dim = D / num_heads; num_heads must
 // divide D.
 //   X: (K,D).  Wq, Wk, Wv, Wo: each (D,D).
+//   bq, bk, bv, bo: optional length-D bias vectors (any shape with D
+//                   elements, FP32). Added row-wise after the matching
+//                   projection: Q/K/V get bq/bk/bv post-projection, O gets
+//                   bo post-Wo. Any of the four may be null to skip that
+//                   bias term.
 //   d_mask: optional length-K device mask (1 valid / 0 invalid); may be null.
 //           Same semantics as single-head attention.
 //   O: (K,D) output, resized if mis-shaped.
 //   Backward caches (out-params, resized if mis-shaped): Qh, Kh, Vh
 //   (num_heads*K, head_dim) with head h in rows [h*K, (h+1)*K); Attnh
-//   (num_heads*K, K) per-head softmax weights; Yconcat (K,D) pre-Wo concat.
+//   (num_heads*K, K) per-head softmax weights; Yconcat (K,D) pre-Wo concat
+//   (does NOT include bo — bo is folded into O directly).
 void mha_forward(const Tensor& X,
                  const Tensor& Wq, const Tensor& Wk,
                  const Tensor& Wv, const Tensor& Wo,
+                 const Tensor* bq, const Tensor* bk,
+                 const Tensor* bv, const Tensor* bo,
                  const float* d_mask,
                  int num_heads,
                  Tensor& Qh, Tensor& Kh, Tensor& Vh,
                  Tensor& Attnh, Tensor& Yconcat,
                  Tensor& O);
 
+// Bias-less convenience overload — forwards to the bias-aware mha_forward
+// with bq/bk/bv/bo == nullptr. Preserves the original call shape so existing
+// callers don't change.
+inline void mha_forward(const Tensor& X,
+                        const Tensor& Wq, const Tensor& Wk,
+                        const Tensor& Wv, const Tensor& Wo,
+                        const float* d_mask,
+                        int num_heads,
+                        Tensor& Qh, Tensor& Kh, Tensor& Vh,
+                        Tensor& Attnh, Tensor& Yconcat,
+                        Tensor& O) {
+    mha_forward(X, Wq, Wk, Wv, Wo,
+                nullptr, nullptr, nullptr, nullptr,
+                d_mask, num_heads,
+                Qh, Kh, Vh, Attnh, Yconcat, O);
+}
+
 // Backward of mha_forward.
 //   dO: (K,D) upstream.  X, Qh, Kh, Vh, Attnh, Yconcat: forward caches.
 //   Wq, Wk, Wv, Wo: (D,D) forward weights.  d_mask: as forward (or null).
 //   num_heads must match forward.
 //   dX: (K,D) overwritten.  dWq, dWk, dWv, dWo: (D,D) accumulated — caller zeros.
+//   dbq, dbk, dbv, dbo: optional length-D bias gradients, accumulated
+//                       (caller zeros). Pass null to skip — must match the
+//                       null/non-null pattern of the forward biases.
 void mha_backward(const Tensor& dO,
                   const Tensor& X,
                   const Tensor& Qh, const Tensor& Kh,
@@ -181,7 +209,9 @@ void mha_backward(const Tensor& dO,
                   int num_heads,
                   Tensor& dX,
                   Tensor& dWq, Tensor& dWk,
-                  Tensor& dWv, Tensor& dWo);
+                  Tensor& dWv, Tensor& dWo,
+                  Tensor* dbq = nullptr, Tensor* dbk = nullptr,
+                  Tensor* dbv = nullptr, Tensor* dbo = nullptr);
 
 // ─── Pooling / losses / embeddings / concat ────────────────────────────────
 

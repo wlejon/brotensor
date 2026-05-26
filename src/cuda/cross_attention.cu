@@ -25,6 +25,8 @@ namespace brotensor::detail::cuda {
 void mha_forward(const ::brotensor::Tensor& X,
                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                 const ::brotensor::Tensor* bq, const ::brotensor::Tensor* bk,
+                 const ::brotensor::Tensor* bv, const ::brotensor::Tensor* bo,
                  const float* d_mask,
                  int num_heads,
                  ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,
@@ -41,7 +43,9 @@ void mha_backward(const ::brotensor::Tensor& dO,
                   int num_heads,
                   ::brotensor::Tensor& dX,
                   ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,
-                  ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo);
+                  ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo,
+                  ::brotensor::Tensor* dbq, ::brotensor::Tensor* dbk,
+                  ::brotensor::Tensor* dbv, ::brotensor::Tensor* dbo);
 void flash_attention_qkvo_forward(const ::brotensor::Tensor& X,
                                   const ::brotensor::Tensor* Ctx,
                                   const ::brotensor::Tensor& Wq, const ::brotensor::Tensor* bq,
@@ -524,7 +528,9 @@ void self_attention_forward_train(const ::brotensor::Tensor& X,
                                   ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,
                                   ::brotensor::Tensor& Attnh, ::brotensor::Tensor& Yconcat,
                                   ::brotensor::Tensor& O) {
-    mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
+    mha_forward(X, Wq, Wk, Wv, Wo,
+                nullptr, nullptr, nullptr, nullptr,
+                d_mask, num_heads,
                 Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 
@@ -542,7 +548,8 @@ void self_attention_backward(const ::brotensor::Tensor& dO,
                              ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo) {
     mha_backward(dO, X, Qh, Kh, Vh, Attnh, Yconcat,
                  Wq, Wk, Wv, Wo, d_mask, num_heads,
-                 dX, dWq, dWk, dWv, dWo);
+                 dX, dWq, dWk, dWv, dWo,
+                 nullptr, nullptr, nullptr, nullptr);
 }
 
 // ─── FP32 cross-attention training ────────────────────────────────────────
@@ -782,7 +789,9 @@ void self_attention_forward(const ::brotensor::Tensor& X,
     Tensor Vh      = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
     Tensor Attnh   = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
     Tensor Yconcat = Tensor::empty_on(::brotensor::Device::CUDA, 0, 0, Dtype::FP32);
-    mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
+    mha_forward(X, Wq, Wk, Wv, Wo,
+                nullptr, nullptr, nullptr, nullptr,
+                d_mask, num_heads,
                 Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 

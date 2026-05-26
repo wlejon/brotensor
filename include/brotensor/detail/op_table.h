@@ -63,7 +63,10 @@
                                                        ::brotensor::Tensor& dX, ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,                                     \
                                                        ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo))                                                             \
     X(mha_forward,                             void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,                      \
-                                                       const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo, const float* d_mask, int num_heads,                \
+                                                       const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,                                                    \
+                                                       const ::brotensor::Tensor* bq, const ::brotensor::Tensor* bk,                                                    \
+                                                       const ::brotensor::Tensor* bv, const ::brotensor::Tensor* bo,                                                    \
+                                                       const float* d_mask, int num_heads,                                                                              \
                                                        ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh, ::brotensor::Tensor& Vh,                                       \
                                                        ::brotensor::Tensor& Attnh, ::brotensor::Tensor& Yconcat, ::brotensor::Tensor& O))                               \
     X(mha_backward,                            void,  (const ::brotensor::Tensor& dO, const ::brotensor::Tensor& X, const ::brotensor::Tensor& Qh,                      \
@@ -71,7 +74,9 @@
                                                        const ::brotensor::Tensor& Yconcat, const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,                \
                                                        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo, const float* d_mask, int num_heads,                \
                                                        ::brotensor::Tensor& dX, ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,                                     \
-                                                       ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo))                                                             \
+                                                       ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo,                                                              \
+                                                       ::brotensor::Tensor* dbq, ::brotensor::Tensor* dbk,                                                              \
+                                                       ::brotensor::Tensor* dbv, ::brotensor::Tensor* dbo))                                                             \
     /* ─── Pooling / losses / embeddings / concat ─── */                                                                                                                \
     X(masked_mean_pool_forward,                void,  (const ::brotensor::Tensor& X, const float* d_mask, ::brotensor::Tensor& y))                                      \
     X(masked_mean_pool_backward,               void,  (const ::brotensor::Tensor& dY, const float* d_mask, int K, ::brotensor::Tensor& dX))                             \

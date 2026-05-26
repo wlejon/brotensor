@@ -286,10 +286,13 @@ void attention_backward(const Tensor& dO, const Tensor& X,
 void mha_forward(const Tensor& X,
                  const Tensor& Wq, const Tensor& Wk,
                  const Tensor& Wv, const Tensor& Wo,
+                 const Tensor* bq, const Tensor* bk,
+                 const Tensor* bv, const Tensor* bo,
                  const float* d_mask, int num_heads,
                  Tensor& Qh, Tensor& Kh, Tensor& Vh,
                  Tensor& Attnh, Tensor& Yconcat, Tensor& O) {
-    const auto& v = detail::dispatch(X, Wq, Wk, Wv, Wo, Qh, Kh, Vh);
+    const auto& v = detail::dispatch_with_opts(
+        X, Wq, {&Wk, &Wv, &Wo, bq, bk, bv, bo, &Qh, &Kh, &Vh});
     if (!v.mha_forward) detail::throw_not_implemented("mha_forward", X.device);
     detail::adopt_output(Qh, X.device);
     detail::adopt_output(Kh, X.device);
@@ -297,7 +300,7 @@ void mha_forward(const Tensor& X,
     detail::adopt_output(Attnh, X.device);
     detail::adopt_output(Yconcat, X.device);
     detail::adopt_output(O, X.device);
-    v.mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
+    v.mha_forward(X, Wq, Wk, Wv, Wo, bq, bk, bv, bo, d_mask, num_heads,
                   Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 
@@ -310,17 +313,25 @@ void mha_backward(const Tensor& dO, const Tensor& X,
                   const float* d_mask, int num_heads,
                   Tensor& dX,
                   Tensor& dWq, Tensor& dWk,
-                  Tensor& dWv, Tensor& dWo) {
-    const auto& v = detail::dispatch(dO, X, Qh, Kh, Vh, Attnh, Yconcat);
+                  Tensor& dWv, Tensor& dWo,
+                  Tensor* dbq, Tensor* dbk,
+                  Tensor* dbv, Tensor* dbo) {
+    const auto& v = detail::dispatch_with_opts(
+        dO, X, {&Qh, &Kh, &Vh, &Attnh, &Yconcat, dbq, dbk, dbv, dbo});
     if (!v.mha_backward) detail::throw_not_implemented("mha_backward", dO.device);
     detail::adopt_output(dX, dO.device);
     detail::adopt_output(dWq, dO.device);
     detail::adopt_output(dWk, dO.device);
     detail::adopt_output(dWv, dO.device);
     detail::adopt_output(dWo, dO.device);
+    if (dbq) detail::adopt_output(*dbq, dO.device);
+    if (dbk) detail::adopt_output(*dbk, dO.device);
+    if (dbv) detail::adopt_output(*dbv, dO.device);
+    if (dbo) detail::adopt_output(*dbo, dO.device);
     v.mha_backward(dO, X, Qh, Kh, Vh, Attnh, Yconcat,
                    Wq, Wk, Wv, Wo, d_mask, num_heads,
-                   dX, dWq, dWk, dWv, dWo);
+                   dX, dWq, dWk, dWv, dWo,
+                   dbq, dbk, dbv, dbo);
 }
 
 // ─── Pooling / losses / embedding / concat ─────────────────────────────────

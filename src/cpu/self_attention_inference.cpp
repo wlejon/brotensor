@@ -28,6 +28,8 @@ namespace brotensor::detail::cpu {
 void mha_forward(const ::brotensor::Tensor& X,
                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+                 const ::brotensor::Tensor* bq, const ::brotensor::Tensor* bk,
+                 const ::brotensor::Tensor* bv, const ::brotensor::Tensor* bo,
                  const float* d_mask, int num_heads,
                  ::brotensor::Tensor& Qh, ::brotensor::Tensor& Kh,
                  ::brotensor::Tensor& Vh, ::brotensor::Tensor& Attnh,
@@ -42,7 +44,9 @@ void self_attention_forward(const ::brotensor::Tensor& X,
                             int num_heads,
                             ::brotensor::Tensor& O) {
     ::brotensor::Tensor Qh, Kh, Vh, Attnh, Yconcat;
-    mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
+    mha_forward(X, Wq, Wk, Wv, Wo,
+                nullptr, nullptr, nullptr, nullptr,
+                d_mask, num_heads,
                 Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 

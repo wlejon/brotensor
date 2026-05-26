@@ -592,8 +592,10 @@ void self_attention_forward_train(const Tensor& X,
                                       Tensor& Qh, Tensor& Kh, Tensor& Vh,
                                       Tensor& Attnh, Tensor& Yconcat,
                                       Tensor& O) {
-    mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
-                    Qh, Kh, Vh, Attnh, Yconcat, O);
+    mha_forward(X, Wq, Wk, Wv, Wo,
+                nullptr, nullptr, nullptr, nullptr,
+                d_mask, num_heads,
+                Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 
 void self_attention_backward(const Tensor& dO,
@@ -609,8 +611,9 @@ void self_attention_backward(const Tensor& dO,
                                  Tensor& dWq, Tensor& dWk,
                                  Tensor& dWv, Tensor& dWo) {
     mha_backward(dO, X, Qh, Kh, Vh, Attnh, Yconcat,
-                     Wq, Wk, Wv, Wo, d_mask, num_heads,
-                     dX, dWq, dWk, dWv, dWo);
+                 Wq, Wk, Wv, Wo, d_mask, num_heads,
+                 dX, dWq, dWk, dWv, dWo,
+                 nullptr, nullptr, nullptr, nullptr);
 }
 
 void cross_attention_forward_train(const Tensor& X,
@@ -876,8 +879,10 @@ void self_attention_forward(const Tensor& X,
     Tensor Vh      = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
     Tensor Attnh   = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
     Tensor Yconcat = Tensor::empty_on(Device::Metal, 0, 0, Dtype::FP32);
-    mha_forward(X, Wq, Wk, Wv, Wo, d_mask, num_heads,
-                    Qh, Kh, Vh, Attnh, Yconcat, O);
+    mha_forward(X, Wq, Wk, Wv, Wo,
+                nullptr, nullptr, nullptr, nullptr,
+                d_mask, num_heads,
+                Qh, Kh, Vh, Attnh, Yconcat, O);
 }
 
 } // namespace brotensor::detail::metal
