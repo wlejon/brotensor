@@ -164,12 +164,21 @@ void dequant_q6k_to_fp16(const Tensor& W_q6k, Tensor& W_fp16) {
     if (rows == 0 || blocks_per_row == 0) return;
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
-    dim3 grid(blocks_per_row, rows);
-    dim3 block(Q6K_BLOCK_ELEMS);
-    dequant_q6k_to_fp16_kernel<<<grid, block, 0, stream>>>(
-        static_cast<const uint8_t*>(W_q6k.data),
-        static_cast<__half*>(W_fp16.data),
-        rows, blocks_per_row);
+    // CUDA caps gridDim.y at 65535; chunk rows to stay within the limit.
+    constexpr int kMaxGridY = 65535;
+    const uint8_t* W_p = static_cast<const uint8_t*>(W_q6k.data);
+    __half*        Y_p = static_cast<__half*>(W_fp16.data);
+    const size_t row_bytes_w = static_cast<size_t>(blocks_per_row) * Q6K_BLOCK_BYTES;
+    const size_t row_elems_y = static_cast<size_t>(blocks_per_row) * Q6K_BLOCK_ELEMS;
+    for (int r0 = 0; r0 < rows; r0 += kMaxGridY) {
+        const int r_chunk = (rows - r0) < kMaxGridY ? (rows - r0) : kMaxGridY;
+        dim3 grid(blocks_per_row, r_chunk);
+        dim3 block(Q6K_BLOCK_ELEMS);
+        dequant_q6k_to_fp16_kernel<<<grid, block, 0, stream>>>(
+            W_p + static_cast<size_t>(r0) * row_bytes_w,
+            Y_p + static_cast<size_t>(r0) * row_elems_y,
+            r_chunk, blocks_per_row);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

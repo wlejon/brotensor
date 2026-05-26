@@ -293,6 +293,73 @@ int main() {
     run_gemm_case(/*OUT*/128, /*IN*/1024, /*B*/32, /*wmma*/true,  "G", 1e-1f);
 #endif
 
+    // ─── H: dequant with rows > 65535 (gridDim.y limit) ───────────────────
+    //
+    // Regression for the launcher launching with gridDim.y == rows: anything
+    // above 65535 (e.g. an 8B-vocab Q8_0 embedding table at 151936 rows)
+    // tripped cudaErrorInvalidConfiguration. The launcher now chunks rows.
+    // Sanity is bitwise equivalence against running the dequant on two
+    // smaller row-slices and concatenating.
+    {
+        constexpr int LARGE_ROWS = 70000;
+        constexpr int LARGE_IN   = 32;   // one Q8 block per row, cheap fixture
+        constexpr int LARGE_BPR  = LARGE_IN / Q8_BLOCK;
+        std::vector<Q8Block> WqL(
+            static_cast<size_t>(LARGE_ROWS) * LARGE_BPR);
+        std::uniform_real_distribution<float> dL(-0.5f, 0.5f);
+        std::vector<float> rowBuf(LARGE_IN);
+        for (int r = 0; r < LARGE_ROWS; ++r) {
+            for (auto& v : rowBuf) v = dL(rng);
+            quantize_q8_0_block(rowBuf.data(), WqL[r]);
+        }
+
+        Tensor WqL_g = Tensor::empty_on(dev, LARGE_ROWS, LARGE_IN, Dtype::Q8_0);
+        cudaMemcpy(WqL_g.data, WqL.data(),
+                   static_cast<size_t>(LARGE_ROWS) * LARGE_BPR * Q8_BYTES,
+                   cudaMemcpyHostToDevice);
+
+        Tensor Yfull;
+        brotensor::dequant_q8_0_to_fp16(WqL_g, Yfull);
+        brotensor::sync_all();
+        CHECK(Yfull.dtype == Dtype::FP16);
+        CHECK(Yfull.rows == LARGE_ROWS && Yfull.cols == LARGE_IN);
+
+        // Reference: dequant two halves separately.
+        const int H0 = LARGE_ROWS / 2;
+        const int H1 = LARGE_ROWS - H0;
+        Tensor Wq0 = Tensor::empty_on(dev, H0, LARGE_IN, Dtype::Q8_0);
+        Tensor Wq1 = Tensor::empty_on(dev, H1, LARGE_IN, Dtype::Q8_0);
+        cudaMemcpy(Wq0.data, WqL.data(),
+                   static_cast<size_t>(H0) * LARGE_BPR * Q8_BYTES,
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(Wq1.data, WqL.data() + static_cast<size_t>(H0) * LARGE_BPR,
+                   static_cast<size_t>(H1) * LARGE_BPR * Q8_BYTES,
+                   cudaMemcpyHostToDevice);
+        Tensor Y0, Y1;
+        brotensor::dequant_q8_0_to_fp16(Wq0, Y0);
+        brotensor::dequant_q8_0_to_fp16(Wq1, Y1);
+        brotensor::sync_all();
+
+        std::vector<uint16_t> got(
+            static_cast<size_t>(LARGE_ROWS) * LARGE_IN);
+        Yfull.copy_to_host_fp16(got.data());
+        std::vector<uint16_t> ref0(static_cast<size_t>(H0) * LARGE_IN);
+        std::vector<uint16_t> ref1(static_cast<size_t>(H1) * LARGE_IN);
+        Y0.copy_to_host_fp16(ref0.data());
+        Y1.copy_to_host_fp16(ref1.data());
+
+        int mismatched = 0;
+        for (size_t i = 0; i < ref0.size(); ++i) {
+            if (got[i] != ref0[i]) ++mismatched;
+        }
+        for (size_t i = 0; i < ref1.size(); ++i) {
+            if (got[static_cast<size_t>(H0) * LARGE_IN + i] != ref1[i]) ++mismatched;
+        }
+        std::printf("  H: dequant rows=%d mismatched=%d\n",
+                    LARGE_ROWS, mismatched);
+        CHECK(mismatched == 0);
+    }
+
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;
 }
