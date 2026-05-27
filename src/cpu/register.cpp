@@ -153,6 +153,13 @@ void softmax_xent_fused_batched(const ::brotensor::Tensor& logits_BL,
                                 ::brotensor::Tensor& probs_BL,
                                 ::brotensor::Tensor& dLogits_BL,
                                 ::brotensor::Tensor& loss_per_sample);
+void bce_with_logits_fused_batched(const ::brotensor::Tensor& logits_BL,
+                                   const ::brotensor::Tensor& target_BL,
+                                   const float* d_mask_BL,
+                                   float pos_weight,
+                                   ::brotensor::Tensor& probs_BL,
+                                   ::brotensor::Tensor& dLogits_BL,
+                                   ::brotensor::Tensor& loss_per_sample);
 
 // ── CHUNK 1 — elementwise.cpp / loss.cpp / embedding.cpp / concat.cpp /
 //    public_reductions.cpp / layernorm_inference.cpp ──
@@ -957,6 +964,7 @@ struct CpuStaticRegistrar {
         ops.tanh_backward_batched    = &detail::cpu::tanh_backward_batched;
         ops.mse_vec_per_sample       = &detail::cpu::mse_vec_per_sample;
         ops.softmax_xent_fused_batched = &detail::cpu::softmax_xent_fused_batched;
+        ops.bce_with_logits_fused_batched = &detail::cpu::bce_with_logits_fused_batched;
         ops.masked_mean_pool_forward  = &detail::cpu::masked_mean_pool_forward;
         ops.masked_mean_pool_backward = &detail::cpu::masked_mean_pool_backward;
         ops.build_slot_mask           = &detail::cpu::build_slot_mask;

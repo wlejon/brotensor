@@ -460,6 +460,24 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
                                 Tensor& dLogits_BL,
                                 Tensor& loss_per_sample);
 
+// Batched fused sigmoid + binary cross-entropy with per-sample loss reduction.
+// Numerically stable via softplus:
+//   loss(b,i) = w*y*softplus(-z) + (1-y)*softplus(z),  w = pos_weight,  s = sigmoid(z)
+//   dLogits   = s*(w*y + 1 - y) - w*y    (reduces to s - y when w == 1)
+//   probs_BL[b,i] = s on valid, 0 on masked.
+//   logits_BL, target_BL, probs_BL, dLogits_BL: (B, L).
+//   d_mask_BL: optional (B, L) mask (1 valid / 0 invalid); masked entries get
+//              probs=0, dLogits=0, and contribute 0 to loss.
+//   loss_per_sample: (B, 1), overwritten with sum-over-L per-element loss.
+// pos_weight == 1.0f gives standard unweighted BCE.
+void bce_with_logits_fused_batched(const Tensor& logits_BL,
+                                   const Tensor& target_BL,
+                                   const float* d_mask_BL,
+                                   float pos_weight,
+                                   Tensor& probs_BL,
+                                   Tensor& dLogits_BL,
+                                   Tensor& loss_per_sample);
+
 // ─── Conv2d / diffusion-vision ops ─────────────────────────────────────────
 //
 // NCHW tensors are carried as flat (rows, cols) buffers; the (N,C,H,W) dims

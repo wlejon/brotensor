@@ -649,6 +649,22 @@ void softmax_xent_fused_batched(const Tensor& logits_BL, const Tensor& target_BL
                                  probs_BL, dLogits_BL, loss_per_sample);
 }
 
+void bce_with_logits_fused_batched(const Tensor& logits_BL, const Tensor& target_BL,
+                                   const float* d_mask_BL,
+                                   float pos_weight,
+                                   Tensor& probs_BL, Tensor& dLogits_BL,
+                                   Tensor& loss_per_sample) {
+    const auto& v = detail::dispatch(logits_BL, target_BL, probs_BL, dLogits_BL, loss_per_sample);
+    if (!v.bce_with_logits_fused_batched)
+        detail::throw_not_implemented("bce_with_logits_fused_batched", logits_BL.device);
+    detail::adopt_output(probs_BL, logits_BL.device);
+    detail::adopt_output(dLogits_BL, logits_BL.device);
+    detail::adopt_output(loss_per_sample, logits_BL.device);
+    v.bce_with_logits_fused_batched(logits_BL, target_BL, d_mask_BL,
+                                    pos_weight,
+                                    probs_BL, dLogits_BL, loss_per_sample);
+}
+
 // ─── Conv2d ────────────────────────────────────────────────────────────────
 
 void conv2d_forward(const Tensor& X, const Tensor& Wt, const Tensor* bias,

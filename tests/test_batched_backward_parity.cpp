@@ -232,6 +232,70 @@ void run_softmax_xent_fused_batched(int B, int n_heads,
                     "softmax_xent_fused_batched.loss");
 }
 
+// ─── bce_with_logits_fused_batched ─────────────────────────────────────────
+//
+// logits/target/probs/dLogits all (B, L); optional (B, L) mask. pos_weight
+// scales the positive-class loss / gradient term.
+
+void run_bce_with_logits_fused_batched(int B, int L, float pos_weight,
+                                       bool with_mask, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor logits = Tensor::mat(B, L);
+    fill_random(logits, rng);
+
+    // Targets: mix of soft and hard binary in [0,1].
+    Tensor target = Tensor::mat(B, L);
+    for (int i = 0; i < B * L; ++i) {
+        const float r = rng.next_f01();
+        target.host_f32_mut()[i] = (r < 0.33f) ? 0.0f
+                                    : (r < 0.66f) ? 1.0f
+                                                  : r;
+    }
+
+    // Optional mask: keep at least one valid entry per row.
+    std::vector<float> mask_vec;
+    if (with_mask) {
+        mask_vec.assign(static_cast<size_t>(B) * L, 1.0f);
+        for (int b = 0; b < B; ++b) {
+            for (int i = 0; i < L; ++i) {
+                if (i > 0 && (i % 2) == 1)
+                    mask_vec[static_cast<size_t>(b) * L + i] = 0.0f;
+            }
+        }
+    }
+
+    // CPU path.
+    Tensor probs_cpu = Tensor::mat(B, L);
+    Tensor dLogits_cpu = Tensor::mat(B, L);
+    Tensor loss_cpu = Tensor::vec(B);
+    brotensor::bce_with_logits_fused_batched(
+        logits, target,
+        with_mask ? mask_vec.data() : nullptr,
+        pos_weight, probs_cpu, dLogits_cpu, loss_cpu);
+
+    // GPU path.
+    Tensor glogits = logits.to(gpu_device());
+    Tensor gtarget = target.to(gpu_device());
+    Tensor gprobs = Tensor::zeros_on(gpu_device(), B, L);
+    Tensor gdLogits = Tensor::zeros_on(gpu_device(), B, L);
+    Tensor gloss = Tensor::zeros_on(gpu_device(), B, 1);
+
+    Tensor d_mask_buf = upload_mask(with_mask ? &mask_vec : nullptr);
+    const float* d_mask =
+        with_mask ? static_cast<const float*>(d_mask_buf.data) : nullptr;
+
+    brotensor::bce_with_logits_fused_batched(
+        glogits, gtarget, d_mask, pos_weight,
+        gprobs, gdLogits, gloss);
+
+    compare_tensors(probs_cpu, download_to_host(gprobs),
+                    "bce_with_logits_fused_batched.probs");
+    compare_tensors(dLogits_cpu, download_to_host(gdLogits),
+                    "bce_with_logits_fused_batched.dLogits");
+    compare_tensors(loss_cpu, download_to_host(gloss),
+                    "bce_with_logits_fused_batched.loss");
+}
+
 } // namespace
 
 // ─── linear_backward_batched ───────────────────────────────────────────────
@@ -278,6 +342,20 @@ BT_PARITY_TEST(sxfb_3heads_B8_mask) {
 }
 BT_PARITY_TEST(sxfb_4heads_B1_mask) {
     run_softmax_xent_fused_batched(1, 4, {0, 8, 16, 24, 32}, true, 0x145ull);
+}
+
+// ─── bce_with_logits_fused_batched ─────────────────────────────────────────
+BT_PARITY_TEST(bce_B1_L1_nomask) {
+    run_bce_with_logits_fused_batched(1, 1, 1.0f, false, 0x150ull);
+}
+BT_PARITY_TEST(bce_B8_L1_nomask) {
+    run_bce_with_logits_fused_batched(8, 1, 1.0f, false, 0x151ull);
+}
+BT_PARITY_TEST(bce_B8_L4_mask) {
+    run_bce_with_logits_fused_batched(8, 4, 1.0f, true, 0x152ull);
+}
+BT_PARITY_TEST(bce_B4_L2_posweight) {
+    run_bce_with_logits_fused_batched(4, 2, 3.0f, false, 0x153ull);
 }
 
 int main() { return run_all("batched-backward cpu/gpu parity"); }

@@ -1301,6 +1301,68 @@ void softmax_xent_fused_batched(const ::brotensor::Tensor& logits_BL,
     }
 }
 
+void bce_with_logits_fused_batched(const ::brotensor::Tensor& logits_BL,
+                                   const ::brotensor::Tensor& target_BL,
+                                   const float* d_mask_BL,
+                                   float pos_weight,
+                                   ::brotensor::Tensor& probs_BL,
+                                   ::brotensor::Tensor& dLogits_BL,
+                                   ::brotensor::Tensor& loss_per_sample) {
+    const int B = logits_BL.rows;
+    const int L = logits_BL.cols;
+    if (probs_BL.rows != B || probs_BL.cols != L ||
+        probs_BL.dtype != ::brotensor::Dtype::FP32) {
+        probs_BL.resize(B, L, ::brotensor::Dtype::FP32);
+    }
+    if (dLogits_BL.rows != B || dLogits_BL.cols != L ||
+        dLogits_BL.dtype != ::brotensor::Dtype::FP32) {
+        dLogits_BL.resize(B, L, ::brotensor::Dtype::FP32);
+    }
+    if (loss_per_sample.rows != B || loss_per_sample.cols != 1 ||
+        loss_per_sample.dtype != ::brotensor::Dtype::FP32) {
+        loss_per_sample.resize(B, 1, ::brotensor::Dtype::FP32);
+    }
+    if (B == 0 || L == 0) return;
+
+    const float* lp = logits_BL.host_f32();
+    const float* tp = target_BL.host_f32();
+    float* pp = probs_BL.host_f32_mut();
+    float* dp = dLogits_BL.host_f32_mut();
+    float* lossp = loss_per_sample.host_f32_mut();
+    const float w = pos_weight;
+
+    for (int b = 0; b < B; ++b) {
+        float sample_loss = 0.0f;
+        const int row_off = b * L;
+        const float* lr = lp + row_off;
+        const float* tr = tp + row_off;
+        const float* mr = d_mask_BL ? (d_mask_BL + row_off) : nullptr;
+        float* pr = pp + row_off;
+        float* dr = dp + row_off;
+        for (int i = 0; i < L; ++i) {
+            if (mr && mr[i] < 0.5f) {
+                pr[i] = 0.0f;
+                dr[i] = 0.0f;
+                continue;
+            }
+            const float z = lr[i];
+            const float y = tr[i];
+            // softplus(x) = max(x, 0) + log1p(exp(-|x|))
+            const float az = std::fabs(z);
+            const float sp_neg = (z > 0.0f ? 0.0f : -z) + std::log1p(std::exp(-az));
+            const float sp_pos = (z > 0.0f ? z      : 0.0f) + std::log1p(std::exp(-az));
+            sample_loss += w * y * sp_neg + (1.0f - y) * sp_pos;
+            // s = sigmoid(z), numerically stable.
+            const float s = z >= 0.0f
+                ? 1.0f / (1.0f + std::exp(-z))
+                : std::exp(z) / (1.0f + std::exp(z));
+            pr[i] = s;
+            dr[i] = s * (w * y + 1.0f - y) - w * y;
+        }
+        lossp[b] = sample_loss;
+    }
+}
+
 // ─── Masked mean-pool ──────────────────────────────────────────────────────
 
 void build_slot_mask(const ::brotensor::Tensor& x, int offset, int K, int stride,

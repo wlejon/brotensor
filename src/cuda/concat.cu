@@ -232,6 +232,10 @@ void softmax_xent_fused_batched(const Tensor& logits_BL, const Tensor& target_BL
                                 const float* d_mask_BL, const int* d_head_offsets,
                                 int n_heads, Tensor& probs_BL, Tensor& dLogits_BL,
                                 Tensor& loss_per_sample);
+void bce_with_logits_fused_batched(const Tensor& logits_BL, const Tensor& target_BL,
+                                   const float* d_mask_BL, float pos_weight,
+                                   Tensor& probs_BL, Tensor& dLogits_BL,
+                                   Tensor& loss_per_sample);
 
 void embedding_lookup_forward(const Tensor& table, const int32_t* d_idx,
                               int B, Tensor& out);
@@ -295,6 +299,7 @@ void fill_cuda_vtable_specialised(::brotensor::detail::OpsVTable& v) {
     v.mse_vec_per_sample       = &mse_vec_per_sample;
     v.softmax_xent_fused       = &softmax_xent_fused;
     v.softmax_xent_fused_batched = &softmax_xent_fused_batched;
+    v.bce_with_logits_fused_batched = &bce_with_logits_fused_batched;
 
     // Embedding
     v.embedding_lookup_forward  = &embedding_lookup_forward;

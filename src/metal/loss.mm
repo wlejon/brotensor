@@ -228,6 +228,61 @@ kernel void k_softmax_xent_fused_batched(device const float* logits        [[buf
         atomic_fetch_add_explicit(&loss_per_sample[b], sdata[0], memory_order_relaxed);
     }
 }
+
+// One threadgroup per sample b. Per-element fused sigmoid + BCE with stable
+// softplus, optional mask, and pos_weight on the positive class.
+kernel void k_bce_with_logits_fused_batched(device const float* logits     [[buffer(0)]],
+                                            device const float* target     [[buffer(1)]],
+                                            device const float* mask       [[buffer(2)]],
+                                            constant uint& has_mask        [[buffer(3)]],
+                                            constant float& pos_weight     [[buffer(4)]],
+                                            device float*       probs      [[buffer(5)]],
+                                            device float*       dLogits    [[buffer(6)]],
+                                            device float*       loss_per_sample [[buffer(7)]],
+                                            constant uint& B               [[buffer(8)]],
+                                            constant uint& L               [[buffer(9)]],
+                                            uint gid [[threadgroup_position_in_grid]],
+                                            uint tid [[thread_position_in_threadgroup]],
+                                            uint tg_size [[threads_per_threadgroup]]) {
+    threadgroup float sdata[LOSS_BLOCK];
+    uint b = gid;
+    if (b >= B) return;
+    uint row_off = b * L;
+    device const float* logits_row  = logits  + row_off;
+    device const float* target_row  = target  + row_off;
+    device const float* mask_row    = mask    + row_off;
+    device float*       probs_row   = probs   + row_off;
+    device float*       dLogits_row = dLogits + row_off;
+
+    float w = pos_weight;
+    float local_loss = 0.0f;
+    for (uint i = tid; i < L; i += tg_size) {
+        if (has_mask && mask_row[i] == 0.0f) {
+            probs_row[i] = 0.0f;
+            dLogits_row[i] = 0.0f;
+            continue;
+        }
+        float z = logits_row[i];
+        float y = target_row[i];
+        float az = fabs(z);
+        float l1p = log(1.0f + exp(-az));
+        float sp_neg = (z > 0.0f ? 0.0f : -z) + l1p;
+        float sp_pos = (z > 0.0f ? z    : 0.0f) + l1p;
+        local_loss += w * y * sp_neg + (1.0f - y) * sp_pos;
+        float s = z >= 0.0f
+            ? 1.0f / (1.0f + exp(-z))
+            : exp(z) / (1.0f + exp(z));
+        probs_row[i] = s;
+        dLogits_row[i] = s * (w * y + 1.0f - y) - w * y;
+    }
+    sdata[tid] = local_loss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) loss_per_sample[b] = sdata[0];
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -242,6 +297,7 @@ DEF_PSO(pso_mse_bw, @"k_mse_backward")
 DEF_PSO(pso_xent, @"k_softmax_xent_fused")
 DEF_PSO(pso_mse_per_sample, @"k_mse_per_sample")
 DEF_PSO(pso_xent_batched, @"k_softmax_xent_fused_batched")
+DEF_PSO(pso_bce_batched,  @"k_bce_with_logits_fused_batched")
 #undef DEF_PSO
 
 } // namespace
@@ -458,6 +514,63 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
         [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:8];
         [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:9];
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, B, 1)
+            threadsPerThreadgroup:MTLSizeMake(LOSS_BLOCK, 1, 1)];
+        [enc endEncoding];
+        // `cmd` is the shared batched buffer — flush() commits + drains it.
+        metal_impl::flush();
+    }
+}
+
+void bce_with_logits_fused_batched(const Tensor& logits_BL,
+                                   const Tensor& target_BL,
+                                   const float* d_mask_BL,
+                                   float pos_weight,
+                                   Tensor& probs_BL,
+                                   Tensor& dLogits_BL,
+                                   Tensor& loss_per_sample) {
+    const int B = logits_BL.rows;
+    const int L = logits_BL.cols;
+    if (probs_BL.rows != B || probs_BL.cols != L)
+        probs_BL.resize(B, L);
+    if (dLogits_BL.rows != B || dLogits_BL.cols != L)
+        dLogits_BL.resize(B, L);
+    if (loss_per_sample.rows != B || loss_per_sample.cols != 1)
+        loss_per_sample.resize(B, 1);
+    if (B == 0 || L == 0) return;
+
+    id<MTLComputePipelineState> pso = pso_bce_batched();
+    id<MTLBuffer> bL = buffer_for(logits_BL);
+    NSUInteger oL = buffer_offset_for(logits_BL);
+    id<MTLBuffer> bT = buffer_for(target_BL);
+    NSUInteger oT = buffer_offset_for(target_BL);
+    id<MTLBuffer> bM = d_mask_BL ? pool_lookup(d_mask_BL) : nil;
+    NSUInteger oM = d_mask_BL ? pool_lookup_offset(d_mask_BL) : 0;
+    id<MTLBuffer> bM_arg = bM ? bM : bL;
+    NSUInteger oM_arg = bM ? oM : oL;
+    id<MTLBuffer> bP = buffer_for(probs_BL);
+    NSUInteger oP = buffer_offset_for(probs_BL);
+    id<MTLBuffer> bdL = buffer_for(dLogits_BL);
+    NSUInteger odL = buffer_offset_for(dLogits_BL);
+    id<MTLBuffer> bLoss = buffer_for(loss_per_sample);
+    NSUInteger oLoss = buffer_offset_for(loss_per_sample);
+    const uint32_t Bu = static_cast<uint32_t>(B);
+    const uint32_t Lu = static_cast<uint32_t>(L);
+    const uint32_t has_mask = d_mask_BL ? 1u : 0u;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bL offset:oL atIndex:0];
+        [enc setBuffer:bT offset:oT atIndex:1];
+        [enc setBuffer:bM_arg offset:oM_arg atIndex:2];
+        [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&pos_weight length:sizeof(float) atIndex:4];
+        [enc setBuffer:bP offset:oP atIndex:5];
+        [enc setBuffer:bdL offset:odL atIndex:6];
+        [enc setBuffer:bLoss offset:oLoss atIndex:7];
+        [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:8];
+        [enc setBytes:&Lu length:sizeof(uint32_t) atIndex:9];
+        [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(LOSS_BLOCK, 1, 1)];
         [enc endEncoding];
         // `cmd` is the shared batched buffer — flush() commits + drains it.

@@ -244,6 +244,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.softmax_forward                             = &dm::softmax_forward;
     ops.softmax_xent_fused                          = &dm::softmax_xent_fused;
     ops.softmax_xent_fused_batched                  = &dm::softmax_xent_fused_batched;
+    ops.bce_with_logits_fused_batched               = &dm::bce_with_logits_fused_batched;
     ops.split_rows                                  = &dm::split_rows;
     ops.stft                                        = &dm::stft;
     ops.stft_backward                               = &dm::stft_backward;

@@ -129,6 +129,9 @@
     X(softmax_xent_fused_batched,              void,  (const ::brotensor::Tensor& logits_BL, const ::brotensor::Tensor& target_BL, const float* d_mask_BL,              \
                                                        const int* d_head_offsets, int n_heads, ::brotensor::Tensor& probs_BL, ::brotensor::Tensor& dLogits_BL,          \
                                                        ::brotensor::Tensor& loss_per_sample))                                                                           \
+    X(bce_with_logits_fused_batched,           void,  (const ::brotensor::Tensor& logits_BL, const ::brotensor::Tensor& target_BL, const float* d_mask_BL,              \
+                                                       float pos_weight, ::brotensor::Tensor& probs_BL, ::brotensor::Tensor& dLogits_BL,                                \
+                                                       ::brotensor::Tensor& loss_per_sample))                                                                           \
     /* ─── Conv2d (forward + backwards) ─── */                                                                                                                          \
     X(conv2d_forward,                          void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wt, const ::brotensor::Tensor* bias,                    \
                                                        int N, int C_in, int H, int W, int C_out, int kH, int kW,                                                        \

@@ -248,6 +248,59 @@ __global__ void softmax_xent_fused_batched_kernel(
     if (tid == 0) atomicAdd(&loss_per_sample[b], sdata[0]);
 }
 
+__global__ void bce_with_logits_fused_batched_kernel(
+        const float* __restrict__ logits,
+        const float* __restrict__ target,
+        const float* __restrict__ mask,
+        float pos_weight,
+        float* __restrict__ probs,
+        float* __restrict__ dLogits,
+        float* __restrict__ loss_per_sample,
+        int B, int L) {
+    __shared__ float sdata[LOSS_BLOCK];
+
+    const int b = blockIdx.x;
+    if (b >= B) return;
+
+    const int row_off = b * L;
+    const float* logits_row  = logits  + row_off;
+    const float* target_row  = target  + row_off;
+    const float* mask_row    = mask ? (mask + row_off) : nullptr;
+    float*       probs_row   = probs   + row_off;
+    float*       dLogits_row = dLogits + row_off;
+
+    const int tid = threadIdx.x;
+    const float w = pos_weight;
+
+    float local_loss = 0.0f;
+    for (int i = tid; i < L; i += blockDim.x) {
+        if (mask_row && mask_row[i] == 0.0f) {
+            probs_row[i] = 0.0f;
+            dLogits_row[i] = 0.0f;
+            continue;
+        }
+        const float z = logits_row[i];
+        const float y = target_row[i];
+        const float az = fabsf(z);
+        const float l1p = log1pf(expf(-az));
+        const float sp_neg = (z > 0.0f ? 0.0f : -z) + l1p;
+        const float sp_pos = (z > 0.0f ? z    : 0.0f) + l1p;
+        local_loss += w * y * sp_neg + (1.0f - y) * sp_pos;
+        const float s = z >= 0.0f
+            ? 1.0f / (1.0f + expf(-z))
+            : expf(z) / (1.0f + expf(z));
+        probs_row[i] = s;
+        dLogits_row[i] = s * (w * y + 1.0f - y) - w * y;
+    }
+    sdata[tid] = local_loss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) loss_per_sample[b] = sdata[0];
+}
+
 } // namespace
 
 float mse_vec_forward(const Tensor& pred, const Tensor& target) {
@@ -358,6 +411,54 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
             dLogits_p + static_cast<size_t>(b0) * n_act,
             loss_p    + b0,
             b_chunk, n_heads, n_act);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void bce_with_logits_fused_batched(const Tensor& logits_BL,
+                                   const Tensor& target_BL,
+                                   const float* d_mask_BL,
+                                   float pos_weight,
+                                   Tensor& probs_BL,
+                                   Tensor& dLogits_BL,
+                                   Tensor& loss_per_sample) {
+    require_fp32(logits_BL, "bce_with_logits_fused_batched", "logits_BL");
+    require_fp32(target_BL, "bce_with_logits_fused_batched", "target_BL");
+    require_fp32_out(probs_BL,        "bce_with_logits_fused_batched", "probs_BL");
+    require_fp32_out(dLogits_BL,      "bce_with_logits_fused_batched", "dLogits_BL");
+    require_fp32_out(loss_per_sample, "bce_with_logits_fused_batched", "loss_per_sample");
+    const int B = logits_BL.rows;
+    const int L = logits_BL.cols;
+    if (probs_BL.rows != B || probs_BL.cols != L ||
+        probs_BL.dtype != ::brotensor::Dtype::FP32)
+        probs_BL.resize(B, L, ::brotensor::Dtype::FP32);
+    if (dLogits_BL.rows != B || dLogits_BL.cols != L ||
+        dLogits_BL.dtype != ::brotensor::Dtype::FP32)
+        dLogits_BL.resize(B, L, ::brotensor::Dtype::FP32);
+    if (loss_per_sample.rows != B || loss_per_sample.cols != 1 ||
+        loss_per_sample.dtype != ::brotensor::Dtype::FP32)
+        loss_per_sample.resize(B, 1, ::brotensor::Dtype::FP32);
+    if (B == 0 || L == 0) return;
+
+    // 1D grid on B; chunk on gridDim.x to stay under CUDA's 2**31-1 cap (safety
+    // mirror of softmax variant — BCE has no per-head structure).
+    constexpr int kMaxGridX = 65535;
+    const auto* logits_p  = static_cast<const float*>(logits_BL.data);
+    const auto* target_p  = static_cast<const float*>(target_BL.data);
+    auto*       probs_p   = static_cast<float*>(probs_BL.data);
+    auto*       dLogits_p = static_cast<float*>(dLogits_BL.data);
+    auto*       loss_p    = static_cast<float*>(loss_per_sample.data);
+    for (int b0 = 0; b0 < B; b0 += kMaxGridX) {
+        const int b_chunk = (B - b0) < kMaxGridX ? (B - b0) : kMaxGridX;
+        bce_with_logits_fused_batched_kernel<<<b_chunk, LOSS_BLOCK>>>(
+            logits_p  + static_cast<size_t>(b0) * L,
+            target_p  + static_cast<size_t>(b0) * L,
+            d_mask_BL ? (d_mask_BL + static_cast<size_t>(b0) * L) : nullptr,
+            pos_weight,
+            probs_p   + static_cast<size_t>(b0) * L,
+            dLogits_p + static_cast<size_t>(b0) * L,
+            loss_p    + b0,
+            b_chunk, L);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
