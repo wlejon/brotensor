@@ -113,6 +113,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/resblock.cpp
     src/cpu/modulate.cpp
     src/cpu/self_attention_bias.cpp
+    src/cpu/self_attention_decomposed_rel_pos.cpp
     src/cpu/fft.cpp
     src/cpu/stft.cpp
     src/cpu/conv1d.cpp

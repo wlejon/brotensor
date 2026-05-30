@@ -464,6 +464,13 @@
                                                        const ::brotensor::Tensor& Wo_int8, const ::brotensor::Tensor& so,                                                 \
                                                        const float* d_mask, const ::brotensor::Tensor* attn_bias,                                                         \
                                                        int num_heads, float scale, ::brotensor::Tensor& O))                                                               \
+    X(self_attention_decomposed_rel_pos_forward, void, (const ::brotensor::Tensor& X,                                                                                     \
+                                                       const ::brotensor::Tensor& Wq, const ::brotensor::Tensor* bq,                                                      \
+                                                       const ::brotensor::Tensor& Wk, const ::brotensor::Tensor* bk,                                                      \
+                                                       const ::brotensor::Tensor& Wv, const ::brotensor::Tensor* bv,                                                      \
+                                                       const ::brotensor::Tensor& Wo, const ::brotensor::Tensor* bo,                                                      \
+                                                       const ::brotensor::Tensor& rel_pos_h, const ::brotensor::Tensor& rel_pos_w,                                        \
+                                                       int num_heads, int grid_h, int grid_w, float scale, ::brotensor::Tensor& O))                                       \
     /* ─── Spectral / FFT core (brosoundml) ─── */                                                                                                                        \
     X(complex_mul,                             void,  (const ::brotensor::Tensor& a, const ::brotensor::Tensor& b, ::brotensor::Tensor& y))                               \
     X(complex_mul_backward,                    void,  (const ::brotensor::Tensor& a, const ::brotensor::Tensor& b, const ::brotensor::Tensor& dY,                         \

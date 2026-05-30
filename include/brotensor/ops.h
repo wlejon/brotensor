@@ -1258,6 +1258,32 @@ void self_attention_bias_forward(const Tensor& X,
                                  int num_heads, float scale,
                                  Tensor& O);
 
+// Multi-head self-attention with a DECOMPOSED 2D relative-position bias — the
+// SAM / ViTDet image-encoder attention (segment_anything add_decomposed_rel_pos).
+// A token index t maps to grid coords (t/grid_w, t%grid_w) over a grid_h*grid_w
+// patch grid (so X.rows == grid_h*grid_w). Per head, with r_q the projected,
+// UNSCALED query:
+//   bias[q,k] = r_q . rel_pos_h[(qh-kh)+grid_h-1] + r_q . rel_pos_w[(qw-kw)+grid_w-1]
+//   S[q,k]    = scale*(Q[q].K[k]) + bias[q,k]   (scale multiplies the dot only)
+//   O = concat_h( softmax_k S @ V_h ) @ Wo
+// Unlike self_attention_bias_forward the bias is data-dependent (reads Q) and is
+// never materialised as (num_heads*L, L) — it's factored into length-grid_h and
+// length-grid_w terms. Windowed blocks call this per window (grid == window);
+// global blocks call it once over the full grid.
+//   X, O: (L, D).  Wq/Wk/Wv/Wo: (D, D).  bq/bk/bv/bo: optional (D,1), null to skip.
+//   rel_pos_h: (2*grid_h-1, head_dim).  rel_pos_w: (2*grid_w-1, head_dim).
+//   num_heads divides D.  scale: typically 1/sqrt(head_dim).
+// Dispatched on X.dtype; O resized + dtype-set to match X.
+void self_attention_decomposed_rel_pos_forward(
+        const Tensor& X,
+        const Tensor& Wq, const Tensor* bq,
+        const Tensor& Wk, const Tensor* bk,
+        const Tensor& Wv, const Tensor* bv,
+        const Tensor& Wo, const Tensor* bo,
+        const Tensor& rel_pos_h, const Tensor& rel_pos_w,
+        int num_heads, int grid_h, int grid_w, float scale,
+        Tensor& O);
+
 // W8A16 variant of self_attention_bias_forward — quantised T5-bias attention.
 // Identical math and semantics, but each projection weight is an INT8 (D,D)
 // matrix paired with an FP32 (D,1) per-output-row dequant scale (the
