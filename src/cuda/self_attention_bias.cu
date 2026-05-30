@@ -497,6 +497,104 @@ void run_sardp(const ::brotensor::Tensor& X,
     }
 }
 
+// ─── Windowed decomposed-rel-pos attention (SAM windowed encoder block) ──────
+//
+// Gathers the (grid_h, grid_w) token grid into a contiguous per-window batch
+// (zero-padding the bottom/right up to a multiple of `window`), runs run_sardp
+// once per window over a view of that window's rows, then scatters the result
+// back — dropping the padded tokens. Pure layout work around the existing
+// single-grid kernel.
+//
+// Partition row r = w_idx*window*window + lh*window + lw maps to grid token
+// (h, w) = (nh*window+lh, nw*window+lw) with (nh, nw) = (w_idx/nw_w, w_idx%nw_w).
+
+template <typename T>
+__global__ void win_gather_kernel(const T* __restrict__ X, T* __restrict__ P,
+                                  int grid_h, int grid_w, int window,
+                                  int nw_w, int D, int nrows) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (col >= D || row >= nrows) return;
+    const int ww  = window * window;
+    const int loc = row % ww;
+    const int wi  = row / ww;
+    const int h   = (wi / nw_w) * window + loc / window;
+    const int w   = (wi % nw_w) * window + loc % window;
+    T* dst = P + static_cast<size_t>(row) * D + col;
+    if (h < grid_h && w < grid_w)
+        *dst = X[static_cast<size_t>(h * grid_w + w) * D + col];
+    else
+        sab_st(*dst, 0.0f);
+}
+
+template <typename T>
+__global__ void win_scatter_kernel(const T* __restrict__ P, T* __restrict__ O,
+                                   int grid_h, int grid_w, int window,
+                                   int nw_w, int D, int nrows) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (col >= D || row >= nrows) return;
+    const int ww  = window * window;
+    const int loc = row % ww;
+    const int wi  = row / ww;
+    const int h   = (wi / nw_w) * window + loc / window;
+    const int w   = (wi % nw_w) * window + loc % window;
+    if (h < grid_h && w < grid_w)
+        O[static_cast<size_t>(h * grid_w + w) * D + col] =
+            P[static_cast<size_t>(row) * D + col];
+}
+
+template <typename T>
+void run_windowed_sardp(const ::brotensor::Tensor& X,
+                        const ::brotensor::Tensor& Wq, const T* bq,
+                        const ::brotensor::Tensor& Wk, const T* bk,
+                        const ::brotensor::Tensor& Wv, const T* bv,
+                        const ::brotensor::Tensor& Wo, const T* bo,
+                        const ::brotensor::Tensor& rel_h,
+                        const ::brotensor::Tensor& rel_w,
+                        int num_heads, int grid_h, int grid_w, int window,
+                        float scale, ::brotensor::Tensor& O) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    const int D     = X.cols;
+    const auto dt   = X.dtype;
+    const int pad_h = (window - grid_h % window) % window;
+    const int pad_w = (window - grid_w % window) % window;
+    const int nw_h  = (grid_h + pad_h) / window;
+    const int nw_w  = (grid_w + pad_w) / window;
+    const int nW    = nw_h * nw_w;
+    const int ww    = window * window;
+    const int nrows = nW * ww;
+
+    Tensor Pin  = Tensor::empty_on(Device::CUDA, nrows, D, dt);
+    Tensor Pout = Tensor::empty_on(Device::CUDA, nrows, D, dt);
+
+    const dim3 block(16, 16);
+    const dim3 grid((D + block.x - 1) / block.x,
+                    (nrows + block.y - 1) / block.y);
+    win_gather_kernel<T><<<grid, block>>>(static_cast<const T*>(X.data),
+                                          static_cast<T*>(Pin.data),
+                                          grid_h, grid_w, window, nw_w, D, nrows);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+
+    // Per-window attention over contiguous row-slices of the partition buffers.
+    // run_sardp writes O.data without resizing, so non-owning views are safe.
+    const size_t row_stride = static_cast<size_t>(ww) * D * sizeof(T);
+    for (int w = 0; w < nW; ++w) {
+        char* in_p  = static_cast<char*>(Pin.data)  + static_cast<size_t>(w) * row_stride;
+        char* out_p = static_cast<char*>(Pout.data) + static_cast<size_t>(w) * row_stride;
+        Tensor Xv = Tensor::view(Device::CUDA, in_p,  ww, D, dt);
+        Tensor Ov = Tensor::view(Device::CUDA, out_p, ww, D, dt);
+        run_sardp<T>(Xv, Wq, bq, Wk, bk, Wv, bv, Wo, bo,
+                     rel_h, rel_w, num_heads, window, window, scale, Ov);
+    }
+
+    win_scatter_kernel<T><<<grid, block>>>(static_cast<const T*>(Pout.data),
+                                           static_cast<T*>(O.data),
+                                           grid_h, grid_w, window, nw_w, D, nrows);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 void self_attention_bias_forward(const ::brotensor::Tensor& X,
@@ -689,6 +787,86 @@ void self_attention_decomposed_rel_pos_forward(
                                  Wv, static_cast<const __nv_bfloat16*>(bp(bv)),
                                  Wo, static_cast<const __nv_bfloat16*>(bp(bo)),
                                  rel_pos_h, rel_pos_w, num_heads, grid_h, grid_w, scale, O);
+        break;
+    }
+}
+
+void self_attention_decomposed_rel_pos_windowed_forward(
+        const ::brotensor::Tensor& X,
+        const ::brotensor::Tensor& Wq, const ::brotensor::Tensor* bq,
+        const ::brotensor::Tensor& Wk, const ::brotensor::Tensor* bk,
+        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor* bv,
+        const ::brotensor::Tensor& Wo, const ::brotensor::Tensor* bo,
+        const ::brotensor::Tensor& rel_pos_h,
+        const ::brotensor::Tensor& rel_pos_w,
+        int num_heads, int grid_h, int grid_w, int window, float scale,
+        ::brotensor::Tensor& O) {
+    using ::brotensor::Dtype;
+    const char* fn = "self_attention_decomposed_rel_pos_windowed_forward";
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 && X.dtype != Dtype::BF16)
+        throw std::runtime_error(std::string(fn) + ": X must be FP32, FP16, or BF16");
+    if (Wq.dtype != X.dtype || Wk.dtype != X.dtype ||
+        Wv.dtype != X.dtype || Wo.dtype != X.dtype ||
+        rel_pos_h.dtype != X.dtype || rel_pos_w.dtype != X.dtype)
+        throw std::runtime_error(std::string(fn) +
+            ": Wq/Wk/Wv/Wo/rel_pos_h/rel_pos_w dtype must match X");
+    const int L = X.rows;
+    const int D = X.cols;
+    if (window <= 0)
+        throw std::runtime_error(std::string(fn) + ": window must be >= 1");
+    if (num_heads <= 0 || D % num_heads != 0)
+        throw std::runtime_error(std::string(fn) + ": num_heads must divide D");
+    if (grid_h <= 0 || grid_w <= 0 || grid_h * grid_w != L)
+        throw std::runtime_error(std::string(fn) + ": grid_h*grid_w must equal X.rows");
+    if (Wq.rows != D || Wq.cols != D || Wk.rows != D || Wk.cols != D ||
+        Wv.rows != D || Wv.cols != D || Wo.rows != D || Wo.cols != D)
+        throw std::runtime_error(std::string(fn) + ": Wq/Wk/Wv/Wo must be (D, D)");
+    const int dh = D / num_heads;
+    if (rel_pos_h.rows != 2 * window - 1 || rel_pos_h.cols != dh)
+        throw std::runtime_error(std::string(fn) + ": rel_pos_h must be (2*window-1, head_dim)");
+    if (rel_pos_w.rows != 2 * window - 1 || rel_pos_w.cols != dh)
+        throw std::runtime_error(std::string(fn) + ": rel_pos_w must be (2*window-1, head_dim)");
+    auto check_bias = [&](const ::brotensor::Tensor* b, const char* name) {
+        if (b && b->data) {
+            if (b->dtype != X.dtype)
+                throw std::runtime_error(std::string(fn) + ": " + name + " dtype must match X");
+            if (b->size() != D)
+                throw std::runtime_error(std::string(fn) + ": " + name + " must have D entries");
+        }
+    };
+    check_bias(bq, "bq"); check_bias(bk, "bk");
+    check_bias(bv, "bv"); check_bias(bo, "bo");
+    if (O.rows != L || O.cols != D || O.dtype != X.dtype)
+        O.resize(L, D, X.dtype);
+    if (L == 0 || D == 0) return;
+
+    auto bp = [](const ::brotensor::Tensor* b) {
+        return (b && b->data) ? b->data : nullptr;
+    };
+    switch (X.dtype) {
+    case Dtype::FP32:
+        run_windowed_sardp<float>(X, Wq, static_cast<const float*>(bp(bq)),
+                                  Wk, static_cast<const float*>(bp(bk)),
+                                  Wv, static_cast<const float*>(bp(bv)),
+                                  Wo, static_cast<const float*>(bp(bo)),
+                                  rel_pos_h, rel_pos_w, num_heads,
+                                  grid_h, grid_w, window, scale, O);
+        break;
+    case Dtype::FP16:
+        run_windowed_sardp<__half>(X, Wq, static_cast<const __half*>(bp(bq)),
+                                   Wk, static_cast<const __half*>(bp(bk)),
+                                   Wv, static_cast<const __half*>(bp(bv)),
+                                   Wo, static_cast<const __half*>(bp(bo)),
+                                   rel_pos_h, rel_pos_w, num_heads,
+                                   grid_h, grid_w, window, scale, O);
+        break;
+    default:  // BF16
+        run_windowed_sardp<__nv_bfloat16>(X, Wq, static_cast<const __nv_bfloat16*>(bp(bq)),
+                                          Wk, static_cast<const __nv_bfloat16*>(bp(bk)),
+                                          Wv, static_cast<const __nv_bfloat16*>(bp(bv)),
+                                          Wo, static_cast<const __nv_bfloat16*>(bp(bo)),
+                                          rel_pos_h, rel_pos_w, num_heads,
+                                          grid_h, grid_w, window, scale, O);
         break;
     }
 }

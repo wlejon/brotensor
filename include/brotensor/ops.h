@@ -1284,6 +1284,32 @@ void self_attention_decomposed_rel_pos_forward(
         int num_heads, int grid_h, int grid_w, float scale,
         Tensor& O);
 
+// Windowed multi-head self-attention with a decomposed 2D relative-position
+// bias — the SAM/ViTDet *windowed* encoder block (segment_anything runs most
+// blocks over non-overlapping local windows, a few globally). Splits the
+// (grid_h, grid_w) token grid into window x window tiles and runs the
+// decomposed-rel-pos attention above INDEPENDENTLY within each tile, sharing
+// one set of weights and rel-pos tables. The bottom/right of the grid is
+// zero-padded up to a multiple of `window` (SAM's window_partition pad) and the
+// padding is cropped back off the output, so grid_h/grid_w need not be
+// multiples of `window`. For a grid that is exactly one window this is the
+// plain decomposed-rel-pos op.
+//   X, O: (grid_h*grid_w, D), token-major (row = h*grid_w + w).
+//   Wq/Wk/Wv/Wo: (D,D).  bq/bk/bv/bo: optional (D,1), null to skip.
+//   rel_pos_h, rel_pos_w: (2*window-1, head_dim) — sized for the window, not
+//                         the full grid.
+//   num_heads divides D.  scale: typically 1/sqrt(head_dim).
+// Dispatched on X.dtype; O resized + dtype-set to match X.
+void self_attention_decomposed_rel_pos_windowed_forward(
+        const Tensor& X,
+        const Tensor& Wq, const Tensor* bq,
+        const Tensor& Wk, const Tensor* bk,
+        const Tensor& Wv, const Tensor* bv,
+        const Tensor& Wo, const Tensor* bo,
+        const Tensor& rel_pos_h, const Tensor& rel_pos_w,
+        int num_heads, int grid_h, int grid_w, int window, float scale,
+        Tensor& O);
+
 // W8A16 variant of self_attention_bias_forward — quantised T5-bias attention.
 // Identical math and semantics, but each projection weight is an INT8 (D,D)
 // matrix paired with an FP32 (D,1) per-output-row dequant scale (the

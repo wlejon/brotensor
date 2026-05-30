@@ -158,6 +158,101 @@ Tensor manual_ref(const Tensor& X, const Tensor& Wq, const float* bq,
     return O;
 }
 
+// Independent reference for the windowed op: zero-pad (gh,gw) up to a multiple
+// of `window`, run the full from-scratch attention (manual_ref) within each
+// window, crop the padding back off. Calls manual_ref (a different code path
+// from the brotensor windowed op, which loops the single-grid kernel).
+Tensor manual_windowed_ref(const Tensor& X, const Tensor& Wq, const float* bq,
+                           const Tensor& Wk, const float* bk, const Tensor& Wv,
+                           const float* bv, const Tensor& Wo, const float* bo,
+                           const Tensor& rh, const Tensor& rw, int H,
+                           int gh, int gw, int window, float scale) {
+    const int D = X.cols;
+    const int pad_h = (window - gh % window) % window;
+    const int pad_w = (window - gw % window) % window;
+    const int nw_h = (gh + pad_h) / window;
+    const int nw_w = (gw + pad_w) / window;
+    Tensor O = Tensor::mat(gh * gw, D);
+    const float* Xp = X.host_f32();
+    float* Op = O.host_f32_mut();
+
+    for (int nh = 0; nh < nw_h; ++nh)
+        for (int nw = 0; nw < nw_w; ++nw) {
+            Tensor win = Tensor::mat(window * window, D);  // zeroed (pad = 0)
+            float* wp = win.host_f32_mut();
+            for (int lh = 0; lh < window; ++lh) {
+                const int h = nh * window + lh;
+                for (int lw = 0; lw < window; ++lw) {
+                    const int w = nw * window + lw;
+                    if (h < gh && w < gw) {
+                        const float* s = Xp + static_cast<size_t>(h * gw + w) * D;
+                        float* d = wp + static_cast<size_t>(lh * window + lw) * D;
+                        for (int c = 0; c < D; ++c) d[c] = s[c];
+                    }
+                }
+            }
+            Tensor wo = manual_ref(win, Wq, bq, Wk, bk, Wv, bv, Wo, bo,
+                                   rh, rw, H, window, window, scale);
+            const float* wop = wo.host_f32();
+            for (int lh = 0; lh < window; ++lh) {
+                const int h = nh * window + lh;
+                if (h >= gh) continue;
+                for (int lw = 0; lw < window; ++lw) {
+                    const int w = nw * window + lw;
+                    if (w >= gw) continue;
+                    const float* s = wop + static_cast<size_t>(lh * window + lw) * D;
+                    float* d = Op + static_cast<size_t>(h * gw + w) * D;
+                    for (int c = 0; c < D; ++c) d[c] = s[c];
+                }
+            }
+        }
+    return O;
+}
+
+void run_windowed(int gh, int gw, int window, int D, int H, uint64_t seed) {
+    Rng rng(seed);
+    const int L = gh * gw, dh = D / H;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+
+    Tensor X  = rand_mat(L, D, rng, 0.5f);
+    Tensor Wq = rand_mat(D, D, rng, 0.3f), Wk = rand_mat(D, D, rng, 0.3f);
+    Tensor Wv = rand_mat(D, D, rng, 0.3f), Wo = rand_mat(D, D, rng, 0.3f);
+    Tensor rh = rand_mat(2 * window - 1, dh, rng, 0.4f);
+    Tensor rw = rand_mat(2 * window - 1, dh, rng, 0.4f);
+    Tensor bq = rand_mat(D, 1, rng, 0.2f), bk = rand_mat(D, 1, rng, 0.2f);
+    Tensor bv = rand_mat(D, 1, rng, 0.2f), bo = rand_mat(D, 1, rng, 0.2f);
+
+    char tag[96];
+
+    // Windowed op == independent pad/partition/per-window reference.
+    {
+        Tensor O_ref = manual_windowed_ref(X, Wq, bq.host_f32(), Wk, bk.host_f32(),
+                                           Wv, bv.host_f32(), Wo, bo.host_f32(),
+                                           rh, rw, H, gh, gw, window, scale);
+        Tensor O_op;
+        brotensor::self_attention_decomposed_rel_pos_windowed_forward(
+            X, Wq, &bq, Wk, &bk, Wv, &bv, Wo, &bo, rh, rw,
+            H, gh, gw, window, scale, O_op);
+        std::snprintf(tag, sizeof tag, "win   g%dx%d w%d D%d H%d", gh, gw, window, D, H);
+        compare(O_ref, O_op, tag, 1e-4f);
+    }
+
+    // When the window covers the whole grid exactly (no padding), the windowed
+    // op must reduce to the plain single-grid decomposed op.
+    if (window == gh && window == gw) {
+        Tensor O_single;
+        brotensor::self_attention_decomposed_rel_pos_forward(
+            X, Wq, &bq, Wk, &bk, Wv, &bv, Wo, &bo, rh, rw,
+            H, gh, gw, scale, O_single);
+        Tensor O_op;
+        brotensor::self_attention_decomposed_rel_pos_windowed_forward(
+            X, Wq, &bq, Wk, &bk, Wv, &bv, Wo, &bo, rh, rw,
+            H, gh, gw, window, scale, O_op);
+        std::snprintf(tag, sizeof tag, "win==single g%dx%d", gh, gw);
+        compare(O_single, O_op, tag, 1e-5f);
+    }
+}
+
 void run(int gh, int gw, int D, int H, uint64_t seed) {
     Rng rng(seed);
     const int L = gh * gw, dh = D / H;
@@ -209,6 +304,14 @@ int main() {
     run(4, 4, 32, 4, 0x1002ull);  // window-sized
     run(8, 8, 64, 8, 0x1003ull);  // global-block-sized
     run(5, 7, 24, 3, 0x1004ull);  // odd dims, 3 heads
+
+    // Windowed variant: window == grid (no pad), exact multiples, and grids
+    // that need bottom/right padding (SAM's 64-grid / 14-window case in
+    // miniature).
+    run_windowed(4, 4, 4, 16, 2, 0x2001ull);   // single window, no pad
+    run_windowed(8, 8, 4, 32, 4, 0x2002ull);   // 2x2 windows, no pad
+    run_windowed(10, 10, 4, 32, 4, 0x2003ull); // 3x3 windows, pad to 12
+    run_windowed(7, 5, 3, 24, 3, 0x2004ull);   // odd dims, pad both axes
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

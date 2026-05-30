@@ -697,6 +697,15 @@ void self_attention_decomposed_rel_pos_forward(
         const ::brotensor::Tensor& rel_pos_h, const ::brotensor::Tensor& rel_pos_w,
         int num_heads, int grid_h, int grid_w, float scale,
         ::brotensor::Tensor& O);
+void self_attention_decomposed_rel_pos_windowed_forward(
+        const ::brotensor::Tensor& X,
+        const ::brotensor::Tensor& Wq, const ::brotensor::Tensor* bq,
+        const ::brotensor::Tensor& Wk, const ::brotensor::Tensor* bk,
+        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor* bv,
+        const ::brotensor::Tensor& Wo, const ::brotensor::Tensor* bo,
+        const ::brotensor::Tensor& rel_pos_h, const ::brotensor::Tensor& rel_pos_w,
+        int num_heads, int grid_h, int grid_w, int window, float scale,
+        ::brotensor::Tensor& O);
 
 // ── Spectral / FFT core (brosoundml) — fft.cpp ──
 void complex_mul(const ::brotensor::Tensor& a, const ::brotensor::Tensor& b,
@@ -1113,6 +1122,8 @@ struct CpuStaticRegistrar {
         ops.self_attention_bias_forward  = &detail::cpu::self_attention_bias_forward;
         ops.self_attention_decomposed_rel_pos_forward =
             &detail::cpu::self_attention_decomposed_rel_pos_forward;
+        ops.self_attention_decomposed_rel_pos_windowed_forward =
+            &detail::cpu::self_attention_decomposed_rel_pos_windowed_forward;
 
         // ── Spectral / FFT core (brosoundml) ──
         ops.complex_mul                  = &detail::cpu::complex_mul;

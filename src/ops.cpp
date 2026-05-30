@@ -1276,6 +1276,26 @@ void self_attention_decomposed_rel_pos_forward(
         num_heads, grid_h, grid_w, scale, O);
 }
 
+void self_attention_decomposed_rel_pos_windowed_forward(
+        const Tensor& X,
+        const Tensor& Wq, const Tensor* bq,
+        const Tensor& Wk, const Tensor* bk,
+        const Tensor& Wv, const Tensor* bv,
+        const Tensor& Wo, const Tensor* bo,
+        const Tensor& rel_pos_h, const Tensor& rel_pos_w,
+        int num_heads, int grid_h, int grid_w, int window, float scale,
+        Tensor& O) {
+    const auto& v = detail::dispatch_with_opts(
+        X, Wq, {bq, &Wk, bk, &Wv, bv, &Wo, bo, &rel_pos_h, &rel_pos_w, &O});
+    if (!v.self_attention_decomposed_rel_pos_windowed_forward)
+        detail::throw_not_implemented(
+            "self_attention_decomposed_rel_pos_windowed_forward", X.device);
+    detail::adopt_output(O, X.device);
+    v.self_attention_decomposed_rel_pos_windowed_forward(
+        X, Wq, bq, Wk, bk, Wv, bv, Wo, bo, rel_pos_h, rel_pos_w,
+        num_heads, grid_h, grid_w, window, scale, O);
+}
+
 void self_attention_bias_int8w_fp16(const Tensor& X,
                                     const Tensor& Wq_int8, const Tensor& sq,
                                     const Tensor& Wk_int8, const Tensor& sk,

@@ -204,4 +204,86 @@ void self_attention_decomposed_rel_pos_forward(
     }
 }
 
+// Windowed variant: split the (grid_h, grid_w) token grid into window x window
+// tiles (zero-padding the bottom/right up to a multiple of window, SAM's
+// window_partition), run the decomposed-rel-pos attention above independently
+// per tile with the SAME weights / rel-pos, then crop the padding back off.
+// Reuses the single-grid kernel above — the only new work is the gather/scatter
+// across windows.
+void self_attention_decomposed_rel_pos_windowed_forward(
+        const ::brotensor::Tensor& X,
+        const ::brotensor::Tensor& Wq, const ::brotensor::Tensor* bq,
+        const ::brotensor::Tensor& Wk, const ::brotensor::Tensor* bk,
+        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor* bv,
+        const ::brotensor::Tensor& Wo, const ::brotensor::Tensor* bo,
+        const ::brotensor::Tensor& rel_pos_h,
+        const ::brotensor::Tensor& rel_pos_w,
+        int num_heads, int grid_h, int grid_w, int window, float scale,
+        ::brotensor::Tensor& O) {
+    using ::brotensor::Tensor;
+    const char* fn = "self_attention_decomposed_rel_pos_windowed_forward";
+    check_fp32(X, "X");
+    const int L = X.rows;
+    const int D = X.cols;
+    if (window <= 0)
+        throw std::runtime_error(std::string(fn) + ": window must be >= 1");
+    if (grid_h <= 0 || grid_w <= 0 || grid_h * grid_w != L)
+        throw std::runtime_error(std::string(fn) + ": grid_h*grid_w must equal X.rows");
+
+    if (O.rows != L || O.cols != D || O.dtype != Dtype::FP32)
+        O.resize(L, D, Dtype::FP32);
+    if (L == 0 || D == 0) return;
+
+    const int pad_h = (window - grid_h % window) % window;
+    const int pad_w = (window - grid_w % window) % window;
+    const int nw_h  = (grid_h + pad_h) / window;
+    const int nw_w  = (grid_w + pad_w) / window;
+    const int ww    = window * window;
+
+    const float* Xp = X.host_f32();
+    float*       Op = O.host_f32_mut();
+
+    Tensor win_in = Tensor::mat(ww, D);  // host FP32, zeroed
+    Tensor win_out;
+    for (int nh = 0; nh < nw_h; ++nh) {
+        for (int nw = 0; nw < nw_w; ++nw) {
+            // Gather this window's tokens (token-major), zeroing padded cells.
+            float* wi = win_in.host_f32_mut();
+            for (int lh = 0; lh < window; ++lh) {
+                const int h = nh * window + lh;
+                for (int lw = 0; lw < window; ++lw) {
+                    const int w = nw * window + lw;
+                    float* dst = wi + static_cast<size_t>(lh * window + lw) * D;
+                    if (h < grid_h && w < grid_w) {
+                        const float* src =
+                            Xp + static_cast<size_t>(h * grid_w + w) * D;
+                        for (int c = 0; c < D; ++c) dst[c] = src[c];
+                    } else {
+                        for (int c = 0; c < D; ++c) dst[c] = 0.0f;
+                    }
+                }
+            }
+
+            self_attention_decomposed_rel_pos_forward(
+                win_in, Wq, bq, Wk, bk, Wv, bv, Wo, bo, rel_pos_h, rel_pos_w,
+                num_heads, window, window, scale, win_out);
+
+            // Scatter back, dropping the padded tokens.
+            const float* wo = win_out.host_f32();
+            for (int lh = 0; lh < window; ++lh) {
+                const int h = nh * window + lh;
+                if (h >= grid_h) continue;
+                for (int lw = 0; lw < window; ++lw) {
+                    const int w = nw * window + lw;
+                    if (w >= grid_w) continue;
+                    const float* src =
+                        wo + static_cast<size_t>(lh * window + lw) * D;
+                    float* dst = Op + static_cast<size_t>(h * grid_w + w) * D;
+                    for (int c = 0; c < D; ++c) dst[c] = src[c];
+                }
+            }
+        }
+    }
+}
+
 } // namespace brotensor::detail::cpu
