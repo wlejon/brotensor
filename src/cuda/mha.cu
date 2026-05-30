@@ -791,6 +791,16 @@ void self_attention_bias_int8w_fp16(const ::brotensor::Tensor& X,
                                     const ::brotensor::Tensor* attn_bias,
                                     int num_heads, float scale,
                                     ::brotensor::Tensor& O);
+// Defined in self_attention_bias.cu.
+void self_attention_decomposed_rel_pos_forward(
+        const ::brotensor::Tensor& X,
+        const ::brotensor::Tensor& Wq, const ::brotensor::Tensor* bq,
+        const ::brotensor::Tensor& Wk, const ::brotensor::Tensor* bk,
+        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor* bv,
+        const ::brotensor::Tensor& Wo, const ::brotensor::Tensor* bo,
+        const ::brotensor::Tensor& rel_pos_h, const ::brotensor::Tensor& rel_pos_w,
+        int num_heads, int grid_h, int grid_w, float scale,
+        ::brotensor::Tensor& O);
 
 void fill_cuda_vtable_attention(::brotensor::detail::OpsVTable& v) {
     v.mha_forward                            = &mha_forward;
@@ -804,6 +814,8 @@ void fill_cuda_vtable_attention(::brotensor::detail::OpsVTable& v) {
     v.self_attention_forward                 = &self_attention_forward;
     v.self_attention_bias_forward            = &self_attention_bias_forward;
     v.self_attention_bias_int8w_fp16         = &self_attention_bias_int8w_fp16;
+    v.self_attention_decomposed_rel_pos_forward =
+        &self_attention_decomposed_rel_pos_forward;
     v.self_attention_forward_train           = &self_attention_forward_train;
     v.self_attention_backward                = &self_attention_backward;
     v.attention_token_moments                = &attention_token_moments;

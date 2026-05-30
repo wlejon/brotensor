@@ -349,6 +349,154 @@ void run_sab_int8(const ::brotensor::Tensor& X,
     }
 }
 
+// ── Decomposed 2D relative-position attention (SAM / ViTDet) ───────────────
+//
+// Same pipeline as run_sab, but (a) the qkv/output projections carry optional
+// biases and (b) the pre-softmax bias is the decomposed rel-pos term computed
+// from Q inline in the scores kernel — never materialised as a separate buffer.
+// A token i maps to grid coords (i/grid_w, i%grid_w); the bias for key j is
+//   q . rel_pos_h[(qh-kh)+grid_h-1] + q . rel_pos_w[(qw-kw)+grid_w-1].
+// Like run_sab the (H*L, L) scores/softmax scratch is materialised, so the
+// global 64x64 SAM blocks (L=4096) are memory-heavy — inherent to stock SAM,
+// and identical to the sibling self_attention_bias path. A tiled/flash variant
+// that avoids the (H*L, L) scratch is a later optimisation.
+
+// Out[(hh*L+i), j] = (bias ? bias[hh*dh+j] : 0) + sum_k In[i,k]*W[(hh*dh+j), k].
+template <typename T>
+__global__ void sardp_proj_kernel(const T* __restrict__ In,
+                                  const T* __restrict__ W,
+                                  const T* __restrict__ bias,  // (D,1) or null
+                                  float* __restrict__ Out,
+                                  int L, int Din, int dh) {
+    const int j  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int hh = blockIdx.z;
+    if (i >= L || j >= dh) return;
+    const int o = hh * dh + j;
+    const T* xr = In + static_cast<size_t>(i) * Din;
+    const T* wr = W  + static_cast<size_t>(o) * Din;
+    float acc = bias ? sab_ld(bias[o]) : 0.0f;
+    for (int k = 0; k < Din; ++k) acc += sab_ld(xr[k]) * sab_ld(wr[k]);
+    Out[(static_cast<size_t>(hh) * L + i) * dh + j] = acc;
+}
+
+// S[(hh*L+i), j] = scale*(Q_h[i].K_h[j]) + q.rel_pos_h[..] + q.rel_pos_w[..].
+// rel_h: (2*gh-1, dh) typed; rel_w: (2*gw-1, dh) typed (model dtype T).
+template <typename T>
+__global__ void sardp_scores_kernel(const float* __restrict__ Qh,
+                                    const float* __restrict__ Kh,
+                                    const T* __restrict__ rel_h,
+                                    const T* __restrict__ rel_w,
+                                    float* __restrict__ S,
+                                    int L, int dh, float scale,
+                                    int gh, int gw) {
+    const int j  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int hh = blockIdx.z;
+    if (i >= L || j >= L) return;
+    const size_t qrow = (static_cast<size_t>(hh) * L + i) * dh;
+    const size_t krow = (static_cast<size_t>(hh) * L + j) * dh;
+    const int qh = i / gw, qw = i % gw;
+    const int kh = j / gw, kw = j % gw;
+    const T* rhr = rel_h + static_cast<size_t>(qh - kh + gh - 1) * dh;
+    const T* rwr = rel_w + static_cast<size_t>(qw - kw + gw - 1) * dh;
+    float s = 0.0f, bh = 0.0f, bw = 0.0f;
+    for (int k = 0; k < dh; ++k) {
+        const float q = Qh[qrow + k];
+        s  += q * Kh[krow + k];
+        bh += q * sab_ld(rhr[k]);
+        bw += q * sab_ld(rwr[k]);
+    }
+    S[(static_cast<size_t>(hh) * L + i) * L + j] = s * scale + bh + bw;
+}
+
+// O[i, c] = (bias ? bias[c] : 0) + sum_k Yconcat[i,k] * Wo[c,k].
+template <typename T>
+__global__ void sardp_output_kernel(const float* __restrict__ Y,
+                                    const T* __restrict__ Wo,
+                                    const T* __restrict__ bias,  // (D,1) or null
+                                    T* __restrict__ O, int L, int D) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i >= L || c >= D) return;
+    const float* yr = Y + static_cast<size_t>(i) * D;
+    const T* wr = Wo + static_cast<size_t>(c) * D;
+    float acc = bias ? sab_ld(bias[c]) : 0.0f;
+    for (int k = 0; k < D; ++k) acc += yr[k] * sab_ld(wr[k]);
+    sab_st(O[static_cast<size_t>(i) * D + c], acc);
+}
+
+template <typename T>
+void run_sardp(const ::brotensor::Tensor& X,
+               const ::brotensor::Tensor& Wq, const T* bq,
+               const ::brotensor::Tensor& Wk, const T* bk,
+               const ::brotensor::Tensor& Wv, const T* bv,
+               const ::brotensor::Tensor& Wo, const T* bo,
+               const ::brotensor::Tensor& rel_h, const ::brotensor::Tensor& rel_w,
+               int num_heads, int gh, int gw, float scale,
+               ::brotensor::Tensor& O) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    using ::brotensor::Dtype;
+    const int L  = X.rows;
+    const int D  = X.cols;
+    const int H  = num_heads;
+    const int dh = D / H;
+
+    Tensor Qh = Tensor::empty_on(Device::CUDA, H * L, dh, Dtype::FP32);
+    Tensor Kh = Tensor::empty_on(Device::CUDA, H * L, dh, Dtype::FP32);
+    Tensor Vh = Tensor::empty_on(Device::CUDA, H * L, dh, Dtype::FP32);
+    Tensor S  = Tensor::empty_on(Device::CUDA, H * L, L,  Dtype::FP32);
+    Tensor A  = Tensor::empty_on(Device::CUDA, H * L, L,  Dtype::FP32);
+    Tensor Yc = Tensor::empty_on(Device::CUDA, L, D, Dtype::FP32);
+
+    const T* X_p  = static_cast<const T*>(X.data);
+    const T* Wq_p = static_cast<const T*>(Wq.data);
+    const T* Wk_p = static_cast<const T*>(Wk.data);
+    const T* Wv_p = static_cast<const T*>(Wv.data);
+    const T* Wo_p = static_cast<const T*>(Wo.data);
+    const T* rh_p = static_cast<const T*>(rel_h.data);
+    const T* rw_p = static_cast<const T*>(rel_w.data);
+    float* Qh_p = static_cast<float*>(Qh.data);
+    float* Kh_p = static_cast<float*>(Kh.data);
+    float* Vh_p = static_cast<float*>(Vh.data);
+    float* S_p  = static_cast<float*>(S.data);
+    float* A_p  = static_cast<float*>(A.data);
+    float* Yc_p = static_cast<float*>(Yc.data);
+
+    const dim3 block(16, 16);
+    {
+        dim3 grid((dh + block.x - 1) / block.x,
+                  (L  + block.y - 1) / block.y, H);
+        sardp_proj_kernel<T><<<grid, block>>>(X_p, Wq_p, bq, Qh_p, L, D, dh);
+        sardp_proj_kernel<T><<<grid, block>>>(X_p, Wk_p, bk, Kh_p, L, D, dh);
+        sardp_proj_kernel<T><<<grid, block>>>(X_p, Wv_p, bv, Vh_p, L, D, dh);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        dim3 grid((L + block.x - 1) / block.x,
+                  (L + block.y - 1) / block.y, H);
+        sardp_scores_kernel<T><<<grid, block>>>(Qh_p, Kh_p, rh_p, rw_p, S_p,
+                                                L, dh, scale, gh, gw);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+    sab_softmax_kernel<<<H * L, SAB_SM_BLOCK>>>(S_p, A_p, /*mask=*/nullptr, L);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    {
+        dim3 grid((dh + block.x - 1) / block.x,
+                  (L  + block.y - 1) / block.y, H);
+        sab_apply_v_kernel<<<grid, block>>>(A_p, Vh_p, Yc_p, L, dh, D);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        dim3 grid((D + block.x - 1) / block.x,
+                  (L + block.y - 1) / block.y);
+        sardp_output_kernel<T><<<grid, block>>>(Yc_p, Wo_p, bo,
+                                                static_cast<T*>(O.data), L, D);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 } // namespace
 
 void self_attention_bias_forward(const ::brotensor::Tensor& X,
@@ -468,6 +616,81 @@ void self_attention_bias_int8w_fp16(const ::brotensor::Tensor& X,
 
     run_sab_int8<__half>(X, Wq_int8, sq, Wk_int8, sk, Wv_int8, sv, Wo_int8, so,
                          d_mask, bias_p, num_heads, scale, O);
+}
+
+void self_attention_decomposed_rel_pos_forward(
+        const ::brotensor::Tensor& X,
+        const ::brotensor::Tensor& Wq, const ::brotensor::Tensor* bq,
+        const ::brotensor::Tensor& Wk, const ::brotensor::Tensor* bk,
+        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor* bv,
+        const ::brotensor::Tensor& Wo, const ::brotensor::Tensor* bo,
+        const ::brotensor::Tensor& rel_pos_h,
+        const ::brotensor::Tensor& rel_pos_w,
+        int num_heads, int grid_h, int grid_w, float scale,
+        ::brotensor::Tensor& O) {
+    using ::brotensor::Dtype;
+    const char* fn = "self_attention_decomposed_rel_pos_forward";
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 && X.dtype != Dtype::BF16)
+        throw std::runtime_error(std::string(fn) + ": X must be FP32, FP16, or BF16");
+    if (Wq.dtype != X.dtype || Wk.dtype != X.dtype ||
+        Wv.dtype != X.dtype || Wo.dtype != X.dtype ||
+        rel_pos_h.dtype != X.dtype || rel_pos_w.dtype != X.dtype)
+        throw std::runtime_error(std::string(fn) +
+            ": Wq/Wk/Wv/Wo/rel_pos_h/rel_pos_w dtype must match X");
+    const int L = X.rows;
+    const int D = X.cols;
+    if (num_heads <= 0 || D % num_heads != 0)
+        throw std::runtime_error(std::string(fn) + ": num_heads must divide D");
+    if (grid_h <= 0 || grid_w <= 0 || grid_h * grid_w != L)
+        throw std::runtime_error(std::string(fn) + ": grid_h*grid_w must equal X.rows");
+    if (Wq.rows != D || Wq.cols != D || Wk.rows != D || Wk.cols != D ||
+        Wv.rows != D || Wv.cols != D || Wo.rows != D || Wo.cols != D)
+        throw std::runtime_error(std::string(fn) + ": Wq/Wk/Wv/Wo must be (D, D)");
+    const int dh = D / num_heads;
+    if (rel_pos_h.rows != 2 * grid_h - 1 || rel_pos_h.cols != dh)
+        throw std::runtime_error(std::string(fn) + ": rel_pos_h must be (2*grid_h-1, head_dim)");
+    if (rel_pos_w.rows != 2 * grid_w - 1 || rel_pos_w.cols != dh)
+        throw std::runtime_error(std::string(fn) + ": rel_pos_w must be (2*grid_w-1, head_dim)");
+    auto check_bias = [&](const ::brotensor::Tensor* b, const char* name) {
+        if (b && b->data) {
+            if (b->dtype != X.dtype)
+                throw std::runtime_error(std::string(fn) + ": " + name + " dtype must match X");
+            if (b->size() != D)
+                throw std::runtime_error(std::string(fn) + ": " + name + " must have D entries");
+        }
+    };
+    check_bias(bq, "bq"); check_bias(bk, "bk");
+    check_bias(bv, "bv"); check_bias(bo, "bo");
+    if (O.rows != L || O.cols != D || O.dtype != X.dtype)
+        O.resize(L, D, X.dtype);
+    if (L == 0 || D == 0) return;
+
+    auto bp = [](const ::brotensor::Tensor* b) {
+        return (b && b->data) ? b->data : nullptr;
+    };
+    switch (X.dtype) {
+    case Dtype::FP32:
+        run_sardp<float>(X, Wq, static_cast<const float*>(bp(bq)),
+                         Wk, static_cast<const float*>(bp(bk)),
+                         Wv, static_cast<const float*>(bp(bv)),
+                         Wo, static_cast<const float*>(bp(bo)),
+                         rel_pos_h, rel_pos_w, num_heads, grid_h, grid_w, scale, O);
+        break;
+    case Dtype::FP16:
+        run_sardp<__half>(X, Wq, static_cast<const __half*>(bp(bq)),
+                          Wk, static_cast<const __half*>(bp(bk)),
+                          Wv, static_cast<const __half*>(bp(bv)),
+                          Wo, static_cast<const __half*>(bp(bo)),
+                          rel_pos_h, rel_pos_w, num_heads, grid_h, grid_w, scale, O);
+        break;
+    default:  // BF16
+        run_sardp<__nv_bfloat16>(X, Wq, static_cast<const __nv_bfloat16*>(bp(bq)),
+                                 Wk, static_cast<const __nv_bfloat16*>(bp(bk)),
+                                 Wv, static_cast<const __nv_bfloat16*>(bp(bv)),
+                                 Wo, static_cast<const __nv_bfloat16*>(bp(bo)),
+                                 rel_pos_h, rel_pos_w, num_heads, grid_h, grid_w, scale, O);
+        break;
+    }
 }
 
 } // namespace detail::cuda
