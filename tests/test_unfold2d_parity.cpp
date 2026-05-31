@@ -54,7 +54,7 @@ std::vector<float> ref_unfold(const std::vector<float>& X,
                 float v = 0.0f;
                 if (sy >= 0 && sx >= 0)
                     v = X[(((size_t)n * C + c) * H + sy) * W + sx];
-                Y[(((size_t)n * C + (c * kK + k)) * H_out + oy) * W_out + ox] = v;
+                Y[((((size_t)n * C + c) * kK + k) * H_out + oy) * W_out + ox] = v;
               }
           }
     return Y;
