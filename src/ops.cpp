@@ -926,6 +926,35 @@ void slice2d_backward(const Tensor& dY, int N, int C, int H, int W,
     v.slice2d_backward(dY, N, C, H, W, h0, w0, H_out, W_out, dX);
 }
 
+void unfold2d_forward(const Tensor& X, int N, int C, int H, int W,
+                      int kH, int kW, int stride_h, int stride_w,
+                      int pad_top, int pad_bottom, int pad_left, int pad_right,
+                      int mode, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.unfold2d_forward) detail::throw_not_implemented("unfold2d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.unfold2d_forward(X, N, C, H, W, kH, kW, stride_h, stride_w,
+                       pad_top, pad_bottom, pad_left, pad_right, mode, Y);
+}
+
+void l2_normalize_nchw_forward(const Tensor& X, int N, int C, int H, int W,
+                               float eps, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.l2_normalize_nchw_forward)
+        detail::throw_not_implemented("l2_normalize_nchw_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.l2_normalize_nchw_forward(X, N, C, H, W, eps, Y);
+}
+
+void convex_upsample_forward(const Tensor& X, const Tensor& Mask,
+                             int N, int C, int H, int W, int scale, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Mask, Y);
+    if (!v.convex_upsample_forward)
+        detail::throw_not_implemented("convex_upsample_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.convex_upsample_forward(X, Mask, N, C, H, W, scale, Y);
+}
+
 void top_k_rows(const Tensor& X, int k, Tensor& Vals, Tensor& Idx) {
     const auto& v = detail::dispatch(X, Vals, Idx);
     if (!v.top_k_rows) detail::throw_not_implemented("top_k_rows", X.device);
