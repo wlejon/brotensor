@@ -73,9 +73,10 @@ inline void check_args(const char* op,
     }
 }
 
-// Catmull-Rom (Keys) cubic with a = -0.5 — the standard PyTorch /
-// OpenCV / PIL bicubic kernel. |t| in [0,1] uses the first branch, |t| in
-// [1,2] the second, otherwise 0.
+// Catmull-Rom (Keys) cubic with a = -0.5. This matches PIL/Pillow's BICUBIC
+// kernel; note PyTorch's interpolate(mode="bicubic") and OpenCV use a = -0.75,
+// so this is NOT bit-identical to a torch bicubic resample. |t| in [0,1] uses
+// the first branch, |t| in [1,2] the second, otherwise 0.
 inline float cubic_keys(float t) {
     const float a = -0.5f;
     const float at = t < 0.0f ? -t : t;

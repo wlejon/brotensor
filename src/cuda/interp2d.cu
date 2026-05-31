@@ -112,7 +112,8 @@ __device__ inline int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Catmull-Rom (Keys) cubic with a = -0.5.
+// Catmull-Rom (Keys) cubic with a = -0.5 (matches PIL BICUBIC; NOT torch's
+// interpolate(bicubic), which uses a = -0.75). Mirrors src/cpu/interp2d.cpp.
 __device__ inline float cubic_keys(float t) {
     const float a = -0.5f;
     const float at = t < 0.0f ? -t : t;
