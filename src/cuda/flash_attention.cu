@@ -2264,20 +2264,22 @@ void flash_attention_varlen_forward(const Tensor& Q,
 // d_mask is an optional length-Lk device key mask (1 valid / 0 invalid).
 template <typename T>
 __global__ void flash_attention_windowed_kernel(
-        const T* __restrict__ Q,             // (Lq, D)
-        const T* __restrict__ K,             // (Lk, D)
-        const T* __restrict__ V,             // (Lk, D)
+        const T* __restrict__ Q,             // (Lq, Dq)   Dq = num_heads*head_dim
+        const T* __restrict__ K,             // (Lk, Dkv)  Dkv = n_kv*head_dim
+        const T* __restrict__ V,             // (Lk, Dkv)
         const float* __restrict__ mask,      // (Lk) or null
-        T* __restrict__ Out,                 // (Lq, D)
-        int Lk, int D, int head_dim, int window, int q_offset) {
+        T* __restrict__ Out,                 // (Lq, Dq)
+        int Lk, int Dq, int Dkv, int head_dim, int window, int q_offset,
+        int group) {
     extern __shared__ float s_smem[];
     float* scores = s_smem;
     float* red    = s_smem + FA_KTILE;
 
-    const int q        = blockIdx.x;          // query row in [0, Lq)
-    const int h        = blockIdx.y;
-    const int tid      = threadIdx.x;
-    const int head_off = h * head_dim;
+    const int q          = blockIdx.x;        // query row in [0, Lq)
+    const int h          = blockIdx.y;        // query head
+    const int tid        = threadIdx.x;
+    const int head_off   = h * head_dim;          // Q/Out (Dq-wide)
+    const int head_off_kv = (h / group) * head_dim; // K/V (Dkv-wide), GQA group
     const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
 
     const int aq = q + q_offset;              // absolute causal position
@@ -2306,8 +2308,8 @@ __global__ void flash_attention_windowed_kernel(
             } else {
                 float dot = 0.0f;
                 for (int d = 0; d < head_dim; ++d) {
-                    dot += static_cast<float>(Q[q * D + head_off + d]) *
-                           static_cast<float>(K[kg * D + head_off + d]);
+                    dot += static_cast<float>(Q[q * Dq + head_off + d]) *
+                           static_cast<float>(K[kg * Dkv + head_off_kv + d]);
                 }
                 s = dot * inv_sqrt;
             }
@@ -2364,7 +2366,7 @@ __global__ void flash_attention_windowed_kernel(
             float acc = alpha * partial[slot];
             for (int t = 0; t < klen; ++t) {
                 acc += scores[t] *
-                       static_cast<float>(V[(k0 + t) * D + head_off + d]);
+                       static_cast<float>(V[(k0 + t) * Dkv + head_off_kv + d]);
             }
             partial[slot] = acc;
         }
@@ -2378,7 +2380,7 @@ __global__ void flash_attention_windowed_kernel(
     int slot = 0;
     for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
         if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q * D + head_off + d] = T(partial[slot] * inv);
+        Out[q * Dq + head_off + d] = T(partial[slot] * inv);
     }
 }
 
@@ -2396,23 +2398,30 @@ void flash_attention_windowed_forward(const Tensor& Q,
         throw std::runtime_error("flash_attention_windowed_forward: Q, K, V dtype must match");
     if (num_heads <= 0)
         throw std::runtime_error("flash_attention_windowed_forward: num_heads must be positive");
-    const int Lq = Q.rows;
-    const int Lk = K.rows;
-    const int D  = Q.cols;
-    if (D % num_heads != 0)
+    const int Lq  = Q.rows;
+    const int Lk  = K.rows;
+    const int Dq  = Q.cols;        // num_heads * head_dim
+    const int Dkv = K.cols;        // n_kv * head_dim (GQA when < Dq)
+    if (Dq % num_heads != 0)
         throw std::runtime_error("flash_attention_windowed_forward: num_heads must divide D");
-    const int head_dim = D / num_heads;
-    if (K.cols != D || V.cols != D || V.rows != Lk)
+    const int head_dim = Dq / num_heads;
+    if (V.cols != Dkv || V.rows != Lk)
         throw std::runtime_error("flash_attention_windowed_forward: shape mismatch");
+    if (Dkv == 0 || Dkv % head_dim != 0)
+        throw std::runtime_error("flash_attention_windowed_forward: K/V width must be a head_dim multiple");
+    const int n_kv = Dkv / head_dim;
+    if (num_heads % n_kv != 0)
+        throw std::runtime_error("flash_attention_windowed_forward: num_heads must be a multiple of n_kv");
     if (Lk < Lq)
         throw std::runtime_error("flash_attention_windowed_forward: requires Lk >= Lq");
     if ((head_dim + FA_BLOCK - 1) / FA_BLOCK > 8)
         throw std::runtime_error("flash_attention_windowed_forward: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
-    if (O.rows != Lq || O.cols != D || O.dtype != dt)
-        O.resize(Lq, D, dt);
-    if (Lq == 0 || Lk == 0 || D == 0) return;
+    if (O.rows != Lq || O.cols != Dq || O.dtype != dt)
+        O.resize(Lq, Dq, dt);
+    if (Lq == 0 || Lk == 0 || Dq == 0) return;
 
     const int q_offset = Lk - Lq;
+    const int group    = num_heads / n_kv;
     const size_t shmem = (static_cast<size_t>(FA_KTILE) + FA_BLOCK) * sizeof(float);
     dim3 grid(Lq, num_heads, 1);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
@@ -2422,21 +2431,21 @@ void flash_attention_windowed_forward(const Tensor& Q,
             reinterpret_cast<const __nv_bfloat16*>(K.data),
             reinterpret_cast<const __nv_bfloat16*>(V.data),
             d_mask, reinterpret_cast<__nv_bfloat16*>(O.data),
-            Lk, D, head_dim, window, q_offset);
+            Lk, Dq, Dkv, head_dim, window, q_offset, group);
     } else if (dt == Dtype::FP32) {
         flash_attention_windowed_kernel<float><<<grid, FA_BLOCK, shmem, stream>>>(
             reinterpret_cast<const float*>(Q.data),
             reinterpret_cast<const float*>(K.data),
             reinterpret_cast<const float*>(V.data),
             d_mask, reinterpret_cast<float*>(O.data),
-            Lk, D, head_dim, window, q_offset);
+            Lk, Dq, Dkv, head_dim, window, q_offset, group);
     } else {
         flash_attention_windowed_kernel<__half><<<grid, FA_BLOCK, shmem, stream>>>(
             reinterpret_cast<const __half*>(Q.data),
             reinterpret_cast<const __half*>(K.data),
             reinterpret_cast<const __half*>(V.data),
             d_mask, reinterpret_cast<__half*>(O.data),
-            Lk, D, head_dim, window, q_offset);
+            Lk, Dq, Dkv, head_dim, window, q_offset, group);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }

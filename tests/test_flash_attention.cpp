@@ -1253,6 +1253,83 @@ static void run_windowed_decode(const char* label, int Lq, int Lk, int D, int nh
     check_f32(cuda_got, O_ref, (std::string(label) + " cuda").c_str());
 }
 
+// GQA decode reference: Q has nh heads (Dq), K/V have n_kv heads (Dkv); query
+// head h reads K/V head h/(nh/n_kv). Queries at the last Lq causal positions.
+static void gqa_decode_ref(const std::vector<float>& Q, const std::vector<float>& K,
+                           const std::vector<float>& V, int Lq, int Lk, int Dq,
+                           int Dkv, int nh, int n_kv, int window,
+                           std::vector<float>& O) {
+    const int hd = Dq / nh;
+    const int group = nh / n_kv;
+    const int q_off = Lk - Lq;
+    const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
+    O.assign(static_cast<size_t>(Lq) * Dq, 0.0f);
+    std::vector<float> sc(Lk);
+    for (int q = 0; q < Lq; ++q) {
+        const int aq = q + q_off;
+        const int lo = (window > 0) ? std::max(0, aq - window + 1) : 0;
+        for (int h = 0; h < nh; ++h) {
+            const int off    = h * hd;
+            const int off_kv = (h / group) * hd;
+            float mx = -1e30f;
+            for (int k = lo; k <= aq; ++k) {
+                double dot = 0.0;
+                for (int d = 0; d < hd; ++d)
+                    dot += static_cast<double>(Q[q*Dq + off + d]) * K[k*Dkv + off_kv + d];
+                sc[k] = static_cast<float>(dot) * inv_sqrt;
+                if (sc[k] > mx) mx = sc[k];
+            }
+            float sum = 0.0f;
+            for (int k = lo; k <= aq; ++k) { sc[k] = std::exp(sc[k] - mx); sum += sc[k]; }
+            const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+            for (int d = 0; d < hd; ++d) {
+                double a = 0.0;
+                for (int k = lo; k <= aq; ++k)
+                    a += static_cast<double>(sc[k]) * inv * V[k*Dkv + off_kv + d];
+                O[q*Dq + off + d] = static_cast<float>(a);
+            }
+        }
+    }
+}
+
+// Grouped-query windowed attention: K/V carry n_kv < nh heads (inferred from
+// K.cols), as in the Qwen3-TTS AR loop's cache. CPU + CUDA vs reference.
+static void run_gqa_decode(const char* label, int Lq, int Lk, int Dq, int nh,
+                           int n_kv, int window) {
+    const int hd = Dq / nh, Dkv = n_kv * hd;
+    std::printf("  %s gqa Lq=%d Lk=%d Dq=%d nh=%d n_kv=%d window=%d\n",
+                label, Lq, Lk, Dq, nh, n_kv, window);
+    std::mt19937 rng(0x6CA9 + n_kv + window);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    std::vector<float> Q(static_cast<size_t>(Lq)*Dq), K(static_cast<size_t>(Lk)*Dkv),
+                       V(static_cast<size_t>(Lk)*Dkv);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+    std::vector<float> O_ref;
+    gqa_decode_ref(Q, K, V, Lq, Lk, Dq, Dkv, nh, n_kv, window, O_ref);
+
+    Tensor Qc = Tensor::from_host_on(Device::CPU, Q.data(), Lq, Dq);
+    Tensor Kc = Tensor::from_host_on(Device::CPU, K.data(), Lk, Dkv);
+    Tensor Vc = Tensor::from_host_on(Device::CPU, V.data(), Lk, Dkv);
+    Tensor Oc;
+    brotensor::flash_attention_windowed_forward(Qc, Kc, Vc, nullptr, nh, window, Oc);
+    CHECK(Oc.rows == Lq && Oc.cols == Dq);
+    std::vector<float> cpu_got(static_cast<size_t>(Lq) * Dq);
+    Oc.copy_to_host(cpu_got.data());
+    check_f32(cpu_got, O_ref, (std::string(label) + " cpu").c_str());
+
+    Tensor Qg = Tensor::from_host_on(Device::CUDA, Q.data(), Lq, Dq);
+    Tensor Kg = Tensor::from_host_on(Device::CUDA, K.data(), Lk, Dkv);
+    Tensor Vg = Tensor::from_host_on(Device::CUDA, V.data(), Lk, Dkv);
+    Tensor Og;
+    brotensor::flash_attention_windowed_forward(Qg, Kg, Vg, nullptr, nh, window, Og);
+    std::vector<float> cuda_got(static_cast<size_t>(Lq) * Dq);
+    Og.copy_to_host(cuda_got.data());
+    brotensor::sync_all();
+    check_f32(cuda_got, O_ref, (std::string(label) + " cuda").c_str());
+}
+
 // window <= 0 (and window >= L) must reproduce plain causal — cross-check the
 // windowed op against flash_attention_forward(causal=true) on CPU FP32.
 static void run_windowed_eq_causal(const char* label, int L, int D, int nh) {
@@ -1356,6 +1433,12 @@ int main() {
     run_windowed_decode("dec windowed",    1, 90, 32, 4, 72);   // cache beyond window
     run_windowed_decode("dec block",       4, 40, 64, 8, 0);    // multi-token block
     run_windowed_decode("dec block win",   3, 80, 64, 8, 16);   // block + window
+
+    // ── Grouped-query windowed attention (K/V have n_kv < nh heads) ─────────
+    run_gqa_decode("gqa decode",   1, 50, 256, 8, 2, 0);    // 1 query, group 4
+    run_gqa_decode("gqa prefill", 16, 16, 256, 8, 2, 0);    // Lq == Lk, GQA
+    run_gqa_decode("gqa win",      1, 90, 256, 8, 4, 72);   // group 2, windowed
+    run_gqa_decode("gqa block",    3, 40, 128, 4, 1, 0);    // n_kv==nh (MHA degenerate)
 
     // ── Backward tests ────────────────────────────────────────────────────
     run_bwd_self_vs_mha("bwd-self small", 6, 32, 4);

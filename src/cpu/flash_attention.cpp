@@ -116,24 +116,28 @@ void linear_proj_backward(const float* In, const float* W, const float* dOut,
 // scale = 1/sqrt(hd); key mask + causal applied during the row softmax.
 // window > 0 adds a sliding causal band: query q attends only keys
 // k in [q-window+1, q] (window <= 0 leaves the band unbounded).
+// Q/O are H heads wide (Dq = H*hd); K/V may be grouped (Dkv = (H/group)*hd,
+// GQA) — query head h reads K/V head h/group. group == 1 / Dkv < 0 is plain MHA.
 void attention_core(const float* Q, const float* K, const float* V,
                     const float* mask, int Lq, int Lk, int D, int H,
                     bool causal, float* O, float* P, int window = 0,
-                    int q_offset = 0) {
-    const int hd = D / H;
+                    int q_offset = 0, int Dkv = -1, int group = 1) {
+    const int hd  = D / H;
+    if (Dkv < 0) Dkv = D;
     const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
     std::vector<float> scores(static_cast<std::size_t>(Lk));
     for (int q = 0; q < Lq; ++q) {
         const int aq = q + q_offset;   // absolute causal position of this query
         for (int h = 0; h < H; ++h) {
-            const int off = h * hd;
+            const int off    = h * hd;            // Q/O head offset (Dq-wide)
+            const int off_kv = (h / group) * hd;  // K/V head offset (Dkv-wide)
             float m = -1e30f;
             for (int k = 0; k < Lk; ++k) {
                 if (mask && mask[k] <= 0.5f)        { scores[k] = -1e30f; continue; }
                 if (causal && k > aq)               { scores[k] = -1e30f; continue; }
                 if (window > 0 && k <= aq - window) { scores[k] = -1e30f; continue; }
                 const float* qr = Q + static_cast<std::size_t>(q) * D + off;
-                const float* kr = K + static_cast<std::size_t>(k) * D + off;
+                const float* kr = K + static_cast<std::size_t>(k) * Dkv + off_kv;
                 float dot = 0.0f;
                 for (int d = 0; d < hd; ++d) dot += qr[d] * kr[d];
                 const float s = dot * inv_sqrt;
@@ -153,7 +157,7 @@ void attention_core(const float* Q, const float* K, const float* V,
                 float acc = 0.0f;
                 for (int k = 0; k < Lk; ++k) {
                     acc += scores[k] * inv *
-                           V[static_cast<std::size_t>(k) * D + off + d];
+                           V[static_cast<std::size_t>(k) * Dkv + off_kv + d];
                 }
                 orow[d] = acc;
             }
@@ -319,11 +323,18 @@ void flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
                                       ::brotensor::Tensor& O) {
     const int Lq = Q.rows;
     const int Lk = K.rows;
-    const int D  = Q.cols;
-    if (K.cols != D || V.cols != D || V.rows != Lk)
+    const int D    = Q.cols;       // Dq = num_heads * head_dim
+    const int Dkv  = K.cols;       // n_kv * head_dim (GQA when < D)
+    if (V.cols != Dkv || V.rows != Lk)
         throw std::runtime_error("flash_attention_windowed_forward: shape mismatch");
     if (num_heads <= 0 || D % num_heads != 0)
         throw std::runtime_error("flash_attention_windowed_forward: num_heads must divide D");
+    const int head_dim = D / num_heads;
+    if (Dkv == 0 || Dkv % head_dim != 0)
+        throw std::runtime_error("flash_attention_windowed_forward: K/V width must be a head_dim multiple");
+    const int n_kv = Dkv / head_dim;
+    if (num_heads % n_kv != 0)
+        throw std::runtime_error("flash_attention_windowed_forward: num_heads must be a multiple of n_kv");
     if (Lk < Lq)
         throw std::runtime_error("flash_attention_windowed_forward: requires Lk >= Lq");
     ensure_f32(O, Lq, D);
@@ -331,7 +342,8 @@ void flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
 
     attention_core(Q.host_f32(), K.host_f32(), V.host_f32(), d_mask,
                    Lq, Lk, D, num_heads, /*causal=*/true, O.host_f32_mut(),
-                   nullptr, window, /*q_offset=*/Lk - Lq);
+                   nullptr, window, /*q_offset=*/Lk - Lq, Dkv,
+                   /*group=*/num_heads / n_kv);
 }
 
 // ─── flash_attention_varlen_forward ────────────────────────────────────────
