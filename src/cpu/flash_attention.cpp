@@ -118,18 +118,20 @@ void linear_proj_backward(const float* In, const float* W, const float* dOut,
 // k in [q-window+1, q] (window <= 0 leaves the band unbounded).
 void attention_core(const float* Q, const float* K, const float* V,
                     const float* mask, int Lq, int Lk, int D, int H,
-                    bool causal, float* O, float* P, int window = 0) {
+                    bool causal, float* O, float* P, int window = 0,
+                    int q_offset = 0) {
     const int hd = D / H;
     const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
     std::vector<float> scores(static_cast<std::size_t>(Lk));
     for (int q = 0; q < Lq; ++q) {
+        const int aq = q + q_offset;   // absolute causal position of this query
         for (int h = 0; h < H; ++h) {
             const int off = h * hd;
             float m = -1e30f;
             for (int k = 0; k < Lk; ++k) {
-                if (mask && mask[k] <= 0.5f)       { scores[k] = -1e30f; continue; }
-                if (causal && k > q)               { scores[k] = -1e30f; continue; }
-                if (window > 0 && k <= q - window) { scores[k] = -1e30f; continue; }
+                if (mask && mask[k] <= 0.5f)        { scores[k] = -1e30f; continue; }
+                if (causal && k > aq)               { scores[k] = -1e30f; continue; }
+                if (window > 0 && k <= aq - window) { scores[k] = -1e30f; continue; }
                 const float* qr = Q + static_cast<std::size_t>(q) * D + off;
                 const float* kr = K + static_cast<std::size_t>(k) * D + off;
                 float dot = 0.0f;
@@ -299,9 +301,15 @@ void flash_attention_forward(const ::brotensor::Tensor& Q,
 
 // ─── flash_attention_windowed_forward ──────────────────────────────────────
 //
-// Sliding-window causal self-attention (FP32, inference-only). Always causal;
-// query i attends keys [max(0, i-window+1), i]. window <= 0 is unbounded causal
-// (identical to flash_attention_forward with causal=true). Requires Lq == Lk.
+// Sliding-window causal self-attention (FP32, inference-only). Always causal.
+// The Lq queries occupy the last Lq positions of a length-Lk causal sequence
+// (q_offset = Lk - Lq): query row r sits at absolute position r + q_offset and
+// attends keys [max(0, pos-window+1), pos]. window <= 0 is unbounded causal.
+//   - Lq == Lk (q_offset 0): plain causal / sliding window (e.g. the codec).
+//   - Lq  < Lk: incremental decode — a short query block (often a single token)
+//     attending the whole K/V cache, the autoregressive step. Lq == 1 with
+//     window <= 0 attends every cached key (full attention over the cache).
+// Lk >= Lq required.
 void flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
                                       const ::brotensor::Tensor& K,
                                       const ::brotensor::Tensor& V,
@@ -316,14 +324,14 @@ void flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
         throw std::runtime_error("flash_attention_windowed_forward: shape mismatch");
     if (num_heads <= 0 || D % num_heads != 0)
         throw std::runtime_error("flash_attention_windowed_forward: num_heads must divide D");
-    if (Lq != Lk)
-        throw std::runtime_error("flash_attention_windowed_forward: requires Lq == Lk");
+    if (Lk < Lq)
+        throw std::runtime_error("flash_attention_windowed_forward: requires Lk >= Lq");
     ensure_f32(O, Lq, D);
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
     attention_core(Q.host_f32(), K.host_f32(), V.host_f32(), d_mask,
                    Lq, Lk, D, num_heads, /*causal=*/true, O.host_f32_mut(),
-                   nullptr, window);
+                   nullptr, window, /*q_offset=*/Lk - Lq);
 }
 
 // ─── flash_attention_varlen_forward ────────────────────────────────────────

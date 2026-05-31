@@ -1180,6 +1180,79 @@ static void run_windowed(const char* label, int L, int D, int nh, int window) {
     check_f32(cuda_got, O_ref, (std::string(label) + " cuda").c_str());
 }
 
+// Decode reference: Lq queries at the last Lq positions of a length-Lk causal
+// sequence (q_offset = Lk - Lq), each attending [max(0,pos-window+1), pos].
+static void decode_ref(const std::vector<float>& Q, const std::vector<float>& K,
+                       const std::vector<float>& V, int Lq, int Lk, int D, int nh,
+                       int window, std::vector<float>& O) {
+    const int hd = D / nh;
+    const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
+    const int q_off = Lk - Lq;
+    O.assign(static_cast<size_t>(Lq) * D, 0.0f);
+    std::vector<float> sc(Lk);
+    for (int q = 0; q < Lq; ++q) {
+        const int aq = q + q_off;
+        const int lo = (window > 0) ? std::max(0, aq - window + 1) : 0;
+        for (int h = 0; h < nh; ++h) {
+            const int off = h * hd;
+            float mx = -1e30f;
+            for (int k = lo; k <= aq; ++k) {
+                double dot = 0.0;
+                for (int d = 0; d < hd; ++d)
+                    dot += static_cast<double>(Q[q*D + off + d]) * K[k*D + off + d];
+                sc[k] = static_cast<float>(dot) * inv_sqrt;
+                if (sc[k] > mx) mx = sc[k];
+            }
+            float sum = 0.0f;
+            for (int k = lo; k <= aq; ++k) { sc[k] = std::exp(sc[k] - mx); sum += sc[k]; }
+            const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+            for (int d = 0; d < hd; ++d) {
+                double a = 0.0;
+                for (int k = lo; k <= aq; ++k)
+                    a += static_cast<double>(sc[k]) * inv * V[k*D + off + d];
+                O[q*D + off + d] = static_cast<float>(a);
+            }
+        }
+    }
+}
+
+// Incremental-decode case: an Lq-token query block (Lq < Lk) attends a length-Lk
+// K/V cache — the AR step that replaces the varlen path in the TTS loops.
+static void run_windowed_decode(const char* label, int Lq, int Lk, int D, int nh,
+                                int window) {
+    std::printf("  %s decode Lq=%d Lk=%d D=%d nh=%d window=%d\n",
+                label, Lq, Lk, D, nh, window);
+    std::mt19937 rng(0xDEC0 + window + Lk);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    std::vector<float> Q(static_cast<size_t>(Lq)*D), K(static_cast<size_t>(Lk)*D),
+                       V(static_cast<size_t>(Lk)*D);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+    std::vector<float> O_ref;
+    decode_ref(Q, K, V, Lq, Lk, D, nh, window, O_ref);
+
+    Tensor Qc = Tensor::from_host_on(Device::CPU, Q.data(), Lq, D);
+    Tensor Kc = Tensor::from_host_on(Device::CPU, K.data(), Lk, D);
+    Tensor Vc = Tensor::from_host_on(Device::CPU, V.data(), Lk, D);
+    Tensor Oc;
+    brotensor::flash_attention_windowed_forward(Qc, Kc, Vc, nullptr, nh, window, Oc);
+    CHECK(Oc.rows == Lq && Oc.cols == D && Oc.dtype == Dtype::FP32);
+    std::vector<float> cpu_got(static_cast<size_t>(Lq) * D);
+    Oc.copy_to_host(cpu_got.data());
+    check_f32(cpu_got, O_ref, (std::string(label) + " cpu").c_str());
+
+    Tensor Qg = Tensor::from_host_on(Device::CUDA, Q.data(), Lq, D);
+    Tensor Kg = Tensor::from_host_on(Device::CUDA, K.data(), Lk, D);
+    Tensor Vg = Tensor::from_host_on(Device::CUDA, V.data(), Lk, D);
+    Tensor Og;
+    brotensor::flash_attention_windowed_forward(Qg, Kg, Vg, nullptr, nh, window, Og);
+    std::vector<float> cuda_got(static_cast<size_t>(Lq) * D);
+    Og.copy_to_host(cuda_got.data());
+    brotensor::sync_all();
+    check_f32(cuda_got, O_ref, (std::string(label) + " cuda").c_str());
+}
+
 // window <= 0 (and window >= L) must reproduce plain causal — cross-check the
 // windowed op against flash_attention_forward(causal=true) on CPU FP32.
 static void run_windowed_eq_causal(const char* label, int L, int D, int nh) {
@@ -1276,6 +1349,13 @@ int main() {
     run_windowed("win ge-L",       16, 32, 4, 64);    // window >= L => full causal
     run_windowed("win unbounded",  16, 32, 4, 0);     // window <= 0 => full causal
     run_windowed_eq_causal("win identity", 40, 64, 8);
+
+    // ── Incremental-decode windowed attention (Lq < Lk) ─────────────────────
+    run_windowed_decode("dec single",      1,  1, 32, 4, 0);    // first step, cache=1
+    run_windowed_decode("dec one-of-many", 1, 50, 32, 4, 0);    // 1 query, full cache
+    run_windowed_decode("dec windowed",    1, 90, 32, 4, 72);   // cache beyond window
+    run_windowed_decode("dec block",       4, 40, 64, 8, 0);    // multi-token block
+    run_windowed_decode("dec block win",   3, 80, 64, 8, 16);   // block + window
 
     // ── Backward tests ────────────────────────────────────────────────────
     run_bwd_self_vs_mha("bwd-self small", 6, 32, 4);
