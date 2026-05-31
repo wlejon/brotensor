@@ -47,6 +47,7 @@ void fill_cuda_vtable_interp2d       (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_pool2d         (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_pad2d          (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_slice2d        (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_unfold2d       (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_gather_scatter (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_top_k          (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_window_partition(::brotensor::detail::OpsVTable&);
@@ -106,6 +107,7 @@ extern "C" void brotensor_probe_and_register_cuda() {
     dc::fill_cuda_vtable_pool2d(ops);
     dc::fill_cuda_vtable_pad2d(ops);
     dc::fill_cuda_vtable_slice2d(ops);
+    dc::fill_cuda_vtable_unfold2d(ops);
     dc::fill_cuda_vtable_gather_scatter(ops);
     dc::fill_cuda_vtable_top_k(ops);
     dc::fill_cuda_vtable_window_partition(ops);

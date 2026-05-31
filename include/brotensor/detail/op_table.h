@@ -202,6 +202,10 @@
                                                        int h0, int w0, int H_out, int W_out, ::brotensor::Tensor& Y))                                                  \
     X(slice2d_backward,                        void,  (const ::brotensor::Tensor& dY, int N, int C, int H, int W,                                                      \
                                                        int h0, int w0, int H_out, int W_out, ::brotensor::Tensor& dX))                                                 \
+    /* ─── 2D neighborhood unfold (spatial-preserving im2col) on NCHW ─── */                                                                                            \
+    X(unfold2d_forward,                        void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, int kH, int kW,                                       \
+                                                       int stride_h, int stride_w, int pad_top, int pad_bottom, int pad_left, int pad_right,                           \
+                                                       int mode, ::brotensor::Tensor& Y))                                                                              \
     /* ─── Per-row top-k (descending values + int32 indices) ─── */                                                                                                     \
     X(top_k_rows,                              void,  (const ::brotensor::Tensor& X, int k, ::brotensor::Tensor& Vals, ::brotensor::Tensor& Idx))                       \
     /* ─── Adaptive avg pool 2D (NCHW), arbitrary output spatial size ─── */                                                                                            \

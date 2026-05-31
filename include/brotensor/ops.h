@@ -886,6 +886,30 @@ void slice2d_forward(const Tensor& X, int N, int C, int H, int W,
 void slice2d_backward(const Tensor& dY, int N, int C, int H, int W,
                       int h0, int w0, int H_out, int W_out, Tensor& dX);
 
+// 2D neighborhood unfold (spatial-preserving im2col), NCHW. For every output
+// pixel, gathers the kH×kW window around the corresponding input position into
+// its own channel block — the "keep the spatial grid, add a neighbor axis"
+// flavour of im2col (neighborhood attention, guided/bilateral filtering, DSINE
+// NRN propagation), distinct from torch.nn.Unfold's column-collapse form.
+//   X: (N, C*H*W).
+//   Y: (N, C*kK*H_out*W_out), kK = kH*kW, resized + dtype-set to X.
+//   Y[n, c, k, oy, ox] = X[n, c, oy*stride_h - pad_top + ky,
+//                                ox*stride_w - pad_left + kx]
+//   with k = ky*kW + kx and out-of-range source resolved by `mode`:
+//     0 = zero, 1 = reflect (no edge repeat), 2 = replicate (clamp to edge).
+//   H_out = (H + pad_top + pad_bottom - kH)/stride_h + 1   (W_out analogous).
+// stride 1 + pad (k-1)/2 gives the same-size neighborhood unfold (H_out==H).
+// Dispatched FP32/FP16/BF16 on X.dtype (CPU is FP32-only). Inference-only:
+// there is no unfold2d backward.
+void unfold2d_forward(const Tensor& X,
+                      int N, int C, int H, int W,
+                      int kH, int kW,
+                      int stride_h, int stride_w,
+                      int pad_top, int pad_bottom,
+                      int pad_left, int pad_right,
+                      int mode,
+                      Tensor& Y);
+
 // Per-row top-k. For each row of X: select the k largest values, returning
 // them in descending order in `Vals` with their column indices in `Idx`.
 // Ties broken by smaller column index. The companion to argmax_rows for
@@ -1367,14 +1391,19 @@ void flash_attention_forward(const Tensor& Q,
                              Tensor& O);
 
 // Sliding-window causal self-attention (FP32, inference-only) — the local
-// attention of streaming neural codecs (e.g. Qwen3-TTS / Mimi). Q, K, V already
-// projected, (T, num_heads*head_dim). Always causal: query i attends keys
-// [max(0, i-window+1), i]. window <= 0 means unbounded causal — identical to
-// flash_attention_forward with causal=true (so a single op covers both the
-// within-window and beyond-window regimes). Requires Lq == Lk.
+// attention of streaming neural codecs (e.g. Qwen3-TTS / Mimi) and the
+// autoregressive decode step. Q, K, V already projected, (L, num_heads*head_dim).
+// Always causal. The Lq queries occupy the last Lq positions of a length-Lk
+// causal sequence (q_offset = Lk - Lq): query row r is at absolute position
+// r + q_offset and attends keys [max(0, pos-window+1), pos]. window <= 0 means
+// unbounded causal — identical to flash_attention_forward with causal=true.
+//   - Lq == Lk: self-attention (prefill / codec sliding window).
+//   - Lq  < Lk: incremental decode of an Lq-token block over a K/V cache;
+//     Lq == 1 with window <= 0 attends every cached key (full cache attention),
+//     replacing a varlen call with no cu_seqlens upload. Requires Lk >= Lq.
 //   d_mask: optional length-Lk FP32 key mask (1 valid / 0 invalid), combined
 //           multiplicatively with the window; may be null.
-//   num_heads divides D.  O: (T, num_heads*head_dim), resized as needed.
+//   num_heads divides D.  O: (Lq, num_heads*head_dim), resized as needed.
 void flash_attention_windowed_forward(const Tensor& Q,
                                       const Tensor& K,
                                       const Tensor& V,
