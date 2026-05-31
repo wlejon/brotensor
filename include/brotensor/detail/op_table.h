@@ -206,6 +206,8 @@
     X(unfold2d_forward,                        void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, int kH, int kW,                                       \
                                                        int stride_h, int stride_w, int pad_top, int pad_bottom, int pad_left, int pad_right,                           \
                                                        int mode, ::brotensor::Tensor& Y))                                                                              \
+    /* ─── L2 normalize over channel axis (NCHW), per-pixel unit direction ─── */                                                                                       \
+    X(l2_normalize_nchw_forward,               void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, float eps, ::brotensor::Tensor& Y))                   \
     /* ─── Per-row top-k (descending values + int32 indices) ─── */                                                                                                     \
     X(top_k_rows,                              void,  (const ::brotensor::Tensor& X, int k, ::brotensor::Tensor& Vals, ::brotensor::Tensor& Idx))                       \
     /* ─── Adaptive avg pool 2D (NCHW), arbitrary output spatial size ─── */                                                                                            \

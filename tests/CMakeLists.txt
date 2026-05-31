@@ -129,7 +129,7 @@ if(BROTENSOR_HAS_GPU)
         codec_quant resample1d log_exp_round sample_logits
         interp2d
         l2_norm gated_delta_rule
-        pad2d slice2d unfold2d top_k pool2d gather_rows
+        pad2d slice2d unfold2d l2_normalize top_k pool2d gather_rows
         conv_transpose2d window_partition
         batch_norm image_preproc
     )

@@ -910,6 +910,22 @@ void unfold2d_forward(const Tensor& X,
                       int mode,
                       Tensor& Y);
 
+// L2 normalization over the channel axis, NCHW. For every spatial position
+// (n, h, w), rescales the length-C channel vector to unit L2 norm with an
+// epsilon floor on the divisor:
+//   Y[n,c,h,w] = X[n,c,h,w] / max(sqrt(sum_c X[n,c,h,w]^2), eps)
+// The per-pixel direction normalize used by surface-normal / direction-field
+// models (DSINE normal normalize), feature-map L2 norm, and cosine-sim prep.
+// Distinct from l2_norm_forward (gated-deltanet per-head, last dim of an
+// (L, H*D) layout) — here the unit axis is channels in an NCHW grid.
+//   X, Y: (N, C*H*W). Y resized + dtype-set to X; X and Y may alias.
+// Reduction in double. Dispatched FP32/FP16/BF16 on X.dtype (CPU is FP32-only).
+// Inference-only: there is no backward.
+void l2_normalize_nchw_forward(const Tensor& X,
+                               int N, int C, int H, int W,
+                               float eps,
+                               Tensor& Y);
+
 // Per-row top-k. For each row of X: select the k largest values, returning
 // them in descending order in `Vals` with their column indices in `Idx`.
 // Ties broken by smaller column index. The companion to argmax_rows for

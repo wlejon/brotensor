@@ -345,6 +345,9 @@ void unfold2d_forward(const ::brotensor::Tensor& X,
                       int stride_h, int stride_w,
                       int pad_top, int pad_bottom, int pad_left, int pad_right,
                       int mode, ::brotensor::Tensor& Y);
+void l2_normalize_nchw_forward(const ::brotensor::Tensor& X,
+                               int N, int C, int H, int W, float eps,
+                               ::brotensor::Tensor& Y);
 void slice2d_forward(const ::brotensor::Tensor& X,
                      int N, int C, int H, int W,
                      int h0, int w0, int H_out, int W_out,
@@ -1077,6 +1080,7 @@ struct CpuStaticRegistrar {
         ops.slice2d_forward              = &detail::cpu::slice2d_forward;
         ops.slice2d_backward             = &detail::cpu::slice2d_backward;
         ops.unfold2d_forward             = &detail::cpu::unfold2d_forward;
+        ops.l2_normalize_nchw_forward    = &detail::cpu::l2_normalize_nchw_forward;
         ops.top_k_rows                   = &detail::cpu::top_k_rows;
         ops.adaptive_avg_pool2d_forward  = &detail::cpu::adaptive_avg_pool2d_forward;
         ops.adaptive_avg_pool2d_backward = &detail::cpu::adaptive_avg_pool2d_backward;
