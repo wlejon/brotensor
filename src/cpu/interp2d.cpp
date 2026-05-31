@@ -93,12 +93,23 @@ inline float cubic_keys(float t) {
 
 // ─── Forward ───────────────────────────────────────────────────────────────
 
-void interp2d_forward(const ::brotensor::Tensor& X,
-                      int N, int C, int H_in, int W_in,
-                      int H_out, int W_out, int mode,
-                      ::brotensor::Tensor& Y) {
-    check_fp32(X, "interp2d_forward", "X");
-    check_args("interp2d_forward", N, C, H_in, W_in, H_out, W_out, mode,
+// Corner-aligned source coordinate: out pixel `o` maps to o*(in-1)/(out-1),
+// with the degenerate out==1 case pinned to 0 (torch align_corners=True).
+inline double align_corners_src(int o, int in_dim, int out_dim) {
+    if (out_dim <= 1) return 0.0;
+    return static_cast<double>(o) * static_cast<double>(in_dim - 1) /
+           static_cast<double>(out_dim - 1);
+}
+
+// Shared forward worker for both the half-pixel (align_corners=False) and the
+// corner-aligned (align_corners=True) resample — they differ only in the
+// source-coordinate mapping, so the tap math below is identical.
+static void interp2d_forward_impl(const ::brotensor::Tensor& X,
+                                  int N, int C, int H_in, int W_in,
+                                  int H_out, int W_out, int mode, bool align,
+                                  ::brotensor::Tensor& Y, const char* op) {
+    check_fp32(X, op, "X");
+    check_args(op, N, C, H_in, W_in, H_out, W_out, mode,
                /*allow_bicubic=*/true);
 
     const int cols = C * H_out * W_out;
@@ -110,6 +121,7 @@ void interp2d_forward(const ::brotensor::Tensor& X,
     const float* Xp = X.host_f32();
     float* Yp = Y.host_f32_mut();
 
+    // Half-pixel scale (unused on the align path, which reads from in-1/out-1).
     const double sy = static_cast<double>(H_in) / static_cast<double>(H_out);
     const double sx = static_cast<double>(W_in) / static_cast<double>(W_out);
 
@@ -119,10 +131,12 @@ void interp2d_forward(const ::brotensor::Tensor& X,
             const int ybase = (n * C + c) * H_out * W_out;
 
             for (int oh = 0; oh < H_out; ++oh) {
-                const double src_y = (oh + 0.5) * sy - 0.5;
+                const double src_y = align ? align_corners_src(oh, H_in, H_out)
+                                           : (oh + 0.5) * sy - 0.5;
 
                 for (int ow = 0; ow < W_out; ++ow) {
-                    const double src_x = (ow + 0.5) * sx - 0.5;
+                    const double src_x = align ? align_corners_src(ow, W_in, W_out)
+                                               : (ow + 0.5) * sx - 0.5;
 
                     if (mode == 0) {
                         // nearest — round_half_to_even then clamp.
@@ -179,6 +193,22 @@ void interp2d_forward(const ::brotensor::Tensor& X,
             }
         }
     }
+}
+
+void interp2d_forward(const ::brotensor::Tensor& X,
+                      int N, int C, int H_in, int W_in,
+                      int H_out, int W_out, int mode,
+                      ::brotensor::Tensor& Y) {
+    interp2d_forward_impl(X, N, C, H_in, W_in, H_out, W_out, mode,
+                          /*align=*/false, Y, "interp2d_forward");
+}
+
+void interp2d_align_corners_forward(const ::brotensor::Tensor& X,
+                                    int N, int C, int H_in, int W_in,
+                                    int H_out, int W_out, int mode,
+                                    ::brotensor::Tensor& Y) {
+    interp2d_forward_impl(X, N, C, H_in, W_in, H_out, W_out, mode,
+                          /*align=*/true, Y, "interp2d_align_corners_forward");
 }
 
 // ─── Backward ──────────────────────────────────────────────────────────────

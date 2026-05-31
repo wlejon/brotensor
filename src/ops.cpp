@@ -884,6 +884,15 @@ void interp2d_backward(const Tensor& dY,
     detail::adopt_output(dX, dY.device);
     v.interp2d_backward(dY, N, C, H_in, W_in, H_out, W_out, mode, dX);
 }
+void interp2d_align_corners_forward(const Tensor& X,
+                                    int N, int C, int H_in, int W_in,
+                                    int H_out, int W_out, int mode, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.interp2d_align_corners_forward)
+        detail::throw_not_implemented("interp2d_align_corners_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.interp2d_align_corners_forward(X, N, C, H_in, W_in, H_out, W_out, mode, Y);
+}
 
 void pad2d_forward(const Tensor& X, int N, int C, int H, int W,
                    int pad_top, int pad_bottom, int pad_left, int pad_right,

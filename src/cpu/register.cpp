@@ -328,6 +328,10 @@ void interp2d_backward(const ::brotensor::Tensor& dY,
                        int N, int C, int H_in, int W_in,
                        int H_out, int W_out, int mode,
                        ::brotensor::Tensor& dX);
+void interp2d_align_corners_forward(const ::brotensor::Tensor& X,
+                                    int N, int C, int H_in, int W_in,
+                                    int H_out, int W_out, int mode,
+                                    ::brotensor::Tensor& Y);
 void pad2d_forward(const ::brotensor::Tensor& X,
                    int N, int C, int H, int W,
                    int pad_top, int pad_bottom, int pad_left, int pad_right,
@@ -1057,6 +1061,7 @@ struct CpuStaticRegistrar {
         ops.downsample_avg_2x_backward   = &detail::cpu::downsample_avg_2x_backward;
         ops.interp2d_forward             = &detail::cpu::interp2d_forward;
         ops.interp2d_backward            = &detail::cpu::interp2d_backward;
+        ops.interp2d_align_corners_forward = &detail::cpu::interp2d_align_corners_forward;
         ops.pad2d_forward                = &detail::cpu::pad2d_forward;
         ops.pad2d_backward               = &detail::cpu::pad2d_backward;
         ops.slice2d_forward              = &detail::cpu::slice2d_forward;

@@ -56,6 +56,25 @@ void run_bwd(int N, int C, int H_in, int W_in,
                     kAtol, kRtol);
 }
 
+void run_fwd_ac(int N, int C, int H_in, int W_in,
+                int H_out, int W_out, int mode, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X = Tensor::mat(N, C * H_in * W_in);
+    fill_random(X, rng, 1.0f);
+
+    Tensor cpu_Y;
+    brotensor::interp2d_align_corners_forward(X, N, C, H_in, W_in,
+                                              H_out, W_out, mode, cpu_Y);
+
+    Tensor gX = X.to(gpu_device());
+    Tensor gpu_Y;
+    brotensor::interp2d_align_corners_forward(gX, N, C, H_in, W_in,
+                                              H_out, W_out, mode, gpu_Y);
+
+    compare_tensors(cpu_Y, download_to_host(gpu_Y), "interp2d_ac_fwd",
+                    kAtol, kRtol);
+}
+
 } // namespace
 
 // ─── nearest (mode 0) ──────────────────────────────────────────────────────
@@ -79,5 +98,12 @@ BT_PARITY_TEST(i2d_bwd_bil_wide)    { run_bwd(4, 6, 9, 11, 23, 17, 1, 0xB216ull)
 BT_PARITY_TEST(i2d_fwd_bic_up)      { run_fwd(2, 3, 5, 6, 12, 14, 2, 0xB220ull); }
 BT_PARITY_TEST(i2d_fwd_bic_down)    { run_fwd(2, 3, 24, 24, 8, 8, 2, 0xB221ull); }
 BT_PARITY_TEST(i2d_fwd_bic_2x)      { run_fwd(1, 4, 6, 7, 12, 14, 2, 0xB222ull); }
+
+// ─── align_corners=True forward (nearest / bilinear / bicubic) ──────────────
+BT_PARITY_TEST(i2d_ac_fwd_near_up)  { run_fwd_ac(2, 3, 4, 5, 9, 11, 0, 0xB230ull); }
+BT_PARITY_TEST(i2d_ac_fwd_bil_up)   { run_fwd_ac(2, 3, 4, 5, 11, 13, 1, 0xB231ull); }
+BT_PARITY_TEST(i2d_ac_fwd_bil_down) { run_fwd_ac(2, 3, 20, 24, 7, 9, 1, 0xB232ull); }
+BT_PARITY_TEST(i2d_ac_fwd_bil_2x)   { run_fwd_ac(1, 4, 5, 6, 10, 12, 1, 0xB233ull); }
+BT_PARITY_TEST(i2d_ac_fwd_bic_up)   { run_fwd_ac(2, 3, 5, 6, 12, 14, 2, 0xB234ull); }
 
 int main() { return run_all("interp2d cpu/gpu parity"); }

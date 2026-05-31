@@ -825,6 +825,22 @@ void interp2d_backward(const Tensor& dY,
                        int N, int C, int H_in, int W_in, int H_out, int W_out,
                        int mode, Tensor& dX);
 
+// align_corners=True counterpart of interp2d_forward (forward only). The source
+// coordinate uses the corner-aligned mapping
+//   src = o * (in - 1) / (out - 1)     (src = 0 when out == 1)
+// instead of the half-pixel mapping, matching torch.nn.functional.interpolate(
+// ..., align_corners=True). This is the convention DPT-style depth /
+// segmentation heads (Depth-Anything, DPT) use for their fusion and final
+// upsamples, so a faithful inference port needs it. nearest / bilinear / bicubic
+// all honoured (mode 0/1/2), same NCHW layout and FP32/FP16 dtype rules as
+// interp2d_forward. Inference-only: there is no align-corners backward.
+// Registered on CPU and CUDA; the Metal slot is intentionally left null.
+//   X: (N, C*H_in*W_in).  Y: (N, C*H_out*W_out).
+void interp2d_align_corners_forward(
+    const Tensor& X,
+    int N, int C, int H_in, int W_in, int H_out, int W_out,
+    int mode, Tensor& Y);
+
 // 2D pad on the H and W axes of an NCHW tensor (image padding — same role as
 // torch.nn.functional.pad with a 4-element pad). `mode`: 0 zero, 1 reflect
 // (mirror without repeating the edge sample; requires pad_top/pad_bottom < H

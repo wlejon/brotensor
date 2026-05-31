@@ -85,6 +85,18 @@ inline void check_dtype_forward(const ::brotensor::Tensor& t,
     }
 }
 
+// Corner-aligned source coordinate (torch align_corners=True): o*(in-1)/(out-1),
+// with the out==1 degenerate case pinned to 0. align==0 keeps the half-pixel map.
+__device__ inline double src_coord(int o, int in_dim, int out_dim,
+                                   double scale, int align) {
+    if (align) {
+        if (out_dim <= 1) return 0.0;
+        return static_cast<double>(o) * static_cast<double>(in_dim - 1) /
+               static_cast<double>(out_dim - 1);
+    }
+    return (o + 0.5) * scale - 0.5;
+}
+
 // ── per-dtype storage adapters ─────────────────────────────────────────────
 template <typename T> __device__ inline float to_f32(T v);
 template <> __device__ inline float to_f32<float>(float v) { return v; }
@@ -122,7 +134,7 @@ __global__ void interp2d_forward_kernel(const T* __restrict__ X,
                                         T* __restrict__ Y,
                                         int N, int C, int H_in, int W_in,
                                         int H_out, int W_out, int mode,
-                                        double sy, double sx) {
+                                        double sy, double sx, int align) {
     const long long total = (long long)N * C * H_out * W_out;
     for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
          idx < total; idx += (long long)blockDim.x * gridDim.x) {
@@ -133,8 +145,8 @@ __global__ void interp2d_forward_kernel(const T* __restrict__ X,
         const int c = static_cast<int>(t % C);
         const int n = static_cast<int>(t / C);
         const long long xbase = ((long long)n * C + c) * H_in * W_in;
-        const double src_y = (oh + 0.5) * sy - 0.5;
-        const double src_x = (ow + 0.5) * sx - 0.5;
+        const double src_y = src_coord(oh, H_in, H_out, sy, align);
+        const double src_x = src_coord(ow, W_in, W_out, sx, align);
         float out;
         if (mode == 0) {
             const int iy = clampi(static_cast<int>(nearbyint(src_y)),
@@ -168,7 +180,7 @@ __global__ void interp2d_bicubic_forward_kernel(const float* __restrict__ X,
                                                 float* __restrict__ Y,
                                                 int N, int C, int H_in, int W_in,
                                                 int H_out, int W_out,
-                                                double sy, double sx) {
+                                                double sy, double sx, int align) {
     const long long total = (long long)N * C * H_out * W_out;
     for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
          idx < total; idx += (long long)blockDim.x * gridDim.x) {
@@ -179,8 +191,8 @@ __global__ void interp2d_bicubic_forward_kernel(const float* __restrict__ X,
         const int c = static_cast<int>(t % C);
         const int n = static_cast<int>(t / C);
         const long long xbase = ((long long)n * C + c) * H_in * W_in;
-        const double src_y = (oh + 0.5) * sy - 0.5;
-        const double src_x = (ow + 0.5) * sx - 0.5;
+        const double src_y = src_coord(oh, H_in, H_out, sy, align);
+        const double src_x = src_coord(ow, W_in, W_out, sx, align);
         const int y0 = static_cast<int>(floor(src_y));
         const int x0 = static_cast<int>(floor(src_x));
         const float fy = static_cast<float>(src_y - y0);
@@ -274,13 +286,15 @@ __global__ void cast_fp32_store(const float* __restrict__ src,
 //  Wrappers
 // ════════════════════════════════════════════════════════════════════════════
 
-void interp2d_forward(const ::brotensor::Tensor& X,
-                      int N, int C, int H_in, int W_in,
-                      int H_out, int W_out, int mode,
-                      ::brotensor::Tensor& Y) {
-    check_args("interp2d_forward", N, C, H_in, W_in, H_out, W_out, mode,
+// Shared launcher for the half-pixel and corner-aligned forward resamples —
+// they differ only by the `align` flag threaded into the kernels.
+static void launch_forward(const ::brotensor::Tensor& X,
+                           int N, int C, int H_in, int W_in,
+                           int H_out, int W_out, int mode, int align,
+                           ::brotensor::Tensor& Y, const char* op) {
+    check_args(op, N, C, H_in, W_in, H_out, W_out, mode,
                /*allow_bicubic=*/true);
-    check_dtype_forward(X, "interp2d_forward", "X", mode);
+    check_dtype_forward(X, op, "X", mode);
 
     const int cols = C * H_out * W_out;
     if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) {
@@ -296,22 +310,38 @@ void interp2d_forward(const ::brotensor::Tensor& X,
         // bicubic — FP32-only (check_dtype_forward enforced).
         interp2d_bicubic_forward_kernel<<<ip_grid(total), IP_BLOCK>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
-            N, C, H_in, W_in, H_out, W_out, sy, sx);
+            N, C, H_in, W_in, H_out, W_out, sy, sx, align);
     } else if (X.dtype == ::brotensor::Dtype::FP32) {
         interp2d_forward_kernel<float><<<ip_grid(total), IP_BLOCK>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
-            N, C, H_in, W_in, H_out, W_out, mode, sy, sx);
+            N, C, H_in, W_in, H_out, W_out, mode, sy, sx, align);
     } else if (X.dtype == ::brotensor::Dtype::FP16) {
         interp2d_forward_kernel<__half><<<ip_grid(total), IP_BLOCK>>>(
             static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
-            N, C, H_in, W_in, H_out, W_out, mode, sy, sx);
+            N, C, H_in, W_in, H_out, W_out, mode, sy, sx, align);
     } else {
         interp2d_forward_kernel<__nv_bfloat16><<<ip_grid(total), IP_BLOCK>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
-            N, C, H_in, W_in, H_out, W_out, mode, sy, sx);
+            N, C, H_in, W_in, H_out, W_out, mode, sy, sx, align);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void interp2d_forward(const ::brotensor::Tensor& X,
+                      int N, int C, int H_in, int W_in,
+                      int H_out, int W_out, int mode,
+                      ::brotensor::Tensor& Y) {
+    launch_forward(X, N, C, H_in, W_in, H_out, W_out, mode,
+                   /*align=*/0, Y, "interp2d_forward");
+}
+
+void interp2d_align_corners_forward(const ::brotensor::Tensor& X,
+                                    int N, int C, int H_in, int W_in,
+                                    int H_out, int W_out, int mode,
+                                    ::brotensor::Tensor& Y) {
+    launch_forward(X, N, C, H_in, W_in, H_out, W_out, mode,
+                   /*align=*/1, Y, "interp2d_align_corners_forward");
 }
 
 void interp2d_backward(const ::brotensor::Tensor& dY,
@@ -381,8 +411,9 @@ void interp2d_backward(const ::brotensor::Tensor& dY,
 // ─── vtable registration ────────────────────────────────────────────────────
 
 void fill_cuda_vtable_interp2d(::brotensor::detail::OpsVTable& v) {
-    v.interp2d_forward  = &interp2d_forward;
-    v.interp2d_backward = &interp2d_backward;
+    v.interp2d_forward                = &interp2d_forward;
+    v.interp2d_backward               = &interp2d_backward;
+    v.interp2d_align_corners_forward  = &interp2d_align_corners_forward;
 }
 
 } // namespace brotensor::detail::cuda
