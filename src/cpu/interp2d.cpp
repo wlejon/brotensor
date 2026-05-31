@@ -15,7 +15,10 @@
 //
 //   nearest  : Y[oh,ow] = X[clamp(round_half_to_even(src), 0, dim-1)]
 //   bilinear : 2x2 tap weighted blend (border-clamped indices)
-//   bicubic  : 4x4 Catmull-Rom (a = -0.5) tap, border-clamped — forward only.
+//   bicubic  : 4x4 cubic-convolution tap, border-clamped — forward only.
+//              mode 2 uses a = -0.5 (Catmull-Rom, matches PIL/Pillow BICUBIC);
+//              mode 3 uses a = -0.75 (matches torch.nn.functional.interpolate
+//              mode="bicubic" and OpenCV). The two differ only in that constant.
 //
 // ACCUMULATION:
 //   interp2d_forward  — Y  OVERWRITTEN.
@@ -58,10 +61,11 @@ inline void check_args(const char* op,
                                  ": N, C, H_in, W_in, H_out, W_out must be "
                                  "non-negative");
     }
-    const int max_mode = allow_bicubic ? 2 : 1;
+    const int max_mode = allow_bicubic ? 3 : 1;
     if (mode < 0 || mode > max_mode) {
         const char* msg = allow_bicubic
-            ? ": mode must be 0 (nearest), 1 (bilinear), or 2 (bicubic)"
+            ? ": mode must be 0 (nearest), 1 (bilinear), 2 (bicubic a=-0.5, "
+              "PIL), or 3 (bicubic a=-0.75, torch)"
             : ": mode must be 0 (nearest) or 1 (bilinear) — bicubic "
               "backward is not implemented";
         throw std::runtime_error(std::string("brotensor: ") + op + msg);
@@ -73,12 +77,11 @@ inline void check_args(const char* op,
     }
 }
 
-// Catmull-Rom (Keys) cubic with a = -0.5. This matches PIL/Pillow's BICUBIC
-// kernel; note PyTorch's interpolate(mode="bicubic") and OpenCV use a = -0.75,
-// so this is NOT bit-identical to a torch bicubic resample. |t| in [0,1] uses
-// the first branch, |t| in [1,2] the second, otherwise 0.
-inline float cubic_keys(float t) {
-    const float a = -0.5f;
+// Keys cubic-convolution kernel with coefficient `a`. a = -0.5 is Catmull-Rom
+// (matches PIL/Pillow BICUBIC); a = -0.75 matches PyTorch
+// interpolate(mode="bicubic") and OpenCV. |t| in [0,1] uses the first branch,
+// |t| in [1,2] the second, otherwise 0.
+inline float cubic_keys(float t, float a) {
     const float at = t < 0.0f ? -t : t;
     if (at < 1.0f) {
         return ((a + 2.0f) * at - (a + 3.0f)) * at * at + 1.0f;
@@ -168,15 +171,17 @@ static void interp2d_forward_impl(const ::brotensor::Tensor& X,
                         Yp[ybase + oh * W_out + ow] =
                             top + (bot - top) * fy;
                     } else {
-                        // bicubic — 4x4 Catmull-Rom (a=-0.5), border-clamped.
+                        // bicubic — 4x4 cubic-convolution, border-clamped.
+                        // mode 2: a=-0.5 (PIL); mode 3: a=-0.75 (torch).
+                        const float a = (mode == 3) ? -0.75f : -0.5f;
                         const int y0 = static_cast<int>(std::floor(src_y));
                         const int x0 = static_cast<int>(std::floor(src_x));
                         const float fy = static_cast<float>(src_y - y0);
                         const float fx = static_cast<float>(src_x - x0);
                         float wy[4], wx[4];
                         for (int k = 0; k < 4; ++k) {
-                            wy[k] = cubic_keys(fy - (k - 1));
-                            wx[k] = cubic_keys(fx - (k - 1));
+                            wy[k] = cubic_keys(fy - (k - 1), a);
+                            wx[k] = cubic_keys(fx - (k - 1), a);
                         }
                         float acc = 0.0f;
                         for (int j = 0; j < 4; ++j) {

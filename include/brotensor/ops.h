@@ -801,12 +801,15 @@ void downsample_avg_2x_backward(const Tensor& dY,
 //   src_x = (ow + 0.5) * (W_in / W_out) - 0.5
 //   mode == 0  nearest  — round_half_to_even then clamp to border.
 //   mode == 1  bilinear — 2x2 tap weighted blend with border-clamped indices.
-//   mode == 2  bicubic  — 4x4 Catmull-Rom (a = -0.5) tap, border-clamped.
+//   mode == 2  bicubic  — 4x4 cubic-convolution, a = -0.5 (Catmull-Rom, matches
+//                         PIL/Pillow BICUBIC), border-clamped.
+//   mode == 3  bicubic  — same, a = -0.75 (matches torch.nn.functional.
+//                         interpolate mode="bicubic" and OpenCV).
 //
 // H_in / W_in / H_out / W_out may be any non-negative ints; H_out==H_in and
-// W_out==W_in is the identity. Modes other than 0/1/2 throw. Dispatched
-// FP32/FP16 on X.dtype where the backend supports it (CPU is FP32-only);
-// Y resized + dtype-set to match X.
+// W_out==W_in is the identity. Modes other than 0/1/2/3 throw; bicubic (2/3) is
+// FP32-only. Dispatched FP32/FP16 on X.dtype where the backend supports it (CPU
+// is FP32-only); Y resized + dtype-set to match X.
 //   X: (N, C*H_in*W_in).  Y: (N, C*H_out*W_out).
 void interp2d_forward(const Tensor& X,
                       int N, int C, int H_in, int W_in, int H_out, int W_out,

@@ -55,10 +55,11 @@ inline void check_args(const char* op,
         H_out < 0 || W_out < 0) {
         fail(op, "N, C, H_in, W_in, H_out, W_out must be non-negative");
     }
-    const int max_mode = allow_bicubic ? 2 : 1;
+    const int max_mode = allow_bicubic ? 3 : 1;
     if (mode < 0 || mode > max_mode) {
         fail(op, allow_bicubic
-            ? "mode must be 0 (nearest), 1 (bilinear), or 2 (bicubic)"
+            ? "mode must be 0 (nearest), 1 (bilinear), 2 (bicubic a=-0.5, PIL), "
+              "or 3 (bicubic a=-0.75, torch)"
             : "mode must be 0 (nearest) or 1 (bilinear) — bicubic backward "
               "is not implemented");
     }
@@ -71,7 +72,7 @@ inline void check_args(const char* op,
 inline void check_dtype_forward(const ::brotensor::Tensor& t,
                                 const char* op, const char* name,
                                 int mode) {
-    if (mode == 2) {
+    if (mode >= 2) {
         if (t.dtype != ::brotensor::Dtype::FP32) {
             fail(op, std::string(name) +
                      " must be FP32 (bicubic only supports FP32 on CUDA)");
@@ -112,10 +113,10 @@ __device__ inline int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Catmull-Rom (Keys) cubic with a = -0.5 (matches PIL BICUBIC; NOT torch's
-// interpolate(bicubic), which uses a = -0.75). Mirrors src/cpu/interp2d.cpp.
-__device__ inline float cubic_keys(float t) {
-    const float a = -0.5f;
+// Keys cubic-convolution kernel with coefficient `a`. a = -0.5 is Catmull-Rom
+// (PIL BICUBIC); a = -0.75 matches torch interpolate(bicubic) and OpenCV.
+// Mirrors src/cpu/interp2d.cpp.
+__device__ inline float cubic_keys(float t, float a) {
     const float at = t < 0.0f ? -t : t;
     if (at < 1.0f) {
         return ((a + 2.0f) * at - (a + 3.0f)) * at * at + 1.0f;
@@ -181,7 +182,8 @@ __global__ void interp2d_bicubic_forward_kernel(const float* __restrict__ X,
                                                 float* __restrict__ Y,
                                                 int N, int C, int H_in, int W_in,
                                                 int H_out, int W_out,
-                                                double sy, double sx, int align) {
+                                                double sy, double sx, int align,
+                                                float a) {
     const long long total = (long long)N * C * H_out * W_out;
     for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
          idx < total; idx += (long long)blockDim.x * gridDim.x) {
@@ -201,8 +203,8 @@ __global__ void interp2d_bicubic_forward_kernel(const float* __restrict__ X,
         float wy[4], wx[4];
         #pragma unroll
         for (int k = 0; k < 4; ++k) {
-            wy[k] = cubic_keys(fy - (k - 1));
-            wx[k] = cubic_keys(fx - (k - 1));
+            wy[k] = cubic_keys(fy - (k - 1), a);
+            wx[k] = cubic_keys(fx - (k - 1), a);
         }
         float acc = 0.0f;
         #pragma unroll
@@ -307,11 +309,13 @@ static void launch_forward(const ::brotensor::Tensor& X,
     const double sx = static_cast<double>(W_in) / static_cast<double>(W_out);
     const long long total = (long long)N * C * H_out * W_out;
 
-    if (mode == 2) {
+    if (mode >= 2) {
         // bicubic — FP32-only (check_dtype_forward enforced).
+        // mode 2: a=-0.5 (PIL); mode 3: a=-0.75 (torch).
+        const float a = (mode == 3) ? -0.75f : -0.5f;
         interp2d_bicubic_forward_kernel<<<ip_grid(total), IP_BLOCK>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
-            N, C, H_in, W_in, H_out, W_out, sy, sx, align);
+            N, C, H_in, W_in, H_out, W_out, sy, sx, align, a);
     } else if (X.dtype == ::brotensor::Dtype::FP32) {
         interp2d_forward_kernel<float><<<ip_grid(total), IP_BLOCK>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
