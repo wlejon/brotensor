@@ -1335,6 +1335,16 @@ void flash_attention_forward(const Tensor& Q, const Tensor& K, const Tensor& V,
     v.flash_attention_forward(Q, K, V, d_mask, num_heads, causal, O);
 }
 
+void flash_attention_windowed_forward(const Tensor& Q, const Tensor& K, const Tensor& V,
+                                      const float* d_mask, int num_heads, int window,
+                                      Tensor& O) {
+    const auto& v = detail::dispatch(Q, K, V, O);
+    if (!v.flash_attention_windowed_forward)
+        detail::throw_not_implemented("flash_attention_windowed_forward", Q.device);
+    detail::adopt_output(O, Q.device);
+    v.flash_attention_windowed_forward(Q, K, V, d_mask, num_heads, window, O);
+}
+
 void flash_attention_varlen_forward(const Tensor& Q, const Tensor& K, const Tensor& V,
                                     const int32_t* cu_seqlens_q,
                                     const int32_t* cu_seqlens_k,

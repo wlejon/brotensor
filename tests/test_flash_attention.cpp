@@ -1093,6 +1093,118 @@ static void run_bwd_causal_cpu(const char* label, int L, int D, int nh) {
     check_fp16(dbo_got, dbo, "causal-bwd dbo");
 }
 
+// ─── flash_attention_windowed_forward (FP32, CPU + CUDA) ────────────────────
+
+static void check_f32(const std::vector<float>& got, const std::vector<float>& ref,
+                      const char* label, float atol = 1e-4f, float rtol = 1e-4f) {
+    int bad = 0; float max_err = 0.0f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const float e = std::fabs(got[i] - ref[i]);
+        if (e > max_err) max_err = e;
+        if (e > atol + rtol * std::fabs(ref[i])) {
+            if (bad < 3)
+                std::printf("    %s mismatch i=%zu got=%g ref=%g err=%g\n",
+                            label, i, got[i], ref[i], e);
+            ++bad;
+        }
+    }
+    std::printf("    %s max_err=%g bad=%d / %zu\n", label, max_err, bad, ref.size());
+    CHECK(bad == 0);
+}
+
+// Naive sliding-window causal reference: query q attends keys [lo, q] with
+// lo = max(0, q-window+1) (window <= 0 => lo = 0, full causal).
+static void windowed_ref(const std::vector<float>& Q, const std::vector<float>& K,
+                         const std::vector<float>& V, int L, int D, int nh,
+                         int window, std::vector<float>& O) {
+    const int hd = D / nh;
+    const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
+    O.assign(static_cast<size_t>(L) * D, 0.0f);
+    std::vector<float> sc(L);
+    for (int q = 0; q < L; ++q) {
+        const int lo = (window > 0) ? std::max(0, q - window + 1) : 0;
+        for (int h = 0; h < nh; ++h) {
+            const int off = h * hd;
+            float mx = -1e30f;
+            for (int k = lo; k <= q; ++k) {
+                double dot = 0.0;
+                for (int d = 0; d < hd; ++d)
+                    dot += static_cast<double>(Q[q*D + off + d]) * K[k*D + off + d];
+                sc[k] = static_cast<float>(dot) * inv_sqrt;
+                if (sc[k] > mx) mx = sc[k];
+            }
+            float sum = 0.0f;
+            for (int k = lo; k <= q; ++k) { sc[k] = std::exp(sc[k] - mx); sum += sc[k]; }
+            const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+            for (int d = 0; d < hd; ++d) {
+                double a = 0.0;
+                for (int k = lo; k <= q; ++k)
+                    a += static_cast<double>(sc[k]) * inv * V[k*D + off + d];
+                O[q*D + off + d] = static_cast<float>(a);
+            }
+        }
+    }
+}
+
+static void run_windowed(const char* label, int L, int D, int nh, int window) {
+    std::printf("  %s windowed L=%d D=%d nh=%d window=%d\n", label, L, D, nh, window);
+    std::mt19937 rng(0x5117 + window);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    std::vector<float> Q(L*D), K(L*D), V(L*D);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+    std::vector<float> O_ref;
+    windowed_ref(Q, K, V, L, D, nh, window, O_ref);
+
+    // CPU FP32.
+    Tensor Qc = Tensor::from_host_on(Device::CPU, Q.data(), L, D);
+    Tensor Kc = Tensor::from_host_on(Device::CPU, K.data(), L, D);
+    Tensor Vc = Tensor::from_host_on(Device::CPU, V.data(), L, D);
+    Tensor Oc;
+    brotensor::flash_attention_windowed_forward(Qc, Kc, Vc, nullptr, nh, window, Oc);
+    CHECK(Oc.rows == L && Oc.cols == D && Oc.dtype == Dtype::FP32);
+    std::vector<float> cpu_got(static_cast<size_t>(L) * D);
+    Oc.copy_to_host(cpu_got.data());
+    check_f32(cpu_got, O_ref, (std::string(label) + " cpu").c_str());
+
+    // CUDA FP32.
+    Tensor Qg = Tensor::from_host_on(Device::CUDA, Q.data(), L, D);
+    Tensor Kg = Tensor::from_host_on(Device::CUDA, K.data(), L, D);
+    Tensor Vg = Tensor::from_host_on(Device::CUDA, V.data(), L, D);
+    Tensor Og;
+    brotensor::flash_attention_windowed_forward(Qg, Kg, Vg, nullptr, nh, window, Og);
+    std::vector<float> cuda_got(static_cast<size_t>(L) * D);
+    Og.copy_to_host(cuda_got.data());
+    brotensor::sync_all();
+    check_f32(cuda_got, O_ref, (std::string(label) + " cuda").c_str());
+}
+
+// window <= 0 (and window >= L) must reproduce plain causal — cross-check the
+// windowed op against flash_attention_forward(causal=true) on CPU FP32.
+static void run_windowed_eq_causal(const char* label, int L, int D, int nh) {
+    std::printf("  %s windowed==causal L=%d D=%d nh=%d\n", label, L, D, nh);
+    std::mt19937 rng(0xCA05A1);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    std::vector<float> Q(L*D), K(L*D), V(L*D);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+    Tensor Qc = Tensor::from_host_on(Device::CPU, Q.data(), L, D);
+    Tensor Kc = Tensor::from_host_on(Device::CPU, K.data(), L, D);
+    Tensor Vc = Tensor::from_host_on(Device::CPU, V.data(), L, D);
+    Tensor O_causal, O_win0, O_winL;
+    brotensor::flash_attention_forward(Qc, Kc, Vc, nullptr, nh, /*causal=*/true, O_causal);
+    brotensor::flash_attention_windowed_forward(Qc, Kc, Vc, nullptr, nh, /*window=*/0, O_win0);
+    brotensor::flash_attention_windowed_forward(Qc, Kc, Vc, nullptr, nh, /*window=*/L, O_winL);
+    std::vector<float> ref(static_cast<size_t>(L)*D), w0(ref.size()), wL(ref.size());
+    O_causal.copy_to_host(ref.data());
+    O_win0.copy_to_host(w0.data());
+    O_winL.copy_to_host(wL.data());
+    check_f32(w0, ref, (std::string(label) + " window=0").c_str());
+    check_f32(wL, ref, (std::string(label) + " window=L").c_str());
+}
+
 static void run_stress() {
     // Lk = 8192 is too big for the dynamic-shmem cross-attention but fine for
     // flash. We can't compare against CPU full-precision reasonably at this
@@ -1156,6 +1268,14 @@ int main() {
     run_qkvo_causal("clip text", 77, 768, 12);
 
     run_stress();
+
+    // ── Sliding-window causal attention (FP32, CPU + CUDA) ──────────────────
+    run_windowed("win tiny",        8, 16, 2, 3);     // window < L, single tile
+    run_windowed("win multi-head", 10, 32, 4, 4);
+    run_windowed("win ktile",     200, 32, 4, 72);    // codec-like: spans Lk tiles
+    run_windowed("win ge-L",       16, 32, 4, 64);    // window >= L => full causal
+    run_windowed("win unbounded",  16, 32, 4, 0);     // window <= 0 => full causal
+    run_windowed_eq_causal("win identity", 40, 64, 8);
 
     // ── Backward tests ────────────────────────────────────────────────────
     run_bwd_self_vs_mha("bwd-self small", 6, 32, 4);

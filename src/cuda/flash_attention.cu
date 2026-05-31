@@ -2252,8 +2252,191 @@ void flash_attention_varlen_forward(const Tensor& Q,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+// ─── flash_attention_windowed_forward ──────────────────────────────────────
+//
+// Sliding-window causal self-attention over one sequence. Query q attends keys
+// [lo, q] with lo = max(0, q-window+1) (window <= 0 => lo = 0, plain causal).
+// One CUDA block per (q, head). The online-softmax math is byte-identical to
+// flash_attention_varlen_kernel; only the K-tile bounds change — so window >= L
+// reproduces the plain-causal varlen path exactly. d_mask is an optional
+// length-L device key mask (1 valid / 0 invalid), combined with the window.
+template <typename T>
+__global__ void flash_attention_windowed_kernel(
+        const T* __restrict__ Q,             // (L, D)
+        const T* __restrict__ K,             // (L, D)
+        const T* __restrict__ V,             // (L, D)
+        const float* __restrict__ mask,      // (L) or null
+        T* __restrict__ Out,                 // (L, D)
+        int L, int D, int head_dim, int window) {
+    extern __shared__ float s_smem[];
+    float* scores = s_smem;
+    float* red    = s_smem + FA_KTILE;
+
+    const int q        = blockIdx.x;
+    const int h        = blockIdx.y;
+    const int tid      = threadIdx.x;
+    const int head_off = h * head_dim;
+    const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
+
+    int lo = (window > 0) ? (q - window + 1) : 0;
+    if (lo < 0) lo = 0;
+    const int k_hi = q;                       // inclusive causal upper bound
+
+    float run_max = -1e30f;
+    float run_sum = 0.0f;
+    constexpr int MAX_HD_PER_THREAD = 8;
+    float partial[MAX_HD_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
+
+    const int k0_start = (lo / FA_KTILE) * FA_KTILE;   // align down to a tile
+    for (int k0 = k0_start; k0 <= k_hi; k0 += FA_KTILE) {
+        int klen = FA_KTILE;
+        if (k0 + klen - 1 > k_hi) klen = k_hi - k0 + 1;   // causal trim
+
+        // 1. Scores (keys below the window or masked out -> -inf).
+        for (int t = tid; t < klen; t += blockDim.x) {
+            const int kg = k0 + t;
+            float s;
+            if (kg < lo || (mask && mask[kg] <= 0.5f)) {
+                s = -1e30f;
+            } else {
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    dot += static_cast<float>(Q[q * D + head_off + d]) *
+                           static_cast<float>(K[kg * D + head_off + d]);
+                }
+                s = dot * inv_sqrt;
+            }
+            scores[t] = s;
+        }
+        __syncthreads();
+
+        // 2. Tile max.
+        float local_max = -1e30f;
+        for (int t = tid; t < klen; t += blockDim.x) {
+            if (scores[t] > local_max) local_max = scores[t];
+        }
+        red[tid] = local_max;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                const float other = red[tid + stride];
+                if (other > red[tid]) red[tid] = other;
+            }
+            __syncthreads();
+        }
+        const float tile_max = red[0];
+        const float m_new = (tile_max > run_max) ? tile_max : run_max;
+
+        // 3. Exponentiate, sum.
+        const bool tile_empty = (m_new <= -1e29f);
+        for (int t = tid; t < klen; t += blockDim.x) {
+            const float e = tile_empty ? 0.0f : __expf(scores[t] - m_new);
+            scores[t] = e;
+        }
+        __syncthreads();
+        float local_sum = 0.0f;
+        for (int t = tid; t < klen; t += blockDim.x) local_sum += scores[t];
+        red[tid] = local_sum;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) red[tid] += red[tid + stride];
+            __syncthreads();
+        }
+        const float tile_sum = red[0];
+
+        // 4. Rescale.
+        float alpha;
+        if (run_max <= -1e29f) {
+            alpha = 0.0f;
+        } else {
+            alpha = __expf(run_max - m_new);
+        }
+
+        // 5. Update partial output.
+        int slot = 0;
+        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+            if (slot >= MAX_HD_PER_THREAD) break;
+            float acc = alpha * partial[slot];
+            for (int t = 0; t < klen; ++t) {
+                acc += scores[t] *
+                       static_cast<float>(V[(k0 + t) * D + head_off + d]);
+            }
+            partial[slot] = acc;
+        }
+
+        run_max = m_new;
+        run_sum = alpha * run_sum + tile_sum;
+        __syncthreads();
+    }
+
+    const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
+    int slot = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+        if (slot >= MAX_HD_PER_THREAD) break;
+        Out[q * D + head_off + d] = T(partial[slot] * inv);
+    }
+}
+
+void flash_attention_windowed_forward(const Tensor& Q,
+                                      const Tensor& K,
+                                      const Tensor& V,
+                                      const float* d_mask,
+                                      int num_heads,
+                                      int window,
+                                      Tensor& O) {
+    const Dtype dt = Q.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16 && dt != Dtype::FP32)
+        throw std::runtime_error("flash_attention_windowed_forward: Q, K, V must be FP16, BF16, or FP32");
+    if (K.dtype != dt || V.dtype != dt)
+        throw std::runtime_error("flash_attention_windowed_forward: Q, K, V dtype must match");
+    if (num_heads <= 0)
+        throw std::runtime_error("flash_attention_windowed_forward: num_heads must be positive");
+    const int L = Q.rows;
+    const int D = Q.cols;
+    if (D % num_heads != 0)
+        throw std::runtime_error("flash_attention_windowed_forward: num_heads must divide D");
+    const int head_dim = D / num_heads;
+    if (K.cols != D || V.cols != D || K.rows != L || V.rows != L)
+        throw std::runtime_error("flash_attention_windowed_forward: shape mismatch (requires Lq == Lk)");
+    if ((head_dim + FA_BLOCK - 1) / FA_BLOCK > 8)
+        throw std::runtime_error("flash_attention_windowed_forward: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
+    if (O.rows != L || O.cols != D || O.dtype != dt)
+        O.resize(L, D, dt);
+    if (L == 0 || D == 0) return;
+
+    const size_t shmem = (static_cast<size_t>(FA_KTILE) + FA_BLOCK) * sizeof(float);
+    dim3 grid(L, num_heads, 1);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    if (dt == Dtype::BF16) {
+        flash_attention_windowed_kernel<__nv_bfloat16><<<grid, FA_BLOCK, shmem, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(Q.data),
+            reinterpret_cast<const __nv_bfloat16*>(K.data),
+            reinterpret_cast<const __nv_bfloat16*>(V.data),
+            d_mask, reinterpret_cast<__nv_bfloat16*>(O.data),
+            L, D, head_dim, window);
+    } else if (dt == Dtype::FP32) {
+        flash_attention_windowed_kernel<float><<<grid, FA_BLOCK, shmem, stream>>>(
+            reinterpret_cast<const float*>(Q.data),
+            reinterpret_cast<const float*>(K.data),
+            reinterpret_cast<const float*>(V.data),
+            d_mask, reinterpret_cast<float*>(O.data),
+            L, D, head_dim, window);
+    } else {
+        flash_attention_windowed_kernel<__half><<<grid, FA_BLOCK, shmem, stream>>>(
+            reinterpret_cast<const __half*>(Q.data),
+            reinterpret_cast<const __half*>(K.data),
+            reinterpret_cast<const __half*>(V.data),
+            d_mask, reinterpret_cast<__half*>(O.data),
+            L, D, head_dim, window);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 void fill_cuda_vtable_flash_attention(::brotensor::detail::OpsVTable& v) {
     v.flash_attention_forward                       = &flash_attention_forward;
+    v.flash_attention_windowed_forward              = &flash_attention_windowed_forward;
     v.flash_attention_varlen_forward                = &flash_attention_varlen_forward;
     v.flash_attention_qkvo_forward                  = &flash_attention_qkvo_forward;
     v.flash_attention_qkvo_backward                 = &flash_attention_qkvo_backward;

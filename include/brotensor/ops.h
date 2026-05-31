@@ -1366,6 +1366,23 @@ void flash_attention_forward(const Tensor& Q,
                              bool causal,
                              Tensor& O);
 
+// Sliding-window causal self-attention (FP32, inference-only) — the local
+// attention of streaming neural codecs (e.g. Qwen3-TTS / Mimi). Q, K, V already
+// projected, (T, num_heads*head_dim). Always causal: query i attends keys
+// [max(0, i-window+1), i]. window <= 0 means unbounded causal — identical to
+// flash_attention_forward with causal=true (so a single op covers both the
+// within-window and beyond-window regimes). Requires Lq == Lk.
+//   d_mask: optional length-Lk FP32 key mask (1 valid / 0 invalid), combined
+//           multiplicatively with the window; may be null.
+//   num_heads divides D.  O: (T, num_heads*head_dim), resized as needed.
+void flash_attention_windowed_forward(const Tensor& Q,
+                                      const Tensor& K,
+                                      const Tensor& V,
+                                      const float* d_mask,
+                                      int num_heads,
+                                      int window,
+                                      Tensor& O);
+
 // Packed variable-length multi-head attention, forward only (Qwen3-VL window
 // attention). All sequences in a batch live contiguously in one packed tensor;
 // per-sequence boundaries come from `cu_seqlens_*` INT32 prefix-sum buffers of
