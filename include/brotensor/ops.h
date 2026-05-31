@@ -885,7 +885,7 @@ void top_k_rows(const Tensor& X, int k, Tensor& Vals, Tensor& Idx);
 // spatial dims don't divide evenly. Used by SegFormer / Mask2Former
 // decoder-side aggregation and detection-head global pooling.
 //   X: (N, C*H*W).  Y: (N, C*H_out*W_out), resized + dtype-set to X.
-// CPU FP32-only first chunk; GPU follow-ups TBD.
+// FP32-only, on both the CPU and CUDA backends.
 void adaptive_avg_pool2d_forward(const Tensor& X, int N, int C, int H, int W,
                                  int H_out, int W_out, Tensor& Y);
 
@@ -963,7 +963,7 @@ void scatter_rows_add(const Tensor& dY, const Tensor& Idx, int R, Tensor& dX);
 // bias may be null. groups must divide both C_in and C_out (default 1).
 // output_padding must be < stride or < dilation on each axis (matches torch).
 //   X: (N, C_in*H*W).  Y: (N, C_out*H_out*W_out), resized + dtype-set.
-// CPU FP32-only first chunk; GPU follow-ups TBD.
+// FP32-only, on both the CPU and CUDA backends.
 void conv_transpose2d_forward(const Tensor& X, const Tensor& Wt,
                               const Tensor* bias,
                               int N, int C_in, int H, int W,
