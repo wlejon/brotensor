@@ -99,6 +99,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/slice2d.cpp
     src/cpu/unfold2d.cpp
     src/cpu/l2_normalize.cpp
+    src/cpu/convex_upsample.cpp
     src/cpu/top_k.cpp
     src/cpu/pool2d.cpp
     src/cpu/gather_rows.cpp
@@ -181,6 +182,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/slice2d.cu
         src/cuda/unfold2d.cu
         src/cuda/l2_normalize.cu
+        src/cuda/convex_upsample.cu
         src/cuda/gather_scatter.cu
         src/cuda/top_k.cu
         src/cuda/window_partition.cu

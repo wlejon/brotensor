@@ -926,6 +926,23 @@ void l2_normalize_nchw_forward(const Tensor& X,
                                float eps,
                                Tensor& Y);
 
+// Convex (mask-based) upsample, NCHW — the RAFT-style learned-upsampler used by
+// optical-flow, stereo, and surface-normal refinement (DSINE up_prob_head).
+// Each low-res pixel expands to a scale×scale block; every fine pixel is a
+// softmax-weighted blend of the 3×3 low-res neighborhood around its source:
+//   Y[n,c,k*y+sy,k*x+sx] = sum_{m=0..8} W[n,m,sy,sx,y,x] * X[n,c,ny,nx]
+//   W = softmax over the 9 neighbors m of Mask[n,m,sy,sx,y,x]
+//   neighbor m: ny = clamp(y-1+m/3), nx = clamp(x-1+m%3)  (replicate pad)
+// Mask layout matches torch view (N,9,k,k,H,W): flat channel = (m*k*k + sy*k + sx).
+//   X:    (N, C*H*W).
+//   Mask: (N, 9*scale*scale*H*W) (shares X.dtype).
+//   Y:    (N, C*(scale*H)*(scale*W)), resized + dtype-set to X.
+// Softmax in double. Dispatched FP32/FP16/BF16 on X.dtype (CPU is FP32-only).
+// Inference-only: there is no backward.
+void convex_upsample_forward(const Tensor& X, const Tensor& Mask,
+                             int N, int C, int H, int W, int scale,
+                             Tensor& Y);
+
 // Per-row top-k. For each row of X: select the k largest values, returning
 // them in descending order in `Vals` with their column indices in `Idx`.
 // Ties broken by smaller column index. The companion to argmax_rows for
