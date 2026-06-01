@@ -73,6 +73,7 @@ void check_args(const char* op,
 struct I2dParams {
     uint32_t N, C, H_in, W_in, H_out, W_out;
     uint32_t mode;     // 0 = nearest, 1 = bilinear, 2 = bicubic (fwd only)
+    uint32_t align;    // 0 = half-pixel (align_corners=False), 1 = align_corners=True
     uint32_t total;
 };
 
@@ -83,6 +84,7 @@ using namespace metal;
 struct I2dParams {
     uint N, C, H_in, W_in, H_out, W_out;
     uint mode;
+    uint align;
     uint total;
 };
 
@@ -115,9 +117,16 @@ kernel void k_interp2d_forward(device const float* X [[buffer(0)]],
     uint xbase = (n * P.C + c) * P.H_in * P.W_in;
     float sy = float(P.H_in) / float(P.H_out);
     float sx = float(P.W_in) / float(P.W_out);
-    float src_y = (float(oh) + 0.5f) * sy - 0.5f;
-    float src_x = (float(ow) + 0.5f) * sx - 0.5f;
     int Hi = int(P.H_in), Wi = int(P.W_in);
+    // align_corners=True maps o -> o*(in-1)/(out-1); else half-pixel.
+    float src_y, src_x;
+    if (P.align != 0u) {
+        src_y = (P.H_out > 1u) ? float(oh) * float(Hi - 1) / float(int(P.H_out) - 1) : 0.0f;
+        src_x = (P.W_out > 1u) ? float(ow) * float(Wi - 1) / float(int(P.W_out) - 1) : 0.0f;
+    } else {
+        src_y = (float(oh) + 0.5f) * sy - 0.5f;
+        src_x = (float(ow) + 0.5f) * sx - 0.5f;
+    }
 
     if (P.mode == 0u) {
         int iy = max(0, min(int(rint(src_y)), Hi - 1));
@@ -272,6 +281,41 @@ void interp2d_forward(const Tensor& X,
     p.H_out = static_cast<uint32_t>(H_out);
     p.W_out = static_cast<uint32_t>(W_out);
     p.mode = static_cast<uint32_t>(mode);
+    p.total = static_cast<uint32_t>(N) * static_cast<uint32_t>(cols);
+
+    dispatch1d(pso_interp2d_forward(), p.total,
+               ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:buffer_for(X) offset:buffer_offset_for(X) atIndex:0];
+        [enc setBuffer:buffer_for(Y) offset:buffer_offset_for(Y) atIndex:1];
+        [enc setBytes:&p length:sizeof(I2dParams) atIndex:2];
+    });
+}
+
+// ─── Forward, align_corners=True (inference resample for DPT / seg heads) ─────
+// Reuses the forward kernel; only the source-coordinate map differs (align=1).
+void interp2d_align_corners_forward(const Tensor& X,
+                                    int N, int C, int H_in, int W_in,
+                                    int H_out, int W_out, int mode, Tensor& Y) {
+    const char* op = "interp2d_align_corners_forward";
+    req_fp32(op, X, "X");
+    check_args(op, N, C, H_in, W_in, H_out, W_out, mode,
+               /*allow_bicubic=*/true);
+
+    const int cols = C * H_out * W_out;
+    if (Y.rows != N || Y.cols != cols || Y.dtype != Dtype::FP32) {
+        Y.resize(N, cols, Dtype::FP32);
+    }
+    if (N == 0 || cols == 0) return;
+
+    I2dParams p{};
+    p.N = static_cast<uint32_t>(N);
+    p.C = static_cast<uint32_t>(C);
+    p.H_in = static_cast<uint32_t>(H_in);
+    p.W_in = static_cast<uint32_t>(W_in);
+    p.H_out = static_cast<uint32_t>(H_out);
+    p.W_out = static_cast<uint32_t>(W_out);
+    p.mode = static_cast<uint32_t>(mode);
+    p.align = 1u;
     p.total = static_cast<uint32_t>(N) * static_cast<uint32_t>(cols);
 
     dispatch1d(pso_interp2d_forward(), p.total,

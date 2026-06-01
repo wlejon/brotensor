@@ -1127,6 +1127,132 @@ kernel void k_flash_attention_varlen_bf16(
         ++slot;
     }
 }
+
+// FP32 twin of k_flash_attention_varlen.
+kernel void k_flash_attention_varlen_fp32(
+        device const float* Q    [[buffer(0)]],
+        device const float* Kk   [[buffer(1)]],
+        device const float* V    [[buffer(2)]],
+        device const int*   cu_q [[buffer(3)]],
+        device const int*   cu_k [[buffer(4)]],
+        device float*       Out  [[buffer(5)]],
+        constant uint& B         [[buffer(6)]],
+        constant uint& D         [[buffer(7)]],
+        constant uint& head_dim  [[buffer(8)]],
+        constant uint& causal    [[buffer(9)]],
+        threadgroup float* scratch [[threadgroup(0)]],
+        uint3 gid    [[threadgroup_position_in_grid]],
+        uint3 tid3   [[thread_position_in_threadgroup]],
+        uint3 tgs3   [[threads_per_threadgroup]]) {
+    uint tid = tid3.x;
+    uint tg_size = tgs3.x;
+    threadgroup float* scores = scratch;
+    threadgroup float* red    = scratch + FA_KTILE;
+
+    uint q_global = gid.x;
+    uint h        = gid.y;
+    uint head_off = h * head_dim;
+
+    uint b = 0;
+    while (b < B && uint(cu_q[b + 1]) <= q_global) ++b;
+    if (b >= B) return;
+    uint q_beg = uint(cu_q[b]);
+    uint k_beg = uint(cu_k[b]);
+    uint k_end = uint(cu_k[b + 1]);
+    if (k_end <= k_beg) {
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            Out[q_global * D + head_off + d] = 0.0f;
+        }
+        return;
+    }
+    uint Lk = k_end - k_beg;
+    uint q_local = q_global - q_beg;
+    float inv_sqrt = rsqrt(float(head_dim));
+
+    float run_max = -1e30f;
+    float run_sum = 0.0f;
+    float partial[MAX_HD_PER_THREAD];
+    for (uint i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
+
+    for (uint k0 = 0; k0 < Lk; k0 += FA_KTILE) {
+        if (causal != 0u && k0 > q_local) break;
+        uint klen = (Lk - k0) < FA_KTILE ? (Lk - k0) : FA_KTILE;
+        if (causal != 0u && k0 + klen - 1u > q_local) klen = q_local - k0 + 1u;
+
+        for (uint t = tid; t < klen; t += tg_size) {
+            uint kg = k_beg + k0 + t;
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; ++d) {
+                dot += Q[q_global * D + head_off + d] *
+                       Kk[kg * D + head_off + d];
+            }
+            scores[t] = dot * inv_sqrt;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float local_max = -1e30f;
+        for (uint t = tid; t < klen; t += tg_size) {
+            if (scores[t] > local_max) local_max = scores[t];
+        }
+        red[tid] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                float other = red[tid + s];
+                if (other > red[tid]) red[tid] = other;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float tile_max = red[0];
+        float m_new = (tile_max > run_max) ? tile_max : run_max;
+
+        bool tile_empty = (m_new <= -1e29f);
+        for (uint t = tid; t < klen; t += tg_size) {
+            float e = tile_empty ? 0.0f : exp(scores[t] - m_new);
+            scores[t] = e;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float local_sum = 0.0f;
+        for (uint t = tid; t < klen; t += tg_size) local_sum += scores[t];
+        red[tid] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float tile_sum = red[0];
+
+        float alpha;
+        if (run_max <= -1e29f) {
+            alpha = 0.0f;
+        } else {
+            alpha = exp(run_max - m_new);
+        }
+
+        uint slot = 0;
+        for (uint d = tid; d < head_dim; d += tg_size) {
+            if (slot >= MAX_HD_PER_THREAD) break;
+            float acc = alpha * partial[slot];
+            for (uint t = 0; t < klen; ++t) {
+                acc += scores[t] * V[(k_beg + k0 + t) * D + head_off + d];
+            }
+            partial[slot] = acc;
+            ++slot;
+        }
+
+        run_max = m_new;
+        run_sum = alpha * run_sum + tile_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
+    uint slot = 0;
+    for (uint d = tid; d < head_dim; d += tg_size) {
+        if (slot >= MAX_HD_PER_THREAD) break;
+        Out[q_global * D + head_off + d] = partial[slot] * inv;
+        ++slot;
+    }
+}
 )msl";
 
 id<MTLComputePipelineState> pso_flash() {
@@ -1151,6 +1277,12 @@ id<MTLComputePipelineState> pso_flash_varlen_bf16() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_varlen_bf16"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_flash_varlen_fp32() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_varlen_fp32"); });
     return pso;
 }
 id<MTLComputePipelineState> pso_extract_LD() {
@@ -1593,8 +1725,8 @@ void flash_attention_varlen_forward(const Tensor& Q,
                                     bool causal,
                                     Tensor& O) {
     const Dtype dt = Q.dtype;
-    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
-        throw std::runtime_error("flash_attention_varlen_forward: Q, K, V must be FP16 or BF16");
+    if (dt != Dtype::FP16 && dt != Dtype::BF16 && dt != Dtype::FP32) {
+        throw std::runtime_error("flash_attention_varlen_forward: Q, K, V must be FP16, BF16, or FP32");
     }
     if (K.dtype != dt || V.dtype != dt) {
         throw std::runtime_error("flash_attention_varlen_forward: Q, K, V dtype must match");
@@ -1623,8 +1755,10 @@ void flash_attention_varlen_forward(const Tensor& Q,
     if (total_q == 0 || D == 0 || batch_size == 0) return;
     (void)max_seqlen_q; (void)max_seqlen_k;
 
-    const bool bf16 = (dt == Dtype::BF16);
-    id<MTLComputePipelineState> pso = bf16 ? pso_flash_varlen_bf16() : pso_flash_varlen();
+    id<MTLComputePipelineState> pso =
+        (dt == Dtype::BF16) ? pso_flash_varlen_bf16()
+      : (dt == Dtype::FP32) ? pso_flash_varlen_fp32()
+                            : pso_flash_varlen();
 
     id<MTLBuffer> bQ = buffer_for(Q); NSUInteger oQ = buffer_offset_for(Q);
     id<MTLBuffer> bK = buffer_for(K); NSUInteger oK = buffer_offset_for(K);

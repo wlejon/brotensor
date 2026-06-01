@@ -140,6 +140,8 @@ kernel void k_mha_output_proj(device const float* Y    [[buffer(0)]],
                               device float*       O    [[buffer(4)]],
                               constant uint& K         [[buffer(5)]],
                               constant uint& D         [[buffer(6)]],
+                              device const float* bo   [[buffer(7)]],
+                              constant uint& has_bo    [[buffer(8)]],
                               uint2 gid [[thread_position_in_grid]]) {
     uint c = gid.x; uint i = gid.y;
     if (i >= K || c >= D) return;
@@ -149,9 +151,53 @@ kernel void k_mha_output_proj(device const float* Y    [[buffer(0)]],
     }
     device const float* yr = Y + i * D;
     device const float* wr = Wo + c * D;
-    float acc = 0.0f;
+    float acc = has_bo != 0u ? bo[c] : 0.0f;
     for (uint k = 0; k < D; ++k) acc += yr[k] * wr[k];
     O[i * D + c] = acc;
+}
+
+// Out[(hh*K+i)*dh+j] += bias[hh*dh+j]. One thread per (j, i, hh).
+kernel void k_mha_proj_bias_add(device float*       Out  [[buffer(0)]],
+                                device const float* bias [[buffer(1)]],
+                                constant uint& K   [[buffer(2)]],
+                                constant uint& dh  [[buffer(3)]],
+                                uint3 gid [[thread_position_in_grid]]) {
+    uint j = gid.x; uint i = gid.y; uint hh = gid.z;
+    if (i >= K || j >= dh) return;
+    Out[(hh * K + i) * dh + j] += bias[hh * dh + j];
+}
+
+// db[r] += sum_i dProjH[(hh*K+i)*dh+j], r = hh*dh+j. One thread per r in [0, D).
+kernel void k_mha_dbqkv(device const float* dProjH [[buffer(0)]],
+                        device float*       db     [[buffer(1)]],
+                        constant uint& K  [[buffer(2)]],
+                        constant uint& D  [[buffer(3)]],
+                        constant uint& dh [[buffer(4)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    uint r = gid.x;
+    if (r >= D) return;
+    uint hh = r / dh, j = r % dh;
+    float acc = 0.0f;
+    for (uint i = 0; i < K; ++i) acc += dProjH[(hh * K + i) * dh + j];
+    db[r] += acc;
+}
+
+// dbo[c] += sum_{valid i} dO[i, c]. One thread per c in [0, D).
+kernel void k_mha_dbo(device const float* dO   [[buffer(0)]],
+                      device const float* mask [[buffer(1)]],
+                      constant uint& has_mask  [[buffer(2)]],
+                      device float*       dbo  [[buffer(3)]],
+                      constant uint& K [[buffer(4)]],
+                      constant uint& D [[buffer(5)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    uint c = gid.x;
+    if (c >= D) return;
+    float acc = 0.0f;
+    for (uint i = 0; i < K; ++i) {
+        if (has_mask != 0u && mask[i] < 0.5f) continue;
+        acc += dO[i * D + c];
+    }
+    dbo[c] += acc;
 }
 
 kernel void k_mha_wo_back_dW(device const float* dO   [[buffer(0)]],
@@ -371,6 +417,9 @@ DEF_PSO(pso_scores, @"k_mha_scores")
 DEF_PSO(pso_rsm, @"k_mha_row_softmax")
 DEF_PSO(pso_av, @"k_mha_attn_apply_v")
 DEF_PSO(pso_op, @"k_mha_output_proj")
+DEF_PSO(pso_proj_bias_add, @"k_mha_proj_bias_add")
+DEF_PSO(pso_dbqkv_bias, @"k_mha_dbqkv")
+DEF_PSO(pso_dbo, @"k_mha_dbo")
 DEF_PSO(pso_wodW, @"k_mha_wo_back_dW")
 DEF_PSO(pso_wodY, @"k_mha_wo_back_dY")
 DEF_PSO(pso_dAttn, @"k_mha_dAttn")
@@ -443,10 +492,6 @@ void mha_forward(const Tensor& X,
                  Tensor& Qh, Tensor& Kh, Tensor& Vh,
                  Tensor& Attnh, Tensor& Yconcat,
                  Tensor& O) {
-    if (bq || bk || bv || bo) {
-        throw std::runtime_error("brotensor: mha_forward: Q/K/V/O biases "
-                                 "not yet implemented on Metal");
-    }
     const int K = X.rows;
     const int D = X.cols;
     const int H = num_heads;
@@ -506,6 +551,21 @@ void mha_forward(const Tensor& X,
     proj(bWk, oWk, bKh, oKh);
     proj(bWv, oWv, bVh, oVh);
 
+    // Optional Q/K/V bias adds: Out[(hh*K+i)*dh+j] += bias[hh*dh+j].
+    auto bias_add = ^(const Tensor* b, id<MTLBuffer> bOut, NSUInteger oOut) {
+        if (!b || !b->data) return;
+        id<MTLBuffer> bB = buffer_for(*b); NSUInteger oB = buffer_offset_for(*b);
+        run3d(pso_proj_bias_add(), dh, K, H, ^(id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:bOut offset:oOut atIndex:0];
+            [enc setBuffer:bB   offset:oB   atIndex:1];
+            [enc setBytes:&Ku  length:sizeof(uint32_t) atIndex:2];
+            [enc setBytes:&dhU length:sizeof(uint32_t) atIndex:3];
+        });
+    };
+    bias_add(bq, bQh, oQh);
+    bias_add(bk, bKh, oKh);
+    bias_add(bv, bVh, oVh);
+
     Tensor scores = Tensor::empty_on(Device::Metal, H * K, K);
     id<MTLBuffer> bS = buffer_for(scores);
     NSUInteger oS = buffer_offset_for(scores);
@@ -535,6 +595,9 @@ void mha_forward(const Tensor& X,
         [enc setBytes:&Du length:sizeof(uint32_t) atIndex:5];
     });
 
+    id<MTLBuffer> bBo = (bo && bo->data) ? buffer_for(*bo) : bO;
+    NSUInteger oBo = (bo && bo->data) ? buffer_offset_for(*bo) : oO;
+    const uint32_t has_bo = (bo && bo->data) ? 1u : 0u;
     run2d(pso_op(), D, K, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bYc offset:oYc atIndex:0];
         [enc setBuffer:bWo offset:oWo atIndex:1];
@@ -543,6 +606,8 @@ void mha_forward(const Tensor& X,
         [enc setBuffer:bO offset:oO atIndex:4];
         [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
         [enc setBytes:&Du length:sizeof(uint32_t) atIndex:6];
+        [enc setBuffer:bBo offset:oBo atIndex:7];
+        [enc setBytes:&has_bo length:sizeof(uint32_t) atIndex:8];
     });
 }
 
@@ -560,10 +625,6 @@ void mha_backward(const Tensor& dO,
                   Tensor& dWv, Tensor& dWo,
                   Tensor* dbq, Tensor* dbk,
                   Tensor* dbv, Tensor* dbo) {
-    if (dbq || dbk || dbv || dbo) {
-        throw std::runtime_error("brotensor: mha_backward: Q/K/V/O bias "
-                                 "gradients not yet implemented on Metal");
-    }
     const int K = X.rows;
     const int D = X.cols;
     const int H = num_heads;
@@ -636,6 +697,20 @@ void mha_backward(const Tensor& dO,
         [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
         [enc setBytes:&Du length:sizeof(uint32_t) atIndex:6];
     });
+
+    // Optional dbo[c] += sum_{valid i} dO[i, c].
+    if (dbo && dbo->data) {
+        id<MTLBuffer> bdbo = buffer_for(*dbo);
+        NSUInteger odbo = buffer_offset_for(*dbo);
+        run2d(pso_dbo(), D, 1, ^(id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:bdO offset:odO atIndex:0];
+            [enc setBuffer:bM_arg offset:oM_arg atIndex:1];
+            [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:2];
+            [enc setBuffer:bdbo offset:odbo atIndex:3];
+            [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&Du length:sizeof(uint32_t) atIndex:5];
+        });
+    }
 
     Tensor dAttn = Tensor::empty_on(Device::Metal, H * K, K);
     Tensor dVh = Tensor::empty_on(Device::Metal, H * K, dh);
@@ -719,6 +794,22 @@ void mha_backward(const Tensor& dO,
         [enc setBytes:&dhU length:sizeof(uint32_t) atIndex:9];
         [enc setBytes:&Hu length:sizeof(uint32_t) atIndex:10];
     });
+
+    // Optional Q/K/V bias gradients: db[hh*dh+j] += sum_i dProjH[(hh*K+i)*dh+j].
+    auto db_reduce = ^(Tensor* db, id<MTLBuffer> bdProj, NSUInteger odProj) {
+        if (!db || !db->data) return;
+        id<MTLBuffer> bdb = buffer_for(*db); NSUInteger odb = buffer_offset_for(*db);
+        run2d(pso_dbqkv_bias(), D, 1, ^(id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:bdProj offset:odProj atIndex:0];
+            [enc setBuffer:bdb    offset:odb    atIndex:1];
+            [enc setBytes:&Ku  length:sizeof(uint32_t) atIndex:2];
+            [enc setBytes:&Du  length:sizeof(uint32_t) atIndex:3];
+            [enc setBytes:&dhU length:sizeof(uint32_t) atIndex:4];
+        });
+    };
+    db_reduce(dbq, bdQh, odQh);
+    db_reduce(dbk, bdKh, odKh);
+    db_reduce(dbv, bdVh, odVh);
 }
 
 } // namespace brotensor::detail::metal
