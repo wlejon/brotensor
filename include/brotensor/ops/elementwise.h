@@ -39,7 +39,7 @@ void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD);
 void mul_inplace(Tensor& y, const Tensor& x);
 
 
-// ─── log / exp / round elementwise (audio) ─────────────────────────────────
+// ─── log / exp / round elementwise ─────────────────────────────────────────
 //
 // FP32-only, implemented on all three backends (CPU / CUDA / Metal).
 // Elementwise scalar maps; outputs resized + dtype-set to match the input; x/y

@@ -8,7 +8,7 @@
 namespace brotensor {
 
 
-// ─── AdaLN modulation + GEGLU (DiT / SD3 / Flux) ───────────────────────────
+// ─── AdaLN modulation (DiT / SD3 / Flux) ───────────────────────────────────
 
 // AdaLN modulation: Y = X*(1+scale) + shift, with scale/shift broadcast across
 // every token row — the affine step every DiT block applies after norm().

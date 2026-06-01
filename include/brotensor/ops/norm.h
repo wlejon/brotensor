@@ -150,7 +150,7 @@ void rms_norm_backward(const Tensor& X, const Tensor& gamma,
                       Tensor& dX, Tensor& dGamma);
 
 
-// ─── L2 norm + Gated Delta Rule ────────────────────────────────────────────
+// ─── L2 norm (per-head; Gated DeltaNet q/k) ────────────────────────────────
 //
 // Building blocks for Gated DeltaNet linear-attention text layers (the
 // recurrence-based half of hybrid linear/standard attention decoders). Acts on

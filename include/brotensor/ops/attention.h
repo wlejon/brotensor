@@ -122,7 +122,7 @@ void mha_backward(const Tensor& dO,
                   Tensor* dbv = nullptr, Tensor* dbo = nullptr);
 
 
-// ─── Attention: cross / self / flash ───────────────────────────────────────
+// ─── Cross / self attention + masks ────────────────────────────────────────
 
 // Causal mask helper: fills the length-L FP32 buffer for query row q,
 //   mask[k] = (k <= q) ? 1.0f : 0.0f

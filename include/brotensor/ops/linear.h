@@ -7,8 +7,6 @@
 
 namespace brotensor {
 
-// ─── Dense layers + elementwise activations ────────────────────────────────
-
 // y = W*x + b.  W:(out,in)  b:(out,1)  x:(in,1)  y:(out,1) (resized).
 void linear_forward(const Tensor& W, const Tensor& b,
                     const Tensor& x, Tensor& y);
@@ -22,8 +20,6 @@ void linear_backward(const Tensor& W, const Tensor& x,
                      Tensor& dX, Tensor& dW, Tensor& dB);
 
 
-// ─── Batched inference-only variants ───────────────────────────────────────
-//
 // B independent forward passes in a single launch, forward-only. Tensors
 // carrying B rows are (B, D) row-major: row b holds the b'th sample.
 
@@ -32,8 +28,6 @@ void linear_backward(const Tensor& W, const Tensor& x,
 void linear_forward_batched(const Tensor& W, const Tensor& bias,
                             const Tensor& X_BD, Tensor& Y_BD);
 
-
-// ─── Batched training backward variants ────────────────────────────────────
 
 // Linear backward over a B-row minibatch. Dtype-dispatched (FP32/FP16); all
 // tensors share dtype.
@@ -53,8 +47,6 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
                                  const Tensor& X_BD, Tensor& Y_BD);
 
-
-// ─── Llama-style transformer ops ───────────────────────────────────────────
 
 // Row-major matrix multiply, no bias: C(M,N) = A(M,K) @ B(K,N).
 // Dispatched on A.dtype; B and C share it (C resized + dtype-set to match A).

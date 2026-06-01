@@ -7,9 +7,6 @@
 
 namespace brotensor {
 
-
-// ─── Pooling / losses / embeddings / concat ────────────────────────────────
-
 // Masked mean-pool over the rows of a (K,D) matrix.
 //   X: (K,D).  d_mask: K-float device mask (1 valid / 0 invalid), or null
 //   (all rows valid).  y: (D,1) output, resized if mis-shaped.

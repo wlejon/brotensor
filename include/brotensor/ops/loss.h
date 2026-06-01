@@ -7,8 +7,7 @@
 
 namespace brotensor {
 
-
-// ─── Softmax / LayerNorm / single-head attention ───────────────────────────
+// ─── Softmax ───────────────────────────────────────────────────────────────
 
 // Numerically stable softmax over a flat length-N vector.
 //   logits, probs: (N,1) or (1,N), treated flat; probs resized to match.

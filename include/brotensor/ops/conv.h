@@ -8,7 +8,7 @@
 namespace brotensor {
 
 
-// ─── Conv2d / diffusion-vision ops ─────────────────────────────────────────
+// ─── Convolution: conv2d / conv3d / conv_transpose2d ───────────────────────
 //
 // NCHW tensors are carried as flat (rows, cols) buffers; the (N,C,H,W) dims
 // are passed as int args. Unless noted, these ops are dtype-dispatched on the
