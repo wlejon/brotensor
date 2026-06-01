@@ -461,6 +461,224 @@ kernel void k_fab_dKh_bf16(
     }
     dKh[k * hd + d] = bfloat(acc);
 }
+
+// ── FP32 twins (no half↔float conversions; used by the varlen backward) ──────
+
+kernel void k_fab_extract_head_LD_fp32(
+        device const float* X   [[buffer(0)]],
+        device float*       Y   [[buffer(1)]],
+        constant uint& L         [[buffer(2)]],
+        constant uint& D         [[buffer(3)]],
+        constant uint& head_off  [[buffer(4)]],
+        constant uint& head_dim  [[buffer(5)]],
+        uint gid [[thread_position_in_grid]]) {
+    uint total = L * head_dim;
+    if (gid >= total) return;
+    uint l = gid / head_dim;
+    uint d = gid % head_dim;
+    Y[l * head_dim + d] = X[l * D + head_off + d];
+}
+
+kernel void k_fab_pack_head_LD_fp32(
+        device const float* Yh  [[buffer(0)]],
+        device float*       Out [[buffer(1)]],
+        constant uint& L         [[buffer(2)]],
+        constant uint& D         [[buffer(3)]],
+        constant uint& head_off  [[buffer(4)]],
+        constant uint& head_dim  [[buffer(5)]],
+        uint gid [[thread_position_in_grid]]) {
+    uint total = L * head_dim;
+    if (gid >= total) return;
+    uint l = gid / head_dim;
+    uint d = gid % head_dim;
+    Out[l * D + head_off + d] = Yh[l * head_dim + d];
+}
+
+// Naive FP32 ABT matmul. C[m,n] = sum_k A[m,k] * B[n,k].
+kernel void k_fab_matmul_ABT_fp32(
+        device const float* A [[buffer(0)]],
+        device const float* B [[buffer(1)]],
+        device float*       C [[buffer(2)]],
+        constant uint& M         [[buffer(3)]],
+        constant uint& N         [[buffer(4)]],
+        constant uint& K         [[buffer(5)]],
+        uint gid [[thread_position_in_grid]]) {
+    uint total = M * N;
+    if (gid >= total) return;
+    uint m = gid / N;
+    uint n = gid % N;
+    float acc = 0.0f;
+    for (uint k = 0; k < K; ++k) {
+        acc += A[m * K + k] * B[n * K + k];
+    }
+    C[gid] = acc;
+}
+
+kernel void k_fab_scale_mask_causal_softmax_rows_fp32(
+        device float*       S    [[buffer(0)]],
+        device const float* mask [[buffer(1)]],
+        constant uint& Lq        [[buffer(2)]],
+        constant uint& Lk        [[buffer(3)]],
+        constant float& scale    [[buffer(4)]],
+        constant uint& has_mask  [[buffer(5)]],
+        constant uint& causal    [[buffer(6)]],
+        threadgroup float* ssm   [[threadgroup(0)]],
+        uint3 gid  [[threadgroup_position_in_grid]],
+        uint3 tid3 [[thread_position_in_threadgroup]],
+        uint3 tgs3 [[threads_per_threadgroup]]) {
+    uint q = gid.x;
+    uint tid = tid3.x;
+    uint tg = tgs3.x;
+    device float* row = S + (ulong)q * (ulong)Lk;
+
+    float local_max = -1e30f;
+    for (uint k = tid; k < Lk; k += tg) {
+        float v = row[k] * scale;
+        if (has_mask != 0u && mask[k] <= 0.5f) v = -1e30f;
+        if (causal != 0u && k > q) v = -1e30f;
+        if (v > local_max) local_max = v;
+    }
+    ssm[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg / 2; s > 0; s >>= 1) {
+        if (tid < s) { float o = ssm[tid + s]; if (o > ssm[tid]) ssm[tid] = o; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rmax = ssm[0];
+    bool empty = (rmax <= -1e29f);
+
+    float local_sum = 0.0f;
+    for (uint k = tid; k < Lk; k += tg) {
+        float v = row[k] * scale;
+        if (has_mask != 0u && mask[k] <= 0.5f) v = -1e30f;
+        if (causal != 0u && k > q) v = -1e30f;
+        float e = empty ? 0.0f : exp(v - rmax);
+        row[k] = e;
+        local_sum += e;
+    }
+    ssm[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg / 2; s > 0; s >>= 1) {
+        if (tid < s) ssm[tid] += ssm[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rsum = ssm[0];
+    float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
+    for (uint k = tid; k < Lk; k += tg) {
+        row[k] = row[k] * inv;
+    }
+}
+
+// dP[q,k] = sum_d dOh[q,d] * Vh[k,d]
+kernel void k_fab_dP_fp32(
+        device const float* dOh [[buffer(0)]],
+        device const float* Vh  [[buffer(1)]],
+        device float*       dP  [[buffer(2)]],
+        constant uint& Lq      [[buffer(3)]],
+        constant uint& Lk      [[buffer(4)]],
+        constant uint& hd      [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    uint k = gid.x;
+    uint q = gid.y;
+    if (q >= Lq || k >= Lk) return;
+    float acc = 0.0f;
+    for (uint d = 0; d < hd; ++d) {
+        acc += dOh[q * hd + d] * Vh[k * hd + d];
+    }
+    dP[q * Lk + k] = acc;
+}
+
+// dS = P * (dP - D_q) * scale, in-place over P. One threadgroup per query row.
+kernel void k_fab_dS_from_P_dP_fp32(
+        device float*       P_dS [[buffer(0)]],
+        device const float* dP   [[buffer(1)]],
+        constant uint& Lq       [[buffer(2)]],
+        constant uint& Lk       [[buffer(3)]],
+        constant float& scale   [[buffer(4)]],
+        threadgroup float* ssm  [[threadgroup(0)]],
+        uint3 gid  [[threadgroup_position_in_grid]],
+        uint3 tid3 [[thread_position_in_threadgroup]],
+        uint3 tgs3 [[threads_per_threadgroup]]) {
+    uint q = gid.x;
+    uint tid = tid3.x;
+    uint tg = tgs3.x;
+    device float* prow = P_dS + (ulong)q * (ulong)Lk;
+    device const float* dprow = dP + (ulong)q * (ulong)Lk;
+
+    float local = 0.0f;
+    for (uint k = tid; k < Lk; k += tg) {
+        local += prow[k] * dprow[k];
+    }
+    ssm[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg / 2; s > 0; s >>= 1) {
+        if (tid < s) ssm[tid] += ssm[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float Dq = ssm[0];
+    for (uint k = tid; k < Lk; k += tg) {
+        float p  = prow[k];
+        float dp = dprow[k];
+        prow[k] = p * (dp - Dq) * scale;
+    }
+}
+
+// dVh[k,d] = sum_q P[q,k] * dOh[q,d]
+kernel void k_fab_dVh_fp32(
+        device const float* P   [[buffer(0)]],
+        device const float* dOh [[buffer(1)]],
+        device float*       dVh [[buffer(2)]],
+        constant uint& Lq      [[buffer(3)]],
+        constant uint& Lk      [[buffer(4)]],
+        constant uint& hd      [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    uint k = gid.y;
+    if (k >= Lk || d >= hd) return;
+    float acc = 0.0f;
+    for (uint q = 0; q < Lq; ++q) {
+        acc += P[q * Lk + k] * dOh[q * hd + d];
+    }
+    dVh[k * hd + d] = acc;
+}
+
+// dQh[q,d] = sum_k dS[q,k] * Kh[k,d]
+kernel void k_fab_dQh_fp32(
+        device const float* dS  [[buffer(0)]],
+        device const float* Kh  [[buffer(1)]],
+        device float*       dQh [[buffer(2)]],
+        constant uint& Lq      [[buffer(3)]],
+        constant uint& Lk      [[buffer(4)]],
+        constant uint& hd      [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    uint q = gid.y;
+    if (q >= Lq || d >= hd) return;
+    float acc = 0.0f;
+    for (uint k = 0; k < Lk; ++k) {
+        acc += dS[q * Lk + k] * Kh[k * hd + d];
+    }
+    dQh[q * hd + d] = acc;
+}
+
+// dKh[k,d] = sum_q dS[q,k] * Qh[q,d]
+kernel void k_fab_dKh_fp32(
+        device const float* dS  [[buffer(0)]],
+        device const float* Qh  [[buffer(1)]],
+        device float*       dKh [[buffer(2)]],
+        constant uint& Lq      [[buffer(3)]],
+        constant uint& Lk      [[buffer(4)]],
+        constant uint& hd      [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    uint d = gid.x;
+    uint k = gid.y;
+    if (k >= Lk || d >= hd) return;
+    float acc = 0.0f;
+    for (uint q = 0; q < Lq; ++q) {
+        acc += dS[q * Lk + k] * Qh[q * hd + d];
+    }
+    dKh[k * hd + d] = acc;
+}
 )msl";
 
 id<MTLComputePipelineState> pso_extract() {
@@ -576,6 +794,90 @@ void launch_matmul_abt_bf16_bwd(id<MTLBuffer> bA, NSUInteger oA,
                                  int M, int N, int K) {
     if (M == 0 || N == 0) return;
     id<MTLComputePipelineState> pso = pso_matmul_abt_bf16();
+    const uint32_t Mu = M, Nu = N, Ku = K;
+    const NSUInteger total = (NSUInteger)M * (NSUInteger)N;
+    const NSUInteger tg = 128;
+    const NSUInteger grid = ((total + tg - 1) / tg) * tg;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bA offset:oA atIndex:0];
+        [enc setBuffer:bB offset:oB atIndex:1];
+        [enc setBuffer:bC offset:oC atIndex:2];
+        [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(grid, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        ::brotensor::metal_impl::submit(cmd);
+    }
+}
+
+// ── FP32 PSO accessors ───────────────────────────────────────────────────────
+id<MTLComputePipelineState> pso_extract_fp32() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_extract_head_LD_fp32"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_pack_fp32() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_pack_head_LD_fp32"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_matmul_abt_fp32() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_matmul_ABT_fp32"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_softmax_fp32() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_scale_mask_causal_softmax_rows_fp32"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_dP_fp32() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_dP_fp32"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_dS_fp32() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_dS_from_P_dP_fp32"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_dVh_fp32() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_dVh_fp32"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_dQh_fp32() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_dQh_fp32"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_dKh_fp32() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_dKh_fp32"); });
+    return pso;
+}
+
+// Self-contained naive FP32 ABT matmul launch helper.
+void launch_matmul_abt_fp32_bwd(id<MTLBuffer> bA, NSUInteger oA,
+                                 id<MTLBuffer> bB, NSUInteger oB,
+                                 id<MTLBuffer> bC, NSUInteger oC,
+                                 int M, int N, int K) {
+    if (M == 0 || N == 0) return;
+    id<MTLComputePipelineState> pso = pso_matmul_abt_fp32();
     const uint32_t Mu = M, Nu = N, Ku = K;
     const NSUInteger total = (NSUInteger)M * (NSUInteger)N;
     const NSUInteger tg = 128;
@@ -850,6 +1152,209 @@ void flash_attention_backward(const Tensor& Q,
         run_pack_or_extract(p_pack, bdQh, odQh_, bdQ, odQ_, Lq, D, head_off, hd);
         run_pack_or_extract(p_pack, bdKh, odKh_, bdK, odK_, Lk, D, head_off, hd);
         run_pack_or_extract(p_pack, bdVh, odVh_, bdV, odV_, Lk, D, head_off, hd);
+    }
+}
+
+// ─── flash_attention_varlen_backward ────────────────────────────────────────
+//
+// Packed variable-length backward. Mirrors src/cuda/flash_attention_backward.cu:
+// per-sequence offset arithmetic into the (total_tokens, D) Q/K/V/dO/dQ/dK/dV
+// buffers, then the same 8-kernel per-head sweep as flash_attention_backward
+// above. cu_seqlens_q/k are DEVICE pointers (shared storage on Metal); we read
+// them host-side once to drive the per-sequence loop. Per-head scratch is sized
+// to the observed max-per-sequence dims and reused; the kernels take explicit
+// (Lq, Lk) bounds so each segment uses the compact prefix of every scratch
+// buffer. FP16 / BF16 only, matching the dense Metal backward.
+void flash_attention_varlen_backward(const Tensor& Q,
+                                     const Tensor& K,
+                                     const Tensor& V,
+                                     const Tensor& O,
+                                     const Tensor& dO,
+                                     const int32_t* cu_seqlens_q,
+                                     const int32_t* cu_seqlens_k,
+                                     int batch_size,
+                                     int max_seqlen_q,
+                                     int max_seqlen_k,
+                                     int num_heads,
+                                     int head_dim,
+                                     bool causal,
+                                     Tensor& dQ,
+                                     Tensor& dK,
+                                     Tensor& dV) {
+    (void)O;  // recompute-based; O retained in API for symmetry with CUDA.
+
+    const Dtype dt = Q.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16 && dt != Dtype::FP32) {
+        throw std::runtime_error("flash_attention_varlen_backward: Q, K, V, dO must be FP16, BF16, or FP32");
+    }
+    if (K.dtype != dt || V.dtype != dt || dO.dtype != dt) {
+        throw std::runtime_error("flash_attention_varlen_backward: Q, K, V, dO dtype must match");
+    }
+    const bool bf16 = (dt == Dtype::BF16);
+    const bool fp32 = (dt == Dtype::FP32);
+    const int total_q = Q.rows;
+    const int total_k = K.rows;
+    const int D = num_heads * head_dim;
+    if (Q.cols != D || K.cols != D || V.cols != D || V.rows != total_k) {
+        throw std::runtime_error("flash_attention_varlen_backward: shape mismatch");
+    }
+    if (dO.rows != total_q || dO.cols != D) {
+        throw std::runtime_error("flash_attention_varlen_backward: dO shape mismatch");
+    }
+    if (num_heads <= 0 || head_dim <= 0) {
+        throw std::runtime_error("flash_attention_varlen_backward: num_heads/head_dim must be positive");
+    }
+    if (batch_size < 0) {
+        throw std::runtime_error("flash_attention_varlen_backward: batch_size must be non-negative");
+    }
+    if (batch_size > 0 && (!cu_seqlens_q || !cu_seqlens_k)) {
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q/k required when batch_size > 0");
+    }
+    if (max_seqlen_q < 0 || max_seqlen_k < 0) {
+        throw std::runtime_error("flash_attention_varlen_backward: max_seqlen_q/k must be non-negative");
+    }
+
+    if (dQ.rows != total_q || dQ.cols != D || dQ.dtype != dt) dQ.resize(total_q, D, dt);
+    if (dK.rows != total_k || dK.cols != D || dK.dtype != dt) dK.resize(total_k, D, dt);
+    if (dV.rows != total_k || dV.cols != D || dV.dtype != dt) dV.resize(total_k, D, dt);
+    dQ.zero();
+    dK.zero();
+    dV.zero();
+
+    if (D == 0 || batch_size == 0) return;
+    if (total_q == 0 && total_k == 0) return;
+
+    // Read cu_seqlens host-side from the (shared-storage) pool buffers.
+    id<MTLBuffer> bCQ = pool_lookup(cu_seqlens_q);
+    id<MTLBuffer> bCK = pool_lookup(cu_seqlens_k);
+    const int32_t* cq = reinterpret_cast<const int32_t*>(
+        reinterpret_cast<const char*>([bCQ contents]) + pool_lookup_offset(cu_seqlens_q));
+    const int32_t* ck = reinterpret_cast<const int32_t*>(
+        reinterpret_cast<const char*>([bCK contents]) + pool_lookup_offset(cu_seqlens_k));
+
+    if (cq[0] != 0)
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q[0] must be 0");
+    if (ck[0] != 0)
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_k[0] must be 0");
+    if (cq[batch_size] != total_q)
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q[B] != total_tokens_q");
+    if (ck[batch_size] != total_k)
+        throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_k[B] != total_tokens_k");
+
+    // Observed max-per-sequence for scratch allocation (honour the actual
+    // maximum so an under-reported advisory max can't cause OOB).
+    int max_lq = max_seqlen_q, max_lk = max_seqlen_k;
+    for (int b = 0; b < batch_size; ++b) {
+        const int Lq_b = cq[b + 1] - cq[b];
+        const int Lk_b = ck[b + 1] - ck[b];
+        if (Lq_b < 0 || Lk_b < 0)
+            throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens must be non-decreasing");
+        if (causal && Lq_b != Lk_b)
+            throw std::runtime_error("flash_attention_varlen_backward: causal requires per-sequence Lq == Lk");
+        if (Lq_b > max_lq) max_lq = Lq_b;
+        if (Lk_b > max_lk) max_lk = Lk_b;
+    }
+    if (max_lq <= 0 || max_lk <= 0) return;  // every sequence empty.
+
+    const int hd = head_dim;
+    const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
+    const NSUInteger dtsz = static_cast<NSUInteger>(::brotensor::dtype_size_bytes(dt));
+
+    // Per-head scratch, max-sized once and reused across sequences/heads.
+    Tensor Qh  = Tensor::empty_on(Device::Metal, max_lq, hd, dt);
+    Tensor Kh  = Tensor::empty_on(Device::Metal, max_lk, hd, dt);
+    Tensor Vh  = Tensor::empty_on(Device::Metal, max_lk, hd, dt);
+    Tensor dOh = Tensor::empty_on(Device::Metal, max_lq, hd, dt);
+    Tensor P   = Tensor::empty_on(Device::Metal, max_lq, max_lk, dt);
+    Tensor dP  = Tensor::empty_on(Device::Metal, max_lq, max_lk, dt);
+    Tensor dQh = Tensor::empty_on(Device::Metal, max_lq, hd, dt);
+    Tensor dKh = Tensor::empty_on(Device::Metal, max_lk, hd, dt);
+    Tensor dVh = Tensor::empty_on(Device::Metal, max_lk, hd, dt);
+
+    id<MTLBuffer> bQ  = buffer_for(Q);   const NSUInteger oQ0  = buffer_offset_for(Q);
+    id<MTLBuffer> bK  = buffer_for(K);   const NSUInteger oK0  = buffer_offset_for(K);
+    id<MTLBuffer> bV  = buffer_for(V);   const NSUInteger oV0  = buffer_offset_for(V);
+    id<MTLBuffer> bdO = buffer_for(dO);  const NSUInteger odO0 = buffer_offset_for(dO);
+    id<MTLBuffer> bdQ = buffer_for(dQ);  const NSUInteger odQ0 = buffer_offset_for(dQ);
+    id<MTLBuffer> bdK = buffer_for(dK);  const NSUInteger odK0 = buffer_offset_for(dK);
+    id<MTLBuffer> bdV = buffer_for(dV);  const NSUInteger odV0 = buffer_offset_for(dV);
+
+    id<MTLBuffer> bQh  = buffer_for(Qh);   const NSUInteger oQh_  = buffer_offset_for(Qh);
+    id<MTLBuffer> bKh  = buffer_for(Kh);   const NSUInteger oKh_  = buffer_offset_for(Kh);
+    id<MTLBuffer> bVh  = buffer_for(Vh);   const NSUInteger oVh_  = buffer_offset_for(Vh);
+    id<MTLBuffer> bdOh = buffer_for(dOh);  const NSUInteger odOh_ = buffer_offset_for(dOh);
+    id<MTLBuffer> bP   = buffer_for(P);    const NSUInteger oP_   = buffer_offset_for(P);
+    id<MTLBuffer> bdP  = buffer_for(dP);   const NSUInteger odP_  = buffer_offset_for(dP);
+    id<MTLBuffer> bdQh = buffer_for(dQh);  const NSUInteger odQh_ = buffer_offset_for(dQh);
+    id<MTLBuffer> bdKh = buffer_for(dKh);  const NSUInteger odKh_ = buffer_offset_for(dKh);
+    id<MTLBuffer> bdVh = buffer_for(dVh);  const NSUInteger odVh_ = buffer_offset_for(dVh);
+
+    // No key mask in the varlen path; dummy-bind Q for the softmax slot.
+    id<MTLBuffer> bMask = bQ; NSUInteger oMask = oQ0; const bool has_mask = false;
+
+    id<MTLComputePipelineState> p_ext    = fp32 ? pso_extract_fp32() : bf16 ? pso_extract_bf16() : pso_extract();
+    id<MTLComputePipelineState> p_pack   = fp32 ? pso_pack_fp32()    : bf16 ? pso_pack_bf16()    : pso_pack();
+    id<MTLComputePipelineState> p_sm     = fp32 ? pso_softmax_fp32() : bf16 ? pso_softmax_bf16() : pso_softmax();
+    id<MTLComputePipelineState> p_dVh    = fp32 ? pso_dVh_fp32()     : bf16 ? pso_dVh_bf16()     : pso_dVh();
+    id<MTLComputePipelineState> p_dP     = fp32 ? pso_dP_fp32()      : bf16 ? pso_dP_bf16()      : pso_dP();
+    id<MTLComputePipelineState> p_dS_sel = fp32 ? pso_dS_fp32()      : bf16 ? pso_dS_bf16()      : pso_dS();
+    id<MTLComputePipelineState> p_dQh    = fp32 ? pso_dQh_fp32()     : bf16 ? pso_dQh_bf16()     : pso_dQh();
+    id<MTLComputePipelineState> p_dKh    = fp32 ? pso_dKh_fp32()     : bf16 ? pso_dKh_bf16()     : pso_dKh();
+
+    for (int b = 0; b < batch_size; ++b) {
+        const int q_beg = cq[b];
+        const int k_beg = ck[b];
+        const int Lq    = cq[b + 1] - q_beg;
+        const int Lk    = ck[b + 1] - k_beg;
+        if (Lq == 0 || Lk == 0) continue;  // grad rows already zero.
+
+        const NSUInteger qoff = static_cast<NSUInteger>(q_beg) * D * dtsz;  // byte offset
+        const NSUInteger koff = static_cast<NSUInteger>(k_beg) * D * dtsz;
+        const NSUInteger oQ_  = oQ0  + qoff;
+        const NSUInteger oK_  = oK0  + koff;
+        const NSUInteger oV_  = oV0  + koff;
+        const NSUInteger odO_ = odO0 + qoff;
+        const NSUInteger odQ_ = odQ0 + qoff;
+        const NSUInteger odK_ = odK0 + koff;
+        const NSUInteger odV_ = odV0 + koff;
+
+        for (int h = 0; h < num_heads; ++h) {
+            const uint32_t head_off = static_cast<uint32_t>(h * hd);
+
+            // 1) Extract Qh, Kh, Vh, dOh for this (sequence, head).
+            run_pack_or_extract(p_ext, bQ,  oQ_,  bQh,  oQh_,  Lq, D, head_off, hd);
+            run_pack_or_extract(p_ext, bK,  oK_,  bKh,  oKh_,  Lk, D, head_off, hd);
+            run_pack_or_extract(p_ext, bV,  oV_,  bVh,  oVh_,  Lk, D, head_off, hd);
+            run_pack_or_extract(p_ext, bdO, odO_, bdOh, odOh_, Lq, D, head_off, hd);
+
+            // 2) S = Qh · Kh^T  →  P (Lq, Lk). FP32 accumulation.
+            if (fp32) {
+                launch_matmul_abt_fp32_bwd(bQh, oQh_, bKh, oKh_, bP, oP_, Lq, Lk, hd);
+            } else if (bf16) {
+                launch_matmul_abt_bf16_bwd(bQh, oQh_, bKh, oKh_, bP, oP_, Lq, Lk, hd);
+            } else {
+                launch_matmul_abt_fp16(bQh, oQh_, bKh, oKh_, bP, oP_, Lq, Lk, hd);
+            }
+
+            // 3) Row-softmax (scale + causal), in-place over P.
+            run_softmax_rows(p_sm, bP, oP_, bMask, oMask, has_mask, Lq, Lk, inv_sqrt, causal);
+
+            // 4) dVh = P^T · dOh   (Lk, hd)
+            run_2d_kernel(p_dVh, bP, oP_, bdOh, odOh_, bdVh, odVh_, Lq, Lk, hd, hd, Lk);
+            // 5) dP = dOh · Vh^T   (Lq, Lk)
+            run_2d_kernel(p_dP, bdOh, odOh_, bVh, oVh_, bdP, odP_, Lq, Lk, hd, Lk, Lq);
+            // 6) dS = P * (dP - D_q) * inv_sqrt   (in-place over P)
+            run_dS(p_dS_sel, bP, oP_, bdP, odP_, Lq, Lk, inv_sqrt);
+            // 7) dQh = dS · Kh   (Lq, hd)
+            run_2d_kernel(p_dQh, bP, oP_, bKh, oKh_, bdQh, odQh_, Lq, Lk, hd, hd, Lq);
+            // 8) dKh = dS^T · Qh   (Lk, hd)
+            run_2d_kernel(p_dKh, bP, oP_, bQh, oQh_, bdKh, odKh_, Lq, Lk, hd, hd, Lk);
+
+            // 9) Pack per-head grads into this sequence's (L, D) slot.
+            run_pack_or_extract(p_pack, bdQh, odQh_, bdQ, odQ_, Lq, D, head_off, hd);
+            run_pack_or_extract(p_pack, bdKh, odKh_, bdK, odK_, Lk, D, head_off, hd);
+            run_pack_or_extract(p_pack, bdVh, odVh_, bdV, odV_, Lk, D, head_off, hd);
+        }
     }
 }
 

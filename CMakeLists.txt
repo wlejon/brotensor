@@ -302,6 +302,10 @@ if(BROTENSOR_WITH_METAL)
         src/metal/sample_logits.mm
         src/metal/noise.mm
         src/metal/l2_norm.mm
+        src/metal/l2_normalize.mm
+        src/metal/convex_upsample.mm
+        src/metal/unfold2d.mm
+        src/metal/flash_attention_windowed.mm
         src/metal/gated_delta_rule.mm
         src/metal/spatial_merge.mm
         src/metal/rope_mrope.mm
@@ -374,6 +378,10 @@ if(BROTENSOR_WITH_METAL)
         src/metal/sample_logits.mm
         src/metal/noise.mm
         src/metal/l2_norm.mm
+        src/metal/l2_normalize.mm
+        src/metal/convex_upsample.mm
+        src/metal/unfold2d.mm
+        src/metal/flash_attention_windowed.mm
         src/metal/gated_delta_rule.mm
         src/metal/spatial_merge.mm
         src/metal/rope_mrope.mm

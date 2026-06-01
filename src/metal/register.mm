@@ -96,6 +96,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.conv_transpose2d_backward_input             = &dm::conv_transpose2d_backward_input;
     ops.conv_transpose2d_backward_weight            = &dm::conv_transpose2d_backward_weight;
     ops.conv_transpose2d_forward                    = &dm::conv_transpose2d_forward;
+    ops.convex_upsample_forward                     = &dm::convex_upsample_forward;
     ops.copy_d2d                                    = &dm::copy_d2d;
     ops.cross_attention_backward                    = &dm::cross_attention_backward;
     ops.cross_attention_forward                     = &dm::cross_attention_forward;
@@ -126,7 +127,9 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.flash_attention_qkvo_backward               = &dm::flash_attention_qkvo_backward;
     ops.flash_attention_qkvo_forward                = &dm::flash_attention_qkvo_forward;
     ops.flash_attention_qkvo_int8w_fp16             = &dm::flash_attention_qkvo_int8w_fp16;
+    ops.flash_attention_varlen_backward             = &dm::flash_attention_varlen_backward;
     ops.flash_attention_varlen_forward              = &dm::flash_attention_varlen_forward;
+    ops.flash_attention_windowed_forward            = &dm::flash_attention_windowed_forward;
     ops.fsq_quantize_backward                       = &dm::fsq_quantize_backward;
     ops.fsq_quantize_forward                        = &dm::fsq_quantize_forward;
     ops.gather_rows                                 = &dm::gather_rows;
@@ -154,6 +157,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.kv_cache_append                             = &dm::kv_cache_append;
     ops.l2_norm_backward                            = &dm::l2_norm_backward;
     ops.l2_norm_forward                             = &dm::l2_norm_forward;
+    ops.l2_normalize_nchw_forward                   = &dm::l2_normalize_nchw_forward;
     ops.layernorm_backward                          = &dm::layernorm_backward;
     ops.layernorm_forward                           = &dm::layernorm_forward;
     ops.layernorm_forward_inference_batched         = &dm::layernorm_forward_inference_batched;
@@ -227,6 +231,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.self_attention_backward                     = &dm::self_attention_backward;
     ops.self_attention_bias_forward                 = &dm::self_attention_bias_forward;
     ops.self_attention_bias_int8w_fp16              = &dm::self_attention_bias_int8w_fp16;
+    ops.self_attention_decomposed_rel_pos_forward          = &dm::self_attention_decomposed_rel_pos_forward;
+    ops.self_attention_decomposed_rel_pos_windowed_forward = &dm::self_attention_decomposed_rel_pos_windowed_forward;
     ops.self_attention_forward                      = &dm::self_attention_forward;
     ops.self_attention_forward_train                = &dm::self_attention_forward_train;
     ops.sequence_to_nchw                            = &dm::sequence_to_nchw;
@@ -258,6 +264,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.tanh_forward_batched                        = &dm::tanh_forward_batched;
     ops.timestep_embedding                          = &dm::timestep_embedding;
     ops.top_k_rows                                  = &dm::top_k_rows;
+    ops.unfold2d_forward                            = &dm::unfold2d_forward;
     ops.upsample_bilinear_2x                        = &dm::upsample_bilinear_2x;
     ops.upsample_bilinear_2x_backward               = &dm::upsample_bilinear_2x_backward;
     ops.upsample_nearest_2x                         = &dm::upsample_nearest_2x;
