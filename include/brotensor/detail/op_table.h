@@ -253,6 +253,8 @@
     /* ─── FP16 linear (inference-only) + GEGLU family ─── */                                                                                                           \
     X(linear_forward_batched_fp16,             void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
                                                        ::brotensor::Tensor& Y_BD))                                                                                      \
+    X(linear_forward_batched_fp16_act,         void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
+                                                       int act, ::brotensor::Tensor& Y_BD))                                                                             \
     X(geglu_forward,                           void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y))                                                           \
     X(geglu_backward,                          void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))                           \
     X(geglu_exact_forward,                     void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y))                                                           \

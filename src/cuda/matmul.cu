@@ -210,6 +210,11 @@ void linear_backward_batched(const ::brotensor::Tensor& W,
                              ::brotensor::Tensor& dX_BD,
                              ::brotensor::Tensor& dW,
                              ::brotensor::Tensor& dB);
+void linear_forward_batched_fp16_act(const ::brotensor::Tensor& W,
+                                     const ::brotensor::Tensor* bias,
+                                     const ::brotensor::Tensor& X_BD,
+                                     int act,
+                                     ::brotensor::Tensor& Y_BD);
 void linear_forward_batched_fp16(const ::brotensor::Tensor& W,
                                  const ::brotensor::Tensor* bias,
                                  const ::brotensor::Tensor& X_BD,
@@ -280,6 +285,7 @@ void fill_cuda_vtable_utils(::brotensor::detail::OpsVTable& v) {
     v.linear_forward_batched              = &linear_forward_batched;
     v.linear_backward_batched             = &linear_backward_batched;
     v.linear_forward_batched_fp16         = &linear_forward_batched_fp16;
+    v.linear_forward_batched_fp16_act     = &linear_forward_batched_fp16_act;
     v.linear_forward_batched_int8w_fp16   = &linear_forward_batched_int8w_fp16;
     v.matmul_int8w_fp16                   = &matmul_int8w_fp16;
     v.rope_forward                        = &rope_forward;

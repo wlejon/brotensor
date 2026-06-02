@@ -1103,6 +1103,15 @@ void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
     v.linear_forward_batched_fp16(W, bias, X_BD, Y_BD);
 }
 
+void linear_forward_batched_fp16_act(const Tensor& W, const Tensor* bias,
+                                     const Tensor& X_BD, int act, Tensor& Y_BD) {
+    const auto& v = detail::dispatch_with_opts(W, X_BD, {bias, &Y_BD});
+    if (!v.linear_forward_batched_fp16_act)
+        detail::throw_not_implemented("linear_forward_batched_fp16_act", W.device);
+    detail::adopt_output(Y_BD, W.device);
+    v.linear_forward_batched_fp16_act(W, bias, X_BD, act, Y_BD);
+}
+
 void geglu_forward(const Tensor& X, Tensor& Y) {
     const auto& v = detail::dispatch(X, Y);
     if (!v.geglu_forward) detail::throw_not_implemented("geglu_forward", X.device);

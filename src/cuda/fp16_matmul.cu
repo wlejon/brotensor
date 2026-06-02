@@ -15,6 +15,8 @@
 #include <mma.h>
 #include <cstdint>
 
+#include "detail/activations.cuh"
+
 namespace brotensor {
 void* cuda_current_stream();      // shim defined in runtime.cu
 namespace fp16_internal {
@@ -41,11 +43,18 @@ static constexpr int FRAGS_N = WN / WMMA_N;  // 2
 static constexpr int LDA_SMEM = BK + 8;   // for A tile (BM rows, BK cols)
 static constexpr int LDB_SMEM = BK + 8;   // for B tile (BN rows, BK cols)
 
+// Optional epilogue (bias + activation) is fused into the global store stage:
+// `bias` (length N, broadcast over rows) is added and `act` applied in-register
+// before writing C, so a linear-forward needs neither a separate bias-add nor a
+// separate activation kernel. bias == nullptr && act == 0 keeps the fast int4
+// store path untouched — the matmul / attention callers that pass no epilogue
+// are unaffected.
 __launch_bounds__(THREADS_PER_CTA)
 __global__ void matmul_ABT_wmma_kernel(const __half* __restrict__ A,
                                        const __half* __restrict__ B,
                                        __half* __restrict__ C,
-                                       int M, int N, int K) {
+                                       int M, int N, int K,
+                                       const __half* __restrict__ bias, int act) {
     __shared__ __half As[BM][LDA_SMEM];
     __shared__ __half Bs[BN][LDB_SMEM];
 
@@ -221,7 +230,7 @@ __global__ void matmul_ABT_wmma_kernel(const __half* __restrict__ A,
             const int gn   = block_n + gcol;
 
             if (grow >= M) continue;
-            if (gn + kHalvesPerStore <= N) {
+            if (bias == nullptr && act == 0 && gn + kHalvesPerStore <= N) {
                 int4 v = *reinterpret_cast<const int4*>(&Cs[row][gcol]);
                 *reinterpret_cast<int4*>(&C[grow * N + gn]) = v;
             } else {
@@ -229,7 +238,10 @@ __global__ void matmul_ABT_wmma_kernel(const __half* __restrict__ A,
                 for (int q = 0; q < kHalvesPerStore; ++q) {
                     int gn_q = gn + q;
                     if (gn_q < N) {
-                        C[grow * N + gn_q] = Cs[row][gcol + q];
+                        float cv = __half2float(Cs[row][gcol + q]);
+                        if (bias) cv += __half2float(bias[gn_q]);
+                        cv = ::brotensor::detail::cuda::apply_linear_act(act, cv);
+                        C[grow * N + gn_q] = __float2half(cv);
                     }
                 }
             }
@@ -241,7 +253,8 @@ __global__ void matmul_ABT_wmma_kernel(const __half* __restrict__ A,
 __global__ void matmul_ABT_naive_kernel(const __half* __restrict__ A,
                                         const __half* __restrict__ B,
                                         __half* __restrict__ C,
-                                        int M, int N, int K) {
+                                        int M, int N, int K,
+                                        const __half* __restrict__ bias, int act) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = M * N;
     if (idx >= total) return;
@@ -251,11 +264,14 @@ __global__ void matmul_ABT_naive_kernel(const __half* __restrict__ A,
     for (int k = 0; k < K; ++k) {
         acc += __half2float(A[m * K + k]) * __half2float(B[n * K + k]);
     }
+    if (bias) acc += __half2float(bias[n]);
+    acc = ::brotensor::detail::cuda::apply_linear_act(act, acc);
     C[idx] = __float2half(acc);
 }
 
 void launch_matmul_ABT_impl(const __half* A, const __half* B, __half* C,
-                            int M, int N, int K) {
+                            int M, int N, int K,
+                            const __half* bias, int act) {
     if (M == 0 || N == 0) return;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     if (K == 0) {
@@ -274,13 +290,13 @@ void launch_matmul_ABT_impl(const __half* A, const __half* B, __half* C,
         const int total = M * N;
         const int block = 128;
         const int grid  = (total + block - 1) / block;
-        matmul_ABT_naive_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
+        matmul_ABT_naive_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K, bias, act);
         return;
     }
 
     dim3 block(THREADS_PER_CTA);
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    matmul_ABT_wmma_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
+    matmul_ABT_wmma_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K, bias, act);
 }
 
 } // namespace fp16_internal

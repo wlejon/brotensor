@@ -48,6 +48,27 @@ void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
                                  const Tensor& X_BD, Tensor& Y_BD);
 
 
+// Activation applied in the GEMM epilogue (fused into the output write) by
+// linear_forward_batched_fp16_act. Plain-int values so the op surface stays
+// int-typed (mirrors the `int mode` convention); kept in sync with the kernel
+// selector in src/cuda/detail/activations.cuh.
+enum LinearActivation {
+    kLinearActNone      = 0,
+    kLinearActRelu      = 1,
+    kLinearActGeluTanh  = 2,
+    kLinearActGeluExact = 3,
+    kLinearActSilu      = 4,
+    kLinearActQuickGelu = 5,
+};
+
+// As linear_forward_batched_fp16, but fuses bias + activation `act` (a
+// LinearActivation value) into the matmul's output-store stage — no separate
+// bias-add or activation launch, and no extra HBM round-trips over Y.
+//   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.
+void linear_forward_batched_fp16_act(const Tensor& W, const Tensor* bias,
+                                     const Tensor& X_BD, int act, Tensor& Y_BD);
+
+
 // Row-major matrix multiply, no bias: C(M,N) = A(M,K) @ B(K,N).
 // Dispatched on A.dtype; B and C share it (C resized + dtype-set to match A).
 // FP32 accumulation for both the FP32 and FP16 paths.

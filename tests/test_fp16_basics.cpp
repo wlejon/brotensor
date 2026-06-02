@@ -102,6 +102,66 @@ static void test_linear_fp16() {
     check_fp16(got2, Ref2, "linear-nobias");
 }
 
+// Reference for the fused epilogue activation (FP32 domain), matching
+// src/cuda/detail/activations.cuh.
+static float ref_linear_act(int act, float v) {
+    switch (act) {
+        case 1: return v > 0.0f ? v : 0.0f;
+        case 2: { const float u = 0.7978845608f * (v + 0.044715f * v * v * v);
+                  return 0.5f * v * (1.0f + std::tanh(u)); }
+        case 3: return 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752440f));
+        case 4: return v / (1.0f + std::exp(-v));
+        case 5: return v / (1.0f + std::exp(-1.702f * v));
+        default: return v;
+    }
+}
+
+// Drives linear_forward_batched_fp16_act for one shape/activation and compares
+// against an FP32 linear+bias+activation reference.
+static void run_linear_act_case(int B, int in_dim, int out_dim,
+                                 int act, const char* label) {
+    std::mt19937 rng(4321u + static_cast<unsigned>(act));
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<float> Wf(out_dim * in_dim), Bf(out_dim), Xf(B * in_dim);
+    for (auto& v : Wf) v = dist(rng);
+    for (auto& v : Bf) v = dist(rng);
+    for (auto& v : Xf) v = dist(rng);
+
+    auto Wq = rq(Wf), Bq = rq(Bf), Xq = rq(Xf);
+    std::vector<float> Ref(B * out_dim, 0.0f);
+    for (int b = 0; b < B; ++b)
+        for (int o = 0; o < out_dim; ++o) {
+            double s = Bq[o];
+            for (int k = 0; k < in_dim; ++k)
+                s += static_cast<double>(Xq[b*in_dim+k]) * Wq[o*in_dim+k];
+            Ref[b*out_dim+o] = ref_linear_act(act, static_cast<float>(s));
+        }
+
+    Tensor W, Bb, X, Y;
+    auto Wh = to_fp16(Wf), Bh = to_fp16(Bf), Xh = to_fp16(Xf);
+    W  = Tensor::from_host_fp16_on(Device::CUDA, Wh.data(), out_dim, in_dim);
+    Bb = Tensor::from_host_fp16_on(Device::CUDA, Bh.data(), out_dim, 1);
+    X  = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(), B, in_dim);
+    brotensor::linear_forward_batched_fp16_act(W, &Bb, X, act, Y);
+    CHECK(Y.rows == B && Y.cols == out_dim && Y.dtype == Dtype::FP16);
+    std::vector<uint16_t> got(Y.size());
+    Y.copy_to_host_fp16(got.data());
+    brotensor::sync_all();
+    check_fp16(got, Ref, label);
+}
+
+static void test_linear_fp16_act() {
+    std::printf("  linear_forward_batched_fp16_act\n");
+    // WMMA store path: M*N>=256, K>=16, K%8==0, N%8==0 — exercises the fused
+    // epilogue in the vectorised store stage.
+    run_linear_act_case(16, 32, 24, brotensor::kLinearActRelu,      "wmma-relu");
+    run_linear_act_case(16, 32, 24, brotensor::kLinearActGeluTanh,  "wmma-gelu_tanh");
+    run_linear_act_case(16, 32, 24, brotensor::kLinearActSilu,      "wmma-silu");
+    run_linear_act_case(16, 32, 24, brotensor::kLinearActQuickGelu, "wmma-quick_gelu");
+    // Naive fallback path (K%8!=0) — same epilogue applied per element.
+    run_linear_act_case(5, 11, 7,   brotensor::kLinearActSilu,      "naive-silu");
+}
+
 static void test_elementwise_fp16() {
     std::printf("  elementwise fp16 (add/scale/mul inplace)\n");
     const int N = 128;
@@ -576,6 +636,7 @@ int main() {
     }
     std::printf("test_fp16_basics\n");
     test_linear_fp16();
+    test_linear_fp16_act();
     test_elementwise_fp16();
     test_concat_fp16();
     test_concat_nchw_channels_fp16();
