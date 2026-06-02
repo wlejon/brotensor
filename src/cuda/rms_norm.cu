@@ -20,6 +20,12 @@ constexpr int RMS_BLOCK = 256;
 
 __device__ inline float block_sum(float v, float* sdata) {
     const int tid = threadIdx.x;
+    // Barrier before reuse: the backward kernel calls block_sum twice sharing
+    // sdata, and without this a fast warp can overwrite sdata[0] before a slow
+    // warp finishes reading the previous reduction's result — a data race whose
+    // corruption surfaces as a bogus rrms (huge dX) once enough blocks are in
+    // flight (large batch). Harmless on the first call (sdata not yet read).
+    __syncthreads();
     sdata[tid] = v;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
