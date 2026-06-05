@@ -12,7 +12,7 @@ Built as a standalone sibling so multiple downstream projects (`brogameagent`, `
 
 A single `brotensor::Tensor` is a row-major `(rows, cols)` buffer carrying two runtime tags: a `Dtype` and a `Device` (CPU / CUDA / Metal). There is **no separate host/device tensor type**.
 
-`Dtype` is `FP32 / FP16 / BF16 / INT8 / INT32` plus the opaque GGUF block-quant carriers (`Q4_0 … Q8_K`). FP32/FP16/BF16 are the arithmetic dtypes ops dispatch on (BF16 is GPU-only; FP16/BF16 are stored as `uint16_t` bit patterns on the host). INT8/INT32 are pure storage carriers — INT8 backs weight-only quantised matmul/conv (W8A16), INT32 carries device-resident index/offset buffers; no arithmetic op dispatches on them. The GGUF quant dtypes are non-element-addressable block carriers (32-element legacy blocks, 256-element K-quant superblocks) consumed only by the GGUF dequant / fused-matmul ops. Element/block sizing is via `dtype_size_bytes` / `dtype_block_size` / `dtype_block_bytes` / `dtype_storage_bytes` / `dtype_is_quant`.
+`Dtype` is `FP32 / FP16 / BF16 / INT8 / INT32 / F64` plus the opaque GGUF block-quant carriers (`Q4_0 … Q8_K`). FP32/FP16/BF16 are the arithmetic dtypes ops dispatch on (BF16 is GPU-only; FP16/BF16 are stored as `uint16_t` bit patterns on the host). INT8/INT32/F64 are pure storage carriers — INT8 backs weight-only quantised matmul/conv (W8A16), INT32 carries device-resident index/offset buffers, F64 is a reserved 8-byte carrier; no arithmetic op dispatches on them. The GGUF quant dtypes are non-element-addressable block carriers (32-element legacy blocks, 256-element K-quant superblocks) consumed only by the GGUF dequant / fused-matmul ops. Element/block sizing is via `dtype_size_bytes` / `dtype_block_size` / `dtype_block_bytes` / `dtype_storage_bytes` / `dtype_is_quant`.
 
 Every op is device-neutral — `brotensor::linear_forward(W, b, x, y)` — and dispatches to the CPU, CUDA, or Metal backend by its operands' `Device` tag. No `_cpu` / `_gpu` suffixes, no overload set. A backend is a vtable of op + allocator function pointers registered at runtime: the CPU backend self-registers at static-init time and is always present; CUDA / Metal register inside `brotensor::init()` if they were compiled in and probe successfully. Calling an op the operands' backend doesn't implement throws `std::runtime_error`.
 
@@ -61,7 +61,7 @@ The rest are GPU-gated (built only with a CUDA or Metal backend):
 | `Tensor::to(Device)` | Returns a copy migrated to another backend; source unchanged. `clone()` is a device-preserving deep copy. |
 | `Tensor::view(Device, ptr, r, c)` | Non-owning view over an existing backend-resident pointer. |
 | `fp32_to_fp16_bits` / `fp16_bits_to_fp32` / `fp32_to_bf16_bits` / `bf16_bits_to_fp32` | Pure-CPU half/bfloat ↔ FP32 bit conversion (tests, small preprocessing). |
-| `brotensor::Device { CPU, CUDA, Metal }` / `Dtype { FP32, FP16, BF16, INT8, INT32, Q4_0…Q8_K }` | Runtime tags carried on every tensor. |
+| `brotensor::Device { CPU, CUDA, Metal }` / `Dtype { FP32, FP16, BF16, INT8, INT32, F64, Q4_0…Q8_K }` | Runtime tags carried on every tensor. |
 | `brotensor::init()` | Idempotent. Probes + registers the CUDA / Metal backends (CPU is always registered). |
 | `default_device()` / `set_default_device()` / `DeviceScope` / `compute_dtype()` | Where new `zeros`/`empty`/`from_host` tensors land (best-available: CUDA > Metal > CPU; overridable, also via the `BROTENSOR_DEFAULT_DEVICE` env var). `compute_dtype()` is the dtype a model loader should upload weights at for the current default device (FP32 on CPU, FP16 on a GPU). |
 | `available_devices()` / `is_available(Device)` | Backends registered in this binary at runtime. |
@@ -83,10 +83,10 @@ All ops are device-neutral and declared in the per-category headers under `<brot
 | `linear.h` | linear (single / batched / fp16 / fused-act-epilogue), matmul (+ bwd), W8A16 batched linear |
 | `norm.h` | LayerNorm (single + batched ±caches), RMSNorm, GroupNorm, BatchNorm (train/infer/bwd), per-head L2-norm (Gated DeltaNet), NCHW channel L2-normalize |
 | `conv.h` / `conv1d.h` | conv2d / conv3d (+ W8A16), conv_transpose2d, and the 1D family (conv1d wrappers, pad1d, conv_transpose1d, causal_conv1d + streaming update) — all with backward where applicable |
-| `rope.h` | RoPE forward/backward, rope_apply (explicit cos/sin tables) + bwd, M-RoPE (Qwen-VL three-axis) |
+| `rope.h` | RoPE forward/backward, rope_apply (explicit cos/sin tables, head-shared) + bwd, rope_apply_perhead (per-head cos/sin tables), M-RoPE (Qwen-VL three-axis) |
 | `delta_rule.h` | Gated Delta Rule linear attention — chunked prefill + streaming step |
 | `diffusion.h` | AdaLN modulate / broadcast_mul, fused ResBlock (+ W8A16, + bwd), DDIM / Euler / DPM++ 2M sampler steps, sinusoidal timestep embedding |
-| `spatial.h` | pad2d, slice2d, unfold2d (neighborhood im2col), window partition/reverse (SAM), spatial 2×2 patch merge (Qwen-VL), NCHW↔sequence transpose |
+| `spatial.h` | pad2d, slice2d, unfold2d (neighborhood im2col), window partition/reverse (SAM), spatial 2×2 patch merge (Qwen-VL block-major + `pixel_unshuffle` channel-major), NCHW↔sequence transpose |
 | `resize.h` | 2× nearest/bilinear up + 2× avg down (+ bwd), arbitrary-scale interp2d (nearest/bilinear/bicubic, half-pixel + align-corners), convex (RAFT) upsample, 1D resample |
 | `pooling.h` | masked mean-pool, 2× avg downsample, adaptive avg pool2d, max pool2d (+ index bwd) |
 | `embedding.h` | embedding lookup (+ scatter bwd), gather_rows / scatter_rows_add |
@@ -167,12 +167,12 @@ FP32 fwd/bwd columns below mirror the CPU surface; the FP16 column is the GPU-on
 | batch_norm | ✓ | ✓ | — | NCHW train/infer/bwd, running stats (pretrained ResNet/DETR backbones); FP32 |
 | l2_norm / l2_normalize_nchw | ✓ | ✓ (l2_norm) | ✓ | per-head q/k L2 (Gated DeltaNet) + channel-axis NCHW normalize (DSINE normals); FP32/FP16/BF16 |
 | gated_delta_rule | ✓ | n/a | ✓ | chunked prefill + streaming step (linear-attention text decoders); FP32/FP16, FP32 accumulators |
-| rope_apply / rope_apply_mrope | ✓ | ✓ (apply) | ✓ | explicit cos/sin tables (2D axial RoPE) + Qwen-VL three-axis M-RoPE |
+| rope_apply / rope_apply_perhead / rope_apply_mrope | ✓ | ✓ (apply) | ✓ | explicit cos/sin tables (2D axial RoPE), head-shared or per-head; + Qwen-VL three-axis M-RoPE; FP32/FP16/BF16 (perhead/mrope are inference-only, no bwd) |
 | self_attention_bias | ✓ | n/a | ✓ | additive pre-softmax bias (T5 rel-pos / ALiBi); FP32/FP16/BF16; W8A16 variant GPU-only |
 | decomposed_rel_pos (± windowed) | ✓ | n/a | ✓ | SAM/ViTDet data-dependent 2D rel-pos attention; FP32/FP16/BF16 |
 | modulate / broadcast_mul | ✓ | n/a | ✓ | AdaLN affine + per-channel gate (DiT/SD3/Flux); FP32/FP16/BF16 |
 | pad2d / slice2d / unfold2d | ✓ | ✓ (pad/slice) | ✓ | image pad (zero/reflect/replicate), crop, neighborhood im2col |
-| window_partition / spatial_merge | ✓ | n/a | ✓ | SAM window tiling (+ reverse) and Qwen-VL 2×2 patch merge |
+| window_partition / spatial_merge | ✓ | n/a | ✓ | SAM window tiling (+ reverse) and 2×2 patch merge (Qwen-VL block-major / `pixel_unshuffle` channel-major, e.g. Flux.2 VAE) |
 | interp2d / convex_upsample | ✓ | ✓ (interp) | ✓ | arbitrary-scale resize (nearest/bilinear/bicubic, half-pixel + align-corners) + RAFT convex upsample |
 | max_pool2d / adaptive_avg_pool2d | ✓ | ✓ | — | indexed max-pool bwd + PyTorch adaptive avg pool; FP32 (CPU+CUDA) |
 | gather_rows / scatter_rows_add | ✓ | ✓ | — | index-driven row gather/scatter (SAM prompt encoder, DETR queries); FP32 |
