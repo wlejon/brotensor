@@ -718,6 +718,23 @@ void conv2d_backward_bias(const Tensor& dY,
     v.conv2d_backward_bias(dY, N, C_out, H_out, W_out, dB);
 }
 
+void deform_conv2d_forward(const Tensor& X, const Tensor& offset,
+                           const Tensor* mask, const Tensor& Wt,
+                           const Tensor* bias,
+                           int N, int C_in, int H, int W,
+                           int C_out, int kH, int kW,
+                           int stride_h, int stride_w,
+                           int pad_h, int pad_w,
+                           int dil_h, int dil_w,
+                           int groups, int deform_groups, Tensor& Y) {
+    const auto& v = detail::dispatch_with_opts(X, Wt, {&offset, mask, bias, &Y});
+    if (!v.deform_conv2d_forward) detail::throw_not_implemented("deform_conv2d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.deform_conv2d_forward(X, offset, mask, Wt, bias, N, C_in, H, W,
+                            C_out, kH, kW, stride_h, stride_w, pad_h, pad_w,
+                            dil_h, dil_w, groups, deform_groups, Y);
+}
+
 // ─── Conv3d ────────────────────────────────────────────────────────────────
 
 void conv3d_forward(const Tensor& X, const Tensor& Wt, const Tensor* bias,

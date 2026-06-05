@@ -91,6 +91,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/rope.cpp
     src/cpu/rms_norm.cpp
     src/cpu/conv2d.cpp
+    src/cpu/deform_conv2d.cpp
     src/cpu/conv3d.cpp
     src/cpu/group_norm.cpp
     src/cpu/resample.cpp
@@ -164,6 +165,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/batched_ops.cu
         src/cuda/conv2d.cu
         src/cuda/conv2d_wmma.cu
+        src/cuda/deform_conv2d.cu
         src/cuda/conv_transpose2d.cu
         src/cuda/conv3d.cu
         src/cuda/conv2d_int8w_wmma.cu

@@ -132,6 +132,40 @@ void conv2d_backward_bias(const Tensor& dY,
                           Tensor& dB);
 
 
+// Modulated deformable 2D convolution forward — torchvision `deform_conv2d`
+// (Deformable ConvNets v2), NCHW, forward/inference only. Each output pixel's
+// kH×kW sampling grid is shifted per-tap by a learned `offset` field and
+// (optionally) reweighted by a learned `mask` modulator; taps are bilinearly
+// sampled from X with ZERO padding outside the input (torchvision convention).
+//   X:      (N, C_in*H*W).
+//   offset: (N, deform_groups*2*kH*kW * H_out*W_out). Channel-major within a
+//           batch row: channel = grp*(2*kH*kW) + 2*(kh*kW+kw) [+1 for the col
+//           axis], then (H_out,W_out). Channel 2*(kh*kW+kw) is the ROW (y)
+//           offset, +1 the COL (x) offset — matches an offset_conv whose output
+//           channels are laid out (deform_groups, 2, kH, kW).
+//   mask:   (N, deform_groups*kH*kW * H_out*W_out) or null. null == plain
+//           deformable conv (all modulators 1). Channel grp*(kH*kW)+(kh*kW+kw).
+//   Wt:     (C_out, (C_in/groups)*kH*kW)  OIHW (same layout as conv2d_forward).
+//   bias:   (C_out,1) or null.
+//   Y:      (N, C_out*H_out*W_out), resized + dtype-set to match X.
+//   groups divides C_in and C_out (regular conv grouping); deform_groups
+//   divides C_in (offset/mask grouping). H_out/W_out follow the conv2d formula.
+// Dispatched FP32/FP16 on X.dtype (CPU is FP32-only); FP32 accumulation. No
+// backward (an inference op — BiRefNet's ASPP-deformable decoder).
+void deform_conv2d_forward(const Tensor& X,
+                           const Tensor& offset,
+                           const Tensor* mask,
+                           const Tensor& Wt,
+                           const Tensor* bias,
+                           int N, int C_in, int H, int W,
+                           int C_out, int kH, int kW,
+                           int stride_h, int stride_w,
+                           int pad_h, int pad_w,
+                           int dil_h, int dil_w,
+                           int groups, int deform_groups,
+                           Tensor& Y);
+
+
 // 3D convolution, NCTHW (forward only). Dispatched on X.dtype (FP32/FP16/BF16
 // on GPU; CPU is FP32-only). FP32 accumulation.
 //   X:    (N, C_in*T*H*W).
