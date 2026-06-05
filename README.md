@@ -2,15 +2,17 @@
 
 Tensor + ops library. One tensor type, one flat `brotensor::` namespace, three backends — CPU (always built), CUDA and Metal (optional, additive) — selected at runtime per tensor.
 
-Forward + backward primitives for dense layers, elementwise activations, softmax, layernorm/RMSNorm, attention (single + multi-head + flash), embedding lookup, concat/split, SGD + Adam, MSE + cross-entropy, plus batched inference variants. The GPU backends add an FP16 precision path, a diffusion-oriented op set (conv2d, GroupNorm, SiLU/GELU, 2× up/downsample, cross-attention, fused DDIM/Euler/DPM++ 2M sampler steps, sinusoidal timestep embedding) for downstream `brodiffusion` inference (SD 1.5 + SDXL), LLM-oriented primitives (RoPE, RMSNorm, SwiGLU, KV-cache append + causal flash-decode) for autoregressive inference, and INT8 weight-only matmul/conv2d (W8A16) for memory-bound deployment.
+Forward + backward primitives for dense layers, elementwise activations, GLU gates (GEGLU/SwiGLU), softmax, LayerNorm/RMSNorm/GroupNorm/BatchNorm, attention (single + multi-head + flash + windowed + var-length + decomposed-rel-pos + T5/ALiBi bias), RoPE / M-RoPE, embedding/gather, concat/split, conv1d/2d/3d (+ transposed), pooling, resampling, SGD + Adam, MSE + cross-entropy + BCE, plus batched-inference variants. CPU runs the whole forward+backward surface in FP32. The GPU backends add an FP16 (and BF16) precision path, a diffusion-oriented op set (conv2d, GroupNorm, SiLU/GELU, 2× up/downsample, cross-attention, AdaLN modulate, fused DDIM/Euler/DPM++ 2M sampler steps, sinusoidal timestep embedding) for downstream `brodiffusion` inference (SD 1.5 + SDXL + DiT), LLM-oriented primitives (RoPE, RMSNorm, SwiGLU, KV-cache append + causal flash-decode with GQA, Gated DeltaNet linear attention) for autoregressive inference, INT8 weight-only matmul/conv (W8A16), and GGUF block-quant GEMV/GEMM (Q4_K / Q6_K / Q8_0, W4/6/8-A16) for memory-bound deployment.
 
-An FP32 **audio-ML op family** — FFT/STFT spectral core, 1D convolution (incl. transposed + streaming), vocoder/codec activations, codec quantization, resampling, and an autoregressive logit sampler — runs on all three backends for downstream `brosoundml` (TTS / STT / neural-codec) inference.
+An FP32 **audio-ML op family** — FFT/STFT spectral core, 1D convolution (incl. transposed + streaming), vocoder/codec activations, codec quantization, resampling, and an autoregressive logit sampler — runs on all three backends for downstream `brosoundml` (TTS / STT / neural-codec) inference. A growing set of **vision primitives** (image normalize, NHWC→NCHW, conv3d, window partition, spatial 2×2 merge, decomposed-rel-pos attention, adaptive/max pool, arbitrary-scale interp2d, convex upsample) backs `brovisionml` and the Qwen-VL/SAM-style backbones.
 
-Built as a standalone sibling so multiple downstream projects (`brogameagent`, `brodiffusion`, …) share one tensor layer. Both vendor it in as an `add_subdirectory` dependency — no system deps, no release process.
+Built as a standalone sibling so multiple downstream projects (`brogameagent`, `brodiffusion`, `brolm`, `brosoundml`, `brovisionml`, …) share one tensor layer. Each vendors it in as an `add_subdirectory` dependency — no system deps, no release process.
 
 ## Model
 
-A single `brotensor::Tensor` is a row-major `(rows, cols)` buffer carrying two runtime tags: a `Dtype` (FP32 / FP16 / INT8 / INT32) and a `Device` (CPU / CUDA / Metal). There is **no separate host/device tensor type**.
+A single `brotensor::Tensor` is a row-major `(rows, cols)` buffer carrying two runtime tags: a `Dtype` and a `Device` (CPU / CUDA / Metal). There is **no separate host/device tensor type**.
+
+`Dtype` is `FP32 / FP16 / BF16 / INT8 / INT32` plus the opaque GGUF block-quant carriers (`Q4_0 … Q8_K`). FP32/FP16/BF16 are the arithmetic dtypes ops dispatch on (BF16 is GPU-only; FP16/BF16 are stored as `uint16_t` bit patterns on the host). INT8/INT32 are pure storage carriers — INT8 backs weight-only quantised matmul/conv (W8A16), INT32 carries device-resident index/offset buffers; no arithmetic op dispatches on them. The GGUF quant dtypes are non-element-addressable block carriers (32-element legacy blocks, 256-element K-quant superblocks) consumed only by the GGUF dequant / fused-matmul ops. Element/block sizing is via `dtype_size_bytes` / `dtype_block_size` / `dtype_block_bytes` / `dtype_storage_bytes` / `dtype_is_quant`.
 
 Every op is device-neutral — `brotensor::linear_forward(W, b, x, y)` — and dispatches to the CPU, CUDA, or Metal backend by its operands' `Device` tag. No `_cpu` / `_gpu` suffixes, no overload set. A backend is a vtable of op + allocator function pointers registered at runtime: the CPU backend self-registers at static-init time and is always present; CUDA / Metal register inside `brotensor::init()` if they were compiled in and probe successfully. Calling an op the operands' backend doesn't implement throws `std::runtime_error`.
 
@@ -30,7 +32,9 @@ cmake -B build -DBROTENSOR_WITH_METAL=ON
 cmake --build build --config Release
 ```
 
-CPU is always built. CUDA and Metal are additive and mutually exclusive — at most one GPU backend per binary. `BROTENSOR_HAS_CUDA` / `BROTENSOR_HAS_METAL` are set per backend; `BROTENSOR_HAS_GPU` is the umbrella. Most code never needs them — the unified `Tensor` and op surface compile identically regardless of backend; reach for the defines only to gate a path that genuinely needs a GPU device present.
+CPU is always built. CUDA and Metal are additive; CMake no longer forbids enabling both, but they stay exclusive in practice because their toolchains (nvcc vs. the Apple toolchain) don't coexist on one host — so at most one GPU backend per binary. `BROTENSOR_HAS_CUDA` / `BROTENSOR_HAS_METAL` are set per backend; `BROTENSOR_HAS_GPU` is the umbrella. Most code never needs them — the unified `Tensor` and op surface compile identically regardless of backend; reach for the defines only to gate a path that genuinely needs a GPU device present.
+
+Each backend compiles as its own static library (`brotensor_core`, `brotensor_cpu`, `brotensor_cuda`, `brotensor_metal`) and self-registers into the dispatcher; the consumed `brotensor::brotensor` INTERFACE target whole-archives the backend libs so their registration TUs survive the link.
 
 ## Tests
 
@@ -38,11 +42,13 @@ CPU is always built. CUDA and Metal are additive and mutually exclusive — at m
 ctest --test-dir build -C Release
 ```
 
-`test_cpu_ops.cpp` and `test_dispatch.cpp` are CPU-only and always built. The rest are GPU-gated (built only with a CUDA or Metal backend):
+A large set of tests is **always built** (CPU-only): `test_cpu_ops.cpp`, `test_dispatch.cpp`, plus standalone CPU coverage for the safetensors / GGUF loaders, BF16 basics, the audio family (fft, stft, conv1d, vocoder activations, codec quant, resample1d, log/exp/round, sample_logits, noise), and the newer CPU op families (conv3d, gated_delta_rule, spatial_merge, rope_mrope, interp2d, pad2d/slice2d, top_k, pool2d, gather_rows, conv_transpose2d, window_partition, batch_norm, image_preproc, bce_with_logits, flash_attention_varlen, self_attention_decomposed_rel_pos).
+
+The rest are GPU-gated (built only with a CUDA or Metal backend):
 
 - `test_cpu_gpu_parity.cpp` — monolithic CPU↔GPU parity.
-- `test_*_parity.cpp` — per-op CPU↔GPU parity suite, one executable per op group (linear, elementwise, softmax, layernorm, attention, optim, adam, reduce, loss, embedding, concat, mha, batched), sharing the `parity_helpers.h` harness. Each runs the same device-neutral op on CPU- and GPU-resident tensors and asserts the results match.
-- Diffusion / LLM kernels (conv2d, group_norm, flash attention, RoPE, INT8, …) have dedicated GPU smoke tests.
+- `test_*_parity.cpp` — per-op CPU↔GPU parity suite, one executable per op group, sharing the `parity_helpers.h` harness. Each runs the same device-neutral op on CPU- and GPU-resident tensors and asserts the results match.
+- Diffusion / LLM / vision / INT8 / GGUF-quant kernels have dedicated GPU smoke tests (conv2d, group_norm, flash attention, RoPE, int8 linear/conv WMMA, q4k/q6k/q8_0 parity, SDXL schedulers, …).
 
 ## API surface
 
@@ -51,39 +57,55 @@ ctest --test-dir build -C Release
 | `brotensor::Tensor` | Row-major `(rows, cols)` buffer with runtime `Dtype` + `Device` tags. Copyable (device-aware deep copy) + movable. |
 | `Tensor::mat(r,c)` / `Tensor::vec(n)` | Zero-filled FP32 **host** (CPU) factories — build params on the host, then migrate. |
 | `Tensor::zeros[_on]` / `empty[_on]` | Allocate on the default device (or an explicit one). `zeros` zero-fills; `empty` and `resize()` leave contents **undefined**. |
-| `Tensor::from_host[_on]` / `to_host_vector` / `copy_to_host` | Host↔device bootstrap and readback (FP32 + FP16 variants). |
+| `Tensor::from_host[_on]` / `to_host_vector` / `copy_to_host` | Host↔device bootstrap and readback (FP32 / FP16 / BF16 / INT8 variants). |
 | `Tensor::to(Device)` | Returns a copy migrated to another backend; source unchanged. `clone()` is a device-preserving deep copy. |
 | `Tensor::view(Device, ptr, r, c)` | Non-owning view over an existing backend-resident pointer. |
-| `brotensor::Device { CPU, CUDA, Metal }` / `Dtype { FP32, FP16, INT8, INT32 }` | Runtime tags carried on every tensor. |
+| `fp32_to_fp16_bits` / `fp16_bits_to_fp32` / `fp32_to_bf16_bits` / `bf16_bits_to_fp32` | Pure-CPU half/bfloat ↔ FP32 bit conversion (tests, small preprocessing). |
+| `brotensor::Device { CPU, CUDA, Metal }` / `Dtype { FP32, FP16, BF16, INT8, INT32, Q4_0…Q8_K }` | Runtime tags carried on every tensor. |
 | `brotensor::init()` | Idempotent. Probes + registers the CUDA / Metal backends (CPU is always registered). |
-| `default_device()` / `set_default_device()` / `DeviceScope` | Where new `zeros`/`empty`/`from_host` tensors land (best-available: CUDA > Metal > CPU; overridable, also via the `BROTENSOR_DEFAULT_DEVICE` env var). |
+| `default_device()` / `set_default_device()` / `DeviceScope` / `compute_dtype()` | Where new `zeros`/`empty`/`from_host` tensors land (best-available: CUDA > Metal > CPU; overridable, also via the `BROTENSOR_DEFAULT_DEVICE` env var). `compute_dtype()` is the dtype a model loader should upload weights at for the current default device (FP32 on CPU, FP16 on a GPU). |
 | `available_devices()` / `is_available(Device)` | Backends registered in this binary at runtime. |
 | `sync(Device)` / `sync_all()` | Drain pending backend work (no-op on CPU). |
-| `<brotensor/ops.h>` | The device-neutral op surface; every op dispatches on its operands' `Device`. |
+| `<brotensor/ops.h>` | The device-neutral op surface (umbrella over the per-category headers in `<brotensor/ops/>`); every op dispatches on its operands' `Device`. |
+| `<brotensor/safetensors.h>` / `<brotensor/gguf.h>` | mmap'd zero-copy weight loaders → `Tensor`. safetensors reads/writes F32/F16/BF16/I32/…; GGUF reads metadata + F32/F16 and the Q4_K/Q6_K/Q8_0 block-quant carriers. |
 
 Backends throw plain `std::runtime_error` (`"brotensor: <op>: <reason>"`) for precondition / dispatch failures.
 
 ## Op coverage
 
-All ops live in `<brotensor/ops.h>` and are device-neutral. The **CPU backend** implements the dense / attention / loss / optimizer subset that drives autograd-free training (FP32 only). The **CUDA and Metal backends** additionally implement the FP16 / INT8 precision paths, batched-inference variants, and the diffusion / LLM kernel set. A separate FP32 [audio op family](#audio-op-family) is implemented on **all three** backends.
+All ops are device-neutral and declared in the per-category headers under `<brotensor/ops/>` (the `ls` of that directory is the table of contents; `<brotensor/ops.h>` is an umbrella that includes them all):
 
-### CPU backend
-
-FP32 only — scalar, autovectorize-friendly loops; the simple, correct fallback. Forward + backward for:
-
-| Group | Ops |
+| Header | Surface |
 |---|---|
-| Dense | `linear` (single + batched) |
-| Activations | `relu` / `tanh` / `sigmoid` (single + batched), `add_inplace` / `add_scalar_inplace` / `scale_inplace` |
-| Attention | `softmax`, `layernorm`, `attention` (single-head), `mha` (multi-head) |
-| Pooling | `masked_mean_pool`, `build_slot_mask` |
-| Loss | `softmax_xent` (+ `_segment`, `_fused_batched`), `mse_scalar`, `mse_vec_per_sample` |
-| Optimizers | `sgd_step`, `adam_step` |
-| Plumbing | `concat_rows` / `split_rows`, `copy_d2d`, `xavier_init` |
+| `activation.h` | relu / tanh / sigmoid, silu, gelu (tanh-approx / exact / quick), GEGLU / GEGLU-exact / SwiGLU, snake (BigVGAN/DAC), elu (EnCodec), leaky_relu (HiFi-GAN) |
+| `attention.h` | single-head attention, MHA (optional biases), self/cross attention (train + flash), cross-attention with head-avg map + logit bias, attention token moments, self-attention with T5/ALiBi additive bias, SAM/ViTDet decomposed-rel-pos (incl. windowed), W8A16 bias-attention |
+| `flash_attention.h` | tiled flash attention (+ bare-core bwd), windowed (sliding-window causal), packed var-length (+ bwd), fused QKV+O projections (+ bwd), project-KV / Q-with-cached-KV, KV-cache append, causal flash-decode (GQA), W8A16 variants |
+| `linear.h` | linear (single / batched / fp16 / fused-act-epilogue), matmul (+ bwd), W8A16 batched linear |
+| `norm.h` | LayerNorm (single + batched ±caches), RMSNorm, GroupNorm, BatchNorm (train/infer/bwd), per-head L2-norm (Gated DeltaNet), NCHW channel L2-normalize |
+| `conv.h` / `conv1d.h` | conv2d / conv3d (+ W8A16), conv_transpose2d, and the 1D family (conv1d wrappers, pad1d, conv_transpose1d, causal_conv1d + streaming update) — all with backward where applicable |
+| `rope.h` | RoPE forward/backward, rope_apply (explicit cos/sin tables) + bwd, M-RoPE (Qwen-VL three-axis) |
+| `delta_rule.h` | Gated Delta Rule linear attention — chunked prefill + streaming step |
+| `diffusion.h` | AdaLN modulate / broadcast_mul, fused ResBlock (+ W8A16, + bwd), DDIM / Euler / DPM++ 2M sampler steps, sinusoidal timestep embedding |
+| `spatial.h` | pad2d, slice2d, unfold2d (neighborhood im2col), window partition/reverse (SAM), spatial 2×2 patch merge (Qwen-VL), NCHW↔sequence transpose |
+| `resize.h` | 2× nearest/bilinear up + 2× avg down (+ bwd), arbitrary-scale interp2d (nearest/bilinear/bicubic, half-pixel + align-corners), convex (RAFT) upsample, 1D resample |
+| `pooling.h` | masked mean-pool, 2× avg downsample, adaptive avg pool2d, max pool2d (+ index bwd) |
+| `embedding.h` | embedding lookup (+ scatter bwd), gather_rows / scatter_rows_add |
+| `concat.h` | concat/split rows, batched column-block concat, NCHW channel concat (+ bwd), copy_d2d |
+| `reduction.h` | sum_rows / sum_cols, argmax_rows, top_k_rows |
+| `loss.h` | softmax (+ bwd), softmax-xent (+ segment / fused / fused-batched), MSE (vec / scalar / per-sample), BCE-with-logits fused-batched |
+| `optim.h` | sgd_step, adam_step, xavier_init |
+| `elementwise.h` | add / scale / clamp / mul-inplace, dtype `cast` (FP32↔FP16/BF16), log / exp / round (+ bwd) |
+| `sampling.h` | `sample_logits` (temperature / top-k / top-p / greedy), Philox RNG (`randn` / `rand_uniform` / `rand_bernoulli` / `randn_truncated`) |
+| `spectral.h` | complex ops, FFT/iFFT, rFFT/irFFT (+ bwd), STFT/iSTFT (+ bwd) |
+| `codec.h` | VQ encode (RVQ codeword search) + FSQ quantize (NanoCodec), straight-through bwd |
+| `quant.h` | W8A16 host quantizer + matmul, GGUF Q4_K / Q6_K / Q8_0 dequant + fused GEMV + batched matmul |
+| `image.h` | per-channel image normalize, uint8 HWC → FP32 NCHW |
 
-This is the code path `brogameagent`'s hand-crafted ExIt circuits use by default; FP16 / INT8 / diffusion / LLM ops are GPU-only by design.
+**Backend coverage.** The **CPU backend** implements essentially the entire FP32 surface — forward *and* backward, including the diffusion samplers, flash attention, the audio family, and the vision primitives — as the simple, correct, autovectorize-friendly fallback. CPU is **FP32-only by design**: it leaves the FP16 / BF16 / INT8-W8A16 / GGUF-quant vtable slots null, and the dispatcher throws `"brotensor: <op>: not implemented on CPU"` if you call one. The **CUDA and Metal backends** add the FP16 (and BF16) precision paths, batched-inference variants, the W8A16 and GGUF block-quant kernels, and a handful of GPU-only fused kernels. A few inference-only ops are CPU+CUDA but leave the Metal slot null (noted below). The [audio op family](#audio-op-family) is FP32 on **all three** backends with per-family CPU↔GPU parity tests.
 
 ### GPU backends (CUDA / Metal)
+
+FP32 fwd/bwd columns below mirror the CPU surface; the FP16 column is the GPU-only precision path (BF16 follows FP16 where the kernel lists it). INT8-W8A16 and GGUF-quant ops are GPU-only.
 
 | Op | FP32 fwd | FP32 bwd | FP16 fwd | Notes |
 |---|---|---|---|---|
@@ -110,7 +132,9 @@ This is the code path `brogameagent`'s hand-crafted ExIt circuits use by default
 | self_attention | ✓ | ✓ | ✓ | FP32 = training (caches exposed via `_train`); FP16 = flash inference |
 | cross_attention | ✓ | ✓ | ✓ | FP32 = training (caches exposed via `_train`, rectangular Wk/Wv); FP16 = flash inference |
 | flash_attention | — | ✓ | ✓ | tiled online-softmax, Lk-unbounded, optional causal; FP16 backward via recompute returns dQ/dK/dV (no fwd-time caches). Bare-core bwd enables LoRA training when projections live outside the attention call. |
-| flash_attention_qkvo | — | — | ✓ (fwd) / ✓ (bwd) | fused Q/K/V/O projections + biases; rectangular Wk/Wv for cross-attn; optional causal; verified at SD1.5 U-Net head_dims (40/80/160) and CLIP head_dim 64. FP16 backward via recompute (no fwd-time caches); CUDA only — Metal bwd throws. **W8A16 variant** (`flash_attention_qkvo_int8w_fp16`) routes all four projections through `linear_forward_batched_int8w_fp16`; attention core stays FP16 |
+| flash_attention_qkvo | — | — | ✓ (fwd) / ✓ (bwd) | fused Q/K/V/O projections + biases; rectangular Wk/Wv for cross-attn; optional causal; verified at SD1.5 U-Net head_dims (40/80/160) and CLIP head_dim 64. FP16 backward via recompute (no fwd-time caches); registered on CUDA **and** Metal (and the FP32 path on CPU). **W8A16 variant** (`flash_attention_qkvo_int8w_fp16`) routes all four projections through `linear_forward_batched_int8w_fp16`; attention core stays FP16 |
+| flash_attention_varlen | — | ✓ (bwd) | ✓ | packed variable-length MHA (Qwen-VL window attn); per-sequence boundaries from `cu_seqlens` INT32 prefix-sum buffers; optional per-sequence causal; recompute-based backward returns dQ/dK/dV |
+| flash_attention_windowed | ✓ | — | — | sliding-window causal self-attention (streaming codecs / decode); window ≤ 0 is unbounded causal; FP32 (CPU + GPU) |
 | flash_attention_project_kv | — | — | ✓ | pre-project ctx → K/V for cached cross-attention (SD timesteps reuse). W8A16 variant available |
 | flash_attention_q_with_kv_cached | — | — | ✓ | forward against pre-projected K/V; bitwise-equivalent to `flash_attention_qkvo`'s cached path. W8A16 variant available |
 | flash_attention_decode | — | — | ✓ | causal-aware decode against a partially-filled K/V cache; supports `L_q ≥ 1` (token-by-token or chunked) |
@@ -137,11 +161,28 @@ This is the code path `brogameagent`'s hand-crafted ExIt circuits use by default
 | copy_d2d | ✓ | n/a | ✓ | flat-buffer device-to-device chunk copy |
 | build_causal_mask_row | n/a | n/a | ✓ | length-L FP32 mask, CLIP text |
 | sgd / adam | ✓ | n/a | — | optimizer steps |
-| mse / softmax-xent | ✓ | ✓ | — | per-sample + batched |
+| mse / softmax-xent / bce | ✓ | ✓ | — | per-sample + batched (BCE-with-logits fused-batched added) |
+| conv3d | ✓ | — | ✓ | NCTHW (forward only), grouped, FP32/FP16/BF16; W8A16 `conv3d_int8w_fp16` for Qwen-VL patch-embed (GPU-only) |
+| conv_transpose1d / 2d | ✓ | ✓ | — | learned upsample (vocoders, SAM mask decoder, DPT heads); FP32 on CPU+CUDA |
+| batch_norm | ✓ | ✓ | — | NCHW train/infer/bwd, running stats (pretrained ResNet/DETR backbones); FP32 |
+| l2_norm / l2_normalize_nchw | ✓ | ✓ (l2_norm) | ✓ | per-head q/k L2 (Gated DeltaNet) + channel-axis NCHW normalize (DSINE normals); FP32/FP16/BF16 |
+| gated_delta_rule | ✓ | n/a | ✓ | chunked prefill + streaming step (linear-attention text decoders); FP32/FP16, FP32 accumulators |
+| rope_apply / rope_apply_mrope | ✓ | ✓ (apply) | ✓ | explicit cos/sin tables (2D axial RoPE) + Qwen-VL three-axis M-RoPE |
+| self_attention_bias | ✓ | n/a | ✓ | additive pre-softmax bias (T5 rel-pos / ALiBi); FP32/FP16/BF16; W8A16 variant GPU-only |
+| decomposed_rel_pos (± windowed) | ✓ | n/a | ✓ | SAM/ViTDet data-dependent 2D rel-pos attention; FP32/FP16/BF16 |
+| modulate / broadcast_mul | ✓ | n/a | ✓ | AdaLN affine + per-channel gate (DiT/SD3/Flux); FP32/FP16/BF16 |
+| pad2d / slice2d / unfold2d | ✓ | ✓ (pad/slice) | ✓ | image pad (zero/reflect/replicate), crop, neighborhood im2col |
+| window_partition / spatial_merge | ✓ | n/a | ✓ | SAM window tiling (+ reverse) and Qwen-VL 2×2 patch merge |
+| interp2d / convex_upsample | ✓ | ✓ (interp) | ✓ | arbitrary-scale resize (nearest/bilinear/bicubic, half-pixel + align-corners) + RAFT convex upsample |
+| max_pool2d / adaptive_avg_pool2d | ✓ | ✓ | — | indexed max-pool bwd + PyTorch adaptive avg pool; FP32 (CPU+CUDA) |
+| gather_rows / scatter_rows_add | ✓ | ✓ | — | index-driven row gather/scatter (SAM prompt encoder, DETR queries); FP32 |
+| top_k_rows | ✓ | n/a | — | per-row top-k values + indices; FP32 |
+| randn / rand_uniform / rand_bernoulli / randn_truncated | ✓ | n/a | — | Philox 4×32-10 RNG, PyTorch/JAX-compatible, FP32, all three backends |
+| GGUF Q4_K / Q6_K / Q8_0 | — | — | ✓ | block-quant dequant + fused GEMV + batched matmul (W4/6/8-A16); CUDA WMMA fast paths, GEMV fallback; registered on CUDA **and** Metal |
 
 ### Audio op family
 
-An FP32 op family for TTS / STT / neural-codec inference, consumed by the `brosoundml` sibling. Unlike the FP16 / INT8 / diffusion / LLM kernels, these are implemented on **all three backends** — CPU, CUDA, and Metal — FP32 throughout, with per-family CPU↔GPU parity tests.
+An FP32 op family for TTS / STT / neural-codec inference, consumed by the `brosoundml` sibling. Like the rest of the FP32 surface these are implemented on **all three backends** — CPU, CUDA, and Metal — FP32 throughout, with per-family CPU↔GPU parity tests.
 
 | Group | Ops |
 |---|---|
