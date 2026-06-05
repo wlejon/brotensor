@@ -166,6 +166,34 @@ __global__ void rope_apply_fwd_kernel(const T* __restrict__ X,
     }
 }
 
+// Per-head variant: cos/sin tables are (L*num_heads, head_dim/2), one angle per
+// (row, head, pair) — table row (row*num_heads + h).
+template <typename T>
+__global__ void rope_apply_perhead_fwd_kernel(const T* __restrict__ X,
+                                              const float* __restrict__ cos_tbl,
+                                              const float* __restrict__ sin_tbl,
+                                              T* __restrict__ Y,
+                                              int L, int num_heads, int head_dim) {
+    const int half = head_dim / 2;
+    const int total = L * num_heads * half;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += blockDim.x * gridDim.x) {
+        const int i    = idx % half;
+        const int rest = idx / half;
+        const int h    = rest % num_heads;
+        const int row  = rest / num_heads;
+        const int tbl  = (row * num_heads + h) * half + i;
+        const float c  = cos_tbl[tbl];
+        const float s  = sin_tbl[tbl];
+        const int D    = num_heads * head_dim;
+        const int base_off = row * D + h * head_dim;
+        const float x0 = rp_ld(X[base_off + 2 * i]);
+        const float x1 = rp_ld(X[base_off + 2 * i + 1]);
+        rp_st(Y[base_off + 2 * i],     x0 * c - x1 * s);
+        rp_st(Y[base_off + 2 * i + 1], x0 * s + x1 * c);
+    }
+}
+
 template <typename T>
 __global__ void rope_apply_bwd_kernel(const T* __restrict__ dY,
                                       const float* __restrict__ cos_tbl,
@@ -314,6 +342,59 @@ void rope_apply(const ::brotensor::Tensor& X, const ::brotensor::Tensor& cos_tbl
         break;
     default:  // BF16
         rope_apply_fwd_kernel<__nv_bfloat16><<<blocks, RP_BLOCK>>>(
+            static_cast<const __nv_bfloat16*>(X.data), cos_p, sin_p,
+            static_cast<__nv_bfloat16*>(Y.data), L, num_heads, head_dim);
+        break;
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void rope_apply_perhead(const ::brotensor::Tensor& X,
+                        const ::brotensor::Tensor& cos_tbl,
+                        const ::brotensor::Tensor& sin_tbl,
+                        int head_dim, int num_heads, ::brotensor::Tensor& Y) {
+    if (head_dim <= 0 || (head_dim & 1) != 0) {
+        throw std::runtime_error("rope_apply_perhead: head_dim must be a positive even integer");
+    }
+    if (num_heads <= 0) {
+        throw std::runtime_error("rope_apply_perhead: num_heads must be positive");
+    }
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("rope_apply_perhead: X must be FP32, FP16, or BF16");
+    }
+    if (X.cols != num_heads * head_dim) {
+        throw std::runtime_error("rope_apply_perhead: X.cols != num_heads * head_dim");
+    }
+    const int L = X.rows;
+    const int half = head_dim / 2;
+    if (cos_tbl.dtype != Dtype::FP32 || sin_tbl.dtype != Dtype::FP32) {
+        throw std::runtime_error("rope_apply_perhead: cos_tbl / sin_tbl must be FP32");
+    }
+    if (cos_tbl.size() != L * num_heads * half || sin_tbl.size() != L * num_heads * half) {
+        throw std::runtime_error(
+            "rope_apply_perhead: cos_tbl / sin_tbl must each be (L*num_heads, head_dim/2)");
+    }
+    if (Y.rows != L || Y.cols != X.cols || Y.dtype != X.dtype) {
+        Y.resize(L, X.cols, X.dtype);
+    }
+    const int total = L * num_heads * half;
+    if (total == 0) return;
+    const int blocks = grid_for(total);
+    const float* cos_p = static_cast<const float*>(cos_tbl.data);
+    const float* sin_p = static_cast<const float*>(sin_tbl.data);
+    switch (X.dtype) {
+    case Dtype::FP32:
+        rope_apply_perhead_fwd_kernel<float><<<blocks, RP_BLOCK>>>(
+            static_cast<const float*>(X.data), cos_p, sin_p,
+            static_cast<float*>(Y.data), L, num_heads, head_dim);
+        break;
+    case Dtype::FP16:
+        rope_apply_perhead_fwd_kernel<__half><<<blocks, RP_BLOCK>>>(
+            static_cast<const __half*>(X.data), cos_p, sin_p,
+            static_cast<__half*>(Y.data), L, num_heads, head_dim);
+        break;
+    default:  // BF16
+        rope_apply_perhead_fwd_kernel<__nv_bfloat16><<<blocks, RP_BLOCK>>>(
             static_cast<const __nv_bfloat16*>(X.data), cos_p, sin_p,
             static_cast<__nv_bfloat16*>(Y.data), L, num_heads, head_dim);
         break;

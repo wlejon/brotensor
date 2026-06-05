@@ -464,6 +464,8 @@
     X(broadcast_mul,                           void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& v, ::brotensor::Tensor& Y))         \
     X(rope_apply,                              void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& cos_tbl,                                                  \
                                                        const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads, ::brotensor::Tensor& Y))                         \
+    X(rope_apply_perhead,                      void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& cos_tbl,                                                  \
+                                                       const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads, ::brotensor::Tensor& Y))                         \
     X(rope_apply_backward,                     void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& cos_tbl,                                                 \
                                                        const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads, ::brotensor::Tensor& dX))                        \
     X(rope_apply_mrope,                        void,  (const ::brotensor::Tensor& X,                                                                                       \

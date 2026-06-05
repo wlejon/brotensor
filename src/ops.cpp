@@ -1661,6 +1661,16 @@ void rope_apply(const Tensor& X, const Tensor& cos_tbl, const Tensor& sin_tbl,
     v.rope_apply(X, cos_tbl, sin_tbl, head_dim, num_heads, Y);
 }
 
+void rope_apply_perhead(const Tensor& X, const Tensor& cos_tbl,
+                        const Tensor& sin_tbl, int head_dim, int num_heads,
+                        Tensor& Y) {
+    const auto& v = detail::dispatch(X, cos_tbl, sin_tbl, Y);
+    if (!v.rope_apply_perhead)
+        detail::throw_not_implemented("rope_apply_perhead", X.device);
+    detail::adopt_output(Y, X.device);
+    v.rope_apply_perhead(X, cos_tbl, sin_tbl, head_dim, num_heads, Y);
+}
+
 void rope_apply_backward(const Tensor& dY, const Tensor& cos_tbl,
                          const Tensor& sin_tbl, int head_dim, int num_heads,
                          Tensor& dX) {

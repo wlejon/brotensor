@@ -38,6 +38,23 @@ void rope_apply(const Tensor& X, const Tensor& cos_tbl, const Tensor& sin_tbl,
                 int head_dim, int num_heads, Tensor& Y);
 
 
+// RoPE with explicit PER-HEAD cos/sin tables — like rope_apply, but each head
+// carries its own rotation angles (content-dependent / per-head positional
+// schemes, e.g. TripoSplat's RePo3D rotary where every attention head predicts
+// its own 3-D delta position). Pairing is the same adjacent-pair (interleaved)
+// convention as rope_apply.
+//   x_{2i}   <- x_{2i}*cos_tbl[(row*num_heads+h),i] - x_{2i+1}*sin_tbl[...]
+//   x_{2i+1} <- x_{2i}*sin_tbl[(row*num_heads+h),i] + x_{2i+1}*cos_tbl[...]
+//   X, Y: (L, num_heads*head_dim); head_dim even.
+//   cos_tbl, sin_tbl: (L*num_heads, head_dim/2) FP32 — one angle per
+//     (row, head, pair), rows ordered head-minor within each token.
+//   Y resized + dtype-set to X. Dispatched on X.dtype (FP32/FP16/BF16); FP32
+//   math. Inference-only (no backward).
+void rope_apply_perhead(const Tensor& X, const Tensor& cos_tbl,
+                        const Tensor& sin_tbl, int head_dim, int num_heads,
+                        Tensor& Y);
+
+
 // Backward of rope_apply — the inverse (transpose) rotation:
 //   dX_{2i}   <-  dY_{2i}*cos_tbl[row,i] + dY_{2i+1}*sin_tbl[row,i]
 //   dX_{2i+1} <- -dY_{2i}*sin_tbl[row,i] + dY_{2i+1}*cos_tbl[row,i]

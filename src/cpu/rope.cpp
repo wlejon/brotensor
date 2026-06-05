@@ -170,6 +170,62 @@ void rope_apply(const ::brotensor::Tensor& X, const ::brotensor::Tensor& cos_tbl
     }
 }
 
+// ─── RoPE with explicit PER-HEAD cos/sin tables ───────────────────────────
+//
+// Like rope_apply, but cos_tbl / sin_tbl are (L*num_heads, head_dim/2): one
+// angle per (row, head, pair). Rows are head-minor within each token, i.e. the
+// table row for (row, h) is (row*num_heads + h). Inference-only.
+
+void rope_apply_perhead(const ::brotensor::Tensor& X,
+                        const ::brotensor::Tensor& cos_tbl,
+                        const ::brotensor::Tensor& sin_tbl,
+                        int head_dim, int num_heads, ::brotensor::Tensor& Y) {
+    if (head_dim <= 0 || (head_dim & 1) != 0) {
+        throw std::runtime_error("rope_apply_perhead: head_dim must be a positive even integer");
+    }
+    if (num_heads <= 0) {
+        throw std::runtime_error("rope_apply_perhead: num_heads must be positive");
+    }
+    if (X.dtype != Dtype::FP32) {
+        throw std::runtime_error("rope_apply_perhead: X must be FP32 (CPU backend is FP32-only)");
+    }
+    if (X.cols != num_heads * head_dim) {
+        throw std::runtime_error("rope_apply_perhead: X.cols != num_heads * head_dim");
+    }
+    const int L = X.rows;
+    const int half = head_dim / 2;
+    if (cos_tbl.dtype != Dtype::FP32 || sin_tbl.dtype != Dtype::FP32) {
+        throw std::runtime_error("rope_apply_perhead: cos_tbl / sin_tbl must be FP32");
+    }
+    if (cos_tbl.size() != L * num_heads * half || sin_tbl.size() != L * num_heads * half) {
+        throw std::runtime_error(
+            "rope_apply_perhead: cos_tbl / sin_tbl must each be (L*num_heads, head_dim/2)");
+    }
+    if (Y.rows != L || Y.cols != X.cols || Y.dtype != Dtype::FP32) {
+        Y.resize(L, X.cols, Dtype::FP32);
+    }
+    if (L * num_heads * half == 0) return;
+    const int D = num_heads * head_dim;
+    const float* Xp = X.host_f32();
+    const float* Cp = cos_tbl.host_f32();
+    const float* Sp = sin_tbl.host_f32();
+    float* Yp = Y.host_f32_mut();
+    for (int row = 0; row < L; ++row) {
+        for (int h = 0; h < num_heads; ++h) {
+            const int base_off = row * D + h * head_dim;
+            const int tbl_off  = (row * num_heads + h) * half;
+            for (int i = 0; i < half; ++i) {
+                const float c = Cp[tbl_off + i];
+                const float s = Sp[tbl_off + i];
+                const float x0 = Xp[base_off + 2 * i];
+                const float x1 = Xp[base_off + 2 * i + 1];
+                Yp[base_off + 2 * i]     = x0 * c - x1 * s;
+                Yp[base_off + 2 * i + 1] = x0 * s + x1 * c;
+            }
+        }
+    }
+}
+
 void rope_apply_backward(const ::brotensor::Tensor& dY,
                          const ::brotensor::Tensor& cos_tbl,
                          const ::brotensor::Tensor& sin_tbl,

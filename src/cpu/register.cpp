@@ -691,6 +691,9 @@ void broadcast_mul(const ::brotensor::Tensor& X, const ::brotensor::Tensor& v,
 void rope_apply(const ::brotensor::Tensor& X, const ::brotensor::Tensor& cos_tbl,
                 const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads,
                 ::brotensor::Tensor& Y);
+void rope_apply_perhead(const ::brotensor::Tensor& X, const ::brotensor::Tensor& cos_tbl,
+                        const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads,
+                        ::brotensor::Tensor& Y);
 void rope_apply_backward(const ::brotensor::Tensor& dY,
                          const ::brotensor::Tensor& cos_tbl,
                          const ::brotensor::Tensor& sin_tbl,
@@ -1145,6 +1148,7 @@ struct CpuStaticRegistrar {
         ops.modulate                     = &detail::cpu::modulate;
         ops.broadcast_mul                = &detail::cpu::broadcast_mul;
         ops.rope_apply                   = &detail::cpu::rope_apply;
+        ops.rope_apply_perhead           = &detail::cpu::rope_apply_perhead;
         ops.rope_apply_backward          = &detail::cpu::rope_apply_backward;
         ops.self_attention_bias_forward  = &detail::cpu::self_attention_bias_forward;
         ops.self_attention_decomposed_rel_pos_forward =

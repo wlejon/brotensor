@@ -220,6 +220,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.rms_norm_backward                           = &dm::rms_norm_backward;
     ops.rms_norm_forward                            = &dm::rms_norm_forward;
     ops.rope_apply                                  = &dm::rope_apply;
+    ops.rope_apply_perhead                          = &dm::rope_apply_perhead;
     ops.rope_apply_backward                         = &dm::rope_apply_backward;
     ops.rope_apply_mrope                            = &dm::rope_apply_mrope;
     ops.rope_backward                               = &dm::rope_backward;
