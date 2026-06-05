@@ -122,21 +122,25 @@ void sequence_to_nchw(const Tensor& X,
                       Tensor& Y);
 
 
-// ─── Spatial 2x2 patch merger (Qwen2.5-VL / Qwen3-VL) ──────────────────────
+// ─── Spatial 2x2 pixel-unshuffle (Qwen-VL patch merger / Flux.2 VAE) ───────
 //
-// Patch merger used before the vision -> LLM projector. Stacks each 2x2 spatial
-// block of X into the channel axis, producing 4x as many channels and half the
-// spatial extent in each direction:
+// Stacks each 2x2 spatial block of X into the channel axis, producing 4x as
+// many channels and half the spatial extent in each direction:
 //   X: (N, C*H*W) — NCHW; H and W must both be even.
 //   Y: (N, 4*C*(H/2)*(W/2)) — NCHW with (C_out, H_out, W_out) =
 //                              (4*C, H/2, W/2). Resized + dtype-set to X.
-// Layout:
-//   c_out = (dh*2 + dw)*C + c_in,    dh in {0,1}, dw in {0,1}, c_in in [0,C).
-//   (h_out, w_out) maps to (h_in = 2*h_out + dh, w_in = 2*w_out + dw).
+// In both modes (h_out, w_out) maps to (h_in = 2*h_out + dh, w_in = 2*w_out + dw)
+// with dh, dw in {0,1} and block = dh*2 + dw. The two modes differ only in how
+// the output channel index is composed from (block, c_in):
+//   channel_major = false → c_out = block*C + c_in
+//                           (Qwen2.5-VL / Qwen3-VL patch merger — block-major).
+//   channel_major = true  → c_out = c_in*4 + block
+//                           (torch F.pixel_unshuffle / Flux.2 VAE tail — channel-major).
 // Pure gather — no arithmetic. Inference-only (no backward).
 // Dispatched on X.dtype (FP32/FP16/BF16 on GPU; FP32 only on CPU).
 void spatial_merge_2x2_forward(const Tensor& X,
                                int N, int C, int H, int W,
+                               bool channel_major,
                                Tensor& Y);
 
 }  // namespace brotensor

@@ -1,9 +1,11 @@
-// ─── CPU spatial 2x2 patch merger (Qwen3-VL) ───────────────────────────────
+// ─── CPU spatial 2x2 pixel-unshuffle (Qwen-VL merger / Flux.2 VAE) ──────────
 //
 // Pure gather. Stacks each 2x2 spatial block into the channel axis:
 //   X: NCHW (N, C*H*W)             — H, W must be even.
 //   Y: NCHW (N, 4*C*(H/2)*(W/2))
-//   c_out = (dh*2 + dw)*C + c_in,  (h_in, w_in) = (2*h_out + dh, 2*w_out + dw).
+//   block = dh*2 + dw,             (h_in, w_in) = (2*h_out + dh, 2*w_out + dw).
+//   channel_major=false: c_out = block*C + c_in  (Qwen-VL, block-major)
+//   channel_major=true:  c_out = c_in*4 + block  (torch pixel_unshuffle / Flux.2)
 // FP32 only on CPU (CPU backend is FP32-only by convention).
 
 #include <brotensor/tensor.h>
@@ -15,6 +17,7 @@ namespace brotensor::detail::cpu {
 
 void spatial_merge_2x2_forward(const ::brotensor::Tensor& X,
                                int N, int C, int H, int W,
+                               bool channel_major,
                                ::brotensor::Tensor& Y) {
     if (X.dtype != Dtype::FP32) {
         throw std::runtime_error("spatial_merge_2x2_forward: X must be FP32 "
@@ -46,7 +49,8 @@ void spatial_merge_2x2_forward(const ::brotensor::Tensor& X,
             for (int dw = 0; dw < 2; ++dw) {
                 const int block = dh * 2 + dw;
                 for (int c_in = 0; c_in < C; ++c_in) {
-                    const int c_out = block * C + c_in;
+                    const int c_out =
+                        channel_major ? c_in * 4 + block : block * C + c_in;
                     const float* xc = Xp + (n * C + c_in) * HW;
                     float*       yc = Yp + (n * C_out + c_out) * HW_out;
                     for (int h_out = 0; h_out < H_out; ++h_out) {

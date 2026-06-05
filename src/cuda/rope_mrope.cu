@@ -32,6 +32,7 @@ namespace detail::cuda {
 // Defined in spatial_merge.cu.
 void spatial_merge_2x2_forward(const ::brotensor::Tensor& X,
                                int N, int C, int H, int W,
+                               bool channel_major,
                                ::brotensor::Tensor& Y);
 
 namespace {

@@ -1,7 +1,8 @@
-// Metal spatial 2x2 patch merger (Qwen3-VL).
+// Metal spatial 2x2 pixel-unshuffle (Qwen-VL merger / Flux.2 VAE).
 //
 // Pure gather: (N, C, H, W) -> (N, 4*C, H/2, W/2). One thread per output
-// element. FP32 / FP16 / BF16.
+// element. channel_major selects the output channel ordering (block-major
+// Qwen-VL vs channel-major torch pixel_unshuffle). FP32 / FP16 / BF16.
 
 #include <brotensor/runtime.h>
 
@@ -33,6 +34,7 @@ kernel void NAME(device const T* X [[buffer(0)]],                             \
                  constant uint& H_out  [[buffer(6)]],                         \
                  constant uint& W_out  [[buffer(7)]],                         \
                  constant uint& total  [[buffer(8)]],                         \
+                 constant uint& chmaj  [[buffer(9)]],                         \
                  uint idx [[thread_position_in_grid]]) {                      \
     if (idx >= total) return;                                                 \
     uint C_out = 4u * C;                                                      \
@@ -42,8 +44,8 @@ kernel void NAME(device const T* X [[buffer(0)]],                             \
     t         /= H_out;                                                       \
     uint c_out = t % C_out;                                                   \
     uint n     = t / C_out;                                                   \
-    uint block = c_out / C;                                                   \
-    uint c_in  = c_out - block * C;                                           \
+    uint block = chmaj ? (c_out & 3u)  : (c_out / C);                         \
+    uint c_in  = chmaj ? (c_out >> 2)  : (c_out - block * C);                 \
     uint dh    = block >> 1;                                                  \
     uint dw    = block & 1u;                                                  \
     uint h_in  = 2u * h_out + dh;                                             \
@@ -75,6 +77,7 @@ DEF_PSO(pso_sm_bf16, @"k_spatial_merge_2x2_bf16")
 
 void spatial_merge_2x2_forward(const Tensor& X,
                                int N, int C, int H, int W,
+                               bool channel_major,
                                Tensor& Y) {
     if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 &&
         X.dtype != Dtype::BF16) {
@@ -107,6 +110,7 @@ void spatial_merge_2x2_forward(const Tensor& X,
     const uint32_t Wu     = (uint32_t)W;
     const uint32_t H_outU = (uint32_t)H_out;
     const uint32_t W_outU = (uint32_t)W_out;
+    const uint32_t chmajU = channel_major ? 1u : 0u;
 
     id<MTLBuffer> bx = buffer_for(X);
     id<MTLBuffer> by = buffer_for(Y);
@@ -126,6 +130,7 @@ void spatial_merge_2x2_forward(const Tensor& X,
         [enc setBytes:&H_outU length:sizeof(uint32_t) atIndex:6];
         [enc setBytes:&W_outU length:sizeof(uint32_t) atIndex:7];
         [enc setBytes:&total  length:sizeof(uint32_t) atIndex:8];
+        [enc setBytes:&chmajU length:sizeof(uint32_t) atIndex:9];
         NSUInteger tpt = [pso maxTotalThreadsPerThreadgroup];
         if (tpt > 256) tpt = 256;
         [enc dispatchThreads:MTLSizeMake(total, 1, 1)

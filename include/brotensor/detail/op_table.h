@@ -352,8 +352,8 @@
     /* ─── NCHW <-> sequence transposes ─── */                                                                                                                          \
     X(nchw_to_sequence,                        void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, ::brotensor::Tensor& Y))                               \
     X(sequence_to_nchw,                        void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, ::brotensor::Tensor& Y))                               \
-    /* ─── Qwen3-VL patch merger: (N,C,H,W) -> (N,4C,H/2,W/2) ─── */                                                                                                    \
-    X(spatial_merge_2x2_forward,               void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, ::brotensor::Tensor& Y))                               \
+    /* ─── 2x2 pixel-unshuffle: (N,C,H,W) -> (N,4C,H/2,W/2) ─── */                                                                                                       \
+    X(spatial_merge_2x2_forward,               void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, bool channel_major, ::brotensor::Tensor& Y))           \
     /* ─── Diffusion ResBlock (forward + W8A16 + backward) ─── */                                                                                                       \
     X(resblock_forward,                        void,  (const ::brotensor::Tensor& X,                                                                                    \
                                                        const ::brotensor::Tensor& gamma1, const ::brotensor::Tensor& beta1,                                             \

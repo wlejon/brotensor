@@ -907,6 +907,7 @@ void gated_delta_rule_step(const ::brotensor::Tensor& Q,
 //    rope_mrope.cpp ──
 void spatial_merge_2x2_forward(const ::brotensor::Tensor& X,
                                int N, int C, int H, int W,
+                               bool channel_major,
                                ::brotensor::Tensor& Y);
 void rope_apply_mrope(const ::brotensor::Tensor& X,
                       const ::brotensor::Tensor& cos_t,

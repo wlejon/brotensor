@@ -1524,12 +1524,12 @@ void sequence_to_nchw(const Tensor& X, int N, int C, int H, int W, Tensor& Y) {
 }
 
 void spatial_merge_2x2_forward(const Tensor& X, int N, int C, int H, int W,
-                               Tensor& Y) {
+                               bool channel_major, Tensor& Y) {
     const auto& v = detail::dispatch(X, Y);
     if (!v.spatial_merge_2x2_forward)
         detail::throw_not_implemented("spatial_merge_2x2_forward", X.device);
     detail::adopt_output(Y, X.device);
-    v.spatial_merge_2x2_forward(X, N, C, H, W, Y);
+    v.spatial_merge_2x2_forward(X, N, C, H, W, channel_major, Y);
 }
 
 // ─── ResBlock ──────────────────────────────────────────────────────────────
