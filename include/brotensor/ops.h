@@ -35,6 +35,7 @@
 #include "ops/image.h"
 #include "ops/linear.h"
 #include "ops/loss.h"
+#include "ops/lstm.h"
 #include "ops/norm.h"
 #include "ops/optim.h"
 #include "ops/pooling.h"

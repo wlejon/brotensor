@@ -398,6 +398,18 @@
     X(matmul,                                  void,  (const ::brotensor::Tensor& A, const ::brotensor::Tensor& B, ::brotensor::Tensor& C))                             \
     X(matmul_backward,                         void,  (const ::brotensor::Tensor& A, const ::brotensor::Tensor& B, const ::brotensor::Tensor& dC,                       \
                                                        ::brotensor::Tensor& dA, ::brotensor::Tensor& dB))                                                               \
+    X(lstm_forward_train,                      void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& W_ih, const ::brotensor::Tensor& W_hh,                  \
+                                                       const ::brotensor::Tensor* b_ih, const ::brotensor::Tensor* b_hh,                                                \
+                                                       const ::brotensor::Tensor* h0, const ::brotensor::Tensor* c0, int T, int B,                                      \
+                                                       ::brotensor::Tensor& Y, ::brotensor::Tensor& gates, ::brotensor::Tensor& C,                                      \
+                                                       ::brotensor::Tensor* hT, ::brotensor::Tensor* cT))                                                               \
+    X(lstm_backward,                           void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& W_ih, const ::brotensor::Tensor& W_hh,                  \
+                                                       const ::brotensor::Tensor* h0, const ::brotensor::Tensor* c0,                                                    \
+                                                       const ::brotensor::Tensor& Y, const ::brotensor::Tensor& gates, const ::brotensor::Tensor& C,                    \
+                                                       const ::brotensor::Tensor& dY, int T, int B, ::brotensor::Tensor& dX,                                            \
+                                                       ::brotensor::Tensor& dW_ih, ::brotensor::Tensor& dW_hh,                                                          \
+                                                       ::brotensor::Tensor* db_ih, ::brotensor::Tensor* db_hh,                                                          \
+                                                       ::brotensor::Tensor* dh0, ::brotensor::Tensor* dc0))                                                             \
     X(rope_forward,                            void,  (const ::brotensor::Tensor& X, int head_dim, int num_heads, int seq_offset, float theta_base,                     \
                                                        ::brotensor::Tensor& Y))                                                                                         \
     X(rope_backward,                           void,  (const ::brotensor::Tensor& dY, int head_dim, int num_heads, int seq_offset, float theta_base,                    \

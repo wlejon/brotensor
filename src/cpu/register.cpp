@@ -974,6 +974,24 @@ void image_u8_to_f32_nhwc_to_nchw(const uint8_t* src,
                                   int N, int H, int W, int C,
                                   float scale, float bias,
                                   ::brotensor::Tensor& Y);
+void lstm_forward_train(const ::brotensor::Tensor& X, const ::brotensor::Tensor& W_ih,
+                        const ::brotensor::Tensor& W_hh,
+                        const ::brotensor::Tensor* b_ih, const ::brotensor::Tensor* b_hh,
+                        const ::brotensor::Tensor* h0, const ::brotensor::Tensor* c0,
+                        int T, int B,
+                        ::brotensor::Tensor& Y, ::brotensor::Tensor& gates,
+                        ::brotensor::Tensor& C,
+                        ::brotensor::Tensor* hT, ::brotensor::Tensor* cT);
+void lstm_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& W_ih,
+                   const ::brotensor::Tensor& W_hh,
+                   const ::brotensor::Tensor* h0, const ::brotensor::Tensor* c0,
+                   const ::brotensor::Tensor& Y, const ::brotensor::Tensor& gates,
+                   const ::brotensor::Tensor& C,
+                   const ::brotensor::Tensor& dY, int T, int B,
+                   ::brotensor::Tensor& dX, ::brotensor::Tensor& dW_ih,
+                   ::brotensor::Tensor& dW_hh,
+                   ::brotensor::Tensor* db_ih, ::brotensor::Tensor* db_hh,
+                   ::brotensor::Tensor* dh0, ::brotensor::Tensor* dc0);
 
 } // namespace brotensor::detail::cpu
 
@@ -1070,6 +1088,8 @@ struct CpuStaticRegistrar {
         ops.swiglu_backward            = &detail::cpu::swiglu_backward;
         ops.matmul                     = &detail::cpu::matmul;
         ops.matmul_backward            = &detail::cpu::matmul_backward;
+        ops.lstm_forward_train         = &detail::cpu::lstm_forward_train;
+        ops.lstm_backward              = &detail::cpu::lstm_backward;
         ops.rope_forward               = &detail::cpu::rope_forward;
         ops.rope_backward              = &detail::cpu::rope_backward;
         ops.rms_norm_forward           = &detail::cpu::rms_norm_forward;

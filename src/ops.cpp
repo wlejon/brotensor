@@ -1656,6 +1656,41 @@ void matmul_backward(const Tensor& A, const Tensor& B, const Tensor& dC,
     v.matmul_backward(A, B, dC, dA, dB);
 }
 
+void lstm_forward_train(const Tensor& X, const Tensor& W_ih, const Tensor& W_hh,
+                        const Tensor* b_ih, const Tensor* b_hh,
+                        const Tensor* h0, const Tensor* c0, int T, int B,
+                        Tensor& Y, Tensor& gates, Tensor& C,
+                        Tensor* hT, Tensor* cT) {
+    const auto& v = detail::dispatch(X);
+    if (!v.lstm_forward_train) detail::throw_not_implemented("lstm_forward_train", X.device);
+    detail::adopt_output(Y, X.device);
+    detail::adopt_output(gates, X.device);
+    detail::adopt_output(C, X.device);
+    if (hT) detail::adopt_output(*hT, X.device);
+    if (cT) detail::adopt_output(*cT, X.device);
+    v.lstm_forward_train(X, W_ih, W_hh, b_ih, b_hh, h0, c0, T, B, Y, gates, C, hT, cT);
+}
+
+void lstm_backward(const Tensor& X, const Tensor& W_ih, const Tensor& W_hh,
+                   const Tensor* h0, const Tensor* c0,
+                   const Tensor& Y, const Tensor& gates, const Tensor& C,
+                   const Tensor& dY, int T, int B,
+                   Tensor& dX, Tensor& dW_ih, Tensor& dW_hh,
+                   Tensor* db_ih, Tensor* db_hh,
+                   Tensor* dh0, Tensor* dc0) {
+    const auto& v = detail::dispatch(X);
+    if (!v.lstm_backward) detail::throw_not_implemented("lstm_backward", X.device);
+    detail::adopt_output(dX, X.device);
+    detail::adopt_output(dW_ih, X.device);
+    detail::adopt_output(dW_hh, X.device);
+    if (db_ih) detail::adopt_output(*db_ih, X.device);
+    if (db_hh) detail::adopt_output(*db_hh, X.device);
+    if (dh0) detail::adopt_output(*dh0, X.device);
+    if (dc0) detail::adopt_output(*dc0, X.device);
+    v.lstm_backward(X, W_ih, W_hh, h0, c0, Y, gates, C, dY, T, B,
+                    dX, dW_ih, dW_hh, db_ih, db_hh, dh0, dc0);
+}
+
 void rope_forward(const Tensor& X, int head_dim, int num_heads,
                   int seq_offset, float theta_base, Tensor& Y) {
     const auto& v = detail::dispatch(X, Y);

@@ -88,6 +88,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/geglu.cpp
     src/cpu/swiglu.cpp
     src/cpu/matmul.cpp
+    src/cpu/lstm.cpp
     src/cpu/rope.cpp
     src/cpu/rms_norm.cpp
     src/cpu/conv2d.cpp
