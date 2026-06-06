@@ -39,6 +39,10 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
                                  const ::brotensor::Tensor& Wk,
                                  const ::brotensor::Tensor& Wv,
                                  const ::brotensor::Tensor& Wo,
+                                 const ::brotensor::Tensor* bq,
+                                 const ::brotensor::Tensor* bk,
+                                 const ::brotensor::Tensor* bv,
+                                 const ::brotensor::Tensor* bo,
                                  const float* d_mask,
                                  const ::brotensor::Tensor* attn_bias,
                                  int num_heads, float scale,
@@ -65,6 +69,19 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
         }
         bias = attn_bias->host_f32();
     }
+    // Optional length-D projection biases (added post-projection).
+    auto bias_ptr = [&](const ::brotensor::Tensor* b, const char* name) -> const float* {
+        if (!b || !b->data) return nullptr;
+        check_fp32(*b, name);
+        if (b->size() != D)
+            throw std::runtime_error(std::string("self_attention_bias_forward: ") +
+                                     name + " must have D entries");
+        return b->host_f32();
+    };
+    const float* bqp = bias_ptr(bq, "bq");
+    const float* bkp = bias_ptr(bk, "bk");
+    const float* bvp = bias_ptr(bv, "bv");
+    const float* bop = bias_ptr(bo, "bo");
     if (O.rows != L || O.cols != D || O.dtype != Dtype::FP32) {
         O.resize(L, D, Dtype::FP32);
     }
@@ -81,22 +98,23 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
     std::vector<float> Qh(static_cast<size_t>(H) * L * dh);
     std::vector<float> Kh(static_cast<size_t>(H) * L * dh);
     std::vector<float> Vh(static_cast<size_t>(H) * L * dh);
-    auto project = [&](const float* W, std::vector<float>& Out) {
+    auto project = [&](const float* W, const float* b, std::vector<float>& Out) {
         for (int hh = 0; hh < H; ++hh) {
             for (int i = 0; i < L; ++i) {
                 const float* xr = Xp + static_cast<size_t>(i) * D;
                 for (int j = 0; j < dh; ++j) {
-                    const float* wr = W + static_cast<size_t>(hh * dh + j) * D;
-                    float acc = 0.0f;
+                    const int o = hh * dh + j;
+                    const float* wr = W + static_cast<size_t>(o) * D;
+                    float acc = b ? b[o] : 0.0f;
                     for (int k = 0; k < D; ++k) acc += xr[k] * wr[k];
                     Out[(static_cast<size_t>(hh) * L + i) * dh + j] = acc;
                 }
             }
         }
     };
-    project(Wqp, Qh);
-    project(Wkp, Kh);
-    project(Wvp, Vh);
+    project(Wqp, bqp, Qh);
+    project(Wkp, bkp, Kh);
+    project(Wvp, bvp, Vh);
 
     // Yconcat (L, D): per-head attention output, concatenated.
     std::vector<float> Yc(static_cast<size_t>(L) * D, 0.0f);
@@ -149,7 +167,7 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
         const float* yr = &Yc[static_cast<size_t>(i) * D];
         for (int c = 0; c < D; ++c) {
             const float* wr = Wop + static_cast<size_t>(c) * D;
-            float acc = 0.0f;
+            float acc = bop ? bop[c] : 0.0f;
             for (int k = 0; k < D; ++k) acc += yr[k] * wr[k];
             Op[static_cast<size_t>(i) * D + c] = acc;
         }

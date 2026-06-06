@@ -447,4 +447,78 @@ BT_PARITY_TEST(sab_int8_L8_D32_h4_bias_mask) {
     run_sab_int8(8, 32, 4, 0.176776695f, true, &m, 0x634ull);
 }
 
+// ─── self_attention_bias_forward with qkv/proj biases (Swin window attn) ────
+//
+// The biased-projection path validated two ways: (1) against mha_forward (the
+// independent biased-MHA impl) with attn_bias disabled — same math, so they
+// must agree; (2) CPU<->GPU parity with BOTH proj biases and an additive
+// attn_bias active (the full Swin window-attention shape).
+
+void run_sab_qkvo_vs_mha(int L, int D, int num_heads, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X  = Tensor::mat(L, D);
+    Tensor Wq = Tensor::mat(D, D), Wk = Tensor::mat(D, D),
+           Wv = Tensor::mat(D, D), Wo = Tensor::mat(D, D);
+    Tensor bq = Tensor::vec(D), bk = Tensor::vec(D),
+           bv = Tensor::vec(D), bo = Tensor::vec(D);
+    fill_random(X, rng, 0.5f);
+    fill_random(Wq, rng, 0.3f); fill_random(Wk, rng, 0.3f);
+    fill_random(Wv, rng, 0.3f); fill_random(Wo, rng, 0.3f);
+    fill_random(bq, rng, 0.4f); fill_random(bk, rng, 0.4f);
+    fill_random(bv, rng, 0.4f); fill_random(bo, rng, 0.4f);
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D / num_heads));
+
+    Tensor O_sab;
+    brotensor::self_attention_bias_forward(X, Wq, Wk, Wv, Wo,
+                                           &bq, &bk, &bv, &bo,
+                                           nullptr, nullptr, num_heads, scale, O_sab);
+
+    Tensor Qh, Kh, Vh, Attnh, Yconcat, O_mha;
+    brotensor::mha_forward(X, Wq, Wk, Wv, Wo, &bq, &bk, &bv, &bo,
+                           nullptr, num_heads,
+                           Qh, Kh, Vh, Attnh, Yconcat, O_mha);
+
+    compare_tensors(O_mha, O_sab, "sab_qkvo_vs_mha", 1e-4f, 1e-3f);
+}
+
+// Full Swin shape: proj biases + additive attn_bias, CPU<->GPU.
+void run_sab_qkvo_parity(int L, int D, int num_heads, float scale, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X  = Tensor::mat(L, D);
+    Tensor Wq = Tensor::mat(D, D), Wk = Tensor::mat(D, D),
+           Wv = Tensor::mat(D, D), Wo = Tensor::mat(D, D);
+    Tensor bq = Tensor::vec(D), bk = Tensor::vec(D),
+           bv = Tensor::vec(D), bo = Tensor::vec(D);
+    Tensor ab = Tensor::mat(num_heads * L, L);
+    fill_random(X, rng, 0.5f);
+    fill_random(Wq, rng, 0.3f); fill_random(Wk, rng, 0.3f);
+    fill_random(Wv, rng, 0.3f); fill_random(Wo, rng, 0.3f);
+    fill_random(bq, rng, 0.4f); fill_random(bk, rng, 0.4f);
+    fill_random(bv, rng, 0.4f); fill_random(bo, rng, 0.4f);
+    fill_random(ab, rng, 0.5f);
+
+    Tensor O_cpu;
+    brotensor::self_attention_bias_forward(X, Wq, Wk, Wv, Wo, &bq, &bk, &bv, &bo,
+                                           nullptr, &ab, num_heads, scale, O_cpu);
+
+    Tensor gX = X.to(gpu_device());
+    Tensor gWq = Wq.to(gpu_device()), gWk = Wk.to(gpu_device()),
+           gWv = Wv.to(gpu_device()), gWo = Wo.to(gpu_device());
+    Tensor gbq = bq.to(gpu_device()), gbk = bk.to(gpu_device()),
+           gbv = bv.to(gpu_device()), gbo = bo.to(gpu_device());
+    Tensor gab = ab.to(gpu_device());
+    Tensor O_gpu;
+    brotensor::self_attention_bias_forward(gX, gWq, gWk, gWv, gWo,
+                                           &gbq, &gbk, &gbv, &gbo,
+                                           nullptr, &gab, num_heads, scale, O_gpu);
+
+    compare_tensors(O_cpu, download_to_host(O_gpu), "sab_qkvo_parity", 1e-4f, 1e-3f);
+}
+
+BT_PARITY_TEST(sab_qkvo_vs_mha_L8_D32_h4)  { run_sab_qkvo_vs_mha(8, 32, 4, 0x640ull); }
+BT_PARITY_TEST(sab_qkvo_vs_mha_L12_D48_h6) { run_sab_qkvo_vs_mha(12, 48, 6, 0x641ull); }
+BT_PARITY_TEST(sab_qkvo_parity_L8_D32_h4)  { run_sab_qkvo_parity(8, 32, 4, 0.176776695f, 0x650ull); }
+BT_PARITY_TEST(sab_qkvo_parity_L16_D64_h8) { run_sab_qkvo_parity(16, 64, 8, 0.125f, 0x651ull); }
+
 int main() { return run_all("self_attention cpu/gpu parity"); }

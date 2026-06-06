@@ -42,18 +42,21 @@ using namespace metal;
 // Per-head projection: Out[(hh*L+i), j] = sum_k In[i,k] * W[hh*dh+j, k].
 // In: (L, Din) typed, W: (D, Din) typed, Out: (H*L, dh) FP32.
 #define SAB_PROJ_KERNEL(NAME, T)                                              \
-kernel void NAME(device const T*     In  [[buffer(0)]],                       \
-                 device const T*     W   [[buffer(1)]],                       \
-                 device float*       Out [[buffer(2)]],                       \
-                 constant uint& L   [[buffer(3)]],                            \
-                 constant uint& Din [[buffer(4)]],                            \
-                 constant uint& dh  [[buffer(5)]],                            \
+kernel void NAME(device const T*     In       [[buffer(0)]],                  \
+                 device const T*     W        [[buffer(1)]],                  \
+                 device const T*     bias     [[buffer(2)]],                  \
+                 constant uint&      has_bias [[buffer(3)]],                  \
+                 device float*       Out      [[buffer(4)]],                  \
+                 constant uint& L   [[buffer(5)]],                            \
+                 constant uint& Din [[buffer(6)]],                            \
+                 constant uint& dh  [[buffer(7)]],                            \
                  uint3 gid [[thread_position_in_grid]]) {                     \
     uint j = gid.x, i = gid.y, hh = gid.z;                                    \
     if (i >= L || j >= dh) return;                                            \
+    uint o = hh * dh + j;                                                     \
     device const T* xr = In + (ulong)i * Din;                                 \
-    device const T* wr = W  + (ulong)(hh * dh + j) * Din;                     \
-    float acc = 0.0f;                                                         \
+    device const T* wr = W  + (ulong)o * Din;                                 \
+    float acc = has_bias != 0u ? float(bias[o]) : 0.0f;                       \
     for (uint k = 0; k < Din; ++k) acc += float(xr[k]) * float(wr[k]);        \
     Out[((ulong)hh * L + i) * dh + j] = acc;                                  \
 }
@@ -158,20 +161,22 @@ kernel void k_sab_apply_v(device const float* Attn    [[buffer(0)]],
 
 // O[i, c] = mask[i] ? sum_k Yconcat[i,k] * Wo[c,k] : 0.
 #define SAB_OUTPUT_KERNEL(NAME, T)                                            \
-kernel void NAME(device const float* Y    [[buffer(0)]],                      \
-                 device const T*     Wo   [[buffer(1)]],                      \
-                 device const float* mask [[buffer(2)]],                      \
-                 constant uint& has_mask  [[buffer(3)]],                      \
-                 device T*           O    [[buffer(4)]],                      \
-                 constant uint& L [[buffer(5)]],                              \
-                 constant uint& D [[buffer(6)]],                              \
+kernel void NAME(device const float* Y        [[buffer(0)]],                  \
+                 device const T*     Wo       [[buffer(1)]],                  \
+                 device const T*     bias     [[buffer(2)]],                  \
+                 constant uint&      has_bias [[buffer(3)]],                  \
+                 device const float* mask     [[buffer(4)]],                  \
+                 constant uint& has_mask      [[buffer(5)]],                  \
+                 device T*           O        [[buffer(6)]],                  \
+                 constant uint& L [[buffer(7)]],                              \
+                 constant uint& D [[buffer(8)]],                              \
                  uint3 gid [[thread_position_in_grid]]) {                     \
     uint c = gid.x, i = gid.y;                                                \
     if (i >= L || c >= D) return;                                             \
     if (has_mask && mask[i] < 0.5f) { O[(ulong)i * D + c] = T(0.0f); return; }\
     device const float* yr = Y  + (ulong)i * D;                               \
     device const T*     wr = Wo + (ulong)c * D;                               \
-    float acc = 0.0f;                                                         \
+    float acc = has_bias != 0u ? float(bias[c]) : 0.0f;                       \
     for (uint k = 0; k < D; ++k) acc += yr[k] * float(wr[k]);                 \
     O[(ulong)i * D + c] = T(acc);                                             \
 }
@@ -593,7 +598,10 @@ void run_rows(id<MTLComputePipelineState> pso, NSUInteger rows,
 
 void self_attention_bias_forward(const Tensor& X, const Tensor& Wq,
                                  const Tensor& Wk, const Tensor& Wv,
-                                 const Tensor& Wo, const float* d_mask,
+                                 const Tensor& Wo,
+                                 const Tensor* bq, const Tensor* bk,
+                                 const Tensor* bv, const Tensor* bo,
+                                 const float* d_mask,
                                  const Tensor* attn_bias, int num_heads,
                                  float scale, Tensor& O) {
     if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 && X.dtype != Dtype::BF16) {
@@ -668,21 +676,28 @@ void self_attention_bias_forward(const Tensor& X, const Tensor& Wq,
       : (X.dtype == Dtype::BF16) ? pso_proj_bf16()
       : pso_proj_fp32();
 
-    // Q / K / V per-head projections.
-    auto proj = ^(id<MTLBuffer> bW, NSUInteger oW,
-                  id<MTLBuffer> bOut, NSUInteger oOut) {
+    // Q / K / V per-head projections, each with an optional bias.
+    auto proj = [&](const Tensor& W, const Tensor* b,
+                    id<MTLBuffer> bOut, NSUInteger oOut) {
+        id<MTLBuffer> bW = buffer_for(W); NSUInteger oW = buffer_offset_for(W);
+        const bool hb = (b && b->data);
+        id<MTLBuffer> bB = hb ? buffer_for(*b) : bW;
+        NSUInteger oB = hb ? buffer_offset_for(*b) : oW;
+        const uint32_t hb_u = hb ? 1u : 0u;
         run3d(proj_pso, dhu, Lu, H, ^(id<MTLComputeCommandEncoder> enc) {
             [enc setBuffer:bX   offset:oX   atIndex:0];
             [enc setBuffer:bW   offset:oW   atIndex:1];
-            [enc setBuffer:bOut offset:oOut atIndex:2];
-            [enc setBytes:&Lu  length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Du  length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&dhu length:sizeof(uint32_t) atIndex:5];
+            [enc setBuffer:bB   offset:oB   atIndex:2];
+            [enc setBytes:&hb_u length:sizeof(uint32_t) atIndex:3];
+            [enc setBuffer:bOut offset:oOut atIndex:4];
+            [enc setBytes:&Lu  length:sizeof(uint32_t) atIndex:5];
+            [enc setBytes:&Du  length:sizeof(uint32_t) atIndex:6];
+            [enc setBytes:&dhu length:sizeof(uint32_t) atIndex:7];
         });
     };
-    proj(buffer_for(Wq), buffer_offset_for(Wq), bQh, oQh);
-    proj(buffer_for(Wk), buffer_offset_for(Wk), bKh, oKh);
-    proj(buffer_for(Wv), buffer_offset_for(Wv), bVh, oVh);
+    proj(Wq, bq, bQh, oQh);
+    proj(Wk, bk, bKh, oKh);
+    proj(Wv, bv, bVh, oVh);
 
     // Scores: scale * (Q.K) + bias.
     run3d(pso_scores(), Lu, Lu, H, ^(id<MTLComputeCommandEncoder> enc) {
@@ -723,14 +738,20 @@ void self_attention_bias_forward(const Tensor& X, const Tensor& Wq,
       : pso_output_fp32();
     id<MTLBuffer> bWo = buffer_for(Wo);
     NSUInteger oWo = buffer_offset_for(Wo);
+    const bool hbo = (bo && bo->data);
+    id<MTLBuffer> bBo = hbo ? buffer_for(*bo) : bWo;
+    NSUInteger oBo = hbo ? buffer_offset_for(*bo) : oWo;
+    const uint32_t has_bo = hbo ? 1u : 0u;
     run3d(out_pso, Du, Lu, 1, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bYc    offset:oYc    atIndex:0];
         [enc setBuffer:bWo    offset:oWo    atIndex:1];
-        [enc setBuffer:bM_arg offset:oM_arg atIndex:2];
-        [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:3];
-        [enc setBuffer:bO     offset:oO     atIndex:4];
-        [enc setBytes:&Lu     length:sizeof(uint32_t) atIndex:5];
-        [enc setBytes:&Du     length:sizeof(uint32_t) atIndex:6];
+        [enc setBuffer:bBo    offset:oBo    atIndex:2];
+        [enc setBytes:&has_bo length:sizeof(uint32_t) atIndex:3];
+        [enc setBuffer:bM_arg offset:oM_arg atIndex:4];
+        [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:5];
+        [enc setBuffer:bO     offset:oO     atIndex:6];
+        [enc setBytes:&Lu     length:sizeof(uint32_t) atIndex:7];
+        [enc setBytes:&Du     length:sizeof(uint32_t) atIndex:8];
     });
 }
 

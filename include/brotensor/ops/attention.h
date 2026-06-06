@@ -286,20 +286,41 @@ void self_attention_forward(const Tensor& X,
 // ALiBi. `scale` multiplies the raw dot product BEFORE the bias: pass
 // 1/sqrt(head_dim) for standard attention, or 1.0 for T5.
 //   X, O: (L,D).  Wq, Wk, Wv, Wo: (D,D), same dtype as X.
+//   bq, bk, bv, bo: optional length-D projection biases (X.dtype), added
+//                   row-wise after the matching projection — bq/bk/bv to Q/K/V,
+//                   bo after Wo. Any may be null. This makes the op a full
+//                   biased MHA + additive-bias attention (the Swin window-attn
+//                   block: qkv/proj bias + relative-position bias as attn_bias).
 //   d_mask: optional length-L FP32 key mask (also gates padded query rows);
 //           may be null.
 //   attn_bias: optional (num_heads*L, L) FP32 — row h*L+q is head h query q's
 //              length-L bias. Null => plain scaled self-attention.
 //   num_heads divides D.  O resized + dtype-set to match X.
-// Dispatched on X.dtype (FP32/FP16/BF16); FP32 math; bias is FP32 on every
+// Dispatched on X.dtype (FP32/FP16/BF16); FP32 math; attn_bias is FP32 on every
 // backend. Scores are materialised (L,L) per head — for encoder-length seqs.
 void self_attention_bias_forward(const Tensor& X,
                                  const Tensor& Wq, const Tensor& Wk,
                                  const Tensor& Wv, const Tensor& Wo,
+                                 const Tensor* bq, const Tensor* bk,
+                                 const Tensor* bv, const Tensor* bo,
                                  const float* d_mask,
                                  const Tensor* attn_bias,
                                  int num_heads, float scale,
                                  Tensor& O);
+
+// Bias-less-projection convenience overload — preserves the original call shape
+// (no qkv/proj biases) by forwarding bq/bk/bv/bo == nullptr.
+inline void self_attention_bias_forward(const Tensor& X,
+                                        const Tensor& Wq, const Tensor& Wk,
+                                        const Tensor& Wv, const Tensor& Wo,
+                                        const float* d_mask,
+                                        const Tensor* attn_bias,
+                                        int num_heads, float scale,
+                                        Tensor& O) {
+    self_attention_bias_forward(X, Wq, Wk, Wv, Wo,
+                                nullptr, nullptr, nullptr, nullptr,
+                                d_mask, attn_bias, num_heads, scale, O);
+}
 
 
 // Multi-head self-attention with a DECOMPOSED 2D relative-position bias — the

@@ -40,20 +40,24 @@ __device__ inline void  sab_st(float& d, float v)         { d = v; }
 __device__ inline void  sab_st(__half& d, float v)        { d = __float2half(v); }
 __device__ inline void  sab_st(__nv_bfloat16& d, float v) { d = __float2bfloat16(v); }
 
-// Per-head projection: Out[(hh*L+i), j] = sum_k In[i,k] * W[hh*dh+j, k].
-// In: (L, Din) typed, W: (D, Din) typed, Out: (H*L, dh) FP32. grid.z = H.
+// Per-head projection: Out[(hh*L+i), j] = (bias?bias[hh*dh+j]:0) +
+//                                          sum_k In[i,k] * W[hh*dh+j, k].
+// In: (L, Din) typed, W: (D, Din) typed, bias: (D,1) typed or null,
+// Out: (H*L, dh) FP32. grid.z = H.
 template <typename T>
 __global__ void sab_proj_kernel(const T* __restrict__ In,
                                 const T* __restrict__ W,
+                                const T* __restrict__ bias,  // (D,1) or null
                                 float* __restrict__ Out,
                                 int L, int Din, int dh) {
     const int j  = blockIdx.x * blockDim.x + threadIdx.x;
     const int i  = blockIdx.y * blockDim.y + threadIdx.y;
     const int hh = blockIdx.z;
     if (i >= L || j >= dh) return;
+    const int o = hh * dh + j;
     const T* xr = In + static_cast<size_t>(i) * Din;
-    const T* wr = W  + static_cast<size_t>(hh * dh + j) * Din;
-    float acc = 0.0f;
+    const T* wr = W  + static_cast<size_t>(o) * Din;
+    float acc = bias ? sab_ld(bias[o]) : 0.0f;
     for (int k = 0; k < Din; ++k) acc += sab_ld(xr[k]) * sab_ld(wr[k]);
     Out[(static_cast<size_t>(hh) * L + i) * dh + j] = acc;
 }
@@ -150,10 +154,11 @@ __global__ void sab_apply_v_kernel(const float* __restrict__ Attn,
     Yconcat[static_cast<size_t>(i) * D + (hh * dh + k)] = acc;
 }
 
-// O[i, c] = mask[i] ? sum_k Yconcat[i,k] * Wo[c,k] : 0.
+// O[i, c] = mask[i] ? (bias?bias[c]:0) + sum_k Yconcat[i,k] * Wo[c,k] : 0.
 template <typename T>
 __global__ void sab_output_kernel(const float* __restrict__ Y,
                                   const T* __restrict__ Wo,
+                                  const T* __restrict__ bias,  // (D,1) or null
                                   const float* __restrict__ mask,
                                   T* __restrict__ O, int L, int D) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -162,7 +167,7 @@ __global__ void sab_output_kernel(const float* __restrict__ Y,
     if (mask && mask[i] < 0.5f) { sab_st(O[static_cast<size_t>(i) * D + c], 0.0f); return; }
     const float* yr = Y + static_cast<size_t>(i) * D;
     const T* wr = Wo + static_cast<size_t>(c) * D;
-    float acc = 0.0f;
+    float acc = bias ? sab_ld(bias[c]) : 0.0f;
     for (int k = 0; k < D; ++k) acc += yr[k] * sab_ld(wr[k]);
     sab_st(O[static_cast<size_t>(i) * D + c], acc);
 }
@@ -172,6 +177,7 @@ template <typename T>
 void run_sab(const ::brotensor::Tensor& X,
              const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
              const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,
+             const T* bq, const T* bk, const T* bv, const T* bo,
              const float* d_mask, const float* bias_p,
              int num_heads, float scale, ::brotensor::Tensor& O) {
     using ::brotensor::Tensor;
@@ -205,9 +211,9 @@ void run_sab(const ::brotensor::Tensor& X,
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (L  + block.y - 1) / block.y, H);
-        sab_proj_kernel<T><<<grid, block>>>(X_p, Wq_p, Qh_p, L, D, dh);
-        sab_proj_kernel<T><<<grid, block>>>(X_p, Wk_p, Kh_p, L, D, dh);
-        sab_proj_kernel<T><<<grid, block>>>(X_p, Wv_p, Vh_p, L, D, dh);
+        sab_proj_kernel<T><<<grid, block>>>(X_p, Wq_p, bq, Qh_p, L, D, dh);
+        sab_proj_kernel<T><<<grid, block>>>(X_p, Wk_p, bk, Kh_p, L, D, dh);
+        sab_proj_kernel<T><<<grid, block>>>(X_p, Wv_p, bv, Vh_p, L, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
@@ -227,7 +233,7 @@ void run_sab(const ::brotensor::Tensor& X,
     {
         dim3 grid((D + block.x - 1) / block.x,
                   (L + block.y - 1) / block.y);
-        sab_output_kernel<T><<<grid, block>>>(Yc_p, Wo_p, d_mask,
+        sab_output_kernel<T><<<grid, block>>>(Yc_p, Wo_p, bo, d_mask,
                                               static_cast<T*>(O.data), L, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -602,6 +608,10 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
                                  const ::brotensor::Tensor& Wk,
                                  const ::brotensor::Tensor& Wv,
                                  const ::brotensor::Tensor& Wo,
+                                 const ::brotensor::Tensor* bq,
+                                 const ::brotensor::Tensor* bk,
+                                 const ::brotensor::Tensor* bv,
+                                 const ::brotensor::Tensor* bo,
                                  const float* d_mask,
                                  const ::brotensor::Tensor* attn_bias,
                                  int num_heads, float scale,
@@ -633,20 +643,44 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
         }
         bias_p = static_cast<const float*>(attn_bias->data);
     }
+    auto check_proj_bias = [&](const ::brotensor::Tensor* b, const char* name) {
+        if (b && b->data) {
+            if (b->dtype != X.dtype)
+                throw std::runtime_error(std::string("self_attention_bias_forward: ") +
+                                         name + " dtype must match X");
+            if (b->size() != D)
+                throw std::runtime_error(std::string("self_attention_bias_forward: ") +
+                                         name + " must have D entries");
+        }
+    };
+    check_proj_bias(bq, "bq"); check_proj_bias(bk, "bk");
+    check_proj_bias(bv, "bv"); check_proj_bias(bo, "bo");
     if (O.rows != L || O.cols != D || O.dtype != X.dtype) {
         O.resize(L, D, X.dtype);
     }
     if (L == 0 || D == 0) return;
 
+    auto bp = [](const ::brotensor::Tensor* b) {
+        return (b && b->data) ? b->data : nullptr;
+    };
     switch (X.dtype) {
     case Dtype::FP32:
-        run_sab<float>(X, Wq, Wk, Wv, Wo, d_mask, bias_p, num_heads, scale, O);
+        run_sab<float>(X, Wq, Wk, Wv, Wo,
+                       static_cast<const float*>(bp(bq)), static_cast<const float*>(bp(bk)),
+                       static_cast<const float*>(bp(bv)), static_cast<const float*>(bp(bo)),
+                       d_mask, bias_p, num_heads, scale, O);
         break;
     case Dtype::FP16:
-        run_sab<__half>(X, Wq, Wk, Wv, Wo, d_mask, bias_p, num_heads, scale, O);
+        run_sab<__half>(X, Wq, Wk, Wv, Wo,
+                        static_cast<const __half*>(bp(bq)), static_cast<const __half*>(bp(bk)),
+                        static_cast<const __half*>(bp(bv)), static_cast<const __half*>(bp(bo)),
+                        d_mask, bias_p, num_heads, scale, O);
         break;
     default:  // BF16
-        run_sab<__nv_bfloat16>(X, Wq, Wk, Wv, Wo, d_mask, bias_p, num_heads, scale, O);
+        run_sab<__nv_bfloat16>(X, Wq, Wk, Wv, Wo,
+                               static_cast<const __nv_bfloat16*>(bp(bq)), static_cast<const __nv_bfloat16*>(bp(bk)),
+                               static_cast<const __nv_bfloat16*>(bp(bv)), static_cast<const __nv_bfloat16*>(bp(bo)),
+                               d_mask, bias_p, num_heads, scale, O);
         break;
     }
 }

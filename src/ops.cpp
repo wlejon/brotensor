@@ -1310,14 +1310,16 @@ void self_attention_forward(const Tensor& X,
 void self_attention_bias_forward(const Tensor& X,
                                  const Tensor& Wq, const Tensor& Wk,
                                  const Tensor& Wv, const Tensor& Wo,
+                                 const Tensor* bq, const Tensor* bk,
+                                 const Tensor* bv, const Tensor* bo,
                                  const float* d_mask,
                                  const Tensor* attn_bias,
                                  int num_heads, float scale, Tensor& O) {
-    const auto& v = detail::dispatch_with_opts(X, Wq, {&Wk, &Wv, &Wo, attn_bias, &O});
+    const auto& v = detail::dispatch_with_opts(X, Wq, {&Wk, &Wv, &Wo, bq, bk, bv, bo, attn_bias, &O});
     if (!v.self_attention_bias_forward)
         detail::throw_not_implemented("self_attention_bias_forward", X.device);
     detail::adopt_output(O, X.device);
-    v.self_attention_bias_forward(X, Wq, Wk, Wv, Wo, d_mask, attn_bias,
+    v.self_attention_bias_forward(X, Wq, Wk, Wv, Wo, bq, bk, bv, bo, d_mask, attn_bias,
                                   num_heads, scale, O);
 }
 
