@@ -37,6 +37,7 @@ brotensor_add_test(brotensor_test_fft test_fft.cpp)
 brotensor_add_test(brotensor_test_stft test_stft.cpp)
 brotensor_add_test(brotensor_test_conv1d test_conv1d.cpp)
 brotensor_add_test(brotensor_test_lstm test_lstm.cpp)
+brotensor_add_test(brotensor_test_lora test_lora.cpp)
 brotensor_add_test(brotensor_test_vocoder_activations test_vocoder_activations.cpp)
 brotensor_add_test(brotensor_test_codec_quant test_codec_quant.cpp)
 brotensor_add_test(brotensor_test_resample1d test_resample1d.cpp)
@@ -118,7 +119,7 @@ if(BROTENSOR_HAS_GPU)
         reduce loss embedding concat mha batched
         elementwise_extra loss_fused embedding_extra concat_extra
         reduce_extra layernorm_inference layernorm_batched_caches
-        activations geglu swiglu matmul rope rmsnorm lstm
+        activations geglu swiglu matmul rope rmsnorm lstm lora
         conv2d deform_conv2d conv3d group_norm
         resample transpose diffusion kv_cache
         cross_attention self_attention self_attention_decomposed_rel_pos attention_moments
