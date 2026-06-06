@@ -60,6 +60,7 @@ void fill_cuda_vtable_xavier_init    (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_batch_norm     (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_image_preproc  (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_noise          (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_lstm           (::brotensor::detail::OpsVTable&);
 
 // ── alloc table (defined in tensor.cu) ──
 const ::brotensor::detail::AllocVTable& cuda_alloc_table();
@@ -123,6 +124,7 @@ extern "C" void brotensor_probe_and_register_cuda() {
     dc::fill_cuda_vtable_batch_norm(ops);
     dc::fill_cuda_vtable_image_preproc(ops);
     dc::fill_cuda_vtable_noise(ops);
+    dc::fill_cuda_vtable_lstm(ops);
 
     ::brotensor::detail::register_backend(Device::CUDA, ops, dc::cuda_alloc_table());
 }

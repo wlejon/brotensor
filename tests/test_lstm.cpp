@@ -44,11 +44,15 @@ static const int I = 3;
 static const int H = 5;
 static const int G = 4 * H;
 
+// Pin to CPU explicitly: this is a host-side test (finite differences mutate
+// tensors through operator[]), and in a CUDA-enabled build the default device
+// is the GPU — from_host() would land the data there and host indexing would
+// fault. Tensor::mat() (used for the grad buffers below) is already CPU.
 static Tensor make_random(int r, int c, std::mt19937& rng, float scale) {
     std::uniform_real_distribution<float> u(-scale, scale);
     std::vector<float> v(static_cast<std::size_t>(r) * c);
     for (auto& x : v) x = u(rng);
-    return Tensor::from_host(v.data(), r, c);
+    return Tensor::from_host_on(Device::CPU, v.data(), r, c);
 }
 
 // Hand-rolled reference forward — independent of the kernel under test.

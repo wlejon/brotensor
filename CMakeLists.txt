@@ -198,6 +198,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/transpose.cu
         src/cuda/matmul.cu
         src/cuda/matmul_backward.cu
+        src/cuda/lstm.cu
         src/cuda/rope.cu
         src/cuda/rms_norm.cu
         src/cuda/swiglu.cu

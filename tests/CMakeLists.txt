@@ -118,7 +118,7 @@ if(BROTENSOR_HAS_GPU)
         reduce loss embedding concat mha batched
         elementwise_extra loss_fused embedding_extra concat_extra
         reduce_extra layernorm_inference layernorm_batched_caches
-        activations geglu swiglu matmul rope rmsnorm
+        activations geglu swiglu matmul rope rmsnorm lstm
         conv2d deform_conv2d conv3d group_norm
         resample transpose diffusion kv_cache
         cross_attention self_attention self_attention_decomposed_rel_pos attention_moments
