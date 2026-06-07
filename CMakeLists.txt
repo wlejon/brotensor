@@ -334,6 +334,12 @@ if(BROTENSOR_WITH_METAL)
         src/metal/q4k.mm
         src/metal/q6k.mm
         src/metal/q8_0.mm
+        src/metal/stylegan_elementwise.mm
+        src/metal/bias_act.mm
+        src/metal/upfirdn2d.mm
+        src/metal/modulated_conv2d.mm
+        src/metal/deform_conv2d.mm
+        src/metal/lstm.mm
         src/metal/register.mm
     )
     set_source_files_properties(
@@ -410,6 +416,12 @@ if(BROTENSOR_WITH_METAL)
         src/metal/q4k.mm
         src/metal/q6k.mm
         src/metal/q8_0.mm
+        src/metal/stylegan_elementwise.mm
+        src/metal/bias_act.mm
+        src/metal/upfirdn2d.mm
+        src/metal/modulated_conv2d.mm
+        src/metal/deform_conv2d.mm
+        src/metal/lstm.mm
         src/metal/register.mm
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"

@@ -1,13 +1,15 @@
-// CPU↔CUDA parity for the StyleGAN3-R op surface:
+// CPU↔GPU parity for the StyleGAN3-R op surface (runs on whichever GPU backend
+// this binary was built with — CUDA when present, else Metal):
 //   sin / cos / rsqrt / pixel_norm   (fwd + bwd)
 //   bias_act                         (fwd + bwd, dX + dB)
 //   upfirdn2d                        (fwd + bwd)
 //   modulated_conv2d                 (fwd + bwd, dX + dW + ds + dcoef)
 //   filtered_lrelu                   (composite over bias_act + upfirdn2d)
+//   linear_forward_batched_fp16_act  (fused fp16 linear + activation epilogue)
 //
-// The validated CPU FP32 path is the reference; each op runs on CPU and on
-// CUDA over identical inputs and the device result is compared back. Skips
-// cleanly when no CUDA backend is present.
+// The validated CPU FP32 path is the reference; each op runs on CPU and on the
+// GPU backend over identical inputs and the device result is compared back.
+// Skips cleanly when no GPU backend is present.
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -39,11 +41,18 @@ static std::vector<float> rnd(int n, uint64_t seed, float lo, float hi) {
     return v;
 }
 
+// GPU backend this binary was built with: CUDA when present, else Metal.
+static Device gdev() {
+    if (brotensor::is_available(Device::CUDA))  return Device::CUDA;
+    if (brotensor::is_available(Device::Metal)) return Device::Metal;
+    return Device::CPU;
+}
+
 static Tensor cpu(const std::vector<float>& v, int r, int c) {
     return Tensor::from_host_on(Device::CPU, v.data(), r, c);
 }
 static Tensor gpu(const std::vector<float>& v, int r, int c) {
-    return Tensor::from_host_on(Device::CUDA, v.data(), r, c);
+    return Tensor::from_host_on(gdev(), v.data(), r, c);
 }
 
 // Compare a CUDA-resident tensor against a CPU-resident reference tensor.
@@ -142,7 +151,7 @@ static void test_bias_act() {
 
                 Tensor dYc = cpu(w, N, cols), dYg = gpu(w, N, cols), dXc, dXg;
                 Tensor dBc = Tensor::zeros_on(Device::CPU,  C, 1);
-                Tensor dBg = Tensor::zeros_on(Device::CUDA, C, 1);
+                Tensor dBg = Tensor::zeros_on(gdev(), C, 1);
                 brotensor::bias_act_backward(dYc, Xc, bpc, N, C, HW, act, alpha, gain, clamp,
                                              dXc, hb ? &dBc : nullptr);
                 brotensor::bias_act_backward(dYg, Xg, bpg, N, C, HW, act, alpha, gain, clamp,
@@ -213,7 +222,7 @@ static void test_modulated_conv2d() {
         Tensor dYc = cpu(g, N, C_out * H_out * W_out), dYg = gpu(g, N, C_out * H_out * W_out);
         Tensor dXc, dXg, dsc, dsg;
         Tensor dWc = Tensor::zeros_on(Device::CPU,  C_out, wk);
-        Tensor dWg = Tensor::zeros_on(Device::CUDA, C_out, wk);
+        Tensor dWg = Tensor::zeros_on(gdev(), C_out, wk);
         brotensor::modulated_conv2d_backward(Xc, Wc, Sc, dcc, dYc, N, C_in, H, Wd,
                                              C_out, kH, kW, pad_h, pad_w, demod, eps,
                                              dXc, dWc, dsc);
@@ -256,7 +265,7 @@ static void test_filtered_lrelu() {
     Tensor dYc = cpu(g, Yc.rows, Yc.cols), dYg = gpu(g, Yg.rows, Yg.cols);
     Tensor dXc, dXg;
     Tensor dBc = Tensor::zeros_on(Device::CPU,  C, 1);
-    Tensor dBg = Tensor::zeros_on(Device::CUDA, C, 1);
+    Tensor dBg = Tensor::zeros_on(gdev(), C, 1);
     brotensor::filtered_lrelu_backward(dYc, Xc, Fuc, Fdc, &Bc, N, C, H, Wd,
                                        up, down, px0, px1, py0, py1,
                                        gain, slope, clamp, up_bufc, dXc, &dBc);
@@ -293,13 +302,13 @@ static Tensor cpu_q(Prec p, const std::vector<float>& v, int r, int c) {
 static Tensor gpu_h(Prec p, const std::vector<float>& v, int r, int c) {
     std::vector<uint16_t> b(v.size());
     for (size_t i = 0; i < v.size(); ++i) b[i] = to_bits(p, v[i]);
-    return p == F16 ? Tensor::from_host_fp16_on(Device::CUDA, b.data(), r, c)
-                    : Tensor::from_host_bf16_on(Device::CUDA, b.data(), r, c);
+    return p == F16 ? Tensor::from_host_fp16_on(gdev(), b.data(), r, c)
+                    : Tensor::from_host_bf16_on(gdev(), b.data(), r, c);
 }
 static Tensor zeros_h(Prec p, int r, int c) {
     std::vector<uint16_t> b(static_cast<size_t>(r) * c, to_bits(p, 0.0f));
-    return p == F16 ? Tensor::from_host_fp16_on(Device::CUDA, b.data(), r, c)
-                    : Tensor::from_host_bf16_on(Device::CUDA, b.data(), r, c);
+    return p == F16 ? Tensor::from_host_fp16_on(gdev(), b.data(), r, c)
+                    : Tensor::from_host_bf16_on(gdev(), b.data(), r, c);
 }
 // Compare a half GPU tensor against an FP32 CPU reference tensor.
 static void cmp_h(const char* label, Prec p, const Tensor& ref_cpu,
@@ -435,11 +444,55 @@ static void test_half(Prec p) {
     }
 }
 
+// ─── linear_forward_batched_fp16_act ─────────────────────────────────────────
+// FP16 fused linear + activation. CPU FP32 reference computed on the same values
+// the half tensors store. act: 0 none·1 relu·2 gelu(tanh)·3 gelu(exact)·4 silu·
+// 5 quick_gelu (mirrors brotensor::detail activation epilogue).
+static float act_ref(int act, float v) {
+    switch (act) {
+        case 1: return v > 0.0f ? v : 0.0f;
+        case 2: { const float k = 0.7978845608f;
+                  return 0.5f * v * (1.0f + std::tanh(k * (v + 0.044715f * v * v * v))); }
+        case 3: return 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752440f));
+        case 4: return v / (1.0f + std::exp(-v));
+        case 5: return v / (1.0f + std::exp(-1.702f * v));
+        default: return v;
+    }
+}
+
+static void test_linear_fp16_act() {
+    std::printf("  --- linear_forward_batched_fp16_act ---\n");
+    const Prec p = F16;
+    const float atol = 2e-2f, rtol = 2e-2f;
+    const int B = 4, in_dim = 16, out_dim = 8;
+    for (int act = 0; act <= 5; ++act) {
+        auto xv = rnd(B * in_dim, 700 + act, -1.5f, 1.5f);
+        auto wv = rnd(out_dim * in_dim, 800 + act, -0.5f, 0.5f);
+        auto bv = rnd(out_dim, 900 + act, -0.5f, 0.5f);
+        auto xq = quantize(p, xv), wq = quantize(p, wv), bq = quantize(p, bv);
+        std::vector<float> ref(static_cast<size_t>(B) * out_dim);
+        for (int r = 0; r < B; ++r)
+            for (int o = 0; o < out_dim; ++o) {
+                float acc = 0.0f;
+                for (int k = 0; k < in_dim; ++k) acc += xq[r * in_dim + k] * wq[o * in_dim + k];
+                ref[r * out_dim + o] = act_ref(act, acc + bq[o]);
+            }
+        Tensor Rc = Tensor::from_host_on(Device::CPU, ref.data(), B, out_dim);
+        Tensor Wg = gpu_h(p, wv, out_dim, in_dim);
+        Tensor Bg = gpu_h(p, bv, out_dim, 1);
+        Tensor Xg = gpu_h(p, xv, B, in_dim);
+        Tensor Yg;
+        brotensor::linear_forward_batched_fp16_act(Wg, &Bg, Xg, act, Yg);
+        char lbl[48]; std::snprintf(lbl, sizeof lbl, "fp16_act act=%d", act);
+        cmp_h(lbl, p, Rc, Yg, atol, rtol);
+    }
+}
+
 int main() {
     brotensor::init();
-    std::printf("test_stylegan_cuda_parity\n");
-    if (!brotensor::is_available(Device::CUDA)) {
-        std::printf("  CUDA backend unavailable — skipping.\n");
+    std::printf("test_stylegan_parity\n");
+    if (gdev() == Device::CPU) {
+        std::printf("  no GPU backend available — skipping.\n");
         return 0;
     }
     test_elementwise();
@@ -448,12 +501,13 @@ int main() {
     test_upfirdn2d();
     test_modulated_conv2d();
     test_filtered_lrelu();
+    test_linear_fp16_act();
     test_half(F16);
     test_half(B16);
     if (g_failures) {
-        std::printf("\nstylegan_cuda_parity: %d FAILED\n", g_failures);
+        std::printf("\nstylegan_parity: %d FAILED\n", g_failures);
         return 1;
     }
-    std::printf("\nstylegan_cuda_parity: all passed\n");
+    std::printf("\nstylegan_parity: all passed\n");
     return 0;
 }

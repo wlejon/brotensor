@@ -193,12 +193,58 @@ kernel void k_fp16_bias_add(device half*       Y    [[buffer(0)]],
     uint j = idx % out_dim;
     Y[idx] = half(float(Y[idx]) + float(bias[j]));
 }
+
+// MSL has no built-in erf; Abramowitz & Stegun 7.1.26 (matches elementwise.mm
+// so the fused epilogue tracks the unfused linear→activation sequence).
+inline float erf_approx(float x) {
+    const float a1 =  0.254829592f, a2 = -0.284496736f, a3 = 1.421413741f;
+    const float a4 = -1.453152027f, a5 = 1.061405429f, pp = 0.3275911f;
+    float sign_x = (x < 0.0f) ? -1.0f : 1.0f;
+    float ax = fabs(x);
+    float t  = 1.0f / (1.0f + pp * ax);
+    float y  = 1.0f - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-ax * ax);
+    return sign_x * y;
+}
+inline float apply_linear_act(int act, float v) {
+    switch (act) {
+        case 1: return v > 0.0f ? v : 0.0f;                                    // relu
+        case 2: { float u = 0.7978845608f * (v + 0.044715f * v * v * v);       // gelu(tanh)
+                  return 0.5f * v * (1.0f + tanh(clamp(u, -9.0f, 9.0f))); }
+        case 3: return 0.5f * v * (1.0f + erf_approx(v * 0.70710678118654752440f)); // gelu(exact)
+        case 4: return v / (1.0f + exp(-v));                                   // silu
+        case 5: return v / (1.0f + exp(-1.702f * v));                          // quick_gelu
+        default: return v;
+    }
+}
+
+// Fused per-row bias (optional) + activation epilogue.
+kernel void k_fp16_bias_act(device half*       Y    [[buffer(0)]],
+                            device const half* bias [[buffer(1)]],
+                            constant uint& B        [[buffer(2)]],
+                            constant uint& out_dim  [[buffer(3)]],
+                            constant int&  act      [[buffer(4)]],
+                            constant uint& has_bias [[buffer(5)]],
+                            uint idx [[thread_position_in_grid]]) {
+    uint total = B * out_dim;
+    if (idx >= total) return;
+    uint j = idx % out_dim;
+    float v = float(Y[idx]);
+    if (has_bias != 0u) v += float(bias[j]);
+    Y[idx] = half(apply_linear_act(act, v));
+}
 )msl";
 
 id<MTLComputePipelineState> pso_bias_add() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kFp16LinearSrc, @"k_fp16_bias_add"); });
+    return pso;
+}
+
+id<MTLComputePipelineState> pso_bias_act() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kFp16LinearSrc, @"k_fp16_bias_act"); });
     return pso;
 }
 
@@ -260,6 +306,54 @@ void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
             [enc setBytes:&Ou length:sizeof(uint32_t) atIndex:3];
         });
     }
+}
+
+// FP16 batched linear with a fused bias + activation epilogue.
+//   act: 0 none · 1 relu · 2 gelu(tanh) · 3 gelu(exact) · 4 silu · 5 quick_gelu
+void linear_forward_batched_fp16_act(const Tensor& W, const Tensor* bias,
+                                     const Tensor& X_BD, int act, Tensor& Y_BD) {
+    if (W.dtype != Dtype::FP16 || X_BD.dtype != Dtype::FP16) {
+        throw std::runtime_error("linear_forward_batched_fp16_act: W and X must be FP16");
+    }
+    if (bias && bias->dtype != Dtype::FP16) {
+        throw std::runtime_error("linear_forward_batched_fp16_act: bias must be FP16");
+    }
+    const int B       = X_BD.rows;
+    const int in_dim  = X_BD.cols;
+    const int out_dim = W.rows;
+    if (W.cols != in_dim) {
+        throw std::runtime_error("linear_forward_batched_fp16_act: shape mismatch (W.cols != X.cols)");
+    }
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
+        Y_BD.resize(B, out_dim, Dtype::FP16);
+    }
+    if (B == 0 || out_dim == 0) return;
+
+    const uint32_t total = static_cast<uint32_t>(B) * static_cast<uint32_t>(out_dim);
+    metal_impl::launch_matmul_abt_fp16(buffer_for(X_BD), buffer_offset_for(X_BD),
+                                       buffer_for(W),    buffer_offset_for(W),
+                                       buffer_for(Y_BD), buffer_offset_for(Y_BD),
+                                       B, out_dim, in_dim);
+
+    const bool has_bias = bias && bias->size() > 0;
+    if (!has_bias && act == 0) return;  // pure linear, no epilogue needed
+
+    id<MTLBuffer> bY = buffer_for(Y_BD);
+    id<MTLBuffer> bb = has_bias ? buffer_for(*bias) : bY;  // dummy bind if no bias
+    const NSUInteger oY = buffer_offset_for(Y_BD);
+    const NSUInteger ob = has_bias ? buffer_offset_for(*bias) : oY;
+    const uint32_t Bu = static_cast<uint32_t>(B);
+    const uint32_t Ou = static_cast<uint32_t>(out_dim);
+    const int32_t acti = act;
+    const uint32_t has_b = has_bias ? 1u : 0u;
+    launch_1d(pso_bias_act(), total, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bY offset:oY atIndex:0];
+        [enc setBuffer:bb offset:ob atIndex:1];
+        [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&Ou length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&acti length:sizeof(int32_t) atIndex:4];
+        [enc setBytes:&has_b length:sizeof(uint32_t) atIndex:5];
+    });
 }
 
 } // namespace brotensor::detail::metal

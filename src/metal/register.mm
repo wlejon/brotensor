@@ -275,6 +275,26 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.vq_encode_forward                           = &dm::vq_encode_forward;
     ops.window_partition_forward                    = &dm::window_partition_forward;
     ops.window_reverse_forward                      = &dm::window_reverse_forward;
+    // StyleGAN3-R synthesis surface.
+    ops.sin_forward                                 = &dm::sin_forward;
+    ops.sin_backward                                = &dm::sin_backward;
+    ops.cos_forward                                 = &dm::cos_forward;
+    ops.cos_backward                                = &dm::cos_backward;
+    ops.rsqrt_forward                               = &dm::rsqrt_forward;
+    ops.rsqrt_backward                              = &dm::rsqrt_backward;
+    ops.pixel_norm_forward                          = &dm::pixel_norm_forward;
+    ops.pixel_norm_backward                         = &dm::pixel_norm_backward;
+    ops.bias_act_forward                            = &dm::bias_act_forward;
+    ops.bias_act_backward                           = &dm::bias_act_backward;
+    ops.upfirdn2d_forward                           = &dm::upfirdn2d_forward;
+    ops.upfirdn2d_backward                          = &dm::upfirdn2d_backward;
+    ops.modulated_conv2d_forward                    = &dm::modulated_conv2d_forward;
+    ops.modulated_conv2d_backward                   = &dm::modulated_conv2d_backward;
+    // Deformable conv (fwd), LSTM cell, fused fp16 linear+activation.
+    ops.deform_conv2d_forward                       = &dm::deform_conv2d_forward;
+    ops.lstm_forward_train                          = &dm::lstm_forward_train;
+    ops.lstm_backward                               = &dm::lstm_backward;
+    ops.linear_forward_batched_fp16_act             = &dm::linear_forward_batched_fp16_act;
 
     ::brotensor::detail::register_backend(Device::Metal, ops,
                                           dm::metal_alloc_table());
