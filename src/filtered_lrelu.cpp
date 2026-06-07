@@ -1,9 +1,11 @@
 // ─── filtered_lrelu (StyleGAN3 alias-free nonlinearity) ─────────────────────
 //
-// A device-agnostic COMPOSITE over the public bias_act + upfirdn2d ops — no
-// backend kernel and no op_table row; it dispatches through the sub-ops, so it
-// runs on whatever backend the operands live on. Mirrors NVlabs
-// `_filtered_lrelu_ref` EXACTLY, including the operation order:
+// The public entry points are thin dispatchers: if the resolved backend
+// registered a fused `filtered_lrelu_forward/backward` vtable slot (CUDA does),
+// they call it; otherwise they fall back to the device-agnostic COMPOSITE below
+// — a sequence of the public bias_act + upfirdn2d ops, which run on whatever
+// backend the operands live on (this is the only path on CPU/Metal). The
+// composite mirrors NVlabs `_filtered_lrelu_ref` EXACTLY, including order:
 //
 //   x = bias_act(x, b)                              # apply channel bias
 //   x = upfirdn2d(x, fu, up=up,  pad=p, gain=up^2)  # upsample
@@ -16,14 +18,34 @@
 //
 // up_buf/act_buf are returned as caches: up_buf (the post-upsample tensor) is
 // the input to the lrelu bias_act and is required by the backward; act_buf is
-// kept for symmetry with the fused-kernel surface.
+// kept for symmetry with the fused-kernel surface. A fused backend that does
+// not reproduce these caches must keep whatever its own backward consumes —
+// the cache contract is per-backend (see the CUDA kernel).
 
 #include <brotensor/ops.h>
 #include <brotensor/tensor.h>
+#include <brotensor/detail/dispatch.h>
 
 #include <stdexcept>
 
 namespace brotensor {
+
+// Composite fallback, also reused by the CUDA backend for configs its fused
+// kernel does not cover. Declared here (not in the public header) and called
+// from src/cuda/filtered_lrelu.cu via a matching forward declaration.
+void filtered_lrelu_forward_composite(const Tensor& X, const Tensor& fu,
+                                      const Tensor& fd, const Tensor* b,
+                                      int N, int C, int H, int W, int up, int down,
+                                      int pad_x0, int pad_x1, int pad_y0, int pad_y1,
+                                      float gain, float slope, float clamp,
+                                      Tensor& up_buf, Tensor& act_buf, Tensor& Y);
+void filtered_lrelu_backward_composite(const Tensor& dY, const Tensor& X,
+                                       const Tensor& fu, const Tensor& fd,
+                                       const Tensor* b, int N, int C, int H, int W,
+                                       int up, int down, int pad_x0, int pad_x1,
+                                       int pad_y0, int pad_y1, float gain, float slope,
+                                       float clamp, const Tensor& up_buf,
+                                       Tensor& dX, Tensor* dB);
 
 namespace {
 
@@ -38,7 +60,53 @@ inline int up_out(int in, int up, int pad0, int pad1, int fdim) {
 
 } // namespace
 
+// ─── public dispatchers ─────────────────────────────────────────────────────
+
 void filtered_lrelu_forward(const Tensor& X, const Tensor& fu, const Tensor& fd,
+                            const Tensor* b, int N, int C, int H, int W,
+                            int up, int down, int pad_x0, int pad_x1,
+                            int pad_y0, int pad_y1, float gain, float slope,
+                            float clamp, Tensor& up_buf, Tensor& act_buf,
+                            Tensor& Y) {
+    const auto& v = detail::dispatch(X, fu, fd, up_buf, act_buf, Y);
+    if (v.filtered_lrelu_forward) {
+        detail::adopt_output(up_buf, X.device);
+        detail::adopt_output(act_buf, X.device);
+        detail::adopt_output(Y, X.device);
+        v.filtered_lrelu_forward(X, fu, fd, b, N, C, H, W, up, down,
+                                 pad_x0, pad_x1, pad_y0, pad_y1, gain, slope,
+                                 clamp, up_buf, act_buf, Y);
+        return;
+    }
+    filtered_lrelu_forward_composite(X, fu, fd, b, N, C, H, W, up, down,
+                                     pad_x0, pad_x1, pad_y0, pad_y1, gain, slope,
+                                     clamp, up_buf, act_buf, Y);
+}
+
+void filtered_lrelu_backward(const Tensor& dY, const Tensor& X,
+                             const Tensor& fu, const Tensor& fd,
+                             const Tensor* b, int N, int C, int H, int W,
+                             int up, int down, int pad_x0, int pad_x1,
+                             int pad_y0, int pad_y1, float gain, float slope,
+                             float clamp, const Tensor& up_buf,
+                             Tensor& dX, Tensor* dB) {
+    const auto& v = detail::dispatch(dY, X, fu, fd, up_buf, dX);
+    if (v.filtered_lrelu_backward) {
+        detail::adopt_output(dX, X.device);
+        if (dB) detail::adopt_output(*dB, X.device);
+        v.filtered_lrelu_backward(dY, X, fu, fd, b, N, C, H, W, up, down,
+                                  pad_x0, pad_x1, pad_y0, pad_y1, gain, slope,
+                                  clamp, up_buf, dX, dB);
+        return;
+    }
+    filtered_lrelu_backward_composite(dY, X, fu, fd, b, N, C, H, W, up, down,
+                                      pad_x0, pad_x1, pad_y0, pad_y1, gain, slope,
+                                      clamp, up_buf, dX, dB);
+}
+
+// ─── composite implementation (fallback / CPU / Metal) ──────────────────────
+
+void filtered_lrelu_forward_composite(const Tensor& X, const Tensor& fu, const Tensor& fd,
                             const Tensor* b, int N, int C, int H, int W,
                             int up, int down, int pad_x0, int pad_x1,
                             int pad_y0, int pad_y1, float gain, float slope,
@@ -72,7 +140,7 @@ void filtered_lrelu_forward(const Tensor& X, const Tensor& fu, const Tensor& fd,
                       /*flip=*/false, 1.0f, Y);
 }
 
-void filtered_lrelu_backward(const Tensor& dY, const Tensor& X,
+void filtered_lrelu_backward_composite(const Tensor& dY, const Tensor& X,
                              const Tensor& fu, const Tensor& fd,
                              const Tensor* b, int N, int C, int H, int W,
                              int up, int down, int pad_x0, int pad_x1,

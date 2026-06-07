@@ -679,4 +679,18 @@
                                                        float gain, float clamp, ::brotensor::Tensor& Y))                                          \
     X(bias_act_backward,                       void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& X, const ::brotensor::Tensor* b, \
                                                        int N, int C, int HW, int act, float alpha,                                               \
-                                                       float gain, float clamp, ::brotensor::Tensor& dX, ::brotensor::Tensor* dB))
+                                                       float gain, float clamp, ::brotensor::Tensor& dX, ::brotensor::Tensor* dB))              \
+    /* filtered_lrelu: alias-free nonlinearity. CPU/Metal leave these null and  */                                                              \
+    /* fall back to the device-agnostic composite (bias_act + upfirdn2d); CUDA  */                                                              \
+    /* registers a fused kernel. Signatures mirror ops/stylegan.h exactly.      */                                                              \
+    X(filtered_lrelu_forward,                  void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& fu, const ::brotensor::Tensor& fd, \
+                                                       const ::brotensor::Tensor* b, int N, int C, int H, int W,                                 \
+                                                       int up, int down, int pad_x0, int pad_x1, int pad_y0, int pad_y1,                         \
+                                                       float gain, float slope, float clamp,                                                    \
+                                                       ::brotensor::Tensor& up_buf, ::brotensor::Tensor& act_buf, ::brotensor::Tensor& Y))      \
+    X(filtered_lrelu_backward,                 void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& X,                              \
+                                                       const ::brotensor::Tensor& fu, const ::brotensor::Tensor& fd, const ::brotensor::Tensor* b, \
+                                                       int N, int C, int H, int W, int up, int down,                                            \
+                                                       int pad_x0, int pad_x1, int pad_y0, int pad_y1,                                          \
+                                                       float gain, float slope, float clamp, const ::brotensor::Tensor& up_buf,                 \
+                                                       ::brotensor::Tensor& dX, ::brotensor::Tensor* dB))
