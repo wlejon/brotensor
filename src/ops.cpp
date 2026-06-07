@@ -2709,4 +2709,37 @@ void upfirdn2d_backward(const Tensor& dY, const Tensor& f,
                          pad_x0, pad_x1, pad_y0, pad_y1, flip_filter, gain, dX);
 }
 
+// ─── StyleGAN3 modulated_conv2d ─────────────────────────────────────────────
+
+void modulated_conv2d_forward(const Tensor& X, const Tensor& W, const Tensor& s,
+                              int N, int C_in, int H, int Wd,
+                              int C_out, int kH, int kW,
+                              int pad_h, int pad_w,
+                              bool demodulate, float eps,
+                              Tensor& dcoef, Tensor& Y) {
+    const auto& v = detail::dispatch(X, W, s, dcoef, Y);
+    if (!v.modulated_conv2d_forward)
+        detail::throw_not_implemented("modulated_conv2d_forward", X.device);
+    detail::adopt_output(dcoef, X.device);
+    detail::adopt_output(Y, X.device);
+    v.modulated_conv2d_forward(X, W, s, N, C_in, H, Wd, C_out, kH, kW,
+                               pad_h, pad_w, demodulate, eps, dcoef, Y);
+}
+
+void modulated_conv2d_backward(const Tensor& X, const Tensor& W, const Tensor& s,
+                               const Tensor& dcoef, const Tensor& dY,
+                               int N, int C_in, int H, int Wd,
+                               int C_out, int kH, int kW,
+                               int pad_h, int pad_w, bool demodulate, float eps,
+                               Tensor& dX, Tensor& dW, Tensor& ds) {
+    const auto& v = detail::dispatch(X, W, s, dcoef, dY, dX, dW, ds);
+    if (!v.modulated_conv2d_backward)
+        detail::throw_not_implemented("modulated_conv2d_backward", X.device);
+    detail::adopt_output(dX, X.device);
+    detail::adopt_output(dW, X.device);
+    detail::adopt_output(ds, X.device);
+    v.modulated_conv2d_backward(X, W, s, dcoef, dY, N, C_in, H, Wd, C_out, kH, kW,
+                                pad_h, pad_w, demodulate, eps, dX, dW, ds);
+}
+
 } // namespace brotensor

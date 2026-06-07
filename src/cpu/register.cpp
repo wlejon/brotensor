@@ -1027,6 +1027,23 @@ void upfirdn2d_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
                         int up_x, int up_y, int down_x, int down_y,
                         int pad_x0, int pad_x1, int pad_y0, int pad_y1,
                         bool flip_filter, float gain, ::brotensor::Tensor& dX);
+void modulated_conv2d_forward(const ::brotensor::Tensor& X,
+                              const ::brotensor::Tensor& W,
+                              const ::brotensor::Tensor& s,
+                              int N, int C_in, int H, int Wd,
+                              int C_out, int kH, int kW, int pad_h, int pad_w,
+                              bool demodulate, float eps,
+                              ::brotensor::Tensor& dcoef, ::brotensor::Tensor& Y);
+void modulated_conv2d_backward(const ::brotensor::Tensor& X,
+                               const ::brotensor::Tensor& W,
+                               const ::brotensor::Tensor& s,
+                               const ::brotensor::Tensor& dcoef,
+                               const ::brotensor::Tensor& dY,
+                               int N, int C_in, int H, int Wd,
+                               int C_out, int kH, int kW, int pad_h, int pad_w,
+                               bool demodulate, float eps,
+                               ::brotensor::Tensor& dX, ::brotensor::Tensor& dW,
+                               ::brotensor::Tensor& ds);
 
 } // namespace brotensor::detail::cpu
 
@@ -1325,6 +1342,8 @@ struct CpuStaticRegistrar {
         ops.bias_act_backward            = &detail::cpu::bias_act_backward;
         ops.upfirdn2d_forward            = &detail::cpu::upfirdn2d_forward;
         ops.upfirdn2d_backward           = &detail::cpu::upfirdn2d_backward;
+        ops.modulated_conv2d_forward     = &detail::cpu::modulated_conv2d_forward;
+        ops.modulated_conv2d_backward    = &detail::cpu::modulated_conv2d_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

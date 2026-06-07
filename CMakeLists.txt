@@ -137,6 +137,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/stylegan_elementwise.cpp
     src/cpu/bias_act.cpp
     src/cpu/upfirdn2d.cpp
+    src/cpu/modulated_conv2d.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)
