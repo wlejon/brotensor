@@ -44,6 +44,10 @@ void modulated_conv2d_forward(const Tensor& X, const Tensor& W, const Tensor& s,
 // modulated_conv2d backward. Reconstructs w' from (W,s) and uses the saved
 // `dcoef`. dX is overwritten; dW ACCUMULATES (caller zeros); ds is overwritten.
 //   dX: (N, C_in*H*W).  dW: (C_out, C_in*kH*kW).  ds: (N, C_in).
+// dW is OPTIONAL: pass an uncommitted (default-constructed / empty) Tensor to
+// skip the weight gradient entirely — the op then drops the dW GEMM and its
+// scratch. Inversion uses this (it freezes the weights and discards dW). A
+// committed dW must match X's dtype and (C_out, C_in*kH*kW) shape.
 // Math (per sample n; dw'' = conv2d_backward_weight(X[n],dY[n])):
 //   g[n,o]   = Σ_{i,kh,kw} dw''[n,o,..] * w'[n,o,..]
 //   dw'[n,o] = demodulate ? dw''*dcoef - g*dcoef^3*w' : dw''

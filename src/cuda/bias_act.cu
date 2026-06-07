@@ -25,10 +25,20 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
 namespace brotensor::detail::cuda {
+
+// Defined in runtime.cu / tensor.cu (same namespace). The pooled allocator
+// (cudaMallocAsync / cudaFreeAsync) draws from a stream-ordered memory pool, so
+// scratch alloc/free costs nothing on the host timeline — unlike raw cudaMalloc
+// / cudaFree, which synchronize the device. Op scratch must be allocated and
+// freed on the same stream its kernels run on, hence the current-stream launch.
+void* cuda_current_stream();
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
 namespace {
 
@@ -142,7 +152,8 @@ template <typename T>
 void launch_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor* b,
                     long long total, int C, int HW, int act, float alpha,
                     float gain, float clamp, ::brotensor::Tensor& Y) {
-    bias_act_forward_kernel<T><<<ba_grid(total), BA_BLOCK>>>(
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    bias_act_forward_kernel<T><<<ba_grid(total), BA_BLOCK, 0, stream>>>(
         static_cast<const T*>(X.data),
         b ? static_cast<const T*>(b->data) : nullptr,
         total, C, HW, act, alpha, gain, clamp, static_cast<T*>(Y.data));
@@ -208,17 +219,20 @@ void bias_act_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor&
 
     // dB reduction goes through an FP32 scratch (atomicAdd needs FP32 for the
     // FP16/BF16 paths, and gives a stable full-precision reduction in FP32).
+    // The scratch is pooled (stream-ordered) and freed on the same stream the
+    // kernels run on — cudaFreeAsync orders the reclaim after the merge kernel,
+    // so no device sync is needed.
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     float* d_scratch = nullptr;
     if (dB) {
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
-                                        static_cast<size_t>(C) * sizeof(float)));
+        d_scratch = static_cast<float*>(cuda_alloc(static_cast<size_t>(C) * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_scratch, 0,
-                                             static_cast<size_t>(C) * sizeof(float)));
+                                             static_cast<size_t>(C) * sizeof(float), stream));
     }
 
     auto run = [&](auto tag) {
         using T = decltype(tag);
-        bias_act_backward_kernel<T><<<ba_grid(total), BA_BLOCK>>>(
+        bias_act_backward_kernel<T><<<ba_grid(total), BA_BLOCK, 0, stream>>>(
             static_cast<const T*>(dY.data), static_cast<const T*>(X.data),
             b ? static_cast<const T*>(b->data) : nullptr,
             total, C, HW, act, alpha, gain, clamp,
@@ -226,7 +240,7 @@ void bias_act_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor&
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         if (dB) {
             const int blocks = (C + BA_BLOCK - 1) / BA_BLOCK;
-            ba_merge_dB_kernel<T><<<blocks, BA_BLOCK>>>(
+            ba_merge_dB_kernel<T><<<blocks, BA_BLOCK, 0, stream>>>(
                 d_scratch, static_cast<T*>(dB->data), C);
             BROTENSOR_CUDA_CHECK(cudaGetLastError());
         }
@@ -236,12 +250,7 @@ void bias_act_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor&
     else if (X.dtype == ::brotensor::Dtype::BF16)  run(__nv_bfloat16{});
     else                                           run(float{});
 
-    if (d_scratch) {
-        // The merge kernel has consumed the scratch; sync before freeing so we
-        // don't reclaim memory a still-running kernel reads.
-        BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(0));
-        cudaFree(d_scratch);
-    }
+    if (d_scratch) cuda_free(d_scratch);
 }
 
 void fill_cuda_vtable_bias_act(::brotensor::detail::OpsVTable& v) {

@@ -148,6 +148,18 @@ static void run_case(const Dims& d, bool demod) {
         CHECK(close(ds[k], fd, 1e-2f));
     }
 
+    // ── Nullable dW: an uncommitted dW skips the weight gradient but must
+    // leave dX/ds bit-identical to the full-gradient run (and dW untouched).
+    {
+        Tensor dX2, ds2, dW_skip;  // dW_skip uncommitted ⇒ skipped
+        brotensor::modulated_conv2d_backward(X, W, S, dcoef, dY, d.N, d.Cin, d.H, d.W,
+                                             d.Cout, d.kH, d.kW, d.pad, d.pad,
+                                             demod, eps, dX2, dW_skip, ds2);
+        CHECK(dW_skip.data == nullptr);  // still uncommitted — no gradient written
+        for (int i = 0; i < xn; ++i) CHECK(dX2[i] == dX[i]);
+        for (int k = 0; k < sn; ++k) CHECK(ds2[k] == ds[k]);
+    }
+
     // ── CUDA parity: the CUDA backward must match the FD-verified CPU backward.
     // (Forward CUDA parity is covered by test_stylegan_parity; this closes the
     // gap on the backward — dX in particular.)
@@ -172,6 +184,17 @@ static void run_case(const Dims& d, bool demod) {
         for (int k = 0; k < sn; ++k) { mS = std::max(mS, (double)std::fabs(hS[k] - ds[k])); CHECK(close(hS[k], ds[k], 5e-3f)); }
         std::printf("  [cuda parity] %dx%d demod=%d: max|dX|=%.2e max|dW|=%.2e max|ds|=%.2e\n",
                     d.kH, d.kW, demod ? 1 : 0, mX, mW, mS);
+
+        // CUDA nullable dW: skipping the weight gradient must not perturb dX/ds.
+        Tensor dXs, dss, dW_skip;
+        brotensor::modulated_conv2d_backward(Xc, Wc, Sc, dcc, dYc, d.N, d.Cin, d.H, d.W,
+                                             d.Cout, d.kH, d.kW, d.pad, d.pad,
+                                             demod, eps, dXs, dW_skip, dss);
+        CHECK(dW_skip.data == nullptr);
+        std::vector<float> hXs = dXs.to_host_vector();
+        std::vector<float> hSs = dss.to_host_vector();
+        for (int i = 0; i < xn; ++i) CHECK(hXs[i] == hX[i]);
+        for (int k = 0; k < sn; ++k) CHECK(hSs[k] == hS[k]);
     }
 }
 

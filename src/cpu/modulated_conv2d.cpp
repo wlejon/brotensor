@@ -159,8 +159,15 @@ void modulated_conv2d_backward(const ::brotensor::Tensor& X,
     const int W_out = Wd + 2 * pad_w - (kW - 1);
     if (W.rows != C_out || W.cols != wk)
         throw std::runtime_error("modulated_conv2d_backward: W shape mismatch");
-    if (dW.rows != C_out || dW.cols != wk)
-        throw std::runtime_error("modulated_conv2d_backward: dW shape mismatch");
+    // dW is an optional output: an uncommitted (data == nullptr) dW means
+    // "skip the weight gradient" (mirrors the CUDA backend — used by inversion,
+    // which freezes the weights). When committed it must be FP32 and shaped.
+    const bool want_dW = (dW.data != nullptr);
+    if (want_dW) {
+        check_fp32(dW, "modulated_conv2d_backward", "dW");
+        if (dW.rows != C_out || dW.cols != wk)
+            throw std::runtime_error("modulated_conv2d_backward: dW shape mismatch");
+    }
     if (dX.rows != N || dX.cols != C_in * H * Wd || dX.dtype != Dtype::FP32)
         dX.resize(N, C_in * H * Wd, Dtype::FP32);
     if (ds.rows != N || ds.cols != C_in || ds.dtype != Dtype::FP32)
@@ -170,7 +177,7 @@ void modulated_conv2d_backward(const ::brotensor::Tensor& X,
     const float* Wp = W.host_f32();
     const float* sp = s.host_f32();
     const float* dcp = dcoef.host_f32();
-    float* dWp = dW.host_f32_mut();   // accumulate
+    float* dWp = want_dW ? dW.host_f32_mut() : nullptr;   // accumulate (optional)
     float* dsp = ds.host_f32_mut();   // overwrite
 
     const int out_cols = C_out * H_out * W_out;
@@ -235,7 +242,7 @@ void modulated_conv2d_backward(const ::brotensor::Tensor& X,
                 for (int t = 0; t < kH * kW; ++t) {
                     const int col = i * kH * kW + t;
                     const float dwp = dWpr[ob + col];
-                    dWp[ob + col] += dwp * si;             // accumulate dW
+                    if (want_dW) dWp[ob + col] += dwp * si;   // accumulate dW (optional)
                     ds_acc += static_cast<double>(dwp) * Wo[col];
                 }
                 dsn[i] += static_cast<float>(ds_acc);      // overwrite ds[n,i]

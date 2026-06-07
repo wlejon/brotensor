@@ -26,6 +26,11 @@
 
 namespace brotensor::detail::cuda {
 
+// Defined in runtime.cu. Launch on the current stream so this op composes
+// correctly with the stream-ordered modulated_conv2d / bias_act it chains with
+// in filtered_lrelu (rather than always serializing on the default stream).
+void* cuda_current_stream();
+
 namespace {
 
 constexpr int UF_BLOCK = 256;
@@ -129,19 +134,20 @@ void upfirdn2d_run(const ::brotensor::Tensor& In, int N, int C, int Hin, int Win
     if (blocks > 65535) blocks = 65535;
     if (blocks < 1) blocks = 1;
     const int grid = static_cast<int>(blocks);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
 
     if (In.dtype == ::brotensor::Dtype::FP16)
-        upfirdn2d_kernel<__half><<<grid, UF_BLOCK>>>(
+        upfirdn2d_kernel<__half><<<grid, UF_BLOCK, 0, stream>>>(
             static_cast<const __half*>(In.data), static_cast<const __half*>(f.data),
             N, C, Hin, Win, Hout, Wout, fH, fW, up_x, up_y, down_x, down_y,
             px0, py0, Hu, Wu, flip_filter ? 1 : 0, gain, static_cast<__half*>(Out.data));
     else if (In.dtype == ::brotensor::Dtype::BF16)
-        upfirdn2d_kernel<__nv_bfloat16><<<grid, UF_BLOCK>>>(
+        upfirdn2d_kernel<__nv_bfloat16><<<grid, UF_BLOCK, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(In.data), static_cast<const __nv_bfloat16*>(f.data),
             N, C, Hin, Win, Hout, Wout, fH, fW, up_x, up_y, down_x, down_y,
             px0, py0, Hu, Wu, flip_filter ? 1 : 0, gain, static_cast<__nv_bfloat16*>(Out.data));
     else
-        upfirdn2d_kernel<float><<<grid, UF_BLOCK>>>(
+        upfirdn2d_kernel<float><<<grid, UF_BLOCK, 0, stream>>>(
             static_cast<const float*>(In.data), static_cast<const float*>(f.data),
             N, C, Hin, Win, Hout, Wout, fH, fW, up_x, up_y, down_x, down_y,
             px0, py0, Hu, Wu, flip_filter ? 1 : 0, gain, static_cast<float*>(Out.data));

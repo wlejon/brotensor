@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <stdexcept>
 
 // Phase 2G stashes the BROTENSOR_CUDA_CHECK macro here.
@@ -294,6 +295,12 @@ __global__ void conv2d_add_fp32_into_bf16(const float* __restrict__ src,
 
 namespace detail::cuda {
 
+// Pooled, stream-ordered scratch allocator (defined in tensor.cu). Backward
+// scratch is allocated/freed through this instead of raw cudaMalloc/cudaFree so
+// the per-op scratch sites in the inversion loop stop synchronizing the device.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
+
 void conv2d_forward(const ::brotensor::Tensor& X,
                     const ::brotensor::Tensor& Wt,
                     const ::brotensor::Tensor* bias,
@@ -431,8 +438,9 @@ void conv2d_backward_input(const ::brotensor::Tensor& Wt,
     if (total == 0) return;
 
     const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     if (Wt.dtype == Dtype::FP16) {
-        conv2d_backward_input_kernel<__half><<<blocks, CONV_BLOCK>>>(
+        conv2d_backward_input_kernel<__half><<<blocks, CONV_BLOCK, 0, stream>>>(
             static_cast<const __half*>(Wt.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
@@ -440,7 +448,7 @@ void conv2d_backward_input(const ::brotensor::Tensor& Wt,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
     } else if (Wt.dtype == Dtype::BF16) {
-        conv2d_backward_input_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK>>>(
+        conv2d_backward_input_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(Wt.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data),
@@ -448,7 +456,7 @@ void conv2d_backward_input(const ::brotensor::Tensor& Wt,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
     } else {
-        conv2d_backward_input_kernel<float><<<blocks, CONV_BLOCK>>>(
+        conv2d_backward_input_kernel<float><<<blocks, CONV_BLOCK, 0, stream>>>(
             static_cast<const float*>(Wt.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data),
@@ -493,14 +501,15 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
     if (total == 0) return;
 
     // FP32 scratch for the per-element partial sum. We write it (overwrite)
-    // in the main kernel, then fold into the caller's accumulator (add).
-    float* d_scratch = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
-                                    total * sizeof(float)));
+    // in the main kernel, then fold into the caller's accumulator (add). Pooled
+    // + stream-ordered: cudaFreeAsync orders the reclaim after the fold kernel,
+    // so no device sync is needed.
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    float* d_scratch = static_cast<float*>(cuda_alloc(total * sizeof(float)));
 
     const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
     if (X.dtype == Dtype::FP16) {
-        conv2d_backward_weight_kernel<__half><<<blocks, CONV_BLOCK>>>(
+        conv2d_backward_weight_kernel<__half><<<blocks, CONV_BLOCK, 0, stream>>>(
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(dY.data),
             d_scratch,
@@ -508,7 +517,7 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
     } else if (X.dtype == Dtype::BF16) {
-        conv2d_backward_weight_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK>>>(
+        conv2d_backward_weight_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             d_scratch,
@@ -516,7 +525,7 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             groups, Cg_in, Cg_out, total);
     } else {
-        conv2d_backward_weight_kernel<float><<<blocks, CONV_BLOCK>>>(
+        conv2d_backward_weight_kernel<float><<<blocks, CONV_BLOCK, 0, stream>>>(
             static_cast<const float*>(X.data),
             static_cast<const float*>(dY.data),
             d_scratch,
@@ -528,17 +537,17 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
 
     const int fold_blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
     if (X.dtype == Dtype::FP16) {
-        conv2d_add_fp32_into_fp16<<<fold_blocks, CONV_BLOCK>>>(
+        conv2d_add_fp32_into_fp16<<<fold_blocks, CONV_BLOCK, 0, stream>>>(
             d_scratch, static_cast<__half*>(dWt.data), total);
     } else if (X.dtype == Dtype::BF16) {
-        conv2d_add_fp32_into_bf16<<<fold_blocks, CONV_BLOCK>>>(
+        conv2d_add_fp32_into_bf16<<<fold_blocks, CONV_BLOCK, 0, stream>>>(
             d_scratch, static_cast<__nv_bfloat16*>(dWt.data), total);
     } else {
-        conv2d_add_fp32_into_fp32<<<fold_blocks, CONV_BLOCK>>>(
+        conv2d_add_fp32_into_fp32<<<fold_blocks, CONV_BLOCK, 0, stream>>>(
             d_scratch, static_cast<float*>(dWt.data), total);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    cudaFree(d_scratch);
+    cuda_free(d_scratch);
 }
 
 void conv2d_backward_bias(const ::brotensor::Tensor& dY,
@@ -556,20 +565,19 @@ void conv2d_backward_bias(const ::brotensor::Tensor& dY,
     }
     if (C_out == 0 || N == 0 || H_out == 0 || W_out == 0) return;
 
-    float* d_scratch = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
-                                    C_out * sizeof(float)));
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    float* d_scratch = static_cast<float*>(cuda_alloc(C_out * sizeof(float)));
 
     if (dY.dtype == Dtype::FP16) {
-        conv2d_backward_bias_kernel<__half><<<C_out, BIAS_BLOCK>>>(
+        conv2d_backward_bias_kernel<__half><<<C_out, BIAS_BLOCK, 0, stream>>>(
             static_cast<const __half*>(dY.data),
             d_scratch, N, C_out, H_out, W_out);
     } else if (dY.dtype == Dtype::BF16) {
-        conv2d_backward_bias_kernel<__nv_bfloat16><<<C_out, BIAS_BLOCK>>>(
+        conv2d_backward_bias_kernel<__nv_bfloat16><<<C_out, BIAS_BLOCK, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(dY.data),
             d_scratch, N, C_out, H_out, W_out);
     } else {
-        conv2d_backward_bias_kernel<float><<<C_out, BIAS_BLOCK>>>(
+        conv2d_backward_bias_kernel<float><<<C_out, BIAS_BLOCK, 0, stream>>>(
             static_cast<const float*>(dY.data),
             d_scratch, N, C_out, H_out, W_out);
     }
@@ -577,17 +585,17 @@ void conv2d_backward_bias(const ::brotensor::Tensor& dY,
 
     const int fold_blocks = (C_out + 127) / 128;
     if (dY.dtype == Dtype::FP16) {
-        conv2d_add_fp32_into_fp16<<<fold_blocks, 128>>>(
+        conv2d_add_fp32_into_fp16<<<fold_blocks, 128, 0, stream>>>(
             d_scratch, static_cast<__half*>(dB.data), C_out);
     } else if (dY.dtype == Dtype::BF16) {
-        conv2d_add_fp32_into_bf16<<<fold_blocks, 128>>>(
+        conv2d_add_fp32_into_bf16<<<fold_blocks, 128, 0, stream>>>(
             d_scratch, static_cast<__nv_bfloat16*>(dB.data), C_out);
     } else {
-        conv2d_add_fp32_into_fp32<<<fold_blocks, 128>>>(
+        conv2d_add_fp32_into_fp32<<<fold_blocks, 128, 0, stream>>>(
             d_scratch, static_cast<float*>(dB.data), C_out);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    cudaFree(d_scratch);
+    cuda_free(d_scratch);
 }
 
 } // namespace detail::cuda

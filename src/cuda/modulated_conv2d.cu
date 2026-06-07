@@ -35,10 +35,18 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
 namespace brotensor::detail::cuda {
+
+// runtime.cu / tensor.cu (same namespace). Helper kernels launch on the current
+// stream and the FP32 dW accumulator is pooled (cudaMallocAsync/cudaFreeAsync),
+// so the per-sample inversion loop stops synchronizing the device on each op.
+void* cuda_current_stream();
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
 // Reused CUDA conv2d kernels (defined in conv2d.cu, same namespace).
 void conv2d_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wt,
@@ -245,8 +253,9 @@ void forward_impl(const ::brotensor::Tensor& X, const ::brotensor::Tensor& W,
     ::brotensor::Tensor Wn = ::brotensor::Tensor::zeros_on(::brotensor::Device::CUDA,
                                                            C_out, wk, X.dtype);
     const size_t shmem = MC_BLOCK * sizeof(float);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     for (int n = 0; n < N; ++n) {
-        modulate_build_kernel<T><<<C_out, MC_BLOCK, shmem>>>(
+        modulate_build_kernel<T><<<C_out, MC_BLOCK, shmem, stream>>>(
             static_cast<const T*>(W.data), sp + static_cast<size_t>(n) * C_in,
             C_out, khw, wk, demodulate ? 1 : 0, eps,
             static_cast<T*>(Wn.data), dcp + static_cast<size_t>(n) * C_out);
@@ -263,7 +272,7 @@ void backward_impl(const ::brotensor::Tensor& X, const ::brotensor::Tensor& W,
                    const ::brotensor::Tensor& s, const ::brotensor::Tensor& dcoef,
                    const ::brotensor::Tensor& dY, int N, int C_in, int H, int Wd,
                    int C_out, int kH, int kW, int pad_h, int pad_w,
-                   bool demodulate, int wk, int khw, int out_cols,
+                   bool demodulate, bool want_dW, int wk, int khw, int out_cols,
                    ::brotensor::Tensor& dX, ::brotensor::Tensor& dW, ::brotensor::Tensor& ds) {
     const T* sp = static_cast<const T*>(s.data);
     const float* dcp = static_cast<const float*>(dcoef.data);
@@ -277,19 +286,25 @@ void backward_impl(const ::brotensor::Tensor& X, const ::brotensor::Tensor& W,
     const size_t shmem = MC_BLOCK * sizeof(float);
     const size_t dWpp_bytes = static_cast<size_t>(wtotal) *
                               static_cast<size_t>(::brotensor::dtype_size_bytes(X.dtype));
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
 
-    // FP32 dW accumulator across the whole batch.
+    // FP32 dW accumulator across the whole batch — pooled, stream-ordered.
+    // Skipped entirely when the caller doesn't want the weight gradient (an
+    // uncommitted dW), which is the common case during latent inversion: it
+    // freezes the weights and discards dW. That drops the dW GEMM (accum_dW),
+    // the final merge, and the scratch alloc/free for the whole backward.
     float* dW_f32 = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dW_f32),
-                                    static_cast<size_t>(wtotal) * sizeof(float)));
-    BROTENSOR_CUDA_CHECK(cudaMemsetAsync(dW_f32, 0,
-                                         static_cast<size_t>(wtotal) * sizeof(float)));
+    if (want_dW) {
+        dW_f32 = static_cast<float*>(cuda_alloc(static_cast<size_t>(wtotal) * sizeof(float)));
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(dW_f32, 0,
+                                             static_cast<size_t>(wtotal) * sizeof(float), stream));
+    }
 
     for (int n = 0; n < N; ++n) {
         const T* sn = sp + static_cast<size_t>(n) * C_in;
         const float* dcn = dcp + static_cast<size_t>(n) * C_out;
 
-        build_wpr_wpp_kernel<T><<<grid_for(wtotal), MC_BLOCK>>>(
+        build_wpr_wpp_kernel<T><<<grid_for(wtotal), MC_BLOCK, 0, stream>>>(
             static_cast<const T*>(W.data), sn, dcn, khw, wk, wtotal,
             static_cast<T*>(Wpr.data), static_cast<T*>(Wpp.data));
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -297,33 +312,36 @@ void backward_impl(const ::brotensor::Tensor& X, const ::brotensor::Tensor& W,
         ::brotensor::Tensor Xn  = row_view(X, n, C_in * H * Wd);
         ::brotensor::Tensor dYn = row_view(dY, n, out_cols);
 
-        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(dWpp.data, 0, dWpp_bytes));
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(dWpp.data, 0, dWpp_bytes, stream));
         conv2d_backward_weight(Xn, dYn, 1, C_in, H, Wd, C_out, kH, kW,
                                1, 1, pad_h, pad_w, 1, 1, 1, dWpp);
         ::brotensor::Tensor dXn = row_view(dX, n, C_in * H * Wd);
         conv2d_backward_input(Wpp, dYn, 1, C_in, H, Wd, C_out, kH, kW,
                               1, 1, pad_h, pad_w, 1, 1, 1, dXn);
 
-        demod_dwpr_kernel<T><<<C_out, MC_BLOCK, shmem>>>(
+        demod_dwpr_kernel<T><<<C_out, MC_BLOCK, shmem, stream>>>(
             static_cast<const T*>(dWpp.data), static_cast<const T*>(Wpr.data),
             dcn, C_out, wk, demodulate ? 1 : 0, static_cast<T*>(dWpr.data));
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
-        accum_dW_kernel<T><<<grid_for(wtotal), MC_BLOCK>>>(
-            static_cast<const T*>(dWpr.data), sn, khw, wk, wtotal, dW_f32);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        if (want_dW) {
+            accum_dW_kernel<T><<<grid_for(wtotal), MC_BLOCK, 0, stream>>>(
+                static_cast<const T*>(dWpr.data), sn, khw, wk, wtotal, dW_f32);
+            BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        }
 
-        ds_kernel<T><<<C_in, MC_BLOCK, shmem>>>(
+        ds_kernel<T><<<C_in, MC_BLOCK, shmem, stream>>>(
             static_cast<const T*>(dWpr.data), static_cast<const T*>(W.data),
             C_out, C_in, khw, wk, dsp + static_cast<size_t>(n) * C_in);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    merge_dW_kernel<T><<<grid_for(wtotal), MC_BLOCK>>>(
-        dW_f32, static_cast<T*>(dW.data), wtotal);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(0));
-    cudaFree(dW_f32);
+    if (want_dW) {
+        merge_dW_kernel<T><<<grid_for(wtotal), MC_BLOCK, 0, stream>>>(
+            dW_f32, static_cast<T*>(dW.data), wtotal);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        cuda_free(dW_f32);
+    }
 }
 
 } // namespace
@@ -387,9 +405,8 @@ void modulated_conv2d_backward(const ::brotensor::Tensor& X,
     require_fp(W, "modulated_conv2d_backward", "W");
     require_fp(s, "modulated_conv2d_backward", "s");
     require_fp(dY, "modulated_conv2d_backward", "dY");
-    if (W.dtype != X.dtype || s.dtype != X.dtype || dY.dtype != X.dtype ||
-        dW.dtype != X.dtype)
-        throw std::runtime_error("modulated_conv2d_backward: W/s/dY/dW dtype must match X");
+    if (W.dtype != X.dtype || s.dtype != X.dtype || dY.dtype != X.dtype)
+        throw std::runtime_error("modulated_conv2d_backward: W/s/dY dtype must match X");
     if (dcoef.dtype != ::brotensor::Dtype::FP32)
         throw std::runtime_error("modulated_conv2d_backward: dcoef must be FP32");
     (void)eps;  // demod coefficient is precomputed (passed in as dcoef)
@@ -399,8 +416,16 @@ void modulated_conv2d_backward(const ::brotensor::Tensor& X,
     const int W_out = Wd + 2 * pad_w - (kW - 1);
     if (W.rows != C_out || W.cols != wk)
         throw std::runtime_error("modulated_conv2d_backward: W shape mismatch");
-    if (dW.rows != C_out || dW.cols != wk)
-        throw std::runtime_error("modulated_conv2d_backward: dW shape mismatch");
+    // dW is an optional output: an uncommitted (data == nullptr) dW means
+    // "skip the weight gradient" — a straight speedup for inversion, which
+    // freezes the weights. When committed it must match X's dtype and shape.
+    const bool want_dW = (dW.data != nullptr);
+    if (want_dW) {
+        if (dW.dtype != X.dtype)
+            throw std::runtime_error("modulated_conv2d_backward: dW dtype must match X");
+        if (dW.rows != C_out || dW.cols != wk)
+            throw std::runtime_error("modulated_conv2d_backward: dW shape mismatch");
+    }
     if (dX.rows != N || dX.cols != C_in * H * Wd || dX.dtype != X.dtype)
         dX.resize(N, C_in * H * Wd, X.dtype);
     if (ds.rows != N || ds.cols != C_in || ds.dtype != X.dtype)
@@ -410,13 +435,13 @@ void modulated_conv2d_backward(const ::brotensor::Tensor& X,
 
     if (X.dtype == ::brotensor::Dtype::FP16)
         backward_impl<__half>(X, W, s, dcoef, dY, N, C_in, H, Wd, C_out, kH, kW,
-                              pad_h, pad_w, demodulate, wk, khw, out_cols, dX, dW, ds);
+                              pad_h, pad_w, demodulate, want_dW, wk, khw, out_cols, dX, dW, ds);
     else if (X.dtype == ::brotensor::Dtype::BF16)
         backward_impl<__nv_bfloat16>(X, W, s, dcoef, dY, N, C_in, H, Wd, C_out, kH, kW,
-                                     pad_h, pad_w, demodulate, wk, khw, out_cols, dX, dW, ds);
+                                     pad_h, pad_w, demodulate, want_dW, wk, khw, out_cols, dX, dW, ds);
     else
         backward_impl<float>(X, W, s, dcoef, dY, N, C_in, H, Wd, C_out, kH, kW,
-                             pad_h, pad_w, demodulate, wk, khw, out_cols, dX, dW, ds);
+                             pad_h, pad_w, demodulate, want_dW, wk, khw, out_cols, dX, dW, ds);
 }
 
 void fill_cuda_vtable_modulated_conv2d(::brotensor::detail::OpsVTable& v) {
