@@ -7,8 +7,10 @@
 // Backward (dX, dB) is checked vs finite difference of that reference.
 
 #include <brotensor/ops.h>
+#include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -163,24 +165,63 @@ static void run_case(const Cfg& c) {
                close(a, static_cast<float>(fdp), 3e-2f) ||
                close(a, static_cast<float>(fdm), 3e-2f);
     };
+    double worst_central = 0.0;
     for (int i = 0; i < xn; ++i) {
         std::vector<float> xp = x, xm = x; xp[i] += h; xm[i] -= h;
-        CHECK(pw_ok(dX[i], loss(xp, b), loss(xm, b)));
+        const double Lp = loss(xp, b), Lm = loss(xm, b);
+        CHECK(pw_ok(dX[i], Lp, Lm));
+        const double central = (Lp - Lm) / (2.0 * h);
+        if (std::fabs(central) > 1e-3)
+            worst_central = std::max(worst_central,
+                std::fabs(dX[i] - central) / (std::fabs(central) + std::fabs(dX[i]) + 1e-6));
     }
+    std::printf("  dX worst central-FD rel = %.2e (up=%d down=%d fu=%d fd=%d slope=%.1f clamp=%.0f)\n",
+                worst_central, c.up, c.down, c.fuH, c.fdH, c.slope, c.clamp);
     if (c.has_b) {
         for (int ch = 0; ch < c.C; ++ch) {
             std::vector<float> bp2 = b, bm2 = b; bp2[ch] += h; bm2[ch] -= h;
             CHECK(pw_ok(dB[ch], loss(x, bp2), loss(x, bm2)));
         }
     }
+
+    // CUDA parity: the CUDA backward must match the FD-verified CPU dX.
+    if (brotensor::is_available(brotensor::Device::CUDA)) {
+        Tensor Xc = X.to(brotensor::Device::CUDA);
+        Tensor FUc = FU.to(brotensor::Device::CUDA), FDc = FD.to(brotensor::Device::CUDA);
+        Tensor Bc = B.to(brotensor::Device::CUDA);
+        const Tensor* bpc = c.has_b ? &Bc : nullptr;
+        Tensor ub2, ab2, Yc;
+        brotensor::filtered_lrelu_forward(Xc, FUc, FDc, bpc, c.N, c.C, c.H, c.W,
+                                          c.up, c.down, c.px0, c.px1, c.py0, c.py1,
+                                          c.gain, c.slope, c.clamp, ub2, ab2, Yc);
+        Tensor dYc = dY.to(brotensor::Device::CUDA);
+        Tensor dXc;
+        Tensor dBc = Tensor::zeros_on(brotensor::Device::CUDA, c.C, 1);
+        brotensor::filtered_lrelu_backward(dYc, Xc, FUc, FDc, bpc, c.N, c.C, c.H, c.W,
+                                           c.up, c.down, c.px0, c.px1, c.py0, c.py1,
+                                           c.gain, c.slope, c.clamp, ub2,
+                                           dXc, c.has_b ? &dBc : nullptr);
+        std::vector<float> hX = dXc.to_host_vector();
+        double mdiff = 0;
+        for (int i = 0; i < xn; ++i) mdiff = std::max(mdiff, (double)std::fabs(hX[i] - dX[i]));
+        std::printf("  [cuda parity] max|dX_cuda - dX_cpu| = %.2e\n", mdiff);
+        for (int i = 0; i < xn; ++i) CHECK(close(hX[i], dX[i], 5e-3f));
+    }
 }
 
 int main() {
+    brotensor::init();   // register CUDA backend (if compiled) for the parity check
     // up=2/down=2 with bias + clamp; up=2/down=2 no bias, no clamp;
     // up=1/down=1 small filters (pure FIR + lrelu).
     run_case({2, 2, 6, 6, 2, 2, 1, 2, 1, 2, 4, 4, 4, 4, std::sqrt(2.0f), 0.2f, 0.8f, true});
     run_case({2, 2, 6, 6, 2, 2, 2, 1, 2, 1, 4, 4, 4, 4, std::sqrt(2.0f), 0.2f, -1.0f, false});
     run_case({1, 3, 7, 7, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3, 1.3f, 0.2f, -1.0f, true});
+
+    // StyleGAN3-like: 12-tap up/down filters, up=2/down=2. slope=1 (LINEAR — no
+    // lrelu breakpoints, so the central FD is exact and the dX rel must be tiny;
+    // this isolates the resampling backward) and the real slope=0.2 case.
+    run_case({1, 2, 8, 8, 2, 2, 5, 6, 5, 6, 12, 12, 12, 12, 1.0f, 1.0f, -1.0f, true});
+    run_case({1, 2, 8, 8, 2, 2, 5, 6, 5, 6, 12, 12, 12, 12, std::sqrt(2.0f), 0.2f, 256.0f, true});
     if (g_failures) {
         std::printf("filtered_lrelu: %d FAILED\n", g_failures);
         return 1;

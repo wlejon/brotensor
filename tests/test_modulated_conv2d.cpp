@@ -4,8 +4,10 @@
 // demodulate on/off and 1x1 / 3x3 kernels.
 
 #include <brotensor/ops.h>
+#include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -145,9 +147,36 @@ static void run_case(const Dims& d, bool demod) {
         const float fd = static_cast<float>((loss(x, w, sp) - loss(x, w, sm)) / (2.0 * h));
         CHECK(close(ds[k], fd, 1e-2f));
     }
+
+    // ── CUDA parity: the CUDA backward must match the FD-verified CPU backward.
+    // (Forward CUDA parity is covered by test_stylegan_parity; this closes the
+    // gap on the backward — dX in particular.)
+    if (brotensor::is_available(brotensor::Device::CUDA)) {
+        Tensor Xc = X.to(brotensor::Device::CUDA);
+        Tensor Wc = W.to(brotensor::Device::CUDA);
+        Tensor Sc = S.to(brotensor::Device::CUDA);
+        Tensor dcc = dcoef.to(brotensor::Device::CUDA);
+        Tensor dYc = dY.to(brotensor::Device::CUDA);
+        Tensor dXc;
+        Tensor dWc = Tensor::zeros_on(brotensor::Device::CUDA, d.Cout, wk);
+        Tensor dsc;
+        brotensor::modulated_conv2d_backward(Xc, Wc, Sc, dcc, dYc, d.N, d.Cin, d.H, d.W,
+                                             d.Cout, d.kH, d.kW, d.pad, d.pad,
+                                             demod, eps, dXc, dWc, dsc);
+        std::vector<float> hX = dXc.to_host_vector();
+        std::vector<float> hW = dWc.to_host_vector();
+        std::vector<float> hS = dsc.to_host_vector();
+        double mX = 0, mW = 0, mS = 0;
+        for (int i = 0; i < xn; ++i) { mX = std::max(mX, (double)std::fabs(hX[i] - dX[i])); CHECK(close(hX[i], dX[i], 5e-3f)); }
+        for (int j = 0; j < wn; ++j) { mW = std::max(mW, (double)std::fabs(hW[j] - dW[j])); CHECK(close(hW[j], dW[j], 5e-3f)); }
+        for (int k = 0; k < sn; ++k) { mS = std::max(mS, (double)std::fabs(hS[k] - ds[k])); CHECK(close(hS[k], ds[k], 5e-3f)); }
+        std::printf("  [cuda parity] %dx%d demod=%d: max|dX|=%.2e max|dW|=%.2e max|ds|=%.2e\n",
+                    d.kH, d.kW, demod ? 1 : 0, mX, mW, mS);
+    }
 }
 
 int main() {
+    brotensor::init();   // register CUDA backend (if compiled) for the parity check
     // 1x1 (config-R) and 3x3, demod on/off.
     for (bool demod : {true, false}) {
         run_case({2, 3, 4, 5, 4, 1, 1, 0}, demod);
