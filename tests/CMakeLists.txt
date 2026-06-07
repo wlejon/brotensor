@@ -68,6 +68,7 @@ brotensor_add_test(brotensor_test_stylegan_primitives test_stylegan_primitives.c
 brotensor_add_test(brotensor_test_bias_act test_bias_act.cpp)
 brotensor_add_test(brotensor_test_upfirdn2d test_upfirdn2d.cpp)
 brotensor_add_test(brotensor_test_modulated_conv2d test_modulated_conv2d.cpp)
+brotensor_add_test(brotensor_test_filtered_lrelu test_filtered_lrelu.cpp)
 
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)

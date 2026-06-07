@@ -55,6 +55,7 @@ add_library(brotensor_core STATIC
     src/dispatch.cpp
     src/init.cpp
     src/ops.cpp
+    src/filtered_lrelu.cpp
     src/safetensors.cpp
     src/gguf.cpp
 )
