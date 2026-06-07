@@ -1017,6 +1017,16 @@ void bias_act_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor&
                        int N, int C, int HW, int act, float alpha,
                        float gain, float clamp,
                        ::brotensor::Tensor& dX, ::brotensor::Tensor* dB);
+void upfirdn2d_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& f,
+                       int N, int C, int H, int Wd, int fH, int fW,
+                       int up_x, int up_y, int down_x, int down_y,
+                       int pad_x0, int pad_x1, int pad_y0, int pad_y1,
+                       bool flip_filter, float gain, ::brotensor::Tensor& Y);
+void upfirdn2d_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor& f,
+                        int N, int C, int H, int Wd, int fH, int fW,
+                        int up_x, int up_y, int down_x, int down_y,
+                        int pad_x0, int pad_x1, int pad_y0, int pad_y1,
+                        bool flip_filter, float gain, ::brotensor::Tensor& dX);
 
 } // namespace brotensor::detail::cpu
 
@@ -1313,6 +1323,8 @@ struct CpuStaticRegistrar {
         ops.pixel_norm_backward          = &detail::cpu::pixel_norm_backward;
         ops.bias_act_forward             = &detail::cpu::bias_act_forward;
         ops.bias_act_backward            = &detail::cpu::bias_act_backward;
+        ops.upfirdn2d_forward            = &detail::cpu::upfirdn2d_forward;
+        ops.upfirdn2d_backward           = &detail::cpu::upfirdn2d_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

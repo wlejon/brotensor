@@ -2683,4 +2683,30 @@ void bias_act_backward(const Tensor& dY, const Tensor& X, const Tensor* b,
     v.bias_act_backward(dY, X, b, N, C, HW, act, alpha, gain, clamp, dX, dB);
 }
 
+// ─── StyleGAN3 upfirdn2d ────────────────────────────────────────────────────
+
+void upfirdn2d_forward(const Tensor& X, const Tensor& f,
+                       int N, int C, int H, int Wd, int fH, int fW,
+                       int up_x, int up_y, int down_x, int down_y,
+                       int pad_x0, int pad_x1, int pad_y0, int pad_y1,
+                       bool flip_filter, float gain, Tensor& Y) {
+    const auto& v = detail::dispatch(X, f, Y);
+    if (!v.upfirdn2d_forward) detail::throw_not_implemented("upfirdn2d_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.upfirdn2d_forward(X, f, N, C, H, Wd, fH, fW, up_x, up_y, down_x, down_y,
+                        pad_x0, pad_x1, pad_y0, pad_y1, flip_filter, gain, Y);
+}
+
+void upfirdn2d_backward(const Tensor& dY, const Tensor& f,
+                        int N, int C, int H, int Wd, int fH, int fW,
+                        int up_x, int up_y, int down_x, int down_y,
+                        int pad_x0, int pad_x1, int pad_y0, int pad_y1,
+                        bool flip_filter, float gain, Tensor& dX) {
+    const auto& v = detail::dispatch(dY, f, dX);
+    if (!v.upfirdn2d_backward) detail::throw_not_implemented("upfirdn2d_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    v.upfirdn2d_backward(dY, f, N, C, H, Wd, fH, fW, up_x, up_y, down_x, down_y,
+                         pad_x0, pad_x1, pad_y0, pad_y1, flip_filter, gain, dX);
+}
+
 } // namespace brotensor
