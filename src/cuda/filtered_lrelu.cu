@@ -49,10 +49,12 @@ void* cuda_current_stream();
 namespace {
 
 // Output tile per CTA. TH*TW threads; each CTA computes the AH×AW activation
-// region once into shared memory, then downsamples it. Picked so the shared
-// act tile stays small for the up/down=2, ~6–12-tap filters config-R uses.
-constexpr int FL_TH = 8;
-constexpr int FL_TW = 8;
+// region once into shared memory, then downsamples it. 16×16 output tile (256
+// threads) measured best across config-R sizes — enough warps to hide latency
+// while keeping the shared act tile (≈36×36 floats for 6-tap filters) small
+// enough for high occupancy; 8×8 under-occupies and 32×32 spills occupancy.
+constexpr int FL_TH = 16;
+constexpr int FL_TW = 16;
 constexpr int FL_THREADS = FL_TH * FL_TW;
 
 template <typename T> __device__ inline float fl_load(const T* p);
