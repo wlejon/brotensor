@@ -3,8 +3,8 @@
 // Metal counterpart of src/cpu/interp2d.cpp. FP32-only on this backend (first
 // pass — FP16/BF16 dispatch can be added later if vision inference workloads
 // land on Metal hosts). Arbitrary-scale resampling on an NCHW tensor with
-// nearest / bilinear forward and backward, plus bicubic (Catmull-Rom, a=-0.5)
-// forward; bicubic backward throws.
+// nearest / bilinear forward and backward, plus bicubic forward (mode 2 =
+// Catmull-Rom a=-0.5 / PIL; mode 3 = a=-0.75 / torch); bicubic backward throws.
 //
 // Memory layout (NCHW flat — consistent with resample.mm / conv2d.mm):
 //   element (n, c, h, w) at ((n*C + c)*H + h)*W + w
@@ -56,10 +56,11 @@ void check_args(const char* op,
         H_out < 0 || W_out < 0) {
         fail(op, "N, C, H_in, W_in, H_out, W_out must be non-negative");
     }
-    const int max_mode = allow_bicubic ? 2 : 1;
+    const int max_mode = allow_bicubic ? 3 : 1;
     if (mode < 0 || mode > max_mode) {
         fail(op, allow_bicubic
-            ? "mode must be 0 (nearest), 1 (bilinear), or 2 (bicubic)"
+            ? "mode must be 0 (nearest), 1 (bilinear), 2 (bicubic a=-0.5, "
+              "PIL), or 3 (bicubic a=-0.75, torch)"
             : "mode must be 0 (nearest) or 1 (bilinear) — bicubic backward "
               "is not implemented");
     }
@@ -72,7 +73,7 @@ void check_args(const char* op,
 // Parameter block — must match the MSL struct below.
 struct I2dParams {
     uint32_t N, C, H_in, W_in, H_out, W_out;
-    uint32_t mode;     // 0 = nearest, 1 = bilinear, 2 = bicubic (fwd only)
+    uint32_t mode;     // 0 nearest, 1 bilinear, 2 bicubic a=-0.5, 3 bicubic a=-0.75 (fwd only)
     uint32_t align;    // 0 = half-pixel (align_corners=False), 1 = align_corners=True
     uint32_t total;
 };
@@ -88,9 +89,10 @@ struct I2dParams {
     uint total;
 };
 
-// Catmull-Rom (Keys) cubic with a = -0.5.
-static inline float cubic_keys(float t) {
-    const float a = -0.5f;
+// Keys cubic-convolution kernel with coefficient `a`. a = -0.5 is Catmull-Rom
+// (matches PIL/Pillow BICUBIC); a = -0.75 matches torch interpolate("bicubic")
+// and OpenCV. The two differ only in that constant.
+static inline float cubic_keys(float t, float a) {
     float at = fabs(t);
     if (at < 1.0f) {
         return ((a + 2.0f) * at - (a + 3.0f)) * at * at + 1.0f;
@@ -149,15 +151,16 @@ kernel void k_interp2d_forward(device const float* X [[buffer(0)]],
         float bot = v10 + (v11 - v10) * fx;
         Y[gid] = top + (bot - top) * fy;
     } else {
-        // bicubic
+        // bicubic — mode 2: a=-0.5 (PIL); mode 3: a=-0.75 (torch/OpenCV).
+        float a = (P.mode == 3u) ? -0.75f : -0.5f;
         int y0 = int(floor(src_y));
         int x0 = int(floor(src_x));
         float fy = src_y - float(y0);
         float fx = src_x - float(x0);
         float wy[4], wx[4];
         for (int k = 0; k < 4; ++k) {
-            wy[k] = cubic_keys(fy - float(k - 1));
-            wx[k] = cubic_keys(fx - float(k - 1));
+            wy[k] = cubic_keys(fy - float(k - 1), a);
+            wx[k] = cubic_keys(fx - float(k - 1), a);
         }
         float acc = 0.0f;
         for (int j = 0; j < 4; ++j) {

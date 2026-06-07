@@ -94,10 +94,15 @@ BT_PARITY_TEST(i2d_bwd_bil_up)      { run_bwd(2, 3, 4, 5, 11, 13, 1, 0xB214ull);
 BT_PARITY_TEST(i2d_bwd_bil_down)    { run_bwd(2, 3, 20, 24, 7, 9, 1, 0xB215ull); }
 BT_PARITY_TEST(i2d_bwd_bil_wide)    { run_bwd(4, 6, 9, 11, 23, 17, 1, 0xB216ull); }
 
-// ─── bicubic (mode 2, forward only) ────────────────────────────────────────
+// ─── bicubic (mode 2, a=-0.5 / PIL, forward only) ──────────────────────────
 BT_PARITY_TEST(i2d_fwd_bic_up)      { run_fwd(2, 3, 5, 6, 12, 14, 2, 0xB220ull); }
 BT_PARITY_TEST(i2d_fwd_bic_down)    { run_fwd(2, 3, 24, 24, 8, 8, 2, 0xB221ull); }
 BT_PARITY_TEST(i2d_fwd_bic_2x)      { run_fwd(1, 4, 6, 7, 12, 14, 2, 0xB222ull); }
+
+// ─── bicubic (mode 3, a=-0.75 / torch, forward only) ───────────────────────
+BT_PARITY_TEST(i2d_fwd_bic075_up)   { run_fwd(2, 3, 5, 6, 12, 14, 3, 0xB223ull); }
+BT_PARITY_TEST(i2d_fwd_bic075_down) { run_fwd(2, 3, 24, 24, 8, 8, 3, 0xB224ull); }
+BT_PARITY_TEST(i2d_fwd_bic075_2x)   { run_fwd(1, 4, 6, 7, 12, 14, 3, 0xB225ull); }
 
 // ─── align_corners=True forward (nearest / bilinear / bicubic) ──────────────
 BT_PARITY_TEST(i2d_ac_fwd_near_up)  { run_fwd_ac(2, 3, 4, 5, 9, 11, 0, 0xB230ull); }
@@ -105,5 +110,6 @@ BT_PARITY_TEST(i2d_ac_fwd_bil_up)   { run_fwd_ac(2, 3, 4, 5, 11, 13, 1, 0xB231ul
 BT_PARITY_TEST(i2d_ac_fwd_bil_down) { run_fwd_ac(2, 3, 20, 24, 7, 9, 1, 0xB232ull); }
 BT_PARITY_TEST(i2d_ac_fwd_bil_2x)   { run_fwd_ac(1, 4, 5, 6, 10, 12, 1, 0xB233ull); }
 BT_PARITY_TEST(i2d_ac_fwd_bic_up)   { run_fwd_ac(2, 3, 5, 6, 12, 14, 2, 0xB234ull); }
+BT_PARITY_TEST(i2d_ac_fwd_bic075_up){ run_fwd_ac(2, 3, 5, 6, 12, 14, 3, 0xB235ull); }
 
 int main() { return run_all("interp2d cpu/gpu parity"); }
