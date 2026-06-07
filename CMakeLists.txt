@@ -233,6 +233,10 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/xavier_init.cu
         src/cuda/batch_norm.cu
         src/cuda/image_preproc.cu
+        src/cuda/stylegan_elementwise.cu
+        src/cuda/bias_act.cu
+        src/cuda/upfirdn2d.cu
+        src/cuda/modulated_conv2d.cu
         src/cuda/register.cu
     )
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)
