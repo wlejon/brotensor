@@ -1009,6 +1009,14 @@ void pixel_norm_forward(const ::brotensor::Tensor& X, float eps,
 void pixel_norm_backward(const ::brotensor::Tensor& X,
                          const ::brotensor::Tensor& dY, float eps,
                          ::brotensor::Tensor& dX);
+void bias_act_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor* b,
+                      int N, int C, int HW, int act, float alpha,
+                      float gain, float clamp, ::brotensor::Tensor& Y);
+void bias_act_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor& X,
+                       const ::brotensor::Tensor* b,
+                       int N, int C, int HW, int act, float alpha,
+                       float gain, float clamp,
+                       ::brotensor::Tensor& dX, ::brotensor::Tensor* dB);
 
 } // namespace brotensor::detail::cpu
 
@@ -1303,6 +1311,8 @@ struct CpuStaticRegistrar {
         ops.rsqrt_backward               = &detail::cpu::rsqrt_backward;
         ops.pixel_norm_forward           = &detail::cpu::pixel_norm_forward;
         ops.pixel_norm_backward          = &detail::cpu::pixel_norm_backward;
+        ops.bias_act_forward             = &detail::cpu::bias_act_forward;
+        ops.bias_act_backward            = &detail::cpu::bias_act_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

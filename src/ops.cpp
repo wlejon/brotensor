@@ -2662,4 +2662,25 @@ void pixel_norm_backward(const Tensor& X, const Tensor& dY, float eps, Tensor& d
     v.pixel_norm_backward(X, dY, eps, dX);
 }
 
+// ─── StyleGAN3 bias_act ─────────────────────────────────────────────────────
+
+void bias_act_forward(const Tensor& X, const Tensor* b,
+                      int N, int C, int HW, int act, float alpha,
+                      float gain, float clamp, Tensor& Y) {
+    const auto& v = detail::dispatch_with_opts(X, {b, &Y});
+    if (!v.bias_act_forward) detail::throw_not_implemented("bias_act_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.bias_act_forward(X, b, N, C, HW, act, alpha, gain, clamp, Y);
+}
+
+void bias_act_backward(const Tensor& dY, const Tensor& X, const Tensor* b,
+                       int N, int C, int HW, int act, float alpha,
+                       float gain, float clamp, Tensor& dX, Tensor* dB) {
+    const auto& v = detail::dispatch_with_opts(dY, X, {b, dB, &dX});
+    if (!v.bias_act_backward) detail::throw_not_implemented("bias_act_backward", dY.device);
+    detail::adopt_output(dX, dY.device);
+    if (dB) detail::adopt_output(*dB, dY.device);
+    v.bias_act_backward(dY, X, b, N, C, HW, act, alpha, gain, clamp, dX, dB);
+}
+
 } // namespace brotensor
