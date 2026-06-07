@@ -67,6 +67,7 @@ void fill_cuda_vtable_stylegan_elementwise(::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_bias_act       (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_upfirdn2d      (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_modulated_conv2d(::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_filtered_lrelu (::brotensor::detail::OpsVTable&);
 
 // ── alloc table (defined in tensor.cu) ──
 const ::brotensor::detail::AllocVTable& cuda_alloc_table();
@@ -135,6 +136,7 @@ extern "C" void brotensor_probe_and_register_cuda() {
     dc::fill_cuda_vtable_bias_act(ops);
     dc::fill_cuda_vtable_upfirdn2d(ops);
     dc::fill_cuda_vtable_modulated_conv2d(ops);
+    dc::fill_cuda_vtable_filtered_lrelu(ops);
 
     ::brotensor::detail::register_backend(Device::CUDA, ops, dc::cuda_alloc_table());
 }

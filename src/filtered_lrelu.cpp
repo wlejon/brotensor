@@ -152,6 +152,22 @@ void filtered_lrelu_backward_composite(const Tensor& dY, const Tensor& X,
     const int Huo = up_out(H, up, pad_y0, pad_y1, fuH);
     const int Wuo = up_out(W, up, pad_x0, pad_x1, fuW);
 
+    // up_buf is the post-upsample (pre-lrelu) tensor — the lrelu backward needs
+    // it. The fused forward skips producing it (it's the buffer fusion avoids),
+    // so when the caller hands us an uncommitted up_buf we recompute it here
+    // from X exactly as the forward did (bias → up-FIR). The cache is thus
+    // optional: a populated up_buf is used directly, an empty one is rebuilt.
+    Tensor up_buf_local;
+    const Tensor* up_ptr = &up_buf;
+    if (up_buf.data == nullptr) {
+        Tensor pre;
+        bias_act_forward(X, b, N, C, H * W, ACT_LINEAR, 0.0f, 1.0f, NO_CLAMP, pre);
+        upfirdn2d_forward(pre, fu, N, C, H, W, fuH, fuW,
+                          up, up, 1, 1, pad_x0, pad_x1, pad_y0, pad_y1,
+                          /*flip=*/false, static_cast<float>(up * up), up_buf_local);
+        up_ptr = &up_buf_local;
+    }
+
     // 4'. Through the downsample.
     Tensor d_act;
     upfirdn2d_backward(dY, fd, N, C, Huo, Wuo, fdH, fdW,
@@ -160,7 +176,7 @@ void filtered_lrelu_backward_composite(const Tensor& dY, const Tensor& X,
 
     // 3'. Through the leaky ReLU (no bias gradient here).
     Tensor d_up;
-    bias_act_backward(d_act, up_buf, nullptr, N, C, Huo * Wuo, ACT_LRELU, slope,
+    bias_act_backward(d_act, *up_ptr, nullptr, N, C, Huo * Wuo, ACT_LRELU, slope,
                       gain, clamp, d_up, nullptr);
 
     // 2'. Through the upsample.

@@ -237,6 +237,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/bias_act.cu
         src/cuda/upfirdn2d.cu
         src/cuda/modulated_conv2d.cu
+        src/cuda/filtered_lrelu.cu
         src/cuda/register.cu
     )
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)

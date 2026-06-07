@@ -190,10 +190,22 @@ static void run_case(const Cfg& c) {
         Tensor FUc = FU.to(brotensor::Device::CUDA), FDc = FD.to(brotensor::Device::CUDA);
         Tensor Bc = B.to(brotensor::Device::CUDA);
         const Tensor* bpc = c.has_b ? &Bc : nullptr;
+        // Uncommitted ub2/ab2 ⇒ the fused (no-cache) forward path on CUDA.
         Tensor ub2, ab2, Yc;
         brotensor::filtered_lrelu_forward(Xc, FUc, FDc, bpc, c.N, c.C, c.H, c.W,
                                           c.up, c.down, c.px0, c.px1, c.py0, c.py1,
                                           c.gain, c.slope, c.clamp, ub2, ab2, Yc);
+        // Fused forward must match the independent CPU golden.
+        std::vector<float> hY = Yc.to_host_vector();
+        double mY = 0;
+        for (size_t i = 0; i < Yref.size(); ++i) {
+            mY = std::max(mY, (double)std::fabs(hY[i] - Yref[i]));
+            CHECK(close(hY[i], Yref[i], 5e-3f));
+        }
+        std::printf("  [cuda fused fwd] max|Y_cuda - Y_ref| = %.2e\n", mY);
+        // ub2 stays uncommitted — the fused path produces no cache; the backward
+        // below recomputes up_buf from X.
+        CHECK(ub2.data == nullptr);
         Tensor dYc = dY.to(brotensor::Device::CUDA);
         Tensor dXc;
         Tensor dBc = Tensor::zeros_on(brotensor::Device::CUDA, c.C, 1);

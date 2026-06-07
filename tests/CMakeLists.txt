@@ -151,5 +151,6 @@ if(BROTENSOR_HAS_GPU)
     # CUDA-only: it uses cudaEvent_t for timing.
     if(BROTENSOR_WITH_CUDA)
         brotensor_add_executable(brotensor_bench_diffusion bench_diffusion.cpp)
+        brotensor_add_executable(brotensor_bench_filtered_lrelu bench_filtered_lrelu.cpp)
     endif()
 endif()
