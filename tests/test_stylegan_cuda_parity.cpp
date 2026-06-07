@@ -267,6 +267,174 @@ static void test_filtered_lrelu() {
     cmp("filtered_lrelu_backward dB", dBc, dBg, 1e-3f, 1e-4f);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  FP16 / BF16 parity. GPU half result vs the CPU FP32 reference computed on
+//  the SAME values the half tensor stores (inputs rounded through the half
+//  dtype), isolating intermediate-precision drift. Looser tolerances per dtype.
+// ════════════════════════════════════════════════════════════════════════════
+
+enum Prec { F16, B16 };
+
+static uint16_t to_bits(Prec p, float v) {
+    return p == F16 ? brotensor::fp32_to_fp16_bits(v) : brotensor::fp32_to_bf16_bits(v);
+}
+static float from_bits(Prec p, uint16_t b) {
+    return p == F16 ? brotensor::fp16_bits_to_fp32(b) : brotensor::bf16_bits_to_fp32(b);
+}
+static std::vector<float> quantize(Prec p, const std::vector<float>& v) {
+    std::vector<float> o(v.size());
+    for (size_t i = 0; i < v.size(); ++i) o[i] = from_bits(p, to_bits(p, v[i]));
+    return o;
+}
+static Tensor cpu_q(Prec p, const std::vector<float>& v, int r, int c) {
+    auto q = quantize(p, v);
+    return Tensor::from_host_on(Device::CPU, q.data(), r, c);
+}
+static Tensor gpu_h(Prec p, const std::vector<float>& v, int r, int c) {
+    std::vector<uint16_t> b(v.size());
+    for (size_t i = 0; i < v.size(); ++i) b[i] = to_bits(p, v[i]);
+    return p == F16 ? Tensor::from_host_fp16_on(Device::CUDA, b.data(), r, c)
+                    : Tensor::from_host_bf16_on(Device::CUDA, b.data(), r, c);
+}
+static Tensor zeros_h(Prec p, int r, int c) {
+    std::vector<uint16_t> b(static_cast<size_t>(r) * c, to_bits(p, 0.0f));
+    return p == F16 ? Tensor::from_host_fp16_on(Device::CUDA, b.data(), r, c)
+                    : Tensor::from_host_bf16_on(Device::CUDA, b.data(), r, c);
+}
+// Compare a half GPU tensor against an FP32 CPU reference tensor.
+static void cmp_h(const char* label, Prec p, const Tensor& ref_cpu,
+                  const Tensor& got_gpu, float atol, float rtol) {
+    brotensor::sync_all();
+    CHECK(ref_cpu.rows == got_gpu.rows);
+    CHECK(ref_cpu.cols == got_gpu.cols);
+    const int n = ref_cpu.rows * ref_cpu.cols;
+    std::vector<uint16_t> bits(static_cast<size_t>(n), 0);
+    if (p == F16) const_cast<Tensor&>(got_gpu).copy_to_host_fp16(bits.data());
+    else          const_cast<Tensor&>(got_gpu).copy_to_host_bf16(bits.data());
+    brotensor::sync_all();
+    const float* r = ref_cpu.host_f32();
+    int bad = 0; float me = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float g = from_bits(p, bits[i]);
+        const float e = std::fabs(g - r[i]);
+        if (e > me) me = e;
+        if (e > atol + rtol * std::fabs(r[i])) {
+            if (bad < 5)
+                std::printf("    %s mismatch i=%d gpu=%g cpu=%g err=%g\n",
+                            label, i, g, r[i], e);
+            ++bad;
+        }
+    }
+    std::printf("    %-26s max_err=%g bad=%d / %d\n", label, me, bad, n);
+    CHECK(bad == 0);
+}
+
+static void test_half(Prec p) {
+    const char* pn = (p == F16) ? "fp16" : "bf16";
+    const float atol = (p == F16) ? 2e-2f : 1e-1f;
+    const float rtol = (p == F16) ? 2e-2f : 6e-2f;
+    std::printf("  --- %s ---\n", pn);
+    auto lbl = [&](const char* s) {
+        static char buf[64]; std::snprintf(buf, sizeof buf, "%s %s", pn, s); return buf;
+    };
+
+    // elementwise (sin/cos/rsqrt) + pixel_norm.
+    {
+        const int R = 4, C = 65, n = R * C;
+        auto x  = rnd(n, 51, -3.0f, 3.0f);
+        auto xp = rnd(n, 52, 0.3f, 4.0f);
+        auto w  = rnd(n, 53, -1.0f, 1.0f);
+        Tensor Xc = cpu_q(p, x, R, C), Xg = gpu_h(p, x, R, C), Yc, Yg;
+        brotensor::sin_forward(Xc, Yc); brotensor::sin_forward(Xg, Yg);
+        cmp_h(lbl("sin_forward"), p, Yc, Yg, atol, rtol);
+        brotensor::cos_forward(Xc, Yc); brotensor::cos_forward(Xg, Yg);
+        cmp_h(lbl("cos_forward"), p, Yc, Yg, atol, rtol);
+        Tensor Xpc = cpu_q(p, xp, R, C), Xpg = gpu_h(p, xp, R, C), Ypc, Ypg;
+        brotensor::rsqrt_forward(Xpc, Ypc); brotensor::rsqrt_forward(Xpg, Ypg);
+        cmp_h(lbl("rsqrt_forward"), p, Ypc, Ypg, atol, rtol);
+        { Tensor dYc = cpu_q(p, w, R, C), dYg = gpu_h(p, w, R, C), dXc, dXg;
+          brotensor::rsqrt_backward(Ypc, dYc, dXc); brotensor::rsqrt_backward(Ypg, dYg, dXg);
+          cmp_h(lbl("rsqrt_backward"), p, dXc, dXg, atol, rtol); }
+        const float eps = 1e-4f;
+        Tensor Pc, Pg; brotensor::pixel_norm_forward(Xc, eps, Pc);
+        brotensor::pixel_norm_forward(Xg, eps, Pg);
+        cmp_h(lbl("pixel_norm_forward"), p, Pc, Pg, atol, rtol);
+        { Tensor dYc = cpu_q(p, w, R, C), dYg = gpu_h(p, w, R, C), dXc, dXg;
+          brotensor::pixel_norm_backward(Xc, dYc, eps, dXc);
+          brotensor::pixel_norm_backward(Xg, dYg, eps, dXg);
+          cmp_h(lbl("pixel_norm_backward"), p, dXc, dXg, atol, rtol); }
+    }
+
+    // bias_act (lrelu, with bias, no clamp).
+    {
+        const int N = 3, C = 4, HW = 5, cols = C * HW;
+        const int act = 1; const float alpha = 0.2f, gain = std::sqrt(2.0f), clamp = -1.0f;
+        auto x = rnd(N * cols, 61, -2.0f, 2.0f);
+        auto b = rnd(C, 62, -1.0f, 1.0f);
+        auto w = rnd(N * cols, 63, -1.0f, 1.0f);
+        Tensor Xc = cpu_q(p, x, N, cols), Xg = gpu_h(p, x, N, cols);
+        Tensor Bc = cpu_q(p, b, C, 1),   Bg = gpu_h(p, b, C, 1);
+        Tensor Yc, Yg;
+        brotensor::bias_act_forward(Xc, &Bc, N, C, HW, act, alpha, gain, clamp, Yc);
+        brotensor::bias_act_forward(Xg, &Bg, N, C, HW, act, alpha, gain, clamp, Yg);
+        cmp_h(lbl("bias_act_forward"), p, Yc, Yg, atol, rtol);
+        Tensor dYc = cpu_q(p, w, N, cols), dYg = gpu_h(p, w, N, cols), dXc, dXg;
+        Tensor dBc = Tensor::zeros_on(Device::CPU, C, 1), dBg = zeros_h(p, C, 1);
+        brotensor::bias_act_backward(dYc, Xc, &Bc, N, C, HW, act, alpha, gain, clamp, dXc, &dBc);
+        brotensor::bias_act_backward(dYg, Xg, &Bg, N, C, HW, act, alpha, gain, clamp, dXg, &dBg);
+        cmp_h(lbl("bias_act_backward dX"), p, dXc, dXg, atol, rtol);
+        cmp_h(lbl("bias_act_backward dB"), p, dBc, dBg, atol, 8e-2f);
+    }
+
+    // upfirdn2d (2x upsample).
+    {
+        const int N = 2, C = 3, H = 8, Wd = 8, fH = 4, fW = 4;
+        const int up_x = 2, up_y = 2, down_x = 1, down_y = 1, px0 = 1, px1 = 1, py0 = 1, py1 = 1;
+        const float gain = float(up_x * up_y);
+        auto x = rnd(N * C * H * Wd, 71, -1.0f, 1.0f);
+        auto f = rnd(fH * fW, 72, -0.5f, 0.5f);
+        Tensor Xc = cpu_q(p, x, N, C * H * Wd), Xg = gpu_h(p, x, N, C * H * Wd);
+        Tensor Fc = cpu_q(p, f, fH, fW),        Fg = gpu_h(p, f, fH, fW);
+        Tensor Yc, Yg;
+        brotensor::upfirdn2d_forward(Xc, Fc, N, C, H, Wd, fH, fW, up_x, up_y, down_x, down_y,
+                                     px0, px1, py0, py1, false, gain, Yc);
+        brotensor::upfirdn2d_forward(Xg, Fg, N, C, H, Wd, fH, fW, up_x, up_y, down_x, down_y,
+                                     px0, px1, py0, py1, false, gain, Yg);
+        cmp_h(lbl("upfirdn2d_forward"), p, Yc, Yg, atol, rtol);
+    }
+
+    // modulated_conv2d (demod).
+    {
+        const int N = 2, C_in = 3, H = 6, Wd = 6, C_out = 4, kH = 3, kW = 3;
+        const int pad_h = 1, pad_w = 1, wk = C_in * kH * kW;
+        const int H_out = H + 2 * pad_h - (kH - 1), W_out = Wd + 2 * pad_w - (kW - 1);
+        const float eps = 1e-4f;
+        auto x = rnd(N * C_in * H * Wd, 81, -1.0f, 1.0f);
+        auto W = rnd(C_out * wk, 82, -0.5f, 0.5f);
+        auto s = rnd(N * C_in, 83, 0.2f, 1.5f);
+        Tensor Xc = cpu_q(p, x, N, C_in * H * Wd), Xg = gpu_h(p, x, N, C_in * H * Wd);
+        Tensor Wc = cpu_q(p, W, C_out, wk),        Wg = gpu_h(p, W, C_out, wk);
+        Tensor Sc = cpu_q(p, s, N, C_in),          Sg = gpu_h(p, s, N, C_in);
+        Tensor dcc, dcg, Yc, Yg;
+        brotensor::modulated_conv2d_forward(Xc, Wc, Sc, N, C_in, H, Wd, C_out, kH, kW,
+                                            pad_h, pad_w, true, eps, dcc, Yc);
+        brotensor::modulated_conv2d_forward(Xg, Wg, Sg, N, C_in, H, Wd, C_out, kH, kW,
+                                            pad_h, pad_w, true, eps, dcg, Yg);
+        cmp_h(lbl("modconv_fwd Y"), p, Yc, Yg, atol, rtol);
+        auto g = rnd(N * C_out * H_out * W_out, 84, -1.0f, 1.0f);
+        Tensor dYc = cpu_q(p, g, N, C_out * H_out * W_out), dYg = gpu_h(p, g, N, C_out * H_out * W_out);
+        Tensor dXc, dXg, dsc, dsg;
+        Tensor dWc = Tensor::zeros_on(Device::CPU, C_out, wk), dWg = zeros_h(p, C_out, wk);
+        brotensor::modulated_conv2d_backward(Xc, Wc, Sc, dcc, dYc, N, C_in, H, Wd, C_out, kH, kW,
+                                             pad_h, pad_w, true, eps, dXc, dWc, dsc);
+        brotensor::modulated_conv2d_backward(Xg, Wg, Sg, dcg, dYg, N, C_in, H, Wd, C_out, kH, kW,
+                                             pad_h, pad_w, true, eps, dXg, dWg, dsg);
+        cmp_h(lbl("modconv_bwd dX"), p, dXc, dXg, atol, rtol);
+        cmp_h(lbl("modconv_bwd dW"), p, dWc, dWg, atol, 8e-2f);
+        cmp_h(lbl("modconv_bwd ds"), p, dsc, dsg, atol, 8e-2f);
+    }
+}
+
 int main() {
     brotensor::init();
     std::printf("test_stylegan_cuda_parity\n");
@@ -280,6 +448,8 @@ int main() {
     test_upfirdn2d();
     test_modulated_conv2d();
     test_filtered_lrelu();
+    test_half(F16);
+    test_half(B16);
     if (g_failures) {
         std::printf("\nstylegan_cuda_parity: %d FAILED\n", g_failures);
         return 1;
