@@ -242,4 +242,21 @@ void batch_norm_backward(const Tensor& X,
                          Tensor& dX,
                          Tensor& dGamma, Tensor& dBeta);
 
+
+// ─── Pixel norm (StyleGAN mapping network) ──────────────────────────────────
+//
+// RMS-style normalisation over the feature/channel axis (the trailing `cols`
+// dim), per row: Y = X * rsqrt(mean_c(X^2) + eps). This is NOT l2_normalize —
+// it divides by the root-MEAN-square (includes the 1/C factor), matching
+// StyleGAN's `normalize_2nd_moment`. No learnable parameters.
+//   X, Y: (N, C) FP32. Y resized + dtype-set to match X.
+//   eps:  added to the mean-square before rsqrt (StyleGAN uses 1e-8f).
+void pixel_norm_forward(const Tensor& X, float eps, Tensor& Y);
+
+// Pixel-norm backward. With r = rsqrt(mean(x^2)+eps) and s = Σ_c dY_c·X_c
+// (per row), dX_c = r·dY_c − (r^3·X_c / C)·s. Reads the raw forward input X.
+//   X, dY, dX: (N, C) FP32. dX overwritten (resized + dtype-set to X).
+void pixel_norm_backward(const Tensor& X, const Tensor& dY, float eps,
+                         Tensor& dX);
+
 }  // namespace brotensor

@@ -2604,4 +2604,62 @@ void randn_truncated(float lo, float hi, uint64_t key, uint64_t counter,
     v.randn_truncated(lo, hi, key, counter, Y);
 }
 
+// ─── StyleGAN3 synthesis-input primitives — sin/cos/rsqrt + pixel_norm ──────
+
+void sin_forward(const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.sin_forward) detail::throw_not_implemented("sin_forward", x.device);
+    detail::adopt_output(y, x.device);
+    v.sin_forward(x, y);
+}
+
+void sin_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
+    const auto& v = detail::dispatch(x, dY, dX);
+    if (!v.sin_backward) detail::throw_not_implemented("sin_backward", x.device);
+    detail::adopt_output(dX, x.device);
+    v.sin_backward(x, dY, dX);
+}
+
+void cos_forward(const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.cos_forward) detail::throw_not_implemented("cos_forward", x.device);
+    detail::adopt_output(y, x.device);
+    v.cos_forward(x, y);
+}
+
+void cos_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
+    const auto& v = detail::dispatch(x, dY, dX);
+    if (!v.cos_backward) detail::throw_not_implemented("cos_backward", x.device);
+    detail::adopt_output(dX, x.device);
+    v.cos_backward(x, dY, dX);
+}
+
+void rsqrt_forward(const Tensor& x, Tensor& y) {
+    const auto& v = detail::dispatch(x, y);
+    if (!v.rsqrt_forward) detail::throw_not_implemented("rsqrt_forward", x.device);
+    detail::adopt_output(y, x.device);
+    v.rsqrt_forward(x, y);
+}
+
+void rsqrt_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
+    const auto& v = detail::dispatch(y, dY, dX);
+    if (!v.rsqrt_backward) detail::throw_not_implemented("rsqrt_backward", y.device);
+    detail::adopt_output(dX, y.device);
+    v.rsqrt_backward(y, dY, dX);
+}
+
+void pixel_norm_forward(const Tensor& X, float eps, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.pixel_norm_forward) detail::throw_not_implemented("pixel_norm_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.pixel_norm_forward(X, eps, Y);
+}
+
+void pixel_norm_backward(const Tensor& X, const Tensor& dY, float eps, Tensor& dX) {
+    const auto& v = detail::dispatch(X, dY, dX);
+    if (!v.pixel_norm_backward) detail::throw_not_implemented("pixel_norm_backward", X.device);
+    detail::adopt_output(dX, X.device);
+    v.pixel_norm_backward(X, dY, eps, dX);
+}
+
 } // namespace brotensor

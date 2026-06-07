@@ -81,4 +81,35 @@ void round_forward(const Tensor& x, Tensor& y);
 //   dY, dX: (R,C) FP32.
 void round_backward(const Tensor& dY, Tensor& dX);
 
+
+// ─── sin / cos / rsqrt elementwise (StyleGAN3 Fourier features + demod) ─────
+//
+// FP32-only elementwise scalar maps. Outputs resized + dtype-set to match the
+// input; x/y and dX/dY may alias. None has learnable parameters, so every
+// backward overwrites dX. sin/cos back the SynthesisInput Fourier features
+// (sin(2π·…)); rsqrt backs the modulation-demod / pixel-norm reciprocal-sqrt.
+
+// y = sin(x), elementwise.  x, y: (R,C) FP32.
+void sin_forward(const Tensor& x, Tensor& y);
+
+// Sine backward, reads the raw forward input x: dX = dY * cos(x).
+// dX overwritten; may alias dY.  x, dY, dX: (R,C) FP32.
+void sin_backward(const Tensor& x, const Tensor& dY, Tensor& dX);
+
+// y = cos(x), elementwise.  x, y: (R,C) FP32.
+void cos_forward(const Tensor& x, Tensor& y);
+
+// Cosine backward, reads the raw forward input x: dX = -dY * sin(x).
+// dX overwritten; may alias dY.  x, dY, dX: (R,C) FP32.
+void cos_backward(const Tensor& x, const Tensor& dY, Tensor& dX);
+
+// y = 1/sqrt(x), elementwise reciprocal square root. The caller owns the
+// x > 0 precondition — no guard (rsqrt(0) = +inf, rsqrt(<0) = NaN).
+//   x, y: (R,C) FP32.
+void rsqrt_forward(const Tensor& x, Tensor& y);
+
+// Rsqrt backward, reads the forward OUTPUT y (= 1/sqrt(x)): dX = -0.5*dY*y^3.
+// dX overwritten; may alias dY.  y, dY, dX: (R,C) FP32.
+void rsqrt_backward(const Tensor& y, const Tensor& dY, Tensor& dX);
+
 }  // namespace brotensor

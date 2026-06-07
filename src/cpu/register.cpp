@@ -993,6 +993,23 @@ void lstm_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& W_ih
                    ::brotensor::Tensor* db_ih, ::brotensor::Tensor* db_hh,
                    ::brotensor::Tensor* dh0, ::brotensor::Tensor* dc0);
 
+// ── StyleGAN3-R primitives — stylegan_elementwise.cpp / bias_act.cpp /
+//    upfirdn2d.cpp / modulated_conv2d.cpp ──
+void sin_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void sin_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
+                  ::brotensor::Tensor& dX);
+void cos_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void cos_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
+                  ::brotensor::Tensor& dX);
+void rsqrt_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void rsqrt_backward(const ::brotensor::Tensor& y, const ::brotensor::Tensor& dY,
+                    ::brotensor::Tensor& dX);
+void pixel_norm_forward(const ::brotensor::Tensor& X, float eps,
+                        ::brotensor::Tensor& Y);
+void pixel_norm_backward(const ::brotensor::Tensor& X,
+                         const ::brotensor::Tensor& dY, float eps,
+                         ::brotensor::Tensor& dX);
+
 } // namespace brotensor::detail::cpu
 
 namespace {
@@ -1276,6 +1293,16 @@ struct CpuStaticRegistrar {
         // ── Image preprocessing helpers ──
         ops.image_normalize              = &detail::cpu::image_normalize;
         ops.image_u8_to_f32_nhwc_to_nchw = &detail::cpu::image_u8_to_f32_nhwc_to_nchw;
+
+        // ── StyleGAN3-R synthesis-input primitives ──
+        ops.sin_forward                  = &detail::cpu::sin_forward;
+        ops.sin_backward                 = &detail::cpu::sin_backward;
+        ops.cos_forward                  = &detail::cpu::cos_forward;
+        ops.cos_backward                 = &detail::cpu::cos_backward;
+        ops.rsqrt_forward                = &detail::cpu::rsqrt_forward;
+        ops.rsqrt_backward               = &detail::cpu::rsqrt_backward;
+        ops.pixel_norm_forward           = &detail::cpu::pixel_norm_forward;
+        ops.pixel_norm_backward          = &detail::cpu::pixel_norm_backward;
 
         detail::register_backend(Device::CPU, ops,
                                  detail::cpu::cpu_alloc_table());

@@ -46,4 +46,5 @@
 #include "ops/sampling.h"
 #include "ops/spatial.h"
 #include "ops/spectral.h"
+#include "ops/stylegan.h"
 

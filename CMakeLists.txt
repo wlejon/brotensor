@@ -134,6 +134,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/rope_mrope.cpp
     src/cpu/batch_norm.cpp
     src/cpu/image_preproc.cpp
+    src/cpu/stylegan_elementwise.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
 if(MSVC)

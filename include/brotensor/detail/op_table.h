@@ -641,4 +641,42 @@
     X(randn,                                   void,  (uint64_t key, uint64_t counter, ::brotensor::Tensor& Y))                                   \
     X(rand_uniform,                            void,  (uint64_t key, uint64_t counter, ::brotensor::Tensor& Y))                                   \
     X(rand_bernoulli,                          void,  (float p, uint64_t key, uint64_t counter, ::brotensor::Tensor& Y))                          \
-    X(randn_truncated,                         void,  (float lo, float hi, uint64_t key, uint64_t counter, ::brotensor::Tensor& Y))
+    X(randn_truncated,                         void,  (float lo, float hi, uint64_t key, uint64_t counter, ::brotensor::Tensor& Y))               \
+    /* ─── StyleGAN3-R synthesis primitives — sin/cos/rsqrt + pixel_norm ─── */                                                                   \
+    X(sin_forward,                             void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                      \
+    X(sin_backward,                            void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))      \
+    X(cos_forward,                             void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                      \
+    X(cos_backward,                            void,  (const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))      \
+    X(rsqrt_forward,                           void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                      \
+    X(rsqrt_backward,                          void,  (const ::brotensor::Tensor& y, const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))      \
+    X(pixel_norm_forward,                      void,  (const ::brotensor::Tensor& X, float eps, ::brotensor::Tensor& Y))                           \
+    X(pixel_norm_backward,                     void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& dY, float eps,                     \
+                                                       ::brotensor::Tensor& dX))                                                                  \
+    /* ─── StyleGAN3-R core ops — modulated_conv2d / upfirdn2d / bias_act ─── */                                                                  \
+    X(modulated_conv2d_forward,                void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& W, const ::brotensor::Tensor& s,   \
+                                                       int N, int C_in, int H, int Wd,                                                            \
+                                                       int C_out, int kH, int kW, int pad_h, int pad_w,                                           \
+                                                       bool demodulate, float eps,                                                               \
+                                                       ::brotensor::Tensor& dcoef, ::brotensor::Tensor& Y))                                       \
+    X(modulated_conv2d_backward,               void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& W, const ::brotensor::Tensor& s,  \
+                                                       const ::brotensor::Tensor& dcoef, const ::brotensor::Tensor& dY,                           \
+                                                       int N, int C_in, int H, int Wd,                                                            \
+                                                       int C_out, int kH, int kW, int pad_h, int pad_w,                                           \
+                                                       bool demodulate, float eps,                                                               \
+                                                       ::brotensor::Tensor& dX, ::brotensor::Tensor& dW, ::brotensor::Tensor& ds))                \
+    X(upfirdn2d_forward,                       void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& f,                                 \
+                                                       int N, int C, int H, int Wd, int fH, int fW,                                               \
+                                                       int up_x, int up_y, int down_x, int down_y,                                               \
+                                                       int pad_x0, int pad_x1, int pad_y0, int pad_y1,                                           \
+                                                       bool flip_filter, float gain, ::brotensor::Tensor& Y))                                     \
+    X(upfirdn2d_backward,                      void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& f,                                \
+                                                       int N, int C, int H, int Wd, int fH, int fW,                                               \
+                                                       int up_x, int up_y, int down_x, int down_y,                                               \
+                                                       int pad_x0, int pad_x1, int pad_y0, int pad_y1,                                           \
+                                                       bool flip_filter, float gain, ::brotensor::Tensor& dX))                                    \
+    X(bias_act_forward,                        void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor* b,                                 \
+                                                       int N, int C, int HW, int act, float alpha,                                               \
+                                                       float gain, float clamp, ::brotensor::Tensor& Y))                                          \
+    X(bias_act_backward,                       void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& X, const ::brotensor::Tensor* b, \
+                                                       int N, int C, int HW, int act, float alpha,                                               \
+                                                       float gain, float clamp, ::brotensor::Tensor& dX, ::brotensor::Tensor* dB))
