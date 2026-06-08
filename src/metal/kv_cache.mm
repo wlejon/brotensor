@@ -54,9 +54,11 @@ kernel void k_flash_attention_decode(
         device half*       Out     [[buffer(3)]],   // (Lq, D)
         constant uint& Lq          [[buffer(4)]],
         constant uint& valid_len   [[buffer(5)]],
-        constant uint& D           [[buffer(6)]],
+        constant uint& Dq          [[buffer(6)]],
         constant uint& head_dim    [[buffer(7)]],
         constant uint& seq_offset  [[buffer(8)]],
+        constant uint& Dkv         [[buffer(9)]],
+        constant uint& group       [[buffer(10)]],
         threadgroup float* scratch [[threadgroup(0)]],
         uint3 gid    [[threadgroup_position_in_grid]],
         uint3 tid3   [[thread_position_in_threadgroup]],
@@ -68,7 +70,8 @@ kernel void k_flash_attention_decode(
 
     uint q = gid.x;
     uint h = gid.y;
-    uint head_off = h * head_dim;
+    uint q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
+    uint kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
     float inv_sqrt = rsqrt(float(head_dim));
     uint p_q = seq_offset + q;
 
@@ -87,8 +90,8 @@ kernel void k_flash_attention_decode(
             uint kg = k0 + t;
             float dot = 0.0f;
             for (uint d = 0; d < head_dim; ++d) {
-                dot += float(Q[q * D + head_off + d]) *
-                       float(Kk[kg * D + head_off + d]);
+                dot += float(Q[q * Dq + q_head_off + d]) *
+                       float(Kk[kg * Dkv + kv_head_off + d]);
             }
             scores[t] = dot * inv_sqrt;
         }
@@ -142,7 +145,7 @@ kernel void k_flash_attention_decode(
             if (slot >= MAX_HD_PER_THREAD) break;
             float acc = alpha * partial[slot];
             for (uint t = 0; t < klen; ++t) {
-                acc += scores[t] * float(V[(k0 + t) * D + head_off + d]);
+                acc += scores[t] * float(V[(k0 + t) * Dkv + kv_head_off + d]);
             }
             partial[slot] = acc;
             ++slot;
@@ -157,7 +160,7 @@ kernel void k_flash_attention_decode(
     uint slot = 0;
     for (uint d = tid; d < head_dim; d += tg_size) {
         if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q * D + head_off + d] = half(partial[slot] * inv);
+        Out[q * Dq + q_head_off + d] = half(partial[slot] * inv);
         ++slot;
     }
 }
@@ -170,9 +173,11 @@ kernel void k_flash_attention_decode_bf16(
         device bfloat*       Out     [[buffer(3)]],
         constant uint& Lq          [[buffer(4)]],
         constant uint& valid_len   [[buffer(5)]],
-        constant uint& D           [[buffer(6)]],
+        constant uint& Dq          [[buffer(6)]],
         constant uint& head_dim    [[buffer(7)]],
         constant uint& seq_offset  [[buffer(8)]],
+        constant uint& Dkv         [[buffer(9)]],
+        constant uint& group       [[buffer(10)]],
         threadgroup float* scratch [[threadgroup(0)]],
         uint3 gid    [[threadgroup_position_in_grid]],
         uint3 tid3   [[thread_position_in_threadgroup]],
@@ -184,7 +189,8 @@ kernel void k_flash_attention_decode_bf16(
 
     uint q = gid.x;
     uint h = gid.y;
-    uint head_off = h * head_dim;
+    uint q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
+    uint kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
     float inv_sqrt = rsqrt(float(head_dim));
     uint p_q = seq_offset + q;
 
@@ -202,8 +208,8 @@ kernel void k_flash_attention_decode_bf16(
             uint kg = k0 + t;
             float dot = 0.0f;
             for (uint d = 0; d < head_dim; ++d) {
-                dot += float(Q[q * D + head_off + d]) *
-                       float(Kk[kg * D + head_off + d]);
+                dot += float(Q[q * Dq + q_head_off + d]) *
+                       float(Kk[kg * Dkv + kv_head_off + d]);
             }
             scores[t] = dot * inv_sqrt;
         }
@@ -253,7 +259,7 @@ kernel void k_flash_attention_decode_bf16(
             if (slot >= MAX_HD_PER_THREAD) break;
             float acc = alpha * partial[slot];
             for (uint t = 0; t < klen; ++t) {
-                acc += scores[t] * float(V[(k0 + t) * D + head_off + d]);
+                acc += scores[t] * float(V[(k0 + t) * Dkv + kv_head_off + d]);
             }
             partial[slot] = acc;
             ++slot;
@@ -268,7 +274,7 @@ kernel void k_flash_attention_decode_bf16(
     uint slot = 0;
     for (uint d = tid; d < head_dim; d += tg_size) {
         if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q * D + head_off + d] = bfloat(partial[slot] * inv);
+        Out[q * Dq + q_head_off + d] = bfloat(partial[slot] * inv);
         ++slot;
     }
 }
@@ -373,22 +379,16 @@ void flash_attention_decode(const Tensor& Q,
                             const Tensor& K_cache, const Tensor& V_cache,
                             int valid_len, int num_q_heads, int num_kv_heads,
                             Tensor& O) {
-    if (num_kv_heads != num_q_heads) {
-        // GQA flash-decode (num_kv_heads != num_q_heads) lives only on CPU for now.
-        throw std::runtime_error("brotensor: flash_attention_decode: GQA "
-                                 "(num_kv_heads != num_q_heads) not yet "
-                                 "implemented on Metal backend");
-    }
-    const int num_heads = num_q_heads;
     const bool is_bf16 = (Q.dtype == Dtype::BF16);
     if ((Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) ||
         K_cache.dtype != Q.dtype || V_cache.dtype != Q.dtype) {
         throw std::runtime_error("flash_attention_decode_gpu: all tensors must be FP16 or all BF16");
     }
-    const int Lq = Q.rows;
-    const int D  = Q.cols;
-    if (K_cache.cols != D || V_cache.cols != D) {
-        throw std::runtime_error("flash_attention_decode_gpu: K/V cache cols must match Q.cols");
+    const int Lq  = Q.rows;
+    const int Dq  = Q.cols;            // num_q_heads  * head_dim
+    const int Dkv = K_cache.cols;      // num_kv_heads * head_dim
+    if (V_cache.cols != Dkv) {
+        throw std::runtime_error("flash_attention_decode_gpu: K_cache.cols != V_cache.cols");
     }
     if (valid_len < 0 || valid_len > K_cache.rows || valid_len > V_cache.rows) {
         throw std::runtime_error("flash_attention_decode_gpu: invalid valid_len");
@@ -396,24 +396,36 @@ void flash_attention_decode(const Tensor& Q,
     if (valid_len < Lq) {
         throw std::runtime_error("flash_attention_decode_gpu: valid_len must be >= Lq");
     }
-    if (num_heads <= 0 || D % num_heads != 0) {
-        throw std::runtime_error("flash_attention_decode_gpu: num_heads must divide D");
+    if (num_q_heads <= 0 || num_kv_heads <= 0) {
+        throw std::runtime_error("flash_attention_decode_gpu: num_q_heads / num_kv_heads must be positive");
     }
-    const int head_dim = D / num_heads;
+    if (num_q_heads % num_kv_heads != 0) {
+        throw std::runtime_error("flash_attention_decode_gpu: num_kv_heads must divide num_q_heads");
+    }
+    if (Dq % num_q_heads != 0 || Dkv % num_kv_heads != 0) {
+        throw std::runtime_error("flash_attention_decode_gpu: head_dim does not divide cols cleanly");
+    }
+    const int head_dim = Dq / num_q_heads;
+    if (Dkv / num_kv_heads != head_dim) {
+        throw std::runtime_error("flash_attention_decode_gpu: head_dim mismatch between Q and K/V");
+    }
+    const int group = num_q_heads / num_kv_heads;   // q heads served per kv head
     if ((head_dim + static_cast<int>(FAD_BLOCK) - 1) / static_cast<int>(FAD_BLOCK) > 8) {
         throw std::runtime_error("flash_attention_decode_gpu: head_dim too large (max 8 * FAD_BLOCK = 1024)");
     }
     Dtype out_dtype = is_bf16 ? Dtype::BF16 : Dtype::FP16;
-    if (O.rows != Lq || O.cols != D || O.dtype != out_dtype) {
-        O.resize(Lq, D, out_dtype);
+    if (O.rows != Lq || O.cols != Dq || O.dtype != out_dtype) {
+        O.resize(Lq, Dq, out_dtype);
     }
-    if (Lq == 0 || D == 0 || valid_len == 0) return;
+    if (Lq == 0 || Dq == 0 || valid_len == 0) return;
 
     const uint32_t seq_offset = static_cast<uint32_t>(valid_len - Lq);
     const uint32_t uLq = static_cast<uint32_t>(Lq);
     const uint32_t uValid = static_cast<uint32_t>(valid_len);
-    const uint32_t uD = static_cast<uint32_t>(D);
+    const uint32_t uDq = static_cast<uint32_t>(Dq);
+    const uint32_t uDkv = static_cast<uint32_t>(Dkv);
     const uint32_t uHd = static_cast<uint32_t>(head_dim);
+    const uint32_t uGroup = static_cast<uint32_t>(group);
 
     id<MTLComputePipelineState> pso = is_bf16 ? pso_decode_bf16() : pso_decode();
     id<MTLBuffer> bQ = buffer_for(Q);
@@ -437,12 +449,14 @@ void flash_attention_decode(const Tensor& Q,
         [enc setBuffer:bO offset:oO atIndex:3];
         [enc setBytes:&uLq      length:sizeof(uint32_t) atIndex:4];
         [enc setBytes:&uValid   length:sizeof(uint32_t) atIndex:5];
-        [enc setBytes:&uD       length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&uDq      length:sizeof(uint32_t) atIndex:6];
         [enc setBytes:&uHd      length:sizeof(uint32_t) atIndex:7];
         [enc setBytes:&seq_offset length:sizeof(uint32_t) atIndex:8];
+        [enc setBytes:&uDkv     length:sizeof(uint32_t) atIndex:9];
+        [enc setBytes:&uGroup   length:sizeof(uint32_t) atIndex:10];
         [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(Lq),
-                                              static_cast<NSUInteger>(num_heads), 1)
+                                              static_cast<NSUInteger>(num_q_heads), 1)
             threadsPerThreadgroup:MTLSizeMake(FAD_BLOCK, 1, 1)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);

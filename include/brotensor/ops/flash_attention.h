@@ -251,9 +251,9 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
 //       num_q_heads is plain MHA. head_dim = Q.cols/num_q_heads must equal
 //       K_cache.cols/num_kv_heads.
 //   O: (L_q, num_q_heads*head_dim) FP16, resized as needed.
-// CUDA and Metal currently support num_kv_heads == num_q_heads only and throw
-// "brotensor: flash_attention_decode: GQA not yet implemented on <backend>"
-// otherwise; CPU supports GQA fully.
+// GQA is native on all three backends: the decode kernel maps query head h to KV
+// head h/(num_q_heads/num_kv_heads), reading the n_kv-wide cache directly — no
+// KV-head widening needed. num_kv_heads == num_q_heads is plain MHA.
 void flash_attention_decode(const Tensor& Q,
                            const Tensor& K_cache, const Tensor& V_cache,
                            int valid_len, int num_q_heads, int num_kv_heads,

@@ -94,23 +94,30 @@ void run_append(int L_max, int D, int len0, int len1, uint64_t seed) {
 }
 
 // ─── flash_attention_decode ────────────────────────────────────────────────
-// valid_len cache rows, Lq query rows (the tail). num_heads divides D.
-void run_decode(int valid_len, int Lq, int D, int num_heads, uint64_t seed) {
+// valid_len cache rows, Lq query rows (the tail). Q is (Lq, num_q_heads*head_dim);
+// the K/V cache is (valid_len, num_kv_heads*head_dim). num_kv_heads == num_q_heads
+// is MHA; num_kv_heads < num_q_heads is GQA (each KV head serves
+// num_q_heads/num_kv_heads consecutive query heads).
+void run_decode(int valid_len, int Lq, int num_q_heads, int num_kv_heads,
+                int head_dim, uint64_t seed) {
     SplitMix64 rng(seed);
+    const int Dq  = num_q_heads  * head_dim;
+    const int Dkv = num_kv_heads * head_dim;
     // Small magnitude keeps FP16 softmax well-conditioned.
-    Tensor Q  = make_q16_cpu(Lq, D, rng, 0.4f);
-    Tensor Kc = make_q16_cpu(valid_len, D, rng, 0.4f);
-    Tensor Vc = make_q16_cpu(valid_len, D, rng, 0.4f);
+    Tensor Q  = make_q16_cpu(Lq, Dq, rng, 0.4f);
+    Tensor Kc = make_q16_cpu(valid_len, Dkv, rng, 0.4f);
+    Tensor Vc = make_q16_cpu(valid_len, Dkv, rng, 0.4f);
 
     Tensor cpu_O;
-    brotensor::flash_attention_decode(Q, Kc, Vc, valid_len, num_heads, cpu_O);
+    brotensor::flash_attention_decode(Q, Kc, Vc, valid_len,
+                                      num_q_heads, num_kv_heads, cpu_O);
 
     Tensor gQ  = to_fp16_cuda(Q);
     Tensor gKc = to_fp16_cuda(Kc);
     Tensor gVc = to_fp16_cuda(Vc);
     Tensor gpu_O;
-    brotensor::flash_attention_decode(gQ, gKc, gVc, valid_len, num_heads,
-                                      gpu_O);
+    brotensor::flash_attention_decode(gQ, gKc, gVc, valid_len,
+                                      num_q_heads, num_kv_heads, gpu_O);
 
     // FP16 dot-product + softmax reduction + fast-math expf/rsqrtf.
     compare_tensors(cpu_O, fp16_cuda_to_cpu(gpu_O), "flash_decode",
@@ -125,12 +132,20 @@ BT_PARITY_TEST(kv_cache_append_wide)   { run_append(16, 32, 5, 4, 0x7301ull); }
 BT_PARITY_TEST(kv_cache_append_full)   { run_append(10, 8,  6, 4, 0x7302ull); }
 BT_PARITY_TEST(kv_cache_append_single) { run_append(12, 16, 1, 1, 0x7303ull); }
 
-// ─── flash_attention_decode ────────────────────────────────────────────────
-BT_PARITY_TEST(kv_decode_single_query) { run_decode(12, 1, 16, 2, 0x7310ull); }
-BT_PARITY_TEST(kv_decode_tail)         { run_decode(12, 3, 16, 2, 0x7311ull); }
-BT_PARITY_TEST(kv_decode_one_head)     { run_decode(10, 2, 8,  1, 0x7312ull); }
-BT_PARITY_TEST(kv_decode_full_prefill) { run_decode(8,  8, 32, 4, 0x7313ull); }
-BT_PARITY_TEST(kv_decode_wide_head)    { run_decode(20, 2, 64, 1, 0x7314ull); }
+// ─── flash_attention_decode (MHA: num_kv_heads == num_q_heads) ─────────────
+//   args: valid_len, Lq, num_q_heads, num_kv_heads, head_dim, seed
+BT_PARITY_TEST(kv_decode_single_query) { run_decode(12, 1, 2, 2, 8,  0x7310ull); }
+BT_PARITY_TEST(kv_decode_tail)         { run_decode(12, 3, 2, 2, 8,  0x7311ull); }
+BT_PARITY_TEST(kv_decode_one_head)     { run_decode(10, 2, 1, 1, 8,  0x7312ull); }
+BT_PARITY_TEST(kv_decode_full_prefill) { run_decode(8,  8, 4, 4, 8,  0x7313ull); }
+BT_PARITY_TEST(kv_decode_wide_head)    { run_decode(20, 2, 1, 1, 64, 0x7314ull); }
+
+// ─── flash_attention_decode (GQA: num_kv_heads < num_q_heads) ──────────────
+// Qwen3-shaped 8q/2kv (group 4), 2q/1kv MQA, and a wider 6q/3kv (group 2).
+BT_PARITY_TEST(kv_decode_gqa_qwen3)    { run_decode(16, 1, 8, 2, 16, 0x7315ull); }
+BT_PARITY_TEST(kv_decode_gqa_tail)     { run_decode(16, 3, 8, 2, 16, 0x7316ull); }
+BT_PARITY_TEST(kv_decode_mqa)          { run_decode(12, 1, 2, 1, 8,  0x7317ull); }
+BT_PARITY_TEST(kv_decode_gqa_group2)   { run_decode(14, 2, 6, 3, 8,  0x7318ull); }
 
 // ─── BF16: BF16-on-CUDA vs FP32 CPU reference ─────────────────────────────
 // Same harness as FP16 but quantise through BF16 (7-bit mantissa).
@@ -188,22 +203,25 @@ void run_append_bf16(int L_max, int D, int len0, int len1, uint64_t seed) {
                     2e-2f, 2e-2f);
 }
 
-void run_decode_bf16(int valid_len, int Lq, int D, int num_heads,
-                     uint64_t seed) {
+void run_decode_bf16(int valid_len, int Lq, int num_q_heads, int num_kv_heads,
+                     int head_dim, uint64_t seed) {
     SplitMix64 rng(seed);
-    Tensor Q  = make_q_bf16_cpu(Lq, D, rng, 0.4f);
-    Tensor Kc = make_q_bf16_cpu(valid_len, D, rng, 0.4f);
-    Tensor Vc = make_q_bf16_cpu(valid_len, D, rng, 0.4f);
+    const int Dq  = num_q_heads  * head_dim;
+    const int Dkv = num_kv_heads * head_dim;
+    Tensor Q  = make_q_bf16_cpu(Lq, Dq, rng, 0.4f);
+    Tensor Kc = make_q_bf16_cpu(valid_len, Dkv, rng, 0.4f);
+    Tensor Vc = make_q_bf16_cpu(valid_len, Dkv, rng, 0.4f);
 
     Tensor cpu_O;
-    brotensor::flash_attention_decode(Q, Kc, Vc, valid_len, num_heads, cpu_O);
+    brotensor::flash_attention_decode(Q, Kc, Vc, valid_len,
+                                      num_q_heads, num_kv_heads, cpu_O);
 
     Tensor gQ  = to_bf16_gpu_from_cpu(Q);
     Tensor gKc = to_bf16_gpu_from_cpu(Kc);
     Tensor gVc = to_bf16_gpu_from_cpu(Vc);
     Tensor gpu_O;
-    brotensor::flash_attention_decode(gQ, gKc, gVc, valid_len, num_heads,
-                                      gpu_O);
+    brotensor::flash_attention_decode(gQ, gKc, gVc, valid_len,
+                                      num_q_heads, num_kv_heads, gpu_O);
 
     compare_tensors(cpu_O, bf16_cuda_to_cpu(gpu_O), "flash_decode_bf16",
                     5e-2f, 5e-2f);
@@ -215,9 +233,13 @@ BT_PARITY_TEST(kv_cache_bf16_append_small)  { run_append_bf16(8,  4,  3, 2, 0x73
 BT_PARITY_TEST(kv_cache_bf16_append_wide)   { run_append_bf16(16, 32, 5, 4, 0x7321ull); }
 BT_PARITY_TEST(kv_cache_bf16_append_full)   { run_append_bf16(10, 8,  6, 4, 0x7322ull); }
 
-BT_PARITY_TEST(kv_decode_bf16_single_query) { run_decode_bf16(12, 1, 16, 2, 0x7330ull); }
-BT_PARITY_TEST(kv_decode_bf16_tail)         { run_decode_bf16(12, 3, 16, 2, 0x7331ull); }
-BT_PARITY_TEST(kv_decode_bf16_one_head)     { run_decode_bf16(10, 2, 8,  1, 0x7332ull); }
-BT_PARITY_TEST(kv_decode_bf16_full_prefill) { run_decode_bf16(8,  8, 32, 4, 0x7333ull); }
+//   args: valid_len, Lq, num_q_heads, num_kv_heads, head_dim, seed
+BT_PARITY_TEST(kv_decode_bf16_single_query) { run_decode_bf16(12, 1, 2, 2, 8,  0x7330ull); }
+BT_PARITY_TEST(kv_decode_bf16_tail)         { run_decode_bf16(12, 3, 2, 2, 8,  0x7331ull); }
+BT_PARITY_TEST(kv_decode_bf16_one_head)     { run_decode_bf16(10, 2, 1, 1, 8,  0x7332ull); }
+BT_PARITY_TEST(kv_decode_bf16_full_prefill) { run_decode_bf16(8,  8, 4, 4, 8,  0x7333ull); }
+// GQA (num_kv_heads < num_q_heads): Qwen3-shaped 8q/2kv and 2q/1kv MQA.
+BT_PARITY_TEST(kv_decode_bf16_gqa_qwen3)    { run_decode_bf16(16, 1, 8, 2, 16, 0x7334ull); }
+BT_PARITY_TEST(kv_decode_bf16_mqa)          { run_decode_bf16(12, 1, 2, 1, 8,  0x7335ull); }
 
 int main() { return run_all("kv-cache cpu/gpu parity"); }
