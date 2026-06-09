@@ -8,12 +8,18 @@
 
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor {
 namespace detail::cuda {
 
 namespace {
 
 constexpr int SM_BLOCK = 256;
+
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 // One block computes softmax over a vector of length N.
 // Stable: subtract max over valid (mask==1) entries, exp, normalise.
@@ -269,7 +275,7 @@ void softmax_forward(const ::brotensor::Tensor& logits,
         float* d_scratch = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
                                         n * sizeof(float)));
-        softmax_forward_kernel_fp16<<<1, SM_BLOCK>>>(
+        softmax_forward_kernel_fp16<<<1, SM_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(logits.data),
             static_cast<__half*>(probs.data),
             d_mask, d_scratch, n);
@@ -279,14 +285,14 @@ void softmax_forward(const ::brotensor::Tensor& logits,
         float* d_scratch = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
                                         n * sizeof(float)));
-        softmax_forward_kernel_bf16<<<1, SM_BLOCK>>>(
+        softmax_forward_kernel_bf16<<<1, SM_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(logits.data),
             static_cast<__nv_bfloat16*>(probs.data),
             d_mask, d_scratch, n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_scratch);
     } else {
-        softmax_forward_kernel<<<1, SM_BLOCK>>>(
+        softmax_forward_kernel<<<1, SM_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(logits.data),
             static_cast<float*>(probs.data), d_mask, n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -311,17 +317,17 @@ void softmax_backward(const ::brotensor::Tensor& probs,
     }
     if (n == 0) return;
     if (probs.dtype == Dtype::FP16) {
-        softmax_backward_kernel_fp16<<<1, SM_BLOCK>>>(
+        softmax_backward_kernel_fp16<<<1, SM_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(probs.data),
             static_cast<const __half*>(dProbs.data),
             static_cast<__half*>(dLogits.data), n);
     } else if (probs.dtype == Dtype::BF16) {
-        softmax_backward_kernel_bf16<<<1, SM_BLOCK>>>(
+        softmax_backward_kernel_bf16<<<1, SM_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(probs.data),
             static_cast<const __nv_bfloat16*>(dProbs.data),
             static_cast<__nv_bfloat16*>(dLogits.data), n);
     } else {
-        softmax_backward_kernel<<<1, SM_BLOCK>>>(
+        softmax_backward_kernel<<<1, SM_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(probs.data),
             static_cast<const float*>(dProbs.data),
             static_cast<float*>(dLogits.data), n);

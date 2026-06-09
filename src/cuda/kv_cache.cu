@@ -12,10 +12,16 @@
 #include <cmath>
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 using ::brotensor::Tensor;
 using ::brotensor::Dtype;
+
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
                      int cur_len, Tensor& K_cache, Tensor& V_cache) {
@@ -50,10 +56,10 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
 
     BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(
         reinterpret_cast<char*>(K_cache.data) + dst_off,
-        K_new.data, bytes, cudaMemcpyDeviceToDevice));
+        K_new.data, bytes, cudaMemcpyDeviceToDevice, cur_stream()));
     BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(
         reinterpret_cast<char*>(V_cache.data) + dst_off,
-        V_new.data, bytes, cudaMemcpyDeviceToDevice));
+        V_new.data, bytes, cudaMemcpyDeviceToDevice, cur_stream()));
 }
 
 namespace {
@@ -326,14 +332,14 @@ void flash_attention_decode(const Tensor& Q,
     const size_t shmem = (static_cast<size_t>(FAD_KTILE) + FAD_BLOCK) * sizeof(float);
     dim3 grid(Lq, num_q_heads, 1);
     if (Q.dtype == Dtype::FP16) {
-        flash_attention_decode_kernel<<<grid, FAD_BLOCK, shmem>>>(
+        flash_attention_decode_kernel<<<grid, FAD_BLOCK, shmem, cur_stream()>>>(
             static_cast<const __half*>(Q.data),
             static_cast<const __half*>(K_cache.data),
             static_cast<const __half*>(V_cache.data),
             static_cast<__half*>(O.data),
             Lq, valid_len, Dq, Dkv, head_dim, seq_offset, group);
     } else {
-        flash_attention_decode_bf16_kernel<<<grid, FAD_BLOCK, shmem>>>(
+        flash_attention_decode_bf16_kernel<<<grid, FAD_BLOCK, shmem, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(Q.data),
             static_cast<const __nv_bfloat16*>(K_cache.data),
             static_cast<const __nv_bfloat16*>(V_cache.data),

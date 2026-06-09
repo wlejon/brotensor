@@ -22,9 +22,15 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 namespace {
+
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 [[noreturn]] inline void fail(const char* op, const std::string& reason) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + reason);
@@ -131,7 +137,7 @@ void top_k_rows(const ::brotensor::Tensor& X, int k,
 
     const size_t smem_bytes =
         static_cast<size_t>(k) * (sizeof(float) + sizeof(int32_t));
-    top_k_rows_kernel<<<R, 1, smem_bytes>>>(
+    top_k_rows_kernel<<<R, 1, smem_bytes, cur_stream()>>>(
         static_cast<const float*>(X.data),
         static_cast<float*>(Vals.data),
         static_cast<int32_t*>(Idx.data),

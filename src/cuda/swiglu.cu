@@ -12,11 +12,17 @@
 
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 namespace {
 
 constexpr int SG_BLOCK = 256;
+
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 __device__ inline float silu_scalar(float v) {
     return v / (1.0f + __expf(-v));
@@ -147,17 +153,17 @@ void swiglu_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
     const int total = B * D;
     if (total == 0) return;
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        swiglu_forward_fp16_kernel<<<grid_for(total), SG_BLOCK>>>(
+        swiglu_forward_fp16_kernel<<<grid_for(total), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             B, D);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        swiglu_forward_bf16_kernel<<<grid_for(total), SG_BLOCK>>>(
+        swiglu_forward_bf16_kernel<<<grid_for(total), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
             B, D);
     } else {
-        swiglu_forward_fp32_kernel<<<grid_for(total), SG_BLOCK>>>(
+        swiglu_forward_fp32_kernel<<<grid_for(total), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(Y.data), B, D);
     }
@@ -177,19 +183,19 @@ void swiglu_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& dY
     const int total = B * D;
     if (total == 0) return;
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        swiglu_backward_fp16_kernel<<<grid_for(total), SG_BLOCK>>>(
+        swiglu_backward_fp16_kernel<<<grid_for(total), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
             B, D);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        swiglu_backward_bf16_kernel<<<grid_for(total), SG_BLOCK>>>(
+        swiglu_backward_bf16_kernel<<<grid_for(total), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data),
             B, D);
     } else {
-        swiglu_backward_fp32_kernel<<<grid_for(total), SG_BLOCK>>>(
+        swiglu_backward_fp32_kernel<<<grid_for(total), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data), B, D);

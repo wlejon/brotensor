@@ -40,11 +40,17 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 namespace {
 
 constexpr int SL_BLOCK = 128;
+
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 inline int sl_grid(long long n) {
     long long blocks = (n + SL_BLOCK - 1) / SL_BLOCK;
@@ -243,7 +249,7 @@ void sample_logits(const ::brotensor::Tensor& logits, float temperature,
     BROTENSOR_CUDA_CHECK(cudaMalloc(&work,  nv * sizeof(float)));
     BROTENSOR_CUDA_CHECK(cudaMalloc(&order, nv * sizeof(int)));
 
-    sample_logits_kernel<<<sl_grid(N), SL_BLOCK>>>(
+    sample_logits_kernel<<<sl_grid(N), SL_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(logits.data),
         static_cast<int*>(indices.data),
         prob, work, order,

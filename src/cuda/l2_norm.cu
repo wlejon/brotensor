@@ -18,11 +18,17 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 namespace {
 
 constexpr int L2_BLOCK = 128;
+
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 template <typename T> __device__ inline float l2_load(const T* p);
 template <> __device__ inline float l2_load<float>(const float* p)  { return *p; }
@@ -177,17 +183,17 @@ void l2_norm_forward(const ::brotensor::Tensor& X,
     const int block  = L2_BLOCK;
     const size_t shmem = block * sizeof(float);
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        l2_norm_forward_kernel<__half><<<blocks, block, shmem>>>(
+        l2_norm_forward_kernel<__half><<<blocks, block, shmem, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             L, num_heads, head_dim, eps);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        l2_norm_forward_kernel<__nv_bfloat16><<<blocks, block, shmem>>>(
+        l2_norm_forward_kernel<__nv_bfloat16><<<blocks, block, shmem, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
             L, num_heads, head_dim, eps);
     } else {
-        l2_norm_forward_kernel<float><<<blocks, block, shmem>>>(
+        l2_norm_forward_kernel<float><<<blocks, block, shmem, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(Y.data),
             L, num_heads, head_dim, eps);
@@ -220,19 +226,19 @@ void l2_norm_backward(const ::brotensor::Tensor& X,
     const int block  = L2_BLOCK;
     const size_t shmem = 2 * block * sizeof(float);
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        l2_norm_backward_kernel<__half><<<blocks, block, shmem>>>(
+        l2_norm_backward_kernel<__half><<<blocks, block, shmem, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
             L, num_heads, head_dim, eps);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        l2_norm_backward_kernel<__nv_bfloat16><<<blocks, block, shmem>>>(
+        l2_norm_backward_kernel<__nv_bfloat16><<<blocks, block, shmem, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data),
             L, num_heads, head_dim, eps);
     } else {
-        l2_norm_backward_kernel<float><<<blocks, block, shmem>>>(
+        l2_norm_backward_kernel<float><<<blocks, block, shmem, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data),

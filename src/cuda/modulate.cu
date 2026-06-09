@@ -20,12 +20,18 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor {
 namespace detail::cuda {
 
 namespace {
 
 constexpr int MOD_BLOCK = 256;
+
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 // ── typed load / store: storage type T <-> float compute ──
 __device__ inline float ld(const float& x)          { return x; }
@@ -97,21 +103,21 @@ void modulate(const ::brotensor::Tensor& X, const ::brotensor::Tensor& scale,
 
     switch (X.dtype) {
     case Dtype::FP32:
-        modulate_kernel<float><<<blocks, MOD_BLOCK>>>(
+        modulate_kernel<float><<<blocks, MOD_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<const float*>(scale.data),
             static_cast<const float*>(shift.data),
             static_cast<float*>(Y.data), total, D);
         break;
     case Dtype::FP16:
-        modulate_kernel<__half><<<blocks, MOD_BLOCK>>>(
+        modulate_kernel<__half><<<blocks, MOD_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(scale.data),
             static_cast<const __half*>(shift.data),
             static_cast<__half*>(Y.data), total, D);
         break;
     default:  // BF16
-        modulate_kernel<__nv_bfloat16><<<blocks, MOD_BLOCK>>>(
+        modulate_kernel<__nv_bfloat16><<<blocks, MOD_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<const __nv_bfloat16*>(scale.data),
             static_cast<const __nv_bfloat16*>(shift.data),
@@ -142,19 +148,19 @@ void broadcast_mul(const ::brotensor::Tensor& X, const ::brotensor::Tensor& v,
 
     switch (X.dtype) {
     case Dtype::FP32:
-        broadcast_mul_kernel<float><<<blocks, MOD_BLOCK>>>(
+        broadcast_mul_kernel<float><<<blocks, MOD_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<const float*>(v.data),
             static_cast<float*>(Y.data), total, D);
         break;
     case Dtype::FP16:
-        broadcast_mul_kernel<__half><<<blocks, MOD_BLOCK>>>(
+        broadcast_mul_kernel<__half><<<blocks, MOD_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(v.data),
             static_cast<__half*>(Y.data), total, D);
         break;
     default:  // BF16
-        broadcast_mul_kernel<__nv_bfloat16><<<blocks, MOD_BLOCK>>>(
+        broadcast_mul_kernel<__nv_bfloat16><<<blocks, MOD_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<const __nv_bfloat16*>(v.data),
             static_cast<__nv_bfloat16*>(Y.data), total, D);

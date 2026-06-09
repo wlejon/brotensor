@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 using ::brotensor::Tensor;
@@ -21,6 +23,10 @@ using ::brotensor::Dtype;
 namespace {
 
 constexpr int EMB_BLOCK = 256;
+
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 __global__ void embedding_lookup_forward_kernel(const float* __restrict__ table,
                                                 const int* __restrict__ idx,
@@ -147,19 +153,19 @@ void embedding_lookup_forward(const Tensor& table,
     const int total = B * D;
     if (total == 0) return;
     if (table.dtype == Dtype::FP16) {
-        embedding_lookup_forward_fp16_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK>>>(
+        embedding_lookup_forward_fp16_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(table.data),
             reinterpret_cast<const int*>(d_idx),
             static_cast<__half*>(out.data),
             B, D);
     } else if (table.dtype == Dtype::BF16) {
-        embedding_lookup_forward_bf16_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK>>>(
+        embedding_lookup_forward_bf16_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(table.data),
             reinterpret_cast<const int*>(d_idx),
             static_cast<__nv_bfloat16*>(out.data),
             B, D);
     } else {
-        embedding_lookup_forward_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK>>>(
+        embedding_lookup_forward_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(table.data),
             reinterpret_cast<const int*>(d_idx),
             static_cast<float*>(out.data), B, D);
@@ -181,7 +187,7 @@ void embedding_lookup_backward(const Tensor& dOut,
     if (total == 0) return;
 
     if (dTable.dtype == Dtype::FP32) {
-        embedding_lookup_backward_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK>>>(
+        embedding_lookup_backward_kernel<<<grid_for(total, EMB_BLOCK), EMB_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dOut.data),
             reinterpret_cast<const int*>(d_idx),
             static_cast<float*>(dTable.data), B, D);
@@ -192,13 +198,13 @@ void embedding_lookup_backward(const Tensor& dOut,
         float* d_scratch = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
                                         table_n * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMemset(d_scratch, 0, table_n * sizeof(float)));
-        embedding_lookup_backward_kernel_fp16<<<grid_for(total, EMB_BLOCK), EMB_BLOCK>>>(
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_scratch, 0, table_n * sizeof(float), cur_stream()));
+        embedding_lookup_backward_kernel_fp16<<<grid_for(total, EMB_BLOCK), EMB_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(dOut.data),
             reinterpret_cast<const int*>(d_idx),
             d_scratch, B, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        emb_add_fp32_into_fp16<<<grid_for(table_n, EMB_BLOCK), EMB_BLOCK>>>(
+        emb_add_fp32_into_fp16<<<grid_for(table_n, EMB_BLOCK), EMB_BLOCK, 0, cur_stream()>>>(
             d_scratch, static_cast<__half*>(dTable.data), table_n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_scratch);
@@ -209,13 +215,13 @@ void embedding_lookup_backward(const Tensor& dOut,
         float* d_scratch = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
                                         table_n * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMemset(d_scratch, 0, table_n * sizeof(float)));
-        embedding_lookup_backward_kernel_bf16<<<grid_for(total, EMB_BLOCK), EMB_BLOCK>>>(
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_scratch, 0, table_n * sizeof(float), cur_stream()));
+        embedding_lookup_backward_kernel_bf16<<<grid_for(total, EMB_BLOCK), EMB_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(dOut.data),
             reinterpret_cast<const int*>(d_idx),
             d_scratch, B, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        emb_add_fp32_into_bf16<<<grid_for(table_n, EMB_BLOCK), EMB_BLOCK>>>(
+        emb_add_fp32_into_bf16<<<grid_for(table_n, EMB_BLOCK), EMB_BLOCK, 0, cur_stream()>>>(
             d_scratch, static_cast<__nv_bfloat16*>(dTable.data), table_n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_scratch);

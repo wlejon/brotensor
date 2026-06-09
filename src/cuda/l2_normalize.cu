@@ -18,11 +18,17 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 namespace {
 
 constexpr int LN_BLOCK = 256;
+
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 inline int ln_grid(long long n) {
     long long blocks = (n + LN_BLOCK - 1) / LN_BLOCK;
@@ -96,15 +102,15 @@ void l2_normalize_nchw_forward(const ::brotensor::Tensor& X,
     const long long total = (long long)N * HW;
     const double epsd = static_cast<double>(eps);
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        l2_normalize_nchw_kernel<__half><<<ln_grid(total), LN_BLOCK>>>(
+        l2_normalize_nchw_kernel<__half><<<ln_grid(total), LN_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
             N, C, HW, epsd);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        l2_normalize_nchw_kernel<__nv_bfloat16><<<ln_grid(total), LN_BLOCK>>>(
+        l2_normalize_nchw_kernel<__nv_bfloat16><<<ln_grid(total), LN_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), static_cast<__nv_bfloat16*>(Y.data),
             N, C, HW, epsd);
     } else {
-        l2_normalize_nchw_kernel<float><<<ln_grid(total), LN_BLOCK>>>(
+        l2_normalize_nchw_kernel<float><<<ln_grid(total), LN_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
             N, C, HW, epsd);
     }
