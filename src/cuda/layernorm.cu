@@ -10,7 +10,15 @@
 
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
+
+// Current CUDA stream for hot-op launches — so kernels join a non-default
+// capture/replay stream instead of silently landing on the default stream.
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 // NOTE on signature: per Subagent 1's spec, mean_out/rstd_out are host-side
 // floats. We honour that: the kernel writes the two scalars to a tiny device
@@ -389,7 +397,7 @@ void layernorm_forward(const ::brotensor::Tensor& x,
                               2 * sizeof(float)));
 
     if (x.dtype == Dtype::FP16) {
-        layernorm_forward_kernel_fp16<<<1, LN_BLOCK>>>(
+        layernorm_forward_kernel_fp16<<<1, LN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __half*>(x.data),
             reinterpret_cast<const __half*>(gamma.data),
             reinterpret_cast<const __half*>(beta.data),
@@ -397,7 +405,7 @@ void layernorm_forward(const ::brotensor::Tensor& x,
             reinterpret_cast<__half*>(xhat.data),
             d_scratch, n, eps);
     } else if (x.dtype == Dtype::BF16) {
-        layernorm_forward_kernel_bf16<<<1, LN_BLOCK>>>(
+        layernorm_forward_kernel_bf16<<<1, LN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data),
             reinterpret_cast<const __nv_bfloat16*>(gamma.data),
             reinterpret_cast<const __nv_bfloat16*>(beta.data),
@@ -405,7 +413,7 @@ void layernorm_forward(const ::brotensor::Tensor& x,
             reinterpret_cast<__nv_bfloat16*>(xhat.data),
             d_scratch, n, eps);
     } else {
-        layernorm_forward_kernel<<<1, LN_BLOCK>>>(
+        layernorm_forward_kernel<<<1, LN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const float*>(x.data),
             reinterpret_cast<const float*>(gamma.data),
             reinterpret_cast<const float*>(beta.data),
@@ -416,8 +424,9 @@ void layernorm_forward(const ::brotensor::Tensor& x,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     float h[2] = {0.0f, 0.0f};
-    BROTENSOR_CUDA_CHECK(cudaMemcpy(h, d_scratch, 2 * sizeof(float),
-                              cudaMemcpyDeviceToHost));
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(h, d_scratch, 2 * sizeof(float),
+                              cudaMemcpyDeviceToHost, cur_stream()));
+    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
     cudaFree(d_scratch);
     mean_out = h[0];
     rstd_out = h[1];
@@ -590,7 +599,7 @@ void layernorm_forward_inference_batched_fp16(const ::brotensor::Tensor& X_RD,
     if (R == 0 || D == 0) return;
     const int block = LN_BLOCK;
     const size_t shmem = static_cast<size_t>(block) * sizeof(float);
-    layernorm_forward_inference_batched_fp16_kernel<<<R, block, shmem>>>(
+    layernorm_forward_inference_batched_fp16_kernel<<<R, block, shmem, cur_stream()>>>(
         reinterpret_cast<const __half*>(X_RD.data),
         reinterpret_cast<const __half*>(gamma.data),
         reinterpret_cast<const __half*>(beta.data),
@@ -621,21 +630,21 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
     const int block = LN_BLOCK;
     const size_t shmem = static_cast<size_t>(block) * sizeof(float);
     if (X_RD.dtype == Dtype::FP16) {
-        layernorm_forward_inference_batched_fp16_kernel<<<R, block, shmem>>>(
+        layernorm_forward_inference_batched_fp16_kernel<<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const __half*>(X_RD.data),
             reinterpret_cast<const __half*>(gamma.data),
             reinterpret_cast<const __half*>(beta.data),
             reinterpret_cast<__half*>(Y_RD.data),
             R, D, eps);
     } else if (X_RD.dtype == Dtype::BF16) {
-        layernorm_forward_inference_batched_bf16_kernel<<<R, block, shmem>>>(
+        layernorm_forward_inference_batched_bf16_kernel<<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(X_RD.data),
             reinterpret_cast<const __nv_bfloat16*>(gamma.data),
             reinterpret_cast<const __nv_bfloat16*>(beta.data),
             reinterpret_cast<__nv_bfloat16*>(Y_RD.data),
             R, D, eps);
     } else {
-        layernorm_forward_inference_batched_kernel<<<R, block, shmem>>>(
+        layernorm_forward_inference_batched_kernel<<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const float*>(X_RD.data),
             reinterpret_cast<const float*>(gamma.data),
             reinterpret_cast<const float*>(beta.data),
@@ -664,7 +673,7 @@ void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
     if (n == 0) return;
 
     if (dY.dtype == Dtype::FP32) {
-        layernorm_backward_kernel<<<1, LN_BLOCK>>>(
+        layernorm_backward_kernel<<<1, LN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const float*>(dY.data),
             reinterpret_cast<const float*>(xhat.data),
             reinterpret_cast<const float*>(gamma.data),
@@ -679,7 +688,7 @@ void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
         float* d_db = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg), n * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db), n * sizeof(float)));
-        layernorm_backward_kernel_bf16<<<1, LN_BLOCK>>>(
+        layernorm_backward_kernel_bf16<<<1, LN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(dY.data),
             reinterpret_cast<const __nv_bfloat16*>(xhat.data),
             reinterpret_cast<const __nv_bfloat16*>(gamma.data),
@@ -688,9 +697,9 @@ void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
             d_dg, d_db, n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         const int blocks = (n + 255) / 256;
-        ln_add_fp32_into_bf16<<<blocks, 256>>>(
+        ln_add_fp32_into_bf16<<<blocks, 256, 0, cur_stream()>>>(
             d_dg, reinterpret_cast<__nv_bfloat16*>(dGamma.data), n);
-        ln_add_fp32_into_bf16<<<blocks, 256>>>(
+        ln_add_fp32_into_bf16<<<blocks, 256, 0, cur_stream()>>>(
             d_db, reinterpret_cast<__nv_bfloat16*>(dBeta.data), n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_dg);
@@ -700,7 +709,7 @@ void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
         float* d_db = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg), n * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db), n * sizeof(float)));
-        layernorm_backward_kernel_fp16<<<1, LN_BLOCK>>>(
+        layernorm_backward_kernel_fp16<<<1, LN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __half*>(dY.data),
             reinterpret_cast<const __half*>(xhat.data),
             reinterpret_cast<const __half*>(gamma.data),
@@ -709,9 +718,9 @@ void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
             d_dg, d_db, n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         const int blocks = (n + 255) / 256;
-        ln_add_fp32_into_fp16<<<blocks, 256>>>(
+        ln_add_fp32_into_fp16<<<blocks, 256, 0, cur_stream()>>>(
             d_dg, reinterpret_cast<__half*>(dGamma.data), n);
-        ln_add_fp32_into_fp16<<<blocks, 256>>>(
+        ln_add_fp32_into_fp16<<<blocks, 256, 0, cur_stream()>>>(
             d_db, reinterpret_cast<__half*>(dBeta.data), n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_dg);
@@ -904,7 +913,7 @@ void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
     const int block = LN_BLOCK;
     const size_t shmem = static_cast<size_t>(block) * sizeof(float);
     if (X_RD.dtype == Dtype::FP16) {
-        ln_fwd_batched_caches_kernel<__half><<<R, block, shmem>>>(
+        ln_fwd_batched_caches_kernel<__half><<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const __half*>(X_RD.data),
             reinterpret_cast<const __half*>(gamma.data),
             reinterpret_cast<const __half*>(beta.data),
@@ -914,7 +923,7 @@ void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
             reinterpret_cast<float*>(Rstd_R.data),
             R, D, eps);
     } else if (X_RD.dtype == Dtype::BF16) {
-        ln_fwd_batched_caches_kernel<__nv_bfloat16><<<R, block, shmem>>>(
+        ln_fwd_batched_caches_kernel<__nv_bfloat16><<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(X_RD.data),
             reinterpret_cast<const __nv_bfloat16*>(gamma.data),
             reinterpret_cast<const __nv_bfloat16*>(beta.data),
@@ -924,7 +933,7 @@ void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
             reinterpret_cast<float*>(Rstd_R.data),
             R, D, eps);
     } else {
-        ln_fwd_batched_caches_kernel<float><<<R, block, shmem>>>(
+        ln_fwd_batched_caches_kernel<float><<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const float*>(X_RD.data),
             reinterpret_cast<const float*>(gamma.data),
             reinterpret_cast<const float*>(beta.data),
@@ -967,7 +976,7 @@ void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
 
     if (dY_RD.dtype == Dtype::FP32) {
         // Atomic-add directly into the caller's FP32 dGamma/dBeta.
-        ln_bwd_batched_caches_kernel<float><<<R, block, shmem>>>(
+        ln_bwd_batched_caches_kernel<float><<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const float*>(dY_RD.data),
             reinterpret_cast<const float*>(Xhat_RD.data),
             reinterpret_cast<const float*>(gamma.data),
@@ -984,10 +993,10 @@ void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
         float* d_db = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg), D * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db), D * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dg, 0, D * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_db, 0, D * sizeof(float)));
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dg, 0, D * sizeof(float), cur_stream()));
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_db, 0, D * sizeof(float), cur_stream()));
         if (dY_RD.dtype == Dtype::FP16) {
-            ln_bwd_batched_caches_kernel<__half><<<R, block, shmem>>>(
+            ln_bwd_batched_caches_kernel<__half><<<R, block, shmem, cur_stream()>>>(
                 reinterpret_cast<const __half*>(dY_RD.data),
                 reinterpret_cast<const __half*>(Xhat_RD.data),
                 reinterpret_cast<const __half*>(gamma.data),
@@ -996,12 +1005,12 @@ void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
                 d_dg, d_db, R, D);
             BROTENSOR_CUDA_CHECK(cudaGetLastError());
             const int blocks = (D + 255) / 256;
-            ln_fold_fp32_into_fp16<<<blocks, 256>>>(
+            ln_fold_fp32_into_fp16<<<blocks, 256, 0, cur_stream()>>>(
                 d_dg, reinterpret_cast<__half*>(dGamma.data), D);
-            ln_fold_fp32_into_fp16<<<blocks, 256>>>(
+            ln_fold_fp32_into_fp16<<<blocks, 256, 0, cur_stream()>>>(
                 d_db, reinterpret_cast<__half*>(dBeta.data), D);
         } else {
-            ln_bwd_batched_caches_kernel<__nv_bfloat16><<<R, block, shmem>>>(
+            ln_bwd_batched_caches_kernel<__nv_bfloat16><<<R, block, shmem, cur_stream()>>>(
                 reinterpret_cast<const __nv_bfloat16*>(dY_RD.data),
                 reinterpret_cast<const __nv_bfloat16*>(Xhat_RD.data),
                 reinterpret_cast<const __nv_bfloat16*>(gamma.data),
@@ -1010,9 +1019,9 @@ void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
                 d_dg, d_db, R, D);
             BROTENSOR_CUDA_CHECK(cudaGetLastError());
             const int blocks = (D + 255) / 256;
-            ln_fold_fp32_into_bf16<<<blocks, 256>>>(
+            ln_fold_fp32_into_bf16<<<blocks, 256, 0, cur_stream()>>>(
                 d_dg, reinterpret_cast<__nv_bfloat16*>(dGamma.data), D);
-            ln_fold_fp32_into_bf16<<<blocks, 256>>>(
+            ln_fold_fp32_into_bf16<<<blocks, 256, 0, cur_stream()>>>(
                 d_db, reinterpret_cast<__nv_bfloat16*>(dBeta.data), D);
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());

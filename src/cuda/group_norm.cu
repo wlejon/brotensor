@@ -9,7 +9,15 @@
 
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
+
+// Current CUDA stream for hot-op launches — so kernels join a non-default
+// capture/replay stream instead of silently landing on the default stream.
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 namespace {
 
@@ -565,21 +573,21 @@ void group_norm_forward(const ::brotensor::Tensor& X,
     const int channels_per_group = C / num_groups;
     dim3 grid(num_groups, N, 1);
     if (X.dtype == Dtype::FP16) {
-        group_norm_forward_kernel_fp16<<<grid, GN_BLOCK>>>(
+        group_norm_forward_kernel_fp16<<<grid, GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __half*>(X.data),
             reinterpret_cast<const __half*>(gamma.data),
             reinterpret_cast<const __half*>(beta.data),
             reinterpret_cast<__half*>(Y.data),
             C, spatial, channels_per_group, eps);
     } else if (X.dtype == Dtype::BF16) {
-        group_norm_forward_kernel_bf16<<<grid, GN_BLOCK>>>(
+        group_norm_forward_kernel_bf16<<<grid, GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(X.data),
             reinterpret_cast<const __nv_bfloat16*>(gamma.data),
             reinterpret_cast<const __nv_bfloat16*>(beta.data),
             reinterpret_cast<__nv_bfloat16*>(Y.data),
             C, spatial, channels_per_group, eps);
     } else {
-        group_norm_forward_kernel_fp32<<<grid, GN_BLOCK>>>(
+        group_norm_forward_kernel_fp32<<<grid, GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const float*>(X.data),
             reinterpret_cast<const float*>(gamma.data),
             reinterpret_cast<const float*>(beta.data),
@@ -628,13 +636,13 @@ void group_norm_backward(const ::brotensor::Tensor& X,
     float* d_dB = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dG), C * sizeof(float)));
     BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dB), C * sizeof(float)));
-    BROTENSOR_CUDA_CHECK(cudaMemset(d_dG, 0, C * sizeof(float)));
-    BROTENSOR_CUDA_CHECK(cudaMemset(d_dB, 0, C * sizeof(float)));
+    BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dG, 0, C * sizeof(float), cur_stream()));
+    BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dB, 0, C * sizeof(float), cur_stream()));
 
     const int channels_per_group = C / num_groups;
     dim3 grid(num_groups, N, 1);
     if (X.dtype == Dtype::FP16) {
-        group_norm_backward_kernel_fp16<<<grid, GN_BLOCK>>>(
+        group_norm_backward_kernel_fp16<<<grid, GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __half*>(X.data),
             reinterpret_cast<const __half*>(gamma.data),
             reinterpret_cast<const __half*>(dY.data),
@@ -642,7 +650,7 @@ void group_norm_backward(const ::brotensor::Tensor& X,
             d_dG, d_dB,
             C, spatial, channels_per_group, eps);
     } else if (X.dtype == Dtype::BF16) {
-        group_norm_backward_kernel_bf16<<<grid, GN_BLOCK>>>(
+        group_norm_backward_kernel_bf16<<<grid, GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(X.data),
             reinterpret_cast<const __nv_bfloat16*>(gamma.data),
             reinterpret_cast<const __nv_bfloat16*>(dY.data),
@@ -650,7 +658,7 @@ void group_norm_backward(const ::brotensor::Tensor& X,
             d_dG, d_dB,
             C, spatial, channels_per_group, eps);
     } else {
-        group_norm_backward_kernel_fp32<<<grid, GN_BLOCK>>>(
+        group_norm_backward_kernel_fp32<<<grid, GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const float*>(X.data),
             reinterpret_cast<const float*>(gamma.data),
             reinterpret_cast<const float*>(dY.data),
@@ -663,18 +671,18 @@ void group_norm_backward(const ::brotensor::Tensor& X,
     const int block = 128;
     const int gridc = (C + block - 1) / block;
     if (X.dtype == Dtype::FP16) {
-        add_fp32_into_fp16<<<gridc, block>>>(
+        add_fp32_into_fp16<<<gridc, block, 0, cur_stream()>>>(
             d_dG, reinterpret_cast<__half*>(dGamma.data), C);
-        add_fp32_into_fp16<<<gridc, block>>>(
+        add_fp32_into_fp16<<<gridc, block, 0, cur_stream()>>>(
             d_dB, reinterpret_cast<__half*>(dBeta.data),  C);
     } else if (X.dtype == Dtype::BF16) {
-        add_fp32_into_bf16<<<gridc, block>>>(
+        add_fp32_into_bf16<<<gridc, block, 0, cur_stream()>>>(
             d_dG, reinterpret_cast<__nv_bfloat16*>(dGamma.data), C);
-        add_fp32_into_bf16<<<gridc, block>>>(
+        add_fp32_into_bf16<<<gridc, block, 0, cur_stream()>>>(
             d_dB, reinterpret_cast<__nv_bfloat16*>(dBeta.data),  C);
     } else {
-        add_fp32_into_fp32<<<gridc, block>>>(d_dG, reinterpret_cast<float*>(dGamma.data), C);
-        add_fp32_into_fp32<<<gridc, block>>>(d_dB, reinterpret_cast<float*>(dBeta.data),  C);
+        add_fp32_into_fp32<<<gridc, block, 0, cur_stream()>>>(d_dG, reinterpret_cast<float*>(dGamma.data), C);
+        add_fp32_into_fp32<<<gridc, block, 0, cur_stream()>>>(d_dB, reinterpret_cast<float*>(dBeta.data),  C);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
     cudaFree(d_dG);

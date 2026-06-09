@@ -5,7 +5,15 @@
 
 #include <cuda_runtime.h>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
+
+// Current CUDA stream for hot-op launches — so kernels join a non-default
+// capture/replay stream instead of silently landing on the default stream.
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 // Naive correctness-first kernels mirroring src/nn/multi_head_attention.cpp.
 // Heads are stored stacked along rows:
@@ -461,22 +469,22 @@ void mha_forward(const ::brotensor::Tensor& X,
         dim3 grid(((dh) + block_kdh.x - 1) / block_kdh.x,
                   ((K)  + block_kdh.y - 1) / block_kdh.y,
                   H);
-        mha_proj_kernel<<<grid, block_kdh>>>(X_p, Wq_p, Qh_p, K, D, dh);
-        mha_proj_kernel<<<grid, block_kdh>>>(X_p, Wk_p, Kh_p, K, D, dh);
-        mha_proj_kernel<<<grid, block_kdh>>>(X_p, Wv_p, Vh_p, K, D, dh);
+        mha_proj_kernel<<<grid, block_kdh, 0, cur_stream()>>>(X_p, Wq_p, Qh_p, K, D, dh);
+        mha_proj_kernel<<<grid, block_kdh, 0, cur_stream()>>>(X_p, Wk_p, Kh_p, K, D, dh);
+        mha_proj_kernel<<<grid, block_kdh, 0, cur_stream()>>>(X_p, Wv_p, Vh_p, K, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
         // Optional Q/K/V bias adds.
         if (bq) {
-            mha_proj_bias_add_kernel<<<grid, block_kdh>>>(
+            mha_proj_bias_add_kernel<<<grid, block_kdh, 0, cur_stream()>>>(
                 Qh_p, static_cast<const float*>(bq->data), K, dh);
         }
         if (bk) {
-            mha_proj_bias_add_kernel<<<grid, block_kdh>>>(
+            mha_proj_bias_add_kernel<<<grid, block_kdh, 0, cur_stream()>>>(
                 Kh_p, static_cast<const float*>(bk->data), K, dh);
         }
         if (bv) {
-            mha_proj_bias_add_kernel<<<grid, block_kdh>>>(
+            mha_proj_bias_add_kernel<<<grid, block_kdh, 0, cur_stream()>>>(
                 Vh_p, static_cast<const float*>(bv->data), K, dh);
         }
         if (bq || bk || bv) BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -490,13 +498,13 @@ void mha_forward(const ::brotensor::Tensor& X,
         dim3 grid(((K) + block_kk.x - 1) / block_kk.x,
                   ((K) + block_kk.y - 1) / block_kk.y,
                   H);
-        mha_scores_kernel<<<grid, block_kk>>>(Qh_p, Kh_p, scores_p,
+        mha_scores_kernel<<<grid, block_kk, 0, cur_stream()>>>(Qh_p, Kh_p, scores_p,
                                               K, dh, inv_sqrtdh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     // Row-masked softmax across all H*K rows.
-    mha_row_softmax_kernel<<<H * K, ROW_SM_BLOCK>>>(scores_p, Attnh_p,
+    mha_row_softmax_kernel<<<H * K, ROW_SM_BLOCK, 0, cur_stream()>>>(scores_p, Attnh_p,
                                                     d_mask, K);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
@@ -505,7 +513,7 @@ void mha_forward(const ::brotensor::Tensor& X,
         dim3 grid(((dh) + block_kdh.x - 1) / block_kdh.x,
                   ((K)  + block_kdh.y - 1) / block_kdh.y,
                   H);
-        mha_attn_apply_v_kernel<<<grid, block_kdh>>>(Attnh_p, Vh_p,
+        mha_attn_apply_v_kernel<<<grid, block_kdh, 0, cur_stream()>>>(Attnh_p, Vh_p,
                                                      Yconcat_p, K, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -515,7 +523,7 @@ void mha_forward(const ::brotensor::Tensor& X,
         const float* bo_p = bo ? static_cast<const float*>(bo->data) : nullptr;
         dim3 grid(((D) + block_kd.x - 1) / block_kd.x,
                   ((K) + block_kd.y - 1) / block_kd.y);
-        mha_output_proj_kernel<<<grid, block_kd>>>(Yconcat_p, Wo_p, bo_p,
+        mha_output_proj_kernel<<<grid, block_kd, 0, cur_stream()>>>(Yconcat_p, Wo_p, bo_p,
                                                    d_mask, O_p, K, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -576,14 +584,14 @@ void mha_backward(const ::brotensor::Tensor& dO,
     {
         dim3 grid(((D) + block_kd.x - 1) / block_kd.x,
                   ((K) + block_kd.y - 1) / block_kd.y);
-        mha_wo_back_dY_kernel<<<grid, block_kd>>>(dO_p, Wo_p, d_mask,
+        mha_wo_back_dY_kernel<<<grid, block_kd, 0, cur_stream()>>>(dO_p, Wo_p, d_mask,
                                                   dYconcat_p, K, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid(((D) + block_dd.x - 1) / block_dd.x,
                   ((D) + block_dd.y - 1) / block_dd.y);
-        mha_wo_back_dW_kernel<<<grid, block_dd>>>(dO_p, Yconcat_p, d_mask,
+        mha_wo_back_dW_kernel<<<grid, block_dd, 0, cur_stream()>>>(dO_p, Yconcat_p, d_mask,
                                                   dWo_p, K, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -592,7 +600,7 @@ void mha_backward(const ::brotensor::Tensor& dO,
     if (dbo) {
         const int block = 256;
         const int grid_x = (D + block - 1) / block;
-        mha_dbo_kernel<<<grid_x, block>>>(dO_p, d_mask,
+        mha_dbo_kernel<<<grid_x, block, 0, cur_stream()>>>(dO_p, d_mask,
                                           static_cast<float*>(dbo->data),
                                           K, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -607,7 +615,7 @@ void mha_backward(const ::brotensor::Tensor& dO,
         dim3 grid(((K) + block_kk.x - 1) / block_kk.x,
                   ((K) + block_kk.y - 1) / block_kk.y,
                   H);
-        mha_dAttn_kernel<<<grid, block_kk>>>(dYconcat_p, Vh_p, dAttn_p,
+        mha_dAttn_kernel<<<grid, block_kk, 0, cur_stream()>>>(dYconcat_p, Vh_p, dAttn_p,
                                              K, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -615,7 +623,7 @@ void mha_backward(const ::brotensor::Tensor& dO,
         dim3 grid(((dh) + block_kdh.x - 1) / block_kdh.x,
                   ((K)  + block_kdh.y - 1) / block_kdh.y,
                   H);
-        mha_dV_kernel<<<grid, block_kdh>>>(Attnh_p, dYconcat_p, dVh_p,
+        mha_dV_kernel<<<grid, block_kdh, 0, cur_stream()>>>(Attnh_p, dYconcat_p, dVh_p,
                                            K, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -623,7 +631,7 @@ void mha_backward(const ::brotensor::Tensor& dO,
     // dScores (H*K, K) via per-row softmax backward.
     Tensor dScores = Tensor::empty_on(Device::CUDA, H * K, K, Dtype::FP32);
     float* dScores_p = static_cast<float*>(dScores.data);
-    mha_row_softmax_back_kernel<<<H * K, ROW_SM_BLOCK>>>(Attnh_p, dAttn_p,
+    mha_row_softmax_back_kernel<<<H * K, ROW_SM_BLOCK, 0, cur_stream()>>>(Attnh_p, dAttn_p,
                                                          d_mask, dScores_p,
                                                          K, inv_sqrtdh);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -637,9 +645,9 @@ void mha_backward(const ::brotensor::Tensor& dO,
         dim3 grid(((dh) + block_kdh.x - 1) / block_kdh.x,
                   ((K)  + block_kdh.y - 1) / block_kdh.y,
                   H);
-        mha_dQ_kernel<<<grid, block_kdh>>>(dScores_p, Kh_p, dQh_p,
+        mha_dQ_kernel<<<grid, block_kdh, 0, cur_stream()>>>(dScores_p, Kh_p, dQh_p,
                                            K, dh);
-        mha_dK_kernel<<<grid, block_kdh>>>(dScores_p, Qh_p, dKh_p,
+        mha_dK_kernel<<<grid, block_kdh, 0, cur_stream()>>>(dScores_p, Qh_p, dKh_p,
                                            K, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -649,15 +657,15 @@ void mha_backward(const ::brotensor::Tensor& dO,
         const int block = 256;
         const int grid_x = (D + block - 1) / block;
         if (dbq) {
-            mha_dbqkv_kernel<<<grid_x, block>>>(
+            mha_dbqkv_kernel<<<grid_x, block, 0, cur_stream()>>>(
                 dQh_p, static_cast<float*>(dbq->data), K, D, dh);
         }
         if (dbk) {
-            mha_dbqkv_kernel<<<grid_x, block>>>(
+            mha_dbqkv_kernel<<<grid_x, block, 0, cur_stream()>>>(
                 dKh_p, static_cast<float*>(dbk->data), K, D, dh);
         }
         if (dbv) {
-            mha_dbqkv_kernel<<<grid_x, block>>>(
+            mha_dbqkv_kernel<<<grid_x, block, 0, cur_stream()>>>(
                 dVh_p, static_cast<float*>(dbv->data), K, D, dh);
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -667,7 +675,7 @@ void mha_backward(const ::brotensor::Tensor& dO,
     {
         dim3 grid(((D) + block_dd.x - 1) / block_dd.x,
                   ((D) + block_dd.y - 1) / block_dd.y);
-        mha_dWqkv_kernel<<<grid, block_dd>>>(dQh_p, dKh_p, dVh_p, X_p,
+        mha_dWqkv_kernel<<<grid, block_dd, 0, cur_stream()>>>(dQh_p, dKh_p, dVh_p, X_p,
                                              dWq_p, dWk_p, dWv_p,
                                              K, D, dh, H);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -675,7 +683,7 @@ void mha_backward(const ::brotensor::Tensor& dO,
     {
         dim3 grid(((D) + block_kd.x - 1) / block_kd.x,
                   ((K) + block_kd.y - 1) / block_kd.y);
-        mha_dX_proj_kernel<<<grid, block_kd>>>(dQh_p, dKh_p, dVh_p,
+        mha_dX_proj_kernel<<<grid, block_kd, 0, cur_stream()>>>(dQh_p, dKh_p, dVh_p,
                                                Wq_p, Wk_p, Wv_p,
                                                dX_p, K, D, dh, H);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());

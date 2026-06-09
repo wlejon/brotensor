@@ -33,7 +33,15 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
+
+// Current CUDA stream for hot-op launches — so kernels join a non-default
+// capture/replay stream instead of silently landing on the default stream.
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 namespace {
 
@@ -257,7 +265,7 @@ void batch_norm_forward(const ::brotensor::Tensor& X,
     }
     if (N == 0 || cols == 0) return;
 
-    bn_forward_kernel<<<C, BN_BLOCK>>>(
+    bn_forward_kernel<<<C, BN_BLOCK, 0, cur_stream()>>>(
         reinterpret_cast<const float*>(X.data),
         reinterpret_cast<const float*>(gamma.data),
         reinterpret_cast<const float*>(beta.data),
@@ -296,7 +304,7 @@ void batch_norm_inference(const ::brotensor::Tensor& X,
     }
     if (N == 0 || cols == 0) return;
 
-    bn_inference_kernel<<<C, BN_BLOCK>>>(
+    bn_inference_kernel<<<C, BN_BLOCK, 0, cur_stream()>>>(
         reinterpret_cast<const float*>(X.data),
         reinterpret_cast<const float*>(gamma.data),
         reinterpret_cast<const float*>(beta.data),
@@ -345,7 +353,7 @@ void batch_norm_backward(const ::brotensor::Tensor& X,
     }
     if (N == 0 || cols == 0) return;
 
-    bn_backward_kernel<<<C, BN_BLOCK>>>(
+    bn_backward_kernel<<<C, BN_BLOCK, 0, cur_stream()>>>(
         reinterpret_cast<const float*>(X.data),
         reinterpret_cast<const float*>(gamma.data),
         reinterpret_cast<const float*>(saved_mean.data),
