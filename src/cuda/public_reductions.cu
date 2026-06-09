@@ -65,9 +65,11 @@ __global__ void sum_cols_kernel(const T* __restrict__ X, T* __restrict__ Y,
     store_f32<T>(&Y[n], acc);
 }
 
-template <typename T>
+// OutT selects the index storage type: float (legacy) or int32_t (so the index
+// can feed a device gather with no host round-trip — the AR-decode hot path).
+template <typename T, typename OutT>
 __global__ void argmax_rows_kernel(const T* __restrict__ X,
-                                   float* __restrict__ Idx,
+                                   OutT* __restrict__ Idx,
                                    int M, int N) {
     __shared__ float sm_val[RED_BLOCK];
     __shared__ int   sm_idx[RED_BLOCK];
@@ -92,7 +94,24 @@ __global__ void argmax_rows_kernel(const T* __restrict__ X,
         }
         __syncthreads();
     }
-    if (tid == 0) Idx[m] = static_cast<float>(sm_idx[0]);
+    if (tid == 0) Idx[m] = static_cast<OutT>(sm_idx[0]);
+}
+
+// Launch argmax for input dtype T-dispatched, writing OutT indices.
+template <typename OutT>
+void launch_argmax(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx,
+                   int M, int N, cudaStream_t stream) {
+    OutT* out = static_cast<OutT*>(Idx.data);
+    if (X.dtype == Dtype::FP16) {
+        argmax_rows_kernel<__half, OutT><<<M, RED_BLOCK, 0, stream>>>(
+            static_cast<const __half*>(X.data), out, M, N);
+    } else if (X.dtype == Dtype::BF16) {
+        argmax_rows_kernel<__nv_bfloat16, OutT><<<M, RED_BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(X.data), out, M, N);
+    } else {
+        argmax_rows_kernel<float, OutT><<<M, RED_BLOCK, 0, stream>>>(
+            static_cast<const float*>(X.data), out, M, N);
+    }
 }
 
 } // namespace
@@ -160,32 +179,26 @@ void sum_cols(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+// Output dtype is opt-in: pass an INT32-typed `Idx` to get the index written as
+// a device int32 (consumable as a gather index with no host round-trip);
+// otherwise the index is written FP32 (the legacy default). Input X is
+// FP16/BF16/FP32.
 void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx) {
     if (X.dtype != Dtype::FP16 && X.dtype != Dtype::FP32 && X.dtype != Dtype::BF16) {
         throw std::runtime_error("argmax_rows: X must be FP16, BF16, or FP32");
     }
     const int M = X.rows;
     const int N = X.cols;
-    if (Idx.rows != M || Idx.cols != 1 || Idx.dtype != Dtype::FP32) {
-        Idx.resize(M, 1, Dtype::FP32);
+    const Dtype out_dt = (Idx.dtype == Dtype::INT32) ? Dtype::INT32 : Dtype::FP32;
+    if (Idx.rows != M || Idx.cols != 1 || Idx.dtype != out_dt) {
+        Idx.resize(M, 1, out_dt);
     }
     if (M == 0) return;
     if (N == 0) { Idx.zero(); return; }
     cudaStream_t stream =
         reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
-    if (X.dtype == Dtype::FP16) {
-        argmax_rows_kernel<__half><<<M, RED_BLOCK, 0, stream>>>(
-            static_cast<const __half*>(X.data),
-            static_cast<float*>(Idx.data), M, N);
-    } else if (X.dtype == Dtype::BF16) {
-        argmax_rows_kernel<__nv_bfloat16><<<M, RED_BLOCK, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(X.data),
-            static_cast<float*>(Idx.data), M, N);
-    } else {
-        argmax_rows_kernel<float><<<M, RED_BLOCK, 0, stream>>>(
-            static_cast<const float*>(X.data),
-            static_cast<float*>(Idx.data), M, N);
-    }
+    if (out_dt == Dtype::INT32) launch_argmax<int32_t>(X, Idx, M, N, stream);
+    else                        launch_argmax<float>(X, Idx, M, N, stream);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

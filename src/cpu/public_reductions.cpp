@@ -13,6 +13,7 @@
 #include <brotensor/tensor.h>
 
 #include <cstddef>
+#include <cstdint>
 
 namespace brotensor::detail::cpu {
 
@@ -51,17 +52,22 @@ void sum_cols(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
     }
 }
 
+// Output dtype is opt-in (mirrors the CUDA contract): an INT32-typed `Idx`
+// receives the index as int32; otherwise it is written FP32 (the default).
 void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx) {
+    using ::brotensor::Dtype;
     const int M = X.rows;
     const int N = X.cols;
-    if (Idx.rows != M || Idx.cols != 1 ||
-        Idx.dtype != ::brotensor::Dtype::FP32) {
-        Idx.resize(M, 1, ::brotensor::Dtype::FP32);
+    const Dtype out_dt = (Idx.dtype == Dtype::INT32) ? Dtype::INT32 : Dtype::FP32;
+    if (Idx.rows != M || Idx.cols != 1 || Idx.dtype != out_dt) {
+        Idx.resize(M, 1, out_dt);
     }
     if (M == 0) return;
     if (N == 0) { Idx.zero(); return; }
     const float* xp = X.host_f32();
-    float* ip = Idx.host_f32_mut();
+    float*    fp = (out_dt == Dtype::FP32) ? Idx.host_f32_mut() : nullptr;
+    int32_t*  ip = (out_dt == Dtype::INT32)
+                       ? static_cast<int32_t*>(Idx.host_raw_mut()) : nullptr;
     for (int m = 0; m < M; ++m) {
         const float* row = xp + static_cast<std::size_t>(m) * N;
         float best_v = -3.4028235e38f;
@@ -69,7 +75,8 @@ void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx) {
         for (int n = 0; n < N; ++n) {
             if (row[n] > best_v) { best_v = row[n]; best_i = n; }
         }
-        ip[m] = static_cast<float>(best_i);
+        if (ip) ip[m] = best_i;
+        else    fp[m] = static_cast<float>(best_i);
     }
 }
 

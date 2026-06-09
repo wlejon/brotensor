@@ -173,6 +173,17 @@ static void test_argmax_rows() {
         Ig.copy_to_host(got.data());
         for (int m = 0; m < M; ++m) CHECK(static_cast<int>(got[m]) == ref[m]);
     }
+    // FP32 input, INT32 output (opt-in via a pre-typed INT32 Idx tensor).
+    {
+        Tensor Ig = Tensor::empty_on(gpu_device(), 1, 1, Dtype::INT32);
+        Tensor Xg = Tensor::from_host_on(gpu_device(), X.data(), M, N);
+        brotensor::argmax_rows(Xg, Ig);
+        CHECK(Ig.dtype == Dtype::INT32 && Ig.rows == M && Ig.cols == 1);
+        brotensor::sync_all();
+        Tensor Ic = Ig.to(Device::CPU);
+        const int32_t* got = static_cast<const int32_t*>(Ic.host_raw());
+        for (int m = 0; m < M; ++m) CHECK(got[m] == ref[m]);
+    }
 }
 
 static void test_sum_rows_bf16() {

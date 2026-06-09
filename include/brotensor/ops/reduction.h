@@ -31,9 +31,12 @@ void sum_rows(const Tensor& X, Tensor& Y);
 void sum_cols(const Tensor& X, Tensor& Y);
 
 
-// Row-wise argmax: Idx[m,0] = argmax_n X[m,n], stored as the integer index
-// cast to float. X:(M,N) FP32/FP16, Idx:(M,1) FP32, resized. Ties keep the
-// lowest index.
+// Row-wise argmax: Idx[m,0] = argmax_n X[m,n]. X:(M,N) FP32/FP16/BF16. Ties
+// keep the lowest index. The output dtype is opt-in: pass an INT32-typed `Idx`
+// to get the index as a device int32 (directly consumable as a gather index —
+// no host round-trip, the AR-decode hot path); any other `Idx` (e.g. a fresh
+// default tensor) yields the index as FP32. `Idx` is resized to (M,1) of the
+// selected dtype.
 void argmax_rows(const Tensor& X, Tensor& Idx);
 
 }  // namespace brotensor

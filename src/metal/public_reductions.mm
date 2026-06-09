@@ -209,6 +209,101 @@ kernel void k_argmax_rows_bf16(device const bfloat* X [[buffer(0)]],
     }
     if (tid == 0) Idx[m] = float(sm_idx[0]);
 }
+
+// INT32-output argmax variants: identical reduction, index written as int32 so
+// it can feed a device gather with no host round-trip.
+kernel void k_argmax_rows_fp32_i32(device const float* X [[buffer(0)]],
+                                   device int*         Idx [[buffer(1)]],
+                                   constant uint& M [[buffer(2)]],
+                                   constant uint& N [[buffer(3)]],
+                                   uint m   [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_position_in_threadgroup]],
+                                   uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float sm_val[RED_BLOCK];
+    threadgroup int   sm_idx[RED_BLOCK];
+    if (m >= M) return;
+    float best_v = -3.4028235e38f;
+    int   best_i = 0;
+    for (uint n = tid; n < N; n += tgs) {
+        float v = X[m * N + n];
+        if (v > best_v) { best_v = v; best_i = int(n); }
+    }
+    sm_val[tid] = best_v;
+    sm_idx[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sm_val[tid + s] > sm_val[tid]) {
+                sm_val[tid] = sm_val[tid + s];
+                sm_idx[tid] = sm_idx[tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) Idx[m] = sm_idx[0];
+}
+
+kernel void k_argmax_rows_fp16_i32(device const half* X [[buffer(0)]],
+                                   device int*        Idx [[buffer(1)]],
+                                   constant uint& M [[buffer(2)]],
+                                   constant uint& N [[buffer(3)]],
+                                   uint m   [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_position_in_threadgroup]],
+                                   uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float sm_val[RED_BLOCK];
+    threadgroup int   sm_idx[RED_BLOCK];
+    if (m >= M) return;
+    float best_v = -3.4028235e38f;
+    int   best_i = 0;
+    for (uint n = tid; n < N; n += tgs) {
+        float v = float(X[m * N + n]);
+        if (v > best_v) { best_v = v; best_i = int(n); }
+    }
+    sm_val[tid] = best_v;
+    sm_idx[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sm_val[tid + s] > sm_val[tid]) {
+                sm_val[tid] = sm_val[tid + s];
+                sm_idx[tid] = sm_idx[tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) Idx[m] = sm_idx[0];
+}
+
+kernel void k_argmax_rows_bf16_i32(device const bfloat* X [[buffer(0)]],
+                                   device int*          Idx [[buffer(1)]],
+                                   constant uint& M [[buffer(2)]],
+                                   constant uint& N [[buffer(3)]],
+                                   uint m   [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_position_in_threadgroup]],
+                                   uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float sm_val[RED_BLOCK];
+    threadgroup int   sm_idx[RED_BLOCK];
+    if (m >= M) return;
+    float best_v = -3.4028235e38f;
+    int   best_i = 0;
+    for (uint n = tid; n < N; n += tgs) {
+        float v = float(X[m * N + n]);
+        if (v > best_v) { best_v = v; best_i = int(n); }
+    }
+    sm_val[tid] = best_v;
+    sm_idx[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sm_val[tid + s] > sm_val[tid]) {
+                sm_val[tid] = sm_val[tid + s];
+                sm_idx[tid] = sm_idx[tid + s];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) Idx[m] = sm_idx[0];
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -227,6 +322,9 @@ DEF_PSO(pso_sum_cols_bf16, @"k_sum_cols_bf16")
 DEF_PSO(pso_argmax_fp32,   @"k_argmax_rows_fp32")
 DEF_PSO(pso_argmax_fp16,   @"k_argmax_rows_fp16")
 DEF_PSO(pso_argmax_bf16,   @"k_argmax_rows_bf16")
+DEF_PSO(pso_argmax_fp32_i32, @"k_argmax_rows_fp32_i32")
+DEF_PSO(pso_argmax_fp16_i32, @"k_argmax_rows_fp16_i32")
+DEF_PSO(pso_argmax_bf16_i32, @"k_argmax_rows_bf16_i32")
 #undef DEF_PSO
 
 void run_per_row(id<MTLComputePipelineState> pso, uint32_t M, uint32_t N,
@@ -315,15 +413,18 @@ void argmax_rows(const Tensor& X, Tensor& Idx) {
     }
     const int M = X.rows;
     const int N = X.cols;
-    if (Idx.rows != M || Idx.cols != 1 || Idx.dtype != Dtype::FP32) {
-        Idx.resize(M, 1, Dtype::FP32);
+    // Output dtype is opt-in: INT32-typed Idx -> int32 index, else FP32.
+    const Dtype out_dt = (Idx.dtype == Dtype::INT32) ? Dtype::INT32 : Dtype::FP32;
+    if (Idx.rows != M || Idx.cols != 1 || Idx.dtype != out_dt) {
+        Idx.resize(M, 1, out_dt);
     }
     if (M == 0) return;
     if (N == 0) { Idx.zero(); return; }
+    const bool i32 = (out_dt == Dtype::INT32);
     id<MTLComputePipelineState> pso =
-        (X.dtype == Dtype::FP16) ? pso_argmax_fp16()
-      : (X.dtype == Dtype::BF16) ? pso_argmax_bf16()
-      : pso_argmax_fp32();
+        (X.dtype == Dtype::FP16) ? (i32 ? pso_argmax_fp16_i32() : pso_argmax_fp16())
+      : (X.dtype == Dtype::BF16) ? (i32 ? pso_argmax_bf16_i32() : pso_argmax_bf16())
+      :                            (i32 ? pso_argmax_fp32_i32() : pso_argmax_fp32());
     run_per_row(pso, M, N,
                 buffer_for(X), buffer_offset_for(X),
                 buffer_for(Idx), buffer_offset_for(Idx));
