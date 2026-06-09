@@ -17,6 +17,11 @@
 #include <cmath>
 #include <cstdint>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -55,7 +60,7 @@ void xavier_init(::brotensor::Tensor& W, uint64_t& rng_state) {
 
     constexpr int BLOCK = 256;
     const int grid = (n + BLOCK - 1) / BLOCK;
-    xavier_init_kernel<<<grid, BLOCK>>>(static_cast<float*>(W.data),
+    xavier_init_kernel<<<grid, BLOCK, 0, cur_stream()>>>(static_cast<float*>(W.data),
                                         n, limit, base);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 

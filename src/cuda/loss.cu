@@ -15,6 +15,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 using ::brotensor::Tensor;
@@ -310,14 +315,15 @@ float mse_vec_forward(const Tensor& pred, const Tensor& target) {
     if (n == 0) return 0.0f;
     float* d_sum = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(&d_sum, sizeof(float)));
-    mse_forward_kernel<<<1, LOSS_BLOCK>>>(
+    mse_forward_kernel<<<1, LOSS_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(pred.data),
         static_cast<const float*>(target.data),
         d_sum, n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
     float h_sum = 0.0f;
-    BROTENSOR_CUDA_CHECK(cudaMemcpy(&h_sum, d_sum, sizeof(float),
-                              cudaMemcpyDeviceToHost));
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(&h_sum, d_sum, sizeof(float),
+                              cudaMemcpyDeviceToHost, cur_stream()));
+    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
     cudaFree(d_sum);
     return h_sum / static_cast<float>(n);
 }
@@ -334,7 +340,7 @@ void mse_vec_backward(const Tensor& pred, const Tensor& target,
     }
     if (n == 0) return;
     const float scale = 2.0f / static_cast<float>(n);
-    mse_backward_kernel<<<grid_for(n, LOSS_BLOCK), LOSS_BLOCK>>>(
+    mse_backward_kernel<<<grid_for(n, LOSS_BLOCK), LOSS_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(pred.data),
         static_cast<const float*>(target.data),
         static_cast<float*>(dPred.data), n, scale);
@@ -355,7 +361,7 @@ void mse_vec_per_sample(const Tensor& pred, const Tensor& target,
         loss_per_sample.dtype != ::brotensor::Dtype::FP32)
         loss_per_sample.resize(B, 1, ::brotensor::Dtype::FP32);
     if (B == 0) return;
-    mse_per_sample_kernel<<<grid_for(B, LOSS_BLOCK), LOSS_BLOCK>>>(
+    mse_per_sample_kernel<<<grid_for(B, LOSS_BLOCK), LOSS_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(pred.data),
         static_cast<const float*>(target.data),
         static_cast<float*>(dPred.data),
@@ -390,7 +396,7 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
     if (B == 0 || n_act == 0 || n_heads <= 0) return;
 
     BROTENSOR_CUDA_CHECK(cudaMemsetAsync(loss_per_sample.data, 0,
-                                   sizeof(float) * B));
+                                   sizeof(float) * B, cur_stream()));
 
     // CUDA caps gridDim.y at 65535; chunk B to stay within the limit.
     constexpr int kMaxGridY = 65535;
@@ -402,7 +408,7 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
     for (int b0 = 0; b0 < B; b0 += kMaxGridY) {
         const int b_chunk = (B - b0) < kMaxGridY ? (B - b0) : kMaxGridY;
         dim3 grid(n_heads, b_chunk);
-        softmax_xent_fused_batched_kernel<<<grid, LOSS_BLOCK>>>(
+        softmax_xent_fused_batched_kernel<<<grid, LOSS_BLOCK, 0, cur_stream()>>>(
             logits_p  + static_cast<size_t>(b0) * n_act,
             target_p  + static_cast<size_t>(b0) * n_act,
             d_mask_BL ? (d_mask_BL + static_cast<size_t>(b0) * n_act) : nullptr,
@@ -450,7 +456,7 @@ void bce_with_logits_fused_batched(const Tensor& logits_BL,
     auto*       loss_p    = static_cast<float*>(loss_per_sample.data);
     for (int b0 = 0; b0 < B; b0 += kMaxGridX) {
         const int b_chunk = (B - b0) < kMaxGridX ? (B - b0) : kMaxGridX;
-        bce_with_logits_fused_batched_kernel<<<b_chunk, LOSS_BLOCK>>>(
+        bce_with_logits_fused_batched_kernel<<<b_chunk, LOSS_BLOCK, 0, cur_stream()>>>(
             logits_p  + static_cast<size_t>(b0) * L,
             target_p  + static_cast<size_t>(b0) * L,
             d_mask_BL ? (d_mask_BL + static_cast<size_t>(b0) * L) : nullptr,
@@ -483,7 +489,7 @@ float softmax_xent_fused(const Tensor& logits, const Tensor& target,
 
     float* d_loss = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(&d_loss, sizeof(float)));
-    softmax_xent_fused_kernel<<<1, LOSS_BLOCK>>>(
+    softmax_xent_fused_kernel<<<1, LOSS_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(logits.data),
         static_cast<const float*>(target.data),
         d_mask,
@@ -493,8 +499,9 @@ float softmax_xent_fused(const Tensor& logits, const Tensor& target,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     float h_loss = 0.0f;
-    BROTENSOR_CUDA_CHECK(cudaMemcpy(&h_loss, d_loss, sizeof(float),
-                              cudaMemcpyDeviceToHost));
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(&h_loss, d_loss, sizeof(float),
+                              cudaMemcpyDeviceToHost, cur_stream()));
+    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
     cudaFree(d_loss);
     return h_loss;
 }

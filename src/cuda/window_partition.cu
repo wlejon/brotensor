@@ -21,6 +21,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -141,7 +146,7 @@ void window_partition_forward(const ::brotensor::Tensor& X,
     if (N == 0 || cols_out == 0) return;
 
     const long long total = (long long)B_out * cols_out;
-    window_partition_forward_kernel<<<wp_grid(total), WP_BLOCK>>>(
+    window_partition_forward_kernel<<<wp_grid(total), WP_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data),
         static_cast<float*>(Y.data),
         N, C, H, W, window, nw_h, nw_w);
@@ -169,7 +174,7 @@ void window_reverse_forward(const ::brotensor::Tensor& X,
     if (N == 0 || cols_out == 0) return;
 
     const long long total = (long long)N * cols_out;
-    window_reverse_forward_kernel<<<wp_grid(total), WP_BLOCK>>>(
+    window_reverse_forward_kernel<<<wp_grid(total), WP_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data),
         static_cast<float*>(Y.data),
         N, C, H, W, window, nw_h, nw_w);

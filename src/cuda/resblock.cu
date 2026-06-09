@@ -9,6 +9,11 @@
 
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 // Forward declarations of intra-backend ops we compose with. They live in the
@@ -303,14 +308,14 @@ inline void launch_gn_silu_fused(bool is_bf16, dim3 grid,
                                  int C, int spatial, int channels_per_group,
                                  float eps) {
     if (is_bf16) {
-        gn_silu_fused_bf16_kernel<<<grid, RB_GN_BLOCK>>>(
+        gn_silu_fused_bf16_kernel<<<grid, RB_GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(X),
             reinterpret_cast<const __nv_bfloat16*>(gamma),
             reinterpret_cast<const __nv_bfloat16*>(beta),
             reinterpret_cast<__nv_bfloat16*>(Y),
             C, spatial, channels_per_group, eps);
     } else {
-        gn_silu_fused_kernel<<<grid, RB_GN_BLOCK>>>(
+        gn_silu_fused_kernel<<<grid, RB_GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __half*>(X),
             reinterpret_cast<const __half*>(gamma),
             reinterpret_cast<const __half*>(beta),
@@ -324,12 +329,12 @@ inline void launch_add_NC_shift(bool is_bf16, int blocks, int block,
                                 void* Y, const void* shift,
                                 int N, int C, int spatial, int has_N) {
     if (is_bf16) {
-        add_NC_shift_bf16_kernel<<<blocks, block>>>(
+        add_NC_shift_bf16_kernel<<<blocks, block, 0, cur_stream()>>>(
             reinterpret_cast<__nv_bfloat16*>(Y),
             reinterpret_cast<const __nv_bfloat16*>(shift),
             N, C, spatial, has_N);
     } else {
-        add_NC_shift_kernel<<<blocks, block>>>(
+        add_NC_shift_kernel<<<blocks, block, 0, cur_stream()>>>(
             reinterpret_cast<__half*>(Y),
             reinterpret_cast<const __half*>(shift),
             N, C, spatial, has_N);
@@ -548,7 +553,7 @@ void resblock_forward_int8w_fp16(const ::brotensor::Tensor& X,
     // Leg 1: GN1 → SiLU.
     {
         dim3 grid(num_groups, N, 1);
-        gn_silu_fused_kernel<<<grid, RB_GN_BLOCK>>>(
+        gn_silu_fused_kernel<<<grid, RB_GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __half*>(X.data),
             reinterpret_cast<const __half*>(gamma1.data),
             reinterpret_cast<const __half*>(beta1.data),
@@ -579,7 +584,7 @@ void resblock_forward_int8w_fp16(const ::brotensor::Tensor& X,
             throw std::runtime_error("resblock_forward_int8w_fp16: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
         const int total = N * C_out * spatial;
-        add_NC_shift_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK>>>(
+        add_NC_shift_kernel<<<grid_for(total, RB_CONV_BLOCK), RB_CONV_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<__half*>(h2.data),
             reinterpret_cast<const __half*>(t_emb_shift->data),
             N, C_out, spatial, has_N);
@@ -589,7 +594,7 @@ void resblock_forward_int8w_fp16(const ::brotensor::Tensor& X,
     // Leg 2: GN2 → SiLU.
     {
         dim3 grid(num_groups, N, 1);
-        gn_silu_fused_kernel<<<grid, RB_GN_BLOCK>>>(
+        gn_silu_fused_kernel<<<grid, RB_GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __half*>(h2.data),
             reinterpret_cast<const __half*>(gamma2.data),
             reinterpret_cast<const __half*>(beta2.data),
@@ -798,12 +803,12 @@ void resblock_backward(const ::brotensor::Tensor& X,
             // (N, C_out) — sum over HW per (n, c), accumulate into dt_emb_shift.
             const int blocks = N * C_out;
             if (is_bf16) {
-                rb_sum_hw_per_NC_bf16<<<blocks, RB_GN_BLOCK>>>(
+                rb_sum_hw_per_NC_bf16<<<blocks, RB_GN_BLOCK, 0, cur_stream()>>>(
                     reinterpret_cast<const __nv_bfloat16*>(dh2.data),
                     reinterpret_cast<__nv_bfloat16*>(dt_emb_shift->data),
                     N, C_out, spatial);
             } else {
-                rb_sum_hw_per_NC_fp16<<<blocks, RB_GN_BLOCK>>>(
+                rb_sum_hw_per_NC_fp16<<<blocks, RB_GN_BLOCK, 0, cur_stream()>>>(
                     reinterpret_cast<const __half*>(dh2.data),
                     reinterpret_cast<__half*>(dt_emb_shift->data),
                     N, C_out, spatial);

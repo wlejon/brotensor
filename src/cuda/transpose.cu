@@ -8,6 +8,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor {
 namespace detail::cuda {
 
@@ -74,17 +79,17 @@ void nchw_to_sequence(const ::brotensor::Tensor& X,
     const int total = rows * C;
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
-        nchw_to_seq_kernel<__half><<<grid_for(total), TR_BLOCK>>>(
+        nchw_to_seq_kernel<__half><<<grid_for(total), TR_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             N, C, H, W, HW, total);
     } else if (X.dtype == Dtype::BF16) {
-        nchw_to_seq_kernel<__nv_bfloat16><<<grid_for(total), TR_BLOCK>>>(
+        nchw_to_seq_kernel<__nv_bfloat16><<<grid_for(total), TR_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
             N, C, H, W, HW, total);
     } else {
-        nchw_to_seq_kernel<float><<<grid_for(total), TR_BLOCK>>>(
+        nchw_to_seq_kernel<float><<<grid_for(total), TR_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(Y.data),
             N, C, H, W, HW, total);
@@ -104,17 +109,17 @@ void sequence_to_nchw(const ::brotensor::Tensor& X,
     const int total = N * cols;
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
-        seq_to_nchw_kernel<__half><<<grid_for(total), TR_BLOCK>>>(
+        seq_to_nchw_kernel<__half><<<grid_for(total), TR_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             N, C, H, W, HW, total);
     } else if (X.dtype == Dtype::BF16) {
-        seq_to_nchw_kernel<__nv_bfloat16><<<grid_for(total), TR_BLOCK>>>(
+        seq_to_nchw_kernel<__nv_bfloat16><<<grid_for(total), TR_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
             N, C, H, W, HW, total);
     } else {
-        seq_to_nchw_kernel<float><<<grid_for(total), TR_BLOCK>>>(
+        seq_to_nchw_kernel<float><<<grid_for(total), TR_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(Y.data),
             N, C, H, W, HW, total);

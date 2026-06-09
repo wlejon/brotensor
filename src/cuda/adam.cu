@@ -4,6 +4,11 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor {
 namespace detail::cuda {
 
@@ -47,7 +52,7 @@ void adam_step(::brotensor::Tensor& param, const ::brotensor::Tensor& grad,
     const float inv_bc2 = 1.0f / bc2;
     constexpr int BLOCK = 256;
     const int blocks = (n + BLOCK - 1) / BLOCK;
-    adam_step_kernel<<<blocks, BLOCK>>>(
+    adam_step_kernel<<<blocks, BLOCK, 0, cur_stream()>>>(
         static_cast<float*>(param.data),
         static_cast<const float*>(grad.data),
         static_cast<float*>(m.data),

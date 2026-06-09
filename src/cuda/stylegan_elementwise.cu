@@ -27,6 +27,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -208,13 +213,13 @@ inline void run_unary_fwd(const char* op, const ::brotensor::Tensor& x,
 void sin_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     run_unary_fwd("sin_forward", x, y, [&](long long n) {
         if (x.dtype == ::brotensor::Dtype::FP16)
-            sin_forward_kernel<__half><<<sg_grid(n), SG_BLOCK>>>(
+            sin_forward_kernel<__half><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __half*>(x.data), n, static_cast<__half*>(y.data));
         else if (x.dtype == ::brotensor::Dtype::BF16)
-            sin_forward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK>>>(
+            sin_forward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __nv_bfloat16*>(x.data), n, static_cast<__nv_bfloat16*>(y.data));
         else
-            sin_forward_kernel<float><<<sg_grid(n), SG_BLOCK>>>(
+            sin_forward_kernel<float><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
                 static_cast<const float*>(x.data), n, static_cast<float*>(y.data));
     });
 }
@@ -230,15 +235,15 @@ void sin_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
     const long long n = x.size();
     if (n == 0) return;
     if (x.dtype == ::brotensor::Dtype::FP16)
-        sin_backward_kernel<__half><<<sg_grid(n), SG_BLOCK>>>(
+        sin_backward_kernel<__half><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data), static_cast<const __half*>(dY.data),
             n, static_cast<__half*>(dX.data));
     else if (x.dtype == ::brotensor::Dtype::BF16)
-        sin_backward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK>>>(
+        sin_backward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(dY.data),
             n, static_cast<__nv_bfloat16*>(dX.data));
     else
-        sin_backward_kernel<float><<<sg_grid(n), SG_BLOCK>>>(
+        sin_backward_kernel<float><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data), static_cast<const float*>(dY.data),
             n, static_cast<float*>(dX.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -249,13 +254,13 @@ void sin_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
 void cos_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     run_unary_fwd("cos_forward", x, y, [&](long long n) {
         if (x.dtype == ::brotensor::Dtype::FP16)
-            cos_forward_kernel<__half><<<sg_grid(n), SG_BLOCK>>>(
+            cos_forward_kernel<__half><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __half*>(x.data), n, static_cast<__half*>(y.data));
         else if (x.dtype == ::brotensor::Dtype::BF16)
-            cos_forward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK>>>(
+            cos_forward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __nv_bfloat16*>(x.data), n, static_cast<__nv_bfloat16*>(y.data));
         else
-            cos_forward_kernel<float><<<sg_grid(n), SG_BLOCK>>>(
+            cos_forward_kernel<float><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
                 static_cast<const float*>(x.data), n, static_cast<float*>(y.data));
     });
 }
@@ -271,15 +276,15 @@ void cos_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
     const long long n = x.size();
     if (n == 0) return;
     if (x.dtype == ::brotensor::Dtype::FP16)
-        cos_backward_kernel<__half><<<sg_grid(n), SG_BLOCK>>>(
+        cos_backward_kernel<__half><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data), static_cast<const __half*>(dY.data),
             n, static_cast<__half*>(dX.data));
     else if (x.dtype == ::brotensor::Dtype::BF16)
-        cos_backward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK>>>(
+        cos_backward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(dY.data),
             n, static_cast<__nv_bfloat16*>(dX.data));
     else
-        cos_backward_kernel<float><<<sg_grid(n), SG_BLOCK>>>(
+        cos_backward_kernel<float><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data), static_cast<const float*>(dY.data),
             n, static_cast<float*>(dX.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -290,13 +295,13 @@ void cos_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
 void rsqrt_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     run_unary_fwd("rsqrt_forward", x, y, [&](long long n) {
         if (x.dtype == ::brotensor::Dtype::FP16)
-            rsqrt_forward_kernel<__half><<<sg_grid(n), SG_BLOCK>>>(
+            rsqrt_forward_kernel<__half><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __half*>(x.data), n, static_cast<__half*>(y.data));
         else if (x.dtype == ::brotensor::Dtype::BF16)
-            rsqrt_forward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK>>>(
+            rsqrt_forward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __nv_bfloat16*>(x.data), n, static_cast<__nv_bfloat16*>(y.data));
         else
-            rsqrt_forward_kernel<float><<<sg_grid(n), SG_BLOCK>>>(
+            rsqrt_forward_kernel<float><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
                 static_cast<const float*>(x.data), n, static_cast<float*>(y.data));
     });
 }
@@ -312,15 +317,15 @@ void rsqrt_backward(const ::brotensor::Tensor& y, const ::brotensor::Tensor& dY,
     const long long n = y.size();
     if (n == 0) return;
     if (y.dtype == ::brotensor::Dtype::FP16)
-        rsqrt_backward_kernel<__half><<<sg_grid(n), SG_BLOCK>>>(
+        rsqrt_backward_kernel<__half><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(y.data), static_cast<const __half*>(dY.data),
             n, static_cast<__half*>(dX.data));
     else if (y.dtype == ::brotensor::Dtype::BF16)
-        rsqrt_backward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK>>>(
+        rsqrt_backward_kernel<__nv_bfloat16><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(y.data), static_cast<const __nv_bfloat16*>(dY.data),
             n, static_cast<__nv_bfloat16*>(dX.data));
     else
-        rsqrt_backward_kernel<float><<<sg_grid(n), SG_BLOCK>>>(
+        rsqrt_backward_kernel<float><<<sg_grid(n), SG_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(y.data), static_cast<const float*>(dY.data),
             n, static_cast<float*>(dX.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -337,13 +342,13 @@ void pixel_norm_forward(const ::brotensor::Tensor& X, float eps,
     if (R == 0 || C == 0) return;
     const size_t shmem = SG_BLOCK * sizeof(float);
     if (X.dtype == ::brotensor::Dtype::FP16)
-        pixel_norm_forward_kernel<__half><<<R, SG_BLOCK, shmem>>>(
+        pixel_norm_forward_kernel<__half><<<R, SG_BLOCK, shmem, cur_stream()>>>(
             static_cast<const __half*>(X.data), C, eps, static_cast<__half*>(Y.data));
     else if (X.dtype == ::brotensor::Dtype::BF16)
-        pixel_norm_forward_kernel<__nv_bfloat16><<<R, SG_BLOCK, shmem>>>(
+        pixel_norm_forward_kernel<__nv_bfloat16><<<R, SG_BLOCK, shmem, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), C, eps, static_cast<__nv_bfloat16*>(Y.data));
     else
-        pixel_norm_forward_kernel<float><<<R, SG_BLOCK, shmem>>>(
+        pixel_norm_forward_kernel<float><<<R, SG_BLOCK, shmem, cur_stream()>>>(
             static_cast<const float*>(X.data), C, eps, static_cast<float*>(Y.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -361,15 +366,15 @@ void pixel_norm_backward(const ::brotensor::Tensor& X,
     if (R == 0 || C == 0) return;
     const size_t shmem = SG_BLOCK * sizeof(float);
     if (X.dtype == ::brotensor::Dtype::FP16)
-        pixel_norm_backward_kernel<__half><<<R, SG_BLOCK, shmem>>>(
+        pixel_norm_backward_kernel<__half><<<R, SG_BLOCK, shmem, cur_stream()>>>(
             static_cast<const __half*>(X.data), static_cast<const __half*>(dY.data),
             C, eps, static_cast<__half*>(dX.data));
     else if (X.dtype == ::brotensor::Dtype::BF16)
-        pixel_norm_backward_kernel<__nv_bfloat16><<<R, SG_BLOCK, shmem>>>(
+        pixel_norm_backward_kernel<__nv_bfloat16><<<R, SG_BLOCK, shmem, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), static_cast<const __nv_bfloat16*>(dY.data),
             C, eps, static_cast<__nv_bfloat16*>(dX.data));
     else
-        pixel_norm_backward_kernel<float><<<R, SG_BLOCK, shmem>>>(
+        pixel_norm_backward_kernel<float><<<R, SG_BLOCK, shmem, cur_stream()>>>(
             static_cast<const float*>(X.data), static_cast<const float*>(dY.data),
             C, eps, static_cast<float*>(dX.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());

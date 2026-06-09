@@ -19,6 +19,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -159,7 +164,7 @@ inline std::size_t check_y(const char* op, const ::brotensor::Tensor& Y) {
 void randn(uint64_t key, uint64_t counter, ::brotensor::Tensor& Y) {
     const std::size_t n = check_y("randn", Y);
     if (n == 0) return;
-    k_randn<<<noise_grid((long long)n), NOISE_BLOCK>>>(
+    k_randn<<<noise_grid((long long)n), NOISE_BLOCK, 0, cur_stream()>>>(
         static_cast<float*>(Y.data), n, key, counter);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -168,7 +173,7 @@ void randn(uint64_t key, uint64_t counter, ::brotensor::Tensor& Y) {
 void rand_uniform(uint64_t key, uint64_t counter, ::brotensor::Tensor& Y) {
     const std::size_t n = check_y("rand_uniform", Y);
     if (n == 0) return;
-    k_rand_uniform<<<noise_grid((long long)n), NOISE_BLOCK>>>(
+    k_rand_uniform<<<noise_grid((long long)n), NOISE_BLOCK, 0, cur_stream()>>>(
         static_cast<float*>(Y.data), n, key, counter);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -180,7 +185,7 @@ void rand_bernoulli(float p, uint64_t key, uint64_t counter,
     if (!(p >= 0.0f && p <= 1.0f)) fail(op, "p must be in [0, 1]");
     const std::size_t n = check_y(op, Y);
     if (n == 0) return;
-    k_rand_bernoulli<<<noise_grid((long long)n), NOISE_BLOCK>>>(
+    k_rand_bernoulli<<<noise_grid((long long)n), NOISE_BLOCK, 0, cur_stream()>>>(
         static_cast<float*>(Y.data), n, p, key, counter);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -192,7 +197,7 @@ void randn_truncated(float lo, float hi, uint64_t key, uint64_t counter,
     if (!(lo < hi)) fail(op, "lo must be < hi");
     const std::size_t n = check_y(op, Y);
     if (n == 0) return;
-    k_randn_truncated<<<noise_grid((long long)n), NOISE_BLOCK>>>(
+    k_randn_truncated<<<noise_grid((long long)n), NOISE_BLOCK, 0, cur_stream()>>>(
         static_cast<float*>(Y.data), n, lo, hi, key, counter);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }

@@ -9,6 +9,11 @@
 #include <string>
 #include <vector>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor {
 namespace detail::cuda {
 
@@ -99,15 +104,15 @@ void masked_mean_pool_forward(const ::brotensor::Tensor& X, const float* d_mask,
     }
     if (D == 0) return;
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        masked_mean_pool_forward_kernel<__half><<<grid_for(D, RED_BLOCK), RED_BLOCK>>>(
+        masked_mean_pool_forward_kernel<__half><<<grid_for(D, RED_BLOCK), RED_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), d_mask,
             static_cast<__half*>(y.data), K, D);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        masked_mean_pool_forward_kernel<__nv_bfloat16><<<grid_for(D, RED_BLOCK), RED_BLOCK>>>(
+        masked_mean_pool_forward_kernel<__nv_bfloat16><<<grid_for(D, RED_BLOCK), RED_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), d_mask,
             static_cast<__nv_bfloat16*>(y.data), K, D);
     } else {
-        masked_mean_pool_forward_kernel<float><<<grid_for(D, RED_BLOCK), RED_BLOCK>>>(
+        masked_mean_pool_forward_kernel<float><<<grid_for(D, RED_BLOCK), RED_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), d_mask,
             static_cast<float*>(y.data), K, D);
     }
@@ -128,23 +133,24 @@ void masked_mean_pool_backward(const ::brotensor::Tensor& dY, const float* d_mas
     int num_valid = 0;
     if (d_mask) {
         std::vector<float> hmask(K);
-        BROTENSOR_CUDA_CHECK(cudaMemcpy(hmask.data(), d_mask, sizeof(float) * K,
-                                  cudaMemcpyDeviceToHost));
+        BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(hmask.data(), d_mask, sizeof(float) * K,
+                                  cudaMemcpyDeviceToHost, cur_stream()));
+        BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
         for (int k = 0; k < K; ++k) num_valid += (hmask[k] != 0.0f);
     } else {
         num_valid = K;
     }
 
     if (dY.dtype == ::brotensor::Dtype::FP16) {
-        masked_mean_pool_backward_kernel<__half><<<grid_for(total, RED_BLOCK), RED_BLOCK>>>(
+        masked_mean_pool_backward_kernel<__half><<<grid_for(total, RED_BLOCK), RED_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(dY.data), d_mask,
             static_cast<__half*>(dX.data), K, D, num_valid);
     } else if (dY.dtype == ::brotensor::Dtype::BF16) {
-        masked_mean_pool_backward_kernel<__nv_bfloat16><<<grid_for(total, RED_BLOCK), RED_BLOCK>>>(
+        masked_mean_pool_backward_kernel<__nv_bfloat16><<<grid_for(total, RED_BLOCK), RED_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(dY.data), d_mask,
             static_cast<__nv_bfloat16*>(dX.data), K, D, num_valid);
     } else {
-        masked_mean_pool_backward_kernel<float><<<grid_for(total, RED_BLOCK), RED_BLOCK>>>(
+        masked_mean_pool_backward_kernel<float><<<grid_for(total, RED_BLOCK), RED_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data), d_mask,
             static_cast<float*>(dX.data), K, D, num_valid);
     }

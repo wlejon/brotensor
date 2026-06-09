@@ -3,6 +3,11 @@
 
 #include <cuda_runtime.h>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor {
 namespace detail::cuda {
 
@@ -30,7 +35,7 @@ void sgd_step(::brotensor::Tensor& param, ::brotensor::Tensor& grad,
     if (n == 0) return;
     constexpr int BLOCK = 256;
     const int blocks = (n + BLOCK - 1) / BLOCK;
-    sgd_step_kernel<<<blocks, BLOCK>>>(
+    sgd_step_kernel<<<blocks, BLOCK, 0, cur_stream()>>>(
         static_cast<float*>(param.data),
         static_cast<const float*>(grad.data),
         static_cast<float*>(velocity.data),

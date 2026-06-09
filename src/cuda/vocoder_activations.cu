@@ -26,6 +26,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -178,7 +183,7 @@ void snake_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& alph
     }
     const long long total = static_cast<long long>(N) * cols;
     if (total == 0) return;
-    snake_forward_kernel<<<va_grid(total), VA_BLOCK>>>(
+    snake_forward_kernel<<<va_grid(total), VA_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data),
         static_cast<const float*>(alpha.data),
         beta ? static_cast<const float*>(beta->data) : nullptr,
@@ -214,7 +219,7 @@ void snake_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& alp
     }
     const long long total = static_cast<long long>(N) * cols;
     if (total == 0) return;
-    snake_backward_kernel<<<va_grid(total), VA_BLOCK>>>(
+    snake_backward_kernel<<<va_grid(total), VA_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data),
         static_cast<const float*>(alpha.data),
         beta ? static_cast<const float*>(beta->data) : nullptr,
@@ -236,7 +241,7 @@ void elu_forward(const ::brotensor::Tensor& x, float alpha,
     }
     const long long n = x.size();
     if (n == 0) return;
-    elu_forward_kernel<<<va_grid(n), VA_BLOCK>>>(
+    elu_forward_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data), alpha, n,
         static_cast<float*>(y.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -251,7 +256,7 @@ void elu_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
     }
     const long long n = x.size();
     if (n == 0) return;
-    elu_backward_kernel<<<va_grid(n), VA_BLOCK>>>(
+    elu_backward_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data),
         static_cast<const float*>(dY.data), alpha, n,
         static_cast<float*>(dX.data));
@@ -268,7 +273,7 @@ void leaky_relu_forward(const ::brotensor::Tensor& x, float negative_slope,
     }
     const long long n = x.size();
     if (n == 0) return;
-    leaky_relu_forward_kernel<<<va_grid(n), VA_BLOCK>>>(
+    leaky_relu_forward_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data), negative_slope, n,
         static_cast<float*>(y.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -284,7 +289,7 @@ void leaky_relu_backward(const ::brotensor::Tensor& x,
     }
     const long long n = x.size();
     if (n == 0) return;
-    leaky_relu_backward_kernel<<<va_grid(n), VA_BLOCK>>>(
+    leaky_relu_backward_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data),
         static_cast<const float*>(dY.data), negative_slope, n,
         static_cast<float*>(dX.data));

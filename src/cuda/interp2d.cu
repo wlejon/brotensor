@@ -30,6 +30,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -313,19 +318,19 @@ static void launch_forward(const ::brotensor::Tensor& X,
         // bicubic — FP32-only (check_dtype_forward enforced).
         // mode 2: a=-0.5 (PIL); mode 3: a=-0.75 (torch).
         const float a = (mode == 3) ? -0.75f : -0.5f;
-        interp2d_bicubic_forward_kernel<<<ip_grid(total), IP_BLOCK>>>(
+        interp2d_bicubic_forward_kernel<<<ip_grid(total), IP_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
             N, C, H_in, W_in, H_out, W_out, sy, sx, align, a);
     } else if (X.dtype == ::brotensor::Dtype::FP32) {
-        interp2d_forward_kernel<float><<<ip_grid(total), IP_BLOCK>>>(
+        interp2d_forward_kernel<float><<<ip_grid(total), IP_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
             N, C, H_in, W_in, H_out, W_out, mode, sy, sx, align);
     } else if (X.dtype == ::brotensor::Dtype::FP16) {
-        interp2d_forward_kernel<__half><<<ip_grid(total), IP_BLOCK>>>(
+        interp2d_forward_kernel<__half><<<ip_grid(total), IP_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
             N, C, H_in, W_in, H_out, W_out, mode, sy, sx, align);
     } else {
-        interp2d_forward_kernel<__nv_bfloat16><<<ip_grid(total), IP_BLOCK>>>(
+        interp2d_forward_kernel<__nv_bfloat16><<<ip_grid(total), IP_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
             N, C, H_in, W_in, H_out, W_out, mode, sy, sx, align);
@@ -373,10 +378,10 @@ void interp2d_backward(const ::brotensor::Tensor& dY,
     const double sx = static_cast<double>(W_in) / static_cast<double>(W_out);
 
     if (dY.dtype == ::brotensor::Dtype::FP32) {
-        BROTENSOR_CUDA_CHECK(cudaMemset(
-            dX.data, 0, static_cast<size_t>(total_in) * sizeof(float)));
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
+            dX.data, 0, static_cast<size_t>(total_in) * sizeof(float), cur_stream()));
         if (H_out == 0 || W_out == 0) return;
-        interp2d_backward_kernel<float><<<ip_grid(total_out), IP_BLOCK>>>(
+        interp2d_backward_kernel<float><<<ip_grid(total_out), IP_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data),
             N, C, H_in, W_in, H_out, W_out, mode, sy, sx);
@@ -388,25 +393,25 @@ void interp2d_backward(const ::brotensor::Tensor& dY,
     float* scratch = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(&scratch,
         static_cast<size_t>(total_in) * sizeof(float)));
-    BROTENSOR_CUDA_CHECK(cudaMemset(scratch, 0,
-        static_cast<size_t>(total_in) * sizeof(float)));
+    BROTENSOR_CUDA_CHECK(cudaMemsetAsync(scratch, 0,
+        static_cast<size_t>(total_in) * sizeof(float), cur_stream()));
     if (H_out > 0 && W_out > 0) {
         if (dY.dtype == ::brotensor::Dtype::FP16) {
-            interp2d_backward_kernel<__half><<<ip_grid(total_out), IP_BLOCK>>>(
+            interp2d_backward_kernel<__half><<<ip_grid(total_out), IP_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __half*>(dY.data), scratch,
                 N, C, H_in, W_in, H_out, W_out, mode, sy, sx);
         } else {
             interp2d_backward_kernel<__nv_bfloat16>
-                <<<ip_grid(total_out), IP_BLOCK>>>(
+                <<<ip_grid(total_out), IP_BLOCK, 0, cur_stream()>>>(
                     static_cast<const __nv_bfloat16*>(dY.data), scratch,
                     N, C, H_in, W_in, H_out, W_out, mode, sy, sx);
         }
     }
     if (dY.dtype == ::brotensor::Dtype::FP16) {
-        cast_fp32_store<__half><<<ip_grid(total_in), IP_BLOCK>>>(
+        cast_fp32_store<__half><<<ip_grid(total_in), IP_BLOCK, 0, cur_stream()>>>(
             scratch, static_cast<__half*>(dX.data), total_in);
     } else {
-        cast_fp32_store<__nv_bfloat16><<<ip_grid(total_in), IP_BLOCK>>>(
+        cast_fp32_store<__nv_bfloat16><<<ip_grid(total_in), IP_BLOCK, 0, cur_stream()>>>(
             scratch, static_cast<__nv_bfloat16*>(dX.data), total_in);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());

@@ -21,6 +21,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -130,15 +135,15 @@ void slice2d_forward(const ::brotensor::Tensor& X,
 
     const long long total = (long long)N * cols_out;
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        slice2d_forward_kernel<__half><<<sl_grid(total), SL_BLOCK>>>(
+        slice2d_forward_kernel<__half><<<sl_grid(total), SL_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
             N, C, H, W, h0, w0, H_out, W_out);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        slice2d_forward_kernel<__nv_bfloat16><<<sl_grid(total), SL_BLOCK>>>(
+        slice2d_forward_kernel<__nv_bfloat16><<<sl_grid(total), SL_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), static_cast<__nv_bfloat16*>(Y.data),
             N, C, H, W, h0, w0, H_out, W_out);
     } else {
-        slice2d_forward_kernel<float><<<sl_grid(total), SL_BLOCK>>>(
+        slice2d_forward_kernel<float><<<sl_grid(total), SL_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
             N, C, H, W, h0, w0, H_out, W_out);
     }
@@ -164,22 +169,22 @@ void slice2d_backward(const ::brotensor::Tensor& dY,
     // All-bits-zero is +0.0 in IEEE 754 for FP32/FP16/BF16, so cudaMemset is
     // safe across dtypes.
     const long long total_in = (long long)N * cols_in;
-    BROTENSOR_CUDA_CHECK(cudaMemset(
-        dX.data, 0, static_cast<size_t>(total_in) * bytes_of(dY.dtype)));
+    BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
+        dX.data, 0, static_cast<size_t>(total_in) * bytes_of(dY.dtype), cur_stream()));
 
     if (H_out == 0 || W_out == 0) return;
 
     const long long total_out = (long long)N * C * H_out * W_out;
     if (dY.dtype == ::brotensor::Dtype::FP16) {
-        slice2d_backward_kernel<__half><<<sl_grid(total_out), SL_BLOCK>>>(
+        slice2d_backward_kernel<__half><<<sl_grid(total_out), SL_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(dY.data), static_cast<__half*>(dX.data),
             N, C, H, W, h0, w0, H_out, W_out);
     } else if (dY.dtype == ::brotensor::Dtype::BF16) {
-        slice2d_backward_kernel<__nv_bfloat16><<<sl_grid(total_out), SL_BLOCK>>>(
+        slice2d_backward_kernel<__nv_bfloat16><<<sl_grid(total_out), SL_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(dY.data), static_cast<__nv_bfloat16*>(dX.data),
             N, C, H, W, h0, w0, H_out, W_out);
     } else {
-        slice2d_backward_kernel<float><<<sl_grid(total_out), SL_BLOCK>>>(
+        slice2d_backward_kernel<float><<<sl_grid(total_out), SL_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data), static_cast<float*>(dX.data),
             N, C, H, W, h0, w0, H_out, W_out);
     }

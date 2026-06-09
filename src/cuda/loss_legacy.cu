@@ -24,6 +24,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 using ::brotensor::Tensor;
@@ -113,13 +118,14 @@ float run_softmax_xent_segment(const float* d_logits, const float* d_target,
 
     float* d_loss = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(&d_loss, sizeof(float)));
-    softmax_xent_segment_kernel<<<1, LOSS_LEGACY_BLOCK>>>(
+    softmax_xent_segment_kernel<<<1, LOSS_LEGACY_BLOCK, 0, cur_stream()>>>(
         d_logits, d_target, d_mask, d_probs, d_dLogits, d_loss, n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     float h_loss = 0.0f;
-    BROTENSOR_CUDA_CHECK(cudaMemcpy(&h_loss, d_loss, sizeof(float),
-                                    cudaMemcpyDeviceToHost));
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(&h_loss, d_loss, sizeof(float),
+                                    cudaMemcpyDeviceToHost, cur_stream()));
+    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
     cudaFree(d_loss);
     return h_loss;
 }
