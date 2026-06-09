@@ -17,6 +17,11 @@
 #include <cmath>
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -244,14 +249,14 @@ void cross_attention_forward_with_attn(const ::brotensor::Tensor& X,
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cxa_proj_kernel<<<grid, block>>>(X_h, Wq_h, Qh_p, Lq, D, dh);
+        cxa_proj_kernel<<<grid, block, 0, cur_stream()>>>(X_h, Wq_h, Qh_p, Lq, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lk + block.y - 1) / block.y, H);
-        cxa_proj_kernel<<<grid, block>>>(Ctx_h, Wk_h, Kh_p, Lk, Dctx, dh);
-        cxa_proj_kernel<<<grid, block>>>(Ctx_h, Wv_h, Vh_p, Lk, Dctx, dh);
+        cxa_proj_kernel<<<grid, block, 0, cur_stream()>>>(Ctx_h, Wk_h, Kh_p, Lk, Dctx, dh);
+        cxa_proj_kernel<<<grid, block, 0, cur_stream()>>>(Ctx_h, Wv_h, Vh_p, Lk, Dctx, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
@@ -261,26 +266,26 @@ void cross_attention_forward_with_attn(const ::brotensor::Tensor& X,
             ? static_cast<const float*>(attn_logit_bias->data) : nullptr;
         dim3 grid((Lk + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cxa_scores_kernel<<<grid, block>>>(Qh_p, Kh_p, bias_ptr,
+        cxa_scores_kernel<<<grid, block, 0, cur_stream()>>>(Qh_p, Kh_p, bias_ptr,
                                            scores_p, Lq, Lk, dh, inv_sqrtdh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    cxa_row_softmax_kernel<<<H * Lq, ROW_SM_BLOCK>>>(scores_p, Attnh_p,
+    cxa_row_softmax_kernel<<<H * Lq, ROW_SM_BLOCK, 0, cur_stream()>>>(scores_p, Attnh_p,
                                                      d_mask, Lk);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     {
         dim3 grid((Lk + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y);
-        cxa_head_average_kernel<<<grid, block>>>(Attnh_p, AttnAvg_h, Lq, Lk, H);
+        cxa_head_average_kernel<<<grid, block, 0, cur_stream()>>>(Attnh_p, AttnAvg_h, Lq, Lk, H);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cxa_attn_apply_v_kernel<<<grid, block>>>(Attnh_p, Vh_p,
+        cxa_attn_apply_v_kernel<<<grid, block, 0, cur_stream()>>>(Attnh_p, Vh_p,
                                                  Yconcat_p, Lq, Lk, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -288,7 +293,7 @@ void cross_attention_forward_with_attn(const ::brotensor::Tensor& X,
     {
         dim3 grid((D  + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y);
-        cxa_output_proj_kernel<<<grid, block>>>(Yconcat_p, Wo_h, O_h, Lq, D);
+        cxa_output_proj_kernel<<<grid, block, 0, cur_stream()>>>(Yconcat_p, Wo_h, O_h, Lq, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 }

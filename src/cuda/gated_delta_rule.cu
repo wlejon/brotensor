@@ -33,6 +33,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -202,7 +207,7 @@ void run_scan(const ::brotensor::Tensor& Q,
     if (block < 1) block = 1;
 
     const size_t shmem = static_cast<size_t>(d_v) * sizeof(float);
-    gated_delta_rule_kernel<<<num_heads, block, shmem>>>(
+    gated_delta_rule_kernel<<<num_heads, block, shmem, cur_stream()>>>(
         static_cast<const float*>(Q.data),
         static_cast<const float*>(K.data),
         static_cast<const float*>(V.data),

@@ -26,6 +26,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor {
 namespace detail::cuda {
 
@@ -211,29 +216,29 @@ void run_sab(const ::brotensor::Tensor& X,
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (L  + block.y - 1) / block.y, H);
-        sab_proj_kernel<T><<<grid, block>>>(X_p, Wq_p, bq, Qh_p, L, D, dh);
-        sab_proj_kernel<T><<<grid, block>>>(X_p, Wk_p, bk, Kh_p, L, D, dh);
-        sab_proj_kernel<T><<<grid, block>>>(X_p, Wv_p, bv, Vh_p, L, D, dh);
+        sab_proj_kernel<T><<<grid, block, 0, cur_stream()>>>(X_p, Wq_p, bq, Qh_p, L, D, dh);
+        sab_proj_kernel<T><<<grid, block, 0, cur_stream()>>>(X_p, Wk_p, bk, Kh_p, L, D, dh);
+        sab_proj_kernel<T><<<grid, block, 0, cur_stream()>>>(X_p, Wv_p, bv, Vh_p, L, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((L + block.x - 1) / block.x,
                   (L + block.y - 1) / block.y, H);
-        sab_scores_kernel<<<grid, block>>>(Qh_p, Kh_p, bias_p, S_p, L, dh, scale);
+        sab_scores_kernel<<<grid, block, 0, cur_stream()>>>(Qh_p, Kh_p, bias_p, S_p, L, dh, scale);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
-    sab_softmax_kernel<<<H * L, SAB_SM_BLOCK>>>(S_p, A_p, d_mask, L);
+    sab_softmax_kernel<<<H * L, SAB_SM_BLOCK, 0, cur_stream()>>>(S_p, A_p, d_mask, L);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (L  + block.y - 1) / block.y, H);
-        sab_apply_v_kernel<<<grid, block>>>(A_p, Vh_p, Yc_p, L, dh, D);
+        sab_apply_v_kernel<<<grid, block, 0, cur_stream()>>>(A_p, Vh_p, Yc_p, L, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((D + block.x - 1) / block.x,
                   (L + block.y - 1) / block.y);
-        sab_output_kernel<T><<<grid, block>>>(Yc_p, Wo_p, bo, d_mask,
+        sab_output_kernel<T><<<grid, block, 0, cur_stream()>>>(Yc_p, Wo_p, bo, d_mask,
                                               static_cast<T*>(O.data), L, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -327,29 +332,29 @@ void run_sab_int8(const ::brotensor::Tensor& X,
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (L  + block.y - 1) / block.y, H);
-        sab_proj_kernel_int8<T><<<grid, block>>>(X_p, Wq_p, sq_p, Qh_p, L, D, dh);
-        sab_proj_kernel_int8<T><<<grid, block>>>(X_p, Wk_p, sk_p, Kh_p, L, D, dh);
-        sab_proj_kernel_int8<T><<<grid, block>>>(X_p, Wv_p, sv_p, Vh_p, L, D, dh);
+        sab_proj_kernel_int8<T><<<grid, block, 0, cur_stream()>>>(X_p, Wq_p, sq_p, Qh_p, L, D, dh);
+        sab_proj_kernel_int8<T><<<grid, block, 0, cur_stream()>>>(X_p, Wk_p, sk_p, Kh_p, L, D, dh);
+        sab_proj_kernel_int8<T><<<grid, block, 0, cur_stream()>>>(X_p, Wv_p, sv_p, Vh_p, L, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((L + block.x - 1) / block.x,
                   (L + block.y - 1) / block.y, H);
-        sab_scores_kernel<<<grid, block>>>(Qh_p, Kh_p, bias_p, S_p, L, dh, scale);
+        sab_scores_kernel<<<grid, block, 0, cur_stream()>>>(Qh_p, Kh_p, bias_p, S_p, L, dh, scale);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
-    sab_softmax_kernel<<<H * L, SAB_SM_BLOCK>>>(S_p, A_p, d_mask, L);
+    sab_softmax_kernel<<<H * L, SAB_SM_BLOCK, 0, cur_stream()>>>(S_p, A_p, d_mask, L);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (L  + block.y - 1) / block.y, H);
-        sab_apply_v_kernel<<<grid, block>>>(A_p, Vh_p, Yc_p, L, dh, D);
+        sab_apply_v_kernel<<<grid, block, 0, cur_stream()>>>(A_p, Vh_p, Yc_p, L, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((D + block.x - 1) / block.x,
                   (L + block.y - 1) / block.y);
-        sab_output_kernel_int8<T><<<grid, block>>>(Yc_p, Wo_p, so_p, d_mask,
+        sab_output_kernel_int8<T><<<grid, block, 0, cur_stream()>>>(Yc_p, Wo_p, so_p, d_mask,
                                                    static_cast<T*>(O.data), L, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -474,30 +479,30 @@ void run_sardp(const ::brotensor::Tensor& X,
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (L  + block.y - 1) / block.y, H);
-        sardp_proj_kernel<T><<<grid, block>>>(X_p, Wq_p, bq, Qh_p, L, D, dh);
-        sardp_proj_kernel<T><<<grid, block>>>(X_p, Wk_p, bk, Kh_p, L, D, dh);
-        sardp_proj_kernel<T><<<grid, block>>>(X_p, Wv_p, bv, Vh_p, L, D, dh);
+        sardp_proj_kernel<T><<<grid, block, 0, cur_stream()>>>(X_p, Wq_p, bq, Qh_p, L, D, dh);
+        sardp_proj_kernel<T><<<grid, block, 0, cur_stream()>>>(X_p, Wk_p, bk, Kh_p, L, D, dh);
+        sardp_proj_kernel<T><<<grid, block, 0, cur_stream()>>>(X_p, Wv_p, bv, Vh_p, L, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((L + block.x - 1) / block.x,
                   (L + block.y - 1) / block.y, H);
-        sardp_scores_kernel<T><<<grid, block>>>(Qh_p, Kh_p, rh_p, rw_p, S_p,
+        sardp_scores_kernel<T><<<grid, block, 0, cur_stream()>>>(Qh_p, Kh_p, rh_p, rw_p, S_p,
                                                 L, dh, scale, gh, gw);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
-    sab_softmax_kernel<<<H * L, SAB_SM_BLOCK>>>(S_p, A_p, /*mask=*/nullptr, L);
+    sab_softmax_kernel<<<H * L, SAB_SM_BLOCK, 0, cur_stream()>>>(S_p, A_p, /*mask=*/nullptr, L);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (L  + block.y - 1) / block.y, H);
-        sab_apply_v_kernel<<<grid, block>>>(A_p, Vh_p, Yc_p, L, dh, D);
+        sab_apply_v_kernel<<<grid, block, 0, cur_stream()>>>(A_p, Vh_p, Yc_p, L, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((D + block.x - 1) / block.x,
                   (L + block.y - 1) / block.y);
-        sardp_output_kernel<T><<<grid, block>>>(Yc_p, Wo_p, bo,
+        sardp_output_kernel<T><<<grid, block, 0, cur_stream()>>>(Yc_p, Wo_p, bo,
                                                 static_cast<T*>(O.data), L, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -578,7 +583,7 @@ void run_windowed_sardp(const ::brotensor::Tensor& X,
     const dim3 block(16, 16);
     const dim3 grid((D + block.x - 1) / block.x,
                     (nrows + block.y - 1) / block.y);
-    win_gather_kernel<T><<<grid, block>>>(static_cast<const T*>(X.data),
+    win_gather_kernel<T><<<grid, block, 0, cur_stream()>>>(static_cast<const T*>(X.data),
                                           static_cast<T*>(Pin.data),
                                           grid_h, grid_w, window, nw_w, D, nrows);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -595,7 +600,7 @@ void run_windowed_sardp(const ::brotensor::Tensor& X,
                      rel_h, rel_w, num_heads, window, window, scale, Ov);
     }
 
-    win_scatter_kernel<T><<<grid, block>>>(static_cast<const T*>(Pout.data),
+    win_scatter_kernel<T><<<grid, block, 0, cur_stream()>>>(static_cast<const T*>(Pout.data),
                                            static_cast<T*>(O.data),
                                            grid_h, grid_w, window, nw_w, D, nrows);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());

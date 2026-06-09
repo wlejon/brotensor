@@ -26,6 +26,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -144,13 +149,13 @@ void log_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     const long long n = x.size();
     if (n == 0) return;
     if (x.dtype == ::brotensor::Dtype::FP16) {
-        log_forward_kernel<__half><<<ler_grid(n), LER_BLOCK>>>(
+        log_forward_kernel<__half><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data), n, static_cast<__half*>(y.data));
     } else if (x.dtype == ::brotensor::Dtype::BF16) {
-        log_forward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK>>>(
+        log_forward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data), n, static_cast<__nv_bfloat16*>(y.data));
     } else {
-        log_forward_kernel<float><<<ler_grid(n), LER_BLOCK>>>(
+        log_forward_kernel<float><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data), n, static_cast<float*>(y.data));
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -169,15 +174,15 @@ void log_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
     const long long n = x.size();
     if (n == 0) return;
     if (x.dtype == ::brotensor::Dtype::FP16) {
-        log_backward_kernel<__half><<<ler_grid(n), LER_BLOCK>>>(
+        log_backward_kernel<__half><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data), n, static_cast<__half*>(dX.data));
     } else if (x.dtype == ::brotensor::Dtype::BF16) {
-        log_backward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK>>>(
+        log_backward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(dY.data), n, static_cast<__nv_bfloat16*>(dX.data));
     } else {
-        log_backward_kernel<float><<<ler_grid(n), LER_BLOCK>>>(
+        log_backward_kernel<float><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<const float*>(dY.data), n, static_cast<float*>(dX.data));
     }
@@ -194,13 +199,13 @@ void exp_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     const long long n = x.size();
     if (n == 0) return;
     if (x.dtype == ::brotensor::Dtype::FP16) {
-        exp_forward_kernel<__half><<<ler_grid(n), LER_BLOCK>>>(
+        exp_forward_kernel<__half><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data), n, static_cast<__half*>(y.data));
     } else if (x.dtype == ::brotensor::Dtype::BF16) {
-        exp_forward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK>>>(
+        exp_forward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data), n, static_cast<__nv_bfloat16*>(y.data));
     } else {
-        exp_forward_kernel<float><<<ler_grid(n), LER_BLOCK>>>(
+        exp_forward_kernel<float><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data), n, static_cast<float*>(y.data));
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -219,15 +224,15 @@ void exp_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
     const long long n = x.size();
     if (n == 0) return;
     if (x.dtype == ::brotensor::Dtype::FP16) {
-        exp_backward_kernel<__half><<<ler_grid(n), LER_BLOCK>>>(
+        exp_backward_kernel<__half><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data), n, static_cast<__half*>(dX.data));
     } else if (x.dtype == ::brotensor::Dtype::BF16) {
-        exp_backward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK>>>(
+        exp_backward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(dY.data), n, static_cast<__nv_bfloat16*>(dX.data));
     } else {
-        exp_backward_kernel<float><<<ler_grid(n), LER_BLOCK>>>(
+        exp_backward_kernel<float><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<const float*>(dY.data), n, static_cast<float*>(dX.data));
     }
@@ -244,13 +249,13 @@ void round_forward(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     const long long n = x.size();
     if (n == 0) return;
     if (x.dtype == ::brotensor::Dtype::FP16) {
-        round_forward_kernel<__half><<<ler_grid(n), LER_BLOCK>>>(
+        round_forward_kernel<__half><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data), n, static_cast<__half*>(y.data));
     } else if (x.dtype == ::brotensor::Dtype::BF16) {
-        round_forward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK>>>(
+        round_forward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data), n, static_cast<__nv_bfloat16*>(y.data));
     } else {
-        round_forward_kernel<float><<<ler_grid(n), LER_BLOCK>>>(
+        round_forward_kernel<float><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data), n, static_cast<float*>(y.data));
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -264,13 +269,13 @@ void round_backward(const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX) {
     const long long n = dY.size();
     if (n == 0) return;
     if (dY.dtype == ::brotensor::Dtype::FP16) {
-        round_backward_kernel<__half><<<ler_grid(n), LER_BLOCK>>>(
+        round_backward_kernel<__half><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(dY.data), n, static_cast<__half*>(dX.data));
     } else if (dY.dtype == ::brotensor::Dtype::BF16) {
-        round_backward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK>>>(
+        round_backward_kernel<__nv_bfloat16><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(dY.data), n, static_cast<__nv_bfloat16*>(dX.data));
     } else {
-        round_backward_kernel<float><<<ler_grid(n), LER_BLOCK>>>(
+        round_backward_kernel<float><<<ler_grid(n), LER_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data), n, static_cast<float*>(dX.data));
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());

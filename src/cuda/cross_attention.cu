@@ -7,6 +7,11 @@
 #include <cmath>
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 // FP16 inference path (unchanged from prior bundle): cross_attention and
@@ -472,15 +477,15 @@ void cross_attention_forward_train_core(const ::brotensor::Tensor& X,
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cx_proj_kernel<<<grid, block>>>(X_p, Wq_p, Qh_p, Lq, D, dh);
+        cx_proj_kernel<<<grid, block, 0, cur_stream()>>>(X_p, Wq_p, Qh_p, Lq, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     // K and V projections from Ctx (D, D_ctx).
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lk + block.y - 1) / block.y, H);
-        cx_proj_kernel<<<grid, block>>>(Ctx_p, Wk_p, Kh_p, Lk, Dctx, dh);
-        cx_proj_kernel<<<grid, block>>>(Ctx_p, Wv_p, Vh_p, Lk, Dctx, dh);
+        cx_proj_kernel<<<grid, block, 0, cur_stream()>>>(Ctx_p, Wk_p, Kh_p, Lk, Dctx, dh);
+        cx_proj_kernel<<<grid, block, 0, cur_stream()>>>(Ctx_p, Wv_p, Vh_p, Lk, Dctx, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
@@ -490,19 +495,19 @@ void cross_attention_forward_train_core(const ::brotensor::Tensor& X,
         const float inv_sqrtdh = 1.0f / std::sqrt(static_cast<float>(dh));
         dim3 grid((Lk + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cx_scores_kernel<<<grid, block>>>(Qh_p, Kh_p, scores_p,
+        cx_scores_kernel<<<grid, block, 0, cur_stream()>>>(Qh_p, Kh_p, scores_p,
                                           Lq, Lk, dh, inv_sqrtdh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
 
-    cx_row_softmax_kernel<<<H * Lq, ROW_SM_BLOCK>>>(scores_p, Attnh_p,
+    cx_row_softmax_kernel<<<H * Lq, ROW_SM_BLOCK, 0, cur_stream()>>>(scores_p, Attnh_p,
                                                     d_mask, Lq, Lk, gate_query);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cx_attn_apply_v_kernel<<<grid, block>>>(Attnh_p, Vh_p,
+        cx_attn_apply_v_kernel<<<grid, block, 0, cur_stream()>>>(Attnh_p, Vh_p,
                                                 Yconcat_p, Lq, Lk, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -510,7 +515,7 @@ void cross_attention_forward_train_core(const ::brotensor::Tensor& X,
     {
         dim3 grid((D  + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y);
-        cx_output_proj_kernel<<<grid, block>>>(Yconcat_p, Wo_p, d_mask,
+        cx_output_proj_kernel<<<grid, block, 0, cur_stream()>>>(Yconcat_p, Wo_p, d_mask,
                                                gate_query, O_p, Lq, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -626,14 +631,14 @@ void cross_attention_backward(const ::brotensor::Tensor& dO,
     {
         dim3 grid((D  + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y);
-        cx_wo_back_dY_kernel<<<grid, block>>>(dO_p, Wo_p, d_mask,
+        cx_wo_back_dY_kernel<<<grid, block, 0, cur_stream()>>>(dO_p, Wo_p, d_mask,
                                               gate_query, dYconcat_p, Lq, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((D + block.x - 1) / block.x,
                   (D + block.y - 1) / block.y);
-        cx_wo_back_dW_kernel<<<grid, block>>>(dO_p, Yconcat_p, d_mask,
+        cx_wo_back_dW_kernel<<<grid, block, 0, cur_stream()>>>(dO_p, Yconcat_p, d_mask,
                                               gate_query, dWo_p, Lq, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -646,14 +651,14 @@ void cross_attention_backward(const ::brotensor::Tensor& dO,
     {
         dim3 grid((Lk + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cx_dAttn_kernel<<<grid, block>>>(dYconcat_p, Vh_p, dAttn_p,
+        cx_dAttn_kernel<<<grid, block, 0, cur_stream()>>>(dYconcat_p, Vh_p, dAttn_p,
                                          Lq, Lk, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lk + block.y - 1) / block.y, H);
-        cx_dV_kernel<<<grid, block>>>(Attnh_p, dYconcat_p, dVh_p,
+        cx_dV_kernel<<<grid, block, 0, cur_stream()>>>(Attnh_p, dYconcat_p, dVh_p,
                                       Lq, Lk, dh, D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -661,7 +666,7 @@ void cross_attention_backward(const ::brotensor::Tensor& dO,
     // dScores via row softmax backward.
     Tensor dScores = Tensor::empty_on(Device::CUDA, H * Lq, Lk, Dtype::FP32);
     float* dScores_p = static_cast<float*>(dScores.data);
-    cx_row_softmax_back_kernel<<<H * Lq, ROW_SM_BLOCK>>>(
+    cx_row_softmax_back_kernel<<<H * Lq, ROW_SM_BLOCK, 0, cur_stream()>>>(
             Attnh_p, dAttn_p, d_mask, gate_query,
             dScores_p, Lq, Lk, inv_sqrtdh);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -674,14 +679,14 @@ void cross_attention_backward(const ::brotensor::Tensor& dO,
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y, H);
-        cx_dQ_kernel<<<grid, block>>>(dScores_p, Kh_p, dQh_p,
+        cx_dQ_kernel<<<grid, block, 0, cur_stream()>>>(dScores_p, Kh_p, dQh_p,
                                       Lq, Lk, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((dh + block.x - 1) / block.x,
                   (Lk + block.y - 1) / block.y, H);
-        cx_dK_kernel<<<grid, block>>>(dScores_p, Qh_p, dKh_p,
+        cx_dK_kernel<<<grid, block, 0, cur_stream()>>>(dScores_p, Qh_p, dKh_p,
                                       Lq, Lk, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -690,7 +695,7 @@ void cross_attention_backward(const ::brotensor::Tensor& dO,
     {
         dim3 grid((D + block.x - 1) / block.x,
                   (D + block.y - 1) / block.y);
-        cx_dW_proj_kernel<<<grid, block>>>(dQh_p, X_p, dWq_p,
+        cx_dW_proj_kernel<<<grid, block, 0, cur_stream()>>>(dQh_p, X_p, dWq_p,
                                            Lq, D, D, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -698,9 +703,9 @@ void cross_attention_backward(const ::brotensor::Tensor& dO,
     {
         dim3 grid((Dctx + block.x - 1) / block.x,
                   (D    + block.y - 1) / block.y);
-        cx_dW_proj_kernel<<<grid, block>>>(dKh_p, Ctx_p, dWk_p,
+        cx_dW_proj_kernel<<<grid, block, 0, cur_stream()>>>(dKh_p, Ctx_p, dWk_p,
                                            Lk, D, Dctx, dh);
-        cx_dW_proj_kernel<<<grid, block>>>(dVh_p, Ctx_p, dWv_p,
+        cx_dW_proj_kernel<<<grid, block, 0, cur_stream()>>>(dVh_p, Ctx_p, dWv_p,
                                            Lk, D, Dctx, dh);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
@@ -709,14 +714,14 @@ void cross_attention_backward(const ::brotensor::Tensor& dO,
     {
         dim3 grid((D  + block.x - 1) / block.x,
                   (Lq + block.y - 1) / block.y);
-        cx_dX_kernel<<<grid, block>>>(dQh_p, Wq_p, dX_p,
+        cx_dX_kernel<<<grid, block, 0, cur_stream()>>>(dQh_p, Wq_p, dX_p,
                                       Lq, D, dh, H);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     {
         dim3 grid((Dctx + block.x - 1) / block.x,
                   (Lk   + block.y - 1) / block.y);
-        cx_dCtx_kernel<<<grid, block>>>(dKh_p, dVh_p, Wk_p, Wv_p,
+        cx_dCtx_kernel<<<grid, block, 0, cur_stream()>>>(dKh_p, dVh_p, Wk_p, Wv_p,
                                         dCtx_p, Lk, D, Dctx, dh, H);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
