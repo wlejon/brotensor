@@ -553,7 +553,8 @@ inline void launch_matmul_ABT_bf16(const __nv_bfloat16* A,
     const int total = M * N;
     const int block = 128;
     const int grid  = (total + block - 1) / block;
-    matmul_ABT_bf16_kernel<<<grid, block>>>(A, B, C, M, N, K);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    matmul_ABT_bf16_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
 }
 
 __global__ void scale_mask_softmax_rows_bf16_kernel(__nv_bfloat16* __restrict__ S,
@@ -960,6 +961,7 @@ void fa_linear_forward_batched_bf16(const Tensor& W, const Tensor* bias,
         Y_BD.resize(B, out_dim, Dtype::BF16);
     }
     if (B == 0 || out_dim == 0) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     launch_matmul_ABT_bf16(
         static_cast<const __nv_bfloat16*>(X_BD.data),
         static_cast<const __nv_bfloat16*>(W.data),
@@ -969,7 +971,7 @@ void fa_linear_forward_batched_bf16(const Tensor& W, const Tensor* bias,
     if (bias && bias->size() > 0) {
         const int total = B * out_dim;
         const int blocks = (total + 255) / 256;
-        fa_bf16_bias_add_kernel<<<blocks, 256>>>(
+        fa_bf16_bias_add_kernel<<<blocks, 256, 0, stream>>>(
             static_cast<__nv_bfloat16*>(Y_BD.data),
             static_cast<const __nv_bfloat16*>(bias->data),
             B, out_dim);
@@ -988,6 +990,7 @@ void fa_linear_backward_batched_bf16(const Tensor& W, const Tensor& X_BD,
         dX_BD.resize(B, in_dim, Dtype::BF16);
     }
     if (B == 0) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
 
     if (in_dim > 0 && out_dim > 0) {
         dim3 block(64, 1);
@@ -999,7 +1002,7 @@ void fa_linear_backward_batched_bf16(const Tensor& W, const Tensor& X_BD,
         for (int b0 = 0; b0 < B; b0 += kMaxGridY) {
             const int b_chunk = (B - b0) < kMaxGridY ? (B - b0) : kMaxGridY;
             dim3 grid(grid_x, b_chunk);
-            fa_lbb_dx_bf16_kernel<<<grid, block>>>(
+            fa_lbb_dx_bf16_kernel<<<grid, block, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(W.data),
                 dY_p + static_cast<size_t>(b0) * out_dim,
                 dX_p + static_cast<size_t>(b0) * in_dim,
@@ -1014,13 +1017,13 @@ void fa_linear_backward_batched_bf16(const Tensor& W, const Tensor& X_BD,
                                         dw_n * sizeof(float)));
         dim3 block(16, 16);
         dim3 grid((in_dim + 15) / 16, (out_dim + 15) / 16);
-        fa_lbb_dw_bf16_kernel<<<grid, block>>>(
+        fa_lbb_dw_bf16_kernel<<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(dY_BD.data),
             static_cast<const __nv_bfloat16*>(X_BD.data),
             d_dw_scratch, B, out_dim, in_dim);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         const int blocks_fold = (dw_n + 255) / 256;
-        fa_add_fp32_into_bf16_kernel<<<blocks_fold, 256>>>(
+        fa_add_fp32_into_bf16_kernel<<<blocks_fold, 256, 0, stream>>>(
             d_dw_scratch, static_cast<__nv_bfloat16*>(dW.data), dw_n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_dw_scratch);
@@ -1030,12 +1033,12 @@ void fa_linear_backward_batched_bf16(const Tensor& W, const Tensor& X_BD,
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db_scratch),
                                         out_dim * sizeof(float)));
         const int blocks = (out_dim + 255) / 256;
-        fa_lbb_db_bf16_kernel<<<blocks, 256>>>(
+        fa_lbb_db_bf16_kernel<<<blocks, 256, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(dY_BD.data),
             d_db_scratch, B, out_dim);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         const int blocks_fold = (out_dim + 255) / 256;
-        fa_add_fp32_into_bf16_kernel<<<blocks_fold, 256>>>(
+        fa_add_fp32_into_bf16_kernel<<<blocks_fold, 256, 0, stream>>>(
             d_db_scratch, static_cast<__nv_bfloat16*>(dB.data), out_dim);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_db_scratch);
@@ -1143,6 +1146,7 @@ void flash_attention_forward(const Tensor& Q,
     while (sm_block < Lk && sm_block < 1024) sm_block *= 2;
     if (sm_block > 1024) sm_block = 1024;
 
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     for (int h = 0; h < num_heads; ++h) {
         const int head_off = h * head_dim;
         const int total_q = Lq * head_dim;
@@ -1150,15 +1154,15 @@ void flash_attention_forward(const Tensor& Q,
         const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
 
         if (bf16) {
-            extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+            extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(Q.data),
                 reinterpret_cast<__nv_bfloat16*>(Qh.data),
                 Lq, D, head_off, head_dim);
-            extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+            extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(K.data),
                 reinterpret_cast<__nv_bfloat16*>(Kh.data),
                 Lk, D, head_off, head_dim);
-            extract_head_DL_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+            extract_head_DL_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(V.data),
                 reinterpret_cast<__nv_bfloat16*>(Vth.data),
                 Lk, D, head_off, head_dim);
@@ -1167,7 +1171,7 @@ void flash_attention_forward(const Tensor& Q,
                 reinterpret_cast<const __nv_bfloat16*>(Kh.data),
                 reinterpret_cast<__nv_bfloat16*>(S.data),
                 Lq, Lk, head_dim);
-            scale_mask_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem>>>(
+            scale_mask_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
                 reinterpret_cast<__nv_bfloat16*>(S.data),
                 Lq, Lk, inv_sqrt, d_mask);
             launch_matmul_ABT_bf16(
@@ -1175,7 +1179,7 @@ void flash_attention_forward(const Tensor& Q,
                 reinterpret_cast<const __nv_bfloat16*>(Vth.data),
                 reinterpret_cast<__nv_bfloat16*>(Oh.data),
                 Lq, head_dim, Lk);
-            pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+            pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(Oh.data),
                 reinterpret_cast<__nv_bfloat16*>(O.data),
                 Lq, D, head_off, head_dim);
@@ -1183,15 +1187,15 @@ void flash_attention_forward(const Tensor& Q,
         }
 
         // 1. Extract per-head buffers.
-        extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+        extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
             reinterpret_cast<const __half*>(Q.data),
             reinterpret_cast<__half*>(Qh.data),
             Lq, D, head_off, head_dim);
-        extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+        extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
             reinterpret_cast<const __half*>(K.data),
             reinterpret_cast<__half*>(Kh.data),
             Lk, D, head_off, head_dim);
-        extract_head_DL_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+        extract_head_DL_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
             reinterpret_cast<const __half*>(V.data),
             reinterpret_cast<__half*>(Vth.data),
             Lk, D, head_off, head_dim);
@@ -1204,7 +1208,7 @@ void flash_attention_forward(const Tensor& Q,
             Lq, Lk, head_dim);
 
         // 3. Row-wise softmax (scaled, optionally masked).
-        scale_mask_softmax_rows_kernel<<<Lq, sm_block, shmem>>>(
+        scale_mask_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
             reinterpret_cast<__half*>(S.data),
             Lq, Lk, inv_sqrt, d_mask);
 
@@ -1216,7 +1220,7 @@ void flash_attention_forward(const Tensor& Q,
             Lq, head_dim, Lk);
 
         // 5. Pack back into the per-head slot of O.
-        pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+        pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
             reinterpret_cast<const __half*>(Oh.data),
             reinterpret_cast<__half*>(O.data),
             Lq, D, head_off, head_dim);
@@ -1610,6 +1614,8 @@ void flash_attention_qkvo_backward(
 
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+
     // ── 1. Recompute forward projections (same call as forward). ──────────
     Tensor Q = Tensor::empty_on(Device::CUDA, Lq, D, dt);
     Tensor K = Tensor::empty_on(Device::CUDA, Lk, D, dt);
@@ -1650,15 +1656,15 @@ void flash_attention_qkvo_backward(
             const int total_k = Lk * hd;
             const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
             if (bf16) {
-                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(Q.data),
                     reinterpret_cast<__nv_bfloat16*>(Qh.data),
                     Lq, D, head_off, hd);
-                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(K.data),
                     reinterpret_cast<__nv_bfloat16*>(Kh.data),
                     Lk, D, head_off, hd);
-                extract_head_DL_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                extract_head_DL_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(V.data),
                     reinterpret_cast<__nv_bfloat16*>(Vth.data),
                     Lk, D, head_off, hd);
@@ -1667,7 +1673,7 @@ void flash_attention_qkvo_backward(
                     reinterpret_cast<const __nv_bfloat16*>(Kh.data),
                     reinterpret_cast<__nv_bfloat16*>(S.data),
                     Lq, Lk, hd);
-                fa_scale_mask_causal_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem>>>(
+                fa_scale_mask_causal_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
                     reinterpret_cast<__nv_bfloat16*>(S.data),
                     Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
                 launch_matmul_ABT_bf16(
@@ -1675,21 +1681,21 @@ void flash_attention_qkvo_backward(
                     reinterpret_cast<const __nv_bfloat16*>(Vth.data),
                     reinterpret_cast<__nv_bfloat16*>(Oh.data),
                     Lq, hd, Lk);
-                pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(Oh.data),
                     reinterpret_cast<__nv_bfloat16*>(O_attn.data),
                     Lq, D, head_off, hd);
                 continue;
             }
-            extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+            extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(Q.data),
                 reinterpret_cast<__half*>(Qh.data),
                 Lq, D, head_off, hd);
-            extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+            extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(K.data),
                 reinterpret_cast<__half*>(Kh.data),
                 Lk, D, head_off, hd);
-            extract_head_DL_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+            extract_head_DL_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(V.data),
                 reinterpret_cast<__half*>(Vth.data),
                 Lk, D, head_off, hd);
@@ -1700,7 +1706,7 @@ void flash_attention_qkvo_backward(
                 reinterpret_cast<__half*>(S.data),
                 Lq, Lk, hd);
 
-            fa_scale_mask_causal_softmax_rows_kernel<<<Lq, sm_block, shmem>>>(
+            fa_scale_mask_causal_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
                 reinterpret_cast<__half*>(S.data),
                 Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
 
@@ -1710,7 +1716,7 @@ void flash_attention_qkvo_backward(
                 reinterpret_cast<__half*>(Oh.data),
                 Lq, hd, Lk);
 
-            pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+            pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(Oh.data),
                 reinterpret_cast<__half*>(O_attn.data),
                 Lq, D, head_off, hd);
@@ -1761,19 +1767,19 @@ void flash_attention_qkvo_backward(
             const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
 
             if (bf16) {
-                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(Q.data),
                     reinterpret_cast<__nv_bfloat16*>(Qh.data),
                     Lq, D, head_off, hd);
-                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(K.data),
                     reinterpret_cast<__nv_bfloat16*>(Kh.data),
                     Lk, D, head_off, hd);
-                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(V.data),
                     reinterpret_cast<__nv_bfloat16*>(Vh.data),
                     Lk, D, head_off, hd);
-                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(dO_attn.data),
                     reinterpret_cast<__nv_bfloat16*>(dOh.data),
                     Lq, D, head_off, hd);
@@ -1783,14 +1789,14 @@ void flash_attention_qkvo_backward(
                     reinterpret_cast<const __nv_bfloat16*>(Kh.data),
                     reinterpret_cast<__nv_bfloat16*>(P_main.data),
                     Lq, Lk, hd);
-                fa_scale_mask_causal_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem>>>(
+                fa_scale_mask_causal_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
                     reinterpret_cast<__nv_bfloat16*>(P_main.data),
                     Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
 
                 {
                     dim3 block(16, 16);
                     dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                    fa_dVh_bf16_kernel<<<grid, block>>>(
+                    fa_dVh_bf16_kernel<<<grid, block, 0, stream>>>(
                         reinterpret_cast<const __nv_bfloat16*>(P_main.data),
                         reinterpret_cast<const __nv_bfloat16*>(dOh.data),
                         reinterpret_cast<__nv_bfloat16*>(dVh.data),
@@ -1799,14 +1805,14 @@ void flash_attention_qkvo_backward(
                 {
                     dim3 block(16, 16);
                     dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
-                    fa_dP_bf16_kernel<<<grid, block>>>(
+                    fa_dP_bf16_kernel<<<grid, block, 0, stream>>>(
                         reinterpret_cast<const __nv_bfloat16*>(dOh.data),
                         reinterpret_cast<const __nv_bfloat16*>(Vh.data),
                         reinterpret_cast<__nv_bfloat16*>(dP.data),
                         Lq, Lk, hd);
                 }
                 {
-                    fa_dS_from_P_dP_bf16_kernel<<<Lq, sm_block, shmem>>>(
+                    fa_dS_from_P_dP_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
                         reinterpret_cast<__nv_bfloat16*>(P_main.data),
                         reinterpret_cast<const __nv_bfloat16*>(dP.data),
                         Lq, Lk, inv_sqrt);
@@ -1814,7 +1820,7 @@ void flash_attention_qkvo_backward(
                 {
                     dim3 block(16, 16);
                     dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
-                    fa_dQh_bf16_kernel<<<grid, block>>>(
+                    fa_dQh_bf16_kernel<<<grid, block, 0, stream>>>(
                         reinterpret_cast<const __nv_bfloat16*>(P_main.data),
                         reinterpret_cast<const __nv_bfloat16*>(Kh.data),
                         reinterpret_cast<__nv_bfloat16*>(dQh.data),
@@ -1823,40 +1829,40 @@ void flash_attention_qkvo_backward(
                 {
                     dim3 block(16, 16);
                     dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                    fa_dKh_bf16_kernel<<<grid, block>>>(
+                    fa_dKh_bf16_kernel<<<grid, block, 0, stream>>>(
                         reinterpret_cast<const __nv_bfloat16*>(P_main.data),
                         reinterpret_cast<const __nv_bfloat16*>(Qh.data),
                         reinterpret_cast<__nv_bfloat16*>(dKh.data),
                         Lq, Lk, hd);
                 }
-                pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+                pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(dQh.data),
                     reinterpret_cast<__nv_bfloat16*>(dQ.data),
                     Lq, D, head_off, hd);
-                pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(dKh.data),
                     reinterpret_cast<__nv_bfloat16*>(dK.data),
                     Lk, D, head_off, hd);
-                pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+                pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(dVh.data),
                     reinterpret_cast<__nv_bfloat16*>(dV.data),
                     Lk, D, head_off, hd);
                 continue;
             }
 
-            extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+            extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(Q.data),
                 reinterpret_cast<__half*>(Qh.data),
                 Lq, D, head_off, hd);
-            extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+            extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(K.data),
                 reinterpret_cast<__half*>(Kh.data),
                 Lk, D, head_off, hd);
-            extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+            extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(V.data),
                 reinterpret_cast<__half*>(Vh.data),
                 Lk, D, head_off, hd);
-            extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+            extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(dO_attn.data),
                 reinterpret_cast<__half*>(dOh.data),
                 Lq, D, head_off, hd);
@@ -1867,7 +1873,7 @@ void flash_attention_qkvo_backward(
                 reinterpret_cast<const __half*>(Kh.data),
                 reinterpret_cast<__half*>(P_main.data),
                 Lq, Lk, hd);
-            fa_scale_mask_causal_softmax_rows_kernel<<<Lq, sm_block, shmem>>>(
+            fa_scale_mask_causal_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
                 reinterpret_cast<__half*>(P_main.data),
                 Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
 
@@ -1875,7 +1881,7 @@ void flash_attention_qkvo_backward(
             {
                 dim3 block(16, 16);
                 dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                fa_dVh_kernel<<<grid, block>>>(
+                fa_dVh_kernel<<<grid, block, 0, stream>>>(
                     reinterpret_cast<const __half*>(P_main.data),
                     reinterpret_cast<const __half*>(dOh.data),
                     reinterpret_cast<__half*>(dVh.data),
@@ -1886,7 +1892,7 @@ void flash_attention_qkvo_backward(
             {
                 dim3 block(16, 16);
                 dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
-                fa_dP_kernel<<<grid, block>>>(
+                fa_dP_kernel<<<grid, block, 0, stream>>>(
                     reinterpret_cast<const __half*>(dOh.data),
                     reinterpret_cast<const __half*>(Vh.data),
                     reinterpret_cast<__half*>(dP.data),
@@ -1895,7 +1901,7 @@ void flash_attention_qkvo_backward(
 
             // dS = P * (dP - D_q) * inv_sqrt — written in-place over P_main.
             {
-                fa_dS_from_P_dP_kernel<<<Lq, sm_block, shmem>>>(
+                fa_dS_from_P_dP_kernel<<<Lq, sm_block, shmem, stream>>>(
                     reinterpret_cast<__half*>(P_main.data),
                     reinterpret_cast<const __half*>(dP.data),
                     Lq, Lk, inv_sqrt);
@@ -1905,7 +1911,7 @@ void flash_attention_qkvo_backward(
             {
                 dim3 block(16, 16);
                 dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
-                fa_dQh_kernel<<<grid, block>>>(
+                fa_dQh_kernel<<<grid, block, 0, stream>>>(
                     reinterpret_cast<const __half*>(P_main.data),
                     reinterpret_cast<const __half*>(Kh.data),
                     reinterpret_cast<__half*>(dQh.data),
@@ -1915,7 +1921,7 @@ void flash_attention_qkvo_backward(
             {
                 dim3 block(16, 16);
                 dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                fa_dKh_kernel<<<grid, block>>>(
+                fa_dKh_kernel<<<grid, block, 0, stream>>>(
                     reinterpret_cast<const __half*>(P_main.data),
                     reinterpret_cast<const __half*>(Qh.data),
                     reinterpret_cast<__half*>(dKh.data),
@@ -1923,15 +1929,15 @@ void flash_attention_qkvo_backward(
             }
 
             // Pack dQ_h / dK_h / dV_h back into (Lq, D) / (Lk, D).
-            pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK>>>(
+            pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(dQh.data),
                 reinterpret_cast<__half*>(dQ.data),
                 Lq, D, head_off, hd);
-            pack_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+            pack_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(dKh.data),
                 reinterpret_cast<__half*>(dK.data),
                 Lk, D, head_off, hd);
-            pack_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK>>>(
+            pack_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(dVh.data),
                 reinterpret_cast<__half*>(dV.data),
                 Lk, D, head_off, hd);
@@ -1976,11 +1982,11 @@ void flash_attention_qkvo_backward(
     auto add_into = [&](Tensor& dst, const Tensor& src, int n) {
         const int blocks = (n + 255) / 256;
         if (bf16) {
-            fa_bf16_add_inplace_kernel<<<blocks, 256>>>(
+            fa_bf16_add_inplace_kernel<<<blocks, 256, 0, stream>>>(
                 reinterpret_cast<__nv_bfloat16*>(dst.data),
                 reinterpret_cast<const __nv_bfloat16*>(src.data), n);
         } else {
-            fa_fp16_add_inplace_kernel<<<blocks, 256>>>(
+            fa_fp16_add_inplace_kernel<<<blocks, 256, 0, stream>>>(
                 reinterpret_cast<__half*>(dst.data),
                 reinterpret_cast<const __half*>(src.data), n);
         }
