@@ -153,5 +153,7 @@ if(BROTENSOR_HAS_GPU)
         brotensor_add_executable(brotensor_bench_diffusion bench_diffusion.cpp)
         brotensor_add_executable(brotensor_bench_filtered_lrelu bench_filtered_lrelu.cpp)
         brotensor_add_executable(brotensor_bench_modulated_conv2d bench_modulated_conv2d.cpp)
+        # CUDA graph capture/replay (the API is CUDA-only).
+        brotensor_add_test(brotensor_test_cuda_graph test_cuda_graph.cpp)
     endif()
 endif()

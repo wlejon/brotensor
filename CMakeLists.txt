@@ -155,6 +155,7 @@ if(BROTENSOR_WITH_CUDA)
     add_library(brotensor_cuda STATIC
         src/cuda/runtime.cu
         src/cuda/tensor.cu
+        src/cuda/cuda_graph.cu
         src/cuda/gemm.cu
         src/cuda/fp16_matmul.cu
         src/cuda/elementwise.cu
