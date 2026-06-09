@@ -14,11 +14,22 @@
 #include <stdexcept>
 #include <vector>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 using ::brotensor::Tensor;
 using ::brotensor::Dtype;
 using ::brotensor::dtype_size_bytes;
+
+// Current CUDA stream for these copies — so concat / split / copy_d2d join a
+// non-default capture/replay stream instead of silently landing on the legacy
+// default stream (which CUDA-graph capture rejects with "operation would make
+// the legacy stream depend on a capturing blocking stream"). Off-capture this
+// is null = the default stream, so there is no behavior change.
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 void concat_rows(const std::vector<const Tensor*>& parts, Tensor& out) {
     int total = 0;
@@ -43,7 +54,7 @@ void concat_rows(const std::vector<const Tensor*>& parts, Tensor& out) {
         if (n == 0) continue;
         BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(dst_base + off_bytes, p->data,
                                        elem * n,
-                                       cudaMemcpyDeviceToDevice));
+                                       cudaMemcpyDeviceToDevice, cur_stream()));
         off_bytes += elem * n;
     }
 }
@@ -58,7 +69,7 @@ void split_rows(const Tensor& in, const std::vector<Tensor*>& parts) {
         if (n == 0) continue;
         BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(p->data, src_base + off_bytes,
                                        elem * static_cast<size_t>(n),
-                                       cudaMemcpyDeviceToDevice));
+                                       cudaMemcpyDeviceToDevice, cur_stream()));
         off_bytes += elem * static_cast<size_t>(n);
     }
 }
@@ -202,7 +213,7 @@ void copy_d2d(const Tensor& src, int src_off,
         dst_base + static_cast<size_t>(dst_off) * elem,
         src_base + static_cast<size_t>(src_off) * elem,
         elem * static_cast<size_t>(n),
-        cudaMemcpyDeviceToDevice));
+        cudaMemcpyDeviceToDevice, cur_stream()));
 }
 
 // ─── Forward declarations for the rest of the specialised cluster ──────────

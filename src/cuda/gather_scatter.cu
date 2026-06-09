@@ -25,11 +25,20 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 namespace {
 
 constexpr int GS_BLOCK = 256;
+
+// Current CUDA stream — so gather/scatter inside a CUDA-graph capture region
+// joins the capture stream rather than the legacy default stream (capture
+// rejects the latter). Off-capture this is null = the default stream.
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 inline int gs_grid(long long n) {
     long long blocks = (n + GS_BLOCK - 1) / GS_BLOCK;
@@ -131,17 +140,17 @@ void gather_rows(const ::brotensor::Tensor& X,
 
     const long long total = (long long)M * C;
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        gather_rows_kernel<__half><<<gs_grid(total), GS_BLOCK>>>(
+        gather_rows_kernel<__half><<<gs_grid(total), GS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<const int32_t*>(Idx.data),
             static_cast<__half*>(Y.data), M, C);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        gather_rows_kernel<__nv_bfloat16><<<gs_grid(total), GS_BLOCK>>>(
+        gather_rows_kernel<__nv_bfloat16><<<gs_grid(total), GS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<const int32_t*>(Idx.data),
             static_cast<__nv_bfloat16*>(Y.data), M, C);
     } else {
-        gather_rows_kernel<float><<<gs_grid(total), GS_BLOCK>>>(
+        gather_rows_kernel<float><<<gs_grid(total), GS_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<const int32_t*>(Idx.data),
             static_cast<float*>(Y.data), M, C);
@@ -172,7 +181,7 @@ void scatter_rows_add(const ::brotensor::Tensor& dY,
             dX.data, 0, static_cast<size_t>(total_dst) * sizeof(float)));
         if (M == 0) return;
         const long long total = (long long)M * C;
-        scatter_rows_add_into_fp32_kernel<float><<<gs_grid(total), GS_BLOCK>>>(
+        scatter_rows_add_into_fp32_kernel<float><<<gs_grid(total), GS_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data),
             static_cast<const int32_t*>(Idx.data),
             static_cast<float*>(dX.data), M, C);
@@ -189,12 +198,12 @@ void scatter_rows_add(const ::brotensor::Tensor& dY,
     if (M > 0) {
         const long long total = (long long)M * C;
         if (dY.dtype == ::brotensor::Dtype::FP16) {
-            scatter_rows_add_into_fp32_kernel<__half><<<gs_grid(total), GS_BLOCK>>>(
+            scatter_rows_add_into_fp32_kernel<__half><<<gs_grid(total), GS_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __half*>(dY.data),
                 static_cast<const int32_t*>(Idx.data),
                 d_scratch, M, C);
         } else {
-            scatter_rows_add_into_fp32_kernel<__nv_bfloat16><<<gs_grid(total), GS_BLOCK>>>(
+            scatter_rows_add_into_fp32_kernel<__nv_bfloat16><<<gs_grid(total), GS_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __nv_bfloat16*>(dY.data),
                 static_cast<const int32_t*>(Idx.data),
                 d_scratch, M, C);
@@ -202,10 +211,10 @@ void scatter_rows_add(const ::brotensor::Tensor& dY,
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     if (dY.dtype == ::brotensor::Dtype::FP16) {
-        gs_cast_fp32_to_T<__half><<<gs_grid(total_dst), GS_BLOCK>>>(
+        gs_cast_fp32_to_T<__half><<<gs_grid(total_dst), GS_BLOCK, 0, cur_stream()>>>(
             d_scratch, static_cast<__half*>(dX.data), total_dst);
     } else {
-        gs_cast_fp32_to_T<__nv_bfloat16><<<gs_grid(total_dst), GS_BLOCK>>>(
+        gs_cast_fp32_to_T<__nv_bfloat16><<<gs_grid(total_dst), GS_BLOCK, 0, cur_stream()>>>(
             d_scratch, static_cast<__nv_bfloat16*>(dX.data), total_dst);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());

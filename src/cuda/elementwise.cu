@@ -8,11 +8,22 @@
 
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 namespace {
 
 constexpr int EW_BLOCK = 256;
+
+// Current CUDA stream for these launches — so an elementwise op inside a
+// CUDA-graph capture/replay region joins the capture stream instead of the
+// legacy default stream (which capture rejects). Off-capture this is null = the
+// default stream, so there is no behavior change. (Migrated incrementally, op
+// by op, as a capture path needs it — mirrors the rms_norm/rope/batched fix.)
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 __device__ inline float silu_scalar(float v) {
     return v / (1.0f + __expf(-v));
@@ -872,15 +883,15 @@ void relu_forward(const Tensor& x, Tensor& y) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        relu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        relu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        relu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        relu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<__nv_bfloat16*>(y.data), n);
     } else {
-        relu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        relu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<float*>(y.data), n);
     }
@@ -894,17 +905,17 @@ void relu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        relu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        relu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        relu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        relu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
-        relu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        relu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data), n);
@@ -919,15 +930,15 @@ void tanh_forward(const Tensor& x, Tensor& y) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        tanh_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        tanh_forward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        tanh_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        tanh_forward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<__nv_bfloat16*>(y.data), n);
     } else {
-        tanh_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        tanh_forward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<float*>(y.data), n);
     }
@@ -941,17 +952,17 @@ void tanh_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
-        tanh_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        tanh_backward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(y.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
     } else if (y.dtype == Dtype::BF16) {
-        tanh_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        tanh_backward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(y.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
-        tanh_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        tanh_backward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(y.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data), n);
@@ -966,15 +977,15 @@ void sigmoid_forward(const Tensor& x, Tensor& y) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        sigmoid_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        sigmoid_forward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        sigmoid_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        sigmoid_forward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<__nv_bfloat16*>(y.data), n);
     } else {
-        sigmoid_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        sigmoid_forward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<float*>(y.data), n);
     }
@@ -988,17 +999,17 @@ void sigmoid_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
-        sigmoid_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        sigmoid_backward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(y.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
     } else if (y.dtype == Dtype::BF16) {
-        sigmoid_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        sigmoid_backward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(y.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
-        sigmoid_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        sigmoid_backward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(y.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data), n);
@@ -1013,18 +1024,18 @@ void add_inplace(Tensor& y, const Tensor& x) {
         if (x.dtype != Dtype::FP16) {
             throw std::runtime_error("add_inplace: dtype mismatch");
         }
-        add_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        add_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__half*>(y.data),
             static_cast<const __half*>(x.data), n);
     } else if (y.dtype == Dtype::BF16) {
         if (x.dtype != Dtype::BF16) {
             throw std::runtime_error("add_inplace: dtype mismatch");
         }
-        add_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        add_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__nv_bfloat16*>(y.data),
             static_cast<const __nv_bfloat16*>(x.data), n);
     } else {
-        add_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(
+        add_inplace_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<float*>(y.data),
             static_cast<const float*>(x.data), n);
     }
@@ -1044,19 +1055,19 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
         return;
     }
     if (src.dtype == Dtype::FP32 && out_dtype == Dtype::FP16) {
-        cast_f2h_kernel<<<grid_for(n), EW_BLOCK>>>(
+        cast_f2h_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(src.data),
             static_cast<__half*>(dst.data), n);
     } else if (src.dtype == Dtype::FP16 && out_dtype == Dtype::FP32) {
-        cast_h2f_kernel<<<grid_for(n), EW_BLOCK>>>(
+        cast_h2f_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(src.data),
             static_cast<float*>(dst.data), n);
     } else if (src.dtype == Dtype::FP32 && out_dtype == Dtype::BF16) {
-        cast_f2bf_kernel<<<grid_for(n), EW_BLOCK>>>(
+        cast_f2bf_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(src.data),
             static_cast<__nv_bfloat16*>(dst.data), n);
     } else if (src.dtype == Dtype::BF16 && out_dtype == Dtype::FP32) {
-        cast_bf2f_kernel<<<grid_for(n), EW_BLOCK>>>(
+        cast_bf2f_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(src.data),
             static_cast<float*>(dst.data), n);
     } else {
@@ -1070,13 +1081,13 @@ void add_scalar_inplace(Tensor& y, float s) {
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
-        add_scalar_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        add_scalar_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__half*>(y.data), s, n);
     } else if (y.dtype == Dtype::BF16) {
-        add_scalar_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        add_scalar_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__nv_bfloat16*>(y.data), s, n);
     } else {
-        add_scalar_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(
+        add_scalar_inplace_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<float*>(y.data), s, n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -1086,13 +1097,13 @@ void clamp(Tensor& y, float lo, float hi) {
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
-        clamp_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        clamp_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__half*>(y.data), lo, hi, n);
     } else if (y.dtype == Dtype::BF16) {
-        clamp_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        clamp_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__nv_bfloat16*>(y.data), lo, hi, n);
     } else {
-        clamp_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        clamp_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<float*>(y.data), lo, hi, n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -1102,13 +1113,13 @@ void scale_inplace(Tensor& y, float s) {
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
-        scale_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        scale_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__half*>(y.data), s, n);
     } else if (y.dtype == Dtype::BF16) {
-        scale_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        scale_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__nv_bfloat16*>(y.data), s, n);
     } else {
-        scale_inplace_kernel<<<grid_for(n), EW_BLOCK>>>(
+        scale_inplace_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<float*>(y.data), s, n);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -1121,15 +1132,15 @@ void mul_inplace(Tensor& y, const Tensor& x) {
     const int n = y.size();
     if (n == 0) return;
     if (y.dtype == Dtype::FP16) {
-        mul_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        mul_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__half*>(y.data),
             static_cast<const __half*>(x.data), n);
     } else if (y.dtype == Dtype::BF16) {
-        mul_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        mul_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__nv_bfloat16*>(y.data),
             static_cast<const __nv_bfloat16*>(x.data), n);
     } else {
-        mul_inplace_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        mul_inplace_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<float*>(y.data),
             static_cast<const float*>(x.data), n);
     }
@@ -1143,15 +1154,15 @@ void silu_forward(const Tensor& x, Tensor& y) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        silu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        silu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        silu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        silu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<__nv_bfloat16*>(y.data), n);
     } else {
-        silu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        silu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<float*>(y.data), n);
     }
@@ -1165,15 +1176,15 @@ void gelu_forward(const Tensor& x, Tensor& y) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        gelu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        gelu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<__nv_bfloat16*>(y.data), n);
     } else {
-        gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<float*>(y.data), n);
     }
@@ -1187,15 +1198,15 @@ void quick_gelu_forward(const Tensor& x, Tensor& y) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        quick_gelu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        quick_gelu_forward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        quick_gelu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        quick_gelu_forward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<__nv_bfloat16*>(y.data), n);
     } else {
-        quick_gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        quick_gelu_forward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<float*>(y.data), n);
     }
@@ -1209,17 +1220,17 @@ void silu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        silu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        silu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        silu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        silu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
-        silu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        silu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data), n);
@@ -1234,17 +1245,17 @@ void gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        gelu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        gelu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
-        gelu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data), n);
@@ -1259,17 +1270,17 @@ void quick_gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        quick_gelu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        quick_gelu_backward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        quick_gelu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        quick_gelu_backward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
-        quick_gelu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        quick_gelu_backward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data), n);
@@ -1289,17 +1300,17 @@ void geglu_forward(const Tensor& X, Tensor& Y) {
     const int total = B * D;
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
-        geglu_forward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_forward_fp16_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             B, D);
     } else if (X.dtype == Dtype::BF16) {
-        geglu_forward_bf16_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_forward_bf16_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
             B, D);
     } else {
-        geglu_forward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_forward_fp32_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(Y.data), B, D);
     }
@@ -1318,19 +1329,19 @@ void geglu_backward(const Tensor& X, const Tensor& dY, Tensor& dX) {
     const int total = B * D;
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
-        geglu_backward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_backward_fp16_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
             B, D);
     } else if (X.dtype == Dtype::BF16) {
-        geglu_backward_bf16_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_backward_bf16_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data),
             B, D);
     } else {
-        geglu_backward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_backward_fp32_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data), B, D);
@@ -1345,15 +1356,15 @@ void gelu_exact_forward(const Tensor& x, Tensor& y) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        gelu_exact_forward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_exact_forward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        gelu_exact_forward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_exact_forward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<__nv_bfloat16*>(y.data), n);
     } else {
-        gelu_exact_forward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_exact_forward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<float*>(y.data), n);
     }
@@ -1367,17 +1378,17 @@ void gelu_exact_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
     const int n = x.size();
     if (n == 0) return;
     if (x.dtype == Dtype::FP16) {
-        gelu_exact_backward_fp16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_exact_backward_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(x.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data), n);
     } else if (x.dtype == Dtype::BF16) {
-        gelu_exact_backward_bf16_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_exact_backward_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data), n);
     } else {
-        gelu_exact_backward_fp32_kernel<<<grid_for(n), EW_BLOCK>>>(
+        gelu_exact_backward_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(x.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data), n);
@@ -1397,17 +1408,17 @@ void geglu_exact_forward(const Tensor& X, Tensor& Y) {
     const int total = B * D;
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
-        geglu_exact_forward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_exact_forward_fp16_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             B, D);
     } else if (X.dtype == Dtype::BF16) {
-        geglu_exact_forward_bf16_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_exact_forward_bf16_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
             B, D);
     } else {
-        geglu_exact_forward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_exact_forward_fp32_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(Y.data), B, D);
     }
@@ -1426,19 +1437,19 @@ void geglu_exact_backward(const Tensor& X, const Tensor& dY, Tensor& dX) {
     const int total = B * D;
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
-        geglu_exact_backward_fp16_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_exact_backward_fp16_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
             B, D);
     } else if (X.dtype == Dtype::BF16) {
-        geglu_exact_backward_bf16_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_exact_backward_bf16_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data),
             B, D);
     } else {
-        geglu_exact_backward_fp32_kernel<<<grid_for(total), EW_BLOCK>>>(
+        geglu_exact_backward_fp32_kernel<<<grid_for(total), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data), B, D);
@@ -1452,7 +1463,7 @@ void build_causal_mask_row(int L, int q, Tensor& mask) {
     }
     if (L <= 0) return;
     const int blocks = (L + EW_BLOCK - 1) / EW_BLOCK;
-    causal_mask_row_kernel<<<blocks, EW_BLOCK>>>(
+    causal_mask_row_kernel<<<blocks, EW_BLOCK, 0, cur_stream()>>>(
         static_cast<float*>(mask.data), L, q);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -1462,7 +1473,7 @@ void build_slot_mask(const Tensor& x, int offset, int K, int stride,
     if (mask.rows != K || mask.cols != 1) mask.resize(K, 1);
     if (K <= 0) return;
     const int blocks = (K + EW_BLOCK - 1) / EW_BLOCK;
-    build_slot_mask_kernel<<<blocks, EW_BLOCK>>>(
+    build_slot_mask_kernel<<<blocks, EW_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data),
         static_cast<float*>(mask.data),
         offset, K, stride);
