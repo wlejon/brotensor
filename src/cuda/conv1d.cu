@@ -27,6 +27,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -342,7 +347,7 @@ void conv_transpose1d_forward(const ::brotensor::Tensor& X,
     }
     if (N == 0 || out_cols == 0) return;
     const long long total = (long long)N * C_out * L_out;
-    convt1d_forward_kernel<<<c1d_grid(total), C1D_BLOCK>>>(
+    convt1d_forward_kernel<<<c1d_grid(total), C1D_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data), static_cast<const float*>(Wt.data),
         bias ? static_cast<const float*>(bias->data) : nullptr,
         static_cast<float*>(Y.data),
@@ -378,7 +383,7 @@ void conv_transpose1d_backward_input(const ::brotensor::Tensor& Wt,
     }
     if (N == 0 || in_cols == 0) return;
     const long long total = (long long)N * C_in * L;
-    convt1d_bwd_input_kernel<<<c1d_grid(total), C1D_BLOCK>>>(
+    convt1d_bwd_input_kernel<<<c1d_grid(total), C1D_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(Wt.data), static_cast<const float*>(dY.data),
         static_cast<float*>(dX.data),
         N, C_in, L, C_out, kL, stride, padding, dilation, Cg_in, Cg_out, L_out);
@@ -412,7 +417,7 @@ void conv_transpose1d_backward_weight(const ::brotensor::Tensor& X,
     }
     if (C_in == 0 || Cg_out == 0 || kL == 0) return;
     const long long total = (long long)C_in * Cg_out * kL;
-    convt1d_bwd_weight_kernel<<<c1d_grid(total), C1D_BLOCK>>>(
+    convt1d_bwd_weight_kernel<<<c1d_grid(total), C1D_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data), static_cast<const float*>(dY.data),
         static_cast<float*>(dWt.data),
         N, C_in, L, C_out, kL, stride, padding, dilation, Cg_in, Cg_out, L_out);
@@ -432,7 +437,7 @@ void conv_transpose1d_backward_bias(const ::brotensor::Tensor& dY,
         fail(op, "dY shape must be (N, C_out*L_out)");
     }
     if (C_out == 0 || N == 0 || L_out == 0) return;
-    convt1d_bwd_bias_kernel<<<c1d_grid(C_out), C1D_BLOCK>>>(
+    convt1d_bwd_bias_kernel<<<c1d_grid(C_out), C1D_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dY.data), static_cast<float*>(dB.data),
         N, C_out, L_out);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -467,7 +472,7 @@ void causal_conv1d_update(const ::brotensor::Tensor& X,
     }
     if (N == 0 || C == 0 || L_step == 0) return;
     const long long total = (long long)N * C * L_step;
-    causal_conv1d_y_kernel<<<c1d_grid(total), C1D_BLOCK>>>(
+    causal_conv1d_y_kernel<<<c1d_grid(total), C1D_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data), static_cast<const float*>(Wt.data),
         bias ? static_cast<const float*>(bias->data) : nullptr,
         static_cast<const float*>(state.data), static_cast<float*>(Y.data),
@@ -475,7 +480,7 @@ void causal_conv1d_update(const ::brotensor::Tensor& X,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
     // Roll the state forward — strictly after the Y kernel (same stream).
     if (hist > 0) {
-        causal_conv1d_roll_kernel<<<c1d_grid((long long)N * C), C1D_BLOCK>>>(
+        causal_conv1d_roll_kernel<<<c1d_grid((long long)N * C), C1D_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(state.data), N, C, L_step, hist);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -503,7 +508,7 @@ void pad1d_forward(const ::brotensor::Tensor& X, int N, int C, int L,
     }
     if (N == 0 || C == 0) return;
     const long long total = (long long)N * C * L_pad;
-    pad1d_forward_kernel<<<c1d_grid(total), C1D_BLOCK>>>(
+    pad1d_forward_kernel<<<c1d_grid(total), C1D_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data), static_cast<float*>(Y.data),
         N, C, L, L_pad, pad_left, mode);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -532,7 +537,7 @@ void pad1d_backward(const ::brotensor::Tensor& dY, int N, int C, int L,
     }
     if (N == 0 || C == 0) return;
     const long long total = (long long)N * C * L;
-    pad1d_backward_kernel<<<c1d_grid(total), C1D_BLOCK>>>(
+    pad1d_backward_kernel<<<c1d_grid(total), C1D_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dY.data), static_cast<float*>(dX.data),
         N, C, L, L_pad, pad_left, mode);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());

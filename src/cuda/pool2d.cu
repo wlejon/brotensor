@@ -18,6 +18,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -196,7 +201,7 @@ void adaptive_avg_pool2d_forward(const ::brotensor::Tensor& X,
     if (N == 0) return;
 
     const long long total = (long long)N * cols_out;
-    adaptive_avg_pool2d_forward_kernel<<<pl_grid(total), PL_BLOCK>>>(
+    adaptive_avg_pool2d_forward_kernel<<<pl_grid(total), PL_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data), static_cast<float*>(Y.data),
         N, C, H, W, H_out, W_out);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -223,11 +228,11 @@ void adaptive_avg_pool2d_backward(const ::brotensor::Tensor& dY,
     if (N == 0) return;
 
     const long long total_in = (long long)N * cols_in;
-    BROTENSOR_CUDA_CHECK(cudaMemset(
-        dX.data, 0, static_cast<size_t>(total_in) * sizeof(float)));
+    BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
+        dX.data, 0, static_cast<size_t>(total_in) * sizeof(float), cur_stream()));
 
     const long long total_out = (long long)N * C * H_out * W_out;
-    adaptive_avg_pool2d_backward_kernel<<<pl_grid(total_out), PL_BLOCK>>>(
+    adaptive_avg_pool2d_backward_kernel<<<pl_grid(total_out), PL_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dY.data), static_cast<float*>(dX.data),
         N, C, H, W, H_out, W_out);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -268,7 +273,7 @@ void max_pool2d_forward(const ::brotensor::Tensor& X,
     if (N == 0) return;
 
     const long long total = (long long)N * cols_out;
-    max_pool2d_forward_kernel<<<pl_grid(total), PL_BLOCK>>>(
+    max_pool2d_forward_kernel<<<pl_grid(total), PL_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data), static_cast<float*>(Y.data),
         static_cast<int32_t*>(Idx.data),
         N, C, H, W, kH, kW, stride_h, stride_w, pad_h, pad_w,
@@ -302,13 +307,13 @@ void max_pool2d_backward(const ::brotensor::Tensor& dY,
     if (N == 0) return;
 
     const long long total_in = (long long)N * cols_in;
-    BROTENSOR_CUDA_CHECK(cudaMemset(
-        dX.data, 0, static_cast<size_t>(total_in) * sizeof(float)));
+    BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
+        dX.data, 0, static_cast<size_t>(total_in) * sizeof(float), cur_stream()));
 
     if (H_out == 0 || W_out == 0) return;
 
     const long long total_out = (long long)N * C * H_out * W_out;
-    max_pool2d_backward_kernel<<<pl_grid(total_out), PL_BLOCK>>>(
+    max_pool2d_backward_kernel<<<pl_grid(total_out), PL_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dY.data),
         static_cast<const int32_t*>(Idx.data),
         static_cast<float*>(dX.data),

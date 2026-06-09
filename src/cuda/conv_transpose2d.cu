@@ -29,6 +29,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -320,7 +325,7 @@ void conv_transpose2d_forward(const ::brotensor::Tensor& X,
     if (N == 0 || out_cols == 0) return;
 
     const long long total = (long long)N * out_cols;
-    convt2d_forward_kernel<<<ct2d_grid(total), CT2D_BLOCK>>>(
+    convt2d_forward_kernel<<<ct2d_grid(total), CT2D_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data),
         static_cast<const float*>(Wt.data),
         bias ? static_cast<const float*>(bias->data) : nullptr,
@@ -369,7 +374,7 @@ void conv_transpose2d_backward_input(const ::brotensor::Tensor& Wt,
     if (N == 0 || in_cols == 0) return;
 
     const long long total = (long long)N * in_cols;
-    convt2d_bwd_input_kernel<<<ct2d_grid(total), CT2D_BLOCK>>>(
+    convt2d_bwd_input_kernel<<<ct2d_grid(total), CT2D_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(Wt.data),
         static_cast<const float*>(dY.data),
         static_cast<float*>(dX.data),
@@ -416,7 +421,7 @@ void conv_transpose2d_backward_weight(const ::brotensor::Tensor& X,
     if (C_in == 0 || Cg_out == 0 || kHW == 0) return;
 
     const long long total = (long long)C_in * Cg_out * kHW;
-    convt2d_bwd_weight_kernel<<<ct2d_grid(total), CT2D_BLOCK>>>(
+    convt2d_bwd_weight_kernel<<<ct2d_grid(total), CT2D_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data),
         static_cast<const float*>(dY.data),
         static_cast<float*>(dWt.data),
@@ -440,7 +445,7 @@ void conv_transpose2d_backward_bias(const ::brotensor::Tensor& dY,
     }
     if (C_out == 0 || N == 0 || H_out == 0 || W_out == 0) return;
 
-    convt2d_bwd_bias_kernel<<<C_out, CT2D_BIAS_BLOCK>>>(
+    convt2d_bwd_bias_kernel<<<C_out, CT2D_BIAS_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dY.data),
         static_cast<float*>(dB.data),
         N, C_out, H_out, W_out);

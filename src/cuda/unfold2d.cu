@@ -21,6 +21,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -137,17 +142,17 @@ void unfold2d_forward(const ::brotensor::Tensor& X,
 
     const long long total = (long long)N * cols_out;
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        unfold2d_forward_kernel<__half><<<uf_grid(total), UF_BLOCK>>>(
+        unfold2d_forward_kernel<__half><<<uf_grid(total), UF_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
             N, C, H, W, kH, kW, stride_h, stride_w, pad_top, pad_left, mode,
             H_out, W_out);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        unfold2d_forward_kernel<__nv_bfloat16><<<uf_grid(total), UF_BLOCK>>>(
+        unfold2d_forward_kernel<__nv_bfloat16><<<uf_grid(total), UF_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), static_cast<__nv_bfloat16*>(Y.data),
             N, C, H, W, kH, kW, stride_h, stride_w, pad_top, pad_left, mode,
             H_out, W_out);
     } else {
-        unfold2d_forward_kernel<float><<<uf_grid(total), UF_BLOCK>>>(
+        unfold2d_forward_kernel<float><<<uf_grid(total), UF_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
             N, C, H, W, kH, kW, stride_h, stride_w, pad_top, pad_left, mode,
             H_out, W_out);

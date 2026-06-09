@@ -23,6 +23,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -134,15 +139,15 @@ void convex_upsample_forward(const ::brotensor::Tensor& X,
 
     const long long total = (long long)N * C * oHW;
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        convex_upsample_kernel<__half><<<cu_grid(total), CU_BLOCK>>>(
+        convex_upsample_kernel<__half><<<cu_grid(total), CU_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), static_cast<const __half*>(Mask.data),
             static_cast<__half*>(Y.data), N, C, H, W, scale);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        convex_upsample_kernel<__nv_bfloat16><<<cu_grid(total), CU_BLOCK>>>(
+        convex_upsample_kernel<__nv_bfloat16><<<cu_grid(total), CU_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), static_cast<const __nv_bfloat16*>(Mask.data),
             static_cast<__nv_bfloat16*>(Y.data), N, C, H, W, scale);
     } else {
-        convex_upsample_kernel<float><<<cu_grid(total), CU_BLOCK>>>(
+        convex_upsample_kernel<float><<<cu_grid(total), CU_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), static_cast<const float*>(Mask.data),
             static_cast<float*>(Y.data), N, C, H, W, scale);
     }

@@ -32,6 +32,11 @@
 #include <mma.h>
 #include <cstdint>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor {
 namespace conv2d_wmma_internal {
 
@@ -301,17 +306,17 @@ static bool launch_conv2d_implicit_gemm_wmma_impl(
 
     if (kH == 3 && kW == 3 && pad_h == 1 && pad_w == 1 && stride_h == 1 && stride_w == 1) {
         conv2d_implicit_gemm_wmma_kernel<T, 3, 3, 1, 1, 1, 1>
-            <<<grid, block>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
+            <<<grid, block, 0, cur_stream()>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
         return true;
     }
     if (kH == 1 && kW == 1 && pad_h == 0 && pad_w == 0 && stride_h == 1 && stride_w == 1) {
         conv2d_implicit_gemm_wmma_kernel<T, 1, 1, 0, 0, 1, 1>
-            <<<grid, block>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
+            <<<grid, block, 0, cur_stream()>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
         return true;
     }
     if (kH == 3 && kW == 3 && pad_h == 1 && pad_w == 1 && stride_h == 2 && stride_w == 2) {
         conv2d_implicit_gemm_wmma_kernel<T, 3, 3, 1, 1, 2, 2>
-            <<<grid, block>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
+            <<<grid, block, 0, cur_stream()>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
         return true;
     }
     return false;

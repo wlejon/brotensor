@@ -25,6 +25,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -181,15 +186,15 @@ void pad2d_forward(const ::brotensor::Tensor& X,
 
     const long long total = (long long)N * cols_out;
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        pad2d_forward_kernel<__half><<<pd_grid(total), PD_BLOCK>>>(
+        pad2d_forward_kernel<__half><<<pd_grid(total), PD_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
             N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        pad2d_forward_kernel<__nv_bfloat16><<<pd_grid(total), PD_BLOCK>>>(
+        pad2d_forward_kernel<__nv_bfloat16><<<pd_grid(total), PD_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), static_cast<__nv_bfloat16*>(Y.data),
             N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
     } else {
-        pad2d_forward_kernel<float><<<pd_grid(total), PD_BLOCK>>>(
+        pad2d_forward_kernel<float><<<pd_grid(total), PD_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
             N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
     }
@@ -219,10 +224,10 @@ void pad2d_backward(const ::brotensor::Tensor& dY,
     const long long total_out = (long long)N * C * H_pad * W_pad;
 
     if (dY.dtype == ::brotensor::Dtype::FP32) {
-        BROTENSOR_CUDA_CHECK(cudaMemset(
-            dX.data, 0, static_cast<size_t>(total_in) * sizeof(float)));
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
+            dX.data, 0, static_cast<size_t>(total_in) * sizeof(float), cur_stream()));
         if (total_out == 0) return;
-        pad2d_backward_kernel<float><<<pd_grid(total_out), PD_BLOCK>>>(
+        pad2d_backward_kernel<float><<<pd_grid(total_out), PD_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data), static_cast<float*>(dX.data),
             N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -233,15 +238,15 @@ void pad2d_backward(const ::brotensor::Tensor& dY,
     float* d_scratch = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
                                     static_cast<size_t>(total_in) * sizeof(float)));
-    BROTENSOR_CUDA_CHECK(cudaMemset(d_scratch, 0,
-                                    static_cast<size_t>(total_in) * sizeof(float)));
+    BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_scratch, 0,
+                                    static_cast<size_t>(total_in) * sizeof(float), cur_stream()));
     if (total_out > 0) {
         if (dY.dtype == ::brotensor::Dtype::FP16) {
-            pad2d_backward_kernel<__half><<<pd_grid(total_out), PD_BLOCK>>>(
+            pad2d_backward_kernel<__half><<<pd_grid(total_out), PD_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __half*>(dY.data), d_scratch,
                 N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
         } else {
-            pad2d_backward_kernel<__nv_bfloat16><<<pd_grid(total_out), PD_BLOCK>>>(
+            pad2d_backward_kernel<__nv_bfloat16><<<pd_grid(total_out), PD_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __nv_bfloat16*>(dY.data), d_scratch,
                 N, C, H, W, pad_top, pad_left, mode, H_pad, W_pad);
         }
@@ -249,10 +254,10 @@ void pad2d_backward(const ::brotensor::Tensor& dY,
     }
     if (total_in > 0) {
         if (dY.dtype == ::brotensor::Dtype::FP16) {
-            pad2d_cast_fp32_to_T<__half><<<pd_grid(total_in), PD_BLOCK>>>(
+            pad2d_cast_fp32_to_T<__half><<<pd_grid(total_in), PD_BLOCK, 0, cur_stream()>>>(
                 d_scratch, static_cast<__half*>(dX.data), total_in);
         } else {
-            pad2d_cast_fp32_to_T<__nv_bfloat16><<<pd_grid(total_in), PD_BLOCK>>>(
+            pad2d_cast_fp32_to_T<__nv_bfloat16><<<pd_grid(total_in), PD_BLOCK, 0, cur_stream()>>>(
                 d_scratch, static_cast<__nv_bfloat16*>(dX.data), total_in);
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());

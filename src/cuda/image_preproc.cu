@@ -22,6 +22,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -111,12 +116,12 @@ void image_normalize(const ::brotensor::Tensor& X,
     float* d_inv = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_inv),
                                     C * sizeof(float)));
-    image_inv_std_kernel<<<(C + BLK - 1) / BLK, BLK>>>(
+    image_inv_std_kernel<<<(C + BLK - 1) / BLK, BLK, 0, cur_stream()>>>(
         reinterpret_cast<const float*>(std_.data), d_inv, C);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     const int total = N * cols;
-    image_normalize_kernel<<<(total + BLK - 1) / BLK, BLK>>>(
+    image_normalize_kernel<<<(total + BLK - 1) / BLK, BLK, 0, cur_stream()>>>(
         reinterpret_cast<const float*>(X.data),
         reinterpret_cast<const float*>(mean.data),
         d_inv,
@@ -146,7 +151,7 @@ void image_u8_to_f32_nhwc_to_nchw(const uint8_t* src,
     if (N == 0 || cols == 0) return;
 
     const int total = N * cols;
-    image_u8_to_f32_nhwc_to_nchw_kernel<<<(total + BLK - 1) / BLK, BLK>>>(
+    image_u8_to_f32_nhwc_to_nchw_kernel<<<(total + BLK - 1) / BLK, BLK, 0, cur_stream()>>>(
         src,
         reinterpret_cast<float*>(Y.data),
         N, H, W, C, scale, bias);
