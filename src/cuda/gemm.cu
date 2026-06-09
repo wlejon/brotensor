@@ -184,23 +184,27 @@ void linear_forward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& b,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-// FP16 batched linear forward: Y(B, out_dim) = X(B, in_dim) @ W(out_dim, in_dim)^T
+// 16-bit batched linear forward: Y(B, out_dim) = X(B, in_dim) @ W(out_dim, in_dim)^T
 // + optional broadcast bias, with an optional activation. Same matmul kernel as
 // cross-attention's matmul_ABT — X is the (M=B, K=in_dim) side, W is the
 // (N=out_dim, K=in_dim) side. Bias and activation are fused into the GEMM's
 // output-store stage (no separate bias-add / activation launches, no extra HBM
-// round-trips over Y).
+// round-trips over Y). Dispatches FP16 / BF16 on the operand dtype — kept under
+// the historical `_fp16` op name (ABI), but BF16 storage is fully supported.
 namespace {
 void linear_forward_batched_fp16_impl(const ::brotensor::Tensor& W,
                                       const ::brotensor::Tensor* bias,
                                       const ::brotensor::Tensor& X_BD,
                                       int act,
                                       ::brotensor::Tensor& Y_BD) {
-    if (W.dtype != Dtype::FP16 || X_BD.dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_fp16: W and X must be FP16");
+    const Dtype dt = X_BD.dtype;
+    if ((dt != Dtype::FP16 && dt != Dtype::BF16) || W.dtype != dt) {
+        throw std::runtime_error(
+            "linear_forward_batched_fp16: W and X must both be FP16 or both BF16");
     }
-    if (bias && bias->dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_fp16: bias must be FP16");
+    if (bias && bias->dtype != dt) {
+        throw std::runtime_error(
+            "linear_forward_batched_fp16: bias dtype must match X/W");
     }
     const int B       = X_BD.rows;
     const int in_dim  = X_BD.cols;
@@ -208,19 +212,27 @@ void linear_forward_batched_fp16_impl(const ::brotensor::Tensor& W,
     if (W.cols != in_dim) {
         throw std::runtime_error("linear_forward_batched_fp16: shape mismatch (W.cols != X.cols)");
     }
-    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
-        Y_BD.resize(B, out_dim, Dtype::FP16);
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != dt) {
+        Y_BD.resize(B, out_dim, dt);
     }
     if (B == 0 || out_dim == 0) return;
 
-    const __half* biasptr = (bias && bias->size() > 0)
-                                ? static_cast<const __half*>(bias->data)
-                                : nullptr;
-    fp16_internal::launch_matmul_ABT_act(
-        static_cast<const __half*>(X_BD.data),
-        static_cast<const __half*>(W.data),
-        static_cast<__half*>(Y_BD.data),
-        B, out_dim, in_dim, biasptr, act);
+    const bool has_bias = bias && bias->size() > 0;
+    if (dt == Dtype::FP16) {
+        fp16_internal::launch_matmul_ABT_act(
+            static_cast<const __half*>(X_BD.data),
+            static_cast<const __half*>(W.data),
+            static_cast<__half*>(Y_BD.data),
+            B, out_dim, in_dim,
+            has_bias ? static_cast<const __half*>(bias->data) : nullptr, act);
+    } else {  // BF16
+        fp16_internal::launch_matmul_ABT_act(
+            static_cast<const __nv_bfloat16*>(X_BD.data),
+            static_cast<const __nv_bfloat16*>(W.data),
+            static_cast<__nv_bfloat16*>(Y_BD.data),
+            B, out_dim, in_dim,
+            has_bias ? static_cast<const __nv_bfloat16*>(bias->data) : nullptr, act);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 } // namespace

@@ -41,8 +41,10 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
                              Tensor& dW, Tensor& dB);
 
 
-// FP16 batched linear forward, inference-only. Like linear_forward_batched but
-// FP16 storage throughout.
+// 16-bit batched linear forward, inference-only. Like linear_forward_batched but
+// FP16 *or* BF16 storage throughout — W, X, bias and the produced Y all share
+// the operand dtype (FP16 or BF16); the op dispatches internally. (Kept under
+// the historical `_fp16` name for ABI; BF16 is fully supported.)
 //   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
                                  const Tensor& X_BD, Tensor& Y_BD);
@@ -61,9 +63,10 @@ enum LinearActivation {
     kLinearActQuickGelu = 5,
 };
 
-// As linear_forward_batched_fp16, but fuses bias + activation `act` (a
-// LinearActivation value) into the matmul's output-store stage — no separate
-// bias-add or activation launch, and no extra HBM round-trips over Y.
+// As linear_forward_batched_fp16 (FP16 or BF16 storage), but fuses bias +
+// activation `act` (a LinearActivation value) into the matmul's output-store
+// stage — no separate bias-add or activation launch, and no extra HBM
+// round-trips over Y.
 //   W: (out,in).  bias: (out,1) or null.  X_BD: (B,in).  Y_BD: (B,out) resized.
 void linear_forward_batched_fp16_act(const Tensor& W, const Tensor* bias,
                                      const Tensor& X_BD, int act, Tensor& Y_BD);

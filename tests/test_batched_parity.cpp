@@ -217,6 +217,77 @@ BT_PARITY_TEST(linear_bwd_batched_bf16_B3_7_5)  { run_linear_backward_batched_bf
 BT_PARITY_TEST(linear_bwd_batched_bf16_B8_32_16){ run_linear_backward_batched_bf16(8,  32, 16, 0xBF02ull); }
 BT_PARITY_TEST(linear_bwd_batched_bf16_B16_64_32){ run_linear_backward_batched_bf16(16, 64, 32, 0xBF03ull); }
 
+// ─── linear_forward_batched_fp16 / _act, BF16 storage ──────────────────────
+//
+// Exercises the WMMA BF16 forward GEMM (fp16_internal::launch_matmul_ABT, BF16
+// overload) and its float-staged store epilogue, including the fused
+// bias + activation path. Y = X @ W^T (+ bias) (+ act).
+
+static float ref_linear_act(int act, float v) {
+    switch (act) {
+        case 1:  return v > 0.0f ? v : 0.0f;                                  // relu
+        case 2: { const float k = 0.7978845608f;                             // gelu(tanh)
+                  const float u = k * (v + 0.044715f * v * v * v);
+                  return 0.5f * v * (1.0f + std::tanh(u)); }
+        case 3:  return 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752440f)); // gelu(exact)
+        case 4:  return v / (1.0f + std::exp(-v));                            // silu
+        case 5:  return v / (1.0f + std::exp(-1.702f * v));                   // quick_gelu
+        default: return v;
+    }
+}
+
+static void run_linear_forward_batched_bf16(int B, int in_dim, int out_dim,
+                                            bool with_bias, int act,
+                                            uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor W_f32 = Tensor::mat(out_dim, in_dim);
+    Tensor X_f32 = Tensor::mat(B, in_dim);
+    Tensor b_f32 = Tensor::vec(out_dim);
+    fill_random(W_f32, rng);
+    fill_random(X_f32, rng);
+    fill_random(b_f32, rng);
+
+    // CPU FP32 reference.
+    Tensor Y_ref = Tensor::mat(B, out_dim);
+    for (int b = 0; b < B; ++b)
+        for (int i = 0; i < out_dim; ++i) {
+            float a = with_bias ? b_f32[i] : 0.0f;
+            for (int k = 0; k < in_dim; ++k)
+                a += X_f32[static_cast<size_t>(b)*in_dim+k] *
+                     W_f32[static_cast<size_t>(i)*in_dim+k];
+            Y_ref[static_cast<size_t>(b)*out_dim+i] = ref_linear_act(act, a);
+        }
+
+    // BF16 GPU run.
+    Tensor gW = to_bf16_gpu(W_f32);
+    Tensor gX = to_bf16_gpu(X_f32);
+    Tensor gb = to_bf16_gpu(b_f32);
+    Tensor gY;
+    const Tensor* biasp = with_bias ? &gb : nullptr;
+    if (act == 0)
+        brotensor::linear_forward_batched_fp16(gW, biasp, gX, gY);
+    else
+        brotensor::linear_forward_batched_fp16_act(gW, biasp, gX, act, gY);
+    BT_CHECK(gY.dtype == Dtype::BF16);
+    BT_CHECK(gY.rows == B);
+    BT_CHECK(gY.cols == out_dim);
+
+    Tensor Y_gpu = bf16_host_to_f32(download_to_host(gY));
+    const char* label = with_bias ? "linear_fwd_batched_bf16"
+                                  : "linear_fwd_batched_bf16_nobias";
+    compare_tensors(Y_ref, Y_gpu, label, 3e-2f, 3e-2f);
+}
+
+// Plain forward (bias + no-bias), both the WMMA path (B,N,K multiples of 8) and
+// the naive fallback (skinny / unaligned).
+BT_PARITY_TEST(linear_fwd_batched_bf16_B8_32_16)  { run_linear_forward_batched_bf16(8,  32, 16, true,  0, 0xBF11ull); }
+BT_PARITY_TEST(linear_fwd_batched_bf16_B64_128_96){ run_linear_forward_batched_bf16(64, 128, 96, true,  0, 0xBF12ull); }
+BT_PARITY_TEST(linear_fwd_batched_bf16_nobias)    { run_linear_forward_batched_bf16(16, 64, 32, false, 0, 0xBF13ull); }
+BT_PARITY_TEST(linear_fwd_batched_bf16_skinny)    { run_linear_forward_batched_bf16(8,  7,  5,  true,  0, 0xBF14ull); }
+// Fused activation epilogue over the float-staged BF16 store.
+BT_PARITY_TEST(linear_fwd_batched_bf16_silu)      { run_linear_forward_batched_bf16(32, 64, 64, true,  4, 0xBF15ull); }
+BT_PARITY_TEST(linear_fwd_batched_bf16_gelu)      { run_linear_forward_batched_bf16(32, 64, 64, true,  2, 0xBF16ull); }
+
 // ─── linear_forward_batched large-B (grid.y > 65535) ──────────────────────
 //
 // Regression for the Kokoro CUDA error 9: linear_forward_batched mapped the
