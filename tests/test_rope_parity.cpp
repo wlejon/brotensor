@@ -8,11 +8,24 @@
 #include <brotensor/ops.h>
 #include <brotensor/tensor.h>
 
+#include <cstring>
+
 using namespace bt_parity;
 using brotensor::Tensor;
 using brotensor::Device;
 
 namespace {
+
+// Round an FP32 host tensor to FP16 and place it on the GPU backend.
+Tensor to_fp16_gpu(const Tensor& f32cpu) {
+    Tensor h = Tensor::zeros_on(Device::CPU, f32cpu.rows, f32cpu.cols,
+                                brotensor::Dtype::FP16);
+    const float* s = f32cpu.host_f32();
+    uint16_t* d = h.host_fp16_mut();
+    for (int i = 0; i < f32cpu.size(); ++i)
+        d[i] = brotensor::fp32_to_fp16_bits(s[i]);
+    return h.to(gpu_device());
+}
 
 void run_fwd(int L, int num_heads, int head_dim, int seq_offset,
              float theta_base, uint64_t seed) {
@@ -136,6 +149,53 @@ void run_apply_fwd_bf16(int L, int num_heads, int head_dim, int seq_offset,
                     "rope_apply_bf16_fwd", 3e-2f, 3e-2f);
 }
 
+// An offset *view* into a longer cos/sin table must produce byte-identical
+// output to a freshly-built table for the same positions — for both FP32 and
+// FP16 X. The AR-decode hot path (Qwen3-TTS Code Predictor) feeds rope_apply a
+// view(rope_cos.data + pos_start*half, ...) rather than rebuilding the table
+// per step; this confirms there is no "viewed-table edge" in the FP16 rope
+// kernel. The kernel reads cos_tbl[row*half+i] from whatever float* it is
+// handed and the tables are FP32 on every dtype path, so the view at
+// data + pos_start*half carries the same angles as a fresh build for
+// [pos_start, pos_start+n) — the outputs must match bit-for-bit.
+void run_apply_view_parity(int n, int num_heads, int head_dim, int pos_start,
+                           int P, float theta_base, uint64_t seed) {
+    BT_CHECK(pos_start + n <= P);
+    const int half = head_dim / 2;
+    SplitMix64 rng(seed);
+    Tensor X = Tensor::mat(n, num_heads * head_dim);
+    fill_random(X, rng);
+
+    Tensor longC, longS, freshC, freshS;
+    build_rope_tables(P, head_dim, 0,         theta_base, longC,  longS);
+    build_rope_tables(n, head_dim, pos_start, theta_base, freshC, freshS);
+
+    Tensor gLongC  = longC.to(gpu_device());
+    Tensor gLongS  = longS.to(gpu_device());
+    Tensor gFreshC = freshC.to(gpu_device());
+    Tensor gFreshS = freshS.to(gpu_device());
+    Tensor vC = Tensor::view(gpu_device(),
+        static_cast<float*>(gLongC.data) + static_cast<size_t>(pos_start) * half,
+        n, half, brotensor::Dtype::FP32);
+    Tensor vS = Tensor::view(gpu_device(),
+        static_cast<float*>(gLongS.data) + static_cast<size_t>(pos_start) * half,
+        n, half, brotensor::Dtype::FP32);
+
+    auto run_pair = [&](const Tensor& gX) {
+        Tensor Yfresh, Yview;
+        brotensor::rope_apply(gX, gFreshC, gFreshS, head_dim, num_heads, Yfresh);
+        brotensor::rope_apply(gX, vC,      vS,      head_dim, num_heads, Yview);
+        brotensor::sync_all();
+        Tensor hf = Yfresh.to(Device::CPU);
+        Tensor hv = Yview.to(Device::CPU);
+        BT_CHECK(hf.bytes() == hv.bytes());
+        BT_CHECK(std::memcmp(hf.host_raw(), hv.host_raw(), hf.bytes()) == 0);
+    };
+
+    run_pair(X.to(gpu_device()));  // FP32 X
+    run_pair(to_fp16_gpu(X));      // FP16 X — the case flagged for the CP
+}
+
 } // namespace
 
 // ─── forward ───────────────────────────────────────────────────────────────
@@ -160,5 +220,10 @@ BT_PARITY_TEST(rope_apply_bwd_4h)     { run_apply_bwd(12, 4, 8, 0, 10000.0f, 0x6
 BT_PARITY_TEST(rope_apply_bwd_offset) { run_apply_bwd(6, 2, 16, 37, 10000.0f, 0x6031ull); }
 BT_PARITY_TEST(rope_apply_bf16_1h)    { run_apply_fwd_bf16(8, 1, 16, 0, 10000.0f, 0x6040ull); }
 BT_PARITY_TEST(rope_apply_bf16_4h)    { run_apply_fwd_bf16(12, 4, 8, 5, 10000.0f, 0x6041ull); }
+
+// ─── offset-view vs fresh-table parity (Code Predictor decode path) ─────────
+BT_PARITY_TEST(rope_apply_view_decode)  { run_apply_view_parity(1, 4, 64, 3, 16, 1000000.0f, 0x6050ull); }
+BT_PARITY_TEST(rope_apply_view_prefill) { run_apply_view_parity(2, 2, 128, 1, 16, 1000000.0f, 0x6051ull); }
+BT_PARITY_TEST(rope_apply_view_mid)     { run_apply_view_parity(3, 3, 64, 5, 16, 10000.0f, 0x6052ull); }
 
 int main() { return run_all("rope cpu/gpu parity"); }
