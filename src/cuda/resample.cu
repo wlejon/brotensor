@@ -9,6 +9,11 @@
 
 #include "detail/cuda_check.h"
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor {
 
 namespace {
@@ -327,17 +332,17 @@ void upsample_nearest_2x(const ::brotensor::Tensor& X,
     const int total = N * cols;
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
-        upsample_nearest_2x_kernel<__half><<<grid_for(total), RS_BLOCK>>>(
+        upsample_nearest_2x_kernel<__half><<<grid_for(total), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             N, C, H, W, H_out, W_out, total);
     } else if (X.dtype == Dtype::BF16) {
-        upsample_nearest_2x_kernel<__nv_bfloat16><<<grid_for(total), RS_BLOCK>>>(
+        upsample_nearest_2x_kernel<__nv_bfloat16><<<grid_for(total), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
             N, C, H, W, H_out, W_out, total);
     } else {
-        upsample_nearest_2x_kernel<float><<<grid_for(total), RS_BLOCK>>>(
+        upsample_nearest_2x_kernel<float><<<grid_for(total), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(Y.data),
             N, C, H, W, H_out, W_out, total);
@@ -357,17 +362,17 @@ void upsample_bilinear_2x(const ::brotensor::Tensor& X,
     const int total = N * cols;
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
-        upsample_bilinear_2x_kernel<__half><<<grid_for(total), RS_BLOCK>>>(
+        upsample_bilinear_2x_kernel<__half><<<grid_for(total), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             N, C, H, W, H_out, W_out, total);
     } else if (X.dtype == Dtype::BF16) {
-        upsample_bilinear_2x_kernel<__nv_bfloat16><<<grid_for(total), RS_BLOCK>>>(
+        upsample_bilinear_2x_kernel<__nv_bfloat16><<<grid_for(total), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
             N, C, H, W, H_out, W_out, total);
     } else {
-        upsample_bilinear_2x_kernel<float><<<grid_for(total), RS_BLOCK>>>(
+        upsample_bilinear_2x_kernel<float><<<grid_for(total), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(Y.data),
             N, C, H, W, H_out, W_out, total);
@@ -390,17 +395,17 @@ void downsample_avg_2x(const ::brotensor::Tensor& X,
     const int total = N * cols;
     if (total == 0) return;
     if (X.dtype == Dtype::FP16) {
-        downsample_avg_2x_kernel<__half><<<grid_for(total), RS_BLOCK>>>(
+        downsample_avg_2x_kernel<__half><<<grid_for(total), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             N, C, H, W, H_out, W_out, total);
     } else if (X.dtype == Dtype::BF16) {
-        downsample_avg_2x_kernel<__nv_bfloat16><<<grid_for(total), RS_BLOCK>>>(
+        downsample_avg_2x_kernel<__nv_bfloat16><<<grid_for(total), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<__nv_bfloat16*>(Y.data),
             N, C, H, W, H_out, W_out, total);
     } else {
-        downsample_avg_2x_kernel<float><<<grid_for(total), RS_BLOCK>>>(
+        downsample_avg_2x_kernel<float><<<grid_for(total), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(Y.data),
             N, C, H, W, H_out, W_out, total);
@@ -422,17 +427,17 @@ void upsample_nearest_2x_backward(const ::brotensor::Tensor& dY,
     const int total_in = N * cols_in;
     if (total_in == 0) return;
     if (dY.dtype == Dtype::FP16) {
-        upsample_nearest_2x_backward_kernel<__half><<<grid_for(total_in), RS_BLOCK>>>(
+        upsample_nearest_2x_backward_kernel<__half><<<grid_for(total_in), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
             N, C, H, W, H_out, W_out, total_in);
     } else if (dY.dtype == Dtype::BF16) {
-        upsample_nearest_2x_backward_kernel<__nv_bfloat16><<<grid_for(total_in), RS_BLOCK>>>(
+        upsample_nearest_2x_backward_kernel<__nv_bfloat16><<<grid_for(total_in), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data),
             N, C, H, W, H_out, W_out, total_in);
     } else {
-        upsample_nearest_2x_backward_kernel<float><<<grid_for(total_in), RS_BLOCK>>>(
+        upsample_nearest_2x_backward_kernel<float><<<grid_for(total_in), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data),
             N, C, H, W, H_out, W_out, total_in);
@@ -456,8 +461,8 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
 
     if (dY.dtype == Dtype::FP32) {
         // Zero dX, then atomic-scatter directly.
-        BROTENSOR_CUDA_CHECK(cudaMemset(dX.data, 0, total_in * sizeof(float)));
-        upsample_bilinear_2x_backward_scatter_fp32<<<grid_for(total_out), RS_BLOCK>>>(
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(dX.data, 0, total_in * sizeof(float), cur_stream()));
+        upsample_bilinear_2x_backward_scatter_fp32<<<grid_for(total_out), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data),
             N, C, H, W, H_out, W_out, total_out);
@@ -467,12 +472,12 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
         float* d_scratch = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
                                         total_in * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMemset(d_scratch, 0, total_in * sizeof(float)));
-        upsample_bilinear_2x_backward_scatter_fp16<<<grid_for(total_out), RS_BLOCK>>>(
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_scratch, 0, total_in * sizeof(float), cur_stream()));
+        upsample_bilinear_2x_backward_scatter_fp16<<<grid_for(total_out), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(dY.data),
             d_scratch, N, C, H, W, H_out, W_out, total_out);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        copy_fp32_to_fp16<<<grid_for(total_in), RS_BLOCK>>>(
+        copy_fp32_to_fp16<<<grid_for(total_in), RS_BLOCK, 0, cur_stream()>>>(
             d_scratch, static_cast<__half*>(dX.data), total_in);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_scratch);
@@ -481,12 +486,12 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
         float* d_scratch = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
                                         total_in * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMemset(d_scratch, 0, total_in * sizeof(float)));
-        upsample_bilinear_2x_backward_scatter_bf16<<<grid_for(total_out), RS_BLOCK>>>(
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_scratch, 0, total_in * sizeof(float), cur_stream()));
+        upsample_bilinear_2x_backward_scatter_bf16<<<grid_for(total_out), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(dY.data),
             d_scratch, N, C, H, W, H_out, W_out, total_out);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        copy_fp32_to_bf16<<<grid_for(total_in), RS_BLOCK>>>(
+        copy_fp32_to_bf16<<<grid_for(total_in), RS_BLOCK, 0, cur_stream()>>>(
             d_scratch, static_cast<__nv_bfloat16*>(dX.data), total_in);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_scratch);
@@ -508,17 +513,17 @@ void downsample_avg_2x_backward(const ::brotensor::Tensor& dY,
     const int total_in = N * cols_in;
     if (total_in == 0) return;
     if (dY.dtype == Dtype::FP16) {
-        downsample_avg_2x_backward_kernel<__half><<<grid_for(total_in), RS_BLOCK>>>(
+        downsample_avg_2x_backward_kernel<__half><<<grid_for(total_in), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
             N, C, H, W, H_out, W_out, total_in);
     } else if (dY.dtype == Dtype::BF16) {
-        downsample_avg_2x_backward_kernel<__nv_bfloat16><<<grid_for(total_in), RS_BLOCK>>>(
+        downsample_avg_2x_backward_kernel<__nv_bfloat16><<<grid_for(total_in), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(dY.data),
             static_cast<__nv_bfloat16*>(dX.data),
             N, C, H, W, H_out, W_out, total_in);
     } else {
-        downsample_avg_2x_backward_kernel<float><<<grid_for(total_in), RS_BLOCK>>>(
+        downsample_avg_2x_backward_kernel<float><<<grid_for(total_in), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data),
             N, C, H, W, H_out, W_out, total_in);

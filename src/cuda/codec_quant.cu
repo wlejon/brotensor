@@ -22,6 +22,11 @@
 #include <string>
 #include <vector>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -151,7 +156,7 @@ void vq_encode_forward(const ::brotensor::Tensor& x,
         quantized.resize(N, D, ::brotensor::Dtype::FP32);
     }
     if (N == 0) return;
-    vq_encode_forward_kernel<<<cq_grid(N), CQ_BLOCK>>>(
+    vq_encode_forward_kernel<<<cq_grid(N), CQ_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data),
         static_cast<const float*>(codebook.data),
         N, D, K,
@@ -169,7 +174,7 @@ void vq_encode_backward(const ::brotensor::Tensor& dQuantized,
     }
     const long long total = dQuantized.size();
     if (total == 0) return;
-    ste_copy_kernel<<<cq_grid(total), CQ_BLOCK>>>(
+    ste_copy_kernel<<<cq_grid(total), CQ_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dQuantized.data),
         static_cast<float*>(dX.data), total);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -199,15 +204,17 @@ void fsq_quantize_forward(const ::brotensor::Tensor& x,
     // Validate level counts (every L_d >= 2) — copy the small levels vector to
     // the host, matching the CPU op's up-front check.
     std::vector<int32_t> host_levels(static_cast<size_t>(D));
-    BROTENSOR_CUDA_CHECK(cudaMemcpy(
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(
         host_levels.data(), levels.data,
-        static_cast<size_t>(D) * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        static_cast<size_t>(D) * sizeof(int32_t), cudaMemcpyDeviceToHost,
+        cur_stream()));
+    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
     for (int d = 0; d < D; ++d) {
         if (host_levels[d] < 2) {
             fail("fsq_quantize_forward", "every level count must be >= 2");
         }
     }
-    fsq_quantize_forward_kernel<<<cq_grid(N), CQ_BLOCK>>>(
+    fsq_quantize_forward_kernel<<<cq_grid(N), CQ_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data),
         static_cast<const int32_t*>(levels.data),
         N, D,
@@ -225,7 +232,7 @@ void fsq_quantize_backward(const ::brotensor::Tensor& dQuantized,
     }
     const long long total = dQuantized.size();
     if (total == 0) return;
-    ste_copy_kernel<<<cq_grid(total), CQ_BLOCK>>>(
+    ste_copy_kernel<<<cq_grid(total), CQ_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dQuantized.data),
         static_cast<float*>(dX.data), total);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());

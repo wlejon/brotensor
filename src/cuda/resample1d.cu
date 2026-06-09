@@ -25,6 +25,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -148,7 +153,7 @@ void resample1d_forward(const ::brotensor::Tensor& X,
     const double scale = static_cast<double>(L_in) /
                          static_cast<double>(L_out);
     const long long total = (long long)N * C * L_out;
-    resample1d_forward_kernel<<<rs_grid(total), RS_BLOCK>>>(
+    resample1d_forward_kernel<<<rs_grid(total), RS_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(X.data), static_cast<float*>(Y.data),
         N, C, L_in, L_out, mode, scale);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -166,14 +171,14 @@ void resample1d_backward(const ::brotensor::Tensor& dY,
     }
     if (N == 0 || cols_in == 0) return;
     // Adjoint: zero dX, then scatter each output gradient onto its taps.
-    BROTENSOR_CUDA_CHECK(cudaMemset(
+    BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
         dX.data, 0,
-        static_cast<size_t>(N) * cols_in * sizeof(float)));
+        static_cast<size_t>(N) * cols_in * sizeof(float), cur_stream()));
     if (L_out == 0) return;
     const double scale = static_cast<double>(L_in) /
                          static_cast<double>(L_out);
     const long long total = (long long)N * C * L_out;
-    resample1d_backward_kernel<<<rs_grid(total), RS_BLOCK>>>(
+    resample1d_backward_kernel<<<rs_grid(total), RS_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dY.data), static_cast<float*>(dX.data),
         N, C, L_in, L_out, mode, scale);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());

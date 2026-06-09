@@ -17,6 +17,13 @@
 #include <mma.h>
 #include <cstdint>
 
+#include "detail/cuda_check.h"
+
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda::q8_0_wmma_internal {
 
 using namespace nvcuda;
@@ -308,8 +315,10 @@ extern "C" unsigned long long brotensor_q8_0_wmma_calls_consume() {
     unsigned long long h_val = 0;
     unsigned long long* d_buf = nullptr;
     if (cudaMalloc(&d_buf, sizeof(unsigned long long)) != cudaSuccess) return 0;
-    q8_0_wmma_read_counter_kernel<<<1, 1>>>(d_buf, /*reset=*/1);
-    cudaMemcpy(&h_val, d_buf, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    q8_0_wmma_read_counter_kernel<<<1, 1, 0, cur_stream()>>>(d_buf, /*reset=*/1);
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(&h_val, d_buf, sizeof(unsigned long long),
+                                         cudaMemcpyDeviceToHost, cur_stream()));
+    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
     cudaFree(d_buf);
     return h_val;
 }

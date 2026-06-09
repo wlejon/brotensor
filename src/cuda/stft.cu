@@ -29,6 +29,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -334,7 +339,7 @@ void stft(const ::brotensor::Tensor& signal, const ::brotensor::Tensor& window,
                             ? 1.0 / std::sqrt(static_cast<double>(n_fft))
                             : 1.0;
     const long long total = (long long)N * g.frames * g.bins;
-    stft_kernel<<<stft_grid(total), STFT_BLOCK>>>(
+    stft_kernel<<<stft_grid(total), STFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(signal.data),
         static_cast<const float*>(window.data),
         static_cast<float*>(spec.data),
@@ -366,16 +371,16 @@ void stft_backward(const ::brotensor::Tensor& dSpec,
         dSignal.resize(N, signal_len, ::brotensor::Dtype::FP32);
     }
     if (dSignal.size() != 0) {
-        BROTENSOR_CUDA_CHECK(cudaMemset(
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
             dSignal.data, 0,
-            static_cast<size_t>(dSignal.size()) * sizeof(float)));
+            static_cast<size_t>(dSignal.size()) * sizeof(float), cur_stream()));
     }
     if (exp_rows == 0) return;
     const double norm = normalized
                             ? 1.0 / std::sqrt(static_cast<double>(n_fft))
                             : 1.0;
     const long long total = (long long)N * g.frames * win_length;
-    stft_backward_kernel<<<stft_grid(total), STFT_BLOCK>>>(
+    stft_backward_kernel<<<stft_grid(total), STFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dSpec.data),
         static_cast<const float*>(window.data),
         static_cast<float*>(dSignal.data),
@@ -412,13 +417,13 @@ void istft(const ::brotensor::Tensor& spec, const ::brotensor::Tensor& window,
     float* env = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(
         &env, static_cast<size_t>(g.padded_len) * sizeof(float)));
-    cola_env_kernel<<<stft_grid(g.padded_len), STFT_BLOCK>>>(
+    cola_env_kernel<<<stft_grid(g.padded_len), STFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(window.data), env,
         g.padded_len, n_fft, hop_length, win_length, g.pad_lo, g.frames);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     const long long total = (long long)N * signal_len;
-    istft_kernel<<<stft_grid(total), STFT_BLOCK>>>(
+    istft_kernel<<<stft_grid(total), STFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(spec.data),
         static_cast<const float*>(window.data), env,
         static_cast<float*>(signal.data),
@@ -458,13 +463,13 @@ void istft_backward(const ::brotensor::Tensor& dSignal,
     float* env = nullptr;
     BROTENSOR_CUDA_CHECK(cudaMalloc(
         &env, static_cast<size_t>(g.padded_len) * sizeof(float)));
-    cola_env_kernel<<<stft_grid(g.padded_len), STFT_BLOCK>>>(
+    cola_env_kernel<<<stft_grid(g.padded_len), STFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(window.data), env,
         g.padded_len, n_fft, hop_length, win_length, g.pad_lo, g.frames);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     const long long total = (long long)N * g.frames * g.bins;
-    istft_backward_kernel<<<stft_grid(total), STFT_BLOCK>>>(
+    istft_backward_kernel<<<stft_grid(total), STFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dSignal.data),
         static_cast<const float*>(window.data), env,
         static_cast<float*>(dSpec.data),

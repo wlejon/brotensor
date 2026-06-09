@@ -14,6 +14,11 @@
 #include <mma.h>
 #include <cstdint>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor {
 namespace detail {
 namespace cuda {
@@ -234,7 +239,7 @@ bool launch_linear_int8w_fp16_wmma(
 
     dim3 block(THREADS_PER_CTA);
     dim3 grid((M + BN - 1) / BN, (B + BM - 1) / BM);
-    linear_int8w_fp16_wmma_kernel<<<grid, block>>>(
+    linear_int8w_fp16_wmma_kernel<<<grid, block, 0, cur_stream()>>>(
         X, W, scales, bias, Y, B, M, K);
     return true;
 }

@@ -10,6 +10,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor {
 namespace detail::cuda {
 
@@ -160,21 +165,21 @@ void linear_forward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& b,
 
     const int blocks = (out_dim + LF_BLOCK - 1) / LF_BLOCK;
     if (W.dtype == Dtype::FP16) {
-        linear_forward_kernel<__half><<<blocks, LF_BLOCK>>>(
+        linear_forward_kernel<__half><<<blocks, LF_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(W.data),
             static_cast<const __half*>(b.data),
             static_cast<const __half*>(x.data),
             static_cast<__half*>(y.data),
             out_dim, in_dim);
     } else if (W.dtype == Dtype::BF16) {
-        linear_forward_kernel<__nv_bfloat16><<<blocks, LF_BLOCK>>>(
+        linear_forward_kernel<__nv_bfloat16><<<blocks, LF_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(W.data),
             static_cast<const __nv_bfloat16*>(b.data),
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<__nv_bfloat16*>(y.data),
             out_dim, in_dim);
     } else {
-        linear_forward_kernel<float><<<blocks, LF_BLOCK>>>(
+        linear_forward_kernel<float><<<blocks, LF_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(W.data),
             static_cast<const float*>(b.data),
             static_cast<const float*>(x.data),
@@ -272,19 +277,19 @@ void linear_backward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& x,
     if (in_dim > 0) {
         const int blocks = (in_dim + LB_DX_BLOCK - 1) / LB_DX_BLOCK;
         if (W.dtype == Dtype::FP16) {
-            linear_backward_dx_kernel<__half><<<blocks, LB_DX_BLOCK>>>(
+            linear_backward_dx_kernel<__half><<<blocks, LB_DX_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __half*>(W.data),
                 static_cast<const __half*>(dY.data),
                 static_cast<__half*>(dX.data),
                 out_dim, in_dim);
         } else if (W.dtype == Dtype::BF16) {
-            linear_backward_dx_kernel<__nv_bfloat16><<<blocks, LB_DX_BLOCK>>>(
+            linear_backward_dx_kernel<__nv_bfloat16><<<blocks, LB_DX_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __nv_bfloat16*>(W.data),
                 static_cast<const __nv_bfloat16*>(dY.data),
                 static_cast<__nv_bfloat16*>(dX.data),
                 out_dim, in_dim);
         } else {
-            linear_backward_dx_kernel<float><<<blocks, LB_DX_BLOCK>>>(
+            linear_backward_dx_kernel<float><<<blocks, LB_DX_BLOCK, 0, cur_stream()>>>(
                 static_cast<const float*>(W.data),
                 static_cast<const float*>(dY.data),
                 static_cast<float*>(dX.data),
@@ -297,19 +302,19 @@ void linear_backward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& x,
         dim3 block(16, 16);
         dim3 grid((in_dim + 15) / 16, (out_dim + 15) / 16);
         if (W.dtype == Dtype::FP16) {
-            linear_backward_dw_kernel<__half><<<grid, block>>>(
+            linear_backward_dw_kernel<__half><<<grid, block, 0, cur_stream()>>>(
                 static_cast<const __half*>(dY.data),
                 static_cast<const __half*>(x.data),
                 static_cast<__half*>(dW.data),
                 out_dim, in_dim);
         } else if (W.dtype == Dtype::BF16) {
-            linear_backward_dw_kernel<__nv_bfloat16><<<grid, block>>>(
+            linear_backward_dw_kernel<__nv_bfloat16><<<grid, block, 0, cur_stream()>>>(
                 static_cast<const __nv_bfloat16*>(dY.data),
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<__nv_bfloat16*>(dW.data),
                 out_dim, in_dim);
         } else {
-            linear_backward_dw_kernel<float><<<grid, block>>>(
+            linear_backward_dw_kernel<float><<<grid, block, 0, cur_stream()>>>(
                 static_cast<const float*>(dY.data),
                 static_cast<const float*>(x.data),
                 static_cast<float*>(dW.data),
@@ -321,15 +326,15 @@ void linear_backward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& x,
     if (out_dim > 0) {
         const int blocks = (out_dim + 255) / 256;
         if (W.dtype == Dtype::FP16) {
-            linear_backward_db_kernel<__half><<<blocks, 256>>>(
+            linear_backward_db_kernel<__half><<<blocks, 256, 0, cur_stream()>>>(
                 static_cast<const __half*>(dY.data),
                 static_cast<__half*>(dB.data), out_dim);
         } else if (W.dtype == Dtype::BF16) {
-            linear_backward_db_kernel<__nv_bfloat16><<<blocks, 256>>>(
+            linear_backward_db_kernel<__nv_bfloat16><<<blocks, 256, 0, cur_stream()>>>(
                 static_cast<const __nv_bfloat16*>(dY.data),
                 static_cast<__nv_bfloat16*>(dB.data), out_dim);
         } else {
-            linear_backward_db_kernel<float><<<blocks, 256>>>(
+            linear_backward_db_kernel<float><<<blocks, 256, 0, cur_stream()>>>(
                 static_cast<const float*>(dY.data),
                 static_cast<float*>(dB.data), out_dim);
         }

@@ -34,6 +34,11 @@
 #include <stdexcept>
 #include <string>
 
+namespace brotensor { void* cuda_current_stream(); }
+static inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
+
 namespace brotensor::detail::cuda {
 
 namespace {
@@ -318,7 +323,7 @@ void complex_mul(const ::brotensor::Tensor& a, const ::brotensor::Tensor& b,
         y.resize(a.rows, a.cols, ::brotensor::Dtype::FP32);
     const long long pairs = static_cast<long long>(a.size()) / 2;
     if (pairs == 0) return;
-    complex_mul_kernel<<<fft_grid(pairs), FFT_BLOCK>>>(
+    complex_mul_kernel<<<fft_grid(pairs), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(a.data), static_cast<const float*>(b.data),
         pairs, static_cast<float*>(y.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -347,7 +352,7 @@ void complex_mul_backward(const ::brotensor::Tensor& a,
     }
     const long long pairs = static_cast<long long>(a.size()) / 2;
     if (pairs == 0) return;
-    complex_mul_backward_kernel<<<fft_grid(pairs), FFT_BLOCK>>>(
+    complex_mul_backward_kernel<<<fft_grid(pairs), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(a.data), static_cast<const float*>(b.data),
         static_cast<const float*>(dY.data),
         pairs, static_cast<float*>(dA.data), static_cast<float*>(dB.data));
@@ -365,7 +370,7 @@ void complex_abs(const ::brotensor::Tensor& z, ::brotensor::Tensor& y) {
         y.resize(z.rows, C, ::brotensor::Dtype::FP32);
     const long long bins = static_cast<long long>(z.rows) * C;
     if (bins == 0) return;
-    complex_abs_kernel<<<fft_grid(bins), FFT_BLOCK>>>(
+    complex_abs_kernel<<<fft_grid(bins), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(z.data), bins, static_cast<float*>(y.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -388,7 +393,7 @@ void complex_abs_backward(const ::brotensor::Tensor& z,
         dZ.resize(z.rows, z.cols, ::brotensor::Dtype::FP32);
     const long long bins = static_cast<long long>(z.rows) * C;
     if (bins == 0) return;
-    complex_abs_backward_kernel<<<fft_grid(bins), FFT_BLOCK>>>(
+    complex_abs_backward_kernel<<<fft_grid(bins), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(z.data), static_cast<const float*>(dY.data),
         bins, static_cast<float*>(dZ.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -405,7 +410,7 @@ void complex_angle(const ::brotensor::Tensor& z, ::brotensor::Tensor& y) {
         y.resize(z.rows, C, ::brotensor::Dtype::FP32);
     const long long bins = static_cast<long long>(z.rows) * C;
     if (bins == 0) return;
-    complex_angle_kernel<<<fft_grid(bins), FFT_BLOCK>>>(
+    complex_angle_kernel<<<fft_grid(bins), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(z.data), bins, static_cast<float*>(y.data));
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -424,7 +429,7 @@ void complex_from_polar(const ::brotensor::Tensor& mag,
         y.resize(mag.rows, 2 * C, ::brotensor::Dtype::FP32);
     const long long bins = static_cast<long long>(mag.rows) * C;
     if (bins == 0) return;
-    complex_from_polar_kernel<<<fft_grid(bins), FFT_BLOCK>>>(
+    complex_from_polar_kernel<<<fft_grid(bins), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(mag.data),
         static_cast<const float*>(phase.data),
         bins, static_cast<float*>(y.data));
@@ -443,7 +448,7 @@ void fft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
         y.resize(x.rows, x.cols, ::brotensor::Dtype::FP32);
     if (x.size() == 0) return;
     const int N = x.cols / 2;
-    dft_complex_kernel<<<fft_grid((long long)x.rows * N), FFT_BLOCK>>>(
+    dft_complex_kernel<<<fft_grid((long long)x.rows * N), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data), static_cast<float*>(y.data),
         x.rows, N, -1.0, 1.0);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -458,7 +463,7 @@ void ifft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     if (x.size() == 0) return;
     const int N = x.cols / 2;
     const double inv = (N > 0) ? 1.0 / static_cast<double>(N) : 1.0;
-    dft_complex_kernel<<<fft_grid((long long)x.rows * N), FFT_BLOCK>>>(
+    dft_complex_kernel<<<fft_grid((long long)x.rows * N), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data), static_cast<float*>(y.data),
         x.rows, N, +1.0, inv);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -473,7 +478,7 @@ void rfft(const ::brotensor::Tensor& x, ::brotensor::Tensor& y) {
     if (y.rows != x.rows || y.cols != 2 * C || y.dtype != ::brotensor::Dtype::FP32)
         y.resize(x.rows, 2 * C, ::brotensor::Dtype::FP32);
     if (x.size() == 0) return;
-    rfft_kernel<<<fft_grid((long long)x.rows * C), FFT_BLOCK>>>(
+    rfft_kernel<<<fft_grid((long long)x.rows * C), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data), static_cast<float*>(y.data),
         x.rows, L, C);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -491,7 +496,7 @@ void irfft(const ::brotensor::Tensor& x, int L, ::brotensor::Tensor& y) {
     if (y.rows != x.rows || y.cols != L || y.dtype != ::brotensor::Dtype::FP32)
         y.resize(x.rows, L, ::brotensor::Dtype::FP32);
     if (x.size() == 0) return;
-    irfft_kernel<<<fft_grid((long long)x.rows * L), FFT_BLOCK>>>(
+    irfft_kernel<<<fft_grid((long long)x.rows * L), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(x.data), static_cast<float*>(y.data),
         x.rows, L, C);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -510,7 +515,7 @@ void rfft_backward(const ::brotensor::Tensor& dY, int L,
     if (dX.rows != dY.rows || dX.cols != L || dX.dtype != ::brotensor::Dtype::FP32)
         dX.resize(dY.rows, L, ::brotensor::Dtype::FP32);
     if (dY.size() == 0) return;
-    rfft_backward_kernel<<<fft_grid((long long)dY.rows * L), FFT_BLOCK>>>(
+    rfft_backward_kernel<<<fft_grid((long long)dY.rows * L), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dY.data), static_cast<float*>(dX.data),
         dY.rows, L, C);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -525,7 +530,7 @@ void irfft_backward(const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX) {
     if (dX.rows != dY.rows || dX.cols != 2 * C || dX.dtype != ::brotensor::Dtype::FP32)
         dX.resize(dY.rows, 2 * C, ::brotensor::Dtype::FP32);
     if (dY.size() == 0) return;
-    irfft_backward_kernel<<<fft_grid((long long)dY.rows * C), FFT_BLOCK>>>(
+    irfft_backward_kernel<<<fft_grid((long long)dY.rows * C), FFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(dY.data), static_cast<float*>(dX.data),
         dY.rows, L, C);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
