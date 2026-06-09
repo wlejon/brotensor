@@ -12,11 +12,19 @@
 
 #include <stdexcept>
 
+namespace brotensor { void* cuda_current_stream(); }
+
 namespace brotensor::detail::cuda {
 
 namespace {
 
 constexpr int RMS_BLOCK = 256;
+
+// Current CUDA stream for hot-op launches — so kernels join a non-default
+// capture/replay stream instead of silently landing on the default stream.
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 __device__ inline float block_sum(float v, float* sdata) {
     const int tid = threadIdx.x;
@@ -283,19 +291,19 @@ void rms_norm_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& g
     const int block = RMS_BLOCK;
     const size_t shmem = block * sizeof(float);
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        rms_forward_fp16_kernel<<<B, block, shmem>>>(
+        rms_forward_fp16_kernel<<<B, block, shmem, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(gamma.data),
             static_cast<__half*>(Y.data),
             B, D, eps);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        rms_forward_bf16_kernel<<<B, block, shmem>>>(
+        rms_forward_bf16_kernel<<<B, block, shmem, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<const __nv_bfloat16*>(gamma.data),
             static_cast<__nv_bfloat16*>(Y.data),
             B, D, eps);
     } else {
-        rms_forward_fp32_kernel<<<B, block, shmem>>>(
+        rms_forward_fp32_kernel<<<B, block, shmem, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<const float*>(gamma.data),
             static_cast<float*>(Y.data), B, D, eps);
@@ -325,7 +333,7 @@ void rms_norm_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& 
     const int block = RMS_BLOCK;
     const size_t shmem = block * sizeof(float);
     if (X.dtype == ::brotensor::Dtype::FP32) {
-        rms_backward_fp32_kernel<<<B, block, shmem>>>(
+        rms_backward_fp32_kernel<<<B, block, shmem, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<const float*>(gamma.data),
             static_cast<const float*>(dY.data),
@@ -337,8 +345,8 @@ void rms_norm_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& 
         float* d_dg = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg),
                                         D * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dg, 0, D * sizeof(float)));
-        rms_backward_bf16_kernel<<<B, block, shmem>>>(
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dg, 0, D * sizeof(float), cur_stream()));
+        rms_backward_bf16_kernel<<<B, block, shmem, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data),
             static_cast<const __nv_bfloat16*>(gamma.data),
             static_cast<const __nv_bfloat16*>(dY.data),
@@ -346,7 +354,7 @@ void rms_norm_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& 
             d_dg, B, D, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         const int blocks = (D + 255) / 256;
-        rms_fp32_into_bf16_kernel<<<blocks, 256>>>(
+        rms_fp32_into_bf16_kernel<<<blocks, 256, 0, cur_stream()>>>(
             d_dg, static_cast<__nv_bfloat16*>(dGamma.data), D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_dg);
@@ -354,8 +362,8 @@ void rms_norm_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& 
         float* d_dg = nullptr;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg),
                                         D * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dg, 0, D * sizeof(float)));
-        rms_backward_fp16_kernel<<<B, block, shmem>>>(
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dg, 0, D * sizeof(float), cur_stream()));
+        rms_backward_fp16_kernel<<<B, block, shmem, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<const __half*>(gamma.data),
             static_cast<const __half*>(dY.data),
@@ -363,7 +371,7 @@ void rms_norm_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& 
             d_dg, B, D, eps);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         const int blocks = (D + 255) / 256;
-        rms_fp32_into_fp16_kernel<<<blocks, 256>>>(
+        rms_fp32_into_fp16_kernel<<<blocks, 256, 0, cur_stream()>>>(
             d_dg, static_cast<__half*>(dGamma.data), D);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
         cudaFree(d_dg);

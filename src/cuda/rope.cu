@@ -13,11 +13,18 @@
 #include <string>
 
 namespace brotensor {
+void* cuda_current_stream();
 namespace detail::cuda {
 
 namespace {
 
 constexpr int RP_BLOCK = 256;
+
+// Current CUDA stream for hot-op launches — so kernels join a non-default
+// capture/replay stream instead of silently landing on the default stream.
+inline cudaStream_t cur_stream() {
+    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+}
 
 __device__ inline float rope_theta(int pair_i, int head_dim, float base) {
     // theta_i = base^{-2i/head_dim} = exp(-2i/hd * log(base))
@@ -240,12 +247,12 @@ void rope_forward(const ::brotensor::Tensor& X, int head_dim, int num_heads,
     if (total == 0) return;
     const int blocks = grid_for(total);
     if (X.dtype == Dtype::FP16) {
-        rope_forward_fp16_kernel<<<blocks, RP_BLOCK>>>(
+        rope_forward_fp16_kernel<<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data),
             static_cast<__half*>(Y.data),
             L, num_heads, head_dim, seq_offset, theta_base);
     } else {
-        rope_forward_fp32_kernel<<<blocks, RP_BLOCK>>>(
+        rope_forward_fp32_kernel<<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
             static_cast<float*>(Y.data),
             L, num_heads, head_dim, seq_offset, theta_base);
@@ -272,12 +279,12 @@ void rope_backward(const ::brotensor::Tensor& dY, int head_dim, int num_heads,
     if (total == 0) return;
     const int blocks = grid_for(total);
     if (dY.dtype == Dtype::FP16) {
-        rope_backward_fp16_kernel<<<blocks, RP_BLOCK>>>(
+        rope_backward_fp16_kernel<<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(dY.data),
             static_cast<__half*>(dX.data),
             L, num_heads, head_dim, seq_offset, theta_base);
     } else {
-        rope_backward_fp32_kernel<<<blocks, RP_BLOCK>>>(
+        rope_backward_fp32_kernel<<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data),
             static_cast<float*>(dX.data),
             L, num_heads, head_dim, seq_offset, theta_base);
@@ -331,17 +338,17 @@ void rope_apply(const ::brotensor::Tensor& X, const ::brotensor::Tensor& cos_tbl
     const float* sin_p = static_cast<const float*>(sin_tbl.data);
     switch (X.dtype) {
     case Dtype::FP32:
-        rope_apply_fwd_kernel<float><<<blocks, RP_BLOCK>>>(
+        rope_apply_fwd_kernel<float><<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), cos_p, sin_p,
             static_cast<float*>(Y.data), L, num_heads, head_dim);
         break;
     case Dtype::FP16:
-        rope_apply_fwd_kernel<__half><<<blocks, RP_BLOCK>>>(
+        rope_apply_fwd_kernel<__half><<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), cos_p, sin_p,
             static_cast<__half*>(Y.data), L, num_heads, head_dim);
         break;
     default:  // BF16
-        rope_apply_fwd_kernel<__nv_bfloat16><<<blocks, RP_BLOCK>>>(
+        rope_apply_fwd_kernel<__nv_bfloat16><<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), cos_p, sin_p,
             static_cast<__nv_bfloat16*>(Y.data), L, num_heads, head_dim);
         break;
@@ -384,17 +391,17 @@ void rope_apply_perhead(const ::brotensor::Tensor& X,
     const float* sin_p = static_cast<const float*>(sin_tbl.data);
     switch (X.dtype) {
     case Dtype::FP32:
-        rope_apply_perhead_fwd_kernel<float><<<blocks, RP_BLOCK>>>(
+        rope_apply_perhead_fwd_kernel<float><<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), cos_p, sin_p,
             static_cast<float*>(Y.data), L, num_heads, head_dim);
         break;
     case Dtype::FP16:
-        rope_apply_perhead_fwd_kernel<__half><<<blocks, RP_BLOCK>>>(
+        rope_apply_perhead_fwd_kernel<__half><<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), cos_p, sin_p,
             static_cast<__half*>(Y.data), L, num_heads, head_dim);
         break;
     default:  // BF16
-        rope_apply_perhead_fwd_kernel<__nv_bfloat16><<<blocks, RP_BLOCK>>>(
+        rope_apply_perhead_fwd_kernel<__nv_bfloat16><<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), cos_p, sin_p,
             static_cast<__nv_bfloat16*>(Y.data), L, num_heads, head_dim);
         break;
@@ -431,17 +438,17 @@ void rope_apply_backward(const ::brotensor::Tensor& dY,
     const float* sin_p = static_cast<const float*>(sin_tbl.data);
     switch (dY.dtype) {
     case Dtype::FP32:
-        rope_apply_bwd_kernel<float><<<blocks, RP_BLOCK>>>(
+        rope_apply_bwd_kernel<float><<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(dY.data), cos_p, sin_p,
             static_cast<float*>(dX.data), L, num_heads, head_dim);
         break;
     case Dtype::FP16:
-        rope_apply_bwd_kernel<__half><<<blocks, RP_BLOCK>>>(
+        rope_apply_bwd_kernel<__half><<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(dY.data), cos_p, sin_p,
             static_cast<__half*>(dX.data), L, num_heads, head_dim);
         break;
     default:  // BF16
-        rope_apply_bwd_kernel<__nv_bfloat16><<<blocks, RP_BLOCK>>>(
+        rope_apply_bwd_kernel<__nv_bfloat16><<<blocks, RP_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(dY.data), cos_p, sin_p,
             static_cast<__nv_bfloat16*>(dX.data), L, num_heads, head_dim);
         break;
