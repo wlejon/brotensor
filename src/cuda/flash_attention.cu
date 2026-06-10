@@ -2357,6 +2357,16 @@ __global__ void flash_attention_windowed_kernel(
         }
         const float tile_sum = red[0];
 
+        // Fully-masked tile (every key below the window or masked off): the
+        // running max is unchanged, every score is an exact 0, and step 5
+        // would multiply V by it — a provable no-op. Skip it so a fixed-
+        // capacity masked cache (rows >= valid length masked off) costs
+        // O(valid), not O(capacity), per query.
+        if (tile_sum == 0.0f && tile_max <= -1e29f) {
+            __syncthreads();
+            continue;
+        }
+
         // 4. Rescale.
         float alpha;
         if (run_max <= -1e29f) {
