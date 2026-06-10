@@ -483,6 +483,18 @@ void copy_d2d(const Tensor& src, int src_off, Tensor& dst, int dst_off, int n) {
     v.copy_d2d(src, src_off, dst, dst_off, n);
 }
 
+void copy_d2d_strided(const Tensor& src, int src_off, int src_pitch,
+                      Tensor& dst, int dst_off, int dst_pitch,
+                      int width, int height) {
+    if (width > src_pitch || width > dst_pitch) {
+        throw std::runtime_error("brotensor: copy_d2d_strided: width exceeds pitch");
+    }
+    const auto& v = detail::dispatch(src, dst);
+    if (!v.copy_d2d_strided) detail::throw_not_implemented("copy_d2d_strided", src.device);
+    detail::adopt_output(dst, src.device);
+    v.copy_d2d_strided(src, src_off, src_pitch, dst, dst_off, dst_pitch, width, height);
+}
+
 void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
     const auto& v = detail::dispatch(src, dst);
     if (!v.cast) detail::throw_not_implemented("cast", src.device);

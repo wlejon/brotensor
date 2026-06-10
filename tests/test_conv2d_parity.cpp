@@ -272,6 +272,10 @@ const ConvCfg kDilated {1, 3, 11, 11, 4, 3, 3,  1,1, 2,2, 2,2, 1};
 const ConvCfg kGrouped {2, 8, 6, 6,   8, 3, 3,  1,1, 1,1, 1,1, 4};
 const ConvCfg kDepthw  {1, 6, 7, 7,   6, 3, 3,  1,1, 1,1, 1,1, 6};
 const ConvCfg kAsym    {1, 4, 7, 9,   5, 3, 2,  2,1, 1,0, 1,1, 1};
+// 128*64*9 = 73728 weight elements ≥ 65536: exercises the thread-per-element
+// backward-weight path now that the small-grid configs above take the
+// block-per-element kernel.
+const ConvCfg kBigW    {1, 64, 6, 6,  128, 3, 3,  1,1, 1,1, 1,1, 1};
 
 } // namespace
 
@@ -301,6 +305,7 @@ BT_PARITY_TEST(conv2d_bwd_weight_s2)      { run_bwd_weight(k3x3_s2,   0x6022ull)
 BT_PARITY_TEST(conv2d_bwd_weight_dilated) { run_bwd_weight(kDilated,  0x6023ull); }
 BT_PARITY_TEST(conv2d_bwd_weight_grouped) { run_bwd_weight(kGrouped,  0x6024ull); }
 BT_PARITY_TEST(conv2d_bwd_weight_depthw)  { run_bwd_weight(kDepthw,   0x6025ull); }
+BT_PARITY_TEST(conv2d_bwd_weight_biggrid) { run_bwd_weight(kBigW,     0x6026ull); }
 
 // ─── backward bias (accumulate) ────────────────────────────────────────────
 BT_PARITY_TEST(conv2d_bwd_bias_small)  { run_bwd_bias(2, 8, 4, 4, 0x6030ull); }

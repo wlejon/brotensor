@@ -119,6 +119,9 @@ void build_slot_mask(const ::brotensor::Tensor& x, int offset, int K, int stride
                      ::brotensor::Tensor& mask);
 void copy_d2d(const ::brotensor::Tensor& src, int src_off,
               ::brotensor::Tensor& dst, int dst_off, int n);
+void copy_d2d_strided(const ::brotensor::Tensor& src, int src_off, int src_pitch,
+                      ::brotensor::Tensor& dst, int dst_off, int dst_pitch,
+                      int width, int height);
 void add_inplace_batched(::brotensor::Tensor& Y_BD,
                          const ::brotensor::Tensor& X_BD);
 void linear_forward_batched(const ::brotensor::Tensor& W,
@@ -1098,6 +1101,7 @@ struct CpuStaticRegistrar {
         ops.masked_mean_pool_backward = &detail::cpu::masked_mean_pool_backward;
         ops.build_slot_mask           = &detail::cpu::build_slot_mask;
         ops.copy_d2d                  = &detail::cpu::copy_d2d;
+        ops.copy_d2d_strided          = &detail::cpu::copy_d2d_strided;
 
         // ── CHUNK 1 ──
         ops.clamp                      = &detail::cpu::clamp;

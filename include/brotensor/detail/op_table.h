@@ -98,6 +98,8 @@
     X(concat_nchw_channels_backward,           void,  (const ::brotensor::Tensor& dY, int N, int H, int W,                                                              \
                                                        const std::vector<int>& C_per_part, const std::vector<::brotensor::Tensor*>& parts))                             \
     X(copy_d2d,                                void,  (const ::brotensor::Tensor& src, int src_off, ::brotensor::Tensor& dst, int dst_off, int n))                      \
+    X(copy_d2d_strided,                        void,  (const ::brotensor::Tensor& src, int src_off, int src_pitch,                                                      \
+                                                       ::brotensor::Tensor& dst, int dst_off, int dst_pitch, int width, int height))                                    \
     X(cast,                                    void,  (const ::brotensor::Tensor& src, ::brotensor::Tensor& dst, ::brotensor::Dtype out_dtype))                        \
     /* ─── Inference batched + optim ─── */                                                                                                                             \
     X(layernorm_forward_inference_batched,     void,  (const ::brotensor::Tensor& X_RD, const ::brotensor::Tensor& gamma, const ::brotensor::Tensor& beta,              \

@@ -61,4 +61,16 @@ void copy_d2d(const Tensor& src, int src_off,
               Tensor& dst,       int dst_off,
               int n);
 
+
+// Strided device-to-device row-block copy: copies `height` rows of `width`
+// floats; row r reads src.data + src_off + r*src_pitch and writes
+// dst.data + dst_off + r*dst_pitch (offsets/pitches in elements, pitch >=
+// width). Both tensors treated as flat float buffers regardless of (rows,
+// cols). One call replaces a host loop of `height` copy_d2d calls — e.g.
+// padding/unpadding the W dim of an NCHW activation across all (n, c, h)
+// rows. Async on the default stream.
+void copy_d2d_strided(const Tensor& src, int src_off, int src_pitch,
+                      Tensor& dst,       int dst_off, int dst_pitch,
+                      int width, int height);
+
 }  // namespace brotensor

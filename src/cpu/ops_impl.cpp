@@ -1386,6 +1386,18 @@ void copy_d2d(const ::brotensor::Tensor& src, int src_off,
     std::memcpy(dp + dst_off, sp + src_off, static_cast<std::size_t>(n) * sizeof(float));
 }
 
+void copy_d2d_strided(const ::brotensor::Tensor& src, int src_off, int src_pitch,
+                      ::brotensor::Tensor& dst, int dst_off, int dst_pitch,
+                      int width, int height) {
+    const float* sp = src.host_f32() + src_off;
+    float* dp = dst.host_f32_mut() + dst_off;
+    for (int r = 0; r < height; ++r) {
+        std::memcpy(dp + static_cast<std::size_t>(r) * dst_pitch,
+                    sp + static_cast<std::size_t>(r) * src_pitch,
+                    static_cast<std::size_t>(width) * sizeof(float));
+    }
+}
+
 void masked_mean_pool_forward(const ::brotensor::Tensor& X, const float* d_mask,
                               ::brotensor::Tensor& y) {
     const int K = X.rows;

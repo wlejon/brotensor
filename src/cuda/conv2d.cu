@@ -183,9 +183,74 @@ __global__ void conv2d_backward_input_kernel(
     store_f32<T>(&dX[idx], acc);
 }
 
+// One BLOCK per (c_out, c_in, kh, kw) element of dWt. Threads stride over
+// the M = N*H_out*W_out reduction domain and a shared-memory tree reduce
+// folds the partials; thread 0 writes the FP32 scratch slot. No atomics.
+// This is the small-weight-grid path: for depthwise / pointwise convs the
+// element count is only hundreds-to-thousands, so the thread-per-element
+// kernel below would put the whole N*spatial reduction in a serial loop on
+// a tiny fraction of the GPU (and its time scales linearly with N).
+template <typename T>
+__global__ void conv2d_backward_weight_block_kernel(
+        const T* __restrict__ X,
+        const T* __restrict__ dY,
+        float* __restrict__ dWt_scratch,    // FP32, size C_out*Cg_in*kH*kW
+        int N, int C_in, int H, int W,
+        int C_out, int kH, int kW,
+        int H_out, int W_out,
+        int stride_h, int stride_w,
+        int pad_h, int pad_w,
+        int dil_h, int dil_w,
+        int groups, int Cg_in, int Cg_out) {
+    const int idx = blockIdx.x;   // weight element
+    const int tid = threadIdx.x;
+
+    // Unflatten idx → (c_out, c_in_local, kh, kw) in OIHW layout
+    // (I-dim sized as Cg_in for grouped conv).
+    const int kw = idx % kW;
+    int t = idx / kW;
+    const int kh = t % kH;
+    t /= kH;
+    const int c_in_local = t % Cg_in;
+    const int c_out      = t / Cg_in;
+
+    // Absolute input channel for this (c_out, c_in_local).
+    const int g = c_out / Cg_out;
+    const int c_in = g * Cg_in + c_in_local;
+
+    const int spatial = H_out * W_out;
+    const int M = N * spatial;
+
+    float acc = 0.0f;
+    for (int m = tid; m < M; m += blockDim.x) {
+        const int n  = m / spatial;
+        const int sp = m - n * spatial;
+        const int i_out = sp / W_out;
+        const int j_out = sp - i_out * W_out;
+        const int in_h = i_out * stride_h - pad_h + kh * dil_h;
+        if (in_h < 0 || in_h >= H) continue;
+        const int in_w = j_out * stride_w - pad_w + kw * dil_w;
+        if (in_w < 0 || in_w >= W) continue;
+        const int x_idx  = ((n * C_in  + c_in)  * H     + in_h)  * W     + in_w;
+        const int dy_idx = ((n * C_out + c_out) * H_out + i_out) * W_out + j_out;
+        acc += load_f32<T>(&dY[dy_idx]) * load_f32<T>(&X[x_idx]);
+    }
+
+    __shared__ float s_acc[CONV_BLOCK];
+    s_acc[tid] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_acc[tid] += s_acc[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) dWt_scratch[idx] = s_acc[0];
+}
+
 // One thread per (c_out, c_in, kh, kw) element of dWt. Iterates (n, i_out,
 // j_out) and accumulates into an FP32 scratch slot. No atomics. The FP32
 // scratch is folded into the caller's dWt (storage-dtype-dispatched).
+// Kept as the large-weight-grid path: with ≳64K elements the grid already
+// fills the GPU and the per-thread loop is short.
 template <typename T>
 __global__ void conv2d_backward_weight_kernel(
         const T* __restrict__ X,
@@ -507,31 +572,63 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
     float* d_scratch = static_cast<float*>(cuda_alloc(total * sizeof(float)));
 
-    const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
-    if (X.dtype == Dtype::FP16) {
-        conv2d_backward_weight_kernel<__half><<<blocks, CONV_BLOCK, 0, stream>>>(
-            static_cast<const __half*>(X.data),
-            static_cast<const __half*>(dY.data),
-            d_scratch,
-            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-            groups, Cg_in, Cg_out, total);
-    } else if (X.dtype == Dtype::BF16) {
-        conv2d_backward_weight_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(X.data),
-            static_cast<const __nv_bfloat16*>(dY.data),
-            d_scratch,
-            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-            groups, Cg_in, Cg_out, total);
+    // Small weight grids (depthwise / pointwise / small-channel convs) can't
+    // fill the GPU with one thread per element — use one block per element
+    // with the reduction parallelized across threads instead.
+    const bool block_per_element = total < 65536;
+    if (block_per_element) {
+        if (X.dtype == Dtype::FP16) {
+            conv2d_backward_weight_block_kernel<__half><<<total, CONV_BLOCK, 0, stream>>>(
+                static_cast<const __half*>(X.data),
+                static_cast<const __half*>(dY.data),
+                d_scratch,
+                N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+                stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                groups, Cg_in, Cg_out);
+        } else if (X.dtype == Dtype::BF16) {
+            conv2d_backward_weight_block_kernel<__nv_bfloat16><<<total, CONV_BLOCK, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(X.data),
+                static_cast<const __nv_bfloat16*>(dY.data),
+                d_scratch,
+                N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+                stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                groups, Cg_in, Cg_out);
+        } else {
+            conv2d_backward_weight_block_kernel<float><<<total, CONV_BLOCK, 0, stream>>>(
+                static_cast<const float*>(X.data),
+                static_cast<const float*>(dY.data),
+                d_scratch,
+                N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+                stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                groups, Cg_in, Cg_out);
+        }
     } else {
-        conv2d_backward_weight_kernel<float><<<blocks, CONV_BLOCK, 0, stream>>>(
-            static_cast<const float*>(X.data),
-            static_cast<const float*>(dY.data),
-            d_scratch,
-            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-            groups, Cg_in, Cg_out, total);
+        const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
+        if (X.dtype == Dtype::FP16) {
+            conv2d_backward_weight_kernel<__half><<<blocks, CONV_BLOCK, 0, stream>>>(
+                static_cast<const __half*>(X.data),
+                static_cast<const __half*>(dY.data),
+                d_scratch,
+                N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+                stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                groups, Cg_in, Cg_out, total);
+        } else if (X.dtype == Dtype::BF16) {
+            conv2d_backward_weight_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(X.data),
+                static_cast<const __nv_bfloat16*>(dY.data),
+                d_scratch,
+                N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+                stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                groups, Cg_in, Cg_out, total);
+        } else {
+            conv2d_backward_weight_kernel<float><<<blocks, CONV_BLOCK, 0, stream>>>(
+                static_cast<const float*>(X.data),
+                static_cast<const float*>(dY.data),
+                d_scratch,
+                N, C_in, H, W, C_out, kH, kW, H_out, W_out,
+                stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                groups, Cg_in, Cg_out, total);
+        }
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 

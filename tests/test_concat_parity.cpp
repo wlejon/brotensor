@@ -122,7 +122,47 @@ void run_concat_bf16(const std::vector<int>& sizes, uint64_t seed) {
     }
 }
 
+// copy_d2d_strided: CPU op and GPU op against a host-loop oracle. Copies
+// `height` rows of `width` floats between buffers with differing pitches
+// (the pad/unpad-W use case); pre-filled destination lanes outside the
+// copied window must survive.
+void run_copy_strided(int width, int height, int src_pitch, int dst_pitch,
+                      int src_off, int dst_off, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int src_n = src_off + src_pitch * height;
+    const int dst_n = dst_off + dst_pitch * height;
+    Tensor src  = Tensor::vec(src_n);
+    Tensor dst0 = Tensor::vec(dst_n);
+    fill_random(src, rng);
+    fill_random(dst0, rng);
+
+    Tensor ref = Tensor::vec(dst_n);
+    for (int i = 0; i < dst_n; ++i) ref[i] = dst0[i];
+    for (int r = 0; r < height; ++r)
+        for (int i = 0; i < width; ++i)
+            ref[dst_off + r * dst_pitch + i] = src[src_off + r * src_pitch + i];
+
+    Tensor cpu_dst = Tensor::vec(dst_n);
+    for (int i = 0; i < dst_n; ++i) cpu_dst[i] = dst0[i];
+    brotensor::copy_d2d_strided(src, src_off, src_pitch,
+                                cpu_dst, dst_off, dst_pitch, width, height);
+    compare_tensors(ref, cpu_dst, "copy_d2d_strided.cpu");
+
+    Tensor gsrc = src.to(gpu_device());
+    Tensor gdst = dst0.to(gpu_device());
+    brotensor::copy_d2d_strided(gsrc, src_off, src_pitch,
+                                gdst, dst_off, dst_pitch, width, height);
+    brotensor::sync_all();
+    Tensor gpu_dst = download_to_host(gdst);
+    compare_tensors(ref, gpu_dst, "copy_d2d_strided.gpu");
+}
+
 } // namespace
+
+BT_PARITY_TEST(copy_strided_pad_w)   { run_copy_strided(100, 37, 100, 104, 0, 4, 0x620ull); }
+BT_PARITY_TEST(copy_strided_unpad_w) { run_copy_strided(100, 37, 104, 100, 4, 0, 0x621ull); }
+BT_PARITY_TEST(copy_strided_offsets) { run_copy_strided(13, 9, 21, 17, 5, 3, 0x622ull); }
+BT_PARITY_TEST(copy_strided_one_row) { run_copy_strided(64, 1, 64, 64, 0, 0, 0x623ull); }
 
 BT_PARITY_TEST(concat_three_equal)   { run_concat({16, 16, 16}, 0x600ull); }
 BT_PARITY_TEST(concat_varying_sizes) { run_concat({4, 17, 33, 8}, 0x601ull); }

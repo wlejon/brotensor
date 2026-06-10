@@ -216,6 +216,22 @@ void copy_d2d(const Tensor& src, int src_off,
         cudaMemcpyDeviceToDevice, cur_stream()));
 }
 
+void copy_d2d_strided(const Tensor& src, int src_off, int src_pitch,
+                      Tensor& dst,       int dst_off, int dst_pitch,
+                      int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    const size_t elem = static_cast<size_t>(dtype_size_bytes(src.dtype));
+    const char* src_base = reinterpret_cast<const char*>(src.data)
+                         + static_cast<size_t>(src_off) * elem;
+    char*       dst_base = reinterpret_cast<char*>(dst.data)
+                         + static_cast<size_t>(dst_off) * elem;
+    BROTENSOR_CUDA_CHECK(cudaMemcpy2DAsync(
+        dst_base, static_cast<size_t>(dst_pitch) * elem,
+        src_base, static_cast<size_t>(src_pitch) * elem,
+        static_cast<size_t>(width) * elem, static_cast<size_t>(height),
+        cudaMemcpyDeviceToDevice, cur_stream()));
+}
+
 // ─── Forward declarations for the rest of the specialised cluster ──────────
 //
 // Defined in batched_ops.cu / loss.cu / embedding.cu / kv_cache.cu /
@@ -323,6 +339,7 @@ void fill_cuda_vtable_specialised(::brotensor::detail::OpsVTable& v) {
     v.concat_nchw_channels           = &concat_nchw_channels;
     v.concat_nchw_channels_backward  = &concat_nchw_channels_backward;
     v.copy_d2d                       = &copy_d2d;
+    v.copy_d2d_strided               = &copy_d2d_strided;
 
     // KV-cache + decode
     v.kv_cache_append          = &kv_cache_append;
