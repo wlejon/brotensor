@@ -29,6 +29,14 @@ template <> __device__ inline void g_store<float>(float* p, float v) { *p = v; }
 template <> __device__ inline void g_store<__half>(__half* p, float v) { *p = __float2half(v); }
 template <> __device__ inline void g_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
+// Paired-word loads for the GEMV kernel: x/y components of a T2 vector in FP32.
+__device__ inline float g_load2_x(float2 v) { return v.x; }
+__device__ inline float g_load2_y(float2 v) { return v.y; }
+__device__ inline float g_load2_x(__half2 v) { return __low2float(v); }
+__device__ inline float g_load2_y(__half2 v) { return __high2float(v); }
+__device__ inline float g_load2_x(__nv_bfloat162 v) { return __low2float(v); }
+__device__ inline float g_load2_y(__nv_bfloat162 v) { return __high2float(v); }
+
 // y[i] = b[i] + sum_j W[i, j] * x[j]
 // One thread per output row. Uses shared memory to cache tiles of x (in FP32).
 constexpr int LF_BLOCK = 128;
@@ -65,6 +73,46 @@ __global__ void linear_forward_kernel(const T* __restrict__ W,
     }
 
     if (row < out_dim) {
+        g_store<T>(&y[row], g_load<T>(&b[row]) + acc);
+    }
+}
+
+// GEMV fast path: one WARP per output row, lanes striding K with vector loads
+// (consecutive lanes -> consecutive words, fully coalesced), shuffle-reduced.
+// The thread-per-row kernel above issues 32 weight rows per warp — at any k its
+// lanes hit addresses in_dim*sizeof(T) apart, wasting ~31/32 of each memory
+// transaction; per-token decode (LSTM steps, AR decode heads) lives or dies on
+// this. Requires in_dim % 4 == 0 (FP32: float4; FP16/BF16: two T2 words per
+// lane-iteration) so every row stays 16-/8-byte aligned.
+template <typename T, typename T2>
+__global__ void linear_gemv_kernel(const T* __restrict__ W,
+                                   const T* __restrict__ b,
+                                   const T* __restrict__ x,
+                                   T* __restrict__ y,
+                                   int out_dim, int in_dim) {
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row  = blockIdx.x * (blockDim.x / 32) + warp;
+    if (row >= out_dim) return;
+
+    const T2* w2 = reinterpret_cast<const T2*>(W + static_cast<size_t>(row) * in_dim);
+    const T2* x2 = reinterpret_cast<const T2*>(x);
+    const int n2 = in_dim / 2;          // T2 words per row
+
+    float acc = 0.0f;
+    for (int k = 2 * lane; k < n2; k += 64) {   // two adjacent T2 words per lane
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const T2 wv = w2[k + i];
+            const T2 xv = x2[k + i];
+            acc += g_load2_x(wv) * g_load2_x(xv) + g_load2_y(wv) * g_load2_y(xv);
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
         g_store<T>(&y[row], g_load<T>(&b[row]) + acc);
     }
 }
@@ -162,6 +210,37 @@ void linear_forward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& b,
         y.resize(out_dim, 1, W.dtype);
     }
     if (out_dim == 0) return;
+
+    // Coalesced warp-per-row GEMV whenever rows stay vector-aligned; the tiled
+    // thread-per-row kernel remains for odd in_dim.
+    if (in_dim % 4 == 0 && in_dim > 0) {
+        constexpr int kWarps = 8;
+        const int gblocks = (out_dim + kWarps - 1) / kWarps;
+        if (W.dtype == Dtype::FP16) {
+            linear_gemv_kernel<__half, __half2><<<gblocks, kWarps * 32, 0, cur_stream()>>>(
+                static_cast<const __half*>(W.data),
+                static_cast<const __half*>(b.data),
+                static_cast<const __half*>(x.data),
+                static_cast<__half*>(y.data),
+                out_dim, in_dim);
+        } else if (W.dtype == Dtype::BF16) {
+            linear_gemv_kernel<__nv_bfloat16, __nv_bfloat162><<<gblocks, kWarps * 32, 0, cur_stream()>>>(
+                static_cast<const __nv_bfloat16*>(W.data),
+                static_cast<const __nv_bfloat16*>(b.data),
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<__nv_bfloat16*>(y.data),
+                out_dim, in_dim);
+        } else {
+            linear_gemv_kernel<float, float2><<<gblocks, kWarps * 32, 0, cur_stream()>>>(
+                static_cast<const float*>(W.data),
+                static_cast<const float*>(b.data),
+                static_cast<const float*>(x.data),
+                static_cast<float*>(y.data),
+                out_dim, in_dim);
+        }
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     const int blocks = (out_dim + LF_BLOCK - 1) / LF_BLOCK;
     if (W.dtype == Dtype::FP16) {

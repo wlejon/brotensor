@@ -65,6 +65,51 @@ __global__ void linear_forward_batched_kernel(const float* __restrict__ W,
     }
 }
 
+// GEMV fast path for skinny batches (B small — the autoregressive decode
+// regime, where every linear is (B<=2, in_dim) @ W^T). The tiled kernel above
+// puts one THREAD on each output row walking W serially, so at any k the warp's
+// 32 threads hit addresses in_dim*4 bytes apart — 4 useful bytes per 128-byte
+// transaction (~1/10 of DRAM bandwidth measured) and only out_dim threads of
+// parallelism. Here one WARP owns each output row: lanes stride the K dimension
+// with float4 loads (consecutive lanes -> consecutive 16-byte words, fully
+// coalesced), then a shuffle tree reduces the row. X rows are small and shared
+// across all warps, so they ride L2. Requires in_dim % 4 == 0 (every row then
+// stays 16-byte aligned); other shapes keep the tiled kernel.
+constexpr int GV_WARPS_PER_BLOCK = 8;
+constexpr int GV_BLOCK           = GV_WARPS_PER_BLOCK * 32;
+
+__global__ void linear_gemv_kernel(const float* __restrict__ W,
+                                   const float* __restrict__ bias,
+                                   const float* __restrict__ X,
+                                   float* __restrict__ Y,
+                                   int B, int out_dim, int in_dim) {
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row  = blockIdx.x * GV_WARPS_PER_BLOCK + warp;
+    const int b    = blockIdx.y;
+    if (row >= out_dim || b >= B) return;
+
+    const float4* w4 = reinterpret_cast<const float4*>(
+        W + static_cast<size_t>(row) * in_dim);
+    const float4* x4 = reinterpret_cast<const float4*>(
+        X + static_cast<size_t>(b) * in_dim);
+    const int in4 = in_dim >> 2;
+
+    float acc = 0.0f;
+    for (int k = lane; k < in4; k += 32) {
+        const float4 w = w4[k];
+        const float4 x = x4[k];
+        acc += w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        Y[static_cast<size_t>(b) * out_dim + row] = bias[row] + acc;
+    }
+}
+
 constexpr int EW_BLOCK = 256;
 
 constexpr int LBB_DX_BLOCK = 64;
@@ -223,12 +268,24 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
     }
     if (B == 0 || out_dim == 0) return;
 
-    dim3 block(BL_ROWS_PER_BLOCK, 1);
-    const int grid_x = (out_dim + BL_ROWS_PER_BLOCK - 1) / BL_ROWS_PER_BLOCK;
     const float* W_p    = static_cast<const float*>(W.data);
     const float* bias_p = static_cast<const float*>(bias.data);
     const float* X_p    = static_cast<const float*>(X_BD.data);
     float*       Y_p    = static_cast<float*>(Y_BD.data);
+
+    // Skinny batches take the warp-per-row GEMV (see linear_gemv_kernel); the
+    // tiled thread-per-row kernel remains for wide batches and odd in_dim.
+    if (B <= 32 && in_dim % 4 == 0 && in_dim > 0) {
+        const int grid_x = (out_dim + GV_WARPS_PER_BLOCK - 1) / GV_WARPS_PER_BLOCK;
+        dim3 grid(grid_x, B);
+        linear_gemv_kernel<<<grid, GV_BLOCK, 0, cur_stream()>>>(
+            W_p, bias_p, X_p, Y_p, B, out_dim, in_dim);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    dim3 block(BL_ROWS_PER_BLOCK, 1);
+    const int grid_x = (out_dim + BL_ROWS_PER_BLOCK - 1) / BL_ROWS_PER_BLOCK;
     for (int b0 = 0; b0 < B; b0 += LBB_MAX_GRID_Y) {
         const int b_chunk = (B - b0) < LBB_MAX_GRID_Y ? (B - b0) : LBB_MAX_GRID_Y;
         dim3 grid(grid_x, b_chunk);
