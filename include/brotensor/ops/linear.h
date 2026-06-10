@@ -25,6 +25,10 @@ void linear_backward(const Tensor& W, const Tensor& x,
 
 // Y[b,:] = W*X[b,:] + bias for b in [0,B).
 //   W: (out,in).  bias: (out,1).  X_BD: (B,in).  Y_BD: (B,out) resized.
+// W may be FP32, FP16 or BF16; bias/X/Y are FP32 and accumulation is FP32
+// regardless. 16-bit W halves the weight-read bandwidth — the floor of the
+// B<=2 autoregressive-decode regime — without touching the FP32 activation
+// stream. (For 16-bit activations too, see linear_forward_batched_fp16.)
 void linear_forward_batched(const Tensor& W, const Tensor& bias,
                             const Tensor& X_BD, Tensor& Y_BD);
 

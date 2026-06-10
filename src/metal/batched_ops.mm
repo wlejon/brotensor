@@ -36,6 +36,44 @@ kernel void k_linear_fw_batched(device const float* W    [[buffer(0)]],
     Y[b * out_dim + i] = bias[i] + acc;
 }
 
+// 16-bit-weight twins of k_linear_fw_batched: W stored half/bfloat, bias/X/Y
+// and accumulation float. Mirrors the CUDA 16-bit-weight path (batched_ops.cu).
+kernel void k_linear_fw_batched_hw(device const half* W    [[buffer(0)]],
+                                   device const float* bias [[buffer(1)]],
+                                   device const float* X    [[buffer(2)]],
+                                   device float*       Y    [[buffer(3)]],
+                                   constant uint& B         [[buffer(4)]],
+                                   constant uint& out_dim   [[buffer(5)]],
+                                   constant uint& in_dim    [[buffer(6)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    uint i = gid.x; // out
+    uint b = gid.y;
+    if (b >= B || i >= out_dim) return;
+    device const float* xrow = X + b * in_dim;
+    device const half*  wrow = W + i * in_dim;
+    float acc = 0.0f;
+    for (uint k = 0; k < in_dim; ++k) acc += float(wrow[k]) * xrow[k];
+    Y[b * out_dim + i] = bias[i] + acc;
+}
+
+kernel void k_linear_fw_batched_bw(device const bfloat* W   [[buffer(0)]],
+                                   device const float* bias [[buffer(1)]],
+                                   device const float* X    [[buffer(2)]],
+                                   device float*       Y    [[buffer(3)]],
+                                   constant uint& B         [[buffer(4)]],
+                                   constant uint& out_dim   [[buffer(5)]],
+                                   constant uint& in_dim    [[buffer(6)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    uint i = gid.x; // out
+    uint b = gid.y;
+    if (b >= B || i >= out_dim) return;
+    device const float*  xrow = X + b * in_dim;
+    device const bfloat* wrow = W + i * in_dim;
+    float acc = 0.0f;
+    for (uint k = 0; k < in_dim; ++k) acc += float(wrow[k]) * xrow[k];
+    Y[b * out_dim + i] = bias[i] + acc;
+}
+
 kernel void k_relu_fw_batched(device const float* x [[buffer(0)]],
                               device float*       y [[buffer(1)]],
                               constant uint& n      [[buffer(2)]],
@@ -287,6 +325,8 @@ kernel void k_lbb_add_fp32_into_bf16(device const float* src [[buffer(0)]],
         return pso; \
     }
 DEF_PSO(pso_lin_fw, @"k_linear_fw_batched")
+DEF_PSO(pso_lin_fw_hw, @"k_linear_fw_batched_hw")
+DEF_PSO(pso_lin_fw_bw, @"k_linear_fw_batched_bw")
 DEF_PSO(pso_relu_fw, @"k_relu_fw_batched")
 DEF_PSO(pso_tanh_fw, @"k_tanh_fw_batched")
 DEF_PSO(pso_add_ip, @"k_add_inplace_batched")
@@ -351,6 +391,10 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
     const int B       = X_BD.rows;
     if (Y_BD.rows != B || Y_BD.cols != out_dim) Y_BD.resize(B, out_dim);
     if (B == 0 || out_dim == 0) return;
+    id<MTLComputePipelineState> pso =
+        W.dtype == Dtype::FP16 ? pso_lin_fw_hw()
+        : W.dtype == Dtype::BF16 ? pso_lin_fw_bw()
+        : pso_lin_fw();
     id<MTLBuffer> bw = buffer_for(W);
     NSUInteger ow = buffer_offset_for(W);
     id<MTLBuffer> bb = buffer_for(bias);
@@ -362,7 +406,7 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
     const uint32_t Bu = static_cast<uint32_t>(B);
     const uint32_t Ou = static_cast<uint32_t>(out_dim);
     const uint32_t Iu = static_cast<uint32_t>(in_dim);
-    dispatch2d(pso_lin_fw(), out_dim, B, ^(id<MTLComputeCommandEncoder> enc) {
+    dispatch2d(pso, out_dim, B, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bw offset:ow atIndex:0];
         [enc setBuffer:bb offset:ob atIndex:1];
         [enc setBuffer:bx offset:ox atIndex:2];

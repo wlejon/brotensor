@@ -56,6 +56,56 @@ BT_PARITY_TEST(linear_batched_B4)   { run_linear_batched(4,  64, 32, 0xC2ull); }
 BT_PARITY_TEST(linear_batched_B64)  { run_linear_batched(64, 128, 96, 0xC3ull); }
 BT_PARITY_TEST(linear_batched_skinny) { run_linear_batched(8, 1, 7, 0xC4ull); }
 
+// ─── linear_forward_batched, 16-bit weights ────────────────────────────────
+//
+// W stored FP16/BF16 with FP32 activations and accumulation. Both backends
+// widen the identical 16-bit weight values to FP32 before the dot product, so
+// CPU vs GPU differ only by reduction order — the standard tolerance holds.
+
+static void run_linear_batched_w16(int B, int in_dim, int out_dim,
+                                   brotensor::Dtype wdt, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor W = Tensor::mat(out_dim, in_dim), b = Tensor::vec(out_dim);
+    fill_random(W, rng);
+    fill_random(b, rng);
+    Tensor X_BD = Tensor::mat(B, in_dim);
+    fill_random(X_BD, rng);
+
+    // Round W to the 16-bit storage dtype on the host.
+    Tensor W16 = Tensor::zeros_on(brotensor::Device::CPU, out_dim, in_dim, wdt);
+    {
+        const float* s = W.host_f32();
+        uint16_t* d = wdt == Dtype::BF16 ? W16.host_bf16_mut() : W16.host_fp16_mut();
+        for (int i = 0; i < W.size(); ++i)
+            d[i] = wdt == Dtype::BF16 ? brotensor::fp32_to_bf16_bits(s[i])
+                                      : brotensor::fp32_to_fp16_bits(s[i]);
+    }
+
+    // CPU reference: the CPU backend's own 16-bit-weight widening path.
+    Tensor Y_ref;
+    brotensor::linear_forward_batched(W16, b, X_BD, Y_ref);
+
+    // GPU op over the same 16-bit weights.
+    Tensor gW16 = W16.to(gpu_device()), gb = b.to(gpu_device()),
+           gX_BD = X_BD.to(gpu_device());
+    Tensor gY_BD;
+    brotensor::linear_forward_batched(gW16, gb, gX_BD, gY_BD);
+    Tensor Y_batched = download_to_host(gY_BD);
+    BT_CHECK(Y_batched.rows == B);
+    BT_CHECK(Y_batched.cols == out_dim);
+    compare_tensors(Y_ref, Y_batched, "linear_forward_batched_w16",
+                    1e-4f, 1e-4f);
+}
+
+// B<=32 even in_dim -> GEMV; in_dim%4!=0 exercises the T2 tail; odd in_dim
+// and B=64 take the tiled wide-batch kernel.
+BT_PARITY_TEST(linear_batched_bf16w_B1)   { run_linear_batched_w16(1, 512, 96, Dtype::BF16, 0xB161ull); }
+BT_PARITY_TEST(linear_batched_bf16w_B4_tail) { run_linear_batched_w16(4, 30, 17, Dtype::BF16, 0xB162ull); }
+BT_PARITY_TEST(linear_batched_bf16w_odd)  { run_linear_batched_w16(2, 33, 17, Dtype::BF16, 0xB163ull); }
+BT_PARITY_TEST(linear_batched_bf16w_B64)  { run_linear_batched_w16(64, 128, 96, Dtype::BF16, 0xB164ull); }
+BT_PARITY_TEST(linear_batched_fp16w_B1)   { run_linear_batched_w16(1, 512, 96, Dtype::FP16, 0xB165ull); }
+BT_PARITY_TEST(linear_batched_fp16w_B64)  { run_linear_batched_w16(64, 128, 96, Dtype::FP16, 0xB166ull); }
+
 // ─── relu_forward_batched ──────────────────────────────────────────────────
 
 static void run_relu_batched(int B, int D, uint64_t seed) {

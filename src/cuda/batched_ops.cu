@@ -129,6 +129,101 @@ template <> __device__ inline void lbb_store<float>(float* p, float v) { *p = v;
 template <> __device__ inline void lbb_store<__half>(__half* p, float v) { *p = __float2half(v); }
 template <> __device__ inline void lbb_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
+// 16-bit-weight twins of the two linear kernels above: W stored FP16/BF16,
+// bias/X/Y and accumulation FP32. Autoregressive decode is weight-bandwidth
+// bound at B<=2, so halving the weight bytes halves the per-step floor; the
+// activations stay FP32 so the surrounding graph (norms, attention, residual
+// stream) is untouched. Lanes load adjacent T2 words (consecutive 4-byte
+// words across the warp — fully coalesced); requires in_dim % 2 == 0, which
+// also keeps every weight row 4-byte aligned.
+template <typename T2> __device__ inline float lbb_lo2(T2 v);
+template <typename T2> __device__ inline float lbb_hi2(T2 v);
+template <> __device__ inline float lbb_lo2<__half2>(__half2 v) { return __low2float(v); }
+template <> __device__ inline float lbb_hi2<__half2>(__half2 v) { return __high2float(v); }
+template <> __device__ inline float lbb_lo2<__nv_bfloat162>(__nv_bfloat162 v) { return __low2float(v); }
+template <> __device__ inline float lbb_hi2<__nv_bfloat162>(__nv_bfloat162 v) { return __high2float(v); }
+
+template <typename WT, typename WT2>
+__global__ void linear_gemv_w16_kernel(const WT* __restrict__ W,
+                                       const float* __restrict__ bias,
+                                       const float* __restrict__ X,
+                                       float* __restrict__ Y,
+                                       int B, int out_dim, int in_dim) {
+    const int row = blockIdx.x;
+    const int b   = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const WT2* w2 = reinterpret_cast<const WT2*>(
+        W + static_cast<size_t>(row) * in_dim);
+    const float2* x2 = reinterpret_cast<const float2*>(
+        X + static_cast<size_t>(b) * in_dim);
+    const int in2 = in_dim >> 1;
+
+    float acc = 0.0f;
+    for (int k = 2 * tid; k < in2; k += 2 * GV_BLOCK) {  // two adjacent WT2 words
+        const WT2 w0   = w2[k];
+        const float2 x0 = x2[k];
+        acc += lbb_lo2(w0) * x0.x + lbb_hi2(w0) * x0.y;
+        const int k1 = k + 1;
+        if (k1 < in2) {
+            const WT2 w1   = w2[k1];
+            const float2 x1 = x2[k1];
+            acc += lbb_lo2(w1) * x1.x + lbb_hi2(w1) * x1.y;
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    __shared__ float red[GV_BLOCK / 32];
+    if ((tid & 31) == 0) red[tid >> 5] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float s = red[0];
+        #pragma unroll
+        for (int w = 1; w < GV_BLOCK / 32; ++w) s += red[w];
+        Y[static_cast<size_t>(b) * out_dim + row] = bias[row] + s;
+    }
+}
+
+template <typename WT>
+__global__ void linear_forward_batched_w16_kernel(const WT* __restrict__ W,
+                                                  const float* __restrict__ bias,
+                                                  const float* __restrict__ X,
+                                                  float* __restrict__ Y,
+                                                  int B, int out_dim, int in_dim) {
+    __shared__ float xtile[BL_TILE];
+
+    const int b   = blockIdx.y;
+    const int row = blockIdx.x * BL_ROWS_PER_BLOCK + threadIdx.x;
+    if (b >= B) return;
+
+    const float* x_row = X + static_cast<size_t>(b) * in_dim;
+    float acc = 0.0f;
+
+    for (int t0 = 0; t0 < in_dim; t0 += BL_TILE) {
+        const int t_len = (in_dim - t0) < BL_TILE ? (in_dim - t0) : BL_TILE;
+
+        for (int k = threadIdx.x; k < t_len; k += blockDim.x) {
+            xtile[k] = x_row[t0 + k];
+        }
+        __syncthreads();
+
+        if (row < out_dim) {
+            const WT* wrow = W + static_cast<size_t>(row) * in_dim + t0;
+            #pragma unroll 8
+            for (int k = 0; k < t_len; ++k) {
+                acc += lbb_load<WT>(&wrow[k]) * xtile[k];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row < out_dim) {
+        Y[static_cast<size_t>(b) * out_dim + row] = bias[row] + acc;
+    }
+}
+
 template <typename T>
 __global__ void relu_forward_batched_kernel(const T* __restrict__ x,
                                             T* __restrict__ y, int n) {
@@ -260,11 +355,12 @@ constexpr int LBB_MAX_GRID_Y = 65535;
 
 void linear_forward_batched(const Tensor& W, const Tensor& bias,
                             const Tensor& X_BD, Tensor& Y_BD) {
-    if (W.dtype != Dtype::FP32 || X_BD.dtype != Dtype::FP32 ||
+    const bool w16 = (W.dtype == Dtype::FP16 || W.dtype == Dtype::BF16);
+    if ((W.dtype != Dtype::FP32 && !w16) || X_BD.dtype != Dtype::FP32 ||
         bias.dtype != Dtype::FP32) {
         throw std::runtime_error(
-            "linear_forward_batched: W, X, bias must be FP32 "
-            "(use linear_forward_batched_fp16 for FP16)");
+            "linear_forward_batched: X and bias must be FP32, W FP32/FP16/BF16 "
+            "(use linear_forward_batched_fp16 for 16-bit activations)");
     }
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
@@ -274,10 +370,52 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
     }
     if (B == 0 || out_dim == 0) return;
 
-    const float* W_p    = static_cast<const float*>(W.data);
     const float* bias_p = static_cast<const float*>(bias.data);
     const float* X_p    = static_cast<const float*>(X_BD.data);
     float*       Y_p    = static_cast<float*>(Y_BD.data);
+
+    if (w16) {
+        // 16-bit weights, FP32 activations/accumulation. Same skinny/wide
+        // split as the FP32 path below; the GEMV needs in_dim % 2 == 0 (T2
+        // loads), which every transformer width satisfies.
+        if (B <= 32 && in_dim % 2 == 0 && in_dim > 0) {
+            dim3 grid(out_dim, B);
+            if (W.dtype == Dtype::FP16) {
+                linear_gemv_w16_kernel<__half, __half2><<<grid, GV_BLOCK, 0, cur_stream()>>>(
+                    static_cast<const __half*>(W.data), bias_p, X_p, Y_p,
+                    B, out_dim, in_dim);
+            } else {
+                linear_gemv_w16_kernel<__nv_bfloat16, __nv_bfloat162><<<grid, GV_BLOCK, 0, cur_stream()>>>(
+                    static_cast<const __nv_bfloat16*>(W.data), bias_p, X_p, Y_p,
+                    B, out_dim, in_dim);
+            }
+            BROTENSOR_CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        dim3 block(BL_ROWS_PER_BLOCK, 1);
+        const int grid_x = (out_dim + BL_ROWS_PER_BLOCK - 1) / BL_ROWS_PER_BLOCK;
+        for (int b0 = 0; b0 < B; b0 += LBB_MAX_GRID_Y) {
+            const int b_chunk = (B - b0) < LBB_MAX_GRID_Y ? (B - b0) : LBB_MAX_GRID_Y;
+            dim3 grid(grid_x, b_chunk);
+            if (W.dtype == Dtype::FP16) {
+                linear_forward_batched_w16_kernel<__half><<<grid, block, 0, cur_stream()>>>(
+                    static_cast<const __half*>(W.data), bias_p,
+                    X_p + static_cast<size_t>(b0) * in_dim,
+                    Y_p + static_cast<size_t>(b0) * out_dim,
+                    b_chunk, out_dim, in_dim);
+            } else {
+                linear_forward_batched_w16_kernel<__nv_bfloat16><<<grid, block, 0, cur_stream()>>>(
+                    static_cast<const __nv_bfloat16*>(W.data), bias_p,
+                    X_p + static_cast<size_t>(b0) * in_dim,
+                    Y_p + static_cast<size_t>(b0) * out_dim,
+                    b_chunk, out_dim, in_dim);
+            }
+        }
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    const float* W_p = static_cast<const float*>(W.data);
 
     // Skinny batches take the warp-per-row GEMV (see linear_gemv_kernel); the
     // tiled thread-per-row kernel remains for wide batches and odd in_dim.

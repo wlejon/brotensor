@@ -1099,10 +1099,34 @@ void linear_forward_batched(const ::brotensor::Tensor& W,
     }
     if (B == 0 || out_dim == 0) return;
 
-    const float* Wp = W.host_f32();
     const float* bp = bias.host_f32();
     const float* Xp = X_BD.host_f32();
     float* Yp = Y_BD.host_f32_mut();
+
+    // 16-bit weights (FP32 activations): widen per element. Correctness path —
+    // the performance-relevant 16-bit-weight decode runs on the GPU backends.
+    if (W.dtype == ::brotensor::Dtype::FP16 ||
+        W.dtype == ::brotensor::Dtype::BF16) {
+        const bool bf = (W.dtype == ::brotensor::Dtype::BF16);
+        const std::uint16_t* Wp = static_cast<const std::uint16_t*>(W.data);
+        for (int b = 0; b < B; ++b) {
+            const float* xr = Xp + static_cast<std::size_t>(b) * in_dim;
+            float* yr = Yp + static_cast<std::size_t>(b) * out_dim;
+            for (int i = 0; i < out_dim; ++i) {
+                const std::uint16_t* wr = Wp + static_cast<std::size_t>(i) * in_dim;
+                float acc = bp[i];
+                for (int j = 0; j < in_dim; ++j) {
+                    const float w = bf ? ::brotensor::bf16_bits_to_fp32(wr[j])
+                                       : ::brotensor::fp16_bits_to_fp32(wr[j]);
+                    acc += w * xr[j];
+                }
+                yr[i] = acc;
+            }
+        }
+        return;
+    }
+
+    const float* Wp = W.host_f32();
     for (int b = 0; b < B; ++b) {
         const float* xr = Xp + static_cast<std::size_t>(b) * in_dim;
         float* yr = Yp + static_cast<std::size_t>(b) * out_dim;
