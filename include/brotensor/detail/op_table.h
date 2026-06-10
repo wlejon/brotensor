@@ -235,6 +235,7 @@
     /* ─── Row gather / scatter-add (general 2D — superset of embedding_lookup) ─── */                                                                                  \
     X(gather_rows,                             void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Idx, ::brotensor::Tensor& Y))                          \
     X(scatter_rows_add,                        void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& Idx, int R, ::brotensor::Tensor& dX))                 \
+    X(scatter_rows,                            void,  (const ::brotensor::Tensor& Y, const ::brotensor::Tensor& Idx, ::brotensor::Tensor& X))                          \
     /* ─── 2D transposed convolution (NCHW) — forward + three backwards ─── */                                                                                          \
     X(conv_transpose2d_forward,                void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wt, const ::brotensor::Tensor* bias,                    \
                                                        int N, int C_in, int H, int W, int C_out, int kH, int kW,                                                        \

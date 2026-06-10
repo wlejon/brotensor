@@ -67,6 +67,20 @@ kernel void k_zero_f32(device float* p [[buffer(0)]],
     p[gid] = 0.0f;
 }
 
+kernel void k_scatter_rows(device const float* Y   [[buffer(0)]],
+                           device const int*   Idx [[buffer(1)]],
+                           device float*       X   [[buffer(2)]],
+                           constant uint& M        [[buffer(3)]],
+                           constant uint& C        [[buffer(4)]],
+                           uint gid [[thread_position_in_grid]]) {
+    uint total = M * C;
+    if (gid >= total) return;
+    uint m = gid / C;
+    uint j = gid - m * C;
+    int r = Idx[m];
+    X[uint(r) * C + j] = Y[gid];
+}
+
 kernel void k_scatter_rows_add(device const float*  dY  [[buffer(0)]],
                                device const int*    Idx [[buffer(1)]],
                                device atomic_float* dX  [[buffer(2)]],
@@ -99,6 +113,12 @@ id<MTLComputePipelineState> pso_scatter() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_scatter_rows_add"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_scatter_overwrite() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_scatter_rows"); });
     return pso;
 }
 
@@ -179,6 +199,32 @@ void scatter_rows_add(const Tensor& dY,
         [enc setBuffer:buffer_for(dY)  offset:buffer_offset_for(dY)  atIndex:0];
         [enc setBuffer:buffer_for(Idx) offset:buffer_offset_for(Idx) atIndex:1];
         [enc setBuffer:buffer_for(dX)  offset:buffer_offset_for(dX)  atIndex:2];
+        [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&Cu length:sizeof(uint32_t) atIndex:4];
+    });
+}
+
+void scatter_rows(const Tensor& Y,
+                  const Tensor& Idx,
+                  Tensor& X) {
+    const char* op = "scatter_rows";
+    req_fp32(op, Y, "Y");
+    req_idx(op, Idx);
+    const int M = Idx.rows;
+    if (Y.rows != M) fail(op, "Y.rows must equal Idx.rows");
+    if (X.dtype != Dtype::FP32) fail(op, "X must be FP32");
+    if (X.cols != Y.cols) fail(op, "X.cols must equal Y.cols");
+    const int C = Y.cols;
+    if (M == 0 || C == 0) return;
+
+    const uint32_t Mu = static_cast<uint32_t>(M);
+    const uint32_t Cu = static_cast<uint32_t>(C);
+    const NSUInteger total = static_cast<NSUInteger>(M) * static_cast<NSUInteger>(C);
+
+    dispatch1d(pso_scatter_overwrite(), total, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:buffer_for(Y)   offset:buffer_offset_for(Y)   atIndex:0];
+        [enc setBuffer:buffer_for(Idx) offset:buffer_offset_for(Idx) atIndex:1];
+        [enc setBuffer:buffer_for(X)   offset:buffer_offset_for(X)   atIndex:2];
         [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
         [enc setBytes:&Cu length:sizeof(uint32_t) atIndex:4];
     });

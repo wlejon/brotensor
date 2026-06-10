@@ -1043,6 +1043,13 @@ void scatter_rows_add(const Tensor& dY, const Tensor& Idx, int R, Tensor& dX) {
     detail::adopt_output(dX, dY.device);
     v.scatter_rows_add(dY, Idx, R, dX);
 }
+void scatter_rows(const Tensor& Y, const Tensor& Idx, Tensor& X) {
+    const auto& v = detail::dispatch(Y, Idx, X);
+    if (!v.scatter_rows) detail::throw_not_implemented("scatter_rows", Y.device);
+    // X is an in-place destination (existing rows are preserved), so it is
+    // never adopted/resized here — the backend validates its shape instead.
+    v.scatter_rows(Y, Idx, X);
+}
 
 void conv_transpose2d_forward(const Tensor& X, const Tensor& Wt,
                               const Tensor* bias,

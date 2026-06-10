@@ -397,6 +397,9 @@ void gather_rows(const ::brotensor::Tensor& X,
 void scatter_rows_add(const ::brotensor::Tensor& dY,
                       const ::brotensor::Tensor& Idx, int R,
                       ::brotensor::Tensor& dX);
+void scatter_rows(const ::brotensor::Tensor& Y,
+                  const ::brotensor::Tensor& Idx,
+                  ::brotensor::Tensor& X);
 void conv_transpose2d_forward(const ::brotensor::Tensor& X,
                               const ::brotensor::Tensor& Wt,
                               const ::brotensor::Tensor* bias,
@@ -1187,6 +1190,7 @@ struct CpuStaticRegistrar {
         ops.max_pool2d_backward          = &detail::cpu::max_pool2d_backward;
         ops.gather_rows                  = &detail::cpu::gather_rows;
         ops.scatter_rows_add             = &detail::cpu::scatter_rows_add;
+        ops.scatter_rows                 = &detail::cpu::scatter_rows;
         ops.conv_transpose2d_forward     = &detail::cpu::conv_transpose2d_forward;
         ops.conv_transpose2d_backward_input
                                          = &detail::cpu::conv_transpose2d_backward_input;

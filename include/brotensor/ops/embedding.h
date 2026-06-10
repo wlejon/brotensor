@@ -51,4 +51,18 @@ void gather_rows(const Tensor& X, const Tensor& Idx, Tensor& Y);
 //   dX:  (R, C) FP32, resized + dtype-set.
 void scatter_rows_add(const Tensor& dY, const Tensor& Idx, int R, Tensor& dX);
 
+
+// Scatter-OVERWRITE rows: X[Idx[m], :] = Y[m, :]. Unlike scatter_rows_add, X
+// is updated IN PLACE — rows not named by Idx keep their contents (this is the
+// KV-cache-append-at-device-index primitive a CUDA-graph-captured decode step
+// needs: the write offset lives in device memory, so the same captured kernel
+// appends to a different row every replay). X must already be allocated with
+// X.cols == Y.cols and every Idx value in [0, X.rows); it is never resized.
+// Duplicate indices in Idx race (undefined which row wins) — callers pass
+// unique indices.
+//   Y:   (M, C) FP32.
+//   Idx: (M, 1) INT32.
+//   X:   (R, C) FP32, rows Idx[m] overwritten, the rest untouched.
+void scatter_rows(const Tensor& Y, const Tensor& Idx, Tensor& X);
+
 }  // namespace brotensor

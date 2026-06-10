@@ -110,6 +110,23 @@ __global__ void scatter_rows_add_into_fp32_kernel(const T* __restrict__ dY,
     }
 }
 
+// Scatter-overwrite: X[Idx[m], :] = Y[m, :]; untouched rows keep their data.
+// Plain stores (no atomics) — duplicate indices are documented UB.
+template <typename T>
+__global__ void scatter_rows_kernel(const T* __restrict__ Y,
+                                    const int32_t* __restrict__ Idx,
+                                    T* __restrict__ X,
+                                    int M, int C) {
+    const long long total = (long long)M * C;
+    for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         idx < total; idx += (long long)blockDim.x * gridDim.x) {
+        const int c = static_cast<int>(idx % C);
+        const int m = static_cast<int>(idx / C);
+        const int r = Idx[m];
+        X[(long long)r * C + c] = Y[idx];
+    }
+}
+
 template <typename T>
 __global__ void gs_cast_fp32_to_T(const float* __restrict__ src,
                                   T* __restrict__ dst, long long n) {
@@ -221,11 +238,45 @@ void scatter_rows_add(const ::brotensor::Tensor& dY,
     cudaFree(d_scratch);
 }
 
+void scatter_rows(const ::brotensor::Tensor& Y,
+                  const ::brotensor::Tensor& Idx,
+                  ::brotensor::Tensor& X) {
+    const char* op = "scatter_rows";
+    check_fp(Y, op, "Y");
+    check_idx(Idx, op);
+    const int M = Idx.rows;
+    if (Y.rows != M) fail(op, "Y.rows must equal Idx.rows");
+    if (X.dtype != Y.dtype) fail(op, "X dtype must match Y");
+    if (X.cols != Y.cols) fail(op, "X.cols must equal Y.cols");
+    const int C = Y.cols;
+    if (M == 0 || C == 0) return;
+
+    const long long total = (long long)M * C;
+    if (Y.dtype == ::brotensor::Dtype::FP16) {
+        scatter_rows_kernel<__half><<<gs_grid(total), GS_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __half*>(Y.data),
+            static_cast<const int32_t*>(Idx.data),
+            static_cast<__half*>(X.data), M, C);
+    } else if (Y.dtype == ::brotensor::Dtype::BF16) {
+        scatter_rows_kernel<__nv_bfloat16><<<gs_grid(total), GS_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __nv_bfloat16*>(Y.data),
+            static_cast<const int32_t*>(Idx.data),
+            static_cast<__nv_bfloat16*>(X.data), M, C);
+    } else {
+        scatter_rows_kernel<float><<<gs_grid(total), GS_BLOCK, 0, cur_stream()>>>(
+            static_cast<const float*>(Y.data),
+            static_cast<const int32_t*>(Idx.data),
+            static_cast<float*>(X.data), M, C);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 // ─── vtable registration ────────────────────────────────────────────────────
 
 void fill_cuda_vtable_gather_scatter(::brotensor::detail::OpsVTable& v) {
     v.gather_rows      = &gather_rows;
     v.scatter_rows_add = &scatter_rows_add;
+    v.scatter_rows     = &scatter_rows;
 }
 
 } // namespace brotensor::detail::cuda

@@ -111,4 +111,29 @@ void scatter_rows_add(const ::brotensor::Tensor& dY,
     }
 }
 
+void scatter_rows(const ::brotensor::Tensor& Y,
+                  const ::brotensor::Tensor& Idx,
+                  ::brotensor::Tensor& X) {
+    const char* op = "scatter_rows";
+    check_fp32(Y, op, "Y");
+    check_idx(Idx, op);
+    const int M = Idx.rows;
+    if (Y.rows != M) fail(op, "Y.rows must equal Idx.rows");
+    if (X.dtype != Dtype::FP32) fail(op, "X must be FP32");
+    if (X.cols != Y.cols) fail(op, "X.cols must equal Y.cols");
+    const int C = Y.cols;
+    if (M == 0 || C == 0) return;
+
+    const float* Yp = Y.host_f32();
+    const int32_t* Ip = static_cast<const int32_t*>(Idx.data);
+    float* Xp = X.host_f32_mut();
+
+    for (int m = 0; m < M; ++m) {
+        const int r = Ip[m];
+        std::memcpy(Xp + static_cast<long>(r) * C,
+                    Yp + static_cast<long>(m) * C,
+                    static_cast<size_t>(C) * sizeof(float));
+    }
+}
+
 } // namespace brotensor::detail::cpu

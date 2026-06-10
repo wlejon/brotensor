@@ -230,6 +230,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.sample_logits                               = &dm::sample_logits;
     ops.scale_inplace                               = &dm::scale_inplace;
     ops.scatter_rows_add                            = &dm::scatter_rows_add;
+    ops.scatter_rows                                = &dm::scatter_rows;
     ops.self_attention_backward                     = &dm::self_attention_backward;
     ops.self_attention_bias_forward                 = &dm::self_attention_bias_forward;
     ops.self_attention_bias_int8w_fp16              = &dm::self_attention_bias_int8w_fp16;
