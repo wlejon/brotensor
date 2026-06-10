@@ -84,23 +84,26 @@ __global__ void linear_forward_kernel(const T* __restrict__ W,
 // transaction; per-token decode (LSTM steps, AR decode heads) lives or dies on
 // this. Requires in_dim % 4 == 0 (FP32: float4; FP16/BF16: two T2 words per
 // lane-iteration) so every row stays 16-/8-byte aligned.
+constexpr int LGV_BLOCK = 128;   // threads cooperating on one output row
+
 template <typename T, typename T2>
 __global__ void linear_gemv_kernel(const T* __restrict__ W,
                                    const T* __restrict__ b,
                                    const T* __restrict__ x,
                                    T* __restrict__ y,
                                    int out_dim, int in_dim) {
-    const int warp = threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
-    const int row  = blockIdx.x * (blockDim.x / 32) + warp;
-    if (row >= out_dim) return;
+    // One BLOCK per output row (split-K): out_dim blocks keep the SMs full of
+    // outstanding loads at decode widths, where a warp-per-row mapping leaves
+    // the GPU mostly idle on this bandwidth-bound shape.
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
 
     const T2* w2 = reinterpret_cast<const T2*>(W + static_cast<size_t>(row) * in_dim);
     const T2* x2 = reinterpret_cast<const T2*>(x);
     const int n2 = in_dim / 2;          // T2 words per row
 
     float acc = 0.0f;
-    for (int k = 2 * lane; k < n2; k += 64) {   // two adjacent T2 words per lane
+    for (int k = 2 * tid; k < n2; k += 2 * LGV_BLOCK) {  // two adjacent T2 words
         #pragma unroll
         for (int i = 0; i < 2; ++i) {
             const T2 wv = w2[k + i];
@@ -112,8 +115,14 @@ __global__ void linear_gemv_kernel(const T* __restrict__ W,
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
-    if (lane == 0) {
-        g_store<T>(&y[row], g_load<T>(&b[row]) + acc);
+    __shared__ float red[LGV_BLOCK / 32];
+    if ((tid & 31) == 0) red[tid >> 5] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float s = red[0];
+        #pragma unroll
+        for (int w = 1; w < LGV_BLOCK / 32; ++w) s += red[w];
+        g_store<T>(&y[row], g_load<T>(&b[row]) + s);
     }
 }
 
@@ -214,24 +223,23 @@ void linear_forward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& b,
     // Coalesced warp-per-row GEMV whenever rows stay vector-aligned; the tiled
     // thread-per-row kernel remains for odd in_dim.
     if (in_dim % 4 == 0 && in_dim > 0) {
-        constexpr int kWarps = 8;
-        const int gblocks = (out_dim + kWarps - 1) / kWarps;
+        const int gblocks = out_dim;
         if (W.dtype == Dtype::FP16) {
-            linear_gemv_kernel<__half, __half2><<<gblocks, kWarps * 32, 0, cur_stream()>>>(
+            linear_gemv_kernel<__half, __half2><<<gblocks, LGV_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __half*>(W.data),
                 static_cast<const __half*>(b.data),
                 static_cast<const __half*>(x.data),
                 static_cast<__half*>(y.data),
                 out_dim, in_dim);
         } else if (W.dtype == Dtype::BF16) {
-            linear_gemv_kernel<__nv_bfloat16, __nv_bfloat162><<<gblocks, kWarps * 32, 0, cur_stream()>>>(
+            linear_gemv_kernel<__nv_bfloat16, __nv_bfloat162><<<gblocks, LGV_BLOCK, 0, cur_stream()>>>(
                 static_cast<const __nv_bfloat16*>(W.data),
                 static_cast<const __nv_bfloat16*>(b.data),
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<__nv_bfloat16*>(y.data),
                 out_dim, in_dim);
         } else {
-            linear_gemv_kernel<float, float2><<<gblocks, kWarps * 32, 0, cur_stream()>>>(
+            linear_gemv_kernel<float, float2><<<gblocks, LGV_BLOCK, 0, cur_stream()>>>(
                 static_cast<const float*>(W.data),
                 static_cast<const float*>(b.data),
                 static_cast<const float*>(x.data),
