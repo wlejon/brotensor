@@ -275,6 +275,11 @@ void flash_attention_decode(const Tensor& Q,
                             const Tensor& K_cache, const Tensor& V_cache,
                             int valid_len, int num_q_heads, int num_kv_heads,
                             Tensor& O);
+void flash_attention_decode_masked(const Tensor& Q,
+                                   const Tensor& K_cache, const Tensor& V_cache,
+                                   const float* d_mask,
+                                   int num_q_heads, int num_kv_heads,
+                                   Tensor& O);
 
 void matmul_int8w_fp16(const Tensor& W_int8, const Tensor& scales,
                        const Tensor& X, Tensor& Y);
@@ -342,8 +347,9 @@ void fill_cuda_vtable_specialised(::brotensor::detail::OpsVTable& v) {
     v.copy_d2d_strided               = &copy_d2d_strided;
 
     // KV-cache + decode
-    v.kv_cache_append          = &kv_cache_append;
-    v.flash_attention_decode   = &flash_attention_decode;
+    v.kv_cache_append                = &kv_cache_append;
+    v.flash_attention_decode         = &flash_attention_decode;
+    v.flash_attention_decode_masked  = &flash_attention_decode_masked;
 
     // INT8 weight-only paths
     v.matmul_int8w_fp16                 = &matmul_int8w_fp16;

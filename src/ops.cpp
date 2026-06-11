@@ -1822,6 +1822,21 @@ void flash_attention_decode(const Tensor& Q,
                              num_q_heads, num_kv_heads, O);
 }
 
+void flash_attention_decode_masked(const Tensor& Q,
+                                   const Tensor& K_cache,
+                                   const Tensor& V_cache,
+                                   const float* d_mask,
+                                   int num_q_heads, int num_kv_heads,
+                                   Tensor& O) {
+    const auto& v = detail::dispatch(Q, K_cache, V_cache, O);
+    if (!v.flash_attention_decode_masked) {
+        detail::throw_not_implemented("flash_attention_decode_masked", Q.device);
+    }
+    detail::adopt_output(O, Q.device);
+    v.flash_attention_decode_masked(Q, K_cache, V_cache, d_mask,
+                                    num_q_heads, num_kv_heads, O);
+}
+
 // ─── Public reductions ─────────────────────────────────────────────────────
 
 void sum_rows(const Tensor& X, Tensor& Y) {

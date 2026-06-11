@@ -173,6 +173,152 @@ __global__ void flash_attention_decode_kernel(
     }
 }
 
+// Masked fixed-capacity single-query decode — the CUDA-graph-capturable twin
+// of the kernel above. Iterates every tile of the full (cap, ·) cache with NO
+// host-side length anywhere in the launch, so the captured launch replays
+// unchanged as generation advances; a device-resident FP32 key mask carries
+// validity instead. Masked keys score -1e30 (their softmax weights underflow
+// to exact 0.0f, and adding exact zeros leaves every reduction bit-identical
+// to the length-truncated kernel), and fully-masked tiles are skipped before
+// any K/V traffic. Templated over storage type instead of the twin-copy
+// pattern; numerics are unchanged — all math stays FP32.
+
+template <typename T> __device__ inline float fadm_ld(const T& v);
+template <> __device__ inline float fadm_ld<__half>(const __half& v) { return __half2float(v); }
+template <> __device__ inline float fadm_ld<__nv_bfloat16>(const __nv_bfloat16& v) { return __bfloat162float(v); }
+template <typename T> __device__ inline void fadm_st(T& dst, float v);
+template <> __device__ inline void fadm_st<__half>(__half& dst, float v) { dst = __float2half(v); }
+template <> __device__ inline void fadm_st<__nv_bfloat16>(__nv_bfloat16& dst, float v) { dst = __float2bfloat16(v); }
+
+template <typename T>
+__global__ void flash_attention_decode_masked_kernel(
+        const T* __restrict__ Q,
+        const T* __restrict__ K,
+        const T* __restrict__ V,
+        const float* __restrict__ mask,
+        T* __restrict__ Out,
+        int cap, int Dq, int Dkv, int head_dim, int group) {
+    extern __shared__ float s_smem[];
+    float* scores = s_smem;
+    float* red    = s_smem + FAD_KTILE;
+
+    const int h   = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
+    const int kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
+    const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
+
+    constexpr int MAX_HD_PER_THREAD = 8;
+    float partial[MAX_HD_PER_THREAD];
+    #pragma unroll
+    for (int i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
+
+    float run_max = -1e30f;
+    float run_sum = 0.0f;
+
+    for (int k0 = 0; k0 < cap; k0 += FAD_KTILE) {
+        const int klen = (cap - k0) < FAD_KTILE ? (cap - k0) : FAD_KTILE;
+
+        // Tile skip: reduce "any valid key here?" before touching K/V. A
+        // generation cache is a valid prefix, so every tile past the cursor
+        // costs one strided mask scan and one block reduce, nothing more.
+        float any = 0.0f;
+        for (int t = tid; t < klen; t += blockDim.x) {
+            if (mask[k0 + t] > 0.5f) any = 1.0f;
+        }
+        red[tid] = any;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) red[tid] += red[tid + stride];
+            __syncthreads();
+        }
+        const bool tile_any = red[0] > 0.0f;
+        __syncthreads();   // red[] is reused below
+        if (!tile_any) continue;
+
+        for (int t = tid; t < klen; t += blockDim.x) {
+            const int kg = k0 + t;
+            if (mask[kg] <= 0.5f) {
+                scores[t] = -1e30f;   // dropped key — weight becomes exact 0
+                continue;
+            }
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += fadm_ld(Q[q_head_off + d]) *
+                       fadm_ld(K[static_cast<size_t>(kg) * Dkv + kv_head_off + d]);
+            }
+            scores[t] = dot * inv_sqrt;
+        }
+        __syncthreads();
+
+        float local_max = -1e30f;
+        for (int t = tid; t < klen; t += blockDim.x) {
+            if (scores[t] > local_max) local_max = scores[t];
+        }
+        red[tid] = local_max;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                const float other = red[tid + stride];
+                if (other > red[tid]) red[tid] = other;
+            }
+            __syncthreads();
+        }
+        const float tile_max = red[0];
+        const float m_new = (tile_max > run_max) ? tile_max : run_max;
+        const bool tile_empty = (m_new <= -1e29f);
+
+        for (int t = tid; t < klen; t += blockDim.x) {
+            const float e = tile_empty ? 0.0f : __expf(scores[t] - m_new);
+            scores[t] = e;
+        }
+        __syncthreads();
+        float local_sum = 0.0f;
+        for (int t = tid; t < klen; t += blockDim.x) local_sum += scores[t];
+        red[tid] = local_sum;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) red[tid] += red[tid + stride];
+            __syncthreads();
+        }
+        const float tile_sum = red[0];
+
+        float alpha;
+        if (run_max <= -1e29f) {
+            alpha = 0.0f;
+        } else {
+            alpha = __expf(run_max - m_new);
+        }
+
+        int slot = 0;
+        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+            if (slot >= MAX_HD_PER_THREAD) break;
+            float acc = alpha * partial[slot];
+            for (int t = 0; t < klen; ++t) {
+                const float s = scores[t];
+                // Zero-weight keys add exactly nothing for any finite V, and
+                // masked rows may hold garbage (even NaN bit patterns) that
+                // 0*v would otherwise propagate — skip the V read entirely.
+                if (s == 0.0f) continue;
+                acc += s *
+                       fadm_ld(V[static_cast<size_t>(k0 + t) * Dkv + kv_head_off + d]);
+            }
+            partial[slot] = acc;
+        }
+
+        run_max = m_new;
+        run_sum = alpha * run_sum + tile_sum;
+        __syncthreads();
+    }
+
+    const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
+    int slot = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+        if (slot >= MAX_HD_PER_THREAD) break;
+        fadm_st(Out[q_head_off + d], partial[slot] * inv);
+    }
+}
+
 // BF16 twin: verbatim copy of flash_attention_decode_kernel with
 // __half -> __nv_bfloat16, __half2float -> __bfloat162float,
 // __float2half -> __float2bfloat16.
@@ -345,6 +491,77 @@ void flash_attention_decode(const Tensor& Q,
             static_cast<const __nv_bfloat16*>(V_cache.data),
             static_cast<__nv_bfloat16*>(O.data),
             Lq, valid_len, Dq, Dkv, head_dim, seq_offset, group);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void flash_attention_decode_masked(const Tensor& Q,
+                                   const Tensor& K_cache,
+                                   const Tensor& V_cache,
+                                   const float* d_mask,
+                                   int num_q_heads, int num_kv_heads,
+                                   Tensor& O) {
+    if (Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) {
+        throw std::runtime_error("flash_attention_decode_masked: tensors must be FP16 or BF16");
+    }
+    if (K_cache.dtype != Q.dtype || V_cache.dtype != Q.dtype) {
+        throw std::runtime_error("flash_attention_decode_masked: all tensors must share the same dtype");
+    }
+    if (d_mask == nullptr) {
+        throw std::runtime_error("flash_attention_decode_masked: d_mask must not be null");
+    }
+    if (Q.rows != 1) {
+        throw std::runtime_error("flash_attention_decode_masked: Q must be a single row (L_q == 1)");
+    }
+    const int Dq  = Q.cols;
+    const int Dkv = K_cache.cols;
+    const int cap = K_cache.rows;
+    if (V_cache.cols != Dkv) {
+        throw std::runtime_error("flash_attention_decode_masked: K_cache.cols != V_cache.cols");
+    }
+    if (V_cache.rows != cap) {
+        throw std::runtime_error("flash_attention_decode_masked: K_cache/V_cache row mismatch");
+    }
+    if (num_q_heads <= 0 || num_kv_heads <= 0) {
+        throw std::runtime_error("flash_attention_decode_masked: num_q_heads / num_kv_heads must be positive");
+    }
+    if (num_q_heads % num_kv_heads != 0) {
+        throw std::runtime_error("flash_attention_decode_masked: num_kv_heads must divide num_q_heads");
+    }
+    if (Dq % num_q_heads != 0 || Dkv % num_kv_heads != 0) {
+        throw std::runtime_error("flash_attention_decode_masked: head_dim does not divide cols cleanly");
+    }
+    const int head_dim = Dq / num_q_heads;
+    if (Dkv / num_kv_heads != head_dim) {
+        throw std::runtime_error("flash_attention_decode_masked: head_dim mismatch between Q and K/V");
+    }
+    const int group = num_q_heads / num_kv_heads;
+    if ((head_dim + FAD_BLOCK - 1) / FAD_BLOCK > 8) {
+        throw std::runtime_error("flash_attention_decode_masked: head_dim too large (max 8 * FAD_BLOCK = 1024)");
+    }
+    if (O.rows != 1 || O.cols != Dq || O.dtype != Q.dtype) {
+        O.resize(1, Dq, Q.dtype);
+    }
+    if (Dq == 0 || cap == 0) return;
+
+    const size_t shmem = (static_cast<size_t>(FAD_KTILE) + FAD_BLOCK) * sizeof(float);
+    dim3 grid(1, num_q_heads, 1);
+    if (Q.dtype == Dtype::FP16) {
+        flash_attention_decode_masked_kernel<__half><<<grid, FAD_BLOCK, shmem, cur_stream()>>>(
+            static_cast<const __half*>(Q.data),
+            static_cast<const __half*>(K_cache.data),
+            static_cast<const __half*>(V_cache.data),
+            d_mask,
+            static_cast<__half*>(O.data),
+            cap, Dq, Dkv, head_dim, group);
+    } else {
+        flash_attention_decode_masked_kernel<__nv_bfloat16><<<grid, FAD_BLOCK, shmem, cur_stream()>>>(
+            static_cast<const __nv_bfloat16*>(Q.data),
+            static_cast<const __nv_bfloat16*>(K_cache.data),
+            static_cast<const __nv_bfloat16*>(V_cache.data),
+            d_mask,
+            static_cast<__nv_bfloat16*>(O.data),
+            cap, Dq, Dkv, head_dim, group);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }

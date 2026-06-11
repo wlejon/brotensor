@@ -260,6 +260,30 @@ void flash_attention_decode(const Tensor& Q,
                            Tensor& O);
 
 
+// Single-token decode attention over a FIXED-CAPACITY masked KV cache — the
+// CUDA-graph-capturable twin of flash_attention_decode. The kernel always
+// sees the full (L_max, ·) cache buffers, so its launch shape never changes
+// as generation advances; validity lives in `d_mask`, a device-resident
+// length-L_max FP32 key mask (1 valid / 0 invalid) the caller updates
+// between graph replays. Masked keys are dropped before the dot product and
+// softmax (their weights underflow to exact zeros), so with
+// mask = [1]*valid_len + [0]*(L_max-valid_len) the result is bit-identical
+// to flash_attention_decode(Q, K, V, valid_len, ...) at L_q == 1. Fully
+// masked key tiles are skipped without touching K/V.
+//   Q: (1, num_q_heads*head_dim) — single query row only.
+//   K_cache, V_cache: (L_max, num_kv_heads*head_dim); same GQA rules as
+//       flash_attention_decode.
+//   d_mask: device pointer, length L_max, FP32; must not be null and must
+//       mark at least one key valid.
+//   O: (1, num_q_heads*head_dim), resized as needed.
+void flash_attention_decode_masked(const Tensor& Q,
+                                   const Tensor& K_cache,
+                                   const Tensor& V_cache,
+                                   const float* d_mask,
+                                   int num_q_heads, int num_kv_heads,
+                                   Tensor& O);
+
+
 // Back-compat overload: num_kv_heads defaults to num_heads (plain MHA).
 inline void flash_attention_decode(const Tensor& Q,
                                    const Tensor& K_cache, const Tensor& V_cache,

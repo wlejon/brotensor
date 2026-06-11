@@ -169,4 +169,102 @@ void flash_attention_decode(const ::brotensor::Tensor& Q,
     }
 }
 
+// Masked fixed-capacity single-query decode — reference twin of the CUDA op.
+// Validity lives entirely in the device-/host-resident FP32 key mask; keys
+// with mask <= 0.5 are skipped before the dot product and softmax, so with a
+// valid-prefix mask the result equals flash_attention_decode at L_q == 1.
+void flash_attention_decode_masked(const ::brotensor::Tensor& Q,
+                                   const ::brotensor::Tensor& K_cache,
+                                   const ::brotensor::Tensor& V_cache,
+                                   const float* d_mask,
+                                   int num_q_heads, int num_kv_heads,
+                                   ::brotensor::Tensor& O) {
+    check_fp32(Q,       "flash_attention_decode_masked", "Q");
+    check_fp32(K_cache, "flash_attention_decode_masked", "K_cache");
+    check_fp32(V_cache, "flash_attention_decode_masked", "V_cache");
+    if (d_mask == nullptr) {
+        throw std::runtime_error("flash_attention_decode_masked: d_mask must not be null");
+    }
+    if (Q.rows != 1) {
+        throw std::runtime_error("flash_attention_decode_masked: Q must be a single row (L_q == 1)");
+    }
+    const int Dq  = Q.cols;
+    const int Dkv = K_cache.cols;
+    const int cap = K_cache.rows;
+    if (V_cache.cols != Dkv) {
+        throw std::runtime_error("flash_attention_decode_masked: K_cache.cols != V_cache.cols");
+    }
+    if (V_cache.rows != cap) {
+        throw std::runtime_error("flash_attention_decode_masked: K_cache/V_cache row mismatch");
+    }
+    if (num_q_heads <= 0 || num_kv_heads <= 0) {
+        throw std::runtime_error("flash_attention_decode_masked: num_q_heads / num_kv_heads must be positive");
+    }
+    if (num_q_heads % num_kv_heads != 0) {
+        throw std::runtime_error("flash_attention_decode_masked: num_kv_heads must divide num_q_heads");
+    }
+    if (Dq % num_q_heads != 0 || Dkv % num_kv_heads != 0) {
+        throw std::runtime_error("flash_attention_decode_masked: head_dim does not divide cols cleanly");
+    }
+    const int head_dim = Dq / num_q_heads;
+    if (Dkv / num_kv_heads != head_dim) {
+        throw std::runtime_error("flash_attention_decode_masked: head_dim mismatch between Q and K/V");
+    }
+    const int q_per_kv = num_q_heads / num_kv_heads;
+    if (O.rows != 1 || O.cols != Dq || O.dtype != Dtype::FP32) {
+        O.resize(1, Dq, Dtype::FP32);
+    }
+    if (Dq == 0 || cap == 0) return;
+
+    const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const float* Qp = Q.host_f32();
+    const float* Kp = K_cache.host_f32();
+    const float* Vp = V_cache.host_f32();
+    float* Op = O.host_f32_mut();
+
+    std::vector<float> scores;
+    for (int hq = 0; hq < num_q_heads; ++hq) {
+        const int hkv = hq / q_per_kv;
+        const int q_head_off  = hq  * head_dim;
+        const int kv_head_off = hkv * head_dim;
+        const float* qrow = Qp + q_head_off;
+
+        scores.assign(static_cast<std::size_t>(cap), 0.0f);
+        float run_max = -1e30f;
+        for (int kg = 0; kg < cap; ++kg) {
+            if (d_mask[kg] <= 0.5f) {
+                scores[static_cast<std::size_t>(kg)] = -1e30f;
+                continue;
+            }
+            const float* krow = Kp + static_cast<std::size_t>(kg) * Dkv + kv_head_off;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) dot += qrow[d] * krow[d];
+            const float s = dot * inv_sqrt;
+            scores[static_cast<std::size_t>(kg)] = s;
+            if (s > run_max) run_max = s;
+        }
+        float sum = 0.0f;
+        for (int kg = 0; kg < cap; ++kg) {
+            const float e = (run_max <= -1e29f)
+                ? 0.0f
+                : std::exp(scores[static_cast<std::size_t>(kg)] - run_max);
+            scores[static_cast<std::size_t>(kg)] = e;
+            sum += e;
+        }
+        const float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        float* orow = Op + q_head_off;
+        for (int d = 0; d < head_dim; ++d) {
+            float acc = 0.0f;
+            for (int kg = 0; kg < cap; ++kg) {
+                const float s = scores[static_cast<std::size_t>(kg)];
+                // Skip zero-weight keys: identical math for any finite V, and
+                // masked rows may hold garbage the multiply would propagate.
+                if (s == 0.0f) continue;
+                acc += s * Vp[static_cast<std::size_t>(kg) * Dkv + kv_head_off + d];
+            }
+            orow[d] = acc * inv;
+        }
+    }
+}
+
 } // namespace brotensor::detail::cpu

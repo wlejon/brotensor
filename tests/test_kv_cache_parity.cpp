@@ -23,6 +23,7 @@
 #include <brotensor/tensor.h>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 using namespace bt_parity;
@@ -124,6 +125,61 @@ void run_decode(int valid_len, int Lq, int num_q_heads, int num_kv_heads,
                     5e-2f, 5e-2f);
 }
 
+// ─── flash_attention_decode_masked ─────────────────────────────────────────
+// Fixed-capacity masked decode vs the length-truncated op over the SAME cache
+// buffers. Rows past valid_len are filled with NaN to prove masked keys are
+// never read: any leak poisons the output. The masked GPU result must match
+// the truncated GPU result bit-for-bit (identical tile math, masked keys
+// reduce to exact zeros); CPU masked vs CPU truncated likewise.
+void run_decode_masked(int cap, int valid_len, int num_q_heads,
+                       int num_kv_heads, int head_dim, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int Dq  = num_q_heads  * head_dim;
+    const int Dkv = num_kv_heads * head_dim;
+
+    Tensor Q  = make_q16_cpu(1, Dq, rng, 0.4f);
+    Tensor Kc = make_q16_cpu(cap, Dkv, rng, 0.4f);
+    Tensor Vc = make_q16_cpu(cap, Dkv, rng, 0.4f);
+    // Poison the masked-out rows.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    for (int r = valid_len; r < cap; ++r) {
+        for (int c = 0; c < Dkv; ++c) {
+            Kc.host_f32_mut()[static_cast<size_t>(r) * Dkv + c] = nan;
+            Vc.host_f32_mut()[static_cast<size_t>(r) * Dkv + c] = nan;
+        }
+    }
+    std::vector<float> mask(static_cast<size_t>(cap), 0.0f);
+    for (int r = 0; r < valid_len; ++r) mask[static_cast<size_t>(r)] = 1.0f;
+
+    // CPU: masked over the full cap == truncated at valid_len, exactly.
+    Tensor cpu_O_ref, cpu_O_masked;
+    brotensor::flash_attention_decode(Q, Kc, Vc, valid_len,
+                                      num_q_heads, num_kv_heads, cpu_O_ref);
+    brotensor::flash_attention_decode_masked(Q, Kc, Vc, mask.data(),
+                                             num_q_heads, num_kv_heads,
+                                             cpu_O_masked);
+    compare_tensors(cpu_O_ref, cpu_O_masked, "decode_masked_cpu_exact",
+                    1e-7f, 1e-7f);
+
+    // GPU: same equivalence on the FP16 path, expected bit-identical.
+    Tensor gQ  = to_fp16_cuda(Q);
+    Tensor gKc = to_fp16_cuda(Kc);
+    Tensor gVc = to_fp16_cuda(Vc);
+    Tensor gmask = Tensor::from_host_on(gpu_device(), mask.data(), cap, 1);
+    Tensor gpu_O_ref, gpu_O_masked;
+    brotensor::flash_attention_decode(gQ, gKc, gVc, valid_len,
+                                      num_q_heads, num_kv_heads, gpu_O_ref);
+    brotensor::flash_attention_decode_masked(
+        gQ, gKc, gVc, static_cast<const float*>(gmask.data),
+        num_q_heads, num_kv_heads, gpu_O_masked);
+    compare_tensors(fp16_cuda_to_cpu(gpu_O_ref), fp16_cuda_to_cpu(gpu_O_masked),
+                    "decode_masked_gpu_exact", 0.0f, 0.0f);
+
+    // And the usual CPU-vs-GPU parity for the masked op itself.
+    compare_tensors(cpu_O_masked, fp16_cuda_to_cpu(gpu_O_masked),
+                    "decode_masked_parity", 5e-2f, 5e-2f);
+}
+
 } // namespace
 
 // ─── kv_cache_append ───────────────────────────────────────────────────────
@@ -146,6 +202,14 @@ BT_PARITY_TEST(kv_decode_gqa_qwen3)    { run_decode(16, 1, 8, 2, 16, 0x7315ull);
 BT_PARITY_TEST(kv_decode_gqa_tail)     { run_decode(16, 3, 8, 2, 16, 0x7316ull); }
 BT_PARITY_TEST(kv_decode_mqa)          { run_decode(12, 1, 2, 1, 8,  0x7317ull); }
 BT_PARITY_TEST(kv_decode_gqa_group2)   { run_decode(14, 2, 6, 3, 8,  0x7318ull); }
+
+// ─── flash_attention_decode_masked (fixed-cap + key mask) ──────────────────
+//   args: cap, valid_len, num_q_heads, num_kv_heads, head_dim, seed
+BT_PARITY_TEST(kv_decode_masked_small)     { run_decode_masked(16,  9,  2, 2, 8,   0x7320ull); }
+BT_PARITY_TEST(kv_decode_masked_gqa)       { run_decode_masked(96,  41, 8, 2, 16,  0x7321ull); }
+BT_PARITY_TEST(kv_decode_masked_multitile) { run_decode_masked(256, 130, 4, 2, 32, 0x7322ull); }
+BT_PARITY_TEST(kv_decode_masked_tile_edge) { run_decode_masked(192, 64,  4, 4, 16, 0x7323ull); }
+BT_PARITY_TEST(kv_decode_masked_one_key)   { run_decode_masked(128, 1,   8, 2, 64, 0x7324ull); }
 
 // ─── BF16: BF16-on-CUDA vs FP32 CPU reference ─────────────────────────────
 // Same harness as FP16 but quantise through BF16 (7-bit mantissa).
