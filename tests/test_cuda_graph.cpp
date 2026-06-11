@@ -117,6 +117,50 @@ int main() {
     g.reset();
     CHECK(!g.valid());
 
+    // ── FP16 op-sequence capture (group_norm → layout → linear) ───────────
+    // Regression coverage for the FP16 inference ops' capture-safety: every
+    // launch and copy must land on the capture stream and perform no
+    // unpaired allocation.
+    {
+        const int C = 8, H = 2, Wd = 2;  // tiny SD1.5-fixture shapes
+        const int L = H * Wd;
+        std::vector<uint16_t> xh(C * H * Wd), gh(C), bh(C), wh(C * C);
+        auto f2h = [](float f) { return brotensor::fp32_to_fp16_bits(f); };
+        for (size_t i = 0; i < xh.size(); ++i) xh[i] = f2h(dist(rng) * 0.1f);
+        for (size_t i = 0; i < gh.size(); ++i) gh[i] = f2h(1.0f);
+        for (size_t i = 0; i < bh.size(); ++i) bh[i] = f2h(0.0f);
+        for (size_t i = 0; i < wh.size(); ++i) wh[i] = f2h(dist(rng) * 0.1f);
+        Tensor Xh  = Tensor::from_host_fp16_on(Device::CUDA, xh.data(), 1, C * H * Wd);
+        Tensor Gg  = Tensor::from_host_fp16_on(Device::CUDA, gh.data(), C, 1);
+        Tensor Gb  = Tensor::from_host_fp16_on(Device::CUDA, bh.data(), C, 1);
+        Tensor Wp  = Tensor::from_host_fp16_on(Device::CUDA, wh.data(), C, C);
+        Tensor gn_out, seq, proj;
+
+        auto fp16_step = [&](int upto) {
+            if (upto >= 1) brotensor::group_norm_forward(Xh, Gg, Gb, 1, C, H, Wd, 2, 1e-6f, gn_out);
+            if (upto >= 2) brotensor::nchw_to_sequence(gn_out, 1, C, H, Wd, seq);
+            if (upto >= 3) brotensor::linear_forward_batched_fp16(Wp, nullptr, seq, proj);
+        };
+        for (int upto = 1; upto <= 3; ++upto) {
+            fp16_step(upto);
+            brotensor::sync_all();
+            try {
+                brotensor::CudaGraph g16;
+                {
+                    brotensor::CudaGraphCapture cap;
+                    fp16_step(upto);
+                    g16 = cap.finish();
+                }
+                g16.launch();
+                brotensor::sync_all();
+                std::printf("  fp16 capture upto=%d OK\n", upto);
+            } catch (const std::exception& e) {
+                std::printf("  fp16 capture upto=%d FAILED: %s\n", upto, e.what());
+                ++g_failures;
+            }
+        }
+    }
+
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;
 }

@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 namespace brotensor {
 // Forward decl: thread-local current stream from runtime.cu.
@@ -80,7 +81,25 @@ void cuda_free(void* ptr) {
         // Best-effort, stream-ordered; unchecked so teardown after context
         // destruction stays quiet, matching the old cudaFree behaviour.
         auto s = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
-        cudaFreeAsync(ptr, s);
+        cudaError_t err = cudaFreeAsync(ptr, s);
+        if (err != cudaSuccess) {
+            // Quiet by design at teardown (context may already be gone) —
+            // but clear the sticky error so it cannot surface at an
+            // unrelated later CUDA call and misattribute the failure. A
+            // free failing while the stream is CAPTURING is a real bug
+            // (freeing non-graph memory inside a capture poisons the
+            // graph), so that case gets a loud warning with the pointer.
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s, &cs);
+            if (cs != cudaStreamCaptureStatusNone) {
+                std::fprintf(stderr,
+                    "brotensor: WARNING: cudaFreeAsync(%p) failed (err=%d) "
+                    "during stream capture — a non-graph allocation was "
+                    "freed inside a captured region\n",
+                    ptr, static_cast<int>(err));
+            }
+            cudaGetLastError();
+        }
     } else {
         cudaFree(ptr);
     }
