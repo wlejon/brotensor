@@ -49,7 +49,9 @@ void downsample_avg_2x_backward(const Tensor& dY,
 // spatial dims don't divide evenly. Used by SegFormer / Mask2Former
 // decoder-side aggregation and detection-head global pooling.
 //   X: (N, C*H*W).  Y: (N, C*H_out*W_out), resized + dtype-set to X.
-// FP32-only, on both the CPU and CUDA backends.
+// CPU backend is FP32-only; the CUDA forward is dtype-dispatched on X
+// (FP32/FP16/BF16 — FP32 accumulation on the 16-bit paths). The backward is
+// FP32-only on both backends.
 void adaptive_avg_pool2d_forward(const Tensor& X, int N, int C, int H, int W,
                                  int H_out, int W_out, Tensor& Y);
 
@@ -70,8 +72,9 @@ void adaptive_avg_pool2d_backward(const Tensor& dY, int N, int C, int H, int W,
 // Returns Y AND a per-output INT32 index into the per-channel flat input
 // spatial plane (Idx[n, c, oh, ow] == in_h * W + in_w of the winning pixel),
 // so max_pool2d_backward can scatter dY without re-scanning the kernel.
-//   X:   (N, C*H*W) FP32.
-//   Y:   (N, C*H_out*W_out) FP32.
+//   X:   (N, C*H*W). FP32 on CPU; the CUDA forward is dtype-dispatched on X
+//        (FP32/FP16/BF16).
+//   Y:   (N, C*H_out*W_out), resized + dtype-set to X.
 //   Idx: (N, C*H_out*W_out) INT32. -1 means "all kernel positions were
 //        padding" (shouldn't happen with kH/kW <= H/W + 2*pad, but signals
 //        a degenerate case cleanly).

@@ -1,18 +1,25 @@
 // ─── CUDA 2D pooling: adaptive_avg_pool2d + max_pool2d ─────────────────────
 //
-// FP32-only port of src/cpu/pool2d.cpp. Contracts mirror CPU exactly:
+// Port of src/cpu/pool2d.cpp. Contracts mirror CPU exactly:
 //   * NCHW flat layout (rows = N, cols = C*H*W).
 //   * max_pool2d Idx is INT32 per-channel flat-spatial (ih*W + iw); -1 if
 //     the kernel window saw no valid (non-padding) pixel.
 //   * Forward overwrites Y / Idx; backward overwrites dX (zero-then-scatter)
 //     with atomicAdd because adaptive windows overlap (avg) and max-pool
 //     stride < kernel can route multiple outputs to the same input pixel.
+//
+// The two forward ops are dtype-dispatched on X (FP32/FP16/BF16 — Y matches;
+// the avg pool accumulates in FP32 for the 16-bit paths and keeps the
+// original double accumulator for FP32, and the max-pool Idx tensor stays
+// INT32 regardless). The backward ops remain FP32-only.
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <math_constants.h>
 
 #include <stdexcept>
@@ -47,6 +54,24 @@ inline void check_fp32(const ::brotensor::Tensor& t,
     }
 }
 
+template <typename T>
+__device__ inline float pl_load_f32(const T* p);
+template <> __device__ inline float pl_load_f32<float>(const float* p)   { return *p; }
+template <> __device__ inline float pl_load_f32<__half>(const __half* p) { return __half2float(*p); }
+template <> __device__ inline float pl_load_f32<__nv_bfloat16>(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+
+template <typename T>
+__device__ inline void pl_store_f32(T* p, float v);
+template <> __device__ inline void pl_store_f32<float>(float* p, float v)   { *p = v; }
+template <> __device__ inline void pl_store_f32<__half>(__half* p, float v) { *p = __float2half(v); }
+template <> __device__ inline void pl_store_f32<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+
+// Accumulator type for the avg pool: keep the original double accumulator on
+// the FP32 path (bit-stable vs the existing CPU/CUDA behavior); FP32 is ample
+// for 16-bit storage.
+template <typename T> struct pl_acc            { using type = float; };
+template <>           struct pl_acc<float>     { using type = double; };
+
 __device__ inline void adaptive_window(int o, int L, int L_out,
                                        int& start, int& end) {
     start = (o * L) / L_out;
@@ -56,8 +81,9 @@ __device__ inline void adaptive_window(int o, int L, int L_out,
 }
 
 // ── adaptive_avg_pool2d forward kernel ────────────────────────────────────
-__global__ void adaptive_avg_pool2d_forward_kernel(const float* __restrict__ X,
-                                                   float* __restrict__ Y,
+template <typename T>
+__global__ void adaptive_avg_pool2d_forward_kernel(const T* __restrict__ X,
+                                                   T* __restrict__ Y,
                                                    int N, int C,
                                                    int H, int W,
                                                    int H_out, int W_out) {
@@ -75,12 +101,12 @@ __global__ void adaptive_avg_pool2d_forward_kernel(const float* __restrict__ X,
         adaptive_window(ow, W, W_out, w0, w1);
         const int area = (h1 - h0) * (w1 - w0);
         const long long xbase = ((long long)n * C + c) * H * W;
-        double acc = 0.0;
+        typename pl_acc<T>::type acc = 0;
         for (int h = h0; h < h1; ++h) {
-            const float* row = X + xbase + (long long)h * W;
-            for (int w = w0; w < w1; ++w) acc += row[w];
+            const T* row = X + xbase + (long long)h * W;
+            for (int w = w0; w < w1; ++w) acc += pl_load_f32<T>(&row[w]);
         }
-        Y[idx] = static_cast<float>(acc / area);
+        pl_store_f32<T>(&Y[idx], static_cast<float>(acc / area));
     }
 }
 
@@ -113,8 +139,9 @@ __global__ void adaptive_avg_pool2d_backward_kernel(const float* __restrict__ dY
 }
 
 // ── max_pool2d forward kernel ─────────────────────────────────────────────
-__global__ void max_pool2d_forward_kernel(const float* __restrict__ X,
-                                          float* __restrict__ Y,
+template <typename T>
+__global__ void max_pool2d_forward_kernel(const T* __restrict__ X,
+                                          T* __restrict__ Y,
                                           int32_t* __restrict__ Idx,
                                           int N, int C, int H, int W,
                                           int kH, int kW,
@@ -138,18 +165,18 @@ __global__ void max_pool2d_forward_kernel(const float* __restrict__ X,
         for (int kh = 0; kh < kH; ++kh) {
             const int ih = h_base + kh;
             if (ih < 0 || ih >= H) continue;
-            const float* row = X + xbase + (long long)ih * W;
+            const T* row = X + xbase + (long long)ih * W;
             for (int kw = 0; kw < kW; ++kw) {
                 const int iw = w_base + kw;
                 if (iw < 0 || iw >= W) continue;
-                const float v = row[iw];
+                const float v = pl_load_f32<T>(&row[iw]);
                 if (v > best_v) {
                     best_v = v;
                     best_i = ih * W + iw;
                 }
             }
         }
-        Y[idx] = best_v;
+        pl_store_f32<T>(&Y[idx], best_v);
         Idx[idx] = best_i;
     }
 }
@@ -185,7 +212,11 @@ void adaptive_avg_pool2d_forward(const ::brotensor::Tensor& X,
                                  int H_out, int W_out,
                                  ::brotensor::Tensor& Y) {
     const char* op = "adaptive_avg_pool2d_forward";
-    check_fp32(X, op, "X");
+    using ::brotensor::Dtype;
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 &&
+        X.dtype != Dtype::BF16) {
+        fail(op, "X must be FP32, FP16 or BF16");
+    }
     if (N < 0 || C < 1 || H < 1 || W < 1)
         fail(op, "C/H/W must be >=1 and N >=0");
     if (H_out < 1 || W_out < 1)
@@ -194,16 +225,26 @@ void adaptive_avg_pool2d_forward(const ::brotensor::Tensor& X,
         fail(op, "X shape must be (N, C*H*W)");
 
     const int cols_out = C * H_out * W_out;
-    if (Y.rows != N || Y.cols != cols_out ||
-        Y.dtype != ::brotensor::Dtype::FP32) {
-        Y.resize(N, cols_out, ::brotensor::Dtype::FP32);
+    if (Y.rows != N || Y.cols != cols_out || Y.dtype != X.dtype) {
+        Y.resize(N, cols_out, X.dtype);
     }
     if (N == 0) return;
 
     const long long total = (long long)N * cols_out;
-    adaptive_avg_pool2d_forward_kernel<<<pl_grid(total), PL_BLOCK, 0, cur_stream()>>>(
-        static_cast<const float*>(X.data), static_cast<float*>(Y.data),
-        N, C, H, W, H_out, W_out);
+    if (X.dtype == Dtype::FP16) {
+        adaptive_avg_pool2d_forward_kernel<__half><<<pl_grid(total), PL_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
+            N, C, H, W, H_out, W_out);
+    } else if (X.dtype == Dtype::BF16) {
+        adaptive_avg_pool2d_forward_kernel<__nv_bfloat16><<<pl_grid(total), PL_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            N, C, H, W, H_out, W_out);
+    } else {
+        adaptive_avg_pool2d_forward_kernel<float><<<pl_grid(total), PL_BLOCK, 0, cur_stream()>>>(
+            static_cast<const float*>(X.data), static_cast<float*>(Y.data),
+            N, C, H, W, H_out, W_out);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -248,7 +289,11 @@ void max_pool2d_forward(const ::brotensor::Tensor& X,
                         int pad_h, int pad_w,
                         ::brotensor::Tensor& Y, ::brotensor::Tensor& Idx) {
     const char* op = "max_pool2d_forward";
-    check_fp32(X, op, "X");
+    using ::brotensor::Dtype;
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 &&
+        X.dtype != Dtype::BF16) {
+        fail(op, "X must be FP32, FP16 or BF16");
+    }
     if (N < 0 || C < 1 || H < 1 || W < 1)
         fail(op, "C/H/W must be >=1 and N >=0");
     if (kH < 1 || kW < 1) fail(op, "kH and kW must be >= 1");
@@ -262,9 +307,8 @@ void max_pool2d_forward(const ::brotensor::Tensor& X,
     const int H_out = (H + 2 * pad_h - kH) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - kW) / stride_w + 1;
     const int cols_out = C * H_out * W_out;
-    if (Y.rows != N || Y.cols != cols_out ||
-        Y.dtype != ::brotensor::Dtype::FP32) {
-        Y.resize(N, cols_out, ::brotensor::Dtype::FP32);
+    if (Y.rows != N || Y.cols != cols_out || Y.dtype != X.dtype) {
+        Y.resize(N, cols_out, X.dtype);
     }
     if (Idx.rows != N || Idx.cols != cols_out ||
         Idx.dtype != ::brotensor::Dtype::INT32) {
@@ -273,11 +317,26 @@ void max_pool2d_forward(const ::brotensor::Tensor& X,
     if (N == 0) return;
 
     const long long total = (long long)N * cols_out;
-    max_pool2d_forward_kernel<<<pl_grid(total), PL_BLOCK, 0, cur_stream()>>>(
-        static_cast<const float*>(X.data), static_cast<float*>(Y.data),
-        static_cast<int32_t*>(Idx.data),
-        N, C, H, W, kH, kW, stride_h, stride_w, pad_h, pad_w,
-        H_out, W_out);
+    if (X.dtype == Dtype::FP16) {
+        max_pool2d_forward_kernel<__half><<<pl_grid(total), PL_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
+            static_cast<int32_t*>(Idx.data),
+            N, C, H, W, kH, kW, stride_h, stride_w, pad_h, pad_w,
+            H_out, W_out);
+    } else if (X.dtype == Dtype::BF16) {
+        max_pool2d_forward_kernel<__nv_bfloat16><<<pl_grid(total), PL_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            static_cast<int32_t*>(Idx.data),
+            N, C, H, W, kH, kW, stride_h, stride_w, pad_h, pad_w,
+            H_out, W_out);
+    } else {
+        max_pool2d_forward_kernel<float><<<pl_grid(total), PL_BLOCK, 0, cur_stream()>>>(
+            static_cast<const float*>(X.data), static_cast<float*>(Y.data),
+            static_cast<int32_t*>(Idx.data),
+            N, C, H, W, kH, kW, stride_h, stride_w, pad_h, pad_w,
+            H_out, W_out);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
