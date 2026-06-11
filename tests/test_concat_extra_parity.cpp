@@ -306,7 +306,70 @@ void run_nchw_bf16(int N, int H, int W, const std::vector<int>& C_per_part,
     }
 }
 
-} // namespace (bf16 helpers)
+// ─── FP16: FP16-on-CUDA vs FP32 CPU reference ──────────────────────────────
+// Same scheme as the BF16 tests above — concat is pure 2-byte memory
+// movement, so the only rounding is on the input values.
+
+void run_nchw_fp16(int N, int H, int W, const std::vector<int>& C_per_part,
+                   uint64_t seed) {
+    SplitMix64 rng(seed);
+    std::vector<Tensor> parts_cpu;
+    for (int Ci : C_per_part) {
+        Tensor t = Tensor::mat(N, Ci * H * W);
+        fill_random(t, rng);
+        parts_cpu.push_back(std::move(t));
+    }
+
+    // FP32 CPU reference with FP16-rounded inputs.
+    std::vector<Tensor> parts_f32(C_per_part.size());
+    for (size_t i = 0; i < C_per_part.size(); ++i)
+        parts_f32[i] = fp16_host_to_f32(to_fp16_host(parts_cpu[i]));
+    std::vector<const Tensor*> cpu_ptr;
+    for (const auto& p : parts_f32) cpu_ptr.push_back(&p);
+    Tensor out_cpu;
+    brotensor::concat_nchw_channels(cpu_ptr, N, H, W, C_per_part, out_cpu);
+
+    // GPU: FP16 parts — the memcpy must move them bit-exactly.
+    std::vector<Tensor> parts_gpu(C_per_part.size());
+    std::vector<const Tensor*> gpu_ptr;
+    for (size_t i = 0; i < C_per_part.size(); ++i) {
+        parts_gpu[i] = to_fp16_gpu(parts_cpu[i]);
+        gpu_ptr.push_back(&parts_gpu[i]);
+    }
+    Tensor out_gpu_fp16;
+    brotensor::concat_nchw_channels(gpu_ptr, N, H, W, C_per_part, out_gpu_fp16);
+    brotensor::sync_all();
+    BT_CHECK(out_gpu_fp16.dtype == brotensor::Dtype::FP16);
+
+    Tensor out_gpu = fp16_host_to_f32(download_to_host(out_gpu_fp16));
+    compare_tensors(out_cpu, out_gpu, "nchw_fp16", 0.0f, 0.0f);  // bit-exact move
+
+    // Backward: split dY back into FP16 per-part tensors, also bit-exact.
+    std::vector<Tensor> dparts_cpu(C_per_part.size());
+    std::vector<Tensor*> dcpu_ptr;
+    for (auto& t : dparts_cpu) dcpu_ptr.push_back(&t);
+    brotensor::concat_nchw_channels_backward(out_cpu, N, H, W, C_per_part,
+                                             dcpu_ptr);
+
+    std::vector<Tensor> dparts_gpu_fp16(C_per_part.size());
+    std::vector<Tensor*> dgpu_ptr;
+    for (auto& t : dparts_gpu_fp16) dgpu_ptr.push_back(&t);
+    brotensor::concat_nchw_channels_backward(out_gpu_fp16, N, H, W, C_per_part,
+                                             dgpu_ptr);
+    brotensor::sync_all();
+
+    for (size_t i = 0; i < C_per_part.size(); ++i) {
+        BT_CHECK(dparts_gpu_fp16[i].dtype == brotensor::Dtype::FP16);
+        Tensor seg = fp16_host_to_f32(download_to_host(dparts_gpu_fp16[i]));
+        compare_tensors(dparts_cpu[i], seg, "nchw_bwd_fp16", 0.0f, 0.0f);
+    }
+}
+
+} // namespace (bf16 + fp16 helpers)
+
+BT_PARITY_TEST(nchw_fp16_equal)   { run_nchw_fp16(2, 4, 4, {3, 3}, 0xA40ull); }
+BT_PARITY_TEST(nchw_fp16_varying) { run_nchw_fp16(3, 2, 5, {1, 4, 2}, 0xA41ull); }
+BT_PARITY_TEST(nchw_fp16_single)  { run_nchw_fp16(1, 8, 8, {16}, 0xA42ull); }
 
 BT_PARITY_TEST(cbr_bf16_equal)   { run_batched_rows_bf16(4, {8, 8, 8}, 0xA20ull); }
 BT_PARITY_TEST(cbr_bf16_varying) { run_batched_rows_bf16(7, {3, 17, 5}, 0xA21ull); }
