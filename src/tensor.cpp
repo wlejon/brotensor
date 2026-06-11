@@ -271,15 +271,18 @@ void Tensor::release_() {
     }
     data = nullptr;
     owns_ = false;
+    cap_bytes_ = 0;
 }
 
 Tensor::Tensor(Tensor&& o) noexcept
     : data(o.data), rows(o.rows), cols(o.cols),
-      dtype(o.dtype), device(o.device), owns_(o.owns_) {
+      dtype(o.dtype), device(o.device), owns_(o.owns_),
+      cap_bytes_(o.cap_bytes_) {
     o.data = nullptr;
     o.rows = 0;
     o.cols = 0;
     o.owns_ = false;
+    o.cap_bytes_ = 0;
 }
 
 Tensor& Tensor::operator=(Tensor&& o) noexcept {
@@ -291,10 +294,12 @@ Tensor& Tensor::operator=(Tensor&& o) noexcept {
         dtype   = o.dtype;
         device  = o.device;
         owns_   = o.owns_;
+        cap_bytes_ = o.cap_bytes_;
         o.data = nullptr;
         o.rows  = 0;
         o.cols  = 0;
         o.owns_ = false;
+        o.cap_bytes_ = 0;
     }
     return *this;
 }
@@ -328,6 +333,7 @@ Tensor Tensor::empty_on(Device d, int r, int c, Dtype dt) {
     t.cols   = c;
     t.data  = backend_alloc(d, t.bytes());
     t.owns_  = (t.data != nullptr);
+    t.cap_bytes_ = t.owns_ ? t.bytes() : 0;
     return t;
 }
 
@@ -466,7 +472,6 @@ void Tensor::resize(int r, int c, Dtype dt) {
     const std::size_t new_bytes = dtype_storage_bytes(
         dt,
         static_cast<std::int64_t>(r) * static_cast<std::int64_t>(c));
-    const std::size_t cur_bytes = bytes();
     if (r == rows && c == cols && dt == dtype && data != nullptr) return;
     // A non-owning view over real storage cannot be reshaped: reallocating
     // would silently allocate fresh owned memory and sever the view, leaving
@@ -478,10 +483,14 @@ void Tensor::resize(int r, int c, Dtype dt) {
         throw_msg("brotensor: resize: cannot reshape a non-owning view; "
                   "allocate a fresh tensor or re-view() with the new shape");
     }
-    if (new_bytes != cur_bytes || !owns_) {
+    // Keep the existing storage whenever the new shape fits — the buffer
+    // stabilises at its high-water mark and its device pointer stays put
+    // (required when the op sequence using it is CUDA-graph captured).
+    if (new_bytes > cap_bytes_ || !owns_) {
         release_();
         data = backend_alloc(device, new_bytes);
         owns_ = (data != nullptr);
+        cap_bytes_ = owns_ ? new_bytes : 0;
     }
     rows  = r;
     cols  = c;

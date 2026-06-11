@@ -174,12 +174,17 @@ struct Tensor {
     // memset_zero hook.
     void zero();
 
-    // Reallocates if (r, c, dt) differs from current shape/dtype; leaves
-    // contents undefined (call zero() afterwards if needed). Device is
-    // preserved. Existing owned storage is freed. A no-op if the shape and
-    // dtype already match. Throws std::runtime_error on a negative dimension,
-    // or if called on a non-owning view (a tensor from view()) — reshaping a
-    // view would silently sever it, so allocate a fresh tensor instead.
+    // Reshapes to (r, c, dt); leaves contents undefined (call zero()
+    // afterwards if needed). Device is preserved. Storage is kept whenever
+    // the requested shape fits the existing allocation (capacity = the
+    // high-water mark of this tensor's past sizes), so a scratch buffer
+    // cycling through shapes stabilises at its largest size instead of
+    // reallocating every call — which also keeps its device pointer stable,
+    // a requirement for CUDA-graph-captured op sequences. Reallocates only
+    // when growing past capacity. A no-op if the shape and dtype already
+    // match. Throws std::runtime_error on a negative dimension, or if called
+    // on a non-owning view (a tensor from view()) — reshaping a view would
+    // silently sever it, so allocate a fresh tensor instead.
     void resize(int r, int c, Dtype dt = Dtype::FP32);
 
     // ─── Accessors ─────────────────────────────────────────────────────────
@@ -232,6 +237,11 @@ struct Tensor {
 
 private:
     bool owns_ = false;
+    // Bytes actually allocated behind `data` when owns_ is true — resize()
+    // keeps the existing storage whenever the requested size fits, so the
+    // capacity is the high-water mark of past sizes. 0 for views, released,
+    // and default-constructed tensors.
+    std::size_t cap_bytes_ = 0;
     void release_();
 };
 
