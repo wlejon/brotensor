@@ -55,7 +55,14 @@ struct CudaGraphCapture::Impl {
 };
 
 CudaGraphCapture::CudaGraphCapture() : impl_(new Impl) {
-    BROTENSOR_CUDA_CHECK(cudaStreamCreate(&impl_->stream));
+    // Non-blocking: a default (blocking) stream may not capture while any other
+    // thread touches the legacy stream — every legacy-stream launch elsewhere
+    // fails with cudaErrorStreamCaptureImplicit (906) and the capture itself is
+    // then poisoned (901). Concurrent model threads (e.g. a wake-word detector
+    // feeding on the legacy stream while an LLM/TTS thread captures its decode
+    // step) make that a routine collision, not an edge case.
+    BROTENSOR_CUDA_CHECK(
+        cudaStreamCreateWithFlags(&impl_->stream, cudaStreamNonBlocking));
     impl_->prev_stream = cuda_current_stream();
     // Route subsequent ops (and pool allocations) onto the capture stream.
     detail::cuda::cuda_set_stream(impl_->stream);
