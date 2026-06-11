@@ -104,7 +104,7 @@ void concat_batched_rows(const std::vector<const Tensor*>& parts,
             dst_base + col_off_bytes, dst_pitch,
             p->data,                  elem * d,
             elem * d,                 B,
-            cudaMemcpyDeviceToDevice));
+            cudaMemcpyDeviceToDevice, cur_stream()));
         col_off_bytes += elem * d;
     }
 }
@@ -151,7 +151,7 @@ void concat_nchw_channels(const std::vector<const Tensor*>& parts,
             dst_base + c_off * HW * elem, dst_pitch,
             parts[i]->data,                width_bytes,
             width_bytes,                   static_cast<size_t>(N),
-            cudaMemcpyDeviceToDevice));
+            cudaMemcpyDeviceToDevice, cur_stream()));
         c_off += static_cast<size_t>(Ci);
     }
 }
@@ -197,7 +197,7 @@ void concat_nchw_channels_backward(const Tensor& dY,
             p->data,                          width_bytes,
             src_base + c_off * HW * elem,     src_pitch,
             width_bytes,                       static_cast<size_t>(N),
-            cudaMemcpyDeviceToDevice));
+            cudaMemcpyDeviceToDevice, cur_stream()));
         c_off += static_cast<size_t>(Ci);
     }
 }

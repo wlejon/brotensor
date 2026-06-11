@@ -150,7 +150,8 @@ void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
     }
     if (M == 0 || N == 0) return;
     if (K == 0) {
-        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(C.data, 0, C.bytes()));
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(C.data, 0, C.bytes(),
+            reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream())));
         return;
     }
 
