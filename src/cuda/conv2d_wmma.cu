@@ -310,6 +310,20 @@ static bool launch_conv2d_implicit_gemm_wmma_impl(
     // slower than the naive kernel (lineart tail 64->1 at 256^2: 1.18 ms
     // WMMA vs 0.16 ms naive). Below the ~4x-waste break-even, go naive.
     if (C_out < 16) return false;
+    // Low-CTA long-K GEMMs: the grid is ceil(M/64) x ceil(C_out/64) CTAs; when
+    // that undershoots the SM count the K loop serializes on a mostly idle GPU
+    // and the naive kernel's M*C_out-thread parallelism wins. Measured on a
+    // 4090 with the openpose CPM stage conv (7x7 128ch, K=6272): 24 CTAs WMMA
+    // 0.63 ms vs naive 0.41 ms; 36 CTAs 0.66 vs ~0.59; 46 CTAs WMMA ahead
+    // (0.64 vs 0.70). Same story for SD-decoder 3x3 1280ch at 8x8 (20 CTAs:
+    // 1.20 vs ~0.77). Short-K GEMMs (1x1 projections) stay WMMA — they win
+    // even at 24 CTAs (0.03 vs 0.04 ms) because there is no long K loop to
+    // serialize. Break-even ~40 CTAs at K >= ~1k.
+    {
+        const long long K = static_cast<long long>(C_in) * kH * kW;
+        const int ctas = ((C_out + BN - 1) / BN) * ((M + BM - 1) / BM);
+        if (ctas < 40 && K >= 1024) return false;
+    }
 
     dim3 block(THREADS_PER_CTA);
     dim3 grid((C_out + BN - 1) / BN, (M + BM - 1) / BM);
