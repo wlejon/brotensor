@@ -28,7 +28,10 @@
 #include <unordered_map>
 #include <vector>
 
-namespace brotensor { struct Tensor; }
+namespace brotensor {
+struct Tensor;
+enum class Dtype;  // brotensor/tensor.h — target dtype for upload_as
+}
 
 namespace brotensor::safetensors {
 
@@ -117,6 +120,14 @@ void upload_fp16(const TensorView& view, int rows, int cols, brotensor::Tensor& 
 // checkpoint serves either backend. BF16 is the on-disk dtype of Flux-family
 // weights; it is widened to FP32 on the CPU backend (which has no BF16
 // arithmetic) and narrowed to FP16 on a GPU backend.
+// Upload `view` (F16 / F32 / BF16 source) as a (rows, cols) tensor at an
+// EXPLICIT arithmetic dtype (FP32 / FP16 / BF16), converting host-side as
+// needed, on the current default device. Lets a module pick a compute dtype
+// different from the global one — e.g. Flux runs BF16 on a GPU backend
+// whose pipeline dtype is FP16, because its activations overflow FP16.
+void upload_as(const TensorView& view, int rows, int cols,
+               brotensor::Dtype want, brotensor::Tensor& dst);
+
 void upload_compute(const TensorView& view, int rows, int cols,
                     brotensor::Tensor& dst);
 

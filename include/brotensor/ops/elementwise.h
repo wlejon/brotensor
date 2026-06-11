@@ -25,8 +25,9 @@ void clamp(Tensor& y, float lo, float hi);
 
 
 // Dtype cast: dst = src converted to out_dtype. dst resized to (src.rows,
-// src.cols, out_dtype) on src's device. Supports FP32<->FP16, FP32<->BF16, and
-// a same-dtype passthrough copy; other pairs throw. The standard
+// src.cols, out_dtype) on src's device. Supports FP32<->FP16, FP32<->BF16,
+// FP16<->BF16 (via FP32 — exact for FP16→BF16's overlapping mantissa range),
+// and a same-dtype passthrough copy; other pairs throw. The standard
 // mixed-precision primitive (low-precision weight <-> FP32 master copy).
 void cast(const Tensor& src, Tensor& dst, Dtype out_dtype);
 

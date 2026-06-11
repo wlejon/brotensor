@@ -889,6 +889,22 @@ __global__ void cast_h2f_kernel(const __half* __restrict__ s,
     }
 }
 
+__global__ void cast_h2bf_kernel(const __half* __restrict__ s,
+                                 __nv_bfloat16* __restrict__ d, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        d[i] = __float2bfloat16(__half2float(s[i]));
+    }
+}
+
+__global__ void cast_bf2h_kernel(const __nv_bfloat16* __restrict__ s,
+                                 __half* __restrict__ d, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        d[i] = __float2half(__bfloat162float(s[i]));
+    }
+}
+
 } // anonymous namespace
 
 using ::brotensor::Tensor;
@@ -1088,9 +1104,18 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
         cast_bf2f_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(src.data),
             static_cast<float*>(dst.data), n);
+    } else if (src.dtype == Dtype::FP16 && out_dtype == Dtype::BF16) {
+        cast_h2bf_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __half*>(src.data),
+            static_cast<__nv_bfloat16*>(dst.data), n);
+    } else if (src.dtype == Dtype::BF16 && out_dtype == Dtype::FP16) {
+        cast_bf2h_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __nv_bfloat16*>(src.data),
+            static_cast<__half*>(dst.data), n);
     } else {
         throw std::runtime_error(
-            "cast: unsupported dtype pair (CUDA supports FP32<->FP16 and FP32<->BF16)");
+            "cast: unsupported dtype pair (CUDA supports FP32<->FP16, "
+            "FP32<->BF16, and FP16<->BF16)");
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
