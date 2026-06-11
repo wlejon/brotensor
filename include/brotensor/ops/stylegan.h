@@ -2,12 +2,14 @@
 
 // brotensor ops/stylegan.h — StyleGAN3-R generator primitives:
 //   modulated_conv2d, upfirdn2d, bias_act (backend ops, fwd+bwd) and
-//   filtered_lrelu (a composite over bias_act + upfirdn2d, no backend kernel).
+//   filtered_lrelu (fused CUDA kernel + a device-agnostic composite over
+//   bias_act + upfirdn2d — the path on CPU/Metal, see src/filtered_lrelu.cpp).
 //
-// CPU FP32 reference path; mirrors the pure-PyTorch `_ref` implementations in
-// NVlabs/stylegan3 (modulated_conv2d / SynthesisLayer, _upfirdn2d_ref,
-// _bias_act_ref, _filtered_lrelu_ref) so numerics match bit-for-the-math.
-// CUDA / Metal slots are left null until the CPU path is validated.
+// Mirrors the pure-PyTorch `_ref` implementations in NVlabs/stylegan3
+// (modulated_conv2d / SynthesisLayer, _upfirdn2d_ref, _bias_act_ref,
+// _filtered_lrelu_ref) so numerics match bit-for-the-math. CPU is the FP32
+// reference; the CUDA / Metal kernels are dtype-dispatched FP32/FP16/BF16
+// with FP32 math.
 
 #include "../tensor.h"
 
