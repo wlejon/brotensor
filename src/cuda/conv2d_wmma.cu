@@ -19,12 +19,17 @@
 // so the store re-scatters the (m=(n,oh,ow), oc) tile cell to
 // Y[n*C_out*HW + oc*HW + oh*W_out + ow].
 //
-// Dispatch is restricted to the SD1.5-relevant cases:
+// Dispatch covers the SD1.5 + brovisionml-annotator cases:
 //   * 3x3, stride 1, pad 1, dilation 1   (almost every UNet/VAE conv)
 //   * 1x1, stride 1, pad 0, dilation 1   (point-wise convs in attention blocks)
-// Other shapes (stride 2 downsamplers, dilated, asymmetric) fall through to
-// the naive direct-conv kernel in conv2d.cu via the dispatch helper in
-// conv2d.cu — this file only provides the WMMA entry point.
+//   * 3x3, stride 2, pad 1, dilation 1   (UNet downsamplers)
+//   * 3x3, stride 1, pad 0, dilation 1   (lineart res blocks, pre-padded input)
+//   * 7x7, stride 1, pad 3, dilation 1   (openpose CPM stages)
+//   * 7x7, stride 1, pad 0, dilation 1   (lineart head/tail, pre-padded input)
+//   * 5x5, stride 1, pad 2, dilation 1   (general coverage)
+// Other shapes (dilated, asymmetric, grouped) fall through to the naive
+// direct-conv kernel in conv2d.cu via the dispatch helper in conv2d.cu —
+// this file only provides the WMMA entry point.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -76,8 +81,8 @@ static constexpr int LDA_SMEM = BK + 8;  // padding to reduce bank conflicts
 static constexpr int LDB_SMEM = BK + 8;
 
 // kH * kW must be a compile-time constant for index unrolling, so the kernel
-// is templated on (KH, KW, PAD, STRIDE).  For SD1.5 we instantiate KH=KW=3,
-// PAD=1, STRIDE=1 and KH=KW=1, PAD=0, STRIDE=1.
+// is templated on (KH, KW, PAD, STRIDE); the dispatcher below instantiates
+// the SD1.5 and annotator shape set listed in the file header.
 template <typename T,
           int KH, int KW, int PAD_H, int PAD_W, int STRIDE_H, int STRIDE_W>
 __launch_bounds__(THREADS_PER_CTA)
@@ -300,6 +305,11 @@ static bool launch_conv2d_implicit_gemm_wmma_impl(
     if (M <= 0 || C_out <= 0 || C_in <= 0) return false;
     // Tiny problems: not worth the launch overhead.
     if (size_t(M) * size_t(C_out) < 1024) return false;
+    // Skinny-N GEMMs: the CTA always computes a BN=64-wide output-channel
+    // tile, so C_out < 16 wastes >4x of the tensor-core work — measured
+    // slower than the naive kernel (lineart tail 64->1 at 256^2: 1.18 ms
+    // WMMA vs 0.16 ms naive). Below the ~4x-waste break-even, go naive.
+    if (C_out < 16) return false;
 
     dim3 block(THREADS_PER_CTA);
     dim3 grid((C_out + BN - 1) / BN, (M + BM - 1) / BM);
@@ -316,6 +326,32 @@ static bool launch_conv2d_implicit_gemm_wmma_impl(
     }
     if (kH == 3 && kW == 3 && pad_h == 1 && pad_w == 1 && stride_h == 2 && stride_w == 2) {
         conv2d_implicit_gemm_wmma_kernel<T, 3, 3, 1, 1, 2, 2>
+            <<<grid, block, 0, cur_stream()>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
+        return true;
+    }
+    // brovisionml annotator shapes (HED / lineart / openpose / DSINE):
+    // 3x3 pad 0 (lineart res blocks on reflect-pre-padded input).
+    if (kH == 3 && kW == 3 && pad_h == 0 && pad_w == 0 && stride_h == 1 && stride_w == 1) {
+        conv2d_implicit_gemm_wmma_kernel<T, 3, 3, 0, 0, 1, 1>
+            <<<grid, block, 0, cur_stream()>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
+        return true;
+    }
+    // 7x7 pad 3 (openpose CPM stages).
+    if (kH == 7 && kW == 7 && pad_h == 3 && pad_w == 3 && stride_h == 1 && stride_w == 1) {
+        conv2d_implicit_gemm_wmma_kernel<T, 7, 7, 3, 3, 1, 1>
+            <<<grid, block, 0, cur_stream()>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
+        return true;
+    }
+    // 7x7 pad 0 (lineart head/tail convs on pre-padded input; the C_out=1
+    // tail stays naive via the skinny-N gate above).
+    if (kH == 7 && kW == 7 && pad_h == 0 && pad_w == 0 && stride_h == 1 && stride_w == 1) {
+        conv2d_implicit_gemm_wmma_kernel<T, 7, 7, 0, 0, 1, 1>
+            <<<grid, block, 0, cur_stream()>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
+        return true;
+    }
+    // 5x5 pad 2 (general coverage — EfficientNet-ish shapes).
+    if (kH == 5 && kW == 5 && pad_h == 2 && pad_w == 2 && stride_h == 1 && stride_w == 1) {
+        conv2d_implicit_gemm_wmma_kernel<T, 5, 5, 2, 2, 1, 1>
             <<<grid, block, 0, cur_stream()>>>(X, Wt, bias, Y, N, C_in, H, W, C_out, H_out, W_out);
         return true;
     }

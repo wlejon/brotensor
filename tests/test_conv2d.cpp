@@ -1290,6 +1290,43 @@ int main() {
             1, 2, 0, 1, 1, 1,
             true);
 
+    // (6) WMMA implicit-GEMM annotator shapes. Sized so M*C_out >= 1024 puts
+    // them on the WMMA fast path (FP16); odd spatial dims exercise the tile
+    // edge masking, and the C_in=3 case exercises a degenerate K extent on
+    // the lineart head conv. The C_out=1 tail conv documents the skinny-N
+    // dispatch gate (it rides the naive kernel — WMMA wastes the 64-wide
+    // output-channel tile there).
+    run_one("wmma 3x3 pad0 (lineart res)",
+            1, 32, 25, 27,
+            48, 3, 3,
+            1, 1, 0, 0, 1, 1,
+            true);
+    run_one("wmma 7x7 pad3 Cin185 (openpose CPM)",
+            1, 185, 15, 17,
+            128, 7, 7,
+            1, 1, 3, 3, 1, 1,
+            true);
+    run_one("wmma 7x7 pad3 Cin128 (openpose CPM)",
+            1, 128, 13, 15,
+            128, 7, 7,
+            1, 1, 3, 3, 1, 1,
+            false);
+    run_one("wmma 7x7 pad0 Cin3 (lineart head)",
+            1, 3, 37, 41,
+            64, 7, 7,
+            1, 1, 0, 0, 1, 1,
+            true);
+    run_one("wmma 7x7 pad0 Cout1 (lineart tail)",
+            1, 64, 45, 39,
+            1, 7, 7,
+            1, 1, 0, 0, 1, 1,
+            true);
+    run_one("wmma 5x5 pad2",
+            1, 48, 21, 19,
+            32, 5, 5,
+            1, 1, 2, 2, 1, 1,
+            true);
+
     // ─── FP32 forward parity ─────────────────────────────────────────────
     run_one_fp32("3x3 same-pad",
                  2, 3, 5, 5, 4, 3, 3,

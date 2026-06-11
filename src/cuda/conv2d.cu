@@ -413,8 +413,9 @@ void conv2d_forward(const ::brotensor::Tensor& X,
                                   : nullptr;
         __half* y_p        = static_cast<__half*>(Y.data);
 
-        // Try the WMMA implicit-GEMM path for the SD1.5-relevant shapes
-        // (3x3 s1 p1 d1, 1x1 s1 p0 d1, 3x3 s2 p1 d1). The WMMA path assumes
+        // Try the WMMA implicit-GEMM path for the SD1.5 + annotator shapes
+        // (3x3 s1 p1, 1x1 s1 p0, 3x3 s2 p1, 3x3 s1 p0, 7x7 s1 p3,
+        // 7x7 s1 p0, 5x5 s1 p2 — all dilation 1). The WMMA path assumes
         // full convolution (groups=1) — bypass it for grouped conv.
         if (groups == 1 &&
             conv2d_wmma_internal::launch_conv2d_implicit_gemm_wmma(

@@ -276,6 +276,10 @@ const ConvCfg kAsym    {1, 4, 7, 9,   5, 3, 2,  2,1, 1,0, 1,1, 1};
 // backward-weight path now that the small-grid configs above take the
 // block-per-element kernel.
 const ConvCfg kBigW    {1, 64, 6, 6,  128, 3, 3,  1,1, 1,1, 1,1, 1};
+// Annotator shapes sized past the M*C_out >= 1024 gate so the BF16 forward
+// rides the WMMA implicit-GEMM path (3x3 pad 0 and 7x7 pad 3 branches).
+const ConvCfg kWmma3x3p0 {1, 32, 25, 27, 48, 3, 3,  1,1, 0,0, 1,1, 1};
+const ConvCfg kWmma7x7p3 {1, 64, 13, 15, 64, 7, 7,  1,1, 3,3, 1,1, 1};
 
 } // namespace
 
@@ -320,6 +324,8 @@ BT_PARITY_TEST(conv2d_fwd_bf16_dilated)    { run_fwd_bf16(kDilated,  false, 0x61
 BT_PARITY_TEST(conv2d_fwd_bf16_grouped)    { run_fwd_bf16(kGrouped,  true,  0x6104ull); }
 BT_PARITY_TEST(conv2d_fwd_bf16_depthwise)  { run_fwd_bf16(kDepthw,   true,  0x6105ull); }
 BT_PARITY_TEST(conv2d_fwd_bf16_asym)       { run_fwd_bf16(kAsym,     false, 0x6106ull); }
+BT_PARITY_TEST(conv2d_fwd_bf16_wmma_3x3p0) { run_fwd_bf16(kWmma3x3p0, true, 0x6107ull); }
+BT_PARITY_TEST(conv2d_fwd_bf16_wmma_7x7p3) { run_fwd_bf16(kWmma7x7p3, true, 0x6108ull); }
 
 // ─── BF16 backward input ────────────────────────────────────────────────────
 BT_PARITY_TEST(conv2d_bwd_input_bf16_1x1)     { run_bwd_input_bf16(k1x1,      0x6110ull); }
