@@ -150,6 +150,31 @@ void run_leaky_fwd(int rows, int cols, float slope, uint64_t seed) {
                     kAtol, kRtol);
 }
 
+// FP16 / BF16 forward (CUDA-only path; FP32 CPU reference over inputs
+// rounded through the 16-bit type — leaky_relu keeps positive values
+// bit-exactly, only the slope*x branch re-rounds on store).
+void run_leaky_fwd_16(int rows, int cols, float slope, bool bf16,
+                      uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X = Tensor::mat(rows, cols);
+    fill_random(X, rng, 2.0f);
+    Tensor Xq = bf16 ? bf16_host_to_f32(to_bf16_host(X))
+                     : fp16_host_to_f32(to_fp16_host(X));
+
+    Tensor cpu_Y;
+    brotensor::leaky_relu_forward(Xq, slope, cpu_Y);
+
+    Tensor gX = bf16 ? to_bf16_gpu(X) : to_fp16_gpu(X);
+    Tensor gpu_Y;
+    brotensor::leaky_relu_forward(gX, slope, gpu_Y);
+    BT_CHECK(gpu_Y.dtype == gX.dtype);
+
+    Tensor host = download_to_host(gpu_Y);
+    Tensor wide = bf16 ? bf16_host_to_f32(host) : fp16_host_to_f32(host);
+    compare_tensors(cpu_Y, wide, bf16 ? "leaky_fwd_bf16" : "leaky_fwd_fp16",
+                    bf16 ? 2e-2f : 2e-3f, bf16 ? 2e-2f : 2e-3f);
+}
+
 void run_leaky_bwd(int rows, int cols, float slope, uint64_t seed) {
     SplitMix64 rng(seed);
     Tensor X = Tensor::mat(rows, cols);
@@ -194,5 +219,8 @@ BT_PARITY_TEST(leaky_fwd_001)  { run_leaky_fwd(5, 7,  0.01f, 0x8031ull); }
 BT_PARITY_TEST(leaky_fwd_wide) { run_leaky_fwd(3, 1153, 0.2f, 0x8032ull); }
 BT_PARITY_TEST(leaky_bwd_01)   { run_leaky_bwd(8, 32, 0.1f,  0x8033ull); }
 BT_PARITY_TEST(leaky_bwd_001)  { run_leaky_bwd(5, 7,  0.01f, 0x8034ull); }
+BT_PARITY_TEST(leaky_fwd_fp16)      { run_leaky_fwd_16(8, 32, 0.1f,  false, 0x8035ull); }
+BT_PARITY_TEST(leaky_fwd_fp16_wide) { run_leaky_fwd_16(3, 1153, 0.2f, false, 0x8036ull); }
+BT_PARITY_TEST(leaky_fwd_bf16)      { run_leaky_fwd_16(8, 32, 0.1f,  true,  0x8037ull); }
 
 int main() { return run_all("vocoder cpu/gpu parity"); }

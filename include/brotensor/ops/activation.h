@@ -196,7 +196,8 @@ inline void elu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
 
 // Leaky ReLU (HiFi-GAN activation), elementwise:
 //   y = x > 0 ? x : negative_slope*x.
-// y resized to match x; x and y may alias. CPU FP32-only.
+// y resized to match x; x and y may alias. CPU FP32-only; the CUDA forward
+// is dtype-dispatched on x (FP32/FP16/BF16, FP32 math per element).
 void leaky_relu_forward(const Tensor& x, float negative_slope, Tensor& y);
 
 

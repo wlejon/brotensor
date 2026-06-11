@@ -15,13 +15,18 @@
 //   elu / leaky_relu forward — y  OVERWRITTEN.
 //   elu / leaky_relu backward— dX OVERWRITTEN (no learnable params).
 //
-// These audio ops are FP32-only on every backend — a non-FP32 operand throws.
+// These audio ops are FP32-only on every backend — a non-FP32 operand throws —
+// with one exception: leaky_relu_forward is dtype-dispatched on x
+// (FP32/FP16/BF16, FP32 math per element) because the brovisionml annotators
+// (HED / lineart / MLSD) lean on it inside otherwise-FP16 conv stacks.
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 #include <string>
@@ -152,6 +157,28 @@ __global__ void leaky_relu_forward_kernel(const float* __restrict__ x,
     }
 }
 
+// FP16 / BF16 twins — same shape-agnostic elementwise map, FP32 math per
+// element (matches the relu/silu FP16 kernels in elementwise.cu).
+__global__ void leaky_relu_forward_fp16_kernel(const __half* __restrict__ x,
+                                               float slope, long long n,
+                                               __half* __restrict__ y) {
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         i < n; i += (long long)blockDim.x * gridDim.x) {
+        const float v = __half2float(x[i]);
+        y[i] = __float2half(v > 0.0f ? v : slope * v);
+    }
+}
+
+__global__ void leaky_relu_forward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
+                                               float slope, long long n,
+                                               __nv_bfloat16* __restrict__ y) {
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         i < n; i += (long long)blockDim.x * gridDim.x) {
+        const float v = __bfloat162float(x[i]);
+        y[i] = __float2bfloat16(v > 0.0f ? v : slope * v);
+    }
+}
+
 __global__ void leaky_relu_backward_kernel(const float* __restrict__ x,
                                            const float* __restrict__ dY,
                                            float slope, long long n,
@@ -267,15 +294,29 @@ void elu_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
 
 void leaky_relu_forward(const ::brotensor::Tensor& x, float negative_slope,
                         ::brotensor::Tensor& y) {
-    require_fp32("leaky_relu_forward", x, "x");
+    using ::brotensor::Dtype;
+    if (x.dtype != Dtype::FP32 && x.dtype != Dtype::FP16 &&
+        x.dtype != Dtype::BF16) {
+        fail("leaky_relu_forward", "x must be FP32, FP16 or BF16");
+    }
     if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
         y.resize(x.rows, x.cols, x.dtype);
     }
     const long long n = x.size();
     if (n == 0) return;
-    leaky_relu_forward_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
-        static_cast<const float*>(x.data), negative_slope, n,
-        static_cast<float*>(y.data));
+    if (x.dtype == Dtype::FP16) {
+        leaky_relu_forward_fp16_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __half*>(x.data), negative_slope, n,
+            static_cast<__half*>(y.data));
+    } else if (x.dtype == Dtype::BF16) {
+        leaky_relu_forward_bf16_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __nv_bfloat16*>(x.data), negative_slope, n,
+            static_cast<__nv_bfloat16*>(y.data));
+    } else {
+        leaky_relu_forward_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
+            static_cast<const float*>(x.data), negative_slope, n,
+            static_cast<float*>(y.data));
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
