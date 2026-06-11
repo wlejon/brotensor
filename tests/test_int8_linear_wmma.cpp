@@ -36,6 +36,12 @@ static std::vector<uint16_t> to_fp16(const std::vector<float>& v) {
     return o;
 }
 
+static std::vector<uint16_t> to_bf16(const std::vector<float>& v) {
+    std::vector<uint16_t> o(v.size());
+    for (size_t i = 0; i < v.size(); ++i) o[i] = brotensor::fp32_to_bf16_bits(v[i]);
+    return o;
+}
+
 static void run_case(const char* label, int B, int M, int K, bool with_bias,
                      uint32_t seed, float tol = 1.5e-2f) {
     std::printf("  %s B=%d M=%d K=%d bias=%d\n", label, B, M, K, (int)with_bias);
@@ -103,6 +109,76 @@ static void run_case(const char* label, int B, int M, int K, bool with_bias,
     CHECK(max_err < tol);
 }
 
+// BF16-activation mirror of run_case: same INT8 weights/scales, X/bias/Y in
+// BF16, reference via the BF16 path of linear_forward_batched_fp16. Slightly
+// looser default tolerance (BF16 has 8 mantissa bits vs FP16's 10).
+static void run_case_bf16(const char* label, int B, int M, int K, bool with_bias,
+                          uint32_t seed, float tol = 3e-2f) {
+    std::printf("  %s B=%d M=%d K=%d bias=%d (BF16)\n", label, B, M, K, (int)with_bias);
+
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dx(-0.5f, 0.5f);
+    std::uniform_real_distribution<float> dw(-0.1f, 0.1f);
+    std::uniform_real_distribution<float> db(-0.05f, 0.05f);
+
+    std::vector<float> Xf(static_cast<size_t>(B) * K);
+    std::vector<float> Wf(static_cast<size_t>(M) * K);
+    std::vector<float> Bf(M);
+    for (auto& v : Xf) v = dx(rng);
+    for (auto& v : Wf) v = dw(rng);
+    for (auto& v : Bf) v = db(rng);
+    auto Xb = to_bf16(Xf), Wh = to_fp16(Wf), Bb = to_bf16(Bf);
+
+    std::vector<int8_t> Wq(static_cast<size_t>(M) * K);
+    std::vector<float>  scales(M);
+    brotensor::quantize_int8_per_row_host(Wh.data(), M, K, Wq.data(), scales.data());
+
+    // Reference: dequantise W → BF16, run the BF16 batched linear.
+    std::vector<uint16_t> Wdeq(static_cast<size_t>(M) * K);
+    for (int r = 0; r < M; ++r) {
+        const float s = scales[r];
+        for (int c = 0; c < K; ++c) {
+            Wdeq[r * K + c] = brotensor::fp32_to_bf16_bits(
+                static_cast<float>(Wq[r * K + c]) * s);
+        }
+    }
+
+    Tensor Bg, Y_ref_g;
+    Tensor Xg     = Tensor::from_host_bf16_on(Device::CUDA, Xb.data(),   B, K);
+    Tensor Wdeq_g = Tensor::from_host_bf16_on(Device::CUDA, Wdeq.data(), M, K);
+    if (with_bias) Bg = Tensor::from_host_bf16_on(Device::CUDA, Bb.data(), M, 1);
+    brotensor::linear_forward_batched_fp16(
+        Wdeq_g, with_bias ? &Bg : nullptr, Xg, Y_ref_g);
+    std::vector<uint16_t> ref(Y_ref_g.size());
+    Y_ref_g.copy_to_host_bf16(ref.data());
+
+    // INT8W path with BF16 activations.
+    Tensor W_int8_g = Tensor::empty_on(Device::CUDA, M, K, Dtype::INT8);
+    Tensor Y_g;
+    cudaMemcpy(W_int8_g.data, Wq.data(),
+               static_cast<size_t>(M) * K * sizeof(int8_t),
+               cudaMemcpyHostToDevice);
+    Tensor S_g = Tensor::from_host_on(Device::CUDA, scales.data(), M, 1);
+    brotensor::linear_forward_batched_int8w_fp16(
+        W_int8_g, S_g, with_bias ? &Bg : nullptr, Xg, Y_g);
+    CHECK(Y_g.dtype == Dtype::BF16 && Y_g.rows == B && Y_g.cols == M);
+    std::vector<uint16_t> got(Y_g.size());
+    brotensor::sync_all();
+    Y_g.copy_to_host_bf16(got.data());
+
+    float max_err = 0.0f;
+    int bad = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const float g = brotensor::bf16_bits_to_fp32(got[i]);
+        const float r = brotensor::bf16_bits_to_fp32(ref[i]);
+        const float e = std::fabs(g - r);
+        if (e > max_err) max_err = e;
+        if (e > 1.5e-2f + 1.5e-2f * std::fabs(r)) ++bad;
+    }
+    std::printf("    max_err=%g bad=%d/%zu\n", max_err, bad, ref.size());
+    CHECK(max_err < tol);
+}
+
 int main() {
     brotensor::init();
     if (!brotensor::is_available(brotensor::Device::CUDA)) {
@@ -129,6 +205,14 @@ int main() {
     // Fallback paths: K%8 != 0 must bypass WMMA and still match the reference.
     run_case("fallback K=24", 16, 64,  24, false, 0x4001);
     run_case("fallback K=33", 16, 64,  33, false, 0x4002);
+
+    // BF16-activation mirror (Flux.1 runs BF16 activations over INT8 weights).
+    run_case_bf16("QKVO D=640",       64, 640,  640,      false, 0x5001);
+    run_case_bf16("QKVO D=1280",      16, 1280, 1280,     false, 0x5002);
+    run_case_bf16("FF2 D=1280",       16, 1280, 2 * 1280, false, 0x5003);
+    run_case_bf16("QKVO D=640 +bias", 64, 640,  640,      true,  0x5004);
+    run_case_bf16("fallback K=24",    16, 64,   24,       false, 0x5005);
+    run_case_bf16("fallback K=33",    16, 64,   33,       false, 0x5006);
 
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;

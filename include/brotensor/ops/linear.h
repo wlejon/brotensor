@@ -96,9 +96,12 @@ void matmul_backward(const Tensor& A,
 
 // W8A16 batched linear: Y(B,out) = X(B,in) @ dequant(W_int8)^T + bias. Same
 // (B,in)->(B,out) layout as linear_forward_batched_fp16. FP32 accumulation.
+// Activations may be FP16 *or* BF16 — X and bias must share the dtype and Y is
+// produced in it; the op dispatches internally. (Kept under the historical
+// `_fp16` name for ABI, same naming quirk as linear_forward_batched_fp16.)
 //   W_int8: (out,in) INT8.  scales: (out,1) FP32 per-output-row dequant scales.
-//   bias: (out,1) or (1,out) FP16, or null.  X_BD: (B,in) FP16.
-//   Y_BD: (B,out) FP16, resized as needed.
+//   bias: (out,1) or (1,out) FP16/BF16, or null.  X_BD: (B,in) FP16 or BF16.
+//   Y_BD: (B,out) same dtype as X, resized as needed.
 void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
                                        const Tensor& scales,
                                        const Tensor* bias,

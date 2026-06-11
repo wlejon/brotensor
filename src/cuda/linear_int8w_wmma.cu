@@ -1,16 +1,20 @@
 // Tensor-core batched-linear forward, W8A16 variant.
 //
 // Y(B, M) = X(B, K) @ dequant(W_int8(M, K))^T + bias(M).
-// Structural copy of fp16_matmul.cu's matmul_ABT WMMA kernel (FP16 A, FP16 B,
-// FP32 accum, FP16 store) with two changes: the B-tile loader reads 8 INT8
-// bytes as int2 and dequantises to FP16 using a per-output-row FP32 scale
-// preloaded once into shared, and the C-store epilogue folds in an optional
-// FP16 bias broadcast along M. Same dispatch heuristic as the conv WMMA path
-// (K%8 alignment, problem-size floor); returns false to fall back to the
-// existing tiled kernel.
+// Structural copy of fp16_matmul.cu's matmul_ABT WMMA kernel (16-bit A, 16-bit
+// B, FP32 accum, 16-bit store) with two changes: the B-tile loader reads 8
+// INT8 bytes as int2 and dequantises to the activation dtype using a
+// per-output-row FP32 scale preloaded once into shared, and the C-store
+// epilogue folds in an optional bias broadcast along M. The kernel is a single
+// template over __half and __nv_bfloat16 (sm_89 supports BF16 WMMA fragments;
+// only the fragment element type and the float conversions differ — see
+// conv2d_wmma.cu for the same treatment). Same dispatch heuristic as the conv
+// WMMA path (K%8 alignment, problem-size floor); returns false to fall back to
+// the existing tiled kernel.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #include <cstdint>
 
@@ -25,6 +29,18 @@ namespace cuda {
 namespace linear_int8w_wmma_internal {
 
 using namespace nvcuda;
+
+// Element-type traits so the WMMA kernel can be a single template over both
+// __half and __nv_bfloat16 (mirrors conv2d_wmma.cu's wmma_traits).
+template <typename T> struct wmma_traits;
+template <> struct wmma_traits<__half> {
+    __device__ static __half from_f32(float v)  { return __float2half(v); }
+    __device__ static float   to_f32(__half v)  { return __half2float(v); }
+};
+template <> struct wmma_traits<__nv_bfloat16> {
+    __device__ static __nv_bfloat16 from_f32(float v)        { return __float2bfloat16(v); }
+    __device__ static float         to_f32(__nv_bfloat16 v)  { return __bfloat162float(v); }
+};
 
 static constexpr int WMMA_M = 16;
 static constexpr int WMMA_N = 16;
@@ -45,17 +61,19 @@ static constexpr int FRAGS_N = WN / WMMA_N;
 static constexpr int LDA_SMEM = BK + 8;
 static constexpr int LDB_SMEM = BK + 8;
 
+template <typename T>
 __launch_bounds__(THREADS_PER_CTA)
-__global__ void linear_int8w_fp16_wmma_kernel(
-        const __half*  __restrict__ X,
+__global__ void linear_int8w_a16_wmma_kernel(
+        const T*       __restrict__ X,
         const int8_t*  __restrict__ W_int8,
         const float*   __restrict__ scales,
-        const __half*  __restrict__ bias,
-        __half*        __restrict__ Y,
+        const T*       __restrict__ bias,
+        T*             __restrict__ Y,
         int B, int M, int K) {
-    __shared__ __half As[BM][LDA_SMEM];
-    __shared__ __half Bs[BN][LDB_SMEM];
-    __shared__ float  Bs_scale[BN];
+    using TR = wmma_traits<T>;
+    __shared__ T     As[BM][LDA_SMEM];
+    __shared__ T     Bs[BN][LDB_SMEM];
+    __shared__ float Bs_scale[BN];
 
     const int tid     = threadIdx.x;
     const int warp_id = tid >> 5;
@@ -98,7 +116,7 @@ __global__ void linear_int8w_fp16_wmma_kernel(
                 const int grow = block_m + row;
                 const int gk   = k0 + gcol;
 
-                __half tmp[kHalvesPerLoad];
+                T tmp[kHalvesPerLoad];
                 if (grow < B && gk + kHalvesPerLoad <= K) {
                     const int4* src = reinterpret_cast<const int4*>(&X[grow * K + gk]);
                     *reinterpret_cast<int4*>(tmp) = *src;
@@ -108,7 +126,7 @@ __global__ void linear_int8w_fp16_wmma_kernel(
                         const int gk_q = gk + q;
                         tmp[q] = (grow < B && gk_q < K)
                                  ? X[grow * K + gk_q]
-                                 : __float2half(0.0f);
+                                 : TR::from_f32(0.0f);
                     }
                 }
                 *reinterpret_cast<int4*>(&As[row][gcol]) =
@@ -149,10 +167,10 @@ __global__ void linear_int8w_fp16_wmma_kernel(
                     }
                 }
                 const float s = Bs_scale[row];
-                __half tmp_h[kHalvesPerLoad];
+                T tmp_h[kHalvesPerLoad];
                 #pragma unroll
                 for (int q = 0; q < kHalvesPerLoad; ++q) {
-                    tmp_h[q] = __float2half(static_cast<float>(tmp8[q]) * s);
+                    tmp_h[q] = TR::from_f32(static_cast<float>(tmp8[q]) * s);
                 }
                 *reinterpret_cast<int4*>(&Bs[row][gcol]) =
                     *reinterpret_cast<const int4*>(tmp_h);
@@ -163,17 +181,17 @@ __global__ void linear_int8w_fp16_wmma_kernel(
 
         #pragma unroll
         for (int kk = 0; kk < BK; kk += WMMA_K) {
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag[FRAGS_M];
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::col_major> b_frag[FRAGS_N];
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, T, wmma::row_major> a_frag[FRAGS_M];
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, T, wmma::col_major> b_frag[FRAGS_N];
 
             #pragma unroll
             for (int i = 0; i < FRAGS_M; ++i) {
-                const __half* a_ptr = &As[warp_m * WM + i * WMMA_M][kk];
+                const T* a_ptr = &As[warp_m * WM + i * WMMA_M][kk];
                 wmma::load_matrix_sync(a_frag[i], a_ptr, LDA_SMEM);
             }
             #pragma unroll
             for (int j = 0; j < FRAGS_N; ++j) {
-                const __half* b_ptr = &Bs[warp_n * WN + j * WMMA_N][kk];
+                const T* b_ptr = &Bs[warp_n * WN + j * WMMA_N][kk];
                 wmma::load_matrix_sync(b_frag[j], b_ptr, LDB_SMEM);
             }
             #pragma unroll
@@ -188,19 +206,17 @@ __global__ void linear_int8w_fp16_wmma_kernel(
         __syncthreads();
     }
 
-    __shared__ __half Cs[BM][BN + 8];
+    // FP32 staging tile (WMMA has no BF16 accumulator fragment, and FP32 is
+    // numerically exact for both storage paths — narrowing happens in the
+    // scatter epilogue below).
+    __shared__ float Cs[BM][BN + 8];
 
     #pragma unroll
     for (int i = 0; i < FRAGS_M; ++i) {
         #pragma unroll
         for (int j = 0; j < FRAGS_N; ++j) {
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __half> c_h;
-            #pragma unroll
-            for (int e = 0; e < c_frag[i][j].num_elements; ++e) {
-                c_h.x[e] = __float2half(c_frag[i][j].x[e]);
-            }
-            __half* c_ptr = &Cs[warp_m * WM + i * WMMA_M][warp_n * WN + j * WMMA_N];
-            wmma::store_matrix_sync(c_ptr, c_h, BN + 8, wmma::mem_row_major);
+            float* c_ptr = &Cs[warp_m * WM + i * WMMA_M][warp_n * WN + j * WMMA_N];
+            wmma::store_matrix_sync(c_ptr, c_frag[i][j], BN + 8, wmma::mem_row_major);
         }
     }
 
@@ -221,16 +237,18 @@ __global__ void linear_int8w_fp16_wmma_kernel(
             const int gcol = block_n + col;   // out
             if (grow >= B || gcol >= M) continue;
 
-            float v = __half2float(Cs[row][col]);
-            if (bias) v += __half2float(bias[gcol]);
-            Y[grow * M + gcol] = __float2half(v);
+            float v = Cs[row][col];
+            if (bias) v += TR::to_f32(bias[gcol]);
+            Y[grow * M + gcol] = TR::from_f32(v);
         }
     }
 }
 
-bool launch_linear_int8w_fp16_wmma(
-        const __half* X, const int8_t* W, const float* scales,
-        const __half* bias, __half* Y,
+// Element-type-generic dispatcher shared by the FP16 and BF16 entry points.
+template <typename T>
+static bool launch_linear_int8w_a16_wmma_impl(
+        const T* X, const int8_t* W, const float* scales,
+        const T* bias, T* Y,
         int B, int M, int K) {
     if (B <= 0 || M <= 0 || K <= 0) return false;
     if ((K & 7) != 0) return false;
@@ -239,9 +257,27 @@ bool launch_linear_int8w_fp16_wmma(
 
     dim3 block(THREADS_PER_CTA);
     dim3 grid((M + BN - 1) / BN, (B + BM - 1) / BM);
-    linear_int8w_fp16_wmma_kernel<<<grid, block, 0, cur_stream()>>>(
+    linear_int8w_a16_wmma_kernel<T><<<grid, block, 0, cur_stream()>>>(
         X, W, scales, bias, Y, B, M, K);
     return true;
+}
+
+bool launch_linear_int8w_fp16_wmma(
+        const __half* X, const int8_t* W, const float* scales,
+        const __half* bias, __half* Y,
+        int B, int M, int K) {
+    return launch_linear_int8w_a16_wmma_impl<__half>(
+        X, W, scales, bias, Y, B, M, K);
+}
+
+// BF16-activation twin of launch_linear_int8w_fp16_wmma — exactly the same
+// template instantiated with __nv_bfloat16 (sm_89 supports BF16 fragments).
+bool launch_linear_int8w_bf16_wmma(
+        const __nv_bfloat16* X, const int8_t* W, const float* scales,
+        const __nv_bfloat16* bias, __nv_bfloat16* Y,
+        int B, int M, int K) {
+    return launch_linear_int8w_a16_wmma_impl<__nv_bfloat16>(
+        X, W, scales, bias, Y, B, M, K);
 }
 
 } // namespace linear_int8w_wmma_internal
