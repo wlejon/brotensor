@@ -432,6 +432,8 @@
     X(sum_rows,                                void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y))                                                           \
     X(sum_cols,                                void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y))                                                           \
     X(argmax_rows,                             void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx))                                                         \
+    X(rows_count_above,                        void,  (const ::brotensor::Tensor& X, float t_lo, float t_hi, ::brotensor::Tensor& counts))                              \
+    X(threshold_u8,                            void,  (const ::brotensor::Tensor& X, float t, ::brotensor::Tensor& Y))                                                  \
     /* ─── Diffusion sampler steps + timestep embedding ─── */                                                                                                          \
     X(ddim_step,                               void,  (const ::brotensor::Tensor& x_t, const ::brotensor::Tensor& eps_pred,                                             \
                                                        float alpha_t, float alpha_prev, float sigma_t, ::brotensor::Tensor& x_prev))                                    \

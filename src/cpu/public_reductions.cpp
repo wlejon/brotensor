@@ -3,9 +3,11 @@
 // FP32 scalar host implementations. Ports the GPU kernels in
 // src/cuda/public_reductions.cu — FP32 path only.
 //
-//   sum_rows    — per-row sum; out is (M, 1).
-//   sum_cols    — per-column sum; out is (1, N).
-//   argmax_rows — per-row argmax index, written as FP32; out is (M, 1).
+//   sum_rows         — per-row sum; out is (M, 1).
+//   sum_cols         — per-column sum; out is (1, N).
+//   argmax_rows      — per-row argmax index, written as FP32; out is (M, 1).
+//   rows_count_above — per-row strict-> counts at two thresholds; counts is
+//                      (R, 2) INT32. Accepts FP32 or FP16 X (matches CUDA).
 //
 // GPU argmax: ties keep the lowest index (strict `v > best_v`); the scalar
 // loop here matches that.
@@ -14,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace brotensor::detail::cpu {
 
@@ -77,6 +80,37 @@ void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx) {
         }
         if (ip) ip[m] = best_i;
         else    fp[m] = static_cast<float>(best_i);
+    }
+}
+
+// One pass per row over both thresholds. Strict >: a value exactly at a
+// threshold is not counted.
+void rows_count_above(const ::brotensor::Tensor& X, float t_lo, float t_hi,
+                      ::brotensor::Tensor& counts) {
+    using ::brotensor::Dtype;
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16) {
+        throw std::runtime_error("rows_count_above: X must be FP32 or FP16");
+    }
+    const int R = X.rows;
+    const int C = X.cols;
+    if (counts.rows != R || counts.cols != 2 || counts.dtype != Dtype::INT32) {
+        counts.resize(R, 2, Dtype::INT32);
+    }
+    if (R == 0) return;
+    int32_t* cp = static_cast<int32_t*>(counts.host_raw_mut());
+    const float* xf = (X.dtype == Dtype::FP32) ? X.host_f32() : nullptr;
+    const uint16_t* xh = (X.dtype == Dtype::FP16) ? X.host_fp16() : nullptr;
+    for (int r = 0; r < R; ++r) {
+        int32_t n_lo = 0, n_hi = 0;
+        const std::size_t base = static_cast<std::size_t>(r) * C;
+        for (int c = 0; c < C; ++c) {
+            const float v = xf ? xf[base + c]
+                               : ::brotensor::fp16_bits_to_fp32(xh[base + c]);
+            n_lo += (v > t_lo) ? 1 : 0;
+            n_hi += (v > t_hi) ? 1 : 0;
+        }
+        cp[2 * r + 0] = n_lo;
+        cp[2 * r + 1] = n_hi;
     }
 }
 

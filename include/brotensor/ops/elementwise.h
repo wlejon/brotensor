@@ -39,6 +39,14 @@ void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD);
 void mul_inplace(Tensor& y, const Tensor& x);
 
 
+// Binary threshold to a byte mask: Y[i] = X[i] > t ? 1 : 0 (strict > —
+// elements exactly at t map to 0). Backs SAM AMG's device-side mask
+// binarization (logits -> 0/1 mask without a host round-trip).
+//   X: (R, C) FP32 or FP16.
+//   Y: (R, C) INT8, resized + dtype-set. Not differentiable.
+void threshold_u8(const Tensor& X, float t, Tensor& Y);
+
+
 // ─── log / exp / round elementwise ─────────────────────────────────────────
 //
 // FP32-only, implemented on all three backends (CPU / CUDA / Metal).

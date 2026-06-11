@@ -5,6 +5,7 @@
 //
 //   clamp        — in-place per-element clamp to [lo, hi].
 //   mul_inplace  — in-place per-element multiply y *= x.
+//   threshold_u8 — Y = X > t ? 1 : 0 as an INT8 byte mask (FP32 or FP16 X).
 
 #include <brotensor/tensor.h>
 
@@ -36,6 +37,30 @@ void mul_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x) {
     float* yp = y.host_f32_mut();
     const float* xp = x.host_f32();
     for (int i = 0; i < n; ++i) yp[i] *= xp[i];
+}
+
+// Strict >: a value exactly at t maps to 0.
+void threshold_u8(const ::brotensor::Tensor& X, float t,
+                  ::brotensor::Tensor& Y) {
+    using ::brotensor::Dtype;
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16) {
+        throw std::runtime_error("threshold_u8: X must be FP32 or FP16");
+    }
+    if (Y.rows != X.rows || Y.cols != X.cols || Y.dtype != Dtype::INT8) {
+        Y.resize(X.rows, X.cols, Dtype::INT8);
+    }
+    const int n = X.size();
+    if (n == 0) return;
+    int8_t* yp = static_cast<int8_t*>(Y.host_raw_mut());
+    if (X.dtype == Dtype::FP32) {
+        const float* xp = X.host_f32();
+        for (int i = 0; i < n; ++i) yp[i] = (xp[i] > t) ? 1 : 0;
+    } else {
+        const std::uint16_t* xp = X.host_fp16();
+        for (int i = 0; i < n; ++i) {
+            yp[i] = (::brotensor::fp16_bits_to_fp32(xp[i]) > t) ? 1 : 0;
+        }
+    }
 }
 
 void cast(const ::brotensor::Tensor& src, ::brotensor::Tensor& dst,

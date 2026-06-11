@@ -355,6 +355,24 @@ __global__ void clamp_fp16_kernel(__half* __restrict__ y, float lo, float hi, in
     }
 }
 
+// Binary threshold to a byte mask: y = x > t ? 1 : 0 (strict > — a value
+// exactly at t maps to 0).
+__global__ void threshold_u8_fp32_kernel(const float* __restrict__ x, float t,
+                                         int8_t* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = (x[i] > t) ? int8_t{1} : int8_t{0};
+    }
+}
+
+__global__ void threshold_u8_fp16_kernel(const __half* __restrict__ x, float t,
+                                         int8_t* __restrict__ y, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = (__half2float(x[i]) > t) ? int8_t{1} : int8_t{0};
+    }
+}
+
 __device__ inline float quick_gelu_scalar(float v) {
     // OpenAI CLIP's QuickGELU: x * sigmoid(1.702 * x).
     return v / (1.0f + __expf(-1.702f * v));
@@ -1147,6 +1165,27 @@ void mul_inplace(Tensor& y, const Tensor& x) {
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+void threshold_u8(const Tensor& X, float t, Tensor& Y) {
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16) {
+        throw std::runtime_error("threshold_u8: X must be FP32 or FP16");
+    }
+    if (Y.rows != X.rows || Y.cols != X.cols || Y.dtype != Dtype::INT8) {
+        Y.resize(X.rows, X.cols, Dtype::INT8);
+    }
+    const int n = X.size();
+    if (n == 0) return;
+    if (X.dtype == Dtype::FP16) {
+        threshold_u8_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __half*>(X.data), t,
+            static_cast<int8_t*>(Y.data), n);
+    } else {
+        threshold_u8_fp32_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<const float*>(X.data), t,
+            static_cast<int8_t*>(Y.data), n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 void silu_forward(const Tensor& x, Tensor& y) {
     if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
         y.resize(x.rows, x.cols, x.dtype);
@@ -1510,6 +1549,7 @@ void fill_cuda_vtable_elementwise(::brotensor::detail::OpsVTable& v) {
     v.cast                    = &cast;
     v.scale_inplace           = &scale_inplace;
     v.mul_inplace             = &mul_inplace;
+    v.threshold_u8            = &threshold_u8;
     v.clamp                   = &clamp;
     v.silu_forward            = &silu_forward;
     v.silu_backward           = &silu_backward;

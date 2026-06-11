@@ -258,6 +258,8 @@ void adam_step(::brotensor::Tensor& param, const ::brotensor::Tensor& grad,
 void sum_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
 void sum_cols(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
 void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx);
+void rows_count_above(const ::brotensor::Tensor& X, float t_lo, float t_hi,
+                      ::brotensor::Tensor& counts);
 void ddim_step(const ::brotensor::Tensor& x_t,
                const ::brotensor::Tensor& eps_pred,
                float alpha_t, float alpha_prev, float sigma_t,
@@ -303,6 +305,7 @@ void fill_cuda_vtable_utils(::brotensor::detail::OpsVTable& v) {
     v.sum_rows                            = &sum_rows;
     v.sum_cols                            = &sum_cols;
     v.argmax_rows                         = &argmax_rows;
+    v.rows_count_above                    = &rows_count_above;
     v.ddim_step                           = &ddim_step;
     v.euler_step                          = &euler_step;
     v.dpmpp_2m_step                       = &dpmpp_2m_step;

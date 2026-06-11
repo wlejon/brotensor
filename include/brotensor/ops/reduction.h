@@ -39,4 +39,15 @@ void sum_cols(const Tensor& X, Tensor& Y);
 // selected dtype.
 void argmax_rows(const Tensor& X, Tensor& Idx);
 
+
+// Per-row above-threshold counts at two thresholds in one pass:
+//   counts[r][0] = #{ c : X[r][c] > t_lo }
+//   counts[r][1] = #{ c : X[r][c] > t_hi }
+// Strict >: elements exactly at a threshold are NOT counted. Backs SAM AMG's
+// device-side stability score (intersection/union of the mask at logit
+// thresholds +/- the stability offset) without downloading the logits.
+//   X:      (R, C) FP32 or FP16.
+//   counts: (R, 2) INT32, resized + dtype-set. Not differentiable.
+void rows_count_above(const Tensor& X, float t_lo, float t_hi, Tensor& counts);
+
 }  // namespace brotensor

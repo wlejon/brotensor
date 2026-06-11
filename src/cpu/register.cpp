@@ -168,6 +168,8 @@ void bce_with_logits_fused_batched(const ::brotensor::Tensor& logits_BL,
 //    public_reductions.cpp / layernorm_inference.cpp ──
 void clamp(::brotensor::Tensor& y, float lo, float hi);
 void mul_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x);
+void threshold_u8(const ::brotensor::Tensor& X, float t,
+                  ::brotensor::Tensor& Y);
 void cast(const ::brotensor::Tensor& src, ::brotensor::Tensor& dst,
           ::brotensor::Dtype out_dtype);
 float mse_vec_forward(const ::brotensor::Tensor& pred,
@@ -199,6 +201,8 @@ void concat_nchw_channels_backward(const ::brotensor::Tensor& dY,
 void sum_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
 void sum_cols(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
 void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx);
+void rows_count_above(const ::brotensor::Tensor& X, float t_lo, float t_hi,
+                      ::brotensor::Tensor& counts);
 void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
                                          const ::brotensor::Tensor& gamma,
                                          const ::brotensor::Tensor& beta,
@@ -1115,6 +1119,7 @@ struct CpuStaticRegistrar {
         // ── CHUNK 1 ──
         ops.clamp                      = &detail::cpu::clamp;
         ops.mul_inplace                = &detail::cpu::mul_inplace;
+        ops.threshold_u8               = &detail::cpu::threshold_u8;
         ops.cast                       = &detail::cpu::cast;
         ops.mse_vec_forward            = &detail::cpu::mse_vec_forward;
         ops.mse_vec_backward           = &detail::cpu::mse_vec_backward;
@@ -1128,6 +1133,7 @@ struct CpuStaticRegistrar {
         ops.sum_rows                   = &detail::cpu::sum_rows;
         ops.sum_cols                   = &detail::cpu::sum_cols;
         ops.argmax_rows                = &detail::cpu::argmax_rows;
+        ops.rows_count_above           = &detail::cpu::rows_count_above;
         ops.layernorm_forward_inference_batched
                                        = &detail::cpu::layernorm_forward_inference_batched;
         ops.layernorm_forward_batched_with_caches

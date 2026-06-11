@@ -97,6 +97,43 @@ __global__ void argmax_rows_kernel(const T* __restrict__ X,
     if (tid == 0) Idx[m] = static_cast<OutT>(sm_idx[0]);
 }
 
+// One block per row; threads stride over the columns counting strict-above
+// hits for both thresholds in the same pass, then a shared-mem tree reduce
+// folds the per-thread partial counts. Thread 0 writes counts[r] = {n_lo,
+// n_hi}.
+template <typename T>
+__global__ void rows_count_above_kernel(const T* __restrict__ X,
+                                        float t_lo, float t_hi,
+                                        int32_t* __restrict__ counts,
+                                        int R, int C) {
+    __shared__ int sm_lo[RED_BLOCK];
+    __shared__ int sm_hi[RED_BLOCK];
+    const int r = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (r >= R) return;
+    int n_lo = 0, n_hi = 0;
+    const T* row = X + static_cast<long long>(r) * C;
+    for (int c = tid; c < C; c += blockDim.x) {
+        const float v = load_f32<T>(&row[c]);
+        n_lo += (v > t_lo) ? 1 : 0;
+        n_hi += (v > t_hi) ? 1 : 0;
+    }
+    sm_lo[tid] = n_lo;
+    sm_hi[tid] = n_hi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sm_lo[tid] += sm_lo[tid + s];
+            sm_hi[tid] += sm_hi[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        counts[2 * r + 0] = sm_lo[0];
+        counts[2 * r + 1] = sm_hi[0];
+    }
+}
+
 // Launch argmax for input dtype T-dispatched, writing OutT indices.
 template <typename OutT>
 void launch_argmax(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx,
@@ -199,6 +236,38 @@ void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx) {
         reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     if (out_dt == Dtype::INT32) launch_argmax<int32_t>(X, Idx, M, N, stream);
     else                        launch_argmax<float>(X, Idx, M, N, stream);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+// Per-row strict-above counts at two thresholds (one pass, block per row).
+// counts is (R, 2) INT32: counts[r] = { #{x > t_lo}, #{x > t_hi} }.
+void rows_count_above(const ::brotensor::Tensor& X, float t_lo, float t_hi,
+                      ::brotensor::Tensor& counts) {
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16) {
+        throw std::runtime_error("rows_count_above: X must be FP32 or FP16");
+    }
+    const int R = X.rows;
+    const int C = X.cols;
+    if (counts.rows != R || counts.cols != 2 || counts.dtype != Dtype::INT32) {
+        counts.resize(R, 2, Dtype::INT32);
+    }
+    if (R == 0) return;
+    cudaStream_t stream =
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+    if (C == 0) {
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
+            counts.data, 0, static_cast<size_t>(R) * 2 * sizeof(int32_t),
+            stream));
+        return;
+    }
+    int32_t* out = static_cast<int32_t*>(counts.data);
+    if (X.dtype == Dtype::FP16) {
+        rows_count_above_kernel<__half><<<R, RED_BLOCK, 0, stream>>>(
+            static_cast<const __half*>(X.data), t_lo, t_hi, out, R, C);
+    } else {
+        rows_count_above_kernel<float><<<R, RED_BLOCK, 0, stream>>>(
+            static_cast<const float*>(X.data), t_lo, t_hi, out, R, C);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

@@ -1857,6 +1857,19 @@ void argmax_rows(const Tensor& X, Tensor& Idx) {
     detail::adopt_output(Idx, X.device);
     v.argmax_rows(X, Idx);
 }
+void rows_count_above(const Tensor& X, float t_lo, float t_hi, Tensor& counts) {
+    const auto& v = detail::dispatch(X, counts);
+    if (!v.rows_count_above)
+        detail::throw_not_implemented("rows_count_above", X.device);
+    detail::adopt_output(counts, X.device);
+    v.rows_count_above(X, t_lo, t_hi, counts);
+}
+void threshold_u8(const Tensor& X, float t, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.threshold_u8) detail::throw_not_implemented("threshold_u8", X.device);
+    detail::adopt_output(Y, X.device);
+    v.threshold_u8(X, t, Y);
+}
 
 // ─── Diffusion sampler steps + timestep embedding ──────────────────────────
 
