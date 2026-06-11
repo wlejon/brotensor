@@ -1,5 +1,6 @@
 #include <brotensor/runtime.h>
 #include "detail/cuda_check.h"
+#include "detail/activations.cuh"
 
 #include "fp16_internal.cuh"
 
@@ -123,6 +124,55 @@ __global__ void linear_gemv_kernel(const T* __restrict__ W,
         #pragma unroll
         for (int w = 1; w < LGV_BLOCK / 32; ++w) s += red[w];
         g_store<T>(&y[row], g_load<T>(&b[row]) + s);
+    }
+}
+
+// Batched skinny-B GEMV for the 16-bit-activation batched linear: one BLOCK
+// per (output row, batch row), the same split-K body as linear_gemv_kernel
+// above. AR decode hits the batched linear with B == 1 on every projection —
+// at that shape the WMMA tile kernel computes a 16-row tile to use one row
+// and its per-warp weight traffic is uncoalesced, so it runs at a fraction
+// of HBM bandwidth. bias may be null; `act` is the fused epilogue activation
+// (0 = identity). Requires in_dim % 4 == 0, which every transformer width
+// satisfies.
+template <typename T, typename T2>
+__global__ void linear_gemv_batched_w16_kernel(const T* __restrict__ W,
+                                               const T* __restrict__ bias,
+                                               const T* __restrict__ X,
+                                               T* __restrict__ Y,
+                                               int out_dim, int in_dim,
+                                               int act) {
+    const int row   = blockIdx.x;
+    const int batch = blockIdx.y;
+    const int tid   = threadIdx.x;
+
+    const T2* w2 = reinterpret_cast<const T2*>(W + static_cast<size_t>(row) * in_dim);
+    const T2* x2 = reinterpret_cast<const T2*>(X + static_cast<size_t>(batch) * in_dim);
+    const int n2 = in_dim / 2;          // T2 words per row
+
+    float acc = 0.0f;
+    for (int k = 2 * tid; k < n2; k += 2 * LGV_BLOCK) {  // two adjacent T2 words
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const T2 wv = w2[k + i];
+            const T2 xv = x2[k + i];
+            acc += g_load2_x(wv) * g_load2_x(xv) + g_load2_y(wv) * g_load2_y(xv);
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    __shared__ float red[LGV_BLOCK / 32];
+    if ((tid & 31) == 0) red[tid >> 5] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float s = red[0];
+        #pragma unroll
+        for (int w = 1; w < LGV_BLOCK / 32; ++w) s += red[w];
+        if (bias != nullptr) s += g_load<T>(&bias[row]);
+        g_store<T>(&Y[static_cast<size_t>(batch) * out_dim + row],
+                   apply_linear_act(act, s));
     }
 }
 
@@ -310,6 +360,35 @@ void linear_forward_batched_fp16_impl(const ::brotensor::Tensor& W,
     if (B == 0 || out_dim == 0) return;
 
     const bool has_bias = bias && bias->size() > 0;
+
+    // Skinny batches take the block-per-row split-K GEMV — fully coalesced
+    // weight traffic, FP32 accumulation, bias + activation fused into the
+    // store (the same dispatch shape as the FP32-activation batched linear).
+    // The WMMA tile kernel keeps the wide-batch case.
+    if (B <= 32 && in_dim % 4 == 0 && in_dim > 0) {
+        dim3 grid(out_dim, B);
+        if (dt == Dtype::FP16) {
+            linear_gemv_batched_w16_kernel<__half, __half2>
+                <<<grid, LGV_BLOCK, 0, cur_stream()>>>(
+                    static_cast<const __half*>(W.data),
+                    has_bias ? static_cast<const __half*>(bias->data) : nullptr,
+                    static_cast<const __half*>(X_BD.data),
+                    static_cast<__half*>(Y_BD.data),
+                    out_dim, in_dim, act);
+        } else {  // BF16
+            linear_gemv_batched_w16_kernel<__nv_bfloat16, __nv_bfloat162>
+                <<<grid, LGV_BLOCK, 0, cur_stream()>>>(
+                    static_cast<const __nv_bfloat16*>(W.data),
+                    has_bias ? static_cast<const __nv_bfloat16*>(bias->data)
+                             : nullptr,
+                    static_cast<const __nv_bfloat16*>(X_BD.data),
+                    static_cast<__nv_bfloat16*>(Y_BD.data),
+                    out_dim, in_dim, act);
+        }
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     if (dt == Dtype::FP16) {
         fp16_internal::launch_matmul_ABT_act(
             static_cast<const __half*>(X_BD.data),

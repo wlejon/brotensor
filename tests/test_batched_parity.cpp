@@ -337,6 +337,9 @@ BT_PARITY_TEST(linear_fwd_batched_bf16_skinny)    { run_linear_forward_batched_b
 // Fused activation epilogue over the float-staged BF16 store.
 BT_PARITY_TEST(linear_fwd_batched_bf16_silu)      { run_linear_forward_batched_bf16(32, 64, 64, true,  4, 0xBF15ull); }
 BT_PARITY_TEST(linear_fwd_batched_bf16_gelu)      { run_linear_forward_batched_bf16(32, 64, 64, true,  2, 0xBF16ull); }
+// B == 1 — the AR-decode shape, which dispatches to the skinny-batch GEMV.
+BT_PARITY_TEST(linear_fwd_batched_bf16_B1_gemv)   { run_linear_forward_batched_bf16(1, 256, 192, true,  0, 0xBF17ull); }
+BT_PARITY_TEST(linear_fwd_batched_bf16_B1_nobias) { run_linear_forward_batched_bf16(1, 256, 192, false, 0, 0xBF18ull); }
 
 // ─── linear_forward_batched large-B (grid.y > 65535) ──────────────────────
 //

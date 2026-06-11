@@ -160,6 +160,8 @@ static void test_linear_fp16_act() {
     run_linear_act_case(16, 32, 24, brotensor::kLinearActQuickGelu, "wmma-quick_gelu");
     // Naive fallback path (K%8!=0) — same epilogue applied per element.
     run_linear_act_case(5, 11, 7,   brotensor::kLinearActSilu,      "naive-silu");
+    // Skinny-batch GEMV path (B<=32, K%4==0) at the AR-decode shape.
+    run_linear_act_case(1, 64, 48,  brotensor::kLinearActSilu,      "gemv-silu");
 }
 
 static void test_elementwise_fp16() {
