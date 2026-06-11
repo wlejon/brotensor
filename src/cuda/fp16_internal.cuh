@@ -30,6 +30,19 @@ void launch_matmul_ABT_impl(const __nv_bfloat16* A, const __nv_bfloat16* B,
                             int M, int N, int K,
                             const __nv_bfloat16* bias = nullptr, int act = 0);
 
+// Strided-batched variant: `batch` independent (M, N, K) problems at element
+// offsets b*strideA / b*strideB / b*strideC (bias, per-N, is shared across the
+// batch). One launch via grid.z — the per-problem kernel is unchanged.
+void launch_matmul_ABT_batched_impl(const __half* A, const __half* B, __half* C,
+                                    int batch, int M, int N, int K,
+                                    size_t strideA, size_t strideB, size_t strideC,
+                                    const __half* bias = nullptr, int act = 0);
+void launch_matmul_ABT_batched_impl(const __nv_bfloat16* A, const __nv_bfloat16* B,
+                                    __nv_bfloat16* C,
+                                    int batch, int M, int N, int K,
+                                    size_t strideA, size_t strideB, size_t strideC,
+                                    const __nv_bfloat16* bias = nullptr, int act = 0);
+
 // Launches C(M, N) = A(M, K) @ B(N, K)^T on the current stream.
 inline void launch_matmul_ABT(const __half* A, const __half* B, __half* C,
                               int M, int N, int K) {
@@ -40,6 +53,24 @@ inline void launch_matmul_ABT(const __nv_bfloat16* A, const __nv_bfloat16* B,
                               __nv_bfloat16* C, int M, int N, int K) {
     if (M == 0 || N == 0) return;
     launch_matmul_ABT_impl(A, B, C, M, N, K);
+}
+
+// Launches `batch` strided problems C_b(M, N) = A_b(M, K) @ B_b(N, K)^T with an
+// optional shared per-N bias epilogue.
+inline void launch_matmul_ABT_batched(const __half* A, const __half* B, __half* C,
+                                      int batch, int M, int N, int K,
+                                      size_t strideA, size_t strideB, size_t strideC,
+                                      const __half* bias = nullptr) {
+    launch_matmul_ABT_batched_impl(A, B, C, batch, M, N, K,
+                                   strideA, strideB, strideC, bias, 0);
+}
+inline void launch_matmul_ABT_batched(const __nv_bfloat16* A, const __nv_bfloat16* B,
+                                      __nv_bfloat16* C,
+                                      int batch, int M, int N, int K,
+                                      size_t strideA, size_t strideB, size_t strideC,
+                                      const __nv_bfloat16* bias = nullptr) {
+    launch_matmul_ABT_batched_impl(A, B, C, batch, M, N, K,
+                                   strideA, strideB, strideC, bias, 0);
 }
 
 // As launch_matmul_ABT but fuses bias + activation into the store (epilogue).

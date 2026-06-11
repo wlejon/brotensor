@@ -70,14 +70,23 @@ static constexpr int LDB_SMEM = BK + 8;   // for B tile (BN rows, BK cols)
 // separate activation kernel. For the FP16 path, bias == nullptr && act == 0
 // keeps the fast int4 store path untouched — the matmul / attention callers that
 // pass no epilogue are unaffected.
+// Batched via grid.z: each z-slice computes an independent (M, N) problem at
+// element offsets z*strideA / z*strideB / z*strideC. Single-matmul callers
+// launch grid.z == 1 with zero strides. `bias` (per-N) is shared across the
+// batch.
 template <typename T>
 __launch_bounds__(THREADS_PER_CTA)
 __global__ void matmul_ABT_wmma_kernel(const T* __restrict__ A,
                                        const T* __restrict__ B,
                                        T* __restrict__ C,
                                        int M, int N, int K,
+                                       size_t strideA, size_t strideB,
+                                       size_t strideC,
                                        const T* __restrict__ bias, int act) {
     using TR = abt_traits<T>;
+    A += blockIdx.z * strideA;
+    B += blockIdx.z * strideB;
+    C += blockIdx.z * strideC;
     __shared__ T As[BM][LDA_SMEM];
     __shared__ T Bs[BN][LDB_SMEM];
 
@@ -305,14 +314,20 @@ __global__ void matmul_ABT_wmma_kernel(const T* __restrict__ A,
     }
 }
 
-// Naive fallback for tiny / unaligned problems.
+// Naive fallback for tiny / unaligned problems. Batched via grid.y (the 1D
+// element grid stays in grid.x).
 template <typename T>
 __global__ void matmul_ABT_naive_kernel(const T* __restrict__ A,
                                         const T* __restrict__ B,
                                         T* __restrict__ C,
                                         int M, int N, int K,
+                                        size_t strideA, size_t strideB,
+                                        size_t strideC,
                                         const T* __restrict__ bias, int act) {
     using TR = abt_traits<T>;
+    A += blockIdx.y * strideA;
+    B += blockIdx.y * strideB;
+    C += blockIdx.y * strideC;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = M * N;
     if (idx >= total) return;
@@ -329,12 +344,16 @@ __global__ void matmul_ABT_naive_kernel(const T* __restrict__ A,
 
 template <typename T>
 static void launch_abt(const T* A, const T* B, T* C,
-                       int M, int N, int K,
+                       int batch, int M, int N, int K,
+                       size_t strideA, size_t strideB, size_t strideC,
                        const T* bias, int act) {
-    if (M == 0 || N == 0) return;
+    if (batch == 0 || M == 0 || N == 0) return;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
     if (K == 0) {
-        cudaMemsetAsync(C, 0, sizeof(T) * size_t(M) * size_t(N), stream);
+        for (int b = 0; b < batch; ++b) {
+            cudaMemsetAsync(C + size_t(b) * strideC, 0,
+                            sizeof(T) * size_t(M) * size_t(N), stream);
+        }
         return;
     }
 
@@ -343,32 +362,62 @@ static void launch_abt(const T* A, const T* B, T* C,
     // of 8: the WMMA path's vectorised int4 loads of A/B (and the FP16 int4
     // store of C) require an 8-element-aligned row stride along K (for A and B)
     // and N (for C); the kernel does not currently emit a scalar-aligned-store
-    // fallback for those cases.
-    if (size_t(M) * size_t(N) < 256 || K < 16 ||
-        (K & 7) != 0 || (N & 7) != 0) {
-        const int total = M * N;
-        const int block = 128;
-        const int grid  = (total + block - 1) / block;
-        matmul_ABT_naive_kernel<T><<<grid, block, 0, stream>>>(A, B, C, M, N, K, bias, act);
-        return;
-    }
+    // fallback for those cases. Batched WMMA additionally needs 8-element-
+    // aligned batch strides so each z-slice keeps the int4 alignment.
+    const bool strides_aligned =
+        batch == 1 || (((strideA | strideB | strideC) & 7) == 0);
+    const bool use_naive =
+        size_t(M) * size_t(N) < 256 || K < 16 ||
+        (K & 7) != 0 || (N & 7) != 0 || !strides_aligned;
 
-    dim3 block(THREADS_PER_CTA);
-    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    matmul_ABT_wmma_kernel<T><<<grid, block, 0, stream>>>(A, B, C, M, N, K, bias, act);
+    // grid.z (WMMA) / grid.y (naive) cap at 65535; chunk larger batches.
+    constexpr int kMaxZ = 65535;
+    for (int b0 = 0; b0 < batch; b0 += kMaxZ) {
+        const int nb = batch - b0 < kMaxZ ? batch - b0 : kMaxZ;
+        const T* Ab = A + size_t(b0) * strideA;
+        const T* Bb = B + size_t(b0) * strideB;
+        T*       Cb = C + size_t(b0) * strideC;
+        if (use_naive) {
+            const int total = M * N;
+            const int block = 128;
+            dim3 grid((total + block - 1) / block, nb);
+            matmul_ABT_naive_kernel<T><<<grid, block, 0, stream>>>(
+                Ab, Bb, Cb, M, N, K, strideA, strideB, strideC, bias, act);
+        } else {
+            dim3 block(THREADS_PER_CTA);
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, nb);
+            matmul_ABT_wmma_kernel<T><<<grid, block, 0, stream>>>(
+                Ab, Bb, Cb, M, N, K, strideA, strideB, strideC, bias, act);
+        }
+    }
 }
 
 void launch_matmul_ABT_impl(const __half* A, const __half* B, __half* C,
                             int M, int N, int K,
                             const __half* bias, int act) {
-    launch_abt<__half>(A, B, C, M, N, K, bias, act);
+    launch_abt<__half>(A, B, C, 1, M, N, K, 0, 0, 0, bias, act);
 }
 
 void launch_matmul_ABT_impl(const __nv_bfloat16* A, const __nv_bfloat16* B,
                             __nv_bfloat16* C,
                             int M, int N, int K,
                             const __nv_bfloat16* bias, int act) {
-    launch_abt<__nv_bfloat16>(A, B, C, M, N, K, bias, act);
+    launch_abt<__nv_bfloat16>(A, B, C, 1, M, N, K, 0, 0, 0, bias, act);
+}
+
+void launch_matmul_ABT_batched_impl(const __half* A, const __half* B, __half* C,
+                                    int batch, int M, int N, int K,
+                                    size_t strideA, size_t strideB, size_t strideC,
+                                    const __half* bias, int act) {
+    launch_abt<__half>(A, B, C, batch, M, N, K, strideA, strideB, strideC, bias, act);
+}
+
+void launch_matmul_ABT_batched_impl(const __nv_bfloat16* A, const __nv_bfloat16* B,
+                                    __nv_bfloat16* C,
+                                    int batch, int M, int N, int K,
+                                    size_t strideA, size_t strideB, size_t strideC,
+                                    const __nv_bfloat16* bias, int act) {
+    launch_abt<__nv_bfloat16>(A, B, C, batch, M, N, K, strideA, strideB, strideC, bias, act);
 }
 
 } // namespace fp16_internal

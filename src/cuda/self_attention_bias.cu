@@ -16,6 +16,7 @@
 #include <brotensor/tensor.h>
 
 #include "detail/cuda_check.h"
+#include "fp16_internal.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -362,79 +363,387 @@ void run_sab_int8(const ::brotensor::Tensor& X,
 
 // ── Decomposed 2D relative-position attention (SAM / ViTDet) ───────────────
 //
-// Same pipeline as run_sab, but (a) the qkv/output projections carry optional
-// biases and (b) the pre-softmax bias is the decomposed rel-pos term computed
-// from Q inline in the scores kernel — never materialised as a separate buffer.
-// A token i maps to grid coords (i/grid_w, i%grid_w); the bias for key j is
-//   q . rel_pos_h[(qh-kh)+grid_h-1] + q . rel_pos_w[(qw-kw)+grid_w-1].
-// Like run_sab the (H*L, L) scores/softmax scratch is materialised, so the
-// global 64x64 SAM blocks (L=4096) are memory-heavy — inherent to stock SAM,
-// and identical to the sibling self_attention_bias path. A tiled/flash variant
-// that avoids the (H*L, L) scratch is a later optimisation.
+// Same math as run_sab plus the decomposed rel-pos bias, but every GEMM-shaped
+// stage runs as a real tiled GEMM instead of a one-thread-per-output kernel:
+// FP16/BF16 go through fp16_internal's WMMA tensor-core matmul (FP32
+// accumulate), FP32 through the register-tiled kernel below. The rel-pos bias
+// is factored as in segment_anything's add_decomposed_rel_pos:
+//   Bh[i, r] = q_i . rel_pos_h[r]   and   Bw[i, r] = q_i . rel_pos_w[r]
+// are two skinny GEMMs against the rel tables; the (qh-kh)/(qw-kw) lookups and
+// the qk scale fold into the softmax load, so the bias never costs a pass over
+// the (L, L) scores. Softmax runs in place on the scores buffer (the only
+// (H*L, L)-sized scratch), with row normalisation deferred to the head-merge.
+//
+// One pipeline serves both the global op (one unit = the whole grid) and the
+// windowed op (one unit per window): all units share weights and rel tables,
+// so the projections are single GEMMs over the concatenated unit rows and
+// scores / A@V are strided-batched GEMMs with batch = nWin * num_heads.
+//
+// Intermediates are stored in the model dtype; all accumulation is FP32. Token
+// panels are padded to Lp = ceil8(Lw) rows so the 16-bit WMMA path keeps its
+// int4 alignment; padded rows project from zero Q rows (zero scores, skipped
+// by softmax) and padded key columns get probability 0 before the A@V GEMM.
 
-// Out[(hh*L+i), j] = (bias ? bias[hh*dh+j] : 0) + sum_k In[i,k]*W[(hh*dh+j), k].
-template <typename T>
-__global__ void sardp_proj_kernel(const T* __restrict__ In,
-                                  const T* __restrict__ W,
-                                  const T* __restrict__ bias,  // (D,1) or null
-                                  float* __restrict__ Out,
-                                  int L, int Din, int dh) {
-    const int j  = blockIdx.x * blockDim.x + threadIdx.x;
-    const int i  = blockIdx.y * blockDim.y + threadIdx.y;
-    const int hh = blockIdx.z;
-    if (i >= L || j >= dh) return;
-    const int o = hh * dh + j;
-    const T* xr = In + static_cast<size_t>(i) * Din;
-    const T* wr = W  + static_cast<size_t>(o) * Din;
-    float acc = bias ? sab_ld(bias[o]) : 0.0f;
-    for (int k = 0; k < Din; ++k) acc += sab_ld(xr[k]) * sab_ld(wr[k]);
-    Out[(static_cast<size_t>(hh) * L + i) * dh + j] = acc;
-}
+template <typename T> struct sardp_dtype;
+template <> struct sardp_dtype<float>         { static constexpr ::brotensor::Dtype value = ::brotensor::Dtype::FP32; };
+template <> struct sardp_dtype<__half>        { static constexpr ::brotensor::Dtype value = ::brotensor::Dtype::FP16; };
+template <> struct sardp_dtype<__nv_bfloat16> { static constexpr ::brotensor::Dtype value = ::brotensor::Dtype::BF16; };
 
-// S[(hh*L+i), j] = scale*(Q_h[i].K_h[j]) + q.rel_pos_h[..] + q.rel_pos_w[..].
-// rel_h: (2*gh-1, dh) typed; rel_w: (2*gw-1, dh) typed (model dtype T).
-template <typename T>
-__global__ void sardp_scores_kernel(const float* __restrict__ Qh,
-                                    const float* __restrict__ Kh,
-                                    const T* __restrict__ rel_h,
-                                    const T* __restrict__ rel_w,
-                                    float* __restrict__ S,
-                                    int L, int dh, float scale,
-                                    int gh, int gw) {
-    const int j  = blockIdx.x * blockDim.x + threadIdx.x;
-    const int i  = blockIdx.y * blockDim.y + threadIdx.y;
-    const int hh = blockIdx.z;
-    if (i >= L || j >= L) return;
-    const size_t qrow = (static_cast<size_t>(hh) * L + i) * dh;
-    const size_t krow = (static_cast<size_t>(hh) * L + j) * dh;
-    const int qh = i / gw, qw = i % gw;
-    const int kh = j / gw, kw = j % gw;
-    const T* rhr = rel_h + static_cast<size_t>(qh - kh + gh - 1) * dh;
-    const T* rwr = rel_w + static_cast<size_t>(qw - kw + gw - 1) * dh;
-    float s = 0.0f, bh = 0.0f, bw = 0.0f;
-    for (int k = 0; k < dh; ++k) {
-        const float q = Qh[qrow + k];
-        s  += q * Kh[krow + k];
-        bh += q * sab_ld(rhr[k]);
-        bw += q * sab_ld(rwr[k]);
+constexpr int SG_BM = 128;  // CTA tile rows
+constexpr int SG_BN = 64;   // CTA tile cols
+constexpr int SG_BK = 16;   // K chunk
+constexpr int SG_TM = 8;    // per-thread micro-tile rows (16 thread rows)
+constexpr int SG_TN = 4;    // per-thread micro-tile cols (16 thread cols)
+
+// FP32 register-tiled GEMM: C(M, N) = A(M, K) @ B(N, K)^T (+ optional per-N
+// bias). Batched via grid.z at element offsets z*strideA / z*strideB /
+// z*strideC. 16x16 threads, each owning an 8x4 micro-tile of the 128x64 CTA
+// tile; A/B chunks are staged through shared memory K-major so the inner loop
+// is an outer product with broadcast/conflict-light reads.
+__global__ void sardp_gemm_f32_kernel(const float* __restrict__ A,
+                                      const float* __restrict__ B,
+                                      float* __restrict__ C,
+                                      int M, int N, int K,
+                                      size_t strideA, size_t strideB,
+                                      size_t strideC,
+                                      const float* __restrict__ bias) {
+    __shared__ float As[SG_BK][SG_BM];
+    __shared__ float Bs[SG_BK][SG_BN];
+    A += blockIdx.z * strideA;
+    B += blockIdx.z * strideB;
+    C += blockIdx.z * strideC;
+    const int tid = threadIdx.y * 16 + threadIdx.x;
+    const int m0  = blockIdx.y * SG_BM;
+    const int n0  = blockIdx.x * SG_BN;
+
+    float acc[SG_TM][SG_TN] = {};
+    for (int k0 = 0; k0 < K; k0 += SG_BK) {
+        // Stage A (SG_BM x SG_BK) and B (SG_BN x SG_BK) K-major, zero-padding
+        // the edges; 16 consecutive K columns per row keep global reads
+        // coalesced.
+        #pragma unroll
+        for (int l = 0; l < (SG_BM * SG_BK) / 256; ++l) {
+            const int lin = tid + l * 256;
+            const int r   = lin >> 4;
+            const int c   = lin & 15;
+            const int gm  = m0 + r;
+            const int gk  = k0 + c;
+            As[c][r] = (gm < M && gk < K) ? A[static_cast<size_t>(gm) * K + gk] : 0.0f;
+        }
+        #pragma unroll
+        for (int l = 0; l < (SG_BN * SG_BK) / 256; ++l) {
+            const int lin = tid + l * 256;
+            const int r   = lin >> 4;
+            const int c   = lin & 15;
+            const int gn  = n0 + r;
+            const int gk  = k0 + c;
+            Bs[c][r] = (gn < N && gk < K) ? B[static_cast<size_t>(gn) * K + gk] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < SG_BK; ++k) {
+            float av[SG_TM], bv[SG_TN];
+            #pragma unroll
+            for (int i = 0; i < SG_TM; ++i) av[i] = As[k][threadIdx.y * SG_TM + i];
+            #pragma unroll
+            for (int j = 0; j < SG_TN; ++j) bv[j] = Bs[k][threadIdx.x * SG_TN + j];
+            #pragma unroll
+            for (int i = 0; i < SG_TM; ++i) {
+                #pragma unroll
+                for (int j = 0; j < SG_TN; ++j) acc[i][j] += av[i] * bv[j];
+            }
+        }
+        __syncthreads();
     }
-    S[(static_cast<size_t>(hh) * L + i) * L + j] = s * scale + bh + bw;
+
+    #pragma unroll
+    for (int i = 0; i < SG_TM; ++i) {
+        const int gm = m0 + threadIdx.y * SG_TM + i;
+        if (gm >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < SG_TN; ++j) {
+            const int gn = n0 + threadIdx.x * SG_TN + j;
+            if (gn >= N) continue;
+            float v = acc[i][j];
+            if (bias) v += bias[gn];
+            C[static_cast<size_t>(gm) * N + gn] = v;
+        }
+    }
 }
 
-// O[i, c] = (bias ? bias[c] : 0) + sum_k Yconcat[i,k] * Wo[c,k].
+// Strided-batched C_b = A_b @ B_b^T (+ shared per-N bias), FP32 accumulation,
+// dispatched per dtype: FP32 takes the register-tiled kernel above, FP16/BF16
+// the shared WMMA tensor-core matmul.
+inline void sardp_gemm(const float* A, const float* B, float* C,
+                       int batch, int M, int N, int K,
+                       size_t sA, size_t sB, size_t sC, const float* bias) {
+    if (batch == 0 || M == 0 || N == 0) return;
+    constexpr int kMaxZ = 65535;  // grid.z cap
+    const dim3 block(16, 16);
+    for (int b0 = 0; b0 < batch; b0 += kMaxZ) {
+        const int nb = batch - b0 < kMaxZ ? batch - b0 : kMaxZ;
+        dim3 grid((N + SG_BN - 1) / SG_BN, (M + SG_BM - 1) / SG_BM, nb);
+        sardp_gemm_f32_kernel<<<grid, block, 0, cur_stream()>>>(
+            A + static_cast<size_t>(b0) * sA,
+            B + static_cast<size_t>(b0) * sB,
+            C + static_cast<size_t>(b0) * sC,
+            M, N, K, sA, sB, sC, bias);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+inline void sardp_gemm(const __half* A, const __half* B, __half* C,
+                       int batch, int M, int N, int K,
+                       size_t sA, size_t sB, size_t sC, const __half* bias) {
+    ::brotensor::fp16_internal::launch_matmul_ABT_batched(
+        A, B, C, batch, M, N, K, sA, sB, sC, bias);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+inline void sardp_gemm(const __nv_bfloat16* A, const __nv_bfloat16* B,
+                       __nv_bfloat16* C,
+                       int batch, int M, int N, int K,
+                       size_t sA, size_t sB, size_t sC,
+                       const __nv_bfloat16* bias) {
+    ::brotensor::fp16_internal::launch_matmul_ABT_batched(
+        A, B, C, batch, M, N, K, sA, sB, sC, bias);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+inline int sardp_flat_grid(long long total) {
+    const long long blocks = (total + 255) / 256;
+    return static_cast<int>(blocks < (1 << 20) ? blocks : (1 << 20));
+}
+
+// Split the row-major (nWin*Lw, D) projection into per-(unit, head) panels
+// padded to Lp rows:  Out[(w*H+h)*Lp + i, c] = In[w*Lw + i, h*dh + c], zero
+// for i >= Lw. total = batch * Lp * dh, grid-stride, c fastest so reads and
+// writes both coalesce.
 template <typename T>
-__global__ void sardp_output_kernel(const float* __restrict__ Y,
-                                    const T* __restrict__ Wo,
-                                    const T* __restrict__ bias,  // (D,1) or null
-                                    T* __restrict__ O, int L, int D) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    const int i = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= L || c >= D) return;
-    const float* yr = Y + static_cast<size_t>(i) * D;
-    const T* wr = Wo + static_cast<size_t>(c) * D;
-    float acc = bias ? sab_ld(bias[c]) : 0.0f;
-    for (int k = 0; k < D; ++k) acc += yr[k] * sab_ld(wr[k]);
-    sab_st(O[static_cast<size_t>(i) * D + c], acc);
+__global__ void sardp_split_heads_kernel(const T* __restrict__ In,
+                                         T* __restrict__ Out,
+                                         int H, int Lw, int Lp, int dh,
+                                         long long total) {
+    const long long step = static_cast<long long>(gridDim.x) * blockDim.x;
+    for (long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+         t < total; t += step) {
+        const int c = static_cast<int>(t % dh);
+        const int i = static_cast<int>((t / dh) % Lp);
+        const int b = static_cast<int>(t / (static_cast<long long>(dh) * Lp));
+        const int w = b / H, h = b % H;
+        T v;
+        if (i < Lw) {
+            v = In[(static_cast<size_t>(w) * Lw + i) * (static_cast<size_t>(H) * dh)
+                   + static_cast<size_t>(h) * dh + c];
+        } else {
+            sab_st(v, 0.0f);
+        }
+        Out[t] = v;
+    }
+}
+
+// As above for V, but writing transposed (dh, Lp) panels so A@V can run as an
+// A@B^T GEMM:  Out[(w*H+h)*dh + c, j] = In[w*Lw + j, h*dh + c]. j fastest so
+// the writes coalesce (the strided reads ride the L2).
+template <typename T>
+__global__ void sardp_split_heads_t_kernel(const T* __restrict__ In,
+                                           T* __restrict__ Out,
+                                           int H, int Lw, int Lp, int dh,
+                                           long long total) {
+    const long long step = static_cast<long long>(gridDim.x) * blockDim.x;
+    for (long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+         t < total; t += step) {
+        const int j = static_cast<int>(t % Lp);
+        const int c = static_cast<int>((t / Lp) % dh);
+        const int b = static_cast<int>(t / (static_cast<long long>(dh) * Lp));
+        const int w = b / H, h = b % H;
+        T v;
+        if (j < Lw) {
+            v = In[(static_cast<size_t>(w) * Lw + j) * (static_cast<size_t>(H) * dh)
+                   + static_cast<size_t>(h) * dh + c];
+        } else {
+            sab_st(v, 0.0f);
+        }
+        Out[t] = v;
+    }
+}
+
+// In-place row softmax over the typed (batch*Lp, Lp) scores panel, folding the
+// qk scale and the decomposed rel-pos lookups into the load:
+//   s_j = scale * S[row, j] + Bh[row, (qh-kh)+gh-1] + Bw[row, (qw-kw)+gw-1]
+// One block per query row. Writes UNNORMALISED exp(s - max) and the row sum to
+// `sums` — the 1/sum scaling is deferred to the head-merge kernel, saving a
+// third pass over the (Lp, Lp) panel. Alignment-padding rows (i >= Lw) keep
+// their zero scores; padded key columns get probability 0 so the A@V GEMM can
+// run over the full Lp width.
+template <typename T>
+__global__ void sardp_softmax_kernel(T* __restrict__ S,
+                                     const T* __restrict__ Bh,
+                                     const T* __restrict__ Bw,
+                                     float* __restrict__ sums,
+                                     int Lw, int Lp, int gh, int gw,
+                                     float scale) {
+    __shared__ float sdata[SAB_SM_BLOCK];
+    const long long row = blockIdx.x;           // b*Lp + i
+    const int i = static_cast<int>(row % Lp);
+    if (i >= Lw) return;
+    const int tid = threadIdx.x;
+    T* srow = S + row * Lp;
+    const T* bhrow = Bh + row * (2 * gh - 1);
+    const T* bwrow = Bw + row * (2 * gw - 1);
+    const int qh = i / gw, qw = i % gw;
+
+    float local_max = -1e30f;
+    for (int j = tid; j < Lw; j += blockDim.x) {
+        const float s = scale * sab_ld(srow[j])
+                      + sab_ld(bhrow[qh - j / gw + gh - 1])
+                      + sab_ld(bwrow[qw - j % gw + gw - 1]);
+        if (s > local_max) local_max = s;
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float a = sdata[tid], b = sdata[tid + s];
+            sdata[tid] = a > b ? a : b;
+        }
+        __syncthreads();
+    }
+    const float m = sdata[0];
+
+    float local_sum = 0.0f;
+    for (int j = tid; j < Lp; j += blockDim.x) {
+        if (j >= Lw) { sab_st(srow[j], 0.0f); continue; }
+        const float s = scale * sab_ld(srow[j])
+                      + sab_ld(bhrow[qh - j / gw + gh - 1])
+                      + sab_ld(bwrow[qw - j % gw + gw - 1]);
+        const float e = expf(s - m);
+        sab_st(srow[j], e);
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) sums[row] = sdata[0];  // >= exp(0) — never zero
+}
+
+// Merge the per-(unit, head) Y panels back to row-major (nWin*Lw, D), applying
+// the deferred softmax row normalisation:
+//   Out[w*Lw + i, h*dh + c] = Y[(w*H+h)*Lp + i, c] / sums[(w*H+h)*Lp + i].
+// total = nWin*Lw*D, grid-stride, (h, c) fastest so the writes coalesce.
+template <typename T>
+__global__ void sardp_merge_heads_kernel(const T* __restrict__ Y,
+                                         const float* __restrict__ sums,
+                                         T* __restrict__ Out,
+                                         int H, int Lw, int Lp, int dh,
+                                         long long total) {
+    const int D = H * dh;
+    const long long step = static_cast<long long>(gridDim.x) * blockDim.x;
+    for (long long t = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+         t < total; t += step) {
+        const int c2  = static_cast<int>(t % D);
+        const long long r = t / D;
+        const int i = static_cast<int>(r % Lw);
+        const int w = static_cast<int>(r / Lw);
+        const int h = c2 / dh, c = c2 % dh;
+        const size_t prow = (static_cast<size_t>(w) * H + h) * Lp + i;
+        sab_st(Out[t], sab_ld(Y[prow * dh + c]) / sums[prow]);
+    }
+}
+
+// Run the pipeline over nWin units of Lw tokens each. Xr is the concatenated
+// (nWin*Lw, D) unit rows (the grid itself for the global op, the gathered
+// window partition for the windowed op); Or receives the same layout.
+template <typename T>
+void run_sardp_fast(const T* Xr, T* Or, int nWin, int Lw, int D, int H,
+                    int gh, int gw, float scale,
+                    const ::brotensor::Tensor& Wq, const T* bq,
+                    const ::brotensor::Tensor& Wk, const T* bk,
+                    const ::brotensor::Tensor& Wv, const T* bv,
+                    const ::brotensor::Tensor& Wo, const T* bo,
+                    const ::brotensor::Tensor& rel_h,
+                    const ::brotensor::Tensor& rel_w) {
+    using ::brotensor::Tensor;
+    using ::brotensor::Device;
+    using ::brotensor::Dtype;
+    constexpr Dtype dt = sardp_dtype<T>::value;
+    const int dh    = D / H;
+    const int Lp    = (Lw + 7) & ~7;
+    const int batch = nWin * H;
+    const int R     = nWin * Lw;
+    const size_t panel_q = static_cast<size_t>(Lp) * dh;
+    const size_t panel_s = static_cast<size_t>(Lp) * Lp;
+
+    const T* Wq_p = static_cast<const T*>(Wq.data);
+    const T* Wk_p = static_cast<const T*>(Wk.data);
+    const T* Wv_p = static_cast<const T*>(Wv.data);
+    const T* Wo_p = static_cast<const T*>(Wo.data);
+    const T* rh_p = static_cast<const T*>(rel_h.data);
+    const T* rw_p = static_cast<const T*>(rel_w.data);
+
+    // Per-(unit, head) Q/K panels, V transposed to (dh, Lp).
+    Tensor Qh = Tensor::empty_on(Device::CUDA, batch * Lp, dh, dt);
+    Tensor Kh = Tensor::empty_on(Device::CUDA, batch * Lp, dh, dt);
+    Tensor Vt = Tensor::empty_on(Device::CUDA, batch * dh, Lp, dt);
+    T* Qh_p = static_cast<T*>(Qh.data);
+    T* Kh_p = static_cast<T*>(Kh.data);
+    T* Vt_p = static_cast<T*>(Vt.data);
+    {
+        // Q/K/V projections: one GEMM each over all units' rows, then split
+        // into head panels (the row buffers die at scope exit).
+        Tensor Qrow = Tensor::empty_on(Device::CUDA, R, D, dt);
+        Tensor Krow = Tensor::empty_on(Device::CUDA, R, D, dt);
+        Tensor Vrow = Tensor::empty_on(Device::CUDA, R, D, dt);
+        sardp_gemm(Xr, Wq_p, static_cast<T*>(Qrow.data), 1, R, D, D, 0, 0, 0, bq);
+        sardp_gemm(Xr, Wk_p, static_cast<T*>(Krow.data), 1, R, D, D, 0, 0, 0, bk);
+        sardp_gemm(Xr, Wv_p, static_cast<T*>(Vrow.data), 1, R, D, D, 0, 0, 0, bv);
+
+        const long long total = static_cast<long long>(batch) * Lp * dh;
+        const int grid = sardp_flat_grid(total);
+        sardp_split_heads_kernel<T><<<grid, 256, 0, cur_stream()>>>(
+            static_cast<const T*>(Qrow.data), Qh_p, H, Lw, Lp, dh, total);
+        sardp_split_heads_kernel<T><<<grid, 256, 0, cur_stream()>>>(
+            static_cast<const T*>(Krow.data), Kh_p, H, Lw, Lp, dh, total);
+        sardp_split_heads_t_kernel<T><<<grid, 256, 0, cur_stream()>>>(
+            static_cast<const T*>(Vrow.data), Vt_p, H, Lw, Lp, dh, total);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Rel-pos factor panels (skinny GEMMs; the tables are shared by every
+    // unit and head, so one launch covers the whole batch).
+    Tensor Bh = Tensor::empty_on(Device::CUDA, batch * Lp, 2 * gh - 1, dt);
+    Tensor Bw = Tensor::empty_on(Device::CUDA, batch * Lp, 2 * gw - 1, dt);
+    sardp_gemm(Qh_p, rh_p, static_cast<T*>(Bh.data),
+               1, batch * Lp, 2 * gh - 1, dh, 0, 0, 0, nullptr);
+    sardp_gemm(Qh_p, rw_p, static_cast<T*>(Bw.data),
+               1, batch * Lp, 2 * gw - 1, dh, 0, 0, 0, nullptr);
+
+    // Scores = Q @ K^T (batched), then in-place fused softmax.
+    Tensor S = Tensor::empty_on(Device::CUDA, batch * Lp, Lp, dt);
+    Tensor sums = Tensor::empty_on(Device::CUDA, batch * Lp, 1, Dtype::FP32);
+    T* S_p = static_cast<T*>(S.data);
+    sardp_gemm(Qh_p, Kh_p, S_p, batch, Lp, Lp, dh,
+               panel_q, panel_q, panel_s, nullptr);
+    sardp_softmax_kernel<T><<<batch * Lp, SAB_SM_BLOCK, 0, cur_stream()>>>(
+        S_p, static_cast<const T*>(Bh.data), static_cast<const T*>(Bw.data),
+        static_cast<float*>(sums.data), Lw, Lp, gh, gw, scale);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+
+    // A @ V (batched against the transposed V panels), merge heads with the
+    // deferred 1/sum, output projection.
+    Tensor Y = Tensor::empty_on(Device::CUDA, batch * Lp, dh, dt);
+    sardp_gemm(S_p, Vt_p, static_cast<T*>(Y.data), batch, Lp, dh, Lp,
+               panel_s, panel_q, panel_q, nullptr);
+    Tensor Yrow = Tensor::empty_on(Device::CUDA, R, D, dt);
+    {
+        const long long total = static_cast<long long>(R) * D;
+        sardp_merge_heads_kernel<T><<<sardp_flat_grid(total), 256, 0, cur_stream()>>>(
+            static_cast<const T*>(Y.data), static_cast<const float*>(sums.data),
+            static_cast<T*>(Yrow.data), H, Lw, Lp, dh, total);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+    sardp_gemm(static_cast<const T*>(Yrow.data), Wo_p, Or, 1, R, D, D, 0, 0, 0, bo);
 }
 
 template <typename T>
@@ -446,75 +755,18 @@ void run_sardp(const ::brotensor::Tensor& X,
                const ::brotensor::Tensor& rel_h, const ::brotensor::Tensor& rel_w,
                int num_heads, int gh, int gw, float scale,
                ::brotensor::Tensor& O) {
-    using ::brotensor::Tensor;
-    using ::brotensor::Device;
-    using ::brotensor::Dtype;
-    const int L  = X.rows;
-    const int D  = X.cols;
-    const int H  = num_heads;
-    const int dh = D / H;
-
-    Tensor Qh = Tensor::empty_on(Device::CUDA, H * L, dh, Dtype::FP32);
-    Tensor Kh = Tensor::empty_on(Device::CUDA, H * L, dh, Dtype::FP32);
-    Tensor Vh = Tensor::empty_on(Device::CUDA, H * L, dh, Dtype::FP32);
-    Tensor S  = Tensor::empty_on(Device::CUDA, H * L, L,  Dtype::FP32);
-    Tensor A  = Tensor::empty_on(Device::CUDA, H * L, L,  Dtype::FP32);
-    Tensor Yc = Tensor::empty_on(Device::CUDA, L, D, Dtype::FP32);
-
-    const T* X_p  = static_cast<const T*>(X.data);
-    const T* Wq_p = static_cast<const T*>(Wq.data);
-    const T* Wk_p = static_cast<const T*>(Wk.data);
-    const T* Wv_p = static_cast<const T*>(Wv.data);
-    const T* Wo_p = static_cast<const T*>(Wo.data);
-    const T* rh_p = static_cast<const T*>(rel_h.data);
-    const T* rw_p = static_cast<const T*>(rel_w.data);
-    float* Qh_p = static_cast<float*>(Qh.data);
-    float* Kh_p = static_cast<float*>(Kh.data);
-    float* Vh_p = static_cast<float*>(Vh.data);
-    float* S_p  = static_cast<float*>(S.data);
-    float* A_p  = static_cast<float*>(A.data);
-    float* Yc_p = static_cast<float*>(Yc.data);
-
-    const dim3 block(16, 16);
-    {
-        dim3 grid((dh + block.x - 1) / block.x,
-                  (L  + block.y - 1) / block.y, H);
-        sardp_proj_kernel<T><<<grid, block, 0, cur_stream()>>>(X_p, Wq_p, bq, Qh_p, L, D, dh);
-        sardp_proj_kernel<T><<<grid, block, 0, cur_stream()>>>(X_p, Wk_p, bk, Kh_p, L, D, dh);
-        sardp_proj_kernel<T><<<grid, block, 0, cur_stream()>>>(X_p, Wv_p, bv, Vh_p, L, D, dh);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    }
-    {
-        dim3 grid((L + block.x - 1) / block.x,
-                  (L + block.y - 1) / block.y, H);
-        sardp_scores_kernel<T><<<grid, block, 0, cur_stream()>>>(Qh_p, Kh_p, rh_p, rw_p, S_p,
-                                                L, dh, scale, gh, gw);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    }
-    sab_softmax_kernel<<<H * L, SAB_SM_BLOCK, 0, cur_stream()>>>(S_p, A_p, /*mask=*/nullptr, L);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    {
-        dim3 grid((dh + block.x - 1) / block.x,
-                  (L  + block.y - 1) / block.y, H);
-        sab_apply_v_kernel<<<grid, block, 0, cur_stream()>>>(A_p, Vh_p, Yc_p, L, dh, D);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    }
-    {
-        dim3 grid((D + block.x - 1) / block.x,
-                  (L + block.y - 1) / block.y);
-        sardp_output_kernel<T><<<grid, block, 0, cur_stream()>>>(Yc_p, Wo_p, bo,
-                                                static_cast<T*>(O.data), L, D);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    }
+    run_sardp_fast<T>(static_cast<const T*>(X.data), static_cast<T*>(O.data),
+                      /*nWin=*/1, /*Lw=*/X.rows, X.cols, num_heads, gh, gw,
+                      scale, Wq, bq, Wk, bk, Wv, bv, Wo, bo, rel_h, rel_w);
 }
 
 // ─── Windowed decomposed-rel-pos attention (SAM windowed encoder block) ──────
 //
 // Gathers the (grid_h, grid_w) token grid into a contiguous per-window batch
-// (zero-padding the bottom/right up to a multiple of `window`), runs run_sardp
-// once per window over a view of that window's rows, then scatters the result
-// back — dropping the padded tokens. Pure layout work around the existing
-// single-grid kernel.
+// (zero-padding the bottom/right up to a multiple of `window`), runs ONE
+// run_sardp_fast over all windows at once — projections as single GEMMs over
+// the gathered rows, scores/A@V batched across windows x heads — then scatters
+// the result back, dropping the padded tokens.
 //
 // Partition row r = w_idx*window*window + lh*window + lw maps to grid token
 // (h, w) = (nh*window+lh, nw*window+lw) with (nh, nw) = (w_idx/nw_w, w_idx%nw_w).
@@ -588,17 +840,12 @@ void run_windowed_sardp(const ::brotensor::Tensor& X,
                                           grid_h, grid_w, window, nw_w, D, nrows);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
-    // Per-window attention over contiguous row-slices of the partition buffers.
-    // run_sardp writes O.data without resizing, so non-owning views are safe.
-    const size_t row_stride = static_cast<size_t>(ww) * D * sizeof(T);
-    for (int w = 0; w < nW; ++w) {
-        char* in_p  = static_cast<char*>(Pin.data)  + static_cast<size_t>(w) * row_stride;
-        char* out_p = static_cast<char*>(Pout.data) + static_cast<size_t>(w) * row_stride;
-        Tensor Xv = Tensor::view(Device::CUDA, in_p,  ww, D, dt);
-        Tensor Ov = Tensor::view(Device::CUDA, out_p, ww, D, dt);
-        run_sardp<T>(Xv, Wq, bq, Wk, bk, Wv, bv, Wo, bo,
-                     rel_h, rel_w, num_heads, window, window, scale, Ov);
-    }
+    // All windows share weights and rel-pos tables, so one batched pipeline
+    // covers the whole partition (padded windows are ordinary zero tokens,
+    // exactly as in SAM's window_partition).
+    run_sardp_fast<T>(static_cast<const T*>(Pin.data), static_cast<T*>(Pout.data),
+                      nW, ww, D, num_heads, window, window, scale,
+                      Wq, bq, Wk, bk, Wv, bv, Wo, bo, rel_h, rel_w);
 
     win_scatter_kernel<T><<<grid, block, 0, cur_stream()>>>(static_cast<const T*>(Pout.data),
                                            static_cast<T*>(O.data),
