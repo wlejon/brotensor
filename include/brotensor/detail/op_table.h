@@ -40,6 +40,7 @@
     X(sigmoid_forward,                         void,  (const ::brotensor::Tensor& x, ::brotensor::Tensor& y))                                                           \
     X(sigmoid_backward,                        void,  (const ::brotensor::Tensor& y, const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX))                           \
     X(add_inplace,                             void,  (::brotensor::Tensor& y, const ::brotensor::Tensor& x))                                                           \
+    X(axpby_inplace,                           void,  (::brotensor::Tensor& y, const ::brotensor::Tensor& x, float a, float b))                                         \
     X(add_scalar_inplace,                      void,  (::brotensor::Tensor& y, float s))                                                                                \
     X(scale_inplace,                           void,  (::brotensor::Tensor& y, float s))                                                                                \
     X(clamp,                                   void,  (::brotensor::Tensor& y, float lo, float hi))                                                                     \

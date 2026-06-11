@@ -168,6 +168,8 @@ void bce_with_logits_fused_batched(const ::brotensor::Tensor& logits_BL,
 //    public_reductions.cpp / layernorm_inference.cpp ──
 void clamp(::brotensor::Tensor& y, float lo, float hi);
 void mul_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x);
+void axpby_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x,
+                   float a, float b);
 void threshold_u8(const ::brotensor::Tensor& X, float t,
                   ::brotensor::Tensor& Y);
 void cast(const ::brotensor::Tensor& src, ::brotensor::Tensor& dst,
@@ -1119,6 +1121,7 @@ struct CpuStaticRegistrar {
         // ── CHUNK 1 ──
         ops.clamp                      = &detail::cpu::clamp;
         ops.mul_inplace                = &detail::cpu::mul_inplace;
+        ops.axpby_inplace              = &detail::cpu::axpby_inplace;
         ops.threshold_u8               = &detail::cpu::threshold_u8;
         ops.cast                       = &detail::cpu::cast;
         ops.mse_vec_forward            = &detail::cpu::mse_vec_forward;

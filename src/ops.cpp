@@ -157,6 +157,13 @@ void add_inplace(Tensor& y, const Tensor& x) {
     v.add_inplace(y, x);
 }
 
+void axpby_inplace(Tensor& y, const Tensor& x, float a, float b) {
+    const auto& v = detail::dispatch(y, x);
+    if (!v.axpby_inplace) detail::throw_not_implemented("axpby_inplace", y.device);
+    detail::adopt_output(y, y.device);
+    v.axpby_inplace(y, x, a, b);
+}
+
 void add_scalar_inplace(Tensor& y, float s) {
     const auto& v = detail::dispatch(y);
     if (!v.add_scalar_inplace) detail::throw_not_implemented("add_scalar_inplace", y.device);

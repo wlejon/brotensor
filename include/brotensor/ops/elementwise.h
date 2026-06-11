@@ -12,6 +12,16 @@ namespace brotensor {
 void add_inplace(Tensor& y, const Tensor& x);
 
 
+// y[i] = a*y[i] + b*x[i], elementwise, with the arithmetic carried out in FP32
+// regardless of the storage dtype. Identical shape and dtype required;
+// dispatched FP32/FP16/BF16 on y.dtype. Motivation: classifier-free guidance
+// blends v = s*v_cond - (s-1)*v_uncond where both terms are large and nearly
+// cancel — FP16 storage is fine but the combine must accumulate in FP32 (a
+// half-precision combine catastrophically cancels); only the final store
+// rounds back to the storage dtype.
+void axpby_inplace(Tensor& y, const Tensor& x, float a, float b);
+
+
 // y[i] += s. Dispatched FP32/FP16 on y.dtype.
 void add_scalar_inplace(Tensor& y, float s);
 

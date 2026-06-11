@@ -311,6 +311,27 @@ __global__ void gelu_forward_fp16_kernel(const __half* __restrict__ x,
     }
 }
 
+// FP32 load/store shims for the templated axpby kernel.
+__device__ inline float axpby_ld(const float* p, int i)          { return p[i]; }
+__device__ inline float axpby_ld(const __half* p, int i)         { return __half2float(p[i]); }
+__device__ inline float axpby_ld(const __nv_bfloat16* p, int i)  { return __bfloat162float(p[i]); }
+__device__ inline void axpby_st(float* p, int i, float v)         { p[i] = v; }
+__device__ inline void axpby_st(__half* p, int i, float v)        { p[i] = __float2half(v); }
+__device__ inline void axpby_st(__nv_bfloat16* p, int i, float v) { p[i] = __float2bfloat16(v); }
+
+// y = a*y + b*x, accumulated in FP32 for every storage dtype; only the final
+// store rounds back (the CFG combine a*v_cond + b*v_uncond nearly cancels —
+// see ops/elementwise.h).
+template <typename T>
+__global__ void axpby_inplace_kernel(T* __restrict__ y,
+                                     const T* __restrict__ x,
+                                     float a, float b, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        axpby_st(y, i, a * axpby_ld(y, i) + b * axpby_ld(x, i));
+    }
+}
+
 __global__ void add_inplace_fp16_kernel(__half* __restrict__ y,
                                         const __half* __restrict__ x, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -1076,6 +1097,28 @@ void add_inplace(Tensor& y, const Tensor& x) {
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+void axpby_inplace(Tensor& y, const Tensor& x, float a, float b) {
+    if (y.dtype != x.dtype || y.rows != x.rows || y.cols != x.cols) {
+        throw std::runtime_error("axpby_inplace: shape/dtype mismatch");
+    }
+    const int n = y.size();
+    if (n == 0) return;
+    if (y.dtype == Dtype::FP16) {
+        axpby_inplace_kernel<__half><<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<__half*>(y.data),
+            static_cast<const __half*>(x.data), a, b, n);
+    } else if (y.dtype == Dtype::BF16) {
+        axpby_inplace_kernel<__nv_bfloat16><<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<__nv_bfloat16*>(y.data),
+            static_cast<const __nv_bfloat16*>(x.data), a, b, n);
+    } else {
+        axpby_inplace_kernel<float><<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<float*>(y.data),
+            static_cast<const float*>(x.data), a, b, n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
     if (dst.rows != src.rows || dst.cols != src.cols ||
         dst.dtype != out_dtype) {
@@ -1570,6 +1613,7 @@ void fill_cuda_vtable_elementwise(::brotensor::detail::OpsVTable& v) {
     v.sigmoid_forward         = &sigmoid_forward;
     v.sigmoid_backward        = &sigmoid_backward;
     v.add_inplace             = &add_inplace;
+    v.axpby_inplace           = &axpby_inplace;
     v.add_scalar_inplace      = &add_scalar_inplace;
     v.cast                    = &cast;
     v.scale_inplace           = &scale_inplace;

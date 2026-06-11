@@ -3,9 +3,10 @@
 // FP32 scalar host implementations. Ports the GPU elementwise kernels in
 // src/cuda/elementwise.cu — kernel math reproduced verbatim, FP32 path only.
 //
-//   clamp        — in-place per-element clamp to [lo, hi].
-//   mul_inplace  — in-place per-element multiply y *= x.
-//   threshold_u8 — Y = X > t ? 1 : 0 as an INT8 byte mask (FP32 or FP16 X).
+//   clamp         — in-place per-element clamp to [lo, hi].
+//   mul_inplace   — in-place per-element multiply y *= x.
+//   axpby_inplace — y = a*y + b*x, FP32 arithmetic for all storage dtypes.
+//   threshold_u8  — Y = X > t ? 1 : 0 as an INT8 byte mask (FP32 or FP16 X).
 
 #include <brotensor/tensor.h>
 
@@ -37,6 +38,41 @@ void mul_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x) {
     float* yp = y.host_f32_mut();
     const float* xp = x.host_f32();
     for (int i = 0; i < n; ++i) yp[i] *= xp[i];
+}
+
+// y = a*y + b*x in FP32 regardless of storage dtype; only the final store
+// rounds back. Matches the GPU kernel exactly (same FP32 expression).
+void axpby_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x,
+                   float a, float b) {
+    using ::brotensor::Dtype;
+    if (y.dtype != x.dtype || y.rows != x.rows || y.cols != x.cols) {
+        throw std::runtime_error("axpby_inplace: shape/dtype mismatch");
+    }
+    const int n = y.size();
+    if (n == 0) return;
+    if (y.dtype == Dtype::FP32) {
+        float* yp = y.host_f32_mut();
+        const float* xp = x.host_f32();
+        for (int i = 0; i < n; ++i) yp[i] = a * yp[i] + b * xp[i];
+    } else if (y.dtype == Dtype::FP16) {
+        std::uint16_t* yp = y.host_fp16_mut();
+        const std::uint16_t* xp = x.host_fp16();
+        for (int i = 0; i < n; ++i) {
+            const float v = a * ::brotensor::fp16_bits_to_fp32(yp[i]) +
+                            b * ::brotensor::fp16_bits_to_fp32(xp[i]);
+            yp[i] = ::brotensor::fp32_to_fp16_bits(v);
+        }
+    } else if (y.dtype == Dtype::BF16) {
+        std::uint16_t* yp = y.host_bf16_mut();
+        const std::uint16_t* xp = x.host_bf16();
+        for (int i = 0; i < n; ++i) {
+            const float v = a * ::brotensor::bf16_bits_to_fp32(yp[i]) +
+                            b * ::brotensor::bf16_bits_to_fp32(xp[i]);
+            yp[i] = ::brotensor::fp32_to_bf16_bits(v);
+        }
+    } else {
+        throw std::runtime_error("axpby_inplace: unsupported dtype");
+    }
 }
 
 // Strict >: a value exactly at t maps to 0.

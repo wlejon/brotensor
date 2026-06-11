@@ -290,6 +290,121 @@ static void parity_add() {
     compare("add_scalar_inplace", zCpu.to_host_vector(), zg.to_host_vector(), 1e-6f, 1e-6f);
 }
 
+// ---- axpby_inplace ----------------------------------------------------------
+
+static void parity_axpby() {
+    std::printf("axpby_inplace parity\n");
+    std::mt19937 rng(0x0304);
+    const int N = 263;
+
+    // (1) FP32 correctness vs an explicit host loop, plus CPU<->GPU parity.
+    {
+        Tensor y = Tensor::zeros_on(Device::CPU, N, 1);
+        Tensor x = Tensor::zeros_on(Device::CPU, N, 1);
+        fill_random(y, rng, -2.0f, 2.0f);
+        fill_random(x, rng, -2.0f, 2.0f);
+        const float a = 1.75f, b = -0.625f;
+
+        std::vector<float> ref(static_cast<std::size_t>(N));
+        {
+            const float* yp = y.host_f32();
+            const float* xp = x.host_f32();
+            for (int i = 0; i < N; ++i) ref[static_cast<std::size_t>(i)] = a * yp[i] + b * xp[i];
+        }
+
+        Tensor yCpu = y.clone();
+        brotensor::axpby_inplace(yCpu, x, a, b);
+        compare("axpby_fp32_cpu_vs_host", yCpu.to_host_vector(), ref, 0.0f, 0.0f);
+
+        // GPU FP32 may differ from the host loop by ~1 ulp: nvcc contracts
+        // a*y + b*x into an FMA (one rounding instead of two). Allow ulp-level
+        // slack here; the FP16 checks below stay exact (the final FP16 store
+        // rounds both variants to the same bits).
+        Tensor yg = y.to(g_gpu);
+        Tensor xg = x.to(g_gpu);
+        brotensor::axpby_inplace(yg, xg, a, b);
+        brotensor::sync(g_gpu);
+        compare("axpby_fp32_gpu_vs_host", yg.to_host_vector(), ref, 1e-6f, 1e-6f);
+    }
+
+    if (g_gpu != Device::CUDA) {
+        std::printf("  (FP16 axpby checks need CUDA — skipped)\n");
+        return;
+    }
+
+    // FP16 helpers: decode an FP16-bit vector to floats.
+    auto fp16_decode = [](const std::vector<uint16_t>& bits) {
+        std::vector<float> out(bits.size());
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+            out[i] = brotensor::fp16_bits_to_fp32(bits[i]);
+        }
+        return out;
+    };
+
+    // (2) FP16 CPU-vs-CUDA parity: both backends do the FP32 combine and round
+    // once on the final store, so results must be bit-identical.
+    {
+        std::uniform_real_distribution<float> d(-2.0f, 2.0f);
+        std::vector<uint16_t> yb(static_cast<std::size_t>(N)), xb(yb.size());
+        for (std::size_t i = 0; i < yb.size(); ++i) {
+            yb[i] = brotensor::fp32_to_fp16_bits(d(rng));
+            xb[i] = brotensor::fp32_to_fp16_bits(d(rng));
+        }
+        const float a = 0.8f, b = 1.3f;
+
+        Tensor yc = Tensor::from_host_fp16_on(Device::CPU, yb.data(), N, 1);
+        Tensor xc = Tensor::from_host_fp16_on(Device::CPU, xb.data(), N, 1);
+        brotensor::axpby_inplace(yc, xc, a, b);
+
+        Tensor yg = Tensor::from_host_fp16_on(g_gpu, yb.data(), N, 1);
+        Tensor xg = Tensor::from_host_fp16_on(g_gpu, xb.data(), N, 1);
+        brotensor::axpby_inplace(yg, xg, a, b);
+        brotensor::sync(g_gpu);
+
+        compare("axpby_fp16_cpu_vs_gpu", fp16_decode(yc.to_host_vector_fp16()),
+                fp16_decode(yg.to_host_vector_fp16()), 0.0f, 0.0f);
+    }
+
+    // (3) FP16 cancellation: a*y + b*x with a=8, b=-7 and x ≈ y, so the two
+    // products (~8|y|) nearly cancel. An FP16-accumulating combine would lose
+    // the small residual to the rounding of the large intermediates; an FP32
+    // combine keeps it exactly, so the stored result must equal the FP32 host
+    // reference rounded ONCE to FP16 (error bound = the final store only).
+    {
+        const float a = 8.0f, b = -7.0f;
+        std::uniform_real_distribution<float> d(0.5f, 2.0f);
+        std::vector<uint16_t> yb(static_cast<std::size_t>(N)), xb(yb.size());
+        for (std::size_t i = 0; i < yb.size(); ++i) {
+            const float base = d(rng);
+            yb[i] = brotensor::fp32_to_fp16_bits(base);
+            // x ≈ y: nudge by a few FP16 ulps so a*y + b*x is a small residual.
+            xb[i] = static_cast<uint16_t>(yb[i] + (i % 5));
+        }
+        // Host double/FP32 reference over the decoded FP16 inputs, rounded once.
+        std::vector<float> ref(yb.size());
+        for (std::size_t i = 0; i < yb.size(); ++i) {
+            const double r =
+                static_cast<double>(a) * brotensor::fp16_bits_to_fp32(yb[i]) +
+                static_cast<double>(b) * brotensor::fp16_bits_to_fp32(xb[i]);
+            ref[i] = brotensor::fp16_bits_to_fp32(
+                brotensor::fp32_to_fp16_bits(static_cast<float>(r)));
+        }
+
+        Tensor yg = Tensor::from_host_fp16_on(g_gpu, yb.data(), N, 1);
+        Tensor xg = Tensor::from_host_fp16_on(g_gpu, xb.data(), N, 1);
+        brotensor::axpby_inplace(yg, xg, a, b);
+        brotensor::sync(g_gpu);
+        compare("axpby_fp16_cancellation_gpu",
+                fp16_decode(yg.to_host_vector_fp16()), ref, 0.0f, 0.0f);
+
+        Tensor yc = Tensor::from_host_fp16_on(Device::CPU, yb.data(), N, 1);
+        Tensor xc = Tensor::from_host_fp16_on(Device::CPU, xb.data(), N, 1);
+        brotensor::axpby_inplace(yc, xc, a, b);
+        compare("axpby_fp16_cancellation_cpu",
+                fp16_decode(yc.to_host_vector_fp16()), ref, 0.0f, 0.0f);
+    }
+}
+
 // NOTE: no parity check for softmax_xent / softmax_xent_segment — the GPU
 //       softmax/xent surface is batched (loss / softmax kernels work in
 //       (batch, n) form with reductions) and does not expose a single-sample
@@ -317,6 +432,7 @@ int main() {
     parity_elementwise_act();
     parity_softmax();
     parity_add();
+    parity_axpby();
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);
