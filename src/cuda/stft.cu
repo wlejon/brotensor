@@ -199,12 +199,18 @@ __global__ void cola_env_kernel(const float* __restrict__ window,
     for (long long p = blockIdx.x * (long long)blockDim.x + threadIdx.x;
          p < padded_len; p += (long long)blockDim.x * gridDim.x) {
         double e = 0.0;
-        for (int f = 0; f < frames; ++f) {
-            const int jj = static_cast<int>(p) - f * hop - pad_lo;
-            if (jj >= 0 && jj < win_length) {
-                const double w = window[jj];
-                e += w * w;
-            }
+        // Only frames with 0 <= p - f*hop - pad_lo < win_length cover p —
+        // iterate exactly that range instead of scanning all `frames` (at
+        // small hop the full scan is thousands of mostly-skipped iterations
+        // per sample).
+        const int rel  = static_cast<int>(p) - pad_lo;
+        const int f_hi = min(frames - 1, rel >= 0 ? rel / hop : -1);
+        const int f_lo = max(0, rel - win_length + hop >= 0
+                                    ? (rel - win_length + hop) / hop : 0);
+        for (int f = f_lo; f <= f_hi; ++f) {
+            const int jj = rel - f * hop;
+            const double w = window[jj];
+            e += w * w;
         }
         env[p] = static_cast<float>(e);
     }
@@ -233,9 +239,15 @@ __global__ void istft_kernel(const float* __restrict__ spec,
             continue;
         }
         double acc = 0.0;
-        for (int f = 0; f < frames; ++f) {
+        // Same covering-frame range as cola_env_kernel: iterate only frames
+        // with pad_lo <= p - f*hop < pad_lo + win_length instead of scanning
+        // all `frames` per output sample.
+        const int rel  = p - pad_lo;
+        const int f_hi = min(frames - 1, rel >= 0 ? rel / hop : -1);
+        const int f_lo = max(0, rel - win_length + hop >= 0
+                                    ? (rel - win_length + hop) / hop : 0);
+        for (int f = f_lo; f <= f_hi; ++f) {
             const int i = p - f * hop;
-            if (i < pad_lo || i >= pad_lo + win_length) continue;
             const int jw = i - pad_lo;
             const float* srow = spec + ((long long)b * frames + f) * (2 * bins);
             const double w = kTwoPi * i / n_fft;    // inverse sign
