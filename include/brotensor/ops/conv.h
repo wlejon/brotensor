@@ -257,7 +257,9 @@ inline void conv3d_int8w_fp16_forward(const Tensor& X,
 // bias may be null. groups must divide both C_in and C_out (default 1).
 // output_padding must be < stride or < dilation on each axis (matches torch).
 //   X: (N, C_in*H*W).  Y: (N, C_out*H_out*W_out), resized + dtype-set.
-// FP32-only, on both the CPU and CUDA backends.
+// CPU backend is FP32-only; the CUDA forward is dtype-dispatched on X
+// (FP32/FP16/BF16 — Wt and bias must match, FP32 accumulation). The three
+// backward ops are FP32-only on both backends.
 void conv_transpose2d_forward(const Tensor& X, const Tensor& Wt,
                               const Tensor* bias,
                               int N, int C_in, int H, int W,

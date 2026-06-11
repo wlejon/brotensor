@@ -148,7 +148,65 @@ void run_bwd_bias(const CT2& c, uint64_t seed) {
                     1e-4f, 1e-3f);
 }
 
+// ── FP16 / BF16 forward (low-precision-on-GPU vs FP32 CPU reference) ───────
+// CUDA-only paths: the CPU backend stays FP32, so the reference runs FP32 and
+// the GPU runs the same values rounded to 16-bit storage.
+void run_fwd_16(const CT2& c, bool has_bias, bool bf16, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int Cg_out = c.C_out / c.groups;
+    Tensor X = Tensor::mat(c.N, c.C_in * c.H * c.W);
+    Tensor Wt = Tensor::mat(c.C_in, Cg_out * c.kH * c.kW);
+    fill_random(X, rng, 0.5f);
+    fill_random(Wt, rng, 0.5f);
+    Tensor B;
+    Tensor* Bp = nullptr;
+    if (has_bias) {
+        B = Tensor::vec(c.C_out);
+        fill_random(B, rng, 0.5f);
+        Bp = &B;
+    }
+
+    Tensor cpu_Y;
+    brotensor::conv_transpose2d_forward(X, Wt, Bp, c.N, c.C_in, c.H, c.W,
+        c.C_out, c.kH, c.kW, c.stride_h, c.stride_w,
+        c.pad_h, c.pad_w, c.output_padding_h, c.output_padding_w,
+        c.dil_h, c.dil_w, c.groups, cpu_Y);
+
+    Tensor gX = bf16 ? to_bf16_gpu(X) : to_fp16_gpu(X);
+    Tensor gW = bf16 ? to_bf16_gpu(Wt) : to_fp16_gpu(Wt);
+    Tensor gB;
+    Tensor* gBp = nullptr;
+    if (has_bias) {
+        gB = bf16 ? to_bf16_gpu(B) : to_fp16_gpu(B);
+        gBp = &gB;
+    }
+    Tensor gpu_Y;
+    brotensor::conv_transpose2d_forward(gX, gW, gBp, c.N, c.C_in, c.H, c.W,
+        c.C_out, c.kH, c.kW, c.stride_h, c.stride_w,
+        c.pad_h, c.pad_w, c.output_padding_h, c.output_padding_w,
+        c.dil_h, c.dil_w, c.groups, gpu_Y);
+
+    Tensor host = download_to_host(gpu_Y);
+    Tensor wide = bf16 ? bf16_host_to_f32(host) : fp16_host_to_f32(host);
+    compare_tensors(cpu_Y, wide, bf16 ? "ct2d_fwd_bf16" : "ct2d_fwd_fp16",
+                    bf16 ? 5e-2f : 2e-2f, bf16 ? 5e-2f : 2e-2f);
+}
+
+// brovisionml shapes (scaled spatially so the FP32 CPU reference stays fast):
+// lineart upsamplers 3x3 s2 p1 op1 (256->128 and 128->64) and the SAM/DPT
+// 2x2 s2 upscaler.
+const CT2 kLineartUp1 {1, 256, 12, 14, 128, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1};
+const CT2 kLineartUp2 {1, 128, 17, 15,  64, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1};
+const CT2 kUp2x2      {1, 256, 11, 13,  64, 2, 2, 2, 2, 0, 0, 0, 0, 1, 1, 1};
+
 } // namespace
+
+// ── FP16 / BF16 forward ─────────────────────────────────────────────────────
+BT_PARITY_TEST(ct2d_fwd_fp16_lineart_up1) { run_fwd_16(kLineartUp1, true,  false, 0xC640ull); }
+BT_PARITY_TEST(ct2d_fwd_fp16_lineart_up2) { run_fwd_16(kLineartUp2, true,  false, 0xC641ull); }
+BT_PARITY_TEST(ct2d_fwd_fp16_up2x2)       { run_fwd_16(kUp2x2,      false, false, 0xC642ull); }
+BT_PARITY_TEST(ct2d_fwd_bf16_lineart_up1) { run_fwd_16(kLineartUp1, true,  true,  0xC643ull); }
+BT_PARITY_TEST(ct2d_fwd_bf16_up2x2)       { run_fwd_16(kUp2x2,      true,  true,  0xC644ull); }
 
 // ── forward ────────────────────────────────────────────────────────────────
 // {N, C_in, H, W, C_out, kH, kW, sh, sw, ph, pw, oph, opw, dh, dw, groups}

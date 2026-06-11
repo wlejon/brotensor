@@ -165,6 +165,39 @@ inline Tensor to_bf16_gpu(const Tensor& f32cpu) {
     return to_bf16_host(f32cpu).to(gpu_device());
 }
 
+// ─── FP16 parity helpers ───────────────────────────────────────────────────
+//
+// Same scheme as the BF16 helpers above: round the FP32 inputs to FP16, run
+// the GPU op in FP16 storage, widen the result back to FP32 and compare
+// against the FP32 CPU reference with a loose tolerance (FP16 carries 11
+// mantissa bits — atol/rtol around 1e-2, looser for long reductions).
+
+// Round an FP32 host tensor to an FP16 host tensor (same shape, Device::CPU).
+inline Tensor to_fp16_host(const Tensor& f32cpu) {
+    Tensor out = Tensor::zeros_on(brotensor::Device::CPU, f32cpu.rows,
+                                  f32cpu.cols, brotensor::Dtype::FP16);
+    const float* s = f32cpu.host_f32();
+    uint16_t* d = out.host_fp16_mut();
+    for (int i = 0; i < f32cpu.size(); ++i) d[i] = brotensor::fp32_to_fp16_bits(s[i]);
+    return out;
+}
+
+// Widen an FP16 host tensor back to an FP32 host tensor for compare_tensors().
+inline Tensor fp16_host_to_f32(const Tensor& fp16cpu) {
+    Tensor out = Tensor::zeros_on(brotensor::Device::CPU, fp16cpu.rows,
+                                  fp16cpu.cols, brotensor::Dtype::FP32);
+    const uint16_t* s = fp16cpu.host_fp16();
+    float* d = out.host_f32_mut();
+    for (int i = 0; i < fp16cpu.size(); ++i) d[i] = brotensor::fp16_bits_to_fp32(s[i]);
+    return out;
+}
+
+// Convenience: round an FP32 host tensor to FP16 and place it on the GPU
+// backend this binary was built with (CUDA when present, else Metal).
+inline Tensor to_fp16_gpu(const Tensor& f32cpu) {
+    return to_fp16_host(f32cpu).to(gpu_device());
+}
+
 // ─── Backend-neutral mask / index buffer helpers ──────────────────────────
 
 // Build a GPU-resident float mask buffer from a host float mask vector. If

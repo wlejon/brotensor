@@ -1,8 +1,11 @@
 // ─── CUDA 2D transposed convolution ─────────────────────────────────────────
 //
-// CUDA port of src/cpu/conv_transpose2d.cpp. FP32-only, mirroring the CPU
-// contracts:
+// CUDA port of src/cpu/conv_transpose2d.cpp, mirroring the CPU contracts:
 //   conv_transpose2d_forward / _backward_input / _backward_weight / _backward_bias
+//
+// The forward op is dtype-dispatched on X (FP32 / FP16 / BF16 — Wt and bias
+// must match, Y resized to X's dtype; FP32 accumulation in the kernel, like
+// conv2d). The three backward ops remain FP32-only.
 //
 // Layout (NCHW):
 //   X / dX : (N, C_in*H*W)        — index ((n*C_in + c_in)*H + h)*W + w
@@ -25,6 +28,8 @@
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 #include <string>
@@ -39,6 +44,18 @@ namespace brotensor::detail::cuda {
 namespace {
 
 constexpr int CT2D_BLOCK = 256;
+
+template <typename T>
+__device__ inline float ct2d_load_f32(const T* p);
+template <> __device__ inline float ct2d_load_f32<float>(const float* p)   { return *p; }
+template <> __device__ inline float ct2d_load_f32<__half>(const __half* p) { return __half2float(*p); }
+template <> __device__ inline float ct2d_load_f32<__nv_bfloat16>(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+
+template <typename T>
+__device__ inline void ct2d_store_f32(T* p, float v);
+template <> __device__ inline void ct2d_store_f32<float>(float* p, float v)   { *p = v; }
+template <> __device__ inline void ct2d_store_f32<__half>(__half* p, float v) { *p = __float2half(v); }
+template <> __device__ inline void ct2d_store_f32<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 constexpr int CT2D_BIAS_BLOCK = 256;
 
 inline int ct2d_grid(long long n) {
@@ -95,10 +112,12 @@ inline void check_geometry(const char* op, int kH, int kW,
 //   wo = w*stride_w - pad_w + kw*dil_w
 // across every oc_local in c_in's group. Inverting: given (oh, ow),
 //   h = (oh + pad_h - kh*dil_h) / stride_h  must be exact + in [0, H).
-__global__ void convt2d_forward_kernel(const float* __restrict__ X,
-                                       const float* __restrict__ Wt,
-                                       const float* __restrict__ bias,
-                                       float* __restrict__ Y,
+// Templated on storage dtype T (FP32 / FP16 / BF16); FP32 accumulator.
+template <typename T>
+__global__ void convt2d_forward_kernel(const T* __restrict__ X,
+                                       const T* __restrict__ Wt,
+                                       const T* __restrict__ bias,
+                                       T* __restrict__ Y,
                                        int N, int C_in, int H, int W,
                                        int C_out, int kH, int kW,
                                        int stride_h, int stride_w,
@@ -121,7 +140,7 @@ __global__ void convt2d_forward_kernel(const float* __restrict__ X,
         const int c_in_base = g * Cg_in;
         const int kHW = kH * kW;
 
-        float acc = bias ? bias[oc] : 0.0f;
+        float acc = bias ? ct2d_load_f32<T>(&bias[oc]) : 0.0f;
         for (int kh = 0; kh < kH; ++kh) {
             const int num_h = oh + pad_h - kh * dil_h;
             if (num_h < 0 || num_h % stride_h != 0) continue;
@@ -134,16 +153,16 @@ __global__ void convt2d_forward_kernel(const float* __restrict__ X,
                 if (w < 0 || w >= W) continue;
                 for (int ci = 0; ci < Cg_in; ++ci) {
                     const int c_in = c_in_base + ci;
-                    const float xv =
-                        X[((long long)n * C_in + c_in) * H * W + h * W + w];
-                    const float wv =
-                        Wt[(long long)(c_in * Cg_out + oc_local) * kHW
-                           + kh * kW + kw];
+                    const float xv = ct2d_load_f32<T>(
+                        &X[((long long)n * C_in + c_in) * H * W + h * W + w]);
+                    const float wv = ct2d_load_f32<T>(
+                        &Wt[(long long)(c_in * Cg_out + oc_local) * kHW
+                            + kh * kW + kw]);
                     acc += xv * wv;
                 }
             }
         }
-        Y[idx] = acc;
+        ct2d_store_f32<T>(&Y[idx], acc);
     }
 }
 
@@ -292,9 +311,13 @@ void conv_transpose2d_forward(const ::brotensor::Tensor& X,
                               int dil_h, int dil_w, int groups,
                               ::brotensor::Tensor& Y) {
     const char* op = "conv_transpose2d_forward";
-    require_fp32(op, X, "X");
-    require_fp32(op, Wt, "Wt");
-    if (bias) require_fp32(op, *bias, "bias");
+    using ::brotensor::Dtype;
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 &&
+        X.dtype != Dtype::BF16) {
+        fail(op, "X must be FP32, FP16 or BF16");
+    }
+    if (Wt.dtype != X.dtype) fail(op, "Wt dtype must match X");
+    if (bias && bias->dtype != X.dtype) fail(op, "bias dtype must match X");
     check_groups(op, C_in, C_out, groups);
     check_geometry(op, kH, kW, stride_h, stride_w, pad_h, pad_w,
                    output_padding_h, output_padding_w, dil_h, dil_w);
@@ -318,21 +341,40 @@ void conv_transpose2d_forward(const ::brotensor::Tensor& X,
         fail(op, "bias shape must be (C_out, 1)");
     }
     const int out_cols = C_out * H_out * W_out;
-    if (Y.rows != N || Y.cols != out_cols
-        || Y.dtype != ::brotensor::Dtype::FP32) {
-        Y.resize(N, out_cols, ::brotensor::Dtype::FP32);
+    if (Y.rows != N || Y.cols != out_cols || Y.dtype != X.dtype) {
+        Y.resize(N, out_cols, X.dtype);
     }
     if (N == 0 || out_cols == 0) return;
 
     const long long total = (long long)N * out_cols;
-    convt2d_forward_kernel<<<ct2d_grid(total), CT2D_BLOCK, 0, cur_stream()>>>(
-        static_cast<const float*>(X.data),
-        static_cast<const float*>(Wt.data),
-        bias ? static_cast<const float*>(bias->data) : nullptr,
-        static_cast<float*>(Y.data),
-        N, C_in, H, W, C_out, kH, kW,
-        stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-        Cg_in, Cg_out, H_out, W_out);
+    if (X.dtype == Dtype::FP16) {
+        convt2d_forward_kernel<__half><<<ct2d_grid(total), CT2D_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __half*>(X.data),
+            static_cast<const __half*>(Wt.data),
+            bias ? static_cast<const __half*>(bias->data) : nullptr,
+            static_cast<__half*>(Y.data),
+            N, C_in, H, W, C_out, kH, kW,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            Cg_in, Cg_out, H_out, W_out);
+    } else if (X.dtype == Dtype::BF16) {
+        convt2d_forward_kernel<__nv_bfloat16><<<ct2d_grid(total), CT2D_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<const __nv_bfloat16*>(Wt.data),
+            bias ? static_cast<const __nv_bfloat16*>(bias->data) : nullptr,
+            static_cast<__nv_bfloat16*>(Y.data),
+            N, C_in, H, W, C_out, kH, kW,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            Cg_in, Cg_out, H_out, W_out);
+    } else {
+        convt2d_forward_kernel<float><<<ct2d_grid(total), CT2D_BLOCK, 0, cur_stream()>>>(
+            static_cast<const float*>(X.data),
+            static_cast<const float*>(Wt.data),
+            bias ? static_cast<const float*>(bias->data) : nullptr,
+            static_cast<float*>(Y.data),
+            N, C_in, H, W, C_out, kH, kW,
+            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+            Cg_in, Cg_out, H_out, W_out);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
