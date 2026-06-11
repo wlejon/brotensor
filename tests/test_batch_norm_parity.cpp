@@ -139,6 +139,53 @@ void run_bn_backward(int N, int C, int H, int W, uint64_t seed) {
     compare_tensors(cpu_dB, download_to_host(gdB), "bn_bwd_dBeta",  kAtol, kRtol);
 }
 
+// ── FP16 / BF16 inference (low-precision-on-GPU vs FP32 CPU reference) ─────
+// CUDA-only paths: the per-channel params must carry X's dtype. The CPU
+// reference runs FP32 over inputs/params rounded through the 16-bit type, so
+// only the per-element output store rounds differently.
+void run_bn_inference_16(int N, int C, int H, int W, bool bf16,
+                         uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X = Tensor::mat(N, C * H * W);
+    fill_random(X, rng, 1.0f);
+    Tensor gamma = Tensor::mat(C, 1);
+    Tensor beta  = Tensor::mat(C, 1);
+    fill_random(gamma, rng, 1.0f);
+    fill_random(beta,  rng, 1.0f);
+    Tensor run_mean = Tensor::mat(C, 1);
+    Tensor run_var  = Tensor::mat(C, 1);
+    fill_random(run_mean, rng, 0.5f);
+    for (int i = 0; i < C; ++i) {
+        run_var.host_f32_mut()[i] = std::fabs(rng.next_unit()) + 0.1f;
+    }
+    const float eps = 1e-5f;
+
+    auto roundtrip = [&](const Tensor& t) {
+        return bf16 ? bf16_host_to_f32(to_bf16_host(t))
+                    : fp16_host_to_f32(to_fp16_host(t));
+    };
+    Tensor cpu_Y;
+    brotensor::batch_norm_inference(roundtrip(X), roundtrip(gamma),
+                                    roundtrip(beta), roundtrip(run_mean),
+                                    roundtrip(run_var),
+                                    N, C, H, W, eps, cpu_Y);
+
+    auto up = [&](const Tensor& t) {
+        return bf16 ? to_bf16_gpu(t) : to_fp16_gpu(t);
+    };
+    Tensor gX = up(X), gg = up(gamma), gb = up(beta);
+    Tensor grm = up(run_mean), grv = up(run_var);
+    Tensor gY;
+    brotensor::batch_norm_inference(gX, gg, gb, grm, grv,
+                                    N, C, H, W, eps, gY);
+    BT_CHECK(gY.dtype == gX.dtype);
+
+    Tensor host = download_to_host(gY);
+    Tensor wide = bf16 ? bf16_host_to_f32(host) : fp16_host_to_f32(host);
+    compare_tensors(cpu_Y, wide, bf16 ? "bn_inf_bf16" : "bn_inf_fp16",
+                    bf16 ? 5e-2f : 1e-2f, bf16 ? 5e-2f : 1e-2f);
+}
+
 } // namespace
 
 BT_PARITY_TEST(bn_fwd_small)      { run_bn_forward(2, 4, 5, 6, 0xBA00ull); }
@@ -147,5 +194,8 @@ BT_PARITY_TEST(bn_inf_small)      { run_bn_inference(2, 4, 5, 6, 0xBA10ull); }
 BT_PARITY_TEST(bn_inf_singleton)  { run_bn_inference(1, 3, 4, 4, 0xBA11ull); }
 BT_PARITY_TEST(bn_bwd_small)      { run_bn_backward(2, 4, 5, 6, 0xBA20ull); }
 BT_PARITY_TEST(bn_bwd_bigger)     { run_bn_backward(3, 8, 7, 9, 0xBA21ull); }
+BT_PARITY_TEST(bn_inf_fp16)       { run_bn_inference_16(2, 4, 5, 6, false, 0xBA30ull); }
+BT_PARITY_TEST(bn_inf_fp16_wide)  { run_bn_inference_16(1, 16, 9, 7, false, 0xBA31ull); }
+BT_PARITY_TEST(bn_inf_bf16)       { run_bn_inference_16(2, 4, 5, 6, true,  0xBA32ull); }
 
 int main() { return run_all("batch_norm cpu/gpu parity"); }

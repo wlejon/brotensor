@@ -13,6 +13,10 @@
 //
 //   batch_norm_inference  — applies (gamma * (x - running_mean) /
 //                           sqrt(running_var + eps) + beta); no state mutation.
+//                           Dtype-dispatched on X (FP32/FP16/BF16 — the
+//                           per-channel params must match X, FP32 math per
+//                           element, Y resized to X's dtype). The training
+//                           forward and the backward stay FP32-only.
 //
 //   batch_norm_backward   — caller zeros dX/dGamma/dBeta; op overwrites dX and
 //                           accumulates into dGamma / dBeta.
@@ -29,6 +33,8 @@
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 #include <string>
@@ -139,23 +145,37 @@ __global__ void bn_forward_kernel(const float* __restrict__ X,
     }
 }
 
-__global__ void bn_inference_kernel(const float* __restrict__ X,
-                                    const float* __restrict__ gamma,
-                                    const float* __restrict__ beta,
-                                    const float* __restrict__ running_mean,
-                                    const float* __restrict__ running_var,
-                                    float* __restrict__ Y,
+template <typename T>
+__device__ inline float bn_load_f32(const T* p);
+template <> __device__ inline float bn_load_f32<float>(const float* p)   { return *p; }
+template <> __device__ inline float bn_load_f32<__half>(const __half* p) { return __half2float(*p); }
+template <> __device__ inline float bn_load_f32<__nv_bfloat16>(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+
+template <typename T>
+__device__ inline void bn_store_f32(T* p, float v);
+template <> __device__ inline void bn_store_f32<float>(float* p, float v)   { *p = v; }
+template <> __device__ inline void bn_store_f32<__half>(__half* p, float v) { *p = __float2half(v); }
+template <> __device__ inline void bn_store_f32<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+
+// Templated on storage dtype T (FP32/FP16/BF16); per-element math in FP32.
+template <typename T>
+__global__ void bn_inference_kernel(const T* __restrict__ X,
+                                    const T* __restrict__ gamma,
+                                    const T* __restrict__ beta,
+                                    const T* __restrict__ running_mean,
+                                    const T* __restrict__ running_var,
+                                    T* __restrict__ Y,
                                     int N, int C, int spatial, float eps) {
     const int c = blockIdx.x;
     const int tid = threadIdx.x;
-    const float inv = rsqrtf(running_var[c] + eps);
-    const float a = gamma[c] * inv;
-    const float b = beta[c] - running_mean[c] * a;
+    const float inv = rsqrtf(bn_load_f32<T>(&running_var[c]) + eps);
+    const float a = bn_load_f32<T>(&gamma[c]) * inv;
+    const float b = bn_load_f32<T>(&beta[c]) - bn_load_f32<T>(&running_mean[c]) * a;
     for (int n = 0; n < N; ++n) {
-        const float* x_chan = X + (n * C + c) * spatial;
-        float*       y_chan = Y + (n * C + c) * spatial;
+        const T* x_chan = X + (n * C + c) * spatial;
+        T*       y_chan = Y + (n * C + c) * spatial;
         for (int s = tid; s < spatial; s += blockDim.x) {
-            y_chan[s] = x_chan[s] * a + b;
+            bn_store_f32<T>(&y_chan[s], bn_load_f32<T>(&x_chan[s]) * a + b);
         }
     }
 }
@@ -287,11 +307,20 @@ void batch_norm_inference(const ::brotensor::Tensor& X,
                           float eps,
                           ::brotensor::Tensor& Y) {
     using ::brotensor::Dtype;
-    check_fp32(X,            "batch_norm_inference", "X");
-    check_fp32(gamma,        "batch_norm_inference", "gamma");
-    check_fp32(beta,         "batch_norm_inference", "beta");
-    check_fp32(running_mean, "batch_norm_inference", "running_mean");
-    check_fp32(running_var,  "batch_norm_inference", "running_var");
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 &&
+        X.dtype != Dtype::BF16) {
+        throw std::runtime_error(
+            "brotensor: batch_norm_inference: X must be FP32, FP16 or BF16");
+    }
+    // Mirror conv2d: the per-channel params must carry X's dtype so the
+    // kernel reads one element type throughout (FP32 math per element).
+    for (const auto* t : {&gamma, &beta, &running_mean, &running_var}) {
+        if (t->dtype != X.dtype) {
+            throw std::runtime_error(
+                "brotensor: batch_norm_inference: "
+                "gamma/beta/running_mean/running_var dtype must match X");
+        }
+    }
     check_per_channel(gamma,        C, "batch_norm_inference", "gamma");
     check_per_channel(beta,         C, "batch_norm_inference", "beta");
     check_per_channel(running_mean, C, "batch_norm_inference", "running_mean");
@@ -299,19 +328,39 @@ void batch_norm_inference(const ::brotensor::Tensor& X,
 
     const int spatial = H * W;
     const int cols = C * spatial;
-    if (Y.rows != N || Y.cols != cols || Y.dtype != Dtype::FP32) {
-        Y.resize(N, cols, Dtype::FP32);
+    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) {
+        Y.resize(N, cols, X.dtype);
     }
     if (N == 0 || cols == 0) return;
 
-    bn_inference_kernel<<<C, BN_BLOCK, 0, cur_stream()>>>(
-        reinterpret_cast<const float*>(X.data),
-        reinterpret_cast<const float*>(gamma.data),
-        reinterpret_cast<const float*>(beta.data),
-        reinterpret_cast<const float*>(running_mean.data),
-        reinterpret_cast<const float*>(running_var.data),
-        reinterpret_cast<float*>(Y.data),
-        N, C, spatial, eps);
+    if (X.dtype == Dtype::FP16) {
+        bn_inference_kernel<__half><<<C, BN_BLOCK, 0, cur_stream()>>>(
+            reinterpret_cast<const __half*>(X.data),
+            reinterpret_cast<const __half*>(gamma.data),
+            reinterpret_cast<const __half*>(beta.data),
+            reinterpret_cast<const __half*>(running_mean.data),
+            reinterpret_cast<const __half*>(running_var.data),
+            reinterpret_cast<__half*>(Y.data),
+            N, C, spatial, eps);
+    } else if (X.dtype == Dtype::BF16) {
+        bn_inference_kernel<__nv_bfloat16><<<C, BN_BLOCK, 0, cur_stream()>>>(
+            reinterpret_cast<const __nv_bfloat16*>(X.data),
+            reinterpret_cast<const __nv_bfloat16*>(gamma.data),
+            reinterpret_cast<const __nv_bfloat16*>(beta.data),
+            reinterpret_cast<const __nv_bfloat16*>(running_mean.data),
+            reinterpret_cast<const __nv_bfloat16*>(running_var.data),
+            reinterpret_cast<__nv_bfloat16*>(Y.data),
+            N, C, spatial, eps);
+    } else {
+        bn_inference_kernel<float><<<C, BN_BLOCK, 0, cur_stream()>>>(
+            reinterpret_cast<const float*>(X.data),
+            reinterpret_cast<const float*>(gamma.data),
+            reinterpret_cast<const float*>(beta.data),
+            reinterpret_cast<const float*>(running_mean.data),
+            reinterpret_cast<const float*>(running_var.data),
+            reinterpret_cast<float*>(Y.data),
+            N, C, spatial, eps);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

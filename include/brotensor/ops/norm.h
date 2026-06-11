@@ -213,6 +213,9 @@ void batch_norm_forward(const Tensor& X,
 // checkpoints want at inference time.
 //   X, Y:               (N, C*H*W).
 //   gamma, beta, running_mean, running_var: (C,1).
+// CPU backend is FP32-only; the CUDA path is dtype-dispatched on X
+// (FP32/FP16/BF16 — the per-channel params must match X's dtype, FP32 math
+// per element, Y resized to X's dtype).
 void batch_norm_inference(const Tensor& X,
                           const Tensor& gamma, const Tensor& beta,
                           const Tensor& running_mean,
