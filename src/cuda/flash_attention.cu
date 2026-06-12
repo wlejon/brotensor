@@ -58,20 +58,24 @@ __global__ void extract_head_LD_kernel(const __half* __restrict__ X,
 }
 
 // Extract a single head and TRANSPOSE on the way in: Y has layout
-// (head_dim, L) so element (d, l) = X[l, head_off + d]. Used to produce a
+// (head_dim, ldY) so element (d, l) = X[l, head_off + d]. Used to produce a
 // (head_dim, L) "B"-style operand for the second GEMM via launch_matmul_ABT.
+// ldY >= L is the row stride of Y — the caller may pad it to an 8-element
+// multiple so the GEMM keeps its vectorised (int4) loads; pad columns are
+// untouched (the caller zeroes them once).
 __global__ void extract_head_DL_kernel(const __half* __restrict__ X,
                                        __half* __restrict__ Y,
-                                       int L, int D, int head_off, int head_dim) {
+                                       int L, int D, int head_off, int head_dim,
+                                       int ldY) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = L * head_dim;
     if (idx >= total) return;
-    // Cooperatively write Y[d * L + l] = X[l * D + head_off + d]. Choose
+    // Cooperatively write Y[d * ldY + l] = X[l * D + head_off + d]. Choose
     // mapping that gives coalesced loads of X (d innermost in source) and
     // strided writes to Y — strided writes are fine for fp16 throughput here.
     const int l = idx / head_dim;
     const int d = idx % head_dim;
-    Y[d * L + l] = X[l * D + head_off + d];
+    Y[d * ldY + l] = X[l * D + head_off + d];
 }
 
 // Inverse of extract_head_LD: write a per-head (Lq, head_dim) block back
@@ -90,15 +94,19 @@ __global__ void pack_head_LD_kernel(const __half* __restrict__ Y,
 // Row-wise softmax over S(Lq, Lk) with a scalar scale (1/sqrt(head_dim))
 // and optional Lk-shaped float mask: positions with mask[k] <= 0.5 are
 // dropped (score forced to -inf). One block per query row, blockDim
-// chosen by the launcher.
+// chosen by the launcher. ldS >= Lk is the row stride; pad columns
+// [Lk, ldS) are written as exact zeros so a downstream GEMM over the
+// padded width adds nothing.
 __global__ void scale_mask_softmax_rows_kernel(__half* __restrict__ S,
                                                int Lq, int Lk,
                                                float scale,
-                                               const float* __restrict__ mask) {
+                                               const float* __restrict__ mask,
+                                               int ldS) {
     extern __shared__ float ssm[];  // size = blockDim.x
     const int q = blockIdx.x;
     const int tid = threadIdx.x;
-    __half* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+    __half* row = S + static_cast<size_t>(q) * static_cast<size_t>(ldS);
+    for (int k = Lk + tid; k < ldS; k += blockDim.x) row[k] = __float2half(0.0f);
 
     // 1. find row max (with scale and mask applied).
     float local_max = -1e30f;
@@ -1132,10 +1140,21 @@ void flash_attention_forward(const Tensor& Q,
     // Scratch tensors are scoped local; for SD1.5 worst-case (Lq=Lk=4096,
     // head_dim=40) the S buffer is 32 MB and the per-head buffers a few
     // hundred KB. Allocator reuse makes subsequent calls effectively free.
+    //
+    // FP16 pads the Lk axis of Kh / Vth / S to a multiple of 8: the WMMA GEMM's
+    // vectorised int4 loads need 8-element row strides along K and N, and an
+    // unaligned Lk (e.g. TripoSplat's 12294-token joint sequence) would demote
+    // both GEMMs to the naive fallback — a ~40x cliff. Pad rows of Kh are
+    // zeroed once (giving pad scores of exactly 0 pre-softmax), the softmax
+    // writes exact zeros into the pad columns of S, and Vth's pad columns are
+    // zeroed once, so the padded second GEMM adds exactly nothing — the result
+    // is bit-identical to the unpadded path. BF16 keeps Lk_pad == Lk (its
+    // naive matmul has no alignment requirement).
+    const int Lk_pad = bf16 ? Lk : ((Lk + 7) & ~7);
     Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, head_dim, dt);
-    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk, head_dim, dt);
-    Tensor Vth = Tensor::empty_on(Device::CUDA, head_dim, Lk, dt);
-    Tensor S = Tensor::empty_on(Device::CUDA, Lq, Lk, dt);
+    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk_pad, head_dim, dt);
+    Tensor Vth = Tensor::empty_on(Device::CUDA, head_dim, Lk_pad, dt);
+    Tensor S = Tensor::empty_on(Device::CUDA, Lq, Lk_pad, dt);
     Tensor Oh = Tensor::empty_on(Device::CUDA, Lq, head_dim, dt);
 
     const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(head_dim));
@@ -1147,6 +1166,20 @@ void flash_attention_forward(const Tensor& Q,
     if (sm_block > 1024) sm_block = 1024;
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+
+    // Zero the Lk pads once per call: Kh's pad ROWS (extract writes only the
+    // valid rows, and rewrites the same region every head, so the pad stays
+    // zero across the head loop) and Vth's whole buffer (its pad is the tail
+    // COLUMNS of every row — interleaved, so blanket-zero the 16-bit buffer).
+    if (Lk_pad != Lk) {
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
+            reinterpret_cast<__half*>(Kh.data) + static_cast<size_t>(Lk) * head_dim, 0,
+            static_cast<size_t>(Lk_pad - Lk) * head_dim * sizeof(__half), stream));
+        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
+            Vth.data, 0,
+            static_cast<size_t>(head_dim) * Lk_pad * sizeof(__half), stream));
+    }
+
     for (int h = 0; h < num_heads; ++h) {
         const int head_off = h * head_dim;
         const int total_q = Lq * head_dim;
@@ -1198,26 +1231,29 @@ void flash_attention_forward(const Tensor& Q,
         extract_head_DL_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
             reinterpret_cast<const __half*>(V.data),
             reinterpret_cast<__half*>(Vth.data),
-            Lk, D, head_off, head_dim);
+            Lk, D, head_off, head_dim, Lk_pad);
 
-        // 2. S(Lq, Lk) = Qh(Lq, hd) @ Kh(Lk, hd)^T.
+        // 2. S(Lq, Lk_pad) = Qh(Lq, hd) @ Kh(Lk_pad, hd)^T. Pad rows of Kh are
+        //    zero, so pad columns of S come out 0 (overwritten by the softmax).
         fp16_internal::launch_matmul_ABT(
             reinterpret_cast<const __half*>(Qh.data),
             reinterpret_cast<const __half*>(Kh.data),
             reinterpret_cast<__half*>(S.data),
-            Lq, Lk, head_dim);
+            Lq, Lk_pad, head_dim);
 
-        // 3. Row-wise softmax (scaled, optionally masked).
+        // 3. Row-wise softmax (scaled, optionally masked) over the valid Lk;
+        //    writes exact zeros into the pad columns.
         scale_mask_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
             reinterpret_cast<__half*>(S.data),
-            Lq, Lk, inv_sqrt, d_mask);
+            Lq, Lk, inv_sqrt, d_mask, Lk_pad);
 
-        // 4. Oh(Lq, hd) = S(Lq, Lk) @ Vth(hd, Lk)^T  — Vth is already (hd, Lk).
+        // 4. Oh(Lq, hd) = S(Lq, Lk_pad) @ Vth(hd, Lk_pad)^T — the pad columns
+        //    of both operands are zero, contributing exactly nothing.
         fp16_internal::launch_matmul_ABT(
             reinterpret_cast<const __half*>(S.data),
             reinterpret_cast<const __half*>(Vth.data),
             reinterpret_cast<__half*>(Oh.data),
-            Lq, head_dim, Lk);
+            Lq, head_dim, Lk_pad);
 
         // 5. Pack back into the per-head slot of O.
         pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
@@ -1698,7 +1734,7 @@ void flash_attention_qkvo_backward(
             extract_head_DL_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __half*>(V.data),
                 reinterpret_cast<__half*>(Vth.data),
-                Lk, D, head_off, hd);
+                Lk, D, head_off, hd, /*ldY=*/Lk);
 
             fp16_internal::launch_matmul_ABT(
                 reinterpret_cast<const __half*>(Qh.data),
@@ -2223,6 +2259,17 @@ void flash_attention_varlen_forward(const Tensor& Q,
     }
     if (total_q == 0 || D == 0 || batch_size == 0) return;
     (void)max_seqlen_q; (void)max_seqlen_k;
+
+    // Single-sequence non-causal FP16/BF16 is exactly flash_attention_forward
+    // over the same packed (L, D) layout (the packing invariant fixes
+    // cu = [0, total]), and that path runs the WMMA tensor-core GEMMs —
+    // ~16x the throughput of the scalar online-softmax kernel below at
+    // transformer-encoder shapes (e.g. DINOv3 ViT-H, TripoSplat flow DiT).
+    if (batch_size == 1 && !causal && (dt == Dtype::FP16 || dt == Dtype::BF16)) {
+        flash_attention_forward(Q, K, V, /*d_mask=*/nullptr, num_heads,
+                                /*causal=*/false, O);
+        return;
+    }
 
     const size_t shmem = (static_cast<size_t>(FA_KTILE) + FA_BLOCK) * sizeof(float);
     dim3 grid(total_q, num_heads, 1);
