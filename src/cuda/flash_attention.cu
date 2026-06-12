@@ -2,6 +2,7 @@
 #include <brotensor/detail/dispatch.h>
 
 #include "fp16_internal.cuh"
+#include "flash_fused_internal.cuh"
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
@@ -1122,6 +1123,34 @@ void flash_attention_forward(const Tensor& Q,
                 1);
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // ── Fused FlashAttention-2 path ───────────────────────────────────────
+    // Tiled online-softmax WMMA kernel reading the interleaved (L, D) layout
+    // directly: no per-head extraction, no (Lq, Lk) score materialisation.
+    // Covers the instantiated head_dims (see flash_fused::supported); masked
+    // and unmasked, FP16 and BF16. Everything else falls through to the
+    // per-head GEMM path below.
+    if (!causal && flash_fused::supported(head_dim)) {
+        cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+        if (bf16) {
+            flash_fused::launch(
+                reinterpret_cast<const __nv_bfloat16*>(Q.data),
+                reinterpret_cast<const __nv_bfloat16*>(K.data),
+                reinterpret_cast<const __nv_bfloat16*>(V.data),
+                d_mask,
+                reinterpret_cast<__nv_bfloat16*>(O.data),
+                Lq, Lk, D, num_heads, head_dim, stream);
+        } else {
+            flash_fused::launch(
+                reinterpret_cast<const __half*>(Q.data),
+                reinterpret_cast<const __half*>(K.data),
+                reinterpret_cast<const __half*>(V.data),
+                d_mask,
+                reinterpret_cast<__half*>(O.data),
+                Lq, Lk, D, num_heads, head_dim, stream);
+        }
         return;
     }
 

@@ -1398,6 +1398,14 @@ int main() {
     run_one("multi-head",  6, 7, 32, 4, false);
     run_one("with mask",   4, 8, 16, 2, true);
     run_one("ktile-cross", 4, 130, 32, 4, false);   // forces multiple Lk tiles
+
+    // Fused FlashAttention-2 path (head_dim == 64). Exercise: exact tile
+    // multiples, q-tile tails (Lq % 128), k-tile tails (Lk % 64), masking,
+    // and a single-head case.
+    run_one("fused hd64 exact", 128, 128, 256, 4, false);
+    run_one("fused hd64 tails", 129,  65, 192, 3, false);
+    run_one("fused hd64 mask",   70, 200, 128, 2, true);
+    run_one("fused hd64 1head", 300, 333,  64, 1, false);
     run_qkvo("qkvo small", 6, 7, 32, 4);
     run_qkvo("qkvo self",  8, 8, 32, 4);
     run_qkvo_with_biases("qkvo biases", 6, 7, 32, 4);
