@@ -2,7 +2,7 @@
 
 // Tiled FP16 matmul for C(M,N) = A(M,K) @ B(N,K)^T, FP16 storage / FP32 accum.
 // Defined in src/metal/fp16_matmul.mm. Used by gemm.mm (Linear forward) and
-// (in a later phase) flash_attention.mm for QK^T / PV inner products.
+// flash_attention.mm for QK^T / PV inner products.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>

@@ -1,4 +1,4 @@
-// CUDA loss kernels. Phase 2G port — kernel bodies unchanged.
+// CUDA loss kernels.
 //
 // Losses are FP32-by-design: even in mixed-precision pipelines, logits feeding
 // xent and prediction/target feeding mse are conventionally upcast to FP32 to

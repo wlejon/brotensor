@@ -1,4 +1,4 @@
-// brotensor public op wrappers. Phase 1A.
+// brotensor public op wrappers.
 //
 // One wrapper per public op declared in <brotensor/ops.h>. Each wrapper:
 //   1. Validates that all operand tensors share a Device (via detail::dispatch

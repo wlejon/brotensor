@@ -26,7 +26,7 @@ namespace brotensor::detail::cuda {
 // rectangular Wk/Wv: (D, D_ctx). Self-attention training is a thin wrapper
 // over mha_forward / mha_backward (Lq == Lk, D_ctx == D, X == Ctx).
 
-// ─── Sibling-cluster forward decls (Phase 2A / same cluster) ──────────────
+// ─── Sibling-cluster forward decls (same cluster) ─────────────────────────
 void mha_forward(const ::brotensor::Tensor& X,
                  const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,
                  const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo,

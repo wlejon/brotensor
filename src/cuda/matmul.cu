@@ -187,10 +187,10 @@ void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
 // ─── Vtable contribution ────────────────────────────────────────────────────
 //
 // Filled into the CUDA OpsVTable from the per-cluster registration entry in
-// src/cuda/register.cu (Phase 2G). Includes every op in this cluster (matmul +
+// src/cuda/register.cu. Includes every op in this cluster (matmul +
 // utilities) as well as the slots whose implementations live in sibling files
-// (linear_forward_batched, linear_backward_batched) — those are owned by
-// other Phase 2 agents but share the `detail::cuda` namespace.
+// (linear_forward_batched, linear_backward_batched) — those share the
+// `detail::cuda` namespace.
 
 namespace brotensor::detail::cuda {
 

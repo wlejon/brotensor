@@ -13,8 +13,8 @@
 
 namespace brotensor {
 
-// Forward decls of CUDA helpers from sibling files (owned by other phase-2
-// clusters). After their port they all live in brotensor::detail::cuda.
+// Forward decls of CUDA helpers from sibling files. They all live in
+// brotensor::detail::cuda.
 namespace detail::cuda {
 void linear_forward_batched_fp16(const ::brotensor::Tensor& W,
                                  const ::brotensor::Tensor* bias,

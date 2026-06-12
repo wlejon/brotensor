@@ -1,6 +1,6 @@
-// CUDA concat / split / copy_d2d. Phase 2G port — kernel bodies unchanged.
-// Also hosts `fill_cuda_vtable_specialised` — the Phase 2G master vtable
-// fill function for this whole cluster.
+// CUDA concat / split / copy_d2d.
+// Also hosts `fill_cuda_vtable_specialised` — the master vtable fill function
+// for this whole cluster.
 
 #include "detail/cuda_check.h"
 

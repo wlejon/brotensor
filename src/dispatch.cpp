@@ -1,4 +1,4 @@
-// Backend registration + per-operand dispatch. Phase 1A: dispatcher core.
+// Backend registration + per-operand dispatch: the dispatcher core.
 //
 // Storage is two parallel std::array<>s indexed by static_cast<int>(Device).
 // Registration happens during static init (CPU) and at brotensor::init()

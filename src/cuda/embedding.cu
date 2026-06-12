@@ -1,4 +1,4 @@
-// CUDA embedding lookup. Phase 2G port — kernel bodies unchanged.
+// CUDA embedding lookup.
 
 #include "detail/cuda_check.h"
 

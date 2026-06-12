@@ -1,4 +1,4 @@
-// CUDA AllocVTable. Phase 2G.
+// CUDA AllocVTable.
 //
 // All Tensor allocation / freeing / memcpy / zero / sync on the CUDA device
 // is routed through `cuda_alloc_table()` (see brotensor/detail/dispatch.h).

@@ -1078,7 +1078,7 @@ void resblock_backward(const ::brotensor::Tensor& X,
                        ::brotensor::Tensor& dW2, ::brotensor::Tensor* db2,
                        ::brotensor::Tensor* dWskip, ::brotensor::Tensor* dbskip);
 
-// Forward decls from sibling group_norm.cu (this cluster, Phase 2E).
+// Forward decls from sibling group_norm.cu (this cluster).
 void group_norm_forward(const ::brotensor::Tensor& X,
                         const ::brotensor::Tensor& gamma,
                         const ::brotensor::Tensor& beta,

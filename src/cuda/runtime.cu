@@ -1,8 +1,8 @@
-// CUDA backend runtime helpers. Phase 2G.
+// CUDA backend runtime helpers.
 //
-// After Phase 2 the public `cuda_init` / `cuda_set_stream` / etc. API is gone
-// (replaced by `brotensor::init()` / `brotensor::sync()`). What remains here
-// are CUDA-internal helpers:
+// There is no public `cuda_init` / `cuda_set_stream` / etc. API — device
+// lifecycle and sync go through `brotensor::init()` / `brotensor::sync()`.
+// What lives here are CUDA-internal helpers:
 //
 //   * `cuda_check_throw` — backs the BROTENSOR_CUDA_CHECK macro defined in
 //                          `src/cuda/detail/cuda_check.h`. Every CUDA TU

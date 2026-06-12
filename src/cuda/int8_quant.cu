@@ -1,16 +1,14 @@
-// CUDA INT8 weight-only quantisation (W8A16). Phase 2G port — kernel bodies
-// unchanged.
+// CUDA INT8 weight-only quantisation (W8A16).
 //
-// The host helper `quantize_int8_per_row_host` is now provided by Phase 1A
-// in src/ops.cpp (it does not depend on CUDA at all) so it is no longer
-// defined here.
+// The host helper `quantize_int8_per_row_host` is provided in src/ops.cpp
+// (it does not depend on CUDA at all) so it is not defined here.
 //
 // The two WMMA fast-path launchers
 //   linear_int8w_wmma_internal::launch_linear_int8w_fp16_wmma
 //   conv2d_int8w_wmma_internal::launch_conv2d_int8w_implicit_gemm_wmma
-// live in src/cuda/linear_int8w_wmma.cu and src/cuda/conv2d_int8w_wmma.cu,
-// which are owned by Phase 2C. We forward-declare them here in their
-// post-Phase-2 namespace (`brotensor::detail::cuda::...`).
+// live in src/cuda/linear_int8w_wmma.cu and src/cuda/conv2d_int8w_wmma.cu.
+// We forward-declare them here in their `brotensor::detail::cuda::...`
+// namespace.
 
 #include "detail/cuda_check.h"
 

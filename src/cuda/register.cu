@@ -1,14 +1,13 @@
-// CUDA backend master registration. Phase 2G.
+// CUDA backend master registration.
 //
 // Called from `brotensor::init()` (src/init.cpp) when BROTENSOR_HAS_CUDA is
 // defined. Probes the driver via cudaGetDeviceCount(); on success, builds
-// the OpsVTable by calling each Phase 2 cluster's per-cluster fill function,
+// the OpsVTable by calling each cluster's per-cluster fill function,
 // pairs it with the CUDA AllocVTable, and hands the pair to the registry.
 //
 // Every per-cluster fill function lives in `brotensor::detail::cuda` and is
-// defined in its own TU (one per Phase 2 agent). A null slot in the vtable
-// means "this op is not implemented on CUDA" — the dispatcher throws on
-// null lookups.
+// defined in its own TU. A null slot in the vtable means "this op is not
+// implemented on CUDA" — the dispatcher throws on null lookups.
 
 #include "detail/cuda_check.h"
 

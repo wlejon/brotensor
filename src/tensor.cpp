@@ -1,4 +1,4 @@
-// brotensor::Tensor implementation. Phase 1A.
+// brotensor::Tensor implementation.
 //
 // All allocation, freeing, and inter-device memory traffic routes through the
 // backend AllocVTable obtained from detail::alloc_for(device). The Tensor type

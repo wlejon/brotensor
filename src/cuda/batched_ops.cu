@@ -1,4 +1,4 @@
-// Batched (inference-only) CUDA ops. Phase 2G port — kernel bodies unchanged.
+// Batched (inference-only) CUDA ops.
 
 #include "detail/cuda_check.h"
 

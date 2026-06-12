@@ -1,5 +1,4 @@
-// KV-cache append + causal flash-attention decode. Phase 2G port — kernel
-// bodies unchanged.
+// KV-cache append + causal flash-attention decode.
 
 #include "detail/cuda_check.h"
 

@@ -8,12 +8,12 @@
 #include <cstddef>
 #include <stdexcept>
 
-// Phase 2G stashes the BROTENSOR_CUDA_CHECK macro here.
+// BROTENSOR_CUDA_CHECK macro lives here.
 #include "detail/cuda_check.h"
 
 namespace brotensor {
 
-// Defined in runtime.cu (Phase 2E). Thread-local current CUDA stream as opaque
+// Defined in runtime.cu. Thread-local current CUDA stream as opaque
 // void*. Kept as a forward declaration here so this TU does not need a public
 // header for it.
 void* cuda_current_stream();
@@ -716,16 +716,16 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
 void downsample_avg_2x_backward(const ::brotensor::Tensor& dY,
                                 int N, int C, int H, int W, ::brotensor::Tensor& dX);
 
-// Per-cluster vtable contribution. Called from the Phase 2G aggregator that
-// stitches together each cluster's slots into the CUDA OpsVTable and hands
-// it to register_backend(Device::CUDA, ...).
+// Per-cluster vtable contribution. Called from the aggregator that stitches
+// together each cluster's slots into the CUDA OpsVTable and hands it to
+// register_backend(Device::CUDA, ...).
 void fill_cuda_vtable_conv(::brotensor::detail::OpsVTable& v) {
     v.conv2d_forward                = &conv2d_forward;
     v.conv2d_backward_input         = &conv2d_backward_input;
     v.conv2d_backward_weight        = &conv2d_backward_weight;
     v.conv2d_backward_bias          = &conv2d_backward_bias;
-    // conv2d_int8w_fp16_forward lives in int8_quant.cu (Phase 2F cluster);
-    // its slot is filled by that cluster's register helper, not here.
+    // conv2d_int8w_fp16_forward lives in int8_quant.cu; its slot is filled
+    // by that cluster's register helper, not here.
     v.upsample_nearest_2x           = &upsample_nearest_2x;
     v.upsample_bilinear_2x          = &upsample_bilinear_2x;
     v.downsample_avg_2x             = &downsample_avg_2x;

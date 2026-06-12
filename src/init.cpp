@@ -1,9 +1,8 @@
 // brotensor runtime: init(), default-device policy, DeviceScope, sync.
-// Phase 1A.
 //
 // The CPU backend self-registers from a static-init object in
-// src/cpu/register.cpp (Phase 1B). init() probes CUDA / Metal if the
-// corresponding backend was compiled in. Until Phase 2/3 land,
+// src/cpu/register.cpp. init() probes CUDA / Metal if the corresponding
+// backend was compiled in. When a backend isn't built,
 // BROTENSOR_HAS_CUDA / BROTENSOR_HAS_METAL are not defined so the probe
 // branches compile out.
 
@@ -21,12 +20,12 @@
 #include <vector>
 
 #if defined(BROTENSOR_HAS_CUDA)
-// Defined in src/cuda/init.cu in Phase 2.
+// Defined in src/cuda/init.cu.
 extern "C" void brotensor_probe_and_register_cuda();
 #endif
 
 #if defined(BROTENSOR_HAS_METAL)
-// Defined in src/metal/init.mm in Phase 3.
+// Defined in src/metal/init.mm.
 extern "C" void brotensor_probe_and_register_metal();
 #endif
 
