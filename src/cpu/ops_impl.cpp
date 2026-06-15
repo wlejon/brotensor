@@ -249,6 +249,17 @@ void add_scalar_inplace(::brotensor::Tensor& y, float s) {
     for (int i = 0; i < n; ++i) yp[i] += s;
 }
 
+void add_channel_bias_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& bias,
+                              int C, int L) {
+    float* yp = y.host_f32_mut();
+    const float* bp = bias.host_f32();
+    for (int c = 0; c < C; ++c) {
+        const float b = bp[c];
+        float* row = yp + static_cast<std::size_t>(c) * L;
+        for (int i = 0; i < L; ++i) row[i] += b;
+    }
+}
+
 // ─── Xavier-uniform init ───────────────────────────────────────────────────
 
 // splitmix64 advanced by reference; deterministic, no external dep.

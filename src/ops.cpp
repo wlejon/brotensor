@@ -171,6 +171,14 @@ void add_scalar_inplace(Tensor& y, float s) {
     v.add_scalar_inplace(y, s);
 }
 
+void add_channel_bias_inplace(Tensor& y, const Tensor& bias, int C, int L) {
+    const auto& v = detail::dispatch(y);
+    if (!v.add_channel_bias_inplace)
+        detail::throw_not_implemented("add_channel_bias_inplace", y.device);
+    detail::adopt_output(y, y.device);
+    v.add_channel_bias_inplace(y, bias, C, L);
+}
+
 void scale_inplace(Tensor& y, float s) {
     const auto& v = detail::dispatch(y);
     if (!v.scale_inplace) detail::throw_not_implemented("scale_inplace", y.device);

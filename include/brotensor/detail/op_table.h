@@ -701,4 +701,5 @@
                                                        int N, int C, int H, int W, int up, int down,                                            \
                                                        int pad_x0, int pad_x1, int pad_y0, int pad_y1,                                          \
                                                        float gain, float slope, float clamp, const ::brotensor::Tensor& up_buf,                 \
-                                                       ::brotensor::Tensor& dX, ::brotensor::Tensor* dB))
+                                                       ::brotensor::Tensor& dX, ::brotensor::Tensor* dB))                                      \
+    X(add_channel_bias_inplace,                void,  (::brotensor::Tensor& y, const ::brotensor::Tensor& bias, int C, int L))

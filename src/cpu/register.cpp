@@ -48,6 +48,7 @@ float softmax_xent(const ::brotensor::Tensor& logits,
 float mse_scalar(float pred, float target, float& dPred);
 void add_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x);
 void add_scalar_inplace(::brotensor::Tensor& y, float s);
+void add_channel_bias_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& bias, int C, int L);
 void xavier_init(::brotensor::Tensor& W, uint64_t& rng_state);
 
 // ── ops_impl.cpp — forward decls of the 20 newly implemented ops ──
@@ -1089,6 +1090,7 @@ struct CpuStaticRegistrar {
         ops.mse_scalar           = &detail::cpu::mse_scalar;
         ops.add_inplace          = &detail::cpu::add_inplace;
         ops.add_scalar_inplace   = &detail::cpu::add_scalar_inplace;
+        ops.add_channel_bias_inplace = &detail::cpu::add_channel_bias_inplace;
         ops.xavier_init          = &detail::cpu::xavier_init;
 
         ops.sgd_step                 = &detail::cpu::sgd_step;

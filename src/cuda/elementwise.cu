@@ -1179,6 +1179,53 @@ void add_scalar_inplace(Tensor& y, float s) {
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+// Channel-broadcast bias add: y[c*L+i] += bias[c], y channel-major (C,L).
+__global__ void add_channel_bias_inplace_kernel(float* __restrict__ y,
+                                                const float* __restrict__ bias,
+                                                int C, int L, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] += bias[i / L];
+    }
+}
+__global__ void add_channel_bias_inplace_fp16_kernel(__half* __restrict__ y,
+                                                     const __half* __restrict__ bias,
+                                                     int C, int L, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2half(__half2float(y[i]) + __half2float(bias[i / L]));
+    }
+}
+__global__ void add_channel_bias_inplace_bf16_kernel(__nv_bfloat16* __restrict__ y,
+                                                     const __nv_bfloat16* __restrict__ bias,
+                                                     int C, int L, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] = __float2bfloat16(__bfloat162float(y[i]) + __bfloat162float(bias[i / L]));
+    }
+}
+
+void add_channel_bias_inplace(Tensor& y, const Tensor& bias, int C, int L) {
+    const int n = C * L;
+    if (n == 0) return;
+    if (y.dtype != bias.dtype)
+        throw std::runtime_error("add_channel_bias_inplace: dtype mismatch");
+    if (y.size() != n)
+        throw std::runtime_error("add_channel_bias_inplace: y size != C*L");
+    if (y.dtype == Dtype::FP16) {
+        add_channel_bias_inplace_fp16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<__half*>(y.data), static_cast<const __half*>(bias.data), C, L, n);
+    } else if (y.dtype == Dtype::BF16) {
+        add_channel_bias_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<__nv_bfloat16*>(y.data),
+            static_cast<const __nv_bfloat16*>(bias.data), C, L, n);
+    } else {
+        add_channel_bias_inplace_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<float*>(y.data), static_cast<const float*>(bias.data), C, L, n);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 void clamp(Tensor& y, float lo, float hi) {
     const int n = y.size();
     if (n == 0) return;
@@ -1615,6 +1662,7 @@ void fill_cuda_vtable_elementwise(::brotensor::detail::OpsVTable& v) {
     v.add_inplace             = &add_inplace;
     v.axpby_inplace           = &axpby_inplace;
     v.add_scalar_inplace      = &add_scalar_inplace;
+    v.add_channel_bias_inplace = &add_channel_bias_inplace;
     v.cast                    = &cast;
     v.scale_inplace           = &scale_inplace;
     v.mul_inplace             = &mul_inplace;

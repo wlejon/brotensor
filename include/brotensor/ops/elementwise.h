@@ -26,6 +26,12 @@ void axpby_inplace(Tensor& y, const Tensor& x, float a, float b);
 void add_scalar_inplace(Tensor& y, float s);
 
 
+// Channel-broadcast bias add for a channel-major (C,L) tensor: y[c*L+i] += bias[c].
+// y carries C*L elements; bias carries C. The per-channel bias every 1x1 conv
+// (and grouped conv) wants when its GEMM is expressed as a plain matmul.
+void add_channel_bias_inplace(Tensor& y, const Tensor& bias, int C, int L);
+
+
 // y[i] *= s. Dispatched FP32/FP16 on y.dtype.
 void scale_inplace(Tensor& y, float s);
 
