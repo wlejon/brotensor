@@ -18,6 +18,13 @@ void softmax_forward(const Tensor& logits, Tensor& probs,
                      const float* mask = nullptr);
 
 
+// Row-batched stable softmax: Y[r, :] = softmax(X[r, :]) over `cols`, for each
+// of `rows` independent rows (X/Y carry rows*cols elements, row-major). One
+// kernel launch covers all rows — the inference primitive for attention score
+// matrices, replacing a per-row softmax_forward loop. May be in-place (Y == X).
+void softmax_rows_forward(const Tensor& X, Tensor& Y, int rows, int cols);
+
+
 // Full-Jacobian softmax backward:
 //   dLogits[i] = sum_j dProbs[j] * probs[j] * (delta_ij - probs[i]).
 // All length-N; dLogits resized to match.

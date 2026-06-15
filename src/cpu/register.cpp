@@ -35,6 +35,8 @@ void sigmoid_backward(const ::brotensor::Tensor& y, const ::brotensor::Tensor& d
                       ::brotensor::Tensor& dX);
 void softmax_forward(const ::brotensor::Tensor& logits, ::brotensor::Tensor& probs,
                      const float* mask);
+void softmax_rows_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y,
+                          int rows, int cols);
 void softmax_backward(const ::brotensor::Tensor& probs,
                       const ::brotensor::Tensor& dProbs,
                       ::brotensor::Tensor& dLogits);
@@ -1084,6 +1086,7 @@ struct CpuStaticRegistrar {
         ops.sigmoid_forward      = &detail::cpu::sigmoid_forward;
         ops.sigmoid_backward     = &detail::cpu::sigmoid_backward;
         ops.softmax_forward      = &detail::cpu::softmax_forward;
+        ops.softmax_rows_forward = &detail::cpu::softmax_rows_forward;
         ops.softmax_backward     = &detail::cpu::softmax_backward;
         ops.softmax_xent         = &detail::cpu::softmax_xent;
         ops.softmax_xent_segment = &detail::cpu::softmax_xent_segment;

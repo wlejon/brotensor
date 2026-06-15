@@ -231,6 +231,13 @@ void softmax_forward(const Tensor& logits, Tensor& probs, const float* mask) {
     v.softmax_forward(logits, probs, mask);
 }
 
+void softmax_rows_forward(const Tensor& X, Tensor& Y, int rows, int cols) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.softmax_rows_forward) detail::throw_not_implemented("softmax_rows_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.softmax_rows_forward(X, Y, rows, cols);
+}
+
 void softmax_backward(const Tensor& probs, const Tensor& dProbs, Tensor& dLogits) {
     const auto& v = detail::dispatch(probs, dProbs, dLogits);
     if (!v.softmax_backward) detail::throw_not_implemented("softmax_backward", probs.device);

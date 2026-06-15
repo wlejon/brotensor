@@ -170,6 +170,24 @@ void softmax_forward(const ::brotensor::Tensor& logits, ::brotensor::Tensor& pro
     for (int i = 0; i < n; ++i) pp[i] *= inv;
 }
 
+void softmax_rows_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y,
+                          int rows, int cols) {
+    if (Y.rows != X.rows || Y.cols != X.cols || Y.dtype != X.dtype)
+        Y.resize(X.rows, X.cols, X.dtype);
+    const float* xp = X.host_f32();
+    float* yp = Y.host_f32_mut();
+    for (int r = 0; r < rows; ++r) {
+        const float* lp = xp + static_cast<std::size_t>(r) * cols;
+        float* pp = yp + static_cast<std::size_t>(r) * cols;
+        float m = -1e30f;
+        for (int i = 0; i < cols; ++i) if (lp[i] > m) m = lp[i];
+        float s = 0.0f;
+        for (int i = 0; i < cols; ++i) { pp[i] = std::exp(lp[i] - m); s += pp[i]; }
+        const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+        for (int i = 0; i < cols; ++i) pp[i] *= inv;
+    }
+}
+
 void softmax_backward(const ::brotensor::Tensor& probs,
                       const ::brotensor::Tensor& dProbs,
                       ::brotensor::Tensor& dLogits) {

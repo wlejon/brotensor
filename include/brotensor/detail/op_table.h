@@ -702,4 +702,5 @@
                                                        int pad_x0, int pad_x1, int pad_y0, int pad_y1,                                          \
                                                        float gain, float slope, float clamp, const ::brotensor::Tensor& up_buf,                 \
                                                        ::brotensor::Tensor& dX, ::brotensor::Tensor* dB))                                      \
-    X(add_channel_bias_inplace,                void,  (::brotensor::Tensor& y, const ::brotensor::Tensor& bias, int C, int L))
+    X(add_channel_bias_inplace,                void,  (::brotensor::Tensor& y, const ::brotensor::Tensor& bias, int C, int L))                                            \
+    X(softmax_rows_forward,                    void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y, int rows, int cols))
