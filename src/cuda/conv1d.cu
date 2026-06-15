@@ -23,6 +23,8 @@
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 #include <string>
@@ -266,9 +268,12 @@ __device__ inline int pad1d_src(int p, int L, int pad_left, int mode) {
     return q < L ? q : period - q;
 }
 
-// pad1d_forward: one thread per (n, c, p) output sample.
-__global__ void pad1d_forward_kernel(const float* __restrict__ X,
-                                     float* __restrict__ Y,
+// pad1d_forward: one thread per (n, c, p) output sample. Pure gather (copy /
+// reflect / replicate / zero-pad) — no arithmetic — so it works for any element
+// type; templated to serve FP32 and the 16-bit field path identically.
+template <typename T>
+__global__ void pad1d_forward_kernel(const T* __restrict__ X,
+                                     T* __restrict__ Y,
                                      int N, int C, int L, int L_pad,
                                      int pad_left, int mode) {
     const long long total = (long long)N * C * L_pad;
@@ -279,7 +284,7 @@ __global__ void pad1d_forward_kernel(const float* __restrict__ X,
         const int c = static_cast<int>(t % C);
         const int n = static_cast<int>(t / C);
         const int src = pad1d_src(p, L, pad_left, mode);
-        Y[idx] = (src < 0) ? 0.0f
+        Y[idx] = (src < 0) ? static_cast<T>(0.0f)
                            : X[((long long)n * C + c) * L + src];
     }
 }
@@ -491,7 +496,9 @@ void pad1d_forward(const ::brotensor::Tensor& X, int N, int C, int L,
                    int pad_left, int pad_right, int mode,
                    ::brotensor::Tensor& Y) {
     const char* op = "pad1d_forward";
-    require_fp32(op, X, "X");
+    using ::brotensor::Dtype;
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 && X.dtype != Dtype::BF16)
+        fail(op, "X must be FP32, FP16, or BF16");
     if (N < 0 || C < 1 || L < 1) fail(op, "C/L must be >=1 and N >=0");
     if (pad_left < 0 || pad_right < 0) fail(op, "pad counts must be >=0");
     if (mode < 0 || mode > 2) {
@@ -502,15 +509,26 @@ void pad1d_forward(const ::brotensor::Tensor& X, int N, int C, int L,
     }
     if (X.rows != N || X.cols != C * L) fail(op, "X shape must be (N, C*L)");
     const int L_pad = L + pad_left + pad_right;
-    if (Y.rows != N || Y.cols != C * L_pad
-        || Y.dtype != ::brotensor::Dtype::FP32) {
-        Y.resize(N, C * L_pad, ::brotensor::Dtype::FP32);
+    if (Y.rows != N || Y.cols != C * L_pad || Y.dtype != X.dtype) {
+        Y.resize(N, C * L_pad, X.dtype);
     }
     if (N == 0 || C == 0) return;
     const long long total = (long long)N * C * L_pad;
-    pad1d_forward_kernel<<<c1d_grid(total), C1D_BLOCK, 0, cur_stream()>>>(
-        static_cast<const float*>(X.data), static_cast<float*>(Y.data),
-        N, C, L, L_pad, pad_left, mode);
+    const int grid = c1d_grid(total);
+    if (X.dtype == Dtype::FP16) {
+        pad1d_forward_kernel<<<grid, C1D_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
+            N, C, L, L_pad, pad_left, mode);
+    } else if (X.dtype == Dtype::BF16) {
+        pad1d_forward_kernel<<<grid, C1D_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            N, C, L, L_pad, pad_left, mode);
+    } else {
+        pad1d_forward_kernel<<<grid, C1D_BLOCK, 0, cur_stream()>>>(
+            static_cast<const float*>(X.data), static_cast<float*>(Y.data),
+            N, C, L, L_pad, pad_left, mode);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 

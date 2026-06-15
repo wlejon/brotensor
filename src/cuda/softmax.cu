@@ -116,6 +116,56 @@ __global__ void softmax_rows_forward_kernel(const float* __restrict__ X,
     for (int i = tid; i < cols; i += blockDim.x) probs[i] *= inv;
 }
 
+// Row-batched stable softmax for 16-bit storage (FP16 / BF16): loads/stores in
+// T, all reductions and the exp/normalise in FP32. Recomputes exp(x-m) in the
+// store pass rather than staging it in T, so no 16-bit rounding leaks into the
+// intermediate and no FP32 scratch buffer is needed (the field's score matrices
+// are small — cols == L or T — so the extra expf is cheap).
+__device__ inline float sr_to_f(__half v)         { return __half2float(v); }
+__device__ inline float sr_to_f(__nv_bfloat16 v)  { return __bfloat162float(v); }
+__device__ inline void  sr_from_f(__half& d, float v)        { d = __float2half(v); }
+__device__ inline void  sr_from_f(__nv_bfloat16& d, float v) { d = __float2bfloat16(v); }
+
+template <typename T>
+__global__ void softmax_rows_forward_kernel_h(const T* __restrict__ X,
+                                              T* __restrict__ Y,
+                                              int rows, int cols) {
+    __shared__ float sdata[SM_BLOCK];
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const T* logits = X + static_cast<long long>(r) * cols;
+    T* probs        = Y + static_cast<long long>(r) * cols;
+    const int tid = threadIdx.x;
+
+    float local_max = -1e30f;
+    for (int i = tid; i < cols; i += blockDim.x) {
+        const float v = sr_to_f(logits[i]);
+        if (v > local_max) local_max = v;
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) { const float a = sdata[tid], b = sdata[tid + s]; sdata[tid] = a > b ? a : b; }
+        __syncthreads();
+    }
+    const float m = sdata[0];
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < cols; i += blockDim.x)
+        local_sum += expf(sr_to_f(logits[i]) - m);
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    const float inv = sdata[0] > 0.0f ? 1.0f / sdata[0] : 0.0f;
+    for (int i = tid; i < cols; i += blockDim.x) {
+        T out; sr_from_f(out, expf(sr_to_f(logits[i]) - m) * inv);
+        probs[i] = out;
+    }
+}
+
 // FP16 forward: loads/stores in FP16, all reductions (max, sum) in FP32.
 // probs is staged in an FP32 scratch buffer between phase 2 and the final
 // normalise+store so we don't pay extra FP16 rounding in the intermediate.
@@ -343,13 +393,22 @@ void softmax_forward(const ::brotensor::Tensor& logits,
 void softmax_rows_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y,
                           int rows, int cols) {
     using ::brotensor::Dtype;
-    if (X.dtype != Dtype::FP32)
-        throw std::runtime_error("softmax_rows_forward: X must be FP32");
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 && X.dtype != Dtype::BF16)
+        throw std::runtime_error("softmax_rows_forward: X must be FP32, FP16, or BF16");
     if (Y.rows != X.rows || Y.cols != X.cols || Y.dtype != X.dtype)
         Y.resize(X.rows, X.cols, X.dtype);
     if (rows <= 0 || cols <= 0) return;
-    softmax_rows_forward_kernel<<<rows, SM_BLOCK, 0, cur_stream()>>>(
-        static_cast<const float*>(X.data), static_cast<float*>(Y.data), rows, cols);
+    if (X.dtype == Dtype::FP16) {
+        softmax_rows_forward_kernel_h<<<rows, SM_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __half*>(X.data), static_cast<__half*>(Y.data), rows, cols);
+    } else if (X.dtype == Dtype::BF16) {
+        softmax_rows_forward_kernel_h<<<rows, SM_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data), rows, cols);
+    } else {
+        softmax_rows_forward_kernel<<<rows, SM_BLOCK, 0, cur_stream()>>>(
+            static_cast<const float*>(X.data), static_cast<float*>(Y.data), rows, cols);
+    }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
