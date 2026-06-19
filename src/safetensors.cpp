@@ -1,5 +1,6 @@
 #include "brotensor/safetensors.h"
 
+#include "brotensor/ops/elementwise.h"
 #include "brotensor/runtime.h"
 #include "brotensor/tensor.h"
 
@@ -9,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -492,6 +494,26 @@ void upload_as(const TensorView& view, int rows, int cols,
     // Decode any source element to FP32.
     const float*    src32 = reinterpret_cast<const float*>(view.data);
     const uint16_t* src16 = reinterpret_cast<const uint16_t*>(view.data);
+
+    // GPU fast path: when the on-disk dtype differs from the compute dtype
+    // (e.g. BF16 checkpoints with an FP16 compute policy), upload the raw bytes
+    // at the source dtype and cast on-device. The host convert-then-upload path
+    // below is a single-threaded scalar loop over every element — for a 2.6B-param
+    // encoder that is ~13 s, versus a ~0.1 s device cast after the same H2D copy.
+    if (brotensor::default_device() != brotensor::Device::CPU) {
+        brotensor::Tensor raw;
+        switch (view.dtype) {
+            case Dtype::F32:  raw = brotensor::Tensor::from_host(src32, rows, cols); break;
+            case Dtype::F16:  raw = brotensor::Tensor::from_host_fp16(src16, rows, cols); break;
+            default:          raw = brotensor::Tensor::from_host_bf16(src16, rows, cols); break;
+        }
+        if (raw.dtype == want) {
+            dst = std::move(raw);
+        } else {
+            brotensor::cast(raw, dst, want);
+        }
+        return;
+    }
     auto at_f32 = [&](std::size_t i) -> float {
         switch (view.dtype) {
             case Dtype::F32:  return src32[i];
