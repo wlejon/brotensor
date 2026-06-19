@@ -15,7 +15,34 @@
 #include <string>
 #include <vector>
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 namespace brotensor {
+
+// ─── env-gated weight-load profiler (BROTENSOR_TIME_LOAD=1) ──────────────────
+// Attributes GPU weight-upload wall time to allocation vs H2D copy, accumulated
+// across every from_host_*_on call and dumped once at process exit. Purely a
+// diagnostic; the fast path (flag unset) is a single getenv-cached bool check.
+namespace {
+struct LoadProf {
+    bool   on   = false;
+    double alloc = 0.0, copy = 0.0, bytes = 0.0;
+    long   calls = 0;
+    LoadProf() { on = std::getenv("BROTENSOR_TIME_LOAD") != nullptr; }
+    ~LoadProf() {
+        if (!on || calls == 0) return;
+        std::fprintf(stderr,
+            "[brotensor load] %ld uploads, %.2f GB: alloc %.2f s, h2d %.2f s "
+            "(%.2f GB/s copy)\n",
+            calls, bytes / 1e9, alloc, copy,
+            copy > 0 ? (bytes / 1e9) / copy : 0.0);
+    }
+};
+LoadProf g_loadprof;
+inline bool loadprof_on() { return g_loadprof.on; }
+}  // namespace
 
 // ─── dtype + device helpers ────────────────────────────────────────────────
 
@@ -351,40 +378,43 @@ Tensor Tensor::zeros(int r, int c, Dtype dt) {
     return zeros_on(default_device(), r, c, dt);
 }
 
-Tensor Tensor::from_host_on(Device d, const float* src, int r, int c) {
-    Tensor t = empty_on(d, r, c, Dtype::FP32);
+namespace {
+// Shared upload core for from_host_*_on. When BROTENSOR_TIME_LOAD is set it
+// attributes host wall time to the empty_on (alloc enqueue) and the H2D copy.
+Tensor from_host_typed(Device d, const void* src, int r, int c, Dtype dt) {
+    using clock = std::chrono::steady_clock;
+    const bool prof = loadprof_on() && d != Device::CPU;
+    auto t0 = clock::now();
+    Tensor t = Tensor::empty_on(d, r, c, dt);
     const std::size_t n = t.bytes();
     if (n == 0) return t;
+    auto t1 = clock::now();
     if (d == Device::CPU) {
         std::memcpy(t.data, src, n);
     } else {
         detail::alloc_for(d).memcpy_h2d(t.data, src, n);
     }
+    if (prof) {
+        auto t2 = clock::now();
+        g_loadprof.alloc += std::chrono::duration<double>(t1 - t0).count();
+        g_loadprof.copy  += std::chrono::duration<double>(t2 - t1).count();
+        g_loadprof.bytes += static_cast<double>(n);
+        ++g_loadprof.calls;
+    }
     return t;
+}
+}  // namespace
+
+Tensor Tensor::from_host_on(Device d, const float* src, int r, int c) {
+    return from_host_typed(d, src, r, c, Dtype::FP32);
 }
 
 Tensor Tensor::from_host_fp16_on(Device d, const uint16_t* src, int r, int c) {
-    Tensor t = empty_on(d, r, c, Dtype::FP16);
-    const std::size_t n = t.bytes();
-    if (n == 0) return t;
-    if (d == Device::CPU) {
-        std::memcpy(t.data, src, n);
-    } else {
-        detail::alloc_for(d).memcpy_h2d(t.data, src, n);
-    }
-    return t;
+    return from_host_typed(d, src, r, c, Dtype::FP16);
 }
 
 Tensor Tensor::from_host_bf16_on(Device d, const uint16_t* src, int r, int c) {
-    Tensor t = empty_on(d, r, c, Dtype::BF16);
-    const std::size_t n = t.bytes();
-    if (n == 0) return t;
-    if (d == Device::CPU) {
-        std::memcpy(t.data, src, n);
-    } else {
-        detail::alloc_for(d).memcpy_h2d(t.data, src, n);
-    }
-    return t;
+    return from_host_typed(d, src, r, c, Dtype::BF16);
 }
 
 Tensor Tensor::from_host_int8_on(Device d, const int8_t* src, int r, int c) {
