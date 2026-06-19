@@ -274,12 +274,12 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
 void flash_attention_decode(const Tensor& Q,
                             const Tensor& K_cache, const Tensor& V_cache,
                             int valid_len, int num_q_heads, int num_kv_heads,
-                            Tensor& O);
+                            Tensor& O, float attn_softcap, int window);
 void flash_attention_decode_masked(const Tensor& Q,
                                    const Tensor& K_cache, const Tensor& V_cache,
                                    const float* d_mask,
                                    int num_q_heads, int num_kv_heads,
-                                   Tensor& O);
+                                   Tensor& O, float attn_softcap, int window);
 
 void matmul_int8w_fp16(const Tensor& W_int8, const Tensor& scales,
                        const Tensor& X, Tensor& Y);

@@ -27,6 +27,12 @@ constant uint FAD_BLOCK = 128;
 constant uint FAD_KTILE = 64;
 constant uint MAX_HD_PER_THREAD = 8;
 
+// Gemma-2 tanh logit soft-cap on an already-scaled score. softcap <= 0 is a
+// no-op (returns s untouched), so the default path stays bit-identical.
+inline float fad_softcap(float s, float softcap) {
+    return softcap > 0.0f ? softcap * tanh(s / softcap) : s;
+}
+
 // Copy L_new * D halves from src into dst starting at dst_off_halves.
 kernel void k_kv_append_copy(device const half* src    [[buffer(0)]],
                              device half*       dst    [[buffer(1)]],
@@ -59,6 +65,8 @@ kernel void k_flash_attention_decode(
         constant uint& seq_offset  [[buffer(8)]],
         constant uint& Dkv         [[buffer(9)]],
         constant uint& group       [[buffer(10)]],
+        constant float& softcap    [[buffer(11)]],
+        constant int& window       [[buffer(12)]],
         threadgroup float* scratch [[threadgroup(0)]],
         uint3 gid    [[threadgroup_position_in_grid]],
         uint3 tid3   [[thread_position_in_threadgroup]],
@@ -73,7 +81,10 @@ kernel void k_flash_attention_decode(
     uint q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
     uint kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
     float inv_sqrt = rsqrt(float(head_dim));
-    uint p_q = seq_offset + q;
+    int p_q = int(seq_offset + q);
+    // Sliding-window lower bound. window <= 0 leaves lo == 0 (unbounded causal),
+    // bit-identical to the pre-window path.
+    int lo = (window > 0) ? max(0, p_q - window + 1) : 0;
 
     float run_max = -1e30f;
     float run_sum = 0.0f;
@@ -81,19 +92,20 @@ kernel void k_flash_attention_decode(
     for (uint i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
 
     for (uint k0 = 0; k0 < valid_len; k0 += FAD_KTILE) {
-        if (k0 > p_q) break;
+        if (int(k0) > p_q) break;
         uint klen = (valid_len - k0) < FAD_KTILE ? (valid_len - k0) : FAD_KTILE;
-        if (k0 + klen - 1u > p_q) klen = p_q - k0 + 1u;
+        if (k0 + klen - 1u > uint(p_q)) klen = uint(p_q) - k0 + 1u;
 
         // 1. scores
         for (uint t = tid; t < klen; t += tg_size) {
             uint kg = k0 + t;
+            if (int(kg) < lo) { scores[t] = -1e30f; continue; }   // out of window
             float dot = 0.0f;
             for (uint d = 0; d < head_dim; ++d) {
                 dot += float(Q[q * Dq + q_head_off + d]) *
                        float(Kk[kg * Dkv + kv_head_off + d]);
             }
-            scores[t] = dot * inv_sqrt;
+            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -178,6 +190,8 @@ kernel void k_flash_attention_decode_bf16(
         constant uint& seq_offset  [[buffer(8)]],
         constant uint& Dkv         [[buffer(9)]],
         constant uint& group       [[buffer(10)]],
+        constant float& softcap    [[buffer(11)]],
+        constant int& window       [[buffer(12)]],
         threadgroup float* scratch [[threadgroup(0)]],
         uint3 gid    [[threadgroup_position_in_grid]],
         uint3 tid3   [[thread_position_in_threadgroup]],
@@ -192,7 +206,8 @@ kernel void k_flash_attention_decode_bf16(
     uint q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
     uint kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
     float inv_sqrt = rsqrt(float(head_dim));
-    uint p_q = seq_offset + q;
+    int p_q = int(seq_offset + q);
+    int lo = (window > 0) ? max(0, p_q - window + 1) : 0;
 
     float run_max = -1e30f;
     float run_sum = 0.0f;
@@ -200,18 +215,19 @@ kernel void k_flash_attention_decode_bf16(
     for (uint i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
 
     for (uint k0 = 0; k0 < valid_len; k0 += FAD_KTILE) {
-        if (k0 > p_q) break;
+        if (int(k0) > p_q) break;
         uint klen = (valid_len - k0) < FAD_KTILE ? (valid_len - k0) : FAD_KTILE;
-        if (k0 + klen - 1u > p_q) klen = p_q - k0 + 1u;
+        if (k0 + klen - 1u > uint(p_q)) klen = uint(p_q) - k0 + 1u;
 
         for (uint t = tid; t < klen; t += tg_size) {
             uint kg = k0 + t;
+            if (int(kg) < lo) { scores[t] = -1e30f; continue; }   // out of window
             float dot = 0.0f;
             for (uint d = 0; d < head_dim; ++d) {
                 dot += float(Q[q * Dq + q_head_off + d]) *
                        float(Kk[kg * Dkv + kv_head_off + d]);
             }
-            scores[t] = dot * inv_sqrt;
+            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -378,7 +394,7 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
 void flash_attention_decode(const Tensor& Q,
                             const Tensor& K_cache, const Tensor& V_cache,
                             int valid_len, int num_q_heads, int num_kv_heads,
-                            Tensor& O) {
+                            Tensor& O, float attn_softcap, int window) {
     const bool is_bf16 = (Q.dtype == Dtype::BF16);
     if ((Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) ||
         K_cache.dtype != Q.dtype || V_cache.dtype != Q.dtype) {
@@ -426,6 +442,8 @@ void flash_attention_decode(const Tensor& Q,
     const uint32_t uDkv = static_cast<uint32_t>(Dkv);
     const uint32_t uHd = static_cast<uint32_t>(head_dim);
     const uint32_t uGroup = static_cast<uint32_t>(group);
+    const float    fSoftcap = attn_softcap;
+    const int32_t  iWindow = static_cast<int32_t>(window);
 
     id<MTLComputePipelineState> pso = is_bf16 ? pso_decode_bf16() : pso_decode();
     id<MTLBuffer> bQ = buffer_for(Q);
@@ -454,6 +472,8 @@ void flash_attention_decode(const Tensor& Q,
         [enc setBytes:&seq_offset length:sizeof(uint32_t) atIndex:8];
         [enc setBytes:&uDkv     length:sizeof(uint32_t) atIndex:9];
         [enc setBytes:&uGroup   length:sizeof(uint32_t) atIndex:10];
+        [enc setBytes:&fSoftcap length:sizeof(float)    atIndex:11];
+        [enc setBytes:&iWindow  length:sizeof(int32_t)  atIndex:12];
         [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(Lq),
                                               static_cast<NSUInteger>(num_q_heads), 1)

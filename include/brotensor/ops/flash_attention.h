@@ -254,10 +254,22 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
 // GQA is native on all three backends: the decode kernel maps query head h to KV
 // head h/(num_q_heads/num_kv_heads), reading the n_kv-wide cache directly — no
 // KV-head widening needed. num_kv_heads == num_q_heads is plain MHA.
+//
+// Gemma-2 extensions (both default to today's exact behaviour):
+//   attn_softcap > 0: tanh logit soft-capping. After the 1/sqrt(head_dim) scale
+//       and BEFORE the causal/window mask and the online-softmax max/exp, each
+//       raw score s is replaced by attn_softcap * tanh(s / attn_softcap).
+//       attn_softcap == 0 (default) disables it — bit-identical to before.
+//   window > 0: sliding-window causal masking. Query at absolute position p
+//       (p = valid_len - L_q + q) attends key j only when j <= p AND
+//       j > p - window, i.e. keys in [max(0, p-window+1), p]. window <= 0
+//       (default) is unbounded causal — bit-identical to before. Composes
+//       multiplicatively with the causal mask.
 void flash_attention_decode(const Tensor& Q,
                            const Tensor& K_cache, const Tensor& V_cache,
                            int valid_len, int num_q_heads, int num_kv_heads,
-                           Tensor& O);
+                           Tensor& O,
+                           float attn_softcap = 0.0f, int window = 0);
 
 
 // Single-token decode attention over a FIXED-CAPACITY masked KV cache — the
@@ -276,20 +288,31 @@ void flash_attention_decode(const Tensor& Q,
 //   d_mask: device pointer, length L_max, FP32; must not be null and must
 //       mark at least one key valid.
 //   O: (1, num_q_heads*head_dim), resized as needed.
+// Gemma-2 extensions match flash_attention_decode (see above):
+//   attn_softcap > 0: tanh logit soft-capping applied to each raw score before
+//       the mask and softmax. attn_softcap == 0 (default) disables it.
+//   window > 0: sliding-window masking. The query's absolute position p is the
+//       highest valid key index (the last 1 in d_mask); a key j is kept only
+//       when it is valid AND j > p - window, i.e. j in [max(0,p-window+1), p].
+//       window <= 0 (default) keeps the full valid set — bit-identical to
+//       before. Combines multiplicatively with the validity mask.
 void flash_attention_decode_masked(const Tensor& Q,
                                    const Tensor& K_cache,
                                    const Tensor& V_cache,
                                    const float* d_mask,
                                    int num_q_heads, int num_kv_heads,
-                                   Tensor& O);
+                                   Tensor& O,
+                                   float attn_softcap = 0.0f, int window = 0);
 
 
 // Back-compat overload: num_kv_heads defaults to num_heads (plain MHA).
 inline void flash_attention_decode(const Tensor& Q,
                                    const Tensor& K_cache, const Tensor& V_cache,
-                                   int valid_len, int num_heads, Tensor& O) {
+                                   int valid_len, int num_heads, Tensor& O,
+                                   float attn_softcap = 0.0f, int window = 0) {
     flash_attention_decode(Q, K_cache, V_cache, valid_len,
-                           num_heads, /*num_kv_heads=*/num_heads, O);
+                           num_heads, /*num_kv_heads=*/num_heads, O,
+                           attn_softcap, window);
 }
 
 

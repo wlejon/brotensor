@@ -44,6 +44,13 @@ inline void check_fp32(const ::brotensor::Tensor& t,
     }
 }
 
+// Gemma-2 tanh logit soft-capping, applied to a raw (already 1/sqrt(hd)-scaled)
+// score. softcap <= 0 disables it — returns s unchanged (bit-identical path).
+inline float apply_softcap(float s, float softcap) {
+    if (softcap > 0.0f) return softcap * std::tanh(s / softcap);
+    return s;
+}
+
 } // namespace
 
 void kv_cache_append(const ::brotensor::Tensor& K_new,
@@ -84,7 +91,8 @@ void flash_attention_decode(const ::brotensor::Tensor& Q,
                             const ::brotensor::Tensor& V_cache,
                             int valid_len,
                             int num_q_heads, int num_kv_heads,
-                            ::brotensor::Tensor& O) {
+                            ::brotensor::Tensor& O,
+                            float attn_softcap, int window) {
     check_fp32(Q,       "flash_attention_decode", "Q");
     check_fp32(K_cache, "flash_attention_decode", "K_cache");
     check_fp32(V_cache, "flash_attention_decode", "V_cache");
@@ -131,6 +139,9 @@ void flash_attention_decode(const ::brotensor::Tensor& Q,
     for (int q = 0; q < Lq; ++q) {
         const int p_q = seq_offset + q;
         const int klen = p_q + 1;   // causal: keys 0..p_q inclusive
+        // Sliding window: keys below `lo` are out of band. window <= 0 keeps the
+        // band unbounded (lo == 0), preserving plain causal exactly.
+        const int lo = (window > 0) ? std::max(0, p_q - window + 1) : 0;
         for (int hq = 0; hq < num_q_heads; ++hq) {
             const int hkv = hq / q_per_kv;
             const int q_head_off  = hq  * head_dim;
@@ -141,10 +152,12 @@ void flash_attention_decode(const ::brotensor::Tensor& Q,
             scores.assign(klen, 0.0f);
             float run_max = -1e30f;
             for (int kg = 0; kg < klen; ++kg) {
+                if (kg < lo) { scores[kg] = -1e30f; continue; }  // out of window
                 const float* krow = Kp + kg * Dkv + kv_head_off;
                 float dot = 0.0f;
                 for (int d = 0; d < head_dim; ++d) dot += qrow[d] * krow[d];
-                const float s = dot * inv_sqrt;
+                float s = dot * inv_sqrt;
+                s = apply_softcap(s, attn_softcap);   // Gemma-2 tanh soft-cap
                 scores[kg] = s;
                 if (s > run_max) run_max = s;
             }
@@ -178,7 +191,8 @@ void flash_attention_decode_masked(const ::brotensor::Tensor& Q,
                                    const ::brotensor::Tensor& V_cache,
                                    const float* d_mask,
                                    int num_q_heads, int num_kv_heads,
-                                   ::brotensor::Tensor& O) {
+                                   ::brotensor::Tensor& O,
+                                   float attn_softcap, int window) {
     check_fp32(Q,       "flash_attention_decode_masked", "Q");
     check_fp32(K_cache, "flash_attention_decode_masked", "K_cache");
     check_fp32(V_cache, "flash_attention_decode_masked", "V_cache");
@@ -222,6 +236,18 @@ void flash_attention_decode_masked(const ::brotensor::Tensor& Q,
     const float* Vp = V_cache.host_f32();
     float* Op = O.host_f32_mut();
 
+    // Sliding window: the query's absolute position is the highest valid key
+    // index (the last 1 in the mask). window <= 0 keeps the full valid set —
+    // lo == 0, the pre-window behaviour exactly.
+    int lo = 0;
+    if (window > 0) {
+        int p_max = -1;
+        for (int kg = 0; kg < cap; ++kg) {
+            if (d_mask[kg] > 0.5f) p_max = kg;
+        }
+        lo = (p_max >= 0) ? std::max(0, p_max - window + 1) : 0;
+    }
+
     std::vector<float> scores;
     for (int hq = 0; hq < num_q_heads; ++hq) {
         const int hkv = hq / q_per_kv;
@@ -232,14 +258,15 @@ void flash_attention_decode_masked(const ::brotensor::Tensor& Q,
         scores.assign(static_cast<std::size_t>(cap), 0.0f);
         float run_max = -1e30f;
         for (int kg = 0; kg < cap; ++kg) {
-            if (d_mask[kg] <= 0.5f) {
+            if (d_mask[kg] <= 0.5f || kg < lo) {
                 scores[static_cast<std::size_t>(kg)] = -1e30f;
                 continue;
             }
             const float* krow = Kp + static_cast<std::size_t>(kg) * Dkv + kv_head_off;
             float dot = 0.0f;
             for (int d = 0; d < head_dim; ++d) dot += qrow[d] * krow[d];
-            const float s = dot * inv_sqrt;
+            float s = dot * inv_sqrt;
+            s = apply_softcap(s, attn_softcap);   // Gemma-2 tanh soft-cap
             scores[static_cast<std::size_t>(kg)] = s;
             if (s > run_max) run_max = s;
         }

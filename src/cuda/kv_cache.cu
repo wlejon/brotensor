@@ -66,13 +66,19 @@ namespace {
 constexpr int FAD_BLOCK = 128;
 constexpr int FAD_KTILE = 64;
 
+// Gemma-2 tanh logit soft-cap on an already-scaled score. softcap <= 0 is a
+// no-op (returns s untouched), so the default path stays bit-identical.
+__device__ __forceinline__ float fad_softcap(float s, float softcap) {
+    return softcap > 0.0f ? softcap * tanhf(s / softcap) : s;
+}
+
 __global__ void flash_attention_decode_kernel(
         const __half* __restrict__ Q,
         const __half* __restrict__ K,
         const __half* __restrict__ V,
         __half* __restrict__ Out,
         int Lq, int valid_len, int Dq, int Dkv, int head_dim, int seq_offset,
-        int group) {
+        int group, float softcap, int window) {
     extern __shared__ float s_smem[];
     float* scores = s_smem;
     float* red    = s_smem + FAD_KTILE;
@@ -84,6 +90,9 @@ __global__ void flash_attention_decode_kernel(
     const int kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
     const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
     const int p_q = seq_offset + q;
+    // Sliding-window lower bound: keys below `lo` are out of band. window <= 0
+    // leaves lo == 0 (unbounded causal) — bit-identical to the pre-window path.
+    const int lo = (window > 0) ? (p_q - window + 1 < 0 ? 0 : p_q - window + 1) : 0;
 
     constexpr int MAX_HD_PER_THREAD = 8;
     float partial[MAX_HD_PER_THREAD];
@@ -100,12 +109,13 @@ __global__ void flash_attention_decode_kernel(
 
         for (int t = tid; t < klen; t += blockDim.x) {
             const int kg = k0 + t;
+            if (kg < lo) { scores[t] = -1e30f; continue; }   // out of window
             float dot = 0.0f;
             for (int d = 0; d < head_dim; ++d) {
                 dot += __half2float(Q[q * Dq + q_head_off + d]) *
                        __half2float(K[kg * Dkv + kv_head_off + d]);
             }
-            scores[t] = dot * inv_sqrt;
+            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
         }
         __syncthreads();
 
@@ -199,7 +209,8 @@ __global__ void flash_attention_decode_masked_kernel(
         const T* __restrict__ V,
         const float* __restrict__ mask,
         T* __restrict__ Out,
-        int cap, int Dq, int Dkv, int head_dim, int group) {
+        int cap, int Dq, int Dkv, int head_dim, int group,
+        float softcap, int window) {
     extern __shared__ float s_smem[];
     float* scores = s_smem;
     float* red    = s_smem + FAD_KTILE;
@@ -209,6 +220,26 @@ __global__ void flash_attention_decode_masked_kernel(
     const int q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
     const int kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
     const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
+
+    // Sliding-window lower bound. window <= 0 keeps the full valid set (lo == 0,
+    // bit-identical to the pre-window path). Otherwise the query sits at the
+    // highest valid key index p_max; keep keys in (p_max - window, p_max].
+    int lo = 0;
+    if (window > 0) {
+        float local_pmax = -1.0f;
+        for (int kg = tid; kg < cap; kg += blockDim.x) {
+            if (mask[kg] > 0.5f) local_pmax = fmaxf(local_pmax, static_cast<float>(kg));
+        }
+        red[tid] = local_pmax;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) red[tid] = fmaxf(red[tid], red[tid + stride]);
+            __syncthreads();
+        }
+        const int p_max = static_cast<int>(red[0]);
+        __syncthreads();
+        if (p_max >= 0) { lo = p_max - window + 1; if (lo < 0) lo = 0; }
+    }
 
     constexpr int MAX_HD_PER_THREAD = 8;
     float partial[MAX_HD_PER_THREAD];
@@ -240,7 +271,7 @@ __global__ void flash_attention_decode_masked_kernel(
 
         for (int t = tid; t < klen; t += blockDim.x) {
             const int kg = k0 + t;
-            if (mask[kg] <= 0.5f) {
+            if (mask[kg] <= 0.5f || kg < lo) {
                 scores[t] = -1e30f;   // dropped key — weight becomes exact 0
                 continue;
             }
@@ -249,7 +280,7 @@ __global__ void flash_attention_decode_masked_kernel(
                 dot += fadm_ld(Q[q_head_off + d]) *
                        fadm_ld(K[static_cast<size_t>(kg) * Dkv + kv_head_off + d]);
             }
-            scores[t] = dot * inv_sqrt;
+            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
         }
         __syncthreads();
 
@@ -330,7 +361,7 @@ __global__ void flash_attention_decode_bf16_kernel(
         const __nv_bfloat16* __restrict__ V,
         __nv_bfloat16* __restrict__ Out,
         int Lq, int valid_len, int Dq, int Dkv, int head_dim, int seq_offset,
-        int group) {
+        int group, float softcap, int window) {
     extern __shared__ float s_smem[];
     float* scores = s_smem;
     float* red    = s_smem + FAD_KTILE;
@@ -342,6 +373,7 @@ __global__ void flash_attention_decode_bf16_kernel(
     const int kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
     const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
     const int p_q = seq_offset + q;
+    const int lo = (window > 0) ? (p_q - window + 1 < 0 ? 0 : p_q - window + 1) : 0;
 
     constexpr int MAX_HD_PER_THREAD = 8;
     float partial[MAX_HD_PER_THREAD];
@@ -358,12 +390,13 @@ __global__ void flash_attention_decode_bf16_kernel(
 
         for (int t = tid; t < klen; t += blockDim.x) {
             const int kg = k0 + t;
+            if (kg < lo) { scores[t] = -1e30f; continue; }   // out of window
             float dot = 0.0f;
             for (int d = 0; d < head_dim; ++d) {
                 dot += __bfloat162float(Q[q * Dq + q_head_off + d]) *
                        __bfloat162float(K[kg * Dkv + kv_head_off + d]);
             }
-            scores[t] = dot * inv_sqrt;
+            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
         }
         __syncthreads();
 
@@ -466,7 +499,8 @@ __global__ void fad_split_partials_kernel(
         float* __restrict__ ws,           // (n_q_heads*n_splits) x (head_dim+2)
         int cap, int valid_len,           // valid_len used when !MASKED
         int Dq, int Dkv, int head_dim, int group,
-        int tiles_per_split, int n_splits) {
+        int tiles_per_split, int n_splits,
+        float softcap, int window) {
     __shared__ float scores[FAD_KTILE];
     __shared__ float bcast[2];
 
@@ -482,6 +516,39 @@ __global__ void fad_split_partials_kernel(
     const int kv_head_off = (h / group) * head_dim;
     const float inv_sqrt  = rsqrtf(static_cast<float>(head_dim));
     const int e = head_dim / 32;                   // dot elems per lane
+
+    // Sliding-window lower bound, shared by all splits of this head. window <= 0
+    // leaves lo == 0 (no band) — bit-identical to the pre-window path. For the
+    // masked op the query position is the highest valid key index (a full-mask
+    // block reduction); for the truncated op it is valid_len - 1 (L_q == 1).
+    int lo = 0;
+    if (window > 0) {
+        int p_max = MASKED ? -1 : (valid_len - 1);
+        if (MASKED) {
+            float lpm = -1.0f;
+            for (int kg = tid; kg < cap; kg += FAD_SPLIT_BLOCK) {
+                if (mask[kg] > 0.5f) lpm = fmaxf(lpm, static_cast<float>(kg));
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                lpm = fmaxf(lpm, __shfl_down_sync(0xffffffffu, lpm, off));
+            }
+            if (lane == 0) scores[warp] = lpm;
+            __syncthreads();
+            if (warp == 0) {
+                float m = (lane < N_WARPS) ? scores[lane] : -1.0f;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
+                }
+                if (lane == 0) bcast[0] = m;
+            }
+            __syncthreads();
+            p_max = static_cast<int>(bcast[0]);
+            __syncthreads();
+        }
+        if (p_max >= 0) { lo = p_max - window + 1; if (lo < 0) lo = 0; }
+    }
 
     // This lane's slice of the query row, kept in registers across all keys.
     float qreg[FAD_SPLIT_MAX_HD / 32];
@@ -510,7 +577,8 @@ __global__ void fad_split_partials_kernel(
             const int t = warp * KPW + j;
             if (t >= klen) break;
             const int kg = k0 + t;
-            const bool valid = MASKED ? (mask[kg] > 0.5f) : (kg < valid_len);
+            const bool valid = (kg >= lo) &&
+                               (MASKED ? (mask[kg] > 0.5f) : (kg < valid_len));
             if (!valid) {
                 if (lane == 0) scores[t] = -1e30f;
                 continue;
@@ -534,7 +602,7 @@ __global__ void fad_split_partials_kernel(
             for (int off = 16; off > 0; off >>= 1) {
                 dot += __shfl_down_sync(0xffffffffu, dot, off);
             }
-            if (lane == 0) scores[t] = dot * inv_sqrt;
+            if (lane == 0) scores[t] = fad_softcap(dot * inv_sqrt, softcap);
         }
         __syncthreads();
 
@@ -686,7 +754,7 @@ inline bool fad_split_eligible(int head_dim) {
 void flash_attention_decode(const Tensor& Q,
                             const Tensor& K_cache, const Tensor& V_cache,
                             int valid_len, int num_q_heads, int num_kv_heads,
-                            Tensor& O) {
+                            Tensor& O, float attn_softcap, int window) {
     if (Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) {
         throw std::runtime_error("flash_attention_decode: tensors must be FP16 or BF16");
     }
@@ -741,7 +809,7 @@ void flash_attention_decode(const Tensor& Q,
                     static_cast<const __half*>(K_cache.data),
                     static_cast<const __half*>(V_cache.data),
                     nullptr, ws, cap, valid_len, Dq, Dkv, head_dim, group,
-                    tps, n_splits);
+                    tps, n_splits, attn_softcap, window);
             fad_split_reduce_kernel<__half>
                 <<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
                     ws, static_cast<__half*>(O.data), head_dim, n_splits);
@@ -752,7 +820,7 @@ void flash_attention_decode(const Tensor& Q,
                     static_cast<const __nv_bfloat16*>(K_cache.data),
                     static_cast<const __nv_bfloat16*>(V_cache.data),
                     nullptr, ws, cap, valid_len, Dq, Dkv, head_dim, group,
-                    tps, n_splits);
+                    tps, n_splits, attn_softcap, window);
             fad_split_reduce_kernel<__nv_bfloat16>
                 <<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
                     ws, static_cast<__nv_bfloat16*>(O.data), head_dim,
@@ -771,14 +839,16 @@ void flash_attention_decode(const Tensor& Q,
             static_cast<const __half*>(K_cache.data),
             static_cast<const __half*>(V_cache.data),
             static_cast<__half*>(O.data),
-            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, group);
+            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, group,
+            attn_softcap, window);
     } else {
         flash_attention_decode_bf16_kernel<<<grid, FAD_BLOCK, shmem, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(Q.data),
             static_cast<const __nv_bfloat16*>(K_cache.data),
             static_cast<const __nv_bfloat16*>(V_cache.data),
             static_cast<__nv_bfloat16*>(O.data),
-            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, group);
+            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, group,
+            attn_softcap, window);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
@@ -788,7 +858,7 @@ void flash_attention_decode_masked(const Tensor& Q,
                                    const Tensor& V_cache,
                                    const float* d_mask,
                                    int num_q_heads, int num_kv_heads,
-                                   Tensor& O) {
+                                   Tensor& O, float attn_softcap, int window) {
     if (Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) {
         throw std::runtime_error("flash_attention_decode_masked: tensors must be FP16 or BF16");
     }
@@ -845,7 +915,7 @@ void flash_attention_decode_masked(const Tensor& Q,
                     static_cast<const __half*>(K_cache.data),
                     static_cast<const __half*>(V_cache.data),
                     d_mask, ws, cap, /*valid_len=*/cap, Dq, Dkv, head_dim,
-                    group, tps, n_splits);
+                    group, tps, n_splits, attn_softcap, window);
             fad_split_reduce_kernel<__half>
                 <<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
                     ws, static_cast<__half*>(O.data), head_dim, n_splits);
@@ -856,7 +926,7 @@ void flash_attention_decode_masked(const Tensor& Q,
                     static_cast<const __nv_bfloat16*>(K_cache.data),
                     static_cast<const __nv_bfloat16*>(V_cache.data),
                     d_mask, ws, cap, /*valid_len=*/cap, Dq, Dkv, head_dim,
-                    group, tps, n_splits);
+                    group, tps, n_splits, attn_softcap, window);
             fad_split_reduce_kernel<__nv_bfloat16>
                 <<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
                     ws, static_cast<__nv_bfloat16*>(O.data), head_dim,
@@ -875,7 +945,7 @@ void flash_attention_decode_masked(const Tensor& Q,
             static_cast<const __half*>(V_cache.data),
             d_mask,
             static_cast<__half*>(O.data),
-            cap, Dq, Dkv, head_dim, group);
+            cap, Dq, Dkv, head_dim, group, attn_softcap, window);
     } else {
         flash_attention_decode_masked_kernel<__nv_bfloat16><<<grid, FAD_BLOCK, shmem, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(Q.data),
@@ -883,7 +953,7 @@ void flash_attention_decode_masked(const Tensor& Q,
             static_cast<const __nv_bfloat16*>(V_cache.data),
             d_mask,
             static_cast<__nv_bfloat16*>(O.data),
-            cap, Dq, Dkv, head_dim, group);
+            cap, Dq, Dkv, head_dim, group, attn_softcap, window);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }

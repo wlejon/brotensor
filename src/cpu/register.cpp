@@ -474,13 +474,15 @@ void flash_attention_decode(const ::brotensor::Tensor& Q,
                             const ::brotensor::Tensor& V_cache,
                             int valid_len,
                             int num_q_heads, int num_kv_heads,
-                            ::brotensor::Tensor& O);
+                            ::brotensor::Tensor& O,
+                            float attn_softcap, int window);
 void flash_attention_decode_masked(const ::brotensor::Tensor& Q,
                                    const ::brotensor::Tensor& K_cache,
                                    const ::brotensor::Tensor& V_cache,
                                    const float* d_mask,
                                    int num_q_heads, int num_kv_heads,
-                                   ::brotensor::Tensor& O);
+                                   ::brotensor::Tensor& O,
+                                   float attn_softcap, int window);
 
 // ── CHUNK 5 — cross_attention.cpp / self_attention.cpp /
 //    attention_moments.cpp ──
