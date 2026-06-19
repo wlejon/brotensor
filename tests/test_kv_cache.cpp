@@ -369,6 +369,121 @@ static void test_decode_vs_causal_forward() {
     CHECK(bad == 0);
 }
 
+// GPU (FP16) sliding-window + soft-cap decode — the path Gemma-2 actually runs,
+// and the one the CPU tests above cannot reach: the split-K decode kernel.
+// head_dim 256 is split-K-eligible, so at a valid_len spanning many FAD splits
+// (FAD_KTILE 64 * FAD_MAX_SPLITS 16) a window narrower than the cache leaves
+// WHOLE splits out of band — the empty-partial combination in the reduce kernel
+// that no other test exercises. Inputs are pre-rounded to FP16 so the FP32
+// brute-force reference (decode_ref) sees identical values; the only residual
+// is the kernel's own FP32-accumulation rounding.
+static void test_gpu_softcap_window() {
+    std::printf("  flash_attention_decode GPU softcap/window (split-K + prefill)\n");
+    std::mt19937 rng(0xA11CE);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+
+    auto fp16_round = [](std::vector<float>& v) {
+        auto h = to_fp16(v);
+        for (std::size_t i = 0; i < v.size(); ++i)
+            v[i] = brotensor::fp16_bits_to_fp32(h[i]);
+    };
+    auto run_gpu = [](const std::vector<float>& Qf, const std::vector<float>& Kf,
+                      const std::vector<float>& Vf, int Lq, int valid_len,
+                      int Dq, int Dkv, int nq, int nkv, int cap,
+                      float softcap, int window) {
+        auto Qh = to_fp16(Qf), Kh = to_fp16(Kf), Vh = to_fp16(Vf);
+        Tensor Q  = Tensor::from_host_fp16_on(Device::CUDA, Qh.data(), Lq, Dq);
+        Tensor Kf16 = Tensor::from_host_fp16_on(Device::CUDA, Kh.data(), valid_len, Dkv);
+        Tensor Vf16 = Tensor::from_host_fp16_on(Device::CUDA, Vh.data(), valid_len, Dkv);
+        Tensor Kc = Tensor::zeros_on(Device::CUDA, cap, Dkv, Dtype::FP16);
+        Tensor Vc = Tensor::zeros_on(Device::CUDA, cap, Dkv, Dtype::FP16);
+        brotensor::kv_cache_append(Kf16, Vf16, 0, Kc, Vc);
+        Tensor O = Tensor::empty_on(Device::CUDA, Lq, Dq, Dtype::FP16);
+        brotensor::flash_attention_decode(Q, Kc, Vc, valid_len, nq, nkv, O,
+                                          softcap, window);
+        brotensor::sync(Device::CUDA);
+        auto oh = O.to_host_vector_fp16();
+        std::vector<float> out(static_cast<std::size_t>(Lq) * Dq);
+        for (std::size_t i = 0; i < out.size(); ++i)
+            out[i] = brotensor::fp16_bits_to_fp32(oh[i]);
+        return out;
+    };
+    auto cmp = [](const std::vector<float>& got, const std::vector<float>& ref,
+                  const char* tag) {
+        float me = 0.0f; int bad = 0;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            const float e = std::fabs(got[i] - ref[i]);
+            if (e > me) me = e;
+            if (e > 2e-2f + 5e-2f * std::fabs(ref[i])) ++bad;
+        }
+        std::printf("    %s: max_err=%g bad=%d/%zu\n", tag, me, bad, ref.size());
+        CHECK(bad == 0);
+    };
+
+    // (a) Gemma-2 decode shape: head_dim 256, GQA 8/4, valid_len 5000 (> the 4096
+    //     sliding window, and 16 splits of ~320 keys). Window 1024 leaves ~12 of
+    //     the 16 splits entirely out of band; softcap 50 (Gemma's value).
+    {
+        const int Lq = 1, nq = 8, nkv = 4, hd = 256;
+        const int Dq = nq * hd, Dkv = nkv * hd, valid_len = 5000, cap = 5000;
+        const float softcap = 50.0f;
+        std::vector<float> Qf(Lq * Dq), Kf(valid_len * Dkv), Vf(valid_len * Dkv);
+        for (auto& v : Qf) v = dist(rng);
+        for (auto& v : Kf) v = dist(rng);
+        for (auto& v : Vf) v = dist(rng);
+        fp16_round(Qf); fp16_round(Kf); fp16_round(Vf);
+
+        for (int window : {1024, 4096}) {   // 4096 == Gemma's actual sliding_window
+            auto got = run_gpu(Qf, Kf, Vf, Lq, valid_len, Dq, Dkv, nq, nkv, cap,
+                               softcap, window);
+            std::vector<float> ref;
+            decode_ref(Qf, Kf, Vf, Lq, valid_len, Dq, Dkv, nq, nkv, softcap, window, ref);
+            char tag[64];
+            std::snprintf(tag, sizeof tag, "split-K hd256 win%d softcap50", window);
+            cmp(got, ref, tag);
+        }
+        // window >= valid_len must reproduce full causal exactly (no band).
+        auto got_full = run_gpu(Qf, Kf, Vf, Lq, valid_len, Dq, Dkv, nq, nkv, cap,
+                                softcap, valid_len);
+        std::vector<float> ref_full;
+        decode_ref(Qf, Kf, Vf, Lq, valid_len, Dq, Dkv, nq, nkv, softcap, 0, ref_full);
+        cmp(got_full, ref_full, "split-K window>=len == full causal");
+    }
+
+    // (b) Split-K with head_dim 64 (different split/lane geometry), mid-range window.
+    {
+        const int Lq = 1, nq = 4, nkv = 2, hd = 64;
+        const int Dq = nq * hd, Dkv = nkv * hd, valid_len = 2000, cap = 2048, window = 300;
+        const float softcap = 20.0f;
+        std::vector<float> Qf(Lq * Dq), Kf(valid_len * Dkv), Vf(valid_len * Dkv);
+        for (auto& v : Qf) v = dist(rng);
+        for (auto& v : Kf) v = dist(rng);
+        for (auto& v : Vf) v = dist(rng);
+        fp16_round(Qf); fp16_round(Kf); fp16_round(Vf);
+        auto got = run_gpu(Qf, Kf, Vf, Lq, valid_len, Dq, Dkv, nq, nkv, cap, softcap, window);
+        std::vector<float> ref;
+        decode_ref(Qf, Kf, Vf, Lq, valid_len, Dq, Dkv, nq, nkv, softcap, window, ref);
+        cmp(got, ref, "split-K hd64 win300 softcap20");
+    }
+
+    // (c) Prefill block (Lq>1 bypasses split-K -> the simple per-(q,head) kernel):
+    //     each query row gets its own window band. GQA + softcap.
+    {
+        const int Lq = 40, valid_len = 40, nq = 4, nkv = 2, hd = 64;
+        const int Dq = nq * hd, Dkv = nkv * hd, cap = 64, window = 12;
+        const float softcap = 30.0f;
+        std::vector<float> Qf(Lq * Dq), Kf(valid_len * Dkv), Vf(valid_len * Dkv);
+        for (auto& v : Qf) v = dist(rng);
+        for (auto& v : Kf) v = dist(rng);
+        for (auto& v : Vf) v = dist(rng);
+        fp16_round(Qf); fp16_round(Kf); fp16_round(Vf);
+        auto got = run_gpu(Qf, Kf, Vf, Lq, valid_len, Dq, Dkv, nq, nkv, cap, softcap, window);
+        std::vector<float> ref;
+        decode_ref(Qf, Kf, Vf, Lq, valid_len, Dq, Dkv, nq, nkv, softcap, window, ref);
+        cmp(got, ref, "prefill Lq40 hd64 win12 softcap30");
+    }
+}
+
 int main() {
     brotensor::init();
     std::printf("test_kv_cache\n");
@@ -385,6 +500,7 @@ int main() {
     }
     test_append();
     test_decode_vs_causal_forward();
+    test_gpu_softcap_window();
     const int total = g_failures + cpu_failures;
     std::printf("%s (%d failures)\n", total ? "FAILED" : "OK", total);
     return total ? 1 : 0;
