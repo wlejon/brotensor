@@ -82,6 +82,18 @@ void linear_forward_batched_fp16_act(const Tensor& W, const Tensor* bias,
 void matmul(const Tensor& A, const Tensor& B, Tensor& C);
 
 
+// Batched A @ B^T, 16-bit (FP16 or BF16) with FP32 accumulation. For each
+// b in [0,batch):  C[b](M,N) = A[b](M,K) @ B[b](N,K)^T, with the given element
+// strides between batch slices (set strides = M*K, N*K, M*N for tightly packed;
+// batch=1 + zero strides for the non-batched case). bias may be null; act is a
+// LinearActivation value fused into the epilogue. A, B, C share dtype (FP16 or
+// BF16); C is NOT auto-resized — caller pre-sizes/dtypes it.
+void matmul_abt(const Tensor& A, const Tensor& B, Tensor& C,
+                int batch, int M, int N, int K,
+                long long strideA, long long strideB, long long strideC,
+                const Tensor* bias, int act);
+
+
 // Backward of matmul. For C = A @ B:
 //   dA(M,K) += dC(M,N) @ B^T;   dB(K,N) += A^T @ dC(M,N).
 // Dtype-dispatched (FP32/FP16); all five tensors share dtype. dC is read-only;

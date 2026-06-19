@@ -257,6 +257,11 @@ void swiglu_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& dY
                      ::brotensor::Tensor& dX);
 void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
             ::brotensor::Tensor& C);
+void matmul_abt(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
+                ::brotensor::Tensor& C,
+                int batch, int M, int N, int K,
+                long long strideA, long long strideB, long long strideC,
+                const ::brotensor::Tensor* bias, int act);
 void matmul_backward(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
                      const ::brotensor::Tensor& dC,
                      ::brotensor::Tensor& dA, ::brotensor::Tensor& dB);
@@ -1171,6 +1176,7 @@ struct CpuStaticRegistrar {
         ops.swiglu_forward             = &detail::cpu::swiglu_forward;
         ops.swiglu_backward            = &detail::cpu::swiglu_backward;
         ops.matmul                     = &detail::cpu::matmul;
+        ops.matmul_abt                 = &detail::cpu::matmul_abt;
         ops.matmul_backward            = &detail::cpu::matmul_backward;
         ops.lstm_forward_train         = &detail::cpu::lstm_forward_train;
         ops.lstm_backward              = &detail::cpu::lstm_backward;

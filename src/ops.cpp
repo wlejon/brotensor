@@ -1697,6 +1697,16 @@ void matmul(const Tensor& A, const Tensor& B, Tensor& C) {
     v.matmul(A, B, C);
 }
 
+void matmul_abt(const Tensor& A, const Tensor& B, Tensor& C,
+                int batch, int M, int N, int K,
+                long long strideA, long long strideB, long long strideC,
+                const Tensor* bias, int act) {
+    const auto& v = detail::dispatch(A, B, C);
+    if (!v.matmul_abt) detail::throw_not_implemented("matmul_abt", A.device);
+    detail::adopt_output(C, A.device);
+    v.matmul_abt(A, B, C, batch, M, N, K, strideA, strideB, strideC, bias, act);
+}
+
 void matmul_backward(const Tensor& A, const Tensor& B, const Tensor& dC,
                      Tensor& dA, Tensor& dB) {
     const auto& v = detail::dispatch(A, B, dC, dA, dB);

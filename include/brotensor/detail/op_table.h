@@ -402,6 +402,10 @@
                                                        ::brotensor::Tensor* dWskip, ::brotensor::Tensor* dbskip))                                                       \
     /* ─── Matmul + RoPE + RMSNorm + SwiGLU + KV-cache + Llama family ─── */                                                                                            \
     X(matmul,                                  void,  (const ::brotensor::Tensor& A, const ::brotensor::Tensor& B, ::brotensor::Tensor& C))                             \
+    X(matmul_abt,                              void,  (const ::brotensor::Tensor& A, const ::brotensor::Tensor& B, ::brotensor::Tensor& C,                              \
+                                                       int batch, int M, int N, int K,                                                                                  \
+                                                       long long strideA, long long strideB, long long strideC,                                                         \
+                                                       const ::brotensor::Tensor* bias, int act))                                                                       \
     X(matmul_backward,                         void,  (const ::brotensor::Tensor& A, const ::brotensor::Tensor& B, const ::brotensor::Tensor& dC,                       \
                                                        ::brotensor::Tensor& dA, ::brotensor::Tensor& dB))                                                               \
     X(lstm_forward_train,                      void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& W_ih, const ::brotensor::Tensor& W_hh,                  \

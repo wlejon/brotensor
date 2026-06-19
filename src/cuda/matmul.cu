@@ -22,6 +22,19 @@ namespace brotensor {
 // Forward decl: thread-local current stream from runtime.cu.
 void* cuda_current_stream();
 
+// Internal WMMA tensor-core A @ B^T launchers (defined in fp16_matmul.cu).
+namespace fp16_internal {
+void launch_matmul_ABT_batched_impl(const __half* A, const __half* B, __half* C,
+                                    int batch, int M, int N, int K,
+                                    size_t strideA, size_t strideB, size_t strideC,
+                                    const __half* bias, int act);
+void launch_matmul_ABT_batched_impl(const __nv_bfloat16* A, const __nv_bfloat16* B,
+                                    __nv_bfloat16* C,
+                                    int batch, int M, int N, int K,
+                                    size_t strideA, size_t strideB, size_t strideC,
+                                    const __nv_bfloat16* bias, int act);
+} // namespace fp16_internal
+
 namespace detail::cuda {
 
 namespace {
@@ -181,6 +194,47 @@ void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+// Public batched A @ B^T exposing the internal WMMA tensor-core kernel.
+// C[b](M,N) = A[b](M,K) @ B[b](N,K)^T, FP32 accumulation, optional fused
+// per-N bias + activation. A/B/C share dtype ∈ {FP16, BF16}; C is caller-sized.
+void matmul_abt(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
+                ::brotensor::Tensor& C,
+                int batch, int M, int N, int K,
+                long long strideA, long long strideB, long long strideC,
+                const ::brotensor::Tensor* bias, int act) {
+    if (A.dtype != B.dtype || A.dtype != C.dtype) {
+        throw std::runtime_error("matmul_abt: A, B, C must share dtype");
+    }
+    if (A.dtype != Dtype::FP16 && A.dtype != Dtype::BF16) {
+        throw std::runtime_error("matmul_abt: dtype must be FP16 or BF16");
+    }
+    if (bias && bias->dtype != A.dtype) {
+        throw std::runtime_error("matmul_abt: bias dtype must match operands");
+    }
+    if (batch <= 0 || M == 0 || N == 0) return;
+
+    if (A.dtype == Dtype::FP16) {
+        fp16_internal::launch_matmul_ABT_batched_impl(
+            static_cast<const __half*>(A.data),
+            static_cast<const __half*>(B.data),
+            static_cast<__half*>(C.data),
+            batch, M, N, K,
+            static_cast<size_t>(strideA), static_cast<size_t>(strideB),
+            static_cast<size_t>(strideC),
+            bias ? static_cast<const __half*>(bias->data) : nullptr, act);
+    } else {
+        fp16_internal::launch_matmul_ABT_batched_impl(
+            static_cast<const __nv_bfloat16*>(A.data),
+            static_cast<const __nv_bfloat16*>(B.data),
+            static_cast<__nv_bfloat16*>(C.data),
+            batch, M, N, K,
+            static_cast<size_t>(strideA), static_cast<size_t>(strideB),
+            static_cast<size_t>(strideC),
+            bias ? static_cast<const __nv_bfloat16*>(bias->data) : nullptr, act);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace detail::cuda
 } // namespace brotensor
 
@@ -287,6 +341,7 @@ void sequence_to_nchw(const ::brotensor::Tensor& X,
 
 void fill_cuda_vtable_utils(::brotensor::detail::OpsVTable& v) {
     v.matmul                              = &matmul;
+    v.matmul_abt                          = &matmul_abt;
     v.matmul_backward                     = &matmul_backward;
     v.linear_forward                      = &linear_forward;
     v.linear_backward                     = &linear_backward;
