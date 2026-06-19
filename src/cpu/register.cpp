@@ -945,6 +945,9 @@ void spatial_merge_2x2_forward(const ::brotensor::Tensor& X,
                                int N, int C, int H, int W,
                                bool channel_major,
                                ::brotensor::Tensor& Y);
+void pixel_shuffle_upsample_2x_forward(const ::brotensor::Tensor& X,
+                                       int N, int C_in, int H, int W,
+                                       int C_out, ::brotensor::Tensor& Y);
 void rope_apply_mrope(const ::brotensor::Tensor& X,
                       const ::brotensor::Tensor& cos_t,
                       const ::brotensor::Tensor& sin_t,
@@ -1350,6 +1353,7 @@ struct CpuStaticRegistrar {
 
         // ── Qwen3-VL polish: spatial_merge_2x2 + M-RoPE ──
         ops.spatial_merge_2x2_forward    = &detail::cpu::spatial_merge_2x2_forward;
+        ops.pixel_shuffle_upsample_2x_forward = &detail::cpu::pixel_shuffle_upsample_2x_forward;
         ops.rope_apply_mrope             = &detail::cpu::rope_apply_mrope;
 
         // ── BatchNorm (vision backbones) ──

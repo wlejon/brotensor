@@ -107,5 +107,86 @@ void spatial_merge_2x2_forward(const ::brotensor::Tensor& X,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+// ─── DC-AE up-shortcut: repeat_interleave + 2x pixel-shuffle ────────────────
+//
+// Y[n, c_out, 2h+i, 2w+j] = X[n, (4*c_out + 2i + j)/repeats, h, w],
+// repeats = 4*C_out/C_in. Pure gather; one thread per output element.
+
+namespace {
+
+template <typename T>
+__global__ void pixel_shuffle_upsample_2x_kernel(const T* __restrict__ X,
+                                                 T* __restrict__ Y,
+                                                 int N, int C_in, int H, int W,
+                                                 int C_out, int repeats,
+                                                 int H_out, int W_out,
+                                                 int total) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int w_out = idx % W_out;
+    int t           = idx / W_out;
+    const int h_out = t % H_out;
+    t              /= H_out;
+    const int c_out = t % C_out;
+    const int n     = t / C_out;
+    const int i = h_out & 1;
+    const int j = w_out & 1;
+    const int h = h_out >> 1;
+    const int w = w_out >> 1;
+    const int src_c = (4 * c_out + 2 * i + j) / repeats;
+    const int x_idx = (n * C_in + src_c) * (H * W) + h * W + w;
+    Y[idx] = X[x_idx];
+}
+
+} // namespace
+
+void pixel_shuffle_upsample_2x_forward(const ::brotensor::Tensor& X,
+                                       int N, int C_in, int H, int W,
+                                       int C_out,
+                                       ::brotensor::Tensor& Y) {
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 &&
+        X.dtype != Dtype::BF16) {
+        throw std::runtime_error("pixel_shuffle_upsample_2x_forward: X must be "
+                                 "FP32, FP16, or BF16");
+    }
+    if (N < 0 || C_in <= 0 || H < 0 || W < 0 || C_out <= 0) {
+        throw std::runtime_error("pixel_shuffle_upsample_2x_forward: bad dimension");
+    }
+    if ((4 * C_out) % C_in != 0) {
+        throw std::runtime_error("pixel_shuffle_upsample_2x_forward: C_in must "
+                                 "divide 4*C_out");
+    }
+    const int repeats = (4 * C_out) / C_in;
+    const int H_out = 2 * H;
+    const int W_out = 2 * W;
+    const int cols  = C_out * H_out * W_out;
+    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) {
+        Y.resize(N, cols, X.dtype);
+    }
+    const int total = N * cols;
+    if (total == 0) return;
+    const int blocks = grid_for(total);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+    switch (X.dtype) {
+    case Dtype::FP16:
+        pixel_shuffle_upsample_2x_kernel<__half><<<blocks, SM_BLOCK, 0, stream>>>(
+            static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
+            N, C_in, H, W, C_out, repeats, H_out, W_out, total);
+        break;
+    case Dtype::BF16:
+        pixel_shuffle_upsample_2x_kernel<__nv_bfloat16><<<blocks, SM_BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(X.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            N, C_in, H, W, C_out, repeats, H_out, W_out, total);
+        break;
+    default:  // FP32
+        pixel_shuffle_upsample_2x_kernel<float><<<blocks, SM_BLOCK, 0, stream>>>(
+            static_cast<const float*>(X.data), static_cast<float*>(Y.data),
+            N, C_in, H, W, C_out, repeats, H_out, W_out, total);
+        break;
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace detail::cuda
 } // namespace brotensor

@@ -34,6 +34,9 @@ void spatial_merge_2x2_forward(const ::brotensor::Tensor& X,
                                int N, int C, int H, int W,
                                bool channel_major,
                                ::brotensor::Tensor& Y);
+void pixel_shuffle_upsample_2x_forward(const ::brotensor::Tensor& X,
+                                       int N, int C_in, int H, int W,
+                                       int C_out, ::brotensor::Tensor& Y);
 
 namespace {
 
@@ -210,6 +213,7 @@ void rope_apply_mrope(const ::brotensor::Tensor& X,
 // Per-cluster vtable contribution for the Qwen3-VL polish ops.
 void fill_cuda_vtable_qwen3_vl_polish(::brotensor::detail::OpsVTable& v) {
     v.spatial_merge_2x2_forward = &spatial_merge_2x2_forward;
+    v.pixel_shuffle_upsample_2x_forward = &pixel_shuffle_upsample_2x_forward;
     v.rope_apply_mrope          = &rope_apply_mrope;
 }
 

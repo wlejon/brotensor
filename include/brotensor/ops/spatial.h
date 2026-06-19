@@ -143,4 +143,24 @@ void spatial_merge_2x2_forward(const Tensor& X,
                                bool channel_major,
                                Tensor& Y);
 
+
+// ─── DC-AE up-shortcut: channel repeat_interleave + 2x pixel-shuffle ────────
+//
+// The residual path of diffusers' DCUpBlock2d (AutoencoderDC decoder,
+// upsample_block_type="interpolate"): a pure gather that upsamples 2x while
+// rearranging channels. With factor=2 and repeats = 4*C_out/C_in (must divide
+// exactly), it is torch's
+//     y = x.repeat_interleave(repeats, dim=1); y = F.pixel_shuffle(y, 2)
+// fused into one op (no intermediate 4*C_out-channel tensor):
+//   Y[n, c_out, 2*h+i, 2*w+j] = X[n, (4*c_out + 2*i + j) / repeats, h, w]
+//   with i,j in {0,1}.
+//   X: (N, C_in*H*W).  Y: (N, C_out*(2H)*(2W)), resized + dtype-set to X.
+// When C_in == 4*C_out (repeats==1) this is a plain pixel-shuffle; when
+// C_in == C_out (repeats==4) it reduces to a 2x nearest upsample. Pure gather —
+// inference-only. Dispatched on X.dtype (FP32/FP16/BF16 on GPU; FP32 on CPU).
+void pixel_shuffle_upsample_2x_forward(const Tensor& X,
+                                       int N, int C_in, int H, int W,
+                                       int C_out,
+                                       Tensor& Y);
+
 }  // namespace brotensor

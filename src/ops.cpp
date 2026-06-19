@@ -1592,6 +1592,15 @@ void spatial_merge_2x2_forward(const Tensor& X, int N, int C, int H, int W,
     v.spatial_merge_2x2_forward(X, N, C, H, W, channel_major, Y);
 }
 
+void pixel_shuffle_upsample_2x_forward(const Tensor& X, int N, int C_in,
+                                       int H, int W, int C_out, Tensor& Y) {
+    const auto& v = detail::dispatch(X, Y);
+    if (!v.pixel_shuffle_upsample_2x_forward)
+        detail::throw_not_implemented("pixel_shuffle_upsample_2x_forward", X.device);
+    detail::adopt_output(Y, X.device);
+    v.pixel_shuffle_upsample_2x_forward(X, N, C_in, H, W, C_out, Y);
+}
+
 // ─── ResBlock ──────────────────────────────────────────────────────────────
 
 void resblock_forward(const Tensor& X,
