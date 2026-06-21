@@ -1406,6 +1406,16 @@ int main() {
     run_one("fused hd64 tails", 129,  65, 192, 3, false);
     run_one("fused hd64 mask",   70, 200, 128, 2, true);
     run_one("fused hd64 1head", 300, 333,  64, 1, false);
+
+    // Fused path for head_dim == 72 (PixArt-Sigma DiT: D=1152, nh=16). 72 is
+    // not a multiple of 16, so this exercises the HD_PAD=80 zero-padded WMMA
+    // tiling and the decoupled softmax(BC) / output(HD_PAD) column ownership.
+    // Same exact/tails/mask/1-head coverage as hd64; BR=64 here.
+    run_one("fused hd72 exact",  64, 128, 1152, 16, false);
+    run_one("fused hd72 tails",  65,  70, 1152, 16, false);
+    run_one("fused hd72 mask",   70, 200,  720, 10, true);
+    run_one("fused hd72 1head", 300, 333,   72,  1, false);
+
     run_qkvo("qkvo small", 6, 7, 32, 4);
     run_qkvo("qkvo self",  8, 8, 32, 4);
     run_qkvo_with_biases("qkvo biases", 6, 7, 32, 4);
