@@ -428,6 +428,14 @@ BT_PARITY_TEST(sab_bf16_L12_D64_h8_bias) {
 BT_PARITY_TEST(sab_bf16_L8_D32_h4_t5scale) {
     run_sab_bf16(8, 32, 4, 1.0f, true, 0x622ull);
 }
+// head_dim = 64 (the T5-XXL / PixArt encoder head dim) at the T5 unscaled-score
+// path — the WMMA K=64 tiling the small-dh cases above never reach.
+BT_PARITY_TEST(sab_bf16_L20_D128_h2_dh64_t5) {
+    run_sab_bf16(20, 128, 2, 1.0f, true, 0x623ull);
+}
+BT_PARITY_TEST(sab_bf16_L40_D256_h4_dh64_t5) {
+    run_sab_bf16(40, 256, 4, 1.0f, true, 0x624ull);
+}
 
 // W8A16 INT8 weight-only T5-bias attention vs the FP16 dequant reference.
 BT_PARITY_TEST(sab_int8_L8_D32_h4_nobias) {
