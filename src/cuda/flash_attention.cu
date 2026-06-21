@@ -517,13 +517,14 @@ __global__ void extract_head_LD_bf16_kernel(const __nv_bfloat16* __restrict__ X,
 
 __global__ void extract_head_DL_bf16_kernel(const __nv_bfloat16* __restrict__ X,
                                             __nv_bfloat16* __restrict__ Y,
-                                            int L, int D, int head_off, int head_dim) {
+                                            int L, int D, int head_off, int head_dim,
+                                            int ldY) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = L * head_dim;
     if (idx >= total) return;
     const int l = idx / head_dim;
     const int d = idx % head_dim;
-    Y[d * L + l] = X[l * D + head_off + d];
+    Y[d * ldY + l] = X[l * D + head_off + d];
 }
 
 __global__ void pack_head_LD_bf16_kernel(const __nv_bfloat16* __restrict__ Y,
@@ -569,11 +570,13 @@ inline void launch_matmul_ABT_bf16(const __nv_bfloat16* A,
 __global__ void scale_mask_softmax_rows_bf16_kernel(__nv_bfloat16* __restrict__ S,
                                                     int Lq, int Lk,
                                                     float scale,
-                                                    const float* __restrict__ mask) {
+                                                    const float* __restrict__ mask,
+                                                    int ldS) {
     extern __shared__ float ssm[];  // size = blockDim.x
     const int q = blockIdx.x;
     const int tid = threadIdx.x;
-    __nv_bfloat16* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
+    __nv_bfloat16* row = S + static_cast<size_t>(q) * static_cast<size_t>(ldS);
+    for (int k = Lk + tid; k < ldS; k += blockDim.x) row[k] = __float2bfloat16(0.0f);
 
     float local_max = -1e30f;
     for (int k = tid; k < Lk; k += blockDim.x) {
@@ -1170,16 +1173,16 @@ void flash_attention_forward(const Tensor& Q,
     // head_dim=40) the S buffer is 32 MB and the per-head buffers a few
     // hundred KB. Allocator reuse makes subsequent calls effectively free.
     //
-    // FP16 pads the Lk axis of Kh / Vth / S to a multiple of 8: the WMMA GEMM's
-    // vectorised int4 loads need 8-element row strides along K and N, and an
-    // unaligned Lk (e.g. TripoSplat's 12294-token joint sequence) would demote
-    // both GEMMs to the naive fallback — a ~40x cliff. Pad rows of Kh are
-    // zeroed once (giving pad scores of exactly 0 pre-softmax), the softmax
-    // writes exact zeros into the pad columns of S, and Vth's pad columns are
-    // zeroed once, so the padded second GEMM adds exactly nothing — the result
-    // is bit-identical to the unpadded path. BF16 keeps Lk_pad == Lk (its
-    // naive matmul has no alignment requirement).
-    const int Lk_pad = bf16 ? Lk : ((Lk + 7) & ~7);
+    // Both FP16 and BF16 pad the Lk axis of Kh / Vth / S to a multiple of 8:
+    // the WMMA GEMM's vectorised int4 loads need 8-element row strides along K
+    // and N, and an unaligned Lk (e.g. TripoSplat's 12294-token joint sequence)
+    // would demote both GEMMs to the naive fallback — a ~40x cliff. Pad rows of
+    // Kh are zeroed once (giving pad scores of exactly 0 pre-softmax), the
+    // softmax writes exact zeros into the pad columns of S, and Vth's pad
+    // columns are zeroed once, so the padded second GEMM adds exactly nothing —
+    // the result is bit-identical to the unpadded path. (sm_80+ runs BF16 WMMA
+    // fragments, so BF16 takes the same tensor-core matmul as FP16.)
+    const int Lk_pad = (Lk + 7) & ~7;
     Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, head_dim, dt);
     Tensor Kh = Tensor::empty_on(Device::CUDA, Lk_pad, head_dim, dt);
     Tensor Vth = Tensor::empty_on(Device::CUDA, head_dim, Lk_pad, dt);
@@ -1227,20 +1230,24 @@ void flash_attention_forward(const Tensor& Q,
             extract_head_DL_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(V.data),
                 reinterpret_cast<__nv_bfloat16*>(Vth.data),
-                Lk, D, head_off, head_dim);
-            launch_matmul_ABT_bf16(
+                Lk, D, head_off, head_dim, Lk_pad);
+            // S(Lq, Lk_pad) = Qh @ Kh^T — pad rows of Kh are zero, so pad cols
+            // of S come out 0 (overwritten by the softmax). BF16 WMMA.
+            fp16_internal::launch_matmul_ABT(
                 reinterpret_cast<const __nv_bfloat16*>(Qh.data),
                 reinterpret_cast<const __nv_bfloat16*>(Kh.data),
                 reinterpret_cast<__nv_bfloat16*>(S.data),
-                Lq, Lk, head_dim);
+                Lq, Lk_pad, head_dim);
             scale_mask_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
                 reinterpret_cast<__nv_bfloat16*>(S.data),
-                Lq, Lk, inv_sqrt, d_mask);
-            launch_matmul_ABT_bf16(
+                Lq, Lk, inv_sqrt, d_mask, Lk_pad);
+            // Oh(Lq, hd) = S(Lq, Lk_pad) @ Vth(hd, Lk_pad)^T — pad columns of
+            // both operands are zero, contributing exactly nothing. BF16 WMMA.
+            fp16_internal::launch_matmul_ABT(
                 reinterpret_cast<const __nv_bfloat16*>(S.data),
                 reinterpret_cast<const __nv_bfloat16*>(Vth.data),
                 reinterpret_cast<__nv_bfloat16*>(Oh.data),
-                Lq, head_dim, Lk);
+                Lq, head_dim, Lk_pad);
             pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat16*>(Oh.data),
                 reinterpret_cast<__nv_bfloat16*>(O.data),
@@ -1732,7 +1739,7 @@ void flash_attention_qkvo_backward(
                 extract_head_DL_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(V.data),
                     reinterpret_cast<__nv_bfloat16*>(Vth.data),
-                    Lk, D, head_off, hd);
+                    Lk, D, head_off, hd, /*ldY=*/Lk);
                 launch_matmul_ABT_bf16(
                     reinterpret_cast<const __nv_bfloat16*>(Qh.data),
                     reinterpret_cast<const __nv_bfloat16*>(Kh.data),

@@ -138,6 +138,81 @@ static void run_one(const char* label, int Lq, int Lk, int D, int nh,
     check_fp16(got, O_ref, label);
 }
 
+static std::vector<uint16_t> to_bf16(const std::vector<float>& v) {
+    std::vector<uint16_t> o(v.size());
+    for (size_t i = 0; i < v.size(); ++i) o[i] = brotensor::fp32_to_bf16_bits(v[i]);
+    return o;
+}
+static std::vector<float> rqb(const std::vector<float>& v) {
+    std::vector<float> o(v.size());
+    for (size_t i = 0; i < v.size(); ++i)
+        o[i] = brotensor::bf16_bits_to_fp32(brotensor::fp32_to_bf16_bits(v[i]));
+    return o;
+}
+static void check_bf16(const std::vector<uint16_t>& got,
+                       const std::vector<float>& ref,
+                       const char* label,
+                       float atol = 4e-2f, float rtol = 4e-2f) {
+    int bad = 0;
+    float max_err = 0.0f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const float g = brotensor::bf16_bits_to_fp32(got[i]);
+        const float e = std::fabs(g - ref[i]);
+        if (e > max_err) max_err = e;
+        if (e > atol + rtol * std::fabs(ref[i])) {
+            if (bad < 3)
+                std::printf("    %s mismatch i=%zu got=%g ref=%g err=%g\n",
+                            label, i, g, ref[i], e);
+            ++bad;
+        }
+    }
+    std::printf("    %s max_err=%g bad=%d / %zu\n", label, max_err, bad, ref.size());
+    CHECK(bad == 0);
+}
+
+// BF16 twin of run_one — exercises flash_attention_forward's BF16 per-head
+// path (the one VAE mid-block self-attention hits: a single head with
+// head_dim > 72, too wide for the fused kernel). Covers the Lk-padding the
+// WMMA matmul now uses for BF16.
+static void run_one_bf16(const char* label, int Lq, int Lk, int D, int nh,
+                         bool use_mask) {
+    std::printf("  %s [bf16]  Lq=%d Lk=%d D=%d nh=%d mask=%d\n",
+                label, Lq, Lk, D, nh, (int)use_mask);
+    std::mt19937 rng(0xB16F);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+    std::vector<float> Q(Lq*D), K(Lk*D), V(Lk*D);
+    for (auto& v : Q) v = dist(rng);
+    for (auto& v : K) v = dist(rng);
+    for (auto& v : V) v = dist(rng);
+    auto Qq = rqb(Q), Kq = rqb(K), Vq = rqb(V);
+    std::vector<float> mask_host;
+    const std::vector<float>* mask_ptr = nullptr;
+    if (use_mask) {
+        mask_host.assign(Lk, 1.0f);
+        for (int k = 3*Lk/4; k < Lk; ++k) mask_host[k] = 0.0f;
+        mask_ptr = &mask_host;
+    }
+    std::vector<float> O_ref;
+    attn_qkv_cpu(Qq, Kq, Vq, mask_ptr, Lq, Lk, D, nh, O_ref);
+
+    auto Qb = to_bf16(Q), Kb = to_bf16(K), Vb = to_bf16(V);
+    Tensor Qg = Tensor::from_host_bf16_on(Device::CUDA, Qb.data(), Lq, D);
+    Tensor Kg = Tensor::from_host_bf16_on(Device::CUDA, Kb.data(), Lk, D);
+    Tensor Vg = Tensor::from_host_bf16_on(Device::CUDA, Vb.data(), Lk, D);
+    Tensor mg;
+    const float* d_mask = nullptr;
+    if (use_mask) {
+        mg = Tensor::from_host_on(Device::CUDA, mask_host.data(), Lk, 1);
+        d_mask = static_cast<const float*>(mg.data);
+    }
+    Tensor Og;
+    brotensor::flash_attention_forward(Qg, Kg, Vg, d_mask, nh, /*causal=*/false, Og);
+    CHECK(Og.rows == Lq && Og.cols == D && Og.dtype == Dtype::BF16);
+    std::vector<uint16_t> got = Og.to_host_vector_bf16();
+    brotensor::sync_all();
+    check_bf16(got, O_ref, label);
+}
+
 static void run_qkvo(const char* label, int Lq, int Lk, int D, int nh) {
     std::printf("  %s qkvo Lq=%d Lk=%d D=%d nh=%d\n", label, Lq, Lk, D, nh);
     std::mt19937 rng(0xC0DE);
@@ -1415,6 +1490,15 @@ int main() {
     run_one("fused hd72 tails",  65,  70, 1152, 16, false);
     run_one("fused hd72 mask",   70, 200,  720, 10, true);
     run_one("fused hd72 1head", 300, 333,   72,  1, false);
+
+    // BF16 per-head WMMA path (the route VAE mid-block self-attention takes:
+    // single head, head_dim > 72). Includes unaligned Lk to exercise the
+    // 8-multiple padding the BF16 matmul now relies on, plus a mask case.
+    run_one_bf16("bf16 multihead",   6,   7,  32, 4, false);
+    run_one_bf16("bf16 1head hd128", 64, 128, 128, 1, false);
+    run_one_bf16("bf16 1head tails", 70,  70, 128, 1, false);   // Lk not mult of 8
+    run_one_bf16("bf16 1head mask",  48, 200, 128, 1, true);
+    run_one_bf16("bf16 hd512 vae",   80,  80, 512, 1, false);   // VAE head_dim
 
     run_qkvo("qkvo small", 6, 7, 32, 4);
     run_qkvo("qkvo self",  8, 8, 32, 4);
