@@ -50,6 +50,9 @@ __global__ void layernorm_forward_kernel(const float* __restrict__ x,
         __syncthreads();
     }
     const float mean = sdata[0] / static_cast<float>(n);
+    __syncthreads();   // barrier before reusing sdata for variance — see the
+                       // batched variant; without it sdata[0] is clobbered by a
+                       // fast thread before a slow thread reads `mean`.
 
     // Variance.
     float local_v = 0.0f;
@@ -225,6 +228,7 @@ __global__ void layernorm_forward_kernel_fp16(const __half* __restrict__ x,
         __syncthreads();
     }
     const float mean = sdata[0] / static_cast<float>(n);
+    __syncthreads();   // barrier before reusing sdata for variance — see FP32 variant
 
     // Variance.
     float local_v = 0.0f;
@@ -274,6 +278,7 @@ __global__ void layernorm_forward_kernel_bf16(const __nv_bfloat16* __restrict__ 
         __syncthreads();
     }
     const float mean = sdata[0] / static_cast<float>(n);
+    __syncthreads();   // barrier before reusing sdata for variance — see FP32 variant
 
     float local_v = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
@@ -462,6 +467,12 @@ __global__ void layernorm_forward_inference_batched_kernel(
         __syncthreads();
     }
     const float mean = sdata[0] / static_cast<float>(D);
+    // Barrier: all threads must read the mean from sdata[0] BEFORE any thread
+    // overwrites the shared buffer with its variance partial below. Without it a
+    // fast thread's `sdata[tid] = local_v` clobbers sdata[0] while a slow thread
+    // still reads `mean` — an intermittent shared-memory race that makes
+    // layernorm nondeterministic (compute-sanitizer racecheck: read/write hazard).
+    __syncthreads();
 
     // Variance.
     float local_v = 0.0f;
@@ -509,6 +520,7 @@ __global__ void layernorm_forward_inference_batched_fp16_kernel(
         __syncthreads();
     }
     const float mean = sdata[0] / static_cast<float>(D);
+    __syncthreads();   // barrier before reusing sdata for variance — see FP32 variant
 
     float local_v = 0.0f;
     for (int i = tid; i < D; i += blockDim.x) {
@@ -557,6 +569,7 @@ __global__ void layernorm_forward_inference_batched_bf16_kernel(
         __syncthreads();
     }
     const float mean = sdata[0] / static_cast<float>(D);
+    __syncthreads();   // barrier before reusing sdata for variance — see FP32 variant
 
     float local_v = 0.0f;
     for (int i = tid; i < D; i += blockDim.x) {
@@ -776,6 +789,7 @@ __global__ void ln_fwd_batched_caches_kernel(const T* __restrict__ x,
         __syncthreads();
     }
     const float mean = sdata[0] / static_cast<float>(D);
+    __syncthreads();   // barrier before reusing sdata for variance — see FP32 variant
 
     float local_v = 0.0f;
     for (int i = tid; i < D; i += blockDim.x) {

@@ -49,6 +49,7 @@ __global__ void softmax_forward_kernel(const float* __restrict__ logits,
         __syncthreads();
     }
     const float m = sdata[0];
+    __syncthreads();   // barrier before reusing sdata for the sum reduction
 
     // Phase 2: write exp(x - m) into probs (zero on masked), accumulate sum.
     float local_sum = 0.0f;
@@ -99,6 +100,12 @@ __global__ void softmax_rows_forward_kernel(const float* __restrict__ X,
         __syncthreads();
     }
     const float m = sdata[0];
+    // Barrier: all threads must read the max from sdata[0] BEFORE any thread
+    // overwrites the shared buffer with its partial sum below. Without this a
+    // fast thread's `sdata[tid] = local_sum` clobbers sdata[0] while a slow
+    // thread is still reading `m` — an intermittent shared-memory race that makes
+    // softmax nondeterministic (compute-sanitizer racecheck: read/write hazard).
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (int i = tid; i < cols; i += blockDim.x) {
@@ -149,6 +156,8 @@ __global__ void softmax_rows_forward_kernel_h(const T* __restrict__ X,
         __syncthreads();
     }
     const float m = sdata[0];
+    // Barrier before reusing sdata for the sum reduction — see the FP32 variant.
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (int i = tid; i < cols; i += blockDim.x)
@@ -194,6 +203,7 @@ __global__ void softmax_forward_kernel_fp16(const __half* __restrict__ logits,
         __syncthreads();
     }
     const float m = sdata[0];
+    __syncthreads();   // barrier before reusing sdata for the sum reduction
 
     float local_sum = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
@@ -244,6 +254,7 @@ __global__ void softmax_forward_kernel_bf16(const __nv_bfloat16* __restrict__ lo
         __syncthreads();
     }
     const float m = sdata[0];
+    __syncthreads();   // barrier before reusing sdata for the sum reduction
 
     float local_sum = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
