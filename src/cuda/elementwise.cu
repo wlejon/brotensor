@@ -1127,8 +1127,13 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
     const int n = src.size();
     if (n == 0) return;
     if (src.dtype == out_dtype) {
-        BROTENSOR_CUDA_CHECK(cudaMemcpy(dst.data, src.data, src.bytes(),
-                                        cudaMemcpyDeviceToDevice));
+        // Stream-ordered: a synchronous cudaMemcpy on the legacy default stream
+        // would break CUDA-graph capture (a no-op cast inside a captured body
+        // must record on the capture stream like every other op, not run off it
+        // and go missing on replay).
+        BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(dst.data, src.data, src.bytes(),
+                                             cudaMemcpyDeviceToDevice,
+                                             cur_stream()));
         return;
     }
     if (src.dtype == Dtype::FP32 && out_dtype == Dtype::FP16) {
