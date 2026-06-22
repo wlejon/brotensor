@@ -1601,6 +1601,16 @@ void pixel_shuffle_upsample_2x_forward(const Tensor& X, int N, int C_in,
     v.pixel_shuffle_upsample_2x_forward(X, N, C_in, H, W, C_out, Y);
 }
 
+void patch_unpack_forward(const Tensor& tokens, int hp, int wp, int P,
+                          int C_total, int C_keep, bool channel_major,
+                          Tensor& Y) {
+    const auto& v = detail::dispatch(tokens, Y);
+    if (!v.patch_unpack_forward)
+        detail::throw_not_implemented("patch_unpack_forward", tokens.device);
+    detail::adopt_output(Y, tokens.device);
+    v.patch_unpack_forward(tokens, hp, wp, P, C_total, C_keep, channel_major, Y);
+}
+
 // ─── ResBlock ──────────────────────────────────────────────────────────────
 
 void resblock_forward(const Tensor& X,

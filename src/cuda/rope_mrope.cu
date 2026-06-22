@@ -37,6 +37,9 @@ void spatial_merge_2x2_forward(const ::brotensor::Tensor& X,
 void pixel_shuffle_upsample_2x_forward(const ::brotensor::Tensor& X,
                                        int N, int C_in, int H, int W,
                                        int C_out, ::brotensor::Tensor& Y);
+void patch_unpack_forward(const ::brotensor::Tensor& tokens,
+                          int hp, int wp, int P, int C_total, int C_keep,
+                          bool channel_major, ::brotensor::Tensor& Y);
 
 namespace {
 
@@ -214,6 +217,7 @@ void rope_apply_mrope(const ::brotensor::Tensor& X,
 void fill_cuda_vtable_qwen3_vl_polish(::brotensor::detail::OpsVTable& v) {
     v.spatial_merge_2x2_forward = &spatial_merge_2x2_forward;
     v.pixel_shuffle_upsample_2x_forward = &pixel_shuffle_upsample_2x_forward;
+    v.patch_unpack_forward      = &patch_unpack_forward;
     v.rope_apply_mrope          = &rope_apply_mrope;
 }
 

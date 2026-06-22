@@ -240,6 +240,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.self_attention_forward_train                = &dm::self_attention_forward_train;
     ops.sequence_to_nchw                            = &dm::sequence_to_nchw;
     ops.spatial_merge_2x2_forward                   = &dm::spatial_merge_2x2_forward;
+    ops.patch_unpack_forward                        = &dm::patch_unpack_forward;
     ops.sgd_step                                    = &dm::sgd_step;
     ops.sigmoid_backward                            = &dm::sigmoid_backward;
     ops.slice2d_backward                            = &dm::slice2d_backward;

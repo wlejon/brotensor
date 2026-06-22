@@ -163,4 +163,26 @@ void pixel_shuffle_upsample_2x_forward(const Tensor& X,
                                        int C_out,
                                        Tensor& Y);
 
+
+// ─── DiT unpatchify: token rows -> image (depth-to-space + channel keep) ────
+//
+// The inverse of a DiT's spatial patchify, fused with the optional drop of
+// trailing channels (PixArt-Sigma's proj_out emits 2*latent_channels — epsilon
+// plus a learned-variance half that is discarded). Pure gather, no arithmetic.
+//   tokens: (hp*wp, P*P*C_total) — one row per (i,j) grid cell, row index
+//           tok = i*wp + j. A row holds a P×P patch over C_total channels,
+//           the column index composing (block in [0,P*P), channel in [0,C_total)):
+//             channel_major=false (block-major): col = block*C_total + c
+//             channel_major=true  (channel-major): col = c*(P*P) + block
+//           block = py*P + px is the offset (py,px) within the P×P output patch.
+//   Y: (1, C_keep*(hp*P)*(wp*P)) NCHW —
+//        Y[c, i*P+py, j*P+px] = tokens[i*wp+j, col], for c in [0, C_keep).
+//        Channels [C_keep, C_total) are dropped. Resized + dtype-set to tokens.
+// Inference-only. Dispatched on tokens.dtype (FP32/FP16/BF16 on GPU; FP32 CPU).
+void patch_unpack_forward(const Tensor& tokens,
+                          int hp, int wp, int P,
+                          int C_total, int C_keep,
+                          bool channel_major,
+                          Tensor& Y);
+
 }  // namespace brotensor

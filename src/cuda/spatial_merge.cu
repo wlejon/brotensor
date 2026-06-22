@@ -188,5 +188,89 @@ void pixel_shuffle_upsample_2x_forward(const ::brotensor::Tensor& X,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+// ─── DiT unpatchify: token rows -> image (depth-to-space + channel keep) ─────
+//
+// Y[c, i*P+py, j*P+px] = tokens[i*wp+j, col], c in [0,C_keep). See ops/spatial.h.
+// Pure gather; one thread per output element.
+
+namespace {
+
+template <typename T>
+__global__ void patch_unpack_kernel(const T* __restrict__ X,
+                                    T* __restrict__ Y,
+                                    int hp, int wp, int P, int C_total,
+                                    int C_keep, int H, int W, int row_stride,
+                                    int total, bool channel_major) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    // Output NCHW walk: idx = (c*H + y)*W + x.
+    const int x = idx % W;
+    int t       = idx / W;
+    const int y = t % H;
+    const int c = t / H;
+    const int i  = y / P;
+    const int py = y % P;
+    const int j  = x / P;
+    const int px = x % P;
+    const int block = py * P + px;
+    const int col = channel_major ? (c * (P * P) + block)
+                                  : (block * C_total + c);
+    const int tok = i * wp + j;
+    Y[idx] = X[tok * row_stride + col];
+    (void)hp; (void)C_keep;
+}
+
+} // namespace
+
+void patch_unpack_forward(const ::brotensor::Tensor& tokens,
+                          int hp, int wp, int P, int C_total, int C_keep,
+                          bool channel_major,
+                          ::brotensor::Tensor& Y) {
+    if (tokens.dtype != Dtype::FP32 && tokens.dtype != Dtype::FP16 &&
+        tokens.dtype != Dtype::BF16) {
+        throw std::runtime_error("patch_unpack_forward: tokens must be FP32, "
+                                 "FP16, or BF16");
+    }
+    if (hp < 0 || wp < 0 || P <= 0 || C_total <= 0 || C_keep <= 0 ||
+        C_keep > C_total) {
+        throw std::runtime_error("patch_unpack_forward: bad dimension");
+    }
+    const int PP   = P * P;
+    const int N    = hp * wp;
+    if (tokens.rows != N || tokens.cols != PP * C_total) {
+        throw std::runtime_error("patch_unpack_forward: tokens shape mismatch");
+    }
+    const int H    = hp * P;
+    const int W    = wp * P;
+    const int cols = C_keep * H * W;
+    if (Y.rows != 1 || Y.cols != cols || Y.dtype != tokens.dtype) {
+        Y.resize(1, cols, tokens.dtype);
+    }
+    const int total = cols;
+    if (total == 0) return;
+    const int row_stride = PP * C_total;
+    const int blocks = grid_for(total);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+    switch (tokens.dtype) {
+    case Dtype::FP16:
+        patch_unpack_kernel<__half><<<blocks, SM_BLOCK, 0, stream>>>(
+            static_cast<const __half*>(tokens.data), static_cast<__half*>(Y.data),
+            hp, wp, P, C_total, C_keep, H, W, row_stride, total, channel_major);
+        break;
+    case Dtype::BF16:
+        patch_unpack_kernel<__nv_bfloat16><<<blocks, SM_BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(tokens.data),
+            static_cast<__nv_bfloat16*>(Y.data),
+            hp, wp, P, C_total, C_keep, H, W, row_stride, total, channel_major);
+        break;
+    default:  // FP32
+        patch_unpack_kernel<float><<<blocks, SM_BLOCK, 0, stream>>>(
+            static_cast<const float*>(tokens.data), static_cast<float*>(Y.data),
+            hp, wp, P, C_total, C_keep, H, W, row_stride, total, channel_major);
+        break;
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace detail::cuda
 } // namespace brotensor

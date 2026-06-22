@@ -10,6 +10,7 @@
 
 #include <brotensor/tensor.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -113,6 +114,64 @@ void pixel_shuffle_upsample_2x_forward(const ::brotensor::Tensor& X,
                     const float* xc =
                         Xp + (static_cast<std::size_t>(n) * C_in + src_c) * HW;
                     yc[h_out * W_out + w_out] = xc[h * W + w];
+                }
+            }
+        }
+    }
+}
+
+// ─── CPU DiT unpatchify: token rows -> image ────────────────────────────────
+//
+// Y[c, i*P+py, j*P+px] = tokens[i*wp+j, col], c in [0,C_keep). See ops/spatial.h.
+// FP32-only on CPU.
+
+void patch_unpack_forward(const ::brotensor::Tensor& tokens,
+                          int hp, int wp, int P, int C_total, int C_keep,
+                          bool channel_major,
+                          ::brotensor::Tensor& Y) {
+    if (tokens.dtype != Dtype::FP32) {
+        throw std::runtime_error("patch_unpack_forward: tokens must be FP32 "
+                                 "(CPU backend is FP32-only)");
+    }
+    if (hp < 0 || wp < 0 || P <= 0 || C_total <= 0 || C_keep <= 0 ||
+        C_keep > C_total) {
+        throw std::runtime_error("patch_unpack_forward: bad dimension");
+    }
+    const int PP   = P * P;
+    const int N    = hp * wp;
+    if (tokens.rows != N || tokens.cols != PP * C_total) {
+        throw std::runtime_error("patch_unpack_forward: tokens shape mismatch");
+    }
+    const int H    = hp * P;
+    const int W    = wp * P;
+    const int cols = C_keep * H * W;
+    if (Y.rows != 1 || Y.cols != cols || Y.dtype != Dtype::FP32) {
+        Y.resize(1, cols, Dtype::FP32);
+    }
+    if (N == 0) return;
+
+    const float* Xp = tokens.host_f32();
+    float*       Yp = Y.host_f32_mut();
+    const int    row_stride = PP * C_total;
+    const std::size_t plane = static_cast<std::size_t>(H) * W;
+
+    for (int c = 0; c < C_keep; ++c) {
+        for (int i = 0; i < hp; ++i) {
+            for (int py = 0; py < P; ++py) {
+                const int y = i * P + py;
+                for (int j = 0; j < wp; ++j) {
+                    const int tok = i * wp + j;
+                    const float* trow = Xp +
+                        static_cast<std::size_t>(tok) * row_stride;
+                    for (int px = 0; px < P; ++px) {
+                        const int x = j * P + px;
+                        const int block = py * P + px;
+                        const int col = channel_major
+                            ? c * PP + block
+                            : block * C_total + c;
+                        Yp[static_cast<std::size_t>(c) * plane +
+                           static_cast<std::size_t>(y) * W + x] = trow[col];
+                    }
                 }
             }
         }

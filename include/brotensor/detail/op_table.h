@@ -366,6 +366,8 @@
     X(spatial_merge_2x2_forward,               void,  (const ::brotensor::Tensor& X, int N, int C, int H, int W, bool channel_major, ::brotensor::Tensor& Y))           \
     /* ─── DC-AE up-shortcut: repeat_interleave + 2x pixel-shuffle ─── */                                                                                                \
     X(pixel_shuffle_upsample_2x_forward,       void,  (const ::brotensor::Tensor& X, int N, int C_in, int H, int W, int C_out, ::brotensor::Tensor& Y))                 \
+    /* ─── DiT unpatchify: token rows -> image (depth-to-space + channel keep) ─── */                                                                                     \
+    X(patch_unpack_forward,                    void,  (const ::brotensor::Tensor& tokens, int hp, int wp, int P, int C_total, int C_keep, bool channel_major, ::brotensor::Tensor& Y)) \
     /* ─── Diffusion ResBlock (forward + W8A16 + backward) ─── */                                                                                                       \
     X(resblock_forward,                        void,  (const ::brotensor::Tensor& X,                                                                                    \
                                                        const ::brotensor::Tensor& gamma1, const ::brotensor::Tensor& beta1,                                             \
