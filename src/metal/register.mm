@@ -228,6 +228,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.round_backward                              = &dm::round_backward;
     ops.round_forward                               = &dm::round_forward;
     ops.sample_logits                               = &dm::sample_logits;
+    ops.sample_logits_into                          = &dm::sample_logits_into;
     ops.scale_inplace                               = &dm::scale_inplace;
     ops.scatter_rows_add                            = &dm::scatter_rows_add;
     ops.scatter_rows                                = &dm::scatter_rows;

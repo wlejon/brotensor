@@ -2543,6 +2543,17 @@ void sample_logits(const Tensor& logits, float temperature, int top_k,
     v.sample_logits(logits, temperature, top_k, top_p, key, counter, indices);
 }
 
+void sample_logits_into(const Tensor& logits, float temperature, int top_k,
+                        float top_p, uint64_t key, Tensor& counter,
+                        Tensor& scratch, Tensor& indices) {
+    const auto& v = detail::dispatch(logits, indices);
+    if (!v.sample_logits_into)
+        detail::throw_not_implemented("sample_logits_into", logits.device);
+    detail::adopt_output(indices, logits.device);
+    v.sample_logits_into(logits, temperature, top_k, top_p, key, counter,
+                         scratch, indices);
+}
+
 // ─── L2 norm + Gated Delta Rule (linear-attention text path) ───────────────
 
 void l2_norm_forward(const Tensor& X, int head_dim, int num_heads,

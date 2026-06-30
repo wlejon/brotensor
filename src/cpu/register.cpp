@@ -907,6 +907,11 @@ void round_backward(const ::brotensor::Tensor& dY, ::brotensor::Tensor& dX);
 void sample_logits(const ::brotensor::Tensor& logits, float temperature,
                    int top_k, float top_p, uint64_t key, uint64_t counter,
                    ::brotensor::Tensor& indices);
+void sample_logits_into(const ::brotensor::Tensor& logits, float temperature,
+                        int top_k, float top_p, uint64_t key,
+                        ::brotensor::Tensor& counter,
+                        ::brotensor::Tensor& scratch,
+                        ::brotensor::Tensor& indices);
 
 // ── Counter-based noise generation (Philox 4x32-10) — noise.cpp ──
 void randn(uint64_t key, uint64_t counter, ::brotensor::Tensor& Y);
@@ -1347,6 +1352,7 @@ struct CpuStaticRegistrar {
 
         // ── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ──
         ops.sample_logits                = &detail::cpu::sample_logits;
+        ops.sample_logits_into           = &detail::cpu::sample_logits_into;
 
         // ── Counter-based noise generation (Philox 4x32-10) ──
         ops.randn                        = &detail::cpu::randn;

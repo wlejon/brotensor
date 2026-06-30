@@ -201,12 +201,134 @@ kernel void k_sample_logits(device const float* logits   [[buffer(0)]],
     }
     indices[n] = chosen;
 }
+
+// ── Graph-capturable variant ────────────────────────────────────────────────
+// Philox base counter read from a device buffer (counter[0]); scratch is
+// caller-owned. The counter is advanced by a separate single-thread kernel so
+// no row races the write. Mirrors the CUDA sample_logits_into path.
+struct SampleParamsG {
+    ulong key;
+    float temperature;
+    int   top_k;
+    float top_p;
+    uint  N;
+    uint  V;
+};
+
+kernel void k_sample_logits_into(device const float* logits  [[buffer(0)]],
+                                 device int*         indices [[buffer(1)]],
+                                 device float*       prob    [[buffer(2)]],
+                                 device float*       work    [[buffer(3)]],
+                                 device int*         order   [[buffer(4)]],
+                                 device const int*   counter [[buffer(5)]],
+                                 constant SampleParamsG& P    [[buffer(6)]],
+                                 uint n [[thread_position_in_grid]]) {
+    if (n >= P.N) return;
+    ulong base = (ulong)(uint)counter[0];
+    uint V = P.V;
+    device const float* row = logits + (ulong)n * V;
+
+    if (P.temperature == 0.0f) {
+        float best_v = kNeg;
+        int   best_i = 0;
+        for (uint v = 0u; v < V; ++v) {
+            if (row[v] > best_v) { best_v = row[v]; best_i = int(v); }
+        }
+        indices[n] = best_i;
+        return;
+    }
+
+    device float* prob_n = prob + (ulong)n * V;
+    device float* work_n = work + (ulong)n * V;
+    device int*   ord_n  = order + (ulong)n * V;
+
+    float max_logit = kNeg;
+    for (uint v = 0u; v < V; ++v) {
+        float s = row[v] / P.temperature;
+        if (s > max_logit) max_logit = s;
+    }
+    float sum = 0.0f;
+    for (uint v = 0u; v < V; ++v) {
+        float s = row[v] / P.temperature;
+        float e = precise::exp(s - max_logit);
+        prob_n[v] = e;
+        sum += e;
+    }
+    float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+    for (uint v = 0u; v < V; ++v) {
+        prob_n[v] *= inv_sum;
+        work_n[v]  = prob_n[v];
+    }
+
+    for (uint r = 0u; r < V; ++r) {
+        float best = kNeg;
+        int   best_i = 0;
+        for (uint v = 0u; v < V; ++v) {
+            if (work_n[v] > best) { best = work_n[v]; best_i = int(v); }
+        }
+        ord_n[r] = best_i;
+        work_n[best_i] = kNeg;
+    }
+
+    int keep = int(V);
+    if (P.top_k > 0 && P.top_k < keep) keep = P.top_k;
+
+    if (P.top_p < 1.0f) {
+        float cum = 0.0f;
+        int nucleus = 0;
+        for (int r = 0; r < keep; ++r) {
+            cum += prob_n[ord_n[r]];
+            ++nucleus;
+            if (cum >= P.top_p) break;
+        }
+        if (nucleus < 1) nucleus = 1;
+        keep = nucleus;
+    }
+
+    float kept_sum = 0.0f;
+    for (int r = 0; r < keep; ++r) kept_sum += prob_n[ord_n[r]];
+
+    float u = philox_uniform(P.key, base + (ulong)n);
+    int chosen = ord_n[0];
+    if (kept_sum > 0.0f) {
+        float target = u * kept_sum;
+        float acc = 0.0f;
+        chosen = ord_n[keep - 1];
+        for (int r = 0; r < keep; ++r) {
+            acc += prob_n[ord_n[r]];
+            if (target < acc) { chosen = ord_n[r]; break; }
+        }
+    }
+    indices[n] = chosen;
+}
+
+kernel void k_advance_counter(device int* counter [[buffer(0)]],
+                              constant uint& N     [[buffer(1)]],
+                              uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    counter[0] = int((uint)counter[0] + N);
+}
 )msl";
 
 id<MTLComputePipelineState> pso_sample_logits() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_sample_logits"); });
+    return pso;
+}
+
+id<MTLComputePipelineState> pso_sample_logits_into() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once,
+                  ^{ pso = compile_pipeline(kSrc, @"k_sample_logits_into"); });
+    return pso;
+}
+
+id<MTLComputePipelineState> pso_advance_counter() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_advance_counter"); });
     return pso;
 }
 
@@ -274,6 +396,83 @@ void sample_logits(const Tensor& logits, float temperature, int top_k,
         [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(N), 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
         [enc endEncoding];
+        ::brotensor::metal_impl::submit(cmd);
+    }
+}
+
+// ─── sample_logits_into ──────────────────────────────────────────────────────
+void sample_logits_into(const Tensor& logits, float temperature, int top_k,
+                        float top_p, uint64_t key, Tensor& counter,
+                        Tensor& scratch, Tensor& indices) {
+    const char* op = "sample_logits_into";
+    if (logits.dtype != Dtype::FP32) fail(op, "logits must be FP32");
+    if (temperature < 0.0f) fail(op, "temperature must be >= 0");
+    if (top_k < 0)          fail(op, "top_k must be >= 0");
+    if (top_p < 0.0f)       fail(op, "top_p must be >= 0");
+
+    const int N = logits.rows;
+    const int V = logits.cols;
+    if (N > 0 && V == 0) fail(op, "vocabulary size (logits.cols) must be > 0");
+
+    if (counter.dtype != Dtype::INT32 ||
+        static_cast<size_t>(counter.rows) * counter.cols < 1) {
+        fail(op, "counter must be an INT32 tensor with >= 1 element");
+    }
+    const size_t nv = static_cast<size_t>(N) * static_cast<size_t>(V);
+    if (scratch.dtype != Dtype::FP32 ||
+        static_cast<size_t>(scratch.rows) * scratch.cols < 3 * nv) {
+        fail(op, "scratch must be FP32 with at least 3*N*V elements");
+    }
+    if (indices.rows != N || indices.cols != 1 || indices.dtype != Dtype::INT32) {
+        fail(op, "indices must be a pre-sized (N,1) INT32 tensor");
+    }
+    if (N == 0) return;
+
+    SampleParamsG p{};
+    p.key = key;
+    p.temperature = temperature;
+    p.top_k = top_k;
+    p.top_p = top_p;
+    p.N = static_cast<uint32_t>(N);
+    p.V = static_cast<uint32_t>(V);
+
+    @autoreleasepool {
+        // The caller's scratch buffer carries prob | sort-work | order, bound at
+        // 0 / nv / 2*nv floats (INT32 and FP32 are both 4 bytes).
+        id<MTLBuffer> scratchBuf = buffer_for(scratch);
+        const NSUInteger sbase = buffer_offset_for(scratch);
+
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso_sample_logits_into()];
+        [enc setBuffer:buffer_for(logits)
+                offset:buffer_offset_for(logits) atIndex:0];
+        [enc setBuffer:buffer_for(indices)
+                offset:buffer_offset_for(indices) atIndex:1];
+        [enc setBuffer:scratchBuf offset:sbase                          atIndex:2];
+        [enc setBuffer:scratchBuf offset:sbase + nv * sizeof(float)     atIndex:3];
+        [enc setBuffer:scratchBuf offset:sbase + 2 * nv * sizeof(float) atIndex:4];
+        [enc setBuffer:buffer_for(counter)
+                offset:buffer_offset_for(counter) atIndex:5];
+        [enc setBytes:&p length:sizeof(SampleParamsG) atIndex:6];
+        NSUInteger tpt = [pso_sample_logits_into() maxTotalThreadsPerThreadgroup];
+        if (tpt > 256) tpt = 256;
+        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(N), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+        [enc endEncoding];
+
+        // Greedy consumes no RNG; only advance the stream when sampling.
+        if (temperature != 0.0f) {
+            uint32_t nN = static_cast<uint32_t>(N);
+            id<MTLComputeCommandEncoder> aenc = [cmd computeCommandEncoder];
+            [aenc setComputePipelineState:pso_advance_counter()];
+            [aenc setBuffer:buffer_for(counter)
+                     offset:buffer_offset_for(counter) atIndex:0];
+            [aenc setBytes:&nN length:sizeof(uint32_t) atIndex:1];
+            [aenc dispatchThreads:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            [aenc endEncoding];
+        }
         ::brotensor::metal_impl::submit(cmd);
     }
 }

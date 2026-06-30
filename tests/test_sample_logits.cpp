@@ -267,6 +267,115 @@ static void test_error_paths() {
     EXPECT_TRUE(threw, "negative top_p throws");
 }
 
+// ─── sample_logits_into (graph-safe variant) ────────────────────────────────
+
+// Build a (1,1) INT32 counter tensor holding `base`.
+static Tensor counter_with(uint32_t base) {
+    Tensor c = Tensor::zeros_on(Device::CPU, 1, 1, Dtype::INT32);
+    static_cast<int32_t*>(c.host_raw_mut())[0] = static_cast<int32_t>(base);
+    return c;
+}
+static uint32_t counter_value(const Tensor& c) {
+    return static_cast<uint32_t>(static_cast<const int32_t*>(c.host_raw())[0]);
+}
+
+// sample_logits_into draws exactly what sample_logits draws at the same base
+// counter (row n uses substream base+n), and advances the counter by N.
+static void test_into_matches_sample_logits() {
+    const int N = 4, V = 8;
+    std::vector<float> flat;
+    const std::vector<float> row = {0.3f, 0.7f, 0.1f, 0.9f, 0.5f, 0.2f, 0.8f, 0.4f};
+    for (int r = 0; r < N; ++r) for (float v : row) flat.push_back(v);
+    Tensor logits = logits_from(N, V, flat);
+
+    const uint64_t key = 555;
+    const uint32_t base = 1000;
+
+    Tensor ref;   // reference via the host-counter op
+    brotensor::sample_logits(logits, 1.0f, 0, 1.0f, key, base, ref);
+
+    Tensor counter = counter_with(base);
+    Tensor scratch = Tensor::zeros_on(Device::CPU, 1, 3 * N * V, Dtype::FP32);
+    Tensor idx = Tensor::zeros_on(Device::CPU, N, 1, Dtype::INT32);
+    brotensor::sample_logits_into(logits, 1.0f, 0, 1.0f, key, counter, scratch, idx);
+
+    for (int r = 0; r < N; ++r)
+        EXPECT_EQ_INT(idx_at(idx, r), idx_at(ref, r), "into matches sample_logits");
+    EXPECT_EQ_INT(counter_value(counter), base + N, "into advances counter by N");
+}
+
+// Repeated calls continue the same Philox stream (counter threads through), so
+// two back-to-back single-row draws equal sample_logits at base and base+1.
+static void test_into_counter_threads() {
+    const int V = 8;
+    Tensor logits = logits_from(1, V,
+        {0.5f, 0.4f, 0.6f, 0.45f, 0.55f, 0.5f, 0.5f, 0.5f});
+    const uint64_t key = 777;
+    const uint32_t base = 10;
+
+    Tensor counter = counter_with(base);
+    Tensor scratch = Tensor::zeros_on(Device::CPU, 1, 3 * V, Dtype::FP32);
+    Tensor idx = Tensor::zeros_on(Device::CPU, 1, 1, Dtype::INT32);
+
+    brotensor::sample_logits_into(logits, 1.0f, 0, 1.0f, key, counter, scratch, idx);
+    const int draw0 = idx_at(idx, 0);
+    EXPECT_EQ_INT(counter_value(counter), base + 1, "after 1st draw counter=base+1");
+    brotensor::sample_logits_into(logits, 1.0f, 0, 1.0f, key, counter, scratch, idx);
+    const int draw1 = idx_at(idx, 0);
+    EXPECT_EQ_INT(counter_value(counter), base + 2, "after 2nd draw counter=base+2");
+
+    Tensor r0, r1;
+    brotensor::sample_logits(logits, 1.0f, 0, 1.0f, key, base,     r0);
+    brotensor::sample_logits(logits, 1.0f, 0, 1.0f, key, base + 1, r1);
+    EXPECT_EQ_INT(draw0, idx_at(r0, 0), "1st draw == sample_logits@base");
+    EXPECT_EQ_INT(draw1, idx_at(r1, 0), "2nd draw == sample_logits@base+1");
+}
+
+// Greedy (temperature == 0) is argmax and consumes no RNG (counter untouched).
+static void test_into_greedy() {
+    Tensor logits = logits_from(2, 5, {
+        0.1f, 2.5f, -1.0f, 0.3f, 1.2f,
+        4.0f, 4.0f, 1.0f, 0.0f, -2.0f,
+    });
+    Tensor counter = counter_with(42);
+    Tensor scratch = Tensor::zeros_on(Device::CPU, 1, 3 * 2 * 5, Dtype::FP32);
+    Tensor idx = Tensor::zeros_on(Device::CPU, 2, 1, Dtype::INT32);
+    brotensor::sample_logits_into(logits, 0.0f, 0, 1.0f, 0, counter, scratch, idx);
+    EXPECT_EQ_INT(idx_at(idx, 0), 1, "into greedy row0 argmax");
+    EXPECT_EQ_INT(idx_at(idx, 1), 0, "into greedy row1 tie -> lowest");
+    EXPECT_EQ_INT(counter_value(counter), 42, "into greedy leaves counter unchanged");
+}
+
+// Contract checks: bad counter / scratch / indices must throw.
+static void test_into_error_paths() {
+    Tensor logits = logits_from(1, 4, {1.0f, 2.0f, 3.0f, 4.0f});
+    Tensor counter = counter_with(0);
+    Tensor scratch = Tensor::zeros_on(Device::CPU, 1, 3 * 4, Dtype::FP32);
+    Tensor idx = Tensor::zeros_on(Device::CPU, 1, 1, Dtype::INT32);
+    bool threw;
+
+    threw = false;
+    try {
+        Tensor small = Tensor::zeros_on(Device::CPU, 1, 4, Dtype::FP32);
+        brotensor::sample_logits_into(logits, 1.0f, 0, 1.0f, 0, counter, small, idx);
+    } catch (const std::exception&) { threw = true; }
+    EXPECT_TRUE(threw, "into: undersized scratch throws");
+
+    threw = false;
+    try {
+        Tensor badidx = Tensor::zeros_on(Device::CPU, 2, 1, Dtype::INT32);
+        brotensor::sample_logits_into(logits, 1.0f, 0, 1.0f, 0, counter, scratch, badidx);
+    } catch (const std::exception&) { threw = true; }
+    EXPECT_TRUE(threw, "into: mis-sized indices throws");
+
+    threw = false;
+    try {
+        Tensor badctr = Tensor::zeros_on(Device::CPU, 1, 1, Dtype::FP32);
+        brotensor::sample_logits_into(logits, 1.0f, 0, 1.0f, 0, badctr, scratch, idx);
+    } catch (const std::exception&) { threw = true; }
+    EXPECT_TRUE(threw, "into: non-INT32 counter throws");
+}
+
 int main() {
     try {
         brotensor::init();
@@ -278,6 +387,10 @@ int main() {
         test_statistical_frequencies();
         test_row_substream_independence();
         test_error_paths();
+        test_into_matches_sample_logits();
+        test_into_counter_threads();
+        test_into_greedy();
+        test_into_error_paths();
 
         if (g_failures == 0) {
             std::printf("test_sample_logits: ALL PASS\n");

@@ -49,6 +49,37 @@ void sample_logits(const Tensor& logits, float temperature, int top_k,
                    Tensor& indices);
 
 
+// ─── Graph-capturable autoregressive sampler ───────────────────────────────
+//
+// Same draw as sample_logits (byte-identical for the same effective base
+// counter), but written so a whole autoregressive decode step can be recorded
+// into a CUDA graph and replayed with a single launch. Three changes make it
+// capture-safe:
+//
+//   counter — a device tensor (>= 1 element, INT32) holding the base counter as
+//             counter[0]. Row n draws from substream (counter[0] + n); the op
+//             then advances counter[0] += N entirely on-device. So a captured
+//             replay reads the value left by the previous step and advances it
+//             again — fresh draws every launch with NO host involvement (the
+//             host never reads or writes the counter). Mirrors the device-side
+//             Philox offset PyTorch uses for graph-safe RNG.
+//   scratch — caller-owned reusable workspace, FP32, with at least 3*N*V
+//             elements (carved into prob / sort-work / order). No per-call
+//             cudaMalloc/cudaFree — those are illegal during capture and force
+//             a device sync otherwise. Sized once and reused across steps.
+//   indices — (N,1) INT32, MUST be pre-sized by the caller; written in place,
+//             never resized (a resize would allocate mid-capture).
+//
+// temperature == 0 is the deterministic argmax (no RNG, counter untouched), so
+// the same buffer set works for a greedy step too. Validation mirrors
+// sample_logits; additionally throws if counter is not INT32 with >= 1 element,
+// if scratch has fewer than 3*N*V FP32 elements, or if indices is not a
+// pre-sized (N,1) INT32 on the logits' device. No backward.
+void sample_logits_into(const Tensor& logits, float temperature, int top_k,
+                        float top_p, uint64_t key, Tensor& counter,
+                        Tensor& scratch, Tensor& indices);
+
+
 // ─── Counter-based noise generation (Philox 4x32-10) ───────────────────────
 //
 // PyTorch/JAX-compatible Philox 4x32-10 stream. (key, counter) seeds the

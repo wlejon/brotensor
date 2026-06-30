@@ -222,4 +222,129 @@ void sample_logits(const ::brotensor::Tensor& logits, float temperature,
     }
 }
 
+// ─── sample_logits_into ─────────────────────────────────────────────────────
+//
+// Graph-capturable variant: the Philox base counter lives in a device tensor
+// (counter[0]) and is advanced by N on completion; scratch is caller-owned.
+// On CPU there is no graph capture, so this is the same per-row pipeline run
+// directly — its purpose here is to keep the op surface and the (key, counter)
+// draw byte-identical to the CUDA/Metal capture path. Draw for row n uses
+// substream (counter[0] + n), matching sample_logits with that base counter.
+
+void sample_logits_into(const ::brotensor::Tensor& logits, float temperature,
+                        int top_k, float top_p, uint64_t key,
+                        ::brotensor::Tensor& counter,
+                        ::brotensor::Tensor& scratch,
+                        ::brotensor::Tensor& indices) {
+    const char* op = "sample_logits_into";
+    if (logits.dtype != ::brotensor::Dtype::FP32) {
+        fail(op, "logits must be FP32 (CPU backend is FP32-only)");
+    }
+    if (temperature < 0.0f) fail(op, "temperature must be >= 0");
+    if (top_k < 0)          fail(op, "top_k must be >= 0");
+    if (top_p < 0.0f)       fail(op, "top_p must be >= 0");
+
+    const int N = logits.rows;
+    const int V = logits.cols;
+    if (N > 0 && V == 0) fail(op, "vocabulary size (logits.cols) must be > 0");
+
+    if (counter.dtype != ::brotensor::Dtype::INT32 ||
+        static_cast<std::size_t>(counter.rows) * counter.cols < 1) {
+        fail(op, "counter must be an INT32 tensor with >= 1 element");
+    }
+    const std::size_t nv = static_cast<std::size_t>(N) * V;
+    if (scratch.dtype != ::brotensor::Dtype::FP32 ||
+        static_cast<std::size_t>(scratch.rows) * scratch.cols < 3 * nv) {
+        fail(op, "scratch must be FP32 with at least 3*N*V elements");
+    }
+    // indices must be a pre-sized (N,1) INT32 — never resized here (a resize
+    // would allocate, which the CUDA path forbids mid-capture).
+    if (indices.rows != N || indices.cols != 1 ||
+        indices.dtype != ::brotensor::Dtype::INT32) {
+        fail(op, "indices must be a pre-sized (N,1) INT32 tensor");
+    }
+    if (N == 0) return;
+
+    int32_t* cp = static_cast<int32_t*>(counter.host_raw_mut());
+    const uint64_t base =
+        static_cast<uint64_t>(static_cast<uint32_t>(cp[0]));
+
+    const float* lp = logits.host_f32();
+    int32_t* ip = static_cast<int32_t*>(indices.host_raw_mut());
+
+    std::vector<float> prob(static_cast<std::size_t>(V));
+    std::vector<int>   order(static_cast<std::size_t>(V));
+
+    for (int n = 0; n < N; ++n) {
+        const float* row = lp + static_cast<std::size_t>(n) * V;
+
+        if (temperature == 0.0f) {
+            float best_v = -3.4028235e38f;
+            int   best_i = 0;
+            for (int v = 0; v < V; ++v) {
+                if (row[v] > best_v) { best_v = row[v]; best_i = v; }
+            }
+            ip[n] = static_cast<int32_t>(best_i);
+            continue;
+        }
+
+        float max_logit = -3.4028235e38f;
+        for (int v = 0; v < V; ++v) {
+            const float s = row[v] / temperature;
+            if (s > max_logit) max_logit = s;
+        }
+        double sum = 0.0;
+        for (int v = 0; v < V; ++v) {
+            const float s = row[v] / temperature;
+            const float e = std::exp(s - max_logit);
+            prob[v] = e;
+            sum += e;
+        }
+        const float inv_sum = (sum > 0.0) ? static_cast<float>(1.0 / sum) : 0.0f;
+        for (int v = 0; v < V; ++v) prob[v] *= inv_sum;
+
+        for (int v = 0; v < V; ++v) order[v] = v;
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int a, int b) { return prob[a] > prob[b]; });
+
+        int keep = V;
+        if (top_k > 0 && top_k < keep) keep = top_k;
+
+        if (top_p < 1.0f) {
+            double cum = 0.0;
+            int nucleus = 0;
+            for (int r = 0; r < keep; ++r) {
+                cum += prob[order[r]];
+                ++nucleus;
+                if (cum >= static_cast<double>(top_p)) break;
+            }
+            if (nucleus < 1) nucleus = 1;
+            keep = nucleus;
+        }
+
+        double kept_sum = 0.0;
+        for (int r = 0; r < keep; ++r) kept_sum += prob[order[r]];
+
+        const float u = philox_uniform(key, base + static_cast<uint64_t>(n));
+        int chosen = order[0];
+        if (kept_sum > 0.0) {
+            const double target = static_cast<double>(u) * kept_sum;
+            double acc = 0.0;
+            chosen = order[keep - 1];
+            for (int r = 0; r < keep; ++r) {
+                acc += prob[order[r]];
+                if (target < acc) { chosen = order[r]; break; }
+            }
+        }
+        ip[n] = static_cast<int32_t>(chosen);
+    }
+
+    // Advance the base counter by the rows drawn (matches the device path so a
+    // repeated call continues the same Philox stream). Greedy consumes no RNG,
+    // so its counter is left untouched — mirroring the CUDA/Metal path.
+    if (temperature != 0.0f)
+        cp[0] = static_cast<int32_t>(
+            static_cast<uint32_t>(base + static_cast<uint64_t>(N)));
+}
+
 } // namespace brotensor::detail::cpu
