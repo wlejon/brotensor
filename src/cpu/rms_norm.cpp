@@ -17,9 +17,12 @@
 // caller is responsible for zeroing dGamma beforehand.
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
+#include <vector>
 
 namespace brotensor::detail::cpu {
 
@@ -39,7 +42,10 @@ void rms_norm_forward(const ::brotensor::Tensor& X,
     const float* Xp = X.host_f32();
     const float* gp = gamma.host_f32();
     float* Yp = Y.host_f32_mut();
-    for (int b = 0; b < B; ++b) {
+    // Each row b owns Y's row b exclusively (X/gamma are read-only shared
+    // inputs), so this parallelizes across b with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(B), [&](std::size_t bi) {
+        const int b = static_cast<int>(bi);
         const float* xrow = Xp + static_cast<size_t>(b) * D;
         float*       yrow = Yp + static_cast<size_t>(b) * D;
         float sum = 0.0f;
@@ -51,7 +57,7 @@ void rms_norm_forward(const ::brotensor::Tensor& X,
         for (int j = 0; j < D; ++j) {
             yrow[j] = xrow[j] * gp[j] * rrms;
         }
-    }
+    });
 }
 
 void rms_norm_backward(const ::brotensor::Tensor& X,
@@ -78,7 +84,18 @@ void rms_norm_backward(const ::brotensor::Tensor& X,
     float* dXp = dX.host_f32_mut();
     float* dGp = dGamma.host_f32_mut();
     const float inv_D = 1.0f / static_cast<float>(D);
-    for (int b = 0; b < B; ++b) {
+
+    // dGamma accumulates dGp[j] += ... summed over every row b — a shared
+    // reduction across the batch axis, not disjoint per b. So the dX pass
+    // (fully owned by row b) is parallelized, while rrms per row is cached
+    // (one float per b, disjoint write) so the dGamma pass below can reuse
+    // it without re-deriving it or touching any shared state during the
+    // parallel section. dGamma itself is accumulated in a separate,
+    // single-threaded pass afterwards.
+    std::vector<float> rrms_cache(static_cast<std::size_t>(B));
+
+    parallel_for(static_cast<std::size_t>(B), [&](std::size_t bi) {
+        const int b = static_cast<int>(bi);
         const float* xrow  = Xp  + static_cast<size_t>(b) * D;
         const float* dyrow = dYp + static_cast<size_t>(b) * D;
         float*       dxrow = dXp + static_cast<size_t>(b) * D;
@@ -89,6 +106,7 @@ void rms_norm_backward(const ::brotensor::Tensor& X,
             sum_xx += v * v;
         }
         const float rrms = 1.0f / std::sqrt(sum_xx * inv_D + eps);
+        rrms_cache[b] = rrms;   // disjoint per-b write
 
         float sum_xdy = 0.0f;
         for (int j = 0; j < D; ++j) {
@@ -101,7 +119,17 @@ void rms_norm_backward(const ::brotensor::Tensor& X,
             const float dy = dyrow[j];
             const float x  = xrow[j];
             dxrow[j] = rrms * (g * dy - x * coeff);   // overwrite dX
-            dGp[j]  += dy * x * rrms;                 // accumulate dGamma
+        }
+    });
+
+    // Single-threaded: dGamma reduces across b, so it cannot be split across
+    // threads without a race on dGp[j].
+    for (int b = 0; b < B; ++b) {
+        const float* xrow  = Xp  + static_cast<size_t>(b) * D;
+        const float* dyrow = dYp + static_cast<size_t>(b) * D;
+        const float rrms = rrms_cache[b];
+        for (int j = 0; j < D; ++j) {
+            dGp[j] += dyrow[j] * xrow[j] * rrms;   // accumulate dGamma
         }
     }
 }

@@ -33,8 +33,10 @@
 // backward dX use the *biased* var (= 1/M sum (x-mean)^2) — same as PyTorch.
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -113,7 +115,12 @@ void batch_norm_forward(const ::brotensor::Tensor& X,
                                    static_cast<float>(M - 1)
                                  : 1.0f;
 
-    for (int c = 0; c < C; ++c) {
+    // Each channel c owns rmp[c]/rvp[c]/smp[c]/srp[c] and Y's per-channel
+    // slice exclusively (X/gamma/beta are read-only shared, and no other c
+    // touches these locations), so this parallelizes across c with no
+    // cross-thread writes.
+    parallel_for(static_cast<std::size_t>(C), [&](std::size_t ci) {
+        const int c = static_cast<int>(ci);
         // Pass 1: sum + sum-of-squares for this channel across (N, H, W).
         float sum = 0.0f, sumsq = 0.0f;
         for (int n = 0; n < N; ++n) {
@@ -147,7 +154,7 @@ void batch_norm_forward(const ::brotensor::Tensor& X,
                 y_chan[s] = (x_chan[s] - mean) * rstd * gv + bv;
             }
         }
-    }
+    });
 }
 
 void batch_norm_inference(const ::brotensor::Tensor& X,
@@ -185,7 +192,10 @@ void batch_norm_inference(const ::brotensor::Tensor& X,
     // Precompute per-channel affine y = x * a_c + b_c.
     // (x - mu) / sqrt(var + eps) * gamma + beta
     //   = x * (gamma / sqrt(var+eps)) + (beta - mu * gamma / sqrt(var+eps))
-    for (int c = 0; c < C; ++c) {
+    // Each channel c owns Y's per-channel slice exclusively, so this
+    // parallelizes across c with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(C), [&](std::size_t ci) {
+        const int c = static_cast<int>(ci);
         const float inv = 1.0f / std::sqrt(rvp[c] + eps);
         const float a = gp[c] * inv;
         const float b = bp[c] - rmp[c] * a;
@@ -196,7 +206,7 @@ void batch_norm_inference(const ::brotensor::Tensor& X,
                 y_chan[s] = x_chan[s] * a + b;
             }
         }
-    }
+    });
 }
 
 void batch_norm_backward(const ::brotensor::Tensor& X,
@@ -248,10 +258,6 @@ void batch_norm_backward(const ::brotensor::Tensor& X,
     const int M = N * spatial;
     const float inv_M = 1.0f / static_cast<float>(M);
 
-    // Scratch buffer for x̂, cached during the first pass and reused in the
-    // dX pass so it doesn't need to be recomputed from X a second time.
-    std::vector<float> xhat_buf(static_cast<std::size_t>(M));
-
     // Per-channel: derive dGamma, dBeta, and the two reduction sums used
     // by the dX formula. Then a second pass over (N, H, W) writes dX.
     //
@@ -260,7 +266,20 @@ void batch_norm_backward(const ::brotensor::Tensor& X,
     //   dGamma_c += sum (dY * xhat)
     //   dBeta_c  += sum dY
     //   dX = rstd * (dxhat - (sum dxhat + xhat * sum(dxhat*xhat)) / M)
-    for (int c = 0; c < C; ++c) {
+    //
+    // The outer axis here is already C (channel), and — unlike GroupNorm's
+    // batch axis — each channel c owns dGp[c]/dBp[c] and dX's per-channel
+    // slice exclusively: no other c ever touches these locations, so the
+    // per-channel reduction over (N, H, W) is entirely local to this c's
+    // work and safe to run concurrently with other c's. The one thing that
+    // must change to parallelize: xhat_buf was a single buffer shared and
+    // reused across every c in the original serial loop, so it's now
+    // declared LOCAL to the lambda (one per c) instead — safe even across
+    // threads since each invocation gets its own buffer.
+    parallel_for(static_cast<std::size_t>(C), [&](std::size_t ci) {
+        const int c = static_cast<int>(ci);
+        std::vector<float> xhat_buf(static_cast<std::size_t>(M));
+
         const float mean = mp[c];
         const float rstd = rp[c];
         const float gv   = gp[c];
@@ -297,7 +316,7 @@ void batch_norm_backward(const ::brotensor::Tensor& X,
                 dx_chan[s] = rstd * (dxh - (sum1 + xh * sum2) * inv_M);
             }
         }
-    }
+    });
 }
 
 } // namespace brotensor::detail::cpu

@@ -13,6 +13,7 @@
 //       from `mask` itself (see src/ops.cpp::build_causal_mask_row).
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <cmath>
 #include <cstddef>
@@ -38,7 +39,10 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
     float* yp = Y_RD.host_f32_mut();
 
     const float invD = 1.0f / static_cast<float>(D);
-    for (int row = 0; row < R; ++row) {
+    // Each row owns Y's row exclusively (gamma/beta are read-only shared),
+    // so this parallelizes across rows with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(R), [&](std::size_t rowi) {
+        const int row = static_cast<int>(rowi);
         const float* xr = xp + static_cast<std::size_t>(row) * D;
         float* yr = yp + static_cast<std::size_t>(row) * D;
 
@@ -56,7 +60,7 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
             const float xh = (xr[i] - mean) * rstd;
             yr[i] = gp[i] * xh + bp[i];
         }
-    }
+    });
 }
 
 void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
@@ -96,7 +100,10 @@ void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
     float* sp = Rstd_R.host_f32_mut();
 
     const float invD = 1.0f / static_cast<float>(D);
-    for (int row = 0; row < R; ++row) {
+    // Each row owns its own slice of Y/Xhat/Mean/Rstd exclusively, so this
+    // parallelizes across rows with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(R), [&](std::size_t rowi) {
+        const int row = static_cast<int>(rowi);
         const float* xr = xp + static_cast<std::size_t>(row) * D;
         float* yr = yp + static_cast<std::size_t>(row) * D;
         float* hr = hp + static_cast<std::size_t>(row) * D;
@@ -119,7 +126,7 @@ void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
             hr[i] = xh;
             yr[i] = gp[i] * xh + bp[i];
         }
-    }
+    });
 }
 
 void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
@@ -146,7 +153,14 @@ void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
     float* dbp = dBeta.host_f32_mut();
 
     const float nf = static_cast<float>(D);
-    for (int row = 0; row < R; ++row) {
+
+    // dGamma/dBeta accumulate dgp[i]/dbp[i] summed over every row — a shared
+    // reduction across the row axis, not disjoint per row. So only the dX
+    // pass (fully owned by its own row) is parallelized here; dGamma/dBeta
+    // are accumulated afterwards in a separate, single-threaded pass (cheap:
+    // dyr/hr are already materialized, no recomputation needed).
+    parallel_for(static_cast<std::size_t>(R), [&](std::size_t rowi) {
+        const int row = static_cast<int>(rowi);
         const float* dyr = dyp + static_cast<std::size_t>(row) * D;
         const float* hr  = hp  + static_cast<std::size_t>(row) * D;
         float* dxr = dxp + static_cast<std::size_t>(row) * D;
@@ -155,10 +169,7 @@ void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
         float sum_dxh = 0.0f;
         float sum_dxh_xhat = 0.0f;
         for (int i = 0; i < D; ++i) {
-            const float g = dyr[i];
-            dgp[i] += g * hr[i];
-            dbp[i] += g;
-            const float dxh = g * gp[i];
+            const float dxh = dyr[i] * gp[i];
             sum_dxh += dxh;
             sum_dxh_xhat += dxh * hr[i];
         }
@@ -166,6 +177,18 @@ void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
         for (int i = 0; i < D; ++i) {
             const float dxh = dyr[i] * gp[i];
             dxr[i] = scale * (nf * dxh - sum_dxh - hr[i] * sum_dxh_xhat);
+        }
+    });
+
+    // Single-threaded: dGamma/dBeta reduce across rows, so they cannot be
+    // split across threads without a race on dgp[i]/dbp[i].
+    for (int row = 0; row < R; ++row) {
+        const float* dyr = dyp + static_cast<std::size_t>(row) * D;
+        const float* hr  = hp  + static_cast<std::size_t>(row) * D;
+        for (int i = 0; i < D; ++i) {
+            const float g = dyr[i];
+            dgp[i] += g * hr[i];
+            dbp[i] += g;
         }
     }
 }

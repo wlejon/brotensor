@@ -29,8 +29,10 @@
 // accumulator would diverge from the GPU and break parity.
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
 #include <vector>
 
@@ -69,7 +71,11 @@ void group_norm_forward(const ::brotensor::Tensor& X,
     const int sample_stride = C * spatial;
     const float inv_M = 1.0f / static_cast<float>(tile_size);
 
-    for (int n = 0; n < N; ++n) {
+    // Each sample n owns its own slice of Y exclusively (X/gamma/beta are
+    // read-only shared), so this parallelizes across n with no cross-thread
+    // writes.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ni) {
+        const int n = static_cast<int>(ni);
         for (int g = 0; g < num_groups; ++g) {
             const int chan_base = g * channels_per_group;
             const float* x_tile = Xp + n * sample_stride + chan_base * spatial;
@@ -92,7 +98,7 @@ void group_norm_forward(const ::brotensor::Tensor& X,
                 y_tile[i] = yn * gp[channel] + bp[channel];   // overwrite
             }
         }
-    }
+    });
 }
 
 void group_norm_backward(const ::brotensor::Tensor& X,
@@ -142,11 +148,32 @@ void group_norm_backward(const ::brotensor::Tensor& X,
     const int sample_stride = C * spatial;
     const float inv_M = 1.0f / static_cast<float>(tile_size);
 
-    // Scratch buffer for x̂, cached during pass 2 and reused in pass 3 so the
-    // tile's data doesn't need to be re-read/recomputed a third time.
-    std::vector<float> xhat_buf(static_cast<std::size_t>(tile_size));
+    // dGamma_c / dBeta_c accumulate over EVERY n (a fixed channel appears in
+    // exactly one group but in all N samples' tiles), so a naive
+    // parallel-for over n would race on dGp[channel]/dBp[channel] — that's a
+    // shared reduction across the batch axis, not disjoint per n.
+    //
+    // Fix: each n instead writes its per-channel partial dg/db into row n of
+    // a (N, C) scratch buffer (disjoint per n — every channel is touched by
+    // exactly one group/local_c per n, so each element of the row is
+    // written exactly once, no init needed). A final single-threaded pass
+    // sums those partials down into dGp/dBp. Pass 1/2/3 (stats, partial
+    // dg/db + x̂ caching, dX write) are otherwise fully independent per n and
+    // run inside the parallel_for; x̂'s scratch buffer is declared LOCAL to
+    // the lambda (one per n, sized tile_size) instead of shared across n, so
+    // concurrent n's never touch the same buffer.
+    std::vector<float> dg_partial(static_cast<std::size_t>(N) * C);
+    std::vector<float> db_partial(static_cast<std::size_t>(N) * C);
 
-    for (int n = 0; n < N; ++n) {
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ni) {
+        const int n = static_cast<int>(ni);
+        float* dg_row = dg_partial.data() + static_cast<std::size_t>(n) * C;
+        float* db_row = db_partial.data() + static_cast<std::size_t>(n) * C;
+        // Local per-n scratch for x̂ — safe even though this lambda runs on
+        // different threads, since each invocation gets its own stack/heap-
+        // local buffer.
+        std::vector<float> xhat_buf(static_cast<std::size_t>(tile_size));
+
         for (int g = 0; g < num_groups; ++g) {
             const int chan_base = g * channels_per_group;
             const float* x_tile  = Xp  + n * sample_stride + chan_base * spatial;
@@ -164,10 +191,11 @@ void group_norm_backward(const ::brotensor::Tensor& X,
             const float var  = sumsq * inv_M - mean * mean;
             const float rstd = 1.0f / std::sqrt(var + eps);
 
-            // Pass 2: sum1 = Σ dx̂, sum2 = Σ dx̂·x̂; accumulate dGamma/dBeta;
-            // cache x̂ into xhat_buf for reuse in pass 3. Nested
-            // (channel, spatial) loops keep local_c/channel loop-invariant
-            // per channel instead of deriving it via division per element.
+            // Pass 2: sum1 = Σ dx̂, sum2 = Σ dx̂·x̂; stash this n's per-channel
+            // dg/db into the partial buffers; cache x̂ into xhat_buf for
+            // reuse in pass 3. Nested (channel, spatial) loops keep
+            // local_c/channel loop-invariant per channel instead of
+            // deriving it via division per element.
             float sum1 = 0.0f, sum2 = 0.0f;
             for (int local_c = 0; local_c < channels_per_group; ++local_c) {
                 const int channel = chan_base + local_c;
@@ -185,8 +213,8 @@ void group_norm_backward(const ::brotensor::Tensor& X,
                     dg += dyv * xh;
                     db += dyv;
                 }
-                dGp[channel] += dg;   // accumulate
-                dBp[channel] += db;   // accumulate
+                dg_row[channel] = dg;   // disjoint per-n write
+                db_row[channel] = db;   // disjoint per-n write
             }
 
             // Pass 3: dX = rstd * (dx̂ - (sum1 + x̂*sum2) / M).
@@ -203,6 +231,17 @@ void group_norm_backward(const ::brotensor::Tensor& X,
                 }
             }
         }
+    });
+
+    // Single-threaded: sum the per-n partials down into dGamma/dBeta.
+    for (int c = 0; c < C; ++c) {
+        float dg = 0.0f, db = 0.0f;
+        for (int n = 0; n < N; ++n) {
+            dg += dg_partial[static_cast<std::size_t>(n) * C + c];
+            db += db_partial[static_cast<std::size_t>(n) * C + c];
+        }
+        dGp[c] += dg;   // accumulate
+        dBp[c] += db;   // accumulate
     }
 }
 
