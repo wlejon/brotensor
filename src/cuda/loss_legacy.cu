@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -33,9 +34,21 @@ namespace brotensor::detail::cuda {
 
 using ::brotensor::Tensor;
 
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair — used below for the per-call
+// scalar-loss scratch instead of raw cudaMalloc/cudaFree.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
+
 namespace {
 
-constexpr int LOSS_LEGACY_BLOCK = 256;
+// softmax_xent_segment_kernel (below) reduces over a SINGLE flat segment —
+// one shared reduction domain — so it always launches exactly one block
+// regardless of n. A vocab-sized n still only occupies one SM no matter the
+// block size, but 1024 threads (vs. 256) still cuts the per-thread
+// grid-stride factor 4x.
+constexpr int LOSS_LEGACY_BLOCK = 1024;
 
 [[noreturn]] inline void fail(const char* op, const std::string& reason) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + reason);
@@ -116,8 +129,11 @@ float run_softmax_xent_segment(const float* d_logits, const float* d_target,
                                const float* d_mask) {
     if (n <= 0) return 0.0f;
 
-    float* d_loss = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(&d_loss, sizeof(float)));
+    // Pooled/stream-ordered scratch alloc — the cudaStreamSynchronize below
+    // stays: this helper returns a host float per its signature (and its
+    // callers, softmax_xent_segment/softmax_xent, do too), so the loss value
+    // must be physically on the host before we can return it.
+    float* d_loss = static_cast<float*>(cuda_alloc(sizeof(float)));
     softmax_xent_segment_kernel<<<1, LOSS_LEGACY_BLOCK, 0, cur_stream()>>>(
         d_logits, d_target, d_mask, d_probs, d_dLogits, d_loss, n);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -126,7 +142,7 @@ float run_softmax_xent_segment(const float* d_logits, const float* d_target,
     BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(&h_loss, d_loss, sizeof(float),
                                     cudaMemcpyDeviceToHost, cur_stream()));
     BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
-    cudaFree(d_loss);
+    cuda_free(d_loss);
     return h_loss;
 }
 

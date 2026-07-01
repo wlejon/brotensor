@@ -1,16 +1,22 @@
 // ─── CUDA convex (mask-based) upsample, NCHW ────────────────────────────────
 //
-// CUDA port of src/cpu/convex_upsample.cpp. One thread per OUTPUT element
-// (n, c, oy, ox); each thread derives its source low-res pixel (y, x) and
-// sub-position (sy, sx), softmaxes the 9 mask logits for that (sy, sx, y, x),
-// and blends the 3×3 low-res neighborhood of channel c:
+// CUDA port of src/cpu/convex_upsample.cpp. One block per OUTPUT spatial
+// location (n, oy, ox), looping internally over channel c; the block derives
+// the source low-res pixel (y, x) and sub-position (sy, sx), softmaxes the 9
+// mask logits for that (sy, sx, y, x) once, and blends the 3×3 low-res
+// neighborhood of every channel c:
 //   Y[n,c,k*y+sy,k*x+sx] = sum_m softmax_m(Mask[n,m,sy,sx,y,x]) * X[n,c,ny,nx]
 //   neighbor m: ny=clamp(y-1+m/3), nx=clamp(x-1+m%3)  (replicate pad)
 // Mask flat channel = (m*k*k + sy*k + sx). Softmax in double (matches CPU).
 //
-// The softmax is recomputed per output channel (redundant across C) for kernel
-// simplicity — fine at the C/scale this targets. CPU is FP32-only; CUDA adds
-// FP16/BF16 (cast at load/store). Y OVERWRITTEN. Inference-only: no backward.
+// The 9-way softmax depends only on (n, sy, sx, y, x) — not on channel c — so
+// it is computed ONCE per spatial location by thread 0 of the owning block and
+// cached in shared memory; all C channel-threads for that spatial location
+// then read the cached weights instead of redoing the FP64 softmax. Each block
+// owns a grid-strided set of spatial locations (never split across blocks) so
+// the __shared__ cache is always valid for every thread that reads it. CPU is
+// FP32-only; CUDA adds FP16/BF16 (cast at load/store). Y OVERWRITTEN.
+// Inference-only: no backward.
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
@@ -66,6 +72,10 @@ template <> __device__ inline void cu_store<float>(float* p, float v) { *p = v; 
 template <> __device__ inline void cu_store<__half>(__half* p, float v) { *p = __float2half(v); }
 template <> __device__ inline void cu_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
+// One block handles a grid-strided set of spatial locations (n, oy, ox); all
+// C channels for the CURRENT spatial location are processed by that same
+// block before it moves to the next one, so the shared-memory softmax cache
+// is always populated by a thread in the same block that reads it.
 template <typename T>
 __global__ void convex_upsample_kernel(const T* __restrict__ X,
                                        const T* __restrict__ Mask,
@@ -75,15 +85,15 @@ __global__ void convex_upsample_kernel(const T* __restrict__ X,
     const int kk = scale * scale;
     const int oH = scale * H, oW = scale * W;
     const long long oHW = (long long)oH * oW;
-    const long long total = (long long)N * C * oHW;
-    for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         idx < total; idx += (long long)blockDim.x * gridDim.x) {
-        const int ox = static_cast<int>(idx % oW);
-        long long t = idx / oW;
+    const long long spatial_total = (long long)N * oHW;
+
+    __shared__ double w[9];
+
+    for (long long sidx = blockIdx.x; sidx < spatial_total; sidx += gridDim.x) {
+        const int ox = static_cast<int>(sidx % oW);
+        long long t = sidx / oW;
         const int oy = static_cast<int>(t % oH);
-        t /= oH;
-        const int c = static_cast<int>(t % C);
-        const int n = static_cast<int>(t / C);
+        const int n = static_cast<int>(t / oH);
 
         const int y = oy / scale, sy = oy % scale;
         const int x = ox / scale, sx = ox % scale;
@@ -91,26 +101,37 @@ __global__ void convex_upsample_kernel(const T* __restrict__ X,
         const int pix = y * W + x;
         const T* m_img = Mask + (long long)n * 9 * kk * HW;
 
-        double mx = -1e300;
-        for (int m = 0; m < 9; ++m) {
-            const double v = cu_load<T>(&m_img[((long long)m * kk + sub) * HW + pix]);
-            if (v > mx) mx = v;
+        // Softmax over the 9 mask logits depends only on (n, sy, sx, y, x) —
+        // computed once by thread 0, cached in shared memory for all C
+        // channel-threads of this block.
+        if (threadIdx.x == 0) {
+            double mx = -1e300;
+            for (int m = 0; m < 9; ++m) {
+                const double v = cu_load<T>(&m_img[((long long)m * kk + sub) * HW + pix]);
+                if (v > mx) mx = v;
+            }
+            double sum = 0.0;
+            for (int m = 0; m < 9; ++m) {
+                const double e = exp(cu_load<T>(&m_img[((long long)m * kk + sub) * HW + pix]) - mx);
+                w[m] = e; sum += e;
+            }
+            const double invs = 1.0 / sum;
+            for (int m = 0; m < 9; ++m) w[m] *= invs;
         }
-        double w[9]; double sum = 0.0;
-        for (int m = 0; m < 9; ++m) {
-            const double e = exp(cu_load<T>(&m_img[((long long)m * kk + sub) * HW + pix]) - mx);
-            w[m] = e; sum += e;
-        }
-        const double invs = 1.0 / sum;
+        __syncthreads();
 
-        const T* xc = X + ((long long)n * C + c) * HW;
-        double acc = 0.0;
-        for (int m = 0; m < 9; ++m) {
-            const int ny = clampi(y - 1 + m / 3, 0, H - 1);
-            const int nx = clampi(x - 1 + m % 3, 0, W - 1);
-            acc += (w[m] * invs) * cu_load<T>(&xc[(long long)ny * W + nx]);
+        for (int c = threadIdx.x; c < C; c += blockDim.x) {
+            const T* xc = X + ((long long)n * C + c) * HW;
+            double acc = 0.0;
+            for (int m = 0; m < 9; ++m) {
+                const int ny = clampi(y - 1 + m / 3, 0, H - 1);
+                const int nx = clampi(x - 1 + m % 3, 0, W - 1);
+                acc += w[m] * cu_load<T>(&xc[(long long)ny * W + nx]);
+            }
+            const long long oidx = ((long long)n * C + c) * oHW + (long long)oy * oW + ox;
+            cu_store<T>(&Y[oidx], static_cast<float>(acc));
         }
-        cu_store<T>(&Y[idx], static_cast<float>(acc));
+        __syncthreads();   // guard w[] before the next sidx iteration overwrites it
     }
 }
 
@@ -137,17 +158,19 @@ void convex_upsample_forward(const ::brotensor::Tensor& X,
         Y.resize(N, static_cast<int>(C * oHW), X.dtype);
     if (N == 0) return;
 
-    const long long total = (long long)N * C * oHW;
+    // Grid is sized over spatial locations (n, oy, ox) — the softmax is cached
+    // once per block per location and shared across all C channel-threads.
+    const long long spatial_total = (long long)N * oHW;
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        convex_upsample_kernel<__half><<<cu_grid(total), CU_BLOCK, 0, cur_stream()>>>(
+        convex_upsample_kernel<__half><<<cu_grid(spatial_total), CU_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), static_cast<const __half*>(Mask.data),
             static_cast<__half*>(Y.data), N, C, H, W, scale);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        convex_upsample_kernel<__nv_bfloat16><<<cu_grid(total), CU_BLOCK, 0, cur_stream()>>>(
+        convex_upsample_kernel<__nv_bfloat16><<<cu_grid(spatial_total), CU_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), static_cast<const __nv_bfloat16*>(Mask.data),
             static_cast<__nv_bfloat16*>(Y.data), N, C, H, W, scale);
     } else {
-        convex_upsample_kernel<float><<<cu_grid(total), CU_BLOCK, 0, cur_stream()>>>(
+        convex_upsample_kernel<float><<<cu_grid(spatial_total), CU_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), static_cast<const float*>(Mask.data),
             static_cast<float*>(Y.data), N, C, H, W, scale);
     }

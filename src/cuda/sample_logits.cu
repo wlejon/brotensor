@@ -4,12 +4,17 @@
 // autoregressive generation loops (brosoundml codec-LM decoding and the brolm
 // language-model project).
 //
-// One thread per row of the (N, V) logit matrix. Each thread runs the full
-// per-row pipeline serially:
-//   temperature scale -> softmax -> descending-probability sort -> top-k filter
-//   -> top-p (nucleus) filter -> renormalise over the kept set -> inverse-CDF
-//   draw with a Philox-generated uniform. temperature == 0 short-circuits to a
-//   deterministic argmax (no RNG consumed).
+// One thread BLOCK per row of the (N, V) logit matrix (see sample_logits_row()
+// below) — the block cooperates over the vocab: parallel softmax (block max +
+// sum), then a partial selection that extracts the kept set in descending-
+// probability order, stopping as soon as top_k / top_p is satisfied (cost
+// O(keep * V / threads), not the O(V^2) a single serial thread would pay for a
+// full per-row sort). Both public entry points, sample_logits() and
+// sample_logits_into(), share this exact kernel body — they differ only in how
+// the Philox base counter arrives (a plain 64-bit value here vs. a device-
+// resident 32-bit counter for sample_logits_into's graph-capture path) and how
+// scratch is sourced (per-call pooled allocation here vs. caller-owned
+// scratch there).
 //
 // ── INT32 output ────────────────────────────────────────────────────────────
 //   indices — (N, 1) INT32 sampled token ids. Resized AND dtype-set to INT32.
@@ -28,7 +33,10 @@
 // ── Scratch ─────────────────────────────────────────────────────────────────
 //   The per-row probability vector and its sorted index order do not fit in a
 //   register file for arbitrary V, so two N*V FP32 buffers (prob + sort work)
-//   and one N*V INT32 buffer (order) are cudaMalloc'd per call.
+//   and one N*V INT32 buffer (order) are needed. sample_logits() draws this
+//   from the pooled (cudaMallocAsync-backed) allocator per call; sample_logits_
+//   into() takes it as caller-owned scratch (no per-call allocation, illegal
+//   during graph capture).
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
@@ -36,6 +44,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -44,19 +53,17 @@ namespace brotensor { void* cuda_current_stream(); }
 
 namespace brotensor::detail::cuda {
 
-namespace {
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair -- sample_logits() uses this for its
+// per-call scratch instead of raw cudaMalloc/cudaFree.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
-constexpr int SL_BLOCK = 128;
+namespace {
 
 inline cudaStream_t cur_stream() {
     return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
-}
-
-inline int sl_grid(long long n) {
-    long long blocks = (n + SL_BLOCK - 1) / SL_BLOCK;
-    if (blocks < 1) blocks = 1;
-    if (blocks > 65535) blocks = 65535;
-    return static_cast<int>(blocks);
 }
 
 [[noreturn]] inline void fail(const char* op, const std::string& reason) {
@@ -112,141 +119,36 @@ __device__ inline float philox_uniform(uint64_t key64, uint64_t substream) {
 
 constexpr float kNeg = -3.4028235e38f;   // -FLT_MAX
 
-// One thread per row of the (N, V) logit matrix.
-__global__ void sample_logits_kernel(const float* __restrict__ logits,
-                                     int* __restrict__ indices,
-                                     float* __restrict__ prob,
-                                     float* __restrict__ work,
-                                     int* __restrict__ order,
-                                     int N, int V, float temperature,
-                                     int top_k, float top_p,
-                                     uint64_t key, uint64_t counter) {
-    for (long long n = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         n < N; n += (long long)blockDim.x * gridDim.x) {
-        const float* row = logits + n * V;
-
-        // ── Greedy: temperature == 0 -> deterministic argmax, no RNG. ──
-        if (temperature == 0.0f) {
-            float best_v = kNeg;
-            int   best_i = 0;
-            for (int v = 0; v < V; ++v) {
-                if (row[v] > best_v) { best_v = row[v]; best_i = v; }
-            }
-            indices[n] = best_i;
-            continue;
-        }
-
-        float* prob_n = prob + n * V;
-        float* work_n = work + n * V;
-        int*   ord_n  = order + n * V;
-
-        // ── 1. temperature scale + 2. softmax (numerically stable). ──
-        float max_logit = kNeg;
-        for (int v = 0; v < V; ++v) {
-            const float s = row[v] / temperature;
-            if (s > max_logit) max_logit = s;
-        }
-        double sum = 0.0;
-        for (int v = 0; v < V; ++v) {
-            const float s = row[v] / temperature;
-            const float e = expf(s - max_logit);
-            prob_n[v] = e;
-            sum += e;
-        }
-        const float inv_sum = (sum > 0.0) ? static_cast<float>(1.0 / sum)
-                                          : 0.0f;
-        for (int v = 0; v < V; ++v) {
-            prob_n[v] *= inv_sum;
-            work_n[v]  = prob_n[v];     // sort scratch
-        }
-
-        // Descending-probability order; ties broken by lower index. Selection
-        // sort scanning ascending with strict `>` reproduces std::stable_sort.
-        for (int r = 0; r < V; ++r) {
-            float best = kNeg;
-            int   best_i = 0;
-            for (int v = 0; v < V; ++v) {
-                if (work_n[v] > best) { best = work_n[v]; best_i = v; }
-            }
-            ord_n[r] = best_i;
-            work_n[best_i] = kNeg;      // remove from the running set
-        }
-
-        // ── 3. top-k filter: keep the top_k highest-probability tokens. ──
-        int keep = V;
-        if (top_k > 0 && top_k < keep) keep = top_k;
-
-        // ── 4. top-p (nucleus): smallest high-prob set with cumprob >= top_p. ──
-        if (top_p < 1.0f) {
-            double cum = 0.0;
-            int nucleus = 0;
-            for (int r = 0; r < keep; ++r) {
-                cum += prob_n[ord_n[r]];
-                ++nucleus;
-                if (cum >= static_cast<double>(top_p)) break;
-            }
-            if (nucleus < 1) nucleus = 1;   // always keep at least one token
-            keep = nucleus;
-        }
-
-        // ── 5. renormalise over the kept set. ──
-        double kept_sum = 0.0;
-        for (int r = 0; r < keep; ++r) kept_sum += prob_n[ord_n[r]];
-
-        // ── 6. inverse-CDF draw with a Philox uniform for substream
-        //       (counter + n). ──
-        const float u = philox_uniform(key, counter + static_cast<uint64_t>(n));
-        int chosen = ord_n[0];
-        if (kept_sum > 0.0) {
-            const double target = static_cast<double>(u) * kept_sum;
-            double acc = 0.0;
-            chosen = ord_n[keep - 1];   // fallback: last kept (covers u≈1).
-            for (int r = 0; r < keep; ++r) {
-                acc += prob_n[ord_n[r]];
-                if (target < acc) { chosen = ord_n[r]; break; }
-            }
-        }
-        indices[n] = chosen;
-    }
-}
-
-// Graph-capturable variant — ONE THREAD BLOCK PER ROW.
+// ONE THREAD BLOCK PER ROW — shared body for both public entry points.
 //
 // The autoregressive decode case is N==1 with a large vocab V, so a thread-per-
 // row kernel would leave one thread to do an O(V^2) selection sort while the
-// rest of the block idles (the original bottleneck). Here each block cooperates
-// on a single row: parallel softmax (block max + sum), then a partial selection
-// that extracts the kept set in descending-probability order, stopping as soon
-// as top_k / top_p is satisfied (so the cost is O(keep * V / threads), not
-// O(V^2)). The Philox base counter is read from device memory so a captured
-// replay advances the RNG with no host involvement; scratch is caller-owned (no
-// per-call malloc, illegal during capture). Accumulations are FP64 to match the
-// CPU reference bit-for-bit on robust draws. The counter is advanced by a
-// separate single-thread kernel so no block races the write.
+// rest of the block idles (the original bottleneck this replaced). Here each
+// block cooperates on a single row: parallel softmax (block max + sum), then a
+// partial selection that extracts the kept set in descending-probability
+// order, stopping as soon as top_k / top_p is satisfied (so the cost is
+// O(keep * V / threads), not O(V^2)). Accumulations are FP64 to match the CPU
+// reference bit-for-bit on robust draws.
 //
-// Shared memory (dynamic): blockDim doubles (reduction values) + blockDim ints
-// (reduction indices).
+// `base_counter` is the already-resolved 64-bit Philox base for row 0 of this
+// launch; row `row` draws from substream (base_counter + row). Callers resolve
+// base_counter differently:
+//   - sample_logits_block_kernel passes the public API's 64-bit `counter`
+//     argument straight through (full width, no per-call device state).
+//   - sample_logits_into_kernel reads it from the caller-owned device counter
+//     tensor (32 bits, so a captured replay can advance it with no host
+//     involvement) and widens to 64 bits.
+//
+// Shared memory (dynamic, sized by the caller): blockDim doubles (reduction
+// values) + blockDim ints (reduction indices), passed in via sdv/sidx.
 constexpr int SLI_THREADS = 256;
 
-__global__ void sample_logits_into_kernel(const float* __restrict__ logits,
-                                          int* __restrict__ indices,
-                                          float* __restrict__ prob,
-                                          float* __restrict__ work,
-                                          int* __restrict__ order,
-                                          const int* __restrict__ counter,
-                                          int N, int V, float temperature,
-                                          int top_k, float top_p, uint64_t key) {
-    const int row = blockIdx.x;
-    if (row >= N) return;
-    const int tid = threadIdx.x;
-    const int nth = blockDim.x;
-
-    extern __shared__ char smem[];
-    double* sdv  = reinterpret_cast<double*>(smem);          // [nth] reduction val
-    int*    sidx = reinterpret_cast<int*>(sdv + nth);        // [nth] reduction idx
-
-    const float* rowL = logits + static_cast<long long>(row) * V;
-
+__device__ inline void sample_logits_row(
+        const float* __restrict__ rowL, int* __restrict__ indices, int row,
+        float* __restrict__ prob_n, float* __restrict__ work_n,
+        int* __restrict__ ord_n, double* __restrict__ sdv,
+        int* __restrict__ sidx, int V, float temperature, int top_k,
+        float top_p, uint64_t key, uint64_t base_counter, int tid, int nth) {
     // ── Greedy: block-parallel argmax (max value, lowest index on ties). ──
     if (temperature == 0.0f) {
         double bv = -1e300; int bi = 0;
@@ -267,10 +169,6 @@ __global__ void sample_logits_into_kernel(const float* __restrict__ logits,
         if (tid == 0) indices[row] = sidx[0];
         return;
     }
-
-    float* prob_n = prob + static_cast<long long>(row) * V;
-    float* work_n = work + static_cast<long long>(row) * V;
-    int*   ord_n  = order + static_cast<long long>(row) * V;
 
     // ── softmax max (parallel). ──
     double lmax = -1e300;
@@ -355,11 +253,9 @@ __global__ void sample_logits_into_kernel(const float* __restrict__ logits,
     // ── Renormalise over the kept set + inverse-CDF draw (serial on thread 0;
     //    O(keep) <= O(V), no longer the quadratic term). ──
     if (tid == 0) {
-        const uint64_t base = static_cast<uint64_t>(
-            static_cast<uint32_t>(counter[0]));
         double kept_sum = 0.0;
         for (int r = 0; r < keep; ++r) kept_sum += prob_n[ord_n[r]];
-        const float u = philox_uniform(key, base + static_cast<uint64_t>(row));
+        const float u = philox_uniform(key, base_counter + static_cast<uint64_t>(row));
         int chosen = ord_n[0];
         if (kept_sum > 0.0) {
             const double target = static_cast<double>(u) * kept_sum;
@@ -372,6 +268,68 @@ __global__ void sample_logits_into_kernel(const float* __restrict__ logits,
         }
         indices[row] = chosen;
     }
+}
+
+// sample_logits(): full 64-bit counter passed straight through as a kernel
+// argument -- no device-resident counter state, so the public API's full
+// counter range is honoured exactly (sample_logits_into's device counter is
+// only 32 bits wide, which would silently truncate values >= 2^32).
+__global__ void sample_logits_block_kernel(const float* __restrict__ logits,
+                                           int* __restrict__ indices,
+                                           float* __restrict__ prob,
+                                           float* __restrict__ work,
+                                           int* __restrict__ order,
+                                           int N, int V, float temperature,
+                                           int top_k, float top_p,
+                                           uint64_t key, uint64_t counter) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int tid = threadIdx.x;
+    const int nth = blockDim.x;
+
+    extern __shared__ char smem[];
+    double* sdv  = reinterpret_cast<double*>(smem);          // [nth] reduction val
+    int*    sidx = reinterpret_cast<int*>(sdv + nth);        // [nth] reduction idx
+
+    const float* rowL = logits + static_cast<long long>(row) * V;
+    float* prob_n = prob + static_cast<long long>(row) * V;
+    float* work_n = work + static_cast<long long>(row) * V;
+    int*   ord_n  = order + static_cast<long long>(row) * V;
+
+    sample_logits_row(rowL, indices, row, prob_n, work_n, ord_n, sdv, sidx,
+                      V, temperature, top_k, top_p, key, counter, tid, nth);
+}
+
+// sample_logits_into(): Philox base counter is read from device memory so a
+// captured replay advances the RNG with no host involvement; scratch is
+// caller-owned (no per-call malloc, illegal during capture). The counter is
+// advanced by a separate single-thread kernel so no block races the write.
+__global__ void sample_logits_into_kernel(const float* __restrict__ logits,
+                                          int* __restrict__ indices,
+                                          float* __restrict__ prob,
+                                          float* __restrict__ work,
+                                          int* __restrict__ order,
+                                          const int* __restrict__ counter,
+                                          int N, int V, float temperature,
+                                          int top_k, float top_p, uint64_t key) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int tid = threadIdx.x;
+    const int nth = blockDim.x;
+
+    extern __shared__ char smem[];
+    double* sdv  = reinterpret_cast<double*>(smem);          // [nth] reduction val
+    int*    sidx = reinterpret_cast<int*>(sdv + nth);        // [nth] reduction idx
+
+    const float* rowL = logits + static_cast<long long>(row) * V;
+    float* prob_n = prob + static_cast<long long>(row) * V;
+    float* work_n = work + static_cast<long long>(row) * V;
+    int*   ord_n  = order + static_cast<long long>(row) * V;
+
+    const uint64_t base_counter = static_cast<uint64_t>(
+        static_cast<uint32_t>(counter[0]));
+    sample_logits_row(rowL, indices, row, prob_n, work_n, ord_n, sdv, sidx,
+                      V, temperature, top_k, top_p, key, base_counter, tid, nth);
 }
 
 // Advance the device base counter by N (single thread). Greedy (temperature==0)
@@ -411,25 +369,35 @@ void sample_logits(const ::brotensor::Tensor& logits, float temperature,
     }
     if (N == 0) return;
 
-    // Per-call scratch: prob + sort work (FP32) and the sorted order (INT32).
+    // Per-call scratch, from the pooled (cudaMallocAsync-backed) allocator --
+    // not raw cudaMalloc/cudaFree, which both synchronize the device on every
+    // call. Same layout sample_logits_into's caller-supplied scratch uses:
+    // prob | sort-work (FP32) | order (INT32); one combined allocation (3*nv
+    // FP32-sized elements) rather than three separate ones, so a failure
+    // partway through can never leak a prior piece.
     const size_t nv = static_cast<size_t>(N) * static_cast<size_t>(V);
-    float* prob  = nullptr;
-    float* work  = nullptr;
-    int*   order = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(&prob,  nv * sizeof(float)));
-    BROTENSOR_CUDA_CHECK(cudaMalloc(&work,  nv * sizeof(float)));
-    BROTENSOR_CUDA_CHECK(cudaMalloc(&order, nv * sizeof(int)));
+    static_assert(sizeof(int) == sizeof(float), "carve assumes 4-byte elements");
+    float* prob  = static_cast<float*>(cuda_alloc(3 * nv * sizeof(float)));
+    float* work  = prob + nv;
+    int*   order = reinterpret_cast<int*>(prob + 2 * nv);
 
-    sample_logits_kernel<<<sl_grid(N), SL_BLOCK, 0, cur_stream()>>>(
+    // One block per row; the block cooperates over the vocab -- the same
+    // efficient kernel body sample_logits_into() uses (O(keep*V/threads), not
+    // the O(V^2) per-thread selection sort this used to run). The counter is
+    // passed as a full 64-bit kernel argument (not a device-resident counter),
+    // so the public API's full 64-bit counter range is preserved exactly.
+    int threads = SLI_THREADS;
+    while (threads > 32 && threads > V) threads >>= 1;
+    const size_t shmem = static_cast<size_t>(threads) *
+                         (sizeof(double) + sizeof(int));
+    sample_logits_block_kernel<<<N, threads, shmem, cur_stream()>>>(
         static_cast<const float*>(logits.data),
         static_cast<int*>(indices.data),
         prob, work, order,
         N, V, temperature, top_k, top_p, key, counter);
     const cudaError_t launch_err = cudaGetLastError();
 
-    BROTENSOR_CUDA_CHECK(cudaFree(prob));
-    BROTENSOR_CUDA_CHECK(cudaFree(work));
-    BROTENSOR_CUDA_CHECK(cudaFree(order));
+    cuda_free(prob);
     BROTENSOR_CUDA_CHECK(launch_err);
 }
 

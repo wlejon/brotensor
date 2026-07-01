@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <stdexcept>
 
 namespace brotensor { void* cuda_current_stream(); }
@@ -13,9 +14,27 @@ namespace brotensor { void* cuda_current_stream(); }
 namespace brotensor {
 namespace detail::cuda {
 
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
+
 namespace {
 
-constexpr int SM_BLOCK = 256;
+// softmax_forward / softmax_backward (below) operate over a SINGLE flat
+// vector — one shared reduction domain (max, then sum, then normalise all
+// cross the whole vector) — so they launch exactly one block regardless of
+// n; splitting that reduction across multiple blocks would need a second
+// cross-block combination pass (extra kernel launches and/or global
+// atomics). softmax_rows_forward avoids the problem entirely by giving each
+// block its own independent row instead of subdividing one row. For a
+// vocab-sized n (5e4-1.5e5) a single block still only ever occupies one SM
+// no matter how large we make it, but bumping the block from 256 to the
+// hardware's full 1024 threads still shrinks the per-thread grid-stride
+// factor 4x, so we use 1024 uniformly here (it's also harmless for the
+// row-batched kernels below, whose grid already scales with `rows`).
+constexpr int SM_BLOCK = 1024;
 
 inline cudaStream_t cur_stream() {
     return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
@@ -374,25 +393,21 @@ void softmax_forward(const ::brotensor::Tensor& logits,
     }
     if (n == 0) return;
     if (logits.dtype == Dtype::FP16) {
-        float* d_scratch = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
-                                        n * sizeof(float)));
+        float* d_scratch = static_cast<float*>(cuda_alloc(static_cast<size_t>(n) * sizeof(float)));
         softmax_forward_kernel_fp16<<<1, SM_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(logits.data),
             static_cast<__half*>(probs.data),
             d_mask, d_scratch, n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_scratch);
+        cuda_free(d_scratch);
     } else if (logits.dtype == Dtype::BF16) {
-        float* d_scratch = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
-                                        n * sizeof(float)));
+        float* d_scratch = static_cast<float*>(cuda_alloc(static_cast<size_t>(n) * sizeof(float)));
         softmax_forward_kernel_bf16<<<1, SM_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(logits.data),
             static_cast<__nv_bfloat16*>(probs.data),
             d_mask, d_scratch, n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_scratch);
+        cuda_free(d_scratch);
     } else {
         softmax_forward_kernel<<<1, SM_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(logits.data),

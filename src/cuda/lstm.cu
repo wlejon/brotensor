@@ -76,6 +76,45 @@ const float* opt_ptr(const char* op, const ::brotensor::Tensor* t,
 
 __device__ inline float sigmoidf_d(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
+// Warp-aggregated atomics helper for the backward kernel below. Several of
+// its accumulation targets (dxrow[j], dh_out_b[m]) are addressed purely by
+// this thread's `b` — independent of `n` — so on every loop iteration, every
+// lane in the warp that shares this thread's `b` is atomicAdd-ing the exact
+// same address; the bias grads (dbih/dbhh) have the mirror pattern keyed by
+// `n`. `mask`/`leader` (from __match_any_sync, computed once by the caller)
+// identify that lane subgroup for whatever H/B happen to be in play — no
+// alignment between warp size and H is assumed. Every lane relays its value
+// through shared memory (indexed by absolute thread id, so concurrent warps
+// never touch each other's slots) and only the elected leader lane sums the
+// subgroup and returns a meaningful result; the caller must gate the actual
+// atomicAdd on `lane == leader`.
+//
+// A shuffle-based tree reduction would be cheaper than the shared-memory
+// relay, but __shfl_*_sync requires every lane named in `mask` to execute
+// the identical instruction — a solo "leader" cannot use it to pull values
+// from the other lanes on its own. Shared memory has no such restriction, at
+// the cost of two __syncwarp() fences per call.
+__device__ inline float warp_relay_sum(float* relay, float val,
+                                       unsigned mask, int leader,
+                                       unsigned active_mask) {
+    const int lane = threadIdx.x & 31;
+    relay[threadIdx.x] = val;
+    __syncwarp(active_mask);
+    float sum = val;
+    if (lane == leader) {
+        sum = 0.0f;
+        unsigned remaining = mask;
+        const int base = threadIdx.x - lane;
+        while (remaining) {
+            const int src = __ffs(remaining) - 1;
+            remaining &= remaining - 1;
+            sum += relay[base + src];
+        }
+    }
+    __syncwarp(active_mask);
+    return sum;
+}
+
 // ───────────────────────────── forward ────────────────────────────────────
 //
 // One thread per unit (b, n) of timestep t. h_prev / c_prev come from the
@@ -176,6 +215,20 @@ __global__ void lstm_bwd_kernel(const float* __restrict__ xp,
     const int G = 4 * H;
     const long long row = static_cast<long long>(t) * B + b;
 
+    // Warp-aggregated atomics setup (see warp_relay_sum above). `active` is
+    // stable for the remainder of the kernel — no further thread returns or
+    // data-dependent branches happen before it (the only later branch,
+    // `if (hprev)`, depends solely on `t` and the launch-wide h0p pointer, so
+    // it is warp-uniform). bmask/bleader group lanes sharing `b` (dxrow /
+    // dh_out targets); nmask/nleader group lanes sharing `n` (bias targets).
+    const unsigned active = __activemask();
+    const int lane = threadIdx.x & 31;
+    const unsigned bmask = __match_any_sync(active, b);
+    const int bleader = __ffs(bmask) - 1;
+    const unsigned nmask = __match_any_sync(active, n);
+    const int nleader = __ffs(nmask) - 1;
+    __shared__ float s_relay[LSTM_BLOCK];
+
     const float* grow = gp + row * G;
     const float ig = grow[n], fg = grow[H + n], gg = grow[2 * H + n], og = grow[3 * H + n];
     const float tc = tanhf(cp[row * H + n]);
@@ -197,8 +250,22 @@ __global__ void lstm_bwd_kernel(const float* __restrict__ xp,
     const float dzg = dg * (1.0f - gg * gg);
     const float dzo = do_ * og * (1.0f - og);
 
-    if (dbih) { atomicAdd(&dbih[n], dzi); atomicAdd(&dbih[H + n], dzf); atomicAdd(&dbih[2 * H + n], dzg); atomicAdd(&dbih[3 * H + n], dzo); }
-    if (dbhh) { atomicAdd(&dbhh[n], dzi); atomicAdd(&dbhh[H + n], dzf); atomicAdd(&dbhh[2 * H + n], dzg); atomicAdd(&dbhh[3 * H + n], dzo); }
+    // Bias grads key off `n` only: whenever a warp straddles a b-boundary
+    // (only possible for H smaller than the warp width) two or more lanes
+    // with the same `n` but different `b` land on the identical dbih[n] /
+    // dbhh[n] address. nmask/nleader (computed once above) capture exactly
+    // that lane subgroup for any H; reduce once and let the leader issue at
+    // most 4+4 atomics per warp group instead of one pair per lane.
+    if (dbih || dbhh) {
+        const float sum_i = warp_relay_sum(s_relay, dzi, nmask, nleader, active);
+        const float sum_f = warp_relay_sum(s_relay, dzf, nmask, nleader, active);
+        const float sum_g = warp_relay_sum(s_relay, dzg, nmask, nleader, active);
+        const float sum_o = warp_relay_sum(s_relay, dzo, nmask, nleader, active);
+        if (lane == nleader) {
+            if (dbih) { atomicAdd(&dbih[n], sum_i); atomicAdd(&dbih[H + n], sum_f); atomicAdd(&dbih[2 * H + n], sum_g); atomicAdd(&dbih[3 * H + n], sum_o); }
+            if (dbhh) { atomicAdd(&dbhh[n], sum_i); atomicAdd(&dbhh[H + n], sum_f); atomicAdd(&dbhh[2 * H + n], sum_g); atomicAdd(&dbhh[3 * H + n], sum_o); }
+        }
+    }
 
     // Input path: dX += W_ih^T·dz ;  dW_ih += dz·x^T
     const float* x = xp + row * I;
@@ -212,7 +279,13 @@ __global__ void lstm_bwd_kernel(const float* __restrict__ xp,
     float* dwg = dwih + static_cast<long long>(2 * H + n) * I;
     float* dwo = dwih + static_cast<long long>(3 * H + n) * I;
     for (int j = 0; j < I; ++j) {
-        atomicAdd(&dxrow[j], wi[j] * dzi + wf[j] * dzf + wg[j] * dzg + wo[j] * dzo);
+        // dxrow[j] is keyed by `b` only (row = t*B + b): whenever H is >=
+        // the warp width, every lane in a warp shares the same `b` and would
+        // otherwise all atomicAdd the same address on every iteration; for
+        // smaller H, bmask still finds whatever same-`b` subgroup exists.
+        const float dx_contrib = wi[j] * dzi + wf[j] * dzf + wg[j] * dzg + wo[j] * dzo;
+        const float dx_sum = warp_relay_sum(s_relay, dx_contrib, bmask, bleader, active);
+        if (lane == bleader) atomicAdd(&dxrow[j], dx_sum);
         const float xj = x[j];
         atomicAdd(&dwi[j], dzi * xj); atomicAdd(&dwf[j], dzf * xj);
         atomicAdd(&dwg[j], dzg * xj); atomicAdd(&dwo[j], dzo * xj);
@@ -231,7 +304,11 @@ __global__ void lstm_bwd_kernel(const float* __restrict__ xp,
     float* duo = dwhh + static_cast<long long>(3 * H + n) * H;
     float* dh_out_b = dh_out + static_cast<long long>(b) * H;
     for (int m = 0; m < H; ++m) {
-        atomicAdd(&dh_out_b[m], ui[m] * dzi + uf[m] * dzf + ug[m] * dzg + uo[m] * dzo);
+        // dh_out_b[m] is keyed by `b` only — same collision pattern as dxrow
+        // above, reduced through the same bmask/bleader group.
+        const float dh_contrib = ui[m] * dzi + uf[m] * dzf + ug[m] * dzg + uo[m] * dzo;
+        const float dh_sum = warp_relay_sum(s_relay, dh_contrib, bmask, bleader, active);
+        if (lane == bleader) atomicAdd(&dh_out_b[m], dh_sum);
         if (hprev) {
             const float hm = hprev[m];
             atomicAdd(&dui[m], dzi * hm); atomicAdd(&duf[m], dzf * hm);
@@ -397,8 +474,15 @@ void lstm_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& W_ih
         BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(
             dc0->data, dc, bh_bytes, cudaMemcpyDeviceToDevice, stream));
     }
-    // dhA/dhB/dcBuf free here — the stream work above must complete first.
-    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(stream));
+    // dhA/dhB/dcBuf free here (Tensor destructors -> cuda_free). That routes
+    // through cudaFreeAsync on this same stream when the pooled allocator is
+    // active (tensor.cu), which is itself stream-ordered — it queues behind
+    // every kernel/copy launched above without needing the host to wait, so
+    // freeing them does not require a synchronize. On the non-pooled fallback
+    // path cuda_free() calls the synchronous cudaFree(), which implicitly
+    // waits out the device itself; either way no explicit host sync is
+    // needed here, and dropping it lets this backward pass pipeline with
+    // whatever the caller enqueues next instead of stalling the host.
 }
 
 void fill_cuda_vtable_lstm(::brotensor::detail::OpsVTable& v) {

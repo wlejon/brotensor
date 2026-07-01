@@ -8,11 +8,18 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <stdexcept>
 
 namespace brotensor { void* cuda_current_stream(); }
 
 namespace brotensor::detail::cuda {
+
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
 using ::brotensor::Tensor;
 using ::brotensor::Dtype;
@@ -623,9 +630,7 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
 
     if (out_dim > 0 && in_dim > 0) {
         const int dw_n = out_dim * in_dim;
-        float* d_dw_scratch = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dw_scratch),
-                                        dw_n * sizeof(float)));
+        float* d_dw_scratch = static_cast<float*>(cuda_alloc(static_cast<size_t>(dw_n) * sizeof(float)));
         dim3 block(16, 16);
         dim3 grid((in_dim + 15) / 16, (out_dim + 15) / 16);
         if (is_fp16) {
@@ -657,13 +662,11 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
                 d_dw_scratch, static_cast<float*>(dW.data), dw_n);
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_dw_scratch);
+        cuda_free(d_dw_scratch);
     }
 
     if (out_dim > 0) {
-        float* d_db_scratch = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db_scratch),
-                                        out_dim * sizeof(float)));
+        float* d_db_scratch = static_cast<float*>(cuda_alloc(static_cast<size_t>(out_dim) * sizeof(float)));
         const int blocks = (out_dim + 255) / 256;
         if (is_fp16) {
             linear_backward_batched_db_kernel<__half><<<blocks, 256, 0, cur_stream()>>>(
@@ -691,7 +694,7 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
                 d_db_scratch, static_cast<float*>(dB.data), out_dim);
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_db_scratch);
+        cuda_free(d_db_scratch);
     }
 }
 

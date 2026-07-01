@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <stdexcept>
 
 namespace brotensor { void* cuda_current_stream(); }
@@ -18,6 +19,12 @@ namespace brotensor::detail::cuda {
 static inline cudaStream_t cur_stream() {
     return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
 }
+
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
 namespace {
 
@@ -189,6 +196,21 @@ __global__ void group_norm_backward_kernel_fp16(
     const __half* dy_tile = dY + n * sample_stride + chan_base * spatial;
     __half*       dx_tile = dX + n * sample_stride + chan_base * spatial;
 
+    // Per-block, per-channel dGamma/dBeta staging: the tile has
+    // channels_per_group channels shared across blockDim.x threads, so most
+    // threads collide on the same channel's global accumulator. Reduce into
+    // shared memory first and flush at most one atomicAdd per (block,
+    // channel) instead of one per thread. Zeroed here; the barriers already
+    // required before Pass 2 uses it make the writes visible without an
+    // extra __syncthreads().
+    extern __shared__ float s_chan[];
+    float* s_dgamma = s_chan;
+    float* s_dbeta  = s_chan + channels_per_group;
+    for (int c = tid; c < channels_per_group; c += blockDim.x) {
+        s_dgamma[c] = 0.0f;
+        s_dbeta[c]  = 0.0f;
+    }
+
     // Pass 1: mean, var.
     float sum = 0.0f, sumsq = 0.0f;
     for (int i = tid; i < tile_size; i += blockDim.x) {
@@ -232,9 +254,10 @@ __global__ void group_norm_backward_kernel_fp16(
         const float dxh = dyv * gv;
         sum1 += dxh;
         sum2 += dxh * xh;
-        // Per-channel accumulators (scattered across spatial within tile).
-        atomicAdd(&dGamma_acc[channel], dyv * xh);
-        atomicAdd(&dBeta_acc[channel],  dyv);
+        // Per-channel accumulators (scattered across spatial within tile) —
+        // reduce into this block's shared staging area, not the global one.
+        atomicAdd(&s_dgamma[local_c], dyv * xh);
+        atomicAdd(&s_dbeta[local_c],  dyv);
     }
     s_a[tid] = sum1; s_b[tid] = sum2;
     __syncthreads();
@@ -251,6 +274,15 @@ __global__ void group_norm_backward_kernel_fp16(
     const float sum1_t = s_sum1;
     const float sum2_t = s_sum2;
     const float inv_M = 1.0f / static_cast<float>(tile_size);
+
+    // Flush this block's per-channel partials — one atomicAdd per (block,
+    // channel) into the caller-wide FP32 scratch. The __syncthreads() calls
+    // above (part of the sum1/sum2 tree reduction) already guarantee every
+    // thread's contribution to s_dgamma/s_dbeta above is visible here.
+    for (int c = tid; c < channels_per_group; c += blockDim.x) {
+        atomicAdd(&dGamma_acc[chan_base + c], s_dgamma[c]);
+        atomicAdd(&dBeta_acc[chan_base + c],  s_dbeta[c]);
+    }
 
     // Pass 3: dX = rstd * (dx̂ - (sum1 + x̂ * sum2) / M).
     for (int i = tid; i < tile_size; i += blockDim.x) {
@@ -286,6 +318,17 @@ __global__ void group_norm_backward_kernel_fp32(
     const float* x_tile  = X  + n * sample_stride + chan_base * spatial;
     const float* dy_tile = dY + n * sample_stride + chan_base * spatial;
     float*       dx_tile = dX + n * sample_stride + chan_base * spatial;
+
+    // Per-block, per-channel dGamma/dBeta staging (see fp16 kernel above for
+    // the rationale). Zeroed here; made visible before Pass 2 uses it by the
+    // barriers already required by the mean/var reduction below.
+    extern __shared__ float s_chan[];
+    float* s_dgamma = s_chan;
+    float* s_dbeta  = s_chan + channels_per_group;
+    for (int c = tid; c < channels_per_group; c += blockDim.x) {
+        s_dgamma[c] = 0.0f;
+        s_dbeta[c]  = 0.0f;
+    }
 
     float sum = 0.0f, sumsq = 0.0f;
     for (int i = tid; i < tile_size; i += blockDim.x) {
@@ -327,8 +370,8 @@ __global__ void group_norm_backward_kernel_fp32(
         const float dxh = dyv * gv;
         sum1 += dxh;
         sum2 += dxh * xh;
-        atomicAdd(&dGamma_acc[channel], dyv * xh);
-        atomicAdd(&dBeta_acc[channel],  dyv);
+        atomicAdd(&s_dgamma[local_c], dyv * xh);
+        atomicAdd(&s_dbeta[local_c],  dyv);
     }
     s_a[tid] = sum1; s_b[tid] = sum2;
     __syncthreads();
@@ -345,6 +388,13 @@ __global__ void group_norm_backward_kernel_fp32(
     const float sum1_t = s_sum1;
     const float sum2_t = s_sum2;
     const float inv_M = 1.0f / static_cast<float>(tile_size);
+
+    // Flush this block's per-channel partials — one atomicAdd per (block,
+    // channel) into the caller-wide FP32 scratch.
+    for (int c = tid; c < channels_per_group; c += blockDim.x) {
+        atomicAdd(&dGamma_acc[chan_base + c], s_dgamma[c]);
+        atomicAdd(&dBeta_acc[chan_base + c],  s_dbeta[c]);
+    }
 
     for (int i = tid; i < tile_size; i += blockDim.x) {
         const int local_c = i / spatial;
@@ -445,6 +495,17 @@ __global__ void group_norm_backward_kernel_bf16(
     const __nv_bfloat16* dy_tile = dY + n * sample_stride + chan_base * spatial;
     __nv_bfloat16*       dx_tile = dX + n * sample_stride + chan_base * spatial;
 
+    // Per-block, per-channel dGamma/dBeta staging (see fp16 kernel above for
+    // the rationale). Zeroed here; made visible before Pass 2 uses it by the
+    // barriers already required by the mean/var reduction below.
+    extern __shared__ float s_chan[];
+    float* s_dgamma = s_chan;
+    float* s_dbeta  = s_chan + channels_per_group;
+    for (int c = tid; c < channels_per_group; c += blockDim.x) {
+        s_dgamma[c] = 0.0f;
+        s_dbeta[c]  = 0.0f;
+    }
+
     // Pass 1: mean, var.
     float sum = 0.0f, sumsq = 0.0f;
     for (int i = tid; i < tile_size; i += blockDim.x) {
@@ -487,8 +548,8 @@ __global__ void group_norm_backward_kernel_bf16(
         const float dxh = dyv * gv;
         sum1 += dxh;
         sum2 += dxh * xh;
-        atomicAdd(&dGamma_acc[channel], dyv * xh);
-        atomicAdd(&dBeta_acc[channel],  dyv);
+        atomicAdd(&s_dgamma[local_c], dyv * xh);
+        atomicAdd(&s_dbeta[local_c],  dyv);
     }
     s_a[tid] = sum1; s_b[tid] = sum2;
     __syncthreads();
@@ -505,6 +566,13 @@ __global__ void group_norm_backward_kernel_bf16(
     const float sum1_t = s_sum1;
     const float sum2_t = s_sum2;
     const float inv_M = 1.0f / static_cast<float>(tile_size);
+
+    // Flush this block's per-channel partials — one atomicAdd per (block,
+    // channel) into the caller-wide FP32 scratch.
+    for (int c = tid; c < channels_per_group; c += blockDim.x) {
+        atomicAdd(&dGamma_acc[chan_base + c], s_dgamma[c]);
+        atomicAdd(&dBeta_acc[chan_base + c],  s_dbeta[c]);
+    }
 
     // Pass 3: dX = rstd * (dx̂ - (sum1 + x̂ * sum2) / M).
     for (int i = tid; i < tile_size; i += blockDim.x) {
@@ -632,17 +700,18 @@ void group_norm_backward(const ::brotensor::Tensor& X,
 
     // FP32 scratch for per-channel grads — accumulate atomically in the
     // backward kernel, then add into the storage-dtype caller buffers.
-    float* d_dG = nullptr;
-    float* d_dB = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dG), C * sizeof(float)));
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dB), C * sizeof(float)));
+    float* d_dG = static_cast<float*>(cuda_alloc(static_cast<size_t>(C) * sizeof(float)));
+    float* d_dB = static_cast<float*>(cuda_alloc(static_cast<size_t>(C) * sizeof(float)));
     BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dG, 0, C * sizeof(float), cur_stream()));
     BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dB, 0, C * sizeof(float), cur_stream()));
 
     const int channels_per_group = C / num_groups;
     dim3 grid(num_groups, N, 1);
+    // Dynamic shared memory for the per-block dGamma/dBeta staging arrays
+    // (two float buffers of length channels_per_group — see kernels above).
+    const size_t chan_smem = static_cast<size_t>(channels_per_group) * 2 * sizeof(float);
     if (X.dtype == Dtype::FP16) {
-        group_norm_backward_kernel_fp16<<<grid, GN_BLOCK, 0, cur_stream()>>>(
+        group_norm_backward_kernel_fp16<<<grid, GN_BLOCK, chan_smem, cur_stream()>>>(
             reinterpret_cast<const __half*>(X.data),
             reinterpret_cast<const __half*>(gamma.data),
             reinterpret_cast<const __half*>(dY.data),
@@ -650,7 +719,7 @@ void group_norm_backward(const ::brotensor::Tensor& X,
             d_dG, d_dB,
             C, spatial, channels_per_group, eps);
     } else if (X.dtype == Dtype::BF16) {
-        group_norm_backward_kernel_bf16<<<grid, GN_BLOCK, 0, cur_stream()>>>(
+        group_norm_backward_kernel_bf16<<<grid, GN_BLOCK, chan_smem, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(X.data),
             reinterpret_cast<const __nv_bfloat16*>(gamma.data),
             reinterpret_cast<const __nv_bfloat16*>(dY.data),
@@ -658,7 +727,7 @@ void group_norm_backward(const ::brotensor::Tensor& X,
             d_dG, d_dB,
             C, spatial, channels_per_group, eps);
     } else {
-        group_norm_backward_kernel_fp32<<<grid, GN_BLOCK, 0, cur_stream()>>>(
+        group_norm_backward_kernel_fp32<<<grid, GN_BLOCK, chan_smem, cur_stream()>>>(
             reinterpret_cast<const float*>(X.data),
             reinterpret_cast<const float*>(gamma.data),
             reinterpret_cast<const float*>(dY.data),
@@ -685,8 +754,8 @@ void group_norm_backward(const ::brotensor::Tensor& X,
         add_fp32_into_fp32<<<gridc, block, 0, cur_stream()>>>(d_dB, reinterpret_cast<float*>(dBeta.data),  C);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    cudaFree(d_dG);
-    cudaFree(d_dB);
+    cuda_free(d_dG);
+    cuda_free(d_dB);
 }
 
 } // namespace brotensor::detail::cuda

@@ -22,6 +22,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -31,6 +32,12 @@ static inline cudaStream_t cur_stream() {
 }
 
 namespace brotensor::detail::cuda {
+
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
 namespace {
 
@@ -235,9 +242,7 @@ void pad2d_backward(const ::brotensor::Tensor& dY,
     }
 
     // FP16/BF16: scatter-accumulate into FP32 scratch, then cast into dX.
-    float* d_scratch = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
-                                    static_cast<size_t>(total_in) * sizeof(float)));
+    float* d_scratch = static_cast<float*>(cuda_alloc(static_cast<size_t>(total_in) * sizeof(float)));
     BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_scratch, 0,
                                     static_cast<size_t>(total_in) * sizeof(float), cur_stream()));
     if (total_out > 0) {
@@ -262,7 +267,7 @@ void pad2d_backward(const ::brotensor::Tensor& dY,
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
-    cudaFree(d_scratch);
+    cuda_free(d_scratch);
 }
 
 // ─── vtable registration ────────────────────────────────────────────────────

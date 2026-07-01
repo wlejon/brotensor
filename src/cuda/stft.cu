@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -35,6 +36,12 @@ static inline cudaStream_t cur_stream() {
 }
 
 namespace brotensor::detail::cuda {
+
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
 namespace {
 
@@ -426,9 +433,7 @@ void istft(const ::brotensor::Tensor& spec, const ::brotensor::Tensor& window,
                                    : 1.0;
     const double invN = 1.0 / static_cast<double>(n_fft);
 
-    float* env = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(
-        &env, static_cast<size_t>(g.padded_len) * sizeof(float)));
+    float* env = static_cast<float*>(cuda_alloc(static_cast<size_t>(g.padded_len) * sizeof(float)));
     cola_env_kernel<<<stft_grid(g.padded_len), STFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(window.data), env,
         g.padded_len, n_fft, hop_length, win_length, g.pad_lo, g.frames);
@@ -442,7 +447,7 @@ void istft(const ::brotensor::Tensor& spec, const ::brotensor::Tensor& window,
         N, signal_len, n_fft, hop_length, win_length, g.pad_lo, g.bins,
         g.frames, center ? 1 : 0, norm, invN);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    BROTENSOR_CUDA_CHECK(cudaFree(env));
+    cuda_free(env);
 }
 
 void istft_backward(const ::brotensor::Tensor& dSignal,
@@ -472,9 +477,7 @@ void istft_backward(const ::brotensor::Tensor& dSignal,
                                    : 1.0;
     const double invN = 1.0 / static_cast<double>(n_fft);
 
-    float* env = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(
-        &env, static_cast<size_t>(g.padded_len) * sizeof(float)));
+    float* env = static_cast<float*>(cuda_alloc(static_cast<size_t>(g.padded_len) * sizeof(float)));
     cola_env_kernel<<<stft_grid(g.padded_len), STFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(window.data), env,
         g.padded_len, n_fft, hop_length, win_length, g.pad_lo, g.frames);
@@ -488,7 +491,7 @@ void istft_backward(const ::brotensor::Tensor& dSignal,
         N, signal_len, n_fft, hop_length, win_length, g.pad_lo, g.bins,
         g.frames, center ? 1 : 0, norm, invN);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    BROTENSOR_CUDA_CHECK(cudaFree(env));
+    cuda_free(env);
 }
 
 // ─── vtable registration ────────────────────────────────────────────────────

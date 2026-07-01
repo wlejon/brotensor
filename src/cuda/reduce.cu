@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,6 +17,12 @@ static inline cudaStream_t cur_stream() {
 
 namespace brotensor {
 namespace detail::cuda {
+
+// Defined in tensor.cu — pooled (cudaMallocAsync/cudaFreeAsync-backed)
+// allocator, used here instead of raw cudaMalloc/cudaFree for the small
+// per-call num_valid scratch.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
 namespace {
 
@@ -30,22 +37,38 @@ template <> __device__ inline void r_store<float>(float* p, float v) { *p = v; }
 template <> __device__ inline void r_store<__half>(__half* p, float v) { *p = __float2half(v); }
 template <> __device__ inline void r_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
+// Single-block preliminary reduction: computes num_valid (count of unmasked
+// rows) ONCE and writes it to device memory, instead of every one of the D
+// column-threads in the main kernel redoing this identical O(K) loop.
+__global__ void count_valid_kernel(const float* __restrict__ mask, int K,
+                                   int* __restrict__ out_num_valid) {
+    __shared__ int sh[RED_BLOCK];
+    const int tid = threadIdx.x;
+    int local = 0;
+    for (int k = tid; k < K; k += blockDim.x) local += (mask[k] != 0.0f);
+    sh[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) *out_num_valid = sh[0];
+}
+
 // One thread per output column. Each thread sums its column over valid rows
-// and divides by num_valid. If num_valid == 0, writes 0.
+// and divides by num_valid. If num_valid == 0, writes 0. num_valid is read
+// from a device scratch int precomputed once by count_valid_kernel (mask !=
+// nullptr) rather than recomputed redundantly by each of the D threads.
 template <typename T>
 __global__ void masked_mean_pool_forward_kernel(const T* __restrict__ X,
                                                 const float* __restrict__ mask,
                                                 T* __restrict__ y,
-                                                int K, int D) {
+                                                int K, int D,
+                                                const int* __restrict__ num_valid_ptr) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= D) return;
 
-    int num_valid = 0;
-    if (mask) {
-        for (int k = 0; k < K; ++k) num_valid += (mask[k] != 0.0f);
-    } else {
-        num_valid = K;
-    }
+    const int num_valid = mask ? *num_valid_ptr : K;
 
     if (num_valid == 0) { r_store<T>(&y[j], 0.0f); return; }
 
@@ -103,20 +126,33 @@ void masked_mean_pool_forward(const ::brotensor::Tensor& X, const float* d_mask,
         y.resize(D, 1, X.dtype);
     }
     if (D == 0) return;
+
+    // Precompute num_valid once (mask case) instead of D-fold redundantly.
+    int* d_num_valid = nullptr;
+    if (d_mask) {
+        d_num_valid = static_cast<int*>(cuda_alloc(sizeof(int)));
+        count_valid_kernel<<<1, RED_BLOCK, 0, cur_stream()>>>(d_mask, K, d_num_valid);
+    }
+
     if (X.dtype == ::brotensor::Dtype::FP16) {
         masked_mean_pool_forward_kernel<__half><<<grid_for(D, RED_BLOCK), RED_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(X.data), d_mask,
-            static_cast<__half*>(y.data), K, D);
+            static_cast<__half*>(y.data), K, D, d_num_valid);
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
         masked_mean_pool_forward_kernel<__nv_bfloat16><<<grid_for(D, RED_BLOCK), RED_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(X.data), d_mask,
-            static_cast<__nv_bfloat16*>(y.data), K, D);
+            static_cast<__nv_bfloat16*>(y.data), K, D, d_num_valid);
     } else {
         masked_mean_pool_forward_kernel<float><<<grid_for(D, RED_BLOCK), RED_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data), d_mask,
-            static_cast<float*>(y.data), K, D);
+            static_cast<float*>(y.data), K, D, d_num_valid);
     }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    const cudaError_t launch_err = cudaGetLastError();
+
+    if (d_num_valid) {
+        cuda_free(d_num_valid);
+    }
+    BROTENSOR_CUDA_CHECK(launch_err);
 }
 
 void masked_mean_pool_backward(const ::brotensor::Tensor& dY, const float* d_mask,

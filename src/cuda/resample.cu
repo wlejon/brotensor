@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -318,6 +319,12 @@ inline void check_dtype_fp(const ::brotensor::Tensor& t,
 
 namespace detail::cuda {
 
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
+
 // ─── Forward ───────────────────────────────────────────────────────────────
 
 void upsample_nearest_2x(const ::brotensor::Tensor& X,
@@ -469,9 +476,7 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     } else if (dY.dtype == Dtype::FP16) {
         // FP16 storage: allocate FP32 scratch, scatter into it, fold back.
-        float* d_scratch = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
-                                        total_in * sizeof(float)));
+        float* d_scratch = static_cast<float*>(cuda_alloc(static_cast<size_t>(total_in) * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_scratch, 0, total_in * sizeof(float), cur_stream()));
         upsample_bilinear_2x_backward_scatter_fp16<<<grid_for(total_out), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(dY.data),
@@ -480,12 +485,10 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
         copy_fp32_to_fp16<<<grid_for(total_in), RS_BLOCK, 0, cur_stream()>>>(
             d_scratch, static_cast<__half*>(dX.data), total_in);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_scratch);
+        cuda_free(d_scratch);
     } else {
         // BF16 storage: same FP32-scratch pattern as FP16.
-        float* d_scratch = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
-                                        total_in * sizeof(float)));
+        float* d_scratch = static_cast<float*>(cuda_alloc(static_cast<size_t>(total_in) * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_scratch, 0, total_in * sizeof(float), cur_stream()));
         upsample_bilinear_2x_backward_scatter_bf16<<<grid_for(total_out), RS_BLOCK, 0, cur_stream()>>>(
             static_cast<const __nv_bfloat16*>(dY.data),
@@ -494,7 +497,7 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
         copy_fp32_to_bf16<<<grid_for(total_in), RS_BLOCK, 0, cur_stream()>>>(
             d_scratch, static_cast<__nv_bfloat16*>(dX.data), total_in);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_scratch);
+        cuda_free(d_scratch);
     }
 }
 

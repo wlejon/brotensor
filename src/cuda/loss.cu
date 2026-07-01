@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -23,6 +24,13 @@ static inline cudaStream_t cur_stream() {
 namespace brotensor::detail::cuda {
 
 using ::brotensor::Tensor;
+
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair — used below for the per-call
+// scalar-loss scratch instead of raw cudaMalloc/cudaFree.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
 namespace {
 
@@ -43,7 +51,15 @@ inline void require_fp32_out(const Tensor& t, const char* op, const char* name) 
 }
 
 
-constexpr int LOSS_BLOCK = 256;
+// mse_forward_kernel / softmax_xent_fused_kernel (below) reduce over a
+// SINGLE flat vector — one shared reduction domain — so they always launch
+// exactly one block regardless of n; a vocab-sized n still only occupies one
+// SM no matter the block size, but 1024 threads (vs. 256) still cuts the
+// per-thread grid-stride factor 4x. The batched siblings below (mse_per_sample,
+// softmax_xent_fused_batched, bce_with_logits_fused_batched) already scale
+// their grid with B (see grid_for()/dim3(n_heads, b_chunk)), so bumping the
+// shared block-size constant is neutral-to-positive there too.
+constexpr int LOSS_BLOCK = 1024;
 
 __global__ void mse_forward_kernel(const float* __restrict__ pred,
                                    const float* __restrict__ target,
@@ -313,8 +329,11 @@ float mse_vec_forward(const Tensor& pred, const Tensor& target) {
     require_fp32(target, "mse_vec_forward", "target");
     const int n = pred.size();
     if (n == 0) return 0.0f;
-    float* d_sum = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(&d_sum, sizeof(float)));
+    // Pooled/stream-ordered scratch alloc — this function returns a host
+    // float per its signature, so the cudaStreamSynchronize below is
+    // unavoidable (the caller needs the loss value on the host now), but the
+    // allocation side no longer forces its own separate device-wide sync.
+    float* d_sum = static_cast<float*>(cuda_alloc(sizeof(float)));
     mse_forward_kernel<<<1, LOSS_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(pred.data),
         static_cast<const float*>(target.data),
@@ -324,7 +343,7 @@ float mse_vec_forward(const Tensor& pred, const Tensor& target) {
     BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(&h_sum, d_sum, sizeof(float),
                               cudaMemcpyDeviceToHost, cur_stream()));
     BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
-    cudaFree(d_sum);
+    cuda_free(d_sum);
     return h_sum / static_cast<float>(n);
 }
 
@@ -487,8 +506,11 @@ float softmax_xent_fused(const Tensor& logits, const Tensor& target,
     }
     if (n == 0) return 0.0f;
 
-    float* d_loss = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(&d_loss, sizeof(float)));
+    // Pooled/stream-ordered scratch alloc (see mse_vec_forward above) — the
+    // cudaStreamSynchronize below stays: this function returns a host float
+    // per its signature, so the loss value must be physically on the host
+    // before we can return it.
+    float* d_loss = static_cast<float*>(cuda_alloc(sizeof(float)));
     softmax_xent_fused_kernel<<<1, LOSS_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(logits.data),
         static_cast<const float*>(target.data),
@@ -502,7 +524,7 @@ float softmax_xent_fused(const Tensor& logits, const Tensor& target,
     BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(&h_loss, d_loss, sizeof(float),
                               cudaMemcpyDeviceToHost, cur_stream()));
     BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
-    cudaFree(d_loss);
+    cuda_free(d_loss);
     return h_loss;
 }
 

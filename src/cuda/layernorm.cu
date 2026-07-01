@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <cstddef>
 #include <stdexcept>
 
 namespace brotensor { void* cuda_current_stream(); }
@@ -19,6 +20,12 @@ namespace brotensor::detail::cuda {
 static inline cudaStream_t cur_stream() {
     return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
 }
+
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
 // NOTE on signature: per Subagent 1's spec, mean_out/rstd_out are host-side
 // floats. We honour that: the kernel writes the two scalars to a tiny device
@@ -396,10 +403,18 @@ void layernorm_forward(const ::brotensor::Tensor& x,
         return;
     }
 
-    // Scratch buffer for [mean, rstd] on device.
-    float* d_scratch = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scratch),
-                              2 * sizeof(float)));
+    // Scratch buffer for [mean, rstd] on device — pooled/stream-ordered alloc
+    // (cudaMallocAsync under the hood when supported) instead of a raw
+    // cudaMalloc, so this per-call scratch doesn't force a device-wide sync
+    // on the allocation side. The cudaStreamSynchronize below is still
+    // required: mean_out/rstd_out are host `float&` outputs per this
+    // function's documented contract (see norm.h), so the value has to be
+    // physically on the host before we can return it — that stall (and the
+    // resulting non-graph-capturability) is inherent to this entry point,
+    // not to the allocator. Callers that need a graph-capturable /
+    // host-sync-free path should use layernorm_forward_batched_with_caches
+    // (device-resident Mean_R/Rstd_R) instead.
+    float* d_scratch = static_cast<float*>(cuda_alloc(2 * sizeof(float)));
 
     if (x.dtype == Dtype::FP16) {
         layernorm_forward_kernel_fp16<<<1, LN_BLOCK, 0, cur_stream()>>>(
@@ -432,7 +447,7 @@ void layernorm_forward(const ::brotensor::Tensor& x,
     BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(h, d_scratch, 2 * sizeof(float),
                               cudaMemcpyDeviceToHost, cur_stream()));
     BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(cur_stream()));
-    cudaFree(d_scratch);
+    cuda_free(d_scratch);
     mean_out = h[0];
     rstd_out = h[1];
 }
@@ -697,10 +712,8 @@ void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
             n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
     } else if (dY.dtype == Dtype::BF16) {
-        float* d_dg = nullptr;
-        float* d_db = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg), n * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db), n * sizeof(float)));
+        float* d_dg = static_cast<float*>(cuda_alloc(static_cast<size_t>(n) * sizeof(float)));
+        float* d_db = static_cast<float*>(cuda_alloc(static_cast<size_t>(n) * sizeof(float)));
         layernorm_backward_kernel_bf16<<<1, LN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(dY.data),
             reinterpret_cast<const __nv_bfloat16*>(xhat.data),
@@ -715,13 +728,11 @@ void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
         ln_add_fp32_into_bf16<<<blocks, 256, 0, cur_stream()>>>(
             d_db, reinterpret_cast<__nv_bfloat16*>(dBeta.data), n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_dg);
-        cudaFree(d_db);
+        cuda_free(d_dg);
+        cuda_free(d_db);
     } else {
-        float* d_dg = nullptr;
-        float* d_db = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg), n * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db), n * sizeof(float)));
+        float* d_dg = static_cast<float*>(cuda_alloc(static_cast<size_t>(n) * sizeof(float)));
+        float* d_db = static_cast<float*>(cuda_alloc(static_cast<size_t>(n) * sizeof(float)));
         layernorm_backward_kernel_fp16<<<1, LN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __half*>(dY.data),
             reinterpret_cast<const __half*>(xhat.data),
@@ -736,8 +747,8 @@ void layernorm_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
         ln_add_fp32_into_fp16<<<blocks, 256, 0, cur_stream()>>>(
             d_db, reinterpret_cast<__half*>(dBeta.data), n);
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_dg);
-        cudaFree(d_db);
+        cuda_free(d_dg);
+        cuda_free(d_db);
     }
 }
 
@@ -1003,10 +1014,8 @@ void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
     } else {
         // Allocate + zero FP32 scratch[D] for dGamma and dBeta, accumulate via
         // atomics, then fold into caller's FP16/BF16 accumulators.
-        float* d_dg = nullptr;
-        float* d_db = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dg), D * sizeof(float)));
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db), D * sizeof(float)));
+        float* d_dg = static_cast<float*>(cuda_alloc(static_cast<size_t>(D) * sizeof(float)));
+        float* d_db = static_cast<float*>(cuda_alloc(static_cast<size_t>(D) * sizeof(float)));
         BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_dg, 0, D * sizeof(float), cur_stream()));
         BROTENSOR_CUDA_CHECK(cudaMemsetAsync(d_db, 0, D * sizeof(float), cur_stream()));
         if (dY_RD.dtype == Dtype::FP16) {
@@ -1039,8 +1048,8 @@ void layernorm_backward_batched_with_caches(const ::brotensor::Tensor& dY_RD,
                 d_db, reinterpret_cast<__nv_bfloat16*>(dBeta.data), D);
         }
         BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_dg);
-        cudaFree(d_db);
+        cuda_free(d_dg);
+        cuda_free(d_db);
     }
 }
 

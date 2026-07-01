@@ -18,6 +18,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -28,6 +29,12 @@ static inline cudaStream_t cur_stream() {
 }
 
 namespace brotensor::detail::cuda {
+
+// Defined in tensor.cu (same namespace). The pooled allocator draws from a
+// stream-ordered memory pool (cudaMallocAsync/cudaFreeAsync) instead of the
+// synchronizing cudaMalloc/cudaFree pair.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
 
 namespace {
 
@@ -113,9 +120,7 @@ void image_normalize(const ::brotensor::Tensor& X,
 
     // Precompute 1/std on device. (Cheap C-length scratch; avoids redundant
     // division in the per-element kernel.)
-    float* d_inv = nullptr;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_inv),
-                                    C * sizeof(float)));
+    float* d_inv = static_cast<float*>(cuda_alloc(static_cast<size_t>(C) * sizeof(float)));
     image_inv_std_kernel<<<(C + BLK - 1) / BLK, BLK, 0, cur_stream()>>>(
         reinterpret_cast<const float*>(std_.data), d_inv, C);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -129,7 +134,7 @@ void image_normalize(const ::brotensor::Tensor& X,
         total, C, spatial);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
-    cudaFree(d_inv);
+    cuda_free(d_inv);
 }
 
 void image_u8_to_f32_nhwc_to_nchw(const uint8_t* src,
