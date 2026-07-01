@@ -14,8 +14,11 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <mma.h>
 
+#include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 namespace brotensor {
 
@@ -145,6 +148,273 @@ __global__ void matmul_bf16_kernel(const __nv_bfloat16* __restrict__ A,
     }
 }
 
+// ─── WMMA tensor-core path: C(M,N) = A(M,K) @ B(K,N), both row-major ───────
+//
+// fp16_matmul.cu's `matmul_ABT_wmma_kernel` computes C = A @ B^T where B is
+// stored row-major as (N,K); it loads B tiles with a col_major fragment so
+// the WMMA math sees B as (K,N) without physically transposing anything.
+// Here B is *already* stored row-major as (K,N) — the layout WMMA's
+// `matrix_b, row_major` fragment expects directly — so B tiles are staged
+// into shared memory with a plain, untransposed (BK x BN) row-major copy and
+// consumed with a row_major fragment. A's tiling (row-major (M,K), row_major
+// fragment) and the FP32-accumulator / per-type store epilogue mirror
+// fp16_matmul.cu's kernel exactly; only the B tile's shape/orientation and
+// the (unused here) bias/act epilogue differ.
+//
+// Same CTA/warp tile shape as fp16_matmul.cu: BM=64, BN=64, BK=32, 4 warps
+// (2x2) per 128-thread CTA, WM=WN=32 (2x2 16x16x16 fragments per warp).
+template <typename T> struct rm_traits;
+template <> struct rm_traits<__half> {
+    __device__ static __half from_f32(float v) { return __float2half(v); }
+    __device__ static float  to_f32(__half v)  { return __half2float(v); }
+};
+template <> struct rm_traits<__nv_bfloat16> {
+    __device__ static __nv_bfloat16 from_f32(float v)       { return __float2bfloat16(v); }
+    __device__ static float         to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+};
+
+constexpr int RM_WMMA_M = 16;
+constexpr int RM_WMMA_N = 16;
+constexpr int RM_WMMA_K = 16;
+
+constexpr int RM_BM = 64;
+constexpr int RM_BN = 64;
+constexpr int RM_BK = 32;
+constexpr int RM_WARPS_M = 2;
+constexpr int RM_WARPS_N = 2;
+constexpr int RM_WARPS_PER_CTA = RM_WARPS_M * RM_WARPS_N;   // 4
+constexpr int RM_THREADS_PER_CTA = RM_WARPS_PER_CTA * 32;   // 128
+constexpr int RM_WM = RM_BM / RM_WARPS_M;                   // 32
+constexpr int RM_WN = RM_BN / RM_WARPS_N;                   // 32
+constexpr int RM_FRAGS_M = RM_WM / RM_WMMA_M;                // 2
+constexpr int RM_FRAGS_N = RM_WN / RM_WMMA_N;                // 2
+
+// Pad shared-memory leading dims to a multiple of 8 (required by
+// wmma::load_matrix_sync's `ldm` for row_major/col_major fragments) while
+// reducing bank conflicts — same trick as fp16_matmul.cu.
+constexpr int RM_LDA_SMEM = RM_BK + 8;   // 40, for A tile (BM rows, BK cols)
+constexpr int RM_LDB_SMEM = RM_BN + 8;   // 72, for B tile (BK rows, BN cols)
+
+template <typename T>
+__launch_bounds__(RM_THREADS_PER_CTA)
+__global__ void matmul_rm_wmma_kernel(const T* __restrict__ A,
+                                      const T* __restrict__ B,
+                                      T* __restrict__ C,
+                                      int M, int N, int K) {
+    using namespace nvcuda;
+    using TR = rm_traits<T>;
+    __shared__ T As[RM_BM][RM_LDA_SMEM];
+    __shared__ T Bs[RM_BK][RM_LDB_SMEM];
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int warp_m  = warp_id / RM_WARPS_N;
+    const int warp_n  = warp_id % RM_WARPS_N;
+
+    const int block_m = blockIdx.y * RM_BM;
+    const int block_n = blockIdx.x * RM_BN;
+
+    wmma::fragment<wmma::accumulator, RM_WMMA_M, RM_WMMA_N, RM_WMMA_K, float> c_frag[RM_FRAGS_M][RM_FRAGS_N];
+    #pragma unroll
+    for (int i = 0; i < RM_FRAGS_M; ++i) {
+        #pragma unroll
+        for (int j = 0; j < RM_FRAGS_N; ++j) {
+            wmma::fill_fragment(c_frag[i][j], 0.0f);
+        }
+    }
+
+    for (int k0 = 0; k0 < K; k0 += RM_BK) {
+        // ---- Load A tile (RM_BM x RM_BK): natural row-major (M,K) access ----
+        {
+            constexpr int kElemsPerLoad = 8;  // int4 = 8 x 16-bit
+            constexpr int kTotalElems   = RM_BM * RM_BK;
+            constexpr int kLoadsTotal   = kTotalElems / kElemsPerLoad;
+            constexpr int kLoadsPerThr  = kLoadsTotal / RM_THREADS_PER_CTA;
+
+            #pragma unroll
+            for (int li = 0; li < kLoadsPerThr; ++li) {
+                const int lin = tid + li * RM_THREADS_PER_CTA;
+                const int row = lin / (RM_BK / kElemsPerLoad);
+                const int col_grp = lin % (RM_BK / kElemsPerLoad);
+                const int gcol = col_grp * kElemsPerLoad;
+                const int grow = block_m + row;
+                const int gk   = k0 + gcol;
+
+                T tmp[kElemsPerLoad];
+                if (grow < M && gk + kElemsPerLoad <= K) {
+                    const int4* src = reinterpret_cast<const int4*>(&A[grow * K + gk]);
+                    *reinterpret_cast<int4*>(tmp) = *src;
+                } else {
+                    #pragma unroll
+                    for (int q = 0; q < kElemsPerLoad; ++q) {
+                        const int gk_q = gk + q;
+                        tmp[q] = (grow < M && gk_q < K) ? A[grow * K + gk_q] : TR::from_f32(0.0f);
+                    }
+                }
+                *reinterpret_cast<int4*>(&As[row][gcol]) = *reinterpret_cast<int4*>(tmp);
+            }
+        }
+
+        // ---- Load B tile (RM_BK x RM_BN): natural row-major (K,N) access,
+        // no transpose — this is the key difference from the ABT kernel. ----
+        {
+            constexpr int kElemsPerLoad = 8;
+            constexpr int kTotalElems   = RM_BK * RM_BN;
+            constexpr int kLoadsTotal   = kTotalElems / kElemsPerLoad;
+            constexpr int kLoadsPerThr  = kLoadsTotal / RM_THREADS_PER_CTA;
+
+            #pragma unroll
+            for (int li = 0; li < kLoadsPerThr; ++li) {
+                const int lin = tid + li * RM_THREADS_PER_CTA;
+                const int row = lin / (RM_BN / kElemsPerLoad);   // K-tile row
+                const int col_grp = lin % (RM_BN / kElemsPerLoad);
+                const int gcol = col_grp * kElemsPerLoad;        // N-tile col
+                const int gk   = k0 + row;
+                const int gn   = block_n + gcol;
+
+                T tmp[kElemsPerLoad];
+                if (gk < K && gn + kElemsPerLoad <= N) {
+                    const int4* src = reinterpret_cast<const int4*>(&B[size_t(gk) * N + gn]);
+                    *reinterpret_cast<int4*>(tmp) = *src;
+                } else {
+                    #pragma unroll
+                    for (int q = 0; q < kElemsPerLoad; ++q) {
+                        const int gn_q = gn + q;
+                        tmp[q] = (gk < K && gn_q < N) ? B[size_t(gk) * N + gn_q] : TR::from_f32(0.0f);
+                    }
+                }
+                *reinterpret_cast<int4*>(&Bs[row][gcol]) = *reinterpret_cast<int4*>(tmp);
+            }
+        }
+
+        __syncthreads();
+
+        // ---- Compute on shared mem tiles ----
+        // A frag: row_major from As, leading dim RM_LDA_SMEM, sub-tile at
+        //         (warp_m*WM+i*WMMA_M, kk).
+        // B frag: row_major from Bs (which is BK-rows by BN-cols row-major,
+        //         exactly the (K,N) shape wmma::matrix_b/row_major expects),
+        //         leading dim RM_LDB_SMEM, sub-tile at (kk, warp_n*WN+j*WMMA_N).
+        #pragma unroll
+        for (int kk = 0; kk < RM_BK; kk += RM_WMMA_K) {
+            wmma::fragment<wmma::matrix_a, RM_WMMA_M, RM_WMMA_N, RM_WMMA_K, T, wmma::row_major> a_frag[RM_FRAGS_M];
+            wmma::fragment<wmma::matrix_b, RM_WMMA_M, RM_WMMA_N, RM_WMMA_K, T, wmma::row_major> b_frag[RM_FRAGS_N];
+
+            #pragma unroll
+            for (int i = 0; i < RM_FRAGS_M; ++i) {
+                const T* a_ptr = &As[warp_m * RM_WM + i * RM_WMMA_M][kk];
+                wmma::load_matrix_sync(a_frag[i], a_ptr, RM_LDA_SMEM);
+            }
+            #pragma unroll
+            for (int j = 0; j < RM_FRAGS_N; ++j) {
+                const T* b_ptr = &Bs[kk][warp_n * RM_WN + j * RM_WMMA_N];
+                wmma::load_matrix_sync(b_frag[j], b_ptr, RM_LDB_SMEM);
+            }
+
+            #pragma unroll
+            for (int i = 0; i < RM_FRAGS_M; ++i) {
+                #pragma unroll
+                for (int j = 0; j < RM_FRAGS_N; ++j) {
+                    wmma::mma_sync(c_frag[i][j], a_frag[i], b_frag[j], c_frag[i][j]);
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // ---- Store C tile ----
+    if constexpr (std::is_same<T, __half>::value) {
+        __shared__ __half Cs[RM_BM][RM_BN + 8];
+
+        #pragma unroll
+        for (int i = 0; i < RM_FRAGS_M; ++i) {
+            #pragma unroll
+            for (int j = 0; j < RM_FRAGS_N; ++j) {
+                wmma::fragment<wmma::accumulator, RM_WMMA_M, RM_WMMA_N, RM_WMMA_K, __half> c_h;
+                #pragma unroll
+                for (int e = 0; e < c_frag[i][j].num_elements; ++e) {
+                    c_h.x[e] = __float2half(c_frag[i][j].x[e]);
+                }
+                __half* c_ptr = &Cs[warp_m * RM_WM + i * RM_WMMA_M][warp_n * RM_WN + j * RM_WMMA_N];
+                wmma::store_matrix_sync(c_ptr, c_h, RM_BN + 8, wmma::mem_row_major);
+            }
+        }
+
+        __syncthreads();
+
+        constexpr int kHalvesPerStore = 8;
+        constexpr int kTotal          = RM_BM * RM_BN;
+        constexpr int kStoresTotal    = kTotal / kHalvesPerStore;
+        constexpr int kStoresPerThr   = kStoresTotal / RM_THREADS_PER_CTA;
+
+        #pragma unroll
+        for (int si = 0; si < kStoresPerThr; ++si) {
+            const int lin = tid + si * RM_THREADS_PER_CTA;
+            const int row = lin / (RM_BN / kHalvesPerStore);
+            const int col_grp = lin % (RM_BN / kHalvesPerStore);
+            const int gcol = col_grp * kHalvesPerStore;
+            const int grow = block_m + row;
+            const int gn   = block_n + gcol;
+
+            if (grow >= M) continue;
+            if (gn + kHalvesPerStore <= N) {
+                int4 v = *reinterpret_cast<const int4*>(&Cs[row][gcol]);
+                *reinterpret_cast<int4*>(&C[size_t(grow) * N + gn]) = v;
+            } else {
+                #pragma unroll
+                for (int q = 0; q < kHalvesPerStore; ++q) {
+                    const int gn_q = gn + q;
+                    if (gn_q < N) {
+                        C[size_t(grow) * N + gn_q] = Cs[row][gcol + q];
+                    }
+                }
+            }
+        }
+    } else {
+        // BF16: WMMA has no BF16 accumulator fragment, so stage the FP32
+        // accumulator through a float tile and narrow to BF16 in the scatter
+        // (same approach as fp16_matmul.cu's BF16 path).
+        __shared__ float Cs[RM_BM][RM_BN + 8];
+
+        #pragma unroll
+        for (int i = 0; i < RM_FRAGS_M; ++i) {
+            #pragma unroll
+            for (int j = 0; j < RM_FRAGS_N; ++j) {
+                float* c_ptr = &Cs[warp_m * RM_WM + i * RM_WMMA_M][warp_n * RM_WN + j * RM_WMMA_N];
+                wmma::store_matrix_sync(c_ptr, c_frag[i][j], RM_BN + 8, wmma::mem_row_major);
+            }
+        }
+
+        __syncthreads();
+
+        constexpr int kTotal       = RM_BM * RM_BN;
+        constexpr int kElemsPerThr = kTotal / RM_THREADS_PER_CTA;
+
+        #pragma unroll
+        for (int si = 0; si < kElemsPerThr; ++si) {
+            const int lin = tid + si * RM_THREADS_PER_CTA;
+            const int row = lin / RM_BN;
+            const int col = lin - row * RM_BN;
+            const int grow = block_m + row;
+            const int gn   = block_n + col;
+            if (grow >= M || gn >= N) continue;
+            C[size_t(grow) * N + gn] = TR::from_f32(Cs[row][col]);
+        }
+    }
+}
+
+// Gating: only take the WMMA path when the vectorised int4 tile loads (A
+// along K, B/C along N) are alignment-safe and the problem is large enough
+// to be worth tensor cores. Mirrors fp16_matmul.cu's `launch_abt` gating
+// (same reasoning: K/N not a multiple of 8, K below one WMMA_K tile, or a
+// tiny M*N all fall back to the existing scalar kernel rather than risk an
+// unhandled edge case in the tensor-core path).
+static bool matmul_rm_wmma_eligible(int M, int N, int K) {
+    return size_t(M) * size_t(N) >= 256 && K >= 16 &&
+           (K & 7) == 0 && (N & 7) == 0;
+}
+
 } // namespace
 
 void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
@@ -168,23 +438,46 @@ void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
         return;
     }
 
-    dim3 block(MM_TILE, MM_TILE);
-    dim3 grid((N + MM_TILE - 1) / MM_TILE, (M + MM_TILE - 1) / MM_TILE);
     cudaStream_t stream =
         reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
-    if (A.dtype == Dtype::FP16) {
-        matmul_fp16_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const __half*>(A.data),
-            static_cast<const __half*>(B.data),
-            static_cast<__half*>(C.data),
-            M, N, K);
-    } else if (A.dtype == Dtype::BF16) {
-        matmul_bf16_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(A.data),
-            static_cast<const __nv_bfloat16*>(B.data),
-            static_cast<__nv_bfloat16*>(C.data),
-            M, N, K);
+
+    if (A.dtype == Dtype::FP16 || A.dtype == Dtype::BF16) {
+        if (matmul_rm_wmma_eligible(M, N, K)) {
+            dim3 block(RM_THREADS_PER_CTA);
+            dim3 grid((N + RM_BN - 1) / RM_BN, (M + RM_BM - 1) / RM_BM);
+            if (A.dtype == Dtype::FP16) {
+                matmul_rm_wmma_kernel<__half><<<grid, block, 0, stream>>>(
+                    static_cast<const __half*>(A.data),
+                    static_cast<const __half*>(B.data),
+                    static_cast<__half*>(C.data),
+                    M, N, K);
+            } else {
+                matmul_rm_wmma_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(A.data),
+                    static_cast<const __nv_bfloat16*>(B.data),
+                    static_cast<__nv_bfloat16*>(C.data),
+                    M, N, K);
+            }
+        } else {
+            dim3 block(MM_TILE, MM_TILE);
+            dim3 grid((N + MM_TILE - 1) / MM_TILE, (M + MM_TILE - 1) / MM_TILE);
+            if (A.dtype == Dtype::FP16) {
+                matmul_fp16_kernel<<<grid, block, 0, stream>>>(
+                    static_cast<const __half*>(A.data),
+                    static_cast<const __half*>(B.data),
+                    static_cast<__half*>(C.data),
+                    M, N, K);
+            } else {
+                matmul_bf16_kernel<<<grid, block, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(A.data),
+                    static_cast<const __nv_bfloat16*>(B.data),
+                    static_cast<__nv_bfloat16*>(C.data),
+                    M, N, K);
+            }
+        }
     } else {
+        dim3 block(MM_TILE, MM_TILE);
+        dim3 grid((N + MM_TILE - 1) / MM_TILE, (M + MM_TILE - 1) / MM_TILE);
         matmul_fp32_kernel<<<grid, block, 0, stream>>>(
             static_cast<const float*>(A.data),
             static_cast<const float*>(B.data),
