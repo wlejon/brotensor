@@ -16,6 +16,19 @@ if(MSVC)
     endif()
 endif()
 
+# CPU-backend SIMD baseline. AVX2+FMA has been the safe floor for any
+# x86-64 machine capable of hosting a CUDA-class GPU dev box since ~2013 —
+# targeting it (vs. the compiler's default pre-AVX baseline) lets the
+# auto-vectorizer use 256-bit paths on the scalar FP32 loops in src/cpu/.
+# Scoped to the CPU-heavy targets only, not forced on GPU backend TUs.
+if(MSVC)
+    set(BROTENSOR_CPU_SIMD_FLAGS $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+else()
+    set(BROTENSOR_CPU_SIMD_FLAGS
+        $<$<COMPILE_LANGUAGE:CXX>:-mavx2>
+        $<$<COMPILE_LANGUAGE:CXX>:-mfma>)
+endif()
+
 # --- Backends ---
 #
 # brotensor is layered: a core dispatcher + always-on CPU backend, plus
@@ -148,6 +161,7 @@ else()
         $<$<COMPILE_LANGUAGE:CXX>:-Wall>
         $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
 endif()
+target_compile_options(brotensor_cpu PRIVATE ${BROTENSOR_CPU_SIMD_FLAGS})
 
 # --- brotensor_cuda: CUDA backend (optional) ---
 
