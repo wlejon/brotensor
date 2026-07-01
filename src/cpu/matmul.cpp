@@ -40,13 +40,18 @@ void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
     const float* Ap = A.host_f32();
     const float* Bp = B.host_f32();
     float* Cp = C.host_f32_mut();
+    // m-k-n order: broadcast A[m,k], walk B's row k and C's row m contiguously
+    // in the innermost loop (both stride-1) instead of striding through B by N
+    // floats per k step.
     for (int m = 0; m < M; ++m) {
-        for (int n = 0; n < N; ++n) {
-            float acc = 0.0f;
-            for (int k = 0; k < K; ++k) {
-                acc += Ap[m * K + k] * Bp[k * N + n];
+        float* Crow = Cp + static_cast<size_t>(m) * N;
+        for (int n = 0; n < N; ++n) Crow[n] = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            const float a_mk = Ap[m * K + k];
+            const float* Brow = Bp + static_cast<size_t>(k) * N;
+            for (int n = 0; n < N; ++n) {
+                Crow[n] += a_mk * Brow[n];
             }
-            Cp[m * N + n] = acc;
         }
     }
 }
@@ -164,13 +169,17 @@ void matmul_backward(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
         }
     }
     // dB[k, n] += sum_m A[m, k] * dC[m, n]  (accumulate — matches GPU atomicAdd)
-    for (int k = 0; k < K; ++k) {
-        for (int n = 0; n < N; ++n) {
-            float acc = 0.0f;
-            for (int m = 0; m < M; ++m) {
-                acc += Ap[m * K + k] * dCp[m * N + n];
+    // m-k-n order: broadcast A[m,k], walk dC's row m and dB's row k
+    // contiguously (both stride-1) instead of striding through A and dC by K
+    // and N floats respectively per m step.
+    for (int m = 0; m < M; ++m) {
+        const float* dCrow = dCp + static_cast<size_t>(m) * N;
+        for (int k = 0; k < K; ++k) {
+            const float a_mk = Ap[m * K + k];
+            float* dBrow = dBp + static_cast<size_t>(k) * N;
+            for (int n = 0; n < N; ++n) {
+                dBrow[n] += a_mk * dCrow[n];
             }
-            dBp[k * N + n] += acc;
         }
     }
 }

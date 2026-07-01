@@ -30,6 +30,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brotensor::detail::cpu {
 
@@ -93,29 +94,42 @@ void upsample_bilinear_2x(const ::brotensor::Tensor& X,
     const float* Xp = X.host_f32();
     float* Yp = Y.host_f32_mut();
 
+    // src_y/src_x and the derived taps depend only on (oh)/(ow), never on
+    // (n, c) — precompute once instead of redoing it inside the (n, c) loop.
+    struct RowTap { int y0, y1; float fy; };
+    struct ColTap { int x0, x1; float fx; };
+    std::vector<RowTap> row_tap(H_out);
+    for (int oh = 0; oh < H_out; ++oh) {
+        const float src_y = (oh + 0.5f) * 0.5f - 0.5f;
+        const int y0 = static_cast<int>(std::floor(src_y));
+        row_tap[oh].fy = src_y - y0;
+        row_tap[oh].y0 = clampi(y0,     0, H - 1);
+        row_tap[oh].y1 = clampi(y0 + 1, 0, H - 1);
+    }
+    std::vector<ColTap> col_tap(W_out);
+    for (int ow = 0; ow < W_out; ++ow) {
+        const float src_x = (ow + 0.5f) * 0.5f - 0.5f;
+        const int x0 = static_cast<int>(std::floor(src_x));
+        col_tap[ow].fx = src_x - x0;
+        col_tap[ow].x0 = clampi(x0,     0, W - 1);
+        col_tap[ow].x1 = clampi(x0 + 1, 0, W - 1);
+    }
+
     for (int n = 0; n < N; ++n) {
         for (int c = 0; c < C; ++c) {
             const int base = (n * C + c) * H;
             for (int oh = 0; oh < H_out; ++oh) {
-                const float src_y = (oh + 0.5f) * 0.5f - 0.5f;
-                const int y0 = static_cast<int>(std::floor(src_y));
-                const float fy = src_y - y0;
-                const int y0c = clampi(y0, 0, H - 1);
-                const int y1c = clampi(y0 + 1, 0, H - 1);
+                const RowTap& r = row_tap[oh];
                 for (int ow = 0; ow < W_out; ++ow) {
-                    const float src_x = (ow + 0.5f) * 0.5f - 0.5f;
-                    const int x0 = static_cast<int>(std::floor(src_x));
-                    const float fx = src_x - x0;
-                    const int x0c = clampi(x0, 0, W - 1);
-                    const int x1c = clampi(x0 + 1, 0, W - 1);
-                    const float v00 = Xp[(base + y0c) * W + x0c];
-                    const float v01 = Xp[(base + y0c) * W + x1c];
-                    const float v10 = Xp[(base + y1c) * W + x0c];
-                    const float v11 = Xp[(base + y1c) * W + x1c];
-                    const float top = v00 + (v01 - v00) * fx;
-                    const float bot = v10 + (v11 - v10) * fx;
+                    const ColTap& cx = col_tap[ow];
+                    const float v00 = Xp[(base + r.y0) * W + cx.x0];
+                    const float v01 = Xp[(base + r.y0) * W + cx.x1];
+                    const float v10 = Xp[(base + r.y1) * W + cx.x0];
+                    const float v11 = Xp[(base + r.y1) * W + cx.x1];
+                    const float top = v00 + (v01 - v00) * cx.fx;
+                    const float bot = v10 + (v11 - v10) * cx.fx;
                     Yp[((n * C + c) * H_out + oh) * W_out + ow] =
-                        top + (bot - top) * fy;
+                        top + (bot - top) * r.fy;
                 }
             }
         }
@@ -208,31 +222,43 @@ void upsample_bilinear_2x_backward(const ::brotensor::Tensor& dY,
     const int total_in = N * cols_in;
     for (int i = 0; i < total_in; ++i) dXp[i] = 0.0f;
 
+    // Same per-row / per-column tap hoist as the forward pass.
+    struct RowTap { int y0, y1; float fy; };
+    struct ColTap { int x0, x1; float fx; };
+    std::vector<RowTap> row_tap(H_out);
+    for (int oh = 0; oh < H_out; ++oh) {
+        const float src_y = (oh + 0.5f) * 0.5f - 0.5f;
+        const int y0 = static_cast<int>(std::floor(src_y));
+        row_tap[oh].fy = src_y - y0;
+        row_tap[oh].y0 = clampi(y0,     0, H - 1);
+        row_tap[oh].y1 = clampi(y0 + 1, 0, H - 1);
+    }
+    std::vector<ColTap> col_tap(W_out);
+    for (int ow = 0; ow < W_out; ++ow) {
+        const float src_x = (ow + 0.5f) * 0.5f - 0.5f;
+        const int x0 = static_cast<int>(std::floor(src_x));
+        col_tap[ow].fx = src_x - x0;
+        col_tap[ow].x0 = clampi(x0,     0, W - 1);
+        col_tap[ow].x1 = clampi(x0 + 1, 0, W - 1);
+    }
+
     for (int n = 0; n < N; ++n) {
         for (int c = 0; c < C; ++c) {
             const int base = (n * C + c) * H;
             for (int oh = 0; oh < H_out; ++oh) {
-                const float src_y = (oh + 0.5f) * 0.5f - 0.5f;
-                const int y0 = static_cast<int>(std::floor(src_y));
-                const float fy = src_y - y0;
-                const int y0c = clampi(y0, 0, H - 1);
-                const int y1c = clampi(y0 + 1, 0, H - 1);
+                const RowTap& r = row_tap[oh];
                 for (int ow = 0; ow < W_out; ++ow) {
-                    const float src_x = (ow + 0.5f) * 0.5f - 0.5f;
-                    const int x0 = static_cast<int>(std::floor(src_x));
-                    const float fx = src_x - x0;
-                    const int x0c = clampi(x0, 0, W - 1);
-                    const int x1c = clampi(x0 + 1, 0, W - 1);
-                    const float w00 = (1.0f - fy) * (1.0f - fx);
-                    const float w01 = (1.0f - fy) * fx;
-                    const float w10 = fy * (1.0f - fx);
-                    const float w11 = fy * fx;
+                    const ColTap& cx = col_tap[ow];
+                    const float w00 = (1.0f - r.fy) * (1.0f - cx.fx);
+                    const float w01 = (1.0f - r.fy) * cx.fx;
+                    const float w10 = r.fy * (1.0f - cx.fx);
+                    const float w11 = r.fy * cx.fx;
                     const float g =
                         dYp[((n * C + c) * H_out + oh) * W_out + ow];
-                    dXp[(base + y0c) * W + x0c] += w00 * g;
-                    dXp[(base + y0c) * W + x1c] += w01 * g;
-                    dXp[(base + y1c) * W + x0c] += w10 * g;
-                    dXp[(base + y1c) * W + x1c] += w11 * g;
+                    dXp[(base + r.y0) * W + cx.x0] += w00 * g;
+                    dXp[(base + r.y0) * W + cx.x1] += w01 * g;
+                    dXp[(base + r.y1) * W + cx.x0] += w10 * g;
+                    dXp[(base + r.y1) * W + cx.x1] += w11 * g;
                 }
             }
         }

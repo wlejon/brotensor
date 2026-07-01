@@ -32,6 +32,7 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <vector>
 
 namespace brotensor::detail::cpu {
 
@@ -141,6 +142,10 @@ void group_norm_backward(const ::brotensor::Tensor& X,
     const int sample_stride = C * spatial;
     const float inv_M = 1.0f / static_cast<float>(tile_size);
 
+    // Scratch buffer for x̂, cached during pass 2 and reused in pass 3 so the
+    // tile's data doesn't need to be re-read/recomputed a third time.
+    std::vector<float> xhat_buf(static_cast<std::size_t>(tile_size));
+
     for (int n = 0; n < N; ++n) {
         for (int g = 0; g < num_groups; ++g) {
             const int chan_base = g * channels_per_group;
@@ -159,30 +164,43 @@ void group_norm_backward(const ::brotensor::Tensor& X,
             const float var  = sumsq * inv_M - mean * mean;
             const float rstd = 1.0f / std::sqrt(var + eps);
 
-            // Pass 2: sum1 = Σ dx̂, sum2 = Σ dx̂·x̂; accumulate dGamma/dBeta.
+            // Pass 2: sum1 = Σ dx̂, sum2 = Σ dx̂·x̂; accumulate dGamma/dBeta;
+            // cache x̂ into xhat_buf for reuse in pass 3. Nested
+            // (channel, spatial) loops keep local_c/channel loop-invariant
+            // per channel instead of deriving it via division per element.
             float sum1 = 0.0f, sum2 = 0.0f;
-            for (int i = 0; i < tile_size; ++i) {
-                const int local_c = i / spatial;
+            for (int local_c = 0; local_c < channels_per_group; ++local_c) {
                 const int channel = chan_base + local_c;
-                const float gv  = gp[channel];
-                const float dyv = dy_tile[i];
-                const float xh  = (x_tile[i] - mean) * rstd;
-                const float dxh = dyv * gv;
-                sum1 += dxh;
-                sum2 += dxh * xh;
-                dGp[channel] += dyv * xh;   // accumulate
-                dBp[channel] += dyv;        // accumulate
+                const float gv = gp[channel];
+                const int base = local_c * spatial;
+                float dg = 0.0f, db = 0.0f;
+                for (int s = 0; s < spatial; ++s) {
+                    const int i = base + s;
+                    const float dyv = dy_tile[i];
+                    const float xh  = (x_tile[i] - mean) * rstd;
+                    xhat_buf[i] = xh;
+                    const float dxh = dyv * gv;
+                    sum1 += dxh;
+                    sum2 += dxh * xh;
+                    dg += dyv * xh;
+                    db += dyv;
+                }
+                dGp[channel] += dg;   // accumulate
+                dBp[channel] += db;   // accumulate
             }
 
             // Pass 3: dX = rstd * (dx̂ - (sum1 + x̂*sum2) / M).
-            for (int i = 0; i < tile_size; ++i) {
-                const int local_c = i / spatial;
+            for (int local_c = 0; local_c < channels_per_group; ++local_c) {
                 const int channel = chan_base + local_c;
-                const float gv  = gp[channel];
-                const float dyv = dy_tile[i];
-                const float xh  = (x_tile[i] - mean) * rstd;
-                const float dxh = dyv * gv;
-                dx_tile[i] = rstd * (dxh - (sum1 + xh * sum2) * inv_M);  // overwrite
+                const float gv = gp[channel];
+                const int base = local_c * spatial;
+                for (int s = 0; s < spatial; ++s) {
+                    const int i = base + s;
+                    const float dyv = dy_tile[i];
+                    const float xh  = xhat_buf[i];
+                    const float dxh = dyv * gv;
+                    dx_tile[i] = rstd * (dxh - (sum1 + xh * sum2) * inv_M);  // overwrite
+                }
             }
         }
     }

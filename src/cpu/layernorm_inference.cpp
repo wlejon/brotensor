@@ -42,16 +42,14 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
         const float* xr = xp + static_cast<std::size_t>(row) * D;
         float* yr = yp + static_cast<std::size_t>(row) * D;
 
-        float mean = 0.0f;
-        for (int i = 0; i < D; ++i) mean += xr[i];
-        mean *= invD;
-
-        float var = 0.0f;
+        float sum = 0.0f, sumsq = 0.0f;
         for (int i = 0; i < D; ++i) {
-            const float d = xr[i] - mean;
-            var += d * d;
+            const float v = xr[i];
+            sum   += v;
+            sumsq += v * v;
         }
-        var *= invD;
+        const float mean = sum * invD;
+        const float var  = sumsq * invD - mean * mean;
         const float rstd = 1.0f / std::sqrt(var + eps);
 
         for (int i = 0; i < D; ++i) {
@@ -103,16 +101,14 @@ void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
         float* yr = yp + static_cast<std::size_t>(row) * D;
         float* hr = hp + static_cast<std::size_t>(row) * D;
 
-        float mean = 0.0f;
-        for (int i = 0; i < D; ++i) mean += xr[i];
-        mean *= invD;
-
-        float var = 0.0f;
+        float sum = 0.0f, sumsq = 0.0f;
         for (int i = 0; i < D; ++i) {
-            const float d = xr[i] - mean;
-            var += d * d;
+            const float v = xr[i];
+            sum   += v;
+            sumsq += v * v;
         }
-        var *= invD;
+        const float mean = sum * invD;
+        const float var  = sumsq * invD - mean * mean;
         const float rstd = 1.0f / std::sqrt(var + eps);
 
         mp[row] = mean;

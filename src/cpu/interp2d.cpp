@@ -33,6 +33,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brotensor::detail::cpu {
 
@@ -129,69 +130,121 @@ static void interp2d_forward_impl(const ::brotensor::Tensor& X,
     const double sy = static_cast<double>(H_in) / static_cast<double>(H_out);
     const double sx = static_cast<double>(W_in) / static_cast<double>(W_out);
 
+    // Per-row / per-column tap tables. src_y/src_x and the derived taps depend
+    // only on (oh) or (ow) — never on (n, c) — so compute them once here
+    // instead of redoing it inside the (n, c) loop below.
+    struct RowNearest { int iy; };
+    struct ColNearest { int ix; };
+    struct RowBilinear { int y0, y1; float fy; };
+    struct ColBilinear { int x0, x1; float fx; };
+    struct RowBicubic { int iy[4]; float wy[4]; };
+    struct ColBicubic { int ix[4]; float wx[4]; };
+
+    std::vector<RowNearest> row_nearest;
+    std::vector<ColNearest> col_nearest;
+    std::vector<RowBilinear> row_bilinear;
+    std::vector<ColBilinear> col_bilinear;
+    std::vector<RowBicubic> row_bicubic;
+    std::vector<ColBicubic> col_bicubic;
+
+    if (mode == 0) {
+        row_nearest.resize(H_out);
+        for (int oh = 0; oh < H_out; ++oh) {
+            const double src_y = align ? align_corners_src(oh, H_in, H_out)
+                                       : (oh + 0.5) * sy - 0.5;
+            row_nearest[oh].iy = clampi(
+                static_cast<int>(std::nearbyint(src_y)), 0, H_in - 1);
+        }
+        col_nearest.resize(W_out);
+        for (int ow = 0; ow < W_out; ++ow) {
+            const double src_x = align ? align_corners_src(ow, W_in, W_out)
+                                       : (ow + 0.5) * sx - 0.5;
+            col_nearest[ow].ix = clampi(
+                static_cast<int>(std::nearbyint(src_x)), 0, W_in - 1);
+        }
+    } else if (mode == 1) {
+        row_bilinear.resize(H_out);
+        for (int oh = 0; oh < H_out; ++oh) {
+            const double src_y = align ? align_corners_src(oh, H_in, H_out)
+                                       : (oh + 0.5) * sy - 0.5;
+            const int y0 = static_cast<int>(std::floor(src_y));
+            row_bilinear[oh].fy = static_cast<float>(src_y - y0);
+            row_bilinear[oh].y0 = clampi(y0,     0, H_in - 1);
+            row_bilinear[oh].y1 = clampi(y0 + 1, 0, H_in - 1);
+        }
+        col_bilinear.resize(W_out);
+        for (int ow = 0; ow < W_out; ++ow) {
+            const double src_x = align ? align_corners_src(ow, W_in, W_out)
+                                       : (ow + 0.5) * sx - 0.5;
+            const int x0 = static_cast<int>(std::floor(src_x));
+            col_bilinear[ow].fx = static_cast<float>(src_x - x0);
+            col_bilinear[ow].x0 = clampi(x0,     0, W_in - 1);
+            col_bilinear[ow].x1 = clampi(x0 + 1, 0, W_in - 1);
+        }
+    } else {
+        // bicubic — 4x4 cubic-convolution, border-clamped.
+        // mode 2: a=-0.5 (PIL); mode 3: a=-0.75 (torch).
+        const float a = (mode == 3) ? -0.75f : -0.5f;
+        row_bicubic.resize(H_out);
+        for (int oh = 0; oh < H_out; ++oh) {
+            const double src_y = align ? align_corners_src(oh, H_in, H_out)
+                                       : (oh + 0.5) * sy - 0.5;
+            const int y0 = static_cast<int>(std::floor(src_y));
+            const float fy = static_cast<float>(src_y - y0);
+            for (int k = 0; k < 4; ++k) {
+                row_bicubic[oh].wy[k] = cubic_keys(fy - (k - 1), a);
+                row_bicubic[oh].iy[k] = clampi(y0 + k - 1, 0, H_in - 1);
+            }
+        }
+        col_bicubic.resize(W_out);
+        for (int ow = 0; ow < W_out; ++ow) {
+            const double src_x = align ? align_corners_src(ow, W_in, W_out)
+                                       : (ow + 0.5) * sx - 0.5;
+            const int x0 = static_cast<int>(std::floor(src_x));
+            const float fx = static_cast<float>(src_x - x0);
+            for (int k = 0; k < 4; ++k) {
+                col_bicubic[ow].wx[k] = cubic_keys(fx - (k - 1), a);
+                col_bicubic[ow].ix[k] = clampi(x0 + k - 1, 0, W_in - 1);
+            }
+        }
+    }
+
     for (int n = 0; n < N; ++n) {
         for (int c = 0; c < C; ++c) {
             const int xbase = (n * C + c) * H_in * W_in;
             const int ybase = (n * C + c) * H_out * W_out;
 
             for (int oh = 0; oh < H_out; ++oh) {
-                const double src_y = align ? align_corners_src(oh, H_in, H_out)
-                                           : (oh + 0.5) * sy - 0.5;
-
                 for (int ow = 0; ow < W_out; ++ow) {
-                    const double src_x = align ? align_corners_src(ow, W_in, W_out)
-                                               : (ow + 0.5) * sx - 0.5;
-
                     if (mode == 0) {
                         // nearest — round_half_to_even then clamp.
-                        const int iy = clampi(
-                            static_cast<int>(std::nearbyint(src_y)),
-                            0, H_in - 1);
-                        const int ix = clampi(
-                            static_cast<int>(std::nearbyint(src_x)),
-                            0, W_in - 1);
+                        const int iy = row_nearest[oh].iy;
+                        const int ix = col_nearest[ow].ix;
                         Yp[ybase + oh * W_out + ow] =
                             Xp[xbase + iy * W_in + ix];
                     } else if (mode == 1) {
                         // bilinear — 2x2 tap, border-clamped.
-                        const int y0 = static_cast<int>(std::floor(src_y));
-                        const int x0 = static_cast<int>(std::floor(src_x));
-                        const float fy = static_cast<float>(src_y - y0);
-                        const float fx = static_cast<float>(src_x - x0);
-                        const int y0c = clampi(y0,     0, H_in - 1);
-                        const int y1c = clampi(y0 + 1, 0, H_in - 1);
-                        const int x0c = clampi(x0,     0, W_in - 1);
-                        const int x1c = clampi(x0 + 1, 0, W_in - 1);
-                        const float v00 = Xp[xbase + y0c * W_in + x0c];
-                        const float v01 = Xp[xbase + y0c * W_in + x1c];
-                        const float v10 = Xp[xbase + y1c * W_in + x0c];
-                        const float v11 = Xp[xbase + y1c * W_in + x1c];
-                        const float top = v00 + (v01 - v00) * fx;
-                        const float bot = v10 + (v11 - v10) * fx;
+                        const RowBilinear& r = row_bilinear[oh];
+                        const ColBilinear& cx = col_bilinear[ow];
+                        const float v00 = Xp[xbase + r.y0 * W_in + cx.x0];
+                        const float v01 = Xp[xbase + r.y0 * W_in + cx.x1];
+                        const float v10 = Xp[xbase + r.y1 * W_in + cx.x0];
+                        const float v11 = Xp[xbase + r.y1 * W_in + cx.x1];
+                        const float top = v00 + (v01 - v00) * cx.fx;
+                        const float bot = v10 + (v11 - v10) * cx.fx;
                         Yp[ybase + oh * W_out + ow] =
-                            top + (bot - top) * fy;
+                            top + (bot - top) * r.fy;
                     } else {
                         // bicubic — 4x4 cubic-convolution, border-clamped.
-                        // mode 2: a=-0.5 (PIL); mode 3: a=-0.75 (torch).
-                        const float a = (mode == 3) ? -0.75f : -0.5f;
-                        const int y0 = static_cast<int>(std::floor(src_y));
-                        const int x0 = static_cast<int>(std::floor(src_x));
-                        const float fy = static_cast<float>(src_y - y0);
-                        const float fx = static_cast<float>(src_x - x0);
-                        float wy[4], wx[4];
-                        for (int k = 0; k < 4; ++k) {
-                            wy[k] = cubic_keys(fy - (k - 1), a);
-                            wx[k] = cubic_keys(fx - (k - 1), a);
-                        }
+                        const RowBicubic& r = row_bicubic[oh];
+                        const ColBicubic& cx = col_bicubic[ow];
                         float acc = 0.0f;
                         for (int j = 0; j < 4; ++j) {
-                            const int iy = clampi(y0 + j - 1, 0, H_in - 1);
                             float row = 0.0f;
                             for (int i = 0; i < 4; ++i) {
-                                const int ix = clampi(x0 + i - 1, 0, W_in - 1);
-                                row += wx[i] * Xp[xbase + iy * W_in + ix];
+                                row += cx.wx[i] * Xp[xbase + r.iy[j] * W_in + cx.ix[i]];
                             }
-                            acc += wy[j] * row;
+                            acc += r.wy[j] * row;
                         }
                         Yp[ybase + oh * W_out + ow] = acc;
                     }
@@ -246,43 +299,74 @@ void interp2d_backward(const ::brotensor::Tensor& dY,
     const double sy = static_cast<double>(H_in) / static_cast<double>(H_out);
     const double sx = static_cast<double>(W_in) / static_cast<double>(W_out);
 
+    // Per-row / per-column tap tables — same rationale as the forward pass:
+    // src_y/src_x and the derived taps depend only on (oh)/(ow), not (n, c).
+    struct RowNearest { int iy; };
+    struct ColNearest { int ix; };
+    struct RowBilinear { int y0, y1; float fy; };
+    struct ColBilinear { int x0, x1; float fx; };
+
+    std::vector<RowNearest> row_nearest;
+    std::vector<ColNearest> col_nearest;
+    std::vector<RowBilinear> row_bilinear;
+    std::vector<ColBilinear> col_bilinear;
+
+    if (mode == 0) {
+        row_nearest.resize(H_out);
+        for (int oh = 0; oh < H_out; ++oh) {
+            const double src_y = (oh + 0.5) * sy - 0.5;
+            row_nearest[oh].iy = clampi(
+                static_cast<int>(std::nearbyint(src_y)), 0, H_in - 1);
+        }
+        col_nearest.resize(W_out);
+        for (int ow = 0; ow < W_out; ++ow) {
+            const double src_x = (ow + 0.5) * sx - 0.5;
+            col_nearest[ow].ix = clampi(
+                static_cast<int>(std::nearbyint(src_x)), 0, W_in - 1);
+        }
+    } else {
+        row_bilinear.resize(H_out);
+        for (int oh = 0; oh < H_out; ++oh) {
+            const double src_y = (oh + 0.5) * sy - 0.5;
+            const int y0 = static_cast<int>(std::floor(src_y));
+            row_bilinear[oh].fy = static_cast<float>(src_y - y0);
+            row_bilinear[oh].y0 = clampi(y0,     0, H_in - 1);
+            row_bilinear[oh].y1 = clampi(y0 + 1, 0, H_in - 1);
+        }
+        col_bilinear.resize(W_out);
+        for (int ow = 0; ow < W_out; ++ow) {
+            const double src_x = (ow + 0.5) * sx - 0.5;
+            const int x0 = static_cast<int>(std::floor(src_x));
+            col_bilinear[ow].fx = static_cast<float>(src_x - x0);
+            col_bilinear[ow].x0 = clampi(x0,     0, W_in - 1);
+            col_bilinear[ow].x1 = clampi(x0 + 1, 0, W_in - 1);
+        }
+    }
+
     for (int n = 0; n < N; ++n) {
         for (int c = 0; c < C; ++c) {
             const int xbase = (n * C + c) * H_in * W_in;
             const int ybase = (n * C + c) * H_out * W_out;
 
             for (int oh = 0; oh < H_out; ++oh) {
-                const double src_y = (oh + 0.5) * sy - 0.5;
-
                 for (int ow = 0; ow < W_out; ++ow) {
-                    const double src_x = (ow + 0.5) * sx - 0.5;
                     const float g = dYp[ybase + oh * W_out + ow];
 
                     if (mode == 0) {
-                        const int iy = clampi(
-                            static_cast<int>(std::nearbyint(src_y)),
-                            0, H_in - 1);
-                        const int ix = clampi(
-                            static_cast<int>(std::nearbyint(src_x)),
-                            0, W_in - 1);
+                        const int iy = row_nearest[oh].iy;
+                        const int ix = col_nearest[ow].ix;
                         dXp[xbase + iy * W_in + ix] += g;
                     } else {
-                        const int y0 = static_cast<int>(std::floor(src_y));
-                        const int x0 = static_cast<int>(std::floor(src_x));
-                        const float fy = static_cast<float>(src_y - y0);
-                        const float fx = static_cast<float>(src_x - x0);
-                        const int y0c = clampi(y0,     0, H_in - 1);
-                        const int y1c = clampi(y0 + 1, 0, H_in - 1);
-                        const int x0c = clampi(x0,     0, W_in - 1);
-                        const int x1c = clampi(x0 + 1, 0, W_in - 1);
-                        const float w00 = (1.0f - fy) * (1.0f - fx);
-                        const float w01 = (1.0f - fy) * fx;
-                        const float w10 = fy        * (1.0f - fx);
-                        const float w11 = fy        * fx;
-                        dXp[xbase + y0c * W_in + x0c] += w00 * g;
-                        dXp[xbase + y0c * W_in + x1c] += w01 * g;
-                        dXp[xbase + y1c * W_in + x0c] += w10 * g;
-                        dXp[xbase + y1c * W_in + x1c] += w11 * g;
+                        const RowBilinear& r = row_bilinear[oh];
+                        const ColBilinear& cx = col_bilinear[ow];
+                        const float w00 = (1.0f - r.fy) * (1.0f - cx.fx);
+                        const float w01 = (1.0f - r.fy) * cx.fx;
+                        const float w10 = r.fy        * (1.0f - cx.fx);
+                        const float w11 = r.fy        * cx.fx;
+                        dXp[xbase + r.y0 * W_in + cx.x0] += w00 * g;
+                        dXp[xbase + r.y0 * W_in + cx.x1] += w01 * g;
+                        dXp[xbase + r.y1 * W_in + cx.x0] += w10 * g;
+                        dXp[xbase + r.y1 * W_in + cx.x1] += w11 * g;
                     }
                 }
             }

@@ -118,14 +118,28 @@ void linear_proj_backward(const float* In, const float* W, const float* dOut,
 // k in [q-window+1, q] (window <= 0 leaves the band unbounded).
 // Q/O are H heads wide (Dq = H*hd); K/V may be grouped (Dkv = (H/group)*hd,
 // GQA) — query head h reads K/V head h/group. group == 1 / Dkv < 0 is plain MHA.
+// scratch_scores, if non-null, must point at a caller-owned buffer of at
+// least Lk floats and is reused verbatim (no allocation here) — callers
+// looping over many short sequences (e.g. varlen attention) hoist one buffer
+// sized to the batch's max Lk instead of paying a heap allocation per call.
+// A null scratch_scores falls back to a local per-call allocation, matching
+// the original single-call behavior.
 void attention_core(const float* Q, const float* K, const float* V,
                     const float* mask, int Lq, int Lk, int D, int H,
                     bool causal, float* O, float* P, int window = 0,
-                    int q_offset = 0, int Dkv = -1, int group = 1) {
+                    int q_offset = 0, int Dkv = -1, int group = 1,
+                    float* scratch_scores = nullptr) {
     const int hd  = D / H;
     if (Dkv < 0) Dkv = D;
     const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
-    std::vector<float> scores(static_cast<std::size_t>(Lk));
+    std::vector<float> scores_local;
+    float* scores;
+    if (scratch_scores) {
+        scores = scratch_scores;
+    } else {
+        scores_local.resize(static_cast<std::size_t>(Lk));
+        scores = scores_local.data();
+    }
     for (int q = 0; q < Lq; ++q) {
         const int aq = q + q_offset;   // absolute causal position of this query
         for (int h = 0; h < H; ++h) {
@@ -173,10 +187,21 @@ void attention_core(const float* Q, const float* K, const float* V,
 // Per-head flash-attention backward over pre-projected Q/K/V. Recompute P,
 // then dV = P^T·dO_attn, dP = dO_attn·V^T, dS = P*(dP - D_q)*scale,
 // dQ = dS·K, dK = dS^T·Q. dQ/dK/dV are OVERWRITTEN.
+//
+// scratch_P/scratch_dP/scratch_dS, if all non-null, must each point at a
+// caller-owned buffer of at least Lq*Lk floats and are reused verbatim (no
+// allocation here) — callers looping over many short sequences (e.g. varlen
+// attention backward) hoist one triple of buffers sized to the batch's max
+// Lq*Lk instead of paying three heap allocations per call. Leaving any of
+// them null falls back to a local per-call allocation, matching the original
+// single-call behavior.
 void attention_core_backward(const float* Q, const float* K, const float* V,
                              const float* dO, const float* mask,
                              int Lq, int Lk, int D, int H, bool causal,
-                             float* dQ, float* dK, float* dV) {
+                             float* dQ, float* dK, float* dV,
+                             float* scratch_P = nullptr,
+                             float* scratch_dP = nullptr,
+                             float* scratch_dS = nullptr) {
     const int hd = D / H;
     const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
     for (std::size_t i = 0; i < static_cast<std::size_t>(Lq) * D; ++i)
@@ -185,15 +210,29 @@ void attention_core_backward(const float* Q, const float* K, const float* V,
         dK[i] = 0.0f;
         dV[i] = 0.0f;
     }
-    std::vector<float> P(static_cast<std::size_t>(Lq) * Lk);
-    std::vector<float> dP(static_cast<std::size_t>(Lq) * Lk);
-    std::vector<float> dS(static_cast<std::size_t>(Lq) * Lk);
+    std::vector<float> P_local, dP_local, dS_local;
+    float* P;
+    float* dP;
+    float* dS;
+    if (scratch_P && scratch_dP && scratch_dS) {
+        P = scratch_P;
+        dP = scratch_dP;
+        dS = scratch_dS;
+    } else {
+        const std::size_t n = static_cast<std::size_t>(Lq) * Lk;
+        P_local.resize(n);
+        dP_local.resize(n);
+        dS_local.resize(n);
+        P = P_local.data();
+        dP = dP_local.data();
+        dS = dS_local.data();
+    }
     for (int h = 0; h < H; ++h) {
         const int off = h * hd;
         // Recompute P for this head.
         for (int q = 0; q < Lq; ++q) {
             float m = -1e30f;
-            float* prow = P.data() + static_cast<std::size_t>(q) * Lk;
+            float* prow = P + static_cast<std::size_t>(q) * Lk;
             for (int k = 0; k < Lk; ++k) {
                 if (mask && mask[k] <= 0.5f) { prow[k] = -1e30f; continue; }
                 if (causal && k > q)         { prow[k] = -1e30f; continue; }
@@ -237,9 +276,9 @@ void attention_core_backward(const float* Q, const float* K, const float* V,
         }
         // dS[q,k] = P[q,k] * (dP[q,k] - D_q) * inv_sqrt.
         for (int q = 0; q < Lq; ++q) {
-            const float* prow = P.data() + static_cast<std::size_t>(q) * Lk;
-            const float* dpr  = dP.data() + static_cast<std::size_t>(q) * Lk;
-            float* dsr = dS.data() + static_cast<std::size_t>(q) * Lk;
+            const float* prow = P + static_cast<std::size_t>(q) * Lk;
+            const float* dpr  = dP + static_cast<std::size_t>(q) * Lk;
+            float* dsr = dS + static_cast<std::size_t>(q) * Lk;
             float Dq = 0.0f;
             for (int k = 0; k < Lk; ++k) Dq += prow[k] * dpr[k];
             for (int k = 0; k < Lk; ++k)
@@ -248,7 +287,7 @@ void attention_core_backward(const float* Q, const float* K, const float* V,
         // dQ[q, off+d] = sum_k dS[q,k] * K[k, off+d].
         for (int q = 0; q < Lq; ++q) {
             float* dqr = dQ + static_cast<std::size_t>(q) * D + off;
-            const float* dsr = dS.data() + static_cast<std::size_t>(q) * Lk;
+            const float* dsr = dS + static_cast<std::size_t>(q) * Lk;
             for (int d = 0; d < hd; ++d) {
                 float acc = 0.0f;
                 for (int k = 0; k < Lk; ++k)
@@ -398,6 +437,19 @@ void flash_attention_varlen_forward(const ::brotensor::Tensor& Q,
     const float* Vp = V.host_f32();
     float* Op = O.host_f32_mut();
 
+    // Hoist attention_core's per-call `scores` scratch (size Lk) to one
+    // buffer sized for the widest sequence in the batch, reused for every
+    // sequence below — batches of many short sequences would otherwise pay
+    // one small heap allocation per sequence. Negative per-sequence lengths
+    // (malformed cu_seqlens) are skipped here; the loop below throws on them
+    // before attention_core is ever called for that b.
+    int max_lk = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        const int lk = cu_seqlens_k[b + 1] - cu_seqlens_k[b];
+        if (lk > max_lk) max_lk = lk;
+    }
+    std::vector<float> scratch_scores(static_cast<std::size_t>(max_lk));
+
     for (int b = 0; b < batch_size; ++b) {
         const int q_beg = cu_seqlens_q[b];
         const int q_end = cu_seqlens_q[b + 1];
@@ -422,7 +474,8 @@ void flash_attention_varlen_forward(const ::brotensor::Tensor& Q,
                        /*mask=*/nullptr,
                        Lq, Lk, D, num_heads, causal,
                        Op + static_cast<std::size_t>(q_beg) * D,
-                       /*P=*/nullptr);
+                       /*P=*/nullptr, /*window=*/0, /*q_offset=*/0, /*Dkv=*/-1,
+                       /*group=*/1, scratch_scores.data());
     }
 }
 
@@ -645,6 +698,27 @@ void flash_attention_varlen_backward(const ::brotensor::Tensor& Q,
     const float* Vp  = V.host_f32();
     const float* dOp = dO.host_f32();
 
+    // Hoist attention_core_backward's per-call P/dP/dS scratch (each size
+    // Lq*Lk) to one triple of buffers sized for the widest sequence in the
+    // batch, reused for every sequence below — batches of many short
+    // sequences would otherwise pay three small heap allocations per
+    // sequence. Malformed (negative) per-sequence lengths are skipped in this
+    // sizing pass; the loop below throws on them before attention_core_backward
+    // is ever called for that b, and casting a negative length to size_t here
+    // could otherwise wrap to a huge value and provoke a bogus allocation.
+    std::size_t max_qk = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        const int lq = cu_seqlens_q[b + 1] - cu_seqlens_q[b];
+        const int lk = cu_seqlens_k[b + 1] - cu_seqlens_k[b];
+        if (lq < 0 || lk < 0) continue;
+        const std::size_t qk =
+            static_cast<std::size_t>(lq) * static_cast<std::size_t>(lk);
+        if (qk > max_qk) max_qk = qk;
+    }
+    std::vector<float> scratch_P(max_qk);
+    std::vector<float> scratch_dP(max_qk);
+    std::vector<float> scratch_dS(max_qk);
+
     for (int b = 0; b < batch_size; ++b) {
         const int q_beg = cu_seqlens_q[b];
         const int q_end = cu_seqlens_q[b + 1];
@@ -667,7 +741,8 @@ void flash_attention_varlen_backward(const ::brotensor::Tensor& Q,
             Lq, Lk, D, num_heads, causal,
             dQp + static_cast<std::size_t>(q_beg) * D,
             dKp + static_cast<std::size_t>(k_beg) * D,
-            dVp + static_cast<std::size_t>(k_beg) * D);
+            dVp + static_cast<std::size_t>(k_beg) * D,
+            scratch_P.data(), scratch_dP.data(), scratch_dS.data());
     }
 }
 

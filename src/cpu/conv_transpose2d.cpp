@@ -138,6 +138,26 @@ void conv_transpose2d_forward(const ::brotensor::Tensor& X,
         }
     }
 
+    // Interior region: the input rows/cols for which every kernel tap
+    // scatters into a valid output position (the mirror image of conv2d's
+    // gather-side split, applied to this scatter direction), computed once
+    // — independent of n/c_in. Only the thin border ring of input pixels
+    // needs the per-tap bounds check; the interior runs a branch-free
+    // kh/kw/oc_local loop.
+    int h_lo = (pad_h + stride_h - 1) / stride_h;
+    int h_hi = H_out - 1 + pad_h - (kH - 1) * dil_h;
+    h_hi = (h_hi >= 0) ? (h_hi / stride_h) : -1;
+    if (h_lo < 0) h_lo = 0;
+    if (h_hi >= H) h_hi = H - 1;
+
+    int w_lo = (pad_w + stride_w - 1) / stride_w;
+    int w_hi = W_out - 1 + pad_w - (kW - 1) * dil_w;
+    w_hi = (w_hi >= 0) ? (w_hi / stride_w) : -1;
+    if (w_lo < 0) w_lo = 0;
+    if (w_hi >= W) w_hi = W - 1;
+
+    const bool has_interior = (h_lo <= h_hi) && (w_lo <= w_hi);
+
     // Scatter-add. Input pixel (n, c_in, h, w) reaches output pixel
     //   ho = h*stride_h - pad_h + kh*dil_h
     //   wo = w*stride_w - pad_w + kw*dil_w
@@ -148,30 +168,66 @@ void conv_transpose2d_forward(const ::brotensor::Tensor& X,
             const int oc_base = g * Cg_out;
             const float* x_chan =
                 Xp + (static_cast<long>(n) * C_in + c_in) * H * W;
-            for (int h = 0; h < H; ++h) {
+
+            // Border pixel: same bounds-checked scatter as before.
+            auto scatter_bordered = [&](int h, int w) {
+                const float xv = x_chan[static_cast<long>(h) * W + w];
+                if (xv == 0.0f) return;
                 const int ho_origin = h * stride_h - pad_h;
-                for (int w = 0; w < W; ++w) {
-                    const float xv = x_chan[static_cast<long>(h) * W + w];
-                    if (xv == 0.0f) continue;
-                    const int wo_origin = w * stride_w - pad_w;
-                    for (int kh = 0; kh < kH; ++kh) {
-                        const int ho = ho_origin + kh * dil_h;
-                        if (ho < 0 || ho >= H_out) continue;
-                        for (int kw = 0; kw < kW; ++kw) {
-                            const int wo = wo_origin + kw * dil_w;
-                            if (wo < 0 || wo >= W_out) continue;
-                            for (int oc_local = 0; oc_local < Cg_out; ++oc_local) {
-                                const int oc = oc_base + oc_local;
-                                const int w_idx =
-                                    (c_in * Cg_out + oc_local) * kHW
-                                    + kh * kW + kw;
-                                Yp[(static_cast<long>(n) * C_out + oc)
-                                   * H_out * W_out + ho * W_out + wo]
-                                    += xv * Wp[w_idx];
-                            }
+                const int wo_origin = w * stride_w - pad_w;
+                for (int kh = 0; kh < kH; ++kh) {
+                    const int ho = ho_origin + kh * dil_h;
+                    if (ho < 0 || ho >= H_out) continue;
+                    for (int kw = 0; kw < kW; ++kw) {
+                        const int wo = wo_origin + kw * dil_w;
+                        if (wo < 0 || wo >= W_out) continue;
+                        for (int oc_local = 0; oc_local < Cg_out; ++oc_local) {
+                            const int oc = oc_base + oc_local;
+                            const int w_idx =
+                                (c_in * Cg_out + oc_local) * kHW
+                                + kh * kW + kw;
+                            Yp[(static_cast<long>(n) * C_out + oc)
+                               * H_out * W_out + ho * W_out + wo]
+                                += xv * Wp[w_idx];
                         }
                     }
                 }
+            };
+
+            // Interior pixel: every tap guaranteed in-bounds — no checks.
+            auto scatter_interior = [&](int h, int w) {
+                const float xv = x_chan[static_cast<long>(h) * W + w];
+                if (xv == 0.0f) return;
+                const int ho_origin = h * stride_h - pad_h;
+                const int wo_origin = w * stride_w - pad_w;
+                for (int kh = 0; kh < kH; ++kh) {
+                    const int ho = ho_origin + kh * dil_h;
+                    const int y_ho_base = ho * W_out;
+                    const int w_kh_base = kh * kW;
+                    for (int kw = 0; kw < kW; ++kw) {
+                        const int wo = wo_origin + kw * dil_w;
+                        for (int oc_local = 0; oc_local < Cg_out; ++oc_local) {
+                            const int oc = oc_base + oc_local;
+                            const int w_idx =
+                                (c_in * Cg_out + oc_local) * kHW
+                                + w_kh_base + kw;
+                            Yp[(static_cast<long>(n) * C_out + oc)
+                               * H_out * W_out + y_ho_base + wo]
+                                += xv * Wp[w_idx];
+                        }
+                    }
+                }
+            };
+
+            for (int h = 0; h < H; ++h) {
+                const bool h_interior = has_interior && h >= h_lo && h <= h_hi;
+                if (!h_interior) {
+                    for (int w = 0; w < W; ++w) scatter_bordered(h, w);
+                    continue;
+                }
+                for (int w = 0; w < w_lo; ++w) scatter_bordered(h, w);
+                for (int w = w_lo; w <= w_hi; ++w) scatter_interior(h, w);
+                for (int w = w_hi + 1; w < W; ++w) scatter_bordered(h, w);
             }
         }
     }

@@ -607,15 +607,20 @@ void attention_backward(const ::brotensor::Tensor& dO,
             dY[static_cast<std::size_t>(i) * D + k] = acc;
         }
     }
-    for (int c = 0; c < D; ++c) {
-        for (int k = 0; k < D; ++k) {
-            float acc = 0.0f;
-            for (int i = 0; i < N; ++i) {
-                if (d_mask && d_mask[i] < 0.5f) continue;
-                acc += dOp[static_cast<std::size_t>(i) * D + c] *
-                       Yp[static_cast<std::size_t>(i) * D + k];
+    // Token axis (i) outermost, accumulating directly into the resident
+    // dWop buffer as we go: both dOp[i,c] and Yp[i,k] are then read
+    // contiguously (stride-1 in the inner k loop) instead of gathered with
+    // stride D once per (c,k) pair.
+    for (int i = 0; i < N; ++i) {
+        if (d_mask && d_mask[i] < 0.5f) continue;
+        const float* dOi = dOp + static_cast<std::size_t>(i) * D;
+        const float* Yi  = Yp  + static_cast<std::size_t>(i) * D;
+        for (int c = 0; c < D; ++c) {
+            const float dov = dOi[c];
+            float* dWrow = dWop + static_cast<std::size_t>(c) * D;
+            for (int k = 0; k < D; ++k) {
+                dWrow[k] += dov * Yi[k];
             }
-            dWop[static_cast<std::size_t>(c) * D + k] += acc;
         }
     }
 
@@ -629,13 +634,18 @@ void attention_backward(const ::brotensor::Tensor& dO,
             dAttn[static_cast<std::size_t>(i) * N + j] = acc;
         }
     }
-    for (int j = 0; j < N; ++j) {
-        for (int k = 0; k < D; ++k) {
-            float acc = 0.0f;
-            for (int i = 0; i < N; ++i)
-                acc += Ap[static_cast<std::size_t>(i) * N + j] *
-                       dY[static_cast<std::size_t>(i) * D + k];
-            dV[static_cast<std::size_t>(j) * D + k] = acc;
+    // dV: same token-outermost reorder as dWo above. dV starts zero-filled
+    // (std::vector value-init), so accumulating with += is equivalent to the
+    // original overwrite.
+    for (int i = 0; i < N; ++i) {
+        const float* Ai = Ap + static_cast<std::size_t>(i) * N;
+        const float* dYi = dY.data() + static_cast<std::size_t>(i) * D;
+        for (int j = 0; j < N; ++j) {
+            const float av = Ai[j];
+            float* dVrow = dV.data() + static_cast<std::size_t>(j) * D;
+            for (int k = 0; k < D; ++k) {
+                dVrow[k] += av * dYi[k];
+            }
         }
     }
 
@@ -666,30 +676,40 @@ void attention_backward(const ::brotensor::Tensor& dO,
             dQ[static_cast<std::size_t>(i) * D + k] = acc;
         }
     }
-    for (int j = 0; j < N; ++j) {
-        for (int k = 0; k < D; ++k) {
-            float acc = 0.0f;
-            for (int i = 0; i < N; ++i)
-                acc += dScores[static_cast<std::size_t>(i) * N + j] *
-                       Qp[static_cast<std::size_t>(i) * D + k];
-            dK[static_cast<std::size_t>(j) * D + k] = acc;
+    // dK: token-outermost reorder (dScores row i is contiguous over j; dK
+    // starts zero-filled, so += matches the original overwrite).
+    for (int i = 0; i < N; ++i) {
+        const float* dSi = dScores.data() + static_cast<std::size_t>(i) * N;
+        const float* Qi = Qp + static_cast<std::size_t>(i) * D;
+        for (int j = 0; j < N; ++j) {
+            const float ds = dSi[j];
+            float* dKrow = dK.data() + static_cast<std::size_t>(j) * D;
+            for (int k = 0; k < D; ++k) {
+                dKrow[k] += ds * Qi[k];
+            }
         }
     }
 
-    // dWq/dWk/dWv accumulate: dW(j,k) += sum_i dQ(i,j) * X(i,k).
-    for (int j = 0; j < D; ++j) {
-        for (int k = 0; k < D; ++k) {
-            float aq = 0.0f, ak = 0.0f, av = 0.0f;
-            for (int i = 0; i < N; ++i) {
-                const float xv = Xp[static_cast<std::size_t>(i) * D + k];
-                aq += dQ[static_cast<std::size_t>(i) * D + j] * xv;
-                ak += dK[static_cast<std::size_t>(i) * D + j] * xv;
-                av += dV[static_cast<std::size_t>(i) * D + j] * xv;
+    // dWq/dWk/dWv accumulate: dW(j,k) += sum_i dQ(i,j) * X(i,k). Token-axis
+    // (i) outermost, same GEMM-reorder principle as dWo/dV/dK above.
+    for (int i = 0; i < N; ++i) {
+        const float* Xi  = Xp + static_cast<std::size_t>(i) * D;
+        const float* dQi = dQ.data() + static_cast<std::size_t>(i) * D;
+        const float* dKi = dK.data() + static_cast<std::size_t>(i) * D;
+        const float* dVi = dV.data() + static_cast<std::size_t>(i) * D;
+        for (int j = 0; j < D; ++j) {
+            const float qj = dQi[j];
+            const float kj = dKi[j];
+            const float vj = dVi[j];
+            float* dWqrow = dWqp + static_cast<std::size_t>(j) * D;
+            float* dWkrow = dWkp + static_cast<std::size_t>(j) * D;
+            float* dWvrow = dWvp + static_cast<std::size_t>(j) * D;
+            for (int k = 0; k < D; ++k) {
+                const float xv = Xi[k];
+                dWqrow[k] += qj * xv;
+                dWkrow[k] += kj * xv;
+                dWvrow[k] += vj * xv;
             }
-            const std::size_t idx = static_cast<std::size_t>(j) * D + k;
-            dWqp[idx] += aq;
-            dWkp[idx] += ak;
-            dWvp[idx] += av;
         }
     }
 
@@ -907,28 +927,31 @@ void mha_backward(const ::brotensor::Tensor& dO,
             dYc[static_cast<std::size_t>(i) * D + k] = acc;
         }
     }
-    for (int c = 0; c < D; ++c) {
-        for (int k = 0; k < D; ++k) {
-            float acc = 0.0f;
-            for (int i = 0; i < K; ++i) {
-                if (d_mask && d_mask[i] < 0.5f) continue;
-                acc += dOp[static_cast<std::size_t>(i) * D + c] *
-                       Yp[static_cast<std::size_t>(i) * D + k];
+    // Token axis (i) outermost — same GEMM-reorder as attention_backward's
+    // dWo above: dOp[i,c] and Yp[i,k] read contiguously in the inner k loop.
+    for (int i = 0; i < K; ++i) {
+        if (d_mask && d_mask[i] < 0.5f) continue;
+        const float* dOi = dOp + static_cast<std::size_t>(i) * D;
+        const float* Yi  = Yp  + static_cast<std::size_t>(i) * D;
+        for (int c = 0; c < D; ++c) {
+            const float dov = dOi[c];
+            float* dWrow = dWop + static_cast<std::size_t>(c) * D;
+            for (int k = 0; k < D; ++k) {
+                dWrow[k] += dov * Yi[k];
             }
-            dWop[static_cast<std::size_t>(c) * D + k] += acc;
         }
     }
 
-    // dbo[c] += sum over valid rows of dO[i,c] (caller zeros).
+    // dbo[c] += sum over valid rows of dO[i,c] (caller zeros). Token axis
+    // outermost so both dOp[i,:] and dbop[:] are read/written contiguously.
     if (dbo) {
         float* dbop = dbo->host_f32_mut();
-        for (int c = 0; c < D; ++c) {
-            float acc = 0.0f;
-            for (int i = 0; i < K; ++i) {
-                if (d_mask && d_mask[i] < 0.5f) continue;
-                acc += dOp[static_cast<std::size_t>(i) * D + c];
+        for (int i = 0; i < K; ++i) {
+            if (d_mask && d_mask[i] < 0.5f) continue;
+            const float* dOi = dOp + static_cast<std::size_t>(i) * D;
+            for (int c = 0; c < D; ++c) {
+                dbop[c] += dOi[c];
             }
-            dbop[c] += acc;
         }
     }
 
@@ -945,15 +968,18 @@ void mha_backward(const ::brotensor::Tensor& dO,
                 dAttn[(static_cast<std::size_t>(hh) * K + i) * K + j] = acc;
             }
         }
-        for (int j = 0; j < K; ++j) {
-            for (int k = 0; k < dh; ++k) {
-                float acc = 0.0f;
-                for (int i = 0; i < K; ++i) {
-                    const float a  = Ap[(static_cast<std::size_t>(hh) * K + i) * K + j];
-                    const float dy = dYc[static_cast<std::size_t>(i) * D + (hh * dh + k)];
-                    acc += a * dy;
+        // dVh: token axis (i) outermost. Ap's row i is contiguous over j;
+        // dYc's per-head segment is contiguous over k. dVh starts
+        // zero-filled, so += matches the original overwrite.
+        for (int i = 0; i < K; ++i) {
+            const float* Arow = Ap + (static_cast<std::size_t>(hh) * K + i) * K;
+            const float* dYseg = dYc.data() + static_cast<std::size_t>(i) * D + hh * dh;
+            for (int j = 0; j < K; ++j) {
+                const float av = Arow[j];
+                float* dVrow = dVh.data() + (static_cast<std::size_t>(hh) * K + j) * dh;
+                for (int k = 0; k < dh; ++k) {
+                    dVrow[k] += av * dYseg[k];
                 }
-                dVh[(static_cast<std::size_t>(hh) * K + j) * dh + k] = acc;
             }
         }
     }
@@ -990,15 +1016,16 @@ void mha_backward(const ::brotensor::Tensor& dO,
                 dQh[(static_cast<std::size_t>(hh) * K + i) * dh + k] = acc;
             }
         }
-        for (int j = 0; j < K; ++j) {
-            for (int k = 0; k < dh; ++k) {
-                float acc = 0.0f;
-                for (int i = 0; i < K; ++i) {
-                    const float ds = dScores[(static_cast<std::size_t>(hh) * K + i) * K + j];
-                    const float qq = Qp[(static_cast<std::size_t>(hh) * K + i) * dh + k];
-                    acc += ds * qq;
+        // dKh: token axis (i) outermost, same reorder as dVh above.
+        for (int i = 0; i < K; ++i) {
+            const float* dSrow = dScores.data() + (static_cast<std::size_t>(hh) * K + i) * K;
+            const float* Qseg = Qp + (static_cast<std::size_t>(hh) * K + i) * dh;
+            for (int j = 0; j < K; ++j) {
+                const float ds = dSrow[j];
+                float* dKrow = dKh.data() + (static_cast<std::size_t>(hh) * K + j) * dh;
+                for (int k = 0; k < dh; ++k) {
+                    dKrow[k] += ds * Qseg[k];
                 }
-                dKh[(static_cast<std::size_t>(hh) * K + j) * dh + k] = acc;
             }
         }
     }
@@ -1009,40 +1036,46 @@ void mha_backward(const ::brotensor::Tensor& dO,
         float* dbqp = dbq ? dbq->host_f32_mut() : nullptr;
         float* dbkp = dbk ? dbk->host_f32_mut() : nullptr;
         float* dbvp = dbv ? dbv->host_f32_mut() : nullptr;
+        // Token axis (i) outermost: dQh/dKh/dVh's per-(hh,i) segment is
+        // contiguous over j, matching a contiguous dbq/dbk/dbv row.
         for (int hh = 0; hh < H; ++hh) {
-            for (int j = 0; j < dh; ++j) {
-                const int r = hh * dh + j;
-                float aq = 0.0f, ak = 0.0f, av = 0.0f;
-                for (int i = 0; i < K; ++i) {
-                    const std::size_t idx =
-                        (static_cast<std::size_t>(hh) * K + i) * dh + j;
-                    if (dbqp) aq += dQh[idx];
-                    if (dbkp) ak += dKh[idx];
-                    if (dbvp) av += dVh[idx];
+            float* dbq_row = dbqp ? dbqp + hh * dh : nullptr;
+            float* dbk_row = dbkp ? dbkp + hh * dh : nullptr;
+            float* dbv_row = dbvp ? dbvp + hh * dh : nullptr;
+            for (int i = 0; i < K; ++i) {
+                const std::size_t base = (static_cast<std::size_t>(hh) * K + i) * dh;
+                for (int j = 0; j < dh; ++j) {
+                    if (dbq_row) dbq_row[j] += dQh[base + j];
+                    if (dbk_row) dbk_row[j] += dKh[base + j];
+                    if (dbv_row) dbv_row[j] += dVh[base + j];
                 }
-                if (dbqp) dbqp[r] += aq;
-                if (dbkp) dbkp[r] += ak;
-                if (dbvp) dbvp[r] += av;
             }
         }
     }
 
     // dWq/dWk/dWv accumulate: dW(hh*dh+j, k) += sum_i dQh(hh,i,j) * X(i,k).
-    for (int wrow = 0; wrow < D; ++wrow) {
-        const int hh = wrow / dh;
-        const int j  = wrow % dh;
-        for (int k = 0; k < D; ++k) {
-            float aq = 0.0f, ak = 0.0f, av = 0.0f;
-            for (int i = 0; i < K; ++i) {
-                const float xv = Xp[static_cast<std::size_t>(i) * D + k];
-                aq += dQh[(static_cast<std::size_t>(hh) * K + i) * dh + j] * xv;
-                ak += dKh[(static_cast<std::size_t>(hh) * K + i) * dh + j] * xv;
-                av += dVh[(static_cast<std::size_t>(hh) * K + i) * dh + j] * xv;
+    // Token axis (i) outermost — same GEMM-reorder as attention_backward's
+    // dWq/dWk/dWv: Xi and the dWq/dWk/dWv rows are then read/written
+    // contiguously (stride-1) in the inner k loop.
+    for (int hh = 0; hh < H; ++hh) {
+        for (int i = 0; i < K; ++i) {
+            const float* Xi = Xp + static_cast<std::size_t>(i) * D;
+            const std::size_t base = (static_cast<std::size_t>(hh) * K + i) * dh;
+            for (int j = 0; j < dh; ++j) {
+                const int wrow = hh * dh + j;
+                const float qv = dQh[base + j];
+                const float kv = dKh[base + j];
+                const float vv = dVh[base + j];
+                float* dWqrow = dWqp + static_cast<std::size_t>(wrow) * D;
+                float* dWkrow = dWkp + static_cast<std::size_t>(wrow) * D;
+                float* dWvrow = dWvp + static_cast<std::size_t>(wrow) * D;
+                for (int k = 0; k < D; ++k) {
+                    const float xv = Xi[k];
+                    dWqrow[k] += qv * xv;
+                    dWkrow[k] += kv * xv;
+                    dWvrow[k] += vv * xv;
+                }
             }
-            const std::size_t idx = static_cast<std::size_t>(wrow) * D + k;
-            dWqp[idx] += aq;
-            dWkp[idx] += ak;
-            dWvp[idx] += av;
         }
     }
 

@@ -144,26 +144,19 @@ void run_scan(const ::brotensor::Tensor& Q,
             const float alpha = std::exp(-softplus(a_raw_t) * exp_A);
 
             // u = S * k  (shape d_v).  S row v stride d_k.
-            // We hold u on-stack via direct accumulation into the update;
-            // for clarity and to allow the (v - u) compute, materialise it.
-            // d_v is typically <= 256 in practice, so a stack-sized array
-            // would suffice, but we use a small local heap buffer to avoid
-            // VLA portability concerns.
+            // The output row (orow) doubles as scratch for delta_v between
+            // the update pass and the output pass below — no separate
+            // allocation needed.
             //
-            // To keep the kernel allocation-light, fold the three steps:
-            //   1) u_v = sum_k S[v,k] * k[k]
-            //   2) delta_v = v[v] - u_v
-            //   3) S[v,k] = alpha * S[v,k] + beta * delta_v * k[k]
-            //   4) o_v    = sum_k S[v,k] * q[k]
-            // into two passes per head per token:
-            //   pass A: compute delta_v (needs u_v), then update S in place.
+            // The recurrence per head per token is:
+            //   1) u_v      = sum_k S[v,k] * k[k]          (against decayed S)
+            //   2) delta_v  = v[v] - u_v
+            //   3) S[v,k]   = alpha * S[v,k] + beta * delta_v * k[k]
+            //   4) o_v      = sum_k S[v,k] * q[k]
+            // computed in two passes per head per token:
+            //   pass A: compute delta_v (needs u_v against decayed S), then
+            //           update S in place.
             //   pass B: compute o_v from the updated S.
-            // pass A reads S once and writes S once; pass B reads S once.
-            // Total: 3 * d_v * d_k flops + d_v * d_k memory traffic / token.
-            //
-            // We use a small temp for delta; size <= 4 KiB at d_v=1024.
-            // For d_v that fits on stack we could VLA, but a local static
-            // std::vector is allocated once per call.
 
             // FLA / HF Qwen3.5 ordering: decay S FIRST, then compute u against
             // the decayed S, then add the delta-write. Without this ordering,
@@ -172,25 +165,28 @@ void run_scan(const ::brotensor::Tensor& Q,
             // depends on alpha, producing percent-level logit drift in
             // Qwen3.5-VL.
             //
-            // pass A1 — decay S in place
-            for (int v = 0; v < d_v; ++v) {
-                float* Sv = S + v * d_k;
-                for (int k = 0; k < d_k; ++k) Sv[k] *= alpha;
-            }
-            // pass A2 — compute u against the decayed S; stash delta in orow.
+            // u_v is computed against the decayed state S_decayed = alpha *
+            // S_old, i.e. u_v = dot(S_decayed[v], k) = alpha * dot(S_old[v], k).
+            // That lets us read S_old[v,:] once, derive u_v directly from it
+            // (skipping the separately-materialized decayed-state pass), and
+            // then overwrite the row in place with the final
+            // S_new[v,k] = alpha * S_old[v,k] + beta * delta_v * k[k] —
+            // safe in place since each element's write only consumes its own
+            // pre-overwrite value. This folds what was a decay-only pass plus
+            // a re-read-and-rewrite pass into a single pass (2 sweeps of the
+            // state matrix total, counting the output pass below, instead of
+            // 3).
             float* orow = Op + t * Dv + h * d_v;
             for (int v = 0; v < d_v; ++v) {
-                const float* Sv = S + v * d_k;
+                float* Sv = S + v * d_k;
                 float u_v = 0.0f;
                 for (int k = 0; k < d_k; ++k) u_v += Sv[k] * kt[k];
-                orow[v] = vt[v] - u_v;       // stash delta in orow
-            }
-            // pass A3 — add the delta-write: S += beta * delta_v * k_t.
-            for (int v = 0; v < d_v; ++v) {
-                float* Sv = S + v * d_k;
-                const float scale_v = beta_t * orow[v]; // beta * delta_v
+                u_v *= alpha;
+                const float delta_v = vt[v] - u_v;
+                orow[v] = delta_v;                  // stash delta in orow
+                const float scale_v = beta_t * delta_v;
                 for (int k = 0; k < d_k; ++k) {
-                    Sv[k] += scale_v * kt[k];
+                    Sv[k] = alpha * Sv[k] + scale_v * kt[k];
                 }
             }
             // pass B — o = S @ q (overwrites the stashed delta)

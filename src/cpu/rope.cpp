@@ -19,6 +19,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brotensor::detail::cpu {
 
@@ -50,15 +51,21 @@ void rope_forward(const ::brotensor::Tensor& X, int head_dim, int num_heads,
     const int D = num_heads * head_dim;
     const float* Xp = X.host_f32();
     float* Yp = Y.host_f32_mut();
+    std::vector<float> cos_row(half);
+    std::vector<float> sin_row(half);
     for (int row = 0; row < L; ++row) {
         const int pos = row + seq_offset;
+        for (int i = 0; i < half; ++i) {
+            const float theta =
+                static_cast<float>(pos) * rope_theta(i, head_dim, theta_base);
+            cos_row[i] = std::cos(theta);
+            sin_row[i] = std::sin(theta);
+        }
         for (int h = 0; h < num_heads; ++h) {
             const int base_off = row * D + h * head_dim;
             for (int i = 0; i < half; ++i) {
-                const float theta =
-                    static_cast<float>(pos) * rope_theta(i, head_dim, theta_base);
-                const float c = std::cos(theta);
-                const float s = std::sin(theta);
+                const float c = cos_row[i];
+                const float s = sin_row[i];
                 const float x0 = Xp[base_off + 2 * i];
                 const float x1 = Xp[base_off + 2 * i + 1];
                 Yp[base_off + 2 * i]     = x0 * c - x1 * s;
@@ -86,15 +93,21 @@ void rope_backward(const ::brotensor::Tensor& dY, int head_dim, int num_heads,
     const int D = num_heads * head_dim;
     const float* dYp = dY.host_f32();
     float* dXp = dX.host_f32_mut();
+    std::vector<float> cos_row(half);
+    std::vector<float> sin_row(half);
     for (int row = 0; row < L; ++row) {
         const int pos = row + seq_offset;
+        for (int i = 0; i < half; ++i) {
+            const float theta =
+                static_cast<float>(pos) * rope_theta(i, head_dim, theta_base);
+            cos_row[i] = std::cos(theta);
+            sin_row[i] = std::sin(theta);
+        }
         for (int h = 0; h < num_heads; ++h) {
             const int base_off = row * D + h * head_dim;
             for (int i = 0; i < half; ++i) {
-                const float theta =
-                    static_cast<float>(pos) * rope_theta(i, head_dim, theta_base);
-                const float c = std::cos(theta);
-                const float s = std::sin(theta);
+                const float c = cos_row[i];
+                const float s = sin_row[i];
                 const float dy0 = dYp[base_off + 2 * i];
                 const float dy1 = dYp[base_off + 2 * i + 1];
                 // Inverse rotation (transpose of R(θ)).

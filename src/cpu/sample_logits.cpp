@@ -176,15 +176,24 @@ void sample_logits(const ::brotensor::Tensor& logits, float temperature,
         const float inv_sum = (sum > 0.0) ? static_cast<float>(1.0 / sum) : 0.0f;
         for (int v = 0; v < V; ++v) prob[v] *= inv_sum;
 
-        // Indices sorted by descending probability; ties broken by lower
-        // index (stable sort on a 0..V-1 identity ordering).
-        for (int v = 0; v < V; ++v) order[v] = v;
-        std::stable_sort(order.begin(), order.end(),
-                         [&](int a, int b) { return prob[a] > prob[b]; });
-
         // ── 3. top-k filter: keep the top_k highest-probability tokens. ──
-        int keep = V;
-        if (top_k > 0 && top_k < keep) keep = top_k;
+        // Only the top `bound` entries are ever consulted below (top-p can
+        // only shrink the kept set further, never grow it past top_k), so a
+        // partial_sort bounded to `bound` reproduces the same output as a
+        // full sort of all V entries while avoiding O(V log V) work. The
+        // comparator breaks ties by ascending index to match std::stable_sort
+        // applied to the identity-ordered 0..V-1 sequence.
+        int bound = V;
+        if (top_k > 0 && top_k < bound) bound = top_k;
+
+        for (int v = 0; v < V; ++v) order[v] = v;
+        std::partial_sort(order.begin(), order.begin() + bound, order.end(),
+                          [&](int a, int b) {
+                              return prob[a] > prob[b] ||
+                                     (prob[a] == prob[b] && a < b);
+                          });
+
+        int keep = bound;
 
         // ── 4. top-p (nucleus): keep the smallest high-prob set whose
         //       cumulative probability >= top_p, applied to the top-k
@@ -303,12 +312,20 @@ void sample_logits_into(const ::brotensor::Tensor& logits, float temperature,
         const float inv_sum = (sum > 0.0) ? static_cast<float>(1.0 / sum) : 0.0f;
         for (int v = 0; v < V; ++v) prob[v] *= inv_sum;
 
-        for (int v = 0; v < V; ++v) order[v] = v;
-        std::stable_sort(order.begin(), order.end(),
-                         [&](int a, int b) { return prob[a] > prob[b]; });
+        // See the matching comment in sample_logits() above: bound to the
+        // number of entries top-p/top-k can ever consult, and break ties by
+        // ascending index to match std::stable_sort's behavior exactly.
+        int bound = V;
+        if (top_k > 0 && top_k < bound) bound = top_k;
 
-        int keep = V;
-        if (top_k > 0 && top_k < keep) keep = top_k;
+        for (int v = 0; v < V; ++v) order[v] = v;
+        std::partial_sort(order.begin(), order.begin() + bound, order.end(),
+                          [&](int a, int b) {
+                              return prob[a] > prob[b] ||
+                                     (prob[a] == prob[b] && a < b);
+                          });
+
+        int keep = bound;
 
         if (top_p < 1.0f) {
             double cum = 0.0;

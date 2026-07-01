@@ -27,12 +27,17 @@ inline float gelu_tanh_scalar(float v) {
     return 0.5f * v * (1.0f + std::tanh(u));
 }
 
-inline float gelu_tanh_grad_scalar(float v) {
+// Backward needs both gelu(v) and gelu'(v) for the same v; both are
+// algebraically derivable from a single std::tanh evaluation, so compute it
+// once here instead of calling gelu_tanh_scalar plus a separate gradient
+// function (which would redo the tanh).
+inline void gelu_tanh_value_grad(float v, float& g, float& gprime) {
     constexpr float kSqrt2OverPi = 0.7978845608f;
     const float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
     const float t = std::tanh(u);
     const float dudx = kSqrt2OverPi * (1.0f + 3.0f * 0.044715f * v * v);
-    return 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * dudx;
+    g = 0.5f * v * (1.0f + t);
+    gprime = 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * dudx;
 }
 
 inline float gelu_exact_scalar(float v) {
@@ -40,12 +45,16 @@ inline float gelu_exact_scalar(float v) {
     return 0.5f * v * (1.0f + std::erf(v * kInvSqrt2));
 }
 
-inline float gelu_exact_grad_scalar(float v) {
+// Backward needs both gelu(v) and gelu'(v) for the same v; both share the
+// same std::erf evaluation (cdf_term), so compute it once here instead of
+// calling gelu_exact_scalar plus a separate gradient function.
+inline void gelu_exact_value_grad(float v, float& g, float& gprime) {
     constexpr float kInvSqrt2   = 0.70710678118654752440f;
     constexpr float kInvSqrt2Pi = 0.39894228040143267794f;
     const float cdf_term = 0.5f * (1.0f + std::erf(v * kInvSqrt2));
-    const float pdf      = kInvSqrt2Pi * std::exp(-0.5f * v * v);
-    return cdf_term + v * pdf;
+    g = v * cdf_term;
+    const float pdf = kInvSqrt2Pi * std::exp(-0.5f * v * v);
+    gprime = cdf_term + v * pdf;
 }
 
 template <typename GeluFn>
@@ -71,11 +80,11 @@ void geglu_forward_impl(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y,
     }
 }
 
-template <typename GeluFn, typename GeluGradFn>
+template <typename GeluValueGradFn>
 void geglu_backward_impl(const ::brotensor::Tensor& X,
                          const ::brotensor::Tensor& dY,
                          ::brotensor::Tensor& dX,
-                         const char* op, GeluFn gelu, GeluGradFn gelu_grad) {
+                         const char* op, GeluValueGradFn gelu_value_grad) {
     if (X.cols % 2 != 0) {
         throw std::runtime_error(std::string(op) + ": X.cols must be even (2*D)");
     }
@@ -90,11 +99,11 @@ void geglu_backward_impl(const ::brotensor::Tensor& X,
     const int two_d = 2 * D;
     for (int b = 0; b < B; ++b) {
         for (int d = 0; d < D; ++d) {
-            const float a      = Xp[b * two_d + d];
-            const float bh     = Xp[b * two_d + D + d];
-            const float dy     = dYp[b * D + d];
-            const float g      = gelu(bh);
-            const float gprime = gelu_grad(bh);
+            const float a  = Xp[b * two_d + d];
+            const float bh = Xp[b * two_d + D + d];
+            const float dy = dYp[b * D + d];
+            float g, gprime;
+            gelu_value_grad(bh, g, gprime);
             dXp[b * two_d + d]     = dy * g;
             dXp[b * two_d + D + d] = dy * a * gprime;
         }
@@ -109,8 +118,7 @@ void geglu_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
 
 void geglu_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& dY,
                     ::brotensor::Tensor& dX) {
-    geglu_backward_impl(X, dY, dX, "geglu_backward",
-                        gelu_tanh_scalar, gelu_tanh_grad_scalar);
+    geglu_backward_impl(X, dY, dX, "geglu_backward", gelu_tanh_value_grad);
 }
 
 void geglu_exact_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
@@ -120,8 +128,7 @@ void geglu_exact_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
 void geglu_exact_backward(const ::brotensor::Tensor& X,
                           const ::brotensor::Tensor& dY,
                           ::brotensor::Tensor& dX) {
-    geglu_backward_impl(X, dY, dX, "geglu_exact_backward",
-                        gelu_exact_scalar, gelu_exact_grad_scalar);
+    geglu_backward_impl(X, dY, dX, "geglu_exact_backward", gelu_exact_value_grad);
 }
 
 } // namespace brotensor::detail::cpu

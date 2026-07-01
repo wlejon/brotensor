@@ -37,6 +37,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brotensor::detail::cpu {
 
@@ -247,6 +248,10 @@ void batch_norm_backward(const ::brotensor::Tensor& X,
     const int M = N * spatial;
     const float inv_M = 1.0f / static_cast<float>(M);
 
+    // Scratch buffer for x̂, cached during the first pass and reused in the
+    // dX pass so it doesn't need to be recomputed from X a second time.
+    std::vector<float> xhat_buf(static_cast<std::size_t>(M));
+
     // Per-channel: derive dGamma, dBeta, and the two reduction sums used
     // by the dX formula. Then a second pass over (N, H, W) writes dX.
     //
@@ -265,8 +270,10 @@ void batch_norm_backward(const ::brotensor::Tensor& X,
         for (int n = 0; n < N; ++n) {
             const float* x_chan  = Xp  + (n * C + c) * spatial;
             const float* dy_chan = dYp + (n * C + c) * spatial;
+            float*       xh_chan = xhat_buf.data() + n * spatial;
             for (int s = 0; s < spatial; ++s) {
                 const float xh = (x_chan[s] - mean) * rstd;
+                xh_chan[s] = xh;
                 sum_dY     += dy_chan[s];
                 sum_dY_xh  += dy_chan[s] * xh;
             }
@@ -281,11 +288,11 @@ void batch_norm_backward(const ::brotensor::Tensor& X,
         const float sum2 = gv * sum_dY_xh;
 
         for (int n = 0; n < N; ++n) {
-            const float* x_chan  = Xp  + (n * C + c) * spatial;
             const float* dy_chan = dYp + (n * C + c) * spatial;
             float*       dx_chan = dXp + (n * C + c) * spatial;
+            const float* xh_chan = xhat_buf.data() + n * spatial;
             for (int s = 0; s < spatial; ++s) {
-                const float xh  = (x_chan[s] - mean) * rstd;
+                const float xh  = xh_chan[s];
                 const float dxh = dy_chan[s] * gv;
                 dx_chan[s] = rstd * (dxh - (sum1 + xh * sum2) * inv_M);
             }

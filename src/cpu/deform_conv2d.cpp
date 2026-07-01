@@ -23,6 +23,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brotensor::detail::cpu {
 
@@ -104,20 +105,27 @@ void deform_conv2d_forward(const ::brotensor::Tensor& X,
     const int off_row_stride  = deform_groups * 2 * ksz * H_out * W_out;  // per-n
     const int mask_row_stride = deform_groups * ksz * H_out * W_out;      // per-n
 
+    // The modulated bilinear sample depends only on (n, oh, ow, ic, tap) — it
+    // never depends on oc — but the original oc -> ic_local -> kh,kw loop
+    // order resampled it once per output channel (O(C_out) redundant work).
+    // Reorder to n -> g -> oh -> ow: sample each group's (Cg_in * ksz) taps
+    // once into a scratch column (im2col-style), then dot that column against
+    // every oc's weight row within the group. The inner accumulation order
+    // (ic_local-major, tap-minor) is preserved exactly, so results match the
+    // original bit-for-bit.
+    std::vector<float> col(static_cast<size_t>(Cg_in) * ksz);
+
     for (int n = 0; n < N; ++n) {
         const float* off_n  = Op + static_cast<size_t>(n) * off_row_stride;
         const float* mask_n = Mp ? Mp + static_cast<size_t>(n) * mask_row_stride : nullptr;
-        for (int oc = 0; oc < C_out; ++oc) {
-            const int g = oc / Cg_out;
+        for (int g = 0; g < groups; ++g) {
             const int ic_base = g * Cg_in;
-            const int w_oc_base = oc * Cg_in * ksz;
-            const float bias_v = Bp ? Bp[oc] : 0.0f;
             for (int oh = 0; oh < H_out; ++oh) {
                 const int in_h_origin = oh * stride_h - pad_h;
                 for (int ow = 0; ow < W_out; ++ow) {
                     const int in_w_origin = ow * stride_w - pad_w;
                     const int sp = oh * W_out + ow;
-                    float acc = bias_v;
+
                     for (int ic_local = 0; ic_local < Cg_in; ++ic_local) {
                         const int ic = ic_base + ic_local;
                         const int off_grp = ic / c_per_off_grp;
@@ -127,7 +135,7 @@ void deform_conv2d_forward(const ::brotensor::Tensor& X,
                         const float* mask_grp_base =
                             mask_n ? mask_n + static_cast<size_t>(off_grp) * ksz * H_out * W_out
                                    : nullptr;
-                        const int w_ic_base = w_oc_base + ic_local * ksz;
+                        float* col_ic = col.data() + ic_local * ksz;
                         for (int kh = 0; kh < kH; ++kh) {
                             for (int kw = 0; kw < kW; ++kw) {
                                 const int tap = kh * kW + kw;
@@ -138,11 +146,22 @@ void deform_conv2d_forward(const ::brotensor::Tensor& X,
                                 const float y = in_h_origin + kh * dil_h + off_y;
                                 const float x = in_w_origin + kw * dil_w + off_x;
                                 const float val = bilinear(in_ch, H, W, y, x);
-                                acc += Wp[w_ic_base + tap] * (m * val);
+                                col_ic[tap] = m * val;
                             }
                         }
                     }
-                    Yp[(static_cast<size_t>(n) * C_out + oc) * H_out * W_out + sp] = acc;
+
+                    const int col_len = Cg_in * ksz;
+                    for (int oc_local = 0; oc_local < Cg_out; ++oc_local) {
+                        const int oc = g * Cg_out + oc_local;
+                        const int w_oc_base = oc * Cg_in * ksz;
+                        const float bias_v = Bp ? Bp[oc] : 0.0f;
+                        float acc = bias_v;
+                        for (int k = 0; k < col_len; ++k) {
+                            acc += Wp[w_oc_base + k] * col[k];
+                        }
+                        Yp[(static_cast<size_t>(n) * C_out + oc) * H_out * W_out + sp] = acc;
+                    }
                 }
             }
         }

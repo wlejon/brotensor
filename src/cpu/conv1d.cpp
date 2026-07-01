@@ -105,6 +105,18 @@ void conv_transpose1d_forward(const ::brotensor::Tensor& X,
             for (int lo = 0; lo < L_out; ++lo) y_row[lo] = bv;
         }
     }
+    // Interior region: input samples for which every kernel tap scatters
+    // into a valid output position (1D mirror of conv_transpose2d.cpp's
+    // split), computed once — independent of n/c_in. Only the thin border
+    // of input samples needs the per-tap bounds check; the interior runs a
+    // branch-free kl/oc_local loop.
+    int l_lo = (padding + stride - 1) / stride;
+    int l_hi = L_out - 1 + padding - (kL - 1) * dilation;
+    l_hi = (l_hi >= 0) ? (l_hi / stride) : -1;
+    if (l_lo < 0) l_lo = 0;
+    if (l_hi >= L) l_hi = L - 1;
+    const bool has_interior = l_lo <= l_hi;
+
     // Scatter: input sample (n, c_in, l) reaches l_out = l*stride - padding +
     // kl*dilation in each output channel of c_in's group.
     for (int n = 0; n < N; ++n) {
@@ -113,9 +125,11 @@ void conv_transpose1d_forward(const ::brotensor::Tensor& X,
             const int oc_base = g * Cg_out;
             const float* x_row =
                 Xp + (static_cast<long>(n) * C_in + c_in) * L;
-            for (int l = 0; l < L; ++l) {
+
+            // Border sample: same bounds-checked scatter as before.
+            auto scatter_bordered = [&](int l) {
                 const float xv = x_row[l];
-                if (xv == 0.0f) continue;
+                if (xv == 0.0f) return;
                 const int lo_origin = l * stride - padding;
                 for (int kl = 0; kl < kL; ++kl) {
                     const int lo = lo_origin + kl * dilation;
@@ -128,6 +142,31 @@ void conv_transpose1d_forward(const ::brotensor::Tensor& X,
                             += xv * Wp[w_idx];
                     }
                 }
+            };
+
+            // Interior sample: every tap guaranteed in-bounds — no checks.
+            auto scatter_interior = [&](int l) {
+                const float xv = x_row[l];
+                if (xv == 0.0f) return;
+                const int lo_origin = l * stride - padding;
+                for (int kl = 0; kl < kL; ++kl) {
+                    const int lo = lo_origin + kl * dilation;
+                    for (int oc_local = 0; oc_local < Cg_out; ++oc_local) {
+                        const int oc = oc_base + oc_local;
+                        const int w_idx =
+                            (c_in * Cg_out + oc_local) * kL + kl;
+                        Yp[(static_cast<long>(n) * C_out + oc) * L_out + lo]
+                            += xv * Wp[w_idx];
+                    }
+                }
+            };
+
+            if (has_interior) {
+                for (int l = 0; l < l_lo; ++l) scatter_bordered(l);
+                for (int l = l_lo; l <= l_hi; ++l) scatter_interior(l);
+                for (int l = l_hi + 1; l < L; ++l) scatter_bordered(l);
+            } else {
+                for (int l = 0; l < L; ++l) scatter_bordered(l);
             }
         }
     }

@@ -20,9 +20,17 @@
 // the radices 2/3/5/7 (covers Whisper's n_fft = 400 = 2^4 * 5^2); anything
 // with a large or prime factor falls back to a Bluestein chirp-z transform,
 // so dft_1d is correct for every length >= 1.
+//
+// The twiddle table (mixed-radix path) and chirp table (Bluestein path) are
+// each a pure function of (N, sign), so they're cached per-thread across
+// calls (see cached_twiddles / cached_chirp below) — a multi-frame STFT that
+// calls dft_1d once per frame at a fixed n_fft reuses the same tables
+// instead of rebuilding them every frame.
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace brotensor::detail::cpu::fftcore {
@@ -50,6 +58,62 @@ inline std::vector<Cd> make_twiddles(int N, int sign) {
         w[static_cast<std::size_t>(k)] = {std::cos(s * k), std::sin(s * k)};
     }
     return w;
+}
+
+// ─── (N, sign) -> precomputed-table cache ──────────────────────────────────
+//
+// The mixed-radix recursion and its Bluestein fallback each build a
+// trigonometric table (the twiddle table / the chirp table) that is a pure
+// function of (N, sign) — once computed its values never change. A single
+// STFT/iSTFT call runs `dft_1d` once per frame/row with the *same* n_fft, so
+// the recursion revisits the exact same set of (N, sign) sub-problems (N's
+// factorisation tree is deterministic) on every frame. Without caching that
+// means thousands of redundant heap allocations and sin/cos evaluations per
+// call. Cache the tables keyed on (N, sign) instead of rebuilding them.
+//
+// The cache is `thread_local` rather than behind a mutex: this codebase's
+// convention (see CLAUDE.md — "no mutexes") is single-owner/thread-local
+// state, and the CPU backend already uses exactly this
+// `thread_local static` reusable-scratch pattern elsewhere (mirrored from
+// src/cuda/resblock.cu and src/metal/resblock.mm, which cache per-thread
+// scratch tensors across calls). A thread_local table means each thread that
+// calls into the CPU FFT backend gets its own private cache — no shared
+// mutable state, so nothing to race on, without needing any locking
+// machinery that single-threaded CPU-backend use doesn't need.
+//
+// No eviction policy: the cache grows to the number of distinct (N, sign)
+// pairs a thread has ever computed, which in practice is bounded by the
+// handful of n_fft / signal-length configurations a process actually uses
+// (plus the O(log N) sub-sizes each one's recursion visits) — not by the
+// number of frames or calls, so it saturates quickly and stays small.
+inline std::uint64_t table_cache_key(int N, int sign) {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(N)) << 1)
+           | (sign > 0 ? 1u : 0u);
+}
+
+// Cached twiddle table for fft_recursive's per-level combine step.
+inline const std::vector<Cd>& cached_twiddles(int N, int sign) {
+    thread_local std::unordered_map<std::uint64_t, std::vector<Cd>> cache;
+    const std::uint64_t key = table_cache_key(N, sign);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    return cache.emplace(key, make_twiddles(N, sign)).first->second;
+}
+
+// Cached chirp table for Bluestein's chirp-z transform (exp(sign * i*pi*n^2/N)).
+inline const std::vector<Cd>& cached_chirp(int N, int sign) {
+    thread_local std::unordered_map<std::uint64_t, std::vector<Cd>> cache;
+    const std::uint64_t key = table_cache_key(N, sign);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    std::vector<Cd> chirp(static_cast<std::size_t>(N));
+    for (int n = 0; n < N; ++n) {
+        const long long n2 = (static_cast<long long>(n) * n) % (2LL * N);
+        const double ang = static_cast<double>(sign) * kPi
+                           * static_cast<double>(n2) / static_cast<double>(N);
+        chirp[static_cast<std::size_t>(n)] = {std::cos(ang), std::sin(ang)};
+    }
+    return cache.emplace(key, std::move(chirp)).first->second;
 }
 
 // ─── naive O(N^2) DFT — base case + Bluestein small kernels ────────────────
@@ -102,13 +166,7 @@ inline void bluestein(const std::vector<Cd>& in, std::vector<Cd>& out,
     int M = 1;
     while (M < 2 * N - 1) M <<= 1;
 
-    std::vector<Cd> chirp(static_cast<std::size_t>(N));
-    for (int n = 0; n < N; ++n) {
-        const long long n2 = (static_cast<long long>(n) * n) % (2LL * N);
-        const double ang = static_cast<double>(sign) * kPi
-                           * static_cast<double>(n2) / static_cast<double>(N);
-        chirp[static_cast<std::size_t>(n)] = {std::cos(ang), std::sin(ang)};
-    }
+    const std::vector<Cd>& chirp = cached_chirp(N, sign);
 
     std::vector<Cd> a(static_cast<std::size_t>(M), Cd{});
     for (int n = 0; n < N; ++n) {
@@ -182,7 +240,7 @@ inline void fft_recursive(const std::vector<Cd>& in, std::vector<Cd>& out,
                       subF[static_cast<std::size_t>(j)], sign);
     }
 
-    const std::vector<Cd> w = make_twiddles(N, sign);
+    const std::vector<Cd>& w = cached_twiddles(N, sign);
     out.assign(static_cast<std::size_t>(N), Cd{});
     for (int k = 0; k < N; ++k) {
         const int km = k % m;
