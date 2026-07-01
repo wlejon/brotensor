@@ -480,25 +480,12 @@ void upload_raw(const TensorInfo& info, int rows, int cols,
         }
     }
 
-    // Build on CPU first, then migrate to default device. The alloc vtable's
-    // h2d hook is dtype-agnostic — it just copies bytes() — so this works for
-    // every dtype including the opaque quant carriers.
-    brotensor::Tensor cpu_t = brotensor::Tensor::empty_on(
-        brotensor::Device::CPU, rows, cols, info.dtype);
-    if (cpu_t.bytes() != info.nbytes) {
-        fail("upload_raw: computed bytes (" + std::to_string(cpu_t.bytes()) +
-             ") != info.nbytes (" + std::to_string(info.nbytes) + ")");
-    }
-    if (info.nbytes > 0) {
-        std::memcpy(cpu_t.host_raw_mut(), info.data, info.nbytes);
-    }
-
+    // info.data points into the mmap'd, host-resident GGUF file — a valid
+    // H2D source as-is. Upload straight from it (single copy) instead of
+    // staging through an intermediate CPU tensor and then migrating.
     const brotensor::Device target = brotensor::default_device();
-    if (target == brotensor::Device::CPU) {
-        dst = std::move(cpu_t);
-    } else {
-        dst = cpu_t.to(target);
-    }
+    dst = brotensor::Tensor::from_raw_bytes_on(
+        target, info.data, rows, cols, info.dtype, info.nbytes);
 }
 
 }  // namespace brotensor::gguf

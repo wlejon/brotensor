@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -429,6 +430,22 @@ Tensor Tensor::from_host_int8_on(Device d, const int8_t* src, int r, int c) {
     return t;
 }
 
+Tensor Tensor::from_raw_bytes_on(Device target, const void* src, int r, int c,
+                                  Dtype dt, std::size_t nbytes) {
+    Tensor t = empty_on(target, r, c, dt);
+    if (t.bytes() != nbytes) {
+        throw std::runtime_error(
+            "brotensor: from_raw_bytes_on: nbytes does not match tensor size");
+    }
+    if (nbytes == 0) return t;
+    if (target == Device::CPU) {
+        std::memcpy(t.data, src, nbytes);
+    } else {
+        detail::alloc_for(target).memcpy_h2d(t.data, src, nbytes);
+    }
+    return t;
+}
+
 Tensor Tensor::from_host(const float* src, int r, int c) {
     return from_host_on(default_device(), src, r, c);
 }
@@ -483,10 +500,13 @@ Tensor Tensor::to(Device target) const {
         // GPU → CPU.
         detail::alloc_for(device).memcpy_d2h(t.data, data, n);
     } else {
-        // GPU → different GPU backend. Bounce through host.
-        std::vector<unsigned char> staging(n);
-        detail::alloc_for(device).memcpy_d2h(staging.data(), data, n);
-        detail::alloc_for(target).memcpy_h2d(t.data, staging.data(), n);
+        // GPU → different GPU backend. Bounce through host. The staging
+        // buffer is fully overwritten by the D2H copy below, so allocate it
+        // uninitialized rather than paying for a zero-fill of a multi-GB
+        // tensor just to immediately clobber it.
+        std::unique_ptr<unsigned char[]> staging(new unsigned char[n]);
+        detail::alloc_for(device).memcpy_d2h(staging.get(), data, n);
+        detail::alloc_for(target).memcpy_h2d(t.data, staging.get(), n);
     }
     return t;
 }
@@ -499,10 +519,10 @@ void Tensor::zero() {
 
 void Tensor::resize(int r, int c, Dtype dt) {
     check_dims(r, c, "resize");
+    if (r == rows && c == cols && dt == dtype && data != nullptr) return;
     const std::size_t new_bytes = dtype_storage_bytes(
         dt,
         static_cast<std::int64_t>(r) * static_cast<std::int64_t>(c));
-    if (r == rows && c == cols && dt == dtype && data != nullptr) return;
     // A non-owning view over real storage cannot be reshaped: reallocating
     // would silently allocate fresh owned memory and sever the view, leaving
     // callers with a tensor that no longer aliases what they passed to

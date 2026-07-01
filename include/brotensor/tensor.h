@@ -157,6 +157,16 @@ struct Tensor {
     // responsible for lifetime. Mirrors the legacy GpuTensor::view pattern.
     static Tensor view(Device, void* data, int rows, int cols, Dtype = Dtype::FP32);
 
+    // Dtype-agnostic host bootstrap: allocates on `target` and copies
+    // `nbytes` raw bytes from `src` — a plain memcpy for Device::CPU, a
+    // single memcpy_h2d otherwise. Unlike from_host*_on, this works for any
+    // Dtype including the opaque GGUF block-quant carriers, since it copies
+    // bytes() rather than interpreting elements. `nbytes` must equal the
+    // resulting tensor's bytes() (i.e. dtype_storage_bytes(dt, r*c)).
+    static Tensor from_raw_bytes_on(Device target, const void* src,
+                                     int r, int c, Dtype dt,
+                                     std::size_t nbytes);
+
     // ─── Migration ─────────────────────────────────────────────────────────
 
     // Returns a fresh tensor on `target` with the same shape/dtype/contents
