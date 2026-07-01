@@ -13,6 +13,7 @@
 // kernel also requires dA / dB to be pre-sized to (M, K) / (K, N).
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <cmath>
 #include <cstdint>
@@ -42,8 +43,10 @@ void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
     float* Cp = C.host_f32_mut();
     // m-k-n order: broadcast A[m,k], walk B's row k and C's row m contiguously
     // in the innermost loop (both stride-1) instead of striding through B by N
-    // floats per k step.
-    for (int m = 0; m < M; ++m) {
+    // floats per k step. Each m exclusively owns C's row m (B is read-only),
+    // so the outer loop parallelizes across m with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(M), [&](std::size_t mi) {
+        const int m = static_cast<int>(mi);
         float* Crow = Cp + static_cast<size_t>(m) * N;
         for (int n = 0; n < N; ++n) Crow[n] = 0.0f;
         for (int k = 0; k < K; ++k) {
@@ -53,7 +56,7 @@ void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
                 Crow[n] += a_mk * Brow[n];
             }
         }
-    }
+    });
 }
 
 // Batched A @ B^T, 16-bit (FP16/BF16), FP32 accumulation. Reference triple
@@ -159,7 +162,10 @@ void matmul_backward(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
     float* dBp = dB.host_f32_mut();
 
     // dA[m, k] += sum_n dC[m, n] * B[k, n]  (accumulate — matches GPU atomicAdd)
-    for (int m = 0; m < M; ++m) {
+    // Each m exclusively owns dA's row m (dC/B are read-only), so this
+    // parallelizes across m with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(M), [&](std::size_t mi) {
+        const int m = static_cast<int>(mi);
         for (int k = 0; k < K; ++k) {
             float acc = 0.0f;
             for (int n = 0; n < N; ++n) {
@@ -167,21 +173,26 @@ void matmul_backward(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
             }
             dAp[m * K + k] += acc;
         }
-    }
+    });
     // dB[k, n] += sum_m A[m, k] * dC[m, n]  (accumulate — matches GPU atomicAdd)
-    // m-k-n order: broadcast A[m,k], walk dC's row m and dB's row k
-    // contiguously (both stride-1) instead of striding through A and dC by K
-    // and N floats respectively per m step.
-    for (int m = 0; m < M; ++m) {
-        const float* dCrow = dCp + static_cast<size_t>(m) * N;
-        for (int k = 0; k < K; ++k) {
+    // k-m-n order: each k exclusively owns dB's row k (accumulated over all
+    // m), so this axis parallelizes across k with no cross-thread writes —
+    // unlike an m-outer order, which would need every thread to accumulate
+    // into the same shared dB rows across m. dC's row m and dB's row k are
+    // still walked contiguously (both stride-1) in the innermost loop; only
+    // the A[m,k] broadcast load is strided, which doesn't block
+    // vectorization of the n loop.
+    parallel_for(static_cast<std::size_t>(K), [&](std::size_t ki) {
+        const int k = static_cast<int>(ki);
+        float* dBrow = dBp + static_cast<size_t>(k) * N;
+        for (int m = 0; m < M; ++m) {
             const float a_mk = Ap[m * K + k];
-            float* dBrow = dBp + static_cast<size_t>(k) * N;
+            const float* dCrow = dCp + static_cast<size_t>(m) * N;
             for (int n = 0; n < N; ++n) {
                 dBrow[n] += a_mk * dCrow[n];
             }
         }
-    }
+    });
 }
 
 } // namespace brotensor::detail::cpu
