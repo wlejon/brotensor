@@ -23,6 +23,17 @@
 // optimisation we can layer in later; the contract is identical either way.
 //
 // FP32-only. brolm's text path runs FP32 here per the public contract.
+//
+// OCCUPANCY: this launches exactly `num_heads` blocks (<<<num_heads, block>>>
+// below), so a batch of B sequences occupies only num_heads SMs per serial
+// per-sequence launch rather than num_heads*B — the natural fix is folding a
+// batch axis into the grid, but the public contract (delta_rule.h) is
+// single-sequence (Q/K/V have no batch dimension), so that would be an
+// ABI-visible shape change, not a purely internal one — deferred pending an
+// explicit decision to widen the op's contract. The WY/UT chunked-parallel
+// transform noted above is the other lever and doesn't require an API
+// change, but is a substantially larger algorithmic undertaking; also
+// deferred. Both are documented here rather than attempted blind.
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
