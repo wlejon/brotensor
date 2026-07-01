@@ -26,7 +26,9 @@
 //                            into the caller's dB. Caller zeros dB first.
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -103,7 +105,10 @@ void conv2d_forward(const ::brotensor::Tensor& X,
 
     const bool has_interior = (oh_lo <= oh_hi) && (ow_lo <= ow_hi);
 
-    for (int n = 0; n < N; ++n) {
+    // Each n exclusively owns Y's batch slice n (X/Wt/bias are read-only), so
+    // this parallelizes across n with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ni) {
+        const int n = static_cast<int>(ni);
         for (int oc = 0; oc < C_out; ++oc) {
             const int g = oc / Cg_out;
             const int ic_base = g * Cg_in;
@@ -175,7 +180,7 @@ void conv2d_forward(const ::brotensor::Tensor& X,
                 }
             }
         }
-    }
+    });
 }
 
 void conv2d_backward_input(const ::brotensor::Tensor& Wt,
@@ -210,7 +215,10 @@ void conv2d_backward_input(const ::brotensor::Tensor& Wt,
 
     // Gather form: one accumulation per input pixel, inverting the forward
     // index relation in_h = stride_h*i_out - pad_h + dil_h*kh.
-    for (int n = 0; n < N; ++n) {
+    // Each n exclusively owns dX's batch slice n (dY/Wt are read-only), so
+    // this parallelizes across n with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ni) {
+        const int n = static_cast<int>(ni);
         for (int c_in = 0; c_in < C_in; ++c_in) {
             const int g = c_in / Cg_in;
             const int c_in_local = c_in - g * Cg_in;
@@ -245,7 +253,7 @@ void conv2d_backward_input(const ::brotensor::Tensor& Wt,
                 }
             }
         }
-    }
+    });
 }
 
 void conv2d_backward_weight(const ::brotensor::Tensor& X,
@@ -281,6 +289,13 @@ void conv2d_backward_weight(const ::brotensor::Tensor& X,
 
     // One accumulation per weight element; accumulate (+=) into dWt to match
     // the GPU's FP32-scratch-fold-into-dWt contract.
+    //
+    // NOT parallelized over n: here n is the innermost reduction axis (every
+    // batch item's contribution sums into the same dWp[w_idx]), not the outer
+    // axis — naively wrapping parallel_for around n would have every thread
+    // racing on the same dWt elements. Parallelizing over c_out instead would
+    // be race-free (each c_out row of dWt is disjoint), but that's a
+    // different axis than what this task scopes to, so left single-threaded.
     for (int c_out = 0; c_out < C_out; ++c_out) {
         const int g = c_out / Cg_out;
         for (int c_in_local = 0; c_in_local < Cg_in; ++c_in_local) {
@@ -332,6 +347,10 @@ void conv2d_backward_bias(const ::brotensor::Tensor& dY,
     const int spatial = H_out * W_out;
     // Per-channel sum over (N, H_out, W_out); accumulate (+=) into dB to match
     // the GPU's FP32-scratch-fold-into-dB contract.
+    //
+    // NOT parallelized over n: n is the reduction axis here too (summed into
+    // the same dBp[c_out] for every batch item), so it's left single-threaded
+    // for the same reason as conv2d_backward_weight above.
     for (int c_out = 0; c_out < C_out; ++c_out) {
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {

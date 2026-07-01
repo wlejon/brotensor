@@ -19,8 +19,10 @@
 // border contribute zero — NOT clamped.
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -113,9 +115,15 @@ void deform_conv2d_forward(const ::brotensor::Tensor& X,
     // every oc's weight row within the group. The inner accumulation order
     // (ic_local-major, tap-minor) is preserved exactly, so results match the
     // original bit-for-bit.
-    std::vector<float> col(static_cast<size_t>(Cg_in) * ksz);
-
-    for (int n = 0; n < N; ++n) {
+    // Each n exclusively owns Y's batch slice n (X/offset/mask/Wt/bias are
+    // read-only), so this parallelizes across n with no cross-thread writes.
+    // The im2col scratch `col` MUST be declared inside this lambda (fresh
+    // per invocation, even across threads) rather than hoisted above the
+    // loop — a single shared vector reused across n/g would race under
+    // parallel_for (every thread scribbling into the same buffer).
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ni) {
+        const int n = static_cast<int>(ni);
+        std::vector<float> col(static_cast<size_t>(Cg_in) * ksz);
         const float* off_n  = Op + static_cast<size_t>(n) * off_row_stride;
         const float* mask_n = Mp ? Mp + static_cast<size_t>(n) * mask_row_stride : nullptr;
         for (int g = 0; g < groups; ++g) {
@@ -165,7 +173,7 @@ void deform_conv2d_forward(const ::brotensor::Tensor& X,
                 }
             }
         }
-    }
+    });
 }
 
 } // namespace brotensor::detail::cpu

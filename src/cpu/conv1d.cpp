@@ -21,7 +21,9 @@
 //                                              caller zeros them first.
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -97,14 +99,18 @@ void conv_transpose1d_forward(const ::brotensor::Tensor& X,
     const float* Bp = bias ? bias->host_f32() : nullptr;
     float* Yp = Y.host_f32_mut();
 
-    // Seed every output sample with its channel bias, then scatter-add.
-    for (int n = 0; n < N; ++n) {
+    // Seed every output sample with its channel bias, then scatter-add. Each
+    // n exclusively owns Y's batch slice n, so this parallelizes across n
+    // with no cross-thread writes; it fully completes (parallel_for blocks)
+    // before the scatter-add pass below starts touching the same Y buffer.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ni) {
+        const int n = static_cast<int>(ni);
         for (int oc = 0; oc < C_out; ++oc) {
             const float bv = Bp ? Bp[oc] : 0.0f;
             float* y_row = Yp + (static_cast<long>(n) * C_out + oc) * L_out;
             for (int lo = 0; lo < L_out; ++lo) y_row[lo] = bv;
         }
-    }
+    });
     // Interior region: input samples for which every kernel tap scatters
     // into a valid output position (1D mirror of conv_transpose2d.cpp's
     // split), computed once — independent of n/c_in. Only the thin border
@@ -118,8 +124,13 @@ void conv_transpose1d_forward(const ::brotensor::Tensor& X,
     const bool has_interior = l_lo <= l_hi;
 
     // Scatter: input sample (n, c_in, l) reaches l_out = l*stride - padding +
-    // kl*dilation in each output channel of c_in's group.
-    for (int n = 0; n < N; ++n) {
+    // kl*dilation in each output channel of c_in's group. Each n only ever
+    // scatters into Y's own batch slice n, so this parallelizes across n with
+    // no cross-thread writes — the c_in loop stays sequential per-n, so the
+    // += accumulation across c_in into a shared oc is untouched by another
+    // thread.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ni) {
+        const int n = static_cast<int>(ni);
         for (int c_in = 0; c_in < C_in; ++c_in) {
             const int g = c_in / Cg_in;
             const int oc_base = g * Cg_out;
@@ -169,7 +180,7 @@ void conv_transpose1d_forward(const ::brotensor::Tensor& X,
                 for (int l = 0; l < L; ++l) scatter_bordered(l);
             }
         }
-    }
+    });
 }
 
 // ─── conv_transpose1d_backward_input ───────────────────────────────────────
@@ -205,8 +216,11 @@ void conv_transpose1d_backward_input(const ::brotensor::Tensor& Wt,
     const float* dYp = dY.host_f32();
     float* dXp = dX.host_f32_mut();
 
-    // Adjoint of the transposed-conv scatter is a plain gather conv.
-    for (int n = 0; n < N; ++n) {
+    // Adjoint of the transposed-conv scatter is a plain gather conv. Each n
+    // exclusively owns dX's batch slice n (dY/Wt are read-only), so this
+    // parallelizes across n with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ni) {
+        const int n = static_cast<int>(ni);
         for (int c_in = 0; c_in < C_in; ++c_in) {
             const int g = c_in / Cg_in;
             const int oc_base = g * Cg_out;
@@ -228,7 +242,7 @@ void conv_transpose1d_backward_input(const ::brotensor::Tensor& Wt,
                 dXp[(static_cast<long>(n) * C_in + c_in) * L + l] = acc;
             }
         }
-    }
+    });
 }
 
 // ─── conv_transpose1d_backward_weight ──────────────────────────────────────
@@ -264,6 +278,11 @@ void conv_transpose1d_backward_weight(const ::brotensor::Tensor& X,
     float* dWp = dWt.host_f32_mut();
 
     // One accumulation per weight element; += into dWt (caller zeroed it).
+    //
+    // NOT parallelized over n: n is the innermost reduction axis (every
+    // batch item's contribution sums into the same dWp element), not an
+    // outer axis — parallelizing it would race every thread on the same
+    // dWt element. Left single-threaded per this task's scope.
     for (int c_in = 0; c_in < C_in; ++c_in) {
         const int g = c_in / Cg_in;
         const int oc_base = g * Cg_out;
@@ -307,6 +326,9 @@ void conv_transpose1d_backward_bias(const ::brotensor::Tensor& dY,
     float* dBp = dB.host_f32_mut();
 
     // Per-channel sum over (N, L_out); += into dB (caller zeroed it).
+    //
+    // NOT parallelized over n: same reason as backward_weight above — n is
+    // the reduction axis here, not the outer axis.
     for (int oc = 0; oc < C_out; ++oc) {
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {

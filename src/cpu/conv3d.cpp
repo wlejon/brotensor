@@ -24,7 +24,9 @@
 // ACCUMULATION: conv3d_forward — Y OVERWRITTEN (kernel stores acc directly).
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -108,7 +110,10 @@ void conv3d_forward(const ::brotensor::Tensor& X,
     const bool has_interior =
         (ot_lo <= ot_hi) && (oh_lo <= oh_hi) && (ow_lo <= ow_hi);
 
-    for (int n = 0; n < N; ++n) {
+    // Each n exclusively owns Y's batch slice n (X/Wt/bias are read-only), so
+    // this parallelizes across n with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ni) {
+        const int n = static_cast<int>(ni);
         for (int oc = 0; oc < C_out; ++oc) {
             const int g = oc / Cg_out;
             const int ic_base = g * Cg_in;
@@ -207,7 +212,7 @@ void conv3d_forward(const ::brotensor::Tensor& X,
                 }
             }
         }
-    }
+    });
 }
 
 } // namespace brotensor::detail::cpu
