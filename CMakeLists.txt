@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 if(MSVC)
     add_compile_options(
         $<$<COMPILE_LANGUAGE:CXX>:/MP>
@@ -90,6 +93,7 @@ endif()
 
 add_library(brotensor_cpu STATIC
     src/cpu/alloc.cpp
+    src/cpu/thread_pool.cpp
     src/cpu/ops_impl.cpp
     src/cpu/register.cpp
     src/cpu/elementwise.cpp
@@ -153,7 +157,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/upfirdn2d.cpp
     src/cpu/modulated_conv2d.cpp
 )
-target_link_libraries(brotensor_cpu PUBLIC brotensor_core)
+target_link_libraries(brotensor_cpu PUBLIC brotensor_core Threads::Threads)
 if(MSVC)
     target_compile_options(brotensor_cpu PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 else()
