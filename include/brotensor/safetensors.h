@@ -23,10 +23,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include <brotensor/detail/string_hash.h>
 
 namespace brotensor {
 struct Tensor;
@@ -91,7 +94,7 @@ private:
     std::size_t file_size_ = 0;
 
     std::vector<TensorView> tensors_;
-    std::unordered_map<std::string, std::size_t> index_;
+    std::unordered_map<std::string, std::size_t, detail::StringHash, std::equal_to<>> index_;
 };
 
 // Upload a tensor view as a 2D (rows, cols) Tensor.

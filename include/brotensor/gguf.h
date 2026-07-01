@@ -11,9 +11,11 @@
 // (innermost-first) dim list to (rows, cols) for upload_raw().
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/string_hash.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -94,9 +96,9 @@ private:
     uint32_t alignment_ = 32;
 
     std::vector<std::pair<std::string, Value>>    metadata_;
-    std::unordered_map<std::string, std::size_t>  meta_index_;
+    std::unordered_map<std::string, std::size_t, detail::StringHash, std::equal_to<>> meta_index_;
     std::vector<TensorInfo>                       tensors_;
-    std::unordered_map<std::string, std::size_t>  tensor_index_;
+    std::unordered_map<std::string, std::size_t, detail::StringHash, std::equal_to<>> tensor_index_;
 };
 
 // Convert GGUF shape (innermost-first) to brotensor 2D (rows, cols). cols is

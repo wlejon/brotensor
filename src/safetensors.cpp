@@ -404,7 +404,7 @@ File File::open(const std::string& path) {
 }
 
 const TensorView* File::find(std::string_view name) const {
-    auto it = index_.find(std::string(name));
+    auto it = index_.find(name);
     if (it == index_.end()) return nullptr;
     return &tensors_[it->second];
 }

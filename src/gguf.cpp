@@ -434,7 +434,7 @@ File File::open(const std::string& path) {
 }
 
 const TensorInfo* File::find_tensor(std::string_view name) const {
-    auto it = tensor_index_.find(std::string(name));
+    auto it = tensor_index_.find(name);
     if (it == tensor_index_.end()) return nullptr;
     return &tensors_[it->second];
 }
@@ -446,7 +446,7 @@ const TensorInfo& File::get_tensor(std::string_view name) const {
 }
 
 const Value* File::find_meta(std::string_view key) const {
-    auto it = meta_index_.find(std::string(key));
+    auto it = meta_index_.find(key);
     if (it == meta_index_.end()) return nullptr;
     return &metadata_[it->second].second;
 }
