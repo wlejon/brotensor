@@ -878,6 +878,14 @@ BT_PARITY_TEST(flash_fwd_6x10_D48_h6)  { run_flash_forward(6,  10, 48, 6, 0x701u
 BT_PARITY_TEST(flash_fwd_12x20_D64_h8) { run_flash_forward(12, 20, 64, 8, 0x702ull, false, false); }
 BT_PARITY_TEST(flash_fwd_8x8_D32_h4_mask)   { run_flash_forward(8, 8, 32, 4, 0x703ull, true,  false); }
 BT_PARITY_TEST(flash_fwd_10x10_D32_h2_causal){ run_flash_forward(10, 10, 32, 2, 0x704ull, false, true); }
+// head_dim=40 (D=80, h=2): exercises the fused WMMA path's head_dim=40
+// instantiation (SD1.5-class self-attention shape) added this session —
+// non-causal so it actually routes through flash_fused rather than the
+// per-head GEMM fallback; Lk=96 spans two BC=64 K-tiles (one partial) and
+// Lq=200 spans two BR=128 query tiles (one partial), exercising both
+// tile-boundary paths.
+BT_PARITY_TEST(flash_fwd_200x96_D80_h2_hd40) { run_flash_forward(200, 96, 80, 2, 0x705ull, false, false); }
+BT_PARITY_TEST(flash_fwd_200x96_D80_h2_hd40_mask) { run_flash_forward(200, 96, 80, 2, 0x706ull, true, false); }
 
 // ─── flash_attention_qkvo_forward (self + cross, bias, mask, causal) ──────
 BT_PARITY_TEST(qkvo_fwd_self_8x8_D32_h4) {
@@ -938,6 +946,9 @@ BT_PARITY_TEST(flash_fwd_bf16_8x8_D32_h4)    { run_flash_forward_bf16(8,  8,  32
 BT_PARITY_TEST(flash_fwd_bf16_12x20_D64_h8)  { run_flash_forward_bf16(12, 20, 64, 8, 0x7A1ull, false, false); }
 BT_PARITY_TEST(flash_fwd_bf16_8x8_D32_h4_mask)    { run_flash_forward_bf16(8, 8, 32, 4, 0x7A2ull, true,  false); }
 BT_PARITY_TEST(flash_fwd_bf16_10x10_D32_h2_causal){ run_flash_forward_bf16(10, 10, 32, 2, 0x7A3ull, false, true); }
+// head_dim=40 (D=80, h=2), same tile-boundary coverage as the FP16 case above.
+BT_PARITY_TEST(flash_fwd_bf16_200x96_D80_h2_hd40) { run_flash_forward_bf16(200, 96, 80, 2, 0x7A4ull, false, false); }
+BT_PARITY_TEST(flash_fwd_bf16_200x96_D80_h2_hd40_mask) { run_flash_forward_bf16(200, 96, 80, 2, 0x7A5ull, true, false); }
 
 BT_PARITY_TEST(qkvo_fwd_bf16_self_8x8_D32_h4) {
     run_qkvo_forward_bf16(8, 8, 32, 32, 4, 0x7B0ull, false, false, false, false);

@@ -320,6 +320,14 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
                      int Lq, int Lk, int D, int num_heads, int head_dim,
                      cudaStream_t stream) {
     switch (head_dim) {
+        case 40:
+            // PAD = round16(40) = 48, smaller than head_dim 64's PAD (64), so
+            // shared-memory pressure is lower here than the 64/BR=128 case —
+            // BR=128 fits comfortably. SD1.5-class self-attention (Lq=Lk=4096,
+            // head_dim=40) is the motivating shape: previously fell through to
+            // the O(Lq*Lk) scalar path since this switch had no case for it.
+            launch_impl<T, 40, 128>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
         case 64:
             launch_impl<T, 64, 128>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
             return;
@@ -334,7 +342,7 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
 }  // namespace
 
 bool supported(int head_dim) {
-    return head_dim == 64 || head_dim == 72;
+    return head_dim == 40 || head_dim == 64 || head_dim == 72;
 }
 
 void launch(const __half* Q, const __half* K, const __half* V,
