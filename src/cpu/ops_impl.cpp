@@ -6,6 +6,7 @@
 // differs from the legacy `.ptr()` / `.data.data()` accessors.
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <algorithm>
 #include <cassert>
@@ -470,7 +471,10 @@ void attention_forward(const ::brotensor::Tensor& X,
     float* Op = O.host_f32_mut();
 
     // Q/K/V projections: out(i,j) = sum_k X(i,k) * W(j,k)   (W stored (D,D)).
-    for (int i = 0; i < N; ++i) {
+    // Each token i exclusively owns row i of Q/K/V (W* are read-only), so the
+    // token axis parallelizes with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         const float* xr = Xp + static_cast<std::size_t>(i) * D;
         for (int j = 0; j < D; ++j) {
             const float* wq = Wqp + static_cast<std::size_t>(j) * D;
@@ -487,16 +491,18 @@ void attention_forward(const ::brotensor::Tensor& X,
             Kp[idx] = ak;
             Vp[idx] = av;
         }
-    }
+    });
 
     const float inv_sqrtd = 1.0f / std::sqrt(static_cast<float>(D));
 
-    // Scores → masked row softmax → Attn.
-    for (int i = 0; i < N; ++i) {
+    // Scores → masked row softmax → Attn. Each i owns row i of Attn
+    // exclusively (Q/K are read-only here), so this parallelizes over i.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         float* arow = Ap + static_cast<std::size_t>(i) * N;
         if (d_mask && d_mask[i] < 0.5f) {
             for (int j = 0; j < N; ++j) arow[j] = 0.0f;
-            continue;
+            return;
         }
         const float* qr = Qp + static_cast<std::size_t>(i) * D;
         float m = -1e30f;
@@ -518,10 +524,12 @@ void attention_forward(const ::brotensor::Tensor& X,
         }
         const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
         for (int j = 0; j < N; ++j) arow[j] *= inv;
-    }
+    });
 
-    // Y_pre_Wo = Attn @ V.
-    for (int i = 0; i < N; ++i) {
+    // Y_pre_Wo = Attn @ V. Each i owns row i of Y_pre_Wo exclusively (Attn/V
+    // read-only), so this parallelizes over i.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         const float* arow = Ap + static_cast<std::size_t>(i) * N;
         float* yr = Yp + static_cast<std::size_t>(i) * D;
         for (int k = 0; k < D; ++k) {
@@ -530,14 +538,16 @@ void attention_forward(const ::brotensor::Tensor& X,
                 acc += arow[j] * Vp[static_cast<std::size_t>(j) * D + k];
             yr[k] = acc;
         }
-    }
+    });
 
-    // O = Y @ Wo^T, zero invalid query rows.
-    for (int i = 0; i < N; ++i) {
+    // O = Y @ Wo^T, zero invalid query rows. Each i owns row i of O
+    // exclusively (Y/Wo read-only), so this parallelizes over i.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         float* orow = Op + static_cast<std::size_t>(i) * D;
         if (d_mask && d_mask[i] < 0.5f) {
             for (int c = 0; c < D; ++c) orow[c] = 0.0f;
-            continue;
+            return;
         }
         const float* yr = Yp + static_cast<std::size_t>(i) * D;
         for (int c = 0; c < D; ++c) {
@@ -546,7 +556,7 @@ void attention_forward(const ::brotensor::Tensor& X,
             for (int k = 0; k < D; ++k) acc += yr[k] * wr[k];
             orow[c] = acc;
         }
-    }
+    });
 }
 
 void attention_backward(const ::brotensor::Tensor& dO,
@@ -594,8 +604,10 @@ void attention_backward(const ::brotensor::Tensor& dO,
     std::vector<float> dQ(static_cast<std::size_t>(N) * D, 0.0f);
     std::vector<float> dK(static_cast<std::size_t>(N) * D, 0.0f);
 
-    // dY (overwrite, zero on invalid rows) and dWo (accumulate).
-    for (int i = 0; i < N; ++i) {
+    // dY (overwrite, zero on invalid rows). Each i owns row i of dY
+    // exclusively (Wo/dO read-only), so this parallelizes over i.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         const bool valid = !(d_mask && d_mask[i] < 0.5f);
         for (int k = 0; k < D; ++k) {
             float acc = 0.0f;
@@ -606,11 +618,16 @@ void attention_backward(const ::brotensor::Tensor& dO,
             }
             dY[static_cast<std::size_t>(i) * D + k] = acc;
         }
-    }
-    // Token axis (i) outermost, accumulating directly into the resident
-    // dWop buffer as we go: both dOp[i,c] and Yp[i,k] are then read
-    // contiguously (stride-1 in the inner k loop) instead of gathered with
-    // stride D once per (c,k) pair.
+    });
+    // dWo (accumulate). NOT parallelized: this is a genuine reduction across
+    // the whole token axis i into the single shared (D, D) dWo buffer (every
+    // i contributes to every (c, k) cell) — unlike the per-i loops above/
+    // below, no reordering of this token-outermost loop makes different i
+    // values touch disjoint memory, so splitting it across threads would race
+    // multiple i's on the same dWrow[k] accumulator. Left single-threaded
+    // (see also mha_backward's dWo/dbo, and cross_attention_backward's dWo,
+    // which already uses a c-outer/i-inner-private-sum order that IS
+    // parallel-safe and has been parallelized over c).
     for (int i = 0; i < N; ++i) {
         if (d_mask && d_mask[i] < 0.5f) continue;
         const float* dOi = dOp + static_cast<std::size_t>(i) * D;
@@ -624,8 +641,10 @@ void attention_backward(const ::brotensor::Tensor& dO,
         }
     }
 
-    // dAttn(i,j) = sum_k dY(i,k) * V(j,k);  dV(j,k) = sum_i Attn(i,j) * dY(i,k).
-    for (int i = 0; i < N; ++i) {
+    // dAttn(i,j) = sum_k dY(i,k) * V(j,k). Each i owns row i of dAttn
+    // exclusively (dY/V read-only), so this parallelizes over i.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         for (int j = 0; j < N; ++j) {
             float acc = 0.0f;
             for (int k = 0; k < D; ++k)
@@ -633,8 +652,11 @@ void attention_backward(const ::brotensor::Tensor& dO,
                        Vp[static_cast<std::size_t>(j) * D + k];
             dAttn[static_cast<std::size_t>(i) * N + j] = acc;
         }
-    }
-    // dV: same token-outermost reorder as dWo above. dV starts zero-filled
+    });
+    // dV(j,k) = sum_i Attn(i,j) * dY(i,k). NOT parallelized: token-outermost
+    // reorder (same as dWo above) means every i accumulates into every dV
+    // row j — a genuine reduction across i into shared dV, not disjoint per
+    // outer-loop index. Left single-threaded. dV starts zero-filled
     // (std::vector value-init), so accumulating with += is equivalent to the
     // original overwrite.
     for (int i = 0; i < N; ++i) {
@@ -649,14 +671,16 @@ void attention_backward(const ::brotensor::Tensor& dO,
         }
     }
 
-    // dScores via per-row softmax backward, scaled by inv_sqrtd.
-    for (int i = 0; i < N; ++i) {
+    // dScores via per-row softmax backward, scaled by inv_sqrtd. Each i owns
+    // row i of dScores exclusively, so this parallelizes over i.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         const float* prow  = Ap + static_cast<std::size_t>(i) * N;
         const float* dprow = dAttn.data() + static_cast<std::size_t>(i) * N;
         float* drow = dScores.data() + static_cast<std::size_t>(i) * N;
         if (d_mask && d_mask[i] < 0.5f) {
             for (int j = 0; j < N; ++j) drow[j] = 0.0f;
-            continue;
+            return;
         }
         float dot = 0.0f;
         for (int j = 0; j < N; ++j) dot += dprow[j] * prow[j];
@@ -664,10 +688,12 @@ void attention_backward(const ::brotensor::Tensor& dO,
             if (d_mask && d_mask[j] < 0.5f) drow[j] = 0.0f;
             else drow[j] = prow[j] * (dprow[j] - dot) * inv_sqrtd;
         }
-    }
+    });
 
-    // dQ(i,k) = sum_j dScores(i,j) * K(j,k);  dK(j,k) = sum_i dScores(i,j) * Q(i,k).
-    for (int i = 0; i < N; ++i) {
+    // dQ(i,k) = sum_j dScores(i,j) * K(j,k). Each i owns row i of dQ
+    // exclusively (dScores/K read-only), so this parallelizes over i.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         for (int k = 0; k < D; ++k) {
             float acc = 0.0f;
             for (int j = 0; j < N; ++j)
@@ -675,9 +701,12 @@ void attention_backward(const ::brotensor::Tensor& dO,
                        Kp[static_cast<std::size_t>(j) * D + k];
             dQ[static_cast<std::size_t>(i) * D + k] = acc;
         }
-    }
-    // dK: token-outermost reorder (dScores row i is contiguous over j; dK
-    // starts zero-filled, so += matches the original overwrite).
+    });
+    // dK(j,k) = sum_i dScores(i,j) * Q(i,k). NOT parallelized: same
+    // token-outermost reduction hazard as dV above — every i accumulates
+    // into every dK row j. Left single-threaded (dScores row i is
+    // contiguous over j; dK starts zero-filled, so += matches the original
+    // overwrite).
     for (int i = 0; i < N; ++i) {
         const float* dSi = dScores.data() + static_cast<std::size_t>(i) * N;
         const float* Qi = Qp + static_cast<std::size_t>(i) * D;
@@ -690,8 +719,12 @@ void attention_backward(const ::brotensor::Tensor& dO,
         }
     }
 
-    // dWq/dWk/dWv accumulate: dW(j,k) += sum_i dQ(i,j) * X(i,k). Token-axis
-    // (i) outermost, same GEMM-reorder principle as dWo/dV/dK above.
+    // dWq/dWk/dWv accumulate: dW(j,k) += sum_i dQ(i,j) * X(i,k). NOT
+    // parallelized: token-axis (i) outermost, same reduction hazard as
+    // dWo/dV/dK above — every i accumulates into the full (D,D) dWq/dWk/dWv,
+    // no per-i disjoint slice exists (single-head attention has no per-head
+    // row partition to hide the reduction behind, unlike mha_backward's
+    // per-head dWq/dWk/dWv below). Left single-threaded.
     for (int i = 0; i < N; ++i) {
         const float* Xi  = Xp + static_cast<std::size_t>(i) * D;
         const float* dQi = dQ.data() + static_cast<std::size_t>(i) * D;
@@ -714,7 +747,10 @@ void attention_backward(const ::brotensor::Tensor& dO,
     }
 
     // dX(i,k) = sum_j dQ(i,j)*Wq(j,k) + dK(i,j)*Wk(j,k) + dV(i,j)*Wv(j,k).
-    for (int i = 0; i < N; ++i) {
+    // Each i owns row i of dX exclusively (dQ/dK/dV/Wq/Wk/Wv read-only), so
+    // this parallelizes over i.
+    parallel_for(static_cast<std::size_t>(N), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         for (int k = 0; k < D; ++k) {
             float acc = 0.0f;
             for (int j = 0; j < D; ++j) {
@@ -725,7 +761,7 @@ void attention_backward(const ::brotensor::Tensor& dO,
             }
             dXp[static_cast<std::size_t>(i) * D + k] = acc;
         }
-    }
+    });
 }
 
 // ─── Multi-head self-attention ─────────────────────────────────────────────
@@ -771,8 +807,11 @@ void mha_forward(const ::brotensor::Tensor& X,
 
     // Per-head Q/K/V projection: out(hh,i,j) = sum_k X(i,k) * W(hh*dh+j, k)
     // + (b ? b[hh*dh+j] : 0). Biases are flat length-D vectors indexed by
-    // the full output column (hh*dh+j).
-    for (int hh = 0; hh < H; ++hh) {
+    // the full output column (hh*dh+j). Each head hh owns rows
+    // [hh*K, hh*K+K) of Qh/Kh/Vh exclusively (X/W*/b* read-only), so the
+    // head axis parallelizes with no cross-thread writes.
+    parallel_for(static_cast<std::size_t>(H), [&](std::size_t hhi) {
+        const int hh = static_cast<int>(hhi);
         const int row_off = hh * dh;
         for (int i = 0; i < K; ++i) {
             const float* xr = Xp + static_cast<std::size_t>(i) * D;
@@ -797,12 +836,14 @@ void mha_forward(const ::brotensor::Tensor& X,
                 Vp[out_row + j] = av;
             }
         }
-    }
+    });
 
     const float inv_sqrtdh = 1.0f / std::sqrt(static_cast<float>(dh));
 
-    // Per-head scores → masked row softmax → Attnh.
-    for (int hh = 0; hh < H; ++hh) {
+    // Per-head scores → masked row softmax → Attnh. Each hh owns rows
+    // [hh*K, hh*K+K) of Attnh exclusively, so parallelizes over hh.
+    parallel_for(static_cast<std::size_t>(H), [&](std::size_t hhi) {
+        const int hh = static_cast<int>(hhi);
         for (int i = 0; i < K; ++i) {
             float* arow = Ap + (static_cast<std::size_t>(hh) * K + i) * K;
             if (d_mask && d_mask[i] < 0.5f) {
@@ -830,10 +871,13 @@ void mha_forward(const ::brotensor::Tensor& X,
             const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
             for (int j = 0; j < K; ++j) arow[j] *= inv;
         }
-    }
+    });
 
-    // Per-head Attn @ V → Yconcat(i, hh*dh+k).
-    for (int hh = 0; hh < H; ++hh) {
+    // Per-head Attn @ V → Yconcat(i, hh*dh+k). Each hh writes only its own
+    // column range [hh*dh, hh*dh+dh) of every row of Yconcat — different hh
+    // never touch the same bytes, so this parallelizes over hh.
+    parallel_for(static_cast<std::size_t>(H), [&](std::size_t hhi) {
+        const int hh = static_cast<int>(hhi);
         for (int i = 0; i < K; ++i) {
             const float* arow = Ap + (static_cast<std::size_t>(hh) * K + i) * K;
             for (int k = 0; k < dh; ++k) {
@@ -845,14 +889,17 @@ void mha_forward(const ::brotensor::Tensor& X,
                 Yp[static_cast<std::size_t>(i) * D + (hh * dh + k)] = acc;
             }
         }
-    }
+    });
 
     // Output projection O = Yconcat @ Wo^T + bo, zero invalid query rows.
-    for (int i = 0; i < K; ++i) {
+    // Each i owns row i of O exclusively (Yconcat/Wo/bo read-only), so this
+    // parallelizes over i.
+    parallel_for(static_cast<std::size_t>(K), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         float* orow = Op + static_cast<std::size_t>(i) * D;
         if (d_mask && d_mask[i] < 0.5f) {
             for (int c = 0; c < D; ++c) orow[c] = 0.0f;
-            continue;
+            return;
         }
         const float* yr = Yp + static_cast<std::size_t>(i) * D;
         for (int c = 0; c < D; ++c) {
@@ -862,7 +909,7 @@ void mha_forward(const ::brotensor::Tensor& X,
             if (bop) acc += bop[c];
             orow[c] = acc;
         }
-    }
+    });
 }
 
 void mha_backward(const ::brotensor::Tensor& dO,
@@ -914,8 +961,10 @@ void mha_backward(const ::brotensor::Tensor& dO,
     std::vector<float> dQh(static_cast<std::size_t>(H) * K * dh, 0.0f);
     std::vector<float> dKh(static_cast<std::size_t>(H) * K * dh, 0.0f);
 
-    // dYconcat (overwrite, zero on invalid rows) and dWo (accumulate).
-    for (int i = 0; i < K; ++i) {
+    // dYconcat (overwrite, zero on invalid rows). Each i owns row i of dYc
+    // exclusively (Wo/dO read-only), so this parallelizes over i.
+    parallel_for(static_cast<std::size_t>(K), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         const bool valid = !(d_mask && d_mask[i] < 0.5f);
         for (int k = 0; k < D; ++k) {
             float acc = 0.0f;
@@ -926,9 +975,13 @@ void mha_backward(const ::brotensor::Tensor& dO,
             }
             dYc[static_cast<std::size_t>(i) * D + k] = acc;
         }
-    }
-    // Token axis (i) outermost — same GEMM-reorder as attention_backward's
-    // dWo above: dOp[i,c] and Yp[i,k] read contiguously in the inner k loop.
+    });
+    // dWo (accumulate). NOT parallelized: token axis (i) outermost, same
+    // GEMM-reorder as attention_backward's dWo — every i accumulates into
+    // the single shared (D, D) dWo (no per-head row partition here, unlike
+    // dWq/dWk/dWv below, since Wo mixes all heads' columns together), so
+    // splitting this loop across threads would race multiple i's on the same
+    // dWrow[k] accumulator. Left single-threaded.
     for (int i = 0; i < K; ++i) {
         if (d_mask && d_mask[i] < 0.5f) continue;
         const float* dOi = dOp + static_cast<std::size_t>(i) * D;
@@ -942,8 +995,9 @@ void mha_backward(const ::brotensor::Tensor& dO,
         }
     }
 
-    // dbo[c] += sum over valid rows of dO[i,c] (caller zeros). Token axis
-    // outermost so both dOp[i,:] and dbop[:] are read/written contiguously.
+    // dbo[c] += sum over valid rows of dO[i,c] (caller zeros). NOT
+    // parallelized: same full-reduction-over-i hazard as dWo above (every i
+    // accumulates into the same D-length dbo). Left single-threaded.
     if (dbo) {
         float* dbop = dbo->host_f32_mut();
         for (int i = 0; i < K; ++i) {
@@ -955,8 +1009,12 @@ void mha_backward(const ::brotensor::Tensor& dO,
         }
     }
 
-    // Per-head dAttn and dVh.
-    for (int hh = 0; hh < H; ++hh) {
+    // Per-head dAttn and dVh. Each hh owns rows [hh*K, hh*K+K) of dAttn and
+    // dVh exclusively; the inner reduction over i (for dVh) sums only into
+    // this head's own private slice, never touched by another hh, so the
+    // whole per-head block parallelizes over hh.
+    parallel_for(static_cast<std::size_t>(H), [&](std::size_t hhi) {
+        const int hh = static_cast<int>(hhi);
         for (int i = 0; i < K; ++i) {
             for (int j = 0; j < K; ++j) {
                 float acc = 0.0f;
@@ -982,10 +1040,12 @@ void mha_backward(const ::brotensor::Tensor& dO,
                 }
             }
         }
-    }
+    });
 
-    // Per-head softmax backward → dScores.
-    for (int hh = 0; hh < H; ++hh) {
+    // Per-head softmax backward → dScores. Each hh owns rows
+    // [hh*K, hh*K+K) of dScores exclusively, so parallelizes over hh.
+    parallel_for(static_cast<std::size_t>(H), [&](std::size_t hhi) {
+        const int hh = static_cast<int>(hhi);
         for (int i = 0; i < K; ++i) {
             const float* prow  = Ap + (static_cast<std::size_t>(hh) * K + i) * K;
             const float* dprow = dAttn.data() + (static_cast<std::size_t>(hh) * K + i) * K;
@@ -1001,10 +1061,13 @@ void mha_backward(const ::brotensor::Tensor& dO,
                 else drow[j] = prow[j] * (dprow[j] - dot) * inv_sqrtdh;
             }
         }
-    }
+    });
 
-    // Per-head dQh and dKh.
-    for (int hh = 0; hh < H; ++hh) {
+    // Per-head dQh and dKh. Each hh owns rows [hh*K, hh*K+K) of dQh/dKh
+    // exclusively (the inner dKh reduction over i sums only into this
+    // head's own private slice), so parallelizes over hh.
+    parallel_for(static_cast<std::size_t>(H), [&](std::size_t hhi) {
+        const int hh = static_cast<int>(hhi);
         for (int i = 0; i < K; ++i) {
             for (int k = 0; k < dh; ++k) {
                 float acc = 0.0f;
@@ -1028,17 +1091,19 @@ void mha_backward(const ::brotensor::Tensor& dO,
                 }
             }
         }
-    }
+    });
 
     // dbq/dbk/dbv accumulate: db[hh*dh+j] += sum_i dQh/dKh/dVh(hh,i,j).
-    // Caller zeros. Skipped when the matching pointer is null.
+    // Caller zeros. Skipped when the matching pointer is null. Each hh
+    // writes only its own [hh*dh, hh*dh+dh) slice of dbq/dbk/dbv — disjoint
+    // across heads (D = H*dh total) — so parallelizes over hh even though
+    // each head's own reduction over i is accumulated serially inside.
     if (dbq || dbk || dbv) {
         float* dbqp = dbq ? dbq->host_f32_mut() : nullptr;
         float* dbkp = dbk ? dbk->host_f32_mut() : nullptr;
         float* dbvp = dbv ? dbv->host_f32_mut() : nullptr;
-        // Token axis (i) outermost: dQh/dKh/dVh's per-(hh,i) segment is
-        // contiguous over j, matching a contiguous dbq/dbk/dbv row.
-        for (int hh = 0; hh < H; ++hh) {
+        parallel_for(static_cast<std::size_t>(H), [&](std::size_t hhi) {
+            const int hh = static_cast<int>(hhi);
             float* dbq_row = dbqp ? dbqp + hh * dh : nullptr;
             float* dbk_row = dbkp ? dbkp + hh * dh : nullptr;
             float* dbv_row = dbvp ? dbvp + hh * dh : nullptr;
@@ -1050,14 +1115,18 @@ void mha_backward(const ::brotensor::Tensor& dO,
                     if (dbv_row) dbv_row[j] += dVh[base + j];
                 }
             }
-        }
+        });
     }
 
     // dWq/dWk/dWv accumulate: dW(hh*dh+j, k) += sum_i dQh(hh,i,j) * X(i,k).
-    // Token axis (i) outermost — same GEMM-reorder as attention_backward's
-    // dWq/dWk/dWv: Xi and the dWq/dWk/dWv rows are then read/written
-    // contiguously (stride-1) in the inner k loop.
-    for (int hh = 0; hh < H; ++hh) {
+    // Each hh writes only its own rows [hh*dh, hh*dh+dh) of dWq/dWk/dWv —
+    // disjoint across heads (D = H*dh total rows) — so this parallelizes
+    // over hh even though the reduction over i is accumulated serially
+    // inside each head's own row range (unlike attention_backward's
+    // single-head dWq/dWk/dWv, which has no such per-head partition and is
+    // left single-threaded there).
+    parallel_for(static_cast<std::size_t>(H), [&](std::size_t hhi) {
+        const int hh = static_cast<int>(hhi);
         for (int i = 0; i < K; ++i) {
             const float* Xi = Xp + static_cast<std::size_t>(i) * D;
             const std::size_t base = (static_cast<std::size_t>(hh) * K + i) * dh;
@@ -1077,10 +1146,13 @@ void mha_backward(const ::brotensor::Tensor& dO,
                 }
             }
         }
-    }
+    });
 
     // dX(i,k) = sum over heads, j of dQh*Wq + dKh*Wk + dVh*Wv at (hh*dh+j, k).
-    for (int i = 0; i < K; ++i) {
+    // Each i owns row i of dX exclusively (dQh/dKh/dVh/Wq/Wk/Wv read-only),
+    // so this parallelizes over i.
+    parallel_for(static_cast<std::size_t>(K), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         for (int k = 0; k < D; ++k) {
             float acc = 0.0f;
             for (int hh = 0; hh < H; ++hh) {
@@ -1095,7 +1167,7 @@ void mha_backward(const ::brotensor::Tensor& dO,
             }
             dXp[static_cast<std::size_t>(i) * D + k] = acc;
         }
-    }
+    });
 }
 
 // ─── Concat / split ────────────────────────────────────────────────────────

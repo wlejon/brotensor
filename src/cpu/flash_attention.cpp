@@ -49,6 +49,7 @@
 //                                      folds into the caller's grad buffers.
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <cmath>
 #include <stdexcept>
@@ -63,9 +64,12 @@ using ::brotensor::Dtype;
 
 // out(i, n) = sum_k In(i, k) * W(n, k) + (bias ? bias[n] : 0).
 //   In : (M, Din)   W : (Dout, Din)   bias : (Dout,) optional   out : (M, Dout)
+// Each token i owns row i of Out exclusively (In/W/bias read-only), so the
+// token axis parallelizes with no cross-thread writes.
 void linear_proj(const float* In, const float* W, const float* bias,
                  float* Out, int M, int Din, int Dout) {
-    for (int i = 0; i < M; ++i) {
+    parallel_for(static_cast<std::size_t>(M), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         const float* xr = In + static_cast<std::size_t>(i) * Din;
         float* orow = Out + static_cast<std::size_t>(i) * Dout;
         for (int n = 0; n < Dout; ++n) {
@@ -74,7 +78,7 @@ void linear_proj(const float* In, const float* W, const float* bias,
             for (int k = 0; k < Din; ++k) acc += xr[k] * wr[k];
             orow[n] = acc;
         }
-    }
+    });
 }
 
 // Backward of linear_proj. forward: Out = In @ W^T + b.
@@ -84,7 +88,11 @@ void linear_proj(const float* In, const float* W, const float* bias,
 void linear_proj_backward(const float* In, const float* W, const float* dOut,
                           float* dIn, float* dW, float* db,
                           int M, int Din, int Dout) {
-    for (int i = 0; i < M; ++i) {
+    // Each i owns row i of dIn exclusively: the "+=" here accumulates onto
+    // that row's pre-existing value (from before this call), never onto
+    // another i's row, so this parallelizes over i (the token axis).
+    parallel_for(static_cast<std::size_t>(M), [&](std::size_t ii) {
+        const int i = static_cast<int>(ii);
         const float* dor = dOut + static_cast<std::size_t>(i) * Dout;
         float* dir = dIn + static_cast<std::size_t>(i) * Din;
         for (int k = 0; k < Din; ++k) {
@@ -93,8 +101,12 @@ void linear_proj_backward(const float* In, const float* W, const float* dOut,
                 acc += dor[n] * W[static_cast<std::size_t>(n) * Din + k];
             dir[k] += acc;
         }
-    }
-    for (int n = 0; n < Dout; ++n) {
+    });
+    // dW/db: n-outer with a private serial sum over i (the reduction axis) —
+    // each n owns row n of dW and scalar db[n] exclusively, written exactly
+    // once, so this parallelizes over n (Dout).
+    parallel_for(static_cast<std::size_t>(Dout), [&](std::size_t ni) {
+        const int n = static_cast<int>(ni);
         float dbacc = 0.0f;
         for (int k = 0; k < Din; ++k) {
             float dw = 0.0f;
@@ -106,7 +118,7 @@ void linear_proj_backward(const float* In, const float* W, const float* dOut,
         for (int i = 0; i < M; ++i)
             dbacc += dOut[static_cast<std::size_t>(i) * Dout + n];
         if (db) db[n] += dbacc;
-    }
+    });
 }
 
 // Materialised multi-head attention over pre-projected Q/K/V.
@@ -124,6 +136,21 @@ void linear_proj_backward(const float* In, const float* W, const float* dOut,
 // sized to the batch's max Lk instead of paying a heap allocation per call.
 // A null scratch_scores falls back to a local per-call allocation, matching
 // the original single-call behavior.
+//
+// THREADING: when scratch_scores is null (every caller except the varlen
+// family), the outer q loop is safe to parallelize because each q's row of
+// O/P is written exclusively by that q (see per-iteration comments below);
+// the only shared mutable state is the `scores` scratch buffer, so the
+// parallel path gives every q its own private Lk-wide slice of a
+// freshly-allocated Lq*Lk buffer instead of one buffer reused across q.
+// When scratch_scores is non-null, the caller (flash_attention_varlen_*)
+// has explicitly hoisted ONE Lk-sized buffer across many sequential calls
+// to this function (one per sequence in a batch) specifically to avoid
+// per-sequence allocation; parallelizing the q loop in that case would have
+// every thread's q race on that single shared buffer, so this path is left
+// exactly as it was (serial, reusing the caller's buffer verbatim) — see
+// flash_attention_varlen_forward's own comment for why it stays
+// single-threaded.
 void attention_core(const float* Q, const float* K, const float* V,
                     const float* mask, int Lq, int Lk, int D, int H,
                     bool causal, float* O, float* P, int window = 0,
@@ -132,15 +159,12 @@ void attention_core(const float* Q, const float* K, const float* V,
     const int hd  = D / H;
     if (Dkv < 0) Dkv = D;
     const float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(hd));
-    std::vector<float> scores_local;
-    float* scores;
-    if (scratch_scores) {
-        scores = scratch_scores;
-    } else {
-        scores_local.resize(static_cast<std::size_t>(Lk));
-        scores = scores_local.data();
-    }
-    for (int q = 0; q < Lq; ++q) {
+
+    // Per-q body. `scores` must be a private Lk-wide buffer when running
+    // concurrently with other q's (see threading note above) — each q
+    // writes only row q of O (and, if requested, the q-th row of every
+    // head's P segment), so distinct q's never touch the same output bytes.
+    auto process_q = [&](int q, float* scores) {
         const int aq = q + q_offset;   // absolute causal position of this query
         for (int h = 0; h < H; ++h) {
             const int off    = h * hd;            // Q/O head offset (Dq-wide)
@@ -181,6 +205,23 @@ void attention_core(const float* Q, const float* K, const float* V,
                 for (int k = 0; k < Lk; ++k) prow[k] = scores[k] * inv;
             }
         }
+    };
+
+    if (scratch_scores) {
+        // Varlen path: caller owns a single Lk-sized buffer reused across
+        // many sequential calls to this function. Stay serial (see the
+        // threading note above).
+        for (int q = 0; q < Lq; ++q) process_q(q, scratch_scores);
+    } else {
+        // Every other caller: parallelize over q, each q privately slicing
+        // a freshly allocated Lq*Lk buffer so concurrent q's never share a
+        // `scores` row.
+        std::vector<float> scores_all(static_cast<std::size_t>(Lq) *
+                                       static_cast<std::size_t>(Lk));
+        parallel_for(static_cast<std::size_t>(Lq), [&](std::size_t qi) {
+            const int q = static_cast<int>(qi);
+            process_q(q, scores_all.data() + static_cast<std::size_t>(q) * Lk);
+        });
     }
 }
 
@@ -195,6 +236,19 @@ void attention_core(const float* Q, const float* K, const float* V,
 // Lq*Lk instead of paying three heap allocations per call. Leaving any of
 // them null falls back to a local per-call allocation, matching the original
 // single-call behavior.
+//
+// THREADING: when the scratch triple is null (every caller except the
+// varlen family), the outer h loop is safe to parallelize — each head h
+// writes only its own column range [h*hd, h*hd+hd) of dQ/dK/dV (never
+// touched by another h), so the only shared mutable state is P/dP/dS, which
+// the parallel path gives each h its own private Lq*Lk slice of a
+// freshly-allocated H*Lq*Lk buffer instead of one triple reused across h.
+// When the scratch triple is supplied, the caller
+// (flash_attention_varlen_backward) has explicitly hoisted ONE Lq*Lk-sized
+// triple across many sequential calls to this function (one per sequence in
+// a batch); parallelizing the h loop in that case would have every thread's
+// h race on that single shared triple, so this path is left exactly as it
+// was (serial, reusing the caller's buffers verbatim).
 void attention_core_backward(const float* Q, const float* K, const float* V,
                              const float* dO, const float* mask,
                              int Lq, int Lk, int D, int H, bool causal,
@@ -210,24 +264,12 @@ void attention_core_backward(const float* Q, const float* K, const float* V,
         dK[i] = 0.0f;
         dV[i] = 0.0f;
     }
-    std::vector<float> P_local, dP_local, dS_local;
-    float* P;
-    float* dP;
-    float* dS;
-    if (scratch_P && scratch_dP && scratch_dS) {
-        P = scratch_P;
-        dP = scratch_dP;
-        dS = scratch_dS;
-    } else {
-        const std::size_t n = static_cast<std::size_t>(Lq) * Lk;
-        P_local.resize(n);
-        dP_local.resize(n);
-        dS_local.resize(n);
-        P = P_local.data();
-        dP = dP_local.data();
-        dS = dS_local.data();
-    }
-    for (int h = 0; h < H; ++h) {
+
+    // Per-head body. P/dP/dS must be a private Lq*Lk buffer when running
+    // concurrently with other heads (see threading note above) — each h
+    // writes only its own column range of dQ/dK/dV, so distinct h's never
+    // touch the same output bytes.
+    auto process_head = [&](int h, float* P, float* dP, float* dS) {
         const int off = h * hd;
         // Recompute P for this head.
         for (int q = 0; q < Lq; ++q) {
@@ -307,6 +349,28 @@ void attention_core_backward(const float* Q, const float* K, const float* V,
                 dkr[d] = acc;
             }
         }
+    };
+
+    if (scratch_P && scratch_dP && scratch_dS) {
+        // Varlen path: caller owns a single Lq*Lk-sized triple reused across
+        // many sequential calls to this function. Stay serial (see the
+        // threading note above).
+        for (int h = 0; h < H; ++h)
+            process_head(h, scratch_P, scratch_dP, scratch_dS);
+    } else {
+        // Every other caller: parallelize over h, each h privately slicing
+        // a freshly allocated H*Lq*Lk buffer so concurrent heads never
+        // share a P/dP/dS segment.
+        const std::size_t n = static_cast<std::size_t>(Lq) * Lk;
+        std::vector<float> P_all(static_cast<std::size_t>(H) * n);
+        std::vector<float> dP_all(static_cast<std::size_t>(H) * n);
+        std::vector<float> dS_all(static_cast<std::size_t>(H) * n);
+        parallel_for(static_cast<std::size_t>(H), [&](std::size_t hi) {
+            const int h = static_cast<int>(hi);
+            process_head(h, P_all.data() + static_cast<std::size_t>(h) * n,
+                         dP_all.data() + static_cast<std::size_t>(h) * n,
+                         dS_all.data() + static_cast<std::size_t>(h) * n);
+        });
     }
 }
 
