@@ -25,12 +25,19 @@ ThreadPool::ThreadPool() {
 }
 
 ThreadPool::~ThreadPool() {
+    shutdown();
+}
+
+void ThreadPool::shutdown() {
     shutdown_.store(true, std::memory_order_relaxed);
     generation_.fetch_add(1, std::memory_order_release);
     generation_.notify_all();
     for (auto& t : workers_) {
         if (t.joinable()) t.join();
     }
+    // Idempotent: an empty vector makes a second call (e.g. the eventual
+    // destructor, after an explicit early shutdown()) a no-op.
+    workers_.clear();
 }
 
 ThreadPool& ThreadPool::instance() {

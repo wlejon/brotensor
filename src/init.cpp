@@ -9,6 +9,7 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <atomic>
 #include <cstdlib>
@@ -115,6 +116,10 @@ void init() {
     }
 
     init_done_flag().store(true, std::memory_order_release);
+}
+
+void shutdown() {
+    detail::cpu::ThreadPool::instance().shutdown();
 }
 
 Device default_device() {

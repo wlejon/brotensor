@@ -16,6 +16,18 @@ namespace brotensor {
 // If init() is never called, CPU is the only available backend.
 void init();
 
+// Joins the CPU backend's background worker threads. Call this
+// deterministically as part of your own process/engine shutdown sequence,
+// before returning from main() — worker threads are otherwise daemon
+// threads that live until the pool's Meyers-singleton destructor runs
+// during the process's static-destruction phase, by which point every
+// other thread has already been suspended by the OS. A worker suspended
+// mid-op while holding some global lock (e.g. the Debug CRT's
+// iterator-checking mutex) can deadlock the main thread's own exit-time
+// destructors waiting on that same lock forever. Idempotent; safe to call
+// even if init() was never called or no CPU work ever ran.
+void shutdown();
+
 // ─── Default-device policy ─────────────────────────────────────────────────
 
 // Returns the device the next zeros/empty/from_host call will land on.

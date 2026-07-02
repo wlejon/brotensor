@@ -46,6 +46,19 @@ public:
     // run() call can spread work across.
     int num_threads() const { return static_cast<int>(workers_.size()) + 1; }
 
+    // Explicitly joins every worker thread. Callers should invoke this
+    // deterministically during their own shutdown sequence — the pool is
+    // a Meyers singleton, so its destructor only runs during the process's
+    // static-destruction phase, by which point every *other* thread has
+    // already been suspended by RtlExitUserProcess. A worker suspended
+    // mid-operation while holding some global lock (e.g. the Debug CRT's
+    // iterator-checking mutex, taken by any std::vector destructor) can
+    // then deadlock the main thread's own exit-time TLS destructors
+    // waiting on that same lock forever. Calling shutdown() early — before
+    // any of that starts — avoids the whole class of hazard. Idempotent:
+    // safe to call more than once (the eventual destructor call included).
+    void shutdown();
+
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
