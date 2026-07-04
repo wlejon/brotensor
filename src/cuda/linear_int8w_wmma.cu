@@ -11,6 +11,14 @@
 // conv2d_wmma.cu for the same treatment). Same dispatch heuristic as the conv
 // WMMA path (K%8 alignment, problem-size floor); returns false to fall back to
 // the existing tiled kernel.
+//
+// The K loop is a two-stage software pipeline: tile kt+1's global reads are
+// issued into registers before tile kt's MMAs so their latency hides behind
+// tensor-core work, and the smem tiles are double-buffered so the register
+// spill into stage kt+1 needs no extra barrier — one __syncthreads() per
+// K tile total. This matters here more than in the plain FP16 kernel: at the
+// big SwiGLU shapes the weight stream is ~100 MB per call and the serialized
+// load->sync->mma form left the tensor cores idle for most of it.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -71,17 +79,18 @@ __global__ void linear_int8w_a16_wmma_kernel(
         T*             __restrict__ Y,
         int B, int M, int K) {
     using TR = wmma_traits<T>;
-    // The FP32 epilogue staging tile Cs aliases the As/Bs K-loop tiles (both
-    // are dead once the loop's final __syncthreads() passes) so the 128x64
-    // CTA tile stays under the 48 KB static-shared limit.
-    constexpr int kAsBytes = BM * LDA_SMEM * static_cast<int>(sizeof(T));
-    constexpr int kBsBytes = BN * LDB_SMEM * static_cast<int>(sizeof(T));
+    // Double-buffered K-loop tiles; the FP32 epilogue staging tile Cs aliases
+    // them (both stages are dead once the loop's final __syncthreads()
+    // passes) so the 128x64 CTA tile stays under the 48 KB static-shared
+    // limit.
+    constexpr int kAsBytes = 2 * BM * LDA_SMEM * static_cast<int>(sizeof(T));
+    constexpr int kBsBytes = 2 * BN * LDB_SMEM * static_cast<int>(sizeof(T));
     constexpr int kCsBytes = BM * (BN + 8) * static_cast<int>(sizeof(float));
     constexpr int kSmemBytes =
         (kAsBytes + kBsBytes > kCsBytes) ? kAsBytes + kBsBytes : kCsBytes;
     __shared__ __align__(32) char smem_buf[kSmemBytes];
-    auto* As = reinterpret_cast<T(*)[LDA_SMEM]>(smem_buf);
-    auto* Bs = reinterpret_cast<T(*)[LDB_SMEM]>(smem_buf + kAsBytes);
+    auto* As = reinterpret_cast<T(*)[BM][LDA_SMEM]>(smem_buf);
+    auto* Bs = reinterpret_cast<T(*)[BN][LDB_SMEM]>(smem_buf + kAsBytes);
     auto* Cs = reinterpret_cast<float(*)[BN + 8]>(smem_buf);
     __shared__ float Bs_scale[BN];
 
@@ -90,8 +99,18 @@ __global__ void linear_int8w_a16_wmma_kernel(
     const int warp_m  = warp_id / WARPS_N;
     const int warp_n  = warp_id % WARPS_N;
 
-    const int block_m = blockIdx.y * BM;   // batch axis (B)
-    const int block_n = blockIdx.x * BN;   // out axis (M)
+    // Panel swizzle: CTAs launch x-major, so with a naive (x=N, y=M) mapping
+    // a concurrent wave is ~256 distinct output-column blocks whose combined
+    // weight stream (e.g. 100 MB at 16384x6144) thrashes L2. Remap the linear
+    // launch index so a wave covers a PANEL_N-column by full-M panel instead:
+    // its weight columns and A rows both stay L2-resident.
+    constexpr int PANEL_N = 16;
+    const int lid = blockIdx.y * gridDim.x + blockIdx.x;
+    const int p   = lid / (PANEL_N * gridDim.y);
+    const int rem = lid - p * (PANEL_N * gridDim.y);
+    const int pw  = min(PANEL_N, static_cast<int>(gridDim.x) - p * PANEL_N);
+    const int block_m = (rem / pw) * BM;              // batch axis (B)
+    const int block_n = (p * PANEL_N + rem % pw) * BN; // out axis (M)
 
     // Per-output-row scale is invariant across k; load once before the loop.
     if (tid < BN) {
@@ -109,85 +128,99 @@ __global__ void linear_int8w_a16_wmma_kernel(
         }
     }
 
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        // ---- Load A tile (BM x BK) from X(B, K) ----
-        {
-            constexpr int kHalvesPerLoad = 8;
-            constexpr int kTotalHalves   = BM * BK;
-            constexpr int kLoadsTotal    = kTotalHalves / kHalvesPerLoad;
-            constexpr int kLoadsPerThr   = kLoadsTotal / THREADS_PER_CTA;
+    // Per-thread register staging for one K tile (8-wide vector chunks).
+    constexpr int kChunk   = 8;
+    constexpr int kALoads  = (BM * BK / kChunk) / THREADS_PER_CTA;
+    constexpr int kBLoads  = (BN * BK / kChunk) / THREADS_PER_CTA;
+    static_assert(kALoads * THREADS_PER_CTA * kChunk == BM * BK, "A tile split");
+    static_assert(kBLoads * THREADS_PER_CTA * kChunk == BN * BK, "B tile split");
 
-            #pragma unroll
-            for (int li = 0; li < kLoadsPerThr; ++li) {
-                const int lin = tid + li * THREADS_PER_CTA;
-                const int row = lin / (BK / kHalvesPerLoad);
-                const int col_grp = lin % (BK / kHalvesPerLoad);
-                const int gcol = col_grp * kHalvesPerLoad;
-                const int grow = block_m + row;
-                const int gk   = k0 + gcol;
+    T      a_regs[kALoads][kChunk];
+    int8_t b_regs[kBLoads][kChunk];
 
-                T tmp[kHalvesPerLoad];
-                if (grow < B && gk + kHalvesPerLoad <= K) {
-                    const int4* src = reinterpret_cast<const int4*>(&X[grow * K + gk]);
-                    *reinterpret_cast<int4*>(tmp) = *src;
-                } else {
-                    #pragma unroll
-                    for (int q = 0; q < kHalvesPerLoad; ++q) {
-                        const int gk_q = gk + q;
-                        tmp[q] = (grow < B && gk_q < K)
-                                 ? X[grow * K + gk_q]
-                                 : TR::from_f32(0.0f);
-                    }
-                }
-                *reinterpret_cast<int4*>(&As[row][gcol]) =
-                    *reinterpret_cast<int4*>(tmp);
-            }
-        }
-
-        // ---- Load B tile (BN x BK), dequantising INT8 -> FP16 ----
-        {
-            constexpr int kHalvesPerLoad = 8;
-            constexpr int kTotalHalves   = BN * BK;
-            constexpr int kLoadsTotal    = kTotalHalves / kHalvesPerLoad;
-            constexpr int kLoadsPerThr   = kLoadsTotal / THREADS_PER_CTA;
-
-            const bool k_aligned8 = ((K & 7) == 0);
-
-            #pragma unroll
-            for (int li = 0; li < kLoadsPerThr; ++li) {
-                const int lin = tid + li * THREADS_PER_CTA;
-                const int row = lin / (BK / kHalvesPerLoad);
-                const int col_grp = lin % (BK / kHalvesPerLoad);
-                const int gcol = col_grp * kHalvesPerLoad;
-                const int grow = block_n + row;
-                const int gk   = k0 + gcol;
-
-                int8_t tmp8[kHalvesPerLoad];
-                if (k_aligned8 && grow < M && gk + kHalvesPerLoad <= K) {
-                    const int2* src = reinterpret_cast<const int2*>(
-                        &W_int8[grow * K + gk]);
-                    *reinterpret_cast<int2*>(tmp8) = *src;
-                } else {
-                    #pragma unroll
-                    for (int q = 0; q < kHalvesPerLoad; ++q) {
-                        const int gk_q = gk + q;
-                        tmp8[q] = (grow < M && gk_q < K)
-                                  ? W_int8[grow * K + gk_q]
-                                  : (int8_t)0;
-                    }
-                }
-                const float s = Bs_scale[row];
-                T tmp_h[kHalvesPerLoad];
+    // Issue tile k0's global reads into registers.
+    auto gload = [&](int k0) {
+        #pragma unroll
+        for (int li = 0; li < kALoads; ++li) {
+            const int lin  = tid + li * THREADS_PER_CTA;
+            const int row  = lin / (BK / kChunk);
+            const int gcol = (lin % (BK / kChunk)) * kChunk;
+            const int grow = block_m + row;
+            const int gk   = k0 + gcol;
+            if (grow < B && gk + kChunk <= K) {
+                *reinterpret_cast<int4*>(a_regs[li]) =
+                    *reinterpret_cast<const int4*>(&X[grow * K + gk]);
+            } else {
                 #pragma unroll
-                for (int q = 0; q < kHalvesPerLoad; ++q) {
-                    tmp_h[q] = TR::from_f32(static_cast<float>(tmp8[q]) * s);
+                for (int q = 0; q < kChunk; ++q) {
+                    const int gk_q = gk + q;
+                    a_regs[li][q] = (grow < B && gk_q < K)
+                                    ? X[grow * K + gk_q]
+                                    : TR::from_f32(0.0f);
                 }
-                *reinterpret_cast<int4*>(&Bs[row][gcol]) =
-                    *reinterpret_cast<const int4*>(tmp_h);
             }
         }
+        #pragma unroll
+        for (int li = 0; li < kBLoads; ++li) {
+            const int lin  = tid + li * THREADS_PER_CTA;
+            const int row  = lin / (BK / kChunk);
+            const int gcol = (lin % (BK / kChunk)) * kChunk;
+            const int grow = block_n + row;
+            const int gk   = k0 + gcol;
+            // Dispatch guarantees K%8==0, so the vector path only needs the
+            // row/tail bound checks.
+            if (grow < M && gk + kChunk <= K) {
+                *reinterpret_cast<int2*>(b_regs[li]) =
+                    *reinterpret_cast<const int2*>(&W_int8[grow * K + gk]);
+            } else {
+                #pragma unroll
+                for (int q = 0; q < kChunk; ++q) {
+                    const int gk_q = gk + q;
+                    b_regs[li][q] = (grow < M && gk_q < K)
+                                    ? W_int8[grow * K + gk_q]
+                                    : (int8_t)0;
+                }
+            }
+        }
+    };
 
-        __syncthreads();
+    // Spill the staged registers into smem stage `st` (B dequantises here).
+    auto sstore = [&](int st) {
+        #pragma unroll
+        for (int li = 0; li < kALoads; ++li) {
+            const int lin  = tid + li * THREADS_PER_CTA;
+            const int row  = lin / (BK / kChunk);
+            const int gcol = (lin % (BK / kChunk)) * kChunk;
+            *reinterpret_cast<int4*>(&As[st][row][gcol]) =
+                *reinterpret_cast<int4*>(a_regs[li]);
+        }
+        #pragma unroll
+        for (int li = 0; li < kBLoads; ++li) {
+            const int lin  = tid + li * THREADS_PER_CTA;
+            const int row  = lin / (BK / kChunk);
+            const int gcol = (lin % (BK / kChunk)) * kChunk;
+            const float s = Bs_scale[row];
+            T tmp_h[kChunk];
+            #pragma unroll
+            for (int q = 0; q < kChunk; ++q) {
+                tmp_h[q] = TR::from_f32(static_cast<float>(b_regs[li][q]) * s);
+            }
+            *reinterpret_cast<int4*>(&Bs[st][row][gcol]) =
+                *reinterpret_cast<const int4*>(tmp_h);
+        }
+    };
+
+    const int ktiles = (K + BK - 1) / BK;
+    gload(0);
+    sstore(0);
+    __syncthreads();
+
+    for (int kt = 0; kt < ktiles; ++kt) {
+        const int cur = kt & 1;
+        // Issue the next tile's global reads first: their latency hides
+        // behind this tile's MMAs, and the spill below only stalls if the
+        // loads still haven't landed by then.
+        if (kt + 1 < ktiles) gload((kt + 1) * BK);
 
         #pragma unroll
         for (int kk = 0; kk < BK; kk += WMMA_K) {
@@ -196,12 +229,12 @@ __global__ void linear_int8w_a16_wmma_kernel(
 
             #pragma unroll
             for (int i = 0; i < FRAGS_M; ++i) {
-                const T* a_ptr = &As[warp_m * WM + i * WMMA_M][kk];
+                const T* a_ptr = &As[cur][warp_m * WM + i * WMMA_M][kk];
                 wmma::load_matrix_sync(a_frag[i], a_ptr, LDA_SMEM);
             }
             #pragma unroll
             for (int j = 0; j < FRAGS_N; ++j) {
-                const T* b_ptr = &Bs[warp_n * WN + j * WMMA_N][kk];
+                const T* b_ptr = &Bs[cur][warp_n * WN + j * WMMA_N][kk];
                 wmma::load_matrix_sync(b_frag[j], b_ptr, LDB_SMEM);
             }
             #pragma unroll
@@ -213,6 +246,10 @@ __global__ void linear_int8w_a16_wmma_kernel(
             }
         }
 
+        if (kt + 1 < ktiles) sstore(cur ^ 1);
+        // One barrier per tile: it both publishes stage cur^1 for the next
+        // iteration's MMAs and fences this iteration's MMA reads of stage
+        // cur before iteration kt+1 overwrites it.
         __syncthreads();
     }
 
