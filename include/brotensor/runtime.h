@@ -80,6 +80,14 @@ void sync(Device d);
 // Sync every registered backend.
 void sync_all();
 
+// ─── Memory ────────────────────────────────────────────────────────────────
+//
+// Device-wide free/total memory in bytes for `d` (e.g. cudaMemGetInfo).
+// Returns false — leaving the outputs untouched — when the backend is not
+// registered or cannot report (CPU always returns false).
+bool device_mem_info(Device d, std::size_t& free_bytes,
+                     std::size_t& total_bytes);
+
 // ─── Errors ────────────────────────────────────────────────────────────────
 //
 // Backend impls throw plain std::runtime_error with a readable

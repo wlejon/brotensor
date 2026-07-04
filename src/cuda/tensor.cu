@@ -139,6 +139,17 @@ void cuda_sync() {
     BROTENSOR_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+bool cuda_mem_info(std::size_t* free_bytes, std::size_t* total_bytes) {
+    std::size_t f = 0, t = 0;
+    if (cudaMemGetInfo(&f, &t) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (free_bytes)  *free_bytes = f;
+    if (total_bytes) *total_bytes = t;
+    return true;
+}
+
 const ::brotensor::detail::AllocVTable& cuda_alloc_table() {
     static const ::brotensor::detail::AllocVTable t = {
         &cuda_alloc,
@@ -148,6 +159,7 @@ const ::brotensor::detail::AllocVTable& cuda_alloc_table() {
         &cuda_memcpy_d2d,
         &cuda_memset_zero,
         &cuda_sync,
+        &cuda_mem_info,
     };
     return t;
 }

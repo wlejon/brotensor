@@ -49,6 +49,10 @@ struct AllocVTable {
     void  (*memcpy_d2d)(void* dst, const void* src, std::size_t n);
     void  (*memset_zero)(void* dst, std::size_t n);
     void  (*sync)();
+    // Optional (backends that can't report leave it null via aggregate
+    // value-init): device-wide free/total memory in bytes, e.g.
+    // cudaMemGetInfo. Serves brotensor::device_mem_info().
+    bool  (*mem_info)(std::size_t* free_bytes, std::size_t* total_bytes);
 };
 
 // ─── Backend registration ──────────────────────────────────────────────────

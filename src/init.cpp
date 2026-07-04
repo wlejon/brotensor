@@ -209,4 +209,14 @@ void sync_all() {
     }
 }
 
+// ─── memory ────────────────────────────────────────────────────────────────
+
+bool device_mem_info(Device d, std::size_t& free_bytes,
+                     std::size_t& total_bytes) {
+    if (!detail::is_registered(d)) return false;
+    const auto* fn = detail::alloc_for(d).mem_info;
+    if (fn == nullptr) return false;
+    return fn(&free_bytes, &total_bytes);
+}
+
 } // namespace brotensor
