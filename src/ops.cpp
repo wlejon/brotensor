@@ -21,6 +21,7 @@
 #include <brotensor/ops.h>
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <algorithm>
 #include <cmath>
@@ -1963,7 +1964,10 @@ void timestep_embedding(const Tensor& timesteps, int dim, float max_period,
 
 // ─── INT8 weight-only quantisation (W8A16) ─────────────────────────────────
 
-// Host helper — pure host buffers, no device dispatch.
+// Host helper — pure host buffers, no device dispatch. Rows are independent,
+// so they fan out over the CPU thread pool: the multi-GB checkpoint quantise
+// during a quantized model load is this function's dominant caller, and the
+// serial version left it minutes-long on 10B+-parameter models.
 void quantize_int8_per_row_host(const uint16_t* W_fp16,
                                 int out, int in,
                                 int8_t* W_int8_out,
@@ -1972,8 +1976,8 @@ void quantize_int8_per_row_host(const uint16_t* W_fp16,
         for (int r = 0; r < out; ++r) scales_out[r] = 0.0f;
         return;
     }
-    for (int r = 0; r < out; ++r) {
-        const uint16_t* row = W_fp16 + static_cast<std::size_t>(r) * static_cast<std::size_t>(in);
+    detail::cpu::parallel_for(static_cast<std::size_t>(out), [&](std::size_t r) {
+        const uint16_t* row = W_fp16 + r * static_cast<std::size_t>(in);
         float amax = 0.0f;
         for (int c = 0; c < in; ++c) {
             const float v = fp16_bits_to_fp32(row[c]);
@@ -1983,7 +1987,7 @@ void quantize_int8_per_row_host(const uint16_t* W_fp16,
         const float scale = (amax > 0.0f) ? (amax / 127.0f) : 0.0f;
         const float inv   = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
         scales_out[r] = scale;
-        int8_t* dst = W_int8_out + static_cast<std::size_t>(r) * static_cast<std::size_t>(in);
+        int8_t* dst = W_int8_out + r * static_cast<std::size_t>(in);
         for (int c = 0; c < in; ++c) {
             const float v = fp16_bits_to_fp32(row[c]);
             int q = static_cast<int>(std::lrint(v * inv));
@@ -1991,7 +1995,7 @@ void quantize_int8_per_row_host(const uint16_t* W_fp16,
             if (q >  127) q =  127;
             dst[c] = static_cast<int8_t>(q);
         }
-    }
+    });
 }
 
 void matmul_int8w_fp16(const Tensor& W_int8, const Tensor& scales,
