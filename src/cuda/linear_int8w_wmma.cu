@@ -46,10 +46,10 @@ static constexpr int WMMA_M = 16;
 static constexpr int WMMA_N = 16;
 static constexpr int WMMA_K = 16;
 
-static constexpr int BM = 64;
+static constexpr int BM = 128;
 static constexpr int BN = 64;
 static constexpr int BK = 32;
-static constexpr int WARPS_M = 2;
+static constexpr int WARPS_M = 4;
 static constexpr int WARPS_N = 2;
 static constexpr int WARPS_PER_CTA = WARPS_M * WARPS_N;
 static constexpr int THREADS_PER_CTA = WARPS_PER_CTA * 32;
@@ -71,8 +71,18 @@ __global__ void linear_int8w_a16_wmma_kernel(
         T*             __restrict__ Y,
         int B, int M, int K) {
     using TR = wmma_traits<T>;
-    __shared__ T     As[BM][LDA_SMEM];
-    __shared__ T     Bs[BN][LDB_SMEM];
+    // The FP32 epilogue staging tile Cs aliases the As/Bs K-loop tiles (both
+    // are dead once the loop's final __syncthreads() passes) so the 128x64
+    // CTA tile stays under the 48 KB static-shared limit.
+    constexpr int kAsBytes = BM * LDA_SMEM * static_cast<int>(sizeof(T));
+    constexpr int kBsBytes = BN * LDB_SMEM * static_cast<int>(sizeof(T));
+    constexpr int kCsBytes = BM * (BN + 8) * static_cast<int>(sizeof(float));
+    constexpr int kSmemBytes =
+        (kAsBytes + kBsBytes > kCsBytes) ? kAsBytes + kBsBytes : kCsBytes;
+    __shared__ __align__(32) char smem_buf[kSmemBytes];
+    auto* As = reinterpret_cast<T(*)[LDA_SMEM]>(smem_buf);
+    auto* Bs = reinterpret_cast<T(*)[LDB_SMEM]>(smem_buf + kAsBytes);
+    auto* Cs = reinterpret_cast<float(*)[BN + 8]>(smem_buf);
     __shared__ float Bs_scale[BN];
 
     const int tid     = threadIdx.x;
@@ -206,11 +216,10 @@ __global__ void linear_int8w_a16_wmma_kernel(
         __syncthreads();
     }
 
-    // FP32 staging tile (WMMA has no BF16 accumulator fragment, and FP32 is
-    // numerically exact for both storage paths — narrowing happens in the
-    // scatter epilogue below).
-    __shared__ float Cs[BM][BN + 8];
-
+    // FP32 staging via Cs (aliasing As/Bs — see the smem_buf carve above;
+    // WMMA has no BF16 accumulator fragment, and FP32 is numerically exact
+    // for both storage paths — narrowing happens in the scatter epilogue
+    // below). The k-loop's trailing __syncthreads() fences the aliased reads.
     #pragma unroll
     for (int i = 0; i < FRAGS_M; ++i) {
         #pragma unroll
