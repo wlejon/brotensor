@@ -88,6 +88,16 @@ void sync_all();
 bool device_mem_info(Device d, std::size_t& free_bytes,
                      std::size_t& total_bytes);
 
+// Return the backend allocator's cached-but-unused memory to the driver,
+// keeping at most `keep_bytes` cached. Synchronizes the device first so
+// stream-ordered frees are actually reclaimable. Use between pipeline phases
+// with very different scratch shapes: cached blocks count against device
+// residency, and on Windows (WDDM) sustained near-full commit makes the OS
+// demote large resident allocations to shared memory — which silently turns
+// weight reads into PCIe traffic. Returns false when the backend is not
+// registered or has no trimmable allocator (CPU always returns false).
+bool device_mem_trim(Device d, std::size_t keep_bytes = 0);
+
 // ─── Errors ────────────────────────────────────────────────────────────────
 //
 // Backend impls throw plain std::runtime_error with a readable

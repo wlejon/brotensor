@@ -150,6 +150,22 @@ bool cuda_mem_info(std::size_t* free_bytes, std::size_t* total_bytes) {
     return true;
 }
 
+bool cuda_mem_trim(std::size_t keep_bytes) {
+    if (!async_pool_ready()) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    cudaMemPool_t pool = nullptr;
+    if (cudaDeviceGetDefaultMemPool(&pool, dev) != cudaSuccess) return false;
+    // Stream-ordered frees only become reclaimable once the work that used
+    // them has drained.
+    if (cudaDeviceSynchronize() != cudaSuccess) return false;
+    if (cudaMemPoolTrimTo(pool, keep_bytes) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 const ::brotensor::detail::AllocVTable& cuda_alloc_table() {
     static const ::brotensor::detail::AllocVTable t = {
         &cuda_alloc,
@@ -160,6 +176,7 @@ const ::brotensor::detail::AllocVTable& cuda_alloc_table() {
         &cuda_memset_zero,
         &cuda_sync,
         &cuda_mem_info,
+        &cuda_mem_trim,
     };
     return t;
 }

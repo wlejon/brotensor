@@ -53,6 +53,10 @@ struct AllocVTable {
     // value-init): device-wide free/total memory in bytes, e.g.
     // cudaMemGetInfo. Serves brotensor::device_mem_info().
     bool  (*mem_info)(std::size_t* free_bytes, std::size_t* total_bytes);
+    // Optional: return the allocator's cached-but-unused blocks to the
+    // driver, keeping at most `keep_bytes` cached (e.g. cudaMemPoolTrimTo
+    // after a device sync). Serves brotensor::device_mem_trim().
+    bool  (*mem_trim)(std::size_t keep_bytes);
 };
 
 // ─── Backend registration ──────────────────────────────────────────────────
