@@ -131,5 +131,6 @@ int main() {
     bench_shape(4101, 16, 64);    // context_refiner
     bench_shape(8192, 16, 64);    // noise_refiner
     bench_shape(12294, 16, 64);   // joint blocks
+    bench_shape(4115, 48, 128);   // Krea 2 DiT body (compacted joint seq)
     return 0;
 }
