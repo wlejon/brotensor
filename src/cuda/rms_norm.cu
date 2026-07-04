@@ -74,8 +74,17 @@ __global__ void rms_forward_fp32_kernel(const float* __restrict__ X,
     }
 }
 
+// Gamma may be the activation dtype or FP32: the math is FP32 either way,
+// so an FP32 gamma against 16-bit activations loses nothing — it serves
+// models that deliberately keep the small norm weights in FP32 (e.g.
+// _keep_in_fp32_modules) without upcasting the activation tensor.
+__device__ __forceinline__ float gamma_to_f32(__half v)         { return __half2float(v); }
+__device__ __forceinline__ float gamma_to_f32(__nv_bfloat16 v)  { return __bfloat162float(v); }
+__device__ __forceinline__ float gamma_to_f32(float v)          { return v; }
+
+template <typename GT>
 __global__ void rms_forward_fp16_kernel(const __half* __restrict__ X,
-                                        const __half* __restrict__ gamma,
+                                        const GT* __restrict__ gamma,
                                         __half* __restrict__ Y,
                                         int B, int D, float eps) {
     extern __shared__ float sdata[];
@@ -95,7 +104,7 @@ __global__ void rms_forward_fp16_kernel(const __half* __restrict__ X,
 
     for (int j = tid; j < D; j += blockDim.x) {
         const float xv = __half2float(xrow[j]);
-        const float gv = __half2float(gamma[j]);
+        const float gv = gamma_to_f32(gamma[j]);
         yrow[j] = __float2half(xv * gv * rrms);
     }
 }
@@ -205,8 +214,9 @@ __global__ void rms_fp32_into_fp16_kernel(const float* __restrict__ src,
 
 // ─── BF16 kernels (verbatim copies of FP16 with __half→__nv_bfloat16) ────────
 
+template <typename GT>
 __global__ void rms_forward_bf16_kernel(const __nv_bfloat16* __restrict__ X,
-                                        const __nv_bfloat16* __restrict__ gamma,
+                                        const GT* __restrict__ gamma,
                                         __nv_bfloat16* __restrict__ Y,
                                         int B, int D, float eps) {
     extern __shared__ float sdata[];
@@ -226,7 +236,7 @@ __global__ void rms_forward_bf16_kernel(const __nv_bfloat16* __restrict__ X,
 
     for (int j = tid; j < D; j += blockDim.x) {
         const float xv = __bfloat162float(xrow[j]);
-        const float gv = __bfloat162float(gamma[j]);
+        const float gv = gamma_to_f32(gamma[j]);
         yrow[j] = __float2bfloat16(xv * gv * rrms);
     }
 }
@@ -283,8 +293,12 @@ __global__ void rms_fp32_into_bf16_kernel(const float* __restrict__ src,
 
 void rms_norm_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& gamma,
                       float eps, ::brotensor::Tensor& Y) {
-    if (gamma.dtype != X.dtype) {
-        throw std::runtime_error("rms_norm_forward: gamma.dtype must match X.dtype");
+    // gamma either matches X.dtype or is FP32 against 16-bit activations
+    // (the kernel math is FP32 regardless — see gamma_to_f32 above).
+    const bool gamma_f32 = (gamma.dtype == ::brotensor::Dtype::FP32);
+    if (gamma.dtype != X.dtype && !gamma_f32) {
+        throw std::runtime_error(
+            "rms_norm_forward: gamma.dtype must match X.dtype or be FP32");
     }
     const int B = X.rows;
     const int D = X.cols;
@@ -298,17 +312,33 @@ void rms_norm_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& g
     const int block = RMS_BLOCK;
     const size_t shmem = block * sizeof(float);
     if (X.dtype == ::brotensor::Dtype::FP16) {
-        rms_forward_fp16_kernel<<<B, block, shmem, cur_stream()>>>(
-            static_cast<const __half*>(X.data),
-            static_cast<const __half*>(gamma.data),
-            static_cast<__half*>(Y.data),
-            B, D, eps);
+        if (gamma_f32) {
+            rms_forward_fp16_kernel<<<B, block, shmem, cur_stream()>>>(
+                static_cast<const __half*>(X.data),
+                static_cast<const float*>(gamma.data),
+                static_cast<__half*>(Y.data),
+                B, D, eps);
+        } else {
+            rms_forward_fp16_kernel<<<B, block, shmem, cur_stream()>>>(
+                static_cast<const __half*>(X.data),
+                static_cast<const __half*>(gamma.data),
+                static_cast<__half*>(Y.data),
+                B, D, eps);
+        }
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        rms_forward_bf16_kernel<<<B, block, shmem, cur_stream()>>>(
-            static_cast<const __nv_bfloat16*>(X.data),
-            static_cast<const __nv_bfloat16*>(gamma.data),
-            static_cast<__nv_bfloat16*>(Y.data),
-            B, D, eps);
+        if (gamma_f32) {
+            rms_forward_bf16_kernel<<<B, block, shmem, cur_stream()>>>(
+                static_cast<const __nv_bfloat16*>(X.data),
+                static_cast<const float*>(gamma.data),
+                static_cast<__nv_bfloat16*>(Y.data),
+                B, D, eps);
+        } else {
+            rms_forward_bf16_kernel<<<B, block, shmem, cur_stream()>>>(
+                static_cast<const __nv_bfloat16*>(X.data),
+                static_cast<const __nv_bfloat16*>(gamma.data),
+                static_cast<__nv_bfloat16*>(Y.data),
+                B, D, eps);
+        }
     } else {
         rms_forward_fp32_kernel<<<B, block, shmem, cur_stream()>>>(
             static_cast<const float*>(X.data),
