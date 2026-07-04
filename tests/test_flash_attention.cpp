@@ -1491,6 +1491,15 @@ int main() {
     run_one("fused hd72 mask",   70, 200,  720, 10, true);
     run_one("fused hd72 1head", 300, 333,   72,  1, false);
 
+    // Fused path for head_dim == 128 (Krea 2 / Flux-class DiT self-attention).
+    // PAD == HD here (no zero-pad columns) but BR drops to 48 for the shared-
+    // memory cap, so exercise q-tile tails (Lq % 48), k-tile tails (Lk % 64),
+    // masking, and a single-head case.
+    run_one("fused hd128 exact",  96, 128, 512, 4, false);
+    run_one("fused hd128 tails", 100,  70, 256, 2, false);
+    run_one("fused hd128 mask",   70, 200, 384, 3, true);
+    run_one("fused hd128 1head", 300, 333, 128, 1, false);
+
     // BF16 per-head WMMA path (the route VAE mid-block self-attention takes:
     // single head, head_dim > 72). Includes unaligned Lk to exercise the
     // 8-multiple padding the BF16 matmul now relies on, plus a mask case.

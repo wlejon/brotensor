@@ -334,6 +334,15 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
         case 72:
             launch_impl<T, 72, 64>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
             return;
+        case 128:
+            // PAD = 128 doubles the per-query-row shared footprint (LDQ/LDS
+            // rows are 2x the head_dim-64 case), so the query tile drops to
+            // BR = 48 (3 warps) to stay under sm_89's ~99 KB dynamic-shared
+            // cap: 1088*BR + 36864 = 89088 bytes. Krea 2 / Flux-class DiT
+            // self-attention (head_dim 128) is the motivating shape —
+            // previously fell through to the O(Lq*Lk) scalar path.
+            launch_impl<T, 128, 48>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
         default:
             return;  // guarded by supported(); unreachable
     }
@@ -342,7 +351,8 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
 }  // namespace
 
 bool supported(int head_dim) {
-    return head_dim == 40 || head_dim == 64 || head_dim == 72;
+    return head_dim == 40 || head_dim == 64 || head_dim == 72 ||
+           head_dim == 128;
 }
 
 void launch(const __half* Q, const __half* K, const __half* V,
