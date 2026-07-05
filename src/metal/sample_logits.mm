@@ -428,7 +428,7 @@ void sample_logits_into(const Tensor& logits, float temperature, int top_k,
     }
     if (N == 0) return;
 
-    SampleParamsG p{};
+    SampleParams p{};
     p.key = key;
     p.temperature = temperature;
     p.top_k = top_k;
@@ -454,7 +454,7 @@ void sample_logits_into(const Tensor& logits, float temperature, int top_k,
         [enc setBuffer:scratchBuf offset:sbase + 2 * nv * sizeof(float) atIndex:4];
         [enc setBuffer:buffer_for(counter)
                 offset:buffer_offset_for(counter) atIndex:5];
-        [enc setBytes:&p length:sizeof(SampleParamsG) atIndex:6];
+        [enc setBytes:&p length:sizeof(SampleParams) atIndex:6];
         NSUInteger tpt = [pso_sample_logits_into() maxTotalThreadsPerThreadgroup];
         if (tpt > 256) tpt = 256;
         [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(N), 1, 1)

@@ -24,12 +24,16 @@ endif()
 # targeting it (vs. the compiler's default pre-AVX baseline) lets the
 # auto-vectorizer use 256-bit paths on the scalar FP32 loops in src/cpu/.
 # Scoped to the CPU-heavy targets only, not forced on GPU backend TUs.
-if(MSVC)
-    set(BROTENSOR_CPU_SIMD_FLAGS $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i.86)$")
+    if(MSVC)
+        set(BROTENSOR_CPU_SIMD_FLAGS $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+    else()
+        set(BROTENSOR_CPU_SIMD_FLAGS
+            $<$<COMPILE_LANGUAGE:CXX>:-mavx2>
+            $<$<COMPILE_LANGUAGE:CXX>:-mfma>)
+    endif()
 else()
-    set(BROTENSOR_CPU_SIMD_FLAGS
-        $<$<COMPILE_LANGUAGE:CXX>:-mavx2>
-        $<$<COMPILE_LANGUAGE:CXX>:-mfma>)
+    set(BROTENSOR_CPU_SIMD_FLAGS "")
 endif()
 
 # --- Backends ---
