@@ -1355,4 +1355,178 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
     });
 }
 
+// ─── axpby_inplace / add_channel_bias_inplace / threshold_u8 ──────────────
+//
+// CUDA-only until now (see src/metal/register.mm's parity-gap comment); these
+// three are plain elementwise/broadcast kernels, so they follow the same
+// compile_pipeline + launch_1d pattern as the FP16-extension block above.
+
+namespace {
+
+NSString* const kExtra2Src = @R"msl(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void k_axpby_inplace_fp32(device float*       y [[buffer(0)]],
+                                 device const float* x [[buffer(1)]],
+                                 constant float& a     [[buffer(2)]],
+                                 constant float& b     [[buffer(3)]],
+                                 constant uint&  n     [[buffer(4)]],
+                                 uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = a * y[i] + b * x[i];
+}
+kernel void k_axpby_inplace_fp16(device half*       y [[buffer(0)]],
+                                 device const half* x [[buffer(1)]],
+                                 constant float& a    [[buffer(2)]],
+                                 constant float& b    [[buffer(3)]],
+                                 constant uint&  n    [[buffer(4)]],
+                                 uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = half(a * float(y[i]) + b * float(x[i]));
+}
+kernel void k_axpby_inplace_bf16(device bfloat*       y [[buffer(0)]],
+                                 device const bfloat* x [[buffer(1)]],
+                                 constant float& a      [[buffer(2)]],
+                                 constant float& b      [[buffer(3)]],
+                                 constant uint&  n      [[buffer(4)]],
+                                 uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(a * float(y[i]) + b * float(x[i]));
+}
+
+kernel void k_add_channel_bias_inplace_fp32(device float*       y    [[buffer(0)]],
+                                            device const float* bias [[buffer(1)]],
+                                            constant uint& L         [[buffer(2)]],
+                                            constant uint& n         [[buffer(3)]],
+                                            uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] += bias[i / L];
+}
+kernel void k_add_channel_bias_inplace_fp16(device half*       y    [[buffer(0)]],
+                                            device const half* bias [[buffer(1)]],
+                                            constant uint& L        [[buffer(2)]],
+                                            constant uint& n        [[buffer(3)]],
+                                            uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = half(float(y[i]) + float(bias[i / L]));
+}
+kernel void k_add_channel_bias_inplace_bf16(device bfloat*       y    [[buffer(0)]],
+                                            device const bfloat* bias [[buffer(1)]],
+                                            constant uint& L          [[buffer(2)]],
+                                            constant uint& n          [[buffer(3)]],
+                                            uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(float(y[i]) + float(bias[i / L]));
+}
+
+kernel void k_threshold_u8_fp32(device const float* x [[buffer(0)]],
+                                constant float& t     [[buffer(1)]],
+                                device char*    y     [[buffer(2)]],
+                                constant uint&  n     [[buffer(3)]],
+                                uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = (x[i] > t) ? char(1) : char(0);
+}
+kernel void k_threshold_u8_fp16(device const half* x [[buffer(0)]],
+                                constant float& t    [[buffer(1)]],
+                                device char*    y    [[buffer(2)]],
+                                constant uint&  n    [[buffer(3)]],
+                                uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = (float(x[i]) > t) ? char(1) : char(0);
+}
+)msl";
+
+#define DEF_PSO(NAME, FN) \
+    id<MTLComputePipelineState> NAME() { \
+        static dispatch_once_t once; \
+        static id<MTLComputePipelineState> pso; \
+        dispatch_once(&once, ^{ pso = compile_pipeline(kExtra2Src, FN); }); \
+        return pso; \
+    }
+DEF_PSO(pso_axpby_fp32, @"k_axpby_inplace_fp32")
+DEF_PSO(pso_axpby_fp16, @"k_axpby_inplace_fp16")
+DEF_PSO(pso_axpby_bf16, @"k_axpby_inplace_bf16")
+DEF_PSO(pso_add_channel_bias_fp32, @"k_add_channel_bias_inplace_fp32")
+DEF_PSO(pso_add_channel_bias_fp16, @"k_add_channel_bias_inplace_fp16")
+DEF_PSO(pso_add_channel_bias_bf16, @"k_add_channel_bias_inplace_bf16")
+DEF_PSO(pso_threshold_u8_fp32, @"k_threshold_u8_fp32")
+DEF_PSO(pso_threshold_u8_fp16, @"k_threshold_u8_fp16")
+#undef DEF_PSO
+
+} // namespace
+
+void axpby_inplace(Tensor& y, const Tensor& x, float a, float b) {
+    if (y.dtype != x.dtype || y.rows != x.rows || y.cols != x.cols) {
+        throw std::runtime_error("axpby_inplace: shape/dtype mismatch");
+    }
+    const uint32_t n = static_cast<uint32_t>(y.size());
+    if (n == 0) return;
+    id<MTLComputePipelineState> pso =
+        (y.dtype == Dtype::FP16) ? pso_axpby_fp16()
+      : (y.dtype == Dtype::BF16) ? pso_axpby_bf16()
+      : pso_axpby_fp32();
+    id<MTLBuffer> by = buffer_for(y);
+    id<MTLBuffer> bx = buffer_for(x);
+    const NSUInteger oy = buffer_offset_for(y);
+    const NSUInteger ox = buffer_offset_for(x);
+    launch_1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:by offset:oy atIndex:0];
+        [enc setBuffer:bx offset:ox atIndex:1];
+        [enc setBytes:&a length:sizeof(float) atIndex:2];
+        [enc setBytes:&b length:sizeof(float) atIndex:3];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:4];
+    });
+}
+
+void add_channel_bias_inplace(Tensor& y, const Tensor& bias, int C, int L) {
+    const uint32_t n = static_cast<uint32_t>(C) * static_cast<uint32_t>(L);
+    if (n == 0) return;
+    if (y.dtype != bias.dtype) {
+        throw std::runtime_error("add_channel_bias_inplace: dtype mismatch");
+    }
+    if (static_cast<uint32_t>(y.size()) != n) {
+        throw std::runtime_error("add_channel_bias_inplace: y size != C*L");
+    }
+    id<MTLComputePipelineState> pso =
+        (y.dtype == Dtype::FP16) ? pso_add_channel_bias_fp16()
+      : (y.dtype == Dtype::BF16) ? pso_add_channel_bias_bf16()
+      : pso_add_channel_bias_fp32();
+    id<MTLBuffer> by = buffer_for(y);
+    id<MTLBuffer> bb = buffer_for(bias);
+    const NSUInteger oy = buffer_offset_for(y);
+    const NSUInteger ob = buffer_offset_for(bias);
+    const uint32_t Lu = static_cast<uint32_t>(L);
+    launch_1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:by offset:oy atIndex:0];
+        [enc setBuffer:bb offset:ob atIndex:1];
+        [enc setBytes:&Lu length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&n  length:sizeof(uint32_t) atIndex:3];
+    });
+}
+
+void threshold_u8(const Tensor& X, float t, Tensor& Y) {
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16) {
+        throw std::runtime_error("threshold_u8: X must be FP32 or FP16");
+    }
+    if (Y.rows != X.rows || Y.cols != X.cols || Y.dtype != Dtype::INT8) {
+        Y.resize(X.rows, X.cols, Dtype::INT8);
+    }
+    const uint32_t n = static_cast<uint32_t>(X.size());
+    if (n == 0) return;
+    id<MTLComputePipelineState> pso =
+        (X.dtype == Dtype::FP16) ? pso_threshold_u8_fp16() : pso_threshold_u8_fp32();
+    id<MTLBuffer> bx = buffer_for(X);
+    id<MTLBuffer> by = buffer_for(Y);
+    const NSUInteger ox = buffer_offset_for(X);
+    const NSUInteger oy = buffer_offset_for(Y);
+    launch_1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bx offset:ox atIndex:0];
+        [enc setBytes:&t length:sizeof(float) atIndex:1];
+        [enc setBuffer:by offset:oy atIndex:2];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
+    });
+}
+
 } // namespace brotensor::detail::metal

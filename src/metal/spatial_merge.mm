@@ -91,6 +91,39 @@ kernel void NAME(device const T* X [[buffer(0)]],                            \
 PATCH_UNPACK(k_patch_unpack_fp32, float)
 PATCH_UNPACK(k_patch_unpack_fp16, half)
 PATCH_UNPACK(k_patch_unpack_bf16, bfloat)
+
+// DC-AE up-shortcut: Y[n,c_out,2h+i,2w+j] = X[n,(4*c_out+2i+j)/repeats,h,w].
+#define PIXEL_SHUFFLE_UP2X(NAME, T)                                           \
+kernel void NAME(device const T* X [[buffer(0)]],                             \
+                 device T*       Y [[buffer(1)]],                             \
+                 constant uint& C_in    [[buffer(2)]],                        \
+                 constant uint& H       [[buffer(3)]],                        \
+                 constant uint& W       [[buffer(4)]],                        \
+                 constant uint& C_out   [[buffer(5)]],                        \
+                 constant uint& repeats [[buffer(6)]],                        \
+                 constant uint& H_out   [[buffer(7)]],                        \
+                 constant uint& W_out   [[buffer(8)]],                        \
+                 constant uint& total   [[buffer(9)]],                        \
+                 uint idx [[thread_position_in_grid]]) {                      \
+    if (idx >= total) return;                                                 \
+    uint w_out = idx % W_out;                                                 \
+    uint t     = idx / W_out;                                                 \
+    uint h_out = t % H_out;                                                   \
+    t         /= H_out;                                                       \
+    uint c_out = t % C_out;                                                   \
+    uint n     = t / C_out;                                                   \
+    uint i = h_out & 1u;                                                      \
+    uint j = w_out & 1u;                                                      \
+    uint h = h_out >> 1;                                                      \
+    uint w = w_out >> 1;                                                      \
+    uint src_c = (4u * c_out + 2u * i + j) / repeats;                         \
+    uint x_idx = (n * C_in + src_c) * (H * W) + h * W + w;                    \
+    Y[idx] = X[x_idx];                                                        \
+}
+
+PIXEL_SHUFFLE_UP2X(k_pixel_shuffle_up2x_fp32, float)
+PIXEL_SHUFFLE_UP2X(k_pixel_shuffle_up2x_fp16, half)
+PIXEL_SHUFFLE_UP2X(k_pixel_shuffle_up2x_bf16, bfloat)
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -106,6 +139,9 @@ DEF_PSO(pso_sm_bf16, @"k_spatial_merge_2x2_bf16")
 DEF_PSO(pso_pu_fp32, @"k_patch_unpack_fp32")
 DEF_PSO(pso_pu_fp16, @"k_patch_unpack_fp16")
 DEF_PSO(pso_pu_bf16, @"k_patch_unpack_bf16")
+DEF_PSO(pso_psu2x_fp32, @"k_pixel_shuffle_up2x_fp32")
+DEF_PSO(pso_psu2x_fp16, @"k_pixel_shuffle_up2x_fp16")
+DEF_PSO(pso_psu2x_bf16, @"k_pixel_shuffle_up2x_bf16")
 #undef DEF_PSO
 
 } // namespace
@@ -233,6 +269,72 @@ void patch_unpack_forward(const Tensor& tokens,
         [enc setBytes:&rsU    length:sizeof(uint32_t) atIndex:7];
         [enc setBytes:&total  length:sizeof(uint32_t) atIndex:8];
         [enc setBytes:&chmajU length:sizeof(uint32_t) atIndex:9];
+        NSUInteger tpt = [pso maxTotalThreadsPerThreadgroup];
+        if (tpt > 256) tpt = 256;
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+        [enc endEncoding];
+        ::brotensor::metal_impl::submit(cmd);
+    }
+}
+
+void pixel_shuffle_upsample_2x_forward(const Tensor& X,
+                                       int N, int C_in, int H, int W,
+                                       int C_out,
+                                       Tensor& Y) {
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 &&
+        X.dtype != Dtype::BF16) {
+        throw std::runtime_error("pixel_shuffle_upsample_2x_forward: X must be "
+                                 "FP32, FP16, or BF16");
+    }
+    if (N < 0 || C_in <= 0 || H < 0 || W < 0 || C_out <= 0) {
+        throw std::runtime_error("pixel_shuffle_upsample_2x_forward: bad dimension");
+    }
+    if ((4 * C_out) % C_in != 0) {
+        throw std::runtime_error("pixel_shuffle_upsample_2x_forward: C_in must "
+                                 "divide 4*C_out");
+    }
+    const int repeats = (4 * C_out) / C_in;
+    const int H_out = 2 * H;
+    const int W_out = 2 * W;
+    const int cols  = C_out * H_out * W_out;
+    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) {
+        Y.resize(N, cols, X.dtype);
+    }
+    const uint32_t total = (uint32_t)N * (uint32_t)cols;
+    if (total == 0) return;
+    id<MTLComputePipelineState> pso =
+        (X.dtype == Dtype::FP16) ? pso_psu2x_fp16()
+      : (X.dtype == Dtype::BF16) ? pso_psu2x_bf16()
+      : pso_psu2x_fp32();
+
+    const uint32_t CinU = (uint32_t)C_in;
+    const uint32_t Hu   = (uint32_t)H;
+    const uint32_t Wu   = (uint32_t)W;
+    const uint32_t CoutU = (uint32_t)C_out;
+    const uint32_t repU  = (uint32_t)repeats;
+    const uint32_t H_outU = (uint32_t)H_out;
+    const uint32_t W_outU = (uint32_t)W_out;
+
+    id<MTLBuffer> bx = buffer_for(X);
+    id<MTLBuffer> by = buffer_for(Y);
+    NSUInteger ox = buffer_offset_for(X);
+    NSUInteger oy = buffer_offset_for(Y);
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bx offset:ox atIndex:0];
+        [enc setBuffer:by offset:oy atIndex:1];
+        [enc setBytes:&CinU   length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&Hu     length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&Wu     length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&CoutU  length:sizeof(uint32_t) atIndex:5];
+        [enc setBytes:&repU   length:sizeof(uint32_t) atIndex:6];
+        [enc setBytes:&H_outU length:sizeof(uint32_t) atIndex:7];
+        [enc setBytes:&W_outU length:sizeof(uint32_t) atIndex:8];
+        [enc setBytes:&total  length:sizeof(uint32_t) atIndex:9];
         NSUInteger tpt = [pso maxTotalThreadsPerThreadgroup];
         if (tpt > 256) tpt = 256;
         [enc dispatchThreads:MTLSizeMake(total, 1, 1)

@@ -195,8 +195,7 @@
     X(interp2d_backward,                       void,  (const ::brotensor::Tensor& dY, int N, int C, int H_in, int W_in, int H_out, int W_out, int mode,                \
                                                        ::brotensor::Tensor& dX))                                                                                        \
     /* align_corners=True variant (forward only — inference resample for DPT     \
-       depth / segmentation heads). Metal slot intentionally left unregistered.  \
-       CUDA is the GPU target here. */                                            \
+       depth / segmentation heads). Implemented on all three backends. */         \
     X(interp2d_align_corners_forward,          void,  (const ::brotensor::Tensor& X, int N, int C, int H_in, int W_in, int H_out, int W_out, int mode, \
                                                        ::brotensor::Tensor& Y))                                                                         \
     /* ─── 2D padding (zero / reflect / replicate) — NCHW ─── */                                                                                                        \

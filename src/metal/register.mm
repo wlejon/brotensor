@@ -9,8 +9,10 @@
 // A null slot in the vtable means "this op is not implemented on Metal" — the
 // dispatcher throws on null lookups. Metal does not implement the four host-
 // scalar / host-RNG ops `mse_scalar`, `softmax_xent`, `softmax_xent_segment`,
-// and `xavier_init`; those slots stay null. Every other op in the X-macro is
-// implemented.
+// and `xavier_init` (host-side by design — no GPU kernel makes sense for
+// them), nor `filtered_lrelu_forward`/`filtered_lrelu_backward` (CUDA-only
+// fused kernel; CPU/Metal fall back to the bias_act + upfirdn2d composite,
+// see op_table.h). Every other op in the X-macro is implemented.
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/detail/op_table.h>
@@ -61,10 +63,12 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.add_inplace                                 = &dm::add_inplace;
     ops.add_inplace_batched                         = &dm::add_inplace_batched;
     ops.add_scalar_inplace                          = &dm::add_scalar_inplace;
+    ops.add_channel_bias_inplace                    = &dm::add_channel_bias_inplace;
     ops.argmax_rows                                 = &dm::argmax_rows;
     ops.attention_backward                          = &dm::attention_backward;
     ops.attention_forward                           = &dm::attention_forward;
     ops.attention_token_moments                     = &dm::attention_token_moments;
+    ops.axpby_inplace                               = &dm::axpby_inplace;
     ops.broadcast_mul                               = &dm::broadcast_mul;
     ops.build_causal_mask_row                       = &dm::build_causal_mask_row;
     ops.build_slot_mask                             = &dm::build_slot_mask;
@@ -98,6 +102,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.conv_transpose2d_forward                    = &dm::conv_transpose2d_forward;
     ops.convex_upsample_forward                     = &dm::convex_upsample_forward;
     ops.copy_d2d                                    = &dm::copy_d2d;
+    ops.copy_d2d_strided                            = &dm::copy_d2d_strided;
     ops.cross_attention_backward                    = &dm::cross_attention_backward;
     ops.cross_attention_forward                     = &dm::cross_attention_forward;
     ops.cross_attention_forward_train               = &dm::cross_attention_forward_train;
@@ -119,6 +124,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.fft                                         = &dm::fft;
     ops.flash_attention_backward                    = &dm::flash_attention_backward;
     ops.flash_attention_decode                      = &dm::flash_attention_decode;
+    ops.flash_attention_decode_masked               = &dm::flash_attention_decode_masked;
     ops.flash_attention_forward                     = &dm::flash_attention_forward;
     ops.flash_attention_project_kv                  = &dm::flash_attention_project_kv;
     ops.flash_attention_project_kv_int8w_fp16       = &dm::flash_attention_project_kv_int8w_fp16;
@@ -184,6 +190,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.masked_mean_pool_backward                   = &dm::masked_mean_pool_backward;
     ops.masked_mean_pool_forward                    = &dm::masked_mean_pool_forward;
     ops.matmul                                      = &dm::matmul;
+    ops.matmul_abt                                  = &dm::matmul_abt;
     ops.matmul_backward                             = &dm::matmul_backward;
     ops.matmul_int8w_fp16                           = &dm::matmul_int8w_fp16;
     ops.max_pool2d_backward                         = &dm::max_pool2d_backward;
@@ -215,6 +222,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.resblock_backward                           = &dm::resblock_backward;
     ops.resblock_forward                            = &dm::resblock_forward;
     ops.resblock_forward_int8w_fp16                 = &dm::resblock_forward_int8w_fp16;
+    ops.rows_count_above                            = &dm::rows_count_above;
     ops.rfft                                        = &dm::rfft;
     ops.rfft_backward                               = &dm::rfft_backward;
     ops.rms_norm_backward                           = &dm::rms_norm_backward;
@@ -242,6 +250,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.sequence_to_nchw                            = &dm::sequence_to_nchw;
     ops.spatial_merge_2x2_forward                   = &dm::spatial_merge_2x2_forward;
     ops.patch_unpack_forward                        = &dm::patch_unpack_forward;
+    ops.pixel_shuffle_upsample_2x_forward            = &dm::pixel_shuffle_upsample_2x_forward;
     ops.sgd_step                                    = &dm::sgd_step;
     ops.sigmoid_backward                            = &dm::sigmoid_backward;
     ops.slice2d_backward                            = &dm::slice2d_backward;
@@ -253,6 +262,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.snake_forward                               = &dm::snake_forward;
     ops.softmax_backward                            = &dm::softmax_backward;
     ops.softmax_forward                             = &dm::softmax_forward;
+    ops.softmax_rows_forward                        = &dm::softmax_rows_forward;
     ops.softmax_xent_fused                          = &dm::softmax_xent_fused;
     ops.softmax_xent_fused_batched                  = &dm::softmax_xent_fused_batched;
     ops.bce_with_logits_fused_batched               = &dm::bce_with_logits_fused_batched;
@@ -267,6 +277,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.tanh_backward_batched                       = &dm::tanh_backward_batched;
     ops.tanh_forward                                = &dm::tanh_forward;
     ops.tanh_forward_batched                        = &dm::tanh_forward_batched;
+    ops.threshold_u8                                = &dm::threshold_u8;
     ops.timestep_embedding                          = &dm::timestep_embedding;
     ops.top_k_rows                                  = &dm::top_k_rows;
     ops.unfold2d_forward                            = &dm::unfold2d_forward;

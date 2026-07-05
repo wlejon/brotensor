@@ -227,4 +227,24 @@ void copy_d2d(const Tensor& src, int src_off,
                elem * static_cast<std::size_t>(n));
 }
 
+void copy_d2d_strided(const Tensor& src, int src_off, int src_pitch,
+                      Tensor& dst,       int dst_off, int dst_pitch,
+                      int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    cuda_sync();  // drain pending GPU writes before the host memcpy
+    const std::size_t elem = static_cast<std::size_t>(dtype_size_bytes(src.dtype));
+    const char* src_base = reinterpret_cast<const char*>(src.data)
+                         + static_cast<std::size_t>(src_off) * elem;
+    char*       dst_base = reinterpret_cast<char*>(dst.data)
+                         + static_cast<std::size_t>(dst_off) * elem;
+    const std::size_t src_pitch_bytes = static_cast<std::size_t>(src_pitch) * elem;
+    const std::size_t dst_pitch_bytes = static_cast<std::size_t>(dst_pitch) * elem;
+    const std::size_t row_bytes = static_cast<std::size_t>(width) * elem;
+    for (int r = 0; r < height; ++r) {
+        copy_bytes(dst_base + static_cast<std::size_t>(r) * dst_pitch_bytes,
+                   src_base + static_cast<std::size_t>(r) * src_pitch_bytes,
+                   row_bytes);
+    }
+}
+
 } // namespace brotensor::detail::metal

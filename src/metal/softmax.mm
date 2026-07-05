@@ -98,6 +98,143 @@ kernel void k_softmax_bw(device const float* probs   [[buffer(0)]],
 }
 )msl";
 
+// Row-batched stable softmax: one threadgroup per row, softmax over `cols`.
+NSString* const kRowsSrc = @R"msl(
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint SM_BLOCK = 256;
+
+kernel void k_softmax_rows_fp32(device const float* X [[buffer(0)]],
+                                device float*       Y [[buffer(1)]],
+                                constant uint& rows    [[buffer(2)]],
+                                constant uint& cols    [[buffer(3)]],
+                                uint r   [[threadgroup_position_in_grid]],
+                                uint tid [[thread_position_in_threadgroup]],
+                                uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float sdata[SM_BLOCK];
+    if (r >= rows) return;
+    device const float* logits = X + (ulong)r * cols;
+    device float*       probs  = Y + (ulong)r * cols;
+
+    float local_max = -1e30f;
+    for (uint i = tid; i < cols; i += tgs) local_max = max(local_max, logits[i]);
+    sdata[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float m = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < cols; i += tgs) {
+        float e = exp(logits[i] - m);
+        probs[i] = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / sdata[0];
+    for (uint i = tid; i < cols; i += tgs) probs[i] *= inv;
+}
+
+kernel void k_softmax_rows_fp16(device const half* X [[buffer(0)]],
+                                device half*       Y [[buffer(1)]],
+                                constant uint& rows   [[buffer(2)]],
+                                constant uint& cols   [[buffer(3)]],
+                                uint r   [[threadgroup_position_in_grid]],
+                                uint tid [[thread_position_in_threadgroup]],
+                                uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float sdata[SM_BLOCK];
+    if (r >= rows) return;
+    device const half* logits = X + (ulong)r * cols;
+    device half*       probs  = Y + (ulong)r * cols;
+
+    float local_max = -1e30f;
+    for (uint i = tid; i < cols; i += tgs) local_max = max(local_max, float(logits[i]));
+    sdata[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float m = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < cols; i += tgs) {
+        float e = exp(float(logits[i]) - m);
+        probs[i] = half(e);
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / sdata[0];
+    for (uint i = tid; i < cols; i += tgs) probs[i] = half(float(probs[i]) * inv);
+}
+
+kernel void k_softmax_rows_bf16(device const bfloat* X [[buffer(0)]],
+                                device bfloat*       Y [[buffer(1)]],
+                                constant uint& rows     [[buffer(2)]],
+                                constant uint& cols     [[buffer(3)]],
+                                uint r   [[threadgroup_position_in_grid]],
+                                uint tid [[thread_position_in_threadgroup]],
+                                uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float sdata[SM_BLOCK];
+    if (r >= rows) return;
+    device const bfloat* logits = X + (ulong)r * cols;
+    device bfloat*       probs  = Y + (ulong)r * cols;
+
+    float local_max = -1e30f;
+    for (uint i = tid; i < cols; i += tgs) local_max = max(local_max, float(logits[i]));
+    sdata[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float m = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < cols; i += tgs) {
+        float e = exp(float(logits[i]) - m);
+        probs[i] = bfloat(e);
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0f / sdata[0];
+    for (uint i = tid; i < cols; i += tgs) probs[i] = bfloat(float(probs[i]) * inv);
+}
+)msl";
+
+#define DEF_ROWS_PSO(NAME, FN) \
+    id<MTLComputePipelineState> NAME() { \
+        static dispatch_once_t once; \
+        static id<MTLComputePipelineState> pso; \
+        dispatch_once(&once, ^{ pso = compile_pipeline(kRowsSrc, FN); }); \
+        return pso; \
+    }
+DEF_ROWS_PSO(pso_softmax_rows_fp32, @"k_softmax_rows_fp32")
+DEF_ROWS_PSO(pso_softmax_rows_fp16, @"k_softmax_rows_fp16")
+DEF_ROWS_PSO(pso_softmax_rows_bf16, @"k_softmax_rows_bf16")
+#undef DEF_ROWS_PSO
+
 id<MTLComputePipelineState> fw_pso() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -174,6 +311,39 @@ void softmax_backward(const Tensor& probs, const Tensor& dProbs,
         [enc setBuffer:bdL offset:odL atIndex:2];
         [enc setBytes:&nu length:sizeof(uint32_t) atIndex:3];
     });
+}
+
+void softmax_rows_forward(const Tensor& X, Tensor& Y, int rows, int cols) {
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 && X.dtype != Dtype::BF16) {
+        throw std::runtime_error("softmax_rows_forward: X must be FP32, FP16, or BF16");
+    }
+    if (Y.rows != X.rows || Y.cols != X.cols || Y.dtype != X.dtype) {
+        Y.resize(X.rows, X.cols, X.dtype);
+    }
+    if (rows <= 0 || cols <= 0) return;
+    id<MTLComputePipelineState> pso =
+        (X.dtype == Dtype::FP16) ? pso_softmax_rows_fp16()
+      : (X.dtype == Dtype::BF16) ? pso_softmax_rows_bf16()
+      : pso_softmax_rows_fp32();
+    id<MTLBuffer> bX = buffer_for(X);
+    id<MTLBuffer> bY = buffer_for(Y);
+    const NSUInteger oX = buffer_offset_for(X);
+    const NSUInteger oY = buffer_offset_for(Y);
+    const uint32_t ru = static_cast<uint32_t>(rows);
+    const uint32_t cu = static_cast<uint32_t>(cols);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bX offset:oX atIndex:0];
+        [enc setBuffer:bY offset:oY atIndex:1];
+        [enc setBytes:&ru length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&cu length:sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(ru, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(SM_BLOCK, 1, 1)];
+        [enc endEncoding];
+        ::brotensor::metal_impl::submit(cmd);
+    }
 }
 
 } // namespace brotensor::detail::metal

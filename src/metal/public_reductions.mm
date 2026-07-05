@@ -274,6 +274,76 @@ kernel void k_argmax_rows_fp16_i32(device const half* X [[buffer(0)]],
     if (tid == 0) Idx[m] = sm_idx[0];
 }
 
+// Per-row strict-above counts at two thresholds (one pass, block per row).
+// counts is (R, 2) INT32: counts[r] = { #{x > t_lo}, #{x > t_hi} }.
+kernel void k_rows_count_above_fp32(device const float* X [[buffer(0)]],
+                                    constant float& t_lo   [[buffer(1)]],
+                                    constant float& t_hi   [[buffer(2)]],
+                                    device int*     counts [[buffer(3)]],
+                                    constant uint& R [[buffer(4)]],
+                                    constant uint& C [[buffer(5)]],
+                                    uint r   [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_position_in_threadgroup]],
+                                    uint tgs [[threads_per_threadgroup]]) {
+    threadgroup int sm_lo[RED_BLOCK];
+    threadgroup int sm_hi[RED_BLOCK];
+    if (r >= R) return;
+    int n_lo = 0, n_hi = 0;
+    for (uint c = tid; c < C; c += tgs) {
+        float v = X[r * C + c];
+        n_lo += (v > t_lo) ? 1 : 0;
+        n_hi += (v > t_hi) ? 1 : 0;
+    }
+    sm_lo[tid] = n_lo;
+    sm_hi[tid] = n_hi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sm_lo[tid] += sm_lo[tid + s];
+            sm_hi[tid] += sm_hi[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        counts[2 * r + 0] = sm_lo[0];
+        counts[2 * r + 1] = sm_hi[0];
+    }
+}
+
+kernel void k_rows_count_above_fp16(device const half* X [[buffer(0)]],
+                                    constant float& t_lo  [[buffer(1)]],
+                                    constant float& t_hi  [[buffer(2)]],
+                                    device int*     counts [[buffer(3)]],
+                                    constant uint& R [[buffer(4)]],
+                                    constant uint& C [[buffer(5)]],
+                                    uint r   [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_position_in_threadgroup]],
+                                    uint tgs [[threads_per_threadgroup]]) {
+    threadgroup int sm_lo[RED_BLOCK];
+    threadgroup int sm_hi[RED_BLOCK];
+    if (r >= R) return;
+    int n_lo = 0, n_hi = 0;
+    for (uint c = tid; c < C; c += tgs) {
+        float v = float(X[r * C + c]);
+        n_lo += (v > t_lo) ? 1 : 0;
+        n_hi += (v > t_hi) ? 1 : 0;
+    }
+    sm_lo[tid] = n_lo;
+    sm_hi[tid] = n_hi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sm_lo[tid] += sm_lo[tid + s];
+            sm_hi[tid] += sm_hi[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        counts[2 * r + 0] = sm_lo[0];
+        counts[2 * r + 1] = sm_hi[0];
+    }
+}
+
 kernel void k_argmax_rows_bf16_i32(device const bfloat* X [[buffer(0)]],
                                    device int*          Idx [[buffer(1)]],
                                    constant uint& M [[buffer(2)]],
@@ -325,6 +395,8 @@ DEF_PSO(pso_argmax_bf16,   @"k_argmax_rows_bf16")
 DEF_PSO(pso_argmax_fp32_i32, @"k_argmax_rows_fp32_i32")
 DEF_PSO(pso_argmax_fp16_i32, @"k_argmax_rows_fp16_i32")
 DEF_PSO(pso_argmax_bf16_i32, @"k_argmax_rows_bf16_i32")
+DEF_PSO(pso_rows_count_above_fp32, @"k_rows_count_above_fp32")
+DEF_PSO(pso_rows_count_above_fp16, @"k_rows_count_above_fp16")
 #undef DEF_PSO
 
 void run_per_row(id<MTLComputePipelineState> pso, uint32_t M, uint32_t N,
@@ -428,6 +500,41 @@ void argmax_rows(const Tensor& X, Tensor& Idx) {
     run_per_row(pso, M, N,
                 buffer_for(X), buffer_offset_for(X),
                 buffer_for(Idx), buffer_offset_for(Idx));
+}
+
+void rows_count_above(const Tensor& X, float t_lo, float t_hi, Tensor& counts) {
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16) {
+        throw std::runtime_error("rows_count_above: X must be FP32 or FP16");
+    }
+    const uint32_t R = static_cast<uint32_t>(X.rows);
+    const uint32_t C = static_cast<uint32_t>(X.cols);
+    if (counts.rows != static_cast<int>(R) || counts.cols != 2 ||
+        counts.dtype != Dtype::INT32) {
+        counts.resize(static_cast<int>(R), 2, Dtype::INT32);
+    }
+    if (R == 0) return;
+    if (C == 0) { counts.zero(); return; }
+    id<MTLComputePipelineState> pso =
+        (X.dtype == Dtype::FP16) ? pso_rows_count_above_fp16() : pso_rows_count_above_fp32();
+    id<MTLBuffer> bX = buffer_for(X);
+    id<MTLBuffer> bC = buffer_for(counts);
+    const NSUInteger oX = buffer_offset_for(X);
+    const NSUInteger oC = buffer_offset_for(counts);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bX offset:oX atIndex:0];
+        [enc setBytes:&t_lo length:sizeof(float) atIndex:1];
+        [enc setBytes:&t_hi length:sizeof(float) atIndex:2];
+        [enc setBuffer:bC offset:oC atIndex:3];
+        [enc setBytes:&R length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&C length:sizeof(uint32_t) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(R, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(RED_BLOCK, 1, 1)];
+        [enc endEncoding];
+        ::brotensor::metal_impl::submit(cmd);
+    }
 }
 
 } // namespace brotensor::detail::metal
