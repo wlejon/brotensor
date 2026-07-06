@@ -150,6 +150,19 @@ bool cuda_mem_info(std::size_t* free_bytes, std::size_t* total_bytes) {
     return true;
 }
 
+bool cuda_device_name(char* out, std::size_t cap) {
+    if (!out || cap == 0) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return false; }
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    std::snprintf(out, cap, "%s", prop.name);
+    return true;
+}
+
 bool cuda_mem_trim(std::size_t keep_bytes) {
     if (!async_pool_ready()) return false;
     int dev = 0;
@@ -177,6 +190,7 @@ const ::brotensor::detail::AllocVTable& cuda_alloc_table() {
         &cuda_sync,
         &cuda_mem_info,
         &cuda_mem_trim,
+        &cuda_device_name,
     };
     return t;
 }

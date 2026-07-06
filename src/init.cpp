@@ -226,4 +226,13 @@ bool device_mem_trim(Device d, std::size_t keep_bytes) {
     return fn(keep_bytes);
 }
 
+std::string device_product_name(Device d) {
+    if (!detail::is_registered(d)) return {};
+    const auto fn = detail::alloc_for(d).device_name;
+    if (fn == nullptr) return {};
+    char buf[256] = {0};
+    if (!fn(buf, sizeof(buf))) return {};
+    return std::string(buf);
+}
+
 } // namespace brotensor

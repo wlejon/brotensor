@@ -57,6 +57,11 @@ struct AllocVTable {
     // driver, keeping at most `keep_bytes` cached (e.g. cudaMemPoolTrimTo
     // after a device sync). Serves brotensor::device_mem_trim().
     bool  (*mem_trim)(std::size_t keep_bytes);
+    // Optional: the device's human-readable name (e.g. cudaDeviceProp.name,
+    // "NVIDIA GeForce RTX 4090"), written NUL-terminated into `out` (truncated
+    // to `cap`). Serves brotensor::device_name(). Null when the backend can't
+    // report (leaves the field null via aggregate value-init).
+    bool  (*device_name)(char* out, std::size_t cap);
 };
 
 // ─── Backend registration ──────────────────────────────────────────────────

@@ -2,6 +2,7 @@
 
 #include "tensor.h"
 
+#include <string>
 #include <vector>
 
 namespace brotensor {
@@ -97,6 +98,12 @@ bool device_mem_info(Device d, std::size_t& free_bytes,
 // weight reads into PCIe traffic. Returns false when the backend is not
 // registered or has no trimmable allocator (CPU always returns false).
 bool device_mem_trim(Device d, std::size_t keep_bytes = 0);
+
+// The device's human-readable product name (e.g. cudaDeviceProp.name, "NVIDIA
+// GeForce RTX 4090") — distinct from device_name(), which is the backend kind
+// ("cuda"/"metal"/"cpu"). Returns "" when the backend is not registered or
+// cannot report (CPU always returns "").
+std::string device_product_name(Device d);
 
 // ─── Errors ────────────────────────────────────────────────────────────────
 //
