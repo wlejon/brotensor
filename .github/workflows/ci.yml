@@ -90,12 +90,19 @@ jobs:
   # genuine Metal parity failure fails the job rather than being silently
   # skipped.
   #
+  # Runner must be macos-15, not macos-14: src/metal/runtime.mm builds an
+  # offset-backed MPSGraphTensorData via -[MPSNDArray initWithBuffer:offset:
+  # descriptor:], which is a macOS 15 API. Against the macOS 14 SDK that
+  # selector is not declared and the TU does not compile. The CPU job above
+  # stays on macos-14 (it never touches MPS), so the older OS keeps its arm64
+  # coverage for the portable core.
+  #
   # This is the heaviest job: the Metal backend *and* the full 158-executable
-  # test tier, on the smallest runner GitHub offers (macos-14 arm64 is 3 vCPU /
-  # 7 GB). Hence Ninja + a pinned job count + ccache.
+  # test tier, on a small runner (3 vCPU / 7 GB). Hence Ninja + a pinned job
+  # count + ccache.
   metal:
-    name: Metal · macos-14
-    runs-on: macos-14
+    name: Metal · macos-15
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
 
@@ -105,7 +112,7 @@ jobs:
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: metal-macos-14
+          key: metal-macos-15
           max-size: 500M
 
       - name: Configure
