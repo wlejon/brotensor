@@ -1,6 +1,7 @@
 # brotensor
 
 [![CI](https://github.com/wlejon/brotensor/actions/workflows/ci.yml/badge.svg)](https://github.com/wlejon/brotensor/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/wlejon/brotensor/actions/workflows/codeql.yml/badge.svg)](https://github.com/wlejon/brotensor/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A C++20 tensor + ops library with **one tensor type** and **three interchangeable backends** — CPU (always built), CUDA, and Metal (both optional). Every op is device-neutral: you write
@@ -11,7 +12,7 @@ brotensor::linear_forward(W, b, x, y);
 
 once, and it runs on whichever device the tensors live on. No `_cpu` / `_gpu` suffixes, no separate host/device tensor types, no template parameters — a `Tensor` carries a runtime `Device` tag and ops dispatch on it.
 
-brotensor is the shared tensor layer for a family of sibling projects (`brodiffusion`, `brolm`, `brosoundml`, `brovisionml`, `brogameagent`, …). Each vendors it via CMake `add_subdirectory` — no system dependencies, no release process.
+brotensor is the shared tensor layer for a family of sibling projects (`brodiffusion`, `brolm`, `brosoundml`, `brovisionml`, `brogameagent`, …). Each vendors it via CMake `add_subdirectory`. There are no third-party library dependencies to install — the CPU backend is scalar C++, and the GPU backends use the SDKs that ship with their own toolchains.
 
 ## What's inside
 
@@ -106,6 +107,8 @@ Enabling a GPU backend matters: most of `src/cpu/` is exercised by the parity su
 The GPU backends themselves are compiled by nvcc / the Apple toolchain and aren't gcov-instrumented, so they're excluded rather than counted as 0%.
 
 **CI.** GitHub Actions builds and tests the CPU tier on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64; builds *and runs* the Metal backend on macOS (the hosted runner has a real Metal device, so CPU↔Metal parity is verified on every push); and compiles the CUDA backend on Linux — compile-only, since hosted runners have no NVIDIA GPU, so CUDA parity runs on real hardware off CI. The coverage numbers land in each run's job summary, with the line-by-line HTML report attached as a build artifact.
+
+**Static analysis.** A [CodeQL](.github/workflows/codeql.yml) run analyses the core and the CPU backend on every push and once a week, with results in the repository's Security tab. It is pointed primarily at the safetensors and GGUF readers: both mmap a file supplied by the user and index into it using header-declared offsets, which is where a memory-safety bug in this library would realistically live.
 
 ## Documentation
 

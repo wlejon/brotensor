@@ -1,0 +1,72 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so a newly-published query finds existing code without waiting
+    # for the next push to touch it.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+# Static analysis over the core and the CPU backend. The value is concentrated
+# in two places:
+#
+#   * src/safetensors.cpp and src/gguf.cpp parse *untrusted* files — a model
+#     checkpoint downloaded from a hub — and both mmap the file and index into
+#     it from header-supplied offsets and lengths. Out-of-bounds reads there are
+#     the realistic memory-safety bug in this library.
+#
+#   * Tensor storage is an opaque void* with hand-computed strides, so the usual
+#     C++ footguns (arithmetic on the wrong element size, unchecked casts) are
+#     everywhere the analysis can help.
+#
+# CPU-only build: the CUDA and Metal backends are compiled by nvcc and the Apple
+# toolchain, neither of which CodeQL's C++ extractor can trace. Attempting them
+# would fail extraction, not analyze them. Their host-side entry points are
+# thin — the kernels are where GPU bugs live, and those need parity tests, not
+# static analysis.
+jobs:
+  analyze:
+    name: Analyze C++
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write   # upload the SARIF results to the Security tab
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+          # security-extended over the default suite: the parser surface above
+          # justifies the extra query set. Not security-and-quality — the
+          # quality queries are style-grade and would bury the security ones.
+          queries: security-extended
+
+      # Debug, not Release: -O0 keeps the extracted IR close to the source, so
+      # dataflow paths in the results point at code a human can act on rather
+      # than at an inlined blur.
+      - name: Build (CPU backend)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBROTENSOR_TESTS=OFF
+          cmake --build build --parallel 4
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:c-cpp

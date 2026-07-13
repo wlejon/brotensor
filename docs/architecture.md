@@ -105,4 +105,4 @@ FP32 ops should land on CPU too — it's the parity reference. FP16/BF16/INT8/GG
 
 **Adding a new dtype path:** extend `Dtype`, update `dtype_size_bytes` (and `dtype_block_size` / `dtype_block_bytes` for a block-quant carrier), and add the path inside the relevant GPU op kernel. Don't add per-dtype public entry points.
 
-**ABI:** downstream siblings vendor brotensor via `add_subdirectory` and consume changes without a release process — don't break the public ABI casually.
+**ABI:** downstream siblings vendor brotensor via `add_subdirectory` and build it from source alongside their own code, so a change here reaches every consumer as soon as they update their checkout. Don't break the public ABI casually.

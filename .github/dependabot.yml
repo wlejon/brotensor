@@ -1,0 +1,22 @@
+version: 2
+
+# The only thing here with a version to bump is the CI itself. brotensor has no
+# third-party library dependencies — the CPU backend is scalar C++, the GPU
+# backends use the vendor SDKs that ship with their toolchains, and consumers
+# vendor this repo via add_subdirectory. So there is no package manifest for
+# Dependabot to read, and the "dependencies" it can usefully watch are the
+# pinned actions in .github/workflows/.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # A handful of actions across two workflows: one PR that moves them all
+    # together is easier to review than four that each bump one.
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: [ci]
+    commit-message:
+      prefix: "ci"

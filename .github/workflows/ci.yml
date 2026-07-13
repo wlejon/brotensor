@@ -80,9 +80,9 @@ jobs:
 
   # ── Metal ─────────────────────────────────────────────────────────────────
   #
-  # Builds the ~80 .mm backend TUs — the check that has been missing entirely
-  # (Metal changes have been landing on inspection alone, since no machine in
-  # the loop runs the Apple toolchain).
+  # Builds the ~80 .mm backend TUs. This is the only Apple toolchain in the
+  # loop — no development machine here runs one, so without this job a Metal
+  # change lands on inspection alone.
   #
   # ctest runs too: the GPU suite guards on is_available() and skips cleanly
   # when the runner exposes no Metal device, so this is a build check at
@@ -189,7 +189,7 @@ jobs:
   # gated behind BROTENSOR_HAS_GPU, meaning it does not even *build* without a
   # GPU backend, let alone run. Measuring coverage on a GPU-less runner
   # therefore reports the CPU backend with two-thirds of the tests that exercise
-  # it structurally excluded (that read 56.2% lines / 46 tests). The hosted
+  # it structurally excluded, understating it by tens of points. The hosted
   # macos-15 runner has a real Metal device, so here the full suite runs and the
   # number reflects what the tests actually reach.
   #
@@ -202,7 +202,9 @@ jobs:
   # No ccache: it interacts badly with --coverage (the .gcno sidecars are
   # compile-time artifacts, and a cache hit skips emitting them).
   #
-  # No --fail-under gate yet: the first green run establishes the baseline.
+  # This job reports; it does not gate. gcovr's --fail-under-line would turn a
+  # coverage dip into a red build, which is a policy choice worth making only
+  # against a threshold the suite has held for a while.
   coverage:
     name: Coverage · CPU (via Metal parity suite)
     runs-on: macos-15
@@ -279,8 +281,9 @@ jobs:
 
       # Coverage lives entirely inside GitHub: the headline numbers land in the
       # run's job summary (above) and the full line-by-line drill-down is this
-      # artifact. No third-party coverage service is wired up — deliberately;
-      # one more account to keep alive, for a badge.
+      # artifact. There is no third-party coverage service in the loop, by
+      # choice — it would add an external account and an upload token to the
+      # critical path of a build, in exchange for a badge.
       - name: Upload HTML report
         if: always()
         uses: actions/upload-artifact@v4
