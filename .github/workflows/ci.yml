@@ -291,3 +291,70 @@ jobs:
           name: coverage-html
           path: coverage-html/
           retention-days: 14
+
+  # ── Pages ─────────────────────────────────────────────────────────────────
+  #
+  # Publishes the docs and the coverage report to
+  # https://wlejon.github.io/brotensor/.
+  #
+  # The coverage report is the reason this job exists. gcovr's --html-details
+  # output is the only view of *which lines* the suite misses, and as a build
+  # artifact it expired after 14 days — so the one artifact worth keeping was
+  # the one guaranteed to be gone by the time anyone wanted it. Here it gets a
+  # stable URL, rebuilt on every push to main.
+  #
+  # It reuses the artifact the coverage job already produced rather than
+  # re-running an instrumented build: that build is a 4-minute macOS job, and
+  # doing it twice per push to publish the same bytes would be silly.
+  #
+  # The docs come along because a coverage report with no docs around it is a
+  # dead end, and because op-coverage.md is the table the sibling projects
+  # actually want to link into.
+  pages:
+    name: Publish docs + coverage
+    needs: coverage
+    # Deploy only from main. A PR's build is not the published site, and the
+    # deploy needs write scopes a fork PR must never get.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write        # deploy
+      id-token: write     # OIDC token deploy-pages exchanges for the upload
+      contents: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    # Pages accepts one deployment at a time. Queue rather than cancel: a
+    # cancelled deploy leaves the previous site up, which is fine, but a
+    # cancelled *upload* has been known to wedge the environment.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Render markdown -> site/
+        run: |
+          python -m pip install --quiet markdown
+          python .github/scripts/build_site.py site
+
+      # Into site/coverage/, which is where build_site.py's nav link points.
+      - name: Add the coverage report
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-html
+          path: site/coverage
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@v5

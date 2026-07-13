@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
-project(brotensor LANGUAGES CXX)
+
+# Pre-1.0 on purpose: the op surface grows with each sibling project that
+# adopts it, and the ABI still moves. Consumers vendor this repo and build it
+# from source, so the version is a label for a tag — something to pin a
+# FetchContent GIT_TAG to — not a compatibility promise.
+project(brotensor VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -549,7 +554,18 @@ if(BROTENSOR_INSTALL)
         "${CMAKE_CURRENT_BINARY_DIR}/brotensorConfig.cmake"
         INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/brotensor
     )
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/brotensorConfig.cmake"
+
+    # SameMinorVersion, not the usual SameMajorVersion: under semver a 0.x minor
+    # bump is allowed to break, so 0.1 must not satisfy find_package(brotensor 0.2).
+    write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/brotensorConfigVersion.cmake"
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMinorVersion
+    )
+
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/brotensorConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/brotensorConfigVersion.cmake"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/brotensor
     )
 endif()

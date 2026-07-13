@@ -106,17 +106,23 @@ Enabling a GPU backend matters: most of `src/cpu/` is exercised by the parity su
 
 The GPU backends themselves are compiled by nvcc / the Apple toolchain and aren't gcov-instrumented, so they're excluded rather than counted as 0%.
 
-**CI.** GitHub Actions builds and tests the CPU tier on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64; builds *and runs* the Metal backend on macOS (the hosted runner has a real Metal device, so CPU↔Metal parity is verified on every push); and compiles the CUDA backend on Linux — compile-only, since hosted runners have no NVIDIA GPU, so CUDA parity runs on real hardware off CI. The coverage numbers land in each run's job summary, with the line-by-line HTML report attached as a build artifact.
+**CI.** GitHub Actions builds and tests the CPU tier on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64; builds *and runs* the Metal backend on macOS (the hosted runner has a real Metal device, so CPU↔Metal parity is verified on every push); and compiles the CUDA backend on Linux — compile-only, since hosted runners have no NVIDIA GPU, so CUDA parity runs on real hardware off CI. The coverage numbers land in each run's job summary, and the [line-by-line report](https://wlejon.github.io/brotensor/coverage/) is published on every push to `main`.
 
 **Static analysis.** A [CodeQL](.github/workflows/codeql.yml) run analyses the core and the CPU backend on every push and once a week, with results in the repository's Security tab. It is pointed primarily at the safetensors and GGUF readers: both mmap a file supplied by the user and index into it using header-declared offsets, which is where a memory-safety bug in this library would realistically live.
 
 ## Documentation
+
+Published at **[wlejon.github.io/brotensor](https://wlejon.github.io/brotensor/)** — the pages below plus the line-by-line coverage report, rebuilt on every push to `main`.
 
 | Doc | Contents |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | The design: the unified `Tensor`, the dtype system, runtime dispatch, backend registration, device policy, streams/sync, error handling, build internals, and how to add an op |
 | [docs/api.md](docs/api.md) | API reference: `Tensor` factories and accessors, runtime functions, the safetensors and GGUF loaders |
 | [docs/op-coverage.md](docs/op-coverage.md) | Full op surface: per-header table, per-op backend/dtype coverage, the audio op family, test layout |
+
+## Versioning
+
+Pre-1.0: the op surface is still growing and the ABI can move between minor versions. Siblings vendor the repo and build from source, so a tag is a pin point rather than a compatibility promise — `find_package(brotensor 0.1)` accepts `0.1.x` and rejects `0.2`.
 
 ## License
 
