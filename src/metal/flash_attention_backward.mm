@@ -34,6 +34,7 @@ using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
 using metal_impl::pool_lookup;
 using metal_impl::pool_lookup_offset;
+using metal_impl::launch_matmul_abt_bf16;
 using metal_impl::launch_matmul_abt_fp16;
 
 namespace {
@@ -276,25 +277,6 @@ kernel void k_fab_pack_head_LD_bf16(
 }
 
 // Naive BF16 ABT matmul. C[m,n] = sum_k A[m,k] * B[n,k]. FP32 accumulation.
-kernel void k_fab_matmul_ABT_bf16(
-        device const bfloat* A [[buffer(0)]],
-        device const bfloat* B [[buffer(1)]],
-        device bfloat*       C [[buffer(2)]],
-        constant uint& M         [[buffer(3)]],
-        constant uint& N         [[buffer(4)]],
-        constant uint& K         [[buffer(5)]],
-        uint gid [[thread_position_in_grid]]) {
-    uint total = M * N;
-    if (gid >= total) return;
-    uint m = gid / N;
-    uint n = gid % N;
-    float acc = 0.0f;
-    for (uint k = 0; k < K; ++k) {
-        acc += float(A[m * K + k]) * float(B[n * K + k]);
-    }
-    C[gid] = bfloat(acc);
-}
-
 kernel void k_fab_scale_mask_causal_softmax_rows_bf16(
         device bfloat*       S    [[buffer(0)]],
         device const float* mask [[buffer(1)]],
@@ -743,12 +725,6 @@ id<MTLComputePipelineState> pso_pack_bf16() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_pack_head_LD_bf16"); });
     return pso;
 }
-id<MTLComputePipelineState> pso_matmul_abt_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_matmul_ABT_bf16"); });
-    return pso;
-}
 id<MTLComputePipelineState> pso_softmax_bf16() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -786,34 +762,6 @@ id<MTLComputePipelineState> pso_dKh_bf16() {
     return pso;
 }
 
-// Self-contained naive BF16 ABT matmul launch helper (mirrors the one in
-// flash_attention.mm; this TU can't reach that file-local symbol).
-void launch_matmul_abt_bf16_bwd(id<MTLBuffer> bA, NSUInteger oA,
-                                 id<MTLBuffer> bB, NSUInteger oB,
-                                 id<MTLBuffer> bC, NSUInteger oC,
-                                 int M, int N, int K) {
-    if (M == 0 || N == 0) return;
-    id<MTLComputePipelineState> pso = pso_matmul_abt_bf16();
-    const uint32_t Mu = M, Nu = N, Ku = K;
-    const NSUInteger total = (NSUInteger)M * (NSUInteger)N;
-    const NSUInteger tg = 128;
-    const NSUInteger grid = ((total + tg - 1) / tg) * tg;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bA offset:oA atIndex:0];
-        [enc setBuffer:bB offset:oB atIndex:1];
-        [enc setBuffer:bC offset:oC atIndex:2];
-        [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
-        [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(grid, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
-}
 
 // ── FP32 PSO accessors ───────────────────────────────────────────────────────
 id<MTLComputePipelineState> pso_extract_fp32() {
@@ -1121,7 +1069,7 @@ void flash_attention_backward(const Tensor& Q,
 
         // 2) S = Qh · Kh^T  →  P (Lq, Lk). FP32 accumulation.
         if (bf16) {
-            launch_matmul_abt_bf16_bwd(bQh, oQh_, bKh, oKh_, bP, oP_, Lq, Lk, hd);
+            launch_matmul_abt_bf16(bQh, oQh_, bKh, oKh_, bP, oP_, Lq, Lk, hd);
         } else {
             launch_matmul_abt_fp16(bQh, oQh_, bKh, oKh_, bP, oP_, Lq, Lk, hd);
         }
@@ -1331,7 +1279,7 @@ void flash_attention_varlen_backward(const Tensor& Q,
             if (fp32) {
                 launch_matmul_abt_fp32_bwd(bQh, oQh_, bKh, oKh_, bP, oP_, Lq, Lk, hd);
             } else if (bf16) {
-                launch_matmul_abt_bf16_bwd(bQh, oQh_, bKh, oKh_, bP, oP_, Lq, Lk, hd);
+                launch_matmul_abt_bf16(bQh, oQh_, bKh, oKh_, bP, oP_, Lq, Lk, hd);
             } else {
                 launch_matmul_abt_fp16(bQh, oQh_, bKh, oKh_, bP, oP_, Lq, Lk, hd);
             }

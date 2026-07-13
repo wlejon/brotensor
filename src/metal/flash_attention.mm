@@ -21,6 +21,7 @@ using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
 using metal_impl::pool_lookup;
 using metal_impl::pool_lookup_offset;
+using metal_impl::launch_matmul_abt_bf16;
 using metal_impl::launch_matmul_abt_fp16;
 
 namespace {
@@ -260,28 +261,6 @@ kernel void k_pack_head_LD_bf16(
     uint l = gid / head_dim;
     uint d = gid % head_dim;
     Out[l * D + head_off + d] = Yh[l * head_dim + d];
-}
-
-// Naive BF16 matmul: C(M, N) = A(M, K) @ B(N, K)^T, FP32 accumulation.
-// Same contract as launch_matmul_abt_fp16; one thread per output element.
-// Used on the BF16 path because fp16_matmul is FP16-only.
-kernel void k_matmul_ABT_bf16(
-        device const bfloat* A [[buffer(0)]],     // (M, K)
-        device const bfloat* B [[buffer(1)]],     // (N, K)
-        device bfloat*       C [[buffer(2)]],     // (M, N)
-        constant uint& M         [[buffer(3)]],
-        constant uint& N         [[buffer(4)]],
-        constant uint& K         [[buffer(5)]],
-        uint gid [[thread_position_in_grid]]) {
-    uint total = M * N;
-    if (gid >= total) return;
-    uint m = gid / N;
-    uint n = gid % N;
-    float acc = 0.0f;
-    for (uint k = 0; k < K; ++k) {
-        acc += float(A[m * K + k]) * float(B[n * K + k]);
-    }
-    C[gid] = bfloat(acc);
 }
 
 // Causal-aware row-wise softmax: same as k_scale_mask_softmax_rows but with
@@ -1321,12 +1300,6 @@ id<MTLComputePipelineState> pso_pack_LD_bf16() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_pack_head_LD_bf16"); });
     return pso;
 }
-id<MTLComputePipelineState> pso_matmul_abt_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_matmul_ABT_bf16"); });
-    return pso;
-}
 id<MTLComputePipelineState> pso_fa_linear_bias_add_bf16() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -1418,35 +1391,6 @@ id<MTLComputePipelineState> pso_fa_dKh_bf16() {
     return pso;
 }
 
-// Self-contained naive BF16 matmul launch helper (mirrors CUDA's
-// launch_matmul_ABT_bf16). Used on the BF16 non-causal forward/backward
-// paths in place of launch_matmul_abt_fp16 which is FP16-only.
-void launch_matmul_abt_bf16(id<MTLBuffer> bA, NSUInteger oA,
-                             id<MTLBuffer> bB, NSUInteger oB,
-                             id<MTLBuffer> bC, NSUInteger oC,
-                             int M, int N, int K) {
-    if (M == 0 || N == 0) return;
-    id<MTLComputePipelineState> pso = pso_matmul_abt_bf16();
-    const uint32_t Mu = M, Nu = N, Ku = K;
-    const NSUInteger total = (NSUInteger)M * (NSUInteger)N;
-    const NSUInteger tg = 128;
-    const NSUInteger grid = ((total + tg - 1) / tg) * tg;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bA offset:oA atIndex:0];
-        [enc setBuffer:bB offset:oB atIndex:1];
-        [enc setBuffer:bC offset:oC atIndex:2];
-        [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
-        [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(grid, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
-}
 
 // BF16 twin of linear_forward_batched_fp16 (batched_ops.mm): Y(B,out) =
 // X(B,in) @ W(out,in)^T, optional row-broadcast bias. Built on the file-local
