@@ -75,6 +75,14 @@ brotensor_add_test(brotensor_test_softmax_rows test_softmax_rows.cpp)
 brotensor_add_test(brotensor_test_add_channel_bias test_add_channel_bias.cpp)
 brotensor_add_test(brotensor_test_pixel_shuffle_upsample test_pixel_shuffle_upsample.cpp)
 
+# Coverage-driven: the serializers' writer + error paths, the FP16/BF16 CPU
+# matmul_abt (whose only other test is GPU-gated), and the Tensor / dispatch
+# error paths. All CPU-only.
+brotensor_add_test(brotensor_test_safetensors_extra test_safetensors_extra.cpp)
+brotensor_add_test(brotensor_test_gguf_extra test_gguf_extra.cpp)
+brotensor_add_test(brotensor_test_matmul_abt_cpu test_matmul_abt_cpu.cpp)
+brotensor_add_test(brotensor_test_tensor_errors test_tensor_errors.cpp)
+
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)
 if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL)

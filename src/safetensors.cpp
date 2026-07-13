@@ -109,6 +109,39 @@ struct Parser {
         if (!eat(c)) fail(std::string("expected '") + c + "'");
     }
 
+    // Four hex digits at q -> value, or -1 if any is not a hex digit.
+    static int hex4(const char* q) {
+        int v = 0;
+        for (int i = 0; i < 4; ++i) {
+            const char c = q[i];
+            int d;
+            if      (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else return -1;
+            v = (v << 4) | d;
+        }
+        return v;
+    }
+
+    static void append_utf8(std::string& out, uint32_t cp) {
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+
     std::string parse_string() {
         skip_ws();
         if (p >= end || *p != '"') fail("expected string");
@@ -117,6 +150,34 @@ struct Parser {
         while (p < end && *p != '"') {
             if (*p == '\\' && p + 1 < end) {
                 char e = p[1];
+                // \uXXXX carries a UTF-16 code unit, possibly the high half of
+                // a surrogate pair. It must be decoded and re-emitted as UTF-8:
+                // safetensors headers are UTF-8 JSON, \u is what most writers
+                // emit for a non-ASCII tensor name, and it is what our own
+                // json_escape_append emits for control characters — so without
+                // this we reject both third-party files and our own output.
+                if (e == 'u') {
+                    if (p + 6 > end) fail("truncated \\u escape in string");
+                    int hi = hex4(p + 2);
+                    if (hi < 0) fail("bad hex digit in \\u escape");
+                    p += 6;
+                    uint32_t cp = static_cast<uint32_t>(hi);
+                    if (hi >= 0xD800 && hi <= 0xDBFF) {
+                        if (p + 6 > end || p[0] != '\\' || p[1] != 'u')
+                            fail("unpaired high surrogate in string");
+                        const int lo = hex4(p + 2);
+                        if (lo < 0) fail("bad hex digit in \\u escape");
+                        if (lo < 0xDC00 || lo > 0xDFFF)
+                            fail("unpaired high surrogate in string");
+                        cp = 0x10000u + ((static_cast<uint32_t>(hi) - 0xD800u) << 10)
+                             + (static_cast<uint32_t>(lo) - 0xDC00u);
+                        p += 6;
+                    } else if (hi >= 0xDC00 && hi <= 0xDFFF) {
+                        fail("unpaired low surrogate in string");
+                    }
+                    append_utf8(out, cp);
+                    continue;   // p is already past the escape
+                }
                 switch (e) {
                     case '"':  out += '"';  break;
                     case '\\': out += '\\'; break;
@@ -654,9 +715,13 @@ void write_file(const std::string& path, const std::vector<WriteEntry>& entries)
         if (dsz <= 0) {
             throw std::runtime_error("safetensors::write: '" + e.name + "' bad dtype");
         }
+        // Same overflow guard the reader applies in TensorView::numel() — an
+        // unchecked product here is signed-overflow UB, not a clean throw.
         int64_t n = 1;
         for (int64_t d : e.shape) {
             if (d < 0) throw std::runtime_error("safetensors::write: '" + e.name + "' negative shape");
+            if (d != 0 && n > INT64_MAX / d)
+                throw std::runtime_error("safetensors::write: '" + e.name + "' element count overflows int64");
             n *= d;
         }
         std::size_t expected = static_cast<std::size_t>(n) * static_cast<std::size_t>(dsz);

@@ -137,7 +137,10 @@ struct Reader {
     std::size_t    size = 0;
 
     void need(std::size_t n) const {
-        if (pos + n > size) fail("unexpected EOF");
+        // Subtract rather than add: `pos + n` wraps for a corrupt/hostile n near
+        // SIZE_MAX (string and array lengths come straight off disk as u64), and
+        // a wrapped sum silently passes the check. pos <= size is an invariant.
+        if (n > size - pos) fail("unexpected EOF");
     }
 
     uint8_t read_u8() {
@@ -405,6 +408,9 @@ File File::open(const std::string& path) {
         info.dtype           = gt.dtype;
         info.dtype_supported = gt.supported;
 
+        // An unsupported ggml type is the only case with supported == false, and
+        // ggml_type_info's default arm returns block_size == type_size == 0 for
+        // it — so nbytes stays 0 and the tensor is indexed but not sized.
         std::size_t nbytes = 0;
         if (gt.supported) {
             if (gt.block_size > 1 && (numel % gt.block_size) != 0) {
@@ -413,15 +419,20 @@ File File::open(const std::string& path) {
             nbytes = (static_cast<std::size_t>(numel) /
                       static_cast<std::size_t>(gt.block_size)) *
                      static_cast<std::size_t>(gt.type_size);
-        } else if (gt.block_size > 0 && gt.type_size > 0) {
-            nbytes = (static_cast<std::size_t>(numel) /
-                      static_cast<std::size_t>(gt.block_size)) *
-                     static_cast<std::size_t>(gt.type_size);
         }
         info.nbytes = nbytes;
 
-        const std::size_t abs_off = data_blob_start + static_cast<std::size_t>(pt.offset);
-        if (abs_off > m.size || abs_off + nbytes > m.size) {
+        // pt.offset is a u64 straight off disk. Bound it *before* adding, and
+        // bound nbytes against the remaining span: `data_blob_start + offset`
+        // wraps for a corrupt offset near SIZE_MAX, and a wrapped sum lands back
+        // inside the mapping — silently aliasing a tensor onto the wrong bytes
+        // instead of failing.
+        const std::size_t rel_off = static_cast<std::size_t>(pt.offset);
+        if (pt.offset > m.size || rel_off > m.size - data_blob_start) {
+            fail("tensor '" + info.name + "' data out of bounds");
+        }
+        const std::size_t abs_off = data_blob_start + rel_off;
+        if (nbytes > m.size - abs_off) {
             fail("tensor '" + info.name + "' data out of bounds");
         }
         info.data = static_cast<const uint8_t*>(m.base) + abs_off;
