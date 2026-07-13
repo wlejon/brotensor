@@ -11,14 +11,28 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Build-tool notes that apply to every job below:
+#
+#   * Ninja, not Make. CMake's default generator on Linux/macOS is Unix
+#     Makefiles, and `cmake --build --parallel` with no job count passes a bare
+#     `-j` to make — which GNU make reads as *unlimited* parallelism. Enabling a
+#     GPU backend flips BROTENSOR_HAS_GPU in tests/CMakeLists.txt and pulls in
+#     the full GPU test tier (158 executables, up from 35), so an unbounded make
+#     forks ~160 compiles onto a 3-core / 7 GB hosted runner and the box spends
+#     its time swapping instead of compiling. Ninja bounds concurrency by
+#     default; the job counts below are pinned anyway.
+#
+#   * ccache on the two expensive jobs (Metal: ~80 Objective-C++ TUs; CUDA: ~90
+#     .cu TUs). Cold runs are unaffected; a push that doesn't touch a backend
+#     gets those TUs back for free.
 jobs:
   # ── CPU tier ──────────────────────────────────────────────────────────────
   #
   # The CPU backend is always built and has no opt-out, so this is the tier
   # every consumer gets. It is also the configuration most likely to rot
   # unnoticed: day-to-day work happens in a CUDA-enabled build dir, where the
-  # 35 CPU-only tests are drowned out by the GPU suite and a CPU-only
-  # compile break never surfaces.
+  # 35 CPU-only tests are drowned out by the GPU suite and a CPU-only compile
+  # break never surfaces.
   #
   # macOS here is deliberately *without* Metal — it is the arm64 / AppleClang
   # build check for the portable core (the SIMD baseline is x86-gated).
@@ -34,16 +48,32 @@ jobs:
           - { name: windows-msvc, os: windows-2022 }
           - { name: macos-arm64,  os: macos-14 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      # Windows keeps the Visual Studio generator: MSBuild's /m is already
+      # bounded, and the CPU tier is only 35 test targets there.
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          else
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          fi
+        shell: bash
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --config Release --parallel 4
 
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
@@ -59,20 +89,38 @@ jobs:
   # minimum and a real parity run when the runner has a GPU. Either way a
   # genuine Metal parity failure fails the job rather than being silently
   # skipped.
+  #
+  # This is the heaviest job: the Metal backend *and* the full 158-executable
+  # test tier, on the smallest runner GitHub offers (macos-14 arm64 is 3 vCPU /
+  # 7 GB). Hence Ninja + a pinned job count + ccache.
   metal:
     name: Metal · macos-14
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: metal-macos-14
+          max-size: 500M
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_METAL=ON
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBROTENSOR_WITH_METAL=ON \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --parallel 3
 
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build --output-on-failure
 
   # ── CUDA ──────────────────────────────────────────────────────────────────
   #
@@ -87,7 +135,10 @@ jobs:
     name: CUDA build · ubuntu-24.04
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Install Ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
 
       - name: Install CUDA toolkit (nvcc + cudart)
         run: |
@@ -97,15 +148,23 @@ jobs:
           sudo apt-get install -y --no-install-recommends cuda-nvcc-12-6 cuda-cudart-dev-12-6
           echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
 
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: cuda-ubuntu-24.04
+          max-size: 500M
+
       - name: Configure
         run: |
-          cmake -S . -B build \
+          cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBROTENSOR_WITH_CUDA=ON \
-            -DCMAKE_CUDA_ARCHITECTURES=89
+            -DCMAKE_CUDA_ARCHITECTURES=89 \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --parallel 4
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
@@ -116,23 +175,26 @@ jobs:
   # here — they are excluded from the report rather than counted as 0%, which
   # would make the headline number meaningless.
   #
+  # No ccache here: it interacts badly with --coverage (the .gcno sidecars are
+  # compile-time artifacts), and the job is only ~1 minute anyway.
+  #
   # No --fail-under gate yet: the first green run establishes the baseline.
   coverage:
     name: Coverage · CPU
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install gcovr
+      - name: Install gcovr + Ninja
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcovr
+          sudo apt-get install -y --no-install-recommends gcovr ninja-build
 
       - name: Configure (instrumented)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBROTENSOR_COVERAGE=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBROTENSOR_COVERAGE=ON
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel 4
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
