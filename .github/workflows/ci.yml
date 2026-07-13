@@ -206,18 +206,33 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      # pipefail matters here: piping gcovr into tee otherwise hands the step
+      # tee's exit status, so a gcovr crash produces no report and the job still
+      # goes green — a coverage step that silently reports nothing is worse than
+      # no coverage step at all.
+      #
+      # --gcov-ignore-parse-errors: gcc-13's gcov emits negative branch counts
+      # for some TUs (src/cpu/conv2d.cpp trips it), a long-standing gcov bug —
+      # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=68080. gcovr treats that as
+      # fatal by default. Downgrade it to a per-file warning: the line counts are
+      # unaffected, only a handful of branch counts in the offending files are.
       - name: Report
+        shell: bash
         run: |
+          set -o pipefail
           mkdir -p coverage-html
           gcovr --root . \
             --filter 'src/' --filter 'include/brotensor/' \
             --exclude 'src/cuda/' --exclude 'src/metal/' \
             --exclude 'tests/' \
             --exclude-unreachable-branches \
+            --gcov-ignore-parse-errors negative_hits.warn_once_per_file \
             --print-summary \
             --cobertura coverage.xml --cobertura-pretty \
             --html-details coverage-html/index.html \
             | tee coverage-summary.txt
+          # The report must actually exist — guard against a silent no-op.
+          test -s coverage.xml
 
       - name: Job summary
         if: always()
