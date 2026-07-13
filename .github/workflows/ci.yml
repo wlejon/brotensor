@@ -175,33 +175,52 @@ jobs:
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
-  # Instrumented CPU-only build. Scope is honest and worth stating: this
-  # measures the core (dispatcher, Tensor, safetensors/GGUF readers) plus the
-  # FP32 CPU reference backend. src/cuda and src/metal are compiled by nvcc /
-  # the Apple toolchain, are not gcov-instrumented, and have no GPU to run on
-  # here — they are excluded from the report rather than counted as 0%, which
-  # would make the headline number meaningless.
+  # Runs on the macOS runner *with Metal on*, not on a GPU-less Linux box, and
+  # that choice is the whole point of this job.
   #
-  # No ccache here: it interacts badly with --coverage (the .gcno sidecars are
-  # compile-time artifacts), and the job is only ~1 minute anyway.
+  # Roughly 110 of the 158 tests are the CPU<->GPU parity suite, and every one
+  # of them computes its reference by calling the op on the CPU backend:
+  #
+  #     brotensor::foo(X, cpu_Y, ...);          // <- CPU backend, CPU path
+  #     brotensor::foo(X.to(gpu), gpu_Y, ...);  // <- GPU backend
+  #     compare_tensors(cpu_Y, gpu_Y);
+  #
+  # So the parity suite is the single biggest exerciser of src/cpu/ — and it is
+  # gated behind BROTENSOR_HAS_GPU, meaning it does not even *build* without a
+  # GPU backend, let alone run. Measuring coverage on a GPU-less runner
+  # therefore reports the CPU backend with two-thirds of the tests that exercise
+  # it structurally excluded (that read 56.2% lines / 46 tests). The hosted
+  # macos-15 runner has a real Metal device, so here the full suite runs and the
+  # number reflects what the tests actually reach.
+  #
+  # What is measured: the core (dispatcher, Tensor, safetensors/GGUF readers)
+  # plus the FP32 CPU reference backend. BROTENSOR_COVERAGE scopes --coverage to
+  # COMPILE_LANGUAGE:CXX, so src/metal's Objective-C++ TUs are not instrumented;
+  # they are excluded from the report rather than counted as 0%, which would
+  # make the headline number meaningless.
+  #
+  # No ccache: it interacts badly with --coverage (the .gcno sidecars are
+  # compile-time artifacts, and a cache hit skips emitting them).
   #
   # No --fail-under gate yet: the first green run establishes the baseline.
   coverage:
-    name: Coverage · CPU
-    runs-on: ubuntu-24.04
+    name: Coverage · CPU (via Metal parity suite)
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
 
       - name: Install gcovr + Ninja
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcovr ninja-build
+        run: brew install gcovr ninja
 
       - name: Configure (instrumented)
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBROTENSOR_COVERAGE=ON
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBROTENSOR_COVERAGE=ON \
+            -DBROTENSOR_WITH_METAL=ON
 
       - name: Build
-        run: cmake --build build --parallel 4
+        run: cmake --build build --parallel 3
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
@@ -211,17 +230,21 @@ jobs:
       # goes green — a coverage step that silently reports nothing is worse than
       # no coverage step at all.
       #
-      # --gcov-ignore-parse-errors: gcc-13's gcov emits negative branch counts
-      # for some TUs (src/cpu/conv2d.cpp trips it), a long-standing gcov bug —
-      # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=68080. gcovr treats that as
-      # fatal by default. Downgrade it to a per-file warning: the line counts are
-      # unaffected, only a handful of branch counts in the offending files are.
+      # --gcov-executable: AppleClang emits gcov-format .gcno/.gcda, but the
+      # `gcov` on PATH is a shim that cannot read them. `llvm-cov gcov` is the
+      # matching reader.
+      #
+      # --gcov-ignore-parse-errors: gcov (both GCC's and llvm-cov's) can emit
+      # negative branch hit counts — a long-standing bug, gcc bugzilla 68080 —
+      # which gcovr treats as fatal. Downgrade to a per-file warning: line counts
+      # are unaffected, only a few branch counts in the offending files are.
       - name: Report
         shell: bash
         run: |
           set -o pipefail
           mkdir -p coverage-html
           gcovr --root . \
+            --gcov-executable 'xcrun llvm-cov gcov' \
             --filter 'src/' --filter 'include/brotensor/' \
             --exclude 'src/cuda/' --exclude 'src/metal/' \
             --exclude 'tests/' \
@@ -240,8 +263,14 @@ jobs:
           {
             echo '## Coverage — core + CPU backend'
             echo
-            echo 'Scope: `src/` + `include/brotensor/`, excluding the CUDA and Metal'
-            echo 'backends (not gcov-instrumented, no GPU on the runner).'
+            echo 'Measured on the macOS runner with Metal enabled, so the CPU↔GPU'
+            echo 'parity suite runs — it is the biggest exerciser of `src/cpu/`, since'
+            echo 'every parity test calls the CPU op as its reference, and it does not'
+            echo 'build at all without a GPU backend.'
+            echo
+            echo 'Scope: `src/` + `include/brotensor/`. The CUDA and Metal backends are'
+            echo 'compiled by nvcc / the Apple toolchain, are not gcov-instrumented, and'
+            echo 'are excluded rather than counted as 0%.'
             echo
             echo '```'
             cat coverage-summary.txt

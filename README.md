@@ -92,16 +92,18 @@ CPU tests always build; CPU↔GPU parity and GPU smoke tests build only when a G
 
 Every op in the table is exercised by at least one test.
 
-**Coverage.** `-DBROTENSOR_COVERAGE=ON` instruments the core + CPU backend for gcov (GCC/Clang; `-O0`, so use a fresh build dir):
+**Coverage.** `-DBROTENSOR_COVERAGE=ON` instruments the core + CPU backend for gcov (GCC/Clang; `-O0`, so use a fresh build dir). Enable a GPU backend alongside it:
 
 ```bash
-cmake -S . -B build-cov -DCMAKE_BUILD_TYPE=Debug -DBROTENSOR_COVERAGE=ON
+cmake -S . -B build-cov -DCMAKE_BUILD_TYPE=Debug -DBROTENSOR_COVERAGE=ON -DBROTENSOR_WITH_CUDA=ON
 cmake --build build-cov
 ctest --test-dir build-cov
 gcovr --root . --filter src/ --exclude src/cuda/ --exclude src/metal/ --print-summary
 ```
 
-The GPU backends are compiled by nvcc / the Apple toolchain and aren't gcov-instrumented, so they're excluded rather than counted as 0%.
+Enabling a GPU backend matters: most of `src/cpu/` is exercised by the parity suite — every parity test calls the CPU op as its reference — and that suite doesn't build at all without one. A CPU-only coverage run measures the CPU backend with the majority of the tests that exercise it excluded.
+
+The GPU backends themselves are compiled by nvcc / the Apple toolchain and aren't gcov-instrumented, so they're excluded rather than counted as 0%.
 
 **CI.** GitHub Actions builds and tests the CPU tier on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64; builds *and runs* the Metal backend on macOS (the hosted runner has a real Metal device, so CPU↔Metal parity is verified on every push); and compiles the CUDA backend on Linux — compile-only, since hosted runners have no NVIDIA GPU, so CUDA parity runs on real hardware off CI. The coverage numbers land in each run's job summary, with the line-by-line HTML report attached as a build artifact.
 
