@@ -55,6 +55,35 @@ kernel void k_fp16_zero(device half* C [[buffer(0)]],
     C[idx] = half(0.0f);
 }
 
+// ---------------- BF16: naive only ----------------
+// No simdgroup-matrix tile for bfloat — simdgroup_matrix is half/float, so the
+// BF16 path trades peak throughput for coverage, as the other Metal 16-bit
+// GEMMs (Q4_K / Q8_0 / INT8W) already do.
+kernel void k_matmul_abt_bf16_naive(device const bfloat* A [[buffer(0)]],
+                                    device const bfloat* B [[buffer(1)]],
+                                    device bfloat*       C [[buffer(2)]],
+                                    constant uint& M       [[buffer(3)]],
+                                    constant uint& N       [[buffer(4)]],
+                                    constant uint& K       [[buffer(5)]],
+                                    uint idx [[thread_position_in_grid]]) {
+    uint total = M * N;
+    if (idx >= total) return;
+    uint m = idx / N;
+    uint n = idx % N;
+    float acc = 0.0f;
+    for (uint k = 0; k < K; ++k) {
+        acc += float(A[m * K + k]) * float(B[n * K + k]);
+    }
+    C[idx] = bfloat(acc);
+}
+
+kernel void k_bf16_zero(device bfloat* C [[buffer(0)]],
+                        constant uint& total [[buffer(1)]],
+                        uint idx [[thread_position_in_grid]]) {
+    if (idx >= total) return;
+    C[idx] = bfloat(0.0f);
+}
+
 // ---------------- Tiled simdgroup-matrix kernel ----------------
 constant constexpr int BM = 32;
 constant constexpr int BN = 32;
@@ -218,6 +247,18 @@ id<MTLComputePipelineState> pso_zero() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fp16_zero"); });
     return pso;
 }
+id<MTLComputePipelineState> pso_naive_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_matmul_abt_bf16_naive"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_zero_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_bf16_zero"); });
+    return pso;
+}
 
 constexpr int kBM = 32;
 constexpr int kBN = 32;
@@ -294,6 +335,46 @@ void launch_matmul_abt_fp16(id<MTLBuffer> A, NSUInteger ofs_A,
                 threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         }
 
+        [enc endEncoding];
+        ::brotensor::metal_impl::submit(cmd);
+    }
+}
+
+void launch_matmul_abt_bf16(id<MTLBuffer> A, NSUInteger ofs_A,
+                            id<MTLBuffer> B, NSUInteger ofs_B,
+                            id<MTLBuffer> C, NSUInteger ofs_C,
+                            int M, int N, int K) {
+    if (M == 0 || N == 0) return;
+
+    const uint32_t Mu = static_cast<uint32_t>(M);
+    const uint32_t Nu = static_cast<uint32_t>(N);
+    const uint32_t Ku = static_cast<uint32_t>(K);
+    const uint32_t total = Mu * Nu;
+
+    // K == 0 leaves the (M,N) output as a plain zero-fill.
+    id<MTLComputePipelineState> pso = (K == 0) ? pso_zero_bf16() : pso_naive_bf16();
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+
+        if (K == 0) {
+            [enc setBuffer:C offset:ofs_C atIndex:0];
+            [enc setBytes:&total length:sizeof(uint32_t) atIndex:1];
+        } else {
+            [enc setBuffer:A offset:ofs_A atIndex:0];
+            [enc setBuffer:B offset:ofs_B atIndex:1];
+            [enc setBuffer:C offset:ofs_C atIndex:2];
+            [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
+            [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
+            [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
+        }
+
+        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
+        if (tg > 256) tg = 256;
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
     }

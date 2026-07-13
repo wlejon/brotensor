@@ -14,4 +14,11 @@ void launch_matmul_abt_fp16(id<MTLBuffer> A, NSUInteger ofs_A,
                             id<MTLBuffer> C, NSUInteger ofs_C,
                             int M, int N, int K);
 
+// BF16 twin. Naive per-thread GEMM — simdgroup_matrix has no bfloat form, so
+// there is no tiled fast path here.
+void launch_matmul_abt_bf16(id<MTLBuffer> A, NSUInteger ofs_A,
+                            id<MTLBuffer> B, NSUInteger ofs_B,
+                            id<MTLBuffer> C, NSUInteger ofs_C,
+                            int M, int N, int K);
+
 } // namespace brotensor::metal_impl

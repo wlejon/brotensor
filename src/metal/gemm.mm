@@ -232,6 +232,34 @@ kernel void k_fp16_bias_act(device half*       Y    [[buffer(0)]],
     if (has_bias != 0u) v += float(bias[j]);
     Y[idx] = half(apply_linear_act(act, v));
 }
+
+// ─── BF16 epilogues (verbatim copies of the FP16 pair with half→bfloat) ────
+
+kernel void k_bf16_bias_add(device bfloat*       Y    [[buffer(0)]],
+                            device const bfloat* bias [[buffer(1)]],
+                            constant uint& B          [[buffer(2)]],
+                            constant uint& out_dim    [[buffer(3)]],
+                            uint idx [[thread_position_in_grid]]) {
+    uint total = B * out_dim;
+    if (idx >= total) return;
+    uint j = idx % out_dim;
+    Y[idx] = bfloat(float(Y[idx]) + float(bias[j]));
+}
+
+kernel void k_bf16_bias_act(device bfloat*       Y    [[buffer(0)]],
+                            device const bfloat* bias [[buffer(1)]],
+                            constant uint& B          [[buffer(2)]],
+                            constant uint& out_dim    [[buffer(3)]],
+                            constant int&  act        [[buffer(4)]],
+                            constant uint& has_bias   [[buffer(5)]],
+                            uint idx [[thread_position_in_grid]]) {
+    uint total = B * out_dim;
+    if (idx >= total) return;
+    uint j = idx % out_dim;
+    float v = float(Y[idx]);
+    if (has_bias != 0u) v += float(bias[j]);
+    Y[idx] = bfloat(apply_linear_act(act, v));
+}
 )msl";
 
 id<MTLComputePipelineState> pso_bias_add() {
@@ -246,6 +274,37 @@ id<MTLComputePipelineState> pso_bias_act() {
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kFp16LinearSrc, @"k_fp16_bias_act"); });
     return pso;
+}
+
+id<MTLComputePipelineState> pso_bias_add_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kFp16LinearSrc, @"k_bf16_bias_add"); });
+    return pso;
+}
+
+id<MTLComputePipelineState> pso_bias_act_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kFp16LinearSrc, @"k_bf16_bias_act"); });
+    return pso;
+}
+
+// Both linear_forward_batched_fp16 entry points take FP16 *or* BF16, with W, X,
+// bias and Y all carrying the one dtype. Route the GEMM and the epilogue to the
+// matching pair.
+bool is_bf16(const Tensor& t) { return t.dtype == Dtype::BF16; }
+
+void launch_matmul_abt_16(const Tensor& like,
+                          id<MTLBuffer> A, NSUInteger ofs_A,
+                          id<MTLBuffer> B, NSUInteger ofs_B,
+                          id<MTLBuffer> C, NSUInteger ofs_C,
+                          int M, int N, int K) {
+    if (is_bf16(like)) {
+        metal_impl::launch_matmul_abt_bf16(A, ofs_A, B, ofs_B, C, ofs_C, M, N, K);
+    } else {
+        metal_impl::launch_matmul_abt_fp16(A, ofs_A, B, ofs_B, C, ofs_C, M, N, K);
+    }
 }
 
 void launch_1d(id<MTLComputePipelineState> pso, NSUInteger n,
@@ -269,11 +328,11 @@ void launch_1d(id<MTLComputePipelineState> pso, NSUInteger n,
 
 void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
                                  const Tensor& X_BD, Tensor& Y_BD) {
-    if (W.dtype != Dtype::FP16 || X_BD.dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_fp16: W and X must be FP16");
+    if ((W.dtype != Dtype::FP16 && W.dtype != Dtype::BF16) || X_BD.dtype != W.dtype) {
+        throw std::runtime_error("linear_forward_batched_fp16: W and X must both be FP16 or both be BF16");
     }
-    if (bias && bias->dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_fp16: bias must be FP16");
+    if (bias && bias->dtype != W.dtype) {
+        throw std::runtime_error("linear_forward_batched_fp16: bias dtype must match W");
     }
     const int B       = X_BD.rows;
     const int in_dim  = X_BD.cols;
@@ -281,16 +340,17 @@ void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
     if (W.cols != in_dim) {
         throw std::runtime_error("linear_forward_batched_fp16: shape mismatch (W.cols != X.cols)");
     }
-    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
-        Y_BD.resize(B, out_dim, Dtype::FP16);
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != X_BD.dtype) {
+        Y_BD.resize(B, out_dim, X_BD.dtype);
     }
     if (B == 0 || out_dim == 0) return;
 
     const uint32_t total = static_cast<uint32_t>(B) * static_cast<uint32_t>(out_dim);
-    metal_impl::launch_matmul_abt_fp16(buffer_for(X_BD), buffer_offset_for(X_BD),
-                                       buffer_for(W),    buffer_offset_for(W),
-                                       buffer_for(Y_BD), buffer_offset_for(Y_BD),
-                                       B, out_dim, in_dim);
+    launch_matmul_abt_16(X_BD,
+                         buffer_for(X_BD), buffer_offset_for(X_BD),
+                         buffer_for(W),    buffer_offset_for(W),
+                         buffer_for(Y_BD), buffer_offset_for(Y_BD),
+                         B, out_dim, in_dim);
 
     if (bias && bias->size() > 0) {
         id<MTLBuffer> bY = buffer_for(Y_BD);
@@ -299,7 +359,9 @@ void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
         const NSUInteger ob = buffer_offset_for(*bias);
         const uint32_t Bu = static_cast<uint32_t>(B);
         const uint32_t Ou = static_cast<uint32_t>(out_dim);
-        launch_1d(pso_bias_add(), total, ^(id<MTLComputeCommandEncoder> enc) {
+        id<MTLComputePipelineState> pso =
+            is_bf16(X_BD) ? pso_bias_add_bf16() : pso_bias_add();
+        launch_1d(pso, total, ^(id<MTLComputeCommandEncoder> enc) {
             [enc setBuffer:bY offset:oY atIndex:0];
             [enc setBuffer:bb offset:ob atIndex:1];
             [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:2];
@@ -312,11 +374,11 @@ void linear_forward_batched_fp16(const Tensor& W, const Tensor* bias,
 //   act: 0 none · 1 relu · 2 gelu(tanh) · 3 gelu(exact) · 4 silu · 5 quick_gelu
 void linear_forward_batched_fp16_act(const Tensor& W, const Tensor* bias,
                                      const Tensor& X_BD, int act, Tensor& Y_BD) {
-    if (W.dtype != Dtype::FP16 || X_BD.dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_fp16_act: W and X must be FP16");
+    if ((W.dtype != Dtype::FP16 && W.dtype != Dtype::BF16) || X_BD.dtype != W.dtype) {
+        throw std::runtime_error("linear_forward_batched_fp16_act: W and X must both be FP16 or both be BF16");
     }
-    if (bias && bias->dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_fp16_act: bias must be FP16");
+    if (bias && bias->dtype != W.dtype) {
+        throw std::runtime_error("linear_forward_batched_fp16_act: bias dtype must match W");
     }
     const int B       = X_BD.rows;
     const int in_dim  = X_BD.cols;
@@ -324,16 +386,17 @@ void linear_forward_batched_fp16_act(const Tensor& W, const Tensor* bias,
     if (W.cols != in_dim) {
         throw std::runtime_error("linear_forward_batched_fp16_act: shape mismatch (W.cols != X.cols)");
     }
-    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
-        Y_BD.resize(B, out_dim, Dtype::FP16);
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != X_BD.dtype) {
+        Y_BD.resize(B, out_dim, X_BD.dtype);
     }
     if (B == 0 || out_dim == 0) return;
 
     const uint32_t total = static_cast<uint32_t>(B) * static_cast<uint32_t>(out_dim);
-    metal_impl::launch_matmul_abt_fp16(buffer_for(X_BD), buffer_offset_for(X_BD),
-                                       buffer_for(W),    buffer_offset_for(W),
-                                       buffer_for(Y_BD), buffer_offset_for(Y_BD),
-                                       B, out_dim, in_dim);
+    launch_matmul_abt_16(X_BD,
+                         buffer_for(X_BD), buffer_offset_for(X_BD),
+                         buffer_for(W),    buffer_offset_for(W),
+                         buffer_for(Y_BD), buffer_offset_for(Y_BD),
+                         B, out_dim, in_dim);
 
     const bool has_bias = bias && bias->size() > 0;
     if (!has_bias && act == 0) return;  // pure linear, no epilogue needed
@@ -346,7 +409,9 @@ void linear_forward_batched_fp16_act(const Tensor& W, const Tensor* bias,
     const uint32_t Ou = static_cast<uint32_t>(out_dim);
     const int32_t acti = act;
     const uint32_t has_b = has_bias ? 1u : 0u;
-    launch_1d(pso_bias_act(), total, ^(id<MTLComputeCommandEncoder> enc) {
+    id<MTLComputePipelineState> pso =
+        is_bf16(X_BD) ? pso_bias_act_bf16() : pso_bias_act();
+    launch_1d(pso, total, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bY offset:oY atIndex:0];
         [enc setBuffer:bb offset:ob atIndex:1];
         [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:2];
