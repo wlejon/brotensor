@@ -72,30 +72,44 @@ kernel void k_bn_forward(
     threadgroup float s_sumsq[BN_BLOCK];
     threadgroup float s_mean, s_rstd, s_gv, s_bv;
 
-    // Pass 1: sum + sumsq.
-    float lsum = 0.0f, lsumsq = 0.0f;
+    // Pass 1: the channel mean, then the variance from squared deviations about
+    // it. Fusing the two — E[x^2] - E[x]^2 — cancels catastrophically once a
+    // channel's mean dwarfs its spread, because both terms land on the same
+    // large value and their FP32 difference is rounding noise that can come out
+    // negative, making rstd NaN. Deviations are non-negative by construction.
+    float lsum = 0.0f;
+    for (uint n = 0; n < N; ++n) {
+        device const float* x_chan = X + (n * C + c) * spatial;
+        for (uint s = tid; s < spatial; s += tg_size) lsum += x_chan[s];
+    }
+    s_sum[tid] = lsum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_M  = 1.0f / float(M);
+    float mean_c = s_sum[0] * inv_M;
+
+    float lsumsq = 0.0f;
     for (uint n = 0; n < N; ++n) {
         device const float* x_chan = X + (n * C + c) * spatial;
         for (uint s = tid; s < spatial; s += tg_size) {
-            float v = x_chan[s];
-            lsum   += v;
-            lsumsq += v * v;
+            float d = x_chan[s] - mean_c;
+            lsumsq += d * d;
         }
     }
-    s_sum[tid]   = lsum;
     s_sumsq[tid] = lsumsq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_sum[tid]   += s_sum[tid + stride];
-            s_sumsq[tid] += s_sumsq[tid + stride];
-        }
+        if (tid < stride) s_sumsq[tid] += s_sumsq[tid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    float var_b_c = s_sumsq[0] * inv_M;   // biased
+
     if (tid == 0) {
-        float inv_M = 1.0f / float(M);
-        float mean  = s_sum[0]   * inv_M;
-        float var_b = s_sumsq[0] * inv_M - mean * mean;   // biased
+        float mean  = mean_c;
+        float var_b = var_b_c;
         float rstd  = rsqrt(var_b + eps);
         float bessel = (M > 1) ? float(M) / float(M - 1) : 1.0f;
         float var_unb = var_b * bessel;

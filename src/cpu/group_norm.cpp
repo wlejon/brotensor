@@ -81,14 +81,22 @@ void group_norm_forward(const ::brotensor::Tensor& X,
             const float* x_tile = Xp + n * sample_stride + chan_base * spatial;
             float*       y_tile = Yp + n * sample_stride + chan_base * spatial;
 
-            float sum = 0.0f, sumsq = 0.0f;
-            for (int i = 0; i < tile_size; ++i) {
-                const float v = x_tile[i];
-                sum   += v;
-                sumsq += v * v;
-            }
+            // Two passes: mean, then the sum of squared deviations from it.
+            // E[x^2] - E[x]^2 is one pass but cancels catastrophically once a
+            // tile's mean dwarfs its spread — a near-constant channel puts both
+            // terms on the same large value, so their FP32 difference is noise
+            // and can come out negative, making rstd NaN. Deviations are
+            // non-negative by construction, so var cannot go negative.
+            float sum = 0.0f;
+            for (int i = 0; i < tile_size; ++i) sum += x_tile[i];
             const float mean = sum * inv_M;
-            const float var  = sumsq * inv_M - mean * mean;
+
+            float sumsq = 0.0f;
+            for (int i = 0; i < tile_size; ++i) {
+                const float d = x_tile[i] - mean;
+                sumsq += d * d;
+            }
+            const float var  = sumsq * inv_M;
             const float rstd = 1.0f / std::sqrt(var + eps);
 
             for (int i = 0; i < tile_size; ++i) {
@@ -180,15 +188,19 @@ void group_norm_backward(const ::brotensor::Tensor& X,
             const float* dy_tile = dYp + n * sample_stride + chan_base * spatial;
             float*       dx_tile = dXp + n * sample_stride + chan_base * spatial;
 
-            // Pass 1: mean, var, rstd over the tile.
-            float sum = 0.0f, sumsq = 0.0f;
-            for (int i = 0; i < tile_size; ++i) {
-                const float v = x_tile[i];
-                sum   += v;
-                sumsq += v * v;
-            }
+            // Pass 1: mean, var, rstd over the tile. Variance from squared
+            // deviations, for the cancellation reason spelled out in
+            // group_norm_forward above.
+            float sum = 0.0f;
+            for (int i = 0; i < tile_size; ++i) sum += x_tile[i];
             const float mean = sum * inv_M;
-            const float var  = sumsq * inv_M - mean * mean;
+
+            float sumsq = 0.0f;
+            for (int i = 0; i < tile_size; ++i) {
+                const float d = x_tile[i] - mean;
+                sumsq += d * d;
+            }
+            const float var  = sumsq * inv_M;
             const float rstd = 1.0f / std::sqrt(var + eps);
 
             // Pass 2: sum1 = Σ dx̂, sum2 = Σ dx̂·x̂; stash this n's per-channel

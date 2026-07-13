@@ -85,34 +85,48 @@ __global__ void bn_forward_kernel(const float* __restrict__ X,
     const int tid = threadIdx.x;
     const int M = N * spatial;
 
-    // Pass 1: sum + sumsq over channel `c`.
-    float lsum = 0.0f, lsumsq = 0.0f;
+    // Pass 1: the channel mean, then the variance from squared deviations about
+    // it. Fusing the two — E[x^2] - E[x]^2 — cancels catastrophically once a
+    // channel's mean dwarfs its spread, because both terms land on the same
+    // large value and their FP32 difference is rounding noise that can come out
+    // negative, making rstd NaN. Deviations are non-negative by construction.
+    __shared__ float s_sum[BN_BLOCK];
+    __shared__ float s_sumsq[BN_BLOCK];
+
+    float lsum = 0.0f;
+    for (int n = 0; n < N; ++n) {
+        const float* x_chan = X + (n * C + c) * spatial;
+        for (int s = tid; s < spatial; s += blockDim.x) lsum += x_chan[s];
+    }
+    s_sum[tid] = lsum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        __syncthreads();
+    }
+    const float inv_M  = 1.0f / static_cast<float>(M);
+    const float mean_c = s_sum[0] * inv_M;
+
+    float lsumsq = 0.0f;
     for (int n = 0; n < N; ++n) {
         const float* x_chan = X + (n * C + c) * spatial;
         for (int s = tid; s < spatial; s += blockDim.x) {
-            const float v = x_chan[s];
-            lsum   += v;
-            lsumsq += v * v;
+            const float d = x_chan[s] - mean_c;
+            lsumsq += d * d;
         }
     }
-    __shared__ float s_sum[BN_BLOCK];
-    __shared__ float s_sumsq[BN_BLOCK];
-    s_sum[tid]   = lsum;
     s_sumsq[tid] = lsumsq;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_sum[tid]   += s_sum[tid + stride];
-            s_sumsq[tid] += s_sumsq[tid + stride];
-        }
+        if (tid < stride) s_sumsq[tid] += s_sumsq[tid + stride];
         __syncthreads();
     }
+    const float var_b_c = s_sumsq[0] * inv_M;   // biased
 
     __shared__ float s_mean, s_rstd, s_gv, s_bv;
     if (tid == 0) {
-        const float inv_M = 1.0f / static_cast<float>(M);
-        const float mean  = s_sum[0]   * inv_M;
-        const float var_b = s_sumsq[0] * inv_M - mean * mean;  // biased
+        const float mean  = mean_c;
+        const float var_b = var_b_c;
         const float rstd  = rsqrtf(var_b + eps);
         const float bessel = (M > 1)
             ? static_cast<float>(M) / static_cast<float>(M - 1)

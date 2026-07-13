@@ -56,39 +56,39 @@ __global__ void group_norm_forward_kernel_fp16(
     const __half* x_tile = X + n * sample_stride + chan_base * spatial;
     __half*       y_tile = Y + n * sample_stride + chan_base * spatial;
 
-    float sum = 0.0f;
-    float sumsq = 0.0f;
-    for (int i = tid; i < tile_size; i += blockDim.x) {
-        const float v = __half2float(x_tile[i]);
-        sum   += v;
-        sumsq += v * v;
-    }
-
+    // Two reduction passes: the mean, then the sum of squared deviations from
+    // it. Fusing them — E[x^2] - E[x]^2 — cancels catastrophically once a
+    // tile's mean dwarfs its spread, because both terms land on the same large
+    // value and their FP32 difference is rounding noise that can come out
+    // negative, making rstd NaN. Deviations are non-negative by construction.
     __shared__ float s_sum[GN_BLOCK];
     __shared__ float s_sumsq[GN_BLOCK];
-    s_sum[tid]   = sum;
+
+    float sum = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        sum += __half2float(x_tile[i]);
+    }
+    s_sum[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        __syncthreads();
+    }
+    const float inv_n = 1.0f / static_cast<float>(tile_size);
+    const float mean  = s_sum[0] * inv_n;
+
+    float sumsq = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const float d = __half2float(x_tile[i]) - mean;
+        sumsq += d * d;
+    }
     s_sumsq[tid] = sumsq;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_sum[tid]   += s_sum[tid + stride];
-            s_sumsq[tid] += s_sumsq[tid + stride];
-        }
+        if (tid < stride) s_sumsq[tid] += s_sumsq[tid + stride];
         __syncthreads();
     }
-
-    __shared__ float s_mean;
-    __shared__ float s_rstd;
-    if (tid == 0) {
-        const float inv_n = 1.0f / static_cast<float>(tile_size);
-        const float mean  = s_sum[0] * inv_n;
-        const float var   = s_sumsq[0] * inv_n - mean * mean;
-        s_mean = mean;
-        s_rstd = rsqrtf(var + eps);
-    }
-    __syncthreads();
-    const float mean = s_mean;
-    const float rstd = s_rstd;
+    const float rstd = rsqrtf(s_sumsq[0] * inv_n + eps);
 
     for (int i = tid; i < tile_size; i += blockDim.x) {
         const int local_c = i / spatial;
@@ -119,39 +119,37 @@ __global__ void group_norm_forward_kernel_fp32(
     const float* x_tile = X + n * sample_stride + chan_base * spatial;
     float*       y_tile = Y + n * sample_stride + chan_base * spatial;
 
-    float sum = 0.0f;
-    float sumsq = 0.0f;
-    for (int i = tid; i < tile_size; i += blockDim.x) {
-        const float v = x_tile[i];
-        sum   += v;
-        sumsq += v * v;
-    }
-
+    // Two reduction passes: the mean, then the sum of squared deviations from
+    // it. Fusing them — E[x^2] - E[x]^2 — cancels catastrophically once a
+    // tile's mean dwarfs its spread, because both terms land on the same large
+    // value and their FP32 difference is rounding noise that can come out
+    // negative, making rstd NaN. Deviations are non-negative by construction.
     __shared__ float s_sum[GN_BLOCK];
     __shared__ float s_sumsq[GN_BLOCK];
-    s_sum[tid]   = sum;
+
+    float sum = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) sum += x_tile[i];
+    s_sum[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        __syncthreads();
+    }
+    const float inv_n = 1.0f / static_cast<float>(tile_size);
+    const float mean  = s_sum[0] * inv_n;
+
+    float sumsq = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const float d = x_tile[i] - mean;
+        sumsq += d * d;
+    }
     s_sumsq[tid] = sumsq;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_sum[tid]   += s_sum[tid + stride];
-            s_sumsq[tid] += s_sumsq[tid + stride];
-        }
+        if (tid < stride) s_sumsq[tid] += s_sumsq[tid + stride];
         __syncthreads();
     }
-
-    __shared__ float s_mean;
-    __shared__ float s_rstd;
-    if (tid == 0) {
-        const float inv_n = 1.0f / static_cast<float>(tile_size);
-        const float mean  = s_sum[0] * inv_n;
-        const float var   = s_sumsq[0] * inv_n - mean * mean;
-        s_mean = mean;
-        s_rstd = rsqrtf(var + eps);
-    }
-    __syncthreads();
-    const float mean = s_mean;
-    const float rstd = s_rstd;
+    const float rstd = rsqrtf(s_sumsq[0] * inv_n + eps);
 
     for (int i = tid; i < tile_size; i += blockDim.x) {
         const int local_c = i / spatial;
@@ -211,35 +209,42 @@ __global__ void group_norm_backward_kernel_fp16(
         s_dbeta[c]  = 0.0f;
     }
 
-    // Pass 1: mean, var.
-    float sum = 0.0f, sumsq = 0.0f;
-    for (int i = tid; i < tile_size; i += blockDim.x) {
-        const float v = __half2float(x_tile[i]);
-        sum   += v;
-        sumsq += v * v;
-    }
+    // Pass 1: the mean, then the variance from squared deviations about it.
+    // Fusing the two — E[x^2] - E[x]^2 — cancels catastrophically once a tile's
+    // mean dwarfs its spread, because both terms land on the same large value
+    // and their FP32 difference is rounding noise that can come out negative,
+    // making rstd NaN. Deviations are non-negative by construction.
     __shared__ float s_a[GN_BLOCK];
     __shared__ float s_b[GN_BLOCK];
-    s_a[tid] = sum; s_b[tid] = sumsq;
+
+    float sum = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        sum += __half2float(x_tile[i]);
+    }
+    s_a[tid] = sum;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_a[tid] += s_a[tid + stride];
-            s_b[tid] += s_b[tid + stride];
-        }
+        if (tid < stride) s_a[tid] += s_a[tid + stride];
         __syncthreads();
     }
-    __shared__ float s_mean, s_rstd;
-    if (tid == 0) {
-        const float inv_n = 1.0f / static_cast<float>(tile_size);
-        const float mean = s_a[0] * inv_n;
-        const float var  = s_b[0] * inv_n - mean * mean;
-        s_mean = mean;
-        s_rstd = rsqrtf(var + eps);
+    const float inv_n = 1.0f / static_cast<float>(tile_size);
+    const float mean  = s_a[0] * inv_n;
+
+    float sumsq = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const float d = __half2float(x_tile[i]) - mean;
+        sumsq += d * d;
     }
+    s_b[tid] = sumsq;
     __syncthreads();
-    const float mean = s_mean;
-    const float rstd = s_rstd;
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_b[tid] += s_b[tid + stride];
+        __syncthreads();
+    }
+    const float rstd = rsqrtf(s_b[0] * inv_n + eps);
+    __syncthreads();   // every thread has read s_a[0]/s_b[0] by now; Pass 2
+                       // reuses both arrays, and without this a fast thread
+                       // overwrites s_b[0] before a slow one reads rstd.
 
     // Pass 2: sum1 = Σ dx̂, sum2 = Σ dx̂ * x̂.
     // Also accumulate dGamma/dBeta per channel (atomic into FP32 scratch).
@@ -330,34 +335,40 @@ __global__ void group_norm_backward_kernel_fp32(
         s_dbeta[c]  = 0.0f;
     }
 
-    float sum = 0.0f, sumsq = 0.0f;
-    for (int i = tid; i < tile_size; i += blockDim.x) {
-        const float v = x_tile[i];
-        sum   += v;
-        sumsq += v * v;
-    }
+    // Pass 1: the mean, then the variance from squared deviations about it.
+    // Fusing the two — E[x^2] - E[x]^2 — cancels catastrophically once a tile's
+    // mean dwarfs its spread, because both terms land on the same large value
+    // and their FP32 difference is rounding noise that can come out negative,
+    // making rstd NaN. Deviations are non-negative by construction.
     __shared__ float s_a[GN_BLOCK];
     __shared__ float s_b[GN_BLOCK];
-    s_a[tid] = sum; s_b[tid] = sumsq;
+
+    float sum = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) sum += x_tile[i];
+    s_a[tid] = sum;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_a[tid] += s_a[tid + stride];
-            s_b[tid] += s_b[tid + stride];
-        }
+        if (tid < stride) s_a[tid] += s_a[tid + stride];
         __syncthreads();
     }
-    __shared__ float s_mean, s_rstd;
-    if (tid == 0) {
-        const float inv_n = 1.0f / static_cast<float>(tile_size);
-        const float mean = s_a[0] * inv_n;
-        const float var  = s_b[0] * inv_n - mean * mean;
-        s_mean = mean;
-        s_rstd = rsqrtf(var + eps);
+    const float inv_n = 1.0f / static_cast<float>(tile_size);
+    const float mean  = s_a[0] * inv_n;
+
+    float sumsq = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const float d = x_tile[i] - mean;
+        sumsq += d * d;
     }
+    s_b[tid] = sumsq;
     __syncthreads();
-    const float mean = s_mean;
-    const float rstd = s_rstd;
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_b[tid] += s_b[tid + stride];
+        __syncthreads();
+    }
+    const float rstd = rsqrtf(s_b[0] * inv_n + eps);
+    __syncthreads();   // every thread has read s_a[0]/s_b[0] by now; Pass 2
+                       // reuses both arrays, and without this a fast thread
+                       // overwrites s_b[0] before a slow one reads rstd.
 
     float sum1 = 0.0f, sum2 = 0.0f;
     for (int i = tid; i < tile_size; i += blockDim.x) {
@@ -429,39 +440,39 @@ __global__ void group_norm_forward_kernel_bf16(
     const __nv_bfloat16* x_tile = X + n * sample_stride + chan_base * spatial;
     __nv_bfloat16*       y_tile = Y + n * sample_stride + chan_base * spatial;
 
-    float sum = 0.0f;
-    float sumsq = 0.0f;
-    for (int i = tid; i < tile_size; i += blockDim.x) {
-        const float v = __bfloat162float(x_tile[i]);
-        sum   += v;
-        sumsq += v * v;
-    }
-
+    // Two reduction passes: the mean, then the sum of squared deviations from
+    // it. Fusing them — E[x^2] - E[x]^2 — cancels catastrophically once a
+    // tile's mean dwarfs its spread, because both terms land on the same large
+    // value and their FP32 difference is rounding noise that can come out
+    // negative, making rstd NaN. Deviations are non-negative by construction.
     __shared__ float s_sum[GN_BLOCK];
     __shared__ float s_sumsq[GN_BLOCK];
-    s_sum[tid]   = sum;
+
+    float sum = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        sum += __bfloat162float(x_tile[i]);
+    }
+    s_sum[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+        __syncthreads();
+    }
+    const float inv_n = 1.0f / static_cast<float>(tile_size);
+    const float mean  = s_sum[0] * inv_n;
+
+    float sumsq = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const float d = __bfloat162float(x_tile[i]) - mean;
+        sumsq += d * d;
+    }
     s_sumsq[tid] = sumsq;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_sum[tid]   += s_sum[tid + stride];
-            s_sumsq[tid] += s_sumsq[tid + stride];
-        }
+        if (tid < stride) s_sumsq[tid] += s_sumsq[tid + stride];
         __syncthreads();
     }
-
-    __shared__ float s_mean;
-    __shared__ float s_rstd;
-    if (tid == 0) {
-        const float inv_n = 1.0f / static_cast<float>(tile_size);
-        const float mean  = s_sum[0] * inv_n;
-        const float var   = s_sumsq[0] * inv_n - mean * mean;
-        s_mean = mean;
-        s_rstd = rsqrtf(var + eps);
-    }
-    __syncthreads();
-    const float mean = s_mean;
-    const float rstd = s_rstd;
+    const float rstd = rsqrtf(s_sumsq[0] * inv_n + eps);
 
     for (int i = tid; i < tile_size; i += blockDim.x) {
         const int local_c = i / spatial;
@@ -506,35 +517,42 @@ __global__ void group_norm_backward_kernel_bf16(
         s_dbeta[c]  = 0.0f;
     }
 
-    // Pass 1: mean, var.
-    float sum = 0.0f, sumsq = 0.0f;
-    for (int i = tid; i < tile_size; i += blockDim.x) {
-        const float v = __bfloat162float(x_tile[i]);
-        sum   += v;
-        sumsq += v * v;
-    }
+    // Pass 1: the mean, then the variance from squared deviations about it.
+    // Fusing the two — E[x^2] - E[x]^2 — cancels catastrophically once a tile's
+    // mean dwarfs its spread, because both terms land on the same large value
+    // and their FP32 difference is rounding noise that can come out negative,
+    // making rstd NaN. Deviations are non-negative by construction.
     __shared__ float s_a[GN_BLOCK];
     __shared__ float s_b[GN_BLOCK];
-    s_a[tid] = sum; s_b[tid] = sumsq;
+
+    float sum = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        sum += __bfloat162float(x_tile[i]);
+    }
+    s_a[tid] = sum;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            s_a[tid] += s_a[tid + stride];
-            s_b[tid] += s_b[tid + stride];
-        }
+        if (tid < stride) s_a[tid] += s_a[tid + stride];
         __syncthreads();
     }
-    __shared__ float s_mean, s_rstd;
-    if (tid == 0) {
-        const float inv_n = 1.0f / static_cast<float>(tile_size);
-        const float mean = s_a[0] * inv_n;
-        const float var  = s_b[0] * inv_n - mean * mean;
-        s_mean = mean;
-        s_rstd = rsqrtf(var + eps);
+    const float inv_n = 1.0f / static_cast<float>(tile_size);
+    const float mean  = s_a[0] * inv_n;
+
+    float sumsq = 0.0f;
+    for (int i = tid; i < tile_size; i += blockDim.x) {
+        const float d = __bfloat162float(x_tile[i]) - mean;
+        sumsq += d * d;
     }
+    s_b[tid] = sumsq;
     __syncthreads();
-    const float mean = s_mean;
-    const float rstd = s_rstd;
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_b[tid] += s_b[tid + stride];
+        __syncthreads();
+    }
+    const float rstd = rsqrtf(s_b[0] * inv_n + eps);
+    __syncthreads();   // every thread has read s_a[0]/s_b[0] by now; Pass 2
+                       // reuses both arrays, and without this a fast thread
+                       // overwrites s_b[0] before a slow one reads rstd.
 
     // Pass 2: sum1 = Σ dx̂, sum2 = Σ dx̂ * x̂.
     float sum1 = 0.0f, sum2 = 0.0f;

@@ -17,7 +17,8 @@
 //                                       + momentum     * batch_stat
 //                           (PyTorch's nn.BatchNorm2d convention; the "batch"
 //                           variance fed into running_var is the *unbiased*
-//                           estimator, sumsq/(M-1) - mean*mean*M/(M-1).)
+//                           estimator — the sum of squared deviations from the
+//                           channel mean over M/(M-1).)
 //
 //   batch_norm_inference  — uses running_mean / running_var; pure forward;
 //                           no state mutation. This is what loaded pretrained
@@ -121,18 +122,29 @@ void batch_norm_forward(const ::brotensor::Tensor& X,
     // cross-thread writes.
     parallel_for(static_cast<std::size_t>(C), [&](std::size_t ci) {
         const int c = static_cast<int>(ci);
-        // Pass 1: sum + sum-of-squares for this channel across (N, H, W).
-        float sum = 0.0f, sumsq = 0.0f;
+        // Pass 1: the channel's mean across (N, H, W), then the sum of squared
+        // deviations from it. E[x^2] - E[x]^2 is one pass but cancels
+        // catastrophically once a channel's mean dwarfs its spread — a
+        // near-constant channel puts both terms on the same large value, so
+        // their FP32 difference is noise and can come out negative, making rstd
+        // NaN. Deviations are non-negative by construction, so var cannot go
+        // negative.
+        float sum = 0.0f;
+        for (int n = 0; n < N; ++n) {
+            const float* x_chan = Xp + (n * C + c) * spatial;
+            for (int s = 0; s < spatial; ++s) sum += x_chan[s];
+        }
+        const float mean = sum * inv_M;
+
+        float sumsq = 0.0f;
         for (int n = 0; n < N; ++n) {
             const float* x_chan = Xp + (n * C + c) * spatial;
             for (int s = 0; s < spatial; ++s) {
-                const float v = x_chan[s];
-                sum   += v;
-                sumsq += v * v;
+                const float d = x_chan[s] - mean;
+                sumsq += d * d;
             }
         }
-        const float mean    = sum * inv_M;
-        const float var_b   = sumsq * inv_M - mean * mean;  // biased
+        const float var_b   = sumsq * inv_M;                 // biased
         const float rstd    = 1.0f / std::sqrt(var_b + eps);
         const float var_unb = var_b * bessel;                // unbiased
 

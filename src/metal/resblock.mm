@@ -71,8 +71,6 @@ kernel void k_gn_silu_fused(
         uint3 tgs3   [[threads_per_threadgroup]]) {
     threadgroup float s_sum[RB_GN_BLOCK];
     threadgroup float s_sumsq[RB_GN_BLOCK];
-    threadgroup float s_mean;
-    threadgroup float s_rstd;
     uint tid = tid3.x;
     uint tg_size = tgs3.x;
     uint g = gid.x;
@@ -83,33 +81,36 @@ kernel void k_gn_silu_fused(
     device const half* x_tile = X + n * sample_stride + chan_base * spatial;
     device       half* y_tile = Y + n * sample_stride + chan_base * spatial;
 
+    // Two reduction passes: the mean, then the sum of squared deviations from
+    // it. Fusing them — E[x^2] - E[x]^2 — cancels catastrophically once a
+    // tile's mean dwarfs its spread, because both terms land on the same large
+    // value and their FP32 difference is rounding noise that can come out
+    // negative, making rstd NaN. Deviations are non-negative by construction.
     float sum = 0.0f;
+    for (uint i = tid; i < tile_size; i += tg_size) {
+        sum += float(x_tile[i]);
+    }
+    s_sum[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) s_sum[tid] += s_sum[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_n = 1.0f / float(tile_size);
+    float mean  = s_sum[0] * inv_n;
+
     float sumsq = 0.0f;
     for (uint i = tid; i < tile_size; i += tg_size) {
-        float v = float(x_tile[i]);
-        sum   += v;
-        sumsq += v * v;
+        float d = float(x_tile[i]) - mean;
+        sumsq += d * d;
     }
-    s_sum[tid]   = sum;
     s_sumsq[tid] = sumsq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_sum[tid]   += s_sum[tid + s];
-            s_sumsq[tid] += s_sumsq[tid + s];
-        }
+        if (tid < s) s_sumsq[tid] += s_sumsq[tid + s];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tid == 0) {
-        float inv_n = 1.0f / float(tile_size);
-        float mean = s_sum[0] * inv_n;
-        float var  = s_sumsq[0] * inv_n - mean * mean;
-        s_mean = mean;
-        s_rstd = rsqrt(var + eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float mean = s_mean;
-    float rstd = s_rstd;
+    float rstd = rsqrt(s_sumsq[0] * inv_n + eps);
 
     for (uint i = tid; i < tile_size; i += tg_size) {
         uint local_c = i / spatial;
@@ -189,8 +190,6 @@ kernel void k_gn_silu_fused_bf16(
         uint3 tgs3   [[threads_per_threadgroup]]) {
     threadgroup float s_sum[RB_GN_BLOCK];
     threadgroup float s_sumsq[RB_GN_BLOCK];
-    threadgroup float s_mean;
-    threadgroup float s_rstd;
     uint tid = tid3.x;
     uint tg_size = tgs3.x;
     uint g = gid.x;
@@ -201,33 +200,36 @@ kernel void k_gn_silu_fused_bf16(
     device const bfloat* x_tile = X + n * sample_stride + chan_base * spatial;
     device       bfloat* y_tile = Y + n * sample_stride + chan_base * spatial;
 
+    // Two reduction passes: the mean, then the sum of squared deviations from
+    // it. Fusing them — E[x^2] - E[x]^2 — cancels catastrophically once a
+    // tile's mean dwarfs its spread, because both terms land on the same large
+    // value and their FP32 difference is rounding noise that can come out
+    // negative, making rstd NaN. Deviations are non-negative by construction.
     float sum = 0.0f;
+    for (uint i = tid; i < tile_size; i += tg_size) {
+        sum += float(x_tile[i]);
+    }
+    s_sum[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) s_sum[tid] += s_sum[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_n = 1.0f / float(tile_size);
+    float mean  = s_sum[0] * inv_n;
+
     float sumsq = 0.0f;
     for (uint i = tid; i < tile_size; i += tg_size) {
-        float v = float(x_tile[i]);
-        sum   += v;
-        sumsq += v * v;
+        float d = float(x_tile[i]) - mean;
+        sumsq += d * d;
     }
-    s_sum[tid]   = sum;
     s_sumsq[tid] = sumsq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            s_sum[tid]   += s_sum[tid + s];
-            s_sumsq[tid] += s_sumsq[tid + s];
-        }
+        if (tid < s) s_sumsq[tid] += s_sumsq[tid + s];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tid == 0) {
-        float inv_n = 1.0f / float(tile_size);
-        float mean = s_sum[0] * inv_n;
-        float var  = s_sumsq[0] * inv_n - mean * mean;
-        s_mean = mean;
-        s_rstd = rsqrt(var + eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float mean = s_mean;
-    float rstd = s_rstd;
+    float rstd = rsqrt(s_sumsq[0] * inv_n + eps);
 
     for (uint i = tid; i < tile_size; i += tg_size) {
         uint local_c = i / spatial;
