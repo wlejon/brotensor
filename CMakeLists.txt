@@ -69,9 +69,9 @@ endif()
 # brotensor is layered: a core dispatcher + always-on CPU backend, plus
 # optional GPU backends (CUDA, Metal) that compile as independent static
 # libraries and register themselves into the dispatcher at static-init.
-# Multiple GPU backends are no longer prohibited at the CMake level — they
-# remain mutually exclusive in practice because their toolchains do not
-# coexist on the same host (nvcc on Linux/Windows; Apple toolchain on Mac).
+# Nothing at the CMake level rejects enabling both GPU backends at once. They
+# stay mutually exclusive in practice because their toolchains do not coexist
+# on the same host (nvcc on Linux/Windows; Apple toolchain on Mac).
 # CPU has no opt-out.
 option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
 option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
