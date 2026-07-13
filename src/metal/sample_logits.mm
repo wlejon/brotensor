@@ -58,6 +58,17 @@ struct SampleParams {
     uint32_t V;
 };
 
+// sample_logits_into reads its counter from a device tensor, not the parameter
+// block — must match the MSL SampleParamsG, which drops the `counter` field.
+struct SampleParamsG {
+    uint64_t key;
+    float    temperature;
+    int32_t  top_k;
+    float    top_p;
+    uint32_t N;
+    uint32_t V;
+};
+
 NSString* const kSrc = @R"msl(
 #include <metal_stdlib>
 using namespace metal;
@@ -428,7 +439,7 @@ void sample_logits_into(const Tensor& logits, float temperature, int top_k,
     }
     if (N == 0) return;
 
-    SampleParams p{};
+    SampleParamsG p{};
     p.key = key;
     p.temperature = temperature;
     p.top_k = top_k;
@@ -454,7 +465,7 @@ void sample_logits_into(const Tensor& logits, float temperature, int top_k,
         [enc setBuffer:scratchBuf offset:sbase + 2 * nv * sizeof(float) atIndex:4];
         [enc setBuffer:buffer_for(counter)
                 offset:buffer_offset_for(counter) atIndex:5];
-        [enc setBytes:&p length:sizeof(SampleParams) atIndex:6];
+        [enc setBytes:&p length:sizeof(SampleParamsG) atIndex:6];
         NSUInteger tpt = [pso_sample_logits_into() maxTotalThreadsPerThreadgroup];
         if (tpt > 256) tpt = 256;
         [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(N), 1, 1)
