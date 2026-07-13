@@ -198,7 +198,8 @@ void conv_transpose2d_forward(const ::brotensor::Tensor& X,
                                 (c_in * Cg_out + oc_local) * kHW
                                 + kh * kW + kw;
                             Yp[(static_cast<long>(n) * C_out + oc)
-                               * H_out * W_out + ho * W_out + wo]
+                               * H_out * W_out
+                               + static_cast<long>(ho) * W_out + wo]
                                 += xv * Wp[w_idx];
                         }
                     }
@@ -314,13 +315,14 @@ void conv_transpose2d_backward_input(const ::brotensor::Tensor& Wt,
                                     + kh * kW + kw;
                                 const long dy_idx =
                                     (static_cast<long>(n) * C_out + oc)
-                                    * H_out * W_out + ho * W_out + wo;
+                                    * H_out * W_out
+                                    + static_cast<long>(ho) * W_out + wo;
                                 acc += dYp[dy_idx] * Wp[w_idx];
                             }
                         }
                     }
                     dXp[(static_cast<long>(n) * C_in + c_in) * H * W
-                        + h * W + w] = acc;
+                        + static_cast<long>(h) * W + w] = acc;
                 }
             }
         }
