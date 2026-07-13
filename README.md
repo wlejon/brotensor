@@ -1,5 +1,9 @@
 # brotensor
 
+[![CI](https://github.com/wlejon/brotensor/actions/workflows/ci.yml/badge.svg)](https://github.com/wlejon/brotensor/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/wlejon/brotensor/branch/main/graph/badge.svg)](https://codecov.io/gh/wlejon/brotensor)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A C++20 tensor + ops library with **one tensor type** and **three interchangeable backends** — CPU (always built), CUDA, and Metal (both optional). Every op is device-neutral: you write
 
 ```cpp
@@ -86,6 +90,21 @@ ctest --test-dir build -C Release
 ```
 
 CPU tests always build; CPU↔GPU parity and GPU smoke tests build only when a GPU backend is enabled and skip cleanly otherwise. See [docs/op-coverage.md](docs/op-coverage.md#tests) for the layout.
+
+Every op in the table is exercised by at least one test.
+
+**Coverage.** `-DBROTENSOR_COVERAGE=ON` instruments the core + CPU backend for gcov (GCC/Clang; `-O0`, so use a fresh build dir):
+
+```bash
+cmake -S . -B build-cov -DCMAKE_BUILD_TYPE=Debug -DBROTENSOR_COVERAGE=ON
+cmake --build build-cov
+ctest --test-dir build-cov
+gcovr --root . --filter src/ --exclude src/cuda/ --exclude src/metal/ --print-summary
+```
+
+The GPU backends are compiled by nvcc / the Apple toolchain and aren't gcov-instrumented, so they're excluded rather than counted as 0%.
+
+**CI.** GitHub Actions builds and tests the CPU tier on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64; builds the Metal backend on macOS and the CUDA backend on Linux (compile-only — hosted runners have no GPU); and publishes a coverage report. GPU parity *runs* happen on real hardware, off CI.
 
 ## Documentation
 

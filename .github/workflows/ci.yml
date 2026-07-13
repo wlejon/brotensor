@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same ref supersedes the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── CPU tier ──────────────────────────────────────────────────────────────
+  #
+  # The CPU backend is always built and has no opt-out, so this is the tier
+  # every consumer gets. It is also the configuration most likely to rot
+  # unnoticed: day-to-day work happens in a CUDA-enabled build dir, where the
+  # 35 CPU-only tests are drowned out by the GPU suite and a CPU-only
+  # compile break never surfaces.
+  #
+  # macOS here is deliberately *without* Metal — it is the arm64 / AppleClang
+  # build check for the portable core (the SIMD baseline is x86-gated).
+  cpu:
+    name: CPU · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++ }
+          - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++ }
+          - { name: windows-msvc, os: windows-2022 }
+          - { name: macos-arm64,  os: macos-14 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # ── Metal ─────────────────────────────────────────────────────────────────
+  #
+  # Builds the ~80 .mm backend TUs — the check that has been missing entirely
+  # (Metal changes have been landing on inspection alone, since no machine in
+  # the loop runs the Apple toolchain).
+  #
+  # ctest runs too: the GPU suite guards on is_available() and skips cleanly
+  # when the runner exposes no Metal device, so this is a build check at
+  # minimum and a real parity run when the runner has a GPU. Either way a
+  # genuine Metal parity failure fails the job rather than being silently
+  # skipped.
+  metal:
+    name: Metal · macos-14
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_METAL=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # ── CUDA ──────────────────────────────────────────────────────────────────
+  #
+  # Compile-only: GitHub's hosted runners have no NVIDIA GPU, so nothing can be
+  # executed here. That still buys the thing that actually breaks — nvcc
+  # accepting all ~90 .cu TUs, and the device link (CUDA_RESOLVE_DEVICE_SYMBOLS)
+  # resolving. The parity *runs* stay on the local box / a self-hosted runner.
+  #
+  # CMAKE_CUDA_ARCHITECTURES must be pinned: the project defaults to `native`,
+  # which cannot be probed without a GPU present.
+  cuda:
+    name: CUDA build · ubuntu-24.04
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit (nvcc + cudart)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-12-6 cuda-cudart-dev-12-6
+          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBROTENSOR_WITH_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=89
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+  # ── Coverage ──────────────────────────────────────────────────────────────
+  #
+  # Instrumented CPU-only build. Scope is honest and worth stating: this
+  # measures the core (dispatcher, Tensor, safetensors/GGUF readers) plus the
+  # FP32 CPU reference backend. src/cuda and src/metal are compiled by nvcc /
+  # the Apple toolchain, are not gcov-instrumented, and have no GPU to run on
+  # here — they are excluded from the report rather than counted as 0%, which
+  # would make the headline number meaningless.
+  #
+  # No --fail-under gate yet: the first green run establishes the baseline.
+  coverage:
+    name: Coverage · CPU
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gcovr
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcovr
+
+      - name: Configure (instrumented)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBROTENSOR_COVERAGE=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Report
+        run: |
+          mkdir -p coverage-html
+          gcovr --root . \
+            --filter 'src/' --filter 'include/brotensor/' \
+            --exclude 'src/cuda/' --exclude 'src/metal/' \
+            --exclude 'tests/' \
+            --exclude-unreachable-branches \
+            --print-summary \
+            --cobertura coverage.xml --cobertura-pretty \
+            --html-details coverage-html/index.html \
+            | tee coverage-summary.txt
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage — core + CPU backend'
+            echo
+            echo 'Scope: `src/` + `include/brotensor/`, excluding the CUDA and Metal'
+            echo 'backends (not gcov-instrumented, no GPU on the runner).'
+            echo
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage-html/
+          retention-days: 14
+
+      # Public repo, so a token is optional — but Codecov's tokenless uploads
+      # are rate-limited and flaky, and a coverage-upload hiccup must never
+      # fail the build. Set CODECOV_TOKEN in repo secrets to make it reliable.
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

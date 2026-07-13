@@ -19,6 +19,29 @@ if(MSVC)
     endif()
 endif()
 
+# --- Coverage instrumentation (gcov / llvm-cov) ---
+#
+# Scoped to the CPU + core build: the GPU backends are compiled by nvcc / the
+# Apple toolchain and are not gcov-instrumented, and CI has no GPU to run them
+# on anyway. So a coverage run measures exactly what the CPU-only test tier
+# exercises — the dispatcher, Tensor, the safetensors/GGUF readers, and the
+# FP32 reference backend. Optimisation is dropped to -O0 so line attribution is
+# not scrambled by inlining.
+option(BROTENSOR_COVERAGE "Instrument the core + CPU build for gcov coverage (GCC/Clang)" OFF)
+if(BROTENSOR_COVERAGE)
+    if(MSVC)
+        message(FATAL_ERROR
+            "BROTENSOR_COVERAGE requires GCC or Clang (gcov instrumentation); MSVC is unsupported.")
+    endif()
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:--coverage>
+        $<$<COMPILE_LANGUAGE:CXX>:-O0>
+        $<$<COMPILE_LANGUAGE:CXX>:-g>
+    )
+    add_link_options(--coverage)
+    message(STATUS "brotensor: coverage instrumentation ON (core + CPU, -O0)")
+endif()
+
 # CPU-backend SIMD baseline. AVX2+FMA has been the safe floor for any
 # x86-64 machine capable of hosting a CUDA-class GPU dev box since ~2013 —
 # targeting it (vs. the compiler's default pre-AVX baseline) lets the

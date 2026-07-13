@@ -71,6 +71,9 @@ brotensor_add_test(brotensor_test_upfirdn2d test_upfirdn2d.cpp)
 brotensor_add_test(brotensor_test_modulated_conv2d test_modulated_conv2d.cpp)
 brotensor_add_test(brotensor_test_filtered_lrelu test_filtered_lrelu.cpp)
 brotensor_add_test(brotensor_test_stylegan_parity test_stylegan_parity.cpp)
+brotensor_add_test(brotensor_test_softmax_rows test_softmax_rows.cpp)
+brotensor_add_test(brotensor_test_add_channel_bias test_add_channel_bias.cpp)
+brotensor_add_test(brotensor_test_pixel_shuffle_upsample test_pixel_shuffle_upsample.cpp)
 
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)
@@ -143,6 +146,7 @@ if(BROTENSOR_HAS_GPU)
         pad2d slice2d unfold2d l2_normalize convex_upsample top_k pool2d gather_rows
         conv_transpose2d window_partition
         batch_norm image_preproc
+        softmax_rows add_channel_bias pixel_shuffle_upsample
     )
     foreach(_name IN LISTS _brotensor_parity_tests)
         brotensor_add_test(brotensor_test_${_name}_parity test_${_name}_parity.cpp)

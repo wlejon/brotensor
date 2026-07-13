@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 using brotensor::Tensor;
