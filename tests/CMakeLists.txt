@@ -74,6 +74,7 @@ brotensor_add_test(brotensor_test_stylegan_parity test_stylegan_parity.cpp)
 brotensor_add_test(brotensor_test_softmax_rows test_softmax_rows.cpp)
 brotensor_add_test(brotensor_test_add_channel_bias test_add_channel_bias.cpp)
 brotensor_add_test(brotensor_test_pixel_shuffle_upsample test_pixel_shuffle_upsample.cpp)
+brotensor_add_test(brotensor_test_layernorm_stability test_layernorm_stability.cpp)
 
 # Coverage-driven: the serializers' writer + error paths, the FP16/BF16 CPU
 # matmul_abt (whose only other test is GPU-gated), and the Tensor / dispatch

@@ -46,14 +46,22 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
         const float* xr = xp + static_cast<std::size_t>(row) * D;
         float* yr = yp + static_cast<std::size_t>(row) * D;
 
-        float sum = 0.0f, sumsq = 0.0f;
-        for (int i = 0; i < D; ++i) {
-            const float v = xr[i];
-            sum   += v;
-            sumsq += v * v;
-        }
+        // Two passes: mean, then the sum of squared deviations from it.
+        // E[x^2] - E[x]^2 is one pass but cancels catastrophically once a row's
+        // mean dominates its spread — a CLIP text row whose embedding sits near
+        // 395 has both terms at ~1.6e5 in FP32, so their difference is noise and
+        // lands negative about as often as not, making rstd NaN. Summing
+        // deviations keeps every term non-negative, so var cannot go negative.
+        float sum = 0.0f;
+        for (int i = 0; i < D; ++i) sum += xr[i];
         const float mean = sum * invD;
-        const float var  = sumsq * invD - mean * mean;
+
+        float sumsq = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            const float d = xr[i] - mean;
+            sumsq += d * d;
+        }
+        const float var  = sumsq * invD;
         const float rstd = 1.0f / std::sqrt(var + eps);
 
         for (int i = 0; i < D; ++i) {
@@ -108,14 +116,18 @@ void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
         float* yr = yp + static_cast<std::size_t>(row) * D;
         float* hr = hp + static_cast<std::size_t>(row) * D;
 
-        float sum = 0.0f, sumsq = 0.0f;
-        for (int i = 0; i < D; ++i) {
-            const float v = xr[i];
-            sum   += v;
-            sumsq += v * v;
-        }
+        // Two-pass variance, for the cancellation reason spelled out in
+        // layernorm_forward_inference_batched above.
+        float sum = 0.0f;
+        for (int i = 0; i < D; ++i) sum += xr[i];
         const float mean = sum * invD;
-        const float var  = sumsq * invD - mean * mean;
+
+        float sumsq = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            const float d = xr[i] - mean;
+            sumsq += d * d;
+        }
+        const float var  = sumsq * invD;
         const float rstd = 1.0f / std::sqrt(var + eps);
 
         mp[row] = mean;
