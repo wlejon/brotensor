@@ -1,6 +1,11 @@
 // ─── Metal 2D pooling: adaptive_avg_pool2d + max_pool2d ────────────────────
 //
-// Metal counterpart of src/cpu/pool2d.cpp. FP32-only.
+// Metal counterpart of src/cpu/pool2d.cpp / src/cuda/pool2d.cu.
+//
+// The two forward ops are dtype-dispatched on X (FP32/FP16/BF16 — Y matches;
+// the 16-bit paths accumulate / compare in FP32 and only round on the store,
+// and the max-pool Idx tensor stays INT32 regardless). The backward ops are
+// FP32-only, as on CUDA.
 //
 //   adaptive_avg_pool2d_forward  — Y OVERWRITTEN.
 //   adaptive_avg_pool2d_backward — dX OVERWRITTEN. Adjoint = scatter the
@@ -40,6 +45,14 @@ void req_fp32(const char* op, const Tensor& t, const char* name) {
     }
 }
 
+// Forward inputs accept the three arithmetic dtypes.
+void req_float(const char* op, const Tensor& t, const char* name) {
+    if (t.dtype != Dtype::FP32 && t.dtype != Dtype::FP16 &&
+        t.dtype != Dtype::BF16) {
+        fail(op, std::string(name) + " must be FP32, FP16 or BF16");
+    }
+}
+
 // ── Adaptive avg pool ──────────────────────────────────────────────────────
 
 struct AAPParams {
@@ -60,10 +73,10 @@ static inline void adapt(int o, int L, int L_out, thread int& start, thread int&
     if (start < 0) start = 0;
 }
 
-kernel void k_aap_forward(device const float* X [[buffer(0)]],
-                          device float*       Y [[buffer(1)]],
-                          constant AAPParams& P [[buffer(2)]],
-                          uint gid [[thread_position_in_grid]]) {
+kernel void k_aap_forward_fp32(device const float* X [[buffer(0)]],
+                               device float*       Y [[buffer(1)]],
+                               constant AAPParams& P [[buffer(2)]],
+                               uint gid [[thread_position_in_grid]]) {
     if (gid >= P.total) return;
     uint ow = gid % P.W_out;
     uint t1 = gid / P.W_out;
@@ -85,7 +98,58 @@ kernel void k_aap_forward(device const float* X [[buffer(0)]],
     Y[gid] = acc / float(area);
 }
 
-// backward: one thread per input pixel — gather adjoint.
+// FP32 accumulation, FP16 IO — only the final store rounds.
+kernel void k_aap_forward_fp16(device const half*  X [[buffer(0)]],
+                               device half*        Y [[buffer(1)]],
+                               constant AAPParams& P [[buffer(2)]],
+                               uint gid [[thread_position_in_grid]]) {
+    if (gid >= P.total) return;
+    uint ow = gid % P.W_out;
+    uint t1 = gid / P.W_out;
+    uint oh = t1 % P.H_out;
+    uint t2 = t1 / P.H_out;
+    uint c  = t2 % P.C;
+    uint n  = t2 / P.C;
+    int h0, h1, w0, w1;
+    adapt(int(oh), int(P.H), int(P.H_out), h0, h1);
+    adapt(int(ow), int(P.W), int(P.W_out), w0, w1);
+    int area = (h1 - h0) * (w1 - w0);
+    uint xbase = (n * P.C + c) * P.H * P.W;
+    float acc = 0.0f;
+    for (int h = h0; h < h1; ++h) {
+        for (int w = w0; w < w1; ++w) {
+            acc += float(X[xbase + uint(h) * P.W + uint(w)]);
+        }
+    }
+    Y[gid] = half(acc / float(area));
+}
+
+kernel void k_aap_forward_bf16(device const bfloat* X [[buffer(0)]],
+                               device bfloat*       Y [[buffer(1)]],
+                               constant AAPParams&  P [[buffer(2)]],
+                               uint gid [[thread_position_in_grid]]) {
+    if (gid >= P.total) return;
+    uint ow = gid % P.W_out;
+    uint t1 = gid / P.W_out;
+    uint oh = t1 % P.H_out;
+    uint t2 = t1 / P.H_out;
+    uint c  = t2 % P.C;
+    uint n  = t2 / P.C;
+    int h0, h1, w0, w1;
+    adapt(int(oh), int(P.H), int(P.H_out), h0, h1);
+    adapt(int(ow), int(P.W), int(P.W_out), w0, w1);
+    int area = (h1 - h0) * (w1 - w0);
+    uint xbase = (n * P.C + c) * P.H * P.W;
+    float acc = 0.0f;
+    for (int h = h0; h < h1; ++h) {
+        for (int w = w0; w < w1; ++w) {
+            acc += float(X[xbase + uint(h) * P.W + uint(w)]);
+        }
+    }
+    Y[gid] = bfloat(acc / float(area));
+}
+
+// backward: one thread per input pixel — gather adjoint. FP32-only.
 kernel void k_aap_backward(device const float* dY [[buffer(0)]],
                            device float*       dX [[buffer(1)]],
                            constant AAPParams& P  [[buffer(2)]],
@@ -147,11 +211,11 @@ struct MPParams {
     uint total;
 };
 
-kernel void k_mp_forward(device const float* X   [[buffer(0)]],
-                         device float*       Y   [[buffer(1)]],
-                         device int*         Idx [[buffer(2)]],
-                         constant MPParams&  P   [[buffer(3)]],
-                         uint gid [[thread_position_in_grid]]) {
+kernel void k_mp_forward_fp32(device const float* X   [[buffer(0)]],
+                              device float*       Y   [[buffer(1)]],
+                              device int*         Idx [[buffer(2)]],
+                              constant MPParams&  P   [[buffer(3)]],
+                              uint gid [[thread_position_in_grid]]) {
     if (gid >= P.total) return;
     uint ow = gid % P.W_out;
     uint t1 = gid / P.W_out;
@@ -182,7 +246,82 @@ kernel void k_mp_forward(device const float* X   [[buffer(0)]],
     Idx[gid] = best_i;
 }
 
-// backward: one thread per input pixel — gather adjoint. Scan every
+// FP32 compare, FP16 IO. The running max is a float and the sentinel is the
+// FP32 -inf: every candidate widens to FP32 losslessly, so the comparison
+// order (and hence Idx) matches the FP32 path bit-for-bit. Only the store
+// narrows — and it narrows a value that was already an exact FP16, so Y is
+// exact too. An all-padding window stores half(-inf), which is -inf in FP16.
+kernel void k_mp_forward_fp16(device const half*  X   [[buffer(0)]],
+                              device half*        Y   [[buffer(1)]],
+                              device int*         Idx [[buffer(2)]],
+                              constant MPParams&  P   [[buffer(3)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= P.total) return;
+    uint ow = gid % P.W_out;
+    uint t1 = gid / P.W_out;
+    uint oh = t1 % P.H_out;
+    uint t2 = t1 / P.H_out;
+    uint c  = t2 % P.C;
+    uint n  = t2 / P.C;
+
+    int h_base = int(oh) * P.stride_h - P.pad_h;
+    int w_base = int(ow) * P.stride_w - P.pad_w;
+    uint xbase = (n * P.C + c) * P.H * P.W;
+    float best_v = -INFINITY;
+    int best_i = -1;
+    for (int kh = 0; kh < P.kH; ++kh) {
+        int ih = h_base + kh;
+        if (ih < 0 || ih >= int(P.H)) continue;
+        for (int kw = 0; kw < P.kW; ++kw) {
+            int iw = w_base + kw;
+            if (iw < 0 || iw >= int(P.W)) continue;
+            float v = float(X[xbase + uint(ih) * P.W + uint(iw)]);
+            if (v > best_v) {
+                best_v = v;
+                best_i = ih * int(P.W) + iw;
+            }
+        }
+    }
+    Y[gid]   = half(best_v);
+    Idx[gid] = best_i;
+}
+
+kernel void k_mp_forward_bf16(device const bfloat* X   [[buffer(0)]],
+                              device bfloat*       Y   [[buffer(1)]],
+                              device int*          Idx [[buffer(2)]],
+                              constant MPParams&   P   [[buffer(3)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= P.total) return;
+    uint ow = gid % P.W_out;
+    uint t1 = gid / P.W_out;
+    uint oh = t1 % P.H_out;
+    uint t2 = t1 / P.H_out;
+    uint c  = t2 % P.C;
+    uint n  = t2 / P.C;
+
+    int h_base = int(oh) * P.stride_h - P.pad_h;
+    int w_base = int(ow) * P.stride_w - P.pad_w;
+    uint xbase = (n * P.C + c) * P.H * P.W;
+    float best_v = -INFINITY;
+    int best_i = -1;
+    for (int kh = 0; kh < P.kH; ++kh) {
+        int ih = h_base + kh;
+        if (ih < 0 || ih >= int(P.H)) continue;
+        for (int kw = 0; kw < P.kW; ++kw) {
+            int iw = w_base + kw;
+            if (iw < 0 || iw >= int(P.W)) continue;
+            float v = float(X[xbase + uint(ih) * P.W + uint(iw)]);
+            if (v > best_v) {
+                best_v = v;
+                best_i = ih * int(P.W) + iw;
+            }
+        }
+    }
+    Y[gid]   = bfloat(best_v);
+    Idx[gid] = best_i;
+}
+
+// backward: one thread per input pixel — gather adjoint. FP32-only. Scan every
 // (oh, ow) output (kernel geometry isn't carried into _backward) and sum
 // dY where Idx points back to this input pixel. O(H_out*W_out) per input.
 kernel void k_mp_backward(device const float* dY  [[buffer(0)]],
@@ -218,10 +357,14 @@ kernel void k_mp_backward(device const float* dY  [[buffer(0)]],
         dispatch_once(&once, ^{ pso = compile_pipeline(SRC, FN); });           \
         return pso;                                                            \
     }
-DEF_PSO(pso_aap_fwd, kAAP, @"k_aap_forward")
-DEF_PSO(pso_aap_bwd, kAAP, @"k_aap_backward")
-DEF_PSO(pso_mp_fwd,  kMP,  @"k_mp_forward")
-DEF_PSO(pso_mp_bwd,  kMP,  @"k_mp_backward")
+DEF_PSO(pso_aap_fwd_fp32, kAAP, @"k_aap_forward_fp32")
+DEF_PSO(pso_aap_fwd_fp16, kAAP, @"k_aap_forward_fp16")
+DEF_PSO(pso_aap_fwd_bf16, kAAP, @"k_aap_forward_bf16")
+DEF_PSO(pso_aap_bwd,      kAAP, @"k_aap_backward")
+DEF_PSO(pso_mp_fwd_fp32,  kMP,  @"k_mp_forward_fp32")
+DEF_PSO(pso_mp_fwd_fp16,  kMP,  @"k_mp_forward_fp16")
+DEF_PSO(pso_mp_fwd_bf16,  kMP,  @"k_mp_forward_bf16")
+DEF_PSO(pso_mp_bwd,       kMP,  @"k_mp_backward")
 #undef DEF_PSO
 
 void dispatch1d(id<MTLComputePipelineState> pso, NSUInteger total,
@@ -250,14 +393,14 @@ void adaptive_avg_pool2d_forward(const Tensor& X,
                                  int H_out, int W_out,
                                  Tensor& Y) {
     const char* op = "adaptive_avg_pool2d_forward";
-    req_fp32(op, X, "X");
+    req_float(op, X, "X");
     if (N < 0 || C < 1 || H < 1 || W < 1) fail(op, "C/H/W must be >=1 and N >=0");
     if (H_out < 1 || W_out < 1) fail(op, "H_out and W_out must be >= 1");
     if (X.rows != N || X.cols != C * H * W) fail(op, "X shape must be (N, C*H*W)");
 
     const int cols_out = C * H_out * W_out;
-    if (Y.rows != N || Y.cols != cols_out || Y.dtype != Dtype::FP32) {
-        Y.resize(N, cols_out, Dtype::FP32);
+    if (Y.rows != N || Y.cols != cols_out || Y.dtype != X.dtype) {
+        Y.resize(N, cols_out, X.dtype);
     }
     if (N == 0) return;
 
@@ -266,7 +409,11 @@ void adaptive_avg_pool2d_forward(const Tensor& X,
     p.H_out = H_out; p.W_out = W_out;
     p.total = static_cast<uint32_t>(N) * static_cast<uint32_t>(cols_out);
 
-    dispatch1d(pso_aap_fwd(), p.total, ^(id<MTLComputeCommandEncoder> enc) {
+    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_aap_fwd_fp16()
+                                    : (X.dtype == Dtype::BF16) ? pso_aap_fwd_bf16()
+                                                               : pso_aap_fwd_fp32();
+
+    dispatch1d(pso, p.total, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:buffer_for(X) offset:buffer_offset_for(X) atIndex:0];
         [enc setBuffer:buffer_for(Y) offset:buffer_offset_for(Y) atIndex:1];
         [enc setBytes:&p length:sizeof(AAPParams) atIndex:2];
@@ -310,7 +457,7 @@ void max_pool2d_forward(const Tensor& X,
                         int pad_h, int pad_w,
                         Tensor& Y, Tensor& Idx) {
     const char* op = "max_pool2d_forward";
-    req_fp32(op, X, "X");
+    req_float(op, X, "X");
     if (N < 0 || C < 1 || H < 1 || W < 1) fail(op, "C/H/W must be >=1 and N >=0");
     if (kH < 1 || kW < 1) fail(op, "kH and kW must be >= 1");
     if (stride_h < 1 || stride_w < 1) fail(op, "strides must be >= 1");
@@ -323,8 +470,8 @@ void max_pool2d_forward(const Tensor& X,
     const int H_out = (H + 2 * pad_h - kH) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - kW) / stride_w + 1;
     const int cols_out = C * H_out * W_out;
-    if (Y.rows != N || Y.cols != cols_out || Y.dtype != Dtype::FP32) {
-        Y.resize(N, cols_out, Dtype::FP32);
+    if (Y.rows != N || Y.cols != cols_out || Y.dtype != X.dtype) {
+        Y.resize(N, cols_out, X.dtype);
     }
     if (Idx.rows != N || Idx.cols != cols_out || Idx.dtype != Dtype::INT32) {
         Idx.resize(N, cols_out, Dtype::INT32);
@@ -339,7 +486,11 @@ void max_pool2d_forward(const Tensor& X,
     p.pad_h = pad_h; p.pad_w = pad_w;
     p.total = static_cast<uint32_t>(N) * static_cast<uint32_t>(cols_out);
 
-    dispatch1d(pso_mp_fwd(), p.total, ^(id<MTLComputeCommandEncoder> enc) {
+    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_mp_fwd_fp16()
+                                    : (X.dtype == Dtype::BF16) ? pso_mp_fwd_bf16()
+                                                               : pso_mp_fwd_fp32();
+
+    dispatch1d(pso, p.total, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:buffer_for(X)   offset:buffer_offset_for(X)   atIndex:0];
         [enc setBuffer:buffer_for(Y)   offset:buffer_offset_for(Y)   atIndex:1];
         [enc setBuffer:buffer_for(Idx) offset:buffer_offset_for(Idx) atIndex:2];

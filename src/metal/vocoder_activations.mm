@@ -6,6 +6,12 @@
 //   elu_forward / elu_backward             — EnCodec ELU
 //   leaky_relu_forward / leaky_relu_backward — HiFi-GAN leaky ReLU
 //
+// One exception to the FP32-only rule (mirrors the CUDA backend):
+// leaky_relu_forward is dtype-dispatched on x (FP32/FP16/BF16, FP32 math per
+// element) because the brovisionml annotators (HED / lineart / MLSD) lean on
+// it inside otherwise-FP16 conv stacks. Everything else here — including
+// leaky_relu_backward — still throws on a non-FP32 operand.
+//
 // ── Layout ──────────────────────────────────────────────────────────────────
 //   snake is per-channel over an NCL tensor: element (n, c, l) at flat index
 //   (n*C + c)*L + l. alpha / beta carry one scalar per channel c, broadcast
@@ -191,6 +197,26 @@ kernel void k_leaky_relu_forward(device const float* x  [[buffer(0)]],
     y[gid] = v > 0.0f ? v : P.param * v;
 }
 
+// FP16 / BF16 twins — same elementwise map, FP32 math per element, 16-bit IO
+// (the bf16 kernel is the fp16 one verbatim with half→bfloat).
+kernel void k_leaky_relu_forward_fp16(device const half*  x  [[buffer(0)]],
+                                      device half*        y  [[buffer(1)]],
+                                      constant ActParams& P  [[buffer(2)]],
+                                      uint gid [[thread_position_in_grid]]) {
+    if (gid >= P.total) return;
+    float v = float(x[gid]);
+    y[gid] = half(v > 0.0f ? v : P.param * v);
+}
+
+kernel void k_leaky_relu_forward_bf16(device const bfloat* x  [[buffer(0)]],
+                                      device bfloat*       y  [[buffer(1)]],
+                                      constant ActParams&  P  [[buffer(2)]],
+                                      uint gid [[thread_position_in_grid]]) {
+    if (gid >= P.total) return;
+    float v = float(x[gid]);
+    y[gid] = bfloat(v > 0.0f ? v : P.param * v);
+}
+
 kernel void k_leaky_relu_backward(device const float* x  [[buffer(0)]],
                                   device const float* dY [[buffer(1)]],
                                   device float*       dX [[buffer(2)]],
@@ -214,8 +240,10 @@ DEF_PSO(pso_snake_backward_dx,     @"k_snake_backward_dx")
 DEF_PSO(pso_snake_backward_params, @"k_snake_backward_params")
 DEF_PSO(pso_elu_forward,           @"k_elu_forward")
 DEF_PSO(pso_elu_backward,          @"k_elu_backward")
-DEF_PSO(pso_leaky_relu_forward,    @"k_leaky_relu_forward")
-DEF_PSO(pso_leaky_relu_backward,   @"k_leaky_relu_backward")
+DEF_PSO(pso_leaky_relu_forward,      @"k_leaky_relu_forward")
+DEF_PSO(pso_leaky_relu_forward_fp16, @"k_leaky_relu_forward_fp16")
+DEF_PSO(pso_leaky_relu_forward_bf16, @"k_leaky_relu_forward_bf16")
+DEF_PSO(pso_leaky_relu_backward,     @"k_leaky_relu_backward")
 #undef DEF_PSO
 
 // Encode + submit a 1-D-grid dispatch.
@@ -387,15 +415,26 @@ void elu_backward(const Tensor& x, const Tensor& dY, float alpha, Tensor& dX) {
 // ════════════════════════════════════════════════════════════════════════════
 //  leaky_relu
 // ════════════════════════════════════════════════════════════════════════════
+// The one dtype-dispatched op in this file: FP32 / FP16 / BF16 on x, y follows
+// x's dtype. Math is FP32 per element in every variant; only the load/store
+// width changes.
 void leaky_relu_forward(const Tensor& x, float negative_slope, Tensor& y) {
-    req_fp32("leaky_relu_forward", x, "x");
+    const char* op = "leaky_relu_forward";
+    if (x.dtype != Dtype::FP32 && x.dtype != Dtype::FP16 &&
+        x.dtype != Dtype::BF16) {
+        fail(op, "x must be FP32, FP16 or BF16");
+    }
     if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
         y.resize(x.rows, x.cols, x.dtype);
     }
     const int n = x.size();
     if (n == 0) return;
     ActParams p{static_cast<uint32_t>(n), negative_slope};
-    dispatch1d(pso_leaky_relu_forward(), static_cast<NSUInteger>(n),
+    id<MTLComputePipelineState> pso =
+        (x.dtype == Dtype::FP16) ? pso_leaky_relu_forward_fp16()
+      : (x.dtype == Dtype::BF16) ? pso_leaky_relu_forward_bf16()
+                                 : pso_leaky_relu_forward();
+    dispatch1d(pso, static_cast<NSUInteger>(n),
                ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:buffer_for(x) offset:buffer_offset_for(x) atIndex:0];
         [enc setBuffer:buffer_for(y) offset:buffer_offset_for(y) atIndex:1];

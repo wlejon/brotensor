@@ -1,4 +1,4 @@
-// Metal BatchNorm (NCHW, FP32-only — matches CPU / CUDA contract).
+// Metal BatchNorm (NCHW — matches CPU / CUDA contract).
 //
 // Three slots, all reducing over (N, H, W) per channel:
 //
@@ -6,11 +6,14 @@
 //                           writes Y, updates running_mean / running_var
 //                           in place (PyTorch convention; running_var uses
 //                           the unbiased estimator). Saves batch mean and
-//                           rstd for the backward pass.
+//                           rstd for the backward pass. FP32-only.
 //   batch_norm_inference  — applies the affine using running stats; no state
-//                           mutation.
+//                           mutation. Dtype-dispatched on X (FP32/FP16/BF16 —
+//                           the per-channel params must match X, FP32 math per
+//                           element, Y resized to X's dtype). The training
+//                           forward and the backward stay FP32-only.
 //   batch_norm_backward   — caller zeros dX / dGamma / dBeta; op overwrites
-//                           dX and accumulates into dGamma / dBeta.
+//                           dX and accumulates into dGamma / dBeta. FP32-only.
 //
 // Kernel layout: one threadgroup per channel (BN_BLOCK threads), threads
 // cooperate over the M = N*spatial elements of that channel scattered
@@ -121,7 +124,10 @@ kernel void k_bn_forward(
     }
 }
 
-kernel void k_bn_inference(
+// Inference is dtype-dispatched (FP32 / FP16 / BF16). One threadgroup per
+// channel; the per-channel affine (a, b) is folded once in FP32 and applied
+// per element — FP32 math throughout, 16-bit only for IO.
+kernel void k_bn_inference_fp32(
         device const float* X            [[buffer(0)]],
         device const float* gamma        [[buffer(1)]],
         device const float* beta         [[buffer(2)]],
@@ -146,6 +152,65 @@ kernel void k_bn_inference(
         device       float* y_chan = Y + (n * C + c) * spatial;
         for (uint s = tid; s < spatial; s += tg_size) {
             y_chan[s] = x_chan[s] * a + b;
+        }
+    }
+}
+
+kernel void k_bn_inference_fp16(
+        device const half*  X            [[buffer(0)]],
+        device const half*  gamma        [[buffer(1)]],
+        device const half*  beta         [[buffer(2)]],
+        device const half*  running_mean [[buffer(3)]],
+        device const half*  running_var  [[buffer(4)]],
+        device half*        Y            [[buffer(5)]],
+        constant uint& N        [[buffer(6)]],
+        constant uint& C        [[buffer(7)]],
+        constant uint& spatial  [[buffer(8)]],
+        constant float& eps     [[buffer(9)]],
+        uint3 gid   [[threadgroup_position_in_grid]],
+        uint3 tid3  [[thread_position_in_threadgroup]],
+        uint3 tgs3  [[threads_per_threadgroup]]) {
+    const uint c = gid.x;
+    const uint tid = tid3.x;
+    const uint tg_size = tgs3.x;
+    float inv = rsqrt(float(running_var[c]) + eps);
+    float a = float(gamma[c]) * inv;
+    float b = float(beta[c]) - float(running_mean[c]) * a;
+    for (uint n = 0; n < N; ++n) {
+        device const half* x_chan = X + (n * C + c) * spatial;
+        device       half* y_chan = Y + (n * C + c) * spatial;
+        for (uint s = tid; s < spatial; s += tg_size) {
+            y_chan[s] = half(float(x_chan[s]) * a + b);
+        }
+    }
+}
+
+// BF16 kernel — verbatim copy of the FP16 one with half→bfloat.
+kernel void k_bn_inference_bf16(
+        device const bfloat* X            [[buffer(0)]],
+        device const bfloat* gamma        [[buffer(1)]],
+        device const bfloat* beta         [[buffer(2)]],
+        device const bfloat* running_mean [[buffer(3)]],
+        device const bfloat* running_var  [[buffer(4)]],
+        device bfloat*       Y            [[buffer(5)]],
+        constant uint& N        [[buffer(6)]],
+        constant uint& C        [[buffer(7)]],
+        constant uint& spatial  [[buffer(8)]],
+        constant float& eps     [[buffer(9)]],
+        uint3 gid   [[threadgroup_position_in_grid]],
+        uint3 tid3  [[thread_position_in_threadgroup]],
+        uint3 tgs3  [[threads_per_threadgroup]]) {
+    const uint c = gid.x;
+    const uint tid = tid3.x;
+    const uint tg_size = tgs3.x;
+    float inv = rsqrt(float(running_var[c]) + eps);
+    float a = float(gamma[c]) * inv;
+    float b = float(beta[c]) - float(running_mean[c]) * a;
+    for (uint n = 0; n < N; ++n) {
+        device const bfloat* x_chan = X + (n * C + c) * spatial;
+        device       bfloat* y_chan = Y + (n * C + c) * spatial;
+        for (uint s = tid; s < spatial; s += tg_size) {
+            y_chan[s] = bfloat(float(x_chan[s]) * a + b);
         }
     }
 }
@@ -234,9 +299,11 @@ kernel void k_bn_backward(
         dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, FN); }); \
         return pso; \
     }
-DEF_PSO(pso_bn_forward,   @"k_bn_forward")
-DEF_PSO(pso_bn_inference, @"k_bn_inference")
-DEF_PSO(pso_bn_backward,  @"k_bn_backward")
+DEF_PSO(pso_bn_forward,        @"k_bn_forward")
+DEF_PSO(pso_bn_inference_fp32, @"k_bn_inference_fp32")
+DEF_PSO(pso_bn_inference_fp16, @"k_bn_inference_fp16")
+DEF_PSO(pso_bn_inference_bf16, @"k_bn_inference_bf16")
+DEF_PSO(pso_bn_backward,       @"k_bn_backward")
 #undef DEF_PSO
 
 inline void check_fp32(const ::brotensor::Tensor& t,
@@ -345,11 +412,20 @@ void batch_norm_inference(const Tensor& X,
                           int N, int C, int H, int W,
                           float eps,
                           Tensor& Y) {
-    check_fp32(X,            "batch_norm_inference", "X");
-    check_fp32(gamma,        "batch_norm_inference", "gamma");
-    check_fp32(beta,         "batch_norm_inference", "beta");
-    check_fp32(running_mean, "batch_norm_inference", "running_mean");
-    check_fp32(running_var,  "batch_norm_inference", "running_var");
+    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16 &&
+        X.dtype != Dtype::BF16) {
+        throw std::runtime_error(
+            "brotensor: batch_norm_inference: X must be FP32, FP16 or BF16");
+    }
+    // Mirror conv2d: the per-channel params must carry X's dtype so the
+    // kernel reads one element type throughout (FP32 math per element).
+    for (const auto* t : {&gamma, &beta, &running_mean, &running_var}) {
+        if (t->dtype != X.dtype) {
+            throw std::runtime_error(
+                "brotensor: batch_norm_inference: "
+                "gamma/beta/running_mean/running_var dtype must match X");
+        }
+    }
     check_per_channel(gamma,        C, "batch_norm_inference", "gamma");
     check_per_channel(beta,         C, "batch_norm_inference", "beta");
     check_per_channel(running_mean, C, "batch_norm_inference", "running_mean");
@@ -357,14 +433,19 @@ void batch_norm_inference(const Tensor& X,
 
     const int spatial = H * W;
     const int cols = C * spatial;
-    if (Y.rows != N || Y.cols != cols || Y.dtype != Dtype::FP32) {
-        Y.resize(N, cols, Dtype::FP32);
+    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) {
+        Y.resize(N, cols, X.dtype);
     }
     if (N == 0 || cols == 0) return;
 
     const uint32_t Nu = static_cast<uint32_t>(N);
     const uint32_t Cu = static_cast<uint32_t>(C);
     const uint32_t Su = static_cast<uint32_t>(spatial);
+
+    id<MTLComputePipelineState> pso =
+        (X.dtype == Dtype::FP16) ? pso_bn_inference_fp16()
+      : (X.dtype == Dtype::BF16) ? pso_bn_inference_bf16()
+                                 : pso_bn_inference_fp32();
 
     id<MTLBuffer> bX  = buffer_for(X);
     id<MTLBuffer> bG  = buffer_for(gamma);
@@ -382,7 +463,7 @@ void batch_norm_inference(const Tensor& X,
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = new_command_buffer();
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso_bn_inference()];
+        [enc setComputePipelineState:pso];
         [enc setBuffer:bX  offset:oX  atIndex:0];
         [enc setBuffer:bG  offset:oG  atIndex:1];
         [enc setBuffer:bB  offset:oB  atIndex:2];
