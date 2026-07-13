@@ -1,7 +1,6 @@
 # brotensor
 
 [![CI](https://github.com/wlejon/brotensor/actions/workflows/ci.yml/badge.svg)](https://github.com/wlejon/brotensor/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/wlejon/brotensor/branch/main/graph/badge.svg)](https://codecov.io/gh/wlejon/brotensor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A C++20 tensor + ops library with **one tensor type** and **three interchangeable backends** — CPU (always built), CUDA, and Metal (both optional). Every op is device-neutral: you write
@@ -65,7 +64,7 @@ int main() {
 
 ## Build
 
-Requires CMake ≥ 3.24 and a C++20 compiler. CUDA additionally needs the CUDA Toolkit (nvcc); Metal needs the Apple toolchain.
+Requires CMake ≥ 3.24 and a C++20 compiler. CUDA additionally needs the CUDA Toolkit (nvcc); Metal needs the Apple toolchain and **macOS 15 or newer** — the backend builds offset-backed `MPSGraphTensorData` via `-[MPSNDArray initWithBuffer:offset:descriptor:]`, which the macOS 14 SDK does not declare.
 
 ```bash
 # CPU-only (any OS)
@@ -104,7 +103,7 @@ gcovr --root . --filter src/ --exclude src/cuda/ --exclude src/metal/ --print-su
 
 The GPU backends are compiled by nvcc / the Apple toolchain and aren't gcov-instrumented, so they're excluded rather than counted as 0%.
 
-**CI.** GitHub Actions builds and tests the CPU tier on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64; builds the Metal backend on macOS and the CUDA backend on Linux (compile-only — hosted runners have no GPU); and publishes a coverage report. GPU parity *runs* happen on real hardware, off CI.
+**CI.** GitHub Actions builds and tests the CPU tier on Linux (GCC + Clang), Windows (MSVC) and macOS/arm64; builds *and runs* the Metal backend on macOS (the hosted runner has a real Metal device, so CPU↔Metal parity is verified on every push); and compiles the CUDA backend on Linux — compile-only, since hosted runners have no NVIDIA GPU, so CUDA parity runs on real hardware off CI. The coverage numbers land in each run's job summary, with the line-by-line HTML report attached as a build artifact.
 
 ## Documentation
 
