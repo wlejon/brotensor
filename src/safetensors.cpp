@@ -767,7 +767,14 @@ void write_file(const std::string& path, const std::vector<WriteEntry>& entries)
     FILE* fp = nullptr;
     fopen_s(&fp, path.c_str(), "wb");
 #else
-    FILE* fp = std::fopen(path.c_str(), "wb");
+    // open(..., 0644) rather than fopen: fopen requests 0666 and leans on the
+    // caller's umask to take the write bits back off. A process that has
+    // cleared its umask — a daemon, a container entrypoint — then writes a
+    // world-writable checkpoint, which anyone on the box can swap under us.
+    // Ask for 0644 outright; umask can only ever narrow it further.
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    FILE* fp = (fd < 0) ? nullptr : ::fdopen(fd, "wb");
+    if (fd >= 0 && !fp) ::close(fd);  // fdopen failed: the fd is still ours
 #endif
     if (!fp) throw std::runtime_error("safetensors::write: cannot open '" + path + "'");
 
