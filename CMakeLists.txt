@@ -10,6 +10,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Build every backend static lib position-independent. Consumers vendor this
+# repo and sometimes link the archives into a shared object (e.g. a Python
+# extension module or a plugin .so); without PIC the CPU pool's thread-local
+# `t_active` emits a local-exec TLS relocation (R_X86_64_TPOFF32) that the
+# linker rejects when the archive lands in a shared object. Scoped to this
+# directory's targets — it does not leak to a parent that add_subdirectory()s us.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
