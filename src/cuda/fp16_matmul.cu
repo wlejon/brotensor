@@ -64,6 +64,102 @@ static constexpr int FRAGS_N = WN / WMMA_N;  // 2
 static constexpr int LDA_SMEM = BK + 8;   // for A tile (BM rows, BK cols)
 static constexpr int LDB_SMEM = BK + 8;   // for B tile (BN rows, BK cols)
 
+// One thread's share of a K-slab, as int4s (8 x 16-bit each).
+static constexpr int A_SLAB_REGS = (BM * BK / 8) / THREADS_PER_CTA;  // 2
+static constexpr int B_SLAB_REGS = (BN * BK / 8) / THREADS_PER_CTA;  // 2
+
+// Register-staged software prefetch. The single-buffered kernel stalled on each
+// slab's global load between the two __syncthreads. Here the next slab's GLOBAL
+// reads are issued (into registers) *before* the WMMA compute, so the (long) HBM
+// latency overlaps the tensor-core math; the fast register->shared deposit then
+// happens at the top of the next iteration. Shared memory stays single-buffered
+// (occupancy is unchanged — doubling the shared tiles measured slower here, the
+// GEMMs being occupancy/concurrency-bound), and the mma_sync order is identical,
+// so results are bit-for-bit the same.
+template <typename T>
+__device__ __forceinline__ void abt_prefetch_A(
+    int4 (&a_reg)[A_SLAB_REGS], const T* __restrict__ A,
+    int M, int K, int k0, int block_m, int tid) {
+    using TR = abt_traits<T>;
+    constexpr int kEPL = 8;
+    #pragma unroll
+    for (int li = 0; li < A_SLAB_REGS; ++li) {
+        const int lin = tid + li * THREADS_PER_CTA;
+        const int row = lin / (BK / kEPL);
+        const int gcol = (lin % (BK / kEPL)) * kEPL;
+        const int grow = block_m + row;
+        const int gk   = k0 + gcol;
+        T tmp[kEPL];
+        if (grow < M && gk + kEPL <= K) {
+            *reinterpret_cast<int4*>(tmp) =
+                *reinterpret_cast<const int4*>(&A[grow * K + gk]);
+        } else {
+            #pragma unroll
+            for (int q = 0; q < kEPL; ++q) {
+                const int gk_q = gk + q;
+                tmp[q] = (grow < M && gk_q < K) ? A[grow * K + gk_q]
+                                                : TR::from_f32(0.0f);
+            }
+        }
+        a_reg[li] = *reinterpret_cast<int4*>(tmp);
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ void abt_prefetch_B(
+    int4 (&b_reg)[B_SLAB_REGS], const T* __restrict__ B,
+    int N, int K, int k0, int block_n, int tid) {
+    using TR = abt_traits<T>;
+    constexpr int kEPL = 8;
+    #pragma unroll
+    for (int li = 0; li < B_SLAB_REGS; ++li) {
+        const int lin = tid + li * THREADS_PER_CTA;
+        const int row = lin / (BK / kEPL);
+        const int gcol = (lin % (BK / kEPL)) * kEPL;
+        const int grow = block_n + row;
+        const int gk   = k0 + gcol;
+        T tmp[kEPL];
+        if (grow < N && gk + kEPL <= K) {
+            *reinterpret_cast<int4*>(tmp) =
+                *reinterpret_cast<const int4*>(&B[grow * K + gk]);
+        } else {
+            #pragma unroll
+            for (int q = 0; q < kEPL; ++q) {
+                const int gk_q = gk + q;
+                tmp[q] = (grow < N && gk_q < K) ? B[grow * K + gk_q]
+                                                : TR::from_f32(0.0f);
+            }
+        }
+        b_reg[li] = *reinterpret_cast<int4*>(tmp);
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ void abt_deposit_A(
+    const int4 (&a_reg)[A_SLAB_REGS], T As[BM][LDA_SMEM], int tid) {
+    constexpr int kEPL = 8;
+    #pragma unroll
+    for (int li = 0; li < A_SLAB_REGS; ++li) {
+        const int lin = tid + li * THREADS_PER_CTA;
+        const int row = lin / (BK / kEPL);
+        const int gcol = (lin % (BK / kEPL)) * kEPL;
+        *reinterpret_cast<int4*>(&As[row][gcol]) = a_reg[li];
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ void abt_deposit_B(
+    const int4 (&b_reg)[B_SLAB_REGS], T Bs[BN][LDB_SMEM], int tid) {
+    constexpr int kEPL = 8;
+    #pragma unroll
+    for (int li = 0; li < B_SLAB_REGS; ++li) {
+        const int lin = tid + li * THREADS_PER_CTA;
+        const int row = lin / (BK / kEPL);
+        const int gcol = (lin % (BK / kEPL)) * kEPL;
+        *reinterpret_cast<int4*>(&Bs[row][gcol]) = b_reg[li];
+    }
+}
+
 // Optional epilogue (bias + activation) is fused into the global store stage:
 // `bias` (length N, broadcast over rows) is added and `act` applied in-register
 // before writing C, so a linear-forward needs neither a separate bias-add nor a
@@ -108,86 +204,32 @@ __global__ void matmul_ABT_wmma_kernel(const T* __restrict__ A,
         }
     }
 
-    // Loop over K dimension in chunks of BK.
+    // K loop with register-staged prefetch: the next slab's global reads are
+    // hoisted ahead of the WMMA math so HBM latency overlaps the tensor cores.
+    // Shared memory is single-buffered (occupancy preserved); the mma_sync order
+    // is unchanged, so the FP32 accumulation is bit-for-bit identical.
+    int4 a_reg[A_SLAB_REGS];
+    int4 b_reg[B_SLAB_REGS];
+    abt_prefetch_A<T>(a_reg, A, M, K, 0, block_m, tid);
+    abt_prefetch_B<T>(b_reg, B, N, K, 0, block_n, tid);
+
     for (int k0 = 0; k0 < K; k0 += BK) {
-        // ---- Load A tile (BM x BK) ----
-        // Vectorized: each thread loads 8 elements (one int4 = 16 bytes) per iter.
-        // Both __half and __nv_bfloat16 are 16-bit, so 8 pack into one int4.
-        {
-            constexpr int kElemsPerLoad = 8;  // int4 = 8 x 16-bit
-            constexpr int kTotalElems    = BM * BK;
-            constexpr int kLoadsTotal    = kTotalElems / kElemsPerLoad;  // 256
-            constexpr int kLoadsPerThr   = kLoadsTotal / THREADS_PER_CTA;  // 2
-
-            #pragma unroll
-            for (int li = 0; li < kLoadsPerThr; ++li) {
-                const int lin = tid + li * THREADS_PER_CTA;  // 0..kLoadsTotal-1
-                const int row = lin / (BK / kElemsPerLoad); // BK/8 = 4 loads per row
-                const int col_grp = lin % (BK / kElemsPerLoad);
-                const int gcol = col_grp * kElemsPerLoad;
-                const int grow = block_m + row;
-                const int gk   = k0 + gcol;
-
-                T tmp[kElemsPerLoad];
-                if (grow < M && gk + kElemsPerLoad <= K) {
-                    const int4* src = reinterpret_cast<const int4*>(&A[grow * K + gk]);
-                    *reinterpret_cast<int4*>(tmp) = *src;
-                } else {
-                    #pragma unroll
-                    for (int q = 0; q < kElemsPerLoad; ++q) {
-                        int gk_q = gk + q;
-                        if (grow < M && gk_q < K) {
-                            tmp[q] = A[grow * K + gk_q];
-                        } else {
-                            tmp[q] = TR::from_f32(0.0f);
-                        }
-                    }
-                }
-                *reinterpret_cast<int4*>(&As[row][gcol]) = *reinterpret_cast<int4*>(tmp);
-            }
-        }
-
-        // ---- Load B tile (BN x BK) ----
-        {
-            constexpr int kElemsPerLoad = 8;
-            constexpr int kTotalElems    = BN * BK;
-            constexpr int kLoadsTotal    = kTotalElems / kElemsPerLoad;
-            constexpr int kLoadsPerThr   = kLoadsTotal / THREADS_PER_CTA;
-
-            #pragma unroll
-            for (int li = 0; li < kLoadsPerThr; ++li) {
-                const int lin = tid + li * THREADS_PER_CTA;
-                const int row = lin / (BK / kElemsPerLoad);
-                const int col_grp = lin % (BK / kElemsPerLoad);
-                const int gcol = col_grp * kElemsPerLoad;
-                const int grow = block_n + row;
-                const int gk   = k0 + gcol;
-
-                T tmp[kElemsPerLoad];
-                if (grow < N && gk + kElemsPerLoad <= K) {
-                    const int4* src = reinterpret_cast<const int4*>(&B[grow * K + gk]);
-                    *reinterpret_cast<int4*>(tmp) = *src;
-                } else {
-                    #pragma unroll
-                    for (int q = 0; q < kElemsPerLoad; ++q) {
-                        int gk_q = gk + q;
-                        if (grow < N && gk_q < K) {
-                            tmp[q] = B[grow * K + gk_q];
-                        } else {
-                            tmp[q] = TR::from_f32(0.0f);
-                        }
-                    }
-                }
-                *reinterpret_cast<int4*>(&Bs[row][gcol]) = *reinterpret_cast<int4*>(tmp);
-            }
-        }
-
+        // Deposit the slab prefetched last iteration, then publish it.
+        abt_deposit_A<T>(a_reg, As, tid);
+        abt_deposit_B<T>(b_reg, Bs, tid);
         __syncthreads();
 
+        // Issue the next slab's global loads BEFORE compute so they overlap.
+        const int k_next = k0 + BK;
+        if (k_next < K) {
+            abt_prefetch_A<T>(a_reg, A, M, K, k_next, block_m, tid);
+            abt_prefetch_B<T>(b_reg, B, N, K, k_next, block_n, tid);
+        }
+
         // ---- Compute on shared mem tiles ----
-        // A frag: row_major from As, leading dim LDA_SMEM, sub-tile starts at (warp_m*WM, kk).
-        // B frag: col_major from Bs (which is BN-rows by BK-cols row-major) -> viewed as
-        //        (BK x BN) col_major with leading dim LDB_SMEM, sub-tile at (kk, warp_n*WN).
+        // A frag: row_major from As, leading dim LDA_SMEM, sub-tile at (warp_m*WM, kk).
+        // B frag: col_major view of Bs (BN-rows by BK-cols row-major) -> (BK x BN),
+        //        sub-tile at (kk, warp_n*WN).
         #pragma unroll
         for (int kk = 0; kk < BK; kk += WMMA_K) {
             wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, T, wmma::row_major> a_frag[FRAGS_M];
@@ -200,9 +242,6 @@ __global__ void matmul_ABT_wmma_kernel(const T* __restrict__ A,
             }
             #pragma unroll
             for (int j = 0; j < FRAGS_N; ++j) {
-                // col_major view of Bs: element (kk_row, n_col) lives at Bs[n_col][kk_row].
-                // Sub-tile origin (row=kk in K, col=warp_n*WN+j*WMMA_N in N) =>
-                // pointer = &Bs[warp_n*WN + j*WMMA_N][kk]; leading dim = LDB_SMEM.
                 const T* b_ptr = &Bs[warp_n * WN + j * WMMA_N][kk];
                 wmma::load_matrix_sync(b_frag[j], b_ptr, LDB_SMEM);
             }
