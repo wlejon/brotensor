@@ -126,6 +126,8 @@ if(BROTENSOR_HAS_GPU)
     brotensor_add_test(brotensor_test_int8_attention test_int8_attention.cpp)
     if(BROTENSOR_WITH_CUDA)
         brotensor_add_test(brotensor_test_streams test_streams.cpp)
+        # Hand-run microbench for the plain FP16 matmul WMMA path (not a ctest).
+        brotensor_add_executable(brotensor_bench_matmul_rm bench_matmul_rm.cpp)
     endif()
 
     # CPU↔GPU parity (GPU-only).
