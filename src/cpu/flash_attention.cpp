@@ -449,6 +449,50 @@ void flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
                    /*group=*/num_heads / n_kv);
 }
 
+// ─── flash_attention_gqa_forward ───────────────────────────────────────────
+//
+// GQA generalisation of flash_attention_forward, causal OR bidirectional. Q is
+// num_q_heads-wide, K/V are num_kv_heads-wide (GQA group = num_q_heads/num_kv_heads;
+// equal == MHA). causal == false attends every key (the bidirectional encoder
+// prefill). attention_core already carries the group mapping, the causal flag,
+// and the key mask, so this is a validate-and-dispatch shim — q_offset is 0
+// because the queries occupy positions [0, Lq) (Lq == Lk when causal).
+void flash_attention_gqa_forward(const ::brotensor::Tensor& Q,
+                                 const ::brotensor::Tensor& K,
+                                 const ::brotensor::Tensor& V,
+                                 const float* d_mask,
+                                 int num_q_heads,
+                                 int num_kv_heads,
+                                 bool causal,
+                                 ::brotensor::Tensor& O) {
+    const int Lq  = Q.rows;
+    const int Lk  = K.rows;
+    const int Dq  = Q.cols;        // num_q_heads * head_dim
+    const int Dkv = K.cols;        // num_kv_heads * head_dim
+    if (num_q_heads <= 0 || num_kv_heads <= 0)
+        throw std::runtime_error("flash_attention_gqa_forward: head counts must be positive");
+    if (Dq % num_q_heads != 0)
+        throw std::runtime_error("flash_attention_gqa_forward: num_q_heads must divide Q.cols");
+    const int head_dim = Dq / num_q_heads;
+    if (V.cols != Dkv || V.rows != Lk)
+        throw std::runtime_error("flash_attention_gqa_forward: shape mismatch");
+    if (Dkv != num_kv_heads * head_dim)
+        throw std::runtime_error("flash_attention_gqa_forward: K/V width must be num_kv_heads*head_dim");
+    if (num_q_heads % num_kv_heads != 0)
+        throw std::runtime_error("flash_attention_gqa_forward: num_kv_heads must divide num_q_heads");
+    if (Lk < Lq)
+        throw std::runtime_error("flash_attention_gqa_forward: requires Lk >= Lq");
+    if (causal && Lq != Lk)
+        throw std::runtime_error("flash_attention_gqa_forward: causal requires Lq == Lk");
+    ensure_f32(O, Lq, Dq);
+    if (Lq == 0 || Lk == 0 || Dq == 0) return;
+
+    attention_core(Q.host_f32(), K.host_f32(), V.host_f32(), d_mask,
+                   Lq, Lk, Dq, num_q_heads, causal, O.host_f32_mut(),
+                   /*P=*/nullptr, /*window=*/0, /*q_offset=*/0, Dkv,
+                   /*group=*/num_q_heads / num_kv_heads);
+}
+
 // ─── flash_attention_varlen_forward ────────────────────────────────────────
 //
 // Packed variable-length attention (Qwen3-VL window attention). Q/K/V are one

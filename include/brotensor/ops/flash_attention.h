@@ -26,6 +26,29 @@ void flash_attention_forward(const Tensor& Q,
                              Tensor& O);
 
 
+// GQA generalisation of flash_attention_forward: grouped-query self-attention
+// over pre-projected Q/K/V, causal OR bidirectional. Q carries num_q_heads,
+// K/V carry num_kv_heads (num_kv_heads must divide num_q_heads; equal == plain
+// MHA). causal == false is full bidirectional attention over all Lk keys — the
+// encoder prefill a bidirectional-ified decoder needs (LLM2Vec). causal == true
+// reproduces flash_attention_forward's causal mask with GQA (requires Lq == Lk).
+// Tiled online softmax, FP16/BF16/FP32, FP32 accumulation; shares the windowed
+// kernel's GQA + key-mask machinery.
+//   Q: (Lq, num_q_heads*head_dim);  K, V: (Lk, num_kv_heads*head_dim).
+//   d_mask: optional length-Lk FP32 key mask (1 valid / 0 invalid); may be null.
+//   num_kv_heads divides num_q_heads; head_dim = Q.cols/num_q_heads must equal
+//     K.cols/num_kv_heads.  Lk >= Lq; causal additionally requires Lq == Lk.
+//   O: (Lq, num_q_heads*head_dim), same dtype as Q, resized as needed.
+void flash_attention_gqa_forward(const Tensor& Q,
+                                 const Tensor& K,
+                                 const Tensor& V,
+                                 const float* d_mask,
+                                 int num_q_heads,
+                                 int num_kv_heads,
+                                 bool causal,
+                                 Tensor& O);
+
+
 // Sliding-window causal self-attention (FP32, inference-only) — the local
 // attention of streaming neural codecs (e.g. Qwen3-TTS / Mimi) and the
 // autoregressive decode step. Q, K, V already projected, (L, num_heads*head_dim).

@@ -143,7 +143,7 @@ if(BROTENSOR_HAS_GPU)
         conv2d deform_conv2d conv3d group_norm
         resample transpose diffusion kv_cache
         cross_attention self_attention self_attention_decomposed_rel_pos attention_moments
-        flash_attention flash_attention_varlen flash_attention_varlen_backward resblock
+        flash_attention flash_attention_gqa flash_attention_varlen flash_attention_varlen_backward resblock
         spatial_merge patch_unpack rope_mrope
         batched_backward tensor_ops
         modulate

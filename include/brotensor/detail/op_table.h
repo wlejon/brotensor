@@ -316,6 +316,8 @@
     /* ─── Flash attention family ─── */                                                                                                                                \
     X(flash_attention_forward,                 void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
                                                        const float* d_mask, int num_heads, bool causal, ::brotensor::Tensor& O))                                        \
+    X(flash_attention_gqa_forward,             void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
+                                                       const float* d_mask, int num_q_heads, int num_kv_heads, bool causal, ::brotensor::Tensor& O))                    \
     X(flash_attention_windowed_forward,        void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
                                                        const float* d_mask, int num_heads, int window, ::brotensor::Tensor& O))                                         \
     X(flash_attention_varlen_forward,          void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \

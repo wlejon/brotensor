@@ -34,7 +34,7 @@ constexpr NSUInteger FAW_KTILE = 64;
 struct WinParams {
     uint32_t Lk, Dq, Dkv, head_dim;
     int32_t  window;
-    uint32_t q_offset, group, has_mask;
+    uint32_t q_offset, group, has_mask, causal;
 };
 
 NSString* const kSrc = @R"msl(
@@ -48,7 +48,7 @@ constant uint MAX_HD_PER_THREAD = 8;
 struct WinParams {
     uint Lk, Dq, Dkv, head_dim;
     int  window;
-    uint q_offset, group, has_mask;
+    uint q_offset, group, has_mask, causal;
 };
 
 // Online-softmax core. One threadgroup per (q, head). scores[] holds one
@@ -70,7 +70,8 @@ static inline void flash_windowed_core(device const T* Q,
     const int aq = int(q) + int(p.q_offset);                 // absolute causal pos
     int lo = (p.window > 0) ? (aq - p.window + 1) : 0;
     if (lo < 0) lo = 0;
-    const int k_hi = aq;                                      // inclusive upper bound
+    // causal: query attends keys [lo, aq]; bidirectional: every key [0, Lk).
+    const int k_hi = (p.causal != 0u) ? aq : (int(p.Lk) - 1);
 
     float run_max = -1e30f;
     float run_sum = 0.0f;
@@ -246,6 +247,7 @@ void flash_attention_windowed_forward(const Tensor& Q,
     p.q_offset = static_cast<uint32_t>(Lk - Lq);
     p.group    = static_cast<uint32_t>(num_heads / n_kv);
     p.has_mask = d_mask ? 1u : 0u;
+    p.causal   = 1u;
 
     id<MTLComputePipelineState> pso =
         (dt == Dtype::BF16) ? pso_bf16()
@@ -272,6 +274,92 @@ void flash_attention_windowed_forward(const Tensor& Q,
         [enc setBuffer:bO offset:oO atIndex:4];
         [enc setBytes:&p length:sizeof(WinParams) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(Lq, num_heads, 1)
+            threadsPerThreadgroup:MTLSizeMake(FAW_BLOCK, 1, 1)];
+        [enc endEncoding];
+        ::brotensor::metal_impl::submit(cmd);
+    }
+}
+
+// ─── flash_attention_gqa_forward ───────────────────────────────────────────
+//
+// GQA generalisation of flash_attention_forward, causal OR bidirectional, on the
+// same windowed kernel (window disabled, causal flag threaded through WinParams).
+// Q is num_q_heads-wide, K/V num_kv_heads-wide; causal == false attends every
+// key — the bidirectional encoder prefill. FP16 / BF16 / FP32.
+void flash_attention_gqa_forward(const Tensor& Q,
+                                 const Tensor& K,
+                                 const Tensor& V,
+                                 const float* d_mask,
+                                 int num_q_heads,
+                                 int num_kv_heads,
+                                 bool causal,
+                                 Tensor& O) {
+    const Dtype dt = Q.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16 && dt != Dtype::FP32)
+        throw std::runtime_error("flash_attention_gqa_forward: Q, K, V must be FP16, BF16, or FP32");
+    if (K.dtype != dt || V.dtype != dt)
+        throw std::runtime_error("flash_attention_gqa_forward: Q, K, V dtype must match");
+    if (num_q_heads <= 0 || num_kv_heads <= 0)
+        throw std::runtime_error("flash_attention_gqa_forward: head counts must be positive");
+    const int Lq  = Q.rows;
+    const int Lk  = K.rows;
+    const int Dq  = Q.cols;
+    const int Dkv = K.cols;
+    if (Dq % num_q_heads != 0)
+        throw std::runtime_error("flash_attention_gqa_forward: num_q_heads must divide Q.cols");
+    const int head_dim = Dq / num_q_heads;
+    if (V.cols != Dkv || V.rows != Lk)
+        throw std::runtime_error("flash_attention_gqa_forward: shape mismatch");
+    if (Dkv != num_kv_heads * head_dim)
+        throw std::runtime_error("flash_attention_gqa_forward: K/V width must be num_kv_heads*head_dim");
+    if (num_q_heads % num_kv_heads != 0)
+        throw std::runtime_error("flash_attention_gqa_forward: num_kv_heads must divide num_q_heads");
+    if (Lk < Lq)
+        throw std::runtime_error("flash_attention_gqa_forward: requires Lk >= Lq");
+    if (causal && Lq != Lk)
+        throw std::runtime_error("flash_attention_gqa_forward: causal requires Lq == Lk");
+    if ((head_dim + (int)FAW_BLOCK - 1) / (int)FAW_BLOCK > 8)
+        throw std::runtime_error("flash_attention_gqa_forward: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
+    if (O.rows != Lq || O.cols != Dq || O.dtype != dt)
+        O.resize(Lq, Dq, dt);
+    if (Lq == 0 || Lk == 0 || Dq == 0) return;
+
+    WinParams p{};
+    p.Lk       = static_cast<uint32_t>(Lk);
+    p.Dq       = static_cast<uint32_t>(Dq);
+    p.Dkv      = static_cast<uint32_t>(Dkv);
+    p.head_dim = static_cast<uint32_t>(head_dim);
+    p.window   = 0;
+    p.q_offset = static_cast<uint32_t>(Lk - Lq);
+    p.group    = static_cast<uint32_t>(num_q_heads / num_kv_heads);
+    p.has_mask = d_mask ? 1u : 0u;
+    p.causal   = causal ? 1u : 0u;
+
+    id<MTLComputePipelineState> pso =
+        (dt == Dtype::BF16) ? pso_bf16()
+      : (dt == Dtype::FP32) ? pso_fp32()
+                            : pso_fp16();
+
+    id<MTLBuffer> bQ = buffer_for(Q);   NSUInteger oQ = buffer_offset_for(Q);
+    id<MTLBuffer> bK = buffer_for(K);   NSUInteger oK = buffer_offset_for(K);
+    id<MTLBuffer> bV = buffer_for(V);   NSUInteger oV = buffer_offset_for(V);
+    id<MTLBuffer> bO = buffer_for(O);   NSUInteger oO = buffer_offset_for(O);
+    id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
+    NSUInteger oM = d_mask ? pool_lookup_offset(d_mask) : 0;
+    id<MTLBuffer> bM_arg = bM ? bM : bQ;     // dummy bind when no mask
+    NSUInteger oM_arg = bM ? oM : oQ;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:bQ offset:oQ atIndex:0];
+        [enc setBuffer:bK offset:oK atIndex:1];
+        [enc setBuffer:bV offset:oV atIndex:2];
+        [enc setBuffer:bM_arg offset:oM_arg atIndex:3];
+        [enc setBuffer:bO offset:oO atIndex:4];
+        [enc setBytes:&p length:sizeof(WinParams) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(Lq, num_q_heads, 1)
             threadsPerThreadgroup:MTLSizeMake(FAW_BLOCK, 1, 1)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
