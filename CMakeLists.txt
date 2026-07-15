@@ -300,7 +300,12 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/filtered_lrelu.cu
         src/cuda/register.cu
     )
-    target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart)
+    # Static CUDA runtime: keeps the shipped binary self-contained. The tower
+    # links into a single executable, so there is exactly one cudart instance —
+    # no multi-module context split. On a machine with no NVIDIA driver the
+    # lazily-loaded driver stub simply reports no device and init.cpp falls back
+    # to CPU, so one build runs everywhere (GPU when present, CPU otherwise).
+    target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart_static)
     target_compile_definitions(brotensor_cuda PUBLIC
         BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
     # brotensor_core's init.cpp must know whether to probe + register CUDA.
