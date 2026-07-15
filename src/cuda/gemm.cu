@@ -430,8 +430,21 @@ void linear_forward_batched_fp16_impl(const ::brotensor::Tensor& W,
     // Skinny batches take the block-per-row split-K GEMV — fully coalesced
     // weight traffic, FP32 accumulation, bias + activation fused into the
     // store (the same dispatch shape as the FP32-activation batched linear).
-    // The WMMA tile kernel keeps the wide-batch case.
-    if (B <= 32 && in_dim % 4 == 0 && in_dim > 0) {
+    // The WMMA tile kernel keeps the wider-batch case.
+    //
+    // Threshold is B <= 4, NOT the batch's whole small end: this GEMV grid is
+    // (out_dim, B) — one block per (output, row) — so it re-reads the entire
+    // weight matrix B times. It runs at near-peak bandwidth, but that B× traffic
+    // means its wall time grows linearly with B, while the WMMA tile kernel reads
+    // the weights once (its time is ~flat in B for the short-sequence regime).
+    // Measured on a 4090 (Llama-8B-shaped FP16 linears): GEMV ≈ 1.08 TB/s but B×
+    // traffic; WMMA ≈ 0.24 TB/s at 1× traffic — so GEMV only wins for B ≲ 4.
+    // At the old B <= 32 cutoff an L=32 prefill did 32× the weight traffic and
+    // ran ~6.5× SLOWER than L=64 (101 ms vs 15 ms for an 8-layer stack) — a cliff
+    // that hit every short prompt / bidirectional-encoder forward. B <= 4 keeps
+    // GEMV only where its coalesced single-pass-per-row actually beats WMMA
+    // (decode's B == 1, and 2–4-row micro-batches).
+    if (B <= 4 && in_dim % 4 == 0 && in_dim > 0) {
         dim3 grid(out_dim, B);
         if (in_dim % 8 == 0) {   // 16-byte loads (every transformer width)
             if (dt == Dtype::FP16) {
