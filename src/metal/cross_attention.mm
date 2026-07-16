@@ -480,12 +480,12 @@ void cross_attention_forward_train_core(const Tensor& X,
     const int Dctx = Ctx.cols;
     const int H    = num_heads;
     const int dh   = (H > 0) ? D / H : 0;
-    if (Qh.rows != H * Lq || Qh.cols != dh) Qh.resize(H * Lq, dh);
-    if (Kh.rows != H * Lk || Kh.cols != dh) Kh.resize(H * Lk, dh);
-    if (Vh.rows != H * Lk || Vh.cols != dh) Vh.resize(H * Lk, dh);
-    if (Attnh.rows != H * Lq || Attnh.cols != Lk) Attnh.resize(H * Lq, Lk);
-    if (Yconcat.rows != Lq || Yconcat.cols != D) Yconcat.resize(Lq, D);
-    if (O.rows != Lq || O.cols != D) O.resize(Lq, D);
+    if (Qh.rows != H * Lq || Qh.cols != dh || Qh.dtype != Dtype::FP32) Qh.resize(H * Lq, dh, Dtype::FP32);
+    if (Kh.rows != H * Lk || Kh.cols != dh || Kh.dtype != Dtype::FP32) Kh.resize(H * Lk, dh, Dtype::FP32);
+    if (Vh.rows != H * Lk || Vh.cols != dh || Vh.dtype != Dtype::FP32) Vh.resize(H * Lk, dh, Dtype::FP32);
+    if (Attnh.rows != H * Lq || Attnh.cols != Lk || Attnh.dtype != Dtype::FP32) Attnh.resize(H * Lq, Lk, Dtype::FP32);
+    if (Yconcat.rows != Lq || Yconcat.cols != D || Yconcat.dtype != Dtype::FP32) Yconcat.resize(Lq, D, Dtype::FP32);
+    if (O.rows != Lq || O.cols != D || O.dtype != Dtype::FP32) O.resize(Lq, D, Dtype::FP32);
     if (Lq == 0 || Lk == 0 || D == 0 || H == 0) return;
 
     const uint32_t Lqu = static_cast<uint32_t>(Lq);
@@ -652,8 +652,8 @@ void cross_attention_backward(const Tensor& dO,
     const int Dctx = Ctx.cols;
     const int H    = num_heads;
     const int dh   = (H > 0) ? D / H : 0;
-    if (dX.rows != Lq || dX.cols != D) dX.resize(Lq, D);
-    if (dCtx.rows != Lk || dCtx.cols != Dctx) dCtx.resize(Lk, Dctx);
+    if (dX.rows != Lq || dX.cols != D || dX.dtype != Dtype::FP32) dX.resize(Lq, D, Dtype::FP32);
+    if (dCtx.rows != Lk || dCtx.cols != Dctx || dCtx.dtype != Dtype::FP32) dCtx.resize(Lk, Dctx, Dtype::FP32);
     if (Lq == 0 || Lk == 0 || D == 0 || H == 0) return;
 
     const uint32_t Lqu = static_cast<uint32_t>(Lq);

@@ -166,4 +166,31 @@ BT_PARITY_TEST(add_inplace_bf16_n1024) { test_add_inplace_bf16(1024, 0x61ull); }
 BT_PARITY_TEST(add_scalar_bf16_n256)  { test_add_scalar_inplace_bf16(256, 0x62ull); }
 BT_PARITY_TEST(add_scalar_bf16_n1024) { test_add_scalar_inplace_bf16(1024, 0x63ull); }
 
+// FP16 forward parity for the relu/tanh/sigmoid trio — the qwen35 attention
+// gate runs sigmoid on FP16 activations. Quantise inputs through FP16, run
+// CPU in FP32 and GPU in FP16 storage, compare loosely.
+namespace {
+void test_unary_fp16(void (*op)(const Tensor&, Tensor&), const char* tag,
+                     int n, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor x = Tensor::vec(n);
+    fill_random(x, rng);
+    Tensor x_q = fp16_host_to_f32(to_fp16_host(x));
+
+    Tensor y_cpu = Tensor::vec(n);
+    op(x_q, y_cpu);
+
+    Tensor gx = to_fp16_gpu(x_q);
+    Tensor gy;
+    op(gx, gy);
+
+    compare_tensors(y_cpu, fp16_host_to_f32(download_to_host(gy)),
+                    tag, 1e-3f, 1e-3f);
+}
+} // namespace
+
+BT_PARITY_TEST(relu_fp16_n256)    { test_unary_fp16(brotensor::relu_forward,    "relu_fp16",    256, 0x70ull); }
+BT_PARITY_TEST(tanh_fp16_n256)    { test_unary_fp16(brotensor::tanh_forward,    "tanh_fp16",    256, 0x71ull); }
+BT_PARITY_TEST(sigmoid_fp16_n256) { test_unary_fp16(brotensor::sigmoid_forward, "sigmoid_fp16", 256, 0x72ull); }
+
 int main() { return run_all("elementwise cpu/gpu parity"); }

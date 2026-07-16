@@ -496,12 +496,12 @@ void mha_forward(const Tensor& X,
     const int D = X.cols;
     const int H = num_heads;
     const int dh = (H > 0) ? D / H : 0;
-    if (Qh.rows != H * K || Qh.cols != dh) Qh.resize(H * K, dh);
-    if (Kh.rows != H * K || Kh.cols != dh) Kh.resize(H * K, dh);
-    if (Vh.rows != H * K || Vh.cols != dh) Vh.resize(H * K, dh);
-    if (Attnh.rows != H * K || Attnh.cols != K) Attnh.resize(H * K, K);
-    if (Yconcat.rows != K || Yconcat.cols != D) Yconcat.resize(K, D);
-    if (O.rows != K || O.cols != D) O.resize(K, D);
+    if (Qh.rows != H * K || Qh.cols != dh || Qh.dtype != Dtype::FP32) Qh.resize(H * K, dh, Dtype::FP32);
+    if (Kh.rows != H * K || Kh.cols != dh || Kh.dtype != Dtype::FP32) Kh.resize(H * K, dh, Dtype::FP32);
+    if (Vh.rows != H * K || Vh.cols != dh || Vh.dtype != Dtype::FP32) Vh.resize(H * K, dh, Dtype::FP32);
+    if (Attnh.rows != H * K || Attnh.cols != K || Attnh.dtype != Dtype::FP32) Attnh.resize(H * K, K, Dtype::FP32);
+    if (Yconcat.rows != K || Yconcat.cols != D || Yconcat.dtype != Dtype::FP32) Yconcat.resize(K, D, Dtype::FP32);
+    if (O.rows != K || O.cols != D || O.dtype != Dtype::FP32) O.resize(K, D, Dtype::FP32);
     if (K == 0 || D == 0 || H == 0) return;
 
     id<MTLBuffer> bX = buffer_for(X);
@@ -629,7 +629,7 @@ void mha_backward(const Tensor& dO,
     const int D = X.cols;
     const int H = num_heads;
     const int dh = (H > 0) ? D / H : 0;
-    if (dX.rows != K || dX.cols != D) dX.resize(K, D);
+    if (dX.rows != K || dX.cols != D || dX.dtype != Dtype::FP32) dX.resize(K, D, Dtype::FP32);
     if (K == 0 || D == 0 || H == 0) return;
 
     const uint32_t Ku = static_cast<uint32_t>(K);

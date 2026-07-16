@@ -302,8 +302,10 @@ void layernorm_forward(const Tensor& x,
                        float& mean_out, float& rstd_out,
                        float eps) {
     const int n = x.size();
-    if (y.rows != x.rows || y.cols != x.cols) y.resize(x.rows, x.cols);
-    if (xhat.rows != x.rows || xhat.cols != x.cols) xhat.resize(x.rows, x.cols);
+    if (y.rows != x.rows || y.cols != x.cols || y.dtype != Dtype::FP32)
+        y.resize(x.rows, x.cols, Dtype::FP32);
+    if (xhat.rows != x.rows || xhat.cols != x.cols || xhat.dtype != Dtype::FP32)
+        xhat.resize(x.rows, x.cols, Dtype::FP32);
     if (n == 0) { mean_out = 0.0f; rstd_out = 0.0f; return; }
     @autoreleasepool {
         id<MTLBuffer> scratch = [metal_impl::device()
@@ -492,7 +494,7 @@ void layernorm_forward_inference_batched(const Tensor& X_RD,
                                          float eps) {
     const int R = X_RD.rows;
     const int D = X_RD.cols;
-    if (Y_RD.rows != R || Y_RD.cols != D) Y_RD.resize(R, D);
+    if (Y_RD.rows != R || Y_RD.cols != D || Y_RD.dtype != Dtype::FP32) Y_RD.resize(R, D, Dtype::FP32);
     if (R == 0 || D == 0) return;
     id<MTLComputePipelineState> pso = pso_fw_inf();
     id<MTLBuffer> bx = buffer_for(X_RD);

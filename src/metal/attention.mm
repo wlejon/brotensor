@@ -401,12 +401,12 @@ void attention_forward(const Tensor& X,
                        Tensor& O) {
     const int N = X.rows;
     const int D = X.cols;
-    if (Q.rows != N || Q.cols != D) Q.resize(N, D);
-    if (K.rows != N || K.cols != D) K.resize(N, D);
-    if (V.rows != N || V.cols != D) V.resize(N, D);
-    if (Attn.rows != N || Attn.cols != N) Attn.resize(N, N);
-    if (Y_pre_Wo.rows != N || Y_pre_Wo.cols != D) Y_pre_Wo.resize(N, D);
-    if (O.rows != N || O.cols != D) O.resize(N, D);
+    if (Q.rows != N || Q.cols != D || Q.dtype != Dtype::FP32) Q.resize(N, D, Dtype::FP32);
+    if (K.rows != N || K.cols != D || K.dtype != Dtype::FP32) K.resize(N, D, Dtype::FP32);
+    if (V.rows != N || V.cols != D || V.dtype != Dtype::FP32) V.resize(N, D, Dtype::FP32);
+    if (Attn.rows != N || Attn.cols != N || Attn.dtype != Dtype::FP32) Attn.resize(N, N, Dtype::FP32);
+    if (Y_pre_Wo.rows != N || Y_pre_Wo.cols != D || Y_pre_Wo.dtype != Dtype::FP32) Y_pre_Wo.resize(N, D, Dtype::FP32);
+    if (O.rows != N || O.cols != D || O.dtype != Dtype::FP32) O.resize(N, D, Dtype::FP32);
     if (N == 0 || D == 0) return;
 
     id<MTLBuffer> bX = buffer_for(X);
@@ -511,7 +511,7 @@ void attention_backward(const Tensor& dO,
                         Tensor& dWv, Tensor& dWo) {
     const int N = X.rows;
     const int D = X.cols;
-    if (dX.rows != N || dX.cols != D) dX.resize(N, D);
+    if (dX.rows != N || dX.cols != D || dX.dtype != Dtype::FP32) dX.resize(N, D, Dtype::FP32);
     if (N == 0 || D == 0) return;
     const float inv_sqrtd = 1.0f / std::sqrt(static_cast<float>(D));
     const uint32_t Nu = static_cast<uint32_t>(N);

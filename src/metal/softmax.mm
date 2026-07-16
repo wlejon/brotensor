@@ -268,8 +268,9 @@ void run_single_block(id<MTLComputePipelineState> pso,
 void softmax_forward(const Tensor& logits, Tensor& probs,
                      const float* d_mask) {
     const int n = logits.size();
-    if (probs.rows != logits.rows || probs.cols != logits.cols) {
-        probs.resize(logits.rows, logits.cols);
+    if (probs.rows != logits.rows || probs.cols != logits.cols ||
+        probs.dtype != Dtype::FP32) {
+        probs.resize(logits.rows, logits.cols, Dtype::FP32);
     }
     if (n == 0) return;
     id<MTLBuffer> bL = buffer_for(logits);
@@ -294,8 +295,9 @@ void softmax_forward(const Tensor& logits, Tensor& probs,
 void softmax_backward(const Tensor& probs, const Tensor& dProbs,
                       Tensor& dLogits) {
     const int n = probs.size();
-    if (dLogits.rows != probs.rows || dLogits.cols != probs.cols) {
-        dLogits.resize(probs.rows, probs.cols);
+    if (dLogits.rows != probs.rows || dLogits.cols != probs.cols ||
+        dLogits.dtype != Dtype::FP32) {
+        dLogits.resize(probs.rows, probs.cols, Dtype::FP32);
     }
     if (n == 0) return;
     id<MTLBuffer> bP  = buffer_for(probs);

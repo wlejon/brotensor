@@ -84,7 +84,7 @@ void linear_forward(const Tensor& W, const Tensor& b,
                     const Tensor& x, Tensor& y) {
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
-    if (y.rows != out_dim || y.cols != 1) y.resize(out_dim, 1);
+    if (y.rows != out_dim || y.cols != 1 || y.dtype != Dtype::FP32) y.resize(out_dim, 1, Dtype::FP32);
     if (out_dim == 0) return;
 
     id<MTLBuffer> bW = buffer_for(W);
@@ -113,7 +113,7 @@ void linear_backward(const Tensor& W, const Tensor& x,
                      Tensor& dX, Tensor& dW, Tensor& dB) {
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
-    if (dX.rows != in_dim || dX.cols != 1) dX.resize(in_dim, 1);
+    if (dX.rows != in_dim || dX.cols != 1 || dX.dtype != Dtype::FP32) dX.resize(in_dim, 1, Dtype::FP32);
 
     // dX = W^T * dY
     if (in_dim > 0 && out_dim > 0) {

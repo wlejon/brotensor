@@ -88,6 +88,38 @@ kernel void k_rms_fw_fp16(device const half* X     [[buffer(0)]],
     }
 }
 
+// FP16 activations with FP32 gamma (the kernel math is FP32 regardless) —
+// mirrors the gamma_f32 forward instantiations in src/cuda/rms_norm.cu.
+kernel void k_rms_fw_fp16_g32(device const half*  X     [[buffer(0)]],
+                              device const float* gamma [[buffer(1)]],
+                              device half*        Y     [[buffer(2)]],
+                              constant uint& B   [[buffer(3)]],
+                              constant uint& D   [[buffer(4)]],
+                              constant float& eps [[buffer(5)]],
+                              uint b   [[threadgroup_position_in_grid]],
+                              uint tid [[thread_position_in_threadgroup]],
+                              uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float sdata[RMS_BLOCK];
+    if (b >= B) return;
+    device const half* xrow = X + b * D;
+    device       half* yrow = Y + b * D;
+    float local = 0.0f;
+    for (uint j = tid; j < D; j += tgs) {
+        float v = float(xrow[j]);
+        local += v * v;
+    }
+    sdata[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rrms = rsqrt(sdata[0] / float(D) + eps);
+    for (uint j = tid; j < D; j += tgs) {
+        yrow[j] = half(float(xrow[j]) * gamma[j] * rrms);
+    }
+}
+
 kernel void k_rms_bw_fp32(device const float* X     [[buffer(0)]],
                           device const float* gamma [[buffer(1)]],
                           device const float* dY    [[buffer(2)]],
@@ -236,6 +268,36 @@ kernel void k_rms_fw_bf16(device const bfloat* X     [[buffer(0)]],
     }
 }
 
+kernel void k_rms_fw_bf16_g32(device const bfloat* X     [[buffer(0)]],
+                              device const float*  gamma [[buffer(1)]],
+                              device bfloat*       Y     [[buffer(2)]],
+                              constant uint& B   [[buffer(3)]],
+                              constant uint& D   [[buffer(4)]],
+                              constant float& eps [[buffer(5)]],
+                              uint b   [[threadgroup_position_in_grid]],
+                              uint tid [[thread_position_in_threadgroup]],
+                              uint tgs [[threads_per_threadgroup]]) {
+    threadgroup float sdata[RMS_BLOCK];
+    if (b >= B) return;
+    device const bfloat* xrow = X + b * D;
+    device       bfloat* yrow = Y + b * D;
+    float local = 0.0f;
+    for (uint j = tid; j < D; j += tgs) {
+        float v = float(xrow[j]);
+        local += v * v;
+    }
+    sdata[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rrms = rsqrt(sdata[0] / float(D) + eps);
+    for (uint j = tid; j < D; j += tgs) {
+        yrow[j] = bfloat(float(xrow[j]) * gamma[j] * rrms);
+    }
+}
+
 kernel void k_rms_bw_bf16(device const bfloat* X     [[buffer(0)]],
                           device const bfloat* gamma [[buffer(1)]],
                           device const bfloat* dY    [[buffer(2)]],
@@ -307,6 +369,8 @@ kernel void k_rms_fold_bf16(device bfloat*      dst [[buffer(0)]],
     }
 DEF_PSO(pso_fw_fp32, @"k_rms_fw_fp32")
 DEF_PSO(pso_fw_fp16, @"k_rms_fw_fp16")
+DEF_PSO(pso_fw_fp16_g32, @"k_rms_fw_fp16_g32")
+DEF_PSO(pso_fw_bf16_g32, @"k_rms_fw_bf16_g32")
 DEF_PSO(pso_bw_fp32, @"k_rms_bw_fp32")
 DEF_PSO(pso_bw_fp16, @"k_rms_bw_fp16")
 DEF_PSO(pso_fold,    @"k_rms_fold_fp16")
@@ -319,8 +383,12 @@ DEF_PSO(pso_fold_bf16, @"k_rms_fold_bf16")
 
 void rms_norm_forward(const Tensor& X, const Tensor& gamma,
                       float eps, Tensor& Y) {
-    if (gamma.dtype != X.dtype) {
-        throw std::runtime_error("rms_norm_forward_gpu: gamma.dtype must match X.dtype");
+    // gamma either matches X.dtype or is FP32 against 16-bit activations
+    // (the kernel math is FP32 regardless) — same contract as CUDA.
+    const bool gamma_f32 = (gamma.dtype == Dtype::FP32);
+    if (gamma.dtype != X.dtype && !gamma_f32) {
+        throw std::runtime_error(
+            "rms_norm_forward_gpu: gamma.dtype must match X.dtype or be FP32");
     }
     const int B = X.rows;
     const int D = X.cols;
@@ -332,9 +400,10 @@ void rms_norm_forward(const Tensor& X, const Tensor& gamma,
     }
     if (B == 0 || D == 0) return;
 
-    id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_fw_fp16()
-                                   : (X.dtype == Dtype::BF16) ? pso_fw_bf16()
-                                                               : pso_fw_fp32();
+    id<MTLComputePipelineState> pso =
+        (X.dtype == Dtype::FP16) ? (gamma_f32 ? pso_fw_fp16_g32() : pso_fw_fp16())
+      : (X.dtype == Dtype::BF16) ? (gamma_f32 ? pso_fw_bf16_g32() : pso_fw_bf16())
+                                 : pso_fw_fp32();
     id<MTLBuffer> bX = buffer_for(X);
     id<MTLBuffer> bG = buffer_for(gamma);
     id<MTLBuffer> bY = buffer_for(Y);

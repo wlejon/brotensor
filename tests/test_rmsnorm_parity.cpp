@@ -169,4 +169,36 @@ BT_PARITY_TEST(rms_norm_bf16_bwd_8x32)  { run_bwd_bf16(8, 32, 1e-5f,  0x7090ull)
 BT_PARITY_TEST(rms_norm_bf16_bwd_5x7)   { run_bwd_bf16(5, 7, 1e-6f,   0x7091ull); }
 BT_PARITY_TEST(rms_norm_bf16_bwd_wide)  { run_bwd_bf16(3, 257, 1e-5f, 0x7092ull); }
 
+// ─── FP16 activations with FP32 gamma ───────────────────────────────────────
+// The forward also accepts FP32 gamma against 16-bit X (LoRA / DiT weights
+// stay FP32 while activations run FP16) — dedicated g32 kernel instantiations
+// on both GPU backends.
+
+namespace {
+
+void run_fwd_fp16_g32(int B, int D, float eps, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X     = Tensor::mat(B, D);
+    Tensor gamma = Tensor::vec(D);
+    fill_random(X, rng);
+    fill_random(gamma, rng);
+    Tensor X_q = fp16_host_to_f32(to_fp16_host(X));   // shared quantised input
+
+    Tensor cpu_Y;
+    brotensor::rms_norm_forward(X_q, gamma, eps, cpu_Y);
+
+    Tensor gX     = to_fp16_gpu(X_q);
+    Tensor ggamma = gamma.to(gpu_device());           // FP32 gamma on device
+    Tensor gpu_Y;
+    brotensor::rms_norm_forward(gX, ggamma, eps, gpu_Y);
+
+    Tensor Y_h = fp16_host_to_f32(download_to_host(gpu_Y));
+    compare_tensors(cpu_Y, Y_h, "rms_norm_fp16_g32_fwd", 1e-2f, 1e-2f);
+}
+
+} // namespace
+
+BT_PARITY_TEST(rms_norm_fp16_g32_fwd_8x32) { run_fwd_fp16_g32(8, 32, 1e-5f,  0x70A0ull); }
+BT_PARITY_TEST(rms_norm_fp16_g32_fwd_wide) { run_fwd_fp16_g32(3, 257, 1e-5f, 0x70A1ull); }
+
 int main() { return run_all("rms_norm cpu/gpu parity"); }

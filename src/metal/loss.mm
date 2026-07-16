@@ -336,8 +336,9 @@ float mse_vec_forward(const Tensor& pred, const Tensor& target) {
 void mse_vec_backward(const Tensor& pred, const Tensor& target,
                       Tensor& dPred) {
     const int n = pred.size();
-    if (dPred.rows != pred.rows || dPred.cols != pred.cols) {
-        dPred.resize(pred.rows, pred.cols);
+    if (dPred.rows != pred.rows || dPred.cols != pred.cols ||
+        dPred.dtype != Dtype::FP32) {
+        dPred.resize(pred.rows, pred.cols, Dtype::FP32);
     }
     if (n == 0) return;
     const float scale = 2.0f / static_cast<float>(n);
@@ -372,11 +373,13 @@ float softmax_xent_fused(const Tensor& logits, const Tensor& target,
                          const float* d_mask,
                          Tensor& probs, Tensor& dLogits) {
     const int n = logits.size();
-    if (probs.rows != logits.rows || probs.cols != logits.cols) {
-        probs.resize(logits.rows, logits.cols);
+    if (probs.rows != logits.rows || probs.cols != logits.cols ||
+        probs.dtype != Dtype::FP32) {
+        probs.resize(logits.rows, logits.cols, Dtype::FP32);
     }
-    if (dLogits.rows != logits.rows || dLogits.cols != logits.cols) {
-        dLogits.resize(logits.rows, logits.cols);
+    if (dLogits.rows != logits.rows || dLogits.cols != logits.cols ||
+        dLogits.dtype != Dtype::FP32) {
+        dLogits.resize(logits.rows, logits.cols, Dtype::FP32);
     }
     if (n == 0) return 0.0f;
     @autoreleasepool {
@@ -423,10 +426,12 @@ float softmax_xent_fused(const Tensor& logits, const Tensor& target,
 void mse_vec_per_sample(const Tensor& pred, const Tensor& target,
                         Tensor& dPred, Tensor& loss_per_sample) {
     const int B = pred.size();
-    if (dPred.rows != pred.rows || dPred.cols != pred.cols)
-        dPred.resize(pred.rows, pred.cols);
-    if (loss_per_sample.rows != B || loss_per_sample.cols != 1)
-        loss_per_sample.resize(B, 1);
+    if (dPred.rows != pred.rows || dPred.cols != pred.cols ||
+        dPred.dtype != Dtype::FP32)
+        dPred.resize(pred.rows, pred.cols, Dtype::FP32);
+    if (loss_per_sample.rows != B || loss_per_sample.cols != 1 ||
+        loss_per_sample.dtype != Dtype::FP32)
+        loss_per_sample.resize(B, 1, Dtype::FP32);
     if (B == 0) return;
     id<MTLComputePipelineState> pso = pso_mse_per_sample();
     id<MTLBuffer> bp = buffer_for(pred);
@@ -467,12 +472,15 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
                                 Tensor& loss_per_sample) {
     const int B     = logits_BL.rows;
     const int n_act = logits_BL.cols;
-    if (probs_BL.rows != B || probs_BL.cols != n_act)
-        probs_BL.resize(B, n_act);
-    if (dLogits_BL.rows != B || dLogits_BL.cols != n_act)
-        dLogits_BL.resize(B, n_act);
-    if (loss_per_sample.rows != B || loss_per_sample.cols != 1)
-        loss_per_sample.resize(B, 1);
+    if (probs_BL.rows != B || probs_BL.cols != n_act ||
+        probs_BL.dtype != Dtype::FP32)
+        probs_BL.resize(B, n_act, Dtype::FP32);
+    if (dLogits_BL.rows != B || dLogits_BL.cols != n_act ||
+        dLogits_BL.dtype != Dtype::FP32)
+        dLogits_BL.resize(B, n_act, Dtype::FP32);
+    if (loss_per_sample.rows != B || loss_per_sample.cols != 1 ||
+        loss_per_sample.dtype != Dtype::FP32)
+        loss_per_sample.resize(B, 1, Dtype::FP32);
     if (B == 0 || n_act == 0 || n_heads <= 0) return;
 
     // Zero loss accumulator (unified memory).
@@ -530,12 +538,15 @@ void bce_with_logits_fused_batched(const Tensor& logits_BL,
                                    Tensor& loss_per_sample) {
     const int B = logits_BL.rows;
     const int L = logits_BL.cols;
-    if (probs_BL.rows != B || probs_BL.cols != L)
-        probs_BL.resize(B, L);
-    if (dLogits_BL.rows != B || dLogits_BL.cols != L)
-        dLogits_BL.resize(B, L);
-    if (loss_per_sample.rows != B || loss_per_sample.cols != 1)
-        loss_per_sample.resize(B, 1);
+    if (probs_BL.rows != B || probs_BL.cols != L ||
+        probs_BL.dtype != Dtype::FP32)
+        probs_BL.resize(B, L, Dtype::FP32);
+    if (dLogits_BL.rows != B || dLogits_BL.cols != L ||
+        dLogits_BL.dtype != Dtype::FP32)
+        dLogits_BL.resize(B, L, Dtype::FP32);
+    if (loss_per_sample.rows != B || loss_per_sample.cols != 1 ||
+        loss_per_sample.dtype != Dtype::FP32)
+        loss_per_sample.resize(B, 1, Dtype::FP32);
     if (B == 0 || L == 0) return;
 
     id<MTLComputePipelineState> pso = pso_bce_batched();

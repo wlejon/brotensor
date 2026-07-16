@@ -74,50 +74,73 @@ kernel void k_linear_fw_batched_bw(device const bfloat* W   [[buffer(0)]],
     Y[b * out_dim + i] = bias[i] + acc;
 }
 
-kernel void k_relu_fw_batched(device const float* x [[buffer(0)]],
-                              device float*       y [[buffer(1)]],
-                              constant uint& n      [[buffer(2)]],
-                              uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    float v = x[i];
-    y[i] = v > 0.0f ? v : 0.0f;
+// relu/tanh/add batched — dtype-dispatched on X (FP32/FP16/BF16, FP32 math),
+// matching the templated CUDA kernels in batched_ops.cu.
+#define LBB_RELU_FW(NAME, T)                                                  \
+kernel void NAME(device const T* x [[buffer(0)]],                             \
+                 device T*       y [[buffer(1)]],                             \
+                 constant uint& n  [[buffer(2)]],                             \
+                 uint i [[thread_position_in_grid]]) {                        \
+    if (i >= n) return;                                                       \
+    float v = float(x[i]);                                                    \
+    y[i] = T(v > 0.0f ? v : 0.0f);                                            \
 }
 
-kernel void k_tanh_fw_batched(device const float* x [[buffer(0)]],
-                              device float*       y [[buffer(1)]],
-                              constant uint& n      [[buffer(2)]],
-                              uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    // See kernels.mm k_tanh_forward — Metal's tanh overflows for x ≳ 45.
-    y[i] = tanh(clamp(x[i], -9.0f, 9.0f));
+// See kernels.mm k_tanh_forward — Metal's tanh overflows for x ≳ 45.
+#define LBB_TANH_FW(NAME, T)                                                  \
+kernel void NAME(device const T* x [[buffer(0)]],                             \
+                 device T*       y [[buffer(1)]],                             \
+                 constant uint& n  [[buffer(2)]],                             \
+                 uint i [[thread_position_in_grid]]) {                        \
+    if (i >= n) return;                                                       \
+    y[i] = T(tanh(clamp(float(x[i]), -9.0f, 9.0f)));                          \
 }
 
-kernel void k_add_inplace_batched(device float*       y [[buffer(0)]],
-                                  device const float* x [[buffer(1)]],
-                                  constant uint& n      [[buffer(2)]],
-                                  uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    y[i] += x[i];
+#define LBB_ADD_IP(NAME, T)                                                   \
+kernel void NAME(device T*       y [[buffer(0)]],                             \
+                 device const T* x [[buffer(1)]],                             \
+                 constant uint& n  [[buffer(2)]],                             \
+                 uint i [[thread_position_in_grid]]) {                        \
+    if (i >= n) return;                                                       \
+    y[i] = T(float(y[i]) + float(x[i]));                                      \
 }
 
-kernel void k_relu_bw_batched(device const float* x  [[buffer(0)]],
-                              device const float* dY [[buffer(1)]],
-                              device float*       dX [[buffer(2)]],
-                              constant uint& n       [[buffer(3)]],
-                              uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    dX[i] = x[i] > 0.0f ? dY[i] : 0.0f;
+#define LBB_RELU_BW(NAME, T)                                                  \
+kernel void NAME(device const T* x  [[buffer(0)]],                            \
+                 device const T* dY [[buffer(1)]],                            \
+                 device T*       dX [[buffer(2)]],                            \
+                 constant uint& n   [[buffer(3)]],                            \
+                 uint i [[thread_position_in_grid]]) {                        \
+    if (i >= n) return;                                                       \
+    dX[i] = float(x[i]) > 0.0f ? dY[i] : T(0.0f);                             \
 }
 
-kernel void k_tanh_bw_batched(device const float* y  [[buffer(0)]],
-                              device const float* dY [[buffer(1)]],
-                              device float*       dX [[buffer(2)]],
-                              constant uint& n       [[buffer(3)]],
-                              uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    float yv = y[i];
-    dX[i] = dY[i] * (1.0f - yv * yv);
+#define LBB_TANH_BW(NAME, T)                                                  \
+kernel void NAME(device const T* y  [[buffer(0)]],                            \
+                 device const T* dY [[buffer(1)]],                            \
+                 device T*       dX [[buffer(2)]],                            \
+                 constant uint& n   [[buffer(3)]],                            \
+                 uint i [[thread_position_in_grid]]) {                        \
+    if (i >= n) return;                                                       \
+    float yv = float(y[i]);                                                   \
+    dX[i] = T(float(dY[i]) * (1.0f - yv * yv));                               \
 }
+
+LBB_RELU_FW(k_relu_fw_batched,      float)
+LBB_RELU_FW(k_relu_fw_batched_fp16, half)
+LBB_RELU_FW(k_relu_fw_batched_bf16, bfloat)
+LBB_TANH_FW(k_tanh_fw_batched,      float)
+LBB_TANH_FW(k_tanh_fw_batched_fp16, half)
+LBB_TANH_FW(k_tanh_fw_batched_bf16, bfloat)
+LBB_ADD_IP(k_add_inplace_batched,      float)
+LBB_ADD_IP(k_add_inplace_batched_fp16, half)
+LBB_ADD_IP(k_add_inplace_batched_bf16, bfloat)
+LBB_RELU_BW(k_relu_bw_batched,      float)
+LBB_RELU_BW(k_relu_bw_batched_fp16, half)
+LBB_RELU_BW(k_relu_bw_batched_bf16, bfloat)
+LBB_TANH_BW(k_tanh_bw_batched,      float)
+LBB_TANH_BW(k_tanh_bw_batched_fp16, half)
+LBB_TANH_BW(k_tanh_bw_batched_bf16, bfloat)
 
 // dX[b, j] = sum_i W[i, j] * dY[b, i]
 kernel void k_linear_bw_batched_dx(device const float* W   [[buffer(0)]],
@@ -328,10 +351,20 @@ DEF_PSO(pso_lin_fw, @"k_linear_fw_batched")
 DEF_PSO(pso_lin_fw_hw, @"k_linear_fw_batched_hw")
 DEF_PSO(pso_lin_fw_bw, @"k_linear_fw_batched_bw")
 DEF_PSO(pso_relu_fw, @"k_relu_fw_batched")
+DEF_PSO(pso_relu_fw_fp16, @"k_relu_fw_batched_fp16")
+DEF_PSO(pso_relu_fw_bf16, @"k_relu_fw_batched_bf16")
 DEF_PSO(pso_tanh_fw, @"k_tanh_fw_batched")
+DEF_PSO(pso_tanh_fw_fp16, @"k_tanh_fw_batched_fp16")
+DEF_PSO(pso_tanh_fw_bf16, @"k_tanh_fw_batched_bf16")
 DEF_PSO(pso_add_ip, @"k_add_inplace_batched")
+DEF_PSO(pso_add_ip_fp16, @"k_add_inplace_batched_fp16")
+DEF_PSO(pso_add_ip_bf16, @"k_add_inplace_batched_bf16")
 DEF_PSO(pso_relu_bw, @"k_relu_bw_batched")
+DEF_PSO(pso_relu_bw_fp16, @"k_relu_bw_batched_fp16")
+DEF_PSO(pso_relu_bw_bf16, @"k_relu_bw_batched_bf16")
 DEF_PSO(pso_tanh_bw, @"k_tanh_bw_batched")
+DEF_PSO(pso_tanh_bw_fp16, @"k_tanh_bw_batched_fp16")
+DEF_PSO(pso_tanh_bw_bf16, @"k_tanh_bw_batched_bf16")
 DEF_PSO(pso_lin_bw_dx, @"k_linear_bw_batched_dx")
 DEF_PSO(pso_lin_bw_dw, @"k_linear_bw_batched_dw")
 DEF_PSO(pso_lin_bw_db, @"k_linear_bw_batched_db")
@@ -386,10 +419,22 @@ void dispatch2d(id<MTLComputePipelineState> pso, NSUInteger nx, NSUInteger ny,
 
 void linear_forward_batched(const Tensor& W, const Tensor& bias,
                             const Tensor& X_BD, Tensor& Y_BD) {
+    const bool w16 = (W.dtype == Dtype::FP16 || W.dtype == Dtype::BF16);
+    if ((W.dtype != Dtype::FP32 && !w16) || X_BD.dtype != Dtype::FP32 ||
+        bias.dtype != Dtype::FP32) {
+        throw std::runtime_error(
+            "linear_forward_batched: X and bias must be FP32, W FP32/FP16/BF16 "
+            "(use linear_forward_batched_fp16 for 16-bit activations)");
+    }
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
     const int B       = X_BD.rows;
-    if (Y_BD.rows != B || Y_BD.cols != out_dim) Y_BD.resize(B, out_dim);
+    // The dtype check matters: a shape-matched Y arriving FP16 (a scratch
+    // tensor last used by a 16-bit op) must be retyped, or the FP32 kernel
+    // writes past the half-sized allocation.
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP32) {
+        Y_BD.resize(B, out_dim, Dtype::FP32);
+    }
     if (B == 0 || out_dim == 0) return;
     id<MTLComputePipelineState> pso =
         W.dtype == Dtype::FP16 ? pso_lin_fw_hw()
@@ -418,15 +463,20 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
 }
 
 void relu_forward_batched(const Tensor& X_BD, Tensor& Y_BD) {
-    if (Y_BD.rows != X_BD.rows || Y_BD.cols != X_BD.cols)
-        Y_BD.resize(X_BD.rows, X_BD.cols);
+    if (Y_BD.rows != X_BD.rows || Y_BD.cols != X_BD.cols ||
+        Y_BD.dtype != X_BD.dtype)
+        Y_BD.resize(X_BD.rows, X_BD.cols, X_BD.dtype);
     const uint32_t n = static_cast<uint32_t>(X_BD.size());
     if (n == 0) return;
+    id<MTLComputePipelineState> pso =
+        X_BD.dtype == Dtype::FP16 ? pso_relu_fw_fp16()
+      : X_BD.dtype == Dtype::BF16 ? pso_relu_fw_bf16()
+      : pso_relu_fw();
     id<MTLBuffer> bx = buffer_for(X_BD);
     NSUInteger ox = buffer_offset_for(X_BD);
     id<MTLBuffer> by = buffer_for(Y_BD);
     NSUInteger oy = buffer_offset_for(Y_BD);
-    dispatch1d(pso_relu_fw(), n, ^(id<MTLComputeCommandEncoder> enc) {
+    dispatch1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bx offset:ox atIndex:0];
         [enc setBuffer:by offset:oy atIndex:1];
         [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
@@ -434,15 +484,20 @@ void relu_forward_batched(const Tensor& X_BD, Tensor& Y_BD) {
 }
 
 void tanh_forward_batched(const Tensor& X_BD, Tensor& Y_BD) {
-    if (Y_BD.rows != X_BD.rows || Y_BD.cols != X_BD.cols)
-        Y_BD.resize(X_BD.rows, X_BD.cols);
+    if (Y_BD.rows != X_BD.rows || Y_BD.cols != X_BD.cols ||
+        Y_BD.dtype != X_BD.dtype)
+        Y_BD.resize(X_BD.rows, X_BD.cols, X_BD.dtype);
     const uint32_t n = static_cast<uint32_t>(X_BD.size());
     if (n == 0) return;
+    id<MTLComputePipelineState> pso =
+        X_BD.dtype == Dtype::FP16 ? pso_tanh_fw_fp16()
+      : X_BD.dtype == Dtype::BF16 ? pso_tanh_fw_bf16()
+      : pso_tanh_fw();
     id<MTLBuffer> bx = buffer_for(X_BD);
     NSUInteger ox = buffer_offset_for(X_BD);
     id<MTLBuffer> by = buffer_for(Y_BD);
     NSUInteger oy = buffer_offset_for(Y_BD);
-    dispatch1d(pso_tanh_fw(), n, ^(id<MTLComputeCommandEncoder> enc) {
+    dispatch1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bx offset:ox atIndex:0];
         [enc setBuffer:by offset:oy atIndex:1];
         [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
@@ -452,11 +507,15 @@ void tanh_forward_batched(const Tensor& X_BD, Tensor& Y_BD) {
 void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD) {
     const uint32_t n = static_cast<uint32_t>(Y_BD.size());
     if (n == 0) return;
+    id<MTLComputePipelineState> pso =
+        Y_BD.dtype == Dtype::FP16 ? pso_add_ip_fp16()
+      : Y_BD.dtype == Dtype::BF16 ? pso_add_ip_bf16()
+      : pso_add_ip();
     id<MTLBuffer> by = buffer_for(Y_BD);
     NSUInteger oy = buffer_offset_for(Y_BD);
     id<MTLBuffer> bx = buffer_for(X_BD);
     NSUInteger ox = buffer_offset_for(X_BD);
-    dispatch1d(pso_add_ip(), n, ^(id<MTLComputeCommandEncoder> enc) {
+    dispatch1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:by offset:oy atIndex:0];
         [enc setBuffer:bx offset:ox atIndex:1];
         [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
@@ -465,8 +524,9 @@ void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD) {
 
 void relu_backward_batched(const Tensor& X_BD, const Tensor& dY_BD,
                            Tensor& dX_BD) {
-    if (dX_BD.rows != X_BD.rows || dX_BD.cols != X_BD.cols)
-        dX_BD.resize(X_BD.rows, X_BD.cols);
+    if (dX_BD.rows != X_BD.rows || dX_BD.cols != X_BD.cols ||
+        dX_BD.dtype != X_BD.dtype)
+        dX_BD.resize(X_BD.rows, X_BD.cols, X_BD.dtype);
     const uint32_t n = static_cast<uint32_t>(X_BD.size());
     if (n == 0) return;
     id<MTLBuffer> bx  = buffer_for(X_BD);
@@ -475,7 +535,11 @@ void relu_backward_batched(const Tensor& X_BD, const Tensor& dY_BD,
     NSUInteger ody = buffer_offset_for(dY_BD);
     id<MTLBuffer> bdx = buffer_for(dX_BD);
     NSUInteger odx = buffer_offset_for(dX_BD);
-    dispatch1d(pso_relu_bw(), n, ^(id<MTLComputeCommandEncoder> enc) {
+    id<MTLComputePipelineState> pso =
+        X_BD.dtype == Dtype::FP16 ? pso_relu_bw_fp16()
+      : X_BD.dtype == Dtype::BF16 ? pso_relu_bw_bf16()
+      : pso_relu_bw();
+    dispatch1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bx offset:ox atIndex:0];
         [enc setBuffer:bdy offset:ody atIndex:1];
         [enc setBuffer:bdx offset:odx atIndex:2];
@@ -485,8 +549,9 @@ void relu_backward_batched(const Tensor& X_BD, const Tensor& dY_BD,
 
 void tanh_backward_batched(const Tensor& Y_BD, const Tensor& dY_BD,
                            Tensor& dX_BD) {
-    if (dX_BD.rows != Y_BD.rows || dX_BD.cols != Y_BD.cols)
-        dX_BD.resize(Y_BD.rows, Y_BD.cols);
+    if (dX_BD.rows != Y_BD.rows || dX_BD.cols != Y_BD.cols ||
+        dX_BD.dtype != Y_BD.dtype)
+        dX_BD.resize(Y_BD.rows, Y_BD.cols, Y_BD.dtype);
     const uint32_t n = static_cast<uint32_t>(Y_BD.size());
     if (n == 0) return;
     id<MTLBuffer> by  = buffer_for(Y_BD);
@@ -495,7 +560,11 @@ void tanh_backward_batched(const Tensor& Y_BD, const Tensor& dY_BD,
     NSUInteger ody = buffer_offset_for(dY_BD);
     id<MTLBuffer> bdx = buffer_for(dX_BD);
     NSUInteger odx = buffer_offset_for(dX_BD);
-    dispatch1d(pso_tanh_bw(), n, ^(id<MTLComputeCommandEncoder> enc) {
+    id<MTLComputePipelineState> pso =
+        Y_BD.dtype == Dtype::FP16 ? pso_tanh_bw_fp16()
+      : Y_BD.dtype == Dtype::BF16 ? pso_tanh_bw_bf16()
+      : pso_tanh_bw();
+    dispatch1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:by offset:oy atIndex:0];
         [enc setBuffer:bdy offset:ody atIndex:1];
         [enc setBuffer:bdx offset:odx atIndex:2];

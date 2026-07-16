@@ -4,7 +4,9 @@
 //   pad2d_backward — dX OVERWRITTEN. Scatter adjoint (replicate/reflect can
 //                    fold multiple output pixels onto the same input).
 //
-// FP32-only. NCHW flat layout. Modes: 0 zero, 1 reflect, 2 replicate.
+// CPU is FP32-only; the GPU backends dispatch on X.dtype (FP32/FP16/BF16 —
+// pad is a pure copy, so the 16-bit runs are exact on quantised inputs).
+// NCHW flat layout. Modes: 0 zero, 1 reflect, 2 replicate.
 
 #include "parity_helpers.h"
 
@@ -54,6 +56,25 @@ void run_bwd(int N, int C, int H, int W,
                     kAtol, kRtol);
 }
 
+void run_fwd_fp16(int N, int C, int H, int W,
+                  int pt, int pb, int pl, int pr, int mode, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X = Tensor::mat(N, C * H * W);
+    fill_random(X, rng, 1.0f);
+    Tensor X_q = fp16_host_to_f32(to_fp16_host(X));   // shared quantised input
+
+    Tensor cpu_Y;
+    brotensor::pad2d_forward(X_q, N, C, H, W, pt, pb, pl, pr, mode, cpu_Y);
+
+    Tensor gX = to_fp16_gpu(X_q);
+    Tensor gpu_Y;
+    brotensor::pad2d_forward(gX, N, C, H, W, pt, pb, pl, pr, mode, gpu_Y);
+
+    // Forward pad only copies values — exact match expected.
+    compare_tensors(cpu_Y, fp16_host_to_f32(download_to_host(gpu_Y)),
+                    "pad2d_fp16_fwd", 0.0f, 0.0f);
+}
+
 } // namespace
 
 // zero pad
@@ -70,5 +91,10 @@ BT_PARITY_TEST(pad2d_bwd_reflect)    { run_bwd(2, 3, 5, 7, 2, 2, 3, 3, 1, 0xC112
 BT_PARITY_TEST(pad2d_fwd_replicate)  { run_fwd(2, 3, 4, 5, 3, 1, 4, 2, 2, 0xC120ull); }
 BT_PARITY_TEST(pad2d_bwd_replicate)  { run_bwd(2, 3, 4, 5, 3, 1, 4, 2, 2, 0xC121ull); }
 BT_PARITY_TEST(pad2d_bwd_replicate2) { run_bwd(1, 2, 6, 8, 5, 0, 0, 7, 2, 0xC122ull); }
+
+// FP16 storage — the diffusion VAE shape class (zero + reflect are the
+// modes the VAE/img2img path hits).
+BT_PARITY_TEST(pad2d_fp16_fwd_zero)    { run_fwd_fp16(2, 3, 5, 7, 1, 1, 2, 2, 0, 0xC130ull); }
+BT_PARITY_TEST(pad2d_fp16_fwd_reflect) { run_fwd_fp16(2, 3, 5, 7, 2, 2, 3, 3, 1, 0xC131ull); }
 
 int main() { return run_all("pad2d cpu/gpu parity"); }

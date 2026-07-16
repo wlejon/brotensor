@@ -12,64 +12,8 @@ using metal_impl::compile_pipeline;
 using metal_impl::dispatch1d_sync;
 using metal_impl::new_command_buffer;
 
-namespace {
-
-void launch_unary(NSString* name,
-                  const Tensor& in, Tensor& out) {
-    if (out.rows != in.rows || out.cols != in.cols) out.resize(in.rows, in.cols);
-    const uint32_t n = static_cast<uint32_t>(in.size());
-    if (n == 0) return;
-    id<MTLBuffer> bin  = buffer_for(in);
-    id<MTLBuffer> bout = buffer_for(out);
-    const NSUInteger off_in  = buffer_offset_for(in);
-    const NSUInteger off_out = buffer_offset_for(out);
-    dispatch1d_sync(name, n, ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:bin offset:off_in atIndex:0];
-        [enc setBuffer:bout offset:off_out atIndex:1];
-        [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
-    });
-}
-
-void launch_binary_back(NSString* name,
-                        const Tensor& a, const Tensor& dY,
-                        Tensor& dX, int rows, int cols) {
-    if (dX.rows != rows || dX.cols != cols) dX.resize(rows, cols);
-    const uint32_t n = static_cast<uint32_t>(rows * cols);
-    if (n == 0) return;
-    id<MTLBuffer> ba  = buffer_for(a);
-    id<MTLBuffer> bdy = buffer_for(dY);
-    id<MTLBuffer> bdx = buffer_for(dX);
-    const NSUInteger off_a  = buffer_offset_for(a);
-    const NSUInteger off_dy = buffer_offset_for(dY);
-    const NSUInteger off_dx = buffer_offset_for(dX);
-    dispatch1d_sync(name, n, ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:ba  offset:off_a  atIndex:0];
-        [enc setBuffer:bdy offset:off_dy atIndex:1];
-        [enc setBuffer:bdx offset:off_dx atIndex:2];
-        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
-    });
-}
-
-} // namespace
-
-void relu_forward(const Tensor& x, Tensor& y) {
-    launch_unary(@"k_relu_forward", x, y);
-}
-void relu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
-    launch_binary_back(@"k_relu_backward", x, dY, dX, x.rows, x.cols);
-}
-void tanh_forward(const Tensor& x, Tensor& y) {
-    launch_unary(@"k_tanh_forward", x, y);
-}
-void tanh_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
-    launch_binary_back(@"k_tanh_backward", y, dY, dX, y.rows, y.cols);
-}
-void sigmoid_forward(const Tensor& x, Tensor& y) {
-    launch_unary(@"k_sigmoid_forward", x, y);
-}
-void sigmoid_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
-    launch_binary_back(@"k_sigmoid_backward", y, dY, dX, y.rows, y.cols);
-}
+// relu/tanh/sigmoid dispatch on dtype like the silu/gelu family below —
+// their wrappers live after the kActivationSrc DEF_PSOs.
 
 // add_inplace forward decls (FP16 dispatcher lives further down with the
 // other FP16-extension kernels).
@@ -210,7 +154,7 @@ void clamp(Tensor& y, float lo, float hi) {
 
 void build_slot_mask(const Tensor& x, int offset, int K, int stride,
                      Tensor& mask) {
-    if (mask.rows != K || mask.cols != 1) mask.resize(K, 1);
+    if (mask.rows != K || mask.cols != 1 || mask.dtype != Dtype::FP32) mask.resize(K, 1, Dtype::FP32);
     if (K <= 0) return;
     id<MTLBuffer> bx = buffer_for(x);
     id<MTLBuffer> bm = buffer_for(mask);
@@ -527,6 +471,54 @@ kernel void k_clamp_bf16(device bfloat* y [[buffer(0)]],
     v = min(v, hi);
     y[i] = bfloat(v);
 }
+
+// ── relu / tanh / sigmoid (all dtypes; math in FP32) ─────────────────────
+// tanh/sigmoid backward take the FORWARD OUTPUT y as first argument, same as
+// kernels.mm and CUDA.
+
+inline float relu_scalar(float v)    { return v > 0.0f ? v : 0.0f; }
+inline float sigmoid_scalar(float v) { return 1.0f / (1.0f + exp(-v)); }
+
+#define EW_UNARY(NAME, T, FN)                                                 \
+kernel void NAME(device const T* x [[buffer(0)]],                             \
+                 device T*       y [[buffer(1)]],                             \
+                 constant uint& n  [[buffer(2)]],                             \
+                 uint i [[thread_position_in_grid]]) {                        \
+    if (i >= n) return;                                                       \
+    y[i] = T(FN(float(x[i])));                                                \
+}
+
+#define EW_UNARY_BWD(NAME, T, GRAD_EXPR)                                      \
+kernel void NAME(device const T* a  [[buffer(0)]],                            \
+                 device const T* dY [[buffer(1)]],                            \
+                 device T*       dX [[buffer(2)]],                            \
+                 constant uint& n   [[buffer(3)]],                            \
+                 uint i [[thread_position_in_grid]]) {                        \
+    if (i >= n) return;                                                       \
+    float av = float(a[i]);                                                   \
+    float dy = float(dY[i]);                                                  \
+    dX[i] = T(GRAD_EXPR);                                                     \
+}
+
+EW_UNARY(k_relu_forward_fp32, float,  relu_scalar)
+EW_UNARY(k_relu_forward_fp16, half,   relu_scalar)
+EW_UNARY(k_relu_forward_bf16, bfloat, relu_scalar)
+EW_UNARY(k_tanh_forward_fp32, float,  safe_tanh)
+EW_UNARY(k_tanh_forward_fp16, half,   safe_tanh)
+EW_UNARY(k_tanh_forward_bf16, bfloat, safe_tanh)
+EW_UNARY(k_sigmoid_forward_fp32, float,  sigmoid_scalar)
+EW_UNARY(k_sigmoid_forward_fp16, half,   sigmoid_scalar)
+EW_UNARY(k_sigmoid_forward_bf16, bfloat, sigmoid_scalar)
+
+EW_UNARY_BWD(k_relu_backward_fp32, float,  av > 0.0f ? dy : 0.0f)
+EW_UNARY_BWD(k_relu_backward_fp16, half,   av > 0.0f ? dy : 0.0f)
+EW_UNARY_BWD(k_relu_backward_bf16, bfloat, av > 0.0f ? dy : 0.0f)
+EW_UNARY_BWD(k_tanh_backward_fp32, float,  dy * (1.0f - av * av))
+EW_UNARY_BWD(k_tanh_backward_fp16, half,   dy * (1.0f - av * av))
+EW_UNARY_BWD(k_tanh_backward_bf16, bfloat, dy * (1.0f - av * av))
+EW_UNARY_BWD(k_sigmoid_backward_fp32, float,  dy * av * (1.0f - av))
+EW_UNARY_BWD(k_sigmoid_backward_fp16, half,   dy * av * (1.0f - av))
+EW_UNARY_BWD(k_sigmoid_backward_bf16, bfloat, dy * av * (1.0f - av))
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -566,6 +558,24 @@ DEF_PSO(pso_scale_fp16,       @"k_scale_inplace_fp16")
 DEF_PSO(pso_clamp_fp32,       @"k_clamp_fp32")
 DEF_PSO(pso_clamp_fp16,       @"k_clamp_fp16")
 DEF_PSO(pso_clamp_bf16,       @"k_clamp_bf16")
+DEF_PSO(pso_relu_fp32,        @"k_relu_forward_fp32")
+DEF_PSO(pso_relu_fp16,        @"k_relu_forward_fp16")
+DEF_PSO(pso_relu_bf16,        @"k_relu_forward_bf16")
+DEF_PSO(pso_tanh_fp32,        @"k_tanh_forward_fp32")
+DEF_PSO(pso_tanh_fp16,        @"k_tanh_forward_fp16")
+DEF_PSO(pso_tanh_bf16,        @"k_tanh_forward_bf16")
+DEF_PSO(pso_sigmoid_fp32,     @"k_sigmoid_forward_fp32")
+DEF_PSO(pso_sigmoid_fp16,     @"k_sigmoid_forward_fp16")
+DEF_PSO(pso_sigmoid_bf16,     @"k_sigmoid_forward_bf16")
+DEF_PSO(pso_relu_bwd_fp32,    @"k_relu_backward_fp32")
+DEF_PSO(pso_relu_bwd_fp16,    @"k_relu_backward_fp16")
+DEF_PSO(pso_relu_bwd_bf16,    @"k_relu_backward_bf16")
+DEF_PSO(pso_tanh_bwd_fp32,    @"k_tanh_backward_fp32")
+DEF_PSO(pso_tanh_bwd_fp16,    @"k_tanh_backward_fp16")
+DEF_PSO(pso_tanh_bwd_bf16,    @"k_tanh_backward_bf16")
+DEF_PSO(pso_sigmoid_bwd_fp32, @"k_sigmoid_backward_fp32")
+DEF_PSO(pso_sigmoid_bwd_fp16, @"k_sigmoid_backward_fp16")
+DEF_PSO(pso_sigmoid_bwd_bf16, @"k_sigmoid_backward_bf16")
 #undef DEF_PSO
 
 void launch_activation_unary(id<MTLComputePipelineState> pso,
@@ -680,6 +690,43 @@ void gelu_exact_backward(const Tensor& x, const Tensor& dY,
         x.dtype == Dtype::FP16 ? pso_gelu_exact_bwd_fp16()
       : x.dtype == Dtype::BF16 ? pso_gelu_exact_bwd_bf16()
       : pso_gelu_exact_bwd_fp32(), x, dY, dX);
+}
+void relu_forward(const Tensor& x, Tensor& y) {
+    launch_activation_unary(
+        x.dtype == Dtype::FP16 ? pso_relu_fp16()
+      : x.dtype == Dtype::BF16 ? pso_relu_bf16()
+      : pso_relu_fp32(), x, y);
+}
+void relu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
+    launch_activation_bwd(
+        x.dtype == Dtype::FP16 ? pso_relu_bwd_fp16()
+      : x.dtype == Dtype::BF16 ? pso_relu_bwd_bf16()
+      : pso_relu_bwd_fp32(), x, dY, dX);
+}
+void tanh_forward(const Tensor& x, Tensor& y) {
+    launch_activation_unary(
+        x.dtype == Dtype::FP16 ? pso_tanh_fp16()
+      : x.dtype == Dtype::BF16 ? pso_tanh_bf16()
+      : pso_tanh_fp32(), x, y);
+}
+// tanh/sigmoid backward take the forward OUTPUT y, not x (same as CUDA).
+void tanh_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
+    launch_activation_bwd(
+        y.dtype == Dtype::FP16 ? pso_tanh_bwd_fp16()
+      : y.dtype == Dtype::BF16 ? pso_tanh_bwd_bf16()
+      : pso_tanh_bwd_fp32(), y, dY, dX);
+}
+void sigmoid_forward(const Tensor& x, Tensor& y) {
+    launch_activation_unary(
+        x.dtype == Dtype::FP16 ? pso_sigmoid_fp16()
+      : x.dtype == Dtype::BF16 ? pso_sigmoid_bf16()
+      : pso_sigmoid_fp32(), x, y);
+}
+void sigmoid_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
+    launch_activation_bwd(
+        y.dtype == Dtype::FP16 ? pso_sigmoid_bwd_fp16()
+      : y.dtype == Dtype::BF16 ? pso_sigmoid_bwd_bf16()
+      : pso_sigmoid_bwd_fp32(), y, dY, dX);
 }
 
 namespace {
