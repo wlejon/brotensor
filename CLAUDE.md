@@ -14,18 +14,24 @@ include/brotensor/
                     public surface (ls ops/ is the table of contents)
   ops/              activation, attention, codec, concat, conv, conv1d,
                     delta_rule, diffusion, elementwise, embedding,
-                    flash_attention, image, linear, loss, norm, optim, pooling,
-                    quant, reduction, resize, rope, sampling, spatial, spectral
-  runtime.h         init() / default-device policy / compute_dtype() /
-                    DeviceScope / sync
+                    flash_attention, image, linear, lora, loss, lstm, norm,
+                    optim, pooling, quant, reduction, resize, rope, sampling,
+                    spatial, spectral, stylegan
+  runtime.h         init() / shutdown() / default-device policy /
+                    compute_dtype() / DeviceScope / sync / device mem info+trim
   safetensors.h     safetensors reader + writer — File/TensorView + upload* +
                     write_file. Tensor-container format; output type is Tensor
   gguf.h            GGUF reader — mmap'd File + TensorInfo + metadata +
-                    shape_to_2d + upload_raw; F32/F16 and Q4_K/Q6_K/Q8_0 carriers
+                    shape_to_2d + upload_raw. Carries F32/F16/BF16 + every
+                    legacy/K-quant block type; only Q4_K/Q6_K/Q8_0 have ops
+  cuda_graph.h      CUDA graph capture/replay (CudaGraph, CudaGraphCapture) —
+                    CUDA-only, gate on BROTENSOR_HAS_CUDA
   metal_interop.h   Public Metal custom-kernel surface (Obj-C++ / .mm only)
   detail/op_table.h  X-macro: the single canonical op list
   detail/dispatch.h  OpsVTable / AllocVTable + register_backend + dispatch()
-  detail/cpu/        CPU-internal helpers shared across CPU TUs (e.g. fft_core.h)
+  detail/string_hash.h  Heterogeneous string hash for the loaders' name indices
+  detail/cpu/        CPU-internal helpers shared across CPU TUs
+                     (fft_core.h, thread_pool.h)
 
 src/
   tensor.cpp        Tensor impl — alloc/clone/to/resize/zero via AllocVTable
@@ -38,7 +44,8 @@ src/
                     essentially the whole FP32 fwd+bwd surface (audio, vision,
                     diffusion samplers, flash attention, …); leaves FP16/BF16/
                     INT8/GGUF-quant slots null
-  cuda/             *.cu  — CUDA backend (gated on BROTENSOR_WITH_CUDA)
+  cuda/             *.cu  — CUDA backend (gated on BROTENSOR_WITH_CUDA);
+                    detail/ holds CUDA-internal helpers (cuda_check.h, …)
   metal/            *.mm  — Metal backend (gated on BROTENSOR_WITH_METAL)
 ```
 

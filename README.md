@@ -17,13 +17,14 @@ brotensor is the shared tensor layer for a family of sibling projects (`brodiffu
 ## What's inside
 
 - **A forward + backward op surface** covering the dense / attention / normalization / convolution / loss / optimizer core, plus dedicated families for:
-  - **LLM inference** — RoPE (incl. M-RoPE), RMSNorm, SwiGLU, KV-cache append, causal flash-decode with GQA, Gated DeltaNet linear attention, GGUF fused quant matmul
+  - **LLM inference** — RoPE (incl. M-RoPE), RMSNorm, SwiGLU, KV-cache append, causal flash-decode with GQA, GQA prefill attention (causal *or* bidirectional, for LLM2Vec-style encoders), Gated DeltaNet linear attention, GGUF fused quant matmul
   - **Diffusion inference** — conv2d, GroupNorm, cross-attention, fused ResBlock, AdaLN modulate, fused DDIM / Euler / DPM++ 2M sampler steps (SD 1.5, SDXL, DiT)
   - **Audio (TTS / STT / codecs)** — FFT/STFT spectral core, 1D convolution (incl. transposed + streaming causal), vocoder activations, VQ/FSQ codec quantization, resampling, autoregressive logit sampling
   - **Vision** — SAM/ViTDet decomposed-rel-pos attention, window partition, Qwen-VL spatial merge, deformable conv2d, interp2d, image preprocessing
   - **Training building blocks** — flash attention with backward, LSTM with full BPTT, LoRA adapters, StyleGAN3 generator primitives (modulated conv, upfirdn2d, filtered lrelu), SGD/Adam
 - **Precision & quantization** — the CPU backend is the complete FP32 reference; the GPU backends add FP16/BF16 paths, INT8 weight-only matmul/conv (W8A16), and GGUF block-quant kernels (Q4_K / Q6_K / Q8_0)
 - **Model loading** — mmap'd zero-copy readers for **safetensors** (also writes) and **GGUF**
+- **CUDA graph capture** (`<brotensor/cuda_graph.h>`) — capture a fixed-shape step once and replay it with a single launch, amortising per-kernel launch overhead in tight decode loops. `Tensor::resize` keeps device pointers stable across shape cycles so captured buffers stay valid
 
 See [docs/op-coverage.md](docs/op-coverage.md) for the full per-op coverage tables.
 

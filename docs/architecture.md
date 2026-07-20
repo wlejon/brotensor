@@ -51,9 +51,9 @@ The vtable slot signature *is* the public signature: same argument order, same s
 
 - **CPU** — scalar FP32, always compiled. It implements essentially the entire FP32 surface, forward *and* backward — including the diffusion samplers, flash attention, the audio family, and the vision primitives. It is the simple, correct, autovectorize-friendly reference that the parity tests measure the GPU backends against. By design it leaves the FP16 / BF16 / INT8-W8A16 / GGUF-quant slots null.
 - **CUDA** (`BROTENSOR_WITH_CUDA=ON`) — mirrors the FP32 surface and adds the FP16/BF16 precision paths, batched-inference variants, W8A16 WMMA kernels, GGUF block-quant kernels, and fused inference kernels.
-- **Metal** (`BROTENSOR_WITH_METAL=ON`) — same role as CUDA on Apple GPUs. A few inference-only ops are CPU+CUDA with the Metal slot left null (noted in the [coverage tables](op-coverage.md)).
+- **Metal** (`BROTENSOR_WITH_METAL=ON`) — same role as CUDA on Apple GPUs, and at near-total parity with it: of the 260 slots Metal leaves six null (three host-scalar loss/RNG ops, `xavier_init`, and the CUDA-only fused `filtered_lrelu` pair). See the [coverage tables](op-coverage.md#backend-coverage).
 
-A handful of "ops" are not vtable entries at all but device-agnostic compositions of public ops — LoRA (`ops/lora.h`, header-only) and the `filtered_lrelu` composite fallback — so they run on any backend automatically.
+A handful of "ops" are not vtable entries at all but device-agnostic compositions of public ops — LoRA (`ops/lora.h`, header-only) and the `filtered_lrelu` composite — so they run on any backend automatically.
 
 ## Default device and scopes
 
