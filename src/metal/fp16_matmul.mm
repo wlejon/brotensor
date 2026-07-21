@@ -1,17 +1,25 @@
 // Tiled FP16 matmul on Metal using simdgroup_matrix<half, 8, 8>.
 //
-// Computes C(M, N) = A(M, K) @ B(N, K)^T, FP16 storage with FP32 accumulator.
-// Memory layout: A row-major (M, K). B row-major (N, K). C row-major (M, N).
+// Computes C(M, N) = A(M, K) @ B(N, K)^T, FP16 storage with FP32 accumulator,
+// optionally batched (per-matrix strides), with a fused per-N bias and an
+// epilogue activation. Memory layout within a batch: A row-major (M, K),
+// B row-major (N, K), C row-major (M, N).
 //
-// CTA (threadgroup) tile: BM=32, BN=32, BK=16. 4 simdgroups in a 2x2 grid;
-// each simdgroup owns a 16x16 sub-tile of C (= 2x2 grid of 8x8 fragments).
-// Threadgroup size = 128 (4 simdgroups * 32 threads/simdgroup on Apple).
+// Threadgroup tile: BM=64, BN=64, BK=32 — mirrors the CUDA WMMA GEMM and the
+// in-tree conv2d_wmma implicit-GEMM (src/metal/conv2d_wmma.mm), the best
+// reference kernel here. 4 simdgroups in a 2x2 grid, 32 threads each = 128
+// threads/threadgroup; each simdgroup owns a 32x32 output region covered by a
+// 4x4 grid of 8x8 simdgroup_matrix tiles. Shared A/B tiles carry an 8-element
+// pad on the leading dim (LDA/LDB = BK+8) to avoid threadgroup-memory bank
+// conflicts; the FP32 epilogue stages through Cs (LDC = BN+8).
 //
-// Fast-path safety conditions (otherwise fall back to naive kernel):
-//   K >= 16 && (K % 16 == 0) && (N % 32 == 0) && M*N >= 256
-// M may be arbitrary — M-edge tiles mask both load (zero-fill rows of A)
-// and store (skip rows >= M). N and K must be aligned so that 8x8
-// simdgroup loads/stores never straddle the tile boundary.
+// The tiled kernel masks all three of M, N, K by zero-filling the shared tiles
+// on out-of-range global loads (partial K-tiles contribute zero, partial N/M
+// rows are skipped on store), so it is correct for ARBITRARY M, N, K — no
+// alignment precondition. Small problems (M*N below kTiledMin) and K==0 take
+// the one-thread-per-output naive kernel, which also carries batch/bias/act.
+//
+// BF16 has no simdgroup_matrix form, so it keeps a naive per-thread GEMM.
 
 #include "fp16_matmul.h"
 
@@ -28,196 +36,221 @@ NSString* const kSrc = @R"msl(
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
-// ---------------- Naive fallback (one thread per output) ----------------
-kernel void k_matmul_abt_fp16_naive(device const half* A [[buffer(0)]],
-                                    device const half* B [[buffer(1)]],
-                                    device half*       C [[buffer(2)]],
-                                    constant uint& M     [[buffer(3)]],
-                                    constant uint& N     [[buffer(4)]],
-                                    constant uint& K     [[buffer(5)]],
-                                    uint idx [[thread_position_in_grid]]) {
-    uint total = M * N;
-    if (idx >= total) return;
-    uint m = idx / N;
-    uint n = idx % N;
-    float acc = 0.0f;
-    for (uint k = 0; k < K; ++k) {
-        acc += float(A[m * K + k]) * float(B[n * K + k]);
+struct AbtParams {
+    uint  M, N, K, has_bias;
+    int   act;
+    uint  _pad;
+    ulong sA, sB, sC;
+};
+
+// ---- Fused activation epilogue (matches src/cuda/fp16_matmul.cu act codes) --
+// MSL has no built-in erf; Abramowitz & Stegun 7.1.26 (max abs err ~1.5e-7).
+inline float abt_erf_approx(float x) {
+    const float a1 =  0.254829592f;
+    const float a2 = -0.284496736f;
+    const float a3 =  1.421413741f;
+    const float a4 = -1.453152027f;
+    const float a5 =  1.061405429f;
+    const float p  =  0.3275911f;
+    float sign_x = (x < 0.0f) ? -1.0f : 1.0f;
+    float ax = fabs(x);
+    float t  = 1.0f / (1.0f + p * ax);
+    float y  = 1.0f - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-ax * ax);
+    return sign_x * y;
+}
+
+inline float abt_apply_act(int act, float v) {
+    switch (act) {
+        case 1:  return max(v, 0.0f);
+        case 2: {
+            constexpr float kSqrt2OverPi = 0.7978845608f;
+            float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
+            return 0.5f * v * (1.0f + tanh(clamp(u, -9.0f, 9.0f)));
+        }
+        case 3: {
+            constexpr float kInvSqrt2 = 0.70710678118654752440f;
+            return 0.5f * v * (1.0f + abt_erf_approx(v * kInvSqrt2));
+        }
+        case 4:  return v / (1.0f + exp(-v));
+        case 5:  return v / (1.0f + exp(-1.702f * v));
+        default: return v;
     }
-    C[idx] = half(acc);
 }
 
-// ---------------- Zero-fill (used when K == 0) ----------------
-kernel void k_fp16_zero(device half* C [[buffer(0)]],
-                        constant uint& total [[buffer(1)]],
-                        uint idx [[thread_position_in_grid]]) {
+// ---------------- Naive fallback (one thread per output, batched) -----------
+kernel void k_matmul_abt_fp16_naive(device const half*   A    [[buffer(0)]],
+                                    device const half*   B    [[buffer(1)]],
+                                    device half*         C    [[buffer(2)]],
+                                    device const half*   bias [[buffer(3)]],
+                                    constant AbtParams&  p    [[buffer(4)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
+    const uint idx = gid.x;
+    const uint b   = gid.y;
+    const uint total = p.M * p.N;
     if (idx >= total) return;
-    C[idx] = half(0.0f);
-}
-
-// ---------------- BF16: naive only ----------------
-// No simdgroup-matrix tile for bfloat — simdgroup_matrix is half/float, so the
-// BF16 path trades peak throughput for coverage, as the other Metal 16-bit
-// GEMMs (Q4_K / Q8_0 / INT8W) already do. K == 0 needs no zero-fill twin: the
-// k-loop simply doesn't run and every thread stores 0.
-kernel void k_matmul_abt_bf16_naive(device const bfloat* A [[buffer(0)]],
-                                    device const bfloat* B [[buffer(1)]],
-                                    device bfloat*       C [[buffer(2)]],
-                                    constant uint& M       [[buffer(3)]],
-                                    constant uint& N       [[buffer(4)]],
-                                    constant uint& K       [[buffer(5)]],
-                                    uint idx [[thread_position_in_grid]]) {
-    uint total = M * N;
-    if (idx >= total) return;
-    uint m = idx / N;
-    uint n = idx % N;
+    device const half* Ab = A + b * p.sA;
+    device const half* Bb = B + b * p.sB;
+    device half*       Cb = C + b * p.sC;
+    const uint m = idx / p.N;
+    const uint n = idx % p.N;
     float acc = 0.0f;
-    for (uint k = 0; k < K; ++k) {
-        acc += float(A[m * K + k]) * float(B[n * K + k]);
+    for (uint k = 0; k < p.K; ++k) {
+        acc += float(Ab[m * p.K + k]) * float(Bb[n * p.K + k]);
     }
-    C[idx] = bfloat(acc);
+    if (p.has_bias) acc += float(bias[n]);
+    acc = abt_apply_act(p.act, acc);
+    Cb[idx] = half(acc);
 }
 
-// ---------------- Tiled simdgroup-matrix kernel ----------------
-constant constexpr int BM = 32;
-constant constexpr int BN = 32;
-constant constexpr int BK = 16;
+// ---------------- BF16 naive (no simdgroup form for bfloat) -----------------
+kernel void k_matmul_abt_bf16_naive(device const bfloat* A    [[buffer(0)]],
+                                    device const bfloat* B    [[buffer(1)]],
+                                    device bfloat*       C    [[buffer(2)]],
+                                    device const bfloat* bias [[buffer(3)]],
+                                    constant AbtParams&  p    [[buffer(4)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
+    const uint idx = gid.x;
+    const uint b   = gid.y;
+    const uint total = p.M * p.N;
+    if (idx >= total) return;
+    device const bfloat* Ab = A + b * p.sA;
+    device const bfloat* Bb = B + b * p.sB;
+    device bfloat*       Cb = C + b * p.sC;
+    const uint m = idx / p.N;
+    const uint n = idx % p.N;
+    float acc = 0.0f;
+    for (uint k = 0; k < p.K; ++k) {
+        acc += float(Ab[m * p.K + k]) * float(Bb[n * p.K + k]);
+    }
+    if (p.has_bias) acc += float(bias[n]);
+    acc = abt_apply_act(p.act, acc);
+    Cb[idx] = bfloat(acc);
+}
+
+// ---------------- Tiled simdgroup-matrix kernel (batched) -------------------
+constant constexpr int BM = 64;
+constant constexpr int BN = 64;
+constant constexpr int BK = 32;
 constant constexpr int WARPS_M = 2;
 constant constexpr int WARPS_N = 2;
-constant constexpr int THREADS_PER_TG = 128;  // WARPS_M * WARPS_N * 32
-constant constexpr int WM = BM / WARPS_M;     // 16
-constant constexpr int WN = BN / WARPS_N;     // 16
-constant constexpr int FRAGS_M = WM / 8;      // 2
-constant constexpr int FRAGS_N = WN / 8;      // 2
-constant constexpr int FRAGS_K = BK / 8;      // 2
+constant constexpr int THREADS_PER_TG = 128;   // WARPS_M * WARPS_N * 32
+constant constexpr int WM = BM / WARPS_M;       // 32
+constant constexpr int WN = BN / WARPS_N;       // 32
+constant constexpr int FRAGS_M = WM / 8;        // 4
+constant constexpr int FRAGS_N = WN / 8;        // 4
+constant constexpr int FRAGS_K = BK / 8;        // 4
+constant constexpr int LDA = BK + 8;            // pad to dodge bank conflicts
+constant constexpr int LDB = BK + 8;
+constant constexpr int LDC = BN + 8;
 
 [[max_total_threads_per_threadgroup(THREADS_PER_TG)]]
-kernel void k_matmul_abt_fp16_simdgroup(device const half* A [[buffer(0)]],
-                                        device const half* B [[buffer(1)]],
-                                        device half*       C [[buffer(2)]],
-                                        constant uint& M     [[buffer(3)]],
-                                        constant uint& N     [[buffer(4)]],
-                                        constant uint& K     [[buffer(5)]],
-                                        uint3 tid_in_tg3 [[thread_position_in_threadgroup]],
-                                        uint3 tg_pos3    [[threadgroup_position_in_grid]]) {
-    const uint  tid_in_tg = tid_in_tg3.x;
-    const uint2 tg_pos    = uint2(tg_pos3.x, tg_pos3.y);
-    const uint  sg_id     = tid_in_tg / 32u;
-    threadgroup half As[BM * BK];          // (BM, BK) row-major
-    threadgroup half Bs[BN * BK];          // (BN, BK) row-major
-    threadgroup float Cs[BM * BN];         // staging for fp32 -> fp16 store
+kernel void k_matmul_abt_fp16_simdgroup(device const half*  A    [[buffer(0)]],
+                                        device const half*  B    [[buffer(1)]],
+                                        device half*        C    [[buffer(2)]],
+                                        device const half*  bias [[buffer(3)]],
+                                        constant AbtParams& p    [[buffer(4)]],
+                                        uint3 tg_pos [[threadgroup_position_in_grid]],
+                                        uint  tid    [[thread_index_in_threadgroup]],
+                                        uint  sg_id  [[simdgroup_index_in_threadgroup]]) {
+    const uint M = p.M, N = p.N, K = p.K;
+    const uint b = tg_pos.z;
+    device const half* Ab = A + (ulong)b * p.sA;
+    device const half* Bb = B + (ulong)b * p.sB;
+    device half*       Cb = C + (ulong)b * p.sC;
 
-    const uint block_m = tg_pos.y * BM;
-    const uint block_n = tg_pos.x * BN;
+    const int block_m = int(tg_pos.y) * BM;
+    const int block_n = int(tg_pos.x) * BN;
+    const int warp_m = int(sg_id) / WARPS_N;
+    const int warp_n = int(sg_id) % WARPS_N;
 
-    const uint warp_m = sg_id / WARPS_N;   // 0 or 1
-    const uint warp_n = sg_id % WARPS_N;   // 0 or 1
+    threadgroup half As[BM * LDA];
+    threadgroup half Bs[BN * LDB];
 
-    // Accumulator fragments (fp32).
     simdgroup_matrix<float, 8, 8> c_frag[FRAGS_M][FRAGS_N];
-    for (int i = 0; i < FRAGS_M; ++i) {
-        for (int j = 0; j < FRAGS_N; ++j) {
-            c_frag[i][j] = simdgroup_matrix<float, 8, 8>(0);
-        }
-    }
+    for (int i = 0; i < FRAGS_M; ++i)
+        for (int j = 0; j < FRAGS_N; ++j)
+            c_frag[i][j] = simdgroup_matrix<float, 8, 8>(0.0f);
 
-    // Loop over K in chunks of BK.
     for (uint k0 = 0; k0 < K; k0 += BK) {
-        // ---- Load A tile (BM x BK = 32 x 16 = 512 halves; 128 threads => 4/thread)
-        // Layout: each thread loads 4 halves along K (one row-chunk).
-        // We use one half per load with row-major linearization.
-        for (int li = 0; li < 4; ++li) {
-            int lin = int(tid_in_tg) + li * THREADS_PER_TG;  // 0..511
-            int r = lin / BK;                                // 0..31
-            int c = lin % BK;                                // 0..15
-            int gr = int(block_m) + r;
-            int gk = int(k0) + c;
-            half v = half(0.0f);
-            if (gr < int(M)) {
-                v = A[uint(gr) * K + uint(gk)];
+        // A tile (BM x BK), row = M index, col = K index. Masked on M and K.
+        {
+            constexpr int kPerThr = (BM * BK) / THREADS_PER_TG;   // 16
+            for (int li = 0; li < kPerThr; ++li) {
+                const int lin = int(tid) + li * THREADS_PER_TG;
+                const int r   = lin / BK;              // 0..BM-1
+                const int c   = lin - r * BK;          // 0..BK-1
+                const int m_g = block_m + r;
+                const uint gk = k0 + uint(c);
+                half v = half(0);
+                if (m_g < int(M) && gk < K) v = Ab[uint(m_g) * K + gk];
+                As[r * LDA + c] = v;
             }
-            As[r * BK + c] = v;
         }
-
-        // ---- Load B tile (BN x BK = 32 x 16) — N and K are aligned, no bounds check.
-        for (int li = 0; li < 4; ++li) {
-            int lin = int(tid_in_tg) + li * THREADS_PER_TG;
-            int r = lin / BK;                                // row in N
-            int c = lin % BK;                                // col in K
-            int gr = int(block_n) + r;
-            int gk = int(k0) + c;
-            Bs[r * BK + c] = B[uint(gr) * K + uint(gk)];
+        // B tile (BN x BK), row = N index, col = K index. Masked on N and K.
+        {
+            constexpr int kPerThr = (BN * BK) / THREADS_PER_TG;   // 16
+            for (int li = 0; li < kPerThr; ++li) {
+                const int lin = int(tid) + li * THREADS_PER_TG;
+                const int r   = lin / BK;              // 0..BN-1
+                const int c   = lin - r * BK;          // 0..BK-1
+                const int n_g = block_n + r;
+                const uint gk = k0 + uint(c);
+                half v = half(0);
+                if (n_g < int(N) && gk < K) v = Bb[uint(n_g) * K + gk];
+                Bs[r * LDB + c] = v;
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- Compute on tile ----
-        // A frag (matrix_a) loaded from As, row-major stride BK.
-        // B frag (matrix_b) is (K, N) view: B[k,n] = Bs[n,k]. We load via
-        // simdgroup_load with transpose=true reading from &Bs[n_col][kk], so
-        // the loaded 8x8 frag holds Bs[n_col:n_col+8, kk:kk+8] transposed,
-        // i.e. B^T[kk:kk+8, n_col:n_col+8] = the matrix_b slice we want.
-        for (int kk = 0; kk < BK; kk += 8) {
+        for (int kk = 0; kk < FRAGS_K; ++kk) {
             simdgroup_matrix<half, 8, 8> a_frag[FRAGS_M];
             simdgroup_matrix<half, 8, 8> b_frag[FRAGS_N];
-
             for (int i = 0; i < FRAGS_M; ++i) {
-                ulong a_row = ulong(warp_m * WM + i * 8);
-                ulong a_col = ulong(kk);
-                simdgroup_load(a_frag[i],
-                               (const threadgroup half*)As,
-                               ulong(BK),
-                               ulong2(a_col, a_row),
-                               false);
+                const int a_row = warp_m * WM + i * 8;
+                simdgroup_load(a_frag[i], As + a_row * LDA + kk * 8, LDA,
+                               ulong2(0, 0), false);
             }
+            // B stored row-major (N, K). The MMA right operand wants (K, N):
+            // load with transpose=true so the 8x8 frag is B^T[k, n].
             for (int j = 0; j < FRAGS_N; ++j) {
-                // Want frag = B^T[kk:kk+8, n0:n0+8] where n0 = warp_n*WN + j*8.
-                // Source in Bs is at row=n0, col=kk; load with transpose=true.
-                ulong n0 = ulong(warp_n * WN + j * 8);
-                simdgroup_load(b_frag[j],
-                               (const threadgroup half*)Bs,
-                               ulong(BK),
-                               ulong2(ulong(kk), n0),
-                               true);
+                const int b_row = warp_n * WN + j * 8;   // n
+                simdgroup_load(b_frag[j], Bs + b_row * LDB + kk * 8, LDB,
+                               ulong2(0, 0), true);
             }
-
-            for (int i = 0; i < FRAGS_M; ++i) {
-                for (int j = 0; j < FRAGS_N; ++j) {
-                    simdgroup_multiply_accumulate(c_frag[i][j],
-                                                  a_frag[i],
-                                                  b_frag[j],
-                                                  c_frag[i][j]);
-                }
-            }
+            for (int i = 0; i < FRAGS_M; ++i)
+                for (int j = 0; j < FRAGS_N; ++j)
+                    simdgroup_multiply_accumulate(c_frag[i][j], a_frag[i],
+                                                  b_frag[j], c_frag[i][j]);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // ---- Store fp32 frags to threadgroup Cs, then convert + write to C ----
-    for (int i = 0; i < FRAGS_M; ++i) {
+    // Epilogue: stage FP32 frags to Cs, then write to C with bias + activation.
+    threadgroup float Cs[BM * LDC];
+    for (int i = 0; i < FRAGS_M; ++i)
         for (int j = 0; j < FRAGS_N; ++j) {
-            ulong row = ulong(warp_m * WM + i * 8);
-            ulong col = ulong(warp_n * WN + j * 8);
-            simdgroup_store(c_frag[i][j],
-                            (threadgroup float*)Cs,
-                            ulong(BN),
-                            ulong2(col, row),
-                            false);
+            const int c_row = warp_m * WM + i * 8;
+            const int c_col = warp_n * WN + j * 8;
+            simdgroup_store(c_frag[i][j], Cs + c_row * LDC + c_col, LDC,
+                            ulong2(0, 0), false);
         }
-    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Cooperative write Cs -> C global (BM*BN = 1024 halves, 128 thr => 8/thr).
-    // N is aligned to BN, so no N-bounds check. M-edge: skip out-of-range rows.
-    for (int li = 0; li < 8; ++li) {
-        int lin = int(tid_in_tg) + li * THREADS_PER_TG;  // 0..1023
-        int r = lin / BN;                                // 0..31
-        int c = lin % BN;                                // 0..31
-        int gr = int(block_m) + r;
-        int gn = int(block_n) + c;
-        if (gr < int(M)) {
-            C[uint(gr) * N + uint(gn)] = half(Cs[r * BN + c]);
+    {
+        constexpr int kPerThr = (BM * BN) / THREADS_PER_TG;   // 32
+        for (int si = 0; si < kPerThr; ++si) {
+            const int lin = int(tid) + si * THREADS_PER_TG;
+            const int r   = lin / BN;
+            const int c   = lin - r * BN;
+            const int m_g = block_m + r;
+            const int n_g = block_n + c;
+            if (m_g >= int(M) || n_g >= int(N)) continue;
+            float v = Cs[r * LDC + c];
+            if (p.has_bias) v += float(bias[n_g]);
+            v = abt_apply_act(p.act, v);
+            Cb[uint(m_g) * N + uint(n_g)] = half(v);
         }
     }
 }
@@ -235,12 +268,6 @@ id<MTLComputePipelineState> pso_naive() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_matmul_abt_fp16_naive"); });
     return pso;
 }
-id<MTLComputePipelineState> pso_zero() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fp16_zero"); });
-    return pso;
-}
 id<MTLComputePipelineState> pso_naive_bf16() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -248,64 +275,61 @@ id<MTLComputePipelineState> pso_naive_bf16() {
     return pso;
 }
 
-constexpr int kBM = 32;
-constexpr int kBN = 32;
-constexpr int kBK = 16;
-constexpr int kThreadsPerTG = 128;
+// Parameter block — must match the MSL `AbtParams` struct byte-for-byte.
+struct AbtParams {
+    uint32_t M, N, K, has_bias;
+    int32_t  act;
+    uint32_t _pad;
+    uint64_t sA, sB, sC;
+};
+
+constexpr int kBM = 64;
+constexpr int kBN = 64;
+constexpr int kThreadsPerTG = 128;   // WARPS_M * WARPS_N * 32, matches the MSL
+constexpr size_t kTiledMin = 1024;   // below this M*N, the naive path wins
 
 } // namespace
 
-void launch_matmul_abt_fp16(id<MTLBuffer> A, NSUInteger ofs_A,
-                            id<MTLBuffer> B, NSUInteger ofs_B,
-                            id<MTLBuffer> C, NSUInteger ofs_C,
-                            int M, int N, int K) {
-    if (M == 0 || N == 0) return;
+void launch_matmul_abt_fp16_ex(id<MTLBuffer> A, NSUInteger ofs_A,
+                               id<MTLBuffer> B, NSUInteger ofs_B,
+                               id<MTLBuffer> C, NSUInteger ofs_C,
+                               int batch, int M, int N, int K,
+                               uint64_t strideA, uint64_t strideB, uint64_t strideC,
+                               id<MTLBuffer> bias, NSUInteger ofs_bias, bool has_bias,
+                               int act) {
+    if (batch <= 0 || M == 0 || N == 0) return;
 
-    const uint32_t Mu = static_cast<uint32_t>(M);
-    const uint32_t Nu = static_cast<uint32_t>(N);
-    const uint32_t Ku = static_cast<uint32_t>(K);
+    AbtParams p{};
+    p.M = static_cast<uint32_t>(M);
+    p.N = static_cast<uint32_t>(N);
+    p.K = static_cast<uint32_t>(K < 0 ? 0 : K);
+    p.has_bias = has_bias ? 1u : 0u;
+    p.act = static_cast<int32_t>(act);
+    p.sA = strideA;
+    p.sB = strideB;
+    p.sC = strideC;
 
-    if (K == 0) {
-        // Zero the (M,N) output.
-        const uint32_t total = Mu * Nu;
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            id<MTLComputePipelineState> pso = pso_zero();
-            [enc setComputePipelineState:pso];
-            [enc setBuffer:C offset:ofs_C atIndex:0];
-            [enc setBytes:&total length:sizeof(uint32_t) atIndex:1];
-            NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-            if (tg > 256) tg = 256;
-            [enc dispatchThreads:MTLSizeMake(total, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-        return;
-    }
+    // Dummy bias bind when has_bias=false; the kernel never reads it.
+    id<MTLBuffer> bBias = has_bias ? bias : A;
+    const NSUInteger oBias = has_bias ? ofs_bias : ofs_A;
 
-    const bool tiled_ok = (static_cast<size_t>(M) * static_cast<size_t>(N) >= 256)
-                       && (K >= kBK)
-                       && (K % kBK == 0)
-                       && (N % kBN == 0);
+    const bool tiled = (K > 0) &&
+        (static_cast<size_t>(M) * static_cast<size_t>(N) >= kTiledMin);
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = new_command_buffer();
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-
-        if (tiled_ok) {
+        if (tiled) {
             id<MTLComputePipelineState> pso = pso_tiled();
             [enc setComputePipelineState:pso];
             [enc setBuffer:A offset:ofs_A atIndex:0];
             [enc setBuffer:B offset:ofs_B atIndex:1];
             [enc setBuffer:C offset:ofs_C atIndex:2];
-            [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
-            const NSUInteger grid_x = static_cast<NSUInteger>((N + kBN - 1) / kBN);
-            const NSUInteger grid_y = static_cast<NSUInteger>((M + kBM - 1) / kBM);
-            [enc dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
+            [enc setBuffer:bBias offset:oBias atIndex:3];
+            [enc setBytes:&p length:sizeof(AbtParams) atIndex:4];
+            const NSUInteger gx = static_cast<NSUInteger>((N + kBN - 1) / kBN);
+            const NSUInteger gy = static_cast<NSUInteger>((M + kBM - 1) / kBM);
+            [enc dispatchThreadgroups:MTLSizeMake(gx, gy, static_cast<NSUInteger>(batch))
                 threadsPerThreadgroup:MTLSizeMake(kThreadsPerTG, 1, 1)];
         } else {
             id<MTLComputePipelineState> pso = pso_naive();
@@ -313,31 +337,57 @@ void launch_matmul_abt_fp16(id<MTLBuffer> A, NSUInteger ofs_A,
             [enc setBuffer:A offset:ofs_A atIndex:0];
             [enc setBuffer:B offset:ofs_B atIndex:1];
             [enc setBuffer:C offset:ofs_C atIndex:2];
-            [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
-            const NSUInteger total = static_cast<NSUInteger>(Mu) * static_cast<NSUInteger>(Nu);
+            [enc setBuffer:bBias offset:oBias atIndex:3];
+            [enc setBytes:&p length:sizeof(AbtParams) atIndex:4];
+            const NSUInteger total = static_cast<NSUInteger>(M) * static_cast<NSUInteger>(N);
             NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
             if (tg > 256) tg = 256;
-            [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+            [enc dispatchThreads:MTLSizeMake(total, static_cast<NSUInteger>(batch), 1)
                 threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         }
-
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
     }
 }
 
-void launch_matmul_abt_bf16(id<MTLBuffer> A, NSUInteger ofs_A,
+void launch_matmul_abt_fp16(id<MTLBuffer> A, NSUInteger ofs_A,
                             id<MTLBuffer> B, NSUInteger ofs_B,
                             id<MTLBuffer> C, NSUInteger ofs_C,
                             int M, int N, int K) {
-    if (M == 0 || N == 0) return;
+    // Single (non-batched) contiguous case, no bias, no activation — the shape
+    // the attention QK^T/PV and Linear-forward callers use. Routes through the
+    // batched tiled path so those callers get the simdgroup fast path.
+    launch_matmul_abt_fp16_ex(A, ofs_A, B, ofs_B, C, ofs_C,
+                              /*batch=*/1, M, N, K,
+                              static_cast<uint64_t>(M) * static_cast<uint64_t>(K < 0 ? 0 : K),
+                              static_cast<uint64_t>(N) * static_cast<uint64_t>(K < 0 ? 0 : K),
+                              static_cast<uint64_t>(M) * static_cast<uint64_t>(N),
+                              /*bias=*/nil, /*ofs_bias=*/0, /*has_bias=*/false,
+                              /*act=*/0);
+}
 
-    const uint32_t Mu = static_cast<uint32_t>(M);
-    const uint32_t Nu = static_cast<uint32_t>(N);
-    const uint32_t Ku = static_cast<uint32_t>(K);
-    const uint32_t total = Mu * Nu;
+void launch_matmul_abt_bf16_ex(id<MTLBuffer> A, NSUInteger ofs_A,
+                               id<MTLBuffer> B, NSUInteger ofs_B,
+                               id<MTLBuffer> C, NSUInteger ofs_C,
+                               int batch, int M, int N, int K,
+                               uint64_t strideA, uint64_t strideB, uint64_t strideC,
+                               id<MTLBuffer> bias, NSUInteger ofs_bias, bool has_bias,
+                               int act) {
+    // BF16 has no simdgroup_matrix form, so this is naive-only (one thread per
+    // output). It still carries batch strides + bias + activation so the public
+    // matmul_abt op has a real BF16 path.
+    if (batch <= 0 || M == 0 || N == 0) return;
+    AbtParams p{};
+    p.M = static_cast<uint32_t>(M);
+    p.N = static_cast<uint32_t>(N);
+    p.K = static_cast<uint32_t>(K < 0 ? 0 : K);
+    p.has_bias = has_bias ? 1u : 0u;
+    p.act = static_cast<int32_t>(act);
+    p.sA = strideA;
+    p.sB = strideB;
+    p.sC = strideC;
+    id<MTLBuffer> bBias = has_bias ? bias : A;
+    const NSUInteger oBias = has_bias ? ofs_bias : ofs_A;
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = new_command_buffer();
@@ -347,16 +397,30 @@ void launch_matmul_abt_bf16(id<MTLBuffer> A, NSUInteger ofs_A,
         [enc setBuffer:A offset:ofs_A atIndex:0];
         [enc setBuffer:B offset:ofs_B atIndex:1];
         [enc setBuffer:C offset:ofs_C atIndex:2];
-        [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
-        [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
+        [enc setBuffer:bBias offset:oBias atIndex:3];
+        [enc setBytes:&p length:sizeof(AbtParams) atIndex:4];
+        const NSUInteger total = static_cast<NSUInteger>(M) * static_cast<NSUInteger>(N);
         NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
         if (tg > 256) tg = 256;
-        [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+        [enc dispatchThreads:MTLSizeMake(total, static_cast<NSUInteger>(batch), 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
     }
+}
+
+void launch_matmul_abt_bf16(id<MTLBuffer> A, NSUInteger ofs_A,
+                            id<MTLBuffer> B, NSUInteger ofs_B,
+                            id<MTLBuffer> C, NSUInteger ofs_C,
+                            int M, int N, int K) {
+    const uint64_t Ku = static_cast<uint64_t>(K < 0 ? 0 : K);
+    launch_matmul_abt_bf16_ex(A, ofs_A, B, ofs_B, C, ofs_C,
+                              /*batch=*/1, M, N, K,
+                              static_cast<uint64_t>(M) * Ku,
+                              static_cast<uint64_t>(N) * Ku,
+                              static_cast<uint64_t>(M) * static_cast<uint64_t>(N),
+                              /*bias=*/nil, /*ofs_bias=*/0, /*has_bias=*/false,
+                              /*act=*/0);
 }
 
 } // namespace brotensor::metal_impl

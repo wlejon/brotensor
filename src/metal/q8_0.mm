@@ -242,6 +242,14 @@ void linear_forward_batched_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
         Y_BD.resize(B, out, Dtype::FP16);
     }
     if (B == 0 || out == 0) return;
+    // Prefill (large B): dequant the weight once, then a simdgroup GEMM —
+    // amortizes the per-token weight decode the GEMV path would repeat.
+    if (B >= kQuantPrefillMinB) {
+        Tensor Wf = Tensor::zeros_on(Device::Metal, out, K, Dtype::FP16);
+        dequant_q8_0_to_fp16(W_q8, Wf);
+        quant_prefill_gemm_fp16(Wf, bias, X_BD, Y_BD);
+        return;
+    }
     launch_gemv(W_q8, bias, X_BD, Y_BD, B, out, K);
 }
 

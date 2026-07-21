@@ -123,6 +123,12 @@ if(BROTENSOR_HAS_GPU)
     brotensor_add_test(brotensor_test_q4k_parity test_q4k_parity.cpp)
     brotensor_add_test(brotensor_test_q8_0_parity test_q8_0_parity.cpp)
     brotensor_add_test(brotensor_test_q6k_parity test_q6k_parity.cpp)
+    # Backend-neutral (runs on Metal too): quantized batched-linear prefill
+    # fast path vs the trusted per-token GEMV path.
+    brotensor_add_test(brotensor_test_quant_prefill_parity test_quant_prefill_parity.cpp)
+    # Hand-run microbench for the matmul_abt simdgroup fast path (not a ctest);
+    # runs on CUDA or Metal.
+    brotensor_add_executable(brotensor_bench_matmul_abt bench_matmul_abt.cpp)
     brotensor_add_test(brotensor_test_int8_attention test_int8_attention.cpp)
     if(BROTENSOR_WITH_CUDA)
         brotensor_add_test(brotensor_test_streams test_streams.cpp)
@@ -141,7 +147,7 @@ if(BROTENSOR_HAS_GPU)
         reduce loss embedding concat mha batched
         elementwise_extra loss_fused embedding_extra concat_extra
         reduce_extra layernorm_inference layernorm_batched_caches
-        activations geglu swiglu matmul rope rmsnorm lstm lora
+        activations geglu swiglu matmul matmul_abt rope rmsnorm lstm lora
         conv2d deform_conv2d conv3d group_norm
         resample transpose diffusion kv_cache
         cross_attention self_attention self_attention_decomposed_rel_pos attention_moments

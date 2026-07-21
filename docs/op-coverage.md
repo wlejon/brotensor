@@ -50,7 +50,7 @@ FP32 fwd/bwd columns below mirror the CPU surface; the FP16 column is the GPU-on
 | Op | FP32 fwd | FP32 bwd | FP16 fwd | Notes |
 |---|---|---|---|---|
 | matmul | ✓ | ✓ | ✓ | plain row-major `A @ B` (no bias); dtype-dispatched FP32 + FP16 (FP32 accumulation); backward returns dA/dB (caller zeros, op accumulates; FP16 uses FP32 scratch + fold) |
-| matmul_abt | — | — | ✓ | batched strided `A @ Bᵀ`: `C[b](M,N) = A[b](M,K) @ B[b](N,K)ᵀ` with caller-supplied per-slice element strides; 16-bit only (FP16 or BF16), FP32 accumulation, optional fused bias + activation epilogue. `C` is **not** auto-resized — the caller pre-sizes and dtypes it |
+| matmul_abt | — | — | ✓ | batched strided `A @ Bᵀ`: `C[b](M,N) = A[b](M,K) @ B[b](N,K)ᵀ` with caller-supplied per-slice element strides; 16-bit only (FP16 or BF16), FP32 accumulation, optional fused bias + activation epilogue; backs attention QK^T/PV and Linear. `C` is **not** auto-resized — the caller pre-sizes and dtypes it. Metal FP16: 64×64×32 simdgroup-matrix fast path (M·N≥1024, masked so any shape is valid), naive fallback below that; BF16 naive (no bfloat simdgroup form). CUDA WMMA equivalent |
 | matmul_int8w_fp16 | — | — | ✓ | W8A16 weight-only matmul; INT8 weights + per-row FP32 scales, FP16 acts, FP32 accum |
 | linear_forward_batched_int8w_fp16 | — | — | ✓ | W8A16 batched linear in (B,in)→(B,out) layout; fused FP16 bias add; mirrors `linear_forward_batched_fp16` shape contract; WMMA fast path for K%8==0 (FP16 tensor cores with INT8→FP16 dequant on shared-mem load), tiled fallback otherwise |
 | linear | ✓ | ✓ | ✓ | dense; FP32 single + batched (fwd/bwd), FP16 batched-inference and batched-train backward (dtype-dispatched, FP32 scratch + fold) |
@@ -134,7 +134,7 @@ FP32 fwd/bwd columns below mirror the CPU surface; the FP16 column is the GPU-on
 | gather_rows / scatter_rows / scatter_rows_add | ✓ | ✓ | — | index-driven row gather + scatter (overwrite / accumulate) (SAM prompt encoder, DETR queries); FP32, all three backends |
 | top_k_rows | ✓ | n/a | — | per-row top-k values + indices; FP32, all three backends |
 | randn / rand_uniform / rand_bernoulli / randn_truncated | ✓ | n/a | — | Philox 4×32-10 RNG, PyTorch/JAX-compatible, FP32, all three backends |
-| GGUF Q4_K / Q6_K / Q8_0 | — | — | ✓ | block-quant dequant + fused GEMV + batched matmul (W4/6/8-A16); CUDA WMMA fast paths, GEMV fallback; registered on CUDA **and** Metal |
+| GGUF Q4_K / Q6_K / Q8_0 | — | — | ✓ | block-quant dequant + fused GEMV + batched matmul (W4/6/8-A16); registered on CUDA **and** Metal. Batched prefill (large B) uses a tensor-core GEMM — CUDA fused-dequant WMMA, Metal dequant-once + simdgroup matmul; small B is per-token GEMV |
 
 ## Audio op family
 

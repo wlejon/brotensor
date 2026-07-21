@@ -54,9 +54,10 @@ void linear_forward_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
 
 
 // Batched form: Y(B, out) = X(B, in) @ W_q4k(out, in)^T + bias(out)? Same
-// (B, in) -> (B, out) row layout as linear_forward_batched_fp16. For
-// chunk 2 the kernel is GEMV-optimized; B>1 is accepted but currently
-// implemented as a simple loop over rows of X (slower than a fused GEMM).
+// (B, in) -> (B, out) row layout as linear_forward_batched_fp16. Small B is
+// GEMV-optimized (one decode of the weight per output token); large B (prefill)
+// takes a tensor-core GEMM path — CUDA a fused-dequant WMMA kernel, Metal a
+// dequant-once + simdgroup matmul — so the weight decode is amortized across B.
 void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
                                      const Tensor& X_BD, Tensor& Y_BD);
 
@@ -79,9 +80,10 @@ void linear_forward_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
                               const Tensor& x, Tensor& y);
 
 
-// Batched form: Y(B, out) = X(B, in) @ W_q8(out, in)^T + bias(out)?. The
-// kernel uses a fused WMMA tensor-core GEMM when B >= 4 and K is aligned;
-// smaller B falls back to a per-row GEMV loop.
+// Batched form: Y(B, out) = X(B, in) @ W_q8(out, in)^T + bias(out)?. Large B
+// (prefill) uses a tensor-core GEMM — a fused-dequant WMMA kernel on CUDA, a
+// dequant-once + simdgroup matmul on Metal; small B falls back to a per-token
+// GEMV that re-decodes the weight.
 void linear_forward_batched_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
                                       const Tensor& X_BD, Tensor& Y_BD);
 

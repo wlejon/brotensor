@@ -85,3 +85,24 @@ void dispatch1d_sync(NSString* pipeline_name,
                      void (^bind)(id<MTLComputeCommandEncoder>));
 
 } // namespace brotensor::metal_impl
+
+namespace brotensor::detail::metal {
+
+// Shared prefill fast path for the quantized batched-linear ops (Q4_K / Q6_K /
+// Q8_0). Given an already-dequantized FP16 weight W_fp16 (out, K), computes
+// Y(B, out) = X_BD(B, K) @ W_fp16^T (+ optional bias) via the simdgroup ABT
+// GEMM in fp16_matmul.mm. Lets each quant op dequant its weight ONCE and reuse
+// the tensor-core kernel, instead of re-decoding the weight per output token.
+void quant_prefill_gemm_fp16(const ::brotensor::Tensor& W_fp16,
+                             const ::brotensor::Tensor* bias,
+                             const ::brotensor::Tensor& X_BD,
+                             ::brotensor::Tensor& Y_BD);
+
+// Batch size at/above which the quantized batched-linear ops switch from the
+// per-token dequant+GEMV path to the dequant-once + tensor-core GEMM prefill
+// path above. Below this, re-reading the (compact) quantized weight per token
+// is cheaper than materializing a full FP16 weight; above it, amortizing the
+// dequant and using simdgroup matmul wins.
+inline constexpr int kQuantPrefillMinB = 8;
+
+} // namespace brotensor::detail::metal
