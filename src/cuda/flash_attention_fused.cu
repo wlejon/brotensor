@@ -35,7 +35,7 @@
 //   head_dim 128 -> BR 128, BC 32 (Krea 2 / Flux-class DiT self-attention)
 //
 // CAUSAL is a template parameter too, so the non-causal path keeps exactly the
-// codegen it had before causal existed � no runtime branch in the softmax inner
+// codegen it had before causal existed - no runtime branch in the softmax inner
 // loop, no extra register pressure. A causal CTA stops its key loop at its own
 // query tile (kv_end) and masks j > i per element only in the one tile that
 // straddles the diagonal, which is where the ~2x arithmetic saving comes from.
@@ -118,30 +118,66 @@ size_t smem_bytes_host() {
            size_t(BR) * D::LDS * sizeof(T);
 }
 
-// Cooperatively load a (rows<=BC, HD) tile from the interleaved (L, D) source
-// into shared (LDKV stride), zero-filling rows past Lk AND the pad columns
-// [HD, HD_PAD) (so the padded WMMA reads exact zeros there). int4 = 8 halves
-// per thread per step; D % 8 == 0 always holds (D = num_heads * HD, HD % 8 == 0).
+// K/V tile staging. A (rows<=BC, HD) tile of the interleaved (L, D) source is
+// moved to shared (LDKV stride) in two halves — global->register, then
+// register->shared — so the key loop can issue tile j+1's global reads before
+// doing tile j's math and let the DRAM latency retire underneath it. int4 = 8
+// halves per thread per step; D % 8 == 0 always holds (D = num_heads * HD,
+// HD % 8 == 0).
+//
+// The alternative shape, a second shared K/V buffer filled by cp.async, does
+// not fit: head_dim 64 already sits at 92 of the ~99 KB per-block cap, and
+// double-buffering K+V costs another 20 KB. Registers are the free resource
+// here — PER is 2 for three of the four instantiations, 5 for head_dim 72.
+template <int HD, int BR, int BC>
+struct kv_stage {
+    static constexpr int NTHREADS  = (BR / 16) * 32;
+    static constexpr int SEGS      = hd_dims<HD, BC>::PAD / 8;  // incl. pad cols
+    static constexpr int SEGS_REAL = HD / 8;                    // backed by src
+    static constexpr int TOTAL     = BC * SEGS;
+    static constexpr int PER       = (TOTAL + NTHREADS - 1) / NTHREADS;
+    // Only the head_dim 40 tiling leaves a partial final step (TOTAL 384 over
+    // 256 threads); everywhere else the guard folds away at compile time.
+    static constexpr bool GUARD    = (PER * NTHREADS != TOTAL);
+};
+
+// Read one tile into registers, materialising the zero-fill (rows past Lk and
+// the pad columns [HD, HD_PAD)) here rather than at the shared store, so the
+// padded WMMA reads exact zeros without a second pass.
 template <typename T, int HD, int BR, int BC>
-__device__ void load_kv_tile(const T* __restrict__ src, T* __restrict__ dst,
-                             int l0, int Lk, int D, int head_off) {
-    constexpr int NTHREADS = (BR / 16) * 32;
-    constexpr int SEGS     = hd_dims<HD, BC>::PAD / 8; // 8-elem segments incl pad
-    constexpr int SEGS_REAL = HD / 8;                  // segments backed by src
-    constexpr int LDKV     = hd_dims<HD, BC>::LDKV;
-    constexpr int TOTAL    = BC * SEGS;
-    const int4 zero4 = make_int4(0, 0, 0, 0);
-    for (int idx = threadIdx.x; idx < TOTAL; idx += NTHREADS) {
-        const int r   = idx / SEGS;
-        const int seg = idx % SEGS;
-        const int c   = seg * 8;
-        int4* d = reinterpret_cast<int4*>(dst + size_t(r) * LDKV + c);
-        if (seg < SEGS_REAL && l0 + r < Lk) {
-            *d = *reinterpret_cast<const int4*>(
-                src + size_t(l0 + r) * D + head_off + c);
+__device__ __forceinline__
+void load_kv_regs(const T* __restrict__ src,
+                  int4 (&reg)[kv_stage<HD, BR, BC>::PER],
+                  int l0, int Lk, int D, int head_off) {
+    using S = kv_stage<HD, BR, BC>;
+#pragma unroll
+    for (int i = 0; i < S::PER; ++i) {
+        const int idx = threadIdx.x + i * S::NTHREADS;
+        if (S::GUARD && idx >= S::TOTAL) continue;
+        const int r   = idx / S::SEGS;
+        const int seg = idx % S::SEGS;
+        if (seg < S::SEGS_REAL && l0 + r < Lk) {
+            reg[i] = *reinterpret_cast<const int4*>(
+                src + size_t(l0 + r) * D + head_off + seg * 8);
         } else {
-            *d = zero4;
+            reg[i] = make_int4(0, 0, 0, 0);
         }
+    }
+}
+
+template <typename T, int HD, int BR, int BC>
+__device__ __forceinline__
+void store_kv_regs(const int4 (&reg)[kv_stage<HD, BR, BC>::PER],
+                   T* __restrict__ dst) {
+    using S = kv_stage<HD, BR, BC>;
+    constexpr int LDKV = hd_dims<HD, BC>::LDKV;
+#pragma unroll
+    for (int i = 0; i < S::PER; ++i) {
+        const int idx = threadIdx.x + i * S::NTHREADS;
+        if (S::GUARD && idx >= S::TOTAL) continue;
+        const int r   = idx / S::SEGS;
+        const int seg = idx % S::SEGS;
+        *reinterpret_cast<int4*>(dst + size_t(r) * LDKV + seg * 8) = reg[i];
     }
 }
 
@@ -217,10 +253,29 @@ flash_fused_kernel(const T* __restrict__ Q,
     // and masked per element below.
     const int kv_end = CAUSAL ? min(Lk, q0 + BR) : Lk;
 
+    // Tile 0's reads are the only ones that cannot be hidden: there is no
+    // preceding tile to hide them behind.
+    using KVS = kv_stage<HD, BR, BC>;
+    int4 kreg[KVS::PER], vreg[KVS::PER];
+    load_kv_regs<T, HD, BR, BC>(K, kreg, 0, Lk, D, head_off);
+    load_kv_regs<T, HD, BR, BC>(V, vreg, 0, Lk, D, head_off);
+
     for (int j0 = 0; j0 < kv_end; j0 += BC) {
         __syncthreads();  // everyone done with the previous K/V tile
-        load_kv_tile<T, HD, BR, BC>(K, sm.k, j0, Lk, D, head_off);
-        load_kv_tile<T, HD, BR, BC>(V, sm.v, j0, Lk, D, head_off);
+        store_kv_regs<T, HD, BR, BC>(kreg, sm.k);
+        store_kv_regs<T, HD, BR, BC>(vreg, sm.v);
+
+        // Issue the next tile's global reads before waiting on the barrier and
+        // before any of this tile's math. They land in registers and are not
+        // consumed until the store at the top of the next iteration, so the
+        // DRAM latency retires underneath the QK^T / softmax / P@V below. The
+        // previous shape stalled the whole CTA on these loads between two
+        // barriers with nothing else in flight.
+        const int jnext = j0 + BC;
+        if (jnext < kv_end) {
+            load_kv_regs<T, HD, BR, BC>(K, kreg, jnext, Lk, D, head_off);
+            load_kv_regs<T, HD, BR, BC>(V, vreg, jnext, Lk, D, head_off);
+        }
         __syncthreads();
 
         // ── S_strip(16, BC) = Q_strip @ K_tile^T (WMMA, FP32 accum) ──
