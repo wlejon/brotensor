@@ -10,13 +10,22 @@
 //
 // against running per-row statistics, so no (Lq, Lk) score matrix ever exists
 // and the kernel reads Q/K/V directly from the interleaved (L, num_heads*hd)
-// layout (no per-head extraction, no pack-back). The P@V accumulator is
-// ferried back to per-thread registers one 16-column fragment at a time
-// through a slot in the (now free) FP32 S staging buffer, so that buffer only
-// ever needs BC (score) columns — not head_dim columns. That matters for the
-// wide heads: head_dim 128 with a full-width ferry needed a 136-column FP32
-// buffer, which capped the query tile at BR = 48 (3 warps — one of the four
-// warp schedulers permanently idle, 1 CTA/SM).
+// layout (no per-head extraction, no pack-back). The P@V accumulator stays in
+// WMMA accumulator fragments for the entire key loop — the per-row softmax
+// correction is applied to fragment elements in place, using a row map the
+// kernel probes from the API rather than assumes. Only the final normalised
+// write-back is ferried out through a slot in the (by then free) FP32 S
+// staging buffer, one 16-column fragment at a time, so that buffer only ever
+// needs BC (score) columns — not head_dim columns. That matters for the wide
+// heads: head_dim 128 with a full-width ferry needed a 136-column FP32 buffer,
+// which capped the query tile at BR = 48 (3 warps — one of the four warp
+// schedulers permanently idle, 1 CTA/SM).
+//
+// K/V tiles are prefetched a tile ahead through registers, so a tile's global
+// reads are in flight while the previous tile's math runs.
+//
+// Scores carry a factor of log2(e) folded into the Q staging scale so the
+// softmax is exp2 (one ex2.approx) rather than exp (ex2.approx plus a mul).
 //
 // Both 16-bit storage types share the one templated kernel (sm_80+ has BF16
 // WMMA); accumulation and softmax are FP32 regardless.
@@ -347,12 +356,16 @@ flash_fused_kernel(const T* __restrict__ Q,
         tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, 1));
 
         const float m_new = fmaxf(m_run, tile_max);
-        const float corr = __expf(m_run - m_new);   // m_run <= m_new, finite diff
+        // exp2, not exp: the scores arrive pre-multiplied by log2(e) (folded
+        // into the Q staging scale), so every softmax exponential here is one
+        // MUFU with no accompanying multiply. __expf() is ex2.approx preceded
+        // by a mul by log2(e), and there are BR*BC of them per key tile.
+        const float corr = exp2f(m_run - m_new);   // m_run <= m_new, finite diff
         T* prow = sm.p + size_t(wrow0 + trow) * LDS + tcol_s;
         float tile_sum = 0.0f;
 #pragma unroll
         for (int c = 0; c < SCOL; ++c) {
-            const float p = s_val[c] > -1e29f ? __expf(s_val[c] - m_new) : 0.0f;
+            const float p = s_val[c] > -1e29f ? exp2f(s_val[c] - m_new) : 0.0f;
             prow[c] = ff_traits<T>::from_f32(p);
             tile_sum += p;
         }
@@ -436,7 +449,12 @@ void launch_impl(const T* Q, const T* K, const T* V, const float* mask, T* O,
             static_cast<int>(shmem)));
         attr_set = true;
     }
-    const float scale = 1.0f / sqrtf(static_cast<float>(HD));
+    // log2(e) is folded into the score scale so the kernel's softmax can be
+    // exp2 rather than exp. exp2(x*log2e) == exp(x) exactly in the algebra;
+    // the running max is scaled by the same constant, so every comparison and
+    // correction stays consistent. Q is staged pre-scaled, so this costs
+    // nothing at run time.
+    const float scale = 1.4426950408889634f / sqrtf(static_cast<float>(HD));
     dim3 grid((Lq + BR - 1) / BR, num_heads);
     flash_fused_kernel<T, HD, BR, BC, CAUSAL><<<grid, NTHREADS, shmem, stream>>>(
         Q, K, V, mask, O, Lq, Lk, D, scale);
