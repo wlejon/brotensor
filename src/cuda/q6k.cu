@@ -6,7 +6,8 @@
 // Decoded value: y = d * sc[sb] * (val6 - 32), see q6k_internal.cuh
 // for the index mapping. The dequant kernel writes a row-major FP16 weight;
 // the GEMV kernel fuses dequant into a one-row dot product with FP32
-// accumulation. 256 threads per CTA (one per element).
+// accumulation. The dequant kernel runs 256 threads per CTA (one per
+// element); the GEMV kernel runs 64, four elements each.
 
 #include "detail/cuda_check.h"
 #include "q6k_internal.cuh"
@@ -36,6 +37,9 @@ namespace {
 
 constexpr int Q6K_BLOCK_ELEMS = q6k::kBlockElems;
 constexpr int Q6K_BLOCK_BYTES = q6k::kBlockBytes;
+
+// GEMV threads per CTA: four elements each covers one 256-element super-block.
+constexpr int Q6K_GEMV_THREADS = Q6K_BLOCK_ELEMS / 4;
 
 // One CTA per (out_row, super_block). 256 threads, one per element.
 __global__ void dequant_q6k_to_fp16_kernel(const uint8_t* __restrict__ W,
@@ -91,7 +95,20 @@ __device__ __forceinline__ float block_reduce_sum_256(float v, float* scratch) {
     return scratch[0];
 }
 
-// One CTA per output row; loops over super-blocks along K. 256 threads.
+// One CTA per output row; loops over super-blocks along K. 64 threads, four
+// consecutive elements each.
+//
+// Nothing is staged in shared and there is no barrier in the loop. The
+// previous version copied the whole 210-byte block and all 256 x-halves into
+// shared behind three __syncthreads() per super-block, with thread 0 decoding
+// `d` serially while the other 255 waited at the barrier, then had every
+// thread re-derive the ql/qh layout for its single element.
+//
+// A run of four consecutive elements shares its group, quad and sub-block, so
+// it needs four consecutive ql bytes, four consecutive qh bytes, one scale
+// byte and four x-halves. The ql/qh reads go through load_u32_align2: a block
+// is 210 bytes and 210 % 4 == 2, so every other block start is only 2-byte
+// aligned and a single uint32 load would be misaligned. See q6k_internal.cuh.
 __global__ void linear_q6k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
                                             const __half*  __restrict__ x,
                                             const __half*  __restrict__ bias,
@@ -100,10 +117,9 @@ __global__ void linear_q6k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
     const int row = blockIdx.x;
     const int t   = threadIdx.x;
 
-    __shared__ uint8_t W_smem[Q6K_BLOCK_BYTES];
-    __shared__ __half  X_smem[Q6K_BLOCK_ELEMS];
-    __shared__ float   d_f;
-    __shared__ float   red_scratch[8];
+    // Four consecutive elements per thread; 64 threads cover the super-block.
+    const q6k::QuadDesc qd = q6k::quad_desc(t * 4);
+    const int xoff = t * 4;
 
     float partial = 0.0f;
 
@@ -112,28 +128,37 @@ __global__ void linear_q6k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
     for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
         const uint8_t* blk = row_base + sb_idx * Q6K_BLOCK_BYTES;
 
-        if (t < Q6K_BLOCK_BYTES) W_smem[t] = blk[t];
-        X_smem[t] = x[sb_idx * Q6K_BLOCK_ELEMS + t];
-        __syncthreads();
+        const uint32_t ql4 = q6k::load_u32_align2(blk + q6k::kQlOffset + qd.ql_off);
+        const uint32_t qh4 = q6k::load_u32_align2(blk + q6k::kQhOffset + qd.qh_off);
+        const float d_f = __half2float(
+            __ldg(reinterpret_cast<const __half*>(blk + q6k::kDOffset)));
+        const int8_t scv = static_cast<int8_t>(
+            __ldg(blk + q6k::kScalesOffset + qd.sb));
+        const float wscale = d_f * static_cast<float>(scv);
 
-        if (t == 0) {
-            const __half d_h = *reinterpret_cast<const __half*>(W_smem + q6k::kDOffset);
-            d_f = __half2float(d_h);
+        const uint2 xpack = __ldg(reinterpret_cast<const uint2*>(
+            x + sb_idx * Q6K_BLOCK_ELEMS + xoff));
+        const __half2* xh = reinterpret_cast<const __half2*>(&xpack);
+
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const int val6 = q6k::decode_packed(qd, ql4, qh4, c);
+            const float xv = (c & 1) ? __high2float(xh[c >> 1])
+                                     : __low2float (xh[c >> 1]);
+            partial += wscale * static_cast<float>(val6) * xv;
         }
-        __syncthreads();
-
-        int sb, val6;
-        q6k::decode_element(t, W_smem + q6k::kQlOffset, W_smem + q6k::kQhOffset,
-                            sb, val6);
-        const int8_t scv = static_cast<int8_t>(W_smem[q6k::kScalesOffset + sb]);
-        const float  w   = d_f * static_cast<float>(scv) * static_cast<float>(val6);
-        partial += w * __half2float(X_smem[t]);
-        __syncthreads();
     }
 
-    const float sum = block_reduce_sum_256(partial, red_scratch);
+    // 64 threads = two warps: shuffle within each, then combine the pair.
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        partial += __shfl_down_sync(0xffffffffu, partial, off);
+    }
+    __shared__ float warp_sum[2];
+    if ((t & 31) == 0) warp_sum[t >> 5] = partial;
+    __syncthreads();
     if (t == 0) {
-        float out = sum;
+        float out = warp_sum[0] + warp_sum[1];
         if (bias) out += __half2float(bias[row]);
         y[row] = __float2half_rn(out);
     }
@@ -212,7 +237,7 @@ void linear_forward_q6k_fp16(const Tensor& W_q6k, const Tensor* bias,
         ? static_cast<const __half*>(bias->data)
         : nullptr;
 
-    linear_q6k_fp16_gemv_kernel<<<out, Q6K_BLOCK_ELEMS, 0, stream>>>(
+    linear_q6k_fp16_gemv_kernel<<<out, Q6K_GEMV_THREADS, 0, stream>>>(
         static_cast<const uint8_t*>(W_q6k.data),
         static_cast<const __half*>(x.data),
         b_p,
@@ -270,7 +295,7 @@ void linear_forward_batched_q6k_fp16(const Tensor& W_q6k, const Tensor* bias,
     for (int b = 0; b < B; ++b) {
         const __half* x_p = static_cast<const __half*>(X_BD.data) + static_cast<size_t>(b) * K;
         __half*       y_p = static_cast<__half*>(Y_BD.data)       + static_cast<size_t>(b) * out;
-        linear_q6k_fp16_gemv_kernel<<<out, Q6K_BLOCK_ELEMS, 0, stream>>>(
+        linear_q6k_fp16_gemv_kernel<<<out, Q6K_GEMV_THREADS, 0, stream>>>(
             static_cast<const uint8_t*>(W_q6k.data),
             x_p, b_p, y_p,
             K, blocks_per_row);

@@ -14,6 +14,7 @@
 // elements has its own int8 scale.
 
 #pragma once
+#include <cuda_runtime.h>   // __ldg
 #include <cstdint>
 
 namespace brotensor::detail::cuda::q6k {
@@ -48,6 +49,56 @@ void decode_element(int e, const uint8_t* ql, const uint8_t* qh,
 
     sb_out   = sb;
     val6_out = val6;
+}
+
+// ─── Register-resident form, four elements at a time ──────────────────────
+//
+// decode_element() re-derives the layout and issues two byte loads per
+// element. A run of four consecutive elements starting at a multiple of four
+// shares its group, quad and sub-block (4 divides both 32 and 16), and needs
+// four *consecutive* ql bytes and four consecutive qh bytes — so the whole
+// run costs two 4-byte reads instead of eight 1-byte ones.
+//
+// Those reads cannot be a single uint32 load: a block is 210 bytes and
+// 210 % 4 == 2, so every other block start is only 2-byte aligned. Every
+// offset involved is even, though, so a pair of uint16 loads is always legal.
+// load_u32_align2() is that pair.
+struct QuadDesc {
+    int ql_off;      // byte offset of the run within ql
+    int qh_off;      // byte offset of the run within qh
+    int sb;          // sub-block index -> scales[sb]
+    int qh_shift;    // bit position of this quad's 2 high bits
+    bool low_nib;    // take the low nibble of ql (quad < 2) rather than the high
+};
+
+__device__ __forceinline__ QuadDesc quad_desc(int e0) {
+    const int group = e0 >> 7;
+    const int local = e0 - (group << 7);
+    const int quad  = local >> 5;
+    const int l     = local - (quad << 5);
+    QuadDesc q;
+    q.ql_off   = group * 64 + (quad & 1) * 32 + l;
+    q.qh_off   = group * 32 + l;
+    q.sb       = (group << 3) + (quad << 1) + (l >> 4);
+    q.qh_shift = quad * 2;
+    q.low_nib  = quad < 2;
+    return q;
+}
+
+__device__ __forceinline__ uint32_t load_u32_align2(const uint8_t* p) {
+    const uint32_t lo = __ldg(reinterpret_cast<const uint16_t*>(p));
+    const uint32_t hi = __ldg(reinterpret_cast<const uint16_t*>(p + 2));
+    return lo | (hi << 16);
+}
+
+// c-th element (0..3) of the run described by `q`, from the two packed words.
+__device__ __forceinline__ int decode_packed(const QuadDesc& q, uint32_t ql4,
+                                             uint32_t qh4, int c) {
+    const uint32_t qlb  = (ql4 >> (c * 8)) & 0xFFu;
+    const uint32_t qhb  = (qh4 >> (c * 8)) & 0xFFu;
+    const uint32_t raw4 = q.low_nib ? (qlb & 0x0Fu) : (qlb >> 4);
+    const uint32_t hi2  = (qhb >> q.qh_shift) & 0x03u;
+    return static_cast<int>(raw4 | (hi2 << 4)) - 32;
 }
 
 }  // namespace brotensor::detail::cuda::q6k
