@@ -25,6 +25,130 @@ inline cudaStream_t cur_stream() {
     return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
 }
 
+// ── Wide 16-bit elementwise ────────────────────────────────────────────────
+//
+// A 16-bit kernel moves half the bytes per element that its FP32 twin does, so
+// over the same total bytes it issues twice the memory instructions. That runs
+// into the per-SM request-throughput ceiling before the bandwidth one: the FP32
+// scale_inplace reaches 891 GB/s where the FP16 one, moving identical bytes,
+// stalls at 740. Reading 8 elements per thread as one int4 restores parity —
+// same bytes, an eighth of the requests.
+//
+// Tensors can be view()s over a caller-supplied pointer, so 16-byte alignment
+// is not guaranteed. Elements before the first boundary and after the last
+// whole vector are handled one at a time; a 16-bit pointer is always 2-byte
+// aligned, so the head is always a whole number of elements.
+template <typename T>
+__device__ __forceinline__ int vec_head(const T* p, int n) {
+    const unsigned off = static_cast<unsigned>(reinterpret_cast<uintptr_t>(p) & 15u);
+    const int head = off ? static_cast<int>((16u - off) / sizeof(T)) : 0;
+    return head < n ? head : n;
+}
+
+// Apply `op` (float -> float, per element) to every element of a 16-bit buffer,
+// eight at a time. `Cvt` supplies the pair pack/unpack for the storage type so
+// the arithmetic stays exactly what the scalar kernel did: widen to FP32, apply,
+// round once back to 16-bit.
+template <typename T, typename Cvt, typename Op>
+__device__ __forceinline__ void vec_apply_inplace(T* __restrict__ y, int n, Op op) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    const int head = vec_head(y, n);
+    const int nvec = (n - head) >> 3;
+    const int tail0 = head + (nvec << 3);
+
+    int4* v4 = reinterpret_cast<int4*>(y + head);
+    for (int i = tid; i < nvec; i += stride) {
+        int4 v = v4[i];
+        auto* h = reinterpret_cast<typename Cvt::pair*>(&v);
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            h[k] = Cvt::pack(op(Cvt::lo(h[k])), op(Cvt::hi(h[k])));
+        v4[i] = v;
+    }
+    for (int i = tid; i < head; i += stride)
+        y[i] = Cvt::from_f32(op(Cvt::to_f32(y[i])));
+    for (int i = tail0 + tid; i < n; i += stride)
+        y[i] = Cvt::from_f32(op(Cvt::to_f32(y[i])));
+}
+
+struct HalfCvt {
+    using pair = __half2;
+    __device__ static float lo(pair v) { return __low2float(v); }
+    __device__ static float hi(pair v) { return __high2float(v); }
+    __device__ static pair pack(float a, float b) { return __floats2half2_rn(a, b); }
+    __device__ static float to_f32(__half v) { return __half2float(v); }
+    __device__ static __half from_f32(float v) { return __float2half(v); }
+};
+
+struct Bf16Cvt {
+    using pair = __nv_bfloat162;
+    __device__ static float lo(pair v) { return __low2float(v); }
+    __device__ static float hi(pair v) { return __high2float(v); }
+    __device__ static pair pack(float a, float b) { return __floats2bfloat162_rn(a, b); }
+    __device__ static float to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+    __device__ static __nv_bfloat16 from_f32(float v) { return __float2bfloat16(v); }
+};
+
+// Same, for an in-place op reading a second buffer: y[i] = op(y[i], x[i]).
+// Both pointers are widened together, so the vector path needs them congruent
+// mod 16; when they are not, everything falls back to the scalar loop rather
+// than reading one side unaligned.
+template <typename T, typename Cvt, typename Op>
+__device__ __forceinline__ void vec_apply_inplace2(T* __restrict__ y,
+                                                   const T* __restrict__ x,
+                                                   int n, Op op) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    const bool congruent = ((reinterpret_cast<uintptr_t>(y) ^
+                             reinterpret_cast<uintptr_t>(x)) & 15u) == 0;
+    const int head = congruent ? vec_head(y, n) : n;
+    const int nvec = (n - head) >> 3;
+    const int tail0 = head + (nvec << 3);
+
+    int4* v4 = reinterpret_cast<int4*>(y + head);
+    const int4* u4 = reinterpret_cast<const int4*>(x + head);
+    for (int i = tid; i < nvec; i += stride) {
+        int4 v = v4[i];
+        int4 u = u4[i];
+        auto* h = reinterpret_cast<typename Cvt::pair*>(&v);
+        auto* g = reinterpret_cast<typename Cvt::pair*>(&u);
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            h[k] = Cvt::pack(op(Cvt::lo(h[k]), Cvt::lo(g[k])),
+                             op(Cvt::hi(h[k]), Cvt::hi(g[k])));
+        v4[i] = v;
+    }
+    for (int i = tid; i < head; i += stride)
+        y[i] = Cvt::from_f32(op(Cvt::to_f32(y[i]), Cvt::to_f32(x[i])));
+    for (int i = tail0 + tid; i < n; i += stride)
+        y[i] = Cvt::from_f32(op(Cvt::to_f32(y[i]), Cvt::to_f32(x[i])));
+}
+
+// Per-element ops for the two helpers above. Plain functors rather than
+// __device__ lambdas, which would need --extended-lambda on the whole build.
+struct ScaleOp {
+    float s;
+    __device__ float operator()(float v) const { return v * s; }
+};
+struct AddScalarOp {
+    float s;
+    __device__ float operator()(float v) const { return v + s; }
+};
+struct ClampOp {
+    // Written as comparisons, not fminf/fmaxf: those return the non-NaN operand,
+    // whereas the scalar kernel this replaces left a NaN untouched (every
+    // comparison against it is false). Keep that.
+    float lo, hi;
+    __device__ float operator()(float v) const {
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        return v;
+    }
+};
+struct AddOp { __device__ float operator()(float a, float b) const { return a + b; } };
+struct MulOp { __device__ float operator()(float a, float b) const { return a * b; } };
+
 __device__ inline float silu_scalar(float v) {
     return v / (1.0f + __expf(-v));
 }
@@ -334,26 +458,15 @@ __global__ void axpby_inplace_kernel(T* __restrict__ y,
 
 __global__ void add_inplace_fp16_kernel(__half* __restrict__ y,
                                         const __half* __restrict__ x, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        const float a = __half2float(y[i]);
-        const float b = __half2float(x[i]);
-        y[i] = __float2half(a + b);
-    }
+    vec_apply_inplace2<__half, HalfCvt>(y, x, n, AddOp{});
 }
 
 __global__ void scale_inplace_fp16_kernel(__half* __restrict__ y, float s, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        y[i] = __float2half(__half2float(y[i]) * s);
-    }
+    vec_apply_inplace<__half, HalfCvt>(y, n, ScaleOp{s});
 }
 
 __global__ void add_scalar_inplace_fp16_kernel(__half* __restrict__ y, float s, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        y[i] = __float2half(__half2float(y[i]) + s);
-    }
+    vec_apply_inplace<__half, HalfCvt>(y, n, AddScalarOp{s});
 }
 
 __global__ void clamp_fp32_kernel(float* __restrict__ y, float lo, float hi, int n) {
@@ -367,13 +480,7 @@ __global__ void clamp_fp32_kernel(float* __restrict__ y, float lo, float hi, int
 }
 
 __global__ void clamp_fp16_kernel(__half* __restrict__ y, float lo, float hi, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        float v = __half2float(y[i]);
-        if (v < lo) v = lo;
-        if (v > hi) v = hi;
-        y[i] = __float2half(v);
-    }
+    vec_apply_inplace<__half, HalfCvt>(y, n, ClampOp{lo, hi});
 }
 
 // Binary threshold to a byte mask: y = x > t ? 1 : 0 (strict > — a value
@@ -425,12 +532,7 @@ __global__ void mul_inplace_fp32_kernel(float* __restrict__ y,
 
 __global__ void mul_inplace_fp16_kernel(__half* __restrict__ y,
                                         const __half* __restrict__ x, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        const float a = __half2float(y[i]);
-        const float b = __half2float(x[i]);
-        y[i] = __float2half(a * b);
-    }
+    vec_apply_inplace2<__half, HalfCvt>(y, x, n, MulOp{});
 }
 
 // Y(B, D) = X_a(B, D) * gelu(X_b(B, D)) where X is (B, 2D) — A is the first
@@ -693,36 +795,19 @@ __global__ void gelu_forward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
 
 __global__ void add_inplace_bf16_kernel(__nv_bfloat16* __restrict__ y,
                                         const __nv_bfloat16* __restrict__ x, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        const float a = __bfloat162float(y[i]);
-        const float b = __bfloat162float(x[i]);
-        y[i] = __float2bfloat16(a + b);
-    }
+    vec_apply_inplace2<__nv_bfloat16, Bf16Cvt>(y, x, n, AddOp{});
 }
 
 __global__ void scale_inplace_bf16_kernel(__nv_bfloat16* __restrict__ y, float s, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        y[i] = __float2bfloat16(__bfloat162float(y[i]) * s);
-    }
+    vec_apply_inplace<__nv_bfloat16, Bf16Cvt>(y, n, ScaleOp{s});
 }
 
 __global__ void add_scalar_inplace_bf16_kernel(__nv_bfloat16* __restrict__ y, float s, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        y[i] = __float2bfloat16(__bfloat162float(y[i]) + s);
-    }
+    vec_apply_inplace<__nv_bfloat16, Bf16Cvt>(y, n, AddScalarOp{s});
 }
 
 __global__ void clamp_bf16_kernel(__nv_bfloat16* __restrict__ y, float lo, float hi, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        float v = __bfloat162float(y[i]);
-        if (v < lo) v = lo;
-        if (v > hi) v = hi;
-        y[i] = __float2bfloat16(v);
-    }
+    vec_apply_inplace<__nv_bfloat16, Bf16Cvt>(y, n, ClampOp{lo, hi});
 }
 
 __global__ void quick_gelu_forward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
@@ -735,12 +820,7 @@ __global__ void quick_gelu_forward_bf16_kernel(const __nv_bfloat16* __restrict__
 
 __global__ void mul_inplace_bf16_kernel(__nv_bfloat16* __restrict__ y,
                                         const __nv_bfloat16* __restrict__ x, int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += blockDim.x * gridDim.x) {
-        const float a = __bfloat162float(y[i]);
-        const float b = __bfloat162float(x[i]);
-        y[i] = __float2bfloat16(a * b);
-    }
+    vec_apply_inplace2<__nv_bfloat16, Bf16Cvt>(y, x, n, MulOp{});
 }
 
 __global__ void geglu_forward_bf16_kernel(const __nv_bfloat16* __restrict__ X,

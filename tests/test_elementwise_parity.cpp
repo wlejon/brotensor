@@ -4,6 +4,10 @@
 
 #include <brotensor/ops.h>
 
+#include <cstdint>
+#include <cstdio>
+#include <stdexcept>
+
 using namespace bt_parity;
 using brotensor::Tensor;
 using brotensor::Device;
@@ -192,5 +196,129 @@ void test_unary_fp16(void (*op)(const Tensor&, Tensor&), const char* tag,
 BT_PARITY_TEST(relu_fp16_n256)    { test_unary_fp16(brotensor::relu_forward,    "relu_fp16",    256, 0x70ull); }
 BT_PARITY_TEST(tanh_fp16_n256)    { test_unary_fp16(brotensor::tanh_forward,    "tanh_fp16",    256, 0x71ull); }
 BT_PARITY_TEST(sigmoid_fp16_n256) { test_unary_fp16(brotensor::sigmoid_forward, "sigmoid_fp16", 256, 0x72ull); }
+
+// ─── Misaligned 16-bit in-place ops ────────────────────────────────────────
+//
+// The 16-bit in-place kernels read eight elements at a time as an int4, which
+// needs a 16-byte-aligned base. Every tensor the rest of this suite builds is
+// cudaMalloc-backed and so is 256-byte aligned, which means the kernels' scalar
+// head — the elements before the first boundary — is unreachable from any other
+// test here. (Verified: poisoning that loop left all 167 tests green.) But
+// Tensor::view() hands the ops a caller-supplied pointer, so misalignment is
+// reachable in real use.
+//
+// These build a view starting at element `off` of a larger buffer, which puts
+// the base at 2*off mod 16, and check every residue class. For the two-operand
+// ops the offsets are chosen to cover both the congruent case (same residue,
+// vector path with a head) and the incongruent one (different residues, no
+// vector path at all).
+namespace {
+
+using brotensor::Dtype;
+
+Tensor q16(const Tensor& f32, bool bf16) {
+    return bf16 ? bf16_host_to_f32(to_bf16_host(f32)) : fp16_host_to_f32(to_fp16_host(f32));
+}
+Tensor up16(const Tensor& f32, bool bf16) {
+    return bf16 ? to_bf16_gpu(f32) : to_fp16_gpu(f32);
+}
+Tensor down16(const Tensor& g, bool bf16) {
+    return bf16 ? bf16_host_to_f32(download_to_host(g)) : fp16_host_to_f32(download_to_host(g));
+}
+// A view of `n` elements starting `off` elements into `g`. The view aliases
+// g's storage, so g must outlive it — callers keep both in scope.
+Tensor sub_view(const Tensor& g, int off, int n, bool bf16) {
+    return Tensor::view(gpu_device(), static_cast<uint16_t*>(g.data) + off, n, 1,
+                        bf16 ? Dtype::BF16 : Dtype::FP16);
+}
+// Everything outside [off, off+n) must be byte-identical to what was uploaded.
+void check_untouched(const Tensor& before, const Tensor& after, int off, int n,
+                     int total, const char* tag) {
+    for (int i = 0; i < total; ++i) {
+        if (i >= off && i < off + n) continue;
+        if (before[i] != after[i]) {
+            std::fprintf(stderr, "%s: wrote outside the view at %d\n", tag, i);
+            throw std::runtime_error(tag);
+        }
+    }
+}
+
+void test_scale_inplace_misaligned(int off, int n, bool bf16, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int total = off + n + 3;          // trailing slack guards the tail too
+    Tensor h = Tensor::vec(total);
+    fill_random(h, rng);
+    Tensor hq = q16(h, bf16);
+    const float s = 0.375f;                 // exact in FP16 and BF16
+
+    // Rounded back through the storage type: the kernel widens to FP32,
+    // multiplies and rounds once, so the reference has to round once too.
+    Tensor ref = Tensor::vec(n);
+    for (int i = 0; i < n; ++i) ref.ptr()[i] = hq[off + i] * s;
+    ref = q16(ref, bf16);
+
+    Tensor g = up16(hq, bf16);
+    Tensor v = sub_view(g, off, n, bf16);
+    brotensor::scale_inplace(v, s);
+    brotensor::sync_all();
+
+    Tensor back = down16(g, bf16);
+    Tensor got = Tensor::vec(n);
+    for (int i = 0; i < n; ++i) got.ptr()[i] = back[off + i];
+    compare_tensors(ref, got, "scale_inplace_misaligned", 1e-3f, 1e-3f);
+    check_untouched(hq, back, off, n, total, "scale_inplace_misaligned");
+}
+
+// y_off and x_off differing by an odd multiple of 8 elements makes the two
+// bases incongruent mod 16, which disables the vector path entirely.
+void test_mul_inplace_misaligned(int y_off, int x_off, int n, bool bf16,
+                                 uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int total = (y_off > x_off ? y_off : x_off) + n + 3;
+    Tensor hy = Tensor::vec(total), hx = Tensor::vec(total);
+    fill_random(hy, rng);
+    fill_random(hx, rng);
+    Tensor hyq = q16(hy, bf16), hxq = q16(hx, bf16);
+
+    Tensor ref = Tensor::vec(n);
+    for (int i = 0; i < n; ++i) ref.ptr()[i] = hyq[y_off + i] * hxq[x_off + i];
+    ref = q16(ref, bf16);
+
+    Tensor gy = up16(hyq, bf16), gx = up16(hxq, bf16);
+    Tensor vy = sub_view(gy, y_off, n, bf16);
+    Tensor vx = sub_view(gx, x_off, n, bf16);
+    brotensor::mul_inplace(vy, vx);
+    brotensor::sync_all();
+
+    Tensor back = down16(gy, bf16);
+    Tensor got = Tensor::vec(n);
+    for (int i = 0; i < n; ++i) got.ptr()[i] = back[y_off + i];
+    compare_tensors(ref, got, "mul_inplace_misaligned", 1e-3f, 1e-3f);
+    check_untouched(hyq, back, y_off, n, total, "mul_inplace_misaligned");
+}
+
+}  // namespace
+
+// Every base residue mod 16 (offset 0..7 elements), at a length that is not a
+// multiple of 8 so the trailing scalar loop runs as well.
+BT_PARITY_TEST(scale_inplace_fp16_off0)  { test_scale_inplace_misaligned(0, 1021, false, 0x80ull); }
+BT_PARITY_TEST(scale_inplace_fp16_off1)  { test_scale_inplace_misaligned(1, 1021, false, 0x81ull); }
+BT_PARITY_TEST(scale_inplace_fp16_off2)  { test_scale_inplace_misaligned(2, 1021, false, 0x82ull); }
+BT_PARITY_TEST(scale_inplace_fp16_off3)  { test_scale_inplace_misaligned(3, 1021, false, 0x83ull); }
+BT_PARITY_TEST(scale_inplace_fp16_off4)  { test_scale_inplace_misaligned(4, 1021, false, 0x84ull); }
+BT_PARITY_TEST(scale_inplace_fp16_off5)  { test_scale_inplace_misaligned(5, 1021, false, 0x85ull); }
+BT_PARITY_TEST(scale_inplace_fp16_off6)  { test_scale_inplace_misaligned(6, 1021, false, 0x86ull); }
+BT_PARITY_TEST(scale_inplace_fp16_off7)  { test_scale_inplace_misaligned(7, 1021, false, 0x87ull); }
+BT_PARITY_TEST(scale_inplace_bf16_off3)  { test_scale_inplace_misaligned(3, 1021, true,  0x88ull); }
+BT_PARITY_TEST(scale_inplace_bf16_off5)  { test_scale_inplace_misaligned(5, 1021, true,  0x89ull); }
+// Shorter than one vector: head clamps to n and the vector loop does nothing.
+BT_PARITY_TEST(scale_inplace_fp16_tiny)  { test_scale_inplace_misaligned(3, 5, false, 0x8Aull); }
+
+// Congruent bases (vector path with a head) and incongruent ones (no vector
+// path at all).
+BT_PARITY_TEST(mul_inplace_fp16_cong)    { test_mul_inplace_misaligned(3, 11, 1021, false, 0x90ull); }
+BT_PARITY_TEST(mul_inplace_fp16_incong)  { test_mul_inplace_misaligned(3,  6, 1021, false, 0x91ull); }
+BT_PARITY_TEST(mul_inplace_bf16_cong)    { test_mul_inplace_misaligned(5, 13, 1021, true,  0x92ull); }
+BT_PARITY_TEST(mul_inplace_bf16_incong)  { test_mul_inplace_misaligned(5,  2, 1021, true,  0x93ull); }
 
 int main() { return run_all("elementwise cpu/gpu parity"); }
