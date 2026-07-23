@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 
@@ -144,13 +145,26 @@ __device__ __forceinline__ float block_reduce_sum_256(float v, float* scratch) {
 //
 // 64-thread CTAs still reach full occupancy on sm_89: the 24-block-per-SM cap
 // times 64 threads is 1536, which is the SM's thread limit.
+// One CTA per output row. The row's super-blocks are split across SBG groups
+// of 64 threads — a group covers one super-block's 256 elements at 4 per
+// thread — so SBG scales how many of a row's loads are in flight at once
+// without changing the CTA count.
+//
+// That is the knob that matters here, because this kernel is latency-bound
+// rather than bandwidth-bound once the output is narrow. At one 64-thread
+// group per row, a 4096-row projection reached 442 GB/s where a 12288-row one
+// reached 601 on identical per-row work: the only difference was how many CTAs
+// were resident to keep requests outstanding. Widening the row itself supplies
+// that memory-level parallelism regardless of how many rows there are.
+template <int SBG>
 __global__ void linear_q4k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
                                             const __half*  __restrict__ x,
                                             const __half*  __restrict__ bias,
                                             __half*        __restrict__ y,
                                             int K, int blocks_per_row) {
     const int row = blockIdx.x;
-    const int t   = threadIdx.x;
+    const int grp = threadIdx.x >> 6;      // which super-block group
+    const int t   = threadIdx.x & 63;      // lane within the group
 
     const int is   = t >> 3;         // sub-block 0..7
     const int lg   = t & 7;          // element quad within the sub-block
@@ -162,7 +176,7 @@ __global__ void linear_q4k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
 
     const uint8_t* row_base = W + static_cast<size_t>(row) * blocks_per_row * Q4K_BLOCK_BYTES;
 
-    for (int sb = 0; sb < blocks_per_row; ++sb) {
+    for (int sb = grp; sb < blocks_per_row; sb += SBG) {
         const uint8_t* blk = row_base + sb * Q4K_BLOCK_BYTES;
 
         const uint4 hdr = __ldg(reinterpret_cast<const uint4*>(blk));
@@ -190,18 +204,79 @@ __global__ void linear_q4k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
         }
     }
 
-    // 64 threads = two warps: shuffle within each, then combine the pair.
+    // Reduce within each warp, then across the CTA's 2*SBG warps.
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         partial += __shfl_down_sync(0xffffffffu, partial, off);
     }
-    __shared__ float warp_sum[2];
-    if ((t & 31) == 0) warp_sum[t >> 5] = partial;
+    constexpr int NWARP = SBG * 2;
+    __shared__ float warp_sum[NWARP];
+    const int tid = threadIdx.x;
+    if ((tid & 31) == 0) warp_sum[tid >> 5] = partial;
     __syncthreads();
-    if (t == 0) {
-        float out = warp_sum[0] + warp_sum[1];
+    if (tid == 0) {
+        float out = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NWARP; ++w) out += warp_sum[w];
         if (bias) out += __half2float(bias[row]);
         y[row] = __float2half_rn(out);
+    }
+}
+
+// Pick the group count for a row of `blocks_per_row` super-blocks.
+//
+// Widening a row only pays when the plain one-group grid cannot already fill
+// the machine. Measured on a 4090 (128 SMs, 24 resident blocks/SM, so 3072
+// CTAs to a wave), three runs each:
+//
+//   shape                     out     1 group     4 groups
+//   qkv_proj   6144 x  4096   6144    576 GB/s    512-532
+//   gate/up   12288 x  4096  12288    628-643     564
+//   o_proj     4096 x  4096   4096    446-461     463-485
+//   down_proj  4096 x 12288   4096    453-469     553
+//
+// The crossover lands exactly at two block-waves. At or above it the grid
+// already has the CTAs to keep requests outstanding, and the coarser 8-warp
+// CTAs only cost scheduling freedom; below it the CTAs are not there, and the
+// parallelism has to come from inside the row instead. So the threshold is
+// read from the device rather than hard-coded — it moves with SM count.
+inline int q4k_gemv_groups(int out, int blocks_per_row) {
+    // Relaxed atomic, not a guarded static: every caller computes the same
+    // value, so a racing double-compute is harmless and no lock is needed.
+    static std::atomic<int> two_waves{0};
+    int tw = two_waves.load(std::memory_order_relaxed);
+    if (tw == 0) {
+        int dev = 0, sms = 1, blocks = 1;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaDeviceGetAttribute(&blocks, cudaDevAttrMaxBlocksPerMultiprocessor, dev);
+        tw = 2 * sms * blocks;
+        two_waves.store(tw, std::memory_order_relaxed);
+    }
+    if (out >= tw) return 1;
+    // Groups past the row's super-block count would sit idle.
+    int g = 4;
+    while (g > 1 && g > blocks_per_row) g >>= 1;
+    return g;
+}
+
+inline void q4k_gemv_launch(const uint8_t* W, const __half* x,
+                            const __half* bias, __half* y,
+                            int out, int K, int blocks_per_row,
+                            cudaStream_t stream) {
+    switch (q4k_gemv_groups(out, blocks_per_row)) {
+        case 4:
+            linear_q4k_fp16_gemv_kernel<4><<<out, 4 * Q4K_GEMV_THREADS, 0, stream>>>(
+                W, x, bias, y, K, blocks_per_row);
+            break;
+        case 2:
+            linear_q4k_fp16_gemv_kernel<2><<<out, 2 * Q4K_GEMV_THREADS, 0, stream>>>(
+                W, x, bias, y, K, blocks_per_row);
+            break;
+        default:
+            linear_q4k_fp16_gemv_kernel<1><<<out, Q4K_GEMV_THREADS, 0, stream>>>(
+                W, x, bias, y, K, blocks_per_row);
+            break;
     }
 }
 
@@ -278,12 +353,11 @@ void linear_forward_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
         ? static_cast<const __half*>(bias->data)
         : nullptr;
 
-    linear_q4k_fp16_gemv_kernel<<<out, Q4K_GEMV_THREADS, 0, stream>>>(
-        static_cast<const uint8_t*>(W_q4k.data),
-        static_cast<const __half*>(x.data),
-        b_p,
-        static_cast<__half*>(y.data),
-        K, blocks_per_row);
+    q4k_gemv_launch(static_cast<const uint8_t*>(W_q4k.data),
+                    static_cast<const __half*>(x.data),
+                    b_p,
+                    static_cast<__half*>(y.data),
+                    out, K, blocks_per_row, stream);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -339,10 +413,8 @@ void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
     for (int b = 0; b < B; ++b) {
         const __half* x_p = static_cast<const __half*>(X_BD.data) + static_cast<size_t>(b) * K;
         __half*       y_p = static_cast<__half*>(Y_BD.data)       + static_cast<size_t>(b) * out;
-        linear_q4k_fp16_gemv_kernel<<<out, Q4K_GEMV_THREADS, 0, stream>>>(
-            static_cast<const uint8_t*>(W_q4k.data),
-            x_p, b_p, y_p,
-            K, blocks_per_row);
+        q4k_gemv_launch(static_cast<const uint8_t*>(W_q4k.data),
+                        x_p, b_p, y_p, out, K, blocks_per_row, stream);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
