@@ -181,6 +181,12 @@ if(BROTENSOR_HAS_GPU)
         brotensor_add_executable(brotensor_bench_sam_attention bench_sam_attention.cpp)
         brotensor_add_executable(brotensor_bench_conv_annotators bench_conv_annotators.cpp)
         brotensor_add_executable(brotensor_bench_flow_attention bench_flow_attention.cpp)
+        # Bandwidth baseline for the elementwise/norm family, the quantized
+        # linear paths, and the causal-vs-fused attention gap. These three
+        # cover the ops with no prior perf instrumentation.
+        brotensor_add_executable(brotensor_bench_elementwise bench_elementwise.cpp)
+        brotensor_add_executable(brotensor_bench_quant_matmul bench_quant_matmul.cpp)
+        brotensor_add_executable(brotensor_bench_causal_attention bench_causal_attention.cpp)
         # CUDA graph capture/replay (the API is CUDA-only).
         brotensor_add_test(brotensor_test_cuda_graph test_cuda_graph.cpp)
     endif()
