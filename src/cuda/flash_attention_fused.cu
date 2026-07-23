@@ -33,6 +33,12 @@
 //   head_dim 64  -> BR 128, BC 64 (DINOv3, TripoSplat flow, SD-class self-attn)
 //   head_dim 72  -> BR 64,  BC 64 (PixArt-Sigma DiT self-attention)
 //   head_dim 128 -> BR 128, BC 32 (Krea 2 / Flux-class DiT self-attention)
+//
+// CAUSAL is a template parameter too, so the non-causal path keeps exactly the
+// codegen it had before causal existed � no runtime branch in the softmax inner
+// loop, no extra register pressure. A causal CTA stops its key loop at its own
+// query tile (kv_end) and masks j > i per element only in the one tile that
+// straddles the diagonal, which is where the ~2x arithmetic saving comes from.
 
 #include "flash_fused_internal.cuh"
 #include "detail/cuda_check.h"
@@ -139,7 +145,7 @@ __device__ void load_kv_tile(const T* __restrict__ src, T* __restrict__ dst,
     }
 }
 
-template <typename T, int HD, int BR, int BC>
+template <typename T, int HD, int BR, int BC, bool CAUSAL>
 __global__ void __launch_bounds__((BR / 16) * 32)
 flash_fused_kernel(const T* __restrict__ Q,
                    const T* __restrict__ K,
@@ -166,7 +172,14 @@ flash_fused_kernel(const T* __restrict__ Q,
 
     const int head = blockIdx.y;
     const int head_off = head * HD;
-    const int q0 = blockIdx.x * BR;
+    // Causal CTAs do work proportional to their query tile index: tile 0 walks
+    // one key tile, the last walks Lk/BC of them. Blocks are dispatched in
+    // increasing linear id, so issuing the tiles in reverse puts the longest
+    // CTAs into the first wave and leaves the short ones to fill the tail.
+    // In-order dispatch strands the heaviest CTA in the final wave with the
+    // rest of the machine idle behind it.
+    const int qtile = CAUSAL ? (gridDim.x - 1 - blockIdx.x) : blockIdx.x;
+    const int q0 = qtile * BR;
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -197,7 +210,14 @@ flash_fused_kernel(const T* __restrict__ Q,
     float m_run = -1e30f;
     float l_run = 0.0f;
 
-    for (int j0 = 0; j0 < Lk; j0 += BC) {
+    // Causal: this CTA's tallest query row is q0 + BR - 1, so every key tile
+    // starting at or past q0 + BR is entirely above the diagonal. Skipping
+    // them outright is where the ~2x arithmetic saving comes from — the
+    // partially-masked tile straddling the diagonal is still computed in full
+    // and masked per element below.
+    const int kv_end = CAUSAL ? min(Lk, q0 + BR) : Lk;
+
+    for (int j0 = 0; j0 < kv_end; j0 += BC) {
         __syncthreads();  // everyone done with the previous K/V tile
         load_kv_tile<T, HD, BR, BC>(K, sm.k, j0, Lk, D, head_off);
         load_kv_tile<T, HD, BR, BC>(V, sm.v, j0, Lk, D, head_off);
@@ -236,7 +256,12 @@ flash_fused_kernel(const T* __restrict__ Q,
 #pragma unroll
         for (int c = 0; c < SCOL; ++c) {
             const int j = j0 + tcol_s + c;
-            const bool valid = j < Lk && (!mask || mask[j] > 0.5f);
+            // `orow` is this thread's global query row. Masked-out scores go to
+            // -1e30, so their exp() below is written as an exact 0.0f into the
+            // P tile — the P@V contraction then runs over the whole BC tile
+            // unchanged and still adds nothing for them.
+            const bool valid = j < Lk && (!CAUSAL || j <= orow) &&
+                               (!mask || mask[j] > 0.5f);
             s_val[c] = valid ? srow[c] : -1e30f;
             tile_max = fmaxf(tile_max, s_val[c]);
         }
@@ -309,7 +334,7 @@ flash_fused_kernel(const T* __restrict__ Q,
     }
 }
 
-template <typename T, int HD, int BR, int BC>
+template <typename T, int HD, int BR, int BC, bool CAUSAL>
 void launch_impl(const T* Q, const T* K, const T* V, const float* mask, T* O,
                  int Lq, int Lk, int D, int num_heads, cudaStream_t stream) {
     constexpr int NTHREADS = (BR / 16) * 32;
@@ -317,19 +342,19 @@ void launch_impl(const T* Q, const T* K, const T* V, const float* mask, T* O,
     static bool attr_set = false;   // one-time opt-in past the 48KB default
     if (!attr_set) {
         BROTENSOR_CUDA_CHECK(cudaFuncSetAttribute(
-            flash_fused_kernel<T, HD, BR, BC>,
+            flash_fused_kernel<T, HD, BR, BC, CAUSAL>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(shmem)));
         attr_set = true;
     }
     const float scale = 1.0f / sqrtf(static_cast<float>(HD));
     dim3 grid((Lq + BR - 1) / BR, num_heads);
-    flash_fused_kernel<T, HD, BR, BC><<<grid, NTHREADS, shmem, stream>>>(
+    flash_fused_kernel<T, HD, BR, BC, CAUSAL><<<grid, NTHREADS, shmem, stream>>>(
         Q, K, V, mask, O, Lq, Lk, D, scale);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename T>
+template <typename T, bool CAUSAL>
 void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O,
                      int Lq, int Lk, int D, int num_heads, int head_dim,
                      cudaStream_t stream) {
@@ -340,13 +365,13 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
             // BR=128 fits comfortably. SD1.5-class self-attention (Lq=Lk=4096,
             // head_dim=40) is the motivating shape: previously fell through to
             // the O(Lq*Lk) scalar path since this switch had no case for it.
-            launch_impl<T, 40, 128, 64>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 40, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
             return;
         case 64:
-            launch_impl<T, 64, 128, 64>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 64, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
             return;
         case 72:
-            launch_impl<T, 72, 64, 64>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 72, 64, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
             return;
         case 128:
             // The wide head doubles the Q footprint per query row, so the key
@@ -357,7 +382,7 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
             // BR = 48 / 3 warps / 1 CTA per SM (~32 TFLOPS). Krea 2 /
             // Flux-class DiT self-attention (head_dim 128) is the motivating
             // shape.
-            launch_impl<T, 128, 128, 32>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 128, 128, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
             return;
         default:
             return;  // guarded by supported(); unreachable
@@ -373,17 +398,25 @@ bool supported(int head_dim) {
 
 void launch(const __half* Q, const __half* K, const __half* V,
             const float* mask, __half* O,
-            int Lq, int Lk, int D, int num_heads, int head_dim,
+            int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
             cudaStream_t stream) {
-    launch_dispatch<__half>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, stream);
+    if (causal) {
+        launch_dispatch<__half, true>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, stream);
+    } else {
+        launch_dispatch<__half, false>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, stream);
+    }
 }
 
 void launch(const __nv_bfloat16* Q, const __nv_bfloat16* K,
             const __nv_bfloat16* V,
             const float* mask, __nv_bfloat16* O,
-            int Lq, int Lk, int D, int num_heads, int head_dim,
+            int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
             cudaStream_t stream) {
-    launch_dispatch<__nv_bfloat16>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, stream);
+    if (causal) {
+        launch_dispatch<__nv_bfloat16, true>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, stream);
+    } else {
+        launch_dispatch<__nv_bfloat16, false>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, stream);
+    }
 }
 
 }  // namespace flash_fused

@@ -887,6 +887,32 @@ BT_PARITY_TEST(flash_fwd_10x10_D32_h2_causal){ run_flash_forward(10, 10, 32, 2, 
 BT_PARITY_TEST(flash_fwd_200x96_D80_h2_hd40) { run_flash_forward(200, 96, 80, 2, 0x705ull, false, false); }
 BT_PARITY_TEST(flash_fwd_200x96_D80_h2_hd40_mask) { run_flash_forward(200, 96, 80, 2, 0x706ull, true, false); }
 
+// ─── causal on the fused WMMA path ────────────────────────────────────────
+// The causal cases above use D=32/h=2 -> head_dim 16, which flash_fused
+// doesn't instantiate, so they route to the scalar fallback and cover none of
+// the fused kernel's causal logic. These pin every instantiated head_dim with
+// its own (BR, BC) tiling:
+//
+//   hd 40 -> BR 128, BC 64      hd 72  -> BR 64,  BC 64
+//   hd 64 -> BR 128, BC 64      hd 128 -> BR 128, BC 32
+//
+// Lq = Lk = 200 is deliberately not a multiple of any BR or BC: it spans
+// several query tiles with a partial last one, and the diagonal key tile is
+// partial too. That covers the three things the causal path adds — the
+// per-element j <= i mask, the kv_end tile-skip clamp, and the reversed query
+// tile ordering — including the CTA whose diagonal tile is also the tile
+// truncated by Lk. The mask variants check causal composes with a key mask
+// rather than one silently overriding the other.
+BT_PARITY_TEST(flash_fwd_200x200_D80_h2_hd40_causal)   { run_flash_forward(200, 200, 80,  2, 0x707ull, false, true); }
+BT_PARITY_TEST(flash_fwd_200x200_D128_h2_hd64_causal)  { run_flash_forward(200, 200, 128, 2, 0x708ull, false, true); }
+BT_PARITY_TEST(flash_fwd_200x200_D144_h2_hd72_causal)  { run_flash_forward(200, 200, 144, 2, 0x709ull, false, true); }
+BT_PARITY_TEST(flash_fwd_200x200_D256_h2_hd128_causal) { run_flash_forward(200, 200, 256, 2, 0x70Aull, false, true); }
+BT_PARITY_TEST(flash_fwd_200x200_D128_h2_hd64_causal_mask)  { run_flash_forward(200, 200, 128, 2, 0x70Bull, true, true); }
+BT_PARITY_TEST(flash_fwd_200x200_D256_h2_hd128_causal_mask) { run_flash_forward(200, 200, 256, 2, 0x70Cull, true, true); }
+// Single query tile, exactly one key tile: the kv_end clamp lands on the
+// loop's first iteration, so tile 0 must still mask per element.
+BT_PARITY_TEST(flash_fwd_64x64_D128_h2_hd64_causal)    { run_flash_forward(64, 64, 128, 2, 0x70Dull, false, true); }
+
 // ─── flash_attention_qkvo_forward (self + cross, bias, mask, causal) ──────
 BT_PARITY_TEST(qkvo_fwd_self_8x8_D32_h4) {
     run_qkvo_forward(8, 8, 32, 32, 4, 0x710ull, false, false, false, false);
@@ -949,6 +975,14 @@ BT_PARITY_TEST(flash_fwd_bf16_10x10_D32_h2_causal){ run_flash_forward_bf16(10, 1
 // head_dim=40 (D=80, h=2), same tile-boundary coverage as the FP16 case above.
 BT_PARITY_TEST(flash_fwd_bf16_200x96_D80_h2_hd40) { run_flash_forward_bf16(200, 96, 80, 2, 0x7A4ull, false, false); }
 BT_PARITY_TEST(flash_fwd_bf16_200x96_D80_h2_hd40_mask) { run_flash_forward_bf16(200, 96, 80, 2, 0x7A5ull, true, false); }
+// Causal on the fused path in BF16 — same instantiations as the FP16 block
+// above. BF16 shares the one templated kernel, so this guards the dtype
+// dispatch rather than the masking arithmetic.
+BT_PARITY_TEST(flash_fwd_bf16_200x200_D80_h2_hd40_causal)   { run_flash_forward_bf16(200, 200, 80,  2, 0x7A6ull, false, true); }
+BT_PARITY_TEST(flash_fwd_bf16_200x200_D128_h2_hd64_causal)  { run_flash_forward_bf16(200, 200, 128, 2, 0x7A7ull, false, true); }
+BT_PARITY_TEST(flash_fwd_bf16_200x200_D144_h2_hd72_causal)  { run_flash_forward_bf16(200, 200, 144, 2, 0x7A8ull, false, true); }
+BT_PARITY_TEST(flash_fwd_bf16_200x200_D256_h2_hd128_causal) { run_flash_forward_bf16(200, 200, 256, 2, 0x7A9ull, false, true); }
+BT_PARITY_TEST(flash_fwd_bf16_200x200_D128_h2_hd64_causal_mask) { run_flash_forward_bf16(200, 200, 128, 2, 0x7AAull, true, true); }
 
 BT_PARITY_TEST(qkvo_fwd_bf16_self_8x8_D32_h4) {
     run_qkvo_forward_bf16(8, 8, 32, 32, 4, 0x7B0ull, false, false, false, false);

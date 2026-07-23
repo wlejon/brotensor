@@ -16,18 +16,24 @@ namespace flash_fused {
 // True if the fused kernel covers this problem (head_dim instantiation).
 bool supported(int head_dim);
 
-// O(Lq, D) = softmax(Q K^T / sqrt(head_dim), mask) V, non-causal, per head.
+// O(Lq, D) = softmax(Q K^T / sqrt(head_dim), mask) V, per head.
 // Q/K/V/O are (L, D) row-major with D = num_heads*head_dim and the head dim
 // contiguous within each row. `mask` is an optional Lk-length float vector
-// (positions with mask[k] <= 0.5 drop out). Caller checks supported() first.
+// (positions with mask[k] <= 0.5 drop out). `causal` additionally drops every
+// key j > query row i, and requires Lq == Lk (the caller enforces this); it
+// composes with `mask`. Caller checks supported() first.
+//
+// `causal` selects a separate kernel instantiation rather than branching at
+// run time, so the non-causal path keeps exactly the codegen it had before
+// causal existed.
 void launch(const __half* Q, const __half* K, const __half* V,
             const float* mask, __half* O,
-            int Lq, int Lk, int D, int num_heads, int head_dim,
+            int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
             cudaStream_t stream);
 void launch(const __nv_bfloat16* Q, const __nv_bfloat16* K,
             const __nv_bfloat16* V,
             const float* mask, __nv_bfloat16* O,
-            int Lq, int Lk, int D, int num_heads, int head_dim,
+            int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
             cudaStream_t stream);
 
 }  // namespace flash_fused
