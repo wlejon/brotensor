@@ -14,6 +14,8 @@
 // elements has its own int8 scale.
 
 #pragma once
+#include "detail/load_align.cuh"
+
 #include <cuda_runtime.h>   // __ldg
 #include <cstdint>
 
@@ -62,7 +64,9 @@ void decode_element(int e, const uint8_t* ql, const uint8_t* qh,
 // Those reads cannot be a single uint32 load: a block is 210 bytes and
 // 210 % 4 == 2, so every other block start is only 2-byte aligned. Every
 // offset involved is even, though, so a pair of uint16 loads is always legal.
-// load_u32_align2() is that pair.
+// That is load_u32_align2(), in detail/load_align.cuh - Q8_0 has the same
+// problem for the same reason (34-byte block), so it lives outside this
+// header.
 struct QuadDesc {
     int ql_off;      // byte offset of the run within ql
     int qh_off;      // byte offset of the run within qh
@@ -83,12 +87,6 @@ __device__ __forceinline__ QuadDesc quad_desc(int e0) {
     q.qh_shift = quad * 2;
     q.low_nib  = quad < 2;
     return q;
-}
-
-__device__ __forceinline__ uint32_t load_u32_align2(const uint8_t* p) {
-    const uint32_t lo = __ldg(reinterpret_cast<const uint16_t*>(p));
-    const uint32_t hi = __ldg(reinterpret_cast<const uint16_t*>(p + 2));
-    return lo | (hi << 16);
 }
 
 // c-th element (0..3) of the run described by `q`, from the two packed words.

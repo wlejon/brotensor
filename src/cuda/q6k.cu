@@ -135,8 +135,8 @@ __global__ void linear_q6k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
     for (int sb_idx = grp; sb_idx < blocks_per_row; sb_idx += SBG) {
         const uint8_t* blk = row_base + sb_idx * Q6K_BLOCK_BYTES;
 
-        const uint32_t ql4 = q6k::load_u32_align2(blk + q6k::kQlOffset + qd.ql_off);
-        const uint32_t qh4 = q6k::load_u32_align2(blk + q6k::kQhOffset + qd.qh_off);
+        const uint32_t ql4 = load_u32_align2(blk + q6k::kQlOffset + qd.ql_off);
+        const uint32_t qh4 = load_u32_align2(blk + q6k::kQhOffset + qd.qh_off);
         const float d_f = __half2float(
             __ldg(reinterpret_cast<const __half*>(blk + q6k::kDOffset)));
         const int8_t scv = static_cast<int8_t>(

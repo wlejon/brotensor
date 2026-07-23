@@ -1,10 +1,12 @@
 // CUDA Q8_0 (W8A16-style) dequant + GEMV. Q8_0 block = 34 bytes / 32
 // elements: fp16 d + int8 qs[32]. y = d * qs[i]. Dequant kernel uses one
 // CTA per (row, block) with 32 threads (one per element). GEMV kernel uses
-// one CTA per output row with 32 threads (one warp), looping super-blocks
-// along K with warp-shuffle reduction at the end.
+// one CTA per output row, four elements per thread, walking blocks along K
+// with a shuffle reduction at the end; see the kernel for the load shape and
+// for how the row widens when the grid is too small to fill the GPU.
 
 #include "detail/cuda_check.h"
+#include "detail/load_align.cuh"
 #include "q8_0_internal.cuh"
 
 #include <brotensor/tensor.h>
@@ -12,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 
@@ -50,37 +53,128 @@ __global__ void dequant_q8_0_to_fp16_kernel(const uint8_t* __restrict__ W,
           + sb * Q8_BLOCK_ELEMS + t] = __float2half_rn(d_f * static_cast<float>(q));
 }
 
-// One CTA per output row; one warp (32 threads) loops blocks along K.
+// One CTA per output row. Each thread takes four consecutive elements of a
+// 32-element block, so eight threads cover a block and a WARPS-warp CTA keeps
+// 4*WARPS blocks in flight.
+//
+// Granularity is the point. The shape this replaces handed every thread a
+// single int8 and a single half per block - one- and two-byte requests, the
+// worst granularity on offer, and the same defect that capped the Q4_K and
+// Q6_K GEMVs before they were rebuilt. Four elements per thread turns that
+// into one 8-byte x load and one 4-byte weight read per block.
+//
+// The weight read cannot be a plain uint32 load: a block is 34 bytes, so qs
+// starts on an arbitrary even boundary and half the blocks are not 4-byte
+// aligned. It goes out as the usual 16-bit pair (detail/load_align.cuh). x
+// needs no such care - element sb*32 + lane*4 sits at byte 64*sb + 8*lane,
+// always 8-byte aligned.
+//
+// WARPS widens the row for the same reason as q4k/q6k: a single-warp row has
+// almost no memory-level parallelism, so at low output widths the grid cannot
+// keep enough requests outstanding and the kernel runs latency-bound.
+template <int WARPS>
 __global__ void linear_q8_0_fp16_gemv_kernel(const uint8_t* __restrict__ W,
                                              const __half*  __restrict__ x,
                                              const __half*  __restrict__ bias,
                                              __half*        __restrict__ y,
                                              int K, int blocks_per_row) {
-    const int row = blockIdx.x;
-    const int t   = threadIdx.x;
+    constexpr int NGRP = WARPS * 4;        // blocks walked concurrently
+
+    const int row  = blockIdx.x;
+    const int grp  = threadIdx.x >> 3;     // which of the NGRP blocks
+    const int lane = threadIdx.x & 7;      // element quad within that block
 
     float partial = 0.0f;
 
     const uint8_t* row_base = W + static_cast<size_t>(row) * blocks_per_row * Q8_BLOCK_BYTES;
 
-    for (int sb = 0; sb < blocks_per_row; ++sb) {
+    for (int sb = grp; sb < blocks_per_row; sb += NGRP) {
         const uint8_t* blk = row_base + sb * Q8_BLOCK_BYTES;
-        const __half d_h = *reinterpret_cast<const __half*>(blk + q8_0::kDOffset);
-        const float  d_f = __half2float(d_h);
-        const int8_t q   = static_cast<int8_t>(blk[q8_0::kQsOffset + t]);
-        const float  xv  = __half2float(x[sb * Q8_BLOCK_ELEMS + t]);
-        partial += d_f * static_cast<float>(q) * xv;
+
+        const float d_f = __half2float(
+            __ldg(reinterpret_cast<const __half*>(blk + q8_0::kDOffset)));
+        const uint32_t q4 = load_u32_align2(blk + q8_0::kQsOffset + lane * 4);
+        const uint2 xpack = __ldg(reinterpret_cast<const uint2*>(
+            x + sb * Q8_BLOCK_ELEMS + lane * 4));
+        const __half2* xh = reinterpret_cast<const __half2*>(&xpack);
+
+        // Scale once per block rather than once per element: d is shared by
+        // all 32, and the products are exact int8*fp16 either way.
+        float acc = 0.0f;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const int qv = static_cast<int8_t>((q4 >> (c * 8)) & 0xFFu);
+            const float xv = (c & 1) ? __high2float(xh[c >> 1])
+                                     : __low2float (xh[c >> 1]);
+            acc += static_cast<float>(qv) * xv;
+        }
+        partial += d_f * acc;
     }
 
-    // Warp-shuffle reduction across the 32 threads (one warp).
+    // Reduce within each warp, then across the CTA's warps.
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        partial += __shfl_down_sync(0xffffffff, partial, off);
+        partial += __shfl_down_sync(0xffffffffu, partial, off);
     }
-    if (t == 0) {
-        float out = partial;
+    if (WARPS == 1) {
+        if (threadIdx.x == 0) {
+            float out = partial;
+            if (bias) out += __half2float(bias[row]);
+            y[row] = __float2half_rn(out);
+        }
+        return;
+    }
+    __shared__ float warp_sum[WARPS];
+    const int tid = threadIdx.x;
+    if ((tid & 31) == 0) warp_sum[tid >> 5] = partial;
+    __syncthreads();
+    if (tid == 0) {
+        float out = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) out += warp_sum[w];
         if (bias) out += __half2float(bias[row]);
         y[row] = __float2half_rn(out);
+    }
+}
+
+// Group count and dispatch, same rule as q4k_gemv_groups / q6k_gemv_groups:
+// widen the row only when the plain one-warp grid does not already span two
+// block-waves, with the threshold read from the device so it tracks SM count.
+inline int q8_0_gemv_warps(int out, int blocks_per_row) {
+    static std::atomic<int> two_waves{0};   // benign double-compute, no lock
+    int tw = two_waves.load(std::memory_order_relaxed);
+    if (tw == 0) {
+        int dev = 0, sms = 1, blocks = 1;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaDeviceGetAttribute(&blocks, cudaDevAttrMaxBlocksPerMultiprocessor, dev);
+        tw = 2 * sms * blocks;
+        two_waves.store(tw, std::memory_order_relaxed);
+    }
+    if (out >= tw) return 1;
+    // Warps whose four blocks fall past the row's block count would sit idle.
+    int w = 4;
+    while (w > 1 && w * 4 > blocks_per_row) w >>= 1;
+    return w;
+}
+
+inline void q8_0_gemv_launch(const uint8_t* W, const __half* x,
+                             const __half* bias, __half* y,
+                             int out, int K, int blocks_per_row,
+                             cudaStream_t stream) {
+    switch (q8_0_gemv_warps(out, blocks_per_row)) {
+        case 4:
+            linear_q8_0_fp16_gemv_kernel<4><<<out, 4 * 32, 0, stream>>>(
+                W, x, bias, y, K, blocks_per_row);
+            break;
+        case 2:
+            linear_q8_0_fp16_gemv_kernel<2><<<out, 2 * 32, 0, stream>>>(
+                W, x, bias, y, K, blocks_per_row);
+            break;
+        default:
+            linear_q8_0_fp16_gemv_kernel<1><<<out, 32, 0, stream>>>(
+                W, x, bias, y, K, blocks_per_row);
+            break;
     }
 }
 
@@ -157,12 +251,10 @@ void linear_forward_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
         ? static_cast<const __half*>(bias->data)
         : nullptr;
 
-    linear_q8_0_fp16_gemv_kernel<<<out, Q8_BLOCK_ELEMS, 0, stream>>>(
-        static_cast<const uint8_t*>(W_q8.data),
-        static_cast<const __half*>(x.data),
-        b_p,
-        static_cast<__half*>(y.data),
-        K, blocks_per_row);
+    q8_0_gemv_launch(static_cast<const uint8_t*>(W_q8.data),
+                     static_cast<const __half*>(x.data),
+                     b_p, static_cast<__half*>(y.data),
+                     out, K, blocks_per_row, stream);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -215,10 +307,8 @@ void linear_forward_batched_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
     for (int b = 0; b < B; ++b) {
         const __half* x_p = static_cast<const __half*>(X_BD.data) + static_cast<size_t>(b) * K;
         __half*       y_p = static_cast<__half*>(Y_BD.data)       + static_cast<size_t>(b) * out;
-        linear_q8_0_fp16_gemv_kernel<<<out, Q8_BLOCK_ELEMS, 0, stream>>>(
-            static_cast<const uint8_t*>(W_q8.data),
-            x_p, b_p, y_p,
-            K, blocks_per_row);
+        q8_0_gemv_launch(static_cast<const uint8_t*>(W_q8.data),
+                         x_p, b_p, y_p, out, K, blocks_per_row, stream);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
