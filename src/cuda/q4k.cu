@@ -2,9 +2,9 @@
 //   fp16 d, fp16 dmin, uint8 scales[12] (eight 6-bit (sc,m) packed pairs),
 //   uint8 qs[128] (256 nibbles). 8 sub-blocks of 32; element value
 //   y = d * sc[is] * nibble - dmin * m[is]. The dequant kernel writes a
-//   row-major FP16 weight; the GEMV kernel fuses dequant into a one-row dot
-//   product with FP32 accumulation. Block size 256 (one thread per element of
-//   a super-block); cross-warp reduction via shared memory.
+//   row-major FP16 weight (256 threads, one per element of a super-block);
+//   the GEMV kernel fuses dequant into a one-row dot product with FP32
+//   accumulation (64 threads, four elements each — see the comment on it).
 
 #include "detail/cuda_check.h"
 #include "q4k_internal.cuh"
@@ -36,6 +36,9 @@ namespace {
 
 constexpr int Q4K_BLOCK_ELEMS = q4k::kBlockElems;
 constexpr int Q4K_BLOCK_BYTES = q4k::kBlockBytes;
+
+// GEMV threads per CTA: four elements each covers one 256-element super-block.
+constexpr int Q4K_GEMV_THREADS = Q4K_BLOCK_ELEMS / 4;
 
 __device__ __forceinline__ void q4k_unpack_sc_m(int j, const uint8_t* s,
                                                 uint8_t* sc, uint8_t* m) {
@@ -115,7 +118,32 @@ __device__ __forceinline__ float block_reduce_sum_256(float v, float* scratch) {
     return scratch[0];
 }
 
-// One CTA per output row; loops over super-blocks along K. 256 threads.
+// One CTA per output row; loops over super-blocks along K. 64 threads, four
+// elements each — one CTA still covers a whole 256-element super-block per
+// iteration, but in a quarter of the threads with four times the load width.
+//
+// Thread t owns sub-block is = t>>3 and the four consecutive elements
+// l = (t&7)*4 .. +3 within it, which is exactly:
+//
+//   one uint32 of qs   at kQsOffset + (is>>1)*32 + (t&7)*4   (4-byte aligned)
+//   one uint2  of x    at is*32 + (t&7)*4                    (4 halves, 8B)
+//   one uint4  header  at the block start                    (16B aligned:
+//                                                             144 = 9 * 16)
+//
+// Three load instructions per thread per super-block, all naturally aligned,
+// against the eleven byte- and half-wide ones the one-element-per-thread map
+// needed. The sector count is unchanged — it is fixed by the data — but the
+// instruction count and the per-instruction coalescing are not, and this
+// kernel is request-throughput bound rather than DRAM bound: Q8_0's GEMV
+// issues *more* total requests than Q4_K's did and still finished sooner.
+//
+// Nothing is staged in shared and there is no barrier in the loop. (An
+// earlier version copied the 144-byte block and all 256 x-halves into shared
+// behind three __syncthreads() per super-block, with thread 0 decoding the
+// header and threads 0..7 the scales serially while the other 248 waited.)
+//
+// 64-thread CTAs still reach full occupancy on sm_89: the 24-block-per-SM cap
+// times 64 threads is 1536, which is the SM's thread limit.
 __global__ void linear_q4k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
                                             const __half*  __restrict__ x,
                                             const __half*  __restrict__ bias,
@@ -124,17 +152,11 @@ __global__ void linear_q4k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
     const int row = blockIdx.x;
     const int t   = threadIdx.x;
 
-    __shared__ uint8_t W_smem[Q4K_BLOCK_BYTES];
-    __shared__ __half  X_smem[Q4K_BLOCK_ELEMS];
-    __shared__ float   sc_f[8];
-    __shared__ float   m_f [8];
-    __shared__ float   d_f;
-    __shared__ float   dmin_f;
-    __shared__ float   red_scratch[8];
-
-    const int is   = t >> 5;
-    const int l    = t & 31;
-    const int pair = is >> 1;
+    const int is   = t >> 3;         // sub-block 0..7
+    const int lg   = t & 7;          // element quad within the sub-block
+    const int qoff = q4k::kQsOffset + (is >> 1) * 32 + lg * 4;
+    const int xoff = is * 32 + lg * 4;
+    const int hi   = is & 1;         // this sub-block takes the high nibbles
 
     float partial = 0.0f;
 
@@ -143,36 +165,41 @@ __global__ void linear_q4k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
     for (int sb = 0; sb < blocks_per_row; ++sb) {
         const uint8_t* blk = row_base + sb * Q4K_BLOCK_BYTES;
 
-        if (t < Q4K_BLOCK_BYTES) W_smem[t] = blk[t];
-        X_smem[t] = x[sb * Q4K_BLOCK_ELEMS + t];
-        __syncthreads();
+        const uint4 hdr = __ldg(reinterpret_cast<const uint4*>(blk));
+        const float d_f    = __half2float(__ushort_as_half(
+            static_cast<unsigned short>(hdr.x & 0xFFFFu)));
+        const float dmin_f = __half2float(__ushort_as_half(
+            static_cast<unsigned short>(hdr.x >> 16)));
+        uint32_t sc, m;
+        q4k::unpack_sc_m(is, hdr, sc, m);
+        const float wscale = d_f * static_cast<float>(sc);
+        const float wmin   = dmin_f * static_cast<float>(m);
 
-        if (t == 0) {
-            __half d_h, dmin_h;
-            d_h    = *reinterpret_cast<const __half*>(W_smem);
-            dmin_h = *reinterpret_cast<const __half*>(W_smem + 2);
-            d_f    = __half2float(d_h);
-            dmin_f = __half2float(dmin_h);
-        }
-        if (t < 8) {
-            uint8_t sc, m;
-            q4k_unpack_sc_m(t, W_smem + 4, &sc, &m);
-            sc_f[t] = static_cast<float>(sc);
-            m_f [t] = static_cast<float>(m);
-        }
-        __syncthreads();
+        const uint32_t q4 = __ldg(reinterpret_cast<const uint32_t*>(blk + qoff));
+        const uint2 xpack = __ldg(reinterpret_cast<const uint2*>(
+            x + sb * Q4K_BLOCK_ELEMS + xoff));
+        const __half2* xh = reinterpret_cast<const __half2*>(&xpack);
 
-        const uint8_t qb = W_smem[16 + pair * 32 + l];
-        const int nib  = (is & 1) ? (qb >> 4) : (qb & 0x0F);
-        const float w  = d_f * sc_f[is] * static_cast<float>(nib)
-                       - dmin_f * m_f[is];
-        partial += w * __half2float(X_smem[t]);
-        __syncthreads();
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const uint32_t qb  = (q4 >> (c * 8)) & 0xFFu;
+            const uint32_t nib = hi ? (qb >> 4) : (qb & 0x0Fu);
+            const float xv = (c & 1) ? __high2float(xh[c >> 1])
+                                     : __low2float (xh[c >> 1]);
+            partial += (wscale * static_cast<float>(nib) - wmin) * xv;
+        }
     }
 
-    const float sum = block_reduce_sum_256(partial, red_scratch);
+    // 64 threads = two warps: shuffle within each, then combine the pair.
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        partial += __shfl_down_sync(0xffffffffu, partial, off);
+    }
+    __shared__ float warp_sum[2];
+    if ((t & 31) == 0) warp_sum[t >> 5] = partial;
+    __syncthreads();
     if (t == 0) {
-        float out = sum;
+        float out = warp_sum[0] + warp_sum[1];
         if (bias) out += __half2float(bias[row]);
         y[row] = __float2half_rn(out);
     }
@@ -251,7 +278,7 @@ void linear_forward_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
         ? static_cast<const __half*>(bias->data)
         : nullptr;
 
-    linear_q4k_fp16_gemv_kernel<<<out, Q4K_BLOCK_ELEMS, 0, stream>>>(
+    linear_q4k_fp16_gemv_kernel<<<out, Q4K_GEMV_THREADS, 0, stream>>>(
         static_cast<const uint8_t*>(W_q4k.data),
         static_cast<const __half*>(x.data),
         b_p,
@@ -312,7 +339,7 @@ void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
     for (int b = 0; b < B; ++b) {
         const __half* x_p = static_cast<const __half*>(X_BD.data) + static_cast<size_t>(b) * K;
         __half*       y_p = static_cast<__half*>(Y_BD.data)       + static_cast<size_t>(b) * out;
-        linear_q4k_fp16_gemv_kernel<<<out, Q4K_BLOCK_ELEMS, 0, stream>>>(
+        linear_q4k_fp16_gemv_kernel<<<out, Q4K_GEMV_THREADS, 0, stream>>>(
             static_cast<const uint8_t*>(W_q4k.data),
             x_p, b_p, y_p,
             K, blocks_per_row);

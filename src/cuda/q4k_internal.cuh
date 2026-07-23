@@ -27,6 +27,29 @@ void unpack_sc_m(int j, const uint8_t* scales, uint8_t& sc, uint8_t& m) {
     }
 }
 
+// Same recovery, but reading the 16-byte block header out of registers rather
+// than memory. A block is 144 bytes = 9 * 16, so every block start is 16-byte
+// aligned and `d`, `dmin` and all twelve scale bytes fit in one uint4 load —
+// one request instead of the three-plus separate byte loads the memory form
+// issues per sub-block. `h` is bytes [0..15] of the block: h.x = d | dmin<<16,
+// h.y/h.z/h.w = scales[0..3] / [4..7] / [8..11].
+__device__ __forceinline__ uint32_t scale_byte(const uint4& h, int s) {
+    const uint32_t b = 4u + static_cast<uint32_t>(s);   // byte index in the block
+    const uint32_t w = (b < 8u) ? h.y : ((b < 12u) ? h.z : h.w);
+    return (w >> ((b & 3u) * 8u)) & 0xFFu;
+}
+
+__device__ __forceinline__
+void unpack_sc_m(int j, const uint4& h, uint32_t& sc, uint32_t& m) {
+    if (j < 4) {
+        sc = scale_byte(h, j)     & 0x3Fu;
+        m  = scale_byte(h, j + 4) & 0x3Fu;
+    } else {
+        sc = (scale_byte(h, j + 4) & 0x0Fu) | ((scale_byte(h, j - 4) >> 6) << 4);
+        m  = (scale_byte(h, j + 4) >> 4)    | ((scale_byte(h, j)     >> 6) << 4);
+    }
+}
+
 constexpr int kBlockBytes    = 144;
 constexpr int kBlockElems    = 256;
 constexpr int kSubBlockElems = 32;
