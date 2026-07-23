@@ -20,6 +20,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include "bench_helpers.h"
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -57,17 +59,13 @@ float time_graph_ms(int chunk, const std::function<void(int)>& body) {
     }
     g.launch();
     cudaDeviceSynchronize();
-    cudaEvent_t e0, e1;
-    cudaEventCreate(&e0);
-    cudaEventCreate(&e1);
-    cudaEventRecord(e0);
-    for (int r = 0; r < REPLAYS; ++r) g.launch();
-    cudaEventRecord(e1);
-    cudaEventSynchronize(e1);
-    float ms = 0.0f;
-    cudaEventElapsedTime(&ms, e0, e1);
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
+    // One sample is a batch of REPLAYS launches: a single replay of these
+    // kernels is a few microseconds, close enough to cudaEvent resolution to
+    // be noise. The batch keeps that amortisation while time_min_ms adds the
+    // fixed-duration warm-up and best-of-N that the clock ramp requires.
+    const float ms = bt_bench::time_min_ms([&] {
+        for (int r = 0; r < REPLAYS; ++r) g.launch();
+    });
     return ms / (REPLAYS * chunk);
 }
 
@@ -248,6 +246,8 @@ void bench_attn(const char* name, int cap, int valid_len, int n_q, int n_kv,
 int main() {
     brotensor::init();
     if (!brotensor::is_available(brotensor::Device::CUDA)) {
+    // Pull the SM clock off its P8 idle floor before any timing.
+    bt_bench::spin_up();
         std::printf("CUDA not available — skipping decode kernel bench\n");
         return 0;
     }

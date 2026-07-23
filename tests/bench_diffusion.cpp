@@ -11,6 +11,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include "bench_helpers.h"
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -26,8 +28,6 @@ using brotensor::Dtype;
 
 namespace {
 
-constexpr int WARMUP = 5;
-constexpr int ITERS  = 50;
 
 std::vector<uint16_t> to_fp16(const std::vector<float>& v) {
     std::vector<uint16_t> o(v.size());
@@ -44,21 +44,8 @@ void upload_rand_fp16(int rows, int cols, Tensor& g,
     g = Tensor::from_host_fp16_on(brotensor::Device::CUDA, h.data(), rows, cols);
 }
 
-float time_loop_ms(int iters, const std::function<void()>& body) {
-    cudaEvent_t e0, e1;
-    cudaEventCreate(&e0);
-    cudaEventCreate(&e1);
-    for (int i = 0; i < WARMUP; ++i) body();
-    cudaDeviceSynchronize();
-    cudaEventRecord(e0);
-    for (int i = 0; i < iters; ++i) body();
-    cudaEventRecord(e1);
-    cudaEventSynchronize(e1);
-    float ms = 0.0f;
-    cudaEventElapsedTime(&ms, e0, e1);
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
-    return ms / iters;
+float time_loop_ms(const std::function<void()>& body) {
+    return bt_bench::time_min_ms(body);
 }
 
 // Sanity check between two FP16 outputs of the SAME op via different
@@ -98,11 +85,11 @@ void bench_self_attention(int Lq, int D, int nh, std::vector<Row>& rows) {
     bool unfused_ok = (Lq <= 4096);
     float ms_un = 0.0f;
     if (unfused_ok) {
-        ms_un = time_loop_ms(ITERS, [&] {
+        ms_un = time_loop_ms([&] {
             brotensor::self_attention_forward(X, Wq, Wk, Wv, Wo, nullptr, nh, O_a);
         });
     }
-    float ms_fu = time_loop_ms(ITERS, [&] {
+    float ms_fu = time_loop_ms([&] {
         brotensor::flash_attention_qkvo_forward(X, nullptr,
                                                 Wq, nullptr, Wk, nullptr,
                                                 Wv, nullptr, Wo, nullptr,
@@ -124,11 +111,11 @@ void bench_cross_attention(int Lq, int Lk, int D, int nh, std::vector<Row>& rows
     upload_rand_fp16(D, D, Wk, rng);
     upload_rand_fp16(D, D, Wv, rng);
     upload_rand_fp16(D, D, Wo, rng);
-    float ms_un = time_loop_ms(ITERS, [&] {
+    float ms_un = time_loop_ms([&] {
         brotensor::cross_attention_forward(X, Ctx, Wq, Wk, Wv, Wo,
                                            nullptr, nh, O_a);
     });
-    float ms_fu = time_loop_ms(ITERS, [&] {
+    float ms_fu = time_loop_ms([&] {
         brotensor::flash_attention_qkvo_forward(X, &Ctx,
                                                 Wq, nullptr, Wk, nullptr,
                                                 Wv, nullptr, Wo, nullptr,
@@ -179,11 +166,11 @@ void bench_resblock(int N, int C, int H, int Wd, std::vector<Row>& rows) {
     upload_rand_fp16(C, C * 9, W2, rng);
     upload_rand_fp16(C, 1, bcv2, rng);
     Tensor Y_un, Y_fu;
-    float ms_un = time_loop_ms(ITERS, [&] {
+    float ms_un = time_loop_ms([&] {
         resblock_unfused(X, g1, b1, W1, bcv1, g2, b2, W2, bcv2,
                          N, C, H, Wd, 32, Y_un);
     });
-    float ms_fu = time_loop_ms(ITERS, [&] {
+    float ms_fu = time_loop_ms([&] {
         brotensor::resblock_forward(X, g1, b1, W1, &bcv1, nullptr,
                                     g2, b2, W2, &bcv2, nullptr, nullptr,
                                     N, C, C, H, Wd, 32, 1e-5f, Y_fu);
@@ -222,11 +209,13 @@ void print_table(const std::vector<Row>& rows) {
 int main() {
     brotensor::init();
     if (!brotensor::is_available(brotensor::Device::CUDA)) {
+    // Pull the SM clock off its P8 idle floor before any timing.
+    bt_bench::spin_up();
         std::printf("CUDA not available - skipping\n");
         return 0;
     }
-    std::printf("brotensor_bench_diffusion  (warmup=%d, iters=%d)\n",
-                WARMUP, ITERS);
+    std::printf("brotensor_bench_diffusion  (warmup %.0f ms/op, best of %d)\n",
+                bt_bench::kWarmupMs, bt_bench::kSamples);
 
     std::vector<Row> rows;
 

@@ -7,6 +7,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include "bench_helpers.h"
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -34,26 +36,26 @@ static void bench(int M, int N, int K, int iters) {
     Tensor Bg = Tensor::from_host_fp16_on(Device::CUDA, Bh.data(), K, N);
 
     Tensor Cg;
-    brotensor::matmul(Ag, Bg, Cg);  // warm-up
+    brotensor::matmul(Ag, Bg, Cg);  // warm-up (also sizes Cg)
     brotensor::sync_all();
 
-    using clk = std::chrono::steady_clock;
-    const auto t0 = clk::now();
-    for (int i = 0; i < iters; ++i) {
-        Tensor tmp;
-        brotensor::matmul(Ag, Bg, tmp);
-    }
-    brotensor::sync_all();
-    const double ms =
-        std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    // Reuse Cg rather than allocating a fresh output per iteration: the timed
+    // region should be the GEMM, not the allocator. (The previous loop built a
+    // new Tensor every pass, so every sample carried an alloc + free.)
+    (void)iters;   // the harness picks its own warm-up length and sample count
+    const double ms = bt_bench::time_min_ms([&] {
+        brotensor::matmul(Ag, Bg, Cg);
+    });
     const double gflop = 2.0 * M * N * K * 1e-9;
     std::printf("  M=%-6d N=%-6d K=%-6d : %8.4f ms/iter  %8.1f GFLOP/s\n",
-                M, N, K, ms / iters, gflop / (ms / iters * 1e-3));
+                M, N, K, ms, gflop / (ms * 1e-3));
 }
 
 int main() {
     brotensor::init();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // Pull the SM clock off its P8 idle floor before any timing.
+    bt_bench::spin_up();
     std::printf("[bench] matmul_rm FP16 WMMA path\n");
     const int it = 100;
     // Square GEMMs across scales.

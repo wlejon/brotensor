@@ -8,6 +8,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include "bench_helpers.h"
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -43,13 +45,8 @@ static void bench(Device dev, int M, int N, int K, int iters) {
     run();                    // warm-up (also builds the PSO)
     brotensor::sync_all();
 
-    using clk = std::chrono::steady_clock;
-    auto t0 = clk::now();
-    for (int i = 0; i < iters; ++i) run();
-    brotensor::sync_all();
-    auto t1 = clk::now();
-
-    const double secs = std::chrono::duration<double>(t1 - t0).count() / iters;
+    (void)iters;   // the harness picks its own warm-up length and sample count
+    const double secs = bt_bench::time_min_ms(run) * 1e-3;
     const double gflop = 2.0 * M * N * K / 1e9;
     std::printf("  M=%-5d N=%-5d K=%-5d  %8.3f ms  %8.1f GFLOP/s\n",
                 M, N, K, secs * 1e3, gflop / secs);
@@ -60,7 +57,9 @@ int main() {
     Device dev = Device::CPU;
     if (brotensor::is_available(Device::CUDA))       dev = Device::CUDA;
     else if (brotensor::is_available(Device::Metal)) dev = Device::Metal;
-    else { std::printf("no GPU backend available - skipping\n"); return 0; }
+    else {    // Pull the SM clock off its P8 idle floor before any timing.
+    bt_bench::spin_up();
+ std::printf("no GPU backend available - skipping\n"); return 0; }
     std::printf("bench_matmul_abt (device=%s)\n",
                 dev == Device::CUDA ? "CUDA" : "Metal");
 

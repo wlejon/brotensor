@@ -13,6 +13,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include "bench_helpers.h"
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -29,8 +31,6 @@ using brotensor::Dtype;
 
 namespace {
 
-constexpr int WARMUP = 2;
-constexpr int ITERS  = 10;
 
 std::vector<float> rand_vec(size_t n, std::mt19937& rng, float scale) {
     std::uniform_real_distribution<float> d(-scale, scale);
@@ -49,20 +49,7 @@ Tensor upload(const std::vector<float>& v, int rows, int cols, Dtype dt) {
 }
 
 float time_loop_ms(const std::function<void()>& body) {
-    cudaEvent_t e0, e1;
-    cudaEventCreate(&e0);
-    cudaEventCreate(&e1);
-    for (int i = 0; i < WARMUP; ++i) body();
-    cudaDeviceSynchronize();
-    cudaEventRecord(e0);
-    for (int i = 0; i < ITERS; ++i) body();
-    cudaEventRecord(e1);
-    cudaEventSynchronize(e1);
-    float ms = 0.0f;
-    cudaEventElapsedTime(&ms, e0, e1);
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
-    return ms / ITERS;
+    return bt_bench::time_min_ms(body);
 }
 
 // Spot check that the op produced finite, bounded output. Element-by-element
@@ -128,10 +115,13 @@ void bench(const char* tag, bool windowed, int gh, int gw, int window,
 int main() {
     brotensor::init();
     if (!brotensor::is_available(Device::CUDA)) {
+    // Pull the SM clock off its P8 idle floor before any timing.
+    bt_bench::spin_up();
         std::printf("CUDA not available - skipping\n");
         return 0;
     }
-    std::printf("SAM/ViTDet attention bench (ViT-B shapes), avg of %d iters\n", ITERS);
+    std::printf("SAM/ViTDet attention bench (ViT-B shapes), warmup %.0f ms/op, "
+                "best of %d\n", bt_bench::kWarmupMs, bt_bench::kSamples);
     // Global block: 64x64 grid -> L=4096.
     bench("global  64x64 D768 H12  FP32", false, 64, 64, 0, 768, 12, Dtype::FP32);
     bench("global  64x64 D768 H12  FP16", false, 64, 64, 0, 768, 12, Dtype::FP16);

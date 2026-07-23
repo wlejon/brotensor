@@ -19,6 +19,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include "bench_helpers.h"
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -33,8 +35,6 @@ using brotensor::Tensor;
 
 namespace {
 
-constexpr int WARMUP = 2;
-constexpr int ITERS  = 5;   // the slow path is ~600 ms/call at L=12294
 
 void upload_rand_fp16(int rows, int cols, Tensor& g, std::mt19937& rng,
                       float scale = 0.3f) {
@@ -46,21 +46,8 @@ void upload_rand_fp16(int rows, int cols, Tensor& g, std::mt19937& rng,
     g = Tensor::from_host_fp16_on(brotensor::Device::CUDA, h.data(), rows, cols);
 }
 
-float time_loop_ms(int iters, const std::function<void()>& body) {
-    cudaEvent_t e0, e1;
-    cudaEventCreate(&e0);
-    cudaEventCreate(&e1);
-    for (int i = 0; i < WARMUP; ++i) body();
-    cudaDeviceSynchronize();
-    cudaEventRecord(e0);
-    for (int i = 0; i < iters; ++i) body();
-    cudaEventRecord(e1);
-    cudaEventSynchronize(e1);
-    float ms = 0.0f;
-    cudaEventElapsedTime(&ms, e0, e1);
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
-    return ms / iters;
+float time_loop_ms(const std::function<void()>& body) {
+    return bt_bench::time_min_ms(body);
 }
 
 // Spot-check the two outputs agree. Attention output is a convex mix of V
@@ -97,11 +84,11 @@ void bench_shape(int L, int nh, int hd) {
     cu = cu.to(brotensor::Device::CUDA);
     const int32_t* cu_p = static_cast<const int32_t*>(cu.data);
 
-    const float ms_fa = time_loop_ms(ITERS, [&] {
+    const float ms_fa = time_loop_ms([&] {
         brotensor::flash_attention_forward(Q, K, V, /*d_mask=*/nullptr, nh,
                                            /*causal=*/false, O_fa);
     });
-    const float ms_vl = time_loop_ms(ITERS, [&] {
+    const float ms_vl = time_loop_ms([&] {
         brotensor::flash_attention_varlen_forward(Q, K, V, cu_p, cu_p,
                                                   /*batch=*/1, L, L, nh, hd,
                                                   /*causal=*/false, O_vl);
@@ -123,11 +110,13 @@ void bench_shape(int L, int nh, int hd) {
 int main() {
     brotensor::init();
     if (!brotensor::is_available(brotensor::Device::CUDA)) {
+    // Pull the SM clock off its P8 idle floor before any timing.
+    bt_bench::spin_up();
         std::printf("CUDA not available - skipping\n");
         return 0;
     }
-    std::printf("brotensor_bench_flow_attention  (warmup=%d, iters=%d)\n",
-                WARMUP, ITERS);
+    std::printf("brotensor_bench_flow_attention  (warmup %.0f ms/op, best of %d)\n",
+                bt_bench::kWarmupMs, bt_bench::kSamples);
     bench_shape(4101, 16, 64);    // context_refiner
     bench_shape(8192, 16, 64);    // noise_refiner
     bench_shape(12294, 16, 64);   // joint blocks
