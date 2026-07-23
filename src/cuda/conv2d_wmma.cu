@@ -161,80 +161,105 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
         }
     }
 
+    // ---- B-tile addressing, also hoisted ----
+    // W is laid out (C_out, C_in*KHW) row-major == (N_gemm, K) row-major, so a
+    // B-tile row is a contiguous run of K and the load vectorises to int4 (8
+    // 16-bit elements). Only the K offset moves with k0.
+    constexpr int kHalvesPerLoad = 8;
+    constexpr int kLoadsPerThr   = (BN * BK) / kHalvesPerLoad / THREADS_PER_CTA;  // 2
+    int b_row[kLoadsPerThr], b_gcol[kLoadsPerThr];
+    #pragma unroll
+    for (int li = 0; li < kLoadsPerThr; ++li) {
+        const int lin = tid + li * THREADS_PER_CTA;
+        b_row[li]  = lin / (BK / kHalvesPerLoad);
+        b_gcol[li] = (lin % (BK / kHalvesPerLoad)) * kHalvesPerLoad;
+    }
+    // The int4 fast path needs K_total 8-aligned; K = C_in*KH*KW often is not
+    // (C_in=3, KHW=9 -> K=27), so the scalar fallback stays.
+    const bool k_aligned8 = ((K_total & 7) == 0);
+
+    // ---- Global -> register loads, hoisted into lambdas ----
+    //
+    // The K loop below is software-pipelined: iteration k computes on the
+    // shared-memory tiles while the global loads for k+1 are already in flight.
+    // Without that, each iteration is load -> sync -> mma -> sync with nothing
+    // to cover the global latency, and at 28 KB of shared per CTA there is only
+    // one CTA resident per SM, so no other warp can cover it either. Staging
+    // through registers rather than a second shared buffer keeps the shared
+    // footprint (and hence occupancy) exactly where it was.
+    T    a_reg[kElemsPerThr];
+    int4 b_reg[kLoadsPerThr];
+
+    auto load_a = [&](int k0) {
+        const int gk = k0 + a_col;
+        // KHW and KW are template constants, so these two divisions become
+        // multiply-shift sequences rather than the hardware divide.
+        const int ic  = gk / KHW;
+        const int khw = gk - ic * KHW;
+        const int kh  = khw / KW;
+        const int kw  = khw - kh * KW;
+        const int ic_off = ic * H * W;
+        const bool k_ok  = gk < K_total;
+
+        #pragma unroll
+        for (int li = 0; li < kElemsPerThr; ++li) {
+            T v = TR::from_f32(0.0f);
+            if (k_ok && row_xbase[li] >= 0) {
+                const int in_h = row_ih[li] + kh;
+                const int in_w = row_iw[li] + kw;
+                if (in_h >= 0 && in_h < H && in_w >= 0 && in_w < W) {
+                    v = X[row_xbase[li] + ic_off + in_h * W + in_w];
+                }
+            }
+            a_reg[li] = v;
+        }
+    };
+
+    auto load_b = [&](int k0) {
+        #pragma unroll
+        for (int li = 0; li < kLoadsPerThr; ++li) {
+            const int grow = block_n + b_row[li];
+            const int gk   = k0 + b_gcol[li];
+            T tmp[kHalvesPerLoad];
+            if (k_aligned8 && grow < C_out && gk + kHalvesPerLoad <= K_total) {
+                *reinterpret_cast<int4*>(tmp) =
+                    *reinterpret_cast<const int4*>(&Wt[grow * K_total + gk]);
+            } else {
+                #pragma unroll
+                for (int q = 0; q < kHalvesPerLoad; ++q) {
+                    const int gk_q = gk + q;
+                    tmp[q] = (grow < C_out && gk_q < K_total)
+                                 ? Wt[grow * K_total + gk_q]
+                                 : TR::from_f32(0.0f);
+                }
+            }
+            b_reg[li] = *reinterpret_cast<int4*>(tmp);
+        }
+    };
+
+    load_a(0);
+    load_b(0);
+
     // Loop over K dimension in chunks of BK.
     for (int k0 = 0; k0 < K_total; k0 += BK) {
-        // ---- Load A tile (BM rows by BK cols), gathering from X ----
-        // Per-element (not vectorised): each column can come from a different
-        // (ic, kh, kw), so the address pattern is gather-shaped.
-        {
-            const int gk = k0 + a_col;
-            // KHW and KW are template constants, so these two divisions become
-            // multiply-shift sequences rather than the hardware divide.
-            const int ic  = gk / KHW;
-            const int khw = gk - ic * KHW;
-            const int kh  = khw / KW;
-            const int kw  = khw - kh * KW;
-            const int ic_off = ic * H * W;
-            const bool k_ok  = gk < K_total;
-
-            #pragma unroll
-            for (int li = 0; li < kElemsPerThr; ++li) {
-                T v = TR::from_f32(0.0f);
-                if (k_ok && row_xbase[li] >= 0) {
-                    const int in_h = row_ih[li] + kh;
-                    const int in_w = row_iw[li] + kw;
-                    if (in_h >= 0 && in_h < H && in_w >= 0 && in_w < W) {
-                        v = X[row_xbase[li] + ic_off + in_h * W + in_w];
-                    }
-                }
-                As[a_row0 + 4 * li][a_col] = v;
-            }
+        // Publish the tiles fetched during the previous iteration.
+        #pragma unroll
+        for (int li = 0; li < kElemsPerThr; ++li) {
+            As[a_row0 + 4 * li][a_col] = a_reg[li];
         }
-
-        // ---- Load B tile (BN rows by BK cols) from W ----
-        // W is laid out (C_out, C_in*KHW) row-major == (N_gemm, K) row-major.
-        // The int4 fast path requires both K_total and the per-thread gk to be
-        // 8-aligned; for conv2d K = C_in*KH*KW which is often NOT a multiple of
-        // 8 (e.g. C_in=4, K=4 or C_in=3, KHW=9 → K=27). Pick per-element fallback
-        // unless K_total is 8-aligned. int4 carries 8 16-bit elements for both
-        // __half and __nv_bfloat16.
-        {
-            constexpr int kHalvesPerLoad = 8;  // int4 = 8 16-bit elements
-            constexpr int kTotalHalves   = BN * BK;
-            constexpr int kLoadsTotal    = kTotalHalves / kHalvesPerLoad;  // 256
-            constexpr int kLoadsPerThr   = kLoadsTotal / THREADS_PER_CTA;  // 2
-
-            const bool k_aligned8 = ((K_total & 7) == 0);
-
-            #pragma unroll
-            for (int li = 0; li < kLoadsPerThr; ++li) {
-                const int lin = tid + li * THREADS_PER_CTA;
-                const int row = lin / (BK / kHalvesPerLoad);     // 0..BN-1
-                const int col_grp = lin % (BK / kHalvesPerLoad);
-                const int gcol = col_grp * kHalvesPerLoad;
-                const int grow = block_n + row;                  // oc
-                const int gk   = k0 + gcol;
-
-                T tmp[kHalvesPerLoad];
-                if (k_aligned8 && grow < C_out && gk + kHalvesPerLoad <= K_total) {
-                    const int4* src = reinterpret_cast<const int4*>(&Wt[grow * K_total + gk]);
-                    *reinterpret_cast<int4*>(tmp) = *src;
-                } else {
-                    #pragma unroll
-                    for (int q = 0; q < kHalvesPerLoad; ++q) {
-                        const int gk_q = gk + q;
-                        if (grow < C_out && gk_q < K_total) {
-                            tmp[q] = Wt[grow * K_total + gk_q];
-                        } else {
-                            tmp[q] = TR::from_f32(0.0f);
-                        }
-                    }
-                }
-                *reinterpret_cast<int4*>(&Bs[row][gcol]) = *reinterpret_cast<int4*>(tmp);
-            }
+        #pragma unroll
+        for (int li = 0; li < kLoadsPerThr; ++li) {
+            *reinterpret_cast<int4*>(&Bs[b_row[li]][b_gcol[li]]) = b_reg[li];
         }
 
         __syncthreads();
+
+        // Issue the next iteration's global loads now. They are independent of
+        // the WMMA work below, so the scheduler covers their latency with it.
+        if (k0 + BK < K_total) {
+            load_a(k0 + BK);
+            load_b(k0 + BK);
+        }
 
         // ---- WMMA compute on shared-mem tiles ----
         #pragma unroll
