@@ -120,49 +120,74 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
         }
     }
 
+    // ---- A-tile addressing, hoisted out of the K loop ----
+    //
+    // The A-tile load assigns thread `tid` element `lin = tid + li*128` of the
+    // BM x BK tile, so with BK == 32 and 128 threads:
+    //     lin = 32*(tid>>5) + (tid&31) + 128*li  =>  row = (tid>>5) + 4*li,
+    //                                                col = tid & 31.
+    // The column — and therefore the K index each thread reads — is fixed for
+    // the whole kernel, and the 16 rows a thread touches are fixed too. Only
+    // the (ic, kh, kw) decomposition varies with k0, and it varies identically
+    // for all 16 of a thread's elements.
+    //
+    // The original loop rederived (n, oh, ow) from scratch for all 16 elements
+    // on every K iteration: two integer divisions by runtime values (HW_out,
+    // W_out) per element per iteration, which on a 576-deep K is 18 iterations
+    // x 16 elements x 2 divisions of pure redundancy. Hoisting them costs 48
+    // registers — affordable at 128 threads/CTA — and leaves the inner loop
+    // doing address arithmetic only.
+    constexpr int kElemsPerThr = (BM * BK) / THREADS_PER_CTA;   // 16
+    const int a_col = tid & (BK - 1);        // this thread's K offset within BK
+    const int a_row0 = tid >> 5;             // first of its 16 rows
+
+    int  row_xbase[kElemsPerThr];   // n * C_in * H * W, or -1 when the row is OOB
+    int  row_ih[kElemsPerThr];      // oh * STRIDE_H - PAD_H
+    int  row_iw[kElemsPerThr];      // ow * STRIDE_W - PAD_W
+    const int M_total = N * HW_out;
+    #pragma unroll
+    for (int li = 0; li < kElemsPerThr; ++li) {
+        const int m_g = block_m + a_row0 + 4 * li;
+        if (m_g < M_total) {
+            const int n  = m_g / HW_out;
+            const int sp = m_g - n * HW_out;
+            const int oh = sp / W_out;
+            const int ow = sp - oh * W_out;
+            row_xbase[li] = n * C_in * H * W;
+            row_ih[li]    = oh * STRIDE_H - PAD_H;
+            row_iw[li]    = ow * STRIDE_W - PAD_W;
+        } else {
+            row_xbase[li] = -1;
+        }
+    }
+
     // Loop over K dimension in chunks of BK.
     for (int k0 = 0; k0 < K_total; k0 += BK) {
         // ---- Load A tile (BM rows by BK cols), gathering from X ----
-        // Each thread loads (BM*BK)/THREADS_PER_CTA = 16 halves total.
-        // Layout: 128 threads cover 64 rows x 32 cols. Two threads per row
-        // (cols [0..15] and [16..31]) — but per-element load (not vectorised)
-        // because each col can come from a different (n, ic, kh, kw) and the
-        // address pattern is gather-shaped.
+        // Per-element (not vectorised): each column can come from a different
+        // (ic, kh, kw), so the address pattern is gather-shaped.
         {
-            constexpr int kElemsPerRow = BK;            // 32
-            constexpr int kElemsPerCol = BM;            // 64
-            constexpr int kElemsTotal  = BM * BK;       // 2048
-            constexpr int kElemsPerThr = kElemsTotal / THREADS_PER_CTA;  // 16
+            const int gk = k0 + a_col;
+            // KHW and KW are template constants, so these two divisions become
+            // multiply-shift sequences rather than the hardware divide.
+            const int ic  = gk / KHW;
+            const int khw = gk - ic * KHW;
+            const int kh  = khw / KW;
+            const int kw  = khw - kh * KW;
+            const int ic_off = ic * H * W;
+            const bool k_ok  = gk < K_total;
 
             #pragma unroll
             for (int li = 0; li < kElemsPerThr; ++li) {
-                const int lin = tid + li * THREADS_PER_CTA;
-                const int row = lin / kElemsPerRow;       // 0..BM-1
-                const int col = lin - row * kElemsPerRow; // 0..BK-1
-                const int gk  = k0 + col;                 // global K index
-                const int m_g = block_m + row;            // global output-pixel index
-
                 T v = TR::from_f32(0.0f);
-                if (m_g < N * HW_out && gk < K_total) {
-                    // Decompose m_g -> (n, oh, ow).
-                    const int n     = m_g / HW_out;
-                    const int sp    = m_g - n * HW_out;
-                    const int oh    = sp / W_out;
-                    const int ow    = sp - oh * W_out;
-
-                    // Decompose gk -> (ic, kh, kw).
-                    const int ic    = gk / KHW;
-                    const int khw   = gk - ic * KHW;
-                    const int kh    = khw / KW;
-                    const int kw    = khw - kh * KW;
-
-                    const int in_h  = oh * STRIDE_H - PAD_H + kh;  // dil=1
-                    const int in_w  = ow * STRIDE_W - PAD_W + kw;
+                if (k_ok && row_xbase[li] >= 0) {
+                    const int in_h = row_ih[li] + kh;
+                    const int in_w = row_iw[li] + kw;
                     if (in_h >= 0 && in_h < H && in_w >= 0 && in_w < W) {
-                        v = X[((n * C_in + ic) * H + in_h) * W + in_w];
+                        v = X[row_xbase[li] + ic_off + in_h * W + in_w];
                     }
                 }
-                As[row][col] = v;
+                As[a_row0 + 4 * li][a_col] = v;
             }
         }
 
