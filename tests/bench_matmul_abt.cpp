@@ -57,11 +57,12 @@ int main() {
     Device dev = Device::CPU;
     if (brotensor::is_available(Device::CUDA))       dev = Device::CUDA;
     else if (brotensor::is_available(Device::Metal)) dev = Device::Metal;
-    else {    // Pull the SM clock off its P8 idle floor before any timing.
-    bt_bench::spin_up();
- std::printf("no GPU backend available - skipping\n"); return 0; }
+    else { std::printf("no GPU backend available - skipping\n"); return 0; }
     std::printf("bench_matmul_abt (device=%s)\n",
                 dev == Device::CUDA ? "CUDA" : "Metal");
+
+    // Pull the SM clock off its P8 idle floor before any timing.
+    bt_bench::spin_up();
 
     bench(dev, 512,  512,  512,  50);
     bench(dev, 256,  2048, 2048, 30);   // attention out-proj shape
