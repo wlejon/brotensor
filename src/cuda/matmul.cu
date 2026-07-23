@@ -540,6 +540,51 @@ void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
+// ─── Raw-pointer entry to the row-major WMMA GEMM ──────────────────────────
+//
+// Exposed for conv2d.cu. A 1x1 stride-1 pad-0 convolution is not merely
+// GEMM-like, it IS a GEMM: with H_out == H and W_out == W,
+//     Y[n](C_out, H*W) = Wt(C_out, C_in) @ X[n](C_in, H*W)
+// and both operands are already contiguous in exactly that layout. Routing it
+// here instead of through the implicit-GEMM conv kernel skips the gather
+// addressing and the scatter epilogue, neither of which buys anything when the
+// "im2col" is the identity.
+//
+// Returns false without launching when the shape is outside the WMMA path's
+// gating, so callers can fall back.
+namespace matmul_rm_internal {
+
+// CTAs this kernel would launch for an (M, N) output. Callers deciding between
+// one fused launch and a loop of GEMM launches need the grid size to judge
+// whether each launch carries enough work; exposing it here keeps the tile
+// constants in this file.
+int rm_wmma_grid_ctas(int M, int N) {
+    return ((N + RM_BN - 1) / RM_BN) * ((M + RM_BM - 1) / RM_BM);
+}
+
+template <typename T>
+static bool launch_rm_wmma(const T* A, const T* B, T* C, int M, int N, int K) {
+    if (!matmul_rm_wmma_eligible(M, N, K)) return false;
+    dim3 block(RM_THREADS_PER_CTA);
+    dim3 grid((N + RM_BN - 1) / RM_BN, (M + RM_BM - 1) / RM_BM);
+    matmul_rm_wmma_kernel<T><<<grid, block, 0,
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream())>>>(
+            A, B, C, M, N, K);
+    return true;
+}
+
+bool launch_matmul_rm_wmma(const __half* A, const __half* B, __half* C,
+                           int M, int N, int K) {
+    return launch_rm_wmma<__half>(A, B, C, M, N, K);
+}
+
+bool launch_matmul_rm_wmma_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B,
+                                __nv_bfloat16* C, int M, int N, int K) {
+    return launch_rm_wmma<__nv_bfloat16>(A, B, C, M, N, K);
+}
+
+}  // namespace matmul_rm_internal
+
 // Public batched A @ B^T exposing the internal WMMA tensor-core kernel.
 // C[b](M,N) = A[b](M,K) @ B[b](N,K)^T, FP32 accumulation, optional fused
 // per-N bias + activation. A/B/C share dtype ∈ {FP16, BF16}; C is caller-sized.

@@ -43,6 +43,18 @@ bool launch_conv2d_implicit_gemm_wmma_bf16(
         int H_out, int W_out);
 }
 
+namespace detail::cuda::matmul_rm_internal {
+// Defined in matmul.cu. Row-major C(M,N) = A(M,K) @ B(K,N) on tensor cores.
+// Returns false without launching when the shape falls outside the WMMA path's
+// gating (K or N not 8-aligned, K < 16, tiny M*N), so the caller can fall back.
+bool launch_matmul_rm_wmma(const __half* A, const __half* B, __half* C,
+                           int M, int N, int K);
+bool launch_matmul_rm_wmma_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B,
+                                __nv_bfloat16* C, int M, int N, int K);
+// CTAs one such launch would occupy, for the batch-loop trade-off below.
+int rm_wmma_grid_ctas(int M, int N);
+}
+
 namespace {
 
 constexpr int CONV_BLOCK = 256;
@@ -406,6 +418,67 @@ void conv2d_forward(const ::brotensor::Tensor& X,
 
     const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+
+    // ── 1x1 stride-1 pad-0: dispatch to the row-major GEMM ──
+    //
+    // With H_out == H and W_out == W the convolution reduces exactly to
+    //     Y[n](C_out, H*W) = Wt(C_out, C_in) @ X[n](C_in, H*W),
+    // and both operands are already contiguous in that layout — the implicit
+    // GEMM's gather and scatter are addressing an im2col that is the identity.
+    // The plain GEMM kernel is an order of magnitude faster on these shapes
+    // (measured 8 -> 88 TFLOP/s at C=128, 256^2, batch 1), because a 1x1's K is
+    // just C_in, so the conv kernel's fixed prologue and epilogue are amortised
+    // over only a handful of K iterations.
+    //
+    // Bias is excluded rather than emulated: the GEMM has no bias epilogue, and
+    // a separate add would give back what this saves. Every 1x1 in the diffusion
+    // and terrain nets is bias-free (the converters fold it), so the exclusion
+    // costs nothing in practice.
+    //
+    // The conv kernel does the whole batch in one launch; this does one launch
+    // per batch item, because X's per-item (C_in, H*W) blocks are not
+    // contiguous as a single (C_in, N*H*W) matrix. So the trade is a much
+    // better kernel against N times the launch overhead, and it only pays when
+    // each launch carries real work. Requiring a grid of at least 128 CTAs —
+    // roughly one per SM on the cards this targets — admits the shapes where it
+    // wins by an order of magnitude (C=128 at 256^2, batch 1: 8 -> 91 TFLOP/s)
+    // and rejects the ones where it loses (C=768 at 8^2, batch 16, a 36-CTA
+    // grid launched 16 times: measured 2.9x SLOWER than the conv kernel).
+    constexpr int kMinGemmCtas = 128;
+    if (groups == 1 && bias == nullptr && kH == 1 && kW == 1 &&
+        pad_h == 0 && pad_w == 0 && stride_h == 1 && stride_w == 1 &&
+        dil_h == 1 && dil_w == 1 &&
+        (X.dtype == Dtype::FP16 || X.dtype == Dtype::BF16) &&
+        detail::cuda::matmul_rm_internal::rm_wmma_grid_ctas(C_out, H * W) >=
+            kMinGemmCtas) {
+        const int HW = H * W;
+        const std::size_t x_stride = static_cast<std::size_t>(C_in) * HW;
+        const std::size_t y_stride = static_cast<std::size_t>(C_out) * HW;
+        bool taken = true;
+        for (int n = 0; n < N && taken; ++n) {
+            if (X.dtype == Dtype::FP16) {
+                taken = detail::cuda::matmul_rm_internal::launch_matmul_rm_wmma(
+                    static_cast<const __half*>(Wt.data),
+                    static_cast<const __half*>(X.data) + n * x_stride,
+                    static_cast<__half*>(Y.data) + n * y_stride,
+                    C_out, HW, C_in);
+            } else {
+                taken = detail::cuda::matmul_rm_internal::launch_matmul_rm_wmma_bf16(
+                    static_cast<const __nv_bfloat16*>(Wt.data),
+                    static_cast<const __nv_bfloat16*>(X.data) + n * x_stride,
+                    static_cast<__nv_bfloat16*>(Y.data) + n * y_stride,
+                    C_out, HW, C_in);
+            }
+        }
+        // The gating is shape-only, so it either accepts every batch item or
+        // rejects the first; a partial run would have written some of Y, but
+        // the fall-through below overwrites all of it either way.
+        if (taken) {
+            BROTENSOR_CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+
     if (X.dtype == Dtype::FP16) {
         const __half* x_p  = static_cast<const __half*>(X.data);
         const __half* w_p  = static_cast<const __half*>(Wt.data);
