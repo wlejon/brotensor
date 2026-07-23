@@ -19,6 +19,20 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+// The quantized weight is staged as raw host bytes and pushed into a device
+// tensor. Metal's storage is host-addressable so a plain std::memcpy lands,
+// but a CUDA Tensor::data is a bare cudaMalloc pointer — writing it from the
+// host segfaults. Same shim as test_q4k_parity.cpp.
+#if defined(BROTENSOR_HAS_CUDA)
+#include <cuda_runtime.h>
+#else
+#include <cstring>
+static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
+    std::memcpy(dst, src, n);
+}
+#define cudaMemcpyHostToDevice 0
+#endif
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -69,7 +83,7 @@ Tensor make_quant_weight(int out, int in, Dtype dt,
         }
     }
     Tensor W = Tensor::empty_on(g_dev, out, in, dt);
-    std::memcpy(W.data, bytes.data(), bytes.size());
+    cudaMemcpy(W.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice);
     return W;
 }
 
