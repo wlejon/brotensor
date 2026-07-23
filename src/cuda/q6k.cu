@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 
@@ -109,13 +110,19 @@ __device__ __forceinline__ float block_reduce_sum_256(float v, float* scratch) {
 // byte and four x-halves. The ql/qh reads go through load_u32_align2: a block
 // is 210 bytes and 210 % 4 == 2, so every other block start is only 2-byte
 // aligned and a single uint32 load would be misaligned. See q6k_internal.cuh.
+// One CTA per output row, with the row's super-blocks split across SBG groups
+// of 64 threads. See q4k.cu for why: a one-group row has only two warps of
+// memory-level parallelism, so at low output widths the grid cannot keep enough
+// requests outstanding and the kernel runs latency-bound.
+template <int SBG>
 __global__ void linear_q6k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
                                             const __half*  __restrict__ x,
                                             const __half*  __restrict__ bias,
                                             __half*        __restrict__ y,
                                             int K, int blocks_per_row) {
     const int row = blockIdx.x;
-    const int t   = threadIdx.x;
+    const int grp = threadIdx.x >> 6;      // which super-block group
+    const int t   = threadIdx.x & 63;      // lane within the group
 
     // Four consecutive elements per thread; 64 threads cover the super-block.
     const q6k::QuadDesc qd = q6k::quad_desc(t * 4);
@@ -125,7 +132,7 @@ __global__ void linear_q6k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
 
     const uint8_t* row_base = W + static_cast<size_t>(row) * blocks_per_row * Q6K_BLOCK_BYTES;
 
-    for (int sb_idx = 0; sb_idx < blocks_per_row; ++sb_idx) {
+    for (int sb_idx = grp; sb_idx < blocks_per_row; sb_idx += SBG) {
         const uint8_t* blk = row_base + sb_idx * Q6K_BLOCK_BYTES;
 
         const uint32_t ql4 = q6k::load_u32_align2(blk + q6k::kQlOffset + qd.ql_off);
@@ -149,18 +156,62 @@ __global__ void linear_q6k_fp16_gemv_kernel(const uint8_t* __restrict__ W,
         }
     }
 
-    // 64 threads = two warps: shuffle within each, then combine the pair.
+    // Reduce within each warp, then across the CTA's 2*SBG warps.
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         partial += __shfl_down_sync(0xffffffffu, partial, off);
     }
-    __shared__ float warp_sum[2];
-    if ((t & 31) == 0) warp_sum[t >> 5] = partial;
+    constexpr int NWARP = SBG * 2;
+    __shared__ float warp_sum[NWARP];
+    const int tid = threadIdx.x;
+    if ((tid & 31) == 0) warp_sum[tid >> 5] = partial;
     __syncthreads();
-    if (t == 0) {
-        float out = warp_sum[0] + warp_sum[1];
+    if (tid == 0) {
+        float out = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NWARP; ++w) out += warp_sum[w];
         if (bias) out += __half2float(bias[row]);
         y[row] = __float2half_rn(out);
+    }
+}
+
+// Group count and dispatch, same rule as q4k_gemv_groups: widen the row only
+// when the plain one-group grid does not already span two block-waves, with the
+// threshold read from the device so it tracks SM count.
+inline int q6k_gemv_groups(int out, int blocks_per_row) {
+    static std::atomic<int> two_waves{0};   // benign double-compute, no lock
+    int tw = two_waves.load(std::memory_order_relaxed);
+    if (tw == 0) {
+        int dev = 0, sms = 1, blocks = 1;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaDeviceGetAttribute(&blocks, cudaDevAttrMaxBlocksPerMultiprocessor, dev);
+        tw = 2 * sms * blocks;
+        two_waves.store(tw, std::memory_order_relaxed);
+    }
+    if (out >= tw) return 1;
+    int g = 4;
+    while (g > 1 && g > blocks_per_row) g >>= 1;
+    return g;
+}
+
+inline void q6k_gemv_launch(const uint8_t* W, const __half* x,
+                            const __half* bias, __half* y,
+                            int out, int K, int blocks_per_row,
+                            cudaStream_t stream) {
+    switch (q6k_gemv_groups(out, blocks_per_row)) {
+        case 4:
+            linear_q6k_fp16_gemv_kernel<4><<<out, 4 * Q6K_GEMV_THREADS, 0, stream>>>(
+                W, x, bias, y, K, blocks_per_row);
+            break;
+        case 2:
+            linear_q6k_fp16_gemv_kernel<2><<<out, 2 * Q6K_GEMV_THREADS, 0, stream>>>(
+                W, x, bias, y, K, blocks_per_row);
+            break;
+        default:
+            linear_q6k_fp16_gemv_kernel<1><<<out, Q6K_GEMV_THREADS, 0, stream>>>(
+                W, x, bias, y, K, blocks_per_row);
+            break;
     }
 }
 
@@ -237,12 +288,11 @@ void linear_forward_q6k_fp16(const Tensor& W_q6k, const Tensor* bias,
         ? static_cast<const __half*>(bias->data)
         : nullptr;
 
-    linear_q6k_fp16_gemv_kernel<<<out, Q6K_GEMV_THREADS, 0, stream>>>(
-        static_cast<const uint8_t*>(W_q6k.data),
-        static_cast<const __half*>(x.data),
-        b_p,
-        static_cast<__half*>(y.data),
-        K, blocks_per_row);
+    q6k_gemv_launch(static_cast<const uint8_t*>(W_q6k.data),
+                    static_cast<const __half*>(x.data),
+                    b_p,
+                    static_cast<__half*>(y.data),
+                    out, K, blocks_per_row, stream);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -295,10 +345,8 @@ void linear_forward_batched_q6k_fp16(const Tensor& W_q6k, const Tensor* bias,
     for (int b = 0; b < B; ++b) {
         const __half* x_p = static_cast<const __half*>(X_BD.data) + static_cast<size_t>(b) * K;
         __half*       y_p = static_cast<__half*>(Y_BD.data)       + static_cast<size_t>(b) * out;
-        linear_q6k_fp16_gemv_kernel<<<out, Q6K_GEMV_THREADS, 0, stream>>>(
-            static_cast<const uint8_t*>(W_q6k.data),
-            x_p, b_p, y_p,
-            K, blocks_per_row);
+        q6k_gemv_launch(static_cast<const uint8_t*>(W_q6k.data),
+                        x_p, b_p, y_p, out, K, blocks_per_row, stream);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
