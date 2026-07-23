@@ -1,21 +1,19 @@
 // Micro-benchmark: causal vs non-causal prefill attention.
 //
-// flash_attention_forward routes to a fused FlashAttention-2 WMMA kernel
-// (src/cuda/flash_attention_fused.cu) only for the non-causal case — see the
-// `if (!causal && flash_fused::supported(head_dim))` gate in
-// flash_attention.cu. With causal=true it falls through to a scalar fallback
-// that computes each score as a serial per-thread head_dim dot product read
-// straight from global memory, with a shared-memory tree reduction per tile.
-//
-// So every LLM prefill — which is causal by definition — misses the tensor
-// cores entirely. This bench times the same shape both ways: the non-causal
-// row is the fused kernel, the causal row is the fallback. The ratio is the
-// cliff, and it is the number to watch when the causal path is taught to use
-// the fused kernel.
+// flash_attention_forward routes both cases to the fused FlashAttention-2
+// WMMA kernel (src/cuda/flash_attention_fused.cu). It used to gate that path
+// on !causal, so every LLM prefill — causal by definition — fell through to a
+// scalar fallback computing each score as a serial per-thread head_dim dot
+// product straight from global memory: a 25-30x cliff, at 0.7% of the part's
+// tensor-core peak. This bench is what measured that, and what now guards
+// against regressing to it.
 //
 // Causal does strictly *less* arithmetic (roughly half the score matrix), so
-// a correct causal path should end up FASTER than its non-causal twin, not
-// slower. Any ratio above 1.0x is pure lost work.
+// it should be FASTER than its non-causal twin, not slower. Any ratio above
+// 1.0x is lost work. It does not reach the ideal 0.5x at short sequences
+// because the saving is quantised to whole key tiles: a CTA covering query
+// rows [q0, q0+BR) must still walk every key tile up to q0+BR, so the wasted
+// fraction shrinks only as L grows past BR.
 //
 // GFLOP/s uses each variant's own flop count: 4*L*L*hd*nh non-causal (two
 // GEMMs), half that for causal.
@@ -198,8 +196,7 @@ int main() {
     bt_bench::spin_up();
     std::printf("brotensor_bench_causal_attention  (warmup %.0f ms/op, best of %d)\n",
                 bt_bench::kWarmupMs, bt_bench::kSamples);
-    std::printf("non-causal takes the fused WMMA path; causal falls back to "
-                "the scalar kernel.\n");
+    std::printf("both variants take the fused WMMA path.\n");
     std::printf("causal does ~half the arithmetic, so a healthy ratio is "
                 "BELOW 1.0x.\n\n");
 
