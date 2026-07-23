@@ -68,7 +68,6 @@ struct hd_dims {
     static constexpr int LDS  = BC + 8;               // S scores / P staging
     static constexpr int KT   = PAD / 16;             // head-dim tiles
     static constexpr int NT   = BC / 16;              // key tiles across BC
-    static constexpr int OCOL = PAD / 2;              // O cols / thread
 };
 
 template <typename T> struct ff_traits;
@@ -198,8 +197,10 @@ flash_fused_kernel(const T* __restrict__ Q,
     constexpr int LDS  = DM::LDS;
     constexpr int KT   = DM::KT;       // head-dim tiles (contraction / output)
     constexpr int NT   = DM::NT;       // key tiles across the BC key rows
-    constexpr int OCOL = DM::OCOL;     // O columns owned per thread
     constexpr int SCOL = BC / 2;       // softmax (key) columns owned per thread
+
+    using OFrag = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+    constexpr int OFE = OFrag::num_elements;   // 8 on every arch so far
 
     // 32-byte alignment: WMMA tile pointers must be 256-bit aligned, and the
     // carve in Smem keeps every tile offset a multiple of 32 relative to base.
@@ -240,9 +241,32 @@ flash_fused_kernel(const T* __restrict__ Q,
                 : 0.0f);
     }
 
-    float o_acc[OCOL];
+    // ── Probe the accumulator fragment's element -> row mapping ──
+    // O now lives in accumulator fragments for the whole key loop, so the
+    // per-row online-softmax correction has to be applied to fragment elements
+    // directly — and the WMMA API does not document which element belongs to
+    // which row. Rather than hard-code the arrangement Volta through Ada happen
+    // to use, ask for it: fill a 16x16 tile with its own row indices, load it
+    // as an accumulator fragment, and read back where each of this thread's
+    // elements came from. One warp-private shared round-trip, once per CTA.
+    int frag_row[OFE];
+    {
+        float* probe_slot = sm.s + size_t(wrow0) * LDS;
+        for (int idx = lane; idx < 16 * 16; idx += 32) {
+            probe_slot[size_t(idx / 16) * LDS + (idx % 16)] =
+                static_cast<float>(idx / 16);
+        }
+        __syncwarp();
+        OFrag probe;
+        wmma::load_matrix_sync(probe, probe_slot, LDS, wmma::mem_row_major);
 #pragma unroll
-    for (int i = 0; i < OCOL; ++i) o_acc[i] = 0.0f;
+        for (int i = 0; i < OFE; ++i) frag_row[i] = static_cast<int>(probe.x[i]);
+        __syncwarp();
+    }
+
+    OFrag o_frag[KT];
+#pragma unroll
+    for (int t = 0; t < KT; ++t) wmma::fill_fragment(o_frag[t], 0.0f);
     float m_run = -1e30f;
     float l_run = 0.0f;
 
@@ -337,53 +361,63 @@ flash_fused_kernel(const T* __restrict__ Q,
         m_run = m_new;
         __syncwarp();
 
-        // ── O_strip += P_strip(16, BC) @ V_tile(BC, HD_PAD) (WMMA, FP32 accum) ──
-        // Each 16-column output fragment is finished independently (P fragments
-        // are register-resident, so the contraction re-runs per output tile),
-        // then ferried to o_acc through a 16-column slot at the head of the
-        // warp's rows in the (now free) S buffer. Slot reuse is warp-private:
-        // the two __syncwarp()s order store -> read -> next store.
+        // ── O_strip = corr * O_strip + P_strip(16, BC) @ V_tile(BC, HD_PAD) ──
+        // The running O stays in accumulator fragments across the entire key
+        // loop and the rescale is applied to fragment elements in place, so
+        // nothing round-trips through shared here. `corr` for query row r sits
+        // in lanes 2r and 2r+1 (softmax pairs two threads per row and equalises
+        // them across lane^1), so one shuffle per element position fetches it.
+        // The element->row map is a property of the fragment shape, not of the
+        // output tile, so this is OFE shuffles per key tile rather than per
+        // output tile — replacing KT shared stores, KT*8 shared loads and
+        // 2*KT __syncwarp()s that the per-tile ferry paid on every iteration.
         {
+            float corr_e[OFE];
+#pragma unroll
+            for (int i = 0; i < OFE; ++i)
+                corr_e[i] = __shfl_sync(0xffffffffu, corr, frag_row[i] * 2);
+
             wmma::fragment<wmma::matrix_a, 16, 16, 16, T, wmma::row_major> p_frag[NT];
 #pragma unroll
             for (int k = 0; k < NT; ++k) {
                 wmma::load_matrix_sync(p_frag[k], sm.p + size_t(wrow0) * LDS + k * 16, LDS);
             }
-            float* slot = sm.s + size_t(wrow0) * LDS;
-            const float* slot_rd = sm.s + size_t(wrow0 + trow) * LDS + half_o;
 #pragma unroll
             for (int t = 0; t < KT; ++t) {
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_frag;
-                wmma::fill_fragment(o_frag, 0.0f);
+#pragma unroll
+                for (int i = 0; i < OFE; ++i) o_frag[t].x[i] *= corr_e[i];
 #pragma unroll
                 for (int k = 0; k < NT; ++k) {
                     wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::row_major> b_frag;
                     wmma::load_matrix_sync(b_frag, sm.v + size_t(k) * 16 * LDKV + t * 16, LDKV);
-                    wmma::mma_sync(o_frag, p_frag[k], b_frag, o_frag);
+                    wmma::mma_sync(o_frag[t], p_frag[k], b_frag, o_frag[t]);
                 }
-                wmma::store_matrix_sync(slot, o_frag, LDS, wmma::mem_row_major);
-                __syncwarp();
-#pragma unroll
-                for (int c = 0; c < 8; ++c) {
-                    o_acc[t * 8 + c] = o_acc[t * 8 + c] * corr + slot_rd[c];
-                }
-                __syncwarp();  // reads done before the slot is overwritten
             }
         }
     }
 
     // ── Normalise and write the strip back into the interleaved output (only
-    //    the real head_dim columns; the pad columns [HD, HD_PAD) are dropped).
-    //    o_acc[t*8 + c] holds column t*16 + half_o + c. ──
-    if (orow < Lq) {
+    //    the real head_dim columns; the pad columns [HD, HD_PAD) are dropped) ──
+    // The probe recovered rows, not columns, so the write-back still ferries
+    // each output fragment through the warp's slot in the (now free) S buffer
+    // — but KT times for the whole CTA rather than KT times per key tile.
+    {
         const float inv_l = l_run > 0.0f ? 1.0f / l_run : 0.0f;
+        float* slot = sm.s + size_t(wrow0) * LDS;
+        const float* slot_rd = sm.s + size_t(wrow0 + trow) * LDS + half_o;
         T* out = O + size_t(orow) * D + head_off;
 #pragma unroll
         for (int t = 0; t < KT; ++t) {
+            __syncwarp();  // previous slot reads done before it is overwritten
+            wmma::store_matrix_sync(slot, o_frag[t], LDS, wmma::mem_row_major);
+            __syncwarp();
+            if (orow < Lq) {
 #pragma unroll
-            for (int c = 0; c < 8; ++c) {
-                const int col = t * 16 + half_o + c;
-                if (col < HD) out[col] = ff_traits<T>::from_f32(o_acc[t * 8 + c] * inv_l);
+                for (int c = 0; c < 8; ++c) {
+                    const int col = t * 16 + half_o + c;
+                    if (col < HD)
+                        out[col] = ff_traits<T>::from_f32(slot_rd[c] * inv_l);
+                }
             }
         }
     }

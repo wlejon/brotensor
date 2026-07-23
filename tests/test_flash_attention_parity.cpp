@@ -138,6 +138,46 @@ void run_flash_forward(int Lq, int Lk, int D, int num_heads, uint64_t seed,
     compare_tensors(O_c, fp16_cuda_to_cpu(gO), "flash_fwd.O", 1e-2f, 1e-2f);
 }
 
+// Same op, but with inputs built to exercise the online-softmax rescale.
+//
+// The uniform-random inputs above leave every query row with nearly the same
+// running maximum, and that maximum barely moves after the first key tile — so
+// the per-row correction factor is ~1 everywhere and a kernel that applied one
+// row's correction to every row would still pass. (Confirmed by poisoning the
+// fused kernel's accumulator row map: the whole parity suite stayed green.)
+//
+// Here each query row gets its own magnitude and the keys grow along the
+// sequence, so the running max climbs tile after tile at a rate that differs
+// per row. That makes the correction both materially below 1 and row-specific,
+// which is the only condition under which a wrong row mapping shows up.
+void run_flash_forward_skewed(int Lq, int Lk, int D, int num_heads,
+                              uint64_t seed, bool causal) {
+    SplitMix64 rng(seed);
+    Tensor Q = make_q16_cpu(Lq, D, rng, 0.3f);
+    Tensor K = make_q16_cpu(Lk, D, rng, 0.3f);
+    Tensor V = make_q16_cpu(Lk, D, rng, 0.3f);
+
+    for (int i = 0; i < Lq; ++i) {
+        const float s = q16(0.5f + 0.35f * static_cast<float>((i * 37) % 11));
+        for (int c = 0; c < D; ++c) Q.ptr()[size_t(i) * D + c] = q16(Q[i * D + c] * s);
+    }
+    for (int j = 0; j < Lk; ++j) {
+        const float s = q16(0.4f + 3.6f * static_cast<float>(j) /
+                                   static_cast<float>(Lk - 1));
+        for (int c = 0; c < D; ++c) K.ptr()[size_t(j) * D + c] = q16(K[j * D + c] * s);
+    }
+
+    Tensor O_c;
+    brotensor::flash_attention_forward(Q, K, V, nullptr, num_heads, causal, O_c);
+
+    Tensor gQ = to_fp16_cuda(Q), gK = to_fp16_cuda(K), gV = to_fp16_cuda(V);
+    Tensor gO;
+    brotensor::flash_attention_forward(gQ, gK, gV, nullptr, num_heads, causal,
+                                       gO);
+
+    compare_tensors(O_c, fp16_cuda_to_cpu(gO), "flash_fwd_skewed.O", 1e-2f, 1e-2f);
+}
+
 // ─── flash_attention_qkvo_forward parity (self + cross) ───────────────────
 
 void run_qkvo_forward(int Lq, int Lk, int D, int D_ctx, int num_heads,
@@ -912,6 +952,18 @@ BT_PARITY_TEST(flash_fwd_200x200_D256_h2_hd128_causal_mask) { run_flash_forward(
 // Single query tile, exactly one key tile: the kv_end clamp lands on the
 // loop's first iteration, so tile 0 must still mask per element.
 BT_PARITY_TEST(flash_fwd_64x64_D128_h2_hd64_causal)    { run_flash_forward(64, 64, 128, 2, 0x70Dull, false, true); }
+
+// Divergent per-row running maxima across many key tiles — pins the fused
+// kernel's per-row online-softmax rescale. Lq = Lk = 320 spans 5 key tiles at
+// BC 64 and 10 at BC 32, so the correction is applied repeatedly rather than
+// once. One case per instantiated head_dim (each has its own BR/BC tiling and
+// therefore its own number of rescale steps), causal and not.
+BT_PARITY_TEST(flash_fwd_skew_320_D80_h2_hd40)          { run_flash_forward_skewed(320, 320, 80,  2, 0x7B0ull, false); }
+BT_PARITY_TEST(flash_fwd_skew_320_D128_h2_hd64)         { run_flash_forward_skewed(320, 320, 128, 2, 0x7B1ull, false); }
+BT_PARITY_TEST(flash_fwd_skew_320_D144_h2_hd72)         { run_flash_forward_skewed(320, 320, 144, 2, 0x7B2ull, false); }
+BT_PARITY_TEST(flash_fwd_skew_320_D256_h2_hd128)        { run_flash_forward_skewed(320, 320, 256, 2, 0x7B3ull, false); }
+BT_PARITY_TEST(flash_fwd_skew_320_D128_h2_hd64_causal)  { run_flash_forward_skewed(320, 320, 128, 2, 0x7B4ull, true); }
+BT_PARITY_TEST(flash_fwd_skew_320_D256_h2_hd128_causal) { run_flash_forward_skewed(320, 320, 256, 2, 0x7B5ull, true); }
 
 // ─── flash_attention_qkvo_forward (self + cross, bias, mask, causal) ──────
 BT_PARITY_TEST(qkvo_fwd_self_8x8_D32_h4) {
