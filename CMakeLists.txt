@@ -308,9 +308,12 @@ if(BROTENSOR_WITH_CUDA)
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart_static)
     target_compile_definitions(brotensor_cuda PUBLIC
         BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
-    # brotensor_core's init.cpp must know whether to probe + register CUDA.
+    # brotensor_core's init.cpp must know whether to probe + register CUDA, and
+    # dispatch.cpp calls cudaSetDevice() directly to activate the resolved
+    # operand's device, so core needs the CUDA headers + cudart as well.
     target_compile_definitions(brotensor_core PRIVATE
         BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
+    target_link_libraries(brotensor_core PRIVATE CUDA::cudart_static)
     set_target_properties(brotensor_cuda PROPERTIES
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON
