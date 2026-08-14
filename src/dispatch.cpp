@@ -7,6 +7,7 @@
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/tensor.h>
+#include <brotensor/runtime.h>
 
 #include <array>
 #include <cstddef>
@@ -14,6 +15,10 @@
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
+
+#if defined(BROTENSOR_HAS_CUDA)
+#include <cuda_runtime.h>
+#endif
 
 namespace brotensor::detail {
 
@@ -38,12 +43,7 @@ std::array<Slot, kNumDevices>& slots() {
 }
 
 const char* dev_name(Device d) {
-    switch (d) {
-        case Device::CPU:   return "CPU";
-        case Device::CUDA:  return "CUDA";
-        case Device::Metal: return "Metal";
-    }
-    return "?";
+    return device_name(d);
 }
 
 [[noreturn]] void throw_unregistered(Device d) {
@@ -70,6 +70,16 @@ inline bool committed(const Tensor& t) { return t.data != nullptr; }
     throw std::runtime_error(msg);
 }
 
+inline void activate_device_context(Device dev) {
+#if defined(BROTENSOR_HAS_CUDA)
+    if (dev.is_cuda()) {
+        cudaSetDevice(dev.index);
+    }
+#else
+    (void)dev;
+#endif
+}
+
 // Resolve the op's device from the first committed operand; verify every other
 // committed operand agrees (uncommitted operands are skipped). Returns the
 // vtable for the resolved device.
@@ -91,6 +101,7 @@ const OpsVTable& dispatch_v(std::initializer_list<const Tensor*> ts) {
         }
         ++idx;
     }
+    activate_device_context(dev);
     return ops_for(dev);
 }
 
@@ -118,6 +129,7 @@ const OpsVTable& resolve_over(const Tensor* const* all, std::size_t count) {
             throw_device_mismatch(dev, static_cast<int>(i), all[i]->device);
         }
     }
+    activate_device_context(dev);
     return ops_for(dev);
 }
 
@@ -130,25 +142,45 @@ const OpsVTable& resolve_over(const Tensor* const* all, std::size_t count) {
 
 } // namespace
 
-void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc) {
-    auto& s = slots()[static_cast<int>(d)];
+static int g_cuda_device_count = 0;
+
+void set_cuda_device_count(int count) {
+    g_cuda_device_count = count;
+}
+
+void register_backend(DeviceType dt, const OpsVTable& ops, const AllocVTable& alloc) {
+    auto& s = slots()[static_cast<int>(dt)];
     std::memcpy(&s.ops,   &ops,   sizeof(OpsVTable));
     std::memcpy(&s.alloc, &alloc, sizeof(AllocVTable));
     s.registered = true;
 }
 
+void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc) {
+    register_backend(d.type, ops, alloc);
+}
+
 bool is_registered(Device d) {
-    return slots()[static_cast<int>(d)].registered;
+    if (d.is_cpu()) return slots()[static_cast<int>(DeviceType::CPU)].registered;
+    if (d.is_cuda()) {
+        if (!slots()[static_cast<int>(DeviceType::CUDA)].registered) return false;
+        int count = ::brotensor::cuda_device_count();
+        if (count <= 0) count = 1;
+        return d.index >= 0 && d.index < count;
+    }
+    if (d.is_metal()) {
+        return slots()[static_cast<int>(DeviceType::Metal)].registered && d.index == 0;
+    }
+    return false;
 }
 
 const OpsVTable& ops_for(Device d) {
-    auto& s = slots()[static_cast<int>(d)];
+    auto& s = slots()[static_cast<int>(d.type)];
     if (!s.registered) throw_unregistered(d);
     return s.ops;
 }
 
 const AllocVTable& alloc_for(Device d) {
-    auto& s = slots()[static_cast<int>(d)];
+    auto& s = slots()[static_cast<int>(d.type)];
     if (!s.registered) throw_unregistered(d);
     return s.alloc;
 }
@@ -238,3 +270,9 @@ void adopt_output(Tensor& t, Device d) {
 }
 
 } // namespace brotensor::detail
+
+namespace brotensor {
+int cuda_device_count() {
+    return detail::g_cuda_device_count;
+}
+}

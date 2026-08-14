@@ -42,6 +42,9 @@ Device default_device();
 // active DeviceScope.
 void set_default_device(Device d);
 
+// Number of probed CUDA devices (0 if CUDA not compiled in or no CUDA GPU found).
+int cuda_device_count();
+
 // Backends actually registered in this binary at runtime. CPU is always
 // present; CUDA / Metal appear only if their backend was both compiled in
 // and successfully probed by init().
@@ -56,6 +59,7 @@ bool is_available(Device);
 // and any active DeviceScope. This is the single decision point a model loader
 // uses to pick the dtype it uploads weights at.
 Dtype compute_dtype();
+Dtype compute_dtype(Device d);
 
 // Thread-local scope override. Default device for tensor construction
 // inside the scope is `d`. Restored on destruction. Throws on construction

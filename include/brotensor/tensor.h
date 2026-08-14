@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace brotensor {
@@ -70,11 +71,45 @@ bool dtype_is_quant(Dtype);
 //
 // Runtime backend tag carried on every Tensor. CPU is always available;
 // CUDA / Metal are registered at runtime by `brotensor::init()` if the
-// corresponding backend was compiled into this binary. Multi-GPU within a
-// single backend is deliberately out of scope for now (no Device::CUDA(idx)).
-enum class Device { CPU, CUDA, Metal };
+// corresponding backend was compiled into this binary. Supports multi-GPU
+// device indexing (e.g. Device::cuda(0), Device::cuda(1)).
+enum class DeviceType : int { CPU = 0, CUDA = 1, Metal = 2 };
+
+struct Device {
+    DeviceType type  = DeviceType::CPU;
+    int        index = 0;
+
+    constexpr Device() = default;
+    constexpr Device(DeviceType t, int idx = 0) : type(t), index(idx) {}
+
+    static constexpr Device cpu()              { return Device(DeviceType::CPU, 0); }
+    static constexpr Device cuda(int idx = 0)  { return Device(DeviceType::CUDA, idx); }
+    static constexpr Device metal(int idx = 0) { return Device(DeviceType::Metal, idx); }
+
+    // Legacy enum compatibility constants so `Device::CPU`, `Device::CUDA`, `Device::Metal` work verbatim.
+    static const Device CPU;
+    static const Device CUDA;
+    static const Device Metal;
+
+    constexpr bool operator==(const Device& o) const {
+        return type == o.type && index == o.index;
+    }
+    constexpr bool operator!=(const Device& o) const {
+        return !(*this == o);
+    }
+    constexpr bool operator<(const Device& o) const {
+        if (type != o.type) return static_cast<int>(type) < static_cast<int>(o.type);
+        return index < o.index;
+    }
+
+    constexpr bool is_cpu()   const { return type == DeviceType::CPU; }
+    constexpr bool is_cuda()  const { return type == DeviceType::CUDA; }
+    constexpr bool is_metal() const { return type == DeviceType::Metal; }
+    constexpr bool is_gpu()   const { return type != DeviceType::CPU; }
+};
 
 const char* device_name(Device);
+std::string to_string(Device);
 
 // ─── Tensor ────────────────────────────────────────────────────────────────
 //
@@ -267,3 +302,12 @@ uint16_t fp32_to_bf16_bits(float v);
 float    bf16_bits_to_fp32(uint16_t bits);
 
 } // namespace brotensor
+
+namespace std {
+template <>
+struct hash<brotensor::Device> {
+    std::size_t operator()(const brotensor::Device& d) const noexcept {
+        return (static_cast<std::size_t>(d.type) << 16) | (static_cast<std::size_t>(d.index) & 0xFFFF);
+    }
+};
+}

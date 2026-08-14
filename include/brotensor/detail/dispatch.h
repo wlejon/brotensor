@@ -42,26 +42,27 @@ struct OpsVTable {
 //   * `sync` waits for pending work on this backend to drain. CPU's slot is
 //     a no-op.
 struct AllocVTable {
-    void* (*alloc)(std::size_t bytes);
-    void  (*free)(void* ptr);
-    void  (*memcpy_h2d)(void* dst, const void* src, std::size_t n);
-    void  (*memcpy_d2h)(void* dst, const void* src, std::size_t n);
-    void  (*memcpy_d2d)(void* dst, const void* src, std::size_t n);
-    void  (*memset_zero)(void* dst, std::size_t n);
-    void  (*sync)();
+    void* (*alloc)(std::size_t bytes, int device_index);
+    void  (*free)(void* ptr, int device_index);
+    void  (*memcpy_h2d)(void* dst, const void* src, std::size_t n, int device_index);
+    void  (*memcpy_d2h)(void* dst, const void* src, std::size_t n, int device_index);
+    void  (*memcpy_d2d)(void* dst, const void* src, std::size_t n, int device_index);
+    void  (*memcpy_peer)(void* dst, int dst_device_index, const void* src, int src_device_index, std::size_t n);
+    void  (*memset_zero)(void* dst, std::size_t n, int device_index);
+    void  (*sync)(int device_index);
     // Optional (backends that can't report leave it null via aggregate
     // value-init): device-wide free/total memory in bytes, e.g.
     // cudaMemGetInfo. Serves brotensor::device_mem_info().
-    bool  (*mem_info)(std::size_t* free_bytes, std::size_t* total_bytes);
+    bool  (*mem_info)(std::size_t* free_bytes, std::size_t* total_bytes, int device_index);
     // Optional: return the allocator's cached-but-unused blocks to the
     // driver, keeping at most `keep_bytes` cached (e.g. cudaMemPoolTrimTo
     // after a device sync). Serves brotensor::device_mem_trim().
-    bool  (*mem_trim)(std::size_t keep_bytes);
+    bool  (*mem_trim)(std::size_t keep_bytes, int device_index);
     // Optional: the device's human-readable name (e.g. cudaDeviceProp.name,
     // "NVIDIA GeForce RTX 4090"), written NUL-terminated into `out` (truncated
     // to `cap`). Serves brotensor::device_name(). Null when the backend can't
     // report (leaves the field null via aggregate value-init).
-    bool  (*device_name)(char* out, std::size_t cap);
+    bool  (*device_name)(char* out, std::size_t cap, int device_index);
 };
 
 // ─── Backend registration ──────────────────────────────────────────────────
@@ -71,6 +72,7 @@ struct AllocVTable {
 // from `brotensor::init()` after a successful driver probe. Registering the
 // same Device twice replaces the previous tables — callers should not rely
 // on that (it exists for testability).
+void register_backend(DeviceType dt, const OpsVTable& ops, const AllocVTable& alloc);
 void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc);
 
 // Dispatcher lookups. Throw std::runtime_error if `d` is not currently
@@ -132,6 +134,9 @@ const OpsVTable& dispatch_with_opts(const Tensor& a, const Tensor& b,
 // this for every non-const Tensor& output, after dispatch and before invoking
 // the backend impl, so the impl resizes/allocates on the right backend.
 void adopt_output(Tensor& t, Device d);
+
+// Set registered CUDA device count.
+void set_cuda_device_count(int count);
 
 // Throw a "<op>: not implemented on <device>" std::runtime_error. Called
 // by the public wrapper when the chosen vtable slot is null.

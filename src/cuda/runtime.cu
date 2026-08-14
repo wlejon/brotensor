@@ -39,15 +39,38 @@ void cuda_check_throw(int err, const char* expr_text, const char* file, int line
 // ─── Current stream (CUDA-internal) ────────────────────────────────────────
 
 namespace {
-thread_local cudaStream_t g_current_stream = nullptr;
+constexpr int kMaxCudaStreams = 16;
+thread_local cudaStream_t g_current_streams[kMaxCudaStreams] = {nullptr};
+
+int resolve_device_index(int dev) {
+    if (dev < 0) {
+        int d = 0;
+        if (cudaGetDevice(&d) == cudaSuccess && d >= 0 && d < kMaxCudaStreams) {
+            return d;
+        }
+        return 0;
+    }
+    if (dev >= kMaxCudaStreams) return 0;
+    return dev;
+}
 } // namespace
 
+void* cuda_current_stream(int dev) {
+    const int idx = resolve_device_index(dev);
+    return reinterpret_cast<void*>(g_current_streams[idx]);
+}
+
 void* cuda_current_stream() {
-    return reinterpret_cast<void*>(g_current_stream);
+    return cuda_current_stream(-1);
+}
+
+void cuda_set_stream(void* stream, int dev) {
+    const int idx = resolve_device_index(dev);
+    g_current_streams[idx] = reinterpret_cast<cudaStream_t>(stream);
 }
 
 void cuda_set_stream(void* stream) {
-    g_current_stream = reinterpret_cast<cudaStream_t>(stream);
+    cuda_set_stream(stream, -1);
 }
 
 } // namespace brotensor::detail::cuda
@@ -56,5 +79,6 @@ void cuda_set_stream(void* stream) {
 // namespace brotensor and call it from there. Keep that name resolvable so
 // each individual file doesn't have to re-qualify its forward decl.
 namespace brotensor {
-void* cuda_current_stream() { return ::brotensor::detail::cuda::cuda_current_stream(); }
+void* cuda_current_stream(int dev) { return ::brotensor::detail::cuda::cuda_current_stream(dev); }
+void* cuda_current_stream() { return ::brotensor::detail::cuda::cuda_current_stream(-1); }
 }

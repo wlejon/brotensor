@@ -68,20 +68,21 @@ Device pick_default_from_available() {
 std::optional<Device> parse_env_device() {
     const char* env = std::getenv("BROTENSOR_DEFAULT_DEVICE");
     if (!env) return std::nullopt;
-    // case-insensitive compare against a few names
-    auto eq = [](const char* a, const char* b) {
-        while (*a && *b) {
-            char ca = *a, cb = *b;
-            if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca + 32);
-            if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb + 32);
-            if (ca != cb) return false;
-            ++a; ++b;
-        }
-        return *a == 0 && *b == 0;
-    };
-    if (eq(env, "cpu"))   return Device::CPU;
-    if (eq(env, "cuda"))  return Device::CUDA;
-    if (eq(env, "metal")) return Device::Metal;
+    std::string s(env);
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    }
+    if (s == "cpu") return Device::cpu();
+    if (s == "cuda" || s == "cuda:0") return Device::cuda(0);
+    if (s.rfind("cuda:", 0) == 0) {
+        int idx = std::atoi(s.c_str() + 5);
+        return Device::cuda(idx);
+    }
+    if (s == "metal" || s == "metal:0") return Device::metal(0);
+    if (s.rfind("metal:", 0) == 0) {
+        int idx = std::atoi(s.c_str() + 6);
+        return Device::metal(idx);
+    }
     return std::nullopt;
 }
 
@@ -132,7 +133,11 @@ Device default_device() {
 }
 
 Dtype compute_dtype() {
-    return default_device() == Device::CPU ? Dtype::FP32 : Dtype::FP16;
+    return compute_dtype(default_device());
+}
+
+Dtype compute_dtype(Device d) {
+    return d.is_cpu() ? Dtype::FP32 : Dtype::FP16;
 }
 
 void set_default_device(Device d) {
@@ -148,9 +153,19 @@ void set_default_device(Device d) {
 
 std::vector<Device> available_devices() {
     std::vector<Device> out;
-    if (detail::is_registered(Device::CPU))   out.push_back(Device::CPU);
-    if (detail::is_registered(Device::CUDA))  out.push_back(Device::CUDA);
-    if (detail::is_registered(Device::Metal)) out.push_back(Device::Metal);
+    if (detail::is_registered(Device::CPU)) {
+        out.push_back(Device::CPU);
+    }
+    if (detail::is_registered(Device::CUDA)) {
+        int count = cuda_device_count();
+        if (count <= 0) count = 1;
+        for (int i = 0; i < count; ++i) {
+            out.push_back(Device::cuda(i));
+        }
+    }
+    if (detail::is_registered(Device::Metal)) {
+        out.push_back(Device::Metal);
+    }
     return out;
 }
 
@@ -200,12 +215,12 @@ void sync(Device d) {
         m += " is not available";
         throw std::runtime_error(m);
     }
-    detail::alloc_for(d).sync();
+    detail::alloc_for(d).sync(d.index);
 }
 
 void sync_all() {
     for (Device d : available_devices()) {
-        detail::alloc_for(d).sync();
+        detail::alloc_for(d).sync(d.index);
     }
 }
 
@@ -216,14 +231,14 @@ bool device_mem_info(Device d, std::size_t& free_bytes,
     if (!detail::is_registered(d)) return false;
     const auto fn = detail::alloc_for(d).mem_info;
     if (fn == nullptr) return false;
-    return fn(&free_bytes, &total_bytes);
+    return fn(&free_bytes, &total_bytes, d.index);
 }
 
 bool device_mem_trim(Device d, std::size_t keep_bytes) {
     if (!detail::is_registered(d)) return false;
     const auto fn = detail::alloc_for(d).mem_trim;
     if (fn == nullptr) return false;
-    return fn(keep_bytes);
+    return fn(keep_bytes, d.index);
 }
 
 std::string device_product_name(Device d) {
@@ -231,7 +246,7 @@ std::string device_product_name(Device d) {
     const auto fn = detail::alloc_for(d).device_name;
     if (fn == nullptr) return {};
     char buf[256] = {0};
-    if (!fn(buf, sizeof(buf))) return {};
+    if (!fn(buf, sizeof(buf), d.index)) return {};
     return std::string(buf);
 }
 

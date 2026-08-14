@@ -132,13 +132,29 @@ std::size_t dtype_storage_bytes(Dtype d, std::int64_t numel) {
            static_cast<std::size_t>(bb);
 }
 
+const Device Device::CPU{DeviceType::CPU, 0};
+const Device Device::CUDA{DeviceType::CUDA, 0};
+const Device Device::Metal{DeviceType::Metal, 0};
+
 const char* device_name(Device d) {
-    switch (d) {
-        case Device::CPU:   return "CPU";
-        case Device::CUDA:  return "CUDA";
-        case Device::Metal: return "Metal";
+    if (d.is_cpu()) return "CPU";
+    if (d.is_cuda()) {
+        if (d.index == 0) return "CUDA";
+        static thread_local char buf[32];
+        std::snprintf(buf, sizeof(buf), "CUDA:%d", d.index);
+        return buf;
+    }
+    if (d.is_metal()) {
+        if (d.index == 0) return "Metal";
+        static thread_local char buf[32];
+        std::snprintf(buf, sizeof(buf), "Metal:%d", d.index);
+        return buf;
     }
     return "?";
+}
+
+std::string to_string(Device d) {
+    return device_name(d);
 }
 
 // ─── FP16 ↔ FP32 conversion (host-side IEEE 754 binary16) ──────────────────
@@ -269,17 +285,17 @@ void check_dtype(const Tensor& t, Dtype expected, const char* who) {
 
 void* backend_alloc(Device d, std::size_t bytes) {
     if (bytes == 0) return nullptr;
-    return detail::alloc_for(d).alloc(bytes);
+    return detail::alloc_for(d).alloc(bytes, d.index);
 }
 
 void backend_free(Device d, void* p) {
     if (!p) return;
-    detail::alloc_for(d).free(p);
+    detail::alloc_for(d).free(p, d.index);
 }
 
 void backend_zero(Device d, void* p, std::size_t bytes) {
     if (bytes == 0 || !p) return;
-    detail::alloc_for(d).memset_zero(p, bytes);
+    detail::alloc_for(d).memset_zero(p, bytes, d.index);
 }
 
 } // namespace
@@ -393,7 +409,7 @@ Tensor from_host_typed(Device d, const void* src, int r, int c, Dtype dt) {
     if (d == Device::CPU) {
         std::memcpy(t.data, src, n);
     } else {
-        detail::alloc_for(d).memcpy_h2d(t.data, src, n);
+        detail::alloc_for(d).memcpy_h2d(t.data, src, n, d.index);
     }
     if (prof) {
         auto t2 = clock::now();
@@ -425,7 +441,7 @@ Tensor Tensor::from_host_int8_on(Device d, const int8_t* src, int r, int c) {
     if (d == Device::CPU) {
         std::memcpy(t.data, src, n);
     } else {
-        detail::alloc_for(d).memcpy_h2d(t.data, src, n);
+        detail::alloc_for(d).memcpy_h2d(t.data, src, n, d.index);
     }
     return t;
 }
@@ -441,7 +457,7 @@ Tensor Tensor::from_raw_bytes_on(Device target, const void* src, int r, int c,
     if (target == Device::CPU) {
         std::memcpy(t.data, src, nbytes);
     } else {
-        detail::alloc_for(target).memcpy_h2d(t.data, src, nbytes);
+        detail::alloc_for(target).memcpy_h2d(t.data, src, nbytes, target.index);
     }
     return t;
 }
@@ -482,7 +498,7 @@ Tensor Tensor::clone() const {
     if (device == Device::CPU) {
         std::memcpy(t.data, data, n);
     } else {
-        detail::alloc_for(device).memcpy_d2d(t.data, data, n);
+        detail::alloc_for(device).memcpy_d2d(t.data, data, n, device.index);
     }
     return t;
 }
@@ -493,20 +509,27 @@ Tensor Tensor::to(Device target) const {
     const std::size_t n = bytes();
     if (n == 0 || !data) return t;
 
-    if (device == Device::CPU) {
+    if (device.is_cpu()) {
         // CPU → GPU.
-        detail::alloc_for(target).memcpy_h2d(t.data, data, n);
-    } else if (target == Device::CPU) {
+        detail::alloc_for(target).memcpy_h2d(t.data, data, n, target.index);
+    } else if (target.is_cpu()) {
         // GPU → CPU.
-        detail::alloc_for(device).memcpy_d2h(t.data, data, n);
+        detail::alloc_for(device).memcpy_d2h(t.data, data, n, device.index);
+    } else if (device.is_cuda() && target.is_cuda()) {
+        // Direct peer copy between CUDA GPUs.
+        auto peer_fn = detail::alloc_for(target).memcpy_peer;
+        if (peer_fn) {
+            peer_fn(t.data, target.index, data, device.index, n);
+        } else {
+            std::unique_ptr<unsigned char[]> staging(new unsigned char[n]);
+            detail::alloc_for(device).memcpy_d2h(staging.get(), data, n, device.index);
+            detail::alloc_for(target).memcpy_h2d(t.data, staging.get(), n, target.index);
+        }
     } else {
-        // GPU → different GPU backend. Bounce through host. The staging
-        // buffer is fully overwritten by the D2H copy below, so allocate it
-        // uninitialized rather than paying for a zero-fill of a multi-GB
-        // tensor just to immediately clobber it.
+        // GPU → different GPU backend. Bounce through host.
         std::unique_ptr<unsigned char[]> staging(new unsigned char[n]);
-        detail::alloc_for(device).memcpy_d2h(staging.get(), data, n);
-        detail::alloc_for(target).memcpy_h2d(t.data, staging.get(), n);
+        detail::alloc_for(device).memcpy_d2h(staging.get(), data, n, device.index);
+        detail::alloc_for(target).memcpy_h2d(t.data, staging.get(), n, target.index);
     }
     return t;
 }
@@ -618,10 +641,10 @@ std::vector<float> Tensor::to_host_vector() const {
     std::vector<float> out(static_cast<std::size_t>(rows) * cols);
     const std::size_t n = bytes();
     if (n == 0) return out;
-    if (device == Device::CPU) {
+    if (device.is_cpu()) {
         std::memcpy(out.data(), data, n);
     } else {
-        detail::alloc_for(device).memcpy_d2h(out.data(), data, n);
+        detail::alloc_for(device).memcpy_d2h(out.data(), data, n, device.index);
     }
     return out;
 }
@@ -633,10 +656,10 @@ std::vector<uint16_t> Tensor::to_host_vector_fp16() const {
     std::vector<uint16_t> out(static_cast<std::size_t>(rows) * cols);
     const std::size_t n = bytes();
     if (n == 0) return out;
-    if (device == Device::CPU) {
+    if (device.is_cpu()) {
         std::memcpy(out.data(), data, n);
     } else {
-        detail::alloc_for(device).memcpy_d2h(out.data(), data, n);
+        detail::alloc_for(device).memcpy_d2h(out.data(), data, n, device.index);
     }
     return out;
 }
@@ -648,10 +671,10 @@ std::vector<uint16_t> Tensor::to_host_vector_bf16() const {
     std::vector<uint16_t> out(static_cast<std::size_t>(rows) * cols);
     const std::size_t n = bytes();
     if (n == 0) return out;
-    if (device == Device::CPU) {
+    if (device.is_cpu()) {
         std::memcpy(out.data(), data, n);
     } else {
-        detail::alloc_for(device).memcpy_d2h(out.data(), data, n);
+        detail::alloc_for(device).memcpy_d2h(out.data(), data, n, device.index);
     }
     return out;
 }
@@ -662,10 +685,10 @@ void Tensor::copy_to_host(float* dst) const {
     }
     const std::size_t n = bytes();
     if (n == 0) return;
-    if (device == Device::CPU) {
+    if (device.is_cpu()) {
         std::memcpy(dst, data, n);
     } else {
-        detail::alloc_for(device).memcpy_d2h(dst, data, n);
+        detail::alloc_for(device).memcpy_d2h(dst, data, n, device.index);
     }
 }
 
@@ -675,10 +698,10 @@ void Tensor::copy_to_host_fp16(uint16_t* dst) const {
     }
     const std::size_t n = bytes();
     if (n == 0) return;
-    if (device == Device::CPU) {
+    if (device.is_cpu()) {
         std::memcpy(dst, data, n);
     } else {
-        detail::alloc_for(device).memcpy_d2h(dst, data, n);
+        detail::alloc_for(device).memcpy_d2h(dst, data, n, device.index);
     }
 }
 
@@ -688,10 +711,10 @@ void Tensor::copy_to_host_bf16(uint16_t* dst) const {
     }
     const std::size_t n = bytes();
     if (n == 0) return;
-    if (device == Device::CPU) {
+    if (device.is_cpu()) {
         std::memcpy(dst, data, n);
     } else {
-        detail::alloc_for(device).memcpy_d2h(dst, data, n);
+        detail::alloc_for(device).memcpy_d2h(dst, data, n, device.index);
     }
 }
 

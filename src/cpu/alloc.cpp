@@ -13,34 +13,38 @@
 
 namespace brotensor::detail::cpu {
 
-void* cpu_alloc(std::size_t bytes) {
+void* cpu_alloc(std::size_t bytes, int) {
     if (bytes == 0) return nullptr;
     void* p = std::malloc(bytes);
     if (!p) throw std::bad_alloc();
     return p;
 }
 
-void cpu_free(void* ptr) {
+void cpu_free(void* ptr, int) {
     if (ptr) std::free(ptr);
 }
 
-void cpu_memcpy_h2d(void* dst, const void* src, std::size_t n) {
+void cpu_memcpy_h2d(void* dst, const void* src, std::size_t n, int) {
     if (n) std::memcpy(dst, src, n);
 }
 
-void cpu_memcpy_d2h(void* dst, const void* src, std::size_t n) {
+void cpu_memcpy_d2h(void* dst, const void* src, std::size_t n, int) {
     if (n) std::memcpy(dst, src, n);
 }
 
-void cpu_memcpy_d2d(void* dst, const void* src, std::size_t n) {
+void cpu_memcpy_d2d(void* dst, const void* src, std::size_t n, int) {
     if (n) std::memcpy(dst, src, n);
 }
 
-void cpu_memset_zero(void* dst, std::size_t n) {
+void cpu_memcpy_peer(void* dst, int, const void* src, int, std::size_t n) {
+    if (n) std::memcpy(dst, src, n);
+}
+
+void cpu_memset_zero(void* dst, std::size_t n, int) {
     if (n) std::memset(dst, 0, n);
 }
 
-void cpu_sync() {
+void cpu_sync(int) {
     // no-op — CPU ops are synchronous
 }
 
@@ -51,6 +55,7 @@ const AllocVTable& cpu_alloc_table() {
         &cpu_memcpy_h2d,
         &cpu_memcpy_d2h,
         &cpu_memcpy_d2d,
+        &cpu_memcpy_peer,
         &cpu_memset_zero,
         &cpu_sync,
     };

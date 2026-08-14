@@ -70,6 +70,7 @@ void fill_cuda_vtable_filtered_lrelu (::brotensor::detail::OpsVTable&);
 
 // ── alloc table (defined in tensor.cu) ──
 const ::brotensor::detail::AllocVTable& cuda_alloc_table();
+void init_async_pool_for_device(int dev);
 
 } // namespace brotensor::detail::cuda
 
@@ -84,12 +85,27 @@ extern "C" void brotensor_probe_and_register_cuda() {
         return;
     }
 
-    // Pick device 0; let lazy context creation happen the first time a kernel
-    // launches. (Old behaviour from `cuda_init()`; kept implicit.)
-    err = cudaSetDevice(0);
-    if (err != cudaSuccess) return;
+    ::brotensor::detail::set_cuda_device_count(device_count);
 
-    using ::brotensor::Device;
+    // Enable peer access between all GPU pairs and initialize async pools
+    for (int i = 0; i < device_count; ++i) {
+        if (cudaSetDevice(i) != cudaSuccess) continue;
+        brotensor::detail::cuda::init_async_pool_for_device(i);
+        for (int j = 0; j < device_count; ++j) {
+            if (i != j) {
+                int can = 0;
+                if (cudaDeviceCanAccessPeer(&can, i, j) == cudaSuccess && can) {
+                    cudaDeviceEnablePeerAccess(j, 0);
+                    cudaGetLastError(); // Clear any benign sticky error
+                }
+            }
+        }
+    }
+
+    // Set default active device to 0
+    cudaSetDevice(0);
+
+    using ::brotensor::DeviceType;
     using ::brotensor::detail::OpsVTable;
     namespace dc = ::brotensor::detail::cuda;
 
@@ -137,5 +153,5 @@ extern "C" void brotensor_probe_and_register_cuda() {
     dc::fill_cuda_vtable_modulated_conv2d(ops);
     dc::fill_cuda_vtable_filtered_lrelu(ops);
 
-    ::brotensor::detail::register_backend(Device::CUDA, ops, dc::cuda_alloc_table());
+    ::brotensor::detail::register_backend(DeviceType::CUDA, ops, dc::cuda_alloc_table());
 }
