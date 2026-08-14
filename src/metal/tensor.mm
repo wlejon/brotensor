@@ -117,7 +117,7 @@ void pool_release(void* data_ptr) {
 
 namespace detail::metal {
 
-void* metal_alloc(std::size_t bytes) {
+void* metal_alloc(std::size_t bytes, int) {
     if (bytes == 0) return nullptr;
     ::brotensor::cuda_init();
     @autoreleasepool {
@@ -133,7 +133,7 @@ void* metal_alloc(std::size_t bytes) {
     }
 }
 
-void metal_free(void* ptr) {
+void metal_free(void* ptr, int) {
     if (ptr) metal_impl::pool_release(ptr);
 }
 
@@ -142,23 +142,28 @@ void metal_free(void* ptr) {
 // command buffers asynchronously (see metal_impl::submit), so each transfer
 // flushes first: a device->host read must observe completed GPU writes, and a
 // host write must not race a kernel still reading or writing the same buffer.
-void metal_memcpy_h2d(void* dst, const void* src, std::size_t n) {
+void metal_memcpy_h2d(void* dst, const void* src, std::size_t n, int) {
     if (!n) return;
     metal_impl::flush();
     std::memcpy(dst, src, n);
 }
-void metal_memcpy_d2h(void* dst, const void* src, std::size_t n) {
+void metal_memcpy_d2h(void* dst, const void* src, std::size_t n, int) {
     if (!n) return;
     metal_impl::flush();
     std::memcpy(dst, src, n);
 }
-void metal_memcpy_d2d(void* dst, const void* src, std::size_t n) {
+void metal_memcpy_d2d(void* dst, const void* src, std::size_t n, int) {
+    if (!n) return;
+    metal_impl::flush();
+    std::memcpy(dst, src, n);
+}
+void metal_memcpy_peer(void* dst, int, const void* src, int, std::size_t n) {
     if (!n) return;
     metal_impl::flush();
     std::memcpy(dst, src, n);
 }
 
-void metal_memset_zero(void* dst, std::size_t n) {
+void metal_memset_zero(void* dst, std::size_t n, int) {
     if (!n) return;
     metal_impl::flush();
     std::memset(dst, 0, n);
@@ -166,7 +171,31 @@ void metal_memset_zero(void* dst, std::size_t n) {
 
 // Drain the asynchronous submission queue — wait on the most recent pending
 // command buffer, which (serial queue) implies all earlier ones are done.
-void metal_sync() { metal_impl::flush(); }
+void metal_sync(int) { metal_impl::flush(); }
+
+bool metal_mem_info(std::size_t* free_bytes, std::size_t* total_bytes, int) {
+    @autoreleasepool {
+        id<MTLDevice> dev = metal_impl::device();
+        if (!dev) return false;
+        uint64_t allocated = [dev currentAllocatedSize];
+        uint64_t total = [dev recommendedMaxWorkingSetSize];
+        if (free_bytes)  *free_bytes  = (total > allocated) ? (total - allocated) : 0;
+        if (total_bytes) *total_bytes = total;
+        return true;
+    }
+}
+
+bool metal_device_name(char* out, std::size_t cap, int) {
+    if (!out || cap == 0) return false;
+    @autoreleasepool {
+        id<MTLDevice> dev = metal_impl::device();
+        if (!dev) return false;
+        const char* name = [[dev name] UTF8String];
+        if (!name) return false;
+        std::snprintf(out, cap, "%s", name);
+        return true;
+    }
+}
 
 const ::brotensor::detail::AllocVTable& metal_alloc_table() {
     static const ::brotensor::detail::AllocVTable t = {
@@ -175,8 +204,12 @@ const ::brotensor::detail::AllocVTable& metal_alloc_table() {
         &metal_memcpy_h2d,
         &metal_memcpy_d2h,
         &metal_memcpy_d2d,
+        &metal_memcpy_peer,
         &metal_memset_zero,
         &metal_sync,
+        &metal_mem_info,
+        nullptr, // mem_trim
+        &metal_device_name,
     };
     return t;
 }
