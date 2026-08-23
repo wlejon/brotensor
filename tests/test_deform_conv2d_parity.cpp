@@ -4,7 +4,7 @@
 // Two checks:
 //   * Parity: random inputs, CPU vs GPU backend, tight FP32 tolerance.
 //   * Golden: torchvision.ops.deform_conv2d reference, loaded from an
-//     out-of-repo .bin (D:/projects/_splat_assets/deform_conv_golden.bin,
+//     out-of-repo .bin (tests/golden/deform_conv_golden.bin or DEFORM_CONV_GOLDEN env var,
 //     gen_deform_conv_golden.py). Skips cleanly when the file is absent — the
 //     parity check above always runs.
 
@@ -121,7 +121,8 @@ Tensor mat_from(const std::vector<float>& src, int rows, int cols) {
 }
 
 BT_PARITY_TEST(deform_conv2d_torchvision_golden) {
-    const char* path = "D:/projects/_splat_assets/deform_conv_golden.bin";
+    const char* env_path = std::getenv("DEFORM_CONV_GOLDEN");
+    const char* path = (env_path && *env_path) ? env_path : "tests/golden/deform_conv_golden.bin";
     FILE* f = std::fopen(path, "rb");
     if (!f) {
         std::printf("    [skip] golden file absent (%s)\n", path);
