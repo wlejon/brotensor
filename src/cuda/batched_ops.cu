@@ -231,6 +231,112 @@ __global__ void linear_forward_batched_w16_kernel(const WT* __restrict__ W,
     }
 }
 
+// ─── Wide-batch tiled GEMM ─────────────────────────────────────────────────
+//
+// Y(B, out_dim) = X(B, in_dim) · W(out_dim, in_dim)^T + bias, for the regime
+// the two kernels above are wrong for: many batch rows at once.
+//
+// **They read the whole weight matrix once per batch row.** One thread owns one
+// output row and walks W serially; the batch is `blockIdx.y`, so nothing is
+// shared between batch rows and the DRAM traffic is B·out_dim·in_dim·4 bytes.
+// For a 226-frame FastConformer FFN (in 1024, out 4096) that is 3.8 GB *per
+// linear* — 149 ms of a 643 ms encoder for one of the two macaron FFNs, and the
+// same again for the other, all of it bandwidth for weights already on the card.
+//
+// Here a CTA owns a 64x64 tile of Y and streams K in slabs of 16, so each slab
+// of W is loaded once and used by 64 batch rows. Traffic falls to
+// ceil(B/64)·out_dim·in_dim + ceil(out_dim/64)·B·in_dim — 126 MB for that same
+// linear, 30x less, which takes it from bandwidth-bound to arithmetic-bound.
+// 16x16 threads, 4x4 outputs each: 16 accumulators in registers, 8 KB of shared.
+//
+// The X tile is staged transposed (Xs[k][m]) so the inner product reads both
+// operands contiguously across the 16 lanes of a row. Ragged edges are zero
+// filled on load and guarded on store, so no shape is refused — the dispatch
+// below picks this kernel on size alone.
+//
+// Templated on the weight type: FP16/BF16 weights widen to FP32 as they are
+// staged, which is what the 16-bit path has always done. Accumulation is FP32
+// in every case, so the answer differs from the serial kernels only in the
+// order the products are summed.
+constexpr int TG_BM = 64;   // batch rows per CTA
+constexpr int TG_BN = 64;   // output cols per CTA
+constexpr int TG_BK = 16;   // K slab
+constexpr int TG_TM = 4;    // outputs per thread, batch direction
+constexpr int TG_TN = 4;    // outputs per thread, output direction
+constexpr int TG_THREADS = (TG_BM / TG_TM) * (TG_BN / TG_TN);   // 256
+
+template <typename WT>
+__global__ void linear_tiled_kernel(const WT* __restrict__ W,
+                                    const float* __restrict__ bias,
+                                    const float* __restrict__ X,
+                                    float* __restrict__ Y,
+                                    int B, int out_dim, int in_dim) {
+    __shared__ float Xs[TG_BK][TG_BM];
+    __shared__ float Ws[TG_BK][TG_BN];
+
+    const int m0  = blockIdx.y * TG_BM;
+    const int n0  = blockIdx.x * TG_BN;
+    const int tid = threadIdx.y * (TG_BN / TG_TN) + threadIdx.x;
+
+    float acc[TG_TM][TG_TN];
+    #pragma unroll
+    for (int i = 0; i < TG_TM; ++i)
+        #pragma unroll
+        for (int j = 0; j < TG_TN; ++j) acc[i][j] = 0.0f;
+
+    for (int k0 = 0; k0 < in_dim; k0 += TG_BK) {
+        // 64x16 elements per tile, 256 threads: four each, indexed (row, k) so
+        // the sixteen threads sharing a row read sixteen consecutive floats.
+        #pragma unroll
+        for (int s = 0; s < (TG_BM * TG_BK) / TG_THREADS; ++s) {
+            const int idx = tid + s * TG_THREADS;
+            const int r   = idx / TG_BK;
+            const int k   = idx % TG_BK;
+            const int gm  = m0 + r, gk = k0 + k;
+            Xs[k][r] = (gm < B && gk < in_dim)
+                           ? X[static_cast<size_t>(gm) * in_dim + gk]
+                           : 0.0f;
+        }
+        #pragma unroll
+        for (int s = 0; s < (TG_BN * TG_BK) / TG_THREADS; ++s) {
+            const int idx = tid + s * TG_THREADS;
+            const int r   = idx / TG_BK;
+            const int k   = idx % TG_BK;
+            const int gn  = n0 + r, gk = k0 + k;
+            Ws[k][r] = (gn < out_dim && gk < in_dim)
+                           ? lbb_load<WT>(&W[static_cast<size_t>(gn) * in_dim + gk])
+                           : 0.0f;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < TG_BK; ++k) {
+            float a[TG_TM], b[TG_TN];
+            #pragma unroll
+            for (int i = 0; i < TG_TM; ++i) a[i] = Xs[k][threadIdx.y * TG_TM + i];
+            #pragma unroll
+            for (int j = 0; j < TG_TN; ++j) b[j] = Ws[k][threadIdx.x * TG_TN + j];
+            #pragma unroll
+            for (int i = 0; i < TG_TM; ++i)
+                #pragma unroll
+                for (int j = 0; j < TG_TN; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TG_TM; ++i) {
+        const int gm = m0 + threadIdx.y * TG_TM + i;
+        if (gm >= B) continue;
+        #pragma unroll
+        for (int j = 0; j < TG_TN; ++j) {
+            const int gn = n0 + threadIdx.x * TG_TN + j;
+            if (gn >= out_dim) continue;
+            Y[static_cast<size_t>(gm) * out_dim + gn] = bias[gn] + acc[i][j];
+        }
+    }
+}
+
 template <typename T>
 __global__ void relu_forward_batched_kernel(const T* __restrict__ x,
                                             T* __restrict__ y, int n) {
@@ -380,6 +486,32 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
     const float* bias_p = static_cast<const float*>(bias.data);
     const float* X_p    = static_cast<const float*>(X_BD.data);
     float*       Y_p    = static_cast<float*>(Y_BD.data);
+
+    // Wide batch: the tiled GEMM, which is the only path here that reuses a
+    // weight across batch rows. See linear_tiled_kernel for the traffic
+    // arithmetic that decides the threshold — the serial kernels' cost is
+    // linear in B with no reuse at all, so a tile is ahead as soon as there are
+    // enough rows to fill one. Below TG_BM the tile is mostly padding and the
+    // GEMV/serial kernels are the right shape.
+    if (B >= TG_BM && out_dim >= TG_BN && in_dim > 0) {
+        const dim3 block(TG_BN / TG_TN, TG_BM / TG_TM);
+        const dim3 grid((out_dim + TG_BN - 1) / TG_BN, (B + TG_BM - 1) / TG_BM);
+        if (W.dtype == Dtype::FP16) {
+            linear_tiled_kernel<__half><<<grid, block, 0, cur_stream()>>>(
+                static_cast<const __half*>(W.data), bias_p, X_p, Y_p,
+                B, out_dim, in_dim);
+        } else if (W.dtype == Dtype::BF16) {
+            linear_tiled_kernel<__nv_bfloat16><<<grid, block, 0, cur_stream()>>>(
+                static_cast<const __nv_bfloat16*>(W.data), bias_p, X_p, Y_p,
+                B, out_dim, in_dim);
+        } else {
+            linear_tiled_kernel<float><<<grid, block, 0, cur_stream()>>>(
+                static_cast<const float*>(W.data), bias_p, X_p, Y_p,
+                B, out_dim, in_dim);
+        }
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     if (w16) {
         // 16-bit weights, FP32 activations/accumulation. Same skinny/wide

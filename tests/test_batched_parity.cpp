@@ -55,6 +55,13 @@ BT_PARITY_TEST(linear_batched_B1)   { run_linear_batched(1,  16, 32, 0xC1ull); }
 BT_PARITY_TEST(linear_batched_B4)   { run_linear_batched(4,  64, 32, 0xC2ull); }
 BT_PARITY_TEST(linear_batched_B64)  { run_linear_batched(64, 128, 96, 0xC3ull); }
 BT_PARITY_TEST(linear_batched_skinny) { run_linear_batched(8, 1, 7, 0xC4ull); }
+// A wide batch takes the 64x64x16 tiled kernel rather than the thread-per-row
+// one; none of the three sizes here is a multiple of a tile, so every edge
+// guard — a partial batch tile, a partial output tile and a partial K slab —
+// is loaded and stored at once. Ragged K is the one that would be silent: an
+// unguarded slab reads whatever follows the row and still produces numbers.
+BT_PARITY_TEST(linear_batched_tiled_ragged) { run_linear_batched(70, 37, 100, 0xC5ull); }
+BT_PARITY_TEST(linear_batched_tiled_wide)   { run_linear_batched(226, 256, 320, 0xC6ull); }
 
 // ─── linear_forward_batched, 16-bit weights ────────────────────────────────
 //
@@ -105,6 +112,9 @@ BT_PARITY_TEST(linear_batched_bf16w_odd)  { run_linear_batched_w16(2, 33, 17, Dt
 BT_PARITY_TEST(linear_batched_bf16w_B64)  { run_linear_batched_w16(64, 128, 96, Dtype::BF16, 0xB164ull); }
 BT_PARITY_TEST(linear_batched_fp16w_B1)   { run_linear_batched_w16(1, 512, 96, Dtype::FP16, 0xB165ull); }
 BT_PARITY_TEST(linear_batched_fp16w_B64)  { run_linear_batched_w16(64, 128, 96, Dtype::FP16, 0xB166ull); }
+// Ragged on all three axes, through the tiled kernel's 16-bit staging path.
+BT_PARITY_TEST(linear_batched_bf16w_tiled) { run_linear_batched_w16(70, 37, 100, Dtype::BF16, 0xB167ull); }
+BT_PARITY_TEST(linear_batched_fp16w_tiled) { run_linear_batched_w16(70, 37, 100, Dtype::FP16, 0xB168ull); }
 
 // ─── relu_forward_batched ──────────────────────────────────────────────────
 
