@@ -36,6 +36,7 @@
 // multi-resolution STFT loss.
 
 #include <brotensor/detail/cpu/fft_core.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 #include <brotensor/tensor.h>
 
 #include <algorithm>
@@ -158,34 +159,41 @@ void stft(const ::brotensor::Tensor& signal, const ::brotensor::Tensor& window,
                             ? 1.0 / std::sqrt(static_cast<double>(n_fft))
                             : 1.0;
 
-    std::vector<Cd> buf(static_cast<std::size_t>(n_fft)), out;
-    for (int b = 0; b < N; ++b) {
+    // One frame per work item. Frames are independent — each reads its own slice
+    // of the signal and writes its own row of `spec` — so this is the pool's
+    // ordinary case, and it is worth taking: a mel front end is thousands of
+    // frames of a double-precision DFT and it was the *host* half of an ASR
+    // encoder's cost. Measured on a FastConformer over 18 s of 16 kHz audio
+    // (1 801 frames, n_fft 512): 212 ms on one core.
+    //
+    // The scratch buffers are per item rather than hoisted, because two workers
+    // sharing them is a data race. fft_core's twiddle table is thread_local and
+    // keyed on (N, sign), so each worker builds it once and every frame after
+    // the first reuses it — which is why the buffers being fresh costs nothing.
+    parallel_for(static_cast<std::size_t>(N) * static_cast<std::size_t>(g.frames),
+                 [&](std::size_t item) {
+        const int b = static_cast<int>(item / static_cast<std::size_t>(g.frames));
+        const int f = static_cast<int>(item % static_cast<std::size_t>(g.frames));
         const float* srow = sig + static_cast<std::size_t>(b) * signal_len;
-        for (int f = 0; f < g.frames; ++f) {
-            // Build the windowed n_fft frame buffer (real, im = 0).
-            for (int i = 0; i < n_fft; ++i) buf[static_cast<std::size_t>(i)] = Cd{};
-            const int base = f * hop_length;  // padded-position start
-            for (int j = 0; j < win_length; ++j) {
-                const int i = g.pad_lo + j;
-                const int p = base + i;
-                const int s = padded_index(p, signal_len, n_fft, center);
-                buf[static_cast<std::size_t>(i)] =
-                    {static_cast<double>(srow[s]) *
-                         static_cast<double>(win[j]),
-                     0.0};
-            }
-            dft_1d(buf, out, -1);  // unscaled forward DFT
-            float* dst = sp + static_cast<std::size_t>(
-                                  static_cast<std::size_t>(b) * g.frames + f) *
-                                  out_cols;
-            for (int k = 0; k < g.bins; ++k) {
-                dst[2 * k] = static_cast<float>(
-                    out[static_cast<std::size_t>(k)].re * norm);
-                dst[2 * k + 1] = static_cast<float>(
-                    out[static_cast<std::size_t>(k)].im * norm);
-            }
+
+        std::vector<Cd> buf(static_cast<std::size_t>(n_fft)), out;
+        const int base = f * hop_length;  // padded-position start
+        for (int j = 0; j < win_length; ++j) {
+            const int i = g.pad_lo + j;
+            const int p = base + i;
+            const int s = padded_index(p, signal_len, n_fft, center);
+            buf[static_cast<std::size_t>(i)] =
+                {static_cast<double>(srow[s]) * static_cast<double>(win[j]), 0.0};
         }
-    }
+        dft_1d(buf, out, -1);  // unscaled forward DFT
+        float* dst = sp + item * static_cast<std::size_t>(out_cols);
+        for (int k = 0; k < g.bins; ++k) {
+            dst[2 * k] = static_cast<float>(
+                out[static_cast<std::size_t>(k)].re * norm);
+            dst[2 * k + 1] = static_cast<float>(
+                out[static_cast<std::size_t>(k)].im * norm);
+        }
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
