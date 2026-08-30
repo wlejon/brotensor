@@ -7,7 +7,7 @@ All ops are device-neutral and declared in the per-category headers under `<brot
 | Header | Surface |
 |---|---|
 | `activation.h` | relu / tanh / sigmoid, silu, gelu (tanh-approx / exact / quick), GEGLU / GEGLU-exact / SwiGLU, snake (BigVGAN/DAC), elu (EnCodec), leaky_relu (HiFi-GAN) |
-| `attention.h` | single-head attention, MHA (optional biases), self/cross attention (train + flash), cross-attention with head-avg map + logit bias, attention token moments, self-attention with T5/ALiBi additive bias, SAM/ViTDet decomposed-rel-pos (incl. windowed), W8A16 bias-attention |
+| `attention.h` | single-head attention, MHA (optional biases), self/cross attention (train + flash), cross-attention with head-avg map + logit bias, attention token moments, self-attention with T5/ALiBi additive bias, Transformer-XL rel-pos bias producer (Conformer / FastConformer), SAM/ViTDet decomposed-rel-pos (incl. windowed), W8A16 bias-attention |
 | `flash_attention.h` | tiled flash attention (+ bare-core bwd), GQA prefill (causal or bidirectional), windowed (sliding-window causal), packed var-length (+ bwd), fused QKV+O projections (+ bwd), project-KV / Q-with-cached-KV, KV-cache append, causal flash-decode (GQA, + per-key-masked variant), W8A16 variants |
 | `linear.h` | linear (single / batched / fp16 / fused-act-epilogue), matmul (+ bwd), matmul_abt (batched strided `A @ Bᵀ`, 16-bit, fused bias+act epilogue), W8A16 batched linear |
 | `lora.h` | **header-only** LoRA adapter — low-rank delta on a frozen base linear, optional per-rank gate, forward + backward. Pure composition of public ops; runs on any backend |

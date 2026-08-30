@@ -12,6 +12,9 @@
 // sequences, not long-context decoding. Dispatched on X.dtype (FP32 / FP16 /
 // BF16): the projection inputs/outputs are typed, every intermediate
 // (Q/K/V/scores/softmax) is FP32 scratch, math is FP32. attn_bias is FP32.
+//
+// Also here: `rel_pos_bias_xl_forward`, the Transformer-XL relative-position
+// *producer* of that bias (Conformer / FastConformer / Transformer-XL).
 
 #include <brotensor/runtime.h>
 
@@ -33,11 +36,16 @@ namespace {
 
 constexpr NSUInteger kSabSoftmaxBlock = 256;
 
+// Threadgroup staging area for one query slice in k_rel_pos_bias_xl — must
+// match RPB_XL_MAX_HEAD_DIM in the MSL source below.
+constexpr int kRelPosXlMaxHeadDim = 512;
+
 NSString* const kSrc = @R"msl(
 #include <metal_stdlib>
 using namespace metal;
 
 #define SAB_SM_BLOCK 256u
+#define RPB_XL_MAX_HEAD_DIM 512u
 
 // Per-head projection: Out[(hh*L+i), j] = sum_k In[i,k] * W[hh*dh+j, k].
 // In: (L, Din) typed, W: (D, Din) typed, Out: (H*L, dh) FP32.
@@ -371,6 +379,41 @@ kernel void NAME(device const T* P   [[buffer(0)]],                           \
 WIN_SCATTER_KERNEL(k_sardp_win_scatter_fp32, float)
 WIN_SCATTER_KERNEL(k_sardp_win_scatter_fp16, half)
 WIN_SCATTER_KERNEL(k_sardp_win_scatter_bf16, bfloat)
+
+// ── Transformer-XL relative-position bias ──────────────────────────────────
+//
+// out[(h*T + q), k] = sum_d qv[q, h*head_dim + d] * pk[(T-1-q) + k, h*head_dim + d]
+//
+// The rel_shift is the column offset (T-1-q) on the pk read, so no (T, 2T-1)
+// matrix_bd intermediate is built. One threadgroup per (head, query) row: the
+// row's query slice is staged in threadgroup memory once and reused across all
+// T keys.
+kernel void k_rel_pos_bias_xl(device const float* qv  [[buffer(0)]],
+                              device const float* pk  [[buffer(1)]],
+                              device float*       out [[buffer(2)]],
+                              constant uint& T        [[buffer(3)]],
+                              constant uint& D        [[buffer(4)]],
+                              constant uint& head_dim [[buffer(5)]],
+                              uint row [[threadgroup_position_in_grid]],
+                              uint tid [[thread_position_in_threadgroup]],
+                              uint tg_size [[threads_per_threadgroup]]) {
+    threadgroup float qs[RPB_XL_MAX_HEAD_DIM];
+    uint h  = row / T;
+    uint q  = row - h * T;
+    uint co = h * head_dim;
+
+    device const float* qrow = qv + (ulong)q * D + co;
+    for (uint d = tid; d < head_dim; d += tg_size) qs[d] = qrow[d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint base = T - 1u - q;
+    for (uint k = tid; k < T; k += tg_size) {
+        device const float* prow = pk + (ulong)(base + k) * D + co;
+        float s = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) s += qs[d] * prow[d];
+        out[(ulong)row * T + k] = s;
+    }
+}
 )msl";
 
 #define DEF_PSO(NAME, FN) \
@@ -406,6 +449,7 @@ DEF_PSO(pso_win_gather_bf16,    @"k_sardp_win_gather_bf16")
 DEF_PSO(pso_win_scatter_fp32,   @"k_sardp_win_scatter_fp32")
 DEF_PSO(pso_win_scatter_fp16,   @"k_sardp_win_scatter_fp16")
 DEF_PSO(pso_win_scatter_bf16,   @"k_sardp_win_scatter_bf16")
+DEF_PSO(pso_rel_pos_bias_xl,    @"k_rel_pos_bias_xl")
 #undef DEF_PSO
 
 // Forward declarations — run3d / run_rows are defined just below.
@@ -1076,6 +1120,56 @@ void self_attention_decomposed_rel_pos_windowed_forward(
         [enc setBuffer:bPout offset:oPout atIndex:0];
         [enc setBuffer:buffer_for(O) offset:buffer_offset_for(O) atIndex:1];
         win_args(enc);
+    });
+}
+
+// ── Transformer-XL relative-position bias ──────────────────────────────────
+//
+// Bias[h*T + q, k] = sum_d Qv[q, h*head_dim + d] * Pk[(T-1-q) + k, h*head_dim + d]
+//
+// Ports src/cuda/self_attention_bias.cu's rel_pos_bias_xl_kernel: one
+// threadgroup per (head, query) row, the query slice staged in threadgroup
+// memory (CUDA's shared-memory `qs`), the rel_shift folded into the pk column
+// offset. FP32 only, matching CUDA.
+void rel_pos_bias_xl_forward(const Tensor& Qv, const Tensor& Pk,
+                             int num_heads, int head_dim, Tensor& Bias) {
+    if (Qv.dtype != Dtype::FP32 || Pk.dtype != Dtype::FP32)
+        throw std::runtime_error("rel_pos_bias_xl_forward: Qv and Pk must be FP32");
+    const int T = Qv.rows;
+    const int D = Qv.cols;
+    if (num_heads <= 0 || head_dim <= 0 || num_heads * head_dim != D)
+        throw std::runtime_error("rel_pos_bias_xl_forward: num_heads*head_dim "
+                                 "must equal Qv.cols");
+    if (Pk.cols != D || Pk.rows != 2 * T - 1)
+        throw std::runtime_error("rel_pos_bias_xl_forward: Pk must be "
+                                 "(2*Qv.rows - 1, Qv.cols)");
+    if (head_dim > kRelPosXlMaxHeadDim)
+        throw std::runtime_error("rel_pos_bias_xl_forward: head_dim above 512 "
+                                 "is not implemented on Metal");
+    if (Bias.rows != num_heads * T || Bias.cols != T ||
+        Bias.dtype != Dtype::FP32) {
+        Bias = Tensor::empty_on(Qv.device, num_heads * T, T, Dtype::FP32);
+    }
+    if (T <= 0) return;
+
+    id<MTLBuffer> bQv = buffer_for(Qv); NSUInteger oQv = buffer_offset_for(Qv);
+    id<MTLBuffer> bPk = buffer_for(Pk); NSUInteger oPk = buffer_offset_for(Pk);
+    id<MTLBuffer> bB  = buffer_for(Bias);
+    NSUInteger oB = buffer_offset_for(Bias);
+
+    const uint32_t Tu  = static_cast<uint32_t>(T);
+    const uint32_t Du  = static_cast<uint32_t>(D);
+    const uint32_t hdu = static_cast<uint32_t>(head_dim);
+
+    run_rows(pso_rel_pos_bias_xl(),
+             static_cast<NSUInteger>(num_heads) * static_cast<NSUInteger>(T),
+             ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:bQv offset:oQv atIndex:0];
+        [enc setBuffer:bPk offset:oPk atIndex:1];
+        [enc setBuffer:bB  offset:oB  atIndex:2];
+        [enc setBytes:&Tu  length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&Du  length:sizeof(uint32_t) atIndex:4];
+        [enc setBytes:&hdu length:sizeof(uint32_t) atIndex:5];
     });
 }
 

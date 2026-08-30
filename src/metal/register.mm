@@ -214,6 +214,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.rand_uniform                                = &dm::rand_uniform;
     ops.randn                                       = &dm::randn;
     ops.randn_truncated                             = &dm::randn_truncated;
+    ops.rel_pos_bias_xl_forward                     = &dm::rel_pos_bias_xl_forward;
     ops.relu_backward                               = &dm::relu_backward;
     ops.relu_backward_batched                       = &dm::relu_backward_batched;
     ops.relu_forward                                = &dm::relu_forward;
