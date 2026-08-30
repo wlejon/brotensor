@@ -1205,5 +1205,86 @@ void self_attention_decomposed_rel_pos_windowed_forward(
     }
 }
 
+// ─── Transformer-XL relative-position bias ─────────────────────────────────
+//
+// Bias[h*T + q, k] = sum_d Qv[q, h*dk + d] * Pk[(T-1-q) + k, h*dk + d].
+//
+// One block per (head, query) row and one thread per key, so the whole
+// num_heads*T*T*head_dim reduction is num_heads*T blocks deep — hundreds of
+// blocks of T threads, which is the shape that fills a card. The query's
+// head_dim slice is read once into shared memory because every thread in the
+// block multiplies against it; `Pk` is read straight from global, where the
+// L2 carries it: consecutive `k` are consecutive *rows* of Pk, so the reads are
+// strided, but each row is read by T of the blocks and the whole (2T-1, D)
+// encoding is a couple of megabytes.
+//
+// The rel_shift is the `base + k` index and costs nothing — there is no
+// (T, 2T-1) matrix_bd here to build and then shift.
+namespace {
+
+constexpr int kRelPosMaxHeadDim = 512;   // 4 kB shared; Conformer's is 128
+
+__global__ void rel_pos_bias_xl_kernel(const float* __restrict__ qv,
+                                       const float* __restrict__ pk,
+                                       float* __restrict__ out,
+                                       int T, int D, int head_dim) {
+    extern __shared__ float qs[];        // head_dim floats: this query's slice
+
+    const int row = blockIdx.x;          // h*T + q
+    const int h   = row / T;
+    const int q   = row - h * T;
+    const int co  = h * head_dim;
+
+    const float* qrow = qv + static_cast<long long>(q) * D + co;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) qs[d] = qrow[d];
+    __syncthreads();
+
+    const int base = T - 1 - q;
+    for (int k = threadIdx.x; k < T; k += blockDim.x) {
+        const float* prow = pk + static_cast<long long>(base + k) * D + co;
+        float s = 0.0f;
+        for (int d = 0; d < head_dim; ++d) s += qs[d] * prow[d];
+        out[static_cast<long long>(row) * T + k] = s;
+    }
+}
+
+} // namespace
+
+void rel_pos_bias_xl_forward(const ::brotensor::Tensor& Qv,
+                             const ::brotensor::Tensor& Pk,
+                             int num_heads, int head_dim,
+                             ::brotensor::Tensor& Bias) {
+    if (Qv.dtype != Dtype::FP32 || Pk.dtype != Dtype::FP32)
+        throw std::runtime_error("rel_pos_bias_xl_forward: Qv and Pk must be FP32");
+    const int T = Qv.rows;
+    const int D = Qv.cols;
+    if (num_heads <= 0 || head_dim <= 0 || num_heads * head_dim != D)
+        throw std::runtime_error("rel_pos_bias_xl_forward: num_heads*head_dim "
+                                 "must equal Qv.cols");
+    if (Pk.cols != D || Pk.rows != 2 * T - 1)
+        throw std::runtime_error("rel_pos_bias_xl_forward: Pk must be "
+                                 "(2*Qv.rows - 1, Qv.cols)");
+    if (head_dim > kRelPosMaxHeadDim)
+        throw std::runtime_error("rel_pos_bias_xl_forward: head_dim above 512 "
+                                 "is not implemented on CUDA");
+    if (Bias.rows != num_heads * T || Bias.cols != T ||
+        Bias.dtype != Dtype::FP32) {
+        Bias = ::brotensor::Tensor::empty_on(Qv.device, num_heads * T, T,
+                                             Dtype::FP32);
+    }
+    if (T <= 0) return;
+
+    const int threads = T < 256 ? ((T + 31) / 32) * 32 : 256;
+    const dim3 grid(static_cast<unsigned>(num_heads * T));
+    const size_t shmem = static_cast<size_t>(head_dim) * sizeof(float);
+    cudaStream_t stream =
+        reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+    rel_pos_bias_xl_kernel<<<grid, threads, shmem, stream>>>(
+        static_cast<const float*>(Qv.data),
+        static_cast<const float*>(Pk.data),
+        static_cast<float*>(Bias.data), T, D, head_dim);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace detail::cuda
 } // namespace brotensor

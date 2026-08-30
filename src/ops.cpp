@@ -1365,6 +1365,15 @@ void self_attention_bias_forward(const Tensor& X,
                                   num_heads, scale, O);
 }
 
+void rel_pos_bias_xl_forward(const Tensor& Qv, const Tensor& Pk,
+                             int num_heads, int head_dim, Tensor& Bias) {
+    const auto& v = detail::dispatch_with_opts(Qv, Pk, {&Bias});
+    if (!v.rel_pos_bias_xl_forward)
+        detail::throw_not_implemented("rel_pos_bias_xl_forward", Qv.device);
+    detail::adopt_output(Bias, Qv.device);
+    v.rel_pos_bias_xl_forward(Qv, Pk, num_heads, head_dim, Bias);
+}
+
 void self_attention_decomposed_rel_pos_forward(
         const Tensor& X,
         const Tensor& Wq, const Tensor* bq,

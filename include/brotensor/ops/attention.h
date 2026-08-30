@@ -308,6 +308,34 @@ void self_attention_bias_forward(const Tensor& X,
                                  int num_heads, float scale,
                                  Tensor& O);
 
+// Transformer-XL relative-position bias, in the layout self_attention_bias_
+// forward's `attn_bias` takes. This is the *producer* of that bias for the
+// FastConformer / Conformer / Transformer-XL family, where the position term is
+// a second dot product against a projected relative positional encoding rather
+// than a learned table:
+//
+//   Bias[h*T + q, k] = sum_d Qv[q, h*head_dim + d] * Pk[(T-1-q) + k, h*head_dim + d]
+//
+// which is the NeMo `rel_shift` of matrix_bd = Qv @ Pk^T, per head. `Qv` is the
+// position-term query — the q-projection of the layer input plus pos_bias_v,
+// already scaled by 1/sqrt(head_dim) — and `Pk` is the relative-key projection
+// of the (2T-1, D) positional encoding, so the caller does the two linears and
+// this does the dot products and the shift.
+//
+//   Qv:   (T, D) FP32.  Pk: (2T-1, D) FP32.  D == num_heads*head_dim.
+//   Bias: (num_heads*T, T) FP32 — resized if mis-shaped.
+//
+// **It exists because the alternative is the host.** Building this bias on the
+// CPU costs num_heads*T*T*head_dim scalar multiply-adds plus two downloads and
+// an upload *per layer*: measured on one 4090, a 24-layer FastConformer over an
+// 18-second window spent 1 134 ms in transcribe, of which the encoder was
+// 1 112 ms and nearly all of that was this — with the card at 40% and dipping
+// to 0% waiting for a single host core. Everything else about that forward was
+// already a device op.
+void rel_pos_bias_xl_forward(const Tensor& Qv, const Tensor& Pk,
+                             int num_heads, int head_dim, Tensor& Bias);
+
+
 // Bias-less-projection convenience overload — preserves the original call shape
 // (no qkv/proj biases) by forwarding bq/bk/bv/bo == nullptr.
 inline void self_attention_bias_forward(const Tensor& X,

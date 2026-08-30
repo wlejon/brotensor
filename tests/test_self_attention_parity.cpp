@@ -529,4 +529,39 @@ BT_PARITY_TEST(sab_qkvo_vs_mha_L12_D48_h6) { run_sab_qkvo_vs_mha(12, 48, 6, 0x64
 BT_PARITY_TEST(sab_qkvo_parity_L8_D32_h4)  { run_sab_qkvo_parity(8, 32, 4, 0.176776695f, 0x650ull); }
 BT_PARITY_TEST(sab_qkvo_parity_L16_D64_h8) { run_sab_qkvo_parity(16, 64, 8, 0.125f, 0x651ull); }
 
+// ─── rel_pos_bias_xl_forward parity ────────────────────────────────────────
+//
+// The Transformer-XL relative-position bias, built for a Conformer's attention
+// and fed straight into self_attention_bias_forward above. It replaced a host
+// loop, so parity is the whole point: the CPU implementation IS that loop, and
+// the CUDA kernel has to agree with it for every (head, query, key) — including
+// the diagonal shift, which is the part an off-by-one leaves plausible-looking.
+static void run_rel_pos_bias_xl(int T, int num_heads, int head_dim,
+                                uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int C = num_heads * head_dim;
+
+    Tensor Qv = Tensor::mat(T, C);
+    Tensor Pk = Tensor::mat(2 * T - 1, C);
+    fill_random(Qv, rng, 0.5f);
+    fill_random(Pk, rng, 0.5f);
+
+    Tensor Bias_cpu;
+    brotensor::rel_pos_bias_xl_forward(Qv, Pk, num_heads, head_dim, Bias_cpu);
+    BT_CHECK(Bias_cpu.rows == num_heads * T);
+    BT_CHECK(Bias_cpu.cols == T);
+
+    Tensor gQv = Qv.to(gpu_device()), gPk = Pk.to(gpu_device());
+    Tensor Bias_gpu;
+    brotensor::rel_pos_bias_xl_forward(gQv, gPk, num_heads, head_dim, Bias_gpu);
+
+    compare_tensors(Bias_cpu, download_to_host(Bias_gpu), "rel_pos_bias_xl",
+                    1e-4f, 1e-3f);
+}
+
+BT_PARITY_TEST(rel_pos_bias_xl_T8_h4_d16)   { run_rel_pos_bias_xl(8, 4, 16, 0x660ull); }
+BT_PARITY_TEST(rel_pos_bias_xl_T1)          { run_rel_pos_bias_xl(1, 2, 8, 0x661ull); }
+// Parakeet's own shape: 8 heads of 128 at a couple of hundred encoder frames.
+BT_PARITY_TEST(rel_pos_bias_xl_T226_h8_d128) { run_rel_pos_bias_xl(226, 8, 128, 0x662ull); }
+
 int main() { return run_all("self_attention cpu/gpu parity"); }

@@ -517,6 +517,8 @@
                                                        const ::brotensor::Tensor* bq, const ::brotensor::Tensor* bk,                                                      \
                                                        const ::brotensor::Tensor* bv, const ::brotensor::Tensor* bo, const float* d_mask,                                \
                                                        const ::brotensor::Tensor* attn_bias, int num_heads, float scale, ::brotensor::Tensor& O))                         \
+    X(rel_pos_bias_xl_forward,                 void,  (const ::brotensor::Tensor& Qv, const ::brotensor::Tensor& Pk,                                                      \
+                                                       int num_heads, int head_dim, ::brotensor::Tensor& Bias))                                                            \
     X(self_attention_bias_int8w_fp16,          void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wq_int8, const ::brotensor::Tensor& sq,                   \
                                                        const ::brotensor::Tensor& Wk_int8, const ::brotensor::Tensor& sk,                                                 \
                                                        const ::brotensor::Tensor& Wv_int8, const ::brotensor::Tensor& sv,                                                 \

@@ -13,6 +13,7 @@
 // O is fully overwritten.
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
 #include <algorithm>
 #include <cmath>
@@ -172,6 +173,56 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
             Op[static_cast<size_t>(i) * D + c] = acc;
         }
     }
+}
+
+// ─── Transformer-XL relative-position bias ─────────────────────────────────
+//
+// Bias[h*T + q, k] = sum_d Qv[q, h*dk + d] * Pk[(T-1-q) + k, h*dk + d].
+//
+// The rel_shift is expressed as the column offset (T-1-q) rather than by
+// building matrix_bd and shifting it: the shifted read is the same cost and
+// there is no (T, 2T-1) intermediate. Parallelised over (head, query) rows,
+// which is num_heads*T of them — hundreds, so the pool has something to spread.
+void rel_pos_bias_xl_forward(const ::brotensor::Tensor& Qv,
+                             const ::brotensor::Tensor& Pk,
+                             int num_heads, int head_dim,
+                             ::brotensor::Tensor& Bias) {
+    check_fp32(Qv, "Qv");
+    check_fp32(Pk, "Pk");
+    const int T = Qv.rows;
+    const int D = Qv.cols;
+    if (num_heads <= 0 || head_dim <= 0 || num_heads * head_dim != D)
+        throw std::runtime_error("rel_pos_bias_xl_forward: num_heads*head_dim "
+                                 "must equal Qv.cols");
+    if (Pk.cols != D || Pk.rows != 2 * T - 1)
+        throw std::runtime_error("rel_pos_bias_xl_forward: Pk must be "
+                                 "(2*Qv.rows - 1, Qv.cols)");
+    if (Bias.rows != num_heads * T || Bias.cols != T ||
+        Bias.dtype != Dtype::FP32) {
+        Bias = ::brotensor::Tensor::empty_on(Qv.device, num_heads * T, T,
+                                             Dtype::FP32);
+    }
+
+    const float* qv = static_cast<const float*>(Qv.data);
+    const float* pk = static_cast<const float*>(Pk.data);
+    float* out = static_cast<float*>(Bias.data);
+
+    parallel_for(static_cast<std::size_t>(num_heads) * static_cast<std::size_t>(T),
+                 [&](std::size_t row) {
+        const int h = static_cast<int>(row / static_cast<std::size_t>(T));
+        const int q = static_cast<int>(row % static_cast<std::size_t>(T));
+        const int co = h * head_dim;
+        const float* qrow = qv + static_cast<std::size_t>(q) * D + co;
+        const int base = T - 1 - q;
+        float* orow = out + row * static_cast<std::size_t>(T);
+        for (int k = 0; k < T; ++k) {
+            const float* prow =
+                pk + static_cast<std::size_t>(base + k) * D + co;
+            float s = 0.0f;
+            for (int d = 0; d < head_dim; ++d) s += qrow[d] * prow[d];
+            orow[k] = s;
+        }
+    });
 }
 
 } // namespace brotensor::detail::cpu

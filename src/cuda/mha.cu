@@ -824,6 +824,11 @@ void self_attention_decomposed_rel_pos_windowed_forward(
         int num_heads, int grid_h, int grid_w, int window, float scale,
         ::brotensor::Tensor& O);
 
+void rel_pos_bias_xl_forward(const ::brotensor::Tensor& Qv,
+                             const ::brotensor::Tensor& Pk,
+                             int num_heads, int head_dim,
+                             ::brotensor::Tensor& Bias);
+
 void fill_cuda_vtable_attention(::brotensor::detail::OpsVTable& v) {
     v.mha_forward                            = &mha_forward;
     v.mha_backward                           = &mha_backward;
@@ -835,6 +840,7 @@ void fill_cuda_vtable_attention(::brotensor::detail::OpsVTable& v) {
     v.cross_attention_forward_with_attn      = &cross_attention_forward_with_attn;
     v.self_attention_forward                 = &self_attention_forward;
     v.self_attention_bias_forward            = &self_attention_bias_forward;
+    v.rel_pos_bias_xl_forward                = &rel_pos_bias_xl_forward;
     v.self_attention_bias_int8w_fp16         = &self_attention_bias_int8w_fp16;
     v.self_attention_decomposed_rel_pos_forward =
         &self_attention_decomposed_rel_pos_forward;

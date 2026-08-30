@@ -755,6 +755,10 @@ void self_attention_bias_forward(const ::brotensor::Tensor& X,
                                  const ::brotensor::Tensor* attn_bias,
                                  int num_heads, float scale,
                                  ::brotensor::Tensor& O);
+void rel_pos_bias_xl_forward(const ::brotensor::Tensor& Qv,
+                             const ::brotensor::Tensor& Pk,
+                             int num_heads, int head_dim,
+                             ::brotensor::Tensor& Bias);
 
 // ── Self-attention with decomposed 2D rel-pos bias (SAM/ViTDet) —
 //    self_attention_decomposed_rel_pos.cpp ──
@@ -1293,6 +1297,7 @@ struct CpuStaticRegistrar {
         ops.rope_apply_perhead           = &detail::cpu::rope_apply_perhead;
         ops.rope_apply_backward          = &detail::cpu::rope_apply_backward;
         ops.self_attention_bias_forward  = &detail::cpu::self_attention_bias_forward;
+        ops.rel_pos_bias_xl_forward      = &detail::cpu::rel_pos_bias_xl_forward;
         ops.self_attention_decomposed_rel_pos_forward =
             &detail::cpu::self_attention_decomposed_rel_pos_forward;
         ops.self_attention_decomposed_rel_pos_windowed_forward =
