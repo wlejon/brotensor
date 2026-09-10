@@ -21,8 +21,10 @@
 
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brotensor::detail::cpu {
 
@@ -70,6 +72,16 @@ void top_k_rows(const ::brotensor::Tensor& X, int k,
     float* Vp = Vals.host_f32_mut();
     int32_t* Ip = static_cast<int32_t*>(Idx.data);
 
+    // Large k (the masked-diffusion host loop asks for k up to the full row
+    // length): the streaming replacement below is O(C * k) per row, so past
+    // a modest k a full sort of the row's indices under the same total order
+    // — O(C log C), independent of k — is the cheaper route. The order is
+    // total (descending value, ascending index), so both paths produce the
+    // identical Vals / Idx; only the cost model differs.
+    constexpr int kSortThreshold = 64;
+    std::vector<int32_t> order;
+    if (k > kSortThreshold) order.resize(C);
+
     // Per-row working arrays (size k). Keeping them on the stack via VLA
     // isn't portable on MSVC; allocate on the heap once and reuse.
     // k is small in practice but C can be huge — so we allocate per row.
@@ -78,6 +90,19 @@ void top_k_rows(const ::brotensor::Tensor& X, int k,
         const float* row = Xp + static_cast<long>(r) * C;
         float* out_v = Vp + static_cast<long>(r) * k;
         int32_t* out_i = Ip + static_cast<long>(r) * k;
+
+        if (k > kSortThreshold) {
+            for (int c = 0; c < C; ++c) order[c] = c;
+            std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                              [row](int32_t a, int32_t b) {
+                                  return prefers(row[a], a, row[b], b);
+                              });
+            for (int j = 0; j < k; ++j) {
+                out_i[j] = order[j];
+                out_v[j] = row[order[j]];
+            }
+            continue;
+        }
 
         // Step 1: seed the working set with the first k elements (verbatim
         // order — ties get resolved on later replacements).

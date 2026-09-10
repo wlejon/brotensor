@@ -44,6 +44,8 @@ brotensor_add_test(brotensor_test_codec_quant test_codec_quant.cpp)
 brotensor_add_test(brotensor_test_resample1d test_resample1d.cpp)
 brotensor_add_test(brotensor_test_log_exp_round test_log_exp_round.cpp)
 brotensor_add_test(brotensor_test_sample_logits test_sample_logits.cpp)
+# CPU checks always; the CUDA parity half runs when that backend registers.
+brotensor_add_test(brotensor_test_masked_diffusion test_masked_diffusion.cpp)
 brotensor_add_test(brotensor_test_noise test_noise.cpp)
 brotensor_add_test(brotensor_test_gated_delta_rule test_gated_delta_rule.cpp)
 brotensor_add_test(brotensor_test_conv3d test_conv3d.cpp)

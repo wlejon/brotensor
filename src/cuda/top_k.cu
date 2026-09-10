@@ -127,6 +127,52 @@ __global__ void top_k_rows_kernel(const float* __restrict__ X,
     }
 }
 
+// ── Large k: rank selection ──────────────────────────────────────────────────
+//
+// The streaming kernel above keeps a k-entry working set per thread in shared
+// memory and scans in O(C * k), so it stops being viable once k reaches the
+// thousands (the masked-diffusion host loop calls top_k_rows over a (1, C*T)
+// score row with k anywhere up to the full row length, tens of thousands).
+// Past kRankThreshold the selection is done by rank instead: `prefers` is a
+// strict total order (descending value, ascending index) over the row, so
+// rank(c) = #{ w : (X[w], w) precedes (X[c], c) } is a permutation of
+// [0, C), and every element with rank < k writes itself straight into output
+// slot `rank`. One thread per element, the row streamed through a shared-
+// memory tile so every comparison reads smem; O(C^2 / threads) per row — a
+// 32768-wide row is ~1e9 comparisons spread over 128 blocks. Output is
+// bit-identical to the streaming path (same order, same tie rule).
+
+constexpr int kRankThreshold = 256;
+constexpr int kRankTile = 256;
+
+__global__ void top_k_rank_kernel(const float* __restrict__ X,
+                                  float* __restrict__ Vals,
+                                  int32_t* __restrict__ Idx,
+                                  int C, int k, int row0) {
+    __shared__ float tile[kRankTile];
+    const int r = row0 + blockIdx.y;
+    const int c = blockIdx.x * kRankTile + threadIdx.x;
+    const float* row = X + (long long)r * C;
+    const bool live = c < C;
+    const float v = live ? row[c] : 0.0f;
+    int rank = 0;
+    for (int base = 0; base < C; base += kRankTile) {
+        __syncthreads();
+        if (base + (int)threadIdx.x < C) tile[threadIdx.x] = row[base + threadIdx.x];
+        __syncthreads();
+        const int n = min(kRankTile, C - base);
+        if (live) {
+            for (int j = 0; j < n; ++j) {
+                rank += prefers(tile[j], base + j, v, c) ? 1 : 0;
+            }
+        }
+    }
+    if (live && rank < k) {
+        Vals[(long long)r * k + rank] = v;
+        Idx[(long long)r * k + rank] = c;
+    }
+}
+
 } // namespace
 
 void top_k_rows(const ::brotensor::Tensor& X, int k,
@@ -146,6 +192,22 @@ void top_k_rows(const ::brotensor::Tensor& X, int k,
         Idx.resize(R, k, ::brotensor::Dtype::INT32);
     }
     if (R == 0 || k == 0) return;
+
+    if (k > kRankThreshold) {
+        const int tiles = (C + kRankTile - 1) / kRankTile;
+        constexpr int kMaxGridY = 65535;
+        for (int row0 = 0; row0 < R; row0 += kMaxGridY) {
+            const int nrows = (R - row0 < kMaxGridY) ? (R - row0) : kMaxGridY;
+            const dim3 grid(static_cast<unsigned>(tiles), static_cast<unsigned>(nrows));
+            top_k_rank_kernel<<<grid, kRankTile, 0, cur_stream()>>>(
+                static_cast<const float*>(X.data),
+                static_cast<float*>(Vals.data),
+                static_cast<int32_t*>(Idx.data),
+                C, k, row0);
+            BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
 
     // Pack up to TK_THREADS independent rows per block instead of one thread
     // doing all the work per block while every sibling lane idles. Each

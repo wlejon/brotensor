@@ -118,4 +118,82 @@ void randn_truncated(float lo, float hi,
                      uint64_t key, uint64_t counter,
                      Tensor& Y);
 
+
+// ─── Masked-diffusion token selection (OmniVoice-style codebook grids) ─────
+//
+// One step of a masked-diffusion language model over a (C codebooks, T frames)
+// token grid with vocabulary V, where id `mask_id` marks a still-masked cell.
+// Two ops split the step: `masked_diffusion_scores` fuses classifier-free
+// guidance, log-softmax, per-cell prediction and the confidence score every
+// cell competes with; the host then picks the k best cells (top_k_rows over
+// the scores viewed as one (1, C*T) row) and `masked_diffusion_commit` writes
+// the chosen predictions back. FP32-only, implemented on CPU, CUDA and Metal.
+//
+// Math per cell (c, t), with c_logits / u_logits its conditional and
+// unconditional logit rows (upstream: OmniVoice._predict_tokens_with_scoring):
+//   if guidance_scale != 0:
+//       c = log_softmax(c_logits); u = log_softmax(u_logits)
+//       log_probs = log_softmax(c + guidance_scale * (c - u))
+//   else:
+//       log_probs = log_softmax(c_logits)
+//   log_probs[mask_id] = -inf
+//   if class_temperature > 0:
+//       k = ceil(class_top_frac * V), clamped to [1, V]
+//       filtered = log_probs with all but its k largest entries set to -inf
+//                  (ties at the k-th value keep the lower vocabulary index)
+//       pred = argmax(filtered / class_temperature + gumbel(u_class[v]))
+//   else:
+//       pred = argmax(log_probs)                       (ties: lowest index)
+//   confidence = max(log_probs)                        (UNfiltered, always)
+//   score = confidence - c * layer_penalty
+//   if position_temperature > 0:
+//       score = score / position_temperature + gumbel(u_pos)
+//   score = -inf where tokens[c, t] != mask_id         (already decided)
+//   gumbel(u) = -log(-log(u + 1e-10) + 1e-10), u ~ U[0, 1)
+//
+// Noise: the uniforms are a counter-based hash (detail/hash_rng.h,
+// splitmix64) of (seed, cell index c*T + t) for u_pos and of (seed, cell
+// index * V + v) for u_class, under two distinct domain constants — so the
+// CPU and CUDA backends draw bit-identical noise for the same `seed`, and the
+// caller gets fresh noise by varying `seed` per step. Nothing is consumed or
+// advanced; the same (inputs, seed) always yields the same result.
+//
+// Numerics: log-sum-exp accumulates in FP64 on CPU and CUDA (Metal, which has
+// no FP64, accumulates in FP32); everything else is FP32 with the same
+// operation order on every backend, so CPU and CUDA agree to the last ulp
+// except where their libm exp/log differ, and `pred` can only diverge on an
+// exact FP32 near-tie.
+//
+//   logits: (R, C*V) FP32; column c*V + v. R == 2*T when guidance_scale != 0
+//           (rows [0, T) conditional, rows [T, 2T) unconditional), R == T
+//           otherwise.
+//   tokens: (C, T) INT32 current grid; cell (c, t) is at c*T + t and is masked
+//           iff tokens == mask_id.
+//   pred:   (C, T) INT32 output, resized + dtype-set. The predicted id for
+//           every cell (never mask_id unless the whole row is -inf).
+//   scores: (C, T) FP32 output, resized + dtype-set. -inf where tokens !=
+//           mask_id.
+// Throws ("brotensor: masked_diffusion_scores: <reason>") for a non-FP32
+// logits / non-INT32 tokens, T/C/V < 1, mask_id outside [0, V), or a shape
+// that does not match (T, C, V, guidance_scale).
+void masked_diffusion_scores(const Tensor& logits, const Tensor& tokens,
+                             int T, int C, int V, int mask_id,
+                             float guidance_scale, float layer_penalty,
+                             float position_temperature, float class_temperature,
+                             float class_top_frac, std::uint64_t seed,
+                             Tensor& pred, Tensor& scores);
+
+
+// Commit the k selected cells: for i in [0, k): p = idx[i]; tokens[p] =
+// pred[p]; unmask_step[p] = step. `idx` holds flat cell indices c*T + t into
+// the (C, T) grids — the layout top_k_rows returns over `scores` viewed as
+// (1, C*T). tokens / unmask_step / pred are (C, T) INT32 (all pre-sized,
+// nothing is resized); idx is INT32 with at least k elements, of which only
+// the first k are read. k == 0 is a no-op. An index outside [0, C*T) is
+// ignored on every backend (a device kernel cannot throw), so the host should
+// only ever pass what top_k_rows produced. Throws for a dtype / shape / k
+// mismatch.
+void masked_diffusion_commit(const Tensor& pred, const Tensor& idx, int k, int step,
+                             Tensor& tokens, Tensor& unmask_step);
+
 }  // namespace brotensor

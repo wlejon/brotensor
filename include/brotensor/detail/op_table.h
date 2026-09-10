@@ -624,6 +624,15 @@
     X(sample_logits_into,                      void,  (const ::brotensor::Tensor& logits, float temperature, int top_k, float top_p,          \
                                                        uint64_t key, ::brotensor::Tensor& counter, ::brotensor::Tensor& scratch,              \
                                                        ::brotensor::Tensor& indices))                                                         \
+    /* ─── Masked-diffusion token selection (OmniVoice codebook grids) ─── */                                                                   \
+    X(masked_diffusion_scores,                 void,  (const ::brotensor::Tensor& logits, const ::brotensor::Tensor& tokens,                  \
+                                                       int T, int C, int V, int mask_id,                                                      \
+                                                       float guidance_scale, float layer_penalty,                                             \
+                                                       float position_temperature, float class_temperature,                                   \
+                                                       float class_top_frac, uint64_t seed,                                                   \
+                                                       ::brotensor::Tensor& pred, ::brotensor::Tensor& scores))                               \
+    X(masked_diffusion_commit,                 void,  (const ::brotensor::Tensor& pred, const ::brotensor::Tensor& idx, int k, int step,      \
+                                                       ::brotensor::Tensor& tokens, ::brotensor::Tensor& unmask_step))                        \
     /* ─── L2 norm + Gated Delta Rule (linear-attention text path) ─── */                                                                      \
     X(l2_norm_forward,                         void,  (const ::brotensor::Tensor& X, int head_dim, int num_heads, float eps,                   \
                                                        ::brotensor::Tensor& Y))                                                                \

@@ -2577,6 +2577,33 @@ void sample_logits_into(const Tensor& logits, float temperature, int top_k,
                          scratch, indices);
 }
 
+// ─── Masked-diffusion token selection (OmniVoice codebook grids) ────────────
+
+void masked_diffusion_scores(const Tensor& logits, const Tensor& tokens,
+                             int T, int C, int V, int mask_id,
+                             float guidance_scale, float layer_penalty,
+                             float position_temperature, float class_temperature,
+                             float class_top_frac, std::uint64_t seed,
+                             Tensor& pred, Tensor& scores) {
+    const auto& v = detail::dispatch(logits, tokens, pred, scores);
+    if (!v.masked_diffusion_scores)
+        detail::throw_not_implemented("masked_diffusion_scores", logits.device);
+    detail::adopt_output(pred, logits.device);
+    detail::adopt_output(scores, logits.device);
+    v.masked_diffusion_scores(logits, tokens, T, C, V, mask_id,
+                              guidance_scale, layer_penalty,
+                              position_temperature, class_temperature,
+                              class_top_frac, seed, pred, scores);
+}
+
+void masked_diffusion_commit(const Tensor& pred, const Tensor& idx, int k, int step,
+                             Tensor& tokens, Tensor& unmask_step) {
+    const auto& v = detail::dispatch(pred, idx, tokens, unmask_step);
+    if (!v.masked_diffusion_commit)
+        detail::throw_not_implemented("masked_diffusion_commit", pred.device);
+    v.masked_diffusion_commit(pred, idx, k, step, tokens, unmask_step);
+}
+
 // ─── L2 norm + Gated Delta Rule (linear-attention text path) ───────────────
 
 void l2_norm_forward(const Tensor& X, int head_dim, int num_heads,

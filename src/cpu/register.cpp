@@ -922,6 +922,19 @@ void sample_logits_into(const ::brotensor::Tensor& logits, float temperature,
                         ::brotensor::Tensor& scratch,
                         ::brotensor::Tensor& indices);
 
+// ── Masked-diffusion token selection — masked_diffusion.cpp ──
+void masked_diffusion_scores(const ::brotensor::Tensor& logits,
+                             const ::brotensor::Tensor& tokens,
+                             int T, int C, int V, int mask_id,
+                             float guidance_scale, float layer_penalty,
+                             float position_temperature, float class_temperature,
+                             float class_top_frac, uint64_t seed,
+                             ::brotensor::Tensor& pred, ::brotensor::Tensor& scores);
+void masked_diffusion_commit(const ::brotensor::Tensor& pred,
+                             const ::brotensor::Tensor& idx, int k, int step,
+                             ::brotensor::Tensor& tokens,
+                             ::brotensor::Tensor& unmask_step);
+
 // ── Counter-based noise generation (Philox 4x32-10) — noise.cpp ──
 void randn(uint64_t key, uint64_t counter, ::brotensor::Tensor& Y);
 void rand_uniform(uint64_t key, uint64_t counter, ::brotensor::Tensor& Y);
@@ -1364,6 +1377,10 @@ struct CpuStaticRegistrar {
         // ── Autoregressive logit sampling (brosoundml CHUNK 7, family F) ──
         ops.sample_logits                = &detail::cpu::sample_logits;
         ops.sample_logits_into           = &detail::cpu::sample_logits_into;
+
+        // ── Masked-diffusion token selection ──
+        ops.masked_diffusion_scores      = &detail::cpu::masked_diffusion_scores;
+        ops.masked_diffusion_commit      = &detail::cpu::masked_diffusion_commit;
 
         // ── Counter-based noise generation (Philox 4x32-10) ──
         ops.randn                        = &detail::cpu::randn;
