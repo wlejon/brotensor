@@ -2584,16 +2584,17 @@ void masked_diffusion_scores(const Tensor& logits, const Tensor& tokens,
                              float guidance_scale, float layer_penalty,
                              float position_temperature, float class_temperature,
                              float class_top_frac, std::uint64_t seed,
-                             Tensor& pred, Tensor& scores) {
-    const auto& v = detail::dispatch(logits, tokens, pred, scores);
+                             Tensor& pred, Tensor& scores, Tensor& confidence) {
+    const auto& v = detail::dispatch(logits, tokens, pred, scores, confidence);
     if (!v.masked_diffusion_scores)
         detail::throw_not_implemented("masked_diffusion_scores", logits.device);
     detail::adopt_output(pred, logits.device);
     detail::adopt_output(scores, logits.device);
+    detail::adopt_output(confidence, logits.device);
     v.masked_diffusion_scores(logits, tokens, T, C, V, mask_id,
                               guidance_scale, layer_penalty,
                               position_temperature, class_temperature,
-                              class_top_frac, seed, pred, scores);
+                              class_top_frac, seed, pred, scores, confidence);
 }
 
 void masked_diffusion_commit(const Tensor& pred, const Tensor& idx, int k, int step,

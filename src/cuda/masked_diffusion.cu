@@ -28,7 +28,7 @@
 // where their libm expf / logf differ.
 //
 // ── ACCUMULATION ────────────────────────────────────────────────────────────
-//   masked_diffusion_scores — pred and scores OVERWRITTEN.
+//   masked_diffusion_scores — pred, scores and confidence OVERWRITTEN.
 //   masked_diffusion_commit — tokens / unmask_step written only at idx[0..k).
 
 #include <brotensor/tensor.h>
@@ -174,7 +174,8 @@ masked_diffusion_scores_kernel(const float* __restrict__ logits,
                                uint64_t seed,
                                float* __restrict__ scratch,
                                int32_t* __restrict__ pred,
-                               float* __restrict__ scores) {
+                               float* __restrict__ scores,
+                               float* __restrict__ confidence) {
     __shared__ float sh_f[kWarps];
     __shared__ double sh_d[kWarps];
     __shared__ int sh_i[kWarps];
@@ -298,6 +299,7 @@ masked_diffusion_scores_kernel(const float* __restrict__ logits,
     // ── score ──
     if (tid == 0) {
         pred[p] = best;
+        confidence[p] = conf;   // raw, for every cell — masked or already decided
         float s = neg_inf();
         if (tokens[p] == mask_id) {
             s = __fsub_rn(conf, __fmul_rn(static_cast<float>(c), layer_penalty));
@@ -334,7 +336,8 @@ void masked_diffusion_scores(const ::brotensor::Tensor& logits,
                              float guidance_scale, float layer_penalty,
                              float position_temperature, float class_temperature,
                              float class_top_frac, uint64_t seed,
-                             ::brotensor::Tensor& pred, ::brotensor::Tensor& scores) {
+                             ::brotensor::Tensor& pred, ::brotensor::Tensor& scores,
+                             ::brotensor::Tensor& confidence) {
     using ::brotensor::Dtype;
     const char* op = "masked_diffusion_scores";
     if (logits.dtype != Dtype::FP32) fail(op, "logits must be FP32");
@@ -358,6 +361,9 @@ void masked_diffusion_scores(const ::brotensor::Tensor& logits,
     if (scores.rows != C || scores.cols != T || scores.dtype != Dtype::FP32) {
         scores.resize(C, T, Dtype::FP32);
     }
+    if (confidence.rows != C || confidence.cols != T || confidence.dtype != Dtype::FP32) {
+        confidence.resize(C, T, Dtype::FP32);
+    }
 
     int k_keep = V;
     if (class_temperature > 0.0f) {
@@ -376,7 +382,8 @@ void masked_diffusion_scores(const ::brotensor::Tensor& logits,
         position_temperature, class_temperature, k_keep, seed,
         scratch,
         static_cast<int32_t*>(pred.data),
-        static_cast<float*>(scores.data));
+        static_cast<float*>(scores.data),
+        static_cast<float*>(confidence.data));
     const cudaError_t err = cudaGetLastError();
     cuda_free(scratch);   // stream-ordered: released after the kernel drains
     BROTENSOR_CUDA_CHECK(err);

@@ -21,7 +21,7 @@
 // equal to it until k are kept.
 //
 // ── ACCUMULATION ────────────────────────────────────────────────────────────
-//   masked_diffusion_scores — pred and scores OVERWRITTEN.
+//   masked_diffusion_scores — pred, scores and confidence OVERWRITTEN.
 //   masked_diffusion_commit — tokens / unmask_step written only at idx[0..k).
 
 #include <brotensor/tensor.h>
@@ -77,7 +77,8 @@ void masked_diffusion_scores(const ::brotensor::Tensor& logits,
                              float guidance_scale, float layer_penalty,
                              float position_temperature, float class_temperature,
                              float class_top_frac, uint64_t seed,
-                             ::brotensor::Tensor& pred, ::brotensor::Tensor& scores) {
+                             ::brotensor::Tensor& pred, ::brotensor::Tensor& scores,
+                             ::brotensor::Tensor& confidence) {
     const char* op = "masked_diffusion_scores";
     if (logits.dtype != Dtype::FP32) fail(op, "logits must be FP32 (CPU backend is FP32-only)");
     if (tokens.dtype != Dtype::INT32) fail(op, "tokens must be INT32");
@@ -100,6 +101,9 @@ void masked_diffusion_scores(const ::brotensor::Tensor& logits,
     if (scores.rows != C || scores.cols != T || scores.dtype != Dtype::FP32) {
         scores.resize(C, T, Dtype::FP32);
     }
+    if (confidence.rows != C || confidence.cols != T || confidence.dtype != Dtype::FP32) {
+        confidence.resize(C, T, Dtype::FP32);
+    }
 
     // Top-k class filter width, fixed per call (ceil(frac * V), clamped).
     int k_keep = V;
@@ -112,6 +116,7 @@ void masked_diffusion_scores(const ::brotensor::Tensor& logits,
     const int32_t* tok = static_cast<const int32_t*>(tokens.host_raw());
     int32_t* pr = static_cast<int32_t*>(pred.host_raw_mut());
     float* sc = scores.host_f32_mut();
+    float* cf = confidence.host_f32_mut();
     const std::size_t row_stride = static_cast<std::size_t>(C) * V;
 
     parallel_for(static_cast<std::size_t>(rows), [&](std::size_t pi) {
@@ -151,6 +156,7 @@ void masked_diffusion_scores(const ::brotensor::Tensor& logits,
         // ── confidence: max of the UNfiltered log_probs ──
         float conf = kNegInf;
         for (int v = 0; v < V; ++v) conf = (lp[v] > conf) ? lp[v] : conf;
+        cf[p] = conf;   // raw, for every cell — masked or already decided
 
         // ── prediction ──
         int best = 0;

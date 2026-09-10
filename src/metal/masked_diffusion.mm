@@ -111,7 +111,8 @@ kernel void k_masked_diffusion_scores(device const float* logits  [[buffer(0)]],
                                       device float*       scratch [[buffer(2)]],
                                       device int*         pred    [[buffer(3)]],
                                       device float*       scores  [[buffer(4)]],
-                                      constant MDParams&  P       [[buffer(5)]],
+                                      device float*       confidence [[buffer(5)]],
+                                      constant MDParams&  P       [[buffer(6)]],
                                       uint p [[thread_position_in_grid]]) {
     const uint T = P.T, C = P.C, V = P.V;
     if (p >= C * T) return;
@@ -142,6 +143,7 @@ kernel void k_masked_diffusion_scores(device const float* logits  [[buffer(0)]],
     // ── confidence: max of the UNfiltered log_probs ──
     float conf = -INFINITY;
     for (uint v = 0; v < V; ++v) conf = (lp[v] > conf) ? lp[v] : conf;
+    confidence[p] = conf;   // raw, for every cell — masked or already decided
 
     // ── prediction ──
     int best = 0;
@@ -233,7 +235,7 @@ void masked_diffusion_scores(const Tensor& logits, const Tensor& tokens,
                              float guidance_scale, float layer_penalty,
                              float position_temperature, float class_temperature,
                              float class_top_frac, uint64_t seed,
-                             Tensor& pred, Tensor& scores) {
+                             Tensor& pred, Tensor& scores, Tensor& confidence) {
     const char* op = "masked_diffusion_scores";
     if (logits.dtype != Dtype::FP32) fail(op, "logits must be FP32");
     if (tokens.dtype != Dtype::INT32) fail(op, "tokens must be INT32");
@@ -255,6 +257,9 @@ void masked_diffusion_scores(const Tensor& logits, const Tensor& tokens,
     }
     if (scores.rows != C || scores.cols != T || scores.dtype != Dtype::FP32) {
         scores.resize(C, T, Dtype::FP32);
+    }
+    if (confidence.rows != C || confidence.cols != T || confidence.dtype != Dtype::FP32) {
+        confidence.resize(C, T, Dtype::FP32);
     }
 
     int k_keep = V;
@@ -291,7 +296,8 @@ void masked_diffusion_scores(const Tensor& logits, const Tensor& tokens,
         [enc setBuffer:scratch offset:0 atIndex:2];
         [enc setBuffer:buffer_for(pred)   offset:buffer_offset_for(pred)   atIndex:3];
         [enc setBuffer:buffer_for(scores) offset:buffer_offset_for(scores) atIndex:4];
-        [enc setBytes:&p length:sizeof(MDParams) atIndex:5];
+        [enc setBuffer:buffer_for(confidence) offset:buffer_offset_for(confidence) atIndex:5];
+        [enc setBytes:&p length:sizeof(MDParams) atIndex:6];
         NSUInteger tpt = [pso maxTotalThreadsPerThreadgroup];
         if (tpt > 64) tpt = 64;
         [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(rows), 1, 1)

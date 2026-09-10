@@ -173,6 +173,15 @@ void randn_truncated(float lo, float hi,
 //           every cell (never mask_id unless the whole row is -inf).
 //   scores: (C, T) FP32 output, resized + dtype-set. -inf where tokens !=
 //           mask_id.
+//   confidence: (C, T) FP32 output, resized + dtype-set. The RAW `confidence`
+//           of the math above — max(log_probs) — before the layer penalty, the
+//           position temperature and the Gumbel noise, and WITHOUT the -inf
+//           masking `scores` applies. It is written for EVERY cell, including
+//           cells that are already unmasked: their logits exist just the same
+//           (the model predicts every target position every step), so their
+//           confidence is a real number, not -inf. That makes it the honest
+//           "how sure was the model here" signal a caller can record per step,
+//           where `scores` only says which masked cell won the selection.
 // Throws ("brotensor: masked_diffusion_scores: <reason>") for a non-FP32
 // logits / non-INT32 tokens, T/C/V < 1, mask_id outside [0, V), or a shape
 // that does not match (T, C, V, guidance_scale).
@@ -181,7 +190,7 @@ void masked_diffusion_scores(const Tensor& logits, const Tensor& tokens,
                              float guidance_scale, float layer_penalty,
                              float position_temperature, float class_temperature,
                              float class_top_frac, std::uint64_t seed,
-                             Tensor& pred, Tensor& scores);
+                             Tensor& pred, Tensor& scores, Tensor& confidence);
 
 
 // Commit the k selected cells: for i in [0, k): p = idx[i]; tokens[p] =

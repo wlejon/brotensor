@@ -929,7 +929,8 @@ void masked_diffusion_scores(const ::brotensor::Tensor& logits,
                              float guidance_scale, float layer_penalty,
                              float position_temperature, float class_temperature,
                              float class_top_frac, uint64_t seed,
-                             ::brotensor::Tensor& pred, ::brotensor::Tensor& scores);
+                             ::brotensor::Tensor& pred, ::brotensor::Tensor& scores,
+                             ::brotensor::Tensor& confidence);
 void masked_diffusion_commit(const ::brotensor::Tensor& pred,
                              const ::brotensor::Tensor& idx, int k, int step,
                              ::brotensor::Tensor& tokens,

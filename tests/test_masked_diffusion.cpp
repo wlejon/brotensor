@@ -5,7 +5,11 @@
 //      reference of the upstream pseudocode written here, over every switch:
 //      guidance_scale 0 (R == T) and != 0 (R == 2T), position_temperature 0
 //      and > 0, class_temperature 0 (argmax) and > 0 (top-k Gumbel sampling),
-//      and already-unmasked cells scoring -inf.
+//      and already-unmasked cells scoring -inf. The raw `confidence` output is
+//      checked against the reference at every cell — including the unmasked
+//      ones, which are -inf in `scores` but carry a real confidence — and,
+//      where position_temperature is 0, against `score + c * layer_penalty`
+//      exactly (the relation brosoundml's OmniVoice trace relies on).
 //   2. Argument validation throws.
 //   3. commit: tokens / unmask_step change only at the k indices; out-of-
 //      range indices are ignored.
@@ -100,6 +104,7 @@ struct Params {
 struct Ref {
     std::vector<int> pred;
     std::vector<double> score;
+    std::vector<double> conf;   // raw max(log_probs), every cell
 };
 
 double gumbel_ref(float u) {
@@ -123,6 +128,7 @@ Ref reference(const std::vector<float>& logits, const std::vector<int32_t>& toke
     Ref r;
     r.pred.assign(C * T, 0);
     r.score.assign(C * T, 0.0);
+    r.conf.assign(C * T, 0.0);
     const size_t stride = static_cast<size_t>(C) * V;
     for (int c = 0; c < C; ++c) {
         for (int t = 0; t < T; ++t) {
@@ -142,6 +148,7 @@ Ref reference(const std::vector<float>& logits, const std::vector<int32_t>& toke
             lp[P.mask_id] = -kInf;
             double conf = -kInf;
             for (double v : lp) conf = std::max(conf, v);
+            r.conf[p] = conf;
 
             int pred = 0;
             if (P.class_temp > 0.0f) {
@@ -200,18 +207,21 @@ void check_case(const char* name, const std::vector<float>& logits,
     const int R = (P.gs != 0.0f) ? 2 * P.T : P.T;
     Tensor L = make_f32(R, P.C * P.V, logits);
     Tensor tok = make_i32(P.C, P.T, tokens);
-    Tensor pred, scores;
+    Tensor pred, scores, conf;
     brotensor::masked_diffusion_scores(L, tok, P.T, P.C, P.V, P.mask_id,
                                        P.gs, P.pen, P.pos_temp, P.class_temp,
-                                       P.top_frac, P.seed, pred, scores);
+                                       P.top_frac, P.seed, pred, scores, conf);
     CHECK(pred.rows == P.C && pred.cols == P.T && pred.dtype == Dtype::INT32);
     CHECK(scores.rows == P.C && scores.cols == P.T && scores.dtype == Dtype::FP32);
+    CHECK(conf.rows == P.C && conf.cols == P.T && conf.dtype == Dtype::FP32);
 
     const Ref ref = reference(logits, tokens, P);
     const std::vector<int32_t> pr = i32_of(pred);
     const std::vector<float> sc = f32_of(scores);
+    const std::vector<float> cf = f32_of(conf);
     int bad = 0;
     for (int p = 0; p < P.C * P.T; ++p) {
+        const int c = p / P.T;
         if (pr[p] != ref.pred[p]) {
             ++bad;
             std::printf("    [%s] pred mismatch at p=%d: op=%d ref=%d\n", name, p, pr[p], ref.pred[p]);
@@ -227,6 +237,27 @@ void check_case(const char* name, const std::vector<float>& logits,
         if (tokens[p] != P.mask_id && !(sc[p] == -std::numeric_limits<float>::infinity())) {
             ++bad;
             std::printf("    [%s] unmasked cell p=%d not -inf: %g\n", name, p, sc[p]);
+        }
+        // Raw confidence: matches the reference at EVERY cell, unmasked ones
+        // included, and is always finite (the logits exist for every target).
+        if (!close(ref.conf[p], cf[p], 1e-4, 1e-5)) {
+            ++bad;
+            std::printf("    [%s] confidence mismatch at p=%d: op=%.7g ref=%.7g\n",
+                        name, p, cf[p], ref.conf[p]);
+        }
+        if (!std::isfinite(cf[p])) {
+            ++bad;
+            std::printf("    [%s] confidence not finite at p=%d: %g\n", name, p, cf[p]);
+        }
+        // With no position noise, score = confidence - c * layer_penalty on
+        // every masked cell — the exact relation brosoundml's trace inverts.
+        if (P.pos_temp == 0.0f && tokens[p] == P.mask_id) {
+            const float want = cf[p] - static_cast<float>(c) * P.pen;
+            if (want != sc[p]) {
+                ++bad;
+                std::printf("    [%s] score != conf - c*pen at p=%d: %.9g vs %.9g\n",
+                            name, p, sc[p], want);
+            }
         }
     }
     CHECK(bad == 0);
@@ -280,12 +311,15 @@ void test_small_grid() {
     {
         Tensor L = make_f32(2 * T, C * V, both);
         Tensor tok = make_i32(C, T, tokens);
-        Tensor pa, sa, pb, sb, pc, sc;
-        brotensor::masked_diffusion_scores(L, tok, T, C, V, mask_id, 2.0f, 0.5f, 0.7f, 0.0f, 0.5f, 1ull, pa, sa);
-        brotensor::masked_diffusion_scores(L, tok, T, C, V, mask_id, 2.0f, 0.5f, 0.7f, 0.0f, 0.5f, 2ull, pb, sb);
-        brotensor::masked_diffusion_scores(L, tok, T, C, V, mask_id, 2.0f, 0.5f, 0.7f, 0.0f, 0.5f, 1ull, pc, sc);
+        Tensor pa, sa, pb, sb, pc, sc, ca, cb, cc;
+        brotensor::masked_diffusion_scores(L, tok, T, C, V, mask_id, 2.0f, 0.5f, 0.7f, 0.0f, 0.5f, 1ull, pa, sa, ca);
+        brotensor::masked_diffusion_scores(L, tok, T, C, V, mask_id, 2.0f, 0.5f, 0.7f, 0.0f, 0.5f, 2ull, pb, sb, cb);
+        brotensor::masked_diffusion_scores(L, tok, T, C, V, mask_id, 2.0f, 0.5f, 0.7f, 0.0f, 0.5f, 1ull, pc, sc, cc);
         CHECK(f32_of(sa) != f32_of(sb));
         CHECK(f32_of(sa) == f32_of(sc));
+        // The raw confidence carries no noise, so the seed cannot move it.
+        CHECK(f32_of(ca) == f32_of(cb));
+        CHECK(f32_of(ca) == f32_of(cc));
     }
 }
 
@@ -294,21 +328,21 @@ void test_throws() {
     const int T = 2, C = 1, V = 3;
     Tensor L = Tensor::zeros_on(Device::CPU, T, C * V);
     Tensor tok = Tensor::zeros_on(Device::CPU, C, T, Dtype::INT32);
-    Tensor pred, scores;
+    Tensor pred, scores, conf;
     bool threw = false;
     try {   // guidance on but only T rows
-        brotensor::masked_diffusion_scores(L, tok, T, C, V, 2, 1.0f, 0, 0, 0, 0.1f, 0, pred, scores);
+        brotensor::masked_diffusion_scores(L, tok, T, C, V, 2, 1.0f, 0, 0, 0, 0.1f, 0, pred, scores, conf);
     } catch (const std::runtime_error&) { threw = true; }
     CHECK(threw);
     threw = false;
     try {   // mask_id out of range
-        brotensor::masked_diffusion_scores(L, tok, T, C, V, 3, 0.0f, 0, 0, 0, 0.1f, 0, pred, scores);
+        brotensor::masked_diffusion_scores(L, tok, T, C, V, 3, 0.0f, 0, 0, 0, 0.1f, 0, pred, scores, conf);
     } catch (const std::runtime_error&) { threw = true; }
     CHECK(threw);
     threw = false;
     try {   // tokens wrong shape
         Tensor bad = Tensor::zeros_on(Device::CPU, T, C, Dtype::INT32);
-        brotensor::masked_diffusion_scores(L, bad, T, C, V, 2, 0.0f, 0, 0, 0, 0.1f, 0, pred, scores);
+        brotensor::masked_diffusion_scores(L, bad, T, C, V, 2, 0.0f, 0, 0, 0, 0.1f, 0, pred, scores, conf);
     } catch (const std::runtime_error&) { threw = true; }
     CHECK(threw);
     threw = false;
@@ -426,19 +460,20 @@ void parity_case(const char* name, const Params& P, uint64_t input_seed, int k_u
     }
     Tensor L = make_f32(R, C * V, logits);
     Tensor tok = make_i32(C, T, tokens);
-    Tensor pred_c, sc_c;
+    Tensor pred_c, sc_c, cf_c;
     brotensor::masked_diffusion_scores(L, tok, T, C, V, P.mask_id, P.gs, P.pen,
                                        P.pos_temp, P.class_temp, P.top_frac, P.seed,
-                                       pred_c, sc_c);
+                                       pred_c, sc_c, cf_c);
     Tensor gL = L.to(Device::CUDA), gtok = tok.to(Device::CUDA);
-    Tensor pred_g, sc_g;
+    Tensor pred_g, sc_g, cf_g;
     brotensor::masked_diffusion_scores(gL, gtok, T, C, V, P.mask_id, P.gs, P.pen,
                                        P.pos_temp, P.class_temp, P.top_frac, P.seed,
-                                       pred_g, sc_g);
+                                       pred_g, sc_g, cf_g);
     const std::vector<int32_t> pc = i32_of(pred_c), pg = i32_of(to_host(pred_g));
     const std::vector<float> scc = f32_of(sc_c), scg = f32_of(to_host(sc_g));
-    int bad_pred = 0, bad_score = 0;
-    float worst = 0.0f;
+    const std::vector<float> cfc = f32_of(cf_c), cfg = f32_of(to_host(cf_g));
+    int bad_pred = 0, bad_score = 0, bad_conf = 0;
+    float worst = 0.0f, worst_conf = 0.0f;
     for (int p = 0; p < C * T; ++p) {
         if (pc[p] != pg[p]) {
             if (bad_pred < 5) std::printf("    [%s] pred mismatch p=%d cpu=%d cuda=%d\n", name, p, pc[p], pg[p]);
@@ -448,18 +483,26 @@ void parity_case(const char* name, const Params& P, uint64_t input_seed, int k_u
             if (bad_score < 5) std::printf("    [%s] score mismatch p=%d cpu=%.8g cuda=%.8g\n", name, p, scc[p], scg[p]);
             ++bad_score;
         }
+        if (!close(cfc[p], cfg[p], 1e-4, 1e-5) || !std::isfinite(cfc[p]) || !std::isfinite(cfg[p])) {
+            if (bad_conf < 5) std::printf("    [%s] confidence mismatch p=%d cpu=%.8g cuda=%.8g\n", name, p, cfc[p], cfg[p]);
+            ++bad_conf;
+        }
         if (!std::isinf(scc[p]) && !std::isinf(scg[p])) {
             worst = std::max(worst, std::fabs(scc[p] - scg[p]));
         }
+        worst_conf = std::max(worst_conf, std::fabs(cfc[p] - cfg[p]));
     }
     CHECK(bad_pred == 0);
     CHECK(bad_score == 0);
+    CHECK(bad_conf == 0);
 
-    // Against the double reference too (pred exact, scores to tolerance).
+    // Against the double reference too (pred exact, scores + confidence to
+    // tolerance; confidence is finite even on the already-unmasked cells).
     const Ref ref = reference(logits, tokens, P);
     int bad_ref = 0;
     for (int p = 0; p < C * T; ++p) {
         if (pc[p] != ref.pred[p] || !close(ref.score[p], scc[p], 1e-4, 1e-5)) ++bad_ref;
+        if (!close(ref.conf[p], cfc[p], 1e-4, 1e-5)) ++bad_ref;
     }
     CHECK(bad_ref == 0);
 
@@ -493,9 +536,10 @@ void parity_case(const char* name, const Params& P, uint64_t input_seed, int k_u
     CHECK(changed == k_unmask);
     CHECK(wrong == 0);
     std::printf("  %s  parity %s: pred %d/%d mismatches, scores %d over tol (worst |d|=%.3g), "
-                "unmask set %s\n",
-                (bad_pred || bad_score || bad_ref || ic != ig || tc != tg) ? "FAIL" : "ok  ",
-                name, bad_pred, C * T, bad_score, worst, ic == ig ? "identical" : "DIFFERS");
+                "confidence %d over tol (worst |d|=%.3g), unmask set %s\n",
+                (bad_pred || bad_score || bad_conf || bad_ref || ic != ig || tc != tg) ? "FAIL" : "ok  ",
+                name, bad_pred, C * T, bad_score, worst, bad_conf, worst_conf,
+                ic == ig ? "identical" : "DIFFERS");
 }
 
 void test_parity() {
