@@ -39,7 +39,7 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
     const float* bp = beta.host_f32();
     float* yp = Y_RD.host_f32_mut();
 
-    if (jit::is_jit_available()) {
+    if (jit::is_jit_available() && D >= 8) {
         jit::layernorm_forward_inference_batched(xp, gp, bp, eps, yp, R, D);
         return;
     }

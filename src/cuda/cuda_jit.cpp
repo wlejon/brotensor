@@ -78,6 +78,66 @@ void launch_fused_residual_rmsnorm_ptx(
     }
 }
 
+void launch_fused_residual_layernorm_ptx(
+    float* X,
+    const float* res,
+    const float* gamma,
+    const float* beta,
+    float* Y,
+    int B,
+    int D,
+    float eps,
+    void* stream
+) {
+    if (B <= 0 || D <= 0) return;
+
+    static const std::string ptx = []() {
+        brass::codegen::MlFusionCompiler comp;
+        return comp.emit_ptx_fused_residual_layernorm(make_ptx_opts());
+    }();
+
+    CUfunction fn = CudaJitEngine::instance().get_function(
+        "fused_residual_layernorm",
+        ptx,
+        "fused_residual_layernorm_kernel"
+    );
+
+    CUdeviceptr d_x = reinterpret_cast<CUdeviceptr>(X);
+    CUdeviceptr d_res = reinterpret_cast<CUdeviceptr>(res);
+    CUdeviceptr d_gamma = reinterpret_cast<CUdeviceptr>(gamma);
+    CUdeviceptr d_beta = reinterpret_cast<CUdeviceptr>(beta);
+    CUdeviceptr d_y = reinterpret_cast<CUdeviceptr>(Y);
+    uint32_t b_arg = static_cast<uint32_t>(B);
+    uint32_t d_arg = static_cast<uint32_t>(D);
+    float eps_arg = eps;
+
+    void* kernel_params[] = {
+        &d_x,
+        &d_res,
+        &d_gamma,
+        &d_beta,
+        &d_y,
+        &b_arg,
+        &d_arg,
+        &eps_arg
+    };
+
+    CUstream custream = resolve_stream(stream);
+    CUresult status = cuLaunchKernel(
+        fn,
+        static_cast<unsigned int>(B), 1, 1,
+        256, 1, 1,
+        0,
+        custream,
+        kernel_params,
+        nullptr
+    );
+
+    if (status != CUDA_SUCCESS) {
+        throw std::runtime_error("cuLaunchKernel failed for fused_residual_layernorm_kernel");
+    }
+}
+
 void launch_fused_layernorm_modulate_ptx(
     const float* X,
     const float* gamma,

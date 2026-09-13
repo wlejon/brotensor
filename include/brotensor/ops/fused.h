@@ -16,6 +16,11 @@ namespace brotensor {
 void fused_residual_rmsnorm(Tensor& h, const Tensor& proj, const Tensor& gamma,
                             float eps, Tensor& out);
 
+// In-place residual add (x += res) and LayerNorm (out = layernorm(x, gamma, beta, eps))
+// fused into a single register pass without intermediate DRAM round-trips.
+void fused_residual_layernorm(Tensor& x, const Tensor& res, const Tensor& gamma,
+                             const Tensor& beta, float eps, Tensor& out);
+
 // LayerNorm over x with gamma, beta, followed by AdaLN modulate with (1 + scale) + shift
 // computed directly in registers without intermediate writes.
 void fused_layernorm_modulate(const Tensor& x, const Tensor& gamma, const Tensor& beta,

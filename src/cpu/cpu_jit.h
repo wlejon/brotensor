@@ -29,6 +29,9 @@ void layernorm_forward_inference_batched(const float* X, const float* gamma, con
 // Fused Residual RMSNorm: X += res in-place, accumulates sum_sq in same pass, Y = X * gamma * rrms
 void fused_residual_rmsnorm(float* X, const float* res, const float* gamma, float eps, float* Y, int B, int D);
 
+// Fused Residual LayerNorm: X += res in-place, cooperatively computes mean/var, Y = gamma * (X - mean) * rstd + beta
+void fused_residual_layernorm(float* X, const float* res, const float* gamma, const float* beta, float eps, float* Y, int B, int D);
+
 // Fused LayerNorm + AdaLN Modulate: computes LayerNorm directly in registers and applies modulate into Y (0 intermediate writes)
 void fused_layernorm_modulate(const float* X, const float* gamma, const float* beta, const float* scale, const float* shift, float eps, float* Y, int R, int D);
 

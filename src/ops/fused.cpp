@@ -68,6 +68,64 @@ void fused_residual_rmsnorm(Tensor& h, const Tensor& proj, const Tensor& gamma,
     rms_norm_forward(h, gamma, eps, out);
 }
 
+void fused_residual_layernorm(Tensor& x, const Tensor& res, const Tensor& gamma,
+                             const Tensor& beta, float eps, Tensor& out) {
+    if (x.device != res.device || x.device != gamma.device || x.device != beta.device) {
+        throw std::runtime_error("fused_residual_layernorm: device mismatch between operands");
+    }
+    if (x.size() != res.size()) {
+        throw std::runtime_error("fused_residual_layernorm: x and res size mismatch");
+    }
+    int D = gamma.size();
+    if (D <= 0 || beta.size() != D || (x.size() % D != 0)) {
+        throw std::runtime_error("fused_residual_layernorm: invalid hidden dimension");
+    }
+    int B = x.size() / D;
+
+    if (out.rows != x.rows || out.cols != x.cols ||
+        out.dtype != x.dtype || out.device != x.device) {
+        if (out.device != x.device) {
+            out = Tensor::empty_on(x.device, x.rows, x.cols, x.dtype);
+        } else {
+            out.resize(x.rows, x.cols, x.dtype);
+        }
+    }
+
+#ifdef BROTENSOR_HAS_CUDA
+    if (x.device.type == DeviceType::CUDA &&
+        x.dtype == Dtype::FP32 && res.dtype == Dtype::FP32 && gamma.dtype == Dtype::FP32 && beta.dtype == Dtype::FP32 &&
+        detail::cuda::jit::is_cuda_jit_available()) {
+        detail::cuda::jit::launch_fused_residual_layernorm_ptx(
+            static_cast<float*>(x.data),
+            static_cast<const float*>(res.data),
+            static_cast<const float*>(gamma.data),
+            static_cast<const float*>(beta.data),
+            static_cast<float*>(out.data),
+            B, D, eps, nullptr
+        );
+        return;
+    }
+#endif
+
+    if (x.device.type == DeviceType::CPU &&
+        x.dtype == Dtype::FP32 && res.dtype == Dtype::FP32 && gamma.dtype == Dtype::FP32 && beta.dtype == Dtype::FP32 &&
+        detail::cpu::jit::is_jit_available() && D >= 8) {
+        detail::cpu::jit::fused_residual_layernorm(
+            static_cast<float*>(x.data),
+            static_cast<const float*>(res.data),
+            static_cast<const float*>(gamma.data),
+            static_cast<const float*>(beta.data),
+            eps,
+            static_cast<float*>(out.data),
+            B, D
+        );
+        return;
+    }
+
+    add_inplace(x, res);
+    layernorm_forward_inference_batched(x, gamma, beta, out, eps);
+}
+
 void fused_layernorm_modulate(const Tensor& x, const Tensor& gamma, const Tensor& beta,
                               const Tensor& scale, const Tensor& shift, float eps,
                               Tensor& out) {

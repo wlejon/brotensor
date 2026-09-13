@@ -32,6 +32,29 @@ void reference_rmsnorm(const float* X, const float* gamma, float eps, float* Y, 
     }
 }
 
+void reference_residual_layernorm(const float* X, const float* gamma, const float* beta,
+                                  float eps, float* Y, int B, int D) {
+    const float inv_D = 1.0f / static_cast<float>(D);
+    for (int b = 0; b < B; ++b) {
+        const float* x = X + b * D;
+        float* y = Y + b * D;
+        float sum = 0.0f;
+        for (int d = 0; d < D; ++d) sum += x[d];
+        float mean = sum * inv_D;
+        float sum_sq = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            float diff = x[d] - mean;
+            sum_sq += diff * diff;
+        }
+        float var = sum_sq * inv_D;
+        float rstd = 1.0f / std::sqrt(var + eps);
+        for (int d = 0; d < D; ++d) {
+            float xhat = (x[d] - mean) * rstd;
+            y[d] = gamma[d] * xhat + beta[d];
+        }
+    }
+}
+
 void reference_layernorm_modulate(const float* X, const float* gamma, const float* beta,
                                   const float* scale, const float* shift, float eps,
                                   float* Y, int R, int D) {
@@ -133,6 +156,61 @@ void test_residual_rmsnorm() {
             Tensor out_gpu_back = out_gpu_dev.to(Device::CPU);
             compare_tensors(h_ref, h_gpu_back, "fused_residual_rmsnorm h (CUDA)", 1e-4f, 1e-4f);
             compare_tensors(out_cpu, out_gpu_back, "fused_residual_rmsnorm out (CUDA)", 1e-4f, 1e-4f);
+        }
+    }
+}
+
+void test_residual_layernorm() {
+    std::printf("  Testing fused_residual_layernorm...\n");
+    SplitMix64 rng(4242);
+    const std::vector<std::pair<int, int>> shapes = {
+        {1, 128}, {4, 256}, {1, 1024}, {2, 4096}, {14, 768}, {64, 1024}
+    };
+    const float eps = 1e-5f;
+
+    for (auto [B, D] : shapes) {
+        Tensor x_cpu = Tensor::zeros_on(Device::CPU, B, D);
+        Tensor res_cpu = Tensor::zeros_on(Device::CPU, B, D);
+        Tensor gamma_cpu = Tensor::zeros_on(Device::CPU, D, 1);
+        Tensor beta_cpu = Tensor::zeros_on(Device::CPU, D, 1);
+        Tensor out_cpu = Tensor::empty_on(Device::CPU, B, D);
+
+        fill_random(x_cpu, rng, 1.0f);
+        fill_random(res_cpu, rng, 0.5f);
+        fill_random(gamma_cpu, rng, 1.0f);
+        fill_random(beta_cpu, rng, 0.2f);
+
+        Tensor x_ref = x_cpu.clone();
+        for (int i = 0; i < B * D; ++i) x_ref.ptr()[i] += res_cpu.ptr()[i];
+        std::vector<float> ref_out(B * D);
+        reference_residual_layernorm(x_ref.ptr(), gamma_cpu.ptr(), beta_cpu.ptr(), eps, ref_out.data(), B, D);
+
+        // Run CPU op
+        brotensor::fused_residual_layernorm(x_cpu, res_cpu, gamma_cpu, beta_cpu, eps, out_cpu);
+
+        // Verify CPU in-place x and out
+        for (int i = 0; i < B * D; ++i) {
+            BT_CHECK(std::fabs(x_cpu.ptr()[i] - x_ref.ptr()[i]) < 1e-4f);
+            BT_CHECK(std::fabs(out_cpu.ptr()[i] - ref_out[i]) < 1e-3f);
+        }
+
+        // Run GPU if available
+        if (brotensor::is_available(Device::CUDA)) {
+            Tensor x_gpu = x_ref.clone(); // start from pre-residual x
+            for (int i = 0; i < B * D; ++i) x_gpu.ptr()[i] -= res_cpu.ptr()[i];
+            Tensor x_gpu_dev = x_gpu.to(Device::CUDA);
+            Tensor res_gpu_dev = res_cpu.to(Device::CUDA);
+            Tensor gamma_gpu_dev = gamma_cpu.to(Device::CUDA);
+            Tensor beta_gpu_dev = beta_cpu.to(Device::CUDA);
+            Tensor out_gpu_dev = Tensor::empty_on(Device::CUDA, B, D);
+
+            brotensor::fused_residual_layernorm(x_gpu_dev, res_gpu_dev, gamma_gpu_dev, beta_gpu_dev, eps, out_gpu_dev);
+            brotensor::sync_all();
+
+            Tensor x_gpu_back = x_gpu_dev.to(Device::CPU);
+            Tensor out_gpu_back = out_gpu_dev.to(Device::CPU);
+            compare_tensors(x_ref, x_gpu_back, "fused_residual_layernorm x (CUDA)", 1e-4f, 1e-4f);
+            compare_tensors(out_cpu, out_gpu_back, "fused_residual_layernorm out (CUDA)", 1e-3f, 1e-3f);
         }
     }
 }
@@ -298,6 +376,7 @@ int main() {
 
     try {
         test_residual_rmsnorm();
+        test_residual_layernorm();
         test_layernorm_modulate();
         test_gemv_swiglu();
         test_gemv_residual();

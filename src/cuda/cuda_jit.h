@@ -29,6 +29,21 @@ void launch_fused_residual_rmsnorm_ptx(
     void* stream = nullptr
 );
 
+// Launches parallel PTX kernel for Fused Residual LayerNorm:
+// Updates X in-place (X += res), cooperatively computes mean & variance,
+// writes Y = ((X - mean) * rstd) * gamma + beta directly in registers.
+void launch_fused_residual_layernorm_ptx(
+    float* X,
+    const float* res,
+    const float* gamma,
+    const float* beta,
+    float* Y,
+    int B,
+    int D,
+    float eps = 1e-5f,
+    void* stream = nullptr
+);
+
 // Launches parallel PTX kernel for Fused LayerNorm + AdaLN Modulate:
 // Cooperatively computes LayerNorm mean & variance, applies modulate (1 + scale) + shift
 // directly into Y in registers with zero intermediate DRAM writes.
