@@ -67,4 +67,31 @@ void launch_modulate_ptx(
     void* stream = nullptr
 );
 
+// Launches parallel PTX kernel for Fused GEMV SwiGLU:
+// Single-token decode (M=1): computes dot products with Gate and Up weight matrices (N x K),
+// warp-shuffle reduction, fast in-register SiLU(gate) * up, and stores directly to Y.
+void launch_fused_gemv_swiglu_ptx(
+    const float* W_gate,
+    const float* W_up,
+    const float* x,
+    float* y,
+    int N,
+    int K,
+    void* stream = nullptr
+);
+
+// Launches parallel PTX kernel for Fused GEMV Residual:
+// Single-token decode (M=1): computes dot product with Down weight matrix (N x K),
+// adds residual directly in registers, and stores to Y.
+void launch_fused_gemv_residual_ptx(
+    const float* W_down,
+    const float* x,
+    const float* res,
+    float* y,
+    int N,
+    int K,
+    void* stream = nullptr
+);
+
 } // namespace brotensor::detail::cuda::jit
+

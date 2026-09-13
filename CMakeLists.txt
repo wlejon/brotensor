@@ -326,6 +326,8 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/filtered_lrelu.cu
         src/cuda/register.cu
         src/cuda/cuda_jit.cpp
+        src/cuda/cuda_jit_gemv.cpp
+        src/cuda/cuda_graph_jit.cpp
     )
     # Static CUDA runtime: keeps the shipped binary self-contained. The tower
     # links into a single executable, so there is exactly one cudart instance —
