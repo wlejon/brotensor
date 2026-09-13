@@ -325,13 +325,24 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/modulated_conv2d.cu
         src/cuda/filtered_lrelu.cu
         src/cuda/register.cu
+        src/cuda/cuda_jit.cpp
     )
     # Static CUDA runtime: keeps the shipped binary self-contained. The tower
     # links into a single executable, so there is exactly one cudart instance —
     # no multi-module context split. On a machine with no NVIDIA driver the
     # lazily-loaded driver stub simply reports no device and init.cpp falls back
     # to CPU, so one build runs everywhere (GPU when present, CPU otherwise).
-    target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart_static)
+    target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart_static CUDA::cuda_driver)
+    target_include_directories(brotensor_cuda PUBLIC /usr/local/cuda-12.6/targets/x86_64-linux/include)
+    if(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")
+        target_include_directories(brotensor_cuda PUBLIC "${BRASS_ROOT}/include")
+        if(EXISTS "${BRASS_ROOT}/build/libbrass.a")
+            target_link_libraries(brotensor_cuda PUBLIC "${BRASS_ROOT}/build/libbrass.a")
+        elseif(EXISTS "${BRASS_ROOT}/build/brass.lib")
+            target_link_libraries(brotensor_cuda PUBLIC "${BRASS_ROOT}/build/brass.lib")
+        endif()
+        target_compile_definitions(brotensor_cuda PUBLIC BROTENSOR_HAS_BRASS_CUDA_JIT=1)
+    endif()
     target_compile_definitions(brotensor_cuda PUBLIC
         BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
     # brotensor_core's init.cpp must know whether to probe + register CUDA, and
