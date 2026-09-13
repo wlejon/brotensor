@@ -32,6 +32,7 @@
 #include "ops/elementwise.h"
 #include "ops/embedding.h"
 #include "ops/flash_attention.h"
+#include "ops/fused.h"
 #include "ops/image.h"
 #include "ops/linear.h"
 #include "ops/loss.h"
