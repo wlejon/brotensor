@@ -26,4 +26,10 @@ void broadcast_mul(const float* X, const float* v, float* Y, int L, int D);
 // Batched LayerNorm forward inference: Y = gamma * (X - mean) / sqrt(var + eps) + beta
 void layernorm_forward_inference_batched(const float* X, const float* gamma, const float* beta, float eps, float* Y, int R, int D);
 
+// Fused Residual RMSNorm: X += res in-place, accumulates sum_sq in same pass, Y = X * gamma * rrms
+void fused_residual_rmsnorm(float* X, const float* res, const float* gamma, float eps, float* Y, int B, int D);
+
+// Fused LayerNorm + AdaLN Modulate: computes LayerNorm directly in registers and applies modulate into Y (0 intermediate writes)
+void fused_layernorm_modulate(const float* X, const float* gamma, const float* beta, const float* scale, const float* shift, float eps, float* Y, int R, int D);
+
 } // namespace brotensor::detail::cpu::jit
