@@ -93,5 +93,31 @@ void launch_fused_gemv_residual_ptx(
     void* stream = nullptr
 );
 
+// Launches parallel PTX kernel for Fused Q8_0 GEMV:
+// Single-token decode (M=1): computes dot product with Q8_0 weight matrix (N x K),
+// dequantizes weights in registers, and multiplies by FP32 activation vector x.
+void launch_fused_gemv_q8_0_ptx(
+    const void* W_q8_0,
+    const float* x,
+    float* y,
+    int N,
+    int K,
+    void* stream = nullptr
+);
+
+// Launches parallel PTX kernel for Fused Q4_K GEMV:
+// Single-token decode (M=1): computes dot product with Q4_K weight matrix (N x K),
+// unpacks 4-bit nibbles, applies affine sub-block scaling/min in registers,
+// and multiplies by FP32 activation vector x.
+void launch_fused_gemv_q4_k_ptx(
+    const void* W_q4_k,
+    const float* x,
+    float* y,
+    int N,
+    int K,
+    void* stream = nullptr
+);
+
 } // namespace brotensor::detail::cuda::jit
+
 
