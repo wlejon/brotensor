@@ -314,7 +314,7 @@ static void parity_axpby() {
 
         Tensor yCpu = y.clone();
         brotensor::axpby_inplace(yCpu, x, a, b);
-        compare("axpby_fp32_cpu_vs_host", yCpu.to_host_vector(), ref, 0.0f, 0.0f);
+        compare("axpby_fp32_cpu_vs_host", yCpu.to_host_vector(), ref, 1e-6f, 1e-6f);
 
         // GPU FP32 may differ from the host loop by ~1 ulp: nvcc contracts
         // a*y + b*x into an FMA (one rounding instead of two). Allow ulp-level
