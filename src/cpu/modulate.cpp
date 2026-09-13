@@ -11,6 +11,7 @@
 // Both ops fully OVERWRITE their output.
 
 #include <brotensor/tensor.h>
+#include "cpu_jit.h"
 
 #include <stdexcept>
 #include <string>
@@ -49,6 +50,11 @@ void modulate(const ::brotensor::Tensor& X, const ::brotensor::Tensor& scale,
     const float* sh = shift.host_f32();
     float* Yp = Y.host_f32_mut();
 
+    if (jit::is_jit_available()) {
+        jit::modulate(Xp, sc, sh, Yp, L, D);
+        return;
+    }
+
     for (int l = 0; l < L; ++l) {
         const int base = l * D;
         for (int d = 0; d < D; ++d) {
@@ -74,6 +80,11 @@ void broadcast_mul(const ::brotensor::Tensor& X, const ::brotensor::Tensor& v,
     const float* Xp = X.host_f32();
     const float* vp = v.host_f32();
     float* Yp = Y.host_f32_mut();
+
+    if (jit::is_jit_available()) {
+        jit::broadcast_mul(Xp, vp, Yp, L, D);
+        return;
+    }
 
     for (int l = 0; l < L; ++l) {
         const int base = l * D;

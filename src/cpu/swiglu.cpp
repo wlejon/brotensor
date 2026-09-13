@@ -12,6 +12,7 @@
 // Backward overwrites dX (the GPU kernel writes both halves directly).
 
 #include <brotensor/tensor.h>
+#include "cpu_jit.h"
 
 #include <cmath>
 #include <stdexcept>
@@ -47,6 +48,11 @@ void swiglu_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y) {
     if (total == 0) return;
     const float* Xp = X.host_f32();
     float* Yp = Y.host_f32_mut();
+
+    if (jit::is_jit_available()) {
+        jit::swiglu_forward(Xp, Yp, B, D);
+        return;
+    }
     const int two_d = 2 * D;
     for (int b = 0; b < B; ++b) {
         for (int d = 0; d < D; ++d) {

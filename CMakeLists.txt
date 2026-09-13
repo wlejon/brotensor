@@ -197,6 +197,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/bias_act.cpp
     src/cpu/upfirdn2d.cpp
     src/cpu/modulated_conv2d.cpp
+    src/cpu/cpu_jit.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core Threads::Threads)
 if(MSVC)
@@ -207,6 +208,28 @@ else()
         $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
 endif()
 target_compile_options(brotensor_cpu PRIVATE ${BROTENSOR_CPU_SIMD_FLAGS})
+
+# --- Brass JIT acceleration (optional, enabled if Brass is found) ---
+if(NOT BRASS_ROOT)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../brass/include/brass/codegen/kernel_jit.hpp")
+        get_filename_component(BRASS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../brass" ABSOLUTE)
+    elseif(EXISTS "/home/j/projects/brass/include/brass/codegen/kernel_jit.hpp")
+        set(BRASS_ROOT "/home/j/projects/brass")
+    endif()
+endif()
+
+if(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")
+    message(STATUS "brotensor: found Brass at ${BRASS_ROOT}")
+    target_include_directories(brotensor_cpu PUBLIC "${BRASS_ROOT}/include")
+    if(EXISTS "${BRASS_ROOT}/build/libbrass.a")
+        target_link_libraries(brotensor_cpu PUBLIC "${BRASS_ROOT}/build/libbrass.a")
+    elseif(EXISTS "${BRASS_ROOT}/build/brass.lib")
+        target_link_libraries(brotensor_cpu PUBLIC "${BRASS_ROOT}/build/brass.lib")
+    endif()
+    target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_BRASS_JIT=1)
+else()
+    message(STATUS "brotensor: Brass not found; Brass CPU JIT disabled")
+endif()
 
 # --- brotensor_cuda: CUDA backend (optional) ---
 

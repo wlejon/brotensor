@@ -18,6 +18,7 @@
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/cpu/thread_pool.h>
+#include "cpu_jit.h"
 
 #include <cmath>
 #include <cstddef>
@@ -42,6 +43,11 @@ void rms_norm_forward(const ::brotensor::Tensor& X,
     const float* Xp = X.host_f32();
     const float* gp = gamma.host_f32();
     float* Yp = Y.host_f32_mut();
+
+    if (jit::is_jit_available()) {
+        jit::rms_norm_forward(Xp, gp, eps, Yp, B, D);
+        return;
+    }
     // Each row b owns Y's row b exclusively (X/gamma are read-only shared
     // inputs), so this parallelizes across b with no cross-thread writes.
     parallel_for(static_cast<std::size_t>(B), [&](std::size_t bi) {
