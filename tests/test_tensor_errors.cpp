@@ -582,12 +582,7 @@ static void test_dispatch_device_mismatch() {
 // ─── 9d. a null CPU vtable slot surfaces as "not implemented on CPU" ───────
 static void test_null_cpu_slot_throws() {
     std::printf("test_null_cpu_slot_throws\n");
-    // The CPU backend deliberately leaves the GGUF-quant / W8A16 slots null.
-    Tensor w_q4k = Tensor::zeros_on(Device::CPU, 1, 256, Dtype::Q4_K);
-    Tensor w_fp16 = Tensor::zeros_on(Device::CPU, 1, 256, Dtype::FP16);
-    CHECK(throws_with([&] { brotensor::dequant_q4k_to_fp16(w_q4k, w_fp16); },
-                      "dequant_q4k_to_fp16: not implemented on CPU"));
-
+    // The CPU backend deliberately leaves the W8A16 slots null.
     Tensor w_i8 = Tensor::zeros_on(Device::CPU, 4, 4, Dtype::INT8);
     Tensor scales = Tensor::zeros_on(Device::CPU, 4, 1, Dtype::FP32);
     Tensor x = Tensor::zeros_on(Device::CPU, 4, 2, Dtype::FP16);
