@@ -200,6 +200,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/modulated_conv2d.cpp
     src/cpu/cpu_jit.cpp
     src/cpu/cpu_jit_fused.cpp
+    src/cpu/cpu_jit_quant.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core Threads::Threads)
 if(MSVC)

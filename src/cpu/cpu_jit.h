@@ -35,4 +35,10 @@ void fused_residual_layernorm(float* X, const float* res, const float* gamma, co
 // Fused LayerNorm + AdaLN Modulate: computes LayerNorm directly in registers and applies modulate into Y (0 intermediate writes)
 void fused_layernorm_modulate(const float* X, const float* gamma, const float* beta, const float* scale, const float* shift, float eps, float* Y, int R, int D);
 
+// Quantized GEMV Q8_0: Y = W_q8_0 @ X
+void gemv_q8_0(const void* W, const float* X, float* Y, int N, int K);
+
+// Quantized GEMV Q4_K: Y = W_q4_k @ X
+void gemv_q4_k(const void* W, const float* X, float* Y, int N, int K);
+
 } // namespace brotensor::detail::cpu::jit
