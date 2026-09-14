@@ -5,8 +5,10 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#if BROTENSOR_HAS_BRASS_CUDA_JIT
 #include <brass/codegen/ml_fusion.hpp>
 #include <brass/target/ptx_target.hpp>
+#endif
 
 #include <iostream>
 #include <string>
@@ -20,6 +22,8 @@ namespace brotensor::detail::cuda::jit {
 bool is_cuda_jit_available() {
     return CudaJitEngine::instance().is_available();
 }
+
+#if BROTENSOR_HAS_BRASS_CUDA_JIT
 
 void launch_fused_residual_rmsnorm_ptx(
     float* X,
@@ -309,5 +313,15 @@ void launch_modulate_ptx(
         throw std::runtime_error("cuLaunchKernel failed for adaln_modulate_kernel");
     }
 }
+
+#else // !BROTENSOR_HAS_BRASS_CUDA_JIT
+
+void launch_fused_residual_rmsnorm_ptx(float*, const float*, const float*, float*, int, int, float, void*) {}
+void launch_fused_residual_layernorm_ptx(float*, const float*, const float*, const float*, float*, int, int, float, void*) {}
+void launch_fused_layernorm_modulate_ptx(const float*, const float*, const float*, const float*, const float*, float*, int, int, float, void*) {}
+void launch_swiglu_ptx(const float*, float*, int, int, void*) {}
+void launch_modulate_ptx(const float*, const float*, const float*, float*, int, int, void*) {}
+
+#endif // BROTENSOR_HAS_BRASS_CUDA_JIT
 
 } // namespace brotensor::detail::cuda::jit

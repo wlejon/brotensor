@@ -1,13 +1,17 @@
 #include "cuda_jit.h"
 #include "cuda_jit_engine.h"
 
+#if BROTENSOR_HAS_BRASS_CUDA_JIT
 #include <brass/codegen/ml_fusion.hpp>
 #include <brass/target/ptx_target.hpp>
+#endif
 
 #include <stdexcept>
 #include <string>
 
 namespace brotensor::detail::cuda::jit {
+
+#if BROTENSOR_HAS_BRASS_CUDA_JIT
 
 void launch_fused_gemv_swiglu_ptx(
     const float* W_gate,
@@ -116,5 +120,12 @@ void launch_fused_gemv_residual_ptx(
         throw std::runtime_error("cuLaunchKernel failed for fused_gemv_residual_kernel");
     }
 }
+
+#else // !BROTENSOR_HAS_BRASS_CUDA_JIT
+
+void launch_fused_gemv_swiglu_ptx(const float*, const float*, const float*, float*, int, int, void*) {}
+void launch_fused_gemv_residual_ptx(const float*, const float*, const float*, float*, int, int, void*) {}
+
+#endif // BROTENSOR_HAS_BRASS_CUDA_JIT
 
 } // namespace brotensor::detail::cuda::jit

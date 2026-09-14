@@ -365,6 +365,10 @@ int main() {
     std::printf("  BRASS AUTOMATIC TRACING JIT TEST SUITE (CPU & CUDA RTX 4090)\n");
     std::printf("================================================================================\n");
 
+#if !BROTENSOR_HAS_BRASS_JIT
+    std::printf("[SKIP] Brass JIT is not enabled in this build; skipping trace JIT tests.\n");
+    return 0;
+#else
     // Run CPU test suite
     std::printf("\n============================= [ CPU TEST SUITE ] =============================\n");
     test_elementwise_expression(Device::cpu());
@@ -392,4 +396,5 @@ int main() {
     std::printf("================================================================================\n");
 
     return g_failures == 0 ? 0 : 1;
+#endif
 }

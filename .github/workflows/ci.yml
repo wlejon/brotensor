@@ -58,6 +58,25 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
 
+      - name: Checkout brass
+        if: runner.os != 'macOS'
+        uses: actions/checkout@v7
+        with:
+          repository: wlejon/brass
+          path: brass
+
+      - name: Build brass
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          EXTRA_BRASS=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXTRA_BRASS='-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>'
+          fi
+          cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release $EXTRA_BRASS
+          cmake --build brass/build --config Release --target brass --parallel 4
+          echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
+
       # Windows keeps the Visual Studio generator: MSBuild's /m is already
       # bounded, and the CPU tier is only 35 test targets there.
       - name: Configure
@@ -160,6 +179,19 @@ jobs:
         with:
           key: cuda-ubuntu-24.04
           max-size: 500M
+
+      - name: Checkout brass
+        uses: actions/checkout@v7
+        with:
+          repository: wlejon/brass
+          path: brass
+
+      - name: Build brass
+        shell: bash
+        run: |
+          cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release
+          cmake --build brass/build --config Release --target brass --parallel 4
+          echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
 
       - name: Configure
         run: |

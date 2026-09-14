@@ -2,7 +2,9 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#if BROTENSOR_HAS_BRASS_CUDA_JIT
 #include <brass/target/ptx_target.hpp>
+#endif
 
 #include <mutex>
 #include <string>
@@ -143,6 +145,7 @@ inline CUstream resolve_stream(void* stream) {
     return reinterpret_cast<CUstream>(::brotensor::cuda_current_stream());
 }
 
+#if BROTENSOR_HAS_BRASS_CUDA_JIT
 inline brass::target::PtxOptions make_ptx_opts() {
     brass::target::PtxOptions opts;
     opts.sm_arch = "sm_89";
@@ -150,5 +153,6 @@ inline brass::target::PtxOptions make_ptx_opts() {
     opts.ptx_version_minor = 8;
     return opts;
 }
+#endif
 
 } // namespace brotensor::detail::cuda::jit

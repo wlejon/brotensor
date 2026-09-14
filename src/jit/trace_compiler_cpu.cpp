@@ -4,12 +4,14 @@
 #include "../cpu/cpu_jit.h"
 #include <brotensor/detail/cpu/thread_pool.h>
 
+#if BROTENSOR_HAS_BRASS_JIT
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/codegen/trace_builder.hpp>
 #include <brass/mir/builder.hpp>
 #include <brass/mir/module.hpp>
 #include <brass/mir/function.hpp>
 #include <brass/mir/types.hpp>
+#endif
 
 #include <cmath>
 #include <string>
@@ -126,6 +128,8 @@ TraceHandle end_trace() {
 }
 
 namespace cpu {
+
+#if BROTENSOR_HAS_BRASS_JIT
 
 using ElementwiseFn = void (*)(float* const* out_ptrs, const float* const* in_ptrs, int64_t n);
 
@@ -555,6 +559,14 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
 
     return compile_cpu_elementwise(dag);
 }
+
+#else // !BROTENSOR_HAS_BRASS_JIT
+
+std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& /*dag*/, FusionPattern /*pattern*/) {
+    throw std::runtime_error("brotensor::jit: Brass CPU JIT compiler is not enabled in this build");
+}
+
+#endif // BROTENSOR_HAS_BRASS_JIT
 
 } // namespace cpu
 } // namespace brotensor::jit

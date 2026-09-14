@@ -468,8 +468,8 @@ int main() {
     std::cout << "========================================================================================\n";
 
     if (!brotensor::detail::cpu::jit::is_jit_available()) {
-        std::cerr << "ERROR: Brass JIT is not available on this CPU platform!\n";
-        return 1;
+        std::cout << "[SKIP] Brass JIT is not available on this CPU platform.\n";
+        return 0;
     }
     std::cout << " Brass JIT Engine: ACTIVE (AVX2 + FMA + Polyhedral/Chunk Parallel Multi-threading)\n";
     std::cout << " Thread Pool Workers: " << brotensor::detail::cpu::ThreadPool::instance().num_threads() << " threads\n";

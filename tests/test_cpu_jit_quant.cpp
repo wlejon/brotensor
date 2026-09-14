@@ -497,6 +497,10 @@ int main() {
     std::cout << "  Threads: " << brotensor::detail::cpu::ThreadPool::instance().num_threads() << "\n";
     std::cout << "================================================================================\n";
 
+#if !BROTENSOR_HAS_BRASS_JIT
+    std::cout << "[SKIP] Brass JIT is not enabled in this build.\n";
+    return 0;
+#else
     test_q8_0_cpu();
     test_q4_k_cpu();
     test_dequant_cpu();
@@ -510,4 +514,5 @@ int main() {
     std::cout << "================================================================================\n";
 
     return g_failures == 0 ? 0 : 1;
+#endif
 }
