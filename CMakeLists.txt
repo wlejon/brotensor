@@ -201,6 +201,10 @@ add_library(brotensor_cpu STATIC
     src/cpu/cpu_jit.cpp
     src/cpu/cpu_jit_fused.cpp
     src/cpu/cpu_jit_quant.cpp
+    src/jit/trace_dag.cpp
+    src/jit/trace_cache.cpp
+    src/jit/trace_compiler_cpu.cpp
+    src/jit/trace_ops.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core Threads::Threads)
 if(MSVC)
@@ -331,6 +335,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/cuda_jit_gemv.cpp
         src/cuda/cuda_graph_jit.cpp
         src/cuda/cuda_jit_quant.cpp
+        src/jit/trace_compiler_cuda.cpp
     )
     # Static CUDA runtime: keeps the shipped binary self-contained. The tower
     # links into a single executable, so there is exactly one cudart instance —

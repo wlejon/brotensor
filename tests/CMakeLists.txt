@@ -28,6 +28,7 @@ function(brotensor_add_test name)
 endfunction()
 
 # --- CPU tests (always built) ---
+brotensor_add_test(brotensor_test_jit_trace test_jit_trace.cpp)
 brotensor_add_test(brotensor_test_cpu_jit test_cpu_jit.cpp)
 brotensor_add_test(brotensor_test_cpu_jit_quant test_cpu_jit_quant.cpp)
 brotensor_add_test(brotensor_test_cpu_ops test_cpu_ops.cpp)
