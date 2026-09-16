@@ -21,6 +21,20 @@ else()
         brotensor
         bronze::runtime_shared
     )
+    # The tool runs at build time and links bronze's shared runtime, which is
+    # built into BRONZE_SHARED_RUNTIME_DIR rather than beside this exe. The PE
+    # loader only looks beside the .exe, so without this the custom command
+    # dies with 0xc0000135 (and a modal "dll was not found" box).
+    if(WIN32)
+        add_custom_command(TARGET brotensor-native-manifest POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:bronze_runtime_shared>
+                $<TARGET_FILE_DIR:brotensor-native-manifest>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_LINKER_FILE:bronze_runtime_shared>
+                $<TARGET_FILE_DIR:brotensor-native-manifest>
+        )
+    endif()
 
     set(TENSOR_NATIVE_MANIFEST "${GEN_DIR}/tensor_natives.json")
     add_custom_command(
