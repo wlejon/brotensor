@@ -21,6 +21,15 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+# Static CRT for a top-level build. This has to be chosen BEFORE bronze (and
+# through it brass) is add_subdirectory()'d below: CMAKE_MSVC_RUNTIME_LIBRARY
+# is read per target at definition time, so anything added earlier gets the
+# /MD default and the api executables (which link brotensor /MT + brass +
+# bronze_runtime_shared) fail with LNK2038 RuntimeLibrary mismatches.
+if(MSVC AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # bronze AOT JavaScript compiler & runtime (standalone ../bronze or third_party/bronze submodule)
 if(NOT TARGET bronze_runtime_shared)
     set(BRONZE_BUILD_SHARED_RUNTIME ON CACHE BOOL "" FORCE)
@@ -48,9 +57,6 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:/permissive->
         $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
     )
-    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    endif()
 endif()
 
 # --- Coverage instrumentation (gcov / llvm-cov) ---
@@ -260,8 +266,13 @@ endif()
 
 if(TARGET brass)
     message(STATUS "brotensor: found Brass target")
-    set(BROTENSOR_BRASS_LIB brass)
-    target_link_libraries(brotensor_cpu PRIVATE brass)
+    # BUILD_INTERFACE-only: brass is a sibling add_subdirectory target that is
+    # not part of brotensor's export set, and install(EXPORT) refuses any
+    # target whose (LINK_ONLY) interface names one it cannot export. The
+    # installed package therefore does not carry the brass link; a consumer of
+    # the install tree links brass itself.
+    set(BROTENSOR_BRASS_LIB "$<BUILD_INTERFACE:brass>")
+    target_link_libraries(brotensor_cpu PRIVATE ${BROTENSOR_BRASS_LIB})
     target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_BRASS_JIT=1)
     set(BROTENSOR_HAS_BRASS_JIT 1)
 elseif(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")
