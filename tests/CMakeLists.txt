@@ -33,6 +33,11 @@ if(BROTENSOR_HAS_BRASS_JIT)
     brotensor_add_test(brotensor_test_cpu_jit test_cpu_jit.cpp)
     brotensor_add_test(brotensor_test_cpu_jit_quant test_cpu_jit_quant.cpp)
 endif()
+# --- Bronze API test ---
+add_executable(brotensor_test_api test_api.cpp)
+target_link_libraries(brotensor_test_api PRIVATE brotensor_api bronze::runtime_shared)
+add_test(NAME brotensor_test_api COMMAND brotensor_test_api)
+
 brotensor_add_test(brotensor_test_cpu_ops test_cpu_ops.cpp)
 brotensor_add_test(brotensor_test_dispatch test_dispatch.cpp)
 brotensor_add_test(brotensor_test_thread_pool test_thread_pool.cpp)

@@ -21,6 +21,27 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+# bronze AOT JavaScript compiler & runtime (standalone ../bronze or third_party/bronze submodule)
+if(NOT TARGET bronze_runtime_shared)
+    set(BRONZE_BUILD_SHARED_RUNTIME ON CACHE BOOL "" FORCE)
+    set(BRONZE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BRONZE_WITH_LLVM ON CACHE BOOL "Build bronze's LLVM codegen backend")
+    if(DEFINED BRONZE_DIR AND EXISTS "${BRONZE_DIR}/CMakeLists.txt")
+        # Explicit BRONZE_DIR supplied
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
+        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze AOT compiler source tree")
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bronze/CMakeLists.txt")
+        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bronze" CACHE PATH "bronze AOT compiler source tree")
+    endif()
+
+    if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "bronze not found. Either provide ../bronze, third_party/bronze, or pass -DBRONZE_DIR=<path>.")
+    endif()
+
+    add_subdirectory("${BRONZE_DIR}" "${CMAKE_BINARY_DIR}/bronze-build" EXCLUDE_FROM_ALL)
+endif()
+
 if(MSVC)
     add_compile_options(
         $<$<COMPILE_LANGUAGE:CXX>:/MP>
@@ -240,7 +261,7 @@ endif()
 if(TARGET brass)
     message(STATUS "brotensor: found Brass target")
     set(BROTENSOR_BRASS_LIB brass)
-    target_link_libraries(brotensor_cpu PUBLIC brass)
+    target_link_libraries(brotensor_cpu PRIVATE brass)
     target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_BRASS_JIT=1)
     set(BROTENSOR_HAS_BRASS_JIT 1)
 elseif(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")
@@ -617,6 +638,8 @@ target_link_libraries(brotensor INTERFACE
     "$<$<BOOL:${BROTENSOR_WITH_CUDA}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_cuda>>"
     "$<$<BOOL:${BROTENSOR_WITH_METAL}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_metal>>"
 )
+
+add_subdirectory(src/api)
 
 # --- Install / export ---
 option(BROTENSOR_INSTALL "Generate install targets for brotensor" ${PROJECT_IS_TOP_LEVEL})

@@ -1,0 +1,4 @@
+# Host globals read by tensor.js
+__bro_native
+bro
+globalThis
