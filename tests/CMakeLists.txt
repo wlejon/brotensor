@@ -37,10 +37,11 @@ endif()
 #
 # Boots a bronze realm, installs the api exactly as bro's host does, and
 # checks `bro.tensor` from JavaScript. The JavaScript half is js/tensor.js
-# compiled by the bronze CLI, and bronze emits x86_64 only, so on Apple
-# Silicon the api carries a no-op entry instead (src/api/CMakeLists.txt) and
-# there is nothing for this test to see: it is not registered there rather
-# than registered to fail. Everything else in this directory still runs.
+# compiled by the bronze CLI, which needs a brass code generator for the
+# target (BRASS_HOST_BACKEND; Apple Silicon has none yet), so there the api
+# carries a no-op entry instead (src/api/CMakeLists.txt) and there is nothing
+# for this test to see: it is not registered there rather than registered to
+# fail. Everything else in this directory still runs.
 if(NOT BROTENSOR_API_COMPILED_JS)
     message(STATUS "brotensor: brotensor_test_api not registered (no compiled JS on this target)")
 endif()

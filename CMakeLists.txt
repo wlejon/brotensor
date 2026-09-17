@@ -275,7 +275,13 @@ if(NOT TARGET brass)
     endif()
 endif()
 
-if(TARGET brass)
+# A brass with no code generator for this target (BRASS_HOST_BACKEND OFF —
+# Apple Silicon today) is no JIT: brotensor_cpu would compile every trace it
+# is handed into bytes the CPU cannot execute, and the first op through it
+# is SIGBUS. Such a build takes the plain kernels, as if brass were absent.
+if(TARGET brass AND NOT BRASS_HOST_BACKEND)
+    message(STATUS "brotensor: brass has no code generator for this target; CPU JIT off")
+elseif(TARGET brass)
     message(STATUS "brotensor: found Brass target")
     # BUILD_INTERFACE-only: brass is a sibling add_subdirectory target that is
     # not part of brotensor's export set, and install(EXPORT) refuses any
