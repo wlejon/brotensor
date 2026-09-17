@@ -11,6 +11,24 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Checkout layout, every job below:
+#
+#   $GITHUB_WORKSPACE/
+#     brotensor/   <- this repo
+#     bronze/      <- sibling: the JavaScript runtime brotensor_api binds and
+#                     the compiler that builds src/api/js/tensor.js
+#     brass/       <- sibling: bronze's code generator (and the kernel JIT)
+#
+# which is the layout of a bro development tree (D:/projects/<name>), so the
+# CMake here resolves ../bronze exactly as it does on a developer's machine,
+# and bronze resolves ../brass the same way and add_subdirectory()s it. Both
+# are laid out by bronze's checkout-toolchain action and compiled inside this
+# build tree, with this job's compiler, generator and CRT — the api is bound
+# across bronze's C++ embed boundary, which a prebuilt bronze from elsewhere
+# could not honour. That also makes brotensor_test_api the check that this
+# library works the way bro uses it: a bronze realm, installTensor(), and
+# `bro.tensor` driven from JavaScript.
+#
 # Build-tool notes that apply to every job below:
 #
 #   * Ninja, not Make. CMake's default generator on Linux/macOS is Unix
@@ -24,7 +42,8 @@ concurrency:
 #
 #   * ccache on the two expensive jobs (Metal: ~80 Objective-C++ TUs; CUDA: ~90
 #     .cu TUs). Cold runs are unaffected; a push that doesn't touch a backend
-#     gets those TUs back for free.
+#     gets those TUs back for free. bronze and brass are built in-tree in
+#     every job, so they are cached by the same launcher.
 jobs:
   # ── CPU tier ──────────────────────────────────────────────────────────────
   #
@@ -35,7 +54,10 @@ jobs:
   # break never surfaces.
   #
   # macOS here is deliberately *without* Metal — it is the arm64 / AppleClang
-  # build check for the portable core (the SIMD baseline is x86-gated).
+  # build check for the portable core (the SIMD baseline is x86-gated). bronze
+  # emits x86_64 only, so on that runner the api is built with its no-op JS
+  # entry and brotensor_test_api is not registered (tests/CMakeLists.txt); the
+  # three x86-64 jobs are where the api runs.
   cpu:
     name: CPU · ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -49,6 +71,10 @@ jobs:
           - { name: macos-arm64,  os: macos-14 }
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: brotensor
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
@@ -58,25 +84,6 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
 
-      - name: Checkout brass
-        if: runner.os != 'macOS'
-        uses: actions/checkout@v7
-        with:
-          repository: wlejon/brass
-          path: brass
-
-      - name: Build brass
-        if: runner.os != 'macOS'
-        shell: bash
-        run: |
-          EXTRA_BRASS=""
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            EXTRA_BRASS='-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>'
-          fi
-          cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release $EXTRA_BRASS
-          cmake --build brass/build --config Release --target brass --parallel 4
-          echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
-
       # Windows keeps the Visual Studio generator: MSBuild's /m is already
       # bounded, and the CPU tier is only 35 test targets there.
       - name: Configure
@@ -85,9 +92,9 @@ jobs:
           CXX: ${{ matrix.cxx }}
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            cmake -S brotensor -B build -DCMAKE_BUILD_TYPE=Release
           else
-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+            cmake -S brotensor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           fi
         shell: bash
 
@@ -124,6 +131,10 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: brotensor
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install Ninja
         run: brew install ninja
@@ -136,7 +147,7 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -S . -B build -G Ninja \
+          cmake -S brotensor -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBROTENSOR_WITH_METAL=ON \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -162,6 +173,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: brotensor
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
@@ -180,22 +195,9 @@ jobs:
           key: cuda-ubuntu-24.04
           max-size: 500M
 
-      - name: Checkout brass
-        uses: actions/checkout@v7
-        with:
-          repository: wlejon/brass
-          path: brass
-
-      - name: Build brass
-        shell: bash
-        run: |
-          cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release
-          cmake --build brass/build --config Release --target brass --parallel 4
-          echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
-
       - name: Configure
         run: |
-          cmake -S . -B build -G Ninja \
+          cmake -S brotensor -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBROTENSOR_WITH_CUDA=ON \
             -DCMAKE_CUDA_ARCHITECTURES=89 \
@@ -229,7 +231,9 @@ jobs:
   # plus the FP32 CPU reference backend. BROTENSOR_COVERAGE scopes --coverage to
   # COMPILE_LANGUAGE:CXX, so src/metal's Objective-C++ TUs are not instrumented;
   # they are excluded from the report rather than counted as 0%, which would
-  # make the headline number meaningless.
+  # make the headline number meaningless. bronze and brass are compiled in
+  # this tree but added before the --coverage flags, so they are not
+  # instrumented; the filters keep them out of the report either way.
   #
   # No ccache: it interacts badly with --coverage (the .gcno sidecars are
   # compile-time artifacts, and a cache hit skips emitting them).
@@ -242,13 +246,17 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: brotensor
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install gcovr + Ninja
         run: brew install gcovr ninja
 
       - name: Configure (instrumented)
         run: |
-          cmake -S . -B build -G Ninja \
+          cmake -S brotensor -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DBROTENSOR_COVERAGE=ON \
             -DBROTENSOR_WITH_METAL=ON
@@ -263,6 +271,9 @@ jobs:
       # tee's exit status, so a gcovr crash produces no report and the job still
       # goes green — a coverage step that silently reports nothing is worse than
       # no coverage step at all.
+      #
+      # --root is the workspace, where build/ is, so gcovr finds the .gcda
+      # files; the filters then scope the report to this repo's own tree.
       #
       # --gcov-executable: AppleClang emits gcov-format .gcno/.gcda, but the
       # `gcov` on PATH is a shim that cannot read them. `llvm-cov gcov` is the
@@ -279,9 +290,9 @@ jobs:
           mkdir -p coverage-html
           gcovr --root . \
             --gcov-executable 'xcrun llvm-cov gcov' \
-            --filter 'src/' --filter 'include/brotensor/' \
-            --exclude 'src/cuda/' --exclude 'src/metal/' \
-            --exclude 'tests/' \
+            --filter 'brotensor/src/' --filter 'brotensor/include/brotensor/' \
+            --exclude 'brotensor/src/cuda/' --exclude 'brotensor/src/metal/' \
+            --exclude 'brotensor/tests/' \
             --exclude-unreachable-branches \
             --gcov-ignore-parse-errors negative_hits.warn_once_per_file \
             --print-summary \
@@ -304,7 +315,8 @@ jobs:
             echo
             echo 'Scope: `src/` + `include/brotensor/`. The CUDA and Metal backends are'
             echo 'compiled by nvcc / the Apple toolchain, are not gcov-instrumented, and'
-            echo 'are excluded rather than counted as 0%.'
+            echo 'are excluded rather than counted as 0%. bronze and brass, built'
+            echo 'in-tree, are not instrumented and are filtered out.'
             echo
             echo '```'
             cat coverage-summary.txt
@@ -342,6 +354,8 @@ jobs:
   # The docs come along because a coverage report with no docs around it is a
   # dead end, and because op-coverage.md is the table the sibling projects
   # actually want to link into.
+  #
+  # Nothing is compiled here, so this is the one job with a root checkout.
   pages:
     name: Publish docs + coverage
     needs: coverage

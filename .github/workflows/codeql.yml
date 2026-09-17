@@ -40,8 +40,17 @@ jobs:
       contents: read
       actions: read
 
+    # Same checkout layout as ci.yml: this repo under brotensor/, with bronze
+    # and brass beside it, because the api (src/api) does not configure
+    # without them. They are compiled in the same tree and CodeQL traces
+    # them along with everything else; source-root keeps their files out of
+    # the database, so the findings are this repo's own and not bronze's.
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: brotensor
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
@@ -51,6 +60,7 @@ jobs:
         with:
           languages: c-cpp
           build-mode: manual
+          source-root: brotensor
           # security-extended over the default suite: the parser surface above
           # justifies the extra query set. Not security-and-quality — the
           # quality queries are style-grade and would bury the security ones.
@@ -61,7 +71,7 @@ jobs:
       # than at an inlined blur.
       - name: Build (CPU backend)
         run: |
-          cmake -S . -B build -G Ninja \
+          cmake -S brotensor -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DBROTENSOR_TESTS=OFF
           cmake --build build --parallel 4

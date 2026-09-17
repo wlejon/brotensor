@@ -30,22 +30,33 @@ if(MSVC AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# bronze AOT JavaScript compiler & runtime (standalone ../bronze or third_party/bronze submodule)
+# bronze, the JavaScript runtime brotensor_api binds and the compiler that
+# builds src/api/js/tensor.js. A checkout beside this one (../bronze), the
+# layout of a bro development tree and of CI (bronze's
+# .github/actions/checkout-toolchain lays bronze and brass out that way), or
+# an explicit -DBRONZE_DIR. There is no vendored fallback: the api is bound
+# across bronze's C++ embed boundary, so it has to build against the bronze
+# the surrounding tree builds against, never a pinned copy of its own.
+#
+# bronze resolves brass, its code generator, by itself (BRASS_ROOT, then
+# <bronze>/../brass) and add_subdirectory()s it, which is where the `brass`
+# target the kernel JIT block below picks up comes from.
+#
+# Under bro, bro's third_party/CMakeLists.txt has already added bronze and
+# this block is skipped.
 if(NOT TARGET bronze_runtime_shared)
     set(BRONZE_BUILD_SHARED_RUNTIME ON CACHE BOOL "" FORCE)
     set(BRONZE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(BRONZE_WITH_LLVM ON CACHE BOOL "Build bronze's LLVM codegen backend")
     if(DEFINED BRONZE_DIR AND EXISTS "${BRONZE_DIR}/CMakeLists.txt")
         # Explicit BRONZE_DIR supplied
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
-        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze AOT compiler source tree")
-    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bronze/CMakeLists.txt")
-        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bronze" CACHE PATH "bronze AOT compiler source tree")
+        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
     endif()
 
     if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")
         message(FATAL_ERROR
-            "bronze not found. Either provide ../bronze, third_party/bronze, or pass -DBRONZE_DIR=<path>.")
+            "bronze not found: check it out beside this repository (../bronze, with ../brass beside it) "
+            "or pass -DBRONZE_DIR=<path>.")
     endif()
 
     add_subdirectory("${BRONZE_DIR}" "${CMAKE_BINARY_DIR}/bronze-build" EXCLUDE_FROM_ALL)

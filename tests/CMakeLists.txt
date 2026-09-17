@@ -34,6 +34,17 @@ if(BROTENSOR_HAS_BRASS_JIT)
     brotensor_add_test(brotensor_test_cpu_jit_quant test_cpu_jit_quant.cpp)
 endif()
 # --- Bronze API test ---
+#
+# Boots a bronze realm, installs the api exactly as bro's host does, and
+# checks `bro.tensor` from JavaScript. The JavaScript half is js/tensor.js
+# compiled by the bronze CLI, and bronze emits x86_64 only, so on Apple
+# Silicon the api carries a no-op entry instead (src/api/CMakeLists.txt) and
+# there is nothing for this test to see: it is not registered there rather
+# than registered to fail. Everything else in this directory still runs.
+if(NOT BROTENSOR_API_COMPILED_JS)
+    message(STATUS "brotensor: brotensor_test_api not registered (no compiled JS on this target)")
+endif()
+if(BROTENSOR_API_COMPILED_JS)
 add_executable(brotensor_test_api test_api.cpp)
 # brass FIRST, and /INCLUDE a symbol only brass's GC object defines: both
 # brass.lib and bronze_runtime_shared.dll define brass_gc_write_barrier, and
@@ -65,6 +76,7 @@ if(WIN32)
     set_tests_properties(brotensor_test_api PROPERTIES
         ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brotensor_test_api>;$ENV{PATH}")
 endif()
+endif() # BROTENSOR_API_COMPILED_JS
 
 brotensor_add_test(brotensor_test_cpu_ops test_cpu_ops.cpp)
 brotensor_add_test(brotensor_test_dispatch test_dispatch.cpp)

@@ -1,6 +1,13 @@
+# bronze's code generator emits x86_64 only, so on Apple Silicon js/tensor.js
+# is not compiled and a no-op entry stands in: the natives still register,
+# but nothing mounts `bro.tensor`. BROTENSOR_API_COMPILED_JS tells the tests
+# which of the two they are looking at.
 if(APPLE AND (CMAKE_OSX_ARCHITECTURES MATCHES "arm64" OR (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")))
     set(BROTENSOR_COMPILED_JS_OBJECTS "${CMAKE_CURRENT_SOURCE_DIR}/bronze_js_stubs_arm64.cpp")
+    set(BROTENSOR_API_COMPILED_JS OFF PARENT_SCOPE)
+    message(STATUS "brotensor: api built with the arm64 no-op JS entry (bronze emits x86_64 only)")
 else()
+    set(BROTENSOR_API_COMPILED_JS ON PARENT_SCOPE)
     set(GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
     file(MAKE_DIRECTORY "${GEN_DIR}")
 
