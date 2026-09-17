@@ -214,15 +214,18 @@ void launch_swiglu_ptx(
 ) {
     if (B <= 0 || D <= 0) return;
 
+    // X is one packed gate|up projection, [B, 2D] — the layout swiglu_forward
+    // is defined on — so this is brass's packed kernel, not
+    // fused_swiglu_kernel(gate, up, out, n), which wants two flat buffers.
     static const std::string ptx = []() {
         brass::codegen::MlFusionCompiler comp;
-        return comp.emit_ptx_swiglu(make_ptx_opts());
+        return comp.emit_ptx_swiglu_packed(make_ptx_opts());
     }();
 
     CUfunction fn = CudaJitEngine::instance().get_function(
-        "swiglu",
+        "swiglu_packed",
         ptx,
-        "swiglu_kernel"
+        "fused_swiglu_packed_kernel"
     );
 
     CUdeviceptr d_x = reinterpret_cast<CUdeviceptr>(X);
@@ -253,7 +256,7 @@ void launch_swiglu_ptx(
     );
 
     if (status != CUDA_SUCCESS) {
-        throw std::runtime_error("cuLaunchKernel failed for swiglu_kernel");
+        throw std::runtime_error("cuLaunchKernel failed for fused_swiglu_packed_kernel");
     }
 }
 
@@ -276,7 +279,7 @@ void launch_modulate_ptx(
     CUfunction fn = CudaJitEngine::instance().get_function(
         "adaln_modulate",
         ptx,
-        "adaln_modulate_kernel"
+        "fused_adaln_modulate_kernel"
     );
 
     CUdeviceptr d_x = reinterpret_cast<CUdeviceptr>(X);
@@ -310,7 +313,7 @@ void launch_modulate_ptx(
     );
 
     if (status != CUDA_SUCCESS) {
-        throw std::runtime_error("cuLaunchKernel failed for adaln_modulate_kernel");
+        throw std::runtime_error("cuLaunchKernel failed for fused_adaln_modulate_kernel");
     }
 }
 

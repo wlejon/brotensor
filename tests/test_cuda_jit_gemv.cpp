@@ -284,8 +284,16 @@ int main() {
               << ", Global Mem: " << std::fixed << std::setprecision(1) << (prop.totalGlobalMem / 1e9) << " GB)\n";
     std::cout << "================================================================================\n";
 
-    bench_fused_gemv_swiglu();
-    bench_fused_gemv_residual();
+    // A kernel the JIT cannot find or launch (a brass launch contract that
+    // moved under this file) throws; caught, it is a failure that names the
+    // kernel instead of a fast-fail exit with the buffered output lost.
+    try {
+        bench_fused_gemv_swiglu();
+        bench_fused_gemv_residual();
+    } catch (const std::exception& e) {
+        std::cout << "  [FAIL] " << e.what() << "\n";
+        ++g_failures;
+    }
 
     std::cout << "================================================================================\n";
     if (g_failures == 0) {

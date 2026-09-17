@@ -389,6 +389,12 @@ int main() {
     const std::vector<int> batches = {1, 8, 32, 64};
     const std::vector<int> dims = {4096, 1152};
 
+    // The JIT throws on a kernel it cannot find or launch — a brass launch
+    // contract that moved under this file. Uncaught, that is a fast-fail exit
+    // with the buffered output lost (0xC0000409 on Windows and not a word of
+    // why); caught, it is a failure that names the kernel.
+    try {
+
     // 1. Fused Residual RMSNorm
     std::printf("─── 1. Fused Residual RMSNorm (In-Place Residual + Warp Reduction) ──────────\n");
     for (int D : dims) {
@@ -424,6 +430,11 @@ int main() {
         }
     }
     std::printf("\n");
+
+    } catch (const std::exception& e) {
+        std::printf("  [FAIL] %s\n", e.what());
+        ++g_failures;
+    }
 
     std::printf("================================================================================\n");
     if (g_failures == 0) {
