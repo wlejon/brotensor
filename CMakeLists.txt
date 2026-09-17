@@ -261,8 +261,6 @@ if(NOT TARGET brass)
             set(BRASS_ROOT "$ENV{BRASS_ROOT}")
         elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../brass/include/brass/codegen/kernel_jit.hpp")
             get_filename_component(BRASS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../brass" ABSOLUTE)
-        elseif(EXISTS "/home/j/projects/brass/include/brass/codegen/kernel_jit.hpp")
-            set(BRASS_ROOT "/home/j/projects/brass")
         endif()
     endif()
 
