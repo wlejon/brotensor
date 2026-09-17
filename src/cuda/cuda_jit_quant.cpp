@@ -49,7 +49,7 @@ void launch_fused_gemv_q8_0_ptx(
     };
 
     CUstream custream = resolve_stream(stream);
-    CUresult status = cuLaunchKernel(
+    CUresult status = drv::cuLaunchKernel(
         fn,
         static_cast<unsigned int>(N), 1, 1,
         256, 1, 1,
@@ -100,7 +100,7 @@ void launch_fused_gemv_q4_k_ptx(
     };
 
     CUstream custream = resolve_stream(stream);
-    CUresult status = cuLaunchKernel(
+    CUresult status = drv::cuLaunchKernel(
         fn,
         static_cast<unsigned int>(N), 1, 1,
         256, 1, 1,

@@ -67,7 +67,7 @@ void launch_fused_residual_rmsnorm_ptx(
     };
 
     CUstream custream = resolve_stream(stream);
-    CUresult status = cuLaunchKernel(
+    CUresult status = drv::cuLaunchKernel(
         fn,
         static_cast<unsigned int>(B), 1, 1,
         256, 1, 1,
@@ -127,7 +127,7 @@ void launch_fused_residual_layernorm_ptx(
     };
 
     CUstream custream = resolve_stream(stream);
-    CUresult status = cuLaunchKernel(
+    CUresult status = drv::cuLaunchKernel(
         fn,
         static_cast<unsigned int>(B), 1, 1,
         256, 1, 1,
@@ -190,7 +190,7 @@ void launch_fused_layernorm_modulate_ptx(
     };
 
     CUstream custream = resolve_stream(stream);
-    CUresult status = cuLaunchKernel(
+    CUresult status = drv::cuLaunchKernel(
         fn,
         static_cast<unsigned int>(R), 1, 1,
         256, 1, 1,
@@ -242,7 +242,7 @@ void launch_swiglu_ptx(
     if (grid_x == 0) grid_x = 1;
 
     CUstream custream = resolve_stream(stream);
-    CUresult status = cuLaunchKernel(
+    CUresult status = drv::cuLaunchKernel(
         fn,
         grid_x, 1, 1,
         256, 1, 1,
@@ -299,7 +299,7 @@ void launch_modulate_ptx(
     if (grid_x == 0) grid_x = 1;
 
     CUstream custream = resolve_stream(stream);
-    CUresult status = cuLaunchKernel(
+    CUresult status = drv::cuLaunchKernel(
         fn,
         grid_x, 1, 1,
         256, 1, 1,

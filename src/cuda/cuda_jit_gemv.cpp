@@ -52,7 +52,7 @@ void launch_fused_gemv_swiglu_ptx(
     };
 
     CUstream custream = resolve_stream(stream);
-    CUresult status = cuLaunchKernel(
+    CUresult status = drv::cuLaunchKernel(
         fn,
         static_cast<unsigned int>(N), 1, 1,
         256, 1, 1,
@@ -106,7 +106,7 @@ void launch_fused_gemv_residual_ptx(
     };
 
     CUstream custream = resolve_stream(stream);
-    CUresult status = cuLaunchKernel(
+    CUresult status = drv::cuLaunchKernel(
         fn,
         static_cast<unsigned int>(N), 1, 1,
         256, 1, 1,

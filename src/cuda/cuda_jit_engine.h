@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda_driver.h"
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #if BROTENSOR_HAS_BRASS_CUDA_JIT
@@ -44,9 +46,9 @@ public:
 
         // Ensure active context
         CUcontext current_ctx = nullptr;
-        cuCtxGetCurrent(&current_ctx);
+        drv::cuCtxGetCurrent(&current_ctx);
         if (!current_ctx) {
-            cuCtxSetCurrent(context_);
+            drv::cuCtxSetCurrent(context_);
         }
 
         // Setup JIT options with maximum optimization level 4
@@ -71,7 +73,7 @@ public:
         };
 
         CUmodule module = nullptr;
-        CUresult res = cuModuleLoadDataEx(&module, ptx.c_str(), 5, options, option_values);
+        CUresult res = drv::cuModuleLoadDataEx(&module, ptx.c_str(), 5, options, option_values);
         if (res != CUDA_SUCCESS) {
             std::string err_msg = "CUDA JIT compilation failed for " + entry_name + ": " + error_log.data();
             throw std::runtime_error(err_msg);
@@ -79,7 +81,7 @@ public:
         modules_.push_back(module);
 
         CUfunction fn = nullptr;
-        res = cuModuleGetFunction(&fn, module, entry_name.c_str());
+        res = drv::cuModuleGetFunction(&fn, module, entry_name.c_str());
         if (res != CUDA_SUCCESS) {
             throw std::runtime_error("Failed to find kernel entry point '" + entry_name + "' in compiled PTX module");
         }
@@ -95,7 +97,7 @@ private:
         std::lock_guard<std::mutex> lock(mu_);
         for (auto mod : modules_) {
             if (mod) {
-                cuModuleUnload(mod);
+                drv::cuModuleUnload(mod);
             }
         }
         modules_.clear();
@@ -106,25 +108,27 @@ private:
         if (initialized_) return;
         initialized_ = true;
 
-        CUresult res = cuInit(0);
+        // Without a driver on the machine every drv:: call answers
+        // CUDA_ERROR_NOT_INITIALIZED, so this is also the "no GPU" exit.
+        CUresult res = drv::cuInit(0);
         if (res != CUDA_SUCCESS) {
             available_ = false;
             return;
         }
 
         int dev_count = 0;
-        res = cuDeviceGetCount(&dev_count);
+        res = drv::cuDeviceGetCount(&dev_count);
         if (res != CUDA_SUCCESS || dev_count <= 0) {
             available_ = false;
             return;
         }
 
-        res = cuCtxGetCurrent(&context_);
+        res = drv::cuCtxGetCurrent(&context_);
         if (res != CUDA_SUCCESS || !context_) {
             CUdevice dev;
-            if (cuDeviceGet(&dev, 0) == CUDA_SUCCESS) {
-                if (cuDevicePrimaryCtxRetain(&context_, dev) == CUDA_SUCCESS) {
-                    cuCtxSetCurrent(context_);
+            if (drv::cuDeviceGet(&dev, 0) == CUDA_SUCCESS) {
+                if (drv::cuDevicePrimaryCtxRetain(&context_, dev) == CUDA_SUCCESS) {
+                    drv::cuCtxSetCurrent(context_);
                 }
             }
         }

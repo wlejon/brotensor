@@ -410,6 +410,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/modulated_conv2d.cu
         src/cuda/filtered_lrelu.cu
         src/cuda/register.cu
+        src/cuda/cuda_driver.cpp
         src/cuda/cuda_jit.cpp
         src/cuda/cuda_jit_gemv.cpp
         src/cuda/cuda_graph_jit.cpp
@@ -421,7 +422,14 @@ if(BROTENSOR_WITH_CUDA)
     # no multi-module context split. On a machine with no NVIDIA driver the
     # lazily-loaded driver stub simply reports no device and init.cpp falls back
     # to CPU, so one build runs everywhere (GPU when present, CPU otherwise).
-    target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart_static CUDA::cuda_driver)
+    #
+    # Never CUDA::cuda_driver here: that is a hard link against libcuda.so.1 /
+    # nvcuda.dll, and the executable then does not load at all on a machine
+    # without the driver — which is exactly the case the paragraph above is
+    # about (and the hosted CI runner, where brotensor-native-manifest has to
+    # run at build time). The JIT's driver-API calls go through
+    # src/cuda/cuda_driver.cpp, resolved via cudaGetDriverEntryPoint.
+    target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart_static)
     target_include_directories(brotensor_cuda PUBLIC /usr/local/cuda-12.6/targets/x86_64-linux/include)
     if(TARGET brass OR (BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include"))
         if(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")

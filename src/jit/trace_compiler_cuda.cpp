@@ -340,7 +340,7 @@ std::shared_ptr<TraceHandleImpl> compile_cuda(const TraceDAG& dag, FusionPattern
             if (grid_size > 65535) grid_size = 65535;
 
             CUstream custream = reinterpret_cast<CUstream>(cuda_current_stream());
-            CUresult res = cuLaunchKernel(
+            CUresult res = detail::cuda::drv::cuLaunchKernel(
                 fn,
                 grid_size, 1, 1,
                 block_size, 1, 1,
