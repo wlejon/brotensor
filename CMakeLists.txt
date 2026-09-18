@@ -277,8 +277,10 @@ endif()
 # Apple Silicon today) is no JIT: brotensor_cpu would compile every trace it
 # is handed into bytes the CPU cannot execute, and the first op through it
 # is SIGBUS. Such a build takes the plain kernels, as if brass were absent.
-if(TARGET brass AND NOT BRASS_HOST_BACKEND)
-    message(STATUS "brotensor: brass has no code generator for this target; CPU JIT off")
+# Note: brotensor's CPU JIT specifically emits x86-64 AVX2 (256-bit) vector instructions,
+# so the JIT is restricted to x86_64/AMD64 until ARM64 NEON vector paths are implemented.
+if((TARGET brass AND NOT BRASS_HOST_BACKEND) OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    message(STATUS "brotensor: brass has no x86_64 CPU JIT for this target; CPU JIT off")
 elseif(TARGET brass)
     message(STATUS "brotensor: found Brass target")
     # BUILD_INTERFACE-only: brass is a sibling add_subdirectory target that is
@@ -290,7 +292,7 @@ elseif(TARGET brass)
     target_link_libraries(brotensor_cpu PRIVATE ${BROTENSOR_BRASS_LIB})
     target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_BRASS_JIT=1)
     set(BROTENSOR_HAS_BRASS_JIT 1)
-elseif(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")
+elseif(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
     message(STATUS "brotensor: found Brass at ${BRASS_ROOT}")
     target_include_directories(brotensor_cpu PRIVATE "${BRASS_ROOT}/include")
     if(MSVC)
