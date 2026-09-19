@@ -221,4 +221,205 @@ void bro_tensor_adamStep(void* param, void* grad, void* m, void* v, double lr, d
     brotensor::adam_step(*pt, *gt, *mt, *vt, static_cast<float>(lr), static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(eps), step);
 }
 
+// ---- restored from the QuickJS binding (tensor_bindings.cpp) ---------------
+
+void bro_tensor_cast(void* src, void* dst, const char* outDtype) {
+    if (!need("cast", {src, dst})) return;
+    BROTENSOR_API_TRY
+        brotensor::cast(*toTensor(src), *toTensor(dst), parseDtype(outDtype));
+    BROTENSOR_API_CATCH("cast")
+}
+
+// softmaxForward(logits, probs, mask|null): the old third argument.
+void bro_tensor_softmaxForwardMasked(void* logits, void* probs, uint64_t mask_bits) {
+    if (!need("softmaxForward", {logits, probs})) return;
+    BROTENSOR_API_TRY
+        brotensor::softmax_forward(*toTensor(logits), *toTensor(probs), maskPtr(mask_bits));
+    BROTENSOR_API_CATCH("softmaxForward")
+}
+
+// layernormForward(x, gamma, beta, y, xhat, eps) -> {mean, rstd}: the two
+// scalar caches come back as a length-2 f64[] the wrapper unpacks.
+void bro_tensor_layernormForward(void* x, void* gamma, void* beta, void* y, void* xhat, double eps, bronze_native_buffer* out) {
+    static thread_local double stats[2];
+    if (!out) return;
+    out->data = nullptr;
+    out->length = 0;
+    out->release = nullptr;
+    out->ctx = nullptr;
+    if (!need("layernormForward", {x, gamma, beta, y, xhat})) return;
+    BROTENSOR_API_TRY
+        float mean = 0.f, rstd = 0.f;
+        brotensor::layernorm_forward(*toTensor(x), *toTensor(gamma), *toTensor(beta), *toTensor(y), *toTensor(xhat),
+                                     mean, rstd, static_cast<float>(eps));
+        stats[0] = mean;
+        stats[1] = rstd;
+        out->data = stats;
+        out->length = 2;
+    BROTENSOR_API_CATCH("layernormForward")
+}
+
+void bro_tensor_maskedMeanPoolForward(void* X, uint64_t mask_bits, void* y) {
+    if (!need("maskedMeanPoolForward", {X, y})) return;
+    BROTENSOR_API_TRY
+        brotensor::masked_mean_pool_forward(*toTensor(X), maskPtr(mask_bits), *toTensor(y));
+    BROTENSOR_API_CATCH("maskedMeanPoolForward")
+}
+
+void bro_tensor_maskedMeanPoolBackward(void* dY, uint64_t mask_bits, int32_t K, void* dX) {
+    if (!need("maskedMeanPoolBackward", {dY, dX})) return;
+    BROTENSOR_API_TRY
+        brotensor::masked_mean_pool_backward(*toTensor(dY), maskPtr(mask_bits), K, *toTensor(dX));
+    BROTENSOR_API_CATCH("maskedMeanPoolBackward")
+}
+
+double bro_tensor_softmaxXentFused(void* logits, void* target, uint64_t mask_bits, void* probs, void* dLogits) {
+    if (!need("softmaxXentFused", {logits, target, probs, dLogits})) return 0.0;
+    BROTENSOR_API_TRY
+        return brotensor::softmax_xent_fused(*toTensor(logits), *toTensor(target), maskPtr(mask_bits),
+                                             *toTensor(probs), *toTensor(dLogits));
+    BROTENSOR_API_CATCH("softmaxXentFused")
+    return 0.0;
+}
+
+// The head_offsets GpuTensor is a device INT32 buffer (cumulative, n_heads+1),
+// the old binding's convention.
+void bro_tensor_softmaxXentFusedBatched(void* logits_BL, void* target_BL, uint64_t mask_bits, void* headOffsets, int32_t nHeads, void* probs_BL, void* dLogits_BL, void* lossPerSample) {
+    if (!need("softmaxXentFusedBatched", {logits_BL, target_BL, headOffsets, probs_BL, dLogits_BL, lossPerSample})) return;
+    BROTENSOR_API_TRY
+        brotensor::softmax_xent_fused_batched(*toTensor(logits_BL), *toTensor(target_BL), maskPtr(mask_bits),
+                                              static_cast<const int*>(toTensor(headOffsets)->data), nHeads,
+                                              *toTensor(probs_BL), *toTensor(dLogits_BL), *toTensor(lossPerSample));
+    BROTENSOR_API_CATCH("softmaxXentFusedBatched")
+}
+
 } // extern "C"
+
+namespace {
+
+std::vector<const brotensor::Tensor*> asConst(const std::vector<brotensor::Tensor*>& v) {
+    return std::vector<const brotensor::Tensor*>(v.begin(), v.end());
+}
+
+std::vector<int> asInts(const int32_t* p, uint32_t n) {
+    return p ? std::vector<int>(p, p + n) : std::vector<int>();
+}
+
+} // namespace
+
+extern "C" {
+
+void bro_tensor_concatRows(uint64_t parts_bits, void* out) {
+    std::vector<brotensor::Tensor*> parts;
+    if (!need("concatRows", {out}) || !readTensorArray(parts_bits, parts, "concatRows")) return;
+    BROTENSOR_API_TRY
+        brotensor::concat_rows(asConst(parts), *toTensor(out));
+    BROTENSOR_API_CATCH("concatRows")
+}
+
+void bro_tensor_splitRows(void* in, uint64_t parts_bits) {
+    std::vector<brotensor::Tensor*> parts;
+    if (!need("splitRows", {in}) || !readTensorArray(parts_bits, parts, "splitRows")) return;
+    BROTENSOR_API_TRY
+        brotensor::split_rows(*toTensor(in), parts);
+    BROTENSOR_API_CATCH("splitRows")
+}
+
+void bro_tensor_concatBatchedRows(uint64_t parts_bits, void* out) {
+    std::vector<brotensor::Tensor*> parts;
+    if (!need("concatBatchedRows", {out}) || !readTensorArray(parts_bits, parts, "concatBatchedRows")) return;
+    BROTENSOR_API_TRY
+        brotensor::concat_batched_rows(asConst(parts), *toTensor(out));
+    BROTENSOR_API_CATCH("concatBatchedRows")
+}
+
+void bro_tensor_concatNchwChannels(uint64_t parts_bits, int32_t N, int32_t H, int32_t W, const int32_t* C_per_part, uint32_t C_len, void* out) {
+    std::vector<brotensor::Tensor*> parts;
+    if (!need("concatNchwChannels", {out}) || !readTensorArray(parts_bits, parts, "concatNchwChannels")) return;
+    BROTENSOR_API_TRY
+        brotensor::concat_nchw_channels(asConst(parts), N, H, W, asInts(C_per_part, C_len), *toTensor(out));
+    BROTENSOR_API_CATCH("concatNchwChannels")
+}
+
+void bro_tensor_concatNchwChannelsBackward(void* dY, int32_t N, int32_t H, int32_t W, const int32_t* C_per_part, uint32_t C_len, uint64_t parts_bits) {
+    std::vector<brotensor::Tensor*> parts;
+    if (!need("concatNchwChannelsBackward", {dY}) || !readTensorArray(parts_bits, parts, "concatNchwChannelsBackward")) return;
+    BROTENSOR_API_TRY
+        brotensor::concat_nchw_channels_backward(*toTensor(dY), N, H, W, asInts(C_per_part, C_len), parts);
+    BROTENSOR_API_CATCH("concatNchwChannelsBackward")
+}
+
+// ---- counter-based RNG + init (key / counter / state: BigInt or Number) ----
+
+void bro_tensor_randUniform(uint64_t key_bits, uint64_t counter_bits, void* Y) {
+    if (!need("randUniform", {Y})) return;
+    BROTENSOR_API_TRY
+        brotensor::rand_uniform(bronze::embed::toUint64(bronze::Value{key_bits}),
+                                bronze::embed::toUint64(bronze::Value{counter_bits}), *toTensor(Y));
+    BROTENSOR_API_CATCH("randUniform")
+}
+
+void bro_tensor_randn(uint64_t key_bits, uint64_t counter_bits, void* Y) {
+    if (!need("randn", {Y})) return;
+    BROTENSOR_API_TRY
+        brotensor::randn(bronze::embed::toUint64(bronze::Value{key_bits}),
+                         bronze::embed::toUint64(bronze::Value{counter_bits}), *toTensor(Y));
+    BROTENSOR_API_CATCH("randn")
+}
+
+void bro_tensor_randBernoulli(double p, uint64_t key_bits, uint64_t counter_bits, void* Y) {
+    if (!need("randBernoulli", {Y})) return;
+    BROTENSOR_API_TRY
+        brotensor::rand_bernoulli(static_cast<float>(p), bronze::embed::toUint64(bronze::Value{key_bits}),
+                                  bronze::embed::toUint64(bronze::Value{counter_bits}), *toTensor(Y));
+    BROTENSOR_API_CATCH("randBernoulli")
+}
+
+void bro_tensor_randnTruncated(double lo, double hi, uint64_t key_bits, uint64_t counter_bits, void* Y) {
+    if (!need("randnTruncated", {Y})) return;
+    BROTENSOR_API_TRY
+        brotensor::randn_truncated(static_cast<float>(lo), static_cast<float>(hi),
+                                   bronze::embed::toUint64(bronze::Value{key_bits}),
+                                   bronze::embed::toUint64(bronze::Value{counter_bits}), *toTensor(Y));
+    BROTENSOR_API_CATCH("randnTruncated")
+}
+
+// xavierInit(W, rngState) -> advanced state. The old binding returned a
+// BigInt; the embed API mints no BigInt, so the state comes back as a Number
+// (exact below 2^53 — thread it through successive inits as before).
+double bro_tensor_xavierInit(void* W, uint64_t state_bits) {
+    uint64_t state = bronze::embed::toUint64(bronze::Value{state_bits});
+    if (!need("xavierInit", {W})) return static_cast<double>(state);
+    BROTENSOR_API_TRY
+        brotensor::xavier_init(*toTensor(W), state);
+    BROTENSOR_API_CATCH("xavierInit")
+    return static_cast<double>(state);
+}
+
+} // extern "C"
+
+namespace brotensor::api {
+
+bool readTensorArray(uint64_t bits, std::vector<brotensor::Tensor*>& out, const char* label) {
+    namespace ev = bronze::embed;
+    ev::Persistent arr(bronze::Value{bits});
+    out.clear();
+    if (!ev::isObject(arr.get())) {
+        setError(std::string(label) + ": expected an array of GpuTensors");
+        return false;
+    }
+    const auto n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(arr.get(), "length")));
+    out.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        void* d = ev::handleData(ev::getElement(arr.get(), i));
+        auto* t = d ? toTensor(d) : nullptr;
+        if (!t) {
+            setError(std::string(label) + ": element " + std::to_string(i) + " is not a GpuTensor");
+            return false;
+        }
+        out.push_back(t);
+    }
+    return true;
+}
+
+} // namespace brotensor::api

@@ -3,6 +3,15 @@
 # a no-op entry stands in: the natives still register, but nothing mounts
 # `bro.tensor`. BROTENSOR_API_COMPILED_JS tells the tests which of the two
 # they are looking at.
+set(BROTENSOR_API_NATIVE_SOURCES
+    api.cpp
+    native_tensor_core.cpp
+    native_tensor_ops.cpp
+    native_tensor_nn.cpp
+    native_tensor_attention.cpp
+    native_tensor_safetensors.cpp
+)
+
 if(NOT BRASS_HOST_BACKEND)
     set(BROTENSOR_COMPILED_JS_OBJECTS "${CMAKE_CURRENT_SOURCE_DIR}/bronze_js_stubs_arm64.cpp")
     set(BROTENSOR_API_COMPILED_JS OFF PARENT_SCOPE)
@@ -14,10 +23,7 @@ else()
 
     add_executable(brotensor-native-manifest
         manifest_tool.cpp
-        api.cpp
-        native_tensor_core.cpp
-        native_tensor_ops.cpp
-        native_tensor_nn.cpp
+        ${BROTENSOR_API_NATIVE_SOURCES}
         bronze_js_stubs_arm64.cpp
     )
     target_include_directories(brotensor-native-manifest PRIVATE
@@ -55,28 +61,33 @@ else()
     )
 
     set(BROTENSOR_GLOBALS "${CMAKE_CURRENT_SOURCE_DIR}/tensor.globals")
-    set(INPUT "${CMAKE_CURRENT_SOURCE_DIR}/js/tensor.js")
-    set(OUTPUT "${GEN_DIR}/tensor.o")
 
-    add_custom_command(
-        OUTPUT "${OUTPUT}"
-        COMMAND $<TARGET_FILE:bronze> build "${INPUT}" --emit-obj
-                --host-globals "${BROTENSOR_GLOBALS}"
-                --native-manifest "${TENSOR_NATIVE_MANIFEST}"
-                --entry-symbol=bronze_tensor_main -o "${OUTPUT}"
-        DEPENDS bronze "${INPUT}" "${BROTENSOR_GLOBALS}" "${TENSOR_NATIVE_MANIFEST}"
-        COMMENT "bronze compile js/tensor.js -> tensor.o (bronze_tensor_main)"
-        VERBATIM
-    )
-    set_source_files_properties("${OUTPUT}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-    set(BROTENSOR_COMPILED_JS_OBJECTS "${OUTPUT}")
+    # Two compiled modules, one entry symbol each, mounted in this order by
+    # installTensorJS: js/tensor.js (bro.tensor, GpuTensor, the dense /
+    # elementwise / conv surface, safetensors, RNG) and js/tensor_ext.js (the
+    # attention family, losses, pooling, concat). Split so each file stays
+    # readable; both read the same host globals and the same native manifest.
+    set(BROTENSOR_COMPILED_JS_OBJECTS "")
+    foreach(module tensor tensor_ext)
+        set(INPUT "${CMAKE_CURRENT_SOURCE_DIR}/js/${module}.js")
+        set(OUTPUT "${GEN_DIR}/${module}.o")
+        add_custom_command(
+            OUTPUT "${OUTPUT}"
+            COMMAND $<TARGET_FILE:bronze> build "${INPUT}" --emit-obj
+                    --host-globals "${BROTENSOR_GLOBALS}"
+                    --native-manifest "${TENSOR_NATIVE_MANIFEST}"
+                    --entry-symbol=bronze_${module}_main -o "${OUTPUT}"
+            DEPENDS bronze "${INPUT}" "${BROTENSOR_GLOBALS}" "${TENSOR_NATIVE_MANIFEST}"
+            COMMENT "bronze compile js/${module}.js -> ${module}.o (bronze_${module}_main)"
+            VERBATIM
+        )
+        set_source_files_properties("${OUTPUT}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+        list(APPEND BROTENSOR_COMPILED_JS_OBJECTS "${OUTPUT}")
+    endforeach()
 endif()
 
 add_library(brotensor_api STATIC
-    api.cpp
-    native_tensor_core.cpp
-    native_tensor_ops.cpp
-    native_tensor_nn.cpp
+    ${BROTENSOR_API_NATIVE_SOURCES}
     ${BROTENSOR_COMPILED_JS_OBJECTS}
 )
 

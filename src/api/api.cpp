@@ -6,12 +6,18 @@
 #include <string>
 
 extern "C" void bronze_tensor_main(void);
+extern "C" void bronze_tensor_ext_main(void);
 
 namespace brotensor::api {
 
 namespace {
 
 namespace ev = bronze::embed;
+
+std::function<std::string(const std::string&)>& pathResolverSlot() {
+    static std::function<std::string(const std::string&)> resolver;
+    return resolver;
+}
 
 ev::NativeSignature sig(const char* ret, std::initializer_list<const char*> params, ev::NativeKind kind) {
     ev::NativeSignature s;
@@ -55,11 +61,82 @@ void* p(F* f) { return reinterpret_cast<void*>(f); }
 
 } // namespace
 
+std::string& lastErrorSlot() {
+    static thread_local std::string slot;
+    return slot;
+}
+
+std::string resolvePath(const std::string& path) {
+    auto& r = pathResolverSlot();
+    return r ? r(path) : path;
+}
+
+void setPathResolver(std::function<std::string(const std::string&)> resolver) {
+    pathResolverSlot() = std::move(resolver);
+}
+
 bool registerTensorNatives(std::string* error) {
     const char* kTensorCls = "__bro_native.tensor.GpuTensor";
+    const char* kStCls = "__bro_native.tensor.SafetensorsFile";
+    const char* dyn = "dynamic";
 
     bool ok =
         ctor(kTensorCls, p(&bro_tensor_GpuTensor_ctor), &bro_tensor_GpuTensor_dtor, bronze::runtime::Finalize::InSweep, {}, error) &&
+        ctor(kStCls, p(&bro_tensor_SafetensorsFile_ctor), &bro_tensor_SafetensorsFile_dtor, bronze::runtime::Finalize::InSweep, {}, error) &&
+        fn("__bro_native.tensor.takeError", p(&bro_tensor_takeError), "str", {}, error) &&
+        fn("__bro_native.tensor.GpuTensor_downloadInto", p(&bro_tensor_GpuTensor_downloadInto), "bool", {kTensorCls, "f32[]"}, error) &&
+        // safetensors
+        fn("__bro_native.tensor.openSafetensors", p(&bro_tensor_openSafetensors), kStCls, {"str"}, error) &&
+        fn("__bro_native.tensor.SafetensorsFile_isOpen", p(&bro_tensor_SafetensorsFile_isOpen), "bool", {kStCls}, error) &&
+        fn("__bro_native.tensor.SafetensorsFile_count_get", p(&bro_tensor_SafetensorsFile_count_get), "i32", {kStCls}, error) &&
+        fn("__bro_native.tensor.SafetensorsFile_nameAt", p(&bro_tensor_SafetensorsFile_nameAt), "str", {kStCls, "i32"}, error) &&
+        fn("__bro_native.tensor.SafetensorsFile_dtypeAt", p(&bro_tensor_SafetensorsFile_dtypeAt), "str", {kStCls, "i32"}, error) &&
+        fn("__bro_native.tensor.SafetensorsFile_shapeAt", p(&bro_tensor_SafetensorsFile_shapeAt), "f64[]", {kStCls, "i32"}, error) &&
+        fn("__bro_native.tensor.SafetensorsFile_nbytesAt", p(&bro_tensor_SafetensorsFile_nbytesAt), "f64", {kStCls, "i32"}, error) &&
+        fn("__bro_native.tensor.SafetensorsFile_get", p(&bro_tensor_SafetensorsFile_get), kTensorCls, {kStCls, "str", "i32", "i32", "str"}, error) &&
+        fn("__bro_native.tensor.SafetensorsFile_close", p(&bro_tensor_SafetensorsFile_close), "void", {kStCls}, error) &&
+        fn("__bro_native.tensor.saveSafetensors", p(&bro_tensor_saveSafetensors), "bool", {"str", dyn, dyn}, error) &&
+        // RNG / init
+        fn("__bro_native.tensor.randUniform", p(&bro_tensor_randUniform), "void", {dyn, dyn, kTensorCls}, error) &&
+        fn("__bro_native.tensor.randn", p(&bro_tensor_randn), "void", {dyn, dyn, kTensorCls}, error) &&
+        fn("__bro_native.tensor.randBernoulli", p(&bro_tensor_randBernoulli), "void", {"f64", dyn, dyn, kTensorCls}, error) &&
+        fn("__bro_native.tensor.randnTruncated", p(&bro_tensor_randnTruncated), "void", {"f64", "f64", dyn, dyn, kTensorCls}, error) &&
+        fn("__bro_native.tensor.xavierInit", p(&bro_tensor_xavierInit), "f64", {kTensorCls, dyn}, error) &&
+        // restored dense / loss / concat
+        fn("__bro_native.tensor.cast", p(&bro_tensor_cast), "void", {kTensorCls, kTensorCls, "str"}, error) &&
+        fn("__bro_native.tensor.softmaxForwardMasked", p(&bro_tensor_softmaxForwardMasked), "void", {kTensorCls, kTensorCls, dyn}, error) &&
+        fn("__bro_native.tensor.layernormForward", p(&bro_tensor_layernormForward), "f64[]", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, "f64"}, error) &&
+        fn("__bro_native.tensor.maskedMeanPoolForward", p(&bro_tensor_maskedMeanPoolForward), "void", {kTensorCls, dyn, kTensorCls}, error) &&
+        fn("__bro_native.tensor.maskedMeanPoolBackward", p(&bro_tensor_maskedMeanPoolBackward), "void", {kTensorCls, dyn, "i32", kTensorCls}, error) &&
+        fn("__bro_native.tensor.softmaxXentFused", p(&bro_tensor_softmaxXentFused), "f64", {kTensorCls, kTensorCls, dyn, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.softmaxXentFusedBatched", p(&bro_tensor_softmaxXentFusedBatched), "void", {kTensorCls, kTensorCls, dyn, kTensorCls, "i32", kTensorCls, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.concatRows", p(&bro_tensor_concatRows), "void", {dyn, kTensorCls}, error) &&
+        fn("__bro_native.tensor.splitRows", p(&bro_tensor_splitRows), "void", {kTensorCls, dyn}, error) &&
+        fn("__bro_native.tensor.concatBatchedRows", p(&bro_tensor_concatBatchedRows), "void", {dyn, kTensorCls}, error) &&
+        fn("__bro_native.tensor.concatNchwChannels", p(&bro_tensor_concatNchwChannels), "void", {dyn, "i32", "i32", "i32", "i32[]", kTensorCls}, error) &&
+        fn("__bro_native.tensor.concatNchwChannelsBackward", p(&bro_tensor_concatNchwChannelsBackward), "void", {kTensorCls, "i32", "i32", "i32", "i32[]", dyn}, error) &&
+        // attention family
+        fn("__bro_native.tensor.attentionForward", p(&bro_tensor_attentionForward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.attentionBackward", p(&bro_tensor_attentionBackward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.mhaForward", p(&bro_tensor_mhaForward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, "i32", kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.mhaBackward", p(&bro_tensor_mhaBackward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, "i32", kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.selfAttentionForward", p(&bro_tensor_selfAttentionForward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, "i32", kTensorCls}, error) &&
+        fn("__bro_native.tensor.selfAttentionForwardTrain", p(&bro_tensor_selfAttentionForwardTrain), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, "i32", kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.selfAttentionBackward", p(&bro_tensor_selfAttentionBackward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, "i32", kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.selfAttentionBiasForward", p(&bro_tensor_selfAttentionBiasForward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, dyn, "i32", "f64", kTensorCls}, error) &&
+        fn("__bro_native.tensor.crossAttentionForward", p(&bro_tensor_crossAttentionForward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, "i32", kTensorCls}, error) &&
+        fn("__bro_native.tensor.crossAttentionForwardWithAttn", p(&bro_tensor_crossAttentionForwardWithAttn), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, dyn, "i32", kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.crossAttentionForwardTrain", p(&bro_tensor_crossAttentionForwardTrain), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, "i32", kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.crossAttentionBackward", p(&bro_tensor_crossAttentionBackward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, "i32", kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.flashAttentionForward", p(&bro_tensor_flashAttentionForward), "void", {kTensorCls, kTensorCls, kTensorCls, dyn, "i32", "bool", kTensorCls}, error) &&
+        fn("__bro_native.tensor.flashAttentionWindowedForward", p(&bro_tensor_flashAttentionWindowedForward), "void", {kTensorCls, kTensorCls, kTensorCls, dyn, "i32", "i32", kTensorCls}, error) &&
+        fn("__bro_native.tensor.flashAttentionBackward", p(&bro_tensor_flashAttentionBackward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, "i32", "bool", kTensorCls, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.flashAttentionQkvoForward", p(&bro_tensor_flashAttentionQkvoForward), "void", {kTensorCls, dyn, kTensorCls, dyn, kTensorCls, dyn, kTensorCls, dyn, kTensorCls, dyn, dyn, "i32", "bool", kTensorCls}, error) &&
+        fn("__bro_native.tensor.flashAttentionQkvoBackward", p(&bro_tensor_flashAttentionQkvoBackward), "void", {kTensorCls, dyn, kTensorCls, dyn, kTensorCls, dyn, kTensorCls, dyn, kTensorCls, dyn, dyn, "i32", "bool", kTensorCls, kTensorCls, dyn, kTensorCls, dyn, kTensorCls, dyn, kTensorCls, dyn, kTensorCls, dyn}, error) &&
+        fn("__bro_native.tensor.flashAttentionProjectKv", p(&bro_tensor_flashAttentionProjectKv), "void", {kTensorCls, kTensorCls, dyn, kTensorCls, dyn, kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.flashAttentionQWithKvCachedForward", p(&bro_tensor_flashAttentionQWithKvCachedForward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, kTensorCls, dyn, dyn, "i32", "bool", kTensorCls}, error) &&
+        fn("__bro_native.tensor.resblockForward", p(&bro_tensor_resblockForward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, dyn, kTensorCls, kTensorCls, kTensorCls, dyn, dyn, dyn, "i32", "i32", "i32", "i32", "i32", "i32", "f64", kTensorCls}, error) &&
+        fn("__bro_native.tensor.resblockBackward", p(&bro_tensor_resblockBackward), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, dyn, kTensorCls, kTensorCls, kTensorCls, dyn, dyn, dyn, "i32", "i32", "i32", "i32", "i32", "i32", "f64", kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, dyn, dyn, kTensorCls, kTensorCls, kTensorCls, dyn, dyn, dyn}, error) &&
         fn("__bro_native.tensor.createTensor", p(&bro_tensor_createTensor), kTensorCls, {"i32", "i32", "str"}, error) &&
         fn("__bro_native.tensor.GpuTensor_rows_get", p(&bro_tensor_GpuTensor_rows_get), "i32", {kTensorCls}, error) &&
         fn("__bro_native.tensor.GpuTensor_cols_get", p(&bro_tensor_GpuTensor_cols_get), "i32", {kTensorCls}, error) &&
@@ -161,11 +238,16 @@ bool registerTensorNatives(std::string* error) {
 
     if (!ok) return false;
     publishPrototype("tensor", kTensorCls, "GpuTensorProto");
+    publishPrototype("tensor", kStCls, "SafetensorsFileProto");
     return true;
 }
 
 void installTensorJS() {
+    // js/tensor.js first (it mounts bro.tensor and GpuTensor), then
+    // js/tensor_ext.js, which decorates that namespace with the attention /
+    // loss / concat family and reads GpuTensor for its argument checks.
     ev::runEntry(bronze_tensor_main);
+    ev::runEntry(bronze_tensor_ext_main);
 }
 
 void installTensor() {

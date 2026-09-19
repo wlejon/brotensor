@@ -106,11 +106,19 @@ void bro_tensor_GpuTensor_download(void* self, bronze_native_buffer* out) {
         out->data = tl_download_f32.data();
         out->length = static_cast<uint32_t>(tl_download_f32.size());
     } else {
-        auto host_t = t->to(brotensor::Device::CPU);
-        brotensor::Tensor fp32_t = brotensor::Tensor::empty(t->rows, t->cols, brotensor::Dtype::FP32);
-        brotensor::cast(host_t, fp32_t, brotensor::Dtype::FP32);
-        tl_download_f32.resize(static_cast<size_t>(fp32_t.size()));
-        fp32_t.copy_to_host(tl_download_f32.data());
+        // Convert on the host: the scratch tensor must live on the CPU too,
+        // or cast() sees a mixed-device pair (Tensor::empty follows the
+        // default device, CUDA once the backend is up).
+        try {
+            auto host_t = t->to(brotensor::Device::CPU);
+            brotensor::Tensor fp32_t = brotensor::Tensor::empty_on(brotensor::Device::CPU, t->rows, t->cols, brotensor::Dtype::FP32);
+            brotensor::cast(host_t, fp32_t, brotensor::Dtype::FP32);
+            tl_download_f32.resize(static_cast<size_t>(fp32_t.size()));
+            fp32_t.copy_to_host(tl_download_f32.data());
+        } catch (const std::exception& e) {
+            tl_download_f32.clear();
+            setError(std::string("download: ") + e.what());
+        }
         out->data = tl_download_f32.data();
         out->length = static_cast<uint32_t>(tl_download_f32.size());
     }
@@ -146,11 +154,16 @@ void bro_tensor_GpuTensor_downloadFp16(void* self, bronze_native_buffer* out) {
         out->data = tl_download_u16.data();
         out->length = static_cast<uint32_t>(tl_download_u16.size());
     } else {
-        auto host_t = t->to(brotensor::Device::CPU);
-        brotensor::Tensor fp16_t = brotensor::Tensor::empty(t->rows, t->cols, brotensor::Dtype::FP16);
-        brotensor::cast(host_t, fp16_t, brotensor::Dtype::FP16);
-        tl_download_u16.resize(static_cast<size_t>(fp16_t.size()));
-        fp16_t.copy_to_host_fp16(tl_download_u16.data());
+        try {
+            auto host_t = t->to(brotensor::Device::CPU);
+            brotensor::Tensor fp16_t = brotensor::Tensor::empty_on(brotensor::Device::CPU, t->rows, t->cols, brotensor::Dtype::FP16);
+            brotensor::cast(host_t, fp16_t, brotensor::Dtype::FP16);
+            tl_download_u16.resize(static_cast<size_t>(fp16_t.size()));
+            fp16_t.copy_to_host_fp16(tl_download_u16.data());
+        } catch (const std::exception& e) {
+            tl_download_u16.clear();
+            setError(std::string("downloadFp16: ") + e.what());
+        }
         out->data = tl_download_u16.data();
         out->length = static_cast<uint32_t>(tl_download_u16.size());
     }
@@ -187,6 +200,41 @@ void bro_tensor_GpuTensor_downloadInt8(void* self, bronze_native_buffer* out) {
     out->length = static_cast<uint32_t>(tl_download_i8.size());
     out->release = nullptr;
     out->ctx = nullptr;
+}
+
+bool bro_tensor_GpuTensor_downloadInto(void* self, float* dst, uint32_t dst_len) {
+    auto* t = toTensor(self);
+    if (!t || !dst) {
+        setError("download(dst): not a GpuTensor");
+        return false;
+    }
+    if (t->empty()) return true;
+    const auto n = static_cast<size_t>(t->size());
+    if (dst_len < n) {
+        setError("download(dst): dst holds " + std::to_string(dst_len) + " elements, tensor has " + std::to_string(n));
+        return false;
+    }
+    BROTENSOR_API_TRY
+        if (t->dtype == brotensor::Dtype::FP32) {
+            t->copy_to_host(dst);
+        } else {
+            auto host_t = t->to(brotensor::Device::CPU);
+            brotensor::Tensor fp32_t = brotensor::Tensor::empty_on(brotensor::Device::CPU, t->rows, t->cols, brotensor::Dtype::FP32);
+            brotensor::cast(host_t, fp32_t, brotensor::Dtype::FP32);
+            fp32_t.copy_to_host(dst);
+        }
+        return true;
+    BROTENSOR_API_CATCH("download(dst)")
+    return false;
+}
+
+const char* bro_tensor_takeError(void) {
+    // The slot keeps the string alive until the next failure; the runtime
+    // copies a `str` return into a JS string before anything else runs.
+    static thread_local std::string taken;
+    taken.swap(lastErrorSlot());
+    lastErrorSlot().clear();
+    return taken.c_str();
 }
 
 bool bro_tensor_available_get(void) {

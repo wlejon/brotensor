@@ -26,12 +26,77 @@ void bro_tensor_GpuTensor_uploadFp16(void* self, const uint16_t* data, uint32_t 
 void bro_tensor_GpuTensor_downloadFp16(void* self, bronze_native_buffer* out);
 void bro_tensor_GpuTensor_uploadInt8(void* self, const int8_t* data, uint32_t data_len);
 void bro_tensor_GpuTensor_downloadInt8(void* self, bronze_native_buffer* out);
+// download(dst): in place into a caller-owned Float32Array (dst.length >= size).
+bool bro_tensor_GpuTensor_downloadInto(void* self, float* dst, uint32_t dst_len);
 
 // --- Backend Control ---
 bool bro_tensor_available_get(void);
 const char* bro_tensor_backend_get(void);
 void bro_tensor_init(void);
 void bro_tensor_sync(void);
+// The message of the last failed native on this thread, cleared by the read
+// ("" when nothing failed). js/tensor*.js throws it after each call.
+const char* bro_tensor_takeError(void);
+
+// --- Safetensors (native_tensor_safetensors.cpp) ---
+void* bro_tensor_SafetensorsFile_ctor(void);
+void bro_tensor_SafetensorsFile_dtor(void* self);
+void* bro_tensor_openSafetensors(const char* path);                   // null + error on failure
+bool bro_tensor_SafetensorsFile_isOpen(void* self);
+int32_t bro_tensor_SafetensorsFile_count_get(void* self);
+const char* bro_tensor_SafetensorsFile_nameAt(void* self, int32_t i);
+const char* bro_tensor_SafetensorsFile_dtypeAt(void* self, int32_t i);
+void bro_tensor_SafetensorsFile_shapeAt(void* self, int32_t i, bronze_native_buffer* out);  // f64[]
+double bro_tensor_SafetensorsFile_nbytesAt(void* self, int32_t i);
+// rows/cols 0 = flatten to (shape[0], numel/shape[0]); mode "native" | "compute" | "fp16".
+void* bro_tensor_SafetensorsFile_get(void* self, const char* name, int32_t rows, int32_t cols, const char* mode);
+void bro_tensor_SafetensorsFile_close(void* self);
+// names: JS array of strings; tensors: JS array of GpuTensors, same length.
+bool bro_tensor_saveSafetensors(const char* path, uint64_t names_bits, uint64_t tensors_bits);
+
+// --- RNG / init (key, counter, state: BigInt or Number) ---
+void bro_tensor_randUniform(uint64_t key_bits, uint64_t counter_bits, void* Y);
+void bro_tensor_randn(uint64_t key_bits, uint64_t counter_bits, void* Y);
+void bro_tensor_randBernoulli(double p, uint64_t key_bits, uint64_t counter_bits, void* Y);
+void bro_tensor_randnTruncated(double lo, double hi, uint64_t key_bits, uint64_t counter_bits, void* Y);
+double bro_tensor_xavierInit(void* W, uint64_t state_bits);            // returns the advanced state
+
+// --- Restored dense / loss / concat ops (native_tensor_nn.cpp) ---
+void bro_tensor_cast(void* src, void* dst, const char* outDtype);
+void bro_tensor_softmaxForwardMasked(void* logits, void* probs, uint64_t mask_bits);
+void bro_tensor_layernormForward(void* x, void* gamma, void* beta, void* y, void* xhat, double eps, bronze_native_buffer* out);  // f64[] {mean, rstd}
+void bro_tensor_maskedMeanPoolForward(void* X, uint64_t mask_bits, void* y);
+void bro_tensor_maskedMeanPoolBackward(void* dY, uint64_t mask_bits, int32_t K, void* dX);
+double bro_tensor_softmaxXentFused(void* logits, void* target, uint64_t mask_bits, void* probs, void* dLogits);
+void bro_tensor_softmaxXentFusedBatched(void* logits_BL, void* target_BL, uint64_t mask_bits, void* headOffsets, int32_t nHeads, void* probs_BL, void* dLogits_BL, void* lossPerSample);
+void bro_tensor_concatRows(uint64_t parts_bits, void* out);
+void bro_tensor_splitRows(void* in, uint64_t parts_bits);
+void bro_tensor_concatBatchedRows(uint64_t parts_bits, void* out);
+void bro_tensor_concatNchwChannels(uint64_t parts_bits, int32_t N, int32_t H, int32_t W, const int32_t* C_per_part, uint32_t C_len, void* out);
+void bro_tensor_concatNchwChannelsBackward(void* dY, int32_t N, int32_t H, int32_t W, const int32_t* C_per_part, uint32_t C_len, uint64_t parts_bits);
+
+// --- Attention family (native_tensor_attention.cpp); *_bits are nullable GpuTensors ---
+void bro_tensor_attentionForward(void* X, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, void* Q, void* K, void* V, void* Attn, void* Y_pre_Wo, void* O);
+void bro_tensor_attentionBackward(void* dO, void* X, void* Q, void* K, void* V, void* Attn, void* Y_pre_Wo, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, void* dX, void* dWq, void* dWk, void* dWv, void* dWo);
+void bro_tensor_mhaForward(void* X, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, int32_t numHeads, void* Qh, void* Kh, void* Vh, void* Attnh, void* Yconcat, void* O);
+void bro_tensor_mhaBackward(void* dO, void* X, void* Qh, void* Kh, void* Vh, void* Attnh, void* Yconcat, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, int32_t numHeads, void* dX, void* dWq, void* dWk, void* dWv, void* dWo);
+void bro_tensor_selfAttentionForward(void* X, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, int32_t numHeads, void* O);
+void bro_tensor_selfAttentionForwardTrain(void* X, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, int32_t numHeads, void* Qh, void* Kh, void* Vh, void* Attnh, void* Yconcat, void* O);
+void bro_tensor_selfAttentionBackward(void* dO, void* X, void* Qh, void* Kh, void* Vh, void* Attnh, void* Yconcat, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, int32_t numHeads, void* dX, void* dWq, void* dWk, void* dWv, void* dWo);
+void bro_tensor_selfAttentionBiasForward(void* X, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, uint64_t attnBias_bits, int32_t numHeads, double scale, void* O);
+void bro_tensor_crossAttentionForward(void* X, void* Ctx, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, int32_t numHeads, void* O);
+void bro_tensor_crossAttentionForwardWithAttn(void* X, void* Ctx, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, uint64_t attnLogitBias_bits, int32_t numHeads, void* O, void* AttnAvg);
+void bro_tensor_crossAttentionForwardTrain(void* X, void* Ctx, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, int32_t numHeads, void* Qh, void* Kh, void* Vh, void* Attnh, void* Yconcat, void* O);
+void bro_tensor_crossAttentionBackward(void* dO, void* X, void* Ctx, void* Qh, void* Kh, void* Vh, void* Attnh, void* Yconcat, void* Wq, void* Wk, void* Wv, void* Wo, uint64_t mask_bits, int32_t numHeads, void* dX, void* dCtx, void* dWq, void* dWk, void* dWv, void* dWo);
+void bro_tensor_flashAttentionForward(void* Q, void* K, void* V, uint64_t mask_bits, int32_t numHeads, bool causal, void* O);
+void bro_tensor_flashAttentionWindowedForward(void* Q, void* K, void* V, uint64_t mask_bits, int32_t numHeads, int32_t window, void* O);
+void bro_tensor_flashAttentionBackward(void* Q, void* K, void* V, void* O, void* dO, uint64_t mask_bits, int32_t numHeads, bool causal, void* dQ, void* dK, void* dV);
+void bro_tensor_flashAttentionQkvoForward(void* X, uint64_t Ctx_bits, void* Wq, uint64_t bq_bits, void* Wk, uint64_t bk_bits, void* Wv, uint64_t bv_bits, void* Wo, uint64_t bo_bits, uint64_t mask_bits, int32_t numHeads, bool causal, void* O);
+void bro_tensor_flashAttentionQkvoBackward(void* X, uint64_t Ctx_bits, void* Wq, uint64_t bq_bits, void* Wk, uint64_t bk_bits, void* Wv, uint64_t bv_bits, void* Wo, uint64_t bo_bits, uint64_t mask_bits, int32_t numHeads, bool causal, void* dO, void* dX, uint64_t dCtx_bits, void* dWq, uint64_t dbq_bits, void* dWk, uint64_t dbk_bits, void* dWv, uint64_t dbv_bits, void* dWo, uint64_t dbo_bits);
+void bro_tensor_flashAttentionProjectKv(void* ctx, void* Wk, uint64_t bk_bits, void* Wv, uint64_t bv_bits, void* K_out, void* V_out);
+void bro_tensor_flashAttentionQWithKvCachedForward(void* X, void* K, void* V, void* Wq, uint64_t bq_bits, void* Wo, uint64_t bo_bits, uint64_t mask_bits, int32_t numHeads, bool causal, void* O);
+void bro_tensor_resblockForward(void* X, void* gamma1, void* beta1, void* W1, uint64_t b1_bits, uint64_t t_emb_shift_bits, void* gamma2, void* beta2, void* W2, uint64_t b2_bits, uint64_t Wskip_bits, uint64_t bskip_bits, int32_t N, int32_t C_in, int32_t C_out, int32_t H, int32_t W, int32_t numGroups, double eps, void* Y);
+void bro_tensor_resblockBackward(void* X, void* gamma1, void* beta1, void* W1, uint64_t b1_bits, uint64_t t_emb_shift_bits, void* gamma2, void* beta2, void* W2, uint64_t b2_bits, uint64_t Wskip_bits, uint64_t bskip_bits, int32_t N, int32_t C_in, int32_t C_out, int32_t H, int32_t W, int32_t numGroups, double eps, void* dY, void* dX, void* dGamma1, void* dBeta1, void* dW1, uint64_t db1_bits, uint64_t dt_emb_shift_bits, void* dGamma2, void* dBeta2, void* dW2, uint64_t db2_bits, uint64_t dWskip_bits, uint64_t dbskip_bits);
 
 // --- Math & Activation Ops ---
 void bro_tensor_linearForward(void* W, void* b, void* x, void* y);

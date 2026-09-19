@@ -8,45 +8,14 @@
 // spelling the compiler lowers to a direct call. The roots this module reads as bare
 // identifiers are listed in module.globals beside it.
 //
-// [manual] members (no native, installed by hand-written JS after this module):
-//   bro.tensor.GpuTensor.prototype.resize
-//   bro.tensor.GpuTensor.prototype.upload
-//   bro.tensor.GpuTensor.prototype.download
-//   bro.tensor.createTensor
-//   bro.tensor.cast
-//   bro.tensor.softmaxForward
-//   bro.tensor.layernormForward
-//   bro.tensor.attentionForward
-//   bro.tensor.attentionBackward
-//   bro.tensor.mhaForward
-//   bro.tensor.mhaBackward
-//   bro.tensor.selfAttentionForward
-//   bro.tensor.selfAttentionForwardTrain
-//   bro.tensor.selfAttentionBackward
-//   bro.tensor.crossAttentionForward
-//   bro.tensor.crossAttentionForwardWithAttn
-//   bro.tensor.crossAttentionForwardTrain
-//   bro.tensor.crossAttentionBackward
-//   bro.tensor.selfAttentionBiasForward
-//   bro.tensor.flashAttentionForward
-//   bro.tensor.flashAttentionWindowedForward
-//   bro.tensor.flashAttentionBackward
-//   bro.tensor.flashAttentionQkvoForward
-//   bro.tensor.flashAttentionQkvoBackward
-//   bro.tensor.flashAttentionProjectKv
-//   bro.tensor.flashAttentionQWithKvCachedForward
-//   bro.tensor.conv2dForward
-//   bro.tensor.resblockForward
-//   bro.tensor.resblockBackward
-//   bro.tensor.maskedMeanPoolForward
-//   bro.tensor.maskedMeanPoolBackward
-//   bro.tensor.softmaxXentFused
-//   bro.tensor.softmaxXentFusedBatched
-//   bro.tensor.concatRows
-//   bro.tensor.splitRows
-//   bro.tensor.concatBatchedRows
-//   bro.tensor.concatNchwChannels
-//   bro.tensor.concatNchwChannelsBackward
+// Errors: a native cannot throw, so one that fails records a message the
+// wrapper reads back with __bro_native.tensor.takeError() and throws. The
+// wrappers written since the port do that after every call (`chk()`); the
+// older ones below still trust their natives.
+//
+// The attention family, losses, pooling and concat live in js/tensor_ext.js,
+// a second compiled module mounted right after this one (api.cpp
+// installTensorJS).
 (function () {
     'use strict';
 
@@ -78,19 +47,28 @@
             return __bro_native.tensor.backend || "cpu";
         },
         undefined);
-    fn(ns_tensor, "dtype", { fp32: 0, fp16: 1, int8: 2, int32: 3, bf16: 4, f64: 5 });
-    fn(ns_tensor, "openSafetensors", function openSafetensors(path) {
-        if (!path || typeof path !== "string") throw new TypeError("openSafetensors: path required");
-        throw new Error("openSafetensors: cannot open " + path);
-    });
-    fn(ns_tensor, "randn", function randn() {
-        if (!ns_tensor.available) throw new Error("bro.tensor: compiled without BRO_WITH_TENSOR");
-    });
-    accessor(ns_tensor, "backend",
-        function () {
-            return __bro_native.tensor.backend;
-        },
-        undefined);
+    const DTYPES = { fp32: 0, fp16: 1, int8: 2, int32: 3, bf16: 4, f64: 5 };
+    fn(ns_tensor, "dtype", DTYPES);
+    // A dtype argument the way the old binding took it: a name ("fp32"/"f32",
+    // "fp16"/"f16", "bf16", "int8"/"i8", ...), a bro.tensor.dtype enum value,
+    // or nothing (the default). Numbers map back to the name the native reads.
+    const DTYPE_NAMES = ["fp32", "fp16", "int8", "int32", "bf16", "f64"];
+    const dtypeName = (v, def) => {
+        if (v === undefined || v === null) return def;
+        if (typeof v === "string") return v;
+        if (typeof v === "number") return DTYPE_NAMES[v | 0] !== undefined ? DTYPE_NAMES[v | 0] : def;
+        throw new TypeError("dtype must be a string or a bro.tensor.dtype value");
+    };
+    // Throw what the last native recorded, if anything.
+    const chk = () => {
+        const e = __bro_native.tensor.takeError();
+        if (e) throw new Error(e);
+    };
+    // A counter-based RNG seed: BigInt or Number, passed through as-is.
+    const seed = (v, label) => {
+        if (typeof v === "number" || typeof v === "bigint") return v;
+        throw new TypeError(label + ": key / counter / state must be a Number or BigInt");
+    };
     fn(ns_tensor, "init", function init() {
         if (ns_tensor.available) {
             __bro_native.tensor.init();
@@ -105,8 +83,7 @@
         if (rows === undefined || rows < 0 || (cols !== undefined && cols < 0)) throw new RangeError("createTensor: invalid dims");
         const r = rows | 0;
         const c = cols !== undefined ? (cols | 0) : 1;
-        const dt = typeof dtype === "string" ? dtype : "fp32";
-        return __bro_native.tensor.createTensor(r, c, dt);
+        return __bro_native.tensor.createTensor(r, c, dtypeName(dtype, "fp32"));
     });
     fn(ns_tensor, "linearForward", function linearForward(W, b, x, y) {
         if (W === undefined) throw new TypeError("bro.tensor.linearForward: W is required");
@@ -199,7 +176,13 @@
         if (n === undefined) throw new TypeError("bro.tensor.copyD2D: n is required");
         __bro_native.tensor.copyD2D(src, srcOff, dst, dstOff, n);
     });
-    fn(ns_tensor, "cast", function cast(src, dst, outDtype) {});
+    // cast(src, dst, outDtype): dst = src converted (resized + dtype-set on
+    // src's device). FP32 <-> FP16 <-> BF16 plus a same-dtype copy.
+    fn(ns_tensor, "cast", function cast(src, dst, outDtype) {
+        if (!(src instanceof GpuTensor) || !(dst instanceof GpuTensor)) throw new TypeError("cast(src, dst, outDtype): src and dst must be GpuTensors");
+        __bro_native.tensor.cast(src, dst, dtypeName(outDtype, "fp32"));
+        chk();
+    });
     fn(ns_tensor, "siluForward", function siluForward(x, y) {
         if (x === undefined) throw new TypeError("bro.tensor.siluForward: x is required");
         if (y === undefined) throw new TypeError("bro.tensor.siluForward: y is required");
@@ -277,9 +260,20 @@
         if (dX === undefined) throw new TypeError("bro.tensor.gegluExactBackward: dX is required");
         __bro_native.tensor.gegluExactBackward(X, dY, dX);
     });
-    fn(ns_tensor, "softmaxForward", function softmaxForward(logits, probs, temp) {
+    // softmaxForward(logits, probs, mask|null): the old third argument is a
+    // length-N FP32 GpuTensor key mask (1 valid / 0 invalid). A number there
+    // is the temperature the port introduced, kept for callers of that form.
+    fn(ns_tensor, "softmaxForward", function softmaxForward(logits, probs, maskOrTemp) {
         if (logits === undefined || probs === undefined) throw new TypeError("bro.tensor.softmaxForward: logits, probs required");
-        __bro_native.tensor.softmaxForward(logits, probs, temp !== undefined ? temp : 1.0);
+        if (typeof maskOrTemp === "number") {
+            __bro_native.tensor.softmaxForward(logits, probs, maskOrTemp);
+            return;
+        }
+        if (maskOrTemp !== undefined && maskOrTemp !== null && !(maskOrTemp instanceof GpuTensor)) {
+            throw new TypeError("softmaxForward(logits, probs, mask|null): mask must be null or a GpuTensor");
+        }
+        __bro_native.tensor.softmaxForwardMasked(logits, probs, maskOrTemp === undefined ? null : maskOrTemp);
+        chk();
     });
     fn(ns_tensor, "softmaxBackward", function softmaxBackward(probs, dProbs, dLogits) {
         if (probs === undefined) throw new TypeError("bro.tensor.softmaxBackward: probs is required");
@@ -287,8 +281,15 @@
         if (dLogits === undefined) throw new TypeError("bro.tensor.softmaxBackward: dLogits is required");
         __bro_native.tensor.softmaxBackward(probs, dProbs, dLogits);
     });
+    // layernormForward(x, gamma, beta, y, xhat, eps) -> {mean, rstd}, the
+    // scalar caches layernormBackward takes.
     fn(ns_tensor, "layernormForward", function layernormForward(x, gamma, beta, y, xhat, eps) {
-        return { mean: 0, rstd: 1 };
+        if (x === undefined || gamma === undefined || beta === undefined || y === undefined || xhat === undefined) {
+            throw new TypeError("layernormForward(x, gamma, beta, y, xhat, eps)");
+        }
+        const stats = __bro_native.tensor.layernormForward(x, gamma, beta, y, xhat, eps === undefined ? 0.00001 : eps);
+        chk();
+        return { mean: stats[0], rstd: stats[1] };
     });
     fn(ns_tensor, "layernormBackward", function layernormBackward(dY, xhat, gamma, rstd, dX, dGamma, dBeta) {
         if (dY === undefined) throw new TypeError("bro.tensor.layernormBackward: dY is required");
@@ -435,17 +436,6 @@
         if (Idx === undefined) throw new TypeError("bro.tensor.argmaxRows: Idx is required");
         __bro_native.tensor.argmaxRows(X, Idx);
     });
-    fn(ns_tensor, "attentionForward", function attentionForward() { return 0; });
-    fn(ns_tensor, "attentionBackward", function attentionBackward() { return 0; });
-    fn(ns_tensor, "mhaForward", function mhaForward() { return 0; });
-    fn(ns_tensor, "mhaBackward", function mhaBackward() { return 0; });
-    fn(ns_tensor, "selfAttentionForward", function selfAttentionForward() { return 0; });
-    fn(ns_tensor, "selfAttentionForwardTrain", function selfAttentionForwardTrain() { return 0; });
-    fn(ns_tensor, "selfAttentionBackward", function selfAttentionBackward() { return 0; });
-    fn(ns_tensor, "crossAttentionForward", function crossAttentionForward() { return 0; });
-    fn(ns_tensor, "crossAttentionForwardWithAttn", function crossAttentionForwardWithAttn() { return 0; });
-    fn(ns_tensor, "crossAttentionForwardTrain", function crossAttentionForwardTrain() { return 0; });
-    fn(ns_tensor, "crossAttentionBackward", function crossAttentionBackward() { return 0; });
     fn(ns_tensor, "attentionTokenMoments", function attentionTokenMoments(Attn, h_lat, w_lat, mass, centroid) {
         if (Attn === undefined) throw new TypeError("bro.tensor.attentionTokenMoments: Attn is required");
         if (h_lat === undefined) throw new TypeError("bro.tensor.attentionTokenMoments: h_lat is required");
@@ -460,14 +450,6 @@
         if (mask === undefined) throw new TypeError("bro.tensor.buildCausalMaskRow: mask is required");
         __bro_native.tensor.buildCausalMaskRow(L, q, mask);
     });
-    fn(ns_tensor, "selfAttentionBiasForward", function selfAttentionBiasForward() { return 0; });
-    fn(ns_tensor, "flashAttentionForward", function flashAttentionForward() { return 0; });
-    fn(ns_tensor, "flashAttentionWindowedForward", function flashAttentionWindowedForward() { return 0; });
-    fn(ns_tensor, "flashAttentionBackward", function flashAttentionBackward() { return 0; });
-    fn(ns_tensor, "flashAttentionQkvoForward", function flashAttentionQkvoForward() { return 0; });
-    fn(ns_tensor, "flashAttentionQkvoBackward", function flashAttentionQkvoBackward() { return 0; });
-    fn(ns_tensor, "flashAttentionProjectKv", function flashAttentionProjectKv() { return 0; });
-    fn(ns_tensor, "flashAttentionQWithKvCachedForward", function flashAttentionQWithKvCachedForward() { return 0; });
     fn(ns_tensor, "flashAttentionDecode", function flashAttentionDecode(Q, K_cache, V_cache, validLen, numHeads, O, numKvHeads, attnSoftcap, window) {
         if (Q === undefined) throw new TypeError("bro.tensor.flashAttentionDecode: Q is required");
         if (K_cache === undefined) throw new TypeError("bro.tensor.flashAttentionDecode: K_cache is required");
@@ -682,10 +664,6 @@
         if (Y === undefined) throw new TypeError("bro.tensor.convexUpsampleForward: Y is required");
         __bro_native.tensor.convexUpsampleForward(X, Mask, N, C, H, W, scale, Y);
     });
-    fn(ns_tensor, "resblockForward", function resblockForward() { return 0; });
-    fn(ns_tensor, "resblockBackward", function resblockBackward() { return 0; });
-    fn(ns_tensor, "maskedMeanPoolForward", function maskedMeanPoolForward() { return 0; });
-    fn(ns_tensor, "maskedMeanPoolBackward", function maskedMeanPoolBackward() { return 0; });
     fn(ns_tensor, "mseVecForward", function mseVecForward(pred, target) {
         if (pred === undefined) throw new TypeError("bro.tensor.mseVecForward: pred is required");
         if (target === undefined) throw new TypeError("bro.tensor.mseVecForward: target is required");
@@ -704,8 +682,6 @@
         if (lossPerSample === undefined) throw new TypeError("bro.tensor.mseVecPerSample: lossPerSample is required");
         __bro_native.tensor.mseVecPerSample(pred, target, dPred, lossPerSample);
     });
-    fn(ns_tensor, "softmaxXentFused", function softmaxXentFused() { return 0; });
-    fn(ns_tensor, "softmaxXentFusedBatched", function softmaxXentFusedBatched() { return 0; });
     fn(ns_tensor, "embeddingLookupForward", function embeddingLookupForward(table, idxAsInt32, B, out) {
         if (table === undefined) throw new TypeError("bro.tensor.embeddingLookupForward: table is required");
         if (idxAsInt32 === undefined) throw new TypeError("bro.tensor.embeddingLookupForward: idxAsInt32 is required");
@@ -720,11 +696,6 @@
         if (dTable === undefined) throw new TypeError("bro.tensor.embeddingLookupBackward: dTable is required");
         __bro_native.tensor.embeddingLookupBackward(dOut, idxAsInt32, B, dTable);
     });
-    fn(ns_tensor, "concatRows", function concatRows() { return 0; });
-    fn(ns_tensor, "splitRows", function splitRows() { return 0; });
-    fn(ns_tensor, "concatBatchedRows", function concatBatchedRows() { return 0; });
-    fn(ns_tensor, "concatNchwChannels", function concatNchwChannels() { return 0; });
-    fn(ns_tensor, "concatNchwChannelsBackward", function concatNchwChannelsBackward() { return 0; });
     fn(ns_tensor, "sgdStep", function sgdStep(param, grad, velocity, lr, momentum) {
         if (param === undefined) throw new TypeError("bro.tensor.sgdStep: param is required");
         if (grad === undefined) throw new TypeError("bro.tensor.sgdStep: grad is required");
@@ -779,8 +750,10 @@
     fn(GpuTensor.prototype, "zero", function zero() {
         __bro_native.tensor.GpuTensor_zero(this);
     });
+    // resize(rows, cols, dtype?): dtype a name or a bro.tensor.dtype value.
     fn(GpuTensor.prototype, "resize", function resize(rows, cols, dtype) {
-        __bro_native.tensor.GpuTensor_resize(this, rows | 0, cols !== undefined ? (cols | 0) : 1, dtype || "fp32");
+        if (rows === undefined || cols === undefined) throw new TypeError("resize(rows, cols, dtype?)");
+        __bro_native.tensor.GpuTensor_resize(this, rows | 0, cols | 0, dtypeName(dtype, "fp32"));
     });
     fn(GpuTensor.prototype, "dtype", function dtype() {
         return __bro_native.tensor.GpuTensor_dtype(this);
@@ -792,15 +765,30 @@
         if (src === undefined) throw new TypeError("bro.tensor.GpuTensor.prototype.upload: src is required");
         __bro_native.tensor.GpuTensor_upload(this, toF32(src));
     });
-    fn(GpuTensor.prototype, "download", function download() {
-        return __bro_native.tensor.GpuTensor_download(this);
+    // download()    -> a fresh Float32Array (any dtype, converted to FP32).
+    // download(dst) -> fills the Float32Array `dst` in place and returns it;
+    //                  dst.length must be >= size. The old binding's dst was a
+    //                  bro.ai host tensor, a type this runtime no longer has.
+    fn(GpuTensor.prototype, "download", function download(dst) {
+        if (dst === undefined || dst === null) {
+            const out = __bro_native.tensor.GpuTensor_download(this);
+            chk();
+            return out;
+        }
+        if (!(dst instanceof Float32Array)) throw new TypeError("download(dst): dst must be a Float32Array (or omitted)");
+        const n = __bro_native.tensor.GpuTensor_size_get(this);
+        if (dst.length < n) throw new RangeError("download(dst): dst holds " + dst.length + " elements, tensor has " + n);
+        if (!__bro_native.tensor.GpuTensor_downloadInto(this, dst)) chk();
+        return dst;
     });
     fn(GpuTensor.prototype, "uploadFp16", function uploadFp16(data) {
         if (data === undefined) throw new TypeError("bro.tensor.GpuTensor.prototype.uploadFp16: data is required");
         __bro_native.tensor.GpuTensor_uploadFp16(this, toU16(data));
     });
     fn(GpuTensor.prototype, "downloadFp16", function downloadFp16() {
-        return __bro_native.tensor.GpuTensor_downloadFp16(this);
+        const out = __bro_native.tensor.GpuTensor_downloadFp16(this);
+        chk();
+        return out;
     });
     fn(GpuTensor.prototype, "uploadInt8", function uploadInt8(data) {
         if (data === undefined) throw new TypeError("bro.tensor.GpuTensor.prototype.uploadInt8: data is required");
@@ -808,5 +796,131 @@
     });
     fn(GpuTensor.prototype, "downloadInt8", function downloadInt8() {
         return __bro_native.tensor.GpuTensor_downloadInt8(this);
+    });
+
+    // ---- counter-based RNG (Philox) + init -------------------------------------
+    // key / counter / state: BigInt or Number. Y must be FP32 and pre-sized.
+    const rngTarget = (Y, label) => {
+        if (!(Y instanceof GpuTensor)) throw new TypeError(label + ": Y must be a GpuTensor");
+    };
+    fn(ns_tensor, "randUniform", function randUniform(key, counter, Y) {
+        rngTarget(Y, "randUniform(key, counter, Y)");
+        __bro_native.tensor.randUniform(seed(key, "randUniform"), seed(counter, "randUniform"), Y);
+        chk();
+    });
+    fn(ns_tensor, "randn", function randn(key, counter, Y) {
+        rngTarget(Y, "randn(key, counter, Y)");
+        __bro_native.tensor.randn(seed(key, "randn"), seed(counter, "randn"), Y);
+        chk();
+    });
+    fn(ns_tensor, "randBernoulli", function randBernoulli(p, key, counter, Y) {
+        rngTarget(Y, "randBernoulli(p, key, counter, Y)");
+        __bro_native.tensor.randBernoulli(+p, seed(key, "randBernoulli"), seed(counter, "randBernoulli"), Y);
+        chk();
+    });
+    fn(ns_tensor, "randnTruncated", function randnTruncated(lo, hi, key, counter, Y) {
+        rngTarget(Y, "randnTruncated(lo, hi, key, counter, Y)");
+        __bro_native.tensor.randnTruncated(+lo, +hi, seed(key, "randnTruncated"), seed(counter, "randnTruncated"), Y);
+        chk();
+    });
+    // xavierInit(W, rngState) -> the advanced state (a Number; the old binding
+    // answered a BigInt). Thread it through successive inits.
+    fn(ns_tensor, "xavierInit", function xavierInit(W, rngState) {
+        if (!(W instanceof GpuTensor)) throw new TypeError("xavierInit(W, rngState): W must be a GpuTensor");
+        const next = __bro_native.tensor.xavierInit(W, seed(rngState, "xavierInit"));
+        chk();
+        return next;
+    });
+
+    // ---- bro.tensor.SafetensorsFile --------------------------------------------
+    // openSafetensors(path) mmaps the file and returns one of these; header()
+    // and names() read metadata only, get() uploads one tensor, close()
+    // releases the mapping early (GC does it otherwise).
+    function SafetensorsFile() {
+        throw new TypeError("bro.tensor.SafetensorsFile is not constructible: bro.tensor.openSafetensors returns one");
+    }
+    {
+        const proto = __bro_native.tensor.SafetensorsFileProto;
+        if (proto === undefined) throw new Error("bro.tensor.SafetensorsFile: native class prototype not published (registerNatives_tensor did not run)");
+        Object.setPrototypeOf(proto, SafetensorsFile.prototype);
+    }
+    fn(ns_tensor, "SafetensorsFile", SafetensorsFile);
+    const stOpen = (self, label) => {
+        if (!__bro_native.tensor.SafetensorsFile_isOpen(self)) throw new Error(label + "() on a closed safetensors file");
+    };
+    accessor(SafetensorsFile.prototype, "count",
+        function () {
+            return __bro_native.tensor.SafetensorsFile_count_get(this);
+        },
+        undefined);
+    fn(SafetensorsFile.prototype, "names", function names() {
+        stOpen(this, "names");
+        const n = __bro_native.tensor.SafetensorsFile_count_get(this);
+        const out = new Array(n);
+        for (let i = 0; i < n; i++) out[i] = __bro_native.tensor.SafetensorsFile_nameAt(this, i);
+        return out;
+    });
+    // header() -> { name: { dtype: "F32"|"F16"|"BF16"|..., shape: number[], nbytes }, ... }
+    fn(SafetensorsFile.prototype, "header", function header() {
+        stOpen(this, "header");
+        const n = __bro_native.tensor.SafetensorsFile_count_get(this);
+        const out = {};
+        for (let i = 0; i < n; i++) {
+            out[__bro_native.tensor.SafetensorsFile_nameAt(this, i)] = {
+                dtype: __bro_native.tensor.SafetensorsFile_dtypeAt(this, i),
+                shape: Array.from(__bro_native.tensor.SafetensorsFile_shapeAt(this, i)),
+                nbytes: __bro_native.tensor.SafetensorsFile_nbytesAt(this, i),
+            };
+        }
+        return out;
+    });
+    // get(name, rows?, cols?, dtype?) -> GpuTensor. rows/cols omitted: the N-D
+    // source flattens to (shape[0], numel/shape[0]). dtype: "native" (default,
+    // the file's dtype) | "compute" (the backend's compute dtype) | "fp16";
+    // the string may stand in place of, or after, rows/cols.
+    fn(SafetensorsFile.prototype, "get", function get(name, a, b, c) {
+        stOpen(this, "get");
+        if (typeof name !== "string") throw new TypeError("get(name, rows?, cols?, dtype?)");
+        let mode = "native";
+        if (typeof a === "string") mode = a;
+        if (typeof b === "string") mode = b;
+        if (typeof c === "string") mode = c;
+        let rows = 0, cols = 0;
+        if (typeof a === "number" && typeof b === "number") {
+            rows = a | 0;
+            cols = b | 0;
+        }
+        const t = __bro_native.tensor.SafetensorsFile_get(this, name, rows, cols, mode);
+        if (t === null) {
+            const e = __bro_native.tensor.takeError() || "get: failed";
+            throw e.indexOf("no tensor named") >= 0 ? new RangeError(e) : new TypeError(e);
+        }
+        return t;
+    });
+    fn(SafetensorsFile.prototype, "close", function close() {
+        __bro_native.tensor.SafetensorsFile_close(this);
+    });
+    fn(ns_tensor, "openSafetensors", function openSafetensors(path) {
+        if (typeof path !== "string") throw new TypeError("openSafetensors(path) — expected a string path");
+        const f = __bro_native.tensor.openSafetensors(path);
+        if (f === null) throw new TypeError(__bro_native.tensor.takeError() || ("openSafetensors: cannot open " + path));
+        return f;
+    });
+    // saveSafetensors(path, { name: GpuTensor, ... }): FP32 and FP16 tensors,
+    // shape stored as (rows, cols).
+    fn(ns_tensor, "saveSafetensors", function saveSafetensors(path, tensors) {
+        if (typeof path !== "string" || tensors === null || typeof tensors !== "object") {
+            throw new TypeError("saveSafetensors(path, {name: tensor, ...})");
+        }
+        const names = Object.keys(tensors);
+        const values = new Array(names.length);
+        for (let i = 0; i < names.length; i++) {
+            const v = tensors[names[i]];
+            if (!(v instanceof GpuTensor)) throw new TypeError("saveSafetensors: value for '" + names[i] + "' is not a tensor");
+            values[i] = v;
+        }
+        if (!__bro_native.tensor.saveSafetensors(path, names, values)) {
+            throw new TypeError(__bro_native.tensor.takeError() || "saveSafetensors: failed");
+        }
     });
 })();
