@@ -241,8 +241,19 @@ bool bro_tensor_available_get(void) {
     return true;
 }
 
+// The old binding published a lowercase identifier ("cuda" | "metal" |
+// "unknown"), and everything written against bro.tensor compares against one:
+// js/tensor.js falls back to "cpu", the docs spell the values lowercase and
+// every caller gates with `backend === "cpu"` / `!== "cpu"`. device_name()
+// answers a display name ("CPU", "CUDA", "Metal", "CUDA:1"), so lower-case it
+// here rather than hand JS a string no gate can match.
 const char* bro_tensor_backend_get(void) {
-    return brotensor::device_name(brotensor::default_device());
+    static thread_local std::string name;
+    name = brotensor::device_name(brotensor::default_device());
+    for (char& c : name) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    }
+    return name.c_str();
 }
 
 void bro_tensor_init(void) {

@@ -1,4 +1,5 @@
 #include "api/api.h"
+#include "api_test_helpers.h"
 #include "embed/embed.h"
 #include "eval/eval.h"
 #include "brotensor/tensor.h"
@@ -628,6 +629,14 @@ int main() {
     test_js_download_and_dtypes();
     test_js_restored_ops();
     test_js_attention();
+
+    // The restored free-function groups keep their checks beside themselves.
+    g_failures += run_api_batched_tests();
+    g_failures += run_api_attn2_tests();
+    g_failures += run_api_audio_tests();
+    g_failures += run_api_conv_tests();
+    g_failures += run_api_int8_tests();
+    g_failures += run_api_misc_tests();
 
     if (g_failures > 0) {
         std::printf("FAILED: %d assertions failed\n", g_failures);

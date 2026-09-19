@@ -46,7 +46,15 @@ if(NOT BROTENSOR_API_COMPILED_JS)
     message(STATUS "brotensor: brotensor_test_api not registered (no compiled JS on this target)")
 endif()
 if(BROTENSOR_API_COMPILED_JS)
-add_executable(brotensor_test_api test_api.cpp)
+add_executable(brotensor_test_api
+    test_api.cpp
+    test_api_batched.cpp
+    test_api_attn2.cpp
+    test_api_audio.cpp
+    test_api_conv.cpp
+    test_api_int8.cpp
+    test_api_misc.cpp
+)
 # brass FIRST, and /INCLUDE a symbol only brass's GC object defines: both
 # brass.lib and bronze_runtime_shared.dll define brass_gc_write_barrier, and
 # the bronze-compiled tensor.o inside brotensor_api references it the way a

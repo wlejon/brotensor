@@ -10,6 +10,13 @@ set(BROTENSOR_API_NATIVE_SOURCES
     native_tensor_nn.cpp
     native_tensor_attention.cpp
     native_tensor_safetensors.cpp
+    native_tensor_batched.cpp
+    native_tensor_attn2.cpp
+    native_tensor_audio.cpp
+    native_tensor_audio_b.cpp
+    native_tensor_conv.cpp
+    native_tensor_int8.cpp
+    native_tensor_misc.cpp
 )
 
 if(NOT BRASS_HOST_BACKEND)
@@ -62,13 +69,18 @@ else()
 
     set(BROTENSOR_GLOBALS "${CMAKE_CURRENT_SOURCE_DIR}/tensor.globals")
 
-    # Two compiled modules, one entry symbol each, mounted in this order by
-    # installTensorJS: js/tensor.js (bro.tensor, GpuTensor, the dense /
-    # elementwise / conv surface, safetensors, RNG) and js/tensor_ext.js (the
-    # attention family, losses, pooling, concat). Split so each file stays
-    # readable; both read the same host globals and the same native manifest.
+    # One compiled module per file, one entry symbol each, mounted in this
+    # order by installTensorJS: js/tensor.js (bro.tensor, GpuTensor, the dense
+    # / elementwise / conv surface, safetensors, RNG), js/tensor_ext.js (the
+    # attention family, losses, pooling, concat), then the restored groups —
+    # batched dense + gather/scatter/topK, the second attention family
+    # (decomposed rel-pos, varlen flash, gated delta rule, mrope), the audio /
+    # 1-D / spectral family, the 2-D conv + pooling + batch-norm family, the
+    # GGUF-quant + INT8-W8A16 family and the l2/bce/diffusion-sampler
+    # leftovers. Split so each file stays readable; they all read the same host
+    # globals and the same native manifest.
     set(BROTENSOR_COMPILED_JS_OBJECTS "")
-    foreach(module tensor tensor_ext)
+    foreach(module tensor tensor_ext tensor_batched tensor_attn2 tensor_audio tensor_conv tensor_int8 tensor_misc)
         set(INPUT "${CMAKE_CURRENT_SOURCE_DIR}/js/${module}.js")
         set(OUTPUT "${GEN_DIR}/${module}.o")
         add_custom_command(

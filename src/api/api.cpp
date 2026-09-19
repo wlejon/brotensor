@@ -1,12 +1,24 @@
 #include "api.h"
 #include "api_internal.h"
 #include "native_tensor_decl.h"
+#include "native_tensor_batched_decl.h"
+#include "native_tensor_attn2_decl.h"
+#include "native_tensor_audio_decl.h"
+#include "native_tensor_conv_decl.h"
+#include "native_tensor_int8_decl.h"
+#include "native_tensor_misc_decl.h"
 
 #include <initializer_list>
 #include <string>
 
 extern "C" void bronze_tensor_main(void);
 extern "C" void bronze_tensor_ext_main(void);
+extern "C" void bronze_tensor_batched_main(void);
+extern "C" void bronze_tensor_attn2_main(void);
+extern "C" void bronze_tensor_audio_main(void);
+extern "C" void bronze_tensor_conv_main(void);
+extern "C" void bronze_tensor_int8_main(void);
+extern "C" void bronze_tensor_misc_main(void);
 
 namespace brotensor::api {
 
@@ -236,6 +248,16 @@ bool registerTensorNatives(std::string* error) {
         fn("__bro_native.tensor.sgdStep", p(&bro_tensor_sgdStep), "void", {kTensorCls, kTensorCls, kTensorCls, "f64", "f64"}, error) &&
         fn("__bro_native.tensor.adamStep", p(&bro_tensor_adamStep), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, "f64", "f64", "f64", "f64", "i32"}, error);
 
+    // The restored free-function groups: each native file owns its own table
+    // so the files stay readable (see native_register.h).
+    ok = ok &&
+        registerTensorNatives_batched(error) &&
+        registerTensorNatives_attn2(error) &&
+        registerTensorNatives_audio(error) &&
+        registerTensorNatives_conv(error) &&
+        registerTensorNatives_int8(error) &&
+        registerTensorNatives_misc(error);
+
     if (!ok) return false;
     publishPrototype("tensor", kTensorCls, "GpuTensorProto");
     publishPrototype("tensor", kStCls, "SafetensorsFileProto");
@@ -248,6 +270,14 @@ void installTensorJS() {
     // loss / concat family and reads GpuTensor for its argument checks.
     ev::runEntry(bronze_tensor_main);
     ev::runEntry(bronze_tensor_ext_main);
+    // The restored groups decorate the same namespace and read GpuTensor for
+    // their argument checks, so they all run after those two.
+    ev::runEntry(bronze_tensor_batched_main);
+    ev::runEntry(bronze_tensor_attn2_main);
+    ev::runEntry(bronze_tensor_audio_main);
+    ev::runEntry(bronze_tensor_conv_main);
+    ev::runEntry(bronze_tensor_int8_main);
+    ev::runEntry(bronze_tensor_misc_main);
 }
 
 void installTensor() {
