@@ -317,6 +317,103 @@ void launch_modulate_ptx(
     }
 }
 
+void launch_elementwise_div_ptx(
+    float* Y,
+    const float* X,
+    int n,
+    void* stream
+) {
+    if (n <= 0) return;
+
+    static const std::string ptx = R"(
+.version 7.8
+.target sm_89
+.address_size 64
+
+.visible .entry elementwise_div_kernel(
+    .param .u64 param_y,
+    .param .u64 param_x,
+    .param .u32 param_n
+) {
+    .reg .b32 %r_tid, %r_ntid, %r_ctaid, %r_ncta, %r_stride, %r_idx, %r_n;
+    .reg .pred %p_oob;
+    .reg .b64 %r_off64;
+    .reg .b64 %r_p_y, %r_addr_y;
+    .reg .b64 %r_p_x, %r_addr_x;
+    .reg .f32 %f_y, %f_x, %f_res;
+
+    ld.param.u32 %r_n, [param_n];
+    ld.param.u64 %r_p_y, [param_y];
+    ld.param.u64 %r_p_x, [param_x];
+
+    mov.u32 %r_tid, %tid.x;
+    mov.u32 %r_ntid, %ntid.x;
+    mov.u32 %r_ctaid, %ctaid.x;
+    mov.u32 %r_ncta, %nctaid.x;
+    mad.lo.u32 %r_idx, %r_ctaid, %r_ntid, %r_tid;
+    mul.lo.u32 %r_stride, %r_ntid, %r_ncta;
+
+LOOP:
+    setp.ge.u32 %p_oob, %r_idx, %r_n;
+    @%p_oob bra EXIT;
+
+    cvt.u64.u32 %r_off64, %r_idx;
+    shl.b64 %r_off64, %r_off64, 2;
+
+    add.u64 %r_addr_y, %r_p_y, %r_off64;
+    ld.global.f32 %f_y, [%r_addr_y];
+
+    add.u64 %r_addr_x, %r_p_x, %r_off64;
+    ld.global.f32 %f_x, [%r_addr_x];
+
+    div.rn.f32 %f_res, %f_y, %f_x;
+    st.global.f32 [%r_addr_y], %f_res;
+
+    add.u32 %r_idx, %r_idx, %r_stride;
+    bra LOOP;
+
+EXIT:
+    ret;
+}
+)";
+
+    CUfunction fn = CudaJitEngine::instance().get_function(
+        "elementwise_div",
+        ptx,
+        "elementwise_div_kernel"
+    );
+
+    CUdeviceptr d_y = reinterpret_cast<CUdeviceptr>(Y);
+    CUdeviceptr d_x = reinterpret_cast<CUdeviceptr>(X);
+    uint32_t n_arg = static_cast<uint32_t>(n);
+
+    void* kernel_params[] = {
+        &d_y,
+        &d_x,
+        &n_arg
+    };
+
+    unsigned int block_size = 256;
+    unsigned int grid_size = (n_arg + block_size - 1) / block_size;
+    if (grid_size == 0) grid_size = 1;
+    if (grid_size > 65535) grid_size = 65535;
+
+    CUstream custream = resolve_stream(stream);
+    CUresult status = drv::cuLaunchKernel(
+        fn,
+        grid_size, 1, 1,
+        block_size, 1, 1,
+        0,
+        custream,
+        kernel_params,
+        nullptr
+    );
+
+    if (status != CUDA_SUCCESS) {
+        throw std::runtime_error("cuLaunchKernel failed for elementwise_div_kernel");
+    }
+}
+
 #else // !BROTENSOR_HAS_BRASS_CUDA_JIT
 
 void launch_fused_residual_rmsnorm_ptx(float*, const float*, const float*, float*, int, int, float, void*) {}
@@ -324,6 +421,7 @@ void launch_fused_residual_layernorm_ptx(float*, const float*, const float*, con
 void launch_fused_layernorm_modulate_ptx(const float*, const float*, const float*, const float*, const float*, float*, int, int, float, void*) {}
 void launch_swiglu_ptx(const float*, float*, int, int, void*) {}
 void launch_modulate_ptx(const float*, const float*, const float*, float*, int, int, void*) {}
+void launch_elementwise_div_ptx(float*, const float*, int, void*) {}
 
 #endif // BROTENSOR_HAS_BRASS_CUDA_JIT
 

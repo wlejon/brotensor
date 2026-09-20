@@ -82,6 +82,14 @@ void launch_modulate_ptx(
     void* stream = nullptr
 );
 
+// Launches parallel PTX kernel for elementwise division: Y[i] /= X[i]
+void launch_elementwise_div_ptx(
+    float* Y,
+    const float* X,
+    int n,
+    void* stream = nullptr
+);
+
 // Launches parallel PTX kernel for Fused GEMV SwiGLU:
 // Single-token decode (M=1): computes dot products with Gate and Up weight matrices (N x K),
 // warp-shuffle reduction, fast in-register SiLU(gate) * up, and stores directly to Y.

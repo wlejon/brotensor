@@ -266,6 +266,30 @@ static void test_js_safetensors() {
         const hd = g.get("h").download();
         if (!same(hd[0], 1.5) || !same(hd[1], -2)) throw new Error("saved h data: " + Array.from(hd));
         g.close();
+
+        // 4D tensor shape preservation test
+        const t4d = tensor.createTensor(2, 12);
+        t4d.shape = [2, 3, 2, 2];
+        tensor.saveSafetensors(savedPath, { t4d: t4d });
+        const g2 = tensor.openSafetensors(savedPath);
+        const gh2 = g2.header();
+        if (!gh2.t4d || gh2.t4d.shape.length !== 4 || gh2.t4d.shape[0] !== 2 || gh2.t4d.shape[1] !== 3 || gh2.t4d.shape[2] !== 2 || gh2.t4d.shape[3] !== 2) {
+            throw new Error("saved t4d header: " + JSON.stringify(gh2.t4d));
+        }
+        const t4d_loaded = g2.get("t4d");
+        if (!t4d_loaded.shape || t4d_loaded.shape.length !== 4 || t4d_loaded.shape[1] !== 3) {
+            throw new Error("loaded t4d shape: " + JSON.stringify(t4d_loaded.shape));
+        }
+        // Round-trip saving the loaded 4D tensor
+        tensor.saveSafetensors(savedPath, { t4d_copy: t4d_loaded });
+        g2.close();
+        const g3 = tensor.openSafetensors(savedPath);
+        const gh3 = g3.header();
+        if (!gh3.t4d_copy || gh3.t4d_copy.shape.length !== 4 || gh3.t4d_copy.shape[1] !== 3) {
+            throw new Error("re-saved t4d_copy header: " + JSON.stringify(gh3.t4d_copy));
+        }
+        g3.close();
+
         threw = false;
         try { tensor.saveSafetensors(savedPath, { w: 5 }); } catch (e) { threw = e instanceof TypeError; }
         if (!threw) throw new Error("saveSafetensors with a non-tensor did not throw");

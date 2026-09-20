@@ -71,9 +71,10 @@ const char* bro_tensor_GpuTensor_dtype(void* self) {
 
 void* bro_tensor_GpuTensor_clone(void* self) {
     auto* h = new GpuTensorHandle();
-    auto* t = toTensor(self);
-    if (t) {
-        h->tensor = t->clone();
+    auto* src = toHandle(self);
+    if (src) {
+        h->tensor = src->tensor.clone();
+        h->shape = src->shape;
     }
     return h;
 }

@@ -14,7 +14,18 @@ namespace brotensor::api {
 
 struct GpuTensorHandle {
     brotensor::Tensor tensor;
+    std::vector<int64_t> shape;
 };
+
+inline GpuTensorHandle* toHandle(void* ptr) {
+    if (!ptr) return nullptr;
+    return static_cast<GpuTensorHandle*>(ptr);
+}
+
+inline const GpuTensorHandle* constHandle(const void* ptr) {
+    if (!ptr) return nullptr;
+    return static_cast<const GpuTensorHandle*>(ptr);
+}
 
 inline brotensor::Tensor* toTensor(void* ptr) {
     if (!ptr) return nullptr;

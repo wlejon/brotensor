@@ -747,6 +747,14 @@
             return __bro_native.tensor.GpuTensor_bytes_get(this);
         },
         undefined);
+    accessor(GpuTensor.prototype, "shape",
+        function () {
+            if (this._shape && Array.isArray(this._shape)) return this._shape.slice();
+            return [this.rows, this.cols];
+        },
+        function (s) {
+            if (Array.isArray(s)) this._shape = s.slice();
+        });
     fn(GpuTensor.prototype, "zero", function zero() {
         __bro_native.tensor.GpuTensor_zero(this);
     });
@@ -894,6 +902,12 @@
         if (t === null) {
             const e = __bro_native.tensor.takeError() || "get: failed";
             throw e.indexOf("no tensor named") >= 0 ? new RangeError(e) : new TypeError(e);
+        }
+        if (rows === 0 && cols === 0) {
+            const h = this.header();
+            if (h && h[name] && Array.isArray(h[name].shape)) {
+                t.shape = h[name].shape.slice();
+            }
         }
         return t;
     });

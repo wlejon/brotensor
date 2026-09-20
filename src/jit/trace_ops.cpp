@@ -114,7 +114,19 @@ Tensor operator/(const Tensor& a, const Tensor& b) {
         int n = a.size();
         for (int i = 0; i < n; ++i) p_out[i] /= p_b[i];
     } else {
-        throw std::runtime_error("brotensor: elementwise eager div on GPU not implemented");
+#if BROTENSOR_HAS_CUDA
+        if (a.device.is_cuda()) {
+            detail::cuda::jit::launch_elementwise_div_ptx(
+                out.ptr(),
+                b.ptr(),
+                a.size()
+            );
+        } else {
+            throw std::runtime_error("brotensor: elementwise eager div on GPU requires CUDA backend");
+        }
+#else
+        throw std::runtime_error("brotensor: elementwise eager div on GPU requires CUDA backend");
+#endif
     }
     return out;
 }

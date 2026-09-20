@@ -24,6 +24,7 @@
 namespace stns = brotensor::safetensors;
 namespace ev = bronze::embed;
 using namespace brotensor::api;
+using Value = bronze::Value;
 
 namespace {
 
@@ -145,6 +146,7 @@ void* bro_tensor_SafetensorsFile_get(void* self, const char* name, int32_t rows,
         }
     }
     auto* gt = new GpuTensorHandle();
+    gt->shape = (rows <= 0 || cols <= 0) ? tv->shape : std::vector<int64_t>{rows, cols};
     try {
         if (mode && std::strcmp(mode, "compute") == 0) {
             stns::upload_compute(*tv, r, c, gt->tensor);
@@ -188,15 +190,53 @@ bool bro_tensor_saveSafetensors(const char* path, uint64_t names_bits, uint64_t 
         brotensor::sync_all();
         for (uint32_t i = 0; i < n; ++i) {
             const std::string key = ev::toUtf8(ev::getElement(names.get(), i));
-            void* d = ev::handleData(ev::getElement(tensors.get(), i));
-            auto* gt = d ? toTensor(d) : nullptr;
+            Value tVal = ev::getElement(tensors.get(), i);
+            void* d = ev::handleData(tVal);
+            auto* gh = d ? toHandle(d) : nullptr;
+            auto* gt = gh ? &gh->tensor : nullptr;
             if (!gt) {
                 setError("saveSafetensors: value for '" + key + "' is not a tensor");
                 return false;
             }
             stns::WriteEntry e;
             e.name = key;
-            e.shape = {gt->rows, gt->cols};
+
+            // Preserve full n-dimensional tensor shape if present
+            bool shapeSet = false;
+            Value shapeProp = ev::getProperty(tVal, "shape");
+            if (ev::isObject(shapeProp)) {
+                Value lenVal = ev::getProperty(shapeProp, "length");
+                if (ev::isNumber(lenVal)) {
+                    uint32_t shapeLen = static_cast<uint32_t>(ev::toDouble(lenVal));
+                    if (shapeLen > 0) {
+                        std::vector<int64_t> customShape;
+                        customShape.reserve(shapeLen);
+                        int64_t numel = 1;
+                        for (uint32_t s = 0; s < shapeLen; ++s) {
+                            int64_t dim = static_cast<int64_t>(ev::toDouble(ev::getElement(shapeProp, s)));
+                            customShape.push_back(dim);
+                            numel *= dim;
+                        }
+                        if (numel == static_cast<int64_t>(gt->rows) * gt->cols) {
+                            e.shape = std::move(customShape);
+                            shapeSet = true;
+                        }
+                    }
+                }
+            }
+
+            if (!shapeSet && gh && !gh->shape.empty()) {
+                int64_t numel = 1;
+                for (int64_t dim : gh->shape) numel *= dim;
+                if (numel == static_cast<int64_t>(gt->rows) * gt->cols) {
+                    e.shape = gh->shape;
+                    shapeSet = true;
+                }
+            }
+
+            if (!shapeSet) {
+                e.shape = {gt->rows, gt->cols};
+            }
             brotensor::Tensor host = gt->to(brotensor::Device::CPU);
             if (host.dtype == brotensor::Dtype::FP32) {
                 f32store.push_back(host.to_host_vector());
