@@ -1,5 +1,109 @@
 #include "cpu_jit.h"
 #include <brotensor/detail/cpu/thread_pool.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+
+namespace brotensor::detail::cpu::jit {
+namespace ref {
+
+inline void fused_residual_rmsnorm(float* X, const float* res, const float* gamma, float eps, float* Y, int B, int D) {
+    if (B <= 0 || D <= 0) return;
+    const float inv_D = 1.0f / static_cast<float>(D);
+    auto row_fn = [&](int b) {
+        float* xr       = X + static_cast<size_t>(b) * D;
+        const float* rr = res + static_cast<size_t>(b) * D;
+        float* yr       = Y + static_cast<size_t>(b) * D;
+        float sum = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            xr[i] += rr[i];
+            sum += xr[i] * xr[i];
+        }
+        float rrms = 1.0f / std::sqrt(sum * inv_D + eps);
+        for (int i = 0; i < D; ++i) {
+            yr[i] = xr[i] * gamma[i] * rrms;
+        }
+    };
+    if (B > 1 && static_cast<int64_t>(B) * D >= 262144) {
+        detail::cpu::parallel_for(static_cast<size_t>(B), [&](size_t bi) {
+            row_fn(static_cast<int>(bi));
+        });
+    } else {
+        for (int b = 0; b < B; ++b) row_fn(b);
+    }
+}
+
+inline void fused_residual_layernorm(float* X, const float* res, const float* gamma, const float* beta,
+                                     float eps, float* Y, int B, int D) {
+    if (B <= 0 || D <= 0) return;
+    const float inv_D = 1.0f / static_cast<float>(D);
+    auto row_fn = [&](int b) {
+        float* xr       = X + static_cast<size_t>(b) * D;
+        const float* rr = res + static_cast<size_t>(b) * D;
+        float* yr       = Y + static_cast<size_t>(b) * D;
+        float sum = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            xr[i] += rr[i];
+            sum += xr[i];
+        }
+        float mean = sum * inv_D;
+        float sumsq = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            float diff = xr[i] - mean;
+            sumsq += diff * diff;
+        }
+        float var = sumsq * inv_D;
+        float rstd = 1.0f / std::sqrt(var + eps);
+        for (int i = 0; i < D; ++i) {
+            float g = gamma ? gamma[i] : 1.0f;
+            float bv = beta ? beta[i] : 0.0f;
+            yr[i] = g * ((xr[i] - mean) * rstd) + bv;
+        }
+    };
+    if (B > 1 && static_cast<int64_t>(B) * D >= 262144) {
+        detail::cpu::parallel_for(static_cast<size_t>(B), [&](size_t bi) {
+            row_fn(static_cast<int>(bi));
+        });
+    } else {
+        for (int b = 0; b < B; ++b) row_fn(b);
+    }
+}
+
+inline void fused_layernorm_modulate(const float* X, const float* gamma, const float* beta,
+                                     const float* scale, const float* shift, float eps, float* Y, int R, int D) {
+    if (R <= 0 || D <= 0) return;
+    const float inv_D = 1.0f / static_cast<float>(D);
+    auto row_fn = [&](int r) {
+        const float* xr = X + static_cast<size_t>(r) * D;
+        float* yr       = Y + static_cast<size_t>(r) * D;
+        float sum = 0.0f;
+        for (int i = 0; i < D; ++i) sum += xr[i];
+        float mean = sum * inv_D;
+        float sumsq = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            float diff = xr[i] - mean;
+            sumsq += diff * diff;
+        }
+        float var = sumsq * inv_D;
+        float rstd = 1.0f / std::sqrt(var + eps);
+        for (int i = 0; i < D; ++i) {
+            float g = gamma ? gamma[i] : 1.0f;
+            float bv = beta ? beta[i] : 0.0f;
+            float norm = g * ((xr[i] - mean) * rstd) + bv;
+            yr[i] = norm * (1.0f + scale[i]) + shift[i];
+        }
+    };
+    if (R > 1 && static_cast<int64_t>(R) * D >= 262144) {
+        detail::cpu::parallel_for(static_cast<size_t>(R), [&](size_t ri) {
+            row_fn(static_cast<int>(ri));
+        });
+    } else {
+        for (int r = 0; r < R; ++r) row_fn(r);
+    }
+}
+
+} // namespace ref
+} // namespace brotensor::detail::cpu::jit
 
 #if BROTENSOR_HAS_BRASS_JIT
 
@@ -712,7 +816,10 @@ static const JitFusedKernels& get_fused_kernels() {
 
 void fused_residual_rmsnorm(float* X, const float* res, const float* gamma, float eps, float* Y, int B, int D) {
     const auto& k = get_fused_kernels();
-    if (!k.available || k.fused_residual_rmsnorm_row_fn == nullptr) return;
+    if (!k.available || k.fused_residual_rmsnorm_row_fn == nullptr) {
+        ref::fused_residual_rmsnorm(X, res, gamma, eps, Y, B, D);
+        return;
+    }
 
     const float inv_D = 1.0f / static_cast<float>(D);
 
@@ -737,7 +844,10 @@ void fused_residual_rmsnorm(float* X, const float* res, const float* gamma, floa
 void fused_residual_layernorm(float* X, const float* res, const float* gamma, const float* beta,
                               float eps, float* Y, int B, int D) {
     const auto& k = get_fused_kernels();
-    if (!k.available || k.fused_residual_layernorm_row_fn == nullptr) return;
+    if (!k.available || k.fused_residual_layernorm_row_fn == nullptr) {
+        ref::fused_residual_layernorm(X, res, gamma, beta, eps, Y, B, D);
+        return;
+    }
 
     const float inv_D = 1.0f / static_cast<float>(D);
 
@@ -762,7 +872,10 @@ void fused_residual_layernorm(float* X, const float* res, const float* gamma, co
 void fused_layernorm_modulate(const float* X, const float* gamma, const float* beta,
                               const float* scale, const float* shift, float eps, float* Y, int R, int D) {
     const auto& k = get_fused_kernels();
-    if (!k.available || k.fused_layernorm_modulate_row_fn == nullptr) return;
+    if (!k.available || k.fused_layernorm_modulate_row_fn == nullptr) {
+        ref::fused_layernorm_modulate(X, gamma, beta, scale, shift, eps, Y, R, D);
+        return;
+    }
 
     const float inv_D = 1.0f / static_cast<float>(D);
 
@@ -788,9 +901,16 @@ void fused_layernorm_modulate(const float* X, const float* gamma, const float* b
 
 namespace brotensor::detail::cpu::jit {
 
-void fused_residual_rmsnorm(float*, const float*, const float*, float, float*, int, int) {}
-void fused_residual_layernorm(float*, const float*, const float*, const float*, float, float*, int, int) {}
-void fused_layernorm_modulate(const float*, const float*, const float*, const float*, const float*, float, float*, int, int) {}
+void fused_residual_rmsnorm(float* X, const float* res, const float* gamma, float eps, float* Y, int B, int D) {
+    ref::fused_residual_rmsnorm(X, res, gamma, eps, Y, B, D);
+}
+void fused_residual_layernorm(float* X, const float* res, const float* gamma, const float* beta, float eps, float* Y, int B, int D) {
+    ref::fused_residual_layernorm(X, res, gamma, beta, eps, Y, B, D);
+}
+void fused_layernorm_modulate(const float* X, const float* gamma, const float* beta,
+                              const float* scale, const float* shift, float eps, float* Y, int R, int D) {
+    ref::fused_layernorm_modulate(X, gamma, beta, scale, shift, eps, Y, R, D);
+}
 
 } // namespace brotensor::detail::cpu::jit
 

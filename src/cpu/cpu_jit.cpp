@@ -1,5 +1,123 @@
 #include "cpu_jit.h"
 #include <brotensor/detail/cpu/thread_pool.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+
+namespace brotensor::detail::cpu::jit {
+namespace ref {
+
+inline void rms_norm(const float* X, const float* gamma, float eps, float* Y, int B, int D) {
+    if (B <= 0 || D <= 0) return;
+    const float inv_D = 1.0f / static_cast<float>(D);
+    auto row_fn = [&](int b) {
+        const float* xr = X + static_cast<size_t>(b) * D;
+        float* yr       = Y + static_cast<size_t>(b) * D;
+        float sum = 0.0f;
+        for (int i = 0; i < D; ++i) sum += xr[i] * xr[i];
+        float rrms = 1.0f / std::sqrt(sum * inv_D + eps);
+        for (int i = 0; i < D; ++i) yr[i] = xr[i] * gamma[i] * rrms;
+    };
+    if (B > 1 && static_cast<int64_t>(B) * D >= 262144) {
+        detail::cpu::parallel_for(static_cast<size_t>(B), [&](size_t bi) {
+            row_fn(static_cast<int>(bi));
+        });
+    } else {
+        for (int b = 0; b < B; ++b) row_fn(b);
+    }
+}
+
+inline void swiglu(const float* X, float* Y, int B, int D) {
+    if (B <= 0 || D <= 0) return;
+    auto row_fn = [&](int b) {
+        const float* gate = X + static_cast<size_t>(b) * 2 * D;
+        const float* up   = gate + D;
+        float* out        = Y + static_cast<size_t>(b) * D;
+        for (int i = 0; i < D; ++i) {
+            float g = gate[i];
+            float silu = g / (1.0f + std::exp(-g));
+            out[i] = silu * up[i];
+        }
+    };
+    if (B > 1 && static_cast<int64_t>(B) * D >= 16384) {
+        detail::cpu::parallel_for(static_cast<size_t>(B), [&](size_t bi) {
+            row_fn(static_cast<int>(bi));
+        });
+    } else {
+        for (int b = 0; b < B; ++b) row_fn(b);
+    }
+}
+
+inline void modulate(const float* X, const float* scale, const float* shift, float* Y, int L, int D) {
+    if (L <= 0 || D <= 0) return;
+    auto row_fn = [&](int l) {
+        const float* xr = X + static_cast<size_t>(l) * D;
+        float* yr       = Y + static_cast<size_t>(l) * D;
+        for (int d = 0; d < D; ++d) {
+            yr[d] = xr[d] * (1.0f + scale[d]) + shift[d];
+        }
+    };
+    if (L > 1 && static_cast<int64_t>(L) * D >= 262144) {
+        detail::cpu::parallel_for(static_cast<size_t>(L), [&](size_t li) {
+            row_fn(static_cast<int>(li));
+        });
+    } else {
+        for (int l = 0; l < L; ++l) row_fn(l);
+    }
+}
+
+inline void broadcast_mul(const float* X, const float* v, float* Y, int L, int D) {
+    if (L <= 0 || D <= 0) return;
+    auto row_fn = [&](int l) {
+        const float* xr = X + static_cast<size_t>(l) * D;
+        float* yr       = Y + static_cast<size_t>(l) * D;
+        for (int d = 0; d < D; ++d) {
+            yr[d] = xr[d] * v[d];
+        }
+    };
+    if (L > 1 && static_cast<int64_t>(L) * D >= 262144) {
+        detail::cpu::parallel_for(static_cast<size_t>(L), [&](size_t li) {
+            row_fn(static_cast<int>(li));
+        });
+    } else {
+        for (int l = 0; l < L; ++l) row_fn(l);
+    }
+}
+
+inline void layernorm_forward_inference_batched(const float* X, const float* gamma, const float* beta,
+                                               float eps, float* Y, int R, int D) {
+    if (R <= 0 || D <= 0) return;
+    const float inv_D = 1.0f / static_cast<float>(D);
+    auto row_fn = [&](int r) {
+        const float* xr = X + static_cast<size_t>(r) * D;
+        float* yr       = Y + static_cast<size_t>(r) * D;
+        float sum = 0.0f;
+        for (int i = 0; i < D; ++i) sum += xr[i];
+        float mean = sum * inv_D;
+        float sumsq = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            float diff = xr[i] - mean;
+            sumsq += diff * diff;
+        }
+        float var = sumsq * inv_D;
+        float rstd = 1.0f / std::sqrt(var + eps);
+        for (int i = 0; i < D; ++i) {
+            float g = gamma ? gamma[i] : 1.0f;
+            float b = beta ? beta[i] : 0.0f;
+            yr[i] = g * ((xr[i] - mean) * rstd) + b;
+        }
+    };
+    if (R > 1 && static_cast<int64_t>(R) * D >= 262144) {
+        detail::cpu::parallel_for(static_cast<size_t>(R), [&](size_t ri) {
+            row_fn(static_cast<int>(ri));
+        });
+    } else {
+        for (int r = 0; r < R; ++r) row_fn(r);
+    }
+}
+
+} // namespace ref
+} // namespace brotensor::detail::cpu::jit
 
 #if BROTENSOR_HAS_BRASS_JIT
 
@@ -630,7 +748,10 @@ bool is_jit_available() {
 
 void rms_norm_forward(const float* X, const float* gamma, float eps, float* Y, int B, int D) {
     const auto& k = get_kernels();
-    if (!k.available) return;
+    if (!k.available || k.rms_norm_row_fn == nullptr) {
+        ref::rms_norm(X, gamma, eps, Y, B, D);
+        return;
+    }
 
     const float inv_D = 1.0f / static_cast<float>(D);
 
@@ -654,7 +775,10 @@ void rms_norm_forward(const float* X, const float* gamma, float eps, float* Y, i
 
 void swiglu_forward(const float* X, float* Y, int B, int D) {
     const auto& k = get_kernels();
-    if (!k.available) return;
+    if (!k.available || k.swiglu_fn == nullptr) {
+        ref::swiglu(X, Y, B, D);
+        return;
+    }
 
     if (B > 1 && static_cast<int64_t>(B) * D >= 16384) {
         detail::cpu::parallel_for(static_cast<std::size_t>(B), [&](std::size_t bi) {
@@ -676,7 +800,10 @@ void swiglu_forward(const float* X, float* Y, int B, int D) {
 
 void modulate(const float* X, const float* scale, const float* shift, float* Y, int L, int D) {
     const auto& k = get_kernels();
-    if (!k.available) return;
+    if (!k.available || k.adaln_fn == nullptr) {
+        ref::modulate(X, scale, shift, Y, L, D);
+        return;
+    }
 
     if (L > 1 && static_cast<int64_t>(L) * D >= 262144) {
         detail::cpu::parallel_for(static_cast<std::size_t>(L), [&](std::size_t li) {
@@ -696,7 +823,10 @@ void modulate(const float* X, const float* scale, const float* shift, float* Y, 
 
 void broadcast_mul(const float* X, const float* v, float* Y, int L, int D) {
     const auto& k = get_kernels();
-    if (!k.available) return;
+    if (!k.available || k.broadcast_mul_fn == nullptr) {
+        ref::broadcast_mul(X, v, Y, L, D);
+        return;
+    }
 
     if (L > 1 && static_cast<int64_t>(L) * D >= 262144) {
         detail::cpu::parallel_for(static_cast<std::size_t>(L), [&](std::size_t li) {
@@ -716,7 +846,10 @@ void broadcast_mul(const float* X, const float* v, float* Y, int L, int D) {
 
 void layernorm_forward_inference_batched(const float* X, const float* gamma, const float* beta, float eps, float* Y, int R, int D) {
     const auto& k = get_kernels();
-    if (!k.available) return;
+    if (!k.available || k.layernorm_row_fn == nullptr) {
+        ref::layernorm_forward_inference_batched(X, gamma, beta, eps, Y, R, D);
+        return;
+    }
 
     const float inv_D = 1.0f / static_cast<float>(D);
 
@@ -743,11 +876,21 @@ void layernorm_forward_inference_batched(const float* X, const float* gamma, con
 namespace brotensor::detail::cpu::jit {
 
 bool is_jit_available() { return false; }
-void rms_norm_forward(const float*, const float*, float, float*, int, int) {}
-void swiglu_forward(const float*, float*, int, int) {}
-void modulate(const float*, const float*, const float*, float*, int, int) {}
-void broadcast_mul(const float*, const float*, float*, int, int) {}
-void layernorm_forward_inference_batched(const float*, const float*, const float*, float, float*, int, int) {}
+void rms_norm_forward(const float* X, const float* gamma, float eps, float* Y, int B, int D) {
+    ref::rms_norm(X, gamma, eps, Y, B, D);
+}
+void swiglu_forward(const float* X, float* Y, int B, int D) {
+    ref::swiglu(X, Y, B, D);
+}
+void modulate(const float* X, const float* scale, const float* shift, float* Y, int L, int D) {
+    ref::modulate(X, scale, shift, Y, L, D);
+}
+void broadcast_mul(const float* X, const float* v, float* Y, int L, int D) {
+    ref::broadcast_mul(X, v, Y, L, D);
+}
+void layernorm_forward_inference_batched(const float* X, const float* gamma, const float* beta, float eps, float* Y, int R, int D) {
+    ref::layernorm_forward_inference_batched(X, gamma, beta, eps, Y, R, D);
+}
 
 } // namespace brotensor::detail::cpu::jit
 

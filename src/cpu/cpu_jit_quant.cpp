@@ -13,48 +13,8 @@
 #include <stdexcept>
 #include <vector>
 
-#if BROTENSOR_HAS_BRASS_JIT
-
-#include <brass/codegen/ml_fusion.hpp>
-#include <brass/codegen/kernel_jit.hpp>
-
 namespace brotensor::detail::cpu::jit {
-
 namespace {
-
-using namespace brass::codegen;
-
-struct QuantJitKernels {
-    bool available = false;
-    MlFusionCompiler::GemvQ8_0Fn gemv_q8_0_fn = nullptr;
-    MlFusionCompiler::GemvQ4_KFn gemv_q4_k_fn = nullptr;
-    std::unique_ptr<MlFusionCompiler> compiler;
-    KernelFunction kfn_q8_0;
-    KernelFunction kfn_q4_k;
-};
-
-static const QuantJitKernels& get_quant_kernels() {
-    static QuantJitKernels kernels = []() {
-        QuantJitKernels k;
-        try {
-            k.compiler = std::make_unique<MlFusionCompiler>();
-            k.kfn_q8_0 = k.compiler->compile_gemv_q8_0();
-            k.kfn_q4_k = k.compiler->compile_gemv_q4_k();
-            if (k.kfn_q8_0.is_valid()) {
-                k.gemv_q8_0_fn = k.kfn_q8_0.as<MlFusionCompiler::GemvQ8_0Fn>();
-            }
-            if (k.kfn_q4_k.is_valid()) {
-                k.gemv_q4_k_fn = k.kfn_q4_k.as<MlFusionCompiler::GemvQ4_KFn>();
-            }
-            k.available = (k.gemv_q8_0_fn != nullptr && k.gemv_q4_k_fn != nullptr);
-        } catch (const std::exception& e) {
-            std::cerr << "brotensor: Brass JIT quant kernels initialization failed: " << e.what() << "\n";
-            k.available = false;
-        }
-        return k;
-    }();
-    return kernels;
-}
 
 static inline void ref_dequant_q8_0_block(const void* blk_ptr, float* out32) {
     uint16_t d_raw;
@@ -143,6 +103,52 @@ static void ref_gemv_q4k(const void* W, const float* X, float* Y, int N, int K) 
 }
 
 } // namespace
+} // namespace brotensor::detail::cpu::jit
+
+#if BROTENSOR_HAS_BRASS_JIT
+
+#include <brass/codegen/ml_fusion.hpp>
+#include <brass/codegen/kernel_jit.hpp>
+
+namespace brotensor::detail::cpu::jit {
+
+namespace {
+
+using namespace brass::codegen;
+
+struct QuantJitKernels {
+    bool available = false;
+    MlFusionCompiler::GemvQ8_0Fn gemv_q8_0_fn = nullptr;
+    MlFusionCompiler::GemvQ4_KFn gemv_q4_k_fn = nullptr;
+    std::unique_ptr<MlFusionCompiler> compiler;
+    KernelFunction kfn_q8_0;
+    KernelFunction kfn_q4_k;
+};
+
+static const QuantJitKernels& get_quant_kernels() {
+    static QuantJitKernels kernels = []() {
+        QuantJitKernels k;
+        try {
+            k.compiler = std::make_unique<MlFusionCompiler>();
+            k.kfn_q8_0 = k.compiler->compile_gemv_q8_0();
+            k.kfn_q4_k = k.compiler->compile_gemv_q4_k();
+            if (k.kfn_q8_0.is_valid()) {
+                k.gemv_q8_0_fn = k.kfn_q8_0.as<MlFusionCompiler::GemvQ8_0Fn>();
+            }
+            if (k.kfn_q4_k.is_valid()) {
+                k.gemv_q4_k_fn = k.kfn_q4_k.as<MlFusionCompiler::GemvQ4_KFn>();
+            }
+            k.available = (k.gemv_q8_0_fn != nullptr && k.gemv_q4_k_fn != nullptr);
+        } catch (const std::exception& e) {
+            std::cerr << "brotensor: Brass JIT quant kernels initialization failed: " << e.what() << "\n";
+            k.available = false;
+        }
+        return k;
+    }();
+    return kernels;
+}
+
+} // namespace
 
 void gemv_q8_0(const void* W, const float* X, float* Y, int N, int K) {
     if (N <= 0 || K <= 0) return;
@@ -210,8 +216,15 @@ void gemv_q4_k(const void* W, const float* X, float* Y, int N, int K) {
 
 namespace brotensor::detail::cpu::jit {
 
-void gemv_q8_0(const void*, const float*, float*, int, int) {}
-void gemv_q4_k(const void*, const float*, float*, int, int) {}
+void gemv_q8_0(const void* W, const float* X, float* Y, int N, int K) {
+    if (N <= 0 || K <= 0) return;
+    ref_gemv_q8_0(W, X, Y, N, K);
+}
+
+void gemv_q4_k(const void* W, const float* X, float* Y, int N, int K) {
+    if (N <= 0 || K <= 0) return;
+    ref_gemv_q4k(W, X, Y, N, K);
+}
 
 } // namespace brotensor::detail::cpu::jit
 

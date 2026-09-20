@@ -71,26 +71,26 @@
     };
     fn(ns_tensor, "init", function init() {
         if (ns_tensor.available) {
-            __bro_native.tensor.init();
+            __bro_native.tensor.init(); chk();
         }
         return undefined;
     });
     fn(ns_tensor, "sync", function sync() {
-        __bro_native.tensor.sync();
+        __bro_native.tensor.sync(); chk();
     });
     fn(ns_tensor, "createTensor", function createTensor(rows, cols, dtype) {
         if (!ns_tensor.available) throw new Error("bro.tensor: compiled without BRO_WITH_TENSOR");
         if (rows === undefined || rows < 0 || (cols !== undefined && cols < 0)) throw new RangeError("createTensor: invalid dims");
         const r = rows | 0;
         const c = cols !== undefined ? (cols | 0) : 1;
-        return __bro_native.tensor.createTensor(r, c, dtypeName(dtype, "fp32"));
+        const res = __bro_native.tensor.createTensor(r, c, dtypeName(dtype, "fp32")); chk(); return res;
     });
     fn(ns_tensor, "linearForward", function linearForward(W, b, x, y) {
         if (W === undefined) throw new TypeError("bro.tensor.linearForward: W is required");
         if (b === undefined) throw new TypeError("bro.tensor.linearForward: b is required");
         if (x === undefined) throw new TypeError("bro.tensor.linearForward: x is required");
         if (y === undefined) throw new TypeError("bro.tensor.linearForward: y is required");
-        __bro_native.tensor.linearForward(W, b, x, y);
+        __bro_native.tensor.linearForward(W, b, x, y); chk();
     });
     fn(ns_tensor, "linearBackward", function linearBackward(W, x, dY, dX, dW, dB) {
         if (W === undefined) throw new TypeError("bro.tensor.linearBackward: W is required");
@@ -99,66 +99,66 @@
         if (dX === undefined) throw new TypeError("bro.tensor.linearBackward: dX is required");
         if (dW === undefined) throw new TypeError("bro.tensor.linearBackward: dW is required");
         if (dB === undefined) throw new TypeError("bro.tensor.linearBackward: dB is required");
-        __bro_native.tensor.linearBackward(W, x, dY, dX, dW, dB);
+        __bro_native.tensor.linearBackward(W, x, dY, dX, dW, dB); chk();
     });
     fn(ns_tensor, "reluForward", function reluForward(x, y) {
         if (x === undefined) throw new TypeError("bro.tensor.reluForward: x is required");
         if (y === undefined) throw new TypeError("bro.tensor.reluForward: y is required");
-        __bro_native.tensor.reluForward(x, y);
+        __bro_native.tensor.reluForward(x, y); chk();
     });
     fn(ns_tensor, "reluBackward", function reluBackward(x, dY, dX) {
         if (x === undefined) throw new TypeError("bro.tensor.reluBackward: x is required");
         if (dY === undefined) throw new TypeError("bro.tensor.reluBackward: dY is required");
         if (dX === undefined) throw new TypeError("bro.tensor.reluBackward: dX is required");
-        __bro_native.tensor.reluBackward(x, dY, dX);
+        __bro_native.tensor.reluBackward(x, dY, dX); chk();
     });
     fn(ns_tensor, "tanhForward", function tanhForward(x, y) {
         if (x === undefined) throw new TypeError("bro.tensor.tanhForward: x is required");
         if (y === undefined) throw new TypeError("bro.tensor.tanhForward: y is required");
-        __bro_native.tensor.tanhForward(x, y);
+        __bro_native.tensor.tanhForward(x, y); chk();
     });
     fn(ns_tensor, "tanhBackward", function tanhBackward(y, dY, dX) {
         if (y === undefined) throw new TypeError("bro.tensor.tanhBackward: y is required");
         if (dY === undefined) throw new TypeError("bro.tensor.tanhBackward: dY is required");
         if (dX === undefined) throw new TypeError("bro.tensor.tanhBackward: dX is required");
-        __bro_native.tensor.tanhBackward(y, dY, dX);
+        __bro_native.tensor.tanhBackward(y, dY, dX); chk();
     });
     fn(ns_tensor, "sigmoidForward", function sigmoidForward(x, y) {
         if (x === undefined) throw new TypeError("bro.tensor.sigmoidForward: x is required");
         if (y === undefined) throw new TypeError("bro.tensor.sigmoidForward: y is required");
-        __bro_native.tensor.sigmoidForward(x, y);
+        __bro_native.tensor.sigmoidForward(x, y); chk();
     });
     fn(ns_tensor, "sigmoidBackward", function sigmoidBackward(y, dY, dX) {
         if (y === undefined) throw new TypeError("bro.tensor.sigmoidBackward: y is required");
         if (dY === undefined) throw new TypeError("bro.tensor.sigmoidBackward: dY is required");
         if (dX === undefined) throw new TypeError("bro.tensor.sigmoidBackward: dX is required");
-        __bro_native.tensor.sigmoidBackward(y, dY, dX);
+        __bro_native.tensor.sigmoidBackward(y, dY, dX); chk();
     });
     fn(ns_tensor, "addInplace", function addInplace(y, x) {
         if (y === undefined) throw new TypeError("bro.tensor.addInplace: y is required");
         if (x === undefined) throw new TypeError("bro.tensor.addInplace: x is required");
-        __bro_native.tensor.addInplace(y, x);
+        __bro_native.tensor.addInplace(y, x); chk();
     });
     fn(ns_tensor, "addScalarInplace", function addScalarInplace(y, s) {
         if (y === undefined) throw new TypeError("bro.tensor.addScalarInplace: y is required");
         if (s === undefined) throw new TypeError("bro.tensor.addScalarInplace: s is required");
-        __bro_native.tensor.addScalarInplace(y, s);
+        __bro_native.tensor.addScalarInplace(y, s); chk();
     });
     fn(ns_tensor, "scaleInplace", function scaleInplace(y, s) {
         if (y === undefined) throw new TypeError("bro.tensor.scaleInplace: y is required");
         if (s === undefined) throw new TypeError("bro.tensor.scaleInplace: s is required");
-        __bro_native.tensor.scaleInplace(y, s);
+        __bro_native.tensor.scaleInplace(y, s); chk();
     });
     fn(ns_tensor, "mulInplace", function mulInplace(y, x) {
         if (y === undefined) throw new TypeError("bro.tensor.mulInplace: y is required");
         if (x === undefined) throw new TypeError("bro.tensor.mulInplace: x is required");
-        __bro_native.tensor.mulInplace(y, x);
+        __bro_native.tensor.mulInplace(y, x); chk();
     });
     fn(ns_tensor, "clamp", function clamp(y, lo, hi) {
         if (y === undefined) throw new TypeError("bro.tensor.clamp: y is required");
         if (lo === undefined) throw new TypeError("bro.tensor.clamp: lo is required");
         if (hi === undefined) throw new TypeError("bro.tensor.clamp: hi is required");
-        __bro_native.tensor.clamp(y, lo, hi);
+        __bro_native.tensor.clamp(y, lo, hi); chk();
     });
     fn(ns_tensor, "buildSlotMask", function buildSlotMask(x, offset, K, stride, mask) {
         if (x === undefined) throw new TypeError("bro.tensor.buildSlotMask: x is required");
@@ -166,7 +166,7 @@
         if (K === undefined) throw new TypeError("bro.tensor.buildSlotMask: K is required");
         if (stride === undefined) throw new TypeError("bro.tensor.buildSlotMask: stride is required");
         if (mask === undefined) throw new TypeError("bro.tensor.buildSlotMask: mask is required");
-        __bro_native.tensor.buildSlotMask(x, offset, K, stride, mask);
+        __bro_native.tensor.buildSlotMask(x, offset, K, stride, mask); chk();
     });
     fn(ns_tensor, "copyD2D", function copyD2D(src, srcOff, dst, dstOff, n) {
         if (src === undefined) throw new TypeError("bro.tensor.copyD2D: src is required");
@@ -174,7 +174,7 @@
         if (dst === undefined) throw new TypeError("bro.tensor.copyD2D: dst is required");
         if (dstOff === undefined) throw new TypeError("bro.tensor.copyD2D: dstOff is required");
         if (n === undefined) throw new TypeError("bro.tensor.copyD2D: n is required");
-        __bro_native.tensor.copyD2D(src, srcOff, dst, dstOff, n);
+        __bro_native.tensor.copyD2D(src, srcOff, dst, dstOff, n); chk();
     });
     // cast(src, dst, outDtype): dst = src converted (resized + dtype-set on
     // src's device). FP32 <-> FP16 <-> BF16 plus a same-dtype copy.
@@ -186,79 +186,79 @@
     fn(ns_tensor, "siluForward", function siluForward(x, y) {
         if (x === undefined) throw new TypeError("bro.tensor.siluForward: x is required");
         if (y === undefined) throw new TypeError("bro.tensor.siluForward: y is required");
-        __bro_native.tensor.siluForward(x, y);
+        __bro_native.tensor.siluForward(x, y); chk();
     });
     fn(ns_tensor, "siluBackward", function siluBackward(x, dY, dX) {
         if (x === undefined) throw new TypeError("bro.tensor.siluBackward: x is required");
         if (dY === undefined) throw new TypeError("bro.tensor.siluBackward: dY is required");
         if (dX === undefined) throw new TypeError("bro.tensor.siluBackward: dX is required");
-        __bro_native.tensor.siluBackward(x, dY, dX);
+        __bro_native.tensor.siluBackward(x, dY, dX); chk();
     });
     fn(ns_tensor, "geluForward", function geluForward(x, y) {
         if (x === undefined) throw new TypeError("bro.tensor.geluForward: x is required");
         if (y === undefined) throw new TypeError("bro.tensor.geluForward: y is required");
-        __bro_native.tensor.geluForward(x, y);
+        __bro_native.tensor.geluForward(x, y); chk();
     });
     fn(ns_tensor, "geluBackward", function geluBackward(x, dY, dX) {
         if (x === undefined) throw new TypeError("bro.tensor.geluBackward: x is required");
         if (dY === undefined) throw new TypeError("bro.tensor.geluBackward: dY is required");
         if (dX === undefined) throw new TypeError("bro.tensor.geluBackward: dX is required");
-        __bro_native.tensor.geluBackward(x, dY, dX);
+        __bro_native.tensor.geluBackward(x, dY, dX); chk();
     });
     fn(ns_tensor, "geluExactForward", function geluExactForward(x, y) {
         if (x === undefined) throw new TypeError("bro.tensor.geluExactForward: x is required");
         if (y === undefined) throw new TypeError("bro.tensor.geluExactForward: y is required");
-        __bro_native.tensor.geluExactForward(x, y);
+        __bro_native.tensor.geluExactForward(x, y); chk();
     });
     fn(ns_tensor, "geluExactBackward", function geluExactBackward(x, dY, dX) {
         if (x === undefined) throw new TypeError("bro.tensor.geluExactBackward: x is required");
         if (dY === undefined) throw new TypeError("bro.tensor.geluExactBackward: dY is required");
         if (dX === undefined) throw new TypeError("bro.tensor.geluExactBackward: dX is required");
-        __bro_native.tensor.geluExactBackward(x, dY, dX);
+        __bro_native.tensor.geluExactBackward(x, dY, dX); chk();
     });
     fn(ns_tensor, "quickGeluForward", function quickGeluForward(x, y) {
         if (x === undefined) throw new TypeError("bro.tensor.quickGeluForward: x is required");
         if (y === undefined) throw new TypeError("bro.tensor.quickGeluForward: y is required");
-        __bro_native.tensor.quickGeluForward(x, y);
+        __bro_native.tensor.quickGeluForward(x, y); chk();
     });
     fn(ns_tensor, "quickGeluBackward", function quickGeluBackward(x, dY, dX) {
         if (x === undefined) throw new TypeError("bro.tensor.quickGeluBackward: x is required");
         if (dY === undefined) throw new TypeError("bro.tensor.quickGeluBackward: dY is required");
         if (dX === undefined) throw new TypeError("bro.tensor.quickGeluBackward: dX is required");
-        __bro_native.tensor.quickGeluBackward(x, dY, dX);
+        __bro_native.tensor.quickGeluBackward(x, dY, dX); chk();
     });
     fn(ns_tensor, "swigluForward", function swigluForward(X, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.swigluForward: X is required");
         if (Y === undefined) throw new TypeError("bro.tensor.swigluForward: Y is required");
-        __bro_native.tensor.swigluForward(X, Y);
+        __bro_native.tensor.swigluForward(X, Y); chk();
     });
     fn(ns_tensor, "swigluBackward", function swigluBackward(X, dY, dX) {
         if (X === undefined) throw new TypeError("bro.tensor.swigluBackward: X is required");
         if (dY === undefined) throw new TypeError("bro.tensor.swigluBackward: dY is required");
         if (dX === undefined) throw new TypeError("bro.tensor.swigluBackward: dX is required");
-        __bro_native.tensor.swigluBackward(X, dY, dX);
+        __bro_native.tensor.swigluBackward(X, dY, dX); chk();
     });
     fn(ns_tensor, "gegluForward", function gegluForward(X, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.gegluForward: X is required");
         if (Y === undefined) throw new TypeError("bro.tensor.gegluForward: Y is required");
-        __bro_native.tensor.gegluForward(X, Y);
+        __bro_native.tensor.gegluForward(X, Y); chk();
     });
     fn(ns_tensor, "gegluBackward", function gegluBackward(X, dY, dX) {
         if (X === undefined) throw new TypeError("bro.tensor.gegluBackward: X is required");
         if (dY === undefined) throw new TypeError("bro.tensor.gegluBackward: dY is required");
         if (dX === undefined) throw new TypeError("bro.tensor.gegluBackward: dX is required");
-        __bro_native.tensor.gegluBackward(X, dY, dX);
+        __bro_native.tensor.gegluBackward(X, dY, dX); chk();
     });
     fn(ns_tensor, "gegluExactForward", function gegluExactForward(X, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.gegluExactForward: X is required");
         if (Y === undefined) throw new TypeError("bro.tensor.gegluExactForward: Y is required");
-        __bro_native.tensor.gegluExactForward(X, Y);
+        __bro_native.tensor.gegluExactForward(X, Y); chk();
     });
     fn(ns_tensor, "gegluExactBackward", function gegluExactBackward(X, dY, dX) {
         if (X === undefined) throw new TypeError("bro.tensor.gegluExactBackward: X is required");
         if (dY === undefined) throw new TypeError("bro.tensor.gegluExactBackward: dY is required");
         if (dX === undefined) throw new TypeError("bro.tensor.gegluExactBackward: dX is required");
-        __bro_native.tensor.gegluExactBackward(X, dY, dX);
+        __bro_native.tensor.gegluExactBackward(X, dY, dX); chk();
     });
     // softmaxForward(logits, probs, mask|null): the old third argument is a
     // length-N FP32 GpuTensor key mask (1 valid / 0 invalid). A number there
@@ -266,7 +266,7 @@
     fn(ns_tensor, "softmaxForward", function softmaxForward(logits, probs, maskOrTemp) {
         if (logits === undefined || probs === undefined) throw new TypeError("bro.tensor.softmaxForward: logits, probs required");
         if (typeof maskOrTemp === "number") {
-            __bro_native.tensor.softmaxForward(logits, probs, maskOrTemp);
+            __bro_native.tensor.softmaxForward(logits, probs, maskOrTemp); chk();
             return;
         }
         if (maskOrTemp !== undefined && maskOrTemp !== null && !(maskOrTemp instanceof GpuTensor)) {
@@ -279,7 +279,7 @@
         if (probs === undefined) throw new TypeError("bro.tensor.softmaxBackward: probs is required");
         if (dProbs === undefined) throw new TypeError("bro.tensor.softmaxBackward: dProbs is required");
         if (dLogits === undefined) throw new TypeError("bro.tensor.softmaxBackward: dLogits is required");
-        __bro_native.tensor.softmaxBackward(probs, dProbs, dLogits);
+        __bro_native.tensor.softmaxBackward(probs, dProbs, dLogits); chk();
     });
     // layernormForward(x, gamma, beta, y, xhat, eps) -> {mean, rstd}, the
     // scalar caches layernormBackward takes.
@@ -299,28 +299,28 @@
         if (dX === undefined) throw new TypeError("bro.tensor.layernormBackward: dX is required");
         if (dGamma === undefined) throw new TypeError("bro.tensor.layernormBackward: dGamma is required");
         if (dBeta === undefined) throw new TypeError("bro.tensor.layernormBackward: dBeta is required");
-        __bro_native.tensor.layernormBackward(dY, xhat, gamma, rstd, dX, dGamma, dBeta);
+        __bro_native.tensor.layernormBackward(dY, xhat, gamma, rstd, dX, dGamma, dBeta); chk();
     });
     fn(ns_tensor, "layernormForwardInferenceBatched", function layernormForwardInferenceBatched(X_RD, gamma, beta, Y_RD, eps) {
         if (X_RD === undefined) throw new TypeError("bro.tensor.layernormForwardInferenceBatched: X_RD is required");
         if (gamma === undefined) throw new TypeError("bro.tensor.layernormForwardInferenceBatched: gamma is required");
         if (beta === undefined) throw new TypeError("bro.tensor.layernormForwardInferenceBatched: beta is required");
         if (Y_RD === undefined) throw new TypeError("bro.tensor.layernormForwardInferenceBatched: Y_RD is required");
-        __bro_native.tensor.layernormForwardInferenceBatched(X_RD, gamma, beta, Y_RD, eps === undefined ? 0.00001 : eps);
+        __bro_native.tensor.layernormForwardInferenceBatched(X_RD, gamma, beta, Y_RD, eps === undefined ? 0.00001 : eps); chk();
     });
     fn(ns_tensor, "layernormForwardInferenceBatchedFp16", function layernormForwardInferenceBatchedFp16(X_RD, gamma, beta, Y_RD, eps) {
         if (X_RD === undefined) throw new TypeError("bro.tensor.layernormForwardInferenceBatchedFp16: X_RD is required");
         if (gamma === undefined) throw new TypeError("bro.tensor.layernormForwardInferenceBatchedFp16: gamma is required");
         if (beta === undefined) throw new TypeError("bro.tensor.layernormForwardInferenceBatchedFp16: beta is required");
         if (Y_RD === undefined) throw new TypeError("bro.tensor.layernormForwardInferenceBatchedFp16: Y_RD is required");
-        __bro_native.tensor.layernormForwardInferenceBatchedFp16(X_RD, gamma, beta, Y_RD, eps === undefined ? 0.00001 : eps);
+        __bro_native.tensor.layernormForwardInferenceBatchedFp16(X_RD, gamma, beta, Y_RD, eps === undefined ? 0.00001 : eps); chk();
     });
     fn(ns_tensor, "rmsNormForward", function rmsNormForward(X, gamma, eps, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.rmsNormForward: X is required");
         if (gamma === undefined) throw new TypeError("bro.tensor.rmsNormForward: gamma is required");
         if (eps === undefined) throw new TypeError("bro.tensor.rmsNormForward: eps is required");
         if (Y === undefined) throw new TypeError("bro.tensor.rmsNormForward: Y is required");
-        __bro_native.tensor.rmsNormForward(X, gamma, eps, Y);
+        __bro_native.tensor.rmsNormForward(X, gamma, eps, Y); chk();
     });
     fn(ns_tensor, "rmsNormBackward", function rmsNormBackward(X, gamma, dY, eps, dX, dGamma) {
         if (X === undefined) throw new TypeError("bro.tensor.rmsNormBackward: X is required");
@@ -329,7 +329,7 @@
         if (eps === undefined) throw new TypeError("bro.tensor.rmsNormBackward: eps is required");
         if (dX === undefined) throw new TypeError("bro.tensor.rmsNormBackward: dX is required");
         if (dGamma === undefined) throw new TypeError("bro.tensor.rmsNormBackward: dGamma is required");
-        __bro_native.tensor.rmsNormBackward(X, gamma, dY, eps, dX, dGamma);
+        __bro_native.tensor.rmsNormBackward(X, gamma, dY, eps, dX, dGamma); chk();
     });
     fn(ns_tensor, "groupNormForward", function groupNormForward(X, gamma, beta, N, C, H, W, numGroups, eps, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.groupNormForward: X is required");
@@ -342,7 +342,7 @@
         if (numGroups === undefined) throw new TypeError("bro.tensor.groupNormForward: numGroups is required");
         if (eps === undefined) throw new TypeError("bro.tensor.groupNormForward: eps is required");
         if (Y === undefined) throw new TypeError("bro.tensor.groupNormForward: Y is required");
-        __bro_native.tensor.groupNormForward(X, gamma, beta, N, C, H, W, numGroups, eps, Y);
+        __bro_native.tensor.groupNormForward(X, gamma, beta, N, C, H, W, numGroups, eps, Y); chk();
     });
     fn(ns_tensor, "groupNormBackward", function groupNormBackward(X, gamma, dY, N, C, H, W, numGroups, eps, dX, dGamma, dBeta) {
         if (X === undefined) throw new TypeError("bro.tensor.groupNormBackward: X is required");
@@ -357,14 +357,14 @@
         if (dX === undefined) throw new TypeError("bro.tensor.groupNormBackward: dX is required");
         if (dGamma === undefined) throw new TypeError("bro.tensor.groupNormBackward: dGamma is required");
         if (dBeta === undefined) throw new TypeError("bro.tensor.groupNormBackward: dBeta is required");
-        __bro_native.tensor.groupNormBackward(X, gamma, dY, N, C, H, W, numGroups, eps, dX, dGamma, dBeta);
+        __bro_native.tensor.groupNormBackward(X, gamma, dY, N, C, H, W, numGroups, eps, dX, dGamma, dBeta); chk();
     });
     fn(ns_tensor, "matmul", function matmul(A, B, C) {
         if (arguments.length === 0) throw new TypeError("matmul: arguments required");
         if (!A || !B || !C || !(A instanceof GpuTensor) || !(B instanceof GpuTensor) || !(C instanceof GpuTensor)) {
             throw new TypeError("matmul: arguments must be GpuTensor instances");
         }
-        __bro_native.tensor.matmul(A, B, C);
+        __bro_native.tensor.matmul(A, B, C); chk();
     });
     fn(ns_tensor, "matmulBackward", function matmulBackward(A, B, dC, dA, dB) {
         if (A === undefined) throw new TypeError("bro.tensor.matmulBackward: A is required");
@@ -372,7 +372,7 @@
         if (dC === undefined) throw new TypeError("bro.tensor.matmulBackward: dC is required");
         if (dA === undefined) throw new TypeError("bro.tensor.matmulBackward: dA is required");
         if (dB === undefined) throw new TypeError("bro.tensor.matmulBackward: dB is required");
-        __bro_native.tensor.matmulBackward(A, B, dC, dA, dB);
+        __bro_native.tensor.matmulBackward(A, B, dC, dA, dB); chk();
     });
     fn(ns_tensor, "ropeForward", function ropeForward(X, headDim, numHeads, seqOffset, thetaBase, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.ropeForward: X is required");
@@ -381,7 +381,7 @@
         if (seqOffset === undefined) throw new TypeError("bro.tensor.ropeForward: seqOffset is required");
         if (thetaBase === undefined) throw new TypeError("bro.tensor.ropeForward: thetaBase is required");
         if (Y === undefined) throw new TypeError("bro.tensor.ropeForward: Y is required");
-        __bro_native.tensor.ropeForward(X, headDim, numHeads, seqOffset, thetaBase, Y);
+        __bro_native.tensor.ropeForward(X, headDim, numHeads, seqOffset, thetaBase, Y); chk();
     });
     fn(ns_tensor, "ropeBackward", function ropeBackward(dY, headDim, numHeads, seqOffset, thetaBase, dX) {
         if (dY === undefined) throw new TypeError("bro.tensor.ropeBackward: dY is required");
@@ -390,7 +390,7 @@
         if (seqOffset === undefined) throw new TypeError("bro.tensor.ropeBackward: seqOffset is required");
         if (thetaBase === undefined) throw new TypeError("bro.tensor.ropeBackward: thetaBase is required");
         if (dX === undefined) throw new TypeError("bro.tensor.ropeBackward: dX is required");
-        __bro_native.tensor.ropeBackward(dY, headDim, numHeads, seqOffset, thetaBase, dX);
+        __bro_native.tensor.ropeBackward(dY, headDim, numHeads, seqOffset, thetaBase, dX); chk();
     });
     fn(ns_tensor, "ropeApply", function ropeApply(X, cosTbl, sinTbl, headDim, numHeads, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.ropeApply: X is required");
@@ -399,42 +399,42 @@
         if (headDim === undefined) throw new TypeError("bro.tensor.ropeApply: headDim is required");
         if (numHeads === undefined) throw new TypeError("bro.tensor.ropeApply: numHeads is required");
         if (Y === undefined) throw new TypeError("bro.tensor.ropeApply: Y is required");
-        __bro_native.tensor.ropeApply(X, cosTbl, sinTbl, headDim, numHeads, Y);
+        __bro_native.tensor.ropeApply(X, cosTbl, sinTbl, headDim, numHeads, Y); chk();
     });
     fn(ns_tensor, "ropeApplyBackward", function ropeApplyBackward(dY, headDim, numHeads, dX) {
         if (dY === undefined) throw new TypeError("bro.tensor.ropeApplyBackward: dY is required");
         if (headDim === undefined) throw new TypeError("bro.tensor.ropeApplyBackward: headDim is required");
         if (numHeads === undefined) throw new TypeError("bro.tensor.ropeApplyBackward: numHeads is required");
         if (dX === undefined) throw new TypeError("bro.tensor.ropeApplyBackward: dX is required");
-        __bro_native.tensor.ropeApplyBackward(dY, headDim, numHeads, dX);
+        __bro_native.tensor.ropeApplyBackward(dY, headDim, numHeads, dX); chk();
     });
     fn(ns_tensor, "modulate", function modulate(X, scale, shift, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.modulate: X is required");
         if (scale === undefined) throw new TypeError("bro.tensor.modulate: scale is required");
         if (shift === undefined) throw new TypeError("bro.tensor.modulate: shift is required");
         if (Y === undefined) throw new TypeError("bro.tensor.modulate: Y is required");
-        __bro_native.tensor.modulate(X, scale, shift, Y);
+        __bro_native.tensor.modulate(X, scale, shift, Y); chk();
     });
     fn(ns_tensor, "broadcastMul", function broadcastMul(X, v, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.broadcastMul: X is required");
         if (v === undefined) throw new TypeError("bro.tensor.broadcastMul: v is required");
         if (Y === undefined) throw new TypeError("bro.tensor.broadcastMul: Y is required");
-        __bro_native.tensor.broadcastMul(X, v, Y);
+        __bro_native.tensor.broadcastMul(X, v, Y); chk();
     });
     fn(ns_tensor, "sumRows", function sumRows(X, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.sumRows: X is required");
         if (Y === undefined) throw new TypeError("bro.tensor.sumRows: Y is required");
-        __bro_native.tensor.sumRows(X, Y);
+        __bro_native.tensor.sumRows(X, Y); chk();
     });
     fn(ns_tensor, "sumCols", function sumCols(X, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.sumCols: X is required");
         if (Y === undefined) throw new TypeError("bro.tensor.sumCols: Y is required");
-        __bro_native.tensor.sumCols(X, Y);
+        __bro_native.tensor.sumCols(X, Y); chk();
     });
     fn(ns_tensor, "argmaxRows", function argmaxRows(X, Idx) {
         if (X === undefined) throw new TypeError("bro.tensor.argmaxRows: X is required");
         if (Idx === undefined) throw new TypeError("bro.tensor.argmaxRows: Idx is required");
-        __bro_native.tensor.argmaxRows(X, Idx);
+        __bro_native.tensor.argmaxRows(X, Idx); chk();
     });
     fn(ns_tensor, "attentionTokenMoments", function attentionTokenMoments(Attn, h_lat, w_lat, mass, centroid) {
         if (Attn === undefined) throw new TypeError("bro.tensor.attentionTokenMoments: Attn is required");
@@ -442,13 +442,13 @@
         if (w_lat === undefined) throw new TypeError("bro.tensor.attentionTokenMoments: w_lat is required");
         if (mass === undefined) throw new TypeError("bro.tensor.attentionTokenMoments: mass is required");
         if (centroid === undefined) throw new TypeError("bro.tensor.attentionTokenMoments: centroid is required");
-        __bro_native.tensor.attentionTokenMoments(Attn, h_lat, w_lat, mass, centroid);
+        __bro_native.tensor.attentionTokenMoments(Attn, h_lat, w_lat, mass, centroid); chk();
     });
     fn(ns_tensor, "buildCausalMaskRow", function buildCausalMaskRow(L, q, mask) {
         if (L === undefined) throw new TypeError("bro.tensor.buildCausalMaskRow: L is required");
         if (q === undefined) throw new TypeError("bro.tensor.buildCausalMaskRow: q is required");
         if (mask === undefined) throw new TypeError("bro.tensor.buildCausalMaskRow: mask is required");
-        __bro_native.tensor.buildCausalMaskRow(L, q, mask);
+        __bro_native.tensor.buildCausalMaskRow(L, q, mask); chk();
     });
     fn(ns_tensor, "flashAttentionDecode", function flashAttentionDecode(Q, K_cache, V_cache, validLen, numHeads, O, numKvHeads, attnSoftcap, window) {
         if (Q === undefined) throw new TypeError("bro.tensor.flashAttentionDecode: Q is required");
@@ -457,7 +457,7 @@
         if (validLen === undefined) throw new TypeError("bro.tensor.flashAttentionDecode: validLen is required");
         if (numHeads === undefined) throw new TypeError("bro.tensor.flashAttentionDecode: numHeads is required");
         if (O === undefined) throw new TypeError("bro.tensor.flashAttentionDecode: O is required");
-        __bro_native.tensor.flashAttentionDecode(Q, K_cache, V_cache, validLen, numHeads, O, numKvHeads !== undefined, numKvHeads === undefined ? 0 : numKvHeads, attnSoftcap === undefined ? 0 : attnSoftcap, window === undefined ? 0 : window);
+        __bro_native.tensor.flashAttentionDecode(Q, K_cache, V_cache, validLen, numHeads, O, numKvHeads !== undefined, numKvHeads === undefined ? 0 : numKvHeads, attnSoftcap === undefined ? 0 : attnSoftcap, window === undefined ? 0 : window); chk();
     });
     fn(ns_tensor, "flashAttentionDecodeMasked", function flashAttentionDecodeMasked(Q, K_cache, V_cache, dMask, numHeads, O, numKvHeads, attnSoftcap, window) {
         if (Q === undefined) throw new TypeError("bro.tensor.flashAttentionDecodeMasked: Q is required");
@@ -466,7 +466,7 @@
         if (dMask === undefined) throw new TypeError("bro.tensor.flashAttentionDecodeMasked: dMask is required");
         if (numHeads === undefined) throw new TypeError("bro.tensor.flashAttentionDecodeMasked: numHeads is required");
         if (O === undefined) throw new TypeError("bro.tensor.flashAttentionDecodeMasked: O is required");
-        __bro_native.tensor.flashAttentionDecodeMasked(Q, K_cache, V_cache, dMask, numHeads, O, numKvHeads !== undefined, numKvHeads === undefined ? 0 : numKvHeads, attnSoftcap === undefined ? 0 : attnSoftcap, window === undefined ? 0 : window);
+        __bro_native.tensor.flashAttentionDecodeMasked(Q, K_cache, V_cache, dMask, numHeads, O, numKvHeads !== undefined, numKvHeads === undefined ? 0 : numKvHeads, attnSoftcap === undefined ? 0 : attnSoftcap, window === undefined ? 0 : window); chk();
     });
     fn(ns_tensor, "kvCacheAppend", function kvCacheAppend(K_new, V_new, curLen, K_cache, V_cache) {
         if (K_new === undefined) throw new TypeError("bro.tensor.kvCacheAppend: K_new is required");
@@ -474,11 +474,11 @@
         if (curLen === undefined) throw new TypeError("bro.tensor.kvCacheAppend: curLen is required");
         if (K_cache === undefined) throw new TypeError("bro.tensor.kvCacheAppend: K_cache is required");
         if (V_cache === undefined) throw new TypeError("bro.tensor.kvCacheAppend: V_cache is required");
-        __bro_native.tensor.kvCacheAppend(K_new, V_new, curLen, K_cache, V_cache);
+        __bro_native.tensor.kvCacheAppend(K_new, V_new, curLen, K_cache, V_cache); chk();
     });
     fn(ns_tensor, "conv2dForward", function conv2dForward(X, Wt, bias, N, C_in, H, W, C_out, kH, kW, sH, sW, pH, pW, dH, dW, groups, Y) {
         if (X === undefined || Wt === undefined || Y === undefined) throw new TypeError("bro.tensor.conv2dForward: X, Wt, Y required");
-        __bro_native.tensor.conv2dForward(X, Wt, bias || null, N, C_in, H, W, C_out, kH, kW, sH || 1, sW || 1, pH || 0, pW || 0, dH || 1, dW || 1, groups || 1, Y);
+        __bro_native.tensor.conv2dForward(X, Wt, bias || null, N, C_in, H, W, C_out, kH, kW, sH || 1, sW || 1, pH || 0, pW || 0, dH || 1, dW || 1, groups || 1, Y); chk();
     });
     fn(ns_tensor, "conv2dBackwardInput", function conv2dBackwardInput(Wt, dY, N, C_in, H, W, C_out, kH, kW, sH, sW, pH, pW, dH, dW, groups, dX) {
         if (Wt === undefined) throw new TypeError("bro.tensor.conv2dBackwardInput: Wt is required");
@@ -498,7 +498,7 @@
         if (dW === undefined) throw new TypeError("bro.tensor.conv2dBackwardInput: dW is required");
         if (groups === undefined) throw new TypeError("bro.tensor.conv2dBackwardInput: groups is required");
         if (dX === undefined) throw new TypeError("bro.tensor.conv2dBackwardInput: dX is required");
-        __bro_native.tensor.conv2dBackwardInput(Wt, dY, N, C_in, H, W, C_out, kH, kW, sH, sW, pH, pW, dH, dW, groups, dX);
+        __bro_native.tensor.conv2dBackwardInput(Wt, dY, N, C_in, H, W, C_out, kH, kW, sH, sW, pH, pW, dH, dW, groups, dX); chk();
     });
     fn(ns_tensor, "conv2dBackwardWeight", function conv2dBackwardWeight(X, dY, N, C_in, H, W, C_out, kH, kW, sH, sW, pH, pW, dH, dW, groups, dWt) {
         if (X === undefined) throw new TypeError("bro.tensor.conv2dBackwardWeight: X is required");
@@ -518,7 +518,7 @@
         if (dW === undefined) throw new TypeError("bro.tensor.conv2dBackwardWeight: dW is required");
         if (groups === undefined) throw new TypeError("bro.tensor.conv2dBackwardWeight: groups is required");
         if (dWt === undefined) throw new TypeError("bro.tensor.conv2dBackwardWeight: dWt is required");
-        __bro_native.tensor.conv2dBackwardWeight(X, dY, N, C_in, H, W, C_out, kH, kW, sH, sW, pH, pW, dH, dW, groups, dWt);
+        __bro_native.tensor.conv2dBackwardWeight(X, dY, N, C_in, H, W, C_out, kH, kW, sH, sW, pH, pW, dH, dW, groups, dWt); chk();
     });
     fn(ns_tensor, "conv2dBackwardBias", function conv2dBackwardBias(dY, N, C_out, H_out, W_out, dB) {
         if (dY === undefined) throw new TypeError("bro.tensor.conv2dBackwardBias: dY is required");
@@ -527,7 +527,7 @@
         if (H_out === undefined) throw new TypeError("bro.tensor.conv2dBackwardBias: H_out is required");
         if (W_out === undefined) throw new TypeError("bro.tensor.conv2dBackwardBias: W_out is required");
         if (dB === undefined) throw new TypeError("bro.tensor.conv2dBackwardBias: dB is required");
-        __bro_native.tensor.conv2dBackwardBias(dY, N, C_out, H_out, W_out, dB);
+        __bro_native.tensor.conv2dBackwardBias(dY, N, C_out, H_out, W_out, dB); chk();
     });
     fn(ns_tensor, "upsampleNearest2xForward", function upsampleNearest2xForward(X, N, C, H, W, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.upsampleNearest2xForward: X is required");
@@ -536,7 +536,7 @@
         if (H === undefined) throw new TypeError("bro.tensor.upsampleNearest2xForward: H is required");
         if (W === undefined) throw new TypeError("bro.tensor.upsampleNearest2xForward: W is required");
         if (Y === undefined) throw new TypeError("bro.tensor.upsampleNearest2xForward: Y is required");
-        __bro_native.tensor.upsampleNearest2xForward(X, N, C, H, W, Y);
+        __bro_native.tensor.upsampleNearest2xForward(X, N, C, H, W, Y); chk();
     });
     fn(ns_tensor, "upsampleNearest2xBackward", function upsampleNearest2xBackward(dY, N, C, H, W, dX) {
         if (dY === undefined) throw new TypeError("bro.tensor.upsampleNearest2xBackward: dY is required");
@@ -545,7 +545,7 @@
         if (H === undefined) throw new TypeError("bro.tensor.upsampleNearest2xBackward: H is required");
         if (W === undefined) throw new TypeError("bro.tensor.upsampleNearest2xBackward: W is required");
         if (dX === undefined) throw new TypeError("bro.tensor.upsampleNearest2xBackward: dX is required");
-        __bro_native.tensor.upsampleNearest2xBackward(dY, N, C, H, W, dX);
+        __bro_native.tensor.upsampleNearest2xBackward(dY, N, C, H, W, dX); chk();
     });
     fn(ns_tensor, "upsampleBilinear2xForward", function upsampleBilinear2xForward(X, N, C, H, W, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.upsampleBilinear2xForward: X is required");
@@ -554,7 +554,7 @@
         if (H === undefined) throw new TypeError("bro.tensor.upsampleBilinear2xForward: H is required");
         if (W === undefined) throw new TypeError("bro.tensor.upsampleBilinear2xForward: W is required");
         if (Y === undefined) throw new TypeError("bro.tensor.upsampleBilinear2xForward: Y is required");
-        __bro_native.tensor.upsampleBilinear2xForward(X, N, C, H, W, Y);
+        __bro_native.tensor.upsampleBilinear2xForward(X, N, C, H, W, Y); chk();
     });
     fn(ns_tensor, "upsampleBilinear2xBackward", function upsampleBilinear2xBackward(dY, N, C, H, W, dX) {
         if (dY === undefined) throw new TypeError("bro.tensor.upsampleBilinear2xBackward: dY is required");
@@ -563,7 +563,7 @@
         if (H === undefined) throw new TypeError("bro.tensor.upsampleBilinear2xBackward: H is required");
         if (W === undefined) throw new TypeError("bro.tensor.upsampleBilinear2xBackward: W is required");
         if (dX === undefined) throw new TypeError("bro.tensor.upsampleBilinear2xBackward: dX is required");
-        __bro_native.tensor.upsampleBilinear2xBackward(dY, N, C, H, W, dX);
+        __bro_native.tensor.upsampleBilinear2xBackward(dY, N, C, H, W, dX); chk();
     });
     fn(ns_tensor, "downsampleAvg2xForward", function downsampleAvg2xForward(X, N, C, H, W, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.downsampleAvg2xForward: X is required");
@@ -572,7 +572,7 @@
         if (H === undefined) throw new TypeError("bro.tensor.downsampleAvg2xForward: H is required");
         if (W === undefined) throw new TypeError("bro.tensor.downsampleAvg2xForward: W is required");
         if (Y === undefined) throw new TypeError("bro.tensor.downsampleAvg2xForward: Y is required");
-        __bro_native.tensor.downsampleAvg2xForward(X, N, C, H, W, Y);
+        __bro_native.tensor.downsampleAvg2xForward(X, N, C, H, W, Y); chk();
     });
     fn(ns_tensor, "downsampleAvg2xBackward", function downsampleAvg2xBackward(dY, N, C, H, W, dX) {
         if (dY === undefined) throw new TypeError("bro.tensor.downsampleAvg2xBackward: dY is required");
@@ -581,7 +581,7 @@
         if (H === undefined) throw new TypeError("bro.tensor.downsampleAvg2xBackward: H is required");
         if (W === undefined) throw new TypeError("bro.tensor.downsampleAvg2xBackward: W is required");
         if (dX === undefined) throw new TypeError("bro.tensor.downsampleAvg2xBackward: dX is required");
-        __bro_native.tensor.downsampleAvg2xBackward(dY, N, C, H, W, dX);
+        __bro_native.tensor.downsampleAvg2xBackward(dY, N, C, H, W, dX); chk();
     });
     fn(ns_tensor, "nchwToSequence", function nchwToSequence(X, N, C, H, W, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.nchwToSequence: X is required");
@@ -590,7 +590,7 @@
         if (H === undefined) throw new TypeError("bro.tensor.nchwToSequence: H is required");
         if (W === undefined) throw new TypeError("bro.tensor.nchwToSequence: W is required");
         if (Y === undefined) throw new TypeError("bro.tensor.nchwToSequence: Y is required");
-        __bro_native.tensor.nchwToSequence(X, N, C, H, W, Y);
+        __bro_native.tensor.nchwToSequence(X, N, C, H, W, Y); chk();
     });
     fn(ns_tensor, "sequenceToNchw", function sequenceToNchw(X, N, C, H, W, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.sequenceToNchw: X is required");
@@ -599,7 +599,7 @@
         if (H === undefined) throw new TypeError("bro.tensor.sequenceToNchw: H is required");
         if (W === undefined) throw new TypeError("bro.tensor.sequenceToNchw: W is required");
         if (Y === undefined) throw new TypeError("bro.tensor.sequenceToNchw: Y is required");
-        __bro_native.tensor.sequenceToNchw(X, N, C, H, W, Y);
+        __bro_native.tensor.sequenceToNchw(X, N, C, H, W, Y); chk();
     });
     fn(ns_tensor, "interp2dForward", function interp2dForward(X, N, C, H_in, W_in, H_out, W_out, mode, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.interp2dForward: X is required");
@@ -611,7 +611,7 @@
         if (W_out === undefined) throw new TypeError("bro.tensor.interp2dForward: W_out is required");
         if (mode === undefined) throw new TypeError("bro.tensor.interp2dForward: mode is required");
         if (Y === undefined) throw new TypeError("bro.tensor.interp2dForward: Y is required");
-        __bro_native.tensor.interp2dForward(X, N, C, H_in, W_in, H_out, W_out, mode, Y);
+        __bro_native.tensor.interp2dForward(X, N, C, H_in, W_in, H_out, W_out, mode, Y); chk();
     });
     fn(ns_tensor, "interp2dAlignCornersForward", function interp2dAlignCornersForward(X, N, C, H_in, W_in, H_out, W_out, mode, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.interp2dAlignCornersForward: X is required");
@@ -623,7 +623,7 @@
         if (W_out === undefined) throw new TypeError("bro.tensor.interp2dAlignCornersForward: W_out is required");
         if (mode === undefined) throw new TypeError("bro.tensor.interp2dAlignCornersForward: mode is required");
         if (Y === undefined) throw new TypeError("bro.tensor.interp2dAlignCornersForward: Y is required");
-        __bro_native.tensor.interp2dAlignCornersForward(X, N, C, H_in, W_in, H_out, W_out, mode, Y);
+        __bro_native.tensor.interp2dAlignCornersForward(X, N, C, H_in, W_in, H_out, W_out, mode, Y); chk();
     });
     fn(ns_tensor, "unfold2dForward", function unfold2dForward(X, N, C, H, W, kH, kW, sH, sW, padT, padB, padL, padR, mode, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.unfold2dForward: X is required");
@@ -641,7 +641,7 @@
         if (padR === undefined) throw new TypeError("bro.tensor.unfold2dForward: padR is required");
         if (mode === undefined) throw new TypeError("bro.tensor.unfold2dForward: mode is required");
         if (Y === undefined) throw new TypeError("bro.tensor.unfold2dForward: Y is required");
-        __bro_native.tensor.unfold2dForward(X, N, C, H, W, kH, kW, sH, sW, padT, padB, padL, padR, mode, Y);
+        __bro_native.tensor.unfold2dForward(X, N, C, H, W, kH, kW, sH, sW, padT, padB, padL, padR, mode, Y); chk();
     });
     fn(ns_tensor, "l2NormalizeNchwForward", function l2NormalizeNchwForward(X, N, C, H, W, eps, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.l2NormalizeNchwForward: X is required");
@@ -651,7 +651,7 @@
         if (W === undefined) throw new TypeError("bro.tensor.l2NormalizeNchwForward: W is required");
         if (eps === undefined) throw new TypeError("bro.tensor.l2NormalizeNchwForward: eps is required");
         if (Y === undefined) throw new TypeError("bro.tensor.l2NormalizeNchwForward: Y is required");
-        __bro_native.tensor.l2NormalizeNchwForward(X, N, C, H, W, eps, Y);
+        __bro_native.tensor.l2NormalizeNchwForward(X, N, C, H, W, eps, Y); chk();
     });
     fn(ns_tensor, "convexUpsampleForward", function convexUpsampleForward(X, Mask, N, C, H, W, scale, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.convexUpsampleForward: X is required");
@@ -662,39 +662,39 @@
         if (W === undefined) throw new TypeError("bro.tensor.convexUpsampleForward: W is required");
         if (scale === undefined) throw new TypeError("bro.tensor.convexUpsampleForward: scale is required");
         if (Y === undefined) throw new TypeError("bro.tensor.convexUpsampleForward: Y is required");
-        __bro_native.tensor.convexUpsampleForward(X, Mask, N, C, H, W, scale, Y);
+        __bro_native.tensor.convexUpsampleForward(X, Mask, N, C, H, W, scale, Y); chk();
     });
     fn(ns_tensor, "mseVecForward", function mseVecForward(pred, target) {
         if (pred === undefined) throw new TypeError("bro.tensor.mseVecForward: pred is required");
         if (target === undefined) throw new TypeError("bro.tensor.mseVecForward: target is required");
-        return __bro_native.tensor.mseVecForward(pred, target);
+        const res = __bro_native.tensor.mseVecForward(pred, target); chk(); return res;
     });
     fn(ns_tensor, "mseVecBackward", function mseVecBackward(pred, target, dPred) {
         if (pred === undefined) throw new TypeError("bro.tensor.mseVecBackward: pred is required");
         if (target === undefined) throw new TypeError("bro.tensor.mseVecBackward: target is required");
         if (dPred === undefined) throw new TypeError("bro.tensor.mseVecBackward: dPred is required");
-        __bro_native.tensor.mseVecBackward(pred, target, dPred);
+        __bro_native.tensor.mseVecBackward(pred, target, dPred); chk();
     });
     fn(ns_tensor, "mseVecPerSample", function mseVecPerSample(pred, target, dPred, lossPerSample) {
         if (pred === undefined) throw new TypeError("bro.tensor.mseVecPerSample: pred is required");
         if (target === undefined) throw new TypeError("bro.tensor.mseVecPerSample: target is required");
         if (dPred === undefined) throw new TypeError("bro.tensor.mseVecPerSample: dPred is required");
         if (lossPerSample === undefined) throw new TypeError("bro.tensor.mseVecPerSample: lossPerSample is required");
-        __bro_native.tensor.mseVecPerSample(pred, target, dPred, lossPerSample);
+        __bro_native.tensor.mseVecPerSample(pred, target, dPred, lossPerSample); chk();
     });
     fn(ns_tensor, "embeddingLookupForward", function embeddingLookupForward(table, idxAsInt32, B, out) {
         if (table === undefined) throw new TypeError("bro.tensor.embeddingLookupForward: table is required");
         if (idxAsInt32 === undefined) throw new TypeError("bro.tensor.embeddingLookupForward: idxAsInt32 is required");
         if (B === undefined) throw new TypeError("bro.tensor.embeddingLookupForward: B is required");
         if (out === undefined) throw new TypeError("bro.tensor.embeddingLookupForward: out is required");
-        __bro_native.tensor.embeddingLookupForward(table, idxAsInt32, B, out);
+        __bro_native.tensor.embeddingLookupForward(table, idxAsInt32, B, out); chk();
     });
     fn(ns_tensor, "embeddingLookupBackward", function embeddingLookupBackward(dOut, idxAsInt32, B, dTable) {
         if (dOut === undefined) throw new TypeError("bro.tensor.embeddingLookupBackward: dOut is required");
         if (idxAsInt32 === undefined) throw new TypeError("bro.tensor.embeddingLookupBackward: idxAsInt32 is required");
         if (B === undefined) throw new TypeError("bro.tensor.embeddingLookupBackward: B is required");
         if (dTable === undefined) throw new TypeError("bro.tensor.embeddingLookupBackward: dTable is required");
-        __bro_native.tensor.embeddingLookupBackward(dOut, idxAsInt32, B, dTable);
+        __bro_native.tensor.embeddingLookupBackward(dOut, idxAsInt32, B, dTable); chk();
     });
     fn(ns_tensor, "sgdStep", function sgdStep(param, grad, velocity, lr, momentum) {
         if (param === undefined) throw new TypeError("bro.tensor.sgdStep: param is required");
@@ -702,7 +702,7 @@
         if (velocity === undefined) throw new TypeError("bro.tensor.sgdStep: velocity is required");
         if (lr === undefined) throw new TypeError("bro.tensor.sgdStep: lr is required");
         if (momentum === undefined) throw new TypeError("bro.tensor.sgdStep: momentum is required");
-        __bro_native.tensor.sgdStep(param, grad, velocity, lr, momentum);
+        __bro_native.tensor.sgdStep(param, grad, velocity, lr, momentum); chk();
     });
     fn(ns_tensor, "adamStep", function adamStep(param, grad, m, v, lr, beta1, beta2, eps, step) {
         if (param === undefined) throw new TypeError("bro.tensor.adamStep: param is required");
@@ -714,7 +714,7 @@
         if (beta2 === undefined) throw new TypeError("bro.tensor.adamStep: beta2 is required");
         if (eps === undefined) throw new TypeError("bro.tensor.adamStep: eps is required");
         if (step === undefined) throw new TypeError("bro.tensor.adamStep: step is required");
-        __bro_native.tensor.adamStep(param, grad, m, v, lr, beta1, beta2, eps, step);
+        __bro_native.tensor.adamStep(param, grad, m, v, lr, beta1, beta2, eps, step); chk();
     });
 
     // ---- bro.tensor.GpuTensor ------------------------------------------------
@@ -756,22 +756,22 @@
             if (Array.isArray(s)) this._shape = s.slice();
         });
     fn(GpuTensor.prototype, "zero", function zero() {
-        __bro_native.tensor.GpuTensor_zero(this);
+        __bro_native.tensor.GpuTensor_zero(this); chk();
     });
     // resize(rows, cols, dtype?): dtype a name or a bro.tensor.dtype value.
     fn(GpuTensor.prototype, "resize", function resize(rows, cols, dtype) {
         if (rows === undefined || cols === undefined) throw new TypeError("resize(rows, cols, dtype?)");
-        __bro_native.tensor.GpuTensor_resize(this, rows | 0, cols | 0, dtypeName(dtype, "fp32"));
+        __bro_native.tensor.GpuTensor_resize(this, rows | 0, cols | 0, dtypeName(dtype, "fp32")); chk();
     });
     fn(GpuTensor.prototype, "dtype", function dtype() {
-        return __bro_native.tensor.GpuTensor_dtype(this);
+        const res = __bro_native.tensor.GpuTensor_dtype(this); chk(); return res;
     });
     fn(GpuTensor.prototype, "clone", function clone() {
-        return __bro_native.tensor.GpuTensor_clone(this);
+        const res = __bro_native.tensor.GpuTensor_clone(this); chk(); return res;
     });
     fn(GpuTensor.prototype, "upload", function upload(src) {
         if (src === undefined) throw new TypeError("bro.tensor.GpuTensor.prototype.upload: src is required");
-        __bro_native.tensor.GpuTensor_upload(this, toF32(src));
+        __bro_native.tensor.GpuTensor_upload(this, toF32(src)); chk();
     });
     // download()    -> a fresh Float32Array (any dtype, converted to FP32).
     // download(dst) -> fills the Float32Array `dst` in place and returns it;
@@ -791,7 +791,7 @@
     });
     fn(GpuTensor.prototype, "uploadFp16", function uploadFp16(data) {
         if (data === undefined) throw new TypeError("bro.tensor.GpuTensor.prototype.uploadFp16: data is required");
-        __bro_native.tensor.GpuTensor_uploadFp16(this, toU16(data));
+        __bro_native.tensor.GpuTensor_uploadFp16(this, toU16(data)); chk();
     });
     fn(GpuTensor.prototype, "downloadFp16", function downloadFp16() {
         const out = __bro_native.tensor.GpuTensor_downloadFp16(this);
@@ -800,10 +800,10 @@
     });
     fn(GpuTensor.prototype, "uploadInt8", function uploadInt8(data) {
         if (data === undefined) throw new TypeError("bro.tensor.GpuTensor.prototype.uploadInt8: data is required");
-        __bro_native.tensor.GpuTensor_uploadInt8(this, toI8(data));
+        __bro_native.tensor.GpuTensor_uploadInt8(this, toI8(data)); chk();
     });
     fn(GpuTensor.prototype, "downloadInt8", function downloadInt8() {
-        return __bro_native.tensor.GpuTensor_downloadInt8(this);
+        const res = __bro_native.tensor.GpuTensor_downloadInt8(this); chk(); return res;
     });
 
     // ---- counter-based RNG (Philox) + init -------------------------------------
@@ -912,7 +912,7 @@
         return t;
     });
     fn(SafetensorsFile.prototype, "close", function close() {
-        __bro_native.tensor.SafetensorsFile_close(this);
+        __bro_native.tensor.SafetensorsFile_close(this); chk();
     });
     fn(ns_tensor, "openSafetensors", function openSafetensors(path) {
         if (typeof path !== "string") throw new TypeError("openSafetensors(path) — expected a string path");
