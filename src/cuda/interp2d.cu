@@ -65,19 +65,26 @@ inline void check_args(const char* op,
                        bool allow_bicubic) {
     if (N < 0 || C < 0 || H_in < 0 || W_in < 0 ||
         H_out < 0 || W_out < 0) {
-        fail(op, "N, C, H_in, W_in, H_out, W_out must be non-negative");
+        throw std::invalid_argument(std::string("brotensor: ") + op +
+                                    ": N, C, H_in, W_in, H_out, W_out must be "
+                                    "non-negative");
     }
-    const int max_mode = allow_bicubic ? 3 : 1;
-    if (mode < 0 || mode > max_mode) {
-        fail(op, allow_bicubic
-            ? "mode must be 0 (nearest), 1 (bilinear), 2 (bicubic a=-0.5, PIL), "
-              "or 3 (bicubic a=-0.75, torch)"
-            : "mode must be 0 (nearest) or 1 (bilinear) — bicubic backward "
-              "is not implemented");
+    if (mode < 0 || mode > 3) {
+        throw std::invalid_argument(std::string("brotensor: ") + op +
+            ": mode must be 0 (nearest), 1 (bilinear), 2 (bicubic a=-0.5, PIL), or 3 (bicubic a=-0.75, torch)");
+    }
+    if (!allow_bicubic && (mode == 2 || mode == 3)) {
+        const char* detail = (mode == 2)
+            ? "mode 2 (bicubic a=-0.5, PIL)"
+            : "mode 3 (bicubic a=-0.75, torch)";
+        throw std::runtime_error(std::string("brotensor: ") + op +
+            ": bicubic backward is not implemented for " + detail +
+            " — mode must be 0 (nearest) or 1 (bilinear)");
     }
     if ((H_out > 0 && H_in == 0) || (W_out > 0 && W_in == 0)) {
-        fail(op, "input spatial dims must be > 0 when output spatial "
-                 "dims are > 0");
+        throw std::invalid_argument(std::string("brotensor: ") + op +
+                                    ": input spatial dims must be > 0 when "
+                                    "output spatial dims are > 0");
     }
 }
 

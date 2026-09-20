@@ -246,14 +246,32 @@ static void test_nearest_backward_count() {
 static void test_bicubic_backward_throws() {
     Tensor dY = make_cpu(1, 1 * 2 * 2);
     Tensor dX = make_cpu(0, 0);
-    bool threw = false;
+    // mode 2 (PIL bicubic)
+    bool threw_mode2 = false;
     try {
-        brotensor::interp2d_backward(dY, 1, 1, 1, 1, 2, 2,
-                                     /*bicubic*/ 2, dX);
-    } catch (const std::runtime_error&) {
-        threw = true;
+        brotensor::interp2d_backward(dY, 1, 1, 1, 1, 2, 2, /*bicubic*/ 2, dX);
+    } catch (const std::runtime_error& e) {
+        threw_mode2 = (std::string(e.what()).find("mode 2") != std::string::npos);
     }
-    CHECK(threw);
+    CHECK(threw_mode2);
+
+    // mode 3 (torch bicubic)
+    bool threw_mode3 = false;
+    try {
+        brotensor::interp2d_backward(dY, 1, 1, 1, 1, 2, 2, /*bicubic*/ 3, dX);
+    } catch (const std::runtime_error& e) {
+        threw_mode3 = (std::string(e.what()).find("mode 3") != std::string::npos);
+    }
+    CHECK(threw_mode3);
+
+    // invalid mode
+    bool threw_invalid = false;
+    try {
+        brotensor::interp2d_backward(dY, 1, 1, 1, 1, 2, 2, /*invalid*/ 99, dX);
+    } catch (const std::invalid_argument&) {
+        threw_invalid = true;
+    }
+    CHECK(threw_invalid);
 }
 
 int main() {
