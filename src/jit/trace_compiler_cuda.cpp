@@ -30,14 +30,30 @@ static std::string float_to_ptx_hex(float f) {
     return ss.str();
 }
 
+static std::string query_cuda_arch() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess) {
+            int sm = major * 10 + minor;
+            if (sm >= 75) {
+                return "sm_" + std::to_string(sm);
+            }
+        }
+    }
+    return "sm_75";
+}
+
 static std::string emit_ptx_elementwise(const TraceDAG& dag,
                                         const std::vector<int>& input_node_ids,
                                         const std::vector<int>& output_node_ids) {
     const auto& nodes = dag.nodes();
 
+    std::string arch = query_cuda_arch();
     std::stringstream ss;
-    ss << ".version 8.0\n";
-    ss << ".target sm_89\n";
+    ss << ".version 7.8\n";
+    ss << ".target " << arch << "\n";
     ss << ".address_size 64\n\n";
 
     ss << ".visible .entry trace_elementwise_cuda_kernel(\n";
@@ -50,7 +66,7 @@ static std::string emit_ptx_elementwise(const TraceDAG& dag,
     ss << "    .param .u32 param_n\n";
     ss << ") {\n";
 
-    ss << "    .reg .b32 %r_tid, %r_ntid, %r_ctaid, %r_idx, %r_n;\n";
+    ss << "    .reg .b32 %r_tid, %r_ntid, %r_ctaid, %r_nctaid, %r_stride, %r_idx, %r_n;\n";
     ss << "    .reg .pred %p_oob;\n";
     ss << "    .reg .b64 %r_off64;\n";
 
@@ -65,24 +81,36 @@ static std::string emit_ptx_elementwise(const TraceDAG& dag,
     for (const auto& n : nodes) {
         ss << "    .reg .f32 %f_node_" << n.id << ";\n";
     }
-    // Scratch registers for SiLU
-    ss << "    .reg .f32 %t_neg, %t_exp_arg, %t_exp, %t_denom, %t_sig;\n\n";
+    // Scratch registers for SiLU and GELU
+    ss << "    .reg .f32 %t_neg, %t_exp_arg, %t_exp, %t_denom, %t_sig;\n";
+    ss << "    .reg .f32 %t_x2, %t_inner, %t_poly, %t_arg, %t_tanh, %t_1pt, %t_half_x;\n\n";
 
+    ss << "    ld.param.u32 %r_n, [param_n];\n";
     ss << "    mov.u32 %r_tid, %tid.x;\n";
     ss << "    mov.u32 %r_ntid, %ntid.x;\n";
     ss << "    mov.u32 %r_ctaid, %ctaid.x;\n";
+    ss << "    mov.u32 %r_nctaid, %nctaid.x;\n";
     ss << "    mad.lo.u32 %r_idx, %r_ctaid, %r_ntid, %r_tid;\n";
-    ss << "    ld.param.u32 %r_n, [param_n];\n";
+    ss << "    mul.lo.u32 %r_stride, %r_ntid, %r_nctaid;\n\n";
+
+    for (size_t m = 0; m < output_node_ids.size(); ++m) {
+        ss << "    ld.param.u64 %r_p_out_" << m << ", [param_out_" << m << "];\n";
+    }
+    for (size_t k = 0; k < input_node_ids.size(); ++k) {
+        ss << "    ld.param.u64 %r_p_in_" << k << ", [param_in_" << k << "];\n";
+    }
+    ss << "\n";
+
+    ss << "LOOP_HEAD:\n";
     ss << "    setp.ge.u32 %p_oob, %r_idx, %r_n;\n";
-    ss << "    @%p_oob bra EXIT;\n\n";
+    ss << "    @%p_oob bra LOOP_EXIT;\n\n";
 
     ss << "    cvt.u64.u32 %r_off64, %r_idx;\n";
     ss << "    shl.b64 %r_off64, %r_off64, 2;\n\n";
 
-    // Load input pointers and load values
+    // Load input values
     for (size_t k = 0; k < input_node_ids.size(); ++k) {
         int nid = input_node_ids[k];
-        ss << "    ld.param.u64 %r_p_in_" << k << ", [param_in_" << k << "];\n";
         ss << "    add.u64 %r_addr_in_" << k << ", %r_p_in_" << k << ", %r_off64;\n";
         ss << "    ld.global.f32 %f_node_" << nid << ", [%r_addr_in_" << k << "];\n";
     }
@@ -125,8 +153,15 @@ static std::string emit_ptx_elementwise(const TraceDAG& dag,
         } else if (n.op == TraceOpKind::ReLU) {
             ss << "    max.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", 0f00000000;\n";
         } else if (n.op == TraceOpKind::GELU) {
-            // Approx GELU: 0.5 * x * (1 + tanh(...))
-            ss << "    max.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", 0f00000000;\n";
+            // Approx GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+            ss << "    mul.f32 %t_x2, %f_node_" << n.inputs[0] << ", %f_node_" << n.inputs[0] << ";\n";
+            ss << "    fma.rn.f32 %t_inner, %t_x2, " << float_to_ptx_hex(0.044715f) << ", " << float_to_ptx_hex(1.0f) << ";\n";
+            ss << "    mul.f32 %t_poly, %t_inner, %f_node_" << n.inputs[0] << ";\n";
+            ss << "    mul.f32 %t_arg, %t_poly, " << float_to_ptx_hex(0.7978845608f) << ";\n";
+            ss << "    tanh.approx.f32 %t_tanh, %t_arg;\n";
+            ss << "    add.f32 %t_1pt, %t_tanh, " << float_to_ptx_hex(1.0f) << ";\n";
+            ss << "    mul.f32 %t_half_x, %f_node_" << n.inputs[0] << ", " << float_to_ptx_hex(0.5f) << ";\n";
+            ss << "    mul.f32 %f_node_" << n.id << ", %t_half_x, %t_1pt;\n";
         }
     }
     ss << "\n";
@@ -134,12 +169,15 @@ static std::string emit_ptx_elementwise(const TraceDAG& dag,
     // Store outputs
     for (size_t m = 0; m < output_node_ids.size(); ++m) {
         int nid = output_node_ids[m];
-        ss << "    ld.param.u64 %r_p_out_" << m << ", [param_out_" << m << "];\n";
         ss << "    add.u64 %r_addr_out_" << m << ", %r_p_out_" << m << ", %r_off64;\n";
         ss << "    st.global.f32 [%r_addr_out_" << m << "], %f_node_" << nid << ";\n";
     }
 
-    ss << "\nEXIT:\n";
+    ss << "\n";
+    ss << "    add.u32 %r_idx, %r_idx, %r_stride;\n";
+    ss << "    bra LOOP_HEAD;\n\n";
+
+    ss << "LOOP_EXIT:\n";
     ss << "    ret;\n";
     ss << "}\n";
 
@@ -304,7 +342,7 @@ std::shared_ptr<TraceHandleImpl> compile_cuda(const TraceDAG& dag, FusionPattern
 
     std::string ptx = emit_ptx_elementwise(dag, input_node_ids, output_node_ids);
     uint64_t hash = dag.compute_hash();
-    std::string cache_key = "trace_cuda_elem_" + std::to_string(hash);
+    std::string cache_key = "trace_cuda_elem_" + query_cuda_arch() + "_" + std::to_string(hash);
 
     CUfunction fn = CudaJitEngine::instance().get_function(
         cache_key,
