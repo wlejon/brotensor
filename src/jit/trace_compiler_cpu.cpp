@@ -143,7 +143,32 @@ namespace cpu {
 
 using ElementwiseFn = void (*)(float* const* out_ptrs, const float* const* in_ptrs, int64_t n);
 
+// What the host codegen below can actually be handed.
+//
+// It walks every operand as a flat run of `total_numel` FP32 values. A (1, D)
+// broadcast row or a half-precision buffer would be read past the end of its
+// allocation — a crash, or worse, silently wrong numbers — so anything that is
+// not the trace's full shape in FP32 is refused here. end_trace() then throws
+// and the caller falls back to its eager path, which is the contract the CUDA
+// compiler already follows for expressions it cannot fuse.
+static void require_cpu_fusable(const TraceDAG& dag) {
+    int rows = 0, cols = 0;
+    dag.dominant_shape(rows, cols);
+    for (const TraceNode& n : dag.nodes()) {
+        if (n.dtype != Dtype::FP32) {
+            throw std::runtime_error(
+                "brotensor::jit: the CPU trace compiler is FP32 only");
+        }
+        if (n.rows != rows || n.cols != cols) {
+            throw std::runtime_error(
+                "brotensor::jit: the CPU trace compiler has no broadcast form — "
+                "every operand must be the trace's full (rows, cols) shape");
+        }
+    }
+}
+
 static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& dag) {
+    require_cpu_fusable(dag);
     const auto& nodes = dag.nodes();
 
     std::vector<int> input_node_ids;
@@ -459,20 +484,21 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
         const TraceNode* node_gamma = nullptr;
 
         for (const auto& n : nodes) {
-            if (n.op == TraceOpKind::RMSNorm) {
-                node_rms = &n;
-                int add_id = n.inputs[0];
-                node_add = &nodes[add_id];
-                int res_id = node_add->inputs[1];
-                node_res = &nodes[res_id];
-                if (n.inputs.size() > 1) {
-                    node_gamma = &nodes[n.inputs[1]];
-                }
-                break;
-            }
+            if (n.op != TraceOpKind::RMSNorm || n.inputs.empty()) continue;
+            const TraceNode& add = nodes[n.inputs[0]];
+            // The hand kernel below is exactly `x += res; rms_norm(x, gamma)`.
+            // Anything else — no residual, no gain — is not this pattern, and
+            // reading its operands as if it were would be a crash.
+            if (add.op != TraceOpKind::Add || add.inputs.size() < 2) continue;
+            if (n.inputs.size() < 2) continue;
+            node_rms = &n;
+            node_add = &add;
+            node_res = &nodes[add.inputs[1]];
+            node_gamma = &nodes[n.inputs[1]];
+            break;
         }
 
-        if (node_rms && node_add && node_res) {
+        if (node_rms && node_add && node_res && node_gamma) {
             int B = node_add->rows;
             int D = node_add->cols;
             float eps = node_rms->scalar > 0.0f ? node_rms->scalar : 1e-5f;
@@ -545,7 +571,10 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
             }
         }
 
-        if (node_ln && node_out) {
+        // The hand kernel dereferences all five operands, so a trace missing
+        // any of them (a non-affine LayerNorm, a modulate with no shift) is
+        // not this pattern and falls through to the generic path.
+        if (node_ln && node_out && node_gamma && node_beta && node_scale && node_shift) {
             int R = node_ln->rows;
             int D = node_ln->cols;
             float eps = node_ln->scalar > 0.0f ? node_ln->scalar : 1e-5f;
