@@ -433,6 +433,75 @@ void test_store_into_row_views(Device dev, Dtype dt) {
 //
 // (5, 6) FP32 is 30 elements: not a multiple of the 4-wide access, so the
 // launcher has to fall back to the scalar entry. The answer must be identical.
+// ── narrow rows, many of them ───────────────────────────────────────────────
+//
+// A VAE feature map reaches the row kernel as (H*W, channels): tens of
+// thousands of rows 96 to 384 wide. One row per 256-thread block idles most
+// of every block, so the kernel packs several rows into a block instead, and
+// the reduction then has to stay inside each row. These are the shapes that
+// catch a reduction that leaked across the row boundary — a row's normaliser
+// would pick up its neighbours' sums and every value would be wrong.
+void test_narrow_rows(Device dev, Dtype dt) {
+    struct Shape { int n, d; };
+    // 96 and 384 are real Qwen-Image 2.1 VAE widths; 4096x64 is the extreme
+    // (one warp per row, eight rows a block); 1023 rows is deliberately not a
+    // multiple of any row-packing, which forces one row per block.
+    const Shape shapes[] = {{8192, 96}, {4096, 128}, {2048, 384}, {4096, 64}, {1023, 128}};
+    for (const Shape& s : shapes) {
+        SplitMix64 rng(0xC0FFEE ^ static_cast<uint64_t>(s.d));
+        const std::vector<float> hx = random_rows(rng, s.n, s.d, 1.5f);
+        std::vector<float> hg = random_rows(rng, 1, s.d, 0.4f);
+        for (auto& v : hg) v += 1.0f;
+
+        Tensor x = make(dev, hx, s.n, s.d, dt);
+        Tensor gamma = make(dev, hg, 1, s.d, dt);
+
+        begin_trace();
+        Tensor out = jit::silu(jit::rms_norm(x, gamma, 1e-6f));
+        TraceHandle h = end_trace();
+        sync_all();
+
+        Tensor en = Tensor::empty_on(dev, s.n, s.d, dt);
+        rms_norm_forward(x, gamma, 1e-6f, en);
+        silu_forward(en, en);
+        sync_all();
+
+        const std::string tag = "narrow rms_norm+silu " + std::to_string(s.n) + "x" +
+                                std::to_string(s.d) + " [" + dtype_name(dt) + "]";
+        check(tag, read(out), read(en), tol_for(dt));
+        check_true(tag + " is one launch", h.launch_count() == 1, h.fusion_name());
+    }
+}
+
+// LayerNorm carries a second accumulator through the same reduction, so its
+// per-row isolation is worth its own narrow-row case.
+void test_narrow_layernorm(Device dev, Dtype dt) {
+    const int N = 4096, D = 192;
+    SplitMix64 rng(0x5EED);
+    const std::vector<float> hx = random_rows(rng, N, D, 2.0f);
+    std::vector<float> hs = random_rows(rng, 1, D, 0.3f);
+
+    Tensor x = make(dev, hx, N, D, dt);
+    Tensor scale = make(dev, hs, 1, D, dt);
+    Tensor shift = make(dev, std::vector<float>(static_cast<std::size_t>(D), 0.0f), 1, D, dt);
+
+    begin_trace();
+    Tensor out = jit::modulate(jit::layernorm(x, Tensor(), Tensor(), 1e-6f), scale, shift);
+    TraceHandle h = end_trace();
+    sync_all();
+
+    Tensor ones = make(dev, std::vector<float>(static_cast<std::size_t>(D), 1.0f), 1, D, dt);
+    Tensor ln = Tensor::empty_on(dev, N, D, dt);
+    layernorm_forward_inference_batched(x, ones, shift, ln, 1e-6f);
+    Tensor en = Tensor::empty_on(dev, N, D, dt);
+    modulate(ln, scale, shift, en);
+    sync_all();
+
+    const std::string tag = std::string("narrow layernorm+modulate [") + dtype_name(dt) + "]";
+    check(tag, read(out), read(en), tol_for(dt));
+    check_true(tag + " is one launch", h.launch_count() == 1, h.fusion_name());
+}
+
 void test_scalar_entry_fallback(Device dev) {
     const int N = 5, D = 6;
     SplitMix64 rng(0x4242);
@@ -473,6 +542,8 @@ void run_suite(Device dev, const char* label) {
         test_residual_rmsnorm(dev, dt);
         test_layernorm_modulate(dev, dt);
         test_store_into_row_views(dev, dt);
+        test_narrow_rows(dev, dt);
+        test_narrow_layernorm(dev, dt);
     }
     test_scalar_entry_fallback(dev);
 }

@@ -10,12 +10,28 @@ namespace brotensor::jit::ptx {
 
 using namespace brotensor::jit::ptx::detail;
 
+void row_norm_geometry(int cols, int rows, int lanes, int& tpr, int& rpb) {
+    if (lanes < 1) lanes = 1;
+    const int per_row = (cols + lanes - 1) / lanes;   // threads to cover a row
+    int t = 32;
+    while (t < per_row && t < kRowThreads) t <<= 1;
+    int r = kRowThreads / t;
+    // The out-of-range exit has to be block-uniform, or the threads that stay
+    // hit a barrier the ones that left never will.
+    while (r > 1 && rows % r != 0) r >>= 1;
+    tpr = t;
+    rpb = r;
+}
+
 namespace {
 
 // ─── row-norm kernel ────────────────────────────────────────────────────────
 //
-// One block per row, kRowThreads threads walking the row in strides of
-// kRowThreads * lanes columns, so each access moves 16 bytes.
+// A block holds `rpb` rows of `tpr` threads; each group of tpr threads walks
+// its row in strides of tpr * lanes columns, so every access moves 16 bytes.
+// row_norm_geometry picks the pair — wide rows get all 256 threads and one
+// row per block, narrow ones pack several rows into a block instead of idling
+// most of it.
 //
 //   pass 1   evaluate the pre chain (the nodes the reduction depends on) and
 //            accumulate sum and sum-of-squares; reduce across the block with a
@@ -40,8 +56,12 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
     const int D = ew.cols;
     const int R = ew.rows;
     const bool mean = (plan.reduce == RowReduce::Mean);
-    const int warps = kRowThreads / 32;
-    const int step = kRowThreads * lanes;
+    int tpr = kRowThreads, rpb = 1;
+    row_norm_geometry(D, R, lanes, tpr, rpb);
+    // tpr is never below 32, so a row's threads always fill whole warps and
+    // the butterfly below is always a full-warp one.
+    const int warps = tpr / 32;           // warps cooperating on one row
+    const int step = tpr * lanes;
 
     Alloc a;
     std::stringstream b;
@@ -59,19 +79,35 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
         b << "    ld.param.u64 " << in_ptr[k] << ", [" << name << "_in_" << k << "];\n";
     }
 
+    // tid splits into (which row of this block, which thread within the row).
     const std::string r_tid = a.R(), r_row = a.R(), r_c0 = a.R();
+    const std::string r_sub = a.R(), r_local = a.R();
     b << "    mov.u32 " << r_tid << ", %tid.x;\n";
     b << "    mov.u32 " << r_row << ", %ctaid.x;\n";
+    if (rpb == 1) {
+        b << "    mov.u32 " << r_local << ", 0;\n";
+        b << "    mov.u32 " << r_sub << ", " << r_tid << ";\n";
+    } else {
+        // tpr is a power of two, so both halves are a shift and a mask.
+        int log_tpr = 0;
+        while ((1 << log_tpr) < tpr) ++log_tpr;
+        b << "    shr.u32 " << r_local << ", " << r_tid << ", " << log_tpr << ";\n";
+        b << "    and.b32 " << r_sub << ", " << r_tid << ", " << (tpr - 1) << ";\n";
+        b << "    mad.lo.u32 " << r_row << ", " << r_row << ", " << rpb << ", "
+          << r_local << ";\n";
+    }
     {
+        // rpb divides R (row_norm_geometry guarantees it), so this exit is
+        // uniform across the block and the barrier below stays safe.
         const std::string p = a.P();
         b << "    setp.ge.u32 " << p << ", " << r_row << ", " << R << ";\n";
         b << "    @" << p << " bra $L_" << name << "_done;\n";
     }
     // This thread's first column.
     if (lanes == 1) {
-        b << "    mov.u32 " << r_c0 << ", " << r_tid << ";\n";
+        b << "    mov.u32 " << r_c0 << ", " << r_sub << ";\n";
     } else {
-        b << "    mul.lo.u32 " << r_c0 << ", " << r_tid << ", " << lanes << ";\n";
+        b << "    mul.lo.u32 " << r_c0 << ", " << r_sub << ", " << lanes << ";\n";
     }
 
     // Element index of column 0 of this row, and its byte offset per dtype.
@@ -199,7 +235,12 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
     if (mean) warp_reduce(f_sum);
     warp_reduce(f_sq);
 
-    {
+    // With one warp per row the butterfly already produced the row total in
+    // every lane; only a row spanning several warps needs the shared round,
+    // and then only across ITS warps. Slot layout is one entry per warp of
+    // the block (at most eight), sums after squares.
+    if (warps > 1) {
+        const int slots = kRowThreads / 32;
         const std::string r_warp = a.R(), r_lane = a.R(), r_sb = a.R(), r_sa = a.R();
         const std::string p_lane0 = a.P();
         b << "    shr.u32 " << r_warp << ", " << r_tid << ", 5;\n";
@@ -214,7 +255,7 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
             b << "    st.shared.b32 [" << r_sa << "], " << rt << ";\n";
             if (mean) {
                 const std::string rt2 = a.R(), ra2 = a.R();
-                b << "    add.u32 " << ra2 << ", " << r_sa << ", " << (warps * 4) << ";\n";
+                b << "    add.u32 " << ra2 << ", " << r_sa << ", " << (slots * 4) << ";\n";
                 b << "    mov.b32 " << rt2 << ", " << f_sum << ";\n";
                 b << "    st.shared.b32 [" << ra2 << "], " << rt2 << ";\n";
             }
@@ -222,20 +263,27 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
         b << "$L_" << name << "_nostore:\n";
         b << "    bar.sync 0;\n";
 
-        // Every thread folds the per-warp partials itself, so the result needs
-        // no second broadcast: at 256 threads that is eight shared loads.
+        // This row's warps start at (row within block) * warps. Every thread
+        // folds them itself, so the result needs no second broadcast.
+        const std::string r_base = a.R();
+        if (rpb == 1) {
+            b << "    mov.u32 " << r_base << ", " << r_sb << ";\n";
+        } else {
+            b << "    mad.lo.u32 " << r_base << ", " << r_local << ", " << (warps * 4)
+              << ", " << r_sb << ";\n";
+        }
         b << "    mov.f32 " << f_sq << ", 0f00000000;\n";
         if (mean) b << "    mov.f32 " << f_sum << ", 0f00000000;\n";
         for (int w = 0; w < warps; ++w) {
             const std::string ra = a.R(), rv = a.R(), fv = a.F();
-            b << "    add.u32 " << ra << ", " << r_sb << ", " << (w * 4) << ";\n";
+            b << "    add.u32 " << ra << ", " << r_base << ", " << (w * 4) << ";\n";
             b << "    ld.shared.b32 " << rv << ", [" << ra << "];\n";
             b << "    mov.b32 " << fv << ", " << rv << ";\n";
             b << "    add.f32 " << f_sq << ", " << f_sq << ", " << fv << ";\n";
             if (mean) {
                 const std::string ra2 = a.R(), rv2 = a.R(), fv2 = a.F();
-                b << "    add.u32 " << ra2 << ", " << r_sb << ", " << (warps * 4 + w * 4)
-                  << ";\n";
+                b << "    add.u32 " << ra2 << ", " << r_base << ", "
+                  << (slots * 4 + w * 4) << ";\n";
                 b << "    ld.shared.b32 " << rv2 << ", [" << ra2 << "];\n";
                 b << "    mov.b32 " << fv2 << ", " << rv2 << ";\n";
                 b << "    add.f32 " << f_sum << ", " << f_sum << ", " << fv2 << ";\n";

@@ -105,7 +105,21 @@ inline constexpr const char* kEntryScalar = "trace_ew_scalar";
 inline constexpr const char* kEntryRowNorm = "trace_row_norm_vec";
 inline constexpr const char* kEntryRowNormScalar = "trace_row_norm_scalar";
 
-// Threads per block for the row-norm kernel; also the reduction width.
+// Upper bound on a row-norm block. The actual block is rows_per_block rows of
+// threads_per_row threads each, never more than this.
 inline constexpr int kRowThreads = 256;
+
+// How the row-norm kernel tiles a (rows, cols) trace at `lanes` elements per
+// access. `tpr` threads cooperate on one row and `rpb` rows share a block.
+//
+// A row needs ceil(cols/lanes) threads to cover it in one stride. Giving it
+// 256 regardless — which is what a one-row-per-block kernel does — is right
+// for a 4096-wide transformer activation and catastrophic for a VAE feature
+// map, where cols is 96 to 384 and rows runs into the millions: seven eighths
+// of every block idles, and the launch is a million blocks deep.
+//
+// `rpb` is also held to a divisor of `rows`, so the "my row is past the end"
+// exit is uniform across a block and the reduction's barrier is safe.
+void row_norm_geometry(int cols, int rows, int lanes, int& tpr, int& rpb);
 
 }  // namespace brotensor::jit::ptx

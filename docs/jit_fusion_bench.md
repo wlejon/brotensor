@@ -102,6 +102,28 @@ ratio here *is* the launch-count ratio.
 | chain4 | bf16 | 256×1024 | 0.015 ms (5) | **0.004 ms (1)** | 3.75× |
 | layernorm-modulate | bf16 | 256×1024 | 0.009 ms (2) | **0.004 ms (1)** | 2.25× |
 
+### VAE feature maps — many narrow rows
+
+A convolutional feature map reaches the row kernel as `(H*W, channels)`, which
+is the opposite regime to a transformer activation: hundreds of thousands of
+rows, 96 to 384 wide. One row per 256-thread block — which is what the kernel
+did originally — gives a 96-wide row 256 threads and idles seven eighths of
+them. The kernel now picks `threads_per_row` from the row width and packs
+`256 / threads_per_row` rows into each block, holding the packing to a divisor
+of the row count so the "past the end" exit stays uniform and the reduction's
+barrier stays safe. At 1048576×96 that is 1.156 ms → 0.894 ms; at 384 wide,
+where a row already wants most of a block, nothing changes.
+
+| pattern | dtype | shape | eager | jit | jit vs eager |
+|---|---|---|---|---|---|
+| rmsnorm-silu | fp32 | 262144×384 | 1.837 ms (2) | **0.889 ms (1)** | 2.07× |
+| rmsnorm-silu | fp32 | 1048576×96 | 2.829 ms (2) | **0.894 ms (1)** | 3.16× |
+| rmsnorm-silu | fp32 | 65536×384 | 0.418 ms (2) | **0.208 ms (1)** | 2.01× |
+
+All three land at 96–103% of measured streaming bandwidth. Eager only reaches
+30–51%, because at these widths its two kernels are bound by how fast they can
+issue rows, not by bandwidth.
+
 ## Launch counts
 
 The JIT is one launch for every pattern here. Eager is:
@@ -152,6 +174,7 @@ so the eager column was the only option.
 | Pre-chain store in pass one, reload in pass two | `residual-rmsnorm` bf16 4096×12288: 0.538 → 0.442 ms (from 1.4% slower than eager to 26% faster). The fused kernel used to replay the residual add in both passes, reading x and p twice; now pass one writes x and pass two reads it back out of L2. |
 | `tanh` / `sigmoid` ops | Coverage, not speed — the DiT applies `tanh` to a `(1, D)` row once per forward, not per token. |
 | Lock-free caches | No measurable replay cost either way; the mutex was never on the hot path. It is a design constraint, and removing it also removed the initialisation flag. |
+| Row-width-aware block geometry | `rmsnorm-silu` fp32 1048576×96: 1.156 → 0.894 ms (72% → 96% of peak). A one-row-per-block kernel gives a 96-wide row 256 threads and idles seven eighths of them; packing eight such rows into a block recovers the occupancy. Wider rows are unaffected — 262144×384 is 0.890 ms either way. |
 
 ## Where the JIT still loses, and why
 

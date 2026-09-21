@@ -449,6 +449,16 @@ int main() {
         }
     }
 
+    // The VAE's shape: a feature map reaches the row kernel as (H*W, channels),
+    // which is a different regime entirely — hundreds of thousands of rows a
+    // hundred elements wide, where the reduction's fixed cost per row is what
+    // decides whether fusing beats two plain elementwise passes.
+    const Shape vae[] = {{262144, 384}, {1048576, 96}, {65536, 384}};
+    for (const Shape& s : vae) {
+        std::printf("\n## %dx%d (VAE feature map)\n\n", s.rows, s.cols);
+        bench_rmsnorm_silu(dev, s.rows, s.cols, Dtype::FP32);
+    }
+
     bench_compile_cost(dev);
     print_markdown();
     return 0;

@@ -332,6 +332,7 @@ std::shared_ptr<TraceHandleImpl> compile_row_norm(const TraceDAG& dag,
         CudaJitEngine::instance().get_function(key + ":s", ptx_src, ptx::kEntryRowNormScalar);
 
     const int rows = plan.ew.rows;
+    const int cols = plan.ew.cols;
     const int lanes = plan.ew.vec;
     const bool is_ln = (plan.reduce == ptx::RowReduce::Mean);
 
@@ -345,7 +346,7 @@ std::shared_ptr<TraceHandleImpl> compile_row_norm(const TraceDAG& dag,
         out_align[i] = lanes * ptx::elem_bytes(plan.ew.outputs[i].dtype);
     }
 
-    auto bind = [fn_vec, fn_sca, rows, lanes, is_ln, in_align, out_align](
+    auto bind = [fn_vec, fn_sca, rows, cols, lanes, is_ln, in_align, out_align](
                     const std::vector<void*>& ins, const std::vector<void*>& outs) {
         bool use_vec = lanes > 1;
         for (std::size_t i = 0; i < ins.size() && use_vec; ++i) {
@@ -358,8 +359,14 @@ std::shared_ptr<TraceHandleImpl> compile_row_norm(const TraceDAG& dag,
         auto args = std::make_shared<LaunchArgs>();
         args->build(outs, ins, 0, /*with_count=*/false);
 
-        unsigned grid = static_cast<unsigned>(rows);
+        // The entry chosen here decides the tiling: the scalar fallback covers
+        // a row with more threads than the vector one does, so its geometry
+        // has to be recomputed, not inherited.
+        int tpr = ptx::kRowThreads, rpb = 1;
+        ptx::row_norm_geometry(cols, rows, use_vec ? lanes : 1, tpr, rpb);
+        unsigned grid = static_cast<unsigned>((rows + rpb - 1) / rpb);
         if (grid == 0) grid = 1;
+        const unsigned block = static_cast<unsigned>(tpr * rpb);
 
         CUfunction fn = use_vec ? fn_vec : fn_sca;
         auto h = std::make_shared<TraceHandleImpl>();
@@ -367,8 +374,8 @@ std::shared_ptr<TraceHandleImpl> compile_row_norm(const TraceDAG& dag,
         h->launch_count = 1;
         h->fusion_name = is_ln ? (use_vec ? "row-layernorm-chain" : "row-layernorm-chain-scalar")
                                : (use_vec ? "row-rmsnorm-chain" : "row-rmsnorm-chain-scalar");
-        h->execute_fn = [fn, grid, args]() {
-            launch(fn, grid, static_cast<unsigned>(ptx::kRowThreads), *args, "trace row-norm");
+        h->execute_fn = [fn, grid, block, args]() {
+            launch(fn, grid, block, *args, "trace row-norm");
         };
         return h;
     };
