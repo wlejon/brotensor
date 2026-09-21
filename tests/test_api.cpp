@@ -280,9 +280,9 @@ static void test_js_safetensors() {
         if (!t4d_loaded.shape || t4d_loaded.shape.length !== 4 || t4d_loaded.shape[1] !== 3) {
             throw new Error("loaded t4d shape: " + JSON.stringify(t4d_loaded.shape));
         }
+        g2.close();
         // Round-trip saving the loaded 4D tensor
         tensor.saveSafetensors(savedPath, { t4d_copy: t4d_loaded });
-        g2.close();
         const g3 = tensor.openSafetensors(savedPath);
         const gh3 = g3.header();
         if (!gh3.t4d_copy || gh3.t4d_copy.shape.length !== 4 || gh3.t4d_copy.shape[1] !== 3) {

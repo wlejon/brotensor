@@ -57,8 +57,8 @@ static bool near_(float a, float b, float abs_eps, float rel_eps) {
     } while (0)
 
 // Helper: a zeroed CPU tensor of shape (r, c).
-static Tensor cpu_zeros(int r, int c = 1) {
-    return Tensor::zeros_on(Device::CPU, r, c);
+static Tensor cpu_zeros(int r, int c = 1, brotensor::Dtype dt = brotensor::Dtype::FP32) {
+    return Tensor::zeros_on(Device::CPU, r, c, dt);
 }
 
 // ---- Generic finite-difference gradient checker -----------------------------
@@ -468,25 +468,25 @@ static void test_diffusion_samplers_dtypes() {
     std::printf("test_diffusion_samplers_dtypes\n");
     const int N = 4, D = 4;
     for (brotensor::Dtype dt : {brotensor::Dtype::FP32, brotensor::Dtype::FP16, brotensor::Dtype::BF16}) {
-        Tensor x_t = Tensor::zeros(N, D, dt);
-        Tensor eps = Tensor::zeros(N, D, dt);
-        Tensor xp = Tensor::zeros(N, D, dt);
+        Tensor x_t = cpu_zeros(N, D, dt);
+        Tensor eps = cpu_zeros(N, D, dt);
+        Tensor xp = cpu_zeros(N, D, dt);
         brotensor::ddim_step(x_t, eps, 0.64f, 0.36f, 0.0f, xp);
         EXPECT_TRUE(xp.dtype == dt, "ddim_step output dtype matches input");
         EXPECT_TRUE(xp.rows == N && xp.cols == D, "ddim_step shape");
 
-        Tensor x_euler = Tensor::zeros(N, D, dt);
+        Tensor x_euler = cpu_zeros(N, D, dt);
         brotensor::euler_step(x_t, eps, 1.0f, 0.6f, x_euler);
         EXPECT_TRUE(x_euler.dtype == dt, "euler_step output dtype matches input");
 
-        Tensor x0p = Tensor::zeros(N, D, dt);
-        Tensor x_dpm = Tensor::zeros(N, D, dt);
-        Tensor x0_out = Tensor::zeros(N, D, dt);
+        Tensor x0p = cpu_zeros(N, D, dt);
+        Tensor x_dpm = cpu_zeros(N, D, dt);
+        Tensor x0_out = cpu_zeros(N, D, dt);
         brotensor::dpmpp_2m_step(x_t, eps, x0p, 0.5f, 0.75f, 0.5f, -0.25f, x_dpm, x0_out);
         EXPECT_TRUE(x_dpm.dtype == dt, "dpmpp_2m_step x_prev dtype");
         EXPECT_TRUE(x0_out.dtype == dt, "dpmpp_2m_step x0_out dtype");
 
-        Tensor ts = Tensor::zeros(N, 1, dt);
+        Tensor ts = cpu_zeros(N, 1, dt);
         Tensor Y;
         brotensor::timestep_embedding(ts, D, 10000.0f, Y);
         EXPECT_TRUE(Y.rows == N && Y.cols == D, "timestep_embedding shape");
