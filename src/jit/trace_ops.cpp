@@ -267,6 +267,20 @@ Tensor relu(const Tensor& a) {
     return out;
 }
 
+void store(Tensor& dst, const Tensor& src) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_src = ctx.get_or_register_slot(src);
+        ctx.record_op(TraceOpKind::Copy, {slot_src}, 0.0f, dst);
+        return;
+    }
+    if (dst.rows != src.rows || dst.cols != src.cols || dst.dtype != src.dtype) {
+        throw std::runtime_error("brotensor::jit: store() needs dst and src to agree on "
+                                 "shape and dtype");
+    }
+    brotensor::copy_d2d(src, 0, dst, 0, src.size());
+}
+
 Tensor tanh(const Tensor& a) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();

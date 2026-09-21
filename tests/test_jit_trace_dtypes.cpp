@@ -372,6 +372,63 @@ void test_layernorm_modulate(Device dev, Dtype dt) {
     check_true(tag + " is one launch", h.launch_count() == 1, h.fusion_name());
 }
 
+// ── store(): the traced result lands in a buffer the caller owns ────────────
+//
+// Without this the tracer allocates the output and the caller has to copy it
+// somewhere useful, which is the round trip the fusion exists to remove. The
+// case that matters is a row view: two traces with different modulation rows
+// writing disjoint row ranges of one (N, D) scratch tensor, the way the DiT
+// applies one modulation to its prefix rows and another to the rest.
+void test_store_into_row_views(Device dev, Dtype dt) {
+    const int N = 384, D = 512, split = 128;
+    SplitMix64 rng(0x50FA);
+    const std::vector<float> hx = random_rows(rng, N, D, 1.0f);
+    const std::vector<float> ha = random_rows(rng, 1, D, 0.5f);
+    const std::vector<float> hb = random_rows(rng, 1, D, 0.5f);
+
+    Tensor x = make(dev, hx, N, D, dt);
+    Tensor sa = make(dev, ha, 1, D, dt);
+    Tensor sb = make(dev, hb, 1, D, dt);
+    Tensor dst = Tensor::zeros_on(dev, N, D, dt);
+
+    auto view = [&](Tensor& t, int start, int n) {
+        return Tensor::view(t.device, static_cast<char*>(t.data) +
+                                          static_cast<std::size_t>(start) * t.cols *
+                                              (t.dtype == Dtype::FP32 ? 4 : 2),
+                            n, t.cols, t.dtype);
+    };
+
+    Tensor d0 = view(dst, 0, split);
+    Tensor x0 = view(x, 0, split);
+    begin_trace();
+    jit::store(d0, x0 * sa);
+    TraceHandle h0 = end_trace();
+
+    Tensor d1 = view(dst, split, N - split);
+    Tensor x1 = view(x, split, N - split);
+    begin_trace();
+    jit::store(d1, x1 * sb);
+    TraceHandle h1 = end_trace();
+    sync_all();
+
+    const std::vector<float> xr = read(x);
+    const float* pa = ha.data();
+    const float* pb = hb.data();
+    std::vector<float> want(xr.size());
+    for (int r = 0; r < N; ++r) {
+        const float* s = (r < split) ? pa : pb;
+        for (int c = 0; c < D; ++c) {
+            want[static_cast<std::size_t>(r) * D + c] =
+                xr[static_cast<std::size_t>(r) * D + c] * s[c];
+        }
+    }
+
+    const std::string tag = std::string("store into row views [") + dtype_name(dt) + "]";
+    check(tag, read(dst), want, tol_for(dt));
+    check_true(tag + " is two launches total",
+               h0.launch_count() == 1 && h1.launch_count() == 1, h0.fusion_name());
+}
+
 // ── a shape the vector entry cannot take ────────────────────────────────────
 //
 // (5, 6) FP32 is 30 elements: not a multiple of the 4-wide access, so the
@@ -415,6 +472,7 @@ void run_suite(Device dev, const char* label) {
         test_rmsnorm_silu(dev, dt);
         test_residual_rmsnorm(dev, dt);
         test_layernorm_modulate(dev, dt);
+        test_store_into_row_views(dev, dt);
     }
     test_scalar_entry_fallback(dev);
 }

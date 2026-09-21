@@ -118,6 +118,11 @@ inline void emit_lane_op(std::ostream& o, Alloc& a, const TraceNode& n,
         case TraceOpKind::Tanh:
             o << "    tanh.approx.f32 " << d << ", " << in[0] << ";\n";
             break;
+        case TraceOpKind::Copy:
+            // The value already sits in a register; the node exists so the
+            // store below lands in the caller's buffer.
+            o << "    mov.f32 " << d << ", " << in[0] << ";\n";
+            break;
         case TraceOpKind::GELU: {
             // 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))) — the tanh
             // approximation nn.GELU(approximate="tanh") uses.

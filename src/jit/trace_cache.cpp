@@ -115,4 +115,8 @@ bool is_tracing() {
     return TraceContext::current().is_active();
 }
 
+void abort_trace() {
+    TraceContext::current().discard();
+}
+
 }  // namespace brotensor::jit

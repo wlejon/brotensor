@@ -281,6 +281,10 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
             res = tb.vtanh_f32x8(v_node_vals[n.inputs[0]]);
         } else if (n.op == TraceOpKind::Sigmoid) {
             res = tb.vsigmoid_f32x8(v_node_vals[n.inputs[0]]);
+        } else if (n.op == TraceOpKind::Copy) {
+            // The node exists so the store lands in the caller's buffer; the
+            // value is already the one to write.
+            res = v_node_vals[n.inputs[0]];
         } else {
             throw std::runtime_error(
                 std::string("brotensor::jit: op '") + op_kind_name(n.op) +
@@ -356,6 +360,8 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
             res = tb.tanh_f32(s_node_vals[n.inputs[0]]);
         } else if (n.op == TraceOpKind::Sigmoid) {
             res = tb.sigmoid_f32(s_node_vals[n.inputs[0]]);
+        } else if (n.op == TraceOpKind::Copy) {
+            res = s_node_vals[n.inputs[0]];
         } else {
             throw std::runtime_error(
                 std::string("brotensor::jit: op '") + op_kind_name(n.op) +

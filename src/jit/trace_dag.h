@@ -29,7 +29,8 @@ enum class TraceOpKind : uint8_t {
     LayerNorm,
     Modulate,
     Tanh,
-    Sigmoid
+    Sigmoid,
+    Copy
 };
 
 const char* op_kind_name(TraceOpKind op);
@@ -100,6 +101,8 @@ public:
 
     void begin();
     TraceDAG end();
+    // Throws away a trace in progress. Leaves the context idle.
+    void discard();
     bool is_active() const noexcept { return active_; }
 
     int get_or_register_slot(const Tensor& t);

@@ -26,6 +26,7 @@ const char* op_kind_name(TraceOpKind op) {
         case TraceOpKind::Modulate: return "Modulate";
         case TraceOpKind::Tanh: return "Tanh";
         case TraceOpKind::Sigmoid: return "Sigmoid";
+        case TraceOpKind::Copy: return "Copy";
     }
     return "Unknown";
 }
@@ -202,6 +203,12 @@ void TraceContext::begin() {
     dag_.reset();
     active_ptr_to_slot_.clear();
     active_ = true;
+}
+
+void TraceContext::discard() {
+    dag_.reset();
+    active_ptr_to_slot_.clear();
+    active_ = false;
 }
 
 TraceDAG TraceContext::end() {

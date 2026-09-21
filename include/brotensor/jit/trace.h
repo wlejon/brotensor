@@ -55,6 +55,12 @@ void begin_trace();
 // Stops tracing, compiles the captured DAG (or retrieves from cache), and returns a TraceHandle.
 TraceHandle end_trace();
 
+// Discards a trace in progress without compiling it. For a caller that has to
+// unwind out of a traced region — an unsupported expression throws from
+// end_trace(), and the thread's trace context has to be left clean for the
+// next attempt.
+void abort_trace();
+
 // Returns true if tracing is currently active on this thread.
 bool is_tracing();
 
@@ -117,12 +123,21 @@ Tensor rms_norm(const Tensor& x, const Tensor& gamma = Tensor(), float eps = 1e-
 Tensor layernorm(const Tensor& x, const Tensor& gamma = Tensor(), const Tensor& beta = Tensor(), float eps = 1e-5f);
 Tensor modulate(const Tensor& x, const Tensor& scale, const Tensor& shift);
 
+// Writes `src` into `dst`'s existing buffer. Under a trace this is what makes
+// an expression land somewhere the caller already owns — a preallocated
+// scratch tensor, or a row view into a larger one — instead of in a buffer the
+// tracer allocated and the caller would have to copy out of. Outside a trace
+// it is an ordinary device-to-device copy.
+void store(Tensor& dst, const Tensor& src);
+
 } // namespace brotensor::jit
 
 namespace brotensor {
 using jit::begin_trace;
 using jit::end_trace;
+using jit::abort_trace;
 using jit::is_tracing;
+using jit::store;
 using jit::TraceScope;
 using jit::TraceHandle;
 
