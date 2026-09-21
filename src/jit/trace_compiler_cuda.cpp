@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -119,10 +120,11 @@ bool build_plan(const TraceDAG& dag, ptx::ElementwisePlan& plan) {
     return true;
 }
 
-// A trace is a row-norm when exactly one node is a norm, that node reads a
-// traced input directly, and every other node is elementwise. The residual
-// forms (`x += p; rms_norm(x)`) keep the hand-written kernel — the generic
-// emitter would have to replay the pre-norm chain in both passes.
+// A trace is a row-norm when exactly one node is a reduction and every other
+// node is elementwise. The nodes the reduction depends on become the `pre`
+// chain, which the kernel evaluates in both passes; everything downstream
+// becomes `post`. That partition is what lets `x += p; rms_norm(x)` fuse at
+// any dtype — the reduction consumes an x this same kernel produces.
 bool build_row_norm_plan(const TraceDAG& dag, ptx::RowNormPlan& plan) {
     const auto& nodes = dag.nodes();
     const TraceNode* norm = nullptr;
@@ -132,12 +134,11 @@ bool build_row_norm_plan(const TraceDAG& dag, ptx::RowNormPlan& plan) {
             norm = &n;
         }
     }
-    if (!norm) return false;
-    if (norm->inputs.empty()) return false;
-    if (nodes[static_cast<std::size_t>(norm->inputs[0])].op != TraceOpKind::Input) return false;
+    if (!norm || norm->inputs.empty()) return false;
 
     if (!build_plan(dag, plan.ew)) return false;
     if (plan.ew.cols != norm->cols) return false;
+    if (plan.ew.rows != norm->rows) return false;
 
     auto input_index = [&](int node_id) {
         for (std::size_t i = 0; i < plan.ew.inputs.size(); ++i) {
@@ -145,8 +146,6 @@ bool build_row_norm_plan(const TraceDAG& dag, ptx::RowNormPlan& plan) {
         }
         return -1;
     };
-    plan.x_input = input_index(norm->inputs[0]);
-    if (plan.x_input < 0) return false;
     if (norm->inputs.size() > 1) {
         plan.gamma_input = input_index(norm->inputs[1]);
         if (plan.gamma_input < 0) return false;
@@ -155,13 +154,89 @@ bool build_row_norm_plan(const TraceDAG& dag, ptx::RowNormPlan& plan) {
         plan.beta_input = input_index(norm->inputs[2]);
         if (plan.beta_input < 0) return false;
     }
+
+    plan.x_node = norm->inputs[0];
+    plan.norm_node = norm->id;
     plan.reduce = (norm->op == TraceOpKind::LayerNorm) ? ptx::RowReduce::Mean
                                                        : ptx::RowReduce::RMS;
-    plan.norm_node = norm->id;
     plan.eps = norm->scalar > 0.0f ? norm->scalar : 1e-5f;
-    // The row kernel walks one element per iteration; the vector entry is not
-    // emitted for it.
-    plan.ew.vec = 1;
+
+    // Reverse reachability from the reduction's data input. Node ids are
+    // assigned in creation order, which is topological, so one backward sweep
+    // is enough.
+    std::vector<char> in_pre(nodes.size(), 0);
+    if (plan.x_node >= 0) in_pre[static_cast<std::size_t>(plan.x_node)] = 1;
+    for (std::size_t i = nodes.size(); i-- > 0;) {
+        if (!in_pre[i]) continue;
+        for (int src : nodes[i].inputs) {
+            if (src >= 0) in_pre[static_cast<std::size_t>(src)] = 1;
+        }
+    }
+    in_pre[static_cast<std::size_t>(norm->id)] = 0;
+
+    for (const auto& n : nodes) {
+        if (n.op == TraceOpKind::Input) continue;
+        if (n.id == norm->id) continue;
+        if (in_pre[static_cast<std::size_t>(n.id)]) {
+            plan.pre_ids.push_back(n.id);
+        } else {
+            plan.post_ids.push_back(n.id);
+        }
+    }
+
+    plan.pre_input.assign(plan.ew.inputs.size(), 0);
+    for (std::size_t i = 0; i < plan.ew.inputs.size(); ++i) {
+        const int id = plan.ew.inputs[i].node_id;
+        plan.pre_input[i] = in_pre[static_cast<std::size_t>(id)] ? 1 : 0;
+    }
+    plan.pre_output.assign(plan.ew.outputs.size(), 0);
+    for (std::size_t i = 0; i < plan.ew.outputs.size(); ++i) {
+        const int id = plan.ew.outputs[i].node_id;
+        plan.pre_output[i] = in_pre[static_cast<std::size_t>(id)] ? 1 : 0;
+    }
+
+    // Pass two can skip the pre chain entirely when its result is one of the
+    // trace's own outputs — pass one writes it, pass two reads it back — and
+    // when nothing downstream of the reduction needs any *other* pre value.
+    plan.x_output = -1;
+    if (!plan.pre_ids.empty()) {
+        int x_out = -1;
+        for (std::size_t i = 0; i < plan.ew.outputs.size(); ++i) {
+            if (plan.ew.outputs[i].node_id == plan.x_node) x_out = static_cast<int>(i);
+        }
+        bool post_only_needs_x = true;
+        for (int pid : plan.post_ids) {
+            for (int src : nodes[static_cast<std::size_t>(pid)].inputs) {
+                if (src < 0) continue;
+                if (src == plan.x_node) continue;
+                if (nodes[static_cast<std::size_t>(src)].op == TraceOpKind::Input) continue;
+                if (in_pre[static_cast<std::size_t>(src)]) post_only_needs_x = false;
+            }
+        }
+        if (x_out >= 0 && post_only_needs_x) plan.x_output = x_out;
+    }
+
+    // What pass two loads: with the reload it is the reduction's gamma/beta
+    // plus whatever the post chain reads; without it, everything.
+    plan.post_input.assign(plan.ew.inputs.size(), plan.x_output >= 0 ? 0 : 1);
+    if (plan.x_output >= 0) {
+        if (plan.gamma_input >= 0) plan.post_input[static_cast<std::size_t>(plan.gamma_input)] = 1;
+        if (plan.beta_input >= 0) plan.post_input[static_cast<std::size_t>(plan.beta_input)] = 1;
+        for (int pid : plan.post_ids) {
+            for (int src : nodes[static_cast<std::size_t>(pid)].inputs) {
+                if (src < 0) continue;
+                for (std::size_t i = 0; i < plan.ew.inputs.size(); ++i) {
+                    if (plan.ew.inputs[i].node_id == src) plan.post_input[i] = 1;
+                }
+            }
+        }
+    }
+
+    // The row kernel's stride loop takes `vec` columns per thread per step.
+    // build_plan already reduced `vec` to the narrowest dtype in play; the row
+    // form additionally needs D to divide evenly so a vector never straddles a
+    // row boundary.
+    if (plan.ew.cols % plan.ew.vec != 0) plan.ew.vec = 1;
     return true;
 }
 
@@ -251,23 +326,47 @@ std::shared_ptr<TraceHandleImpl> compile_row_norm(const TraceDAG& dag,
     const std::string ptx_src = ptx::emit_row_norm(dag, plan, arch);
     const std::string key = "trace_rn_" + arch + "_" + std::to_string(dag.compute_hash());
 
-    CUfunction fn = CudaJitEngine::instance().get_function(key, ptx_src, ptx::kEntryRowNorm);
+    CUfunction fn_vec =
+        CudaJitEngine::instance().get_function(key + ":v", ptx_src, ptx::kEntryRowNorm);
+    CUfunction fn_sca =
+        CudaJitEngine::instance().get_function(key + ":s", ptx_src, ptx::kEntryRowNormScalar);
 
     const int rows = plan.ew.rows;
+    const int lanes = plan.ew.vec;
     const bool is_ln = (plan.reduce == ptx::RowReduce::Mean);
 
-    auto bind = [fn, rows, is_ln](const std::vector<void*>& ins,
-                                  const std::vector<void*>& outs) {
+    std::vector<int> in_align(plan.ew.inputs.size()), out_align(plan.ew.outputs.size());
+    for (std::size_t i = 0; i < plan.ew.inputs.size(); ++i) {
+        in_align[i] = (plan.ew.inputs[i].bcast == BroadcastKind::Scalar)
+                          ? ptx::elem_bytes(plan.ew.inputs[i].dtype)
+                          : lanes * ptx::elem_bytes(plan.ew.inputs[i].dtype);
+    }
+    for (std::size_t i = 0; i < plan.ew.outputs.size(); ++i) {
+        out_align[i] = lanes * ptx::elem_bytes(plan.ew.outputs[i].dtype);
+    }
+
+    auto bind = [fn_vec, fn_sca, rows, lanes, is_ln, in_align, out_align](
+                    const std::vector<void*>& ins, const std::vector<void*>& outs) {
+        bool use_vec = lanes > 1;
+        for (std::size_t i = 0; i < ins.size() && use_vec; ++i) {
+            if (!aligned(ins[i], in_align[i])) use_vec = false;
+        }
+        for (std::size_t i = 0; i < outs.size() && use_vec; ++i) {
+            if (!aligned(outs[i], out_align[i])) use_vec = false;
+        }
+
         auto args = std::make_shared<LaunchArgs>();
         args->build(outs, ins, 0, /*with_count=*/false);
 
         unsigned grid = static_cast<unsigned>(rows);
         if (grid == 0) grid = 1;
 
+        CUfunction fn = use_vec ? fn_vec : fn_sca;
         auto h = std::make_shared<TraceHandleImpl>();
         h->is_cuda = true;
         h->launch_count = 1;
-        h->fusion_name = is_ln ? "row-layernorm-chain" : "row-rmsnorm-chain";
+        h->fusion_name = is_ln ? (use_vec ? "row-layernorm-chain" : "row-layernorm-chain-scalar")
+                               : (use_vec ? "row-rmsnorm-chain" : "row-rmsnorm-chain-scalar");
         h->execute_fn = [fn, grid, args]() {
             launch(fn, grid, static_cast<unsigned>(ptx::kRowThreads), *args, "trace row-norm");
         };
@@ -341,10 +440,15 @@ std::shared_ptr<TraceHandleImpl> compile_cuda(const TraceDAG& dag, FusionPattern
     const auto t0 = std::chrono::steady_clock::now();
     std::shared_ptr<TraceHandleImpl> h;
 
-    // `x += p; rms_norm(x)` keeps brass's hand-written kernel: it fuses the
-    // residual write into the reduction's first pass, which the generic row
-    // emitter cannot express. FP32 only — the kernel takes float*.
-    if (pattern == FusionPattern::ResidualRMSNorm && all_fp32(dag)) {
+    // `x += p; rms_norm(x)` at FP32 keeps brass's hand-written kernel, which
+    // is a single-pass form the generic emitter does not match. BROTENSOR_JIT_
+    // PREFER=generic forces the emitted kernel instead, which is how the
+    // benchmark puts the two side by side.
+    static const bool prefer_generic = []() {
+        const char* v = std::getenv("BROTENSOR_JIT_PREFER");
+        return v && std::string(v) == "generic";
+    }();
+    if (!prefer_generic && pattern == FusionPattern::ResidualRMSNorm && all_fp32(dag)) {
         h = compile_residual_rmsnorm(dag);
     }
 

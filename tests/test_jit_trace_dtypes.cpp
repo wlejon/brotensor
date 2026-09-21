@@ -300,6 +300,43 @@ void test_rmsnorm_silu(Device dev, Dtype dt) {
     check_true(tag + " is one launch", h.launch_count() == 1, h.fusion_name());
 }
 
+// ── x += p; y = rms_norm(x) ─────────────────────────────────────────────────
+//
+// The reduction consumes a value this same kernel writes, so the fused form
+// has to replay the residual add inside both passes of the row kernel. The
+// hand-written kernel that used to be the only fused form of this is FP32
+// only; at BF16 there was no fusion at all.
+void test_residual_rmsnorm(Device dev, Dtype dt) {
+    const int N = 129, D = 640;
+    SplitMix64 rng(0xC0DE);
+    const std::vector<float> hx = random_rows(rng, N, D, 1.0f);
+    const std::vector<float> hp = random_rows(rng, N, D, 0.7f);
+    std::vector<float> hg = random_rows(rng, 1, D, 0.3f);
+    for (auto& v : hg) v += 1.0f;
+
+    Tensor x = make(dev, hx, N, D, dt);
+    Tensor p = make(dev, hp, N, D, dt);
+    Tensor gamma = make(dev, hg, 1, D, dt);
+
+    begin_trace();
+    x += p;
+    Tensor y = jit::rms_norm(x, gamma, 1e-6f);
+    TraceHandle h = end_trace();
+    sync_all();
+
+    Tensor ex = make(dev, hx, N, D, dt);
+    Tensor ep = make(dev, hp, N, D, dt);
+    add_inplace(ex, ep);
+    Tensor ey = Tensor::empty_on(dev, N, D, dt);
+    rms_norm_forward(ex, gamma, 1e-6f, ey);
+    sync_all();
+
+    const std::string tag = std::string("residual+rmsnorm [") + dtype_name(dt) + "]";
+    check(tag + " residual", read(x), read(ex), tol_for(dt));
+    check(tag + " norm", read(y), read(ey), tol_for(dt));
+    check_true(tag + " is one launch", h.launch_count() == 1, h.fusion_name());
+}
+
 // ── LayerNorm followed by a (1,D) modulation ────────────────────────────────
 
 void test_layernorm_modulate(Device dev, Dtype dt) {
@@ -376,6 +413,7 @@ void run_suite(Device dev, const char* label) {
         test_activations(dev, dt);
         test_scalar_broadcast(dev, dt);
         test_rmsnorm_silu(dev, dt);
+        test_residual_rmsnorm(dev, dt);
         test_layernorm_modulate(dev, dt);
     }
     test_scalar_entry_fallback(dev);

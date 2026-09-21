@@ -422,6 +422,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/cuda_graph_jit.cpp
         src/cuda/cuda_jit_quant.cpp
         src/jit/ptx_emit_elementwise.cpp
+        src/jit/ptx_emit_rownorm.cpp
         src/jit/trace_compiler_cuda.cpp
     )
     # Static CUDA runtime: keeps the shipped binary self-contained. The tower

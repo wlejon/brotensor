@@ -52,13 +52,35 @@ struct ElementwisePlan {
 enum class RowReduce { RMS, Mean };
 
 struct RowNormPlan {
-    ElementwisePlan ew;       // the chain applied after the norm
+    ElementwisePlan ew;       // buffers and shape; `vec` is always 1 here
     RowReduce reduce = RowReduce::RMS;
-    int x_input = -1;         // index into ew.inputs: the tensor being normed
+
+    int norm_node = -1;       // the RMSNorm / LayerNorm node
+    int x_node = -1;          // what feeds it: an input, or the end of pre_ids
     int gamma_input = -1;     // index into ew.inputs, or -1
     int beta_input = -1;      // index into ew.inputs, or -1
-    int norm_node = -1;       // DAG node id the normalised value feeds
     float eps = 1e-5f;
+
+    // Nodes to evaluate before the reduction and after it. The pre chain runs
+    // in both passes — that is what lets `x += p; rms_norm(x)` fuse, since the
+    // reduction needs the updated x that the same kernel is about to write.
+    std::vector<int> pre_ids;
+    std::vector<int> post_ids;
+
+    // Per ew.inputs index: whether the pre chain reads it, and whether pass
+    // two needs it. Inputs only the post chain wants (a modulation row, say)
+    // stay out of pass one, and vice versa.
+    std::vector<char> pre_input;
+    std::vector<char> post_input;
+
+    // When the pre chain's result is itself one of the trace's outputs, pass
+    // one can store it and pass two can read it back instead of replaying the
+    // chain — one fewer read of every pre-chain input, and the value comes
+    // back out of L2. `x_output` indexes ew.outputs; -1 disables the reload.
+    int x_output = -1;
+
+    // Per ew.outputs index: produced by the pre chain, so written in pass one.
+    std::vector<char> pre_output;
 };
 
 // Elements per thread for a 16-byte access at this dtype.
@@ -74,14 +96,14 @@ bool dtype_supported(Dtype d);
 std::string emit_elementwise(const TraceDAG& dag, const ElementwisePlan& plan,
                              const std::string& arch);
 
-// One module, one entry (kEntryRowNorm). The reduction makes a scalar variant
-// pointless: the block already walks the row with a stride loop.
+// One module, two entries (kEntryRowNorm and kEntryRowNormScalar).
 std::string emit_row_norm(const TraceDAG& dag, const RowNormPlan& plan,
                           const std::string& arch);
 
 inline constexpr const char* kEntryVec = "trace_ew_vec";
 inline constexpr const char* kEntryScalar = "trace_ew_scalar";
-inline constexpr const char* kEntryRowNorm = "trace_row_norm";
+inline constexpr const char* kEntryRowNorm = "trace_row_norm_vec";
+inline constexpr const char* kEntryRowNormScalar = "trace_row_norm_scalar";
 
 // Threads per block for the row-norm kernel; also the reduction width.
 inline constexpr int kRowThreads = 256;
