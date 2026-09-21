@@ -153,10 +153,78 @@ Amortised over a 20-step denoise with 32 blocks it is noise — the cost is paid
 once per distinct *shape*, because D, the row count and eps are baked into the
 PTX as immediates.
 
-A cached re-trace still costs ~30 µs. That is not the cache lookup; it is
-re-running the traced user code to rebuild the DAG (allocating the output
-tensors) plus re-binding. **Adopters should hold the `TraceHandle` and call
-`execute()`, not re-trace every step.**
+A cached re-trace costs ~23 µs (elementwise) to ~29 µs (row-norm). That is not
+the cache lookup; it is re-running the traced user code to rebuild the DAG plus
+re-binding. **Adopters should hold the `TraceHandle` and call `execute()`, not
+re-trace every step.**
+
+## What a trace allocates
+
+A traced op does not compute anything, so it does not allocate anything: it
+returns a *symbolic* tensor — real shape, dtype and device, null buffer, and an
+opaque `jit_slot` naming the DAG node it stands for. `end_trace()` then gives a
+real buffer to exactly the live-at-end nodes the caller is still holding, and to
+nothing else.
+
+Measured by `brotensor::alloc_stats()` in `tests/test_jit_trace.cpp` at
+512×1024 FP32:
+
+| trace | allocations | bytes | eager equivalent |
+|---|---|---|---|
+| `store(dst, silu(x)*y + x)` | **0** | **0** | 3 × 2 MiB of intermediates |
+| `Tensor kept = silu(x)*y + x` | 1 | 2 MiB (the one output) | same 3 × 2 MiB |
+
+This is what made the VAE seam below adoptable. The tracer used to allocate a
+full-size output for *every* traced op before recording its node — at the
+decoder's widest feature map, `(1048576, 144)` BF16, that is 288 MiB per
+intermediate, 576 MiB per trace, for contents the fused kernel never reads.
+
+Two consequences for callers. A symbolic tensor cannot be copied — it is a
+value in an expression, not a tensor, and the copy ctor throws. And an
+intermediate the fused kernel only consumes internally (`Tensor ln =
+layernorm(x); out = ln * g;` — nothing else reads `ln`) comes back from
+`end_trace()` as an *empty* tensor rather than a buffer of uninitialised
+garbage, which is what it used to be.
+
+## Adoption: the Qwen-Image 2.1 VAE's RMSNorm + SiLU seam
+
+`brodiffusion/src/vae_qwenimage21.cpp`. Every norm in the graph except the
+attention block's is immediately followed by a SiLU — 35 seams in the decoder
+(17 resnets × 2, plus `norm_out`). Eagerly each is two full passes over the
+feature map: `rms_norm_forward` writes it and `silu_forward` reads it straight
+back. Traced it is one kernel, and the normalised map never lands.
+
+Measured with `brodiffusion.exe qi21-vae-fwd --synthetic --bench-ab 8` on
+GPU 1, min-of-8, alternating in one process:
+
+| decode | eager | fused | | peak VRAM eager | peak VRAM fused |
+|---|---|---|---|---|---|
+| 32×32 latent → 512×512 px | 106.6 ms | **102.6 ms** | 1.04× | 3546 MiB | 3514 MiB |
+| 64×64 latent → 1024×1024 px | 429.3 ms | **409.1 ms** | 1.05× | 7674 MiB | 7706 MiB |
+
+Two things to read honestly here.
+
+The win is 4–5%, not the 2–3× the seam shows in isolation, because a VAE decode
+is convolution-bound: the norms are a small slice of it. In isolation the same
+kernel is `rmsnorm-silu 1048576×96 fp32: 2.543 ms → 0.883 ms` in the table
+above, and the ~20 ms recovered at 1024² is about what summing the seam's
+traffic across every stage predicts.
+
+Peak VRAM does not move, and should not: the fusion removes *traffic*, not
+residency — the store destination is still a materialised feature map. What the
+symbolic tracer changes is that building the trace costs nothing. The first
+decode allocates **72 allocations / 9725 MiB at 1024² with the JIT on and
+exactly the same 72 / 9725 MiB with `BRODIFFUSION_JIT=0`**: the tracer adds not
+one byte. Under the old tracer those 35 seams would each have bought two
+full-size buffers at trace time.
+
+Numerically the fused path differs from the eager one at the BF16 ulp level
+(one fewer rounding — the normalised value never round-trips through BF16
+before the SiLU). Against the FP32 diffusers reference at `.parity/`, decode is
+cosine 0.999504 / rel-L2 0.0315 fused against 0.999579 / 0.0290 eager, and
+encode 0.999731 / 0.0232 against 0.999752 / 0.0223 — both well inside the ~3%
+band the BF16 VAE already sits in, and the gap between the two is an order of
+magnitude smaller than the gap to the reference.
 
 ## What each improvement bought
 
