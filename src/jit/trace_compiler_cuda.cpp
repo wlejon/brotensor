@@ -1,6 +1,7 @@
 #include "trace_compiler.h"
 #include "trace_dag.h"
 #include "trace_cache.h"
+#include "ptx_emit.h"
 
 #if BROTENSOR_HAS_CUDA
 
@@ -9,411 +10,374 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include <sstream>
-#include <iomanip>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
-#include <cstring>
-#include <unordered_map>
-#include <algorithm>
-#include <stdexcept>
 
 namespace brotensor::jit::cuda {
 
 using detail::cuda::jit::CudaJitEngine;
 
-static std::string float_to_ptx_hex(float f) {
-    uint32_t bits = 0;
-    std::memcpy(&bits, &f, sizeof(float));
-    std::stringstream ss;
-    ss << "0f" << std::uppercase << std::hex << std::setfill('0') << std::setw(8) << bits;
-    return ss.str();
-}
+namespace {
 
-static std::string query_cuda_arch() {
+std::string query_cuda_arch() {
     int dev = 0;
     if (cudaGetDevice(&dev) == cudaSuccess) {
         int major = 0, minor = 0;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess) {
-            int sm = major * 10 + minor;
-            if (sm >= 75) {
-                return "sm_" + std::to_string(sm);
-            }
+            const int sm = major * 10 + minor;
+            if (sm >= 75) return "sm_" + std::to_string(sm);
         }
     }
     return "sm_75";
 }
 
-static std::string emit_ptx_elementwise(const TraceDAG& dag,
-                                        const std::vector<int>& input_node_ids,
-                                        const std::vector<int>& output_node_ids) {
-    const auto& nodes = dag.nodes();
+// Stable argument storage for one bound launch. The pointer array and the
+// element count are filled once at bind time and the `params` vector points
+// into them, so replaying a trace does no allocation — which matters when the
+// whole point of the fusion is that the kernel costs a few microseconds.
+struct LaunchArgs {
+    std::vector<CUdeviceptr> ptrs;
+    std::uint32_t n = 0;
+    std::vector<void*> params;
 
-    std::string arch = query_cuda_arch();
-    std::stringstream ss;
-    ss << ".version 7.8\n";
-    ss << ".target " << arch << "\n";
-    ss << ".address_size 64\n\n";
-
-    ss << ".visible .entry trace_elementwise_cuda_kernel(\n";
-    for (size_t m = 0; m < output_node_ids.size(); ++m) {
-        ss << "    .param .u64 param_out_" << m << ",\n";
+    void build(const std::vector<void*>& outs, const std::vector<void*>& ins,
+               std::uint32_t count, bool with_count) {
+        ptrs.clear();
+        ptrs.reserve(outs.size() + ins.size());
+        for (void* p : outs) ptrs.push_back(reinterpret_cast<CUdeviceptr>(p));
+        for (void* p : ins) ptrs.push_back(reinterpret_cast<CUdeviceptr>(p));
+        n = count;
+        params.clear();
+        params.reserve(ptrs.size() + 1);
+        for (auto& d : ptrs) params.push_back(&d);
+        if (with_count) params.push_back(&n);
     }
-    for (size_t k = 0; k < input_node_ids.size(); ++k) {
-        ss << "    .param .u64 param_in_" << k << ",\n";
-    }
-    ss << "    .param .u32 param_n\n";
-    ss << ") {\n";
+};
 
-    ss << "    .reg .b32 %r_tid, %r_ntid, %r_ctaid, %r_nctaid, %r_stride, %r_idx, %r_n;\n";
-    ss << "    .reg .pred %p_oob;\n";
-    ss << "    .reg .b64 %r_off64;\n";
-
-    for (size_t m = 0; m < output_node_ids.size(); ++m) {
-        ss << "    .reg .b64 %r_p_out_" << m << ", %r_addr_out_" << m << ";\n";
-    }
-    for (size_t k = 0; k < input_node_ids.size(); ++k) {
-        ss << "    .reg .b64 %r_p_in_" << k << ", %r_addr_in_" << k << ";\n";
-    }
-
-    // Allocate virtual float registers for every node
-    for (const auto& n : nodes) {
-        ss << "    .reg .f32 %f_node_" << n.id << ";\n";
-    }
-    // Scratch registers for SiLU and GELU
-    ss << "    .reg .f32 %t_neg, %t_exp_arg, %t_exp, %t_denom, %t_sig;\n";
-    ss << "    .reg .f32 %t_x2, %t_inner, %t_poly, %t_arg, %t_tanh, %t_1pt, %t_half_x;\n\n";
-
-    ss << "    ld.param.u32 %r_n, [param_n];\n";
-    ss << "    mov.u32 %r_tid, %tid.x;\n";
-    ss << "    mov.u32 %r_ntid, %ntid.x;\n";
-    ss << "    mov.u32 %r_ctaid, %ctaid.x;\n";
-    ss << "    mov.u32 %r_nctaid, %nctaid.x;\n";
-    ss << "    mad.lo.u32 %r_idx, %r_ctaid, %r_ntid, %r_tid;\n";
-    ss << "    mul.lo.u32 %r_stride, %r_ntid, %r_nctaid;\n\n";
-
-    for (size_t m = 0; m < output_node_ids.size(); ++m) {
-        ss << "    ld.param.u64 %r_p_out_" << m << ", [param_out_" << m << "];\n";
-    }
-    for (size_t k = 0; k < input_node_ids.size(); ++k) {
-        ss << "    ld.param.u64 %r_p_in_" << k << ", [param_in_" << k << "];\n";
-    }
-    ss << "\n";
-
-    ss << "LOOP_HEAD:\n";
-    ss << "    setp.ge.u32 %p_oob, %r_idx, %r_n;\n";
-    ss << "    @%p_oob bra LOOP_EXIT;\n\n";
-
-    ss << "    cvt.u64.u32 %r_off64, %r_idx;\n";
-    ss << "    shl.b64 %r_off64, %r_off64, 2;\n\n";
-
-    // Load input values
-    for (size_t k = 0; k < input_node_ids.size(); ++k) {
-        int nid = input_node_ids[k];
-        ss << "    add.u64 %r_addr_in_" << k << ", %r_p_in_" << k << ", %r_off64;\n";
-        ss << "    ld.global.f32 %f_node_" << nid << ", [%r_addr_in_" << k << "];\n";
-    }
-    ss << "\n";
-
-    // Operations in topological order
-    for (const auto& n : nodes) {
-        if (n.op == TraceOpKind::Input) continue;
-
-        if (n.op == TraceOpKind::Add) {
-            ss << "    add.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", %f_node_" << n.inputs[1] << ";\n";
-        } else if (n.op == TraceOpKind::Sub) {
-            ss << "    sub.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", %f_node_" << n.inputs[1] << ";\n";
-        } else if (n.op == TraceOpKind::Mul) {
-            ss << "    mul.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", %f_node_" << n.inputs[1] << ";\n";
-        } else if (n.op == TraceOpKind::Div) {
-            ss << "    div.approx.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", %f_node_" << n.inputs[1] << ";\n";
-        } else if (n.op == TraceOpKind::AddScalar) {
-            ss << "    add.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", " << float_to_ptx_hex(n.scalar) << ";\n";
-        } else if (n.op == TraceOpKind::SubScalar) {
-            ss << "    sub.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", " << float_to_ptx_hex(n.scalar) << ";\n";
-        } else if (n.op == TraceOpKind::MulScalar) {
-            ss << "    mul.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", " << float_to_ptx_hex(n.scalar) << ";\n";
-        } else if (n.op == TraceOpKind::DivScalar) {
-            ss << "    div.approx.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", " << float_to_ptx_hex(n.scalar) << ";\n";
-        } else if (n.op == TraceOpKind::ScalarSub) {
-            ss << "    sub.f32 %f_node_" << n.id << ", " << float_to_ptx_hex(n.scalar) << ", %f_node_" << n.inputs[0] << ";\n";
-        } else if (n.op == TraceOpKind::ScalarDiv) {
-            ss << "    div.approx.f32 %f_node_" << n.id << ", " << float_to_ptx_hex(n.scalar) << ", %f_node_" << n.inputs[0] << ";\n";
-        } else if (n.op == TraceOpKind::FMA) {
-            ss << "    fma.rn.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", %f_node_" << n.inputs[1] << ", %f_node_" << n.inputs[2] << ";\n";
-        } else if (n.op == TraceOpKind::SiLU) {
-            // silu(x) = x / (1 + exp(-x)) using fast PTX ex2.approx.f32
-            ss << "    neg.f32 %t_neg, %f_node_" << n.inputs[0] << ";\n";
-            ss << "    mul.f32 %t_exp_arg, %t_neg, 0f3FB8AA3B;\n"; // log2(e)
-            ss << "    ex2.approx.f32 %t_exp, %t_exp_arg;\n";
-            ss << "    add.f32 %t_denom, %t_exp, 0f3F800000;\n"; // 1.0f
-            ss << "    rcp.approx.f32 %t_sig, %t_denom;\n";
-            ss << "    mul.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", %t_sig;\n";
-        } else if (n.op == TraceOpKind::ReLU) {
-            ss << "    max.f32 %f_node_" << n.id << ", %f_node_" << n.inputs[0] << ", 0f00000000;\n";
-        } else if (n.op == TraceOpKind::GELU) {
-            // Approx GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-            ss << "    mul.f32 %t_x2, %f_node_" << n.inputs[0] << ", %f_node_" << n.inputs[0] << ";\n";
-            ss << "    fma.rn.f32 %t_inner, %t_x2, " << float_to_ptx_hex(0.044715f) << ", " << float_to_ptx_hex(1.0f) << ";\n";
-            ss << "    mul.f32 %t_poly, %t_inner, %f_node_" << n.inputs[0] << ";\n";
-            ss << "    mul.f32 %t_arg, %t_poly, " << float_to_ptx_hex(0.7978845608f) << ";\n";
-            ss << "    tanh.approx.f32 %t_tanh, %t_arg;\n";
-            ss << "    add.f32 %t_1pt, %t_tanh, " << float_to_ptx_hex(1.0f) << ";\n";
-            ss << "    mul.f32 %t_half_x, %f_node_" << n.inputs[0] << ", " << float_to_ptx_hex(0.5f) << ";\n";
-            ss << "    mul.f32 %f_node_" << n.id << ", %t_half_x, %t_1pt;\n";
-        }
-    }
-    ss << "\n";
-
-    // Store outputs
-    for (size_t m = 0; m < output_node_ids.size(); ++m) {
-        int nid = output_node_ids[m];
-        ss << "    add.u64 %r_addr_out_" << m << ", %r_p_out_" << m << ", %r_off64;\n";
-        ss << "    st.global.f32 [%r_addr_out_" << m << "], %f_node_" << nid << ";\n";
-    }
-
-    ss << "\n";
-    ss << "    add.u32 %r_idx, %r_idx, %r_stride;\n";
-    ss << "    bra LOOP_HEAD;\n\n";
-
-    ss << "LOOP_EXIT:\n";
-    ss << "    ret;\n";
-    ss << "}\n";
-
-    return ss.str();
+bool aligned(void* p, int bytes) {
+    return (reinterpret_cast<std::uintptr_t>(p) % static_cast<std::uintptr_t>(bytes)) == 0;
 }
 
-std::shared_ptr<TraceHandleImpl> compile_cuda(const TraceDAG& dag, FusionPattern pattern) {
+void launch(CUfunction fn, unsigned grid, unsigned block, LaunchArgs& args,
+            const char* what) {
+    const CUresult res = detail::cuda::drv::cuLaunchKernel(
+        fn, grid, 1, 1, block, 1, 1, 0,
+        reinterpret_cast<CUstream>(cuda_current_stream()),
+        args.params.data(), nullptr);
+    if (res != CUDA_SUCCESS) {
+        throw std::runtime_error(std::string("brotensor::jit: cuLaunchKernel failed for ") + what);
+    }
+}
+
+// ── plan construction ───────────────────────────────────────────────────────
+
+// Collects the trace's parameter buffers and rejects anything the emitters
+// cannot address. Returns false rather than throwing so the caller can try a
+// different fusion.
+bool build_plan(const TraceDAG& dag, ptx::ElementwisePlan& plan) {
+    int rows = 0, cols = 0;
+    dag.dominant_shape(rows, cols);
+    if (rows <= 0 || cols <= 0) return false;
+
+    plan.rows = rows;
+    plan.cols = cols;
+    plan.numel = static_cast<std::int64_t>(rows) * cols;
+
+    int lanes = 8;
+    for (const auto& n : dag.nodes()) {
+        const bool is_in = (n.op == TraceOpKind::Input);
+        const bool is_out = n.is_live_at_end;
+        if (!is_in && !is_out) continue;
+        if (!ptx::dtype_supported(n.dtype)) return false;
+
+        const BroadcastKind bk = broadcast_of(n.rows, n.cols, rows, cols);
+        if (bk == BroadcastKind::Full &&
+            static_cast<std::int64_t>(n.rows) * n.cols != plan.numel) {
+            return false;
+        }
+        if (is_out && bk != BroadcastKind::Full) return false;
+
+        lanes = std::min(lanes, ptx::vec_width_for(n.dtype));
+        if (bk == BroadcastKind::Row) plan.any_row_bcast = true;
+
+        const ptx::BufferSpec spec{n.id, n.dtype, bk};
+        if (is_in) plan.inputs.push_back(spec);
+        if (is_out) plan.outputs.push_back(spec);
+    }
+    if (plan.outputs.empty()) return false;
+
+    if (plan.numel % lanes != 0) lanes = 1;
+    if (plan.any_row_bcast && cols % lanes != 0) lanes = 1;
+    plan.vec = lanes;
+    return true;
+}
+
+// A trace is a row-norm when exactly one node is a norm, that node reads a
+// traced input directly, and every other node is elementwise. The residual
+// forms (`x += p; rms_norm(x)`) keep the hand-written kernel — the generic
+// emitter would have to replay the pre-norm chain in both passes.
+bool build_row_norm_plan(const TraceDAG& dag, ptx::RowNormPlan& plan) {
     const auto& nodes = dag.nodes();
-
-    if (pattern == FusionPattern::ResidualRMSNorm) {
-        const TraceNode* node_rms = nullptr;
-        const TraceNode* node_add = nullptr;
-        const TraceNode* node_res = nullptr;
-        const TraceNode* node_gamma = nullptr;
-
-        for (const auto& n : nodes) {
-            if (n.op == TraceOpKind::RMSNorm) {
-                node_rms = &n;
-                int add_id = n.inputs[0];
-                node_add = &nodes[add_id];
-                int res_id = node_add->inputs[1];
-                node_res = &nodes[res_id];
-                if (n.inputs.size() > 1) node_gamma = &nodes[n.inputs[1]];
-                break;
-            }
-        }
-
-        if (node_rms && node_add && node_res) {
-            int B = node_add->rows;
-            int D = node_add->cols;
-            float eps = node_rms->scalar > 0.0f ? node_rms->scalar : 1e-5f;
-
-            auto make_handle = [B, D, eps](void* x_buf, const void* res_buf, const void* gamma_buf, void* y_buf) {
-                auto h = std::make_shared<TraceHandleImpl>();
-                h->is_cuda = true;
-                h->execute_fn = [x_buf, res_buf, gamma_buf, y_buf, B, D, eps]() {
-                    detail::cuda::jit::launch_fused_residual_rmsnorm_ptx(
-                        static_cast<float*>(x_buf),
-                        static_cast<const float*>(res_buf),
-                        static_cast<const float*>(gamma_buf),
-                        static_cast<float*>(y_buf),
-                        B, D, eps,
-                        cuda_current_stream()
-                    );
-                };
-                return h;
-            };
-
-            void* x_buf = node_add->buffer;
-            const void* res_buf = node_res->buffer;
-            const void* gamma_buf = node_gamma ? node_gamma->buffer : nullptr;
-            void* y_buf = node_rms->buffer;
-
-            auto handle = make_handle(x_buf, res_buf, gamma_buf, y_buf);
-            handle->rebind_fn = [make_handle](const std::vector<void*>& in_b, const std::vector<void*>& out_b) {
-                const void* res_p = in_b.size() > 1 ? in_b[1] : nullptr;
-                const void* gamma_p = in_b.size() > 2 ? in_b[2] : nullptr;
-                void* x_p = out_b.size() > 0 ? out_b[0] : in_b[0];
-                void* y_p = out_b.size() > 1 ? out_b[1] : (out_b.size() > 0 ? out_b[0] : nullptr);
-                return make_handle(x_p, res_p, gamma_p, y_p);
-            };
-            return handle;
-        }
-    } else if (pattern == FusionPattern::LayerNormModulate) {
-        const TraceNode* node_ln = nullptr;
-        const TraceNode* node_gamma = nullptr;
-        const TraceNode* node_beta = nullptr;
-        const TraceNode* node_scale = nullptr;
-        const TraceNode* node_shift = nullptr;
-        const TraceNode* node_out = nullptr;
-
-        for (const auto& n : nodes) {
-            if (n.op == TraceOpKind::LayerNorm) {
-                node_ln = &n;
-                if (n.inputs.size() > 1) node_gamma = &nodes[n.inputs[1]];
-                if (n.inputs.size() > 2) node_beta = &nodes[n.inputs[2]];
-            }
-            if (n.is_live_at_end && n.op != TraceOpKind::LayerNorm) {
-                node_out = &n;
-            }
-            if (n.op == TraceOpKind::Modulate) {
-                if (n.inputs.size() > 1) node_scale = &nodes[n.inputs[1]];
-                if (n.inputs.size() > 2) node_shift = &nodes[n.inputs[2]];
-            }
-        }
-
-        if (!node_scale || !node_shift) {
-            for (const auto& n : nodes) {
-                if (n.op == TraceOpKind::AddScalar && n.inputs.size() > 0) {
-                    node_scale = &nodes[n.inputs[0]];
-                }
-                if (n.op == TraceOpKind::Add && n.inputs.size() > 1) {
-                    int rhs = n.inputs[1];
-                    if (nodes[rhs].op == TraceOpKind::Input) {
-                        node_shift = &nodes[rhs];
-                    }
-                }
-            }
-        }
-
-        if (node_ln && node_out) {
-            int R = node_ln->rows;
-            int D = node_ln->cols;
-            float eps = node_ln->scalar > 0.0f ? node_ln->scalar : 1e-5f;
-
-            auto make_handle = [R, D, eps](const void* x, const void* g, const void* b,
-                                           const void* scale, const void* shift, void* y) {
-                auto h = std::make_shared<TraceHandleImpl>();
-                h->is_cuda = true;
-                h->execute_fn = [x, g, b, scale, shift, y, R, D, eps]() {
-                    detail::cuda::jit::launch_fused_layernorm_modulate_ptx(
-                        static_cast<const float*>(x),
-                        static_cast<const float*>(g),
-                        static_cast<const float*>(b),
-                        static_cast<const float*>(scale),
-                        static_cast<const float*>(shift),
-                        static_cast<float*>(y),
-                        R, D, eps,
-                        cuda_current_stream()
-                    );
-                };
-                return h;
-            };
-
-            const void* x_buf = nodes[node_ln->inputs[0]].buffer;
-            const void* g_buf = node_gamma ? node_gamma->buffer : nullptr;
-            const void* b_buf = node_beta ? node_beta->buffer : nullptr;
-            const void* s_buf = node_scale ? node_scale->buffer : nullptr;
-            const void* sh_buf = node_shift ? node_shift->buffer : nullptr;
-            void* y_buf = node_out->buffer;
-
-            auto handle = make_handle(x_buf, g_buf, b_buf, s_buf, sh_buf, y_buf);
-            handle->rebind_fn = [make_handle](const std::vector<void*>& in_b, const std::vector<void*>& out_b) {
-                const void* x = in_b.size() > 0 ? in_b[0] : nullptr;
-                const void* g = in_b.size() > 1 ? in_b[1] : nullptr;
-                const void* b = in_b.size() > 2 ? in_b[2] : nullptr;
-                const void* sc = in_b.size() > 3 ? in_b[3] : nullptr;
-                const void* sh = in_b.size() > 4 ? in_b[4] : nullptr;
-                void* y = out_b.size() > 0 ? out_b[0] : nullptr;
-                return make_handle(x, g, b, sc, sh, y);
-            };
-            return handle;
-        }
-    }
-
-    // Default: General Elementwise PTX JIT compilation
-    std::vector<int> input_node_ids;
-    std::vector<int> output_node_ids;
+    const TraceNode* norm = nullptr;
     for (const auto& n : nodes) {
-        if (n.op == TraceOpKind::Input) input_node_ids.push_back(n.id);
-        if (n.is_live_at_end) output_node_ids.push_back(n.id);
+        if (n.op == TraceOpKind::RMSNorm || n.op == TraceOpKind::LayerNorm) {
+            if (norm) return false;  // more than one reduction
+            norm = &n;
+        }
+    }
+    if (!norm) return false;
+    if (norm->inputs.empty()) return false;
+    if (nodes[static_cast<std::size_t>(norm->inputs[0])].op != TraceOpKind::Input) return false;
+
+    if (!build_plan(dag, plan.ew)) return false;
+    if (plan.ew.cols != norm->cols) return false;
+
+    auto input_index = [&](int node_id) {
+        for (std::size_t i = 0; i < plan.ew.inputs.size(); ++i) {
+            if (plan.ew.inputs[i].node_id == node_id) return static_cast<int>(i);
+        }
+        return -1;
+    };
+    plan.x_input = input_index(norm->inputs[0]);
+    if (plan.x_input < 0) return false;
+    if (norm->inputs.size() > 1) {
+        plan.gamma_input = input_index(norm->inputs[1]);
+        if (plan.gamma_input < 0) return false;
+    }
+    if (norm->inputs.size() > 2) {
+        plan.beta_input = input_index(norm->inputs[2]);
+        if (plan.beta_input < 0) return false;
+    }
+    plan.reduce = (norm->op == TraceOpKind::LayerNorm) ? ptx::RowReduce::Mean
+                                                       : ptx::RowReduce::RMS;
+    plan.norm_node = norm->id;
+    plan.eps = norm->scalar > 0.0f ? norm->scalar : 1e-5f;
+    // The row kernel walks one element per iteration; the vector entry is not
+    // emitted for it.
+    plan.ew.vec = 1;
+    return true;
+}
+
+bool all_fp32(const TraceDAG& dag) {
+    for (const auto& n : dag.nodes()) {
+        if (n.dtype != Dtype::FP32) return false;
+    }
+    return true;
+}
+
+// ── generic elementwise ─────────────────────────────────────────────────────
+
+std::shared_ptr<TraceHandleImpl> compile_elementwise(const TraceDAG& dag,
+                                                     const ptx::ElementwisePlan& plan) {
+    const std::string arch = query_cuda_arch();
+    const std::string ptx_src = ptx::emit_elementwise(dag, plan, arch);
+    const std::string key = "trace_ew_" + arch + "_" + std::to_string(dag.compute_hash());
+
+    // One key per entry: the engine caches CUfunctions, not modules.
+    CUfunction fn_vec =
+        CudaJitEngine::instance().get_function(key + ":v", ptx_src, ptx::kEntryVec);
+    CUfunction fn_sca =
+        CudaJitEngine::instance().get_function(key + ":s", ptx_src, ptx::kEntryScalar);
+
+    const int lanes = plan.vec;
+    const std::int64_t numel = plan.numel;
+
+    // Access width in bytes per buffer, for the alignment test that decides
+    // between the two entries.
+    std::vector<int> in_align(plan.inputs.size()), out_align(plan.outputs.size());
+    for (std::size_t i = 0; i < plan.inputs.size(); ++i) {
+        in_align[i] = (plan.inputs[i].bcast == BroadcastKind::Scalar)
+                          ? ptx::elem_bytes(plan.inputs[i].dtype)
+                          : lanes * ptx::elem_bytes(plan.inputs[i].dtype);
+    }
+    for (std::size_t i = 0; i < plan.outputs.size(); ++i) {
+        out_align[i] = lanes * ptx::elem_bytes(plan.outputs[i].dtype);
     }
 
-    int32_t total_numel = 0;
-    if (!output_node_ids.empty()) {
-        const auto& out_node = nodes[output_node_ids[0]];
-        total_numel = out_node.rows * out_node.cols;
-    } else if (!input_node_ids.empty()) {
-        const auto& in_node = nodes[input_node_ids[0]];
-        total_numel = in_node.rows * in_node.cols;
-    }
+    auto bind = [fn_vec, fn_sca, lanes, numel, in_align, out_align](
+                    const std::vector<void*>& ins, const std::vector<void*>& outs) {
+        bool use_vec = lanes > 1;
+        if (use_vec) {
+            for (std::size_t i = 0; i < ins.size() && use_vec; ++i) {
+                if (!aligned(ins[i], in_align[i])) use_vec = false;
+            }
+            for (std::size_t i = 0; i < outs.size() && use_vec; ++i) {
+                if (!aligned(outs[i], out_align[i])) use_vec = false;
+            }
+        }
 
-    std::string ptx = emit_ptx_elementwise(dag, input_node_ids, output_node_ids);
-    uint64_t hash = dag.compute_hash();
-    std::string cache_key = "trace_cuda_elem_" + query_cuda_arch() + "_" + std::to_string(hash);
+        const std::int64_t slots = use_vec ? numel / lanes : numel;
+        auto args = std::make_shared<LaunchArgs>();
+        args->build(outs, ins, static_cast<std::uint32_t>(slots), true);
 
-    CUfunction fn = CudaJitEngine::instance().get_function(
-        cache_key,
-        ptx,
-        "trace_elementwise_cuda_kernel"
-    );
+        unsigned grid = static_cast<unsigned>((slots + 255) / 256);
+        if (grid == 0) grid = 1;
+        if (grid > 65535) grid = 65535;
 
-    auto make_bound_handle = [fn, total_numel, input_node_ids, output_node_ids]
-                             (const std::vector<void*>& in_buffers, const std::vector<void*>& out_buffers) {
+        CUfunction fn = use_vec ? fn_vec : fn_sca;
         auto h = std::make_shared<TraceHandleImpl>();
         h->is_cuda = true;
-        h->execute_fn = [fn, total_numel, in_buffers, out_buffers]() {
-            std::vector<void*> kernel_params;
-            std::vector<CUdeviceptr> d_ptrs;
-            d_ptrs.reserve(out_buffers.size() + in_buffers.size());
-
-            for (void* p : out_buffers) {
-                d_ptrs.push_back(reinterpret_cast<CUdeviceptr>(p));
-            }
-            for (void* p : in_buffers) {
-                d_ptrs.push_back(reinterpret_cast<CUdeviceptr>(p));
-            }
-
-            for (size_t i = 0; i < d_ptrs.size(); ++i) {
-                kernel_params.push_back(&d_ptrs[i]);
-            }
-            uint32_t n_arg = static_cast<uint32_t>(total_numel);
-            kernel_params.push_back(&n_arg);
-
-            unsigned int block_size = 256;
-            unsigned int grid_size = (n_arg + block_size - 1) / block_size;
-            if (grid_size == 0) grid_size = 1;
-            if (grid_size > 65535) grid_size = 65535;
-
-            CUstream custream = reinterpret_cast<CUstream>(cuda_current_stream());
-            CUresult res = detail::cuda::drv::cuLaunchKernel(
-                fn,
-                grid_size, 1, 1,
-                block_size, 1, 1,
-                0,
-                custream,
-                kernel_params.data(),
-                nullptr
-            );
-            if (res != CUDA_SUCCESS) {
-                throw std::runtime_error("cuLaunchKernel failed for trace_elementwise_cuda_kernel");
-            }
+        h->launch_count = 1;
+        h->fusion_name = use_vec ? "elementwise-vec" : "elementwise-scalar";
+        h->execute_fn = [fn, grid, args]() {
+            launch(fn, grid, 256, *args, "trace elementwise");
         };
         return h;
     };
 
-    std::vector<void*> initial_in_buffers;
-    for (int nid : input_node_ids) initial_in_buffers.push_back(nodes[nid].buffer);
-    std::vector<void*> initial_out_buffers;
-    for (int nid : output_node_ids) initial_out_buffers.push_back(nodes[nid].buffer);
+    std::vector<void*> ins, outs;
+    for (const auto& s : plan.inputs) ins.push_back(dag.node(s.node_id).buffer);
+    for (const auto& s : plan.outputs) outs.push_back(dag.node(s.node_id).buffer);
 
-    auto handle = make_bound_handle(initial_in_buffers, initial_out_buffers);
-    handle->rebind_fn = [make_bound_handle](const std::vector<void*>& in_b, const std::vector<void*>& out_b) {
-        return make_bound_handle(in_b, out_b);
+    auto h = bind(ins, outs);
+    h->rebind_fn = [bind](const std::vector<void*>& in_b, const std::vector<void*>& out_b) {
+        return bind(in_b, out_b);
     };
-
-    return handle;
+    return h;
 }
 
-struct CudaTraceRegistrar {
-    CudaTraceRegistrar() {
-        register_cuda_trace_compiler(&compile_cuda);
+// ── generic row-norm ────────────────────────────────────────────────────────
+
+std::shared_ptr<TraceHandleImpl> compile_row_norm(const TraceDAG& dag,
+                                                  const ptx::RowNormPlan& plan) {
+    const std::string arch = query_cuda_arch();
+    const std::string ptx_src = ptx::emit_row_norm(dag, plan, arch);
+    const std::string key = "trace_rn_" + arch + "_" + std::to_string(dag.compute_hash());
+
+    CUfunction fn = CudaJitEngine::instance().get_function(key, ptx_src, ptx::kEntryRowNorm);
+
+    const int rows = plan.ew.rows;
+    const bool is_ln = (plan.reduce == ptx::RowReduce::Mean);
+
+    auto bind = [fn, rows, is_ln](const std::vector<void*>& ins,
+                                  const std::vector<void*>& outs) {
+        auto args = std::make_shared<LaunchArgs>();
+        args->build(outs, ins, 0, /*with_count=*/false);
+
+        unsigned grid = static_cast<unsigned>(rows);
+        if (grid == 0) grid = 1;
+
+        auto h = std::make_shared<TraceHandleImpl>();
+        h->is_cuda = true;
+        h->launch_count = 1;
+        h->fusion_name = is_ln ? "row-layernorm-chain" : "row-rmsnorm-chain";
+        h->execute_fn = [fn, grid, args]() {
+            launch(fn, grid, static_cast<unsigned>(ptx::kRowThreads), *args, "trace row-norm");
+        };
+        return h;
+    };
+
+    std::vector<void*> ins, outs;
+    for (const auto& s : plan.ew.inputs) ins.push_back(dag.node(s.node_id).buffer);
+    for (const auto& s : plan.ew.outputs) outs.push_back(dag.node(s.node_id).buffer);
+
+    auto h = bind(ins, outs);
+    h->rebind_fn = [bind](const std::vector<void*>& in_b, const std::vector<void*>& out_b) {
+        return bind(in_b, out_b);
+    };
+    return h;
+}
+
+// ── hand-written residual + RMSNorm ─────────────────────────────────────────
+
+std::shared_ptr<TraceHandleImpl> compile_residual_rmsnorm(const TraceDAG& dag) {
+    const auto& nodes = dag.nodes();
+    const TraceNode* node_rms = nullptr;
+    const TraceNode* node_add = nullptr;
+    const TraceNode* node_res = nullptr;
+    const TraceNode* node_gamma = nullptr;
+
+    for (const auto& n : nodes) {
+        if (n.op != TraceOpKind::RMSNorm || n.inputs.empty()) continue;
+        node_rms = &n;
+        node_add = &nodes[static_cast<std::size_t>(n.inputs[0])];
+        if (node_add->inputs.size() < 2) return nullptr;
+        node_res = &nodes[static_cast<std::size_t>(node_add->inputs[1])];
+        if (n.inputs.size() > 1) node_gamma = &nodes[static_cast<std::size_t>(n.inputs[1])];
+        break;
     }
+    if (!node_rms || !node_add || !node_res) return nullptr;
+
+    const int B = node_add->rows;
+    const int D = node_add->cols;
+    const float eps = node_rms->scalar > 0.0f ? node_rms->scalar : 1e-5f;
+
+    auto bind = [B, D, eps](void* x, const void* res, const void* gamma, void* y) {
+        auto h = std::make_shared<TraceHandleImpl>();
+        h->is_cuda = true;
+        h->launch_count = 1;
+        h->fusion_name = "residual-rmsnorm";
+        h->execute_fn = [x, res, gamma, y, B, D, eps]() {
+            detail::cuda::jit::launch_fused_residual_rmsnorm_ptx(
+                static_cast<float*>(x), static_cast<const float*>(res),
+                static_cast<const float*>(gamma), static_cast<float*>(y), B, D, eps,
+                cuda_current_stream());
+        };
+        return h;
+    };
+
+    auto h = bind(node_add->buffer, node_res->buffer,
+                  node_gamma ? node_gamma->buffer : nullptr, node_rms->buffer);
+    h->rebind_fn = [bind](const std::vector<void*>& in_b, const std::vector<void*>& out_b) {
+        const void* res = in_b.size() > 1 ? in_b[1] : nullptr;
+        const void* gamma = in_b.size() > 2 ? in_b[2] : nullptr;
+        void* x = !out_b.empty() ? out_b[0] : in_b[0];
+        void* y = out_b.size() > 1 ? out_b[1] : (!out_b.empty() ? out_b[0] : nullptr);
+        return bind(x, res, gamma, y);
+    };
+    return h;
+}
+
+}  // namespace
+
+std::shared_ptr<TraceHandleImpl> compile_cuda(const TraceDAG& dag, FusionPattern pattern) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::shared_ptr<TraceHandleImpl> h;
+
+    // `x += p; rms_norm(x)` keeps brass's hand-written kernel: it fuses the
+    // residual write into the reduction's first pass, which the generic row
+    // emitter cannot express. FP32 only — the kernel takes float*.
+    if (pattern == FusionPattern::ResidualRMSNorm && all_fp32(dag)) {
+        h = compile_residual_rmsnorm(dag);
+    }
+
+    if (!h) {
+        ptx::RowNormPlan rn;
+        if (build_row_norm_plan(dag, rn)) {
+            h = compile_row_norm(dag, rn);
+        }
+    }
+
+    if (!h) {
+        ptx::ElementwisePlan ew;
+        if (!build_plan(dag, ew)) {
+            throw std::runtime_error(
+                "brotensor::jit: the traced expression has no CUDA fusion — check that "
+                "every operand is FP32/FP16/BF16 and is either the full (rows, cols) "
+                "shape, a (1, cols) row, or a (1, 1) scalar");
+        }
+        h = compile_elementwise(dag, ew);
+    }
+
+    h->compile_us = std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - t0).count();
+    return h;
+}
+
+namespace {
+struct CudaTraceRegistrar {
+    CudaTraceRegistrar() { register_cuda_trace_compiler(&compile_cuda); }
 };
-static CudaTraceRegistrar s_cuda_trace_registrar;
+CudaTraceRegistrar s_cuda_trace_registrar;
+}  // namespace
 
-} // namespace brotensor::jit::cuda
+}  // namespace brotensor::jit::cuda
 
-#endif // BROTENSOR_HAS_CUDA
+#endif  // BROTENSOR_HAS_CUDA

@@ -29,6 +29,20 @@ public:
     double last_duration_us() const;
     bool is_cache_hit() const;
 
+    // How many kernel launches one execute() issues. A fully fused trace is 1;
+    // a trace the compiler could only partly fuse reports what it actually
+    // costs, which is the number the benchmarks compare against the eager op
+    // sequence's launch count.
+    size_t launch_count() const;
+
+    // Wall-clock cost of producing this trace's code, in microseconds: PTX
+    // emission plus the driver's PTX->SASS compile. Zero on a cache hit.
+    double compile_us() const;
+
+    // Human-readable name of the fusion the compiler chose, for benchmark and
+    // test output ("elementwise-vec8-bf16", "row-norm", "residual-rmsnorm", …).
+    const char* fusion_name() const;
+
     explicit operator bool() const noexcept { return impl_ != nullptr; }
 
 private:
@@ -96,6 +110,8 @@ inline Tensor& operator*=(Tensor& a, int s) { return a *= static_cast<float>(s);
 Tensor silu(const Tensor& a);
 Tensor gelu(const Tensor& a);
 Tensor relu(const Tensor& a);
+Tensor tanh(const Tensor& a);
+Tensor sigmoid(const Tensor& a);
 
 Tensor rms_norm(const Tensor& x, const Tensor& gamma = Tensor(), float eps = 1e-5f);
 Tensor layernorm(const Tensor& x, const Tensor& gamma = Tensor(), const Tensor& beta = Tensor(), float eps = 1e-5f);
@@ -120,6 +136,8 @@ using jit::operator*=;
 using jit::silu;
 using jit::gelu;
 using jit::relu;
+using jit::tanh;
+using jit::sigmoid;
 using jit::rms_norm;
 using jit::layernorm;
 using jit::modulate;

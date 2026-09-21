@@ -13,6 +13,7 @@
 #include <brass/mir/types.hpp>
 #endif
 
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -98,6 +99,7 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
         }
     }
 
+    const auto compile_t0 = std::chrono::steady_clock::now();
     std::shared_ptr<TraceHandleImpl> handle;
     if (is_cuda) {
         auto cuda_fn = get_cuda_trace_compiler_hook();
@@ -113,6 +115,14 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
     handle->is_cuda = is_cuda;
     handle->node_count = dag.node_count();
     handle->is_cache_hit = false;
+    // The CUDA compiler names its own fusion and times its own PTX build; the
+    // CPU path is always one fused call through brass's host codegen.
+    if (handle->launch_count == 0) handle->launch_count = 1;
+    if (!is_cuda) {
+        handle->fusion_name = "cpu-avx2-fused";
+        handle->compile_us = std::chrono::duration<double, std::micro>(
+                                 std::chrono::steady_clock::now() - compile_t0).count();
+    }
 
     TraceCache::instance().insert(hash, handle);
 
@@ -267,6 +277,14 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
             res = tb.vgelu_f32x8(v_node_vals[n.inputs[0]]);
         } else if (n.op == TraceOpKind::ReLU) {
             res = tb.vrelu_f32x8(v_node_vals[n.inputs[0]]);
+        } else if (n.op == TraceOpKind::Tanh) {
+            res = tb.vtanh_f32x8(v_node_vals[n.inputs[0]]);
+        } else if (n.op == TraceOpKind::Sigmoid) {
+            res = tb.vsigmoid_f32x8(v_node_vals[n.inputs[0]]);
+        } else {
+            throw std::runtime_error(
+                std::string("brotensor::jit: op '") + op_kind_name(n.op) +
+                "' has no CPU elementwise form");
         }
         v_node_vals[n.id] = res;
 
@@ -334,6 +352,14 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
             res = tb.gelu_f32(s_node_vals[n.inputs[0]]);
         } else if (n.op == TraceOpKind::ReLU) {
             res = tb.relu_f32(s_node_vals[n.inputs[0]]);
+        } else if (n.op == TraceOpKind::Tanh) {
+            res = tb.tanh_f32(s_node_vals[n.inputs[0]]);
+        } else if (n.op == TraceOpKind::Sigmoid) {
+            res = tb.sigmoid_f32(s_node_vals[n.inputs[0]]);
+        } else {
+            throw std::runtime_error(
+                std::string("brotensor::jit: op '") + op_kind_name(n.op) +
+                "' has no CPU elementwise form");
         }
         s_node_vals[n.id] = res;
 

@@ -254,6 +254,13 @@ if(BROTENSOR_HAS_GPU)
         # Multi-GPU P2P transfer and pipeline execution test.
         brotensor_add_test(brotensor_test_multigpu test_multigpu.cpp)
         # Brass CUDA JIT benchmark & parity test suite
+        # Typed (BF16/FP16) I/O, row/scalar broadcast operands, tanh/sigmoid,
+        # and the fused norm+chain kernels — the trace JIT surface the DiT and
+        # VAE adoption depends on.
+        brotensor_add_test(brotensor_test_jit_trace_dtypes test_jit_trace_dtypes.cpp)
+        # Per-pattern eager / hand-fused / JIT bandwidth comparison. Built but
+        # not a ctest: invoke ./tests/Release/brotensor_bench_jit_fusion.
+        brotensor_add_executable(brotensor_bench_jit_fusion bench_jit_fusion.cpp)
         brotensor_add_test(brotensor_test_cuda_jit test_cuda_jit.cpp)
         if(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")
             target_include_directories(brotensor_test_cuda_jit PRIVATE "${BRASS_ROOT}/include")

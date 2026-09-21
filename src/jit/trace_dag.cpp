@@ -24,13 +24,35 @@ const char* op_kind_name(TraceOpKind op) {
         case TraceOpKind::RMSNorm: return "RMSNorm";
         case TraceOpKind::LayerNorm: return "LayerNorm";
         case TraceOpKind::Modulate: return "Modulate";
+        case TraceOpKind::Tanh: return "Tanh";
+        case TraceOpKind::Sigmoid: return "Sigmoid";
     }
     return "Unknown";
 }
 
+BroadcastKind broadcast_of(int node_rows, int node_cols, int rows, int cols) {
+    if (node_rows == 1 && node_cols == 1 && rows * cols != 1) {
+        return BroadcastKind::Scalar;
+    }
+    if (node_rows == 1 && node_cols == cols && rows != 1) {
+        return BroadcastKind::Row;
+    }
+    // Anything else is addressed linearly. A node whose element count does not
+    // match the dominant shape is rejected by the compiler before it gets
+    // here (see trace_compiler_cuda.cpp's plan builder).
+    return BroadcastKind::Full;
+}
+
+bool TraceDAG::slot_matches(int slot, const Tensor& t) const {
+    if (slot < 0 || slot >= static_cast<int>(nodes_.size())) return false;
+    const TraceNode& n = nodes_[static_cast<std::size_t>(slot)];
+    return n.buffer == t.data && n.rows == t.rows && n.cols == t.cols &&
+           n.dtype == t.dtype && n.device == t.device;
+}
+
 int TraceDAG::register_input(const Tensor& t) {
     auto it = input_ptr_to_slot_.find(t.data);
-    if (it != input_ptr_to_slot_.end()) {
+    if (it != input_ptr_to_slot_.end() && slot_matches(it->second, t)) {
         return it->second;
     }
 
@@ -118,6 +140,20 @@ void TraceDAG::analyze_liveness() {
     }
 }
 
+void TraceDAG::dominant_shape(int& rows, int& cols) const {
+    rows = 0;
+    cols = 0;
+    int64_t best = 0;
+    for (const auto& n : nodes_) {
+        const int64_t numel = static_cast<int64_t>(n.rows) * static_cast<int64_t>(n.cols);
+        if (numel > best) {
+            best = numel;
+            rows = n.rows;
+            cols = n.cols;
+        }
+    }
+}
+
 uint64_t TraceDAG::compute_hash() const {
     // 64-bit FNV-1a hash
     uint64_t hash = 14695981039346656037ULL;
@@ -179,8 +215,13 @@ TraceDAG TraceContext::end() {
 }
 
 int TraceContext::get_or_register_slot(const Tensor& t) {
+    // A traced op's output Tensor owns its buffer and frees it when the
+    // enclosing expression ends, so an address seen earlier in this trace can
+    // be handed back by the allocator to a different tensor. Confirm the
+    // recorded node still describes the tensor in hand before reusing its
+    // slot; a mismatch means the entry is stale and the buffer is a new input.
     auto it = active_ptr_to_slot_.find(t.data);
-    if (it != active_ptr_to_slot_.end()) {
+    if (it != active_ptr_to_slot_.end() && dag_.slot_matches(it->second, t)) {
         return it->second;
     }
     int slot = dag_.register_input(t);

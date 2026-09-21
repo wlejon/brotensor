@@ -27,10 +27,23 @@ enum class TraceOpKind : uint8_t {
     ReLU,
     RMSNorm,
     LayerNorm,
-    Modulate
+    Modulate,
+    Tanh,
+    Sigmoid
 };
 
 const char* op_kind_name(TraceOpKind op);
+
+// How a node's buffer maps onto the trace's dominant (rows, cols) shape.
+//
+// Row and Scalar are the broadcast forms the DiT modulation surfaces need: a
+// (1, D) gate or scale row multiplied against an (N, D) activation, and a
+// (1, 1) scalar. The emitters turn these into a different address computation
+// for that operand, not into a materialised expansion — a broadcast operand
+// contributes D (or 1) elements of traffic, not N*D.
+enum class BroadcastKind : uint8_t { Full = 0, Row = 1, Scalar = 2 };
+
+BroadcastKind broadcast_of(int node_rows, int node_cols, int rows, int cols);
 
 struct TraceNode {
     int id = -1;
@@ -62,10 +75,18 @@ public:
     void analyze_liveness();
     uint64_t compute_hash() const;
 
+    // The trace's dominant shape: the largest (rows * cols) any node carries.
+    // Every non-broadcast node must match it; (1, cols) and (1, 1) nodes are
+    // broadcast operands.
+    void dominant_shape(int& rows, int& cols) const;
+
     const std::vector<TraceNode>& nodes() const noexcept { return nodes_; }
     std::vector<TraceNode>& nodes() noexcept { return nodes_; }
     const TraceNode& node(int id) const { return nodes_.at(id); }
     size_t node_count() const noexcept { return nodes_.size(); }
+
+    // True when `slot` still describes `t` (same buffer, shape, dtype, device).
+    bool slot_matches(int slot, const Tensor& t) const;
     void reset();
 
 private:

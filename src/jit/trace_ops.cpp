@@ -7,20 +7,50 @@
 #include "../cuda/cuda_jit.h"
 #endif
 
+#include <cstdint>
+#include <string>
 #include <vector>
 #include <stdexcept>
 
 namespace brotensor::jit {
+
+namespace {
+
+// Result shape of a binary op whose operands may differ in rank: the operand
+// with more elements wins, so `gate * x` and `x * gate` both produce x's
+// shape when gate is a (1, D) row or a (1, 1) scalar. The trace records the
+// broadcast as an addressing mode on that operand; nothing is materialised.
+Tensor binary_out(const Tensor& a, const Tensor& b) {
+    const Tensor& big = (static_cast<int64_t>(b.rows) * b.cols >
+                         static_cast<int64_t>(a.rows) * a.cols)
+                            ? b
+                            : a;
+    return Tensor::empty_on(big.device, big.rows, big.cols, big.dtype);
+}
+
+bool same_shape(const Tensor& a, const Tensor& b) {
+    return a.rows == b.rows && a.cols == b.cols;
+}
+
+[[noreturn]] void no_eager_broadcast(const char* op) {
+    throw std::runtime_error(
+        std::string("brotensor::jit: eager ") + op +
+        " does not broadcast; trace the expression (begin_trace/end_trace) or "
+        "call the shaped op directly");
+}
+
+}  // namespace
 
 Tensor operator+(const Tensor& a, const Tensor& b) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
+        Tensor out = binary_out(a, b);
         ctx.record_op(TraceOpKind::Add, {slot_a, slot_b}, 0.0f, out);
         return out;
     }
+    if (!same_shape(a, b)) no_eager_broadcast("+");
     Tensor out = a.clone();
     brotensor::add_inplace(out, b);
     return out;
@@ -44,10 +74,11 @@ Tensor operator-(const Tensor& a, const Tensor& b) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
+        Tensor out = binary_out(a, b);
         ctx.record_op(TraceOpKind::Sub, {slot_a, slot_b}, 0.0f, out);
         return out;
     }
+    if (!same_shape(a, b)) no_eager_broadcast("-");
     Tensor out = a.clone();
     brotensor::axpby_inplace(out, b, 1.0f, -1.0f);
     return out;
@@ -76,9 +107,24 @@ Tensor operator*(const Tensor& a, const Tensor& b) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
+        Tensor out = binary_out(a, b);
         ctx.record_op(TraceOpKind::Mul, {slot_a, slot_b}, 0.0f, out);
         return out;
+    }
+    if (!same_shape(a, b)) {
+        // The one eager broadcast brotensor already has a kernel for: a
+        // length-D row against (L, D). Anything else is an error.
+        const Tensor& big = (static_cast<int64_t>(b.rows) * b.cols >
+                             static_cast<int64_t>(a.rows) * a.cols)
+                                ? b
+                                : a;
+        const Tensor& small = (&big == &a) ? b : a;
+        if (small.rows == 1 && small.cols == big.cols) {
+            Tensor out;
+            brotensor::broadcast_mul(big, small, out);
+            return out;
+        }
+        no_eager_broadcast("*");
     }
     Tensor out = a.clone();
     brotensor::mul_inplace(out, b);
@@ -103,10 +149,11 @@ Tensor operator/(const Tensor& a, const Tensor& b) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
+        Tensor out = binary_out(a, b);
         ctx.record_op(TraceOpKind::Div, {slot_a, slot_b}, 0.0f, out);
         return out;
     }
+    if (!same_shape(a, b)) no_eager_broadcast("/");
     Tensor out = a.clone();
     if (a.is_host()) {
         float* p_out = out.ptr();
@@ -217,6 +264,32 @@ Tensor relu(const Tensor& a) {
     }
     Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
     brotensor::relu_forward(a, out);
+    return out;
+}
+
+Tensor tanh(const Tensor& a) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_a = ctx.get_or_register_slot(a);
+        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
+        ctx.record_op(TraceOpKind::Tanh, {slot_a}, 0.0f, out);
+        return out;
+    }
+    Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
+    brotensor::tanh_forward(a, out);
+    return out;
+}
+
+Tensor sigmoid(const Tensor& a) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_a = ctx.get_or_register_slot(a);
+        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
+        ctx.record_op(TraceOpKind::Sigmoid, {slot_a}, 0.0f, out);
+        return out;
+    }
+    Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
+    brotensor::sigmoid_forward(a, out);
     return out;
 }
 
