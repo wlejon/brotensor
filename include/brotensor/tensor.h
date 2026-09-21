@@ -134,6 +134,19 @@ struct Tensor {
     Dtype  dtype  = Dtype::FP32;
     Device device = Device::CPU;
 
+    // Opaque outside brotensor::jit, which is the only code that ever sets or
+    // reads it. -1 on every ordinary tensor.
+    //
+    // >= 0 means this Tensor is a *symbolic* traced intermediate standing for
+    // node `jit_slot` of the trace currently recording: `data` is null, it
+    // owns nothing and frees nothing, and it carries only rows / cols / dtype
+    // / device. A fused kernel evaluates such a value in registers and never
+    // reads it back out of memory, so the tracer allocates nothing for it;
+    // end_trace() hands a real buffer to exactly those symbolic tensors the
+    // caller is still holding when the trace closes. Copying one throws — see
+    // the copy ctor.
+    int jit_slot = -1;
+
     Tensor() = default;
     ~Tensor();
 
@@ -142,6 +155,11 @@ struct Tensor {
     // used with value semantics (caches, std::vector storage, by-value
     // params). clone() remains for call sites that want the copy to be
     // explicit. Copying a GPU-resident tensor allocates + copies on-device.
+    //
+    // Copying a symbolic traced intermediate (jit_slot >= 0) throws
+    // std::runtime_error: it stands for a node of a trace and owns no memory,
+    // so there is nothing to deep-copy, and two Tensors cannot both become
+    // the one buffer end_trace() will allocate for that node.
     Tensor(const Tensor&);
     Tensor& operator=(const Tensor&);
     Tensor(Tensor&&) noexcept;
@@ -289,6 +307,39 @@ private:
     std::size_t cap_bytes_ = 0;
     void release_();
 };
+
+// ─── jit symbolic-tensor tracking hook ─────────────────────────────────────
+//
+// brotensor::jit has to be able to find the caller's Tensor object again when
+// a trace closes, because a value that is still live then must end up owning
+// a real buffer the caller can read. It keeps a slot -> Tensor* table, and
+// Tensor's move ctor / move assignment / destructor keep that table honest
+// through this one function pointer.
+//
+// It is null unless a trace has been started on this process, so an ordinary
+// tensor's lifetime costs a single `jit_slot >= 0` test and nothing else, and
+// tensor.cpp gains no dependency on the jit. `to == nullptr` means the
+// symbolic tensor at `from` is gone; otherwise it moved from `from` to `to`.
+namespace detail {
+using JitSlotRetargetHook = void (*)(int slot, const Tensor* from, Tensor* to);
+extern JitSlotRetargetHook jit_slot_retarget;
+}  // namespace detail
+
+// ─── Allocation accounting ─────────────────────────────────────────────────
+//
+// Monotonic, process-wide counters over every Tensor storage allocation that
+// goes through a backend allocator — every zeros/empty/from_host/clone/to and
+// every growing resize(), on any device. Views and no-op resizes do not count.
+//
+// This exists so a test can assert what a piece of code did *not* allocate:
+// the trace JIT's contract is that a fused expression whose result is store()d
+// into a caller buffer allocates nothing at all for its intermediates, and the
+// only way to hold it to that is to read the counter on both sides.
+struct AllocStats {
+    std::uint64_t count = 0;   // allocations performed
+    std::uint64_t bytes = 0;   // bytes requested across them
+};
+AllocStats alloc_stats();
 
 // ─── FP16 / BF16 ↔ FP32 host-side conversion helpers ───────────────────────
 //

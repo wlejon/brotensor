@@ -49,16 +49,58 @@ private:
     std::shared_ptr<TraceHandleImpl> impl_;
 };
 
+// ── What a traced op returns ──────────────────────────────────────────────
+//
+// Between begin_trace() and end_trace(), the operators and functions below do
+// not compute anything and do not allocate anything. Each returns a *symbolic*
+// Tensor: a name for one node of the trace, carrying the right shape, dtype
+// and device but no buffer. The fused kernel evaluates the whole expression in
+// registers, so a full-size buffer per intermediate would be pure waste — at
+// VAE decode width it is hundreds of megabytes per trace for contents nothing
+// ever reads.
+//
+// Three consequences for the caller:
+//
+//   * A symbolic Tensor cannot be copied. It is a value in an expression, not
+//     a tensor; the copy ctor throws. Use it, move it, or store() it.
+//
+//   * end_trace() gives a real buffer to every symbolic Tensor the caller is
+//     still holding whose value the trace actually produces — in
+//     `Tensor out = (a*b+c)*silu(d); auto h = end_trace();`, `out` owns a real
+//     buffer afterwards and `h.execute()` refills it, exactly as before.
+//
+//   * A symbolic Tensor whose value the fused kernel only consumes internally
+//     — `Tensor ln = layernorm(x); Tensor out = ln * g;`, where nothing else
+//     reads `ln` — comes back from end_trace() as an *empty* tensor. Its
+//     contents were never written to memory. (Before, it came back holding an
+//     allocated buffer of uninitialised garbage, so no correct code can be
+//     relying on it.)
+
 // Starts tracing thread-local operations.
 void begin_trace();
 
-// Stops tracing, compiles the captured DAG (or retrieves from cache), and returns a TraceHandle.
+// Stops tracing, compiles the captured DAG (or retrieves from cache), and
+// returns a TraceHandle. Materialises the live-at-end intermediates the caller
+// still holds, as described above.
+//
+// If compilation throws — the expression has no fusion on this backend — the
+// trace has already been closed and those tensors have already been given
+// buffers; they hold undefined contents and the caller is expected to run its
+// eager path over them. abort_trace() afterwards is harmless.
 TraceHandle end_trace();
 
 // Discards a trace in progress without compiling it. For a caller that has to
 // unwind out of a traced region — an unsupported expression throws from
 // end_trace(), and the thread's trace context has to be left clean for the
 // next attempt.
+//
+// Every symbolic Tensor the caller still holds is neutralised to an empty
+// tensor (no buffer, zero rows and cols, jit_slot cleared) rather than
+// materialised: the abort path exists so the caller can recompute the whole
+// expression eagerly, and allocating buffers it is about to overwrite would
+// cost exactly what tracing is here to avoid. A caller that wants values back
+// assigns over those tensors on its eager path, which is what
+// brodiffusion::detail::try_fused does.
 void abort_trace();
 
 // Returns true if tracing is currently active on this thread.

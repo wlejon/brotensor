@@ -20,16 +20,22 @@ namespace {
 // with more elements wins, so `gate * x` and `x * gate` both produce x's
 // shape when gate is a (1, D) row or a (1, 1) scalar. The trace records the
 // broadcast as an addressing mode on that operand; nothing is materialised.
-Tensor binary_out(const Tensor& a, const Tensor& b) {
-    const Tensor& big = (static_cast<int64_t>(b.rows) * b.cols >
-                         static_cast<int64_t>(a.rows) * a.cols)
-                            ? b
-                            : a;
-    return Tensor::empty_on(big.device, big.rows, big.cols, big.dtype);
+const Tensor& binary_shape(const Tensor& a, const Tensor& b) {
+    return (static_cast<int64_t>(b.rows) * b.cols >
+            static_cast<int64_t>(a.rows) * a.cols)
+               ? b
+               : a;
 }
 
 bool same_shape(const Tensor& a, const Tensor& b) {
     return a.rows == b.rows && a.cols == b.cols;
+}
+
+// An operand the caller did not supply — the default-constructed Tensor that
+// means "no gamma" / "no beta". A symbolic intermediate also has a null
+// `data`, so emptiness alone does not answer the question.
+bool absent(const Tensor& t) {
+    return t.jit_slot < 0 && t.empty();
 }
 
 [[noreturn]] void no_eager_broadcast(const char* op) {
@@ -46,9 +52,9 @@ Tensor operator+(const Tensor& a, const Tensor& b) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
-        Tensor out = binary_out(a, b);
-        ctx.record_op(TraceOpKind::Add, {slot_a, slot_b}, 0.0f, out);
-        return out;
+        const Tensor& r = binary_shape(a, b);
+        return ctx.record_op(TraceOpKind::Add, {slot_a, slot_b}, 0.0f,
+                             r.device, r.dtype, r.rows, r.cols);
     }
     if (!same_shape(a, b)) no_eager_broadcast("+");
     Tensor out = a.clone();
@@ -60,9 +66,8 @@ Tensor operator+(const Tensor& a, float s) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
-        ctx.record_op(TraceOpKind::AddScalar, {slot_a}, s, out);
-        return out;
+        return ctx.record_op(TraceOpKind::AddScalar, {slot_a}, s,
+                             a.device, a.dtype, a.rows, a.cols);
     }
     Tensor out = a.clone();
     brotensor::add_scalar_inplace(out, s);
@@ -74,9 +79,9 @@ Tensor operator-(const Tensor& a, const Tensor& b) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
-        Tensor out = binary_out(a, b);
-        ctx.record_op(TraceOpKind::Sub, {slot_a, slot_b}, 0.0f, out);
-        return out;
+        const Tensor& r = binary_shape(a, b);
+        return ctx.record_op(TraceOpKind::Sub, {slot_a, slot_b}, 0.0f,
+                             r.device, r.dtype, r.rows, r.cols);
     }
     if (!same_shape(a, b)) no_eager_broadcast("-");
     Tensor out = a.clone();
@@ -92,9 +97,8 @@ Tensor operator-(float s, const Tensor& a) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
-        ctx.record_op(TraceOpKind::ScalarSub, {slot_a}, s, out);
-        return out;
+        return ctx.record_op(TraceOpKind::ScalarSub, {slot_a}, s,
+                             a.device, a.dtype, a.rows, a.cols);
     }
     Tensor out = a.clone();
     brotensor::scale_inplace(out, -1.0f);
@@ -107,9 +111,9 @@ Tensor operator*(const Tensor& a, const Tensor& b) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
-        Tensor out = binary_out(a, b);
-        ctx.record_op(TraceOpKind::Mul, {slot_a, slot_b}, 0.0f, out);
-        return out;
+        const Tensor& r = binary_shape(a, b);
+        return ctx.record_op(TraceOpKind::Mul, {slot_a, slot_b}, 0.0f,
+                             r.device, r.dtype, r.rows, r.cols);
     }
     if (!same_shape(a, b)) {
         // The one eager broadcast brotensor already has a kernel for: a
@@ -135,9 +139,8 @@ Tensor operator*(const Tensor& a, float s) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
-        ctx.record_op(TraceOpKind::MulScalar, {slot_a}, s, out);
-        return out;
+        return ctx.record_op(TraceOpKind::MulScalar, {slot_a}, s,
+                             a.device, a.dtype, a.rows, a.cols);
     }
     Tensor out = a.clone();
     brotensor::scale_inplace(out, s);
@@ -149,9 +152,9 @@ Tensor operator/(const Tensor& a, const Tensor& b) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
-        Tensor out = binary_out(a, b);
-        ctx.record_op(TraceOpKind::Div, {slot_a, slot_b}, 0.0f, out);
-        return out;
+        const Tensor& r = binary_shape(a, b);
+        return ctx.record_op(TraceOpKind::Div, {slot_a, slot_b}, 0.0f,
+                             r.device, r.dtype, r.rows, r.cols);
     }
     if (!same_shape(a, b)) no_eager_broadcast("/");
     Tensor out = a.clone();
@@ -232,9 +235,8 @@ Tensor silu(const Tensor& a) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
-        ctx.record_op(TraceOpKind::SiLU, {slot_a}, 0.0f, out);
-        return out;
+        return ctx.record_op(TraceOpKind::SiLU, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
     }
     Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
     brotensor::silu_forward(a, out);
@@ -245,9 +247,8 @@ Tensor gelu(const Tensor& a) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
-        ctx.record_op(TraceOpKind::GELU, {slot_a}, 0.0f, out);
-        return out;
+        return ctx.record_op(TraceOpKind::GELU, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
     }
     Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
     brotensor::gelu_forward(a, out);
@@ -258,9 +259,8 @@ Tensor relu(const Tensor& a) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
-        ctx.record_op(TraceOpKind::ReLU, {slot_a}, 0.0f, out);
-        return out;
+        return ctx.record_op(TraceOpKind::ReLU, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
     }
     Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
     brotensor::relu_forward(a, out);
@@ -271,7 +271,7 @@ void store(Tensor& dst, const Tensor& src) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
         int slot_src = ctx.get_or_register_slot(src);
-        ctx.record_op(TraceOpKind::Copy, {slot_src}, 0.0f, dst);
+        ctx.record_store(slot_src, dst);
         return;
     }
     if (dst.rows != src.rows || dst.cols != src.cols || dst.dtype != src.dtype) {
@@ -285,9 +285,8 @@ Tensor tanh(const Tensor& a) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
-        ctx.record_op(TraceOpKind::Tanh, {slot_a}, 0.0f, out);
-        return out;
+        return ctx.record_op(TraceOpKind::Tanh, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
     }
     Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
     brotensor::tanh_forward(a, out);
@@ -298,9 +297,8 @@ Tensor sigmoid(const Tensor& a) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
         int slot_a = ctx.get_or_register_slot(a);
-        Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
-        ctx.record_op(TraceOpKind::Sigmoid, {slot_a}, 0.0f, out);
-        return out;
+        return ctx.record_op(TraceOpKind::Sigmoid, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
     }
     Tensor out = Tensor::empty_on(a.device, a.rows, a.cols, a.dtype);
     brotensor::sigmoid_forward(a, out);
@@ -312,12 +310,11 @@ Tensor rms_norm(const Tensor& x, const Tensor& gamma, float eps) {
         auto& ctx = TraceContext::current();
         int slot_x = ctx.get_or_register_slot(x);
         std::vector<int> inputs = {slot_x};
-        if (!gamma.empty()) {
+        if (!absent(gamma)) {
             inputs.push_back(ctx.get_or_register_slot(gamma));
         }
-        Tensor out = Tensor::empty_on(x.device, x.rows, x.cols, x.dtype);
-        ctx.record_op(TraceOpKind::RMSNorm, inputs, eps, out);
-        return out;
+        return ctx.record_op(TraceOpKind::RMSNorm, inputs, eps,
+                             x.device, x.dtype, x.rows, x.cols);
     }
 
     Tensor g = gamma;
@@ -335,11 +332,10 @@ Tensor layernorm(const Tensor& x, const Tensor& gamma, const Tensor& beta, float
         auto& ctx = TraceContext::current();
         int slot_x = ctx.get_or_register_slot(x);
         std::vector<int> inputs = {slot_x};
-        if (!gamma.empty()) inputs.push_back(ctx.get_or_register_slot(gamma));
-        if (!beta.empty()) inputs.push_back(ctx.get_or_register_slot(beta));
-        Tensor out = Tensor::empty_on(x.device, x.rows, x.cols, x.dtype);
-        ctx.record_op(TraceOpKind::LayerNorm, inputs, eps, out);
-        return out;
+        if (!absent(gamma)) inputs.push_back(ctx.get_or_register_slot(gamma));
+        if (!absent(beta)) inputs.push_back(ctx.get_or_register_slot(beta));
+        return ctx.record_op(TraceOpKind::LayerNorm, inputs, eps,
+                             x.device, x.dtype, x.rows, x.cols);
     }
 
     Tensor g = gamma;
@@ -362,9 +358,8 @@ Tensor modulate(const Tensor& x, const Tensor& scale, const Tensor& shift) {
         int slot_x = ctx.get_or_register_slot(x);
         int slot_s = ctx.get_or_register_slot(scale);
         int slot_sh = ctx.get_or_register_slot(shift);
-        Tensor out = Tensor::empty_on(x.device, x.rows, x.cols, x.dtype);
-        ctx.record_op(TraceOpKind::Modulate, {slot_x, slot_s, slot_sh}, 0.0f, out);
-        return out;
+        return ctx.record_op(TraceOpKind::Modulate, {slot_x, slot_s, slot_sh}, 0.0f,
+                             x.device, x.dtype, x.rows, x.cols);
     }
 
     Tensor out = Tensor::empty_on(x.device, x.rows, x.cols, x.dtype);

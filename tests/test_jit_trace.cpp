@@ -366,6 +366,128 @@ void test_cache_hit_and_speedup(Device dev) {
     CHECK_TRUE(speedup > 0.0, "JIT replay completed successfully");
 }
 
+// ── Test 5: what tracing allocates, and what it must not ────────────────────
+//
+// The tracer's whole reason for keeping symbolic tensors is that a fused
+// kernel never reads an intermediate out of memory, so it must never buy one.
+// brotensor::alloc_stats() counts every backend allocation, so the claim is
+// checkable rather than merely intended: an expression that store()s into a
+// buffer the caller already owns has to cost ZERO bytes, and an expression
+// whose result the caller keeps has to cost exactly the one output buffer.
+
+void test_trace_allocates_nothing(Device dev) {
+    const std::string dev_name = dev.is_cuda() ? "CUDA" : "CPU";
+    std::printf("\n--- Test 5: Trace-time allocation on %s ---\n", dev_name.c_str());
+
+    const int R = 512;
+    const int D = 1024;
+    const std::size_t N = static_cast<std::size_t>(R) * D;
+    const std::uint64_t buf_bytes = static_cast<std::uint64_t>(N) * sizeof(float);
+
+    // Every operand is the full (R, D) shape: the CPU trace compiler has no
+    // broadcast form, and this test has to measure the same expression on
+    // both backends.
+    std::vector<float> h_x(N), h_y(N);
+    fill_random(h_x, 5001, 1.5f);
+    fill_random(h_y, 5002, 1.0f);
+
+    Tensor x = Tensor::from_host_on(dev, h_x.data(), R, D);
+    Tensor y = Tensor::from_host_on(dev, h_y.data(), R, D);
+    Tensor dst = Tensor::empty_on(dev, R, D);
+
+    // ── store()d result: nothing at all ──────────────────────────────────
+    //
+    // silu(x) * y + x is three traced ops. Eagerly that is three full-size
+    // (R, D) buffers; traced it must be none — every one of those values is
+    // consumed inside the single kernel and never lands in memory.
+    const AllocStats before_store = brotensor::alloc_stats();
+    begin_trace();
+    jit::store(dst, jit::silu(x) * y + x);
+    TraceHandle h_store = end_trace();
+    const AllocStats after_store = brotensor::alloc_stats();
+
+    const std::uint64_t store_bytes = after_store.bytes - before_store.bytes;
+    const std::uint64_t store_count = after_store.count - before_store.count;
+    std::printf("  store()d trace: %llu allocation(s), %llu bytes "
+                "(eager intermediates would be %llu)\n",
+                static_cast<unsigned long long>(store_count),
+                static_cast<unsigned long long>(store_bytes),
+                static_cast<unsigned long long>(3 * buf_bytes));
+    CHECK_TRUE(store_count == 0 && store_bytes == 0,
+               (dev_name + " store()d trace allocates no intermediates").c_str());
+
+    // and it still computes the right thing.
+    brotensor::sync(dev);
+    Tensor ref = Tensor::empty_on(dev, R, D);
+    brotensor::silu_forward(x, ref);
+    brotensor::mul_inplace(ref, y);
+    brotensor::add_inplace(ref, x);
+    brotensor::sync(dev);
+    CHECK_PARITY(max_abs_diff(dst.to_host_vector(), ref.to_host_vector()), 1e-4f,
+                 (dev_name + " store()d trace is numerically correct").c_str());
+    CHECK_TRUE(h_store.launch_count() == 1,
+               (dev_name + " store()d trace is one launch").c_str());
+
+    // ── kept result: exactly one output buffer ───────────────────────────
+    //
+    // Same expression, but the caller keeps the value instead of storing it.
+    // end_trace() has to hand that one live-at-end node a real buffer — and
+    // nothing else: silu(x) and silu(x)*y are still interior to the kernel.
+    const AllocStats before_keep = brotensor::alloc_stats();
+    begin_trace();
+    Tensor kept = jit::silu(x) * y + x;
+    TraceHandle h_keep = end_trace();
+    const AllocStats after_keep = brotensor::alloc_stats();
+
+    const std::uint64_t keep_bytes = after_keep.bytes - before_keep.bytes;
+    const std::uint64_t keep_count = after_keep.count - before_keep.count;
+    std::printf("  kept trace:     %llu allocation(s), %llu bytes "
+                "(one output buffer is %llu)\n",
+                static_cast<unsigned long long>(keep_count),
+                static_cast<unsigned long long>(keep_bytes),
+                static_cast<unsigned long long>(buf_bytes));
+    CHECK_TRUE(keep_count == 1 && keep_bytes == buf_bytes,
+               (dev_name + " kept trace allocates exactly its one output").c_str());
+    CHECK_TRUE(kept.data != nullptr && kept.jit_slot < 0 &&
+                   kept.rows == R && kept.cols == D,
+               (dev_name + " kept result owns a real buffer after end_trace()").c_str());
+
+    brotensor::sync(dev);
+    CHECK_PARITY(max_abs_diff(kept.to_host_vector(), ref.to_host_vector()), 1e-4f,
+                 (dev_name + " kept trace is numerically correct").c_str());
+
+    // ── copying a traced intermediate is rejected ────────────────────────
+    //
+    // It stands for a node of the trace and owns nothing, so there is no
+    // meaning to give a copy. Better a clear throw than an empty tensor.
+    bool threw = false;
+    begin_trace();
+    try {
+        Tensor sym = jit::silu(x);
+        Tensor copy = sym;   // no meaning: throws
+        (void)copy;
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    abort_trace();
+    CHECK_TRUE(threw, (dev_name + " copying a traced intermediate throws").c_str());
+
+    // ── abort_trace() leaves held tensors sane ───────────────────────────
+    //
+    // The eager fallback path: nothing was compiled, so nothing holds a
+    // value, and every symbolic tensor the caller kept is an empty tensor it
+    // can assign over.
+    begin_trace();
+    Tensor aborted = jit::silu(x) * y;
+    abort_trace();
+    CHECK_TRUE(aborted.data == nullptr && aborted.jit_slot < 0 && aborted.empty(),
+               (dev_name + " abort_trace() neutralises held intermediates").c_str());
+    aborted = Tensor::empty_on(dev, R, D);   // and it is an ordinary tensor again
+    brotensor::silu_forward(x, aborted);
+    brotensor::sync(dev);
+    CHECK_TRUE(aborted.rows == R, (dev_name + " a neutralised tensor is reusable").c_str());
+}
+
 } // namespace
 
 int main() {
@@ -385,6 +507,7 @@ int main() {
     test_residual_rmsnorm(Device::cpu());
     test_layernorm_modulate(Device::cpu());
     test_cache_hit_and_speedup(Device::cpu());
+    test_trace_allocates_nothing(Device::cpu());
 
     // Run CUDA test suite if CUDA device is available
     if (brotensor::is_available(Device::cuda())) {
@@ -393,6 +516,7 @@ int main() {
         test_residual_rmsnorm(Device::cuda());
         test_layernorm_modulate(Device::cuda());
         test_cache_hit_and_speedup(Device::cuda());
+        test_trace_allocates_nothing(Device::cuda());
     } else {
         std::printf("\n[SKIP] CUDA device not available or not detected; skipping CUDA tests.\n");
     }

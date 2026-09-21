@@ -52,7 +52,19 @@ struct TraceNode {
     std::vector<int> inputs;
     std::vector<int> outputs; // consumer node indices
     float scalar = 0.0f;
-    void* buffer = nullptr; // destination or input data pointer
+    // Destination or input data pointer — and null for every node the fused
+    // kernel evaluates in registers and never spills.
+    //
+    // A buffer is present on exactly three kinds of node: an Input and an
+    // in-place target, whose storage the caller owns and whose address is
+    // therefore stable for the whole trace; a store() destination, likewise
+    // caller-owned; and a live-at-end intermediate, which end_trace()
+    // allocates and installs into the Tensor the caller is still holding.
+    // Every other node — every dead intermediate — carries a null buffer and
+    // is addressed by `id` alone, which is the reason the tracer no longer
+    // allocates a full-size tensor per traced op. Nothing hashes the buffer,
+    // so a null one cannot collide two different traces.
+    void* buffer = nullptr;
     Device device = Device::CPU;
     Dtype dtype = Dtype::FP32;
     int rows = 0;
@@ -95,25 +107,70 @@ private:
     std::unordered_map<const void*, int> input_ptr_to_slot_;
 };
 
+// ─── TraceContext ───────────────────────────────────────────────────────────
+//
+// The thread's trace in progress, and the symbolic tensors it has handed out.
+//
+// A traced op does not produce a tensor; it produces a *name* for a node of
+// the DAG. record_op() returns that name as a Tensor with a null `data`, a
+// real shape/dtype/device and `jit_slot` set — so the expression the caller
+// wrote goes on type-checking and composing exactly as before while allocating
+// nothing. Node identity follows suit: a symbolic operand is identified by its
+// slot, and only a caller-owned buffer (an input, an in-place target, a store()
+// destination) is still identified by its pointer, which is safe precisely
+// because the caller owns it and it cannot be recycled mid-trace.
+//
+// The catch a tracked-pointer table solves: a value the caller still holds
+// when the trace closes has to end up owning a real buffer it can read from.
+// Every symbolic Tensor handed out is recorded here as slot -> Tensor*, and
+// Tensor's move ctor / move assignment / destructor keep that table pointing
+// at wherever the caller moved the value (see detail::jit_slot_retarget in
+// tensor.h). end() then allocates for exactly those slots.
 class TraceContext {
 public:
     static TraceContext& current();
 
     void begin();
+    // Runs liveness, gives every still-held live-at-end intermediate a real
+    // buffer, and returns the DAG. Any symbolic Tensor the caller still holds
+    // whose value the fused kernel only consumes internally is neutralised to
+    // an empty tensor — its contents were never computed to memory.
     TraceDAG end();
-    // Throws away a trace in progress. Leaves the context idle.
+    // Throws away a trace in progress and neutralises every symbolic Tensor
+    // the caller still holds to an empty tensor. Leaves the context idle.
     void discard();
     bool is_active() const noexcept { return active_; }
 
     int get_or_register_slot(const Tensor& t);
-    int record_op(TraceOpKind op, const std::vector<int>& in_slots, float scalar, const Tensor& out_tensor);
-    int record_inplace_op(TraceOpKind op, int target_slot, int arg_slot, float scalar, const Tensor& target_tensor);
+
+    // Records `op` and returns the symbolic Tensor standing for its result.
+    Tensor record_op(TraceOpKind op, const std::vector<int>& in_slots, float scalar,
+                     const Device& dev, Dtype dt, int rows, int cols);
+
+    // Records a Copy into `dst`, a buffer the caller already owns.
+    void record_store(int src_slot, const Tensor& dst);
+
+    int record_inplace_op(TraceOpKind op, int target_slot, int arg_slot, float scalar,
+                          Tensor& target_tensor);
+
+    // Tensor lifetime callback: the symbolic Tensor for `slot` moved from
+    // `from` to `to`, or was destroyed (`to` == nullptr). Never throws and
+    // never allocates — Tensor's move and destructor are noexcept.
+    void retarget(int slot, const Tensor* from, Tensor* to) noexcept;
 
 private:
     TraceContext() = default;
+
+    // Allocates and installs the buffers for live-at-end nodes that do not
+    // already have one; demotes a live-at-end node nobody can observe.
+    void materialize_();
+    // Turns every still-tracked symbolic Tensor into an ordinary empty one.
+    void release_tracked_() noexcept;
+
     bool active_ = false;
     TraceDAG dag_;
     std::unordered_map<const void*, int> active_ptr_to_slot_;
+    std::unordered_map<int, Tensor*> slot_to_tensor_;
 };
 
 } // namespace brotensor::jit

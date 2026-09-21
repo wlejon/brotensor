@@ -196,19 +196,89 @@ TraceContext& TraceContext::current() {
     return instance;
 }
 
+namespace {
+
+// The hook Tensor calls from its move ctor / move assignment / destructor.
+// Installed by begin(), which is the earliest point at which a symbolic
+// tensor can exist, so there is no static-initialisation order to get wrong.
+void slot_retarget(int slot, const Tensor* from, Tensor* to) {
+    TraceContext::current().retarget(slot, from, to);
+}
+
+}  // namespace
+
+void TraceContext::retarget(int slot, const Tensor* from, Tensor* to) noexcept {
+    auto it = slot_to_tensor_.find(slot);
+    // A stale entry — the slot was already materialised or re-tracked — must
+    // not be clobbered by a tensor that no longer stands for it.
+    if (it == slot_to_tensor_.end() || it->second != from) return;
+    if (to) {
+        it->second = to;
+    } else {
+        slot_to_tensor_.erase(it);
+    }
+}
+
+void TraceContext::release_tracked_() noexcept {
+    for (auto& kv : slot_to_tensor_) {
+        Tensor* t = kv.second;
+        if (!t) continue;
+        // It never owned anything, and its value was never written anywhere,
+        // so the honest result is an empty tensor rather than a shape with no
+        // storage behind it.
+        t->jit_slot = -1;
+        t->rows = 0;
+        t->cols = 0;
+    }
+    slot_to_tensor_.clear();
+}
+
 void TraceContext::begin() {
     if (active_) {
         throw std::runtime_error("brotensor::jit: Nested begin_trace() calls are not permitted");
     }
+    detail::jit_slot_retarget = &slot_retarget;
     dag_.reset();
     active_ptr_to_slot_.clear();
+    release_tracked_();
     active_ = true;
 }
 
 void TraceContext::discard() {
     dag_.reset();
     active_ptr_to_slot_.clear();
+    release_tracked_();
     active_ = false;
+}
+
+void TraceContext::materialize_() {
+    for (TraceNode& n : dag_.nodes()) {
+        if (!n.is_live_at_end) continue;
+        if (n.buffer != nullptr) continue;  // caller already owns the storage
+
+        auto it = slot_to_tensor_.find(n.id);
+        if (it == slot_to_tensor_.end() || it->second == nullptr) {
+            // The caller dropped the Tensor, so nothing can read this value.
+            // Leave it an interior value of the fused kernel rather than
+            // allocating a buffer no one will look at.
+            n.is_live_at_end = false;
+            continue;
+        }
+
+        Tensor* held = it->second;
+        Tensor buf = Tensor::empty_on(n.device, n.rows, n.cols, n.dtype);
+        if (buf.data == nullptr) {
+            n.is_live_at_end = false;
+            continue;
+        }
+        // Drop the tracking first: the move assignment below must see an
+        // ordinary tensor on both sides, or it would retarget the slot it is
+        // in the middle of retiring.
+        slot_to_tensor_.erase(it);
+        held->jit_slot = -1;
+        *held = std::move(buf);
+        n.buffer = held->data;
+    }
 }
 
 TraceDAG TraceContext::end() {
@@ -216,17 +286,39 @@ TraceDAG TraceContext::end() {
         throw std::runtime_error("brotensor::jit: end_trace() called without matching begin_trace()");
     }
     dag_.analyze_liveness();
+    materialize_();
     active_ = false;
     active_ptr_to_slot_.clear();
+    // Whatever is still tracked stands for a value the fused kernel only ever
+    // holds in registers; there is nothing to hand back.
+    release_tracked_();
+
+    bool any_output = false;
+    for (const TraceNode& n : dag_.nodes()) {
+        if (n.is_live_at_end) { any_output = true; break; }
+    }
+    if (!any_output) {
+        dag_.reset();
+        throw std::runtime_error(
+            "brotensor::jit: the trace has no observable result — every value it "
+            "produced was dropped before end_trace(), so there is nothing for the "
+            "fused kernel to write. Keep the result Tensor alive across "
+            "end_trace(), store() it into a buffer you own, or write in place "
+            "into one of the inputs");
+    }
     return std::move(dag_);
 }
 
 int TraceContext::get_or_register_slot(const Tensor& t) {
-    // A traced op's output Tensor owns its buffer and frees it when the
-    // enclosing expression ends, so an address seen earlier in this trace can
-    // be handed back by the allocator to a different tensor. Confirm the
-    // recorded node still describes the tensor in hand before reusing its
-    // slot; a mismatch means the entry is stale and the buffer is a new input.
+    // A symbolic intermediate already *is* a node: it names its own slot, and
+    // it has no buffer to key on.
+    if (t.jit_slot >= 0) return t.jit_slot;
+
+    // Everything else is caller-owned storage, keyed on its address. The
+    // address is stable for the trace's lifetime because the caller owns it —
+    // but a slot recorded earlier can still be stale if that tensor was freed
+    // and its address reused, so confirm the node still describes the tensor
+    // in hand before reusing its slot.
     auto it = active_ptr_to_slot_.find(t.data);
     if (it != active_ptr_to_slot_.end() && dag_.slot_matches(it->second, t)) {
         return it->second;
@@ -236,16 +328,46 @@ int TraceContext::get_or_register_slot(const Tensor& t) {
     return slot;
 }
 
-int TraceContext::record_op(TraceOpKind op, const std::vector<int>& in_slots, float scalar, const Tensor& out_tensor) {
-    int slot = dag_.add_node(op, in_slots, scalar, out_tensor.data,
-                             out_tensor.device, out_tensor.dtype, out_tensor.rows, out_tensor.cols);
-    active_ptr_to_slot_[out_tensor.data] = slot;
-    return slot;
+Tensor TraceContext::record_op(TraceOpKind op, const std::vector<int>& in_slots,
+                               float scalar, const Device& dev, Dtype dt,
+                               int rows, int cols) {
+    const int slot = dag_.add_node(op, in_slots, scalar, /*buffer=*/nullptr,
+                                   dev, dt, rows, cols);
+    Tensor out;
+    out.device = dev;
+    out.dtype = dt;
+    out.rows = rows;
+    out.cols = cols;
+    out.jit_slot = slot;
+    // With copy elision `out` is already the caller's object; without it, the
+    // move ctor retargets this entry onto wherever it lands.
+    slot_to_tensor_[slot] = &out;
+    return out;
 }
 
-int TraceContext::record_inplace_op(TraceOpKind op, int target_slot, int arg_slot, float scalar, const Tensor& target_tensor) {
+void TraceContext::record_store(int src_slot, const Tensor& dst) {
+    if (dst.jit_slot >= 0) {
+        throw std::runtime_error(
+            "brotensor::jit: store() needs a destination the caller owns; its "
+            "target is a traced intermediate, which has no buffer to write to");
+    }
+    const int slot = dag_.add_node(TraceOpKind::Copy, {src_slot}, 0.0f, dst.data,
+                                   dst.device, dst.dtype, dst.rows, dst.cols);
+    active_ptr_to_slot_[dst.data] = slot;
+}
+
+int TraceContext::record_inplace_op(TraceOpKind op, int target_slot, int arg_slot,
+                                    float scalar, Tensor& target_tensor) {
     int slot = dag_.add_inplace_node(op, target_slot, arg_slot, target_tensor.data, scalar);
-    active_ptr_to_slot_[target_tensor.data] = slot;
+    if (target_tensor.jit_slot >= 0) {
+        // In-place on a traced intermediate: it has no buffer, and from here
+        // on it stands for the node this op just produced.
+        slot_to_tensor_.erase(target_tensor.jit_slot);
+        target_tensor.jit_slot = slot;
+        slot_to_tensor_[slot] = &target_tensor;
+    } else {
+        active_ptr_to_slot_[target_tensor.data] = slot;
+    }
     return slot;
 }
 

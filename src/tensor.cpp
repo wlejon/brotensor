@@ -9,6 +9,7 @@
 #include <brotensor/runtime.h>
 #include <brotensor/detail/dispatch.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -283,8 +284,16 @@ void check_dtype(const Tensor& t, Dtype expected, const char* who) {
     }
 }
 
+// Allocation accounting. Two relaxed atomics on a path that is already an
+// allocator call, so the cost is nil; see AllocStats in tensor.h for why the
+// counters exist at all.
+std::atomic<std::uint64_t> g_alloc_count{0};
+std::atomic<std::uint64_t> g_alloc_bytes{0};
+
 void* backend_alloc(Device d, std::size_t bytes) {
     if (bytes == 0) return nullptr;
+    g_alloc_count.fetch_add(1, std::memory_order_relaxed);
+    g_alloc_bytes.fetch_add(bytes, std::memory_order_relaxed);
     return detail::alloc_for(d).alloc(bytes, d.index);
 }
 
@@ -300,9 +309,46 @@ void backend_zero(Device d, void* p, std::size_t bytes) {
 
 } // namespace
 
+// ─── jit symbolic-tensor tracking ──────────────────────────────────────────
+
+namespace detail {
+// Null until brotensor::jit starts a trace. See tensor.h.
+JitSlotRetargetHook jit_slot_retarget = nullptr;
+}  // namespace detail
+
+namespace {
+
+// Tensor is 48 bytes on a 64-bit build. The only hole in the 40-byte layout
+// it had before `jit_slot` was the three bytes after `owns_`, which a
+// four-byte field cannot use, so the tag cost one alignment word. Pinned so a
+// future field lands by decision rather than by accident.
+static_assert(sizeof(void*) != 8 || sizeof(Tensor) == 48,
+              "brotensor::Tensor layout changed unexpectedly");
+
+[[noreturn]] void throw_symbolic(const char* who) {
+    std::string m = "brotensor: ";
+    m += who;
+    m += ": this Tensor is a traced intermediate, not a tensor. It stands for "
+         "a node of the trace being recorded between begin_trace() and "
+         "end_trace(), owns no memory, and has no contents to read or copy — "
+         "two Tensors cannot both become the one buffer end_trace() allocates "
+         "for it. Use it in the expression, move it, or store() it into a "
+         "buffer you already own.";
+    throw std::runtime_error(m);
+}
+
+inline void check_not_symbolic(const Tensor& t, const char* who) {
+    if (t.jit_slot >= 0) throw_symbolic(who);
+}
+
+}  // namespace
+
 // ─── Tensor lifetime ───────────────────────────────────────────────────────
 
 Tensor::~Tensor() {
+    if (jit_slot >= 0 && detail::jit_slot_retarget) {
+        detail::jit_slot_retarget(jit_slot, this, nullptr);
+    }
     release_();
 }
 
@@ -318,19 +364,30 @@ void Tensor::release_() {
     cap_bytes_ = 0;
 }
 
+// Move: a symbolic traced intermediate moves like any other tensor, and the
+// jit's slot -> Tensor* table is retargeted onto the new object so end_trace()
+// still knows where the caller is holding that value.
 Tensor::Tensor(Tensor&& o) noexcept
     : data(o.data), rows(o.rows), cols(o.cols),
-      dtype(o.dtype), device(o.device), owns_(o.owns_),
+      dtype(o.dtype), device(o.device), jit_slot(o.jit_slot), owns_(o.owns_),
       cap_bytes_(o.cap_bytes_) {
     o.data = nullptr;
     o.rows = 0;
     o.cols = 0;
     o.owns_ = false;
     o.cap_bytes_ = 0;
+    if (jit_slot >= 0) {
+        o.jit_slot = -1;
+        if (detail::jit_slot_retarget) detail::jit_slot_retarget(jit_slot, &o, this);
+    }
 }
 
 Tensor& Tensor::operator=(Tensor&& o) noexcept {
     if (this != &o) {
+        if (jit_slot >= 0 && detail::jit_slot_retarget) {
+            detail::jit_slot_retarget(jit_slot, this, nullptr);
+        }
+        jit_slot = -1;
         release_();
         data   = o.data;
         rows    = o.rows;
@@ -344,19 +401,30 @@ Tensor& Tensor::operator=(Tensor&& o) noexcept {
         o.cols  = 0;
         o.owns_ = false;
         o.cap_bytes_ = 0;
+        if (o.jit_slot >= 0) {
+            jit_slot = o.jit_slot;
+            o.jit_slot = -1;
+            if (detail::jit_slot_retarget) detail::jit_slot_retarget(jit_slot, &o, this);
+        }
     }
     return *this;
 }
 
 // Copy ctor / assignment: device-aware deep copy via clone(). Implemented in
 // terms of the move assignment so all the ownership bookkeeping lives in one
-// place.
+// place. A symbolic traced intermediate has no contents to copy and cannot be
+// owned twice, so copying one is rejected rather than silently producing an
+// empty tensor.
 Tensor::Tensor(const Tensor& o) {
+    check_not_symbolic(o, "copy");
     *this = o.clone();
 }
 
 Tensor& Tensor::operator=(const Tensor& o) {
-    if (this != &o) *this = o.clone();
+    if (this != &o) {
+        check_not_symbolic(o, "copy");
+        *this = o.clone();
+    }
     return *this;
 }
 
@@ -492,6 +560,7 @@ Tensor Tensor::view(Device d, void* data, int r, int c, Dtype dt) {
 // ─── Migration ─────────────────────────────────────────────────────────────
 
 Tensor Tensor::clone() const {
+    check_not_symbolic(*this, "clone");
     Tensor t = empty_on(device, rows, cols, dtype);
     const std::size_t n = bytes();
     if (n == 0 || !data) return t;
@@ -504,6 +573,7 @@ Tensor Tensor::clone() const {
 }
 
 Tensor Tensor::to(Device target) const {
+    check_not_symbolic(*this, "to");
     if (target == device) return clone();
     Tensor t = empty_on(target, rows, cols, dtype);
     const std::size_t n = bytes();
@@ -541,6 +611,7 @@ void Tensor::zero() {
 }
 
 void Tensor::resize(int r, int c, Dtype dt) {
+    check_not_symbolic(*this, "resize");
     check_dims(r, c, "resize");
     if (r == rows && c == cols && dt == dtype && data != nullptr) return;
     const std::size_t new_bytes = dtype_storage_bytes(
@@ -716,6 +787,15 @@ void Tensor::copy_to_host_bf16(uint16_t* dst) const {
     } else {
         detail::alloc_for(device).memcpy_d2h(dst, data, n, device.index);
     }
+}
+
+// ─── Allocation accounting ─────────────────────────────────────────────────
+
+AllocStats alloc_stats() {
+    AllocStats s;
+    s.count = g_alloc_count.load(std::memory_order_relaxed);
+    s.bytes = g_alloc_bytes.load(std::memory_order_relaxed);
+    return s;
 }
 
 } // namespace brotensor

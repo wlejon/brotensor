@@ -374,12 +374,15 @@ void bench_compile_cost(Device dev) {
         double first_us = 0.0, hit_us = 0.0;
         const bool row_norm = (std::string(cs.name).rfind("row-norm", 0) == 0);
 
+        // `out` outlives end_trace(): a traced result has to be somewhere the
+        // caller still holds when the trace closes, or there is nothing for
+        // the fused kernel to write and nothing to time. (Dropping it inside
+        // the lambda used to leave the DAG pointing at a freed buffer.)
+        Tensor out;
         auto build = [&]() {
             begin_trace();
             if (row_norm) {
-                Tensor ln = jit::layernorm(x, g, beta, 1e-6f);
-                Tensor o = jit::modulate(ln, g, shift);
-                (void)o;
+                out = jit::modulate(jit::layernorm(x, g, beta, 1e-6f), g, shift);
             } else {
                 x += g * y;
             }
