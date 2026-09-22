@@ -71,6 +71,12 @@ void layernorm_forward_inference_batched(const Tensor& X_RD,
                                          Tensor& Y_RD,
                                          float eps);
 
+// Bias-free LayerNorm forward inference: computes y = gamma * xhat without adding beta.
+void layernorm_forward_inference_batched(const Tensor& X_RD,
+                                         const Tensor& gamma,
+                                         Tensor& Y_RD,
+                                         float eps);
+
 
 // GroupNorm forward, NCHW. Dispatched on X.dtype (FP32/FP16); gamma, beta, Y
 // share it. FP32 accumulation.
@@ -129,6 +135,12 @@ void l2_normalize_nchw_forward(const Tensor& X,
 void layernorm_forward_inference_batched_fp16(const Tensor& X_RD,
                                               const Tensor& gamma,
                                               const Tensor& beta,
+                                              Tensor& Y_RD,
+                                              float eps);
+
+// Bias-free FP16 LayerNorm forward inference: computes y = gamma * xhat without adding beta.
+void layernorm_forward_inference_batched_fp16(const Tensor& X_RD,
+                                              const Tensor& gamma,
                                               Tensor& Y_RD,
                                               float eps);
 

@@ -173,7 +173,8 @@ void attention_core(const float* Q, const float* K, const float* V,
             for (int k = 0; k < Lk; ++k) {
                 if (mask && mask[k] <= 0.5f)        { scores[k] = -1e30f; continue; }
                 if (causal && k > aq)               { scores[k] = -1e30f; continue; }
-                if (window > 0 && k <= aq - window) { scores[k] = -1e30f; continue; }
+                if (causal && window > 0 && k <= aq - window) { scores[k] = -1e30f; continue; }
+                if (!causal && window > 0 && std::abs(k - aq) > window / 2) { scores[k] = -1e30f; continue; }
                 const float* qr = Q + static_cast<std::size_t>(q) * D + off;
                 const float* kr = K + static_cast<std::size_t>(k) * Dkv + off_kv;
                 float dot = 0.0f;
@@ -423,7 +424,8 @@ void flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
                                       const float* d_mask,
                                       int num_heads,
                                       int window,
-                                      ::brotensor::Tensor& O) {
+                                      ::brotensor::Tensor& O,
+                                      bool causal) {
     const int Lq = Q.rows;
     const int Lk = K.rows;
     const int D    = Q.cols;       // Dq = num_heads * head_dim
@@ -444,7 +446,7 @@ void flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
     attention_core(Q.host_f32(), K.host_f32(), V.host_f32(), d_mask,
-                   Lq, Lk, D, num_heads, /*causal=*/true, O.host_f32_mut(),
+                   Lq, Lk, D, num_heads, causal, O.host_f32_mut(),
                    nullptr, window, /*q_offset=*/Lk - Lq, Dkv,
                    /*group=*/num_heads / n_kv);
 }

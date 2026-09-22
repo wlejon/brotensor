@@ -180,6 +180,14 @@ void add_channel_bias_inplace(Tensor& y, const Tensor& bias, int C, int L) {
     v.add_channel_bias_inplace(y, bias, C, L);
 }
 
+void add_row_bias_inplace(Tensor& Y, const Tensor& bias) {
+    const auto& v = detail::dispatch(Y, bias);
+    if (!v.add_row_bias_inplace)
+        detail::throw_not_implemented("add_row_bias_inplace", Y.device);
+    detail::adopt_output(Y, Y.device);
+    v.add_row_bias_inplace(Y, bias);
+}
+
 void scale_inplace(Tensor& y, float s) {
     const auto& v = detail::dispatch(y);
     if (!v.scale_inplace) detail::throw_not_implemented("scale_inplace", y.device);
@@ -535,7 +543,17 @@ void layernorm_forward_inference_batched(const Tensor& X_RD,
     if (!v.layernorm_forward_inference_batched)
         detail::throw_not_implemented("layernorm_forward_inference_batched", X_RD.device);
     detail::adopt_output(Y_RD, X_RD.device);
-    v.layernorm_forward_inference_batched(X_RD, gamma, beta, Y_RD, eps);
+    v.layernorm_forward_inference_batched(X_RD, gamma, &beta, Y_RD, eps);
+}
+
+void layernorm_forward_inference_batched(const Tensor& X_RD,
+                                         const Tensor& gamma,
+                                         Tensor& Y_RD, float eps) {
+    const auto& v = detail::dispatch(X_RD, gamma, Y_RD);
+    if (!v.layernorm_forward_inference_batched)
+        detail::throw_not_implemented("layernorm_forward_inference_batched", X_RD.device);
+    detail::adopt_output(Y_RD, X_RD.device);
+    v.layernorm_forward_inference_batched(X_RD, gamma, nullptr, Y_RD, eps);
 }
 
 void layernorm_forward_batched_with_caches(const Tensor& X_RD,
@@ -1336,7 +1354,17 @@ void layernorm_forward_inference_batched_fp16(const Tensor& X_RD,
     if (!v.layernorm_forward_inference_batched_fp16)
         detail::throw_not_implemented("layernorm_forward_inference_batched_fp16", X_RD.device);
     detail::adopt_output(Y_RD, X_RD.device);
-    v.layernorm_forward_inference_batched_fp16(X_RD, gamma, beta, Y_RD, eps);
+    v.layernorm_forward_inference_batched_fp16(X_RD, gamma, &beta, Y_RD, eps);
+}
+
+void layernorm_forward_inference_batched_fp16(const Tensor& X_RD,
+                                              const Tensor& gamma,
+                                              Tensor& Y_RD, float eps) {
+    const auto& v = detail::dispatch(X_RD, gamma, Y_RD);
+    if (!v.layernorm_forward_inference_batched_fp16)
+        detail::throw_not_implemented("layernorm_forward_inference_batched_fp16", X_RD.device);
+    detail::adopt_output(Y_RD, X_RD.device);
+    v.layernorm_forward_inference_batched_fp16(X_RD, gamma, nullptr, Y_RD, eps);
 }
 
 void self_attention_forward(const Tensor& X,
@@ -1455,12 +1483,12 @@ void flash_attention_gqa_forward(const Tensor& Q, const Tensor& K, const Tensor&
 
 void flash_attention_windowed_forward(const Tensor& Q, const Tensor& K, const Tensor& V,
                                       const float* d_mask, int num_heads, int window,
-                                      Tensor& O) {
+                                      Tensor& O, bool causal) {
     const auto& v = detail::dispatch(Q, K, V, O);
     if (!v.flash_attention_windowed_forward)
         detail::throw_not_implemented("flash_attention_windowed_forward", Q.device);
     detail::adopt_output(O, Q.device);
-    v.flash_attention_windowed_forward(Q, K, V, d_mask, num_heads, window, O);
+    v.flash_attention_windowed_forward(Q, K, V, d_mask, num_heads, window, O, causal);
 }
 
 void flash_attention_varlen_forward(const Tensor& Q, const Tensor& K, const Tensor& V,

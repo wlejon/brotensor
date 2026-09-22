@@ -135,4 +135,53 @@ void cast(const ::brotensor::Tensor& src, ::brotensor::Tensor& dst,
     }
 }
 
+void add_row_bias_inplace(::brotensor::Tensor& Y, const ::brotensor::Tensor& bias) {
+    using ::brotensor::Dtype;
+    if (Y.dtype != bias.dtype) {
+        throw std::runtime_error("add_row_bias_inplace: dtype mismatch");
+    }
+    if (bias.size() != Y.cols) {
+        throw std::runtime_error("add_row_bias_inplace: bias size != Y.cols");
+    }
+    const int R = Y.rows;
+    const int D = Y.cols;
+    const int n = R * D;
+    if (n == 0) return;
+
+    if (Y.dtype == Dtype::FP32) {
+        float* yp = Y.host_f32_mut();
+        const float* bp = bias.host_f32();
+        for (int r = 0; r < R; ++r) {
+            float* yrow = yp + static_cast<std::size_t>(r) * D;
+            for (int d = 0; d < D; ++d) {
+                yrow[d] += bp[d];
+            }
+        }
+    } else if (Y.dtype == Dtype::FP16) {
+        std::uint16_t* yp = Y.host_fp16_mut();
+        const std::uint16_t* bp = bias.host_fp16();
+        for (int r = 0; r < R; ++r) {
+            std::uint16_t* yrow = yp + static_cast<std::size_t>(r) * D;
+            for (int d = 0; d < D; ++d) {
+                float v = ::brotensor::fp16_bits_to_fp32(yrow[d]) +
+                          ::brotensor::fp16_bits_to_fp32(bp[d]);
+                yrow[d] = ::brotensor::fp32_to_fp16_bits(v);
+            }
+        }
+    } else if (Y.dtype == Dtype::BF16) {
+        std::uint16_t* yp = Y.host_bf16_mut();
+        const std::uint16_t* bp = bias.host_bf16();
+        for (int r = 0; r < R; ++r) {
+            std::uint16_t* yrow = yp + static_cast<std::size_t>(r) * D;
+            for (int d = 0; d < D; ++d) {
+                float v = ::brotensor::bf16_bits_to_fp32(yrow[d]) +
+                          ::brotensor::bf16_bits_to_fp32(bp[d]);
+                yrow[d] = ::brotensor::fp32_to_bf16_bits(v);
+            }
+        }
+    } else {
+        throw std::runtime_error("add_row_bias_inplace: unsupported dtype");
+    }
+}
+
 } // namespace brotensor::detail::cpu

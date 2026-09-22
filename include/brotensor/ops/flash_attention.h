@@ -49,14 +49,17 @@ void flash_attention_gqa_forward(const Tensor& Q,
                                  Tensor& O);
 
 
-// Sliding-window causal self-attention (FP32, inference-only) — the local
-// attention of streaming neural codecs (e.g. Qwen3-TTS / Mimi) and the
-// autoregressive decode step. Q, K, V already projected, (L, num_heads*head_dim).
-// Always causal. The Lq queries occupy the last Lq positions of a length-Lk
-// causal sequence (q_offset = Lk - Lq): query row r is at absolute position
-// r + q_offset and attends keys [max(0, pos-window+1), pos]. window <= 0 means
-// unbounded causal — identical to flash_attention_forward with causal=true.
-//   - Lq == Lk: self-attention (prefill / codec sliding window).
+// Sliding-window self-attention (FP32/FP16/BF16, inference-only) — the local
+// attention of streaming neural codecs (e.g. Qwen3-TTS / Mimi), autoregressive decode,
+// and bidirectional encoder models (e.g. ModernBERT). Q, K, V already projected,
+// (L, num_heads*head_dim).
+// The Lq queries occupy the last Lq positions of a length-Lk sequence
+// (q_offset = Lk - Lq): query row r is at absolute position aq = r + q_offset.
+//   - causal == true: attends keys [max(0, aq-window+1), aq]. window <= 0 means
+//     unbounded causal — identical to flash_attention_forward with causal=true.
+//   - causal == false: attends keys [max(0, aq - window/2), min(Lk - 1, aq + window/2)]
+//     when window > 0, or all keys [0, Lk) when window <= 0 (full bidirectional).
+//   - Lq == Lk: self-attention (prefill / codec sliding window / encoder).
 //   - Lq  < Lk: incremental decode of an Lq-token block over a K/V cache;
 //     Lq == 1 with window <= 0 attends every cached key (full cache attention),
 //     replacing a varlen call with no cu_seqlens upload. Requires Lk >= Lq.
@@ -69,7 +72,8 @@ void flash_attention_windowed_forward(const Tensor& Q,
                                       const float* d_mask,
                                       int num_heads,
                                       int window,
-                                      Tensor& O);
+                                      Tensor& O,
+                                      bool causal = true);
 
 
 // Packed variable-length multi-head attention, forward only (Qwen3-VL window

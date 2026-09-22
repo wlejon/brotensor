@@ -32,6 +32,11 @@ void add_scalar_inplace(Tensor& y, float s);
 void add_channel_bias_inplace(Tensor& y, const Tensor& bias, int C, int L);
 
 
+// Row-broadcast bias add for a row-major (R,D) tensor: Y[r, d] += bias[d].
+// Y carries R*D elements; bias carries D. Dispatched FP32/FP16/BF16 on Y.dtype.
+void add_row_bias_inplace(Tensor& Y, const Tensor& bias);
+
+
 // y[i] *= s. Dispatched FP32/FP16 on y.dtype.
 void scale_inplace(Tensor& y, float s);
 

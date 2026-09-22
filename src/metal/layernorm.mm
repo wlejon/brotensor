@@ -241,6 +241,7 @@ kernel void k_ln_forward_inference_batched(device const float* x      [[buffer(0
                                            constant uint& R           [[buffer(4)]],
                                            constant uint& D           [[buffer(5)]],
                                            constant float& eps        [[buffer(6)]],
+                                           constant uint& has_beta    [[buffer(7)]],
                                            uint row [[threadgroup_position_in_grid]],
                                            uint tid [[thread_position_in_threadgroup]],
                                            uint tg_size [[threads_per_threadgroup]]) {
@@ -273,7 +274,8 @@ kernel void k_ln_forward_inference_batched(device const float* x      [[buffer(0
     float rstd = rsqrt(var + eps);
     for (uint i = tid; i < D; i += tg_size) {
         float xh = (xrow[i] - mean) * rstd;
-        yrow[i] = xh * gamma[i] + beta[i];
+        float b = (has_beta != 0u) ? beta[i] : 0.0f;
+        yrow[i] = xh * gamma[i] + b;
     }
 }
 )msl";
@@ -489,7 +491,7 @@ void layernorm_backward(const Tensor& dY, const Tensor& xhat,
 
 void layernorm_forward_inference_batched(const Tensor& X_RD,
                                          const Tensor& gamma,
-                                         const Tensor& beta,
+                                         const Tensor* beta,
                                          Tensor& Y_RD,
                                          float eps) {
     const int R = X_RD.rows;
@@ -501,12 +503,13 @@ void layernorm_forward_inference_batched(const Tensor& X_RD,
     NSUInteger ox = buffer_offset_for(X_RD);
     id<MTLBuffer> bg = buffer_for(gamma);
     NSUInteger og = buffer_offset_for(gamma);
-    id<MTLBuffer> bb = buffer_for(beta);
-    NSUInteger ob = buffer_offset_for(beta);
+    id<MTLBuffer> bb = beta ? buffer_for(*beta) : bg;
+    NSUInteger ob = beta ? buffer_offset_for(*beta) : 0;
     id<MTLBuffer> by = buffer_for(Y_RD);
     NSUInteger oy = buffer_offset_for(Y_RD);
     const uint32_t Ru = static_cast<uint32_t>(R);
     const uint32_t Du = static_cast<uint32_t>(D);
+    const uint32_t has_beta = beta ? 1u : 0u;
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = new_command_buffer();
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -518,6 +521,7 @@ void layernorm_forward_inference_batched(const Tensor& X_RD,
         [enc setBytes:&Ru length:sizeof(uint32_t) atIndex:4];
         [enc setBytes:&Du length:sizeof(uint32_t) atIndex:5];
         [enc setBytes:&eps length:sizeof(float) atIndex:6];
+        [enc setBytes:&has_beta length:sizeof(uint32_t) atIndex:7];
         [enc dispatchThreadgroups:MTLSizeMake(R, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(LN_BLOCK, 1, 1)];
         [enc endEncoding];
@@ -541,6 +545,7 @@ kernel void k_ln_forward_inference_batched_fp16(
         constant uint& R          [[buffer(4)]],
         constant uint& D          [[buffer(5)]],
         constant float& eps       [[buffer(6)]],
+        constant uint& has_beta   [[buffer(7)]],
         uint row [[threadgroup_position_in_grid]],
         uint tid [[thread_position_in_threadgroup]],
         uint tg_size [[threads_per_threadgroup]]) {
@@ -574,7 +579,7 @@ kernel void k_ln_forward_inference_batched_fp16(
     for (uint i = tid; i < D; i += tg_size) {
         float xh = (float(xrow[i]) - mean) * rstd;
         float g  = float(gamma[i]);
-        float b  = float(beta[i]);
+        float b  = (has_beta != 0u) ? float(beta[i]) : 0.0f;
         yrow[i] = half(xh * g + b);
     }
 }
@@ -593,11 +598,11 @@ id<MTLComputePipelineState> pso_fw_inf_fp16() {
 
 void layernorm_forward_inference_batched_fp16(const Tensor& X_RD,
                                               const Tensor& gamma,
-                                              const Tensor& beta,
+                                              const Tensor* beta,
                                               Tensor& Y_RD,
                                               float eps) {
     if (X_RD.dtype != Dtype::FP16 || gamma.dtype != Dtype::FP16 ||
-        beta.dtype != Dtype::FP16) {
+        (beta && beta->dtype != Dtype::FP16)) {
         throw std::runtime_error("layernorm_forward_inference_batched_fp16: all tensors must be FP16");
     }
     const int R = X_RD.rows;
@@ -609,14 +614,15 @@ void layernorm_forward_inference_batched_fp16(const Tensor& X_RD,
     id<MTLComputePipelineState> pso = pso_fw_inf_fp16();
     id<MTLBuffer> bx = buffer_for(X_RD);
     id<MTLBuffer> bg = buffer_for(gamma);
-    id<MTLBuffer> bb = buffer_for(beta);
+    id<MTLBuffer> bb = beta ? buffer_for(*beta) : bg;
     id<MTLBuffer> by = buffer_for(Y_RD);
     const NSUInteger ox = buffer_offset_for(X_RD);
     const NSUInteger og = buffer_offset_for(gamma);
-    const NSUInteger ob = buffer_offset_for(beta);
+    const NSUInteger ob = beta ? buffer_offset_for(*beta) : 0;
     const NSUInteger oy = buffer_offset_for(Y_RD);
     const uint32_t Ru = static_cast<uint32_t>(R);
     const uint32_t Du = static_cast<uint32_t>(D);
+    const uint32_t has_beta = beta ? 1u : 0u;
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = new_command_buffer();
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -628,6 +634,7 @@ void layernorm_forward_inference_batched_fp16(const Tensor& X_RD,
         [enc setBytes:&Ru length:sizeof(uint32_t) atIndex:4];
         [enc setBytes:&Du length:sizeof(uint32_t) atIndex:5];
         [enc setBytes:&eps length:sizeof(float) atIndex:6];
+        [enc setBytes:&has_beta length:sizeof(uint32_t) atIndex:7];
         [enc dispatchThreadgroups:MTLSizeMake(R, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(LN_BLOCK, 1, 1)];
         [enc endEncoding];

@@ -23,7 +23,7 @@ namespace brotensor::detail::cpu {
 
 void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
                                          const ::brotensor::Tensor& gamma,
-                                         const ::brotensor::Tensor& beta,
+                                         const ::brotensor::Tensor* beta,
                                          ::brotensor::Tensor& Y_RD,
                                          float eps) {
     const int R = X_RD.rows;
@@ -36,10 +36,10 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
 
     const float* xp = X_RD.host_f32();
     const float* gp = gamma.host_f32();
-    const float* bp = beta.host_f32();
+    const float* bp = beta ? beta->host_f32() : nullptr;
     float* yp = Y_RD.host_f32_mut();
 
-    if (jit::is_jit_available() && D >= 8) {
+    if (bp && jit::is_jit_available() && D >= 8) {
         jit::layernorm_forward_inference_batched(xp, gp, bp, eps, yp, R, D);
         return;
     }
@@ -72,7 +72,52 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
 
         for (int i = 0; i < D; ++i) {
             const float xh = (xr[i] - mean) * rstd;
-            yr[i] = gp[i] * xh + bp[i];
+            yr[i] = bp ? (gp[i] * xh + bp[i]) : (gp[i] * xh);
+        }
+    });
+}
+
+void layernorm_forward_inference_batched_fp16(const ::brotensor::Tensor& X_RD,
+                                              const ::brotensor::Tensor& gamma,
+                                              const ::brotensor::Tensor* beta,
+                                              ::brotensor::Tensor& Y_RD,
+                                              float eps) {
+    const int R = X_RD.rows;
+    const int D = X_RD.cols;
+    if (Y_RD.rows != R || Y_RD.cols != D ||
+        Y_RD.dtype != ::brotensor::Dtype::FP16) {
+        Y_RD.resize(R, D, ::brotensor::Dtype::FP16);
+    }
+    if (R == 0 || D == 0) return;
+
+    const uint16_t* xp = X_RD.host_fp16();
+    const uint16_t* gp = gamma.host_fp16();
+    const uint16_t* bp = beta ? beta->host_fp16() : nullptr;
+    uint16_t* yp = Y_RD.host_fp16_mut();
+
+    const float invD = 1.0f / static_cast<float>(D);
+    parallel_for(static_cast<std::size_t>(R), [&](std::size_t rowi) {
+        const int row = static_cast<int>(rowi);
+        const uint16_t* xr = xp + static_cast<std::size_t>(row) * D;
+        uint16_t* yr = yp + static_cast<std::size_t>(row) * D;
+
+        float sum = 0.0f;
+        for (int i = 0; i < D; ++i) sum += ::brotensor::fp16_bits_to_fp32(xr[i]);
+        const float mean = sum * invD;
+
+        float sumsq = 0.0f;
+        for (int i = 0; i < D; ++i) {
+            const float d = ::brotensor::fp16_bits_to_fp32(xr[i]) - mean;
+            sumsq += d * d;
+        }
+        const float var  = sumsq * invD;
+        const float rstd = 1.0f / std::sqrt(var + eps);
+
+        for (int i = 0; i < D; ++i) {
+            const float xh = (::brotensor::fp16_bits_to_fp32(xr[i]) - mean) * rstd;
+            const float g  = ::brotensor::fp16_bits_to_fp32(gp[i]);
+            const float b  = bp ? ::brotensor::fp16_bits_to_fp32(bp[i]) : 0.0f;
+            yr[i] = ::brotensor::fp32_to_fp16_bits(g * xh + b);
         }
     });
 }

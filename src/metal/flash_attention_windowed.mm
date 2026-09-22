@@ -68,10 +68,18 @@ static inline void flash_windowed_core(device const T* Q,
     const float inv_sqrt   = rsqrt(float(p.head_dim));
 
     const int aq = int(q) + int(p.q_offset);                 // absolute causal pos
-    int lo = (p.window > 0) ? (aq - p.window + 1) : 0;
-    if (lo < 0) lo = 0;
-    // causal: query attends keys [lo, aq]; bidirectional: every key [0, Lk).
-    const int k_hi = (p.causal != 0u) ? aq : (int(p.Lk) - 1);
+    int lo = 0;
+    int k_hi = int(p.Lk) - 1;
+    if (p.causal != 0u) {
+        lo = (p.window > 0) ? (aq - p.window + 1) : 0;
+        if (lo < 0) lo = 0;
+        k_hi = aq;
+    } else if (p.window > 0) {
+        lo = aq - p.window / 2;
+        if (lo < 0) lo = 0;
+        k_hi = aq + p.window / 2;
+        if (k_hi >= int(p.Lk)) k_hi = int(p.Lk) - 1;
+    }
 
     float run_max = -1e30f;
     float run_sum = 0.0f;
@@ -208,7 +216,8 @@ void flash_attention_windowed_forward(const Tensor& Q,
                                       const float* d_mask,
                                       int num_heads,
                                       int window,
-                                      Tensor& O) {
+                                      Tensor& O,
+                                      bool causal) {
     const Dtype dt = Q.dtype;
     if (dt != Dtype::FP16 && dt != Dtype::BF16 && dt != Dtype::FP32)
         throw std::runtime_error("flash_attention_windowed_forward: Q, K, V must be FP16, BF16, or FP32");
@@ -247,7 +256,7 @@ void flash_attention_windowed_forward(const Tensor& Q,
     p.q_offset = static_cast<uint32_t>(Lk - Lq);
     p.group    = static_cast<uint32_t>(num_heads / n_kv);
     p.has_mask = d_mask ? 1u : 0u;
-    p.causal   = 1u;
+    p.causal   = causal ? 1u : 0u;
 
     id<MTLComputePipelineState> pso =
         (dt == Dtype::BF16) ? pso_bf16()

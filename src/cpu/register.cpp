@@ -51,6 +51,7 @@ float mse_scalar(float pred, float target, float& dPred);
 void add_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x);
 void add_scalar_inplace(::brotensor::Tensor& y, float s);
 void add_channel_bias_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& bias, int C, int L);
+void add_row_bias_inplace(::brotensor::Tensor& Y, const ::brotensor::Tensor& bias);
 void xavier_init(::brotensor::Tensor& W, uint64_t& rng_state);
 
 // ── ops_impl.cpp — forward decls of the 20 newly implemented ops ──
@@ -210,8 +211,12 @@ void rows_count_above(const ::brotensor::Tensor& X, float t_lo, float t_hi,
                       ::brotensor::Tensor& counts);
 void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
                                          const ::brotensor::Tensor& gamma,
-                                         const ::brotensor::Tensor& beta,
+                                         const ::brotensor::Tensor* beta,
                                          ::brotensor::Tensor& Y_RD, float eps);
+void layernorm_forward_inference_batched_fp16(const ::brotensor::Tensor& X_RD,
+                                              const ::brotensor::Tensor& gamma,
+                                              const ::brotensor::Tensor* beta,
+                                              ::brotensor::Tensor& Y_RD, float eps);
 void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
                                            const ::brotensor::Tensor& gamma,
                                            const ::brotensor::Tensor& beta,
@@ -587,7 +592,7 @@ void flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
                                       const ::brotensor::Tensor& K,
                                       const ::brotensor::Tensor& V,
                                       const float* d_mask, int num_heads, int window,
-                                      ::brotensor::Tensor& O);
+                                      ::brotensor::Tensor& O, bool causal);
 void flash_attention_gqa_forward(const ::brotensor::Tensor& Q,
                                  const ::brotensor::Tensor& K,
                                  const ::brotensor::Tensor& V,
@@ -1147,6 +1152,7 @@ struct CpuStaticRegistrar {
         ops.add_inplace          = &detail::cpu::add_inplace;
         ops.add_scalar_inplace   = &detail::cpu::add_scalar_inplace;
         ops.add_channel_bias_inplace = &detail::cpu::add_channel_bias_inplace;
+        ops.add_row_bias_inplace     = &detail::cpu::add_row_bias_inplace;
         ops.xavier_init          = &detail::cpu::xavier_init;
 
         ops.sgd_step                 = &detail::cpu::sgd_step;
@@ -1197,6 +1203,8 @@ struct CpuStaticRegistrar {
         ops.rows_count_above           = &detail::cpu::rows_count_above;
         ops.layernorm_forward_inference_batched
                                        = &detail::cpu::layernorm_forward_inference_batched;
+        ops.layernorm_forward_inference_batched_fp16
+                                       = &detail::cpu::layernorm_forward_inference_batched_fp16;
         ops.layernorm_forward_batched_with_caches
                                        = &detail::cpu::layernorm_forward_batched_with_caches;
         ops.layernorm_backward_batched_with_caches

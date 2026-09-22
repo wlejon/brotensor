@@ -103,7 +103,7 @@
                                                        ::brotensor::Tensor& dst, int dst_off, int dst_pitch, int width, int height))                                    \
     X(cast,                                    void,  (const ::brotensor::Tensor& src, ::brotensor::Tensor& dst, ::brotensor::Dtype out_dtype))                        \
     /* ─── Inference batched + optim ─── */                                                                                                                             \
-    X(layernorm_forward_inference_batched,     void,  (const ::brotensor::Tensor& X_RD, const ::brotensor::Tensor& gamma, const ::brotensor::Tensor& beta,              \
+    X(layernorm_forward_inference_batched,     void,  (const ::brotensor::Tensor& X_RD, const ::brotensor::Tensor& gamma, const ::brotensor::Tensor* beta,              \
                                                        ::brotensor::Tensor& Y_RD, float eps))                                                                           \
     X(layernorm_forward_batched_with_caches,   void,  (const ::brotensor::Tensor& X_RD, const ::brotensor::Tensor& gamma, const ::brotensor::Tensor& beta,              \
                                                        ::brotensor::Tensor& Y_RD, ::brotensor::Tensor& Xhat_RD,                                                         \
@@ -308,7 +308,7 @@
                                                        ::brotensor::Tensor& dWq, ::brotensor::Tensor& dWk,                                                              \
                                                        ::brotensor::Tensor& dWv, ::brotensor::Tensor& dWo))                                                             \
     /* ─── FP16 LayerNorm inference + FP16 self-attention ─── */                                                                                                        \
-    X(layernorm_forward_inference_batched_fp16, void, (const ::brotensor::Tensor& X_RD, const ::brotensor::Tensor& gamma, const ::brotensor::Tensor& beta,              \
+    X(layernorm_forward_inference_batched_fp16, void, (const ::brotensor::Tensor& X_RD, const ::brotensor::Tensor& gamma, const ::brotensor::Tensor* beta,              \
                                                        ::brotensor::Tensor& Y_RD, float eps))                                                                           \
     X(self_attention_forward,                  void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& Wk,                      \
                                                        const ::brotensor::Tensor& Wv, const ::brotensor::Tensor& Wo, const float* d_mask, int num_heads,                \
@@ -319,7 +319,7 @@
     X(flash_attention_gqa_forward,             void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
                                                        const float* d_mask, int num_q_heads, int num_kv_heads, bool causal, ::brotensor::Tensor& O))                    \
     X(flash_attention_windowed_forward,        void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
-                                                       const float* d_mask, int num_heads, int window, ::brotensor::Tensor& O))                                         \
+                                                       const float* d_mask, int num_heads, int window, ::brotensor::Tensor& O, bool causal))                             \
     X(flash_attention_varlen_forward,          void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
                                                        const int32_t* cu_seqlens_q, const int32_t* cu_seqlens_k,                                                        \
                                                        int batch_size, int max_seqlen_q, int max_seqlen_k,                                                              \
@@ -729,4 +729,5 @@
                                                        float gain, float slope, float clamp, const ::brotensor::Tensor& up_buf,                 \
                                                        ::brotensor::Tensor& dX, ::brotensor::Tensor* dB))                                      \
     X(add_channel_bias_inplace,                void,  (::brotensor::Tensor& y, const ::brotensor::Tensor& bias, int C, int L))                                            \
+    X(add_row_bias_inplace,                    void,  (::brotensor::Tensor& Y, const ::brotensor::Tensor& bias))                                                          \
     X(softmax_rows_forward,                    void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y, int rows, int cols))

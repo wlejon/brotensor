@@ -1467,6 +1467,31 @@ kernel void k_add_channel_bias_inplace_bf16(device bfloat*       y    [[buffer(0
     y[i] = bfloat(float(y[i]) + float(bias[i / L]));
 }
 
+kernel void k_add_row_bias_inplace_fp32(device float*       y    [[buffer(0)]],
+                                        device const float* bias [[buffer(1)]],
+                                        constant uint& D         [[buffer(2)]],
+                                        constant uint& n         [[buffer(3)]],
+                                        uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] += bias[i % D];
+}
+kernel void k_add_row_bias_inplace_fp16(device half*       y    [[buffer(0)]],
+                                        device const half* bias [[buffer(1)]],
+                                        constant uint& D        [[buffer(2)]],
+                                        constant uint& n        [[buffer(3)]],
+                                        uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = half(float(y[i]) + float(bias[i % D]));
+}
+kernel void k_add_row_bias_inplace_bf16(device bfloat*       y    [[buffer(0)]],
+                                        device const bfloat* bias [[buffer(1)]],
+                                        constant uint& D          [[buffer(2)]],
+                                        constant uint& n          [[buffer(3)]],
+                                        uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] = bfloat(float(y[i]) + float(bias[i % D]));
+}
+
 kernel void k_threshold_u8_fp32(device const float* x [[buffer(0)]],
                                 constant float& t     [[buffer(1)]],
                                 device char*    y     [[buffer(2)]],
@@ -1498,6 +1523,9 @@ DEF_PSO(pso_axpby_bf16, @"k_axpby_inplace_bf16")
 DEF_PSO(pso_add_channel_bias_fp32, @"k_add_channel_bias_inplace_fp32")
 DEF_PSO(pso_add_channel_bias_fp16, @"k_add_channel_bias_inplace_fp16")
 DEF_PSO(pso_add_channel_bias_bf16, @"k_add_channel_bias_inplace_bf16")
+DEF_PSO(pso_add_row_bias_fp32, @"k_add_row_bias_inplace_fp32")
+DEF_PSO(pso_add_row_bias_fp16, @"k_add_row_bias_inplace_fp16")
+DEF_PSO(pso_add_row_bias_bf16, @"k_add_row_bias_inplace_bf16")
 DEF_PSO(pso_threshold_u8_fp32, @"k_threshold_u8_fp32")
 DEF_PSO(pso_threshold_u8_fp16, @"k_threshold_u8_fp16")
 #undef DEF_PSO
@@ -1550,6 +1578,32 @@ void add_channel_bias_inplace(Tensor& y, const Tensor& bias, int C, int L) {
         [enc setBuffer:bb offset:ob atIndex:1];
         [enc setBytes:&Lu length:sizeof(uint32_t) atIndex:2];
         [enc setBytes:&n  length:sizeof(uint32_t) atIndex:3];
+    });
+}
+
+void add_row_bias_inplace(Tensor& y, const Tensor& bias) {
+    if (y.dtype != bias.dtype) {
+        throw std::runtime_error("add_row_bias_inplace: dtype mismatch");
+    }
+    if (bias.size() != y.cols) {
+        throw std::runtime_error("add_row_bias_inplace: bias size != y.cols");
+    }
+    const uint32_t n = static_cast<uint32_t>(y.size());
+    if (n == 0) return;
+    const uint32_t D = static_cast<uint32_t>(y.cols);
+    id<MTLComputePipelineState> pso =
+        (y.dtype == Dtype::FP16) ? pso_add_row_bias_fp16()
+      : (y.dtype == Dtype::BF16) ? pso_add_row_bias_bf16()
+      : pso_add_row_bias_fp32();
+    id<MTLBuffer> by = buffer_for(y);
+    id<MTLBuffer> bb = buffer_for(bias);
+    const NSUInteger oy = buffer_offset_for(y);
+    const NSUInteger ob = buffer_offset_for(bias);
+    launch_1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:by offset:oy atIndex:0];
+        [enc setBuffer:bb offset:ob atIndex:1];
+        [enc setBytes:&D length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
     });
 }
 

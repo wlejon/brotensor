@@ -2373,10 +2373,18 @@ __global__ void flash_attention_windowed_kernel(
     const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
 
     const int aq = q + q_offset;              // absolute causal position
-    int lo = (window > 0) ? (aq - window + 1) : 0;
-    if (lo < 0) lo = 0;
-    // causal: query attends keys [lo, aq]; bidirectional: every key [0, Lk).
-    const int k_hi = causal ? aq : (Lk - 1);
+    int lo = 0;
+    int k_hi = Lk - 1;
+    if (causal) {
+        lo = (window > 0) ? (aq - window + 1) : 0;
+        if (lo < 0) lo = 0;
+        k_hi = aq;
+    } else if (window > 0) {
+        lo = aq - window / 2;
+        if (lo < 0) lo = 0;
+        k_hi = aq + window / 2;
+        if (k_hi >= Lk) k_hi = Lk - 1;
+    }
 
     float run_max = -1e30f;
     float run_sum = 0.0f;
@@ -2491,7 +2499,8 @@ void flash_attention_windowed_forward(const Tensor& Q,
                                       const float* d_mask,
                                       int num_heads,
                                       int window,
-                                      Tensor& O) {
+                                      Tensor& O,
+                                      bool causal) {
     const Dtype dt = Q.dtype;
     if (dt != Dtype::FP16 && dt != Dtype::BF16 && dt != Dtype::FP32)
         throw std::runtime_error("flash_attention_windowed_forward: Q, K, V must be FP16, BF16, or FP32");
@@ -2523,6 +2532,7 @@ void flash_attention_windowed_forward(const Tensor& Q,
 
     const int q_offset = Lk - Lq;
     const int group    = num_heads / n_kv;
+    const int causal_i = causal ? 1 : 0;
     const size_t shmem = (static_cast<size_t>(FA_KTILE) + FA_BLOCK) * sizeof(float);
     dim3 grid(Lq, num_heads, 1);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
@@ -2532,21 +2542,21 @@ void flash_attention_windowed_forward(const Tensor& Q,
             reinterpret_cast<const __nv_bfloat16*>(K.data),
             reinterpret_cast<const __nv_bfloat16*>(V.data),
             d_mask, reinterpret_cast<__nv_bfloat16*>(O.data),
-            Lk, Dq, Dkv, head_dim, window, q_offset, group, /*causal=*/1);
+            Lk, Dq, Dkv, head_dim, window, q_offset, group, causal_i);
     } else if (dt == Dtype::FP32) {
         flash_attention_windowed_kernel<float><<<grid, FA_BLOCK, shmem, stream>>>(
             reinterpret_cast<const float*>(Q.data),
             reinterpret_cast<const float*>(K.data),
             reinterpret_cast<const float*>(V.data),
             d_mask, reinterpret_cast<float*>(O.data),
-            Lk, Dq, Dkv, head_dim, window, q_offset, group, /*causal=*/1);
+            Lk, Dq, Dkv, head_dim, window, q_offset, group, causal_i);
     } else {
         flash_attention_windowed_kernel<__half><<<grid, FA_BLOCK, shmem, stream>>>(
             reinterpret_cast<const __half*>(Q.data),
             reinterpret_cast<const __half*>(K.data),
             reinterpret_cast<const __half*>(V.data),
             d_mask, reinterpret_cast<__half*>(O.data),
-            Lk, Dq, Dkv, head_dim, window, q_offset, group, /*causal=*/1);
+            Lk, Dq, Dkv, head_dim, window, q_offset, group, causal_i);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }

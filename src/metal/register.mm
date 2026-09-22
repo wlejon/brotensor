@@ -64,6 +64,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.add_inplace_batched                         = &dm::add_inplace_batched;
     ops.add_scalar_inplace                          = &dm::add_scalar_inplace;
     ops.add_channel_bias_inplace                    = &dm::add_channel_bias_inplace;
+    ops.add_row_bias_inplace                        = &dm::add_row_bias_inplace;
     ops.argmax_rows                                 = &dm::argmax_rows;
     ops.attention_backward                          = &dm::attention_backward;
     ops.attention_forward                           = &dm::attention_forward;

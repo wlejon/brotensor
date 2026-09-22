@@ -506,7 +506,7 @@ __global__ void layernorm_forward_inference_batched_kernel(
 
     for (int i = tid; i < D; i += blockDim.x) {
         const float xh = (xrow[i] - mean) * rstd;
-        yrow[i] = xh * gamma[i] + beta[i];
+        yrow[i] = beta ? (xh * gamma[i] + beta[i]) : (xh * gamma[i]);
     }
 }
 } // namespace
@@ -554,7 +554,7 @@ __global__ void layernorm_forward_inference_batched_fp16_kernel(
     for (int i = tid; i < D; i += blockDim.x) {
         const float xh = (__half2float(xrow[i]) - mean) * rstd;
         const float g  = __half2float(gamma[i]);
-        const float b  = __half2float(beta[i]);
+        const float b  = beta ? __half2float(beta[i]) : 0.0f;
         yrow[i] = __float2half(xh * g + b);
     }
 }
@@ -603,7 +603,7 @@ __global__ void layernorm_forward_inference_batched_bf16_kernel(
     for (int i = tid; i < D; i += blockDim.x) {
         const float xh = (__bfloat162float(xrow[i]) - mean) * rstd;
         const float g  = __bfloat162float(gamma[i]);
-        const float b  = __bfloat162float(beta[i]);
+        const float b  = beta ? __bfloat162float(beta[i]) : 0.0f;
         yrow[i] = __float2bfloat16(xh * g + b);
     }
 }
@@ -611,12 +611,12 @@ __global__ void layernorm_forward_inference_batched_bf16_kernel(
 
 void layernorm_forward_inference_batched_fp16(const ::brotensor::Tensor& X_RD,
                                               const ::brotensor::Tensor& gamma,
-                                              const ::brotensor::Tensor& beta,
+                                              const ::brotensor::Tensor* beta,
                                               ::brotensor::Tensor& Y_RD,
                                               float eps) {
     using ::brotensor::Dtype;
     if (X_RD.dtype != Dtype::FP16 || gamma.dtype != Dtype::FP16 ||
-        beta.dtype != Dtype::FP16) {
+        (beta && beta->dtype != Dtype::FP16)) {
         throw std::runtime_error("layernorm_forward_inference_batched_fp16: all tensors must be FP16");
     }
     const int R = X_RD.rows;
@@ -630,7 +630,7 @@ void layernorm_forward_inference_batched_fp16(const ::brotensor::Tensor& X_RD,
     layernorm_forward_inference_batched_fp16_kernel<<<R, block, shmem, cur_stream()>>>(
         reinterpret_cast<const __half*>(X_RD.data),
         reinterpret_cast<const __half*>(gamma.data),
-        reinterpret_cast<const __half*>(beta.data),
+        beta ? reinterpret_cast<const __half*>(beta->data) : nullptr,
         reinterpret_cast<__half*>(Y_RD.data),
         R, D, eps);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -638,7 +638,7 @@ void layernorm_forward_inference_batched_fp16(const ::brotensor::Tensor& X_RD,
 
 void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
                                          const ::brotensor::Tensor& gamma,
-                                         const ::brotensor::Tensor& beta,
+                                         const ::brotensor::Tensor* beta,
                                          ::brotensor::Tensor& Y_RD,
                                          float eps) {
     using ::brotensor::Dtype;
@@ -646,7 +646,7 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
         X_RD.dtype != Dtype::FP32) {
         throw std::runtime_error("layernorm_forward_inference_batched: X must be FP16, BF16, or FP32");
     }
-    if (gamma.dtype != X_RD.dtype || beta.dtype != X_RD.dtype) {
+    if (gamma.dtype != X_RD.dtype || (beta && beta->dtype != X_RD.dtype)) {
         throw std::runtime_error("layernorm_forward_inference_batched: gamma/beta dtype must match X.dtype");
     }
     const int R = X_RD.rows;
@@ -661,21 +661,21 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
         layernorm_forward_inference_batched_fp16_kernel<<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const __half*>(X_RD.data),
             reinterpret_cast<const __half*>(gamma.data),
-            reinterpret_cast<const __half*>(beta.data),
+            beta ? reinterpret_cast<const __half*>(beta->data) : nullptr,
             reinterpret_cast<__half*>(Y_RD.data),
             R, D, eps);
     } else if (X_RD.dtype == Dtype::BF16) {
         layernorm_forward_inference_batched_bf16_kernel<<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(X_RD.data),
             reinterpret_cast<const __nv_bfloat16*>(gamma.data),
-            reinterpret_cast<const __nv_bfloat16*>(beta.data),
+            beta ? reinterpret_cast<const __nv_bfloat16*>(beta->data) : nullptr,
             reinterpret_cast<__nv_bfloat16*>(Y_RD.data),
             R, D, eps);
     } else {
         layernorm_forward_inference_batched_kernel<<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const float*>(X_RD.data),
             reinterpret_cast<const float*>(gamma.data),
-            reinterpret_cast<const float*>(beta.data),
+            beta ? reinterpret_cast<const float*>(beta->data) : nullptr,
             reinterpret_cast<float*>(Y_RD.data),
             R, D, eps);
     }
