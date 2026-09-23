@@ -399,12 +399,17 @@
         if (Y === undefined) throw new TypeError("bro.tensor.ropeApply: Y is required");
         __bro_native.tensor.ropeApply(X, cosTbl, sinTbl, headDim, numHeads, Y); chk();
     });
-    fn(ns_tensor, "ropeApplyBackward", function ropeApplyBackward(dY, headDim, numHeads, dX) {
+    // The adjoint of ropeApply needs the same cos/sin tables: with arbitrary
+    // tables the rotation cannot be recovered from dY alone.
+    fn(ns_tensor, "ropeApplyBackward", function ropeApplyBackward(dY, cosTbl, sinTbl, headDim, numHeads, dX) {
         if (dY === undefined) throw new TypeError("bro.tensor.ropeApplyBackward: dY is required");
+        if (!(cosTbl instanceof GpuTensor) || !(sinTbl instanceof GpuTensor)) {
+            throw new TypeError("bro.tensor.ropeApplyBackward(dY, cosTbl, sinTbl, headDim, numHeads, dX): cosTbl and sinTbl must be GpuTensors");
+        }
         if (headDim === undefined) throw new TypeError("bro.tensor.ropeApplyBackward: headDim is required");
         if (numHeads === undefined) throw new TypeError("bro.tensor.ropeApplyBackward: numHeads is required");
         if (dX === undefined) throw new TypeError("bro.tensor.ropeApplyBackward: dX is required");
-        __bro_native.tensor.ropeApplyBackward(dY, headDim, numHeads, dX); chk();
+        __bro_native.tensor.ropeApplyBackward(dY, cosTbl, sinTbl, headDim, numHeads, dX); chk();
     });
     fn(ns_tensor, "modulate", function modulate(X, scale, shift, Y) {
         if (X === undefined) throw new TypeError("bro.tensor.modulate: X is required");

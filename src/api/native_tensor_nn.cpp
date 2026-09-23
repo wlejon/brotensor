@@ -96,11 +96,12 @@ void bro_tensor_ropeApply(void* X, void* cosTbl, void* sinTbl, int32_t headDim, 
     brotensor::rope_apply(*xt, *ct, *st, headDim, numHeads, *yt);
 }
 
-void bro_tensor_ropeApplyBackward(void* dY, int32_t headDim, int32_t numHeads, void* dX) {
-    auto* dyt = toTensor(dY);
-    auto* dxt = toTensor(dX);
-    if (!dyt || !dxt) return;
-    brotensor::rope_backward(*dyt, headDim, numHeads, 0, 10000.0f, *dxt);
+void bro_tensor_ropeApplyBackward(void* dY, void* cosTbl, void* sinTbl, int32_t headDim, int32_t numHeads, void* dX) {
+    if (!need("ropeApplyBackward", {dY, cosTbl, sinTbl, dX})) return;
+    BROTENSOR_API_TRY
+        brotensor::rope_apply_backward(*toTensor(dY), *toTensor(cosTbl), *toTensor(sinTbl),
+                                       headDim, numHeads, *toTensor(dX));
+    BROTENSOR_API_CATCH("ropeApplyBackward")
 }
 
 void bro_tensor_modulate(void* X, void* scale, void* shift, void* Y) {

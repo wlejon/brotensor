@@ -234,7 +234,7 @@ bool registerTensorNatives(std::string* error) {
         fn("__bro_native.tensor.ropeForward", p(&bro_tensor_ropeForward), "void", {kTensorCls, "i32", "i32", "i32", "f64", kTensorCls}, error) &&
         fn("__bro_native.tensor.ropeBackward", p(&bro_tensor_ropeBackward), "void", {kTensorCls, "i32", "i32", "i32", "f64", kTensorCls}, error) &&
         fn("__bro_native.tensor.ropeApply", p(&bro_tensor_ropeApply), "void", {kTensorCls, kTensorCls, kTensorCls, "i32", "i32", kTensorCls}, error) &&
-        fn("__bro_native.tensor.ropeApplyBackward", p(&bro_tensor_ropeApplyBackward), "void", {kTensorCls, "i32", "i32", kTensorCls}, error) &&
+        fn("__bro_native.tensor.ropeApplyBackward", p(&bro_tensor_ropeApplyBackward), "void", {kTensorCls, kTensorCls, kTensorCls, "i32", "i32", kTensorCls}, error) &&
         fn("__bro_native.tensor.modulate", p(&bro_tensor_modulate), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls}, error) &&
         fn("__bro_native.tensor.broadcastMul", p(&bro_tensor_broadcastMul), "void", {kTensorCls, kTensorCls, kTensorCls}, error) &&
         fn("__bro_native.tensor.attentionTokenMoments", p(&bro_tensor_attentionTokenMoments), "void", {kTensorCls, "i32", "i32", kTensorCls, kTensorCls}, error) &&
