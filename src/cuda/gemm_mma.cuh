@@ -47,4 +47,12 @@ bool launch(const __nv_bfloat16* A, const __nv_bfloat16* W, __nv_bfloat16* C, in
             const __nv_bfloat16* bias, int act, int epi, float* ws, std::size_t ws_floats,
             cudaStream_t stream, int acc_mode = kAccF32);
 
+// C(M, N) = A(M, K) · W(N, K)^T with the FP32 accumulators stored as FP32 —
+// for a product whose consumer needs more than 16 bits (attention scores ahead
+// of a softmax). No epilogue, never split. Same preconditions and false return
+// as launch().
+bool launch_f32out(const __half* A, const __half* W, float* C, int M, int N, int K, cudaStream_t stream);
+bool launch_f32out(const __nv_bfloat16* A, const __nv_bfloat16* W, float* C, int M, int N, int K,
+                   cudaStream_t stream);
+
 }  // namespace brotensor::detail::cuda::mma_gemm

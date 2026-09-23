@@ -390,7 +390,38 @@ bool launch_t(const T* A, const T* W, T* C, int M, int N, int K, const T* bias, 
     return true;
 }
 
+// FP32 output: the kernel's split-K partial store with a single split, so C
+// receives the raw FP32 accumulators (no bias / activation / narrowing).
+template <typename T>
+bool launch_f32out_t(const T* A, const T* W, float* C, int M, int N, int K, cudaStream_t stream) {
+    if (M <= 0 || N <= 0 || K <= 0) return false;
+    if ((K & 7) || (N & 7)) return false;
+    const auto misaligned = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) != 0; };
+    if (misaligned(A) || misaligned(W) || misaligned(C)) return false;
+    int major = 0;
+    const int sms = sm_count_and_major(major);
+    if (major < 8) return false;
+    const Plan p = make_plan(M, N, K, sms);
+    const int kps = (K + BK - 1) / BK;
+    if (p.large) {
+        run<T, kAccF32, 128, 128, 2, 4, 3, 2>(A, W, nullptr, M, N, K, nullptr, 0, kStore, C, 1, kps, stream);
+    } else {
+        run<T, kAccF32, 64, 64, 2, 2, 4, 1>(A, W, nullptr, M, N, K, nullptr, 0, kStore, C, 1, kps, stream);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 }  // namespace
+
+bool launch_f32out(const __half* A, const __half* W, float* C, int M, int N, int K, cudaStream_t stream) {
+    return launch_f32out_t<__half>(A, W, C, M, N, K, stream);
+}
+
+bool launch_f32out(const __nv_bfloat16* A, const __nv_bfloat16* W, float* C, int M, int N, int K,
+                   cudaStream_t stream) {
+    return launch_f32out_t<__nv_bfloat16>(A, W, C, M, N, K, stream);
+}
 
 std::size_t workspace_floats(int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return 0;
