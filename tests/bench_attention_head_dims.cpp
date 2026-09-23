@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 using brotensor::Device;
@@ -75,9 +76,99 @@ void bench(const char* tag, int Lq, int Lk, int nh, int hd, Dtype dt) {
                 flop / (ms * 1e9), finite_spot(O) ? "ok" : "NOT FINITE");
 }
 
+// flash_attention_backward at the same shapes (dQ, dK, dV from Q, K, V, dO).
+void bench_bwd(const char* tag, int Lq, int Lk, int nh, int hd, Dtype dt, bool causal = false) {
+    std::mt19937 rng(43);
+    const int D = nh * hd;
+    Tensor Q = upload_rand(Lq, D, dt, rng, 1.0f);
+    Tensor K = upload_rand(Lk, D, dt, rng, 1.0f);
+    Tensor V = upload_rand(Lk, D, dt, rng, 1.0f);
+    Tensor dO = upload_rand(Lq, D, dt, rng, 1.0f);
+    Tensor dQ, dK, dV;
+    const float ms = bt_bench::time_min_ms([&] {
+        brotensor::flash_attention_backward(Q, K, V, dO, dO, nullptr, nh, causal, dQ, dK, dV);
+    });
+    const double flop = 10.0 * double(Lq) * Lk * D;   // S, dP, dV, dQ, dK GEMMs
+    std::printf("bwd %-18s %-4s Lq=%5d Lk=%5d nh=%2d hd=%3d%s %9.3f ms  %7.1f TFLOP/s  %s\n", tag,
+                dt == Dtype::BF16 ? "bf16" : "fp16", Lq, Lk, nh, hd, causal ? " causal" : "       ", ms,
+                flop / (ms * 1e9), finite_spot(dQ) && finite_spot(dK) && finite_spot(dV) ? "ok" : "NOT FINITE");
+}
+
+// flash_attention_varlen_backward: `nseq` sequences of `len` tokens.
+void bench_varlen_bwd(const char* tag, int nseq, int len, int nh, int hd, Dtype dt, bool causal) {
+    std::mt19937 rng(44);
+    const int D = nh * hd, T = nseq * len;
+    Tensor Q = upload_rand(T, D, dt, rng, 1.0f);
+    Tensor K = upload_rand(T, D, dt, rng, 1.0f);
+    Tensor V = upload_rand(T, D, dt, rng, 1.0f);
+    Tensor dO = upload_rand(T, D, dt, rng, 1.0f);
+    Tensor cuh = Tensor::zeros_on(Device::CPU, nseq + 1, 1, Dtype::INT32);
+    for (int b = 0; b <= nseq; ++b) static_cast<int32_t*>(cuh.data)[b] = b * len;
+    Tensor cud = cuh.to(Device::CUDA);
+    const int32_t* c = static_cast<const int32_t*>(cud.data);
+    Tensor dQ, dK, dV;
+    const float ms = bt_bench::time_min_ms([&] {
+        brotensor::flash_attention_varlen_backward(Q, K, V, dO, dO, c, c, nseq, len, len, nh, hd, causal, dQ, dK,
+                                                   dV);
+    });
+    const double flop = 10.0 * double(nseq) * len * len * D;
+    std::printf("varlen bwd %-11s %-4s %2d x %5d  nh=%2d hd=%3d%s %9.3f ms  %7.1f TFLOP/s  %s\n", tag,
+                dt == Dtype::BF16 ? "bf16" : "fp16", nseq, len, nh, hd, causal ? " causal" : "       ", ms,
+                flop / (ms * 1e9), finite_spot(dQ) && finite_spot(dK) && finite_spot(dV) ? "ok" : "NOT FINITE");
+}
+
+// flash_attention_packed_qkv_backward: `nseq` sequences of `len` rows, fused QKV.
+void bench_packed_bwd(const char* tag, int nseq, int len, int nh, int hd, Dtype dt, int window) {
+    std::mt19937 rng(46);
+    const int D = nh * hd, L = nseq * len;
+    Tensor QKV = upload_rand(L, 3 * D, dt, rng, 1.0f);
+    Tensor dO = upload_rand(L, D, dt, rng, 1.0f);
+    Tensor bh = Tensor::zeros_on(Device::CPU, L, 2, Dtype::INT32);
+    for (int r = 0; r < L; ++r) {
+        static_cast<int32_t*>(bh.data)[2 * r] = r / len * len;
+        static_cast<int32_t*>(bh.data)[2 * r + 1] = r / len * len + len;
+    }
+    Tensor bd = bh.to(Device::CUDA), dQKV;
+    const float ms = bt_bench::time_min_ms([&] {
+        brotensor::flash_attention_packed_qkv_backward(QKV, dO, bd, nh, window, dQKV);
+    });
+    const double flop = 10.0 * double(nseq) * len * len * D;
+    std::printf("packed bwd %-11s %-4s %2d x %5d  nh=%2d hd=%3d w=%3d %9.3f ms  %7.1f TFLOP/s  %s\n", tag,
+                dt == Dtype::BF16 ? "bf16" : "fp16", nseq, len, nh, hd, window, ms, flop / (ms * 1e9),
+                finite_spot(dQKV) ? "ok" : "NOT FINITE");
+}
+
+// flash_attention_qkvo_backward: projections + attention core + projection grads.
+void bench_qkvo_bwd(const char* tag, int Lq, int D, int nh, int Lk, int Dctx, bool cross, Dtype dt) {
+    std::mt19937 rng(45);
+    Tensor X = upload_rand(Lq, D, dt, rng, 1.0f);
+    Tensor C = cross ? upload_rand(Lk, Dctx, dt, rng, 1.0f) : X;
+    const float ws = 1.0f / std::sqrt(float(cross ? Dctx : D));
+    Tensor Wq = upload_rand(D, D, dt, rng, 2.0f / std::sqrt(float(D)));
+    Tensor Wk = upload_rand(D, cross ? Dctx : D, dt, rng, 2.0f * ws);
+    Tensor Wv = upload_rand(D, cross ? Dctx : D, dt, rng, ws);
+    Tensor Wo = upload_rand(D, D, dt, rng, 1.0f / std::sqrt(float(D)));
+    Tensor dO = upload_rand(Lq, D, dt, rng, 1.0f);
+    const int Dk = cross ? Dctx : D;
+    Tensor dX, dCtx;
+    Tensor dWq = Tensor::zeros_on(Device::CUDA, D, D, dt), dWk = Tensor::zeros_on(Device::CUDA, D, Dk, dt);
+    Tensor dWv = Tensor::zeros_on(Device::CUDA, D, Dk, dt), dWo = Tensor::zeros_on(Device::CUDA, D, D, dt);
+    const float ms = bt_bench::time_min_ms([&] {
+        brotensor::flash_attention_qkvo_backward(X, cross ? &C : nullptr, Wq, nullptr, Wk, nullptr, Wv, nullptr,
+                                                 Wo, nullptr, nullptr, nh, false, dO, dX,
+                                                 cross ? &dCtx : nullptr, dWq, nullptr, dWk, nullptr, dWv,
+                                                 nullptr, dWo, nullptr);
+    });
+    std::printf("qkvo bwd %-13s %-4s Lq=%5d Lk=%5d D=%4d nh=%2d hd=%3d  %9.3f ms  %s\n", tag,
+                dt == Dtype::BF16 ? "bf16" : "fp16", Lq, cross ? Lk : Lq, D, nh, D / nh, ms,
+                finite_spot(dX) ? "ok" : "NOT FINITE");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // Optional argument: `fwd` or `bwd` runs only that half.
+    const std::string only = argc > 1 ? argv[1] : "";
     brotensor::init();
     if (!brotensor::is_available(Device::CUDA)) {
         std::printf("CUDA not available - skipping\n");
@@ -87,6 +178,30 @@ int main() {
     std::printf("brotensor_bench_attention_head_dims  (warmup %.0f ms/op, best of %d)\n",
                 bt_bench::kWarmupMs, bt_bench::kSamples);
     for (const Dtype dt : {Dtype::FP16, Dtype::BF16}) {
+        if (only == "fwd") break;
+        bench_bwd("sam tok->img",     7, 4096,  8,  16, dt);
+        bench_bwd("hd16 self",     1024, 1024,  8,  16, dt);
+        bench_bwd("hd32 self",     4096, 4096, 16,  32, dt);
+        bench_bwd("hd20 self",     4096, 4096,  4,  20, dt);
+        bench_bwd("sd15 L1 self",  4096, 4096,  8,  40, dt);
+        bench_bwd("sd15 L1 cross", 4096,   77,  8,  40, dt);
+        bench_bwd("sd15 L2 self",  1024, 1024,  8,  80, dt);
+        bench_bwd("sd15 L3 self",   256,  256,  8, 160, dt);
+        bench_bwd("hd64 self",     4096, 4096, 16,  64, dt);
+        bench_bwd("hd64 causal",   2048, 2048, 16,  64, dt, true);
+        bench_bwd("hd128 self",    2048, 2048, 16, 128, dt);
+        bench_varlen_bwd("bert",      8,  512, 12, 64, dt, false);
+        bench_varlen_bwd("causal",    4, 1024, 16, 64, dt, true);
+        bench_varlen_bwd("short",    64,   48,  8, 32, dt, false);
+        bench_packed_bwd("bert",      8,  512, 12, 64, dt, 0);
+        bench_packed_bwd("short",    64,   48,  8, 32, dt, 0);
+        bench_packed_bwd("l3",        1,  256,  8, 160, dt, 0);
+        bench_qkvo_bwd("sd15 L1 self",  4096, 320, 8, 4096, 320, false, dt);
+        bench_qkvo_bwd("sd15 L2 cross", 1024, 640, 8,   77, 768, true,  dt);
+        bench_qkvo_bwd("dit hd64 self", 1024, 1024, 16, 1024, 1024, false, dt);
+    }
+    for (const Dtype dt : {Dtype::FP16, Dtype::BF16}) {
+        if (only == "bwd") break;
         bench("sam tok->img",     7, 4096,  8,  16, dt);
         bench("sam img->tok",  4096,    7,  8,  16, dt);
         bench("sam hd32 tok->img", 7, 4096, 8,  32, dt);
