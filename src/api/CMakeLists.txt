@@ -18,6 +18,8 @@ set(BROTENSOR_API_NATIVE_SOURCES
     native_tensor_int8.cpp
     native_tensor_misc.cpp
     native_tensor_extra.cpp
+    native_tensor_extra_nn.cpp
+    native_tensor_extra_conv.cpp
 )
 
 if(NOT BRASS_HOST_BACKEND)
