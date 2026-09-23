@@ -1,32 +1,51 @@
-// Backward of flash_attention_forward_gpu — bare attention core, no
-// projection weights. Recompute-based: reproduces the per-head softmax to
-// obtain P, then runs the standard FlashAttention-2 backward (dV = P^T·dO,
-// dP = dO·V^T, dS = P*(dP - D_q)*inv_sqrt, dQ = dS·K, dK = dS^T·Q) per head
-// and packs results back into (Lq, D) / (Lk, D).
+// Backward of the bare attention core (flash_attention_backward) and of its
+// packed variable-length form (flash_attention_varlen_backward). Both are
+// recompute-based: per head (and per sequence) the scores are re-derived from
+// Q and K, the softmax is reversed, and dQ / dK / dV are written. O is not
+// read. flash_attention_qkvo_backward (flash_attention.cu) runs its attention
+// core through flash_attention_backward as well.
 //
-// Numerically this is the same per-head sweep used inside
-// flash_attention_qkvo_backward_gpu (src/cuda/flash_attention.cu) — the
-// helper kernels (extract_head_LD, pack_head_LD, extract_head_DL,
-// fa_scale_mask_causal_softmax_rows_kernel, fa_dP_kernel, fa_dS_from_P_dP_kernel,
-// fa_dVh_kernel, fa_dQh_kernel, fa_dKh_kernel) live in flash_attention.cu.
-// We forward-declare them here at namespace scope so we can call them
-// without duplicating code. They have internal linkage in flash_attention.cu;
-// to keep this file self-contained, we re-define equivalent helpers in our
-// own anonymous namespace.
+// 16-bit inputs take a tensor-core pipeline whose precision-sensitive half is
+// FP32 throughout:
+//
+//   S  = Q_h K_h^T      FP32 out of the mma GEMM (mma_gemm::launch_f32out)
+//   dP = dO_h V_h^T     FP32 likewise
+//   row statistics      max, normaliser and D_q = sum_k P dP, all FP32
+//   P, dS               formed in FP32: dS = P (dP - D_q) / sqrt(hd)
+//   dV = P^T dO_h,  dQ = dS K_h,  dK = dS^T Q_h
+//                       16-bit operands, FP32 accumulation and FP32 output,
+//                       narrowed once when scattered into dQ / dK / dV
+//
+// P and dS are the only 16-bit intermediates. Each is a GEMM operand whose
+// rounding is an independent relative error per term, as P is in the
+// forward's P@V. What this path used to hold in 16 bits instead -- the raw
+// score ahead of the scale and the exp, dP ahead of the dP - D_q difference
+// (where most of its bits cancel), D_q's own reduction over 16-bit P and dP,
+// and each head's gradient before it was packed -- put the rounding inside the
+// softmax and inside that cancellation: 1-2e-2 of the gradient row's scale in
+// FP16 and 5e-2 to 1 in BF16, where this pipeline sits at the output rounding.
+//
+// That pipeline launches per head and per sequence, so short sequences and
+// small score matrices take the row path instead (prefer_rows): one warp per
+// (row, head), two launches for the whole call, every score, P and dS in FP32
+// registers. The row path is also the FP32 path (varlen only) and the fallback
+// on devices where the FP32-output GEMM does not run (pre-sm_80).
 
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
-#include "fp16_internal.cuh"
 #include "detail/cuda_check.h"
+#include "gemm_mma.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -36,585 +55,633 @@ void* cuda_current_stream();
 
 namespace {
 
-constexpr int FAB_BLOCK = 128;
-
-inline int grid_for(int n, int block) {
-    int b = (n + block - 1) / block;
+inline int grid_for(long long n, int block) {
+    long long b = (n + block - 1) / block;
     if (b < 1) b = 1;
-    return b;
+    return static_cast<int>(b);
 }
 
-// ───── Per-head extract / pack kernels (mirror flash_attention.cu) ─────────
+inline int round8(int n) { return (n + 7) & ~7; }
 
-__global__ void fab_extract_head_LD_kernel(const __half* __restrict__ X,
-                                           __half* __restrict__ Y,
-                                           int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Y[l * head_dim + d] = X[l * D + head_off + d];
+__device__ __forceinline__ float to_f32(float v) { return v; }
+__device__ __forceinline__ float to_f32(__half v) { return __half2float(v); }
+__device__ __forceinline__ float to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+
+template <typename T> __device__ __forceinline__ T from_f32(float v);
+template <> __device__ __forceinline__ float from_f32<float>(float v) { return v; }
+template <> __device__ __forceinline__ __half from_f32<__half>(float v) { return __float2half(v); }
+template <> __device__ __forceinline__ __nv_bfloat16 from_f32<__nv_bfloat16>(float v) {
+    return __float2bfloat16(v);
 }
 
-__global__ void fab_extract_head_DL_kernel(const __half* __restrict__ X,
-                                           __half* __restrict__ Y,
-                                           int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Y[d * L + l] = X[l * D + head_off + d];
-}
+template <typename T> constexpr Dtype dtype_of();
+template <> constexpr Dtype dtype_of<__half>() { return Dtype::FP16; }
+template <> constexpr Dtype dtype_of<__nv_bfloat16>() { return Dtype::BF16; }
 
-__global__ void fab_pack_head_LD_kernel(const __half* __restrict__ Y,
-                                        __half* __restrict__ Out,
-                                        int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Out[l * D + head_off + d] = Y[l * head_dim + d];
-}
+__device__ __forceinline__ float neg_inf() { return __int_as_float(0xff800000); }
 
-// Row-wise scaled, optionally masked, optionally causal softmax. One block
-// per query row. Equivalent to fa_scale_mask_causal_softmax_rows_kernel.
-__global__ void fab_softmax_rows_kernel(__half* __restrict__ S,
-                                        int Lq, int Lk,
-                                        float scale,
-                                        const float* __restrict__ mask,
-                                        int causal) {
-    extern __shared__ float ssm[];
-    const int q = blockIdx.x;
-    const int tid = threadIdx.x;
-    __half* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-
-    float local_max = -1e30f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        float v = __half2float(row[k]) * scale;
-        if (mask && mask[k] <= 0.5f) v = -1e30f;
-        if (causal && k > q) v = -1e30f;
-        if (v > local_max) local_max = v;
-    }
-    ssm[tid] = local_max;
+// Block-wide max / sum over blockDim.x (a multiple of 32) threads; every
+// thread gets the result. `red` holds 32 floats.
+__device__ __forceinline__ float block_max(float v, float* red) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    if (lane == 0) red[warp] = v;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            const float o = ssm[tid + s];
-            if (o > ssm[tid]) ssm[tid] = o;
+    v = lane < nw ? red[lane] : neg_inf();
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    __syncthreads();
+    return v;
+}
+__device__ __forceinline__ float block_sum(float v, float* red) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    v = lane < nw ? red[lane] : 0.0f;
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    __syncthreads();
+    return v;
+}
+
+// ─── Tensor-core pipeline (FP16 / BF16) ─────────────────────────────────────
+
+// Y[r, d] (row stride ldY) = X[r, col0 + d] for r < rows, d < hd; the pad rows
+// [rows, rows_pad) and pad columns [hd, ldY) are written as zeros.
+template <typename T>
+__global__ void bw_gather_kernel(const T* __restrict__ X, int ldX, int col0, int rows, int hd,
+                                 T* __restrict__ Y, int rows_pad, int ldY) {
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<long long>(rows_pad) * ldY) return;
+    const int r = static_cast<int>(idx / ldY), d = static_cast<int>(idx % ldY);
+    Y[idx] = (r < rows && d < hd) ? X[static_cast<size_t>(r) * ldX + col0 + d] : from_f32<T>(0.0f);
+}
+
+// Transposed gather: Y[d, r] (row stride ldY) = X[r, col0 + d] for d < hdp,
+// r < rows_pad, zeros in the pads. dup != 0 writes a second copy at column
+// offset rows_pad -- the [X; X] operand the hi / lo dS pair multiplies.
+template <typename T>
+__global__ void bw_gather_T_kernel(const T* __restrict__ X, int ldX, int col0, int rows, int hd,
+                                   T* __restrict__ Y, int rows_pad, int hdp, int ldY, int dup) {
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<long long>(hdp) * rows_pad) return;
+    const int d = static_cast<int>(idx / rows_pad), r = static_cast<int>(idx % rows_pad);
+    const T v = (r < rows && d < hd) ? X[static_cast<size_t>(r) * ldX + col0 + d] : from_f32<T>(0.0f);
+    T* y = Y + static_cast<size_t>(d) * ldY + r;
+    y[0] = v;
+    if (dup) y[rows_pad] = v;
+}
+
+// The power-of-two scale that puts the chunk's largest |dS| bound near 2^14:
+// dS * scale is far from FP16's overflow and keeps ~28 binades of normal range
+// below it. `bits` is the bound's FP32 bit pattern (bw_row_stats_kernel).
+__device__ __forceinline__ float bw_ds_scale(const unsigned int* bits) {
+    const float b = __uint_as_float(*bits);
+    if (!(b > 0.0f) || !isfinite(b)) return 1.0f;
+    int e = 0;
+    frexpf(b, &e);                              // b < 2^e
+    return ldexpf(1.0f, max(-120, min(120, 14 - e)));
+}
+
+// Fixed scale of P in its 16-bit GEMM operand: P <= 1 becomes <= 2^14, so FP16
+// holds probabilities down to 2^-28 at full precision instead of 2^-14.
+constexpr float kPScale = 16384.0f;
+
+// Out[r, col0 + d] = Y[r, d] / scale (FP32, row stride ldY) for r < rows,
+// d < hd, with scale from bw_ds_scale.
+template <typename T>
+__global__ void bw_scatter_kernel(const float* __restrict__ Y, int ldY, int rows, int hd,
+                                  T* __restrict__ Out, int ldO, int col0, const unsigned int* __restrict__ sbits) {
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<long long>(rows) * hd) return;
+    const int r = static_cast<int>(idx / hd), d = static_cast<int>(idx % hd);
+    const float inv = sbits ? 1.0f / bw_ds_scale(sbits) : 1.0f;
+    Out[static_cast<size_t>(r) * ldO + col0 + d] = from_f32<T>(Y[static_cast<size_t>(r) * ldY + d] * inv);
+}
+
+// acc = (first ? 0 : acc) + src * inv, inv = 1 / bw_ds_scale(sbits) when sbits
+// is given, else inv_const. Every scale is a power of two, so the unscaling is
+// exact.
+__global__ void bw_acc_kernel(float* __restrict__ acc, const float* __restrict__ src, long long n,
+                              const unsigned int* __restrict__ sbits, float inv_const, int first) {
+    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const float inv = sbits ? 1.0f / bw_ds_scale(sbits) : inv_const;
+    const float v = src[idx] * inv;
+    acc[idx] = first ? v : acc[idx] + v;
+}
+
+// Key k is attended by chunk row i (absolute query q0 + i).
+__device__ __forceinline__ bool bw_key_on(const float* mask, int causal, int k, int qa) {
+    return !(mask && mask[k] <= 0.5f) && !(causal && k > qa);
+}
+
+// Per chunk row i (one block each): the row's max of the scaled log2 scores,
+// 1 / normaliser, and D_q = sum_k P dP -- all from the FP32 S / dP rows.
+// A row with no key attended gets stats (0, 0, 0), so its P and dS are zero.
+// Also folds scale * (max_k |dP| + |D_q|), a bound on the row's |dS| (P <= 1),
+// into *bound_bits with an integer max (valid for non-negative floats).
+__global__ void bw_row_stats_kernel(const float* __restrict__ S, const float* __restrict__ dP, int ld, int Lk,
+                                    int q0, float scale_log2, float scale, const float* __restrict__ mask,
+                                    int causal, float* __restrict__ stats, unsigned int* __restrict__ bound_bits) {
+    __shared__ float red[32];
+    const int i = blockIdx.x;
+    const float* s = S + static_cast<size_t>(i) * ld;
+    const float* dp = dP + static_cast<size_t>(i) * ld;
+    const int qa = q0 + i;
+    const int kend = causal ? min(Lk, qa + 1) : Lk;
+    float mx = neg_inf();
+    for (int k = threadIdx.x; k < kend; k += blockDim.x)
+        if (bw_key_on(mask, 0, k, qa)) mx = fmaxf(mx, s[k] * scale_log2);
+    mx = block_max(mx, red);
+    float l = 0.0f, a = 0.0f, g = 0.0f;
+    if (mx != neg_inf()) {
+        for (int k = threadIdx.x; k < kend; k += blockDim.x) {
+            if (!bw_key_on(mask, 0, k, qa)) continue;
+            const float e = exp2f(fmaf(s[k], scale_log2, -mx));
+            l += e;
+            a = fmaf(e, dp[k], a);
+            g = fmaxf(g, fabsf(dp[k]));
         }
-        __syncthreads();
     }
-    const float rmax = ssm[0];
-    const bool empty = (rmax <= -1e29f);
+    l = block_sum(l, red);
+    a = block_sum(a, red);
+    g = block_max(g, red);
+    if (threadIdx.x == 0) {
+        const bool any = l > 0.0f;
+        const float Dq = any ? a / l : 0.0f;
+        stats[3 * i + 0] = any ? mx : 0.0f;
+        stats[3 * i + 1] = any ? 1.0f / l : 0.0f;
+        stats[3 * i + 2] = Dq;
+        const float b = any ? scale * (g + fabsf(Dq)) : 0.0f;
+        if (isfinite(b)) atomicMax(bound_bits, __float_as_uint(b));
+    }
+}
 
-    float local_sum = 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        float v = __half2float(row[k]) * scale;
-        if (mask && mask[k] <= 0.5f) v = -1e30f;
-        if (causal && k > q) v = -1e30f;
-        const float e = empty ? 0.0f : __expf(v - rmax);
-        row[k] = __float2half(e);
-        local_sum += e;
+// One 32 x 32 tile of (chunk row i, key j) per block of 32 x 8 threads:
+// P = exp(s - max) / l and dS = P (dP - D_q) * scale in FP32, then narrowed for
+// the three GEMMs that consume them. dS, scaled by bw_ds_scale, is split into
+// a 16-bit hi part and the 16-bit rounding of its remainder (lo): the dQ / dK
+// GEMMs multiply [hi | lo] by [K ; K] (resp. [Q ; Q]), which carries dS to
+// ~2^-22 (FP16) / 2^-16 (BF16) instead of one 16-bit rounding. dS enters dQ and
+// dK through sums whose terms cancel (sum_k dS = 0), so a single rounding is
+// amplified exactly where the softmax is peaked.
+//   dS  (m, 2 Lk_pad):     row i = [hi | lo] for dQ
+//   dST (Lk_pad, 2 m_pad): row j = [hi | lo] for dK
+//   PT  (Lk_pad, m_pad):   P * kPScale for dV
+// The transposes go through shared memory so both stores coalesce. Masked,
+// causal-excluded and pad positions are exact zeros.
+template <typename T>
+__global__ void bw_ds_kernel(const float* __restrict__ S, const float* __restrict__ dP, int ldS,
+                             const float* __restrict__ stats, const unsigned int* __restrict__ sbits, int m,
+                             int m_pad, int Lk, int Lk_pad, int q0, float scale_log2, float scale,
+                             const float* __restrict__ mask, int causal, T* __restrict__ dS, T* __restrict__ dST,
+                             T* __restrict__ PT) {
+    __shared__ float tp[32][33], tds[32][33];
+    const int j0 = blockIdx.x * 32, i0 = blockIdx.y * 32;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int j = j0 + tx;
+    const bool jon = j < Lk && !(mask && mask[j] <= 0.5f);
+    const float dsc = bw_ds_scale(sbits) * scale;
+    for (int r = ty; r < 32; r += 8) {
+        const int i = i0 + r;
+        float p = 0.0f, ds = 0.0f;
+        if (i < m && jon && !(causal && j > q0 + i)) {
+            const float* st = stats + 3 * i;
+            const size_t o = static_cast<size_t>(i) * ldS + j;
+            if (st[1] > 0.0f) {
+                p = exp2f(fmaf(S[o], scale_log2, -st[0])) * st[1];
+                ds = p * (dP[o] - st[2]) * dsc;
+            }
+        }
+        if (i < m && j < Lk_pad) {
+            const T hi = from_f32<T>(ds);
+            T* row = dS + static_cast<size_t>(i) * 2 * Lk_pad;
+            row[j] = hi;
+            row[Lk_pad + j] = from_f32<T>(ds - to_f32(hi));
+        }
+        tp[r][tx] = p;
+        tds[r][tx] = ds;
     }
-    ssm[tid] = local_sum;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        __syncthreads();
-    }
-    const float rsum = ssm[0];
-    const float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        const float e = __half2float(row[k]);
-        row[k] = __float2half(e * inv);
-    }
-}
-
-// dP[q, k] = sum_d dO_h[q, d] * V_h[k, d]   (Lq, Lk), FP32 accumulation
-__global__ void fab_dP_kernel(const __half* __restrict__ dOh,
-                              const __half* __restrict__ Vh,
-                              __half* __restrict__ dP,
-                              int Lq, int Lk, int hd) {
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    const int q = blockIdx.y * blockDim.y + threadIdx.y;
-    if (q >= Lq || k >= Lk) return;
-    float acc = 0.0f;
-    for (int d = 0; d < hd; ++d) {
-        acc += __half2float(dOh[q * hd + d]) * __half2float(Vh[k * hd + d]);
-    }
-    dP[q * Lk + k] = __float2half(acc);
-}
-
-// In-place dS = P * (dP - D_q) * scale  where D_q = sum_k P[q,k]*dP[q,k].
-__global__ void fab_dS_from_P_dP_kernel(__half* __restrict__ P_dS,
-                                        const __half* __restrict__ dP,
-                                        int Lq, int Lk,
-                                        float scale) {
-    extern __shared__ float ssm[];
-    const int q = blockIdx.x;
-    const int tid = threadIdx.x;
-    __half* prow = P_dS + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-    const __half* dprow = dP + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-
-    float local = 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        local += __half2float(prow[k]) * __half2float(dprow[k]);
-    }
-    ssm[tid] = local;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        __syncthreads();
-    }
-    const float Dq = ssm[0];
-
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        const float p  = __half2float(prow[k]);
-        const float dp = __half2float(dprow[k]);
-        prow[k] = __float2half(p * (dp - Dq) * scale);
+    for (int r = ty; r < 32; r += 8) {
+        const int jj = j0 + r, ii = i0 + tx;
+        if (jj < Lk_pad && ii < m_pad) {
+            PT[static_cast<size_t>(jj) * m_pad + ii] = from_f32<T>(tp[tx][r] * kPScale);
+            const float ds = tds[tx][r];
+            const T hi = from_f32<T>(ds);
+            T* row = dST + static_cast<size_t>(jj) * 2 * m_pad;
+            row[ii] = hi;
+            row[m_pad + ii] = from_f32<T>(ds - to_f32(hi));
+        }
     }
 }
 
-// dV_h[k, d] = sum_q P[q, k] * dO_h[q, d]
-__global__ void fab_dVh_kernel(const __half* __restrict__ P,
-                               const __half* __restrict__ dOh,
-                               __half* __restrict__ dVh,
-                               int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (int q = 0; q < Lq; ++q) {
-        acc += __half2float(P[q * Lk + k]) * __half2float(dOh[q * hd + d]);
+// Score elements (rows x Lk_pad) per query chunk. Each costs 18 bytes of
+// scratch (FP32 S and dP, the 16-bit hi / lo dS and dS^T, 16-bit P^T):
+// 8 M -> 144 MB.
+constexpr size_t kBwdScoreBudget = size_t(8) << 20;
+
+// dQ / dK / dV of one block of rows: Q, dO (Lq rows), K, V (Lk rows), row
+// stride ld, head h at columns [h*hd, (h+1)*hd); the gradients are written at
+// the same strides. Returns false, having written nothing, when the
+// FP32-output GEMM cannot run on this device.
+template <typename T>
+bool tc_backward(const T* Q, const T* K, const T* V, const T* dO, const float* mask, bool causal, T* dQ, T* dK,
+                 T* dV, int Lq, int Lk, int ld, int nh, int hd, cudaStream_t stream) {
+    namespace mg = detail::cuda::mma_gemm;
+    const Dtype dt = dtype_of<T>();
+    const int hdp = round8(hd), Lk_pad = round8(Lk);
+    int rows = Lq;
+    if (static_cast<size_t>(Lq) * Lk_pad > kBwdScoreBudget) {
+        rows = static_cast<int>(kBwdScoreBudget / Lk_pad) / 128 * 128;
+        if (rows < 128) rows = 128;
+        if (rows > Lq) rows = Lq;
     }
-    dVh[k * hd + d] = __float2half(acc);
+    const int rows_pad = round8(rows);
+
+    auto buf = [&](size_t n, Dtype d) { return Tensor::empty_on(Device::CUDA, static_cast<int>(n), 1, d); };
+    const size_t kd = static_cast<size_t>(Lk_pad) * hdp, qd = static_cast<size_t>(rows_pad) * hdp;
+    const size_t sc = static_cast<size_t>(rows) * Lk_pad, tc = static_cast<size_t>(Lk_pad) * rows_pad;
+    Tensor Kh = buf(kd, dt), Vh = buf(kd, dt), KhT = buf(2 * kd, dt);
+    Tensor Qh = buf(qd, dt), dOh = buf(qd, dt), QhT = buf(2 * qd, dt), dOhT = buf(qd, dt);
+    Tensor Sb = buf(sc, Dtype::FP32), dPb = buf(sc, Dtype::FP32), dSb = buf(2 * sc, dt);
+    Tensor dSTb = buf(2 * tc, dt), PTb = buf(tc, dt), stats = buf(static_cast<size_t>(rows) * 3, Dtype::FP32);
+    Tensor dq32 = buf(qd, Dtype::FP32), dk32 = buf(kd, Dtype::FP32), dv32 = buf(kd, Dtype::FP32);
+    Tensor tmp = buf(2 * kd, Dtype::FP32), bound = buf(1, Dtype::FP32);
+
+    T* kh = static_cast<T*>(Kh.data);
+    T* vh = static_cast<T*>(Vh.data);
+    T* khT = static_cast<T*>(KhT.data);
+    T* qh = static_cast<T*>(Qh.data);
+    T* doh = static_cast<T*>(dOh.data);
+    T* qhT = static_cast<T*>(QhT.data);
+    T* dohT = static_cast<T*>(dOhT.data);
+    float* s = static_cast<float*>(Sb.data);
+    float* dp = static_cast<float*>(dPb.data);
+    T* ds = static_cast<T*>(dSb.data);
+    T* dsT = static_cast<T*>(dSTb.data);
+    T* pT = static_cast<T*>(PTb.data);
+    float* st = static_cast<float*>(stats.data);
+    float* dq = static_cast<float*>(dq32.data);
+    float* dk = static_cast<float*>(dk32.data);
+    float* dv = static_cast<float*>(dv32.data);
+    float* tk = static_cast<float*>(tmp.data);
+    float* tv = tk + kd;
+    unsigned int* bb = static_cast<unsigned int*>(bound.data);
+
+    const float scale = 1.0f / sqrtf(static_cast<float>(hd));
+    const float scale_log2 = scale * 1.4426950408889634f;
+    constexpr int CP = 256;
+    const int cz = causal ? 1 : 0;
+    const long long kdl = static_cast<long long>(kd);
+
+    for (int h = 0; h < nh; ++h) {
+        const int c0 = h * hd;
+        bw_gather_kernel<T><<<grid_for(kd, CP), CP, 0, stream>>>(K, ld, c0, Lk, hd, kh, Lk_pad, hdp);
+        bw_gather_kernel<T><<<grid_for(kd, CP), CP, 0, stream>>>(V, ld, c0, Lk, hd, vh, Lk_pad, hdp);
+        bw_gather_T_kernel<T><<<grid_for(kd, CP), CP, 0, stream>>>(K, ld, c0, Lk, hd, khT, Lk_pad, hdp,
+                                                                   2 * Lk_pad, 1);
+        for (int q0 = 0; q0 < Lq; q0 += rows) {
+            const int m = Lq - q0 < rows ? Lq - q0 : rows;
+            const int m_pad = round8(m);
+            const size_t mo = static_cast<size_t>(q0) * ld;
+            const long long mq = static_cast<long long>(m) * hdp, mqT = static_cast<long long>(m_pad) * hdp;
+            bw_gather_kernel<T><<<grid_for(mq, CP), CP, 0, stream>>>(Q + mo, ld, c0, m, hd, qh, m, hdp);
+            bw_gather_kernel<T><<<grid_for(mq, CP), CP, 0, stream>>>(dO + mo, ld, c0, m, hd, doh, m, hdp);
+            bw_gather_T_kernel<T><<<grid_for(mqT, CP), CP, 0, stream>>>(Q + mo, ld, c0, m, hd, qhT, m_pad, hdp,
+                                                                        2 * m_pad, 1);
+            bw_gather_T_kernel<T><<<grid_for(mqT, CP), CP, 0, stream>>>(dO + mo, ld, c0, m, hd, dohT, m_pad, hdp,
+                                                                        m_pad, 0);
+
+            // Only the first GEMM of the call can refuse (the device check);
+            // nothing has been written to dQ / dK / dV by then.
+            if (!mg::launch_f32out(qh, kh, s, m, Lk_pad, hdp, stream)) return false;
+            mg::launch_f32out(doh, vh, dp, m, Lk_pad, hdp, stream);
+            BROTENSOR_CUDA_CHECK(cudaMemsetAsync(bb, 0, sizeof(unsigned int), stream));
+            bw_row_stats_kernel<<<m, 256, 0, stream>>>(s, dp, Lk_pad, Lk, q0, scale_log2, scale, mask, cz, st, bb);
+            {
+                dim3 block(32, 8);
+                dim3 grid((Lk_pad + 31) / 32, (m_pad + 31) / 32);
+                bw_ds_kernel<T><<<grid, block, 0, stream>>>(s, dp, Lk_pad, st, bb, m, m_pad, Lk, Lk_pad, q0,
+                                                            scale_log2, scale, mask, cz, ds, dsT, pT);
+            }
+            mg::launch_f32out(ds, khT, dq, m, hdp, 2 * Lk_pad, stream);
+            bw_scatter_kernel<T><<<grid_for(static_cast<long long>(m) * hd, CP), CP, 0, stream>>>(
+                dq, hdp, m, hd, dQ + mo, ld, c0, bb);
+            const int first = q0 == 0;
+            mg::launch_f32out(dsT, qhT, tk, Lk_pad, hdp, 2 * m_pad, stream);
+            mg::launch_f32out(pT, dohT, tv, Lk_pad, hdp, m_pad, stream);
+            bw_acc_kernel<<<grid_for(kd, CP), CP, 0, stream>>>(dk, tk, kdl, bb, 1.0f, first);
+            bw_acc_kernel<<<grid_for(kd, CP), CP, 0, stream>>>(dv, tv, kdl, nullptr, 1.0f / kPScale, first);
+        }
+        const long long kh_n = static_cast<long long>(Lk) * hd;
+        bw_scatter_kernel<T><<<grid_for(kh_n, CP), CP, 0, stream>>>(dk, hdp, Lk, hd, dK, ld, c0, nullptr);
+        bw_scatter_kernel<T><<<grid_for(kh_n, CP), CP, 0, stream>>>(dv, hdp, Lk, hd, dV, ld, c0, nullptr);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
-// dQ_h[q, d] = sum_k dS[q, k] * K_h[k, d]
-__global__ void fab_dQh_kernel(const __half* __restrict__ dS,
-                               const __half* __restrict__ Kh,
-                               __half* __restrict__ dQh,
-                               int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int q = blockIdx.y * blockDim.y + threadIdx.y;
-    if (q >= Lq || d >= hd) return;
-    float acc = 0.0f;
-    for (int k = 0; k < Lk; ++k) {
-        acc += __half2float(dS[q * Lk + k]) * __half2float(Kh[k * hd + d]);
-    }
-    dQh[q * hd + d] = __float2half(acc);
-}
-
-// dK_h[k, d] = sum_q dS[q, k] * Q_h[q, d]
-__global__ void fab_dKh_kernel(const __half* __restrict__ dS,
-                               const __half* __restrict__ Qh,
-                               __half* __restrict__ dKh,
-                               int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (int q = 0; q < Lq; ++q) {
-        acc += __half2float(dS[q * Lk + k]) * __half2float(Qh[q * hd + d]);
-    }
-    dKh[k * hd + d] = __float2half(acc);
-}
-
-// ─── BF16 kernels (verbatim copies of the FP16 kernels above, with ──────────
-//     __half→__nv_bfloat16 / __half2float→__bfloat162float /
-//     __float2half→__float2bfloat16). All real math stays in float. ──────────
+// ─── Row path (FP32 math, 3 floats of scratch per row and head) ─────────────
 //
-// fp16_internal::launch_matmul_ABT is FP16-only (tensor cores), so the BF16
-// path uses a self-contained naive BF16 matmul (FP32 accumulation) instead.
+// One warp per (row, head), after flash_attention_packed_qkv_backward:
+//   rw_query_kernel  each query row re-runs its softmax online (max, normaliser
+//                    and its output O_r), stores (max, 1/l, D_r = dO_r . O_r),
+//                    then walks its keys again for dQ_r = scale sum_k dS_rk k_k.
+//   rw_key_kernel    each key row walks the queries attending it for
+//                    dK_k = scale sum_r dS_rk q_r and dV_k = sum_r P_rk dO_r.
+// Scores, P and dS live in FP32 registers; nothing is accumulated atomically,
+// so the result is deterministic. Two launches cover every head and every
+// varlen sequence, where the tensor-core pipeline launches per head and per
+// sequence: this path is the faster one until the per-sequence score matrix
+// is large (kRowsMaxScores). It is also the FP32 path, and the fallback
+// wherever the FP32-output GEMM does not run.
 
-__global__ void fab_extract_head_LD_bf16_kernel(const __nv_bfloat16* __restrict__ X,
-                                                __nv_bfloat16* __restrict__ Y,
-                                                int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Y[l * head_dim + d] = X[l * D + head_off + d];
-}
+// Warps per block. Consecutive warps take consecutive rows of one head, so a
+// block's warps walk the same keys (queries) together through L1.
+constexpr int kRowWarps = 8;
 
-__global__ void fab_pack_head_LD_bf16_kernel(const __nv_bfloat16* __restrict__ Y,
-                                             __nv_bfloat16* __restrict__ Out,
-                                             int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Out[l * D + head_off + d] = Y[l * head_dim + d];
-}
-
-// Naive BF16 matmul: C(M, N) = A(M, K) @ B(N, K)^T, FP32 accumulation.
-__global__ void fab_matmul_ABT_bf16_kernel(const __nv_bfloat16* __restrict__ A,
-                                           const __nv_bfloat16* __restrict__ B,
-                                           __nv_bfloat16* __restrict__ C,
-                                           int M, int N, int K) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = M * N;
-    if (idx >= total) return;
-    const int m = idx / N;
-    const int n = idx % N;
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        acc += __bfloat162float(A[m * K + k]) * __bfloat162float(B[n * K + k]);
+// The sequence of packed row r under offsets cu[0..B]: the b with
+// cu[b] <= r < cu[b + 1] (an empty sequence shares its offset with the next).
+__device__ __forceinline__ int rw_seq_of(const int32_t* __restrict__ cu, int B, int r) {
+    int lo = 0, hi = B;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) >> 1;
+        if (cu[mid] <= r) lo = mid;
+        else hi = mid;
     }
-    C[idx] = __float2bfloat16(acc);
+    return lo;
 }
 
-inline void launch_matmul_ABT_bf16(const __nv_bfloat16* A,
-                                   const __nv_bfloat16* B,
-                                   __nv_bfloat16* C, int M, int N, int K,
-                                   cudaStream_t stream) {
-    if (M == 0 || N == 0) return;
-    const int total = M * N;
-    const int block = 128;
-    const int grid  = (total + block - 1) / block;
-    fab_matmul_ABT_bf16_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
+__device__ __forceinline__ float rw_warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
 }
 
-__global__ void fab_softmax_rows_bf16_kernel(__nv_bfloat16* __restrict__ S,
-                                             int Lq, int Lk,
-                                             float scale,
-                                             const float* __restrict__ mask,
-                                             int causal) {
-    extern __shared__ float ssm[];
-    const int q = blockIdx.x;
-    const int tid = threadIdx.x;
-    __nv_bfloat16* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-
-    float local_max = -1e30f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        float v = __bfloat162float(row[k]) * scale;
-        if (mask && mask[k] <= 0.5f) v = -1e30f;
-        if (causal && k > q) v = -1e30f;
-        if (v > local_max) local_max = v;
+// Lane-strided slice of one head vector: element i of the lane is d = lane + 32 i.
+template <typename T, int NPL>
+__device__ __forceinline__ void rw_load(const T* __restrict__ p, int lane, int hd, float (&x)[NPL]) {
+#pragma unroll
+    for (int i = 0; i < NPL; ++i) {
+        const int d = lane + 32 * i;
+        x[i] = d < hd ? to_f32(p[d]) : 0.0f;
     }
-    ssm[tid] = local_max;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            const float o = ssm[tid + s];
-            if (o > ssm[tid]) ssm[tid] = o;
+}
+
+template <int NPL>
+__device__ __forceinline__ float rw_dot(const float (&a)[NPL], const float (&b)[NPL]) {
+    float s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NPL; ++i) s = fmaf(a[i], b[i], s);
+    return rw_warp_sum(s);
+}
+
+template <typename T, int NPL>
+__device__ __forceinline__ void rw_store(T* __restrict__ p, int lane, int hd, const float (&x)[NPL], float mul) {
+#pragma unroll
+    for (int i = 0; i < NPL; ++i) {
+        const int d = lane + 32 * i;
+        if (d < hd) p[d] = from_f32<T>(x[i] * mul);
+    }
+}
+
+// Rows [q0, q1) of the packed query axis attend keys [k0, k1). cu_q == nullptr
+// is the single block (0, nq) x (0, nk), where the key mask applies.
+struct RwSeg {
+    int q0, q1, k0, k1;
+};
+__device__ __forceinline__ RwSeg rw_seg(const int32_t* cu_q, const int32_t* cu_k, int b, int nq, int nk) {
+    if (!cu_q) return {0, nq, 0, nk};
+    return {cu_q[b], cu_q[b + 1], cu_k[b], cu_k[b + 1]};
+}
+
+template <typename T, int NPL>
+__global__ void rw_query_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __restrict__ V,
+                                const T* __restrict__ dO, int ld, int H, int hd, const int32_t* __restrict__ cu_q,
+                                const int32_t* __restrict__ cu_k, int B, int nq, int nk,
+                                const float* __restrict__ mask, int causal, float scale, float scale_log2,
+                                float* __restrict__ stats, T* __restrict__ dQ) {
+    const long long warp = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= static_cast<long long>(nq) * H) return;
+    const int h = static_cast<int>(warp / nq), r = static_cast<int>(warp % nq);
+    const RwSeg sg = rw_seg(cu_q, cu_k, cu_q ? rw_seq_of(cu_q, B, r) : 0, nq, nk);
+    const int k1 = causal ? min(sg.k1, sg.k0 + (r - sg.q0) + 1) : sg.k1;
+    const int c0 = h * hd;
+
+    float q[NPL], g[NPL], kk[NPL], vv[NPL], acc[NPL];
+    rw_load<T, NPL>(Q + static_cast<size_t>(r) * ld + c0, lane, hd, q);
+    rw_load<T, NPL>(dO + static_cast<size_t>(r) * ld + c0, lane, hd, g);
+#pragma unroll
+    for (int i = 0; i < NPL; ++i) acc[i] = 0.0f;
+
+    // Pass 1: max (log2 domain), normaliser and O_r, online.
+    float m = neg_inf(), l = 0.0f;
+    for (int k = sg.k0; k < k1; ++k) {
+        if (mask && mask[k - sg.k0] <= 0.5f) continue;
+        const T* kr = K + static_cast<size_t>(k) * ld + c0;
+        rw_load<T, NPL>(kr, lane, hd, kk);
+        rw_load<T, NPL>(V + static_cast<size_t>(k) * ld + c0, lane, hd, vv);
+        const float s = rw_dot<NPL>(q, kk) * scale_log2;
+        if (s > m) {
+            const float f = exp2f(m - s);  // 0 on the first key
+            l = fmaf(l, f, 1.0f);
+#pragma unroll
+            for (int i = 0; i < NPL; ++i) acc[i] = fmaf(acc[i], f, vv[i]);
+            m = s;
+        } else {
+            const float e = exp2f(s - m);
+            l += e;
+#pragma unroll
+            for (int i = 0; i < NPL; ++i) acc[i] = fmaf(e, vv[i], acc[i]);
         }
-        __syncthreads();
     }
-    const float rmax = ssm[0];
-    const bool empty = (rmax <= -1e29f);
-
-    float local_sum = 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        float v = __bfloat162float(row[k]) * scale;
-        if (mask && mask[k] <= 0.5f) v = -1e30f;
-        if (causal && k > q) v = -1e30f;
-        const float e = empty ? 0.0f : __expf(v - rmax);
-        row[k] = __float2bfloat16(e);
-        local_sum += e;
+    const bool any = l > 0.0f;
+    const float inv_l = any ? 1.0f / l : 0.0f;
+    const float D = rw_dot<NPL>(g, acc) * inv_l;
+    if (!any) m = 0.0f;
+    if (lane == 0) {
+        float* st = stats + 3 * static_cast<size_t>(warp);
+        st[0] = m;
+        st[1] = inv_l;
+        st[2] = D;
     }
-    ssm[tid] = local_sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        __syncthreads();
-    }
-    const float rsum = ssm[0];
-    const float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        const float e = __bfloat162float(row[k]);
-        row[k] = __float2bfloat16(e * inv);
-    }
-}
 
-__global__ void fab_dP_bf16_kernel(const __nv_bfloat16* __restrict__ dOh,
-                                   const __nv_bfloat16* __restrict__ Vh,
-                                   __nv_bfloat16* __restrict__ dP,
-                                   int Lq, int Lk, int hd) {
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    const int q = blockIdx.y * blockDim.y + threadIdx.y;
-    if (q >= Lq || k >= Lk) return;
-    float acc = 0.0f;
-    for (int d = 0; d < hd; ++d) {
-        acc += __bfloat162float(dOh[q * hd + d]) * __bfloat162float(Vh[k * hd + d]);
-    }
-    dP[q * Lk + k] = __float2bfloat16(acc);
-}
-
-__global__ void fab_dS_from_P_dP_bf16_kernel(__nv_bfloat16* __restrict__ P_dS,
-                                             const __nv_bfloat16* __restrict__ dP,
-                                             int Lq, int Lk,
-                                             float scale) {
-    extern __shared__ float ssm[];
-    const int q = blockIdx.x;
-    const int tid = threadIdx.x;
-    __nv_bfloat16* prow = P_dS + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-    const __nv_bfloat16* dprow = dP + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-
-    float local = 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        local += __bfloat162float(prow[k]) * __bfloat162float(dprow[k]);
-    }
-    ssm[tid] = local;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        __syncthreads();
-    }
-    const float Dq = ssm[0];
-
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        const float p  = __bfloat162float(prow[k]);
-        const float dp = __bfloat162float(dprow[k]);
-        prow[k] = __float2bfloat16(p * (dp - Dq) * scale);
-    }
-}
-
-__global__ void fab_dVh_bf16_kernel(const __nv_bfloat16* __restrict__ P,
-                                    const __nv_bfloat16* __restrict__ dOh,
-                                    __nv_bfloat16* __restrict__ dVh,
-                                    int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (int q = 0; q < Lq; ++q) {
-        acc += __bfloat162float(P[q * Lk + k]) * __bfloat162float(dOh[q * hd + d]);
-    }
-    dVh[k * hd + d] = __float2bfloat16(acc);
-}
-
-__global__ void fab_dQh_bf16_kernel(const __nv_bfloat16* __restrict__ dS,
-                                    const __nv_bfloat16* __restrict__ Kh,
-                                    __nv_bfloat16* __restrict__ dQh,
-                                    int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int q = blockIdx.y * blockDim.y + threadIdx.y;
-    if (q >= Lq || d >= hd) return;
-    float acc = 0.0f;
-    for (int k = 0; k < Lk; ++k) {
-        acc += __bfloat162float(dS[q * Lk + k]) * __bfloat162float(Kh[k * hd + d]);
-    }
-    dQh[q * hd + d] = __float2bfloat16(acc);
-}
-
-__global__ void fab_dKh_bf16_kernel(const __nv_bfloat16* __restrict__ dS,
-                                    const __nv_bfloat16* __restrict__ Qh,
-                                    __nv_bfloat16* __restrict__ dKh,
-                                    int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (int q = 0; q < Lq; ++q) {
-        acc += __bfloat162float(dS[q * Lk + k]) * __bfloat162float(Qh[q * hd + d]);
-    }
-    dKh[k * hd + d] = __float2bfloat16(acc);
-}
-
-// ─── FP32 kernels (mirror the BF16 block with no half↔float conversions) ───
-//
-// Used only by flash_attention_varlen_backward's FP32 path. Naive matmuls,
-// scalar softmax — slower than the FP16 tensor-core route but eliminates the
-// cast hop for FP32 trainers (per brosoundml's profiling, the cast pairs
-// around varlen calls were a measurable cost). FP32 storage throughout.
-
-__global__ void fab_extract_head_LD_fp32_kernel(const float* __restrict__ X,
-                                                float* __restrict__ Y,
-                                                int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Y[l * head_dim + d] = X[l * D + head_off + d];
-}
-
-__global__ void fab_pack_head_LD_fp32_kernel(const float* __restrict__ Y,
-                                             float* __restrict__ Out,
-                                             int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Out[l * D + head_off + d] = Y[l * head_dim + d];
-}
-
-// Naive FP32 matmul: C(M, N) = A(M, K) @ B(N, K)^T.
-__global__ void fab_matmul_ABT_fp32_kernel(const float* __restrict__ A,
-                                           const float* __restrict__ B,
-                                           float* __restrict__ C,
-                                           int M, int N, int K) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = M * N;
-    if (idx >= total) return;
-    const int m = idx / N;
-    const int n = idx % N;
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        acc += A[m * K + k] * B[n * K + k];
-    }
-    C[idx] = acc;
-}
-
-inline void launch_matmul_ABT_fp32(const float* A, const float* B, float* C,
-                                   int M, int N, int K, cudaStream_t stream) {
-    if (M == 0 || N == 0) return;
-    const int total = M * N;
-    const int block = 128;
-    const int grid  = (total + block - 1) / block;
-    fab_matmul_ABT_fp32_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
-}
-
-__global__ void fab_softmax_rows_fp32_kernel(float* __restrict__ S,
-                                             int Lq, int Lk,
-                                             float scale,
-                                             const float* __restrict__ mask,
-                                             int causal) {
-    extern __shared__ float ssm[];
-    const int q = blockIdx.x;
-    const int tid = threadIdx.x;
-    float* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-
-    float local_max = -1e30f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        float v = row[k] * scale;
-        if (mask && mask[k] <= 0.5f) v = -1e30f;
-        if (causal && k > q) v = -1e30f;
-        if (v > local_max) local_max = v;
-    }
-    ssm[tid] = local_max;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            const float o = ssm[tid + s];
-            if (o > ssm[tid]) ssm[tid] = o;
+    // Pass 2: dQ_r = scale * sum_k P (dP - D) k_k.
+#pragma unroll
+    for (int i = 0; i < NPL; ++i) acc[i] = 0.0f;
+    if (any) {
+        for (int k = sg.k0; k < k1; ++k) {
+            if (mask && mask[k - sg.k0] <= 0.5f) continue;
+            rw_load<T, NPL>(K + static_cast<size_t>(k) * ld + c0, lane, hd, kk);
+            rw_load<T, NPL>(V + static_cast<size_t>(k) * ld + c0, lane, hd, vv);
+            const float p = exp2f(fmaf(rw_dot<NPL>(q, kk), scale_log2, -m)) * inv_l;
+            const float ds = p * (rw_dot<NPL>(g, vv) - D);
+#pragma unroll
+            for (int i = 0; i < NPL; ++i) acc[i] = fmaf(ds, kk[i], acc[i]);
         }
-        __syncthreads();
     }
-    const float rmax = ssm[0];
-    const bool empty = (rmax <= -1e29f);
-
-    float local_sum = 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        float v = row[k] * scale;
-        if (mask && mask[k] <= 0.5f) v = -1e30f;
-        if (causal && k > q) v = -1e30f;
-        const float e = empty ? 0.0f : __expf(v - rmax);
-        row[k] = e;
-        local_sum += e;
-    }
-    ssm[tid] = local_sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        __syncthreads();
-    }
-    const float rsum = ssm[0];
-    const float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        row[k] *= inv;
-    }
+    rw_store<T, NPL>(dQ + static_cast<size_t>(r) * ld + c0, lane, hd, acc, scale);
 }
 
-__global__ void fab_dP_fp32_kernel(const float* __restrict__ dOh,
-                                   const float* __restrict__ Vh,
-                                   float* __restrict__ dP,
-                                   int Lq, int Lk, int hd) {
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    const int q = blockIdx.y * blockDim.y + threadIdx.y;
-    if (q >= Lq || k >= Lk) return;
-    float acc = 0.0f;
-    for (int d = 0; d < hd; ++d) {
-        acc += dOh[q * hd + d] * Vh[k * hd + d];
+template <typename T, int NPL>
+__global__ void rw_key_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __restrict__ V,
+                              const T* __restrict__ dO, int ld, int H, int hd, const int32_t* __restrict__ cu_q,
+                              const int32_t* __restrict__ cu_k, int B, int nq, int nk,
+                              const float* __restrict__ mask, int causal, float scale, float scale_log2,
+                              const float* __restrict__ stats, T* __restrict__ dK, T* __restrict__ dV) {
+    const long long warp = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= static_cast<long long>(nk) * H) return;
+    const int h = static_cast<int>(warp / nk), j = static_cast<int>(warp % nk);
+    const RwSeg sg = rw_seg(cu_q, cu_k, cu_k ? rw_seq_of(cu_k, B, j) : 0, nq, nk);
+    const int kj = j - sg.k0;
+    const int c0 = h * hd;
+    const float* sth = stats + 3 * static_cast<size_t>(h) * nq;
+
+    float kk[NPL], vv[NPL], q[NPL], g[NPL], dk[NPL], dv[NPL];
+#pragma unroll
+    for (int i = 0; i < NPL; ++i) dk[i] = dv[i] = 0.0f;
+    if (!(mask && mask[kj] <= 0.5f)) {
+        rw_load<T, NPL>(K + static_cast<size_t>(j) * ld + c0, lane, hd, kk);
+        rw_load<T, NPL>(V + static_cast<size_t>(j) * ld + c0, lane, hd, vv);
+        for (int r = causal ? sg.q0 + kj : sg.q0; r < sg.q1; ++r) {
+            const float* st = sth + 3 * static_cast<size_t>(r);
+            rw_load<T, NPL>(Q + static_cast<size_t>(r) * ld + c0, lane, hd, q);
+            rw_load<T, NPL>(dO + static_cast<size_t>(r) * ld + c0, lane, hd, g);
+            const float p = exp2f(fmaf(rw_dot<NPL>(q, kk), scale_log2, -st[0])) * st[1];
+            const float ds = p * (rw_dot<NPL>(g, vv) - st[2]);
+#pragma unroll
+            for (int i = 0; i < NPL; ++i) {
+                dk[i] = fmaf(ds, q[i], dk[i]);
+                dv[i] = fmaf(p, g[i], dv[i]);
+            }
+        }
     }
-    dP[q * Lk + k] = acc;
+    rw_store<T, NPL>(dK + static_cast<size_t>(j) * ld + c0, lane, hd, dk, scale);
+    rw_store<T, NPL>(dV + static_cast<size_t>(j) * ld + c0, lane, hd, dv, 1.0f);
 }
 
-__global__ void fab_dS_from_P_dP_fp32_kernel(float* __restrict__ P_dS,
-                                             const float* __restrict__ dP,
-                                             int Lq, int Lk,
-                                             float scale) {
-    extern __shared__ float ssm[];
-    const int q = blockIdx.x;
-    const int tid = threadIdx.x;
-    float* prow = P_dS + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-    const float* dprow = dP + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-
-    float local = 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        local += prow[k] * dprow[k];
-    }
-    ssm[tid] = local;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        __syncthreads();
-    }
-    const float Dq = ssm[0];
-
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        prow[k] = prow[k] * (dprow[k] - Dq) * scale;
-    }
+template <typename T, int NPL>
+void rows_launch(const Tensor& Q, const Tensor& K, const Tensor& V, const Tensor& dO, const int32_t* cu_q,
+                 const int32_t* cu_k, int B, const float* mask, bool causal, int H, int hd, Tensor& dQ, Tensor& dK,
+                 Tensor& dV, cudaStream_t stream) {
+    const int nq = Q.rows, nk = K.rows, ld = Q.cols;
+    const float scale = 1.0f / sqrtf(static_cast<float>(hd));
+    const float scale_log2 = scale * 1.4426950408889634f;
+    Tensor stats = Tensor::empty_on(Device::CUDA, nq * H, 3, Dtype::FP32);
+    const T* q = static_cast<const T*>(Q.data);
+    const T* k = static_cast<const T*>(K.data);
+    const T* v = static_cast<const T*>(V.data);
+    const T* g = static_cast<const T*>(dO.data);
+    float* st = static_cast<float*>(stats.data);
+    constexpr int threads = 32 * kRowWarps;
+    const int cz = causal ? 1 : 0;
+    rw_query_kernel<T, NPL><<<grid_for(static_cast<long long>(nq) * H * 32, threads), threads, 0, stream>>>(
+        q, k, v, g, ld, H, hd, cu_q, cu_k, B, nq, nk, mask, cz, scale, scale_log2, st, static_cast<T*>(dQ.data));
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    rw_key_kernel<T, NPL><<<grid_for(static_cast<long long>(nk) * H * 32, threads), threads, 0, stream>>>(
+        q, k, v, g, ld, H, hd, cu_q, cu_k, B, nq, nk, mask, cz, scale, scale_log2, st, static_cast<T*>(dK.data),
+        static_cast<T*>(dV.data));
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ void fab_dVh_fp32_kernel(const float* __restrict__ P,
-                                    const float* __restrict__ dOh,
-                                    float* __restrict__ dVh,
-                                    int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (int q = 0; q < Lq; ++q) {
-        acc += P[q * Lk + k] * dOh[q * hd + d];
+template <typename T>
+void rows_backward_t(const Tensor& Q, const Tensor& K, const Tensor& V, const Tensor& dO, const int32_t* cu_q,
+                     const int32_t* cu_k, int B, const float* mask, bool causal, int H, int hd, Tensor& dQ,
+                     Tensor& dK, Tensor& dV, cudaStream_t stream) {
+#define BT_RW(N) rows_launch<T, N>(Q, K, V, dO, cu_q, cu_k, B, mask, causal, H, hd, dQ, dK, dV, stream)
+    switch ((hd + 31) / 32) {
+    case 1: BT_RW(1); break;
+    case 2: BT_RW(2); break;
+    case 3: BT_RW(3); break;
+    case 4: BT_RW(4); break;
+    case 5: BT_RW(5); break;
+    case 6: BT_RW(6); break;
+    case 7:
+    case 8: BT_RW(8); break;
+    default:
+        throw std::runtime_error("flash_attention_backward: head_dim above 256 needs the tensor-core path (sm_80+)");
     }
-    dVh[k * hd + d] = acc;
+#undef BT_RW
 }
 
-__global__ void fab_dQh_fp32_kernel(const float* __restrict__ dS,
-                                    const float* __restrict__ Kh,
-                                    float* __restrict__ dQh,
-                                    int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int q = blockIdx.y * blockDim.y + threadIdx.y;
-    if (q >= Lq || d >= hd) return;
-    float acc = 0.0f;
-    for (int k = 0; k < Lk; ++k) {
-        acc += dS[q * Lk + k] * Kh[k * hd + d];
-    }
-    dQh[q * hd + d] = acc;
+// The row path over the whole call: Q / dO / dQ have Q.rows rows, K / V / dK /
+// dV K.rows, row stride Q.cols. cu_q / cu_k (device, B + 1 offsets) or, when
+// null, one block with the key mask.
+void rows_backward(Dtype dt, const Tensor& Q, const Tensor& K, const Tensor& V, const Tensor& dO,
+                   const int32_t* cu_q, const int32_t* cu_k, int B, const float* mask, bool causal, int H, int hd,
+                   Tensor& dQ, Tensor& dK, Tensor& dV, cudaStream_t stream) {
+    if (dt == Dtype::FP32)
+        rows_backward_t<float>(Q, K, V, dO, cu_q, cu_k, B, mask, causal, H, hd, dQ, dK, dV, stream);
+    else if (dt == Dtype::BF16)
+        rows_backward_t<__nv_bfloat16>(Q, K, V, dO, cu_q, cu_k, B, mask, causal, H, hd, dQ, dK, dV, stream);
+    else
+        rows_backward_t<__half>(Q, K, V, dO, cu_q, cu_k, B, mask, causal, H, hd, dQ, dK, dV, stream);
 }
 
-__global__ void fab_dKh_fp32_kernel(const float* __restrict__ dS,
-                                    const float* __restrict__ Qh,
-                                    float* __restrict__ dKh,
-                                    int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (int q = 0; q < Lq; ++q) {
-        acc += dS[q * Lk + k] * Qh[q * hd + d];
+// One block of rows (query rows from q_row, key rows from k_row) through the
+// tensor-core pipeline; false, having written nothing, when it cannot run.
+bool tc_block(Dtype dt, const Tensor& Q, const Tensor& K, const Tensor& V, const Tensor& dO, const float* mask,
+              bool causal, Tensor& dQ, Tensor& dK, Tensor& dV, size_t q_row, size_t k_row, int Lq, int Lk, int D,
+              int nh, int hd, cudaStream_t stream) {
+    const size_t qo = q_row * D, ko = k_row * D;
+    auto run = [&](auto tag) {
+        using T = decltype(tag);
+        return tc_backward<T>(static_cast<const T*>(Q.data) + qo, static_cast<const T*>(K.data) + ko,
+                              static_cast<const T*>(V.data) + ko, static_cast<const T*>(dO.data) + qo, mask,
+                              causal, static_cast<T*>(dQ.data) + qo, static_cast<T*>(dK.data) + ko,
+                              static_cast<T*>(dV.data) + ko, Lq, Lk, D, nh, hd, stream);
+    };
+    if (dt == Dtype::BF16) return run(__nv_bfloat16{});
+    if (dt == Dtype::FP16) return run(__half{});
+    return false;  // no FP32 tensor-core GEMM
+}
+
+// Row path or tensor-core pipeline, from a cost model fitted to
+// bench_attention_head_dims bwd (RTX 4090, Windows):
+//   rows  ~ c(hd) ns per attended (query, key, head) triple, c = 0.26 up to
+//           hd 64 and +0.1 per further 32 dims (shuffle-bound dot products),
+//           plus ~0.2 us per step of the longest serial walk (a query row walks
+//           its keys twice, a key row its queries once);
+//   tc    ~ (0.055 + 1e-4 hd) ns per (query, key, head) of the full score
+//           matrix, but never below ~0.2 ms per (sequence, head): that
+//           block's ~19 launches and scratch allocations.
+// So short sequences, few queries against many heads' worth of launches, and
+// small score matrices take the rows; large per-head score matrices the GEMMs.
+// BROTENSOR_ATTN_BWD_PATH=rows|tc forces one (A/B comparisons and tests); read
+// per call so a process can flip it.
+bool prefer_rows(const std::vector<int32_t>& cq, const std::vector<int32_t>& ck, int nh, int hd, bool causal) {
+    if (const char* e = std::getenv("BROTENSOR_ATTN_BWD_PATH")) {
+        if (e[0] == 'r') return true;
+        if (e[0] == 't') return false;
     }
-    dKh[k * hd + d] = acc;
+    const int npl = (hd + 31) / 32;
+    if (npl > 8) return false;
+    double rows_pairs = 0.0, tc_pairs = 0.0, blocks = 0.0;
+    int max_q = 0, max_k = 0;
+    for (size_t b = 0; b + 1 < cq.size(); ++b) {
+        const double lq = cq[b + 1] - cq[b], lk = ck[b + 1] - ck[b];
+        if (lq <= 0.0 || lk <= 0.0) continue;
+        tc_pairs += lq * lk;
+        rows_pairs += causal ? lq * (lq + 1.0) * 0.5 : lq * lk;
+        blocks += 1.0;
+        max_q = std::max(max_q, cq[b + 1] - cq[b]);
+        max_k = std::max(max_k, ck[b + 1] - ck[b]);
+    }
+    const double c_rows = 0.26 + 0.1 * std::max(0, npl - 2);
+    const double rows_ms = rows_pairs * nh * c_rows * 1e-6 + (2.0 * max_k + max_q) * 0.2e-3;
+    const double tc_ms = std::max(tc_pairs * nh * (0.055 + 1e-4 * hd) * 1e-6, blocks * nh * 0.2);
+    return rows_ms <= tc_ms;
 }
 
 } // namespace
 
 namespace detail::cuda {
 
-// O is consumed by the qkvo backward only via Wo backward; here we don't have
-// Wo. O is not actually needed for the recompute path — we re-derive P from
-// (Q, K) + softmax. We accept O in the signature to mirror standard
-// flash-attn backward APIs and to allow a future caller-supplied-cache path,
-// but the parameter is currently unused.
+// O is not read: the backward recomputes the softmax from Q and K. It stays in
+// the signature to mirror standard flash-attention backward APIs.
 void flash_attention_backward(const Tensor& Q,
                               const Tensor& K,
                               const Tensor& V,
@@ -626,9 +693,7 @@ void flash_attention_backward(const Tensor& Q,
                               Tensor& dQ,
                               Tensor& dK,
                               Tensor& dV) {
-    (void)O;  // recompute-based; O retained in API for symmetry.
-
-    // Dtype-dispatched: FP16 or BF16; Q/K/V/dO (and dQ/dK/dV) share one dtype.
+    (void)O;
     const Dtype dt = Q.dtype;
     if (dt != Dtype::FP16 && dt != Dtype::BF16) {
         throw std::runtime_error("flash_attention_backward: Q, K, V, dO must be FP16 or BF16");
@@ -636,7 +701,6 @@ void flash_attention_backward(const Tensor& Q,
     if (K.dtype != dt || V.dtype != dt || dO.dtype != dt) {
         throw std::runtime_error("flash_attention_backward: Q, K, V, dO dtype must match");
     }
-    const bool bf16 = (dt == Dtype::BF16);
     const int Lq = Q.rows;
     const int Lk = K.rows;
     const int D  = Q.cols;
@@ -654,248 +718,34 @@ void flash_attention_backward(const Tensor& Q,
     }
     const int hd = D / num_heads;
 
-    if (dQ.rows != Lq || dQ.cols != D || dQ.dtype != dt) {
-        dQ.resize(Lq, D, dt);
+    if (dQ.rows != Lq || dQ.cols != D || dQ.dtype != dt) dQ.resize(Lq, D, dt);
+    if (dK.rows != Lk || dK.cols != D || dK.dtype != dt) dK.resize(Lk, D, dt);
+    if (dV.rows != Lk || dV.cols != D || dV.dtype != dt) dV.resize(Lk, D, dt);
+    if (Lq == 0 || Lk == 0 || D == 0) {
+        dQ.zero();
+        dK.zero();
+        dV.zero();
+        return;
     }
-    if (dK.rows != Lk || dK.cols != D || dK.dtype != dt) {
-        dK.resize(Lk, D, dt);
-    }
-    if (dV.rows != Lk || dV.cols != D || dV.dtype != dt) {
-        dV.resize(Lk, D, dt);
-    }
-    dQ.zero();
-    dK.zero();
-    dV.zero();
-
-    if (Lq == 0 || Lk == 0 || D == 0) return;
-
-    constexpr int CP_BLOCK = 256;
-    int sm_block = 32;
-    while (sm_block < Lk && sm_block < 1024) sm_block *= 2;
-    if (sm_block > 1024) sm_block = 1024;
-    const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(hd));
-
-    Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
-    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
-    Tensor Vh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
-    Tensor dOh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
-    Tensor P = Tensor::empty_on(Device::CUDA, Lq, Lk, dt);
-    Tensor dP = Tensor::empty_on(Device::CUDA, Lq, Lk, dt);
-    Tensor dQh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
-    Tensor dKh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
-    Tensor dVh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
-    (void)FAB_BLOCK;
-
-    for (int h = 0; h < num_heads; ++h) {
-        const int head_off = h * hd;
-        const int total_q = Lq * hd;
-        const int total_k = Lk * hd;
-        const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
-
-        if (bf16) {
-            // BF16 path — fp16_internal::launch_matmul_ABT is FP16-only, so
-            // use the file-local naive BF16 matmul. Math stays in float.
-            fab_extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(Q.data),
-                reinterpret_cast<__nv_bfloat16*>(Qh.data),
-                Lq, D, head_off, hd);
-            fab_extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(K.data),
-                reinterpret_cast<__nv_bfloat16*>(Kh.data),
-                Lk, D, head_off, hd);
-            fab_extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(V.data),
-                reinterpret_cast<__nv_bfloat16*>(Vh.data),
-                Lk, D, head_off, hd);
-            fab_extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(dO.data),
-                reinterpret_cast<__nv_bfloat16*>(dOh.data),
-                Lq, D, head_off, hd);
-
-            launch_matmul_ABT_bf16(
-                reinterpret_cast<const __nv_bfloat16*>(Qh.data),
-                reinterpret_cast<const __nv_bfloat16*>(Kh.data),
-                reinterpret_cast<__nv_bfloat16*>(P.data),
-                Lq, Lk, hd, stream);
-            fab_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
-                reinterpret_cast<__nv_bfloat16*>(P.data),
-                Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
-
-            {
-                dim3 block(16, 16);
-                dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                fab_dVh_bf16_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(P.data),
-                    reinterpret_cast<const __nv_bfloat16*>(dOh.data),
-                    reinterpret_cast<__nv_bfloat16*>(dVh.data),
-                    Lq, Lk, hd);
-            }
-            {
-                dim3 block(16, 16);
-                dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
-                fab_dP_bf16_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(dOh.data),
-                    reinterpret_cast<const __nv_bfloat16*>(Vh.data),
-                    reinterpret_cast<__nv_bfloat16*>(dP.data),
-                    Lq, Lk, hd);
-            }
-            {
-                fab_dS_from_P_dP_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
-                    reinterpret_cast<__nv_bfloat16*>(P.data),
-                    reinterpret_cast<const __nv_bfloat16*>(dP.data),
-                    Lq, Lk, inv_sqrt);
-            }
-            {
-                dim3 block(16, 16);
-                dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
-                fab_dQh_bf16_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(P.data),
-                    reinterpret_cast<const __nv_bfloat16*>(Kh.data),
-                    reinterpret_cast<__nv_bfloat16*>(dQh.data),
-                    Lq, Lk, hd);
-            }
-            {
-                dim3 block(16, 16);
-                dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                fab_dKh_bf16_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(P.data),
-                    reinterpret_cast<const __nv_bfloat16*>(Qh.data),
-                    reinterpret_cast<__nv_bfloat16*>(dKh.data),
-                    Lq, Lk, hd);
-            }
-            fab_pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(dQh.data),
-                reinterpret_cast<__nv_bfloat16*>(dQ.data),
-                Lq, D, head_off, hd);
-            fab_pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(dKh.data),
-                reinterpret_cast<__nv_bfloat16*>(dK.data),
-                Lk, D, head_off, hd);
-            fab_pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(dVh.data),
-                reinterpret_cast<__nv_bfloat16*>(dV.data),
-                Lk, D, head_off, hd);
-            continue;
-        }
-
-        // Extract per-head buffers (Q_h, K_h, V_h, dO_h).
-        fab_extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(Q.data),
-            reinterpret_cast<__half*>(Qh.data),
-            Lq, D, head_off, hd);
-        fab_extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(K.data),
-            reinterpret_cast<__half*>(Kh.data),
-            Lk, D, head_off, hd);
-        fab_extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(V.data),
-            reinterpret_cast<__half*>(Vh.data),
-            Lk, D, head_off, hd);
-        fab_extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(dO.data),
-            reinterpret_cast<__half*>(dOh.data),
-            Lq, D, head_off, hd);
-
-        // Recompute P: S(Lq, Lk) = Qh · Kh^T then row-softmax(scale, mask, causal).
-        fp16_internal::launch_matmul_ABT(
-            reinterpret_cast<const __half*>(Qh.data),
-            reinterpret_cast<const __half*>(Kh.data),
-            reinterpret_cast<__half*>(P.data),
-            Lq, Lk, hd);
-        {
-            fab_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
-                reinterpret_cast<__half*>(P.data),
-                Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
-        }
-
-        // dV_h = P^T · dO_h
-        {
-            dim3 block(16, 16);
-            dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-            fab_dVh_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __half*>(P.data),
-                reinterpret_cast<const __half*>(dOh.data),
-                reinterpret_cast<__half*>(dVh.data),
-                Lq, Lk, hd);
-        }
-
-        // dP = dO_h · V_h^T
-        {
-            dim3 block(16, 16);
-            dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
-            fab_dP_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __half*>(dOh.data),
-                reinterpret_cast<const __half*>(Vh.data),
-                reinterpret_cast<__half*>(dP.data),
-                Lq, Lk, hd);
-        }
-
-        // dS = P * (dP - D_q) * inv_sqrt  (in-place over P)
-        {
-            fab_dS_from_P_dP_kernel<<<Lq, sm_block, shmem, stream>>>(
-                reinterpret_cast<__half*>(P.data),
-                reinterpret_cast<const __half*>(dP.data),
-                Lq, Lk, inv_sqrt);
-        }
-
-        // dQ_h = dS · K_h
-        {
-            dim3 block(16, 16);
-            dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
-            fab_dQh_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __half*>(P.data),
-                reinterpret_cast<const __half*>(Kh.data),
-                reinterpret_cast<__half*>(dQh.data),
-                Lq, Lk, hd);
-        }
-
-        // dK_h = dS^T · Q_h
-        {
-            dim3 block(16, 16);
-            dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-            fab_dKh_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __half*>(P.data),
-                reinterpret_cast<const __half*>(Qh.data),
-                reinterpret_cast<__half*>(dKh.data),
-                Lq, Lk, hd);
-        }
-
-        // Pack per-head grads back into the (L, D) slot for this head.
-        fab_pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(dQh.data),
-            reinterpret_cast<__half*>(dQ.data),
-            Lq, D, head_off, hd);
-        fab_pack_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(dKh.data),
-            reinterpret_cast<__half*>(dK.data),
-            Lk, D, head_off, hd);
-        fab_pack_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-            reinterpret_cast<const __half*>(dVh.data),
-            reinterpret_cast<__half*>(dV.data),
-            Lk, D, head_off, hd);
-    }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    if (!prefer_rows({0, Lq}, {0, Lk}, num_heads, hd, causal) &&
+        tc_block(dt, Q, K, V, dO, d_mask, causal, dQ, dK, dV, 0, 0, Lq, Lk, D, num_heads, hd, stream))
+        return;
+    rows_backward(dt, Q, K, V, dO, nullptr, nullptr, 1, d_mask, causal, num_heads, hd, dQ, dK, dV, stream);
 }
 
 // ─── flash_attention_varlen_backward ────────────────────────────────────────
 //
-// Packed variable-length backward. Per-sequence offset arithmetic into the
-// (total_tokens, D) Q/K/V/dO/dQ/dK/dV buffers, then the same 8-kernel
-// per-head sweep as `flash_attention_backward` above (extract → matmul →
-// row-softmax → dV, dP, dS, dQ_h, dK_h → pack).
+// Packed variable-length backward. The row path takes the whole batch in its
+// two launches (each row finds its sequence in cu_seqlens); the tensor-core
+// pipeline runs each sequence as one block (pointer offsets into the
+// (total_tokens, D) buffers). Either way the math per sequence is
+// flash_attention_backward's.
 //
-// cu_seqlens_q/k are DEVICE pointers (matching the varlen forward); we copy
-// them host-side once per call (B+1 INT32s) so the host can drive the
-// per-sequence loop. B is small for visual / token workloads — a few dozen
-// at most — so the D→H copy + B kernel-launch tier overhead is negligible
-// next to the per-sequence kernel work.
-//
-// Scratch (Qh/Kh/Vh/dOh/dQh/dKh/dVh + P + dP) is sized to the observed
-// max-per-sequence dims and reused across sequences. The kernels take
-// explicit (Lq, Lk) bounds so the unused tail of each scratch buffer is
-// never read.
+// cu_seqlens_q/k are DEVICE pointers (matching the varlen forward); they are
+// copied host-side once per call (B+1 INT32s) to validate them and to choose
+// the path.
 void flash_attention_varlen_backward(const Tensor& Q,
                                      const Tensor& K,
                                      const Tensor& V,
@@ -912,7 +762,7 @@ void flash_attention_varlen_backward(const Tensor& Q,
                                      Tensor& dQ,
                                      Tensor& dK,
                                      Tensor& dV) {
-    (void)O;  // recompute-based; O retained in API for symmetry.
+    (void)O;
 
     const Dtype dt = Q.dtype;
     if (dt != Dtype::FP16 && dt != Dtype::BF16 && dt != Dtype::FP32) {
@@ -921,8 +771,6 @@ void flash_attention_varlen_backward(const Tensor& Q,
     if (K.dtype != dt || V.dtype != dt || dO.dtype != dt) {
         throw std::runtime_error("flash_attention_varlen_backward: Q, K, V, dO dtype must match");
     }
-    const bool bf16 = (dt == Dtype::BF16);
-    const bool fp32 = (dt == Dtype::FP32);
     const int total_q = Q.rows;
     const int total_k = K.rows;
     const int D = num_heads * head_dim;
@@ -948,6 +796,7 @@ void flash_attention_varlen_backward(const Tensor& Q,
     if (dQ.rows != total_q || dQ.cols != D || dQ.dtype != dt) dQ.resize(total_q, D, dt);
     if (dK.rows != total_k || dK.cols != D || dK.dtype != dt) dK.resize(total_k, D, dt);
     if (dV.rows != total_k || dV.cols != D || dV.dtype != dt) dV.resize(total_k, D, dt);
+    // Rows of empty sequences (and any rows outside cu_seqlens) stay zero.
     dQ.zero();
     dK.zero();
     dV.zero();
@@ -957,14 +806,11 @@ void flash_attention_varlen_backward(const Tensor& Q,
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
 
-    // Copy cu_seqlens device→host once. (batch_size+1)*4 bytes — negligible.
     std::vector<int32_t> cq(batch_size + 1);
     std::vector<int32_t> ck(batch_size + 1);
-    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(cq.data(), cu_seqlens_q,
-                                         sizeof(int32_t) * (batch_size + 1),
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(cq.data(), cu_seqlens_q, sizeof(int32_t) * (batch_size + 1),
                                          cudaMemcpyDeviceToHost, stream));
-    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(ck.data(), cu_seqlens_k,
-                                         sizeof(int32_t) * (batch_size + 1),
+    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(ck.data(), cu_seqlens_k, sizeof(int32_t) * (batch_size + 1),
                                          cudaMemcpyDeviceToHost, stream));
     BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -977,10 +823,8 @@ void flash_attention_varlen_backward(const Tensor& Q,
     if (ck[batch_size] != total_k)
         throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_k[B] != total_tokens_k");
 
-    // Determine effective max-per-sequence for scratch allocation. The caller's
-    // max_seqlen_* are advisory; we honour the observed maximum so an
-    // under-reported max doesn't cause out-of-bounds writes.
-    int max_lq = max_seqlen_q, max_lk = max_seqlen_k;
+    // max_seqlen_q/k are advisory: the kernels bound each sequence by cu_seqlens.
+    bool any = false;
     for (int b = 0; b < batch_size; ++b) {
         const int Lq_b = cq[b + 1] - cq[b];
         const int Lk_b = ck[b + 1] - ck[b];
@@ -988,302 +832,29 @@ void flash_attention_varlen_backward(const Tensor& Q,
             throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens must be non-decreasing");
         if (causal && Lq_b != Lk_b)
             throw std::runtime_error("flash_attention_varlen_backward: causal requires per-sequence Lq == Lk");
-        if (Lq_b > max_lq) max_lq = Lq_b;
-        if (Lk_b > max_lk) max_lk = Lk_b;
+        any = any || (Lq_b > 0 && Lk_b > 0);
     }
-    if (max_lq <= 0 || max_lk <= 0) return;  // every sequence empty.
+    if (!any) return;  // every sequence empty.
 
-    const int hd = head_dim;
-    const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(hd));
-    constexpr int CP_BLOCK = 256;
-    int sm_block = 32;
-    while (sm_block < max_lk && sm_block < 1024) sm_block *= 2;
-    if (sm_block > 1024) sm_block = 1024;
-
-    // Per-head scratch, max-sized once.
-    Tensor Qh  = Tensor::empty_on(Device::CUDA, max_lq, hd, dt);
-    Tensor Kh  = Tensor::empty_on(Device::CUDA, max_lk, hd, dt);
-    Tensor Vh  = Tensor::empty_on(Device::CUDA, max_lk, hd, dt);
-    Tensor dOh = Tensor::empty_on(Device::CUDA, max_lq, hd, dt);
-    Tensor P   = Tensor::empty_on(Device::CUDA, max_lq, max_lk, dt);
-    Tensor dP  = Tensor::empty_on(Device::CUDA, max_lq, max_lk, dt);
-    Tensor dQh = Tensor::empty_on(Device::CUDA, max_lq, hd, dt);
-    Tensor dKh = Tensor::empty_on(Device::CUDA, max_lk, hd, dt);
-    Tensor dVh = Tensor::empty_on(Device::CUDA, max_lk, hd, dt);
-
-    const std::size_t dtsz = static_cast<std::size_t>(dtype_size_bytes(dt));
-
-    for (int b = 0; b < batch_size; ++b) {
-        const int q_beg = cq[b];
-        const int k_beg = ck[b];
-        const int Lq    = cq[b + 1] - q_beg;
-        const int Lk    = ck[b + 1] - k_beg;
-        if (Lq == 0 || Lk == 0) continue;  // grad rows already zero.
-
-        const std::size_t q_off = static_cast<std::size_t>(q_beg) * D * dtsz;
-        const std::size_t k_off = static_cast<std::size_t>(k_beg) * D * dtsz;
-
-        const void* Qp_b  = static_cast<const char*>(Q.data)  + q_off;
-        const void* Kp_b  = static_cast<const char*>(K.data)  + k_off;
-        const void* Vp_b  = static_cast<const char*>(V.data)  + k_off;
-        const void* dOp_b = static_cast<const char*>(dO.data) + q_off;
-        void* dQp_b = static_cast<char*>(dQ.data) + q_off;
-        void* dKp_b = static_cast<char*>(dK.data) + k_off;
-        void* dVp_b = static_cast<char*>(dV.data) + k_off;
-
-        const std::size_t shmem = static_cast<std::size_t>(sm_block) * sizeof(float);
-        const int total_qh = Lq * hd;
-        const int total_kh = Lk * hd;
-
-        for (int h = 0; h < num_heads; ++h) {
-            const int head_off = h * hd;
-
-            if (bf16) {
-                fab_extract_head_LD_bf16_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(Qp_b),
-                    reinterpret_cast<__nv_bfloat16*>(Qh.data),
-                    Lq, D, head_off, hd);
-                fab_extract_head_LD_bf16_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(Kp_b),
-                    reinterpret_cast<__nv_bfloat16*>(Kh.data),
-                    Lk, D, head_off, hd);
-                fab_extract_head_LD_bf16_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(Vp_b),
-                    reinterpret_cast<__nv_bfloat16*>(Vh.data),
-                    Lk, D, head_off, hd);
-                fab_extract_head_LD_bf16_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(dOp_b),
-                    reinterpret_cast<__nv_bfloat16*>(dOh.data),
-                    Lq, D, head_off, hd);
-
-                launch_matmul_ABT_bf16(
-                    reinterpret_cast<const __nv_bfloat16*>(Qh.data),
-                    reinterpret_cast<const __nv_bfloat16*>(Kh.data),
-                    reinterpret_cast<__nv_bfloat16*>(P.data),
-                    Lq, Lk, hd, stream);
-                fab_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
-                    reinterpret_cast<__nv_bfloat16*>(P.data),
-                    Lq, Lk, inv_sqrt, /*mask=*/nullptr, causal ? 1 : 0);
-
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                    fab_dVh_bf16_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(P.data),
-                        reinterpret_cast<const __nv_bfloat16*>(dOh.data),
-                        reinterpret_cast<__nv_bfloat16*>(dVh.data),
-                        Lq, Lk, hd);
-                }
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
-                    fab_dP_bf16_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(dOh.data),
-                        reinterpret_cast<const __nv_bfloat16*>(Vh.data),
-                        reinterpret_cast<__nv_bfloat16*>(dP.data),
-                        Lq, Lk, hd);
-                }
-                fab_dS_from_P_dP_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
-                    reinterpret_cast<__nv_bfloat16*>(P.data),
-                    reinterpret_cast<const __nv_bfloat16*>(dP.data),
-                    Lq, Lk, inv_sqrt);
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
-                    fab_dQh_bf16_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(P.data),
-                        reinterpret_cast<const __nv_bfloat16*>(Kh.data),
-                        reinterpret_cast<__nv_bfloat16*>(dQh.data),
-                        Lq, Lk, hd);
-                }
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                    fab_dKh_bf16_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(P.data),
-                        reinterpret_cast<const __nv_bfloat16*>(Qh.data),
-                        reinterpret_cast<__nv_bfloat16*>(dKh.data),
-                        Lq, Lk, hd);
-                }
-                fab_pack_head_LD_bf16_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(dQh.data),
-                    reinterpret_cast<__nv_bfloat16*>(dQp_b),
-                    Lq, D, head_off, hd);
-                fab_pack_head_LD_bf16_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(dKh.data),
-                    reinterpret_cast<__nv_bfloat16*>(dKp_b),
-                    Lk, D, head_off, hd);
-                fab_pack_head_LD_bf16_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(dVh.data),
-                    reinterpret_cast<__nv_bfloat16*>(dVp_b),
-                    Lk, D, head_off, hd);
-                continue;
-            }
-
-            if (fp32) {
-                fab_extract_head_LD_fp32_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const float*>(Qp_b),
-                    reinterpret_cast<float*>(Qh.data),
-                    Lq, D, head_off, hd);
-                fab_extract_head_LD_fp32_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const float*>(Kp_b),
-                    reinterpret_cast<float*>(Kh.data),
-                    Lk, D, head_off, hd);
-                fab_extract_head_LD_fp32_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const float*>(Vp_b),
-                    reinterpret_cast<float*>(Vh.data),
-                    Lk, D, head_off, hd);
-                fab_extract_head_LD_fp32_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const float*>(dOp_b),
-                    reinterpret_cast<float*>(dOh.data),
-                    Lq, D, head_off, hd);
-
-                launch_matmul_ABT_fp32(
-                    reinterpret_cast<const float*>(Qh.data),
-                    reinterpret_cast<const float*>(Kh.data),
-                    reinterpret_cast<float*>(P.data),
-                    Lq, Lk, hd, stream);
-                fab_softmax_rows_fp32_kernel<<<Lq, sm_block, shmem, stream>>>(
-                    reinterpret_cast<float*>(P.data),
-                    Lq, Lk, inv_sqrt, /*mask=*/nullptr, causal ? 1 : 0);
-
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                    fab_dVh_fp32_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const float*>(P.data),
-                        reinterpret_cast<const float*>(dOh.data),
-                        reinterpret_cast<float*>(dVh.data),
-                        Lq, Lk, hd);
-                }
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
-                    fab_dP_fp32_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const float*>(dOh.data),
-                        reinterpret_cast<const float*>(Vh.data),
-                        reinterpret_cast<float*>(dP.data),
-                        Lq, Lk, hd);
-                }
-                fab_dS_from_P_dP_fp32_kernel<<<Lq, sm_block, shmem, stream>>>(
-                    reinterpret_cast<float*>(P.data),
-                    reinterpret_cast<const float*>(dP.data),
-                    Lq, Lk, inv_sqrt);
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
-                    fab_dQh_fp32_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const float*>(P.data),
-                        reinterpret_cast<const float*>(Kh.data),
-                        reinterpret_cast<float*>(dQh.data),
-                        Lq, Lk, hd);
-                }
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                    fab_dKh_fp32_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const float*>(P.data),
-                        reinterpret_cast<const float*>(Qh.data),
-                        reinterpret_cast<float*>(dKh.data),
-                        Lq, Lk, hd);
-                }
-                fab_pack_head_LD_fp32_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const float*>(dQh.data),
-                    reinterpret_cast<float*>(dQp_b),
-                    Lq, D, head_off, hd);
-                fab_pack_head_LD_fp32_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const float*>(dKh.data),
-                    reinterpret_cast<float*>(dKp_b),
-                    Lk, D, head_off, hd);
-                fab_pack_head_LD_fp32_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const float*>(dVh.data),
-                    reinterpret_cast<float*>(dVp_b),
-                    Lk, D, head_off, hd);
-                continue;
-            }
-
-            // FP16 path
-            fab_extract_head_LD_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(Qp_b),
-                reinterpret_cast<__half*>(Qh.data),
-                Lq, D, head_off, hd);
-            fab_extract_head_LD_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(Kp_b),
-                reinterpret_cast<__half*>(Kh.data),
-                Lk, D, head_off, hd);
-            fab_extract_head_LD_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(Vp_b),
-                reinterpret_cast<__half*>(Vh.data),
-                Lk, D, head_off, hd);
-            fab_extract_head_LD_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(dOp_b),
-                reinterpret_cast<__half*>(dOh.data),
-                Lq, D, head_off, hd);
-
-            fp16_internal::launch_matmul_ABT(
-                reinterpret_cast<const __half*>(Qh.data),
-                reinterpret_cast<const __half*>(Kh.data),
-                reinterpret_cast<__half*>(P.data),
-                Lq, Lk, hd);
-            fab_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
-                reinterpret_cast<__half*>(P.data),
-                Lq, Lk, inv_sqrt, /*mask=*/nullptr, causal ? 1 : 0);
-
-            {
-                dim3 block(16, 16);
-                dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                fab_dVh_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __half*>(P.data),
-                    reinterpret_cast<const __half*>(dOh.data),
-                    reinterpret_cast<__half*>(dVh.data),
-                    Lq, Lk, hd);
-            }
-            {
-                dim3 block(16, 16);
-                dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
-                fab_dP_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __half*>(dOh.data),
-                    reinterpret_cast<const __half*>(Vh.data),
-                    reinterpret_cast<__half*>(dP.data),
-                    Lq, Lk, hd);
-            }
-            fab_dS_from_P_dP_kernel<<<Lq, sm_block, shmem, stream>>>(
-                reinterpret_cast<__half*>(P.data),
-                reinterpret_cast<const __half*>(dP.data),
-                Lq, Lk, inv_sqrt);
-            {
-                dim3 block(16, 16);
-                dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
-                fab_dQh_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __half*>(P.data),
-                    reinterpret_cast<const __half*>(Kh.data),
-                    reinterpret_cast<__half*>(dQh.data),
-                    Lq, Lk, hd);
-            }
-            {
-                dim3 block(16, 16);
-                dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                fab_dKh_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __half*>(P.data),
-                    reinterpret_cast<const __half*>(Qh.data),
-                    reinterpret_cast<__half*>(dKh.data),
-                    Lq, Lk, hd);
-            }
-            fab_pack_head_LD_kernel<<<grid_for(total_qh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(dQh.data),
-                reinterpret_cast<__half*>(dQp_b),
-                Lq, D, head_off, hd);
-            fab_pack_head_LD_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(dKh.data),
-                reinterpret_cast<__half*>(dKp_b),
-                Lk, D, head_off, hd);
-            fab_pack_head_LD_kernel<<<grid_for(total_kh, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(dVh.data),
-                reinterpret_cast<__half*>(dVp_b),
-                Lk, D, head_off, hd);
+    if (!prefer_rows(cq, ck, num_heads, head_dim, causal)) {
+        // Only the first block can refuse (the device check), before writing.
+        bool ran = false, refused = false;
+        for (int b = 0; b < batch_size && !refused; ++b) {
+            const int Lq = cq[b + 1] - cq[b];
+            const int Lk = ck[b + 1] - ck[b];
+            if (Lq == 0 || Lk == 0) continue;  // grad rows already zero.
+            if (tc_block(dt, Q, K, V, dO, nullptr, causal, dQ, dK, dV, static_cast<size_t>(cq[b]),
+                         static_cast<size_t>(ck[b]), Lq, Lk, D, num_heads, head_dim, stream))
+                ran = true;
+            else
+                refused = true;
         }
+        if (!refused) return;
+        if (ran) throw std::runtime_error("flash_attention_varlen_backward: tensor-core path refused mid-call");
     }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    // Rows of a sequence with no keys (or no queries) write zeros here too.
+    rows_backward(dt, Q, K, V, dO, cu_seqlens_q, cu_seqlens_k, batch_size, nullptr, causal, num_heads, head_dim, dQ,
+                  dK, dV, stream);
 }
 
 } // namespace detail::cuda

@@ -33,6 +33,16 @@ void linear_forward_batched_int8w_fp16(const ::brotensor::Tensor& W_int8,
                                        const ::brotensor::Tensor* bias,
                                        const ::brotensor::Tensor& X_BD,
                                        ::brotensor::Tensor& Y_BD);
+// flash_attention_backward.cu
+void flash_attention_backward(const ::brotensor::Tensor& Q,
+                              const ::brotensor::Tensor& K,
+                              const ::brotensor::Tensor& V,
+                              const ::brotensor::Tensor& O,
+                              const ::brotensor::Tensor& dO,
+                              const float* d_mask, int num_heads, bool causal,
+                              ::brotensor::Tensor& dQ,
+                              ::brotensor::Tensor& dK,
+                              ::brotensor::Tensor& dV);
 } // namespace detail::cuda
 
 void* cuda_current_stream();
@@ -41,57 +51,6 @@ namespace {
 
 constexpr int FA_BLOCK = 128;
 constexpr int FA_KTILE = 64;
-
-// ─── Per-head extract / pack-back kernels ──────────────────────────────────
-//
-// Source X laid out as (L, D) with D = num_heads * head_dim and the head
-// dimension contiguous within each row: X[l, h*head_dim + d]. The WMMA
-// matmul path wants a contiguous (L, head_dim) view per head.
-
-__global__ void extract_head_LD_kernel(const __half* __restrict__ X,
-                                       __half* __restrict__ Y,
-                                       int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Y[l * head_dim + d] = X[l * D + head_off + d];
-}
-
-// Extract a single head and TRANSPOSE on the way in: Y has layout
-// (head_dim, ldY) so element (d, l) = X[l, head_off + d]. Used to produce a
-// (head_dim, L) "B"-style operand for the second GEMM via launch_matmul_ABT.
-// ldY >= L is the row stride of Y — the caller may pad it to an 8-element
-// multiple so the GEMM keeps its vectorised (int4) loads; pad columns are
-// untouched (the caller zeroes them once).
-__global__ void extract_head_DL_kernel(const __half* __restrict__ X,
-                                       __half* __restrict__ Y,
-                                       int L, int D, int head_off, int head_dim,
-                                       int ldY) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    // Cooperatively write Y[d * ldY + l] = X[l * D + head_off + d]. Choose
-    // mapping that gives coalesced loads of X (d innermost in source) and
-    // strided writes to Y — strided writes are fine for fp16 throughput here.
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Y[d * ldY + l] = X[l * D + head_off + d];
-}
-
-// Inverse of extract_head_LD: write a per-head (Lq, head_dim) block back
-// into the (Lq, D) output at column slot [head_off, head_off+head_dim).
-__global__ void pack_head_LD_kernel(const __half* __restrict__ Y,
-                                    __half* __restrict__ Out,
-                                    int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Out[l * D + head_off + d] = Y[l * head_dim + d];
-}
 
 // ─── Per-head fallback kernels (flash_attention_forward, uncovered head_dim) ─
 
@@ -346,177 +305,7 @@ __global__ void flash_attention_kernel(
     }
 }
 
-// ─── Backward-helper kernels ───────────────────────────────────────────────
-//
-// All of these run on per-head buffers (Q_h, K_h, V_h of shape (L, hd)) and
-// the (Lq, Lk) probability matrix `P` re-derived from the forward math by a
-// scaled, optionally masked / causal row-softmax. The forward already
-// materialises an (Lq, Lk) buffer per head (`S` in flash_attention_forward's
-// WMMA path); the backward sweeps that same buffer twice — once to compute
-// the per-row `D_q = Σ_k P[q,k] · dP[q,k]`, once to scatter dQ/dK/dV — so we
-// don't add a fundamentally new memory cost. Causal/mask are applied during
-// the softmax recompute, so downstream kernels see P[q,k]=0 at invalid (q,k)
-// pairs and naturally produce zero contributions to dV/dK/dQ at those
-// positions.
-
-// Row-wise softmax with optional Lk-shaped mask AND optional causal masking.
-// One block per query row: scale, mask, max, exp, normalise in place, with an
-// extra "k > q ⇒ -inf" clause when `causal != 0`. Used by the
-// backward recompute regardless of the forward path the user invoked; for
-// correctness this only needs to match the forward's P to FP16 tolerance.
-__global__ void fa_scale_mask_causal_softmax_rows_kernel(__half* __restrict__ S,
-                                                         int Lq, int Lk,
-                                                         float scale,
-                                                         const float* __restrict__ mask,
-                                                         int causal) {
-    extern __shared__ float ssm[];
-    const int q = blockIdx.x;
-    const int tid = threadIdx.x;
-    __half* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-
-    float local_max = -1e30f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        float v = __half2float(row[k]) * scale;
-        if (mask && mask[k] <= 0.5f) v = -1e30f;
-        if (causal && k > q) v = -1e30f;
-        if (v > local_max) local_max = v;
-    }
-    ssm[tid] = local_max;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            const float o = ssm[tid + s];
-            if (o > ssm[tid]) ssm[tid] = o;
-        }
-        __syncthreads();
-    }
-    const float rmax = ssm[0];
-    const bool empty = (rmax <= -1e29f);
-
-    float local_sum = 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        float v = __half2float(row[k]) * scale;
-        if (mask && mask[k] <= 0.5f) v = -1e30f;
-        if (causal && k > q) v = -1e30f;
-        const float e = empty ? 0.0f : __expf(v - rmax);
-        row[k] = __float2half(e);
-        local_sum += e;
-    }
-    ssm[tid] = local_sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        __syncthreads();
-    }
-    const float rsum = ssm[0];
-    const float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
-
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        const float e = __half2float(row[k]);
-        row[k] = __float2half(e * inv);
-    }
-}
-
-// dP[q, k] = sum_d dO_attn_h[q, d] * V_h[k, d]   (per-head)
-//   dO_attn_h: (Lq, hd) FP16
-//   V_h:       (Lk, hd) FP16
-//   dP:        (Lq, Lk) FP16 (overwritten)
-// One thread per (q, k). FP32 accumulation.
-__global__ void fa_dP_kernel(const __half* __restrict__ dOh,
-                             const __half* __restrict__ Vh,
-                             __half* __restrict__ dP,
-                             int Lq, int Lk, int hd) {
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    const int q = blockIdx.y * blockDim.y + threadIdx.y;
-    if (q >= Lq || k >= Lk) return;
-    float acc = 0.0f;
-    for (int d = 0; d < hd; ++d) {
-        acc += __half2float(dOh[q * hd + d]) *
-               __half2float(Vh[k * hd + d]);
-    }
-    dP[q * Lk + k] = __float2half(acc);
-}
-
-// In-place dS overwrite of P: dS[q, k] = P[q, k] * (dP[q, k] - D_q) * scale
-// where D_q = sum_k P[q, k] * dP[q, k]. One block per query row.
-// Reads P and dP, writes dS over P (we don't need P after this kernel for
-// the dV path — dV is computed BEFORE this transform — so reusing P's
-// memory is safe). `scale` folds in the 1/sqrt(hd) factor that was applied
-// when forming S.
-__global__ void fa_dS_from_P_dP_kernel(__half* __restrict__ P_dS,
-                                       const __half* __restrict__ dP,
-                                       int Lq, int Lk,
-                                       float scale) {
-    extern __shared__ float ssm[];
-    const int q = blockIdx.x;
-    const int tid = threadIdx.x;
-    __half* prow = P_dS + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-    const __half* dprow = dP + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-
-    float local = 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        local += __half2float(prow[k]) * __half2float(dprow[k]);
-    }
-    ssm[tid] = local;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        __syncthreads();
-    }
-    const float Dq = ssm[0];
-
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        const float p  = __half2float(prow[k]);
-        const float dp = __half2float(dprow[k]);
-        prow[k] = __float2half(p * (dp - Dq) * scale);
-    }
-}
-
-// dV_h[k, d] += sum_q P[q, k] * dO_attn_h[q, d]   (overwrite, not accumulate;
-// we own the buffer for this head's pass).
-__global__ void fa_dVh_kernel(const __half* __restrict__ P,
-                              const __half* __restrict__ dOh,
-                              __half* __restrict__ dVh,
-                              int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (int q = 0; q < Lq; ++q) {
-        acc += __half2float(P[q * Lk + k]) * __half2float(dOh[q * hd + d]);
-    }
-    dVh[k * hd + d] = __float2half(acc);
-}
-
-// dQ_h[q, d] = sum_k dS[q, k] * K_h[k, d]
-__global__ void fa_dQh_kernel(const __half* __restrict__ dS,
-                              const __half* __restrict__ Kh,
-                              __half* __restrict__ dQh,
-                              int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int q = blockIdx.y * blockDim.y + threadIdx.y;
-    if (q >= Lq || d >= hd) return;
-    float acc = 0.0f;
-    for (int k = 0; k < Lk; ++k) {
-        acc += __half2float(dS[q * Lk + k]) * __half2float(Kh[k * hd + d]);
-    }
-    dQh[q * hd + d] = __float2half(acc);
-}
-
-// dK_h[k, d] = sum_q dS[q, k] * Q_h[q, d]
-__global__ void fa_dKh_kernel(const __half* __restrict__ dS,
-                              const __half* __restrict__ Qh,
-                              __half* __restrict__ dKh,
-                              int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (int q = 0; q < Lq; ++q) {
-        acc += __half2float(dS[q * Lk + k]) * __half2float(Qh[q * hd + d]);
-    }
-    dKh[k * hd + d] = __float2half(acc);
-}
+// ─── qkvo-backward helpers ─────────────────────────────────────────────────
 
 // FP16 in-place add: dst[i] += src[i] (FP32 sum, written back as FP16).
 __global__ void fa_fp16_add_inplace_kernel(__half* __restrict__ dst,
@@ -527,51 +316,10 @@ __global__ void fa_fp16_add_inplace_kernel(__half* __restrict__ dst,
     dst[i] = __float2half(__half2float(dst[i]) + __half2float(src[i]));
 }
 
-// ─── BF16 kernels (verbatim copies of the FP16 kernels above, with ──────────
-//     __half→__nv_bfloat16 / __half2float→__bfloat162float /
-//     __float2half→__float2bfloat16). All real math stays in float. ──────────
-//
-// The non-causal forward/backward WMMA path uses fp16_internal::launch_matmul_ABT,
-// which is FP16-only (tensor cores). BF16 cannot use that kernel, so this file
-// carries its own self-contained naive BF16 matmul (matmul_ABT_bf16_kernel)
-// with FP32 accumulation — numerically equivalent to the FP16 naive fallback.
+// ─── BF16 kernels ──────────────────────────────────────────────────────────
 
-__global__ void extract_head_LD_bf16_kernel(const __nv_bfloat16* __restrict__ X,
-                                            __nv_bfloat16* __restrict__ Y,
-                                            int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Y[l * head_dim + d] = X[l * D + head_off + d];
-}
-
-__global__ void extract_head_DL_bf16_kernel(const __nv_bfloat16* __restrict__ X,
-                                            __nv_bfloat16* __restrict__ Y,
-                                            int L, int D, int head_off, int head_dim,
-                                            int ldY) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Y[d * ldY + l] = X[l * D + head_off + d];
-}
-
-__global__ void pack_head_LD_bf16_kernel(const __nv_bfloat16* __restrict__ Y,
-                                         __nv_bfloat16* __restrict__ Out,
-                                         int L, int D, int head_off, int head_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = L * head_dim;
-    if (idx >= total) return;
-    const int l = idx / head_dim;
-    const int d = idx % head_dim;
-    Out[l * D + head_off + d] = Y[l * head_dim + d];
-}
-
-// Naive BF16 matmul: C(M, N) = A(M, K) @ B(N, K)^T, FP32 accumulation.
-// Same contract as fp16_internal::launch_matmul_ABT; one thread per output.
+// Naive BF16 matmul: C(M, N) = A(M, K) @ B(N, K)^T, FP32 accumulation, one
+// thread per output (the BF16 batched-linear helpers below).
 __global__ void matmul_ABT_bf16_kernel(const __nv_bfloat16* __restrict__ A,
                                        const __nv_bfloat16* __restrict__ B,
                                        __nv_bfloat16* __restrict__ C,
@@ -705,146 +453,6 @@ __global__ void flash_attention_bf16_kernel(
         if (slot >= MAX_HD_PER_THREAD) break;
         Out[q * D + head_off + d] = __float2bfloat16(partial[slot] * inv);
     }
-}
-
-__global__ void fa_scale_mask_causal_softmax_rows_bf16_kernel(
-        __nv_bfloat16* __restrict__ S,
-        int Lq, int Lk,
-        float scale,
-        const float* __restrict__ mask,
-        int causal) {
-    extern __shared__ float ssm[];
-    const int q = blockIdx.x;
-    const int tid = threadIdx.x;
-    __nv_bfloat16* row = S + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-
-    float local_max = -1e30f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        float v = __bfloat162float(row[k]) * scale;
-        if (mask && mask[k] <= 0.5f) v = -1e30f;
-        if (causal && k > q) v = -1e30f;
-        if (v > local_max) local_max = v;
-    }
-    ssm[tid] = local_max;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            const float o = ssm[tid + s];
-            if (o > ssm[tid]) ssm[tid] = o;
-        }
-        __syncthreads();
-    }
-    const float rmax = ssm[0];
-    const bool empty = (rmax <= -1e29f);
-
-    float local_sum = 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        float v = __bfloat162float(row[k]) * scale;
-        if (mask && mask[k] <= 0.5f) v = -1e30f;
-        if (causal && k > q) v = -1e30f;
-        const float e = empty ? 0.0f : __expf(v - rmax);
-        row[k] = __float2bfloat16(e);
-        local_sum += e;
-    }
-    ssm[tid] = local_sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        __syncthreads();
-    }
-    const float rsum = ssm[0];
-    const float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
-
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        const float e = __bfloat162float(row[k]);
-        row[k] = __float2bfloat16(e * inv);
-    }
-}
-
-__global__ void fa_dP_bf16_kernel(const __nv_bfloat16* __restrict__ dOh,
-                                  const __nv_bfloat16* __restrict__ Vh,
-                                  __nv_bfloat16* __restrict__ dP,
-                                  int Lq, int Lk, int hd) {
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    const int q = blockIdx.y * blockDim.y + threadIdx.y;
-    if (q >= Lq || k >= Lk) return;
-    float acc = 0.0f;
-    for (int d = 0; d < hd; ++d) {
-        acc += __bfloat162float(dOh[q * hd + d]) *
-               __bfloat162float(Vh[k * hd + d]);
-    }
-    dP[q * Lk + k] = __float2bfloat16(acc);
-}
-
-__global__ void fa_dS_from_P_dP_bf16_kernel(__nv_bfloat16* __restrict__ P_dS,
-                                            const __nv_bfloat16* __restrict__ dP,
-                                            int Lq, int Lk,
-                                            float scale) {
-    extern __shared__ float ssm[];
-    const int q = blockIdx.x;
-    const int tid = threadIdx.x;
-    __nv_bfloat16* prow = P_dS + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-    const __nv_bfloat16* dprow = dP + static_cast<size_t>(q) * static_cast<size_t>(Lk);
-
-    float local = 0.0f;
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        local += __bfloat162float(prow[k]) * __bfloat162float(dprow[k]);
-    }
-    ssm[tid] = local;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        __syncthreads();
-    }
-    const float Dq = ssm[0];
-
-    for (int k = tid; k < Lk; k += blockDim.x) {
-        const float p  = __bfloat162float(prow[k]);
-        const float dp = __bfloat162float(dprow[k]);
-        prow[k] = __float2bfloat16(p * (dp - Dq) * scale);
-    }
-}
-
-__global__ void fa_dVh_bf16_kernel(const __nv_bfloat16* __restrict__ P,
-                                   const __nv_bfloat16* __restrict__ dOh,
-                                   __nv_bfloat16* __restrict__ dVh,
-                                   int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (int q = 0; q < Lq; ++q) {
-        acc += __bfloat162float(P[q * Lk + k]) * __bfloat162float(dOh[q * hd + d]);
-    }
-    dVh[k * hd + d] = __float2bfloat16(acc);
-}
-
-__global__ void fa_dQh_bf16_kernel(const __nv_bfloat16* __restrict__ dS,
-                                   const __nv_bfloat16* __restrict__ Kh,
-                                   __nv_bfloat16* __restrict__ dQh,
-                                   int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int q = blockIdx.y * blockDim.y + threadIdx.y;
-    if (q >= Lq || d >= hd) return;
-    float acc = 0.0f;
-    for (int k = 0; k < Lk; ++k) {
-        acc += __bfloat162float(dS[q * Lk + k]) * __bfloat162float(Kh[k * hd + d]);
-    }
-    dQh[q * hd + d] = __float2bfloat16(acc);
-}
-
-__global__ void fa_dKh_bf16_kernel(const __nv_bfloat16* __restrict__ dS,
-                                   const __nv_bfloat16* __restrict__ Qh,
-                                   __nv_bfloat16* __restrict__ dKh,
-                                   int Lq, int Lk, int hd) {
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    const int k = blockIdx.y * blockDim.y + threadIdx.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (int q = 0; q < Lq; ++q) {
-        acc += __bfloat162float(dS[q * Lk + k]) * __bfloat162float(Qh[q * hd + d]);
-    }
-    dKh[k * hd + d] = __float2bfloat16(acc);
 }
 
 // BF16 in-place add: dst[i] += src[i] (FP32 sum, written back as BF16).
@@ -1527,19 +1135,18 @@ void flash_attention_qkvo_int8w_fp16(const Tensor& X,
         d_mask, num_heads, causal, O);
 }
 
-// ─── Recompute-style FP16 backward ─────────────────────────────────────────
+// ─── Recompute-style FP16 / BF16 backward ──────────────────────────────────
 //
-// Strategy: re-run the forward up to the per-head softmax + V matmul to
-// reconstruct O_attn (post-attention, pre-Wo) AND each head's P matrix.
+// Strategy: re-run the forward to reconstruct O_attn (post-attention, pre-Wo),
+// then reverse each stage.
 //   1. Re-project X→Q, Ctx→K, Ctx→V via linear_forward_batched_fp16
 //      (bit-identical to the forward).
-//   2. Run the per-head extract/matmul/softmax pipeline (mirroring the
-//      forward's WMMA path) to land O_attn (Lq, D).
+//   2. O_attn (Lq, D) = flash_attention_forward(Q, K, V).
 //   3. Wo+bo backward: dO_attn = dO·Wo, dWo += dO^T·O_attn,
 //      dbo += colsum(dO). linear_backward_batched handles all three
 //      with FP16 storage + FP32 scratch.
-//   4. Per head: re-extract Q_h, K_h, V_h, dO_attn_h. Re-derive P. Compute
-//      dV_h, dP, dS = P*(dP-D_q)*inv_sqrt, dQ_h, dK_h. Pack dQ/dK/dV back.
+//   4. dQ, dK, dV = flash_attention_backward(Q, K, V, dO_attn): FP32 scores,
+//      softmax, dP and D_q; P and dS narrowed only as GEMM operands.
 //   5. Q,K,V-projection backward: linear_backward_batched for each.
 //      Self-attn (Ctx=null) accumulates Q/K/V dX contributions; cross-attn
 //      sends Q→dX, K+V→dCtx.
@@ -1614,7 +1221,6 @@ void flash_attention_qkvo_backward(
     if (causal && Lq != Lk) {
         throw std::runtime_error("flash_attention_qkvo_backward: causal requires Lq == Lk");
     }
-    const int hd = D / num_heads;
 
     if (dX.rows != Lq || dX.cols != D || dX.dtype != dt) {
         dX.resize(Lq, D, dt);
@@ -1645,99 +1251,11 @@ void flash_attention_qkvo_backward(
         linear_forward_batched_fp16(Wv, bv, kv_src, V);
     }
 
-    // ── 2. Per-head recompute of P and O_attn (Lq, D). ────────────────────
-    Tensor Qh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
-    Tensor Kh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
-    Tensor Vh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
-    Tensor Vth = Tensor::empty_on(Device::CUDA, hd, Lk, dt);   // V transposed for matmul_ABT in O_attn step
-    Tensor P_main = Tensor::empty_on(Device::CUDA, Lq, Lk, dt); // P during main bwd sweep (per head)
-    Tensor O_attn = Tensor::empty_on(Device::CUDA, Lq, D, dt);  // full (Lq, D) post-attn pre-Wo
-
-    constexpr int CP_BLOCK = 256;
-    int sm_block = 32;
-    while (sm_block < Lk && sm_block < 1024) sm_block *= 2;
-    if (sm_block > 1024) sm_block = 1024;
-    const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(hd));
-
-    // Recompute pass 1: fill O_attn so we can run Wo backward against it.
-    // We use launch_matmul_ABT for both matmuls — mirror forward's WMMA path
-    // (the file-local naive BF16 matmul for the BF16 dtype).
-    {
-        Tensor S = Tensor::empty_on(Device::CUDA, Lq, Lk, dt);
-        Tensor Oh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
-        for (int h = 0; h < num_heads; ++h) {
-            const int head_off = h * hd;
-            const int total_q = Lq * hd;
-            const int total_k = Lk * hd;
-            const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
-            if (bf16) {
-                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(Q.data),
-                    reinterpret_cast<__nv_bfloat16*>(Qh.data),
-                    Lq, D, head_off, hd);
-                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(K.data),
-                    reinterpret_cast<__nv_bfloat16*>(Kh.data),
-                    Lk, D, head_off, hd);
-                extract_head_DL_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(V.data),
-                    reinterpret_cast<__nv_bfloat16*>(Vth.data),
-                    Lk, D, head_off, hd, /*ldY=*/Lk);
-                launch_matmul_ABT_bf16(
-                    reinterpret_cast<const __nv_bfloat16*>(Qh.data),
-                    reinterpret_cast<const __nv_bfloat16*>(Kh.data),
-                    reinterpret_cast<__nv_bfloat16*>(S.data),
-                    Lq, Lk, hd);
-                fa_scale_mask_causal_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
-                    reinterpret_cast<__nv_bfloat16*>(S.data),
-                    Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
-                launch_matmul_ABT_bf16(
-                    reinterpret_cast<const __nv_bfloat16*>(S.data),
-                    reinterpret_cast<const __nv_bfloat16*>(Vth.data),
-                    reinterpret_cast<__nv_bfloat16*>(Oh.data),
-                    Lq, hd, Lk);
-                pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(Oh.data),
-                    reinterpret_cast<__nv_bfloat16*>(O_attn.data),
-                    Lq, D, head_off, hd);
-                continue;
-            }
-            extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(Q.data),
-                reinterpret_cast<__half*>(Qh.data),
-                Lq, D, head_off, hd);
-            extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(K.data),
-                reinterpret_cast<__half*>(Kh.data),
-                Lk, D, head_off, hd);
-            extract_head_DL_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(V.data),
-                reinterpret_cast<__half*>(Vth.data),
-                Lk, D, head_off, hd, /*ldY=*/Lk);
-
-            fp16_internal::launch_matmul_ABT(
-                reinterpret_cast<const __half*>(Qh.data),
-                reinterpret_cast<const __half*>(Kh.data),
-                reinterpret_cast<__half*>(S.data),
-                Lq, Lk, hd);
-
-            fa_scale_mask_causal_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
-                reinterpret_cast<__half*>(S.data),
-                Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
-
-            fp16_internal::launch_matmul_ABT(
-                reinterpret_cast<const __half*>(S.data),
-                reinterpret_cast<const __half*>(Vth.data),
-                reinterpret_cast<__half*>(Oh.data),
-                Lq, hd, Lk);
-
-            pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(Oh.data),
-                reinterpret_cast<__half*>(O_attn.data),
-                Lq, D, head_off, hd);
-        }
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    }
+    // ── 2. Recompute O_attn (Lq, D) = attention(Q, K, V) for Wo's backward. ─
+    // The same attention the forward ran (flash_attention_forward: FP32
+    // scores and softmax on every path).
+    Tensor O_attn = Tensor::empty_on(Device::CUDA, Lq, D, dt);  // post-attn, pre-Wo
+    flash_attention_forward(Q, K, V, d_mask, num_heads, causal, O_attn);
 
     // ── 3. Wo + bo backward via linear_backward_batched. ──────────────
     //   forward: O(Lq, D) = O_attn(Lq, D) @ Wo(D, D)^T + bo
@@ -1765,200 +1283,13 @@ void flash_attention_qkvo_backward(
         }
     }
 
-    // ── 4. Per-head backward sweep. ───────────────────────────────────────
-    Tensor dQ = Tensor::empty_on(Device::CUDA, Lq, D, dt); dQ.zero();
-    Tensor dK = Tensor::empty_on(Device::CUDA, Lk, D, dt); dK.zero();
-    Tensor dV = Tensor::empty_on(Device::CUDA, Lk, D, dt); dV.zero();
-    {
-        Tensor dOh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
-        Tensor dP = Tensor::empty_on(Device::CUDA, Lq, Lk, dt);
-        Tensor dQh = Tensor::empty_on(Device::CUDA, Lq, hd, dt);
-        Tensor dKh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
-        Tensor dVh = Tensor::empty_on(Device::CUDA, Lk, hd, dt);
-        for (int h = 0; h < num_heads; ++h) {
-            const int head_off = h * hd;
-            const int total_q = Lq * hd;
-            const int total_k = Lk * hd;
-            const size_t shmem = static_cast<size_t>(sm_block) * sizeof(float);
-
-            if (bf16) {
-                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(Q.data),
-                    reinterpret_cast<__nv_bfloat16*>(Qh.data),
-                    Lq, D, head_off, hd);
-                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(K.data),
-                    reinterpret_cast<__nv_bfloat16*>(Kh.data),
-                    Lk, D, head_off, hd);
-                extract_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(V.data),
-                    reinterpret_cast<__nv_bfloat16*>(Vh.data),
-                    Lk, D, head_off, hd);
-                extract_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(dO_attn.data),
-                    reinterpret_cast<__nv_bfloat16*>(dOh.data),
-                    Lq, D, head_off, hd);
-
-                launch_matmul_ABT_bf16(
-                    reinterpret_cast<const __nv_bfloat16*>(Qh.data),
-                    reinterpret_cast<const __nv_bfloat16*>(Kh.data),
-                    reinterpret_cast<__nv_bfloat16*>(P_main.data),
-                    Lq, Lk, hd);
-                fa_scale_mask_causal_softmax_rows_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
-                    reinterpret_cast<__nv_bfloat16*>(P_main.data),
-                    Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
-
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                    fa_dVh_bf16_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(P_main.data),
-                        reinterpret_cast<const __nv_bfloat16*>(dOh.data),
-                        reinterpret_cast<__nv_bfloat16*>(dVh.data),
-                        Lq, Lk, hd);
-                }
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
-                    fa_dP_bf16_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(dOh.data),
-                        reinterpret_cast<const __nv_bfloat16*>(Vh.data),
-                        reinterpret_cast<__nv_bfloat16*>(dP.data),
-                        Lq, Lk, hd);
-                }
-                {
-                    fa_dS_from_P_dP_bf16_kernel<<<Lq, sm_block, shmem, stream>>>(
-                        reinterpret_cast<__nv_bfloat16*>(P_main.data),
-                        reinterpret_cast<const __nv_bfloat16*>(dP.data),
-                        Lq, Lk, inv_sqrt);
-                }
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
-                    fa_dQh_bf16_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(P_main.data),
-                        reinterpret_cast<const __nv_bfloat16*>(Kh.data),
-                        reinterpret_cast<__nv_bfloat16*>(dQh.data),
-                        Lq, Lk, hd);
-                }
-                {
-                    dim3 block(16, 16);
-                    dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                    fa_dKh_bf16_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<const __nv_bfloat16*>(P_main.data),
-                        reinterpret_cast<const __nv_bfloat16*>(Qh.data),
-                        reinterpret_cast<__nv_bfloat16*>(dKh.data),
-                        Lq, Lk, hd);
-                }
-                pack_head_LD_bf16_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(dQh.data),
-                    reinterpret_cast<__nv_bfloat16*>(dQ.data),
-                    Lq, D, head_off, hd);
-                pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(dKh.data),
-                    reinterpret_cast<__nv_bfloat16*>(dK.data),
-                    Lk, D, head_off, hd);
-                pack_head_LD_bf16_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                    reinterpret_cast<const __nv_bfloat16*>(dVh.data),
-                    reinterpret_cast<__nv_bfloat16*>(dV.data),
-                    Lk, D, head_off, hd);
-                continue;
-            }
-
-            extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(Q.data),
-                reinterpret_cast<__half*>(Qh.data),
-                Lq, D, head_off, hd);
-            extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(K.data),
-                reinterpret_cast<__half*>(Kh.data),
-                Lk, D, head_off, hd);
-            extract_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(V.data),
-                reinterpret_cast<__half*>(Vh.data),
-                Lk, D, head_off, hd);
-            extract_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(dO_attn.data),
-                reinterpret_cast<__half*>(dOh.data),
-                Lq, D, head_off, hd);
-
-            // Recompute P for this head — same code path as pass 1.
-            fp16_internal::launch_matmul_ABT(
-                reinterpret_cast<const __half*>(Qh.data),
-                reinterpret_cast<const __half*>(Kh.data),
-                reinterpret_cast<__half*>(P_main.data),
-                Lq, Lk, hd);
-            fa_scale_mask_causal_softmax_rows_kernel<<<Lq, sm_block, shmem, stream>>>(
-                reinterpret_cast<__half*>(P_main.data),
-                Lq, Lk, inv_sqrt, d_mask, causal ? 1 : 0);
-
-            // dV_h = P^T · dO_attn_h  (Lk, hd)
-            {
-                dim3 block(16, 16);
-                dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                fa_dVh_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __half*>(P_main.data),
-                    reinterpret_cast<const __half*>(dOh.data),
-                    reinterpret_cast<__half*>(dVh.data),
-                    Lq, Lk, hd);
-            }
-
-            // dP = dO_attn_h · V_h^T   (Lq, Lk)
-            {
-                dim3 block(16, 16);
-                dim3 grid((Lk + 15) / 16, (Lq + 15) / 16);
-                fa_dP_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __half*>(dOh.data),
-                    reinterpret_cast<const __half*>(Vh.data),
-                    reinterpret_cast<__half*>(dP.data),
-                    Lq, Lk, hd);
-            }
-
-            // dS = P * (dP - D_q) * inv_sqrt — written in-place over P_main.
-            {
-                fa_dS_from_P_dP_kernel<<<Lq, sm_block, shmem, stream>>>(
-                    reinterpret_cast<__half*>(P_main.data),
-                    reinterpret_cast<const __half*>(dP.data),
-                    Lq, Lk, inv_sqrt);
-            }
-
-            // dQ_h = dS · K_h
-            {
-                dim3 block(16, 16);
-                dim3 grid((hd + 15) / 16, (Lq + 15) / 16);
-                fa_dQh_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __half*>(P_main.data),
-                    reinterpret_cast<const __half*>(Kh.data),
-                    reinterpret_cast<__half*>(dQh.data),
-                    Lq, Lk, hd);
-            }
-            // dK_h = dS^T · Q_h
-            {
-                dim3 block(16, 16);
-                dim3 grid((hd + 15) / 16, (Lk + 15) / 16);
-                fa_dKh_kernel<<<grid, block, 0, stream>>>(
-                    reinterpret_cast<const __half*>(P_main.data),
-                    reinterpret_cast<const __half*>(Qh.data),
-                    reinterpret_cast<__half*>(dKh.data),
-                    Lq, Lk, hd);
-            }
-
-            // Pack dQ_h / dK_h / dV_h back into (Lq, D) / (Lk, D).
-            pack_head_LD_kernel<<<grid_for(total_q, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(dQh.data),
-                reinterpret_cast<__half*>(dQ.data),
-                Lq, D, head_off, hd);
-            pack_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(dKh.data),
-                reinterpret_cast<__half*>(dK.data),
-                Lk, D, head_off, hd);
-            pack_head_LD_kernel<<<grid_for(total_k, CP_BLOCK), CP_BLOCK, 0, stream>>>(
-                reinterpret_cast<const __half*>(dVh.data),
-                reinterpret_cast<__half*>(dV.data),
-                Lk, D, head_off, hd);
-        }
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    }
+    // ── 4. Attention-core backward: dQ, dK, dV from dO_attn. ──────────────
+    // flash_attention_backward's pipeline (FP32 scores, softmax, dP and D_q;
+    // see flash_attention_backward.cu).
+    Tensor dQ = Tensor::empty_on(Device::CUDA, Lq, D, dt);
+    Tensor dK = Tensor::empty_on(Device::CUDA, Lk, D, dt);
+    Tensor dV = Tensor::empty_on(Device::CUDA, Lk, D, dt);
+    flash_attention_backward(Q, K, V, O_attn, dO_attn, d_mask, num_heads, causal, dQ, dK, dV);
 
     // ── 5. Q / K / V projection backward. ─────────────────────────────────
     // forward: Q = X·Wq^T + bq  →  dX_q = dQ·Wq, dWq += dQ^T·X, dbq += colsum(dQ).
@@ -2023,16 +1354,6 @@ void flash_attention_qkvo_backward(
 // is owned by src/cuda/kv_cache.cu (different cluster), so it's NOT assigned
 // here. flash_attention_backward lives in flash_attention_backward.cu and is
 // wired here for cluster locality.
-
-void flash_attention_backward(const ::brotensor::Tensor& Q,
-                              const ::brotensor::Tensor& K,
-                              const ::brotensor::Tensor& V,
-                              const ::brotensor::Tensor& O,
-                              const ::brotensor::Tensor& dO,
-                              const float* d_mask, int num_heads, bool causal,
-                              ::brotensor::Tensor& dQ,
-                              ::brotensor::Tensor& dK,
-                              ::brotensor::Tensor& dV);
 
 void flash_attention_varlen_backward(const ::brotensor::Tensor& Q,
                                      const ::brotensor::Tensor& K,
