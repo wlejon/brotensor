@@ -197,46 +197,44 @@ __global__ void conv2d_int8w_implicit_gemm_wmma_kernel(
         __syncthreads();
     }
 
-    __shared__ __half Cs[BM][BN + 8];
+    // Epilogue: the FP32 accumulator is staged one warp row (WM x BN) at a
+    // time, so the bias is added before the one narrowing to FP16 — in the
+    // shared footprint a whole-tile __half staging would take.
+    static_assert(WARPS_M == 2 && WM * WARPS_M == BM, "two warp rows, one staging pass each");
+    __shared__ __align__(32) float Cs[WM][BN + 8];
+    constexpr int kElemsPerThr = WM * BN / THREADS_PER_CTA;
 
     #pragma unroll
-    for (int i = 0; i < FRAGS_M; ++i) {
-        #pragma unroll
-        for (int j = 0; j < FRAGS_N; ++j) {
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __half> c_h;
+    for (int pass = 0; pass < WARPS_M; ++pass) {
+        if (warp_m == pass) {
             #pragma unroll
-            for (int e = 0; e < c_frag[i][j].num_elements; ++e) {
-                c_h.x[e] = __float2half(c_frag[i][j].x[e]);
+            for (int i = 0; i < FRAGS_M; ++i) {
+                #pragma unroll
+                for (int j = 0; j < FRAGS_N; ++j) {
+                    wmma::store_matrix_sync(&Cs[i * WMMA_M][warp_n * WN + j * WMMA_N], c_frag[i][j], BN + 8,
+                                            wmma::mem_row_major);
+                }
             }
-            __half* c_ptr = &Cs[warp_m * WM + i * WMMA_M][warp_n * WN + j * WMMA_N];
-            wmma::store_matrix_sync(c_ptr, c_h, BN + 8, wmma::mem_row_major);
         }
-    }
-
-    __syncthreads();
-
-    {
-        constexpr int kElemsPerCol = BN;
-        constexpr int kElemsTotal  = BM * BN;
-        constexpr int kElemsPerThr = kElemsTotal / THREADS_PER_CTA;
+        __syncthreads();
 
         #pragma unroll
         for (int si = 0; si < kElemsPerThr; ++si) {
             const int lin = tid + si * THREADS_PER_CTA;
-            const int row = lin / kElemsPerCol;
-            const int col = lin - row * kElemsPerCol;
+            const int row = lin / BN;
+            const int col = lin - row * BN;
 
-            const int m_g = block_m + row;
+            const int m_g = block_m + pass * WM + row;
             const int oc  = block_n + col;
-            if (oc >= C_out) continue;
-            if (m_g >= N * HW_out) continue;
-
-            const int n   = m_g / HW_out;
-            const int sp  = m_g - n * HW_out;
-            float v = __half2float(Cs[row][col]);
-            if (bias) v += __half2float(bias[oc]);
-            Y[(n * C_out + oc) * HW_out + sp] = __float2half(v);
+            if (oc < C_out && m_g < N * HW_out) {
+                const int n  = m_g / HW_out;
+                const int sp = m_g - n * HW_out;
+                float v = Cs[row][col];
+                if (bias) v += __half2float(bias[oc]);
+                Y[(n * C_out + oc) * HW_out + sp] = __float2half(v);
+            }
         }
+        __syncthreads();
     }
 }
 

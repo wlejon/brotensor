@@ -12,10 +12,13 @@
 //
 // One template over both __half and __nv_bfloat16 (RTX 4090 / sm_89 supports BF16
 // WMMA fragments; load_matrix_sync / mma_sync / store_matrix_sync are identical —
-// only the fragment element type and the host-side conversions differ). The FP16
-// path keeps its original __half-accumulator + vectorised int4 store epilogue
-// untouched; the BF16 path stages the FP32 accumulator through a float tile (WMMA
-// has no BF16 accumulator fragment) and narrows in the scatter.
+// only the fragment element type and the host-side conversions differ). Without
+// an epilogue the FP16 path narrows the accumulator to a __half tile and keeps
+// the vectorised int4 store; with a bias or activation it stages the FP32
+// accumulator (half the tile per pass, same shared footprint) so the epilogue
+// runs before the one narrowing. The BF16 path always stages the FP32
+// accumulator through a float tile (WMMA has no BF16 accumulator fragment) and
+// narrows in the scatter.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -274,59 +277,92 @@ __global__ void matmul_ABT_wmma_kernel(const T* __restrict__ A,
 
     // ---- Store C tile ----
     if constexpr (std::is_same<T, __half>::value) {
-        // FP16 path: stage the accumulator as __half and write out, reusing the
-        // vectorised int4 store for the no-epilogue case (unchanged from the
-        // original FP16-only kernel).
-        __shared__ __half Cs[BM][BN + 8];
+        // FP16 path. One shared buffer, two views of it:
+        //   no epilogue  — the accumulator narrowed to __half (BM x BN) and
+        //                  written out with the vectorised int4 store;
+        //   bias / act   — the FP32 accumulator (BM/2 x BN, one warp row at a
+        //                  time), so the bias and activation apply before the
+        //                  single narrowing rather than to an already-rounded
+        //                  product. Same shared footprint as the half tile.
+        static_assert(WARPS_M == 2 && WM * WARPS_M == BM, "two warp rows, one staging pass each");
+        __shared__ __align__(32) unsigned char cs_raw[BM * (BN + 8) * sizeof(__half)];
 
-        #pragma unroll
-        for (int i = 0; i < FRAGS_M; ++i) {
+        if (bias == nullptr && act == 0) {
+            auto Cs = reinterpret_cast<__half (*)[BN + 8]>(cs_raw);
             #pragma unroll
-            for (int j = 0; j < FRAGS_N; ++j) {
-                // Convert FP32 frag -> FP16 via a temp FP16 frag.
-                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __half> c_h;
+            for (int i = 0; i < FRAGS_M; ++i) {
                 #pragma unroll
-                for (int e = 0; e < c_frag[i][j].num_elements; ++e) {
-                    c_h.x[e] = __float2half(c_frag[i][j].x[e]);
+                for (int j = 0; j < FRAGS_N; ++j) {
+                    // Convert FP32 frag -> FP16 via a temp FP16 frag.
+                    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, __half> c_h;
+                    #pragma unroll
+                    for (int e = 0; e < c_frag[i][j].num_elements; ++e) {
+                        c_h.x[e] = __float2half(c_frag[i][j].x[e]);
+                    }
+                    __half* c_ptr = &Cs[warp_m * WM + i * WMMA_M][warp_n * WN + j * WMMA_N];
+                    wmma::store_matrix_sync(c_ptr, c_h, BN + 8, wmma::mem_row_major);
                 }
-                __half* c_ptr = &Cs[warp_m * WM + i * WMMA_M][warp_n * WN + j * WMMA_N];
-                wmma::store_matrix_sync(c_ptr, c_h, BN + 8, wmma::mem_row_major);
             }
-        }
 
-        __syncthreads();
+            __syncthreads();
 
-        // Write Cs -> C global.
-        // BM*BN = 4096 halves, 128 threads, 32 per thread (4 int4).
-        constexpr int kHalvesPerStore = 8;
-        constexpr int kTotal          = BM * BN;
-        constexpr int kStoresTotal    = kTotal / kHalvesPerStore;  // 512
-        constexpr int kStoresPerThr   = kStoresTotal / THREADS_PER_CTA;  // 4
+            // Write Cs -> C global.
+            // BM*BN = 4096 halves, 128 threads, 32 per thread (4 int4).
+            constexpr int kHalvesPerStore = 8;
+            constexpr int kTotal          = BM * BN;
+            constexpr int kStoresTotal    = kTotal / kHalvesPerStore;  // 512
+            constexpr int kStoresPerThr   = kStoresTotal / THREADS_PER_CTA;  // 4
 
-        #pragma unroll
-        for (int si = 0; si < kStoresPerThr; ++si) {
-            const int lin = tid + si * THREADS_PER_CTA;
-            const int row = lin / (BN / kHalvesPerStore);  // BN/8 = 8 per row
-            const int col_grp = lin % (BN / kHalvesPerStore);
-            const int gcol = col_grp * kHalvesPerStore;
-            const int grow = block_m + row;
-            const int gn   = block_n + gcol;
+            #pragma unroll
+            for (int si = 0; si < kStoresPerThr; ++si) {
+                const int lin = tid + si * THREADS_PER_CTA;
+                const int row = lin / (BN / kHalvesPerStore);  // BN/8 = 8 per row
+                const int col_grp = lin % (BN / kHalvesPerStore);
+                const int gcol = col_grp * kHalvesPerStore;
+                const int grow = block_m + row;
+                const int gn   = block_n + gcol;
 
-            if (grow >= M) continue;
-            if (bias == nullptr && act == 0 && gn + kHalvesPerStore <= N) {
-                int4 v = *reinterpret_cast<const int4*>(&Cs[row][gcol]);
-                *reinterpret_cast<int4*>(&C[grow * N + gn]) = v;
-            } else {
-                #pragma unroll
-                for (int q = 0; q < kHalvesPerStore; ++q) {
-                    int gn_q = gn + q;
-                    if (gn_q < N) {
-                        float cv = __half2float(Cs[row][gcol + q]);
-                        if (bias) cv += __half2float(bias[gn_q]);
-                        cv = ::brotensor::detail::cuda::apply_linear_act(act, cv);
-                        C[grow * N + gn_q] = __float2half(cv);
+                if (grow >= M) continue;
+                if (gn + kHalvesPerStore <= N) {
+                    int4 v = *reinterpret_cast<const int4*>(&Cs[row][gcol]);
+                    *reinterpret_cast<int4*>(&C[grow * N + gn]) = v;
+                } else {
+                    #pragma unroll
+                    for (int q = 0; q < kHalvesPerStore; ++q) {
+                        if (gn + q < N) C[grow * N + gn + q] = Cs[row][gcol + q];
                     }
                 }
+            }
+        } else {
+            auto Cf = reinterpret_cast<float (*)[BN + 8]>(cs_raw);   // WM rows
+            constexpr int kElemsPerThr = WM * BN / THREADS_PER_CTA;  // 16
+            #pragma unroll
+            for (int pass = 0; pass < WARPS_M; ++pass) {
+                if (warp_m == pass) {
+                    #pragma unroll
+                    for (int i = 0; i < FRAGS_M; ++i) {
+                        #pragma unroll
+                        for (int j = 0; j < FRAGS_N; ++j) {
+                            wmma::store_matrix_sync(&Cf[i * WMMA_M][warp_n * WN + j * WMMA_N], c_frag[i][j],
+                                                    BN + 8, wmma::mem_row_major);
+                        }
+                    }
+                }
+                __syncthreads();
+                #pragma unroll
+                for (int si = 0; si < kElemsPerThr; ++si) {
+                    const int lin = tid + si * THREADS_PER_CTA;
+                    const int row = lin / BN;
+                    const int col = lin - row * BN;
+                    const int grow = block_m + pass * WM + row;
+                    const int gn   = block_n + col;
+                    if (grow >= M || gn >= N) continue;
+                    float cv = Cf[row][col];
+                    if (bias) cv += __half2float(bias[gn]);
+                    cv = ::brotensor::detail::cuda::apply_linear_act(act, cv);
+                    C[grow * N + gn] = __float2half(cv);
+                }
+                __syncthreads();
             }
         }
     } else {
