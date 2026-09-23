@@ -858,19 +858,17 @@ void run_qkvo_backward(Device dev, const std::string& dn, uint64_t seed) {
                                                      c.cross ? &dCtx : nullptr, dWq, &dbq, dWk, &dbk, dWv, &dbv,
                                                      dWo, &dbo);
 
-            // Reference. lin: rows of `in` (n, k) through W (m, k) + b, rounded.
+            // Reference. lin: rows of `in` (n, k) through W (m, k) + b, rounded
+            // once to the op's dtype (the projections add the bias in FP32).
             auto lin = [&](const Tensor& in, const Tensor& W, const Tensor& b) {
                 const int n = in.rows, kk = in.cols, m = W.rows;
                 std::vector<float> y(static_cast<size_t>(n) * m);
                 for (int r = 0; r < n; ++r)
                     for (int o = 0; o < m; ++o) {
-                        double a = 0.0;
+                        double a = b.host_f32()[o];
                         for (int i = 0; i < kk; ++i)
                             a += static_cast<double>(in.host_f32()[r * kk + i]) * W.host_f32()[o * kk + i];
-                        // The BF16 projection rounds X W^T, then adds the bias
-                        // and rounds again; FP16 fuses the bias into one rounding.
-                        if (dt == Dtype::BF16) a = round_to(a, dt);
-                        y[static_cast<size_t>(r) * m + o] = round_to(a + b.host_f32()[o], dt);
+                        y[static_cast<size_t>(r) * m + o] = round_to(a, dt);
                     }
                 return y;
             };

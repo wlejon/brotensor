@@ -318,35 +318,6 @@ __global__ void fa_fp16_add_inplace_kernel(__half* __restrict__ dst,
 
 // ─── BF16 kernels ──────────────────────────────────────────────────────────
 
-// Naive BF16 matmul: C(M, N) = A(M, K) @ B(N, K)^T, FP32 accumulation, one
-// thread per output (the BF16 batched-linear helpers below).
-__global__ void matmul_ABT_bf16_kernel(const __nv_bfloat16* __restrict__ A,
-                                       const __nv_bfloat16* __restrict__ B,
-                                       __nv_bfloat16* __restrict__ C,
-                                       int M, int N, int K) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = M * N;
-    if (idx >= total) return;
-    const int m = idx / N;
-    const int n = idx % N;
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        acc += __bfloat162float(A[m * K + k]) * __bfloat162float(B[n * K + k]);
-    }
-    C[idx] = __float2bfloat16(acc);
-}
-
-inline void launch_matmul_ABT_bf16(const __nv_bfloat16* A,
-                                   const __nv_bfloat16* B,
-                                   __nv_bfloat16* C, int M, int N, int K) {
-    if (M == 0 || N == 0) return;
-    const int total = M * N;
-    const int block = 128;
-    const int grid  = (total + block - 1) / block;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
-    matmul_ABT_bf16_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
-}
-
 __global__ void flash_attention_bf16_kernel(
         const __nv_bfloat16* __restrict__ Q,    // (Lq, D)
         const __nv_bfloat16* __restrict__ K,    // (Lk, D)
@@ -464,26 +435,14 @@ __global__ void fa_bf16_add_inplace_kernel(__nv_bfloat16* __restrict__ dst,
     dst[i] = __float2bfloat16(__bfloat162float(dst[i]) + __bfloat162float(src[i]));
 }
 
-// ─── BF16 batched-linear helpers ────────────────────────────────────────────
+// ─── BF16 batched-linear backward helpers ───────────────────────────────────
 //
-// linear_forward_batched_fp16 / linear_backward_batched (gemm.cu / batched_ops.cu)
-// are fixed-FP16 / FP16-or-FP32 and out of this chunk's scope. The flash qkvo
-// ops need a BF16 projection path, so flash_attention.cu carries its own
-// self-contained BF16 batched-linear forward + backward — same contracts:
-//   forward:  Y_BD(B, out) = X_BD(B, in) @ W(out, in)^T + bias
-//   backward: dX_BD = dY·W ; dW += dY^T·X (FP32 scratch) ; dB += colsum(dY).
-
-__global__ void fa_bf16_bias_add_kernel(__nv_bfloat16* __restrict__ Y,
-                                        const __nv_bfloat16* __restrict__ bias,
-                                        int B, int out_dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = B * out_dim;
-    if (idx >= total) return;
-    const int j = idx % out_dim;
-    const float yv = __bfloat162float(Y[idx]);
-    const float bv = __bfloat162float(bias[j]);
-    Y[idx] = __float2bfloat16(yv + bv);
-}
+// The qkvo projections' forward runs on linear_forward_batched_fp16 (gemm.cu),
+// which takes FP16 and BF16 alike: tensor-core GEMM, FP32 accumulation, bias
+// and activation added in FP32 ahead of the one narrowing. The backward's
+// linear_backward_batched (batched_ops.cu) is FP16-or-FP32 only, so the BF16
+// projection grads are carried here:
+//   dX_BD = dY·W ; dW += dY^T·X (FP32 scratch) ; dB += colsum(dY).
 
 __global__ void fa_lbb_dx_bf16_kernel(const __nv_bfloat16* __restrict__ W,
                                       const __nv_bfloat16* __restrict__ dY,
@@ -540,43 +499,12 @@ __global__ void fa_add_fp32_into_bf16_kernel(const float* __restrict__ src,
 
 namespace detail::cuda {
 
-// ─── BF16 batched-linear host wrappers (file-local) ─────────────────────────
+// ─── BF16 batched-linear backward host wrapper (file-local) ─────────────────
 //
-// BF16 twins of linear_forward_batched_fp16 / linear_backward_batched, built
-// on the file-local naive BF16 matmul + FP32-scratch fold kernels above. Used
-// by the BF16 path of the qkvo flash-attention ops.
+// BF16 twin of linear_backward_batched on the FP32-scratch fold kernels above.
+// Used by the BF16 path of flash_attention_qkvo_backward.
 
 namespace {
-
-void fa_linear_forward_batched_bf16(const Tensor& W, const Tensor* bias,
-                                    const Tensor& X_BD, Tensor& Y_BD) {
-    const int B       = X_BD.rows;
-    const int in_dim  = X_BD.cols;
-    const int out_dim = W.rows;
-    if (W.cols != in_dim) {
-        throw std::runtime_error("fa_linear_forward_batched_bf16: shape mismatch");
-    }
-    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::BF16) {
-        Y_BD.resize(B, out_dim, Dtype::BF16);
-    }
-    if (B == 0 || out_dim == 0) return;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
-    launch_matmul_ABT_bf16(
-        static_cast<const __nv_bfloat16*>(X_BD.data),
-        static_cast<const __nv_bfloat16*>(W.data),
-        static_cast<__nv_bfloat16*>(Y_BD.data),
-        B, out_dim, in_dim);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    if (bias && bias->size() > 0) {
-        const int total = B * out_dim;
-        const int blocks = (total + 255) / 256;
-        fa_bf16_bias_add_kernel<<<blocks, 256, 0, stream>>>(
-            static_cast<__nv_bfloat16*>(Y_BD.data),
-            static_cast<const __nv_bfloat16*>(bias->data),
-            B, out_dim);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    }
-}
 
 // dX_BD overwritten; dW / dB accumulate (+=), matching linear_backward_batched.
 void fa_linear_backward_batched_bf16(const Tensor& W, const Tensor& X_BD,
@@ -867,7 +795,6 @@ void flash_attention_project_kv(const Tensor& ctx,
         (bk && bk->dtype != dt) || (bv && bv->dtype != dt)) {
         throw std::runtime_error("flash_attention_project_kv: dtype mismatch");
     }
-    const bool bf16 = (dt == Dtype::BF16);
     const int Lk = ctx.rows;
     const int D_ctx = ctx.cols;
     const int D = Wk.rows;
@@ -881,13 +808,8 @@ void flash_attention_project_kv(const Tensor& ctx,
         V_out.resize(Lk, D, dt);
     }
     if (Lk == 0 || D == 0) return;
-    if (bf16) {
-        fa_linear_forward_batched_bf16(Wk, bk, ctx, K_out);
-        fa_linear_forward_batched_bf16(Wv, bv, ctx, V_out);
-    } else {
-        linear_forward_batched_fp16(Wk, bk, ctx, K_out);
-        linear_forward_batched_fp16(Wv, bv, ctx, V_out);
-    }
+    linear_forward_batched_fp16(Wk, bk, ctx, K_out);
+    linear_forward_batched_fp16(Wv, bv, ctx, V_out);
 }
 
 // Core attention with caller-supplied K/V (pre-projected). Projects X → Q
@@ -911,7 +833,6 @@ void flash_attention_q_with_kv_cached_forward(const Tensor& X,
         (bq && bq->dtype != dt) || (bo && bo->dtype != dt)) {
         throw std::runtime_error("flash_attention_q_with_kv_cached_forward: dtype mismatch");
     }
-    const bool bf16 = (dt == Dtype::BF16);
     const int Lq = X.rows;
     const int D  = X.cols;
     const int Lk = K.rows;
@@ -932,15 +853,9 @@ void flash_attention_q_with_kv_cached_forward(const Tensor& X,
     Tensor Qp = Tensor::empty_on(Device::CUDA, Lq, D, dt);
     Tensor Op = Tensor::empty_on(Device::CUDA, Lq, D, dt);
 
-    if (bf16) {
-        fa_linear_forward_batched_bf16(Wq, bq, X, Qp);
-        flash_attention_forward(Qp, K, V, d_mask, num_heads, causal, Op);
-        fa_linear_forward_batched_bf16(Wo, bo, Op, O);
-    } else {
-        linear_forward_batched_fp16(Wq, bq, X, Qp);
-        flash_attention_forward(Qp, K, V, d_mask, num_heads, causal, Op);
-        linear_forward_batched_fp16(Wo, bo, Op, O);
-    }
+    linear_forward_batched_fp16(Wq, bq, X, Qp);
+    flash_attention_forward(Qp, K, V, d_mask, num_heads, causal, Op);
+    linear_forward_batched_fp16(Wo, bo, Op, O);
 }
 
 // Variant that fuses Q/K/V/O projections at the boundary. Delegates each
@@ -1241,15 +1156,9 @@ void flash_attention_qkvo_backward(
     Tensor Q = Tensor::empty_on(Device::CUDA, Lq, D, dt);
     Tensor K = Tensor::empty_on(Device::CUDA, Lk, D, dt);
     Tensor V = Tensor::empty_on(Device::CUDA, Lk, D, dt);
-    if (bf16) {
-        fa_linear_forward_batched_bf16(Wq, bq, X,      Q);
-        fa_linear_forward_batched_bf16(Wk, bk, kv_src, K);
-        fa_linear_forward_batched_bf16(Wv, bv, kv_src, V);
-    } else {
-        linear_forward_batched_fp16(Wq, bq, X,      Q);
-        linear_forward_batched_fp16(Wk, bk, kv_src, K);
-        linear_forward_batched_fp16(Wv, bv, kv_src, V);
-    }
+    linear_forward_batched_fp16(Wq, bq, X,      Q);
+    linear_forward_batched_fp16(Wk, bk, kv_src, K);
+    linear_forward_batched_fp16(Wv, bv, kv_src, V);
 
     // ── 2. Recompute O_attn (Lq, D) = attention(Q, K, V) for Wo's backward. ─
     // The same attention the forward ran (flash_attention_forward: FP32
