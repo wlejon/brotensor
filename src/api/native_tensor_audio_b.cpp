@@ -12,6 +12,27 @@
 #include "api_internal.h"
 
 using namespace brotensor::api;
+using brotensor::Tensor;
+
+namespace {
+
+Tensor* T(void* p) { return toTensor(p); }
+
+// conv1d is conv2d with H = kH = 1, and conv2d's device kernels trust the
+// caller's dims, so the operand extents are checked here. Computes L_out.
+bool conv1dGeom(const char* L, int32_t N, int32_t C_in, int32_t Lin, int32_t C_out, int32_t kL,
+                int32_t stride, int32_t padding, int32_t dilation, int32_t groups, int64_t& L_out) {
+    int64_t H_out = 0;
+    if (!needNonNegative(L, {N})) return false;
+    return convGeom2d(L, C_in, C_out, 1, Lin, 1, kL, 1, stride, 0, padding, 1, dilation, groups, H_out, L_out);
+}
+
+// The conv1d filter is OIL: (C_out, (C_in/groups)*kL).
+int64_t conv1dWeightElems(int32_t C_in, int32_t C_out, int32_t kL, int32_t groups) {
+    return elems({C_out, C_in / groups, kL});
+}
+
+} // namespace
 
 extern "C" {
 
@@ -38,7 +59,12 @@ void bro_tensor_pad1dBackward(void* dY, int32_t N, int32_t C, int32_t L,
 void bro_tensor_conv1d(void* X, void* Wt, uint64_t bias_bits, int32_t N, int32_t C_in,
                        int32_t L, int32_t C_out, int32_t kL, int32_t stride,
                        int32_t padding, int32_t dilation, int32_t groups, void* Y) {
-    if (!need("conv1d", {X, Wt, Y})) return;
+    const char* Lb = "conv1d";
+    int64_t L_out = 0;
+    if (!need(Lb, {X, Wt, Y}) || !conv1dGeom(Lb, N, C_in, L, C_out, kL, stride, padding, dilation, groups, L_out)) return;
+    if (!needOperands(Lb, T(X), {{"X", T(X), elems({N, C_in, L})},
+                                 {"Wt", T(Wt), conv1dWeightElems(C_in, C_out, kL, groups)},
+                                 {"bias", tensorFromValue(bias_bits), C_out}})) return;
     BROTENSOR_API_TRY
         brotensor::conv1d(*toTensor(X), *toTensor(Wt), tensorFromValue(bias_bits),
                           N, C_in, L, C_out, kL, stride, padding, dilation, groups,
@@ -50,7 +76,11 @@ void bro_tensor_conv1dBackwardInput(void* Wt, void* dY, int32_t N, int32_t C_in,
                                     int32_t L, int32_t C_out, int32_t kL, int32_t stride,
                                     int32_t padding, int32_t dilation, int32_t groups,
                                     void* dX) {
-    if (!need("conv1dBackwardInput", {Wt, dY, dX})) return;
+    const char* Lb = "conv1dBackwardInput";
+    int64_t L_out = 0;
+    if (!need(Lb, {Wt, dY, dX}) || !conv1dGeom(Lb, N, C_in, L, C_out, kL, stride, padding, dilation, groups, L_out)) return;
+    if (!needOperands(Lb, T(dY), {{"dY", T(dY), elems({N, C_out, L_out})},
+                                  {"Wt", T(Wt), conv1dWeightElems(C_in, C_out, kL, groups)}})) return;
     BROTENSOR_API_TRY
         brotensor::conv1d_backward_input(*toTensor(Wt), *toTensor(dY), N, C_in, L, C_out, kL,
                                          stride, padding, dilation, groups, *toTensor(dX));
@@ -61,7 +91,12 @@ void bro_tensor_conv1dBackwardWeight(void* X, void* dY, int32_t N, int32_t C_in,
                                      int32_t L, int32_t C_out, int32_t kL, int32_t stride,
                                      int32_t padding, int32_t dilation, int32_t groups,
                                      void* dWt) {
-    if (!need("conv1dBackwardWeight", {X, dY, dWt})) return;
+    const char* Lb = "conv1dBackwardWeight";
+    int64_t L_out = 0;
+    if (!need(Lb, {X, dY, dWt}) || !conv1dGeom(Lb, N, C_in, L, C_out, kL, stride, padding, dilation, groups, L_out)) return;
+    // dWt accumulates — "caller zeros".
+    if (!needOperands(Lb, T(X), {{"X", T(X), elems({N, C_in, L})}, {"dY", T(dY), elems({N, C_out, L_out})},
+                                 {"dWt", T(dWt), conv1dWeightElems(C_in, C_out, kL, groups)}})) return;
     BROTENSOR_API_TRY
         brotensor::conv1d_backward_weight(*toTensor(X), *toTensor(dY), N, C_in, L, C_out, kL,
                                           stride, padding, dilation, groups, *toTensor(dWt));
@@ -69,7 +104,9 @@ void bro_tensor_conv1dBackwardWeight(void* X, void* dY, int32_t N, int32_t C_in,
 }
 
 void bro_tensor_conv1dBackwardBias(void* dY, int32_t N, int32_t C_out, int32_t L_out, void* dB) {
-    if (!need("conv1dBackwardBias", {dY, dB})) return;
+    const char* Lb = "conv1dBackwardBias";
+    if (!need(Lb, {dY, dB}) || !needNonNegative(Lb, {N, C_out, L_out})) return;
+    if (!needOperands(Lb, T(dY), {{"dY", T(dY), elems({N, C_out, L_out})}, {"dB", T(dB), C_out}})) return;
     BROTENSOR_API_TRY
         brotensor::conv1d_backward_bias(*toTensor(dY), N, C_out, L_out, *toTensor(dB));
     BROTENSOR_API_CATCH("conv1dBackwardBias")
@@ -81,7 +118,13 @@ void bro_tensor_conv1dInt8wFp16(void* X, void* W_int8, void* scales, uint64_t bi
                                 int32_t N, int32_t C_in, int32_t L, int32_t C_out,
                                 int32_t kL, int32_t stride, int32_t padding,
                                 int32_t dilation, int32_t groups, void* Y) {
-    if (!need("conv1dInt8wFp16", {X, W_int8, scales, Y})) return;
+    const char* Lb = "conv1dInt8wFp16";
+    int64_t L_out = 0;
+    if (!need(Lb, {X, W_int8, scales, Y}) ||
+        !conv1dGeom(Lb, N, C_in, L, C_out, kL, stride, padding, dilation, groups, L_out)) return;
+    // The op checks W_int8 / scales shapes and every dtype.
+    if (!needOperands(Lb, T(X), {{"X", T(X), elems({N, C_in, L})},
+                                 {"bias", tensorFromValue(bias_bits), C_out}})) return;
     BROTENSOR_API_TRY
         brotensor::conv1d_int8w_fp16(*toTensor(X), *toTensor(W_int8), *toTensor(scales),
                                      tensorFromValue(bias_bits), N, C_in, L, C_out, kL,
@@ -93,7 +136,9 @@ void bro_tensor_convTranspose1dForward(void* X, void* Wt, uint64_t bias_bits, in
                                        int32_t C_in, int32_t L, int32_t C_out, int32_t kL,
                                        int32_t stride, int32_t padding, int32_t outputPadding,
                                        int32_t dilation, int32_t groups, void* Y) {
-    if (!need("convTranspose1dForward", {X, Wt, Y})) return;
+    // The op checks Wt / bias shapes; X's extent is the caller's.
+    if (!need("convTranspose1dForward", {X, Wt, Y}) || !needNonNegative("convTranspose1dForward", {N, C_in, L}) ||
+        !needElems("convTranspose1dForward", "X", T(X), elems({N, C_in, L}))) return;
     BROTENSOR_API_TRY
         brotensor::conv_transpose1d_forward(*toTensor(X), *toTensor(Wt),
                                             tensorFromValue(bias_bits), N, C_in, L, C_out, kL,
@@ -141,7 +186,17 @@ void bro_tensor_convTranspose1dBackwardBias(void* dY, int32_t N, int32_t C_out,
 void bro_tensor_causalConv1d(void* X, void* Wt, uint64_t bias_bits, int32_t N, int32_t C_in,
                              int32_t L, int32_t C_out, int32_t kL, int32_t stride,
                              int32_t dilation, int32_t groups, void* scratch, void* Y) {
-    if (!need("causalConv1d", {X, Wt, scratch, Y})) return;
+    // pad1d checks X; the valid conv over the left-padded scratch runs on
+    // conv2d's trusted dims, so the filter and bias are checked here.
+    const char* Lb = "causalConv1d";
+    if (!need(Lb, {X, Wt, scratch, Y}) || !needPositive(Lb, {kL, dilation})) return;
+    int64_t L_out = 0;
+    const int64_t padded = static_cast<int64_t>(L) + static_cast<int64_t>(dilation) * (kL - 1);
+    if (padded > INT32_MAX) { setError("causalConv1d: L + dilation*(kL-1) overflows"); return; }
+    if (!conv1dGeom(Lb, N, C_in, static_cast<int32_t>(padded), C_out, kL, stride, 0, dilation, groups, L_out)) return;
+    if (!needOperands(Lb, T(X), {{"X", T(X), elems({N, C_in, L})},
+                                 {"Wt", T(Wt), conv1dWeightElems(C_in, C_out, kL, groups)},
+                                 {"bias", tensorFromValue(bias_bits), C_out}})) return;
     BROTENSOR_API_TRY
         brotensor::causal_conv1d(*toTensor(X), *toTensor(Wt), tensorFromValue(bias_bits),
                                  N, C_in, L, C_out, kL, stride, dilation, groups,
@@ -192,7 +247,7 @@ void bro_tensor_eluForward(void* x, double alpha, void* y) {
 }
 
 void bro_tensor_eluBackward(void* x, void* dY, double alpha, void* dX) {
-    if (!need("eluBackward", {x, dY, dX})) return;
+    if (!need("eluBackward", {x, dY, dX}) || !needPair("eluBackward", "dY", T(dY), T(x))) return;
     BROTENSOR_API_TRY
         brotensor::elu_backward(*toTensor(x), *toTensor(dY), static_cast<float>(alpha),
                                 *toTensor(dX));
@@ -207,7 +262,7 @@ void bro_tensor_leakyReluForward(void* x, double negativeSlope, void* y) {
 }
 
 void bro_tensor_leakyReluBackward(void* x, void* dY, double negativeSlope, void* dX) {
-    if (!need("leakyReluBackward", {x, dY, dX})) return;
+    if (!need("leakyReluBackward", {x, dY, dX}) || !needPair("leakyReluBackward", "dY", T(dY), T(x))) return;
     BROTENSOR_API_TRY
         brotensor::leaky_relu_backward(*toTensor(x), *toTensor(dY),
                                        static_cast<float>(negativeSlope), *toTensor(dX));
@@ -250,7 +305,8 @@ void bro_tensor_fsqQuantizeBackward(void* dQuantized, void* dX) {
 
 void bro_tensor_resample1dForward(void* X, int32_t N, int32_t C, int32_t L_in,
                                   int32_t L_out, int32_t mode, void* Y) {
-    if (!need("resample1dForward", {X, Y})) return;
+    if (!need("resample1dForward", {X, Y}) || !needNonNegative("resample1dForward", {N, C, L_in, L_out}) ||
+        !needElems("resample1dForward", "X", T(X), elems({N, C, L_in}))) return;
     BROTENSOR_API_TRY
         brotensor::resample1d_forward(*toTensor(X), N, C, L_in, L_out, mode, *toTensor(Y));
     BROTENSOR_API_CATCH("resample1dForward")
@@ -258,7 +314,8 @@ void bro_tensor_resample1dForward(void* X, int32_t N, int32_t C, int32_t L_in,
 
 void bro_tensor_resample1dBackward(void* dY, int32_t N, int32_t C, int32_t L_in,
                                    int32_t L_out, int32_t mode, void* dX) {
-    if (!need("resample1dBackward", {dY, dX})) return;
+    if (!need("resample1dBackward", {dY, dX}) || !needNonNegative("resample1dBackward", {N, C, L_in, L_out}) ||
+        !needElems("resample1dBackward", "dY", T(dY), elems({N, C, L_out}))) return;
     BROTENSOR_API_TRY
         brotensor::resample1d_backward(*toTensor(dY), N, C, L_in, L_out, mode, *toTensor(dX));
     BROTENSOR_API_CATCH("resample1dBackward")
@@ -274,7 +331,7 @@ void bro_tensor_logForward(void* x, void* y) {
 }
 
 void bro_tensor_logBackward(void* x, void* dY, void* dX) {
-    if (!need("logBackward", {x, dY, dX})) return;
+    if (!need("logBackward", {x, dY, dX}) || !needPair("logBackward", "dY", T(dY), T(x))) return;
     BROTENSOR_API_TRY
         brotensor::log_backward(*toTensor(x), *toTensor(dY), *toTensor(dX));
     BROTENSOR_API_CATCH("logBackward")
@@ -288,7 +345,7 @@ void bro_tensor_expForward(void* x, void* y) {
 }
 
 void bro_tensor_expBackward(void* x, void* dY, void* dX) {
-    if (!need("expBackward", {x, dY, dX})) return;
+    if (!need("expBackward", {x, dY, dX}) || !needPair("expBackward", "dY", T(dY), T(x))) return;
     BROTENSOR_API_TRY
         brotensor::exp_backward(*toTensor(x), *toTensor(dY), *toTensor(dX));
     BROTENSOR_API_CATCH("expBackward")

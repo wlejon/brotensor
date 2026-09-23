@@ -146,6 +146,58 @@ int run_api_bounds_tests() {
             throws("selfAttentionForward short mask", () => T.selfAttentionForward(X, W, W, W, W, mk(1, 1), 2, O), "mask"));
     )JS"));
 
+    failures += runJs("bounds: batched rows / gather indices", block(R"JS(
+        const W = mk(3, 4), b = mk(3, 1);
+        const X = mk(2, 4, [1, 2, 3, 4, 5, 6, 7, 8]);
+        const src = mk(2, 2, [1, 2, 3, 4]);
+        // gatherRows still works with an FP32 index list, and copies the rows.
+        const G = mk(1, 1);
+        T.gatherRows(src, mk(2, 1, [1, 0]), G);
+        const g = G.download();
+        if (g[0] !== 3 || g[3] !== 2) return "gatherRows FP32 idx: " + Array.from(g);
+        return firstFail(
+            throws("linearForwardBatched X cols", () => T.linearForwardBatched(W, b, mk(2, 3), mk(1, 1)), "X_BD"),
+            throws("linearForwardBatched short bias", () => T.linearForwardBatched(W, mk(1, 1), X, mk(1, 1)), "bias"),
+            throws("gatherRows idx out of range", () => T.gatherRows(src, mk(1, 1, [2]), G), "Idx[0]"),
+            throws("gatherRows negative idx", () => T.gatherRows(src, mk(1, 1, [-1]), G), "Idx[0]"),
+            throws("scatterRowsAdd idx >= R", () => T.scatterRowsAdd(src, mk(2, 1, [0, 3]), 2, mk(2, 2)), "Idx[1]"),
+            throws("addInplaceBatched pair", () => T.addInplaceBatched(X, mk(1, 1)), "X_BD"));
+    )JS"));
+
+    failures += runJs("bounds: conv / pool / pad dims", block(R"JS(
+        const X = mk(1, 8);   // claims N=1, C=2, 4x4 = 32
+        return firstFail(
+            throws("pad2dForward short X", () => T.pad2dForward(X, 1, 2, 4, 4, 1, 1, 1, 1, 0, mk(1, 1)), "X"),
+            throws("maxPool2dForward short X", () => T.maxPool2dForward(X, 1, 2, 4, 4, 2, 2, 2, 2, 0, 0, mk(1, 1), mk(1, 1)), "X"),
+            throws("adaptiveAvgPool2dForward zero out", () => T.adaptiveAvgPool2dForward(mk(1, 32), 1, 2, 4, 4, 0, 2, mk(1, 1)), ""),
+            throws("convTranspose2dForward short X", () => T.convTranspose2dForward(X, mk(2, 9), null, 1, 2, 4, 4, 1, 3, 3, 1, 1, 0, 0, 0, 0, 1, 1, 1, mk(1, 1)), "X"),
+            throws("l2NormForward head cols", () => T.l2NormForward(mk(2, 6), 4, 2, 1e-6, mk(1, 1)), "numHeads*headDim"));
+    )JS"));
+
+    failures += runJs("bounds: audio conv1d / resample / pairs", block(R"JS(
+        const X = mk(1, 4);   // claims N=1, C_in=2, L=8 = 16
+        return firstFail(
+            throws("conv1d short X", () => T.conv1d(X, mk(1, 6), null, 1, 2, 8, 1, 3, 1, 1, 1, 1, mk(1, 1)), "X"),
+            throws("conv1d short Wt", () => T.conv1d(mk(1, 16), mk(1, 2), null, 1, 2, 8, 1, 3, 1, 1, 1, 1, mk(1, 1)), "Wt"),
+            throws("resample1dForward short X", () => T.resample1dForward(X, 1, 2, 8, 16, 0, mk(1, 1)), "X"),
+            throws("eluBackward pair", () => T.eluBackward(mk(4, 1), mk(2, 1), 1.0, mk(4, 1)), "dY"));
+    )JS"));
+
+    failures += runJs("bounds: varlen cuSeq / M-RoPE positions", block(R"JS(
+        const D = 4;   // numHeads=1, headDim=4
+        const Q = mk(3, D), K = mk(3, D), V = mk(3, D), O = mk(1, 1);
+        const table = mk(4, 2);   // (maxPos=4, d_t=2)
+        const e = mk(1, 1);
+        return firstFail(
+            throws("varlen cuSeq past total", () => T.flashAttentionVarlenForward(Q, K, V, mk(2, 1, [0, 5]), mk(2, 1, [0, 3]), 1, 5, 3, 1, D, false, O), "cuSeqQ"),
+            throws("varlen cuSeq decreasing", () => T.flashAttentionVarlenForward(Q, K, V, mk(3, 1, [0, 2, 1]), mk(3, 1, [0, 1, 3]), 2, 3, 3, 1, D, false, O), "cuSeqQ"),
+            throws("varlen sequence > maxQ", () => T.flashAttentionVarlenForward(Q, K, V, mk(2, 1, [0, 3]), mk(2, 1, [0, 3]), 1, 2, 3, 1, D, false, O), "cuSeqQ"),
+            throws("varlen missing cuSeq", () => T.flashAttentionVarlenForward(Q, K, V, null, null, 1, 3, 3, 1, D, false, O), "cuSeqQ"),
+            throws("mrope pos out of table", () => T.ropeApplyMrope(mk(3, D), table, table, e, e, e, e, mk(3, 1, [0, 1, 4]), null, null, D, 1, 2, 0, 0, mk(1, 1)), "posT[2]"),
+            throws("mrope fractional pos", () => T.ropeApplyMrope(mk(3, D), table, table, e, e, e, e, mk(3, 1, [0, 1.5, 2]), null, null, D, 1, 2, 0, 0, mk(1, 1)), "posT[1]"),
+            throws("mrope missing stream", () => T.ropeApplyMrope(mk(3, D), table, table, e, e, e, e, null, null, null, D, 1, 2, 0, 0, mk(1, 1)), "posT"));
+    )JS"));
+
     failures += runJs("bounds: concat / split", block(R"JS(
         const a = mk(2, 1, [1, 2]);
         const h = mk(2, 1, null, "fp16");

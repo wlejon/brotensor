@@ -15,6 +15,57 @@
 #include <string>
 
 using namespace brotensor::api;
+using brotensor::Tensor;
+using brotensor::Dtype;
+
+// Every body checks its operands against the dims first (api_internal.h
+// "input-size contract"); accumulated gradients are checked like inputs.
+
+namespace {
+
+Tensor* T(void* p) { return toTensor(p); }
+
+// Transposed-conv geometry (torch ConvTranspose2d): positive kernel, stride,
+// dilation and groups dividing both channel counts; the output extent is
+//   (in-1)*s - 2p + d*(k-1) + op + 1.
+bool convTGeom(const char* L, int64_t C_in, int64_t C_out, int64_t H, int64_t W, int64_t kH, int64_t kW,
+               int64_t sH, int64_t sW, int64_t pH, int64_t pW, int64_t opH, int64_t opW, int64_t dH, int64_t dW,
+               int64_t groups, int64_t& H_out, int64_t& W_out) {
+    if (!needPositive(L, {kH, kW, sH, sW, dH, dW, groups})) return false;
+    if (!needNonNegative(L, {C_in, C_out, H, W, pH, pW, opH, opW})) return false;
+    if (C_in % groups != 0 || C_out % groups != 0) {
+        setError(std::string(L) + ": groups must divide C_in and C_out");
+        return false;
+    }
+    H_out = (H - 1) * sH - 2 * pH + dH * (kH - 1) + opH + 1;
+    W_out = (W - 1) * sW - 2 * pW + dW * (kW - 1) + opW + 1;
+    if (H_out < 0) H_out = 0;
+    if (W_out < 0) W_out = 0;
+    return true;
+}
+
+// Idx values address the per-channel H*W input plane on the device: read
+// them back and range-check them (-1 = "all padding" is skipped by the op).
+bool needPoolIndices(const char* L, const Tensor* idx, int64_t n, int64_t plane) {
+    if (idx->dtype != Dtype::INT32) {
+        setError(std::string(L) + ": Idx must be INT32 (the forward's output)");
+        return false;
+    }
+    if (!needElems(L, "Idx", idx, n)) return false;
+    if (n == 0) return true;
+    auto host = idx->to(brotensor::Device::CPU);
+    const auto* v = static_cast<const int32_t*>(host.host_raw());
+    for (int64_t i = 0; i < n; ++i) {
+        if (v[i] < -1 || v[i] >= plane) {
+            setError(std::string(L) + ": Idx[" + std::to_string(i) + "] = " + std::to_string(v[i]) +
+                     " is outside the " + std::to_string(plane) + "-pixel input plane");
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
 
 extern "C" {
 
@@ -22,10 +73,13 @@ extern "C" {
 
 void bro_tensor_interp2dBackward(void* dY, int32_t N, int32_t C, int32_t H_in, int32_t W_in,
                                  int32_t H_out, int32_t W_out, int32_t mode, void* dX) {
-    if (!need("interp2dBackward", {dY, dX})) return;
+    const char* L = "interp2dBackward";
+    if (!need(L, {dY, dX})) return;
+    if (!needNonNegative(L, {N, C, H_in, W_in})) return;
+    if (!needElems(L, "dY", T(dY), elems({N, C, H_out, W_out}))) return;
     BROTENSOR_API_TRY
         brotensor::interp2d_backward(*toTensor(dY), N, C, H_in, W_in, H_out, W_out, mode, *toTensor(dX));
-    BROTENSOR_API_CATCH("interp2dBackward")
+    BROTENSOR_API_CATCH(L)
 }
 
 // ---- pad2d / slice2d -------------------------------------------------------
@@ -33,35 +87,44 @@ void bro_tensor_interp2dBackward(void* dY, int32_t N, int32_t C, int32_t H_in, i
 void bro_tensor_pad2dForward(void* X, int32_t N, int32_t C, int32_t H, int32_t W,
                              int32_t padT, int32_t padB, int32_t padL, int32_t padR,
                              int32_t mode, void* Y) {
-    if (!need("pad2dForward", {X, Y})) return;
+    const char* L = "pad2dForward";
+    if (!need(L, {X, Y}) || !needNonNegative(L, {padT, padB, padL, padR})) return;
+    if (!needElems(L, "X", T(X), elems({N, C, H, W}))) return;
     BROTENSOR_API_TRY
         brotensor::pad2d_forward(*toTensor(X), N, C, H, W, padT, padB, padL, padR, mode, *toTensor(Y));
-    BROTENSOR_API_CATCH("pad2dForward")
+    BROTENSOR_API_CATCH(L)
 }
 
 void bro_tensor_pad2dBackward(void* dY, int32_t N, int32_t C, int32_t H, int32_t W,
                               int32_t padT, int32_t padB, int32_t padL, int32_t padR,
                               int32_t mode, void* dX) {
-    if (!need("pad2dBackward", {dY, dX})) return;
+    const char* L = "pad2dBackward";
+    if (!need(L, {dY, dX}) || !needNonNegative(L, {N, C, H, W, padT, padB, padL, padR})) return;
+    if (!needElems(L, "dY", T(dY), elems({N, C, static_cast<int64_t>(H) + padT + padB,
+                                          static_cast<int64_t>(W) + padL + padR}))) return;
     BROTENSOR_API_TRY
         brotensor::pad2d_backward(*toTensor(dY), N, C, H, W, padT, padB, padL, padR, mode, *toTensor(dX));
-    BROTENSOR_API_CATCH("pad2dBackward")
+    BROTENSOR_API_CATCH(L)
 }
 
 void bro_tensor_slice2dForward(void* X, int32_t N, int32_t C, int32_t H, int32_t W,
                                int32_t h0, int32_t w0, int32_t H_out, int32_t W_out, void* Y) {
-    if (!need("slice2dForward", {X, Y})) return;
+    const char* L = "slice2dForward";
+    if (!need(L, {X, Y})) return;
+    if (!needElems(L, "X", T(X), elems({N, C, H, W}))) return;
     BROTENSOR_API_TRY
         brotensor::slice2d_forward(*toTensor(X), N, C, H, W, h0, w0, H_out, W_out, *toTensor(Y));
-    BROTENSOR_API_CATCH("slice2dForward")
+    BROTENSOR_API_CATCH(L)
 }
 
 void bro_tensor_slice2dBackward(void* dY, int32_t N, int32_t C, int32_t H, int32_t W,
                                 int32_t h0, int32_t w0, int32_t H_out, int32_t W_out, void* dX) {
-    if (!need("slice2dBackward", {dY, dX})) return;
+    const char* L = "slice2dBackward";
+    if (!need(L, {dY, dX})) return;
+    if (!needElems(L, "dY", T(dY), elems({N, C, H_out, W_out}))) return;
     BROTENSOR_API_TRY
         brotensor::slice2d_backward(*toTensor(dY), N, C, H, W, h0, w0, H_out, W_out, *toTensor(dX));
-    BROTENSOR_API_CATCH("slice2dBackward")
+    BROTENSOR_API_CATCH(L)
 }
 
 // ---- max pool / adaptive average pool --------------------------------------
@@ -69,35 +132,46 @@ void bro_tensor_slice2dBackward(void* dY, int32_t N, int32_t C, int32_t H, int32
 void bro_tensor_maxPool2dForward(void* X, int32_t N, int32_t C, int32_t H, int32_t W,
                                  int32_t kH, int32_t kW, int32_t sH, int32_t sW,
                                  int32_t padH, int32_t padW, void* Y, void* Idx) {
-    if (!need("maxPool2dForward", {X, Y, Idx})) return;
+    const char* L = "maxPool2dForward";
+    if (!need(L, {X, Y, Idx})) return;
+    if (!needPositive(L, {kH, kW, sH, sW}) || !needNonNegative(L, {padH, padW})) return;
+    if (!needElems(L, "X", T(X), elems({N, C, H, W}))) return;
     BROTENSOR_API_TRY
         brotensor::max_pool2d_forward(*toTensor(X), N, C, H, W, kH, kW, sH, sW, padH, padW,
                                       *toTensor(Y), *toTensor(Idx));
-    BROTENSOR_API_CATCH("maxPool2dForward")
+    BROTENSOR_API_CATCH(L)
 }
 
 void bro_tensor_maxPool2dBackward(void* dY, void* Idx, int32_t N, int32_t C, int32_t H, int32_t W,
                                   int32_t H_out, int32_t W_out, void* dX) {
-    if (!need("maxPool2dBackward", {dY, Idx, dX})) return;
+    const char* L = "maxPool2dBackward";
+    if (!need(L, {dY, Idx, dX}) || !needNonNegative(L, {N, C, H, W})) return;
+    const int64_t n = elems({N, C, H_out, W_out});
+    if (!needElems(L, "dY", T(dY), n)) return;
     BROTENSOR_API_TRY
+        if (!needPoolIndices(L, T(Idx), n, elems({H, W}))) return;
         brotensor::max_pool2d_backward(*toTensor(dY), *toTensor(Idx), N, C, H, W, H_out, W_out, *toTensor(dX));
-    BROTENSOR_API_CATCH("maxPool2dBackward")
+    BROTENSOR_API_CATCH(L)
 }
 
 void bro_tensor_adaptiveAvgPool2dForward(void* X, int32_t N, int32_t C, int32_t H, int32_t W,
                                          int32_t H_out, int32_t W_out, void* Y) {
-    if (!need("adaptiveAvgPool2dForward", {X, Y})) return;
+    const char* L = "adaptiveAvgPool2dForward";
+    if (!need(L, {X, Y}) || !needPositive(L, {H_out, W_out})) return;
+    if (!needElems(L, "X", T(X), elems({N, C, H, W}))) return;
     BROTENSOR_API_TRY
         brotensor::adaptive_avg_pool2d_forward(*toTensor(X), N, C, H, W, H_out, W_out, *toTensor(Y));
-    BROTENSOR_API_CATCH("adaptiveAvgPool2dForward")
+    BROTENSOR_API_CATCH(L)
 }
 
 void bro_tensor_adaptiveAvgPool2dBackward(void* dY, int32_t N, int32_t C, int32_t H, int32_t W,
                                           int32_t H_out, int32_t W_out, void* dX) {
-    if (!need("adaptiveAvgPool2dBackward", {dY, dX})) return;
+    const char* L = "adaptiveAvgPool2dBackward";
+    if (!need(L, {dY, dX}) || !needPositive(L, {H_out, W_out}) || !needNonNegative(L, {N, C, H, W})) return;
+    if (!needElems(L, "dY", T(dY), elems({N, C, H_out, W_out}))) return;
     BROTENSOR_API_TRY
         brotensor::adaptive_avg_pool2d_backward(*toTensor(dY), N, C, H, W, H_out, W_out, *toTensor(dX));
-    BROTENSOR_API_CATCH("adaptiveAvgPool2dBackward")
+    BROTENSOR_API_CATCH(L)
 }
 
 // ---- transposed conv2d -----------------------------------------------------
@@ -108,7 +182,13 @@ void bro_tensor_convTranspose2dForward(void* X, void* Wt, uint64_t bias_bits,
                                        int32_t sH, int32_t sW, int32_t pH, int32_t pW,
                                        int32_t opH, int32_t opW, int32_t dH, int32_t dW,
                                        int32_t groups, void* Y) {
-    if (!need("convTranspose2dForward", {X, Wt, Y})) return;
+    const char* L = "convTranspose2dForward";
+    if (!need(L, {X, Wt, Y})) return;
+    int64_t H_out = 0, W_out = 0;
+    if (!convTGeom(L, C_in, C_out, H, W, kH, kW, sH, sW, pH, pW, opH, opW, dH, dW, groups, H_out, W_out)) return;
+    if (!needOperands(L, T(X), {{"X", T(X), elems({N, C_in, H, W})},
+                                {"Wt", T(Wt), elems({C_in, C_out / groups, kH, kW})},
+                                {"bias", tensorFromValue(bias_bits), C_out}})) return;
     BROTENSOR_API_TRY
         brotensor::conv_transpose2d_forward(*toTensor(X), *toTensor(Wt), tensorFromValue(bias_bits),
                                             N, C_in, H, W, C_out, kH, kW, sH, sW, pH, pW,
@@ -122,7 +202,13 @@ void bro_tensor_convTranspose2dBackwardInput(void* Wt, void* dY,
                                              int32_t sH, int32_t sW, int32_t pH, int32_t pW,
                                              int32_t opH, int32_t opW, int32_t dH, int32_t dW,
                                              int32_t groups, void* dX) {
-    if (!need("convTranspose2dBackwardInput", {Wt, dY, dX})) return;
+    const char* L = "convTranspose2dBackwardInput";
+    if (!need(L, {Wt, dY, dX})) return;
+    int64_t H_out = 0, W_out = 0;
+    if (!convTGeom(L, C_in, C_out, H, W, kH, kW, sH, sW, pH, pW, opH, opW, dH, dW, groups, H_out, W_out)) return;
+    if (!needNonNegative(L, {N})) return;
+    if (!needOperands(L, T(Wt), {{"Wt", T(Wt), elems({C_in, C_out / groups, kH, kW})},
+                                 {"dY", T(dY), elems({N, C_out, H_out, W_out})}})) return;
     BROTENSOR_API_TRY
         brotensor::conv_transpose2d_backward_input(*toTensor(Wt), *toTensor(dY),
                                                    N, C_in, H, W, C_out, kH, kW, sH, sW, pH, pW,
@@ -136,7 +222,15 @@ void bro_tensor_convTranspose2dBackwardWeight(void* X, void* dY,
                                               int32_t sH, int32_t sW, int32_t pH, int32_t pW,
                                               int32_t opH, int32_t opW, int32_t dH, int32_t dW,
                                               int32_t groups, void* dWt) {
-    if (!need("convTranspose2dBackwardWeight", {X, dY, dWt})) return;
+    const char* L = "convTranspose2dBackwardWeight";
+    if (!need(L, {X, dY, dWt})) return;
+    int64_t H_out = 0, W_out = 0;
+    if (!convTGeom(L, C_in, C_out, H, W, kH, kW, sH, sW, pH, pW, opH, opW, dH, dW, groups, H_out, W_out)) return;
+    if (!needNonNegative(L, {N})) return;
+    // dWt accumulates — "pre-zeroed by caller".
+    if (!needOperands(L, T(X), {{"X", T(X), elems({N, C_in, H, W})},
+                                {"dY", T(dY), elems({N, C_out, H_out, W_out})},
+                                {"dWt", T(dWt), elems({C_in, C_out / groups, kH, kW})}})) return;
     BROTENSOR_API_TRY
         brotensor::conv_transpose2d_backward_weight(*toTensor(X), *toTensor(dY),
                                                     N, C_in, H, W, C_out, kH, kW, sH, sW, pH, pW,
@@ -146,7 +240,9 @@ void bro_tensor_convTranspose2dBackwardWeight(void* X, void* dY,
 
 void bro_tensor_convTranspose2dBackwardBias(void* dY, int32_t N, int32_t C_out,
                                             int32_t H_out, int32_t W_out, void* dB) {
-    if (!need("convTranspose2dBackwardBias", {dY, dB})) return;
+    const char* L = "convTranspose2dBackwardBias";
+    if (!need(L, {dY, dB})) return;
+    if (!needOperands(L, T(dY), {{"dY", T(dY), elems({N, C_out, H_out, W_out})}, {"dB", T(dB), C_out}})) return;
     BROTENSOR_API_TRY
         brotensor::conv_transpose2d_backward_bias(*toTensor(dY), N, C_out, H_out, W_out, *toTensor(dB));
     BROTENSOR_API_CATCH("convTranspose2dBackwardBias")
@@ -161,7 +257,15 @@ void bro_tensor_conv3dForward(void* X, void* Wt, uint64_t bias_bits,
                               int32_t pT, int32_t pH, int32_t pW,
                               int32_t dT, int32_t dH, int32_t dW,
                               int32_t groups, void* Y) {
-    if (!need("conv3dForward", {X, Wt, Y})) return;
+    const char* L = "conv3dForward";
+    if (!need(L, {X, Wt, Y})) return;
+    // conv2d's geometry on (H, W) plus the same rules on T.
+    int64_t H_out = 0, W_out = 0;
+    if (!convGeom2d(L, C_in, C_out, H, W, kH, kW, sH, sW, pH, pW, dH, dW, groups, H_out, W_out)) return;
+    if (!needPositive(L, {kT, sT, dT}) || !needNonNegative(L, {N, T, pT})) return;
+    if (!needOperands(L, toTensor(X), {{"X", toTensor(X), elems({N, C_in, T, H, W})},
+                                       {"Wt", toTensor(Wt), elems({C_out, C_in / groups, kT, kH, kW})},
+                                       {"bias", tensorFromValue(bias_bits), C_out}})) return;
     BROTENSOR_API_TRY
         brotensor::conv3d_forward(*toTensor(X), *toTensor(Wt), tensorFromValue(bias_bits),
                                   N, C_in, T, H, W, C_out, kT, kH, kW,
@@ -173,7 +277,10 @@ void bro_tensor_conv3dForward(void* X, void* Wt, uint64_t bias_bits,
 
 void bro_tensor_windowPartitionForward(void* X, int32_t N, int32_t C, int32_t H, int32_t W,
                                        int32_t window, void* Y) {
-    if (!need("windowPartitionForward", {X, Y})) return;
+    const char* L = "windowPartitionForward";
+    if (!need(L, {X, Y}) || !needPositive(L, {window})) return;
+    if (H % window != 0 || W % window != 0) { setError("windowPartitionForward: H and W must be multiples of window"); return; }
+    if (!needElems(L, "X", T(X), elems({N, C, H, W}))) return;
     BROTENSOR_API_TRY
         brotensor::window_partition_forward(*toTensor(X), N, C, H, W, window, *toTensor(Y));
     BROTENSOR_API_CATCH("windowPartitionForward")
@@ -181,7 +288,11 @@ void bro_tensor_windowPartitionForward(void* X, int32_t N, int32_t C, int32_t H,
 
 void bro_tensor_windowReverseForward(void* X, int32_t N, int32_t C, int32_t H, int32_t W,
                                      int32_t window, void* Y) {
-    if (!need("windowReverseForward", {X, Y})) return;
+    const char* L = "windowReverseForward";
+    if (!need(L, {X, Y}) || !needPositive(L, {window})) return;
+    if (H % window != 0 || W % window != 0) { setError("windowReverseForward: H and W must be multiples of window"); return; }
+    // The windowed batch holds the same N*C*H*W elements, re-tiled.
+    if (!needElems(L, "X", T(X), elems({N, C, H, W}))) return;
     BROTENSOR_API_TRY
         brotensor::window_reverse_forward(*toTensor(X), N, C, H, W, window, *toTensor(Y));
     BROTENSOR_API_CATCH("windowReverseForward")
@@ -191,7 +302,10 @@ void bro_tensor_windowReverseForward(void* X, int32_t N, int32_t C, int32_t H, i
 // c_out = block*C + c_in (Qwen-VL); true = torch pixel_unshuffle ordering.
 void bro_tensor_spatialMerge2x2Forward(void* X, int32_t N, int32_t C, int32_t H, int32_t W,
                                        void* Y, bool channelMajor) {
-    if (!need("spatialMerge2x2Forward", {X, Y})) return;
+    const char* L = "spatialMerge2x2Forward";
+    if (!need(L, {X, Y})) return;
+    if (H % 2 != 0 || W % 2 != 0) { setError("spatialMerge2x2Forward: H and W must be even"); return; }
+    if (!needElems(L, "X", T(X), elems({N, C, H, W}))) return;
     BROTENSOR_API_TRY
         brotensor::spatial_merge_2x2_forward(*toTensor(X), N, C, H, W, channelMajor, *toTensor(Y));
     BROTENSOR_API_CATCH("spatialMerge2x2Forward")
@@ -202,7 +316,10 @@ void bro_tensor_spatialMerge2x2Forward(void* X, int32_t N, int32_t C, int32_t H,
 void bro_tensor_batchNormForward(void* X, void* gamma, void* beta, void* runningMean, void* runningVar,
                                  int32_t N, int32_t C, int32_t H, int32_t W,
                                  double eps, double momentum, void* Y, void* savedMean, void* savedRstd) {
-    if (!need("batchNormForward", {X, gamma, beta, runningMean, runningVar, Y, savedMean, savedRstd})) return;
+    const char* L = "batchNormForward";
+    if (!need(L, {X, gamma, beta, runningMean, runningVar, Y, savedMean, savedRstd})) return;
+    if (!needOperands(L, T(X), {{"X", T(X), elems({N, C, H, W})}, {"gamma", T(gamma), C}, {"beta", T(beta), C},
+                                {"runningMean", T(runningMean), C}, {"runningVar", T(runningVar), C}})) return;
     BROTENSOR_API_TRY
         brotensor::batch_norm_forward(*toTensor(X), *toTensor(gamma), *toTensor(beta),
                                       *toTensor(runningMean), *toTensor(runningVar),
@@ -214,7 +331,13 @@ void bro_tensor_batchNormForward(void* X, void* gamma, void* beta, void* running
 void bro_tensor_batchNormBackward(void* X, void* gamma, void* savedMean, void* savedRstd, void* dY,
                                   int32_t N, int32_t C, int32_t H, int32_t W,
                                   void* dX, void* dGamma, void* dBeta) {
-    if (!need("batchNormBackward", {X, gamma, savedMean, savedRstd, dY, dX, dGamma, dBeta})) return;
+    const char* L = "batchNormBackward";
+    if (!need(L, {X, gamma, savedMean, savedRstd, dY, dX, dGamma, dBeta})) return;
+    const int64_t n = elems({N, C, H, W});
+    // savedMean/savedRstd are the forward's FP32 caches; dGamma/dBeta accumulate.
+    if (!needOperands(L, T(X), {{"X", T(X), n}, {"dY", T(dY), n}, {"gamma", T(gamma), C},
+                                {"dGamma", T(dGamma), C}, {"dBeta", T(dBeta), C}})) return;
+    if (!needMask(L, T(savedMean), C, "savedMean") || !needMask(L, T(savedRstd), C, "savedRstd")) return;
     BROTENSOR_API_TRY
         brotensor::batch_norm_backward(*toTensor(X), *toTensor(gamma), *toTensor(savedMean),
                                        *toTensor(savedRstd), *toTensor(dY), N, C, H, W,
@@ -224,7 +347,10 @@ void bro_tensor_batchNormBackward(void* X, void* gamma, void* savedMean, void* s
 
 void bro_tensor_batchNormInference(void* X, void* gamma, void* beta, void* runningMean, void* runningVar,
                                    int32_t N, int32_t C, int32_t H, int32_t W, double eps, void* Y) {
-    if (!need("batchNormInference", {X, gamma, beta, runningMean, runningVar, Y})) return;
+    const char* L = "batchNormInference";
+    if (!need(L, {X, gamma, beta, runningMean, runningVar, Y})) return;
+    if (!needOperands(L, T(X), {{"X", T(X), elems({N, C, H, W})}, {"gamma", T(gamma), C}, {"beta", T(beta), C},
+                                {"runningMean", T(runningMean), C}, {"runningVar", T(runningVar), C}})) return;
     BROTENSOR_API_TRY
         brotensor::batch_norm_inference(*toTensor(X), *toTensor(gamma), *toTensor(beta),
                                         *toTensor(runningMean), *toTensor(runningVar),
@@ -236,7 +362,9 @@ void bro_tensor_batchNormInference(void* X, void* gamma, void* beta, void* runni
 
 void bro_tensor_imageNormalize(void* X, void* mean, void* std_,
                                int32_t N, int32_t C, int32_t H, int32_t W, void* Y) {
-    if (!need("imageNormalize", {X, mean, std_, Y})) return;
+    const char* L = "imageNormalize";
+    if (!need(L, {X, mean, std_, Y})) return;
+    if (!needOperands(L, T(X), {{"X", T(X), elems({N, C, H, W})}, {"mean", T(mean), C}, {"std", T(std_), C}})) return;
     BROTENSOR_API_TRY
         brotensor::image_normalize(*toTensor(X), *toTensor(mean), *toTensor(std_), N, C, H, W, *toTensor(Y));
     BROTENSOR_API_CATCH("imageNormalize")

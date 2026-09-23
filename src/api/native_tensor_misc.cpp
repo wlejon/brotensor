@@ -12,19 +12,34 @@
 
 using namespace brotensor::api;
 
+namespace {
+
+// X is (L, numHeads*headDim), both positive.
+bool needHeadCols(const char* L, const brotensor::Tensor* x, int32_t headDim, int32_t numHeads) {
+    if (!needPositive(L, {headDim, numHeads})) return false;
+    if (static_cast<int64_t>(x->cols) != static_cast<int64_t>(numHeads) * headDim) {
+        setError(std::string(L) + ": X must have numHeads*headDim columns");
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 extern "C" {
 
 // ---- L2 norm ---------------------------------------------------------------
 
 void bro_tensor_l2NormForward(void* X, int32_t headDim, int32_t numHeads, double eps, void* Y) {
-    if (!need("l2NormForward", {X, Y})) return;
+    if (!need("l2NormForward", {X, Y}) || !needHeadCols("l2NormForward", toTensor(X), headDim, numHeads)) return;
     BROTENSOR_API_TRY
         brotensor::l2_norm_forward(*toTensor(X), headDim, numHeads, static_cast<float>(eps), *toTensor(Y));
     BROTENSOR_API_CATCH("l2NormForward")
 }
 
 void bro_tensor_l2NormBackward(void* X, int32_t headDim, int32_t numHeads, double eps, void* dY, void* dX) {
-    if (!need("l2NormBackward", {X, dY, dX})) return;
+    if (!need("l2NormBackward", {X, dY, dX}) || !needHeadCols("l2NormBackward", toTensor(X), headDim, numHeads)) return;
+    if (!needPair("l2NormBackward", "dY", toTensor(dY), toTensor(X))) return;
     BROTENSOR_API_TRY
         brotensor::l2_norm_backward(*toTensor(X), headDim, numHeads, static_cast<float>(eps),
                                     *toTensor(dY), *toTensor(dX));
@@ -36,7 +51,10 @@ void bro_tensor_l2NormBackward(void* X, int32_t headDim, int32_t numHeads, doubl
 void bro_tensor_bceWithLogitsFusedBatched(void* logits_BL, void* target_BL, uint64_t mask_bits,
                                           double posWeight, void* probs_BL, void* dLogits_BL,
                                           void* lossPerSample) {
-    if (!need("bceWithLogitsFusedBatched", {logits_BL, target_BL, probs_BL, dLogits_BL, lossPerSample})) return;
+    const char* L = "bceWithLogitsFusedBatched";
+    if (!need(L, {logits_BL, target_BL, probs_BL, dLogits_BL, lossPerSample})) return;
+    if (!needPair(L, "target_BL", toTensor(target_BL), toTensor(logits_BL))) return;
+    if (!needMask(L, tensorFromValue(mask_bits), toTensor(logits_BL)->size())) return;
     BROTENSOR_API_TRY
         brotensor::bce_with_logits_fused_batched(*toTensor(logits_BL), *toTensor(target_BL),
                                                  maskPtr(mask_bits), static_cast<float>(posWeight),
@@ -101,6 +119,7 @@ void bro_tensor_mseScalar(double pred, double target, bronze_native_buffer* out)
 void bro_tensor_ddimStep(void* x_t, void* eps_pred, double alphaT, double alphaPrev,
                          double sigmaT, void* x_prev) {
     if (!need("ddimStep", {x_t, eps_pred, x_prev})) return;
+    if (!needPair("ddimStep", "eps_pred", toTensor(eps_pred), toTensor(x_t))) return;
     BROTENSOR_API_TRY
         brotensor::ddim_step(*toTensor(x_t), *toTensor(eps_pred), static_cast<float>(alphaT),
                              static_cast<float>(alphaPrev), static_cast<float>(sigmaT), *toTensor(x_prev));
@@ -109,6 +128,7 @@ void bro_tensor_ddimStep(void* x_t, void* eps_pred, double alphaT, double alphaP
 
 void bro_tensor_eulerStep(void* x_t, void* eps_pred, double sigmaT, double sigmaPrev, void* x_prev) {
     if (!need("eulerStep", {x_t, eps_pred, x_prev})) return;
+    if (!needPair("eulerStep", "eps_pred", toTensor(eps_pred), toTensor(x_t))) return;
     BROTENSOR_API_TRY
         brotensor::euler_step(*toTensor(x_t), *toTensor(eps_pred), static_cast<float>(sigmaT),
                               static_cast<float>(sigmaPrev), *toTensor(x_prev));
@@ -119,6 +139,8 @@ void bro_tensor_dpmpp2mStep(void* x_t, void* eps_pred, void* x0_prev, double sig
                             double c_xt, double c_x0t, double c_x0prev,
                             void* x_prev, void* x0_out) {
     if (!need("dpmpp2mStep", {x_t, eps_pred, x0_prev, x_prev, x0_out})) return;
+    if (!needPair("dpmpp2mStep", "eps_pred", toTensor(eps_pred), toTensor(x_t)) ||
+        !needPair("dpmpp2mStep", "x0_prev", toTensor(x0_prev), toTensor(x_t))) return;
     BROTENSOR_API_TRY
         brotensor::dpmpp_2m_step(*toTensor(x_t), *toTensor(eps_pred), *toTensor(x0_prev),
                                  static_cast<float>(sigmaT), static_cast<float>(c_xt),
@@ -128,7 +150,7 @@ void bro_tensor_dpmpp2mStep(void* x_t, void* eps_pred, void* x0_prev, double sig
 }
 
 void bro_tensor_timestepEmbedding(void* timesteps, int32_t dim, double maxPeriod, void* Y) {
-    if (!need("timestepEmbedding", {timesteps, Y})) return;
+    if (!need("timestepEmbedding", {timesteps, Y}) || !needNonNegative("timestepEmbedding", {dim})) return;
     BROTENSOR_API_TRY
         brotensor::timestep_embedding(*toTensor(timesteps), dim, static_cast<float>(maxPeriod), *toTensor(Y));
     BROTENSOR_API_CATCH("timestepEmbedding")

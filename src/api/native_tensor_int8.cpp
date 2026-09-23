@@ -11,6 +11,7 @@
 #include "native_register.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 using namespace brotensor::api;
@@ -30,6 +31,21 @@ void clearBuffer(bronze_native_buffer* out) {
     out->length = 0;
     out->release = nullptr;
     out->ctx = nullptr;
+}
+
+using brotensor::Tensor;
+
+Tensor* T(void* p) { return toTensor(p); }
+
+// The device ops check weight dtypes and (out,in) shapes themselves; what
+// they take on trust is the activation extent the caller's dims imply, the
+// optional bias lengths and the raw `const float*` masks. Those are checked
+// here.
+
+// An optional per-output bias of `out` elements carried in a kDyn slot.
+bool needBias(const char* L, const char* name, uint64_t bits, int64_t out) {
+    const Tensor* b = tensorFromValue(bits);
+    return !b || needElems(L, name, b, out);
 }
 
 } // namespace
@@ -153,7 +169,8 @@ void bro_tensor_matmulInt8wFp16(void* W_int8, void* scales, void* X, void* Y) {
 
 void bro_tensor_linearForwardBatchedInt8wFp16(void* W_int8, void* scales, uint64_t bias_bits,
                                               void* X_BD, void* Y_BD) {
-    if (!need("linearForwardBatchedInt8wFp16", {W_int8, scales, X_BD, Y_BD})) return;
+    if (!need("linearForwardBatchedInt8wFp16", {W_int8, scales, X_BD, Y_BD}) ||
+        !needBias("linearForwardBatchedInt8wFp16", "bias", bias_bits, T(W_int8)->rows)) return;
     BROTENSOR_API_TRY
         brotensor::linear_forward_batched_int8w_fp16(*toTensor(W_int8), *toTensor(scales),
                                                      tensorFromValue(bias_bits),
@@ -168,7 +185,12 @@ void bro_tensor_conv2dInt8wFp16Forward(void* X, void* W_int8, void* scales, uint
                                        int32_t C_out, int32_t kH, int32_t kW,
                                        int32_t sH, int32_t sW, int32_t pH, int32_t pW,
                                        int32_t dH, int32_t dW, int32_t groups, void* Y) {
-    if (!need("conv2dInt8wFp16Forward", {X, W_int8, scales, Y})) return;
+    const char* L = "conv2dInt8wFp16Forward";
+    if (!need(L, {X, W_int8, scales, Y})) return;
+    int64_t H_out = 0, W_out = 0;
+    if (!convGeom2d(L, C_in, C_out, H, Win, kH, kW, sH, sW, pH, pW, dH, dW, groups, H_out, W_out)) return;
+    if (!needNonNegative(L, {N}) || !needElems(L, "X", T(X), elems({N, C_in, H, Win})) ||
+        !needBias(L, "bias", bias_bits, C_out)) return;
     BROTENSOR_API_TRY
         brotensor::conv2d_int8w_fp16_forward(*toTensor(X), *toTensor(W_int8), *toTensor(scales),
                                              tensorFromValue(bias_bits),
@@ -184,7 +206,12 @@ void bro_tensor_conv3dInt8wFp16Forward(void* X, void* W_int8, void* scales, uint
                                        int32_t pT, int32_t pH, int32_t pW,
                                        int32_t dT, int32_t dH, int32_t dW,
                                        int32_t groups, void* Y) {
-    if (!need("conv3dInt8wFp16Forward", {X, W_int8, scales, Y})) return;
+    const char* L = "conv3dInt8wFp16Forward";
+    if (!need(L, {X, W_int8, scales, Y})) return;
+    int64_t H_out = 0, W_out = 0;
+    if (!convGeom2d(L, C_in, C_out, H, Win, kH, kW, sH, sW, pH, pW, dH, dW, groups, H_out, W_out)) return;
+    if (!needPositive(L, {kT, sT, dT}) || !needNonNegative(L, {N, T, pT})) return;
+    if (!needElems(L, "X", toTensor(X), elems({N, C_in, T, H, Win})) || !needBias(L, "bias", bias_bits, C_out)) return;
     BROTENSOR_API_TRY
         brotensor::conv3d_int8w_fp16_forward(*toTensor(X), *toTensor(W_int8), *toTensor(scales),
                                              tensorFromValue(bias_bits),
@@ -204,7 +231,28 @@ void bro_tensor_resblockForwardInt8wFp16(void* X, void* gamma1, void* beta1,
                                          uint64_t Wskip_bits, uint64_t sskip_bits, uint64_t bskip_bits,
                                          int32_t N, int32_t C_in, int32_t C_out, int32_t H, int32_t Win,
                                          int32_t numGroups, double eps, void* Y) {
-    if (!need("resblockForwardInt8wFp16", {X, gamma1, beta1, W1_int8, s1, gamma2, beta2, W2_int8, s2, Y})) return;
+    const char* L = "resblockForwardInt8wFp16";
+    if (!need(L, {X, gamma1, beta1, W1_int8, s1, gamma2, beta2, W2_int8, s2, Y})) return;
+    if (!needPositive(L, {numGroups}) || !needNonNegative(L, {N, C_in, C_out, H, Win})) return;
+    if (C_in != C_out && !tensorFromValue(Wskip_bits)) {
+        setError(std::string(L) + ": C_in != C_out needs a Wskip projection");
+        return;
+    }
+    // The op checks dtypes, numGroups and W1/W2 shapes; the FP16 operands'
+    // extents and the optional tensors are checked here.
+    if (!needOperands(L, T(X), {{"X", T(X), elems({N, C_in, H, Win})},
+                                {"gamma1", T(gamma1), C_in}, {"beta1", T(beta1), C_in},
+                                {"b1", tensorFromValue(b1_bits), C_out},
+                                {"t_emb_shift", tensorFromValue(t_emb_shift_bits), C_out},
+                                {"gamma2", T(gamma2), C_out}, {"beta2", T(beta2), C_out},
+                                {"b2", tensorFromValue(b2_bits), C_out},
+                                {"bskip", tensorFromValue(bskip_bits), C_out}})) return;
+    if (!needMask(L, T(s1), C_out, "s1") || !needMask(L, T(s2), C_out, "s2")) return;
+    if (const Tensor* ws = tensorFromValue(Wskip_bits)) {
+        const Tensor* ss = tensorFromValue(sskip_bits);
+        if (!ss) { setError(std::string(L) + ": Wskip_int8 needs sskip scales"); return; }
+        if (!needElems(L, "Wskip_int8", ws, elems({C_out, C_in})) || !needMask(L, ss, C_out, "sskip")) return;
+    }
     BROTENSOR_API_TRY
         brotensor::resblock_forward_int8w_fp16(*toTensor(X), *toTensor(gamma1), *toTensor(beta1),
                                                *toTensor(W1_int8), *toTensor(s1),
@@ -224,7 +272,9 @@ void bro_tensor_resblockForwardInt8wFp16(void* X, void* gamma1, void* beta1,
 void bro_tensor_flashAttentionProjectKvInt8wFp16(void* ctx, void* Wk_int8, void* sk, uint64_t bk_bits,
                                                  void* Wv_int8, void* sv, uint64_t bv_bits,
                                                  void* K_out, void* V_out) {
-    if (!need("flashAttentionProjectKvInt8wFp16", {ctx, Wk_int8, sk, Wv_int8, sv, K_out, V_out})) return;
+    const char* L = "flashAttentionProjectKvInt8wFp16";
+    if (!need(L, {ctx, Wk_int8, sk, Wv_int8, sv, K_out, V_out})) return;
+    if (!needBias(L, "bk", bk_bits, T(Wk_int8)->rows) || !needBias(L, "bv", bv_bits, T(Wv_int8)->rows)) return;
     BROTENSOR_API_TRY
         brotensor::flash_attention_project_kv_int8w_fp16(*toTensor(ctx), *toTensor(Wk_int8), *toTensor(sk),
                                                          tensorFromValue(bk_bits),
@@ -239,7 +289,10 @@ void bro_tensor_flashAttentionQWithKvCachedInt8wFp16(void* X, void* K, void* V,
                                                      void* Wo_int8, void* so, uint64_t bo_bits,
                                                      uint64_t mask_bits, int32_t numHeads,
                                                      bool causal, void* O) {
-    if (!need("flashAttentionQWithKvCachedInt8wFp16", {X, K, V, Wq_int8, sq, Wo_int8, so, O})) return;
+    const char* L = "flashAttentionQWithKvCachedInt8wFp16";
+    if (!need(L, {X, K, V, Wq_int8, sq, Wo_int8, so, O})) return;
+    if (!needBias(L, "bq", bq_bits, T(Wq_int8)->rows) || !needBias(L, "bo", bo_bits, T(Wo_int8)->rows) ||
+        !needMask(L, tensorFromValue(mask_bits), T(K)->rows)) return;
     BROTENSOR_API_TRY
         brotensor::flash_attention_q_with_kv_cached_int8w_fp16(*toTensor(X), *toTensor(K), *toTensor(V),
                                                                *toTensor(Wq_int8), *toTensor(sq),
@@ -258,7 +311,12 @@ void bro_tensor_flashAttentionQkvoInt8wFp16(void* X, uint64_t Ctx_bits,
                                             void* Wo_int8, void* so, uint64_t bo_bits,
                                             uint64_t mask_bits, int32_t numHeads,
                                             bool causal, void* O) {
-    if (!need("flashAttentionQkvoInt8wFp16", {X, Wq_int8, sq, Wk_int8, sk, Wv_int8, sv, Wo_int8, so, O})) return;
+    const char* L = "flashAttentionQkvoInt8wFp16";
+    if (!need(L, {X, Wq_int8, sq, Wk_int8, sk, Wv_int8, sv, Wo_int8, so, O})) return;
+    const Tensor* kvSrc = tensorFromValue(Ctx_bits) ? tensorFromValue(Ctx_bits) : T(X);
+    if (!needBias(L, "bq", bq_bits, T(Wq_int8)->rows) || !needBias(L, "bk", bk_bits, T(Wk_int8)->rows) ||
+        !needBias(L, "bv", bv_bits, T(Wv_int8)->rows) || !needBias(L, "bo", bo_bits, T(Wo_int8)->rows) ||
+        !needMask(L, tensorFromValue(mask_bits), kvSrc->rows)) return;
     BROTENSOR_API_TRY
         brotensor::flash_attention_qkvo_int8w_fp16(*toTensor(X), tensorFromValue(Ctx_bits),
                                                    *toTensor(Wq_int8), *toTensor(sq), tensorFromValue(bq_bits),
@@ -278,7 +336,8 @@ void bro_tensor_selfAttentionBiasInt8wFp16(void* X,
                                            void* Wo_int8, void* so,
                                            uint64_t mask_bits, uint64_t attnBias_bits,
                                            int32_t numHeads, double scale, void* O) {
-    if (!need("selfAttentionBiasInt8wFp16", {X, Wq_int8, sq, Wk_int8, sk, Wv_int8, sv, Wo_int8, so, O})) return;
+    if (!need("selfAttentionBiasInt8wFp16", {X, Wq_int8, sq, Wk_int8, sk, Wv_int8, sv, Wo_int8, so, O}) ||
+        !needMask("selfAttentionBiasInt8wFp16", tensorFromValue(mask_bits), T(X)->rows)) return;
     BROTENSOR_API_TRY
         brotensor::self_attention_bias_int8w_fp16(*toTensor(X),
                                                   *toTensor(Wq_int8), *toTensor(sq),
