@@ -102,6 +102,7 @@ endif() # BROTENSOR_API_COMPILED_JS
 
 brotensor_add_test(brotensor_test_cpu_ops test_cpu_ops.cpp)
 brotensor_add_test(brotensor_test_dispatch test_dispatch.cpp)
+brotensor_add_test(brotensor_test_vit_block_ops test_vit_block_ops.cpp)
 brotensor_add_test(brotensor_test_thread_pool test_thread_pool.cpp)
 brotensor_add_test(brotensor_test_safetensors test_safetensors.cpp)
 brotensor_add_test(brotensor_test_gguf test_gguf.cpp)
