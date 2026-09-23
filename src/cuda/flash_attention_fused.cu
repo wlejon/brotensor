@@ -1,7 +1,7 @@
 // Fused flash-attention forward (FlashAttention-2 style).
 //
 // One CTA per (head, BR-row query tile). Q is staged to shared once per CTA
-// (pre-scaled by 1/sqrt(head_dim)); K/V stream through shared in BC-row tiles.
+// as stored; K/V stream through shared in BC-row tiles.
 // Each warp owns 16 query rows end to end:
 //
 //   S_strip(16, BC) = Q_strip @ K_tile^T        WMMA, FP32 accum -> shared
@@ -24,8 +24,12 @@
 // K/V tiles are prefetched a tile ahead through registers, so a tile's global
 // reads are in flight while the previous tile's math runs.
 //
-// Scores carry a factor of log2(e) folded into the Q staging scale so the
-// softmax is exp2 (one ex2.approx) rather than exp (ex2.approx plus a mul).
+// The 1/sqrt(head_dim) scale is applied to the FP32 scores, with log2(e)
+// folded in, so each softmax term is one FFMA (scale, subtract the running
+// max) plus one ex2.approx. Scaling Q before staging it would round the scaled
+// Q back to 16 bits (in BF16, a 2^-9 error per element, carried into every
+// score); nothing ahead of the softmax is ever held at 16-bit precision except
+// the Q/K/V inputs themselves.
 //
 // Both 16-bit storage types share the one templated kernel (sm_80+ has BF16
 // WMMA); accumulation and softmax are FP32 regardless.
@@ -38,10 +42,19 @@
 // the query-tile height BR and key-tile depth BC are also template parameters —
 // the wide heads use a shallower key tile to afford a taller query tile under
 // the per-block shared-memory cap (sm_89 ≈ 99 KB).
-// Add (head_dim, BR, BC) triples in supported()/launch() as callers appear:
+// Add (head_dim, BR, BC) triples in supported()/launch() as callers appear
+// (every other head_dim takes flash_attention.cu's per-head fallback, ~10x
+// slower at these shapes; brotensor_bench_attention_head_dims measures both):
+//   head_dim 16  -> BR 128, BC 64 (SAM mask decoder token<->image, Lk 4096)
+//   head_dim 32  -> BR 128, BC 32 (Sana-class / DC-AE width self-attention)
+//   head_dim 40  -> BR 128, BC 64 (SD1.5 UNet level 1)
 //   head_dim 64  -> BR 128, BC 64 (DINOv3, TripoSplat flow, SD-class self-attn)
 //   head_dim 72  -> BR 64,  BC 64 (PixArt-Sigma DiT self-attention)
+//   head_dim 80  -> BR 64,  BC 64 (SD1.5 UNet level 2; L = 1024 at 512 px
+//                                  wants the 2x CTA count over BR 128)
+//   head_dim 112 -> BR 128, BC 32 (Sana 1.6B cross-attention)
 //   head_dim 128 -> BR 128, BC 32 (Krea 2 / Flux-class DiT self-attention)
+//   head_dim 160 -> BR 64,  BC 32 (SD1.5 UNet level 3; ~1.5x BR 128 here)
 //
 // CAUSAL is a template parameter too, so the non-causal path keeps exactly the
 // codegen it had before causal existed - no runtime branch in the softmax inner
@@ -53,6 +66,7 @@
 #include "detail/cuda_check.h"
 #include "detail/smem_opt_in.cuh"
 
+#include <math_constants.h>
 #include <mma.h>
 
 #include <cmath>
@@ -137,7 +151,7 @@ size_t smem_bytes_host() {
 // The alternative shape, a second shared K/V buffer filled by cp.async, does
 // not fit: head_dim 64 already sits at 92 of the ~99 KB per-block cap, and
 // double-buffering K+V costs another 20 KB. Registers are the free resource
-// here — PER is 2 for three of the four instantiations, 5 for head_dim 72.
+// here — PER is 1 or 2 for most instantiations, 5 for head_dim 72/80/160.
 template <int HD, int BR, int BC>
 struct kv_stage {
     static constexpr int NTHREADS  = (BR / 16) * 32;
@@ -145,8 +159,9 @@ struct kv_stage {
     static constexpr int SEGS_REAL = HD / 8;                    // backed by src
     static constexpr int TOTAL     = BC * SEGS;
     static constexpr int PER       = (TOTAL + NTHREADS - 1) / NTHREADS;
-    // Only the head_dim 40 tiling leaves a partial final step (TOTAL 384 over
-    // 256 threads); everywhere else the guard folds away at compile time.
+    // A tiling whose tile is not a whole number of thread-steps (head_dim 40:
+    // TOTAL 384 over 256 threads; 16, 32 and 112 likewise) keeps the guard;
+    // everywhere else it folds away at compile time.
     static constexpr bool GUARD    = (PER * NTHREADS != TOTAL);
 };
 
@@ -240,15 +255,18 @@ flash_fused_kernel(const T* __restrict__ Q,
     const int half_o = (lane % 2) * 8;        // per-fragment output half
     const int orow  = q0 + wrow0 + trow;      // global query row
 
-    // ── Stage Q (pre-scaled), zero-filling rows past Lq and pad cols [HD,PAD) ──
+    // ── Stage Q as stored (unscaled), zero-filling rows past Lq and pad cols
+    //    [HD, PAD). The score scale is applied to the FP32 scores in the
+    //    softmax, not here: a pre-scaled Q is rounded back to 16 bits, which
+    //    in BF16 puts a 2^-9 relative error on every Q element and so on every
+    //    score — a percent-level error on each probability of a peaked softmax.
     for (int idx = threadIdx.x; idx < BR * PAD; idx += NTHREADS) {
         const int r = idx / PAD;
         const int c = idx % PAD;
         const int l = q0 + r;
-        sm.q[size_t(r) * LDQ + c] = ff_traits<T>::from_f32(
-            (l < Lq && c < HD)
-                ? ff_traits<T>::to_f32(Q[size_t(l) * D + head_off + c]) * scale
-                : 0.0f);
+        sm.q[size_t(r) * LDQ + c] = (l < Lq && c < HD)
+            ? Q[size_t(l) * D + head_off + c]
+            : ff_traits<T>::from_f32(0.0f);
     }
 
     // ── Probe the accumulator fragment's element -> row mapping ──
@@ -341,32 +359,35 @@ flash_fused_kernel(const T* __restrict__ Q,
         //    one row; its lane^1 partner holds the other SCOL) ──
         const float* srow = sm.s + size_t(wrow0 + trow) * LDS + tcol_s;
         float s_val[SCOL];
-        float tile_max = -1e30f;
+        float tile_max = -CUDART_INF_F;
 #pragma unroll
         for (int c = 0; c < SCOL; ++c) {
             const int j = j0 + tcol_s + c;
             // `orow` is this thread's global query row. Masked-out scores go to
-            // -1e30, so their exp() below is written as an exact 0.0f into the
-            // P tile — the P@V contraction then runs over the whole BC tile
-            // unchanged and still adds nothing for them.
+            // -inf, so their exp2() below is an exact 0.0f in the P tile — the
+            // P@V contraction then runs over the whole BC tile unchanged and
+            // still adds nothing for them.
             const bool valid = j < Lk && (!CAUSAL || j <= orow) &&
                                (!mask || mask[j] > 0.5f);
-            s_val[c] = valid ? srow[c] : -1e30f;
+            s_val[c] = valid ? srow[c] : -CUDART_INF_F;
             tile_max = fmaxf(tile_max, s_val[c]);
         }
         tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, 1));
 
-        const float m_new = fmaxf(m_run, tile_max);
-        // exp2, not exp: the scores arrive pre-multiplied by log2(e) (folded
-        // into the Q staging scale), so every softmax exponential here is one
-        // MUFU with no accompanying multiply. __expf() is ex2.approx preceded
-        // by a mul by log2(e), and there are BR*BC of them per key tile.
+        // The running max lives in the scaled domain; scale > 0, so scaling the
+        // raw tile max is the max of the scaled scores (-inf for a tile with no
+        // valid key, which leaves m_run's finite -1e30 floor in place).
+        const float m_new = fmaxf(m_run, tile_max * scale);
+        // exp2, not exp: `scale` carries log2(e) with 1/sqrt(head_dim), so each
+        // softmax exponential is one FFMA (scale the FP32 score, subtract the
+        // max) and one MUFU. __expf() is ex2.approx preceded by a mul by
+        // log2(e), and there are BR*BC of them per key tile.
         const float corr = exp2f(m_run - m_new);   // m_run <= m_new, finite diff
         T* prow = sm.p + size_t(wrow0 + trow) * LDS + tcol_s;
         float tile_sum = 0.0f;
 #pragma unroll
         for (int c = 0; c < SCOL; ++c) {
-            const float p = s_val[c] > -1e29f ? exp2f(s_val[c] - m_new) : 0.0f;
+            const float p = exp2f(fmaf(s_val[c], scale, -m_new));   // -inf -> 0
             prow[c] = ff_traits<T>::from_f32(p);
             tile_sum += p;
         }
@@ -448,8 +469,8 @@ void launch_impl(const T* Q, const T* K, const T* V, const float* mask, T* O,
     // log2(e) is folded into the score scale so the kernel's softmax can be
     // exp2 rather than exp. exp2(x*log2e) == exp(x) exactly in the algebra;
     // the running max is scaled by the same constant, so every comparison and
-    // correction stays consistent. Q is staged pre-scaled, so this costs
-    // nothing at run time.
+    // correction stays consistent. The kernel applies it to the FP32 scores
+    // inside the FFMA that also subtracts the max, so it costs nothing.
     const float scale = 1.4426950408889634f / sqrtf(static_cast<float>(HD));
     dim3 grid((Lq + BR - 1) / BR, num_heads);
     flash_fused_kernel<T, HD, BR, BC, CAUSAL><<<grid, NTHREADS, shmem, stream>>>(
@@ -462,6 +483,21 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
                      int Lq, int Lk, int D, int num_heads, int head_dim,
                      cudaStream_t stream) {
     switch (head_dim) {
+        case 16:
+            launch_impl<T, 16, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 32:
+            launch_impl<T, 32, 128, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 80:
+            launch_impl<T, 80, 64, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 112:
+            launch_impl<T, 112, 128, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 160:
+            launch_impl<T, 160, 64, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
         case 40:
             // PAD = round16(40) = 48, smaller than head_dim 64's PAD (64), so
             // shared-memory pressure is lower here than the 64/BR=128 case —
@@ -495,8 +531,12 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
 }  // namespace
 
 bool supported(int head_dim) {
-    return head_dim == 40 || head_dim == 64 || head_dim == 72 ||
-           head_dim == 128;
+    switch (head_dim) {
+        case 16: case 32: case 40: case 64: case 72: case 80: case 112: case 128: case 160:
+            return true;
+        default:
+            return false;
+    }
 }
 
 void launch(const __half* Q, const __half* K, const __half* V,
