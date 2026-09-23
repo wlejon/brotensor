@@ -110,6 +110,29 @@ void flash_attention_varlen_forward(const Tensor& Q,
                                     Tensor& O);
 
 
+// Packed variable-length bidirectional self-attention straight off a fused QKV
+// projection — the encoder-batching entry point (many independent sequences of
+// any lengths packed back to back, no padding, one launch per layer).
+//   QKV: (L, 3*num_heads*head_dim) — per row [q heads | k heads | v heads], the
+//        layout a fused Wqkv linear produces. FP16/BF16 on the GPU (head_dim 64
+//        takes the tensor-core kernel, other widths a generic one), FP32 on
+//        both CPU and GPU.
+//   seq_bounds: (L, 2) INT32 on the same device — row r's sequence occupies
+//        rows [seq_bounds[r,0], seq_bounds[r,1]) and must contain r. Rows only
+//        ever attend inside their own sequence.
+//   window > 0: row r attends keys j of its sequence with |r - j| <= window/2
+//        (ModernBERT / flash_attention_windowed_forward's bidirectional window);
+//   window <= 0: every key of its sequence.
+//   O: (L, num_heads*head_dim), same dtype as QKV, resized as needed.
+// Row → sequence membership is data, not launch shape: the grid depends only
+// on L, so a CUDA graph captured for one L replays for any packing of it.
+void flash_attention_packed_qkv_forward(const Tensor& QKV,
+                                        const Tensor& seq_bounds,
+                                        int num_heads,
+                                        int window,
+                                        Tensor& O);
+
+
 // Backward of flash_attention_varlen_forward — packed variable-length attention
 // over pre-projected Q/K/V (no projection weights, no biases — projections are
 // handled by the caller's linear layer; bias gradients belong to that layer).

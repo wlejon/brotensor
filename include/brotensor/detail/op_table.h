@@ -262,6 +262,8 @@
     /* ─── FP16 linear (inference-only) + GEGLU family ─── */                                                                                                           \
     X(linear_forward_batched_fp16,             void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
                                                        ::brotensor::Tensor& Y_BD))                                                                                      \
+    X(linear_forward_batched_ex,               void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
+                                                       int act, int epilogue, ::brotensor::Tensor* workspace, ::brotensor::Tensor& Y_BD))                              \
     X(linear_forward_batched_fp16_act,         void,  (const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,                  \
                                                        int act, ::brotensor::Tensor& Y_BD))                                                                             \
     X(geglu_forward,                           void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y))                                                           \
@@ -325,6 +327,8 @@
                                                        int batch_size, int max_seqlen_q, int max_seqlen_k,                                                              \
                                                        int num_heads, int head_dim, bool causal,                                                                        \
                                                        ::brotensor::Tensor& O))                                                                                         \
+    X(flash_attention_packed_qkv_forward,      void,  (const ::brotensor::Tensor& QKV, const ::brotensor::Tensor& seq_bounds,                                           \
+                                                       int num_heads, int window, ::brotensor::Tensor& O))                                                              \
     X(flash_attention_varlen_backward,         void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
                                                        const ::brotensor::Tensor& O, const ::brotensor::Tensor& dO,                                                     \
                                                        const int32_t* cu_seqlens_q, const int32_t* cu_seqlens_k,                                                        \
@@ -445,6 +449,7 @@
     X(sum_cols,                                void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y))                                                           \
     X(argmax_rows,                             void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx))                                                         \
     X(rows_count_above,                        void,  (const ::brotensor::Tensor& X, float t_lo, float t_hi, ::brotensor::Tensor& counts))                              \
+    X(segment_softmax_stats,                   void,  (const ::brotensor::Tensor& logits, const ::brotensor::Tensor& seg_offsets, ::brotensor::Tensor& out))           \
     X(threshold_u8,                            void,  (const ::brotensor::Tensor& X, float t, ::brotensor::Tensor& Y))                                                  \
     /* ─── Diffusion sampler steps + timestep embedding ─── */                                                                                                          \
     X(ddim_step,                               void,  (const ::brotensor::Tensor& x_t, const ::brotensor::Tensor& eps_pred,                                             \
@@ -505,6 +510,8 @@
                                                        const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads, ::brotensor::Tensor& Y))                         \
     X(rope_apply_backward,                     void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& cos_tbl,                                                 \
                                                        const ::brotensor::Tensor& sin_tbl, int head_dim, int num_heads, ::brotensor::Tensor& dX))                        \
+    X(rope_qkv_packed_inplace,                 void,  (::brotensor::Tensor& QKV, const ::brotensor::Tensor& cos_tbl, const ::brotensor::Tensor& sin_tbl,                  \
+                                                       const ::brotensor::Tensor& pos, int num_heads, int head_dim))                                                     \
     X(rope_apply_mrope,                        void,  (const ::brotensor::Tensor& X,                                                                                       \
                                                        const ::brotensor::Tensor& cos_t, const ::brotensor::Tensor& sin_t,                                                 \
                                                        const ::brotensor::Tensor& cos_h, const ::brotensor::Tensor& sin_h,                                                 \

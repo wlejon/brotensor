@@ -789,6 +789,30 @@ void Tensor::copy_to_host_bf16(uint16_t* dst) const {
     }
 }
 
+void Tensor::copy_from_host_raw(const void* src, std::size_t nbytes) {
+    if (nbytes > bytes()) {
+        throw_msg("brotensor: copy_from_host_raw: nbytes exceeds the tensor's size");
+    }
+    if (nbytes == 0) return;
+    if (device.is_cpu()) {
+        std::memcpy(data, src, nbytes);
+    } else {
+        detail::alloc_for(device).memcpy_h2d(data, src, nbytes, device.index);
+    }
+}
+
+void Tensor::copy_to_host_raw(void* dst, std::size_t nbytes) const {
+    if (nbytes > bytes()) {
+        throw_msg("brotensor: copy_to_host_raw: nbytes exceeds the tensor's size");
+    }
+    if (nbytes == 0) return;
+    if (device.is_cpu()) {
+        std::memcpy(dst, data, nbytes);
+    } else {
+        detail::alloc_for(device).memcpy_d2h(dst, data, nbytes, device.index);
+    }
+}
+
 // ─── Allocation accounting ─────────────────────────────────────────────────
 
 AllocStats alloc_stats() {

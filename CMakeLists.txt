@@ -202,6 +202,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/top_k.cpp
     src/cpu/pool2d.cpp
     src/cpu/gather_rows.cpp
+    src/cpu/packed_encoder.cpp
     src/cpu/conv_transpose2d.cpp
     src/cpu/window_partition.cpp
     src/cpu/transpose.cpp
@@ -375,6 +376,10 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/flash_attention.cu
         src/cuda/flash_attention_fused.cu
         src/cuda/flash_attention_backward.cu
+        src/cuda/flash_attention_packed.cu
+        src/cuda/gemm_mma.cu
+        src/cuda/linear_ex.cu
+        src/cuda/packed_encoder.cu
         src/cuda/resblock.cu
         src/cuda/transpose.cu
         src/cuda/matmul.cu

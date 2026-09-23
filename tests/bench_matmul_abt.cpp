@@ -37,19 +37,47 @@ static void bench(Device dev, int M, int N, int K, int iters) {
     Tensor Bg = Tensor::from_host_fp16_on(dev, Bh.data(), N, K);
     Tensor Cg = Tensor::zeros_on(dev, M, N, Dtype::FP16);
 
+    // Back-to-back launches per timed sample, so a short GEMM's time is the
+    // kernel's and not the launch / event floor (~10 us under WDDM).
+    constexpr int kReps = 20;
     auto run = [&] {
-        brotensor::matmul_abt(Ag, Bg, Cg, 1, M, N, K,
-                              (long long)M * K, (long long)N * K, (long long)M * N,
-                              nullptr, 0);
+        for (int r = 0; r < kReps; ++r) {
+            brotensor::matmul_abt(Ag, Bg, Cg, 1, M, N, K,
+                                  (long long)M * K, (long long)N * K, (long long)M * N,
+                                  nullptr, 0);
+        }
     };
     run();                    // warm-up (also builds the PSO)
     brotensor::sync_all();
 
     (void)iters;   // the harness picks its own warm-up length and sample count
-    const double secs = bt_bench::time_min_ms(run) * 1e-3;
+    const double secs = bt_bench::time_min_ms(run) * 1e-3 / kReps;
     const double gflop = 2.0 * M * N * K / 1e9;
-    std::printf("  M=%-5d N=%-5d K=%-5d  %8.3f ms  %8.1f GFLOP/s\n",
+    std::printf("  M=%-5d N=%-5d K=%-5d  %8.3f ms  %8.1f GFLOP/s",
                 M, N, K, secs * 1e3, gflop / secs);
+    if (dev == Device::CUDA) {
+        // Same product through linear_forward_batched_ex with a split-K workspace.
+        Tensor ws;
+        auto run_ex = [&] {
+            for (int r = 0; r < kReps; ++r)
+                brotensor::linear_forward_batched_ex(Bg, nullptr, Ag, 0, brotensor::kLinearEpiStore, &ws, Cg);
+        };
+        run_ex();
+        brotensor::sync_all();
+        const double s2 = bt_bench::time_min_ms(run_ex) * 1e-3 / kReps;
+        std::printf("   | split-K %8.3f ms  %8.1f GFLOP/s", s2 * 1e3, gflop / s2);
+        auto run_fast = [&] {
+            for (int r = 0; r < kReps; ++r)
+                brotensor::linear_forward_batched_ex(Bg, nullptr, Ag, 0,
+                                                     brotensor::kLinearEpiStore | brotensor::kLinearEpiFastAccum,
+                                                     &ws, Cg);
+        };
+        run_fast();
+        brotensor::sync_all();
+        const double s3 = bt_bench::time_min_ms(run_fast) * 1e-3 / kReps;
+        std::printf("   | fast-acc %8.1f GFLOP/s", gflop / s3);
+    }
+    std::printf("\n");
 }
 
 int main() {
@@ -68,5 +96,14 @@ int main() {
     bench(dev, 256,  2048, 2048, 30);   // attention out-proj shape
     bench(dev, 512,  4096, 4096, 20);   // FFN-ish shape
     bench(dev, 1024, 1024, 1024, 30);
+    // Packed encoder batches (ModernBERT-large: D 1024, GeGLU F 2624) at a
+    // short (112-row), medium (960) and large (4608) packed row count:
+    // Wqkv, Wo, Wi, mlp Wo.
+    for (int M : {112, 960, 4608}) {
+        bench(dev, M, 3072, 1024, 30);
+        bench(dev, M, 1024, 1024, 30);
+        bench(dev, M, 5248, 1024, 30);
+        bench(dev, M, 1024, 2624, 30);
+    }
     return 0;
 }

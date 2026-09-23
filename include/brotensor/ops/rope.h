@@ -92,4 +92,18 @@ void rope_apply_mrope(const Tensor& X,
                       int d_t, int d_h, int d_w,
                       Tensor& Y);
 
+
+// In-place RoPE over the Q and K sections of a fused (L, 3*num_heads*head_dim)
+// QKV buffer (the layout flash_attention_packed_qkv_forward reads), with a
+// per-row position id selecting the cos/sin table row — packed sequences each
+// restart their positions at 0. Same interleaved-pair rotation as rope_apply:
+//   x_{2i}   <- x_{2i}*cos_tbl[pos[r],i] - x_{2i+1}*sin_tbl[pos[r],i]
+//   x_{2i+1} <- x_{2i}*sin_tbl[pos[r],i] + x_{2i+1}*cos_tbl[pos[r],i]
+// for every head of the first two sections; the V section is untouched.
+//   QKV: FP32/FP16/BF16 (FP32 math).  cos_tbl, sin_tbl: (P, head_dim/2) FP32.
+//   pos: (L, 1) INT32, every entry in [0, P).
+void rope_qkv_packed_inplace(Tensor& QKV, const Tensor& cos_tbl,
+                             const Tensor& sin_tbl, const Tensor& pos,
+                             int num_heads, int head_dim);
+
 }  // namespace brotensor

@@ -298,6 +298,13 @@ struct Tensor {
     void copy_to_host_fp16(uint16_t* dst) const;           // FP16 only
     void copy_to_host_bf16(uint16_t* dst) const;           // BF16 only
 
+    // Dtype-agnostic raw byte transfers against the tensor's EXISTING storage:
+    // no reallocation, so the device pointer stays put — how a caller feeds
+    // new inputs to (and reads outputs from) a CUDA-graph-captured op
+    // sequence. Copies the first `nbytes` bytes; nbytes must be <= bytes().
+    void copy_from_host_raw(const void* src, std::size_t nbytes);
+    void copy_to_host_raw(void* dst, std::size_t nbytes) const;
+
 private:
     bool owns_ = false;
     // Bytes actually allocated behind `data` when owns_ is true — resize()

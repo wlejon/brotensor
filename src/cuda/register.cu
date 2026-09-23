@@ -68,6 +68,10 @@ void fill_cuda_vtable_bias_act       (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_upfirdn2d      (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_modulated_conv2d(::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_filtered_lrelu (::brotensor::detail::OpsVTable&);
+// ── packed variable-length encoder batching (flash_attention_packed.cu, packed_encoder.cu) ──
+void fill_cuda_vtable_packed_encoder (::brotensor::detail::OpsVTable&);
+// ── fused-epilogue / split-K linear (linear_ex.cu, gemm_mma.cu) ──
+void fill_cuda_vtable_linear_ex (::brotensor::detail::OpsVTable&);
 
 // ── alloc table (defined in tensor.cu) ──
 const ::brotensor::detail::AllocVTable& cuda_alloc_table();
@@ -154,6 +158,8 @@ extern "C" void brotensor_probe_and_register_cuda() {
     dc::fill_cuda_vtable_upfirdn2d(ops);
     dc::fill_cuda_vtable_modulated_conv2d(ops);
     dc::fill_cuda_vtable_filtered_lrelu(ops);
+    dc::fill_cuda_vtable_packed_encoder(ops);
+    dc::fill_cuda_vtable_linear_ex(ops);
 
     ::brotensor::detail::register_backend(DeviceType::CUDA, ops, dc::cuda_alloc_table());
 }

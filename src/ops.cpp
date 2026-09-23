@@ -1189,6 +1189,16 @@ void linear_forward_batched_fp16_act(const Tensor& W, const Tensor* bias,
     v.linear_forward_batched_fp16_act(W, bias, X_BD, act, Y_BD);
 }
 
+void linear_forward_batched_ex(const Tensor& W, const Tensor* bias, const Tensor& X_BD,
+                               int act, int epilogue, Tensor* workspace, Tensor& Y_BD) {
+    const auto& v = detail::dispatch_with_opts(W, X_BD, {bias, &Y_BD, workspace});
+    if (!v.linear_forward_batched_ex)
+        detail::throw_not_implemented("linear_forward_batched_ex", W.device);
+    detail::adopt_output(Y_BD, W.device);
+    if (workspace) detail::adopt_output(*workspace, W.device);
+    v.linear_forward_batched_ex(W, bias, X_BD, act, epilogue, workspace, Y_BD);
+}
+
 void geglu_forward(const Tensor& X, Tensor& Y) {
     const auto& v = detail::dispatch(X, Y);
     if (!v.geglu_forward) detail::throw_not_implemented("geglu_forward", X.device);
@@ -1956,6 +1966,28 @@ void argmax_rows(const Tensor& X, Tensor& Idx) {
     if (!v.argmax_rows) detail::throw_not_implemented("argmax_rows", X.device);
     detail::adopt_output(Idx, X.device);
     v.argmax_rows(X, Idx);
+}
+void segment_softmax_stats(const Tensor& logits, const Tensor& seg_offsets, Tensor& out) {
+    const auto& v = detail::dispatch(logits, seg_offsets, out);
+    if (!v.segment_softmax_stats)
+        detail::throw_not_implemented("segment_softmax_stats", logits.device);
+    detail::adopt_output(out, logits.device);
+    v.segment_softmax_stats(logits, seg_offsets, out);
+}
+void flash_attention_packed_qkv_forward(const Tensor& QKV, const Tensor& seq_bounds,
+                                        int num_heads, int window, Tensor& O) {
+    const auto& v = detail::dispatch(QKV, seq_bounds, O);
+    if (!v.flash_attention_packed_qkv_forward)
+        detail::throw_not_implemented("flash_attention_packed_qkv_forward", QKV.device);
+    detail::adopt_output(O, QKV.device);
+    v.flash_attention_packed_qkv_forward(QKV, seq_bounds, num_heads, window, O);
+}
+void rope_qkv_packed_inplace(Tensor& QKV, const Tensor& cos_tbl, const Tensor& sin_tbl,
+                             const Tensor& pos, int num_heads, int head_dim) {
+    const auto& v = detail::dispatch(QKV, cos_tbl, sin_tbl, pos);
+    if (!v.rope_qkv_packed_inplace)
+        detail::throw_not_implemented("rope_qkv_packed_inplace", QKV.device);
+    v.rope_qkv_packed_inplace(QKV, cos_tbl, sin_tbl, pos, num_heads, head_dim);
 }
 void rows_count_above(const Tensor& X, float t_lo, float t_hi, Tensor& counts) {
     const auto& v = detail::dispatch(X, counts);

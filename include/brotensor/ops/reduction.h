@@ -50,4 +50,17 @@ void argmax_rows(const Tensor& X, Tensor& Idx);
 //   counts: (R, 2) INT32, resized + dtype-set. Not differentiable.
 void rows_count_above(const Tensor& X, float t_lo, float t_hi, Tensor& counts);
 
+
+// Softmax summary statistics of variable-length segments of a logit column —
+// the confidence features a decision head reads off each item's option scores
+// without a host round-trip. Segment s covers logits rows
+// [seg_offsets[s], seg_offsets[s+1]); with p = softmax(segment) (FP32) and
+// k = max(2, segment length):
+//   out[s] = [ top1, top1 - top2, -sum p*log(max(p,1e-9)) / log(k), k / 255 ]
+// top2 is 0 for a one-element segment; an empty segment writes zeros.
+//   logits: (K, 1) FP32/FP16/BF16.  seg_offsets: (S+1, 1) INT32, non-decreasing,
+//   last entry <= K.  out: (S, 4), same dtype as logits, resized as needed.
+void segment_softmax_stats(const Tensor& logits, const Tensor& seg_offsets,
+                           Tensor& out);
+
 }  // namespace brotensor

@@ -76,6 +76,34 @@ void linear_forward_batched_fp16_act(const Tensor& W, const Tensor* bias,
                                      const Tensor& X_BD, int act, Tensor& Y_BD);
 
 
+// How linear_forward_batched_ex writes its result r = act(X·Wᵀ + bias).
+enum LinearEpilogue {
+    kLinearEpiStore      = 0,  // Y  = r                      Y (B, out) resized
+    kLinearEpiAccumulate = 1,  // Y += r (residual add)       Y must already be (B, out)
+    kLinearEpiGeglu      = 2,  // Y[:, j] = r[:, 2j] * gelu_exact(r[:, 2j+1]); act must be 0.
+                               // W's rows interleave the two GeGLU halves pairwise
+                               // (row 2j = gated half, row 2j+1 = gelu input). Y (B, out/2) resized.
+
+    // Flag OR'd into the epilogue: FP16 operands may accumulate each 16-deep
+    // k step in FP16 (the doubled tensor-core rate of consumer GPUs) before
+    // folding it into FP32. Error is that of a 16-term FP16 sum — bounded, not
+    // growing with K — but above pure FP32 accumulation; opt in per model
+    // after checking parity. Ignored for BF16 and on the CPU.
+    kLinearEpiFastAccum  = 16,
+};
+
+// Batched linear with the epilogue fused into the GEMM's output store — no
+// separate residual-add / GeGLU pass over the output. FP16/BF16 on the GPU
+// (FP32 accumulation), FP32 on the CPU.
+//   W: (out, in).  bias: (out, 1) or null.  X_BD: (B, in).  act: LinearActivation.
+//   workspace: optional FP32 scratch. Given one, the GPU may split K across
+//     more CTAs when B is too short to fill the device, reducing the partials
+//     deterministically; the op resizes it as needed. Reusing one workspace
+//     keeps its device pointer stable (CUDA-graph capture); null never splits.
+void linear_forward_batched_ex(const Tensor& W, const Tensor* bias, const Tensor& X_BD,
+                               int act, int epilogue, Tensor* workspace, Tensor& Y_BD);
+
+
 // Row-major matrix multiply, no bias: C(M,N) = A(M,K) @ B(K,N).
 // Dispatched on A.dtype; B and C share it (C resized + dtype-set to match A).
 // FP32 accumulation for both the FP32 and FP16 paths.

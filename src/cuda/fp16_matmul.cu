@@ -25,10 +25,24 @@
 #include <type_traits>
 
 #include "detail/activations.cuh"
+#include "gemm_mma.cuh"
+
+#include <cstdlib>
 
 namespace brotensor {
 void* cuda_current_stream();      // shim defined in runtime.cu
 namespace fp16_internal {
+
+// Single (non-batched) products go to the mma.sync multistage kernel
+// (gemm_mma.cu) whenever it can take them; BROTENSOR_MMA_GEMM=0 forces the
+// WMMA kernel below (A/B comparisons).
+static bool mma_gemm_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("BROTENSOR_MMA_GEMM");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 
 using namespace nvcuda;
 
@@ -388,6 +402,12 @@ static void launch_abt(const T* A, const T* B, T* C,
                        const T* bias, int act) {
     if (batch == 0 || M == 0 || N == 0) return;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+    if (batch == 1 && size_t(M) * size_t(N) >= 256 && mma_gemm_enabled() &&
+        ::brotensor::detail::cuda::mma_gemm::launch(A, B, C, M, N, K, bias, act,
+                                                   ::brotensor::detail::cuda::mma_gemm::kStore, nullptr, 0,
+                                                   stream)) {
+        return;
+    }
     if (K == 0) {
         for (int b = 0; b < batch; ++b) {
             cudaMemsetAsync(C + size_t(b) * strideC, 0,

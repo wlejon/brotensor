@@ -209,6 +209,20 @@ void sum_cols(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
 void argmax_rows(const ::brotensor::Tensor& X, ::brotensor::Tensor& Idx);
 void rows_count_above(const ::brotensor::Tensor& X, float t_lo, float t_hi,
                       ::brotensor::Tensor& counts);
+// ── packed_encoder.cpp ──
+void flash_attention_packed_qkv_forward(const ::brotensor::Tensor& QKV,
+                                        const ::brotensor::Tensor& seq_bounds,
+                                        int num_heads, int window,
+                                        ::brotensor::Tensor& O);
+void rope_qkv_packed_inplace(::brotensor::Tensor& QKV, const ::brotensor::Tensor& cos_tbl,
+                             const ::brotensor::Tensor& sin_tbl, const ::brotensor::Tensor& pos,
+                             int num_heads, int head_dim);
+void segment_softmax_stats(const ::brotensor::Tensor& logits,
+                           const ::brotensor::Tensor& seg_offsets,
+                           ::brotensor::Tensor& out);
+void linear_forward_batched_ex(const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias,
+                               const ::brotensor::Tensor& X, int act, int epilogue,
+                               ::brotensor::Tensor* workspace, ::brotensor::Tensor& Y);
 void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
                                          const ::brotensor::Tensor& gamma,
                                          const ::brotensor::Tensor* beta,
@@ -1313,6 +1327,11 @@ struct CpuStaticRegistrar {
                                          = &detail::cpu::flash_attention_varlen_forward;
         ops.flash_attention_varlen_backward
                                          = &detail::cpu::flash_attention_varlen_backward;
+        ops.flash_attention_packed_qkv_forward
+                                         = &detail::cpu::flash_attention_packed_qkv_forward;
+        ops.rope_qkv_packed_inplace      = &detail::cpu::rope_qkv_packed_inplace;
+        ops.segment_softmax_stats        = &detail::cpu::segment_softmax_stats;
+        ops.linear_forward_batched_ex    = &detail::cpu::linear_forward_batched_ex;
         ops.flash_attention_qkvo_forward = &detail::cpu::flash_attention_qkvo_forward;
         ops.flash_attention_qkvo_backward
                                          = &detail::cpu::flash_attention_qkvo_backward;
