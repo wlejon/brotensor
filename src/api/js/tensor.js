@@ -1,8 +1,6 @@
 // tensor.js — the public shape of bro.tensor, bro.tensor.GpuTensor, assembled over the
 // natives under __bro_native.tensor (native_tensor_decl.h states each C entry point,
-// api.cpp registers them). Hand-written, like the rest of src/api/: it began as
-// brosurface's output for idl/tensor.idl and has been edited since; the IDL is now
-// the source of the docs and the .d.ts only.
+// api.cpp registers them). Hand-written, like the rest of src/api/.
 //
 // Every native is spelled by its full dotted path at the point of use: that is the
 // spelling the compiler lowers to a direct call. The roots this module reads as bare
