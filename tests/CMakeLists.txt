@@ -259,6 +259,7 @@ if(BROTENSOR_HAS_GPU)
         brotensor_add_executable(brotensor_bench_conv_annotators bench_conv_annotators.cpp)
         brotensor_add_executable(brotensor_bench_conv_unet bench_conv_unet.cpp)
         brotensor_add_executable(brotensor_bench_flow_attention bench_flow_attention.cpp)
+        brotensor_add_executable(brotensor_bench_attention_head_dims bench_attention_head_dims.cpp)
         # Bandwidth baseline for the elementwise/norm family, the quantized
         # linear paths, and the causal-vs-fused attention gap. These three
         # cover the ops with no prior perf instrumentation.

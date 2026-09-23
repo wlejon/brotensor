@@ -66,8 +66,10 @@ void fill_residual(Tensor& t, SplitMix64& rng, float massive) {
 // Compare an op output against the FP64 reference. The tolerance is
 // rtol * max|ref| per row plus a small absolute floor: FP32 rounding of a
 // length-n reduction is ~n * 6e-8 relative to its magnitude, far below rtol.
+// `show_err` appends the worst error as a fraction of its row's max |ref|.
 void expect_close(const char* what, const std::string& dev, const Tensor& got_any,
-                  const std::vector<double>& ref, int rows, int cols, double rtol) {
+                  const std::vector<double>& ref, int rows, int cols, double rtol,
+                  bool show_err = false) {
     Tensor got = to_host(got_any);
     if (got.rows * got.cols != rows * cols) {
         std::printf("  FAIL %-34s %-5s shape %dx%d, want %dx%d\n", what, dev.c_str(),
@@ -76,7 +78,7 @@ void expect_close(const char* what, const std::string& dev, const Tensor& got_an
         return;
     }
     const float* g = got.host_f32();
-    double worst = 0.0;
+    double worst = 0.0, worst_rel = 0.0;
     int worst_i = -1;
     for (int r = 0; r < rows; ++r) {
         double scale = 0.0;
@@ -85,15 +87,18 @@ void expect_close(const char* what, const std::string& dev, const Tensor& got_an
         for (int c = 0; c < cols; ++c) {
             const int i = r * cols + c;
             const double e = std::fabs(static_cast<double>(g[i]) - ref[i]);
+            if (scale > 0.0) worst_rel = std::max(worst_rel, e / scale);
             if (!(e <= tol) && (worst_i < 0 || e / tol > worst)) { worst = e / tol; worst_i = i; }
         }
     }
+    char err[48] = "";
+    if (show_err) std::snprintf(err, sizeof err, "  max err %.2e", worst_rel);
     if (worst_i >= 0) {
-        std::printf("  FAIL %-34s %-5s at %d: got %.7g want %.7g (%.1fx tol)\n", what,
-                    dev.c_str(), worst_i, g[worst_i], ref[worst_i], worst);
+        std::printf("  FAIL %-34s %-5s at %d: got %.7g want %.7g (%.1fx tol)%s\n", what,
+                    dev.c_str(), worst_i, g[worst_i], ref[worst_i], worst, err);
         ++g_failures;
     } else {
-        std::printf("  ok   %-34s %s\n", what, dev.c_str());
+        std::printf("  ok   %-34s %s%s\n", what, dev.c_str(), err);
     }
 }
 
@@ -155,7 +160,9 @@ std::vector<double> ref_rope(const Tensor& X, const Tensor& c, const Tensor& s, 
     return y;
 }
 
-std::vector<double> ref_attention(const Tensor& Q, const Tensor& K, const Tensor& V, int nh, int hd) {
+// `mask` (length Lk, optional): keys with mask[j] <= 0.5 drop out.
+std::vector<double> ref_attention(const Tensor& Q, const Tensor& K, const Tensor& V, int nh, int hd,
+                                  const std::vector<float>* mask = nullptr) {
     const int Lq = Q.rows, Lk = K.rows, W = nh * hd;
     std::vector<double> o(static_cast<size_t>(Lq) * W), p(Lk);
     const double sc = 1.0 / std::sqrt(static_cast<double>(hd));
@@ -167,10 +174,13 @@ std::vector<double> ref_attention(const Tensor& Q, const Tensor& K, const Tensor
                 for (int d = 0; d < hd; ++d)
                     a += static_cast<double>(Q.host_f32()[i * W + h * hd + d]) * K.host_f32()[j * W + h * hd + d];
                 p[j] = a * sc;
-                mx = std::max(mx, p[j]);
+                if (!mask || (*mask)[j] > 0.5f) mx = std::max(mx, p[j]);
             }
             double z = 0;
-            for (int j = 0; j < Lk; ++j) { p[j] = std::exp(p[j] - mx); z += p[j]; }
+            for (int j = 0; j < Lk; ++j) {
+                p[j] = (!mask || (*mask)[j] > 0.5f) ? std::exp(p[j] - mx) : 0.0;
+                z += p[j];
+            }
             for (int d = 0; d < hd; ++d) {
                 double a = 0;
                 for (int j = 0; j < Lk; ++j) a += p[j] * V.host_f32()[j * W + h * hd + d];
@@ -472,6 +482,76 @@ void run_fp16_attention(Device dev, const std::string& dn, uint64_t seed) {
     }
 }
 
+// flash_attention_forward called directly in FP16 and BF16, at head dims the
+// fused FlashAttention-2 kernel is instantiated for and at ones it is not (hd
+// 20 and 512 here, which take the per-head fallback). SAM's mask decoder
+// attends at hd 16 / 32 over Lk 4096, SD1.5's UNet at hd 40 / 80 / 160, the SD
+// VAE mid-block at a single hd 512 head; hd 20 is not a multiple of 8. q and k span
+// [-4, 4], so the scaled logits reach ~+-20 and the softmax is peaked: that is
+// where a score rounded to 16 bits before the softmax shows, as an error on
+// every probability. The reference is FP64 over the 16-bit-ROUNDED inputs, so
+// the tolerance covers only the 16-bit output and P@V operand rounding.
+void run_direct_flash_attention(Device dev, const std::string& dn, uint64_t seed) {
+    SplitMix64 rng(seed);
+    struct Case { const char* name; int Lq, Lk, heads, hd; bool masked; };
+    const Case cases[] = {
+        {"hd16 tok->img",     64, 4096, 8,  16, false},
+        {"hd16 img->tok",   4096,    7, 8,  16, false},
+        {"hd32 self",       1024, 1024, 8,  32, false},
+        {"hd32 tok->img",     64, 4096, 8,  32, false},
+        {"hd32 masked",      512, 1000, 4,  32, true},
+        {"hd20 self",        512,  512, 3,  20, false},
+        {"hd24 masked",      512, 1001, 4,  24, true},
+        {"hd80 self",       1024, 1024, 2,  80, false},
+        {"hd160 self",       256,  256, 2, 160, false},
+        {"hd512 self (vae)", 1024, 1024, 1, 512, false},
+        {"hd40 self",       1024, 1024, 2,  40, false},   // fused-kernel head_dims
+        {"hd64 self",       1024, 1024, 2,  64, false},
+        {"hd128 tok->img",    64, 4096, 2, 128, false},
+    };
+    for (const Dtype dt : {Dtype::FP16, Dtype::BF16}) {
+        const bool bf = dt == Dtype::BF16;
+        auto rnd = [&](const Tensor& t) {
+            return bf ? bt_parity::bf16_host_to_f32(bt_parity::to_bf16_host(t)) : round16(t);
+        };
+        auto dev16 = [&](const Tensor& t) {
+            return (bf ? bt_parity::to_bf16_host(t) : bt_parity::to_fp16_host(t)).to(dev);
+        };
+        auto back = [&](const Tensor& t) {
+            Tensor h = to_host(t);
+            return bf ? bt_parity::bf16_host_to_f32(h) : bt_parity::fp16_host_to_f32(h);
+        };
+        // Output rounding alone is up to 2^-12 (FP16) / 2^-9 (BF16) of the row
+        // max, and P's rounding for the P@V GEMM adds about as much again: the
+        // worst case measured is 7.3e-4 / 6.0e-3. A score held in 16 bits
+        // ahead of the softmax lands at 4-7e-3 / 3-5e-2.
+        const double rtol = bf ? 1.2e-2 : 1.5e-3;
+        for (const Case& c : cases) {
+            const int D = c.heads * c.hd;
+            Tensor q = host(c.Lq, D), k = host(c.Lk, D), v = host(c.Lk, D);
+            fill(q, rng, 4.0f);
+            fill(k, rng, 4.0f);
+            fill(v, rng, 3.0f);
+            q = rnd(q); k = rnd(k); v = rnd(v);
+            std::vector<float> mask;
+            Tensor maskd;
+            if (c.masked) {
+                mask.resize(c.Lk);
+                for (int j = 0; j < c.Lk; ++j) mask[j] = (j % 7 == 3 || j > 900) ? 0.0f : 1.0f;
+                maskd = Tensor::from_host_on(dev, mask.data(), c.Lk, 1);
+            }
+            Tensor o;
+            brotensor::flash_attention_forward(dev16(q), dev16(k), dev16(v),
+                                               c.masked ? static_cast<const float*>(maskd.data) : nullptr,
+                                               c.heads, /*causal=*/false, o);
+            const std::string tag = std::string(bf ? "bf16" : "fp16") + " flash_attention " + c.name;
+            expect_close(tag.c_str(), dn, back(o),
+                         ref_attention(q, k, v, c.heads, c.hd, c.masked ? &mask : nullptr),
+                         c.Lq, D, rtol, /*show_err=*/true);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -490,7 +570,10 @@ int main() {
     for (const auto& [dev, name] : devs) run_mask_upscale(dev, name, 99);
     // FP16 storage is GPU-only (the CPU backend is FP32 by design).
     for (const auto& [dev, name] : devs)
-        if (dev != Device::CPU) run_fp16_attention(dev, name, 7);
+        if (dev != Device::CPU) {
+            run_fp16_attention(dev, name, 7);
+            run_direct_flash_attention(dev, name, 11);
+        }
 
     if (g_failures) {
         std::printf("test_vit_block_ops: %d failure(s)\n", g_failures);
