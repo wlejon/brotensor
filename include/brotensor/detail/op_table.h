@@ -329,6 +329,9 @@
                                                        ::brotensor::Tensor& O))                                                                                         \
     X(flash_attention_packed_qkv_forward,      void,  (const ::brotensor::Tensor& QKV, const ::brotensor::Tensor& seq_bounds,                                           \
                                                        int num_heads, int window, ::brotensor::Tensor& O))                                                              \
+    X(flash_attention_packed_qkv_backward,     void,  (const ::brotensor::Tensor& QKV, const ::brotensor::Tensor& dO,                                                   \
+                                                       const ::brotensor::Tensor& seq_bounds, int num_heads, int window,                                                \
+                                                       ::brotensor::Tensor& dQKV))                                                                                      \
     X(flash_attention_varlen_backward,         void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K, const ::brotensor::Tensor& V,                        \
                                                        const ::brotensor::Tensor& O, const ::brotensor::Tensor& dO,                                                     \
                                                        const int32_t* cu_seqlens_q, const int32_t* cu_seqlens_k,                                                        \

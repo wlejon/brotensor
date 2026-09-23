@@ -133,6 +133,28 @@ void flash_attention_packed_qkv_forward(const Tensor& QKV,
                                         Tensor& O);
 
 
+// Backward of flash_attention_packed_qkv_forward — the same packing, bounds
+// and window, so a packed encoder can be trained (or differentiated to its
+// inputs) through the exact attention it runs. Recompute-based: consumes no
+// forward caches; re-derives each row's softmax statistics, then accumulates
+// dQ per query row and dK / dV per key row (no atomics, deterministic).
+//   QKV: the forward's input (L, 3*num_heads*head_dim), post-RoPE.
+//   dO:  (L, num_heads*head_dim) upstream gradient of the forward's O, same
+//        dtype as QKV.
+//   seq_bounds, num_heads, window: exactly as passed to the forward.
+//   dQKV: (L, 3*num_heads*head_dim) OVERWRITTEN (resized + dtype-set to
+//        QKV's) — per row [dQ heads | dK heads | dV heads].
+// FP16/BF16/FP32 on the GPU (FP32 math), FP32 on the CPU. Cost is
+// O(L * span * head_dim) with span the keys a row attends (window + 1, or its
+// sequence length).
+void flash_attention_packed_qkv_backward(const Tensor& QKV,
+                                         const Tensor& dO,
+                                         const Tensor& seq_bounds,
+                                         int num_heads,
+                                         int window,
+                                         Tensor& dQKV);
+
+
 // Backward of flash_attention_varlen_forward — packed variable-length attention
 // over pre-projected Q/K/V (no projection weights, no biases — projections are
 // handled by the caller's linear layer; bias gradients belong to that layer).

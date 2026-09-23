@@ -214,6 +214,9 @@ void flash_attention_packed_qkv_forward(const ::brotensor::Tensor& QKV,
                                         const ::brotensor::Tensor& seq_bounds,
                                         int num_heads, int window,
                                         ::brotensor::Tensor& O);
+void flash_attention_packed_qkv_backward(const ::brotensor::Tensor& QKV, const ::brotensor::Tensor& dO,
+                                         const ::brotensor::Tensor& seq_bounds, int num_heads, int window,
+                                         ::brotensor::Tensor& dQKV);
 void rope_qkv_packed_inplace(::brotensor::Tensor& QKV, const ::brotensor::Tensor& cos_tbl,
                              const ::brotensor::Tensor& sin_tbl, const ::brotensor::Tensor& pos,
                              int num_heads, int head_dim);
@@ -1329,6 +1332,8 @@ struct CpuStaticRegistrar {
                                          = &detail::cpu::flash_attention_varlen_backward;
         ops.flash_attention_packed_qkv_forward
                                          = &detail::cpu::flash_attention_packed_qkv_forward;
+        ops.flash_attention_packed_qkv_backward
+                                         = &detail::cpu::flash_attention_packed_qkv_backward;
         ops.rope_qkv_packed_inplace      = &detail::cpu::rope_qkv_packed_inplace;
         ops.segment_softmax_stats        = &detail::cpu::segment_softmax_stats;
         ops.linear_forward_batched_ex    = &detail::cpu::linear_forward_batched_ex;

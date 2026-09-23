@@ -1982,6 +1982,14 @@ void flash_attention_packed_qkv_forward(const Tensor& QKV, const Tensor& seq_bou
     detail::adopt_output(O, QKV.device);
     v.flash_attention_packed_qkv_forward(QKV, seq_bounds, num_heads, window, O);
 }
+void flash_attention_packed_qkv_backward(const Tensor& QKV, const Tensor& dO, const Tensor& seq_bounds,
+                                         int num_heads, int window, Tensor& dQKV) {
+    const auto& v = detail::dispatch(QKV, dO, seq_bounds, dQKV);
+    if (!v.flash_attention_packed_qkv_backward)
+        detail::throw_not_implemented("flash_attention_packed_qkv_backward", QKV.device);
+    detail::adopt_output(dQKV, QKV.device);
+    v.flash_attention_packed_qkv_backward(QKV, dO, seq_bounds, num_heads, window, dQKV);
+}
 void rope_qkv_packed_inplace(Tensor& QKV, const Tensor& cos_tbl, const Tensor& sin_tbl,
                              const Tensor& pos, int num_heads, int head_dim) {
     const auto& v = detail::dispatch(QKV, cos_tbl, sin_tbl, pos);

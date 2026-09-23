@@ -88,6 +88,84 @@ void flash_attention_packed_qkv_forward(const ::brotensor::Tensor& QKV,
     }
 }
 
+void flash_attention_packed_qkv_backward(const ::brotensor::Tensor& QKV, const ::brotensor::Tensor& dO,
+                                         const ::brotensor::Tensor& seq_bounds, int num_heads, int window,
+                                         ::brotensor::Tensor& dQKV) {
+    constexpr const char* op = "flash_attention_packed_qkv_backward";
+    need_fp32(QKV, op, "QKV");
+    need_fp32(dO, op, "dO");
+    if (seq_bounds.dtype != Dtype::INT32) fail(op, "seq_bounds must be INT32");
+    if (num_heads <= 0 || QKV.cols % (3 * num_heads) != 0) {
+        fail(op, "QKV.cols must be 3 * num_heads * head_dim");
+    }
+    const int L = QKV.rows;
+    const int D = QKV.cols / 3;
+    const int hd = D / num_heads;
+    if (seq_bounds.rows != L || seq_bounds.cols != 2) fail(op, "seq_bounds must be (L, 2)");
+    if (dO.rows != L || dO.cols != D) fail(op, "dO must be (L, num_heads*head_dim)");
+    if (dQKV.rows != L || dQKV.cols != 3 * D || dQKV.dtype != Dtype::FP32) dQKV.resize(L, 3 * D, Dtype::FP32);
+    dQKV.zero();
+    if (L == 0) return;
+
+    const float* qkv = QKV.host_f32();
+    const float* go = dO.host_f32();
+    const int32_t* b = static_cast<const int32_t*>(seq_bounds.host_raw());
+    float* g = dQKV.host_f32_mut();
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    const int hw = window > 0 ? window / 2 : -1;
+    std::vector<float> p;
+    std::vector<float> o(static_cast<std::size_t>(hd));
+    for (int r = 0; r < L; ++r) {
+        const int start = b[2 * r], end = b[2 * r + 1];
+        if (start < 0 || end > L || r < start || r >= end) fail(op, "row outside its seq_bounds");
+        const int lo = hw >= 0 ? std::max(start, r - hw) : start;
+        const int hi = hw >= 0 ? std::min(end, r + hw + 1) : end;
+        p.assign(static_cast<std::size_t>(hi - lo), 0.0f);
+        for (int h = 0; h < num_heads; ++h) {
+            const float* q = qkv + static_cast<std::size_t>(r) * 3 * D + h * hd;
+            const float* dout = go + static_cast<std::size_t>(r) * D + h * hd;
+            float mx = -INFINITY;
+            for (int j = lo; j < hi; ++j) {
+                const float* k = qkv + static_cast<std::size_t>(j) * 3 * D + D + h * hd;
+                float dot = 0.0f;
+                for (int d = 0; d < hd; ++d) dot += q[d] * k[d];
+                p[static_cast<std::size_t>(j - lo)] = dot * scale;
+                mx = std::max(mx, dot * scale);
+            }
+            float sum = 0.0f;
+            for (float& v : p) {
+                v = std::exp(v - mx);
+                sum += v;
+            }
+            std::fill(o.begin(), o.end(), 0.0f);
+            for (int j = lo; j < hi; ++j) {
+                float& pj = p[static_cast<std::size_t>(j - lo)];
+                pj /= sum;
+                const float* v = qkv + static_cast<std::size_t>(j) * 3 * D + 2 * D + h * hd;
+                for (int d = 0; d < hd; ++d) o[static_cast<std::size_t>(d)] += pj * v[d];
+            }
+            float drow = 0.0f;  // D_r = dO_r . O_r = sum_j P_rj dP_rj
+            for (int d = 0; d < hd; ++d) drow += dout[d] * o[static_cast<std::size_t>(d)];
+            float* dq = g + static_cast<std::size_t>(r) * 3 * D + h * hd;
+            for (int j = lo; j < hi; ++j) {
+                const float pj = p[static_cast<std::size_t>(j - lo)];
+                const float* k = qkv + static_cast<std::size_t>(j) * 3 * D + D + h * hd;
+                const float* v = qkv + static_cast<std::size_t>(j) * 3 * D + 2 * D + h * hd;
+                float* dk = g + static_cast<std::size_t>(j) * 3 * D + D + h * hd;
+                float* dv = g + static_cast<std::size_t>(j) * 3 * D + 2 * D + h * hd;
+                float dp = 0.0f;
+                for (int d = 0; d < hd; ++d) dp += dout[d] * v[d];
+                const float ds = pj * (dp - drow) * scale;
+                for (int d = 0; d < hd; ++d) {
+                    dv[d] += pj * dout[d];
+                    dq[d] += ds * k[d];
+                    dk[d] += ds * q[d];
+                }
+            }
+        }
+    }
+}
+
 void rope_qkv_packed_inplace(::brotensor::Tensor& QKV, const ::brotensor::Tensor& cos_tbl,
                              const ::brotensor::Tensor& sin_tbl, const ::brotensor::Tensor& pos,
                              int num_heads, int head_dim) {

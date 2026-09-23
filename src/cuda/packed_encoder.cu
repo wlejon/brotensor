@@ -24,6 +24,10 @@ void flash_attention_packed_qkv_forward(const ::brotensor::Tensor& QKV,
                                         const ::brotensor::Tensor& seq_bounds,
                                         int num_heads, int window,
                                         ::brotensor::Tensor& O);
+// flash_attention_packed_backward.cu
+void flash_attention_packed_qkv_backward(const ::brotensor::Tensor& QKV, const ::brotensor::Tensor& dO,
+                                         const ::brotensor::Tensor& seq_bounds, int num_heads, int window,
+                                         ::brotensor::Tensor& dQKV);
 
 namespace {
 
@@ -189,6 +193,7 @@ void segment_softmax_stats(const ::brotensor::Tensor& logits, const ::brotensor:
 
 void fill_cuda_vtable_packed_encoder(::brotensor::detail::OpsVTable& v) {
     v.flash_attention_packed_qkv_forward = &flash_attention_packed_qkv_forward;
+    v.flash_attention_packed_qkv_backward = &flash_attention_packed_qkv_backward;
     v.rope_qkv_packed_inplace = &rope_qkv_packed_inplace;
     v.segment_softmax_stats = &segment_softmax_stats;
 }

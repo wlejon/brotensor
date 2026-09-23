@@ -377,6 +377,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/flash_attention_fused.cu
         src/cuda/flash_attention_backward.cu
         src/cuda/flash_attention_packed.cu
+        src/cuda/flash_attention_packed_backward.cu
         src/cuda/gemm_mma.cu
         src/cuda/linear_ex.cu
         src/cuda/packed_encoder.cu

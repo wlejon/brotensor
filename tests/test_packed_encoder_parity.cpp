@@ -117,6 +117,79 @@ BT_PARITY_TEST(gpu_bf16_hd64_window) { gpu_parity(kLens, 2, 64, 128, Dtype::BF16
 BT_PARITY_TEST(gpu_fp16_generic_hd16) { gpu_parity(kLens, 4, 16, 16, Dtype::FP16, 0x66); }
 BT_PARITY_TEST(gpu_fp32_generic) { gpu_parity({9, 40, 3}, 2, 64, 0, Dtype::FP32, 0x67); }
 
+// Backward: CPU against central finite differences of the CPU forward under
+// the loss sum(O * G), then GPU against CPU.
+double packed_loss(const Tensor& qkv, const Tensor& b, const Tensor& G, int H, int window) {
+    Tensor O;
+    brotensor::flash_attention_packed_qkv_forward(qkv, b, H, window, O);
+    double s = 0;
+    for (int i = 0; i < O.size(); ++i) s += static_cast<double>(O.ptr()[i]) * G.ptr()[i];
+    return s;
+}
+
+void cpu_backward_fd(const std::vector<int>& lens, int H, int hd, int window, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const Tensor b = bounds_for(lens);
+    const int L = b.rows, D = H * hd;
+    Tensor qkv = Tensor::mat(L, 3 * D), G = Tensor::mat(L, D);
+    fill_random(qkv, rng, 1.0f);
+    fill_random(G, rng, 1.0f);
+    Tensor dqkv;
+    brotensor::flash_attention_packed_qkv_backward(qkv, G, b, H, window, dqkv);
+    BT_CHECK(dqkv.rows == L && dqkv.cols == 3 * D);
+    const float eps = 1e-2f;
+    float worst = 0.0f;
+    for (int i = 0; i < qkv.size(); i += 7) {
+        const float x = qkv.ptr()[i];
+        qkv.ptr()[i] = x + eps;
+        const double lp = packed_loss(qkv, b, G, H, window);
+        qkv.ptr()[i] = x - eps;
+        const double lm = packed_loss(qkv, b, G, H, window);
+        qkv.ptr()[i] = x;
+        const float fd = static_cast<float>((lp - lm) / (2.0 * eps));
+        worst = std::max(worst, std::fabs(fd - dqkv.ptr()[i]) / (1.0f + std::fabs(fd)));
+    }
+    BT_CHECK(worst < 2e-3f);
+}
+
+void gpu_backward_parity(const std::vector<int>& lens, int H, int hd, int window, Dtype dt, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const Tensor b = bounds_for(lens);
+    const int L = b.rows, D = H * hd;
+    Tensor qkv = Tensor::mat(L, 3 * D), G = Tensor::mat(L, D);
+    auto round = [&](Tensor& t, float scale) {
+        for (int i = 0; i < t.size(); ++i) {
+            const float x = rng.next_unit() * scale;
+            t.ptr()[i] = dt == Dtype::FP16 ? q16(x) : dt == Dtype::BF16 ? qbf(x) : x;
+        }
+    };
+    round(qkv, 2.0f);
+    round(G, 1.0f);
+    Tensor ref;
+    brotensor::flash_attention_packed_qkv_backward(qkv, G, b, H, window, ref);
+    auto up = [&](const Tensor& t) {
+        return dt == Dtype::FP16 ? to_fp16_gpu(t) : dt == Dtype::BF16 ? to_bf16_gpu(t) : t.to(gpu_device());
+    };
+    Tensor gd;
+    brotensor::flash_attention_packed_qkv_backward(up(qkv), up(G), b.to(gpu_device()), H, window, gd);
+    Tensor back = download_to_host(gd);
+    if (dt == Dtype::FP16) back = fp16_host_to_f32(back);
+    if (dt == Dtype::BF16) back = bf16_host_to_f32(back);
+    const float tol = dt == Dtype::FP16 ? 2e-2f : dt == Dtype::BF16 ? 6e-2f : 1e-4f;
+    compare_tensors(ref, back, "packed_attn_bwd_gpu", tol, tol);
+}
+
+BT_PARITY_TEST(backward_cpu_finite_difference) {
+    cpu_backward_fd({1, 9, 23, 4}, 2, 8, 0, 0x81);
+    cpu_backward_fd({30, 2, 17}, 2, 8, 6, 0x82);
+}
+BT_PARITY_TEST(backward_gpu_fp32) { gpu_backward_parity({9, 40, 3, 1}, 2, 64, 0, Dtype::FP32, 0x83); }
+BT_PARITY_TEST(backward_gpu_fp32_window) { gpu_backward_parity(kLens, 2, 16, 16, Dtype::FP32, 0x84); }
+BT_PARITY_TEST(backward_gpu_fp16_hd64_window) { gpu_backward_parity(kLens, 4, 64, 128, Dtype::FP16, 0x85); }
+BT_PARITY_TEST(backward_gpu_fp16_hd64_full) { gpu_backward_parity(kLens, 4, 64, 0, Dtype::FP16, 0x86); }
+BT_PARITY_TEST(backward_gpu_bf16_hd128) { gpu_backward_parity({70, 5, 33}, 2, 128, 0, Dtype::BF16, 0x87); }
+BT_PARITY_TEST(backward_gpu_fp16_hd40) { gpu_backward_parity({70, 5, 33}, 3, 40, 8, Dtype::FP16, 0x88); }
+
 BT_PARITY_TEST(rope_packed) {
     SplitMix64 rng(0x71);
     const int H = 3, hd = 8, half = hd / 2, D = H * hd;
