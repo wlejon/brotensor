@@ -2302,7 +2302,16 @@ void flash_attention_varlen_forward(const Tensor& Q,
     // cu = [0, total]), and that path runs the WMMA tensor-core GEMMs —
     // ~16x the throughput of the scalar online-softmax kernel below at
     // transformer-encoder shapes (e.g. DINOv3 ViT-H, TripoSplat flow DiT).
-    if (batch_size == 1 && !causal && (dt == Dtype::FP16 || dt == Dtype::BF16)) {
+    //
+    // Only for the head_dims the fused FlashAttention-2 kernel covers: it keeps
+    // the scores in FP32. flash_attention_forward's per-head fallback (every
+    // other head_dim) stores the UNSCALED Q@K^T in a 16-bit buffer before the
+    // 1/sqrt(hd) scale and the max subtraction, so each exp() inherits the
+    // score's FP16 rounding — ~1-2% per probability at SAM's mask-decoder
+    // shapes (head_dim 16/32, Lk 4096), which moved its mask logits by 0.7.
+    // The scalar kernel below keeps scores in FP32.
+    if (batch_size == 1 && !causal && (dt == Dtype::FP16 || dt == Dtype::BF16) &&
+        flash_fused::supported(head_dim)) {
         flash_attention_forward(Q, K, V, /*d_mask=*/nullptr, num_heads,
                                 /*causal=*/false, O);
         return;
