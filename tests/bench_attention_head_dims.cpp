@@ -9,6 +9,10 @@
 //   hd 512         SD VAE mid-block (one head over the whole latent)
 //   hd 20          not a multiple of 8
 //
+// The qkvo rows time flash_attention_qkvo_forward / _backward (the four
+// projections around the core) at SD1.5 and DiT shapes, with and without
+// projection biases; `qkvo` as the argument runs only those.
+//
 // Useful for before/after comparison of the fused FlashAttention-2 kernel's
 // head_dim coverage against the per-head fallback. Each row also runs a
 // finite spot check so a fast-but-wrong kernel can't pass silently; accuracy
@@ -138,36 +142,90 @@ void bench_packed_bwd(const char* tag, int nseq, int len, int nh, int hd, Dtype 
                 finite_spot(dQKV) ? "ok" : "NOT FINITE");
 }
 
+// The operands of one flash_attention_qkvo_* call. `biased` gives all four
+// projections a bias (DiT-style); otherwise every bias is null.
+struct QkvoOperands {
+    Tensor X, C, Wq, Wk, Wv, Wo, bq, bk, bv, bo, dO;
+    bool cross = false, biased = false;
+    QkvoOperands(int Lq, int D, int Lk, int Dctx, bool cross_, bool biased_, Dtype dt, std::mt19937& rng)
+        : cross(cross_), biased(biased_) {
+        X = upload_rand(Lq, D, dt, rng, 1.0f);
+        C = cross ? upload_rand(Lk, Dctx, dt, rng, 1.0f) : X;
+        const float ws = 1.0f / std::sqrt(float(cross ? Dctx : D));
+        Wq = upload_rand(D, D, dt, rng, 2.0f / std::sqrt(float(D)));
+        Wk = upload_rand(D, cross ? Dctx : D, dt, rng, 2.0f * ws);
+        Wv = upload_rand(D, cross ? Dctx : D, dt, rng, ws);
+        Wo = upload_rand(D, D, dt, rng, 1.0f / std::sqrt(float(D)));
+        if (biased) {
+            bq = upload_rand(D, 1, dt, rng, 0.2f);
+            bk = upload_rand(D, 1, dt, rng, 0.2f);
+            bv = upload_rand(D, 1, dt, rng, 0.2f);
+            bo = upload_rand(D, 1, dt, rng, 0.2f);
+        }
+        dO = upload_rand(Lq, D, dt, rng, 1.0f);
+    }
+    const Tensor* ctx() const { return cross ? &C : nullptr; }
+    const Tensor* b(const Tensor& t) const { return biased ? &t : nullptr; }
+};
+
+// flash_attention_qkvo_forward: four projections around the attention core.
+void bench_qkvo_fwd(const char* tag, int Lq, int D, int nh, int Lk, int Dctx, bool cross, bool biased, Dtype dt) {
+    std::mt19937 rng(47);
+    const QkvoOperands op(Lq, D, Lk, Dctx, cross, biased, dt, rng);
+    Tensor O;
+    const float ms = bt_bench::time_min_ms([&] {
+        brotensor::flash_attention_qkvo_forward(op.X, op.ctx(), op.Wq, op.b(op.bq), op.Wk, op.b(op.bk), op.Wv,
+                                                op.b(op.bv), op.Wo, op.b(op.bo), nullptr, nh, false, O);
+    });
+    std::printf("qkvo fwd %-13s %-4s Lq=%5d Lk=%5d D=%4d nh=%2d hd=%3d%s %9.3f ms  %s\n", tag,
+                dt == Dtype::BF16 ? "bf16" : "fp16", Lq, cross ? Lk : Lq, D, nh, D / nh, biased ? " bias" : "     ",
+                ms, finite_spot(O) ? "ok" : "NOT FINITE");
+}
+
 // flash_attention_qkvo_backward: projections + attention core + projection grads.
-void bench_qkvo_bwd(const char* tag, int Lq, int D, int nh, int Lk, int Dctx, bool cross, Dtype dt) {
+void bench_qkvo_bwd(const char* tag, int Lq, int D, int nh, int Lk, int Dctx, bool cross, Dtype dt,
+                    bool biased = false) {
     std::mt19937 rng(45);
-    Tensor X = upload_rand(Lq, D, dt, rng, 1.0f);
-    Tensor C = cross ? upload_rand(Lk, Dctx, dt, rng, 1.0f) : X;
-    const float ws = 1.0f / std::sqrt(float(cross ? Dctx : D));
-    Tensor Wq = upload_rand(D, D, dt, rng, 2.0f / std::sqrt(float(D)));
-    Tensor Wk = upload_rand(D, cross ? Dctx : D, dt, rng, 2.0f * ws);
-    Tensor Wv = upload_rand(D, cross ? Dctx : D, dt, rng, ws);
-    Tensor Wo = upload_rand(D, D, dt, rng, 1.0f / std::sqrt(float(D)));
-    Tensor dO = upload_rand(Lq, D, dt, rng, 1.0f);
+    const QkvoOperands op(Lq, D, Lk, Dctx, cross, biased, dt, rng);
     const int Dk = cross ? Dctx : D;
     Tensor dX, dCtx;
     Tensor dWq = Tensor::zeros_on(Device::CUDA, D, D, dt), dWk = Tensor::zeros_on(Device::CUDA, D, Dk, dt);
     Tensor dWv = Tensor::zeros_on(Device::CUDA, D, Dk, dt), dWo = Tensor::zeros_on(Device::CUDA, D, D, dt);
+    Tensor dbq = Tensor::zeros_on(Device::CUDA, D, 1, dt), dbk = Tensor::zeros_on(Device::CUDA, D, 1, dt);
+    Tensor dbv = Tensor::zeros_on(Device::CUDA, D, 1, dt), dbo = Tensor::zeros_on(Device::CUDA, D, 1, dt);
+    auto db = [&](Tensor& t) { return biased ? &t : nullptr; };
     const float ms = bt_bench::time_min_ms([&] {
-        brotensor::flash_attention_qkvo_backward(X, cross ? &C : nullptr, Wq, nullptr, Wk, nullptr, Wv, nullptr,
-                                                 Wo, nullptr, nullptr, nh, false, dO, dX,
-                                                 cross ? &dCtx : nullptr, dWq, nullptr, dWk, nullptr, dWv,
-                                                 nullptr, dWo, nullptr);
+        brotensor::flash_attention_qkvo_backward(op.X, op.ctx(), op.Wq, op.b(op.bq), op.Wk, op.b(op.bk), op.Wv,
+                                                 op.b(op.bv), op.Wo, op.b(op.bo), nullptr, nh, false, op.dO, dX,
+                                                 cross ? &dCtx : nullptr, dWq, db(dbq), dWk, db(dbk), dWv,
+                                                 db(dbv), dWo, db(dbo));
     });
-    std::printf("qkvo bwd %-13s %-4s Lq=%5d Lk=%5d D=%4d nh=%2d hd=%3d  %9.3f ms  %s\n", tag,
-                dt == Dtype::BF16 ? "bf16" : "fp16", Lq, cross ? Lk : Lq, D, nh, D / nh, ms,
-                finite_spot(dX) ? "ok" : "NOT FINITE");
+    std::printf("qkvo bwd %-13s %-4s Lq=%5d Lk=%5d D=%4d nh=%2d hd=%3d%s %9.3f ms  %s\n", tag,
+                dt == Dtype::BF16 ? "bf16" : "fp16", Lq, cross ? Lk : Lq, D, nh, D / nh, biased ? " bias" : "     ",
+                ms, finite_spot(dX) ? "ok" : "NOT FINITE");
+}
+
+// The qkvo rows: SD1.5 levels (projection biases only on the output, as in
+// the UNet; modelled here with and without) and a DiT block (all biased).
+void bench_qkvo(bool fwd, Dtype dt) {
+    struct Row { const char* tag; int Lq, D, nh, Lk, Dctx; bool cross; };
+    const Row rows[] = {
+        {"sd15 L1 self",  4096, 320, 8, 4096, 320, false},
+        {"sd15 L2 cross", 1024, 640, 8,   77, 768, true},
+        {"dit hd64 self", 1024, 1024, 16, 1024, 1024, false},
+    };
+    for (const bool biased : {false, true})
+        for (const Row& r : rows) {
+            if (fwd) bench_qkvo_fwd(r.tag, r.Lq, r.D, r.nh, r.Lk, r.Dctx, r.cross, biased, dt);
+            else bench_qkvo_bwd(r.tag, r.Lq, r.D, r.nh, r.Lk, r.Dctx, r.cross, dt, biased);
+        }
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Optional argument: `fwd` or `bwd` runs only that half.
+    // Optional argument: `fwd` or `bwd` runs only that half; `qkvo` runs only
+    // the flash_attention_qkvo_forward / _backward rows.
     const std::string only = argc > 1 ? argv[1] : "";
     brotensor::init();
     if (!brotensor::is_available(Device::CUDA)) {
@@ -177,6 +235,11 @@ int main(int argc, char** argv) {
     bt_bench::spin_up();
     std::printf("brotensor_bench_attention_head_dims  (warmup %.0f ms/op, best of %d)\n",
                 bt_bench::kWarmupMs, bt_bench::kSamples);
+    if (only == "qkvo") {
+        for (const Dtype dt : {Dtype::FP16, Dtype::BF16}) bench_qkvo(/*fwd=*/true, dt);
+        for (const Dtype dt : {Dtype::FP16, Dtype::BF16}) bench_qkvo(/*fwd=*/false, dt);
+        return 0;
+    }
     for (const Dtype dt : {Dtype::FP16, Dtype::BF16}) {
         if (only == "fwd") break;
         bench_bwd("sam tok->img",     7, 4096,  8,  16, dt);
@@ -196,9 +259,7 @@ int main(int argc, char** argv) {
         bench_packed_bwd("bert",      8,  512, 12, 64, dt, 0);
         bench_packed_bwd("short",    64,   48,  8, 32, dt, 0);
         bench_packed_bwd("l3",        1,  256,  8, 160, dt, 0);
-        bench_qkvo_bwd("sd15 L1 self",  4096, 320, 8, 4096, 320, false, dt);
-        bench_qkvo_bwd("sd15 L2 cross", 1024, 640, 8,   77, 768, true,  dt);
-        bench_qkvo_bwd("dit hd64 self", 1024, 1024, 16, 1024, 1024, false, dt);
+        bench_qkvo(/*fwd=*/false, dt);
     }
     for (const Dtype dt : {Dtype::FP16, Dtype::BF16}) {
         if (only == "bwd") break;
@@ -220,6 +281,7 @@ int main(int argc, char** argv) {
         bench("hd64 self",     4096, 4096, 16,  64, dt);
         bench("hd72 self",     4096, 4096, 16,  72, dt);
         bench("hd128 self",    4115, 4115, 24, 128, dt);
+        bench_qkvo(/*fwd=*/true, dt);
     }
     return 0;
 }
