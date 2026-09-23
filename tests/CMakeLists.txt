@@ -208,6 +208,10 @@ if(BROTENSOR_HAS_GPU)
     brotensor_add_test(brotensor_test_int8_attention test_int8_attention.cpp)
     if(BROTENSOR_WITH_CUDA)
         brotensor_add_test(brotensor_test_streams test_streams.cpp)
+        # 16-bit linears round once (bias + activation in FP32), on the
+        # default GEMM and again with the WMMA kernel forced.
+        brotensor_add_test(brotensor_test_linear_rounding test_linear_rounding.cpp)
+        add_test(NAME brotensor_test_linear_rounding_wmma COMMAND brotensor_test_linear_rounding wmma)
         # Hand-run microbench for the plain FP16 matmul WMMA path (not a ctest).
         brotensor_add_executable(brotensor_bench_matmul_rm bench_matmul_rm.cpp)
     endif()
