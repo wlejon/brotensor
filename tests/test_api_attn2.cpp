@@ -105,20 +105,8 @@ int run_api_attn2_tests() {
         const tensor = globalThis.bro.tensor;
         const same = (a, b, tol) => Math.abs(a - b) < (tol || 1e-3);
         const finite = (t, label) => { const d = t.download(); for (let i = 0; i < d.length; i++) if (!isFinite(d[i])) throw new Error(label + " not finite"); return d; };
-        // A GpuTensor whose raw storage is a little-endian INT32 buffer.
-        const i32 = (arr) => {
-            const b = new Int8Array(arr.length * 4);
-            for (let i = 0; i < arr.length; i++) {
-                const v = arr[i] | 0;
-                b[4 * i] = v & 0xff;
-                b[4 * i + 1] = (v >> 8) & 0xff;
-                b[4 * i + 2] = (v >> 16) & 0xff;
-                b[4 * i + 3] = (v >> 24) & 0xff;
-            }
-            const t = tensor.createTensor(arr.length * 4, 1, "int8");
-            t.uploadInt8(b);
-            return t;
-        };
+        // An INT32 GpuTensor.
+        const i32 = (arr) => { const t = tensor.createTensor(arr.length, 1); t.uploadInt32(arr); return t; };
 
         // Two packed sequences: rows [0,2) and [2,3). 1 head, head_dim 2.
         const nH = 1, hd = 2, D = nH * hd, batch = 2;
@@ -251,19 +239,7 @@ int run_api_attn2_tests() {
         const tensor = globalThis.bro.tensor;
         const same = (a, b, tol) => Math.abs(a - b) < (tol || 1e-3);
         const finite = (t, label) => { const d = t.download(); for (let i = 0; i < d.length; i++) if (!isFinite(d[i])) throw new Error(label + " not finite"); return d; };
-        const i32 = (arr) => {
-            const b = new Int8Array(arr.length * 4);
-            for (let i = 0; i < arr.length; i++) {
-                const v = arr[i] | 0;
-                b[4 * i] = v & 0xff;
-                b[4 * i + 1] = (v >> 8) & 0xff;
-                b[4 * i + 2] = (v >> 16) & 0xff;
-                b[4 * i + 3] = (v >> 24) & 0xff;
-            }
-            const t = tensor.createTensor(arr.length * 4, 1, "int8");
-            t.uploadInt8(b);
-            return t;
-        };
+        const i32 = (arr) => { const t = tensor.createTensor(arr.length, 1); t.uploadInt32(arr); return t; };
         const mk = (r, c, vals) => { const t = tensor.createTensor(r, c); if (vals) t.upload(vals); return t; };
 
         // Degenerate single-axis M-RoPE (d_h = d_w = 0, posT = 0..L-1) is

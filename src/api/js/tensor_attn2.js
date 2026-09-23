@@ -8,11 +8,11 @@
 //
 // Signatures are the QuickJS binding's (tensor_bindings_attention.cpp), same
 // argument order and the same optional slots: `bq|null` and friends take a
-// GpuTensor or null, and the INT32 streams (cuSeqQ / cuSeqK, posT / posH /
-// posW) keep that binding's convention — a GpuTensor whose raw storage is
-// read as an INT32 buffer (device storage on CUDA/Metal, host storage on CPU),
-// or null. Every wrapper validates here, because the natives receive the
-// nullable slots as raw values, and reads back the native's error afterwards.
+// GpuTensor or null, and the index streams (cuSeqQ / cuSeqK, posT / posH /
+// posW) are an INT32 or whole-number FP32 GpuTensor, or null. The wrappers
+// check argument types here, because the natives receive the nullable slots
+// as raw values; the natives read the streams back and range-check them, and
+// each wrapper rethrows the native's error afterwards.
 (function () {
     'use strict';
 

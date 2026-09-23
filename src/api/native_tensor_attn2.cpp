@@ -1,24 +1,81 @@
 // Native bodies for the second attention family (see
 // native_tensor_attn2_decl.h): decomposed 2D rel-pos self-attention (global +
 // windowed), packed variable-length flash attention, the gated delta rule and
-// M-RoPE. js/tensor_attn2.js has already checked every argument, so a body
-// only has to unwrap, call and record any thrown contract violation.
+// M-RoPE. js/tensor_attn2.js checks argument types; a body checks the index
+// streams' values (see IdxStream), calls, and records any thrown violation.
 
 #include "native_tensor_attn2_decl.h"
 #include "api_internal.h"
 #include "native_register.h"
+#include "native_tensor_extra_util.h"
+
+#include <string>
+#include <vector>
 
 using namespace brotensor::api;
+using brotensor::Tensor;
 
 namespace {
 
-// The `const int32_t*` convention of the varlen / M-RoPE ops: the raw storage
-// of an optional GpuTensor viewed as INT32 (a device pointer on CUDA/Metal, a
-// host pointer on CPU), or nullptr. Mirrors maskPtr() for FP32 masks and
-// embeddingLookupForward's idx handling.
-inline const int32_t* idxPtr(uint64_t bits) {
-    auto* t = tensorFromValue(bits);
-    return t ? static_cast<const int32_t*>(t->data) : nullptr;
+Tensor* T(void* p) { return toTensor(p); }
+
+// The varlen / M-RoPE ops take `const int32_t*` streams (device pointers on
+// CUDA/Metal, host on CPU) whose VALUES address rows of the other operands,
+// and the kernels trust them. A stream is an optional GpuTensor holding INT32
+// (uploadInt32) or whole-number FP32 (upload); the native reads it back,
+// checks every value, and hands the op INT32 storage — the tensor's own, or
+// an INT32 copy held in `scratch` (reading FP32 storage as INT32 would turn
+// 1.0f into 1065353216).
+struct IdxStream {
+    std::vector<int32_t> vals;
+    Tensor scratch;
+    const int32_t* ptr = nullptr;
+};
+
+// Reads `n` values of the stream in `bits` into `s`; a null stream leaves
+// s.ptr null (the op decides whether that is allowed).
+bool readStream(const char* L, const char* name, uint64_t bits, int64_t n, IdxStream& s) {
+    const Tensor* t = tensorFromValue(bits);
+    if (!t) return true;
+    if (!extra::hostInt32(L, name, t, n, s.vals)) return false;
+    s.ptr = static_cast<const int32_t*>(extra::int32Operand(*t, s.vals, s.scratch).data);
+    return true;
+}
+
+// cu_seqlens: batch+1 non-decreasing prefix sums inside [0, total], each
+// sequence at most maxLen long (the GPU kernels size their tiles from it).
+bool needCuSeq(const char* L, const char* name, uint64_t bits, int32_t batch, int64_t total, int32_t maxLen,
+               IdxStream& s) {
+    if (batch <= 0) return true;
+    if (!tensorFromValue(bits)) {
+        setError(std::string(L) + ": " + name + " is required when batch > 0");
+        return false;
+    }
+    if (!readStream(L, name, bits, static_cast<int64_t>(batch) + 1, s)) return false;
+    if (!extra::needIndicesIn(L, name, s.vals, static_cast<int64_t>(batch) + 1, 0, total + 1)) return false;
+    for (int32_t b = 0; b < batch; ++b) {
+        const int64_t len = static_cast<int64_t>(s.vals[b + 1]) - s.vals[b];
+        if (len < 0 || len > maxLen) {
+            setError(std::string(L) + ": " + name + " sequence " + std::to_string(b) + " has length " +
+                     std::to_string(len) + " (must be in [0, " + std::to_string(maxLen) + "])");
+            return false;
+        }
+    }
+    return true;
+}
+
+// An M-RoPE position stream for an axis of width d: length L, every value a
+// row of that axis's cos/sin tables.
+bool needPosStream(const char* L, const char* name, uint64_t bits, int32_t d, int64_t rows, const Tensor* cosT,
+                   const Tensor* sinT, IdxStream& s) {
+    if (d <= 0) return true;
+    if (!tensorFromValue(bits)) {
+        setError(std::string(L) + ": " + name + " is required when its axis width is > 0");
+        return false;
+    }
+    if (!readStream(L, name, bits, rows, s)) return false;
+    const int64_t maxPos = cosT->rows < sinT->rows ? cosT->rows : sinT->rows;
+    return extra::needIndicesIn(L, name, s.vals, rows, 0, maxPos);
 }
 
 } // namespace
@@ -68,13 +125,17 @@ void bro_tensor_selfAttentionDecomposedRelPosWindowedForward(void* X, void* Wq, 
 void bro_tensor_flashAttentionVarlenForward(void* Q, void* K, void* V, uint64_t cuSeqQ_bits, uint64_t cuSeqK_bits,
                                             int32_t batch, int32_t maxQ, int32_t maxK,
                                             int32_t numHeads, int32_t headDim, bool causal, void* O) {
-    if (!need("flashAttentionVarlenForward", {Q, K, V, O})) return;
+    const char* L = "flashAttentionVarlenForward";
+    if (!need(L, {Q, K, V, O}) || !needNonNegative(L, {batch, maxQ, maxK})) return;
     BROTENSOR_API_TRY
+        IdxStream cq, ck;
+        if (!needCuSeq(L, "cuSeqQ", cuSeqQ_bits, batch, T(Q)->rows, maxQ, cq) ||
+            !needCuSeq(L, "cuSeqK", cuSeqK_bits, batch, T(K)->rows, maxK, ck)) return;
         brotensor::flash_attention_varlen_forward(*toTensor(Q), *toTensor(K), *toTensor(V),
-                                                  idxPtr(cuSeqQ_bits), idxPtr(cuSeqK_bits),
+                                                  cq.ptr, ck.ptr,
                                                   batch, maxQ, maxK, numHeads, headDim, causal,
                                                   *toTensor(O));
-    BROTENSOR_API_CATCH("flashAttentionVarlenForward")
+    BROTENSOR_API_CATCH(L)
 }
 
 void bro_tensor_flashAttentionVarlenBackward(void* Q, void* K, void* V, void* O, void* dO,
@@ -82,14 +143,19 @@ void bro_tensor_flashAttentionVarlenBackward(void* Q, void* K, void* V, void* O,
                                              int32_t batch, int32_t maxQ, int32_t maxK,
                                              int32_t numHeads, int32_t headDim, bool causal,
                                              void* dQ, void* dK, void* dV) {
-    if (!need("flashAttentionVarlenBackward", {Q, K, V, O, dO, dQ, dK, dV})) return;
+    const char* L = "flashAttentionVarlenBackward";
+    if (!need(L, {Q, K, V, O, dO, dQ, dK, dV}) || !needNonNegative(L, {batch, maxQ, maxK})) return;
+    if (!needPair(L, "O", T(O), T(Q)) || !needPair(L, "dO", T(dO), T(Q))) return;
     BROTENSOR_API_TRY
+        IdxStream cq, ck;
+        if (!needCuSeq(L, "cuSeqQ", cuSeqQ_bits, batch, T(Q)->rows, maxQ, cq) ||
+            !needCuSeq(L, "cuSeqK", cuSeqK_bits, batch, T(K)->rows, maxK, ck)) return;
         brotensor::flash_attention_varlen_backward(*toTensor(Q), *toTensor(K), *toTensor(V),
                                                    *toTensor(O), *toTensor(dO),
-                                                   idxPtr(cuSeqQ_bits), idxPtr(cuSeqK_bits),
+                                                   cq.ptr, ck.ptr,
                                                    batch, maxQ, maxK, numHeads, headDim, causal,
                                                    *toTensor(dQ), *toTensor(dK), *toTensor(dV));
-    BROTENSOR_API_CATCH("flashAttentionVarlenBackward")
+    BROTENSOR_API_CATCH(L)
 }
 
 // ---- gated delta rule (linear attention — Qwen3-Next) ---------------------
@@ -120,15 +186,21 @@ void bro_tensor_ropeApplyMrope(void* X, void* cosT, void* sinT, void* cosH, void
                                uint64_t posT_bits, uint64_t posH_bits, uint64_t posW_bits,
                                int32_t headDim, int32_t numHeads, int32_t d_t, int32_t d_h, int32_t d_w,
                                void* Y) {
-    if (!need("ropeApplyMrope", {X, cosT, sinT, cosH, sinH, cosW, sinW, Y})) return;
+    const char* L = "ropeApplyMrope";
+    if (!need(L, {X, cosT, sinT, cosH, sinH, cosW, sinW, Y})) return;
+    const int64_t rows = T(X)->rows;
     BROTENSOR_API_TRY
+        IdxStream pt, ph, pw;
+        if (!needPosStream(L, "posT", posT_bits, d_t, rows, T(cosT), T(sinT), pt) ||
+            !needPosStream(L, "posH", posH_bits, d_h, rows, T(cosH), T(sinH), ph) ||
+            !needPosStream(L, "posW", posW_bits, d_w, rows, T(cosW), T(sinW), pw)) return;
         brotensor::rope_apply_mrope(*toTensor(X),
                                     *toTensor(cosT), *toTensor(sinT),
                                     *toTensor(cosH), *toTensor(sinH),
                                     *toTensor(cosW), *toTensor(sinW),
-                                    idxPtr(posT_bits), idxPtr(posH_bits), idxPtr(posW_bits),
+                                    pt.ptr, ph.ptr, pw.ptr,
                                     headDim, numHeads, d_t, d_h, d_w, *toTensor(Y));
-    BROTENSOR_API_CATCH("ropeApplyMrope")
+    BROTENSOR_API_CATCH(L)
 }
 
 } // extern "C"
