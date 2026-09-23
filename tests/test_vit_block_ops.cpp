@@ -351,6 +351,127 @@ void run_block_ops(const Shapes& s, Device dev, const std::string& dn, uint64_t 
     }
 }
 
+// Bilinear, align_corners=False, border-clamped: PyTorch's F.interpolate.
+std::vector<double> ref_bilinear(const std::vector<double>& x, int C, int H, int W,
+                                 int Ho, int Wo) {
+    std::vector<double> y(static_cast<size_t>(C) * Ho * Wo);
+    const double sy = static_cast<double>(H) / Ho, sx = static_cast<double>(W) / Wo;
+    for (int c = 0; c < C; ++c)
+        for (int oy = 0; oy < Ho; ++oy) {
+            const double fy = std::max(0.0, (oy + 0.5) * sy - 0.5);
+            const int y0 = std::min(static_cast<int>(fy), H - 1), y1 = std::min(y0 + 1, H - 1);
+            const double wy = fy - y0;
+            for (int ox = 0; ox < Wo; ++ox) {
+                const double fx = std::max(0.0, (ox + 0.5) * sx - 0.5);
+                const int x0 = std::min(static_cast<int>(fx), W - 1), x1 = std::min(x0 + 1, W - 1);
+                const double wx = fx - x0;
+                const double* p = x.data() + static_cast<size_t>(c) * H * W;
+                const double t = p[y0 * W + x0] + (p[y0 * W + x1] - p[y0 * W + x0]) * wx;
+                const double b = p[y1 * W + x0] + (p[y1 * W + x1] - p[y1 * W + x0]) * wx;
+                y[(static_cast<size_t>(c) * Ho + oy) * Wo + ox] = t + (b - t) * wy;
+            }
+        }
+    return y;
+}
+
+// SAM's mask postprocess: (3, 256, 256) low-res logits -> bilinear up to the
+// 1024 model frame -> crop the letterboxed content (819 x 1024 for a 320x256
+// image) -> bilinear DOWN to the original 256 x 320.
+void run_mask_upscale(Device dev, const std::string& dn, uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int C = 3, ms = 256, S = 1024, rh = 819, rw = 1024, oh = 256, ow = 320;
+    Tensor m = host(1, C * ms * ms);
+    // Smooth logits in [-20, 20] with sharp-ish edges, like a mask head.
+    for (int c = 0; c < C; ++c)
+        for (int yy = 0; yy < ms; ++yy)
+            for (int xx = 0; xx < ms; ++xx) {
+                const double r = std::hypot(yy - 100.0 - 20 * c, xx - 128.0);
+                m.host_f32_mut()[(c * ms + yy) * ms + xx] =
+                    static_cast<float>(20.0 * std::tanh((60.0 - r) / 6.0) + rng.next_unit());
+            }
+    auto on = [&](const Tensor& t) { return dev == Device::CPU ? t : t.to(dev); };
+    Tensor up1, crop, up2;
+    brotensor::interp2d_forward(on(m), 1, C, ms, ms, S, S, 1, up1);
+    brotensor::slice2d_forward(up1, 1, C, S, S, 0, 0, rh, rw, crop);
+    brotensor::interp2d_forward(crop, 1, C, rh, rw, oh, ow, 1, up2);
+
+    std::vector<double> x(m.host_f32(), m.host_f32() + m.size());
+    std::vector<double> r1 = ref_bilinear(x, C, ms, ms, S, S);
+    std::vector<double> rc(static_cast<size_t>(C) * rh * rw);
+    for (int c = 0; c < C; ++c)
+        for (int yy = 0; yy < rh; ++yy)
+            for (int xx = 0; xx < rw; ++xx)
+                rc[(static_cast<size_t>(c) * rh + yy) * rw + xx] = r1[(static_cast<size_t>(c) * S + yy) * S + xx];
+    expect_close("sam mask upscale 256->1024 (bilinear)", dn, up1, r1, C, S * S, 1e-5);
+    expect_close("sam mask upscale ->256x320 (bilinear)", dn, up2,
+                 ref_bilinear(rc, C, rh, rw, oh, ow), C, oh * ow, 1e-5);
+}
+
+// FP16 attention path (SAM mask decoder on a GPU backend): q/k/v/out
+// projections through linear_forward_batched_fp16 and FP16 varlen attention,
+// token-to-image (Lq=7, Lk=4096) and image-to-token (Lq=4096, Lk=7), at the
+// decoder's widths (D=256; cross attention downsampled to 128, 8 heads -> hd 16;
+// self attention hd 32). The reference is FP64 over the FP16-ROUNDED inputs, so
+// the tolerance only has to cover FP16 output rounding and FP32 accumulation.
+Tensor round16(const Tensor& t) {
+    return bt_parity::fp16_host_to_f32(bt_parity::to_fp16_host(t));
+}
+
+void run_fp16_attention(Device dev, const std::string& dn, uint64_t seed) {
+    SplitMix64 rng(seed);
+    struct Case { const char* name; int Lq, Lk, in, internal, heads; };
+    const Case cases[] = {
+        {"fp16 attn tok->img", 7, 4096, 256, 128, 8},
+        {"fp16 attn img->tok", 4096, 7, 256, 128, 8},
+        {"fp16 attn self", 7, 7, 256, 256, 8},
+        {"fp16 attn hd64 tok->img", 7, 4096, 256, 256, 4},   // fused-kernel head_dim
+    };
+    for (const Case& c : cases) {
+        Tensor xq = host(c.Lq, c.in), xk = host(c.Lk, c.in);
+        fill(xq, rng, 4.0f);
+        fill(xk, rng, 4.0f);
+        Tensor Wq = host(c.internal, c.in), bq = host(c.internal, 1);
+        Tensor Wk = host(c.internal, c.in), bk = host(c.internal, 1);
+        fill(Wq, rng, 0.15f); fill(bq, rng, 0.2f);
+        fill(Wk, rng, 0.15f); fill(bk, rng, 0.2f);
+        xq = round16(xq); xk = round16(xk);
+        Wq = round16(Wq); bq = round16(bq); Wk = round16(Wk); bk = round16(bk);
+
+        auto g16 = [&](const Tensor& t) { return bt_parity::to_fp16_host(t).to(dev); };
+        auto back = [&](const Tensor& t) {
+            Tensor h = to_host(t);
+            return h.dtype == Dtype::FP16 ? bt_parity::fp16_host_to_f32(h) : h;
+        };
+        Tensor bq16 = g16(bq), bk16 = g16(bk);
+        Tensor q16, k16;
+        brotensor::linear_forward_batched_fp16(g16(Wq), &bq16, g16(xq), q16);
+        brotensor::linear_forward_batched_fp16(g16(Wk), &bk16, g16(xk), k16);
+        const std::string tag = c.name;
+        expect_close((tag + " q proj").c_str(), dn, back(q16), ref_linear(Wq, bq, xq),
+                     c.Lq, c.internal, 2e-3);
+        expect_close((tag + " k proj").c_str(), dn, back(k16), ref_linear(Wk, bk, xk),
+                     c.Lk, c.internal, 2e-3);
+
+        // Attention over the (FP16) projections actually produced.
+        Tensor qh = back(q16), kh = back(k16);
+        Tensor vh = host(c.Lk, c.internal);
+        fill(vh, rng, 3.0f);
+        vh = round16(vh);
+        Tensor cq = Tensor::zeros_on(Device::CPU, 2, 1, Dtype::INT32);
+        Tensor ck = Tensor::zeros_on(Device::CPU, 2, 1, Dtype::INT32);
+        static_cast<int32_t*>(cq.data)[1] = c.Lq;
+        static_cast<int32_t*>(ck.data)[1] = c.Lk;
+        Tensor cqd = cq.to(dev), ckd = ck.to(dev);
+        Tensor o;
+        brotensor::flash_attention_varlen_forward(q16, k16, g16(vh),
+            static_cast<const int32_t*>(cqd.data), static_cast<const int32_t*>(ckd.data),
+            1, c.Lq, c.Lk, c.heads, c.internal / c.heads, false, o);
+        expect_close((tag + " varlen attention").c_str(), dn, back(o),
+                     ref_attention(qh, kh, vh, c.heads, c.internal / c.heads),
+                     c.Lq, c.internal, 4e-3);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -366,6 +487,10 @@ int main() {
     uint64_t seed = 1234;
     for (const Shapes& s : shapes)
         for (const auto& [dev, name] : devs) run_block_ops(s, dev, name, seed++);
+    for (const auto& [dev, name] : devs) run_mask_upscale(dev, name, 99);
+    // FP16 storage is GPU-only (the CPU backend is FP32 by design).
+    for (const auto& [dev, name] : devs)
+        if (dev != Device::CPU) run_fp16_attention(dev, name, 7);
 
     if (g_failures) {
         std::printf("test_vit_block_ops: %d failure(s)\n", g_failures);
