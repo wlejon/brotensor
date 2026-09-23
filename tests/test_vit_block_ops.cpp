@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
@@ -552,10 +553,388 @@ void run_direct_flash_attention(Device dev, const std::string& dn, uint64_t seed
     }
 }
 
+// ── Attention backward against FP64 ─────────────────────────────────────────
+
+float round_to(double x, Dtype dt) {
+    const float f = static_cast<float>(x);
+    if (dt == Dtype::FP16) return brotensor::fp16_bits_to_fp32(brotensor::fp32_to_fp16_bits(f));
+    if (dt == Dtype::BF16) return brotensor::bf16_bits_to_fp32(brotensor::fp32_to_bf16_bits(f));
+    return f;
+}
+
+Tensor rand_rounded(int r, int c, SplitMix64& rng, float scale, Dtype dt) {
+    Tensor t = host(r, c);
+    fill(t, rng, scale);
+    float* p = t.host_f32_mut();
+    for (int i = 0; i < t.size(); ++i) p[i] = round_to(p[i], dt);
+    return t;
+}
+
+Tensor upload(const Tensor& t, Dtype dt, Device dev) {
+    if (dt == Dtype::BF16) return bt_parity::to_bf16_host(t).to(dev);
+    if (dt == Dtype::FP16) return bt_parity::to_fp16_host(t).to(dev);
+    return t.to(dev);
+}
+
+Tensor download(const Tensor& t) {
+    Tensor h = to_host(t);
+    if (h.dtype == Dtype::BF16) return bt_parity::bf16_host_to_f32(h);
+    if (h.dtype == Dtype::FP16) return bt_parity::fp16_host_to_f32(h);
+    return h;
+}
+
+const char* dt_name(Dtype dt) { return dt == Dtype::BF16 ? "bf16" : dt == Dtype::FP16 ? "fp16" : "fp32"; }
+
+Tensor cols_of(const Tensor& t, int c0, int w) {
+    Tensor o = host(t.rows, w);
+    for (int r = 0; r < t.rows; ++r)
+        for (int c = 0; c < w; ++c) o.host_f32_mut()[r * w + c] = t.host_f32()[r * t.cols + c0 + c];
+    return o;
+}
+
+std::vector<double> cols_of(const std::vector<double>& v, int rows, int cols, int c0, int w) {
+    std::vector<double> o(static_cast<size_t>(rows) * w);
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < w; ++c) o[r * w + c] = v[static_cast<size_t>(r) * cols + c0 + c];
+    return o;
+}
+
+// FP64 forward + backward of softmax(Q K^T / sqrt(hd)) V over one block of
+// rows. Row i of Q / K / V sits at q / k / v + i*ld, head h at column h*hd; dO
+// rows at g + i*ldg. Key j is seen by query i when the mask (if any) keeps it,
+// j <= i under causal, and |i - j| <= hw when hw >= 0. dq / dk / dv (row
+// stride ldd) and o (row stride ldg, optional) are accumulated into.
+void ref_attention_bwd(const float* q, const float* k, const float* v, int ld, const float* g, int ldg,
+                       int Lq, int Lk, int nh, int hd, const std::vector<float>* mask, bool causal,
+                       int hw, double* dq, double* dk, double* dv, int ldd, double* o = nullptr) {
+    const double sc = 1.0 / std::sqrt(static_cast<double>(hd));
+    std::vector<double> p(Lk), dp(Lk);
+    std::vector<char> on(Lk);
+    for (int h = 0; h < nh; ++h) {
+        const int c0 = h * hd;
+        for (int i = 0; i < Lq; ++i) {
+            const float* qi = q + static_cast<size_t>(i) * ld + c0;
+            const float* gi = g + static_cast<size_t>(i) * ldg + c0;
+            double mx = -1e300;
+            for (int j = 0; j < Lk; ++j) {
+                on[j] = (!mask || (*mask)[j] > 0.5f) && (!causal || j <= i) &&
+                        (hw < 0 || std::abs(i - j) <= hw);
+                if (!on[j]) continue;
+                const float* kj = k + static_cast<size_t>(j) * ld + c0;
+                double a = 0.0;
+                for (int d = 0; d < hd; ++d) a += static_cast<double>(qi[d]) * kj[d];
+                p[j] = a * sc;
+                mx = std::max(mx, p[j]);
+            }
+            double z = 0.0;
+            for (int j = 0; j < Lk; ++j) {
+                p[j] = on[j] ? std::exp(p[j] - mx) : 0.0;
+                z += p[j];
+            }
+            if (z == 0.0) continue;
+            double Dq = 0.0;
+            for (int j = 0; j < Lk; ++j) {
+                p[j] /= z;
+                dp[j] = 0.0;
+                if (!on[j]) continue;
+                const float* vj = v + static_cast<size_t>(j) * ld + c0;
+                for (int d = 0; d < hd; ++d) dp[j] += static_cast<double>(gi[d]) * vj[d];
+                Dq += p[j] * dp[j];
+                if (o)
+                    for (int d = 0; d < hd; ++d) o[static_cast<size_t>(i) * ldg + c0 + d] += p[j] * vj[d];
+            }
+            for (int j = 0; j < Lk; ++j) {
+                if (!on[j]) continue;
+                const double ds = p[j] * (dp[j] - Dq) * sc;
+                const float* kj = k + static_cast<size_t>(j) * ld + c0;
+                double* dqi = dq + static_cast<size_t>(i) * ldd + c0;
+                double* dkj = dk + static_cast<size_t>(j) * ldd + c0;
+                double* dvj = dv + static_cast<size_t>(j) * ldd + c0;
+                for (int d = 0; d < hd; ++d) {
+                    dqi[d] += ds * kj[d];
+                    dkj[d] += ds * qi[d];
+                    dvj[d] += p[j] * gi[d];
+                }
+            }
+        }
+    }
+}
+
+// Worst-case error each backward is allowed, as a fraction of the gradient
+// row's max |ref|. The 16-bit outputs round at 2^-12 / 2^-9 of that, and the
+// 16-bit P operand of dV adds about as much again: measured worst cases are
+// 1.8e-3 (FP16) / 8e-3 (BF16). With the scores, P, dP or dS held in 16 bits
+// the same gradients land at 5e-3 - 2e-2 (FP16) and 4e-2 - 2 (BF16).
+void set_env(const char* key, const char* value) {
+#ifdef _WIN32
+    _putenv_s(key, value);
+#else
+    setenv(key, value, 1);
+#endif
+}
+
+double bwd_rtol(Dtype dt) { return dt == Dtype::BF16 ? 1.5e-2 : dt == Dtype::FP16 ? 3e-3 : 1e-4; }
+
+// flash_attention_backward (the bare core LoRA-style trainers wrap) in FP16 and
+// BF16, at the head dims its callers use. Inputs as in the forward test above:
+// q, k in [-4, 4] make the softmax peaked, where a score, probability or dS
+// held in 16 bits shows as an error on every gradient.
+void run_flash_attention_backward(Device dev, const std::string& dn, uint64_t seed) {
+    SplitMix64 rng(seed);
+    struct Case { const char* name; int Lq, Lk, heads, hd; bool masked, causal; };
+    const Case cases[] = {
+        {"hd16 tok->img",     64, 2048, 4,  16, false, false},
+        {"hd20 self",        384,  384, 3,  20, false, false},
+        {"hd32 self causal", 512,  512, 4,  32, false, true},
+        {"hd40 self",        512,  512, 2,  40, false, false},
+        {"hd40 cross",       512,   77, 2,  40, false, false},
+        {"hd64 masked",      256, 1000, 2,  64, true,  false},
+        {"hd64 causal",      512,  512, 2,  64, false, true},
+        {"hd80 self",        512,  512, 2,  80, false, false},
+        {"hd128 self",       256,  256, 2, 128, false, false},
+        {"hd160 self",       256,  256, 2, 160, false, false},
+    };
+    for (const Dtype dt : {Dtype::FP16, Dtype::BF16}) {
+        for (const Case& c : cases) {
+            const int D = c.heads * c.hd;
+            Tensor q = rand_rounded(c.Lq, D, rng, 4.0f, dt), k = rand_rounded(c.Lk, D, rng, 4.0f, dt);
+            Tensor v = rand_rounded(c.Lk, D, rng, 3.0f, dt), g = rand_rounded(c.Lq, D, rng, 1.0f, dt);
+            std::vector<float> mask;
+            Tensor maskd;
+            if (c.masked) {
+                mask.resize(c.Lk);
+                for (int j = 0; j < c.Lk; ++j) mask[j] = (j % 7 == 3 || j > 900) ? 0.0f : 1.0f;
+                maskd = Tensor::from_host_on(dev, mask.data(), c.Lk, 1);
+            }
+            Tensor gd = upload(g, dt, dev), dQ, dK, dV;
+            brotensor::flash_attention_backward(upload(q, dt, dev), upload(k, dt, dev), upload(v, dt, dev),
+                                                gd, gd, c.masked ? static_cast<const float*>(maskd.data) : nullptr,
+                                                c.heads, c.causal, dQ, dK, dV);
+            std::vector<double> rq(static_cast<size_t>(c.Lq) * D), rk(static_cast<size_t>(c.Lk) * D),
+                rv(static_cast<size_t>(c.Lk) * D);
+            ref_attention_bwd(q.host_f32(), k.host_f32(), v.host_f32(), D, g.host_f32(), D, c.Lq, c.Lk,
+                              c.heads, c.hd, c.masked ? &mask : nullptr, c.causal, -1, rq.data(), rk.data(),
+                              rv.data(), D);
+            const std::string tag = std::string(dt_name(dt)) + " fa_bwd " + c.name;
+            expect_close((tag + " dQ").c_str(), dn, download(dQ), rq, c.Lq, D, bwd_rtol(dt), true);
+            expect_close((tag + " dK").c_str(), dn, download(dK), rk, c.Lk, D, bwd_rtol(dt), true);
+            expect_close((tag + " dV").c_str(), dn, download(dV), rv, c.Lk, D, bwd_rtol(dt), true);
+        }
+    }
+}
+
+// flash_attention_varlen_backward: several sequences packed back to back,
+// self (causal) and cross, FP16 / BF16 / FP32.
+void run_varlen_backward(Device dev, const std::string& dn, uint64_t seed) {
+    SplitMix64 rng(seed);
+    struct Case { const char* name; std::vector<int> lq, lk; int heads, hd; bool causal; };
+    const Case cases[] = {
+        {"hd64 causal", {3, 200, 77, 300}, {3, 200, 77, 300}, 4, 64, true},
+        {"hd32 cross",  {5, 120, 64},      {77, 300, 1},      4, 32, false},
+        {"hd80 self",   {150, 256},        {150, 256},        2, 80, false},
+    };
+    for (const Dtype dt : {Dtype::FP16, Dtype::BF16, Dtype::FP32}) {
+        for (const Case& c : cases) {
+            const int B = static_cast<int>(c.lq.size()), D = c.heads * c.hd;
+            Tensor cq = Tensor::zeros_on(Device::CPU, B + 1, 1, Dtype::INT32);
+            Tensor ck = Tensor::zeros_on(Device::CPU, B + 1, 1, Dtype::INT32);
+            int32_t* pq = static_cast<int32_t*>(cq.data);
+            int32_t* pk = static_cast<int32_t*>(ck.data);
+            int mq = 0, mk = 0;
+            for (int b = 0; b < B; ++b) {
+                pq[b + 1] = pq[b] + c.lq[b];
+                pk[b + 1] = pk[b] + c.lk[b];
+                mq = std::max(mq, c.lq[b]);
+                mk = std::max(mk, c.lk[b]);
+            }
+            const int Tq = pq[B], Tk = pk[B];
+            Tensor q = rand_rounded(Tq, D, rng, 4.0f, dt), k = rand_rounded(Tk, D, rng, 4.0f, dt);
+            Tensor v = rand_rounded(Tk, D, rng, 3.0f, dt), g = rand_rounded(Tq, D, rng, 1.0f, dt);
+            Tensor cqd = cq.to(dev), ckd = ck.to(dev), gd = upload(g, dt, dev), dQ, dK, dV;
+            brotensor::flash_attention_varlen_backward(
+                upload(q, dt, dev), upload(k, dt, dev), upload(v, dt, dev), gd, gd,
+                static_cast<const int32_t*>(cqd.data), static_cast<const int32_t*>(ckd.data), B, mq, mk,
+                c.heads, c.hd, c.causal, dQ, dK, dV);
+            std::vector<double> rq(static_cast<size_t>(Tq) * D), rk(static_cast<size_t>(Tk) * D),
+                rv(static_cast<size_t>(Tk) * D);
+            for (int b = 0; b < B; ++b)
+                ref_attention_bwd(q.host_f32() + pq[b] * D, k.host_f32() + pk[b] * D, v.host_f32() + pk[b] * D,
+                                  D, g.host_f32() + pq[b] * D, D, c.lq[b], c.lk[b], c.heads, c.hd, nullptr,
+                                  c.causal, -1, rq.data() + pq[b] * D, rk.data() + pk[b] * D,
+                                  rv.data() + pk[b] * D, D);
+            const std::string tag = std::string(dt_name(dt)) + " varlen_bwd " + c.name;
+            expect_close((tag + " dQ").c_str(), dn, download(dQ), rq, Tq, D, bwd_rtol(dt), true);
+            expect_close((tag + " dK").c_str(), dn, download(dK), rk, Tk, D, bwd_rtol(dt), true);
+            expect_close((tag + " dV").c_str(), dn, download(dV), rv, Tk, D, bwd_rtol(dt), true);
+        }
+    }
+}
+
+// flash_attention_packed_qkv_backward: a fused-QKV encoder batch, full and
+// windowed, FP16 / BF16 / FP32.
+void run_packed_qkv_backward(Device dev, const std::string& dn, uint64_t seed) {
+    SplitMix64 rng(seed);
+    struct Case { const char* name; std::vector<int> lens; int heads, hd, window; };
+    const Case cases[] = {
+        {"hd64 full",     {100, 37, 250}, 4, 64, 0},
+        {"hd32 window64", {100, 37, 250}, 4, 32, 64},
+    };
+    for (const Dtype dt : {Dtype::FP16, Dtype::BF16, Dtype::FP32}) {
+        for (const Case& c : cases) {
+            const int D = c.heads * c.hd;
+            int L = 0;
+            for (int n : c.lens) L += n;
+            Tensor bounds = Tensor::zeros_on(Device::CPU, L, 2, Dtype::INT32);
+            int32_t* pb = static_cast<int32_t*>(bounds.data);
+            std::vector<int> starts;
+            for (int s = 0, r = 0; s < static_cast<int>(c.lens.size()); r += c.lens[s], ++s) {
+                starts.push_back(r);
+                for (int i = r; i < r + c.lens[s]; ++i) { pb[2 * i] = r; pb[2 * i + 1] = r + c.lens[s]; }
+            }
+            Tensor qkv = host(L, 3 * D);
+            for (int r = 0; r < L; ++r)
+                for (int col = 0; col < 3 * D; ++col)
+                    qkv.host_f32_mut()[r * 3 * D + col] =
+                        round_to(rng.next_unit() * (col < 2 * D ? 4.0f : 3.0f), dt);
+            Tensor g = rand_rounded(L, D, rng, 1.0f, dt);
+            Tensor bd = bounds.to(dev), dQKV;
+            brotensor::flash_attention_packed_qkv_backward(upload(qkv, dt, dev), upload(g, dt, dev), bd, c.heads,
+                                                           c.window, dQKV);
+            std::vector<double> ref(static_cast<size_t>(L) * 3 * D);
+            const float* x = qkv.host_f32();
+            for (size_t s = 0; s < c.lens.size(); ++s) {
+                const size_t r0 = static_cast<size_t>(starts[s]);
+                ref_attention_bwd(x + r0 * 3 * D, x + r0 * 3 * D + D, x + r0 * 3 * D + 2 * D, 3 * D,
+                                  g.host_f32() + r0 * D, D, c.lens[s], c.lens[s], c.heads, c.hd, nullptr, false,
+                                  c.window > 0 ? c.window / 2 : -1, ref.data() + r0 * 3 * D,
+                                  ref.data() + r0 * 3 * D + D, ref.data() + r0 * 3 * D + 2 * D, 3 * D);
+            }
+            Tensor got = download(dQKV);
+            const std::string tag = std::string(dt_name(dt)) + " packed_bwd " + c.name;
+            const char* part[3] = {" dQ", " dK", " dV"};
+            for (int p = 0; p < 3; ++p)
+                expect_close((tag + part[p]).c_str(), dn, cols_of(got, p * D, D), cols_of(ref, L, 3 * D, p * D, D),
+                             L, D, bwd_rtol(dt), true);
+        }
+    }
+}
+
+// flash_attention_qkvo_backward, self and cross. The reference rounds to the
+// op's dtype everything the op's contract stores in it (the Q / K / V
+// projections, the attention output, dO @ Wo and dQ / dK / dV), so what is
+// left to measure is the attention core's own precision.
+void run_qkvo_backward(Device dev, const std::string& dn, uint64_t seed) {
+    SplitMix64 rng(seed);
+    struct Case { const char* name; int Lq, D, heads, Lk, Dctx; bool cross, causal; };
+    const Case cases[] = {
+        {"self hd40",        256, 320, 8, 256, 320, false, false},
+        {"cross hd40",       256, 320, 8,  77, 768, true,  false},
+        {"self hd64 causal", 256, 256, 4, 256, 256, false, true},
+    };
+    for (const Dtype dt : {Dtype::FP16, Dtype::BF16}) {
+        for (const Case& c : cases) {
+            const int D = c.D, Dc = c.Dctx, Lq = c.Lq, Lk = c.Lk, hd = D / c.heads;
+            const float ws = 4.5f / std::sqrt(static_cast<float>(Dc)), wq = 4.5f / std::sqrt(static_cast<float>(D));
+            Tensor X = rand_rounded(Lq, D, rng, 2.0f, dt);
+            Tensor C = c.cross ? rand_rounded(Lk, Dc, rng, 2.0f, dt) : X;
+            Tensor Wq = rand_rounded(D, D, rng, wq, dt), Wk = rand_rounded(D, Dc, rng, ws, dt);
+            Tensor Wv = rand_rounded(D, Dc, rng, ws * 0.7f, dt), Wo = rand_rounded(D, D, rng, wq * 0.7f, dt);
+            Tensor bq = rand_rounded(D, 1, rng, 0.2f, dt), bk = rand_rounded(D, 1, rng, 0.2f, dt);
+            Tensor bv = rand_rounded(D, 1, rng, 0.2f, dt), bo = rand_rounded(D, 1, rng, 0.2f, dt);
+            Tensor g = rand_rounded(Lq, D, rng, 1.0f, dt);
+
+            Tensor Xd = upload(X, dt, dev), Cd = upload(C, dt, dev);
+            Tensor Wqd = upload(Wq, dt, dev), Wkd = upload(Wk, dt, dev), Wvd = upload(Wv, dt, dev),
+                   Wod = upload(Wo, dt, dev);
+            Tensor bqd = upload(bq, dt, dev), bkd = upload(bk, dt, dev), bvd = upload(bv, dt, dev),
+                   bod = upload(bo, dt, dev);
+            Tensor dX, dCtx;
+            Tensor dWq = Tensor::zeros_on(dev, D, D, dt), dWk = Tensor::zeros_on(dev, D, Dc, dt);
+            Tensor dWv = Tensor::zeros_on(dev, D, Dc, dt), dWo = Tensor::zeros_on(dev, D, D, dt);
+            Tensor dbq = Tensor::zeros_on(dev, D, 1, dt), dbk = Tensor::zeros_on(dev, D, 1, dt);
+            Tensor dbv = Tensor::zeros_on(dev, D, 1, dt), dbo = Tensor::zeros_on(dev, D, 1, dt);
+            brotensor::flash_attention_qkvo_backward(Xd, c.cross ? &Cd : nullptr, Wqd, &bqd, Wkd, &bkd, Wvd, &bvd,
+                                                     Wod, &bod, nullptr, c.heads, c.causal, upload(g, dt, dev), dX,
+                                                     c.cross ? &dCtx : nullptr, dWq, &dbq, dWk, &dbk, dWv, &dbv,
+                                                     dWo, &dbo);
+
+            // Reference. lin: rows of `in` (n, k) through W (m, k) + b, rounded.
+            auto lin = [&](const Tensor& in, const Tensor& W, const Tensor& b) {
+                const int n = in.rows, kk = in.cols, m = W.rows;
+                std::vector<float> y(static_cast<size_t>(n) * m);
+                for (int r = 0; r < n; ++r)
+                    for (int o = 0; o < m; ++o) {
+                        double a = 0.0;
+                        for (int i = 0; i < kk; ++i)
+                            a += static_cast<double>(in.host_f32()[r * kk + i]) * W.host_f32()[o * kk + i];
+                        // The BF16 projection rounds X W^T, then adds the bias
+                        // and rounds again; FP16 fuses the bias into one rounding.
+                        if (dt == Dtype::BF16) a = round_to(a, dt);
+                        y[static_cast<size_t>(r) * m + o] = round_to(a + b.host_f32()[o], dt);
+                    }
+                return y;
+            };
+            const std::vector<float> Q = lin(X, Wq, bq), K = lin(C, Wk, bk), V = lin(C, Wv, bv);
+            std::vector<double> A(static_cast<size_t>(Lq) * D), sink_q(A.size()),
+                sink_k(static_cast<size_t>(Lk) * D), sink_v(sink_k.size());
+            std::vector<float> zero_g(static_cast<size_t>(Lq) * D, 0.0f);
+            ref_attention_bwd(Q.data(), K.data(), V.data(), D, zero_g.data(), D, Lq, Lk, c.heads, hd, nullptr,
+                              c.causal, -1, sink_q.data(), sink_k.data(), sink_v.data(), D, A.data());
+            std::vector<float> Ar(A.size()), dA(A.size());
+            for (size_t i = 0; i < A.size(); ++i) Ar[i] = round_to(A[i], dt);
+            for (int r = 0; r < Lq; ++r)
+                for (int col = 0; col < D; ++col) {
+                    double a = 0.0;
+                    for (int o = 0; o < D; ++o)
+                        a += static_cast<double>(g.host_f32()[r * D + o]) * Wo.host_f32()[o * D + col];
+                    dA[static_cast<size_t>(r) * D + col] = round_to(a, dt);
+                }
+            std::vector<double> gq(static_cast<size_t>(Lq) * D), gk(static_cast<size_t>(Lk) * D), gv(gk.size());
+            ref_attention_bwd(Q.data(), K.data(), V.data(), D, dA.data(), D, Lq, Lk, c.heads, hd, nullptr,
+                              c.causal, -1, gq.data(), gk.data(), gv.data(), D);
+            for (auto* t : {&gq, &gk, &gv})
+                for (double& x : *t) x = round_to(x, dt);
+            // dIn(n, k) += dY(n, m) @ W(m, k);  dW(m, k) = dY^T @ In.
+            auto back_in = [](const std::vector<double>& dY, const Tensor& W, int n, std::vector<double>& dIn) {
+                const int m = W.rows, kk = W.cols;
+                for (int r = 0; r < n; ++r)
+                    for (int o = 0; o < m; ++o) {
+                        const double gy = dY[static_cast<size_t>(r) * m + o];
+                        for (int i = 0; i < kk; ++i) dIn[static_cast<size_t>(r) * kk + i] += gy * W.host_f32()[o * kk + i];
+                    }
+            };
+            auto back_w = [](const std::vector<double>& dY, const float* in, int n, int m, int kk) {
+                std::vector<double> dW(static_cast<size_t>(m) * kk);
+                for (int r = 0; r < n; ++r)
+                    for (int o = 0; o < m; ++o) {
+                        const double gy = dY[static_cast<size_t>(r) * m + o];
+                        for (int i = 0; i < kk; ++i) dW[static_cast<size_t>(o) * kk + i] += gy * in[r * kk + i];
+                    }
+                return dW;
+            };
+            std::vector<double> rdX(static_cast<size_t>(Lq) * D), rdC(static_cast<size_t>(Lk) * Dc);
+            back_in(gq, Wq, Lq, rdX);
+            back_in(gk, Wk, Lk, c.cross ? rdC : rdX);
+            back_in(gv, Wv, Lk, c.cross ? rdC : rdX);
+            std::vector<double> gd(g.host_f32(), g.host_f32() + g.size());
+            const std::string tag = std::string(dt_name(dt)) + " qkvo_bwd " + c.name;
+            const double rt = bwd_rtol(dt);
+            expect_close((tag + " dX").c_str(), dn, download(dX), rdX, Lq, D, rt, true);
+            if (c.cross) expect_close((tag + " dCtx").c_str(), dn, download(dCtx), rdC, Lk, Dc, rt, true);
+            expect_close((tag + " dWq").c_str(), dn, download(dWq), back_w(gq, X.host_f32(), Lq, D, D), D, D, rt, true);
+            expect_close((tag + " dWk").c_str(), dn, download(dWk), back_w(gk, C.host_f32(), Lk, D, Dc), D, Dc, rt, true);
+            expect_close((tag + " dWv").c_str(), dn, download(dWv), back_w(gv, C.host_f32(), Lk, D, Dc), D, Dc, rt, true);
+            expect_close((tag + " dWo").c_str(), dn, download(dWo), back_w(gd, Ar.data(), Lq, D, D), D, D, rt, true);
+        }
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     brotensor::init();   // before is_available(): the driver probe happens here
+    // `bwd` runs only the attention-backward cases.
+    const bool bwd_only = argc > 1 && std::string(argv[1]) == "bwd";
     const Shapes shapes[] = {
         {"dinov3-vit-h", 201, 1280, 20, 5120, 6.0e4f},
         {"sam-vit-b",    196,  768, 12, 3072, 1.5e3f},
@@ -565,14 +944,30 @@ int main() {
     else if (brotensor::is_available(Device::Metal)) devs.push_back({Device::Metal, "Metal"});
 
     uint64_t seed = 1234;
-    for (const Shapes& s : shapes)
-        for (const auto& [dev, name] : devs) run_block_ops(s, dev, name, seed++);
-    for (const auto& [dev, name] : devs) run_mask_upscale(dev, name, 99);
+    if (!bwd_only) {
+        for (const Shapes& s : shapes)
+            for (const auto& [dev, name] : devs) run_block_ops(s, dev, name, seed++);
+        for (const auto& [dev, name] : devs) run_mask_upscale(dev, name, 99);
+    }
     // FP16 storage is GPU-only (the CPU backend is FP32 by design).
     for (const auto& [dev, name] : devs)
         if (dev != Device::CPU) {
-            run_fp16_attention(dev, name, 7);
-            run_direct_flash_attention(dev, name, 11);
+            if (!bwd_only) {
+                run_fp16_attention(dev, name, 7);
+                run_direct_flash_attention(dev, name, 11);
+            }
+            // The bare core, varlen and qkvo backward pick between two paths
+            // by problem size; each case runs through both. On devices without
+            // the tensor-core path "tc" falls back to the rows.
+            for (const char* path : {"rows", "tc"}) {
+                set_env("BROTENSOR_ATTN_BWD_PATH", path);
+                const std::string tag = name + "/" + path;
+                run_flash_attention_backward(dev, tag, 13);
+                run_varlen_backward(dev, tag, 17);
+                run_qkvo_backward(dev, tag, 23);
+            }
+            set_env("BROTENSOR_ATTN_BWD_PATH", "");
+            run_packed_qkv_backward(dev, name, 19);
         }
 
     if (g_failures) {
