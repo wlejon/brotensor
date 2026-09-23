@@ -80,7 +80,8 @@ static void bench(Device dev, int M, int N, int K, int iters) {
     std::printf("\n");
 }
 
-int main() {
+int main() try {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     brotensor::init();
     Device dev = Device::CPU;
     if (brotensor::is_available(Device::CUDA))       dev = Device::CUDA;
@@ -106,4 +107,7 @@ int main() {
         bench(dev, M, 1024, 2624, 30);
     }
     return 0;
+} catch (const std::exception& e) {
+    std::fprintf(stderr, "bench_matmul_abt: %s\n", e.what());
+    return 1;
 }

@@ -93,8 +93,14 @@ BT_PARITY_TEST(cpu_epilogues) {
     }
 }
 
-// Large tiles (M * N fills the device).
-BT_PARITY_TEST(large_store_fp16) { check(960, 1024, 1024, 0, kStore, true, true, Dtype::FP16, 0x21); }
+// Large tiles (M * N fills the device: >= 128 128x128 tiles on a 128-SM part;
+// the 960-row cases take the 64 x 64 tile there).
+BT_PARITY_TEST(large_store_fp16) {
+    check(960, 1024, 1024, 0, kStore, true, true, Dtype::FP16, 0x21);
+    check(2100, 1536, 512, 3, kStore, true, true, Dtype::FP16, 0x24);
+    check(2100, 1536, 512, 0, kAcc | brotensor::kLinearEpiFastAccum, true, false, Dtype::FP16, 0x25);
+    check(2100, 1536, 256, 0, kGeglu, true, false, Dtype::BF16, 0x26);
+}
 BT_PARITY_TEST(large_acc_fp16) { check(700, 1024, 512, 0, kAcc, true, false, Dtype::FP16, 0x22); }
 BT_PARITY_TEST(large_geglu_bf16) { check(600, 1024, 256, 0, kGeglu, true, false, Dtype::BF16, 0x23); }
 // Short M: small tiles, split-K with a workspace, unsplit without.
