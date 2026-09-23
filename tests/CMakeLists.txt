@@ -81,9 +81,20 @@ if(WIN32)
     )
 endif()
 add_test(NAME brotensor_test_api COMMAND brotensor_test_api)
+# The same run with a collection at every allocation and freed space
+# poisoned: a binding that holds a raw Value across an allocating call reads
+# garbage here instead of passing by luck. `ctest -LE gcstress` skips it.
+add_test(NAME brotensor_test_api_gcstress COMMAND brotensor_test_api)
 if(WIN32)
     set_tests_properties(brotensor_test_api PROPERTIES
         ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brotensor_test_api>;$ENV{PATH}")
+    set_tests_properties(brotensor_test_api_gcstress PROPERTIES
+        ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1;PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brotensor_test_api>;$ENV{PATH}"
+        LABELS gcstress)
+else()
+    set_tests_properties(brotensor_test_api_gcstress PROPERTIES
+        ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1"
+        LABELS gcstress)
 endif()
 endif() # BROTENSOR_API_COMPILED_JS
 

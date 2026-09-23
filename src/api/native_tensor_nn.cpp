@@ -334,19 +334,25 @@ void bro_tensor_concatBatchedRows(uint64_t parts_bits, void* out) {
     BROTENSOR_API_CATCH("concatBatchedRows")
 }
 
+// C_per_part is an i32[] view INTO THE MOVING HEAP, and readTensorArray walks
+// the parts array with allocating getProperty/getElement calls: copy the ints
+// out first, or the second read sees a buffer the collector has moved (the
+// gcstress run caught exactly that).
 void bro_tensor_concatNchwChannels(uint64_t parts_bits, int32_t N, int32_t H, int32_t W, const int32_t* C_per_part, uint32_t C_len, void* out) {
+    const std::vector<int> channels = asInts(C_per_part, C_len);
     std::vector<brotensor::Tensor*> parts;
     if (!need("concatNchwChannels", {out}) || !readTensorArray(parts_bits, parts, "concatNchwChannels")) return;
     BROTENSOR_API_TRY
-        brotensor::concat_nchw_channels(asConst(parts), N, H, W, asInts(C_per_part, C_len), *toTensor(out));
+        brotensor::concat_nchw_channels(asConst(parts), N, H, W, channels, *toTensor(out));
     BROTENSOR_API_CATCH("concatNchwChannels")
 }
 
 void bro_tensor_concatNchwChannelsBackward(void* dY, int32_t N, int32_t H, int32_t W, const int32_t* C_per_part, uint32_t C_len, uint64_t parts_bits) {
+    const std::vector<int> channels = asInts(C_per_part, C_len);
     std::vector<brotensor::Tensor*> parts;
     if (!need("concatNchwChannelsBackward", {dY}) || !readTensorArray(parts_bits, parts, "concatNchwChannelsBackward")) return;
     BROTENSOR_API_TRY
-        brotensor::concat_nchw_channels_backward(*toTensor(dY), N, H, W, asInts(C_per_part, C_len), parts);
+        brotensor::concat_nchw_channels_backward(*toTensor(dY), N, H, W, channels, parts);
     BROTENSOR_API_CATCH("concatNchwChannelsBackward")
 }
 

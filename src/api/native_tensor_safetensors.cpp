@@ -201,11 +201,14 @@ bool bro_tensor_saveSafetensors(const char* path, uint64_t names_bits, uint64_t 
             stns::WriteEntry e;
             e.name = key;
 
-            // Preserve full n-dimensional tensor shape if present
+            // Preserve full n-dimensional tensor shape if present. The shape
+            // array is read across several allocating getProperty/getElement
+            // calls, so it lives in a Persistent: a raw Value is stale after
+            // the first of them.
             bool shapeSet = false;
-            Value shapeProp = ev::getProperty(tVal, "shape");
-            if (ev::isObject(shapeProp)) {
-                Value lenVal = ev::getProperty(shapeProp, "length");
+            ev::Persistent shapeProp(ev::getProperty(tVal, "shape"));
+            if (ev::isObject(shapeProp.get())) {
+                Value lenVal = ev::getProperty(shapeProp.get(), "length");
                 if (ev::isNumber(lenVal)) {
                     uint32_t shapeLen = static_cast<uint32_t>(ev::toDouble(lenVal));
                     if (shapeLen > 0) {
@@ -213,9 +216,12 @@ bool bro_tensor_saveSafetensors(const char* path, uint64_t names_bits, uint64_t 
                         customShape.reserve(shapeLen);
                         int64_t numel = 1;
                         for (uint32_t s = 0; s < shapeLen; ++s) {
-                            int64_t dim = static_cast<int64_t>(ev::toDouble(ev::getElement(shapeProp, s)));
+                            int64_t dim = static_cast<int64_t>(ev::toDouble(ev::getElement(shapeProp.get(), s)));
                             customShape.push_back(dim);
-                            numel *= dim;
+                            // A negative dim can multiply back to rows*cols
+                            // ([-2, -3] for 6); never let it reach the header.
+                            numel = dim < 0 ? -1 : numel * dim;
+                            if (numel < 0) break;
                         }
                         if (numel == static_cast<int64_t>(gt->rows) * gt->cols) {
                             e.shape = std::move(customShape);
