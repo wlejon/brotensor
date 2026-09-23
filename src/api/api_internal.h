@@ -179,6 +179,99 @@ inline int64_t elems(std::initializer_list<int64_t> dims) {
     return n;
 }
 
+// An elementwise partner: same element count and dtype as `ref`.
+inline bool needPair(const char* label, const char* name,
+                     const brotensor::Tensor* t, const brotensor::Tensor* ref) {
+    return needSameSize(label, name, t, ref) && needSameDtype(label, name, t, ref);
+}
+
+// Each value is > 0 (kernel sizes, strides, dilations, groups, heads: a zero
+// is a division by zero inside the op, which on the CPU backend is a crash).
+inline bool needPositive(const char* label, std::initializer_list<int64_t> vals) {
+    for (int64_t v : vals) {
+        if (v <= 0) {
+            setError(std::string(label) + ": kernel/stride/dilation/group/head counts must be positive");
+            return false;
+        }
+    }
+    return true;
+}
+
+// Each value is >= 0 (dims, paddings, offsets).
+inline bool needNonNegative(const char* label, std::initializer_list<int64_t> vals) {
+    for (int64_t v : vals) {
+        if (v < 0) {
+            setError(std::string(label) + ": dims, paddings and offsets must be non-negative");
+            return false;
+        }
+    }
+    return true;
+}
+
+// 2-D convolution geometry: positive kernel/stride/dilation/groups, groups
+// dividing both channel counts, non-negative dims and paddings. Answers the
+// output extent the op will produce (0 when the window does not fit).
+inline bool convGeom2d(const char* label, int64_t C_in, int64_t C_out, int64_t H, int64_t W,
+                       int64_t kH, int64_t kW, int64_t sH, int64_t sW,
+                       int64_t pH, int64_t pW, int64_t dH, int64_t dW, int64_t groups,
+                       int64_t& H_out, int64_t& W_out) {
+    if (!needPositive(label, {kH, kW, sH, sW, dH, dW, groups})) return false;
+    if (!needNonNegative(label, {C_in, C_out, H, W, pH, pW})) return false;
+    if (C_in % groups != 0 || C_out % groups != 0) {
+        setError(std::string(label) + ": groups must divide C_in and C_out");
+        return false;
+    }
+    const int64_t spanH = H + 2 * pH - dH * (kH - 1) - 1;
+    const int64_t spanW = W + 2 * pW - dW * (kW - 1) - 1;
+    H_out = spanH < 0 ? 0 : spanH / sH + 1;
+    W_out = spanW < 0 ? 0 : spanW / sW + 1;
+    return true;
+}
+
+// One operand of a multi-tensor op: `t` must hold `n` elements. A null `t`
+// is an absent optional operand and passes (need() has already rejected a
+// missing required one).
+struct Operand {
+    const char* name;
+    const brotensor::Tensor* t;
+    int64_t n;
+};
+
+// Every operand holds its element count and, when `ref` is given, carries
+// ref's dtype.
+inline bool needOperands(const char* label, const brotensor::Tensor* ref,
+                         std::initializer_list<Operand> ops) {
+    for (const Operand& o : ops) {
+        if (!o.t) continue;
+        if (!needElems(label, o.name, o.t, o.n)) return false;
+        if (ref && !needSameDtype(label, o.name, o.t, ref)) return false;
+    }
+    return true;
+}
+
+// The ops' `const float* d_mask` operands (and the FP32 bias tables): an
+// optional FP32 tensor of at least `n` elements.
+inline bool needMask(const char* label, const brotensor::Tensor* mt, int64_t n, const char* name = "mask") {
+    if (!mt) return true;
+    if (!needElems(label, name, mt, n)) return false;
+    if (mt->dtype != brotensor::Dtype::FP32) {
+        setError(std::string(label) + ": " + name + " must be FP32");
+        return false;
+    }
+    return true;
+}
+
+// numHeads is positive and divides D.
+inline bool needHeads(const char* label, int64_t D, int64_t numHeads) {
+    if (!needPositive(label, {numHeads})) return false;
+    if (D % numHeads != 0) {
+        setError(std::string(label) + ": numHeads (" + std::to_string(numHeads) + ") must divide D (" +
+                 std::to_string(D) + ")");
+        return false;
+    }
+    return true;
+}
+
 // Path resolution for the file loaders (api.h setPathResolver).
 std::string resolvePath(const std::string& path);
 
