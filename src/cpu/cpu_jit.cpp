@@ -143,8 +143,6 @@ using namespace brass::codegen;
 struct JitKernels {
     bool available = false;
 
-    FusedSwiGLUFn swiglu_fn = nullptr;
-
     using AdaLNModulateFn = void (*)(const float* x, const float* scale, const float* shift, float* out, uint64_t n);
     AdaLNModulateFn adaln_fn = nullptr;
 
@@ -698,14 +696,9 @@ static const JitKernels& get_kernels() {
             opts.unroll_factor = 4;
             opts.enable_fp_reassociation = true;
 
-            KernelJit ml_jit(opts);
-            MlFusionCompiler ml_compiler(std::move(ml_jit));
             KernelJit jit(opts);
 
-            // 1. SwiGLU
-            KernelFunction k_swiglu = ml_compiler.compile_swiglu();
-            kernels.swiglu_fn = k_swiglu.as<FusedSwiGLUFn>();
-            kernels.engines.push_back(k_swiglu.engine());
+            // (1. SwiGLU runs the reference loop; see swiglu_forward below.)
 
             // 2. Vectorized AdaLN Modulate
             KernelFunction k_adaln = build_adaln_modulate(jit);
@@ -727,8 +720,7 @@ static const JitKernels& get_kernels() {
             kernels.layernorm_row_fn = k_ln.as<JitKernels::LayerNormRowFn>();
             kernels.engines.push_back(k_ln.engine());
 
-            kernels.available = (kernels.swiglu_fn != nullptr &&
-                                 kernels.adaln_fn != nullptr &&
+            kernels.available = (kernels.adaln_fn != nullptr &&
                                  kernels.broadcast_mul_fn != nullptr &&
                                  kernels.rms_norm_row_fn != nullptr &&
                                  kernels.layernorm_row_fn != nullptr);
@@ -773,29 +765,15 @@ void rms_norm_forward(const float* X, const float* gamma, float eps, float* Y, i
     }
 }
 
+// SwiGLU has no JIT kernel. brass's MlFusionCompiler::compile_swiglu evaluates
+// exp(-g) as a degree-5 Taylor polynomial of -g/16 raised to the 16th power;
+// the polynomial turns negative once -g/16 passes about -3.5, so every gate
+// above ~55 came out with silu(g) ~ 0 instead of g, and ViT-H SwiGLU FFNs
+// (DINOv3) put gates well past that. A JIT kernel calling the exact expf per
+// element measured ~4x slower than this loop (MSVC vectorizes std::exp), so
+// the row-parallel reference is the kernel.
 void swiglu_forward(const float* X, float* Y, int B, int D) {
-    const auto& k = get_kernels();
-    if (!k.available || k.swiglu_fn == nullptr) {
-        ref::swiglu(X, Y, B, D);
-        return;
-    }
-
-    if (B > 1 && static_cast<int64_t>(B) * D >= 16384) {
-        detail::cpu::parallel_for(static_cast<std::size_t>(B), [&](std::size_t bi) {
-            const int b = static_cast<int>(bi);
-            const float* gate = X + static_cast<std::size_t>(b) * 2 * D;
-            const float* up   = gate + D;
-            float* out        = Y + static_cast<std::size_t>(b) * D;
-            k.swiglu_fn(gate, up, out, static_cast<uint64_t>(D));
-        });
-    } else {
-        for (int b = 0; b < B; ++b) {
-            const float* gate = X + static_cast<std::size_t>(b) * 2 * D;
-            const float* up   = gate + D;
-            float* out        = Y + static_cast<std::size_t>(b) * D;
-            k.swiglu_fn(gate, up, out, static_cast<uint64_t>(D));
-        }
-    }
+    ref::swiglu(X, Y, B, D);
 }
 
 void modulate(const float* X, const float* scale, const float* shift, float* Y, int L, int D) {
