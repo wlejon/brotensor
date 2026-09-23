@@ -17,6 +17,7 @@
 
 #include "detail/activations.cuh"
 #include "detail/cuda_check.h"
+#include "detail/smem_opt_in.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -314,12 +315,8 @@ void run(const T* A, const T* W, T* C, int M, int N, int K, const T* bias, int a
          int splits, int kps, cudaStream_t stream) {
     constexpr int smem = STAGES * (BM + BN) * BK * static_cast<int>(sizeof(T));
     if constexpr (smem > 48 * 1024) {
-        static bool opted_in = false;  // per process; the attribute is per function
-        if (!opted_in) {
-            BROTENSOR_CUDA_CHECK(cudaFuncSetAttribute(gemm_kernel<T, MODE, BM, BN, WARPS_M, WARPS_N, STAGES, MIN_CTAS>,
-                                                      cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-            opted_in = true;
-        }
+        static std::atomic<std::uint32_t> opted_in{0};  // per device: the attribute is per context
+        opt_in_dynamic_smem(gemm_kernel<T, MODE, BM, BN, WARPS_M, WARPS_N, STAGES, MIN_CTAS>, smem, opted_in);
     }
     const dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, splits);
     gemm_kernel<T, MODE, BM, BN, WARPS_M, WARPS_N, STAGES, MIN_CTAS>

@@ -51,6 +51,7 @@
 
 #include "flash_fused_internal.cuh"
 #include "detail/cuda_check.h"
+#include "detail/smem_opt_in.cuh"
 
 #include <mma.h>
 
@@ -441,14 +442,9 @@ void launch_impl(const T* Q, const T* K, const T* V, const float* mask, T* O,
                  int Lq, int Lk, int D, int num_heads, cudaStream_t stream) {
     constexpr int NTHREADS = (BR / 16) * 32;
     const size_t shmem = smem_bytes_host<T, HD, BR, BC>();
-    static bool attr_set = false;   // one-time opt-in past the 48KB default
-    if (!attr_set) {
-        BROTENSOR_CUDA_CHECK(cudaFuncSetAttribute(
-            flash_fused_kernel<T, HD, BR, BC, CAUSAL>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(shmem)));
-        attr_set = true;
-    }
+    static std::atomic<std::uint32_t> attr_set{0};  // opt-in past the 48KB default, per device
+    ::brotensor::detail::cuda::opt_in_dynamic_smem(flash_fused_kernel<T, HD, BR, BC, CAUSAL>,
+                                                   static_cast<int>(shmem), attr_set);
     // log2(e) is folded into the score scale so the kernel's softmax can be
     // exp2 rather than exp. exp2(x*log2e) == exp(x) exactly in the algebra;
     // the running max is scaled by the same constant, so every comparison and
