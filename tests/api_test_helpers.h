@@ -41,3 +41,5 @@ int run_api_audio_tests();
 int run_api_conv_tests();
 int run_api_int8_tests();
 int run_api_misc_tests();
+int run_api_extra_tests();
+int run_api_bounds_tests();

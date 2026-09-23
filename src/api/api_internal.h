@@ -5,8 +5,10 @@
 #include "brotensor/runtime.h"
 #include "embed/embed.h"
 
+#include <cstdint>
 #include <cstring>
 #include <exception>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -103,6 +105,78 @@ inline bool need(const char* label, std::initializer_list<const void*> ptrs) {
         }
     }
     return true;
+}
+
+// ---- input-size contract ---------------------------------------------------
+//
+// brotensor ops trust their caller's explicit dims: conv2d_forward reads
+// N*C_in*H*W elements of X because the caller said so, whatever X holds, and
+// an elementwise backward reads dY.size() == x.size() elements without
+// checking. From C++ that is the library's contract; from JS it is an
+// out-of-bounds read (or write) on the host or the device. So every native
+// that hands brotensor a dim or a second operand checks the operand first.
+//
+// Outputs are exempt: the ops resize them.
+
+// `t` holds at least `n` elements. `n` is computed in 64 bits by the caller
+// (dims multiply past INT_MAX easily); a negative `n` means a negative dim.
+inline bool needElems(const char* label, const char* name,
+                      const brotensor::Tensor* t, int64_t n) {
+    if (!t) {
+        setError(std::string(label) + ": " + name + " must be a GpuTensor");
+        return false;
+    }
+    if (n < 0) {
+        setError(std::string(label) + ": negative dimension for " + name);
+        return false;
+    }
+    if (static_cast<int64_t>(t->size()) < n || (n > 0 && t->data == nullptr)) {
+        setError(std::string(label) + ": " + name + " holds " + std::to_string(t->size()) +
+                 " elements, the dims need " + std::to_string(n));
+        return false;
+    }
+    return true;
+}
+
+// `t` has exactly `ref`'s element count (the elementwise-pair case).
+inline bool needSameSize(const char* label, const char* name,
+                         const brotensor::Tensor* t, const brotensor::Tensor* ref) {
+    if (!t || !ref) {
+        setError(std::string(label) + ": " + name + " must be a GpuTensor");
+        return false;
+    }
+    if (t->size() != ref->size()) {
+        setError(std::string(label) + ": " + name + " has " + std::to_string(t->size()) +
+                 " elements, expected " + std::to_string(ref->size()));
+        return false;
+    }
+    return true;
+}
+
+// `t` carries `ref`'s dtype (a kernel dispatches on one operand's dtype and
+// reads the others with that element size).
+inline bool needSameDtype(const char* label, const char* name,
+                          const brotensor::Tensor* t, const brotensor::Tensor* ref) {
+    if (!t || !ref) {
+        setError(std::string(label) + ": " + name + " must be a GpuTensor");
+        return false;
+    }
+    if (t->dtype != ref->dtype) {
+        setError(std::string(label) + ": " + name + " is " + dtypeToString(t->dtype) +
+                 ", expected " + dtypeToString(ref->dtype));
+        return false;
+    }
+    return true;
+}
+
+// Product of dims in 64 bits; negative when any dim is negative.
+inline int64_t elems(std::initializer_list<int64_t> dims) {
+    int64_t n = 1;
+    for (int64_t d : dims) {
+        if (d < 0) return -1;
+        n *= d;
+    }
+    return n;
 }
 
 // Path resolution for the file loaders (api.h setPathResolver).

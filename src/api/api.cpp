@@ -7,6 +7,7 @@
 #include "native_tensor_conv_decl.h"
 #include "native_tensor_int8_decl.h"
 #include "native_tensor_misc_decl.h"
+#include "native_tensor_extra_decl.h"
 
 #include <initializer_list>
 #include <string>
@@ -19,6 +20,7 @@ extern "C" void bronze_tensor_audio_main(void);
 extern "C" void bronze_tensor_conv_main(void);
 extern "C" void bronze_tensor_int8_main(void);
 extern "C" void bronze_tensor_misc_main(void);
+extern "C" void bronze_tensor_extra_main(void);
 
 namespace brotensor::api {
 
@@ -256,7 +258,8 @@ bool registerTensorNatives(std::string* error) {
         registerTensorNatives_audio(error) &&
         registerTensorNatives_conv(error) &&
         registerTensorNatives_int8(error) &&
-        registerTensorNatives_misc(error);
+        registerTensorNatives_misc(error) &&
+        registerTensorNatives_extra(error);
 
     if (!ok) return false;
     publishPrototype("tensor", kTensorCls, "GpuTensorProto");
@@ -278,6 +281,7 @@ void installTensorJS() {
     ev::runEntry(bronze_tensor_conv_main);
     ev::runEntry(bronze_tensor_int8_main);
     ev::runEntry(bronze_tensor_misc_main);
+    ev::runEntry(bronze_tensor_extra_main);
 }
 
 void installTensor() {

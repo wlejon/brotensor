@@ -17,6 +17,7 @@ set(BROTENSOR_API_NATIVE_SOURCES
     native_tensor_conv.cpp
     native_tensor_int8.cpp
     native_tensor_misc.cpp
+    native_tensor_extra.cpp
 )
 
 if(NOT BRASS_HOST_BACKEND)
@@ -77,10 +78,11 @@ else()
     # (decomposed rel-pos, varlen flash, gated delta rule, mrope), the audio /
     # 1-D / spectral family, the 2-D conv + pooling + batch-norm family, the
     # GGUF-quant + INT8-W8A16 family and the l2/bce/diffusion-sampler
-    # leftovers. Split so each file stays readable; they all read the same host
+    # leftovers, and last the ops that never had a binding (js/tensor_extra.js).
+    # Split so each file stays readable; they all read the same host
     # globals and the same native manifest.
     set(BROTENSOR_COMPILED_JS_OBJECTS "")
-    foreach(module tensor tensor_ext tensor_batched tensor_attn2 tensor_audio tensor_conv tensor_int8 tensor_misc)
+    foreach(module tensor tensor_ext tensor_batched tensor_attn2 tensor_audio tensor_conv tensor_int8 tensor_misc tensor_extra)
         set(INPUT "${CMAKE_CURRENT_SOURCE_DIR}/js/${module}.js")
         set(OUTPUT "${GEN_DIR}/${module}.o")
         add_custom_command(

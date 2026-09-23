@@ -8,4 +8,5 @@ void bronze_tensor_audio_main() {}
 void bronze_tensor_conv_main() {}
 void bronze_tensor_int8_main() {}
 void bronze_tensor_misc_main() {}
+void bronze_tensor_extra_main() {}
 }
