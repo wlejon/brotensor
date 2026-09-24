@@ -55,6 +55,11 @@ extern "C" void brotensor_probe_and_register_metal() {
     OpsVTable ops{};   // zero-init: every slot starts as nullptr
 
     ops.adam_step                                   = &dm::adam_step;
+    ops.flash_attention_packed_qkv_backward         = &dm::flash_attention_packed_qkv_backward;
+    ops.flash_attention_packed_qkv_forward          = &dm::flash_attention_packed_qkv_forward;
+    ops.linear_forward_batched_ex                   = &dm::linear_forward_batched_ex;
+    ops.rope_qkv_packed_inplace                     = &dm::rope_qkv_packed_inplace;
+    ops.segment_softmax_stats                       = &dm::segment_softmax_stats;
     ops.adaptive_avg_pool2d_backward                = &dm::adaptive_avg_pool2d_backward;
     ops.batch_norm_backward                         = &dm::batch_norm_backward;
     ops.batch_norm_forward                          = &dm::batch_norm_forward;

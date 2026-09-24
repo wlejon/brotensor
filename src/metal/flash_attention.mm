@@ -1,6 +1,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/detail/op_table.h>
 
+#include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
@@ -21,8 +23,6 @@ using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
 using metal_impl::pool_lookup;
 using metal_impl::pool_lookup_offset;
-using metal_impl::launch_matmul_abt_bf16;
-using metal_impl::launch_matmul_abt_fp16;
 
 namespace {
 
@@ -164,40 +164,10 @@ kernel void k_flash_attention(
     }
 }
 
-// ---- Per-head extract / pack-back kernels (mirror cuda flash_attention) ----
+// ---- Per-head V transpose for the fallback's P @ V GEMM ----
 //
-// X is (L, D) with D = num_heads * head_dim. The matmul fast path wants a
-// contiguous (L, head_dim) view per head.
-
-kernel void k_extract_head_LD(
-        device const half* X   [[buffer(0)]],     // (L, D)
-        device half*       Y   [[buffer(1)]],     // (L, head_dim)
-        constant uint& L         [[buffer(2)]],
-        constant uint& D         [[buffer(3)]],
-        constant uint& head_off  [[buffer(4)]],
-        constant uint& head_dim  [[buffer(5)]],
-        uint gid [[thread_position_in_grid]]) {
-    uint total = L * head_dim;
-    if (gid >= total) return;
-    uint l = gid / head_dim;
-    uint d = gid % head_dim;
-    Y[l * head_dim + d] = X[l * D + head_off + d];
-}
-
-kernel void k_extract_head_LD_bf16(
-        device const bfloat* X   [[buffer(0)]],   // (L, D)
-        device bfloat*       Y   [[buffer(1)]],   // (L, head_dim)
-        constant uint& L         [[buffer(2)]],
-        constant uint& D         [[buffer(3)]],
-        constant uint& head_off  [[buffer(4)]],
-        constant uint& head_dim  [[buffer(5)]],
-        uint gid [[thread_position_in_grid]]) {
-    uint total = L * head_dim;
-    if (gid >= total) return;
-    uint l = gid / head_dim;
-    uint d = gid % head_dim;
-    Y[l * head_dim + d] = X[l * D + head_off + d];
-}
+// X is (L, D) with D = num_heads * head_dim. The GEMMs read Q / K / O's head
+// columns in place; only V is copied, transposed, so P @ V is an A @ B^T.
 
 // Extract a single head and TRANSPOSE: Y is (head_dim, L) with element
 // (d, l) = X[l, head_off + d]. Feeds the second matmul as B-operand.
@@ -229,493 +199,6 @@ kernel void k_extract_head_DL_bf16(
     uint l = gid / head_dim;
     uint d = gid % head_dim;
     Y[d * L + l] = X[l * D + head_off + d];
-}
-
-// Inverse of extract_head_LD: write per-head (Lq, head_dim) back into the
-// (Lq, D) output at column slot [head_off, head_off+head_dim).
-kernel void k_pack_head_LD(
-        device const half* Yh  [[buffer(0)]],     // (L, head_dim)
-        device half*       Out [[buffer(1)]],     // (L, D)
-        constant uint& L         [[buffer(2)]],
-        constant uint& D         [[buffer(3)]],
-        constant uint& head_off  [[buffer(4)]],
-        constant uint& head_dim  [[buffer(5)]],
-        uint gid [[thread_position_in_grid]]) {
-    uint total = L * head_dim;
-    if (gid >= total) return;
-    uint l = gid / head_dim;
-    uint d = gid % head_dim;
-    Out[l * D + head_off + d] = Yh[l * head_dim + d];
-}
-
-kernel void k_pack_head_LD_bf16(
-        device const bfloat* Yh  [[buffer(0)]],   // (L, head_dim)
-        device bfloat*       Out [[buffer(1)]],   // (L, D)
-        constant uint& L         [[buffer(2)]],
-        constant uint& D         [[buffer(3)]],
-        constant uint& head_off  [[buffer(4)]],
-        constant uint& head_dim  [[buffer(5)]],
-        uint gid [[thread_position_in_grid]]) {
-    uint total = L * head_dim;
-    if (gid >= total) return;
-    uint l = gid / head_dim;
-    uint d = gid % head_dim;
-    Out[l * D + head_off + d] = Yh[l * head_dim + d];
-}
-
-// Causal-aware row-wise softmax: same as k_scale_mask_softmax_rows but with
-// an extra "k > q -> -inf" clause when causal != 0. Used by the bwd recompute.
-kernel void k_scale_mask_causal_softmax_rows(
-        device half*       S    [[buffer(0)]],    // (Lq, Lk)
-        device const float* mask [[buffer(1)]],    // (Lk,) may be dummy
-        constant uint& Lq        [[buffer(2)]],
-        constant uint& Lk        [[buffer(3)]],
-        constant float& scale    [[buffer(4)]],
-        constant uint& has_mask  [[buffer(5)]],
-        constant uint& causal    [[buffer(6)]],
-        threadgroup float* ssm   [[threadgroup(0)]],
-        uint3 gid  [[threadgroup_position_in_grid]],
-        uint3 tid3 [[thread_position_in_threadgroup]],
-        uint3 tgs3 [[threads_per_threadgroup]]) {
-    uint q = gid.x;
-    uint tid = tid3.x;
-    uint tg = tgs3.x;
-    device half* row = S + (ulong)q * (ulong)Lk;
-
-    float local_max = -1e30f;
-    for (uint k = tid; k < Lk; k += tg) {
-        float v = float(row[k]) * scale;
-        if (has_mask != 0u && mask[k] <= 0.5f) v = -1e30f;
-        if (causal != 0u && k > q) v = -1e30f;
-        if (v > local_max) local_max = v;
-    }
-    ssm[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg / 2; s > 0; s >>= 1) {
-        if (tid < s) { float o = ssm[tid + s]; if (o > ssm[tid]) ssm[tid] = o; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rmax = ssm[0];
-    bool empty = (rmax <= -1e29f);
-
-    float local_sum = 0.0f;
-    for (uint k = tid; k < Lk; k += tg) {
-        float v = float(row[k]) * scale;
-        if (has_mask != 0u && mask[k] <= 0.5f) v = -1e30f;
-        if (causal != 0u && k > q) v = -1e30f;
-        float e = empty ? 0.0f : exp(v - rmax);
-        row[k] = half(e);
-        local_sum += e;
-    }
-    ssm[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rsum = ssm[0];
-    float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
-    for (uint k = tid; k < Lk; k += tg) {
-        float e = float(row[k]);
-        row[k] = half(e * inv);
-    }
-}
-
-kernel void k_scale_mask_causal_softmax_rows_bf16(
-        device bfloat*     S    [[buffer(0)]],    // (Lq, Lk)
-        device const float* mask [[buffer(1)]],    // (Lk,) may be dummy
-        constant uint& Lq        [[buffer(2)]],
-        constant uint& Lk        [[buffer(3)]],
-        constant float& scale    [[buffer(4)]],
-        constant uint& has_mask  [[buffer(5)]],
-        constant uint& causal    [[buffer(6)]],
-        threadgroup float* ssm   [[threadgroup(0)]],
-        uint3 gid  [[threadgroup_position_in_grid]],
-        uint3 tid3 [[thread_position_in_threadgroup]],
-        uint3 tgs3 [[threads_per_threadgroup]]) {
-    uint q = gid.x;
-    uint tid = tid3.x;
-    uint tg = tgs3.x;
-    device bfloat* row = S + (ulong)q * (ulong)Lk;
-
-    float local_max = -1e30f;
-    for (uint k = tid; k < Lk; k += tg) {
-        float v = float(row[k]) * scale;
-        if (has_mask != 0u && mask[k] <= 0.5f) v = -1e30f;
-        if (causal != 0u && k > q) v = -1e30f;
-        if (v > local_max) local_max = v;
-    }
-    ssm[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg / 2; s > 0; s >>= 1) {
-        if (tid < s) { float o = ssm[tid + s]; if (o > ssm[tid]) ssm[tid] = o; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rmax = ssm[0];
-    bool empty = (rmax <= -1e29f);
-
-    float local_sum = 0.0f;
-    for (uint k = tid; k < Lk; k += tg) {
-        float v = float(row[k]) * scale;
-        if (has_mask != 0u && mask[k] <= 0.5f) v = -1e30f;
-        if (causal != 0u && k > q) v = -1e30f;
-        float e = empty ? 0.0f : exp(v - rmax);
-        row[k] = bfloat(e);
-        local_sum += e;
-    }
-    ssm[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rsum = ssm[0];
-    float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
-    for (uint k = tid; k < Lk; k += tg) {
-        float e = float(row[k]);
-        row[k] = bfloat(e * inv);
-    }
-}
-
-// dP[q,k] = sum_d dOh[q,d] * Vh[k,d]    (Lq, Lk)
-kernel void k_fa_dP(
-        device const half* dOh [[buffer(0)]],   // (Lq, hd)
-        device const half* Vh  [[buffer(1)]],   // (Lk, hd)
-        device half*       dP  [[buffer(2)]],   // (Lq, Lk)
-        constant uint& Lq      [[buffer(3)]],
-        constant uint& Lk      [[buffer(4)]],
-        constant uint& hd      [[buffer(5)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    uint k = gid.x;
-    uint q = gid.y;
-    if (q >= Lq || k >= Lk) return;
-    float acc = 0.0f;
-    for (uint d = 0; d < hd; ++d) {
-        acc += float(dOh[q * hd + d]) * float(Vh[k * hd + d]);
-    }
-    dP[q * Lk + k] = half(acc);
-}
-
-kernel void k_fa_dP_bf16(
-        device const bfloat* dOh [[buffer(0)]],   // (Lq, hd)
-        device const bfloat* Vh  [[buffer(1)]],   // (Lk, hd)
-        device bfloat*       dP  [[buffer(2)]],   // (Lq, Lk)
-        constant uint& Lq        [[buffer(3)]],
-        constant uint& Lk        [[buffer(4)]],
-        constant uint& hd        [[buffer(5)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    uint k = gid.x;
-    uint q = gid.y;
-    if (q >= Lq || k >= Lk) return;
-    float acc = 0.0f;
-    for (uint d = 0; d < hd; ++d) {
-        acc += float(dOh[q * hd + d]) * float(Vh[k * hd + d]);
-    }
-    dP[q * Lk + k] = bfloat(acc);
-}
-
-// In-place dS over P: dS[q,k] = P[q,k] * (dP[q,k] - D_q) * scale
-// where D_q = sum_k P[q,k]*dP[q,k]. One threadgroup per query row.
-kernel void k_fa_dS_from_P_dP(
-        device half*       P_dS [[buffer(0)]],   // (Lq, Lk) in-place
-        device const half* dP   [[buffer(1)]],   // (Lq, Lk)
-        constant uint& Lq       [[buffer(2)]],
-        constant uint& Lk       [[buffer(3)]],
-        constant float& scale   [[buffer(4)]],
-        threadgroup float* ssm  [[threadgroup(0)]],
-        uint3 gid  [[threadgroup_position_in_grid]],
-        uint3 tid3 [[thread_position_in_threadgroup]],
-        uint3 tgs3 [[threads_per_threadgroup]]) {
-    uint q = gid.x;
-    uint tid = tid3.x;
-    uint tg = tgs3.x;
-    device half* prow = P_dS + (ulong)q * (ulong)Lk;
-    device const half* dprow = dP + (ulong)q * (ulong)Lk;
-
-    float local = 0.0f;
-    for (uint k = tid; k < Lk; k += tg) {
-        local += float(prow[k]) * float(dprow[k]);
-    }
-    ssm[tid] = local;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float Dq = ssm[0];
-    for (uint k = tid; k < Lk; k += tg) {
-        float p  = float(prow[k]);
-        float dp = float(dprow[k]);
-        prow[k] = half(p * (dp - Dq) * scale);
-    }
-}
-
-kernel void k_fa_dS_from_P_dP_bf16(
-        device bfloat*       P_dS [[buffer(0)]],   // (Lq, Lk) in-place
-        device const bfloat* dP   [[buffer(1)]],   // (Lq, Lk)
-        constant uint& Lq         [[buffer(2)]],
-        constant uint& Lk         [[buffer(3)]],
-        constant float& scale     [[buffer(4)]],
-        threadgroup float* ssm    [[threadgroup(0)]],
-        uint3 gid  [[threadgroup_position_in_grid]],
-        uint3 tid3 [[thread_position_in_threadgroup]],
-        uint3 tgs3 [[threads_per_threadgroup]]) {
-    uint q = gid.x;
-    uint tid = tid3.x;
-    uint tg = tgs3.x;
-    device bfloat* prow = P_dS + (ulong)q * (ulong)Lk;
-    device const bfloat* dprow = dP + (ulong)q * (ulong)Lk;
-
-    float local = 0.0f;
-    for (uint k = tid; k < Lk; k += tg) {
-        local += float(prow[k]) * float(dprow[k]);
-    }
-    ssm[tid] = local;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float Dq = ssm[0];
-    for (uint k = tid; k < Lk; k += tg) {
-        float p  = float(prow[k]);
-        float dp = float(dprow[k]);
-        prow[k] = bfloat(p * (dp - Dq) * scale);
-    }
-}
-
-// dVh[k,d] = sum_q P[q,k] * dOh[q,d]   (Lk, hd) (overwrite)
-kernel void k_fa_dVh(
-        device const half* P   [[buffer(0)]],   // (Lq, Lk)
-        device const half* dOh [[buffer(1)]],   // (Lq, hd)
-        device half*       dVh [[buffer(2)]],   // (Lk, hd)
-        constant uint& Lq      [[buffer(3)]],
-        constant uint& Lk      [[buffer(4)]],
-        constant uint& hd      [[buffer(5)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    uint d = gid.x;
-    uint k = gid.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (uint q = 0; q < Lq; ++q) {
-        acc += float(P[q * Lk + k]) * float(dOh[q * hd + d]);
-    }
-    dVh[k * hd + d] = half(acc);
-}
-
-kernel void k_fa_dVh_bf16(
-        device const bfloat* P   [[buffer(0)]],   // (Lq, Lk)
-        device const bfloat* dOh [[buffer(1)]],   // (Lq, hd)
-        device bfloat*       dVh [[buffer(2)]],   // (Lk, hd)
-        constant uint& Lq        [[buffer(3)]],
-        constant uint& Lk        [[buffer(4)]],
-        constant uint& hd        [[buffer(5)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    uint d = gid.x;
-    uint k = gid.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (uint q = 0; q < Lq; ++q) {
-        acc += float(P[q * Lk + k]) * float(dOh[q * hd + d]);
-    }
-    dVh[k * hd + d] = bfloat(acc);
-}
-
-// dQh[q,d] = sum_k dS[q,k] * Kh[k,d]
-kernel void k_fa_dQh(
-        device const half* dS  [[buffer(0)]],   // (Lq, Lk)
-        device const half* Kh  [[buffer(1)]],   // (Lk, hd)
-        device half*       dQh [[buffer(2)]],   // (Lq, hd)
-        constant uint& Lq      [[buffer(3)]],
-        constant uint& Lk      [[buffer(4)]],
-        constant uint& hd      [[buffer(5)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    uint d = gid.x;
-    uint q = gid.y;
-    if (q >= Lq || d >= hd) return;
-    float acc = 0.0f;
-    for (uint k = 0; k < Lk; ++k) {
-        acc += float(dS[q * Lk + k]) * float(Kh[k * hd + d]);
-    }
-    dQh[q * hd + d] = half(acc);
-}
-
-kernel void k_fa_dQh_bf16(
-        device const bfloat* dS  [[buffer(0)]],   // (Lq, Lk)
-        device const bfloat* Kh  [[buffer(1)]],   // (Lk, hd)
-        device bfloat*       dQh [[buffer(2)]],   // (Lq, hd)
-        constant uint& Lq        [[buffer(3)]],
-        constant uint& Lk        [[buffer(4)]],
-        constant uint& hd        [[buffer(5)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    uint d = gid.x;
-    uint q = gid.y;
-    if (q >= Lq || d >= hd) return;
-    float acc = 0.0f;
-    for (uint k = 0; k < Lk; ++k) {
-        acc += float(dS[q * Lk + k]) * float(Kh[k * hd + d]);
-    }
-    dQh[q * hd + d] = bfloat(acc);
-}
-
-// dKh[k,d] = sum_q dS[q,k] * Qh[q,d]
-kernel void k_fa_dKh(
-        device const half* dS  [[buffer(0)]],   // (Lq, Lk)
-        device const half* Qh  [[buffer(1)]],   // (Lq, hd)
-        device half*       dKh [[buffer(2)]],   // (Lk, hd)
-        constant uint& Lq      [[buffer(3)]],
-        constant uint& Lk      [[buffer(4)]],
-        constant uint& hd      [[buffer(5)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    uint d = gid.x;
-    uint k = gid.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (uint q = 0; q < Lq; ++q) {
-        acc += float(dS[q * Lk + k]) * float(Qh[q * hd + d]);
-    }
-    dKh[k * hd + d] = half(acc);
-}
-
-kernel void k_fa_dKh_bf16(
-        device const bfloat* dS  [[buffer(0)]],   // (Lq, Lk)
-        device const bfloat* Qh  [[buffer(1)]],   // (Lq, hd)
-        device bfloat*       dKh [[buffer(2)]],   // (Lk, hd)
-        constant uint& Lq        [[buffer(3)]],
-        constant uint& Lk        [[buffer(4)]],
-        constant uint& hd        [[buffer(5)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    uint d = gid.x;
-    uint k = gid.y;
-    if (k >= Lk || d >= hd) return;
-    float acc = 0.0f;
-    for (uint q = 0; q < Lq; ++q) {
-        acc += float(dS[q * Lk + k]) * float(Qh[q * hd + d]);
-    }
-    dKh[k * hd + d] = bfloat(acc);
-}
-
-// Row-wise softmax over S(Lq, Lk) with scalar scale (1/sqrt(head_dim)) and
-// optional Lk-shaped float mask (positions with mask[k] <= 0.5 -> -inf).
-// One threadgroup per query row; threadgroup size chosen by host.
-kernel void k_scale_mask_softmax_rows(
-        device half*       S    [[buffer(0)]],    // (Lq, Lk)
-        device const float* mask [[buffer(1)]],    // (Lk,) may be dummy
-        constant uint& Lq        [[buffer(2)]],
-        constant uint& Lk        [[buffer(3)]],
-        constant float& scale    [[buffer(4)]],
-        constant uint& has_mask  [[buffer(5)]],
-        threadgroup float* ssm   [[threadgroup(0)]],   // size = tg_size
-        uint3 gid  [[threadgroup_position_in_grid]],
-        uint3 tid3 [[thread_position_in_threadgroup]],
-        uint3 tgs3 [[threads_per_threadgroup]]) {
-    uint q = gid.x;
-    uint tid = tid3.x;
-    uint tg = tgs3.x;
-    device half* row = S + (ulong)q * (ulong)Lk;
-
-    // 1. row max with scale and mask applied.
-    float local_max = -1e30f;
-    for (uint k = tid; k < Lk; k += tg) {
-        float v = float(row[k]) * scale;
-        if (has_mask != 0u && mask[k] <= 0.5f) v = -1e30f;
-        if (v > local_max) local_max = v;
-    }
-    ssm[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            float o = ssm[tid + s];
-            if (o > ssm[tid]) ssm[tid] = o;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rmax = ssm[0];
-    bool empty = (rmax <= -1e29f);
-
-    // 2. exponentiate, accumulate sum, write back exp(v - rmax).
-    float local_sum = 0.0f;
-    for (uint k = tid; k < Lk; k += tg) {
-        float v = float(row[k]) * scale;
-        if (has_mask != 0u && mask[k] <= 0.5f) v = -1e30f;
-        float e = empty ? 0.0f : exp(v - rmax);
-        row[k] = half(e);
-        local_sum += e;
-    }
-    ssm[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rsum = ssm[0];
-    float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
-
-    // 3. normalise.
-    for (uint k = tid; k < Lk; k += tg) {
-        float e = float(row[k]);
-        row[k] = half(e * inv);
-    }
-}
-
-kernel void k_scale_mask_softmax_rows_bf16(
-        device bfloat*     S    [[buffer(0)]],    // (Lq, Lk)
-        device const float* mask [[buffer(1)]],    // (Lk,) may be dummy
-        constant uint& Lq        [[buffer(2)]],
-        constant uint& Lk        [[buffer(3)]],
-        constant float& scale    [[buffer(4)]],
-        constant uint& has_mask  [[buffer(5)]],
-        threadgroup float* ssm   [[threadgroup(0)]],   // size = tg_size
-        uint3 gid  [[threadgroup_position_in_grid]],
-        uint3 tid3 [[thread_position_in_threadgroup]],
-        uint3 tgs3 [[threads_per_threadgroup]]) {
-    uint q = gid.x;
-    uint tid = tid3.x;
-    uint tg = tgs3.x;
-    device bfloat* row = S + (ulong)q * (ulong)Lk;
-
-    // 1. row max with scale and mask applied.
-    float local_max = -1e30f;
-    for (uint k = tid; k < Lk; k += tg) {
-        float v = float(row[k]) * scale;
-        if (has_mask != 0u && mask[k] <= 0.5f) v = -1e30f;
-        if (v > local_max) local_max = v;
-    }
-    ssm[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            float o = ssm[tid + s];
-            if (o > ssm[tid]) ssm[tid] = o;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rmax = ssm[0];
-    bool empty = (rmax <= -1e29f);
-
-    // 2. exponentiate, accumulate sum, write back exp(v - rmax).
-    float local_sum = 0.0f;
-    for (uint k = tid; k < Lk; k += tg) {
-        float v = float(row[k]) * scale;
-        if (has_mask != 0u && mask[k] <= 0.5f) v = -1e30f;
-        float e = empty ? 0.0f : exp(v - rmax);
-        row[k] = bfloat(e);
-        local_sum += e;
-    }
-    ssm[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg / 2; s > 0; s >>= 1) {
-        if (tid < s) ssm[tid] += ssm[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rsum = ssm[0];
-    float inv = (rsum > 0.0f) ? (1.0f / rsum) : 0.0f;
-
-    // 3. normalise.
-    for (uint k = tid; k < Lk; k += tg) {
-        float e = float(row[k]);
-        row[k] = bfloat(e * inv);
-    }
 }
 
 // BF16 online-softmax flash-attention kernel. Verbatim copy of
@@ -837,17 +320,6 @@ kernel void k_flash_attention_bf16(
         Out[q * D + head_off + d] = bfloat(partial[slot] * inv);
         ++slot;
     }
-}
-
-// BF16 row-broadcast bias add: Y[b, j] += bias[j]. One thread per element.
-kernel void k_fa_linear_bias_add_bf16(device bfloat*       Y    [[buffer(0)]],
-                                      device const bfloat* bias [[buffer(1)]],
-                                      constant uint& B          [[buffer(2)]],
-                                      constant uint& out_dim    [[buffer(3)]],
-                                      uint i [[thread_position_in_grid]]) {
-    if (i >= B * out_dim) return;
-    uint j = i % out_dim;
-    Y[i] = bfloat(float(Y[i]) + float(bias[j]));
 }
 
 // Packed variable-length flash attention (Qwen3-VL window attention). One
@@ -1232,7 +704,73 @@ kernel void k_flash_attention_varlen_fp32(
         ++slot;
     }
 }
+
+// Row softmax over FP32 scores S (rows, Lk) — the per-head fallback's scores
+// come out of the GEMM in FP32, so every exp() sees an exact score and only
+// the normalised probability is narrowed, once, for the P @ V GEMM. Scores
+// are scaled by `scale`; with a mask, key k is dropped where mask[k] <= 0.5.
+// One threadgroup per row.
+template <typename TO>
+kernel void k_fa_softmax_f32(device const float* S    [[buffer(0)]],
+                             device TO*          P    [[buffer(1)]],
+                             device const float* mask [[buffer(2)]],
+                             constant uint& Lk        [[buffer(3)]],
+                             constant float& scale    [[buffer(4)]],
+                             constant uint& has_mask  [[buffer(5)]],
+                             threadgroup float* red   [[threadgroup(0)]],
+                             uint row  [[threadgroup_position_in_grid]],
+                             uint tid  [[thread_index_in_threadgroup]],
+                             uint tg   [[threads_per_threadgroup]],
+                             uint sg   [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    device const float* s = S + (ulong)row * Lk;
+    device TO* pr = P + (ulong)row * Lk;
+    const uint nsg = (tg + 31) / 32;
+    float mx = -1e30f;
+    for (uint k = tid; k < Lk; k += tg) {
+        const float v = (has_mask != 0u && mask[k] <= 0.5f) ? -1e30f : s[k] * scale;
+        mx = max(mx, v);
+    }
+    mx = simd_max(mx);
+    if (lane == 0) red[sg] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = lane < nsg ? red[lane] : -1e30f;
+    mx = simd_max(mx);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const bool empty = mx <= -1e29f;
+    float sum = 0.0f;
+    for (uint k = tid; k < Lk; k += tg) {
+        const bool drop = empty || (has_mask != 0u && mask[k] <= 0.5f);
+        sum += drop ? 0.0f : exp(s[k] * scale - mx);
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) red[sg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = lane < nsg ? red[lane] : 0.0f;
+    sum = simd_sum(sum);
+    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+    for (uint k = tid; k < Lk; k += tg) {
+        const bool drop = empty || (has_mask != 0u && mask[k] <= 0.5f);
+        pr[k] = TO(drop ? 0.0f : exp(s[k] * scale - mx) * inv);
+    }
+}
+template [[host_name("k_fa_softmax_f32_half")]] kernel void k_fa_softmax_f32<half>(
+    device const float*, device half*, device const float*, constant uint&, constant float&,
+    constant uint&, threadgroup float*, uint, uint, uint, uint, uint);
+template [[host_name("k_fa_softmax_f32_bf16")]] kernel void k_fa_softmax_f32<bfloat>(
+    device const float*, device bfloat*, device const float*, constant uint&, constant float&,
+    constant uint&, threadgroup float*, uint, uint, uint, uint, uint);
 )msl";
+
+id<MTLComputePipelineState> pso_fa_softmax_f32(bool bf16) {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso[2];
+    dispatch_once(&once, ^{
+        pso[0] = compile_pipeline(kSrc, @"k_fa_softmax_f32_half");
+        pso[1] = compile_pipeline(kSrc, @"k_fa_softmax_f32_bf16");
+    });
+    return pso[bf16 ? 1 : 0];
+}
 
 id<MTLComputePipelineState> pso_flash() {
     static dispatch_once_t once;
@@ -1264,18 +802,6 @@ id<MTLComputePipelineState> pso_flash_varlen_fp32() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_varlen_fp32"); });
     return pso;
 }
-id<MTLComputePipelineState> pso_extract_LD() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_extract_head_LD"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_extract_LD_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_extract_head_LD_bf16"); });
-    return pso;
-}
 id<MTLComputePipelineState> pso_extract_DL() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -1288,154 +814,13 @@ id<MTLComputePipelineState> pso_extract_DL_bf16() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_extract_head_DL_bf16"); });
     return pso;
 }
-id<MTLComputePipelineState> pso_pack_LD() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_pack_head_LD"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_pack_LD_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_pack_head_LD_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_linear_bias_add_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_linear_bias_add_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_softmax_rows() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_scale_mask_softmax_rows"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_softmax_rows_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_scale_mask_softmax_rows_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_softmax_rows_causal() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_scale_mask_causal_softmax_rows"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_softmax_rows_causal_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_scale_mask_causal_softmax_rows_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_dP() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_dP"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_dP_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_dP_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_dS() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_dS_from_P_dP"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_dS_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_dS_from_P_dP_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_dVh() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_dVh"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_dVh_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_dVh_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_dQh() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_dQh"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_dQh_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_dQh_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_dKh() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_dKh"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_fa_dKh_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_fa_dKh_bf16"); });
-    return pso;
-}
 
-
-// BF16 twin of linear_forward_batched_fp16 (batched_ops.mm): Y(B,out) =
-// X(B,in) @ W(out,in)^T, optional row-broadcast bias. Built on the file-local
-// naive BF16 matmul because the shared FP16 batched-linear is FP16-only.
-// Mirrors src/cuda/flash_attention.cu's fa_linear_forward_batched_bf16.
+// The BF16 projections' name for linear_forward_batched_fp16 (gemm.mm), which
+// takes BF16 too, with the bias fused and one rounding. Mirrors
+// src/cuda/flash_attention.cu's fa_linear_forward_batched_bf16.
 void fa_linear_forward_batched_bf16(const Tensor& W, const Tensor* bias,
                                     const Tensor& X_BD, Tensor& Y_BD) {
-    const int B       = X_BD.rows;
-    const int in_dim  = X_BD.cols;
-    const int out_dim = W.rows;
-    if (W.cols != in_dim) {
-        throw std::runtime_error("fa_linear_forward_batched_bf16: shape mismatch");
-    }
-    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::BF16) {
-        Y_BD.resize(B, out_dim, Dtype::BF16);
-    }
-    if (B == 0 || out_dim == 0) return;
-    launch_matmul_abt_bf16(buffer_for(X_BD), buffer_offset_for(X_BD),
-                           buffer_for(W),    buffer_offset_for(W),
-                           buffer_for(Y_BD), buffer_offset_for(Y_BD),
-                           B, out_dim, in_dim);
-    if (bias && bias->size() > 0) {
-        id<MTLBuffer> bY = buffer_for(Y_BD);
-        id<MTLBuffer> bB = buffer_for(*bias);
-        const NSUInteger oY = buffer_offset_for(Y_BD);
-        const NSUInteger oB = buffer_offset_for(*bias);
-        const uint32_t Bu = B, Ou = out_dim;
-        const NSUInteger total = (NSUInteger)B * (NSUInteger)out_dim;
-        id<MTLComputePipelineState> pso = pso_fa_linear_bias_add_bf16();
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            [enc setComputePipelineState:pso];
-            [enc setBuffer:bY offset:oY atIndex:0];
-            [enc setBuffer:bB offset:oB atIndex:1];
-            [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:2];
-            [enc setBytes:&Ou length:sizeof(uint32_t) atIndex:3];
-            NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-            if (tg > 256) tg = 256;
-            [enc dispatchThreads:MTLSizeMake(total, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-    }
+    linear_forward_batched_fp16(W, bias, X_BD, Y_BD);
 }
 
 void run_causal_flash(const Tensor& Q,
@@ -1553,105 +938,90 @@ void flash_attention_forward(const Tensor& Q,
         return;
     }
 
-    // ---- Per-head matmul pipeline (mirror cuda flash_attention) ----
-    // BF16 cannot use the FP16 WMMA matmul; it routes through the file-local
-    // naive BF16 matmul instead. Per-head pipeline is otherwise identical.
-    // Reuse scratch tensors across calls to keep allocator pressure flat.
-    thread_local static Tensor Qh = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor Kh = Tensor::empty_on(Device::Metal, 0, 0);
+    // ---- Per-head pipeline: FP32 scores, FP32 softmax, one narrowing of P ----
+    // S = Q_h @ K_h^T comes out of the mixed-precision GEMM in FP32, read
+    // straight from Q / K's head columns (lda = ldb = D). The softmax reads it
+    // in FP32 and writes P in the operand dtype, which the P @ V GEMM
+    // multiplies against V_h^T and stores into O's head columns (ldc = D).
+    // A 16-bit score ahead of the softmax costs 4-7e-3 (FP16) / 3-5e-2 (BF16)
+    // of the row max at peaked shapes; exact scores leave only the P and
+    // output rounding (the CUDA per-head path does the same). The query axis
+    // is chunked to hold the FP32 score buffer under 128 MB.
+    const size_t kMaxScoreBytes = size_t(128) << 20;
+    const int chunk = std::max(1, std::min(Lq, static_cast<int>(kMaxScoreBytes / (sizeof(float) * size_t(Lk)))));
+    thread_local static Tensor S32 = Tensor::empty_on(Device::Metal, 0, 0);
+    thread_local static Tensor P = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local static Tensor Vth = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor S = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor Oh = Tensor::empty_on(Device::Metal, 0, 0);
-    if (Qh.rows != Lq  || Qh.cols != head_dim || Qh.dtype != dt) Qh.resize(Lq, head_dim, dt);
-    if (Kh.rows != Lk  || Kh.cols != head_dim || Kh.dtype != dt) Kh.resize(Lk, head_dim, dt);
+    if (S32.rows != chunk || S32.cols != Lk || S32.dtype != Dtype::FP32) S32.resize(chunk, Lk, Dtype::FP32);
+    if (P.rows != chunk || P.cols != Lk || P.dtype != dt) P.resize(chunk, Lk, dt);
     if (Vth.rows != head_dim || Vth.cols != Lk || Vth.dtype != dt) Vth.resize(head_dim, Lk, dt);
-    if (S.rows != Lq   || S.cols != Lk        || S.dtype != dt) S.resize(Lq, Lk, dt);
-    if (Oh.rows != Lq  || Oh.cols != head_dim || Oh.dtype != dt) Oh.resize(Lq, head_dim, dt);
 
-    id<MTLComputePipelineState> p_ext_LD = bf16 ? pso_extract_LD_bf16() : pso_extract_LD();
     id<MTLComputePipelineState> p_ext_DL = bf16 ? pso_extract_DL_bf16() : pso_extract_DL();
-    id<MTLComputePipelineState> p_pack   = bf16 ? pso_pack_LD_bf16()    : pso_pack_LD();
-    id<MTLComputePipelineState> p_sm     = bf16 ? pso_softmax_rows_bf16() : pso_softmax_rows();
+    id<MTLComputePipelineState> p_sm = pso_fa_softmax_f32(bf16);
 
-    id<MTLBuffer> bQ  = buffer_for(Q);   NSUInteger oQ  = buffer_offset_for(Q);
-    id<MTLBuffer> bK  = buffer_for(K);   NSUInteger oK  = buffer_offset_for(K);
-    id<MTLBuffer> bV  = buffer_for(V);   NSUInteger oV  = buffer_offset_for(V);
-    id<MTLBuffer> bO  = buffer_for(O);   NSUInteger oO  = buffer_offset_for(O);
-    id<MTLBuffer> bQh = buffer_for(Qh);  NSUInteger oQh = buffer_offset_for(Qh);
-    id<MTLBuffer> bKh = buffer_for(Kh);  NSUInteger oKh = buffer_offset_for(Kh);
-    id<MTLBuffer> bVt = buffer_for(Vth); NSUInteger oVt = buffer_offset_for(Vth);
-    id<MTLBuffer> bS  = buffer_for(S);   NSUInteger oS  = buffer_offset_for(S);
-    id<MTLBuffer> bOh = buffer_for(Oh);  NSUInteger oOh = buffer_offset_for(Oh);
+    id<MTLBuffer> bQ = buffer_for(Q);    const NSUInteger oQ = buffer_offset_for(Q);
+    id<MTLBuffer> bK = buffer_for(K);    const NSUInteger oK = buffer_offset_for(K);
+    id<MTLBuffer> bV = buffer_for(V);    const NSUInteger oV = buffer_offset_for(V);
+    id<MTLBuffer> bO = buffer_for(O);    const NSUInteger oO = buffer_offset_for(O);
+    id<MTLBuffer> bS = buffer_for(S32);  const NSUInteger oS = buffer_offset_for(S32);
+    id<MTLBuffer> bP = buffer_for(P);    const NSUInteger oP = buffer_offset_for(P);
+    id<MTLBuffer> bVt = buffer_for(Vth); const NSUInteger oVt = buffer_offset_for(Vth);
 
     id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
-    NSUInteger oM = d_mask ? pool_lookup_offset(d_mask) : 0;
-    id<MTLBuffer> bM_arg = bM ? bM : bS;
-    NSUInteger oM_arg = bM ? oM : oS;
+    const NSUInteger oM = d_mask ? pool_lookup_offset(d_mask) : 0;
     const uint32_t has_mask = d_mask ? 1u : 0u;
-
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    const NSUInteger esz = static_cast<NSUInteger>(dtype_size_bytes(dt));
+    const metal_impl::AbtType ty = metal_impl::abt_type(dt);
 
-    // Softmax threadgroup size: start at 32, double until >= Lk, cap 1024.
     NSUInteger sm_tg = 32;
     while ((int)sm_tg < Lk && sm_tg < 1024) sm_tg *= 2;
-    if (sm_tg > 1024) sm_tg = 1024;
-    const NSUInteger sm_shmem = sm_tg * sizeof(float);
-
-    const uint32_t Lqu = Lq, Lku = Lk, Du = D, hdU = head_dim;
+    const uint32_t Lku = Lk, Du = D, hdU = head_dim;
 
     for (int h = 0; h < num_heads; ++h) {
         const uint32_t head_off = (uint32_t)h * (uint32_t)head_dim;
-
-        // 1. Extract Qh, Kh, Vth on one command buffer.
         @autoreleasepool {
             id<MTLCommandBuffer> cmd = new_command_buffer();
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            encode_per_elem(enc, p_ext_LD, bQ, oQ, bQh, oQh, Lqu, Du, head_off, hdU);
-            encode_per_elem(enc, p_ext_LD, bK, oK, bKh, oKh, Lku, Du, head_off, hdU);
             encode_per_elem(enc, p_ext_DL, bV, oV, bVt, oVt, Lku, Du, head_off, hdU);
             [enc endEncoding];
             ::brotensor::metal_impl::submit(cmd);
         }
+        for (int q0 = 0; q0 < Lq; q0 += chunk) {
+            const int rows = std::min(chunk, Lq - q0);
+            const NSUInteger q_elem = static_cast<NSUInteger>(q0) * D + head_off;
 
-        // 2. S(Lq, Lk) = Qh(Lq, hd) @ Kh(Lk, hd)^T  — A @ B^T.
-        if (bf16) {
-            launch_matmul_abt_bf16(bQh, oQh, bKh, oKh, bS, oS, Lq, Lk, head_dim);
-        } else {
-            launch_matmul_abt_fp16(bQh, oQh, bKh, oKh, bS, oS, Lq, Lk, head_dim);
-        }
+            metal_impl::AbtMixed qk;
+            qk.A = bQ; qk.ofs_A = oQ + q_elem * esz; qk.lda = D;
+            qk.B = bK; qk.ofs_B = oK + NSUInteger(head_off) * esz; qk.ldb = D;
+            qk.C = bS; qk.ofs_C = oS; qk.ldc = Lk;
+            qk.M = rows; qk.N = Lk; qk.K = head_dim;
+            qk.in = ty; qk.out = metal_impl::kAbtF32;
+            metal_impl::launch_matmul_abt_mixed(qk);
 
-        // 3. Row-wise scaled+masked softmax over S.
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            [enc setComputePipelineState:p_sm];
-            [enc setBuffer:bS offset:oS atIndex:0];
-            [enc setBuffer:bM_arg offset:oM_arg atIndex:1];
-            [enc setBytes:&Lqu length:sizeof(uint32_t) atIndex:2];
-            [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&scale length:sizeof(float)    atIndex:4];
-            [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:5];
-            [enc setThreadgroupMemoryLength:sm_shmem atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(Lq, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(sm_tg, 1, 1)];
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmd = new_command_buffer();
+                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                [enc setComputePipelineState:p_sm];
+                [enc setBuffer:bS offset:oS atIndex:0];
+                [enc setBuffer:bP offset:oP atIndex:1];
+                [enc setBuffer:(bM ? bM : bS) offset:(bM ? oM : oS) atIndex:2];
+                [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:3];
+                [enc setBytes:&scale length:sizeof(float) atIndex:4];
+                [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:5];
+                [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(sm_tg, 1, 1)];
+                [enc endEncoding];
+                ::brotensor::metal_impl::submit(cmd);
+            }
 
-        // 4. Oh(Lq, hd) = S(Lq, Lk) @ Vth(hd, Lk)^T  — Vth as B (N=hd, K=Lk).
-        if (bf16) {
-            launch_matmul_abt_bf16(bS, oS, bVt, oVt, bOh, oOh, Lq, head_dim, Lk);
-        } else {
-            launch_matmul_abt_fp16(bS, oS, bVt, oVt, bOh, oOh, Lq, head_dim, Lk);
-        }
-
-        // 5. Pack Oh back into O at slot [head_off, head_off+head_dim).
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            encode_per_elem(enc, p_pack, bOh, oOh, bO, oO, Lqu, Du, head_off, hdU);
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
+            metal_impl::AbtMixed pv;
+            pv.A = bP; pv.ofs_A = oP; pv.lda = Lk;
+            pv.B = bVt; pv.ofs_B = oVt; pv.ldb = Lk;
+            pv.C = bO; pv.ofs_C = oO + q_elem * esz; pv.ldc = D;
+            pv.M = rows; pv.N = head_dim; pv.K = Lk;
+            pv.in = pv.out = ty;
+            metal_impl::launch_matmul_abt_mixed(pv);
         }
     }
 }
@@ -2080,7 +1450,6 @@ void flash_attention_qkvo_backward(
     if (causal && Lq != Lk) {
         throw std::runtime_error("flash_attention_qkvo_backward: causal requires Lq == Lk");
     }
-    const int hd = D / num_heads;
 
     if (dX.rows != Lq || dX.cols != D || dX.dtype != dt) {
         dX.resize(Lq, D, dt);
@@ -2099,20 +1468,8 @@ void flash_attention_qkvo_backward(
     thread_local static Tensor Qp = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local static Tensor Kp = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local static Tensor Vp = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor Qh = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor Kh = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor Vh = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor Vth = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor dOh = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor S = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor P_main = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor dP = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor Oh_scratch = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local static Tensor O_attn = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local static Tensor dO_attn = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor dQh = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor dKh = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor dVh = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local static Tensor dQ = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local static Tensor dK = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local static Tensor dV = Tensor::empty_on(Device::Metal, 0, 0);
@@ -2126,38 +1483,9 @@ void flash_attention_qkvo_backward(
             t.resize(r, c, dt);
         }
     };
-
-    ensure(Qp, Lq, D);
-    ensure(Kp, Lk, D);
-    ensure(Vp, Lk, D);
-    ensure(Qh, Lq, hd);
-    ensure(Kh, Lk, hd);
-    ensure(Vh, Lk, hd);
-    ensure(Vth, hd, Lk);
-    ensure(dOh, Lq, hd);
-    ensure(S, Lq, Lk);
-    ensure(P_main, Lq, Lk);
-    ensure(dP, Lq, Lk);
-    ensure(Oh_scratch, Lq, hd);
-    ensure(O_attn, Lq, D);
-    ensure(dO_attn, Lq, D);
-    ensure(dQh, Lq, hd);
-    ensure(dKh, Lk, hd);
-    ensure(dVh, Lk, hd);
-    ensure(dQ, Lq, D);
-    ensure(dK, Lk, D);
-    ensure(dV, Lk, D);
     ensure(dX_from_Q, Lq, D);
     ensure(dX_from_K, Lk, D_ctx);
     ensure(dX_from_V, Lk, D_ctx);
-
-    // dQ/dK/dV must be zeroed before per-head pack-back (we use overwrite-style
-    // per-head packs which only write the head's column slot; other heads'
-    // slots are not touched in that step, but earlier-iteration data lingers
-    // across calls because the buffer is reused).
-    dQ.zero();
-    dK.zero();
-    dV.zero();
 
     // ── 1. Recompute forward projections. ─────────────────────────────────
     if (bf16) {
@@ -2170,109 +1498,8 @@ void flash_attention_qkvo_backward(
         linear_forward_batched_fp16(Wv, bv, kv_src, Vp);
     }
 
-    // Common encode plumbing (BF16 paths select BF16 PSOs).
-    id<MTLComputePipelineState> p_ext_LD = bf16 ? pso_extract_LD_bf16()            : pso_extract_LD();
-    id<MTLComputePipelineState> p_ext_DL = bf16 ? pso_extract_DL_bf16()            : pso_extract_DL();
-    id<MTLComputePipelineState> p_pack   = bf16 ? pso_pack_LD_bf16()               : pso_pack_LD();
-    id<MTLComputePipelineState> p_sm_c   = bf16 ? pso_softmax_rows_causal_bf16()   : pso_softmax_rows_causal();
-    id<MTLComputePipelineState> p_dP     = bf16 ? pso_fa_dP_bf16()                 : pso_fa_dP();
-    id<MTLComputePipelineState> p_dS     = bf16 ? pso_fa_dS_bf16()                 : pso_fa_dS();
-    id<MTLComputePipelineState> p_dVh    = bf16 ? pso_fa_dVh_bf16()                : pso_fa_dVh();
-    id<MTLComputePipelineState> p_dQh    = bf16 ? pso_fa_dQh_bf16()                : pso_fa_dQh();
-    id<MTLComputePipelineState> p_dKh    = bf16 ? pso_fa_dKh_bf16()                : pso_fa_dKh();
-
-    id<MTLBuffer> bQp = buffer_for(Qp);     NSUInteger oQp = buffer_offset_for(Qp);
-    id<MTLBuffer> bKp = buffer_for(Kp);     NSUInteger oKp = buffer_offset_for(Kp);
-    id<MTLBuffer> bVp = buffer_for(Vp);     NSUInteger oVp = buffer_offset_for(Vp);
-    id<MTLBuffer> bQh = buffer_for(Qh);     NSUInteger oQh = buffer_offset_for(Qh);
-    id<MTLBuffer> bKh = buffer_for(Kh);     NSUInteger oKh = buffer_offset_for(Kh);
-    id<MTLBuffer> bVh = buffer_for(Vh);     NSUInteger oVh = buffer_offset_for(Vh);
-    id<MTLBuffer> bVt = buffer_for(Vth);    NSUInteger oVt = buffer_offset_for(Vth);
-    id<MTLBuffer> bdOh= buffer_for(dOh);    NSUInteger odOh= buffer_offset_for(dOh);
-    id<MTLBuffer> bS  = buffer_for(S);      NSUInteger oS  = buffer_offset_for(S);
-    id<MTLBuffer> bP  = buffer_for(P_main); NSUInteger oP  = buffer_offset_for(P_main);
-    id<MTLBuffer> bdP = buffer_for(dP);     NSUInteger odP = buffer_offset_for(dP);
-    id<MTLBuffer> bOh = buffer_for(Oh_scratch); NSUInteger oOh = buffer_offset_for(Oh_scratch);
-    id<MTLBuffer> bOA = buffer_for(O_attn); NSUInteger oOA = buffer_offset_for(O_attn);
-    id<MTLBuffer> bdOA= buffer_for(dO_attn);NSUInteger odOA= buffer_offset_for(dO_attn);
-    id<MTLBuffer> bdQh= buffer_for(dQh);    NSUInteger odQh= buffer_offset_for(dQh);
-    id<MTLBuffer> bdKh= buffer_for(dKh);    NSUInteger odKh= buffer_offset_for(dKh);
-    id<MTLBuffer> bdVh= buffer_for(dVh);    NSUInteger odVh= buffer_offset_for(dVh);
-    id<MTLBuffer> bdQ = buffer_for(dQ);     NSUInteger odQ = buffer_offset_for(dQ);
-    id<MTLBuffer> bdK = buffer_for(dK);     NSUInteger odK = buffer_offset_for(dK);
-    id<MTLBuffer> bdV = buffer_for(dV);     NSUInteger odV = buffer_offset_for(dV);
-
-    id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
-    NSUInteger oM = d_mask ? pool_lookup_offset(d_mask) : 0;
-    id<MTLBuffer> bM_arg = bM ? bM : bS;
-    NSUInteger oM_arg = bM ? oM : oS;
-    const uint32_t has_mask = d_mask ? 1u : 0u;
-    const uint32_t causal_u = causal ? 1u : 0u;
-
-    const float inv_sqrt = 1.0f / sqrtf(static_cast<float>(hd));
-    const uint32_t Lqu = Lq, Lku = Lk, Du = D, hdU = hd;
-
-    NSUInteger sm_tg = 32;
-    while ((int)sm_tg < Lk && sm_tg < 1024) sm_tg *= 2;
-    if (sm_tg > 1024) sm_tg = 1024;
-    const NSUInteger sm_shmem = sm_tg * sizeof(float);
-
-    // ── 2. Recompute O_attn (Lq, D) by running fwd per head. ─────────────
-    for (int h = 0; h < num_heads; ++h) {
-        const uint32_t head_off = (uint32_t)h * (uint32_t)hd;
-
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            encode_per_elem(enc, p_ext_LD, bQp, oQp, bQh, oQh, Lqu, Du, head_off, hdU);
-            encode_per_elem(enc, p_ext_LD, bKp, oKp, bKh, oKh, Lku, Du, head_off, hdU);
-            encode_per_elem(enc, p_ext_DL, bVp, oVp, bVt, oVt, Lku, Du, head_off, hdU);
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-
-        // S = Qh @ Kh^T
-        if (bf16) {
-            launch_matmul_abt_bf16(bQh, oQh, bKh, oKh, bS, oS, Lq, Lk, hd);
-        } else {
-            launch_matmul_abt_fp16(bQh, oQh, bKh, oKh, bS, oS, Lq, Lk, hd);
-        }
-
-        // S = softmax(scale * S, mask, causal)
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            [enc setComputePipelineState:p_sm_c];
-            [enc setBuffer:bS offset:oS atIndex:0];
-            [enc setBuffer:bM_arg offset:oM_arg atIndex:1];
-            [enc setBytes:&Lqu length:sizeof(uint32_t) atIndex:2];
-            [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&inv_sqrt length:sizeof(float) atIndex:4];
-            [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:5];
-            [enc setBytes:&causal_u length:sizeof(uint32_t) atIndex:6];
-            [enc setThreadgroupMemoryLength:sm_shmem atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(Lq, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(sm_tg, 1, 1)];
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-
-        // Oh = S @ Vth^T  (N = hd, K = Lk)
-        if (bf16) {
-            launch_matmul_abt_bf16(bS, oS, bVt, oVt, bOh, oOh, Lq, hd, Lk);
-        } else {
-            launch_matmul_abt_fp16(bS, oS, bVt, oVt, bOh, oOh, Lq, hd, Lk);
-        }
-
-        // Pack Oh back into O_attn slot.
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            encode_per_elem(enc, p_pack, bOh, oOh, bOA, oOA, Lqu, Du, head_off, hdU);
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-    }
+    // ── 2. Recompute the attention output O_attn (Lq, D). ─────────────────
+    flash_attention_forward(Qp, Kp, Vp, d_mask, num_heads, causal, O_attn);
 
     // ── 3. Wo + bo backward. dO_attn(Lq, D) = dO @ Wo. ────────────────────
     {
@@ -2287,147 +1514,8 @@ void flash_attention_qkvo_backward(
                                 has_bo ? *dbo : scratch_db);
     }
 
-    // ── 4. Per-head backward sweep. ───────────────────────────────────────
-    for (int h = 0; h < num_heads; ++h) {
-        const uint32_t head_off = (uint32_t)h * (uint32_t)hd;
-
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            encode_per_elem(enc, p_ext_LD, bQp, oQp, bQh, oQh, Lqu, Du, head_off, hdU);
-            encode_per_elem(enc, p_ext_LD, bKp, oKp, bKh, oKh, Lku, Du, head_off, hdU);
-            encode_per_elem(enc, p_ext_LD, bVp, oVp, bVh, oVh, Lku, Du, head_off, hdU);
-            encode_per_elem(enc, p_ext_LD, bdOA, odOA, bdOh, odOh, Lqu, Du, head_off, hdU);
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-
-        // Recompute P = softmax(scale * Qh@Kh^T, mask, causal).
-        if (bf16) {
-            launch_matmul_abt_bf16(bQh, oQh, bKh, oKh, bP, oP, Lq, Lk, hd);
-        } else {
-            launch_matmul_abt_fp16(bQh, oQh, bKh, oKh, bP, oP, Lq, Lk, hd);
-        }
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            [enc setComputePipelineState:p_sm_c];
-            [enc setBuffer:bP offset:oP atIndex:0];
-            [enc setBuffer:bM_arg offset:oM_arg atIndex:1];
-            [enc setBytes:&Lqu length:sizeof(uint32_t) atIndex:2];
-            [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&inv_sqrt length:sizeof(float) atIndex:4];
-            [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:5];
-            [enc setBytes:&causal_u length:sizeof(uint32_t) atIndex:6];
-            [enc setThreadgroupMemoryLength:sm_shmem atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(Lq, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(sm_tg, 1, 1)];
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-
-        // dVh, dP — independent, can share one command buffer.
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-
-            // dVh(Lk, hd): grid (hd, Lk).
-            [enc setComputePipelineState:p_dVh];
-            [enc setBuffer:bP offset:oP atIndex:0];
-            [enc setBuffer:bdOh offset:odOh atIndex:1];
-            [enc setBuffer:bdVh offset:odVh atIndex:2];
-            [enc setBytes:&Lqu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&hdU length:sizeof(uint32_t) atIndex:5];
-            {
-                NSUInteger gx = ((hd + 15) / 16) * 16;
-                NSUInteger gy = ((Lk + 15) / 16) * 16;
-                [enc dispatchThreads:MTLSizeMake(gx, gy, 1)
-                  threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-            }
-
-            // dP(Lq, Lk): grid (Lk, Lq).
-            [enc setComputePipelineState:p_dP];
-            [enc setBuffer:bdOh offset:odOh atIndex:0];
-            [enc setBuffer:bVh offset:oVh atIndex:1];
-            [enc setBuffer:bdP offset:odP atIndex:2];
-            [enc setBytes:&Lqu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&hdU length:sizeof(uint32_t) atIndex:5];
-            {
-                NSUInteger gx = ((Lk + 15) / 16) * 16;
-                NSUInteger gy = ((Lq + 15) / 16) * 16;
-                [enc dispatchThreads:MTLSizeMake(gx, gy, 1)
-                  threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-            }
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-
-        // dS = P * (dP - D_q) * inv_sqrt  (in-place over P).
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            [enc setComputePipelineState:p_dS];
-            [enc setBuffer:bP offset:oP atIndex:0];
-            [enc setBuffer:bdP offset:odP atIndex:1];
-            [enc setBytes:&Lqu length:sizeof(uint32_t) atIndex:2];
-            [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&inv_sqrt length:sizeof(float) atIndex:4];
-            [enc setThreadgroupMemoryLength:sm_shmem atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(Lq, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(sm_tg, 1, 1)];
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-
-        // dQh, dKh.
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-
-            [enc setComputePipelineState:p_dQh];
-            [enc setBuffer:bP offset:oP atIndex:0];
-            [enc setBuffer:bKh offset:oKh atIndex:1];
-            [enc setBuffer:bdQh offset:odQh atIndex:2];
-            [enc setBytes:&Lqu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&hdU length:sizeof(uint32_t) atIndex:5];
-            {
-                NSUInteger gx = ((hd + 15) / 16) * 16;
-                NSUInteger gy = ((Lq + 15) / 16) * 16;
-                [enc dispatchThreads:MTLSizeMake(gx, gy, 1)
-                  threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-            }
-
-            [enc setComputePipelineState:p_dKh];
-            [enc setBuffer:bP offset:oP atIndex:0];
-            [enc setBuffer:bQh offset:oQh atIndex:1];
-            [enc setBuffer:bdKh offset:odKh atIndex:2];
-            [enc setBytes:&Lqu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&hdU length:sizeof(uint32_t) atIndex:5];
-            {
-                NSUInteger gx = ((hd + 15) / 16) * 16;
-                NSUInteger gy = ((Lk + 15) / 16) * 16;
-                [enc dispatchThreads:MTLSizeMake(gx, gy, 1)
-                  threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-            }
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-
-        // Pack dQh / dKh / dVh back into per-batch dQ / dK / dV.
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            encode_per_elem(enc, p_pack, bdQh, odQh, bdQ, odQ, Lqu, Du, head_off, hdU);
-            encode_per_elem(enc, p_pack, bdKh, odKh, bdK, odK, Lku, Du, head_off, hdU);
-            encode_per_elem(enc, p_pack, bdVh, odVh, bdV, odV, Lku, Du, head_off, hdU);
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-    }
+    // ── 4. Attention core backward (FP32 inside, dQ / dK / dV rounded once).
+    flash_attention_backward(Qp, Kp, Vp, O_attn, dO_attn, d_mask, num_heads, causal, dQ, dK, dV);
 
     // ── 5. Q / K / V projection backward. ─────────────────────────────────
     auto run_proj_back = [&](const Tensor& W, const Tensor& In,
