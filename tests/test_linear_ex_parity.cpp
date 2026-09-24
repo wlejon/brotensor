@@ -88,7 +88,9 @@ BT_PARITY_TEST(cpu_epilogues) {
         for (int j = 0; j < 3; ++j) {
             const float v = r(m, 2 * j + 1);
             const float gelu = 0.5f * v * (1.0f + std::erf(v * 0.70710678118f));
-            BT_CHECK(std::fabs(g(m, j) - r(m, 2 * j) * gelu) < 1e-6f);
+            // Relative: |g| reaches ~150 here, where one float ulp is 1.5e-5 and an
+            // FMA-contracted difference (arm64 clang) exposes the product's rounding.
+            BT_CHECK(std::fabs(g(m, j) - r(m, 2 * j) * gelu) <= 1e-6f * (1.0f + std::fabs(g(m, j))));
         }
     }
 }
