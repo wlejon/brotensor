@@ -14,6 +14,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 static int g_failures = 0;
 
 #define CHECK(cond) do {                                                    \
@@ -174,13 +180,25 @@ static void run_js(const char* name, const std::string& script) {
 // H1, H2 and the tensor rows of the static handler diff), each against the
 // old binding's contract.
 
+static long current_pid() {
+#ifdef _WIN32
+    return static_cast<long>(_getpid());
+#else
+    return static_cast<long>(getpid());
+#endif
+}
+
 // H1: openSafetensors(path) + the handle's count / names() / header() /
 // get(name, rows?, cols?, dtype?) / close(), and saveSafetensors.
 static void test_js_safetensors() {
     namespace st = brotensor::safetensors;
+    // Per-process names: ctest -j runs this binary as brotensor_test_api and
+    // brotensor_test_api_gcstress at once, and a shared path let one run
+    // delete the fixture while the other was opening it.
     const auto dir = std::filesystem::temp_directory_path();
-    const auto fixture = dir / "brotensor_api_test.safetensors";
-    const auto saved = dir / "brotensor_api_test_saved.safetensors";
+    const std::string tag = std::to_string(current_pid());
+    const auto fixture = dir / ("brotensor_api_test_" + tag + ".safetensors");
+    const auto saved = dir / ("brotensor_api_test_saved_" + tag + ".safetensors");
     {
         const float alpha[6] = {1, 2, 3, 4, 5, 6};
         const uint16_t beta[4] = {0x3c00, 0x4000, 0x4200, 0x4400};  // 1, 2, 3, 4 in fp16
