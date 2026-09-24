@@ -283,6 +283,10 @@ jobs:
       # negative branch hit counts — a long-standing bug, gcc bugzilla 68080 —
       # which gcovr treats as fatal. Downgrade to a per-file warning: line counts
       # are unaffected, only a few branch counts in the offending files are.
+      #
+      # --gcov-suspicious-hits-threshold 0: gcovr takes any count above 2^32 for
+      # the same gcov bug and aborts, but the parity suite really does run the
+      # hot tensor accessors ~3e10 times. 0 turns the heuristic off.
       - name: Report
         shell: bash
         run: |
@@ -295,6 +299,7 @@ jobs:
             --exclude 'brotensor/tests/' \
             --exclude-unreachable-branches \
             --gcov-ignore-parse-errors negative_hits.warn_once_per_file \
+            --gcov-suspicious-hits-threshold 0 \
             --print-summary \
             --cobertura coverage.xml --cobertura-pretty \
             --html-details coverage-html/index.html \
