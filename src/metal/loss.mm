@@ -1,5 +1,8 @@
 #include <brotensor/runtime.h>
 
+#include <stdexcept>
+#include <string>
+
 #import "internal.h"
 
 namespace brotensor::detail::metal {
@@ -369,46 +372,31 @@ void mse_vec_backward(const Tensor& pred, const Tensor& target,
     }
 }
 
-float softmax_xent_fused(const Tensor& logits, const Tensor& target,
-                         const float* d_mask,
-                         Tensor& probs, Tensor& dLogits) {
-    const int n = logits.size();
-    if (probs.rows != logits.rows || probs.cols != logits.cols ||
-        probs.dtype != Dtype::FP32) {
-        probs.resize(logits.rows, logits.cols, Dtype::FP32);
-    }
-    if (dLogits.rows != logits.rows || dLogits.cols != logits.cols ||
-        dLogits.dtype != Dtype::FP32) {
-        dLogits.resize(logits.rows, logits.cols, Dtype::FP32);
-    }
-    if (n == 0) return 0.0f;
+namespace {
+
+// One-threadgroup stable softmax + cross-entropy over a flat segment of n
+// FP32 values (k_softmax_xent_fused): probs = softmax(logits) over the
+// unmasked entries, dLogits = probs - target, returns
+// -sum(target * log(max(probs, 1e-12))). Masked entries (mask < 0.5) get
+// probs = dLogits = 0. Blocks until the loss is on the host.
+float run_xent(id<MTLBuffer> bL, NSUInteger oL, id<MTLBuffer> bT, NSUInteger oT,
+               id<MTLBuffer> bM, NSUInteger oM, id<MTLBuffer> bP, NSUInteger oP,
+               id<MTLBuffer> bdL, NSUInteger odL, int n) {
+    if (n <= 0) return 0.0f;
     @autoreleasepool {
         id<MTLBuffer> scratch = [metal_impl::device()
             newBufferWithLength:sizeof(float)
                         options:MTLResourceStorageModeShared];
         float* sptr = static_cast<float*>([scratch contents]);
         sptr[0] = 0.0f;
-        id<MTLBuffer> bL = buffer_for(logits);
-    NSUInteger oL = buffer_offset_for(logits);
-        id<MTLBuffer> bT = buffer_for(target);
-    NSUInteger oT = buffer_offset_for(target);
-        id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
-        NSUInteger oM = d_mask ? pool_lookup_offset(d_mask) : 0;
-        id<MTLBuffer> bM_arg = bM ? bM : bL;
-        NSUInteger oM_arg = bM ? oM : oL;
-        id<MTLBuffer> bP = buffer_for(probs);
-    NSUInteger oP = buffer_offset_for(probs);
-        id<MTLBuffer> bdL = buffer_for(dLogits);
-    NSUInteger odL = buffer_offset_for(dLogits);
         const uint32_t nu = static_cast<uint32_t>(n);
-        const uint32_t has_mask = d_mask ? 1u : 0u;
-        id<MTLComputePipelineState> pso = pso_xent();
+        const uint32_t has_mask = bM ? 1u : 0u;
         id<MTLCommandBuffer> cmd = new_command_buffer();
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
+        [enc setComputePipelineState:pso_xent()];
         [enc setBuffer:bL offset:oL atIndex:0];
         [enc setBuffer:bT offset:oT atIndex:1];
-        [enc setBuffer:bM_arg offset:oM_arg atIndex:2];
+        [enc setBuffer:(bM ? bM : bL) offset:(bM ? oM : oL) atIndex:2];
         [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:3];
         [enc setBuffer:bP offset:oP atIndex:4];
         [enc setBuffer:bdL offset:odL atIndex:5];
@@ -421,6 +409,72 @@ float softmax_xent_fused(const Tensor& logits, const Tensor& target,
         metal_impl::flush();
         return sptr[0];
     }
+}
+
+[[noreturn]] void fail(const char* op, const char* reason) {
+    throw std::runtime_error(std::string("brotensor: ") + op + ": " + reason);
+}
+
+// The (buffer, offset) a device pointer into the Metal pool lives at.
+id<MTLBuffer> pooled(const float* p, NSUInteger& ofs, const char* op, const char* name) {
+    id<MTLBuffer> b = pool_lookup(p);
+    if (!b) fail(op, (std::string(name) + " is not a Metal device pointer").c_str());
+    ofs = pool_lookup_offset(p);
+    return b;
+}
+
+void ensure_f32_like(const Tensor& like, Tensor& t) {
+    if (t.rows != like.rows || t.cols != like.cols || t.dtype != Dtype::FP32) {
+        t.resize(like.rows, like.cols, Dtype::FP32);
+    }
+}
+
+} // namespace
+
+float softmax_xent_fused(const Tensor& logits, const Tensor& target,
+                         const float* d_mask,
+                         Tensor& probs, Tensor& dLogits) {
+    ensure_f32_like(logits, probs);
+    ensure_f32_like(logits, dLogits);
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = d_mask ? pooled(d_mask, oM, "softmax_xent_fused", "mask") : nil;
+    return run_xent(buffer_for(logits), buffer_offset_for(logits), buffer_for(target), buffer_offset_for(target),
+                    bM, oM, buffer_for(probs), buffer_offset_for(probs), buffer_for(dLogits),
+                    buffer_offset_for(dLogits), logits.size());
+}
+
+// The older Tensor-shaped softmax_xent: the same fused forward + gradient as
+// softmax_xent_fused (dLogits is the backward), FP32 by design like CUDA's.
+float softmax_xent(const Tensor& logits, const Tensor& target, Tensor& probs, Tensor& dLogits,
+                   const float* mask) {
+    constexpr const char* op = "softmax_xent";
+    if (logits.dtype != Dtype::FP32) fail(op, "logits must be FP32 (loss ops are FP32-by-design)");
+    if (target.dtype != Dtype::FP32) fail(op, "target must be FP32 (loss ops are FP32-by-design)");
+    if (target.size() != logits.size()) fail(op, "target size mismatch");
+    return softmax_xent_fused(logits, target, mask, probs, dLogits);
+}
+
+// Raw-pointer form: every pointer is a Metal device pointer (the dispatcher
+// only lands here for Device::Metal operands); mask may be null.
+float softmax_xent_segment(const float* logits, const float* target, float* probs, float* dLogits, int n,
+                           const float* mask) {
+    constexpr const char* op = "softmax_xent_segment";
+    if (n <= 0) return 0.0f;
+    NSUInteger oL = 0, oT = 0, oP = 0, odL = 0, oM = 0;
+    id<MTLBuffer> bL = pooled(logits, oL, op, "logits");
+    id<MTLBuffer> bT = pooled(target, oT, op, "target");
+    id<MTLBuffer> bP = pooled(probs, oP, op, "probs");
+    id<MTLBuffer> bdL = pooled(dLogits, odL, op, "dLogits");
+    id<MTLBuffer> bM = mask ? pooled(mask, oM, op, "mask") : nil;
+    return run_xent(bL, oL, bT, oT, bM, oM, bP, oP, bdL, odL, n);
+}
+
+// Pure host scalar math, as on the CPU and CUDA; registered so dispatch on
+// Device::Metal does not throw.
+float mse_scalar(float pred, float target, float& dPred) {
+    const float d = pred - target;
+    dPred = d;
+    return 0.5f * d * d;
 }
 
 void mse_vec_per_sample(const Tensor& pred, const Tensor& target,

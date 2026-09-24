@@ -486,6 +486,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/fp16_matmul.mm
         src/metal/linear_ex.mm
         src/metal/packed_encoder.mm
+        src/metal/xavier_init.mm
         src/metal/softmax.mm
         src/metal/layernorm.mm
         src/metal/attention.mm
@@ -571,6 +572,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/fp16_matmul.mm
         src/metal/linear_ex.mm
         src/metal/packed_encoder.mm
+        src/metal/xavier_init.mm
         src/metal/softmax.mm
         src/metal/layernorm.mm
         src/metal/attention.mm

@@ -7,12 +7,10 @@
 // with the Metal AllocVTable, and hands the pair to the dispatcher.
 //
 // A null slot in the vtable means "this op is not implemented on Metal" — the
-// dispatcher throws on null lookups. Metal does not implement the four host-
-// scalar / host-RNG ops `mse_scalar`, `softmax_xent`, `softmax_xent_segment`,
-// and `xavier_init` (host-side by design — no GPU kernel makes sense for
-// them), nor `filtered_lrelu_forward`/`filtered_lrelu_backward` (CUDA-only
-// fused kernel; CPU/Metal fall back to the bias_act + upfirdn2d composite,
-// see op_table.h). Every other op in the X-macro is implemented.
+// dispatcher throws on null lookups. The only ops Metal leaves null are
+// `filtered_lrelu_forward`/`filtered_lrelu_backward` (CUDA-only fused kernel;
+// CPU/Metal fall back to the bias_act + upfirdn2d composite, see
+// op_table.h). Every other op in the X-macro is implemented.
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/detail/op_table.h>
@@ -24,9 +22,9 @@ namespace brotensor::detail::metal {
 
 // Forward-declare every public op in the Metal backend namespace. The op
 // table is the single source of truth for the signatures; the implementations
-// live one-per-cluster across the Metal .mm TUs. (The four host-scalar /
-// host-RNG ops Metal does not implement are declared here too but never
-// defined or referenced — harmless.)
+// live one-per-cluster across the Metal .mm TUs. (The two filtered_lrelu ops
+// Metal does not implement are declared here too but never defined or
+// referenced — harmless.)
 #define BROTENSOR_METAL_DECL(name, ret, params) ret name params;
 BROTENSOR_FOR_EACH_OP(BROTENSOR_METAL_DECL)
 #undef BROTENSOR_METAL_DECL
@@ -55,6 +53,10 @@ extern "C" void brotensor_probe_and_register_metal() {
     OpsVTable ops{};   // zero-init: every slot starts as nullptr
 
     ops.adam_step                                   = &dm::adam_step;
+    ops.mse_scalar                                  = &dm::mse_scalar;
+    ops.softmax_xent                                = &dm::softmax_xent;
+    ops.softmax_xent_segment                        = &dm::softmax_xent_segment;
+    ops.xavier_init                                 = &dm::xavier_init;
     ops.flash_attention_packed_qkv_backward         = &dm::flash_attention_packed_qkv_backward;
     ops.flash_attention_packed_qkv_forward          = &dm::flash_attention_packed_qkv_forward;
     ops.linear_forward_batched_ex                   = &dm::linear_forward_batched_ex;

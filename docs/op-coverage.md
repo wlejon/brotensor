@@ -39,7 +39,7 @@ The **CPU backend** implements essentially the entire FP32 surface — forward *
 
 The **CUDA and Metal backends** add the FP16 (and BF16) precision paths, batched-inference variants, the W8A16 and GGUF block-quant kernels, and a handful of GPU-only fused kernels. The [audio op family](#audio-op-family) is FP32 on **all three** backends with per-family CPU↔GPU parity tests.
 
-**Metal is at near-total parity with CUDA.** Of the 260 vtable slots it leaves six null: `mse_scalar`, `softmax_xent`, `softmax_xent_segment` and `xavier_init` (host-scalar / host-RNG ops, null by design) plus `filtered_lrelu_forward` / `filtered_lrelu_backward` (the fused kernel is CUDA-only; Metal takes the composite path). CUDA leaves one null — `filtered_lrelu_backward`, which is the composite on every backend. Everything else in the table below is registered on both GPU backends.
+**Metal is at near-total parity with CUDA.** Of its vtable slots it leaves two null: `filtered_lrelu_forward` / `filtered_lrelu_backward` (the fused kernel is CUDA-only; Metal takes the composite path). CUDA leaves one null — `filtered_lrelu_backward`, which is the composite on every backend. Everything else in the table below is registered on both GPU backends.
 
 Two "ops" are not vtable entries but device-agnostic compositions of public ops, so they run on any backend automatically: **LoRA** (`ops/lora.h`, header-only) and the **filtered_lrelu composite** (`src/filtered_lrelu.cpp` — the forward path on CPU/Metal and for CUDA configs the fused kernel doesn't cover, and the backward path everywhere).
 
