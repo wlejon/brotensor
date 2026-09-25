@@ -207,6 +207,8 @@ if(BROTENSOR_HAS_GPU)
     brotensor_add_executable(brotensor_bench_matmul_abt bench_matmul_abt.cpp)
     # Hand-run microbench for the FP32 GEMM (NN / NT / TN + the 1x1-conv paths).
     brotensor_add_executable(brotensor_bench_gemm_fp32 bench_gemm_fp32.cpp)
+    # Hand-run microbench for the FP16 GEMM (NN / NT / ABT / TN / FP16-weight).
+    brotensor_add_executable(brotensor_bench_gemm_fp16 bench_gemm_fp16.cpp)
     brotensor_add_test(brotensor_test_int8_attention test_int8_attention.cpp)
     if(BROTENSOR_WITH_CUDA)
         brotensor_add_test(brotensor_test_streams test_streams.cpp)
@@ -229,7 +231,7 @@ if(BROTENSOR_HAS_GPU)
         reduce loss embedding concat mha batched
         elementwise_extra loss_fused embedding_extra concat_extra
         reduce_extra layernorm_inference layernorm_batched_caches
-        activations geglu swiglu matmul matmul_abt gemm_fp32 rope rmsnorm lstm lora
+        activations geglu swiglu matmul matmul_abt gemm_fp32 gemm_fp16 rope rmsnorm lstm lora
         conv2d deform_conv2d conv3d group_norm
         resample transpose diffusion kv_cache
         cross_attention self_attention self_attention_decomposed_rel_pos attention_moments

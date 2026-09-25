@@ -18,10 +18,9 @@ namespace brotensor::metal_impl {
 // Batched A @ B^T with optional per-N bias (shared across the batch) and a
 // fused epilogue activation (act code matches src/cuda/fp16_matmul.cu:
 // 0 none, 1 relu, 2 gelu-tanh, 3 gelu-erf, 4 silu, 5 quick-gelu). Strides are
-// element counts per batch matrix. FP16 storage / FP32 accumulate; a
-// 64x64x32 simdgroup-matrix kernel handles M*N >= 1024 (masked on M/N/K, so
-// any shape is valid), with a naive one-thread-per-output fallback below that
-// and for K == 0. This backs the public matmul_abt op.
+// element counts per batch matrix. FP16 storage / FP32 accumulate, on
+// launch_matmul_abt_mixed (so any shape is valid). This backs the public
+// matmul_abt op.
 void launch_matmul_abt_fp16_ex(id<MTLBuffer> A, NSUInteger ofs_A,
                                id<MTLBuffer> B, NSUInteger ofs_B,
                                id<MTLBuffer> C, NSUInteger ofs_C,
@@ -30,7 +29,7 @@ void launch_matmul_abt_fp16_ex(id<MTLBuffer> A, NSUInteger ofs_A,
                                id<MTLBuffer> bias, NSUInteger ofs_bias, bool has_bias,
                                int act);
 
-// BF16 twin. Naive per-thread GEMM; it still carries batch/bias/act.
+// BF16 twin (BF16 widens to FP32 in the GEMM).
 void launch_matmul_abt_bf16_ex(id<MTLBuffer> A, NSUInteger ofs_A,
                                id<MTLBuffer> B, NSUInteger ofs_B,
                                id<MTLBuffer> C, NSUInteger ofs_C,
@@ -46,11 +45,11 @@ void launch_matmul_abt_bf16_ex(id<MTLBuffer> A, NSUInteger ofs_A,
 // FP16 / BF16 / FP32 out) and explicit row strides, so a caller can read a
 // head's column slice of an (L, D) tensor in place (lda = D) and write the
 // result straight into another tensor's column slot (ldc = D). Accumulation is
-// FP32 throughout; the output is rounded exactly once. FP16 operands ride
-// simdgroup_matrix<half>; BF16 and FP32 are widened to FP32 in threadgroup
-// memory and ride simdgroup_matrix<float>, so every input type has a tiled
-// path. bias (N entries, the INPUT type) and act (same codes as above) apply
-// before the epilogue:
+// FP32 throughout; the output is rounded exactly once. FP16 x FP16 operands
+// ride simdgroup_matrix<half>; any BF16 or FP32 operand widens both to FP32
+// and rides simdgroup_matrix<float>. B may carry its own type (in_B), e.g. an
+// FP16 weight under FP32 activations. bias (N entries, A's type) and act (same
+// codes as above) apply before the epilogue:
 //   kAbtStore       C = r
 //   kAbtAccumulate  C = C + r          (C read in the output type)
 //   kAbtGeglu       C[:, j] = r[:, 2j] * gelu_erf(r[:, 2j+1]); N even, C has
@@ -67,6 +66,7 @@ struct AbtMixed {
     id<MTLBuffer> bias = nil; NSUInteger ofs_bias = 0;  // nil = no bias
     int M = 0, N = 0, K = 0;
     AbtType in = kAbtF16, out = kAbtF16;
+    int in_B = -1;            // B's AbtType when it differs from `in`; -1 = `in`
     int act = 0;
     int epilogue = kAbtStore;
     float alpha = 1.0f;
@@ -76,10 +76,11 @@ struct AbtMixed {
 
 void launch_matmul_abt_mixed(const AbtMixed& g);
 
-// The FP32-multiply GEMM (src/metal/gemm_fp32.mm) that launch_matmul_abt_mixed
-// hands every FP32 / BF16 input to: a double-buffered 64x64x16 simdgroup_float
-// kernel for general shapes and a register-blocked kernel for M <= 8. Same
-// AbtMixed contract; the input type must not be FP16 and K must be positive.
+// The FP32-accumulate simdgroup GEMM (src/metal/gemm_fp32.mm) that
+// launch_matmul_abt_mixed hands every K > 0 product of a useful size to: a
+// 64x64 tiled kernel (half tiles, BK 32, for FP16 x FP16; float tiles, BK 16,
+// otherwise) and a register-blocked kernel for M <= 8. Same AbtMixed
+// contract; K must be positive.
 void launch_gemm_fp32(const AbtMixed& g);
 
 // The AbtType for a 16/32-bit float Dtype; throws on anything else.

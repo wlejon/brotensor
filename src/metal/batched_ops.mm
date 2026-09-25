@@ -37,44 +37,6 @@ kernel void k_linear_fw_batched(device const float* W    [[buffer(0)]],
     Y[b * out_dim + i] = bias[i] + acc;
 }
 
-// 16-bit-weight twins of k_linear_fw_batched: W stored half/bfloat, bias/X/Y
-// and accumulation float. Mirrors the CUDA 16-bit-weight path (batched_ops.cu).
-kernel void k_linear_fw_batched_hw(device const half* W    [[buffer(0)]],
-                                   device const float* bias [[buffer(1)]],
-                                   device const float* X    [[buffer(2)]],
-                                   device float*       Y    [[buffer(3)]],
-                                   constant uint& B         [[buffer(4)]],
-                                   constant uint& out_dim   [[buffer(5)]],
-                                   constant uint& in_dim    [[buffer(6)]],
-                                   uint2 gid [[thread_position_in_grid]]) {
-    uint i = gid.x; // out
-    uint b = gid.y;
-    if (b >= B || i >= out_dim) return;
-    device const float* xrow = X + b * in_dim;
-    device const half*  wrow = W + i * in_dim;
-    float acc = 0.0f;
-    for (uint k = 0; k < in_dim; ++k) acc += float(wrow[k]) * xrow[k];
-    Y[b * out_dim + i] = bias[i] + acc;
-}
-
-kernel void k_linear_fw_batched_bw(device const bfloat* W   [[buffer(0)]],
-                                   device const float* bias [[buffer(1)]],
-                                   device const float* X    [[buffer(2)]],
-                                   device float*       Y    [[buffer(3)]],
-                                   constant uint& B         [[buffer(4)]],
-                                   constant uint& out_dim   [[buffer(5)]],
-                                   constant uint& in_dim    [[buffer(6)]],
-                                   uint2 gid [[thread_position_in_grid]]) {
-    uint i = gid.x; // out
-    uint b = gid.y;
-    if (b >= B || i >= out_dim) return;
-    device const float*  xrow = X + b * in_dim;
-    device const bfloat* wrow = W + i * in_dim;
-    float acc = 0.0f;
-    for (uint k = 0; k < in_dim; ++k) acc += float(wrow[k]) * xrow[k];
-    Y[b * out_dim + i] = bias[i] + acc;
-}
-
 // relu/tanh/add batched — dtype-dispatched on X (FP32/FP16/BF16, FP32 math),
 // matching the templated CUDA kernels in batched_ops.cu.
 #define LBB_RELU_FW(NAME, T)                                                  \
@@ -192,42 +154,6 @@ kernel void k_linear_bw_batched_db(device const float* dY  [[buffer(0)]],
 
 // ─── FP16 variants ────────────────────────────────────────────────────────
 
-kernel void k_linear_bw_batched_dx_fp16(device const half* W   [[buffer(0)]],
-                                        device const half* dY  [[buffer(1)]],
-                                        device half*       dX  [[buffer(2)]],
-                                        constant uint& B       [[buffer(3)]],
-                                        constant uint& out_dim [[buffer(4)]],
-                                        constant uint& in_dim  [[buffer(5)]],
-                                        uint2 gid [[thread_position_in_grid]]) {
-    uint j = gid.x;
-    uint b = gid.y;
-    if (b >= B || j >= in_dim) return;
-    device const half* dY_row = dY + b * out_dim;
-    float acc = 0.0f;
-    for (uint i = 0; i < out_dim; ++i)
-        acc += float(W[i * in_dim + j]) * float(dY_row[i]);
-    dX[b * in_dim + j] = half(acc);
-}
-
-// dW_scratch[i, j] = sum_b dY[b, i] * X[b, j] (FP32 scratch)
-kernel void k_linear_bw_batched_dw_fp16(device const half*  dY [[buffer(0)]],
-                                        device const half*  X  [[buffer(1)]],
-                                        device float*       dW_scratch [[buffer(2)]],
-                                        constant uint& B       [[buffer(3)]],
-                                        constant uint& out_dim [[buffer(4)]],
-                                        constant uint& in_dim  [[buffer(5)]],
-                                        uint2 gid [[thread_position_in_grid]]) {
-    uint j = gid.x;
-    uint i = gid.y;
-    if (i >= out_dim || j >= in_dim) return;
-    float acc = 0.0f;
-    for (uint b = 0; b < B; ++b) {
-        acc += float(dY[b * out_dim + i]) * float(X[b * in_dim + j]);
-    }
-    dW_scratch[i * in_dim + j] = acc;
-}
-
-// FP32 variant of dw to scratch (parity with FP16 path).
 kernel void k_linear_bw_batched_dw_fp32_to_scratch(
         device const float* dY [[buffer(0)]],
         device const float* X  [[buffer(1)]],
@@ -286,41 +212,6 @@ kernel void k_lbb_add_fp32_into_fp32(device const float* src [[buffer(0)]],
 
 // ─── BF16 variants ────────────────────────────────────────────────────────
 
-kernel void k_linear_bw_batched_dx_bf16(device const bfloat* W   [[buffer(0)]],
-                                        device const bfloat* dY  [[buffer(1)]],
-                                        device bfloat*       dX  [[buffer(2)]],
-                                        constant uint& B         [[buffer(3)]],
-                                        constant uint& out_dim   [[buffer(4)]],
-                                        constant uint& in_dim    [[buffer(5)]],
-                                        uint2 gid [[thread_position_in_grid]]) {
-    uint j = gid.x;
-    uint b = gid.y;
-    if (b >= B || j >= in_dim) return;
-    device const bfloat* dY_row = dY + b * out_dim;
-    float acc = 0.0f;
-    for (uint i = 0; i < out_dim; ++i)
-        acc += float(W[i * in_dim + j]) * float(dY_row[i]);
-    dX[b * in_dim + j] = bfloat(acc);
-}
-
-// dW_scratch[i, j] = sum_b dY[b, i] * X[b, j] (FP32 scratch)
-kernel void k_linear_bw_batched_dw_bf16(device const bfloat* dY [[buffer(0)]],
-                                        device const bfloat* X  [[buffer(1)]],
-                                        device float*       dW_scratch [[buffer(2)]],
-                                        constant uint& B        [[buffer(3)]],
-                                        constant uint& out_dim  [[buffer(4)]],
-                                        constant uint& in_dim   [[buffer(5)]],
-                                        uint2 gid [[thread_position_in_grid]]) {
-    uint j = gid.x;
-    uint i = gid.y;
-    if (i >= out_dim || j >= in_dim) return;
-    float acc = 0.0f;
-    for (uint b = 0; b < B; ++b) {
-        acc += float(dY[b * out_dim + i]) * float(X[b * in_dim + j]);
-    }
-    dW_scratch[i * in_dim + j] = acc;
-}
-
 kernel void k_linear_bw_batched_db_bf16(device const bfloat* dY [[buffer(0)]],
                                         device float*       dB_scratch [[buffer(1)]],
                                         constant uint& B        [[buffer(2)]],
@@ -349,8 +240,6 @@ kernel void k_lbb_add_fp32_into_bf16(device const float* src [[buffer(0)]],
         return pso; \
     }
 DEF_PSO(pso_lin_fw, @"k_linear_fw_batched")
-DEF_PSO(pso_lin_fw_hw, @"k_linear_fw_batched_hw")
-DEF_PSO(pso_lin_fw_bw, @"k_linear_fw_batched_bw")
 DEF_PSO(pso_relu_fw, @"k_relu_fw_batched")
 DEF_PSO(pso_relu_fw_fp16, @"k_relu_fw_batched_fp16")
 DEF_PSO(pso_relu_fw_bf16, @"k_relu_fw_batched_bf16")
@@ -369,15 +258,11 @@ DEF_PSO(pso_tanh_bw_bf16, @"k_tanh_bw_batched_bf16")
 DEF_PSO(pso_lin_bw_dx, @"k_linear_bw_batched_dx")
 DEF_PSO(pso_lin_bw_dw, @"k_linear_bw_batched_dw")
 DEF_PSO(pso_lin_bw_db, @"k_linear_bw_batched_db")
-DEF_PSO(pso_lin_bw_dx_fp16,  @"k_linear_bw_batched_dx_fp16")
-DEF_PSO(pso_lin_bw_dw_fp16,  @"k_linear_bw_batched_dw_fp16")
 DEF_PSO(pso_lin_bw_dw_fp32_scratch, @"k_linear_bw_batched_dw_fp32_to_scratch")
 DEF_PSO(pso_lin_bw_db_fp16,  @"k_linear_bw_batched_db_fp16")
 DEF_PSO(pso_lin_bw_db_fp32_scratch, @"k_linear_bw_batched_db_fp32_to_scratch")
 DEF_PSO(pso_lbb_add_fp16,    @"k_lbb_add_fp32_into_fp16")
 DEF_PSO(pso_lbb_add_fp32,    @"k_lbb_add_fp32_into_fp32")
-DEF_PSO(pso_lin_bw_dx_bf16,  @"k_linear_bw_batched_dx_bf16")
-DEF_PSO(pso_lin_bw_dw_bf16,  @"k_linear_bw_batched_dw_bf16")
 DEF_PSO(pso_lin_bw_db_bf16,  @"k_linear_bw_batched_db_bf16")
 DEF_PSO(pso_lbb_add_bf16,    @"k_lbb_add_fp32_into_bf16")
 #undef DEF_PSO
@@ -437,8 +322,9 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
         Y_BD.resize(B, out_dim, Dtype::FP32);
     }
     if (B == 0 || out_dim == 0) return;
-    if (W.dtype == Dtype::FP32 && in_dim > 0) {
-        // Y = X @ W^T + bias on the simdgroup GEMM (gemm_fp32.mm).
+    if (in_dim > 0) {
+        // Y = X @ W^T + bias on the simdgroup GEMM (gemm_fp32.mm); a 16-bit W
+        // widens to FP32 on load, so the product and sum stay FP32.
         metal_impl::AbtMixed g;
         g.A = buffer_for(X_BD); g.ofs_A = buffer_offset_for(X_BD); g.lda = static_cast<uint64_t>(in_dim);
         g.B = buffer_for(W);    g.ofs_B = buffer_offset_for(W);    g.ldb = static_cast<uint64_t>(in_dim);
@@ -446,13 +332,12 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
         g.bias = buffer_for(bias); g.ofs_bias = buffer_offset_for(bias);
         g.M = B; g.N = out_dim; g.K = in_dim;
         g.in = g.out = metal_impl::kAbtF32;
+        g.in_B = metal_impl::abt_type(W.dtype);
         metal_impl::launch_matmul_abt_mixed(g);
         return;
     }
-    id<MTLComputePipelineState> pso =
-        W.dtype == Dtype::FP16 ? pso_lin_fw_hw()
-        : W.dtype == Dtype::BF16 ? pso_lin_fw_bw()
-        : pso_lin_fw();
+    // in_dim == 0: Y = bias (W is never read, whatever its type).
+    id<MTLComputePipelineState> pso = pso_lin_fw();
     id<MTLBuffer> bw = buffer_for(W);
     NSUInteger ow = buffer_offset_for(W);
     id<MTLBuffer> bb = buffer_for(bias);
@@ -622,15 +507,17 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
     const uint32_t Ou = static_cast<uint32_t>(out_dim);
     const uint32_t Iu = static_cast<uint32_t>(in_dim);
 
-    if (!is_fp16 && !is_bf16 && in_dim > 0 && out_dim > 0) {
-        // FP32 on the simdgroup GEMM: dX(B, in) = dY(B, out) @ W(out, in),
-        // then dW(out, in) += dY^T @ X (both operands read transposed).
+    if (in_dim > 0 && out_dim > 0) {
+        // The simdgroup GEMM (gemm_fp32.mm): dX(B, in) = dY(B, out) @ W(out, in),
+        // then dW(out, in) += dY^T @ X (both operands read transposed), each
+        // accumulated in FP32 and rounded once into the tensor's dtype.
+        const metal_impl::AbtType ty = metal_impl::abt_type(W.dtype);
         metal_impl::AbtMixed g;
         g.A = bdy; g.ofs_A = ody; g.lda = static_cast<uint64_t>(out_dim);
         g.B = bw;  g.ofs_B = ow;  g.ldb = static_cast<uint64_t>(in_dim); g.transB = true;
         g.C = bdx; g.ofs_C = odx; g.ldc = static_cast<uint64_t>(in_dim);
         g.M = B; g.N = in_dim; g.K = out_dim;
-        g.in = g.out = metal_impl::kAbtF32;
+        g.in = g.out = ty;
         metal_impl::launch_matmul_abt_mixed(g);
         g.A = bdy; g.ofs_A = ody; g.lda = static_cast<uint64_t>(out_dim); g.transA = true;
         g.B = bx;  g.ofs_B = ox;  g.ldb = static_cast<uint64_t>(in_dim);  g.transB = true;
@@ -638,46 +525,6 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
         g.M = out_dim; g.N = in_dim; g.K = B;
         g.epilogue = metal_impl::kAbtAccumulate;
         metal_impl::launch_matmul_abt_mixed(g);
-    } else if (in_dim > 0 && out_dim > 0) {
-        id<MTLComputePipelineState> pso = is_fp16 ? pso_lin_bw_dx_fp16()
-                                        : is_bf16 ? pso_lin_bw_dx_bf16()
-                                        : pso_lin_bw_dx();
-        dispatch2d(pso, in_dim, B, ^(id<MTLComputeCommandEncoder> enc) {
-            [enc setBuffer:bw offset:ow atIndex:0];
-            [enc setBuffer:bdy offset:ody atIndex:1];
-            [enc setBuffer:bdx offset:odx atIndex:2];
-            [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Ou length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&Iu length:sizeof(uint32_t) atIndex:5];
-        });
-    }
-    if ((is_fp16 || is_bf16) && out_dim > 0 && in_dim > 0) {
-        const NSUInteger dw_n = static_cast<NSUInteger>(out_dim) * in_dim;
-        @autoreleasepool {
-            id<MTLBuffer> scratch = [metal_impl::device()
-                newBufferWithLength:dw_n * sizeof(float)
-                            options:MTLResourceStorageModeShared];
-            id<MTLComputePipelineState> pso = is_fp16
-                ? pso_lin_bw_dw_fp16()
-                : is_bf16 ? pso_lin_bw_dw_bf16() : pso_lin_bw_dw_fp32_scratch();
-            dispatch2d(pso, in_dim, out_dim, ^(id<MTLComputeCommandEncoder> enc) {
-                [enc setBuffer:bdy offset:ody atIndex:0];
-                [enc setBuffer:bx offset:ox atIndex:1];
-                [enc setBuffer:scratch offset:0 atIndex:2];
-                [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:3];
-                [enc setBytes:&Ou length:sizeof(uint32_t) atIndex:4];
-                [enc setBytes:&Iu length:sizeof(uint32_t) atIndex:5];
-            });
-            const uint32_t n = static_cast<uint32_t>(dw_n);
-            id<MTLComputePipelineState> add_pso = is_fp16
-                ? pso_lbb_add_fp16()
-                : is_bf16 ? pso_lbb_add_bf16() : pso_lbb_add_fp32();
-            dispatch1d(add_pso, n, ^(id<MTLComputeCommandEncoder> enc) {
-                [enc setBuffer:scratch offset:0 atIndex:0];
-                [enc setBuffer:bdw offset:odw atIndex:1];
-                [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
-            });
-        }
     }
     if (out_dim > 0) {
         @autoreleasepool {
