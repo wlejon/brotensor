@@ -2,7 +2,8 @@
 
 // ─── Brass JIT CPU acceleration interface for brotensor ──────────────────────
 //
-// Provides high-performance AVX2/FMA compiled numerical kernels with zero GC
+// Provides high-performance FMA-vectorized compiled numerical kernels (AVX2 on
+// x86_64, NEON on AArch64 — the same brass MIR for both) with zero GC
 // overhead and multi-threaded parallel execution across rows and token chunks,
 // resolving the N=1 single-thread bottleneck for LLM decode and DiT inference.
 

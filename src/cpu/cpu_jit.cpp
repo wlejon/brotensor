@@ -776,9 +776,20 @@ void swiglu_forward(const float* X, float* Y, int B, int D) {
     ref::swiglu(X, Y, B, D);
 }
 
+// modulate and broadcast_mul are one load-op-store stream per element, which
+// the compiler already vectorizes: on AArch64 clang's NEON loop is unrolled
+// and runs these about 2x faster than the JIT's f32x8 (a q-register pair per
+// iteration, not unrolled), so there the row-parallel reference is the kernel.
+// The norms keep the JIT everywhere: their reductions are where it wins.
+#if defined(__aarch64__) || defined(_M_ARM64)
+constexpr bool kJitStreamingKernels = false;
+#else
+constexpr bool kJitStreamingKernels = true;
+#endif
+
 void modulate(const float* X, const float* scale, const float* shift, float* Y, int L, int D) {
     const auto& k = get_kernels();
-    if (!k.available || k.adaln_fn == nullptr) {
+    if (!kJitStreamingKernels || !k.available || k.adaln_fn == nullptr) {
         ref::modulate(X, scale, shift, Y, L, D);
         return;
     }
@@ -801,7 +812,7 @@ void modulate(const float* X, const float* scale, const float* shift, float* Y, 
 
 void broadcast_mul(const float* X, const float* v, float* Y, int L, int D) {
     const auto& k = get_kernels();
-    if (!k.available || k.broadcast_mul_fn == nullptr) {
+    if (!kJitStreamingKernels || !k.available || k.broadcast_mul_fn == nullptr) {
         ref::broadcast_mul(X, v, Y, L, D);
         return;
     }
