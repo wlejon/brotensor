@@ -11,8 +11,7 @@ using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_lookup;
-using metal_impl::pool_lookup_offset;
+using metal_impl::pool_require;
 
 namespace {
 
@@ -417,10 +416,7 @@ float run_xent(id<MTLBuffer> bL, NSUInteger oL, id<MTLBuffer> bT, NSUInteger oT,
 
 // The (buffer, offset) a device pointer into the Metal pool lives at.
 id<MTLBuffer> pooled(const float* p, NSUInteger& ofs, const char* op, const char* name) {
-    id<MTLBuffer> b = pool_lookup(p);
-    if (!b) fail(op, (std::string(name) + " is not a Metal device pointer").c_str());
-    ofs = pool_lookup_offset(p);
-    return b;
+    return pool_require(p, ofs, op, name);
 }
 
 void ensure_f32_like(const Tensor& like, Tensor& t) {
@@ -546,12 +542,13 @@ void softmax_xent_fused_batched(const Tensor& logits_BL,
     NSUInteger oL = buffer_offset_for(logits_BL);
     id<MTLBuffer> bT = buffer_for(target_BL);
     NSUInteger oT = buffer_offset_for(target_BL);
-    id<MTLBuffer> bM = d_mask_BL ? pool_lookup(d_mask_BL) : nil;
-    NSUInteger oM = d_mask_BL ? pool_lookup_offset(d_mask_BL) : 0;
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask_BL, oM, "softmax_xent_fused_batched", "mask");
     id<MTLBuffer> bM_arg = bM ? bM : bL;
     NSUInteger oM_arg = bM ? oM : oL;
-    id<MTLBuffer> bH = pool_lookup(d_head_offsets);
-    NSUInteger oH = pool_lookup_offset(d_head_offsets);
+    NSUInteger oH = 0;
+    id<MTLBuffer> bH = pool_require(d_head_offsets, oH, "softmax_xent_fused_batched",
+                                    "head_offsets");
     id<MTLBuffer> bP = buffer_for(probs_BL);
     NSUInteger oP = buffer_offset_for(probs_BL);
     id<MTLBuffer> bdL = buffer_for(dLogits_BL);
@@ -608,8 +605,8 @@ void bce_with_logits_fused_batched(const Tensor& logits_BL,
     NSUInteger oL = buffer_offset_for(logits_BL);
     id<MTLBuffer> bT = buffer_for(target_BL);
     NSUInteger oT = buffer_offset_for(target_BL);
-    id<MTLBuffer> bM = d_mask_BL ? pool_lookup(d_mask_BL) : nil;
-    NSUInteger oM = d_mask_BL ? pool_lookup_offset(d_mask_BL) : 0;
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask_BL, oM, "bce_with_logits_fused_batched", "mask");
     id<MTLBuffer> bM_arg = bM ? bM : bL;
     NSUInteger oM_arg = bM ? oM : oL;
     id<MTLBuffer> bP = buffer_for(probs_BL);

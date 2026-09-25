@@ -25,8 +25,7 @@ using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_lookup;
-using metal_impl::pool_lookup_offset;
+using metal_impl::pool_require;
 
 namespace {
 
@@ -202,11 +201,11 @@ void image_u8_to_f32_nhwc_to_nchw(const uint8_t* src,
 
     // Resolve the device-side src pointer through the pool (same convention
     // as embedding_lookup_forward's d_idx).
-    id<MTLBuffer> bSrc = pool_lookup(src);
-    const NSUInteger oSrc = pool_lookup_offset(src);
+    NSUInteger oSrc = 0;
+    id<MTLBuffer> bSrc = pool_require(src, oSrc, "image_u8_to_f32_nhwc_to_nchw", "src");
     if (bSrc == nil) {
         throw std::runtime_error(
-            "brotensor: image_u8_to_f32_nhwc_to_nchw: src is not a Metal-pool pointer");
+            "brotensor: image_u8_to_f32_nhwc_to_nchw: src is null");
     }
 
     id<MTLBuffer> bY = buffer_for(Y);

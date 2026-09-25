@@ -11,8 +11,7 @@ using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_lookup;
-using metal_impl::pool_lookup_offset;
+using metal_impl::pool_require;
 
 namespace {
 
@@ -213,8 +212,8 @@ void embedding_lookup_forward(const Tensor& table,
     NSUInteger oT = buffer_offset_for(table);
     id<MTLBuffer> bO = buffer_for(out);
     NSUInteger oO = buffer_offset_for(out);
-    id<MTLBuffer> bI = pool_lookup(d_idx);
-    NSUInteger oI = pool_lookup_offset(d_idx);
+    NSUInteger oI = 0;
+    id<MTLBuffer> bI = pool_require(d_idx, oI, "embedding_lookup_forward", "indices");
     const uint32_t Bu = static_cast<uint32_t>(B);
     const uint32_t Du = static_cast<uint32_t>(D);
     id<MTLComputePipelineState> pso =
@@ -247,8 +246,8 @@ void embedding_lookup_backward(const Tensor& dOut,
     NSUInteger odO = buffer_offset_for(dOut);
     id<MTLBuffer> bdT = buffer_for(dTable);
     NSUInteger odT = buffer_offset_for(dTable);
-    id<MTLBuffer> bI  = pool_lookup(d_idx);
-    NSUInteger oI = pool_lookup_offset(d_idx);
+    NSUInteger oI = 0;
+    id<MTLBuffer> bI = pool_require(d_idx, oI, "embedding_lookup_backward", "indices");
     const uint32_t Bu = static_cast<uint32_t>(B);
     const uint32_t Du = static_cast<uint32_t>(D);
 

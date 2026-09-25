@@ -392,8 +392,10 @@ void cross_attention_forward_with_attn(const Tensor& X,
         SoftmaxParams p{};
         p.Lk = static_cast<uint32_t>(Lk);
         p.has_mask = d_mask ? 1u : 0u;
-        id<MTLBuffer> bMask = d_mask ? metal_impl::pool_lookup(d_mask) : bQh;
-        const NSUInteger oMask = d_mask ? metal_impl::pool_lookup_offset(d_mask) : 0;
+        NSUInteger oMask = 0;
+        id<MTLBuffer> bMask = metal_impl::pool_require(
+            d_mask, oMask, "cross_attention_forward_with_attn", "mask");
+        if (!bMask) bMask = bQh;
         id<MTLComputePipelineState> pso = pso_row_softmax();
         const uint32_t rows = static_cast<uint32_t>(H) * static_cast<uint32_t>(Lq);
         @autoreleasepool {

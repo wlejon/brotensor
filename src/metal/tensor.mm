@@ -19,6 +19,7 @@
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace brotensor {
@@ -94,6 +95,19 @@ NSUInteger pool_lookup_offset(const void* data_ptr) {
         }
     }
     return 0;
+}
+
+id<MTLBuffer> pool_require(const void* p, NSUInteger& ofs,
+                           const char* op, const char* name) {
+    ofs = 0;
+    if (!p) return nil;
+    id<MTLBuffer> b = pool_lookup(p);
+    if (!b) {
+        throw std::runtime_error(std::string("brotensor: ") + op + ": " + name +
+                                 " is not a Metal device pointer");
+    }
+    ofs = pool_lookup_offset(p);
+    return b;
 }
 
 void pool_release(void* data_ptr) {

@@ -4,6 +4,9 @@
 
 #include <brotensor/ops.h>
 
+#include <stdexcept>
+#include <string>
+
 using namespace bt_parity;
 using brotensor::Tensor;
 using brotensor::Device;
@@ -81,5 +84,41 @@ BT_PARITY_TEST(softmax_mask_half_n128) { auto m = mask_half(128); run_softmax(12
 // Single-valid.
 BT_PARITY_TEST(softmax_mask_one_n8)   { auto m = mask_one(8);   run_softmax(8,   0x130ull, &m); }
 BT_PARITY_TEST(softmax_mask_one_n128) { auto m = mask_one(128); run_softmax(128, 0x131ull, &m); }
+
+// The mask is a device pointer. Handed a host one, Metal must throw rather than
+// resolve it to some other buffer (softmax_forward used to bind the logits in
+// the mask's place and return an unmasked softmax). CUDA cannot cheaply tell a
+// host address from a device one, so this checks Metal only.
+namespace {
+template <class Fn>
+bool throws_not_device_pointer(Fn&& fn) {
+    try {
+        fn();
+    } catch (const std::runtime_error& e) {
+        return std::string(e.what()).find("mask is not a Metal device pointer") !=
+               std::string::npos;
+    }
+    return false;
+}
+} // namespace
+
+BT_PARITY_TEST(softmax_host_mask_rejected_on_metal) {
+    if (!gpu_device().is_metal()) return;
+    const int n = 8;
+    const std::vector<float> host_mask = mask_half(n);
+    SplitMix64 rng(0x140ull);
+    Tensor logits = Tensor::vec(n);
+    fill_random(logits, rng);
+    Tensor glogits = logits.to(gpu_device());
+    Tensor gtarget = Tensor::zeros_on(gpu_device(), n, 1);
+    Tensor gprobs = Tensor::zeros_on(gpu_device(), n, 1);
+    Tensor gdLogits = Tensor::zeros_on(gpu_device(), n, 1);
+    BT_CHECK(throws_not_device_pointer([&] {
+        brotensor::softmax_forward(glogits, gprobs, host_mask.data());
+    }));
+    BT_CHECK(throws_not_device_pointer([&] {
+        brotensor::softmax_xent_fused(glogits, gtarget, host_mask.data(), gprobs, gdLogits);
+    }));
+}
 
 int main() { return run_all("softmax cpu/gpu parity"); }

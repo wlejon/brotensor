@@ -10,7 +10,7 @@ using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_lookup;
+using metal_impl::pool_require;
 
 namespace {
 
@@ -431,8 +431,8 @@ void attention_forward(const Tensor& X,
     NSUInteger oY = buffer_offset_for(Y_pre_Wo);
     id<MTLBuffer> bO = buffer_for(O);
     NSUInteger oO = buffer_offset_for(O);
-    id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
-    NSUInteger oM = d_mask ? metal_impl::pool_lookup_offset(d_mask) : 0;
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask, oM, "attention_forward", "mask");
     id<MTLBuffer> bM_arg = bM ? bM : bX;
     NSUInteger oM_arg = bM ? oM : oX;
     const uint32_t Nu = static_cast<uint32_t>(N);
@@ -550,8 +550,8 @@ void attention_backward(const Tensor& dO,
     NSUInteger odWv = buffer_offset_for(dWv);
     id<MTLBuffer> bdWo = buffer_for(dWo);
     NSUInteger odWo = buffer_offset_for(dWo);
-    id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
-    NSUInteger oM = d_mask ? metal_impl::pool_lookup_offset(d_mask) : 0;
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask, oM, "attention_backward", "mask");
     id<MTLBuffer> bM_arg = bM ? bM : bX;
     NSUInteger oM_arg = bM ? oM : buffer_offset_for(X);
 

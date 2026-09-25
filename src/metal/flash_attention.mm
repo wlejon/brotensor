@@ -21,8 +21,7 @@ using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_lookup;
-using metal_impl::pool_lookup_offset;
+using metal_impl::pool_require;
 
 namespace {
 
@@ -843,8 +842,8 @@ void run_causal_flash(const Tensor& Q,
     const NSUInteger oK = buffer_offset_for(K);
     const NSUInteger oV = buffer_offset_for(V);
     const NSUInteger oO = buffer_offset_for(O);
-    id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
-    NSUInteger oM = d_mask ? pool_lookup_offset(d_mask) : 0;
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask, oM, "flash_attention_forward", "mask");
     id<MTLBuffer> bM_arg = bM ? bM : bQ;
     NSUInteger oM_arg = bM ? oM : oQ;
 
@@ -967,8 +966,8 @@ void flash_attention_forward(const Tensor& Q,
     id<MTLBuffer> bP = buffer_for(P);    const NSUInteger oP = buffer_offset_for(P);
     id<MTLBuffer> bVt = buffer_for(Vth); const NSUInteger oVt = buffer_offset_for(Vth);
 
-    id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
-    const NSUInteger oM = d_mask ? pool_lookup_offset(d_mask) : 0;
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask, oM, "flash_attention_forward", "mask");
     const uint32_t has_mask = d_mask ? 1u : 0u;
     const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
     const NSUInteger esz = static_cast<NSUInteger>(dtype_size_bytes(dt));
@@ -1078,10 +1077,11 @@ void flash_attention_varlen_forward(const Tensor& Q,
     id<MTLBuffer> bK = buffer_for(K); NSUInteger oK = buffer_offset_for(K);
     id<MTLBuffer> bV = buffer_for(V); NSUInteger oV = buffer_offset_for(V);
     id<MTLBuffer> bO = buffer_for(O); NSUInteger oO = buffer_offset_for(O);
-    id<MTLBuffer> bCQ = pool_lookup(cu_seqlens_q);
-    NSUInteger oCQ = pool_lookup_offset(cu_seqlens_q);
-    id<MTLBuffer> bCK = pool_lookup(cu_seqlens_k);
-    NSUInteger oCK = pool_lookup_offset(cu_seqlens_k);
+    NSUInteger oCQ = 0, oCK = 0;
+    id<MTLBuffer> bCQ = pool_require(cu_seqlens_q, oCQ, "flash_attention_varlen_forward",
+                                     "cu_seqlens_q");
+    id<MTLBuffer> bCK = pool_require(cu_seqlens_k, oCK, "flash_attention_varlen_forward",
+                                     "cu_seqlens_k");
 
     const uint32_t Bu = (uint32_t)batch_size;
     const uint32_t Du = (uint32_t)D;

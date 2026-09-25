@@ -13,8 +13,7 @@ using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_lookup;
-using metal_impl::pool_lookup_offset;
+using metal_impl::pool_require;
 
 namespace {
 
@@ -845,12 +844,12 @@ void flash_attention_decode_masked(const Tensor& Q,
     id<MTLBuffer> bQ = buffer_for(Q);
     id<MTLBuffer> bK = buffer_for(K_cache);
     id<MTLBuffer> bV = buffer_for(V_cache);
-    id<MTLBuffer> bM = pool_lookup(d_mask);
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask, oM, "flash_attention_decode_masked", "mask");
     id<MTLBuffer> bO = buffer_for(O);
     const NSUInteger oQ = buffer_offset_for(Q);
     const NSUInteger oK = buffer_offset_for(K_cache);
     const NSUInteger oV = buffer_offset_for(V_cache);
-    const NSUInteger oM = pool_lookup_offset(d_mask);
     const NSUInteger oO = buffer_offset_for(O);
 
     const NSUInteger shmem_bytes = (FAD_KTILE + FAD_BLOCK) * sizeof(float);

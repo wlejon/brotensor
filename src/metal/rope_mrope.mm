@@ -6,7 +6,7 @@
 // out which axis its pair belongs to and looks up cos/sin at pos_a[row].
 //
 // CPU exposes pos_t/h/w as host pointers; Metal looks them up in the device
-// buffer pool via pool_lookup() — same convention as
+// buffer pool via pool_require() — same convention as
 // flash_attention_varlen_forward's cu_seqlens.
 
 #include <brotensor/runtime.h>
@@ -23,8 +23,7 @@ using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_lookup;
-using metal_impl::pool_lookup_offset;
+using metal_impl::pool_require;
 
 namespace {
 
@@ -185,12 +184,13 @@ void rope_apply_mrope(const Tensor& X,
     NSUInteger oCW    = d_w > 0 ? buffer_offset_for(cos_w) : 0;
     id<MTLBuffer> bSW = d_w > 0 ? buffer_for(sin_w) : buffer_for(X);
     NSUInteger oSW    = d_w > 0 ? buffer_offset_for(sin_w) : 0;
-    id<MTLBuffer> bPT = d_t > 0 ? pool_lookup(pos_t) : buffer_for(X);
-    NSUInteger oPT    = d_t > 0 ? pool_lookup_offset(pos_t) : 0;
-    id<MTLBuffer> bPH = d_h > 0 ? pool_lookup(pos_h) : buffer_for(X);
-    NSUInteger oPH    = d_h > 0 ? pool_lookup_offset(pos_h) : 0;
-    id<MTLBuffer> bPW = d_w > 0 ? pool_lookup(pos_w) : buffer_for(X);
-    NSUInteger oPW    = d_w > 0 ? pool_lookup_offset(pos_w) : 0;
+    NSUInteger oPT = 0, oPH = 0, oPW = 0;
+    id<MTLBuffer> bPT = d_t > 0 ? pool_require(pos_t, oPT, "rope_apply_mrope", "pos_t")
+                                : buffer_for(X);
+    id<MTLBuffer> bPH = d_h > 0 ? pool_require(pos_h, oPH, "rope_apply_mrope", "pos_h")
+                                : buffer_for(X);
+    id<MTLBuffer> bPW = d_w > 0 ? pool_require(pos_w, oPW, "rope_apply_mrope", "pos_w")
+                                : buffer_for(X);
 
     const uint32_t Lu = (uint32_t)L;
     const uint32_t Hu = (uint32_t)num_heads;

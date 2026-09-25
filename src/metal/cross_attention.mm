@@ -19,7 +19,7 @@ using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_lookup;
+using metal_impl::pool_require;
 
 namespace {
 
@@ -509,8 +509,8 @@ void cross_attention_forward_train_core(const Tensor& X,
     id<MTLBuffer> bAh = buffer_for(Attnh); NSUInteger oAh = buffer_offset_for(Attnh);
     id<MTLBuffer> bYc = buffer_for(Yconcat); NSUInteger oYc = buffer_offset_for(Yconcat);
     id<MTLBuffer> bO  = buffer_for(O); NSUInteger oO = buffer_offset_for(O);
-    id<MTLBuffer> bM  = d_mask ? pool_lookup(d_mask) : nil;
-    NSUInteger oM = d_mask ? metal_impl::pool_lookup_offset(d_mask) : 0;
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask, oM, "cross_attention_forward", "mask");
     id<MTLBuffer> bM_arg = bM ? bM : bX;
     NSUInteger oM_arg = bM ? oM : oX;
 
@@ -684,8 +684,8 @@ void cross_attention_backward(const Tensor& dO,
     id<MTLBuffer> bdWk = buffer_for(dWk); NSUInteger odWk = buffer_offset_for(dWk);
     id<MTLBuffer> bdWv = buffer_for(dWv); NSUInteger odWv = buffer_offset_for(dWv);
     id<MTLBuffer> bdWo = buffer_for(dWo); NSUInteger odWo = buffer_offset_for(dWo);
-    id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
-    NSUInteger oM = d_mask ? metal_impl::pool_lookup_offset(d_mask) : 0;
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask, oM, "cross_attention_backward", "mask");
     id<MTLBuffer> bM_arg = bM ? bM : bX;
     NSUInteger oM_arg = bM ? oM : oX;
 

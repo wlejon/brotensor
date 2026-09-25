@@ -17,8 +17,7 @@ using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_lookup;
-using metal_impl::pool_lookup_offset;
+using metal_impl::pool_require;
 
 namespace {
 
@@ -134,8 +133,8 @@ void masked_mean_pool_forward(const Tensor& X, const float* d_mask,
     NSUInteger oX = buffer_offset_for(X);
     id<MTLBuffer> bY = buffer_for(y);
     NSUInteger oY = buffer_offset_for(y);
-    id<MTLBuffer> bM = d_mask ? pool_lookup(d_mask) : nil;
-    NSUInteger oM = d_mask ? pool_lookup_offset(d_mask) : 0;
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask, oM, "masked_mean_pool_forward", "mask");
     const uint32_t Ku = static_cast<uint32_t>(K);
     const uint32_t Du = static_cast<uint32_t>(D);
     const uint32_t has_mask = d_mask ? 1u : 0u;
@@ -171,8 +170,8 @@ void masked_mean_pool_backward(const Tensor& dY, const float* d_mask,
     NSUInteger odY = buffer_offset_for(dY);
     id<MTLBuffer> bdX = buffer_for(dX);
     NSUInteger odX = buffer_offset_for(dX);
-    id<MTLBuffer> bM  = d_mask ? pool_lookup(d_mask) : nil;
-    NSUInteger oM = d_mask ? pool_lookup_offset(d_mask) : 0;
+    NSUInteger oM = 0;
+    id<MTLBuffer> bM = pool_require(d_mask, oM, "masked_mean_pool_backward", "mask");
     id<MTLBuffer> bM_arg = bM ? bM : bdY;
     NSUInteger oM_arg = bM ? oM : odY;
     const uint32_t Ku = static_cast<uint32_t>(K);

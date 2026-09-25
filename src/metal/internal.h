@@ -46,6 +46,15 @@ namespace brotensor::metal_impl {
 void  pool_register(void* data_ptr, id<MTLBuffer> buf);
 void  pool_release(void* data_ptr);
 
+// The pooled buffer a raw device-pointer operand (a mask, indices, offsets)
+// lives in, with its byte offset in `ofs`. A null `p` is "no operand": nil,
+// offset 0. A non-null `p` no pooled buffer contains — a host pointer, or one
+// from another backend or already freed — throws "brotensor: <op>: <name> is
+// not a Metal device pointer" rather than leaving the op to bind some other
+// buffer in its place.
+id<MTLBuffer> pool_require(const void* p, NSUInteger& ofs,
+                           const char* op, const char* name);
+
 // Run a single-output MPSGraph synchronously: feed the named placeholders
 // from MTLBuffers, write the result to result_buffer. Synchronous — caller
 // does not need a separate cuda_sync.

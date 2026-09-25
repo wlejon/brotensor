@@ -41,8 +41,7 @@ using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_lookup;
-using metal_impl::pool_lookup_offset;
+using metal_impl::pool_require;
 
 namespace {
 
@@ -307,8 +306,8 @@ void flash_attention_backward(const Tensor& Q,
         return;
     }
 
-    id<MTLBuffer> bMask = d_mask ? pool_lookup(d_mask) : nil;
-    const NSUInteger oMask = d_mask ? pool_lookup_offset(d_mask) : 0;
+    NSUInteger oMask = 0;
+    id<MTLBuffer> bMask = pool_require(d_mask, oMask, "flash_attention_backward", "mask");
     Fp32Io io(Q, K, V, dO, dQ, dK, dV);
     backward_block_f32(rows_of(*io.Q), rows_of(*io.K), rows_of(*io.V), rows_of(*io.dO), rows_of(*io.dQ),
                        rows_of(*io.dK), rows_of(*io.dV), Lq, Lk, D, num_heads, hd, bMask, oMask, causal);
@@ -381,12 +380,15 @@ void flash_attention_varlen_backward(const Tensor& Q,
     }
 
     ::brotensor::sync(Device::Metal);   // the offsets may come from a GPU op still in flight
-    id<MTLBuffer> bCQ = pool_lookup(cu_seqlens_q);
-    id<MTLBuffer> bCK = pool_lookup(cu_seqlens_k);
+    NSUInteger oCQ = 0, oCK = 0;
+    id<MTLBuffer> bCQ = pool_require(cu_seqlens_q, oCQ, "flash_attention_varlen_backward",
+                                     "cu_seqlens_q");
+    id<MTLBuffer> bCK = pool_require(cu_seqlens_k, oCK, "flash_attention_varlen_backward",
+                                     "cu_seqlens_k");
     const int32_t* cq = reinterpret_cast<const int32_t*>(
-        reinterpret_cast<const char*>([bCQ contents]) + pool_lookup_offset(cu_seqlens_q));
+        reinterpret_cast<const char*>([bCQ contents]) + oCQ);
     const int32_t* ck = reinterpret_cast<const int32_t*>(
-        reinterpret_cast<const char*>([bCK contents]) + pool_lookup_offset(cu_seqlens_k));
+        reinterpret_cast<const char*>([bCK contents]) + oCK);
 
     if (cq[0] != 0)
         throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q[0] must be 0");
