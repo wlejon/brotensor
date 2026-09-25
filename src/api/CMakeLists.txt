@@ -1,5 +1,5 @@
 # On a target brass has no code generator for (BRASS_HOST_BACKEND, decided in
-# brass's CMakeLists — Apple Silicon today) js/tensor.js is not compiled and
+# brass's CMakeLists; x86_64 and AArch64 have one) js/tensor.js is not compiled and
 # a no-op entry stands in: the natives still register, but nothing mounts
 # `bro.tensor`. BROTENSOR_API_COMPILED_JS tells the tests which of the two
 # they are looking at.
@@ -23,7 +23,7 @@ set(BROTENSOR_API_NATIVE_SOURCES
 )
 
 if(NOT BRASS_HOST_BACKEND)
-    set(BROTENSOR_COMPILED_JS_OBJECTS "${CMAKE_CURRENT_SOURCE_DIR}/bronze_js_stubs_arm64.cpp")
+    set(BROTENSOR_COMPILED_JS_OBJECTS "${CMAKE_CURRENT_SOURCE_DIR}/bronze_js_stubs_nobackend.cpp")
     set(BROTENSOR_API_COMPILED_JS OFF PARENT_SCOPE)
     message(STATUS "brotensor: api built with the no-op JS entry (brass has no code generator for this target)")
 else()
@@ -34,7 +34,7 @@ else()
     add_executable(brotensor-native-manifest
         manifest_tool.cpp
         ${BROTENSOR_API_NATIVE_SOURCES}
-        bronze_js_stubs_arm64.cpp
+        bronze_js_stubs_nobackend.cpp
     )
     target_include_directories(brotensor-native-manifest PRIVATE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../include>

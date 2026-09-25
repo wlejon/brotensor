@@ -54,10 +54,9 @@ jobs:
   # break never surfaces.
   #
   # macOS here is deliberately *without* Metal — it is the arm64 / AppleClang
-  # build check for the portable core (the SIMD baseline is x86-gated). bronze
-  # emits x86_64 only, so on that runner the api is built with its no-op JS
-  # entry and brotensor_test_api is not registered (tests/CMakeLists.txt); the
-  # three x86-64 jobs are where the api runs.
+  # build check for the portable core (the SIMD baseline and the brass CPU JIT
+  # are x86-gated). brass has a native AArch64 code generator, so js/tensor.js
+  # is compiled and brotensor_test_api runs there as on the x86-64 rows.
   cpu:
     name: CPU · ${{ matrix.name }}
     runs-on: ${{ matrix.os }}

@@ -274,12 +274,14 @@ if(NOT TARGET brass)
     endif()
 endif()
 
-# A brass with no code generator for this target (BRASS_HOST_BACKEND OFF —
-# Apple Silicon today) is no JIT: brotensor_cpu would compile every trace it
-# is handed into bytes the CPU cannot execute, and the first op through it
-# is SIGBUS. Such a build takes the plain kernels, as if brass were absent.
-# Note: brotensor's CPU JIT specifically emits x86-64 AVX2 (256-bit) vector instructions,
-# so the JIT is restricted to x86_64/AMD64 until ARM64 NEON vector paths are implemented.
+# A brass with no code generator for this target (BRASS_HOST_BACKEND OFF) is
+# no JIT: brotensor_cpu would compile every trace it is handed into bytes the
+# CPU cannot execute, and the first op through it is SIGBUS. Such a build
+# takes the plain kernels, as if brass were absent.
+# brass itself has an AArch64 backend (Apple Silicon included), but
+# brotensor's CPU JIT emits x86-64 AVX2 (256-bit) vector instructions, so the
+# JIT stays restricted to x86_64/AMD64 until ARM64 NEON vector paths are
+# implemented; on AArch64 the plain kernels are used.
 if((TARGET brass AND NOT BRASS_HOST_BACKEND) OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
     message(STATUS "brotensor: brass has no x86_64 CPU JIT for this target; CPU JIT off")
 elseif(TARGET brass)
