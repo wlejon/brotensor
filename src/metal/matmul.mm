@@ -1,6 +1,6 @@
 // Public matmul_gpu: row-major C(M,N) = A(M,K) @ B(K,N), no bias.
-// FP32 + FP16 dispatch; FP32 accumulation throughout. Naive tiled GEMM,
-// mirroring src/cuda/matmul.cu.
+// FP32 accumulation throughout. FP32 and BF16 ride the simdgroup GEMM in
+// gemm_fp32.mm; FP16 keeps a naive tiled GEMM mirroring src/cuda/matmul.cu.
 
 #include <brotensor/runtime.h>
 
@@ -158,6 +158,18 @@ void matmul(const Tensor& A, const Tensor& B, Tensor& C) {
     }
     if (A.dtype != Dtype::FP32 && A.dtype != Dtype::FP16 && A.dtype != Dtype::BF16) {
         throw std::runtime_error("matmul_gpu: only FP32/FP16/BF16 supported");
+    }
+
+    if (A.dtype != Dtype::FP16) {
+        // FP32 / BF16: the simdgroup GEMM (gemm_fp32.mm), B read as (K, N).
+        metal_impl::AbtMixed g;
+        g.A = buffer_for(A); g.ofs_A = buffer_offset_for(A); g.lda = static_cast<uint64_t>(K);
+        g.B = buffer_for(B); g.ofs_B = buffer_offset_for(B); g.ldb = static_cast<uint64_t>(N); g.transB = true;
+        g.C = buffer_for(C); g.ofs_C = buffer_offset_for(C); g.ldc = static_cast<uint64_t>(N);
+        g.M = M; g.N = N; g.K = K;
+        g.in = g.out = metal_impl::abt_type(A.dtype);
+        metal_impl::launch_matmul_abt_mixed(g);
+        return;
     }
 
     id<MTLComputePipelineState> pso = (A.dtype == Dtype::FP16) ? pso_fp16()

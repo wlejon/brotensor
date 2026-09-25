@@ -652,6 +652,14 @@ void launch_matmul_abt_mixed(const AbtMixed& g) {
     id<MTLBuffer> bBias = g.bias ? g.bias : g.A;
     const NSUInteger oBias = g.bias ? g.ofs_bias : g.ofs_A;
 
+    // FP32 / BF16 inputs multiply in FP32: the dedicated kernel (gemm_fp32.mm)
+    // is several times faster than the widening path below, and small-M rows
+    // take its GEMV-like kernel rather than the naive one.
+    if (g.in != kAbtF16 && p.K > 0 &&
+        (g.M <= 8 || static_cast<size_t>(g.M) * static_cast<size_t>(g.N) >= kTiledMin)) {
+        launch_gemm_fp32(g);
+        return;
+    }
     const bool tiled = p.K > 0 && static_cast<size_t>(g.M) * static_cast<size_t>(g.N) >= kTiledMin;
     id<MTLComputePipelineState> pso = pso_mixed(tiled, g.in, g.out);
     @autoreleasepool {

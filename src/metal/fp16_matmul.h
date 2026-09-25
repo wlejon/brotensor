@@ -76,6 +76,12 @@ struct AbtMixed {
 
 void launch_matmul_abt_mixed(const AbtMixed& g);
 
+// The FP32-multiply GEMM (src/metal/gemm_fp32.mm) that launch_matmul_abt_mixed
+// hands every FP32 / BF16 input to: a double-buffered 64x64x16 simdgroup_float
+// kernel for general shapes and a register-blocked kernel for M <= 8. Same
+// AbtMixed contract; the input type must not be FP16 and K must be positive.
+void launch_gemm_fp32(const AbtMixed& g);
+
 // The AbtType for a 16/32-bit float Dtype; throws on anything else.
 AbtType abt_type(::brotensor::Dtype dt);
 

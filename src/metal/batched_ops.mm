@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #import "internal.h"
+#import "fp16_matmul.h"
 
 namespace brotensor::detail::metal {
 
@@ -436,6 +437,18 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
         Y_BD.resize(B, out_dim, Dtype::FP32);
     }
     if (B == 0 || out_dim == 0) return;
+    if (W.dtype == Dtype::FP32 && in_dim > 0) {
+        // Y = X @ W^T + bias on the simdgroup GEMM (gemm_fp32.mm).
+        metal_impl::AbtMixed g;
+        g.A = buffer_for(X_BD); g.ofs_A = buffer_offset_for(X_BD); g.lda = static_cast<uint64_t>(in_dim);
+        g.B = buffer_for(W);    g.ofs_B = buffer_offset_for(W);    g.ldb = static_cast<uint64_t>(in_dim);
+        g.C = buffer_for(Y_BD); g.ofs_C = buffer_offset_for(Y_BD); g.ldc = static_cast<uint64_t>(out_dim);
+        g.bias = buffer_for(bias); g.ofs_bias = buffer_offset_for(bias);
+        g.M = B; g.N = out_dim; g.K = in_dim;
+        g.in = g.out = metal_impl::kAbtF32;
+        metal_impl::launch_matmul_abt_mixed(g);
+        return;
+    }
     id<MTLComputePipelineState> pso =
         W.dtype == Dtype::FP16 ? pso_lin_fw_hw()
         : W.dtype == Dtype::BF16 ? pso_lin_fw_bw()
@@ -609,7 +622,23 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
     const uint32_t Ou = static_cast<uint32_t>(out_dim);
     const uint32_t Iu = static_cast<uint32_t>(in_dim);
 
-    if (in_dim > 0 && out_dim > 0) {
+    if (!is_fp16 && !is_bf16 && in_dim > 0 && out_dim > 0) {
+        // FP32 on the simdgroup GEMM: dX(B, in) = dY(B, out) @ W(out, in),
+        // then dW(out, in) += dY^T @ X (both operands read transposed).
+        metal_impl::AbtMixed g;
+        g.A = bdy; g.ofs_A = ody; g.lda = static_cast<uint64_t>(out_dim);
+        g.B = bw;  g.ofs_B = ow;  g.ldb = static_cast<uint64_t>(in_dim); g.transB = true;
+        g.C = bdx; g.ofs_C = odx; g.ldc = static_cast<uint64_t>(in_dim);
+        g.M = B; g.N = in_dim; g.K = out_dim;
+        g.in = g.out = metal_impl::kAbtF32;
+        metal_impl::launch_matmul_abt_mixed(g);
+        g.A = bdy; g.ofs_A = ody; g.lda = static_cast<uint64_t>(out_dim); g.transA = true;
+        g.B = bx;  g.ofs_B = ox;  g.ldb = static_cast<uint64_t>(in_dim);  g.transB = true;
+        g.C = bdw; g.ofs_C = odw; g.ldc = static_cast<uint64_t>(in_dim);
+        g.M = out_dim; g.N = in_dim; g.K = B;
+        g.epilogue = metal_impl::kAbtAccumulate;
+        metal_impl::launch_matmul_abt_mixed(g);
+    } else if (in_dim > 0 && out_dim > 0) {
         id<MTLComputePipelineState> pso = is_fp16 ? pso_lin_bw_dx_fp16()
                                         : is_bf16 ? pso_lin_bw_dx_bf16()
                                         : pso_lin_bw_dx();
@@ -622,7 +651,7 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
             [enc setBytes:&Iu length:sizeof(uint32_t) atIndex:5];
         });
     }
-    if (out_dim > 0 && in_dim > 0) {
+    if ((is_fp16 || is_bf16) && out_dim > 0 && in_dim > 0) {
         const NSUInteger dw_n = static_cast<NSUInteger>(out_dim) * in_dim;
         @autoreleasepool {
             id<MTLBuffer> scratch = [metal_impl::device()

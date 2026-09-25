@@ -496,6 +496,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/gemm.mm
         src/metal/elementwise.mm
         src/metal/fp16_matmul.mm
+        src/metal/gemm_fp32.mm
         src/metal/linear_ex.mm
         src/metal/packed_encoder.mm
         src/metal/xavier_init.mm
@@ -583,6 +584,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/gemm.mm
         src/metal/elementwise.mm
         src/metal/fp16_matmul.mm
+        src/metal/gemm_fp32.mm
         src/metal/linear_ex.mm
         src/metal/packed_encoder.mm
         src/metal/xavier_init.mm

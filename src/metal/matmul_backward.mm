@@ -1,6 +1,7 @@
-// Backward of matmul_gpu (Metal). FP32 path uses atomic_float accumulation
-// directly into dA / dB. FP16 path accumulates into FP32 scratch then folds
-// into the caller-owned FP16 dA / dB (accumulating semantics).
+// Backward of matmul_gpu (Metal). FP32 runs both products on the simdgroup
+// GEMM (gemm_fp32.mm) with an accumulating epilogue. The FP16 / BF16 paths
+// accumulate into FP32 scratch then fold into the caller-owned dA / dB
+// (accumulating semantics).
 
 #include <brotensor/runtime.h>
 
@@ -8,6 +9,7 @@
 #include <stdexcept>
 
 #import "internal.h"
+#import "fp16_matmul.h"
 
 namespace brotensor::detail::metal {
 
@@ -25,62 +27,6 @@ NSString* const kSrc = @R"msl(
 using namespace metal;
 
 constant uint MMB_TILE = 16;
-
-kernel void k_mmb_dA_fp32(device const float* dC [[buffer(0)]],
-                          device const float* B  [[buffer(1)]],
-                          device atomic_float* dA [[buffer(2)]],
-                          constant uint& M [[buffer(3)]],
-                          constant uint& N [[buffer(4)]],
-                          constant uint& K [[buffer(5)]],
-                          uint2 tg  [[threadgroup_position_in_grid]],
-                          uint2 lid [[thread_position_in_threadgroup]]) {
-    threadgroup float dCs[MMB_TILE][MMB_TILE];
-    threadgroup float Bts[MMB_TILE][MMB_TILE];
-    uint row = tg.y * MMB_TILE + lid.y;
-    uint col = tg.x * MMB_TILE + lid.x;
-    float acc = 0.0f;
-    uint n_tiles = (N + MMB_TILE - 1) / MMB_TILE;
-    for (uint t = 0; t < n_tiles; ++t) {
-        uint dc_col = t * MMB_TILE + lid.x;
-        uint bt_row = t * MMB_TILE + lid.y;
-        dCs[lid.y][lid.x] = (row < M && dc_col < N) ? dC[row * N + dc_col] : 0.0f;
-        Bts[lid.y][lid.x] = (col < K && bt_row < N) ? B[col * N + bt_row] : 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint n = 0; n < MMB_TILE; ++n) acc += dCs[lid.y][n] * Bts[n][lid.x];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (row < M && col < K) {
-        atomic_fetch_add_explicit(&dA[row * K + col], acc, memory_order_relaxed);
-    }
-}
-
-kernel void k_mmb_dB_fp32(device const float* A  [[buffer(0)]],
-                          device const float* dC [[buffer(1)]],
-                          device atomic_float* dB [[buffer(2)]],
-                          constant uint& M [[buffer(3)]],
-                          constant uint& N [[buffer(4)]],
-                          constant uint& K [[buffer(5)]],
-                          uint2 tg  [[threadgroup_position_in_grid]],
-                          uint2 lid [[thread_position_in_threadgroup]]) {
-    threadgroup float Ats[MMB_TILE][MMB_TILE];
-    threadgroup float dCs[MMB_TILE][MMB_TILE];
-    uint row = tg.y * MMB_TILE + lid.y;
-    uint col = tg.x * MMB_TILE + lid.x;
-    float acc = 0.0f;
-    uint n_tiles = (M + MMB_TILE - 1) / MMB_TILE;
-    for (uint t = 0; t < n_tiles; ++t) {
-        uint a_row  = t * MMB_TILE + lid.x;
-        uint dc_row = t * MMB_TILE + lid.y;
-        Ats[lid.y][lid.x] = (row < K && a_row < M) ? A[a_row * K + row] : 0.0f;
-        dCs[lid.y][lid.x] = (dc_row < M && col < N) ? dC[dc_row * N + col] : 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint m = 0; m < MMB_TILE; ++m) acc += Ats[lid.y][m] * dCs[m][lid.x];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (row < K && col < N) {
-        atomic_fetch_add_explicit(&dB[row * N + col], acc, memory_order_relaxed);
-    }
-}
 
 kernel void k_mmb_dA_fp16(device const half* dC [[buffer(0)]],
                           device const half* B  [[buffer(1)]],
@@ -220,8 +166,6 @@ kernel void k_mmb_fold_bf16(device bfloat*      dst [[buffer(0)]],
         dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, FN); }); \
         return pso; \
     }
-DEF_PSO(pso_dA_fp32,  @"k_mmb_dA_fp32")
-DEF_PSO(pso_dB_fp32,  @"k_mmb_dB_fp32")
 DEF_PSO(pso_dA_fp16,  @"k_mmb_dA_fp16")
 DEF_PSO(pso_dB_fp16,  @"k_mmb_dB_fp16")
 DEF_PSO(pso_fold,     @"k_mmb_fold_fp16")
@@ -278,34 +222,22 @@ void matmul_backward(const Tensor& A,
                                 (K + MMB_TILE - 1) / MMB_TILE, 1);
 
     if (A.dtype == Dtype::FP32) {
-        id<MTLBuffer> bdA = buffer_for(dA);
-        id<MTLBuffer> bdB = buffer_for(dB);
-        const NSUInteger odA = buffer_offset_for(dA);
-        const NSUInteger odB = buffer_offset_for(dB);
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            [enc setComputePipelineState:pso_dA_fp32()];
-            [enc setBuffer:bdC offset:odC atIndex:0];
-            [enc setBuffer:bB  offset:oB  atIndex:1];
-            [enc setBuffer:bdA offset:odA atIndex:2];
-            [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
-            [enc dispatchThreadgroups:gridA threadsPerThreadgroup:tg];
-
-            [enc setComputePipelineState:pso_dB_fp32()];
-            [enc setBuffer:bA  offset:oA  atIndex:0];
-            [enc setBuffer:bdC offset:odC atIndex:1];
-            [enc setBuffer:bdB offset:odB atIndex:2];
-            [enc setBytes:&Mu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:4];
-            [enc setBytes:&Ku length:sizeof(uint32_t) atIndex:5];
-            [enc dispatchThreadgroups:gridB threadsPerThreadgroup:tg];
-
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
+        // The simdgroup GEMM (gemm_fp32.mm), accumulating into dA / dB.
+        //   dA(M, K) += dC(M, N) @ B(K, N)^T
+        //   dB(K, N) += A(M, K)^T @ dC(M, N)
+        metal_impl::AbtMixed g;
+        g.in = g.out = metal_impl::kAbtF32;
+        g.epilogue = metal_impl::kAbtAccumulate;
+        g.A = bdC; g.ofs_A = odC; g.lda = static_cast<uint64_t>(N);
+        g.B = bB;  g.ofs_B = oB;  g.ldb = static_cast<uint64_t>(N);
+        g.C = buffer_for(dA); g.ofs_C = buffer_offset_for(dA); g.ldc = static_cast<uint64_t>(K);
+        g.M = M; g.N = K; g.K = N;
+        metal_impl::launch_matmul_abt_mixed(g);
+        g.A = bA;  g.ofs_A = oA;  g.lda = static_cast<uint64_t>(K); g.transA = true;
+        g.B = bdC; g.ofs_B = odC; g.ldb = static_cast<uint64_t>(N); g.transB = true;
+        g.C = buffer_for(dB); g.ofs_C = buffer_offset_for(dB); g.ldc = static_cast<uint64_t>(N);
+        g.M = K; g.N = N; g.K = M;
+        metal_impl::launch_matmul_abt_mixed(g);
         return;
     }
 
