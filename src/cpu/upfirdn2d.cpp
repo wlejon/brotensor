@@ -20,7 +20,9 @@
 // ceil(conv_valid_len / down_y) — equal to the slicing x[::down_y] count.
 
 #include <brotensor/tensor.h>
+#include <brotensor/detail/cpu/thread_pool.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -77,34 +79,35 @@ void upfirdn2d_run(const ::brotensor::Tensor& In, int N, int C, int Hin, int Win
     const float* Fp = f.host_f32();
     float* Op = Out.host_f32_mut();
 
-    for (int n = 0; n < N; ++n) {
-        for (int c = 0; c < C; ++c) {
-            const size_t in_base  = (static_cast<size_t>(n) * C + c) * Hin * Win;
-            const size_t out_base = (static_cast<size_t>(n) * C + c) * Hout * Wout;
-            for (int oh = 0; oh < Hout; ++oh) {
-                const int py_base = oh * down_y;
-                for (int ow = 0; ow < Wout; ++ow) {
-                    const int px_base = ow * down_x;
-                    float acc = 0.0f;
-                    for (int kh = 0; kh < fH; ++kh) {
-                        const int uy = py_base + kh - py0;
-                        if (uy < 0 || uy >= Hu || (uy % up_y) != 0) continue;
-                        const int iy = uy / up_y;
-                        const int frow = flip_filter ? kh : (fH - 1 - kh);
-                        for (int kw = 0; kw < fW; ++kw) {
-                            const int ux = px_base + kw - px0;
-                            if (ux < 0 || ux >= Wu || (ux % up_x) != 0) continue;
-                            const int ix = ux / up_x;
-                            const int fcol = flip_filter ? kw : (fW - 1 - kw);
-                            acc += Ip[in_base + static_cast<size_t>(iy) * Win + ix] *
-                                   Fp[static_cast<size_t>(frow) * fW + fcol];
-                        }
+    // One (n, c) plane per task. Only taps landing on a real (non-zero-
+    // inserted, in-range) input sample contribute, so kh/kw start at the first
+    // such tap and step by the up factor: the same taps in the same order as a
+    // full scan (bit-identical), up_x*up_y fewer iterations.
+    parallel_for(static_cast<std::size_t>(N) * C, [&](std::size_t nc) {
+        const size_t in_base  = nc * Hin * Win;
+        const size_t out_base = nc * Hout * Wout;
+        for (int oh = 0; oh < Hout; ++oh) {
+            const int by = oh * down_y - py0;
+            int kh0 = std::max(0, -by);
+            if (const int r = (by + kh0) % up_y) kh0 += up_y - r;
+            const int kh1 = std::min(fH, Hu - by);
+            for (int ow = 0; ow < Wout; ++ow) {
+                const int bx = ow * down_x - px0;
+                int kw0 = std::max(0, -bx);
+                if (const int r = (bx + kw0) % up_x) kw0 += up_x - r;
+                const int kw1 = std::min(fW, Wu - bx);
+                float acc = 0.0f;
+                for (int kh = kh0; kh < kh1; kh += up_y) {
+                    const float* xr = Ip + in_base + static_cast<size_t>((by + kh) / up_y) * Win;
+                    const float* fr = Fp + static_cast<size_t>(flip_filter ? kh : (fH - 1 - kh)) * fW;
+                    for (int kw = kw0; kw < kw1; kw += up_x) {
+                        acc += xr[(bx + kw) / up_x] * fr[flip_filter ? kw : (fW - 1 - kw)];
                     }
-                    Op[out_base + static_cast<size_t>(oh) * Wout + ow] = acc * gain;
                 }
+                Op[out_base + static_cast<size_t>(oh) * Wout + ow] = acc * gain;
             }
         }
-    }
+    });
 }
 
 // Forward output height/width for the given params (shared by the public

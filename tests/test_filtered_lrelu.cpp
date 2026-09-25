@@ -184,13 +184,19 @@ static void run_case(const Cfg& c) {
         }
     }
 
-    // CUDA parity: the CUDA backward must match the FD-verified CPU dX.
-    if (brotensor::is_available(brotensor::Device::CUDA)) {
-        Tensor Xc = X.to(brotensor::Device::CUDA);
-        Tensor FUc = FU.to(brotensor::Device::CUDA), FDc = FD.to(brotensor::Device::CUDA);
-        Tensor Bc = B.to(brotensor::Device::CUDA);
+    // GPU parity (CUDA, else Metal): the fused forward must match the CPU
+    // golden, the backward the FD-verified CPU dX.
+    const brotensor::Device gd =
+        brotensor::is_available(brotensor::Device::CUDA)  ? brotensor::Device::CUDA
+      : brotensor::is_available(brotensor::Device::Metal) ? brotensor::Device::Metal
+                                                          : brotensor::Device::CPU;
+    const char* gname = gd == brotensor::Device::CUDA ? "cuda" : "metal";
+    if (gd != brotensor::Device::CPU) {
+        Tensor Xc = X.to(gd);
+        Tensor FUc = FU.to(gd), FDc = FD.to(gd);
+        Tensor Bc = B.to(gd);
         const Tensor* bpc = c.has_b ? &Bc : nullptr;
-        // Uncommitted ub2/ab2 ⇒ the fused (no-cache) forward path on CUDA.
+        // Uncommitted ub2/ab2 ⇒ the fused (no-cache) forward path.
         Tensor ub2, ab2, Yc;
         brotensor::filtered_lrelu_forward(Xc, FUc, FDc, bpc, c.N, c.C, c.H, c.W,
                                           c.up, c.down, c.px0, c.px1, c.py0, c.py1,
@@ -202,13 +208,13 @@ static void run_case(const Cfg& c) {
             mY = std::max(mY, (double)std::fabs(hY[i] - Yref[i]));
             CHECK(close(hY[i], Yref[i], 5e-3f));
         }
-        std::printf("  [cuda fused fwd] max|Y_cuda - Y_ref| = %.2e\n", mY);
+        std::printf("  [%s fused fwd] max|Y_gpu - Y_ref| = %.2e\n", gname, mY);
         // ub2 stays uncommitted — the fused path produces no cache; the backward
         // below recomputes up_buf from X.
         CHECK(ub2.data == nullptr);
-        Tensor dYc = dY.to(brotensor::Device::CUDA);
+        Tensor dYc = dY.to(gd);
         Tensor dXc;
-        Tensor dBc = Tensor::zeros_on(brotensor::Device::CUDA, c.C, 1);
+        Tensor dBc = Tensor::zeros_on(gd, c.C, 1);
         brotensor::filtered_lrelu_backward(dYc, Xc, FUc, FDc, bpc, c.N, c.C, c.H, c.W,
                                            c.up, c.down, c.px0, c.px1, c.py0, c.py1,
                                            c.gain, c.slope, c.clamp, ub2,
@@ -216,13 +222,24 @@ static void run_case(const Cfg& c) {
         std::vector<float> hX = dXc.to_host_vector();
         double mdiff = 0;
         for (int i = 0; i < xn; ++i) mdiff = std::max(mdiff, (double)std::fabs(hX[i] - dX[i]));
-        std::printf("  [cuda parity] max|dX_cuda - dX_cpu| = %.2e\n", mdiff);
+        std::printf("  [%s parity] max|dX_gpu - dX_cpu| = %.2e\n", gname, mdiff);
         for (int i = 0; i < xn; ++i) CHECK(close(hX[i], dX[i], 5e-3f));
+        // Without dB the backward takes the fused kernel where the backend has
+        // one (Metal); it must agree with the CPU dX too.
+        Tensor dXn;
+        brotensor::filtered_lrelu_backward(dYc, Xc, FUc, FDc, bpc, c.N, c.C, c.H, c.W,
+                                           c.up, c.down, c.px0, c.px1, c.py0, c.py1,
+                                           c.gain, c.slope, c.clamp, ub2, dXn, nullptr);
+        std::vector<float> hXn = dXn.to_host_vector();
+        double mn = 0;
+        for (int i = 0; i < xn; ++i) mn = std::max(mn, (double)std::fabs(hXn[i] - dX[i]));
+        std::printf("  [%s parity, no dB] max|dX_gpu - dX_cpu| = %.2e\n", gname, mn);
+        for (int i = 0; i < xn; ++i) CHECK(close(hXn[i], dX[i], 5e-3f));
     }
 }
 
 int main() {
-    brotensor::init();   // register CUDA backend (if compiled) for the parity check
+    brotensor::init();   // register the GPU backend (if compiled) for the parity check
     // up=2/down=2 with bias + clamp; up=2/down=2 no bias, no clamp;
     // up=1/down=1 small filters (pure FIR + lrelu).
     run_case({2, 2, 6, 6, 2, 2, 1, 2, 1, 2, 4, 4, 4, 4, std::sqrt(2.0f), 0.2f, 0.8f, true});
@@ -234,6 +251,10 @@ int main() {
     // this isolates the resampling backward) and the real slope=0.2 case.
     run_case({1, 2, 8, 8, 2, 2, 5, 6, 5, 6, 12, 12, 12, 12, 1.0f, 1.0f, -1.0f, true});
     run_case({1, 2, 8, 8, 2, 2, 5, 6, 5, 6, 12, 12, 12, 12, std::sqrt(2.0f), 0.2f, 256.0f, true});
+    // Config-R's other shapes: a cropping (negative) pad, and the 4x-upsampling
+    // layers' 24-tap up filter (the fused Metal backward's 8x8-tile path).
+    run_case({1, 2, 16, 16, 2, 2, -3, -4, -3, -4, 12, 12, 12, 12, std::sqrt(2.0f), 0.2f, 256.0f, true});
+    run_case({1, 2, 12, 12, 4, 2, -2, -5, -2, -5, 24, 24, 12, 12, std::sqrt(2.0f), 0.2f, 256.0f, true});
     if (g_failures) {
         std::printf("filtered_lrelu: %d FAILED\n", g_failures);
         return 1;

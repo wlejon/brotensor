@@ -337,7 +337,12 @@ void modulated_conv2d_backward(const Tensor& X, const Tensor& W, const Tensor& s
     require_fp(W, "modulated_conv2d_backward", "W");
     require_fp(s, "modulated_conv2d_backward", "s");
     require_fp(dY, "modulated_conv2d_backward", "dY");
-    if (W.dtype != X.dtype || s.dtype != X.dtype || dY.dtype != X.dtype || dW.dtype != X.dtype)
+    // dW is optional (as on CPU/CUDA): an uncommitted dW skips the weight
+    // gradient's accumulate + merge passes and their FP32 scratch. Inversion
+    // freezes the weights and passes none.
+    const bool want_dW = (dW.data != nullptr);
+    if (W.dtype != X.dtype || s.dtype != X.dtype || dY.dtype != X.dtype ||
+        (want_dW && dW.dtype != X.dtype))
         throw std::runtime_error("modulated_conv2d_backward: W/s/dY/dW dtype must match X");
     if (dcoef.dtype != Dtype::FP32)
         throw std::runtime_error("modulated_conv2d_backward: dcoef must be FP32");
@@ -348,7 +353,7 @@ void modulated_conv2d_backward(const Tensor& X, const Tensor& W, const Tensor& s
     const int W_out = Wd + 2 * pad_w - (kW - 1);
     if (W.rows != C_out || W.cols != wk)
         throw std::runtime_error("modulated_conv2d_backward: W shape mismatch");
-    if (dW.rows != C_out || dW.cols != wk)
+    if (want_dW && (dW.rows != C_out || dW.cols != wk))
         throw std::runtime_error("modulated_conv2d_backward: dW shape mismatch");
     if (dX.rows != N || dX.cols != C_in * H * Wd || dX.dtype != X.dtype)
         dX.resize(N, C_in * H * Wd, X.dtype);
@@ -357,11 +362,14 @@ void modulated_conv2d_backward(const Tensor& X, const Tensor& W, const Tensor& s
     if (N == 0) return;
     const int out_cols = C_out * H_out * W_out;
 
-    Tensor Wpr  = Tensor::zeros_on(Device::Metal, C_out, wk, X.dtype);
-    Tensor Wpp  = Tensor::zeros_on(Device::Metal, C_out, wk, X.dtype);
+    // Wpr / Wpp / dWpr are fully written by their kernels before any read, so
+    // they need no zero-fill (a host memset, which drains the queue).
+    Tensor Wpr  = Tensor::empty_on(Device::Metal, C_out, wk, X.dtype);
+    Tensor Wpp  = Tensor::empty_on(Device::Metal, C_out, wk, X.dtype);
     Tensor dWpp = Tensor::zeros_on(Device::Metal, C_out, wk, X.dtype);
-    Tensor dWpr = Tensor::zeros_on(Device::Metal, C_out, wk, X.dtype);
-    Tensor dW_f32 = Tensor::zeros_on(Device::Metal, C_out, wk, Dtype::FP32);
+    Tensor dWpr = Tensor::empty_on(Device::Metal, C_out, wk, X.dtype);
+    Tensor dW_f32;
+    if (want_dW) dW_f32 = Tensor::zeros_on(Device::Metal, C_out, wk, Dtype::FP32);
     const uint32_t wtotal = static_cast<uint32_t>(C_out) * wk;
     const uint32_t Cou = C_out, Cinu = C_in, khwu = khw, wku = wk;
     const int demodi = demodulate ? 1 : 0;
@@ -400,7 +408,7 @@ void modulated_conv2d_backward(const Tensor& X, const Tensor& W, const Tensor& s
         Tensor Xn  = row_view(X, n, C_in * H * Wd);
         Tensor dYn = row_view(dY, n, out_cols);
 
-        dWpp.zero();  // conv2d_backward_weight accumulates
+        if (n > 0) dWpp.zero();  // conv2d_backward_weight accumulates
         conv2d_backward_weight(Xn, dYn, 1, C_in, H, Wd, C_out, kH, kW,
                                1, 1, pad_h, pad_w, 1, 1, 1, dWpp);
         Tensor dXn = row_view(dX, n, C_in * H * Wd);
@@ -426,7 +434,7 @@ void modulated_conv2d_backward(const Tensor& X, const Tensor& W, const Tensor& s
         }
 
         // dW_f32 += dw' * s   (FP32 accumulate across the batch).
-        @autoreleasepool {
+        if (want_dW) @autoreleasepool {
             id<MTLCommandBuffer> cmd = new_command_buffer();
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             [enc setComputePipelineState:pso_accdw];
@@ -465,6 +473,7 @@ void modulated_conv2d_backward(const Tensor& X, const Tensor& W, const Tensor& s
     }
 
     // Merge the FP32 dW accumulator into the caller's dW (accumulate).
+    if (!want_dW) return;
     id<MTLComputePipelineState> pso_merge = pick(X.dtype, pso_merge_fp32(), pso_merge_fp16(), pso_merge_bf16());
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = new_command_buffer();

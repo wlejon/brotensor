@@ -235,6 +235,97 @@ static void test_modulated_conv2d() {
     }
 }
 
+// ─── modulated_conv2d, 1x1 (config-R) ────────────────────────────────────────
+// Pointwise shapes take the GEMM path on Metal (tiled simdgroup GEMM, and a
+// split-K backward-weight once HW is long). HW = 48^2 splits K evenly; 50^2
+// leaves a short tail chunk.
+static void test_modulated_conv2d_pointwise() {
+    const float eps = 1e-8f;
+    for (int N : {1, 2}) for (int H : {48, 50}) {
+        const int C_in = 40, C_out = 72, Wd = H;
+        auto x = rnd(N * C_in * H * Wd, 51 + H, -1.0f, 1.0f);
+        auto W = rnd(C_out * C_in, 52, -0.5f, 0.5f);
+        auto s = rnd(N * C_in, 53, 0.2f, 1.5f);
+        for (bool demod : {true, false}) {
+            Tensor Xc = cpu(x, N, C_in * H * Wd), Xg = gpu(x, N, C_in * H * Wd);
+            Tensor Wc = cpu(W, C_out, C_in),      Wg = gpu(W, C_out, C_in);
+            Tensor Sc = cpu(s, N, C_in),          Sg = gpu(s, N, C_in);
+            Tensor dcc, dcg, Yc, Yg;
+            brotensor::modulated_conv2d_forward(Xc, Wc, Sc, N, C_in, H, Wd, C_out, 1, 1,
+                                                0, 0, demod, eps, dcc, Yc);
+            brotensor::modulated_conv2d_forward(Xg, Wg, Sg, N, C_in, H, Wd, C_out, 1, 1,
+                                                0, 0, demod, eps, dcg, Yg);
+            cmp("modconv1x1_fwd Y", Yc, Yg, 1e-4f, 1e-4f);
+
+            auto g = rnd(N * C_out * H * Wd, 54, -1.0f, 1.0f);
+            Tensor dYc = cpu(g, N, C_out * H * Wd), dYg = gpu(g, N, C_out * H * Wd);
+            Tensor dXc, dXg, dsc, dsg;
+            Tensor dWc = Tensor::zeros_on(Device::CPU, C_out, C_in);
+            Tensor dWg = Tensor::zeros_on(gdev(), C_out, C_in);
+            brotensor::modulated_conv2d_backward(Xc, Wc, Sc, dcc, dYc, N, C_in, H, Wd,
+                                                 C_out, 1, 1, 0, 0, demod, eps, dXc, dWc, dsc);
+            brotensor::modulated_conv2d_backward(Xg, Wg, Sg, dcg, dYg, N, C_in, H, Wd,
+                                                 C_out, 1, 1, 0, 0, demod, eps, dXg, dWg, dsg);
+            cmp("modconv1x1_bwd dX", dXc, dXg, 1e-4f, 1e-4f);
+            // dW / ds reduce over HW = 2304..2500 terms: FP32 order noise only.
+            cmp("modconv1x1_bwd dW", dWc, dWg, 2e-3f, 1e-4f);
+            cmp("modconv1x1_bwd ds", dsc, dsg, 2e-3f, 1e-4f);
+            // Uncommitted dW: the weight gradient is skipped, dX/ds unchanged.
+            Tensor dXn, dsn, dWn;
+            brotensor::modulated_conv2d_backward(Xg, Wg, Sg, dcg, dYg, N, C_in, H, Wd,
+                                                 C_out, 1, 1, 0, 0, demod, eps, dXn, dWn, dsn);
+            CHECK(dWn.data == nullptr);
+            cmp("modconv1x1_bwd dX (no dW)", dXc, dXn, 1e-4f, 1e-4f);
+            cmp("modconv1x1_bwd ds (no dW)", dsc, dsn, 2e-3f, 1e-4f);
+        }
+    }
+}
+
+// ─── filtered_lrelu, config-R shapes (fused on CUDA fwd / Metal fwd+bwd) ────
+// Uncommitted caches select the fused forward; dB == nullptr selects the fused
+// Metal backward. Covers 12-tap 2x (padded and cropping) and 24-tap 4x.
+static void test_filtered_lrelu_fused() {
+    struct Case { int H, up, p0, p1, fu; float clamp; };
+    const Case cases[] = {
+        {20, 2, 11, 10, 12, 256.0f},
+        {24, 2, -3, -4, 12, 0.6f},
+        {18, 4, -2, -5, 24, 256.0f},
+        {17, 1,  0,  0,  1, -1.0f},
+    };
+    for (const Case& k : cases) {
+        const int N = 1, C = 3, H = k.H, Wd = k.H;
+        const int fd = k.up == 1 ? 1 : 12, down = k.up == 1 ? 1 : 2;
+        const float gain = k.up == 1 ? 1.0f : std::sqrt(2.0f);
+        const float slope = k.up == 1 ? 1.0f : 0.2f;
+        auto x  = rnd(N * C * H * Wd, 61 + k.H, -1.2f, 1.2f);
+        auto b  = rnd(C, 62, -0.5f, 0.5f);
+        auto fu = rnd(k.fu * k.fu, 63, -0.3f, 0.3f);
+        auto fdv = rnd(fd * fd, 64, -0.3f, 0.3f);
+        Tensor Xc = cpu(x, N, C * H * Wd), Xg = gpu(x, N, C * H * Wd);
+        Tensor Bc = cpu(b, C, 1),          Bg = gpu(b, C, 1);
+        Tensor Fuc = cpu(fu, k.fu, k.fu),  Fug = gpu(fu, k.fu, k.fu);
+        Tensor Fdc = cpu(fdv, fd, fd),     Fdg = gpu(fdv, fd, fd);
+        Tensor ubc, abc, Yc, ubg, abg, Yg;
+        brotensor::filtered_lrelu_forward(Xc, Fuc, Fdc, &Bc, N, C, H, Wd, k.up, down,
+                                          k.p0, k.p1, k.p0, k.p1, gain, slope, k.clamp,
+                                          ubc, abc, Yc);
+        brotensor::filtered_lrelu_forward(Xg, Fug, Fdg, &Bg, N, C, H, Wd, k.up, down,
+                                          k.p0, k.p1, k.p0, k.p1, gain, slope, k.clamp,
+                                          ubg, abg, Yg);
+        cmp("filtered_lrelu_fused fwd", Yc, Yg, 1e-4f, 1e-4f);
+        auto g = rnd(Yc.rows * Yc.cols, 65, -1.0f, 1.0f);
+        Tensor dYc = cpu(g, Yc.rows, Yc.cols), dYg = gpu(g, Yg.rows, Yg.cols);
+        Tensor dXc, dXg;
+        brotensor::filtered_lrelu_backward(dYc, Xc, Fuc, Fdc, &Bc, N, C, H, Wd, k.up, down,
+                                           k.p0, k.p1, k.p0, k.p1, gain, slope, k.clamp,
+                                           ubc, dXc, nullptr);
+        brotensor::filtered_lrelu_backward(dYg, Xg, Fug, Fdg, &Bg, N, C, H, Wd, k.up, down,
+                                           k.p0, k.p1, k.p0, k.p1, gain, slope, k.clamp,
+                                           ubg, dXg, nullptr);
+        cmp("filtered_lrelu_fused bwd dX", dXc, dXg, 1e-4f, 1e-4f);
+    }
+}
+
 // ─── filtered_lrelu (device-agnostic composite over bias_act + upfirdn2d) ────
 static void test_filtered_lrelu() {
     const int N = 2, C = 2, H = 6, Wd = 6;
@@ -500,7 +591,9 @@ int main() {
     test_bias_act();
     test_upfirdn2d();
     test_modulated_conv2d();
+    test_modulated_conv2d_pointwise();
     test_filtered_lrelu();
+    test_filtered_lrelu_fused();
     test_linear_fp16_act();
     test_half(F16);
     test_half(B16);

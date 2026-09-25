@@ -56,19 +56,27 @@ kernel void NAME(device const T* In   [[buffer(0)]],                          \
     ulong in_base = ((ulong)n * p.C + c) * p.Hin * p.Win;                     \
     int py_base = oh * p.down_y;                                              \
     int px_base = ow * p.down_x;                                              \
+    /* Only taps landing on a real (non-zero-inserted, in-range) input      */ \
+    /* sample contribute: step kh/kw by the up factor from the first such   */ \
+    /* tap. Same taps in the same order as a full scan, so bit-identical,   */ \
+    /* but up_x*up_y fewer iterations.                                      */ \
+    const int by = py_base - p.py0, bx = px_base - p.px0;                     \
+    int kh0 = max(0, -by);                                                    \
+    { const int r = (by + kh0) % p.up_y; if (r) kh0 += p.up_y - r; }          \
+    const int kh1 = min(p.fH, p.Hu - by);                                     \
+    int kw0 = max(0, -bx);                                                    \
+    { const int r = (bx + kw0) % p.up_x; if (r) kw0 += p.up_x - r; }          \
+    const int kw1 = min(p.fW, p.Wu - bx);                                     \
     float acc = 0.0f;                                                         \
-    for (int kh = 0; kh < p.fH; ++kh) {                                       \
-        int uy = py_base + kh - p.py0;                                        \
-        if (uy < 0 || uy >= p.Hu || (uy % p.up_y) != 0) continue;             \
-        int iy = uy / p.up_y;                                                 \
+    for (int kh = kh0; kh < kh1; kh += p.up_y) {                              \
+        int iy = (by + kh) / p.up_y;                                          \
         int frow = p.flip_filter ? kh : (p.fH - 1 - kh);                      \
-        for (int kw = 0; kw < p.fW; ++kw) {                                   \
-            int ux = px_base + kw - p.px0;                                    \
-            if (ux < 0 || ux >= p.Wu || (ux % p.up_x) != 0) continue;         \
-            int ix = ux / p.up_x;                                             \
+        device const T* xr = In + in_base + (ulong)iy * p.Win;                \
+        device const T* fr = Fp + (ulong)frow * p.fW;                         \
+        for (int kw = kw0; kw < kw1; kw += p.up_x) {                          \
+            int ix = (bx + kw) / p.up_x;                                      \
             int fcol = p.flip_filter ? kw : (p.fW - 1 - kw);                  \
-            acc += float(In[in_base + (ulong)iy * p.Win + ix]) *              \
-                   float(Fp[(ulong)frow * p.fW + fcol]);                      \
+            acc += float(xr[ix]) * float(fr[fcol]);                           \
         }                                                                     \
     }                                                                         \
     ulong out_base = ((ulong)n * p.C + c) * p.Hout * p.Wout;                  \

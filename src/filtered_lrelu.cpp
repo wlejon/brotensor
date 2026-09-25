@@ -1,10 +1,11 @@
 // ─── filtered_lrelu (StyleGAN3 alias-free nonlinearity) ─────────────────────
 //
 // The public entry points are thin dispatchers: if the resolved backend
-// registered a fused `filtered_lrelu_forward/backward` vtable slot (CUDA does),
-// they call it; otherwise they fall back to the device-agnostic COMPOSITE below
-// — a sequence of the public bias_act + upfirdn2d ops, which run on whatever
-// backend the operands live on (this is the only path on CPU/Metal). The
+// registered a fused `filtered_lrelu_forward/backward` vtable slot (CUDA: the
+// forward; Metal: both), they call it; otherwise they fall back to the
+// device-agnostic COMPOSITE below — a sequence of the public bias_act +
+// upfirdn2d ops, which run on whatever backend the operands live on (the only
+// path on CPU; the fused kernels hand uncovered configs back to it). The
 // composite mirrors NVlabs `_filtered_lrelu_ref` EXACTLY, including order:
 //
 //   x = bias_act(x, b)                              # apply channel bias

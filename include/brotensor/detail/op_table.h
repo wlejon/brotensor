@@ -724,9 +724,9 @@
     X(bias_act_backward,                       void,  (const ::brotensor::Tensor& dY, const ::brotensor::Tensor& X, const ::brotensor::Tensor* b, \
                                                        int N, int C, int HW, int act, float alpha,                                               \
                                                        float gain, float clamp, ::brotensor::Tensor& dX, ::brotensor::Tensor* dB))              \
-    /* filtered_lrelu: alias-free nonlinearity. CPU/Metal leave these null and  */                                                              \
-    /* fall back to the device-agnostic composite (bias_act + upfirdn2d); CUDA  */                                                              \
-    /* registers a fused kernel. Signatures mirror ops/stylegan.h exactly.      */                                                              \
+    /* filtered_lrelu: alias-free nonlinearity. CPU leaves both null (the       */                                                              \
+    /* device-agnostic bias_act + upfirdn2d composite); CUDA registers a fused  */                                                              \
+    /* forward, Metal a fused forward + backward. Signatures: ops/stylegan.h.   */                                                              \
     X(filtered_lrelu_forward,                  void,  (const ::brotensor::Tensor& X, const ::brotensor::Tensor& fu, const ::brotensor::Tensor& fd, \
                                                        const ::brotensor::Tensor* b, int N, int C, int H, int W,                                 \
                                                        int up, int down, int pad_x0, int pad_x1, int pad_y0, int pad_y1,                         \

@@ -39,9 +39,9 @@ The **CPU backend** implements essentially the entire FP32 surface — forward *
 
 The **CUDA and Metal backends** add the FP16 (and BF16) precision paths, batched-inference variants, the W8A16 and GGUF block-quant kernels, and a handful of GPU-only fused kernels. The [audio op family](#audio-op-family) is FP32 on **all three** backends with per-family CPU↔GPU parity tests.
 
-**Metal is at near-total parity with CUDA.** Of its vtable slots it leaves two null: `filtered_lrelu_forward` / `filtered_lrelu_backward` (the fused kernel is CUDA-only; Metal takes the composite path). CUDA leaves one null — `filtered_lrelu_backward`, which is the composite on every backend. Everything else in the table below is registered on both GPU backends.
+**Metal is at near-total parity with CUDA.** Every Metal vtable slot is registered. CUDA leaves one null — `filtered_lrelu_backward`, where CUDA takes the composite; Metal has a fused backward (FP32, no dB) as well as the fused forward. Everything else in the table below is registered on both GPU backends.
 
-Two "ops" are not vtable entries but device-agnostic compositions of public ops, so they run on any backend automatically: **LoRA** (`ops/lora.h`, header-only) and the **filtered_lrelu composite** (`src/filtered_lrelu.cpp` — the forward path on CPU/Metal and for CUDA configs the fused kernel doesn't cover, and the backward path everywhere).
+Two "ops" are not vtable entries but device-agnostic compositions of public ops, so they run on any backend automatically: **LoRA** (`ops/lora.h`, header-only) and the **filtered_lrelu composite** (`src/filtered_lrelu.cpp` — the path on CPU, for the configs the fused CUDA/Metal kernels don't cover, and the CUDA backward).
 
 ## GPU backends (CUDA / Metal)
 
@@ -94,7 +94,7 @@ FP32 fwd/bwd columns below mirror the CPU surface; the FP16 column is the GPU-on
 | modulated_conv2d | ✓ | ✓ | ✓ | StyleGAN synthesis core: per-sample style modulation + optional demodulation + conv2d; dW optional (skippable for inversion); GPU dtype-dispatched FP32/FP16/BF16, FP32 reductions |
 | upfirdn2d | ✓ | ✓ | ✓ | upsample → pad/crop → 2D FIR → downsample (StyleGAN3, incl. non-separable config-R radial filters); backward is upfirdn2d with up/down swapped; GPU FP32/FP16/BF16, FP32 filter math |
 | bias_act | ✓ | ✓ | ✓ | fused per-channel bias + activation (linear/lrelu) + gain + clamp; GPU FP32/FP16/BF16 (FP32 math, FP32-scratch dB) |
-| filtered_lrelu | ✓ | ✓ | ✓ | alias-free nonlinearity (bias → upsample → lrelu → downsample). Forward: fused CUDA kernel where the config is covered, otherwise the device-agnostic composite over bias_act/upfirdn2d (always the path on CPU/Metal). Backward is the composite on **every** backend — no backend registers a fused `filtered_lrelu_backward` |
+| filtered_lrelu | ✓ | ✓ | ✓ | alias-free nonlinearity (bias → upsample → lrelu → downsample). Forward: fused CUDA / Metal kernel where the config is covered and no up_buf/act_buf cache is requested, otherwise the device-agnostic composite over bias_act/upfirdn2d (always the path on CPU). Backward: fused on Metal (FP32, dB not requested; recomputes the pre-activation, so it needs no cache), the composite elsewhere |
 | lstm | ✓ | ✓ | — | single-layer training LSTM + full BPTT (PyTorch `nn.LSTM` weight layout, gate order i\|f\|g\|o); FP32 on all three backends |
 | upsample_nearest_2x | ✓ | ✓ | ✓ | backward dtype-dispatched (FP32+FP16) |
 | upsample_bilinear_2x | ✓ | ✓ | ✓ | align_corners=False; backward dtype-dispatched (FP32+FP16; FP16 uses FP32 scratch + fold) |

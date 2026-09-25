@@ -1,9 +1,11 @@
 #include <brotensor/runtime.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 #import "internal.h"
 #import "conv2d_wmma.h"
+#import "fp16_matmul.h"
 
 namespace brotensor::detail::metal {
 
@@ -316,6 +318,22 @@ kernel void k_conv2d_add_fp32_into_bf16(device const float* src [[buffer(0)]],
     if (i >= n) return;
     dst[i] = bfloat(float(dst[i]) + src[i]);
 }
+
+// Split-K fold: dst[i] += sum_s part[s * n + i] (FP32 partials, one rounding).
+#define SPLITK_FOLD(NAME, T)                                                  \
+kernel void NAME(device const float* part [[buffer(0)]],                      \
+                 device T*           dst  [[buffer(1)]],                      \
+                 constant uint& n         [[buffer(2)]],                      \
+                 constant uint& S         [[buffer(3)]],                      \
+                 uint i [[thread_position_in_grid]]) {                        \
+    if (i >= n) return;                                                       \
+    float acc = 0.0f;                                                         \
+    for (uint s = 0; s < S; ++s) acc += part[(ulong)s * n + i];               \
+    dst[i] = T(float(dst[i]) + acc);                                          \
+}
+SPLITK_FOLD(k_conv2d_splitk_fold_fp32, float)
+SPLITK_FOLD(k_conv2d_splitk_fold_fp16, half)
+SPLITK_FOLD(k_conv2d_splitk_fold_bf16, bfloat)
 
 // ─── BF16 variants (verbatim copies of FP16 kernels with half→bfloat) ───────
 
@@ -656,6 +674,17 @@ id<MTLComputePipelineState> pso_conv_add_fp32() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_conv2d_add_fp32_into_fp32"); });
     return pso;
 }
+#define SPLITK_PSO(NAME, FN)                                                  \
+    id<MTLComputePipelineState> NAME() {                                      \
+        static dispatch_once_t once;                                          \
+        static id<MTLComputePipelineState> pso;                               \
+        dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, FN); });          \
+        return pso;                                                           \
+    }
+SPLITK_PSO(pso_splitk_fold_fp32, @"k_conv2d_splitk_fold_fp32")
+SPLITK_PSO(pso_splitk_fold_fp16, @"k_conv2d_splitk_fold_fp16")
+SPLITK_PSO(pso_splitk_fold_bf16, @"k_conv2d_splitk_fold_bf16")
+#undef SPLITK_PSO
 id<MTLComputePipelineState> pso_conv_bf16() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -700,6 +729,25 @@ struct ConvParams {
     uint32_t Cg_in;
     uint32_t Cg_out;
 };
+
+} // namespace
+
+// ─── Pointwise (1x1, stride 1, no padding, ungrouped) GEMM fast path ────────
+//
+// A 1x1 conv over NCHW is a plain GEMM per image: Y[n](C_out, HW) =
+// W(C_out, C_in) @ X[n](C_in, HW), and its two backwards are GEMMs too. The
+// direct-conv kernels below run one thread per output with a serial K loop
+// (~50-130 GFLOP/s); routing these shapes to the tiled simdgroup GEMM
+// (launch_matmul_abt_mixed: FP32 accumulate, any M/N/K) is an order of
+// magnitude faster. StyleGAN3-R's modulated convs are all 1x1, which is what
+// made its Metal inversion (forward + backward) slow.
+namespace {
+
+bool conv2d_is_pointwise(int kH, int kW, int stride_h, int stride_w,
+                         int pad_h, int pad_w, int groups) {
+    return kH == 1 && kW == 1 && stride_h == 1 && stride_w == 1 &&
+           pad_h == 0 && pad_w == 0 && groups == 1;
+}
 
 } // namespace
 
@@ -778,6 +826,23 @@ void conv2d_forward(const Tensor& X,
         }
     }
 
+    if (!bias && conv2d_is_pointwise(kH, kW, stride_h, stride_w, pad_h, pad_w, groups)) {
+        // Y[n](C_out, HW) = W(C_out, C_in) @ X[n], X[n] stored (C_in, HW) = (K, N).
+        const uint64_t HW = static_cast<uint64_t>(H) * W;
+        metal_impl::AbtMixed g;
+        g.A = bw; g.ofs_A = ow_; g.lda = static_cast<uint64_t>(C_in);
+        g.B = bx; g.ofs_B = ox;  g.ldb = HW; g.transB = true;
+        g.C = by; g.ofs_C = oy;  g.ldc = HW;
+        g.M = C_out; g.N = static_cast<int>(HW); g.K = C_in;
+        g.in = g.out = metal_impl::abt_type(X.dtype);
+        g.batch = N;
+        g.strideA = 0;
+        g.strideB = static_cast<uint64_t>(C_in) * HW;
+        g.strideC = static_cast<uint64_t>(C_out) * HW;
+        metal_impl::launch_matmul_abt_mixed(g);
+        return;
+    }
+
     id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_conv_fp16()
                                    : (X.dtype == Dtype::BF16) ? pso_conv_bf16()
                                                                : pso_conv_fp32();
@@ -845,6 +910,25 @@ void conv2d_backward_input(const Tensor& Wt,
     p.groups = static_cast<uint32_t>(groups);
     p.Cg_in = static_cast<uint32_t>(Cg_in);
     p.Cg_out = static_cast<uint32_t>(Cg_out);
+
+    if (conv2d_is_pointwise(kH, kW, stride_h, stride_w, pad_h, pad_w, groups)) {
+        // dX[n](C_in, HW) = W^T @ dY[n]: W stored (C_out, C_in) = (K, M),
+        // dY[n] stored (C_out, HW) = (K, N). Overwrites dX, as the kernel does.
+        const uint64_t HW = static_cast<uint64_t>(H) * W;
+        metal_impl::AbtMixed g;
+        g.A = buffer_for(Wt); g.ofs_A = buffer_offset_for(Wt);
+        g.lda = static_cast<uint64_t>(C_in); g.transA = true;
+        g.B = buffer_for(dY); g.ofs_B = buffer_offset_for(dY); g.ldb = HW; g.transB = true;
+        g.C = buffer_for(dX); g.ofs_C = buffer_offset_for(dX); g.ldc = HW;
+        g.M = C_in; g.N = static_cast<int>(HW); g.K = C_out;
+        g.in = g.out = metal_impl::abt_type(Wt.dtype);
+        g.batch = N;
+        g.strideA = 0;
+        g.strideB = static_cast<uint64_t>(C_out) * HW;
+        g.strideC = static_cast<uint64_t>(C_in) * HW;
+        metal_impl::launch_matmul_abt_mixed(g);
+        return;
+    }
 
     id<MTLComputePipelineState> pso = (Wt.dtype == Dtype::FP16) ? pso_conv_bwd_input_fp16()
                                    : (Wt.dtype == Dtype::BF16) ? pso_conv_bwd_input_bf16()
@@ -917,6 +1001,92 @@ void conv2d_backward_weight(const Tensor& X,
     p.groups = static_cast<uint32_t>(groups);
     p.Cg_in = static_cast<uint32_t>(Cg_in);
     p.Cg_out = static_cast<uint32_t>(Cg_out);
+
+    // Pointwise: dW(C_out, C_in) += sum_n dY[n](C_out, HW) @ X[n](C_in, HW)^T.
+    // The reduction runs over the long HW axis while the output is only
+    // C_out x C_in, so the GEMM has few output tiles (e.g. 128x181 -> 6 64x64
+    // threadgroups over K = 276^2) and would leave the GPU nearly idle. Split
+    // K: batch the K chunks into FP32 partials (one GEMM launch, the chunks as
+    // its batch axis), then fold them into dWt in one pass — a single rounding
+    // per image, like the scratch kernel. With a 16-bit dWt a multi-image batch
+    // would still round once per image, so that case keeps the kernel below.
+    if (conv2d_is_pointwise(kH, kW, stride_h, stride_w, pad_h, pad_w, groups) &&
+        (X.dtype == Dtype::FP32 || N == 1)) {
+        const int64_t HW = static_cast<int64_t>(H) * W;
+        const int64_t tiles = static_cast<int64_t>((C_out + 63) / 64) * ((C_in + 63) / 64);
+        // Aim for >= ~256 threadgroups, but keep each chunk >= 1024 deep.
+        int64_t S = tiles >= 256 ? 1 : (256 + tiles - 1) / tiles;
+        S = std::min<int64_t>(S, std::max<int64_t>(1, HW / 1024));
+        const int64_t Kc = ((HW + S - 1) / S + 31) / 32 * 32;   // whole BK tiles
+        S = (HW + Kc - 1) / Kc;
+        const int64_t S_full = HW / Kc;                         // chunks of exactly Kc
+        const int64_t K_tail = HW - S_full * Kc;                // 0 or one short chunk
+        const uint32_t MN = static_cast<uint32_t>(C_out) * static_cast<uint32_t>(C_in);
+        const metal_impl::AbtType ty = metal_impl::abt_type(X.dtype);
+        const size_t esz = dtype_size_bytes(X.dtype);
+        Tensor part;
+        if (S > 1) part = Tensor::empty_on(Device::Metal, static_cast<int>(S), static_cast<int>(MN), Dtype::FP32);
+        for (int n = 0; n < N; ++n) {
+            const NSUInteger oA = buffer_offset_for(dY) +
+                static_cast<NSUInteger>(static_cast<uint64_t>(n) * C_out * HW * esz);
+            const NSUInteger oB = buffer_offset_for(X) +
+                static_cast<NSUInteger>(static_cast<uint64_t>(n) * C_in * HW * esz);
+            metal_impl::AbtMixed g;
+            g.A = buffer_for(dY); g.lda = static_cast<uint64_t>(HW);
+            g.B = buffer_for(X);  g.ldb = static_cast<uint64_t>(HW);
+            g.ldc = static_cast<uint64_t>(C_in);
+            g.M = C_out; g.N = C_in;
+            g.in = ty;
+            if (S == 1) {
+                g.ofs_A = oA; g.ofs_B = oB;
+                g.C = buffer_for(dWt); g.ofs_C = buffer_offset_for(dWt);
+                g.K = static_cast<int>(HW);
+                g.out = ty;
+                g.epilogue = metal_impl::kAbtAccumulate;
+                metal_impl::launch_matmul_abt_mixed(g);
+                continue;
+            }
+            g.C = buffer_for(part);
+            g.out = metal_impl::kAbtF32;
+            g.epilogue = metal_impl::kAbtStore;
+            if (S_full > 0) {
+                g.ofs_A = oA; g.ofs_B = oB; g.ofs_C = buffer_offset_for(part);
+                g.K = static_cast<int>(Kc);
+                g.batch = static_cast<int>(S_full);
+                g.strideA = g.strideB = static_cast<uint64_t>(Kc);
+                g.strideC = MN;
+                metal_impl::launch_matmul_abt_mixed(g);
+            }
+            if (K_tail > 0) {
+                const NSUInteger koff = static_cast<NSUInteger>(S_full * Kc * esz);
+                g.ofs_A = oA + koff; g.ofs_B = oB + koff;
+                g.ofs_C = buffer_offset_for(part) +
+                          static_cast<NSUInteger>(static_cast<uint64_t>(S_full) * MN * sizeof(float));
+                g.K = static_cast<int>(K_tail);
+                g.batch = 1;
+                g.strideA = g.strideB = g.strideC = 0;
+                metal_impl::launch_matmul_abt_mixed(g);
+            }
+            id<MTLComputePipelineState> fold =
+                X.dtype == Dtype::FP16 ? pso_splitk_fold_fp16()
+              : X.dtype == Dtype::BF16 ? pso_splitk_fold_bf16() : pso_splitk_fold_fp32();
+            const uint32_t Su = static_cast<uint32_t>(S);
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmd = new_command_buffer();
+                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                [enc setComputePipelineState:fold];
+                [enc setBuffer:buffer_for(part) offset:buffer_offset_for(part) atIndex:0];
+                [enc setBuffer:buffer_for(dWt) offset:buffer_offset_for(dWt) atIndex:1];
+                [enc setBytes:&MN length:sizeof(uint32_t) atIndex:2];
+                [enc setBytes:&Su length:sizeof(uint32_t) atIndex:3];
+                [enc dispatchThreads:MTLSizeMake(MN, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                ::brotensor::metal_impl::submit(cmd);
+            }
+        }
+        return;
+    }
 
     const bool is_fp16 = (X.dtype == Dtype::FP16);
     const bool is_bf16 = (X.dtype == Dtype::BF16);

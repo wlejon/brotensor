@@ -523,14 +523,18 @@ kernel void k_abt_mixed_tiled(device const TI* A    [[buffer(0)]],
     for (uint k0 = 0; k0 < K; k0 += MBK) {
         for (int li = 0; li < (MBM * MBK) / MTHREADS; ++li) {
             const int lin = int(tid) + li * MTHREADS;
-            const int r = lin / MBK, c = lin - r * MBK;
+            // Walk the operand's contiguous axis across adjacent threads so the
+            // global loads coalesce: k for row-major A, m for a transposed one.
+            const int r = ta ? lin % MBM : lin / MBK;
+            const int c = ta ? lin / MBM : lin - r * MBK;
             const int m_g = block_m + r;
             const uint gk = k0 + uint(c);
             As[r * MLDA + c] = (m_g < int(M) && gk < K) ? TM(float(Ab[mix_at(ta, uint(m_g), gk, p.lda)])) : TM(0);
         }
         for (int li = 0; li < (MBN * MBK) / MTHREADS; ++li) {
             const int lin = int(tid) + li * MTHREADS;
-            const int r = lin / MBK, c = lin - r * MBK;
+            const int r = tb ? lin % MBN : lin / MBK;
+            const int c = tb ? lin / MBN : lin - r * MBK;
             const int n_g = block_n + r;
             const uint gk = k0 + uint(c);
             Bs[r * MLDB + c] = (n_g < int(N) && gk < K) ? TM(float(Bb[mix_at(tb, uint(n_g), gk, p.ldb)])) : TM(0);

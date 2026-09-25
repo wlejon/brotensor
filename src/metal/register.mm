@@ -7,10 +7,9 @@
 // with the Metal AllocVTable, and hands the pair to the dispatcher.
 //
 // A null slot in the vtable means "this op is not implemented on Metal" — the
-// dispatcher throws on null lookups. The only ops Metal leaves null are
-// `filtered_lrelu_forward`/`filtered_lrelu_backward` (CUDA-only fused kernel;
-// CPU/Metal fall back to the bias_act + upfirdn2d composite, see
-// op_table.h). Every other op in the X-macro is implemented.
+// dispatcher throws on null lookups. Every op in the X-macro is implemented;
+// the filtered_lrelu pair are the fused kernels in filtered_lrelu.mm, which
+// hand the configs they do not cover to the bias_act + upfirdn2d composite.
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/detail/op_table.h>
@@ -22,9 +21,7 @@ namespace brotensor::detail::metal {
 
 // Forward-declare every public op in the Metal backend namespace. The op
 // table is the single source of truth for the signatures; the implementations
-// live one-per-cluster across the Metal .mm TUs. (The two filtered_lrelu ops
-// Metal does not implement are declared here too but never defined or
-// referenced — harmless.)
+// live one-per-cluster across the Metal .mm TUs.
 #define BROTENSOR_METAL_DECL(name, ret, params) ret name params;
 BROTENSOR_FOR_EACH_OP(BROTENSOR_METAL_DECL)
 #undef BROTENSOR_METAL_DECL
@@ -314,6 +311,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.bias_act_backward                           = &dm::bias_act_backward;
     ops.upfirdn2d_forward                           = &dm::upfirdn2d_forward;
     ops.upfirdn2d_backward                          = &dm::upfirdn2d_backward;
+    ops.filtered_lrelu_forward                      = &dm::filtered_lrelu_forward;
+    ops.filtered_lrelu_backward                     = &dm::filtered_lrelu_backward;
     ops.modulated_conv2d_forward                    = &dm::modulated_conv2d_forward;
     ops.modulated_conv2d_backward                   = &dm::modulated_conv2d_backward;
     // Deformable conv (fwd), LSTM cell, fused fp16 linear+activation.

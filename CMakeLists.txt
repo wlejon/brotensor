@@ -570,6 +570,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/stylegan_elementwise.mm
         src/metal/bias_act.mm
         src/metal/upfirdn2d.mm
+        src/metal/filtered_lrelu.mm
         src/metal/modulated_conv2d.mm
         src/metal/deform_conv2d.mm
         src/metal/lstm.mm
@@ -656,6 +657,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/stylegan_elementwise.mm
         src/metal/bias_act.mm
         src/metal/upfirdn2d.mm
+        src/metal/filtered_lrelu.mm
         src/metal/modulated_conv2d.mm
         src/metal/deform_conv2d.mm
         src/metal/lstm.mm
