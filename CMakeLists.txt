@@ -278,12 +278,22 @@ endif()
 # no JIT: brotensor_cpu would compile every trace it is handed into bytes the
 # CPU cannot execute, and the first op through it is SIGBUS. Such a build
 # takes the plain kernels, as if brass were absent.
-# brass itself has an AArch64 backend (Apple Silicon included), but
-# brotensor's CPU JIT emits x86-64 AVX2 (256-bit) vector instructions, so the
-# JIT stays restricted to x86_64/AMD64 until ARM64 NEON vector paths are
-# implemented; on AArch64 the plain kernels are used.
-if((TARGET brass AND NOT BRASS_HOST_BACKEND) OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
-    message(STATUS "brotensor: brass has no x86_64 CPU JIT for this target; CPU JIT off")
+# The CPU JIT builds brass MIR, not machine code: its f32x8 vectors are AVX2
+# ymm registers on x86_64 and NEON q-register pairs on AArch64, so it runs on
+# every architecture brass generates code for (x86_64 and AArch64, the same
+# list brass's own BRASS_HOST_BACKEND test uses).
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    set(_brotensor_jit_arch "${CMAKE_OSX_ARCHITECTURES}")
+else()
+    set(_brotensor_jit_arch "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+if(_brotensor_jit_arch MATCHES "^(x86_64|AMD64|amd64|x64|aarch64|arm64|ARM64)$")
+    set(_brotensor_jit_arch_ok ON)
+else()
+    set(_brotensor_jit_arch_ok OFF)
+endif()
+if((TARGET brass AND NOT BRASS_HOST_BACKEND) OR NOT _brotensor_jit_arch_ok)
+    message(STATUS "brotensor: brass has no code generator for ${_brotensor_jit_arch}; CPU JIT off")
 elseif(TARGET brass)
     message(STATUS "brotensor: found Brass target")
     # BUILD_INTERFACE-only: brass is a sibling add_subdirectory target that is
@@ -295,7 +305,7 @@ elseif(TARGET brass)
     target_link_libraries(brotensor_cpu PRIVATE ${BROTENSOR_BRASS_LIB})
     target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_BRASS_JIT=1)
     set(BROTENSOR_HAS_BRASS_JIT 1)
-elseif(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+elseif(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")
     message(STATUS "brotensor: found Brass at ${BRASS_ROOT}")
     target_include_directories(brotensor_cpu PRIVATE "${BRASS_ROOT}/include")
     if(MSVC)
