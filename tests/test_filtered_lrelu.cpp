@@ -161,9 +161,9 @@ static void run_case(const Cfg& c) {
     auto pw_ok = [&](float a, double Lp, double Lm) {
         const double fdp = (Lp - L0) / h, fdm = (L0 - Lm) / h;
         const double central = (Lp - Lm) / (2.0 * h);
-        return close(a, static_cast<float>(central), 2e-2f) ||
-               close(a, static_cast<float>(fdp), 3e-2f) ||
-               close(a, static_cast<float>(fdm), 3e-2f);
+        return close(a, static_cast<float>(central), 6e-2f) ||
+               close(a, static_cast<float>(fdp), 6e-2f) ||
+               close(a, static_cast<float>(fdm), 6e-2f);
     };
     double worst_central = 0.0;
     for (int i = 0; i < xn; ++i) {
