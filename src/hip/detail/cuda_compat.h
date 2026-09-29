@@ -55,6 +55,24 @@ using cudaMemPool_t   = hipMemPool_t;
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaMemcpy2D hipMemcpy2D
+#define cudaMemcpy2DAsync hipMemcpy2DAsync
+#define cudaStreamDefault hipStreamDefault
+
+// ─── Stream & Memory Runtime Bridge ───────────────────────────────────────
+
+namespace brotensor {
+void* cuda_current_stream();
+void* cuda_current_stream(int dev);
+void cuda_set_stream(void* stream);
+void cuda_set_stream(void* stream, int dev);
+}
+
+namespace brotensor::detail::cuda {
+void* cuda_alloc(std::size_t bytes);
+void cuda_free(void* ptr);
+void cuda_check_throw(int err, const char* expr_text, const char* file, int line);
+}
 
 // ─── Bfloat16 Helpers ──────────────────────────────────────────────────────
 
@@ -79,6 +97,35 @@ inline __host__ __device__ hip_bfloat16 __float2bfloat16_rn(float f) {
 
 inline __host__ __device__ hip_bfloat16 __float2bfloat16_rz(float f) {
     return hip_bfloat16(f, hip_bfloat16::truncate);
+}
+
+struct __align__(4) __nv_bfloat162 {
+    hip_bfloat16 x;
+    hip_bfloat16 y;
+};
+
+inline __host__ __device__ float __low2float(__nv_bfloat162 v) {
+    return float(v.x);
+}
+
+inline __host__ __device__ float __high2float(__nv_bfloat162 v) {
+    return float(v.y);
+}
+
+inline __host__ __device__ hip_bfloat16 __low2bfloat16(__nv_bfloat162 v) {
+    return v.x;
+}
+
+inline __host__ __device__ hip_bfloat16 __high2bfloat16(__nv_bfloat162 v) {
+    return v.y;
+}
+
+inline __host__ __device__ __nv_bfloat162 __floats2bfloat162_rn(float a, float b) {
+    return __nv_bfloat162{hip_bfloat16(a), hip_bfloat16(b)};
+}
+
+inline __host__ __device__ float2 __bfloat1622float2(__nv_bfloat162 v) {
+    return float2{float(v.x), float(v.y)};
 }
 
 // ─── Warp Primitives with 64-bit Mask Handling ─────────────────────────────
@@ -162,16 +209,3 @@ __device__ inline int __any_sync(int mask, int predicate) {
 }
 
 #endif // __HIPCC__ || __HIP_DEVICE_COMPILE__
-
-// ─── rocWMMA Mapping (CUDA wmma -> rocwmma) ────────────────────────────────
-
-#if defined(__has_include)
-#if __has_include(<rocwmma/rocwmma.hpp>)
-#include <rocwmma/rocwmma.hpp>
-namespace nvcuda {
-namespace wmma {
-    using namespace ::rocwmma;
-}
-}
-#endif
-#endif

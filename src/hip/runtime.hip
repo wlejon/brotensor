@@ -69,4 +69,15 @@ void* hip_current_stream(int dev) { return ::brotensor::detail::hip::hip_current
 void* hip_current_stream() { return ::brotensor::detail::hip::hip_current_stream(-1); }
 void hip_set_stream(void* stream, int dev) { ::brotensor::detail::hip::hip_set_stream(stream, dev); }
 void hip_set_stream(void* stream) { ::brotensor::detail::hip::hip_set_stream(stream, -1); }
+
+void* cuda_current_stream(int dev) { return ::brotensor::detail::hip::hip_current_stream(dev); }
+void* cuda_current_stream() { return ::brotensor::detail::hip::hip_current_stream(-1); }
+void cuda_set_stream(void* stream, int dev) { ::brotensor::detail::hip::hip_set_stream(stream, dev); }
+void cuda_set_stream(void* stream) { ::brotensor::detail::hip::hip_set_stream(stream, -1); }
+}
+
+namespace brotensor::detail::cuda {
+void cuda_check_throw(int err, const char* expr_text, const char* file, int line) {
+    ::brotensor::detail::hip::hip_check_throw(static_cast<hipError_t>(err), expr_text, file, line);
+}
 }

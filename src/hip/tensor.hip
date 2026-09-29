@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace brotensor {
 // Forward decl: thread-local current stream from runtime.hip.
@@ -52,8 +54,11 @@ void init_async_pool_for_device(int dev) {
     int prior = 0;
     (void)hipGetDevice(&prior);
     if (prior != dev) (void)hipSetDevice(dev);
+    const char* env_pool = std::getenv("BROTENSOR_HIP_ASYNC_POOL");
+    const bool allow_pool = (env_pool != nullptr && std::strcmp(env_pool, "1") == 0);
     int supported = 0;
-    if (hipDeviceGetAttribute(&supported, hipDeviceAttributeMemoryPoolsSupported, dev) == hipSuccess && supported) {
+    if (allow_pool &&
+        hipDeviceGetAttribute(&supported, hipDeviceAttributeMemoryPoolsSupported, dev) == hipSuccess && supported) {
         hipMemPool_t pool = nullptr;
         if (hipDeviceGetDefaultMemPool(&pool, dev) == hipSuccess) {
             std::uint64_t threshold = UINT64_MAX;
@@ -130,7 +135,9 @@ void hip_memcpy_h2d(void* dst, const void* src, std::size_t n, int dev) {
     int prior = 0;
     (void)hipGetDevice(&prior);
     if (prior != dev) (void)hipSetDevice(dev);
-    BROTENSOR_HIP_CHECK(hipMemcpy(dst, src, n, hipMemcpyHostToDevice));
+    auto s = reinterpret_cast<hipStream_t>(::brotensor::hip_current_stream(dev));
+    BROTENSOR_HIP_CHECK(hipMemcpyAsync(dst, src, n, hipMemcpyHostToDevice, s));
+    BROTENSOR_HIP_CHECK(hipStreamSynchronize(s));
     if (prior != dev) (void)hipSetDevice(prior);
 }
 
@@ -140,7 +147,9 @@ void hip_memcpy_d2h(void* dst, const void* src, std::size_t n, int dev) {
     int prior = 0;
     (void)hipGetDevice(&prior);
     if (prior != dev) (void)hipSetDevice(dev);
-    BROTENSOR_HIP_CHECK(hipMemcpy(dst, src, n, hipMemcpyDeviceToHost));
+    auto s = reinterpret_cast<hipStream_t>(::brotensor::hip_current_stream(dev));
+    BROTENSOR_HIP_CHECK(hipMemcpyAsync(dst, src, n, hipMemcpyDeviceToHost, s));
+    BROTENSOR_HIP_CHECK(hipStreamSynchronize(s));
     if (prior != dev) (void)hipSetDevice(prior);
 }
 
@@ -256,6 +265,7 @@ bool hip_mem_trim(std::size_t keep_bytes, int dev) {
         if (prior != dev) (void)hipSetDevice(prior);
         return false;
     }
+    (void)hipDeviceSynchronize();
     if (prior != dev) (void)hipSetDevice(prior);
     return true;
 }
@@ -278,3 +288,12 @@ const ::brotensor::detail::AllocVTable& hip_alloc_table() {
 }
 
 } // namespace brotensor::detail::hip
+
+namespace brotensor::detail::cuda {
+void* cuda_alloc(std::size_t bytes) {
+    return ::brotensor::detail::hip::hip_alloc(bytes, -1);
+}
+void cuda_free(void* ptr) {
+    ::brotensor::detail::hip::hip_free(ptr, -1);
+}
+} // namespace brotensor::detail::cuda

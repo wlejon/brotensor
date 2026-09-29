@@ -700,10 +700,39 @@ if(BROTENSOR_WITH_HIP)
         src/hip/runtime.hip
         src/hip/tensor.hip
         src/hip/register.hip
+        src/hip/detail/stubs.hip
+        src/cuda/elementwise.cu
+        src/cuda/rms_norm.cu
+        src/cuda/layernorm.cu
+        src/cuda/reduce.cu
+        src/cuda/public_reductions.cu
+        src/cuda/embedding.cu
+        src/cuda/concat.cu
+        src/cuda/swiglu.cu
+        src/cuda/loss.cu
+        src/cuda/l2_norm.cu
+        src/cuda/l2_normalize.cu
+    )
+    set_source_files_properties(
+        src/cuda/elementwise.cu
+        src/cuda/rms_norm.cu
+        src/cuda/layernorm.cu
+        src/cuda/reduce.cu
+        src/cuda/public_reductions.cu
+        src/cuda/embedding.cu
+        src/cuda/concat.cu
+        src/cuda/swiglu.cu
+        src/cuda/loss.cu
+        src/cuda/l2_norm.cu
+        src/cuda/l2_normalize.cu
+        PROPERTIES
+            LANGUAGE HIP
     )
     target_link_libraries(brotensor_hip PUBLIC brotensor_core hip::host roc::hipblas)
     target_include_directories(brotensor_hip PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hip/compat>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hip>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hip/detail>
         /opt/rocm/include
     )
     target_compile_definitions(brotensor_hip PUBLIC
