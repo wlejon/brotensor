@@ -13,13 +13,23 @@ using cudaError_t     = hipError_t;
 using cudaDeviceProp  = hipDeviceProp_t;
 using cudaMemPool_t   = hipMemPool_t;
 using cudaStreamCaptureStatus = hipStreamCaptureStatus;
+using cudaGraph_t     = hipGraph_t;
+using cudaGraphExec_t = hipGraphExec_t;
+using cudaStreamCaptureMode = hipStreamCaptureMode;
 
 #define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
 #define cudaStreamCaptureStatusInvalidated hipStreamCaptureStatusInvalidated
+#define cudaStreamCaptureModeGlobal hipStreamCaptureModeGlobal
+#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
+#define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
 #define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamBeginCapture hipStreamBeginCapture
 #define cudaStreamEndCapture hipStreamEndCapture
+#define cudaGraphLaunch hipGraphLaunch
+#define cudaGraphExecDestroy hipGraphExecDestroy
+#define cudaGraphDestroy hipGraphDestroy
+#define cudaGraphInstantiate(pExec, graph, flags) hipGraphInstantiateWithFlags(pExec, graph, flags)
 
 #define cudaSuccess hipSuccess
 #define cudaErrorNotReady hipErrorNotReady
