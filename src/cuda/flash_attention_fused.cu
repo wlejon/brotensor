@@ -482,6 +482,42 @@ template <typename T, bool CAUSAL>
 void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O,
                      int Lq, int Lk, int D, int num_heads, int head_dim,
                      cudaStream_t stream) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    // On AMD RDNA (e.g. gfx1151 / Radeon 8060S), hardware LDS per workgroup is
+    // 64 KB (65,536 bytes). Tile dimensions are chosen so that total dynamic
+    // shared memory stays <= 64 KB for every supported head dimension.
+    switch (head_dim) {
+        case 16:
+            launch_impl<T, 16, 64, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 32:
+            launch_impl<T, 32, 64, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 40:
+            launch_impl<T, 40, 64, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 64:
+            launch_impl<T, 64, 64, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 72:
+            launch_impl<T, 72, 64, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 80:
+            launch_impl<T, 80, 64, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 112:
+            launch_impl<T, 112, 64, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 128:
+            launch_impl<T, 128, 64, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        case 160:
+            launch_impl<T, 160, 64, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            return;
+        default:
+            return;
+    }
+#else
     switch (head_dim) {
         case 16:
             launch_impl<T, 16, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
@@ -526,6 +562,7 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
         default:
             return;  // guarded by supported(); unreachable
     }
+#endif
 }
 
 }  // namespace

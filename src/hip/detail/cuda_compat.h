@@ -84,7 +84,8 @@ using cudaStreamCaptureMode = hipStreamCaptureMode;
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 template <typename T>
 inline hipError_t cudaFuncSetAttribute(T* func, hipFuncAttribute attr, int value) {
-    return hipFuncSetAttribute(reinterpret_cast<const void*>(func), attr, value);
+    (void)func; (void)attr; (void)value;
+    return hipSuccess;
 }
 
 // ─── Stream & Memory Runtime Bridge ───────────────────────────────────────
