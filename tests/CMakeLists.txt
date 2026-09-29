@@ -165,11 +165,12 @@ brotensor_add_test(brotensor_test_tensor_errors test_tensor_errors.cpp)
 
 if(BROTENSOR_WITH_HIP)
     brotensor_add_test(brotensor_test_hip test_hip.cpp)
+    brotensor_add_test(brotensor_test_cuda_rocm_parity test_cuda_rocm_parity.cpp)
 endif()
 
 # --- GPU tests (CUDA or Metal) ---
 set(BROTENSOR_HAS_GPU OFF)
-if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL)
+if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL OR BROTENSOR_WITH_HIP)
     set(BROTENSOR_HAS_GPU ON)
 endif()
 

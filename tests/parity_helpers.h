@@ -34,6 +34,7 @@ using brotensor::Tensor;
 inline brotensor::Device gpu_device() {
     using brotensor::Device;
     static const Device d = [] {
+        if (brotensor::is_available(Device::HIP))   return Device::HIP;
         if (brotensor::is_available(Device::CUDA))  return Device::CUDA;
         if (brotensor::is_available(Device::Metal)) return Device::Metal;
         return Device::CPU;
