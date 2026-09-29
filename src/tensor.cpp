@@ -136,6 +136,7 @@ std::size_t dtype_storage_bytes(Dtype d, std::int64_t numel) {
 const Device Device::CPU{DeviceType::CPU, 0};
 const Device Device::CUDA{DeviceType::CUDA, 0};
 const Device Device::Metal{DeviceType::Metal, 0};
+const Device Device::HIP{DeviceType::HIP, 0};
 
 const char* device_name(Device d) {
     if (d.is_cpu()) return "CPU";
@@ -149,6 +150,12 @@ const char* device_name(Device d) {
         if (d.index == 0) return "Metal";
         static thread_local char buf[32];
         std::snprintf(buf, sizeof(buf), "Metal:%d", d.index);
+        return buf;
+    }
+    if (d.is_hip()) {
+        if (d.index == 0) return "hip";
+        static thread_local char buf[32];
+        std::snprintf(buf, sizeof(buf), "hip:%d", d.index);
         return buf;
     }
     return "?";

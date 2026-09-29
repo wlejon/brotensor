@@ -138,6 +138,9 @@ void adopt_output(Tensor& t, Device d);
 // Set registered CUDA device count.
 void set_cuda_device_count(int count);
 
+// Set registered HIP device count.
+void set_hip_device_count(int count);
+
 // Throw a "<op>: not implemented on <device>" std::runtime_error. Called
 // by the public wrapper when the chosen vtable slot is null.
 [[noreturn]] void throw_not_implemented(const char* op_name, Device d);

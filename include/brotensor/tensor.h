@@ -73,7 +73,7 @@ bool dtype_is_quant(Dtype);
 // CUDA / Metal are registered at runtime by `brotensor::init()` if the
 // corresponding backend was compiled into this binary. Supports multi-GPU
 // device indexing (e.g. Device::cuda(0), Device::cuda(1)).
-enum class DeviceType : int { CPU = 0, CUDA = 1, Metal = 2 };
+enum class DeviceType : int { CPU = 0, CUDA = 1, Metal = 2, HIP = 3 };
 
 struct Device {
     DeviceType type  = DeviceType::CPU;
@@ -85,11 +85,13 @@ struct Device {
     static constexpr Device cpu()              { return Device(DeviceType::CPU, 0); }
     static constexpr Device cuda(int idx = 0)  { return Device(DeviceType::CUDA, idx); }
     static constexpr Device metal(int idx = 0) { return Device(DeviceType::Metal, idx); }
+    static constexpr Device hip(int idx = 0)   { return Device(DeviceType::HIP, idx); }
 
-    // Legacy enum compatibility constants so `Device::CPU`, `Device::CUDA`, `Device::Metal` work verbatim.
+    // Legacy enum compatibility constants so `Device::CPU`, `Device::CUDA`, `Device::Metal`, `Device::HIP` work verbatim.
     static const Device CPU;
     static const Device CUDA;
     static const Device Metal;
+    static const Device HIP;
 
     constexpr bool operator==(const Device& o) const {
         return type == o.type && index == o.index;
@@ -105,6 +107,7 @@ struct Device {
     constexpr bool is_cpu()   const { return type == DeviceType::CPU; }
     constexpr bool is_cuda()  const { return type == DeviceType::CUDA; }
     constexpr bool is_metal() const { return type == DeviceType::Metal; }
+    constexpr bool is_hip()   const { return type == DeviceType::HIP; }
     constexpr bool is_gpu()   const { return type != DeviceType::CPU; }
 };
 

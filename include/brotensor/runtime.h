@@ -45,6 +45,9 @@ void set_default_device(Device d);
 // Number of probed CUDA devices (0 if CUDA not compiled in or no CUDA GPU found).
 int cuda_device_count();
 
+// Number of probed HIP devices (0 if HIP not compiled in or no HIP GPU found).
+int hip_device_count();
+
 // Backends actually registered in this binary at runtime. CPU is always
 // present; CUDA / Metal appear only if their backend was both compiled in
 // and successfully probed by init().

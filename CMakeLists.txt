@@ -121,6 +121,7 @@ endif()
 # CPU has no opt-out.
 option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
 option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
+option(BROTENSOR_WITH_HIP   "Build GPU backend (HIP/ROCm)" OFF)
 
 if(BROTENSOR_WITH_CUDA)
     if(NOT CMAKE_CUDA_ARCHITECTURES)
@@ -139,6 +140,16 @@ if(BROTENSOR_WITH_METAL)
         message(FATAL_ERROR "BROTENSOR_WITH_METAL requires Apple platform.")
     endif()
     enable_language(OBJCXX)
+endif()
+if(BROTENSOR_WITH_HIP)
+    if(NOT CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES "gfx1151")
+    endif()
+    enable_language(HIP)
+    set(CMAKE_HIP_STANDARD 20)
+    set(CMAKE_HIP_STANDARD_REQUIRED ON)
+    find_package(hip REQUIRED)
+    find_package(hipblas REQUIRED)
 endif()
 
 # --- brotensor_core: dispatcher + public op wrappers + Tensor + runtime ---
@@ -682,6 +693,31 @@ if(BROTENSOR_WITH_METAL)
         BROTENSOR_HAS_METAL=1 BROTENSOR_HAS_GPU=1)
 endif()
 
+# --- brotensor_hip: HIP/ROCm backend (optional) ---
+
+if(BROTENSOR_WITH_HIP)
+    add_library(brotensor_hip STATIC
+        src/hip/runtime.hip
+        src/hip/tensor.hip
+        src/hip/register.hip
+    )
+    target_link_libraries(brotensor_hip PUBLIC brotensor_core hip::host roc::hipblas)
+    target_include_directories(brotensor_hip PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hip>
+        /opt/rocm/include
+    )
+    target_compile_definitions(brotensor_hip PUBLIC
+        BROTENSOR_HAS_HIP=1 BROTENSOR_HAS_GPU=1)
+    target_compile_definitions(brotensor_core PRIVATE
+        BROTENSOR_HAS_HIP=1 BROTENSOR_HAS_GPU=1)
+    target_link_libraries(brotensor_core PRIVATE hip::host)
+    target_include_directories(brotensor_core PRIVATE /opt/rocm/include)
+    set_target_properties(brotensor_hip PROPERTIES
+        HIP_STANDARD 20
+        HIP_STANDARD_REQUIRED ON
+    )
+endif()
+
 # --- brotensor: final consumed target (INTERFACE) ---
 # Links the core + always-on CPU backend + whichever GPU backends are enabled.
 # Consumers (brogameagent, brodiffusion, tests) link this one target.
@@ -703,6 +739,7 @@ target_link_libraries(brotensor INTERFACE
     "$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_cpu>"
     "$<$<BOOL:${BROTENSOR_WITH_CUDA}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_cuda>>"
     "$<$<BOOL:${BROTENSOR_WITH_METAL}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_metal>>"
+    "$<$<BOOL:${BROTENSOR_WITH_HIP}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_hip>>"
 )
 
 add_subdirectory(src/api)
@@ -719,6 +756,9 @@ if(BROTENSOR_INSTALL)
     endif()
     if(BROTENSOR_WITH_METAL)
         list(APPEND _brotensor_install_targets brotensor_metal)
+    endif()
+    if(BROTENSOR_WITH_HIP)
+        list(APPEND _brotensor_install_targets brotensor_hip)
     endif()
 
     install(TARGETS ${_brotensor_install_targets}
@@ -774,5 +814,8 @@ if(BROTENSOR_WITH_CUDA)
 endif()
 if(BROTENSOR_WITH_METAL)
     set(_brotensor_backends "${_brotensor_backends} + Metal")
+endif()
+if(BROTENSOR_WITH_HIP)
+    set(_brotensor_backends "${_brotensor_backends} + HIP")
 endif()
 message(STATUS "brotensor: building with backends: ${_brotensor_backends}")

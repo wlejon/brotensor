@@ -135,6 +135,7 @@ static void test_dtype_sizing() {
     CHECK(std::strcmp(brotensor::device_name(Device::CPU), "CPU") == 0);
     CHECK(std::strcmp(brotensor::device_name(Device::CUDA), "CUDA") == 0);
     CHECK(std::strcmp(brotensor::device_name(Device::Metal), "Metal") == 0);
+    CHECK(std::strcmp(brotensor::device_name(Device::HIP), "hip") == 0);
 }
 
 // ─── 2. negative dimensions ────────────────────────────────────────────────
@@ -481,6 +482,13 @@ static void test_dispatch_registration() {
                           "not registered"));
     } else {
         std::printf("  Metal registered - skipping unregistered-lookup case\n");
+    }
+    if (!d::is_registered(Device::HIP)) {
+        CHECK(throws_with([] { (void)&d::ops_for(Device::HIP); },
+                          "not registered"));
+        CHECK(throws_runtime_error([] { (void)&d::alloc_for(Device::HIP); }));
+    } else {
+        std::printf("  HIP registered - skipping unregistered-lookup case\n");
     }
 
     // throw_not_implemented builds a "<op>: not implemented on <device>" error.

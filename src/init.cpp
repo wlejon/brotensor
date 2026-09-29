@@ -20,6 +20,11 @@
 #include <string>
 #include <vector>
 
+#if defined(BROTENSOR_HAS_HIP)
+// Defined in src/hip/register.hip.
+extern "C" void brotensor_probe_and_register_hip();
+#endif
+
 #if defined(BROTENSOR_HAS_CUDA)
 // Defined in src/cuda/init.cu.
 extern "C" void brotensor_probe_and_register_cuda();
@@ -60,6 +65,7 @@ std::atomic<bool>& global_default_set_flag() {
 thread_local std::optional<Device> tls_scope_override;
 
 Device pick_default_from_available() {
+    if (detail::is_registered(Device::HIP))   return Device::HIP;
     if (detail::is_registered(Device::CUDA))  return Device::CUDA;
     if (detail::is_registered(Device::Metal)) return Device::Metal;
     return Device::CPU;
@@ -73,6 +79,15 @@ std::optional<Device> parse_env_device() {
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
     }
     if (s == "cpu") return Device::cpu();
+    if (s == "hip" || s == "hip:0" || s == "rocm" || s == "rocm:0") return Device::hip(0);
+    if (s.rfind("hip:", 0) == 0) {
+        int idx = std::atoi(s.c_str() + 4);
+        return Device::hip(idx);
+    }
+    if (s.rfind("rocm:", 0) == 0) {
+        int idx = std::atoi(s.c_str() + 5);
+        return Device::hip(idx);
+    }
     if (s == "cuda" || s == "cuda:0") return Device::cuda(0);
     if (s.rfind("cuda:", 0) == 0) {
         int idx = std::atoi(s.c_str() + 5);
@@ -93,6 +108,9 @@ void init() {
     std::lock_guard<std::mutex> lock(init_mutex());
     if (init_done_flag().load(std::memory_order_relaxed)) return;
 
+#if defined(BROTENSOR_HAS_HIP)
+    try { brotensor_probe_and_register_hip(); } catch (...) { /* no HIP */ }
+#endif
 #if defined(BROTENSOR_HAS_CUDA)
     try { brotensor_probe_and_register_cuda(); } catch (...) { /* no CUDA */ }
 #endif
@@ -155,6 +173,13 @@ std::vector<Device> available_devices() {
     std::vector<Device> out;
     if (detail::is_registered(Device::CPU)) {
         out.push_back(Device::CPU);
+    }
+    if (detail::is_registered(Device::HIP)) {
+        int count = hip_device_count();
+        if (count <= 0) count = 1;
+        for (int i = 0; i < count; ++i) {
+            out.push_back(Device::hip(i));
+        }
     }
     if (detail::is_registered(Device::CUDA)) {
         int count = cuda_device_count();
