@@ -40,11 +40,15 @@ namespace fp16_internal {
 // (gemm_mma.cu) whenever it can take them; BROTENSOR_MMA_GEMM=0 forces the
 // WMMA kernel below (A/B comparisons).
 static bool mma_gemm_enabled() {
+#ifdef __HIP__
+    return false;
+#else
     static const bool on = [] {
         const char* e = std::getenv("BROTENSOR_MMA_GEMM");
         return !(e && e[0] == '0');
     }();
     return on;
+#endif
 }
 
 using namespace nvcuda;

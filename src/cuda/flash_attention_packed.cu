@@ -73,6 +73,8 @@ __device__ __forceinline__ void row_range(const int* __restrict__ bounds, int r,
     hi = hw >= 0 ? min(e, r + hw + 1) : e;
 }
 
+#ifndef __HIP__
+
 __device__ __forceinline__ uint32_t smem_addr(const void* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
@@ -320,6 +322,7 @@ __global__ void __launch_bounds__(PK_THREADS)
         }
     }
 }
+#endif // !__HIP__
 
 // ─── Generic fallback: one warp per (row, head), any head_dim ──────────────
 
@@ -389,6 +392,7 @@ void launch(const ::brotensor::Tensor& QKV, const int* bounds, ::brotensor::Tens
     const T* qkv = static_cast<const T*>(QKV.data);
     T* out = static_cast<T*>(O.data);
     constexpr bool tc = !std::is_same<T, float>::value;
+#ifndef __HIP__
     if (tc && hd == PK_HD) {
         if constexpr (tc) {
             const dim3 grid((L + PK_BQ - 1) / PK_BQ, H);
@@ -396,7 +400,9 @@ void launch(const ::brotensor::Tensor& QKV, const int* bounds, ::brotensor::Tens
             packed_attn_hd64_kernel<T><<<grid, PK_THREADS, 0, cur_stream()>>>(qkv, bounds, out, L, H, hw,
                                                                                scale_log2);
         }
-    } else {
+    } else
+#endif
+    {
         constexpr int warps = 4;
         const dim3 grid(L, (H + warps - 1) / warps);
         packed_attn_generic_kernel<T><<<grid, 32 * warps, 0, cur_stream()>>>(

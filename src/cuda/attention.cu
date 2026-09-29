@@ -406,7 +406,7 @@ void attention_forward(const ::brotensor::Tensor& X,
     }
 
     // Scores (N, N).
-    Tensor scores = Tensor::empty_on(Device::CUDA, N, N, Dtype::FP32);
+    Tensor scores = Tensor::empty_on(X.device, N, N, Dtype::FP32);
     float* scores_p = static_cast<float*>(scores.data);
     {
         const float inv_sqrtd = 1.0f / sqrtf(static_cast<float>(D));

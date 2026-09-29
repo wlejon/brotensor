@@ -193,13 +193,23 @@ bool is_registered(Device d) {
 
 const OpsVTable& ops_for(Device d) {
     auto& s = slots()[static_cast<int>(d.type)];
-    if (!s.registered) throw_unregistered(d);
+    if (!s.registered) {
+        if (d.is_cuda() && slots()[static_cast<int>(DeviceType::HIP)].registered) {
+            return slots()[static_cast<int>(DeviceType::HIP)].ops;
+        }
+        throw_unregistered(d);
+    }
     return s.ops;
 }
 
 const AllocVTable& alloc_for(Device d) {
     auto& s = slots()[static_cast<int>(d.type)];
-    if (!s.registered) throw_unregistered(d);
+    if (!s.registered) {
+        if (d.is_cuda() && slots()[static_cast<int>(DeviceType::HIP)].registered) {
+            return slots()[static_cast<int>(DeviceType::HIP)].alloc;
+        }
+        throw_unregistered(d);
+    }
     return s.alloc;
 }
 

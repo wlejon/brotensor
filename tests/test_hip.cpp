@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -53,6 +54,42 @@ static bool check_close(const Tensor& hip_tensor, const Tensor& cpu_tensor, floa
     }
     std::printf("  PASS  %s: max diff %g <= tol %g\n", name, diff, tol);
     return true;
+}
+
+static bool check_close_fp16(const Tensor& hip_tensor, const Tensor& cpu_tensor, float tol, const char* name) {
+    std::vector<uint16_t> hip_bits = hip_tensor.to_host_vector_fp16();
+    std::vector<float> cpu_v = cpu_tensor.to_host_vector();
+    if (hip_bits.size() != cpu_v.size()) {
+        std::printf("  FAIL  %s: size mismatch (hip=%zu, cpu=%zu)\n", name, hip_bits.size(), cpu_v.size());
+        ++g_failures;
+        return false;
+    }
+    std::vector<float> hip_v(hip_bits.size());
+    for (std::size_t i = 0; i < hip_bits.size(); ++i) {
+        hip_v[i] = brotensor::fp16_bits_to_fp32(hip_bits[i]);
+    }
+    float diff = max_abs_diff(hip_v, cpu_v);
+    if (diff > tol) {
+        std::printf("  FAIL  %s: max diff %g > tol %g\n", name, diff, tol);
+        ++g_failures;
+        return false;
+    }
+    std::printf("  PASS  %s: max diff %g <= tol %g\n", name, diff, tol);
+    return true;
+}
+
+static Tensor make_fp16_hip(int rows, int cols, const std::vector<float>& src) {
+    std::vector<uint16_t> h(src.size());
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        h[i] = brotensor::fp32_to_fp16_bits(src[i]);
+    }
+    return Tensor::from_host_fp16_on(Device::HIP, h.data(), rows, cols);
+}
+
+static void round_vector_to_fp16(std::vector<float>& v) {
+    for (float& x : v) {
+        x = brotensor::fp16_bits_to_fp32(brotensor::fp32_to_fp16_bits(x));
+    }
 }
 
 static void test_hip_probe_and_registration() {
@@ -440,6 +477,452 @@ static void test_hip_reductions() {
     }
 }
 
+// ─── Phase 2B Functional Tests ──────────────────────────────────────────────
+
+static void test_hip_matmul() {
+    std::printf("test_hip_matmul\n");
+
+    // FP32 Matmul
+    {
+        const int shapes[][3] = {
+            {64, 64, 64},
+            {16, 32, 48},
+            {1, 64, 32},
+        };
+        for (const auto& s : shapes) {
+            int M = s[0], K = s[1], N = s[2];
+            std::vector<float> va(M * K);
+            std::vector<float> vb(K * N);
+            for (std::size_t i = 0; i < va.size(); ++i) va[i] = std::sin(static_cast<float>(i + 1) * 0.1f);
+            for (std::size_t i = 0; i < vb.size(); ++i) vb[i] = std::cos(static_cast<float>(i + 1) * 0.15f);
+
+            Tensor A_cpu = Tensor::from_host_on(Device::CPU, va.data(), M, K);
+            Tensor B_cpu = Tensor::from_host_on(Device::CPU, vb.data(), K, N);
+            Tensor C_cpu;
+            brotensor::matmul(A_cpu, B_cpu, C_cpu);
+
+            Tensor A_hip = A_cpu.to(Device::HIP);
+            Tensor B_hip = B_cpu.to(Device::HIP);
+            Tensor C_hip;
+            brotensor::matmul(A_hip, B_hip, C_hip);
+            brotensor::sync(Device::HIP);
+
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "matmul_fp32_%dx%dx%d", M, K, N);
+            check_close(C_hip, C_cpu, 1e-4f, tag);
+        }
+    }
+
+    // FP32 Linear Forward
+    {
+        const int OUT = 32, IN = 64;
+        std::vector<float> vw(OUT * IN);
+        std::vector<float> vb(OUT);
+        std::vector<float> vx(IN);
+        for (std::size_t i = 0; i < vw.size(); ++i) vw[i] = std::sin(static_cast<float>(i + 1) * 0.05f);
+        for (std::size_t i = 0; i < vb.size(); ++i) vb[i] = 0.1f * static_cast<float>(i + 1);
+        for (std::size_t i = 0; i < vx.size(); ++i) vx[i] = std::cos(static_cast<float>(i + 1) * 0.2f);
+
+        Tensor W_cpu = Tensor::from_host_on(Device::CPU, vw.data(), OUT, IN);
+        Tensor b_cpu = Tensor::from_host_on(Device::CPU, vb.data(), OUT, 1);
+        Tensor x_cpu = Tensor::from_host_on(Device::CPU, vx.data(), IN, 1);
+        Tensor y_cpu;
+        brotensor::linear_forward(W_cpu, b_cpu, x_cpu, y_cpu);
+
+        Tensor y_hip;
+        brotensor::linear_forward(W_cpu.to(Device::HIP), b_cpu.to(Device::HIP), x_cpu.to(Device::HIP), y_hip);
+        brotensor::sync(Device::HIP);
+        check_close(y_hip, y_cpu, 1e-4f, "linear_forward_fp32");
+    }
+
+    // FP16 Matmul
+    {
+        const int shapes[][3] = {
+            {64, 64, 64},
+            {16, 32, 48},
+            {1, 64, 32},
+        };
+        for (const auto& s : shapes) {
+            int M = s[0], K = s[1], N = s[2];
+            std::vector<float> va(M * K);
+            std::vector<float> vb(K * N);
+            for (std::size_t i = 0; i < va.size(); ++i) va[i] = std::sin(static_cast<float>(i + 1) * 0.1f);
+            for (std::size_t i = 0; i < vb.size(); ++i) vb[i] = std::cos(static_cast<float>(i + 1) * 0.15f);
+            round_vector_to_fp16(va);
+            round_vector_to_fp16(vb);
+
+            Tensor A_cpu = Tensor::from_host_on(Device::CPU, va.data(), M, K);
+            Tensor B_cpu = Tensor::from_host_on(Device::CPU, vb.data(), K, N);
+            Tensor C_cpu;
+            brotensor::matmul(A_cpu, B_cpu, C_cpu);
+
+            Tensor A_hip = make_fp16_hip(M, K, va);
+            Tensor B_hip = make_fp16_hip(K, N, vb);
+            Tensor C_hip;
+            brotensor::matmul(A_hip, B_hip, C_hip);
+            brotensor::sync(Device::HIP);
+
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "matmul_fp16_%dx%dx%d", M, K, N);
+            check_close_fp16(C_hip, C_cpu, 2e-3f, tag);
+        }
+    }
+}
+
+static void test_hip_softmax() {
+    std::printf("test_hip_softmax\n");
+
+    // softmax_forward (unmasked and masked)
+    {
+        const int N = 128;
+        std::vector<float> vlogits(N);
+        for (int i = 0; i < N; ++i) vlogits[i] = std::sin(static_cast<float>(i + 1) * 0.2f) * 2.0f;
+
+        Tensor logits_cpu = Tensor::from_host_on(Device::CPU, vlogits.data(), N, 1);
+        Tensor logits_hip = logits_cpu.to(Device::HIP);
+
+        // unmasked
+        {
+            Tensor probs_cpu, probs_hip;
+            brotensor::softmax_forward(logits_cpu, probs_cpu, nullptr);
+            brotensor::softmax_forward(logits_hip, probs_hip, nullptr);
+            brotensor::sync(Device::HIP);
+            check_close(probs_hip, probs_cpu, 1e-4f, "softmax_forward_unmasked");
+        }
+
+        // masked
+        {
+            std::vector<float> mask(N, 1.0f);
+            for (int i = N / 2; i < N; ++i) mask[i] = 0.0f;
+            Tensor mask_hip = Tensor::from_host_on(Device::HIP, mask.data(), N, 1);
+
+            Tensor probs_cpu, probs_hip;
+            brotensor::softmax_forward(logits_cpu, probs_cpu, mask.data());
+            brotensor::softmax_forward(logits_hip, probs_hip, static_cast<const float*>(mask_hip.data));
+            brotensor::sync(Device::HIP);
+            check_close(probs_hip, probs_cpu, 1e-4f, "softmax_forward_masked");
+        }
+    }
+
+    // softmax_rows_forward (FP32 & FP16)
+    {
+        const int rows = 8, cols = 64;
+        std::vector<float> vx(rows * cols);
+        for (std::size_t i = 0; i < vx.size(); ++i) {
+            vx[i] = std::cos(static_cast<float>(i + 1) * 0.1f) * 2.0f;
+        }
+
+        Tensor X_cpu = Tensor::from_host_on(Device::CPU, vx.data(), rows, cols);
+        Tensor Y_cpu;
+        brotensor::softmax_rows_forward(X_cpu, Y_cpu, rows, cols);
+
+        // FP32
+        {
+            Tensor X_hip = X_cpu.to(Device::HIP);
+            Tensor Y_hip;
+            brotensor::softmax_rows_forward(X_hip, Y_hip, rows, cols);
+            brotensor::sync(Device::HIP);
+            check_close(Y_hip, Y_cpu, 1e-4f, "softmax_rows_forward_fp32");
+        }
+
+        // FP16
+        {
+            round_vector_to_fp16(vx);
+            Tensor X_cpu_fp16 = Tensor::from_host_on(Device::CPU, vx.data(), rows, cols);
+            brotensor::softmax_rows_forward(X_cpu_fp16, Y_cpu, rows, cols);
+
+            Tensor X_hip_fp16 = make_fp16_hip(rows, cols, vx);
+            Tensor Y_hip_fp16;
+            brotensor::softmax_rows_forward(X_hip_fp16, Y_hip_fp16, rows, cols);
+            brotensor::sync(Device::HIP);
+            check_close_fp16(Y_hip_fp16, Y_cpu, 1e-2f, "softmax_rows_forward_fp16");
+        }
+    }
+}
+
+static void test_hip_rope() {
+    std::printf("test_hip_rope\n");
+
+    const int L = 16, num_heads = 4, head_dim = 64;
+    const float theta_base = 10000.0f;
+    std::vector<float> vx(L * num_heads * head_dim);
+    for (std::size_t i = 0; i < vx.size(); ++i) {
+        vx[i] = std::sin(static_cast<float>(i + 1) * 0.1f);
+    }
+    Tensor X_cpu = Tensor::from_host_on(Device::CPU, vx.data(), L, num_heads * head_dim);
+    Tensor X_hip = X_cpu.to(Device::HIP);
+
+    // seq_offset = 0
+    {
+        Tensor Y_cpu, Y_hip;
+        brotensor::rope_forward(X_cpu, head_dim, num_heads, 0, theta_base, Y_cpu);
+        brotensor::rope_forward(X_hip, head_dim, num_heads, 0, theta_base, Y_hip);
+        brotensor::sync(Device::HIP);
+        check_close(Y_hip, Y_cpu, 1e-4f, "rope_forward_offset0");
+
+        Tensor dX_cpu, dX_hip;
+        brotensor::rope_backward(Y_cpu, head_dim, num_heads, 0, theta_base, dX_cpu);
+        brotensor::rope_backward(Y_hip, head_dim, num_heads, 0, theta_base, dX_hip);
+        brotensor::sync(Device::HIP);
+        check_close(dX_hip, dX_cpu, 1e-4f, "rope_backward_offset0");
+    }
+
+    // seq_offset = 7
+    {
+        Tensor Y_cpu, Y_hip;
+        brotensor::rope_forward(X_cpu, head_dim, num_heads, 7, theta_base, Y_cpu);
+        brotensor::rope_forward(X_hip, head_dim, num_heads, 7, theta_base, Y_hip);
+        brotensor::sync(Device::HIP);
+        check_close(Y_hip, Y_cpu, 1e-4f, "rope_forward_offset7");
+    }
+}
+
+static void test_hip_attention() {
+    std::printf("test_hip_attention\n");
+
+    // Standard attention_forward (FP32)
+    {
+        const int N = 8, D = 32;
+        std::vector<float> vx(N * D), vw(D * D);
+        for (std::size_t i = 0; i < vx.size(); ++i) vx[i] = std::sin(static_cast<float>(i + 1) * 0.1f) * 0.2f;
+        for (std::size_t i = 0; i < vw.size(); ++i) vw[i] = std::cos(static_cast<float>(i + 1) * 0.15f) * 0.2f;
+
+        Tensor X_c  = Tensor::from_host_on(Device::CPU, vx.data(), N, D);
+        Tensor Wq_c = Tensor::from_host_on(Device::CPU, vw.data(), D, D);
+        Tensor Wk_c = Tensor::from_host_on(Device::CPU, vw.data(), D, D);
+        Tensor Wv_c = Tensor::from_host_on(Device::CPU, vw.data(), D, D);
+        Tensor Wo_c = Tensor::from_host_on(Device::CPU, vw.data(), D, D);
+        Tensor Q_c, K_c, V_c, Attn_c, Y_pre_c, O_c;
+
+        brotensor::attention_forward(X_c, Wq_c, Wk_c, Wv_c, Wo_c, nullptr,
+                                     Q_c, K_c, V_c, Attn_c, Y_pre_c, O_c);
+
+        Tensor X_h  = X_c.to(Device::HIP);
+        Tensor Wq_h = Wq_c.to(Device::HIP);
+        Tensor Wk_h = Wk_c.to(Device::HIP);
+        Tensor Wv_h = Wv_c.to(Device::HIP);
+        Tensor Wo_h = Wo_c.to(Device::HIP);
+        Tensor Q_h, K_h, V_h, Attn_h, Y_pre_h, O_h;
+
+        brotensor::attention_forward(X_h, Wq_h, Wk_h, Wv_h, Wo_h, nullptr,
+                                     Q_h, K_h, V_h, Attn_h, Y_pre_h, O_h);
+        brotensor::sync(Device::HIP);
+        check_close(O_h, O_c, 1e-3f, "attention_forward_fp32");
+    }
+
+    // flash_attention_forward (FP16 on HIP vs FP32 on CPU)
+    {
+        const int Lq = 32, Lk = 32, D = 64, num_heads = 2;
+        std::vector<float> vq(Lq * D), vk(Lk * D), vv(Lk * D);
+        for (std::size_t i = 0; i < vq.size(); ++i) vq[i] = std::sin(static_cast<float>(i + 1) * 0.1f) * 0.3f;
+        for (std::size_t i = 0; i < vk.size(); ++i) vk[i] = std::cos(static_cast<float>(i + 1) * 0.2f) * 0.3f;
+        for (std::size_t i = 0; i < vv.size(); ++i) vv[i] = std::sin(static_cast<float>(i + 1) * 0.3f) * 0.3f;
+        round_vector_to_fp16(vq);
+        round_vector_to_fp16(vk);
+        round_vector_to_fp16(vv);
+
+        Tensor Q_c = Tensor::from_host_on(Device::CPU, vq.data(), Lq, D);
+        Tensor K_c = Tensor::from_host_on(Device::CPU, vk.data(), Lk, D);
+        Tensor V_c = Tensor::from_host_on(Device::CPU, vv.data(), Lk, D);
+
+        Tensor Q_h = make_fp16_hip(Lq, D, vq);
+        Tensor K_h = make_fp16_hip(Lk, D, vk);
+        Tensor V_h = make_fp16_hip(Lk, D, vv);
+
+        // Bidirectional (causal = false)
+        {
+            Tensor O_c, O_h;
+            brotensor::flash_attention_forward(Q_c, K_c, V_c, nullptr, num_heads, false, O_c);
+            brotensor::flash_attention_forward(Q_h, K_h, V_h, nullptr, num_heads, false, O_h);
+            brotensor::sync(Device::HIP);
+            check_close_fp16(O_h, O_c, 2e-2f, "flash_attention_forward_bidirectional");
+        }
+
+        // Causal (causal = true)
+        {
+            Tensor O_c, O_h;
+            brotensor::flash_attention_forward(Q_c, K_c, V_c, nullptr, num_heads, true, O_c);
+            brotensor::flash_attention_forward(Q_h, K_h, V_h, nullptr, num_heads, true, O_h);
+            brotensor::sync(Device::HIP);
+            check_close_fp16(O_h, O_c, 2e-2f, "flash_attention_forward_causal");
+        }
+    }
+}
+
+// ─── Q4_K Helpers and Tests ──────────────────────────────────────────────────
+
+static constexpr int Q4K_BLOCK = 256;
+static constexpr int Q4K_BYTES = 144;
+
+struct Q4KBlock {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[128];
+};
+static_assert(sizeof(Q4KBlock) == 144, "Q4KBlock must be 144 bytes");
+
+static void pack_sc_m(uint8_t scales[12], const uint8_t sc[8], const uint8_t m[8]) {
+    std::memset(scales, 0, 12);
+    for (int j = 0; j < 4; ++j) {
+        scales[j]     = sc[j] & 0x3F;
+        scales[j + 4] = m[j]  & 0x3F;
+    }
+    for (int j = 4; j < 8; ++j) {
+        scales[j + 4] = static_cast<uint8_t>((sc[j] & 0x0F) | ((m[j] & 0x0F) << 4));
+        scales[j - 4] |= static_cast<uint8_t>(((sc[j] >> 4) & 0x03) << 6);
+        scales[j]     |= static_cast<uint8_t>(((m[j] >> 4) & 0x03) << 6);
+    }
+}
+
+static void unpack_sc_m(const uint8_t scales[12], uint8_t* sc, uint8_t* m) {
+    for (int j = 0; j < 8; ++j) {
+        if (j < 4) {
+            sc[j] = scales[j]     & 0x3F;
+            m [j] = scales[j + 4] & 0x3F;
+        } else {
+            sc[j] = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+            m [j] = (scales[j + 4] >> 4)   | ((scales[j - 0] >> 6) << 4);
+        }
+    }
+}
+
+static void quantize_q4k_block(const float* src, Q4KBlock& out) {
+    float lo[8], hi[8];
+    for (int is = 0; is < 8; ++is) {
+        lo[is] = hi[is] = src[is * 32];
+        for (int l = 1; l < 32; ++l) {
+            const float v = src[is * 32 + l];
+            if (v < lo[is]) lo[is] = v;
+            if (v > hi[is]) hi[is] = v;
+        }
+    }
+    float max_range = 0.0f, max_neg_lo = 0.0f;
+    for (int is = 0; is < 8; ++is) {
+        max_range  = std::max(max_range, hi[is] - lo[is]);
+        max_neg_lo = std::max(max_neg_lo, -lo[is]);
+    }
+    const float d    = (max_range > 0.0f) ? (max_range / (15.0f * 63.0f)) : 1.0f;
+    const float dmin = (max_neg_lo > 0.0f) ? (max_neg_lo / 63.0f) : 1.0f;
+
+    uint8_t sc[8], m[8];
+    for (int is = 0; is < 8; ++is) {
+        int sc_i = (d > 0.0f) ? static_cast<int>(std::lround((hi[is] - lo[is]) / (15.0f * d))) : 0;
+        int m_i  = (dmin > 0.0f) ? static_cast<int>(std::lround(-lo[is] / dmin)) : 0;
+        sc[is] = static_cast<uint8_t>(std::clamp(sc_i, 0, 63));
+        m[is]  = static_cast<uint8_t>(std::clamp(m_i, 0, 63));
+    }
+
+    std::memset(out.qs, 0, 128);
+    for (int p = 0; p < 4; ++p) {
+        const int is_lo = 2 * p, is_hi = 2 * p + 1;
+        const float w_lo = static_cast<float>(sc[is_lo]) * d;
+        const float w_hi = static_cast<float>(sc[is_hi]) * d;
+        const float b_lo = static_cast<float>(m [is_lo]) * dmin;
+        const float b_hi = static_cast<float>(m [is_hi]) * dmin;
+        for (int l = 0; l < 32; ++l) {
+            int n_lo = (w_lo > 0.0f) ? static_cast<int>(std::lround((src[is_lo * 32 + l] + b_lo) / w_lo)) : 0;
+            int n_hi = (w_hi > 0.0f) ? static_cast<int>(std::lround((src[is_hi * 32 + l] + b_hi) / w_hi)) : 0;
+            n_lo = std::clamp(n_lo, 0, 15);
+            n_hi = std::clamp(n_hi, 0, 15);
+            out.qs[p * 32 + l] = static_cast<uint8_t>((n_lo & 0x0F) | ((n_hi & 0x0F) << 4));
+        }
+    }
+    out.d    = brotensor::fp32_to_fp16_bits(d);
+    out.dmin = brotensor::fp32_to_fp16_bits(dmin);
+    pack_sc_m(out.scales, sc, m);
+}
+
+static void dequant_q4k_block(const Q4KBlock& blk, float* dst) {
+    const float d    = brotensor::fp16_bits_to_fp32(blk.d);
+    const float dmin = brotensor::fp16_bits_to_fp32(blk.dmin);
+    uint8_t sc[8], m[8];
+    unpack_sc_m(blk.scales, sc, m);
+    for (int t = 0; t < 256; ++t) {
+        const int is   = t >> 5;
+        const int l    = t & 31;
+        const int pair = is >> 1;
+        const uint8_t qb = blk.qs[pair * 32 + l];
+        const int nib  = (is & 1) ? (qb >> 4) : (qb & 0x0F);
+        dst[t] = d * static_cast<float>(sc[is]) * static_cast<float>(nib)
+               - dmin * static_cast<float>(m[is]);
+    }
+}
+
+static void test_hip_q4k() {
+    std::printf("test_hip_q4k\n");
+    constexpr int OUT = 4;
+    constexpr int IN  = 256;
+    constexpr int BLOCKS_PER_ROW = IN / Q4K_BLOCK;
+
+    std::vector<float> Wf(static_cast<size_t>(OUT) * IN);
+    for (size_t i = 0; i < Wf.size(); ++i) {
+        Wf[i] = std::sin(static_cast<float>(i + 1) * 0.1f) * 0.5f;
+    }
+
+    std::vector<Q4KBlock> Wq(static_cast<size_t>(OUT) * BLOCKS_PER_ROW);
+    std::vector<float> W_deq(static_cast<size_t>(OUT) * IN);
+    for (int r = 0; r < OUT; ++r) {
+        for (int sb = 0; sb < BLOCKS_PER_ROW; ++sb) {
+            quantize_q4k_block(&Wf[r * IN + sb * Q4K_BLOCK], Wq[r * BLOCKS_PER_ROW + sb]);
+            dequant_q4k_block(Wq[r * BLOCKS_PER_ROW + sb], &W_deq[r * IN + sb * Q4K_BLOCK]);
+        }
+    }
+
+    Tensor W_q4k_g = Tensor::from_raw_bytes_on(Device::HIP, Wq.data(), OUT, IN,
+                                               Dtype::Q4_K, Wq.size() * sizeof(Q4KBlock));
+
+    // Test dequant_q4k_to_fp16
+    {
+        Tensor W_fp16_g;
+        brotensor::dequant_q4k_to_fp16(W_q4k_g, W_fp16_g);
+        CHECK(W_fp16_g.dtype == Dtype::FP16);
+        CHECK(W_fp16_g.rows == OUT && W_fp16_g.cols == IN);
+        brotensor::sync(Device::HIP);
+        std::vector<uint16_t> got = W_fp16_g.to_host_vector_fp16();
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < got.size(); ++i) {
+            float g = brotensor::fp16_bits_to_fp32(got[i]);
+            float r = W_deq[i];
+            float e = std::fabs(g - r);
+            if (e > max_abs) max_abs = e;
+        }
+        std::printf("  PASS  dequant_q4k_to_fp16: max_abs=%g <= 1e-3\n", max_abs);
+        CHECK(max_abs <= 1e-3f);
+    }
+
+    // Test linear_forward_q4k_fp16 (GEMV)
+    {
+        std::vector<float> xf(IN);
+        for (int i = 0; i < IN; ++i) {
+            xf[i] = std::cos(static_cast<float>(i + 1) * 0.15f) * 0.3f;
+        }
+        std::vector<float> y_ref(OUT, 0.0f);
+        for (int r = 0; r < OUT; ++r) {
+            float s = 0.0f;
+            for (int k = 0; k < IN; ++k) {
+                s += W_deq[r * IN + k] * xf[k];
+            }
+            y_ref[r] = s;
+        }
+
+        Tensor x_g = make_fp16_hip(IN, 1, xf);
+        Tensor y_g;
+        brotensor::linear_forward_q4k_fp16(W_q4k_g, nullptr, x_g, y_g);
+        CHECK(y_g.dtype == Dtype::FP16 && y_g.rows == OUT && y_g.cols == 1);
+        brotensor::sync(Device::HIP);
+        std::vector<uint16_t> got = y_g.to_host_vector_fp16();
+        float max_abs = 0.0f;
+        for (int r = 0; r < OUT; ++r) {
+            float g = brotensor::fp16_bits_to_fp32(got[r]);
+            float e = std::fabs(g - y_ref[r]);
+            if (e > max_abs) max_abs = e;
+        }
+        std::printf("  PASS  linear_forward_q4k_fp16: max_abs=%g < 5e-2\n", max_abs);
+        CHECK(max_abs < 5e-2f);
+    }
+}
+
 int main() {
     std::printf("test_hip running...\n");
     test_hip_probe_and_registration();
@@ -453,10 +936,17 @@ int main() {
     test_hip_norms();
     test_hip_reductions();
 
+    // Phase 2B functional tests
+    test_hip_matmul();
+    test_hip_softmax();
+    test_hip_rope();
+    test_hip_attention();
+    test_hip_q4k();
+
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);
         return 1;
     }
-    std::printf("\nAll HIP Phase 1 and Phase 2A checks passed successfully.\n");
+    std::printf("\nAll HIP Phase 1, Phase 2A, and Phase 2B checks passed successfully.\n");
     return 0;
 }

@@ -13,6 +13,7 @@
 // bandwidth when M is a short packed batch; the large one takes over once it
 // alone fills the machine.
 
+#ifndef __HIP__
 #include "gemm_mma.cuh"
 
 #include "detail/activations.cuh"
@@ -445,3 +446,36 @@ bool launch(const __nv_bfloat16* A, const __nv_bfloat16* W, __nv_bfloat16* C, in
 }
 
 }  // namespace brotensor::detail::cuda::mma_gemm
+
+#else
+
+#include "gemm_mma.cuh"
+
+namespace brotensor::detail::cuda::mma_gemm {
+
+std::size_t workspace_floats(int /*M*/, int /*N*/, int /*K*/) { return 0; }
+
+bool launch(const __half*, const __half*, __half*, int, int, int, const __half*, int,
+            int, float*, std::size_t, cudaStream_t, int) {
+    return false;
+}
+
+bool launch(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int, int,
+            const __nv_bfloat16*, int, int, float*, std::size_t,
+            cudaStream_t, int) {
+    return false;
+}
+
+bool launch_f32out(const __half*, const __half*, float*, int, int, int, cudaStream_t) {
+    return false;
+}
+
+bool launch_f32out(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int, int,
+                   cudaStream_t) {
+    return false;
+}
+
+}  // namespace brotensor::detail::cuda::mma_gemm
+
+#endif
+

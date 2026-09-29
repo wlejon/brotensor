@@ -24,7 +24,7 @@
 
 #include <cstdint>
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define BROTENSOR_HASH_RNG_HD __host__ __device__
 #else
 #define BROTENSOR_HASH_RNG_HD

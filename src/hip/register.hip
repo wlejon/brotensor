@@ -2,7 +2,8 @@
 //
 // Called from `brotensor::init()` (src/init.cpp) when BROTENSOR_HAS_HIP is
 // defined. Probes the driver via hipGetDeviceCount(); on success, builds
-// the OpsVTable, pairs it with the HIP AllocVTable, and hands the pair to the registry.
+// the OpsVTable by calling each cluster's per-cluster fill function,
+// pairs it with the HIP AllocVTable, and hands the pair to the registry.
 
 #include "detail/hip_check.h"
 
@@ -10,7 +11,6 @@
 #include <brotensor/tensor.h>
 
 #include <hip/hip_runtime.h>
-#include <vector>
 
 namespace brotensor::detail::hip {
 
@@ -23,53 +23,59 @@ void init_async_pool_for_device(int dev);
 namespace brotensor::detail::cuda {
 
 // ── per-cluster vtable-fill entry points ──
-void fill_cuda_vtable_elementwise (::brotensor::detail::OpsVTable&);
-void fill_cuda_vtable_norms       (::brotensor::detail::OpsVTable&);
-void fill_cuda_vtable_utils       (::brotensor::detail::OpsVTable&);
-void fill_cuda_vtable_l2_norm     (::brotensor::detail::OpsVTable&);
-void fill_cuda_vtable_l2_normalize(::brotensor::detail::OpsVTable&);
-
-// ── Embedding (src/cuda/embedding.cu) ──
-void embedding_lookup_forward(const ::brotensor::Tensor& table, const int32_t* d_idx,
-                              int B, ::brotensor::Tensor& out);
-void embedding_lookup_backward(const ::brotensor::Tensor& dOut, const int32_t* d_idx,
-                               int B, ::brotensor::Tensor& dTable);
-
-// ── Concat / split / copy (src/cuda/concat.cu) ──
-void concat_rows(const std::vector<const ::brotensor::Tensor*>& parts, ::brotensor::Tensor& out);
-void split_rows(const ::brotensor::Tensor& in, const std::vector<::brotensor::Tensor*>& parts);
-void concat_batched_rows(const std::vector<const ::brotensor::Tensor*>& parts,
-                         ::brotensor::Tensor& out);
-void concat_nchw_channels(const std::vector<const ::brotensor::Tensor*>& parts,
-                          int N, int H, int W,
-                          const std::vector<int>& C_per_part,
-                          ::brotensor::Tensor& out);
-void concat_nchw_channels_backward(const ::brotensor::Tensor& dY,
-                                   int N, int H, int W,
-                                   const std::vector<int>& C_per_part,
-                                   const std::vector<::brotensor::Tensor*>& dParts);
-void copy_d2d(const ::brotensor::Tensor& src, int src_row,
-              ::brotensor::Tensor& dst, int dst_row, int n_rows);
-void copy_d2d_strided(const ::brotensor::Tensor& src, int src_offset, int src_pitch,
-                      ::brotensor::Tensor& dst, int dst_offset, int dst_pitch,
-                      int width, int height);
-
-// ── Loss (src/cuda/loss.cu) ──
-float mse_vec_forward(const ::brotensor::Tensor& pred, const ::brotensor::Tensor& target);
-void mse_vec_backward(const ::brotensor::Tensor& pred, const ::brotensor::Tensor& target, ::brotensor::Tensor& dPred);
-void mse_vec_per_sample(const ::brotensor::Tensor& pred, const ::brotensor::Tensor& target,
-                        ::brotensor::Tensor& dPred, ::brotensor::Tensor& loss_per_sample);
-float softmax_xent_fused(const ::brotensor::Tensor& logits, const ::brotensor::Tensor& target,
-                         const float* d_mask,
-                         ::brotensor::Tensor& probs, ::brotensor::Tensor& dLogits);
-void softmax_xent_fused_batched(const ::brotensor::Tensor& logits_BL, const ::brotensor::Tensor& target_BL,
-                                const float* d_mask_BL, const int* d_head_offsets,
-                                int n_heads, ::brotensor::Tensor& probs_BL, ::brotensor::Tensor& dLogits_BL,
-                                ::brotensor::Tensor& loss_per_sample);
-void bce_with_logits_fused_batched(const ::brotensor::Tensor& logits_BL, const ::brotensor::Tensor& target_BL,
-                                   const float* d_mask_BL, float pos_weight,
-                                   ::brotensor::Tensor& probs_BL, ::brotensor::Tensor& dLogits_BL,
-                                   ::brotensor::Tensor& loss_per_sample);
+void fill_cuda_vtable_flash_attention(::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_attention      (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_conv           (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_deform_conv    (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_conv3d         (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_elementwise    (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_norms          (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_utils          (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_specialised    (::brotensor::detail::OpsVTable&);
+// ── brosoundml audio-ML clusters (one fill fn per src/cuda/<family>.cu) ──
+void fill_cuda_vtable_vocoder        (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_log_exp_round  (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_fft            (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_stft           (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_conv1d         (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_codec_quant    (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_resample1d     (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_sample_logits  (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_masked_diffusion(::brotensor::detail::OpsVTable&);
+// ── linear-attention text-path clusters ──
+void fill_cuda_vtable_l2_norm        (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_gated_delta_rule(::brotensor::detail::OpsVTable&);
+// ── Qwen3-VL polish (spatial_merge_2x2 + M-RoPE) — rope_mrope.cu ──
+void fill_cuda_vtable_qwen3_vl_polish(::brotensor::detail::OpsVTable&);
+// ── Vision-encoder arbitrary-scale 2D resample (SAM / DPT / depth) ──
+void fill_cuda_vtable_interp2d       (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_pool2d         (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_pad2d          (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_slice2d        (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_unfold2d       (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_l2_normalize   (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_convex_upsample(::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_gather_scatter (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_top_k          (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_window_partition(::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_conv_transpose2d(::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_loss_legacy    (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_xavier_init    (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_batch_norm     (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_image_preproc  (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_noise          (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_lstm           (::brotensor::detail::OpsVTable&);
+// ── StyleGAN3-R synthesis ops (sin/cos/rsqrt/pixel_norm, bias_act,
+//    upfirdn2d, modulated_conv2d) ──
+void fill_cuda_vtable_stylegan_elementwise(::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_bias_act       (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_upfirdn2d      (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_modulated_conv2d(::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_filtered_lrelu (::brotensor::detail::OpsVTable&);
+// ── packed variable-length encoder batching (flash_attention_packed.cu, packed_encoder.cu) ──
+void fill_cuda_vtable_packed_encoder (::brotensor::detail::OpsVTable&);
+// ── fused-epilogue / split-K linear (linear_ex.cu, gemm_mma.cu) ──
+void fill_cuda_vtable_linear_ex      (::brotensor::detail::OpsVTable&);
 
 } // namespace brotensor::detail::cuda
 
@@ -109,35 +115,52 @@ extern "C" void brotensor_probe_and_register_hip() {
     namespace dh = ::brotensor::detail::hip;
     namespace dc = ::brotensor::detail::cuda;
 
-    OpsVTable ops{}; // zero-init: every slot starts as nullptr
-
-    // Wire per-cluster fill functions
+    OpsVTable ops{};   // zero-init: every slot starts as nullptr
+    dc::fill_cuda_vtable_flash_attention(ops);
+    dc::fill_cuda_vtable_attention(ops);
+    dc::fill_cuda_vtable_conv(ops);
+    dc::fill_cuda_vtable_deform_conv(ops);
+    dc::fill_cuda_vtable_conv3d(ops);
     dc::fill_cuda_vtable_elementwise(ops);
     dc::fill_cuda_vtable_norms(ops);
     dc::fill_cuda_vtable_utils(ops);
+    dc::fill_cuda_vtable_specialised(ops);
+    dc::fill_cuda_vtable_vocoder(ops);
+    dc::fill_cuda_vtable_log_exp_round(ops);
+    dc::fill_cuda_vtable_fft(ops);
+    dc::fill_cuda_vtable_stft(ops);
+    dc::fill_cuda_vtable_conv1d(ops);
+    dc::fill_cuda_vtable_codec_quant(ops);
+    dc::fill_cuda_vtable_resample1d(ops);
+    dc::fill_cuda_vtable_sample_logits(ops);
+    dc::fill_cuda_vtable_masked_diffusion(ops);
     dc::fill_cuda_vtable_l2_norm(ops);
+    dc::fill_cuda_vtable_gated_delta_rule(ops);
+    dc::fill_cuda_vtable_qwen3_vl_polish(ops);
+    dc::fill_cuda_vtable_interp2d(ops);
+    dc::fill_cuda_vtable_pool2d(ops);
+    dc::fill_cuda_vtable_pad2d(ops);
+    dc::fill_cuda_vtable_slice2d(ops);
+    dc::fill_cuda_vtable_unfold2d(ops);
     dc::fill_cuda_vtable_l2_normalize(ops);
-
-    // Embedding
-    ops.embedding_lookup_forward  = &dc::embedding_lookup_forward;
-    ops.embedding_lookup_backward = &dc::embedding_lookup_backward;
-
-    // Concat / split / copy
-    ops.concat_rows                   = &dc::concat_rows;
-    ops.split_rows                    = &dc::split_rows;
-    ops.concat_batched_rows           = &dc::concat_batched_rows;
-    ops.concat_nchw_channels          = &dc::concat_nchw_channels;
-    ops.concat_nchw_channels_backward = &dc::concat_nchw_channels_backward;
-    ops.copy_d2d                      = &dc::copy_d2d;
-    ops.copy_d2d_strided              = &dc::copy_d2d_strided;
-
-    // Loss
-    ops.mse_vec_forward               = &dc::mse_vec_forward;
-    ops.mse_vec_backward              = &dc::mse_vec_backward;
-    ops.mse_vec_per_sample            = &dc::mse_vec_per_sample;
-    ops.softmax_xent_fused            = &dc::softmax_xent_fused;
-    ops.softmax_xent_fused_batched    = &dc::softmax_xent_fused_batched;
-    ops.bce_with_logits_fused_batched = &dc::bce_with_logits_fused_batched;
+    dc::fill_cuda_vtable_convex_upsample(ops);
+    dc::fill_cuda_vtable_gather_scatter(ops);
+    dc::fill_cuda_vtable_top_k(ops);
+    dc::fill_cuda_vtable_window_partition(ops);
+    dc::fill_cuda_vtable_conv_transpose2d(ops);
+    dc::fill_cuda_vtable_loss_legacy(ops);
+    dc::fill_cuda_vtable_xavier_init(ops);
+    dc::fill_cuda_vtable_batch_norm(ops);
+    dc::fill_cuda_vtable_image_preproc(ops);
+    dc::fill_cuda_vtable_noise(ops);
+    dc::fill_cuda_vtable_lstm(ops);
+    dc::fill_cuda_vtable_stylegan_elementwise(ops);
+    dc::fill_cuda_vtable_bias_act(ops);
+    dc::fill_cuda_vtable_upfirdn2d(ops);
+    dc::fill_cuda_vtable_modulated_conv2d(ops);
+    dc::fill_cuda_vtable_filtered_lrelu(ops);
+    dc::fill_cuda_vtable_packed_encoder(ops);
+    dc::fill_cuda_vtable_linear_ex(ops);
 
     ::brotensor::detail::register_backend(DeviceType::HIP, ops, dh::hip_alloc_table());
 }

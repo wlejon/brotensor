@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <cuda_runtime.h>
 #include <cstdint>
 
 namespace brotensor::detail::cuda {

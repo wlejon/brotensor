@@ -445,6 +445,9 @@ std::size_t Tensor::bytes() const {
 
 Tensor Tensor::empty_on(Device d, int r, int c, Dtype dt) {
     check_dims(r, c, "empty_on");
+    if (d.is_cuda() && !detail::is_registered(DeviceType::CUDA) && detail::is_registered(DeviceType::HIP)) {
+        d = Device::hip(d.index);
+    }
     Tensor t;
     t.device = d;
     t.dtype  = dt;
@@ -554,6 +557,9 @@ Tensor Tensor::from_host_int8(const int8_t* src, int r, int c) {
 }
 
 Tensor Tensor::view(Device d, void* data, int r, int c, Dtype dt) {
+    if (d.is_cuda() && !detail::is_registered(DeviceType::CUDA) && detail::is_registered(DeviceType::HIP)) {
+        d = Device::hip(d.index);
+    }
     Tensor t;
     t.device = d;
     t.dtype  = dt;
