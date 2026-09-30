@@ -13,16 +13,31 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 #include "detail/hip_check.h"
+#include "detail/hipblas_handle.h"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
 
+#ifndef BROTENSOR_HIPBLAS_CHECK
+#define BROTENSOR_HIPBLAS_CHECK(expr)                                                 \
+    do {                                                                               \
+        hipblasStatus_t _bga_err = (expr);                                             \
+        if (_bga_err != HIPBLAS_STATUS_SUCCESS) {                                      \
+            throw std::runtime_error(std::string("hipBLAS error: ") + #expr);          \
+        }                                                                              \
+    } while (0)
+#endif
+
 namespace brotensor::detail::hip {
+
+void hip_softmax_rows_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y,
+                              int rows, int cols);
 
 void* hip_current_stream(int dev = -1);
 void hip_linear_forward_batched_fp16(const ::brotensor::Tensor& W,
@@ -155,6 +170,11 @@ template <> struct FaScalar<hip_bfloat16> {
     }
 };
 
+template <typename T>
+inline size_t calc_fa_shmem(int head_dim, int ktile = kFaKtile) {
+    return sizeof(float) * (ktile + 32) + sizeof(T) * (head_dim + 2 * ktile * head_dim);
+}
+
 // ─── Native AMD FlashAttention-2 Forward Kernel (Tiled Online Softmax) ────────
 
 template <typename T>
@@ -166,9 +186,12 @@ __global__ void hip_flash_attention_kernel(
         T* __restrict__ Out,
         int Lk, int Dq, int Dkv, int head_dim,
         int window, int q_offset, int group, int causal) {
-    extern __shared__ float s_smem[];
-    float* scores = s_smem;
-    float* red    = s_smem + kFaKtile;
+    extern __shared__ char s_raw[];
+    float* scores = reinterpret_cast<float*>(s_raw);
+    float* red    = scores + kFaKtile;
+    T* s_q        = reinterpret_cast<T*>(red + 32);
+    T* s_k        = s_q + head_dim;
+    T* s_v        = s_k + kFaKtile * head_dim;
 
     const int q           = blockIdx.x;
     const int h           = blockIdx.y;
@@ -200,28 +223,48 @@ __global__ void hip_flash_attention_kernel(
         return;
     }
 
+    const T* q_vec = Q + static_cast<size_t>(q) * Dq + head_off_q;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        s_q[d] = q_vec[d];
+    }
+    __syncthreads();
+
     float run_max = -1e30f;
     float run_sum = 0.0f;
     float partial[kMaxHdPerThread];
     #pragma unroll
     for (int i = 0; i < kMaxHdPerThread; ++i) partial[i] = 0.0f;
 
-    const T* q_vec = Q + static_cast<size_t>(q) * Dq + head_off_q;
     const int k0_start = (lo / kFaKtile) * kFaKtile;
 
     for (int k0 = k0_start; k0 <= k_hi; k0 += kFaKtile) {
         int klen = kFaKtile;
         if (k0 + klen - 1 > k_hi) klen = k_hi - k0 + 1;
 
-        // 1. Compute dot products: Q[q] . K[kg] * inv_sqrt with 128-bit vectorization
+        // Load K and V tiles into LDS
+        const int tile_elems = klen * head_dim;
+        for (int idx = tid; idx < tile_elems; idx += blockDim.x) {
+            const int t = idx / head_dim;
+            const int d = idx % head_dim;
+            const size_t kg = static_cast<size_t>(k0 + t);
+            s_k[idx] = K[kg * Dkv + head_off_kv + d];
+            s_v[idx] = V[kg * Dkv + head_off_kv + d];
+        }
+        __syncthreads();
+
+        // 1. Compute dot products: s_q . s_k * inv_sqrt from LDS
         for (int t = tid; t < klen; t += blockDim.x) {
             const int kg = k0 + t;
             float s;
             if (kg < lo || (mask && mask[kg] <= 0.5f)) {
                 s = -1e30f;
             } else {
-                const T* k_vec = K + static_cast<size_t>(kg) * Dkv + head_off_kv;
-                s = FaScalar<T>::dot(q_vec, k_vec, head_dim) * inv_sqrt;
+                float dot = 0.0f;
+                const T* k_ptr = s_k + t * head_dim;
+                for (int d = 0; d < head_dim; ++d) {
+                    dot += FaScalar<T>::to_f32(s_q[d]) * FaScalar<T>::to_f32(k_ptr[d]);
+                }
+                s = dot * inv_sqrt;
             }
             scores[t] = s;
         }
@@ -272,15 +315,13 @@ __global__ void hip_flash_attention_kernel(
         // 4. Rescale running accumulator
         float alpha = (run_max <= -1e29f) ? 0.0f : __expf(run_max - m_new);
 
-        // 5. Update partial output for this thread's assigned dimension slots
+        // 5. Update partial output for this thread's assigned dimension slots from LDS s_v
         int slot = 0;
         for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
             if (slot >= kMaxHdPerThread) break;
             float acc = alpha * partial[slot];
             for (int t = 0; t < klen; ++t) {
-                const int kg = k0 + t;
-                const float v_val = FaScalar<T>::to_f32(V[static_cast<size_t>(kg) * Dkv + head_off_kv + d]);
-                acc += scores[t] * v_val;
+                acc += scores[t] * FaScalar<T>::to_f32(s_v[t * head_dim + d]);
             }
             partial[slot] = acc;
         }
@@ -311,9 +352,12 @@ __global__ void hip_flash_attention_varlen_kernel(
         T* __restrict__ Out,
         int B, int D, int head_dim,
         int causal) {
-    extern __shared__ float s_smem[];
-    float* scores = s_smem;
-    float* red    = s_smem + kFaKtile;
+    extern __shared__ char s_raw[];
+    float* scores = reinterpret_cast<float*>(s_raw);
+    float* red    = scores + kFaKtile;
+    T* s_q        = reinterpret_cast<T*>(red + 32);
+    T* s_k        = s_q + head_dim;
+    T* s_v        = s_k + kFaKtile * head_dim;
 
     const int q_global  = blockIdx.x;
     const int h         = blockIdx.y;
@@ -341,24 +385,41 @@ __global__ void hip_flash_attention_varlen_kernel(
     }
     const int q_local = q_global - q_beg;
 
+    const T* q_vec = Q + static_cast<size_t>(q_global) * D + head_off;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        s_q[d] = q_vec[d];
+    }
+    __syncthreads();
+
     float run_max = -1e30f;
     float run_sum = 0.0f;
     float partial[kMaxHdPerThread];
     #pragma unroll
     for (int i = 0; i < kMaxHdPerThread; ++i) partial[i] = 0.0f;
 
-    const T* q_vec = Q + static_cast<size_t>(q_global) * D + head_off;
-
     for (int k0 = 0; k0 < Lk; k0 += kFaKtile) {
         if (causal && k0 > q_local) break;
         int klen = (Lk - k0) < kFaKtile ? (Lk - k0) : kFaKtile;
         if (causal && k0 + klen - 1 > q_local) klen = q_local - k0 + 1;
 
+        // Load K and V tiles into LDS
+        const int tile_elems = klen * head_dim;
+        for (int idx = tid; idx < tile_elems; idx += blockDim.x) {
+            const int t = idx / head_dim;
+            const int d = idx % head_dim;
+            const size_t kg = static_cast<size_t>(k_beg + k0 + t);
+            s_k[idx] = K[kg * D + head_off + d];
+            s_v[idx] = V[kg * D + head_off + d];
+        }
+        __syncthreads();
+
         for (int t = tid; t < klen; t += blockDim.x) {
-            const int kg_local = k0 + t;
-            const int kg_global = k_beg + kg_local;
-            const T* k_vec = K + static_cast<size_t>(kg_global) * D + head_off;
-            scores[t] = FaScalar<T>::dot(q_vec, k_vec, head_dim) * inv_sqrt;
+            float dot = 0.0f;
+            const T* k_ptr = s_k + t * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += FaScalar<T>::to_f32(s_q[d]) * FaScalar<T>::to_f32(k_ptr[d]);
+            }
+            scores[t] = dot * inv_sqrt;
         }
         __syncthreads();
 
@@ -402,8 +463,7 @@ __global__ void hip_flash_attention_varlen_kernel(
             if (slot >= kMaxHdPerThread) break;
             float acc = alpha * partial[slot];
             for (int t = 0; t < klen; ++t) {
-                const int kg_global = k_beg + k0 + t;
-                acc += scores[t] * FaScalar<T>::to_f32(V[static_cast<size_t>(kg_global) * D + head_off + d]);
+                acc += scores[t] * FaScalar<T>::to_f32(s_v[t * head_dim + d]);
             }
             partial[slot] = acc;
         }
@@ -419,6 +479,128 @@ __global__ void hip_flash_attention_varlen_kernel(
         if (slot >= kMaxHdPerThread) break;
         Out[static_cast<size_t>(q_global) * D + head_off + d] = FaScalar<T>::from_f32(partial[slot] * inv);
     }
+}
+
+template <typename T>
+__global__ void transpose_lhd_to_hld_kernel(const T* __restrict__ In,
+                                            T* __restrict__ Out,
+                                            int L, int H, int d) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int l = blockIdx.y;
+    const int h = blockIdx.z;
+    if (c < d && l < L && h < H) {
+        Out[(h * L + l) * d + c] = In[(l * H + h) * d + c];
+    }
+}
+
+template <typename T>
+__global__ void transpose_hld_to_lhd_kernel(const T* __restrict__ In,
+                                            T* __restrict__ Out,
+                                            int L, int H, int d) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int l = blockIdx.y;
+    const int h = blockIdx.z;
+    if (c < d && l < L && h < H) {
+        Out[(l * H + h) * d + c] = In[(h * L + l) * d + c];
+    }
+}
+
+bool hip_dense_attention_hipblas(
+    const ::brotensor::Tensor& Q,
+    const ::brotensor::Tensor& K,
+    const ::brotensor::Tensor& V,
+    int num_heads, int head_dim,
+    ::brotensor::Tensor& O) {
+    const int Lq = Q.rows;
+    const int Lk = K.rows;
+    const int H = num_heads;
+    const int d = head_dim;
+    using ::brotensor::Dtype;
+    using ::brotensor::Tensor;
+    const Dtype dt = Q.dtype;
+    hipStream_t stream = cur_stream();
+    hipblasHandle_t handle = hipblas_handle(Q.device.index);
+
+    Tensor Qt = Tensor::zeros_on(Q.device, H * Lq, d, dt);
+    Tensor Kt = Tensor::zeros_on(K.device, H * Lk, d, dt);
+    Tensor Vt = Tensor::zeros_on(V.device, H * Lk, d, dt);
+
+    dim3 blk(std::min(d, 256));
+    dim3 grid_q((d + blk.x - 1) / blk.x, Lq, H);
+    dim3 grid_k((d + blk.x - 1) / blk.x, Lk, H);
+
+    if (dt == Dtype::FP16) {
+        transpose_lhd_to_hld_kernel<__half><<<grid_q, blk, 0, stream>>>(
+            static_cast<const __half*>(Q.data), static_cast<__half*>(Qt.data), Lq, H, d);
+        transpose_lhd_to_hld_kernel<__half><<<grid_k, blk, 0, stream>>>(
+            static_cast<const __half*>(K.data), static_cast<__half*>(Kt.data), Lk, H, d);
+        transpose_lhd_to_hld_kernel<__half><<<grid_k, blk, 0, stream>>>(
+            static_cast<const __half*>(V.data), static_cast<__half*>(Vt.data), Lk, H, d);
+    } else if (dt == Dtype::BF16) {
+        transpose_lhd_to_hld_kernel<hip_bfloat16><<<grid_q, blk, 0, stream>>>(
+            static_cast<const hip_bfloat16*>(Q.data), static_cast<hip_bfloat16*>(Qt.data), Lq, H, d);
+        transpose_lhd_to_hld_kernel<hip_bfloat16><<<grid_k, blk, 0, stream>>>(
+            static_cast<const hip_bfloat16*>(K.data), static_cast<hip_bfloat16*>(Kt.data), Lk, H, d);
+        transpose_lhd_to_hld_kernel<hip_bfloat16><<<grid_k, blk, 0, stream>>>(
+            static_cast<const hip_bfloat16*>(V.data), static_cast<hip_bfloat16*>(Vt.data), Lk, H, d);
+    } else {
+        transpose_lhd_to_hld_kernel<float><<<grid_q, blk, 0, stream>>>(
+            static_cast<const float*>(Q.data), static_cast<float*>(Qt.data), Lq, H, d);
+        transpose_lhd_to_hld_kernel<float><<<grid_k, blk, 0, stream>>>(
+            static_cast<const float*>(K.data), static_cast<float*>(Kt.data), Lk, H, d);
+        transpose_lhd_to_hld_kernel<float><<<grid_k, blk, 0, stream>>>(
+            static_cast<const float*>(V.data), static_cast<float*>(Vt.data), Lk, H, d);
+    }
+
+    Tensor S = Tensor::zeros_on(Q.device, H * Lq, Lk, dt);
+    const float alpha_s = 1.0f / std::sqrt(static_cast<float>(d));
+    const float beta_zero = 0.0f;
+    const long long strideQ = static_cast<long long>(Lq) * d;
+    const long long strideK = static_cast<long long>(Lk) * d;
+    const long long strideS = static_cast<long long>(Lq) * Lk;
+
+    hipDataType hip_dt = (dt == Dtype::FP16) ? HIP_R_16F : (dt == Dtype::BF16 ? HIP_R_16BF : HIP_R_32F);
+
+    BROTENSOR_HIPBLAS_CHECK(hipblasGemmStridedBatchedEx(
+        handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
+        Lk, Lq, d,
+        &alpha_s,
+        Kt.data, hip_dt, d, strideK,
+        Qt.data, hip_dt, d, strideQ,
+        &beta_zero,
+        S.data, hip_dt, Lk, strideS,
+        H,
+        HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+
+    hip_softmax_rows_forward(S, S, H * Lq, Lk);
+
+    Tensor Ot = Tensor::zeros_on(Q.device, H * Lq, d, dt);
+    const float alpha_one = 1.0f;
+    const long long strideO = static_cast<long long>(Lq) * d;
+
+    BROTENSOR_HIPBLAS_CHECK(hipblasGemmStridedBatchedEx(
+        handle, HIPBLAS_OP_N, HIPBLAS_OP_N,
+        d, Lq, Lk,
+        &alpha_one,
+        Vt.data, hip_dt, d, strideK,
+        S.data, hip_dt, Lk, strideS,
+        &beta_zero,
+        Ot.data, hip_dt, d, strideO,
+        H,
+        HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+
+    if (dt == Dtype::FP16) {
+        transpose_hld_to_lhd_kernel<__half><<<grid_q, blk, 0, stream>>>(
+            static_cast<const __half*>(Ot.data), static_cast<__half*>(O.data), Lq, H, d);
+    } else if (dt == Dtype::BF16) {
+        transpose_hld_to_lhd_kernel<hip_bfloat16><<<grid_q, blk, 0, stream>>>(
+            static_cast<const hip_bfloat16*>(Ot.data), static_cast<hip_bfloat16*>(O.data), Lq, H, d);
+    } else {
+        transpose_hld_to_lhd_kernel<float><<<grid_q, blk, 0, stream>>>(
+            static_cast<const float*>(Ot.data), static_cast<float*>(O.data), Lq, H, d);
+    }
+    BROTENSOR_HIP_CHECK(hipGetLastError());
+    return true;
 }
 
 } // namespace
@@ -463,24 +645,32 @@ void hip_flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
     }
     if (Lq == 0 || Lk == 0 || Dq == 0) return;
 
+    const int group = num_heads / n_kv;
+    if (!causal && window == 0 && d_mask == nullptr && group == 1 && Lq >= 64 && Lk >= 64 && head_dim <= 128) {
+        if (hip_dense_attention_hipblas(Q, K, V, num_heads, head_dim, O)) {
+            return;
+        }
+    }
+
     const int q_offset  = (causal || window > 0) ? (Lk - Lq) : 0;
-    const int group     = num_heads / n_kv;
     const int causal_i  = causal ? 1 : 0;
-    const size_t shmem  = (static_cast<size_t>(kFaKtile) + kFaBlock) * sizeof(float);
     dim3 grid(Lq, num_heads, 1);
     hipStream_t stream = cur_stream();
 
     if (dt == Dtype::FP16) {
+        const size_t shmem = calc_fa_shmem<__half>(head_dim);
         hip_flash_attention_kernel<__half><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const __half*>(Q.data), static_cast<const __half*>(K.data), static_cast<const __half*>(V.data),
             d_mask, static_cast<__half*>(O.data),
             Lk, Dq, Dkv, head_dim, window, q_offset, group, causal_i);
     } else if (dt == Dtype::BF16) {
+        const size_t shmem = calc_fa_shmem<hip_bfloat16>(head_dim);
         hip_flash_attention_kernel<hip_bfloat16><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const hip_bfloat16*>(Q.data), static_cast<const hip_bfloat16*>(K.data), static_cast<const hip_bfloat16*>(V.data),
             d_mask, static_cast<hip_bfloat16*>(O.data),
             Lk, Dq, Dkv, head_dim, window, q_offset, group, causal_i);
     } else {
+        const size_t shmem = calc_fa_shmem<float>(head_dim);
         hip_flash_attention_kernel<float><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const float*>(Q.data), static_cast<const float*>(K.data), static_cast<const float*>(V.data),
             d_mask, static_cast<float*>(O.data),
@@ -540,21 +730,29 @@ void hip_flash_attention_varlen_forward(const ::brotensor::Tensor& Q,
     }
     if (total_q == 0 || batch_size <= 0) return;
 
+    if (!causal && batch_size == 1 && total_q >= 64 && K.rows >= 64 && head_dim <= 128) {
+        if (hip_dense_attention_hipblas(Q, K, V, num_heads, head_dim, O)) {
+            return;
+        }
+    }
+
     dim3 grid(total_q, num_heads, 1);
-    const size_t shmem = (static_cast<size_t>(kFaKtile) + kFaBlock) * sizeof(float);
     hipStream_t stream = cur_stream();
 
     if (dt == Dtype::FP16) {
+        const size_t shmem = calc_fa_shmem<__half>(head_dim);
         hip_flash_attention_varlen_kernel<__half><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const __half*>(Q.data), static_cast<const __half*>(K.data), static_cast<const __half*>(V.data),
             cu_seqlens_q, cu_seqlens_k, static_cast<__half*>(O.data),
             batch_size, D, head_dim, causal ? 1 : 0);
     } else if (dt == Dtype::BF16) {
+        const size_t shmem = calc_fa_shmem<hip_bfloat16>(head_dim);
         hip_flash_attention_varlen_kernel<hip_bfloat16><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const hip_bfloat16*>(Q.data), static_cast<const hip_bfloat16*>(K.data), static_cast<const hip_bfloat16*>(V.data),
             cu_seqlens_q, cu_seqlens_k, static_cast<hip_bfloat16*>(O.data),
             batch_size, D, head_dim, causal ? 1 : 0);
     } else {
+        const size_t shmem = calc_fa_shmem<float>(head_dim);
         hip_flash_attention_varlen_kernel<float><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const float*>(Q.data), static_cast<const float*>(K.data), static_cast<const float*>(V.data),
             cu_seqlens_q, cu_seqlens_k, static_cast<float*>(O.data),
