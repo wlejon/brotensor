@@ -23,6 +23,10 @@ void fill_hip_vtable_rope(::brotensor::detail::OpsVTable& v);
 void fill_hip_vtable_mha(::brotensor::detail::OpsVTable& v);
 void fill_hip_vtable_flash_attention(::brotensor::detail::OpsVTable& v);
 void fill_hip_vtable_attention(::brotensor::detail::OpsVTable& v);
+void fill_hip_vtable_conv(::brotensor::detail::OpsVTable& v);
+void fill_hip_vtable_interp(::brotensor::detail::OpsVTable& v);
+void fill_hip_vtable_pool(::brotensor::detail::OpsVTable& v);
+void fill_hip_vtable_spatial(::brotensor::detail::OpsVTable& v);
 
 } // namespace brotensor::detail::hip
 
@@ -173,6 +177,10 @@ extern "C" void brotensor_probe_and_register_hip() {
     dh::fill_hip_vtable_mha(ops);
     dh::fill_hip_vtable_flash_attention(ops);
     dh::fill_hip_vtable_attention(ops);
+    dh::fill_hip_vtable_conv(ops);
+    dh::fill_hip_vtable_interp(ops);
+    dh::fill_hip_vtable_pool(ops);
+    dh::fill_hip_vtable_spatial(ops);
 
     ::brotensor::detail::register_backend(DeviceType::HIP, ops, dh::hip_alloc_table());
 }

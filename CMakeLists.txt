@@ -804,6 +804,16 @@ if(BROTENSOR_WITH_HIP)
         src/hip/flash_attention.hip
         src/hip/flash_attention_extra.hip
         src/hip/attention.hip
+        src/hip/conv.hip
+        src/hip/conv_direct.hip
+        src/hip/conv1d.hip
+        src/hip/conv_transpose.hip
+        src/hip/conv3d.hip
+        src/hip/deform_conv.hip
+        src/hip/interp.hip
+        src/hip/pool.hip
+        src/hip/spatial.hip
+        src/hip/spatial_extra.hip
         src/hip/register.hip
         src/hip/detail/stubs.hip
         ${BROTENSOR_HIP_CUDA_KERNELS}
