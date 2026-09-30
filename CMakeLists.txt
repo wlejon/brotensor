@@ -797,6 +797,13 @@ if(BROTENSOR_WITH_HIP)
     add_library(brotensor_hip STATIC
         src/hip/runtime.hip
         src/hip/tensor.hip
+        src/hip/gemm.hip
+        src/hip/softmax.hip
+        src/hip/rope.hip
+        src/hip/mha.hip
+        src/hip/flash_attention.hip
+        src/hip/flash_attention_extra.hip
+        src/hip/attention.hip
         src/hip/register.hip
         src/hip/detail/stubs.hip
         ${BROTENSOR_HIP_CUDA_KERNELS}

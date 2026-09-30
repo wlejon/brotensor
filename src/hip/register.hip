@@ -17,6 +17,12 @@ namespace brotensor::detail::hip {
 // ── alloc table (defined in tensor.hip) ──
 const ::brotensor::detail::AllocVTable& hip_alloc_table();
 void init_async_pool_for_device(int dev);
+void fill_hip_vtable_gemm(::brotensor::detail::OpsVTable& v);
+void fill_hip_vtable_softmax(::brotensor::detail::OpsVTable& v);
+void fill_hip_vtable_rope(::brotensor::detail::OpsVTable& v);
+void fill_hip_vtable_mha(::brotensor::detail::OpsVTable& v);
+void fill_hip_vtable_flash_attention(::brotensor::detail::OpsVTable& v);
+void fill_hip_vtable_attention(::brotensor::detail::OpsVTable& v);
 
 } // namespace brotensor::detail::hip
 
@@ -161,6 +167,12 @@ extern "C" void brotensor_probe_and_register_hip() {
     dc::fill_cuda_vtable_filtered_lrelu(ops);
     dc::fill_cuda_vtable_packed_encoder(ops);
     dc::fill_cuda_vtable_linear_ex(ops);
+    dh::fill_hip_vtable_gemm(ops);
+    dh::fill_hip_vtable_softmax(ops);
+    dh::fill_hip_vtable_rope(ops);
+    dh::fill_hip_vtable_mha(ops);
+    dh::fill_hip_vtable_flash_attention(ops);
+    dh::fill_hip_vtable_attention(ops);
 
     ::brotensor::detail::register_backend(DeviceType::HIP, ops, dh::hip_alloc_table());
 }

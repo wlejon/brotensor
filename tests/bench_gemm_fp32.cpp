@@ -90,10 +90,11 @@ void bench_conv1x1(int C_in, int C_out, int H, int W) {
 int main() try {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     brotensor::init();
-    if (brotensor::is_available(Device::CUDA))       g_dev = Device::CUDA;
+    if (brotensor::is_available(Device::HIP))        g_dev = Device::HIP;
+    else if (brotensor::is_available(Device::CUDA))  g_dev = Device::CUDA;
     else if (brotensor::is_available(Device::Metal)) g_dev = Device::Metal;
     else { std::printf("no GPU backend available - skipping\n"); return 0; }
-    std::printf("bench_gemm_fp32 (device=%s)\n", g_dev == Device::CUDA ? "CUDA" : "Metal");
+    std::printf("bench_gemm_fp32 (device=%s)\n", brotensor::device_name(g_dev));
     bt_bench::spin_up();
 
     const int shapes[][3] = {

@@ -3,8 +3,10 @@
 // Internal helpers for HIP stream management and error checking.
 
 #include "detail/hip_check.h"
+#include "detail/hipblas_handle.h"
 
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 
 #include <cstdio>
 #include <stdexcept>
@@ -59,6 +61,39 @@ void hip_set_stream(void* stream, int dev) {
 
 void hip_set_stream(void* stream) {
     hip_set_stream(stream, -1);
+}
+
+// ─── hipBLAS Handle Management ───────────────────────────────────────────
+namespace {
+thread_local hipblasHandle_t g_hipblas_handles[kMaxHipStreams] = {nullptr};
+
+struct HipblasCleanup {
+    ~HipblasCleanup() {
+        for (int i = 0; i < kMaxHipStreams; ++i) {
+            if (g_hipblas_handles[i]) {
+                hipblasDestroy(g_hipblas_handles[i]);
+                g_hipblas_handles[i] = nullptr;
+            }
+        }
+    }
+};
+thread_local HipblasCleanup g_hipblas_cleanup;
+} // namespace
+
+hipblasHandle_t hipblas_handle(int dev) {
+    const int idx = resolve_device_index(dev);
+    if (!g_hipblas_handles[idx]) {
+        int old_dev = 0;
+        (void)hipGetDevice(&old_dev);
+        if (old_dev != idx) (void)hipSetDevice(idx);
+        hipblasStatus_t err = hipblasCreate(&g_hipblas_handles[idx]);
+        if (old_dev != idx) (void)hipSetDevice(old_dev);
+        if (err != HIPBLAS_STATUS_SUCCESS) {
+            throw std::runtime_error("brotensor: failed to create hipblas handle");
+        }
+    }
+    hipblasSetStream(g_hipblas_handles[idx], g_current_streams[idx]);
+    return g_hipblas_handles[idx];
 }
 
 } // namespace brotensor::detail::hip
