@@ -67,7 +67,7 @@ void hip_flash_attention_decode_masked(const ::brotensor::Tensor& Q,
 namespace {
 
 constexpr int kFaBlock = 128; // 4 Wave32 waves per block
-constexpr int kFaKtile = 64;  // Key tile depth
+constexpr int kFaKtile = 32;  // Key tile depth (fits within 32 KB LDS budget for RDNA 3.5 occupancy)
 constexpr int kMaxHdPerThread = 8;
 
 inline hipStream_t cur_stream() {
