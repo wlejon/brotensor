@@ -814,6 +814,19 @@ if(BROTENSOR_WITH_HIP)
         src/hip/pool.hip
         src/hip/spatial.hip
         src/hip/spatial_extra.hip
+        src/hip/norm.hip
+        src/hip/norm_rms.hip
+        src/hip/norm_group.hip
+        src/hip/norm_l2.hip
+        src/hip/norm_batch.hip
+        src/hip/elementwise.hip
+        src/hip/elementwise_act.hip
+        src/hip/elementwise_reduce.hip
+        src/hip/audio.hip
+        src/hip/audio_dsp.hip
+        src/hip/audio_fft.hip
+        src/hip/quant.hip
+        src/hip/quant_gguf.hip
         src/hip/register.hip
         src/hip/detail/stubs.hip
         ${BROTENSOR_HIP_CUDA_KERNELS}

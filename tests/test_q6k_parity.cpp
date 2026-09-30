@@ -18,7 +18,11 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
-#if defined(BROTENSOR_HAS_CUDA)
+#if defined(BROTENSOR_HAS_HIP)
+#include <hip/hip_runtime.h>
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#elif defined(BROTENSOR_HAS_CUDA)
 #include <cuda_runtime.h>
 #else
 #include <cstring>
@@ -163,7 +167,9 @@ static std::vector<uint16_t> to_fp16_vec(const std::vector<float>& v) {
 int main() {
     brotensor::init();
     Device dev;
-    if (brotensor::is_available(brotensor::Device::CUDA)) {
+    if (brotensor::is_available(brotensor::Device::HIP)) {
+        dev = Device::HIP;
+    } else if (brotensor::is_available(brotensor::Device::CUDA)) {
         dev = Device::CUDA;
     } else if (brotensor::is_available(brotensor::Device::Metal)) {
         dev = Device::Metal;
@@ -172,7 +178,7 @@ int main() {
         return 0;
     }
     std::printf("test_q6k_parity (device=%s)\n",
-                dev == Device::CUDA ? "CUDA" : "Metal");
+                dev == Device::HIP ? "HIP" : (dev == Device::CUDA ? "CUDA" : "Metal"));
 
     constexpr int OUT = 64;
     constexpr int IN  = 256;

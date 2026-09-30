@@ -5,13 +5,14 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
-#if defined(BROTENSOR_HAS_CUDA)
+#if defined(BROTENSOR_HAS_HIP)
+#include <hip/hip_runtime.h>
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#elif defined(BROTENSOR_HAS_CUDA)
 #include <cuda_runtime.h>
 #else
 #include <cstring>
-// On Metal a device Tensor's .data points to a host-shared MTLBuffer, so a
-// plain memcpy is equivalent to a H2D copy. Provide a tiny shim so the test
-// body stays backend-agnostic.
 static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
     std::memcpy(dst, src, n);
 }
@@ -28,6 +29,7 @@ using brotensor::Device;
 using brotensor::Dtype;
 using brotensor::Tensor;
 
+static Device g_dev = Device::CPU;
 static int g_failures = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++g_failures; } } while(0)
 
@@ -63,18 +65,18 @@ static void test_matmul_int8w() {
     }
 
     Tensor Y_ref_g;
-    Tensor W_deq_g = Tensor::from_host_fp16_on(Device::CUDA, Wdeq.data(), OUT, IN);
-    Tensor X_g     = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),   IN,  B);
+    Tensor W_deq_g = Tensor::from_host_fp16_on(g_dev, Wdeq.data(), OUT, IN);
+    Tensor X_g     = Tensor::from_host_fp16_on(g_dev, Xh.data(),   IN,  B);
     brotensor::matmul(W_deq_g, X_g, Y_ref_g);
     std::vector<uint16_t> ref(OUT * B);
     Y_ref_g.copy_to_host_fp16(ref.data());
 
     // W8A16 path.
-    Tensor W_int8_g = Tensor::empty_on(Device::CUDA, OUT, IN, Dtype::INT8);
+    Tensor W_int8_g = Tensor::empty_on(g_dev, OUT, IN, Dtype::INT8);
     Tensor Y_g;
     cudaMemcpy(W_int8_g.data, Wq.data(), OUT * IN * sizeof(int8_t),
                cudaMemcpyHostToDevice);
-    Tensor S_g = Tensor::from_host_on(Device::CUDA, scales.data(), OUT, 1);
+    Tensor S_g = Tensor::from_host_on(g_dev, scales.data(), OUT, 1);
     brotensor::matmul_int8w_fp16(W_int8_g, S_g, X_g, Y_g);
     CHECK(Y_g.dtype == Dtype::FP16 && Y_g.rows == OUT && Y_g.cols == B);
     std::vector<uint16_t> got(OUT * B);
@@ -124,8 +126,8 @@ static void test_conv2d_int8w() {
     }
 
     Tensor Y_ref_g;
-    Tensor Xg     = Tensor::from_host_fp16_on(Device::CUDA, Xh.data(),   N, C_in * H * W);
-    Tensor Wdeq_g = Tensor::from_host_fp16_on(Device::CUDA, Wdeq.data(), C_out, win);
+    Tensor Xg     = Tensor::from_host_fp16_on(g_dev, Xh.data(),   N, C_in * H * W);
+    Tensor Wdeq_g = Tensor::from_host_fp16_on(g_dev, Wdeq.data(), C_out, win);
     brotensor::conv2d_forward(Xg, Wdeq_g, nullptr,
                               N, C_in, H, W, C_out, kH, kW,
                               stride, stride, pad, pad, dil, dil,
@@ -134,11 +136,11 @@ static void test_conv2d_int8w() {
     Y_ref_g.copy_to_host_fp16(ref.data());
 
     // W8A16 path.
-    Tensor W_int8_g = Tensor::empty_on(Device::CUDA, C_out, win, Dtype::INT8);
+    Tensor W_int8_g = Tensor::empty_on(g_dev, C_out, win, Dtype::INT8);
     Tensor Y_g;
     cudaMemcpy(W_int8_g.data, Wq.data(), C_out * win * sizeof(int8_t),
                cudaMemcpyHostToDevice);
-    Tensor S_g = Tensor::from_host_on(Device::CUDA, scales.data(), C_out, 1);
+    Tensor S_g = Tensor::from_host_on(g_dev, scales.data(), C_out, 1);
     brotensor::conv2d_int8w_fp16_forward(Xg, W_int8_g, S_g, nullptr,
                                          N, C_in, H, W, C_out, kH, kW,
                                          stride, stride, pad, pad, dil, dil,
@@ -163,11 +165,16 @@ static void test_conv2d_int8w() {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping\n");
+    if (brotensor::is_available(brotensor::Device::HIP)) {
+        g_dev = Device::HIP;
+    } else if (brotensor::is_available(brotensor::Device::CUDA)) {
+        g_dev = Device::CUDA;
+    } else {
+        std::printf("no GPU backend available - skipping\n");
         return 0;
     }
-    std::printf("test_int8_quant\n");
+    std::printf("test_int8_quant (device=%s)\n",
+                g_dev == Device::HIP ? "HIP" : "CUDA");
     test_matmul_int8w();
     test_conv2d_int8w();
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);

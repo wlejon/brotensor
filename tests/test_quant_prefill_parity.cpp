@@ -23,7 +23,11 @@
 // tensor. Metal's storage is host-addressable so a plain std::memcpy lands,
 // but a CUDA Tensor::data is a bare cudaMalloc pointer — writing it from the
 // host segfaults. Same shim as test_q4k_parity.cpp.
-#if defined(BROTENSOR_HAS_CUDA)
+#if defined(BROTENSOR_HAS_HIP)
+#include <hip/hip_runtime.h>
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#elif defined(BROTENSOR_HAS_CUDA)
 #include <cuda_runtime.h>
 #else
 #include <cstring>
@@ -149,11 +153,12 @@ void run_case(const char* name, Dtype dt, int block_bytes, int block_elems,
 
 int main() {
     brotensor::init();
-    if (brotensor::is_available(Device::CUDA))       g_dev = Device::CUDA;
+    if (brotensor::is_available(Device::HIP))        g_dev = Device::HIP;
+    else if (brotensor::is_available(Device::CUDA))  g_dev = Device::CUDA;
     else if (brotensor::is_available(Device::Metal)) g_dev = Device::Metal;
     else { std::printf("no GPU backend available - skipping\n"); return 0; }
     std::printf("test_quant_prefill_parity (device=%s)\n",
-                g_dev == Device::CUDA ? "CUDA" : "Metal");
+                g_dev == Device::HIP ? "HIP" : (g_dev == Device::CUDA ? "CUDA" : "Metal"));
 
     for (bool bias : {false, true}) {
         run_case("q4k",  Dtype::Q4_K, 144, 256,
