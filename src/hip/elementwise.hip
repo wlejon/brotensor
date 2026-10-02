@@ -340,11 +340,31 @@ void launch_act_backward(const Tensor& p, const Tensor& dY, Tensor& dX, GradOp g
     BROTENSOR_HIP_CHECK(hipGetLastError());
 }
 
+template <typename Ty, typename Tx>
+__global__ void binary_inplace_mixed_kernel(Ty* __restrict__ y, const Tx* __restrict__ x, long long n) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] = from_f32<Ty>(to_f32(y[i]) + to_f32(x[i]));
+    }
+}
+
 } // namespace
 
 // ─── Public Op Wrappers ────────────────────────────────────────────────────
 
 void add_inplace(Tensor& y, const Tensor& x) {
+    using ::brotensor::Dtype;
+    if (y.dtype == Dtype::FP32 && x.dtype == Dtype::FP16) {
+        if (y.size() != x.size()) throw std::runtime_error("add_inplace: size mismatch");
+        const long long n = y.size();
+        if (n == 0) return;
+        const int grid = grid_for(n);
+        hipStream_t stream = cur_stream();
+        binary_inplace_mixed_kernel<float, __half><<<grid, EW_BLOCK, 0, stream>>>(
+            static_cast<float*>(y.data), static_cast<const __half*>(x.data), n);
+        BROTENSOR_HIP_CHECK(hipGetLastError());
+        return;
+    }
     launch_binary_inplace(y, x, [] __device__ (float a, float b) { return a + b; });
 }
 void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD) {

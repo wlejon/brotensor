@@ -521,9 +521,27 @@ bool hip_dense_attention_hipblas(
     hipStream_t stream = cur_stream();
     hipblasHandle_t handle = hipblas_handle(Q.device.index);
 
-    Tensor Qt = Tensor::zeros_on(Q.device, H * Lq, d, dt);
-    Tensor Kt = Tensor::zeros_on(K.device, H * Lk, d, dt);
-    Tensor Vt = Tensor::zeros_on(V.device, H * Lk, d, dt);
+    struct HipDenseAttnScratch {
+        Tensor Qt, Kt, Vt, S, Ot;
+    };
+    static thread_local HipDenseAttnScratch scratch;
+    if (scratch.Qt.device != Q.device) {
+        scratch.Qt = Tensor::empty_on(Q.device, 1, 1, dt);
+        scratch.Kt = Tensor::empty_on(K.device, 1, 1, dt);
+        scratch.Vt = Tensor::empty_on(V.device, 1, 1, dt);
+        scratch.S  = Tensor::empty_on(Q.device, 1, 1, dt);
+        scratch.Ot = Tensor::empty_on(Q.device, 1, 1, dt);
+    }
+    scratch.Qt.resize(H * Lq, d, dt);
+    scratch.Kt.resize(H * Lk, d, dt);
+    scratch.Vt.resize(H * Lk, d, dt);
+    scratch.S.resize(H * Lq, Lk, dt);
+    scratch.Ot.resize(H * Lq, d, dt);
+    Tensor& Qt = scratch.Qt;
+    Tensor& Kt = scratch.Kt;
+    Tensor& Vt = scratch.Vt;
+    Tensor& S  = scratch.S;
+    Tensor& Ot = scratch.Ot;
 
     dim3 blk(std::min(d, 256));
     dim3 grid_q((d + blk.x - 1) / blk.x, Lq, H);
@@ -552,7 +570,6 @@ bool hip_dense_attention_hipblas(
             static_cast<const float*>(V.data), static_cast<float*>(Vt.data), Lk, H, d);
     }
 
-    Tensor S = Tensor::zeros_on(Q.device, H * Lq, Lk, dt);
     const float alpha_s = 1.0f / std::sqrt(static_cast<float>(d));
     const float beta_zero = 0.0f;
     const long long strideQ = static_cast<long long>(Lq) * d;
@@ -574,7 +591,6 @@ bool hip_dense_attention_hipblas(
 
     hip_softmax_rows_forward(S, S, H * Lq, Lk);
 
-    Tensor Ot = Tensor::zeros_on(Q.device, H * Lq, d, dt);
     const float alpha_one = 1.0f;
     const long long strideO = static_cast<long long>(Lq) * d;
 

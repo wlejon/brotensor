@@ -131,41 +131,38 @@ __global__ void interp2d_forward_kernel(const T* __restrict__ X,
                                         int N, int C, int H_in, int W_in,
                                         int H_out, int W_out, int mode,
                                         double sy, double sx, int align) {
-    const long long total = (long long)N * C * H_out * W_out;
-    for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         idx < total; idx += (long long)blockDim.x * gridDim.x) {
-        const int ow = static_cast<int>(idx % W_out);
-        long long t = idx / W_out;
-        const int oh = static_cast<int>(t % H_out);
-        t /= H_out;
-        const int c = static_cast<int>(t % C);
-        const int n = static_cast<int>(t / C);
-        const long long xbase = ((long long)n * C + c) * H_in * W_in;
-        const double src_y = src_coord(oh, H_in, H_out, sy, align);
-        const double src_x = src_coord(ow, W_in, W_out, sx, align);
-        float out;
-        if (mode == 0) {
-            const int iy = clampi(static_cast<int>(nearbyint(src_y)), 0, H_in - 1);
-            const int ix = clampi(static_cast<int>(nearbyint(src_x)), 0, W_in - 1);
-            out = to_f32<T>(X[xbase + iy * W_in + ix]);
-        } else {
-            const int y0 = static_cast<int>(floor(src_y));
-            const int x0 = static_cast<int>(floor(src_x));
-            const float fy = static_cast<float>(src_y - y0);
-            const float fx = static_cast<float>(src_x - x0);
-            const int y0c = clampi(y0,     0, H_in - 1);
-            const int y1c = clampi(y0 + 1, 0, H_in - 1);
-            const int x0c = clampi(x0,     0, W_in - 1);
-            const int x1c = clampi(x0 + 1, 0, W_in - 1);
-            const float v00 = to_f32<T>(X[xbase + y0c * W_in + x0c]);
-            const float v01 = to_f32<T>(X[xbase + y0c * W_in + x1c]);
-            const float v10 = to_f32<T>(X[xbase + y1c * W_in + x0c]);
-            const float v11 = to_f32<T>(X[xbase + y1c * W_in + x1c]);
-            const float top = v00 + (v01 - v00) * fx;
-            const float bot = v10 + (v11 - v10) * fx;
-            out = top + (bot - top) * fy;
+    const int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ow >= W_out) return;
+    const double src_x = src_coord(ow, W_in, W_out, sx, align);
+    const int x0 = (mode == 0) ? 0 : static_cast<int>(floor(src_x));
+    const float fx = (mode == 0) ? 0.0f : static_cast<float>(src_x - x0);
+    const int x0c = (mode == 0) ? clampi(static_cast<int>(nearbyint(src_x)), 0, W_in - 1) : clampi(x0, 0, W_in - 1);
+    const int x1c = (mode == 0) ? 0 : clampi(x0 + 1, 0, W_in - 1);
+
+    for (int nc = blockIdx.z; nc < N * C; nc += gridDim.z) {
+        const long long xbase = (long long)nc * H_in * W_in;
+        const long long ybase_nc = (long long)nc * H_out * W_out;
+        for (int oh = blockIdx.y * blockDim.y + threadIdx.y; oh < H_out; oh += blockDim.y * gridDim.y) {
+            const double src_y = src_coord(oh, H_in, H_out, sy, align);
+            float out;
+            if (mode == 0) {
+                const int iy = clampi(static_cast<int>(nearbyint(src_y)), 0, H_in - 1);
+                out = to_f32<T>(X[xbase + iy * W_in + x0c]);
+            } else {
+                const int y0 = static_cast<int>(floor(src_y));
+                const float fy = static_cast<float>(src_y - y0);
+                const int y0c = clampi(y0,     0, H_in - 1);
+                const int y1c = clampi(y0 + 1, 0, H_in - 1);
+                const float v00 = to_f32<T>(X[xbase + y0c * W_in + x0c]);
+                const float v01 = to_f32<T>(X[xbase + y0c * W_in + x1c]);
+                const float v10 = to_f32<T>(X[xbase + y1c * W_in + x0c]);
+                const float v11 = to_f32<T>(X[xbase + y1c * W_in + x1c]);
+                const float top = v00 + (v01 - v00) * fx;
+                const float bot = v10 + (v11 - v10) * fx;
+                out = top + (bot - top) * fy;
+            }
+            Y[ybase_nc + (long long)oh * W_out + ow] = from_f32<T>(out);
         }
-        Y[idx] = from_f32<T>(out);
     }
 }
 
@@ -175,41 +172,44 @@ __global__ void interp2d_bicubic_forward_kernel(const float* __restrict__ X,
                                                 int H_out, int W_out,
                                                 double sy, double sx, int align,
                                                 float a) {
-    const long long total = (long long)N * C * H_out * W_out;
-    for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         idx < total; idx += (long long)blockDim.x * gridDim.x) {
-        const int ow = static_cast<int>(idx % W_out);
-        long long t = idx / W_out;
-        const int oh = static_cast<int>(t % H_out);
-        t /= H_out;
-        const int c = static_cast<int>(t % C);
-        const int n = static_cast<int>(t / C);
-        const long long xbase = ((long long)n * C + c) * H_in * W_in;
-        const double src_y = src_coord(oh, H_in, H_out, sy, align);
-        const double src_x = src_coord(ow, W_in, W_out, sx, align);
-        const int y0 = static_cast<int>(floor(src_y));
-        const int x0 = static_cast<int>(floor(src_x));
-        const float fy = static_cast<float>(src_y - y0);
-        const float fx = static_cast<float>(src_x - x0);
-        float wy[4], wx[4];
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            wy[k] = cubic_keys(fy - (k - 1), a);
-            wx[k] = cubic_keys(fx - (k - 1), a);
-        }
-        float acc = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int iy = clampi(y0 + j - 1, 0, H_in - 1);
-            float row = 0.0f;
+    const int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ow >= W_out) return;
+    const double src_x = src_coord(ow, W_in, W_out, sx, align);
+    const int x0 = static_cast<int>(floor(src_x));
+    const float fx = static_cast<float>(src_x - x0);
+    float wx[4];
+    int ix[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        wx[i] = cubic_keys(fx - (i - 1), a);
+        ix[i] = clampi(x0 + i - 1, 0, W_in - 1);
+    }
+
+    for (int nc = blockIdx.z; nc < N * C; nc += gridDim.z) {
+        const long long xbase = (long long)nc * H_in * W_in;
+        const long long ybase_nc = (long long)nc * H_out * W_out;
+        for (int oh = blockIdx.y * blockDim.y + threadIdx.y; oh < H_out; oh += blockDim.y * gridDim.y) {
+            const double src_y = src_coord(oh, H_in, H_out, sy, align);
+            const int y0 = static_cast<int>(floor(src_y));
+            const float fy = static_cast<float>(src_y - y0);
+            float wy[4];
             #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int ix = clampi(x0 + i - 1, 0, W_in - 1);
-                row += wx[i] * X[xbase + iy * W_in + ix];
+            for (int k = 0; k < 4; ++k) wy[k] = cubic_keys(fy - (k - 1), a);
+
+            float acc = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int iy = clampi(y0 + j - 1, 0, H_in - 1);
+                const float* xrow = &X[xbase + iy * W_in];
+                float row = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    row += wx[i] * xrow[ix[i]];
+                }
+                acc += wy[j] * row;
             }
-            acc += wy[j] * row;
+            Y[ybase_nc + (long long)oh * W_out + ow] = acc;
         }
-        Y[idx] = acc;
     }
 }
 
@@ -281,24 +281,28 @@ static void launch_forward(const ::brotensor::Tensor& X,
 
     const double sy = static_cast<double>(H_in) / static_cast<double>(H_out);
     const double sx = static_cast<double>(W_in) / static_cast<double>(W_out);
-    const long long total = (long long)N * out_cols;
     hipStream_t stream = cur_stream();
+    dim3 block(16, 16);
+    const uint32_t gx = (static_cast<uint32_t>(W_out) + block.x - 1) / block.x;
+    const uint32_t gy = (static_cast<uint32_t>(H_out) + block.y - 1) / block.y;
+    const uint32_t gz = static_cast<uint32_t>(N * C);
+    dim3 grid(gx, std::max(1u, std::min(gy, 65535u)), std::max(1u, std::min(gz, 65535u)));
 
     if (mode == 2 || mode == 3) {
         const float a = (mode == 2) ? -0.5f : -0.75f;
-        interp2d_bicubic_forward_kernel<<<ip_grid(total), IP_BLOCK, 0, stream>>>(
+        interp2d_bicubic_forward_kernel<<<grid, block, 0, stream>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
             N, C, H_in, W_in, H_out, W_out, sy, sx, align, a);
     } else if (X.dtype == ::brotensor::Dtype::FP32) {
-        interp2d_forward_kernel<float><<<ip_grid(total), IP_BLOCK, 0, stream>>>(
+        interp2d_forward_kernel<float><<<grid, block, 0, stream>>>(
             static_cast<const float*>(X.data), static_cast<float*>(Y.data),
             N, C, H_in, W_in, H_out, W_out, mode, sy, sx, align);
     } else if (X.dtype == ::brotensor::Dtype::FP16) {
-        interp2d_forward_kernel<__half><<<ip_grid(total), IP_BLOCK, 0, stream>>>(
+        interp2d_forward_kernel<__half><<<grid, block, 0, stream>>>(
             static_cast<const __half*>(X.data), static_cast<__half*>(Y.data),
             N, C, H_in, W_in, H_out, W_out, mode, sy, sx, align);
     } else {
-        interp2d_forward_kernel<hip_bfloat16><<<ip_grid(total), IP_BLOCK, 0, stream>>>(
+        interp2d_forward_kernel<hip_bfloat16><<<grid, block, 0, stream>>>(
             static_cast<const hip_bfloat16*>(X.data), static_cast<hip_bfloat16*>(Y.data),
             N, C, H_in, W_in, H_out, W_out, mode, sy, sx, align);
     }

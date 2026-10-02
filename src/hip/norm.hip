@@ -175,11 +175,11 @@ __global__ void fold_fp32_into_T(const float* __restrict__ src, T* __restrict__ 
 
 // ─── Batched Inference LayerNorm ────────────────────────────────────────────
 
-template <typename T>
+template <typename T, typename Tout = T>
 __global__ void ln_fwd_inference_batched_kernel(const T* __restrict__ x,
                                                 const T* __restrict__ gamma,
                                                 const T* __restrict__ beta,
-                                                T* __restrict__ y,
+                                                Tout* __restrict__ y,
                                                 int R, int D, float eps) {
     __shared__ float sdata[LN_BLOCK >> 5];
     __shared__ float s_mean;
@@ -191,7 +191,7 @@ __global__ void ln_fwd_inference_batched_kernel(const T* __restrict__ x,
 
     const size_t off = static_cast<size_t>(row) * D;
     const T* xrow = x + off;
-    T*       yrow = y + off;
+    Tout*    yrow = y + off;
 
     float local_sum = 0.0f;
     for (int i = tid; i < D; i += blockDim.x) local_sum += to_f32(xrow[i]);
@@ -214,7 +214,7 @@ __global__ void ln_fwd_inference_batched_kernel(const T* __restrict__ x,
         const float xh = (to_f32(xrow[i]) - mean) * rstd;
         const float g  = to_f32(gamma[i]);
         const float b  = beta ? to_f32(beta[i]) : 0.0f;
-        yrow[i] = from_f32<T>(xh * g + b);
+        yrow[i] = from_f32<Tout>(xh * g + b);
     }
 }
 
@@ -471,13 +471,20 @@ void layernorm_forward_inference_batched(const Tensor& X_RD, const Tensor& gamma
     }
     const int R = X_RD.rows;
     const int D = X_RD.cols;
-    if (Y_RD.rows != R || Y_RD.cols != D || Y_RD.dtype != X_RD.dtype) {
+    if (Y_RD.rows != R || Y_RD.cols != D || (Y_RD.dtype != X_RD.dtype && Y_RD.dtype != Dtype::FP16)) {
         Y_RD.resize(R, D, X_RD.dtype);
     }
     if (R == 0 || D == 0) return;
 
     hipStream_t stream = cur_stream();
-    if (X_RD.dtype == Dtype::FP16) {
+    if (X_RD.dtype == Dtype::FP32 && Y_RD.dtype == Dtype::FP16) {
+        ln_fwd_inference_batched_kernel<float, __half><<<R, LN_BLOCK, 0, stream>>>(
+            static_cast<const float*>(X_RD.data),
+            static_cast<const float*>(gamma.data),
+            beta ? static_cast<const float*>(beta->data) : nullptr,
+            static_cast<__half*>(Y_RD.data),
+            R, D, eps);
+    } else if (X_RD.dtype == Dtype::FP16) {
         ln_fwd_inference_batched_kernel<__half><<<R, LN_BLOCK, 0, stream>>>(
             static_cast<const __half*>(X_RD.data),
             static_cast<const __half*>(gamma.data),
