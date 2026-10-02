@@ -1,4 +1,4 @@
-// ─── Tests for brotensor::fused_* public API (CPU & CUDA) ──────────────────
+// ─── Tests for brotensor::fused_* public API (CPU & GPU) ───────────────────
 
 #include "parity_helpers.h"
 #include <brotensor/ops.h>
@@ -141,21 +141,21 @@ void test_residual_rmsnorm() {
         }
 
         // Run GPU if available
-        if (brotensor::is_available(Device::CUDA)) {
+        if (bt_parity::gpu_device() != Device::CPU) {
             Tensor h_gpu = h_ref.clone(); // start from pre-residual h
             for (int i = 0; i < B * D; ++i) h_gpu.ptr()[i] -= proj_cpu.ptr()[i];
-            Tensor h_gpu_dev = h_gpu.to(Device::CUDA);
-            Tensor proj_gpu_dev = proj_cpu.to(Device::CUDA);
-            Tensor gamma_gpu_dev = gamma_cpu.to(Device::CUDA);
-            Tensor out_gpu_dev = Tensor::empty_on(Device::CUDA, B, D);
+            Tensor h_gpu_dev = h_gpu.to(bt_parity::gpu_device());
+            Tensor proj_gpu_dev = proj_cpu.to(bt_parity::gpu_device());
+            Tensor gamma_gpu_dev = gamma_cpu.to(bt_parity::gpu_device());
+            Tensor out_gpu_dev = Tensor::empty_on(bt_parity::gpu_device(), B, D);
 
             brotensor::fused_residual_rmsnorm(h_gpu_dev, proj_gpu_dev, gamma_gpu_dev, eps, out_gpu_dev);
             brotensor::sync_all();
 
             Tensor h_gpu_back = h_gpu_dev.to(Device::CPU);
             Tensor out_gpu_back = out_gpu_dev.to(Device::CPU);
-            compare_tensors(h_ref, h_gpu_back, "fused_residual_rmsnorm h (CUDA)", 1e-4f, 1e-4f);
-            compare_tensors(out_cpu, out_gpu_back, "fused_residual_rmsnorm out (CUDA)", 1e-4f, 1e-4f);
+            compare_tensors(h_ref, h_gpu_back, "fused_residual_rmsnorm h (GPU)", 1e-4f, 1e-4f);
+            compare_tensors(out_cpu, out_gpu_back, "fused_residual_rmsnorm out (GPU)", 1e-4f, 1e-4f);
         }
     }
 }
@@ -195,22 +195,22 @@ void test_residual_layernorm() {
         }
 
         // Run GPU if available
-        if (brotensor::is_available(Device::CUDA)) {
+        if (bt_parity::gpu_device() != Device::CPU) {
             Tensor x_gpu = x_ref.clone(); // start from pre-residual x
             for (int i = 0; i < B * D; ++i) x_gpu.ptr()[i] -= res_cpu.ptr()[i];
-            Tensor x_gpu_dev = x_gpu.to(Device::CUDA);
-            Tensor res_gpu_dev = res_cpu.to(Device::CUDA);
-            Tensor gamma_gpu_dev = gamma_cpu.to(Device::CUDA);
-            Tensor beta_gpu_dev = beta_cpu.to(Device::CUDA);
-            Tensor out_gpu_dev = Tensor::empty_on(Device::CUDA, B, D);
+            Tensor x_gpu_dev = x_gpu.to(bt_parity::gpu_device());
+            Tensor res_gpu_dev = res_cpu.to(bt_parity::gpu_device());
+            Tensor gamma_gpu_dev = gamma_cpu.to(bt_parity::gpu_device());
+            Tensor beta_gpu_dev = beta_cpu.to(bt_parity::gpu_device());
+            Tensor out_gpu_dev = Tensor::empty_on(bt_parity::gpu_device(), B, D);
 
             brotensor::fused_residual_layernorm(x_gpu_dev, res_gpu_dev, gamma_gpu_dev, beta_gpu_dev, eps, out_gpu_dev);
             brotensor::sync_all();
 
             Tensor x_gpu_back = x_gpu_dev.to(Device::CPU);
             Tensor out_gpu_back = out_gpu_dev.to(Device::CPU);
-            compare_tensors(x_ref, x_gpu_back, "fused_residual_layernorm x (CUDA)", 1e-4f, 1e-4f);
-            compare_tensors(out_cpu, out_gpu_back, "fused_residual_layernorm out (CUDA)", 1e-3f, 1e-3f);
+            compare_tensors(x_ref, x_gpu_back, "fused_residual_layernorm x (GPU)", 1e-4f, 1e-4f);
+            compare_tensors(out_cpu, out_gpu_back, "fused_residual_layernorm out (GPU)", 1e-3f, 1e-3f);
         }
     }
 }
@@ -249,20 +249,20 @@ void test_layernorm_modulate() {
             BT_CHECK(std::fabs(out_cpu.ptr()[i] - ref_out[i]) < 1e-3f);
         }
 
-        if (brotensor::is_available(Device::CUDA)) {
-            Tensor x_dev = x_cpu.to(Device::CUDA);
-            Tensor gamma_dev = gamma_cpu.to(Device::CUDA);
-            Tensor beta_dev = beta_cpu.to(Device::CUDA);
-            Tensor scale_dev = scale_cpu.to(Device::CUDA);
-            Tensor shift_dev = shift_cpu.to(Device::CUDA);
-            Tensor out_dev = Tensor::empty_on(Device::CUDA, R, D);
+        if (bt_parity::gpu_device() != Device::CPU) {
+            Tensor x_dev = x_cpu.to(bt_parity::gpu_device());
+            Tensor gamma_dev = gamma_cpu.to(bt_parity::gpu_device());
+            Tensor beta_dev = beta_cpu.to(bt_parity::gpu_device());
+            Tensor scale_dev = scale_cpu.to(bt_parity::gpu_device());
+            Tensor shift_dev = shift_cpu.to(bt_parity::gpu_device());
+            Tensor out_dev = Tensor::empty_on(bt_parity::gpu_device(), R, D);
 
             brotensor::fused_layernorm_modulate(x_dev, gamma_dev, beta_dev,
                                                 scale_dev, shift_dev, eps, out_dev);
             brotensor::sync_all();
 
             Tensor out_back = out_dev.to(Device::CPU);
-            compare_tensors(out_cpu, out_back, "fused_layernorm_modulate (CUDA)", 1e-4f, 1e-4f);
+            compare_tensors(out_cpu, out_back, "fused_layernorm_modulate (GPU)", 1e-4f, 1e-4f);
         }
     }
 }
@@ -294,17 +294,17 @@ void test_gemv_swiglu() {
             BT_CHECK(std::fabs(out_cpu.ptr()[i] - ref_out[i]) < 1e-3f);
         }
 
-        if (brotensor::is_available(Device::CUDA)) {
-            Tensor x_dev = x_cpu.to(Device::CUDA);
-            Tensor w_gate_dev = w_gate_cpu.to(Device::CUDA);
-            Tensor w_up_dev = w_up_cpu.to(Device::CUDA);
-            Tensor out_dev = Tensor::empty_on(Device::CUDA, 1, N);
+        if (bt_parity::gpu_device() != Device::CPU) {
+            Tensor x_dev = x_cpu.to(bt_parity::gpu_device());
+            Tensor w_gate_dev = w_gate_cpu.to(bt_parity::gpu_device());
+            Tensor w_up_dev = w_up_cpu.to(bt_parity::gpu_device());
+            Tensor out_dev = Tensor::empty_on(bt_parity::gpu_device(), 1, N);
 
             brotensor::fused_gemv_swiglu(x_dev, w_gate_dev, w_up_dev, out_dev);
             brotensor::sync_all();
 
             Tensor out_back = out_dev.to(Device::CPU);
-            compare_tensors(out_cpu, out_back, "fused_gemv_swiglu (CUDA)", 1e-4f, 1e-4f);
+            compare_tensors(out_cpu, out_back, "fused_gemv_swiglu (GPU)", 1e-4f, 1e-4f);
         }
     }
 }
@@ -343,24 +343,24 @@ void test_gemv_residual() {
             BT_CHECK(std::fabs(res_inplace.ptr()[i] - ref_out[i]) < 1e-3f);
         }
 
-        if (brotensor::is_available(Device::CUDA)) {
-            Tensor x_dev = x_cpu.to(Device::CUDA);
-            Tensor w_down_dev = w_down_cpu.to(Device::CUDA);
-            Tensor res_dev = res_cpu.to(Device::CUDA);
-            Tensor out_dev = Tensor::empty_on(Device::CUDA, 1, N);
+        if (bt_parity::gpu_device() != Device::CPU) {
+            Tensor x_dev = x_cpu.to(bt_parity::gpu_device());
+            Tensor w_down_dev = w_down_cpu.to(bt_parity::gpu_device());
+            Tensor res_dev = res_cpu.to(bt_parity::gpu_device());
+            Tensor out_dev = Tensor::empty_on(bt_parity::gpu_device(), 1, N);
 
             brotensor::fused_gemv_residual(x_dev, w_down_dev, res_dev, out_dev);
             brotensor::sync_all();
 
             Tensor out_back = out_dev.to(Device::CPU);
-            compare_tensors(out_cpu, out_back, "fused_gemv_residual (CUDA)", 1e-4f, 1e-4f);
+            compare_tensors(out_cpu, out_back, "fused_gemv_residual (GPU)", 1e-4f, 1e-4f);
 
             // In-place on GPU
-            Tensor res_dev_inplace = res_cpu.to(Device::CUDA);
+            Tensor res_dev_inplace = res_cpu.to(bt_parity::gpu_device());
             brotensor::fused_gemv_residual(x_dev, w_down_dev, res_dev_inplace, res_dev_inplace);
             brotensor::sync_all();
             Tensor res_back = res_dev_inplace.to(Device::CPU);
-            compare_tensors(out_cpu, res_back, "fused_gemv_residual in-place (CUDA)", 1e-4f, 1e-4f);
+            compare_tensors(out_cpu, res_back, "fused_gemv_residual in-place (GPU)", 1e-4f, 1e-4f);
         }
     }
 }
@@ -371,7 +371,7 @@ int main() {
     brotensor::init();
     std::printf("========================================================\n");
     std::printf("  brotensor Fused Ops Parity & Verification Suite\n");
-    std::printf("  CUDA available: %s\n", brotensor::is_available(Device::CUDA) ? "YES" : "NO");
+    std::printf("  GPU: %s\n", brotensor::to_string(bt_parity::gpu_device()).c_str());
     std::printf("========================================================\n");
 
     try {

@@ -24,8 +24,9 @@ include/brotensor/
   gguf.h            GGUF reader — mmap'd File + TensorInfo + metadata +
                     shape_to_2d + upload_raw. Carries F32/F16/BF16 + every
                     legacy/K-quant block type; only Q4_K/Q6_K/Q8_0 have ops
-  cuda_graph.h      CUDA graph capture/replay (CudaGraph, CudaGraphCapture) —
-                    CUDA-only, gate on BROTENSOR_HAS_CUDA
+  cuda_graph.h      CUDA / HIP graph capture/replay (CudaGraph,
+                    CudaGraphCapture) — gate on BROTENSOR_HAS_CUDA ||
+                    BROTENSOR_HAS_HIP
   metal_interop.h   Public Metal custom-kernel surface (Obj-C++ / .mm only)
   detail/op_table.h  X-macro: the single canonical op list
   detail/dispatch.h  OpsVTable / AllocVTable + register_backend + dispatch()

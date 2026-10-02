@@ -3,6 +3,7 @@
 // All Tensor allocation / freeing / memcpy / zero / sync on HIP devices
 // is routed through `hip_alloc_table()` (see brotensor/detail/dispatch.h).
 
+#include "detail/capture_arena.h"
 #include "detail/hip_check.h"
 
 #include <brotensor/detail/dispatch.h>
@@ -90,7 +91,13 @@ void* hip_alloc(std::size_t bytes, int dev) {
     hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
     (void)hipStreamIsCapturing(s, &cs);
     const bool capturing = (cs != hipStreamCaptureStatusNone);
-    if (async_pool_ready_for(dev) || capturing) {
+    // Inside a CudaGraphCapture the graph's arena serves the allocation, so the
+    // capture records no memory node (see detail/capture_arena.h). A capture
+    // begun some other way falls back to the stream-ordered allocator.
+    if (capturing) p = capture_arena_alloc(bytes, dev);
+    if (p) {
+        // served by the capture arena
+    } else if (async_pool_ready_for(dev) || capturing) {
         BROTENSOR_HIP_CHECK(hipMallocAsync(&p, bytes, s));
     } else {
         BROTENSOR_HIP_CHECK(hipMalloc(&p, bytes));
@@ -105,6 +112,15 @@ void* hip_alloc(std::size_t bytes) {
 
 void hip_free(void* ptr, int dev) {
     if (!ptr) return;
+    dev = resolve_device_index(dev);
+    auto s = reinterpret_cast<hipStream_t>(::brotensor::hip_current_stream(dev));
+    hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+    (void)hipStreamIsCapturing(s, &cs);
+    if (capture_arena_free(ptr, dev, cs != hipStreamCaptureStatusNone)) return;
+    hip_free_untracked(ptr, dev);
+}
+
+void hip_free_untracked(void* ptr, int dev) {
     dev = resolve_device_index(dev);
     int prior = 0;
     (void)hipGetDevice(&prior);

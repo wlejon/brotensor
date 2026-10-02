@@ -14,7 +14,7 @@ Two further headers are backend-specific and compile only in a build that enable
 
 | Header | Contents |
 |---|---|
-| `<brotensor/cuda_graph.h>` | CUDA graph capture / replay (`CudaGraph`, `CudaGraphCapture`) — CUDA-only; gate on `BROTENSOR_HAS_CUDA` |
+| `<brotensor/cuda_graph.h>` | CUDA / HIP graph capture / replay (`CudaGraph`, `CudaGraphCapture`) — gate on `BROTENSOR_HAS_CUDA \|\| BROTENSOR_HAS_HIP` |
 | `<brotensor/metal_interop.h>` | Metal custom-kernel surface — Obj-C++ / `.mm` consumers only |
 
 All preconditions and dispatch failures throw `std::runtime_error` with a `"brotensor: <op>: <reason>"` message.

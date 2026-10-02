@@ -787,7 +787,6 @@ if(BROTENSOR_WITH_HIP)
         src/cuda/upfirdn2d.cu
         src/cuda/modulated_conv2d.cu
         src/cuda/filtered_lrelu.cu
-        src/cuda/cuda_graph.cu
     )
     set_source_files_properties(
         ${BROTENSOR_HIP_CUDA_KERNELS}
@@ -797,6 +796,7 @@ if(BROTENSOR_WITH_HIP)
     add_library(brotensor_hip STATIC
         src/hip/runtime.hip
         src/hip/tensor.hip
+        src/hip/graph.hip
         src/hip/gemm.hip
         src/hip/softmax.hip
         src/hip/rope.hip

@@ -24,7 +24,7 @@ brotensor is the shared tensor layer for a family of sibling projects (`brodiffu
   - **Training building blocks** — flash attention with backward, LSTM with full BPTT, LoRA adapters, StyleGAN3 generator primitives (modulated conv, upfirdn2d, filtered lrelu), SGD/Adam
 - **Precision & quantization** — the CPU backend is the complete FP32 reference; the GPU backends add FP16/BF16 paths, INT8 weight-only matmul/conv (W8A16), and GGUF block-quant kernels (Q4_K / Q6_K / Q8_0)
 - **Model loading** — mmap'd zero-copy readers for **safetensors** (also writes) and **GGUF**
-- **CUDA graph capture** (`<brotensor/cuda_graph.h>`) — capture a fixed-shape step once and replay it with a single launch, amortising per-kernel launch overhead in tight decode loops. `Tensor::resize` keeps device pointers stable across shape cycles so captured buffers stay valid
+- **CUDA / HIP graph capture** (`<brotensor/cuda_graph.h>`) — capture a fixed-shape step once and replay it with a single launch, amortising per-kernel launch overhead in tight decode loops. `Tensor::resize` keeps device pointers stable across shape cycles so captured buffers stay valid
 
 See [docs/op-coverage.md](docs/op-coverage.md) for the full per-op coverage tables.
 

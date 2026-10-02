@@ -1,22 +1,32 @@
 #pragma once
 
-// CUDA graph capture / replay — amortise per-kernel launch overhead for tight,
-// fixed-shape inference loops (e.g. an autoregressive decode step that issues
-// dozens of tiny kernels per token). Capture the sequence once, then replay the
-// whole thing with a single cudaGraphLaunch instead of re-issuing every kernel.
+// CUDA / HIP graph capture / replay — amortise per-kernel launch overhead for
+// tight, fixed-shape inference loops (e.g. an autoregressive decode step that
+// issues dozens of tiny kernels per token). Capture the sequence once, then
+// replay the whole thing with a single cudaGraphLaunch / hipGraphLaunch instead
+// of re-issuing every kernel.
 //
-// CUDA-only: the symbols are provided by the CUDA backend, so this header is
-// usable only in a BROTENSOR_WITH_CUDA build (mirrors metal_interop.h on the
-// Metal side). Gate calls on BROTENSOR_HAS_CUDA.
+// CUDA and HIP: the symbols are provided by the CUDA backend (cudaGraph*) and
+// by the HIP backend (hipGraph*, src/hip/graph.hip); Metal has no graph
+// capture. Gate calls on `BROTENSOR_HAS_CUDA || BROTENSOR_HAS_HIP` and capture
+// only on a Device::CUDA / Device::HIP default device.
 //
-// The capture stream and the stream-ordered allocator already honour
-// cuda_current_stream(); CudaGraphCapture routes the bracketed ops onto a
-// dedicated capture stream so they land in the graph rather than on the default
-// stream.
+// The capture stream and the allocator already honour the backend's current
+// stream; CudaGraphCapture routes the bracketed ops onto a dedicated capture
+// stream so they land in the graph rather than on the default stream.
+//
+// Allocation inside the capture: on CUDA it is a graph memory node from the
+// stream-ordered pool (on wherever the device supports pools). On HIP every
+// allocation made inside the capture comes from an arena the graph owns and
+// every free inside it is deferred, so the memory a replay touches stays put
+// for the graph's lifetime and the capture records no hipMallocAsync /
+// hipFreeAsync memory nodes, which ROCm replays wrongly (see
+// src/hip/detail/capture_arena.h). Either way a step may allocate and free its
+// temporaries; the warm-up below still matters for buffers that must outlive
+// the step (outputs, carried state), which should be allocated before capture.
 //
 // Usage — warm up once (so every output buffer is allocated), then capture an
-// identical run that reuses those exact tensors (no allocation during capture),
-// then replay:
+// identical run that reuses those exact tensors, then replay:
 //
 //   step();                         // warm-up: ops allocate their outputs
 //   brotensor::sync_all();
@@ -29,14 +39,15 @@
 //   for (int t = 0; t < T; ++t) {
 //       write_new_inputs_in_place();       // update input buffers in place
 //       g.launch();                        // single launch replays the step
-//       brotensor::sync(Device::CUDA);     // before reading outputs to host
+//       brotensor::sync_all();             // before reading outputs to host
 //   }
 //
-// Contract: the captured run MUST reuse the warm-up tensor objects (same device
-// pointers and shapes) so no allocation happens mid-capture; feed new inputs by
-// writing into those buffers in place between launches and read outputs from
-// their buffers after launch(). Every entry point throws std::runtime_error on
-// a CUDA error.
+// Contract: feed new inputs by writing into the captured input buffers in place
+// between launches and read outputs from their buffers after launch(); kernels
+// replay against the device pointers they were captured with, so persistent
+// tensors must be the same objects (same pointers and shapes) in the warm-up,
+// the capture and every replay. Every entry point throws std::runtime_error on
+// a CUDA / HIP error.
 
 #include <memory>
 
@@ -56,11 +67,12 @@ public:
     bool valid() const;
 
     // Replay the captured sequence on the current stream. Does not synchronise
-    // — call sync(Device::CUDA) / sync_all() before reading results to host.
+    // — call sync(device) / sync_all() before reading results to host.
     // Throws if the handle is empty.
     void launch();
 
-    // Drop the captured graph (frees the cudaGraphExec_t).
+    // Drop the captured graph (frees the executable graph and, on HIP, the
+    // capture arena once the device is idle).
     void reset();
 
 private:

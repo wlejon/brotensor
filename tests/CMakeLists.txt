@@ -285,8 +285,6 @@ if(BROTENSOR_HAS_GPU)
         # linear paths, and the causal-vs-fused attention gap. These three
         # cover the ops with no prior perf instrumentation.
         brotensor_add_executable(brotensor_bench_causal_attention bench_causal_attention.cpp)
-        # CUDA graph capture/replay (the API is CUDA-only).
-        brotensor_add_test(brotensor_test_cuda_graph test_cuda_graph.cpp)
         # Multi-GPU P2P transfer and pipeline execution test.
         brotensor_add_test(brotensor_test_multigpu test_multigpu.cpp)
         # Brass CUDA JIT benchmark & parity test suite
@@ -340,7 +338,7 @@ if(BROTENSOR_HAS_GPU)
         target_include_directories(brotensor_test_cuda_jit_quant PRIVATE /usr/local/cuda-12.6/targets/x86_64-linux/include)
         target_link_libraries(brotensor_test_cuda_jit_quant PRIVATE CUDA::cuda_driver)
 
-        # Public Fused Ops (CPU & CUDA) parity test suite
+        # Public Fused Ops (CPU & GPU) parity test suite
         brotensor_add_test(brotensor_test_ops_fused test_ops_fused.cpp)
         if(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")
             target_include_directories(brotensor_test_ops_fused PRIVATE "${BRASS_ROOT}/include")
@@ -350,5 +348,14 @@ if(BROTENSOR_HAS_GPU)
         endif()
         target_include_directories(brotensor_test_ops_fused PRIVATE /usr/local/cuda-12.6/targets/x86_64-linux/include)
         target_link_libraries(brotensor_test_ops_fused PRIVATE CUDA::cuda_driver)
+    endif()
+    if(BROTENSOR_WITH_HIP)
+        brotensor_add_test(brotensor_test_ops_fused test_ops_fused.cpp)
+    endif()
+    # Graph capture/replay: the CudaGraph API is provided by the CUDA and HIP
+    # backends (Metal has none).
+    if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_HIP)
+        brotensor_add_test(brotensor_test_cuda_graph test_cuda_graph.cpp)
+        brotensor_add_test(brotensor_test_graph_capture_alloc test_graph_capture_alloc.cpp)
     endif()
 endif()

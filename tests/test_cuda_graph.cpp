@@ -4,6 +4,8 @@
 // same graph replays correctly for a second, different input — the core
 // contract the Qwen3-TTS Code Predictor decode loop relies on.
 
+#include "parity_helpers.h"
+
 #include <brotensor/cuda_graph.h>
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -27,11 +29,11 @@ static int g_failures = 0;
 } while (0)
 
 // Direct (non-graph) reference: rms_norm(x, gamma) -> linear(W, bias) -> y.
-static std::vector<float> direct_step(const std::vector<float>& x,
+static std::vector<float> direct_step(Device dev, const std::vector<float>& x,
                                       const Tensor& gamma, const Tensor& W,
                                       const Tensor& bias, int B, int D,
                                       int out_dim, float eps) {
-    Tensor X = Tensor::from_host_on(Device::CUDA, x.data(), B, D);
+    Tensor X = Tensor::from_host_on(dev, x.data(), B, D);
     Tensor normed, Y;
     brotensor::rms_norm_forward(X, gamma, eps, normed);
     brotensor::linear_forward_batched(W, bias, normed, Y);
@@ -43,8 +45,10 @@ static std::vector<float> direct_step(const std::vector<float>& x,
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(Device::CUDA)) {
-        std::printf("CUDA not available - skipping\n");
+    // CUDA or HIP (whose graphs share this API); Metal has no graph capture.
+    const Device dev = bt_parity::gpu_device();
+    if (dev == Device::CPU || dev == Device::Metal) {
+        std::printf("CUDA/HIP not available - skipping\n");
         return 0;
     }
     std::printf("test_cuda_graph\n");
@@ -65,12 +69,12 @@ int main() {
     std::vector<float> w = rand_vec(out_dim * D);
     std::vector<float> bia = rand_vec(out_dim);
 
-    Tensor gamma = Tensor::from_host_on(Device::CUDA, gam.data(), D, 1);
-    Tensor W = Tensor::from_host_on(Device::CUDA, w.data(), out_dim, D);
-    Tensor bias = Tensor::from_host_on(Device::CUDA, bia.data(), out_dim, 1);
+    Tensor gamma = Tensor::from_host_on(dev, gam.data(), D, 1);
+    Tensor W = Tensor::from_host_on(dev, w.data(), out_dim, D);
+    Tensor bias = Tensor::from_host_on(dev, bia.data(), out_dim, 1);
 
     // Fixed step tensors reused across warm-up, capture, and every replay.
-    Tensor X = Tensor::from_host_on(Device::CUDA, x0.data(), B, D);
+    Tensor X = Tensor::from_host_on(dev, x0.data(), B, D);
     Tensor normed, Y;
 
     auto step = [&]() {
@@ -95,7 +99,7 @@ int main() {
     // direct non-graph run of the same ops on that input.
     for (int trial = 0; trial < 2; ++trial) {
         std::vector<float> xn = rand_vec(B * D);
-        Tensor tmp = Tensor::from_host_on(Device::CUDA, xn.data(), B, D);
+        Tensor tmp = Tensor::from_host_on(dev, xn.data(), B, D);
         brotensor::copy_d2d(tmp, 0, X, 0, B * D);  // update X in place
 
         g.launch();
@@ -104,7 +108,7 @@ int main() {
         Y.to(Device::CPU).copy_to_host(got.data());
 
         std::vector<float> ref =
-            direct_step(xn, gamma, W, bias, B, D, out_dim, eps);
+            direct_step(dev, xn, gamma, W, bias, B, D, out_dim, eps);
 
         float max_err = 0.0f;
         for (size_t i = 0; i < got.size(); ++i)
@@ -130,10 +134,10 @@ int main() {
         for (size_t i = 0; i < gh.size(); ++i) gh[i] = f2h(1.0f);
         for (size_t i = 0; i < bh.size(); ++i) bh[i] = f2h(0.0f);
         for (size_t i = 0; i < wh.size(); ++i) wh[i] = f2h(dist(rng) * 0.1f);
-        Tensor Xh  = Tensor::from_host_fp16_on(Device::CUDA, xh.data(), 1, C * H * Wd);
-        Tensor Gg  = Tensor::from_host_fp16_on(Device::CUDA, gh.data(), C, 1);
-        Tensor Gb  = Tensor::from_host_fp16_on(Device::CUDA, bh.data(), C, 1);
-        Tensor Wp  = Tensor::from_host_fp16_on(Device::CUDA, wh.data(), C, C);
+        Tensor Xh  = Tensor::from_host_fp16_on(dev, xh.data(), 1, C * H * Wd);
+        Tensor Gg  = Tensor::from_host_fp16_on(dev, gh.data(), C, 1);
+        Tensor Gb  = Tensor::from_host_fp16_on(dev, bh.data(), C, 1);
+        Tensor Wp  = Tensor::from_host_fp16_on(dev, wh.data(), C, C);
         Tensor gn_out, seq, proj;
 
         auto fp16_step = [&](int upto) {
