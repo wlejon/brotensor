@@ -61,6 +61,13 @@ void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD);
 void mul_inplace(Tensor& y, const Tensor& x);
 
 
+// y[i] /= x[i], FP32 math, one rounding on the store. Identical shape and
+// dtype; FP32 on CPU, FP32/FP16/BF16 on HIP. CUDA and Metal register no slot
+// yet (the dispatcher throws "not implemented") — the trace JIT's eager
+// divide is its one caller.
+void div_inplace(Tensor& y, const Tensor& x);
+
+
 // Binary threshold to a byte mask: Y[i] = X[i] > t ? 1 : 0 (strict > —
 // elements exactly at t map to 0). Backs SAM AMG's device-side mask
 // binarization (logits -> 0/1 mask without a host round-trip).

@@ -365,6 +365,140 @@ void test_gemv_residual() {
     }
 }
 
+// ── 16-bit operands on HIP ─────────────────────────────────────────────────
+//
+// None of the five ops has a HIP-specific kernel except the stacked-weight
+// SwiGLU GEMV (linear_forward_batched_ex's epilogue); everything else is the
+// eager composition, which is what has to be right at FP16 / BF16 too. The
+// reference is FP32 over the same rounded inputs, so the tolerance only has
+// to admit the 16-bit stores along the way.
+
+float round16(Dtype dt, float v) {
+    return dt == Dtype::BF16 ? brotensor::bf16_bits_to_fp32(brotensor::fp32_to_bf16_bits(v))
+                             : brotensor::fp16_bits_to_fp32(brotensor::fp32_to_fp16_bits(v));
+}
+
+std::vector<float> random16(Dtype dt, SplitMix64& rng, size_t n, float scale, float offset = 0.0f) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = round16(dt, rng.next_unit() * scale + offset);
+    return v;
+}
+
+Tensor upload16(Dtype dt, const std::vector<float>& v, int rows, int cols) {
+    std::vector<uint16_t> bits(v.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+        bits[i] = dt == Dtype::BF16 ? brotensor::fp32_to_bf16_bits(v[i])
+                                    : brotensor::fp32_to_fp16_bits(v[i]);
+    }
+    return dt == Dtype::BF16
+        ? Tensor::from_host_bf16_on(bt_parity::gpu_device(), bits.data(), rows, cols)
+        : Tensor::from_host_fp16_on(bt_parity::gpu_device(), bits.data(), rows, cols);
+}
+
+Tensor download16(const Tensor& t) {
+    brotensor::sync_all();
+    std::vector<uint16_t> bits = t.dtype == Dtype::BF16 ? t.to_host_vector_bf16()
+                                                        : t.to_host_vector_fp16();
+    Tensor out = Tensor::zeros_on(Device::CPU, t.rows, t.cols);
+    for (size_t i = 0; i < bits.size(); ++i) {
+        out.ptr()[i] = t.dtype == Dtype::BF16 ? brotensor::bf16_bits_to_fp32(bits[i])
+                                              : brotensor::fp16_bits_to_fp32(bits[i]);
+    }
+    return out;
+}
+
+Tensor host(const std::vector<float>& v, int rows, int cols) {
+    return Tensor::from_host_on(Device::CPU, v.data(), rows, cols);
+}
+
+void test_fused_16bit_hip() {
+    if (!bt_parity::gpu_device().is_hip()) return;
+    for (Dtype dt : {Dtype::FP16, Dtype::BF16}) {
+        const char* dn = dt == Dtype::BF16 ? "bf16" : "fp16";
+        std::printf("  Testing fused ops at %s on HIP...\n", dn);
+        const float tol = dt == Dtype::BF16 ? 3e-2f : 4e-3f;
+        SplitMix64 rng(0x16B17 + static_cast<uint64_t>(dt));
+        const int B = 6, D = 384;
+
+        // residual + rmsnorm
+        {
+            auto hh = random16(dt, rng, B * D, 1.0f), hp = random16(dt, rng, B * D, 0.5f);
+            auto hg = random16(dt, rng, D, 0.3f, 1.0f);
+            std::vector<float> sum(B * D), ref(B * D);
+            for (int i = 0; i < B * D; ++i) sum[i] = round16(dt, hh[i] + hp[i]);
+            reference_rmsnorm(sum.data(), hg.data(), 1e-6f, ref.data(), B, D);
+            Tensor h = upload16(dt, hh, B, D), p = upload16(dt, hp, B, D), g = upload16(dt, hg, D, 1);
+            Tensor out;
+            brotensor::fused_residual_rmsnorm(h, p, g, 1e-6f, out);
+            compare_tensors(host(sum, B, D), download16(h), "residual_rmsnorm h (16-bit HIP)", tol, tol);
+            compare_tensors(host(ref, B, D), download16(out), "residual_rmsnorm out (16-bit HIP)", tol, tol);
+        }
+        // residual + layernorm
+        {
+            auto hx = random16(dt, rng, B * D, 1.0f), hr = random16(dt, rng, B * D, 0.5f);
+            auto hg = random16(dt, rng, D, 0.3f, 1.0f), hb = random16(dt, rng, D, 0.2f);
+            std::vector<float> sum(B * D), ref(B * D);
+            for (int i = 0; i < B * D; ++i) sum[i] = round16(dt, hx[i] + hr[i]);
+            reference_residual_layernorm(sum.data(), hg.data(), hb.data(), 1e-6f, ref.data(), B, D);
+            Tensor x = upload16(dt, hx, B, D), r = upload16(dt, hr, B, D);
+            Tensor g = upload16(dt, hg, D, 1), b = upload16(dt, hb, D, 1);
+            Tensor out;
+            brotensor::fused_residual_layernorm(x, r, g, b, 1e-6f, out);
+            compare_tensors(host(ref, B, D), download16(out), "residual_layernorm (16-bit HIP)", tol, tol);
+        }
+        // layernorm + modulate
+        {
+            auto hx = random16(dt, rng, B * D, 1.0f);
+            auto hg = random16(dt, rng, D, 0.3f, 1.0f), hb = random16(dt, rng, D, 0.2f);
+            auto hs = random16(dt, rng, D, 0.5f), hsh = random16(dt, rng, D, 0.5f);
+            std::vector<float> ref(B * D);
+            reference_layernorm_modulate(hx.data(), hg.data(), hb.data(), hs.data(), hsh.data(),
+                                         1e-6f, ref.data(), B, D);
+            Tensor out;
+            brotensor::fused_layernorm_modulate(upload16(dt, hx, B, D), upload16(dt, hg, D, 1),
+                                                upload16(dt, hb, D, 1), upload16(dt, hs, D, 1),
+                                                upload16(dt, hsh, D, 1), 1e-6f, out);
+            compare_tensors(host(ref, B, D), download16(out), "layernorm_modulate (16-bit HIP)",
+                            2 * tol, 2 * tol);
+        }
+        // SwiGLU GEMV: separate weights (eager composition) and the two halves
+        // of one stacked weight (the fused GEMV kernel).
+        {
+            const int N = 320, K = 512;
+            auto hx = random16(dt, rng, K, 0.5f);
+            auto hw = random16(dt, rng, 2 * N * K, 0.1f);
+            std::vector<float> ref(N);
+            reference_gemv_swiglu(hx.data(), hw.data(), hw.data() + N * K, ref.data(), N, K);
+            Tensor x = upload16(dt, hx, 1, K);
+            Tensor w = upload16(dt, hw, 2 * N, K);
+            const size_t half = static_cast<size_t>(N) * K * 2;
+            Tensor wg = Tensor::view(w.device, w.data, N, K, dt);
+            Tensor wu = Tensor::view(w.device, static_cast<char*>(w.data) + half, N, K, dt);
+            Tensor out_stacked = Tensor::empty_on(w.device, 1, N, dt);
+            brotensor::fused_gemv_swiglu(x, wg, wu, out_stacked);
+            compare_tensors(host(ref, 1, N), download16(out_stacked),
+                            "gemv_swiglu stacked (16-bit HIP)", tol, tol);
+            Tensor wg2 = wg.clone(), wu2 = wu.clone();
+            Tensor out_split = Tensor::empty_on(w.device, 1, N, dt);
+            brotensor::fused_gemv_swiglu(x, wg2, wu2, out_split);
+            compare_tensors(host(ref, 1, N), download16(out_split),
+                            "gemv_swiglu separate (16-bit HIP)", tol, tol);
+        }
+        // GEMV + residual
+        {
+            const int N = 320, K = 512;
+            auto hx = random16(dt, rng, K, 0.5f), hw = random16(dt, rng, N * K, 0.1f);
+            auto hr = random16(dt, rng, N, 0.5f);
+            std::vector<float> ref(N);
+            reference_gemv_residual(hx.data(), hw.data(), hr.data(), ref.data(), N, K);
+            Tensor out;
+            brotensor::fused_gemv_residual(upload16(dt, hx, 1, K), upload16(dt, hw, N, K),
+                                           upload16(dt, hr, 1, N), out);
+            compare_tensors(host(ref, 1, N), download16(out), "gemv_residual (16-bit HIP)", tol, tol);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -380,6 +514,7 @@ int main() {
         test_layernorm_modulate();
         test_gemv_swiglu();
         test_gemv_residual();
+        test_fused_16bit_hip();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "Exception during test: %s\n", e.what());
         return 1;

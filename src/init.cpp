@@ -121,8 +121,9 @@ void init() {
     // Determine default device once.
     if (!global_default_set_flag().load(std::memory_order_relaxed)) {
         if (auto envd = parse_env_device()) {
-            if (detail::is_registered(*envd)) {
-                global_default().store(*envd, std::memory_order_relaxed);
+            const Device want = detail::resolve_device_alias(*envd);
+            if (detail::is_registered(want)) {
+                global_default().store(want, std::memory_order_relaxed);
             } else {
                 global_default().store(pick_default_from_available(),
                                        std::memory_order_relaxed);
@@ -159,6 +160,7 @@ Dtype compute_dtype(Device d) {
 }
 
 void set_default_device(Device d) {
+    d = detail::resolve_device_alias(d);
     if (!detail::is_registered(d)) {
         std::string m = "brotensor: set_default_device: backend ";
         m += device_name(d);
@@ -194,6 +196,7 @@ std::vector<Device> available_devices() {
     return out;
 }
 
+// Truthful about the hardware: not alias-resolved (detail/dispatch.h).
 bool is_available(Device d) {
     return detail::is_registered(d);
 }
@@ -208,6 +211,7 @@ thread_local std::vector<bool> tls_scope_had_prev;
 } // namespace
 
 DeviceScope::DeviceScope(Device d) {
+    d = detail::resolve_device_alias(d);
     if (!detail::is_registered(d)) {
         std::string m = "brotensor: DeviceScope: backend ";
         m += device_name(d);
@@ -234,6 +238,7 @@ DeviceScope::~DeviceScope() {
 // ─── sync ──────────────────────────────────────────────────────────────────
 
 void sync(Device d) {
+    d = detail::resolve_device_alias(d);
     if (!detail::is_registered(d)) {
         std::string m = "brotensor: sync: backend ";
         m += device_name(d);
@@ -253,6 +258,7 @@ void sync_all() {
 
 bool device_mem_info(Device d, std::size_t& free_bytes,
                      std::size_t& total_bytes) {
+    d = detail::resolve_device_alias(d);
     if (!detail::is_registered(d)) return false;
     const auto fn = detail::alloc_for(d).mem_info;
     if (fn == nullptr) return false;
@@ -260,6 +266,7 @@ bool device_mem_info(Device d, std::size_t& free_bytes,
 }
 
 bool device_mem_trim(Device d, std::size_t keep_bytes) {
+    d = detail::resolve_device_alias(d);
     if (!detail::is_registered(d)) return false;
     const auto fn = detail::alloc_for(d).mem_trim;
     if (fn == nullptr) return false;
@@ -267,6 +274,7 @@ bool device_mem_trim(Device d, std::size_t keep_bytes) {
 }
 
 std::string device_product_name(Device d) {
+    d = detail::resolve_device_alias(d);
     if (!detail::is_registered(d)) return {};
     const auto fn = detail::alloc_for(d).device_name;
     if (fn == nullptr) return {};

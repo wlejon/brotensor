@@ -12,6 +12,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdio>
+
 namespace brotensor::detail::hip {
 
 // ── alloc table (defined in tensor.hip) ──
@@ -102,6 +104,19 @@ extern "C" void brotensor_probe_and_register_hip() {
     hipError_t err = hipGetDeviceCount(&device_count);
     if (err != hipSuccess || device_count == 0) {
         return;
+    }
+
+    // Every kernel is written for 32-lane wavefronts (see
+    // cmake/BrotensorHip.cmake). A device that runs wider waves would get
+    // wrong answers, not errors, so it gets no backend at all.
+    for (int i = 0; i < device_count; ++i) {
+        int warp = 0;
+        if (hipDeviceGetAttribute(&warp, hipDeviceAttributeWarpSize, i) == hipSuccess && warp != 32) {
+            std::fprintf(stderr,
+                         "brotensor: HIP device %d runs %d-wide wavefronts; the HIP backend "
+                         "needs Wave32 (RDNA 3+). HIP disabled.\n", i, warp);
+            return;
+        }
     }
 
     ::brotensor::detail::set_hip_device_count(device_count);

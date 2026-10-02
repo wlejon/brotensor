@@ -5,6 +5,7 @@
 //
 //   clamp         — in-place per-element clamp to [lo, hi].
 //   mul_inplace   — in-place per-element multiply y *= x.
+//   div_inplace   — in-place per-element divide y /= x.
 //   axpby_inplace — y = a*y + b*x, FP32 arithmetic for all storage dtypes.
 //   threshold_u8  — Y = X > t ? 1 : 0 as an INT8 byte mask (FP32 or FP16 X).
 
@@ -38,6 +39,17 @@ void mul_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x) {
     float* yp = y.host_f32_mut();
     const float* xp = x.host_f32();
     for (int i = 0; i < n; ++i) yp[i] *= xp[i];
+}
+
+void div_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x) {
+    if (y.dtype != x.dtype || y.rows != x.rows || y.cols != x.cols) {
+        throw std::runtime_error("div_inplace: shape/dtype mismatch");
+    }
+    const int n = y.size();
+    if (n == 0) return;
+    float* yp = y.host_f32_mut();
+    const float* xp = x.host_f32();
+    for (int i = 0; i < n; ++i) yp[i] /= xp[i];
 }
 
 // y = a*y + b*x in FP32 regardless of storage dtype; only the final store

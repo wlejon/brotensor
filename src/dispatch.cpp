@@ -74,6 +74,7 @@ inline bool committed(const Tensor& t) { return t.data != nullptr; }
 }
 
 inline void activate_device_context(Device dev) {
+    dev = resolve_device_alias(dev);
 #if defined(BROTENSOR_HAS_CUDA)
     if (dev.is_cuda()) {
         cudaSetDevice(dev.index);
@@ -191,25 +192,25 @@ bool is_registered(Device d) {
     return false;
 }
 
-const OpsVTable& ops_for(Device d) {
-    auto& s = slots()[static_cast<int>(d.type)];
-    if (!s.registered) {
-        if (d.is_cuda() && slots()[static_cast<int>(DeviceType::HIP)].registered) {
-            return slots()[static_cast<int>(DeviceType::HIP)].ops;
-        }
-        throw_unregistered(d);
+Device resolve_device_alias(Device d) {
+    if (d.is_cuda() && !slots()[static_cast<int>(DeviceType::CUDA)].registered &&
+        slots()[static_cast<int>(DeviceType::HIP)].registered) {
+        return Device::hip(d.index);
     }
+    return d;
+}
+
+const OpsVTable& ops_for(Device d) {
+    d = resolve_device_alias(d);
+    auto& s = slots()[static_cast<int>(d.type)];
+    if (!s.registered) throw_unregistered(d);
     return s.ops;
 }
 
 const AllocVTable& alloc_for(Device d) {
+    d = resolve_device_alias(d);
     auto& s = slots()[static_cast<int>(d.type)];
-    if (!s.registered) {
-        if (d.is_cuda() && slots()[static_cast<int>(DeviceType::HIP)].registered) {
-            return slots()[static_cast<int>(DeviceType::HIP)].alloc;
-        }
-        throw_unregistered(d);
-    }
+    if (!s.registered) throw_unregistered(d);
     return s.alloc;
 }
 
@@ -286,7 +287,7 @@ const OpsVTable& dispatch_with_opts(const Tensor& a, const Tensor& b,
 // The wrapper calls this after dispatch so the tensor is pinned to the op's
 // device before the backend impl resizes/allocates it.
 void adopt_output(Tensor& t, Device d) {
-    if (t.data == nullptr) t.device = d;
+    if (t.data == nullptr) t.device = resolve_device_alias(d);
 }
 
 [[noreturn]] void throw_not_implemented(const char* op_name, Device d) {

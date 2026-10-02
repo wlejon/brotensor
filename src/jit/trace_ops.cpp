@@ -163,6 +163,8 @@ Tensor operator/(const Tensor& a, const Tensor& b) {
         const float* p_b = b.ptr();
         int n = a.size();
         for (int i = 0; i < n; ++i) p_out[i] /= p_b[i];
+    } else if (a.device.is_hip()) {
+        brotensor::div_inplace(out, b);
     } else {
 #if BROTENSOR_HAS_CUDA
         if (a.device.is_cuda()) {
@@ -365,6 +367,8 @@ Tensor modulate(const Tensor& x, const Tensor& scale, const Tensor& shift) {
     Tensor out = Tensor::empty_on(x.device, x.rows, x.cols, x.dtype);
     if (x.is_host()) {
         detail::cpu::jit::modulate(x.ptr(), scale.ptr(), shift.ptr(), out.ptr(), x.rows, x.cols);
+    } else if (x.device.is_hip()) {
+        brotensor::modulate(x, scale, shift, out);
     } else {
 #if BROTENSOR_HAS_CUDA
         detail::cuda::jit::launch_modulate_ptx(

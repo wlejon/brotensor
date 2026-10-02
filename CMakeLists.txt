@@ -113,15 +113,20 @@ endif()
 # --- Backends ---
 #
 # brotensor is layered: a core dispatcher + always-on CPU backend, plus
-# optional GPU backends (CUDA, Metal) that compile as independent static
+# optional GPU backends (CUDA, Metal, HIP) that compile as independent static
 # libraries and register themselves into the dispatcher at static-init.
-# Nothing at the CMake level rejects enabling both GPU backends at once. They
-# stay mutually exclusive in practice because their toolchains do not coexist
-# on the same host (nvcc on Linux/Windows; Apple toolchain on Mac).
-# CPU has no opt-out.
+# CUDA and Metal are not rejected together at the CMake level — they stay
+# exclusive in practice because their toolchains do not coexist on one host
+# (nvcc on Linux/Windows; Apple toolchain on Mac). CUDA and HIP are rejected
+# together: the HIP backend compiles src/cuda/*.cu a second time, as HIP, into
+# the same symbols, and the Device::CUDA -> HIP alias assumes only one of them
+# is registered. CPU has no opt-out.
 option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
 option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
 option(BROTENSOR_WITH_HIP   "Build GPU backend (HIP/ROCm)" OFF)
+if(BROTENSOR_WITH_CUDA AND BROTENSOR_WITH_HIP)
+    message(FATAL_ERROR "BROTENSOR_WITH_CUDA and BROTENSOR_WITH_HIP are mutually exclusive.")
+endif()
 
 if(BROTENSOR_WITH_CUDA)
     if(NOT CMAKE_CUDA_ARCHITECTURES)
@@ -142,14 +147,28 @@ if(BROTENSOR_WITH_METAL)
     enable_language(OBJCXX)
 endif()
 if(BROTENSOR_WITH_HIP)
-    if(NOT CMAKE_HIP_ARCHITECTURES)
-        set(CMAKE_HIP_ARCHITECTURES "gfx1151")
-    endif()
+    # ROCm root, target architectures and the Wave32 / LDS / WMMA assumptions
+    # behind them: cmake/BrotensorHip.cmake.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BrotensorHip.cmake")
+    brotensor_hip_prepare()
     enable_language(HIP)
+    brotensor_hip_check_archs()
     set(CMAKE_HIP_STANDARD 20)
     set(CMAKE_HIP_STANDARD_REQUIRED ON)
     find_package(hip REQUIRED)
     find_package(hipblas REQUIRED)
+    # src/hip/compat/mma.h maps nvcuda::wmma onto rocWMMA (header-only); the
+    # WMMA kernels compiled through it do not build without it. Looked up as a
+    # header: the package's roc::rocwmma target links hip::device and OpenMP,
+    # which would turn every C++ consumer into a HIP / OpenMP compile.
+    find_path(BROTENSOR_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
+              HINTS "${ROCM_PATH}/include")
+    if(NOT BROTENSOR_ROCWMMA_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "BROTENSOR_WITH_HIP needs rocWMMA (the ROCm rocwmma package, rocwmma-dev): "
+            "src/hip/compat/mma.h maps CUDA's WMMA onto it. rocwmma/rocwmma.hpp was not "
+            "found under ROCM_PATH='${ROCM_PATH}'.")
+    endif()
 endif()
 
 # --- brotensor_core: dispatcher + public op wrappers + Tensor + runtime ---
@@ -254,6 +273,7 @@ add_library(brotensor_cpu STATIC
     src/jit/trace_dag.cpp
     src/jit/trace_cache.cpp
     src/jit/trace_compiler_cpu.cpp
+    src/jit/trace_eager.cpp
     src/jit/trace_ops.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core Threads::Threads)
@@ -803,6 +823,7 @@ if(BROTENSOR_WITH_HIP)
         src/hip/mha.hip
         src/hip/flash_attention.hip
         src/hip/flash_attention_extra.hip
+        src/hip/flash_attention_dense.hip
         src/hip/attention.hip
         src/hip/conv.hip
         src/hip/conv_direct.hip
@@ -832,18 +853,19 @@ if(BROTENSOR_WITH_HIP)
         ${BROTENSOR_HIP_CUDA_KERNELS}
     )
     target_link_libraries(brotensor_hip PUBLIC brotensor_core hip::host roc::hipblas)
+    # rocWMMA is PUBLIC: consumers compiling their own .cu through
+    # src/hip/compat (brodiffusion's fused kernels) include <mma.h> too.
     target_include_directories(brotensor_hip PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hip/compat>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hip>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hip/detail>
-        /opt/rocm/include
+        $<BUILD_INTERFACE:${BROTENSOR_ROCWMMA_INCLUDE_DIR}>
     )
     target_compile_definitions(brotensor_hip PUBLIC
         BROTENSOR_HAS_HIP=1 BROTENSOR_HAS_GPU=1)
     target_compile_definitions(brotensor_core PRIVATE
         BROTENSOR_HAS_HIP=1 BROTENSOR_HAS_GPU=1)
     target_link_libraries(brotensor_core PRIVATE hip::host)
-    target_include_directories(brotensor_core PRIVATE /opt/rocm/include)
     set_target_properties(brotensor_hip PROPERTIES
         HIP_STANDARD 20
         HIP_STANDARD_REQUIRED ON

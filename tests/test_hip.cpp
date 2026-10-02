@@ -233,6 +233,51 @@ static void test_hip_device_scope() {
     CHECK(brotensor::default_device() == outer);
 }
 
+// The Device::CUDA alias on a HIP-only machine (detail::resolve_device_alias):
+// everything that acts on Device::CUDA lands on HIP, everything that reports
+// hardware stays truthful.
+static void test_hip_cuda_alias() {
+    std::printf("test_hip_cuda_alias\n");
+    if (brotensor::cuda_device_count() > 0) {
+        std::printf("  (CUDA backend present: alias is the identity, skipped)\n");
+        return;
+    }
+    CHECK(!brotensor::is_available(Device::CUDA));
+    CHECK(!contains(brotensor::available_devices(), Device::CUDA));
+
+    Tensor t = Tensor::zeros_on(Device::CUDA, 3, 5);
+    CHECK(t.device == Device::HIP);
+    Tensor v = Tensor::view(Device::CUDA, t.data, 3, 5, Dtype::FP32);
+    CHECK(v.device == Device::HIP);
+    Tensor w;
+    w.device = Device::CUDA;
+    w.resize(2, 2);
+    CHECK(w.device == Device::HIP);
+
+    brotensor::scale_inplace(t, 2.0f);
+    brotensor::sync(Device::CUDA);   // used to throw "backend cuda is not available"
+
+    std::size_t free_b = 0, total_b = 0;
+    CHECK(brotensor::device_mem_info(Device::CUDA, free_b, total_b) && total_b > 0);
+    CHECK(brotensor::device_product_name(Device::CUDA) ==
+          brotensor::device_product_name(Device::HIP));
+
+    const Device outer = brotensor::default_device();
+    {
+        brotensor::DeviceScope s(Device::CUDA);
+        CHECK(brotensor::default_device() == Device::HIP);
+        CHECK(Tensor::zeros(1, 1).device == Device::HIP);
+    }
+    CHECK(brotensor::default_device() == outer);
+
+    // An unsized output tagged CUDA adopts the op's (HIP) device.
+    Tensor src = Tensor::zeros_on(Device::HIP, 2, 4);
+    Tensor out;
+    out.device = Device::CUDA;
+    brotensor::relu_forward(src, out);
+    CHECK(out.device == Device::HIP && out.data != nullptr);
+}
+
 static void test_hip_elementwise() {
     std::printf("test_hip_elementwise\n");
     const int rows = 8, cols = 16;
@@ -930,6 +975,7 @@ int main() {
     test_hip_host_device_transfer();
     test_hip_memory_and_sync();
     test_hip_device_scope();
+    test_hip_cuda_alias();
 
     // Phase 2A functional tests
     test_hip_elementwise();

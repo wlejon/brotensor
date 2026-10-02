@@ -229,6 +229,24 @@ void fused_gemv_swiglu(const Tensor& x, const Tensor& w_gate, const Tensor& w_up
     }
 #endif
 
+    // HIP, 16-bit, gate and up the two halves of one stacked [gate; up]
+    // weight (the layout a fused gate_up projection is stored in): that is
+    // exactly linear_forward_batched_ex's SwiGLU epilogue, whose HIP GEMV
+    // kernel does both dot products and the gate in one pass.
+    const bool sixteen = x.dtype == Dtype::FP16 || x.dtype == Dtype::BF16;
+    if (x.device.type == DeviceType::HIP && sixteen &&
+        w_gate.dtype == x.dtype && w_up.dtype == x.dtype &&
+        static_cast<const char*>(w_up.data) ==
+            static_cast<const char*>(w_gate.data) +
+                static_cast<size_t>(N) * K * dtype_size_bytes(x.dtype)) {
+        Tensor w_stacked = Tensor::view(x.device, w_gate.data, 2 * N, K, x.dtype);
+        Tensor x_row = Tensor::view(x.device, x.data, 1, K, x.dtype);
+        Tensor y_row = Tensor::view(out.device, out.data, 1, N, out.dtype);
+        linear_forward_batched_ex(w_stacked, nullptr, x_row, /*act=*/0, kLinearEpiSwiglu,
+                                  nullptr, y_row);
+        return;
+    }
+
     Tensor zero = Tensor::zeros_on(x.device, N, 1, x.dtype);
     Tensor up = Tensor::empty_on(x.device, (x.rows == 1 ? 1 : N), (x.rows == 1 ? N : 1), x.dtype);
     Tensor x_row = (x.rows == 1) ? x : Tensor::view(x.device, x.data, 1, K, x.dtype);

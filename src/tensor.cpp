@@ -445,9 +445,7 @@ std::size_t Tensor::bytes() const {
 
 Tensor Tensor::empty_on(Device d, int r, int c, Dtype dt) {
     check_dims(r, c, "empty_on");
-    if (d.is_cuda() && !detail::is_registered(DeviceType::CUDA) && detail::is_registered(DeviceType::HIP)) {
-        d = Device::hip(d.index);
-    }
+    d = detail::resolve_device_alias(d);
     Tensor t;
     t.device = d;
     t.dtype  = dt;
@@ -557,9 +555,7 @@ Tensor Tensor::from_host_int8(const int8_t* src, int r, int c) {
 }
 
 Tensor Tensor::view(Device d, void* data, int r, int c, Dtype dt) {
-    if (d.is_cuda() && !detail::is_registered(DeviceType::CUDA) && detail::is_registered(DeviceType::HIP)) {
-        d = Device::hip(d.index);
-    }
+    d = detail::resolve_device_alias(d);
     Tensor t;
     t.device = d;
     t.dtype  = dt;
@@ -598,8 +594,9 @@ Tensor Tensor::to(Device target) const {
     } else if (target.is_cpu()) {
         // GPU → CPU.
         detail::alloc_for(device).memcpy_d2h(t.data, data, n, device.index);
-    } else if (device.is_cuda() && target.is_cuda()) {
-        // Direct peer copy between CUDA GPUs.
+    } else if (device.type == target.type) {
+        // Direct peer copy between two GPUs of one backend (CUDA or HIP;
+        // Metal has a single device and never gets here).
         auto peer_fn = detail::alloc_for(target).memcpy_peer;
         if (peer_fn) {
             peer_fn(t.data, target.index, data, device.index, n);
@@ -645,6 +642,7 @@ void Tensor::resize(int r, int c, Dtype dt) {
     // (required when the op sequence using it is CUDA-graph captured).
     if (new_bytes > cap_bytes_ || !owns_) {
         release_();
+        device = detail::resolve_device_alias(device);
         data = backend_alloc(device, new_bytes);
         owns_ = (data != nullptr);
         cap_bytes_ = owns_ ? new_bytes : 0;

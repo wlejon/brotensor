@@ -5,7 +5,9 @@
 //   Test 2: Auto-fused Residual + RMSNorm: h += proj; norm = rms_norm(h)
 //   Test 3: Auto-fused LayerNorm + Modulate: ln = layernorm(x); out = ln * (1 + scale) + shift
 //   Test 4: Trace cache hit verification & replay speedup benchmark.
-// Runs across both CPU and NVIDIA RTX GPU (CUDA sm_89).
+//   Test 6: A HIP trace never reaches the host code generator.
+//   Test 7: Eager divide / modulate and a traced divide on HIP.
+// Runs across CPU, NVIDIA RTX GPU (CUDA sm_89) and HIP (unfused replay).
 
 #include <brotensor/jit/trace.h>
 #include <brotensor/ops.h>
@@ -72,6 +74,12 @@ void fill_random(std::vector<float>& vec, uint64_t seed, float scale = 1.0f) {
     }
 }
 
+std::string device_label(Device dev) {
+    if (dev.is_cuda()) return "CUDA";
+    if (dev.is_hip()) return "HIP";
+    return "CPU";
+}
+
 float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size()) return 1e9f;
     float max_diff = 0.0f;
@@ -85,7 +93,7 @@ float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
 // ── Test 1: Auto-fused Elementwise Expression: (a * b + c) * silu(d) ─────────
 
 void test_elementwise_expression(Device dev) {
-    const std::string dev_name = dev.is_cuda() ? "CUDA" : "CPU";
+    const std::string dev_name = device_label(dev);
     std::printf("\n--- Test 1: Auto-fused Elementwise Expression on %s ---\n", dev_name.c_str());
 
     const int R = 128;
@@ -134,7 +142,7 @@ void test_elementwise_expression(Device dev) {
 // ── Test 2: Auto-fused Residual + RMSNorm: h += proj; norm = rms_norm(h) ─────
 
 void test_residual_rmsnorm(Device dev) {
-    const std::string dev_name = dev.is_cuda() ? "CUDA" : "CPU";
+    const std::string dev_name = device_label(dev);
     std::printf("\n--- Test 2: Auto-fused Residual + RMSNorm on %s ---\n", dev_name.c_str());
 
     const int B = 4;
@@ -205,7 +213,7 @@ void test_residual_rmsnorm(Device dev) {
 // ── Test 3: Auto-fused LayerNorm + Modulate: ln = layernorm(x); out = ln * (1 + scale) + shift
 
 void test_layernorm_modulate(Device dev) {
-    const std::string dev_name = dev.is_cuda() ? "CUDA" : "CPU";
+    const std::string dev_name = device_label(dev);
     std::printf("\n--- Test 3: Auto-fused LayerNorm + Modulate on %s ---\n", dev_name.c_str());
 
     const int R = 8;
@@ -268,7 +276,7 @@ void test_layernorm_modulate(Device dev) {
 // ── Test 4: Trace Cache Hit Verification & Replay Speedup ─────────────────────
 
 void test_cache_hit_and_speedup(Device dev) {
-    const std::string dev_name = dev.is_cuda() ? "CUDA" : "CPU";
+    const std::string dev_name = device_label(dev);
     std::printf("\n--- Test 4: Trace Cache Hit & Replay Speedup on %s ---\n", dev_name.c_str());
 
     TraceCache::instance().clear();
@@ -376,7 +384,7 @@ void test_cache_hit_and_speedup(Device dev) {
 // whose result the caller keeps has to cost exactly the one output buffer.
 
 void test_trace_allocates_nothing(Device dev) {
-    const std::string dev_name = dev.is_cuda() ? "CUDA" : "CPU";
+    const std::string dev_name = device_label(dev);
     std::printf("\n--- Test 5: Trace-time allocation on %s ---\n", dev_name.c_str());
 
     const int R = 512;
@@ -488,6 +496,97 @@ void test_trace_allocates_nothing(Device dev) {
     CHECK_TRUE(aborted.rows == R, (dev_name + " a neutralised tensor is reusable").c_str());
 }
 
+// ── Test 6: a HIP trace never reaches the host code generator ──────────────
+//
+// There is no GPU trace compiler for HIP. The CPU compiler emits host code
+// that walks raw pointers, so handing it a HIP DAG either faults on a
+// discrete GPU or — on an APU, where hipMalloc memory is host-visible — runs
+// on the host with no ordering against the HIP stream: it reads an input the
+// GPU has not finished writing. The trace has to stay on the device.
+void test_hip_trace_stays_on_device(Device dev) {
+    std::printf("\n--- Test 6: HIP trace stays on the device ---\n");
+
+    const int R = 2048;
+    const int C = 2048;
+    const int N = R * C;
+    std::vector<float> ones(N, 1.0f);
+    Tensor x = Tensor::from_host_on(dev, ones.data(), R, C);
+    Tensor y = Tensor::from_host_on(dev, ones.data(), R, C);
+    brotensor::sync(dev);
+
+    // Queue enough device work on x that it is certainly still running when
+    // the trace is compiled and first executed: x ends up 2^10.
+    for (int i = 0; i < 10; ++i) brotensor::scale_inplace(x, 2.0f);
+
+    begin_trace();
+    Tensor out = x * y + 1.0f;
+    TraceHandle handle = end_trace();
+    brotensor::sync(dev);
+
+    CHECK_TRUE(std::string(handle.fusion_name()) != "cpu-avx2-fused",
+               "HIP trace is not compiled by the CPU code generator");
+    std::vector<float> got = out.to_host_vector();
+    float err = 0.0f;
+    for (int i = 0; i < N; ++i) err = std::fmax(err, std::fabs(got[i] - 1025.0f));
+    CHECK_PARITY(err, 0.0f, "HIP trace sees the device work queued before it");
+
+    for (int i = 0; i < 2; ++i) brotensor::scale_inplace(x, 0.5f);
+    handle.execute();
+    brotensor::sync(dev);
+    got = out.to_host_vector();
+    err = 0.0f;
+    for (int i = 0; i < N; ++i) err = std::fmax(err, std::fabs(got[i] - 257.0f));
+    CHECK_PARITY(err, 0.0f, "HIP trace replay is ordered on the stream");
+}
+
+// ── Test 7: eager `/` and modulate() off the host ──────────────────────────
+//
+// Outside a trace these run immediately. On HIP both used to throw
+// ("requires CUDA backend"); they go through div_inplace / modulate now. The
+// traced divide replays through the same op.
+void test_hip_eager_div_modulate(Device dev) {
+    std::printf("\n--- Test 7: eager divide / modulate on %s ---\n", device_label(dev).c_str());
+
+    const int R = 37;
+    const int C = 96;
+    const int N = R * C;
+    std::vector<float> h_a(N), h_b(N), h_scale(C), h_shift(C);
+    fill_random(h_a, 7001, 2.0f);
+    fill_random(h_b, 7002, 1.0f);
+    for (auto& v : h_b) v += (v < 0.0f ? -0.5f : 0.5f);   // keep |b| >= 0.5
+    fill_random(h_scale, 7003, 0.5f);
+    fill_random(h_shift, 7004, 0.5f);
+
+    Tensor a = Tensor::from_host_on(dev, h_a.data(), R, C);
+    Tensor b = Tensor::from_host_on(dev, h_b.data(), R, C);
+    Tensor scale = Tensor::from_host_on(dev, h_scale.data(), 1, C);
+    Tensor shift = Tensor::from_host_on(dev, h_shift.data(), 1, C);
+
+    std::vector<float> ref_div(N), ref_mod(N);
+    for (int i = 0; i < N; ++i) {
+        ref_div[i] = h_a[i] / h_b[i];
+        ref_mod[i] = h_a[i] * (1.0f + h_scale[i % C]) + h_shift[i % C];
+    }
+
+    Tensor q = a / b;
+    Tensor m = jit::modulate(a, scale, shift);
+    brotensor::sync(dev);
+    CHECK_PARITY(max_abs_diff(q.to_host_vector(), ref_div), 1e-5f,
+                 (device_label(dev) + " eager a / b").c_str());
+    CHECK_PARITY(max_abs_diff(m.to_host_vector(), ref_mod), 1e-5f,
+                 (device_label(dev) + " eager modulate").c_str());
+
+    begin_trace();
+    Tensor t = (a / b) * scale + 1.0f;
+    TraceHandle h = end_trace();
+    brotensor::sync(dev);
+    std::vector<float> ref_t(N);
+    for (int i = 0; i < N; ++i) ref_t[i] = ref_div[i] * h_scale[i % C] + 1.0f;
+    CHECK_PARITY(max_abs_diff(t.to_host_vector(), ref_t), 1e-5f,
+                 (device_label(dev) + " traced (a / b) * row + 1").c_str());
+    (void)h;
+}
+
 } // namespace
 
 int main() {
@@ -519,6 +618,19 @@ int main() {
         test_trace_allocates_nothing(Device::cuda());
     } else {
         std::printf("\n[SKIP] CUDA device not available or not detected; skipping CUDA tests.\n");
+    }
+    // HIP has no trace compiler: its traces replay op by op through the
+    // dispatched ops (src/jit/trace_eager.cpp). Tests 1-4 check results,
+    // replay and the cache; test 5 measures the fused kernel's allocation
+    // and launch count, which an unfused replay does not have.
+    if (brotensor::is_available(Device::hip())) {
+        std::printf("\n============================= [ HIP TEST SUITE ] =============================\n");
+        test_elementwise_expression(Device::hip());
+        test_residual_rmsnorm(Device::hip());
+        test_layernorm_modulate(Device::hip());
+        test_cache_hit_and_speedup(Device::hip());
+        test_hip_trace_stays_on_device(Device::hip());
+        test_hip_eager_div_modulate(Device::hip());
     }
 
     std::printf("\n================================================================================\n");

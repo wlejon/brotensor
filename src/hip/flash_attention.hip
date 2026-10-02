@@ -3,43 +3,32 @@
 // Designed specifically for AMD RDNA 3.5:
 // - Wave32 execution: 32-lane wavefronts, cross-lane shuffles (__shfl_xor / __shfl_down
 //   with 0xffffffff mask) for in-warp max/sum reductions without shared-memory stalls.
-// - 64 KB LDS budget: tile sizes Br x Bc chosen so Q, K, V tiles fit within 32 KB LDS
-//   (preserving >= 2 workgroups per WGP for full occupancy).
-// - Vectorized 128-bit loads (uint4 / 8x half / 4x float) from unified memory.
-// - Unified support for causal, bidirectional, GQA, windowed, and varlen sequences.
+// - 64 KB LDS budget: the K/V tile depth is picked per launch (fa_pick_ktile) so the
+//   staged Q row + K tile + V tile fit; heads too wide to stage read K/V from global.
+// - Unified support for causal, bidirectional, GQA, windowed, and varlen sequences,
+//   at any head_dim (columns split across grid.z, see detail/flash_internal.h).
+// - Non-causal unwindowed attention of any width takes the hipBLAS path
+//   (flash_attention_dense.hip) when it pays for itself.
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/ops/linear.h>
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
+#include "detail/flash_internal.h"
 #include "detail/hip_check.h"
-#include "detail/hipblas_handle.h"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <hipblas/hipblas.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
-
-#ifndef BROTENSOR_HIPBLAS_CHECK
-#define BROTENSOR_HIPBLAS_CHECK(expr)                                                 \
-    do {                                                                               \
-        hipblasStatus_t _bga_err = (expr);                                             \
-        if (_bga_err != HIPBLAS_STATUS_SUCCESS) {                                      \
-            throw std::runtime_error(std::string("hipBLAS error: ") + #expr);          \
-        }                                                                              \
-    } while (0)
-#endif
 
 namespace brotensor::detail::hip {
 
-void hip_softmax_rows_forward(const ::brotensor::Tensor& X, ::brotensor::Tensor& Y,
-                              int rows, int cols);
-
-void* hip_current_stream(int dev = -1);
 void hip_linear_forward_batched_fp16(const ::brotensor::Tensor& W,
                                      const ::brotensor::Tensor* bias,
                                      const ::brotensor::Tensor& X_BD,
@@ -64,118 +53,76 @@ void hip_flash_attention_decode_masked(const ::brotensor::Tensor& Q,
                                        ::brotensor::Tensor& O,
                                        float attn_softcap, int window);
 
+namespace fa {
+
+size_t max_lds_per_block(int dev) {
+    constexpr int kMaxDev = 16;
+    static size_t cache[kMaxDev] = {};
+    static std::once_flag once[kMaxDev];
+    if (dev < 0 || dev >= kMaxDev) dev = 0;
+    std::call_once(once[dev], [dev] {
+        int v = 0;
+        if (hipDeviceGetAttribute(&v, hipDeviceAttributeMaxSharedMemoryPerBlock, dev) != hipSuccess || v <= 0) {
+            (void)hipGetLastError();
+            v = 64 * 1024;
+        }
+        cache[dev] = static_cast<size_t>(v);
+    });
+    return cache[dev];
+}
+
+} // namespace fa
+
 namespace {
 
-constexpr int kFaBlock = 128; // 4 Wave32 waves per block
-constexpr int kFaKtile = 32;  // Key tile depth (fits within 32 KB LDS budget for RDNA 3.5 occupancy)
-constexpr int kMaxHdPerThread = 8;
+using fa::FaScalar;
+using fa::kFaBlock;
+using fa::kFaHdChunk;
+using fa::kMaxHdPerThread;
+using fa::wave32_max;
+using fa::wave32_sum;
+using fa::cur_stream;
 
-inline hipStream_t cur_stream() {
-    return reinterpret_cast<hipStream_t>(hip_current_stream());
-}
+constexpr int kFaKtile = 32;    // Deepest K tile (keeps the common head_dims at >= 2 blocks per WGP)
+constexpr int kFaMinKtile = 8;  // Below this the scalar kernel stops staging K/V in LDS
 
-__device__ __forceinline__ float wave32_max(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val = fmaxf(val, __shfl_xor(val, offset, 32));
-    }
-    return val;
-}
-
-__device__ __forceinline__ float wave32_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val += __shfl_xor(val, offset, 32);
-    }
-    return val;
-}
-
-template <typename T> struct FaScalar;
-
-template <> struct FaScalar<float> {
-    __device__ static __forceinline__ float to_f32(float v) { return v; }
-    __device__ static __forceinline__ float from_f32(float v) { return v; }
-    __device__ static __forceinline__ float dot(const float* a, const float* b, int hd) {
-        float acc = 0.0f;
-        int d = 0;
-        if (hd % 4 == 0) {
-            const float4* a4 = reinterpret_cast<const float4*>(a);
-            const float4* b4 = reinterpret_cast<const float4*>(b);
-            const int n4 = hd / 4;
-            for (int i = 0; i < n4; ++i) {
-                float4 va = a4[i];
-                float4 vb = b4[i];
-                acc += va.x * vb.x + va.y * vb.y + va.z * vb.z + va.w * vb.w;
-            }
-            d = n4 * 4;
-        }
-        for (; d < hd; ++d) acc += a[d] * b[d];
-        return acc;
-    }
-};
-
-template <> struct FaScalar<__half> {
-    __device__ static __forceinline__ float to_f32(__half v) { return __half2float(v); }
-    __device__ static __forceinline__ __half from_f32(float v) { return __float2half(v); }
-    __device__ static __forceinline__ float dot(const __half* a, const __half* b, int hd) {
-        float acc = 0.0f;
-        int d = 0;
-        if (hd % 8 == 0) {
-            // 128-bit vectorized load (8 x 16-bit half)
-            const uint4* a4 = reinterpret_cast<const uint4*>(a);
-            const uint4* b4 = reinterpret_cast<const uint4*>(b);
-            const int n8 = hd / 8;
-            for (int i = 0; i < n8; ++i) {
-                uint4 ra = a4[i];
-                uint4 rb = b4[i];
-                const __half* ha = reinterpret_cast<const __half*>(&ra);
-                const __half* hb = reinterpret_cast<const __half*>(&rb);
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    acc += __half2float(ha[j]) * __half2float(hb[j]);
-                }
-            }
-            d = n8 * 8;
-        }
-        for (; d < hd; ++d) acc += __half2float(a[d]) * __half2float(b[d]);
-        return acc;
-    }
-};
-
-template <> struct FaScalar<hip_bfloat16> {
-    __device__ static __forceinline__ float to_f32(hip_bfloat16 v) { return float(v); }
-    __device__ static __forceinline__ hip_bfloat16 from_f32(float v) { return hip_bfloat16(v); }
-    __device__ static __forceinline__ float dot(const hip_bfloat16* a, const hip_bfloat16* b, int hd) {
-        float acc = 0.0f;
-        int d = 0;
-        if (hd % 8 == 0) {
-            // 128-bit vectorized load (8 x 16-bit bfloat16)
-            const uint4* a4 = reinterpret_cast<const uint4*>(a);
-            const uint4* b4 = reinterpret_cast<const uint4*>(b);
-            const int n8 = hd / 8;
-            for (int i = 0; i < n8; ++i) {
-                uint4 ra = a4[i];
-                uint4 rb = b4[i];
-                const hip_bfloat16* ha = reinterpret_cast<const hip_bfloat16*>(&ra);
-                const hip_bfloat16* hb = reinterpret_cast<const hip_bfloat16*>(&rb);
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    acc += float(ha[j]) * float(hb[j]);
-                }
-            }
-            d = n8 * 8;
-        }
-        for (; d < hd; ++d) acc += float(a[d]) * float(b[d]);
-        return acc;
-    }
-};
-
+// LDS layout of the scalar kernels: scores[ktile] + red[32] (FP32), then the
+// staged Q row (head_dim), the K tile (ktile x head_dim) and the V tile for
+// this block's column chunk (ktile x vchunk). Unstaged launches keep only the
+// FP32 part and read Q/K/V straight from global memory.
 template <typename T>
-inline size_t calc_fa_shmem(int head_dim, int ktile = kFaKtile) {
-    return sizeof(float) * (ktile + 32) + sizeof(T) * (head_dim + 2 * ktile * head_dim);
+inline size_t calc_fa_shmem(int head_dim, int vchunk, int ktile, bool stage) {
+    const size_t f32 = sizeof(float) * static_cast<size_t>(kFaKtile + 32);
+    if (!stage) return f32;
+    return f32 + sizeof(T) * (static_cast<size_t>(head_dim) +
+                              static_cast<size_t>(ktile) * head_dim +
+                              static_cast<size_t>(ktile) * vchunk);
+}
+
+struct FaLaunch {
+    int ktile;
+    int stage;
+    size_t shmem;
+};
+
+// Deepest K tile whose staged footprint fits the device's per-block LDS;
+// unstaged (global reads, full-depth tile) when even kFaMinKtile does not fit.
+template <typename T>
+FaLaunch fa_pick_ktile(int head_dim, int dev) {
+    const int vchunk = std::min(head_dim, kFaHdChunk);
+    const size_t limit = fa::max_lds_per_block(dev);
+    for (int kt = kFaKtile; kt >= kFaMinKtile; kt >>= 1) {
+        const size_t sh = calc_fa_shmem<T>(head_dim, vchunk, kt, true);
+        if (sh <= limit) return {kt, 1, sh};
+    }
+    return {kFaKtile, 0, calc_fa_shmem<T>(head_dim, vchunk, kFaKtile, false)};
 }
 
 // ─── Native AMD FlashAttention-2 Forward Kernel (Tiled Online Softmax) ────────
+//
+// One block per (query row, head, column chunk). `stage` selects whether the
+// Q row and the K/V tiles are copied to LDS first (ktile deep) or read from
+// global memory in place (wide heads).
 
 template <typename T>
 __global__ void hip_flash_attention_kernel(
@@ -185,16 +132,17 @@ __global__ void hip_flash_attention_kernel(
         const float* __restrict__ mask,
         T* __restrict__ Out,
         int Lk, int Dq, int Dkv, int head_dim,
-        int window, int q_offset, int group, int causal) {
+        int window, int q_offset, int group, int causal,
+        int ktile, int stage) {
     extern __shared__ char s_raw[];
     float* scores = reinterpret_cast<float*>(s_raw);
     float* red    = scores + kFaKtile;
-    T* s_q        = reinterpret_cast<T*>(red + 32);
-    T* s_k        = s_q + head_dim;
-    T* s_v        = s_k + kFaKtile * head_dim;
 
     const int q           = blockIdx.x;
     const int h           = blockIdx.y;
+    const int d_base      = blockIdx.z * kFaHdChunk;
+    const int d_end       = min(head_dim, d_base + kFaHdChunk);
+    const int vchunk      = d_end - d_base;
     const int tid         = threadIdx.x;
     const int warp_id     = tid >> 5;
     const int lane        = tid & 31;
@@ -204,6 +152,10 @@ __global__ void hip_flash_attention_kernel(
     const int head_off_q  = h * head_dim;
     const int head_off_kv = h_kv * head_dim;
     const float inv_sqrt  = rsqrtf(static_cast<float>(head_dim));
+
+    T* s_q = reinterpret_cast<T*>(red + 32);
+    T* s_k = s_q + head_dim;
+    T* s_v = s_k + ktile * head_dim;
 
     const int aq = q + q_offset;
     int lo = 0;
@@ -217,17 +169,20 @@ __global__ void hip_flash_attention_kernel(
     }
 
     if (causal && aq < 0) {
-        for (int d = tid; d < head_dim; d += blockDim.x) {
+        for (int d = d_base + tid; d < d_end; d += blockDim.x) {
             Out[static_cast<size_t>(q) * Dq + head_off_q + d] = FaScalar<T>::from_f32(0.0f);
         }
         return;
     }
 
     const T* q_vec = Q + static_cast<size_t>(q) * Dq + head_off_q;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        s_q[d] = q_vec[d];
+    if (stage) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            s_q[d] = q_vec[d];
+        }
+        __syncthreads();
     }
-    __syncthreads();
+    const T* q_src = stage ? s_q : q_vec;
 
     float run_max = -1e30f;
     float run_sum = 0.0f;
@@ -235,24 +190,30 @@ __global__ void hip_flash_attention_kernel(
     #pragma unroll
     for (int i = 0; i < kMaxHdPerThread; ++i) partial[i] = 0.0f;
 
-    const int k0_start = (lo / kFaKtile) * kFaKtile;
+    const int k0_start = (lo / ktile) * ktile;
 
-    for (int k0 = k0_start; k0 <= k_hi; k0 += kFaKtile) {
-        int klen = kFaKtile;
+    for (int k0 = k0_start; k0 <= k_hi; k0 += ktile) {
+        int klen = ktile;
         if (k0 + klen - 1 > k_hi) klen = k_hi - k0 + 1;
 
-        // Load K and V tiles into LDS
-        const int tile_elems = klen * head_dim;
-        for (int idx = tid; idx < tile_elems; idx += blockDim.x) {
-            const int t = idx / head_dim;
-            const int d = idx % head_dim;
-            const size_t kg = static_cast<size_t>(k0 + t);
-            s_k[idx] = K[kg * Dkv + head_off_kv + d];
-            s_v[idx] = V[kg * Dkv + head_off_kv + d];
+        // Load the K tile (full width) and this chunk's V columns into LDS
+        if (stage) {
+            const int k_elems = klen * head_dim;
+            for (int idx = tid; idx < k_elems; idx += blockDim.x) {
+                const int t = idx / head_dim;
+                const int d = idx % head_dim;
+                s_k[idx] = K[static_cast<size_t>(k0 + t) * Dkv + head_off_kv + d];
+            }
+            const int v_elems = klen * vchunk;
+            for (int idx = tid; idx < v_elems; idx += blockDim.x) {
+                const int t = idx / vchunk;
+                const int d = idx % vchunk;
+                s_v[idx] = V[static_cast<size_t>(k0 + t) * Dkv + head_off_kv + d_base + d];
+            }
+            __syncthreads();
         }
-        __syncthreads();
 
-        // 1. Compute dot products: s_q . s_k * inv_sqrt from LDS
+        // 1. Compute dot products: q . k * inv_sqrt
         for (int t = tid; t < klen; t += blockDim.x) {
             const int kg = k0 + t;
             float s;
@@ -260,9 +221,10 @@ __global__ void hip_flash_attention_kernel(
                 s = -1e30f;
             } else {
                 float dot = 0.0f;
-                const T* k_ptr = s_k + t * head_dim;
+                const T* k_ptr = stage ? s_k + t * head_dim
+                                       : K + static_cast<size_t>(kg) * Dkv + head_off_kv;
                 for (int d = 0; d < head_dim; ++d) {
-                    dot += FaScalar<T>::to_f32(s_q[d]) * FaScalar<T>::to_f32(k_ptr[d]);
+                    dot += FaScalar<T>::to_f32(q_src[d]) * FaScalar<T>::to_f32(k_ptr[d]);
                 }
                 s = dot * inv_sqrt;
             }
@@ -285,6 +247,9 @@ __global__ void hip_flash_attention_kernel(
         if (warp_id == 0) red[lane] = tile_max;
         __syncthreads();
         tile_max = red[0];
+        // Every warp must have read the max before the sum reduction below
+        // reuses red: a fast warp writing red[warp_id] raced a slow one here.
+        __syncthreads();
 
         const float m_new = fmaxf(tile_max, run_max);
 
@@ -315,13 +280,15 @@ __global__ void hip_flash_attention_kernel(
         // 4. Rescale running accumulator
         float alpha = (run_max <= -1e29f) ? 0.0f : __expf(run_max - m_new);
 
-        // 5. Update partial output for this thread's assigned dimension slots from LDS s_v
+        // 5. Update partial output for this thread's column slots of the chunk
         int slot = 0;
-        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+        for (int d = d_base + tid; d < d_end; d += blockDim.x, ++slot) {
             if (slot >= kMaxHdPerThread) break;
             float acc = alpha * partial[slot];
             for (int t = 0; t < klen; ++t) {
-                acc += scores[t] * FaScalar<T>::to_f32(s_v[t * head_dim + d]);
+                const T v = stage ? s_v[t * vchunk + (d - d_base)]
+                                  : V[static_cast<size_t>(k0 + t) * Dkv + head_off_kv + d];
+                acc += scores[t] * FaScalar<T>::to_f32(v);
             }
             partial[slot] = acc;
         }
@@ -334,7 +301,7 @@ __global__ void hip_flash_attention_kernel(
     // 6. Normalization and write out
     const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
     int slot = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+    for (int d = d_base + tid; d < d_end; d += blockDim.x, ++slot) {
         if (slot >= kMaxHdPerThread) break;
         Out[static_cast<size_t>(q) * Dq + head_off_q + d] = FaScalar<T>::from_f32(partial[slot] * inv);
     }
@@ -351,20 +318,24 @@ __global__ void hip_flash_attention_varlen_kernel(
         const int* __restrict__ cu_k,
         T* __restrict__ Out,
         int B, int D, int head_dim,
-        int causal) {
+        int causal, int ktile, int stage) {
     extern __shared__ char s_raw[];
     float* scores = reinterpret_cast<float*>(s_raw);
     float* red    = scores + kFaKtile;
-    T* s_q        = reinterpret_cast<T*>(red + 32);
-    T* s_k        = s_q + head_dim;
-    T* s_v        = s_k + kFaKtile * head_dim;
 
     const int q_global  = blockIdx.x;
     const int h         = blockIdx.y;
+    const int d_base    = blockIdx.z * kFaHdChunk;
+    const int d_end     = min(head_dim, d_base + kFaHdChunk);
+    const int vchunk    = d_end - d_base;
     const int tid       = threadIdx.x;
     const int warp_id   = tid >> 5;
     const int lane      = tid & 31;
     const int num_warps = blockDim.x >> 5;
+
+    T* s_q = reinterpret_cast<T*>(red + 32);
+    T* s_k = s_q + head_dim;
+    T* s_v = s_k + ktile * head_dim;
 
     const int head_off = h * head_dim;
     const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
@@ -378,7 +349,7 @@ __global__ void hip_flash_attention_varlen_kernel(
     const int k_end = cu_k[b + 1];
     const int Lk    = k_end - k_beg;
     if (Lk <= 0) {
-        for (int d = tid; d < head_dim; d += blockDim.x) {
+        for (int d = d_base + tid; d < d_end; d += blockDim.x) {
             Out[static_cast<size_t>(q_global) * D + head_off + d] = FaScalar<T>::from_f32(0.0f);
         }
         return;
@@ -386,10 +357,13 @@ __global__ void hip_flash_attention_varlen_kernel(
     const int q_local = q_global - q_beg;
 
     const T* q_vec = Q + static_cast<size_t>(q_global) * D + head_off;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        s_q[d] = q_vec[d];
+    if (stage) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            s_q[d] = q_vec[d];
+        }
+        __syncthreads();
     }
-    __syncthreads();
+    const T* q_src = stage ? s_q : q_vec;
 
     float run_max = -1e30f;
     float run_sum = 0.0f;
@@ -397,27 +371,34 @@ __global__ void hip_flash_attention_varlen_kernel(
     #pragma unroll
     for (int i = 0; i < kMaxHdPerThread; ++i) partial[i] = 0.0f;
 
-    for (int k0 = 0; k0 < Lk; k0 += kFaKtile) {
+    for (int k0 = 0; k0 < Lk; k0 += ktile) {
         if (causal && k0 > q_local) break;
-        int klen = (Lk - k0) < kFaKtile ? (Lk - k0) : kFaKtile;
+        int klen = (Lk - k0) < ktile ? (Lk - k0) : ktile;
         if (causal && k0 + klen - 1 > q_local) klen = q_local - k0 + 1;
 
-        // Load K and V tiles into LDS
-        const int tile_elems = klen * head_dim;
-        for (int idx = tid; idx < tile_elems; idx += blockDim.x) {
-            const int t = idx / head_dim;
-            const int d = idx % head_dim;
-            const size_t kg = static_cast<size_t>(k_beg + k0 + t);
-            s_k[idx] = K[kg * D + head_off + d];
-            s_v[idx] = V[kg * D + head_off + d];
+        // Load the K tile (full width) and this chunk's V columns into LDS
+        if (stage) {
+            const int k_elems = klen * head_dim;
+            for (int idx = tid; idx < k_elems; idx += blockDim.x) {
+                const int t = idx / head_dim;
+                const int d = idx % head_dim;
+                s_k[idx] = K[static_cast<size_t>(k_beg + k0 + t) * D + head_off + d];
+            }
+            const int v_elems = klen * vchunk;
+            for (int idx = tid; idx < v_elems; idx += blockDim.x) {
+                const int t = idx / vchunk;
+                const int d = idx % vchunk;
+                s_v[idx] = V[static_cast<size_t>(k_beg + k0 + t) * D + head_off + d_base + d];
+            }
+            __syncthreads();
         }
-        __syncthreads();
 
         for (int t = tid; t < klen; t += blockDim.x) {
             float dot = 0.0f;
-            const T* k_ptr = s_k + t * head_dim;
+            const T* k_ptr = stage ? s_k + t * head_dim
+                                   : K + static_cast<size_t>(k_beg + k0 + t) * D + head_off;
             for (int d = 0; d < head_dim; ++d) {
-                dot += FaScalar<T>::to_f32(s_q[d]) * FaScalar<T>::to_f32(k_ptr[d]);
+                dot += FaScalar<T>::to_f32(q_src[d]) * FaScalar<T>::to_f32(k_ptr[d]);
             }
             scores[t] = dot * inv_sqrt;
         }
@@ -435,6 +416,9 @@ __global__ void hip_flash_attention_varlen_kernel(
         if (warp_id == 0) red[lane] = tile_max;
         __syncthreads();
         tile_max = red[0];
+        // Every warp must have read the max before the sum reduction below
+        // reuses red: a fast warp writing red[warp_id] raced a slow one here.
+        __syncthreads();
 
         const float m_new = fmaxf(tile_max, run_max);
         const bool tile_empty = (m_new <= -1e29f);
@@ -459,11 +443,13 @@ __global__ void hip_flash_attention_varlen_kernel(
         float alpha = (run_max <= -1e29f) ? 0.0f : __expf(run_max - m_new);
 
         int slot = 0;
-        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+        for (int d = d_base + tid; d < d_end; d += blockDim.x, ++slot) {
             if (slot >= kMaxHdPerThread) break;
             float acc = alpha * partial[slot];
             for (int t = 0; t < klen; ++t) {
-                acc += scores[t] * FaScalar<T>::to_f32(s_v[t * head_dim + d]);
+                const T v = stage ? s_v[t * vchunk + (d - d_base)]
+                                  : V[static_cast<size_t>(k_beg + k0 + t) * D + head_off + d];
+                acc += scores[t] * FaScalar<T>::to_f32(v);
             }
             partial[slot] = acc;
         }
@@ -475,148 +461,38 @@ __global__ void hip_flash_attention_varlen_kernel(
 
     const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
     int slot = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+    for (int d = d_base + tid; d < d_end; d += blockDim.x, ++slot) {
         if (slot >= kMaxHdPerThread) break;
         Out[static_cast<size_t>(q_global) * D + head_off + d] = FaScalar<T>::from_f32(partial[slot] * inv);
     }
 }
 
 template <typename T>
-__global__ void transpose_lhd_to_hld_kernel(const T* __restrict__ In,
-                                            T* __restrict__ Out,
-                                            int L, int H, int d) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    const int l = blockIdx.y;
-    const int h = blockIdx.z;
-    if (c < d && l < L && h < H) {
-        Out[(h * L + l) * d + c] = In[(l * H + h) * d + c];
-    }
+void launch_fa_windowed(const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K,
+                        const ::brotensor::Tensor& V, const float* d_mask,
+                        ::brotensor::Tensor& O, int Lq, int Lk, int Dq, int Dkv,
+                        int num_heads, int head_dim, int window, int q_offset,
+                        int group, int causal) {
+    const FaLaunch L = fa_pick_ktile<T>(head_dim, Q.device.index);
+    dim3 grid(Lq, num_heads, fa::fa_hd_chunks(head_dim));
+    hip_flash_attention_kernel<T><<<grid, kFaBlock, L.shmem, cur_stream()>>>(
+        static_cast<const T*>(Q.data), static_cast<const T*>(K.data), static_cast<const T*>(V.data),
+        d_mask, static_cast<T*>(O.data),
+        Lk, Dq, Dkv, head_dim, window, q_offset, group, causal, L.ktile, L.stage);
+    BROTENSOR_HIP_CHECK(hipGetLastError());
 }
 
 template <typename T>
-__global__ void transpose_hld_to_lhd_kernel(const T* __restrict__ In,
-                                            T* __restrict__ Out,
-                                            int L, int H, int d) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    const int l = blockIdx.y;
-    const int h = blockIdx.z;
-    if (c < d && l < L && h < H) {
-        Out[(l * H + h) * d + c] = In[(h * L + l) * d + c];
-    }
-}
-
-bool hip_dense_attention_hipblas(
-    const ::brotensor::Tensor& Q,
-    const ::brotensor::Tensor& K,
-    const ::brotensor::Tensor& V,
-    int num_heads, int head_dim,
-    ::brotensor::Tensor& O) {
-    const int Lq = Q.rows;
-    const int Lk = K.rows;
-    const int H = num_heads;
-    const int d = head_dim;
-    using ::brotensor::Dtype;
-    using ::brotensor::Tensor;
-    const Dtype dt = Q.dtype;
-    hipStream_t stream = cur_stream();
-    hipblasHandle_t handle = hipblas_handle(Q.device.index);
-
-    struct HipDenseAttnScratch {
-        Tensor Qt, Kt, Vt, S, Ot;
-    };
-    static thread_local HipDenseAttnScratch scratch;
-    if (scratch.Qt.device != Q.device) {
-        scratch.Qt = Tensor::empty_on(Q.device, 1, 1, dt);
-        scratch.Kt = Tensor::empty_on(K.device, 1, 1, dt);
-        scratch.Vt = Tensor::empty_on(V.device, 1, 1, dt);
-        scratch.S  = Tensor::empty_on(Q.device, 1, 1, dt);
-        scratch.Ot = Tensor::empty_on(Q.device, 1, 1, dt);
-    }
-    scratch.Qt.resize(H * Lq, d, dt);
-    scratch.Kt.resize(H * Lk, d, dt);
-    scratch.Vt.resize(H * Lk, d, dt);
-    scratch.S.resize(H * Lq, Lk, dt);
-    scratch.Ot.resize(H * Lq, d, dt);
-    Tensor& Qt = scratch.Qt;
-    Tensor& Kt = scratch.Kt;
-    Tensor& Vt = scratch.Vt;
-    Tensor& S  = scratch.S;
-    Tensor& Ot = scratch.Ot;
-
-    dim3 blk(std::min(d, 256));
-    dim3 grid_q((d + blk.x - 1) / blk.x, Lq, H);
-    dim3 grid_k((d + blk.x - 1) / blk.x, Lk, H);
-
-    if (dt == Dtype::FP16) {
-        transpose_lhd_to_hld_kernel<__half><<<grid_q, blk, 0, stream>>>(
-            static_cast<const __half*>(Q.data), static_cast<__half*>(Qt.data), Lq, H, d);
-        transpose_lhd_to_hld_kernel<__half><<<grid_k, blk, 0, stream>>>(
-            static_cast<const __half*>(K.data), static_cast<__half*>(Kt.data), Lk, H, d);
-        transpose_lhd_to_hld_kernel<__half><<<grid_k, blk, 0, stream>>>(
-            static_cast<const __half*>(V.data), static_cast<__half*>(Vt.data), Lk, H, d);
-    } else if (dt == Dtype::BF16) {
-        transpose_lhd_to_hld_kernel<hip_bfloat16><<<grid_q, blk, 0, stream>>>(
-            static_cast<const hip_bfloat16*>(Q.data), static_cast<hip_bfloat16*>(Qt.data), Lq, H, d);
-        transpose_lhd_to_hld_kernel<hip_bfloat16><<<grid_k, blk, 0, stream>>>(
-            static_cast<const hip_bfloat16*>(K.data), static_cast<hip_bfloat16*>(Kt.data), Lk, H, d);
-        transpose_lhd_to_hld_kernel<hip_bfloat16><<<grid_k, blk, 0, stream>>>(
-            static_cast<const hip_bfloat16*>(V.data), static_cast<hip_bfloat16*>(Vt.data), Lk, H, d);
-    } else {
-        transpose_lhd_to_hld_kernel<float><<<grid_q, blk, 0, stream>>>(
-            static_cast<const float*>(Q.data), static_cast<float*>(Qt.data), Lq, H, d);
-        transpose_lhd_to_hld_kernel<float><<<grid_k, blk, 0, stream>>>(
-            static_cast<const float*>(K.data), static_cast<float*>(Kt.data), Lk, H, d);
-        transpose_lhd_to_hld_kernel<float><<<grid_k, blk, 0, stream>>>(
-            static_cast<const float*>(V.data), static_cast<float*>(Vt.data), Lk, H, d);
-    }
-
-    const float alpha_s = 1.0f / std::sqrt(static_cast<float>(d));
-    const float beta_zero = 0.0f;
-    const long long strideQ = static_cast<long long>(Lq) * d;
-    const long long strideK = static_cast<long long>(Lk) * d;
-    const long long strideS = static_cast<long long>(Lq) * Lk;
-
-    hipDataType hip_dt = (dt == Dtype::FP16) ? HIP_R_16F : (dt == Dtype::BF16 ? HIP_R_16BF : HIP_R_32F);
-
-    BROTENSOR_HIPBLAS_CHECK(hipblasGemmStridedBatchedEx(
-        handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
-        Lk, Lq, d,
-        &alpha_s,
-        Kt.data, hip_dt, d, strideK,
-        Qt.data, hip_dt, d, strideQ,
-        &beta_zero,
-        S.data, hip_dt, Lk, strideS,
-        H,
-        HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
-
-    hip_softmax_rows_forward(S, S, H * Lq, Lk);
-
-    const float alpha_one = 1.0f;
-    const long long strideO = static_cast<long long>(Lq) * d;
-
-    BROTENSOR_HIPBLAS_CHECK(hipblasGemmStridedBatchedEx(
-        handle, HIPBLAS_OP_N, HIPBLAS_OP_N,
-        d, Lq, Lk,
-        &alpha_one,
-        Vt.data, hip_dt, d, strideK,
-        S.data, hip_dt, Lk, strideS,
-        &beta_zero,
-        Ot.data, hip_dt, d, strideO,
-        H,
-        HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
-
-    if (dt == Dtype::FP16) {
-        transpose_hld_to_lhd_kernel<__half><<<grid_q, blk, 0, stream>>>(
-            static_cast<const __half*>(Ot.data), static_cast<__half*>(O.data), Lq, H, d);
-    } else if (dt == Dtype::BF16) {
-        transpose_hld_to_lhd_kernel<hip_bfloat16><<<grid_q, blk, 0, stream>>>(
-            static_cast<const hip_bfloat16*>(Ot.data), static_cast<hip_bfloat16*>(O.data), Lq, H, d);
-    } else {
-        transpose_hld_to_lhd_kernel<float><<<grid_q, blk, 0, stream>>>(
-            static_cast<const float*>(Ot.data), static_cast<float*>(O.data), Lq, H, d);
-    }
+void launch_fa_varlen(const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K,
+                      const ::brotensor::Tensor& V, const int32_t* cu_q, const int32_t* cu_k,
+                      ::brotensor::Tensor& O, int total_q, int batch_size, int num_heads,
+                      int D, int head_dim, int causal) {
+    const FaLaunch L = fa_pick_ktile<T>(head_dim, Q.device.index);
+    dim3 grid(total_q, num_heads, fa::fa_hd_chunks(head_dim));
+    hip_flash_attention_varlen_kernel<T><<<grid, kFaBlock, L.shmem, cur_stream()>>>(
+        static_cast<const T*>(Q.data), static_cast<const T*>(K.data), static_cast<const T*>(V.data),
+        cu_q, cu_k, static_cast<T*>(O.data), batch_size, D, head_dim, causal, L.ktile, L.stage);
     BROTENSOR_HIP_CHECK(hipGetLastError());
-    return true;
 }
 
 } // namespace
@@ -653,46 +529,37 @@ void hip_flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
     if ((causal || window > 0) && Lk < Lq) {
         throw std::runtime_error("hip_flash_attention_windowed_forward: causal/windowed requires Lk >= Lq");
     }
-    if ((head_dim + kFaBlock - 1) / kFaBlock > kMaxHdPerThread) {
-        throw std::runtime_error("hip_flash_attention_windowed_forward: head_dim too large");
-    }
     if (O.rows != Lq || O.cols != Dq || O.dtype != dt) {
         O.resize(Lq, Dq, dt);
     }
     if (Lq == 0 || Lk == 0 || Dq == 0) return;
 
     const int group = num_heads / n_kv;
-    if (!causal && window == 0 && d_mask == nullptr && group == 1 && (head_dim > 128 || (Lq >= 64 && Lk >= 64))) {
-        if (hip_dense_attention_hipblas(Q, K, V, num_heads, head_dim, O)) {
-            return;
-        }
+    // Unwindowed bidirectional attention goes through hipBLAS once the
+    // problem is big enough to amortise the GEMM setup, or the head is wide
+    // enough that the scalar kernel's one-thread-per-key Q.K dot dominates
+    // (past kFaHdChunk it would also recompute that dot per column chunk).
+    // Everything else, causal and windowed included, runs the online-softmax
+    // kernel, which takes any head_dim.
+    if (!causal && window <= 0 &&
+        (head_dim > 128 || (Lq >= 64 && Lk >= 64))) {
+        hip_dense_attention(Q, K, V, d_mask, num_heads, n_kv, head_dim, O);
+        return;
     }
 
     const int q_offset  = (causal || window > 0) ? (Lk - Lq) : 0;
     const int causal_i  = causal ? 1 : 0;
-    dim3 grid(Lq, num_heads, 1);
-    hipStream_t stream = cur_stream();
 
     if (dt == Dtype::FP16) {
-        const size_t shmem = calc_fa_shmem<__half>(head_dim);
-        hip_flash_attention_kernel<__half><<<grid, kFaBlock, shmem, stream>>>(
-            static_cast<const __half*>(Q.data), static_cast<const __half*>(K.data), static_cast<const __half*>(V.data),
-            d_mask, static_cast<__half*>(O.data),
-            Lk, Dq, Dkv, head_dim, window, q_offset, group, causal_i);
+        launch_fa_windowed<__half>(Q, K, V, d_mask, O, Lq, Lk, Dq, Dkv, num_heads, head_dim,
+                                   window, q_offset, group, causal_i);
     } else if (dt == Dtype::BF16) {
-        const size_t shmem = calc_fa_shmem<hip_bfloat16>(head_dim);
-        hip_flash_attention_kernel<hip_bfloat16><<<grid, kFaBlock, shmem, stream>>>(
-            static_cast<const hip_bfloat16*>(Q.data), static_cast<const hip_bfloat16*>(K.data), static_cast<const hip_bfloat16*>(V.data),
-            d_mask, static_cast<hip_bfloat16*>(O.data),
-            Lk, Dq, Dkv, head_dim, window, q_offset, group, causal_i);
+        launch_fa_windowed<hip_bfloat16>(Q, K, V, d_mask, O, Lq, Lk, Dq, Dkv, num_heads, head_dim,
+                                         window, q_offset, group, causal_i);
     } else {
-        const size_t shmem = calc_fa_shmem<float>(head_dim);
-        hip_flash_attention_kernel<float><<<grid, kFaBlock, shmem, stream>>>(
-            static_cast<const float*>(Q.data), static_cast<const float*>(K.data), static_cast<const float*>(V.data),
-            d_mask, static_cast<float*>(O.data),
-            Lk, Dq, Dkv, head_dim, window, q_offset, group, causal_i);
+        launch_fa_windowed<float>(Q, K, V, d_mask, O, Lq, Lk, Dq, Dkv, num_heads, head_dim,
+                                  window, q_offset, group, causal_i);
     }
-    BROTENSOR_HIP_CHECK(hipGetLastError());
 }
 
 void hip_flash_attention_forward(const ::brotensor::Tensor& Q,
@@ -747,34 +614,21 @@ void hip_flash_attention_varlen_forward(const ::brotensor::Tensor& Q,
     if (total_q == 0 || batch_size <= 0) return;
 
     if (!causal && batch_size == 1 && total_q >= 64 && K.rows >= 64 && head_dim <= 128) {
-        if (hip_dense_attention_hipblas(Q, K, V, num_heads, head_dim, O)) {
-            return;
-        }
+        hip_dense_attention(Q, K, V, nullptr, num_heads, num_heads, head_dim, O);
+        return;
     }
 
-    dim3 grid(total_q, num_heads, 1);
-    hipStream_t stream = cur_stream();
-
+    const int causal_i = causal ? 1 : 0;
     if (dt == Dtype::FP16) {
-        const size_t shmem = calc_fa_shmem<__half>(head_dim);
-        hip_flash_attention_varlen_kernel<__half><<<grid, kFaBlock, shmem, stream>>>(
-            static_cast<const __half*>(Q.data), static_cast<const __half*>(K.data), static_cast<const __half*>(V.data),
-            cu_seqlens_q, cu_seqlens_k, static_cast<__half*>(O.data),
-            batch_size, D, head_dim, causal ? 1 : 0);
+        launch_fa_varlen<__half>(Q, K, V, cu_seqlens_q, cu_seqlens_k, O, total_q, batch_size,
+                                 num_heads, D, head_dim, causal_i);
     } else if (dt == Dtype::BF16) {
-        const size_t shmem = calc_fa_shmem<hip_bfloat16>(head_dim);
-        hip_flash_attention_varlen_kernel<hip_bfloat16><<<grid, kFaBlock, shmem, stream>>>(
-            static_cast<const hip_bfloat16*>(Q.data), static_cast<const hip_bfloat16*>(K.data), static_cast<const hip_bfloat16*>(V.data),
-            cu_seqlens_q, cu_seqlens_k, static_cast<hip_bfloat16*>(O.data),
-            batch_size, D, head_dim, causal ? 1 : 0);
+        launch_fa_varlen<hip_bfloat16>(Q, K, V, cu_seqlens_q, cu_seqlens_k, O, total_q, batch_size,
+                                       num_heads, D, head_dim, causal_i);
     } else {
-        const size_t shmem = calc_fa_shmem<float>(head_dim);
-        hip_flash_attention_varlen_kernel<float><<<grid, kFaBlock, shmem, stream>>>(
-            static_cast<const float*>(Q.data), static_cast<const float*>(K.data), static_cast<const float*>(V.data),
-            cu_seqlens_q, cu_seqlens_k, static_cast<float*>(O.data),
-            batch_size, D, head_dim, causal ? 1 : 0);
+        launch_fa_varlen<float>(Q, K, V, cu_seqlens_q, cu_seqlens_k, O, total_q, batch_size,
+                                num_heads, D, head_dim, causal_i);
     }
-    BROTENSOR_HIP_CHECK(hipGetLastError());
 }
 
 void hip_flash_attention_project_kv(const ::brotensor::Tensor& ctx,

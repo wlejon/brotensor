@@ -49,8 +49,14 @@ int cuda_device_count();
 int hip_device_count();
 
 // Backends actually registered in this binary at runtime. CPU is always
-// present; CUDA / Metal appear only if their backend was both compiled in
-// and successfully probed by init().
+// present; CUDA / HIP / Metal appear only if their backend was both compiled
+// in and successfully probed by init().
+//
+// Device::CUDA on a HIP-only machine: these two report the hardware truth
+// (is_available(Device::CUDA) is false), while every call below that *acts*
+// on a device — set_default_device, DeviceScope, sync, the memory queries,
+// the tensor factories — takes Device::cuda(i) as Device::hip(i). The rule is
+// written out once, at detail::resolve_device_alias (detail/dispatch.h).
 std::vector<Device> available_devices();
 bool is_available(Device);
 

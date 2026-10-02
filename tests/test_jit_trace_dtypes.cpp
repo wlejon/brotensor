@@ -30,6 +30,11 @@ namespace {
 
 int g_failures = 0;
 
+// Whether the backend under test fuses. CUDA compiles each trace to one PTX
+// kernel; HIP has no trace compiler and replays the DAG op by op, so its
+// "is one launch" checks are skipped and only the numbers are gated.
+bool g_expect_fused = true;
+
 struct SplitMix64 {
     uint64_t s;
     explicit SplitMix64(uint64_t seed) : s(seed) {}
@@ -126,6 +131,7 @@ void check(const std::string& name, const std::vector<float>& got,
 }
 
 void check_true(const std::string& name, bool cond, const std::string& detail) {
+    if (!g_expect_fused && name.find("launch") != std::string::npos) return;
     if (!cond) {
         std::printf("  [FAIL] %s (%s)\n", name.c_str(), detail.c_str());
         ++g_failures;
@@ -526,7 +532,8 @@ void test_scalar_entry_fallback(Device dev) {
 
 void run_suite(Device dev, const char* label) {
     std::printf("\n=== %s ===\n", label);
-    const bool gpu = dev.is_cuda();
+    const bool gpu = !dev.is_cpu();
+    g_expect_fused = !dev.is_hip();
     std::vector<Dtype> dtypes{Dtype::FP32};
     if (gpu) {
         dtypes.push_back(Dtype::BF16);
@@ -545,7 +552,7 @@ void run_suite(Device dev, const char* label) {
         test_narrow_rows(dev, dt);
         test_narrow_layernorm(dev, dt);
     }
-    test_scalar_entry_fallback(dev);
+    if (g_expect_fused) test_scalar_entry_fallback(dev);
 }
 
 }  // namespace
@@ -564,8 +571,11 @@ int main() {
     if (brotensor::is_available(Device::cuda())) {
         brotensor::set_default_device(Device::cuda());
         run_suite(Device::cuda(), "CUDA");
+    } else if (brotensor::is_available(Device::hip())) {
+        brotensor::set_default_device(Device::hip());
+        run_suite(Device::hip(), "HIP (unfused replay)");
     } else {
-        std::printf("[SKIP] no CUDA device; the typed and broadcast paths are CUDA-only.\n");
+        std::printf("[SKIP] no CUDA or HIP device; the typed and broadcast paths are GPU-only.\n");
     }
 
     std::printf("\n================================================================\n");

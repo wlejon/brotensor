@@ -209,6 +209,13 @@ void mul_inplace(Tensor& y, const Tensor& x) {
     v.mul_inplace(y, x);
 }
 
+void div_inplace(Tensor& y, const Tensor& x) {
+    const auto& v = detail::dispatch(y, x);
+    if (!v.div_inplace) detail::throw_not_implemented("div_inplace", y.device);
+    detail::adopt_output(y, y.device);
+    v.div_inplace(y, x);
+}
+
 void modulate(const Tensor& X, const Tensor& scale, const Tensor& shift,
               Tensor& Y) {
     const auto& v = detail::dispatch(X, scale, shift, Y);

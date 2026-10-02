@@ -5,6 +5,13 @@
 #include <hip/hip_bf16.h>
 #include <cstdint>
 
+// The kernels assume Wave32, RDNA's 64 KB workgroup LDS and WMMA matrix
+// cores: RDNA 3+ only (cmake/BrotensorHip.cmake rejects other targets; this
+// catches a build that bypassed it).
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__GFX8__) || defined(__GFX9__) || defined(__GFX10__))
+#error "brotensor HIP kernels need an RDNA 3+ (gfx11xx / gfx12xx) target"
+#endif
+
 // ─── CUDA Runtime Types & Constants Compatibility ──────────────────────────
 
 using cudaStream_t    = hipStream_t;

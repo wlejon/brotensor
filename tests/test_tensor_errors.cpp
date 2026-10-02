@@ -561,9 +561,12 @@ static void test_dispatch_resolution() {
     }, "exceeds the fixed dispatch buffer"));
 
     // adopt_output pins an uncommitted output; a committed one keeps its tag.
+    // A CUDA tag resolves to HIP when only HIP is registered
+    // (detail::resolve_device_alias).
+    const bool cuda_is_hip = !d::is_registered(Device::CUDA) && d::is_registered(Device::HIP);
     Tensor fresh;
     d::adopt_output(fresh, Device::CUDA);
-    CHECK(fresh.device == Device::CUDA);          // tag only — still no storage
+    CHECK(fresh.device == (cuda_is_hip ? Device::HIP : Device::CUDA));   // tag only — still no storage
     CHECK(fresh.data == nullptr);
     d::adopt_output(fresh, Device::CPU);
     CHECK(fresh.device == Device::CPU);

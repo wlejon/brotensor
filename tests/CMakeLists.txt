@@ -15,9 +15,6 @@ function(brotensor_add_executable name)
     if(BROTENSOR_WITH_CUDA)
         target_include_directories(${name} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
-    if(BROTENSOR_WITH_HIP)
-        target_include_directories(${name} PRIVATE /opt/rocm/include)
-    endif()
     if(MSVC)
         target_compile_options(${name} PRIVATE /W4)
     else()
@@ -267,6 +264,12 @@ if(BROTENSOR_HAS_GPU)
     foreach(_name IN LISTS _brotensor_parity_tests)
         brotensor_add_test(brotensor_test_${_name}_parity test_${_name}_parity.cpp)
     endforeach()
+    # Wide-head attention: register-tile / LDS edges up to head_dim 2100.
+    # CUDA and HIP only (Metal's attention kernels carry their own caps).
+    if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_HIP)
+        brotensor_add_test(brotensor_test_flash_attention_head_dim_parity
+                           test_flash_attention_head_dim_parity.cpp)
+    endif()
 
     # Diffusion micro-benchmark. Built but not added to ctest — invoke
     # manually from the build dir (./tests/Release/brotensor_bench_diffusion).
@@ -351,6 +354,12 @@ if(BROTENSOR_HAS_GPU)
     endif()
     if(BROTENSOR_WITH_HIP)
         brotensor_add_test(brotensor_test_ops_fused test_ops_fused.cpp)
+        # No trace compiler on HIP: the typed / broadcast / norm surface runs
+        # through the unfused replay (src/jit/trace_eager.cpp) and is gated on
+        # its numbers. The PTX-specific suites above have nothing to run.
+        if(BROTENSOR_HAS_BRASS_JIT)
+            brotensor_add_test(brotensor_test_jit_trace_dtypes test_jit_trace_dtypes.cpp)
+        endif()
     endif()
     # Graph capture/replay: the CudaGraph API is provided by the CUDA and HIP
     # backends (Metal has none).

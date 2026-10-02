@@ -75,12 +75,35 @@ struct AllocVTable {
 void register_backend(DeviceType dt, const OpsVTable& ops, const AllocVTable& alloc);
 void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc);
 
-// Dispatcher lookups. Throw std::runtime_error if `d` is not currently
-// registered.
+// ─── The Device::CUDA -> HIP alias ─────────────────────────────────────────
+//
+// A HIP build compiles most of the CUDA kernels through a shim, and code
+// written before HIP existed names the GPU `Device::CUDA`. So that such code
+// runs unchanged on an AMD machine, when the HIP backend is registered and
+// the CUDA backend is not, a Device::cuda(i) *naming a place to put or run
+// work* means Device::hip(i). The rule, in full:
+//
+//   * Everything that acts on a device resolves the alias first: the tensor
+//     factories and view() (the tensor comes back tagged HIP), the ops / alloc
+//     tables, dispatch's device activation, sync, set_default_device,
+//     DeviceScope, device_mem_info / device_mem_trim / device_product_name.
+//   * Everything that reports what hardware exists does not: is_available /
+//     is_registered(Device::CUDA) stay false, available_devices() lists HIP
+//     devices only, cuda_device_count() is 0. Code that probes for CUDA
+//     before using it therefore sees the truth and picks its non-CUDA path;
+//     code that just says Device::CUDA gets the GPU that is there.
+//
+// With a CUDA backend registered (or no HIP backend) the alias is the
+// identity. Resolution happens here and nowhere else.
+Device resolve_device_alias(Device d);
+
+// Dispatcher lookups (alias-resolved). Throw std::runtime_error if `d` is not
+// currently registered.
 const OpsVTable&   ops_for(Device d);
 const AllocVTable& alloc_for(Device d);
 
 // True iff `d` has been registered (CPU is always true after static init).
+// Not alias-resolved: see above.
 bool is_registered(Device d);
 
 // ─── Operand-consistency helpers ───────────────────────────────────────────

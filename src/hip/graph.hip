@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <string>
@@ -382,6 +383,11 @@ CudaGraph CudaGraphCapture::finish() {
 
     std::size_t nodes = 0;
     hipError_t err = hipGraphGetNodes(graph, nullptr, &nodes);
+    static const bool log_nodes = [] {
+        const char* e = std::getenv("BROTENSOR_HIP_GRAPH_LOG");
+        return e && *e && *e != '0';
+    }();
+    if (log_nodes) std::fprintf(stderr, "brotensor: captured HIP graph of %zu nodes\n", nodes);
     // Even alone on an idle queue a graph near the queue size can hang (see
     // the launch window): refuse it rather than deadlock on its first launch.
     if (err == hipSuccess && nodes > aql_queue_packets() * 3 / 4) {

@@ -8,6 +8,7 @@
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
+#include "detail/flash_internal.h"
 #include "detail/hip_check.h"
 
 #include <hip/hip_bfloat16.h>
@@ -20,111 +21,17 @@
 
 namespace brotensor::detail::hip {
 
-void* hip_current_stream(int dev = -1);
-
 namespace {
 
-constexpr int kFaBlock = 128;
+using fa::FaScalar;
+using fa::kFaBlock;
+using fa::kFaHdChunk;
+using fa::kMaxHdPerThread;
+using fa::wave32_max;
+using fa::wave32_sum;
+using fa::cur_stream;
+
 constexpr int kFaKtile = 64;
-constexpr int kMaxHdPerThread = 8;
-
-inline hipStream_t cur_stream() {
-    return reinterpret_cast<hipStream_t>(hip_current_stream());
-}
-
-__device__ __forceinline__ float wave32_max(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val = fmaxf(val, __shfl_xor(val, offset, 32));
-    }
-    return val;
-}
-
-__device__ __forceinline__ float wave32_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val += __shfl_xor(val, offset, 32);
-    }
-    return val;
-}
-
-template <typename T> struct FaScalar;
-
-template <> struct FaScalar<float> {
-    __device__ static __forceinline__ float to_f32(float v) { return v; }
-    __device__ static __forceinline__ float from_f32(float v) { return v; }
-    __device__ static __forceinline__ float dot(const float* a, const float* b, int hd) {
-        float acc = 0.0f;
-        int d = 0;
-        if (hd % 4 == 0) {
-            const float4* a4 = reinterpret_cast<const float4*>(a);
-            const float4* b4 = reinterpret_cast<const float4*>(b);
-            const int n4 = hd / 4;
-            for (int i = 0; i < n4; ++i) {
-                float4 va = a4[i];
-                float4 vb = b4[i];
-                acc += va.x * vb.x + va.y * vb.y + va.z * vb.z + va.w * vb.w;
-            }
-            d = n4 * 4;
-        }
-        for (; d < hd; ++d) acc += a[d] * b[d];
-        return acc;
-    }
-};
-
-template <> struct FaScalar<__half> {
-    __device__ static __forceinline__ float to_f32(__half v) { return __half2float(v); }
-    __device__ static __forceinline__ __half from_f32(float v) { return __float2half(v); }
-    __device__ static __forceinline__ float dot(const __half* a, const __half* b, int hd) {
-        float acc = 0.0f;
-        int d = 0;
-        if (hd % 8 == 0) {
-            const uint4* a4 = reinterpret_cast<const uint4*>(a);
-            const uint4* b4 = reinterpret_cast<const uint4*>(b);
-            const int n8 = hd / 8;
-            for (int i = 0; i < n8; ++i) {
-                uint4 ra = a4[i];
-                uint4 rb = b4[i];
-                const __half* ha = reinterpret_cast<const __half*>(&ra);
-                const __half* hb = reinterpret_cast<const __half*>(&rb);
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    acc += __half2float(ha[j]) * __half2float(hb[j]);
-                }
-            }
-            d = n8 * 8;
-        }
-        for (; d < hd; ++d) acc += __half2float(a[d]) * __half2float(b[d]);
-        return acc;
-    }
-};
-
-template <> struct FaScalar<hip_bfloat16> {
-    __device__ static __forceinline__ float to_f32(hip_bfloat16 v) { return float(v); }
-    __device__ static __forceinline__ hip_bfloat16 from_f32(float v) { return hip_bfloat16(v); }
-    __device__ static __forceinline__ float dot(const hip_bfloat16* a, const hip_bfloat16* b, int hd) {
-        float acc = 0.0f;
-        int d = 0;
-        if (hd % 8 == 0) {
-            const uint4* a4 = reinterpret_cast<const uint4*>(a);
-            const uint4* b4 = reinterpret_cast<const uint4*>(b);
-            const int n8 = hd / 8;
-            for (int i = 0; i < n8; ++i) {
-                uint4 ra = a4[i];
-                uint4 rb = b4[i];
-                const hip_bfloat16* ha = reinterpret_cast<const hip_bfloat16*>(&ra);
-                const hip_bfloat16* hb = reinterpret_cast<const hip_bfloat16*>(&rb);
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    acc += float(ha[j]) * float(hb[j]);
-                }
-            }
-            d = n8 * 8;
-        }
-        for (; d < hd; ++d) acc += float(a[d]) * float(b[d]);
-        return acc;
-    }
-};
 
 // ─── Incremental Decode Attention Kernel ─────────────────────────────────────
 
@@ -136,7 +43,7 @@ __global__ void hip_flash_attention_decode_kernel(
         const float* __restrict__ mask,
         T* __restrict__ Out,
         int Lq, int valid_len, int Dq, int Dkv, int head_dim, int seq_offset,
-        float attn_softcap, int window, int group) {
+        float attn_softcap, int window, int group, int pos_from_mask) {
     (void)Lq;
     extern __shared__ float s_smem[];
     float* scores = s_smem;
@@ -144,6 +51,8 @@ __global__ void hip_flash_attention_decode_kernel(
 
     const int q           = blockIdx.x;
     const int h           = blockIdx.y;
+    const int d_base      = blockIdx.z * kFaHdChunk;
+    const int d_end       = min(head_dim, d_base + kFaHdChunk);
     const int tid         = threadIdx.x;
     const int warp_id     = tid >> 5;
     const int lane        = tid & 31;
@@ -154,7 +63,27 @@ __global__ void hip_flash_attention_decode_kernel(
     const int head_off_kv = h_kv * head_dim;
     const float inv_sqrt  = rsqrtf(static_cast<float>(head_dim));
 
-    const int p_q = seq_offset + q;
+    int p_q = seq_offset + q;
+    if (pos_from_mask) {
+        // decode_masked with a window: the query sits at the highest valid key
+        // index of the fixed-capacity cache, not at its end (the CPU / CUDA
+        // contract). Keys past it are masked anyway, so it bounds k_hi too.
+        int local = -1;
+        for (int kg = tid; kg <= p_q; kg += blockDim.x) {
+            if (mask[kg] > 0.5f) local = kg;
+        }
+        float pmax = wave32_max(static_cast<float>(local));
+        if (lane == 0) red[warp_id] = pmax;
+        __syncthreads();
+        pmax = -1.0f;
+        if (tid < num_warps) pmax = red[tid];
+        pmax = wave32_max(pmax);
+        if (warp_id == 0) red[lane] = pmax;
+        __syncthreads();
+        pmax = red[0];
+        __syncthreads();
+        if (pmax >= 0.0f) p_q = static_cast<int>(pmax);
+    }
     const int lo = (window > 0 && p_q - window + 1 > 0) ? (p_q - window + 1) : 0;
     const int k_hi = p_q;
 
@@ -197,6 +126,9 @@ __global__ void hip_flash_attention_decode_kernel(
         if (warp_id == 0) red[lane] = tile_max;
         __syncthreads();
         tile_max = red[0];
+        // Every warp must have read the max before the sum reduction below
+        // reuses red: a fast warp writing red[warp_id] raced a slow one here.
+        __syncthreads();
 
         const float m_new = fmaxf(tile_max, run_max);
         const bool tile_empty = (m_new <= -1e29f);
@@ -221,7 +153,7 @@ __global__ void hip_flash_attention_decode_kernel(
         float alpha = (run_max <= -1e29f) ? 0.0f : __expf(run_max - m_new);
 
         int slot = 0;
-        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+        for (int d = d_base + tid; d < d_end; d += blockDim.x, ++slot) {
             if (slot >= kMaxHdPerThread) break;
             float acc = alpha * partial[slot];
             for (int t = 0; t < klen; ++t) {
@@ -239,7 +171,7 @@ __global__ void hip_flash_attention_decode_kernel(
 
     const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
     int slot = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+    for (int d = d_base + tid; d < d_end; d += blockDim.x, ++slot) {
         if (slot >= kMaxHdPerThread) break;
         Out[static_cast<size_t>(q) * Dq + head_off_q + d] = FaScalar<T>::from_f32(partial[slot] * inv);
     }
@@ -259,6 +191,8 @@ __global__ void hip_flash_attention_packed_qkv_kernel(
 
     const int q_global  = blockIdx.x;
     const int h         = blockIdx.y;
+    const int d_base    = blockIdx.z * kFaHdChunk;
+    const int d_end     = min(head_dim, d_base + kFaHdChunk);
     const int tid       = threadIdx.x;
     const int warp_id   = tid >> 5;
     const int lane      = tid & 31;
@@ -308,6 +242,9 @@ __global__ void hip_flash_attention_packed_qkv_kernel(
         if (warp_id == 0) red[lane] = tile_max;
         __syncthreads();
         tile_max = red[0];
+        // Every warp must have read the max before the sum reduction below
+        // reuses red: a fast warp writing red[warp_id] raced a slow one here.
+        __syncthreads();
 
         const float m_new = fmaxf(tile_max, run_max);
         const bool tile_empty = (m_new <= -1e29f);
@@ -332,7 +269,7 @@ __global__ void hip_flash_attention_packed_qkv_kernel(
         float alpha = (run_max <= -1e29f) ? 0.0f : __expf(run_max - m_new);
 
         int slot = 0;
-        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+        for (int d = d_base + tid; d < d_end; d += blockDim.x, ++slot) {
             if (slot >= kMaxHdPerThread) break;
             float acc = alpha * partial[slot];
             for (int t = 0; t < klen; ++t) {
@@ -349,7 +286,7 @@ __global__ void hip_flash_attention_packed_qkv_kernel(
 
     const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
     int slot = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
+    for (int d = d_base + tid; d < d_end; d += blockDim.x, ++slot) {
         if (slot >= kMaxHdPerThread) break;
         Out[static_cast<size_t>(q_global) * D + head_off_q + d] = FaScalar<T>::from_f32(partial[slot] * inv);
     }
@@ -376,9 +313,6 @@ void hip_flash_attention_packed_qkv_forward(const ::brotensor::Tensor& QKV,
     if (seq_bounds.dtype != Dtype::INT32 || seq_bounds.rows != total_tokens || seq_bounds.cols != 2) {
         throw std::runtime_error("hip_flash_attention_packed_qkv_forward: seq_bounds must be (L, 2) INT32");
     }
-    if (head_dim > kFaBlock * kMaxHdPerThread) {
-        throw std::runtime_error("hip_flash_attention_packed_qkv_forward: head_dim too large");
-    }
     // window is the full band width, matching the CPU/CUDA |q - k| <= window/2.
     const int hw = window > 0 ? window / 2 : -1;
 
@@ -387,7 +321,7 @@ void hip_flash_attention_packed_qkv_forward(const ::brotensor::Tensor& QKV,
     }
     if (total_tokens == 0) return;
 
-    dim3 grid(total_tokens, num_heads, 1);
+    dim3 grid(total_tokens, num_heads, fa::fa_hd_chunks(head_dim));
     const size_t shmem = (static_cast<size_t>(kFaKtile) + kFaBlock) * sizeof(float);
     hipStream_t stream = cur_stream();
 
@@ -432,23 +366,23 @@ void hip_flash_attention_decode(const ::brotensor::Tensor& Q,
     const int seq_offset = valid_len - Lq;
     const size_t shmem = (static_cast<size_t>(kFaKtile) + kFaBlock) * sizeof(float);
     hipStream_t stream = cur_stream();
-    dim3 grid(Lq, num_q_heads, 1);
+    dim3 grid(Lq, num_q_heads, fa::fa_hd_chunks(head_dim));
 
     if (dt == Dtype::FP16) {
         hip_flash_attention_decode_kernel<__half><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const __half*>(Q.data), static_cast<const __half*>(K_cache.data), static_cast<const __half*>(V_cache.data),
             nullptr, static_cast<__half*>(O.data),
-            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
+            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group, 0);
     } else if (dt == Dtype::BF16) {
         hip_flash_attention_decode_kernel<hip_bfloat16><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const hip_bfloat16*>(Q.data), static_cast<const hip_bfloat16*>(K_cache.data), static_cast<const hip_bfloat16*>(V_cache.data),
             nullptr, static_cast<hip_bfloat16*>(O.data),
-            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
+            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group, 0);
     } else {
         hip_flash_attention_decode_kernel<float><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const float*>(Q.data), static_cast<const float*>(K_cache.data), static_cast<const float*>(V_cache.data),
             nullptr, static_cast<float*>(O.data),
-            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
+            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group, 0);
     }
     BROTENSOR_HIP_CHECK(hipGetLastError());
 }
@@ -480,23 +414,26 @@ void hip_flash_attention_decode_masked(const ::brotensor::Tensor& Q,
     const int seq_offset = valid_len - Lq;
     const size_t shmem = (static_cast<size_t>(kFaKtile) + kFaBlock) * sizeof(float);
     hipStream_t stream = cur_stream();
-    dim3 grid(1, num_q_heads, 1);
+    dim3 grid(1, num_q_heads, fa::fa_hd_chunks(head_dim));
 
     if (dt == Dtype::FP16) {
         hip_flash_attention_decode_kernel<__half><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const __half*>(Q.data), static_cast<const __half*>(K_cache.data), static_cast<const __half*>(V_cache.data),
             d_mask, static_cast<__half*>(O.data),
-            1, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
+            1, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group,
+            window > 0 ? 1 : 0);
     } else if (dt == Dtype::BF16) {
         hip_flash_attention_decode_kernel<hip_bfloat16><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const hip_bfloat16*>(Q.data), static_cast<const hip_bfloat16*>(K_cache.data), static_cast<const hip_bfloat16*>(V_cache.data),
             d_mask, static_cast<hip_bfloat16*>(O.data),
-            1, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
+            1, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group,
+            window > 0 ? 1 : 0);
     } else {
         hip_flash_attention_decode_kernel<float><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const float*>(Q.data), static_cast<const float*>(K_cache.data), static_cast<const float*>(V_cache.data),
             d_mask, static_cast<float*>(O.data),
-            1, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
+            1, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group,
+            window > 0 ? 1 : 0);
     }
     BROTENSOR_HIP_CHECK(hipGetLastError());
 }

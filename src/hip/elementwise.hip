@@ -391,6 +391,9 @@ void scale_inplace(Tensor& y, float s) {
 void mul_inplace(Tensor& y, const Tensor& x) {
     launch_binary_inplace(y, x, [] __device__ (float a, float b) { return a * b; });
 }
+void div_inplace(Tensor& y, const Tensor& x) {
+    launch_binary_inplace(y, x, [] __device__ (float a, float b) { return a / b; });
+}
 void clamp(Tensor& y, float lo, float hi) {
     launch_unary_inplace(y, [lo, hi] __device__ (float v) { return fminf(fmaxf(v, lo), hi); });
 }
@@ -576,6 +579,7 @@ void fill_hip_vtable_elementwise(::brotensor::detail::OpsVTable& v) {
     v.add_scalar_inplace       = &add_scalar_inplace;
     v.scale_inplace            = &scale_inplace;
     v.mul_inplace              = &mul_inplace;
+    v.div_inplace              = &div_inplace;
     v.clamp                    = &clamp;
     v.threshold_u8             = &threshold_u8;
     v.cast                     = &cast;

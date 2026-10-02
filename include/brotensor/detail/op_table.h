@@ -45,6 +45,7 @@
     X(scale_inplace,                           void,  (::brotensor::Tensor& y, float s))                                                                                \
     X(clamp,                                   void,  (::brotensor::Tensor& y, float lo, float hi))                                                                     \
     X(mul_inplace,                             void,  (::brotensor::Tensor& y, const ::brotensor::Tensor& x))                                                           \
+    X(div_inplace,                             void,  (::brotensor::Tensor& y, const ::brotensor::Tensor& x))                                                           \
     X(build_slot_mask,                         void,  (const ::brotensor::Tensor& x, int offset, int K, int stride, ::brotensor::Tensor& mask))                         \
     /* ─── Reductions / norm / softmax / attention (training) ─── */                                                                                                    \
     X(softmax_forward,                         void,  (const ::brotensor::Tensor& logits, ::brotensor::Tensor& probs, const float* mask))                               \
