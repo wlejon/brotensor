@@ -29,8 +29,6 @@
 
 #include "bench_helpers.h"
 
-#include <cuda_runtime.h>
-
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -45,6 +43,8 @@ using brotensor::Dtype;
 using brotensor::Tensor;
 
 namespace {
+
+Device g_dev = Device::CPU;
 
 int g_failures = 0;
 
@@ -473,10 +473,12 @@ void bench_softmax_rows(int cols) {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(Device::CUDA)) {
-        std::printf("CUDA not available — skipping elementwise bench\n");
-        return 0;
-    }
+    if (brotensor::is_available(Device::HIP))        g_dev = Device::HIP;
+    else if (brotensor::is_available(Device::CUDA))  g_dev = Device::CUDA;
+    else if (brotensor::is_available(Device::Metal)) g_dev = Device::Metal;
+    else { std::printf("no GPU backend available - skipping\n"); return 0; }
+    brotensor::set_default_device(g_dev);
+
     // Pull the SM clock off its P8 idle floor before any timing.
     bt_bench::spin_up();
     std::printf("brotensor_bench_elementwise  (warmup %.0f ms/op, best of %d)\n",

@@ -30,8 +30,6 @@
 
 #include "bench_helpers.h"
 
-#include <cuda_runtime.h>
-
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -46,6 +44,8 @@ using brotensor::Dtype;
 using brotensor::Tensor;
 
 namespace {
+
+Device g_dev = Device::CPU;
 
 int g_failures = 0;
 
@@ -108,15 +108,13 @@ Tensor make_quant_weight(int out, int in, const Format& fmt, uint32_t seed) {
             put_f16(p, fmt.block_bytes - 2, 0.01f);
         }
     }
-    Tensor W = Tensor::empty_on(Device::CUDA, out, in, fmt.dt);
-    cudaMemcpy(W.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice);
-    return W;
+    return Tensor::from_raw_bytes_on(g_dev, bytes.data(), out, in, fmt.dt, bytes.size());
 }
 
 Tensor upload_fp16(const std::vector<float>& v, int rows, int cols) {
     std::vector<uint16_t> h(v.size());
     for (size_t i = 0; i < v.size(); ++i) h[i] = f16(v[i]);
-    return Tensor::from_host_fp16_on(Device::CUDA, h.data(), rows, cols);
+    return Tensor::from_host_fp16_on(g_dev, h.data(), rows, cols);
 }
 
 std::vector<float> download_fp16(const Tensor& t) {
@@ -267,10 +265,12 @@ void bench_prefill(const char* label, const Format& fmt, int B, int out, int in)
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(Device::CUDA)) {
-        std::printf("CUDA not available — skipping quant matmul bench\n");
-        return 0;
-    }
+    if (brotensor::is_available(Device::HIP))        g_dev = Device::HIP;
+    else if (brotensor::is_available(Device::CUDA))  g_dev = Device::CUDA;
+    else if (brotensor::is_available(Device::Metal)) g_dev = Device::Metal;
+    else { std::printf("no GPU backend available - skipping\n"); return 0; }
+    brotensor::set_default_device(g_dev);
+
     // Pull the SM clock off its P8 idle floor before any timing.
     bt_bench::spin_up();
     std::printf("brotensor_bench_quant_matmul  (warmup %.0f ms/op, best of %d)\n",
