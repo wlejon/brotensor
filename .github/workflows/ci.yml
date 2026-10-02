@@ -67,7 +67,7 @@ jobs:
           - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++ }
           - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++ }
           - { name: windows-msvc, os: windows-2022 }
-          - { name: macos-arm64,  os: macos-14 }
+          - { name: macos-arm64,  os: macos-15 }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -115,12 +115,10 @@ jobs:
   # genuine Metal parity failure fails the job rather than being silently
   # skipped.
   #
-  # Runner must be macos-15, not macos-14: src/metal/runtime.mm builds an
+  # Runner must be macos-15 or newer: src/metal/runtime.mm builds an
   # offset-backed MPSGraphTensorData via -[MPSNDArray initWithBuffer:offset:
   # descriptor:], which is a macOS 15 API. Against the macOS 14 SDK that
-  # selector is not declared and the TU does not compile. The CPU job above
-  # stays on macos-14 (it never touches MPS), so the older OS keeps its arm64
-  # coverage for the portable core.
+  # selector is not declared and the TU does not compile.
   #
   # This is the heaviest job: the Metal backend *and* the full 158-executable
   # test tier, on a small runner (3 vCPU / 7 GB). Hence Ninja + a pinned job
