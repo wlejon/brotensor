@@ -393,7 +393,10 @@ static void test_host_accessor_device_errors() {
     std::printf("test_host_accessor_device_errors\n");
     std::vector<float> backing(4, 0.0f);
     Tensor fake = Tensor::view(Device::CUDA, backing.data(), 2, 2);
-    CHECK(fake.device == Device::CUDA);
+    // view() retags a CUDA request as HIP when only HIP is registered.
+    namespace d = brotensor::detail;
+    const bool cuda_is_hip = !d::is_registered(Device::CUDA) && d::is_registered(Device::HIP);
+    CHECK(fake.device == (cuda_is_hip ? Device::HIP : Device::CUDA));
     CHECK(!fake.is_host());
 
     const Tensor& cfake = fake;
@@ -469,13 +472,20 @@ static void test_dispatch_registration() {
     CHECK(!throws_runtime_error([] { (void)&d::alloc_for(Device::CPU); }));
 
     // An unregistered backend throws on lookup. Skipped when the backend is
-    // actually present (a CUDA/Metal build).
-    if (!d::is_registered(Device::CUDA)) {
+    // actually present (a CUDA/Metal build). An unregistered CUDA is the one
+    // exception: with HIP registered, ops_for/alloc_for(CUDA) alias to HIP's
+    // tables (code that asks for "the CUDA device" runs on ROCm), while
+    // is_registered(CUDA) stays false.
+    if (d::is_registered(Device::CUDA)) {
+        std::printf("  CUDA registered - skipping unregistered-lookup case\n");
+    } else if (d::is_registered(Device::HIP)) {
+        CHECK(&d::ops_for(Device::CUDA) == &d::ops_for(Device::HIP));
+        CHECK(&d::alloc_for(Device::CUDA) == &d::alloc_for(Device::HIP));
+        CHECK(!brotensor::is_available(Device::CUDA));
+    } else {
         CHECK(throws_with([] { (void)&d::ops_for(Device::CUDA); },
                           "not registered"));
         CHECK(throws_runtime_error([] { (void)&d::alloc_for(Device::CUDA); }));
-    } else {
-        std::printf("  CUDA registered - skipping unregistered-lookup case\n");
     }
     if (!d::is_registered(Device::Metal)) {
         CHECK(throws_with([] { (void)&d::ops_for(Device::Metal); },

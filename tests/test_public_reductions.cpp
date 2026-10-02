@@ -14,10 +14,12 @@ using brotensor::Device;
 using brotensor::Dtype;
 using brotensor::Tensor;
 
-// GPU backend selection: prefer CUDA when present, else Metal. Cached after
-// the first call (which must happen after brotensor::init()).
+// GPU backend selection: HIP, CUDA or Metal, whichever is registered; CPU when
+// none is. Cached after the first call (which must happen after
+// brotensor::init()).
 static Device gpu_device() {
     static const Device d = [] {
+        if (brotensor::is_available(Device::HIP))   return Device::HIP;
         if (brotensor::is_available(Device::CUDA))  return Device::CUDA;
         if (brotensor::is_available(Device::Metal)) return Device::Metal;
         return Device::CPU;
@@ -275,8 +277,10 @@ static void test_argmax_rows_bf16() {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(gpu_device())) {
-        std::printf("CUDA not available - skipping\n");
+    // The FP16/BF16 paths are GPU-only; CPU is always available, so test for
+    // the fallback rather than for availability.
+    if (gpu_device() == Device::CPU) {
+        std::printf("no GPU backend available - skipping\n");
         return 0;
     }
     std::printf("test_public_reductions\n");

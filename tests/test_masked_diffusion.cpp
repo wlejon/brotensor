@@ -560,12 +560,13 @@ int main() {
     test_small_grid();
     test_throws();
     test_commit_cpu();
-    const bool cuda = brotensor::is_available(Device::CUDA);
+    // HIP runs the CUDA half through the CUDA -> HIP device alias.
+    const bool cuda = brotensor::is_available(Device::CUDA) || brotensor::is_available(Device::HIP);
     test_top_k_long_row(cuda);
     if (cuda) {
         test_parity();
     } else {
-        std::printf("  skip  CUDA backend not available; CPU-only run\n");
+        std::printf("  skip  no CUDA/HIP backend; CPU-only run\n");
     }
     if (g_failures == 0) {
         std::printf("  OK  all masked_diffusion tests passed\n");

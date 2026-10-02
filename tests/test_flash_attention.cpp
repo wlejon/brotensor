@@ -1463,8 +1463,8 @@ static void run_stress() {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping\n");
+    if (!(brotensor::is_available(brotensor::Device::CUDA) || brotensor::is_available(brotensor::Device::HIP))) {
+        std::printf("no CUDA/HIP backend - skipping\n");
         return 0;
     }
     std::printf("test_flash_attention\n");

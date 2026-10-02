@@ -165,7 +165,10 @@ brotensor_add_test(brotensor_test_tensor_errors test_tensor_errors.cpp)
 
 if(BROTENSOR_WITH_HIP)
     brotensor_add_test(brotensor_test_hip test_hip.cpp)
+    # Needs a golden file generated on NVIDIA (BROTENSOR_CUDA_ROCM_GOLDEN);
+    # exits 77 (skipped) without one.
     brotensor_add_test(brotensor_test_cuda_rocm_parity test_cuda_rocm_parity.cpp)
+    set_tests_properties(brotensor_test_cuda_rocm_parity PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # --- GPU tests (CUDA or Metal) ---

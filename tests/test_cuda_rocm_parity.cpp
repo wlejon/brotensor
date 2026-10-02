@@ -1,6 +1,10 @@
 // Cross-device numerical validation: NVIDIA CUDA (RTX 3060) vs AMD ROCm/HIP (Radeon 8060S gfx1151).
-// Loads reference tensors produced by PyTorch on NVIDIA CUDA (/tmp/cuda_ops_ref_interleaved.safetensors),
-// executes the identical operations on AMD GPU via brotensor (Device::HIP), and asserts strict tolerance.
+// Loads reference tensors produced by PyTorch on NVIDIA CUDA, executes the identical operations on AMD GPU
+// via brotensor (Device::HIP), and asserts strict tolerance.
+//
+// The golden file (cuda_ops_ref_interleaved.safetensors) is generated on an NVIDIA machine and is not in the
+// repo. Its path comes from argv[1], else the BROTENSOR_CUDA_ROCM_GOLDEN environment variable; with neither,
+// or with no HIP device, the test exits kSkip, which ctest reports as skipped (SKIP_RETURN_CODE).
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -84,8 +88,14 @@ Tensor load_tensor(const File& file, const char* name, int rows, int cols) {
 
 } // namespace
 
+constexpr int kSkip = 77;
+
 int main(int argc, char** argv) {
-    const char* path = (argc > 1) ? argv[1] : "/tmp/cuda_ops_ref_interleaved.safetensors";
+    const char* path = (argc > 1) ? argv[1] : std::getenv("BROTENSOR_CUDA_ROCM_GOLDEN");
+    if (path == nullptr || *path == '\0') {
+        std::printf("SKIP: no golden file (pass a path or set BROTENSOR_CUDA_ROCM_GOLDEN)\n");
+        return kSkip;
+    }
     std::printf("=======================================================================\n");
     std::printf("  AMD ROCm/HIP (gfx1151) vs NVIDIA CUDA (RTX 3060) Numerical Parity   \n");
     std::printf("  Loading golden reference tensors from: %s\n", path);
@@ -93,8 +103,8 @@ int main(int argc, char** argv) {
 
     brotensor::init();
     if (!brotensor::is_available(Device::HIP)) {
-        std::printf("ERROR: Device::HIP is not available on this system!\n");
-        return 1;
+        std::printf("SKIP: Device::HIP is not available on this system\n");
+        return kSkip;
     }
 
     File f;

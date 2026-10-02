@@ -1,6 +1,6 @@
 // Smoke test for the unified brotensor::Tensor: lifecycle, host↔device
 // round-trip, clone, a hand-checked op (relu_forward), and FP16
-// host-conversion + round-trip. CUDA-only — guarded out on a CPU-only build
+// host-conversion + round-trip. CUDA/HIP only — skipped on a CPU-only build
 // since the round-trip / op coverage here exercises a GPU backend.
 
 #include <brotensor/ops.h>
@@ -19,6 +19,12 @@ using brotensor::Device;
 using brotensor::Dtype;
 using brotensor::Tensor;
 
+// The GPU under test: CUDA or HIP, whichever is registered.
+static Device gpu() {
+    static const Device d = brotensor::is_available(Device::CUDA) ? Device::CUDA : Device::HIP;
+    return d;
+}
+
 static int g_failures = 0;
 
 #define CHECK(cond) do {                                                    \
@@ -30,19 +36,19 @@ static int g_failures = 0;
 
 static void test_lifecycle() {
     std::printf("test_lifecycle\n");
-    Tensor a = Tensor::zeros_on(Device::CUDA, 4, 8);
+    Tensor a = Tensor::zeros_on(gpu(), 4, 8);
     CHECK(a.rows == 4);
     CHECK(a.cols == 8);
     CHECK(a.size() == 32);
     CHECK(a.data != nullptr);
-    CHECK(a.device == Device::CUDA);
+    CHECK(a.device == gpu());
     a.zero();
 
     a.resize(2, 3);
     CHECK(a.rows == 2);
     CHECK(a.cols == 3);
     CHECK(a.size() == 6);
-    CHECK(a.device == Device::CUDA);  // resize preserves device
+    CHECK(a.device == gpu());  // resize preserves device
 
     // Move ctor / move assign.
     Tensor b = std::move(a);
@@ -51,15 +57,15 @@ static void test_lifecycle() {
     Tensor c;
     c = std::move(b);
     CHECK(c.rows == 2 && c.cols == 3);
-    CHECK(c.device == Device::CUDA);
+    CHECK(c.device == gpu());
 }
 
 static void test_round_trip() {
     std::printf("test_round_trip\n");
     std::vector<float> host_in = {1.0f, -2.5f, 3.25f, 0.0f, 7.0f, -0.125f};
-    Tensor g = Tensor::from_host_on(Device::CUDA, host_in.data(), 2, 3);
+    Tensor g = Tensor::from_host_on(gpu(), host_in.data(), 2, 3);
     CHECK(g.rows == 2 && g.cols == 3);
-    CHECK(g.device == Device::CUDA);
+    CHECK(g.device == gpu());
 
     std::vector<float> host_out = g.to_host_vector();
     CHECK(host_out.size() == host_in.size());
@@ -78,10 +84,10 @@ static void test_round_trip() {
 static void test_clone() {
     std::printf("test_clone\n");
     std::vector<float> host_in = {5.0f, -1.0f, 2.0f, 4.0f};
-    Tensor a = Tensor::from_host_on(Device::CUDA, host_in.data(), 2, 2);
+    Tensor a = Tensor::from_host_on(gpu(), host_in.data(), 2, 2);
     Tensor b = a.clone();
     CHECK(b.rows == 2 && b.cols == 2);
-    CHECK(b.device == Device::CUDA);
+    CHECK(b.device == gpu());
     CHECK(b.data != a.data);
 
     std::vector<float> host_out = b.to_host_vector();
@@ -93,7 +99,7 @@ static void test_clone() {
 static void test_to_migration() {
     std::printf("test_to_migration\n");
     std::vector<float> host_in = {1.5f, -2.0f, 0.0f, 9.0f};
-    Tensor g = Tensor::from_host_on(Device::CUDA, host_in.data(), 2, 2);
+    Tensor g = Tensor::from_host_on(gpu(), host_in.data(), 2, 2);
 
     // Device → host migration.
     Tensor h = g.to(Device::CPU);
@@ -101,18 +107,18 @@ static void test_to_migration() {
     for (int i = 0; i < 4; ++i) CHECK(h.host_f32()[i] == host_in[i]);
 
     // Host → device round-trips back to the same values.
-    Tensor g2 = h.to(Device::CUDA);
-    CHECK(g2.device == Device::CUDA);
+    Tensor g2 = h.to(gpu());
+    CHECK(g2.device == gpu());
     std::vector<float> back = g2.to_host_vector();
     for (int i = 0; i < 4; ++i) CHECK(back[i] == host_in[i]);
 }
 
 static void test_view_non_owning() {
     std::printf("test_view_non_owning\n");
-    Tensor owner = Tensor::zeros_on(Device::CUDA, 3, 3);
+    Tensor owner = Tensor::zeros_on(gpu(), 3, 3);
     owner.zero();
     {
-        Tensor v = Tensor::view(Device::CUDA, owner.data, 3, 3);
+        Tensor v = Tensor::view(gpu(), owner.data, 3, 3);
         CHECK(v.data == owner.data);
         // v goes out of scope here without freeing owner.data.
     }
@@ -124,10 +130,10 @@ static void test_view_non_owning() {
 static void test_relu_smoke() {
     std::printf("test_relu_smoke\n");
     std::vector<float> host_in = {-3.0f, -0.5f, 0.0f, 0.25f, 7.0f};
-    Tensor x = Tensor::from_host_on(Device::CUDA, host_in.data(), 5, 1);
-    Tensor y = Tensor::empty_on(Device::CUDA, 5, 1);
+    Tensor x = Tensor::from_host_on(gpu(), host_in.data(), 5, 1);
+    Tensor y = Tensor::empty_on(gpu(), 5, 1);
     brotensor::relu_forward(x, y);
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(gpu());
 
     std::vector<float> host_out = y.to_host_vector();
     CHECK(host_out[0] == 0.0f);
@@ -166,7 +172,7 @@ static void test_fp16_round_trip() {
     for (int i = 0; i < 6; ++i) {
         host_in[i] = brotensor::fp32_to_fp16_bits(src_f32[i]);
     }
-    Tensor g = Tensor::from_host_fp16_on(Device::CUDA, host_in.data(), 2, 3);
+    Tensor g = Tensor::from_host_fp16_on(gpu(), host_in.data(), 2, 3);
     CHECK(g.rows == 2 && g.cols == 3);
     CHECK(g.dtype == Dtype::FP16);
     CHECK(g.bytes() == 12);
@@ -189,7 +195,7 @@ static void test_fp16_round_trip() {
 
 static void test_fp16_resize_and_zero() {
     std::printf("test_fp16_resize_and_zero\n");
-    Tensor g = Tensor::zeros_on(Device::CUDA, 4, 4, Dtype::FP16);
+    Tensor g = Tensor::zeros_on(gpu(), 4, 4, Dtype::FP16);
     CHECK(g.dtype == Dtype::FP16);
     CHECK(g.bytes() == 32);
     g.zero();
@@ -204,8 +210,8 @@ static void test_fp16_resize_and_zero() {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping\n");
+    if (!(brotensor::is_available(brotensor::Device::CUDA) || brotensor::is_available(brotensor::Device::HIP))) {
+        std::printf("no CUDA/HIP backend - skipping\n");
         return 0;
     }
 

@@ -121,8 +121,8 @@ static void run_case(bool fp16, int batch, bool with_bias, int act) {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping\n");
+    if (!(brotensor::is_available(brotensor::Device::CUDA) || brotensor::is_available(brotensor::Device::HIP))) {
+        std::printf("no CUDA/HIP backend - skipping\n");
         return 0;
     }
     std::printf("test_matmul_abt\n");

@@ -5,16 +5,6 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
-#if defined(BROTENSOR_HAS_CUDA)
-#include <cuda_runtime.h>
-#else
-#include <cstring>
-static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
-    std::memcpy(dst, src, n);
-}
-#define cudaMemcpyHostToDevice 0
-#endif
-
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -156,20 +146,17 @@ static float run_case(const Case& tc) {
     if (tc.need_skip_conv) Wskdeq_g = up_fp16(Wskdeq, C_out, C_in);
 
     // INT8 weight + FP32 scale tensors for the new op.
-    Tensor W1int8_g = Tensor::zeros_on(Device::CUDA, C_out, C_in * 9, Dtype::INT8);
-    Tensor W2int8_g = Tensor::zeros_on(Device::CUDA, C_out, C_out * 9, Dtype::INT8);
-    cudaMemcpy(W1int8_g.data, W1q.data(), W1q.size() * sizeof(int8_t),
-               cudaMemcpyHostToDevice);
-    cudaMemcpy(W2int8_g.data, W2q.data(), W2q.size() * sizeof(int8_t),
-               cudaMemcpyHostToDevice);
+    Tensor W1int8_g = Tensor::from_raw_bytes_on(Device::CUDA, W1q.data(), C_out, C_in * 9,
+                                                Dtype::INT8, W1q.size() * sizeof(int8_t));
+    Tensor W2int8_g = Tensor::from_raw_bytes_on(Device::CUDA, W2q.data(), C_out, C_out * 9,
+                                                Dtype::INT8, W2q.size() * sizeof(int8_t));
     Tensor s1g = Tensor::from_host_on(Device::CUDA, s1v.data(), C_out, 1);
     Tensor s2g = Tensor::from_host_on(Device::CUDA, s2v.data(), C_out, 1);
 
     Tensor Wskint8_g, sskg;
     if (tc.need_skip_conv) {
-        Wskint8_g = Tensor::zeros_on(Device::CUDA, C_out, C_in, Dtype::INT8);
-        cudaMemcpy(Wskint8_g.data, Wskq.data(), Wskq.size() * sizeof(int8_t),
-                   cudaMemcpyHostToDevice);
+        Wskint8_g = Tensor::from_raw_bytes_on(Device::CUDA, Wskq.data(), C_out, C_in,
+                                              Dtype::INT8, Wskq.size() * sizeof(int8_t));
         sskg = Tensor::from_host_on(Device::CUDA, sskv.data(), C_out, 1);
     }
 
@@ -224,8 +211,8 @@ static float run_case(const Case& tc) {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping\n");
+    if (!(brotensor::is_available(brotensor::Device::CUDA) || brotensor::is_available(brotensor::Device::HIP))) {
+        std::printf("no CUDA/HIP backend - skipping\n");
         return 0;
     }
     std::printf("test_resblock_int8w\n");

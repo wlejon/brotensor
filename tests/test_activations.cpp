@@ -1,6 +1,6 @@
 // Activation-op coverage for silu / gelu / quick_gelu / gelu_exact
-// (forward + backward, FP32 + FP16). Each op is run on CUDA-resident tensors
-// and checked against a host reference. CUDA-only — guarded out on a
+// (forward + backward, FP32 + FP16). Each op is run on GPU-resident tensors
+// and checked against a host reference. CUDA/HIP only — skipped on a
 // CPU-only build since the FP16 paths live on the GPU backend.
 
 #include <brotensor/ops.h>
@@ -17,6 +17,12 @@
 using brotensor::Device;
 using brotensor::Dtype;
 using brotensor::Tensor;
+
+// The GPU under test: CUDA or HIP, whichever is registered.
+static Device gpu() {
+    static const Device d = brotensor::is_available(Device::CUDA) ? Device::CUDA : Device::HIP;
+    return d;
+}
 
 static int g_failures = 0;
 
@@ -71,13 +77,13 @@ static void test_bwd_fp32(BwdOp op, float (*grad_ref)(float), const char* name) 
     std::vector<float> hx(N), hdy(N);
     for (int i = 0; i < N; ++i) { hx[i] = dist(rng); hdy[i] = dydist(rng); }
 
-    Tensor x  = Tensor::from_host_on(Device::CUDA, hx.data(),  N, 1);
-    Tensor dY = Tensor::from_host_on(Device::CUDA, hdy.data(), N, 1);
-    Tensor dX = Tensor::empty_on(Device::CUDA, N, 1);
+    Tensor x  = Tensor::from_host_on(gpu(), hx.data(),  N, 1);
+    Tensor dY = Tensor::from_host_on(gpu(), hdy.data(), N, 1);
+    Tensor dX = Tensor::empty_on(gpu(), N, 1);
     op(x, dY, dX);
     CHECK(dX.rows == N && dX.cols == 1 && dX.dtype == Dtype::FP32);
 
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(gpu());
     std::vector<float> got = dX.to_host_vector();
 
     int bad = 0;
@@ -106,13 +112,13 @@ static void test_bwd_fp16(BwdOp op, float (*grad_ref)(float), const char* name) 
         hx_h[i]  = brotensor::fp32_to_fp16_bits(hx_f[i]);
         hdy_h[i] = brotensor::fp32_to_fp16_bits(hdy_f[i]);
     }
-    Tensor x  = Tensor::from_host_fp16_on(Device::CUDA, hx_h.data(),  N, 1);
-    Tensor dY = Tensor::from_host_fp16_on(Device::CUDA, hdy_h.data(), N, 1);
-    Tensor dX = Tensor::empty_on(Device::CUDA, N, 1, Dtype::FP16);
+    Tensor x  = Tensor::from_host_fp16_on(gpu(), hx_h.data(),  N, 1);
+    Tensor dY = Tensor::from_host_fp16_on(gpu(), hdy_h.data(), N, 1);
+    Tensor dX = Tensor::empty_on(gpu(), N, 1, Dtype::FP16);
     op(x, dY, dX);
     CHECK(dX.rows == N && dX.cols == 1 && dX.dtype == Dtype::FP16);
 
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(gpu());
     std::vector<uint16_t> got_h = dX.to_host_vector_fp16();
 
     int bad = 0;
@@ -138,12 +144,12 @@ static void test_fp32(FwdOp op, float (*ref)(float), const char* name) {
     std::vector<float> host(N);
     for (auto& v : host) v = dist(rng);
 
-    Tensor x = Tensor::from_host_on(Device::CUDA, host.data(), N, 1);
-    Tensor y = Tensor::empty_on(Device::CUDA, N, 1);
+    Tensor x = Tensor::from_host_on(gpu(), host.data(), N, 1);
+    Tensor y = Tensor::empty_on(gpu(), N, 1);
     op(x, y);
     CHECK(y.rows == N && y.cols == 1 && y.dtype == Dtype::FP32);
 
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(gpu());
     std::vector<float> got = y.to_host_vector();
 
     int bad = 0;
@@ -169,12 +175,12 @@ static void test_fp16(FwdOp op, float (*ref)(float), const char* name) {
         host_f[i] = dist(rng);
         host_h[i] = brotensor::fp32_to_fp16_bits(host_f[i]);
     }
-    Tensor x = Tensor::from_host_fp16_on(Device::CUDA, host_h.data(), N, 1);
-    Tensor y = Tensor::empty_on(Device::CUDA, N, 1, Dtype::FP16);
+    Tensor x = Tensor::from_host_fp16_on(gpu(), host_h.data(), N, 1);
+    Tensor y = Tensor::empty_on(gpu(), N, 1, Dtype::FP16);
     op(x, y);
     CHECK(y.rows == N && y.cols == 1 && y.dtype == Dtype::FP16);
 
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(gpu());
     std::vector<uint16_t> got_h = y.to_host_vector_fp16();
 
     int bad = 0;
@@ -193,8 +199,8 @@ static void test_fp16(FwdOp op, float (*ref)(float), const char* name) {
 
 int main() {
     brotensor::init();
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping\n");
+    if (!(brotensor::is_available(brotensor::Device::CUDA) || brotensor::is_available(brotensor::Device::HIP))) {
+        std::printf("no CUDA/HIP backend - skipping\n");
         return 0;
     }
     std::printf("test_activations\n");

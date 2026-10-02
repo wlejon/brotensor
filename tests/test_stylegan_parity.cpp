@@ -41,9 +41,10 @@ static std::vector<float> rnd(int n, uint64_t seed, float lo, float hi) {
     return v;
 }
 
-// GPU backend this binary was built with: CUDA when present, else Metal.
+// GPU backend this binary was built with: CUDA, HIP or Metal.
 static Device gdev() {
     if (brotensor::is_available(Device::CUDA))  return Device::CUDA;
+    if (brotensor::is_available(Device::HIP))   return Device::HIP;
     if (brotensor::is_available(Device::Metal)) return Device::Metal;
     return Device::CPU;
 }
