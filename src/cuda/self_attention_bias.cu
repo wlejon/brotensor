@@ -22,6 +22,18 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#include <hipblas/hipblas.h>
+#include "detail/hipblas_handle.h"
+#define BROTENSOR_HIPBLAS_CHECK(expr)                                                 \
+    do {                                                                              \
+        hipblasStatus_t _stat = (expr);                                               \
+        if (_stat != HIPBLAS_STATUS_SUCCESS) {                                        \
+            throw std::runtime_error(std::string("hipblas error in ") + #expr);       \
+        }                                                                             \
+    } while (0)
+#endif
+
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -367,10 +379,55 @@ __global__ void sardp_gemm_f32_kernel(const float* __restrict__ A,
 // Strided-batched C_b = A_b @ B_b^T (+ shared per-N bias), FP32 accumulation,
 // dispatched per dtype: FP32 takes the register-tiled kernel above, FP16/BF16
 // the shared WMMA tensor-core matmul.
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+__global__ void sardp_bias_add_f32_kernel(float* __restrict__ C,
+                                          const float* __restrict__ bias,
+                                          int M, int N, size_t sC, int batch) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = blockIdx.z;
+    if (m < M && n < N && b < batch) {
+        C[static_cast<size_t>(b) * sC + static_cast<size_t>(m) * N + n] += bias[n];
+    }
+}
+#endif
+
 inline void sardp_gemm(const float* A, const float* B, float* C,
                        int batch, int M, int N, int K,
                        size_t sA, size_t sB, size_t sC, const float* bias) {
     if (batch == 0 || M == 0 || N == 0) return;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+    hipblasHandle_t handle = ::brotensor::detail::hip::hipblas_handle();
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    if (batch == 1) {
+        BROTENSOR_HIPBLAS_CHECK(hipblasSgemm(
+            handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, K,
+            A, K,
+            &beta,
+            C, N));
+    } else {
+        BROTENSOR_HIPBLAS_CHECK(hipblasSgemmStridedBatched(
+            handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            B, K, static_cast<long long>(sB),
+            A, K, static_cast<long long>(sA),
+            &beta,
+            C, N, static_cast<long long>(sC),
+            batch));
+    }
+    if (bias) {
+        dim3 block(16, 16);
+        dim3 grid((N + 15) / 16, (M + 15) / 16, batch);
+        sardp_bias_add_f32_kernel<<<grid, block, 0, cur_stream()>>>(
+            C, bias, M, N, sC, batch);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
+#else
     constexpr int kMaxZ = 65535;  // grid.z cap
     const dim3 block(16, 16);
     for (int b0 = 0; b0 < batch; b0 += kMaxZ) {
@@ -383,6 +440,7 @@ inline void sardp_gemm(const float* A, const float* B, float* C,
             M, N, K, sA, sB, sC, bias);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
+#endif
 }
 inline void sardp_gemm(const __half* A, const __half* B, __half* C,
                        int batch, int M, int N, int K,

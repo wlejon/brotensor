@@ -86,8 +86,11 @@ void* hip_alloc(std::size_t bytes, int dev) {
     int prior = 0;
     (void)hipGetDevice(&prior);
     if (prior != dev) (void)hipSetDevice(dev);
-    if (async_pool_ready_for(dev)) {
-        auto s = reinterpret_cast<hipStream_t>(::brotensor::hip_current_stream(dev));
+    auto s = reinterpret_cast<hipStream_t>(::brotensor::hip_current_stream(dev));
+    hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+    (void)hipStreamIsCapturing(s, &cs);
+    const bool capturing = (cs != hipStreamCaptureStatusNone);
+    if (async_pool_ready_for(dev) || capturing) {
         BROTENSOR_HIP_CHECK(hipMallocAsync(&p, bytes, s));
     } else {
         BROTENSOR_HIP_CHECK(hipMalloc(&p, bytes));
@@ -106,12 +109,13 @@ void hip_free(void* ptr, int dev) {
     int prior = 0;
     (void)hipGetDevice(&prior);
     if (prior != dev) (void)hipSetDevice(dev);
-    if (async_pool_ready_for(dev)) {
-        auto s = reinterpret_cast<hipStream_t>(::brotensor::hip_current_stream(dev));
+    auto s = reinterpret_cast<hipStream_t>(::brotensor::hip_current_stream(dev));
+    hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+    (void)hipStreamIsCapturing(s, &cs);
+    const bool capturing = (cs != hipStreamCaptureStatusNone);
+    if (async_pool_ready_for(dev) || capturing) {
         hipError_t err = hipFreeAsync(ptr, s);
         if (err != hipSuccess) {
-            hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
-            (void)hipStreamIsCapturing(s, &cs);
             if (cs != hipStreamCaptureStatusNone) {
                 std::fprintf(stderr,
                     "brotensor: WARNING: hipFreeAsync(%p) failed (err=%d) on dev %d during stream capture\n",

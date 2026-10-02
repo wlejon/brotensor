@@ -292,7 +292,9 @@ template <typename Op>
 void launch_binary_inplace(Tensor& y, const Tensor& x, Op op) {
     using ::brotensor::Dtype;
     if (y.dtype != x.dtype) throw std::runtime_error("binary elementwise: dtype mismatch");
-    if (y.size() != x.size()) throw std::runtime_error("binary elementwise: size mismatch");
+    if (y.size() != x.size()) {
+        throw std::runtime_error("binary elementwise: size mismatch y=(" + std::to_string(y.rows) + "," + std::to_string(y.cols) + ") x=(" + std::to_string(x.rows) + "," + std::to_string(x.cols) + ")");
+    }
     const long long n = y.size();
     if (n == 0) return;
     const int grid = grid_for(n);
