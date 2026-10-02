@@ -39,14 +39,16 @@ float ref_act(int act, float v) {
 }
 
 // One case: FP16 matmul_abt on the GPU backend vs a double-accum CPU reference
-// computed from the fp16-rounded operands.
+// computed from the fp16-rounded operands. shared_b passes strideB = 0: one
+// (N, K) B slice broadcast across the batch (shared weights).
 void run(int batch, int M, int N, int K, bool with_bias, int act,
-         const char* tag) {
+         const char* tag, bool shared_b = false) {
+    const int b_slices = shared_b ? 1 : batch;
     SplitMix64 rng(0x9111u + batch * 31 + M * 7 + N * 5 + K * 3 + act * 13 +
                    (with_bias ? 1 : 0));
 
     Tensor A = Tensor::zeros_on(Device::CPU, batch * M, K, Dtype::FP32);
-    Tensor B = Tensor::zeros_on(Device::CPU, batch * N, K, Dtype::FP32);
+    Tensor B = Tensor::zeros_on(Device::CPU, b_slices * N, K, Dtype::FP32);
     Tensor bias = Tensor::zeros_on(Device::CPU, 1, N, Dtype::FP32);
     fill_random(A, rng, 0.5f);
     fill_random(B, rng, 0.5f);
@@ -68,7 +70,7 @@ void run(int batch, int M, int N, int K, bool with_bias, int act,
                 double s = 0.0;
                 for (int k = 0; k < K; ++k)
                     s += static_cast<double>(pA[(static_cast<size_t>(b) * M + m) * K + k]) *
-                         static_cast<double>(pB[(static_cast<size_t>(b) * N + n) * K + k]);
+                         static_cast<double>(pB[(static_cast<size_t>(shared_b ? 0 : b) * N + n) * K + k]);
                 float v = static_cast<float>(s);
                 if (with_bias) v += pBias[n];
                 v = ref_act(act, v);
@@ -82,7 +84,7 @@ void run(int batch, int M, int N, int K, bool with_bias, int act,
 
     brotensor::matmul_abt(Ag, Bg, Cg, batch, M, N, K,
                           static_cast<long long>(M) * K,
-                          static_cast<long long>(N) * K,
+                          shared_b ? 0LL : static_cast<long long>(N) * K,
                           static_cast<long long>(M) * N,
                           with_bias ? &biasg : nullptr, act);
 
@@ -114,6 +116,13 @@ BT_PARITY_TEST(matmul_abt_tiled_masked) {
     run(1, 96, 96, 48, true, 4, "tiled masked K48 silu");    // K % 32 == 16
     run(1, 200, 16, 32, false, 0, "tiled tall skinny N16");  // N < BN, masked
     run(1, 128, 130, 64, true, 3, "tiled masked N130 gelu-erf");
+}
+
+// strideB = 0: every batch slice multiplies the same B.
+BT_PARITY_TEST(matmul_abt_shared_b) {
+    run(2, 2, 2, 2, true, 0, "shared B tiny b2 bias", true);
+    run(3, 20, 12, 24, false, 0, "shared B small b3", true);
+    run(2, 50, 70, 40, true, 1, "shared B tiled masked b2 bias relu", true);
 }
 
 int main() { return bt_parity::run_all("test_matmul_abt_parity"); }

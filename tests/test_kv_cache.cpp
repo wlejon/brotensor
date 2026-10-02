@@ -1,6 +1,7 @@
 // Tests for kv_cache_append + flash_attention_decode.
 // Decode is checked against the causal flash_attention_forward.
-// CUDA-only — guarded out on a CPU-only build.
+// The GPU half runs on HIP or CUDA, whichever is registered (FP16 decode is
+// GPU-only); it is skipped on a CPU-only build.
 
 #include <brotensor/ops.h>
 #include <brotensor/runtime.h>
@@ -15,6 +16,14 @@
 using brotensor::Device;
 using brotensor::Dtype;
 using brotensor::Tensor;
+
+// GPU device for the FP16 half: HIP or CUDA, CPU when neither is registered.
+static Device gpu() {
+    static const Device d = brotensor::is_available(Device::HIP)    ? Device::HIP
+                            : brotensor::is_available(Device::CUDA) ? Device::CUDA
+                                                                    : Device::CPU;
+    return d;
+}
 
 static int g_failures = 0;
 #define CHECK(cond) do {                                                    \
@@ -271,8 +280,8 @@ static void test_append() {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
     // Pre-fill caches with zeros.
-    Tensor Kc = Tensor::zeros_on(Device::CUDA, L_max, D, Dtype::FP16);
-    Tensor Vc = Tensor::zeros_on(Device::CUDA, L_max, D, Dtype::FP16);
+    Tensor Kc = Tensor::zeros_on(gpu(), L_max, D, Dtype::FP16);
+    Tensor Vc = Tensor::zeros_on(gpu(), L_max, D, Dtype::FP16);
 
     // Append two chunks: 3 rows then 2 rows.
     std::vector<float> K1f(3 * D), V1f(3 * D), K2f(2 * D), V2f(2 * D);
@@ -283,14 +292,14 @@ static void test_append() {
 
     auto K1h = to_fp16(K1f), V1h = to_fp16(V1f);
     auto K2h = to_fp16(K2f), V2h = to_fp16(V2f);
-    Tensor K1 = Tensor::from_host_fp16_on(Device::CUDA, K1h.data(), 3, D);
-    Tensor V1 = Tensor::from_host_fp16_on(Device::CUDA, V1h.data(), 3, D);
-    Tensor K2 = Tensor::from_host_fp16_on(Device::CUDA, K2h.data(), 2, D);
-    Tensor V2 = Tensor::from_host_fp16_on(Device::CUDA, V2h.data(), 2, D);
+    Tensor K1 = Tensor::from_host_fp16_on(gpu(), K1h.data(), 3, D);
+    Tensor V1 = Tensor::from_host_fp16_on(gpu(), V1h.data(), 3, D);
+    Tensor K2 = Tensor::from_host_fp16_on(gpu(), K2h.data(), 2, D);
+    Tensor V2 = Tensor::from_host_fp16_on(gpu(), V2h.data(), 2, D);
 
     brotensor::kv_cache_append(K1, V1, 0, Kc, Vc);
     brotensor::kv_cache_append(K2, V2, 3, Kc, Vc);
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(gpu());
 
     std::vector<uint16_t> gotK = Kc.to_host_vector_fp16();
     std::vector<uint16_t> gotV = Vc.to_host_vector_fp16();
@@ -329,29 +338,29 @@ static void test_decode_vs_causal_forward() {
     auto Qh = to_fp16(Qf), Kh = to_fp16(Kf), Vh = to_fp16(Vf);
 
     // Reference: causal full-sequence forward.
-    Tensor Qg = Tensor::from_host_fp16_on(Device::CUDA, Qh.data(), L_total, D);
-    Tensor Kg = Tensor::from_host_fp16_on(Device::CUDA, Kh.data(), L_total, D);
-    Tensor Vg = Tensor::from_host_fp16_on(Device::CUDA, Vh.data(), L_total, D);
-    Tensor Oref = Tensor::empty_on(Device::CUDA, L_total, D, Dtype::FP16);
+    Tensor Qg = Tensor::from_host_fp16_on(gpu(), Qh.data(), L_total, D);
+    Tensor Kg = Tensor::from_host_fp16_on(gpu(), Kh.data(), L_total, D);
+    Tensor Vg = Tensor::from_host_fp16_on(gpu(), Vh.data(), L_total, D);
+    Tensor Oref = Tensor::empty_on(gpu(), L_total, D, Dtype::FP16);
     brotensor::flash_attention_forward(Qg, Kg, Vg, nullptr, nh,
                                        /*causal=*/true, Oref);
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(gpu());
     std::vector<uint16_t> ref_h = Oref.to_host_vector_fp16();
 
     // Decode: fill K/V caches with all L_total rows, query is the last Lq=3
     // rows of Q. valid_len = L_total. seq_offset = L_total - Lq.
     const int Lq = 3;
-    Tensor Kc = Tensor::zeros_on(Device::CUDA, L_max, D, Dtype::FP16);
-    Tensor Vc = Tensor::zeros_on(Device::CUDA, L_max, D, Dtype::FP16);
+    Tensor Kc = Tensor::zeros_on(gpu(), L_max, D, Dtype::FP16);
+    Tensor Vc = Tensor::zeros_on(gpu(), L_max, D, Dtype::FP16);
     brotensor::kv_cache_append(Kg, Vg, 0, Kc, Vc);
 
     // Take the last Lq rows of Q via copy_d2d.
-    Tensor Qtail = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
+    Tensor Qtail = Tensor::empty_on(gpu(), Lq, D, Dtype::FP16);
     brotensor::copy_d2d(Qg, (L_total - Lq) * D, Qtail, 0, Lq * D);
 
-    Tensor Odec = Tensor::empty_on(Device::CUDA, Lq, D, Dtype::FP16);
+    Tensor Odec = Tensor::empty_on(gpu(), Lq, D, Dtype::FP16);
     brotensor::flash_attention_decode(Qtail, Kc, Vc, L_total, nh, Odec);
-    brotensor::sync(Device::CUDA);
+    brotensor::sync(gpu());
     std::vector<uint16_t> dec_h = Odec.to_host_vector_fp16();
 
     // Compare against the last Lq*D entries of ref_h.
@@ -392,16 +401,16 @@ static void test_gpu_softcap_window() {
                       int Dq, int Dkv, int nq, int nkv, int cap,
                       float softcap, int window) {
         auto Qh = to_fp16(Qf), Kh = to_fp16(Kf), Vh = to_fp16(Vf);
-        Tensor Q  = Tensor::from_host_fp16_on(Device::CUDA, Qh.data(), Lq, Dq);
-        Tensor Kf16 = Tensor::from_host_fp16_on(Device::CUDA, Kh.data(), valid_len, Dkv);
-        Tensor Vf16 = Tensor::from_host_fp16_on(Device::CUDA, Vh.data(), valid_len, Dkv);
-        Tensor Kc = Tensor::zeros_on(Device::CUDA, cap, Dkv, Dtype::FP16);
-        Tensor Vc = Tensor::zeros_on(Device::CUDA, cap, Dkv, Dtype::FP16);
+        Tensor Q  = Tensor::from_host_fp16_on(gpu(), Qh.data(), Lq, Dq);
+        Tensor Kf16 = Tensor::from_host_fp16_on(gpu(), Kh.data(), valid_len, Dkv);
+        Tensor Vf16 = Tensor::from_host_fp16_on(gpu(), Vh.data(), valid_len, Dkv);
+        Tensor Kc = Tensor::zeros_on(gpu(), cap, Dkv, Dtype::FP16);
+        Tensor Vc = Tensor::zeros_on(gpu(), cap, Dkv, Dtype::FP16);
         brotensor::kv_cache_append(Kf16, Vf16, 0, Kc, Vc);
-        Tensor O = Tensor::empty_on(Device::CUDA, Lq, Dq, Dtype::FP16);
+        Tensor O = Tensor::empty_on(gpu(), Lq, Dq, Dtype::FP16);
         brotensor::flash_attention_decode(Q, Kc, Vc, valid_len, nq, nkv, O,
                                           softcap, window);
-        brotensor::sync(Device::CUDA);
+        brotensor::sync(gpu());
         auto oh = O.to_host_vector_fp16();
         std::vector<float> out(static_cast<std::size_t>(Lq) * Dq);
         for (std::size_t i = 0; i < out.size(); ++i)
@@ -492,8 +501,8 @@ int main() {
     test_cpu_softcap_window();
     test_cpu_masked_softcap_window();
 
-    if (!brotensor::is_available(brotensor::Device::CUDA)) {
-        std::printf("CUDA not available - skipping GPU decode tests\n");
+    if (gpu() == Device::CPU) {
+        std::printf("no CUDA/HIP backend - skipping GPU decode tests\n");
         std::printf("%s (%d failures)\n",
                     cpu_failures ? "FAILED" : "OK", cpu_failures);
         return cpu_failures ? 1 : 0;

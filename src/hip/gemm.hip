@@ -29,6 +29,12 @@
         }                                                                              \
     } while (0)
 
+namespace brotensor::detail::cuda {
+// src/cuda/batched_ops.cu (compiled as HIP through the compat shim).
+void linear_forward_batched(const ::brotensor::Tensor& W, const ::brotensor::Tensor& bias,
+                            const ::brotensor::Tensor& X_BD, ::brotensor::Tensor& Y_BD);
+} // namespace brotensor::detail::cuda
+
 namespace brotensor::detail::hip {
 
 void* hip_current_stream(int dev = -1);
@@ -182,11 +188,10 @@ void hip_matmul_abt(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
     }
     if (batch <= 0 || M == 0 || N == 0) return;
 
-    if (strideA == 0) strideA = static_cast<long long>(M) * K;
-    if (strideB == 0) strideB = static_cast<long long>(N) * K;
-    if (strideC == 0) strideC = static_cast<long long>(M) * N;
-
-    if (C.dtype != A.dtype || C.rows * C.cols < static_cast<long long>(batch) * strideC) {
+    // Strides are taken literally, as on CPU/CUDA: a zero stride broadcasts
+    // that operand's single slice across the batch (shared weights).
+    const long long c_extent = static_cast<long long>(batch - 1) * strideC + static_cast<long long>(M) * N;
+    if (C.dtype != A.dtype || C.rows * C.cols < c_extent) {
         if (C.rows != (batch > 1 ? batch * M : M) || C.cols != N || C.dtype != A.dtype) {
             C.resize(batch > 1 ? batch * M : M, N, A.dtype);
         }
@@ -470,11 +475,6 @@ void hip_linear_forward_batched_fp16(const ::brotensor::Tensor& W,
     hip_linear_forward_batched_fp16_act(W, bias, X_BD, 0, Y_BD);
 }
 
-__global__ void fp32_to_fp16_kernel(const float* __restrict__ src, __half* __restrict__ dst, long long n) {
-    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = __float2half(src[idx]);
-}
-
 template <typename T>
 __global__ void hip_linear_ex_epilogue_kernel(
     const T* __restrict__ r,
@@ -520,37 +520,19 @@ void hip_linear_forward_batched(const ::brotensor::Tensor& W,
         hip_matmul_abt(X_BD, W, Y_BD, 1, B, out_dim, in_dim, 0, 0, 0, bp, 0);
         return;
     }
-    // Mixed precision: FP32 X, FP16 W -> FP32 Y
-    if (X_BD.dtype == Dtype::FP32 && W.dtype == Dtype::FP16) {
-        if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP32) {
-            Y_BD.resize(B, out_dim, Dtype::FP32);
-        }
-        hipStream_t stream = reinterpret_cast<hipStream_t>(hip_current_stream(W.device.index));
-        hipblasHandle_t handle = hipblas_handle(W.device.index);
-
-        ::brotensor::Tensor X_16 = ::brotensor::Tensor::empty_on(X_BD.device, B, in_dim, Dtype::FP16);
-        const long long total_x = static_cast<long long>(B) * in_dim;
-        const int threads = 256;
-        const unsigned blocks = static_cast<unsigned>((total_x + threads - 1) / threads);
-        fp32_to_fp16_kernel<<<blocks, threads, 0, stream>>>(
-            reinterpret_cast<const float*>(X_BD.data),
-            reinterpret_cast<__half*>(X_16.data),
-            total_x);
-
-        const float alpha = 1.0f, beta = 0.0f;
-        BROTENSOR_HIPBLAS_CHECK(hipblasGemmEx(
-            handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
-            out_dim, B, in_dim,
-            &alpha,
-            W.data, HIP_R_16F, in_dim,
-            X_16.data, HIP_R_16F, in_dim,
-            &beta,
-            Y_BD.data, HIP_R_32F, out_dim,
-            HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+    // 16-bit W, FP32 X/bias/Y: the contract widens W to FP32 and accumulates
+    // in FP32 against the unrounded activations. hipBLAS GemmEx has no mixed
+    // FP16 x FP32 input pair, and rounding X to 16 bits to get one breaks the
+    // contract (~1e-3 error at in_dim 512), so this runs the shared kernels
+    // from src/cuda/batched_ops.cu, which load W at 16 bits and widen in
+    // registers.
+    // Those kernels read bias unconditionally; an absent one is a zero bias.
+    if (X_BD.dtype == Dtype::FP32 && (W.dtype == Dtype::FP16 || W.dtype == Dtype::BF16)) {
         if (bp) {
-            launch_epilogue<float>(reinterpret_cast<float*>(Y_BD.data),
-                                   reinterpret_cast<const float*>(bp->data),
-                                   1, B, out_dim, static_cast<long long>(B) * out_dim, 0, stream);
+            ::brotensor::detail::cuda::linear_forward_batched(W, bias, X_BD, Y_BD);
+        } else {
+            const ::brotensor::Tensor zero_bias = ::brotensor::Tensor::zeros_on(W.device, out_dim, 1);
+            ::brotensor::detail::cuda::linear_forward_batched(W, zero_bias, X_BD, Y_BD);
         }
         return;
     }

@@ -213,26 +213,29 @@ __global__ void rope_qkv_packed_kernel(T* __restrict__ QKV,
                                        int D, int half) {
     const int row = blockIdx.y;
     const int p = pos_p[row];
-    const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= D) return;
+    // One thread per (head, pair): D/2 pairs per section, each rotated in
+    // both the Q and the K section of the row.
+    const int pj = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pj >= D / 2) return;
 
-    const int pair_idx = d % half;
-    const float c = cos_p[p * half + pair_idx];
-    const float s = sin_p[p * half + pair_idx];
+    const int pair_idx = pj % half;
+    const int off = (pj / half) * 2 * half + 2 * pair_idx;
+    const float c = cos_p[static_cast<size_t>(p) * half + pair_idx];
+    const float s = sin_p[static_cast<size_t>(p) * half + pair_idx];
 
     T* r = QKV + static_cast<size_t>(row) * (3 * D);
 
     // Rotate Q (first D)
-    const float q0 = RopeScalar<T>::ld(r[2 * pair_idx]);
-    const float q1 = RopeScalar<T>::ld(r[2 * pair_idx + 1]);
-    r[2 * pair_idx]     = RopeScalar<T>::st(q0 * c - q1 * s);
-    r[2 * pair_idx + 1] = RopeScalar<T>::st(q0 * s + q1 * c);
+    const float q0 = RopeScalar<T>::ld(r[off]);
+    const float q1 = RopeScalar<T>::ld(r[off + 1]);
+    r[off]     = RopeScalar<T>::st(q0 * c - q1 * s);
+    r[off + 1] = RopeScalar<T>::st(q0 * s + q1 * c);
 
     // Rotate K (second D)
-    const float k0 = RopeScalar<T>::ld(r[D + 2 * pair_idx]);
-    const float k1 = RopeScalar<T>::ld(r[D + 2 * pair_idx + 1]);
-    r[D + 2 * pair_idx]     = RopeScalar<T>::st(k0 * c - k1 * s);
-    r[D + 2 * pair_idx + 1] = RopeScalar<T>::st(k0 * s + k1 * c);
+    const float k0 = RopeScalar<T>::ld(r[D + off]);
+    const float k1 = RopeScalar<T>::ld(r[D + off + 1]);
+    r[D + off]     = RopeScalar<T>::st(k0 * c - k1 * s);
+    r[D + off + 1] = RopeScalar<T>::st(k0 * s + k1 * c);
 }
 
 // ─── M-RoPE Kernel (Qwen2.5-VL / Qwen3-VL 3D Positional Embedding) ───────────
@@ -525,9 +528,15 @@ void hip_rope_qkv_packed_inplace(::brotensor::Tensor& QKV, const ::brotensor::Te
     if (cos_tbl.cols != half || sin_tbl.cols != half) {
         throw std::runtime_error("hip_rope_qkv_packed_inplace: cos_tbl/sin_tbl must have cols == head_dim/2");
     }
+    if (cos_tbl.dtype != Dtype::FP32 || sin_tbl.dtype != Dtype::FP32) {
+        throw std::runtime_error("hip_rope_qkv_packed_inplace: cos_tbl/sin_tbl must be FP32");
+    }
+    if (QKV.dtype != Dtype::FP32 && QKV.dtype != Dtype::FP16 && QKV.dtype != Dtype::BF16) {
+        throw std::runtime_error("hip_rope_qkv_packed_inplace: QKV must be FP32, FP16, or BF16");
+    }
     if (L == 0) return;
 
-    const dim3 grid((D + 255) / 256, L);
+    const dim3 grid((D / 2 + 255) / 256, L);
     const float* c = static_cast<const float*>(cos_tbl.data);
     const float* s = static_cast<const float*>(sin_tbl.data);
     const int* p = static_cast<const int*>(pos.data);

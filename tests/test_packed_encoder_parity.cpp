@@ -116,6 +116,9 @@ BT_PARITY_TEST(gpu_fp16_hd64_small_window) { gpu_parity(kLens, 2, 64, 6, Dtype::
 BT_PARITY_TEST(gpu_bf16_hd64_window) { gpu_parity(kLens, 2, 64, 128, Dtype::BF16, 0x65); }
 BT_PARITY_TEST(gpu_fp16_generic_hd16) { gpu_parity(kLens, 4, 16, 16, Dtype::FP16, 0x66); }
 BT_PARITY_TEST(gpu_fp32_generic) { gpu_parity({9, 40, 3}, 2, 64, 0, Dtype::FP32, 0x67); }
+// head_dim past one value per thread of a 128-thread block, and odd sizes.
+BT_PARITY_TEST(gpu_fp16_hd160_window) { gpu_parity({33, 1, 90}, 2, 160, 10, Dtype::FP16, 0x68); }
+BT_PARITY_TEST(gpu_fp32_hd256_full) { gpu_parity({17, 70}, 1, 256, 0, Dtype::FP32, 0x69); }
 
 // Backward: CPU against central finite differences of the CPU forward under
 // the loss sum(O * G), then GPU against CPU.
@@ -231,6 +234,36 @@ BT_PARITY_TEST(rope_packed) {
     Tensor g16 = to_fp16_gpu(qkv);
     brotensor::rope_qkv_packed_inplace(g16, ct.to(gpu_device()), st.to(gpu_device()), pos.to(gpu_device()), H, hd);
     compare_tensors(cpu, fp16_host_to_f32(download_to_host(g16)), "rope_packed_gpu16", 2e-3f, 2e-3f);
+}
+
+// Many heads (more pairs per row than one 256-thread block) at FP32 and BF16,
+// GPU against CPU.
+BT_PARITY_TEST(rope_packed_wide) {
+    SplitMix64 rng(0x72);
+    const int H = 12, hd = 64, half = hd / 2, D = H * hd;
+    const Tensor b = bounds_for({3, 40, 21});
+    const int L = b.rows, P = 64;
+    Tensor qkv = Tensor::mat(L, 3 * D);
+    for (int i = 0; i < qkv.size(); ++i) qkv.ptr()[i] = qbf(rng.next_unit() * 2.0f);
+    Tensor ct = Tensor::mat(P, half), st = Tensor::mat(P, half);
+    for (int p = 0; p < P; ++p)
+        for (int i = 0; i < half; ++i) {
+            const float a = p * std::pow(10000.0f, -2.0f * i / hd);
+            ct(p, i) = std::cos(a);
+            st(p, i) = std::sin(a);
+        }
+    Tensor pos = Tensor::zeros_on(Device::CPU, L, 1, Dtype::INT32);
+    int32_t* pp = static_cast<int32_t*>(pos.host_raw_mut());
+    for (int r = 0; r < L; ++r) pp[r] = r - static_cast<const int32_t*>(b.host_raw())[2 * r];
+    Tensor cpu = qkv.clone();
+    brotensor::rope_qkv_packed_inplace(cpu, ct, st, pos, H, hd);
+    const Tensor gct = ct.to(gpu_device()), gst = st.to(gpu_device()), gpos = pos.to(gpu_device());
+    Tensor g32 = qkv.to(gpu_device());
+    brotensor::rope_qkv_packed_inplace(g32, gct, gst, gpos, H, hd);
+    compare_tensors(cpu, download_to_host(g32), "rope_packed_wide_gpu32", 1e-6f, 1e-6f);
+    Tensor gbf = to_bf16_gpu(qkv);
+    brotensor::rope_qkv_packed_inplace(gbf, gct, gst, gpos, H, hd);
+    compare_tensors(cpu, bf16_host_to_f32(download_to_host(gbf)), "rope_packed_wide_gpubf16", 2e-2f, 2e-2f);
 }
 
 BT_PARITY_TEST(segment_stats) {

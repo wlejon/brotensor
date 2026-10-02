@@ -373,7 +373,14 @@ void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD) {
     add_inplace(Y_BD, X_BD);
 }
 void axpby_inplace(Tensor& y, const Tensor& x, float a, float b) {
-    launch_binary_inplace(y, x, [a, b] __device__ (float yv, float xv) { return a * xv + b * yv; });
+    // No contraction: at 16-bit storage the compiler would otherwise fuse the
+    // multiply-add and the narrowing store into one v_fma_mix (exact result,
+    // single rounding to 16 bits), which differs from the contract's FP32
+    // combine + one store rounding — and from CPU/CUDA — on FP16 ties.
+    launch_binary_inplace(y, x, [a, b] __device__ (float yv, float xv) {
+#pragma clang fp contract(off)
+        return a * yv + b * xv;
+    });
 }
 void add_scalar_inplace(Tensor& y, float s) {
     launch_unary_inplace(y, [s] __device__ (float v) { return v + s; });

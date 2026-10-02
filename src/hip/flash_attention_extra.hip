@@ -251,8 +251,8 @@ template <typename T>
 __global__ void hip_flash_attention_packed_qkv_kernel(
         const T* __restrict__ QKV,
         const int* __restrict__ bounds,
-        int B, int num_heads, int head_dim,
-        int window, T* __restrict__ Out) {
+        int num_heads, int head_dim,
+        int hw, T* __restrict__ Out) {
     extern __shared__ float s_smem[];
     float* scores = s_smem;
     float* red    = s_smem + kFaKtile;
@@ -271,18 +271,13 @@ __global__ void hip_flash_attention_packed_qkv_kernel(
     const int head_off_v = 2 * D + head_off_q;
     const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
 
-    int b = 0;
-    while (b < B && bounds[2 * b + 1] <= q_global) ++b;
-    if (b >= B) return;
-
-    const int start_idx = bounds[2 * b];
-    const int end_idx   = bounds[2 * b + 1];
-    const int Lk        = end_idx - start_idx;
-    if (Lk <= 0) return;
-
-    const int q_local = q_global - start_idx;
-    const int lo = (window > 0 && q_local - window + 1 > 0) ? (q_local - window + 1) : 0;
-    const int k_hi = q_local;
+    // Bidirectional: row q attends to its own sequence [start, end), clipped
+    // to the |q - k| <= hw band when windowed (hw < 0 = no window). Both
+    // bounds are global row indices into the packed buffer.
+    const int seq_start = bounds[2 * q_global];
+    const int seq_end   = bounds[2 * q_global + 1];
+    const int lo = hw >= 0 ? max(seq_start, q_global - hw) : seq_start;
+    const int hi = hw >= 0 ? min(seq_end, q_global + hw + 1) : seq_end;
 
     float run_max = -1e30f;
     float run_sum = 0.0f;
@@ -292,19 +287,12 @@ __global__ void hip_flash_attention_packed_qkv_kernel(
 
     const T* q_vec = QKV + static_cast<size_t>(q_global) * stride_row + head_off_q;
 
-    for (int k0 = (lo / kFaKtile) * kFaKtile; k0 <= k_hi; k0 += kFaKtile) {
-        int klen = kFaKtile;
-        if (k0 + klen - 1 > k_hi) klen = k_hi - k0 + 1;
+    for (int k0 = lo; k0 < hi; k0 += kFaKtile) {
+        const int klen = min(kFaKtile, hi - k0);
 
         for (int t = tid; t < klen; t += blockDim.x) {
-            const int kg_local = k0 + t;
-            if (kg_local < lo) {
-                scores[t] = -1e30f;
-            } else {
-                const int kg_global = start_idx + kg_local;
-                const T* k_vec = QKV + static_cast<size_t>(kg_global) * stride_row + head_off_k;
-                scores[t] = FaScalar<T>::dot(q_vec, k_vec, head_dim) * inv_sqrt;
-            }
+            const T* k_vec = QKV + static_cast<size_t>(k0 + t) * stride_row + head_off_k;
+            scores[t] = FaScalar<T>::dot(q_vec, k_vec, head_dim) * inv_sqrt;
         }
         __syncthreads();
 
@@ -348,8 +336,7 @@ __global__ void hip_flash_attention_packed_qkv_kernel(
             if (slot >= kMaxHdPerThread) break;
             float acc = alpha * partial[slot];
             for (int t = 0; t < klen; ++t) {
-                const int kg_global = start_idx + k0 + t;
-                const T* v_vec = QKV + static_cast<size_t>(kg_global) * stride_row + head_off_v;
+                const T* v_vec = QKV + static_cast<size_t>(k0 + t) * stride_row + head_off_v;
                 acc += scores[t] * FaScalar<T>::to_f32(v_vec[d]);
             }
             partial[slot] = acc;
@@ -386,12 +373,19 @@ void hip_flash_attention_packed_qkv_forward(const ::brotensor::Tensor& QKV,
     }
     const int D = three_D / 3;
     const int head_dim = D / num_heads;
-    const int B = seq_bounds.rows;
+    if (seq_bounds.dtype != Dtype::INT32 || seq_bounds.rows != total_tokens || seq_bounds.cols != 2) {
+        throw std::runtime_error("hip_flash_attention_packed_qkv_forward: seq_bounds must be (L, 2) INT32");
+    }
+    if (head_dim > kFaBlock * kMaxHdPerThread) {
+        throw std::runtime_error("hip_flash_attention_packed_qkv_forward: head_dim too large");
+    }
+    // window is the full band width, matching the CPU/CUDA |q - k| <= window/2.
+    const int hw = window > 0 ? window / 2 : -1;
 
     if (O.rows != total_tokens || O.cols != D || O.dtype != dt) {
         O.resize(total_tokens, D, dt);
     }
-    if (total_tokens == 0 || B <= 0) return;
+    if (total_tokens == 0) return;
 
     dim3 grid(total_tokens, num_heads, 1);
     const size_t shmem = (static_cast<size_t>(kFaKtile) + kFaBlock) * sizeof(float);
@@ -400,15 +394,15 @@ void hip_flash_attention_packed_qkv_forward(const ::brotensor::Tensor& QKV,
     if (dt == Dtype::FP16) {
         hip_flash_attention_packed_qkv_kernel<__half><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const __half*>(QKV.data), static_cast<const int*>(seq_bounds.data),
-            B, num_heads, head_dim, window, static_cast<__half*>(O.data));
+            num_heads, head_dim, hw, static_cast<__half*>(O.data));
     } else if (dt == Dtype::BF16) {
         hip_flash_attention_packed_qkv_kernel<hip_bfloat16><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const hip_bfloat16*>(QKV.data), static_cast<const int*>(seq_bounds.data),
-            B, num_heads, head_dim, window, static_cast<hip_bfloat16*>(O.data));
+            num_heads, head_dim, hw, static_cast<hip_bfloat16*>(O.data));
     } else {
         hip_flash_attention_packed_qkv_kernel<float><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const float*>(QKV.data), static_cast<const int*>(seq_bounds.data),
-            B, num_heads, head_dim, window, static_cast<float*>(O.data));
+            num_heads, head_dim, hw, static_cast<float*>(O.data));
     }
     BROTENSOR_HIP_CHECK(hipGetLastError());
 }

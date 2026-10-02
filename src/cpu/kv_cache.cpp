@@ -51,6 +51,54 @@ inline float apply_softcap(float s, float softcap) {
     return s;
 }
 
+// One query head against keys [0, nkeys) of one KV head: scores, stable
+// softmax, weighted V sum into orow. Key kg takes part iff kg >= lo and, when
+// a mask is given, mask[kg] > 0.5. Both decode ops run exactly this code, so
+// masked decode with a valid-prefix mask is bit-identical to the unmasked one
+// (the compiler's FMA contraction and vectorisation choices are made once,
+// here, rather than separately per caller).
+void attend_head(const float* qrow, const float* Kp, const float* Vp, int Dkv,
+                 int kv_head_off, int head_dim, int nkeys, const float* mask, int lo,
+                 float inv_sqrt, float softcap, std::vector<float>& scores, float* orow) {
+    scores.assign(static_cast<std::size_t>(nkeys), 0.0f);
+    float run_max = -1e30f;
+    for (int kg = 0; kg < nkeys; ++kg) {
+        if (kg < lo || (mask && mask[kg] <= 0.5f)) {
+            scores[static_cast<std::size_t>(kg)] = -1e30f;   // out of window / masked
+            continue;
+        }
+        const float* krow = Kp + static_cast<std::size_t>(kg) * Dkv + kv_head_off;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) dot += qrow[d] * krow[d];
+        float s = dot * inv_sqrt;
+        s = apply_softcap(s, softcap);   // Gemma-2 tanh soft-cap
+        scores[static_cast<std::size_t>(kg)] = s;
+        if (s > run_max) run_max = s;
+    }
+    // Stable softmax.
+    float sum = 0.0f;
+    for (int kg = 0; kg < nkeys; ++kg) {
+        const float e = (run_max <= -1e29f)
+            ? 0.0f
+            : std::exp(scores[static_cast<std::size_t>(kg)] - run_max);
+        scores[static_cast<std::size_t>(kg)] = e;
+        sum += e;
+    }
+    const float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+    // Weighted sum of V (the KV head's V).
+    for (int d = 0; d < head_dim; ++d) {
+        float acc = 0.0f;
+        for (int kg = 0; kg < nkeys; ++kg) {
+            const float s = scores[static_cast<std::size_t>(kg)];
+            // Skip zero-weight keys: identical math for any finite V, and
+            // masked rows may hold garbage the multiply would propagate.
+            if (s == 0.0f) continue;
+            acc += s * Vp[static_cast<std::size_t>(kg) * Dkv + kv_head_off + d];
+        }
+        orow[d] = acc * inv;
+    }
+}
+
 } // namespace
 
 void kv_cache_append(const ::brotensor::Tensor& K_new,
@@ -147,37 +195,9 @@ void flash_attention_decode(const ::brotensor::Tensor& Q,
             const int q_head_off  = hq  * head_dim;
             const int kv_head_off = hkv * head_dim;
             const float* qrow = Qp + q * Dq + q_head_off;
-
-            // Scores against the valid causal keys.
-            scores.assign(klen, 0.0f);
-            float run_max = -1e30f;
-            for (int kg = 0; kg < klen; ++kg) {
-                if (kg < lo) { scores[kg] = -1e30f; continue; }  // out of window
-                const float* krow = Kp + kg * Dkv + kv_head_off;
-                float dot = 0.0f;
-                for (int d = 0; d < head_dim; ++d) dot += qrow[d] * krow[d];
-                float s = dot * inv_sqrt;
-                s = apply_softcap(s, attn_softcap);   // Gemma-2 tanh soft-cap
-                scores[kg] = s;
-                if (s > run_max) run_max = s;
-            }
-            // Stable softmax.
-            float sum = 0.0f;
-            for (int kg = 0; kg < klen; ++kg) {
-                const float e = std::exp(scores[kg] - run_max);
-                scores[kg] = e;
-                sum += e;
-            }
-            const float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
-            // Weighted sum of V (KV head's V).
-            float* orow = Op + q * Dq + q_head_off;
-            for (int d = 0; d < head_dim; ++d) {
-                float acc = 0.0f;
-                for (int kg = 0; kg < klen; ++kg) {
-                    acc += scores[kg] * Vp[kg * Dkv + kv_head_off + d];
-                }
-                orow[d] = acc * inv;
-            }
+            // The valid causal keys 0..p_q.
+            attend_head(qrow, Kp, Vp, Dkv, kv_head_off, head_dim, klen, nullptr, lo,
+                        inv_sqrt, attn_softcap, scores, Op + q * Dq + q_head_off);
         }
     }
 }
@@ -253,44 +273,8 @@ void flash_attention_decode_masked(const ::brotensor::Tensor& Q,
         const int hkv = hq / q_per_kv;
         const int q_head_off  = hq  * head_dim;
         const int kv_head_off = hkv * head_dim;
-        const float* qrow = Qp + q_head_off;
-
-        scores.assign(static_cast<std::size_t>(cap), 0.0f);
-        float run_max = -1e30f;
-        for (int kg = 0; kg < cap; ++kg) {
-            if (d_mask[kg] <= 0.5f || kg < lo) {
-                scores[static_cast<std::size_t>(kg)] = -1e30f;
-                continue;
-            }
-            const float* krow = Kp + static_cast<std::size_t>(kg) * Dkv + kv_head_off;
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; ++d) dot += qrow[d] * krow[d];
-            float s = dot * inv_sqrt;
-            s = apply_softcap(s, attn_softcap);   // Gemma-2 tanh soft-cap
-            scores[static_cast<std::size_t>(kg)] = s;
-            if (s > run_max) run_max = s;
-        }
-        float sum = 0.0f;
-        for (int kg = 0; kg < cap; ++kg) {
-            const float e = (run_max <= -1e29f)
-                ? 0.0f
-                : std::exp(scores[static_cast<std::size_t>(kg)] - run_max);
-            scores[static_cast<std::size_t>(kg)] = e;
-            sum += e;
-        }
-        const float inv = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
-        float* orow = Op + q_head_off;
-        for (int d = 0; d < head_dim; ++d) {
-            float acc = 0.0f;
-            for (int kg = 0; kg < cap; ++kg) {
-                const float s = scores[static_cast<std::size_t>(kg)];
-                // Skip zero-weight keys: identical math for any finite V, and
-                // masked rows may hold garbage the multiply would propagate.
-                if (s == 0.0f) continue;
-                acc += s * Vp[static_cast<std::size_t>(kg) * Dkv + kv_head_off + d];
-            }
-            orow[d] = acc * inv;
-        }
+        attend_head(Qp + q_head_off, Kp, Vp, Dkv, kv_head_off, head_dim, cap, d_mask, lo,
+                    inv_sqrt, attn_softcap, scores, Op + q_head_off);
     }
 }
 
