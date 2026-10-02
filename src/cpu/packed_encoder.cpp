@@ -283,9 +283,9 @@ void linear_forward_batched_ex(const ::brotensor::Tensor& W, const ::brotensor::
     const int N = W.rows, K = W.cols, M = X.rows;
     if (X.cols != K) fail(op, "X.cols must equal W.cols");
     if (bias && static_cast<long long>(bias->rows) * bias->cols != N) fail(op, "bias size must equal W.rows");
-    if (epilogue < 0 || epilogue > 2) fail(op, "unknown epilogue");
-    if (epilogue == 2 && (act != 0 || N % 2 != 0)) fail(op, "geglu needs act 0 and even W.rows");
-    const int out_cols = epilogue == 2 ? N / 2 : N;
+    if (epilogue < 0 || epilogue > 3) fail(op, "unknown epilogue");
+    if ((epilogue == 2 || epilogue == 3) && (act != 0 || N % 2 != 0)) fail(op, "geglu/swiglu needs act 0 and even W.rows");
+    const int out_cols = (epilogue == 2 || epilogue == 3) ? N / 2 : N;
     if (epilogue == 1) {
         if (Y.rows != M || Y.cols != N || Y.dtype != Dtype::FP32) fail(op, "accumulate needs Y (B, out) FP32");
     } else if (Y.rows != M || Y.cols != out_cols || Y.dtype != Dtype::FP32) {
@@ -310,9 +310,12 @@ void linear_forward_batched_ex(const ::brotensor::Tensor& W, const ::brotensor::
             for (int n = 0; n < N; ++n) yr[n] = r[static_cast<std::size_t>(n)];
         } else if (epilogue == 1) {
             for (int n = 0; n < N; ++n) yr[n] += r[static_cast<std::size_t>(n)];
-        } else {
+        } else if (epilogue == 2) {
             for (int j = 0; j < out_cols; ++j)
                 yr[j] = r[static_cast<std::size_t>(2 * j)] * apply_act(r[static_cast<std::size_t>(2 * j + 1)], 3);
+        } else {
+            for (int j = 0; j < out_cols; ++j)
+                yr[j] = apply_act(r[static_cast<std::size_t>(j)], 4) * r[static_cast<std::size_t>(out_cols + j)];
         }
     }
 }

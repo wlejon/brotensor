@@ -45,7 +45,7 @@ void check(int M, int N, int K, int act, int epi, bool use_ws, bool use_bias, Dt
     const Tensor W = rnd(N, K, rng, 0.06f, dt);
     const Tensor X = rnd(M, K, rng, 1.0f, dt);
     const Tensor b = rnd(N, 1, rng, 0.5f, dt);
-    const int out_cols = (epi & 15) == brotensor::kLinearEpiGeglu ? N / 2 : N;
+    const int out_cols = ((epi & 15) == brotensor::kLinearEpiGeglu || (epi & 15) == brotensor::kLinearEpiSwiglu) ? N / 2 : N;
     const Tensor Y0 = rnd(M, out_cols, rng, 1.0f, dt);
 
     Tensor yc = Y0.clone();
@@ -70,6 +70,7 @@ void check(int M, int N, int K, int act, int epi, bool use_ws, bool use_bias, Dt
 constexpr int kStore = brotensor::kLinearEpiStore;
 constexpr int kAcc = brotensor::kLinearEpiAccumulate;
 constexpr int kGeglu = brotensor::kLinearEpiGeglu;
+constexpr int kSwiglu = brotensor::kLinearEpiSwiglu;
 
 BT_PARITY_TEST(cpu_epilogues) {
     // CPU accumulate and GeGLU against the plain CPU store.
@@ -131,6 +132,15 @@ BT_PARITY_TEST(fallback_odd_k) {
     check(21, 64, 1028, 3, kStore, true, true, Dtype::FP16, 0x41);
     check(21, 64, 1028, 0, kAcc, true, true, Dtype::FP16, 0x42);
     check(21, 64, 100, 0, kGeglu, false, false, Dtype::FP16, 0x43);
+    check(21, 64, 100, 0, kSwiglu, false, false, Dtype::FP16, 0x44);
+}
+
+BT_PARITY_TEST(swiglu_parity) {
+    // Skinny GEMV SwiGLU (M <= 8) and general prefill SwiGLU
+    check(1, 256, 128, 0, kSwiglu, false, false, Dtype::FP16, 0x61);
+    check(2, 512, 256, 0, kSwiglu, false, false, Dtype::BF16, 0x62);
+    check(8, 128, 64, 0, kSwiglu, false, false, Dtype::FP16, 0x63);
+    check(32, 256, 128, 0, kSwiglu, false, false, Dtype::FP16, 0x64);
 }
 
 }  // namespace

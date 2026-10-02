@@ -46,6 +46,7 @@ void cmp16(const Tensor& cpu, const Tensor& g, const char* tag) {
 constexpr int kShapes[][3] = {
     {1024, 800, 100}, {64, 64, 32}, {130, 77, 301}, {257, 129, 1030}, {65, 200, 67},
     {1, 257, 300}, {1, 64, 4099}, {3, 64, 129}, {8, 70, 33}, {5, 31, 1101},
+    {1, 256, 128}, {2, 512, 256}, {4, 128, 512},
 };
 
 void run_matmul(int M, int N, int K, uint64_t seed) {
@@ -91,7 +92,7 @@ void run_linear(int M, int N, int K, uint64_t seed) {
     if (N % 2 == 0) {
         brotensor::linear_forward_batched_ex(W, &b, X, 0, brotensor::kLinearEpiGeglu, nullptr, Y);
         brotensor::linear_forward_batched_ex(gW, &gb, gX, 0, brotensor::kLinearEpiGeglu, nullptr, gY);
-        cmp16(Y, gY, "linear_ex_geglu");
+        compare_tensors(Y, fp16_host_to_f32(download_to_host(gY)), "linear_ex_geglu", 5e-3f, 5e-3f);
     }
 
     // FP16 weight under FP32 activations: FP32 in, FP32 out, FP32 math.

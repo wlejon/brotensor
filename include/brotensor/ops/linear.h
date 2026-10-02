@@ -83,6 +83,9 @@ enum LinearEpilogue {
     kLinearEpiGeglu      = 2,  // Y[:, j] = r[:, 2j] * gelu_exact(r[:, 2j+1]); act must be 0.
                                // W's rows interleave the two GeGLU halves pairwise
                                // (row 2j = gated half, row 2j+1 = gelu input). Y (B, out/2) resized.
+    kLinearEpiSwiglu     = 3,  // Y[:, j] = silu(r[:, j]) * r[:, out/2 + j]; act must be 0.
+                               // W's rows stack gate and up halves (rows [0, D) = gate,
+                               // rows [D, 2*D) = up). Y (B, out/2) resized.
 
     // Flag OR'd into the epilogue: FP16 operands may accumulate each 16-deep
     // k step in FP16 (the doubled tensor-core rate of consumer GPUs) before

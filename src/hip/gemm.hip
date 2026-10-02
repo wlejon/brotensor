@@ -293,6 +293,131 @@ void hip_matmul_abt(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
     }
 }
 
+constexpr int LGV_BLOCK = 128;
+
+template <typename T>
+struct __align__(16) Oct16 { T v[8]; };
+
+template <typename T>
+__device__ inline float oct_dot8(const Oct16<T>& w, const Oct16<T>& x) {
+    float acc = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        acc += float(w.v[i]) * float(x.v[i]);
+    }
+    return acc;
+}
+
+template <typename T>
+__global__ void hip_linear_gemv_batched_w16_v8_kernel(const T* __restrict__ W,
+                                                      const T* __restrict__ bias,
+                                                      const T* __restrict__ X,
+                                                      T* __restrict__ Y,
+                                                      int out_dim, int in_dim,
+                                                      int act, int epi) {
+    const int row   = blockIdx.x;
+    const int batch = blockIdx.y;
+    const int tid   = threadIdx.x;
+
+    using Q = Oct16<T>;
+    const Q* w8 = reinterpret_cast<const Q*>(W + static_cast<size_t>(row) * in_dim);
+    const Q* x8 = reinterpret_cast<const Q*>(X + static_cast<size_t>(batch) * in_dim);
+    const int n8 = in_dim / 8;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    int k = tid;
+    for (; k + 3 * LGV_BLOCK < n8; k += 4 * LGV_BLOCK) {
+        acc0 += oct_dot8(w8[k], x8[k]);
+        acc1 += oct_dot8(w8[k + LGV_BLOCK], x8[k + LGV_BLOCK]);
+        acc2 += oct_dot8(w8[k + 2 * LGV_BLOCK], x8[k + 2 * LGV_BLOCK]);
+        acc3 += oct_dot8(w8[k + 3 * LGV_BLOCK], x8[k + 3 * LGV_BLOCK]);
+    }
+    for (; k < n8; k += LGV_BLOCK) acc0 += oct_dot8(w8[k], x8[k]);
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, 32);
+    }
+    __shared__ float red[LGV_BLOCK / 32];
+    if ((tid & 31) == 0) red[tid >> 5] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float s = red[0];
+        #pragma unroll
+        for (int w = 1; w < LGV_BLOCK / 32; ++w) s += red[w];
+        if (bias != nullptr) s += float(bias[row]);
+        s = apply_linear_act(act, s);
+        const size_t out_idx = static_cast<size_t>(batch) * out_dim + row;
+        if (epi == 1) {
+            s += float(Y[out_idx]);
+        }
+        Y[out_idx] = T(s);
+    }
+}
+
+template <typename T>
+__global__ void hip_linear_gemv_swiglu_kernel(const T* __restrict__ W,
+                                              const T* __restrict__ X,
+                                              T* __restrict__ Y,
+                                              int half_out, int in_dim) {
+    const int j     = blockIdx.x;
+    const int batch = blockIdx.y;
+    const int tid   = threadIdx.x;
+
+    using Q = Oct16<T>;
+    const Q* wg8 = reinterpret_cast<const Q*>(W + static_cast<size_t>(j) * in_dim);
+    const Q* wu8 = reinterpret_cast<const Q*>(W + static_cast<size_t>(half_out + j) * in_dim);
+    const Q* x8  = reinterpret_cast<const Q*>(X + static_cast<size_t>(batch) * in_dim);
+    const int n8 = in_dim / 8;
+
+    float acc_g0 = 0.0f, acc_g1 = 0.0f;
+    float acc_u0 = 0.0f, acc_u1 = 0.0f;
+    int k = tid;
+    for (; k + LGV_BLOCK < n8; k += 2 * LGV_BLOCK) {
+        Q xv0 = x8[k];
+        Q xv1 = x8[k + LGV_BLOCK];
+        acc_g0 += oct_dot8(wg8[k], xv0);
+        acc_u0 += oct_dot8(wu8[k], xv0);
+        acc_g1 += oct_dot8(wg8[k + LGV_BLOCK], xv1);
+        acc_u1 += oct_dot8(wu8[k + LGV_BLOCK], xv1);
+    }
+    for (; k < n8; k += LGV_BLOCK) {
+        Q xv = x8[k];
+        acc_g0 += oct_dot8(wg8[k], xv);
+        acc_u0 += oct_dot8(wu8[k], xv);
+    }
+    float acc_g = acc_g0 + acc_g1;
+    float acc_u = acc_u0 + acc_u1;
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc_g += __shfl_down(acc_g, off, 32);
+        acc_u += __shfl_down(acc_u, off, 32);
+    }
+    __shared__ float red_g[LGV_BLOCK / 32];
+    __shared__ float red_u[LGV_BLOCK / 32];
+    if ((tid & 31) == 0) {
+        red_g[tid >> 5] = acc_g;
+        red_u[tid >> 5] = acc_u;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sg = red_g[0];
+        float su = red_u[0];
+        #pragma unroll
+        for (int w = 1; w < LGV_BLOCK / 32; ++w) {
+            sg += red_g[w];
+            su += red_u[w];
+        }
+        float silu_g = sg / (1.0f + __expf(-sg));
+        Y[static_cast<size_t>(batch) * half_out + j] = T(silu_g * su);
+    }
+}
+
 void hip_linear_forward_batched_fp16_act(const ::brotensor::Tensor& W,
                                          const ::brotensor::Tensor* bias,
                                          const ::brotensor::Tensor& X_BD,
@@ -306,6 +431,34 @@ void hip_linear_forward_batched_fp16_act(const ::brotensor::Tensor& W,
     }
     if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != X_BD.dtype) {
         Y_BD.resize(B, out_dim, X_BD.dtype);
+    }
+    const bool has_bias = (bias != nullptr && bias->size() > 0);
+    const ::brotensor::Dtype dt = X_BD.dtype;
+    hipStream_t stream = reinterpret_cast<hipStream_t>(hip_current_stream(W.device.index));
+
+    if (B <= 8 && in_dim % 8 == 0 && in_dim > 0) {
+        dim3 grid(out_dim, B);
+        if (dt == ::brotensor::Dtype::FP16) {
+            hip_linear_gemv_batched_w16_v8_kernel<__half>
+                <<<grid, LGV_BLOCK, 0, stream>>>(
+                    static_cast<const __half*>(W.data),
+                    has_bias ? static_cast<const __half*>(bias->data) : nullptr,
+                    static_cast<const __half*>(X_BD.data),
+                    static_cast<__half*>(Y_BD.data),
+                    out_dim, in_dim, act, 0);
+            BROTENSOR_HIP_CHECK(hipGetLastError());
+            return;
+        } else if (dt == ::brotensor::Dtype::BF16) {
+            hip_linear_gemv_batched_w16_v8_kernel<hip_bfloat16>
+                <<<grid, LGV_BLOCK, 0, stream>>>(
+                    static_cast<const hip_bfloat16*>(W.data),
+                    has_bias ? static_cast<const hip_bfloat16*>(bias->data) : nullptr,
+                    static_cast<const hip_bfloat16*>(X_BD.data),
+                    static_cast<hip_bfloat16*>(Y_BD.data),
+                    out_dim, in_dim, act, 0);
+            BROTENSOR_HIP_CHECK(hipGetLastError());
+            return;
+        }
     }
     hip_matmul_abt(X_BD, W, Y_BD, 1, B, out_dim, in_dim, 0, 0, 0, bias, act);
 }
@@ -332,7 +485,7 @@ __global__ void hip_linear_ex_epilogue_kernel(
     if (epi == 1) { // accumulate
         float val = float(y[i]) + float(r[i]);
         y[i] = T(val);
-    } else { // geglu: Y[:, j] = r[:, 2j] * gelu_exact(r[:, 2j+1])
+    } else if (epi == 2) { // geglu: Y[:, j] = r[:, 2j] * gelu_exact(r[:, 2j+1])
         const int half = N / 2;
         const long long m = i / half;
         const int j = static_cast<int>(i - m * half);
@@ -341,6 +494,14 @@ __global__ void hip_linear_ex_epilogue_kernel(
         constexpr float kInvSqrt2 = 0.70710678118654752440f;
         const float gelu_g = 0.5f * g * (1.0f + erff(g * kInvSqrt2));
         y[i] = T(a * gelu_g);
+    } else { // swiglu: Y[:, j] = silu(r[:, j]) * r[:, half + j]
+        const int half = N / 2;
+        const long long m = i / half;
+        const int j = static_cast<int>(i - m * half);
+        const float g = float(r[m * N + j]);
+        const float u = float(r[m * N + half + j]);
+        const float silu_g = g / (1.0f + __expf(-g));
+        y[i] = T(silu_g * u);
     }
 }
 
@@ -407,6 +568,7 @@ void hip_linear_forward_batched_ex(const ::brotensor::Tensor& W,
     constexpr int kLinearEpiStoreCode     = 0;
     constexpr int kLinearEpiAccumulateCode = 1;
     constexpr int kLinearEpiGegluCode     = 2;
+    constexpr int kLinearEpiSwigluCode    = 3;
     const int epilogue_mode = epilogue & ~kLinearEpiFastAccumFlag;
 
     const int B       = X_BD.rows;
@@ -415,7 +577,7 @@ void hip_linear_forward_batched_ex(const ::brotensor::Tensor& W,
     if (W.cols != in_dim) {
         throw std::runtime_error("hip_linear_forward_batched_ex: shape mismatch");
     }
-    const int actual_out = (epilogue_mode == kLinearEpiGegluCode) ? out_dim / 2 : out_dim;
+    const int actual_out = (epilogue_mode == kLinearEpiGegluCode || epilogue_mode == kLinearEpiSwigluCode) ? out_dim / 2 : out_dim;
     if (epilogue_mode == kLinearEpiAccumulateCode) {
         if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != X_BD.dtype) {
             throw std::runtime_error("hip_linear_forward_batched_ex: accumulate requires matching Y");
@@ -430,6 +592,59 @@ void hip_linear_forward_batched_ex(const ::brotensor::Tensor& W,
     if (epilogue_mode == kLinearEpiStoreCode) {
         hip_linear_forward_batched_fp16_act(W, bias, X_BD, act, Y_BD);
         return;
+    }
+
+    if (epilogue_mode == kLinearEpiAccumulateCode && B <= 8 && in_dim % 8 == 0 && in_dim > 0) {
+        const bool has_bias = (bias != nullptr && bias->size() > 0);
+        const ::brotensor::Dtype dt = X_BD.dtype;
+        hipStream_t stream = reinterpret_cast<hipStream_t>(hip_current_stream(W.device.index));
+        dim3 grid(out_dim, B);
+        if (dt == ::brotensor::Dtype::FP16) {
+            hip_linear_gemv_batched_w16_v8_kernel<__half>
+                <<<grid, LGV_BLOCK, 0, stream>>>(
+                    static_cast<const __half*>(W.data),
+                    has_bias ? static_cast<const __half*>(bias->data) : nullptr,
+                    static_cast<const __half*>(X_BD.data),
+                    static_cast<__half*>(Y_BD.data),
+                    out_dim, in_dim, act, 1);
+            BROTENSOR_HIP_CHECK(hipGetLastError());
+            return;
+        } else if (dt == ::brotensor::Dtype::BF16) {
+            hip_linear_gemv_batched_w16_v8_kernel<hip_bfloat16>
+                <<<grid, LGV_BLOCK, 0, stream>>>(
+                    static_cast<const hip_bfloat16*>(W.data),
+                    has_bias ? static_cast<const hip_bfloat16*>(bias->data) : nullptr,
+                    static_cast<const hip_bfloat16*>(X_BD.data),
+                    static_cast<hip_bfloat16*>(Y_BD.data),
+                    out_dim, in_dim, act, 1);
+            BROTENSOR_HIP_CHECK(hipGetLastError());
+            return;
+        }
+    }
+
+    if (epilogue_mode == kLinearEpiSwigluCode && B <= 8 && in_dim % 8 == 0 && in_dim > 0 && out_dim % 2 == 0) {
+        const ::brotensor::Dtype dt = X_BD.dtype;
+        hipStream_t stream = reinterpret_cast<hipStream_t>(hip_current_stream(W.device.index));
+        dim3 grid(actual_out, B);
+        if (dt == ::brotensor::Dtype::FP16) {
+            hip_linear_gemv_swiglu_kernel<__half>
+                <<<grid, LGV_BLOCK, 0, stream>>>(
+                    static_cast<const __half*>(W.data),
+                    static_cast<const __half*>(X_BD.data),
+                    static_cast<__half*>(Y_BD.data),
+                    actual_out, in_dim);
+            BROTENSOR_HIP_CHECK(hipGetLastError());
+            return;
+        } else if (dt == ::brotensor::Dtype::BF16) {
+            hip_linear_gemv_swiglu_kernel<hip_bfloat16>
+                <<<grid, LGV_BLOCK, 0, stream>>>(
+                    static_cast<const hip_bfloat16*>(W.data),
+                    static_cast<const hip_bfloat16*>(X_BD.data),
+                    static_cast<hip_bfloat16*>(Y_BD.data),
+                    actual_out, in_dim);
+            BROTENSOR_HIP_CHECK(hipGetLastError());
+            return;
+        }
     }
 
     ::brotensor::Tensor r = ::brotensor::Tensor::empty_on(W.device, B, out_dim, W.dtype);

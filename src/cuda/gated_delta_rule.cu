@@ -138,6 +138,195 @@ __global__ void gated_delta_rule_kernel(const float* __restrict__ Q,
     }
 }
 
+__global__ void gated_delta_rule_step_fast_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    const float* __restrict__ a_raw,
+    const float* __restrict__ beta,
+    const float* __restrict__ log_A,
+    int num_heads, int d_k, int d_v,
+    float* __restrict__ state,
+    float* __restrict__ O) {
+
+    extern __shared__ float shmem[];
+    float* s_k  = shmem;
+    float* s_q  = shmem + d_k;
+    float* s_kq = shmem + 2 * d_k;
+
+    const int h = blockIdx.x;
+    if (h >= num_heads) return;
+    const int tid = threadIdx.x;
+    const int bdim = blockDim.x;
+
+    const int VK = d_v * d_k;
+
+    const float* q_h = Q + h * d_k;
+    const float* k_h = K + h * d_k;
+    const float* v_h = V + h * d_v;
+    float* S_h       = state + h * VK;
+    float* o_h       = O + h * d_v;
+
+    // Load scalars for this head
+    const float a_raw_val = a_raw[h];
+    const float b_raw_val = beta[h];
+    const float beta_val  = gdr_sigmoid(b_raw_val);
+    const float alpha_val = __expf(-gdr_softplus(a_raw_val) * __expf(log_A[h]));
+
+    // Stage k and q into shared memory
+    for (int j = tid; j < d_k; j += bdim) {
+        s_k[j] = k_h[j];
+        s_q[j] = q_h[j];
+    }
+    __syncthreads();
+
+    // Compute scalar dot product: kq = sum_j s_k[j] * s_q[j]
+    float p_kq = 0.0f;
+    for (int j = tid; j < d_k; j += bdim) {
+        p_kq += s_k[j] * s_q[j];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        p_kq += __shfl_down_sync(0xffffffffu, p_kq, off);
+    }
+    __shared__ float red_kq[8];
+    if ((tid & 31) == 0) red_kq[tid >> 5] = p_kq;
+    __syncthreads();
+    if (tid == 0) {
+        float total_kq = red_kq[0];
+        const int nwarps = bdim >> 5;
+        for (int w = 1; w < nwarps; ++w) total_kq += red_kq[w];
+        *s_kq = total_kq;
+    }
+    __syncthreads();
+    const float kq_val = *s_kq;
+
+    // Now, each warp handles rows of S
+    const int warp_id   = tid >> 5;
+    const int lane_id   = tid & 31;
+    const int num_warps = bdim >> 5;
+
+    const bool is_aligned16 = ((reinterpret_cast<uintptr_t>(S_h) & 15) == 0) &&
+                              ((reinterpret_cast<uintptr_t>(s_k) & 15) == 0) &&
+                              ((reinterpret_cast<uintptr_t>(s_q) & 15) == 0);
+    const int d_k4 = d_k >> 2;
+
+    if (((d_k & 3) == 0) && is_aligned16 && d_k4 <= 32) {
+        // Ultra-fast path: d_k <= 128 and multiple of 4 (e.g. d_k=128)
+        // 1 load of S, all math in registers, 1 store of S
+        const float4* s_k4 = reinterpret_cast<const float4*>(s_k);
+        const float4* s_q4 = reinterpret_cast<const float4*>(s_q);
+        const float4 kj = (lane_id < d_k4) ? s_k4[lane_id] : make_float4(0.f, 0.f, 0.f, 0.f);
+        const float4 qj = (lane_id < d_k4) ? s_q4[lane_id] : make_float4(0.f, 0.f, 0.f, 0.f);
+
+        for (int r = warp_id; r < d_v; r += num_warps) {
+            float4* S_row4 = reinterpret_cast<float4*>(S_h + r * d_k);
+            float4 s = (lane_id < d_k4) ? S_row4[lane_id] : make_float4(0.f, 0.f, 0.f, 0.f);
+
+            float dot_k = s.x * kj.x + s.y * kj.y + s.z * kj.z + s.w * kj.w;
+            float dot_q = s.x * qj.x + s.y * qj.y + s.z * qj.z + s.w * qj.w;
+
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                dot_k += __shfl_down_sync(0xffffffffu, dot_k, off);
+                dot_q += __shfl_down_sync(0xffffffffu, dot_q, off);
+            }
+
+            float beta_delta = 0.0f;
+            if (lane_id == 0) {
+                const float u = alpha_val * dot_k;
+                const float delta = v_h[r] - u;
+                o_h[r] = alpha_val * dot_q + beta_val * delta * kq_val;
+                beta_delta = beta_val * delta;
+            }
+            beta_delta = __shfl_sync(0xffffffffu, beta_delta, 0);
+
+            if (lane_id < d_k4) {
+                s.x = alpha_val * s.x + beta_delta * kj.x;
+                s.y = alpha_val * s.y + beta_delta * kj.y;
+                s.z = alpha_val * s.z + beta_delta * kj.z;
+                s.w = alpha_val * s.w + beta_delta * kj.w;
+                S_row4[lane_id] = s;
+            }
+        }
+    } else if (((d_k & 3) == 0) && is_aligned16) {
+        // Fast path for d_k > 128 and multiple of 4
+        const float4* s_k4 = reinterpret_cast<const float4*>(s_k);
+        const float4* s_q4 = reinterpret_cast<const float4*>(s_q);
+
+        for (int r = warp_id; r < d_v; r += num_warps) {
+            float4* S_row4 = reinterpret_cast<float4*>(S_h + r * d_k);
+            float dot_k = 0.0f;
+            float dot_q = 0.0f;
+
+            for (int j4 = lane_id; j4 < d_k4; j4 += 32) {
+                const float4 s  = S_row4[j4];
+                const float4 kj = s_k4[j4];
+                const float4 qj = s_q4[j4];
+                dot_k += s.x * kj.x + s.y * kj.y + s.z * kj.z + s.w * kj.w;
+                dot_q += s.x * qj.x + s.y * qj.y + s.z * qj.z + s.w * qj.w;
+            }
+
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                dot_k += __shfl_down_sync(0xffffffffu, dot_k, off);
+                dot_q += __shfl_down_sync(0xffffffffu, dot_q, off);
+            }
+
+            float beta_delta = 0.0f;
+            if (lane_id == 0) {
+                const float u = alpha_val * dot_k;
+                const float delta = v_h[r] - u;
+                o_h[r] = alpha_val * dot_q + beta_val * delta * kq_val;
+                beta_delta = beta_val * delta;
+            }
+            beta_delta = __shfl_sync(0xffffffffu, beta_delta, 0);
+
+            for (int j4 = lane_id; j4 < d_k4; j4 += 32) {
+                float4 s = S_row4[j4];
+                const float4 kj = s_k4[j4];
+                s.x = alpha_val * s.x + beta_delta * kj.x;
+                s.y = alpha_val * s.y + beta_delta * kj.y;
+                s.z = alpha_val * s.z + beta_delta * kj.z;
+                s.w = alpha_val * s.w + beta_delta * kj.w;
+                S_row4[j4] = s;
+            }
+        }
+    } else {
+        // General path for arbitrary d_k
+        for (int r = warp_id; r < d_v; r += num_warps) {
+            float* S_row = S_h + r * d_k;
+            float dot_k = 0.0f;
+            float dot_q = 0.0f;
+
+            for (int j = lane_id; j < d_k; j += 32) {
+                const float s = S_row[j];
+                dot_k += s * s_k[j];
+                dot_q += s * s_q[j];
+            }
+
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                dot_k += __shfl_down_sync(0xffffffffu, dot_k, off);
+                dot_q += __shfl_down_sync(0xffffffffu, dot_q, off);
+            }
+
+            float beta_delta = 0.0f;
+            if (lane_id == 0) {
+                const float u = alpha_val * dot_k;
+                const float delta = v_h[r] - u;
+                o_h[r] = alpha_val * dot_q + beta_val * delta * kq_val;
+                beta_delta = beta_val * delta;
+            }
+            beta_delta = __shfl_sync(0xffffffffu, beta_delta, 0);
+
+            for (int j = lane_id; j < d_k; j += 32) {
+                S_row[j] = alpha_val * S_row[j] + beta_delta * s_k[j];
+            }
+        }
+    }
+}
+
 inline void check_fp32(const ::brotensor::Tensor& t,
                        const char* op, const char* name) {
     if (t.dtype != ::brotensor::Dtype::FP32) {
@@ -203,6 +392,25 @@ void run_scan(const ::brotensor::Tensor& Q,
         O.resize(L, Dv, ::brotensor::Dtype::FP32);
     }
     if (L == 0) return;
+
+    if (L == 1) {
+        int num_warps = (d_v < 8) ? d_v : 8;
+        if (num_warps < 1) num_warps = 1;
+        const int block = num_warps * 32;
+        const size_t shmem = static_cast<size_t>(2 * d_k + 1) * sizeof(float);
+        gated_delta_rule_step_fast_kernel<<<num_heads, block, shmem, cur_stream()>>>(
+            static_cast<const float*>(Q.data),
+            static_cast<const float*>(K.data),
+            static_cast<const float*>(V.data),
+            static_cast<const float*>(a_raw.data),
+            static_cast<const float*>(beta.data),
+            static_cast<const float*>(log_A.data),
+            num_heads, d_k, d_v,
+            static_cast<float*>(state.data),
+            static_cast<float*>(O.data));
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     // Cap block at d_v * d_k (no point launching more threads than work units
     // in the largest pass) and at GDR_BLOCK to keep occupancy reasonable.
