@@ -135,13 +135,15 @@ __global__ void hip_flash_attention_decode_kernel(
         const T* __restrict__ V_cache,
         const float* __restrict__ mask,
         T* __restrict__ Out,
-        int valid_len, int Dq, int Dkv, int head_dim,
+        int Lq, int valid_len, int Dq, int Dkv, int head_dim, int seq_offset,
         float attn_softcap, int window, int group) {
+    (void)Lq;
     extern __shared__ float s_smem[];
     float* scores = s_smem;
     float* red    = s_smem + kFaKtile;
 
-    const int h           = blockIdx.x;
+    const int q           = blockIdx.x;
+    const int h           = blockIdx.y;
     const int tid         = threadIdx.x;
     const int warp_id     = tid >> 5;
     const int lane        = tid & 31;
@@ -152,8 +154,9 @@ __global__ void hip_flash_attention_decode_kernel(
     const int head_off_kv = h_kv * head_dim;
     const float inv_sqrt  = rsqrtf(static_cast<float>(head_dim));
 
-    const int lo = (window > 0 && valid_len - window > 0) ? (valid_len - window) : 0;
-    const int k_hi = valid_len - 1;
+    const int p_q = seq_offset + q;
+    const int lo = (window > 0 && p_q - window + 1 > 0) ? (p_q - window + 1) : 0;
+    const int k_hi = p_q;
 
     float run_max = -1e30f;
     float run_sum = 0.0f;
@@ -161,7 +164,7 @@ __global__ void hip_flash_attention_decode_kernel(
     #pragma unroll
     for (int i = 0; i < kMaxHdPerThread; ++i) partial[i] = 0.0f;
 
-    const T* q_vec = Q + head_off_q;
+    const T* q_vec = Q + static_cast<size_t>(q) * Dq + head_off_q;
 
     for (int k0 = (lo / kFaKtile) * kFaKtile; k0 <= k_hi; k0 += kFaKtile) {
         int klen = kFaKtile;
@@ -238,7 +241,7 @@ __global__ void hip_flash_attention_decode_kernel(
     int slot = 0;
     for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
         if (slot >= kMaxHdPerThread) break;
-        Out[head_off_q + d] = FaScalar<T>::from_f32(partial[slot] * inv);
+        Out[static_cast<size_t>(q) * Dq + head_off_q + d] = FaScalar<T>::from_f32(partial[slot] * inv);
     }
 }
 
@@ -418,37 +421,40 @@ void hip_flash_attention_decode(const ::brotensor::Tensor& Q,
                                 float attn_softcap, int window) {
     using ::brotensor::Dtype;
     const Dtype dt = Q.dtype;
+    const int Lq  = Q.rows;
     const int Dq  = Q.cols;
     const int Dkv = K_cache.cols;
     const int head_dim = Dq / num_q_heads;
     const int group = num_q_heads / num_kv_heads;
 
-    if (O.rows != 1 || O.cols != Dq || O.dtype != dt) {
-        O.resize(1, Dq, dt);
+    if (O.rows != Lq || O.cols != Dq || O.dtype != dt) {
+        O.resize(Lq, Dq, dt);
     }
-    if (valid_len <= 0) {
+    if (valid_len <= 0 || Lq <= 0) {
         O.zero();
         return;
     }
 
+    const int seq_offset = valid_len - Lq;
     const size_t shmem = (static_cast<size_t>(kFaKtile) + kFaBlock) * sizeof(float);
     hipStream_t stream = cur_stream();
+    dim3 grid(Lq, num_q_heads, 1);
 
     if (dt == Dtype::FP16) {
-        hip_flash_attention_decode_kernel<__half><<<num_q_heads, kFaBlock, shmem, stream>>>(
+        hip_flash_attention_decode_kernel<__half><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const __half*>(Q.data), static_cast<const __half*>(K_cache.data), static_cast<const __half*>(V_cache.data),
             nullptr, static_cast<__half*>(O.data),
-            valid_len, Dq, Dkv, head_dim, attn_softcap, window, group);
+            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
     } else if (dt == Dtype::BF16) {
-        hip_flash_attention_decode_kernel<hip_bfloat16><<<num_q_heads, kFaBlock, shmem, stream>>>(
+        hip_flash_attention_decode_kernel<hip_bfloat16><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const hip_bfloat16*>(Q.data), static_cast<const hip_bfloat16*>(K_cache.data), static_cast<const hip_bfloat16*>(V_cache.data),
             nullptr, static_cast<hip_bfloat16*>(O.data),
-            valid_len, Dq, Dkv, head_dim, attn_softcap, window, group);
+            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
     } else {
-        hip_flash_attention_decode_kernel<float><<<num_q_heads, kFaBlock, shmem, stream>>>(
+        hip_flash_attention_decode_kernel<float><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const float*>(Q.data), static_cast<const float*>(K_cache.data), static_cast<const float*>(V_cache.data),
             nullptr, static_cast<float*>(O.data),
-            valid_len, Dq, Dkv, head_dim, attn_softcap, window, group);
+            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
     }
     BROTENSOR_HIP_CHECK(hipGetLastError());
 }
@@ -462,6 +468,7 @@ void hip_flash_attention_decode_masked(const ::brotensor::Tensor& Q,
                                        float attn_softcap, int window) {
     using ::brotensor::Dtype;
     const Dtype dt = Q.dtype;
+    const int Lq  = Q.rows;
     const int Dq  = Q.cols;
     const int Dkv = K_cache.cols;
     const int head_dim = Dq / num_q_heads;
@@ -476,24 +483,26 @@ void hip_flash_attention_decode_masked(const ::brotensor::Tensor& Q,
         return;
     }
 
+    const int seq_offset = valid_len - Lq;
     const size_t shmem = (static_cast<size_t>(kFaKtile) + kFaBlock) * sizeof(float);
     hipStream_t stream = cur_stream();
+    dim3 grid(1, num_q_heads, 1);
 
     if (dt == Dtype::FP16) {
-        hip_flash_attention_decode_kernel<__half><<<num_q_heads, kFaBlock, shmem, stream>>>(
+        hip_flash_attention_decode_kernel<__half><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const __half*>(Q.data), static_cast<const __half*>(K_cache.data), static_cast<const __half*>(V_cache.data),
             d_mask, static_cast<__half*>(O.data),
-            valid_len, Dq, Dkv, head_dim, attn_softcap, window, group);
+            1, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
     } else if (dt == Dtype::BF16) {
-        hip_flash_attention_decode_kernel<hip_bfloat16><<<num_q_heads, kFaBlock, shmem, stream>>>(
+        hip_flash_attention_decode_kernel<hip_bfloat16><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const hip_bfloat16*>(Q.data), static_cast<const hip_bfloat16*>(K_cache.data), static_cast<const hip_bfloat16*>(V_cache.data),
             d_mask, static_cast<hip_bfloat16*>(O.data),
-            valid_len, Dq, Dkv, head_dim, attn_softcap, window, group);
+            1, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
     } else {
-        hip_flash_attention_decode_kernel<float><<<num_q_heads, kFaBlock, shmem, stream>>>(
+        hip_flash_attention_decode_kernel<float><<<grid, kFaBlock, shmem, stream>>>(
             static_cast<const float*>(Q.data), static_cast<const float*>(K_cache.data), static_cast<const float*>(V_cache.data),
             d_mask, static_cast<float*>(O.data),
-            valid_len, Dq, Dkv, head_dim, attn_softcap, window, group);
+            1, valid_len, Dq, Dkv, head_dim, seq_offset, attn_softcap, window, group);
     }
     BROTENSOR_HIP_CHECK(hipGetLastError());
 }

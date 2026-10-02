@@ -329,7 +329,15 @@ void conv2d_forward(const ::brotensor::Tensor& X,
         const int K_col = C_in * kH * kW;
         const int M_col = H_out * W_out;
         const size_t elem_size = X.dtype == ::brotensor::Dtype::FP32 ? sizeof(float) : 2;
-        void* d_col = hip_alloc((size_t)K_col * M_col * elem_size, X.device.index);
+        const size_t needed = (size_t)K_col * M_col * elem_size;
+        static thread_local void* s_col_buf = nullptr;
+        static thread_local size_t s_col_cap = 0;
+        if (needed > s_col_cap) {
+            if (s_col_buf) hip_free(s_col_buf, X.device.index);
+            s_col_cap = needed * 2;
+            s_col_buf = hip_alloc(s_col_cap, X.device.index);
+        }
+        void* d_col = s_col_buf;
 
         const float alpha = 1.0f;
         const float beta  = 0.0f;
@@ -382,7 +390,6 @@ void conv2d_forward(const ::brotensor::Tensor& X,
                     reinterpret_cast<float*>(y_ptr), M_col));
             }
         }
-        hip_free(d_col, X.device.index);
 
         if (bias) {
             const int blocks = static_cast<int>((total + CONV_BLOCK - 1) / CONV_BLOCK);

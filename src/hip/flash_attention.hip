@@ -646,7 +646,7 @@ void hip_flash_attention_windowed_forward(const ::brotensor::Tensor& Q,
     if (Lq == 0 || Lk == 0 || Dq == 0) return;
 
     const int group = num_heads / n_kv;
-    if (!causal && window == 0 && d_mask == nullptr && group == 1 && Lq >= 64 && Lk >= 64 && head_dim <= 128) {
+    if (!causal && window == 0 && d_mask == nullptr && group == 1 && (head_dim > 128 || (Lq >= 64 && Lk >= 64))) {
         if (hip_dense_attention_hipblas(Q, K, V, num_heads, head_dim, O)) {
             return;
         }
