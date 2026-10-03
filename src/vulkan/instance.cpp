@@ -117,6 +117,30 @@ bool probe_physical(const LoaderFns& f, VkPhysicalDevice pd, PhysInfo& info, std
     f.vkEnumerateDeviceExtensionProperties(pd, nullptr, &ne, exts.data());
     info.memory_budget = has_extension(exts, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     info.cooperative_matrix = has_extension(exts, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    info.memory_model = f12.vulkanMemoryModel == VK_TRUE && f12.vulkanMemoryModelDeviceScope == VK_TRUE;
+
+    // The GEMM kernels use 16x16x16 FP16 x FP16 -> FP32 subgroup fragments
+    // at a pinned subgroup size of 32 (shaders/gemm_cm.comp). Without that
+    // shape, the memory model GLSL's coopmat needs, or the subgroup size,
+    // the matrix ops run the SIMT kernels.
+    if (info.cooperative_matrix && info.memory_model && info.subgroup_size_control &&
+        info.min_subgroup <= 32 && info.max_subgroup >= 32 &&
+        f.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) {
+        std::uint32_t ncm = 0;
+        f.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(pd, &ncm, nullptr);
+        std::vector<VkCooperativeMatrixPropertiesKHR> cm(
+            ncm, VkCooperativeMatrixPropertiesKHR{VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+        f.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(pd, &ncm, cm.data());
+        for (const auto& p : cm) {
+            if (p.MSize == 16 && p.NSize == 16 && p.KSize == 16 &&
+                p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                p.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && p.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                p.scope == VK_SCOPE_SUBGROUP_KHR) {
+                info.coopmat_f16 = true;
+            }
+        }
+    }
+    if (env_true("BROTENSOR_VK_NO_COOPMAT")) info.coopmat_f16 = false;
     return true;
 }
 
@@ -213,6 +237,12 @@ DeviceCtx::DeviceCtx(int index, const PhysInfo& info) : index_(index), info_(inf
     f12.shaderFloat16 = VK_TRUE;
     f12.shaderInt8 = VK_TRUE;
     f12.storageBuffer8BitAccess = VK_TRUE;
+    // GL_KHR_cooperative_matrix pulls in GL_KHR_memory_scope_semantics, whose
+    // SPIR-V declares the VulkanMemoryModel capability.
+    if (info.memory_model) {
+        f12.vulkanMemoryModel = VK_TRUE;
+        f12.vulkanMemoryModelDeviceScope = VK_TRUE;
+    }
     if (v13) f12.pNext = &f13;
     else if (info.cooperative_matrix) f12.pNext = &cmf;
     VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};

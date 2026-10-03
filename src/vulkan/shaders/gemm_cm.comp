@@ -1,0 +1,304 @@
+#version 460
+// Tensor-core GEMM through VK_KHR_cooperative_matrix: 16x16x16 FP16 fragments
+// with FP32 accumulation, subgroup size pinned to 32 by the host. Contract and
+// epilogues: gemm_common.glsl. -DDT=1 (FP16) or -DDT=2 (BF16 storage, each
+// element converted to FP16 on its way into shared memory, the dtype policy
+// in docs/vulkan.md); C and bias share the dtype.
+//
+// Workgroup tile BM x BN (r columns), K step BK, double-buffered in shared
+// memory, filled with 8-element chunks (16-byte loads when VEC = 1, see
+// load8). Each subgroup owns a WM x WN sub-tile of fragments. Any
+// M, N, K works: chunks outside the matrix load as zero and the epilogue
+// writes inside it only. The shared array is laid out the way the operand is
+// stored (k contiguous for A / NT B, m or n contiguous for TA / NB) and the
+// fragment load picks the matching row- or column-major layout.
+//
+// EPI_SWIGLU maps the B tile's 16-row blocks alternately onto gate rows
+// [n0, n0 + BN/2) and up rows half + [n0, n0 + BN/2), so each subgroup holds
+// a gate fragment next to its up fragment (WN must be a multiple of 32).
+//
+// Epilogue through shared memory: each fragment is stored to a per-subgroup
+// scratch that aliases As (free once the K loop's last barrier has passed),
+// then every lane applies bias / activation / mode to its elements and
+// writes them with bounds checks. The per-element pass is what lets the
+// fragment layout stay opaque (KHR coopmat does not say which lane holds
+// which element).
+#include "common.glsl"
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint BM = 128;
+layout(constant_id = 1) const uint BN = 128;
+layout(constant_id = 2) const uint BK = 32;
+layout(constant_id = 3) const uint WM = 64;
+layout(constant_id = 4) const uint WN = 64;
+layout(constant_id = 5) const uint WG = 128;
+layout(constant_id = 6) const uint EPI = 0;
+layout(constant_id = 7) const uint ACT = 0;
+layout(constant_id = 8) const uint TA = 0;
+layout(constant_id = 9) const uint NB = 0;
+layout(constant_id = 10) const uint VEC = 1;
+layout(constant_id = 11) const uint DIRECT = 0;   // fragment-form epilogue, see main()
+layout(constant_id = 12) const uint BIAS = 0;     // pc.bias is set
+layout(local_size_x_id = 5) in;
+
+#include "gemm_common.glsl"
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer U4Buf { uvec4 v[]; };
+
+const uint TM = WM / 16;
+const uint TN = WN / 16;
+const uint LA = (BM * BK / 8) / WG;      // 8-element chunks per thread per A tile
+const uint LB = (BN * BK / 8) / WG;
+const uint CA = (TA != 0) ? BM / 8 : BK / 8;   // chunks per shared row
+const uint CB = (NB != 0) ? BN / 8 : BK / 8;
+const uint SKA = CA + 1;                 // shared row stride in uvec4 (+1 pad)
+const uint SKB = CB + 1;
+// One buffer: rows x (chunks + 1). Written without ?: so the pipeline guard
+// can evaluate it (TA, NB are 0 or 1). A byte of LDS matters: at 128x128 the
+// two buffers are 40 KiB, which leaves room for three workgroups per WGP.
+const uint ASZ = BM * BK / 8 + BM * (1 - TA) + BK * TA;
+const uint BSZ = BN * BK / 8 + BN * (1 - NB) + BK * NB;
+
+shared uvec4 As[2 * ASZ];
+shared uvec4 Bs[2 * BSZ];
+
+uvec4 ra[LA], rb[LB];
+
+uvec4 bf16x8_to_f16x8(uvec4 w) {
+    uvec4 o;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const vec2 f = vec2(uintBitsToFloat(w[i] << 16), uintBitsToFloat(w[i] & 0xffff0000u));
+        o[i] = packFloat2x16(f16vec2(f));   // RNE conversion, then a bit pack
+    }
+    return o;
+}
+
+// Eight consecutive elements of a row (as FP16 when converted), zero outside
+// the matrix.
+//
+// VEC = 1 (host-checked: 16-byte aligned bases, leading dimensions, batch
+// strides, and contiguous extents that are multiples of 8) means a chunk is
+// wholly inside or wholly outside. The load is then unconditional, at a
+// clamped index, and the raw 16 bytes go to registers with a validity bit;
+// the zeroing select and the BF16 -> FP16 conversion wait until the chunk is
+// stored to shared memory. Anything that consumes the loaded value at the
+// load (a branch, a select, a conversion) makes the compiler wait for it
+// there instead of behind the fragment math, which cost half the K loop's
+// throughput on RADV.
+uvec4 load8_scalar(uint64_t base, uint ld, uint row, bool row_ok, uint col, uint ncols) {
+    if (!row_ok || col >= ncols) return uvec4(0);
+    const uint idx = row * ld + col;
+    float h[8];
+    [[unroll]] for (uint e = 0; e < 8; ++e) h[e] = (col + e < ncols) ? load_elem(DT, base, idx + e) : 0.0;
+    return uvec4(packFloat2x16(f16vec2(h[0], h[1])), packFloat2x16(f16vec2(h[2], h[3])),
+                 packFloat2x16(f16vec2(h[4], h[5])), packFloat2x16(f16vec2(h[6], h[7])));
+}
+
+uint va, vb;   // VEC: validity bit per chunk in ra / rb
+
+void load_chunk(uint64_t base, uint ld, uint row, bool row_ok, uint col, uint ncols, uint bit,
+                inout uint valid, out uvec4 dst) {
+    if (VEC != 0) {
+        const bool ok = row_ok && col < ncols;
+        dst = U4Buf(base).v[ok ? (row * ld + col) / 8u : 0u];
+        valid |= ok ? (1u << bit) : 0u;
+    } else {
+        dst = load8_scalar(base, ld, row, row_ok, col, ncols);
+    }
+}
+
+uvec4 finish_chunk(uvec4 w, uint valid, uint bit) {
+    if (VEC == 0) return w;
+    const uvec4 h = DT == DT_BF16 ? bf16x8_to_f16x8(w) : w;
+    return (valid & (1u << bit)) != 0u ? h : uvec4(0);
+}
+
+// Global row of B behind B-tile row rr (NT layout), and whether it exists.
+uint b_row(uint n0, uint rr, out bool ok) {
+    if (EPI == EPI_SWIGLU) {
+        const uint tb = rr / 16u, o = n0 + (tb / 2u) * 16u + rr % 16u;
+        ok = o < pc.half_n;
+        return ((tb & 1u) != 0u ? pc.half_n : 0u) + o;
+    }
+    ok = n0 + rr < pc.n;
+    return n0 + rr;
+}
+
+void load_tiles(uint64_t A, uint64_t B, uint m0, uint n0, uint k0) {
+    const uint tid = gl_LocalInvocationID.x;
+    va = 0u;
+    vb = 0u;
+    [[unroll]] for (uint j = 0; j < LA; ++j) {
+        const uint i = tid + j * WG, r = i / CA, q = i % CA;
+        if (TA == 0) load_chunk(A, pc.lda, m0 + r, m0 + r < pc.m, k0 + q * 8u, pc.k, j, va, ra[j]);
+        else         load_chunk(A, pc.lda, k0 + r, k0 + r < pc.k, m0 + q * 8u, pc.m, j, va, ra[j]);
+    }
+    [[unroll]] for (uint j = 0; j < LB; ++j) {
+        const uint i = tid + j * WG, r = i / CB, q = i % CB;
+        if (NB == 0) {
+            bool ok;
+            const uint row = b_row(n0, r, ok);
+            load_chunk(B, pc.ldb, row, ok, k0 + q * 8u, pc.k, j, vb, rb[j]);
+        } else {
+            load_chunk(B, pc.ldb, k0 + r, k0 + r < pc.k, n0 + q * 8u, pc.n, j, vb, rb[j]);
+        }
+    }
+}
+
+void store_tiles(uint buf) {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint j = 0; j < LA; ++j) {
+        const uint i = tid + j * WG;
+        As[buf * ASZ + (i / CA) * SKA + i % CA] = finish_chunk(ra[j], va, j);
+    }
+    [[unroll]] for (uint j = 0; j < LB; ++j) {
+        const uint i = tid + j * WG;
+        Bs[buf * BSZ + (i / CB) * SKB + i % CB] = finish_chunk(rb[j], vb, j);
+    }
+}
+
+float scratch(uint base, uint e) { return uintBitsToFloat(As[base + e / 4u][e % 4u]); }
+float bias_at(uint n) { return BIAS != 0 ? load_elem(DT, pc.bias, n) : 0.0; }
+
+void main() {
+    const uint z = gl_WorkGroupID.z;
+    const uint64_t A = batch_base(pc.a, pc.sa, z, 2u);
+    const uint64_t B = batch_base(pc.b, pc.sb, z, 2u);
+    const uint64_t C = batch_base(pc.c, pc.sc, z, 2u);
+    const uint m0 = (gl_WorkGroupID.y + pc.tm0) * BM;
+    const uint n0 = (gl_WorkGroupID.x + pc.tn0) * (EPI == EPI_SWIGLU ? BN / 2u : BN);
+    const uint sg = gl_SubgroupID;
+    const uint wm0 = (sg % (BM / WM)) * WM, wn0 = (sg / (BM / WM)) * WN;
+    const uint nk = (pc.k + BK - 1u) / BK;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[TM * TN];
+    [[unroll]] for (uint i = 0; i < TM * TN; ++i)
+        acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    load_tiles(A, B, m0, n0, 0u);
+    store_tiles(0u);
+    barrier();
+
+    for (uint kt = 0; kt < nk; ++kt) {
+        const uint cur = kt & 1u;
+        if (kt + 1u < nk) load_tiles(A, B, m0, n0, (kt + 1u) * BK);
+        [[unroll]] for (uint kk = 0; kk < BK / 16u; ++kk) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa[TM];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb[TN];
+            [[unroll]] for (uint i = 0; i < TM; ++i) {
+                if (TA == 0)
+                    coopMatLoad(fa[i], As, cur * ASZ + (wm0 + i * 16u) * SKA + kk * 2u, SKA,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                else
+                    coopMatLoad(fa[i], As, cur * ASZ + kk * 16u * SKA + (wm0 + i * 16u) / 8u, SKA,
+                                gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint j = 0; j < TN; ++j) {
+                if (NB == 0)
+                    coopMatLoad(fb[j], Bs, cur * BSZ + (wn0 + j * 16u) * SKB + kk * 2u, SKB,
+                                gl_CooperativeMatrixLayoutColumnMajor);
+                else
+                    coopMatLoad(fb[j], Bs, cur * BSZ + kk * 16u * SKB + (wn0 + j * 16u) / 8u, SKB,
+                                gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                [[unroll]] for (uint j = 0; j < TN; ++j)
+                    acc[i * TN + j] = coopMatMulAdd(fa[i], fb[j], acc[i * TN + j]);
+        }
+        if (kt + 1u < nk) store_tiles(cur ^ 1u);
+        barrier();
+    }
+
+    // ── epilogue, fragment form (DIRECT): FP16 output, every tile of this
+    // dispatch interior (the host dispatches the edge tiles separately with
+    // DIRECT = 0) and C aligned. The bias comes in as a fragment loaded with
+    // row stride 0 (every row = bias[n .. n + 16)), and the activation,
+    // SwiGLU gate and accumulate are elementwise on fragments of one type, so
+    // nothing depends on the opaque element -> lane layout. Deciding this at
+    // run time instead of by specialisation cost the K loop 20% on RADV.
+    if (DIRECT != 0) {
+        const uint step = (EPI == EPI_SWIGLU) ? 2u : 1u;
+        [[unroll]] for (uint i = 0; i < TM; ++i) {
+            [[unroll]] for (uint j = 0; j < TN; j += step) {
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> r = acc[i * TN + j];
+                const uint col = EPI == EPI_SWIGLU ? n0 + ((wn0 / 16u + j) / 2u) * 16u : n0 + wn0 + j * 16u;
+                const uint o = (m0 + wm0 + i * 16u) * pc.ldc + col;
+                if (BIAS != 0) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> bb;
+                    coopMatLoad(bb, F16Buf(pc.bias).v, col, 0u, gl_CooperativeMatrixLayoutRowMajor);
+                    r += coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(bb);
+                }
+                if (EPI == EPI_SWIGLU) {
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> u = acc[i * TN + j + 1u];
+                    if (BIAS != 0) {
+                        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> bu;
+                        coopMatLoad(bu, F16Buf(pc.bias).v, pc.half_n + col, 0u, gl_CooperativeMatrixLayoutRowMajor);
+                        u += coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(bu);
+                    }
+                    for (int e = 0; e < r.length(); ++e) r[e] = silu(r[e]) * u[e];
+                } else if (ACT != LACT_NONE) {
+                    for (int e = 0; e < r.length(); ++e) r[e] = gemm_act(ACT, r[e]);
+                }
+                if (EPI == EPI_ACCUM) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> old;
+                    coopMatLoad(old, F16Buf(C).v, o, pc.ldc, gl_CooperativeMatrixLayoutRowMajor);
+                    r += coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(old);
+                }
+                coopMatStore(coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(r),
+                             F16Buf(C).v, o, pc.ldc, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        return;
+    }
+
+    // ── epilogue: per-subgroup scratch of 2 x 256 floats aliasing As ──
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sbase = sg * 128u;
+    const uint step = (EPI == EPI_SWIGLU) ? 2u : 1u;
+    [[unroll]] for (uint i = 0; i < TM; ++i) {
+        [[unroll]] for (uint j = 0; j < TN; j += step) {
+            coopMatStore(acc[i * TN + j], As, sbase, 4u, gl_CooperativeMatrixLayoutRowMajor);
+            if (EPI == EPI_SWIGLU)
+                coopMatStore(acc[i * TN + j + 1u], As, sbase + 64u, 4u, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            const uint gm0 = m0 + wm0 + i * 16u;
+            if (EPI == EPI_GEGLU) {
+                for (uint e = lane; e < 128u; e += gl_SubgroupSize) {
+                    const uint rr = e / 8u, p = e % 8u, gm = gm0 + rr;
+                    const uint nr = n0 + wn0 + j * 16u + 2u * p;    // r column of the pair
+                    if (gm < pc.m && nr + 1u < pc.n) {
+                        const float a = scratch(sbase, rr * 16u + 2u * p) + bias_at(nr);
+                        const float g = scratch(sbase, rr * 16u + 2u * p + 1u) + bias_at(nr + 1u);
+                        store_elem(DT, C, gm * pc.ldc + nr / 2u, a * gelu_exact(g));
+                    }
+                }
+            } else if (EPI == EPI_SWIGLU) {
+                const uint ob = (wn0 / 16u + j) / 2u;
+                for (uint e = lane; e < 256u; e += gl_SubgroupSize) {
+                    const uint gm = gm0 + e / 16u, oc = n0 + ob * 16u + e % 16u;
+                    if (gm < pc.m && oc < pc.half_n) {
+                        const float g = scratch(sbase, e) + bias_at(oc);
+                        const float u = scratch(sbase + 64u, e) + bias_at(pc.half_n + oc);
+                        store_elem(DT, C, gm * pc.ldc + oc, silu(g) * u);
+                    }
+                }
+            } else {
+                for (uint e = lane; e < 256u; e += gl_SubgroupSize) {
+                    const uint gm = gm0 + e / 16u, nc = n0 + wn0 + j * 16u + e % 16u;
+                    if (gm < pc.m && nc < pc.n) {
+                        float v = gemm_act(ACT, scratch(sbase, e) + bias_at(nc));
+                        const uint o = gm * pc.ldc + nc;
+                        if (EPI == EPI_ACCUM) v += load_elem(DT, C, o);
+                        store_elem(DT, C, o, v);
+                    }
+                }
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+    }
+}

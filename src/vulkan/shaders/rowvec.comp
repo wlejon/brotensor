@@ -1,0 +1,26 @@
+#version 460
+// Per-column vector ops over a row-major (L, D) tensor, one invocation per
+// element (grid-stride), FP32 arithmetic, X / v / w / Y in -DDT:
+//   ROWVEC_MODULATE  y = x * (1 + v[col]) + w[col]    (AdaLN: v = scale, w = shift)
+//   ROWVEC_MUL       y = x * v[col]
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint OP = 0;
+layout(push_constant) uniform PC {
+    uint64_t x, v, w, y;
+    uint n, d;
+} pc;
+
+#include "op_codes.h"
+
+void main() {
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += GRID_STRIDE_X) {
+        const uint c = i % pc.d;
+        const float x = load_elem(DT, pc.x, i), v = load_elem(DT, pc.v, c);
+        float y;
+        if (OP == ROWVEC_MODULATE) y = x * (1.0 + v) + load_elem(DT, pc.w, c);
+        else                       y = x * v;
+        store_elem(DT, pc.y, i, y);
+    }
+}

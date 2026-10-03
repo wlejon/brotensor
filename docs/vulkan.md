@@ -7,8 +7,16 @@ behind its design are in `../vk-spike/RESULTS.md` (Radeon 8060S, Mesa RADV).
 
 **Status:** the runtime is complete. The ops registered so far are the elementwise
 family, the activation backwards, the bias adds, cast, copies, row concat and
-split, the NCHW / sequence transposes, and the row and column reductions. The
-backend is never the default device. To select it, use
+split, the NCHW / sequence transposes, the row and column reductions (chunk 1),
+and the transformer core (chunk 2): `matmul`, `matmul_abt`, the linear family
+(`linear_forward`, `_batched`, `_batched_fp16`, `_fp16_act`, `_ex` with all four
+epilogues), the GEMM backwards (`matmul_backward`, `linear_backward`,
+`linear_backward_batched`), the LayerNorm family (vector, batched inference with
+and without beta, FP16, with caches, both backwards), RMSNorm, per-head L2 norm,
+pixel norm, softmax (masked vector, rows, backward), every RoPE variant
+(`rope_forward/backward`, `rope_apply`, `_backward`, `_perhead`,
+`rope_qkv_packed_inplace`, `rope_apply_mrope`), SwiGLU / GeGLU forward and
+backward, `modulate` and `broadcast_mul`. The backend is never the default device. To select it, use
 `set_default_device(Device::vulkan(i))`, a `DeviceScope`, or
 `BROTENSOR_DEFAULT_DEVICE=vulkan` (also `vk`, `vulkan:1`). Any other op throws
 "not implemented on vulkan".
@@ -43,9 +51,17 @@ src/vulkan/
   tensor.cpp                    AllocVTable: alloc/free/transfers/memset/sync/mem queries
   graph.cpp                     VulkanGraph / VulkanGraphCapture, Event
   register.cpp                  probe + vtable fill + public stats
+  detail/gemm.h, gemm.cpp       the GEMM dispatcher every matrix op goes through
   ops_*.cpp                     ops, one file per family, each with a fill_vulkan_vtable_<family>
-  shaders/                      *.comp kernels, common.glsl, op_codes.h, shaders.cmake (the list)
-tests/test_vulkan.cpp, test_vulkan_ops.cpp, test_vulkan_common.h
+                                (elementwise, copy, reduce, linear, norm, rope, glu)
+  shaders/                      *.comp kernels, common.glsl, gemm_common.glsl, op_codes.h,
+                                shaders.cmake (the list)
+tests/test_vulkan.cpp           runtime; main(), --only=ops|gemm|norm, --bench-gemm
+tests/test_vulkan_ops.cpp       chunk-1 op parity
+tests/test_vulkan_gemm.cpp      matmul / linear parity, every kernel path
+tests/test_vulkan_norm.cpp      norms, softmax, RoPE, GLUs parity
+tests/test_vulkan_bench.cpp     GEMM / GEMV throughput (not in ctest)
+tests/test_vulkan_common.h
 ```
 
 Keep every file under 1000 lines: a new op family gets its own `ops_<family>.cpp`.
@@ -133,6 +149,101 @@ Keep every file under 1000 lines: a new op family gets its own `ops_<family>.cpp
   replayed and 1.4 µs per command eager. Siblings can treat the two graph
   classes as interchangeable shapes.
 
+## Matrix multiply
+
+Every matrix op is one or more calls to `detail::vulkan::gemm()` (`gemm.cpp`):
+C[z](M, N) = op(A[z]) op(B[z]) with A stored (M, K) or transposed, B stored
+(N, K) (the linear layer) or (K, N), batch strides taken literally (0
+broadcasts), and a fused epilogue r = act(acc + bias) then store, accumulate,
+GeGLU (interleaved pairs) or SwiGLU (stacked gate / up rows). It picks one of
+three kernels:
+
+| Kernel | When | What |
+|---|---|---|
+| `gemv.comp` | NT layout, M <= 8, one batch | 64 invocations per output column, 4 chunks of 16 bytes in flight each, all epilogues fused. 235 GB/s of FP16 weights at B = 1-2, 200-215 GB/s at B = 4-8 (256 GB/s peak) |
+| `gemm_cm.comp` | FP16 / BF16 operands, `coopmat_f16` device | 16x16x16 FP16 fragments, FP32 accumulation, subgroup 32, double-buffered shared tiles |
+| `gemm_simt.comp` | everything else | FP32 FMA, 128x128 or 64x64 tile, 8x8 or 4x4 per invocation |
+
+**Cooperative-matrix kernel.** Tiles (BM x BN x BK / subgroup tile) are
+256x128x32/64x64, 128x128x32/64x64, 128x64x32/64x32 and 64x64x32/32x32. The
+choice (`pick_cm`) was measured on the spike's shapes: 256x128 when M >= 512
+and there are >= 150 tiles (or K >= 8192), 128x128 down to 24 tiles, 64x64 for
+M <= 64. `BROTENSOR_VK_GEMM_CFG=256,128,32,64,64` forces one. Any M, N, K works;
+three things decide the speed, all learned the hard way on RADV / ACO:
+
+* **Never consume a load where it is issued.** A bounds branch, a zeroing
+  select or the BF16 -> FP16 conversion at the load site makes the compiler
+  wait for that load there, not after the fragment math: the first version
+  ran at half the spike's speed for this alone. With `VEC` (16-byte aligned
+  bases, leading dimensions and batch strides, contiguous extents that are
+  multiples of 8), chunks are loaded unconditionally at a clamped index with a
+  validity bit, and the select and conversion happen when the chunk is
+  stored to shared memory. Without `VEC` the kernel takes scalar, bounds-
+  checked loads (correct for any view, much slower).
+* **The epilogue form is a specialisation, not a branch.** Interior tiles with
+  FP16 output store straight from the accumulator (`DIRECT = 1`): the bias is a
+  fragment loaded with row stride 0, and activation, SwiGLU and accumulate are
+  elementwise over fragments of one type, so the opaque element-to-lane layout
+  never matters. Edge tiles, BF16 output and GeGLU go through a per-subgroup
+  scratch in shared memory (aliasing the A tile) and a bounds-checked
+  per-element pass. The host dispatches the full tiles with `DIRECT = 1` and
+  the right / bottom edge strips (if any) separately; choosing the form at run
+  time inside one kernel cost 20% even when the slow branch was never taken.
+* **Shared memory per workgroup sets occupancy.** 128x128 uses exactly 40 KiB
+  (three workgroups per WGP); a few hundred bytes more drops it to two.
+
+Measured through the public `matmul_abt` (FP16, NT, wall clock around 200
+back-to-back launches with one sync, median of 7 batches; hipBLAS and spike
+figures from `../vk-spike/RESULTS.md`):
+
+| Shape (M x N x K) | hipBLAS | spike | Vulkan backend | vs hipBLAS |
+|---|---|---|---|---|
+| 4096 x 4096 x 4096 | 22.7 | 24.9 | 23.8 | 1.05 |
+| 2048 x 2048 x 2048 | 38.8 | 30.4 | 29.8 | 0.77 |
+| 8192 x 8192 x 8192 | 25.2 | 21.2 | 19.6 | 0.78 |
+| 512 x 3072 x 1024 | 28.8 | 25.2 | 23.1 | 0.80 |
+| 512 x 1024 x 3072 | 33.8 | 26.2 | 24.8 | 0.73 |
+| 512 x 4096 x 4096 | 20.6 | 21.0 | 20.3 | 0.98 |
+| 512 x 12288 x 4096 | 21.6 | 17.7 | 16.3 | 0.75 |
+| 512 x 4096 x 12288 | 16.2 | 17.5 | 16.2 | 1.00 |
+| 4096 x 3072 x 3072 | 36.4 | 32.1 | 34.0 | 0.93 |
+| 4096 x 12288 x 3072 | 32.5 | 31.7 | 32.6 | 1.00 |
+
+BF16 operands (converted at load, fallback epilogue) run at 10.7-31.9 TF/s on
+the same shapes, the SIMT kernel at 3-8 TF/s in FP16 or FP32, and `matmul`'s
+NN layout at the NT figures. `brotensor_test_vulkan --bench-gemm` reproduces
+the table (`BROTENSOR_VK_BENCH_TILES=1` adds one column per tile,
+`BROTENSOR_VK_BENCH_SHAPE=<tag>` runs one shape, `BROTENSOR_VK_BENCH_GEMV=1`
+the GEMV table). The GPU shares its power budget with the CPU: long runs
+throttle, so compare configurations in separate short processes.
+
+**Contracts.** As the HIP backend where it is wider than the CPU's: FP32 /
+FP16 / BF16 throughout; `linear_forward_batched` takes FP32 activations against
+FP32 / FP16 / BF16 weights and accumulates in FP32 without rounding the
+activations; `matmul_abt` resizes C only when it cannot hold the batch, and
+throws when a stride reaches past an operand (a device fault on Vulkan is a
+lost device). The SIMT path has no GLU epilogue: it writes an unrounded FP32 r
+and gates it in a second pass, so the result matches the fused kernels.
+
+## Norms, softmax, RoPE
+
+One kernel (`norm.comp`) does the row normalisations, softmax and the column
+reductions their backwards need (gamma / beta gradients accumulate, FP32 sums,
+one rounding into the gradient's dtype). LayerNorm takes the variance from
+deviations in a second pass. RMSNorm accepts FP32 gamma against 16-bit X.
+BF16 is computed directly, not converted.
+
+RoPE with angles from `theta_base` computes inv_freq = exp(-(2i/d) ln base)
+with ln base from the host's `logf` and an exp accurate to about an ulp, and
+takes sin / cos through a three-part Cody-Waite reduction, because GLSL's
+`sin` is only specified on [-pi, pi] and RADV's loses bits at decode
+positions. What remains is the FP32 angle itself: pos * inv_freq carries
+ulp(theta), 0.002 rad at position 30000, on the CPU as much as here, so an
+inv_freq one ulp off glibc's moves the result by up to that. Table RoPE is
+exact. `rope_qkv_packed_inplace` leaves a row whose position is outside the
+table untouched rather than reading past it; M-RoPE positions are not
+range-checked (device pointers, as on CUDA / HIP).
+
 ## Dtype policy
 
 - **FP32**: native.
@@ -190,9 +301,12 @@ achieves.
 
 Kernels that need a fixed subgroup size (cooperative matrix) pass
 `subgroup = 32` to `Pipelines::get`. The device enables
-`VK_KHR_cooperative_matrix` and subgroup size control when they are present.
-RADV's default compute subgroup size is 64, and the spike's coopmat kernels
-pinned it to 32. The chunk-1 kernels are subgroup-size agnostic.
+`VK_KHR_cooperative_matrix`, subgroup size control and the Vulkan memory model
+(GLSL's coopmat declares it) when they are present; `PhysInfo::coopmat_f16`
+says whether the 16x16x16 FP16 -> FP32 subgroup shape exists at subgroup 32.
+RADV's default compute subgroup size is 64, and the coopmat kernels pin it to
+32. The other kernels are subgroup-size agnostic (`gemv.comp` needs the size
+to divide 64; the dispatcher checks).
 
 ## Environment
 
@@ -206,6 +320,8 @@ pinned it to 32. The chunk-1 kernels are subgroup-size agnostic.
 | `BROTENSOR_VK_BLOCK_MB=n` | sub-allocation block size (default 256) |
 | `BROTENSOR_VK_MAPPED=0` | do not map device memory even when possible |
 | `BROTENSOR_VK_ALLOW_OVERSIZE=1` | allow tensors over the per-buffer limit (out of spec) |
+| `BROTENSOR_VK_NO_COOPMAT=1` | do not use cooperative matrix (the GEMMs run the SIMT kernel) |
+| `BROTENSOR_VK_GEMM_CFG=bm,bn,bk,wm,wn` | force one cooperative-matrix tile (one of the four in `gemm.cpp`) |
 
 Vulkan validation layers were not installed on the development machine, so
 the backend has not been run under them.

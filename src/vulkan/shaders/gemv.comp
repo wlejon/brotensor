@@ -1,0 +1,137 @@
+#version 460
+// Skinny linear for the decode regime: Y(MB, *) from X(MB, K) and W(N, K)
+// (NT layout, MB <= 8 rows of X), memory-bound on reading W once. Contract:
+// gemm_common.glsl, all four epilogues fused. -DDTX / -DDTW / -DDTY: storage
+// of X, W and Y (the bias shares Y's); FP32 arithmetic.
+//
+// A workgroup of 256 invocations is four units of 64; a unit produces one
+// output column for all MB rows: one W row (store / accumulate), or the two
+// rows a GLU combines (2j and 2j + 1 for GeGLU, j and half + j for SwiGLU).
+// Each invocation walks K in 8-element chunks (16-byte loads when VEC = 1),
+// lanes reduce with subgroupAdd and the unit's subgroups through shared
+// memory. The host only runs this kernel when the subgroup size divides 64.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MB = 1;     // rows of X, 1..8
+layout(constant_id = 1) const uint EPI = 0;
+layout(constant_id = 2) const uint ACT = 0;
+layout(constant_id = 3) const uint VEC = 1;
+
+#include "gemm_common.glsl"
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer U4Buf { uvec4 v[]; };
+
+const uint NW = (EPI == EPI_GEGLU || EPI == EPI_SWIGLU) ? 2u : 1u;   // W rows per unit
+const uint UNR = MB * NW <= 8u ? 4u : 2u;                             // chunks per step
+shared float s_part[64 * 16];   // [subgroup][row of X * NW], subgroups >= 4 lanes
+
+// Eight consecutive elements as floats. VEC = 1 (host-checked: aligned
+// bases and leading dimensions, K a multiple of 8): one or two unconditional
+// 16-byte loads; a load behind a branch would make the compiler wait for it
+// at the branch instead of after the next ones are issued.
+void load8v(const int dt, uint64_t base, uint idx, out float v[8]) {
+    if (dt == DT_F32) {
+        const uvec4 a = U4Buf(base).v[idx / 4u], b = U4Buf(base).v[idx / 4u + 1u];
+        [[unroll]] for (uint i = 0; i < 4; ++i) { v[i] = uintBitsToFloat(a[i]); v[4 + i] = uintBitsToFloat(b[i]); }
+    } else {
+        const uvec4 w = U4Buf(base).v[idx / 8u];
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            if (dt == DT_F16) {
+                const vec2 f = vec2(unpackFloat2x16(w[i]));
+                v[2 * i] = f.x; v[2 * i + 1] = f.y;
+            } else {
+                v[2 * i] = uintBitsToFloat(w[i] << 16);
+                v[2 * i + 1] = uintBitsToFloat(w[i] & 0xffff0000u);
+            }
+        }
+    }
+}
+
+// The same with bounds (any alignment), zero past ncols.
+void load8s(const int dt, uint64_t base, uint idx, uint col, uint ncols, out float v[8]) {
+    [[unroll]] for (uint e = 0; e < 8; ++e) v[e] = (col + e < ncols) ? load_elem(dt, base, idx + e) : 0.0;
+}
+
+float bias_at(uint n) { return pc.bias != 0 ? load_elem(DTY, pc.bias, n) : 0.0; }
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint unit = tid / 64u, t = tid % 64u;
+    const uint j = ((gl_WorkGroupID.y * gl_NumWorkGroups.x) + gl_WorkGroupID.x) * 4u + unit;
+    const uint nout = EPI == EPI_SWIGLU ? pc.half_n : (EPI == EPI_GEGLU ? pc.n / 2u : pc.n);
+    const bool live = j < nout;
+
+    uint wrow[2];
+    if (EPI == EPI_GEGLU)       { wrow[0] = 2u * j; wrow[1] = 2u * j + 1u; }
+    else if (EPI == EPI_SWIGLU) { wrow[0] = j;      wrow[1] = pc.half_n + j; }
+    else                        { wrow[0] = j;      wrow[1] = j; }
+
+    float acc[16];
+    [[unroll]] for (uint q = 0; q < 16; ++q) acc[q] = 0.0;
+    if (live && VEC != 0) {
+        // UNR chunks per step, loads issued together (clamped index, the
+        // contribution of a chunk past K multiplied by zero), so several
+        // 16-byte loads per invocation are in flight at once.
+        const uint nch = pc.k / 8u;
+        for (uint c0 = t; c0 < nch; c0 += 64u * UNR) {
+            float wv[UNR][NW][8];
+            float ok[UNR];
+            uint cc[UNR];
+            [[unroll]] for (uint u = 0; u < UNR; ++u) {
+                const uint c = c0 + u * 64u;
+                ok[u] = c < nch ? 1.0 : 0.0;
+                cc[u] = c < nch ? c : c0;
+                [[unroll]] for (uint w = 0; w < NW; ++w) load8v(DTW, pc.b, wrow[w] * pc.ldb + cc[u] * 8u, wv[u][w]);
+            }
+            [[unroll]] for (uint r = 0; r < MB; ++r) {
+                [[unroll]] for (uint u = 0; u < UNR; ++u) {
+                    float xv[8];
+                    load8v(DTX, pc.a, r * pc.lda + cc[u] * 8u, xv);
+                    [[unroll]] for (uint w = 0; w < NW; ++w) {
+                        float s = 0.0;
+                        [[unroll]] for (uint e = 0; e < 8; ++e) s = fma(xv[e], wv[u][w][e], s);
+                        acc[r * NW + w] += s * ok[u];
+                    }
+                }
+            }
+        }
+    } else if (live) {
+        for (uint col = t * 8u; col < pc.k; col += 64u * 8u) {
+            float wv[NW][8];
+            [[unroll]] for (uint w = 0; w < NW; ++w) load8s(DTW, pc.b, wrow[w] * pc.ldb + col, col, pc.k, wv[w]);
+            [[unroll]] for (uint r = 0; r < MB; ++r) {
+                float xv[8];
+                load8s(DTX, pc.a, r * pc.lda + col, col, pc.k, xv);
+                [[unroll]] for (uint w = 0; w < NW; ++w) {
+                    float s = 0.0;
+                    [[unroll]] for (uint e = 0; e < 8; ++e) s = fma(xv[e], wv[w][e], s);
+                    acc[r * NW + w] += s;
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint q = 0; q < MB * NW; ++q) {
+        const float s = subgroupAdd(acc[q]);
+        if (subgroupElect()) s_part[gl_SubgroupID * 16u + q] = s;
+    }
+    barrier();
+    if (t != 0u || !live) return;
+    const uint per = 64u / gl_SubgroupSize, sg0 = unit * per;
+    [[unroll]] for (uint r = 0; r < MB; ++r) {
+        float v[2];
+        [[unroll]] for (uint w = 0; w < NW; ++w) {
+            float s = 0.0;
+            for (uint g = 0; g < per; ++g) s += s_part[(sg0 + g) * 16u + r * NW + w];
+            v[w] = gemm_act(ACT, s + bias_at(wrow[w]));
+        }
+        const uint o = r * pc.ldc + j;
+        if (EPI == EPI_GEGLU)       store_elem(DTY, pc.c, o, v[0] * gelu_exact(v[1]));
+        else if (EPI == EPI_SWIGLU) store_elem(DTY, pc.c, o, silu(v[0]) * v[1]);
+        else if (EPI == EPI_ACCUM)  store_elem(DTY, pc.c, o, v[0] + load_elem(DTY, pc.c, o));
+        else                        store_elem(DTY, pc.c, o, v[0]);
+    }
+}

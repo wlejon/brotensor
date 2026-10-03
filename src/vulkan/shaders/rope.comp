@@ -1,0 +1,121 @@
+#version 460
+// Rotary position embedding, interleaved-pair convention (x_{2i}, x_{2i+1})
+// over (L, heads * head_dim) rows. Spec constant 0 = ROPE_* (op_codes.h),
+// 1 = BWD (rotate by -theta: the adjoint). One invocation per (row, head,
+// pair), grid-stride; FP32 arithmetic, X / Y in -DDT. Tables are FP32.
+//
+// ROPE_THETA computes the angle like the CPU reference does it:
+// inv_freq = exp(-(2i / head_dim) * ln(base)) with ln(base) from the host,
+// theta = float(pos) * inv_freq, then sin / cos of theta with an explicit
+// Cody-Waite reduction by pi/2. GLSL's sin / cos are only specified on
+// [-pi, pi] (RADV reduces through v_sin's revolutions input and loses bits
+// at decode positions); this keeps the result within a few ulp of sinf(theta)
+// for |theta| up to ~1e5, so the only difference from the CPU is the angle
+// itself (inv_freq within an ulp of glibc's expf).
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+layout(constant_id = 1) const uint BWD = 0;
+layout(push_constant) uniform PC {
+    uint64_t x, y, ct, st, ch, sh, cw, sw, pt, ph, pw;
+    uint rows, heads, hd;
+    uint dt, dh, dw;       // M-RoPE pair counts per axis; ROPE_PACKED: dh = table rows
+    int offset;            // ROPE_THETA: position of row 0
+    float ln_base;         // ROPE_THETA: logf(theta_base), computed on the host
+} pc;
+
+#include "op_codes.h"
+
+// q ~= a / b, refined to (nearly always) the correctly rounded quotient.
+float div_rn(float a, float b) {
+    const float r = 1.0 / b;
+    const float q = a * r;
+    return fma(fma(-q, b, a), r, q);
+}
+
+// exp(t) for t <= 0, about 1 ulp: t = n ln2 + r, |r| <= ln2 / 2.
+float exp_acc(float t) {
+    const float n = round(t * 1.44269504088896341);
+    float r = fma(-n, 0.693145751953125, t);         // ln2 high part (exact product)
+    r = fma(-n, 1.428606765330187045e-06, r);        // ln2 low part
+    float p = 1.0 / 5040.0;
+    p = fma(p, r, 1.0 / 720.0);
+    p = fma(p, r, 1.0 / 120.0);
+    p = fma(p, r, 1.0 / 24.0);
+    p = fma(p, r, 1.0 / 6.0);
+    p = fma(p, r, 0.5);
+    p = fma(p, r, 1.0);
+    p = fma(p, r, 1.0);
+    return ldexp(p, int(n));
+}
+
+// sin and cos of x with a three-part Cody-Waite reduction by pi/2 (fma keeps
+// each product exact) and minimax polynomials on [-pi/4, pi/4].
+void sincos_acc(float x, out float s, out float c) {
+    const float j = round(x * 0.636619772367581343);
+    float y = fma(-j, 1.57079637050628662, x);
+    y = fma(-j, -4.37113882867379e-08, y);
+    y = fma(-j, -1.71512451e-15, y);
+    const float z = y * y;
+    const float sp = y + y * z * (-1.6666654611e-1 + z * (8.3321608736e-3 + z * -1.9515295891e-4));
+    const float cp = 1.0 - 0.5 * z + z * z * (4.166664568298827e-2 + z * (-1.388731625493765e-3 + z * 2.443315711809948e-5));
+    const int q = int(j) & 3;
+    if (q == 0)      { s = sp;  c = cp;  }
+    else if (q == 1) { s = cp;  c = -sp; }
+    else if (q == 2) { s = -sp; c = -cp; }
+    else             { s = -cp; c = sp;  }
+}
+
+void rotate(uint64_t src, uint64_t dst, uint o, float c, float s) {
+    const float x0 = load_elem(DT, src, o), x1 = load_elem(DT, src, o + 1u);
+    if (BWD != 0) s = -s;
+    store_elem(DT, dst, o, x0 * c - x1 * s);
+    store_elem(DT, dst, o + 1u, x0 * s + x1 * c);
+}
+
+void main() {
+    const uint hp = pc.hd / 2u;
+    const uint total = pc.rows * pc.heads * hp;
+    for (uint idx = gl_GlobalInvocationID.x; idx < total; idx += GRID_STRIDE_X) {
+        const uint i = idx % hp, rest = idx / hp;
+        const uint h = rest % pc.heads, row = rest / pc.heads;
+        const uint D = pc.heads * pc.hd;
+        float c, s;
+        if (MODE == ROPE_THETA) {
+            const float a = div_rn(-float(2u * i), float(pc.hd));
+            const float theta = float(int(row) + pc.offset) * exp_acc(a * pc.ln_base);
+            sincos_acc(theta, s, c);
+        } else if (MODE == ROPE_TABLE) {
+            c = F32Buf(pc.ct).v[row * hp + i];
+            s = F32Buf(pc.st).v[row * hp + i];
+        } else if (MODE == ROPE_PERHEAD) {
+            c = F32Buf(pc.ct).v[(row * pc.heads + h) * hp + i];
+            s = F32Buf(pc.st).v[(row * pc.heads + h) * hp + i];
+        } else if (MODE == ROPE_PACKED) {
+            const uint p = uint(I32Buf(pc.pt).v[row]);
+            if (p >= pc.dh) continue;              // pc.dh = table rows; out of range: untouched
+            c = F32Buf(pc.ct).v[p * hp + i];
+            s = F32Buf(pc.st).v[p * hp + i];
+            const uint o = row * 3u * D + h * pc.hd + 2u * i;
+            rotate(pc.x, pc.x, o, c, s);           // Q
+            rotate(pc.x, pc.x, o + D, c, s);       // K
+            continue;
+        } else {   // ROPE_MROPE
+            if (i < pc.dt) {
+                const uint p = uint(I32Buf(pc.pt).v[row]);
+                c = F32Buf(pc.ct).v[p * pc.dt + i];
+                s = F32Buf(pc.st).v[p * pc.dt + i];
+            } else if (i < pc.dt + pc.dh) {
+                const uint p = uint(I32Buf(pc.ph).v[row]), l = i - pc.dt;
+                c = F32Buf(pc.ch).v[p * pc.dh + l];
+                s = F32Buf(pc.sh).v[p * pc.dh + l];
+            } else {
+                const uint p = uint(I32Buf(pc.pw).v[row]), l = i - pc.dt - pc.dh;
+                c = F32Buf(pc.cw).v[p * pc.dw + l];
+                s = F32Buf(pc.sw).v[p * pc.dw + l];
+            }
+        }
+        rotate(pc.x, pc.y, row * D + h * pc.hd + 2u * i, c, s);
+    }
+}

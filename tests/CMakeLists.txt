@@ -165,7 +165,8 @@ brotensor_add_test(brotensor_test_tensor_errors test_tensor_errors.cpp)
 # checks that BROTENSOR_DEFAULT_DEVICE=vulkan selects it. Both skip cleanly
 # without a Vulkan device.
 if(BROTENSOR_WITH_VULKAN)
-    brotensor_add_test(brotensor_test_vulkan test_vulkan.cpp test_vulkan_ops.cpp)
+    brotensor_add_test(brotensor_test_vulkan test_vulkan.cpp test_vulkan_ops.cpp test_vulkan_gemm.cpp
+                       test_vulkan_norm.cpp test_vulkan_bench.cpp)
     target_link_libraries(brotensor_test_vulkan PRIVATE brotensor_vulkan_internal)
     target_compile_options(brotensor_test_vulkan PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-missing-field-initializers>)
     add_test(NAME brotensor_test_vulkan_default_device

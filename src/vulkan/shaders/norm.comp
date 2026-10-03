@@ -1,0 +1,212 @@
+#version 460
+// Row normalisations, row softmax and the column reductions their backwards
+// need. One workgroup per row (grid-stride over rows) for the row modes; the
+// column modes give each workgroup 32 columns and 8 row lanes. Spec constant
+// 0 picks the mode (NORM_* in op_codes.h). Storage: -DDTX for X / Y-side
+// tensors (X, dY, Xhat, dX), -DDTY for the forward output, -DDTG for gamma /
+// beta and the column-reduced gradients. FP32 arithmetic and accumulation.
+//
+// The LayerNorm forward takes the variance from deviations (a second pass
+// after the mean), never E[x^2] - E[x]^2, which cancels when a row's mean
+// dominates its spread (src/cpu/layernorm_inference.cpp).
+//
+// Push fields by mode (unused ones are 0):
+//   LN        x=X  y=Y  g=gamma b=beta(0: none)  xh=Xhat out  s0=Mean out  s1=Rstd out
+//   RMS       x=X  y=Y  g=gamma(0: ones)  s1=rrms out
+//   L2        x=X  y=Y                              (rows = L * heads, d = head_dim)
+//   LN_BWD    x=dY y=dX g=gamma xh=Xhat  s1=Rstd in (0: the scalar `rstd`)
+//   RMS_BWD   x=X  xh=dY  y=dX  g=gamma(0: ones)  s1=rrms out
+//   L2_BWD    x=X  xh=dY  y=dX
+//   SOFTMAX   x=X  y=Y  s0=mask (0: none; entries < 0.5 are excluded and give 0)
+//   SM_BWD    x=probs  xh=dProbs  y=dLogits
+//   COL_LN    x=dY xh=Xhat  g=dGamma  b=dBeta          (+=, over all rows)
+//   COL_RMS   x=X  xh=dY  s1=rrms  g=dGamma            (+=)
+//   COL_SUM   x=X  g=out                               (+=, a bias gradient)
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+layout(push_constant) uniform PC {
+    uint64_t x, y, g, b, xh, s0, s1;
+    uint rows, d;
+    float eps, rstd;
+} pc;
+
+#include "op_codes.h"
+
+shared float s_red[64];
+shared float s_col[8][33];
+
+float block_sum(float v) {
+    v = subgroupAdd(v);
+    if (subgroupElect()) s_red[gl_SubgroupID] = v;
+    barrier();
+    float t = 0.0;
+    for (uint s = 0; s < gl_NumSubgroups; ++s) t += s_red[s];
+    barrier();
+    return t;
+}
+
+float block_max(float v) {
+    v = subgroupMax(v);
+    if (subgroupElect()) s_red[gl_SubgroupID] = v;
+    barrier();
+    float t = s_red[0];
+    for (uint s = 1; s < gl_NumSubgroups; ++s) t = max(t, s_red[s]);
+    barrier();
+    return t;
+}
+
+float gamma_at(uint i) { return pc.g != 0 ? load_elem(DTG, pc.g, i) : 1.0; }
+
+void columns() {
+    const uint lx = gl_LocalInvocationID.x % 32u, ly = gl_LocalInvocationID.x / 32u;
+    for (uint c0 = gl_WorkGroupID.x * 32u; c0 < pc.d; c0 += gl_NumWorkGroups.x * 32u) {
+        const uint c = c0 + lx;
+        float a0 = 0.0, a1 = 0.0;
+        if (c < pc.d) {
+            for (uint r = ly; r < pc.rows; r += 8u) {
+                const uint i = r * pc.d + c;
+                if (MODE == NORM_COL_LN) {
+                    const float dy = load_elem(DTX, pc.x, i);
+                    a0 += dy * load_elem(DTX, pc.xh, i);
+                    a1 += dy;
+                } else if (MODE == NORM_COL_SUM) {
+                    a0 += load_elem(DTX, pc.x, i);
+                } else {
+                    a0 += load_elem(DTX, pc.xh, i) * load_elem(DTX, pc.x, i) * F32Buf(pc.s1).v[r];
+                }
+            }
+        }
+        s_col[ly][lx] = a0;
+        barrier();
+        float t0 = 0.0;
+        if (ly == 0u) for (uint k = 0; k < 8u; ++k) t0 += s_col[k][lx];
+        barrier();
+        s_col[ly][lx] = a1;
+        barrier();
+        if (ly == 0u && c < pc.d) {
+            store_elem(DTG, pc.g, c, load_elem(DTG, pc.g, c) + t0);
+            if (MODE == NORM_COL_LN) {
+                float t1 = 0.0;
+                for (uint k = 0; k < 8u; ++k) t1 += s_col[k][lx];
+                store_elem(DTG, pc.b, c, load_elem(DTG, pc.b, c) + t1);
+            }
+        }
+        barrier();
+    }
+}
+
+void main() {
+    if (MODE >= NORM_COL_LN) { columns(); return; }
+    const uint tid = gl_LocalInvocationID.x, nt = gl_WorkGroupSize.x;
+    const float invd = 1.0 / float(pc.d);
+    for (uint row = gl_WorkGroupID.x; row < pc.rows; row += gl_NumWorkGroups.x) {
+        const uint base = row * pc.d;
+        if (MODE == NORM_LN) {
+            float s = 0.0;
+            for (uint i = tid; i < pc.d; i += nt) s += load_elem(DTX, pc.x, base + i);
+            const float mean = block_sum(s) * invd;
+            float q = 0.0;
+            for (uint i = tid; i < pc.d; i += nt) {
+                const float e = load_elem(DTX, pc.x, base + i) - mean;
+                q += e * e;
+            }
+            const float rstd = 1.0 / sqrt(block_sum(q) * invd + pc.eps);
+            if (tid == 0u) {
+                if (pc.s0 != 0) F32Buf(pc.s0).v[row] = mean;
+                if (pc.s1 != 0) F32Buf(pc.s1).v[row] = rstd;
+            }
+            for (uint i = tid; i < pc.d; i += nt) {
+                const float xh = (load_elem(DTX, pc.x, base + i) - mean) * rstd;
+                if (pc.xh != 0) store_elem(DTX, pc.xh, base + i, xh);
+                float v = load_elem(DTG, pc.g, i) * xh;
+                if (pc.b != 0) v += load_elem(DTG, pc.b, i);
+                store_elem(DTY, pc.y, base + i, v);
+            }
+        } else if (MODE == NORM_RMS || MODE == NORM_L2) {
+            float q = 0.0;
+            for (uint i = tid; i < pc.d; i += nt) {
+                const float v = load_elem(DTX, pc.x, base + i);
+                q += v * v;
+            }
+            q = block_sum(q);
+            const float r = MODE == NORM_RMS ? 1.0 / sqrt(q * invd + pc.eps) : 1.0 / sqrt(q + pc.eps);
+            if (MODE == NORM_RMS && tid == 0u && pc.s1 != 0) F32Buf(pc.s1).v[row] = r;
+            for (uint i = tid; i < pc.d; i += nt) {
+                const float v = load_elem(DTX, pc.x, base + i);
+                store_elem(DTY, pc.y, base + i, MODE == NORM_RMS ? v * gamma_at(i) * r : v * r);
+            }
+        } else if (MODE == NORM_LN_BWD) {
+            float s1 = 0.0, s2 = 0.0;
+            for (uint i = tid; i < pc.d; i += nt) {
+                const float dxh = load_elem(DTX, pc.x, base + i) * load_elem(DTG, pc.g, i);
+                s1 += dxh;
+                s2 += dxh * load_elem(DTX, pc.xh, base + i);
+            }
+            s1 = block_sum(s1);
+            s2 = block_sum(s2);
+            const float rstd = pc.s1 != 0 ? F32Buf(pc.s1).v[row] : pc.rstd;
+            const float nf = float(pc.d), scale = rstd / nf;
+            for (uint i = tid; i < pc.d; i += nt) {
+                const float dxh = load_elem(DTX, pc.x, base + i) * load_elem(DTG, pc.g, i);
+                store_elem(DTX, pc.y, base + i, scale * (nf * dxh - s1 - load_elem(DTX, pc.xh, base + i) * s2));
+            }
+        } else if (MODE == NORM_RMS_BWD || MODE == NORM_L2_BWD) {
+            float q = 0.0, p = 0.0;
+            for (uint i = tid; i < pc.d; i += nt) {
+                const float v = load_elem(DTX, pc.x, base + i);
+                const float dy = load_elem(DTX, pc.xh, base + i);
+                q += v * v;
+                p += MODE == NORM_RMS_BWD ? v * dy * gamma_at(i) : v * dy;
+            }
+            q = block_sum(q);
+            p = block_sum(p);
+            if (MODE == NORM_RMS_BWD) {
+                const float r = 1.0 / sqrt(q * invd + pc.eps);
+                if (tid == 0u && pc.s1 != 0) F32Buf(pc.s1).v[row] = r;
+                const float coeff = invd * r * r * p;
+                for (uint i = tid; i < pc.d; i += nt) {
+                    const float v = load_elem(DTX, pc.x, base + i);
+                    const float dy = load_elem(DTX, pc.xh, base + i);
+                    store_elem(DTX, pc.y, base + i, r * (gamma_at(i) * dy - v * coeff));
+                }
+            } else {
+                const float n = 1.0 / sqrt(q + pc.eps);
+                for (uint i = tid; i < pc.d; i += nt) {
+                    const float v = load_elem(DTX, pc.x, base + i);
+                    const float dy = load_elem(DTX, pc.xh, base + i);
+                    store_elem(DTX, pc.y, base + i, n * (dy - v * n * n * p));
+                }
+            }
+        } else if (MODE == NORM_SOFTMAX) {
+            float m = -1e30;
+            for (uint i = tid; i < pc.d; i += nt) {
+                if (pc.s0 != 0 && F32Buf(pc.s0).v[base + i] < 0.5) continue;
+                m = max(m, load_elem(DTX, pc.x, base + i));
+            }
+            m = block_max(m);
+            float s = 0.0;
+            for (uint i = tid; i < pc.d; i += nt) {
+                if (pc.s0 != 0 && F32Buf(pc.s0).v[base + i] < 0.5) continue;
+                s += exp(load_elem(DTX, pc.x, base + i) - m);
+            }
+            s = block_sum(s);
+            const float inv = s > 0.0 ? 1.0 / s : 0.0;
+            for (uint i = tid; i < pc.d; i += nt) {
+                const bool off = pc.s0 != 0 && F32Buf(pc.s0).v[base + i] < 0.5;
+                store_elem(DTY, pc.y, base + i, off ? 0.0 : exp(load_elem(DTX, pc.x, base + i) - m) * inv);
+            }
+        } else {   // NORM_SM_BWD
+            float dot = 0.0;
+            for (uint i = tid; i < pc.d; i += nt) dot += load_elem(DTX, pc.xh, base + i) * load_elem(DTX, pc.x, base + i);
+            dot = block_sum(dot);
+            for (uint i = tid; i < pc.d; i += nt) {
+                const float p = load_elem(DTX, pc.x, base + i);
+                store_elem(DTX, pc.y, base + i, p * (load_elem(DTX, pc.xh, base + i) - dot));
+            }
+        }
+    }
+}

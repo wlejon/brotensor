@@ -65,8 +65,8 @@ void test_registration(bool expect_default_vulkan) {
     // An op the backend does not implement names the device.
     bool named = false;
     try {
-        Tensor y;
-        brotensor::softmax_rows_forward(a, y, 2, 2);
+        Tensor vals, idx;
+        brotensor::top_k_rows(a, 1, vals, idx);
     } catch (const std::exception& e) {
         named = std::string(e.what()).find("vulkan") != std::string::npos;
     }
@@ -336,9 +336,12 @@ void test_graph() {
 }  // namespace vkt
 
 int main(int argc, char** argv) {
-    bool expect_default_vulkan = false;
+    bool expect_default_vulkan = false, bench = false, only = false;
+    std::string filter;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--expect-default-vulkan") == 0) expect_default_vulkan = true;
+        if (std::strcmp(argv[i], "--bench-gemm") == 0) bench = true;
+        if (std::strncmp(argv[i], "--only=", 7) == 0) { only = true; filter = argv[i] + 7; }
     }
     brotensor::init();
     if (!brotensor::is_available(brotensor::Device::vulkan(0))) {
@@ -346,6 +349,17 @@ int main(int argc, char** argv) {
         return 0;
     }
     try {
+        if (bench) {
+            vkt::run_gemm_bench();
+            return 0;
+        }
+        if (only) {   // --only=ops|gemm|norm: one op group, for iterating on a kernel
+            if (filter == "ops") vkt::run_op_tests();
+            if (filter == "gemm") vkt::run_gemm_tests();
+            if (filter == "norm") vkt::run_norm_tests();
+            std::printf("%s: %d failure(s)\n", vkt::failures() ? "FAILED" : "OK", vkt::failures());
+            return vkt::failures() ? 1 : 0;
+        }
         vkt::test_registration(expect_default_vulkan);
         if (!expect_default_vulkan) {
             vkt::test_transfers();
@@ -354,6 +368,8 @@ int main(int argc, char** argv) {
             vkt::test_events_and_batching();
             vkt::test_graph();
             vkt::run_op_tests();
+            vkt::run_gemm_tests();
+            vkt::run_norm_tests();
         }
     } catch (const std::exception& e) {
         std::printf("  FAIL  uncaught exception: %s\n", e.what());

@@ -134,6 +134,11 @@ const ShaderBlob& shader_blob(ShaderId id) { return k_table[static_cast<std::uin
         ${_src}/ops_elementwise.cpp
         ${_src}/ops_copy.cpp
         ${_src}/ops_reduce.cpp
+        ${_src}/gemm.cpp
+        ${_src}/ops_linear.cpp
+        ${_src}/ops_norm.cpp
+        ${_src}/ops_rope.cpp
+        ${_src}/ops_glu.cpp
         "${_gen}/shader_table.cpp"
         ${_incs}
     )

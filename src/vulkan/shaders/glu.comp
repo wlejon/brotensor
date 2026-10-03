@@ -1,0 +1,61 @@
+#version 460
+// Gated linear units over rows of X (R, 2D) -> Y (R, D), and their
+// backwards. Spec constant 0 selects the gate (GLU_* in op_codes.h):
+//   SWIGLU      y = silu(a) * b            a = X[:, d], b = X[:, D + d]
+//   GEGLU_TANH  y = a * gelu_tanh(b)
+//   GEGLU_EXACT y = a * gelu_exact(b)
+//   GEGLU_PAIRS y = X[:, 2d] * gelu_exact(X[:, 2d + 1])   (linear_ex's
+//               interleaved GeGLU, run after a GEMM that could not fuse it)
+// The _BWD forms read X and dY (R, D) and write both halves of dX (R, 2D).
+// One invocation per (row, d), grid-stride; FP32 arithmetic.
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint OP = 0;
+layout(push_constant) uniform PC {
+    uint64_t x, dy, y;
+    uint n;   // R * D
+    uint d;   // D
+} pc;
+
+#include "op_codes.h"
+
+float gelu_exact(float v) { return 0.5 * v * (1.0 + bt_erf(v * 0.70710678118654752440)); }
+
+void main() {
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += GRID_STRIDE_X) {
+        const uint r = i / pc.d, c = i % pc.d;
+        const uint ia = r * 2u * pc.d + c, ib = ia + pc.d;
+        if (OP == GLU_GEGLU_PAIRS) {
+            const uint p = r * 2u * pc.d + 2u * c;
+            store_elem(DTY, pc.y, i, load_elem(DT, pc.x, p) * gelu_exact(load_elem(DT, pc.x, p + 1u)));
+            continue;
+        }
+        const float a = load_elem(DT, pc.x, ia), b = load_elem(DT, pc.x, ib);
+        if (OP == GLU_SWIGLU) {
+            store_elem(DTY, pc.y, i, a * bt_sigmoid(a) * b);
+        } else if (OP == GLU_GEGLU_TANH) {
+            store_elem(DTY, pc.y, i, a * bt_gelu_tanh(b));
+        } else if (OP == GLU_GEGLU_EXACT) {
+            store_elem(DTY, pc.y, i, a * gelu_exact(b));
+        } else {
+            const float g = load_elem(DT, pc.dy, i);
+            float da, db;
+            if (OP == GLU_SWIGLU_BWD) {
+                const float s = bt_sigmoid(a);
+                da = g * b * s * (1.0 + a * (1.0 - s));
+                db = g * a * s;
+            } else if (OP == GLU_GEGLU_TANH_BWD) {
+                da = g * bt_gelu_tanh(b);
+                db = g * a * bt_gelu_tanh_grad(b);
+            } else {   // GLU_GEGLU_EXACT_BWD
+                const float cdf = 0.5 * (1.0 + bt_erf(b * 0.70710678118654752440));
+                const float pdf = 0.39894228040143267794 * exp(-0.5 * b * b);
+                da = g * b * cdf;
+                db = g * a * (cdf + b * pdf);
+            }
+            store_elem(DTY, pc.y, ia, da);
+            store_elem(DTY, pc.y, ib, db);
+        }
+    }
+}

@@ -22,6 +22,10 @@ const ::brotensor::detail::AllocVTable& vulkan_alloc_table();
 void fill_vulkan_vtable_elementwise(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_copy(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_reduce(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_linear(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_norm(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_rope(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_glu(::brotensor::detail::OpsVTable& v);
 
 namespace {
 
@@ -73,6 +77,10 @@ void probe_and_register() {
     dv::fill_vulkan_vtable_elementwise(ops);
     dv::fill_vulkan_vtable_copy(ops);
     dv::fill_vulkan_vtable_reduce(ops);
+    dv::fill_vulkan_vtable_linear(ops);
+    dv::fill_vulkan_vtable_norm(ops);
+    dv::fill_vulkan_vtable_rope(ops);
+    dv::fill_vulkan_vtable_glu(ops);
     ::brotensor::detail::register_backend(::brotensor::DeviceType::VULKAN, ops,
                                           dv::vulkan_alloc_table());
     if (vk_verbose()) {

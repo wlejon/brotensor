@@ -43,7 +43,10 @@ struct PhysInfo {
     std::uint32_t min_subgroup = 0, max_subgroup = 0;
     bool subgroup_size_control = false;  // pipelines may require a size
     bool memory_budget = false;          // VK_EXT_memory_budget
-    bool cooperative_matrix = false;     // VK_KHR_cooperative_matrix (later chunks)
+    bool cooperative_matrix = false;     // VK_KHR_cooperative_matrix (enabled when present)
+    bool memory_model = false;           // vulkanMemoryModel (+ device scope), enabled when present
+    bool coopmat_f16 = false;            // 16x16x16 FP16 -> FP32 fragments at subgroup 32: the
+                                         // GEMM kernels' tensor-core path (BROTENSOR_VK_NO_COOPMAT=1 off)
     std::string name;
     std::string driver;
 };

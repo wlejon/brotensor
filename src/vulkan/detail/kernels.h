@@ -42,6 +42,8 @@ inline int dt_code(::brotensor::Dtype dt, const char* op) {
 inline constexpr ShaderId kDtypeFamilies[] = {
     ShaderId::unary_f32,  ShaderId::binary_f32,   ShaderId::act_bwd_f32,     ShaderId::bias_f32,
     ShaderId::sum_rows_f32, ShaderId::argmax_rows_f32, ShaderId::sum_cols_f32,
+    ShaderId::gemm_simt_f32, ShaderId::gemv_f32, ShaderId::glu_f32, ShaderId::norm_f32,
+    ShaderId::rope_f32, ShaderId::rowvec_f32,
 };
 
 // The <base>_f16 / <base>_bf16 sibling of a <base>_f32 family shader.

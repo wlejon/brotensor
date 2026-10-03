@@ -1,0 +1,125 @@
+#version 460
+// Plain-shader GEMM with FP32 arithmetic: the FP32 path, the mixed path
+// (FP32 activations against 16-bit weights, widened in registers so the
+// activations are never rounded), and the fallback for 16-bit operands on a
+// device without cooperative matrix. Contract: gemm_common.glsl, except the
+// GLU epilogues, which the host runs as a separate pass over an FP32 result.
+// -DDTA / -DDTB / -DDTC: storage of A, B and C; -DDTBI the bias's (C's by
+// default; the 16-bit -> FP32 variants feed the GLU pass an unrounded r).
+//
+// Workgroup tile BM x BN, K step BK; each invocation owns a TM x TN block of
+// C in registers. Tiles are staged in shared memory k-major (As[k][m],
+// Bs[k][n]) whatever the operand layout, so the inner product reads TM and
+// TN consecutive floats; the next tile is prefetched into registers while the
+// current one is consumed. Any M, N, K: loads outside the matrix give zero.
+#include "common.glsl"
+#extension GL_EXT_control_flow_attributes : enable
+#ifndef DTBI
+#define DTBI DTC
+#endif
+
+layout(constant_id = 0) const uint BM = 64;
+layout(constant_id = 1) const uint BN = 64;
+layout(constant_id = 2) const uint BK = 16;
+layout(constant_id = 3) const uint TM = 4;
+layout(constant_id = 4) const uint TN = 4;
+layout(constant_id = 5) const uint WG = 256;   // (BM / TM) * (BN / TN)
+layout(constant_id = 6) const uint EPI = 0;    // EPI_STORE or EPI_ACCUM
+layout(constant_id = 7) const uint ACT = 0;
+layout(constant_id = 8) const uint TA = 0;
+layout(constant_id = 9) const uint NB = 0;
+layout(local_size_x_id = 5) in;
+
+#include "gemm_common.glsl"
+
+const uint LA = BM * BK / WG;
+const uint LB = BN * BK / WG;
+const uint PA = BM + 4;
+const uint PB = BN + 4;
+
+shared float As[BK * PA];
+shared float Bs[BK * PB];
+
+float ra[LA], rb[LB];
+
+const uint ESA = DTA == DT_F32 ? 4u : 2u;
+const uint ESB = DTB == DT_F32 ? 4u : 2u;
+const uint ESC = DTC == DT_F32 ? 4u : 2u;
+
+void load_tiles(uint64_t A, uint64_t B, uint m0, uint n0, uint k0) {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint j = 0; j < LA; ++j) {
+        const uint e = tid + j * WG;
+        uint m, k;
+        if (TA == 0) { m = e / BK; k = e % BK; } else { k = e / BM; m = e % BM; }
+        const uint gm = m0 + m, gk = k0 + k;
+        const uint idx = TA == 0 ? gm * pc.lda + gk : gk * pc.lda + gm;
+        ra[j] = (gm < pc.m && gk < pc.k) ? load_elem(DTA, A, idx) : 0.0;
+    }
+    [[unroll]] for (uint j = 0; j < LB; ++j) {
+        const uint e = tid + j * WG;
+        uint n, k;
+        if (NB == 0) { n = e / BK; k = e % BK; } else { k = e / BN; n = e % BN; }
+        const uint gn = n0 + n, gk = k0 + k;
+        const uint idx = NB == 0 ? gn * pc.ldb + gk : gk * pc.ldb + gn;
+        rb[j] = (gn < pc.n && gk < pc.k) ? load_elem(DTB, B, idx) : 0.0;
+    }
+}
+
+void store_tiles() {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint j = 0; j < LA; ++j) {
+        const uint e = tid + j * WG;
+        if (TA == 0) As[(e % BK) * PA + e / BK] = ra[j];
+        else         As[(e / BM) * PA + e % BM] = ra[j];
+    }
+    [[unroll]] for (uint j = 0; j < LB; ++j) {
+        const uint e = tid + j * WG;
+        if (NB == 0) Bs[(e % BK) * PB + e / BK] = rb[j];
+        else         Bs[(e / BN) * PB + e % BN] = rb[j];
+    }
+}
+
+void main() {
+    const uint z = gl_WorkGroupID.z;
+    const uint64_t A = batch_base(pc.a, pc.sa, z, ESA);
+    const uint64_t B = batch_base(pc.b, pc.sb, z, ESB);
+    const uint64_t C = batch_base(pc.c, pc.sc, z, ESC);
+    const uint m0 = gl_WorkGroupID.y * BM, n0 = gl_WorkGroupID.x * BN;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tx = tid % (BN / TN), ty = tid / (BN / TN);
+    const uint nk = (pc.k + BK - 1u) / BK;
+
+    float acc[TM * TN];
+    [[unroll]] for (uint i = 0; i < TM * TN; ++i) acc[i] = 0.0;
+
+    load_tiles(A, B, m0, n0, 0u);
+    for (uint kt = 0; kt < nk; ++kt) {
+        store_tiles();
+        barrier();
+        if (kt + 1u < nk) load_tiles(A, B, m0, n0, (kt + 1u) * BK);
+        [[unroll]] for (uint kk = 0; kk < BK; ++kk) {
+            float a[TM], b[TN];
+            [[unroll]] for (uint i = 0; i < TM; ++i) a[i] = As[kk * PA + ty * TM + i];
+            [[unroll]] for (uint j = 0; j < TN; ++j) b[j] = Bs[kk * PB + tx * TN + j];
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                [[unroll]] for (uint j = 0; j < TN; ++j) acc[i * TN + j] = fma(a[i], b[j], acc[i * TN + j]);
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0; i < TM; ++i) {
+        const uint gm = m0 + ty * TM + i;
+        if (gm >= pc.m) continue;
+        [[unroll]] for (uint j = 0; j < TN; ++j) {
+            const uint gn = n0 + tx * TN + j;
+            if (gn >= pc.n) continue;
+            float v = acc[i * TN + j];
+            if (pc.bias != 0) v += load_elem(DTBI, pc.bias, gn);
+            v = gemm_act(ACT, v);
+            const uint o = gm * pc.ldc + gn;
+            if (EPI == EPI_ACCUM) v += load_elem(DTC, C, o);
+            store_elem(DTC, C, o, v);
+        }
+    }
+}

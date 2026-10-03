@@ -53,4 +53,51 @@
 #define BIAS_ROW        0    // y[i] += bias[i % D]
 #define BIAS_CHANNEL    1    // y[i] += bias[(i / L) % C]
 
+// GEMM epilogue activation (= brotensor::LinearActivation) and output mode
+// (= brotensor::LinearEpilogue without the fast-accum flag).
+#define LACT_NONE       0
+#define LACT_RELU       1
+#define LACT_GELU_TANH  2
+#define LACT_GELU_EXACT 3
+#define LACT_SILU       4
+#define LACT_QUICK_GELU 5
+
+#define EPI_STORE       0
+#define EPI_ACCUM       1
+#define EPI_GEGLU       2
+#define EPI_SWIGLU      3
+
+// glu.comp
+#define GLU_SWIGLU          0
+#define GLU_GEGLU_TANH      1
+#define GLU_GEGLU_EXACT     2
+#define GLU_GEGLU_PAIRS     3
+#define GLU_SWIGLU_BWD      4
+#define GLU_GEGLU_TANH_BWD  5
+#define GLU_GEGLU_EXACT_BWD 6
+
+// norm.comp
+#define NORM_LN         0
+#define NORM_RMS        1
+#define NORM_L2         2
+#define NORM_LN_BWD     3
+#define NORM_RMS_BWD    4
+#define NORM_L2_BWD     5
+#define NORM_SOFTMAX    6
+#define NORM_SM_BWD     7
+#define NORM_COL_LN     8
+#define NORM_COL_RMS    9
+#define NORM_COL_SUM    10   // g += column sums of x
+
+// rowvec.comp: y = f(x, v[col] [, w[col]])
+#define ROWVEC_MODULATE 0    // x * (1 + v) + w
+#define ROWVEC_MUL      1    // x * v
+
+// rope.comp
+#define ROPE_THETA      0    // angles from theta_base, position = row + offset
+#define ROPE_TABLE      1    // cos / sin tables (L, half)
+#define ROPE_PERHEAD    2    // tables (L * heads, half)
+#define ROPE_PACKED     3    // in place over Q and K of (L, 3 D), tables indexed by pos[row]
+#define ROPE_MROPE      4    // three tables / position streams over sub-ranges of the pairs
+
 #endif

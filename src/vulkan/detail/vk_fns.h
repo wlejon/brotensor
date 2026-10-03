@@ -35,6 +35,7 @@
     X(vkGetPhysicalDeviceMemoryProperties2)     \
     X(vkGetPhysicalDeviceQueueFamilyProperties) \
     X(vkEnumerateDeviceExtensionProperties)     \
+    X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) \
     X(vkCreateDevice)                           \
     X(vkGetDeviceProcAddr)
 
