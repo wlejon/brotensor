@@ -32,11 +32,10 @@ void shutdown();
 // ─── Default-device policy ─────────────────────────────────────────────────
 
 // Returns the device the next zeros/empty/from_host call will land on.
-// Default policy: best available — HIP > CUDA > Metal > CPU. The Vulkan
-// backend is never picked by default (its op coverage is still partial); select
-// it with set_default_device(Device::vulkan(i)), a DeviceScope, or the
-// BROTENSOR_DEFAULT_DEVICE environment variable ("cpu", "cuda", "metal",
-// "hip", "vulkan" / "vk", each optionally ":<index>").
+// Default policy: best available — CUDA > Metal > Vulkan > CPU. Override it
+// with set_default_device(d), a DeviceScope, or the BROTENSOR_DEFAULT_DEVICE
+// environment variable ("cpu", "cuda", "metal", "vulkan" / "vk", each
+// optionally ":<index>").
 Device default_device();
 
 // Globally override the default device. Throws std::runtime_error if `d` is
@@ -47,22 +46,18 @@ void set_default_device(Device d);
 // Number of probed CUDA devices (0 if CUDA not compiled in or no CUDA GPU found).
 int cuda_device_count();
 
-// Number of probed HIP devices (0 if HIP not compiled in or no HIP GPU found).
-int hip_device_count();
-
 // Number of probed Vulkan devices (0 if the Vulkan backend is not compiled in,
 // there is no Vulkan loader, or no device qualifies; see docs/vulkan.md).
 int vulkan_device_count();
 
 // Backends actually registered in this binary at runtime. CPU is always
-// present; CUDA / HIP / Metal appear only if their backend was both compiled
+// present; CUDA / Metal / Vulkan appear only if their backend was both compiled
 // in and successfully probed by init().
 //
-// Device::CUDA on a HIP-only machine: these two report the hardware truth
+// Device::CUDA on a machine without CUDA: these two report the hardware truth
 // (is_available(Device::CUDA) is false), while every call below that *acts*
 // on a device — set_default_device, DeviceScope, sync, the memory queries,
-// the tensor factories — takes Device::cuda(i) as Device::hip(i) (or, with
-// no HIP backend, Device::vulkan(i)). The rule is written out once, at
+// the tensor factories — takes Device::cuda(i) as Device::vulkan(i). The rule is written out once, at
 // detail::resolve_device_alias (detail/dispatch.h).
 std::vector<Device> available_devices();
 bool is_available(Device);

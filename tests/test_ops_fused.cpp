@@ -365,10 +365,10 @@ void test_gemv_residual() {
     }
 }
 
-// ── 16-bit operands on HIP and Vulkan ──────────────────────────────────────
+// ── 16-bit operands on Vulkan ──────────────────────────────────────────────
 //
 // (Vulkan runs when BROTENSOR_TEST_GPU=vulkan selects it: ctest's
-// brotensor_test_ops_fused_vulkan.) None of the five ops has a HIP- or
+// brotensor_test_ops_fused_vulkan.) None of the five ops has a
 // Vulkan-specific kernel except the stacked-weight
 // SwiGLU GEMV (linear_forward_batched_ex's epilogue); everything else is the
 // eager composition, which is what has to be right at FP16 / BF16 too. The
@@ -413,8 +413,8 @@ Tensor host(const std::vector<float>& v, int rows, int cols) {
     return Tensor::from_host_on(Device::CPU, v.data(), rows, cols);
 }
 
-void test_fused_16bit_hip() {
-    if (!bt_parity::gpu_device().is_hip() && !bt_parity::gpu_device().is_vulkan()) return;
+void test_fused_16bit_vulkan() {
+    if (!bt_parity::gpu_device().is_vulkan()) return;
     for (Dtype dt : {Dtype::FP16, Dtype::BF16}) {
         const char* dn = dt == Dtype::BF16 ? "bf16" : "fp16";
         std::printf("  Testing fused ops at %s on %s...\n", dn, brotensor::to_string(bt_parity::gpu_device()).c_str());
@@ -432,8 +432,8 @@ void test_fused_16bit_hip() {
             Tensor h = upload16(dt, hh, B, D), p = upload16(dt, hp, B, D), g = upload16(dt, hg, D, 1);
             Tensor out;
             brotensor::fused_residual_rmsnorm(h, p, g, 1e-6f, out);
-            compare_tensors(host(sum, B, D), download16(h), "residual_rmsnorm h (16-bit HIP)", tol, tol);
-            compare_tensors(host(ref, B, D), download16(out), "residual_rmsnorm out (16-bit HIP)", tol, tol);
+            compare_tensors(host(sum, B, D), download16(h), "residual_rmsnorm h (16-bit)", tol, tol);
+            compare_tensors(host(ref, B, D), download16(out), "residual_rmsnorm out (16-bit)", tol, tol);
         }
         // residual + layernorm
         {
@@ -446,7 +446,7 @@ void test_fused_16bit_hip() {
             Tensor g = upload16(dt, hg, D, 1), b = upload16(dt, hb, D, 1);
             Tensor out;
             brotensor::fused_residual_layernorm(x, r, g, b, 1e-6f, out);
-            compare_tensors(host(ref, B, D), download16(out), "residual_layernorm (16-bit HIP)", tol, tol);
+            compare_tensors(host(ref, B, D), download16(out), "residual_layernorm (16-bit)", tol, tol);
         }
         // layernorm + modulate
         {
@@ -460,7 +460,7 @@ void test_fused_16bit_hip() {
             brotensor::fused_layernorm_modulate(upload16(dt, hx, B, D), upload16(dt, hg, D, 1),
                                                 upload16(dt, hb, D, 1), upload16(dt, hs, D, 1),
                                                 upload16(dt, hsh, D, 1), 1e-6f, out);
-            compare_tensors(host(ref, B, D), download16(out), "layernorm_modulate (16-bit HIP)",
+            compare_tensors(host(ref, B, D), download16(out), "layernorm_modulate (16-bit)",
                             2 * tol, 2 * tol);
         }
         // SwiGLU GEMV: separate weights (eager composition) and the two halves
@@ -479,12 +479,12 @@ void test_fused_16bit_hip() {
             Tensor out_stacked = Tensor::empty_on(w.device, 1, N, dt);
             brotensor::fused_gemv_swiglu(x, wg, wu, out_stacked);
             compare_tensors(host(ref, 1, N), download16(out_stacked),
-                            "gemv_swiglu stacked (16-bit HIP)", tol, tol);
+                            "gemv_swiglu stacked (16-bit)", tol, tol);
             Tensor wg2 = wg.clone(), wu2 = wu.clone();
             Tensor out_split = Tensor::empty_on(w.device, 1, N, dt);
             brotensor::fused_gemv_swiglu(x, wg2, wu2, out_split);
             compare_tensors(host(ref, 1, N), download16(out_split),
-                            "gemv_swiglu separate (16-bit HIP)", tol, tol);
+                            "gemv_swiglu separate (16-bit)", tol, tol);
         }
         // GEMV + residual
         {
@@ -496,7 +496,7 @@ void test_fused_16bit_hip() {
             Tensor out;
             brotensor::fused_gemv_residual(upload16(dt, hx, 1, K), upload16(dt, hw, N, K),
                                            upload16(dt, hr, 1, N), out);
-            compare_tensors(host(ref, 1, N), download16(out), "gemv_residual (16-bit HIP)", tol, tol);
+            compare_tensors(host(ref, 1, N), download16(out), "gemv_residual (16-bit)", tol, tol);
         }
     }
 }
@@ -516,7 +516,7 @@ int main() {
         test_layernorm_modulate();
         test_gemv_swiglu();
         test_gemv_residual();
-        test_fused_16bit_hip();
+        test_fused_16bit_vulkan();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "Exception during test: %s\n", e.what());
         return 1;

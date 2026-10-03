@@ -1,9 +1,9 @@
 // CPU<->GPU parity for the flash-attention family at wide heads.
 //
 // The GPU kernels hold a per-thread register tile of the output row, so a
-// head wider than one tile (1024 columns on CUDA and HIP) needs either a
-// different path or column chunking, and on HIP the K/V tiles a kernel stages
-// in LDS grow with head_dim until they no longer fit the 64 KB a block may
+// head wider than one tile (1024 columns on CUDA) needs either a
+// different path or column chunking, and the K/V tiles a kernel stages in
+// shared memory grow with head_dim until they no longer fit what a block may
 // take. This suite drives every forward entry point across those edges:
 //
 //   head_dim 256 / 320 FP32  — past the LDS staging budget at full tile depth
@@ -18,7 +18,7 @@
 // Coverage per backend: shapes CUDA accepts (FP16/BF16, head_dim <= 1024 on
 // the scalar kernels) run on every GPU backend this binary has; FP32 inputs
 // and the head_dims past CUDA's limits run where the backend takes them —
-// HIP and Vulkan — and print a skip elsewhere.
+// Vulkan — and print a skip elsewhere.
 
 #include "parity_helpers.h"
 
@@ -36,12 +36,10 @@ using brotensor::Dtype;
 
 namespace {
 
-bool gpu_is_hip() { return gpu_device().is_hip() || gpu_device().is_vulkan(); }
-
-// FP32 inputs and head_dims past CUDA's register-tile / LDS limits: HIP and
-// Vulkan take both.
-bool skip_unless_hip(const char* what) {
-    if (gpu_is_hip()) return false;
+// FP32 inputs and head_dims past CUDA's register-tile / shared-memory limits:
+// Vulkan takes both.
+bool skip_unless_wide(const char* what) {
+    if (gpu_device().is_vulkan()) return false;
     std::printf("    (skipped on this backend: %s)\n", what);
     return true;
 }
@@ -263,23 +261,23 @@ BT_PARITY_TEST(decode_masked_bf16_hd1024_window){ run_decode_masked(Dtype::BF16,
 // ─── FP32 inputs (the CUDA attention kernels take FP16/BF16 only) ─────────
 
 BT_PARITY_TEST(windowed_fp32_hd256_causal_mask) {
-    if (skip_unless_hip("FP32 attention")) return;
+    if (skip_unless_wide("FP32 attention")) return;
     run_windowed(Dtype::FP32, 20, 33, 2, 2, 256, true, 0, true, 0xA20);
 }
 BT_PARITY_TEST(windowed_fp32_hd320_bidir_mask_small) {
-    if (skip_unless_hip("FP32 attention")) return;
+    if (skip_unless_wide("FP32 attention")) return;
     run_windowed(Dtype::FP32, 6, 50, 2, 1, 320, false, 0, true, 0xA21);
 }
 BT_PARITY_TEST(varlen_fp32_hd256) {
-    if (skip_unless_hip("FP32 attention")) return;
+    if (skip_unless_wide("FP32 attention")) return;
     run_varlen(Dtype::FP32, {5, 17}, 2, 256, true, 0xA22);
 }
 BT_PARITY_TEST(packed_fp32_hd320_window) {
-    if (skip_unless_hip("FP32 attention")) return;
+    if (skip_unless_wide("FP32 attention")) return;
     run_packed(Dtype::FP32, {9, 14}, 2, 320, 6, 0xA23);
 }
 BT_PARITY_TEST(decode_fp32_hd256) {
-    if (skip_unless_hip("FP32 attention")) return;
+    if (skip_unless_wide("FP32 attention")) return;
     run_decode(Dtype::FP32, 1, 45, 45, 2, 2, 256, 0, 0xA24);
 }
 
@@ -288,43 +286,43 @@ BT_PARITY_TEST(decode_fp32_hd256) {
 // The qwenimage21 VAE mid-block shape: one head, wide, bidirectional, large
 // enough for the GEMM path. Then the same with a key mask and with GQA.
 BT_PARITY_TEST(forward_fp16_hd1536_bidir_dense) {
-    if (skip_unless_hip("head_dim > 1024")) return;
+    if (skip_unless_wide("head_dim > 1024")) return;
     run_forward(Dtype::FP16, 96, 80, 1, 1536, false, false, 0xA40);
 }
 BT_PARITY_TEST(forward_fp32_hd1536_bidir_dense_mask) {
-    if (skip_unless_hip("head_dim > 1024")) return;
+    if (skip_unless_wide("head_dim > 1024")) return;
     run_forward(Dtype::FP32, 72, 72, 1, 1536, false, true, 0xA41);
 }
 BT_PARITY_TEST(gqa_bf16_hd1100_bidir_dense) {
-    if (skip_unless_hip("head_dim > 1024")) return;
+    if (skip_unless_wide("head_dim > 1024")) return;
     run_gqa(Dtype::BF16, 70, 4, 2, 1100, false, 0xA42);
 }
 BT_PARITY_TEST(forward_fp16_hd1536_causal) {
-    if (skip_unless_hip("head_dim > 1024")) return;
+    if (skip_unless_wide("head_dim > 1024")) return;
     run_forward(Dtype::FP16, 33, 33, 2, 1536, true, false, 0xA43);
 }
 BT_PARITY_TEST(windowed_fp32_hd1100_window_mask) {
-    if (skip_unless_hip("head_dim > 1024")) return;
+    if (skip_unless_wide("head_dim > 1024")) return;
     run_windowed(Dtype::FP32, 16, 40, 2, 1, 1100, true, 12, true, 0xA44);
 }
 BT_PARITY_TEST(windowed_bf16_hd2100_bidir_small) {
-    if (skip_unless_hip("head_dim > 1024")) return;
+    if (skip_unless_wide("head_dim > 1024")) return;
     run_windowed(Dtype::BF16, 5, 30, 1, 1, 2100, false, 0, true, 0xA45);
 }
 BT_PARITY_TEST(varlen_fp16_hd1536_causal) {
-    if (skip_unless_hip("head_dim > 1024")) return;
+    if (skip_unless_wide("head_dim > 1024")) return;
     run_varlen(Dtype::FP16, {11, 6}, 1, 1536, true, 0xA46);
 }
 BT_PARITY_TEST(packed_fp16_hd1536) {
-    if (skip_unless_hip("head_dim > 1024")) return;
+    if (skip_unless_wide("head_dim > 1024")) return;
     run_packed(Dtype::FP16, {12, 7}, 1, 1536, 0, 0xA47);
 }
 BT_PARITY_TEST(decode_bf16_hd1536_gqa) {
-    if (skip_unless_hip("head_dim > 1024")) return;
+    if (skip_unless_wide("head_dim > 1024")) return;
     run_decode(Dtype::BF16, 1, 60, 64, 4, 1, 1536, 0, 0xA48);
 }
 BT_PARITY_TEST(decode_masked_fp16_hd1100_window) {
-    if (skip_unless_hip("head_dim > 1024")) return;
+    if (skip_unless_wide("head_dim > 1024")) return;
     run_decode_masked(Dtype::FP16, 41, 64, 2, 2, 1100, 10, 0xA49);
 }
 

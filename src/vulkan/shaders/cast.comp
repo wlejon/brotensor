@@ -1,7 +1,7 @@
 #version 460
 // dst[i] = convert(src[i]) between FP32 / FP16 / BF16 (-DSDT / -DDDT), going
 // through FP32: FP16 -> BF16 is exact to FP32 then RNE to BF16, the same two
-// steps as the CPU / HIP casts.
+// steps as the CPU / CUDA casts.
 #include "common.glsl"
 
 layout(local_size_x = 256) in;

@@ -54,14 +54,12 @@ bool capturable(Device d) {
 Device pick_capture_device() {
     const Device d = detail::resolve_device_alias(default_device());
     if (capturable(d)) return d;
-    // A CPU / Metal default device: the capture used to be CUDA's / HIP's
-    // current stream whatever the default device was; keep that, then Vulkan.
-    for (DeviceType t : {DeviceType::CUDA, DeviceType::HIP}) {
-        if (capturable(Device(t, 0))) return Device(t, -1);
-    }
+    // A CPU / Metal default device: the capture used to be CUDA's current
+    // stream whatever the default device was; keep that, then Vulkan.
+    if (capturable(Device::cuda(0))) return Device(DeviceType::CUDA, -1);
     if (capturable(Device::vulkan(0))) return Device::vulkan(0);
     throw std::runtime_error(
-        "brotensor: CudaGraphCapture: no GPU with graph capture (CUDA, HIP or Vulkan) is "
+        "brotensor: CudaGraphCapture: no GPU with graph capture (CUDA or Vulkan) is "
         "registered; default device is " + to_string(d));
 }
 

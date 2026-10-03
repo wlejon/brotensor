@@ -329,7 +329,7 @@ static void parity_axpby() {
     }
 
     if (g_gpu == Device::Metal) {
-        std::printf("  (FP16 axpby checks need CUDA, HIP or Vulkan — skipped)\n");
+        std::printf("  (FP16 axpby checks need CUDA or Vulkan — skipped)\n");
         return;
     }
 

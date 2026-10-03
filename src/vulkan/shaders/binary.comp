@@ -21,7 +21,7 @@ void main() {
         const float yv = load_elem(DTY, pc.y, i);
         const float xv = load_elem(DTX, pc.x, i);
         // `precise`: no FMA contraction, so a*y + b*x rounds like the FP32
-        // expression it is on the CPU / CUDA / HIP backends.
+        // expression it is on the CPU / CUDA backends.
         precise float r;
         switch (OP) {
             case BOP_ADD:   r = yv + xv; break;

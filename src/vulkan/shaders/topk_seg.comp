@@ -110,7 +110,7 @@ void segstats() {
         }
         if (tid == 0u) {
             const float kk = max(2.0, float(b - a));
-            store_elem(DT, pc.vals, o, s1[0]);   // the logits' dtype, as CUDA / HIP
+            store_elem(DT, pc.vals, o, s1[0]);   // the logits' dtype, as CUDA
             store_elem(DT, pc.vals, o + 1u, s1[0] - s2[0]);
             store_elem(DT, pc.vals, o + 2u, ent / log(kk));
             store_elem(DT, pc.vals, o + 3u, kk / 255.0);

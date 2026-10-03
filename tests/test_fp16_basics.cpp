@@ -634,7 +634,7 @@ static void test_embedding_backward_fp16() {
 int main() {
     brotensor::init();
     if (!bt_test::has_gpu()) {
-        std::printf("no CUDA/HIP backend - skipping\n");
+        std::printf("no GPU backend - skipping\n");
         return 0;
     }
     std::printf("test_fp16_basics\n");

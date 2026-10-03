@@ -1,9 +1,8 @@
 # BrotensorVulkan.cmake — the Vulkan compute backend's build: headers, the
 # GLSL -> SPIR-V step, the embedded shader table and the brotensor_vulkan
 # static library. Included by the top-level CMakeLists.txt when
-# BROTENSOR_WITH_VULKAN is ON (it coexists with BROTENSOR_WITH_HIP), and by
-# siblings that ship their own Vulkan kernels, the way they include
-# BrotensorHip.cmake:
+# BROTENSOR_WITH_VULKAN is ON, and by siblings that ship their own Vulkan
+# kernels:
 #
 #   brotensor_vulkan_prepare([REQUIRE_HEADERS])
 #                                    finds glslc (BROTENSOR_GLSLC) and the Vulkan
@@ -27,8 +26,7 @@
 #                                    TRUE when this machine can build and run the
 #                                    backend: glslc, the Vulkan headers and the
 #                                    Vulkan loader (libvulkan) are all found. Never
-#                                    fails; for a parent's auto-detection (bro), as
-#                                    brotensor_hip_detect_gpus is for HIP.
+#                                    fails; for a parent's auto-detection (bro).
 #   brotensor_vulkan_add_backend()   defines the brotensor_vulkan target and
 #                                    the defines brotensor_core needs.
 #

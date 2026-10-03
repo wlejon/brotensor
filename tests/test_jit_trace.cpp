@@ -5,10 +5,10 @@
 //   Test 2: Auto-fused Residual + RMSNorm: h += proj; norm = rms_norm(h)
 //   Test 3: Auto-fused LayerNorm + Modulate: ln = layernorm(x); out = ln * (1 + scale) + shift
 //   Test 4: Trace cache hit verification & replay speedup benchmark.
-//   Test 6: A HIP trace never reaches the host code generator.
-//   Test 7: Eager divide / modulate and a traced divide on HIP.
-//   Tests 1-4, 6 and 7 also run on Vulkan (eager replay, as HIP).
-// Runs across CPU, NVIDIA RTX GPU (CUDA sm_89) and HIP (unfused replay).
+//   Test 6: A Vulkan trace never reaches the host code generator.
+//   Test 7: Eager divide / modulate and a traced divide on Vulkan.
+//   Tests 1-4, 6 and 7 run on Vulkan (eager replay).
+// Runs across CPU, NVIDIA RTX GPU (CUDA sm_89) and Vulkan (unfused replay).
 
 #include <brotensor/jit/trace.h>
 #include <brotensor/ops.h>
@@ -77,7 +77,6 @@ void fill_random(std::vector<float>& vec, uint64_t seed, float scale = 1.0f) {
 
 std::string device_label(Device dev) {
     if (dev.is_cuda()) return "CUDA";
-    if (dev.is_hip()) return "HIP";
     if (dev.is_vulkan()) return "Vulkan";
     return "CPU";
 }
@@ -498,14 +497,14 @@ void test_trace_allocates_nothing(Device dev) {
     CHECK_TRUE(aborted.rows == R, (dev_name + " a neutralised tensor is reusable").c_str());
 }
 
-// ── Test 6: a HIP trace never reaches the host code generator ──────────────
+// ── Test 6: a Vulkan trace never reaches the host code generator ───────────
 //
-// There is no GPU trace compiler for HIP. The CPU compiler emits host code
-// that walks raw pointers, so handing it a HIP DAG either faults on a
-// discrete GPU or — on an APU, where hipMalloc memory is host-visible — runs
-// on the host with no ordering against the HIP stream: it reads an input the
-// GPU has not finished writing. The trace has to stay on the device.
-void test_hip_trace_stays_on_device(Device dev) {
+// There is no GPU trace compiler for Vulkan. The CPU compiler emits host code
+// that walks raw pointers, so handing it a Vulkan DAG would dereference
+// buffer device addresses (not host pointers at all), with no ordering
+// against the device stream: it would read an input the GPU has not
+// finished writing. The trace has to stay on the device.
+void test_trace_stays_on_device(Device dev) {
     const std::string dn = device_label(dev);
     std::printf("\n--- Test 6: %s trace stays on the device ---\n", dn.c_str());
 
@@ -544,10 +543,9 @@ void test_hip_trace_stays_on_device(Device dev) {
 
 // ── Test 7: eager `/` and modulate() off the host ──────────────────────────
 //
-// Outside a trace these run immediately. On HIP both used to throw
-// ("requires CUDA backend"); they go through div_inplace / modulate now. The
-// traced divide replays through the same op.
-void test_hip_eager_div_modulate(Device dev) {
+// Outside a trace these run immediately. Off CUDA they go through
+// div_inplace / modulate. The traced divide replays through the same op.
+void test_eager_div_modulate(Device dev) {
     std::printf("\n--- Test 7: eager divide / modulate on %s ---\n", device_label(dev).c_str());
 
     const int R = 37;
@@ -622,30 +620,18 @@ int main() {
     } else {
         std::printf("\n[SKIP] CUDA device not available or not detected; skipping CUDA tests.\n");
     }
-    // HIP has no trace compiler: its traces replay op by op through the
+    // Vulkan has no trace compiler: its traces replay op by op through the
     // dispatched ops (src/jit/trace_eager.cpp). Tests 1-4 check results,
     // replay and the cache; test 5 measures the fused kernel's allocation
     // and launch count, which an unfused replay does not have.
-    if (brotensor::is_available(Device::hip())) {
-        std::printf("\n============================= [ HIP TEST SUITE ] =============================\n");
-        test_elementwise_expression(Device::hip());
-        test_residual_rmsnorm(Device::hip());
-        test_layernorm_modulate(Device::hip());
-        test_cache_hit_and_speedup(Device::hip());
-        test_hip_trace_stays_on_device(Device::hip());
-        test_hip_eager_div_modulate(Device::hip());
-    }
-    // Vulkan, likewise: no trace compiler, eager replay (the same tests as
-    // HIP; test 6 matters more here, a buffer device address is not a host
-    // pointer at all).
     if (brotensor::is_available(Device::vulkan())) {
         std::printf("\n============================ [ VULKAN TEST SUITE ] ===========================\n");
         test_elementwise_expression(Device::vulkan());
         test_residual_rmsnorm(Device::vulkan());
         test_layernorm_modulate(Device::vulkan());
         test_cache_hit_and_speedup(Device::vulkan());
-        test_hip_trace_stays_on_device(Device::vulkan());
-        test_hip_eager_div_modulate(Device::vulkan());
+        test_trace_stays_on_device(Device::vulkan());
+        test_eager_div_modulate(Device::vulkan());
     }
 
     std::printf("\n================================================================================\n");

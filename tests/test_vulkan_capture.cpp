@@ -53,8 +53,7 @@ void test_neutral_capture() {
     VKT_CHECK(!bt::graph_capture_available(Device::cpu()));
 
     const int n = 2048, reps = 20;
-    // Vulkan as the default device (a DeviceScope; HIP may be registered and
-    // is what the capture recorded on before it was neutral).
+    // Vulkan as the default device (a DeviceScope).
     {
         bt::DeviceScope scope(vk());
         VKT_CHECK(bt::graph_capture_available());
@@ -122,14 +121,6 @@ void test_neutral_capture() {
         bt::sync(vk());
         expect_close(y.to_host_vector(), chain_ref(xv, 3), 1e-6f, 1e-6f, "named-device replay");
         VKT_CHECK(throws([&] { bt::CudaGraphCapture cap(Device::cpu()); }));
-    }
-
-    // With a HIP default device the capture stays HIP's.
-    if (bt::is_available(Device::HIP)) {
-        bt::DeviceScope scope(Device::hip(0));
-        bt::CudaGraphCapture cap;
-        VKT_CHECK(cap.device().is_hip());
-        (void)cap.finish();
     }
 }
 

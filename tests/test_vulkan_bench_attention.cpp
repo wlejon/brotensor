@@ -1,15 +1,14 @@
 // `brotensor_test_vulkan --bench-attention`: flash attention throughput on the
 // vk-spike's shapes (../vk-spike/RESULTS.md: FP16, bidirectional, packed
-// heads), next to the spike's cooperative-matrix kernel and the HIP backend
-// running the same public op in the same process (when HIP is registered);
-// then causal prefill and decode against a KV cache. Not part of ctest.
+// heads), next to the spike's cooperative-matrix kernel; then causal prefill,
+// decode against a KV cache and the backward. Not part of ctest.
 //
 // Timing: wall clock around back-to-back launches with one device sync,
 // median of 7 batches after warm-up (test_vulkan_bench.cpp's method). TF/s
 // counts 4 L^2 hd H flops (2 for Q K^T, 2 for P V), halved for causal.
-// BROTENSOR_VK_BENCH_SHAPE=<tag> runs one shape; BROTENSOR_VK_BENCH_NOHIP=1
-// skips the HIP column; BROTENSOR_VK_FA_CFG=bc,nsg forces the fa_cm tile;
-// BROTENSOR_VK_BENCH_PART=prefill|causal|decode|bwd runs one part.
+// BROTENSOR_VK_BENCH_SHAPE=<tag> runs one shape; BROTENSOR_VK_FA_CFG=bc,nsg
+// forces the fa_cm tile; BROTENSOR_VK_BENCH_PART=prefill|causal|decode|bwd
+// runs one part.
 
 #include "test_vulkan_common.h"
 
@@ -64,11 +63,6 @@ const Shape kShapes[] = {
     {2048, 8, 256, "L2048-h8-d256", 0},
 };
 
-bool hip_ok() {
-    if (std::getenv("BROTENSOR_VK_BENCH_NOHIP")) return false;
-    return brotensor::is_available(Device::hip(0));
-}
-
 // One attention call on `dev` with fresh random FP16 inputs.
 struct Problem {
     Tensor Q, K, V, O;
@@ -81,57 +75,40 @@ struct Problem {
 
 void bench_prefill(bool causal) {
     std::printf("\n%s prefill, FP16, flash_attention_forward (ms / TF/s)\n", causal ? "causal" : "bidirectional");
-    std::printf("%-18s %10s %16s %16s %8s %8s\n", "shape", "spike", "vulkan", "hip", "vk/spk", "vk/hip");
+    std::printf("%-18s %10s %16s %8s\n", "shape", "spike", "vulkan", "vk/spk");
     const char* only = std::getenv("BROTENSOR_VK_BENCH_SHAPE");
-    const bool hip = hip_ok();
     for (const Shape& s : kShapes) {
         if (only && std::string(only) != s.tag) continue;
         const double flop = 4.0 * s.L * double(s.L) * s.hd * s.H * (causal ? 0.5 : 1.0);
         const int D = s.H * s.hd;
-        double vk_ms, hip_ms = 0;
-        {
-            Problem p(vk(), s.L, s.L, D, D);
-            vk_ms = median_ms(vk(), [&] { brotensor::flash_attention_forward(p.Q, p.K, p.V, nullptr, s.H, causal, p.O); });
-        }
-        if (hip) {
-            Problem p(Device::hip(0), s.L, s.L, D, D);
-            hip_ms = median_ms(Device::hip(0),
-                               [&] { brotensor::flash_attention_forward(p.Q, p.K, p.V, nullptr, s.H, causal, p.O); });
-        }
+        Problem p(vk(), s.L, s.L, D, D);
+        const double vk_ms =
+            median_ms(vk(), [&] { brotensor::flash_attention_forward(p.Q, p.K, p.V, nullptr, s.H, causal, p.O); });
         const double spk = causal ? 0 : s.spike_ms;
-        char a[32], b[32], c[32];
+        char a[32], b[32];
         std::snprintf(a, sizeof a, "%.2f", spk);
         std::snprintf(b, sizeof b, "%.3f / %5.2f", vk_ms, flop / (vk_ms * 1e9));
-        if (hip) std::snprintf(c, sizeof c, "%.3f / %5.2f", hip_ms, flop / (hip_ms * 1e9));
-        else std::snprintf(c, sizeof c, "-");
-        std::printf("%-18s %10s %16s %16s %8.2f %8.2f\n", s.tag, spk > 0 ? a : "-", b, c, spk > 0 ? spk / vk_ms : 0.0,
-                    hip ? hip_ms / vk_ms : 0.0);
+        std::printf("%-18s %10s %16s %8.2f\n", s.tag, spk > 0 ? a : "-", b, spk > 0 ? spk / vk_ms : 0.0);
     }
 }
 
 void bench_decode() {
     std::printf("\ndecode, FP16, flash_attention_decode (us / GB/s of K+V read)\n");
-    std::printf("%-30s %16s %16s %8s\n", "Lq x hq/hkv/hd x valid_len", "vulkan", "hip", "vk/hip");
+    std::printf("%-30s %16s\n", "Lq x hq/hkv/hd x valid_len", "vulkan");
     struct D { int hq, hkv, hd, len, lq = 1; };
     const D shapes[] = {{16, 8, 128, 512},  {16, 8, 128, 4096},     {32, 8, 128, 16384},    {14, 2, 64, 2048},
                         {32, 32, 128, 4096}, {16, 8, 128, 32768},   {16, 8, 128, 16384, 4}, {16, 8, 128, 16384, 8},
                         {16, 8, 128, 16384, 16}, {16, 8, 128, 16384, 64}};
-    const bool hip = hip_ok();
     for (const D& s : shapes) {
         const int Dq = s.hq * s.hd, Dkv = s.hkv * s.hd;
         const double bytes = 2.0 * s.len * Dkv * 2;
-        double ms[2] = {0, 0};
-        for (int b = 0; b < (hip ? 2 : 1); ++b) {
-            const Device dev = b == 0 ? vk() : Device::hip(0);
-            Problem p(dev, s.lq, s.len, Dq, Dkv);
-            ms[b] = median_ms(dev, [&] { brotensor::flash_attention_decode(p.Q, p.K, p.V, s.len, s.hq, s.hkv, p.O, 0.0f, 0); });
-        }
-        char tag[48], a[32], c[32];
+        Problem p(vk(), s.lq, s.len, Dq, Dkv);
+        const double ms =
+            median_ms(vk(), [&] { brotensor::flash_attention_decode(p.Q, p.K, p.V, s.len, s.hq, s.hkv, p.O, 0.0f, 0); });
+        char tag[48], a[32];
         std::snprintf(tag, sizeof tag, "%d x %d/%d/%d x %d", s.lq, s.hq, s.hkv, s.hd, s.len);
-        std::snprintf(a, sizeof a, "%7.1f / %5.0f", ms[0] * 1e3, bytes / (ms[0] * 1e6));
-        if (hip) std::snprintf(c, sizeof c, "%7.1f / %5.0f", ms[1] * 1e3, bytes / (ms[1] * 1e6));
-        else std::snprintf(c, sizeof c, "-");
-        std::printf("%-30s %16s %16s %8.2f\n", tag, a, c, hip ? ms[1] / ms[0] : 0.0);
+        std::snprintf(a, sizeof a, "%7.1f / %5.0f", ms * 1e3, bytes / (ms * 1e6));
+        std::printf("%-30s %16s\n", tag, a);
     }
 }
 
@@ -139,30 +116,23 @@ void bench_decode() {
 // backward flops (halved for causal).
 void bench_backward() {
     std::printf("\nbackward, FP16, flash_attention_backward (ms / TF/s)\n");
-    std::printf("%-26s %16s %16s %8s\n", "shape", "vulkan", "hip", "vk/hip");
+    std::printf("%-26s %16s\n", "shape", "vulkan");
     struct B { int L, H, hd; bool causal; };
     const B shapes[] = {{512, 8, 64, false}, {1024, 16, 64, false}, {1024, 16, 64, true},
                         {2048, 8, 128, true}, {2048, 16, 64, false}};
-    const bool hip = hip_ok();
     for (const B& s : shapes) {
         const int D = s.H * s.hd;
         const double flop = 10.0 * s.L * double(s.L) * s.hd * s.H * (s.causal ? 0.5 : 1.0);
-        double ms[2] = {0, 0};
-        for (int b = 0; b < (hip ? 2 : 1); ++b) {
-            const Device dev = b == 0 ? vk() : Device::hip(0);
-            Problem p(dev, s.L, s.L, D, D);
-            Tensor g = upload(random_values(std::size_t(s.L) * D, 4, -1.0f, 1.0f, Dtype::FP16), s.L, D, Dtype::FP16, dev);
-            Tensor dQ, dK, dV;
-            ms[b] = median_ms(dev, [&] {
-                brotensor::flash_attention_backward(p.Q, p.K, p.V, p.Q, g, nullptr, s.H, s.causal, dQ, dK, dV);
-            });
-        }
-        char tag[48], a[32], c[32];
+        Problem p(vk(), s.L, s.L, D, D);
+        Tensor g = upload(random_values(std::size_t(s.L) * D, 4, -1.0f, 1.0f, Dtype::FP16), s.L, D, Dtype::FP16, vk());
+        Tensor dQ, dK, dV;
+        const double ms = median_ms(vk(), [&] {
+            brotensor::flash_attention_backward(p.Q, p.K, p.V, p.Q, g, nullptr, s.H, s.causal, dQ, dK, dV);
+        });
+        char tag[48], a[32];
         std::snprintf(tag, sizeof tag, "L%d-h%d-d%d%s", s.L, s.H, s.hd, s.causal ? " causal" : "");
-        std::snprintf(a, sizeof a, "%.3f / %5.2f", ms[0], flop / (ms[0] * 1e9));
-        if (hip) std::snprintf(c, sizeof c, "%.3f / %5.2f", ms[1], flop / (ms[1] * 1e9));
-        else std::snprintf(c, sizeof c, "-");
-        std::printf("%-26s %16s %16s %8.2f\n", tag, a, c, hip ? ms[1] / ms[0] : 0.0);
+        std::snprintf(a, sizeof a, "%.3f / %5.2f", ms, flop / (ms * 1e9));
+        std::printf("%-26s %16s\n", tag, a);
     }
 }
 

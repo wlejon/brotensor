@@ -2,8 +2,24 @@
 
 `BROTENSOR_WITH_VULKAN=ON` builds a compute backend made of hand-written GLSL
 kernels and a small Vulkan host runtime. It runs on any GPU with a stock Vulkan
-1.2+ driver and is meant to replace the HIP backend on AMD. The measurements
-behind its design are in `../vk-spike/RESULTS.md` (Radeon 8060S, Mesa RADV).
+1.2+ driver and is brotensor's AMD GPU path. The measurements behind its
+design are in `../vk-spike/RESULTS.md` (Radeon 8060S, Mesa RADV).
+
+**HIP removal (2026-10-03).** brotensor used to carry a HIP (ROCm) backend
+(`BROTENSOR_WITH_HIP`, `src/hip/`, ~17.6k lines plus ~1.9k of HIP-only tests)
+that compiled most of `src/cuda/*.cu` a second time through a compat shim. It
+was deleted after commit b052cf3, the last one with `src/hip/`, once Vulkan
+covered 266 of 270 op-table slots (training included) and was faster on every
+workload measured on the same Radeon 8060S: 1.1-3x on SD1.5, PixArt, Sana,
+TripoSplat, Depth-Anything and SAM, 2x Qwen3 decode and 10x prefill, the
+T5-XXL encode 2x after the range-safe BF16 GEMM (docs/vulkan-bf16.md), the
+flash-attention backward 3.2-5.8x. The side-by-side numbers are in
+docs/vulkan-perf.md, and the per-op "HIP" columns below are kept as that
+historical comparison. `BROTENSOR_WITH_HIP=ON` is now a configure error;
+`DeviceType::HIP`, `Device::hip()`, `hip_device_count()`,
+`BROTENSOR_HAS_HIP`, `BROTENSOR_PREFER_HIP` and the `hip` / `rocm` device
+strings are gone. Use `-DBROTENSOR_WITH_VULKAN=ON` and `Device::vulkan(i)`
+(or `Device::CUDA`, which aliases to Vulkan without a CUDA backend).
 
 **Status:** the runtime is complete. The ops registered so far are the elementwise
 family, the activation backwards, the bias adds, cast, copies, row concat and
@@ -68,27 +84,20 @@ ops and filtered_lrelu (a composite of bias_act + upfirdn2d by design), none
 of which is ever dispatched to Vulkan. `docs/vulkan-coverage.md` lists every
 slot and, per sibling, what its inference and training code calls.
 **Default device.** Without a CUDA or Metal backend, Vulkan is the default
-device, also in a build that registers HIP as well: on the AMD GPUs both
-drive it runs every sibling model faster (1.1-3x on SD1.5, PixArt, Sana,
-TripoSplat, Depth-Anything, SAM; 2x Qwen3 decode, 10x prefill). The order is
-CUDA, Metal, Vulkan, HIP (`pick_default_from_available`, `src/init.cpp`).
-`BROTENSOR_PREFER_HIP=1`, or `BROTENSOR_DEFAULT_DEVICE=hip`, puts HIP before
-Vulkan again, for comparisons (`detail::prefer_hip()`). A HIP-only build is
-unchanged. Otherwise select it with `set_default_device(Device::vulkan(i))`, a
+device. The order is CUDA, Metal, Vulkan (`pick_default_from_available`,
+`src/init.cpp`). Otherwise select it with `set_default_device(Device::vulkan(i))`, a
 `DeviceScope`, or `BROTENSOR_DEFAULT_DEVICE=vulkan` (also `vk`, `vulkan:1`).
 An op in a null slot throws "not implemented on vulkan"; since chunk 9 no
 public op reaches one (training included).
 `Device::cuda(i)` aliases to `Device::vulkan(i)` when no CUDA backend is
-registered and Vulkan is (`detail::resolve_device_alias`), unless HIP is
-registered and preferred, or HIP is the only one: then it is `Device::hip(i)`.
-In a HIP + Vulkan build the generic test suites (which name the GPU as
-`Device::CUDA` and were written as the HIP backend's tests) run with
-`BROTENSOR_PREFER_HIP=1` (`tests/CMakeLists.txt`), and again on Vulkan as
-`<name>_vulkan` (`BROTENSOR_TEST_GPU=vulkan`, `BROTENSOR_DEFAULT_DEVICE=vulkan`;
-`tests/gpu_select.h` is the one device rule every suite uses); in a
-Vulkan-only build the plain registrations run on Vulkan.
+registered and Vulkan is (`detail::resolve_device_alias`). The generic test
+suites name the GPU as `Device::CUDA` and pick it through `tests/gpu_select.h`
+(the one device rule every suite uses); in a Vulkan-only build they all run
+on Vulkan, and in a build with CUDA or Metal as well they run again on Vulkan
+as `<name>_vulkan` (`BROTENSOR_TEST_GPU=vulkan`,
+`BROTENSOR_DEFAULT_DEVICE=vulkan`).
 Trace-JIT (`jit::*`) DAGs on Vulkan are replayed op by op through the
-dispatched ops (`src/jit/trace_eager.cpp`), as on HIP: there is no Vulkan
+dispatched ops (`src/jit/trace_eager.cpp`): there is no Vulkan
 trace compiler, and the CPU one must never see a buffer device address. The
 `fused_*` ops need no Vulkan case (they compose dispatched ops; the
 stacked-weight SwiGLU GEMV takes the GEMV epilogue).
@@ -96,7 +105,7 @@ stacked-weight SwiGLU GEMV takes the GEMV epilogue).
 ## Build
 
 ```sh
-cmake -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_HIP=ON -DBROTENSOR_WITH_VULKAN=ON
+cmake -B build_vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_VULKAN=ON
 cmake --build build_vk && ctest --test-dir build_vk -R vulkan
 ```
 
@@ -104,7 +113,7 @@ The build needs the Vulkan headers and `glslc` (shaderc). If `glslc` is not
 found, pass `-DBROTENSOR_GLSLC=`. Nothing links `libvulkan`: the loader is
 `dlopen`ed at run time, so a binary built with the backend still starts (and
 falls back to the other backends) on a machine without Vulkan. The backend
-coexists with HIP (and with CUDA or Metal) in one build. `cmake/BrotensorVulkan.cmake`
+coexists with CUDA or Metal in one build. `cmake/BrotensorVulkan.cmake`
 holds the whole build: target, shader compilation and embedding.
 
 ## File layout
@@ -177,7 +186,7 @@ Keep every file under 1000 lines: a new op family gets its own `ops_<family>.cpp
   `VkDeviceAddress` of its first byte (buffer device address), cast to `void*`.
   As a result, views at an offset, `copy_d2d` offsets, and the raw
   `const float* d_mask` / `const int32_t*` operands in the op table all work
-  exactly as on CUDA and HIP. The host never dereferences these values. When a
+  exactly as on CUDA. The host never dereferences these values. When a
   transfer or `vkCmdCopyBuffer` needs a `(VkBuffer, offset)`, the allocator maps
   the address back with `Allocator::resolve`.
 - **Blocks.** Each block is one `VkDeviceMemory` with one `VkBuffer` bound over
@@ -197,7 +206,7 @@ Keep every file under 1000 lines: a new op family gets its own `ops_<family>.cpp
 - **Reuse is stream ordered.** All work on a device is recorded in order into
   one stream, with a full barrier between commands. Every host access first
   drains that stream. So a freed sub-allocation can be handed out immediately,
-  with the same semantics as `hipFreeAsync` on one stream. A dedicated block is
+  with the same semantics as `cudaFreeAsync` on one stream. A dedicated block is
   returned to the driver only once the GPU has passed the work recorded before
   its free (a timeline serial).
 - **Transfers.** Uploads (h2d) take one of four paths:
@@ -209,9 +218,9 @@ Keep every file under 1000 lines: a new op family gets its own `ops_<family>.cpp
   Downloads (d2h) drain the stream. They read in place for 64 KiB or less, and
   otherwise go through a host-cached staging buffer, 64 MiB at a time, because
   mapped device-local memory is write-combined (slow for the CPU to read). Both
-  directions return synchronously, as on HIP. Vulkan↔Vulkan copies across two
-  devices go through the host. Vulkan↔HIP/CPU copies use `Tensor::to`, which
-  also bounces through the host.
+  directions return synchronously. Vulkan↔Vulkan copies across two
+  devices go through the host. Vulkan↔CPU / other-backend copies use
+  `Tensor::to`, which also bounces through the host.
 
 ## Dispatch model
 
@@ -258,20 +267,20 @@ Keep every file under 1000 lines: a new op family gets its own `ops_<family>.cpp
   replayed and 1.4 µs per command eager.
 - **Device-neutral capture.** `CudaGraphCapture` / `CudaGraph` (`cuda_graph.h`)
   are defined once in the core (`src/graph.cpp`) and forward to a recorder
-  each backend registers at probe time (`detail/graph_backend.h`): CUDA's and
-  HIP's are what those classes used to be (unchanged), Vulkan's is a
+  each backend registers at probe time (`detail/graph_backend.h`): CUDA's is
+  what those classes used to be (unchanged), Vulkan's is a
   `VulkanGraphCapture`. `CudaGraphCapture()` records on the default device
   when it is a GPU with capture (so `BROTENSOR_DEFAULT_DEVICE=vulkan` or a
   `DeviceScope` makes an unchanged `bt::CudaGraphCapture cap; ...;
   g = cap.finish(); g.launch();` site record on Vulkan); with a CPU / Metal
-  default device it falls back to CUDA's / HIP's current device as before, then
+  default device it falls back to CUDA's current device as before, then
   Vulkan 0. `CudaGraphCapture(Device)` names the device and
   `graph_capture_available(Device)` is the gate a caller checks instead of
-  `device == CUDA || device == HIP`. What still differs per backend: a Vulkan
-  capture records every thread's ops on its device (CUDA / HIP: the
+  `device == CUDA`. What still differs per backend: a Vulkan
+  capture records every thread's ops on its device (CUDA: the
   capturing thread's), and sync, uploads and downloads on it throw while it
   records. Tested by `brotensor_test_cuda_graph_vulkan`,
-  `brotensor_test_graph_capture_alloc_vulkan` (the CUDA / HIP tests with Vulkan
+  `brotensor_test_graph_capture_alloc_vulkan` (the CUDA tests with Vulkan
   as the default device) and `brotensor_test_vulkan --only=capture`.
 
 ## Custom kernels
@@ -490,8 +499,8 @@ pitch of 2T-2).
 Measured with `brotensor_test_vulkan --bench-attention` (FP16, wall clock
 around back-to-back calls, median of 7 batches, one shape per process:
 `BROTENSOR_VK_BENCH_PART=prefill|causal|decode`,
-`BROTENSOR_VK_BENCH_SHAPE=<tag>`; HIP is the HIP backend's same public op in
-the same process, `BROTENSOR_VK_BENCH_NOHIP=1` skips it; spike figures from
+`BROTENSOR_VK_BENCH_SHAPE=<tag>`; the HIP column is the removed HIP backend's
+same public op, measured in the same process before its removal; spike figures from
 `../vk-spike/RESULTS.md`), ms / TF/s:
 
 | Shape (L, heads, hd) | spike | Vulkan | HIP | vs spike | vs HIP |
@@ -551,8 +560,8 @@ the ResBlock to add conv2 onto the skip path without another pass). Tiles
 
 Measured with `brotensor_test_vulkan --bench-conv` (FP16, batch 1 unless
 noted, 3x3 stride 1 same padding unless noted, wall clock around
-back-to-back calls, median of 7 batches; HIP is the HIP backend's same public
-op, which runs im2col + hipBLAS, in the same process), ms / TF/s:
+back-to-back calls, median of 7 batches; the HIP column is the removed HIP
+backend's same public op, im2col + hipBLAS, measured in the same process), ms / TF/s:
 
 | Shape | Vulkan | HIP | vs HIP |
 |---|---|---|---|
@@ -691,7 +700,8 @@ through `quant_linear()` around the FP16 attention core
 Measured with `brotensor_test_vulkan --bench-quant` (wall clock around
 back-to-back calls, median of 7 batches, one format per process:
 `BROTENSOR_VK_BENCH_FMT=int8|q8_0|q4k|q6k`, `BROTENSOR_VK_BENCH_PART=decode|prefill`;
-HIP is its same public op in the same process). Decode, GB/s of the stored
+the HIP column is the removed HIP backend's same public op, measured in the
+same process). Decode, GB/s of the stored
 weight bytes at B = 1 / 2 / 4 / 8; shapes over 32 MB (the Infinity Cache)
 are DRAM-bound, smaller ones read partly from the cache:
 
@@ -927,8 +937,7 @@ to divide 64; the dispatcher checks).
 
 | Variable | Effect |
 |---|---|
-| `BROTENSOR_DEFAULT_DEVICE=vulkan[:i]` / `vk[:i]` | make Vulkan the default device (it already is without CUDA / Metal, unless HIP is preferred) |
-| `BROTENSOR_PREFER_HIP=1` | with HIP and Vulkan both registered, HIP is the default device and the `Device::CUDA` alias (also implied by `BROTENSOR_DEFAULT_DEVICE=hip`) |
+| `BROTENSOR_DEFAULT_DEVICE=vulkan[:i]` / `vk[:i]` | make Vulkan the default device (it already is without CUDA / Metal) |
 | `BROTENSOR_DISABLE_VULKAN=1` | do not probe Vulkan at all |
 | `BROTENSOR_VK_VERBOSE=1` | print why the backend did or did not register |
 | `BROTENSOR_VK_ALLOW_CPU=1` | accept CPU implementations (lavapipe) |

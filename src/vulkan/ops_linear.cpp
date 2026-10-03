@@ -1,8 +1,8 @@
 // Vulkan matrix ops: matmul, matmul_abt, the linear family (with the bias /
 // activation / accumulate / GeGLU / SwiGLU epilogues) and the GEMM backwards.
 // Every op maps onto one or more detail::vulkan::gemm() calls (gemm.cpp),
-// which picks the GEMV, cooperative-matrix or SIMT kernel. Contracts follow
-// the HIP backend (src/hip/gemm.hip) where it is wider than the CPU's:
+// which picks the GEMV, cooperative-matrix or SIMT kernel. Contracts are wider
+// than the CPU's:
 // FP32 / FP16 / BF16 everywhere, FP32 activations against 16-bit weights in
 // linear_forward_batched (accumulated in FP32 without rounding the
 // activations), matmul_abt strides taken literally (zero broadcasts).
@@ -113,7 +113,7 @@ void matmul_abt(const Tensor& A, const Tensor& B, Tensor& C, int batch, int M, i
     check_act(act, op);
     if (batch <= 0 || M == 0 || N == 0) return;
     if (M < 0 || N < 0 || K < 0) fail(op, "negative dimension");
-    // As on HIP: C is resized only when its dtype differs or it cannot hold
+    // C is resized only when its dtype differs or it cannot hold
     // the batch at the given stride.
     const long long c_extent = static_cast<long long>(batch - 1) * strideC + static_cast<long long>(M) * N;
     if (C.dtype != A.dtype || C.size() < c_extent) C.resize(batch > 1 ? batch * M : M, N, A.dtype);

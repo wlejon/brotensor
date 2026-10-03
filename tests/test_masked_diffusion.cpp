@@ -561,13 +561,13 @@ int main() {
     test_small_grid();
     test_throws();
     test_commit_cpu();
-    // HIP runs the CUDA half through the CUDA -> HIP device alias.
+    // Vulkan runs the CUDA half through the CUDA -> Vulkan device alias.
     const bool cuda = bt_test::has_gpu();
     test_top_k_long_row(cuda);
     if (cuda) {
         test_parity();
     } else {
-        std::printf("  skip  no CUDA/HIP backend; CPU-only run\n");
+        std::printf("  skip  no GPU backend; CPU-only run\n");
     }
     if (g_failures == 0) {
         std::printf("  OK  all masked_diffusion tests passed\n");

@@ -28,7 +28,7 @@ using brotensor::Tensor;
 //
 // The parity suite is backend-neutral: it runs the same device-neutral op on
 // the CPU and on whichever GPU backend this binary was built with
-// (gpu_select.h: BROTENSOR_TEST_GPU, else CUDA, HIP, Metal, Vulkan). Returns
+// (gpu_select.h: BROTENSOR_TEST_GPU, else CUDA, Metal, Vulkan). Returns
 // Device::CPU as a sentinel meaning "no GPU backend" — run_all() checks this
 // up front and skips the suite.
 //

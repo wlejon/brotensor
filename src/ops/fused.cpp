@@ -229,12 +229,12 @@ void fused_gemv_swiglu(const Tensor& x, const Tensor& w_gate, const Tensor& w_up
     }
 #endif
 
-    // HIP / Vulkan, 16-bit, gate and up the two halves of one stacked
+    // Vulkan, 16-bit, gate and up the two halves of one stacked
     // [gate; up] weight (the layout a fused gate_up projection is stored in):
     // that is exactly linear_forward_batched_ex's SwiGLU epilogue, whose GEMV
     // kernel does both dot products and the gate in one pass.
     const bool sixteen = x.dtype == Dtype::FP16 || x.dtype == Dtype::BF16;
-    if ((x.device.type == DeviceType::HIP || x.device.type == DeviceType::VULKAN) && sixteen &&
+    if (x.device.type == DeviceType::VULKAN && sixteen &&
         w_gate.dtype == x.dtype && w_up.dtype == x.dtype &&
         static_cast<const char*>(w_up.data) ==
             static_cast<const char*>(w_gate.data) +

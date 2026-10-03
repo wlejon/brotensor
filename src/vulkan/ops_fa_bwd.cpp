@@ -5,10 +5,9 @@
 // core of all four: recompute-based (O is not read), FP32 scores, softmax
 // statistics, dP and dS, no atomics.
 //
-// Contracts follow the CUDA / HIP backend (src/cuda/flash_attention_backward.cu,
+// Contracts follow the CUDA backend (src/cuda/flash_attention_backward.cu,
 // flash_attention_packed_backward.cu, flash_attention.cu), widened to every
-// float dtype: Q, K, V and dO share one dtype (FP32 / FP16 / BF16; the HIP
-// bare backward takes 16-bit only), dQ / dK / dV are resized to it and
+// float dtype: Q, K, V and dO share one dtype (FP32 / FP16 / BF16), dQ / dK / dV are resized to it and
 // OVERWRITTEN, scale 1 / sqrt(head_dim), a key mask is valid where > 0.5,
 // causal needs Lq == Lk. The device-resident cu_seqlens / seq_bounds tables
 // are not read back (as the Vulkan forwards): they are clamped to [0, lk] in

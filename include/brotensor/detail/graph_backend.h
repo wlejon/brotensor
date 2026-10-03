@@ -3,8 +3,8 @@
 // Backend side of the device-neutral graph capture (public API:
 // include/brotensor/cuda_graph.h). CudaGraphCapture / CudaGraph are defined
 // once, in src/graph.cpp; each GPU backend that can record and replay an op
-// sequence registers a factory here from its probe (CUDA: cudaGraph, HIP:
-// hipGraph + capture arena, Vulkan: a re-submitted command buffer), and the
+// sequence registers a factory here from its probe (CUDA: cudaGraph,
+// Vulkan: a re-submitted command buffer), and the
 // capture scope asks the factory of the backend its device belongs to.
 // Nothing outside brotensor's backends includes this header.
 
@@ -32,8 +32,8 @@ public:
     virtual int device_index() const = 0;
 };
 
-// `device_index` < 0 means "the backend's current device" (HIP / CUDA:
-// hipGetDevice / cudaGetDevice), which is what the pre-neutral capture did.
+// `device_index` < 0 means "the backend's current device" (CUDA:
+// cudaGetDevice), which is what the pre-neutral capture did.
 using GraphRecorderFactory = std::unique_ptr<GraphRecorder> (*)(int device_index);
 
 void register_graph_backend(DeviceType dt, GraphRecorderFactory factory);

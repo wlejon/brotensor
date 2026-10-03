@@ -6,7 +6,7 @@ How brotensor is put together: one tensor type, a runtime dispatch layer, and th
 
 A `brotensor::Tensor` is a row-major `(rows, cols)` buffer carrying two runtime tags:
 
-- `Device device` — `CPU`, `CUDA`, `Metal`, `HIP` or `VULKAN` (plus a card index): where the storage lives.
+- `Device device` — `CPU`, `CUDA`, `Metal` or `VULKAN` (plus a card index): where the storage lives.
 - `Dtype dtype` — what the elements are.
 
 There is **no separate host/device tensor type**. Storage is a single opaque `void* data` allocated through the owning backend's allocator vtable. Rank-1 tensors are `(N, 1)`; higher-rank layouts (NCHW images, `(T*B, H)` sequences, packed heads) are flattened into the two dims by each op's documented shape contract.
@@ -37,7 +37,7 @@ Every public op in `<brotensor/ops.h>` is a thin wrapper that:
 A backend is just an `OpsVTable` (op function pointers) plus an `AllocVTable` (alloc/free/copy), registered at runtime:
 
 - **CPU** self-registers from a static-init object (`src/cpu/register.cpp`) — CPU tensors work without any `init()` call.
-- **CUDA / Metal / HIP / Vulkan** are probed and registered inside `brotensor::init()`, if compiled in and a device is actually present.
+- **CUDA / Metal / Vulkan** are probed and registered inside `brotensor::init()`, if compiled in and a device is actually present.
 
 ### The op table is one X-macro
 
@@ -52,23 +52,23 @@ The vtable slot signature *is* the public signature: same argument order, same s
 - **CPU** — scalar FP32, always compiled. It implements essentially the entire FP32 surface, forward *and* backward — including the diffusion samplers, flash attention, the audio family, and the vision primitives. It is the simple, correct, autovectorize-friendly reference that the parity tests measure the GPU backends against. By design it leaves the FP16 / BF16 / INT8-W8A16 / GGUF-quant slots null.
 - **CUDA** (`BROTENSOR_WITH_CUDA=ON`) — mirrors the FP32 surface and adds the FP16/BF16 precision paths, batched-inference variants, W8A16 WMMA kernels, GGUF block-quant kernels, and fused inference kernels.
 - **Metal** (`BROTENSOR_WITH_METAL=ON`) — same role as CUDA on Apple GPUs, and at near-total parity with it: of the 260 slots Metal leaves six null (three host-scalar loss/RNG ops, `xavier_init`, and the CUDA-only fused `filtered_lrelu` pair). See the [coverage tables](op-coverage.md#backend-coverage).
-- **Vulkan** (`BROTENSOR_WITH_VULKAN=ON`) — hand-written GLSL compute kernels on any GPU with a stock Vulkan 1.2+ driver, meant to replace HIP on AMD. It implements every inference op the siblings call (242 of 270 slots; the null ones are training backwards) and is the default device when there is no CUDA or Metal backend, ahead of HIP unless `BROTENSOR_PREFER_HIP=1`. Design, memory and dispatch model, dtype policy and how to add an op: [vulkan.md](vulkan.md).
+- **Vulkan** (`BROTENSOR_WITH_VULKAN=ON`) — hand-written GLSL compute kernels on any GPU with a stock Vulkan 1.2+ driver, the AMD GPU path. It fills 266 of 270 op-table slots (the 4 null ones are host-only or composite by design) and is the default device when there is no CUDA or Metal backend. Design, memory and dispatch model, dtype policy and how to add an op: [vulkan.md](vulkan.md).
 
 A handful of "ops" are not vtable entries at all but device-agnostic compositions of public ops — LoRA (`ops/lora.h`, header-only) and the `filtered_lrelu` composite — so they run on any backend automatically.
 
 ## Default device and scopes
 
-`default_device()` picks the best available backend (CUDA > Metal > Vulkan > HIP > CPU; `BROTENSOR_PREFER_HIP=1` puts HIP ahead of Vulkan). The no-suffix factories (`Tensor::zeros`, `empty`, `from_host`) allocate there; `*_on` variants pin to an explicit device. Override the default:
+`default_device()` picks the best available backend (CUDA > Metal > Vulkan > CPU). The no-suffix factories (`Tensor::zeros`, `empty`, `from_host`) allocate there; `*_on` variants pin to an explicit device. Override the default:
 
 - globally with `set_default_device(Device)`,
 - per-scope with `DeviceScope` (RAII),
-- per-process with the `BROTENSOR_DEFAULT_DEVICE` env var (`cpu` / `cuda` / `metal` / `vulkan` or `vk` / `hip` or `rocm`, optionally `:N`).
+- per-process with the `BROTENSOR_DEFAULT_DEVICE` env var (`cpu` / `cuda` / `metal` / `vulkan` or `vk`, optionally `:N`).
 
 `compute_dtype()` is the dtype a model loader should upload weights at for the current default device: FP32 on CPU, FP16 on a GPU.
 
 ## Streams and synchronization
 
-CUDA / HIP hot ops launch asynchronously on the current stream. Vulkan records ops into a command buffer submitted when full, on a host read, or on `flush()` (`vulkan.h`). Metal batches command buffers and submits asynchronously (see `metal_interop.h` for `submit` / `flush` and the custom-kernel interop surface). `sync(Device)` / `sync_all()` drain pending work — call one before reading GPU results back to the host. They are no-ops on CPU.
+CUDA hot ops launch asynchronously on the current stream. Vulkan records ops into a command buffer submitted when full, on a host read, or on `flush()` (`vulkan.h`). Metal batches command buffers and submits asynchronously (see `metal_interop.h` for `submit` / `flush` and the custom-kernel interop surface). `sync(Device)` / `sync_all()` drain pending work — call one before reading GPU results back to the host. They are no-ops on CPU.
 
 ## Error handling
 
@@ -85,12 +85,11 @@ Static libraries plus one interface target:
 | `brotensor_cuda` | CUDA backend (`BROTENSOR_WITH_CUDA=ON`) |
 | `brotensor_metal` | Metal backend (`BROTENSOR_WITH_METAL=ON`) |
 | `brotensor_vulkan` | Vulkan backend (`BROTENSOR_WITH_VULKAN=ON`) |
-| `brotensor_hip` | HIP backend (`BROTENSOR_WITH_HIP=ON`) |
 | `brotensor::brotensor` | The INTERFACE target consumers link |
 
 The interface target **whole-archives** the backend libraries so their self-registration translation units survive the link — don't link the backend libs directly.
 
-`BROTENSOR_WITH_CUDA`, `_METAL`, `_HIP` and `_VULKAN` are options (all default OFF); CUDA and HIP are mutually exclusive, CUDA / Metal stay exclusive in practice because the nvcc and Apple toolchains don't coexist on one host, and Vulkan sits beside any of them. Per-backend preprocessor defines: `BROTENSOR_HAS_CUDA` / `BROTENSOR_HAS_METAL` / `BROTENSOR_HAS_HIP` / `BROTENSOR_HAS_VULKAN`, with `BROTENSOR_HAS_GPU` as the umbrella. Most code never needs them — the unified `Tensor` and op surface compile identically regardless of backend; reach for the defines only to gate a path that genuinely needs a GPU present, and prefer `BROTENSOR_HAS_GPU` unless you need backend identity.
+`BROTENSOR_WITH_CUDA`, `_METAL` and `_VULKAN` are options (all default OFF); CUDA / Metal stay exclusive in practice because the nvcc and Apple toolchains don't coexist on one host, and Vulkan sits beside any of them. Per-backend preprocessor defines: `BROTENSOR_HAS_CUDA` / `BROTENSOR_HAS_METAL` / `BROTENSOR_HAS_VULKAN`, with `BROTENSOR_HAS_GPU` as the umbrella. Most code never needs them — the unified `Tensor` and op surface compile identically regardless of backend; reach for the defines only to gate a path that genuinely needs a GPU present, and prefer `BROTENSOR_HAS_GPU` unless you need backend identity.
 
 `BROTENSOR_TESTS` (default ON when built standalone) enables the test suite.
 

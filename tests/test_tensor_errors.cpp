@@ -135,7 +135,7 @@ static void test_dtype_sizing() {
     CHECK(std::strcmp(brotensor::device_name(Device::CPU), "CPU") == 0);
     CHECK(std::strcmp(brotensor::device_name(Device::CUDA), "CUDA") == 0);
     CHECK(std::strcmp(brotensor::device_name(Device::Metal), "Metal") == 0);
-    CHECK(std::strcmp(brotensor::device_name(Device::HIP), "hip") == 0);
+    CHECK(std::strcmp(brotensor::device_name(Device::VULKAN), "vulkan") == 0);
 }
 
 // ─── 2. negative dimensions ────────────────────────────────────────────────
@@ -394,7 +394,7 @@ static void test_host_accessor_device_errors() {
     std::vector<float> backing(4, 0.0f);
     Tensor fake = Tensor::view(Device::CUDA, backing.data(), 2, 2);
     // view() retags a CUDA request as the backend Device::CUDA aliases to
-    // when no CUDA backend is registered (HIP or Vulkan,
+    // when no CUDA backend is registered (Vulkan,
     // detail::resolve_device_alias); otherwise it stays CUDA.
     namespace d = brotensor::detail;
     CHECK(fake.device == d::resolve_device_alias(Device::CUDA));
@@ -474,13 +474,13 @@ static void test_dispatch_registration() {
 
     // An unregistered backend throws on lookup. Skipped when the backend is
     // actually present (a CUDA/Metal build). An unregistered CUDA is the one
-    // exception: with HIP registered, ops_for/alloc_for(CUDA) alias to HIP's
-    // tables (code that asks for "the CUDA device" runs on ROCm), while
+    // exception: with Vulkan registered, ops_for/alloc_for(CUDA) alias to
+    // Vulkan's tables (code that asks for "the CUDA device" runs there), while
     // is_registered(CUDA) stays false.
     if (d::is_registered(Device::CUDA)) {
         std::printf("  CUDA registered - skipping unregistered-lookup case\n");
     } else if (d::resolve_device_alias(Device::CUDA).type != Device::CUDA.type) {
-        // Aliased to HIP or Vulkan (the preferred one when both are registered).
+        // Aliased to Vulkan.
         const Device alias = d::resolve_device_alias(Device::CUDA);
         CHECK(&d::ops_for(Device::CUDA) == &d::ops_for(alias));
         CHECK(&d::alloc_for(Device::CUDA) == &d::alloc_for(alias));
@@ -496,12 +496,12 @@ static void test_dispatch_registration() {
     } else {
         std::printf("  Metal registered - skipping unregistered-lookup case\n");
     }
-    if (!d::is_registered(Device::HIP)) {
-        CHECK(throws_with([] { (void)&d::ops_for(Device::HIP); },
+    if (!d::is_registered(Device::VULKAN)) {
+        CHECK(throws_with([] { (void)&d::ops_for(Device::VULKAN); },
                           "not registered"));
-        CHECK(throws_runtime_error([] { (void)&d::alloc_for(Device::HIP); }));
+        CHECK(throws_runtime_error([] { (void)&d::alloc_for(Device::VULKAN); }));
     } else {
-        std::printf("  HIP registered - skipping unregistered-lookup case\n");
+        std::printf("  Vulkan registered - skipping unregistered-lookup case\n");
     }
 
     // throw_not_implemented builds a "<op>: not implemented on <device>" error.
@@ -565,7 +565,7 @@ static void test_dispatch_resolution() {
 
     // adopt_output pins an uncommitted output; a committed one keeps its tag.
     // A CUDA tag resolves to the aliased backend when CUDA is not registered
-    // (detail::resolve_device_alias: HIP or Vulkan).
+    // (detail::resolve_device_alias: Vulkan).
     Tensor fresh;
     d::adopt_output(fresh, Device::CUDA);
     CHECK(fresh.device == d::resolve_device_alias(Device::CUDA));   // tag only — still no storage

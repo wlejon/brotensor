@@ -136,7 +136,6 @@ std::size_t dtype_storage_bytes(Dtype d, std::int64_t numel) {
 const Device Device::CPU{DeviceType::CPU, 0};
 const Device Device::CUDA{DeviceType::CUDA, 0};
 const Device Device::Metal{DeviceType::Metal, 0};
-const Device Device::HIP{DeviceType::HIP, 0};
 const Device Device::VULKAN{DeviceType::VULKAN, 0};
 
 const char* device_name(Device d) {
@@ -151,12 +150,6 @@ const char* device_name(Device d) {
         if (d.index == 0) return "Metal";
         static thread_local char buf[32];
         std::snprintf(buf, sizeof(buf), "Metal:%d", d.index);
-        return buf;
-    }
-    if (d.is_hip()) {
-        if (d.index == 0) return "hip";
-        static thread_local char buf[32];
-        std::snprintf(buf, sizeof(buf), "hip:%d", d.index);
         return buf;
     }
     if (d.is_vulkan()) {
@@ -602,7 +595,7 @@ Tensor Tensor::to(Device target) const {
         // GPU → CPU.
         detail::alloc_for(device).memcpy_d2h(t.data, data, n, device.index);
     } else if (device.type == target.type) {
-        // Direct peer copy between two GPUs of one backend (CUDA or HIP;
+        // Direct peer copy between two GPUs of one backend (CUDA or Vulkan;
         // Metal has a single device and never gets here).
         auto peer_fn = detail::alloc_for(target).memcpy_peer;
         if (peer_fn) {

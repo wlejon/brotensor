@@ -84,9 +84,9 @@ int main() try {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     brotensor::init();
     Device dev = Device::CPU;
-    if (brotensor::is_available(Device::HIP))        dev = Device::HIP;
-    else if (brotensor::is_available(Device::CUDA))  dev = Device::CUDA;
-    else if (brotensor::is_available(Device::Metal)) dev = Device::Metal;
+    if (brotensor::is_available(Device::CUDA))        dev = Device::CUDA;
+    else if (brotensor::is_available(Device::Metal))  dev = Device::Metal;
+    else if (brotensor::is_available(Device::VULKAN)) dev = Device::VULKAN;
     else { std::printf("no GPU backend available - skipping\n"); return 0; }
     std::printf("bench_matmul_abt (device=%s)\n", brotensor::device_name(dev));
 

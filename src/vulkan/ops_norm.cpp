@@ -2,8 +2,7 @@
 // inference with and without beta, FP16 inference, training with caches and
 // both backwards), RMSNorm, per-head L2 norm, pixel norm, and the vector /
 // row softmax with its backward. One kernel (shaders/norm.comp), one
-// workgroup per row, FP32 accumulation, two-pass variance. Contracts follow
-// the HIP backend (src/hip/norm*.hip, softmax.hip): FP32 / FP16 / BF16
+// workgroup per row, FP32 accumulation, two-pass variance. Contracts: FP32 / FP16 / BF16
 // storage, LayerNorm caches (Mean_R, Rstd_R) in FP32, RMSNorm gamma in X's
 // dtype or FP32, gradients of gamma / beta accumulated (+=).
 
@@ -62,7 +61,7 @@ void ensure(Tensor& t, int r, int c, Dtype dt) {
 }
 
 // A gradient accumulator: kept when it already has n elements of dt,
-// otherwise reshaped like `like` and zeroed (the HIP backend's rule).
+// otherwise reshaped like `like` and zeroed.
 void ensure_grad(Tensor& g, const Tensor& like, long long n, Dtype dt) {
     if (g.size() != n || g.dtype != dt) {
         g.resize(like.rows, like.cols, dt);
@@ -120,7 +119,7 @@ void layernorm_forward_inference_batched(const Tensor& X, const Tensor& gamma, c
                                          float eps) {
     constexpr const char* op = "layernorm_forward_inference_batched";
     dt_code(X.dtype, op);
-    // FP32 X may write a pre-typed FP16 Y (HIP); anything else gets X's dtype.
+    // FP32 X may write a pre-typed FP16 Y; anything else gets X's dtype.
     if (Y.rows != X.rows || Y.cols != X.cols || (Y.dtype != X.dtype && !(X.dtype == Dtype::FP32 && Y.dtype == Dtype::FP16))) {
         Y.resize(X.rows, X.cols, X.dtype);
     }

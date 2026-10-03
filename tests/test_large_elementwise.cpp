@@ -260,7 +260,7 @@ int main() {
     std::printf("test_large_elementwise: exercising kernels at >1M elements\n");
     brotensor::init();
     if (!bt_test::has_gpu()) {
-        std::printf("no CUDA/HIP backend - skipping\n");
+        std::printf("no GPU backend - skipping\n");
         return 0;
     }
     try {

@@ -2,7 +2,7 @@
 // Direct DFT of frame-sized transforms in FP64 (ops_spectral.cpp,
 // dft_rows): the same contract as dft.comp's SP_BASIS + the FP32 GEMM, but
 // every product and sum in double and one rounding to FP32 at the store, as
-// the CPU (FP64 FFT) and CUDA / HIP (FP64 direct DFT) references do. The FP32
+// the CPU (FP64 FFT) and CUDA (FP64 direct DFT) references do. The FP32
 // GEMM's 400-2048-term sums of cancelling terms carried ~5e-5 absolute error
 // at n_fft 512 and rounded a frame differently by its row position; here a
 // frame's result depends only on its samples, so streaming == offline bit

@@ -1,5 +1,5 @@
 // Vulkan LSTM training: lstm_forward_train and lstm_backward (BPTT), FP32
-// as on CUDA / HIP (src/cuda/lstm.cu) and the CPU reference
+// as on CUDA (src/cuda/lstm.cu) and the CPU reference
 // (src/cpu/lstm.cpp): PyTorch layout W_ih (4H, I), W_hh (4H, H), gates
 // [i | f | g | o]; gates holds the post-activation values, C the cell
 // states, Y the hidden states (T B rows, row t B + b); parameter gradients

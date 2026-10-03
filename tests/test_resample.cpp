@@ -399,7 +399,7 @@ static void run_bwd_fp16(int N, int C, int H, int W) {
 int main() {
     brotensor::init();
     if (!bt_test::has_gpu()) {
-        std::printf("no CUDA/HIP backend - skipping\n");
+        std::printf("no GPU backend - skipping\n");
         return 0;
     }
     std::printf("test_resample\n");

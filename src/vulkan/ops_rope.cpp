@@ -4,7 +4,7 @@
 // tables indexed by a per-row position) and rope_apply_mrope (Qwen-VL's three
 // position streams). All in shaders/rope.comp, interleaved-pair convention,
 // FP32 / FP16 / BF16 storage with FP32 math, FP32 tables. Contracts follow
-// src/hip/rope.hip (output resized to X's shape and dtype).
+// src/cuda/rope.cu (output resized to X's shape and dtype).
 
 #include "detail/kernels.h"
 

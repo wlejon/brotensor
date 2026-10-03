@@ -20,7 +20,7 @@
 #include <brotensor/tensor.h>
 
 // The quantized weight is staged as raw host bytes and pushed into a device
-// tensor with Tensor::copy_from_host_raw (a CUDA / HIP pointer cannot be
+// tensor with Tensor::copy_from_host_raw (a CUDA pointer cannot be
 // written from the host, and a Vulkan one is a device address).
 
 #include <cmath>

@@ -2,7 +2,7 @@
 
 // Error handling for the Vulkan backend: every failing Vulkan call becomes a
 // std::runtime_error carrying the VkResult, the expression and the location,
-// the same shape as BROTENSOR_HIP_CHECK / BROTENSOR_CUDA_CHECK.
+// the same shape as BROTENSOR_CUDA_CHECK.
 
 #include "vk_fns.h"
 

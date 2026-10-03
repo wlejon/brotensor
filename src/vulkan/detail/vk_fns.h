@@ -3,7 +3,7 @@
 // Vulkan entry points, loaded at run time.
 //
 // The backend never links libvulkan: a binary built with BROTENSOR_WITH_VULKAN
-// has to start (and fall back to CPU / HIP) on a machine with no Vulkan loader
+// has to start (and fall back to the CPU) on a machine with no Vulkan loader
 // at all, the same reason the CUDA backend links cudart statically and never
 // libcuda. So VK_NO_PROTOTYPES is set, the loader library is dlopen()ed once
 // (loader.cpp), and every call goes through one of the tables below.

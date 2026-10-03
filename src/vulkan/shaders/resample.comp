@@ -8,7 +8,7 @@
 // Source coordinates are exact rationals, not floating point: half-pixel
 // (align_corners = false) is src = ((2 o + 1) in - out) / (2 out), corner-
 // aligned is src = o (in - 1) / (out - 1). floor and round-half-to-even are
-// taken on the rational in 64-bit integers, which is what the CPU / HIP
+// taken on the rational in 64-bit integers, which is what the CPU
 // reference computes in double for every shape where the double rounding
 // does not land on the wrong side of a tie (the fraction is FP32 either way).
 #include "common.glsl"

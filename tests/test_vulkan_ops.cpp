@@ -113,7 +113,7 @@ void test_unary() {
 void test_binary() {
     std::printf("binary in place\n");
     // axpby's atol: the CPU build contracts a*y + b*x into an FMA (one
-    // rounding), the GPU kernels evaluate it unfused like CUDA / HIP (two), so
+    // rounding), the GPU kernels evaluate it unfused like CUDA (two), so
     // where the terms cancel they differ by an ulp of the terms (|terms| <= 4).
     struct Case {
         const char* name;

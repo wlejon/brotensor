@@ -123,7 +123,7 @@ static void run_case(bool fp16, int batch, bool with_bias, int act) {
 int main() {
     brotensor::init();
     if (!bt_test::has_gpu()) {
-        std::printf("no CUDA/HIP backend - skipping\n");
+        std::printf("no GPU backend - skipping\n");
         return 0;
     }
     std::printf("test_matmul_abt\n");

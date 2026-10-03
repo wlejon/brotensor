@@ -113,22 +113,23 @@ endif()
 # --- Backends ---
 #
 # brotensor is layered: a core dispatcher + always-on CPU backend, plus
-# optional GPU backends (CUDA, Metal, HIP) that compile as independent static
+# optional GPU backends (CUDA, Metal, Vulkan) that compile as independent static
 # libraries and register themselves into the dispatcher at static-init.
 # CUDA and Metal are not rejected together at the CMake level — they stay
 # exclusive in practice because their toolchains do not coexist on one host
-# (nvcc on Linux/Windows; Apple toolchain on Mac). CUDA and HIP are rejected
-# together: the HIP backend compiles src/cuda/*.cu a second time, as HIP, into
-# the same symbols, and the Device::CUDA -> HIP alias assumes only one of them
-# is registered. CPU has no opt-out.
+# (nvcc on Linux/Windows; Apple toolchain on Mac). CPU has no opt-out.
 option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
 option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
-option(BROTENSOR_WITH_HIP   "Build GPU backend (HIP/ROCm)" OFF)
 # Vulkan compute (hand-written GLSL, any GPU with a stock Vulkan 1.2+ driver).
-# Independent of the others; builds alongside HIP. See docs/vulkan.md.
+# Independent of the others; the AMD GPU path. See docs/vulkan.md.
 option(BROTENSOR_WITH_VULKAN "Build GPU backend (Vulkan compute)" OFF)
-if(BROTENSOR_WITH_CUDA AND BROTENSOR_WITH_HIP)
-    message(FATAL_ERROR "BROTENSOR_WITH_CUDA and BROTENSOR_WITH_HIP are mutually exclusive.")
+# The HIP (ROCm) backend was removed on 2026-10-03 (docs/vulkan.md): a stale
+# cache or a parent project still asking for it fails loudly rather than
+# silently building CPU-only.
+if(BROTENSOR_WITH_HIP)
+    message(FATAL_ERROR
+        "BROTENSOR_WITH_HIP was removed (the HIP/ROCm backend is gone); "
+        "use -DBROTENSOR_WITH_VULKAN=ON for AMD GPUs and unset BROTENSOR_WITH_HIP.")
 endif()
 
 if(BROTENSOR_WITH_CUDA)
@@ -148,30 +149,6 @@ if(BROTENSOR_WITH_METAL)
         message(FATAL_ERROR "BROTENSOR_WITH_METAL requires Apple platform.")
     endif()
     enable_language(OBJCXX)
-endif()
-if(BROTENSOR_WITH_HIP)
-    # ROCm root, target architectures and the Wave32 / LDS / WMMA assumptions
-    # behind them: cmake/BrotensorHip.cmake.
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BrotensorHip.cmake")
-    brotensor_hip_prepare()
-    enable_language(HIP)
-    brotensor_hip_check_archs()
-    set(CMAKE_HIP_STANDARD 20)
-    set(CMAKE_HIP_STANDARD_REQUIRED ON)
-    find_package(hip REQUIRED)
-    find_package(hipblas REQUIRED)
-    # src/hip/compat/mma.h maps nvcuda::wmma onto rocWMMA (header-only); the
-    # WMMA kernels compiled through it do not build without it. Looked up as a
-    # header: the package's roc::rocwmma target links hip::device and OpenMP,
-    # which would turn every C++ consumer into a HIP / OpenMP compile.
-    find_path(BROTENSOR_ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
-              HINTS "${ROCM_PATH}/include")
-    if(NOT BROTENSOR_ROCWMMA_INCLUDE_DIR)
-        message(FATAL_ERROR
-            "BROTENSOR_WITH_HIP needs rocWMMA (the ROCm rocwmma package, rocwmma-dev): "
-            "src/hip/compat/mma.h maps CUDA's WMMA onto it. rocwmma/rocwmma.hpp was not "
-            "found under ROCM_PATH='${ROCM_PATH}'.")
-    endif()
 endif()
 
 # --- brotensor_core: dispatcher + public op wrappers + Tensor + runtime ---
@@ -445,6 +422,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/int8_quant.cu
         src/cuda/modulate.cu
         src/cuda/self_attention_bias.cu
+        src/cuda/self_attention_rel_pos.cu
         src/cuda/vocoder_activations.cu
         src/cuda/log_exp_round.cu
         src/cuda/fft.cu
@@ -717,165 +695,6 @@ if(BROTENSOR_WITH_METAL)
         BROTENSOR_HAS_METAL=1 BROTENSOR_HAS_GPU=1)
 endif()
 
-# --- brotensor_hip: HIP/ROCm backend (optional) ---
-
-if(BROTENSOR_WITH_HIP)
-    set(BROTENSOR_HIP_CUDA_KERNELS
-        src/cuda/gemm.cu
-        src/cuda/fp16_matmul.cu
-        src/cuda/elementwise.cu
-        src/cuda/softmax.cu
-        src/cuda/layernorm.cu
-        src/cuda/attention.cu
-        src/cuda/optim.cu
-        src/cuda/adam.cu
-        src/cuda/reduce.cu
-        src/cuda/loss.cu
-        src/cuda/embedding.cu
-        src/cuda/concat.cu
-        src/cuda/mha.cu
-        src/cuda/batched_ops.cu
-        src/cuda/conv2d.cu
-        src/cuda/conv2d_wmma.cu
-        src/cuda/deform_conv2d.cu
-        src/cuda/conv_transpose2d.cu
-        src/cuda/conv3d.cu
-        src/cuda/conv2d_int8w_wmma.cu
-        src/cuda/linear_int8w_wmma.cu
-        src/cuda/q4k.cu
-        src/cuda/q4k_wmma.cu
-        src/cuda/q8_0.cu
-        src/cuda/q8_0_wmma.cu
-        src/cuda/q6k.cu
-        src/cuda/q6k_wmma.cu
-        src/cuda/group_norm.cu
-        src/cuda/resample.cu
-        src/cuda/interp2d.cu
-        src/cuda/pool2d.cu
-        src/cuda/pad2d.cu
-        src/cuda/slice2d.cu
-        src/cuda/unfold2d.cu
-        src/cuda/l2_normalize.cu
-        src/cuda/convex_upsample.cu
-        src/cuda/gather_scatter.cu
-        src/cuda/top_k.cu
-        src/cuda/window_partition.cu
-        src/cuda/cross_attention.cu
-        src/cuda/cross_attention_with_attn.cu
-        src/cuda/attention_moments.cu
-        src/cuda/flash_attention.cu
-        src/cuda/flash_attention_fused.cu
-        src/cuda/flash_attention_backward.cu
-        src/cuda/flash_attention_packed.cu
-        src/cuda/flash_attention_packed_backward.cu
-        src/cuda/gemm_mma.cu
-        src/cuda/linear_ex.cu
-        src/cuda/packed_encoder.cu
-        src/cuda/resblock.cu
-        src/cuda/transpose.cu
-        src/cuda/matmul.cu
-        src/cuda/matmul_backward.cu
-        src/cuda/lstm.cu
-        src/cuda/rope.cu
-        src/cuda/rms_norm.cu
-        src/cuda/swiglu.cu
-        src/cuda/kv_cache.cu
-        src/cuda/public_reductions.cu
-        src/cuda/ddim_step.cu
-        src/cuda/euler_step.cu
-        src/cuda/dpmpp_2m_step.cu
-        src/cuda/timestep_embedding.cu
-        src/cuda/int8_quant.cu
-        src/cuda/modulate.cu
-        src/cuda/self_attention_bias.cu
-        src/cuda/vocoder_activations.cu
-        src/cuda/log_exp_round.cu
-        src/cuda/fft.cu
-        src/cuda/stft.cu
-        src/cuda/conv1d.cu
-        src/cuda/codec_quant.cu
-        src/cuda/resample1d.cu
-        src/cuda/sample_logits.cu
-        src/cuda/masked_diffusion.cu
-        src/cuda/noise.cu
-        src/cuda/l2_norm.cu
-        src/cuda/gated_delta_rule.cu
-        src/cuda/spatial_merge.cu
-        src/cuda/rope_mrope.cu
-        src/cuda/loss_legacy.cu
-        src/cuda/xavier_init.cu
-        src/cuda/batch_norm.cu
-        src/cuda/image_preproc.cu
-        src/cuda/stylegan_elementwise.cu
-        src/cuda/bias_act.cu
-        src/cuda/upfirdn2d.cu
-        src/cuda/modulated_conv2d.cu
-        src/cuda/filtered_lrelu.cu
-    )
-    set_source_files_properties(
-        ${BROTENSOR_HIP_CUDA_KERNELS}
-        PROPERTIES
-            LANGUAGE HIP
-    )
-    add_library(brotensor_hip STATIC
-        src/hip/runtime.hip
-        src/hip/tensor.hip
-        src/hip/graph.hip
-        src/hip/gemm.hip
-        src/hip/softmax.hip
-        src/hip/rope.hip
-        src/hip/mha.hip
-        src/hip/flash_attention.hip
-        src/hip/flash_attention_extra.hip
-        src/hip/flash_attention_dense.hip
-        src/hip/attention.hip
-        src/hip/conv.hip
-        src/hip/conv_direct.hip
-        src/hip/conv1d.hip
-        src/hip/conv_transpose.hip
-        src/hip/conv3d.hip
-        src/hip/deform_conv.hip
-        src/hip/interp.hip
-        src/hip/pool.hip
-        src/hip/spatial.hip
-        src/hip/spatial_extra.hip
-        src/hip/norm.hip
-        src/hip/norm_rms.hip
-        src/hip/norm_group.hip
-        src/hip/norm_l2.hip
-        src/hip/norm_batch.hip
-        src/hip/elementwise.hip
-        src/hip/elementwise_act.hip
-        src/hip/elementwise_reduce.hip
-        src/hip/audio.hip
-        src/hip/audio_dsp.hip
-        src/hip/audio_fft.hip
-        src/hip/quant.hip
-        src/hip/quant_gguf.hip
-        src/hip/register.hip
-        src/hip/detail/stubs.hip
-        ${BROTENSOR_HIP_CUDA_KERNELS}
-    )
-    target_link_libraries(brotensor_hip PUBLIC brotensor_core hip::host roc::hipblas)
-    # rocWMMA is PUBLIC: consumers compiling their own .cu through
-    # src/hip/compat (brodiffusion's fused kernels) include <mma.h> too.
-    target_include_directories(brotensor_hip PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hip/compat>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hip>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/hip/detail>
-        $<BUILD_INTERFACE:${BROTENSOR_ROCWMMA_INCLUDE_DIR}>
-    )
-    target_compile_definitions(brotensor_hip PUBLIC
-        BROTENSOR_HAS_HIP=1 BROTENSOR_HAS_GPU=1)
-    target_compile_definitions(brotensor_core PRIVATE
-        BROTENSOR_HAS_HIP=1 BROTENSOR_HAS_GPU=1)
-    target_link_libraries(brotensor_core PRIVATE hip::host)
-    set_target_properties(brotensor_hip PROPERTIES
-        HIP_STANDARD 20
-        HIP_STANDARD_REQUIRED ON
-    )
-endif()
-
 # --- brotensor_vulkan: Vulkan compute backend (optional) ---
 # Target, shader compilation and embedding: cmake/BrotensorVulkan.cmake.
 if(BROTENSOR_WITH_VULKAN)
@@ -904,7 +723,6 @@ target_link_libraries(brotensor INTERFACE
     "$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_cpu>"
     "$<$<BOOL:${BROTENSOR_WITH_CUDA}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_cuda>>"
     "$<$<BOOL:${BROTENSOR_WITH_METAL}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_metal>>"
-    "$<$<BOOL:${BROTENSOR_WITH_HIP}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_hip>>"
     "$<$<BOOL:${BROTENSOR_WITH_VULKAN}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_vulkan>>"
 )
 
@@ -922,9 +740,6 @@ if(BROTENSOR_INSTALL)
     endif()
     if(BROTENSOR_WITH_METAL)
         list(APPEND _brotensor_install_targets brotensor_metal)
-    endif()
-    if(BROTENSOR_WITH_HIP)
-        list(APPEND _brotensor_install_targets brotensor_hip)
     endif()
     if(BROTENSOR_WITH_VULKAN)
         list(APPEND _brotensor_install_targets brotensor_vulkan)
@@ -983,9 +798,6 @@ if(BROTENSOR_WITH_CUDA)
 endif()
 if(BROTENSOR_WITH_METAL)
     set(_brotensor_backends "${_brotensor_backends} + Metal")
-endif()
-if(BROTENSOR_WITH_HIP)
-    set(_brotensor_backends "${_brotensor_backends} + HIP")
 endif()
 if(BROTENSOR_WITH_VULKAN)
     set(_brotensor_backends "${_brotensor_backends} + Vulkan")

@@ -3,7 +3,7 @@
 // pad2d_backward, adaptive_avg_pool2d_backward and max_pool2d_backward
 // (shaders/resample_bwd.comp). The first four are gathers (each input element
 // sums the outputs that read it), max pooling walks each plane's outputs in
-// order: no atomics, deterministic, FP32 sums. Contracts follow CUDA / HIP
+// order: no atomics, deterministic, FP32 sums. Contracts follow CUDA
 // (src/cuda/resample.cu, interp2d.cu, pad2d.cu, pool2d.cu) and the CPU
 // reference: dX resized to (N, C H W) in dY's dtype (FP32 / FP16 / BF16;
 // CUDA's pooling backwards are FP32 only) and OVERWRITTEN; bicubic

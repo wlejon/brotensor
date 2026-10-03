@@ -1,6 +1,6 @@
 // Smoke test for the unified brotensor::Tensor: lifecycle, host↔device
 // round-trip, clone, a hand-checked op (relu_forward), and FP16
-// host-conversion + round-trip. CUDA/HIP only — skipped on a CPU-only build
+// host-conversion + round-trip. GPU only — skipped on a CPU-only build
 // since the round-trip / op coverage here exercises a GPU backend.
 
 #include <brotensor/ops.h>
@@ -20,7 +20,7 @@ using brotensor::Device;
 using brotensor::Dtype;
 using brotensor::Tensor;
 
-// The GPU under test: CUDA or HIP, whichever is registered.
+// The GPU under test (gpu_select.h).
 static Device gpu() {
     static const Device d = bt_test::gpu();
     return d;
@@ -212,7 +212,7 @@ static void test_fp16_resize_and_zero() {
 int main() {
     brotensor::init();
     if (!bt_test::has_gpu()) {
-        std::printf("no CUDA/HIP backend - skipping\n");
+        std::printf("no GPU backend - skipping\n");
         return 0;
     }
 

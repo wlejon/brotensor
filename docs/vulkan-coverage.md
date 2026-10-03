@@ -13,10 +13,10 @@ Vulkan (`brotensor_test_vulkan` checks the null set).
 Outside the op table: `conv1d*`, `causal_conv1d`, `conv1d_int8w_fp16` (wrappers over
 conv2d / conv_transpose1d / the INT8 conv), `lora_forward` / `lora_backward`
 (GEMM compositions) and the five `fused_*` ops (src/ops/fused.cpp; the
-stacked-weight SwiGLU GEMV takes the Vulkan / HIP GEMV epilogue, the rest compose
+stacked-weight SwiGLU GEMV takes the Vulkan GEMV epilogue, the rest compose
 dispatched ops) all run on Vulkan. `jit::*` traces on Vulkan are replayed op by
-op (src/jit/trace_eager.cpp), as on HIP. `Device::CUDA` aliases to Vulkan when
-neither a CUDA nor a HIP backend is registered (detail::resolve_device_alias).
+op (src/jit/trace_eager.cpp). `Device::CUDA` aliases to Vulkan when no CUDA
+backend is registered (detail::resolve_device_alias).
 
 ## Null slots
 
@@ -25,7 +25,7 @@ neither a CUDA nor a HIP backend is registered (detail::resolve_device_alias).
 | `mse_scalar` | host-only: no Tensor operand, ops.cpp always runs it on the CPU table |
 | `softmax_xent_segment` | host-only: raw host pointers, ops.cpp always runs it on the CPU table |
 | `filtered_lrelu_forward` | by design: composite fallback (bias_act + upfirdn2d), runs on Vulkan |
-| `filtered_lrelu_backward` | by design: the public op falls back to its bias_act + upfirdn2d composite (as on HIP), which runs on Vulkan |
+| `filtered_lrelu_backward` | by design: the public op falls back to its bias_act + upfirdn2d composite, which runs on Vulkan |
 
 ## Per sibling
 
@@ -90,6 +90,10 @@ Training: 20 ops, all implemented (`attention_backward` / `mha_backward` in chun
 `linear_backward`, `relu_backward`, `tanh_backward`, `sigmoid_backward`, `softmax_backward`, `layernorm_backward`, `attention_backward`, `mha_backward`, `masked_mean_pool_backward`*, `mse_scalar` (host-only, runs), `softmax_xent`, `softmax_xent_segment` (host-only, runs), `sgd_step`*, `adam_step`*, `xavier_init`*, `linear_backward_batched`, `relu_backward_batched`, `tanh_backward_batched`, `mse_vec_per_sample`*, `softmax_xent_fused_batched`
 
 ## What the siblings still need (chunk 7)
+
+Historical: written while the HIP backend still existed (removed 2026-10-03,
+docs/vulkan.md); the `BROTENSOR_PREFER_HIP` / HIP references below describe
+that time.
 
 **Status after chunk 7b.** Everything in the list below is done: brolm,
 brosoundml and brogameagent gate on `graph_capture_available` and accept

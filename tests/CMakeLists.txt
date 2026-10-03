@@ -183,50 +183,25 @@ if(BROTENSOR_WITH_VULKAN)
         SHADERS "custom_axpy|custom_axpy.comp"
                 "custom_axpy_f64|custom_axpy.comp|-DF64")
     target_compile_options(brotensor_test_vulkan PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-missing-field-initializers>)
-    # Device::CUDA -> Vulkan when no HIP device is visible.
-    add_test(NAME brotensor_test_vulkan_cuda_alias COMMAND brotensor_test_vulkan --only=alias)
-    set_tests_properties(brotensor_test_vulkan_cuda_alias PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
-    add_test(NAME brotensor_test_vulkan_prefer_hip COMMAND brotensor_test_vulkan --only=alias)
-    set_tests_properties(brotensor_test_vulkan_prefer_hip PROPERTIES ENVIRONMENT "BROTENSOR_PREFER_HIP=1")
     add_test(NAME brotensor_test_vulkan_default_device
              COMMAND brotensor_test_vulkan --expect-default-vulkan)
     set_tests_properties(brotensor_test_vulkan_default_device PROPERTIES
         ENVIRONMENT "BROTENSOR_DEFAULT_DEVICE=vulkan")
-    # The device-neutral capture with no HIP device visible (Vulkan is then the
-    # only GPU, and Device::CUDA its alias).
-    add_test(NAME brotensor_test_vulkan_capture_only COMMAND brotensor_test_vulkan --only=capture)
-    set_tests_properties(brotensor_test_vulkan_capture_only PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
 endif()
 
-if(BROTENSOR_WITH_HIP)
-    brotensor_add_test(brotensor_test_hip test_hip.cpp)
-    # Needs a golden file generated on NVIDIA (BROTENSOR_CUDA_ROCM_GOLDEN);
-    # exits 77 (skipped) without one.
-    brotensor_add_test(brotensor_test_cuda_rocm_parity test_cuda_rocm_parity.cpp)
-    set_tests_properties(brotensor_test_cuda_rocm_parity PROPERTIES SKIP_RETURN_CODE 77)
-endif()
-
-# Vulkan vs HIP on the same inputs in one process: the ops the siblings run at
-# inference, per-op tolerances from the dtype policy. Needs both backends;
-# exits 77 (skipped) when either device is missing.
-if(BROTENSOR_WITH_HIP AND BROTENSOR_WITH_VULKAN)
-    brotensor_add_test(brotensor_test_vulkan_hip_parity test_vulkan_hip_parity.cpp test_vulkan_hip_parity_ops.cpp)
-    set_tests_properties(brotensor_test_vulkan_hip_parity PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
-endif()
-
-# --- GPU tests (CUDA, Metal, HIP or Vulkan) ---
+# --- GPU tests (CUDA, Metal or Vulkan) ---
 # Backend-neutral: each suite runs on gpu_select.h's device (BROTENSOR_TEST_GPU,
-# else the first registered of CUDA, HIP, Metal, Vulkan) and names the GPU as
-# Device::CUDA, which aliases to HIP or Vulkan when there is no CUDA backend.
+# else the first registered of CUDA, Metal, Vulkan) and names the GPU as
+# Device::CUDA, which aliases to Vulkan when there is no CUDA backend.
 set(BROTENSOR_HAS_GPU OFF)
-if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL OR BROTENSOR_WITH_HIP OR BROTENSOR_WITH_VULKAN)
+if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL OR BROTENSOR_WITH_VULKAN)
     set(BROTENSOR_HAS_GPU ON)
 endif()
 get_property(_bt_tests_before_gpu DIRECTORY PROPERTY TESTS)
 
 if(BROTENSOR_HAS_GPU)
     brotensor_add_test(brotensor_test test_tensor.cpp)
-    brotensor_add_test(brotensor_test_conv2d test_conv2d.cpp)
+    brotensor_add_test(brotensor_test_conv2d test_conv2d.cpp test_conv2d_grouped.cpp)
     brotensor_add_test(brotensor_test_group_norm test_group_norm.cpp)
     brotensor_add_test(brotensor_test_activations test_activations.cpp)
     brotensor_add_test(brotensor_test_resample test_resample.cpp)
@@ -234,7 +209,7 @@ if(BROTENSOR_HAS_GPU)
     brotensor_add_test(brotensor_test_cross_attention_with_attn test_cross_attention_with_attn.cpp)
     brotensor_add_test(brotensor_test_attention_moments test_attention_moments.cpp)
     brotensor_add_test(brotensor_test_fp16_basics test_fp16_basics.cpp)
-    brotensor_add_test(brotensor_test_flash_attention test_flash_attention.cpp)
+    brotensor_add_test(brotensor_test_flash_attention test_flash_attention.cpp test_flash_attention_bwd.cpp)
     brotensor_add_test(brotensor_test_resblock test_resblock.cpp)
     brotensor_add_test(brotensor_test_resblock_int8w test_resblock_int8w.cpp)
     brotensor_add_test(brotensor_test_diffusion_primitives test_diffusion_primitives.cpp)
@@ -315,8 +290,8 @@ if(BROTENSOR_HAS_GPU)
         brotensor_add_test(brotensor_test_${_name}_parity test_${_name}_parity.cpp)
     endforeach()
     # Wide-head attention: register-tile / LDS edges up to head_dim 2100.
-    # CUDA and HIP only (Metal's attention kernels carry their own caps).
-    if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_HIP)
+    # CUDA and Vulkan (Metal's attention kernels carry their own caps).
+    if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_VULKAN)
         brotensor_add_test(brotensor_test_flash_attention_head_dim_parity
                            test_flash_attention_head_dim_parity.cpp)
     endif()
@@ -402,15 +377,6 @@ if(BROTENSOR_HAS_GPU)
         target_include_directories(brotensor_test_ops_fused PRIVATE /usr/local/cuda-12.6/targets/x86_64-linux/include)
         target_link_libraries(brotensor_test_ops_fused PRIVATE CUDA::cuda_driver)
     endif()
-    if(BROTENSOR_WITH_HIP)
-        brotensor_add_test(brotensor_test_ops_fused test_ops_fused.cpp)
-        # No trace compiler on HIP: the typed / broadcast / norm surface runs
-        # through the unfused replay (src/jit/trace_eager.cpp) and is gated on
-        # its numbers. The PTX-specific suites above have nothing to run.
-        if(BROTENSOR_HAS_BRASS_JIT)
-            brotensor_add_test(brotensor_test_jit_trace_dtypes test_jit_trace_dtypes.cpp)
-        endif()
-    endif()
     # The fused ops again on Vulkan (BROTENSOR_TEST_GPU picks it in
     # parity_helpers.h); the trace tests run their Vulkan suites themselves.
     if(BROTENSOR_WITH_VULKAN)
@@ -423,10 +389,10 @@ if(BROTENSOR_HAS_GPU)
             brotensor_add_test(brotensor_test_jit_trace_dtypes test_jit_trace_dtypes.cpp)
         endif()
     endif()
-    # Graph capture/replay: the device-neutral CudaGraph API records on CUDA,
-    # HIP and Vulkan (Metal has none). The _vulkan registrations run the same
+    # Graph capture/replay: the device-neutral CudaGraph API records on CUDA
+    # and Vulkan (Metal has none). The _vulkan registrations run the same
     # tests with Vulkan as both the test GPU and the default device.
-    if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_HIP OR BROTENSOR_WITH_VULKAN)
+    if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_VULKAN)
         brotensor_add_test(brotensor_test_cuda_graph test_cuda_graph.cpp)
         brotensor_add_test(brotensor_test_graph_capture_alloc test_graph_capture_alloc.cpp)
         # Its last check compares device-wide free memory before and after
@@ -451,7 +417,7 @@ endif()
 # own _vulkan run (cuda_graph, graph_capture_alloc, ops_fused), the trace-JIT
 # suite (it runs its Vulkan cases itself) and the CUDA-only ones.
 get_property(_bt_tests_after_gpu DIRECTORY PROPERTY TESTS)
-if(BROTENSOR_WITH_VULKAN AND (BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_HIP OR BROTENSOR_WITH_METAL))
+if(BROTENSOR_WITH_VULKAN AND (BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL))
     set(_bt_no_vulkan_rerun
         brotensor_test_cuda_graph brotensor_test_graph_capture_alloc brotensor_test_ops_fused
         brotensor_test_jit_trace_dtypes brotensor_test_streams brotensor_test_linear_rounding
@@ -471,22 +437,6 @@ if(BROTENSOR_WITH_VULKAN AND (BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_HIP OR BROTE
         get_test_property(${_t} RUN_SERIAL _bt_serial)
         if(_bt_serial)
             set_tests_properties(${_bt_vk_name} PROPERTIES RUN_SERIAL TRUE)
-        endif()
-    endforeach()
-endif()
-
-# With HIP and Vulkan both in the build, Vulkan is the default device and the
-# target of the Device::CUDA alias (src/init.cpp). The suites above that name
-# the GPU as Device::CUDA or the default device were written as the HIP
-# backend's tests (training backwards, the HIP-only WMMA INT8 kernels, the
-# alias and default-device checks), so they keep testing HIP:
-# BROTENSOR_PREFER_HIP=1 gives back the HIP-first policy. Vulkan runs its own
-# suites, the registrations whose names say so.
-if(BROTENSOR_WITH_HIP AND BROTENSOR_WITH_VULKAN)
-    get_property(_bt_tests DIRECTORY PROPERTY TESTS)
-    foreach(_t IN LISTS _bt_tests)
-        if(NOT _t MATCHES "vulkan")
-            set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT "BROTENSOR_PREFER_HIP=1")
         endif()
     endforeach()
 endif()

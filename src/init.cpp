@@ -1,7 +1,7 @@
 // brotensor runtime: init(), default-device policy, DeviceScope, sync.
 //
 // The CPU backend self-registers from a static-init object in
-// src/cpu/register.cpp. init() probes HIP / CUDA / Metal / Vulkan if the
+// src/cpu/register.cpp. init() probes CUDA / Metal / Vulkan if the
 // corresponding backend was compiled in. When a backend isn't built,
 // BROTENSOR_HAS_CUDA / BROTENSOR_HAS_METAL are not defined so the probe
 // branches compile out.
@@ -20,11 +20,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#if defined(BROTENSOR_HAS_HIP)
-// Defined in src/hip/register.hip.
-extern "C" void brotensor_probe_and_register_hip();
-#endif
 
 #if defined(BROTENSOR_HAS_VULKAN)
 // Defined in src/vulkan/register.cpp.
@@ -70,19 +65,11 @@ std::atomic<bool>& global_default_set_flag() {
 // since DeviceScope ctor saves the previous on the local stack frame.
 thread_local std::optional<Device> tls_scope_override;
 
-// CUDA first, then Metal (the two never share a machine with HIP), then the
-// AMD pair: Vulkan before HIP, because on the AMD GPUs both drive Vulkan
-// runs every sibling model faster (docs/vulkan.md), and HIP before Vulkan
-// when detail::prefer_hip() says so (BROTENSOR_PREFER_HIP=1, or
-// BROTENSOR_DEFAULT_DEVICE naming HIP). A build without Vulkan (or without
-// HIP) gets the other, so a HIP-only build behaves exactly as before.
+// CUDA first, then Metal, then Vulkan (the AMD GPU path, docs/vulkan.md).
 Device pick_default_from_available() {
     if (detail::is_registered(Device::CUDA))  return Device::CUDA;
     if (detail::is_registered(Device::Metal)) return Device::Metal;
-    const bool hip = detail::is_registered(Device::HIP);
-    const bool vk = detail::is_registered(Device::VULKAN);
-    if (hip && (!vk || detail::prefer_hip())) return Device::HIP;
-    if (vk) return Device::VULKAN;
+    if (detail::is_registered(Device::VULKAN)) return Device::VULKAN;
     return Device::CPU;
 }
 
@@ -94,15 +81,6 @@ std::optional<Device> parse_env_device() {
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
     }
     if (s == "cpu") return Device::cpu();
-    if (s == "hip" || s == "hip:0" || s == "rocm" || s == "rocm:0") return Device::hip(0);
-    if (s.rfind("hip:", 0) == 0) {
-        int idx = std::atoi(s.c_str() + 4);
-        return Device::hip(idx);
-    }
-    if (s.rfind("rocm:", 0) == 0) {
-        int idx = std::atoi(s.c_str() + 5);
-        return Device::hip(idx);
-    }
     if (s == "cuda" || s == "cuda:0") return Device::cuda(0);
     if (s.rfind("cuda:", 0) == 0) {
         int idx = std::atoi(s.c_str() + 5);
@@ -123,27 +101,11 @@ std::optional<Device> parse_env_device() {
 
 } // namespace
 
-namespace detail {
-
-bool prefer_hip() {
-    static const bool v = [] {
-        if (const char* e = std::getenv("BROTENSOR_PREFER_HIP"); e && e[0] == '1') return true;
-        const std::optional<Device> envd = parse_env_device();
-        return envd.has_value() && envd->is_hip();
-    }();
-    return v;
-}
-
-} // namespace detail
-
 void init() {
     if (init_done_flag().load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lock(init_mutex());
     if (init_done_flag().load(std::memory_order_relaxed)) return;
 
-#if defined(BROTENSOR_HAS_HIP)
-    try { brotensor_probe_and_register_hip(); } catch (...) { /* no HIP */ }
-#endif
 #if defined(BROTENSOR_HAS_CUDA)
     try { brotensor_probe_and_register_cuda(); } catch (...) { /* no CUDA */ }
 #endif
@@ -211,13 +173,6 @@ std::vector<Device> available_devices() {
     std::vector<Device> out;
     if (detail::is_registered(Device::CPU)) {
         out.push_back(Device::CPU);
-    }
-    if (detail::is_registered(Device::HIP)) {
-        int count = hip_device_count();
-        if (count <= 0) count = 1;
-        for (int i = 0; i < count; ++i) {
-            out.push_back(Device::hip(i));
-        }
     }
     if (detail::is_registered(Device::CUDA)) {
         int count = cuda_device_count();

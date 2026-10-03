@@ -91,16 +91,16 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
 
     FusionPattern pattern = classify_dag(dag);
 
-    // Which compiler gets the DAG. CUDA has the PTX compiler; HIP and Vulkan
-    // have no trace compiler at all, and their DAGs must never reach the CPU
+    // Which compiler gets the DAG. CUDA has the PTX compiler; Vulkan
+    // has no trace compiler at all, and its DAGs must never reach the CPU
     // one (host code over device pointers / addresses, unordered against the
     // device stream), so they are replayed op by op instead. Everything else
     // is the CPU compiler's.
     bool is_cuda = false;
-    bool is_hip = false;   // HIP or Vulkan: eager replay
+    bool eager_replay = false;   // Vulkan: op-by-op replay
     for (const auto& n : dag.nodes()) {
         if (n.device.is_cuda()) is_cuda = true;
-        if (n.device.is_hip() || n.device.is_vulkan()) is_hip = true;
+        if (n.device.is_vulkan()) eager_replay = true;
     }
 
     const auto compile_t0 = std::chrono::steady_clock::now();
@@ -111,7 +111,7 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
             throw std::runtime_error("brotensor::jit: CUDA JIT compiler hook is not registered or CUDA is unavailable");
         }
         handle = cuda_fn(dag, pattern);
-    } else if (is_hip) {
+    } else if (eager_replay) {
         handle = eager::compile_eager(dag);
     } else {
         handle = cpu::compile_cpu(dag, pattern);
@@ -125,7 +125,7 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
     // eager replay counts its own launches; the CPU path is always one fused
     // call through brass's host codegen.
     if (handle->launch_count == 0) handle->launch_count = 1;
-    if (!is_cuda && !is_hip) {
+    if (!is_cuda && !eager_replay) {
         handle->fusion_name = "cpu-avx2-fused";
         handle->compile_us = std::chrono::duration<double, std::micro>(
                                  std::chrono::steady_clock::now() - compile_t0).count();
@@ -174,14 +174,14 @@ static void require_cpu_fusable(const TraceDAG& dag) {
     }
 }
 
-// The emitted code dereferences every buffer on the host. CUDA and HIP
-// device pointers (and Vulkan buffer device addresses) are not host addresses (on an APU a hipMalloc pointer
-// happens to be readable, but the host code is still unordered against the
-// device stream that produces its inputs). Metal storage is
+// The emitted code dereferences every buffer on the host. CUDA device
+// pointers and Vulkan buffer device addresses are not host addresses (and
+// even where one happened to be readable, the host code would be unordered
+// against the device stream that produces its inputs). Metal storage is
 // MTLResourceStorageModeShared, whose contents pointer is a host address.
 static void require_host_addressable(const TraceDAG& dag) {
     for (const TraceNode& n : dag.nodes()) {
-        if (n.device.is_cuda() || n.device.is_hip() || n.device.is_vulkan()) {
+        if (n.device.is_cuda() || n.device.is_vulkan()) {
             throw std::runtime_error(
                 "brotensor::jit: the CPU trace compiler was handed a " +
                 to_string(n.device) + " tensor; it only runs host-addressable memory");

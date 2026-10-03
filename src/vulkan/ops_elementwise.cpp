@@ -1,7 +1,7 @@
 // Vulkan elementwise ops: the unary activations and math functions, the
 // in-place binary / scalar family, the activation backwards and the bias adds.
-// FP32 / FP16 / BF16 storage, FP32 arithmetic; contracts follow the CUDA / HIP
-// backends (output resized to the input's shape and dtype, backwards overwrite
+// FP32 / FP16 / BF16 storage, FP32 arithmetic; contracts follow the CUDA
+// backend (output resized to the input's shape and dtype, backwards overwrite
 // dX, binary ops require equal sizes and dtypes except FP32 += FP16 in
 // add_inplace). Kernels: shaders/unary.comp, binary.comp, act_bwd.comp,
 // bias.comp.

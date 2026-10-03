@@ -45,10 +45,10 @@ static std::vector<float> direct_step(Device dev, const std::vector<float>& x,
 
 int main() {
     brotensor::init();
-    // CUDA or HIP (whose graphs share this API); Metal has no graph capture.
+    // CUDA or Vulkan (whose graphs share this API); Metal has no graph capture.
     const Device dev = bt_parity::gpu_device();
     if (dev == Device::CPU || dev == Device::Metal) {
-        std::printf("CUDA/HIP not available - skipping\n");
+        std::printf("no GPU with graph capture - skipping\n");
         return 0;
     }
     std::printf("test_cuda_graph\n");

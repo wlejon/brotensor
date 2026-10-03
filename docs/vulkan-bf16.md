@@ -177,7 +177,8 @@ overflows, so the inputs do exercise the range. Worst case across them: 0.49
 of the tolerance (one BF16 output ulp at a rounding boundary); many are
 bit-identical to the CPU.
 
-`test_vulkan_hip_parity --only=gemm` adds two large-magnitude BF16 cases
+The Vulkan-vs-HIP parity suite (`test_vulkan_hip_parity --only=gemm`,
+removed with the HIP backend) added two large-magnitude BF16 cases
 (rows 1e-4 .. 4e7, `linear_forward_batched_fp16` 120 x 4096 x 1024 and
 `matmul_abt` 300 x 256 x 512) against HIP's rocBLAS BF16, each row divided by
 its own maximum: 2.9e-3 and 2.4e-3 of the row maximum (tolerance 1.6e-2, one

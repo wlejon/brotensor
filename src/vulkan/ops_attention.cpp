@@ -2,8 +2,8 @@
 // family — flash_attention_forward / _gqa / _windowed / _varlen /
 // _packed_qkv, the decode ops over a KV cache, kv_cache_append, and the
 // projection-fused flash_attention_qkvo_forward / _project_kv /
-// _q_with_kv_cached_forward. Contracts follow the HIP backend
-// (src/hip/flash_attention*.hip) and the CPU reference: Q, K, V and O share
+// _q_with_kv_cached_forward. Contracts follow the CUDA backend
+// (src/cuda/flash_attention*.cu) and the CPU reference: Q, K, V and O share
 // one dtype (FP32 / FP16 / BF16), O is resized to (Lq, Dq) in that dtype,
 // scale 1 / sqrt(head_dim), a key mask is valid where > 0.5, and a query row
 // without a valid key comes out zero. Design: docs/vulkan.md "Attention".

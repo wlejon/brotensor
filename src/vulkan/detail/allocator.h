@@ -30,7 +30,7 @@
 // Stream in submission order with a full memory barrier between commands, and
 // every host access to device memory first drains the stream (transfer.cpp).
 // So a sub-allocated range can be handed out again the moment it is freed,
-// exactly like hipMallocAsync / hipFreeAsync on one stream. A dedicated block
+// exactly like cudaMallocAsync / cudaFreeAsync on one stream. A dedicated block
 // is different only because its VkDeviceMemory is returned to the driver: its
 // destruction waits until the GPU has finished the work recorded before the
 // free (Stream::work_serial()).

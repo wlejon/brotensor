@@ -1,6 +1,6 @@
 // Tests for kv_cache_append + flash_attention_decode.
 // Decode is checked against the causal flash_attention_forward.
-// The GPU half runs on HIP or CUDA, whichever is registered (FP16 decode is
+// The GPU half runs on gpu_select.h's device (FP16 decode is
 // GPU-only); it is skipped on a CPU-only build.
 
 #include <brotensor/ops.h>
@@ -18,7 +18,7 @@ using brotensor::Device;
 using brotensor::Dtype;
 using brotensor::Tensor;
 
-// GPU device for the FP16 half: HIP or CUDA, CPU when neither is registered.
+// GPU device for the FP16 half (gpu_select.h), CPU when there is none.
 static Device gpu() {
     return bt_test::gpu();
 }
@@ -500,7 +500,7 @@ int main() {
     test_cpu_masked_softcap_window();
 
     if (gpu() == Device::CPU) {
-        std::printf("no CUDA/HIP backend - skipping GPU decode tests\n");
+        std::printf("no GPU backend - skipping GPU decode tests\n");
         std::printf("%s (%d failures)\n",
                     cpu_failures ? "FAILED" : "OK", cpu_failures);
         return cpu_failures ? 1 : 0;

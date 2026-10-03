@@ -434,7 +434,7 @@ static void run_bwd_fp16(const char* label,
 int main() {
     brotensor::init();
     if (!bt_test::has_gpu()) {
-        std::printf("no CUDA/HIP backend - skipping\n");
+        std::printf("no GPU backend - skipping\n");
         return 0;
     }
     std::printf("test_group_norm\n");

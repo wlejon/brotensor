@@ -268,7 +268,7 @@ static void test_realistic_random() {
 int main() {
     brotensor::init();
     if (!bt_test::has_gpu()) {
-        std::printf("no CUDA/HIP backend - skipping\n");
+        std::printf("no GPU backend - skipping\n");
         return 0;
     }
     std::printf("test_attention_moments\n");

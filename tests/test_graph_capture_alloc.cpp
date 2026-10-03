@@ -1,9 +1,8 @@
 // Graph capture of a step that allocates: every op inside the captured region
 // writes a fresh temporary and frees the last one, the way a model's forward
 // pass does. Replay must match an eager run of the same step, for several fresh
-// graphs in a row (on ROCm the first few graphs of a process are the ones that
-// replayed wrong while captures recorded hipMallocAsync / hipFreeAsync memory
-// nodes). Also covers the lifetimes around a capture: memory that predates the
+// graphs in a row (the first few graphs of a process are where a backend that
+// records allocations as graph memory nodes goes wrong). Also covers the lifetimes around a capture: memory that predates the
 // capture freed inside it, an output allocated inside it that outlives its
 // graph, a block one graph allocated and a second graph's capture frees, and
 // that repeated capture/destroy cycles give their memory back.
@@ -66,7 +65,7 @@ int main() {
     bt::init();
     const Device dev = bt_parity::gpu_device();
     if (dev == Device::CPU || dev == Device::Metal) {
-        std::printf("no CUDA/HIP device - skipping\n");
+        std::printf("no GPU device - skipping\n");
         return 0;
     }
     std::printf("test_graph_capture_alloc on %s\n", bt::to_string(dev).c_str());

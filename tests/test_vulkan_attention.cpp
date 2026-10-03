@@ -2,7 +2,7 @@
 // family (plain, GQA, windowed, varlen, packed QKV), the decode ops over a KV
 // cache, kv_cache_append and the projection-fused flash ops, in FP32, FP16
 // and BF16, through every kernel path the dispatcher can take (fa_cm, fa_rows,
-// dense). Shapes include the ones that bit the HIP backend: GQA head
+// dense). Shapes include the awkward ones: GQA head
 // layouts, packed QKV with restarting sequences, causal windows with
 // Lk > Lq, fully masked rows (zero output), odd row counts, unaligned views,
 // a cache longer than the query, head widths not a multiple of 16 (or 8).

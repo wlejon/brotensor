@@ -350,7 +350,7 @@ static void run_case_bf16(const char* label, int Lq, int Lk, int D, int nh,
 int main() {
     brotensor::init();
     if (!bt_test::has_gpu()) {
-        std::printf("no CUDA/HIP backend - skipping\n");
+        std::printf("no GPU backend - skipping\n");
         return 0;
     }
     std::printf("test_flash_attention_backward\n");

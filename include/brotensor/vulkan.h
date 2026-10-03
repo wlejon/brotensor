@@ -14,7 +14,7 @@
 // (cuda_graph.h) and have the same contract, and are built on the cheapest
 // thing Vulkan offers: the captured ops are recorded once into a command
 // buffer that launch() resubmits as-is (~0.74 us per dependent kernel on a
-// Radeon 8060S, 2.5x cheaper than a hipGraph replay):
+// Radeon 8060S):
 //
 //   step();                                     // warm-up: outputs allocated
 //   brotensor::sync(dev);

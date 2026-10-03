@@ -87,8 +87,8 @@ void test_self_attention_bias() {
             close_out(dt, O, Oc, tag("self_attention_bias_forward", dt, L, H, variant));
         }
         // self_attention_forward (no biases): FP32 masks query rows and keys
-        // (mha_forward); 16-bit takes the flash route, keys only, as CUDA /
-        // HIP, whose CPU twin is flash_attention_qkvo_forward.
+        // (mha_forward); 16-bit takes the flash route, keys only, as CUDA,
+        // whose CPU twin is flash_attention_qkvo_forward.
         const int L = 45, D = 96, H = 3;
         const Weights w(D, D, dt, 50);
         const auto x = random_values(std::size_t(L) * D, 51, -1.0f, 1.0f, dt);
@@ -206,7 +206,7 @@ void test_topk_segments() {
         Tensor sc, sg;
         brotensor::segment_softmax_stats(host(lg, off.back(), 1), oc_t, sc);
         brotensor::segment_softmax_stats(upload(lg, off.back(), 1, dt), og, sg);
-        VKT_CHECK(sg.dtype == dt);   // the logits' dtype, as CUDA / HIP
+        VKT_CHECK(sg.dtype == dt);   // the logits' dtype, as CUDA
         const float st = dt == Dtype::FP32 ? 2e-5f : dtype_eps(dt);
         expect_close(download(sg), sc.to_host_vector(), 2e-5f, st,
                      tag("segment_softmax_stats", dt, int(off.size()) - 1, off.back(), 0));

@@ -1,6 +1,6 @@
 // Activation-op coverage for silu / gelu / quick_gelu / gelu_exact
 // (forward + backward, FP32 + FP16). Each op is run on GPU-resident tensors
-// and checked against a host reference. CUDA/HIP only — skipped on a
+// and checked against a host reference. GPU only — skipped on a
 // CPU-only build since the FP16 paths live on the GPU backend.
 
 #include <brotensor/ops.h>
@@ -19,7 +19,7 @@ using brotensor::Device;
 using brotensor::Dtype;
 using brotensor::Tensor;
 
-// The GPU under test: CUDA or HIP, whichever is registered.
+// The GPU under test (gpu_select.h).
 static Device gpu() {
     static const Device d = bt_test::gpu();
     return d;
@@ -201,7 +201,7 @@ static void test_fp16(FwdOp op, float (*ref)(float), const char* name) {
 int main() {
     brotensor::init();
     if (!bt_test::has_gpu()) {
-        std::printf("no CUDA/HIP backend - skipping\n");
+        std::printf("no GPU backend - skipping\n");
         return 0;
     }
     std::printf("test_activations\n");

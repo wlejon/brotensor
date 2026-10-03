@@ -5,8 +5,8 @@
 // rows in increasing m, in FP32 from the row's current value, with one
 // rounding into the dtype. No float atomics: VK_EXT_shader_atomic_float would
 // make the sum order (and the 16-bit results) vary from run to run, and
-// FP32 now matches the CPU reference bit for bit. Contracts follow CUDA /
-// HIP (src/cuda/gather_scatter.cu, embedding.cu): FP32 / FP16 / BF16, the
+// FP32 now matches the CPU reference bit for bit. Contracts follow CUDA
+// (src/cuda/gather_scatter.cu, embedding.cu): FP32 / FP16 / BF16, the
 // destination in the source's dtype; an index outside [0, R) is skipped
 // (a device fault would lose the device).
 

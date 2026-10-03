@@ -15,8 +15,8 @@ using brotensor::Device;
 using brotensor::Dtype;
 using brotensor::Tensor;
 
-// GPU backend selection: HIP, CUDA or Metal, whichever is registered; CPU when
-// none is. Cached after the first call (which must happen after
+// GPU backend selection: gpu_select.h's device; CPU when
+// none is registered. Cached after the first call (which must happen after
 // brotensor::init()).
 static Device gpu_device() {
     return bt_test::gpu();

@@ -19,15 +19,12 @@
 #if defined(BROTENSOR_HAS_CUDA)
 #include <cuda_runtime.h>
 #endif
-#if defined(BROTENSOR_HAS_HIP)
-#include <hip/hip_runtime.h>
-#endif
 
 namespace brotensor::detail {
 
 namespace {
 
-constexpr int kNumDevices = 5; // CPU, CUDA, Metal, HIP, VULKAN
+constexpr int kNumDevices = 5; // CPU, CUDA, Metal, (3 unused), VULKAN
 
 // Upper bound on operands a single dispatch call inspects. The widest op is
 // resblock_backward (25 operands); 32 leaves headroom. dispatch_with_opts
@@ -78,11 +75,6 @@ inline void activate_device_context(Device dev) {
 #if defined(BROTENSOR_HAS_CUDA)
     if (dev.is_cuda()) {
         cudaSetDevice(dev.index);
-    }
-#endif
-#if defined(BROTENSOR_HAS_HIP)
-    if (dev.is_hip()) {
-        hipSetDevice(dev.index);
     }
 #endif
     (void)dev;
@@ -151,15 +143,10 @@ const OpsVTable& resolve_over(const Tensor* const* all, std::size_t count) {
 } // namespace
 
 static int g_cuda_device_count = 0;
-static int g_hip_device_count  = 0;
 static int g_vulkan_device_count = 0;
 
 void set_cuda_device_count(int count) {
     g_cuda_device_count = count;
-}
-
-void set_hip_device_count(int count) {
-    g_hip_device_count = count;
 }
 
 void set_vulkan_device_count(int count) {
@@ -179,12 +166,6 @@ void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc) 
 
 bool is_registered(Device d) {
     if (d.is_cpu()) return slots()[static_cast<int>(DeviceType::CPU)].registered;
-    if (d.is_hip()) {
-        if (!slots()[static_cast<int>(DeviceType::HIP)].registered) return false;
-        int count = ::brotensor::hip_device_count();
-        if (count <= 0) count = 1;
-        return d.index >= 0 && d.index < count;
-    }
     if (d.is_cuda()) {
         if (!slots()[static_cast<int>(DeviceType::CUDA)].registered) return false;
         int count = ::brotensor::cuda_device_count();
@@ -203,10 +184,7 @@ bool is_registered(Device d) {
 
 Device resolve_device_alias(Device d) {
     if (d.is_cuda() && !slots()[static_cast<int>(DeviceType::CUDA)].registered) {
-        const bool hip = slots()[static_cast<int>(DeviceType::HIP)].registered;
-        const bool vk = slots()[static_cast<int>(DeviceType::VULKAN)].registered;
-        if (hip && (!vk || prefer_hip())) return Device::hip(d.index);
-        if (vk) return Device::vulkan(d.index);
+        if (slots()[static_cast<int>(DeviceType::VULKAN)].registered) return Device::vulkan(d.index);
     }
     return d;
 }
@@ -314,9 +292,6 @@ void adopt_output(Tensor& t, Device d) {
 namespace brotensor {
 int cuda_device_count() {
     return detail::g_cuda_device_count;
-}
-int hip_device_count() {
-    return detail::g_hip_device_count;
 }
 int vulkan_device_count() {
     return detail::g_vulkan_device_count;

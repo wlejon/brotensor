@@ -1,6 +1,6 @@
 // `brotensor_test_vulkan --bench-gemm`: GEMM throughput on the vk-spike's
 // shapes (../vk-spike/RESULTS.md), through the public matmul_abt (FP16, the
-// linear-layer NT layout), next to the spike's hipBLAS and coopmat figures;
+// linear-layer NT layout), next to the spike's coopmat figures;
 // then each tile configuration, BF16 (converted at load, with the range-safe
 // per-row scaling of A and, for comparison, without it), the SIMT fallback,
 // FP32, and the GEMV kernel's bandwidth on decode shapes. Not part of ctest.
@@ -28,20 +28,20 @@ namespace dv = brotensor::detail::vulkan;
 struct Shape {
     int M, N, K;
     const char* tag;
-    double hipblas, spike;   // TF/s from vk-spike RESULTS.md (run 2)
+    double spike;   // TF/s from vk-spike RESULTS.md (run 2)
 };
 
 const Shape kShapes[] = {
-    {4096, 4096, 4096, "square4k", 22.7, 24.9},
-    {2048, 2048, 2048, "square2k", 38.8, 30.4},
-    {8192, 8192, 8192, "square8k", 25.2, 21.2},
-    {512, 3072, 1024, "qwen0.6B-up-pp512", 28.8, 25.2},
-    {512, 1024, 3072, "qwen0.6B-down-pp512", 33.8, 26.2},
-    {512, 4096, 4096, "8B-qo-pp512", 20.6, 21.0},
-    {512, 12288, 4096, "8B-up-pp512", 21.6, 17.7},
-    {512, 4096, 12288, "8B-down-pp512", 16.2, 17.5},
-    {4096, 3072, 3072, "DiT-3072-L4096", 36.4, 32.1},
-    {4096, 12288, 3072, "DiT-mlp-L4096", 32.5, 31.7},
+    {4096, 4096, 4096, "square4k", 24.9},
+    {2048, 2048, 2048, "square2k", 30.4},
+    {8192, 8192, 8192, "square8k", 21.2},
+    {512, 3072, 1024, "qwen0.6B-up-pp512", 25.2},
+    {512, 1024, 3072, "qwen0.6B-down-pp512", 26.2},
+    {512, 4096, 4096, "8B-qo-pp512", 21.0},
+    {512, 12288, 4096, "8B-up-pp512", 17.7},
+    {512, 4096, 12288, "8B-down-pp512", 17.5},
+    {4096, 3072, 3072, "DiT-3072-L4096", 32.1},
+    {4096, 12288, 3072, "DiT-mlp-L4096", 31.7},
 };
 
 template <class F>
@@ -124,8 +124,7 @@ void run_gemm_bench() {
     const auto info = brotensor::vulkan::device_info(vk());
     std::printf("GEMM benchmark on %s (%s)\n", info.name.c_str(), info.driver.c_str());
     std::printf("C(M,N) = A(M,K) B(N,K)^T through matmul_abt; TF/s = 2MNK / time\n\n");
-    std::printf("%-22s %-16s %8s %8s %8s %7s %7s %9s\n", "shape", "MxNxK", "hipBLAS", "spike", "vulkan", "vk/hip",
-                "vk/spk", "rel.err");
+    std::printf("%-22s %-16s %8s %8s %7s %9s\n", "shape", "MxNxK", "spike", "vulkan", "vk/spk", "rel.err");
     const bool quick = std::getenv("BROTENSOR_VK_BENCH_QUICK") != nullptr;
     const char* only = std::getenv("BROTENSOR_VK_BENCH_SHAPE");   // one shape by tag
     for (const Shape& s : kShapes) {
@@ -139,8 +138,8 @@ void run_gemm_bench() {
         const double tf = 2.0 * s.M * s.N * double(s.K) / (ms * 1e9);
         char dims[32];
         std::snprintf(dims, sizeof dims, "%dx%dx%d", s.M, s.N, s.K);
-        std::printf("%-22s %-16s %8.1f %8.1f %8.1f %7.2f %7.2f %9.1e\n", s.tag, dims, s.hipblas, s.spike, tf,
-                    tf / s.hipblas, tf / s.spike, sample_error(av, bv, C, s.M, s.N, s.K));
+        std::printf("%-22s %-16s %8.1f %8.1f %7.2f %9.1e\n", s.tag, dims, s.spike, tf, tf / s.spike,
+                    sample_error(av, bv, C, s.M, s.N, s.K));
     }
 
     if (only) return;

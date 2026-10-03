@@ -39,7 +39,7 @@ The **CPU backend** implements essentially the entire FP32 surface — forward *
 
 The **CUDA and Metal backends** add the FP16 (and BF16) precision paths, batched-inference variants, the W8A16 and GGUF block-quant kernels, and a handful of GPU-only fused kernels. The [audio op family](#audio-op-family) is FP32 on **all three** backends with per-family CPU↔GPU parity tests.
 
-**HIP** compiles the CUDA sources (plus its own `src/hip/*.hip` kernels) and carries the same table; **Vulkan** (AMD's backend of choice, HIP kept for comparison) implements every inference op the siblings call but leaves some training backwards null — its per-slot table is [vulkan-coverage.md](vulkan-coverage.md).
+**Vulkan** (the AMD GPU path) fills 266 of 270 slots — its per-slot table is [vulkan-coverage.md](vulkan-coverage.md).
 
 **Metal is at near-total parity with CUDA.** Every Metal vtable slot is registered. CUDA leaves one null — `filtered_lrelu_backward`, where CUDA takes the composite; Metal has a fused backward (FP32, no dB) as well as the fused forward. Everything else in the table below is registered on both GPU backends.
 

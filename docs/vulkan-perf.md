@@ -1,5 +1,8 @@
 # Vulkan vs HIP: performance summary
 
+Historical: the HIP backend was removed on 2026-10-03 (docs/vulkan.md); these are
+the last same-machine measurements of both.
+
 Ryzen AI Max+ 395 / Radeon 8060S (gfx1151, 40 CUs, LPDDR5X 256 GB/s),
 Arch Linux, Mesa RADV 26.2.3 (ACO), ROCm 7.2.4. Both backends in one build
 (`build_vk`); "HIP" is brotensor's HIP backend (hipBLAS for dense FP16 GEMM),

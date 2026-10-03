@@ -31,7 +31,7 @@ namespace {
 int g_failures = 0;
 
 // Whether the backend under test fuses. CUDA compiles each trace to one PTX
-// kernel; HIP has no trace compiler and replays the DAG op by op, so its
+// kernel; Vulkan has no trace compiler and replays the DAG op by op, so its
 // "is one launch" checks are skipped and only the numbers are gated.
 bool g_expect_fused = true;
 
@@ -533,7 +533,7 @@ void test_scalar_entry_fallback(Device dev) {
 void run_suite(Device dev, const char* label) {
     std::printf("\n=== %s ===\n", label);
     const bool gpu = !dev.is_cpu();
-    g_expect_fused = !dev.is_hip() && !dev.is_vulkan();
+    g_expect_fused = !dev.is_vulkan();
     std::vector<Dtype> dtypes{Dtype::FP32};
     if (gpu) {
         dtypes.push_back(Dtype::BF16);
@@ -571,13 +571,10 @@ int main() {
     if (brotensor::is_available(Device::cuda())) {
         brotensor::set_default_device(Device::cuda());
         run_suite(Device::cuda(), "CUDA");
-    } else if (brotensor::is_available(Device::hip())) {
-        brotensor::set_default_device(Device::hip());
-        run_suite(Device::hip(), "HIP (unfused replay)");
     } else if (!brotensor::is_available(Device::vulkan())) {
-        std::printf("[SKIP] no CUDA, HIP or Vulkan device; the typed and broadcast paths are GPU-only.\n");
+        std::printf("[SKIP] no CUDA or Vulkan device; the typed and broadcast paths are GPU-only.\n");
     }
-    // Vulkan has no trace compiler either: the same unfused replay as HIP.
+    // Vulkan has no trace compiler: its traces replay op by op.
     if (brotensor::is_available(Device::vulkan())) {
         brotensor::DeviceScope scope(Device::vulkan());
         run_suite(Device::vulkan(), "Vulkan (unfused replay)");

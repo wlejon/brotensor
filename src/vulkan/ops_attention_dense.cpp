@@ -7,8 +7,8 @@
 // and batch strides (head h of Q is columns [h hd, (h+1) hd) of a row of
 // stride ldq, so consecutive heads are a batch stride of hd). GQA runs one
 // KV head at a time with K / V broadcast (batch stride 0) over its group.
-// Scores never exist below FP32 before the max subtraction: the HIP backend's
-// flash_attention_dense.hip makes the same choice for the same reason.
+// Scores never exist below FP32 before the max subtraction, so a 16-bit
+// score cannot overflow before it is normalised.
 
 #include "detail/attention.h"
 #include "detail/gemm.h"

@@ -24,20 +24,9 @@ std::uint64_t address(const Tensor& t) { return reinterpret_cast<std::uintptr_t>
 
 bool contains(const std::vector<Device>& v, Device d) { return std::find(v.begin(), v.end(), d) != v.end(); }
 
-// The GPU the default device and the Device::CUDA alias land on without a
-// CUDA backend: Vulkan, or HIP when it is registered and preferred
-// (BROTENSOR_PREFER_HIP=1 / BROTENSOR_DEFAULT_DEVICE=hip; init.cpp).
-Device amd_target() {
-    const bool hip = brotensor::is_available(Device::HIP);
-    return hip && brotensor::detail::prefer_hip() ? Device::HIP : vk();
-}
-
-// Device::CUDA without a CUDA backend: Vulkan, or HIP when only HIP is
-// registered or it is preferred (detail::resolve_device_alias). Everything
-// that acts on the device lands there; is_available(Device::CUDA) stays
-// false. ctest runs this again with HIP hidden
-// (brotensor_test_vulkan_cuda_alias) and with BROTENSOR_PREFER_HIP=1
-// (brotensor_test_vulkan_prefer_hip).
+// Device::CUDA without a CUDA backend aliases to Vulkan
+// (detail::resolve_device_alias). Everything that acts on the device lands
+// there; is_available(Device::CUDA) stays false.
 void test_cuda_alias() {
     std::printf("Device::CUDA alias\n");
     if (brotensor::is_available(Device::CUDA)) {
@@ -45,7 +34,7 @@ void test_cuda_alias() {
         return;
     }
     VKT_CHECK(!brotensor::is_available(Device::CUDA));
-    const Device target = amd_target();
+    const Device target = vk();
     std::printf("  Device::CUDA -> %s\n", brotensor::to_string(target).c_str());
     if (std::getenv("BROTENSOR_DEFAULT_DEVICE") == nullptr) VKT_CHECK(brotensor::default_device() == target);
     Tensor t = Tensor::zeros_on(Device::CUDA, 3, 5);
@@ -100,8 +89,8 @@ void test_registration(bool expect_default_vulkan) {
         Tensor t = Tensor::zeros(2, 3);
         VKT_CHECK(t.device == vk());
     } else if (!brotensor::is_available(Device::CUDA) && std::getenv("BROTENSOR_DEFAULT_DEVICE") == nullptr) {
-        // Vulkan is the default GPU on an AMD machine unless HIP is preferred.
-        VKT_CHECK(brotensor::default_device() == amd_target());
+        // Vulkan is the default GPU when there is no CUDA backend.
+        VKT_CHECK(brotensor::default_device() == vk());
     }
     {
         brotensor::DeviceScope scope(vk());
@@ -166,11 +155,6 @@ void test_transfers() {
     expect_equal_bits(c.host_f32(), v.data(), v.size() * 4, "clone + to(cpu)");
     Tensor d = c.to(vk());
     expect_close(download(d), v, 0, 0, "cpu -> vulkan via to()");
-    if (brotensor::is_available(Device::hip(0))) {
-        Tensor h = d.to(Device::hip(0));
-        Tensor back = h.to(vk());
-        expect_close(download(back), v, 0, 0, "vulkan -> hip -> vulkan");
-    }
     if (brotensor::vulkan_device_count() > 1) {
         Tensor p = d.to(Device::vulkan(1));
         expect_close(download(p), v, 0, 0, "vulkan:0 -> vulkan:1");

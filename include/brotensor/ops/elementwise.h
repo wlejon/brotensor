@@ -62,7 +62,7 @@ void mul_inplace(Tensor& y, const Tensor& x);
 
 
 // y[i] /= x[i], FP32 math, one rounding on the store. Identical shape and
-// dtype; FP32 on CPU, FP32/FP16/BF16 on HIP. CUDA and Metal register no slot
+// dtype; FP32 on CPU, FP32/FP16/BF16 on Vulkan. CUDA and Metal register no slot
 // yet (the dispatcher throws "not implemented") — the trace JIT's eager
 // divide is its one caller.
 void div_inplace(Tensor& y, const Tensor& x);

@@ -1,7 +1,6 @@
 // `brotensor_test_vulkan --bench-quant`: the quantised linears per weight
-// format (INT8 W8A16, GGUF Q8_0 / Q4_K / Q6_K) on LLM shapes, next to the HIP
-// backend running the same public op in the same process (when HIP is
-// registered). Not part of ctest.
+// format (INT8 W8A16, GGUF Q8_0 / Q4_K / Q6_K) on LLM shapes. Not part of
+// ctest.
 //
 //   decode   linear_forward_batched_<fmt> at B = 1, 2, 4, 8 activation rows:
 //            GB/s of weight bytes read (the stored, quantised size; X and Y
@@ -13,8 +12,7 @@
 // BROTENSOR_VK_BENCH_FMT=int8|q8_0|q4k|q6k runs one format,
 // BROTENSOR_VK_BENCH_PART=decode|prefill one table,
 // BROTENSOR_VK_BENCH_SHAPE=<tag> one shape (BROTENSOR_VK_BENCH_MNK=m,n,k a
-// custom prefill shape), BROTENSOR_VK_BENCH_NOHIP=1
-// skips the HIP column; BROTENSOR_VK_QGEMV=lpr,unr,sg forces the GEMV
+// custom prefill shape); BROTENSOR_VK_QGEMV=lpr,unr,sg forces the GEMV
 // configuration and BROTENSOR_VK_GEMM_CFG the prefill tile.
 //
 // `--bench-audio` (run_audio_bench) times the main audio ops the same way:
@@ -53,11 +51,6 @@ double median_ms(Device dev, F&& launch_once) {
     }
     std::sort(t.begin(), t.end());
     return t[t.size() / 2];
-}
-
-bool hip_ok() {
-    if (std::getenv("BROTENSOR_VK_BENCH_NOHIP")) return false;
-    return brotensor::is_available(Device::hip(0));
 }
 
 bool env_is(const char* var, const char* v) {
@@ -114,42 +107,35 @@ struct Problem {
     }
 };
 
-// ms on Vulkan (and HIP when available) for one configuration.
-void measure(Dtype dt, int n, int k, int B, double ms[2]) {
-    const bool hip = hip_ok();
-    for (int b = 0; b < (hip ? 2 : 1); ++b) {
-        const Device dev = b == 0 ? vk() : Device::hip(0);
-        ms[b] = 0;
-        try {
-            Problem p(dev, dt, n, k, B);
-            ms[b] = median_ms(dev, [&] { p.run(dt); });
-        } catch (const std::exception& e) {
-            std::printf("    (%s: %s)\n", b == 0 ? "vulkan" : "hip", e.what());
-        }
+// ms on Vulkan for one configuration (0 when the op throws).
+double measure(Dtype dt, int n, int k, int B) {
+    try {
+        Problem p(vk(), dt, n, k, B);
+        return median_ms(vk(), [&] { p.run(dt); });
+    } catch (const std::exception& e) {
+        std::printf("    (vulkan: %s)\n", e.what());
+        return 0;
     }
 }
 
 void bench_decode(const Fmt& f) {
     std::printf("\n%s decode: linear_forward_batched, GB/s of weight bytes (ms)\n", f.name);
-    std::printf("%-16s %3s %20s %20s %7s\n", "shape", "B", "vulkan", "hip", "vk/hip");
+    std::printf("%-16s %3s %20s\n", "shape", "B", "vulkan");
     for (const Shape& s : kShapes) {
         if (!env_is("BROTENSOR_VK_BENCH_SHAPE", s.tag)) continue;
         for (int B : {1, 2, 4, 8}) {
-            double ms[2];
-            measure(f.dt, s.n, s.k, B, ms);
+            const double ms = measure(f.dt, s.n, s.k, B);
             const double gb = weight_bytes(f.dt, s.n, s.k) / 1e6;
-            char a[32], c[32];
-            std::snprintf(a, sizeof a, "%6.1f (%.4f)", ms[0] > 0 ? gb / ms[0] : 0.0, ms[0]);
-            if (ms[1] > 0) std::snprintf(c, sizeof c, "%6.1f (%.4f)", gb / ms[1], ms[1]);
-            else std::snprintf(c, sizeof c, "-");
-            std::printf("%-16s %3d %20s %20s %7.2f\n", s.tag, B, a, c, ms[1] > 0 && ms[0] > 0 ? ms[1] / ms[0] : 0.0);
+            char a[32];
+            std::snprintf(a, sizeof a, "%6.1f (%.4f)", ms > 0 ? gb / ms : 0.0, ms);
+            std::printf("%-16s %3d %20s\n", s.tag, B, a);
         }
     }
 }
 
 void bench_prefill(const Fmt& f) {
     std::printf("\n%s prefill: linear_forward_batched, TF/s (ms)\n", f.name);
-    std::printf("%-16s %5s %20s %20s %7s\n", "shape", "M", "vulkan", "hip", "vk/hip");
+    std::printf("%-16s %5s %20s\n", "shape", "M", "vulkan");
     struct P { int m, n, k; const char* tag; };
     const P ps[] = {
         {512, 4096, 4096, "8B-q/o"},
@@ -166,25 +152,22 @@ void bench_prefill(const Fmt& f) {
     }
     for (const P& p : list) {
         if (!env_is("BROTENSOR_VK_BENCH_SHAPE", p.tag) && std::string(p.tag) != "custom") continue;
-        if (p.m > 512 && f.dt != Dtype::INT8) continue;   // HIP's GGUF prefill is a GEMV per row
-        double ms[2];
-        measure(f.dt, p.n, p.k, p.m, ms);
+        if (p.m > 512 && f.dt != Dtype::INT8) continue;   // GGUF prefill: the M = 512 shapes only
+        const double ms = measure(f.dt, p.n, p.k, p.m);
         const double tf = 2.0 * p.m * p.n * p.k / 1e9;
-        char a[32], c[32];
-        std::snprintf(a, sizeof a, "%6.2f (%.3f)", ms[0] > 0 ? tf / ms[0] : 0.0, ms[0]);
-        if (ms[1] > 0) std::snprintf(c, sizeof c, "%6.2f (%.3f)", tf / ms[1], ms[1]);
-        else std::snprintf(c, sizeof c, "-");
-        std::printf("%-16s %5d %20s %20s %7.2f\n", p.tag, p.m, a, c, ms[1] > 0 && ms[0] > 0 ? ms[1] / ms[0] : 0.0);
+        char a[32];
+        std::snprintf(a, sizeof a, "%6.2f (%.3f)", ms > 0 ? tf / ms : 0.0, ms);
+        std::printf("%-16s %5d %20s\n", p.tag, p.m, a);
     }
 }
 
 // ─── audio ──────────────────────────────────────────────────────────────────
 
 // Bandwidth-bound audio ops in GB/s of minimum traffic (each input read once,
-// each output written once) and the transforms in ms, Vulkan next to HIP.
+// each output written once) and the transforms in ms.
 void bench_audio() {
     std::printf("\naudio ops (ms / GB/s of minimum traffic; transforms ms / GFLOP/s)\n");
-    std::printf("%-44s %18s %18s %7s\n", "op", "vulkan", "hip", "vk/hip");
+    std::printf("%-44s %18s\n", "op", "vulkan");
     struct Case { const char* tag; Dtype dt; double bytes, flop; };
     const int C = 512, L = 24000;                 // a vocoder stage: 512 channels, 1 s at 24 kHz
     const int sig = 480000, nfft = 400, hop = 160, frames = 1 + sig / hop, bins = nfft / 2 + 1;   // Whisper, 30 s
@@ -199,27 +182,26 @@ void bench_audio() {
         {"istft 400 / 160, 30 s", Dtype::FP32, 0, 2.0 * frames * nfft * 2 * bins},
         {"complex_abs 3001 x 201", Dtype::FP32, 3001.0 * 201 * 12, 0},
     };
-    const bool hip = hip_ok();
     for (const Case& c : cases) {
         if (!env_is("BROTENSOR_VK_BENCH_SHAPE", c.tag)) continue;
-        double ms[2] = {0, 0};
-        for (int b = 0; b < (hip ? 2 : 1); ++b) {
-            const Device dev = b == 0 ? vk() : Device::hip(0);
+        double ms = 0;
+        {
+            const Device dev = vk();
             try {
                 const std::string t = c.tag;
                 Tensor X, Y, A, W, Z;
                 if (t.rfind("snake", 0) == 0 || t.rfind("pad1d", 0) == 0) {
                     X = upload(random_values(std::size_t(C) * L, 1, -1, 1, c.dt), 1, C * L, c.dt, dev);
                     A = upload(random_values(C, 2, 0.5f, 1.5f, Dtype::FP32), C, 1, Dtype::FP32, dev);
-                    if (t[0] == 's') ms[b] = median_ms(dev, [&] { brotensor::snake_forward(X, A, nullptr, 1, C, L, Y); });
-                    else ms[b] = median_ms(dev, [&] { brotensor::pad1d_forward(X, 1, C, L, 3, 3, 1, Y); });
+                    if (t[0] == 's') ms = median_ms(dev, [&] { brotensor::snake_forward(X, A, nullptr, 1, C, L, Y); });
+                    else ms = median_ms(dev, [&] { brotensor::pad1d_forward(X, 1, C, L, 3, 3, 1, Y); });
                 } else if (t.rfind("resample", 0) == 0) {
                     X = upload(random_values(64ull * 160000, 3, -1, 1, c.dt), 1, 64 * 160000, c.dt, dev);
-                    ms[b] = median_ms(dev, [&] { brotensor::resample1d_forward(X, 1, 64, 160000, 240000, 1, Y); });
+                    ms = median_ms(dev, [&] { brotensor::resample1d_forward(X, 1, 64, 160000, 240000, 1, Y); });
                 } else if (t.rfind("conv_transpose1d", 0) == 0) {
                     X = upload(random_values(512ull * 1000, 4, -1, 1, c.dt), 1, 512 * 1000, c.dt, dev);
                     W = upload(random_values(512ull * 256 * 16, 5, -0.05f, 0.05f, c.dt), 512, 256 * 16, c.dt, dev);
-                    ms[b] = median_ms(dev, [&] {
+                    ms = median_ms(dev, [&] {
                         brotensor::conv_transpose1d_forward(X, W, nullptr, 1, 512, 1000, 256, 16, 8, 4, 0, 1, 1, Y);
                     });
                 } else if (t.rfind("stft", 0) == 0 || t.rfind("istft", 0) == 0) {
@@ -228,15 +210,15 @@ void bench_audio() {
                     W = upload(wv, 1, nfft, Dtype::FP32, dev);
                     X = upload(random_values(sig, 6, -1, 1, Dtype::FP32), 1, sig, Dtype::FP32, dev);
                     brotensor::stft(X, W, 1, nfft, hop, nfft, true, false, Z);
-                    if (t[0] == 's') ms[b] = median_ms(dev, [&] { brotensor::stft(X, W, 1, nfft, hop, nfft, true, false, Y); });
-                    else ms[b] = median_ms(dev, [&] { brotensor::istft(Z, W, 1, sig, nfft, hop, nfft, true, false, Y); });
+                    if (t[0] == 's') ms = median_ms(dev, [&] { brotensor::stft(X, W, 1, nfft, hop, nfft, true, false, Y); });
+                    else ms = median_ms(dev, [&] { brotensor::istft(Z, W, 1, sig, nfft, hop, nfft, true, false, Y); });
                 } else {
                     X = upload(random_values(3001ull * 402, 7, -1, 1, Dtype::FP32), 3001, 402, Dtype::FP32, dev);
-                    ms[b] = median_ms(dev, [&] { brotensor::complex_abs(X, Y); });
+                    ms = median_ms(dev, [&] { brotensor::complex_abs(X, Y); });
                 }
             } catch (const std::exception& e) {
-                std::printf("    (%s: %s)\n", b == 0 ? "vulkan" : "hip", e.what());
-                ms[b] = 0;
+                std::printf("    (vulkan: %s)\n", e.what());
+                ms = 0;
             }
         }
         auto fmt = [&](double m, char* buf, std::size_t n) {
@@ -244,10 +226,9 @@ void bench_audio() {
             if (c.flop > 0) std::snprintf(buf, n, "%.3f / %6.0f", m, c.flop / (m * 1e6));
             else std::snprintf(buf, n, "%.3f / %5.0f", m, c.bytes / (m * 1e6));
         };
-        char a[40], h[40];
-        fmt(ms[0], a, sizeof a);
-        fmt(ms[1], h, sizeof h);
-        std::printf("%-44s %18s %18s %7.2f\n", c.tag, a, h, ms[0] > 0 && ms[1] > 0 ? ms[1] / ms[0] : 0.0);
+        char a[40];
+        fmt(ms, a, sizeof a);
+        std::printf("%-44s %18s\n", c.tag, a);
     }
 }
 

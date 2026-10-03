@@ -1,7 +1,6 @@
 // Vulkan quantised-weight linears: the GGUF formats (Q8_0, Q4_K, Q6_K: GEMV,
 // batched linear, dequantise), the INT8 W8A16 linear and matmul, and the
-// INT8 convolutions. Contracts follow the HIP backend (src/hip/quant.hip,
-// quant_gguf.hip): FP16 activations for GGUF (FP16 or BF16 for the INT8
+// INT8 convolutions. Contracts: FP16 activations for GGUF (FP16 or BF16 for the INT8
 // linear), FP32 accumulation, outputs resized.
 //
 // Kernels (detail/quant.h, docs/vulkan.md "Quantised weights"):

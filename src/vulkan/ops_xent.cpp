@@ -1,7 +1,7 @@
 // Vulkan softmax cross-entropy: softmax_xent, softmax_xent_fused (one
 // segment, the loss returned to the host, which syncs) and
 // softmax_xent_fused_batched (per-row heads from a device offset table, a
-// loss per row), and bce_with_logits_fused_batched. FP32, as on the CPU and HIP backends; kernel
+// loss per row), and bce_with_logits_fused_batched. FP32, as on the CPU backend; kernel
 // shaders/xent.comp. softmax_xent_segment takes raw pointers only and stays
 // on the CPU (src/ops.cpp routes it there).
 

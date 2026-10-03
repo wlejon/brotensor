@@ -1,7 +1,5 @@
 // `brotensor_test_vulkan --bench-conv`: conv2d_forward throughput on the
-// VAE-decoder and SD U-Net shapes (FP16, NCHW), next to the HIP backend
-// running the same public op in the same process (when HIP is registered),
-// then the bandwidth-bound spatial ops (GroupNorm, the 2x upsamples,
+// VAE-decoder and SD U-Net shapes (FP16, NCHW), then the bandwidth-bound spatial ops (GroupNorm, the 2x upsamples,
 // bilinear / bicubic interpolation) in GB/s against the 256 GB/s peak.
 // Not part of ctest.
 //
@@ -10,8 +8,7 @@
 // counts 2 C_out C_in kH kW H_out W_out N flops. GB/s counts the minimum
 // traffic (each input read once, each output written once); GroupNorm
 // actually reads X twice. BROTENSOR_VK_BENCH_SHAPE=<tag> runs one shape,
-// BROTENSOR_VK_BENCH_PART=conv|band runs one table, BROTENSOR_VK_BENCH_NOHIP=1
-// skips the HIP column, BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn forces a tile,
+// BROTENSOR_VK_BENCH_PART=conv|band runs one table, BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn forces a tile,
 // BROTENSOR_VK_BENCH_DTYPE=f32|bf16 changes the conv dtype and
 // BROTENSOR_VK_BENCH_CONV_PATH=simt|direct forces a Vulkan conv path.
 
@@ -47,11 +44,6 @@ double median_ms(Device dev, F&& launch_once) {
     }
     std::sort(t.begin(), t.end());
     return t[t.size() / 2];
-}
-
-bool hip_ok() {
-    if (std::getenv("BROTENSOR_VK_BENCH_NOHIP")) return false;
-    return brotensor::is_available(Device::hip(0));
 }
 
 bool selected(const char* tag) {
@@ -102,33 +94,27 @@ void bench_conv() {
     std::printf("\nconv2d_forward, %s, stride 1, same padding (ms / TF/s)\n", dt_name(bench_dtype()));
     const char* path = std::getenv("BROTENSOR_VK_BENCH_CONV_PATH");
     if (path) brotensor::detail::vulkan::set_conv_override(std::string(path) == "direct" ? 2 : 1);
-    std::printf("%-22s %16s %16s %8s\n", "shape", "vulkan", "hip", "vk/hip");
-    const bool hip = hip_ok();
+    std::printf("%-22s %16s\n", "shape", "vulkan");
     for (const ConvShape& s : kConvShapes) {
         if (!selected(s.tag)) continue;
         const double flop = 2.0 * s.n * s.cout * s.cin * s.k * s.k * double(s.h) * s.w;
-        double ms[2] = {0, 0};
-        for (int b = 0; b < (hip ? 2 : 1); ++b) {
-            const Device dev = b == 0 ? vk() : Device::hip(0);
-            ConvProblem p(dev, s);
-            try {
-                ms[b] = median_ms(dev, [&] { p.run(s); });
-            } catch (const std::exception&) {
-                ms[b] = 0;
-            }
+        double ms = 0;
+        ConvProblem p(vk(), s);
+        try {
+            ms = median_ms(vk(), [&] { p.run(s); });
+        } catch (const std::exception&) {
+            ms = 0;
         }
-        char a[32], c[32];
-        std::snprintf(a, sizeof a, "%.3f / %5.2f", ms[0], flop / (ms[0] * 1e9));
-        if (hip && ms[1] > 0) std::snprintf(c, sizeof c, "%.3f / %5.2f", ms[1], flop / (ms[1] * 1e9));
-        else std::snprintf(c, sizeof c, "-");
-        std::printf("%-22s %16s %16s %8.2f\n", s.tag, a, c, hip && ms[1] > 0 ? ms[1] / ms[0] : 0.0);
+        char a[32];
+        std::snprintf(a, sizeof a, "%.3f / %5.2f", ms, flop / (ms * 1e9));
+        std::printf("%-22s %16s\n", s.tag, a);
     }
     brotensor::detail::vulkan::set_conv_override(0);
 }
 
 void bench_bandwidth() {
     std::printf("\nbandwidth-bound spatial ops, FP16 (ms / GB/s of minimum traffic, peak 256)\n");
-    std::printf("%-30s %16s %16s %8s\n", "op", "vulkan", "hip", "vk/hip");
+    std::printf("%-30s %16s\n", "op", "vulkan");
     struct B { const char* tag; int c, h, w, ho, wo, kind; };   // kind: 0 GN, 1 up-nearest, 2 bilinear, 3 bicubic
     const B shapes[] = {
         {"groupnorm-512c-64", 512, 64, 64, 64, 64, 0},
@@ -142,33 +128,30 @@ void bench_bandwidth() {
         {"bilinear-256c-100to333", 256, 100, 100, 333, 333, 2},
         {"bicubic-64c-512to224", 64, 512, 512, 224, 224, 3},
     };
-    const bool hip = hip_ok();
     for (const B& s : shapes) {
         if (!selected(s.tag)) continue;
         const double bytes = 2.0 * s.c * (double(s.h) * s.w + double(s.ho) * s.wo);
-        double ms[2] = {0, 0};
-        for (int b = 0; b < (hip ? 2 : 1); ++b) {
-            const Device dev = b == 0 ? vk() : Device::hip(0);
+        double ms = 0;
+        {
+            const Device dev = vk();
             Tensor X = upload(random_values(std::size_t(s.c) * s.h * s.w, 4, -1, 1, Dtype::FP16), 1, s.c * s.h * s.w,
                               Dtype::FP16, dev);
             Tensor g = upload(random_values(s.c, 5, 0.5f, 1.5f, Dtype::FP16), s.c, 1, Dtype::FP16, dev);
             Tensor be = upload(random_values(s.c, 6, -0.5f, 0.5f, Dtype::FP16), s.c, 1, Dtype::FP16, dev);
             Tensor Y;
             try {
-                ms[b] = median_ms(dev, [&] {
+                ms = median_ms(dev, [&] {
                     if (s.kind == 0) brotensor::group_norm_forward(X, g, be, 1, s.c, s.h, s.w, 32, 1e-6f, Y);
                     else if (s.kind == 1) brotensor::upsample_nearest_2x(X, 1, s.c, s.h, s.w, Y);
                     else brotensor::interp2d_forward(X, 1, s.c, s.h, s.w, s.ho, s.wo, s.kind == 2 ? 1 : 3, Y);
                 });
             } catch (const std::exception&) {
-                ms[b] = 0;   // e.g. HIP's bicubic is FP32-only
+                ms = 0;
             }
         }
-        char a[32], c[32];
-        std::snprintf(a, sizeof a, "%.3f / %5.0f", ms[0], bytes / (ms[0] * 1e6));
-        if (hip && ms[1] > 0) std::snprintf(c, sizeof c, "%.3f / %5.0f", ms[1], bytes / (ms[1] * 1e6));
-        else std::snprintf(c, sizeof c, "-");
-        std::printf("%-30s %16s %16s %8.2f\n", s.tag, a, c, hip && ms[1] > 0 ? ms[1] / ms[0] : 0.0);
+        char a[32];
+        std::snprintf(a, sizeof a, "%.3f / %5.0f", ms, bytes / (ms * 1e6));
+        std::printf("%-30s %16s\n", s.tag, a);
     }
 }
 

@@ -1,7 +1,7 @@
 // Vulkan AllocVTable: allocation, host <-> device transfers, device copies,
 // memset, sync and the memory / name queries.
 //
-// Transfers keep HIP's stream semantics: a host <-> device copy returns with
+// Transfers keep CUDA-style stream semantics: a host <-> device copy returns with
 // the host buffer free to reuse and the data in place in stream order.
 //   upload   * device memory mapped and the stream idle: memcpy straight in.
 //            * <= 64 KiB, 4-byte aligned: vkCmdUpdateBuffer, recorded in the

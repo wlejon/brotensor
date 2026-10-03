@@ -1,6 +1,6 @@
 #pragma once
 
-// Per-device command recording: the Vulkan backend's equivalent of a HIP
+// Per-device command recording: the Vulkan backend's equivalent of a CUDA
 // stream.
 //
 // Every op on a device records into the device's one Stream. Commands go into
@@ -14,7 +14,7 @@
 // Ordering. A full memory barrier (compute + transfer, write -> read/write)
 // separates consecutive commands and starts every command buffer, so the work
 // is executed exactly in recording order across batches and graph launches,
-// like a single in-order HIP stream. Later chunks may replace the blanket
+// like a single in-order CUDA stream. Later chunks may replace the blanket
 // barrier with hazard tracking; nothing outside this file assumes more than
 // "in order".
 //
@@ -33,8 +33,7 @@
 // that need the host to wait (sync, downloads, uploads larger than an inline
 // update) throw. The finished command buffers are submitted as-is by
 // launch(), as many times as the caller likes: a pre-recorded command buffer
-// replayed on the graphics queue costs ~0.74 us per dependent kernel, 2.5x
-// cheaper than hipGraph replay on the same GPU. A capture is cut into
+// replayed on the graphics queue costs ~0.74 us per dependent kernel. A capture is cut into
 // segments of `batch_limit` commands, the same bound as an eager batch, and
 // launch() submits each segment as its own queue submission: the amdgpu
 // kernel driver resets the GPU when one submission runs past ~10 s, and a

@@ -3,7 +3,7 @@
 // LLM2Vec), threshold_u8 and rows_count_above (SAM's mask post-processing),
 // xavier_init, the SGD / Adam steps and the MSE losses, attention_token_moments,
 // and StyleGAN3's bias_act and upfirdn2d (filtered_lrelu has no slot here: the
-// public op falls back to its bias_act + upfirdn2d composite, as on HIP).
+// public op falls back to its bias_act + upfirdn2d composite).
 // Contracts follow the CUDA backend (src/cuda/embedding.cu, reduce.cu,
 // elementwise.cu, public_reductions.cu, xavier_init.cu, optim.cu, loss.cu,
 // attention_moments.cu, bias_act.cu, upfirdn2d.cu): the pooling, bias_act and

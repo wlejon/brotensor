@@ -294,7 +294,7 @@ void flash_attention_qkvo_forward(const Tensor& X, const Tensor* Ctx, const Tens
                                   Tensor& O);   // ops_attention.cpp
 
 // FP32: mha_forward's semantics (the mask gates query rows too). FP16 / BF16:
-// the flash route, keys only, as on CUDA / HIP (cross_attention.cu).
+// the flash route, keys only, as on CUDA (cross_attention.cu).
 void self_attention_forward(const Tensor& X, const Tensor& Wq, const Tensor& Wk, const Tensor& Wv, const Tensor& Wo,
                             const float* d_mask, int num_heads, Tensor& O) {
     if (X.dtype == Dtype::FP16 || X.dtype == Dtype::BF16) {

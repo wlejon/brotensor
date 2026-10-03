@@ -75,37 +75,26 @@ struct AllocVTable {
 void register_backend(DeviceType dt, const OpsVTable& ops, const AllocVTable& alloc);
 void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc);
 
-// ─── The Device::CUDA -> HIP (or Vulkan) alias ─────────────────────────────
+// ─── The Device::CUDA -> Vulkan alias ──────────────────────────────────────
 //
-// A HIP build compiles most of the CUDA kernels through a shim, and code
-// written before HIP existed names the GPU `Device::CUDA`. So that such code
-// runs unchanged on an AMD machine, when the HIP backend is registered and
-// the CUDA backend is not, a Device::cuda(i) *naming a place to put or run
-// work* means Device::hip(i). The rule, in full:
+// Much code names the GPU `Device::CUDA`. So that such code runs unchanged on
+// an AMD (or any non-NVIDIA) machine, when the Vulkan backend is registered
+// and the CUDA backend is not, a Device::cuda(i) *naming a place to put or
+// run work* means Device::vulkan(i). The rule, in full:
 //
 //   * Everything that acts on a device resolves the alias first: the tensor
-//     factories and view() (the tensor comes back tagged HIP), the ops / alloc
+//     factories and view() (the tensor comes back tagged Vulkan), the ops / alloc
 //     tables, dispatch's device activation, sync, set_default_device,
 //     DeviceScope, device_mem_info / device_mem_trim / device_product_name.
 //   * Everything that reports what hardware exists does not: is_available /
-//     is_registered(Device::CUDA) stay false, available_devices() lists HIP
-//     devices only, cuda_device_count() is 0. Code that probes for CUDA
+//     is_registered(Device::CUDA) stay false, available_devices() lists
+//     Vulkan devices only, cuda_device_count() is 0. Code that probes for CUDA
 //     before using it therefore sees the truth and picks its non-CUDA path;
 //     code that just says Device::CUDA gets the GPU that is there.
 //
-// A registered Vulkan backend takes HIP's place by the same rule:
-// Device::cuda(i) means Device::vulkan(i) when there is no HIP backend, and
-// also when both are registered, Vulkan being the faster of the two on the
-// same AMD GPU (it is the default device then too: init.cpp). prefer_hip()
-// turns that around: with it, a build with HIP and Vulkan aliases to HIP.
-// With a CUDA backend registered (or no HIP or Vulkan backend) the alias is
-// the identity. Resolution happens here and nowhere else.
+// With a CUDA backend registered (or no Vulkan backend) the alias is the
+// identity. Resolution happens here and nowhere else.
 Device resolve_device_alias(Device d);
-
-// True when BROTENSOR_PREFER_HIP=1 or BROTENSOR_DEFAULT_DEVICE names a HIP
-// device: HIP then wins over Vulkan as the default device and as the target
-// of the Device::CUDA alias. Read once.
-bool prefer_hip();
 
 // Dispatcher lookups (alias-resolved). Throw std::runtime_error if `d` is not
 // currently registered.
@@ -170,9 +159,6 @@ void adopt_output(Tensor& t, Device d);
 
 // Set registered CUDA device count.
 void set_cuda_device_count(int count);
-
-// Set registered HIP device count.
-void set_hip_device_count(int count);
 
 // Set registered Vulkan device count.
 void set_vulkan_device_count(int count);

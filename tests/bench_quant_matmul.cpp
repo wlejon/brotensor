@@ -265,9 +265,9 @@ void bench_prefill(const char* label, const Format& fmt, int B, int out, int in)
 
 int main() {
     brotensor::init();
-    if (brotensor::is_available(Device::HIP))        g_dev = Device::HIP;
-    else if (brotensor::is_available(Device::CUDA))  g_dev = Device::CUDA;
-    else if (brotensor::is_available(Device::Metal)) g_dev = Device::Metal;
+    if (brotensor::is_available(Device::CUDA))        g_dev = Device::CUDA;
+    else if (brotensor::is_available(Device::Metal))  g_dev = Device::Metal;
+    else if (brotensor::is_available(Device::VULKAN)) g_dev = Device::VULKAN;
     else { std::printf("no GPU backend available - skipping\n"); return 0; }
     brotensor::set_default_device(g_dev);
 

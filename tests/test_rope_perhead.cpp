@@ -119,7 +119,7 @@ int main() {
         CHECK(e < 1e-6f);
     }
 
-    // ── GPU (CUDA, or HIP through the CUDA alias) FP32 + FP16 parity ──────
+    // ── GPU (CUDA, or Vulkan through the CUDA alias) FP32 + FP16 parity ───
     if (bt_test::has_gpu()) {
         Tensor Cg = Tensor::from_host_on(Device::CUDA, C.data(), L * nh, half);
         Tensor Sg = Tensor::from_host_on(Device::CUDA, S.data(), L * nh, half);
@@ -149,7 +149,7 @@ int main() {
             CHECK(e < 3e-2f);
         }
     } else {
-        std::printf("  no CUDA/HIP backend - GPU parity skipped\n");
+        std::printf("  no GPU backend - GPU parity skipped\n");
     }
 
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);
