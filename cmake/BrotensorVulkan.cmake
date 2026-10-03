@@ -54,8 +54,14 @@
 
 include_guard(GLOBAL)
 
-set(_BROTENSOR_VULKAN_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
-set(BROTENSOR_VULKAN_SHADER_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../src/vulkan/shaders")
+# Cache entries, not directory variables: the GLOBAL guard means only the first
+# include() in a configure runs this file, and that can be in a sibling
+# directory of the consumer (bro includes it from brotensor's subdirectory,
+# then brodiffusion's and brovisionml's includes are skipped), so a plain
+# set() here would be invisible where brotensor_vulkan_add_shaders is called.
+set(_BROTENSOR_VULKAN_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." CACHE INTERNAL "brotensor source root")
+set(BROTENSOR_VULKAN_SHADER_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../src/vulkan/shaders"
+    CACHE INTERNAL "brotensor's GLSL include directory (common.glsl, math_acc.glsl, ...)")
 
 macro(brotensor_vulkan_prepare)
     cmake_parse_arguments(_btvp "REQUIRE_HEADERS" "" "" ${ARGN})
@@ -79,7 +85,6 @@ macro(brotensor_vulkan_prepare)
                 "vulkan-headers (or the LunarG SDK and set VULKAN_SDK).")
         endif()
     endif()
-    set(BROTENSOR_VULKAN_SHADER_INCLUDE_DIR "${_BROTENSOR_VULKAN_ROOT}/src/vulkan/shaders")
 endmacro()
 
 function(brotensor_vulkan_detect out_var)
