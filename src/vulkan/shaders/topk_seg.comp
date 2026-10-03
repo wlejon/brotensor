@@ -1,0 +1,125 @@
+#version 460
+// Two small row ops next to attention (ops_topk.cpp), X in -DDT, FP32 math.
+//   MODE 0, top_k_rows: element i of row r goes to output position
+//     rank(i) = #{j : x_j > x_i, or x_j == x_i and j < i} when rank(i) < k.
+//     The order (descending value, ascending index) is total, so every rank
+//     is distinct and Vals / Idx come out exactly as the CPU's selection.
+//     Grid (ceil(C / 256), rows); each thread ranks one element against the
+//     row, staged through shared memory 256 values at a time: O(C^2) per
+//     row, for any k up to C.
+//   MODE 1, segment_softmax_stats: per segment s of the flat logits
+//     [off[s], off[s+1]): [top1 p, top1 - top2, entropy / ln max(2, n),
+//     max(2, n) / 255], zeros for an empty segment. One workgroup per
+//     segment (grid-stride).
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+layout(push_constant) uniform PC {
+    uint64_t x, vals, idx, off;
+    uint rows, cols, k, nseg;
+} pc;
+
+shared float sv[256];
+shared float s1[256], s2[256];
+
+bool beats(float a, uint ia, float b, uint ib) { return a != b ? a > b : ia < ib; }
+
+void topk() {
+    const uint r = gl_WorkGroupID.y, i = gl_GlobalInvocationID.x, tid = gl_LocalInvocationID.x;
+    const uint base = r * pc.cols;
+    const bool live = i < pc.cols;
+    const float v = live ? load_elem(DT, pc.x, base + i) : 0.0;
+    uint rank = 0u;
+    for (uint j0 = 0; j0 < pc.cols; j0 += 256u) {
+        barrier();
+        if (j0 + tid < pc.cols) sv[tid] = load_elem(DT, pc.x, base + j0 + tid);
+        barrier();
+        const uint n = min(256u, pc.cols - j0);
+        for (uint t = 0; t < n; ++t) rank += beats(sv[t], j0 + t, v, i) ? 1u : 0u;
+    }
+    if (live && rank < pc.k) {
+        F32Buf(pc.vals).v[r * pc.k + rank] = v;
+        I32Buf(pc.idx).v[r * pc.k + rank] = int(i);
+    }
+}
+
+// Top two of {a1 >= a2} and {b1 >= b2}, with multiplicity.
+void merge2(inout float a1, inout float a2, float b1, float b2) {
+    if (b1 > a1) { a2 = max(a1, b2); a1 = b1; }
+    else a2 = max(a2, b1);
+}
+
+float block_max(float v) {
+    v = subgroupMax(v);
+    if (subgroupElect()) s1[gl_SubgroupID] = v;
+    barrier();
+    float t = s1[0];
+    for (uint i = 1; i < gl_NumSubgroups; ++i) t = max(t, s1[i]);
+    barrier();
+    return t;
+}
+
+float block_sum(float v) {
+    v = subgroupAdd(v);
+    if (subgroupElect()) s1[gl_SubgroupID] = v;
+    barrier();
+    float t = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) t += s1[i];
+    barrier();
+    return t;
+}
+
+void segstats() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint s = gl_WorkGroupID.x; s < pc.nseg; s += gl_NumWorkGroups.x) {
+        // Clamped to the logits (pc.cols elements): a bad table must not fault.
+        const int a = clamp(I32Buf(pc.off).v[s], 0, int(pc.cols));
+        const int b = clamp(I32Buf(pc.off).v[s + 1u], a, int(pc.cols));
+        const uint o = s * 4u;
+        if (b <= a) {
+            if (tid < 4u) F32Buf(pc.vals).v[o + tid] = 0.0;
+            continue;
+        }
+        float mx = -3.4028234663852886e38;
+        for (int i = a + int(tid); i < b; i += 256) mx = max(mx, load_elem(DT, pc.x, uint(i)));
+        mx = block_max(mx);
+        float sum = 0.0;
+        for (int i = a + int(tid); i < b; i += 256) sum += exp(load_elem(DT, pc.x, uint(i)) - mx);
+        sum = block_sum(sum);
+        float t1 = 0.0, t2 = 0.0, ent = 0.0;
+        for (int i = a + int(tid); i < b; i += 256) {
+            const float p = exp(load_elem(DT, pc.x, uint(i)) - mx) / sum;
+            ent -= p * log(max(p, 1e-9));
+            merge2(t1, t2, p, 0.0);
+        }
+        ent = block_sum(ent);
+        s1[tid] = t1;
+        s2[tid] = t2;
+        barrier();
+        for (uint w = 128u; w > 0u; w >>= 1) {
+            if (tid < w) {
+                float a1 = s1[tid], a2 = s2[tid];
+                merge2(a1, a2, s1[tid + w], s2[tid + w]);
+                s1[tid] = a1;
+                s2[tid] = a2;
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            const float kk = max(2.0, float(b - a));
+            F32Buf(pc.vals).v[o] = s1[0];
+            F32Buf(pc.vals).v[o + 1u] = s1[0] - s2[0];
+            F32Buf(pc.vals).v[o + 2u] = ent / log(kk);
+            F32Buf(pc.vals).v[o + 3u] = kk / 255.0;
+        }
+        barrier();
+    }
+}
+
+void main() {
+    if (MODE == 0) topk();
+    else segstats();
+}

@@ -168,11 +168,14 @@ inline bool expect_equal_bits(const void* a, const void* b, std::size_t n, const
     return true;
 }
 
-// Defined in test_vulkan_ops.cpp, test_vulkan_gemm.cpp, test_vulkan_norm.cpp
-// and test_vulkan_bench.cpp.
+// Defined in test_vulkan_ops.cpp, test_vulkan_gemm.cpp, test_vulkan_norm.cpp,
+// test_vulkan_attention.cpp, test_vulkan_bench.cpp and
+// test_vulkan_bench_attention.cpp.
 void run_op_tests();
 void run_gemm_tests();
 void run_norm_tests();
+void run_attention_tests();
 void run_gemm_bench();
+void run_attention_bench();
 
 }  // namespace vkt

@@ -1,0 +1,34 @@
+#version 460
+// Small passes of the projection-fused attention ops
+// (ops_attention_proj.cpp), FP32 in, y in -DDT:
+//   AUX_ROW_GATE   y[r, c] = x[r, c], or 0 where mask[r] < 0.5 (mask 0 = none):
+//                  the final cast of an FP32 result with the query gating
+//   AUX_HEAD_MEAN  y[i] = (1 / rows) sum_h x[h * n + i]: the head-averaged
+//                  attention map
+// Grid-stride over the n (HEAD_MEAN) or rows * n (ROW_GATE) outputs.
+#include "common.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+layout(push_constant) uniform PC {
+    uint64_t x, y, mask;
+    uint rows, n;
+} pc;
+
+void main() {
+    if (MODE == AUX_ROW_GATE) {
+        const uint total = pc.rows * pc.n;
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += GRID_STRIDE_X) {
+            const bool ok = pc.mask == 0 || F32Buf(pc.mask).v[i / pc.n] >= 0.5;
+            store_elem(DT, pc.y, i, ok ? F32Buf(pc.x).v[i] : 0.0);
+        }
+    } else {
+        const float inv = 1.0 / float(pc.rows);
+        for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += GRID_STRIDE_X) {
+            float s = 0.0;
+            for (uint h = 0; h < pc.rows; ++h) s += F32Buf(pc.x).v[h * pc.n + i];
+            store_elem(DT, pc.y, i, s * inv);
+        }
+    }
+}

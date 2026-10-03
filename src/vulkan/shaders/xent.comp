@@ -1,0 +1,79 @@
+#version 460
+// Softmax cross-entropy over segments of FP32 rows (ops_xent.cpp): row b is
+// split into heads [off[h], off[h+1]) (one head [0, n) when off = 0); per
+// head, p = softmax over the keys with mask >= 0.5, dLogits = p - t (0 where
+// masked), and the row's loss sums -t log(max(p, 1e-12)) over t > 0 and every
+// head. One workgroup per row (grid-stride), FP32 like the CPU reference
+// (src/cpu/ops_impl.cpp softmax_xent_fused_batched).
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t logits, target, mask, off, probs, dlog, loss;
+    uint rows, n, heads;
+} pc;
+
+shared float red[64];
+
+float block_max(float v) {
+    v = subgroupMax(v);
+    if (subgroupElect()) red[gl_SubgroupID] = v;
+    barrier();
+    float t = red[0];
+    for (uint i = 1; i < gl_NumSubgroups; ++i) t = max(t, red[i]);
+    barrier();
+    return t;
+}
+
+float block_sum(float v) {
+    v = subgroupAdd(v);
+    if (subgroupElect()) red[gl_SubgroupID] = v;
+    barrier();
+    float t = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) t += red[i];
+    barrier();
+    return t;
+}
+
+bool valid(uint i) { return pc.mask == 0 || F32Buf(pc.mask).v[i] >= 0.5; }
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint b = gl_WorkGroupID.x; b < pc.rows; b += gl_NumWorkGroups.x) {
+        const uint ro = b * pc.n;
+        float loss = 0.0;
+        for (uint h = 0; h < pc.heads; ++h) {
+            uint s = 0u, e = pc.n;
+            if (pc.off != 0) {
+                s = uint(clamp(I32Buf(pc.off).v[h], 0, int(pc.n)));
+                e = uint(clamp(I32Buf(pc.off).v[h + 1u], int(s), int(pc.n)));
+            }
+            float m = -1e30;
+            for (uint i = s + tid; i < e; i += 256u)
+                if (valid(ro + i)) m = max(m, F32Buf(pc.logits).v[ro + i]);
+            m = block_max(m);
+            float sum = 0.0;
+            for (uint i = s + tid; i < e; i += 256u)
+                if (valid(ro + i)) sum += exp(F32Buf(pc.logits).v[ro + i] - m);
+            sum = block_sum(sum);
+            const float inv = sum > 0.0 ? 1.0 / sum : 0.0;
+            for (uint i = s + tid; i < e; i += 256u) {
+                const uint at = ro + i;
+                if (!valid(at)) {
+                    F32Buf(pc.probs).v[at] = 0.0;
+                    F32Buf(pc.dlog).v[at] = 0.0;
+                    continue;
+                }
+                const float p = exp(F32Buf(pc.logits).v[at] - m) * inv;
+                const float t = F32Buf(pc.target).v[at];
+                if (t > 0.0) loss -= t * log(max(p, 1e-12));
+                F32Buf(pc.probs).v[at] = p;
+                F32Buf(pc.dlog).v[at] = p - t;
+            }
+        }
+        loss = block_sum(loss);
+        if (tid == 0u) F32Buf(pc.loss).v[b] = loss;
+    }
+}

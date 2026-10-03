@@ -1,0 +1,41 @@
+#version 460
+// Merges fa_rows.comp's split-key partials: for each (row, head),
+// O = sum_s acc_s exp(m_s - M) / sum_s l_s exp(m_s - M), M = max_s m_s, and
+// zero when no split saw a valid key. One workgroup per (row, head) entry
+// (grid-stride), one thread per output column. -DDT = O's dtype.
+#include "common.glsl"
+
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC {
+    uint64_t part;   // (entries * nsplit) x (hd + 2) FP32: acc[hd], m, l
+    uint64_t o;
+    uint entries;    // rows * hq
+    uint nsplit;
+    uint hd;
+    uint hq;
+    uint ldo;
+} pc;
+
+void main() {
+    const uint w = pc.hd + 2u;
+    for (uint e = gl_WorkGroupID.x; e < pc.entries; e += gl_NumWorkGroups.x) {
+        const uint base = e * pc.nsplit * w;
+        float M = -1e30;
+        for (uint s = 0; s < pc.nsplit; ++s) M = max(M, F32Buf(pc.part).v[base + s * w + pc.hd]);
+        float L = 0.0;
+        for (uint s = 0; s < pc.nsplit; ++s) {
+            const float ls = F32Buf(pc.part).v[base + s * w + pc.hd + 1u];
+            L += ls > 0.0 ? ls * exp(F32Buf(pc.part).v[base + s * w + pc.hd] - M) : 0.0;
+        }
+        const float inv = L > 0.0 ? 1.0 / L : 0.0;
+        const uint row = e / pc.hq, h = e % pc.hq;
+        for (uint d = gl_LocalInvocationID.x; d < pc.hd; d += gl_WorkGroupSize.x) {
+            float acc = 0.0;
+            for (uint s = 0; s < pc.nsplit; ++s) {
+                const float ls = F32Buf(pc.part).v[base + s * w + pc.hd + 1u];
+                if (ls > 0.0) acc += F32Buf(pc.part).v[base + s * w + d] * exp(F32Buf(pc.part).v[base + s * w + pc.hd] - M);
+            }
+            store_elem(DT, pc.o, row * pc.ldo + h * pc.hd + d, acc * inv);
+        }
+    }
+}

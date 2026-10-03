@@ -1,0 +1,223 @@
+#version 460
+// Attention for one query row per workgroup, any dtype (-DDT=0/1/2), any head
+// width: the decode kernel (one or a few query rows against a KV cache), the
+// path for FP32 and for devices without cooperative matrix, and the
+// fallback for shapes fa_cm.comp does not take. Host side: ops_attention.cpp.
+//
+// Workgroup (split s, row, head block z) handles G query heads that share one
+// KV head (GQA: K and V are read once for the G heads) over keys
+// [lo + s*chunk, lo + (s+1)*chunk) of the row's interval. Per tile of TK keys
+// each thread scores one key against the G queries (Q staged in shared
+// memory as FP32), the tile's maxima are reduced through subgroup ops and
+// shared memory, and each thread then accumulates its output columns over the
+// tile (V reads are coalesced across threads). The running sums stay
+// per-thread and are reduced once at the end. SPLIT = 0 writes O; SPLIT = 1
+// writes the unnormalised partial and its (max, sum) for fa_combine.comp.
+//
+// A key whose weight is zero contributes nothing even if its V row holds
+// NaN (masked cache slots may be uninitialised). MASKPOS: masked decode with a
+// window, where the query sits at the highest valid key of the mask.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const uint HD = 128;
+layout(constant_id = 1) const uint G = 1;        // query heads per workgroup (divides group)
+layout(constant_id = 2) const uint MODE = 0;
+layout(constant_id = 3) const uint MASK = 0;
+layout(constant_id = 4) const uint SPLIT = 0;
+layout(constant_id = 5) const uint SOFTCAP = 0;
+layout(constant_id = 6) const uint VEC = 0;      // 16-byte K loads: aligned base, ldk, HD % 8 == 0
+layout(constant_id = 7) const uint MASKPOS = 0;
+
+#include "fa_common.glsl"
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer U4Buf { uvec4 v[]; };
+
+const uint WG = 128u;
+const uint TK = 128u;                    // keys per tile, one per thread
+const uint HDS = (HD + WG - 1u) / WG;    // output columns per thread
+const uint PB = 16u;                     // V rows in flight per thread (P V loop)
+const uint KB = 4u;                      // 8-element K chunks in flight per thread (scores)
+const uint NSMAX = 32u;                  // subgroups per workgroup at subgroup size >= 4
+
+shared float Qs[G * HD];
+shared float Ps[G * TK];
+shared float red[G * NSMAX];
+shared int posmax;
+
+// Elements [d, d + 8) of a row as floats; VEC only (d a multiple of 8).
+void load8(uint64_t base, uint idx, out float f[8]) {
+    if (DT == DT_F32) {
+        const uvec4 a = U4Buf(base).v[idx / 4u], b = U4Buf(base).v[idx / 4u + 1u];
+        [[unroll]] for (uint i = 0; i < 4; ++i) { f[i] = uintBitsToFloat(a[i]); f[4 + i] = uintBitsToFloat(b[i]); }
+    } else {
+        const uvec4 w = U4Buf(base).v[idx / 8u];
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            if (DT == DT_F16) {
+                const vec2 p = unpackHalf2x16(w[i]);
+                f[2 * i] = p.x;
+                f[2 * i + 1] = p.y;
+            } else {
+                f[2 * i] = uintBitsToFloat(w[i] << 16);
+                f[2 * i + 1] = uintBitsToFloat(w[i] & 0xffff0000u);
+            }
+        }
+    }
+}
+
+// Workgroup maximum of v[g] for every g (all threads get the results).
+void wg_max(inout float v[G]) {
+    [[unroll]] for (uint g = 0; g < G; ++g) {
+        const float s = subgroupMax(v[g]);
+        if (subgroupElect()) red[g * NSMAX + gl_SubgroupID] = s;
+    }
+    barrier();
+    [[unroll]] for (uint g = 0; g < G; ++g) {
+        float t = red[g * NSMAX];
+        for (uint i = 1; i < gl_NumSubgroups; ++i) t = max(t, red[g * NSMAX + i]);
+        v[g] = t;
+    }
+    barrier();
+}
+
+void wg_sum(inout float v[G]) {
+    [[unroll]] for (uint g = 0; g < G; ++g) {
+        const float s = subgroupAdd(v[g]);
+        if (subgroupElect()) red[g * NSMAX + gl_SubgroupID] = s;
+    }
+    barrier();
+    [[unroll]] for (uint g = 0; g < G; ++g) {
+        float t = 0.0;
+        for (uint i = 0; i < gl_NumSubgroups; ++i) t += red[g * NSMAX + i];
+        v[g] = t;
+    }
+    barrier();
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint s = gl_WorkGroupID.x, nsplit = gl_NumWorkGroups.x;
+    const uint row = gl_WorkGroupID.y + pc.qb0;
+    const uint h0 = gl_WorkGroupID.z * G, hk = h0 / pc.group;
+    const uint koff = hk * HD;
+
+    uint lo, hi;
+    fa_interval(row, lo, hi);
+    if (MASKPOS != 0) {
+        // Masked decode with a window: the query's position is the last valid key.
+        if (tid == 0u) posmax = -1;
+        barrier();
+        int p = -1;
+        for (uint k = tid; k < pc.lk; k += WG) if (F32Buf(pc.mask).v[k] > 0.5) p = int(k);
+        p = subgroupMax(p);
+        if (subgroupElect()) atomicMax(posmax, p);
+        barrier();
+        const int pm = posmax;
+        lo = pm >= 0 ? uint(max(0, pm - int(pc.window) + 1)) : 0u;
+        hi = pc.lk;
+    }
+    const uint a = lo + s * pc.chunk;
+    const uint b = min(hi, a + pc.chunk);
+
+    for (uint i = tid; i < G * HD; i += WG) {
+        Qs[i] = load_elem(DT, pc.q, row * pc.ldq + (h0 + i / HD) * HD + i % HD);
+    }
+    barrier();
+
+    float m[G], lpart[G], acc[G * HDS];
+    [[unroll]] for (uint g = 0; g < G; ++g) { m[g] = -1e30; lpart[g] = 0.0; }
+    [[unroll]] for (uint i = 0; i < G * HDS; ++i) acc[i] = 0.0;
+
+    for (uint t0 = a; t0 < b; t0 += TK) {
+        const uint key = t0 + tid;
+        const bool ok = key < b && (MASK == 0 || F32Buf(pc.mask).v[key] > 0.5);
+        float sc[G];
+        [[unroll]] for (uint g = 0; g < G; ++g) sc[g] = 0.0;
+        if (ok) {
+            const uint kb = key * pc.ldk + koff;
+            if (VEC != 0) {
+                for (uint d0 = 0; d0 < HD; d0 += 8u * KB) {
+                    float f[KB][8];
+                    [[unroll]] for (uint c = 0; c < KB; ++c) load8(pc.k, kb + min(d0 + 8u * c, HD - 8u), f[c]);
+                    [[unroll]] for (uint c = 0; c < KB; ++c) {
+                        const uint d = d0 + 8u * c;
+                        if (d < HD) {
+                            [[unroll]] for (uint g = 0; g < G; ++g)
+                                [[unroll]] for (uint e = 0; e < 8; ++e) sc[g] += Qs[g * HD + d + e] * f[c][e];
+                        }
+                    }
+                }
+            } else {
+                for (uint d = 0; d < HD; ++d) {
+                    const float kv = load_elem(DT, pc.k, kb + d);
+                    [[unroll]] for (uint g = 0; g < G; ++g) sc[g] += Qs[g * HD + d] * kv;
+                }
+            }
+        }
+        [[unroll]] for (uint g = 0; g < G; ++g) {
+            float v = sc[g] * pc.scale;
+            if (SOFTCAP != 0) v = pc.softcap * bt_tanh(v / pc.softcap);
+            sc[g] = ok ? v : -1e30;
+        }
+        float tm[G];
+        [[unroll]] for (uint g = 0; g < G; ++g) tm[g] = sc[g];
+        wg_max(tm);
+        float alpha[G];
+        [[unroll]] for (uint g = 0; g < G; ++g) {
+            const float mnew = max(m[g], tm[g]);
+            alpha[g] = exp(m[g] - mnew);
+            const float p = ok ? exp(sc[g] - mnew) : 0.0;
+            Ps[g * TK + tid] = p;
+            lpart[g] = lpart[g] * alpha[g] + p;
+            m[g] = mnew;
+        }
+        barrier();
+        // Batches of PB keys: all PB loads are issued before any is used
+        // (a load consumed where it is issued stalls the loop on its
+        // latency); keys past the tile load the last valid row, weight 0.
+        const uint n = min(TK, b - t0);
+        [[unroll]] for (uint j = 0; j < HDS; ++j) {
+            const uint d = tid + j * WG;
+            if (d < HD) {
+                [[unroll]] for (uint g = 0; g < G; ++g) acc[g * HDS + j] *= alpha[g];
+                for (uint t = 0; t < n; t += PB) {
+                    float v[PB];
+                    [[unroll]] for (uint u = 0; u < PB; ++u)
+                        v[u] = load_elem(DT, pc.v, (t0 + min(t + u, n - 1u)) * pc.ldk + koff + d);
+                    [[unroll]] for (uint u = 0; u < PB; ++u) {
+                        [[unroll]] for (uint g = 0; g < G; ++g) {
+                            const float p = Ps[g * TK + t + u];
+                            acc[g * HDS + j] += p != 0.0 ? p * v[u] : 0.0;
+                        }
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+
+    wg_sum(lpart);
+    [[unroll]] for (uint g = 0; g < G; ++g) {
+        const uint h = h0 + g;
+        if (SPLIT == 0) {
+            const float inv = lpart[g] > 0.0 ? 1.0 / lpart[g] : 0.0;
+            [[unroll]] for (uint j = 0; j < HDS; ++j) {
+                const uint d = tid + j * WG;
+                if (d < HD) store_elem(DT, pc.o, row * pc.ldo + h * HD + d, acc[g * HDS + j] * inv);
+            }
+        } else {
+            const uint e = ((row * pc.hq + h) * nsplit + s) * (HD + 2u);
+            [[unroll]] for (uint j = 0; j < HDS; ++j) {
+                const uint d = tid + j * WG;
+                if (d < HD) F32Buf(pc.part).v[e + d] = acc[g * HDS + j];
+            }
+            if (tid == 0u) {
+                F32Buf(pc.part).v[e + HD] = m[g];
+                F32Buf(pc.part).v[e + HD + 1u] = lpart[g];
+            }
+        }
+    }
+}

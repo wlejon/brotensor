@@ -16,7 +16,17 @@ and without beta, FP16, with caches, both backwards), RMSNorm, per-head L2 norm,
 pixel norm, softmax (masked vector, rows, backward), every RoPE variant
 (`rope_forward/backward`, `rope_apply`, `_backward`, `_perhead`,
 `rope_qkv_packed_inplace`, `rope_apply_mrope`), SwiGLU / GeGLU forward and
-backward, `modulate` and `broadcast_mul`. The backend is never the default device. To select it, use
+backward, `modulate` and `broadcast_mul`, and the attention family (chunk 3):
+`flash_attention_forward`, `_gqa`, `_windowed`, `_varlen`, `_packed_qkv`, the
+decode ops over a KV cache (`flash_attention_decode`, `_decode_masked`,
+`kv_cache_append`), the projection-fused `flash_attention_qkvo_forward`,
+`_project_kv`, `_q_with_kv_cached_forward`, the materialised-probability
+attentions (`self_attention_bias_forward`, `cross_attention_forward`,
+`_with_attn`, `mha_forward`, `self_attention_forward(_train)`),
+`rel_pos_bias_xl_forward`, `top_k_rows`, `segment_softmax_stats` and the
+softmax cross-entropies (`softmax_xent`, `_fused`, `_fused_batched`). Attention
+backwards and the INT8-weight attention variants are not implemented yet.
+The backend is never the default device. To select it, use
 `set_default_device(Device::vulkan(i))`, a `DeviceScope`, or
 `BROTENSOR_DEFAULT_DEVICE=vulkan` (also `vk`, `vulkan:1`). Any other op throws
 "not implemented on vulkan".
@@ -52,15 +62,22 @@ src/vulkan/
   graph.cpp                     VulkanGraph / VulkanGraphCapture, Event
   register.cpp                  probe + vtable fill + public stats
   detail/gemm.h, gemm.cpp       the GEMM dispatcher every matrix op goes through
+  detail/attention.h            the attention dispatcher (ops_attention.cpp) and dense path
   ops_*.cpp                     ops, one file per family, each with a fill_vulkan_vtable_<family>
-                                (elementwise, copy, reduce, linear, norm, rope, glu)
+                                (elementwise, copy, reduce, linear, norm, rope, glu, attention,
+                                attention_proj, topk, xent; ops_attention_dense.cpp is the
+                                materialised path the others call)
   shaders/                      *.comp kernels, common.glsl, gemm_common.glsl, op_codes.h,
                                 shaders.cmake (the list)
-tests/test_vulkan.cpp           runtime; main(), --only=ops|gemm|norm, --bench-gemm
+tests/test_vulkan.cpp           runtime; main(), --only=ops|gemm|norm|attention, --bench-gemm,
+                                --bench-attention
 tests/test_vulkan_ops.cpp       chunk-1 op parity
 tests/test_vulkan_gemm.cpp      matmul / linear parity, every kernel path
 tests/test_vulkan_norm.cpp      norms, softmax, RoPE, GLUs parity
+tests/test_vulkan_attention.cpp flash family, decode, kv cache parity, every attention path
+tests/test_vulkan_attention_ops.cpp  fused / materialised attentions, top-k, segment stats, xent
 tests/test_vulkan_bench.cpp     GEMM / GEMV throughput (not in ctest)
+tests/test_vulkan_bench_attention.cpp  attention throughput (not in ctest)
 tests/test_vulkan_common.h
 ```
 
@@ -244,6 +261,107 @@ exact. `rope_qkv_packed_inplace` leaves a row whose position is outside the
 table untouched rather than reading past it; M-RoPE positions are not
 range-checked (device pointers, as on CUDA / HIP).
 
+## Attention
+
+Every attention op builds an `AttnProblem` (`detail/attention.h`): lq query
+rows, lk key rows, hq query heads over hkv KV heads (GQA), head width hd,
+row strides for Q, K / V and O, and a mode that gives each query row its own
+key interval [lo, hi) (`fa_common.glsl`): q_offset + causal / window over
+[0, lk) (with an optional key mask), `cu_seqlens_q` / `_k` (varlen, causal
+within a sequence), or per-row `seq_bounds` (packed QKV, band window).
+Device-resident tables are clamped to [0, lk], so a malformed table cannot
+read outside K. `attention()` picks one of three paths:
+
+| Path | When | What |
+|---|---|---|
+| `fa_cm.comp` | FP16 / BF16, `coopmat_f16`, more than 4 query rows, hd <= 256 | flash attention on 16x16x16 fragments, FP32 scores and accumulation |
+| `fa_rows.comp` (+ `fa_combine.comp`) | at most 4 query rows (decode), FP32, no cooperative matrix, soft-capping, masked decode | one query row per workgroup, the G query heads of one KV head together, keys split across workgroups |
+| dense (`ops_attention_dense.cpp`) | bidirectional, unwindowed mode-0 problems on the paths above that do not take them (FP32 with lq, lk >= 64; hd > 256) | S = Q K^T (FP32) through `gemm()`, `attn_softmax.comp`, O = P V through `gemm()` |
+
+**`fa_cm.comp`.** One workgroup is BR = 16 NSG query rows of one head; per
+block of BC keys, S = Q K^T goes through shared memory (FP32), two lanes per
+row run the online softmax and write P as FP16, the accumulator is rescaled
+through the "row index" fragment (a 16x16 accumulator-layout matrix of row
+numbers, loaded once, which tells each lane which row each of its elements
+is in; KHR cooperative matrix does not say) and O += P V. The spike's kernel
+(`../vk-spike/shaders/fa_cm.comp`) with these changes: the GEMM's first rule
+(the next K / V block is loaded into registers before the current block's
+math and stored to shared memory after it, unconditional clamped loads with a
+validity bit when `VEC`), per-row key intervals (the workgroup walks the
+union of its rows' intervals; causal blocks above the diagonal are never
+loaded), a key-mask stage in shared memory, GQA by head index, the head
+padded to 16 * ceil(hd / 16) columns of zeros (any width: 40, 33, 160...),
+BF16 converted to FP16 at the shared-memory store (the dtype policy), late
+query blocks dispatched first (causal balance), and split keys when the query
+blocks alone would not fill the GPU (a few query blocks over a long cache:
+workgroup z takes a slice of the keys and writes its unnormalised rows and
+(max, sum) in `fa_rows`' partial layout for `fa_combine.comp`). Interior
+query blocks with FP16 output and hd % 16 == 0 store straight from the
+accumulator (`DIRECT`, a specialisation, as in the GEMM); the last partial
+block, BF16 and odd widths use a per-subgroup scratch aliasing S.
+Tiles (BC keys x NSG subgroups): (16, 2) for hd <= 96 and > 128, (32, 4) for
+hd 128, measured; `BROTENSOR_VK_FA_CFG=bc,nsg` forces one. Shared memory is
+8-31 KiB at those tiles, and every array length is a specialisation-constant
+expression the pipeline guard checks (a forced 64-key tile at hd 256 is
+refused there, not in the driver).
+
+**`fa_rows.comp`.** Each thread scores one key of a 128-key tile against the
+G (<= 16) queries staged in shared memory, so K is read once for the whole
+GQA group; tile maxima go through subgroup ops and shared memory, the
+running sums stay per thread until the end, and P V streams V rows 16 at a
+time per thread (all loads issued before use; consuming each load where it
+was issued made the loop latency-bound, 2-4x slower). Keys are split across
+workgroups until the grid has `BROTENSOR_VK_FA_WGS` (default 80) workgroups:
+a long cache streams best in a few long splits (160 and more lost 5-30% at
+16k-32k keys). A key whose weight is zero contributes nothing even when its V
+row is NaN (masked decode over a fixed-capacity cache).
+
+**Dense path.** Q, K, V and O are addressed in place through the GEMM's
+leading dimensions and batch strides (head h is a batch stride of hd), GQA
+one KV head at a time with K / V broadcast (batch stride 0) over its group.
+Scores are FP32 before the max subtraction (`gemm()` takes 16-bit operands
+with an FP32 result through the SIMT kernel), as on HIP; passes of heads,
+then of query rows, keep the scores under 256 MiB. It is also the engine of
+the projection-fused ops below.
+
+**Projection-fused ops** (`ops_attention_proj.cpp`): `self_attention_bias_forward`,
+`cross_attention_forward(_with_attn)`, `mha_forward`,
+`self_attention_forward(_train)` keep Q, K, V, scores, probabilities and the
+per-head outputs in FP32 whatever X's dtype (the CUDA contract for these
+ops); O and AttnAvg come out in X's dtype through `attn_aux.comp`, which also
+applies the query gating. `flash_attention_qkvo_forward`, `_project_kv` and
+`_q_with_kv_cached_forward` project in the activations' dtype (HIP's
+contract) and call the flash path. `rel_pos_bias_xl_forward` is one batched
+GEMM over all 2T-1 positions plus a strided copy (the rel shift is a row
+pitch of 2T-2).
+
+Measured with `brotensor_test_vulkan --bench-attention` (FP16, wall clock
+around back-to-back calls, median of 7 batches, one shape per process:
+`BROTENSOR_VK_BENCH_PART=prefill|causal|decode`,
+`BROTENSOR_VK_BENCH_SHAPE=<tag>`; HIP is the HIP backend's same public op in
+the same process, `BROTENSOR_VK_BENCH_NOHIP=1` skips it; spike figures from
+`../vk-spike/RESULTS.md`), ms / TF/s:
+
+| Shape (L, heads, hd) | spike | Vulkan | HIP | vs spike | vs HIP |
+|---|---|---|---|---|---|
+| 542, 48, 128 | 0.58 | 0.520 / 13.9 | 3.02 / 2.4 | 1.11 | 5.8 |
+| 1024, 32, 128 | 1.29 | 1.114 / 15.4 | 6.11 / 2.8 | 1.16 | 5.5 |
+| 4096, 24, 128 | 16.1 | 13.05 / 15.8 | 57.4 / 3.6 | 1.23 | 4.4 |
+| 1024, 16, 64 | 0.43 | 0.306 / 14.1 | 1.93 / 2.2 | 1.41 | 6.3 |
+| 4096, 16, 64 | 5.41 | 4.553 / 15.1 | 33.0 / 2.1 | 1.19 | 7.3 |
+| 4096, 24, 64 | 9.17 | 6.552 / 15.7 | 45.4 / 2.3 | 1.40 | 6.9 |
+| 1024, 16, 80 | - | 0.439 / 12.2 | 1.90 / 2.8 | - | 4.3 |
+| 4096, 16, 96 | - | 7.081 / 14.6 | 35.4 / 2.9 | - | 5.0 |
+| 1024, 16, 160 | - | 0.702 / 15.3 | 2.66 / 4.0 | - | 3.8 |
+| 2048, 8, 256 | - | 3.973 / 8.7 | 10.0 / 3.4 | - | 2.5 |
+
+Causal (TF/s counting half the flops): 9.8-15.5 TF/s for hd 64-160 (HIP's
+causal path is its scalar kernel, 0.05-0.17 TF/s, so 60-170x). Decode
+(`flash_attention_decode`, Lq = 1): 16 / 8 heads x 128 at 16k-32k keys reads
+the cache at 219-225 GB/s (86-88% of 256 GB/s; HIP 14 GB/s); a 4096-key cache
+fits the 32 MB Infinity Cache and shows 405 GB/s; 4-64 query rows over 16k
+keys take 0.50-0.61 ms (HIP 4.9-20.7 ms).
+
 ## Dtype policy
 
 - **FP32**: native.
@@ -264,6 +382,10 @@ range-checked (device pointers, as on CUDA / HIP).
   activation that reaches a GEMM goes through the same `cast` first. The GEMM
   chunk may add an FP32 SIMT path for BF16 values outside FP16's range (±65504).
   It must not grow a native BF16 coopmat path, because the hardware has none.
+  Attention follows the same rule inside the kernel: `fa_cm.comp` converts BF16
+  Q / K / V to FP16 as it stages them (a BF16 value beyond ±65504 becomes inf)
+  and writes O back as BF16; `fa_rows.comp` computes BF16 in FP32, and the
+  dense path keeps its scores in FP32 while its P V GEMM follows the GEMM's rule.
 - **INT8 / INT32**: storage carriers only (8-bit storage is enabled). There is
   no FP8.
 
@@ -322,6 +444,9 @@ to divide 64; the dispatcher checks).
 | `BROTENSOR_VK_ALLOW_OVERSIZE=1` | allow tensors over the per-buffer limit (out of spec) |
 | `BROTENSOR_VK_NO_COOPMAT=1` | do not use cooperative matrix (the GEMMs run the SIMT kernel) |
 | `BROTENSOR_VK_GEMM_CFG=bm,bn,bk,wm,wn` | force one cooperative-matrix tile (one of the four in `gemm.cpp`) |
+| `BROTENSOR_VK_FA_CFG=bc,nsg` | force the `fa_cm` tile: bc in {16, 32, 64} keys, nsg in {1, 2, 4} subgroups, 16 nsg <= 2 bc |
+| `BROTENSOR_VK_FA_WGS=n` | workgroups `fa_rows` splits keys up to (default 80) |
+| `BROTENSOR_VK_FA_PATH=rows\|cm\|dense` | force an attention path where it applies (benchmarking) |
 
 Vulkan validation layers were not installed on the development machine, so
 the backend has not been run under them.

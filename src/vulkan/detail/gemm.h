@@ -21,7 +21,9 @@ namespace brotensor::detail::vulkan {
 struct GemmArgs {
     std::uint64_t a = 0, b = 0, c = 0, bias = 0;   // device addresses; bias 0 = none
     ::brotensor::Dtype da = ::brotensor::Dtype::FP32, db = ::brotensor::Dtype::FP32,
-                       dc = ::brotensor::Dtype::FP32;   // the bias shares dc
+                       dc = ::brotensor::Dtype::FP32;   // the bias shares dc, except for 16-bit
+                                                         // operands with an FP32 result, where it
+                                                         // shares da (SIMT)
     int m = 0, n = 0, k = 0;     // n: columns of the pre-epilogue result r (= rows of B in NT)
     int lda = 0, ldb = 0, ldc = 0;
     bool ta = false;             // A stored (K, M)

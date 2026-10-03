@@ -1,0 +1,91 @@
+#version 460
+// The dense attention path's row softmax (ops_attention_dense.cpp):
+//   P[r, k] = softmax_k(scale * S[r, k] + bias[h * bhs + q * lk + k])
+// over the keys with mask[k] valid, S FP32 (from a GEMM), P in DTP (FP32 may
+// alias S: every element is read before it is written, by the same thread).
+// Row r of the dispatch is query q = q0 + r % lq of head h = h0 + r / lq
+// (bhs: the bias's head stride, 0 when the heads share one). A row
+// without a valid key, or whose query is masked out (QMASK), is all zero.
+// One workgroup per row (grid-stride), subgroup-size agnostic.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint BIAS = 0;
+layout(constant_id = 1) const uint MASK = 0;
+layout(constant_id = 2) const uint QMASK = 0;
+layout(constant_id = 3) const uint MASK_GE = 0;   // valid = mask >= 0.5 (else > 0.5)
+layout(push_constant) uniform PC {
+    uint64_t s, p, bias, mask, qmask;
+    uint rows, lk, lq, h0, lds, ldp, q0, bhs;
+    float scale;
+} pc;
+
+shared float red[64];
+
+bool valid(uint64_t m, uint i) {
+    const float v = F32Buf(m).v[i];
+    return MASK_GE != 0 ? v >= 0.5 : v > 0.5;
+}
+
+float block_max(float v) {
+    v = subgroupMax(v);
+    if (subgroupElect()) red[gl_SubgroupID] = v;
+    barrier();
+    float t = red[0];
+    for (uint i = 1; i < gl_NumSubgroups; ++i) t = max(t, red[i]);
+    barrier();
+    return t;
+}
+
+float block_sum(float v) {
+    v = subgroupAdd(v);
+    if (subgroupElect()) red[gl_SubgroupID] = v;
+    barrier();
+    float t = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) t += red[i];
+    barrier();
+    return t;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint r = gl_WorkGroupID.x; r < pc.rows; r += gl_NumWorkGroups.x) {
+        const uint q = pc.q0 + r % pc.lq, h = pc.h0 + r / pc.lq;
+        const uint so = r * pc.lds, po = r * pc.ldp;
+        const uint bo = h * pc.bhs + q * pc.lk;
+        const bool row_ok = QMASK == 0 || valid(pc.qmask, q);
+        float mx = -1e30;
+        if (row_ok) {
+            for (uint k = tid; k < pc.lk; k += 256u) {
+                if (MASK != 0 && !valid(pc.mask, k)) continue;
+                float x = F32Buf(pc.s).v[so + k] * pc.scale;
+                if (BIAS != 0) x += F32Buf(pc.bias).v[bo + k];
+                mx = max(mx, x);
+            }
+        }
+        mx = block_max(mx);
+        const bool empty = mx <= -1e29;
+        float sum = 0.0;
+        if (!empty) {
+            for (uint k = tid; k < pc.lk; k += 256u) {
+                if (MASK != 0 && !valid(pc.mask, k)) continue;
+                float x = F32Buf(pc.s).v[so + k] * pc.scale;
+                if (BIAS != 0) x += F32Buf(pc.bias).v[bo + k];
+                sum += exp(x - mx);
+            }
+        }
+        sum = block_sum(sum);
+        const float inv = (!empty && sum > 0.0) ? 1.0 / sum : 0.0;
+        for (uint k = tid; k < pc.lk; k += 256u) {
+            float pv = 0.0;
+            if (!empty && (MASK == 0 || valid(pc.mask, k))) {
+                float x = F32Buf(pc.s).v[so + k] * pc.scale;
+                if (BIAS != 0) x += F32Buf(pc.bias).v[bo + k];
+                pv = exp(x - mx) * inv;
+            }
+            store_elem(DTP, pc.p, po + k, pv);
+        }
+    }
+}

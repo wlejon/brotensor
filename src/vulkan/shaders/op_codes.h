@@ -100,4 +100,14 @@
 #define ROPE_PACKED     3    // in place over Q and K of (L, 3 D), tables indexed by pos[row]
 #define ROPE_MROPE      4    // three tables / position streams over sub-ranges of the pairs
 
+// fa_cm.comp / fa_rows.comp: how a query row's key interval is found
+// (fa_common.glsl fa_interval)
+#define FA_MODE_ROWS    0    // q_offset + causal / window over [0, lk)
+#define FA_MODE_VARLEN  1    // cu_seqlens_q / cu_seqlens_k (+ causal within the sequence)
+#define FA_MODE_PACKED  2    // per-row seq_bounds (+ |q - k| <= window / 2)
+
+// attn_aux.comp
+#define AUX_ROW_GATE    0    // y[r, c] = mask[r] >= 0.5 ? x[r, c] : 0 (FP32 x, y in DT)
+#define AUX_HEAD_MEAN   1    // y[i] = mean_h x[h * n + i]
+
 #endif

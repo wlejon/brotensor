@@ -91,6 +91,11 @@ ShaderId simt_shader(const GemmArgs& g) {
     if (g.da == g.db && g.dc == g.da) return dt_variant(ShaderId::gemm_simt_f32, g.da, g.op);
     if (g.da == Dtype::FP32 && g.dc == Dtype::FP32 && g.db == Dtype::FP16) return ShaderId::gemm_simt_f32_w16;
     if (g.da == Dtype::FP32 && g.dc == Dtype::FP32 && g.db == Dtype::BF16) return ShaderId::gemm_simt_f32_wbf16;
+    // 16-bit operands, FP32 result (attention scores, FP32 projections): the
+    // GLU pass's variants. Their bias is in the operands' dtype (gemm.h).
+    if (g.da == g.db && is16(g.da) && g.dc == Dtype::FP32) {
+        return g.da == Dtype::FP16 ? ShaderId::gemm_simt_f16_c32 : ShaderId::gemm_simt_bf16_c32;
+    }
     return ShaderId::kCount;
 }
 

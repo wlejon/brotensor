@@ -65,8 +65,8 @@ void test_registration(bool expect_default_vulkan) {
     // An op the backend does not implement names the device.
     bool named = false;
     try {
-        Tensor vals, idx;
-        brotensor::top_k_rows(a, 1, vals, idx);
+        Tensor dq, dk, dv;   // attention backwards: not on Vulkan yet
+        brotensor::flash_attention_backward(a, a, a, a, a, nullptr, 1, false, dq, dk, dv);
     } catch (const std::exception& e) {
         named = std::string(e.what()).find("vulkan") != std::string::npos;
     }
@@ -336,11 +336,12 @@ void test_graph() {
 }  // namespace vkt
 
 int main(int argc, char** argv) {
-    bool expect_default_vulkan = false, bench = false, only = false;
+    bool expect_default_vulkan = false, bench = false, bench_attn = false, only = false;
     std::string filter;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--expect-default-vulkan") == 0) expect_default_vulkan = true;
         if (std::strcmp(argv[i], "--bench-gemm") == 0) bench = true;
+        if (std::strcmp(argv[i], "--bench-attention") == 0) bench_attn = true;
         if (std::strncmp(argv[i], "--only=", 7) == 0) { only = true; filter = argv[i] + 7; }
     }
     brotensor::init();
@@ -353,10 +354,15 @@ int main(int argc, char** argv) {
             vkt::run_gemm_bench();
             return 0;
         }
-        if (only) {   // --only=ops|gemm|norm: one op group, for iterating on a kernel
+        if (bench_attn) {
+            vkt::run_attention_bench();
+            return 0;
+        }
+        if (only) {   // --only=ops|gemm|norm|attention: one op group, for iterating on a kernel
             if (filter == "ops") vkt::run_op_tests();
             if (filter == "gemm") vkt::run_gemm_tests();
             if (filter == "norm") vkt::run_norm_tests();
+            if (filter == "attention") vkt::run_attention_tests();
             std::printf("%s: %d failure(s)\n", vkt::failures() ? "FAILED" : "OK", vkt::failures());
             return vkt::failures() ? 1 : 0;
         }
@@ -370,6 +376,7 @@ int main(int argc, char** argv) {
             vkt::run_op_tests();
             vkt::run_gemm_tests();
             vkt::run_norm_tests();
+            vkt::run_attention_tests();
         }
     } catch (const std::exception& e) {
         std::printf("  FAIL  uncaught exception: %s\n", e.what());
