@@ -75,7 +75,11 @@ before the bias, activation, GLU and accumulate. B is converted unscaled.
   GEMM itself when M is small. Weights are in range by construction; the
   activation-by-activation products (attention scores Q K^T, P V, Sana's
   S Q^T) have the large operand on the A side in every model measured.
-  Values past 65504 in B still become inf.
+  Values past 65504 in B still become inf. The flash-attention kernels stage
+  every BF16 operand this way, unscaled: the forward's Q / K / V (`fa_cm`)
+  and the cooperative-matrix backward's Q / K / V / dO (`fa_bwd_cm`, whose
+  P and dS also round to FP16); FP32 and `BROTENSOR_VK_NO_COOPMAT=1` keep
+  the backward on its FP32 FMA kernel.
 * FP16 A is not scaled (it cannot exceed the range), so the FP16 GEMM, its
   speed and its bits are unchanged.
 

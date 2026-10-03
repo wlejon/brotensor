@@ -134,6 +134,8 @@ set(BROTENSOR_VK_SHADERS
     "fa_bwd_f32|fa_bwd.comp|-DDT=0"
     "fa_bwd_f16|fa_bwd.comp|-DDT=1"
     "fa_bwd_bf16|fa_bwd.comp|-DDT=2"
+    "fa_bwd_cm_f16|fa_bwd_cm.comp|-DDT=1"
+    "fa_bwd_cm_bf16|fa_bwd_cm.comp|-DDT=2"
     "scatter_add_f32|scatter_add.comp|-DDT=0"
     "scatter_add_f16|scatter_add.comp|-DDT=1"
     "scatter_add_bf16|scatter_add.comp|-DDT=2"

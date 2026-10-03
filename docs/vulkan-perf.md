@@ -81,6 +81,22 @@ read): 195-239 GB/s at B = 1-8 on 4096-12288-wide weights (peak 256).
 Vulkan bidirectional prefill: 9.8-15.8 TF/s (the spike's shader: 0.77-1.33x
 of it). HIP's causal path does not skip masked tiles.
 
+**Flash attention backward, FP16** (`--bench-attention`, `BROTENSOR_VK_BENCH_PART=bwd`, ms / TF/s at 10 L^2 hd H flops)
+
+| Shape | HIP | Vulkan FMA (`fa_bwd`) | Vulkan coopmat (`fa_bwd_cm`) | coopmat / FMA |
+|---|---:|---:|---:|---:|
+| L512 h8 d64 | 3.20 | 0.646 / 2.08 | 0.182 / 7.4 | 3.5x |
+| L1024 h16 d64 | 22.6 | 4.56 / 2.35 | 1.38 / 7.8 | 3.3x |
+| L1024 h16 d64 causal | 12.0 | 2.49 / 2.15 | 0.78 / 6.9 | 3.2x |
+| L2048 h8 d128 causal | 45.0 | 13.9 / 1.55 | 3.6 / 5.9 | 3.9x |
+| L2048 h16 d64 | 99.1 | 17.2 / 2.50 | 4.85 / 8.9 | 3.5x |
+| L1024 h16 d128 | | 13.2 / 1.63 | 2.70 / 7.9 | 4.9x |
+
+The backward recomputes the scores in three dispatches (9 GEMM sweeps for the
+5 the flop count credits; no saved logsumexp, no atomics), each at 9-12 TF/s
+of executed matrix work (docs/vulkan-training.md). FP32 and heads wider than
+128 stay on the FMA kernel.
+
 **Convolution and spatial ops, FP16** (`--bench-conv`, throughput)
 
 | Op | HIP | Vulkan | Vulkan / HIP |
@@ -192,5 +208,5 @@ llama.cpp Vulkan 282 (0.68x); prefill 15.9k vs 14.6k tok/s (1.09x).
 | Where | HIP | Vulkan | Why |
 |---|---:|---:|---|
 | STFT / iSTFT, 30 s Whisper front end | 53 / 124 ms | 3.6 / 4.6 ms | not a loss against HIP; against the FP32 basis GEMM (0.20 / 0.23 ms) the FP64 direct DFT is 18-20x slower, the price of CPU-exact spectra (log-mel 0.025 -> 1e-6 vs the CPU) |
-| BF16 operands in matrix ops | | | the GEMM stages a BF16 A at a per-row power-of-two scale (range-safe, exact; docs/vulkan-bf16.md); B, flash attention's Q / K / V and the convolution's operands are still staged as plain FP16 (range 65504) |
+| BF16 operands in matrix ops | | | the GEMM stages a BF16 A at a per-row power-of-two scale (range-safe, exact; docs/vulkan-bf16.md); B, flash attention's Q / K / V (forward and backward: Q, K, V, dO) and the convolution's operands are still staged as plain FP16 (range 65504) |
 | Training backwards | | | 21 op-table slots still null on Vulkan (docs/vulkan-coverage.md); those paths have no Vulkan timing |

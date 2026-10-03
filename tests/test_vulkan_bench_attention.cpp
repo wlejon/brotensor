@@ -119,7 +119,7 @@ void bench_backward() {
     std::printf("%-26s %16s\n", "shape", "vulkan");
     struct B { int L, H, hd; bool causal; };
     const B shapes[] = {{512, 8, 64, false}, {1024, 16, 64, false}, {1024, 16, 64, true},
-                        {2048, 8, 128, true}, {2048, 16, 64, false}};
+                        {2048, 8, 128, true}, {2048, 16, 64, false}, {1024, 16, 128, false}};
     for (const B& s : shapes) {
         const int D = s.H * s.hd;
         const double flop = 10.0 * s.L * double(s.L) * s.hd * s.H * (s.causal ? 0.5 : 1.0);

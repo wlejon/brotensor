@@ -55,6 +55,16 @@ const char* attention_path(DeviceCtx& d, const AttnProblem& p);
 void set_attention_override(int mode);
 void set_attention_cm_config(int bc, int nsg);
 
+// The flash-attention backward (ops_fa_bwd.cpp) picks fa_bwd_cm.comp
+// (cooperative matrix: FP16 / BF16, `coopmat_f16`, head width <= 128) or
+// fa_bwd.comp (FMA, everything else). Test / benchmark hooks: the override
+// (0 = automatic, 1 = FMA, 2 = coopmat when eligible, 3 = coopmat without its
+// clustered-layout fast path; process-wide, ahead of
+// BROTENSOR_VK_FA_BWD_PATH=fma|cm) and the kernel the calling thread's last
+// backward core ran: "coopmat", "fma" or "" (none yet / empty problem).
+void set_fa_backward_override(int mode);
+const char* fa_backward_last_path();
+
 // The dense (materialised) path, also the engine of the projection-fused
 // ops: per head, S = scale * Q K^T (FP32) [+ bias], P = softmax over the
 // valid keys (rows with a masked query or no valid key are zero), O = P V.

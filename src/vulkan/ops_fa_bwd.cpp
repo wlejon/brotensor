@@ -1,9 +1,11 @@
 // Vulkan flash-attention backwards: flash_attention_backward,
 // flash_attention_varlen_backward, flash_attention_packed_qkv_backward and
-// the projection-fused flash_attention_qkvo_backward. One kernel pair
-// (shaders/fa_bwd.comp, docs/vulkan-training.md) does the attention
-// core of all four: recompute-based (O is not read), FP32 scores, softmax
-// statistics, dP and dS, no atomics.
+// the projection-fused flash_attention_qkvo_backward. Two kernels do the
+// attention core of all four (docs/vulkan-training.md), both recompute-based
+// (O is not read) with FP32 scores, softmax statistics, dP and dS and no
+// atomics: fa_bwd_cm.comp (cooperative matrix; FP16 / BF16, BF16 staged as
+// FP16 as in the forward, head width up to 128) and fa_bwd.comp (FMA; FP32,
+// wider heads, devices without cooperative matrix, BROTENSOR_VK_NO_COOPMAT=1).
 //
 // Contracts follow the CUDA backend (src/cuda/flash_attention_backward.cu,
 // flash_attention_packed_backward.cu, flash_attention.cu), widened to every
@@ -15,14 +17,18 @@
 // flash_attention_qkvo_backward composes the projections (dX / dCtx
 // overwritten, dW* / db* accumulated) around the core.
 
+#include "detail/attention.h"
 #include "detail/kernels.h"
 
 #include <brotensor/detail/dispatch.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <initializer_list>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
@@ -88,21 +94,64 @@ Cfg pick(Dtype dt, int hdp) {
 }
 
 constexpr int kMaxHd = 256;
+constexpr int kCmMaxHd = 128;   // dK + dV accumulators of a 128-wide head fill the registers
 
-void core(DeviceCtx& d, const BwdProblem& p) {
-    if (p.lq == 0 || p.lk == 0 || p.heads == 0 || p.hd == 0) return;
-    if (p.hd > kMaxHd) fail(p.op, "head_dim above 256 is not supported on Vulkan");
-    if (p.heads > 65535) fail(p.op, "too many heads");
-    const int hdp = (p.hd + 31) / 32 * 32;
-    const Cfg c = pick(p.dt, hdp);
-    const long long nstat = static_cast<long long>(p.heads) * p.lq * 4;
-    if (nstat > 0x7fffffffLL) fail(p.op, "problem too large");
-    Tensor stats = Tensor::empty_on(::brotensor::Device::vulkan(d.index()), static_cast<int>(nstat), 1, Dtype::FP32);
-    const ShaderId id = dt_variant(ShaderId::fa_bwd_f32, p.dt, p.op);
-    auto kernel = [&](std::uint32_t pass) -> const Kernel& {
-        return d.pipelines().get(id, {c.nt, static_cast<std::uint32_t>(p.hd), static_cast<std::uint32_t>(hdp), c.br,
-                                      c.bc, static_cast<std::uint32_t>(p.mode), p.mask ? 1u : 0u, pass});
-    };
+std::atomic<int> g_override{0};
+thread_local const char* t_last_path = "";
+
+std::uint64_t cdiv(std::uint64_t a, std::uint64_t b) { return (a + b - 1) / b; }
+
+bool use_cm(DeviceCtx& d, const BwdProblem& p) {
+    const bool eligible = d.info().coopmat_f16 && p.dt != Dtype::FP32 && p.hd <= kCmMaxHd;
+    static const int env_ov = [] {   // BROTENSOR_VK_FA_BWD_PATH=fma|cm (benchmarking)
+        const char* e = std::getenv("BROTENSOR_VK_FA_BWD_PATH");
+        const std::string s = e ? e : "";
+        return s == "fma" ? 1 : s == "cm" ? 2 : 0;
+    }();
+    int ov = g_override.load(std::memory_order_relaxed);
+    if (ov == 0) ov = env_ov;
+    return ov != 1 && eligible;
+}
+
+// Override 3: the coopmat kernel without its clustered-layout fast path.
+bool cm_agnostic() { return g_override.load(std::memory_order_relaxed) == 3; }
+
+// fa_bwd_cm.comp tiles per dispatch (statistics, dQ, dK / dV): subgroups
+// (16 own rows each), streamed rows per block, and whether the own rows' A
+// fragments stay in registers (areg 0 / 1, or 2 = automatic).
+// BROTENSOR_VK_FA_BWD_CFG=nsg,bn,areg x 3 (statistics, dQ, dK / dV) forces them.
+struct CmCfg { std::uint32_t nsg[3], bn[3], areg[3]; };
+
+CmCfg pick_cm(const BwdProblem& p) {
+    static const CmCfg forced = [] {
+        CmCfg c{{0, 0, 0}, {0, 0, 0}, {2, 2, 2}};
+        if (const char* e = std::getenv("BROTENSOR_VK_FA_BWD_CFG")) {
+            unsigned v[9] = {0, 0, 2, 0, 0, 2, 0, 0, 2};
+            if (std::sscanf(e, "%u,%u,%u,%u,%u,%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7],
+                            &v[8]) == 9)
+                c = {{v[0], v[3], v[6]}, {v[1], v[4], v[7]}, {v[2], v[5], v[8]}};
+        }
+        return c;
+    }();
+    CmCfg c = forced;
+    // Measured (docs/vulkan-training.md): 16-key / 16-query blocks; heads
+    // wider than 64 take 4 subgroups everywhere, 32-key blocks for the
+    // statistics and A fragments from shared memory for dQ and dK / dV (in
+    // registers next to the 128-wide accumulators they spill).
+    if (c.nsg[0] == 0) {
+        c = p.hd <= 64 ? CmCfg{{2, 2, 4}, {16, 16, 16}, {1, 1, 1}} : CmCfg{{4, 4, 4}, {32, 16, 16}, {1, 0, 0}};
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (c.areg[i] == 2) c.areg[i] = p.hd <= 64 ? 1 : 0;
+        if ((c.nsg[i] != 1 && c.nsg[i] != 2 && c.nsg[i] != 4) || (c.bn[i] != 16 && c.bn[i] != 32 && c.bn[i] != 64) ||
+            c.bn[i] > 32 * c.nsg[i] || c.areg[i] > 1) {
+            fail(p.op, "BROTENSOR_VK_FA_BWD_CFG: nsg in {1, 2, 4}, bn in {16, 32, 64}, bn <= 32 nsg, areg 0 / 1 / 2");
+        }
+    }
+    return c;
+}
+
+BwdPush make_push(const BwdProblem& p, const Tensor& stats) {
     BwdPush pc{};
     pc.q = p.q; pc.k = p.k; pc.v = p.v; pc.g = p.g;
     pc.mask = p.mask; pc.aux = p.aux; pc.aux2 = p.aux2;
@@ -117,8 +166,63 @@ void core(DeviceCtx& d, const BwdProblem& p) {
     pc.nseq = static_cast<std::uint32_t>(p.nseq);
     pc.oscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(p.hd)));
     pc.scale = static_cast<float>(1.4426950408889634 / std::sqrt(static_cast<double>(p.hd)));
-    const std::uint64_t nqb = (static_cast<std::uint64_t>(p.lq) + c.br - 1) / c.br;
-    const std::uint64_t nkb = (static_cast<std::uint64_t>(p.lk) + c.bc - 1) / c.bc;
+    return pc;
+}
+
+// The statistics (pass 0), then dQ (pass 2, query-major) and dK / dV (pass
+// 1, key-major), both reading them.
+void run_cm(DeviceCtx& d, const BwdProblem& p, const Tensor& stats) {
+    const CmCfg c = pick_cm(p);
+    const bool vec = p.hd % 8 == 0 && p.q % 16 == 0 && p.k % 16 == 0 && p.v % 16 == 0 && p.g % 16 == 0 &&
+                     p.ldq % 8 == 0 && p.ldk % 8 == 0 && p.ldg % 8 == 0;
+    const ShaderId id = p.dt == Dtype::FP16 ? ShaderId::fa_bwd_cm_f16 : ShaderId::fa_bwd_cm_bf16;
+    const std::uint32_t sd = static_cast<std::uint32_t>((p.hd + 15) / 16 * 2 + 1);   // staged row, uvec4
+    BwdPush pc = make_push(p, stats);
+    for (std::uint32_t pass : {0u, 2u, 1u}) {
+        const std::uint32_t i = pass == 0 ? 0 : pass == 2 ? 1 : 2;
+        const std::uint32_t nsg = c.nsg[i], bn = c.bn[i], bo = 16 * nsg;
+        const bool areg = c.areg[i] != 0;
+        // The shader's shared array lengths (SM uvec4, SF floats, SH halves).
+        const std::uint32_t nsm = 2 * (areg ? std::max(bo, bn) : bo + bn) * sd;
+        const std::uint32_t nsf = pass == 0 ? std::max(256 * nsg, 2 * bo * (bn + 4)) : 256 * nsg;
+        const std::uint32_t nsh = pass == 0 ? 1 : (pass == 1 ? 2 : 1) * bo * (bn + 8);
+        const std::uint32_t spec[] = {static_cast<std::uint32_t>(p.hd), nsg, 32 * nsg, bn,
+                                      static_cast<std::uint32_t>(p.mode), p.mask ? 1u : 0u, vec ? 1u : 0u, pass,
+                                      areg ? 1u : 0u, cm_agnostic() ? 1u : 0u, nsm, nsf, nsh};
+        const Kernel& k = d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)), 32);
+        const std::uint64_t n = cdiv(pass == 1 ? p.lk : p.lq, bo);
+        if (n > 65535) fail(p.op, "sequence too long for one dispatch");
+        pc.o0 = pass == 2 ? p.dq : p.dk;
+        pc.o1 = p.dv;
+        pc.ldo = static_cast<std::uint32_t>(pass == 1 ? p.ldk_out : p.ldq_out);
+        launch(d, k, pc, static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(p.heads));
+    }
+}
+
+void core(DeviceCtx& d, const BwdProblem& p) {
+    t_last_path = "";
+    if (p.lq == 0 || p.lk == 0 || p.heads == 0 || p.hd == 0) return;
+    if (p.hd > kMaxHd) fail(p.op, "head_dim above 256 is not supported on Vulkan");
+    if (p.heads > 65535) fail(p.op, "too many heads");
+    const long long nstat = static_cast<long long>(p.heads) * p.lq * 4;
+    if (nstat > 0x7fffffffLL) fail(p.op, "problem too large");
+    Tensor stats = Tensor::empty_on(::brotensor::Device::vulkan(d.index()), static_cast<int>(nstat), 1, Dtype::FP32);
+    if (use_cm(d, p)) {
+        t_last_path = "coopmat";
+        run_cm(d, p, stats);
+        return;
+    }
+    t_last_path = "fma";
+    const int hdp = (p.hd + 31) / 32 * 32;
+    const Cfg c = pick(p.dt, hdp);
+    const ShaderId id = dt_variant(ShaderId::fa_bwd_f32, p.dt, p.op);
+    auto kernel = [&](std::uint32_t pass) -> const Kernel& {
+        return d.pipelines().get(id, {c.nt, static_cast<std::uint32_t>(p.hd), static_cast<std::uint32_t>(hdp), c.br,
+                                      c.bc, static_cast<std::uint32_t>(p.mode), p.mask ? 1u : 0u, pass});
+    };
+    BwdPush pc = make_push(p, stats);
+    const std::uint64_t nqb = cdiv(p.lq, c.br);
+    const std::uint64_t nkb = cdiv(p.lk, c.bc);
     if (nqb > 65535 || nkb > 65535) fail(p.op, "sequence too long for one dispatch");
     // Pass 0: statistics + dQ, query-major.
     pc.o0 = p.dq;
@@ -313,6 +417,9 @@ void flash_attention_qkvo_backward(const Tensor& X, const Tensor* Ctx, const Ten
     add_inplace(dkv, gk);
     add_inplace(dkv, gv);
 }
+
+void set_fa_backward_override(int mode) { g_override.store(mode, std::memory_order_relaxed); }
+const char* fa_backward_last_path() { return t_last_path; }
 
 void fill_vulkan_vtable_fa_bwd(::brotensor::detail::OpsVTable& v) {
     v.flash_attention_backward = &vulkan::flash_attention_backward;

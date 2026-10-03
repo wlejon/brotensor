@@ -846,8 +846,9 @@ chunk 6.
 The training backwards (chunk 8: attention / MHA / self / cross attention,
 training BatchNorm, BCE; chunk 9: flash-attention backwards, GroupNorm /
 ResBlock backwards, scatter-adds, transposed-convolution, resample, pad and
-pool backwards, LSTM) are described in `docs/vulkan-training.md`, with their
-measured errors against the CPU and the flash backward's speed against HIP.
+pool backwards, LSTM; the flash backward's cooperative-matrix kernel
+`fa_bwd_cm.comp`) are described in `docs/vulkan-training.md`, with their
+measured errors against the CPU and the flash backward's speed.
 
 ## Trace JIT
 
@@ -985,12 +986,14 @@ to divide 64; the dispatcher checks).
 | `BROTENSOR_VK_BLOCK_MB=n` | sub-allocation block size (default 256) |
 | `BROTENSOR_VK_MAPPED=0` | do not map device memory even when possible |
 | `BROTENSOR_VK_ALLOW_OVERSIZE=1` | allow tensors over the per-buffer limit (out of spec) |
-| `BROTENSOR_VK_NO_COOPMAT=1` | do not use cooperative matrix (the GEMMs run the SIMT kernel) |
+| `BROTENSOR_VK_NO_COOPMAT=1` | do not use cooperative matrix (the GEMMs run the SIMT kernel, attention and its backward the FMA kernels) |
 | `BROTENSOR_VK_GEMM_NOSCALE=1` | stage a BF16 A as plain FP16 (the pre-scaling behaviour: past ±65504 becomes inf; comparison only) |
 | `BROTENSOR_VK_GEMM_CFG=bm,bn,bk,wm,wn` | force one cooperative-matrix tile (one of the four in `gemm.cpp`) |
 | `BROTENSOR_VK_FA_CFG=bc,nsg` | force the `fa_cm` tile: bc in {16, 32, 64} keys, nsg in {1, 2, 4} subgroups, 16 nsg <= 2 bc |
 | `BROTENSOR_VK_FA_WGS=n` | workgroups `fa_rows` splits keys up to (default 80) |
 | `BROTENSOR_VK_FA_PATH=rows\|cm\|dense` | force an attention path where it applies (benchmarking) |
+| `BROTENSOR_VK_FA_BWD_PATH=fma\|cm` | force the flash-attention backward's kernel (`cm` where eligible: FP16 / BF16, hd <= 128) |
+| `BROTENSOR_VK_FA_BWD_CFG=nsg,bn,areg,...` | force the `fa_bwd_cm` tiles: three (subgroups, streamed rows, A fragments in registers) triples for the statistics, dQ and dK / dV dispatches |
 | `BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn` | force the `conv_cm` tile (one of the six in `ops_conv.cpp`) |
 | `BROTENSOR_VK_QGEMV=lpr,unr,sg,nr` | force the quantised GEMV's lanes per row group, items in flight, subgroup size and rows per group |
 | `BROTENSOR_JIT_VULKAN=eager` / `BROTENSOR_JIT_STRICT=1` | replay traces op by op / make a trace-compiler failure throw (see Trace JIT) |
