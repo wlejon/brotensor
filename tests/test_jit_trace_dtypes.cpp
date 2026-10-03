@@ -533,7 +533,7 @@ void test_scalar_entry_fallback(Device dev) {
 void run_suite(Device dev, const char* label) {
     std::printf("\n=== %s ===\n", label);
     const bool gpu = !dev.is_cpu();
-    g_expect_fused = !dev.is_hip();
+    g_expect_fused = !dev.is_hip() && !dev.is_vulkan();
     std::vector<Dtype> dtypes{Dtype::FP32};
     if (gpu) {
         dtypes.push_back(Dtype::BF16);
@@ -574,8 +574,13 @@ int main() {
     } else if (brotensor::is_available(Device::hip())) {
         brotensor::set_default_device(Device::hip());
         run_suite(Device::hip(), "HIP (unfused replay)");
-    } else {
-        std::printf("[SKIP] no CUDA or HIP device; the typed and broadcast paths are GPU-only.\n");
+    } else if (!brotensor::is_available(Device::vulkan())) {
+        std::printf("[SKIP] no CUDA, HIP or Vulkan device; the typed and broadcast paths are GPU-only.\n");
+    }
+    // Vulkan has no trace compiler either: the same unfused replay as HIP.
+    if (brotensor::is_available(Device::vulkan())) {
+        brotensor::DeviceScope scope(Device::vulkan());
+        run_suite(Device::vulkan(), "Vulkan (unfused replay)");
     }
 
     std::printf("\n================================================================\n");

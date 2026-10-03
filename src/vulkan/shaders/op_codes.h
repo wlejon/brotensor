@@ -194,4 +194,30 @@
 #define SEL_MD              2
 #define SEL_COMMIT          3
 
+// misc.comp (spec constant 0): the chunk-6 small ops (ops_misc.cpp,
+// ops_vision.cpp)
+#define MI_MEAN_POOL        0    // y[j] = mean over valid rows of x[:, j]
+#define MI_MEAN_POOL_BWD    1    // dx[k, j] = valid(k) ? dy[j] / n_valid : 0
+#define MI_SLOT_MASK        2    // mask[k] = x[off + k stride] > 0.5
+#define MI_CAUSAL_ROW       3    // mask[k] = k <= q
+#define MI_THRESHOLD_U8     4    // y[i] = x[i] > t (INT8 0 / 1)
+#define MI_COUNT_ABOVE      5    // counts[r] = (#x > t_lo, #x > t_hi), one workgroup per row
+#define MI_XAVIER           6    // splitmix64 uniform in [-limit, limit]
+#define MI_SGD              7
+#define MI_ADAM             8
+#define MI_MSE_SAMPLE       9    // d = p - t, dp = d, loss = 0.5 d^2
+#define MI_MSE_BWD          10   // dp = (2 / n) (p - t)
+#define MI_MSE_SUM          11   // one workgroup: out[0] = sum (p - t)^2
+#define MI_MOMENTS          12   // attention_token_moments, one workgroup per key
+#define MI_BIAS_ACT         13   // StyleGAN3 bias_act
+#define MI_BIAS_ACT_BWD     14
+#define MI_BIAS_ACT_DB      15   // dB[c] += sum over (n, k) of the gradient, one workgroup per channel
+#define MI_UPFIRDN          16   // upfirdn2d
+#define MI_MODW             17   // modulated_conv2d's per-sample weights, one workgroup per (n, o)
+#define MI_COL2IM2D         18   // conv_transpose2d's overlap-add
+#define MI_DEFORM_COL       19   // deform_conv2d's bilinear im2col (no offsets: plain im2col)
+#define MI_MODW_BWD         20   // modulated_conv2d_backward: dw'' -> dw' through the demodulation
+#define MI_MODW_DS          21   // ds[n, i] = sum over (o, t) of dw'[n, o, i, t] W[o, i, t]
+#define MI_MODW_DW          22   // dW[o, j] += sum over n of dw'[n, o, j] s[n, j / kk]
+
 #endif

@@ -1,0 +1,83 @@
+#version 460
+// Gated delta rule (ops_delta.cpp), FP32: per head h and token t (FLA / HF
+// Qwen3.5 order, decay before the delta read),
+//   alpha = exp(-softplus(a_raw[t, h]) exp(log_A[h])), beta = sigmoid(beta_raw[t, h])
+//   u_v = alpha (S[v, :] . k_t), S[v, :] = alpha S[v, :] + beta (v_t[v] - u_v) k_t
+//   o_t[v] = S[v, :] . q_t
+// Every row v of a head's state evolves independently of the others, so a
+// group of LPR lanes owns one (head, row): the row stays in registers (NE
+// values per lane) for the whole token walk, both dot products are butterfly
+// sums over the lane group, and the state is read and written once per call.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint LPR = 32;   // lanes per row: a power of two <= the subgroup size
+layout(constant_id = 1) const uint NE = 4;     // ceil(d_k / LPR) <= 16
+
+layout(push_constant) uniform PC {
+    uint64_t q, k, v, a, b, loga, s, o;
+    uint L, H, dk, dv, ldq, ldv;
+} pc;
+
+float group_sum(float x) {
+    [[unroll]] for (uint off = LPR / 2u; off > 0u; off >>= 1u) x += subgroupShuffleXor(x, off);
+    return x;
+}
+
+float softplus(float x) {
+    const float e = exp(-abs(x));
+    return max(x, 0.0) + (e < 1e-4 ? e * (1.0 - 0.5 * e) : log(1.0 + e));
+}
+
+float sigmoid_s(float x) {
+    if (x >= 0.0) return 1.0 / (1.0 + exp(-x));
+    const float e = exp(x);
+    return e / (1.0 + e);
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x % LPR;
+    const uint row = gl_GlobalInvocationID.x / LPR;   // h * dv + v
+    if (row >= pc.H * pc.dv) return;
+    const uint h = row / pc.dv, vr = row % pc.dv;
+    const uint sbase = row * pc.dk;
+    float S[16];
+    [[unroll]] for (uint e = 0; e < 16u; ++e) {
+        const uint j = lane + e * LPR;
+        S[e] = (e < NE && j < pc.dk) ? F32Buf(pc.s).v[sbase + j] : 0.0;
+    }
+    const float expA = exp(F32Buf(pc.loga).v[h]);
+    for (uint t = 0; t < pc.L; ++t) {
+        const uint qb = t * pc.ldq + h * pc.dk;
+        float kv[16], qv[16];
+        float dot = 0.0;
+        [[unroll]] for (uint e = 0; e < 16u; ++e) {
+            const uint j = lane + e * LPR;
+            const bool ok = e < NE && j < pc.dk;
+            kv[e] = ok ? F32Buf(pc.k).v[qb + j] : 0.0;
+            qv[e] = ok ? F32Buf(pc.q).v[qb + j] : 0.0;
+            dot += S[e] * kv[e];
+        }
+        const float ar = F32Buf(pc.a).v[t * pc.H + h];
+        const float br = F32Buf(pc.b).v[t * pc.H + h];
+        const float alpha = exp(-softplus(ar) * expA);
+        const float beta = sigmoid_s(br);
+        dot = group_sum(dot) * alpha;
+        const float delta = F32Buf(pc.v).v[t * pc.ldv + h * pc.dv + vr] - dot;
+        const float sc = beta * delta;
+        float o = 0.0;
+        [[unroll]] for (uint e = 0; e < 16u; ++e) {
+            S[e] = alpha * S[e] + sc * kv[e];
+            o += S[e] * qv[e];
+        }
+        o = group_sum(o);
+        if (lane == 0u) F32Buf(pc.o).v[t * pc.ldv + h * pc.dv + vr] = o;
+    }
+    [[unroll]] for (uint e = 0; e < 16u; ++e) {
+        const uint j = lane + e * LPR;
+        if (e < NE && j < pc.dk) F32Buf(pc.s).v[sbase + j] = S[e];
+    }
+}

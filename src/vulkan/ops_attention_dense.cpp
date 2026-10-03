@@ -66,8 +66,17 @@ void dense_attention(DeviceCtx& d, const AttnProblem& p, const DenseExtras& x) {
     }
 
     const ShaderId sm_id = dt_variant(ShaderId::attn_softmax_f32, dt, p.op);
-    const Kernel& ks = d.pipelines().get(sm_id, {x.bias ? 1u : 0u, p.mask ? 1u : 0u, x.qmask ? 1u : 0u,
+    const bool rel = x.rel_h != 0;
+    if (rel && (p.mask || x.bias || x.grid_h <= 0 || x.grid_w <= 0 || x.grid_h > 0xffff || x.grid_w > 0xffff ||
+                x.grid_h * x.grid_w != p.lq)) {
+        throw std::runtime_error(std::string("brotensor: ") + p.op + ": bad decomposed rel-pos problem");
+    }
+    const Kernel& ks = d.pipelines().get(sm_id, {rel ? 2u : x.bias ? 1u : 0u, p.mask ? 1u : 0u, x.qmask ? 1u : 0u,
                                                  x.mask_ge ? 1u : 0u});
+    const std::uint64_t sm_bias = rel ? x.rel_h : x.bias, sm_mask = rel ? x.rel_w : p.mask;
+    const std::uint32_t sm_bhs = rel ? static_cast<std::uint32_t>(x.grid_w) | (static_cast<std::uint32_t>(x.grid_h) << 16)
+                                     : static_cast<std::uint32_t>(x.bias_hs < 0 ? static_cast<long long>(p.lq) * p.lk
+                                                                                 : x.bias_hs);
 
     auto pass = [&](int h0, int nh, int r0, int nr) {
         const std::uint64_t kv_off = static_cast<std::uint64_t>(h0 / group) * p.hd * es;
@@ -91,13 +100,12 @@ void dense_attention(DeviceCtx& d, const AttnProblem& p, const DenseExtras& x) {
         g.sc = nrk;
         gemm(d, g);
 
-        const SoftmaxPush sp{s_addr, p_addr, x.bias, p.mask, x.qmask,
+        const SoftmaxPush sp{s_addr, p_addr, sm_bias, sm_mask, x.qmask,
                              static_cast<std::uint32_t>(nh * nr), static_cast<std::uint32_t>(p.lk),
                              static_cast<std::uint32_t>(nr), static_cast<std::uint32_t>(h0),
                              static_cast<std::uint32_t>(p.lk), static_cast<std::uint32_t>(p.lk),
                              static_cast<std::uint32_t>(r0),
-                             static_cast<std::uint32_t>(x.bias_hs < 0 ? static_cast<long long>(p.lq) * p.lk : x.bias_hs),
-                             scale};
+                             sm_bhs, scale};
         launch(d, ks, sp, std::min<std::uint32_t>(65535, sp.rows));
 
         GemmArgs o;

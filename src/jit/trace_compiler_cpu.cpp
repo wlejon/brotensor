@@ -91,15 +91,16 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
 
     FusionPattern pattern = classify_dag(dag);
 
-    // Which compiler gets the DAG. CUDA has the PTX compiler; HIP has no
-    // trace compiler at all, and its DAG must never reach the CPU one (host
-    // code over device pointers, unordered against the HIP stream), so it is
-    // replayed op by op instead. Everything else is the CPU compiler's.
+    // Which compiler gets the DAG. CUDA has the PTX compiler; HIP and Vulkan
+    // have no trace compiler at all, and their DAGs must never reach the CPU
+    // one (host code over device pointers / addresses, unordered against the
+    // device stream), so they are replayed op by op instead. Everything else
+    // is the CPU compiler's.
     bool is_cuda = false;
-    bool is_hip = false;
+    bool is_hip = false;   // HIP or Vulkan: eager replay
     for (const auto& n : dag.nodes()) {
         if (n.device.is_cuda()) is_cuda = true;
-        if (n.device.is_hip()) is_hip = true;
+        if (n.device.is_hip() || n.device.is_vulkan()) is_hip = true;
     }
 
     const auto compile_t0 = std::chrono::steady_clock::now();
@@ -174,13 +175,13 @@ static void require_cpu_fusable(const TraceDAG& dag) {
 }
 
 // The emitted code dereferences every buffer on the host. CUDA and HIP
-// device pointers are not host addresses (on an APU a hipMalloc pointer
+// device pointers (and Vulkan buffer device addresses) are not host addresses (on an APU a hipMalloc pointer
 // happens to be readable, but the host code is still unordered against the
 // device stream that produces its inputs). Metal storage is
 // MTLResourceStorageModeShared, whose contents pointer is a host address.
 static void require_host_addressable(const TraceDAG& dag) {
     for (const TraceNode& n : dag.nodes()) {
-        if (n.device.is_cuda() || n.device.is_hip()) {
+        if (n.device.is_cuda() || n.device.is_hip() || n.device.is_vulkan()) {
             throw std::runtime_error(
                 "brotensor::jit: the CPU trace compiler was handed a " +
                 to_string(n.device) + " tensor; it only runs host-addressable memory");

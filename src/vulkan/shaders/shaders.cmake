@@ -119,5 +119,9 @@ set(BROTENSOR_VK_SHADERS
     "audio_bf16|audio.comp|-DDT=2"
     "dft|dft.comp|-DDT=0"
     "select|select.comp|-DDT=0"
+    "misc_f32|misc.comp|-DDT=0"
+    "misc_f16|misc.comp|-DDT=1"
+    "misc_bf16|misc.comp|-DDT=2"
+    "delta_rule|delta_rule.comp|"
     "test_shared_overflow|test_shared_overflow.comp|"
 )

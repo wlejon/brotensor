@@ -6,6 +6,10 @@
 // Row r of the dispatch is query q = q0 + r % lq of head h = h0 + r / lq
 // (bhs: the bias's head stride, 0 when the heads share one). A row
 // without a valid key, or whose query is masked out (QMASK), is all zero.
+// BIAS == 2 is SAM's decomposed relative position (ops_vision.cpp): `bias`
+// holds Bh (rows (h, q), 2 gh - 1) and `mask` Bw (2 gw - 1) as FP32, bhs is
+// gw | gh << 16, and the bias of key k is Bh[qh - kh + gh - 1] +
+// Bw[qw - kw + gw - 1]; MASK must be 0 then.
 // One workgroup per row (grid-stride), subgroup-size agnostic.
 #include "common.glsl"
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -49,6 +53,21 @@ float block_sum(float v) {
     return t;
 }
 
+float rel_bias(uint h, uint q, uint k) {
+    const uint gw = pc.bhs & 0xffffu, gh = pc.bhs >> 16;
+    const uint rq = h * gh * gw + q;
+    const int qh = int(q / gw), qw = int(q % gw), kh = int(k / gw), kw = int(k % gw);
+    return F32Buf(pc.bias).v[rq * (2u * gh - 1u) + uint(qh - kh + int(gh) - 1)] +
+           F32Buf(pc.mask).v[rq * (2u * gw - 1u) + uint(qw - kw + int(gw) - 1)];
+}
+
+float score(uint so, uint bo, uint h, uint q, uint k) {
+    float x = F32Buf(pc.s).v[so + k] * pc.scale;
+    if (BIAS == 1) x += F32Buf(pc.bias).v[bo + k];
+    if (BIAS == 2) x += rel_bias(h, q, k);
+    return x;
+}
+
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     for (uint r = gl_WorkGroupID.x; r < pc.rows; r += gl_NumWorkGroups.x) {
@@ -60,9 +79,7 @@ void main() {
         if (row_ok) {
             for (uint k = tid; k < pc.lk; k += 256u) {
                 if (MASK != 0 && !valid(pc.mask, k)) continue;
-                float x = F32Buf(pc.s).v[so + k] * pc.scale;
-                if (BIAS != 0) x += F32Buf(pc.bias).v[bo + k];
-                mx = max(mx, x);
+                mx = max(mx, score(so, bo, h, q, k));
             }
         }
         mx = block_max(mx);
@@ -71,9 +88,7 @@ void main() {
         if (!empty) {
             for (uint k = tid; k < pc.lk; k += 256u) {
                 if (MASK != 0 && !valid(pc.mask, k)) continue;
-                float x = F32Buf(pc.s).v[so + k] * pc.scale;
-                if (BIAS != 0) x += F32Buf(pc.bias).v[bo + k];
-                sum += exp(x - mx);
+                sum += exp(score(so, bo, h, q, k) - mx);
             }
         }
         sum = block_sum(sum);
@@ -81,9 +96,7 @@ void main() {
         for (uint k = tid; k < pc.lk; k += 256u) {
             float pv = 0.0;
             if (!empty && (MASK == 0 || valid(pc.mask, k))) {
-                float x = F32Buf(pc.s).v[so + k] * pc.scale;
-                if (BIAS != 0) x += F32Buf(pc.bias).v[bo + k];
-                pv = exp(x - mx) * inv;
+                pv = exp(score(so, bo, h, q, k) - mx) * inv;
             }
             store_elem(DTP, pc.p, po + k, pv);
         }

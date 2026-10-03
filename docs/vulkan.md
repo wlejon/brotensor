@@ -50,14 +50,31 @@ the INT8 W8A16 family (`linear_forward_batched_int8w_fp16`, `matmul_int8w_fp16`,
 `pad1d_forward` / `_backward`, `snake_forward` / `_backward`,
 `resample1d_forward` / `_backward`, `vq_encode_*`, `fsq_quantize_*`, the complex
 ops, `fft` / `ifft` / `rfft` / `irfft` (+ adjoints), `stft` / `istft` (+
-adjoints), `sample_logits(_into)` and `masked_diffusion_scores` / `_commit`:
-214 slots. Attention backwards, `conv2d_backward_weight`, the spatial
-backwards other than the ones named and the rest of the inference table
-(chunk 6) are not implemented yet.
+adjoints), `sample_logits(_into)` and `masked_diffusion_scores` / `_commit`, and the
+rest of the inference table (chunk 6): `embedding_lookup_forward`, masked
+mean pooling (+ backward), the slot / causal masks, `threshold_u8`,
+`rows_count_above`, `attention_token_moments`, the gated delta rule
+(`gated_delta_rule_step` / `_chunked`), SAM's decomposed-rel-pos attention
+(global and windowed), `deform_conv2d_forward`, StyleGAN3's `bias_act`,
+`upfirdn2d`, `modulated_conv2d` (forward and backward: GAN inversion runs
+one), `conv2d_backward_weight`, `attention_forward`,
+`cross_attention_forward_train`, `xavier_init`, `sgd_step`, `adam_step` and
+the MSE losses: 242 of 270 slots. The 28 null slots are training backwards
+(attention, LSTM, BatchNorm training, the spatial backwards not named), two
+host-only ops and filtered_lrelu (a composite of bias_act + upfirdn2d by
+design). `docs/vulkan-coverage.md` lists every slot and, per sibling, what its
+inference and training code calls.
 The backend is never the default device. To select it, use
 `set_default_device(Device::vulkan(i))`, a `DeviceScope`, or
 `BROTENSOR_DEFAULT_DEVICE=vulkan` (also `vk`, `vulkan:1`). Any other op throws
-"not implemented on vulkan".
+"not implemented on vulkan". `Device::cuda(i)` aliases to `Device::vulkan(i)`
+when neither a CUDA nor a HIP backend is registered (the HIP alias's rule,
+`detail::resolve_device_alias`; with HIP present the alias stays HIP's).
+Trace-JIT (`jit::*`) DAGs on Vulkan are replayed op by op through the
+dispatched ops (`src/jit/trace_eager.cpp`), as on HIP: there is no Vulkan
+trace compiler, and the CPU one must never see a buffer device address. The
+`fused_*` ops need no Vulkan case (they compose dispatched ops; the
+stacked-weight SwiGLU GEMV takes the GEMV epilogue).
 
 ## Build
 
@@ -96,12 +113,14 @@ src/vulkan/
   ops_*.cpp                     ops, one file per family, each with a fill_vulkan_vtable_<family>
                                 (elementwise, copy, reduce, linear, norm, rope, glu, attention,
                                 attention_proj, topk, xent, conv, gnorm, spatial, diffusion,
-                                quant, quant_attention, audio, spectral, sampling;
-                                ops_attention_dense.cpp is the materialised path the others call)
+                                quant, quant_attention, audio, spectral, sampling, misc, delta,
+                                vision; ops_attention_dense.cpp is the materialised path the
+                                others call)
   shaders/                      *.comp kernels, common.glsl, gemm_common.glsl, math_acc.glsl
                                 (accurate exp / log / sincos), quant_decode.glsl (the quantised
                                 chunk loads / decodes), op_codes.h, shaders.cmake (the list)
-tests/test_vulkan.cpp           runtime; main(), --only=ops|gemm|norm|attention|conv|spatial|quant|audio,
+tests/test_vulkan.cpp           runtime, the Device::CUDA alias; main(),
+                                --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision|alias,
                                 --bench-gemm, --bench-attention, --bench-conv, --bench-quant, --bench-audio
 tests/test_vulkan_ops.cpp       chunk-1 op parity
 tests/test_vulkan_gemm.cpp      matmul / linear parity, every kernel path
@@ -118,6 +137,10 @@ tests/test_vulkan_quant_attention.cpp  INT8-weight attentions and ResBlock
 tests/test_vulkan_audio.cpp     1D convs, Snake, pad / resample, codec quantisers, complex, FFT, STFT
 tests/test_vulkan_sampling.cpp  sample_logits(_into), masked diffusion
 tests/test_vulkan_bench_quant.cpp      quantised linears GB/s / TF/s, audio ops (not in ctest)
+tests/test_vulkan_misc.cpp      embedding, pooling / masks, thresholds, init / optimisers / MSE, moments,
+                                bias_act / upfirdn2d / filtered_lrelu, gated delta rule, BF16 checkpoint load
+tests/test_vulkan_vision.cpp    SAM rel-pos attention, deform / modulated conv (+ backward),
+                                conv2d_backward_weight, attention_forward, cross_attention_forward_train
 tests/test_vulkan_common.h
 ```
 
@@ -669,6 +692,53 @@ Snake 512 x 24000 234 (FP32) / 209 (FP16) GB/s (HIP 214, FP32 only), pad1d
 230 (HIP 228), resample1d 113 (HIP 110, the per-output 64-bit rational
 arithmetic bounds it), complex_abs 685 (cache-resident).
 
+## Chunk-6 ops
+
+* **`misc.comp`** (`ops_misc.cpp`, FP32 / FP16 / BF16 by `DT`): the
+  embedding lookup is `gather_rows` over a view of the device index array (an
+  out-of-range index is clamped, not a fault); masked mean pooling counts the
+  valid rows (mask >= 0.5, the CPU's rule) per invocation; `rows_count_above`
+  and `attention_token_moments` are one workgroup per row / key; `xavier_init`
+  draws splitmix64 at state + (i + 1) K, bit-identical to the CPU walk, and
+  advances the state by n K; SGD / Adam are `precise` FP32 elementwise steps
+  (the bias corrections from the host's `powf`); `bias_act`'s dB recomputes
+  the gradient in FP32 per channel rather than summing the rounded dX;
+  `upfirdn2d` visits the CPU's taps in the CPU's order, and its backward is
+  the forward with up / down swapped. filtered_lrelu has no slot (the public
+  op's composite of the two runs here).
+* **Gated delta rule** (`delta_rule.comp`): every row of a head's (d_v, d_k)
+  state evolves on its own, so a group of 32 lanes (the subgroup size is
+  pinned when it can be) owns one (head, row), keeps the row in registers for
+  the whole token walk, and reduces both dot products with subgroup shuffles;
+  the state is read and written once per call whatever L is, and step and
+  chunked are one kernel. d_k up to 512.
+* **SAM attention** (`ops_vision.cpp`): windows are row gathers from X with
+  one zero row appended (the zero padding), projections in X's dtype, Bh =
+  Q_h rel_pos_h^T and Bw likewise as one batched FP32 GEMM over the heads,
+  then the dense path with `attn_softmax.comp`'s `BIAS = 2` mode adding
+  Bh[q, qh - kh + gh - 1] + Bw[q, qw - kw + gw - 1] to each scaled score (the
+  (L, L) bias never exists), and O gathered back.
+* **Deformable / modulated convolution, weight gradients**: deform_conv2d is
+  a bilinear im2col (torchvision's corner rules) per image, group and slab of
+  <= 32 Mi col elements, then `gemm()` and the channel bias;
+  `modulated_conv2d_forward` builds the per-sample weights and demodulation
+  in one pass and runs one grouped conv2d with groups = N over the batch as a
+  single image (so the implicit-GEMM paths apply). `conv2d_backward_weight`
+  and the modulated backward's dw'' are im2col slabs (the same kernel without
+  offsets) and dW += dY col^T through `gemm()`; the backward's dX is
+  `conv2d_backward_input` with w'' as one grouped convolution.
+* **conv_transpose2d** is now conv_transpose1d's design in 2D: cols (C_out kH
+  kW, H W) = Wt_g^T X_g per image batch and group through `gemm()`
+  (cooperative matrix for FP16, FP32 cols for BF16), then the 2D overlap-add
+  gather (`MI_COL2IM2D`); the direct gather remains for an image whose cols
+  exceed 256 MiB and under `set_conv_override(2)`.
+* `attention_forward` is `mha_forward` with one head, and
+  `cross_attention_forward_train` is `cross_attention_forward` keeping its
+  per-head caches (both `ops_attention_proj.cpp`).
+
+These are correctness-first: none of them was benchmarked against HIP in
+chunk 6.
+
 ## Dtype policy
 
 - **FP32**: native.
@@ -695,6 +765,14 @@ arithmetic bounds it), complex_abs 685 (cache-resident).
   dense path keeps its scores in FP32 while its P V GEMM follows the GEMM's rule.
   `conv_cm.comp` does the same as it stages A and B; the SIMT and direct
   convolutions and every spatial kernel compute BF16 in FP32.
+- **At load**: `safetensors::upload_compute(_checked)` and `upload_as` already
+  implement the policy on Vulkan (BF16 bits uploaded raw, cast to the compute
+  dtype, FP16, on the device; `test_vulkan_misc.cpp` pins it bit for bit).
+  `safetensors::upload`, `gguf::upload_raw` and `Tensor::to` keep the source
+  dtype by contract, so a BF16 weight that arrives through them stays BF16 and
+  the matrix kernels convert it per load (correct, slower). A BF16 *activation*
+  beyond FP16's range becomes inf in the cooperative-matrix GEMM: models that
+  rely on BF16's range (brolm's T5 on CUDA / HIP) should not take that path.
 - **INT8 / INT32**: storage carriers only (8-bit storage is enabled): INT8
   weights with FP32 scales, INT32 indices / levels / tokens. The GGUF block
   dtypes (Q8_0, Q4_K, Q6_K) are opaque byte carriers decoded by the quantised

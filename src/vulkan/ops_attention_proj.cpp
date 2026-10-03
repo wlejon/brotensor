@@ -1,7 +1,7 @@
 // Vulkan projection-fused attention with materialised probabilities:
 // self_attention_bias_forward (T5 / ALiBi biases), cross_attention_forward,
 // cross_attention_forward_with_attn (head-averaged map + logit bias),
-// mha_forward, self_attention_forward(_train), and rel_pos_bias_xl_forward.
+// cross_attention_forward_train, mha_forward, attention_forward (one head), self_attention_forward(_train), and rel_pos_bias_xl_forward.
 // Contracts follow the CPU reference (src/cpu/self_attention_bias.cpp,
 // cross_attention.cpp, ops_impl.cpp) and the CUDA backend's dtype rule
 // for these ops: projections, scores, probabilities and the per-head
@@ -253,6 +253,33 @@ void mha_forward(const Tensor& X, const Tensor& Wq, const Tensor& Wk, const Tens
     proj_attention(s);
 }
 
+// Single-head self-attention with every intermediate kept (brogameagent's
+// Attention layer): mha_forward with one head, so Q / K / V are the (N, D)
+// projections, Attn (N, N), Y_pre_Wo = Attn V and O, all FP32.
+void attention_forward(const Tensor& X, const Tensor& Wq, const Tensor& Wk, const Tensor& Wv, const Tensor& Wo,
+                       const float* d_mask, Tensor& Q, Tensor& K, Tensor& V, Tensor& Attn, Tensor& Y_pre_Wo,
+                       Tensor& O) {
+    ProjSpec s{"attention_forward", &X, &X, &Wq, &Wk, &Wv, &Wo};
+    s.kmask = s.qmask = d_mask;
+    s.H = 1;
+    s.Qh = &Q; s.Kh = &K; s.Vh = &V; s.Attnh = &Attn; s.Yc = &Y_pre_Wo;
+    s.O = &O;
+    proj_attention(s);
+}
+
+// cross_attention_forward with the per-head caches the backward reads.
+void cross_attention_forward_train(const Tensor& X, const Tensor& Ctx, const Tensor& Wq, const Tensor& Wk,
+                                   const Tensor& Wv, const Tensor& Wo, const float* d_mask, int num_heads, Tensor& Qh,
+                                   Tensor& Kh, Tensor& Vh, Tensor& Attnh, Tensor& Yconcat, Tensor& O) {
+    ProjSpec s{"cross_attention_forward_train", &X, &Ctx, &Wq, &Wk, &Wv, &Wo};
+    s.kmask = d_mask;
+    s.qmask = X.rows == Ctx.rows ? d_mask : nullptr;
+    s.H = num_heads;
+    s.Qh = &Qh; s.Kh = &Kh; s.Vh = &Vh; s.Attnh = &Attnh; s.Yc = &Yconcat;
+    s.O = &O;
+    proj_attention(s);
+}
+
 void self_attention_forward_train(const Tensor& X, const Tensor& Wq, const Tensor& Wk, const Tensor& Wv,
                                   const Tensor& Wo, const float* d_mask, int num_heads, Tensor& Qh, Tensor& Kh,
                                   Tensor& Vh, Tensor& Attnh, Tensor& Yconcat, Tensor& O) {
@@ -301,6 +328,8 @@ void fill_vulkan_vtable_attention_proj(::brotensor::detail::OpsVTable& v) {
     v.cross_attention_forward = &cross_attention_forward;
     v.cross_attention_forward_with_attn = &cross_attention_forward_with_attn;
     v.mha_forward = &mha_forward;
+    v.attention_forward = &attention_forward;
+    v.cross_attention_forward_train = &cross_attention_forward_train;
     v.self_attention_forward_train = &self_attention_forward_train;
     v.self_attention_forward = &self_attention_forward;
     v.rel_pos_bias_xl_forward = &rel_pos_bias_xl_forward;

@@ -1,14 +1,15 @@
 // ─── Eager trace execution — backends with no trace compiler ────────────────
 //
 // The trace JIT compiles a DAG to host code (brass, CPU) or to PTX (CUDA).
-// HIP has neither: there is no GPU code generator for AMD here, and the CPU
-// compiler must never see a HIP DAG — its host code would walk device
+// HIP and Vulkan have neither: there is no GPU code generator for them here,
+// and the CPU compiler must never see their DAGs — its host code would walk device
 // pointers outside the HIP stream's ordering (and fault outright on a
-// discrete GPU). A HIP trace is therefore executed by replaying the DAG one
+// discrete GPU; a Vulkan address is not even a pointer). Such a trace is
+// therefore executed by replaying the DAG one
 // node at a time through the ordinary device-dispatched ops, on the current
 // stream, in program order.
 //
-// That keeps every trace correct on HIP — same results as the eager op
+// That keeps every trace correct on HIP and Vulkan — same results as the eager op
 // sequence the trace replaces, same TraceHandle replay/rebind contract — but
 // it is not fused: one launch per traced op, and an intermediate the fused
 // kernel would keep in registers is a scratch tensor here (allocated per

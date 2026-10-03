@@ -39,6 +39,9 @@ void fill_vulkan_vtable_quant_attention(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_audio(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_spectral(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_sampling(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_misc(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_delta(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_vision(::brotensor::detail::OpsVTable& v);
 
 namespace {
 
@@ -107,6 +110,9 @@ void probe_and_register() {
     dv::fill_vulkan_vtable_audio(ops);
     dv::fill_vulkan_vtable_spectral(ops);
     dv::fill_vulkan_vtable_sampling(ops);
+    dv::fill_vulkan_vtable_misc(ops);
+    dv::fill_vulkan_vtable_delta(ops);
+    dv::fill_vulkan_vtable_vision(ops);
     ::brotensor::detail::register_backend(::brotensor::DeviceType::VULKAN, ops,
                                           dv::vulkan_alloc_table());
     if (vk_verbose()) {

@@ -365,9 +365,11 @@ void test_gemv_residual() {
     }
 }
 
-// ── 16-bit operands on HIP ─────────────────────────────────────────────────
+// ── 16-bit operands on HIP and Vulkan ──────────────────────────────────────
 //
-// None of the five ops has a HIP-specific kernel except the stacked-weight
+// (Vulkan runs when BROTENSOR_TEST_GPU=vulkan selects it: ctest's
+// brotensor_test_ops_fused_vulkan.) None of the five ops has a HIP- or
+// Vulkan-specific kernel except the stacked-weight
 // SwiGLU GEMV (linear_forward_batched_ex's epilogue); everything else is the
 // eager composition, which is what has to be right at FP16 / BF16 too. The
 // reference is FP32 over the same rounded inputs, so the tolerance only has
@@ -412,10 +414,10 @@ Tensor host(const std::vector<float>& v, int rows, int cols) {
 }
 
 void test_fused_16bit_hip() {
-    if (!bt_parity::gpu_device().is_hip()) return;
+    if (!bt_parity::gpu_device().is_hip() && !bt_parity::gpu_device().is_vulkan()) return;
     for (Dtype dt : {Dtype::FP16, Dtype::BF16}) {
         const char* dn = dt == Dtype::BF16 ? "bf16" : "fp16";
-        std::printf("  Testing fused ops at %s on HIP...\n", dn);
+        std::printf("  Testing fused ops at %s on %s...\n", dn, brotensor::to_string(bt_parity::gpu_device()).c_str());
         const float tol = dt == Dtype::BF16 ? 3e-2f : 4e-3f;
         SplitMix64 rng(0x16B17 + static_cast<uint64_t>(dt));
         const int B = 6, D = 384;

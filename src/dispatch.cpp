@@ -202,9 +202,9 @@ bool is_registered(Device d) {
 }
 
 Device resolve_device_alias(Device d) {
-    if (d.is_cuda() && !slots()[static_cast<int>(DeviceType::CUDA)].registered &&
-        slots()[static_cast<int>(DeviceType::HIP)].registered) {
-        return Device::hip(d.index);
+    if (d.is_cuda() && !slots()[static_cast<int>(DeviceType::CUDA)].registered) {
+        if (slots()[static_cast<int>(DeviceType::HIP)].registered) return Device::hip(d.index);
+        if (slots()[static_cast<int>(DeviceType::VULKAN)].registered) return Device::vulkan(d.index);
     }
     return d;
 }

@@ -31,7 +31,7 @@ const char* conv2d_path(DeviceCtx& d, const Conv2dArgs& a);
 
 // Test / benchmark hook, process-wide: 0 = automatic, 1 = never the
 // cooperative-matrix kernel (SIMT implicit GEMM), 2 = always the direct
-// kernel.
+// kernel (also conv_transpose2d's direct gather instead of its GEMM form).
 void set_conv_override(int mode);
 
 // GroupNorm over (n, c, hw) in `dt`, optionally followed by SiLU; y may be x.

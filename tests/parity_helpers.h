@@ -34,6 +34,16 @@ using brotensor::Tensor;
 inline brotensor::Device gpu_device() {
     using brotensor::Device;
     static const Device d = [] {
+        // BROTENSOR_TEST_GPU=vulkan|hip|cuda|metal picks that backend when it
+        // is available (Vulkan is never picked otherwise: it is never a
+        // default device).
+        if (const char* e = std::getenv("BROTENSOR_TEST_GPU")) {
+            const std::string want(e);
+            const Device pick = want == "vulkan" ? Device::VULKAN : want == "hip" ? Device::HIP
+                              : want == "cuda"   ? Device::CUDA   : want == "metal" ? Device::Metal
+                                                                                    : Device::CPU;
+            if (!pick.is_cpu() && brotensor::is_available(pick)) return pick;
+        }
         if (brotensor::is_available(Device::HIP))   return Device::HIP;
         if (brotensor::is_available(Device::CUDA))  return Device::CUDA;
         if (brotensor::is_available(Device::Metal)) return Device::Metal;

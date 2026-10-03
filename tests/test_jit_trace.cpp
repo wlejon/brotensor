@@ -7,6 +7,7 @@
 //   Test 4: Trace cache hit verification & replay speedup benchmark.
 //   Test 6: A HIP trace never reaches the host code generator.
 //   Test 7: Eager divide / modulate and a traced divide on HIP.
+//   Tests 1-4, 6 and 7 also run on Vulkan (eager replay, as HIP).
 // Runs across CPU, NVIDIA RTX GPU (CUDA sm_89) and HIP (unfused replay).
 
 #include <brotensor/jit/trace.h>
@@ -77,6 +78,7 @@ void fill_random(std::vector<float>& vec, uint64_t seed, float scale = 1.0f) {
 std::string device_label(Device dev) {
     if (dev.is_cuda()) return "CUDA";
     if (dev.is_hip()) return "HIP";
+    if (dev.is_vulkan()) return "Vulkan";
     return "CPU";
 }
 
@@ -504,7 +506,8 @@ void test_trace_allocates_nothing(Device dev) {
 // on the host with no ordering against the HIP stream: it reads an input the
 // GPU has not finished writing. The trace has to stay on the device.
 void test_hip_trace_stays_on_device(Device dev) {
-    std::printf("\n--- Test 6: HIP trace stays on the device ---\n");
+    const std::string dn = device_label(dev);
+    std::printf("\n--- Test 6: %s trace stays on the device ---\n", dn.c_str());
 
     const int R = 2048;
     const int C = 2048;
@@ -524,11 +527,11 @@ void test_hip_trace_stays_on_device(Device dev) {
     brotensor::sync(dev);
 
     CHECK_TRUE(std::string(handle.fusion_name()) != "cpu-avx2-fused",
-               "HIP trace is not compiled by the CPU code generator");
+               (dn + " trace is not compiled by the CPU code generator").c_str());
     std::vector<float> got = out.to_host_vector();
     float err = 0.0f;
     for (int i = 0; i < N; ++i) err = std::fmax(err, std::fabs(got[i] - 1025.0f));
-    CHECK_PARITY(err, 0.0f, "HIP trace sees the device work queued before it");
+    CHECK_PARITY(err, 0.0f, (dn + " trace sees the device work queued before it").c_str());
 
     for (int i = 0; i < 2; ++i) brotensor::scale_inplace(x, 0.5f);
     handle.execute();
@@ -536,7 +539,7 @@ void test_hip_trace_stays_on_device(Device dev) {
     got = out.to_host_vector();
     err = 0.0f;
     for (int i = 0; i < N; ++i) err = std::fmax(err, std::fabs(got[i] - 257.0f));
-    CHECK_PARITY(err, 0.0f, "HIP trace replay is ordered on the stream");
+    CHECK_PARITY(err, 0.0f, (dn + " trace replay is ordered on the stream").c_str());
 }
 
 // ── Test 7: eager `/` and modulate() off the host ──────────────────────────
@@ -631,6 +634,18 @@ int main() {
         test_cache_hit_and_speedup(Device::hip());
         test_hip_trace_stays_on_device(Device::hip());
         test_hip_eager_div_modulate(Device::hip());
+    }
+    // Vulkan, likewise: no trace compiler, eager replay (the same tests as
+    // HIP; test 6 matters more here, a buffer device address is not a host
+    // pointer at all).
+    if (brotensor::is_available(Device::vulkan())) {
+        std::printf("\n============================ [ VULKAN TEST SUITE ] ===========================\n");
+        test_elementwise_expression(Device::vulkan());
+        test_residual_rmsnorm(Device::vulkan());
+        test_layernorm_modulate(Device::vulkan());
+        test_cache_hit_and_speedup(Device::vulkan());
+        test_hip_trace_stays_on_device(Device::vulkan());
+        test_hip_eager_div_modulate(Device::vulkan());
     }
 
     std::printf("\n================================================================================\n");

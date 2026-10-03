@@ -2,7 +2,8 @@
 // matrix for FP16 / BF16, a SIMT implicit GEMM for FP32 and devices without
 // it, a direct kernel for depthwise and narrow grouped convolutions),
 // conv3d_forward (a GEMM when the kernel covers the whole input, the direct
-// kernel otherwise), conv_transpose2d_forward (direct, gather form) and the
+// kernel otherwise), conv_transpose2d_forward (a GEMM + overlap-add in
+// ops_vision.cpp, the direct gather when one image's columns exceed 256 MiB) and the
 // two bias gradients. Contracts follow the CUDA backend (src/cuda/conv2d.cu,
 // conv3d.cu, conv_transpose2d.cu): X, Wt and bias share a dtype (FP32 /
 // FP16 / BF16), Y is resized to (N, C_out * H_out * W_out) in X's dtype and
@@ -397,6 +398,11 @@ void conv3d_forward(const Tensor& X, const Tensor& Wt, const Tensor* bias, int N
     conv_direct(d, 0, X.dtype, pc);
 }
 
+// ops_vision.cpp: the GEMM + overlap-add form; false when it does not apply.
+bool conv_transpose2d_gemm(const Tensor& X, const Tensor& Wt, const Tensor* bias, int N, int C_in, int H, int W,
+                           int C_out, int kH, int kW, int sh, int sw, int ph, int pw, int dh, int dw, int groups,
+                           int Ho, int Wo, Tensor& Y);
+
 void conv_transpose2d_forward(const Tensor& X, const Tensor& Wt, const Tensor* bias, int N, int C_in, int H, int W,
                               int C_out, int kH, int kW, int stride_h, int stride_w, int pad_h, int pad_w,
                               int output_padding_h, int output_padding_w, int dil_h, int dil_w, int groups,
@@ -422,6 +428,11 @@ void conv_transpose2d_forward(const Tensor& X, const Tensor& Wt, const Tensor* b
     need(op, out_cols <= 0x7fffffffLL, "output too large");
     if (Y.rows != N || Y.cols != out_cols || Y.dtype != X.dtype) Y.resize(N, static_cast<int>(out_cols), X.dtype);
     if (N == 0) return;
+    if (g_override.load(std::memory_order_relaxed) != 2 &&
+        conv_transpose2d_gemm(X, Wt, bias, N, C_in, H, W, C_out, kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                              groups, Ho, Wo, Y)) {
+        return;   // the GEMM + overlap-add path (ops_vision.cpp)
+    }
     DirectPush pc{};
     pc.x = addr(X.data); pc.w = addr(Wt.data); pc.y = addr(Y.data); pc.bias = bias ? addr(bias->data) : 0;
     pc.n = static_cast<std::uint32_t>(N);

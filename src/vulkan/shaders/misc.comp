@@ -1,0 +1,405 @@
+#version 460
+// The chunk-6 small ops (ops_misc.cpp, ops_vision.cpp): pooling and masks for
+// brogameagent / LLM2Vec, SAM's thresholds, the optimiser steps and MSE, the
+// cross-attention token moments, StyleGAN3's bias_act / upfirdn2d / modulated
+// weights, conv_transpose2d's overlap-add and deform_conv2d's bilinear
+// im2col. Spec constant 0 = MI_* (op_codes.h); DT is the dtype of the op's
+// main tensor (masks, optimiser state and statistics are FP32). One
+// invocation per item, grid-stride, unless the op says one workgroup per item.
+#include "common.glsl"
+#include "op_codes.h"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint OP = MI_MEAN_POOL;
+
+layout(push_constant) uniform PC {
+    uint64_t a, b, c, d, e;
+    uint u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11, u12, u13, u14, u15;
+    float f0, f1, f2, f3;
+} pc;
+
+shared float red[64];
+
+float block_sum(float v) {
+    v = subgroupAdd(v);
+    barrier();
+    if (subgroupElect()) red[gl_SubgroupID] = v;
+    barrier();
+    float t = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) t += red[i];
+    return t;
+}
+
+uint wg_linear() { return gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x; }
+uint wg_count() { return gl_NumWorkGroups.x * gl_NumWorkGroups.y; }
+
+bool mask_ok(uint64_t m, uint k) { return m == 0 || F32Buf(m).v[k] >= 0.5; }
+
+uint n_valid(uint64_t m, uint K) {
+    if (m == 0) return K;
+    uint n = 0;
+    for (uint k = 0; k < K; ++k) n += F32Buf(m).v[k] >= 0.5 ? 1u : 0u;
+    return n;
+}
+
+float act_f(float t, uint act, float alpha) { return (act == 1u && !(t > 0.0)) ? alpha * t : t; }
+
+// bias_act's gradient at t = x + b (u3 act, f0 alpha, f1 gain, f2 clamp): zero
+// where the pre-clamp output saturated.
+float bias_act_grad(float dy, float t) {
+    const float gr = (pc.u3 == 1u && !(t > 0.0)) ? pc.f0 : 1.0;
+    float dt = dy * pc.f1 * gr;
+    if (pc.f2 >= 0.0) {
+        const float yp = pc.f1 * act_f(t, pc.u3, pc.f0);
+        if (yp < -pc.f2 || yp > pc.f2) dt = 0.0;
+    }
+    return dt;
+}
+
+// torchvision's bilinear_interpolate: zero outside, per-corner guards.
+float bilinear(uint64_t x, uint base, int H, int W, float h, float w) {
+    if (h <= -1.0 || float(H) <= h || w <= -1.0 || float(W) <= w) return 0.0;
+    const int hl = int(floor(h)), wl = int(floor(w));
+    const int hh = hl + 1, wh = wl + 1;
+    const float lh = h - float(hl), lw = w - float(wl);
+    const float ih = 1.0 - lh, iw = 1.0 - lw;
+    const float v1 = (hl >= 0 && wl >= 0) ? load_elem(DT, x, base + uint(hl * W + wl)) : 0.0;
+    const float v2 = (hl >= 0 && wh <= W - 1) ? load_elem(DT, x, base + uint(hl * W + wh)) : 0.0;
+    const float v3 = (hh <= H - 1 && wl >= 0) ? load_elem(DT, x, base + uint(hh * W + wl)) : 0.0;
+    const float v4 = (hh <= H - 1 && wh <= W - 1) ? load_elem(DT, x, base + uint(hh * W + wh)) : 0.0;
+    return ih * iw * v1 + ih * lw * v2 + lh * iw * v3 + lh * lw * v4;
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (OP == MI_MEAN_POOL) {
+        // a x (K, D), b mask (K) or 0, c y (D); u0 K, u1 D
+        const uint nv = n_valid(pc.b, pc.u0);
+        for (uint j = gid; j < pc.u1; j += GRID_STRIDE_X) {
+            float acc = 0.0;
+            for (uint k = 0; k < pc.u0; ++k) {
+                if (mask_ok(pc.b, k)) acc += load_elem(DT, pc.a, k * pc.u1 + j);
+            }
+            store_elem(DT, pc.c, j, nv > 0u ? acc * (1.0 / float(nv)) : 0.0);
+        }
+    } else if (OP == MI_MEAN_POOL_BWD) {
+        // a dy (D), b mask, c dx (K, D); u0 K, u1 D
+        const uint nv = n_valid(pc.b, pc.u0);
+        const float inv = nv > 0u ? 1.0 / float(nv) : 0.0;
+        for (uint i = gid; i < pc.u0 * pc.u1; i += GRID_STRIDE_X) {
+            const uint k = i / pc.u1, j = i % pc.u1;
+            store_elem(DT, pc.c, i, (nv > 0u && mask_ok(pc.b, k)) ? load_elem(DT, pc.a, j) * inv : 0.0);
+        }
+    } else if (OP == MI_SLOT_MASK) {
+        // a x (FP32), c mask; u0 K, u1 offset, u2 stride
+        for (uint k = gid; k < pc.u0; k += GRID_STRIDE_X) {
+            F32Buf(pc.c).v[k] = F32Buf(pc.a).v[pc.u1 + k * pc.u2] > 0.5 ? 1.0 : 0.0;
+        }
+    } else if (OP == MI_CAUSAL_ROW) {
+        // c mask (L); u0 L, u1 q (int)
+        for (uint k = gid; k < pc.u0; k += GRID_STRIDE_X) {
+            F32Buf(pc.c).v[k] = int(k) <= int(pc.u1) ? 1.0 : 0.0;
+        }
+    } else if (OP == MI_THRESHOLD_U8) {
+        // a x, c y (INT8); u0 n; f0 t
+        for (uint i = gid; i < pc.u0; i += GRID_STRIDE_X) {
+            U8Buf(pc.c).v[i] = uint8_t(load_elem(DT, pc.a, i) > pc.f0 ? 1u : 0u);
+        }
+    } else if (OP == MI_COUNT_ABOVE) {
+        // a x (R, C), c counts INT32 (R, 2); u0 R, u1 C; f0 t_lo, f1 t_hi
+        for (uint r = wg_linear(); r < pc.u0; r += wg_count()) {
+            uint lo = 0, hi = 0;
+            for (uint j = tid; j < pc.u1; j += 256u) {
+                const float v = load_elem(DT, pc.a, r * pc.u1 + j);
+                lo += v > pc.f0 ? 1u : 0u;
+                hi += v > pc.f1 ? 1u : 0u;
+            }
+            // Counts below 2^24 are exact in FP32.
+            const float slo = block_sum(float(lo)), shi = block_sum(float(hi));
+            if (tid == 0u) {
+                I32Buf(pc.c).v[2u * r] = int(slo);
+                I32Buf(pc.c).v[2u * r + 1u] = int(shi);
+            }
+            barrier();
+        }
+    } else if (OP == MI_XAVIER) {
+        // c W (FP32); u0 n, u1 / u2 the state's low / high words; f0 limit.
+        // Element i draws splitmix64 at state + (i + 1) K, as the CPU's
+        // sequential walk does.
+        const uint64_t base = uint64_t(pc.u1) | (uint64_t(pc.u2) << 32);
+        for (uint i = gid; i < pc.u0; i += GRID_STRIDE_X) {
+            uint64_t z = base + uint64_t(i + 1u) * 0x9E3779B97F4A7C15UL;
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+            z = z ^ (z >> 31);
+            const float u = float(uint(z >> 40)) / 16777216.0;
+            F32Buf(pc.c).v[i] = (u * 2.0 - 1.0) * pc.f0;
+        }
+    } else if (OP == MI_SGD) {
+        // a param, b grad, c velocity (FP32); u0 n; f0 lr, f1 momentum
+        for (uint i = gid; i < pc.u0; i += GRID_STRIDE_X) {
+            precise float v = pc.f1 * F32Buf(pc.c).v[i] + F32Buf(pc.b).v[i];
+            F32Buf(pc.c).v[i] = v;
+            precise float p = F32Buf(pc.a).v[i] - pc.f0 * v;
+            F32Buf(pc.a).v[i] = p;
+        }
+    } else if (OP == MI_ADAM) {
+        // a param, b grad, c m, d v (FP32); u0 n, u1 / u2 1 / (1 - beta^t) bits;
+        // f0 lr, f1 beta1, f2 beta2, f3 eps
+        const float ibc1 = uintBitsToFloat(pc.u1), ibc2 = uintBitsToFloat(pc.u2);
+        for (uint i = gid; i < pc.u0; i += GRID_STRIDE_X) {
+            const float g = F32Buf(pc.b).v[i];
+            precise float m = pc.f1 * F32Buf(pc.c).v[i] + (1.0 - pc.f1) * g;
+            precise float v = pc.f2 * F32Buf(pc.d).v[i] + (1.0 - pc.f2) * g * g;
+            F32Buf(pc.c).v[i] = m;
+            F32Buf(pc.d).v[i] = v;
+            precise float p = F32Buf(pc.a).v[i] - pc.f0 * (m * ibc1) / (sqrt(v * ibc2) + pc.f3);
+            F32Buf(pc.a).v[i] = p;
+        }
+    } else if (OP == MI_MSE_SAMPLE) {
+        // a pred, b target, c dPred, d loss (FP32); u0 n
+        for (uint i = gid; i < pc.u0; i += GRID_STRIDE_X) {
+            const float dd = F32Buf(pc.a).v[i] - F32Buf(pc.b).v[i];
+            F32Buf(pc.c).v[i] = dd;
+            F32Buf(pc.d).v[i] = 0.5 * dd * dd;
+        }
+    } else if (OP == MI_MSE_BWD) {
+        // a pred, b target, c dPred (FP32); u0 n; f0 2 / n
+        for (uint i = gid; i < pc.u0; i += GRID_STRIDE_X) {
+            F32Buf(pc.c).v[i] = pc.f0 * (F32Buf(pc.a).v[i] - F32Buf(pc.b).v[i]);
+        }
+    } else if (OP == MI_MSE_SUM) {
+        // a pred, b target, c out[1] (FP32); u0 n; one workgroup
+        float acc = 0.0;
+        for (uint i = tid; i < pc.u0; i += 256u) {
+            const float dd = F32Buf(pc.a).v[i] - F32Buf(pc.b).v[i];
+            acc += dd * dd;
+        }
+        acc = block_sum(acc);
+        if (tid == 0u) F32Buf(pc.c).v[0] = acc;
+    } else if (OP == MI_MOMENTS) {
+        // a Attn (Lq, Lk), c mass (Lk), d centroid (Lk, 2) FP32; u0 Lq, u1 Lk, u2 w_lat
+        for (uint k = wg_linear(); k < pc.u1; k += wg_count()) {
+            float am = 0.0, ay = 0.0, ax = 0.0;
+            for (uint q = tid; q < pc.u0; q += 256u) {
+                const float v = load_elem(DT, pc.a, q * pc.u1 + k);
+                am += v;
+                ay += float(q / pc.u2) * v;
+                ax += float(q % pc.u2) * v;
+            }
+            am = block_sum(am);
+            barrier();
+            ay = block_sum(ay);
+            barrier();
+            ax = block_sum(ax);
+            if (tid == 0u) {
+                F32Buf(pc.c).v[k] = am;
+                const bool ok = am > 1e-8;
+                const float inv = ok ? 1.0 / am : 0.0;
+                F32Buf(pc.d).v[2u * k] = ok ? ay * inv : 0.0;
+                F32Buf(pc.d).v[2u * k + 1u] = ok ? ax * inv : 0.0;
+            }
+            barrier();
+        }
+    } else if (OP == MI_BIAS_ACT || OP == MI_BIAS_ACT_BWD) {
+        // forward: a X, b bias, c Y; backward: a dY, b X, c bias, d dX.
+        // u0 N C HW, u1 C, u2 HW, u3 act; f0 alpha, f1 gain, f2 clamp (< 0 none)
+        const bool fwd = OP == MI_BIAS_ACT;
+        const uint64_t xb = fwd ? pc.a : pc.b, bb = fwd ? pc.b : pc.c;
+        for (uint i = gid; i < pc.u0; i += GRID_STRIDE_X) {
+            const uint ch = (i / pc.u2) % pc.u1;
+            const float t = load_elem(DT, xb, i) + (bb != 0 ? load_elem(DT, bb, ch) : 0.0);
+            if (fwd) {
+                float y = act_f(t, pc.u3, pc.f0) * pc.f1;
+                if (pc.f2 >= 0.0) y = clamp(y, -pc.f2, pc.f2);
+                store_elem(DT, pc.c, i, y);
+            } else {
+                store_elem(DT, pc.d, i, bias_act_grad(load_elem(DT, pc.a, i), t));
+            }
+        }
+    } else if (OP == MI_BIAS_ACT_DB) {
+        // a dY, b X, c bias, e dB (C) accumulated, one workgroup per channel;
+        // u0 N, u1 C, u2 HW, u3 act; f0..f2 as above. The gradient is
+        // recomputed in FP32 rather than summed from the rounded dX.
+        for (uint ch = wg_linear(); ch < pc.u1; ch += wg_count()) {
+            const float bias = pc.c != 0 ? load_elem(DT, pc.c, ch) : 0.0;
+            float acc = 0.0;
+            const uint per = pc.u0 * pc.u2;
+            for (uint j = tid; j < per; j += 256u) {
+                const uint i = ((j / pc.u2) * pc.u1 + ch) * pc.u2 + j % pc.u2;
+                acc += bias_act_grad(load_elem(DT, pc.a, i), load_elem(DT, pc.b, i) + bias);
+            }
+            acc = block_sum(acc);
+            if (tid == 0u) store_elem(DT, pc.e, ch, load_elem(DT, pc.e, ch) + acc);
+            barrier();
+        }
+    } else if (OP == MI_UPFIRDN) {
+        // a X (NC, Hin, Win), b f (fH, fW), c Y (NC, Hout, Wout); u0 NC, u1 Hin,
+        // u2 Win, u3 Hout, u4 Wout, u5 fH, u6 fW, u7 up_x, u8 up_y, u9 down_x,
+        // u10 down_y, u11 pad_x0, u12 pad_y0 (int), u13 flip; f0 gain. The
+        // taps and their order are the CPU's.
+        const int Hin = int(pc.u1), Win = int(pc.u2), fH = int(pc.u5), fW = int(pc.u6);
+        const int upx = int(pc.u7), upy = int(pc.u8);
+        const int Hu = Hin * upy, Wu = Win * upx;
+        const uint plane = pc.u3 * pc.u4;
+        for (uint i = gid; i < pc.u0 * plane; i += GRID_STRIDE_X) {
+            const uint nc = i / plane, p = i % plane;
+            const int oh = int(p / pc.u4), ow = int(p % pc.u4);
+            const int by = oh * int(pc.u10) - int(pc.u12), bx = ow * int(pc.u9) - int(pc.u11);
+            int kh0 = max(0, -by);
+            const int rh = (by + kh0) % upy;
+            if (rh != 0) kh0 += upy - rh;
+            const int kh1 = min(fH, Hu - by);
+            int kw0 = max(0, -bx);
+            const int rw = (bx + kw0) % upx;
+            if (rw != 0) kw0 += upx - rw;
+            const int kw1 = min(fW, Wu - bx);
+            const uint ib = nc * uint(Hin * Win);
+            float acc = 0.0;
+            for (int kh = kh0; kh < kh1; kh += upy) {
+                const uint xr = ib + uint((by + kh) / upy) * uint(Win);
+                const uint fr = uint(pc.u13 != 0u ? kh : fH - 1 - kh) * uint(fW);
+                for (int kw = kw0; kw < kw1; kw += upx) {
+                    acc += load_elem(DT, pc.a, xr + uint((bx + kw) / upx)) *
+                           load_elem(DT, pc.b, fr + uint(pc.u13 != 0u ? kw : fW - 1 - kw));
+                }
+            }
+            store_elem(DT, pc.c, i, acc * pc.f0);
+        }
+    } else if (OP == MI_MODW) {
+        // a W (C_out, C_in kk), b s (N, C_in), c Wn (N C_out, C_in kk) in DT, d dcoef
+        // (N, C_out) FP32; u0 N, u1 C_out, u2 C_in, u3 kk, u4 demodulate; f0 eps
+        const uint wk = pc.u2 * pc.u3;
+        for (uint no = wg_linear(); no < pc.u0 * pc.u1; no += wg_count()) {
+            const uint n = no / pc.u1, o = no % pc.u1;
+            float dc = 1.0;
+            if (pc.u5 != 0u) {   // the forward's coefficients (the backward rebuilding w'')
+                dc = pc.u4 != 0u ? F32Buf(pc.d).v[no] : 1.0;
+            } else {
+                float ss = 0.0;
+                for (uint j = tid; j < wk; j += 256u) {
+                    const float w = load_elem(DT, pc.a, o * wk + j) * load_elem(DT, pc.b, n * pc.u2 + j / pc.u3);
+                    ss += w * w;
+                }
+                ss = block_sum(ss);
+                if (pc.u4 != 0u) dc = 1.0 / sqrt(ss + pc.f0);
+            }
+            for (uint j = tid; j < wk; j += 256u) {
+                const float w = load_elem(DT, pc.a, o * wk + j) * load_elem(DT, pc.b, n * pc.u2 + j / pc.u3);
+                store_elem(DT, pc.c, no * wk + j, pc.u4 != 0u ? w * dc : w);
+            }
+            if (tid == 0u && pc.u5 == 0u) F32Buf(pc.d).v[no] = dc;
+            barrier();
+        }
+    } else if (OP == MI_MODW_BWD) {
+        // a W (C_out, wk), b s (N, C_in) in DT, c dw (N C_out, wk) FP32 in place:
+        // dw'' -> dw', d dcoef (N, C_out); u0 N, u1 C_out, u2 C_in, u3 kk, u4 demodulate.
+        // One workgroup per (n, o).
+        const uint wk = pc.u2 * pc.u3;
+        for (uint no = wg_linear(); no < pc.u0 * pc.u1; no += wg_count()) {
+            if (pc.u4 != 0u) {
+                const uint n = no / pc.u1, o = no % pc.u1;
+                float g = 0.0;
+                for (uint j = tid; j < wk; j += 256u) {
+                    const float wp = load_elem(DT, pc.a, o * wk + j) * load_elem(DT, pc.b, n * pc.u2 + j / pc.u3);
+                    g += F32Buf(pc.c).v[no * wk + j] * wp;
+                }
+                g = block_sum(g);
+                const float dc = F32Buf(pc.d).v[no];
+                const float gd3 = g * dc * dc * dc;
+                for (uint j = tid; j < wk; j += 256u) {
+                    const float wp = load_elem(DT, pc.a, o * wk + j) * load_elem(DT, pc.b, n * pc.u2 + j / pc.u3);
+                    F32Buf(pc.c).v[no * wk + j] = F32Buf(pc.c).v[no * wk + j] * dc - gd3 * wp;
+                }
+            }
+            barrier();
+        }
+    } else if (OP == MI_MODW_DS) {
+        // a W (C_out, wk) DT, c dw' (N C_out, wk) FP32, d ds (N, C_in) DT; u0 N,
+        // u1 C_out, u2 C_in, u3 kk. One invocation per (n, i).
+        const uint wk = pc.u2 * pc.u3;
+        for (uint ni = gid; ni < pc.u0 * pc.u2; ni += GRID_STRIDE_X) {
+            const uint n = ni / pc.u2, i = ni % pc.u2;
+            float acc = 0.0;
+            for (uint o = 0; o < pc.u1; ++o) {
+                for (uint t = 0; t < pc.u3; ++t) {
+                    const uint j = i * pc.u3 + t;
+                    acc += F32Buf(pc.c).v[(n * pc.u1 + o) * wk + j] * load_elem(DT, pc.a, o * wk + j);
+                }
+            }
+            store_elem(DT, pc.d, ni, acc);
+        }
+    } else if (OP == MI_MODW_DW) {
+        // b s (N, C_in) DT, c dw' (N C_out, wk) FP32, e dW (C_out, wk) DT accumulated;
+        // u0 N, u1 C_out, u2 C_in, u3 kk
+        const uint wk = pc.u2 * pc.u3;
+        for (uint oj = gid; oj < pc.u1 * wk; oj += GRID_STRIDE_X) {
+            const uint o = oj / wk, j = oj % wk;
+            float acc = 0.0;
+            for (uint n = 0; n < pc.u0; ++n) {
+                acc += F32Buf(pc.c).v[(n * pc.u1 + o) * wk + j] * load_elem(DT, pc.b, n * pc.u2 + j / pc.u3);
+            }
+            store_elem(DT, pc.e, oj, load_elem(DT, pc.e, oj) + acc);
+        }
+    } else if (OP == MI_COL2IM2D) {
+        // a cols (N, C_out kH kW, H W), b bias (C_out) or 0, c Y (N, C_out, Ho, Wo);
+        // u0 N, u1 C_out, u2 H, u3 W, u4 kH, u5 kW, u6 sh, u7 sw, u8 ph, u9 pw,
+        // u10 dh, u11 dw, u13 Ho, u14 Wo, u15 cols are FP32
+        const uint plane = pc.u13 * pc.u14, kk = pc.u4 * pc.u5, hw = pc.u2 * pc.u3;
+        for (uint i = gid; i < pc.u0 * pc.u1 * plane; i += GRID_STRIDE_X) {
+            const uint p = i % plane, noc = i / plane, oc = noc % pc.u1, n = noc / pc.u1;
+            const int oh = int(p / pc.u14), ow = int(p % pc.u14);
+            const uint rowb = (n * pc.u1 + oc) * kk;
+            float acc = pc.b != 0 ? load_elem(DT, pc.b, oc) : 0.0;
+            for (int kh = 0; kh < int(pc.u4); ++kh) {
+                const int th = oh + int(pc.u8) - kh * int(pc.u10);
+                if (th < 0 || th % int(pc.u6) != 0) continue;
+                const int ih = th / int(pc.u6);
+                if (ih >= int(pc.u2)) continue;
+                for (int kw = 0; kw < int(pc.u5); ++kw) {
+                    const int tw = ow + int(pc.u9) - kw * int(pc.u11);
+                    if (tw < 0 || tw % int(pc.u7) != 0) continue;
+                    const int iw = tw / int(pc.u7);
+                    if (iw >= int(pc.u3)) continue;
+                    const uint ci = (rowb + uint(kh) * pc.u5 + uint(kw)) * hw + uint(ih) * pc.u3 + uint(iw);
+                    acc += pc.u15 != 0u ? F32Buf(pc.a).v[ci] : load_elem(DT, pc.a, ci);
+                }
+            }
+            store_elem(DT, pc.c, i, acc);
+        }
+    } else if (OP == MI_DEFORM_COL) {
+        // a X (C_in, H, W) of one image, b offset (dg 2 kk, Ho Wo), c mask (dg kk,
+        // Ho Wo) or 0, d col (Cg_in kk, pc) in DT for the pixels [p0, p0 + pc);
+        // u0 Cg_in, u1 H, u2 W, u3 Wo, u4 Ho Wo, u5 kH, u6 kW, u7 sh | sw << 16,
+        // u8 ph | pw << 16, u9 dh | dw << 16, u10 C_in / dg, u11 first input
+        // channel of the group, u12 p0, u13 pc
+        const uint kk = pc.u5 * pc.u6;
+        const int H = int(pc.u1), W = int(pc.u2);
+        const int sh = int(pc.u7 & 0xffffu), sw = int(pc.u7 >> 16);
+        const int ph = int(pc.u8 & 0xffffu), pw = int(pc.u8 >> 16);
+        const int dh = int(pc.u9 & 0xffffu), dw = int(pc.u9 >> 16);
+        for (uint i = gid; i < pc.u0 * kk * pc.u13; i += GRID_STRIDE_X) {
+            const uint r = i / pc.u13, sp = pc.u12 + i % pc.u13;
+            const uint icl = r / kk, tap = r % kk;
+            const int kh = int(tap / pc.u6), kw = int(tap % pc.u6);
+            const int oh = int(sp / pc.u3), ow = int(sp % pc.u3);
+            const uint ic = pc.u11 + icl;
+            if (pc.b == 0) {   // plain im2col (conv2d_backward_weight, modulated_conv2d_backward)
+                const int y = oh * sh - ph + kh * dh, x = ow * sw - pw + kw * dw;
+                const bool inb = y >= 0 && y < H && x >= 0 && x < W;
+                store_elem(DT, pc.d, i, inb ? load_elem(DT, pc.a, ic * uint(H * W) + uint(y * W + x)) : 0.0);
+                continue;
+            }
+            const uint og = ic / pc.u10;
+            const float oy = load_elem(DT, pc.b, (og * 2u * kk + 2u * tap) * pc.u4 + sp);
+            const float ox = load_elem(DT, pc.b, (og * 2u * kk + 2u * tap + 1u) * pc.u4 + sp);
+            const float m = pc.c != 0 ? load_elem(DT, pc.c, (og * kk + tap) * pc.u4 + sp) : 1.0;
+            const float y = float(oh * sh - ph + kh * dh) + oy;
+            const float x = float(ow * sw - pw + kw * dw) + ox;
+            store_elem(DT, pc.d, i, m * bilinear(pc.a, ic * uint(H * W), H, W, y, x));
+        }
+    }
+}

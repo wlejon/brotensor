@@ -75,7 +75,7 @@ struct AllocVTable {
 void register_backend(DeviceType dt, const OpsVTable& ops, const AllocVTable& alloc);
 void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc);
 
-// ─── The Device::CUDA -> HIP alias ─────────────────────────────────────────
+// ─── The Device::CUDA -> HIP (or Vulkan) alias ─────────────────────────────
 //
 // A HIP build compiles most of the CUDA kernels through a shim, and code
 // written before HIP existed names the GPU `Device::CUDA`. So that such code
@@ -93,8 +93,11 @@ void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc);
 //     before using it therefore sees the truth and picks its non-CUDA path;
 //     code that just says Device::CUDA gets the GPU that is there.
 //
-// With a CUDA backend registered (or no HIP backend) the alias is the
-// identity. Resolution happens here and nowhere else.
+// Without HIP, a registered Vulkan backend takes HIP's place: Device::cuda(i)
+// means Device::vulkan(i) by the same rule (a build with HIP and Vulkan keeps
+// the HIP alias; Vulkan is still never the default device on its own).
+// With a CUDA backend registered (or no HIP or Vulkan backend) the alias is
+// the identity. Resolution happens here and nowhere else.
 Device resolve_device_alias(Device d);
 
 // Dispatcher lookups (alias-resolved). Throw std::runtime_error if `d` is not

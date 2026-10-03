@@ -184,5 +184,7 @@ void run_quant_tests();     // test_vulkan_quant.cpp
 void run_audio_tests();     // test_vulkan_audio.cpp
 void run_quant_bench();     // test_vulkan_bench_quant.cpp
 void run_audio_bench();     // test_vulkan_bench_quant.cpp
+void run_misc_tests();      // test_vulkan_misc.cpp
+void run_vision_tests();    // test_vulkan_vision.cpp
 
 }  // namespace vkt

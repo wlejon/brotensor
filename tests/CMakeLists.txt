@@ -169,10 +169,14 @@ if(BROTENSOR_WITH_VULKAN)
                        test_vulkan_norm.cpp test_vulkan_attention.cpp test_vulkan_attention_ops.cpp
                        test_vulkan_conv.cpp test_vulkan_spatial.cpp test_vulkan_quant.cpp
                        test_vulkan_quant_attention.cpp test_vulkan_audio.cpp test_vulkan_sampling.cpp
+                       test_vulkan_misc.cpp test_vulkan_vision.cpp
                        test_vulkan_bench.cpp test_vulkan_bench_attention.cpp test_vulkan_bench_conv.cpp
                        test_vulkan_bench_quant.cpp)
     target_link_libraries(brotensor_test_vulkan PRIVATE brotensor_vulkan_internal)
     target_compile_options(brotensor_test_vulkan PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-missing-field-initializers>)
+    # Device::CUDA -> Vulkan when no HIP device is visible.
+    add_test(NAME brotensor_test_vulkan_cuda_alias COMMAND brotensor_test_vulkan --only=alias)
+    set_tests_properties(brotensor_test_vulkan_cuda_alias PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
     add_test(NAME brotensor_test_vulkan_default_device
              COMMAND brotensor_test_vulkan --expect-default-vulkan)
     set_tests_properties(brotensor_test_vulkan_default_device PROPERTIES
@@ -377,6 +381,18 @@ if(BROTENSOR_HAS_GPU)
         # through the unfused replay (src/jit/trace_eager.cpp) and is gated on
         # its numbers. The PTX-specific suites above have nothing to run.
         if(BROTENSOR_HAS_BRASS_JIT)
+            brotensor_add_test(brotensor_test_jit_trace_dtypes test_jit_trace_dtypes.cpp)
+        endif()
+    endif()
+    # The fused ops again on Vulkan (BROTENSOR_TEST_GPU picks it in
+    # parity_helpers.h); the trace tests run their Vulkan suites themselves.
+    if(BROTENSOR_WITH_VULKAN)
+        if(NOT TARGET brotensor_test_ops_fused)
+            brotensor_add_test(brotensor_test_ops_fused test_ops_fused.cpp)
+        endif()
+        add_test(NAME brotensor_test_ops_fused_vulkan COMMAND brotensor_test_ops_fused)
+        set_tests_properties(brotensor_test_ops_fused_vulkan PROPERTIES ENVIRONMENT "BROTENSOR_TEST_GPU=vulkan")
+        if(BROTENSOR_HAS_BRASS_JIT AND NOT TARGET brotensor_test_jit_trace_dtypes)
             brotensor_add_test(brotensor_test_jit_trace_dtypes test_jit_trace_dtypes.cpp)
         endif()
     endif()

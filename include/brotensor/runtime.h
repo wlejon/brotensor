@@ -61,8 +61,9 @@ int vulkan_device_count();
 // Device::CUDA on a HIP-only machine: these two report the hardware truth
 // (is_available(Device::CUDA) is false), while every call below that *acts*
 // on a device — set_default_device, DeviceScope, sync, the memory queries,
-// the tensor factories — takes Device::cuda(i) as Device::hip(i). The rule is
-// written out once, at detail::resolve_device_alias (detail/dispatch.h).
+// the tensor factories — takes Device::cuda(i) as Device::hip(i) (or, with
+// no HIP backend, Device::vulkan(i)). The rule is written out once, at
+// detail::resolve_device_alias (detail/dispatch.h).
 std::vector<Device> available_devices();
 bool is_available(Device);
 

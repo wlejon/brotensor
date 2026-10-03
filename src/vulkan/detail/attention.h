@@ -68,6 +68,11 @@ struct DenseExtras {
     std::uint64_t qmask = 0;         // FP32 (lq): rows with qmask < 0.5 are zero
     bool mask_ge = false;            // key valid when mask >= 0.5 (else > 0.5)
     std::uint64_t probs = 0;
+    // SAM's decomposed relative position (in place of bias and mask): FP32
+    // Bh (hq * lq, 2 grid_h - 1) and Bw (hq * lq, 2 grid_w - 1), lq = grid_h grid_w;
+    // key k of query q gains Bh[q, qh - kh + grid_h - 1] + Bw[q, qw - kw + grid_w - 1].
+    std::uint64_t rel_h = 0, rel_w = 0;
+    int grid_h = 0, grid_w = 0;
 };
 void dense_attention(DeviceCtx& d, const AttnProblem& p, const DenseExtras& x = {});
 

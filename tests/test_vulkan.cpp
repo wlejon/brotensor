@@ -23,6 +23,49 @@ std::uint64_t address(const Tensor& t) { return reinterpret_cast<std::uintptr_t>
 
 bool contains(const std::vector<Device>& v, Device d) { return std::find(v.begin(), v.end(), d) != v.end(); }
 
+// Device::CUDA without a CUDA backend: HIP when it is registered, else
+// Vulkan (detail::resolve_device_alias). Everything that acts on the device
+// lands there; is_available(Device::CUDA) stays false. ctest runs this a
+// second time with HIP hidden (brotensor_test_vulkan_cuda_alias).
+void test_cuda_alias() {
+    std::printf("Device::CUDA alias\n");
+    if (brotensor::is_available(Device::CUDA)) {
+        std::printf("  (CUDA backend present: alias is the identity, skipped)\n");
+        return;
+    }
+    VKT_CHECK(!brotensor::is_available(Device::CUDA));
+    const bool hip = brotensor::is_available(Device::HIP);
+    const Device target = hip ? Device::HIP : vk();
+    std::printf("  Device::CUDA -> %s\n", brotensor::to_string(target).c_str());
+    Tensor t = Tensor::zeros_on(Device::CUDA, 3, 5);
+    VKT_CHECK(t.device == target);
+    Tensor v = Tensor::view(Device::CUDA, t.data, 3, 5, Dtype::FP32);
+    VKT_CHECK(v.device == target);
+    Tensor w;
+    w.device = Device::CUDA;
+    w.resize(2, 2);
+    VKT_CHECK(w.device == target);
+    brotensor::add_scalar_inplace(t, 2.0f);
+    brotensor::sync(Device::CUDA);
+    const auto tv = t.to_host_vector();
+    VKT_CHECK(tv.size() == 15 && tv[7] == 2.0f);
+    {
+        brotensor::DeviceScope scope(Device::CUDA);
+        VKT_CHECK(brotensor::default_device() == target);
+        VKT_CHECK(Tensor::zeros(1, 1).device == target);
+    }
+    Tensor out;
+    out.device = Device::CUDA;
+    brotensor::relu_forward(t, out);
+    VKT_CHECK(out.device == target && out.data != nullptr);
+    if (!hip) {
+        std::size_t free_b = 0, total_b = 0;
+        VKT_CHECK(brotensor::device_mem_info(Device::CUDA, free_b, total_b) && total_b > 0);
+        brotensor::vulkan::flush(Device::CUDA);
+    }
+    std::printf("  PASS  Device::CUDA alias\n");
+}
+
 void test_registration(bool expect_default_vulkan) {
     std::printf("registration\n");
     VKT_CHECK(brotensor::vulkan_device_count() >= 1);
@@ -373,7 +416,7 @@ int main(int argc, char** argv) {
             vkt::run_audio_bench();
             return 0;
         }
-        if (only) {   // --only=ops|gemm|norm|attention|conv|spatial|quant|audio: one op group
+        if (only) {   // --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision: one op group
             if (filter == "ops") vkt::run_op_tests();
             if (filter == "gemm") vkt::run_gemm_tests();
             if (filter == "norm") vkt::run_norm_tests();
@@ -382,6 +425,9 @@ int main(int argc, char** argv) {
             if (filter == "spatial") vkt::run_spatial_tests();
             if (filter == "quant") vkt::run_quant_tests();
             if (filter == "audio") vkt::run_audio_tests();
+            if (filter == "misc") vkt::run_misc_tests();
+            if (filter == "alias") vkt::test_cuda_alias();
+            if (filter == "vision") vkt::run_vision_tests();
             std::printf("%s: %d failure(s)\n", vkt::failures() ? "FAILED" : "OK", vkt::failures());
             return vkt::failures() ? 1 : 0;
         }
@@ -392,6 +438,7 @@ int main(int argc, char** argv) {
             vkt::test_pipeline_guard();
             vkt::test_events_and_batching();
             vkt::test_graph();
+            vkt::test_cuda_alias();
             vkt::run_op_tests();
             vkt::run_gemm_tests();
             vkt::run_norm_tests();
@@ -400,6 +447,8 @@ int main(int argc, char** argv) {
             vkt::run_spatial_tests();
             vkt::run_quant_tests();
             vkt::run_audio_tests();
+            vkt::run_misc_tests();
+            vkt::run_vision_tests();
         }
     } catch (const std::exception& e) {
         std::printf("  FAIL  uncaught exception: %s\n", e.what());
