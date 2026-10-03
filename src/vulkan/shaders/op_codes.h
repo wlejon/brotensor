@@ -138,6 +138,25 @@
 #define GN_BN_INFER         2    // BatchNorm with running statistics
 #define GN_L2_NCHW          3    // per-pixel L2 normalise over channels
 #define GN_BIAS_GRAD        4    // dB[c] += sum over (n, hw) of dY (conv bias gradient)
+#define GN_BWD_CH           5    // GroupNorm backward: per (sample, channel) sum dY, sum dY xhat; tile stats
+#define GN_BWD_DX           6    // GroupNorm backward: dX
+#define GN_BWD_PARAM        7    // GroupNorm backward: dGamma += , dBeta += (sums over the batch)
+
+// scatter_add.comp (spec constant 0)
+#define SA_KEYS             0    // (row, m) sort keys, padded to a power of two
+#define SA_LOCAL            1    // the whole bitonic sort in shared memory (P <= 512)
+#define SA_STEP             2    // one global bitonic compare-exchange step
+#define SA_SUM              3    // per destination row: sum its run of source rows
+
+// resample_bwd.comp (spec constant 0)
+#define RB_INTERP           0    // nearest / bilinear half-pixel resample adjoint (gather)
+#define RB_ADAPTIVE         1    // adaptive average pool adjoint (gather)
+#define RB_PAD              2    // pad2d adjoint (gather)
+#define RB_MAXPOOL          3    // max pool adjoint, one plane per invocation in output order
+
+// lstm.comp (spec constant 0)
+#define LS_FWD              0    // one step's activations, c and h
+#define LS_BWD              1    // one step's pre-activation gradients and cell carry
 
 // bnorm.comp (spec constant 0)
 #define BN_TRAIN_FWD        0    // batch statistics, Y, saved mean / rstd, running-stat update

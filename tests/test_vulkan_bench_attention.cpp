@@ -8,7 +8,8 @@
 // median of 7 batches after warm-up (test_vulkan_bench.cpp's method). TF/s
 // counts 4 L^2 hd H flops (2 for Q K^T, 2 for P V), halved for causal.
 // BROTENSOR_VK_BENCH_SHAPE=<tag> runs one shape; BROTENSOR_VK_BENCH_NOHIP=1
-// skips the HIP column; BROTENSOR_VK_FA_CFG=bc,nsg forces the fa_cm tile.
+// skips the HIP column; BROTENSOR_VK_FA_CFG=bc,nsg forces the fa_cm tile;
+// BROTENSOR_VK_BENCH_PART=prefill|causal|decode|bwd runs one part.
 
 #include "test_vulkan_common.h"
 
@@ -134,6 +135,37 @@ void bench_decode() {
     }
 }
 
+// flash_attention_backward (FP16), TF/s counting the usual 10 L^2 hd H
+// backward flops (halved for causal).
+void bench_backward() {
+    std::printf("\nbackward, FP16, flash_attention_backward (ms / TF/s)\n");
+    std::printf("%-26s %16s %16s %8s\n", "shape", "vulkan", "hip", "vk/hip");
+    struct B { int L, H, hd; bool causal; };
+    const B shapes[] = {{512, 8, 64, false}, {1024, 16, 64, false}, {1024, 16, 64, true},
+                        {2048, 8, 128, true}, {2048, 16, 64, false}};
+    const bool hip = hip_ok();
+    for (const B& s : shapes) {
+        const int D = s.H * s.hd;
+        const double flop = 10.0 * s.L * double(s.L) * s.hd * s.H * (s.causal ? 0.5 : 1.0);
+        double ms[2] = {0, 0};
+        for (int b = 0; b < (hip ? 2 : 1); ++b) {
+            const Device dev = b == 0 ? vk() : Device::hip(0);
+            Problem p(dev, s.L, s.L, D, D);
+            Tensor g = upload(random_values(std::size_t(s.L) * D, 4, -1.0f, 1.0f, Dtype::FP16), s.L, D, Dtype::FP16, dev);
+            Tensor dQ, dK, dV;
+            ms[b] = median_ms(dev, [&] {
+                brotensor::flash_attention_backward(p.Q, p.K, p.V, p.Q, g, nullptr, s.H, s.causal, dQ, dK, dV);
+            });
+        }
+        char tag[48], a[32], c[32];
+        std::snprintf(tag, sizeof tag, "L%d-h%d-d%d%s", s.L, s.H, s.hd, s.causal ? " causal" : "");
+        std::snprintf(a, sizeof a, "%.3f / %5.2f", ms[0], flop / (ms[0] * 1e9));
+        if (hip) std::snprintf(c, sizeof c, "%.3f / %5.2f", ms[1], flop / (ms[1] * 1e9));
+        else std::snprintf(c, sizeof c, "-");
+        std::printf("%-26s %16s %16s %8.2f\n", tag, a, c, hip ? ms[1] / ms[0] : 0.0);
+    }
+}
+
 }  // namespace
 
 void run_attention_bench() {
@@ -143,6 +175,7 @@ void run_attention_bench() {
     if (!part || std::string(part) == "prefill") bench_prefill(false);
     if (!part || std::string(part) == "causal") bench_prefill(true);
     if (!part || std::string(part) == "decode") bench_decode();
+    if (!part || std::string(part) == "bwd") bench_backward();
 }
 
 }  // namespace vkt

@@ -1,0 +1,158 @@
+#version 460
+// Adjoints of the NCHW resamples, padding and pooling (ops_spatial_bwd.cpp),
+// FP32 arithmetic, dY / dX in -DDT. Spec constant 0 = RB_* (op_codes.h).
+// Gather form: one invocation per input element (n, c, h, w) enumerates the
+// output positions that read it, per axis (the ops are separable), and sums
+// weight x dY over them, so nothing is accumulated atomically:
+//   RB_INTERP    interp2d_backward / upsample_bilinear_2x_backward: half-pixel
+//                nearest (IMODE 0) or bilinear (IMODE 1), the forward's exact
+//                rational coordinates (resample.comp), candidate outputs in a
+//                window around h out / in
+//   RB_ADAPTIVE  adaptive_avg_pool2d_backward: the windows holding h, each
+//                term dY / area as the CPU reference
+//   RB_PAD       pad2d_backward: the interior position plus, per mode, the
+//                reflected positions or the replicated edge runs
+//   RB_MAXPOOL   max_pool2d_backward: one invocation per (n, c) plane walks
+//                its outputs in order adding dY into dX[Idx] (FP32 dX: the
+//                scratch for 16-bit), the CPU reference's own order
+#include "common.glsl"
+#include "op_codes.h"
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+layout(constant_id = 1) const uint IMODE = 1;   // RB_INTERP: 0 nearest, 1 bilinear; RB_PAD: pad mode
+
+layout(push_constant) uniform PC {
+    uint64_t dy, dx, aux;   // aux: RB_MAXPOOL Idx (INT32)
+    uint planes;            // N * C
+    uint hi, wi, ho, wo;    // input (dX) and output (dY) spatial sizes
+    int pt, pl;             // RB_PAD: top / left padding
+} pc;
+
+int64_t floor_div(int64_t num, int64_t den, out int64_t rem) {
+    int64_t q = num / den;
+    int64_t r = num - q * den;
+    if (r < 0) { q -= 1; r += den; }
+    rem = r;
+    return q;
+}
+
+// Weight output index o gives input index i along one axis (half-pixel).
+float interp_weight(int o, int i, uint in_dim, uint out_dim) {
+    int64_t rem;
+    const int64_t num = int64_t(2 * o + 1) * int64_t(in_dim) - int64_t(out_dim);
+    const int64_t den = 2l * int64_t(out_dim);
+    const int i0 = int(floor_div(num, den, rem));
+    const int last = int(in_dim) - 1;
+    if (IMODE == 0) {
+        const int64_t twice = 2l * rem;
+        const int r = twice > den ? i0 + 1 : (twice < den ? i0 : i0 + (i0 & 1));
+        return clamp(r, 0, last) == i ? 1.0 : 0.0;
+    }
+    const float f = float(rem) / float(den);
+    float w = 0.0;
+    if (clamp(i0, 0, last) == i) w += 1.0 - f;
+    if (clamp(i0 + 1, 0, last) == i) w += f;
+    return w;
+}
+
+// Outputs that can read input i: a window around i out / in, widened to the
+// border for the edge rows (clamped taps).
+void interp_range(int i, uint in_dim, uint out_dim, out int lo, out int hi) {
+    const int64_t in2 = 2l * int64_t(in_dim);
+    lo = int((int64_t(2 * i - 2) * int64_t(out_dim) - int64_t(in_dim)) / in2) - 1;
+    hi = int((int64_t(2 * i + 3) * int64_t(out_dim) - int64_t(in_dim)) / in2) + 1;
+    if (i == 0) lo = 0;
+    if (i == int(in_dim) - 1) hi = int(out_dim) - 1;
+    lo = max(lo, 0);
+    hi = min(hi, int(out_dim) - 1);
+}
+
+void adaptive(int o, uint in_dim, uint out_dim, out int a, out int b) {
+    a = int((uint(o) * in_dim) / out_dim);
+    b = int(((uint(o) + 1u) * in_dim + out_dim - 1u) / out_dim);
+}
+
+// Padded positions [a, b] (up to three runs) whose source is i, along an axis
+// of length L padded by pad_lo in front, total length lp.
+void pad_runs(int i, int L, int pad_lo, int lp, out ivec2 r[3], out int n) {
+    n = 0;
+    r[0] = r[1] = r[2] = ivec2(0, -1);
+    r[n++] = ivec2(i + pad_lo, i + pad_lo);   // interior
+    if (IMODE == 2) {   // replicate: the edge sample takes the whole margin
+        if (i == 0 && pad_lo > 0) r[n++] = ivec2(0, pad_lo - 1);
+        if (i == L - 1 && pad_lo + L < lp) r[n++] = ivec2(pad_lo + L, lp - 1);
+    } else if (IMODE == 1 && L > 1) {   // reflect without repeating the edge
+        const int left = pad_lo - i;                    // rel = -i
+        if (i >= 1 && left >= 0) r[n++] = ivec2(left, left);
+        const int right = pad_lo + 2 * (L - 1) - i;     // rel = 2 (L - 1) - i
+        if (i <= L - 2 && right < lp) r[n++] = ivec2(right, right);
+    }
+}
+
+void main() {
+    if (MODE == RB_MAXPOOL) {
+        const uint plane_i = pc.hi * pc.wi, plane_o = pc.ho * pc.wo;
+        for (uint pl = gl_GlobalInvocationID.x; pl < pc.planes; pl += GRID_STRIDE_X) {
+            const uint xb = pl * plane_i, yb = pl * plane_o;
+            for (uint i = 0; i < plane_i; ++i) F32Buf(pc.dx).v[xb + i] = 0.0;
+            for (uint o = 0; o < plane_o; ++o) {
+                const int idx = I32Buf(pc.aux).v[yb + o];
+                if (idx < 0 || uint(idx) >= plane_i) continue;
+                F32Buf(pc.dx).v[xb + uint(idx)] += load_elem(DT, pc.dy, yb + o);
+            }
+        }
+        return;
+    }
+    const uint plane_i = pc.hi * pc.wi, plane_o = pc.ho * pc.wo;
+    const uint total = pc.planes * plane_i;
+    for (uint e = gl_GlobalInvocationID.x; e < total; e += GRID_STRIDE_X) {
+        const uint pl = e / plane_i, p = e % plane_i;
+        const int h = int(p / pc.wi), w = int(p % pc.wi);
+        const uint yb = pl * plane_o;
+        float acc = 0.0;
+        if (MODE == RB_INTERP) {
+            int ylo, yhi, xlo, xhi;
+            interp_range(h, pc.hi, pc.ho, ylo, yhi);
+            interp_range(w, pc.wi, pc.wo, xlo, xhi);
+            for (int oh = ylo; oh <= yhi; ++oh) {
+                const float wy = interp_weight(oh, h, pc.hi, pc.ho);
+                if (wy == 0.0) continue;
+                float row = 0.0;
+                for (int ow = xlo; ow <= xhi; ++ow) {
+                    const float wx = interp_weight(ow, w, pc.wi, pc.wo);
+                    if (wx != 0.0) row += wx * load_elem(DT, pc.dy, yb + uint(oh) * pc.wo + uint(ow));
+                }
+                acc += wy * row;
+            }
+        } else if (MODE == RB_ADAPTIVE) {
+            const int ylo = max(0, int((uint(h) * pc.ho) / pc.hi) - 1);
+            const int yhi = min(int(pc.ho) - 1, int(((uint(h) + 1u) * pc.ho + pc.hi - 1u) / pc.hi));
+            const int xlo = max(0, int((uint(w) * pc.wo) / pc.wi) - 1);
+            const int xhi = min(int(pc.wo) - 1, int(((uint(w) + 1u) * pc.wo + pc.wi - 1u) / pc.wi));
+            for (int oh = ylo; oh <= yhi; ++oh) {
+                int h0, h1;
+                adaptive(oh, pc.hi, pc.ho, h0, h1);
+                if (h < h0 || h >= h1) continue;
+                for (int ow = xlo; ow <= xhi; ++ow) {
+                    int w0, w1;
+                    adaptive(ow, pc.wi, pc.wo, w0, w1);
+                    if (w < w0 || w >= w1) continue;
+                    acc += load_elem(DT, pc.dy, yb + uint(oh) * pc.wo + uint(ow)) / float((h1 - h0) * (w1 - w0));
+                }
+            }
+        } else if (MODE == RB_PAD) {
+            ivec2 ry[3], rx[3];
+            int ny, nx;
+            pad_runs(h, int(pc.hi), pc.pt, int(pc.ho), ry, ny);
+            pad_runs(w, int(pc.wi), pc.pl, int(pc.wo), rx, nx);
+            for (int a = 0; a < ny; ++a)
+                for (int y = ry[a].x; y <= ry[a].y; ++y)
+                    for (int b = 0; b < nx; ++b)
+                        for (int x = rx[b].x; x <= rx[b].y; ++x)
+                            acc += load_elem(DT, pc.dy, yb + uint(y) * pc.wo + uint(x));
+        }
+        store_elem(DT, pc.dx, e, acc);
+    }
+}

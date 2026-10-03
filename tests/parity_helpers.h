@@ -10,6 +10,8 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include "gpu_select.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -25,32 +27,14 @@ using brotensor::Tensor;
 // ─── GPU backend selection ─────────────────────────────────────────────────
 //
 // The parity suite is backend-neutral: it runs the same device-neutral op on
-// the CPU and on whichever GPU backend this binary was built with. Prefer
-// CUDA when present, else Metal. Returns Device::CPU as a sentinel meaning
-// "no GPU backend" — run_all() checks this up front and skips the suite.
+// the CPU and on whichever GPU backend this binary was built with
+// (gpu_select.h: BROTENSOR_TEST_GPU, else CUDA, HIP, Metal, Vulkan). Returns
+// Device::CPU as a sentinel meaning "no GPU backend" — run_all() checks this
+// up front and skips the suite.
 //
 // First call must happen after brotensor::init() (run_all guarantees this);
 // the result is cached.
-inline brotensor::Device gpu_device() {
-    using brotensor::Device;
-    static const Device d = [] {
-        // BROTENSOR_TEST_GPU=vulkan|hip|cuda|metal picks that backend when it
-        // is available (Vulkan is never picked otherwise: it is never a
-        // default device).
-        if (const char* e = std::getenv("BROTENSOR_TEST_GPU")) {
-            const std::string want(e);
-            const Device pick = want == "vulkan" ? Device::VULKAN : want == "hip" ? Device::HIP
-                              : want == "cuda"   ? Device::CUDA   : want == "metal" ? Device::Metal
-                                                                                    : Device::CPU;
-            if (!pick.is_cpu() && brotensor::is_available(pick)) return pick;
-        }
-        if (brotensor::is_available(Device::HIP))   return Device::HIP;
-        if (brotensor::is_available(Device::CUDA))  return Device::CUDA;
-        if (brotensor::is_available(Device::Metal)) return Device::Metal;
-        return Device::CPU;
-    }();
-    return d;
-}
+inline brotensor::Device gpu_device() { return bt_test::gpu(); }
 
 // ─── Test registry ─────────────────────────────────────────────────────────
 

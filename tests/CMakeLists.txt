@@ -170,6 +170,8 @@ if(BROTENSOR_WITH_VULKAN)
                        test_vulkan_conv.cpp test_vulkan_spatial.cpp test_vulkan_quant.cpp
                        test_vulkan_quant_attention.cpp test_vulkan_audio.cpp test_vulkan_sampling.cpp
                        test_vulkan_misc.cpp test_vulkan_vision.cpp test_vulkan_capture.cpp test_vulkan_train.cpp
+                       test_vulkan_train_fa.cpp test_vulkan_train_spatial.cpp
+                       test_vulkan_train_spatial2.cpp
                        test_vulkan_bench.cpp test_vulkan_bench_attention.cpp test_vulkan_bench_conv.cpp
                        test_vulkan_bench_quant.cpp)
     target_link_libraries(brotensor_test_vulkan PRIVATE brotensor_vulkan_internal)
@@ -211,11 +213,15 @@ if(BROTENSOR_WITH_HIP AND BROTENSOR_WITH_VULKAN)
     set_tests_properties(brotensor_test_vulkan_hip_parity PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 endif()
 
-# --- GPU tests (CUDA or Metal) ---
+# --- GPU tests (CUDA, Metal, HIP or Vulkan) ---
+# Backend-neutral: each suite runs on gpu_select.h's device (BROTENSOR_TEST_GPU,
+# else the first registered of CUDA, HIP, Metal, Vulkan) and names the GPU as
+# Device::CUDA, which aliases to HIP or Vulkan when there is no CUDA backend.
 set(BROTENSOR_HAS_GPU OFF)
-if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL OR BROTENSOR_WITH_HIP)
+if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL OR BROTENSOR_WITH_HIP OR BROTENSOR_WITH_VULKAN)
     set(BROTENSOR_HAS_GPU ON)
 endif()
+get_property(_bt_tests_before_gpu DIRECTORY PROPERTY TESTS)
 
 if(BROTENSOR_HAS_GPU)
     brotensor_add_test(brotensor_test test_tensor.cpp)
@@ -435,6 +441,37 @@ if(BROTENSOR_HAS_GPU)
         endforeach()
         set_tests_properties(brotensor_test_graph_capture_alloc_vulkan PROPERTIES RUN_SERIAL TRUE)
     endif()
+endif()
+
+# The generic GPU suites again on Vulkan when the build has another GPU
+# backend as well (with Vulkan alone the registrations above already run on
+# it): <name>_vulkan with Vulkan as the test GPU and the default device, so
+# Device::CUDA aliases to Vulkan. Not repeated: the suites that register their
+# own _vulkan run (cuda_graph, graph_capture_alloc, ops_fused), the trace-JIT
+# suite (it runs its Vulkan cases itself) and the CUDA-only ones.
+get_property(_bt_tests_after_gpu DIRECTORY PROPERTY TESTS)
+if(BROTENSOR_WITH_VULKAN AND (BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_HIP OR BROTENSOR_WITH_METAL))
+    set(_bt_no_vulkan_rerun
+        brotensor_test_cuda_graph brotensor_test_graph_capture_alloc brotensor_test_ops_fused
+        brotensor_test_jit_trace_dtypes brotensor_test_streams brotensor_test_linear_rounding
+        brotensor_test_linear_rounding_wmma brotensor_test_multigpu brotensor_test_cuda_jit
+        brotensor_test_cuda_jit_gemv brotensor_test_cuda_graph_jit brotensor_test_cuda_jit_quant)
+    foreach(_t IN LISTS _bt_tests_after_gpu)
+        if(_t IN_LIST _bt_tests_before_gpu OR _t IN_LIST _bt_no_vulkan_rerun OR _t MATCHES "vulkan")
+            continue()
+        endif()
+        set(_bt_vk_name ${_t}_vulkan)
+        if(_t STREQUAL "brotensor_test")   # brotensor_test_vulkan is the Vulkan backend's own suite
+            set(_bt_vk_name brotensor_test_tensor_vulkan)
+        endif()
+        add_test(NAME ${_bt_vk_name} COMMAND ${_t})
+        set_tests_properties(${_bt_vk_name} PROPERTIES
+            ENVIRONMENT "BROTENSOR_TEST_GPU=vulkan;BROTENSOR_DEFAULT_DEVICE=vulkan")
+        get_test_property(${_t} RUN_SERIAL _bt_serial)
+        if(_bt_serial)
+            set_tests_properties(${_bt_vk_name} PROPERTIES RUN_SERIAL TRUE)
+        endif()
+    endforeach()
 endif()
 
 # With HIP and Vulkan both in the build, Vulkan is the default device and the

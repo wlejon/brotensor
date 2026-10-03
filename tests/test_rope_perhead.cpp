@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <random>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Tensor;
 using brotensor::Dtype;
@@ -119,7 +120,7 @@ int main() {
     }
 
     // ── GPU (CUDA, or HIP through the CUDA alias) FP32 + FP16 parity ──────
-    if (brotensor::is_available(Device::CUDA) || brotensor::is_available(Device::HIP)) {
+    if (bt_test::has_gpu()) {
         Tensor Cg = Tensor::from_host_on(Device::CUDA, C.data(), L * nh, half);
         Tensor Sg = Tensor::from_host_on(Device::CUDA, S.data(), L * nh, half);
         {

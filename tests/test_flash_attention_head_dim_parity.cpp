@@ -18,7 +18,7 @@
 // Coverage per backend: shapes CUDA accepts (FP16/BF16, head_dim <= 1024 on
 // the scalar kernels) run on every GPU backend this binary has; FP32 inputs
 // and the head_dims past CUDA's limits run where the backend takes them —
-// currently HIP — and print a skip elsewhere.
+// HIP and Vulkan — and print a skip elsewhere.
 
 #include "parity_helpers.h"
 
@@ -36,9 +36,10 @@ using brotensor::Dtype;
 
 namespace {
 
-bool gpu_is_hip() { return gpu_device().is_hip(); }
+bool gpu_is_hip() { return gpu_device().is_hip() || gpu_device().is_vulkan(); }
 
-// FP32 inputs and head_dims past CUDA's register-tile / LDS limits.
+// FP32 inputs and head_dims past CUDA's register-tile / LDS limits: HIP and
+// Vulkan take both.
 bool skip_unless_hip(const char* what) {
     if (gpu_is_hip()) return false;
     std::printf("    (skipped on this backend: %s)\n", what);

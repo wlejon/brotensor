@@ -9,6 +9,7 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -158,6 +159,21 @@ inline bool expect_close(const std::vector<float>& got, const std::vector<float>
     return true;
 }
 
+// |got - want| <= rel * max|want| + 1e-7 (sums of many products in another
+// order: the error scales with the largest output). Prints the worst
+// difference relative to max|want|.
+inline bool expect_scaled(const std::vector<float>& got, const std::vector<float>& want, float rel,
+                          const std::string& tag) {
+    float m = 0;
+    for (float v : want) m = std::max(m, std::fabs(v));
+    double worst = 0;
+    for (std::size_t i = 0; i < got.size() && i < want.size(); ++i) {
+        if (std::isfinite(got[i]) && std::isfinite(want[i])) worst = std::max(worst, std::fabs(double(got[i]) - want[i]));
+    }
+    std::printf("        %s: max|diff| / max|want| = %.3g\n", tag.c_str(), m > 0 ? worst / m : worst);
+    return expect_close(got, want, rel * m + 1e-7f, 0, tag);
+}
+
 inline bool expect_equal_bits(const void* a, const void* b, std::size_t n, const std::string& tag) {
     if (std::memcmp(a, b, n) != 0) {
         std::printf("  FAIL  %s: bytes differ\n", tag.c_str());
@@ -187,6 +203,9 @@ void run_audio_bench();     // test_vulkan_bench_quant.cpp
 void run_misc_tests();      // test_vulkan_misc.cpp
 void run_vision_tests();    // test_vulkan_vision.cpp
 void run_capture_tests();   // test_vulkan_capture.cpp
-void run_train_tests();     // test_vulkan_train.cpp
+void run_train_tests();     // test_vulkan_train.cpp (calls the run_train_*_tests below)
+void run_train_fa_tests();  // test_vulkan_train_fa.cpp
+void run_train_spatial_tests();  // test_vulkan_train_spatial.cpp
+void run_train_spatial2_tests(); // test_vulkan_train_spatial2.cpp
 
 }  // namespace vkt

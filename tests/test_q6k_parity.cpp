@@ -18,19 +18,6 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
-#if defined(BROTENSOR_HAS_HIP)
-#include <hip/hip_runtime.h>
-#define cudaMemcpy hipMemcpy
-#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
-#elif defined(BROTENSOR_HAS_CUDA)
-#include <cuda_runtime.h>
-#else
-#include <cstring>
-static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
-    std::memcpy(dst, src, n);
-}
-#define cudaMemcpyHostToDevice 0
-#endif
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +26,7 @@ static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
 #include <cstring>
 #include <random>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Device;
 using brotensor::Dtype;
@@ -167,18 +155,13 @@ static std::vector<uint16_t> to_fp16_vec(const std::vector<float>& v) {
 int main() {
     brotensor::init();
     Device dev;
-    if (brotensor::is_available(brotensor::Device::HIP)) {
-        dev = Device::HIP;
-    } else if (brotensor::is_available(brotensor::Device::CUDA)) {
-        dev = Device::CUDA;
-    } else if (brotensor::is_available(brotensor::Device::Metal)) {
-        dev = Device::Metal;
-    } else {
+    dev = bt_test::gpu();
+    if (dev.is_cpu()) {
         std::printf("no GPU backend available - skipping\n");
         return 0;
     }
     std::printf("test_q6k_parity (device=%s)\n",
-                dev == Device::HIP ? "HIP" : (dev == Device::CUDA ? "CUDA" : "Metal"));
+                bt_test::gpu_name());
 
     constexpr int OUT = 64;
     constexpr int IN  = 256;
@@ -200,9 +183,7 @@ int main() {
     auto Wd_fp16 = to_fp16_vec(Wd);
 
     Tensor W_q6k_g = Tensor::empty_on(dev, OUT, IN, Dtype::Q6_K);
-    cudaMemcpy(W_q6k_g.data, Wq.data(),
-               static_cast<size_t>(OUT) * BPR * Q6K_BYTES,
-               cudaMemcpyHostToDevice);
+    W_q6k_g.copy_from_host_raw(Wq.data(), static_cast<size_t>(OUT) * BPR * Q6K_BYTES);
 
     // ─── A: dequant ───────────────────────────────────────────────────────
     {
@@ -334,9 +315,7 @@ int main() {
             }
         }
         Tensor Wg2 = Tensor::empty_on(dev, OUT2, IN2, Dtype::Q6_K);
-        cudaMemcpy(Wg2.data, Wq2.data(),
-                   static_cast<size_t>(OUT2) * BPR2 * Q6K_BYTES,
-                   cudaMemcpyHostToDevice);
+        Wg2.copy_from_host_raw(Wq2.data(), static_cast<size_t>(OUT2) * BPR2 * Q6K_BYTES);
 
         std::vector<float> Xf2(static_cast<size_t>(B2) * IN2);
         for (auto& v : Xf2) v = dx2(rng);

@@ -20,28 +20,15 @@
 #include <brotensor/tensor.h>
 
 // The quantized weight is staged as raw host bytes and pushed into a device
-// tensor. Metal's storage is host-addressable so a plain std::memcpy lands,
-// but a CUDA Tensor::data is a bare cudaMalloc pointer — writing it from the
-// host segfaults. Same shim as test_q4k_parity.cpp.
-#if defined(BROTENSOR_HAS_HIP)
-#include <hip/hip_runtime.h>
-#define cudaMemcpy hipMemcpy
-#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
-#elif defined(BROTENSOR_HAS_CUDA)
-#include <cuda_runtime.h>
-#else
-#include <cstring>
-static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
-    std::memcpy(dst, src, n);
-}
-#define cudaMemcpyHostToDevice 0
-#endif
+// tensor with Tensor::copy_from_host_raw (a CUDA / HIP pointer cannot be
+// written from the host, and a Vulkan one is a device address).
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Device;
 using brotensor::Dtype;
@@ -87,7 +74,7 @@ Tensor make_quant_weight(int out, int in, Dtype dt,
         }
     }
     Tensor W = Tensor::empty_on(g_dev, out, in, dt);
-    cudaMemcpy(W.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice);
+    W.copy_from_host_raw(bytes.data(), bytes.size());
     return W;
 }
 
@@ -153,12 +140,10 @@ void run_case(const char* name, Dtype dt, int block_bytes, int block_elems,
 
 int main() {
     brotensor::init();
-    if (brotensor::is_available(Device::HIP))        g_dev = Device::HIP;
-    else if (brotensor::is_available(Device::CUDA))  g_dev = Device::CUDA;
-    else if (brotensor::is_available(Device::Metal)) g_dev = Device::Metal;
-    else { std::printf("no GPU backend available - skipping\n"); return 0; }
+    g_dev = bt_test::gpu();
+    if (g_dev.is_cpu()) { std::printf("no GPU backend available - skipping\n"); return 0; }
     std::printf("test_quant_prefill_parity (device=%s)\n",
-                g_dev == Device::HIP ? "HIP" : (g_dev == Device::CUDA ? "CUDA" : "Metal"));
+                bt_test::gpu_name());
 
     for (bool bias : {false, true}) {
         run_case("q4k",  Dtype::Q4_K, 144, 256,

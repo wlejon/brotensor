@@ -116,11 +116,28 @@ void test_registration(bool expect_default_vulkan) {
     // Ops between devices are rejected by the dispatcher.
     Tensor a = Tensor::zeros_on(vk(), 2, 2), c = Tensor::zeros_on(Device::cpu(), 2, 2);
     VKT_CHECK(throws([&] { brotensor::add_inplace(a, c); }));
-    // An op the backend does not implement names the device.
+    // Every op-table slot is filled except the by-design ones: two host-only
+    // ops (always run on the CPU table) and filtered_lrelu, whose public op
+    // falls back to its bias_act + upfirdn2d composite.
+    const auto& ops = brotensor::detail::ops_for(vk());
+    std::vector<std::string> nulls;
+#define VKT_NULL_SLOT(name, ret, params) \
+    if (!ops.name) nulls.push_back(#name);
+    BROTENSOR_FOR_EACH_OP(VKT_NULL_SLOT)
+#undef VKT_NULL_SLOT
+    const std::vector<std::string> by_design = {"mse_scalar", "softmax_xent_segment", "filtered_lrelu_forward",
+                                                "filtered_lrelu_backward"};
+    for (const std::string& n : nulls) {
+        if (std::find(by_design.begin(), by_design.end(), n) == by_design.end()) {
+            std::printf("  FAIL  op-table slot %s is null on Vulkan\n", n.c_str());
+            ++failures();
+        }
+    }
+    std::printf("  op table: %zu null slots on Vulkan (by design)\n", nulls.size());
+    // A null slot's error names the device.
     bool named = false;
     try {
-        Tensor dq, dk, dv;   // attention backwards: not on Vulkan yet
-        brotensor::flash_attention_backward(a, a, a, a, a, nullptr, 1, false, dq, dk, dv);
+        brotensor::detail::throw_not_implemented("some_op", vk());
     } catch (const std::exception& e) {
         named = std::string(e.what()).find("vulkan") != std::string::npos;
     }

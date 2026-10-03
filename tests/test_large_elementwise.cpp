@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Tensor;
 using brotensor::Dtype;
@@ -258,7 +259,7 @@ static void test_geglu_exact_backward_fp16_big() {
 int main() {
     std::printf("test_large_elementwise: exercising kernels at >1M elements\n");
     brotensor::init();
-    if (!(brotensor::is_available(brotensor::Device::CUDA) || brotensor::is_available(brotensor::Device::HIP))) {
+    if (!bt_test::has_gpu()) {
         std::printf("no CUDA/HIP backend - skipping\n");
         return 0;
     }

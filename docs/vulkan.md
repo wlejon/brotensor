@@ -59,11 +59,14 @@ mean pooling (+ backward), the slot / causal masks, `threshold_u8`,
 `upfirdn2d`, `modulated_conv2d` (forward and backward: GAN inversion runs
 one), `conv2d_backward_weight`, `attention_forward`,
 `cross_attention_forward_train`, `xavier_init`, `sgd_step`, `adam_step` and
-the MSE losses: 242 of 270 slots. The 28 null slots are training backwards
-(attention, LSTM, BatchNorm training, the spatial backwards not named), two
-host-only ops and filtered_lrelu (a composite of bias_act + upfirdn2d by
-design). `docs/vulkan-coverage.md` lists every slot and, per sibling, what its
-inference and training code calls.
+the MSE losses: 242 of 270 slots. Chunk 8 added the attention / MHA
+backwards, training BatchNorm and BCE; chunk 9 the rest of the training
+surface (the flash-attention backwards, GroupNorm / ResBlock backwards, the
+scatter-adds, the transposed-convolution, resample, padding and pooling
+backwards, LSTM training): 266 of 270. The 4 null slots are two host-only
+ops and filtered_lrelu (a composite of bias_act + upfirdn2d by design), none
+of which is ever dispatched to Vulkan. `docs/vulkan-coverage.md` lists every
+slot and, per sibling, what its inference and training code calls.
 **Default device.** Without a CUDA or Metal backend, Vulkan is the default
 device, also in a build that registers HIP as well: on the AMD GPUs both
 drive it runs every sibling model faster (1.1-3x on SD1.5, PixArt, Sana,
@@ -73,16 +76,17 @@ CUDA, Metal, Vulkan, HIP (`pick_default_from_available`, `src/init.cpp`).
 Vulkan again, for comparisons (`detail::prefer_hip()`). A HIP-only build is
 unchanged. Otherwise select it with `set_default_device(Device::vulkan(i))`, a
 `DeviceScope`, or `BROTENSOR_DEFAULT_DEVICE=vulkan` (also `vk`, `vulkan:1`).
-An op in a null slot throws "not implemented on vulkan": the training
-backwards listed in vulkan-coverage.md, so training code that runs on the
-default device needs HIP (or names it) on an AMD machine.
+An op in a null slot throws "not implemented on vulkan"; since chunk 9 no
+public op reaches one (training included).
 `Device::cuda(i)` aliases to `Device::vulkan(i)` when no CUDA backend is
 registered and Vulkan is (`detail::resolve_device_alias`), unless HIP is
 registered and preferred, or HIP is the only one: then it is `Device::hip(i)`.
 In a HIP + Vulkan build the generic test suites (which name the GPU as
 `Device::CUDA` and were written as the HIP backend's tests) run with
-`BROTENSOR_PREFER_HIP=1` (`tests/CMakeLists.txt`); Vulkan's own suites are the
-registrations named `*vulkan*`.
+`BROTENSOR_PREFER_HIP=1` (`tests/CMakeLists.txt`), and again on Vulkan as
+`<name>_vulkan` (`BROTENSOR_TEST_GPU=vulkan`, `BROTENSOR_DEFAULT_DEVICE=vulkan`;
+`tests/gpu_select.h` is the one device rule every suite uses); in a
+Vulkan-only build the plain registrations run on Vulkan.
 Trace-JIT (`jit::*`) DAGs on Vulkan are replayed op by op through the
 dispatched ops (`src/jit/trace_eager.cpp`), as on HIP: there is no Vulkan
 trace compiler, and the CPU one must never see a buffer device address. The
@@ -128,8 +132,8 @@ src/vulkan/
                                 (elementwise, copy, reduce, linear, norm, rope, glu, attention,
                                 attention_proj, topk, xent, conv, gnorm, spatial, diffusion,
                                 quant, quant_attention, audio, spectral, sampling, misc, delta,
-                                vision, attention_bwd; ops_attention_dense.cpp is the materialised path the
-                                others call)
+                                vision, attention_bwd, fa_bwd, scatter, spatial_bwd, lstm;
+                                ops_attention_dense.cpp is the materialised path the others call)
   shaders/                      *.comp kernels, common.glsl, gemm_common.glsl, math_acc.glsl
                                 (accurate exp / log / sincos), quant_decode.glsl (the quantised
                                 chunk loads / decodes), op_codes.h, shaders.cmake (the list)
@@ -157,8 +161,11 @@ tests/test_vulkan_vision.cpp    SAM rel-pos attention, deform / modulated conv (
                                 conv2d_backward_weight, attention_forward, cross_attention_forward_train
 tests/test_vulkan_capture.cpp   the device-neutral CudaGraphCapture on Vulkan, custom kernels
                                 (--only=capture; shaders in tests/vulkan_shaders/)
-tests/test_vulkan_train.cpp     attention / MHA / self / cross attention backwards, training BatchNorm, BCE
-                                (--only=train)
+tests/test_vulkan_train.cpp     attention / MHA / self / cross attention backwards, training BatchNorm, BCE,
+                                LSTM (--only=train; runs the three below too)
+tests/test_vulkan_train_fa.cpp  flash-attention backwards (bare, varlen, packed QKV, QKVO)
+tests/test_vulkan_train_spatial.cpp   GroupNorm / ResBlock backwards
+tests/test_vulkan_train_spatial2.cpp  scatter-adds, conv_transpose2d backwards, resample / pad / pool backwards
 tests/test_vulkan_common.h
 ```
 
@@ -818,27 +825,13 @@ arithmetic bounds it), complex_abs 685 (cache-resident).
 These are correctness-first: none of them was benchmarked against HIP in
 chunk 6.
 
-## Training ops (chunk 8)
+## Training ops
 
-* **Attention backwards** (`ops_attention_bwd.cpp`, `attn_bwd.comp`):
-  `attention_backward`, `mha_backward` (+ the optional bias gradients),
-  `self_attention_backward` and `cross_attention_backward`, the backwards of
-  the materialised-probability forwards brogameagent's Attention / MHA /
-  transformer layers train through. FP32, as the CPU. Each is FP32 GEMMs
-  through `gemm()` (the per-head products are batched GEMMs over the head's
-  columns of the (L, D) matrices, so no head split / merge copies) around one
-  kernel, the row softmax backward in place over dP (one workgroup per
-  (head, query) row; masked keys and gated query rows zero). dW / db
-  accumulate through the GEMM's `EPI_ACCUM` and `column_sum_accumulate`; dX /
-  dCtx are overwritten. Within 2e-5 of the largest output against the CPU.
-* **Training BatchNorm** (`ops_gnorm.cpp`, `bnorm.comp`): `batch_norm_forward`
-  (batch statistics with the CPU's two-pass variance, saved mean / rstd, the
-  running-stat update with the unbiased variance) and `batch_norm_backward`
-  (dGamma / dBeta accumulated), FP32, one workgroup per channel.
-* **`bce_with_logits_fused_batched`** (`ops_xent.cpp`, `xent.comp` MODE 1):
-  per-element sigmoid cross-entropy with a positive-class weight, the CPU's
-  stable softplus / sigmoid forms with `exp_acc` and a log1p from `log_acc`,
-  one workgroup per row for the per-sample loss.
+The training backwards (chunk 8: attention / MHA / self / cross attention,
+training BatchNorm, BCE; chunk 9: flash-attention backwards, GroupNorm /
+ResBlock backwards, scatter-adds, transposed-convolution, resample, pad and
+pool backwards, LSTM) are described in `docs/vulkan-training.md`, with their
+measured errors against the CPU and the flash backward's speed against HIP.
 
 ## Dtype policy
 

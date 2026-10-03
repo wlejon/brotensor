@@ -1,7 +1,8 @@
 // Vulkan diffusion helpers: the sampler steps (DDIM, Euler, DPM++ 2M), the
 // sinusoidal timestep embedding, the image preprocessing helpers, Philox
 // noise (randn, rand_uniform, rand_bernoulli, randn_truncated), and the
-// diffusion ResBlock composed from the Vulkan GroupNorm and convolution.
+// diffusion ResBlock (forward and backward) composed from the Vulkan
+// GroupNorm and convolution.
 // Contracts follow the CPU / CUDA backends (src/cpu/diffusion_samplers.cpp,
 // noise.cpp, image_preproc.cpp, resblock.cpp): the sampler steps take FP32 /
 // FP16 / BF16 with FP32 arithmetic and overwrite their outputs; the scalar
@@ -351,6 +352,110 @@ void resblock_forward_int8w_fp16(const Tensor& X, const Tensor& gamma1, const Te
              Wskip, sskip, bskip, N, C_in, C_out, H, W, num_groups, eps, Y);
 }
 
+// The ResBlock backward, composed as the CPU reference (src/cpu/resblock.cpp)
+// and the CUDA one (resblock.cu): recompute h1 = SiLU(GN1(X)), h2 = conv1(h1)
+// (+ shift), h3 = SiLU(GN2(h2)), then conv2 / SiLU / GN2 / conv1 / SiLU / GN1
+// backwards and the skip path. dX is overwritten; every parameter gradient
+// (and dt_emb_shift) accumulates. FP32 / FP16 / BF16 (CUDA: 16-bit only),
+// all operands in X's dtype.
+void resblock_backward(const Tensor& X, const Tensor& gamma1, const Tensor& beta1, const Tensor& W1, const Tensor* b1,
+                       const Tensor* t_emb_shift, const Tensor& gamma2, const Tensor& beta2, const Tensor& W2,
+                       const Tensor* /*b2*/, const Tensor* Wskip, const Tensor* /*bskip*/, int N, int C_in, int C_out,
+                       int H, int W, int num_groups, float eps, const Tensor& dY, Tensor& dX, Tensor& dGamma1,
+                       Tensor& dBeta1, Tensor& dW1, Tensor* db1, Tensor* dt_emb_shift, Tensor& dGamma2,
+                       Tensor& dBeta2, Tensor& dW2, Tensor* db2, Tensor* dWskip, Tensor* dbskip) {
+    namespace bt = ::brotensor;
+    constexpr const char* op = "resblock_backward";
+    const Dtype dt = X.dtype;
+    dt_code(dt, op);
+    need(op, num_groups > 0 && C_in % num_groups == 0 && C_out % num_groups == 0,
+         "num_groups must divide C_in and C_out");
+    need(op, Wskip != nullptr || C_in == C_out, "Wskip required when C_in != C_out");
+    for (const Tensor* t : {&dY, &gamma1, &beta1, &W1, &gamma2, &beta2, &W2, b1, Wskip, t_emb_shift}) {
+        need(op, t == nullptr || t->dtype == dt, "all tensors must share X's dtype");
+    }
+    need(op, W1.size() == 9LL * C_out * C_in && W2.size() == 9LL * C_out * C_out, "W1 / W2 must be 3x3 OIHW");
+    need(op, !Wskip || Wskip->size() == static_cast<long long>(C_out) * C_in, "Wskip must be (C_out, C_in)");
+    const int hw = H * W;
+    need(op, dY.rows == N && dY.cols == C_out * hw, "dY shape mismatch");
+    need(op, X.size() >= static_cast<long long>(N) * C_in * hw, "X is smaller than N*C_in*H*W");
+    bool shift_n = false;
+    if (t_emb_shift) {
+        const Tensor& t = *t_emb_shift;
+        if (t.rows == N && t.cols == C_out) shift_n = true;
+        else if (!((t.rows == C_out && t.cols == 1) || (t.rows == 1 && t.cols == C_out) || t.size() == C_out))
+            fail(op, "t_emb_shift shape must be (N, C_out) or (C_out,)");
+        if (dt_emb_shift) need(op, dt_emb_shift->dtype == dt && dt_emb_shift->size() == t.size(),
+                               "dt_emb_shift must match t_emb_shift");
+    }
+    if (dX.data == nullptr) dX.device = X.device;
+    if (dX.rows != N || dX.cols != C_in * hw || dX.dtype != dt) dX.resize(N, C_in * hw, dt);
+    if (N == 0 || hw == 0) return;
+    DeviceCtx& d = device_of(X);
+    const ::brotensor::Device dev = ::brotensor::Device::vulkan(d.index());
+    auto tmp = [&](int c) { return Tensor::empty_on(dev, N, c * hw, dt); };
+
+    // Recompute the forward's intermediates.
+    Tensor h1p = tmp(C_in), h1 = tmp(C_in), h2 = tmp(C_out), h3p = tmp(C_out), h3 = tmp(C_out);
+    group_norm(d, addr(X.data), addr(gamma1.data), addr(beta1.data), addr(h1p.data), dt, N, C_in, hw, num_groups,
+               eps, false);
+    bt::silu_forward(h1p, h1);
+    bt::conv2d_forward(h1, W1, b1, N, C_in, H, W, C_out, 3, 3, 1, 1, 1, 1, 1, 1, 1, h2);
+    if (t_emb_shift) {
+        if (shift_n) bt::add_channel_bias_inplace(h2, *t_emb_shift, N * C_out, hw);
+        else
+            for (int n = 0; n < N; ++n) {
+                Tensor row = Tensor::view(dev, static_cast<char*>(h2.data) + std::size_t(n) * C_out * hw * ::brotensor::dtype_size_bytes(dt),
+                                          1, C_out * hw, dt);
+                bt::add_channel_bias_inplace(row, *t_emb_shift, C_out, hw);
+            }
+    }
+    group_norm(d, addr(h2.data), addr(gamma2.data), addr(beta2.data), addr(h3p.data), dt, N, C_out, hw, num_groups,
+               eps, false);
+    bt::silu_forward(h3p, h3);
+
+    // conv2, SiLU2, GN2.
+    Tensor dh3, dh3p, dh2;
+    bt::conv2d_backward_input(W2, dY, N, C_out, H, W, C_out, 3, 3, 1, 1, 1, 1, 1, 1, 1, dh3);
+    bt::conv2d_backward_weight(h3, dY, N, C_out, H, W, C_out, 3, 3, 1, 1, 1, 1, 1, 1, 1, dW2);
+    if (db2) bt::conv2d_backward_bias(dY, N, C_out, H, W, *db2);
+    bt::silu_backward(h3p, dh3, dh3p);
+    bt::group_norm_backward(h2, gamma2, dh3p, N, C_out, H, W, num_groups, eps, dh2, dGamma2, dBeta2);
+
+    // The time-embedding shift: dh2 summed over the pixels (and the batch).
+    if (t_emb_shift && dt_emb_shift) {
+        if (shift_n) {
+            for (int n = 0; n < N; ++n) {
+                Tensor row = Tensor::view(dev, static_cast<char*>(dh2.data) + std::size_t(n) * C_out * hw * ::brotensor::dtype_size_bytes(dt),
+                                          1, C_out * hw, dt);
+                Tensor out = Tensor::view(dev, static_cast<char*>(dt_emb_shift->data) + std::size_t(n) * C_out * ::brotensor::dtype_size_bytes(dt),
+                                          C_out, 1, dt);
+                bt::conv2d_backward_bias(row, 1, C_out, H, W, out);
+            }
+        } else {
+            Tensor out = Tensor::view(dev, dt_emb_shift->data, C_out, 1, dt);
+            bt::conv2d_backward_bias(dh2, N, C_out, H, W, out);
+        }
+    }
+
+    // conv1, SiLU1, GN1 (dX overwritten), then the skip path.
+    Tensor dh1, dh1p;
+    bt::conv2d_backward_input(W1, dh2, N, C_in, H, W, C_out, 3, 3, 1, 1, 1, 1, 1, 1, 1, dh1);
+    bt::conv2d_backward_weight(h1, dh2, N, C_in, H, W, C_out, 3, 3, 1, 1, 1, 1, 1, 1, 1, dW1);
+    if (db1) bt::conv2d_backward_bias(dh2, N, C_out, H, W, *db1);
+    bt::silu_backward(h1p, dh1, dh1p);
+    bt::group_norm_backward(X, gamma1, dh1p, N, C_in, H, W, num_groups, eps, dX, dGamma1, dBeta1);
+    if (!Wskip) {
+        bt::add_inplace(dX, dY);
+        return;
+    }
+    Tensor dxs;
+    bt::conv2d_backward_input(*Wskip, dY, N, C_in, H, W, C_out, 1, 1, 1, 1, 0, 0, 1, 1, 1, dxs);
+    if (dWskip) bt::conv2d_backward_weight(X, dY, N, C_in, H, W, C_out, 1, 1, 1, 1, 0, 0, 1, 1, 1, *dWskip);
+    if (dbskip) bt::conv2d_backward_bias(dY, N, C_out, H, W, *dbskip);
+    bt::add_inplace(dX, dxs);
+}
+
 void fill_vulkan_vtable_diffusion(::brotensor::detail::OpsVTable& v) {
     v.ddim_step = &ddim_step;
     v.euler_step = &euler_step;
@@ -364,6 +469,7 @@ void fill_vulkan_vtable_diffusion(::brotensor::detail::OpsVTable& v) {
     v.randn_truncated = &randn_truncated;
     v.resblock_forward = &resblock_forward;
     v.resblock_forward_int8w_fp16 = &resblock_forward_int8w_fp16;
+    v.resblock_backward = &resblock_backward;
 }
 
 }  // namespace brotensor::detail::vulkan

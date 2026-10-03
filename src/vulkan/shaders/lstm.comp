@@ -1,0 +1,62 @@
+#version 460
+// The LSTM cell's pointwise halves (ops_lstm.cpp), FP32, one invocation per
+// (batch row b, unit n) of one time step; the matrix products around them
+// are gemm() calls. PyTorch gate order [input, forget, cell, output].
+//   LS_FWD  z = gates[row] (X W_ih^T + b_ih + h_{t-1} W_hh^T, staged there)
+//           + b_hh; i, f, o = sigmoid, g = tanh; c = f c_{t-1} + i g;
+//           h = o tanh(c). gates[row] gets the activations, C and Y c, h.
+//   LS_BWD  the CPU reference's step: dh = dY + dh_next, dc from the carry,
+//           the four pre-activation gradients into dZ[row], dc_next = dc f.
+#include "common.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+
+layout(push_constant) uniform PC {
+    uint64_t gates, c, y, bhh, c0, dy, dz, dh, dc;
+    uint b, h, row0;     // batch, hidden size, first row of this step (t B)
+} pc;
+
+float sigm(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void main() {
+    const uint H = pc.h, G = 4u * H;
+    for (uint e = gl_GlobalInvocationID.x; e < pc.b * H; e += GRID_STRIDE_X) {
+        const uint b = e / H, n = e % H;
+        const uint row = pc.row0 + b;
+        const uint gr = row * G;
+        float cprev = 0.0;
+        if (pc.row0 > 0u) cprev = F32Buf(pc.c).v[(row - pc.b) * H + n];
+        else if (pc.c0 != 0ul) cprev = F32Buf(pc.c0).v[b * H + n];
+        if (MODE == LS_FWD) {
+            float zi = F32Buf(pc.gates).v[gr + n], zf = F32Buf(pc.gates).v[gr + H + n];
+            float zg = F32Buf(pc.gates).v[gr + 2u * H + n], zo = F32Buf(pc.gates).v[gr + 3u * H + n];
+            if (pc.bhh != 0ul) {
+                zi += F32Buf(pc.bhh).v[n];
+                zf += F32Buf(pc.bhh).v[H + n];
+                zg += F32Buf(pc.bhh).v[2u * H + n];
+                zo += F32Buf(pc.bhh).v[3u * H + n];
+            }
+            const float ig = sigm(zi), fg = sigm(zf), gg = bt_tanh(zg), og = sigm(zo);
+            const float cn = fg * cprev + ig * gg;
+            F32Buf(pc.gates).v[gr + n] = ig;
+            F32Buf(pc.gates).v[gr + H + n] = fg;
+            F32Buf(pc.gates).v[gr + 2u * H + n] = gg;
+            F32Buf(pc.gates).v[gr + 3u * H + n] = og;
+            F32Buf(pc.c).v[row * H + n] = cn;
+            F32Buf(pc.y).v[row * H + n] = og * bt_tanh(cn);
+        } else {
+            const float ig = F32Buf(pc.gates).v[gr + n], fg = F32Buf(pc.gates).v[gr + H + n];
+            const float gg = F32Buf(pc.gates).v[gr + 2u * H + n], og = F32Buf(pc.gates).v[gr + 3u * H + n];
+            const float tc = bt_tanh(F32Buf(pc.c).v[row * H + n]);
+            const float dh = F32Buf(pc.dy).v[row * H + n] + F32Buf(pc.dh).v[b * H + n];
+            const float dc = dh * og * (1.0 - tc * tc) + F32Buf(pc.dc).v[b * H + n];
+            F32Buf(pc.dz).v[gr + n] = dc * gg * ig * (1.0 - ig);
+            F32Buf(pc.dz).v[gr + H + n] = dc * cprev * fg * (1.0 - fg);
+            F32Buf(pc.dz).v[gr + 2u * H + n] = dc * ig * (1.0 - gg * gg);
+            F32Buf(pc.dz).v[gr + 3u * H + n] = dh * tc * og * (1.0 - og);
+            F32Buf(pc.dc).v[b * H + n] = dc * fg;
+        }
+    }
+}

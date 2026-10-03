@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <random>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Device;
 using brotensor::Dtype;
@@ -19,10 +20,7 @@ using brotensor::Tensor;
 
 // GPU device for the FP16 half: HIP or CUDA, CPU when neither is registered.
 static Device gpu() {
-    static const Device d = brotensor::is_available(Device::HIP)    ? Device::HIP
-                            : brotensor::is_available(Device::CUDA) ? Device::CUDA
-                                                                    : Device::CPU;
-    return d;
+    return bt_test::gpu();
 }
 
 static int g_failures = 0;

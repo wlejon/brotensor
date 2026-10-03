@@ -7,21 +7,13 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
-#if defined(BROTENSOR_HAS_CUDA)
-#include <cuda_runtime.h>
-#else
-#include <cstring>
-static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
-    std::memcpy(dst, src, n);
-}
-#define cudaMemcpyHostToDevice 0
-#endif
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <random>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Device;
 using brotensor::Dtype;
@@ -85,9 +77,7 @@ static void run_case(const char* label, int B, int M, int K, bool with_bias,
     // INT8W path.
     Tensor W_int8_g = Tensor::empty_on(Device::CUDA, M, K, Dtype::INT8);
     Tensor Y_g;
-    cudaMemcpy(W_int8_g.data, Wq.data(),
-               static_cast<size_t>(M) * K * sizeof(int8_t),
-               cudaMemcpyHostToDevice);
+    W_int8_g.copy_from_host_raw(Wq.data(), static_cast<size_t>(M) * K * sizeof(int8_t));
     Tensor S_g = Tensor::from_host_on(Device::CUDA, scales.data(), M, 1);
     brotensor::linear_forward_batched_int8w_fp16(
         W_int8_g, S_g, with_bias ? &Bg : nullptr, Xg, Y_g);
@@ -155,9 +145,7 @@ static void run_case_bf16(const char* label, int B, int M, int K, bool with_bias
     // INT8W path with BF16 activations.
     Tensor W_int8_g = Tensor::empty_on(Device::CUDA, M, K, Dtype::INT8);
     Tensor Y_g;
-    cudaMemcpy(W_int8_g.data, Wq.data(),
-               static_cast<size_t>(M) * K * sizeof(int8_t),
-               cudaMemcpyHostToDevice);
+    W_int8_g.copy_from_host_raw(Wq.data(), static_cast<size_t>(M) * K * sizeof(int8_t));
     Tensor S_g = Tensor::from_host_on(Device::CUDA, scales.data(), M, 1);
     brotensor::linear_forward_batched_int8w_fp16(
         W_int8_g, S_g, with_bias ? &Bg : nullptr, Xg, Y_g);
@@ -181,7 +169,7 @@ static void run_case_bf16(const char* label, int B, int M, int K, bool with_bias
 
 int main() {
     brotensor::init();
-    if (!(brotensor::is_available(brotensor::Device::CUDA) || brotensor::is_available(brotensor::Device::HIP))) {
+    if (!bt_test::has_gpu()) {
         std::printf("no CUDA/HIP backend - skipping\n");
         return 0;
     }

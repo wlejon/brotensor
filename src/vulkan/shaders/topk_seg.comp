@@ -80,7 +80,7 @@ void segstats() {
         const int b = clamp(I32Buf(pc.off).v[s + 1u], a, int(pc.cols));
         const uint o = s * 4u;
         if (b <= a) {
-            if (tid < 4u) F32Buf(pc.vals).v[o + tid] = 0.0;
+            if (tid < 4u) store_elem(DT, pc.vals, o + tid, 0.0);
             continue;
         }
         float mx = -3.4028234663852886e38;
@@ -110,10 +110,10 @@ void segstats() {
         }
         if (tid == 0u) {
             const float kk = max(2.0, float(b - a));
-            F32Buf(pc.vals).v[o] = s1[0];
-            F32Buf(pc.vals).v[o + 1u] = s1[0] - s2[0];
-            F32Buf(pc.vals).v[o + 2u] = ent / log(kk);
-            F32Buf(pc.vals).v[o + 3u] = kk / 255.0;
+            store_elem(DT, pc.vals, o, s1[0]);   // the logits' dtype, as CUDA / HIP
+            store_elem(DT, pc.vals, o + 1u, s1[0] - s2[0]);
+            store_elem(DT, pc.vals, o + 2u, ent / log(kk));
+            store_elem(DT, pc.vals, o + 3u, kk / 255.0);
         }
         barrier();
     }

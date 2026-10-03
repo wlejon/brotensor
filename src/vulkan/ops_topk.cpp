@@ -59,7 +59,8 @@ void segment_softmax_stats(const Tensor& logits, const Tensor& seg_offsets, Tens
     dt_code(logits.dtype, op);
     if (seg_offsets.dtype != Dtype::INT32 || seg_offsets.rows < 1) fail(op, "seg_offsets must be (S+1, 1) INT32");
     const int S = seg_offsets.rows - 1;
-    if (out.rows != S || out.cols != 4 || out.dtype != Dtype::FP32) out.resize(S, 4, Dtype::FP32);
+    // In the logits' dtype, as CUDA / HIP (the CPU reference is FP32-only).
+    if (out.rows != S || out.cols != 4 || out.dtype != logits.dtype) out.resize(S, 4, logits.dtype);
     if (S == 0) return;
     // Offsets are device data: the kernel clamps them to the logits (the CPU
     // reference throws on a bad table instead).

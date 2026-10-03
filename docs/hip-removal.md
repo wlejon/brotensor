@@ -1,6 +1,6 @@
 # Removing the HIP backend: inventory
 
-A write-up, not a plan of record: what deleting brotensor's HIP backend
+A write-up, not a plan of record (§2, §4 and §5 updated for chunk 9): what deleting brotensor's HIP backend
 (`BROTENSOR_WITH_HIP`, `src/hip/`) would remove, what the siblings would lose,
 what stays, and what it costs. Line counts are `wc -l` on the tree as of
 chunk 8 (2026-10-03). Vulkan is already the default device in a HIP + Vulkan
@@ -96,8 +96,8 @@ sibling GPU kernels all have Vulkan twins since chunk 7a:
 (rocWMMA through `compat/mma.h`) back the 9 INT8 W8A16 ops on HIP. Vulkan
 implements all 9 (cooperative-matrix GEMM with INT8 decode in the A/B staging,
 docs/vulkan.md "Quantised weights"), so no op is lost; the HIP kernels stay as
-CUDA kernels. `brotensor_test_int8_conv_wmma` / `_int8_linear_wmma` become
-CUDA-only tests.
+CUDA kernels. `brotensor_test_int8_conv_wmma` / `_int8_linear_wmma` test the
+public ops and run on Vulkan too since chunk 9 (`*_vulkan`).
 
 **Performance.** One model is slower on Vulkan: the T5-XXL encode (1.9 s vs
 0.93 s), because brolm's T5 recasts to BF16 only on CUDA / HIP and runs FP32
@@ -105,36 +105,30 @@ activations through the SIMT GEMM on Vulkan (the matrix-core GEMM stages BF16 as
 FP16, which overflows T5's activations). Removing HIP makes that 2x the only
 choice on AMD unless Vulkan gets a range-safe BF16 GEMM.
 
-**Training backwards still null on Vulkan.** 21 slots are null after chunk
-8, which filled `attention_backward`, `mha_backward`,
-`self_attention_backward`, `cross_attention_backward`, `batch_norm_forward`,
-`batch_norm_backward` and `bce_with_logits_fused_batched`
-(src/vulkan/ops_attention_bwd.cpp 277 lines, attn_bwd.comp 46, bnorm.comp
-95, +81 in ops_gnorm.cpp, +60 for xent.comp's BCE mode: ~560 lines for 7
-slots). Of the 21, 2 are host-only (`mse_scalar`, `softmax_xent_segment`;
-they run on the CPU table from any device) and 2 are composite by design
-(`filtered_lrelu_forward` / `_backward`; the public op falls back to ops
-Vulkan has). The remaining 17 work on HIP today and would have no AMD GPU
-path after removal:
+**Training backwards: none missing since chunk 9.** Chunk 8 filled 7 slots
+(the attention / MHA / self / cross attention backwards, training BatchNorm,
+BCE; ~560 lines); chunk 9 filled the 17 that still worked only on HIP. The
+op table is 266 of 270 on Vulkan; the 4 null slots are 2 host-only ops
+(`mse_scalar`, `softmax_xent_segment`, always run on the CPU table) and
+`filtered_lrelu_forward` / `_backward` (composite by design), none reachable
+from a Vulkan tensor.
 
-| Slot | Who calls it | Est. Vulkan LOC (host + GLSL) |
+| Slots (chunk 9) | Who calls it | Vulkan (host + GLSL, lines) |
 |---|---|---:|
-| `flash_attention_backward`, `_varlen_backward`, `_qkvo_backward`, `_packed_qkv_backward` | brolm LayaGrad (`packed_qkv`), training | 700 (one FA-2 backward kernel, dQ/dK/dV, four entry points) |
-| `lstm_forward_train`, `lstm_backward` | none today | 450 |
-| `resblock_backward` | training | 200 (composition of conv / group_norm / SiLU backwards) |
-| `group_norm_backward` | brosoundml Kokoro decoder backward | 200 |
-| `conv_transpose2d_backward_input`, `_backward_weight` | training | 150 (map onto conv2d forward / GEMM) |
-| `upsample_bilinear_2x_backward`, `interp2d_backward`, `pad2d_backward`, `adaptive_avg_pool2d_backward`, `max_pool2d_backward` | training | 350 (gather-form kernels, no atomics) |
-| `embedding_lookup_backward`, `scatter_rows_add` | brolm LayaGrad soft-row gradient | 200 (scatter-add: `VK_EXT_shader_atomic_float` or sort + segment sum) |
-| **Total (17 slots)** | | **~2,270** |
+| `flash_attention_backward`, `_varlen_backward`, `_qkvo_backward`, `_packed_qkv_backward` | brolm LayaGrad (`packed_qkv`), training | `ops_fa_bwd.cpp` 325 + `fa_bwd.comp` 411 (one FA-2 kernel pair, four entry points, FP32 / FP16 / BF16) |
+| `lstm_forward_train`, `lstm_backward` | none today | `ops_lstm.cpp` 187 + `lstm.comp` 62 (GEMMs around a pointwise cell) |
+| `resblock_backward` | training | +120 in `ops_diffusion.cpp` (composition) |
+| `group_norm_backward` | brosoundml Kokoro decoder backward | +60 in `ops_gnorm.cpp`, +80 in `gnorm.comp` (no atomics) |
+| `conv_transpose2d_backward_input`, `_backward_weight` | training | +110 in `ops_conv.cpp` (conv2d / conv2d_backward_weight) |
+| `upsample_bilinear_2x_backward`, `interp2d_backward`, `pad2d_backward`, `adaptive_avg_pool2d_backward`, `max_pool2d_backward` | training | `ops_spatial_bwd.cpp` 140 + `resample_bwd.comp` 158 (gathers) |
+| `embedding_lookup_backward`, `scatter_rows_add` | brolm LayaGrad soft-row gradient | `ops_scatter.cpp` 108 + `scatter_add.comp` 91 (sort + segmented sum, deterministic) |
+| **Total (17 slots)** | | **~1,850** (estimate was ~2,270) + ~560 lines of `test_vulkan_train*.cpp` |
 
-Plus ~750 lines of `brotensor_test_vulkan` cases (the CPU op as oracle; chunk 8's
-`test_vulkan_train.cpp` is ~230 lines for 7 slots), so **~3,000 lines** for full
-training parity. Calibration: the Vulkan backend
-today is 17,423 lines (`src/vulkan/` + shaders + `vulkan.h` +
-`BrotensorVulkan.cmake`) for 242 slots, ~72 lines per slot; backwards run
-heavier (the CUDA files for the same families: `flash_attention_backward.cu`
-862, `lstm.cu` 494, `group_norm.cu` 779, `resblock.cu` 869).
+Design, errors against the CPU and the flash backward's speed (3.2-5.8x HIP's)
+are in docs/vulkan-training.md. One behavioural difference from HIP worth
+knowing: the Vulkan scatter-adds, GroupNorm backward and pooling backwards
+are deterministic (HIP's use float atomics), and FP32 scatter-adds / max-pool
+backward match the CPU bit for bit.
 
 ## 3. What stays
 
@@ -166,17 +160,33 @@ conv, norms, audio and quant). Nothing in `src/cuda/` exists solely for HIP.
 | Suite | Today | After removal |
 |---|---|---|
 | brotensor `build_hip` | 184 ctest entries | gone |
-| brotensor `build_vk` | 192 entries; the 125 generic CPU↔GPU suites run on **HIP** (`BROTENSOR_PREFER_HIP=1` stamped on every non-`vulkan` test), 8 registrations run Vulkan | the generic GPU block (`tests/CMakeLists.txt` L206-430) is gated on `CUDA OR METAL OR HIP`: in a Vulkan-only build those 125 entries **do not build**. Gating them on Vulkan too runs them through the `Device::CUDA` → Vulkan alias, where the training tests among them (flash-attention backward, LSTM, LoRA, resblock, pooling backwards, …) fail on the null slots until §2 is done. Net coverage today: 59 CPU + 8 Vulkan entries (`brotensor_test_vulkan` holds ~all Vulkan op coverage itself) |
+| brotensor `build_vk` | 312 entries since chunk 9: the generic CPU↔GPU block runs on **HIP** (`BROTENSOR_PREFER_HIP=1`) and again on **Vulkan** as 119 `<name>_vulkan` registrations (`BROTENSOR_TEST_GPU=vulkan`, `BROTENSOR_DEFAULT_DEVICE=vulkan`), all passing, plus the 4 earlier Vulkan entries | the HIP half goes; the block is gated on `CUDA OR METAL OR HIP OR VULKAN` and every suite picks its GPU through `tests/gpu_select.h`, so a **Vulkan-only build** builds and runs the whole block on Vulkan (189 entries, all pass). Not re-run on Vulkan: the four suites with their own Vulkan runs (`cuda_graph`, `graph_capture_alloc`, `ops_fused`, `jit_trace_dtypes`) and the CUDA-only ones (streams, linear_rounding, multigpu, cuda_jit*) |
 | `brotensor_test_hip` | HIP runtime / alias / smoke | gone |
 | `brotensor_test_cuda_rocm_parity` | skipped (no golden) | gone; CUDA golden generation can stay for a future CUDA-vs-Vulkan check |
 | `test_vulkan_hip_parity` (chunk 8) | Vulkan vs HIP per op, same process | gone; the CPU oracle in `brotensor_test_vulkan` remains the only reference |
-| `brotensor_test_int8_{conv,linear}_wmma` | HIP rocWMMA kernels | CUDA-only |
+| `brotensor_test_int8_{conv,linear}_wmma` | HIP rocWMMA kernels, and Vulkan's INT8 paths (`_vulkan`) | CUDA + Vulkan |
 | `--bench-*` HIP columns | Vulkan vs HIP | Vulkan only |
 | brogameagent / brosoundml under `BROTENSOR_PREFER_HIP=1` | all 33 / 48 pass | the 5 / 2 tests that needed HIP pass on Vulkan after chunk 8; no second backend to cross-check |
+| brolm LayaGrad (`brolm_test_laya_grad`) | Vulkan since chunk 9 (packed-QKV backward + scatter-add), HIP under `BROTENSOR_PREFER_HIP=1` | Vulkan only |
 | brolm `brolm_test_bioclip_hip` | HIP or CPU | retarget to the default GPU |
 | bro `tests/gpu/test_gpu_binding.js` | HIP + Vulkan default check | simplified |
 
 ## 5. Recommendation
+
+Steps (1) and (2) of the sequence below are done (chunk 9): every op-table
+slot a sibling can reach runs on Vulkan, training included, and the generic
+CPU↔GPU suite runs on Vulkan (and is the whole GPU suite of a Vulkan-only
+build). What remains before deleting HIP: (3) a range-safe BF16 (or
+FP32-accumulate split) GEMM so the T5-XXL encode stops being 2x slower; the
+flash-attention backward on cooperative-matrix fragments if training
+throughput matters (2.5 TF/s now, against the forward's 15); then (4) delete
+`src/hip/` and the ~185 + ~350 lines of CMake / plumbing listed above. One
+HIP-side wart found while re-gating, moot after removal: in a HIP + Vulkan
+build where Vulkan is the alias target, a HIP op called explicitly allocates
+its `Device::CUDA` temporaries on Vulkan (e.g. `modulated_conv2d_backward`'s
+scratch), so HIP ops are only reliable there under `BROTENSOR_PREFER_HIP=1`.
+
+The original recommendation:
 
 Remove HIP after the training follow-up, not before: Vulkan already wins
 every inference workload but one and has twins for every sibling kernel, so the

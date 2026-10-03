@@ -3,7 +3,8 @@
 // bias gradients), self_attention_backward and cross_attention_backward
 // (lq != lk with a key mask; lq == lk, where the mask also gates queries),
 // training-mode batch_norm_forward / batch_norm_backward, and
-// bce_with_logits_fused_batched. The forward
+// bce_with_logits_fused_batched, and chunk 9's LSTM training forward and
+// backward (the other chunk-9 slots: test_vulkan_train_*.cpp). The forward
 // caches come from the CPU forward and are uploaded, so each comparison
 // isolates the backward; dW / db / dGamma / dBeta start non-zero to check
 // that they accumulate. `--only=train`.
@@ -12,6 +13,7 @@
 
 #include <brotensor/ops/attention.h>
 #include <brotensor/ops/loss.h>
+#include <brotensor/ops/lstm.h>
 #include <brotensor/ops/norm.h>
 
 #include <algorithm>
@@ -204,6 +206,44 @@ void test_bce(int B, int L, bool masked, float pos_weight, const char* name) {
     close_scaled(Lv, Lc, 2e-6f, "bce_with_logits_fused_batched loss" + t);
 }
 
+// lstm_forward_train + lstm_backward (BPTT) with and without the optional
+// biases / initial states; parameter gradients start non-zero.
+void test_lstm(int T, int B, int I, int H, bool full, const char* name) {
+    const std::string t = std::string(" ") + name;
+    const int G = 4 * H;
+    Pair X = Pair::rand(T * B, I, 70), Wih = Pair::rand(G, I, 71, -0.4f, 0.4f), Whh = Pair::rand(G, H, 72, -0.4f, 0.4f);
+    Pair bih = Pair::rand(G, 1, 73), bhh = Pair::rand(G, 1, 74), h0 = Pair::rand(B, H, 75), c0 = Pair::rand(B, H, 76);
+    Tensor Yc, Gc, Cc, hTc, cTc, Yv, Gv, Cv, hTv, cTv;
+    brotensor::lstm_forward_train(X.c, Wih.c, Whh.c, full ? &bih.c : nullptr, full ? &bhh.c : nullptr,
+                                  full ? &h0.c : nullptr, full ? &c0.c : nullptr, T, B, Yc, Gc, Cc, &hTc, &cTc);
+    brotensor::lstm_forward_train(X.v, Wih.v, Whh.v, full ? &bih.v : nullptr, full ? &bhh.v : nullptr,
+                                  full ? &h0.v : nullptr, full ? &c0.v : nullptr, T, B, Yv, Gv, Cv, &hTv, &cTv);
+    close_scaled(Yv, Yc, 2e-6f, "lstm_forward_train Y" + t);
+    close_scaled(Gv, Gc, 2e-6f, "lstm_forward_train gates" + t);
+    close_scaled(Cv, Cc, 2e-6f, "lstm_forward_train C" + t);
+    close_scaled(hTv, hTc, 2e-6f, "lstm_forward_train hT" + t);
+    close_scaled(cTv, cTc, 2e-6f, "lstm_forward_train cT" + t);
+    // The backward reads the CPU's caches on both devices.
+    Pair Y = Pair::of(Yc), Gt = Pair::of(Gc), C = Pair::of(Cc), dY = Pair::rand(T * B, H, 77);
+    Pair dWih = Pair::rand(G, I, 78), dWhh = Pair::rand(G, H, 79), dbih = Pair::rand(G, 1, 80), dbhh = Pair::rand(G, 1, 81);
+    Tensor dXc, dXv, dh0c, dh0v, dc0c, dc0v;
+    brotensor::lstm_backward(X.c, Wih.c, Whh.c, full ? &h0.c : nullptr, full ? &c0.c : nullptr, Y.c, Gt.c, C.c, dY.c,
+                             T, B, dXc, dWih.c, dWhh.c, full ? &dbih.c : nullptr, full ? &dbhh.c : nullptr, &dh0c,
+                             &dc0c);
+    brotensor::lstm_backward(X.v, Wih.v, Whh.v, full ? &h0.v : nullptr, full ? &c0.v : nullptr, Y.v, Gt.v, C.v, dY.v,
+                             T, B, dXv, dWih.v, dWhh.v, full ? &dbih.v : nullptr, full ? &dbhh.v : nullptr, &dh0v,
+                             &dc0v);
+    close_scaled(dXv, dXc, kRel, "lstm_backward dX" + t);
+    close_scaled(dWih.v, dWih.c, kRel, "lstm_backward dW_ih" + t);
+    close_scaled(dWhh.v, dWhh.c, kRel, "lstm_backward dW_hh" + t);
+    if (full) {
+        close_scaled(dbih.v, dbih.c, kRel, "lstm_backward db_ih" + t);
+        close_scaled(dbhh.v, dbhh.c, kRel, "lstm_backward db_hh" + t);
+    }
+    close_scaled(dh0v, dh0c, kRel, "lstm_backward dh0" + t);
+    close_scaled(dc0v, dc0c, kRel, "lstm_backward dc0" + t);
+}
+
 }  // namespace
 
 void run_train_tests() {
@@ -223,6 +263,12 @@ void run_train_tests() {
     test_batch_norm(3, 5, 7, 9, 100.0f, "N 3 C 5 7x9, mean 100");
     test_bce(16, 35, false, 1.0f, "16 x 35");
     test_bce(7, 600, true, 3.5f, "7 x 600, masked, pos_weight 3.5");
+    test_lstm(7, 3, 10, 16, true, "T 7 B 3 I 10 H 16, biases + states");
+    test_lstm(1, 2, 5, 8, false, "T 1 B 2 I 5 H 8, bare");
+    test_lstm(24, 8, 64, 128, true, "T 24 B 8 I 64 H 128");
+    run_train_fa_tests();
+    run_train_spatial_tests();
+    run_train_spatial2_tests();
 }
 
 }  // namespace vkt

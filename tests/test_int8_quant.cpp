@@ -5,25 +5,13 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
-#if defined(BROTENSOR_HAS_HIP)
-#include <hip/hip_runtime.h>
-#define cudaMemcpy hipMemcpy
-#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
-#elif defined(BROTENSOR_HAS_CUDA)
-#include <cuda_runtime.h>
-#else
-#include <cstring>
-static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
-    std::memcpy(dst, src, n);
-}
-#define cudaMemcpyHostToDevice 0
-#endif
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <random>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Device;
 using brotensor::Dtype;
@@ -74,8 +62,7 @@ static void test_matmul_int8w() {
     // W8A16 path.
     Tensor W_int8_g = Tensor::empty_on(g_dev, OUT, IN, Dtype::INT8);
     Tensor Y_g;
-    cudaMemcpy(W_int8_g.data, Wq.data(), OUT * IN * sizeof(int8_t),
-               cudaMemcpyHostToDevice);
+    W_int8_g.copy_from_host_raw(Wq.data(), OUT * IN * sizeof(int8_t));
     Tensor S_g = Tensor::from_host_on(g_dev, scales.data(), OUT, 1);
     brotensor::matmul_int8w_fp16(W_int8_g, S_g, X_g, Y_g);
     CHECK(Y_g.dtype == Dtype::FP16 && Y_g.rows == OUT && Y_g.cols == B);
@@ -138,8 +125,7 @@ static void test_conv2d_int8w() {
     // W8A16 path.
     Tensor W_int8_g = Tensor::empty_on(g_dev, C_out, win, Dtype::INT8);
     Tensor Y_g;
-    cudaMemcpy(W_int8_g.data, Wq.data(), C_out * win * sizeof(int8_t),
-               cudaMemcpyHostToDevice);
+    W_int8_g.copy_from_host_raw(Wq.data(), C_out * win * sizeof(int8_t));
     Tensor S_g = Tensor::from_host_on(g_dev, scales.data(), C_out, 1);
     brotensor::conv2d_int8w_fp16_forward(Xg, W_int8_g, S_g, nullptr,
                                          N, C_in, H, W, C_out, kH, kW,
@@ -165,16 +151,13 @@ static void test_conv2d_int8w() {
 
 int main() {
     brotensor::init();
-    if (brotensor::is_available(brotensor::Device::HIP)) {
-        g_dev = Device::HIP;
-    } else if (brotensor::is_available(brotensor::Device::CUDA)) {
-        g_dev = Device::CUDA;
-    } else {
+    g_dev = bt_test::gpu();
+    if (g_dev.is_cpu() || g_dev == Device::Metal) {
         std::printf("no GPU backend available - skipping\n");
         return 0;
     }
     std::printf("test_int8_quant (device=%s)\n",
-                g_dev == Device::HIP ? "HIP" : "CUDA");
+                bt_test::gpu_name());
     test_matmul_int8w();
     test_conv2d_int8w();
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);

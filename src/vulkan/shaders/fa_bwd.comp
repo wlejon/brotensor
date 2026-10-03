@@ -1,0 +1,411 @@
+#version 460
+// Flash-attention backward (FA-2 style, recompute-based), any dtype (-DDT),
+// FP32 math. Host side: ops_fa_bwd.cpp. Two passes, both tiled through
+// shared memory; nothing is accumulated atomically, so the result is
+// deterministic.
+//
+//   PASS 0 (query-major): one workgroup per (BR query rows, head). Walks the
+//     rows' keys once for the softmax statistics of each row, online:
+//     m = max_k s_k (log2 domain), l = sum_k 2^(s_k - m) and
+//     D = sum_k P_k dP_k with dP_k = dO . V_k (rescaled with l), stores
+//     (m, 1 / l, D) per (head, row), then walks the keys again for
+//     dQ = scale sum_k dS_k K_k, dS = P (dP - D).
+//   PASS 1 (key-major): one workgroup per (BC keys, head). Walks the query
+//     blocks that attend its keys, recomputes P and dS per tile from the
+//     statistics and accumulates dV = sum_r P_r dO_r, dK = scale sum_r dS_r Q_r.
+//
+// A tile step: Q / dO (BR rows) and K / V (BC rows) staged in shared memory in
+// the input's own 16-bit encoding (exact) or FP32, the S = Q K^T and
+// dP = dO V^T tile computed by NT invocations (RPT rows x 4 keys each, the
+// row's CG lanes reduce through subgroup shuffles), P / dS through shared
+// memory into the per-thread accumulators. The head is padded with zeros to
+// HDP columns (a multiple of 32). Each query row's keys come from the
+// attention mode (rows / causal / window / key mask, varlen sequences,
+// packed per-row bounds), as in fa_common.glsl.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "op_codes.h"
+
+layout(constant_id = 0) const uint NT = 128;    // invocations
+layout(constant_id = 1) const uint HD = 64;     // head width
+layout(constant_id = 2) const uint HDP = 64;    // padded head width (multiple of 32)
+layout(constant_id = 3) const uint BR = 32;     // query rows per tile
+layout(constant_id = 4) const uint BC = 32;     // keys per tile
+layout(constant_id = 5) const uint MODE = 0;    // FA_MODE_*
+layout(constant_id = 6) const uint MASK = 0;    // pc.mask is a key-validity vector
+layout(constant_id = 7) const uint PASS = 0;
+layout(local_size_x_id = 0) in;
+
+layout(push_constant) uniform PC {
+    uint64_t q, k, v, g;   // Q, K, V, dO (head 0, row 0)
+    uint64_t mask;         // FP32 key mask (MASK)
+    uint64_t aux, aux2;    // VARLEN: cu_seqlens_q / _k; PACKED: seq_bounds (lq x 2)
+    uint64_t stats;        // FP32 (hq * lq) x 4: m (log2 domain), 1 / l, D, -
+    uint64_t o0, o1;       // PASS 0: dQ; PASS 1: dK, dV
+    uint lq, lk, ldq, ldk, ldg;
+    uint ldo;              // row stride of the outputs (dQ, or dK / dV)
+    uint window, causal, nseq;
+    float scale;           // log2(e) / sqrt(hd)
+    float oscale;          // 1 / sqrt(hd)
+} pc;
+
+#if DT == DT_F32
+#define ST4 vec4
+#define ST1 float
+#define TOV(x) (x)
+#define TOF(x) (x)
+#elif DT == DT_F16
+#define ST4 f16vec4
+#define ST1 float16_t
+#define TOV(x) vec4(x)
+#define TOF(x) float(x)
+#else
+#define ST4 u16vec4
+#define ST1 uint16_t
+#define TOV(x) uintBitsToFloat(uvec4(x) << 16)
+#define TOF(x) bf16_to_f32(x)
+#endif
+
+ST1 load_raw(uint64_t base, uint i) {
+#if DT == DT_F32
+    return F32Buf(base).v[i];
+#elif DT == DT_F16
+    return F16Buf(base).v[i];
+#else
+    return U16Buf(base).v[i];
+#endif
+}
+
+const uint HD4 = HDP / 4u;
+const uint HS4 = HD4 + 1u;            // shared row stride in 4-vectors (+1 pad)
+const uint BC4 = BC / 4u;
+const uint CG = BC4;                  // S tile: lanes per row, 4 keys each (c = cg + CG j)
+const uint RG = NT / CG;              // row groups
+const uint RPT = BR / RG;             // rows per invocation (r = rg + RG i)
+const uint DGK = NT / BC4;            // PASS 1 accumulators: 4 keys x HDP / DGK columns
+const uint NDK = HDP / DGK;
+const uint DGQ = NT / (BR / 4u);      // PASS 0 accumulators: 4 rows x HDP / DGQ columns
+const uint NDQ = HDP / DGQ;
+
+shared ST4 Qs[BR * HS4];
+shared ST4 Gs[BR * HS4];
+shared ST4 Ks[BC * HS4];
+shared ST4 Vs[BC * HS4];
+shared vec4 Ps[BR * BC4];             // P (PASS 1), row-major, 4 keys per entry
+shared vec4 Ds[BR * BC4];             // dS
+shared float kval[BC];
+shared int s_lo, s_hi, s_any;
+
+#define NEG_INF (-1.0 / 0.0)
+
+// Keys [lo, hi) of query row qi (empty past lq), as fa_common.glsl's
+// fa_interval with query row 0 at position 0.
+void bw_interval(uint qi, out int lo, out int hi) {
+    lo = 0;
+    hi = 0;
+    if (qi >= pc.lq) return;
+    int a = 0, b = int(pc.lk);
+    if (MODE == FA_MODE_ROWS) {
+        const int aq = int(qi);
+        if (pc.causal != 0u) {
+            b = min(b, aq + 1);
+            if (pc.window > 0u) a = max(0, aq - int(pc.window) + 1);
+        } else if (pc.window > 0u) {
+            const int w2 = int(pc.window) / 2;
+            a = max(0, aq - w2);
+            b = min(b, aq + w2 + 1);
+        }
+    } else if (MODE == FA_MODE_VARLEN) {
+        const int q = int(qi);
+        if (pc.nseq == 0u || q >= I32Buf(pc.aux).v[pc.nseq]) return;
+        uint s0 = 0u, s1 = pc.nseq;
+        while (s1 - s0 > 1u) {
+            const uint mid = (s0 + s1) / 2u;
+            if (I32Buf(pc.aux).v[mid] <= q) s0 = mid; else s1 = mid;
+        }
+        a = I32Buf(pc.aux2).v[s0];
+        b = I32Buf(pc.aux2).v[s0 + 1u];
+        if (pc.causal != 0u) b = min(b, a + q - I32Buf(pc.aux).v[s0] + 1);
+    } else if (MODE == FA_MODE_PACKED) {
+        a = I32Buf(pc.aux).v[2u * qi];
+        b = I32Buf(pc.aux).v[2u * qi + 1u];
+        if (pc.window > 0u) {
+            const int w2 = int(pc.window) / 2;
+            a = max(a, int(qi) - w2);
+            b = min(b, int(qi) + w2 + 1);
+        }
+    }
+    a = clamp(a, 0, int(pc.lk));
+    b = clamp(b, a, int(pc.lk));
+    lo = a;
+    hi = b;
+}
+
+// Rows [row0, row0 + n) of a (rows, ld) matrix, columns [col0, col0 + HD),
+// zero past `rows` and past HD.
+#define STAGE(ARR, NROWS, BASE, LD, ROW0, ROWS, COL0)                                  \
+    for (uint ci = tid; ci < (NROWS) * HD4; ci += NT) {                                \
+        const uint r_ = ci / HD4, d_ = (ci % HD4) * 4u, gr_ = (ROW0) + r_;             \
+        ST4 v_ = ST4(0);                                                               \
+        if (gr_ < (ROWS)) {                                                            \
+            const uint e_ = gr_ * (LD) + (COL0) + d_;                                  \
+            [[unroll]] for (uint u_ = 0; u_ < 4u; ++u_)                                \
+                if (d_ + u_ < HD) v_[u_] = load_raw(BASE, e_ + u_);                    \
+        }                                                                              \
+        ARR[r_ * HS4 + d_ / 4u] = v_;                                                  \
+    }
+
+// The S and dP entries of this invocation: rows rg + RG i, keys cg + CG j.
+void tile_dots(uint rg, uint cg, out float s[RPT][4], out float dp[RPT][4]) {
+    [[unroll]] for (uint i = 0; i < RPT; ++i)
+        [[unroll]] for (uint j = 0; j < 4u; ++j) { s[i][j] = 0.0; dp[i][j] = 0.0; }
+    for (uint d4 = 0; d4 < HD4; ++d4) {
+        vec4 kk[4], vv[4];
+        [[unroll]] for (uint j = 0; j < 4u; ++j) {
+            kk[j] = TOV(Ks[(cg + CG * j) * HS4 + d4]);
+            vv[j] = TOV(Vs[(cg + CG * j) * HS4 + d4]);
+        }
+        [[unroll]] for (uint i = 0; i < RPT; ++i) {
+            const vec4 qq = TOV(Qs[(rg + RG * i) * HS4 + d4]);
+            const vec4 gg = TOV(Gs[(rg + RG * i) * HS4 + d4]);
+            [[unroll]] for (uint j = 0; j < 4u; ++j) {
+                s[i][j] += dot(qq, kk[j]);
+                dp[i][j] += dot(gg, vv[j]);
+            }
+        }
+    }
+}
+
+float row_max(float x) {
+    [[unroll]] for (uint o = 1u; o < CG; o <<= 1) x = max(x, subgroupShuffleXor(x, o));
+    return x;
+}
+float row_sum(float x) {
+    [[unroll]] for (uint o = 1u; o < CG; o <<= 1) x += subgroupShuffleXor(x, o);
+    return x;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint h = gl_WorkGroupID.y;
+    const uint col = h * HD;
+    const uint rg = tid / CG, cg = tid % CG;
+
+    if (PASS == 0u) {
+        // ── query-major: statistics, then dQ ──
+        const uint r0 = gl_WorkGroupID.x * BR;
+        int lo[RPT], hi[RPT];
+        if (tid == 0u) { s_lo = int(pc.lk); s_hi = 0; }
+        barrier();
+        [[unroll]] for (uint i = 0; i < RPT; ++i) {
+            bw_interval(r0 + rg + RG * i, lo[i], hi[i]);
+            if (cg == 0u && lo[i] < hi[i]) { atomicMin(s_lo, lo[i]); atomicMax(s_hi, hi[i]); }
+        }
+        STAGE(Qs, BR, pc.q, pc.ldq, r0, pc.lq, col)
+        STAGE(Gs, BR, pc.g, pc.ldg, r0, pc.lq, col)
+        barrier();
+        const int klo = s_lo, khi = s_hi;
+
+        float m[RPT], l[RPT], dacc[RPT];
+        [[unroll]] for (uint i = 0; i < RPT; ++i) { m[i] = NEG_INF; l[i] = 0.0; dacc[i] = 0.0; }
+        for (int kb = klo; kb < khi; kb += int(BC)) {
+            barrier();
+            STAGE(Ks, BC, pc.k, pc.ldk, uint(kb), pc.lk, col)
+            STAGE(Vs, BC, pc.v, pc.ldk, uint(kb), pc.lk, col)
+            if (tid < BC) kval[tid] = (MASK != 0u && uint(kb) + tid < pc.lk) ? F32Buf(pc.mask).v[uint(kb) + tid] : 1.0;
+            barrier();
+            float s[RPT][4], dp[RPT][4];
+            tile_dots(rg, cg, s, dp);
+            [[unroll]] for (uint i = 0; i < RPT; ++i) {
+                float tmax = NEG_INF;
+                [[unroll]] for (uint j = 0; j < 4u; ++j) {
+                    const int kc = kb + int(cg + CG * j);
+                    const bool ok = kc >= lo[i] && kc < hi[i] && kval[cg + CG * j] > 0.5;
+                    s[i][j] = ok ? s[i][j] * pc.scale : NEG_INF;
+                    tmax = max(tmax, s[i][j]);
+                }
+                tmax = row_max(tmax);
+                const float mn = max(m[i], tmax);
+                float es = 0.0, ds = 0.0;
+                if (mn != NEG_INF) {
+                    [[unroll]] for (uint j = 0; j < 4u; ++j) {
+                        const float e = s[i][j] == NEG_INF ? 0.0 : exp2(s[i][j] - mn);
+                        es += e;
+                        ds += e * dp[i][j];
+                    }
+                }
+                es = row_sum(es);
+                ds = row_sum(ds);
+                if (mn != NEG_INF) {
+                    const float alpha = m[i] == NEG_INF ? 0.0 : exp2(m[i] - mn);
+                    l[i] = l[i] * alpha + es;
+                    dacc[i] = dacc[i] * alpha + ds;
+                    m[i] = mn;
+                }
+            }
+        }
+        float il[RPT], dd[RPT];
+        [[unroll]] for (uint i = 0; i < RPT; ++i) {
+            const bool any = l[i] > 0.0;
+            il[i] = any ? 1.0 / l[i] : 0.0;
+            dd[i] = dacc[i] * il[i];
+            if (!any) m[i] = 0.0;
+            const uint qr = r0 + rg + RG * i;
+            if (cg == 0u && qr < pc.lq) {
+                const uint e = (h * pc.lq + qr) * 4u;
+                F32Buf(pc.stats).v[e] = m[i];
+                F32Buf(pc.stats).v[e + 1u] = il[i];
+                F32Buf(pc.stats).v[e + 2u] = dd[i];
+            }
+        }
+
+        // dQ: invocation (qg, dg) owns rows 4 qg + a, columns dg + DGQ b.
+        const uint dg = tid % DGQ, qg = tid / DGQ;
+        float acc[4][NDQ];
+        [[unroll]] for (uint a = 0; a < 4u; ++a)
+            [[unroll]] for (uint b = 0; b < NDQ; ++b) acc[a][b] = 0.0;
+        for (int kb = klo; kb < khi; kb += int(BC)) {
+            barrier();
+            STAGE(Ks, BC, pc.k, pc.ldk, uint(kb), pc.lk, col)
+            STAGE(Vs, BC, pc.v, pc.ldk, uint(kb), pc.lk, col)
+            if (tid < BC) kval[tid] = (MASK != 0u && uint(kb) + tid < pc.lk) ? F32Buf(pc.mask).v[uint(kb) + tid] : 1.0;
+            barrier();
+            float s[RPT][4], dp[RPT][4];
+            tile_dots(rg, cg, s, dp);
+            [[unroll]] for (uint i = 0; i < RPT; ++i) {
+                const uint rl = rg + RG * i;
+                [[unroll]] for (uint j = 0; j < 4u; ++j) {
+                    const uint c = cg + CG * j;
+                    const int kc = kb + int(c);
+                    const bool ok = kc >= lo[i] && kc < hi[i] && kval[c] > 0.5;
+                    const float p = ok ? exp2(s[i][j] * pc.scale - m[i]) * il[i] : 0.0;
+                    Ds[rl * BC4 + c / 4u][c % 4u] = p * (dp[i][j] - dd[i]);
+                }
+            }
+            barrier();
+            for (uint c = 0; c < BC; ++c) {
+                float dsv[4];
+                [[unroll]] for (uint a = 0; a < 4u; ++a) dsv[a] = Ds[(4u * qg + a) * BC4 + c / 4u][c % 4u];
+                [[unroll]] for (uint b = 0; b < NDQ; ++b) {
+                    const uint dcol = dg + DGQ * b;
+                    const float kv = TOF(Ks[c * HS4 + dcol / 4u][dcol % 4u]);
+                    [[unroll]] for (uint a = 0; a < 4u; ++a) acc[a][b] += dsv[a] * kv;
+                }
+            }
+        }
+        [[unroll]] for (uint a = 0; a < 4u; ++a) {
+            const uint qr = r0 + 4u * qg + a;
+            if (qr >= pc.lq) continue;
+            [[unroll]] for (uint b = 0; b < NDQ; ++b) {
+                const uint dcol = dg + DGQ * b;
+                if (dcol < HD) store_elem(DT, pc.o0, qr * pc.ldo + col + dcol, acc[a][b] * pc.oscale);
+            }
+        }
+        return;
+    }
+
+    // ── PASS 1, key-major: dK, dV ──
+    const uint k0 = gl_WorkGroupID.x * BC;
+    STAGE(Ks, BC, pc.k, pc.ldk, k0, pc.lk, col)
+    STAGE(Vs, BC, pc.v, pc.ldk, k0, pc.lk, col)
+    if (tid < BC) kval[tid] = (MASK != 0u && k0 + tid < pc.lk) ? F32Buf(pc.mask).v[k0 + tid] : 1.0;
+
+    // Query rows that can attend keys [k0, k0 + BC).
+    int qlo = 0, qhi = int(pc.lq);
+    const int k1 = min(int(k0 + BC), int(pc.lk)) - 1;
+    if (MODE == FA_MODE_ROWS && pc.causal != 0u) {
+        qlo = int(k0);
+        if (pc.window > 0u) qhi = min(qhi, k1 + int(pc.window));
+    } else if (MODE == FA_MODE_ROWS && pc.window > 0u) {
+        const int w2 = int(pc.window) / 2;
+        qlo = max(0, int(k0) - w2);
+        qhi = min(qhi, k1 + w2 + 1);
+    } else if (MODE == FA_MODE_VARLEN) {
+        // The sequences holding k0 and k1: the largest s with cu_k[s] <= key.
+        uint sa = 0u, sb = 0u;
+        for (uint pass_ = 0u; pass_ < 2u; ++pass_) {
+            const int key = pass_ == 0u ? int(k0) : k1;
+            uint s0 = 0u, s1 = pc.nseq;
+            while (s1 - s0 > 1u) {
+                const uint mid = (s0 + s1) / 2u;
+                if (I32Buf(pc.aux2).v[mid] <= key) s0 = mid; else s1 = mid;
+            }
+            if (pass_ == 0u) sa = s0; else sb = s0;
+        }
+        qlo = pc.nseq == 0u ? 0 : clamp(I32Buf(pc.aux).v[sa], 0, int(pc.lq));
+        qhi = pc.nseq == 0u ? 0 : clamp(I32Buf(pc.aux).v[sb + 1u], qlo, int(pc.lq));
+    }
+
+    const uint dg = tid % DGK, kg = tid / DGK;
+    float ak[4][NDK], av[4][NDK];
+    [[unroll]] for (uint a = 0; a < 4u; ++a)
+        [[unroll]] for (uint b = 0; b < NDK; ++b) { ak[a][b] = 0.0; av[a][b] = 0.0; }
+
+    for (int qb = qlo / int(BR) * int(BR); qb < qhi; qb += int(BR)) {
+        int lo[RPT], hi[RPT];
+        bool mine = false;
+        [[unroll]] for (uint i = 0; i < RPT; ++i) {
+            bw_interval(uint(qb) + rg + RG * i, lo[i], hi[i]);
+            mine = mine || (lo[i] < hi[i] && lo[i] <= k1 && hi[i] > int(k0));
+        }
+        barrier();
+        if (MODE == FA_MODE_PACKED) {
+            if (tid == 0u) s_any = 0;
+            barrier();
+            if (mine) s_any = 1;
+            barrier();
+            if (s_any == 0) continue;
+        }
+        STAGE(Qs, BR, pc.q, pc.ldq, uint(qb), pc.lq, col)
+        STAGE(Gs, BR, pc.g, pc.ldg, uint(qb), pc.lq, col)
+        vec4 st[RPT];
+        [[unroll]] for (uint i = 0; i < RPT; ++i) {
+            const uint qr = uint(qb) + rg + RG * i;
+            st[i] = vec4(0.0);
+            if (qr < pc.lq) {
+                const uint e = (h * pc.lq + qr) * 4u;
+                st[i] = vec4(F32Buf(pc.stats).v[e], F32Buf(pc.stats).v[e + 1u], F32Buf(pc.stats).v[e + 2u], 0.0);
+            }
+        }
+        barrier();
+        float s[RPT][4], dp[RPT][4];
+        tile_dots(rg, cg, s, dp);
+        [[unroll]] for (uint i = 0; i < RPT; ++i) {
+            const uint rl = rg + RG * i;
+            [[unroll]] for (uint j = 0; j < 4u; ++j) {
+                const uint c = cg + CG * j;
+                const int kc = int(k0 + c);
+                const bool ok = kc >= lo[i] && kc < hi[i] && kval[c] > 0.5;
+                const float p = ok ? exp2(s[i][j] * pc.scale - st[i].x) * st[i].y : 0.0;
+                Ps[rl * BC4 + c / 4u][c % 4u] = p;
+                Ds[rl * BC4 + c / 4u][c % 4u] = p * (dp[i][j] - st[i].z);
+            }
+        }
+        barrier();
+        for (uint r = 0; r < BR; ++r) {
+            const vec4 p4 = Ps[r * BC4 + kg], d4 = Ds[r * BC4 + kg];
+            [[unroll]] for (uint b = 0; b < NDK; ++b) {
+                const uint dcol = dg + DGK * b;
+                const float gv = TOF(Gs[r * HS4 + dcol / 4u][dcol % 4u]);
+                const float qv = TOF(Qs[r * HS4 + dcol / 4u][dcol % 4u]);
+                [[unroll]] for (uint a = 0; a < 4u; ++a) {
+                    av[a][b] += p4[a] * gv;
+                    ak[a][b] += d4[a] * qv;
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint a = 0; a < 4u; ++a) {
+        const uint kr = k0 + 4u * kg + a;
+        if (kr >= pc.lk) continue;
+        [[unroll]] for (uint b = 0; b < NDK; ++b) {
+            const uint dcol = dg + DGK * b;
+            if (dcol >= HD) continue;
+            store_elem(DT, pc.o0, kr * pc.ldo + col + dcol, ak[a][b] * pc.oscale);
+            store_elem(DT, pc.o1, kr * pc.ldo + col + dcol, av[a][b]);
+        }
+    }
+}

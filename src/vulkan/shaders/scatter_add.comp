@@ -1,0 +1,91 @@
+#version 460
+// Deterministic row scatter-add (ops_scatter.cpp): dst[idx[m], :] += src[m, :]
+// for scatter_rows_add and embedding_lookup_backward, with no float atomics.
+// The M (row, m) pairs are sorted as 64-bit keys row << 32 | m (bitonic, an
+// out-of-range row sorts last as 0xffffffff and is skipped), so the rows a
+// destination row receives are contiguous and in increasing m; the invocation
+// at the start of each run then sums the run in that order, in FP32, starting
+// from the destination's current value, and rounds once into -DDT. For FP32
+// that is the CPU reference's own order: the result is bit-identical.
+//   SA_KEYS    keys[i] = (idx[i] in [0, R) ? idx[i] : ~0) << 32 | i, i < M;
+//              ~0 for the padding up to P (a power of two)
+//   SA_LOCAL   the whole bitonic sort of P <= 2 * WG keys in shared memory
+//   SA_STEP    one global compare-exchange step (k, j) of the bitonic network
+//   SA_SUM     workgroup (column block, position); grid-stride over positions
+#include "common.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+
+layout(push_constant) uniform PC {
+    uint64_t idx;    // INT32 (M)
+    uint64_t keys;   // uint64 (P)
+    uint64_t src;    // (M, C) in DT
+    uint64_t dst;    // (R, C) in DT
+    uint m, r, c, p, k, j;
+} pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64Buf { uint64_t v[]; };
+
+const uint WG = 256u;
+const uint64_t NONE = 0xffffffffffffffffUL;
+
+shared uint64_t sk[2u * WG];
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    if (MODE == SA_KEYS) {
+        for (uint i = gl_GlobalInvocationID.x; i < pc.p; i += GRID_STRIDE_X) {
+            uint64_t key = NONE;
+            if (i < pc.m) {
+                const int row = I32Buf(pc.idx).v[i];
+                const uint64_t hi = (row >= 0 && uint(row) < pc.r) ? uint64_t(uint(row)) : 0xffffffffUL;
+                key = (hi << 32) | uint64_t(i);
+            }
+            U64Buf(pc.keys).v[i] = key;
+        }
+    } else if (MODE == SA_LOCAL) {   // one workgroup, P <= 2 WG
+        for (uint i = t; i < 2u * WG; i += WG) sk[i] = i < pc.p ? U64Buf(pc.keys).v[i] : NONE;
+        barrier();
+        for (uint k = 2u; k <= 2u * WG; k <<= 1) {
+            for (uint j = k >> 1; j > 0u; j >>= 1) {
+                for (uint i = t; i < 2u * WG; i += WG) {
+                    const uint l = i ^ j;
+                    if (l > i) {
+                        const uint64_t a = sk[i], b = sk[l];
+                        const bool up = (i & k) == 0u;
+                        if ((a > b) == up) { sk[i] = b; sk[l] = a; }
+                    }
+                }
+                barrier();
+            }
+        }
+        for (uint i = t; i < pc.p; i += WG) U64Buf(pc.keys).v[i] = sk[i];
+    } else if (MODE == SA_STEP) {
+        for (uint i = gl_GlobalInvocationID.x; i < pc.p; i += GRID_STRIDE_X) {
+            const uint l = i ^ pc.j;
+            if (l <= i) continue;
+            const uint64_t a = U64Buf(pc.keys).v[i], b = U64Buf(pc.keys).v[l];
+            const bool up = (i & pc.k) == 0u;
+            if ((a > b) == up) { U64Buf(pc.keys).v[i] = b; U64Buf(pc.keys).v[l] = a; }
+        }
+    } else if (MODE == SA_SUM) {
+        const uint col = gl_WorkGroupID.x * WG + t;
+        for (uint pos = gl_WorkGroupID.y; pos < pc.m; pos += gl_NumWorkGroups.y) {
+            const uint64_t key = U64Buf(pc.keys).v[pos];
+            const uint row = uint(key >> 32);
+            if (row >= pc.r) break;   // the skipped rows sort last
+            if (pos > 0u && uint(U64Buf(pc.keys).v[pos - 1u] >> 32) == row) continue;
+            if (col >= pc.c) continue;
+            const uint o = row * pc.c + col;
+            float acc = load_elem(DT, pc.dst, o);
+            for (uint q = pos; q < pc.m; ++q) {
+                const uint64_t kq = U64Buf(pc.keys).v[q];
+                if (uint(kq >> 32) != row) break;
+                acc += load_elem(DT, pc.src, uint(kq & 0xffffffffUL) * pc.c + col);
+            }
+            store_elem(DT, pc.dst, o, acc);
+        }
+    }
+}

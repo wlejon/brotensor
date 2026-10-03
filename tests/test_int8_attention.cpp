@@ -9,21 +9,13 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
-#if defined(BROTENSOR_HAS_CUDA)
-#include <cuda_runtime.h>
-#else
-#include <cstring>
-static inline void cudaMemcpy(void* dst, const void* src, size_t n, int) {
-    std::memcpy(dst, src, n);
-}
-#define cudaMemcpyHostToDevice 0
-#endif
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <random>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Tensor;
 using brotensor::Dtype;
@@ -56,8 +48,7 @@ static void prepare_w8a16(int out, int in,
         }
     }
     W_int8 = Tensor::empty_on(Device::CUDA, out, in, Dtype::INT8);
-    cudaMemcpy(W_int8.data, Wq.data(), out * in * sizeof(int8_t),
-               cudaMemcpyHostToDevice);
+    W_int8.copy_from_host_raw(Wq.data(), out * in * sizeof(int8_t));
     S = Tensor::from_host_on(Device::CUDA, scales.data(), out, 1);
     W_deq = Tensor::from_host_fp16_on(Device::CUDA, Wdeq.data(), out, in);
 }
@@ -221,7 +212,7 @@ static void test_flash_split_int8w() {
 
 int main() {
     brotensor::init();
-    if (!(brotensor::is_available(brotensor::Device::CUDA) || brotensor::is_available(brotensor::Device::HIP))) {
+    if (!bt_test::has_gpu()) {
         std::printf("no CUDA/HIP backend - skipping\n");
         return 0;
     }

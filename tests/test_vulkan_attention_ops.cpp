@@ -8,6 +8,8 @@
 
 #include "test_vulkan_common.h"
 
+#include <brotensor/ops/flash_attention.h>
+
 #include <algorithm>
 #include <cstdlib>
 
@@ -84,14 +86,22 @@ void test_self_attention_bias() {
             VKT_CHECK(O.dtype == dt);
             close_out(dt, O, Oc, tag("self_attention_bias_forward", dt, L, H, variant));
         }
-        // self_attention_forward (no biases, query + key mask)
+        // self_attention_forward (no biases): FP32 masks query rows and keys
+        // (mha_forward); 16-bit takes the flash route, keys only, as CUDA /
+        // HIP, whose CPU twin is flash_attention_qkvo_forward.
         const int L = 45, D = 96, H = 3;
         const Weights w(D, D, dt, 50);
         const auto x = random_values(std::size_t(L) * D, 51, -1.0f, 1.0f, dt);
         const auto mv = holes(L, 52);
         Tensor Oc, O;
-        brotensor::self_attention_forward(host(x, L, D), host(w.wq, D, D), host(w.wk, D, D), host(w.wv, D, D),
-                                          host(w.wo, D, D), mv.data(), H, Oc);
+        if (dt == Dtype::FP32) {
+            brotensor::self_attention_forward(host(x, L, D), host(w.wq, D, D), host(w.wk, D, D), host(w.wv, D, D),
+                                              host(w.wo, D, D), mv.data(), H, Oc);
+        } else {
+            brotensor::flash_attention_qkvo_forward(host(x, L, D), nullptr, host(w.wq, D, D), nullptr,
+                                                    host(w.wk, D, D), nullptr, host(w.wv, D, D), nullptr,
+                                                    host(w.wo, D, D), nullptr, mv.data(), H, false, Oc);
+        }
         Tensor M = Tensor::from_host_on(vk(), mv.data(), L, 1);
         brotensor::self_attention_forward(upload(x, L, D, dt), upload(w.wq, D, D, dt), upload(w.wk, D, D, dt),
                                           upload(w.wv, D, D, dt), upload(w.wo, D, D, dt),
@@ -196,7 +206,9 @@ void test_topk_segments() {
         Tensor sc, sg;
         brotensor::segment_softmax_stats(host(lg, off.back(), 1), oc_t, sc);
         brotensor::segment_softmax_stats(upload(lg, off.back(), 1, dt), og, sg);
-        expect_close(sg.to_host_vector(), sc.to_host_vector(), 2e-5f, 2e-5f,
+        VKT_CHECK(sg.dtype == dt);   // the logits' dtype, as CUDA / HIP
+        const float st = dt == Dtype::FP32 ? 2e-5f : dtype_eps(dt);
+        expect_close(download(sg), sc.to_host_vector(), 2e-5f, st,
                      tag("segment_softmax_stats", dt, int(off.size()) - 1, off.back(), 0));
     }
 }

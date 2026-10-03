@@ -13,6 +13,7 @@
 #include <random>
 #include <stdexcept>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Device;
 using brotensor::Dtype;
@@ -20,7 +21,7 @@ using brotensor::Tensor;
 
 // The GPU under test: CUDA or HIP, whichever is registered.
 static Device gpu() {
-    static const Device d = brotensor::is_available(Device::CUDA) ? Device::CUDA : Device::HIP;
+    static const Device d = bt_test::gpu();
     return d;
 }
 
@@ -199,7 +200,7 @@ static void test_fp16(FwdOp op, float (*ref)(float), const char* name) {
 
 int main() {
     brotensor::init();
-    if (!(brotensor::is_available(brotensor::Device::CUDA) || brotensor::is_available(brotensor::Device::HIP))) {
+    if (!bt_test::has_gpu()) {
         std::printf("no CUDA/HIP backend - skipping\n");
         return 0;
     }

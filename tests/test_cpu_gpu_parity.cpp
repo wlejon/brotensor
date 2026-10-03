@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Device;
 using brotensor::Tensor;
@@ -327,8 +328,8 @@ static void parity_axpby() {
         compare("axpby_fp32_gpu_vs_host", yg.to_host_vector(), ref, 1e-6f, 1e-6f);
     }
 
-    if (g_gpu != Device::CUDA && g_gpu != Device::HIP) {
-        std::printf("  (FP16 axpby checks need CUDA or HIP — skipped)\n");
+    if (g_gpu == Device::Metal) {
+        std::printf("  (FP16 axpby checks need CUDA, HIP or Vulkan — skipped)\n");
         return;
     }
 
@@ -420,9 +421,7 @@ static void parity_axpby() {
 
 int main() {
     brotensor::init();
-    if (brotensor::is_available(Device::HIP))        g_gpu = Device::HIP;
-    else if (brotensor::is_available(Device::CUDA))  g_gpu = Device::CUDA;
-    else if (brotensor::is_available(Device::Metal)) g_gpu = Device::Metal;
+    g_gpu = bt_test::gpu();
     if (g_gpu == Device::CPU) {
         std::printf("no GPU backend available - skipping\n");
         return 0;

@@ -393,10 +393,11 @@ static void test_host_accessor_device_errors() {
     std::printf("test_host_accessor_device_errors\n");
     std::vector<float> backing(4, 0.0f);
     Tensor fake = Tensor::view(Device::CUDA, backing.data(), 2, 2);
-    // view() retags a CUDA request as HIP when only HIP is registered.
+    // view() retags a CUDA request as the backend Device::CUDA aliases to
+    // when no CUDA backend is registered (HIP or Vulkan,
+    // detail::resolve_device_alias); otherwise it stays CUDA.
     namespace d = brotensor::detail;
-    const bool cuda_is_hip = !d::is_registered(Device::CUDA) && d::is_registered(Device::HIP);
-    CHECK(fake.device == (cuda_is_hip ? Device::HIP : Device::CUDA));
+    CHECK(fake.device == d::resolve_device_alias(Device::CUDA));
     CHECK(!fake.is_host());
 
     const Tensor& cfake = fake;
@@ -478,9 +479,11 @@ static void test_dispatch_registration() {
     // is_registered(CUDA) stays false.
     if (d::is_registered(Device::CUDA)) {
         std::printf("  CUDA registered - skipping unregistered-lookup case\n");
-    } else if (d::is_registered(Device::HIP)) {
-        CHECK(&d::ops_for(Device::CUDA) == &d::ops_for(Device::HIP));
-        CHECK(&d::alloc_for(Device::CUDA) == &d::alloc_for(Device::HIP));
+    } else if (d::resolve_device_alias(Device::CUDA).type != Device::CUDA.type) {
+        // Aliased to HIP or Vulkan (the preferred one when both are registered).
+        const Device alias = d::resolve_device_alias(Device::CUDA);
+        CHECK(&d::ops_for(Device::CUDA) == &d::ops_for(alias));
+        CHECK(&d::alloc_for(Device::CUDA) == &d::alloc_for(alias));
         CHECK(!brotensor::is_available(Device::CUDA));
     } else {
         CHECK(throws_with([] { (void)&d::ops_for(Device::CUDA); },
@@ -561,12 +564,11 @@ static void test_dispatch_resolution() {
     }, "exceeds the fixed dispatch buffer"));
 
     // adopt_output pins an uncommitted output; a committed one keeps its tag.
-    // A CUDA tag resolves to HIP when only HIP is registered
-    // (detail::resolve_device_alias).
-    const bool cuda_is_hip = !d::is_registered(Device::CUDA) && d::is_registered(Device::HIP);
+    // A CUDA tag resolves to the aliased backend when CUDA is not registered
+    // (detail::resolve_device_alias: HIP or Vulkan).
     Tensor fresh;
     d::adopt_output(fresh, Device::CUDA);
-    CHECK(fresh.device == (cuda_is_hip ? Device::HIP : Device::CUDA));   // tag only — still no storage
+    CHECK(fresh.device == d::resolve_device_alias(Device::CUDA));   // tag only — still no storage
     CHECK(fresh.data == nullptr);
     d::adopt_output(fresh, Device::CPU);
     CHECK(fresh.device == Device::CPU);

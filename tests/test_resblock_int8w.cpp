@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <random>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Tensor;
 using brotensor::Dtype;
@@ -211,7 +212,7 @@ static float run_case(const Case& tc) {
 
 int main() {
     brotensor::init();
-    if (!(brotensor::is_available(brotensor::Device::CUDA) || brotensor::is_available(brotensor::Device::HIP))) {
+    if (!bt_test::has_gpu()) {
         std::printf("no CUDA/HIP backend - skipping\n");
         return 0;
     }

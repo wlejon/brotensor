@@ -3,12 +3,12 @@
 Generated for chunk 6 of the Vulkan backend (docs/vulkan.md). What runs on
 `Device::vulkan(i)` today, slot by slot, and what each sibling's code calls.
 
-**Op table: 249 of 270 slots implemented, 21 null** (chunk 8 filled `attention_backward`, `mha_backward`, `self_attention_backward`, `cross_attention_backward`, `batch_norm_forward`, `batch_norm_backward` and `bce_with_logits_fused_batched`). A null slot
-throws "not implemented on vulkan" when dispatched. Every null slot is a training
-backward / training-mode forward, a host-only op that never dispatches to a GPU,
-or filtered_lrelu, whose public entry point falls back to a composite of two ops
-Vulkan implements. No inference path of brolm, brodiffusion, brosoundml,
-brovisionml or brogameagent reaches a null slot.
+**Op table: 266 of 270 slots implemented, 4 null, all by design** (chunk 9 filled the 17 training slots that remained: the four flash-attention backwards, `group_norm_backward`, `resblock_backward`, `embedding_lookup_backward`, `scatter_rows_add`, the two `conv_transpose2d` backwards, `upsample_bilinear_2x_backward`, `interp2d_backward`, `pad2d_backward`, `adaptive_avg_pool2d_backward`, `max_pool2d_backward`, `lstm_forward_train` and `lstm_backward`; chunk 8 the attention / BatchNorm / BCE ones). A null slot
+throws "not implemented on vulkan" when dispatched; none of the four is ever
+dispatched to Vulkan: two are host-only ops that always run on the CPU table,
+and filtered_lrelu's public entry points fall back to a composite of two ops
+Vulkan implements. Every op the siblings call, inference and training, runs on
+Vulkan (`brotensor_test_vulkan` checks the null set).
 
 Outside the op table: `conv1d*`, `causal_conv1d`, `conv1d_int8w_fp16` (wrappers over
 conv2d / conv_transpose1d / the INT8 conv), `lora_forward` / `lora_backward`
@@ -24,23 +24,6 @@ neither a CUDA nor a HIP backend is registered (detail::resolve_device_alias).
 |---|---|
 | `mse_scalar` | host-only: no Tensor operand, ops.cpp always runs it on the CPU table |
 | `softmax_xent_segment` | host-only: raw host pointers, ops.cpp always runs it on the CPU table |
-| `embedding_lookup_backward` | training backward (scatter-add: needs float atomics or a sort) |
-| `group_norm_backward` | training backward (brosoundml Kokoro decoder backward) |
-| `upsample_bilinear_2x_backward` | training backward |
-| `interp2d_backward` | training backward |
-| `pad2d_backward` | training backward |
-| `adaptive_avg_pool2d_backward` | training backward |
-| `max_pool2d_backward` | training backward |
-| `scatter_rows_add` | training (brolm LayaGrad soft-row gradient; scatter-add) |
-| `conv_transpose2d_backward_input` | training backward |
-| `conv_transpose2d_backward_weight` | training backward |
-| `flash_attention_packed_qkv_backward` | training backward (brolm LayaGrad) |
-| `flash_attention_varlen_backward` | training backward |
-| `flash_attention_qkvo_backward` | training backward |
-| `flash_attention_backward` | training backward |
-| `resblock_backward` | training backward |
-| `lstm_forward_train` | training forward (no sibling calls it) |
-| `lstm_backward` | training backward |
 | `filtered_lrelu_forward` | by design: composite fallback (bias_act + upfirdn2d), runs on Vulkan |
 | `filtered_lrelu_backward` | by design: the public op falls back to its bias_act + upfirdn2d composite (as on HIP), which runs on Vulkan |
 
@@ -58,9 +41,9 @@ Inference: 54 ops, all implemented.
 
 `tanh_forward`, `sigmoid_forward`, `add_inplace`, `scale_inplace`, `clamp`, `mul_inplace`, `masked_mean_pool_forward`*, `embedding_lookup_forward`*, `copy_d2d`, `copy_d2d_strided`, `cast`, `layernorm_forward_inference_batched`, `linear_forward_batched`, `relu_forward_batched`, `conv2d_forward`, `silu_forward`, `gelu_forward`, `gelu_exact_forward`, `quick_gelu_forward`, `gather_rows`, `scatter_rows`, `linear_forward_batched_fp16`, `linear_forward_batched_ex`, `layernorm_forward_inference_batched_fp16`, `flash_attention_forward`, `flash_attention_gqa_forward`, `flash_attention_packed_qkv_forward`, `flash_attention_qkvo_forward`, `nchw_to_sequence`, `sequence_to_nchw`, `matmul`, `rope_forward`, `rms_norm_forward`, `swiglu_forward`, `kv_cache_append`, `flash_attention_decode`, `flash_attention_decode_masked`, `segment_softmax_stats`, `linear_forward_batched_int8w_fp16`, `dequant_q4k_to_fp16`, `linear_forward_batched_q4k_fp16`, `dequant_q8_0_to_fp16`, `linear_forward_batched_q8_0_fp16`, `dequant_q6k_to_fp16`, `linear_forward_batched_q6k_fp16`, `rope_apply`, `rope_qkv_packed_inplace`, `rope_apply_mrope`, `self_attention_bias_forward`, `self_attention_bias_int8w_fp16`, `causal_conv1d_update`, `l2_norm_forward`, `gated_delta_rule_chunked`*, `gated_delta_rule_step`*
 
-Training: 12 ops, null: `scatter_rows_add`, `flash_attention_packed_qkv_backward`.
+Training: 12 ops, all implemented (`scatter_rows_add`, `flash_attention_packed_qkv_backward` in chunk 9).
 
-`relu_backward`, `masked_mean_pool_backward`*, `layernorm_forward_batched_with_caches`, `layernorm_backward_batched_with_caches`, `adam_step`*, `xavier_init`*, `linear_backward_batched`, `silu_backward`, `gelu_exact_backward`, `scatter_rows_add` **(null)**, `geglu_exact_backward`, `flash_attention_packed_qkv_backward` **(null)**
+`relu_backward`, `masked_mean_pool_backward`*, `layernorm_forward_batched_with_caches`, `layernorm_backward_batched_with_caches`, `adam_step`*, `xavier_init`*, `linear_backward_batched`, `silu_backward`, `gelu_exact_backward`, `scatter_rows_add`, `geglu_exact_backward`, `flash_attention_packed_qkv_backward`
 
 ### brodiffusion
 
@@ -78,9 +61,9 @@ Inference: 76 ops, all implemented.
 
 `linear_forward`, `relu_forward`, `tanh_forward`, `sigmoid_forward`, `add_inplace`, `axpby_inplace`, `add_scalar_inplace`, `scale_inplace`, `clamp`, `mul_inplace`, `embedding_lookup_forward`*, `concat_rows`, `concat_batched_rows`, `concat_nchw_channels`, `copy_d2d`, `copy_d2d_strided`, `cast`, `layernorm_forward_inference_batched`, `linear_forward_batched`, `relu_forward_batched`, `add_inplace_batched`, `conv2d_forward`, `group_norm_forward`, `silu_forward`, `gelu_forward`, `gelu_exact_forward`, `interp2d_align_corners_forward`, `pad2d_forward`, `slice2d_forward`, `top_k_rows`, `gather_rows`, `scatter_rows`, `linear_forward_batched_fp16`, `linear_forward_batched_ex`, `flash_attention_forward`, `flash_attention_gqa_forward`, `flash_attention_windowed_forward`, `flash_attention_varlen_forward`, `nchw_to_sequence`, `sequence_to_nchw`, `matmul`, `rms_norm_forward`, `sum_cols`, `argmax_rows`, `modulate`, `broadcast_mul`, `rope_apply`, `self_attention_bias_forward`, `rel_pos_bias_xl_forward`, `complex_mul`, `complex_abs`, `complex_angle`, `complex_from_polar`, `rfft`, `irfft`, `stft`, `istft`, `conv_transpose1d_forward`, `pad1d_forward`, `snake_forward`, `elu_forward`, `leaky_relu_forward`, `vq_encode_forward`, `resample1d_forward`, `log_forward`, `exp_forward`, `sample_logits_into`, `masked_diffusion_scores`, `masked_diffusion_commit`, `batch_norm_inference`, `randn`, `rand_uniform`, `sin_forward`, `add_channel_bias_inplace`, `add_row_bias_inplace`, `softmax_rows_forward`
 
-Training: 19 ops, null: `group_norm_backward` (`batch_norm_forward` / `_backward` and `bce_with_logits_fused_batched` filled in chunk 8).
+Training: 19 ops, all implemented (`group_norm_backward` in chunk 9; `batch_norm_forward` / `_backward` and `bce_with_logits_fused_batched` in chunk 8).
 
-`linear_backward`, `tanh_backward`, `adam_step`*, `xavier_init`*, `linear_backward_batched`, `relu_backward_batched`, `softmax_xent_fused_batched`, `bce_with_logits_fused_batched`, `conv2d_backward_input`, `conv2d_backward_weight`*, `conv2d_backward_bias`, `group_norm_backward` **(null)**, `istft_backward`, `conv_transpose1d_backward_input`, `pad1d_backward`, `snake_backward`, `leaky_relu_backward`, `batch_norm_forward`, `batch_norm_backward`
+`linear_backward`, `tanh_backward`, `adam_step`*, `xavier_init`*, `linear_backward_batched`, `relu_backward_batched`, `softmax_xent_fused_batched`, `bce_with_logits_fused_batched`, `conv2d_backward_input`, `conv2d_backward_weight`*, `conv2d_backward_bias`, `group_norm_backward`, `istft_backward`, `conv_transpose1d_backward_input`, `pad1d_backward`, `snake_backward`, `leaky_relu_backward`, `batch_norm_forward`, `batch_norm_backward`
 
 ### brovisionml
 
@@ -124,8 +107,7 @@ OmniVoice precision default, brogameagent's JS device names, bro's
   33 tests) and brosoundml's BC-ResNet / phoneme-model training
   (`batch_norm_forward` in training mode and `bce_with_logits_fused_batched`;
   2 of 48). They pass on HIP
-  (`BROTENSOR_PREFER_HIP=1`). **Done in chunk 8** (docs/vulkan.md "Training
-  ops"): both siblings pass every test on Vulkan.
+  (`BROTENSOR_PREFER_HIP=1`). **Done in chunk 8** (docs/vulkan-training.md): both siblings pass every test on Vulkan.
 * **STFT precision.** The DFT-as-GEMM STFT (`ops_spectral.cpp`) carries
   ~5e-5 absolute error at n_fft 512 (FP32 partial sums of a DFT row that
   cancel), against the CPU FFT's ~1e-6, and the GEMM's K rotation makes the
@@ -256,7 +238,7 @@ that registers the slot.
 | `softmax_xent_segment` | null | - |
 | `softmax_xent_fused` | implemented | ops_xent.cpp |
 | `embedding_lookup_forward` | implemented (chunk 6) | ops_misc.cpp |
-| `embedding_lookup_backward` | null | - |
+| `embedding_lookup_backward` | implemented (chunk 9) | ops_scatter.cpp |
 | `concat_rows` | implemented | ops_copy.cpp |
 | `split_rows` | implemented | ops_copy.cpp |
 | `concat_batched_rows` | implemented | ops_spatial.cpp |
@@ -329,7 +311,7 @@ that registers the slot.
 | Slot | Vulkan | File |
 |---|---|---|
 | `group_norm_forward` | implemented | ops_gnorm.cpp |
-| `group_norm_backward` | null | - |
+| `group_norm_backward` | implemented (chunk 9) | ops_gnorm.cpp |
 
 **Activations: silu, gelu (tanh-approx + exact), quick_gelu**
 
@@ -352,7 +334,7 @@ that registers the slot.
 | `upsample_bilinear_2x` | implemented | ops_spatial.cpp |
 | `downsample_avg_2x` | implemented | ops_spatial.cpp |
 | `upsample_nearest_2x_backward` | implemented | ops_spatial.cpp |
-| `upsample_bilinear_2x_backward` | null | - |
+| `upsample_bilinear_2x_backward` | implemented (chunk 9) | ops_spatial_bwd.cpp |
 | `downsample_avg_2x_backward` | implemented | ops_spatial.cpp |
 
 **Arbitrary-scale 2D resample (nearest / bilinear / bicubic)**
@@ -360,7 +342,7 @@ that registers the slot.
 | Slot | Vulkan | File |
 |---|---|---|
 | `interp2d_forward` | implemented | ops_spatial.cpp |
-| `interp2d_backward` | null | - |
+| `interp2d_backward` | implemented (chunk 9) | ops_spatial_bwd.cpp |
 | `interp2d_align_corners_forward` | implemented | ops_spatial.cpp |
 
 **2D padding (zero / reflect / replicate) — NCHW**
@@ -368,7 +350,7 @@ that registers the slot.
 | Slot | Vulkan | File |
 |---|---|---|
 | `pad2d_forward` | implemented | ops_spatial.cpp |
-| `pad2d_backward` | null | - |
+| `pad2d_backward` | implemented (chunk 9) | ops_spatial_bwd.cpp |
 
 **2D spatial slice / crop on NCHW**
 
@@ -406,21 +388,21 @@ that registers the slot.
 | Slot | Vulkan | File |
 |---|---|---|
 | `adaptive_avg_pool2d_forward` | implemented | ops_spatial.cpp |
-| `adaptive_avg_pool2d_backward` | null | - |
+| `adaptive_avg_pool2d_backward` | implemented (chunk 9) | ops_spatial_bwd.cpp |
 
 **Max pool 2D (NCHW): forward returns Y + int32 flat-spatial Idx**
 
 | Slot | Vulkan | File |
 |---|---|---|
 | `max_pool2d_forward` | implemented | ops_spatial.cpp |
-| `max_pool2d_backward` | null | - |
+| `max_pool2d_backward` | implemented (chunk 9) | ops_spatial_bwd.cpp |
 
 **Row gather / scatter-add (general 2D — superset of embedding_lookup)**
 
 | Slot | Vulkan | File |
 |---|---|---|
 | `gather_rows` | implemented | ops_spatial.cpp |
-| `scatter_rows_add` | null | - |
+| `scatter_rows_add` | implemented (chunk 9) | ops_scatter.cpp |
 | `scatter_rows` | implemented | ops_spatial.cpp |
 
 **2D transposed convolution (NCHW) — forward + three backwards**
@@ -428,8 +410,8 @@ that registers the slot.
 | Slot | Vulkan | File |
 |---|---|---|
 | `conv_transpose2d_forward` | implemented | ops_conv.cpp |
-| `conv_transpose2d_backward_input` | null | - |
-| `conv_transpose2d_backward_weight` | null | - |
+| `conv_transpose2d_backward_input` | implemented (chunk 9) | ops_conv.cpp |
+| `conv_transpose2d_backward_weight` | implemented (chunk 9) | ops_conv.cpp |
 | `conv_transpose2d_backward_bias` | implemented | ops_conv.cpp |
 
 **SAM-style window partition / reverse (NCHW <-> windowed batch)**
@@ -485,11 +467,11 @@ that registers the slot.
 | `flash_attention_windowed_forward` | implemented | ops_attention.cpp |
 | `flash_attention_varlen_forward` | implemented | ops_attention.cpp |
 | `flash_attention_packed_qkv_forward` | implemented | ops_attention.cpp |
-| `flash_attention_packed_qkv_backward` | null | - |
-| `flash_attention_varlen_backward` | null | - |
+| `flash_attention_packed_qkv_backward` | implemented (chunk 9) | ops_fa_bwd.cpp |
+| `flash_attention_varlen_backward` | implemented (chunk 9) | ops_fa_bwd.cpp |
 | `flash_attention_qkvo_forward` | implemented | ops_attention.cpp |
-| `flash_attention_qkvo_backward` | null | - |
-| `flash_attention_backward` | null | - |
+| `flash_attention_qkvo_backward` | implemented (chunk 9) | ops_fa_bwd.cpp |
+| `flash_attention_backward` | implemented (chunk 9) | ops_fa_bwd.cpp |
 | `flash_attention_project_kv` | implemented | ops_attention.cpp |
 | `flash_attention_q_with_kv_cached_forward` | implemented | ops_attention.cpp |
 
@@ -524,7 +506,7 @@ that registers the slot.
 |---|---|---|
 | `resblock_forward` | implemented | ops_diffusion.cpp |
 | `resblock_forward_int8w_fp16` | implemented | ops_diffusion.cpp |
-| `resblock_backward` | null | - |
+| `resblock_backward` | implemented (chunk 9) | ops_diffusion.cpp |
 
 **Matmul + RoPE + RMSNorm + SwiGLU + KV-cache + Llama family**
 
@@ -533,8 +515,8 @@ that registers the slot.
 | `matmul` | implemented | ops_linear.cpp |
 | `matmul_abt` | implemented | ops_linear.cpp |
 | `matmul_backward` | implemented | ops_linear.cpp |
-| `lstm_forward_train` | null | - |
-| `lstm_backward` | null | - |
+| `lstm_forward_train` | implemented (chunk 9) | ops_lstm.cpp |
+| `lstm_backward` | implemented (chunk 9) | ops_lstm.cpp |
 | `rope_forward` | implemented | ops_rope.cpp |
 | `rope_backward` | implemented | ops_rope.cpp |
 | `rms_norm_forward` | implemented | ops_norm.cpp |

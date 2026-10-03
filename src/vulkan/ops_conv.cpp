@@ -3,8 +3,9 @@
 // it, a direct kernel for depthwise and narrow grouped convolutions),
 // conv3d_forward (a GEMM when the kernel covers the whole input, the direct
 // kernel otherwise), conv_transpose2d_forward (a GEMM + overlap-add in
-// ops_vision.cpp, the direct gather when one image's columns exceed 256 MiB) and the
-// two bias gradients. Contracts follow the CUDA backend (src/cuda/conv2d.cu,
+// ops_vision.cpp, the direct gather when one image's columns exceed 256 MiB) and
+// its input / weight gradients (ordinary convolutions of dY), and the two bias
+// gradients. Contracts follow the CUDA backend (src/cuda/conv2d.cu,
 // conv3d.cu, conv_transpose2d.cu): X, Wt and bias share a dtype (FP32 /
 // FP16 / BF16), Y is resized to (N, C_out * H_out * W_out) in X's dtype and
 // overwritten; bias gradients accumulate. Design: docs/vulkan.md
@@ -16,6 +17,7 @@
 #include "detail/spatial.h"
 
 #include <brotensor/detail/dispatch.h>
+#include <brotensor/ops/spatial.h>
 
 #include <algorithm>
 #include <atomic>
@@ -524,6 +526,103 @@ void conv_transpose2d_backward_bias(const Tensor& dY, int N, int C_out, int H_ou
     conv2d_backward_bias(dY, N, C_out, H_out, W_out, dB);
 }
 
+// ─── conv_transpose2d backwards ────────────────────────────────────────────
+//
+// Both are ordinary convolutions of dY (C_out channels at H_out x W_out) with
+// the transposed convolution's own geometry: the input gradient is conv2d of
+// dY with Wt read as OIHW weights (C_in outputs, C_out / groups inputs per
+// group), and the weight gradient is conv2d_backward_weight of that
+// convolution with X as its output gradient (accumulated, as the CUDA /
+// CPU reference). Same dtypes as the forward (CUDA: FP32 only).
+
+void conv2d_backward_weight(const Tensor& X, const Tensor& dY, int N, int C_in, int H, int W, int C_out, int kH,
+                            int kW, int stride_h, int stride_w, int pad_h, int pad_w, int dil_h, int dil_w, int groups,
+                            Tensor& dWt);   // ops_vision.cpp
+void slice2d_forward(const Tensor& X, int N, int C, int H, int W, int h0, int w0, int H_out, int W_out,
+                     Tensor& Y);   // ops_spatial.cpp
+
+namespace {
+
+struct CtGeom { int Ho, Wo; };
+
+CtGeom ct_check(const char* op, int N, int C_in, int H, int W, int C_out, int kH, int kW, int stride_h, int stride_w,
+                int pad_h, int pad_w, int output_padding_h, int output_padding_w, int dil_h, int dil_w, int groups) {
+    need(op, N >= 0 && C_in > 0 && H > 0 && W > 0 && C_out > 0, "bad dimension");
+    need(op, groups >= 1 && C_in % groups == 0 && C_out % groups == 0,
+         "groups must be >= 1 and divide both C_in and C_out");
+    need(op, kH >= 1 && kW >= 1 && stride_h >= 1 && stride_w >= 1 && dil_h >= 1 && dil_w >= 1 && pad_h >= 0 &&
+                 pad_w >= 0 && output_padding_h >= 0 && output_padding_w >= 0,
+         "kH/kW/stride/dilation >=1 and pad/output_padding >=0");
+    need(op, output_padding_h < std::max(stride_h, dil_h) && output_padding_w < std::max(stride_w, dil_w),
+         "output_padding must be smaller than stride or dilation");
+    const int Ho = (H - 1) * stride_h - 2 * pad_h + dil_h * (kH - 1) + output_padding_h + 1;
+    const int Wo = (W - 1) * stride_w - 2 * pad_w + dil_w * (kW - 1) + output_padding_w + 1;
+    need(op, Ho > 0 && Wo > 0, "non-positive output spatial size");
+    return {Ho, Wo};
+}
+
+}  // namespace
+
+void conv_transpose2d_backward_input(const Tensor& Wt, const Tensor& dY, int N, int C_in, int H, int W, int C_out,
+                                     int kH, int kW, int stride_h, int stride_w, int pad_h, int pad_w,
+                                     int output_padding_h, int output_padding_w, int dil_h, int dil_w, int groups,
+                                     Tensor& dX) {
+    const char* op = "conv_transpose2d_backward_input";
+    check_same_dtype(op, dY, Wt, nullptr);
+    const CtGeom g = ct_check(op, N, C_in, H, W, C_out, kH, kW, stride_h, stride_w, pad_h, pad_w, output_padding_h,
+                              output_padding_w, dil_h, dil_w, groups);
+    need(op, Wt.rows == C_in && Wt.cols == C_out / groups * kH * kW, "Wt shape must be (C_in, (C_out/groups)*kH*kW)");
+    need(op, dY.rows == N && dY.cols == static_cast<long long>(C_out) * g.Ho * g.Wo,
+         "dY shape must be (N, C_out*H_out*W_out)");
+    const int in_cols = C_in * H * W;
+    if (dX.data == nullptr) dX.device = dY.device;
+    if (dX.rows != N || dX.cols != in_cols || dX.dtype != dY.dtype) dX.resize(N, in_cols, dY.dtype);
+    if (N == 0) return;
+    // The convolution's output size; above H x W only when output_padding
+    // reaches a stride (output_padding < dilation): crop it.
+    const int Hc = (g.Ho + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
+    const int Wc = (g.Wo + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
+    if (Hc == H && Wc == W) {
+        conv2d_forward(dY, Wt, nullptr, N, C_out, g.Ho, g.Wo, C_in, kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h,
+                       dil_w, groups, dX);
+        return;
+    }
+    Tensor full;
+    full.device = dY.device;
+    conv2d_forward(dY, Wt, nullptr, N, C_out, g.Ho, g.Wo, C_in, kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                   groups, full);
+    vulkan::slice2d_forward(full, N, C_in, Hc, Wc, 0, 0, H, W, dX);
+}
+
+void conv_transpose2d_backward_weight(const Tensor& X, const Tensor& dY, int N, int C_in, int H, int W, int C_out,
+                                      int kH, int kW, int stride_h, int stride_w, int pad_h, int pad_w,
+                                      int output_padding_h, int output_padding_w, int dil_h, int dil_w, int groups,
+                                      Tensor& dWt) {
+    const char* op = "conv_transpose2d_backward_weight";
+    check_same_dtype(op, X, dY, &dWt);
+    const CtGeom g = ct_check(op, N, C_in, H, W, C_out, kH, kW, stride_h, stride_w, pad_h, pad_w, output_padding_h,
+                              output_padding_w, dil_h, dil_w, groups);
+    need(op, dWt.rows == C_in && dWt.cols == C_out / groups * kH * kW,
+         "dWt shape must be (C_in, (C_out/groups)*kH*kW)");
+    need(op, X.rows == N && X.cols == C_in * H * W, "X shape must be (N, C_in*H*W)");
+    need(op, dY.rows == N && dY.cols == static_cast<long long>(C_out) * g.Ho * g.Wo,
+         "dY shape must be (N, C_out*H_out*W_out)");
+    if (N == 0) return;
+    const int Hc = (g.Ho + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
+    const int Wc = (g.Wo + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
+    if (Hc == H && Wc == W) {
+        conv2d_backward_weight(dY, X, N, C_out, g.Ho, g.Wo, C_in, kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h,
+                               dil_w, groups, dWt);
+        return;
+    }
+    // The convolution's output is larger than X: X zero-padded at the bottom /
+    // right (those outputs receive no gradient).
+    Tensor Xp = Tensor::empty_on(X.device, N, C_in * Hc * Wc, X.dtype);
+    ::brotensor::pad2d_forward(X, N, C_in, H, W, 0, Hc - H, 0, Wc - W, 0, Xp);
+    conv2d_backward_weight(dY, Xp, N, C_out, g.Ho, g.Wo, C_in, kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                           groups, dWt);
+}
+
 void fill_vulkan_vtable_conv(::brotensor::detail::OpsVTable& v) {
     v.conv2d_forward = &conv2d_forward;
     v.conv2d_backward_input = &conv2d_backward_input;
@@ -531,6 +630,8 @@ void fill_vulkan_vtable_conv(::brotensor::detail::OpsVTable& v) {
     v.conv3d_forward = &conv3d_forward;
     v.conv_transpose2d_forward = &conv_transpose2d_forward;
     v.conv_transpose2d_backward_bias = &conv_transpose2d_backward_bias;
+    v.conv_transpose2d_backward_input = &conv_transpose2d_backward_input;
+    v.conv_transpose2d_backward_weight = &conv_transpose2d_backward_weight;
 }
 
 }  // namespace brotensor::detail::vulkan

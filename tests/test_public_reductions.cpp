@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <random>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Device;
 using brotensor::Dtype;
@@ -18,13 +19,7 @@ using brotensor::Tensor;
 // none is. Cached after the first call (which must happen after
 // brotensor::init()).
 static Device gpu_device() {
-    static const Device d = [] {
-        if (brotensor::is_available(Device::HIP))   return Device::HIP;
-        if (brotensor::is_available(Device::CUDA))  return Device::CUDA;
-        if (brotensor::is_available(Device::Metal)) return Device::Metal;
-        return Device::CPU;
-    }();
-    return d;
+    return bt_test::gpu();
 }
 
 // BF16 host helpers (mirrors parity_helpers.h inline versions).

@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "gpu_select.h"
 
 using brotensor::Device;
 using brotensor::Dtype;
@@ -561,7 +562,7 @@ int main() {
     test_throws();
     test_commit_cpu();
     // HIP runs the CUDA half through the CUDA -> HIP device alias.
-    const bool cuda = brotensor::is_available(Device::CUDA) || brotensor::is_available(Device::HIP);
+    const bool cuda = bt_test::has_gpu();
     test_top_k_long_row(cuda);
     if (cuda) {
         test_parity();

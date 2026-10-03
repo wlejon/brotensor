@@ -13,6 +13,16 @@
 //             formula (a tree in shared memory), then normalises its share of
 //             the tile: y = (x - mean) rstd gamma[c] + beta[c], optionally
 //             followed by SiLU (spec constant 1; the ResBlock's GN + SiLU).
+// Its backward (no atomics) reuses GN_STATS, then
+//   GN_BWD_CH     workgroup (c, n): the tile's mean / rstd (from the
+//                 partials), s1 = sum dY, s2 = sum dY xhat over the channel's
+//                 H W elements, into an FP32 (N, C, 2) buffer (pc.rm); the
+//                 group's first channel also stores (mean, rstd) (pc.rv);
+//   GN_BWD_DX     workgroup (x, tile): sum1 = sum_c gamma_c s1, sum2 =
+//                 sum_c gamma_c s2 over the group, then
+//                 dX = rstd (dY gamma - (sum1 + xhat sum2) / M);
+//   GN_BWD_PARAM  per channel: dGamma += sum_n s2, dBeta += sum_n s1 (FP32
+//                 sums, one rounding into the parameter dtype).
 // Never E[x^2] - E[x]^2: the per-chunk sums are shifted by a sample of the
 // data and the chunks combine through their own means, so a tile whose mean
 // dwarfs its spread keeps its variance (the CPU reference's two passes).
@@ -27,7 +37,7 @@ layout(constant_id = 2) const uint V4 = 0;   // GroupNorm: 4-element loads / sto
                                              // 16-byte aligned x / y)
 
 layout(push_constant) uniform PC {
-    uint64_t x, y, g, b, part, rm, rv;
+    uint64_t x, y, g, b, part, rm, rv;   // backward: y = dX, b = dY, rm = per-channel sums, rv = tile stats
     uint tile, hw, cpg, groups;   // GroupNorm: tile = cpg * hw elements
     uint splits, chunk;           // GN_STATS: chunks per tile and their length
     uint total, c;                // BN / L2: element count, channels
@@ -79,6 +89,29 @@ float wg_sum(float v) {
     return r;
 }
 
+// Tile `tile`'s (mean, rstd) from its GN_STATS partials (every lane).
+vec2 tile_stats(uint tile) {
+    const uint t = gl_LocalInvocationID.x;
+    float n = 0.0, m = 0.0, q = 0.0;
+    for (uint s = t; s < pc.splits; s += 256u) {
+        const uint o = (tile * pc.splits + s) * 3u;
+        chan(n, m, q, F32Buf(pc.part).v[o], F32Buf(pc.part).v[o + 1u], F32Buf(pc.part).v[o + 2u]);
+    }
+    s_n[t] = n; s_m[t] = m; s_q[t] = q;
+    barrier();
+    [[unroll]] for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) {
+            float a = s_n[t], am = s_m[t], aq = s_q[t];
+            chan(a, am, aq, s_n[t + s], s_m[t + s], s_q[t + s]);
+            s_n[t] = a; s_m[t] = am; s_q[t] = aq;
+        }
+        barrier();
+    }
+    const vec2 r = vec2(s_m[0], 1.0 / sqrt(s_q[0] / s_n[0] + pc.eps));
+    barrier();
+    return r;
+}
+
 void main() {
     const uint t = gl_LocalInvocationID.x;
     if (MODE == GN_STATS) {
@@ -117,23 +150,8 @@ void main() {
         }
     } else if (MODE == GN_APPLY) {
         const uint tile = gl_WorkGroupID.y;
-        float n = 0.0, m = 0.0, q = 0.0;
-        for (uint s = t; s < pc.splits; s += 256u) {
-            const uint o = (tile * pc.splits + s) * 3u;
-            chan(n, m, q, F32Buf(pc.part).v[o], F32Buf(pc.part).v[o + 1u], F32Buf(pc.part).v[o + 2u]);
-        }
-        s_n[t] = n; s_m[t] = m; s_q[t] = q;
-        barrier();
-        [[unroll]] for (uint s = 128u; s > 0u; s >>= 1) {
-            if (t < s) {
-                float a = s_n[t], am = s_m[t], aq = s_q[t];
-                chan(a, am, aq, s_n[t + s], s_m[t + s], s_q[t + s]);
-                s_n[t] = a; s_m[t] = am; s_q[t] = aq;
-            }
-            barrier();
-        }
-        const float mean = s_m[0];
-        const float rstd = 1.0 / sqrt(s_q[0] / s_n[0] + pc.eps);
+        const vec2 st = tile_stats(tile);
+        const float mean = st.x, rstd = st.y;
         const uint base = tile * pc.tile;
         const uint c0 = (tile % pc.groups) * pc.cpg;
         if (V4 != 0) {   // a group of 4 lies in one channel (hw % 4 == 0)
@@ -153,6 +171,57 @@ void main() {
             v = v * load_elem(DT, pc.g, ch) + load_elem(DT, pc.b, ch);
             if (SILU != 0) v = v / (1.0 + exp(-v));
             store_elem(DT, pc.y, base + i, v);
+        }
+    } else if (MODE == GN_BWD_CH) {   // workgroup (channel, sample); total = N
+        const uint ch = gl_WorkGroupID.x, img = gl_WorkGroupID.y;
+        const uint tile = img * pc.groups + ch / pc.cpg;
+        const vec2 st = tile_stats(tile);
+        const uint base = (img * pc.c + ch) * pc.hw;
+        float s1 = 0.0, s2 = 0.0;
+        for (uint i = t; i < pc.hw; i += 256u) {
+            const float dy = load_elem(DT, pc.b, base + i);
+            s1 += dy;
+            s2 += dy * (load_elem(DT, pc.x, base + i) - st.x) * st.y;
+        }
+        s1 = wg_sum(s1);
+        s2 = wg_sum(s2);
+        if (t == 0u) {
+            F32Buf(pc.rm).v[(img * pc.c + ch) * 2u] = s1;
+            F32Buf(pc.rm).v[(img * pc.c + ch) * 2u + 1u] = s2;
+            if (ch % pc.cpg == 0u) {
+                F32Buf(pc.rv).v[tile * 2u] = st.x;
+                F32Buf(pc.rv).v[tile * 2u + 1u] = st.y;
+            }
+        }
+    } else if (MODE == GN_BWD_DX) {   // workgroup (x, tile)
+        const uint tile = gl_WorkGroupID.y;
+        const uint img = tile / pc.groups, c0 = (tile % pc.groups) * pc.cpg;
+        float a = 0.0, b = 0.0;
+        for (uint k = t; k < pc.cpg; k += 256u) {
+            const uint o = (img * pc.c + c0 + k) * 2u;
+            const float gv = load_elem(DT, pc.g, c0 + k);
+            a += gv * F32Buf(pc.rm).v[o];
+            b += gv * F32Buf(pc.rm).v[o + 1u];
+        }
+        const float inv_m = 1.0 / float(pc.tile);
+        const float sum1 = wg_sum(a) * inv_m, sum2 = wg_sum(b) * inv_m;
+        const float mean = F32Buf(pc.rv).v[tile * 2u], rstd = F32Buf(pc.rv).v[tile * 2u + 1u];
+        const uint base = tile * pc.tile;
+        for (uint i = gl_WorkGroupID.x * 256u + t; i < pc.tile; i += gl_NumWorkGroups.x * 256u) {
+            const uint ch = c0 + i / pc.hw;
+            const float xh = (load_elem(DT, pc.x, base + i) - mean) * rstd;
+            const float dxh = load_elem(DT, pc.b, base + i) * load_elem(DT, pc.g, ch);
+            store_elem(DT, pc.y, base + i, rstd * (dxh - (sum1 + xh * sum2)));
+        }
+    } else if (MODE == GN_BWD_PARAM) {   // total = N; pc.y = dGamma, pc.g = dBeta
+        for (uint ch = gl_GlobalInvocationID.x; ch < pc.c; ch += GRID_STRIDE_X) {
+            float s1 = 0.0, s2 = 0.0;
+            for (uint img = 0; img < pc.total; ++img) {
+                s1 += F32Buf(pc.rm).v[(img * pc.c + ch) * 2u];
+                s2 += F32Buf(pc.rm).v[(img * pc.c + ch) * 2u + 1u];
+            }
+            store_elem(DT, pc.y, ch, load_elem(DT, pc.y, ch) + s2);
+            store_elem(DT, pc.g, ch, load_elem(DT, pc.g, ch) + s1);
         }
     } else if (MODE == GN_BN_INFER) {
         for (uint i = gl_GlobalInvocationID.x; i < pc.total; i += GRID_STRIDE_X) {

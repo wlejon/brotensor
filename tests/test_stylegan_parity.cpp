@@ -15,9 +15,13 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
+#include "gpu_select.h"
+
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 using brotensor::Tensor;
@@ -41,13 +45,8 @@ static std::vector<float> rnd(int n, uint64_t seed, float lo, float hi) {
     return v;
 }
 
-// GPU backend this binary was built with: CUDA, HIP or Metal.
-static Device gdev() {
-    if (brotensor::is_available(Device::CUDA))  return Device::CUDA;
-    if (brotensor::is_available(Device::HIP))   return Device::HIP;
-    if (brotensor::is_available(Device::Metal)) return Device::Metal;
-    return Device::CPU;
-}
+// The GPU backend under test (gpu_select.h).
+static Device gdev() { return bt_test::gpu(); }
 
 static Tensor cpu(const std::vector<float>& v, int r, int c) {
     return Tensor::from_host_on(Device::CPU, v.data(), r, c);
