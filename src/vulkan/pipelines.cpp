@@ -58,7 +58,7 @@ const Kernel& Pipelines::get_custom(std::uint32_t handle, const std::uint32_t* s
 
 const Kernel& Pipelines::get_blob(std::uint32_t key_id, const ShaderBlob& blob,
                                   const std::uint32_t* spec, std::uint32_t nspec,
-                                  std::uint32_t subgroup) {
+                                  std::uint32_t subgroup, const char* entry) {
     Key key{key_id, subgroup, std::vector<std::uint32_t>(spec, spec + nspec)};
     std::lock_guard<std::mutex> lk(mu_);
     auto it = kernels_.find(key);
@@ -120,7 +120,7 @@ const Kernel& Pipelines::get_blob(std::uint32_t key_id, const ShaderBlob& blob,
     ci.stage.flags = subgroup ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT : 0;
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = sm;
-    ci.stage.pName = "main";
+    ci.stage.pName = entry;
     ci.stage.pSpecializationInfo = nspec ? &si : nullptr;
     ci.layout = layout_;
     VkPipeline pipe = VK_NULL_HANDLE;

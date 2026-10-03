@@ -14,8 +14,9 @@ Outside the op table: `conv1d*`, `causal_conv1d`, `conv1d_int8w_fp16` (wrappers 
 conv2d / conv_transpose1d / the INT8 conv), `lora_forward` / `lora_backward`
 (GEMM compositions) and the five `fused_*` ops (src/ops/fused.cpp; the
 stacked-weight SwiGLU GEMV takes the Vulkan GEMV epilogue, the rest compose
-dispatched ops) all run on Vulkan. `jit::*` traces on Vulkan are replayed op by
-op (src/jit/trace_eager.cpp). `Device::CUDA` aliases to Vulkan when no CUDA
+dispatched ops) all run on Vulkan. `jit::*` traces on Vulkan compile to one
+SPIR-V kernel each (src/jit/trace_compiler_vulkan.cpp, docs/vulkan.md "Trace
+JIT"); one with no fusion is replayed op by op (src/jit/trace_eager.cpp). `Device::CUDA` aliases to Vulkan when no CUDA
 backend is registered (detail::resolve_device_alias).
 
 ## Null slots

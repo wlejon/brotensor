@@ -7,8 +7,10 @@
 //   Test 4: Trace cache hit verification & replay speedup benchmark.
 //   Test 6: A Vulkan trace never reaches the host code generator.
 //   Test 7: Eager divide / modulate and a traced divide on Vulkan.
-//   Tests 1-4, 6 and 7 run on Vulkan (eager replay).
-// Runs across CPU, NVIDIA RTX GPU (CUDA sm_89) and Vulkan (unfused replay).
+//   Tests 1-7 run on Vulkan: through the SPIR-V trace compiler when the build
+//   has it (BROTENSOR_HAS_VULKAN_TRACE_JIT; every fused pattern is then one
+//   launch), else as an op-by-op replay (tests 1-4, 6, 7).
+// Runs across CPU, NVIDIA RTX GPU (CUDA sm_89) and Vulkan.
 
 #include <brotensor/jit/trace.h>
 #include <brotensor/ops.h>
@@ -81,6 +83,23 @@ std::string device_label(Device dev) {
     return "CPU";
 }
 
+// Whether `dev`'s traces compile to one fused kernel: CPU and CUDA always,
+// Vulkan with the SPIR-V trace compiler.
+bool fuses(Device dev) {
+#if BROTENSOR_HAS_VULKAN_TRACE_JIT
+    (void)dev;
+    return true;
+#else
+    return !dev.is_vulkan();
+#endif
+}
+
+void check_one_launch(Device dev, const TraceHandle& h, const std::string& what) {
+    if (!fuses(dev)) return;
+    const std::string name = what + " is one launch (" + h.fusion_name() + ")";
+    CHECK_TRUE(h.launch_count() == 1, name.c_str());
+}
+
 float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size()) return 1e9f;
     float max_diff = 0.0f;
@@ -131,6 +150,7 @@ void test_elementwise_expression(Device dev) {
     std::vector<float> h_out = out.to_host_vector();
     float err = max_abs_diff(h_out, ref);
     CHECK_PARITY(err, 1e-4f, (dev_name + " Elementwise (a*b+c)*silu(d) initial").c_str());
+    check_one_launch(dev, handle, dev_name + " (a*b+c)*silu(d)");
 
     // Replay execution
     handle.execute();
@@ -192,6 +212,7 @@ void test_residual_rmsnorm(Device dev) {
 
     CHECK_PARITY(err_h, 1e-4f, (dev_name + " In-place residual h += proj").c_str());
     CHECK_PARITY(err_norm, 1e-4f, (dev_name + " RMSNorm norm = rms_norm(h)").c_str());
+    check_one_launch(dev, handle, dev_name + " h += proj; rms_norm(h)");
 
     // Replay execution: restore h contents and re-execute handle
     if (dev.is_cpu()) {
@@ -265,6 +286,7 @@ void test_layernorm_modulate(Device dev) {
     std::vector<float> actual_out = out.to_host_vector();
     float err = max_abs_diff(actual_out, ref_out);
     CHECK_PARITY(err, 1e-4f, (dev_name + " LayerNorm + Modulate initial").c_str());
+    check_one_launch(dev, handle, dev_name + " layernorm + modulate");
 
     // Replay execution
     handle.execute();
@@ -499,11 +521,11 @@ void test_trace_allocates_nothing(Device dev) {
 
 // ── Test 6: a Vulkan trace never reaches the host code generator ───────────
 //
-// There is no GPU trace compiler for Vulkan. The CPU compiler emits host code
-// that walks raw pointers, so handing it a Vulkan DAG would dereference
+// The CPU compiler emits host code that walks raw pointers, so handing it a Vulkan DAG would dereference
 // buffer device addresses (not host pointers at all), with no ordering
 // against the device stream: it would read an input the GPU has not
-// finished writing. The trace has to stay on the device.
+// finished writing. The trace has to stay on the device (the SPIR-V
+// compiler, or the op-by-op replay), ordered on its stream.
 void test_trace_stays_on_device(Device dev) {
     const std::string dn = device_label(dev);
     std::printf("\n--- Test 6: %s trace stays on the device ---\n", dn.c_str());
@@ -620,16 +642,17 @@ int main() {
     } else {
         std::printf("\n[SKIP] CUDA device not available or not detected; skipping CUDA tests.\n");
     }
-    // Vulkan has no trace compiler: its traces replay op by op through the
-    // dispatched ops (src/jit/trace_eager.cpp). Tests 1-4 check results,
-    // replay and the cache; test 5 measures the fused kernel's allocation
-    // and launch count, which an unfused replay does not have.
+    // Vulkan: the SPIR-V trace compiler when the build has it, else an
+    // op-by-op replay through the dispatched ops (src/jit/trace_eager.cpp).
+    // Test 5 measures the fused kernel's allocation and launch count, which
+    // an unfused replay does not have.
     if (brotensor::is_available(Device::vulkan())) {
         std::printf("\n============================ [ VULKAN TEST SUITE ] ===========================\n");
         test_elementwise_expression(Device::vulkan());
         test_residual_rmsnorm(Device::vulkan());
         test_layernorm_modulate(Device::vulkan());
         test_cache_hit_and_speedup(Device::vulkan());
+        if (fuses(Device::vulkan())) test_trace_allocates_nothing(Device::vulkan());
         test_trace_stays_on_device(Device::vulkan());
         test_eager_div_modulate(Device::vulkan());
     }

@@ -254,6 +254,7 @@ add_library(brotensor_cpu STATIC
     src/jit/trace_dag.cpp
     src/jit/trace_cache.cpp
     src/jit/trace_compiler_cpu.cpp
+    src/jit/trace_plan.cpp
     src/jit/trace_eager.cpp
     src/jit/trace_ops.cpp
 )

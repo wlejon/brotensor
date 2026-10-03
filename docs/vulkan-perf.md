@@ -130,6 +130,45 @@ of it). HIP's causal path does not skip masked tiles.
 Vulkan-vs-HIP parity test): ~21 s per call on HIP (one argmax pass per kept
 token, O(keep V)), 9 ms on Vulkan.
 
+## Trace JIT (`--bench-jit`, after HIP)
+
+The trace JIT's Vulkan compiler (docs/vulkan.md, "Trace JIT"; brass's SPIR-V
+target) against the op-by-op replay Vulkan ran before it
+(`BROTENSOR_JIT_VULKAN=eager`), same traces, same process, 2026-10-03. GB/s
+is over the ideal fused traffic (inputs once, outputs once, rows once); the
+replay's figure is effective. Peak 256 GB/s; 1024-row shapes above it are
+cache-resident.
+
+| Pattern | Shape | dtype | replay (launches) | replay ms | fused ms | fused GB/s | speedup |
+|---|---|---|---:|---:|---:|---:|---:|
+| LN-modulate (DiT AdaLN) | 4096 x 3072 | FP32 | 3 | 2.675 | 0.486 | 207 | 5.50 |
+| | 4096 x 3072 | BF16 | 3 | 0.761 | 0.235 | 214 | 3.24 |
+| | 4096 x 3072 | FP16 | 3 | 0.756 | 0.232 | 217 | 3.26 |
+| | 1024 x 4096 | FP32 / BF16 / FP16 | 3 | 0.518 / 0.116 / 0.112 | 0.066 / 0.030 / 0.024 | 508 / 568 / 686 | 7.82 / 3.91 / 4.57 |
+| VAE norm + SiLU (`silu(rms_norm)`) | 262144 x 128 | FP32 | 3 | 6.697 | 1.172 | 229 | 5.71 |
+| | 65536 x 384 | FP32 | 3 | 4.925 | 0.868 | 232 | 5.67 |
+| | 1048576 x 96 | FP32 | 3 | 21.08 | 3.595 | 224 | 5.86 |
+| | 262144 x 128 | BF16 | 3 | 3.748 | 0.588 | 228 | 6.37 |
+| | 65536 x 384 | BF16 | 3 | 2.585 | 0.436 | 231 | 5.93 |
+| | 1048576 x 96 | BF16 | 3 | 12.16 | 1.826 | 221 | 6.66 |
+| Elementwise chain, 10 ops, 4 inputs | 4096 x 4096 | FP32 | 12 | 22.29 | 1.495 | 224 | 14.9 |
+| | 4096 x 4096 | BF16 / FP16 | 12 | 6.873 / 6.874 | 0.745 / 0.746 | 225 / 225 | 9.23 / 9.21 |
+| | 1024 x 1024 | FP32 / BF16 / FP16 | 12 | 0.320 / 0.132 / 0.131 | 0.023 / 0.013 / 0.012 | 910 / 839 / 845 | 13.9 / 10.5 / 10.6 |
+
+The fused kernels sit at 81-91% of nominal bandwidth on cache-cold shapes,
+level with brass's own SPIR-V kernels against hand-written GLSL (~230 GB/s);
+BF16 matches FP16 (its shared-memory bit reinterpretation costs nothing).
+The replay's FP32 rows are slow mostly from its per-execute scratch
+intermediates.
+
+**End to end** (brodiffusion `build_vk`, Qwen-Image 2.1 txt2img 1024 x 1024,
+8 steps, `BRODIFFUSION_TIME=1`; the DiT's AdaLN / gate / SwiGLU seams, the
+VAE norms and the Euler update are traced): denoise 3.509 s/step fused,
+3.752 s/step with the op-by-op replay (-6.5%), 3.597 s/step with every trace
+site off (`BRODIFFUSION_JIT=0`, the hand-written eager path; -2.4%). VAE
+decode 1.47 / 1.51 / 1.49 s. The step is GEMM-bound; the images are
+visually identical.
+
 ## llama.cpp reference (vk-spike, same machine)
 
 One codebase with expert kernels for both backends (`/home/j/projects/vk-spike/RESULTS.md`,

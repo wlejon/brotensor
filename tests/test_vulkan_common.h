@@ -207,5 +207,7 @@ void run_train_tests();     // test_vulkan_train.cpp (calls the run_train_*_test
 void run_train_fa_tests();  // test_vulkan_train_fa.cpp
 void run_train_spatial_tests();  // test_vulkan_train_spatial.cpp
 void run_train_spatial2_tests(); // test_vulkan_train_spatial2.cpp
+void run_jit_tests();       // test_vulkan_jit.cpp (the trace JIT's SPIR-V compiler)
+void run_jit_bench();       // test_vulkan_bench_jit.cpp
 
 }  // namespace vkt

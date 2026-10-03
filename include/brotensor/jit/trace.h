@@ -4,8 +4,9 @@
 //
 // Dynamic expression and operation sequence tracing powered by Brass.
 // Automatically captures mathematical expressions and operation patterns,
-// analyzes tensor liveness, and emits fused AVX2/FMA machine code on CPU or
-// cooperative PTX kernels on NVIDIA RTX GPUs.
+// analyzes tensor liveness, and emits fused AVX2/FMA machine code on CPU,
+// cooperative PTX kernels on NVIDIA GPUs, or SPIR-V compute kernels on Vulkan
+// (brass's SPIR-V target; a Vulkan trace with no fusion is replayed op by op).
 
 #include <brotensor/tensor.h>
 #include <cstdint>
@@ -36,7 +37,8 @@ public:
     size_t launch_count() const;
 
     // Wall-clock cost of producing this trace's code, in microseconds: PTX
-    // emission plus the driver's PTX->SASS compile. Zero on a cache hit.
+    // emission plus the driver's PTX->SASS compile (CUDA), or MIR, SPIR-V and
+    // pipeline creation (Vulkan). Zero on a cache hit.
     double compile_us() const;
 
     // Human-readable name of the fusion the compiler chose, for benchmark and

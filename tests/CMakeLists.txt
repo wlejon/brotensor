@@ -174,8 +174,12 @@ if(BROTENSOR_WITH_VULKAN)
                        test_vulkan_train_fa.cpp test_vulkan_train_spatial.cpp
                        test_vulkan_train_spatial2.cpp
                        test_vulkan_bench.cpp test_vulkan_bench_attention.cpp test_vulkan_bench_conv.cpp
-                       test_vulkan_bench_quant.cpp)
+                       test_vulkan_bench_quant.cpp test_vulkan_jit.cpp test_vulkan_bench_jit.cpp)
     target_link_libraries(brotensor_test_vulkan PRIVATE brotensor_vulkan_internal)
+    if(BROTENSOR_VULKAN_TRACE_JIT)
+        # test_vulkan_jit.cpp reaches src/vulkan/vulkan_jit.h, which names brass types.
+        target_link_libraries(brotensor_test_vulkan PRIVATE "$<BUILD_INTERFACE:brass>")
+    endif()
     # Custom kernels the way a sibling ships them (cmake/BrotensorVulkan.cmake).
     brotensor_vulkan_add_shaders(brotensor_test_vulkan
         NAMESPACE brotensor_test_vk HEADER brotensor_test_vk_shaders.h

@@ -391,7 +391,7 @@ void test_graph() {
 }  // namespace vkt
 
 int main(int argc, char** argv) {
-    bool expect_default_vulkan = false, bench = false, bench_attn = false, bench_conv = false, bench_quant = false, bench_audio = false, only = false;
+    bool expect_default_vulkan = false, bench = false, bench_attn = false, bench_conv = false, bench_quant = false, bench_audio = false, bench_jit = false, only = false;
     std::string filter;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--expect-default-vulkan") == 0) expect_default_vulkan = true;
@@ -400,6 +400,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--bench-conv") == 0) bench_conv = true;
         if (std::strcmp(argv[i], "--bench-quant") == 0) bench_quant = true;
         if (std::strcmp(argv[i], "--bench-audio") == 0) bench_audio = true;
+        if (std::strcmp(argv[i], "--bench-jit") == 0) bench_jit = true;
         if (std::strncmp(argv[i], "--only=", 7) == 0) { only = true; filter = argv[i] + 7; }
     }
     brotensor::init();
@@ -428,7 +429,11 @@ int main(int argc, char** argv) {
             vkt::run_audio_bench();
             return 0;
         }
-        if (only) {   // --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision|capture|train: one group
+        if (bench_jit) {
+            vkt::run_jit_bench();
+            return 0;
+        }
+        if (only) {   // --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision|capture|train|jit: one group
             if (filter == "ops") vkt::run_op_tests();
             if (filter == "gemm") vkt::run_gemm_tests();
             if (filter == "norm") vkt::run_norm_tests();
@@ -442,6 +447,7 @@ int main(int argc, char** argv) {
             if (filter == "vision") vkt::run_vision_tests();
             if (filter == "capture") vkt::run_capture_tests();
             if (filter == "train") vkt::run_train_tests();
+            if (filter == "jit") vkt::run_jit_tests();
             std::printf("%s: %d failure(s)\n", vkt::failures() ? "FAILED" : "OK", vkt::failures());
             return vkt::failures() ? 1 : 0;
         }
@@ -465,6 +471,7 @@ int main(int argc, char** argv) {
             vkt::run_misc_tests();
             vkt::run_vision_tests();
             vkt::run_train_tests();
+            vkt::run_jit_tests();
         }
     } catch (const std::exception& e) {
         std::printf("  FAIL  uncaught exception: %s\n", e.what());

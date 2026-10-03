@@ -38,8 +38,10 @@ class DeviceCtx;
 
 // The SPIR-V of a custom kernel (custom.cpp); throws for an unknown handle.
 ShaderBlob custom_shader_blob(std::uint32_t handle);
-// Custom kernels' cache keys sit above every ShaderId.
+// Custom kernels' cache keys sit above every ShaderId, run-time compiled
+// (trace JIT) kernels' between the two.
 inline constexpr std::uint32_t kCustomKeyBase = 0x80000000u;
+inline constexpr std::uint32_t kJitKeyBase = 0x40000000u;
 
 struct Kernel {
     VkPipeline    pipe = VK_NULL_HANDLE;
@@ -72,13 +74,22 @@ public:
     const Kernel& get_custom(std::uint32_t handle, const std::uint32_t* spec = nullptr,
                              std::uint32_t nspec = 0, std::uint32_t subgroup = 0);
 
+    // A kernel compiled at run time (vulkan_jit.cpp: brass's SPIR-V target)
+    // under a `key_id` the JIT registry allocated above kJitKeyBase, with the
+    // entry point `entry` (brass names it after the MIR function). The blob's
+    // words need only live for the call.
+    const Kernel& get_jit(std::uint32_t key_id, const ShaderBlob& blob, const char* entry,
+                          const std::uint32_t* spec, std::uint32_t nspec, std::uint32_t subgroup) {
+        return get_blob(key_id, blob, spec, nspec, subgroup, entry);
+    }
+
     VkPipelineLayout layout() const { return layout_; }
     std::uint32_t push_bytes() const { return push_bytes_; }
     std::size_t size() const;
 
 private:
     const Kernel& get_blob(std::uint32_t key_id, const ShaderBlob& blob, const std::uint32_t* spec,
-                           std::uint32_t nspec, std::uint32_t subgroup);
+                           std::uint32_t nspec, std::uint32_t subgroup, const char* entry = "main");
 
     struct Key {
         std::uint32_t id;

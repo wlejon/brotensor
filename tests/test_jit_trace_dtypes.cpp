@@ -31,8 +31,10 @@ namespace {
 int g_failures = 0;
 
 // Whether the backend under test fuses. CUDA compiles each trace to one PTX
-// kernel; Vulkan has no trace compiler and replays the DAG op by op, so its
-// "is one launch" checks are skipped and only the numbers are gated.
+// kernel, Vulkan to one SPIR-V kernel (brass's SPIR-V target) when the build
+// has the Vulkan trace compiler (BROTENSOR_HAS_VULKAN_TRACE_JIT); without it
+// Vulkan replays the DAG op by op, its "is one launch" checks are skipped and
+// only the numbers are gated.
 bool g_expect_fused = true;
 
 struct SplitMix64 {
@@ -533,7 +535,11 @@ void test_scalar_entry_fallback(Device dev) {
 void run_suite(Device dev, const char* label) {
     std::printf("\n=== %s ===\n", label);
     const bool gpu = !dev.is_cpu();
+#if BROTENSOR_HAS_VULKAN_TRACE_JIT
+    g_expect_fused = true;
+#else
     g_expect_fused = !dev.is_vulkan();
+#endif
     std::vector<Dtype> dtypes{Dtype::FP32};
     if (gpu) {
         dtypes.push_back(Dtype::BF16);
@@ -574,10 +580,14 @@ int main() {
     } else if (!brotensor::is_available(Device::vulkan())) {
         std::printf("[SKIP] no CUDA or Vulkan device; the typed and broadcast paths are GPU-only.\n");
     }
-    // Vulkan has no trace compiler: its traces replay op by op.
+    // Vulkan: the SPIR-V trace compiler, or op-by-op replay without it.
     if (brotensor::is_available(Device::vulkan())) {
         brotensor::DeviceScope scope(Device::vulkan());
+#if BROTENSOR_HAS_VULKAN_TRACE_JIT
+        run_suite(Device::vulkan(), "Vulkan (SPIR-V trace compiler)");
+#else
         run_suite(Device::vulkan(), "Vulkan (unfused replay)");
+#endif
     }
 
     std::printf("\n================================================================\n");

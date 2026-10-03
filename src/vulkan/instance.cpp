@@ -57,6 +57,7 @@ bool probe_physical(const LoaderFns& f, VkPhysicalDevice pd, PhysInfo& info, std
     f.vkGetPhysicalDeviceProperties2(pd, &p2);
     info.driver = std::string(drv.driverName) + " " + drv.driverInfo;
     info.subgroup_size = p11.subgroupSize;
+    info.subgroup_ops = p11.subgroupSupportedOperations;
     info.min_subgroup = v13 ? p13.minSubgroupSize : p11.subgroupSize;
     info.max_subgroup = v13 ? p13.maxSubgroupSize : p11.subgroupSize;
 

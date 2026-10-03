@@ -317,6 +317,24 @@ const ShaderBlob& shader_blob(ShaderId id) { return k_table[static_cast<std::uin
     endif()
     target_compile_definitions(brotensor_vulkan PUBLIC BROTENSOR_HAS_VULKAN=1 BROTENSOR_HAS_GPU=1)
     target_compile_definitions(brotensor_vulkan PRIVATE VK_NO_PROTOTYPES)
+    # The trace JIT's Vulkan compiler: the CUDA compiler's fusion plans as
+    # brass MIR, lowered by brass's SPIR-V target (src/jit/spirv_emit*.cpp)
+    # and dispatched through src/vulkan/vulkan_jit.cpp. Needs brass as a
+    # sibling target with the SPIR-V target built; without it Vulkan traces
+    # replay op by op (src/jit/trace_eager.cpp).
+    if(TARGET brass AND BRASS_WITH_SPIRV AND BROTENSOR_HAS_BRASS_JIT)
+        set(_jit "${_BROTENSOR_VULKAN_ROOT}/src/jit")
+        target_sources(brotensor_vulkan PRIVATE
+            ${_src}/vulkan_jit.cpp
+            ${_jit}/spirv_emit_common.cpp
+            ${_jit}/spirv_emit_elementwise.cpp
+            ${_jit}/spirv_emit_rownorm.cpp
+            ${_jit}/trace_compiler_vulkan.cpp)
+        target_link_libraries(brotensor_vulkan PRIVATE "$<BUILD_INTERFACE:brass>")
+        target_compile_definitions(brotensor_vulkan PUBLIC BROTENSOR_HAS_VULKAN_TRACE_JIT=1)
+        message(STATUS "brotensor: Vulkan trace JIT compiler on (brass SPIR-V target)")
+        set(BROTENSOR_VULKAN_TRACE_JIT ON PARENT_SCOPE)
+    endif()
     if(MSVC)
         target_compile_options(brotensor_vulkan PRIVATE /W4)
     else()

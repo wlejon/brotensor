@@ -65,6 +65,16 @@ void register_cuda_trace_compiler(CudaTraceCompilerFn fn) {
     s_cuda_trace_compiler_fn = fn;
 }
 
+static VulkanTraceCompilerFn s_vulkan_trace_compiler_fn = nullptr;
+
+VulkanTraceCompilerFn get_vulkan_trace_compiler_hook() {
+    return s_vulkan_trace_compiler_fn;
+}
+
+void register_vulkan_trace_compiler(VulkanTraceCompilerFn fn) {
+    s_vulkan_trace_compiler_fn = fn;
+}
+
 TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
     uint64_t hash = dag.compute_hash();
 
@@ -91,16 +101,16 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
 
     FusionPattern pattern = classify_dag(dag);
 
-    // Which compiler gets the DAG. CUDA has the PTX compiler; Vulkan
-    // has no trace compiler at all, and its DAGs must never reach the CPU
-    // one (host code over device pointers / addresses, unordered against the
-    // device stream), so they are replayed op by op instead. Everything else
-    // is the CPU compiler's.
+    // Which compiler gets the DAG. CUDA has the PTX compiler and Vulkan the
+    // SPIR-V one (brass MIR); a Vulkan DAG must never reach the CPU compiler
+    // (host code over device addresses, unordered against the device
+    // stream), so what the Vulkan compiler cannot fuse is replayed op by op
+    // instead. Everything else is the CPU compiler's.
     bool is_cuda = false;
-    bool eager_replay = false;   // Vulkan: op-by-op replay
+    bool is_vulkan = false;
     for (const auto& n : dag.nodes()) {
         if (n.device.is_cuda()) is_cuda = true;
-        if (n.device.is_vulkan()) eager_replay = true;
+        if (n.device.is_vulkan()) is_vulkan = true;
     }
 
     const auto compile_t0 = std::chrono::steady_clock::now();
@@ -111,8 +121,9 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
             throw std::runtime_error("brotensor::jit: CUDA JIT compiler hook is not registered or CUDA is unavailable");
         }
         handle = cuda_fn(dag, pattern);
-    } else if (eager_replay) {
-        handle = eager::compile_eager(dag);
+    } else if (is_vulkan) {
+        if (auto vk_fn = get_vulkan_trace_compiler_hook()) handle = vk_fn(dag, pattern);
+        if (!handle) handle = eager::compile_eager(dag);
     } else {
         handle = cpu::compile_cpu(dag, pattern);
     }
@@ -121,11 +132,11 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
     handle->is_cuda = is_cuda;
     handle->node_count = dag.node_count();
     handle->is_cache_hit = false;
-    // The CUDA compiler names its own fusion and times its own PTX build, the
-    // eager replay counts its own launches; the CPU path is always one fused
-    // call through brass's host codegen.
+    // The CUDA and Vulkan compilers name their own fusion and time their own
+    // builds, the eager replay counts its own launches; the CPU path is always
+    // one fused call through brass's host codegen.
     if (handle->launch_count == 0) handle->launch_count = 1;
-    if (!is_cuda && !eager_replay) {
+    if (!is_cuda && !is_vulkan) {
         handle->fusion_name = "cpu-avx2-fused";
         handle->compile_us = std::chrono::duration<double, std::micro>(
                                  std::chrono::steady_clock::now() - compile_t0).count();

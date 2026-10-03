@@ -136,22 +136,6 @@ std::string emit_ew_entry(const TraceDAG& dag, const ElementwisePlan& plan, int 
 
 }  // namespace
 
-int elem_bytes(Dtype d) {
-    switch (d) {
-        case Dtype::FP32: return 4;
-        case Dtype::FP16:
-        case Dtype::BF16: return 2;
-        default: return 0;
-    }
-}
-
-bool dtype_supported(Dtype d) { return elem_bytes(d) != 0; }
-
-int vec_width_for(Dtype d) {
-    const int e = elem_bytes(d);
-    return e ? 16 / e : 1;
-}
-
 std::string emit_elementwise(const TraceDAG& dag, const ElementwisePlan& plan,
                              const std::string& arch) {
     std::stringstream ss;

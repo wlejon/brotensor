@@ -10,19 +10,6 @@ namespace brotensor::jit::ptx {
 
 using namespace brotensor::jit::ptx::detail;
 
-void row_norm_geometry(int cols, int rows, int lanes, int& tpr, int& rpb) {
-    if (lanes < 1) lanes = 1;
-    const int per_row = (cols + lanes - 1) / lanes;   // threads to cover a row
-    int t = 32;
-    while (t < per_row && t < kRowThreads) t <<= 1;
-    int r = kRowThreads / t;
-    // The out-of-range exit has to be block-uniform, or the threads that stay
-    // hit a barrier the ones that left never will.
-    while (r > 1 && rows % r != 0) r >>= 1;
-    tpr = t;
-    rpb = r;
-}
-
 namespace {
 
 // ─── row-norm kernel ────────────────────────────────────────────────────────

@@ -1,13 +1,13 @@
-// ─── Eager trace execution — backends with no trace compiler ────────────────
+// ─── Eager trace execution — Vulkan DAGs with no fusion ─────────────────────
 //
-// The trace JIT compiles a DAG to host code (brass, CPU) or to PTX (CUDA).
-// Vulkan has neither: there is no GPU code generator for it here,
-// and the CPU compiler must never see its DAGs — its host code would walk device
-// addresses outside the device's ordering (a Vulkan address is not even a
-// host pointer). Such a trace is
-// therefore executed by replaying the DAG one
-// node at a time through the ordinary device-dispatched ops, on the current
-// stream, in program order.
+// The trace JIT compiles a DAG to host code (brass, CPU), to PTX (CUDA) or to
+// SPIR-V (Vulkan, trace_compiler_vulkan.cpp). A Vulkan DAG the Vulkan compiler
+// has no fusion for (two reductions, an op with no elementwise form, ...), or
+// a build without that compiler, must still never reach the CPU compiler: its
+// host code would walk device addresses outside the device's ordering (a
+// Vulkan address is not even a host pointer). Such a trace is therefore
+// executed by replaying the DAG one node at a time through the ordinary
+// device-dispatched ops, on the current stream, in program order.
 //
 // That keeps every trace correct on Vulkan — same results as the eager op
 // sequence the trace replaces, same TraceHandle replay/rebind contract — but

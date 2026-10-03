@@ -41,6 +41,7 @@ struct PhysInfo {
     bool graphics_queue = true;          // family has graphics + compute
     std::uint32_t subgroup_size = 0;
     std::uint32_t min_subgroup = 0, max_subgroup = 0;
+    std::uint32_t subgroup_ops = 0;      // VkSubgroupFeatureFlags (compute is checked at eligibility)
     bool subgroup_size_control = false;  // pipelines may require a size
     bool memory_budget = false;          // VK_EXT_memory_budget
     bool cooperative_matrix = false;     // VK_KHR_cooperative_matrix (enabled when present)

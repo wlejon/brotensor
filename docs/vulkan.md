@@ -96,11 +96,11 @@ suites name the GPU as `Device::CUDA` and pick it through `tests/gpu_select.h`
 on Vulkan, and in a build with CUDA or Metal as well they run again on Vulkan
 as `<name>_vulkan` (`BROTENSOR_TEST_GPU=vulkan`,
 `BROTENSOR_DEFAULT_DEVICE=vulkan`).
-Trace-JIT (`jit::*`) DAGs on Vulkan are replayed op by op through the
-dispatched ops (`src/jit/trace_eager.cpp`): there is no Vulkan
-trace compiler, and the CPU one must never see a buffer device address. The
-`fused_*` ops need no Vulkan case (they compose dispatched ops; the
-stacked-weight SwiGLU GEMV takes the GEMV epilogue).
+Trace-JIT (`jit::*`) DAGs on Vulkan are compiled to one SPIR-V kernel each
+(see "Trace JIT" below); a DAG with no fusion is replayed op by op through
+the dispatched ops (`src/jit/trace_eager.cpp`). The `fused_*` ops need no
+Vulkan case (they compose dispatched ops; the stacked-weight SwiGLU GEMV
+takes the GEMV epilogue).
 
 ## Build
 
@@ -132,6 +132,7 @@ src/vulkan/
   tensor.cpp                    AllocVTable: alloc/free/transfers/memset/sync/mem queries
   graph.cpp                     VulkanGraph / VulkanGraphCapture, Event, the neutral capture's recorder
   custom.cpp                    custom kernels: register_shader / kernel_info / dispatch
+  vulkan_jit.h, .cpp            brass SpirvKernel -> pipeline, for src/jit/trace_compiler_vulkan.cpp
   register.cpp                  probe + vtable fill + public stats
   detail/gemm.h, gemm.cpp       the GEMM dispatcher every matrix op goes through
   detail/attention.h            the attention dispatcher (ops_attention.cpp) and dense path
@@ -147,8 +148,8 @@ src/vulkan/
                                 (accurate exp / log / sincos), quant_decode.glsl (the quantised
                                 chunk loads / decodes), op_codes.h, shaders.cmake (the list)
 tests/test_vulkan.cpp           runtime, the Device::CUDA alias; main(),
-                                --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision|capture|train|alias,
-                                --bench-gemm, --bench-attention, --bench-conv, --bench-quant, --bench-audio
+                                --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision|capture|train|jit|alias,
+                                --bench-gemm, --bench-attention, --bench-conv, --bench-quant, --bench-audio, --bench-jit
 tests/test_vulkan_ops.cpp       chunk-1 op parity
 tests/test_vulkan_gemm.cpp      matmul / linear parity, every kernel path
 tests/test_vulkan_norm.cpp      norms, softmax, RoPE, GLUs parity
@@ -175,6 +176,7 @@ tests/test_vulkan_train.cpp     attention / MHA / self / cross attention backwar
 tests/test_vulkan_train_fa.cpp  flash-attention backwards (bare, varlen, packed QKV, QKVO)
 tests/test_vulkan_train_spatial.cpp   GroupNorm / ResBlock backwards
 tests/test_vulkan_train_spatial2.cpp  scatter-adds, conv_transpose2d backwards, resample / pad / pool backwards
+tests/test_vulkan_jit.cpp       the trace JIT's compiler (--only=jit); test_vulkan_bench_jit.cpp: --bench-jit
 tests/test_vulkan_common.h
 ```
 
@@ -845,6 +847,43 @@ ResBlock backwards, scatter-adds, transposed-convolution, resample, pad and
 pool backwards, LSTM) are described in `docs/vulkan-training.md`, with their
 measured errors against the CPU and the flash backward's speed against HIP.
 
+## Trace JIT
+
+`begin_trace()` / `end_trace()` on Vulkan tensors compile the DAG to one
+kernel (`src/jit/trace_compiler_vulkan.cpp`, hook `register_vulkan_trace_compiler`)
+from the CUDA compiler's plans (`src/jit/trace_plan.h`, shared): **elementwise**
+(grid-stride, 16-byte accesses, `(1, cols)` rows / `(1, 1)` scalars by column,
+per-buffer FP32/FP16/BF16, FP32 math) and **row-norm** (one RMSNorm /
+LayerNorm with the chain before and after it, row groups of 32-256 threads, a
+32-lane subgroup butterfly plus one shared round, a 2-D grid past 65535
+groups; LayerNorm's variance two-pass, not the PTX emitter's
+`E[x^2] - E[x]^2`). Each plan is brass MIR through `KernelBuilder`
+(`src/jit/spirv_emit*.cpp`), a vector and a scalar entry lowered by
+`SpirvTarget::compile`; bind picks the vector entry when every pointer is
+aligned for it and packs the push block once, so a replay is one dispatch on
+the stream (barrier-ordered, captured into graphs). `launch_count()` is 1,
+`fusion_name()` names the entry, `compile_us()` covers MIR, SPIR-V and the
+pipelines. brass's runtime contract is this backend's dispatch model (u64
+device addresses in the push block — a tensor's `data` already is one —,
+Pipelines' descriptor-free layout, workgroup size as spec constants 0..2,
+subgroup 32 required when possible: `src/vulkan/vulkan_jit.cpp`). Modules are
+interned by their SPIR-V words (a recompiled trace reuses its pipelines) and
+their capabilities checked once per device (`jit_missing_for` lists every
+missing feature). BF16 is a shift plus a bit reinterpretation, which MIR
+lacks; brass lowers an `i32` access of an `f32` Workgroup array as
+`OpBitcast`, so each thread reinterprets through its own shared word, at no
+measurable cost (BF16 runs at the FP16 bandwidth); rounding is RNE with quiet
+NaNs, as `common.glsl`. A DAG with no plan (two reductions, an op with no
+elementwise form, too many buffers for the push block, >= 2^31 elements) or a
+compile failure is replayed op by op (`trace_eager.cpp`; a failure's reason
+is printed once, `BROTENSOR_JIT_STRICT=1` throws instead,
+`BROTENSOR_JIT_VULKAN=eager` disables the compiler). Built when brass is a
+sibling target with its SPIR-V target (`BROTENSOR_HAS_VULKAN_TRACE_JIT`).
+Measured (`--bench-jit`): 207-232 GB/s on cache-cold shapes, 3.2-7.8x the
+replay on LN-modulate, 5.7-6.7x on the VAE norm + SiLU, 9-15x on a ten-op
+chain; a Qwen-Image 2.1 1024 x 1024 denoise step 3.51 s against 3.75 s
+replayed and 3.60 s with its trace sites off (docs/vulkan-perf.md).
+
 ## Dtype policy
 
 - **FP32**: native.
@@ -953,6 +992,7 @@ to divide 64; the dispatcher checks).
 | `BROTENSOR_VK_FA_PATH=rows\|cm\|dense` | force an attention path where it applies (benchmarking) |
 | `BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn` | force the `conv_cm` tile (one of the six in `ops_conv.cpp`) |
 | `BROTENSOR_VK_QGEMV=lpr,unr,sg,nr` | force the quantised GEMV's lanes per row group, items in flight, subgroup size and rows per group |
+| `BROTENSOR_JIT_VULKAN=eager` / `BROTENSOR_JIT_STRICT=1` | replay traces op by op / make a trace-compiler failure throw (see Trace JIT) |
 | `BROTENSOR_VK_DFT_GEMM=1` | run every spectral transform through the FP32 basis GEMM instead of the FP64 direct DFT (benchmarking; less accurate) |
 
 Vulkan validation layers were not installed on the development machine, so
