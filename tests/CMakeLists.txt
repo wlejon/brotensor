@@ -169,7 +169,7 @@ if(BROTENSOR_WITH_VULKAN)
                        test_vulkan_norm.cpp test_vulkan_attention.cpp test_vulkan_attention_ops.cpp
                        test_vulkan_conv.cpp test_vulkan_spatial.cpp test_vulkan_quant.cpp
                        test_vulkan_quant_attention.cpp test_vulkan_audio.cpp test_vulkan_sampling.cpp
-                       test_vulkan_misc.cpp test_vulkan_vision.cpp test_vulkan_capture.cpp
+                       test_vulkan_misc.cpp test_vulkan_vision.cpp test_vulkan_capture.cpp test_vulkan_train.cpp
                        test_vulkan_bench.cpp test_vulkan_bench_attention.cpp test_vulkan_bench_conv.cpp
                        test_vulkan_bench_quant.cpp)
     target_link_libraries(brotensor_test_vulkan PRIVATE brotensor_vulkan_internal)
@@ -201,6 +201,14 @@ if(BROTENSOR_WITH_HIP)
     # exits 77 (skipped) without one.
     brotensor_add_test(brotensor_test_cuda_rocm_parity test_cuda_rocm_parity.cpp)
     set_tests_properties(brotensor_test_cuda_rocm_parity PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+# Vulkan vs HIP on the same inputs in one process: the ops the siblings run at
+# inference, per-op tolerances from the dtype policy. Needs both backends;
+# exits 77 (skipped) when either device is missing.
+if(BROTENSOR_WITH_HIP AND BROTENSOR_WITH_VULKAN)
+    brotensor_add_test(brotensor_test_vulkan_hip_parity test_vulkan_hip_parity.cpp test_vulkan_hip_parity_ops.cpp)
+    set_tests_properties(brotensor_test_vulkan_hip_parity PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 endif()
 
 # --- GPU tests (CUDA or Metal) ---

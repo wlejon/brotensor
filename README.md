@@ -4,7 +4,7 @@
 [![CodeQL](https://github.com/wlejon/brotensor/actions/workflows/codeql.yml/badge.svg)](https://github.com/wlejon/brotensor/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A C++20 tensor + ops library with **one tensor type** and **three interchangeable backends** — CPU (always built), CUDA, and Metal (both optional). Every op is device-neutral: you write
+A C++20 tensor + ops library with **one tensor type** and **interchangeable backends** — CPU (always built), CUDA, Metal, Vulkan and HIP (all optional; on AMD, Vulkan is the backend of choice and HIP, ROCm, is kept as the comparison backend). Every op is device-neutral: you write
 
 ```cpp
 brotensor::linear_forward(W, b, x, y);
@@ -24,7 +24,7 @@ brotensor is the shared tensor layer for a family of sibling projects (`brodiffu
   - **Training building blocks** — flash attention with backward, LSTM with full BPTT, LoRA adapters, StyleGAN3 generator primitives (modulated conv, upfirdn2d, filtered lrelu), SGD/Adam
 - **Precision & quantization** — the CPU backend is the complete FP32 reference; the GPU backends add FP16/BF16 paths, INT8 weight-only matmul/conv (W8A16), and GGUF block-quant kernels (Q4_K / Q6_K / Q8_0)
 - **Model loading** — mmap'd zero-copy readers for **safetensors** (also writes) and **GGUF**
-- **CUDA / HIP graph capture** (`<brotensor/cuda_graph.h>`) — capture a fixed-shape step once and replay it with a single launch, amortising per-kernel launch overhead in tight decode loops. `Tensor::resize` keeps device pointers stable across shape cycles so captured buffers stay valid
+- **Graph capture** (`<brotensor/cuda_graph.h>`, device-neutral: CUDA / HIP graphs, Vulkan re-submitted command buffers; gate on `graph_capture_available()`) — capture a fixed-shape step once and replay it with a single launch, amortising per-kernel launch overhead in tight decode loops. `Tensor::resize` keeps device pointers stable across shape cycles so captured buffers stay valid
 
 See [docs/op-coverage.md](docs/op-coverage.md) for the full per-op coverage tables.
 
@@ -47,7 +47,7 @@ using namespace brotensor;
 int main() {
     init();  // probe + register GPU backends (CPU works even without this)
 
-    // Host data -> tensors on the best available device (CUDA > Metal > CPU).
+    // Host data -> tensors on the best available device (CUDA > Metal > Vulkan > HIP > CPU).
     float w[6] = {1, 2, 3, 4, 5, 6};           // W: (2,3), row-major
     float v[3] = {1, 0, -1};
     Tensor W = Tensor::from_host(w, 2, 3);
@@ -66,7 +66,7 @@ int main() {
 
 ## Build
 
-Requires CMake ≥ 3.24 and a C++20 compiler. CUDA additionally needs the CUDA Toolkit (nvcc); Metal needs the Apple toolchain and **macOS 15 or newer** — the backend builds offset-backed `MPSGraphTensorData` via `-[MPSNDArray initWithBuffer:offset:descriptor:]`, which the macOS 14 SDK does not declare.
+Requires CMake ≥ 3.24 and a C++20 compiler. CUDA additionally needs the CUDA Toolkit (nvcc); Vulkan needs `glslc` (shaderc) plus the Vulkan headers and loader; HIP needs ROCm with rocWMMA and an RDNA 3+ GPU; Metal needs the Apple toolchain and **macOS 15 or newer** — the backend builds offset-backed `MPSGraphTensorData` via `-[MPSNDArray initWithBuffer:offset:descriptor:]`, which the macOS 14 SDK does not declare.
 
 ```bash
 # CPU-only (any OS)
@@ -80,9 +80,13 @@ cmake --build build --config Release
 # CPU + Metal (Apple)
 cmake -B build -DBROTENSOR_WITH_METAL=ON
 cmake --build build --config Release
+
+# CPU + Vulkan (AMD's backend of choice; any Vulkan 1.2+ GPU), HIP beside it for comparison
+cmake -B build_vk -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_VULKAN=ON -DBROTENSOR_WITH_HIP=ON
+cmake --build build_vk
 ```
 
-CPU is always built; CUDA and Metal are additive. In practice a binary carries at most one GPU backend, since the nvcc and Apple toolchains don't coexist on one host. Build internals (library targets, preprocessor defines, backend registration) are covered in [docs/architecture.md](docs/architecture.md#build-internals).
+CPU is always built; the GPU backends are additive. CUDA and HIP are mutually exclusive, and CUDA / Metal don't share a host; Vulkan sits beside any of them. With HIP and Vulkan both built, Vulkan is the default device and `BROTENSOR_PREFER_HIP=1` picks HIP. Vulkan design and coverage: [docs/vulkan.md](docs/vulkan.md), [docs/vulkan-coverage.md](docs/vulkan-coverage.md), performance vs HIP: [docs/vulkan-perf.md](docs/vulkan-perf.md). Build internals (library targets, preprocessor defines, backend registration) are covered in [docs/architecture.md](docs/architecture.md#build-internals).
 
 ## Tests
 

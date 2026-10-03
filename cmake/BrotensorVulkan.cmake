@@ -285,6 +285,7 @@ const ShaderBlob& shader_blob(ShaderId id) { return k_table[static_cast<std::uin
         ${_src}/ops_attention.cpp
         ${_src}/ops_attention_dense.cpp
         ${_src}/ops_attention_proj.cpp
+        ${_src}/ops_attention_bwd.cpp
         ${_src}/ops_topk.cpp
         ${_src}/ops_xent.cpp
         ${_src}/ops_conv.cpp

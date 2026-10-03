@@ -1,0 +1,95 @@
+#version 460
+// Training-mode BatchNorm over NCHW (ops_gnorm.cpp), FP32, one workgroup per
+// channel (grid-stride over C); statistics over the M = N * HW elements of
+// the channel, as the CPU reference (src/cpu/batch_norm.cpp):
+//   BN_TRAIN_FWD  mean, then the sum of squared deviations from it (two
+//                 passes: never negative); Y = (x - mean) rstd gamma + beta;
+//                 saved mean / rstd; running stats updated in place with the
+//                 unbiased variance (PyTorch's momentum convention)
+//   BN_TRAIN_BWD  dGamma += sum dY xhat, dBeta += sum dY (accumulated);
+//                 dX = rstd (dY gamma - (gamma sum dY + xhat gamma sum dY xhat) / M)
+#include "common.glsl"
+#include "op_codes.h"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = BN_TRAIN_FWD;
+layout(push_constant) uniform PC {
+    uint64_t x, y, g, b, rm, rv, sm, sr, dy, dg, db;
+    uint n, c, hw;
+    float eps, momentum;
+} pc;
+
+shared float s_part[2][64];
+
+// Workgroup sums of (a, b), the same value in every lane.
+vec2 wg_sum2(float a, float b) {
+    a = subgroupAdd(a);
+    b = subgroupAdd(b);
+    if (subgroupElect()) { s_part[0][gl_SubgroupID] = a; s_part[1][gl_SubgroupID] = b; }
+    barrier();
+    vec2 t = vec2(0.0);
+    for (uint s = 0; s < gl_NumSubgroups; ++s) t += vec2(s_part[0][s], s_part[1][s]);
+    barrier();   // s_part is reused by the next call
+    return t;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint M = pc.n * pc.hw;
+    const float invM = 1.0 / float(M);
+    for (uint ch = gl_WorkGroupID.x; ch < pc.c; ch += gl_NumWorkGroups.x) {
+        if (MODE == BN_TRAIN_FWD) {
+            float s = 0.0;
+            for (uint j = tid; j < M; j += gl_WorkGroupSize.x) {
+                const uint n = j / pc.hw, p = j - n * pc.hw;
+                s += F32Buf(pc.x).v[(n * pc.c + ch) * pc.hw + p];
+            }
+            const float mean = wg_sum2(s, 0.0).x * invM;
+            float q = 0.0;
+            for (uint j = tid; j < M; j += gl_WorkGroupSize.x) {
+                const uint n = j / pc.hw, p = j - n * pc.hw;
+                const float d = F32Buf(pc.x).v[(n * pc.c + ch) * pc.hw + p] - mean;
+                q += d * d;
+            }
+            const float var_b = wg_sum2(q, 0.0).x * invM;
+            const float rstd = 1.0 / sqrt(var_b + pc.eps);
+            const float bessel = M > 1u ? float(M) / float(M - 1u) : 1.0;
+            if (tid == 0) {
+                F32Buf(pc.sm).v[ch] = mean;
+                F32Buf(pc.sr).v[ch] = rstd;
+                F32Buf(pc.rm).v[ch] = (1.0 - pc.momentum) * F32Buf(pc.rm).v[ch] + pc.momentum * mean;
+                F32Buf(pc.rv).v[ch] = (1.0 - pc.momentum) * F32Buf(pc.rv).v[ch] + pc.momentum * (var_b * bessel);
+            }
+            const float gv = F32Buf(pc.g).v[ch], bv = F32Buf(pc.b).v[ch];
+            for (uint j = tid; j < M; j += gl_WorkGroupSize.x) {
+                const uint n = j / pc.hw, p = j - n * pc.hw;
+                const uint i = (n * pc.c + ch) * pc.hw + p;
+                F32Buf(pc.y).v[i] = (F32Buf(pc.x).v[i] - mean) * rstd * gv + bv;
+            }
+        } else {
+            const float mean = F32Buf(pc.sm).v[ch], rstd = F32Buf(pc.sr).v[ch], gv = F32Buf(pc.g).v[ch];
+            float sdy = 0.0, sdyx = 0.0;
+            for (uint j = tid; j < M; j += gl_WorkGroupSize.x) {
+                const uint n = j / pc.hw, p = j - n * pc.hw;
+                const uint i = (n * pc.c + ch) * pc.hw + p;
+                const float dyv = F32Buf(pc.dy).v[i];
+                sdy += dyv;
+                sdyx += dyv * ((F32Buf(pc.x).v[i] - mean) * rstd);
+            }
+            const vec2 t = wg_sum2(sdy, sdyx);
+            if (tid == 0) {
+                F32Buf(pc.dg).v[ch] += t.y;
+                F32Buf(pc.db).v[ch] += t.x;
+            }
+            const float s1 = gv * t.x, s2 = gv * t.y;
+            for (uint j = tid; j < M; j += gl_WorkGroupSize.x) {
+                const uint n = j / pc.hw, p = j - n * pc.hw;
+                const uint i = (n * pc.c + ch) * pc.hw + p;
+                const float xh = (F32Buf(pc.x).v[i] - mean) * rstd;
+                F32Buf(pc.y).v[i] = rstd * (F32Buf(pc.dy).v[i] * gv - (s1 + xh * s2) * invM);
+            }
+        }
+    }
+}

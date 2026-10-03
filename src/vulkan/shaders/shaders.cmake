@@ -123,5 +123,8 @@ set(BROTENSOR_VK_SHADERS
     "misc_f16|misc.comp|-DDT=1"
     "misc_bf16|misc.comp|-DDT=2"
     "delta_rule|delta_rule.comp|"
+    "dft64|dft64.comp|"
+    "attn_bwd|attn_bwd.comp|"
+    "bnorm|bnorm.comp|"
     "test_shared_overflow|test_shared_overflow.comp|"
 )

@@ -1,0 +1,155 @@
+#version 460
+// Direct DFT of frame-sized transforms in FP64 (ops_spectral.cpp,
+// dft_rows): the same contract as dft.comp's SP_BASIS + the FP32 GEMM, but
+// every product and sum in double and one rounding to FP32 at the store, as
+// the CPU (FP64 FFT) and CUDA / HIP (FP64 direct DFT) references do. The FP32
+// GEMM's 400-2048-term sums of cancelling terms carried ~5e-5 absolute error
+// at n_fft 512 and rounded a frame differently by its row position; here a
+// frame's result depends only on its samples, so streaming == offline bit
+// for bit.
+//
+// One workgroup per row (grid-stride over batch * R rows). The twiddle table
+// e^{2 pi i m / L}, m < L, is built once per workgroup in shared memory from
+// an FP64 Taylor sincos on the angle folded to [0, pi / 4] (exact integer
+// reduction of m), then each row is read into shared memory as doubles and
+// every invocation sums whole outputs, the angle index m = k n mod L advanced
+// by integer steps.
+//   BASIS_R2C  real input (time n = i + tofs, window[i]) -> bins k: re, im
+//   BASIS_C2R  interleaved bins in (Hermitian weight w_k) -> real output o
+//              at time n = o + tofs, times window[o]
+//   BASIS_C2C  interleaved in and out
+// Signs, scale and weights as SP_BASIS (dft.comp). L <= 2048 (C2C: 1024).
+#include "common.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint64_t x, y, win;
+    uint sa, sc;          // batch strides of x / y in elements
+    uint R, batch;        // rows per batch, batches
+    uint cols, lda;       // inputs per row, row pitch of x
+    uint rows, ldc;       // outputs per row, row pitch of y
+    uint L, mode, tofs, weights;
+    int sgn;
+    float scale;
+} pc;
+
+#define MAXL 2048
+shared dvec2 s_tw[MAXL];
+shared double s_in[MAXL + 2];
+
+// sin / cos of x in [0, pi / 4] to double rounding: Taylor through x^21 / x^20.
+void sincos64(double x, out double s, out double c) {
+    const double z = x * x;
+    s = 1.0LF / 51090942171709440000.0LF;                 // 1 / 21!
+    s = s * z - 1.0LF / 121645100408832000.0LF;           // 19!
+    s = s * z + 1.0LF / 355687428096000.0LF;              // 17!
+    s = s * z - 1.0LF / 1307674368000.0LF;                // 15!
+    s = s * z + 1.0LF / 6227020800.0LF;                   // 13!
+    s = s * z - 1.0LF / 39916800.0LF;                     // 11!
+    s = s * z + 1.0LF / 362880.0LF;                       // 9!
+    s = s * z - 1.0LF / 5040.0LF;
+    s = s * z + 1.0LF / 120.0LF;
+    s = s * z - 1.0LF / 6.0LF;
+    s = x + x * z * s;
+    c = 1.0LF / 2432902008176640000.0LF;                  // 20!
+    c = c * z - 1.0LF / 6402373705728000.0LF;             // 18!
+    c = c * z + 1.0LF / 20922789888000.0LF;               // 16!
+    c = c * z - 1.0LF / 87178291200.0LF;                  // 14!
+    c = c * z + 1.0LF / 479001600.0LF;                    // 12!
+    c = c * z - 1.0LF / 3628800.0LF;                      // 10!
+    c = c * z + 1.0LF / 40320.0LF;
+    c = c * z - 1.0LF / 720.0LF;
+    c = c * z + 1.0LF / 24.0LF;
+    c = c * z - 0.5LF;
+    c = 1.0LF + z * c;
+}
+
+// (cos, sin) of 2 pi m / L: quadrant from 4m / L, the remainder folded to at
+// most an eighth of a turn (as dft.comp's twiddle, in double).
+dvec2 twiddle64(uint m, uint L) {
+    const uint m4 = m * 4u;                        // m < L <= 2048: no overflow
+    const uint q = m4 / L;
+    uint r = m4 - q * L;
+    const bool swp = 2u * r > L;
+    if (swp) r = L - r;
+    const double x = double(r) * (1.5707963267948966192LF / double(L));
+    double sx, cx;
+    sincos64(x, sx, cx);
+    const double cq = swp ? sx : cx, sq = swp ? cx : sx;
+    if (q == 0u) return dvec2(cq, sq);
+    if (q == 1u) return dvec2(-sq, cq);
+    if (q == 2u) return dvec2(-cq, -sq);
+    return dvec2(sq, -cq);
+}
+
+double wk(uint k, uint L) { return (k == 0u || (L % 2u == 0u && 2u * k == L)) ? 1.0LF : 2.0LF; }
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, L = pc.L;
+    for (uint m = tid; m < L; m += gl_WorkGroupSize.x) s_tw[m] = twiddle64(m, L);
+    const double sg = double(pc.sgn), scale = double(pc.scale);
+    const uint total = pc.R * pc.batch;
+    for (uint row = gl_WorkGroupID.x; row < total; row += gl_NumWorkGroups.x) {
+        const uint z = row / pc.R, r = row % pc.R;
+        const uint xo = z * pc.sa + r * pc.lda, yo = z * pc.sc + r * pc.ldc;
+        barrier();   // the previous row's readers are done (and the table is built)
+        for (uint i = tid; i < pc.cols; i += gl_WorkGroupSize.x) {
+            double v = double(F32Buf(pc.x).v[xo + i]);
+            if (pc.mode == BASIS_R2C && pc.win != 0) v *= double(F32Buf(pc.win).v[i]);
+            if (pc.mode == BASIS_C2R && pc.weights != 0u) v *= wk(i >> 1, L);
+            s_in[i] = v;
+        }
+        barrier();
+        if (pc.mode == BASIS_C2R) {
+            const uint nb = pc.cols >> 1;
+            for (uint o = tid; o < pc.rows; o += gl_WorkGroupSize.x) {
+                const uint n = (o + pc.tofs) % L;
+                uint m = 0u;
+                double acc = 0.0LF;
+                for (uint k = 0u; k < nb; ++k) {
+                    const dvec2 t = s_tw[m];
+                    acc += s_in[2u * k] * t.x - sg * s_in[2u * k + 1u] * t.y;
+                    m += n;
+                    if (m >= L) m -= L;
+                }
+                acc *= scale;
+                if (pc.win != 0) acc *= double(F32Buf(pc.win).v[o]);
+                F32Buf(pc.y).v[yo + o] = float(acc);
+            }
+        } else {
+            const bool cx = pc.mode == BASIS_C2C;
+            const uint nin = cx ? pc.cols >> 1 : pc.cols;
+            for (uint k = tid; 2u * k < pc.rows; k += gl_WorkGroupSize.x) {
+                const uint step = k % L;
+                uint m = cx ? 0u : (step * (pc.tofs % L)) % L;
+                double re = 0.0LF, im = 0.0LF;
+                if (cx) {
+                    for (uint n = 0u; n < nin; ++n) {
+                        const dvec2 t = s_tw[m];
+                        const double xr = s_in[2u * n], xi = s_in[2u * n + 1u];
+                        re += xr * t.x - sg * xi * t.y;
+                        im += sg * xr * t.y + xi * t.x;
+                        m += step;
+                        if (m >= L) m -= L;
+                    }
+                } else {
+                    for (uint n = 0u; n < nin; ++n) {
+                        const dvec2 t = s_tw[m];
+                        const double xv = s_in[n];
+                        re += xv * t.x;
+                        im += xv * t.y;
+                        m += step;
+                        if (m >= L) m -= L;
+                    }
+                    im *= sg;
+                }
+                double f = scale;
+                if (pc.weights != 0u) f *= wk(k, L);
+                F32Buf(pc.y).v[yo + 2u * k] = float(re * f);
+                if (2u * k + 1u < pc.rows) F32Buf(pc.y).v[yo + 2u * k + 1u] = float(im * f);
+            }
+        }
+    }
+}

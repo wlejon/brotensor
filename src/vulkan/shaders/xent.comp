@@ -5,14 +5,23 @@
 // masked), and the row's loss sums -t log(max(p, 1e-12)) over t > 0 and every
 // head. One workgroup per row (grid-stride), FP32 like the CPU reference
 // (src/cpu/ops_impl.cpp softmax_xent_fused_batched).
+//
+// MODE 1 (spec constant 0): bce_with_logits_fused_batched instead, per
+// element p = sigmoid(z), dLogits = p (w y + 1 - y) - w y, and the row's loss
+// sums w y softplus(-z) + (1 - y) softplus(z) (w = pos_weight; masked
+// elements give 0 and no loss), the CPU's stable forms with exp_acc /
+// log1p from log_acc.
 #include "common.glsl"
+#include "math_acc.glsl"
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
 
 layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
 layout(push_constant) uniform PC {
     uint64_t logits, target, mask, off, probs, dlog, loss;
     uint rows, n, heads;
+    float pos_weight;
 } pc;
 
 shared float red[64];
@@ -39,11 +48,45 @@ float block_sum(float v) {
 
 bool valid(uint i) { return pc.mask == 0 || F32Buf(pc.mask).v[i] >= 0.5; }
 
+// log(1 + x) for x in [0, 1], accurate for small x (Goldberg's correction).
+float log1p_acc(float x) {
+    const float u = 1.0 + x;
+    return u == 1.0 ? x : log_acc(u) * div_rn(x, u - 1.0);
+}
+
+float bce_row(uint ro) {
+    const float w = pc.pos_weight;
+    float loss = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < pc.n; i += 256u) {
+        const uint at = ro + i;
+        if (!valid(at)) {
+            F32Buf(pc.probs).v[at] = 0.0;
+            F32Buf(pc.dlog).v[at] = 0.0;
+            continue;
+        }
+        const float z = F32Buf(pc.logits).v[at], y = F32Buf(pc.target).v[at];
+        const float e = exp_acc(-abs(z));
+        const float l1 = log1p_acc(e);
+        const float sp_neg = (z > 0.0 ? 0.0 : -z) + l1;
+        const float sp_pos = (z > 0.0 ? z : 0.0) + l1;
+        loss += w * y * sp_neg + (1.0 - y) * sp_pos;
+        const float s = z >= 0.0 ? div_rn(1.0, 1.0 + e) : div_rn(e, 1.0 + e);
+        F32Buf(pc.probs).v[at] = s;
+        F32Buf(pc.dlog).v[at] = s * (w * y + 1.0 - y) - w * y;
+    }
+    return loss;
+}
+
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     for (uint b = gl_WorkGroupID.x; b < pc.rows; b += gl_NumWorkGroups.x) {
         const uint ro = b * pc.n;
         float loss = 0.0;
+        if (MODE == 1u) {
+            loss = block_sum(bce_row(ro));
+            if (tid == 0u) F32Buf(pc.loss).v[b] = loss;
+            continue;
+        }
         for (uint h = 0; h < pc.heads; ++h) {
             uint s = 0u, e = pc.n;
             if (pc.off != 0) {

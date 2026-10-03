@@ -128,13 +128,13 @@ src/vulkan/
                                 (elementwise, copy, reduce, linear, norm, rope, glu, attention,
                                 attention_proj, topk, xent, conv, gnorm, spatial, diffusion,
                                 quant, quant_attention, audio, spectral, sampling, misc, delta,
-                                vision; ops_attention_dense.cpp is the materialised path the
+                                vision, attention_bwd; ops_attention_dense.cpp is the materialised path the
                                 others call)
   shaders/                      *.comp kernels, common.glsl, gemm_common.glsl, math_acc.glsl
                                 (accurate exp / log / sincos), quant_decode.glsl (the quantised
                                 chunk loads / decodes), op_codes.h, shaders.cmake (the list)
 tests/test_vulkan.cpp           runtime, the Device::CUDA alias; main(),
-                                --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision|alias,
+                                --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision|capture|train|alias,
                                 --bench-gemm, --bench-attention, --bench-conv, --bench-quant, --bench-audio
 tests/test_vulkan_ops.cpp       chunk-1 op parity
 tests/test_vulkan_gemm.cpp      matmul / linear parity, every kernel path
@@ -157,6 +157,8 @@ tests/test_vulkan_vision.cpp    SAM rel-pos attention, deform / modulated conv (
                                 conv2d_backward_weight, attention_forward, cross_attention_forward_train
 tests/test_vulkan_capture.cpp   the device-neutral CudaGraphCapture on Vulkan, custom kernels
                                 (--only=capture; shaders in tests/vulkan_shaders/)
+tests/test_vulkan_train.cpp     attention / MHA / self / cross attention backwards, training BatchNorm, BCE
+                                (--only=train)
 tests/test_vulkan_common.h
 ```
 
@@ -728,18 +730,29 @@ its 1/B scaling. Prefill, TF/s:
   CPU's `nearbyint`) and its adjoint as a gather in output order,
   `causal_conv1d_update` (one invocation per (n, c) row, state rolled in
   increasing order), VQ (one workgroup per row, first minimum), FSQ.
-* **Spectral** (`ops_spectral.cpp`, `dft.comp`, FP32): every transform is a
-  matrix product against a DFT basis built on the device per call (angle
-  index (k n) mod L in integers, folded to [0, pi / 4] before `sincos_acc`,
-  so a twiddle is good to ~1e-7 at any L; rows in chunks of <= 16 Mi
-  elements), through the FP32 GEMM. O(L^2) per row at GEMM speed: the right
-  trade for n_fft 400-2048 over thousands of frames, and any length works,
-  primes included. The STFT reads its frames in place (the reflect-padded
-  signal with a row pitch of hop_length), the window and normalisation folded
-  into the basis; the inverse's overlap-add and COLA division, and the two
-  adjoints' scatters, are gathers. Whisper's front end (30 s, n_fft 400,
-  hop 160) takes 0.20 ms for the STFT and 0.21 ms for the iSTFT, against
-  53 / 123 ms on HIP (an O(L^2) DFT kernel).
+* **Spectral** (`ops_spectral.cpp`, `dft.comp`, `dft64.comp`, FP32 in and
+  out). Frame-sized transforms (L <= 2048; C2C <= 1024) on a device with
+  `shaderFloat64` run `dft64.comp`: a direct DFT in FP64, one workgroup per
+  row, the twiddle table e^{2 pi i m / L} built per workgroup in shared memory
+  from an FP64 Taylor sincos on the angle folded to [0, pi / 4] (m reduced
+  exactly in integers), every product and sum in double and one rounding to
+  FP32 at the store, which is what the CPU (FP64 FFT) and CUDA / HIP (FP64
+  direct DFT) references do. A frame's result depends only on its samples,
+  so streaming == offline bit for bit. Longer transforms (and devices without
+  FP64, or `BROTENSOR_VK_DFT_GEMM=1`) are a matrix product against a DFT
+  basis built on the device per call (same twiddle reduction, `sincos_acc`,
+  ~1e-7 per coefficient; rows in chunks of <= 16 Mi elements) through the FP32
+  GEMM: any length, primes included, but its 400-2048-term FP32 sums carry
+  ~5e-5 absolute error at n_fft 512 (CPU: ~1e-6), and the GEMM's K blocking
+  rounds a frame differently by its row position. Chunk 8 measured both on
+  brosoundml `test_mel` (n_fft 512, win 400, log-mel): GEMM 0.025 log-mel vs
+  the CPU and 0.018 streaming vs offline; FP64 DFT below 1e-4 on both. The
+  STFT reads its frames in place (the reflect-padded signal with a row pitch
+  of hop_length), the window and normalisation folded into the transform;
+  the inverse's overlap-add and COLA division, and the two adjoints'
+  scatters, are gathers. Whisper's front end (30 s, n_fft 400, hop 160):
+  STFT 3.6 ms / iSTFT 4.6 ms on the FP64 DFT (0.20 / 0.23 ms on the FP32
+  GEMM), against 53 / 124 ms on HIP (an FP64 O(L^2) DFT kernel).
 * **Sampling** (`select.comp`, one workgroup per row): the CPU sorts the
   vocabulary; here (probability descending, index ascending) is a 64-bit key
   per token and each "first rank such that" (top-k, the top-p nucleus, the
@@ -804,6 +817,28 @@ arithmetic bounds it), complex_abs 685 (cache-resident).
 
 These are correctness-first: none of them was benchmarked against HIP in
 chunk 6.
+
+## Training ops (chunk 8)
+
+* **Attention backwards** (`ops_attention_bwd.cpp`, `attn_bwd.comp`):
+  `attention_backward`, `mha_backward` (+ the optional bias gradients),
+  `self_attention_backward` and `cross_attention_backward`, the backwards of
+  the materialised-probability forwards brogameagent's Attention / MHA /
+  transformer layers train through. FP32, as the CPU. Each is FP32 GEMMs
+  through `gemm()` (the per-head products are batched GEMMs over the head's
+  columns of the (L, D) matrices, so no head split / merge copies) around one
+  kernel, the row softmax backward in place over dP (one workgroup per
+  (head, query) row; masked keys and gated query rows zero). dW / db
+  accumulate through the GEMM's `EPI_ACCUM` and `column_sum_accumulate`; dX /
+  dCtx are overwritten. Within 2e-5 of the largest output against the CPU.
+* **Training BatchNorm** (`ops_gnorm.cpp`, `bnorm.comp`): `batch_norm_forward`
+  (batch statistics with the CPU's two-pass variance, saved mean / rstd, the
+  running-stat update with the unbiased variance) and `batch_norm_backward`
+  (dGamma / dBeta accumulated), FP32, one workgroup per channel.
+* **`bce_with_logits_fused_batched`** (`ops_xent.cpp`, `xent.comp` MODE 1):
+  per-element sigmoid cross-entropy with a positive-class weight, the CPU's
+  stable softplus / sigmoid forms with `exp_acc` and a log1p from `log_acc`,
+  one workgroup per row for the per-sample loss.
 
 ## Dtype policy
 
@@ -912,6 +947,7 @@ to divide 64; the dispatcher checks).
 | `BROTENSOR_VK_FA_PATH=rows\|cm\|dense` | force an attention path where it applies (benchmarking) |
 | `BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn` | force the `conv_cm` tile (one of the six in `ops_conv.cpp`) |
 | `BROTENSOR_VK_QGEMV=lpr,unr,sg,nr` | force the quantised GEMV's lanes per row group, items in flight, subgroup size and rows per group |
+| `BROTENSOR_VK_DFT_GEMM=1` | run every spectral transform through the FP32 basis GEMM instead of the FP64 direct DFT (benchmarking; less accurate) |
 
 Vulkan validation layers were not installed on the development machine, so
 the backend has not been run under them.

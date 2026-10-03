@@ -427,7 +427,7 @@ int main(int argc, char** argv) {
             vkt::run_audio_bench();
             return 0;
         }
-        if (only) {   // --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision|capture: one group
+        if (only) {   // --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision|capture|train: one group
             if (filter == "ops") vkt::run_op_tests();
             if (filter == "gemm") vkt::run_gemm_tests();
             if (filter == "norm") vkt::run_norm_tests();
@@ -440,6 +440,7 @@ int main(int argc, char** argv) {
             if (filter == "alias") vkt::test_cuda_alias();
             if (filter == "vision") vkt::run_vision_tests();
             if (filter == "capture") vkt::run_capture_tests();
+            if (filter == "train") vkt::run_train_tests();
             std::printf("%s: %d failure(s)\n", vkt::failures() ? "FAILED" : "OK", vkt::failures());
             return vkt::failures() ? 1 : 0;
         }
@@ -462,6 +463,7 @@ int main(int argc, char** argv) {
             vkt::run_audio_tests();
             vkt::run_misc_tests();
             vkt::run_vision_tests();
+            vkt::run_train_tests();
         }
     } catch (const std::exception& e) {
         std::printf("  FAIL  uncaught exception: %s\n", e.what());

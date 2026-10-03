@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <initializer_list>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -73,12 +74,48 @@ struct Basis {
     std::uint64_t win = 0;
 };
 
+struct Dft64Push {
+    std::uint64_t x, y, win;
+    std::uint32_t sa, sc, R, batch, cols, lda, rows, ldc, L, mode, tofs, weights;
+    std::int32_t sgn;
+    float scale;
+};
+
+// The FP64 direct DFT (dft64.comp) takes frame-sized transforms on a device
+// with shaderFloat64: L <= 2048 (C2C <= 1024, its shared-memory row). Longer
+// transforms keep the FP32 basis GEMM. BROTENSOR_VK_DFT_GEMM=1 forces the GEMM
+// (the benchmark's before / after).
+bool use_dft64(DeviceCtx& d, const Basis& bs, int cols, long long span) {
+    static const bool force_gemm = [] {
+        const char* e = std::getenv("BROTENSOR_VK_DFT_GEMM");
+        return e && *e && *e != '0';
+    }();
+    if (force_gemm || !d.info().shader_float64) return false;
+    if (bs.L > (bs.mode == BASIS_C2C ? 1024 : 2048) || cols > 2050) return false;
+    return span < 0xffffffffLL;
+}
+
 // Y[z](R, rows) = X[z](R, cols) B^T for z < batch, B the basis; X rows lda
 // apart (they may overlap: STFT frames), batches sa / sc elements apart.
 void dft_gemm(DeviceCtx& d, const Basis& bs, std::uint64_t x, int R, int cols, int lda, long long sa, int batch,
               std::uint64_t y, int rows, int ldc, long long sc, const char* op) {
     if (R == 0 || rows == 0 || batch == 0) return;
     if (cols == 0) fail(op, "empty transform");
+    const long long span = std::max(sa * (batch - 1) + static_cast<long long>(lda) * (R - 1) + cols,
+                                    sc * (batch - 1) + static_cast<long long>(ldc) * (R - 1) + rows);
+    if (use_dft64(d, bs, cols, span)) {
+        Dft64Push pc{};
+        pc.x = x; pc.y = y; pc.win = bs.win;
+        pc.sa = u32(sa); pc.sc = u32(sc); pc.R = u32(R); pc.batch = u32(batch);
+        pc.cols = u32(cols); pc.lda = u32(lda); pc.rows = u32(rows); pc.ldc = u32(ldc);
+        pc.L = u32(bs.L); pc.mode = bs.mode; pc.tofs = u32(bs.tofs); pc.weights = bs.weights ? 1u : 0u;
+        pc.sgn = bs.sign;
+        pc.scale = bs.scale;
+        const Kernel& k = d.pipelines().get(ShaderId::dft64);
+        const long long total = static_cast<long long>(R) * batch;
+        launch(d, k, pc, static_cast<std::uint32_t>(std::min<long long>(total, 65535)));
+        return;
+    }
     const long long kMaxBasis = 16LL << 20;
     const int chunk = static_cast<int>(std::max<long long>(1, std::min<long long>(rows, kMaxBasis / cols)));
     Tensor B = Tensor::empty_on(Device::vulkan(d.index()), chunk, cols, Dtype::FP32);

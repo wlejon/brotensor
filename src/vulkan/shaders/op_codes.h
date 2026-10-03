@@ -139,6 +139,10 @@
 #define GN_L2_NCHW          3    // per-pixel L2 normalise over channels
 #define GN_BIAS_GRAD        4    // dB[c] += sum over (n, hw) of dY (conv bias gradient)
 
+// bnorm.comp (spec constant 0)
+#define BN_TRAIN_FWD        0    // batch statistics, Y, saved mean / rstd, running-stat update
+#define BN_TRAIN_BWD        1    // dX, dGamma += , dBeta +=
+
 // sampler.comp (spec constant 0)
 #define SMP_DDIM            0
 #define SMP_EULER           1

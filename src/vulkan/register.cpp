@@ -28,6 +28,7 @@ void fill_vulkan_vtable_rope(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_glu(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_attention(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_attention_proj(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_attention_bwd(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_topk(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_xent(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_conv(::brotensor::detail::OpsVTable& v);
@@ -100,6 +101,7 @@ void probe_and_register() {
     dv::fill_vulkan_vtable_glu(ops);
     dv::fill_vulkan_vtable_attention(ops);
     dv::fill_vulkan_vtable_attention_proj(ops);
+    dv::fill_vulkan_vtable_attention_bwd(ops);
     dv::fill_vulkan_vtable_topk(ops);
     dv::fill_vulkan_vtable_xent(ops);
     dv::fill_vulkan_vtable_conv(ops);

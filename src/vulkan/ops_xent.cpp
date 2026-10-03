@@ -1,7 +1,7 @@
 // Vulkan softmax cross-entropy: softmax_xent, softmax_xent_fused (one
 // segment, the loss returned to the host, which syncs) and
 // softmax_xent_fused_batched (per-row heads from a device offset table, a
-// loss per row). FP32, as on the CPU and HIP backends; kernel
+// loss per row), and bce_with_logits_fused_batched. FP32, as on the CPU and HIP backends; kernel
 // shaders/xent.comp. softmax_xent_segment takes raw pointers only and stays
 // on the CPU (src/ops.cpp routes it there).
 
@@ -23,6 +23,7 @@ namespace {
 struct XentPush {
     std::uint64_t logits, target, mask, off, probs, dlog, loss;
     std::uint32_t rows, n, heads;
+    float pos_weight;
 };
 
 void need_f32(const Tensor& t, const char* op, const char* what) {
@@ -34,15 +35,15 @@ void like(const Tensor& src, Tensor& dst) {
 }
 
 void run(const char* op, const Tensor& logits, const Tensor& target, const float* mask, const int* off, int rows, int n,
-         int heads, Tensor& probs, Tensor& dlog, std::uint64_t loss) {
+         int heads, Tensor& probs, Tensor& dlog, std::uint64_t loss, int mode = 0, float pos_weight = 1.0f) {
     need_f32(logits, op, "logits");
     need_f32(target, op, "target");
     if (target.size() != logits.size()) throw std::runtime_error(std::string("brotensor: ") + op + ": target shape");
     DeviceCtx& d = device_of(logits);
-    const Kernel& k = d.pipelines().get(ShaderId::xent);
+    const Kernel& k = d.pipelines().get(ShaderId::xent, {static_cast<std::uint32_t>(mode)});
     const XentPush pc{addr(logits.data), addr(target.data), addr(mask), addr(off), addr(probs.data), addr(dlog.data),
                       loss, static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(n),
-                      static_cast<std::uint32_t>(heads)};
+                      static_cast<std::uint32_t>(heads), pos_weight};
     launch(d, k, pc, static_cast<std::uint32_t>(std::min(rows, 65535)));
 }
 
@@ -85,7 +86,22 @@ void softmax_xent_fused_batched(const Tensor& logits_BL, const Tensor& target_BL
         n_heads, probs_BL, dLogits_BL, addr(loss_per_sample.data));
 }
 
+// Per-element sigmoid cross-entropy with a positive-class weight (brosoundml
+// BC-ResNet training): xent.comp's MODE 1, one workgroup per row.
+void bce_with_logits_fused_batched(const Tensor& logits_BL, const Tensor& target_BL, const float* d_mask_BL,
+                                   float pos_weight, Tensor& probs_BL, Tensor& dLogits_BL, Tensor& loss_per_sample) {
+    like(logits_BL, probs_BL);
+    like(logits_BL, dLogits_BL);
+    if (loss_per_sample.rows != logits_BL.rows || loss_per_sample.cols != 1 || loss_per_sample.dtype != Dtype::FP32) {
+        loss_per_sample.resize(logits_BL.rows, 1, Dtype::FP32);
+    }
+    if (logits_BL.rows == 0 || logits_BL.cols == 0) return;
+    run("bce_with_logits_fused_batched", logits_BL, target_BL, d_mask_BL, nullptr, logits_BL.rows, logits_BL.cols, 1,
+        probs_BL, dLogits_BL, addr(loss_per_sample.data), 1, pos_weight);
+}
+
 void fill_vulkan_vtable_xent(::brotensor::detail::OpsVTable& v) {
+    v.bce_with_logits_fused_batched = &bce_with_logits_fused_batched;
     v.softmax_xent = &softmax_xent;
     v.softmax_xent_fused = &softmax_xent_fused;
     v.softmax_xent_fused_batched = &softmax_xent_fused_batched;

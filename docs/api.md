@@ -14,7 +14,8 @@ Two further headers are backend-specific and compile only in a build that enable
 
 | Header | Contents |
 |---|---|
-| `<brotensor/cuda_graph.h>` | CUDA / HIP graph capture / replay (`CudaGraph`, `CudaGraphCapture`) — gate on `BROTENSOR_HAS_CUDA \|\| BROTENSOR_HAS_HIP` |
+| `<brotensor/cuda_graph.h>` | Device-neutral graph capture / replay (`CudaGraph`, `CudaGraphCapture`) on CUDA / HIP / Vulkan — gate on `graph_capture_available(Device)` |
+| `<brotensor/vulkan.h>` | Vulkan batching control, `VulkanGraph`, custom GLSL kernels — gate on `BROTENSOR_HAS_VULKAN` ([vulkan.md](vulkan.md)) |
 | `<brotensor/metal_interop.h>` | Metal custom-kernel surface — Obj-C++ / `.mm` consumers only |
 
 All preconditions and dispatch failures throw `std::runtime_error` with a `"brotensor: <op>: <reason>"` message.
@@ -24,7 +25,8 @@ All preconditions and dispatch failures throw `std::runtime_error` with a `"brot
 A row-major `(rows, cols)` buffer with runtime `Dtype` + `Device` tags. Copyable (device-aware deep copy) and movable. Rank-1 data is `(N, 1)`; higher-rank layouts are flattened per each op's shape contract.
 
 ```cpp
-enum class Device { CPU, CUDA, Metal };
+enum class DeviceType { CPU, CUDA, Metal, HIP, VULKAN };
+struct Device { DeviceType type; int index; };   // Device::cuda(i), ::hip(i), ::vulkan(i), ...
 enum class Dtype  { FP32, FP16, INT8, INT32, BF16, F64,
                     Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1,        // GGUF legacy blocks
                     Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K };       // GGUF K-quant superblocks
@@ -70,7 +72,7 @@ Free functions for sizing a buffer without special-casing the quant carriers:
 | `dtype_block_bytes(dt)` | Encoded bytes per block. |
 | `dtype_storage_bytes(dt, n)` | Bytes needed for `n` elements. **Use this for buffer sizes** — it's correct for quant and non-quant dtypes alike. |
 | `dtype_is_quant(dt)` | Whether `dt` is a GGUF block-quant carrier. |
-| `device_name(dev)` | The backend kind as a string (`"cpu"` / `"cuda"` / `"metal"`). |
+| `device_name(dev)` | The backend kind as a string (`"CPU"` / `"CUDA"` / `"Metal"` / `"hip"` / `"vulkan"`, `":N"` suffixed past card 0). |
 
 ### Bit-conversion helpers
 
@@ -80,10 +82,10 @@ Free functions for sizing a buffer without special-casing the quant carriers:
 
 | Function | Meaning |
 |---|---|
-| `init()` | Idempotent. Probes and registers the CUDA / Metal backends. CPU is always registered (static-init), so CPU-only code works without calling it. |
+| `init()` | Idempotent. Probes and registers the CUDA / Metal / HIP / Vulkan backends. CPU is always registered (static-init), so CPU-only code works without calling it. |
 | `shutdown()` | Joins the CPU backend's worker threads. Idempotent, and safe even if `init()` was never called. See the note below — **call it before returning from `main()`**. |
-| `default_device()` | Where no-suffix factories allocate. Best available: CUDA > Metal > CPU. |
-| `set_default_device(dev)` | Global override. Also overridable per-process via the `BROTENSOR_DEFAULT_DEVICE` env var (`cpu` / `cuda` / `metal`). |
+| `default_device()` | Where no-suffix factories allocate. Best available: CUDA > Metal > Vulkan > HIP > CPU (`BROTENSOR_PREFER_HIP=1` puts HIP ahead of Vulkan). |
+| `set_default_device(dev)` | Global override. Also overridable per-process via the `BROTENSOR_DEFAULT_DEVICE` env var (`cpu` / `cuda` / `metal` / `vulkan` (`vk`) / `hip` (`rocm`), optionally `:N`). |
 | `DeviceScope scope(dev)` | RAII per-scope default-device override. |
 | `compute_dtype()` | The dtype a model loader should upload weights at for the current default device: FP32 on CPU, FP16 on a GPU. |
 | `available_devices()` / `is_available(dev)` | Backends registered in this binary at runtime. |

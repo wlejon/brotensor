@@ -3,7 +3,7 @@
 Generated for chunk 6 of the Vulkan backend (docs/vulkan.md). What runs on
 `Device::vulkan(i)` today, slot by slot, and what each sibling's code calls.
 
-**Op table: 242 of 270 slots implemented, 28 null.** A null slot
+**Op table: 249 of 270 slots implemented, 21 null** (chunk 8 filled `attention_backward`, `mha_backward`, `self_attention_backward`, `cross_attention_backward`, `batch_norm_forward`, `batch_norm_backward` and `bce_with_logits_fused_batched`). A null slot
 throws "not implemented on vulkan" when dispatched. Every null slot is a training
 backward / training-mode forward, a host-only op that never dispatches to a GPU,
 or filtered_lrelu, whose public entry point falls back to a composite of two ops
@@ -22,12 +22,9 @@ neither a CUDA nor a HIP backend is registered (detail::resolve_device_alias).
 
 | Slot | Why |
 |---|---|
-| `attention_backward` | training backward (brogameagent Attention::backward) |
-| `mha_backward` | training backward (brogameagent MultiHeadAttention::backward) |
 | `mse_scalar` | host-only: no Tensor operand, ops.cpp always runs it on the CPU table |
 | `softmax_xent_segment` | host-only: raw host pointers, ops.cpp always runs it on the CPU table |
 | `embedding_lookup_backward` | training backward (scatter-add: needs float atomics or a sort) |
-| `bce_with_logits_fused_batched` | training loss (brosoundml BC-ResNet training) |
 | `group_norm_backward` | training backward (brosoundml Kokoro decoder backward) |
 | `upsample_bilinear_2x_backward` | training backward |
 | `interp2d_backward` | training backward |
@@ -37,8 +34,6 @@ neither a CUDA nor a HIP backend is registered (detail::resolve_device_alias).
 | `scatter_rows_add` | training (brolm LayaGrad soft-row gradient; scatter-add) |
 | `conv_transpose2d_backward_input` | training backward |
 | `conv_transpose2d_backward_weight` | training backward |
-| `self_attention_backward` | training backward |
-| `cross_attention_backward` | training backward |
 | `flash_attention_packed_qkv_backward` | training backward (brolm LayaGrad) |
 | `flash_attention_varlen_backward` | training backward |
 | `flash_attention_qkvo_backward` | training backward |
@@ -46,8 +41,6 @@ neither a CUDA nor a HIP backend is registered (detail::resolve_device_alias).
 | `resblock_backward` | training backward |
 | `lstm_forward_train` | training forward (no sibling calls it) |
 | `lstm_backward` | training backward |
-| `batch_norm_forward` | training-mode BatchNorm (batch statistics + running update); inference uses batch_norm_inference |
-| `batch_norm_backward` | training backward (brosoundml BC-ResNet / phoneme training) |
 | `filtered_lrelu_forward` | by design: composite fallback (bias_act + upfirdn2d), runs on Vulkan |
 | `filtered_lrelu_backward` | by design: the public op falls back to its bias_act + upfirdn2d composite (as on HIP), which runs on Vulkan |
 
@@ -85,9 +78,9 @@ Inference: 76 ops, all implemented.
 
 `linear_forward`, `relu_forward`, `tanh_forward`, `sigmoid_forward`, `add_inplace`, `axpby_inplace`, `add_scalar_inplace`, `scale_inplace`, `clamp`, `mul_inplace`, `embedding_lookup_forward`*, `concat_rows`, `concat_batched_rows`, `concat_nchw_channels`, `copy_d2d`, `copy_d2d_strided`, `cast`, `layernorm_forward_inference_batched`, `linear_forward_batched`, `relu_forward_batched`, `add_inplace_batched`, `conv2d_forward`, `group_norm_forward`, `silu_forward`, `gelu_forward`, `gelu_exact_forward`, `interp2d_align_corners_forward`, `pad2d_forward`, `slice2d_forward`, `top_k_rows`, `gather_rows`, `scatter_rows`, `linear_forward_batched_fp16`, `linear_forward_batched_ex`, `flash_attention_forward`, `flash_attention_gqa_forward`, `flash_attention_windowed_forward`, `flash_attention_varlen_forward`, `nchw_to_sequence`, `sequence_to_nchw`, `matmul`, `rms_norm_forward`, `sum_cols`, `argmax_rows`, `modulate`, `broadcast_mul`, `rope_apply`, `self_attention_bias_forward`, `rel_pos_bias_xl_forward`, `complex_mul`, `complex_abs`, `complex_angle`, `complex_from_polar`, `rfft`, `irfft`, `stft`, `istft`, `conv_transpose1d_forward`, `pad1d_forward`, `snake_forward`, `elu_forward`, `leaky_relu_forward`, `vq_encode_forward`, `resample1d_forward`, `log_forward`, `exp_forward`, `sample_logits_into`, `masked_diffusion_scores`, `masked_diffusion_commit`, `batch_norm_inference`, `randn`, `rand_uniform`, `sin_forward`, `add_channel_bias_inplace`, `add_row_bias_inplace`, `softmax_rows_forward`
 
-Training: 19 ops, null: `bce_with_logits_fused_batched`, `group_norm_backward`, `batch_norm_forward`, `batch_norm_backward`.
+Training: 19 ops, null: `group_norm_backward` (`batch_norm_forward` / `_backward` and `bce_with_logits_fused_batched` filled in chunk 8).
 
-`linear_backward`, `tanh_backward`, `adam_step`*, `xavier_init`*, `linear_backward_batched`, `relu_backward_batched`, `softmax_xent_fused_batched`, `bce_with_logits_fused_batched` **(null)**, `conv2d_backward_input`, `conv2d_backward_weight`*, `conv2d_backward_bias`, `group_norm_backward` **(null)**, `istft_backward`, `conv_transpose1d_backward_input`, `pad1d_backward`, `snake_backward`, `leaky_relu_backward`, `batch_norm_forward` **(null)**, `batch_norm_backward` **(null)**
+`linear_backward`, `tanh_backward`, `adam_step`*, `xavier_init`*, `linear_backward_batched`, `relu_backward_batched`, `softmax_xent_fused_batched`, `bce_with_logits_fused_batched`, `conv2d_backward_input`, `conv2d_backward_weight`*, `conv2d_backward_bias`, `group_norm_backward` **(null)**, `istft_backward`, `conv_transpose1d_backward_input`, `pad1d_backward`, `snake_backward`, `leaky_relu_backward`, `batch_norm_forward`, `batch_norm_backward`
 
 ### brovisionml
 
@@ -103,15 +96,15 @@ Training: 4 ops, all implemented.
 
 ### brogameagent
 
-The nets construct their weights with `xavier_init` (bit-identical to the CPU stream on Vulkan) and infer through the ops below; the null slots are the learners' backwards.
+The nets construct their weights with `xavier_init` (bit-identical to the CPU stream on Vulkan) and infer through the ops below; the learners' backwards run too (chunk 8).
 
 Inference: 22 ops, all implemented.
 
 `linear_forward`, `relu_forward`, `tanh_forward`, `sigmoid_forward`, `add_inplace`, `add_scalar_inplace`, `scale_inplace`, `clamp`, `build_slot_mask`*, `softmax_forward`, `layernorm_forward`, `attention_forward`*, `mha_forward`, `masked_mean_pool_forward`*, `concat_rows`, `split_rows`, `copy_d2d`, `cast`, `linear_forward_batched`, `relu_forward_batched`, `tanh_forward_batched`, `add_inplace_batched`
 
-Training: 20 ops, null: `attention_backward`, `mha_backward`.
+Training: 20 ops, all implemented (`attention_backward` / `mha_backward` in chunk 8).
 
-`linear_backward`, `relu_backward`, `tanh_backward`, `sigmoid_backward`, `softmax_backward`, `layernorm_backward`, `attention_backward` **(null)**, `mha_backward` **(null)**, `masked_mean_pool_backward`*, `mse_scalar` (host-only, runs), `softmax_xent`, `softmax_xent_segment` (host-only, runs), `sgd_step`*, `adam_step`*, `xavier_init`*, `linear_backward_batched`, `relu_backward_batched`, `tanh_backward_batched`, `mse_vec_per_sample`*, `softmax_xent_fused_batched`
+`linear_backward`, `relu_backward`, `tanh_backward`, `sigmoid_backward`, `softmax_backward`, `layernorm_backward`, `attention_backward`, `mha_backward`, `masked_mean_pool_backward`*, `mse_scalar` (host-only, runs), `softmax_xent`, `softmax_xent_segment` (host-only, runs), `sgd_step`*, `adam_step`*, `xavier_init`*, `linear_backward_batched`, `relu_backward_batched`, `tanh_backward_batched`, `mse_vec_per_sample`*, `softmax_xent_fused_batched`
 
 ## What the siblings still need (chunk 7)
 
@@ -129,8 +122,10 @@ OmniVoice precision default, brogameagent's JS device names, bro's
   default device reaches the null slots: brogameagent's attention / MHA /
   transformer layer backwards (`attention_backward`, `mha_backward`; 5 of its
   33 tests) and brosoundml's BC-ResNet / phoneme-model training
-  (`batch_norm_forward` in training mode; 2 of 48). They pass on HIP
-  (`BROTENSOR_PREFER_HIP=1`).
+  (`batch_norm_forward` in training mode and `bce_with_logits_fused_batched`;
+  2 of 48). They pass on HIP
+  (`BROTENSOR_PREFER_HIP=1`). **Done in chunk 8** (docs/vulkan.md "Training
+  ops"): both siblings pass every test on Vulkan.
 * **STFT precision.** The DFT-as-GEMM STFT (`ops_spectral.cpp`) carries
   ~5e-5 absolute error at n_fft 512 (FP32 partial sums of a DFT row that
   cancel), against the CPU FFT's ~1e-6, and the GEMM's K rotation makes the
@@ -139,7 +134,8 @@ OmniVoice precision default, brogameagent's JS device names, bro's
   differs from offline by 0.018 in the quietest bins. STT / KWS / wake
   results are unaffected in every test, but a front end compared bit for
   bit against the CPU will see it. Fix: an FFT, or FP64 (or compensated)
-  accumulation in the DFT GEMM.
+  accumulation in the DFT GEMM. **Done in chunk 8**: transforms up to
+  L = 2048 run an FP64 direct DFT (`dft64.comp`); `test_mel` passes.
 * **Long graph submissions.** A captured TripoSplat step (two 3.6 s flow
   forwards at 512 px, 8 steps) was one command buffer past the amdgpu ~10 s
   job limit: device lost. Graph captures are now cut into
@@ -243,9 +239,9 @@ that registers the slot.
 | `layernorm_forward` | implemented | ops_norm.cpp |
 | `layernorm_backward` | implemented | ops_norm.cpp |
 | `attention_forward` | implemented (chunk 6) | ops_attention_proj.cpp |
-| `attention_backward` | null | - |
+| `attention_backward` | implemented | ops_attention_bwd.cpp |
 | `mha_forward` | implemented | ops_attention_proj.cpp |
-| `mha_backward` | null | - |
+| `mha_backward` | implemented | ops_attention_bwd.cpp |
 
 **Pooling / losses / embeddings / concat**
 
@@ -304,7 +300,7 @@ that registers the slot.
 |---|---|---|
 | `mse_vec_per_sample` | implemented (chunk 6) | ops_misc.cpp |
 | `softmax_xent_fused_batched` | implemented | ops_xent.cpp |
-| `bce_with_logits_fused_batched` | null | - |
+| `bce_with_logits_fused_batched` | implemented | ops_xent.cpp |
 
 **Conv2d (forward + backwards)**
 
@@ -468,10 +464,10 @@ that registers the slot.
 | `cross_attention_forward` | implemented | ops_attention_proj.cpp |
 | `cross_attention_forward_with_attn` | implemented | ops_attention_proj.cpp |
 | `self_attention_forward_train` | implemented | ops_attention_proj.cpp |
-| `self_attention_backward` | null | - |
+| `self_attention_backward` | implemented | ops_attention_bwd.cpp |
 | `attention_token_moments` | implemented (chunk 6) | ops_misc.cpp |
 | `cross_attention_forward_train` | implemented (chunk 6) | ops_attention_proj.cpp |
-| `cross_attention_backward` | null | - |
+| `cross_attention_backward` | implemented | ops_attention_bwd.cpp |
 
 **FP16 LayerNorm inference + FP16 self-attention**
 
@@ -709,9 +705,9 @@ that registers the slot.
 
 | Slot | Vulkan | File |
 |---|---|---|
-| `batch_norm_forward` | null | - |
+| `batch_norm_forward` | implemented | ops_gnorm.cpp |
 | `batch_norm_inference` | implemented | ops_gnorm.cpp |
-| `batch_norm_backward` | null | - |
+| `batch_norm_backward` | implemented | ops_gnorm.cpp |
 
 **Image preprocessing helpers (vision-model inference)**
 

@@ -1,0 +1,46 @@
+#version 460
+// Row softmax backward of the materialised-probability attention backwards
+// (ops_attention_bwd.cpp), FP32, in place over dP:
+//   dS[r, j] = P[r, j] (dP[r, j] - sum_j' dP[r, j'] P[r, j']) * scale
+// zero for a masked key (kmask[j] < 0.5) and for a whole row whose query is
+// gated (qmask[r % lq] < 0.5); a mask address of 0 is "none". Rows are the
+// (head, query) pairs, H * lq of them, lk keys each. One workgroup per row
+// (grid-stride); every lane reads its elements before the barrier that ends
+// the reduction and writes only those after it, so the update is in place.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t p, dp, kmask, qmask;
+    uint rows, lq, lk;
+    float scale;
+} pc;
+
+shared float s_part[64];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint row = gl_WorkGroupID.x; row < pc.rows; row += gl_NumWorkGroups.x) {
+        const uint base = row * pc.lk;
+        const bool gated = pc.qmask != 0 && F32Buf(pc.qmask).v[row % pc.lq] < 0.5;
+        if (gated) {
+            for (uint j = tid; j < pc.lk; j += gl_WorkGroupSize.x) F32Buf(pc.dp).v[base + j] = 0.0;
+            continue;
+        }
+        float acc = 0.0;
+        for (uint j = tid; j < pc.lk; j += gl_WorkGroupSize.x) acc += F32Buf(pc.dp).v[base + j] * F32Buf(pc.p).v[base + j];
+        acc = subgroupAdd(acc);
+        if (subgroupElect()) s_part[gl_SubgroupID] = acc;
+        barrier();
+        float dot = 0.0;
+        for (uint s = 0; s < gl_NumSubgroups; ++s) dot += s_part[s];
+        for (uint j = tid; j < pc.lk; j += gl_WorkGroupSize.x) {
+            const bool masked = pc.kmask != 0 && F32Buf(pc.kmask).v[j] < 0.5;
+            const float pv = F32Buf(pc.p).v[base + j];
+            F32Buf(pc.dp).v[base + j] = masked ? 0.0 : pv * (F32Buf(pc.dp).v[base + j] - dot) * pc.scale;
+        }
+        barrier();   // s_part is reused by the next row
+    }
+}

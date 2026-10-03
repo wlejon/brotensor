@@ -1,6 +1,7 @@
 // Vulkan NCHW normalisations: GroupNorm forward (split statistics + apply,
-// shaders/gnorm.comp), BatchNorm inference with running statistics, and the
-// per-pixel L2 normalise over channels. Contracts follow the CUDA backend
+// shaders/gnorm.comp), BatchNorm inference with running statistics, the
+// per-pixel L2 normalise over channels, and training-mode BatchNorm forward /
+// backward (FP32, shaders/bnorm.comp). Contracts follow the CUDA backend
 // (src/cuda/group_norm.cu, batch_norm.cu, l2_normalize.cu): FP32 / FP16 /
 // BF16 with gamma / beta / running statistics in X's dtype, Y resized to X's
 // shape and dtype and overwritten.
@@ -11,6 +12,7 @@
 #include <brotensor/detail/dispatch.h>
 
 #include <algorithm>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 
@@ -137,9 +139,88 @@ void l2_normalize_nchw_forward(const Tensor& X, int N, int C, int H, int W, floa
     launch(d, k, pc, groups_1d(pc.total, k));
 }
 
+// ─── Training-mode BatchNorm (bnorm.comp) ──────────────────────────────────
+
+namespace {
+
+struct BnPush {
+    std::uint64_t x, y, g, b, rm, rv, sm, sr, dy, dg, db;
+    std::uint32_t n, c, hw;
+    float eps, momentum;
+};
+
+void need_f32(const char* op, const Tensor& t, const char* name) {
+    if (t.dtype != Dtype::FP32) fail(op, std::string(name) + " must be FP32");
+}
+
+void ensure_c1(Tensor& t, int C, ::brotensor::Device dev) {
+    if (t.data == nullptr) t.device = dev;
+    if (t.size() != C || t.dtype != Dtype::FP32) t.resize(C, 1, Dtype::FP32);
+}
+
+std::uint32_t bn_groups(int C) { return static_cast<std::uint32_t>(std::min(C, 65535)); }
+
+}  // namespace
+
+void batch_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta, Tensor& running_mean,
+                        Tensor& running_var, int N, int C, int H, int W, float eps, float momentum, Tensor& Y,
+                        Tensor& saved_mean, Tensor& saved_rstd) {
+    const char* op = "batch_norm_forward";
+    for (const Tensor* t : std::initializer_list<const Tensor*>{&X, &gamma, &beta, &running_mean, &running_var}) need_f32(op, *t, "every operand");
+    need(op, N >= 0 && C > 0 && H >= 0 && W >= 0, "bad dimension");
+    check_param(op, gamma, C, Dtype::FP32, "gamma");
+    check_param(op, beta, C, Dtype::FP32, "beta");
+    check_param(op, running_mean, C, Dtype::FP32, "running_mean");
+    check_param(op, running_var, C, Dtype::FP32, "running_var");
+    const long long cols = static_cast<long long>(C) * H * W;
+    need(op, X.size() >= N * cols, "X is smaller than N*C*H*W");
+    need(op, N * cols <= 0xffffffffLL, "tensor too large");
+    if (Y.data == nullptr) Y.device = X.device;
+    if (Y.rows != N || Y.cols != cols || Y.dtype != Dtype::FP32) Y.resize(N, static_cast<int>(cols), Dtype::FP32);
+    ensure_c1(saved_mean, C, X.device);
+    ensure_c1(saved_rstd, C, X.device);
+    if (N == 0 || cols == 0) return;
+    DeviceCtx& d = device_of(X);
+    BnPush pc{};
+    pc.x = addr(X.data); pc.y = addr(Y.data); pc.g = addr(gamma.data); pc.b = addr(beta.data);
+    pc.rm = addr(running_mean.data); pc.rv = addr(running_var.data);
+    pc.sm = addr(saved_mean.data); pc.sr = addr(saved_rstd.data);
+    pc.n = static_cast<std::uint32_t>(N); pc.c = static_cast<std::uint32_t>(C);
+    pc.hw = static_cast<std::uint32_t>(H * W);
+    pc.eps = eps; pc.momentum = momentum;
+    launch(d, d.pipelines().get(ShaderId::bnorm, {std::uint32_t(BN_TRAIN_FWD)}), pc, bn_groups(C));
+}
+
+void batch_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& saved_mean, const Tensor& saved_rstd,
+                         const Tensor& dY, int N, int C, int H, int W, Tensor& dX, Tensor& dGamma, Tensor& dBeta) {
+    const char* op = "batch_norm_backward";
+    for (const Tensor* t : std::initializer_list<const Tensor*>{&X, &gamma, &saved_mean, &saved_rstd, &dY, &dGamma, &dBeta}) need_f32(op, *t, "every operand");
+    need(op, N >= 0 && C > 0 && H >= 0 && W >= 0, "bad dimension");
+    for (const Tensor* t : std::initializer_list<const Tensor*>{&gamma, &saved_mean, &saved_rstd, &dGamma, &dBeta}) {
+        need(op, t->size() == C, "gamma, saved_mean / rstd, dGamma and dBeta must have C elements");
+    }
+    const long long cols = static_cast<long long>(C) * H * W;
+    need(op, X.rows == N && X.cols == cols, "X shape mismatch");
+    need(op, dY.rows == N && dY.cols == cols, "dY shape mismatch");
+    need(op, N * cols <= 0xffffffffLL, "tensor too large");
+    if (dX.data == nullptr) dX.device = X.device;
+    if (dX.rows != N || dX.cols != cols || dX.dtype != Dtype::FP32) dX.resize(N, static_cast<int>(cols), Dtype::FP32);
+    if (N == 0 || cols == 0) return;
+    DeviceCtx& d = device_of(X);
+    BnPush pc{};
+    pc.x = addr(X.data); pc.y = addr(dX.data); pc.g = addr(gamma.data);
+    pc.sm = addr(saved_mean.data); pc.sr = addr(saved_rstd.data); pc.dy = addr(dY.data);
+    pc.dg = addr(dGamma.data); pc.db = addr(dBeta.data);
+    pc.n = static_cast<std::uint32_t>(N); pc.c = static_cast<std::uint32_t>(C);
+    pc.hw = static_cast<std::uint32_t>(H * W);
+    launch(d, d.pipelines().get(ShaderId::bnorm, {std::uint32_t(BN_TRAIN_BWD)}), pc, bn_groups(C));
+}
+
 void fill_vulkan_vtable_gnorm(::brotensor::detail::OpsVTable& v) {
     v.group_norm_forward = &group_norm_forward;
     v.batch_norm_inference = &batch_norm_inference;
+    v.batch_norm_forward = &batch_norm_forward;
+    v.batch_norm_backward = &batch_norm_backward;
     v.l2_normalize_nchw_forward = &l2_normalize_nchw_forward;
 }
 
