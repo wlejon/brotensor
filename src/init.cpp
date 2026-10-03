@@ -70,13 +70,19 @@ std::atomic<bool>& global_default_set_flag() {
 // since DeviceScope ctor saves the previous on the local stack frame.
 thread_local std::optional<Device> tls_scope_override;
 
-// Vulkan is deliberately absent: its op coverage is still partial, so it is
-// only ever the default when asked for (set_default_device, DeviceScope,
-// BROTENSOR_DEFAULT_DEVICE=vulkan).
+// CUDA first, then Metal (the two never share a machine with HIP), then the
+// AMD pair: Vulkan before HIP, because on the AMD GPUs both drive Vulkan
+// runs every sibling model faster (docs/vulkan.md), and HIP before Vulkan
+// when detail::prefer_hip() says so (BROTENSOR_PREFER_HIP=1, or
+// BROTENSOR_DEFAULT_DEVICE naming HIP). A build without Vulkan (or without
+// HIP) gets the other, so a HIP-only build behaves exactly as before.
 Device pick_default_from_available() {
-    if (detail::is_registered(Device::HIP))   return Device::HIP;
     if (detail::is_registered(Device::CUDA))  return Device::CUDA;
     if (detail::is_registered(Device::Metal)) return Device::Metal;
+    const bool hip = detail::is_registered(Device::HIP);
+    const bool vk = detail::is_registered(Device::VULKAN);
+    if (hip && (!vk || detail::prefer_hip())) return Device::HIP;
+    if (vk) return Device::VULKAN;
     return Device::CPU;
 }
 
@@ -116,6 +122,19 @@ std::optional<Device> parse_env_device() {
 }
 
 } // namespace
+
+namespace detail {
+
+bool prefer_hip() {
+    static const bool v = [] {
+        if (const char* e = std::getenv("BROTENSOR_PREFER_HIP"); e && e[0] == '1') return true;
+        const std::optional<Device> envd = parse_env_device();
+        return envd.has_value() && envd->is_hip();
+    }();
+    return v;
+}
+
+} // namespace detail
 
 void init() {
     if (init_done_flag().load(std::memory_order_acquire)) return;

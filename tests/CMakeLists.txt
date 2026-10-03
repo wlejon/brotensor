@@ -183,6 +183,8 @@ if(BROTENSOR_WITH_VULKAN)
     # Device::CUDA -> Vulkan when no HIP device is visible.
     add_test(NAME brotensor_test_vulkan_cuda_alias COMMAND brotensor_test_vulkan --only=alias)
     set_tests_properties(brotensor_test_vulkan_cuda_alias PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+    add_test(NAME brotensor_test_vulkan_prefer_hip COMMAND brotensor_test_vulkan --only=alias)
+    set_tests_properties(brotensor_test_vulkan_prefer_hip PROPERTIES ENVIRONMENT "BROTENSOR_PREFER_HIP=1")
     add_test(NAME brotensor_test_vulkan_default_device
              COMMAND brotensor_test_vulkan --expect-default-vulkan)
     set_tests_properties(brotensor_test_vulkan_default_device PROPERTIES
@@ -412,6 +414,10 @@ if(BROTENSOR_HAS_GPU)
     if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_HIP OR BROTENSOR_WITH_VULKAN)
         brotensor_add_test(brotensor_test_cuda_graph test_cuda_graph.cpp)
         brotensor_add_test(brotensor_test_graph_capture_alloc test_graph_capture_alloc.cpp)
+        # Its last check compares device-wide free memory before and after
+        # ten capture/destroy cycles, which another GPU test running at the
+        # same time perturbs by more than the 64 MB it allows.
+        set_tests_properties(brotensor_test_graph_capture_alloc PROPERTIES RUN_SERIAL TRUE)
     endif()
     if(BROTENSOR_WITH_VULKAN)
         foreach(_t brotensor_test_cuda_graph brotensor_test_graph_capture_alloc)
@@ -419,5 +425,22 @@ if(BROTENSOR_HAS_GPU)
             set_tests_properties(${_t}_vulkan PROPERTIES
                 ENVIRONMENT "BROTENSOR_TEST_GPU=vulkan;BROTENSOR_DEFAULT_DEVICE=vulkan")
         endforeach()
+        set_tests_properties(brotensor_test_graph_capture_alloc_vulkan PROPERTIES RUN_SERIAL TRUE)
     endif()
+endif()
+
+# With HIP and Vulkan both in the build, Vulkan is the default device and the
+# target of the Device::CUDA alias (src/init.cpp). The suites above that name
+# the GPU as Device::CUDA or the default device were written as the HIP
+# backend's tests (training backwards, the HIP-only WMMA INT8 kernels, the
+# alias and default-device checks), so they keep testing HIP:
+# BROTENSOR_PREFER_HIP=1 gives back the HIP-first policy. Vulkan runs its own
+# suites, the registrations whose names say so.
+if(BROTENSOR_WITH_HIP AND BROTENSOR_WITH_VULKAN)
+    get_property(_bt_tests DIRECTORY PROPERTY TESTS)
+    foreach(_t IN LISTS _bt_tests)
+        if(NOT _t MATCHES "vulkan")
+            set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT "BROTENSOR_PREFER_HIP=1")
+        endif()
+    endforeach()
 endif()

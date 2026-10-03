@@ -93,12 +93,19 @@ void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc);
 //     before using it therefore sees the truth and picks its non-CUDA path;
 //     code that just says Device::CUDA gets the GPU that is there.
 //
-// Without HIP, a registered Vulkan backend takes HIP's place: Device::cuda(i)
-// means Device::vulkan(i) by the same rule (a build with HIP and Vulkan keeps
-// the HIP alias; Vulkan is still never the default device on its own).
+// A registered Vulkan backend takes HIP's place by the same rule:
+// Device::cuda(i) means Device::vulkan(i) when there is no HIP backend, and
+// also when both are registered, Vulkan being the faster of the two on the
+// same AMD GPU (it is the default device then too: init.cpp). prefer_hip()
+// turns that around: with it, a build with HIP and Vulkan aliases to HIP.
 // With a CUDA backend registered (or no HIP or Vulkan backend) the alias is
 // the identity. Resolution happens here and nowhere else.
 Device resolve_device_alias(Device d);
+
+// True when BROTENSOR_PREFER_HIP=1 or BROTENSOR_DEFAULT_DEVICE names a HIP
+// device: HIP then wins over Vulkan as the default device and as the target
+// of the Device::CUDA alias. Read once.
+bool prefer_hip();
 
 // Dispatcher lookups (alias-resolved). Throw std::runtime_error if `d` is not
 // currently registered.

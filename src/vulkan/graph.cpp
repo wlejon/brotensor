@@ -67,7 +67,7 @@ void Event::wait() const {
 
 struct VulkanGraph::Impl {
     int dev = 0;
-    VkCommandBuffer cb = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> cbs;   // the capture's segments, in order
     std::vector<void*> held;          // memory freed during the capture
     std::uint64_t last_launch = 0;
 
@@ -76,7 +76,7 @@ struct VulkanGraph::Impl {
         // A launch may still be running: wait before the buffer and the memory
         // it uses are released.
         if (last_launch) d.stream().wait(last_launch);
-        d.stream().free_command_buffer(cb);
+        d.stream().free_command_buffers(cbs);
         for (void* p : held) d.allocator().free(p);
     }
 };
@@ -90,7 +90,7 @@ bool VulkanGraph::valid() const { return impl_ != nullptr; }
 
 void VulkanGraph::launch() {
     if (!impl_) throw std::runtime_error("brotensor: VulkanGraph::launch: empty graph");
-    impl_->last_launch = detail::vulkan::device(impl_->dev).stream().launch(impl_->cb);
+    impl_->last_launch = detail::vulkan::device(impl_->dev).stream().launch(impl_->cbs);
 }
 
 void VulkanGraph::reset() { impl_.reset(); }
@@ -141,7 +141,7 @@ VulkanGraph VulkanGraphCapture::finish() {
     g.impl_ = std::make_unique<VulkanGraph::Impl>();
     g.impl_->dev = impl_->dev;
     g.impl_->held = std::move(impl_->held);
-    g.impl_->cb = ctx.stream().end_capture();
+    g.impl_->cbs = ctx.stream().end_capture();
     return g;
 }
 

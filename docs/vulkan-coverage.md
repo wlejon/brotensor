@@ -115,6 +115,39 @@ Training: 20 ops, null: `attention_backward`, `mha_backward`.
 
 ## What the siblings still need (chunk 7)
 
+**Status after chunk 7b.** Everything in the list below is done: brolm,
+brosoundml and brogameagent gate on `graph_capture_available` and accept
+`"vulkan"` / `"vk"` (as do bro's `bro.gpu` and `bro.motion`); brolm's T5 runs
+an FP32-activation forward on Vulkan. The list missed some sites, fixed too:
+brolm `laya_batch.cpp` / `laya_scheduler.cpp` (CUDA / HIP-only graphs and
+replicas), brosoundml `omnivoice_lm.cpp` (a `DeviceType` test) and the JS
+OmniVoice precision default, brogameagent's JS device names, bro's
+`native_motion.cpp`. Found while doing it, still open:
+
+* **The null training slots now meet users.** Vulkan is the default device
+  with HIP and Vulkan both built, so the training code that runs on the
+  default device reaches the null slots: brogameagent's attention / MHA /
+  transformer layer backwards (`attention_backward`, `mha_backward`; 5 of its
+  33 tests) and brosoundml's BC-ResNet / phoneme-model training
+  (`batch_norm_forward` in training mode; 2 of 48). They pass on HIP
+  (`BROTENSOR_PREFER_HIP=1`).
+* **STFT precision.** The DFT-as-GEMM STFT (`ops_spectral.cpp`) carries
+  ~5e-5 absolute error at n_fft 512 (FP32 partial sums of a DFT row that
+  cancel), against the CPU FFT's ~1e-6, and the GEMM's K rotation makes the
+  rounding depend on a frame's row position. brosoundml `test_mel` fails on
+  it: log-mel differs from the CPU by 0.025 (HIP: 1e-6), and streaming
+  differs from offline by 0.018 in the quietest bins. STT / KWS / wake
+  results are unaffected in every test, but a front end compared bit for
+  bit against the CPU will see it. Fix: an FFT, or FP64 (or compensated)
+  accumulation in the DFT GEMM.
+* **Long graph submissions.** A captured TripoSplat step (two 3.6 s flow
+  forwards at 512 px, 8 steps) was one command buffer past the amdgpu ~10 s
+  job limit: device lost. Graph captures are now cut into
+  `BROTENSOR_VK_BATCH`-command segments, each its own submission (docs/vulkan.md,
+  "Graphs").
+
+The original list:
+
 The op table is not the whole story: these sibling-side paths name a backend
 explicitly and either skip Vulkan or would misbehave on it. None of them is an
 op gap in brotensor.

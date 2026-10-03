@@ -64,12 +64,25 @@ the MSE losses: 242 of 270 slots. The 28 null slots are training backwards
 host-only ops and filtered_lrelu (a composite of bias_act + upfirdn2d by
 design). `docs/vulkan-coverage.md` lists every slot and, per sibling, what its
 inference and training code calls.
-The backend is never the default device. To select it, use
-`set_default_device(Device::vulkan(i))`, a `DeviceScope`, or
-`BROTENSOR_DEFAULT_DEVICE=vulkan` (also `vk`, `vulkan:1`). Any other op throws
-"not implemented on vulkan". `Device::cuda(i)` aliases to `Device::vulkan(i)`
-when neither a CUDA nor a HIP backend is registered (the HIP alias's rule,
-`detail::resolve_device_alias`; with HIP present the alias stays HIP's).
+**Default device.** Without a CUDA or Metal backend, Vulkan is the default
+device, also in a build that registers HIP as well: on the AMD GPUs both
+drive it runs every sibling model faster (1.1-3x on SD1.5, PixArt, Sana,
+TripoSplat, Depth-Anything, SAM; 2x Qwen3 decode, 10x prefill). The order is
+CUDA, Metal, Vulkan, HIP (`pick_default_from_available`, `src/init.cpp`).
+`BROTENSOR_PREFER_HIP=1`, or `BROTENSOR_DEFAULT_DEVICE=hip`, puts HIP before
+Vulkan again, for comparisons (`detail::prefer_hip()`). A HIP-only build is
+unchanged. Otherwise select it with `set_default_device(Device::vulkan(i))`, a
+`DeviceScope`, or `BROTENSOR_DEFAULT_DEVICE=vulkan` (also `vk`, `vulkan:1`).
+An op in a null slot throws "not implemented on vulkan": the training
+backwards listed in vulkan-coverage.md, so training code that runs on the
+default device needs HIP (or names it) on an AMD machine.
+`Device::cuda(i)` aliases to `Device::vulkan(i)` when no CUDA backend is
+registered and Vulkan is (`detail::resolve_device_alias`), unless HIP is
+registered and preferred, or HIP is the only one: then it is `Device::hip(i)`.
+In a HIP + Vulkan build the generic test suites (which name the GPU as
+`Device::CUDA` and were written as the HIP backend's tests) run with
+`BROTENSOR_PREFER_HIP=1` (`tests/CMakeLists.txt`); Vulkan's own suites are the
+registrations named `*vulkan*`.
 Trace-JIT (`jit::*`) DAGs on Vulkan are replayed op by op through the
 dispatched ops (`src/jit/trace_eager.cpp`), as on HIP: there is no Vulkan
 trace compiler, and the CPU one must never see a buffer device address. The
@@ -223,7 +236,11 @@ Keep every file under 1000 lines: a new op family gets its own `ops_<family>.cpp
 - **Graphs.** `VulkanGraphCapture` / `VulkanGraph` (`vulkan.h`) follow the
   `CudaGraphCapture` / `CudaGraph` contract and are built on what Vulkan does
   cheapest: the captured ops are recorded once into a command buffer with
-  `SIMULTANEOUS_USE`, and `launch()` resubmits it unchanged. While a capture is
+  `SIMULTANEOUS_USE`, and `launch()` resubmits it unchanged. The recording
+  is cut into segments of `BROTENSOR_VK_BATCH` commands, each launched as its
+  own queue submission (in order, barrier-separated like eager batches): the
+  amdgpu driver resets the GPU when one submission runs past ~10 s, which a
+  whole captured TripoSplat step (two 3.6 s flow forwards) did in one. While a capture is
   recording, `sync`, downloads and uploads on that device throw, and frees are
   held by the graph until it is destroyed. The spike measured 0.74 µs per
   dependent kernel for replay, against 1.9 µs for HIP and its graphs. The
@@ -879,7 +896,8 @@ to divide 64; the dispatcher checks).
 
 | Variable | Effect |
 |---|---|
-| `BROTENSOR_DEFAULT_DEVICE=vulkan[:i]` / `vk[:i]` | make Vulkan the default device |
+| `BROTENSOR_DEFAULT_DEVICE=vulkan[:i]` / `vk[:i]` | make Vulkan the default device (it already is without CUDA / Metal, unless HIP is preferred) |
+| `BROTENSOR_PREFER_HIP=1` | with HIP and Vulkan both registered, HIP is the default device and the `Device::CUDA` alias (also implied by `BROTENSOR_DEFAULT_DEVICE=hip`) |
 | `BROTENSOR_DISABLE_VULKAN=1` | do not probe Vulkan at all |
 | `BROTENSOR_VK_VERBOSE=1` | print why the backend did or did not register |
 | `BROTENSOR_VK_ALLOW_CPU=1` | accept CPU implementations (lavapipe) |

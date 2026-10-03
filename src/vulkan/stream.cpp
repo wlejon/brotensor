@@ -112,7 +112,16 @@ void Stream::before_command_locked(VkCommandBuffer cb) {
 void Stream::after_command_locked() {
     ++stats_.commands;
     ++ops_in_batch_;
-    if (!capture_cb_ && ops_in_batch_ >= batch_limit_) submit_locked();
+    if (ops_in_batch_ < batch_limit_) return;
+    if (!capture_cb_) {
+        submit_locked();
+        return;
+    }
+    // A capture segment is full: close it (its results visible to the next
+    // segment through that one's leading barrier) and record on into a new one.
+    BT_VK_CHECK(dev_.fn().vkEndCommandBuffer(capture_cb_));
+    capture_done_.push_back(capture_cb_);
+    begin_capture_segment_locked();
 }
 
 void Stream::submit_cb_locked(VkCommandBuffer cb, std::uint64_t serial) {
@@ -253,10 +262,7 @@ bool Stream::idle() const {
 
 // ─── capture / replay ──────────────────────────────────────────────────────
 
-void Stream::begin_capture() {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (capture_cb_) throw std::runtime_error("brotensor: vulkan: a graph capture is already recording on this device");
-    submit_locked();   // work recorded before the capture runs before it
+VkCommandBuffer Stream::begin_capture_segment_locked() {
     const DeviceFns& f = dev_.fn();
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = pool_;
@@ -267,14 +273,26 @@ void Stream::begin_capture() {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;   // launch() may overlap launches
     BT_VK_CHECK(f.vkBeginCommandBuffer(cb, &bi));
+    // Ordered after everything submitted before it (the previous segment
+    // included), as an eager batch is.
     barrier(cb, /*to_host=*/false);
     capture_cb_ = cb;
+    ops_in_batch_ = 0;
     need_barrier_ = false;
     bound_ = VK_NULL_HANDLE;
+    return cb;
+}
+
+void Stream::begin_capture() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (capture_cb_) throw std::runtime_error("brotensor: vulkan: a graph capture is already recording on this device");
+    submit_locked();   // work recorded before the capture runs before it
+    capture_done_.clear();
+    begin_capture_segment_locked();
     capturing_.store(true, std::memory_order_release);
 }
 
-VkCommandBuffer Stream::end_capture() {
+std::vector<VkCommandBuffer> Stream::end_capture() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!capture_cb_) throw std::runtime_error("brotensor: vulkan: no graph capture is recording");
     VkCommandBuffer cb = capture_cb_;
@@ -283,8 +301,12 @@ VkCommandBuffer Stream::end_capture() {
     capturing_.store(false, std::memory_order_release);
     bound_ = VK_NULL_HANDLE;
     need_barrier_ = false;
+    ops_in_batch_ = 0;
     BT_VK_CHECK(dev_.fn().vkEndCommandBuffer(cb));
-    return cb;
+    std::vector<VkCommandBuffer> out = std::move(capture_done_);
+    capture_done_.clear();
+    out.push_back(cb);
+    return out;
 }
 
 void Stream::abort_capture() {
@@ -295,25 +317,35 @@ void Stream::abort_capture() {
     capturing_.store(false, std::memory_order_release);
     bound_ = VK_NULL_HANDLE;
     need_barrier_ = false;
+    ops_in_batch_ = 0;
     dev_.fn().vkEndCommandBuffer(cb);
-    dev_.fn().vkFreeCommandBuffers(dev_.device(), pool_, 1, &cb);
+    capture_done_.push_back(cb);
+    dev_.fn().vkFreeCommandBuffers(dev_.device(), pool_, static_cast<std::uint32_t>(capture_done_.size()),
+                                   capture_done_.data());
+    capture_done_.clear();
 }
 
-std::uint64_t Stream::launch(VkCommandBuffer cb) {
+std::uint64_t Stream::launch(const std::vector<VkCommandBuffer>& cbs) {
     std::lock_guard<std::mutex> lk(mu_);
     if (capture_cb_) throw std::runtime_error("brotensor: vulkan: cannot launch a graph while a capture is recording");
+    if (cbs.empty()) throw std::runtime_error("brotensor: vulkan: launch of an empty graph");
     submit_locked();
-    const std::uint64_t serial = next_serial_++;
-    work_serial_.store(serial, std::memory_order_release);
-    submit_cb_locked(cb, serial);
+    // One submission per segment, each signalling its own serial, so no
+    // single kernel-driver job holds the whole graph.
+    std::uint64_t serial = 0;
+    for (VkCommandBuffer cb : cbs) {
+        serial = next_serial_++;
+        work_serial_.store(serial, std::memory_order_release);
+        submit_cb_locked(cb, serial);
+    }
     ++stats_.launches;
     return serial;
 }
 
-void Stream::free_command_buffer(VkCommandBuffer cb) {
-    if (!cb) return;
+void Stream::free_command_buffers(const std::vector<VkCommandBuffer>& cbs) {
+    if (cbs.empty()) return;
     std::lock_guard<std::mutex> lk(mu_);
-    dev_.fn().vkFreeCommandBuffers(dev_.device(), pool_, 1, &cb);
+    dev_.fn().vkFreeCommandBuffers(dev_.device(), pool_, static_cast<std::uint32_t>(cbs.size()), cbs.data());
 }
 
 StreamStats Stream::stats() const {

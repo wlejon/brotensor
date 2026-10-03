@@ -31,15 +31,21 @@
 // Capture (graph.cpp). While a capture is active, commands go into the
 // capture's own command buffer instead and are never submitted; operations
 // that need the host to wait (sync, downloads, uploads larger than an inline
-// update) throw. The finished command buffer is submitted as-is by launch(),
-// as many times as the caller likes: a pre-recorded command buffer replayed
-// on the graphics queue costs ~0.74 us per dependent kernel, 2.5x cheaper
-// than hipGraph replay on the same GPU.
+// update) throw. The finished command buffers are submitted as-is by
+// launch(), as many times as the caller likes: a pre-recorded command buffer
+// replayed on the graphics queue costs ~0.74 us per dependent kernel, 2.5x
+// cheaper than hipGraph replay on the same GPU. A capture is cut into
+// segments of `batch_limit` commands, the same bound as an eager batch, and
+// launch() submits each segment as its own queue submission: the amdgpu
+// kernel driver resets the GPU when one submission runs past ~10 s, and a
+// whole captured diffusion step (TripoSplat's flow model: two 3.6 s forwards
+// at 8 steps) is past that as one command buffer.
 
 #include "vk_fns.h"
 
 #include <array>
 #include <atomic>
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -88,11 +94,13 @@ public:
 
     // ── Capture / replay (graph.cpp) ──
     void begin_capture();               // throws if already capturing
-    VkCommandBuffer end_capture();      // ends recording, returns the buffer
+    std::vector<VkCommandBuffer> end_capture();   // ends recording, returns the segments
     void abort_capture();
     bool capturing() const { return capturing_.load(std::memory_order_acquire); }
-    std::uint64_t launch(VkCommandBuffer cb);   // returns the launch's serial
-    void free_command_buffer(VkCommandBuffer cb);
+    // Submits the segments in order, one submission each; returns the serial
+    // the last one signals.
+    std::uint64_t launch(const std::vector<VkCommandBuffer>& cbs);
+    void free_command_buffers(const std::vector<VkCommandBuffer>& cbs);
 
     StreamStats stats() const;
 
@@ -105,6 +113,7 @@ private:
     void wait_value(std::uint64_t value) const;
     void barrier(VkCommandBuffer cb, bool to_host) const;
     void throw_if_capturing(const char* what) const;
+    VkCommandBuffer begin_capture_segment_locked();
 
     static constexpr int kSlots = 4;
     struct Slot {
@@ -128,7 +137,8 @@ private:
     VkPipeline bound_ = VK_NULL_HANDLE;
 
     std::atomic<bool> capturing_{false};
-    VkCommandBuffer capture_cb_ = VK_NULL_HANDLE;
+    VkCommandBuffer capture_cb_ = VK_NULL_HANDLE;    // segment being recorded
+    std::vector<VkCommandBuffer> capture_done_;      // finished segments
 
     StreamStats stats_{};
 };

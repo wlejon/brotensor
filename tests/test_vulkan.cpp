@@ -9,6 +9,7 @@
 // White-box: the pipeline guard test reaches into the backend.
 #include "detail/device.h"
 
+#include <brotensor/detail/dispatch.h>
 #include <brotensor/vulkan.h>
 
 #include <algorithm>
@@ -23,10 +24,20 @@ std::uint64_t address(const Tensor& t) { return reinterpret_cast<std::uintptr_t>
 
 bool contains(const std::vector<Device>& v, Device d) { return std::find(v.begin(), v.end(), d) != v.end(); }
 
-// Device::CUDA without a CUDA backend: HIP when it is registered, else
-// Vulkan (detail::resolve_device_alias). Everything that acts on the device
-// lands there; is_available(Device::CUDA) stays false. ctest runs this a
-// second time with HIP hidden (brotensor_test_vulkan_cuda_alias).
+// The GPU the default device and the Device::CUDA alias land on without a
+// CUDA backend: Vulkan, or HIP when it is registered and preferred
+// (BROTENSOR_PREFER_HIP=1 / BROTENSOR_DEFAULT_DEVICE=hip; init.cpp).
+Device amd_target() {
+    const bool hip = brotensor::is_available(Device::HIP);
+    return hip && brotensor::detail::prefer_hip() ? Device::HIP : vk();
+}
+
+// Device::CUDA without a CUDA backend: Vulkan, or HIP when only HIP is
+// registered or it is preferred (detail::resolve_device_alias). Everything
+// that acts on the device lands there; is_available(Device::CUDA) stays
+// false. ctest runs this again with HIP hidden
+// (brotensor_test_vulkan_cuda_alias) and with BROTENSOR_PREFER_HIP=1
+// (brotensor_test_vulkan_prefer_hip).
 void test_cuda_alias() {
     std::printf("Device::CUDA alias\n");
     if (brotensor::is_available(Device::CUDA)) {
@@ -34,9 +45,9 @@ void test_cuda_alias() {
         return;
     }
     VKT_CHECK(!brotensor::is_available(Device::CUDA));
-    const bool hip = brotensor::is_available(Device::HIP);
-    const Device target = hip ? Device::HIP : vk();
+    const Device target = amd_target();
     std::printf("  Device::CUDA -> %s\n", brotensor::to_string(target).c_str());
+    if (std::getenv("BROTENSOR_DEFAULT_DEVICE") == nullptr) VKT_CHECK(brotensor::default_device() == target);
     Tensor t = Tensor::zeros_on(Device::CUDA, 3, 5);
     VKT_CHECK(t.device == target);
     Tensor v = Tensor::view(Device::CUDA, t.data, 3, 5, Dtype::FP32);
@@ -58,7 +69,7 @@ void test_cuda_alias() {
     out.device = Device::CUDA;
     brotensor::relu_forward(t, out);
     VKT_CHECK(out.device == target && out.data != nullptr);
-    if (!hip) {
+    if (target.is_vulkan()) {
         std::size_t free_b = 0, total_b = 0;
         VKT_CHECK(brotensor::device_mem_info(Device::CUDA, free_b, total_b) && total_b > 0);
         brotensor::vulkan::flush(Device::CUDA);
@@ -88,16 +99,16 @@ void test_registration(bool expect_default_vulkan) {
         VKT_CHECK(brotensor::default_device() == vk());
         Tensor t = Tensor::zeros(2, 3);
         VKT_CHECK(t.device == vk());
-    } else {
-        // Coverage is partial: Vulkan is never the default unless asked for.
-        VKT_CHECK(!brotensor::default_device().is_vulkan());
+    } else if (!brotensor::is_available(Device::CUDA) && std::getenv("BROTENSOR_DEFAULT_DEVICE") == nullptr) {
+        // Vulkan is the default GPU on an AMD machine unless HIP is preferred.
+        VKT_CHECK(brotensor::default_device() == amd_target());
     }
     {
         brotensor::DeviceScope scope(vk());
         Tensor t = Tensor::zeros(4, 4);
         VKT_CHECK(t.device == vk());
     }
-    VKT_CHECK(!Tensor::zeros(1, 1).device.is_vulkan() || expect_default_vulkan);
+    VKT_CHECK(Tensor::zeros(1, 1).device == brotensor::default_device());
     std::size_t free_b = 0, total_b = 0;
     VKT_CHECK(brotensor::device_mem_info(vk(), free_b, total_b));
     VKT_CHECK(total_b > 0 && free_b <= total_b);

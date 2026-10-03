@@ -23,6 +23,12 @@
 #                                    `brotensor::vulkan::ShaderHandle handle(Shader)`
 #                                    (registered on first use). Dispatch with
 #                                    brotensor::vulkan::dispatch (include/brotensor/vulkan.h).
+#   brotensor_vulkan_detect(<out_var>)
+#                                    TRUE when this machine can build and run the
+#                                    backend: glslc, the Vulkan headers and the
+#                                    Vulkan loader (libvulkan) are all found. Never
+#                                    fails; for a parent's auto-detection (bro), as
+#                                    brotensor_hip_detect_gpus is for HIP.
 #   brotensor_vulkan_add_backend()   defines the brotensor_vulkan target and
 #                                    the defines brotensor_core needs.
 #
@@ -75,6 +81,20 @@ macro(brotensor_vulkan_prepare)
     endif()
     set(BROTENSOR_VULKAN_SHADER_INCLUDE_DIR "${_BROTENSOR_VULKAN_ROOT}/src/vulkan/shaders")
 endmacro()
+
+function(brotensor_vulkan_detect out_var)
+    set(_ok FALSE)
+    find_program(_btvd_glslc NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin" NO_CACHE)
+    find_path(_btvd_inc vulkan/vulkan.h HINTS "$ENV{VULKAN_SDK}/include" NO_CACHE)
+    # The loader is dlopen()ed at run time, never linked: look for it only to
+    # tell whether a binary built here would find a driver.
+    find_library(_btvd_loader NAMES vulkan vulkan-1 libvulkan.so.1
+                 HINTS "$ENV{VULKAN_SDK}/lib" "$ENV{VULKAN_SDK}/Lib" NO_CACHE)
+    if(_btvd_glslc AND _btvd_inc AND _btvd_loader)
+        set(_ok TRUE)
+    endif()
+    set(${out_var} ${_ok} PARENT_SCOPE)
+endfunction()
 
 function(brotensor_vulkan_add_shaders target)
     cmake_parse_arguments(_a "" "NAMESPACE;HEADER;SOURCE_DIR" "SHADERS;DEPENDS" ${ARGN})
