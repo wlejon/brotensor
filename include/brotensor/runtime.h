@@ -57,7 +57,8 @@ int vulkan_device_count();
 // Device::CUDA on a machine without CUDA: these two report the hardware truth
 // (is_available(Device::CUDA) is false), while every call below that *acts*
 // on a device — set_default_device, DeviceScope, sync, the memory queries,
-// the tensor factories — takes Device::cuda(i) as Device::vulkan(i). The rule is written out once, at
+// the tensor factories — takes Device::cuda(i) as the GPU that is there
+// (Device::Metal, else Device::vulkan(i)). The rule is written out once, at
 // detail::resolve_device_alias (detail/dispatch.h).
 std::vector<Device> available_devices();
 bool is_available(Device);

@@ -112,20 +112,22 @@ kernel void k_matmul_int8w_fp16(device const char*  W      [[buffer(0)]],
     }
 }
 
-// Y(B, out) = X_fp16(B, K) @ (W_int8(out, K) * scale[out])^T + bias[out].
-// (B,in) → (B,out) layout — mirrors linear_forward_batched_fp16_gpu.
-kernel void k_linear_batched_int8w_fp16(device const half*  X      [[buffer(0)]],
-                                        device const char*  W      [[buffer(1)]],
-                                        device const float* scales [[buffer(2)]],
-                                        device const half*  bias   [[buffer(3)]],
-                                        device half*        Y      [[buffer(4)]],
-                                        constant uint& B           [[buffer(5)]],
-                                        constant uint& M           [[buffer(6)]],
-                                        constant uint& K           [[buffer(7)]],
-                                        constant uint& has_bias    [[buffer(8)]],
-                                        threadgroup float* smem    [[threadgroup(0)]],
-                                        uint2 tg [[threadgroup_position_in_grid]],
-                                        uint2 li [[thread_position_in_threadgroup]]) {
+// Y(B, out) = X(B, K) @ (W_int8(out, K) * scale[out])^T + bias[out], with X,
+// bias and Y all FP16 or all BF16 (T). (B,in) -> (B,out) layout, mirrors
+// linear_forward_batched_fp16_gpu.
+template <typename T>
+kernel void k_linear_batched_int8w(device const T*     X      [[buffer(0)]],
+                                   device const char*  W      [[buffer(1)]],
+                                   device const float* scales [[buffer(2)]],
+                                   device const T*     bias   [[buffer(3)]],
+                                   device T*           Y      [[buffer(4)]],
+                                   constant uint& B           [[buffer(5)]],
+                                   constant uint& M           [[buffer(6)]],
+                                   constant uint& K           [[buffer(7)]],
+                                   constant uint& has_bias    [[buffer(8)]],
+                                   threadgroup float* smem    [[threadgroup(0)]],
+                                   uint2 tg [[threadgroup_position_in_grid]],
+                                   uint2 li [[thread_position_in_threadgroup]]) {
     threadgroup float* Xs = smem;                       // MM_TILE * MM_TILE
     threadgroup float* Ws = smem + MM_TILE * MM_TILE;   // MM_TILE * MM_TILE
 
@@ -160,9 +162,18 @@ kernel void k_linear_batched_int8w_fp16(device const half*  X      [[buffer(0)]]
     }
     if (b < B && m < M) {
         if (has_bias != 0u) acc += float(bias[m]);
-        Y[b * M + m] = half(acc);
+        Y[b * M + m] = T(acc);
     }
 }
+
+template [[host_name("k_linear_batched_int8w_fp16")]] kernel void
+k_linear_batched_int8w<half>(device const half*, device const char*, device const float*,
+                             device const half*, device half*, constant uint&, constant uint&,
+                             constant uint&, constant uint&, threadgroup float*, uint2, uint2);
+template [[host_name("k_linear_batched_int8w_bf16")]] kernel void
+k_linear_batched_int8w<bfloat>(device const bfloat*, device const char*, device const float*,
+                               device const bfloat*, device bfloat*, constant uint&, constant uint&,
+                               constant uint&, constant uint&, threadgroup float*, uint2, uint2);
 
 struct ConvI8Params {
     uint N, C_in, H, W;
@@ -243,11 +254,14 @@ id<MTLComputePipelineState> pso_conv() {
     return pso;
 }
 
-id<MTLComputePipelineState> pso_linear_batched() {
+id<MTLComputePipelineState> pso_linear_batched(bool bf16) {
     static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_linear_batched_int8w_fp16"); });
-    return pso;
+    static id<MTLComputePipelineState> pso_h, pso_b;
+    dispatch_once(&once, ^{
+        pso_h = compile_pipeline(kSrc, @"k_linear_batched_int8w_fp16");
+        pso_b = compile_pipeline(kSrc, @"k_linear_batched_int8w_bf16");
+    });
+    return bf16 ? pso_b : pso_h;
 }
 
 struct ConvI8Params {
@@ -435,11 +449,14 @@ void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
     if (scales.dtype != Dtype::FP32) {
         throw std::runtime_error("linear_forward_batched_int8w_fp16: scales must be FP32");
     }
-    if (X_BD.dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_int8w_fp16: X must be FP16");
+    // "fp16" names the 16-bit activation path: X FP16 or BF16, bias and Y
+    // follow X (as on CUDA and Vulkan).
+    const Dtype dt = X_BD.dtype;
+    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
+        throw std::runtime_error("linear_forward_batched_int8w_fp16: X must be FP16 or BF16");
     }
-    if (bias && bias->dtype != Dtype::FP16) {
-        throw std::runtime_error("linear_forward_batched_int8w_fp16: bias must be FP16");
+    if (bias && bias->size() > 0 && bias->dtype != dt) {
+        throw std::runtime_error("linear_forward_batched_int8w_fp16: bias must share X's dtype");
     }
     const int B   = X_BD.rows;
     const int in_dim  = X_BD.cols;
@@ -450,13 +467,13 @@ void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
     if (scales.rows != out_dim || scales.cols != 1) {
         throw std::runtime_error("linear_forward_batched_int8w_fp16: scales shape must be (out, 1)");
     }
-    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP16) {
-        Y_BD.resize(B, out_dim, Dtype::FP16);
+    if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != dt) {
+        Y_BD.resize(B, out_dim, dt);
     }
     if (B == 0 || out_dim == 0) return;
     if (in_dim == 0) { Y_BD.zero(); return; }
 
-    id<MTLComputePipelineState> pso = pso_linear_batched();
+    id<MTLComputePipelineState> pso = pso_linear_batched(dt == Dtype::BF16);
     id<MTLBuffer> bx = buffer_for(X_BD);
     id<MTLBuffer> bw = buffer_for(W_int8);
     id<MTLBuffer> bs = buffer_for(scales);

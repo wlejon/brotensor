@@ -184,7 +184,14 @@ bool is_registered(Device d) {
 
 Device resolve_device_alias(Device d) {
     if (d.is_cuda() && !slots()[static_cast<int>(DeviceType::CUDA)].registered) {
-        if (slots()[static_cast<int>(DeviceType::VULKAN)].registered) return Device::vulkan(d.index);
+        const bool metal = slots()[static_cast<int>(DeviceType::Metal)].registered;
+        const bool vulkan = slots()[static_cast<int>(DeviceType::VULKAN)].registered;
+        // With both, the default device decides (a Metal + Vulkan build run
+        // with BROTENSOR_DEFAULT_DEVICE=vulkan means Vulkan); otherwise Metal
+        // first, the order pick_default_from_available() uses.
+        if (metal && vulkan && ::brotensor::default_device().is_vulkan()) return Device::vulkan(d.index);
+        if (metal) return Device::Metal;
+        if (vulkan) return Device::vulkan(d.index);
     }
     return d;
 }

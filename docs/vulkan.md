@@ -90,7 +90,9 @@ device. The order is CUDA, Metal, Vulkan (`pick_default_from_available`,
 An op in a null slot throws "not implemented on vulkan"; since chunk 9 no
 public op reaches one (training included).
 `Device::cuda(i)` aliases to `Device::vulkan(i)` when no CUDA backend is
-registered and Vulkan is (`detail::resolve_device_alias`). The generic test
+registered and Vulkan is (`detail::resolve_device_alias`); with Metal
+registered as well it aliases to Metal unless the default device is Vulkan
+(the same alias makes the generic suites run on Metal in a Metal build). The generic test
 suites name the GPU as `Device::CUDA` and pick it through `tests/gpu_select.h`
 (the one device rule every suite uses); in a Vulkan-only build they all run
 on Vulkan, and in a build with CUDA or Metal as well they run again on Vulkan

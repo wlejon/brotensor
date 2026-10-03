@@ -17,7 +17,8 @@ stacked-weight SwiGLU GEMV takes the Vulkan GEMV epilogue, the rest compose
 dispatched ops) all run on Vulkan. `jit::*` traces on Vulkan compile to one
 SPIR-V kernel each (src/jit/trace_compiler_vulkan.cpp, docs/vulkan.md "Trace
 JIT"); one with no fusion is replayed op by op (src/jit/trace_eager.cpp). `Device::CUDA` aliases to Vulkan when no CUDA
-backend is registered (detail::resolve_device_alias).
+backend is registered (detail::resolve_device_alias; to Metal instead when
+Metal is registered and the default device is not Vulkan).
 
 ## Null slots
 

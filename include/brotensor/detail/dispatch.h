@@ -75,12 +75,16 @@ struct AllocVTable {
 void register_backend(DeviceType dt, const OpsVTable& ops, const AllocVTable& alloc);
 void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc);
 
-// ─── The Device::CUDA -> Vulkan alias ──────────────────────────────────────
+// ─── The Device::CUDA -> Metal / Vulkan alias ──────────────────────────────
 //
 // Much code names the GPU `Device::CUDA`. So that such code runs unchanged on
-// an AMD (or any non-NVIDIA) machine, when the Vulkan backend is registered
-// and the CUDA backend is not, a Device::cuda(i) *naming a place to put or
-// run work* means Device::vulkan(i). The rule, in full:
+// an Apple, AMD (or any non-NVIDIA) machine, when the CUDA backend is not
+// registered, a Device::cuda(i) *naming a place to put or run work* means the
+// GPU that is: Device::Metal when the Metal backend is registered, else
+// Device::vulkan(i) when the Vulkan backend is. With both Metal and Vulkan
+// registered, a Vulkan default device (BROTENSOR_DEFAULT_DEVICE=vulkan,
+// set_default_device, DeviceScope) picks Vulkan; otherwise Metal, the order
+// the default device itself is picked in. The rule, in full:
 //
 //   * Everything that acts on a device resolves the alias first: the tensor
 //     factories and view() (the tensor comes back tagged Vulkan), the ops / alloc
@@ -88,12 +92,12 @@ void register_backend(Device d, const OpsVTable& ops, const AllocVTable& alloc);
 //     DeviceScope, device_mem_info / device_mem_trim / device_product_name.
 //   * Everything that reports what hardware exists does not: is_available /
 //     is_registered(Device::CUDA) stay false, available_devices() lists
-//     Vulkan devices only, cuda_device_count() is 0. Code that probes for CUDA
+//     Metal / Vulkan devices only, cuda_device_count() is 0. Code that probes for CUDA
 //     before using it therefore sees the truth and picks its non-CUDA path;
 //     code that just says Device::CUDA gets the GPU that is there.
 //
-// With a CUDA backend registered (or no Vulkan backend) the alias is the
-// identity. Resolution happens here and nowhere else.
+// With a CUDA backend registered (or neither Metal nor Vulkan) the alias is
+// the identity. Resolution happens here and nowhere else.
 Device resolve_device_alias(Device d);
 
 // Dispatcher lookups (alias-resolved). Throw std::runtime_error if `d` is not

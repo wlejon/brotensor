@@ -7,7 +7,8 @@
 // generic GPU suites a second time as <name>_vulkan with
 // BROTENSOR_TEST_GPU=vulkan and BROTENSOR_DEFAULT_DEVICE=vulkan, so the same
 // test (and every Device::CUDA it names, which aliases to Vulkan then) runs
-// on Vulkan; in a Vulkan-only build Vulkan is the only choice.
+// on Vulkan; in a Vulkan-only build Vulkan is the only choice. In a Metal
+// build Device::CUDA aliases to Metal, so the same suites run on Metal.
 
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>

@@ -204,7 +204,8 @@ endif()
 # --- GPU tests (CUDA, Metal or Vulkan) ---
 # Backend-neutral: each suite runs on gpu_select.h's device (BROTENSOR_TEST_GPU,
 # else the first registered of CUDA, Metal, Vulkan) and names the GPU as
-# Device::CUDA, which aliases to Vulkan when there is no CUDA backend.
+# Device::CUDA, which aliases to Metal (else Vulkan) when there is no CUDA
+# backend.
 set(BROTENSOR_HAS_GPU OFF)
 if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL OR BROTENSOR_WITH_VULKAN)
     set(BROTENSOR_HAS_GPU ON)

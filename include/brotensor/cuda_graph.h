@@ -16,7 +16,7 @@
 // Which device. CudaGraphCapture() captures on the default device
 // (default_device(), so set_default_device / DeviceScope /
 // BROTENSOR_DEFAULT_DEVICE pick it) when that is a GPU with graph capture;
-// Device::cuda(i) is resolved through the CUDA -> Vulkan alias first.
+// Device::cuda(i) is resolved through the CUDA -> Metal / Vulkan alias first.
 // With a CPU or Metal default device it falls back to the CUDA backend's
 // current device (what the capture did before it was neutral), and
 // with neither of those to Vulkan device 0. CudaGraphCapture(Device) names it.

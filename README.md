@@ -86,7 +86,7 @@ cmake -B build_vk -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_VULKAN=ON
 cmake --build build_vk
 ```
 
-CPU is always built; the GPU backends are additive. CUDA / Metal don't share a host; Vulkan sits beside either. Without CUDA or Metal, Vulkan is the default device and `Device::CUDA` aliases to it. Vulkan design and coverage: [docs/vulkan.md](docs/vulkan.md), [docs/vulkan-coverage.md](docs/vulkan-coverage.md), performance: [docs/vulkan-perf.md](docs/vulkan-perf.md). Build internals (library targets, preprocessor defines, backend registration) are covered in [docs/architecture.md](docs/architecture.md#build-internals).
+CPU is always built; the GPU backends are additive. CUDA / Metal don't share a host; Vulkan sits beside either. Without CUDA or Metal, Vulkan is the default device. Without CUDA, `Device::CUDA` aliases to the GPU that is there: Metal, else Vulkan (`detail::resolve_device_alias`). Vulkan design and coverage: [docs/vulkan.md](docs/vulkan.md), [docs/vulkan-coverage.md](docs/vulkan-coverage.md), performance: [docs/vulkan-perf.md](docs/vulkan-perf.md). Build internals (library targets, preprocessor defines, backend registration) are covered in [docs/architecture.md](docs/architecture.md#build-internals).
 
 ## Tests
 

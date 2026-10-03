@@ -7,6 +7,11 @@
 // deterministic run to run without one. kLinearEpiFastAccum is accepted and
 // ignored — accumulation stays FP32 (the flag only ever permits less
 // precision, never requires it).
+//
+// SwiGLU's halves are stacked (gate rows [0, D), up rows [D, 2D)), so a
+// gate and its up land in different output tiles; it is the store epilogue
+// into an (B, 2D) scratch followed by the swiglu_forward kernel, which reads
+// exactly that layout.
 
 #include <brotensor/ops/linear.h>
 #include <brotensor/tensor.h>
@@ -21,6 +26,8 @@ namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
+
+void swiglu_forward(const Tensor& X, Tensor& Y);  // swiglu.mm
 
 namespace {
 
@@ -40,8 +47,19 @@ void linear_forward_batched_ex(const Tensor& W, const Tensor* bias, const Tensor
     const int N = W.rows, K = W.cols, M = X.rows;
     if (X.cols != K) fail("X.cols must equal W.cols");
     if (bias && static_cast<long long>(bias->rows) * bias->cols != N) fail("bias size must equal W.rows");
-    if (epilogue < 0 || epilogue > 2) fail("unknown epilogue");
+    if (epilogue < 0 || epilogue > 3) fail("unknown epilogue");
     if (epilogue == 2 && (act != 0 || N % 2 != 0)) fail("geglu needs act 0 and even W.rows");
+    if (epilogue == 3) {
+        if (act != 0 || N % 2 != 0) fail("swiglu needs act 0 and even W.rows");
+        if (M == 0 || N == 0) {
+            Y.resize(M, N / 2, dt);
+            return;
+        }
+        Tensor r = Tensor::empty_on(Device::Metal, M, N, dt);
+        detail::metal::linear_forward_batched_ex(W, bias, X, 0, 0, nullptr, r);
+        detail::metal::swiglu_forward(r, Y);
+        return;
+    }
     const int out_cols = epilogue == 2 ? N / 2 : N;
     if (epilogue == 1) {
         if (Y.rows != M || Y.cols != N || Y.dtype != dt) fail("accumulate needs Y (B, out) in W's dtype");
