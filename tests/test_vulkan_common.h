@@ -177,5 +177,8 @@ void run_norm_tests();
 void run_attention_tests();
 void run_gemm_bench();
 void run_attention_bench();
+void run_conv_tests();      // test_vulkan_conv.cpp
+void run_spatial_tests();   // test_vulkan_spatial.cpp
+void run_conv_bench();      // test_vulkan_bench_conv.cpp
 
 }  // namespace vkt

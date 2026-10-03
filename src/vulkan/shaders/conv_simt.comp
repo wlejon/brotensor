@@ -1,0 +1,134 @@
+#version 460
+// 2D convolution as an implicit GEMM with FP32 FMA arithmetic: the FP32 path
+// and the fallback for 16-bit operands on a device without cooperative
+// matrix. Same GEMM view as conv_cm.comp (Y[oc, p] = W[oc, :] . col[:, p] per
+// image and group, col never materialised); the tiling is gemm_simt.comp's:
+// a BM x BN workgroup tile, K step BK, TM x TN outputs per invocation, tiles
+// staged k-major in shared memory, the next tile loaded into registers while
+// the current one is consumed. -DDT: X, W, bias and Y storage (FP32 sums).
+//
+// B elements are loaded along n (pixels), so a workgroup's loads of one tile
+// row are consecutive input columns; WG is a multiple of BN, so each thread
+// gathers one fixed pixel, decoded once before the K loop.
+#include "common.glsl"
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint BM = 64;
+layout(constant_id = 1) const uint BN = 64;
+layout(constant_id = 2) const uint BK = 16;
+layout(constant_id = 3) const uint TM = 4;
+layout(constant_id = 4) const uint TN = 4;
+layout(constant_id = 5) const uint WG = 256;   // (BM / TM) * (BN / TN)
+layout(constant_id = 6) const int KH = 3;
+layout(constant_id = 7) const int KW = 3;
+layout(constant_id = 8) const int SH = 1;
+layout(constant_id = 9) const int SW = 1;
+layout(constant_id = 10) const int PH = 1;
+layout(constant_id = 11) const int PW = 1;
+layout(constant_id = 12) const int DH = 1;
+layout(constant_id = 13) const int DW = 1;
+layout(constant_id = 14) const uint ACCUM = 0;   // Y += conv
+layout(local_size_x_id = 5) in;
+
+layout(push_constant) uniform PC {
+    uint64_t x, w, y, bias;
+    uint m, n, k;            // Cg_out, H_out * W_out, Cg_in * KH * KW
+    uint h, wd, wo;
+    uint cin, cout, groups;
+} pc;
+
+const uint LA = BM * BK / WG;
+const uint LB = BN * BK / WG;
+const uint PA = BM + 4;
+const uint PB = BN + 4;
+const int KHW = KH * KW;
+const uint ES = DT == DT_F32 ? 4u : 2u;
+
+shared float As[BK * PA];
+shared float Bs[BK * PB];
+
+float ra[LA], rb[LB];
+
+int px_ih, px_iw;      // this thread's B pixel at kh = kw = 0
+bool px_ok;
+
+void load_tiles(uint64_t A, uint64_t X, uint m0, uint k0) {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint j = 0; j < LA; ++j) {
+        const uint e = tid + j * WG;
+        const uint gm = m0 + e / BK, gk = k0 + e % BK;
+        ra[j] = (gm < pc.m && gk < pc.k) ? load_elem(DT, A, gm * pc.k + gk) : 0.0;
+    }
+    [[unroll]] for (uint j = 0; j < LB; ++j) {
+        const uint e = tid + j * WG;
+        const uint gk = k0 + e / BN;
+        const int ic = int(gk) / KHW, t = int(gk) % KHW;
+        const int ih = px_ih + (t / KW) * DH, iw = px_iw + (t % KW) * DW;
+        const bool v = px_ok && gk < pc.k && ih >= 0 && ih < int(pc.h) && iw >= 0 && iw < int(pc.wd);
+        rb[j] = v ? load_elem(DT, X, (uint(ic) * pc.h + uint(ih)) * pc.wd + uint(iw)) : 0.0;
+    }
+}
+
+void store_tiles() {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint j = 0; j < LA; ++j) {
+        const uint e = tid + j * WG;
+        As[(e % BK) * PA + e / BK] = ra[j];
+    }
+    [[unroll]] for (uint j = 0; j < LB; ++j) {
+        const uint e = tid + j * WG;
+        Bs[(e / BN) * PB + e % BN] = rb[j];
+    }
+}
+
+void main() {
+    const uint z = gl_WorkGroupID.z;
+    const uint img = z / pc.groups, g = z % pc.groups;
+    const uint P = pc.n;
+    const uint64_t X = pc.x + uint64_t(ES) * (uint64_t(img) * uint64_t(pc.cin) + uint64_t(g) * uint64_t(pc.cin / pc.groups)) *
+                                  uint64_t(pc.h) * uint64_t(pc.wd);
+    const uint64_t A = pc.w + uint64_t(ES) * uint64_t(g) * uint64_t(pc.m) * uint64_t(pc.k);
+    const uint64_t C = pc.y + uint64_t(ES) * (uint64_t(img) * uint64_t(pc.cout) + uint64_t(g) * uint64_t(pc.m)) * uint64_t(P);
+    const uint m0 = gl_WorkGroupID.y * BM, n0 = gl_WorkGroupID.x * BN;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tx = tid % (BN / TN), ty = tid / (BN / TN);
+    const uint nk = (pc.k + BK - 1u) / BK;
+
+    {
+        const uint p = n0 + tid % BN;
+        px_ok = p < P;
+        px_ih = int(p / pc.wo) * SH - PH;
+        px_iw = int(p % pc.wo) * SW - PW;
+    }
+
+    float acc[TM * TN];
+    [[unroll]] for (uint i = 0; i < TM * TN; ++i) acc[i] = 0.0;
+
+    load_tiles(A, X, m0, 0u);
+    for (uint kt = 0; kt < nk; ++kt) {
+        store_tiles();
+        barrier();
+        if (kt + 1u < nk) load_tiles(A, X, m0, (kt + 1u) * BK);
+        [[unroll]] for (uint kk = 0; kk < BK; ++kk) {
+            float a[TM], b[TN];
+            [[unroll]] for (uint i = 0; i < TM; ++i) a[i] = As[kk * PA + ty * TM + i];
+            [[unroll]] for (uint j = 0; j < TN; ++j) b[j] = Bs[kk * PB + tx * TN + j];
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                [[unroll]] for (uint j = 0; j < TN; ++j) acc[i * TN + j] = fma(a[i], b[j], acc[i * TN + j]);
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0; i < TM; ++i) {
+        const uint gm = m0 + ty * TM + i;
+        if (gm >= pc.m) continue;
+        const float bv = pc.bias != 0 ? load_elem(DT, pc.bias, g * pc.m + gm) : 0.0;
+        [[unroll]] for (uint j = 0; j < TN; ++j) {
+            const uint gn = n0 + tx * TN + j;
+            if (gn >= P) continue;
+            float v = acc[i * TN + j] + bv;
+            if (ACCUM != 0) v += load_elem(DT, C, gm * P + gn);
+            store_elem(DT, C, gm * P + gn, v);
+        }
+    }
+}

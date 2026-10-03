@@ -24,8 +24,25 @@ decode ops over a KV cache (`flash_attention_decode`, `_decode_masked`,
 attentions (`self_attention_bias_forward`, `cross_attention_forward`,
 `_with_attn`, `mha_forward`, `self_attention_forward(_train)`),
 `rel_pos_bias_xl_forward`, `top_k_rows`, `segment_softmax_stats` and the
-softmax cross-entropies (`softmax_xent`, `_fused`, `_fused_batched`). Attention
-backwards and the INT8-weight attention variants are not implemented yet.
+softmax cross-entropies (`softmax_xent`, `_fused`, `_fused_batched`), and the
+spatial / diffusion family (chunk 4): `conv2d_forward`, `conv2d_backward_input`,
+`conv2d_backward_bias`, `conv3d_forward`, `conv_transpose2d_forward` and its bias
+gradient, `resblock_forward`, `group_norm_forward`, `batch_norm_inference`,
+`l2_normalize_nchw_forward`, the 2x resamples (`upsample_nearest_2x`,
+`upsample_bilinear_2x`, `downsample_avg_2x`, the nearest / average backwards),
+`interp2d_forward` / `_align_corners_forward` (nearest, bilinear, both
+bicubics), `adaptive_avg_pool2d_forward`, `max_pool2d_forward`,
+`convex_upsample_forward`, `pad2d_forward`, `slice2d_forward` / `_backward`,
+`unfold2d_forward`, `window_partition_forward` / `window_reverse_forward`,
+`spatial_merge_2x2_forward`, `pixel_shuffle_upsample_2x_forward`,
+`patch_unpack_forward`, `concat_nchw_channels` (+ backward),
+`concat_batched_rows`, `gather_rows`, `scatter_rows`, the sampler steps
+(`ddim_step`, `euler_step`, `dpmpp_2m_step`), `timestep_embedding`,
+`image_normalize`, `image_u8_to_f32_nhwc_to_nchw` and the Philox noise ops
+(`randn`, `rand_uniform`, `rand_bernoulli`, `randn_truncated`): 161 slots.
+Attention backwards, the INT8-weight variants (attention, `conv2d_int8w_fp16`,
+`conv3d_int8w_fp16`, `resblock_forward_int8w_fp16`) and the spatial backwards
+other than the ones named are not implemented yet.
 The backend is never the default device. To select it, use
 `set_default_device(Device::vulkan(i))`, a `DeviceScope`, or
 `BROTENSOR_DEFAULT_DEVICE=vulkan` (also `vk`, `vulkan:1`). Any other op throws
@@ -63,21 +80,25 @@ src/vulkan/
   register.cpp                  probe + vtable fill + public stats
   detail/gemm.h, gemm.cpp       the GEMM dispatcher every matrix op goes through
   detail/attention.h            the attention dispatcher (ops_attention.cpp) and dense path
+  detail/spatial.h              conv2d() / group_norm() entry points the spatial files share
   ops_*.cpp                     ops, one file per family, each with a fill_vulkan_vtable_<family>
                                 (elementwise, copy, reduce, linear, norm, rope, glu, attention,
-                                attention_proj, topk, xent; ops_attention_dense.cpp is the
-                                materialised path the others call)
-  shaders/                      *.comp kernels, common.glsl, gemm_common.glsl, op_codes.h,
-                                shaders.cmake (the list)
-tests/test_vulkan.cpp           runtime; main(), --only=ops|gemm|norm|attention, --bench-gemm,
-                                --bench-attention
+                                attention_proj, topk, xent, conv, gnorm, spatial, diffusion;
+                                ops_attention_dense.cpp is the materialised path the others call)
+  shaders/                      *.comp kernels, common.glsl, gemm_common.glsl, math_acc.glsl
+                                (accurate exp / log / sincos), op_codes.h, shaders.cmake (the list)
+tests/test_vulkan.cpp           runtime; main(), --only=ops|gemm|norm|attention|conv|spatial,
+                                --bench-gemm, --bench-attention, --bench-conv
 tests/test_vulkan_ops.cpp       chunk-1 op parity
 tests/test_vulkan_gemm.cpp      matmul / linear parity, every kernel path
 tests/test_vulkan_norm.cpp      norms, softmax, RoPE, GLUs parity
 tests/test_vulkan_attention.cpp flash family, decode, kv cache parity, every attention path
 tests/test_vulkan_attention_ops.cpp  fused / materialised attentions, top-k, segment stats, xent
+tests/test_vulkan_conv.cpp      conv2d on every path, conv3d, transposed conv, backwards, ResBlock
+tests/test_vulkan_spatial.cpp   resamples, pooling, gathers, NCHW norms, samplers, noise, image ops
 tests/test_vulkan_bench.cpp     GEMM / GEMV throughput (not in ctest)
 tests/test_vulkan_bench_attention.cpp  attention throughput (not in ctest)
+tests/test_vulkan_bench_conv.cpp       conv TF/s, GroupNorm / resample GB/s (not in ctest)
 tests/test_vulkan_common.h
 ```
 
@@ -362,6 +383,132 @@ the cache at 219-225 GB/s (86-88% of 256 GB/s; HIP 14 GB/s); a 4096-key cache
 fits the 32 MB Infinity Cache and shows 405 GB/s; 4-64 query rows over 16k
 keys take 0.50-0.61 ms (HIP 4.9-20.7 ms).
 
+## Convolution
+
+`conv2d()` (`ops_conv.cpp`, `detail/spatial.h`) takes NCHW activations and
+OIHW (grouped) weights in one dtype and picks one of three kernels:
+
+| Kernel | When | What |
+|---|---|---|
+| `conv_cm.comp` | FP16 / BF16, `coopmat_f16`, C_out / groups >= 16 and K = C_in / groups kH kW >= 16 | implicit GEMM on 16x16x16 fragments, FP32 accumulation |
+| `conv_simt.comp` | FP32, or no cooperative matrix, same size rule | implicit GEMM with FP32 FMA (`gemm_simt.comp`'s tiling) |
+| `conv_direct.comp` | depthwise and narrow grouped convolutions (the rule fails) | one output per invocation; also conv3d, the transposed convolution and `conv2d_backward_input` |
+
+**Implicit GEMM.** Per image and group (workgroup z), Y[oc, p] = W[oc, k]
+col[k, p] + bias[oc] with M = C_out / groups, N = H_out W_out pixels and K
+in the weights' own (ic, kh, kw) order, so A is the weight tensor as stored
+and C is the NCHW output (ld = H_out W_out). col is never materialised: the
+B-tile loader computes each element's input address, and each thread's
+8-pixel chunks are fixed for the whole K loop, so their output coordinates
+are decoded once. The kernel geometry (kernel, stride, padding, dilation) is
+specialised. The B gather is what bounds the kernel, and its loads come in
+three forms (spec constant `BVEC`): a plain 1x1 (stride 1, no padding) loads
+a chunk as one aligned 16-byte load; any stride-1 kernel over rows of whole
+16-byte chunks (W % 8 == 0, W_out % 8 == 0) loads the two aligned chunks
+around it and shifts the 8 halves into place when the tile is stored to
+shared memory (the GEMM's first rule: loads at clamped addresses with
+validity bits, consumed after the fragment math); everything else takes eight
+2-byte loads. The vector forms and tiles with fewer B chunks per thread
+took 512 channels at 64x64 from 13.5 to 24.5 TF/s and 128 channels at
+512x512 from 13.7 to 18.2. The epilogue is the GEMM's two-form one (fragment-form for interior
+FP16 tiles, the bias a column-major stride-0 fragment because it is per row;
+per-element for edges and BF16) with an optional accumulate (`ACCUM`, used by
+the ResBlock to add conv2 onto the skip path without another pass). Tiles
+(`pick_cm`, measured): 256x128 (8 subgroups of 64x64) when C_out fills
+256-row tiles and there are >= 48 of them, 128x64 (4 of 64x32) when it fills
+128-row tiles, else 64x64; `BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn` forces one.
+
+Measured with `brotensor_test_vulkan --bench-conv` (FP16, batch 1 unless
+noted, 3x3 stride 1 same padding unless noted, wall clock around
+back-to-back calls, median of 7 batches; HIP is the HIP backend's same public
+op, which runs im2col + hipBLAS, in the same process), ms / TF/s:
+
+| Shape | Vulkan | HIP | vs HIP |
+|---|---|---|---|
+| 512 -> 512, 64x64 | 0.788 / 24.5 | 1.086 / 17.8 | 1.38 |
+| 512 -> 512, 128x128 | 2.806 / 27.6 | 4.123 / 18.8 | 1.47 |
+| 256 -> 256, 256x256 | 2.763 / 28.0 | 6.429 / 12.0 | 2.33 |
+| 128 -> 128, 512x512 | 4.242 / 18.2 | 12.01 / 6.4 | 2.83 |
+| 256 -> 128, 512x512 | 7.701 / 20.1 | 22.76 / 6.8 | 2.95 |
+| 1x1 512 -> 256, 256x256 | 0.765 / 22.5 | 0.847 / 20.3 | 1.11 |
+| 320 -> 320, 64x64, batch 2 (U-Net) | 0.803 / 18.8 | 1.047 / 14.4 | 1.30 |
+| 640 -> 640, 32x32, batch 2 | 0.718 / 21.0 | 0.721 / 21.0 | 1.00 |
+| 1280 -> 1280, 16x16, batch 2 | 0.717 / 21.1 | 0.760 / 19.9 | 1.06 |
+
+BF16 (converted to FP16 at the shared-memory store) runs at 18.7-25.7 TF/s on
+the same shapes, FP32 and the SIMT path at 5.4-8 TF/s
+(`BROTENSOR_VK_BENCH_DTYPE=f32|bf16`, `BROTENSOR_VK_BENCH_CONV_PATH=simt|direct`).
+The 128-channel shapes stay below the GEMM's 30 TF/s because every B element
+is reused by only 128 output channels; staging an input patch in shared
+memory once per (ic, kh) and building the B tiles from it would cut the
+global loads further.
+
+**Other convolutions.** `conv3d_forward` is one GEMM (Y = X Wt^T + bias,
+NT) when the kernel covers the whole input (Qwen-VL's patch embedding), the
+direct kernel otherwise. `conv_transpose2d_forward` and
+`conv2d_backward_input` are the direct kernel's gather form (the latter reads
+the conv weights as the transposed layout with C_in and C_out swapped). The
+bias gradients are a per-channel sum (`gnorm.comp`). `resblock_forward`
+composes GN + SiLU (one fused pass), conv1 with a per-channel time-embedding
+shift folded into its bias, GN + SiLU in place, the skip (copy or 1x1 conv)
+written to Y, and conv2 accumulated onto it.
+
+## Spatial ops, NCHW norms, diffusion helpers
+
+* **`resample.comp`**: interpolation (nearest, bilinear, bicubic a = -0.5 /
+  -0.75; half-pixel or corner-aligned), the 2x average downsample, the
+  nearest / average 2x backwards, adaptive average pooling, max pooling (+
+  INT32 flat argmax), RAFT's convex upsample. One invocation is one output
+  position and walks 16 channels, so coordinates, tap weights and the convex
+  softmax are computed once per position. Source coordinates are exact
+  rationals in 64-bit integers (half-pixel: ((2o + 1) in - out) / (2 out)),
+  floor and round-half-to-even taken exactly, where the CPU and HIP compute
+  them in double; the two agree except where the double product rounds
+  across a tie, which no test shape does.
+* **`remap.comp`** (`_b2` / `_b4` by element size, bit-exact for any dtype):
+  pad (zero / reflect / replicate), crop and its backward (a zero pad),
+  nearest 2x upsample, unfold, window partition / reverse, the 2x2 pixel
+  unshuffle, the DC-AE pixel shuffle, DiT unpatchify, row gather / scatter
+  (an out-of-range index is clamped for a gather and skipped for a scatter:
+  a device fault would lose the device). The channel concats are strided
+  copies.
+* **`gnorm.comp`**: GroupNorm in two kernels. The statistics kernel splits
+  each (sample, group) tile, which is contiguous in NCHW, into chunks of
+  ~8192 elements and reduces each in one pass to (count, mean, M2) with sums
+  shifted by the chunk's first element (no E[x^2] - E[x]^2 cancellation);
+  the apply kernel combines a tile's partials with Chan's formula in shared
+  memory and normalises (+ SiLU for the ResBlock), 4 elements per load when
+  aligned. Traffic is one read for the statistics plus a read and a write.
+  BatchNorm inference and the per-pixel L2 normalise are elementwise /
+  per-pixel passes.
+* **`sampler.comp`**: DDIM, Euler and DPM++ 2M steps with the coefficients
+  computed on the host as the CPU does, evaluated `precise` (unfused; the
+  CPU backend is built with -mfma and GCC contracts them, so FP32 results
+  differ by an ulp), the timestep embedding (exp / sin / cos from
+  `math_acc.glsl`), image normalisation and the u8 NHWC -> NCHW conversion,
+  whose `src` is a Vulkan device address (the data of a tensor the bytes were
+  uploaded to), as on CUDA.
+* **`philox.comp`**: Philox 4x32-10 as in `src/cpu/noise.cpp`; the uniform
+  and Bernoulli draws are bit-identical to the CPU, the normal ones go
+  through `log_acc` / `sincos_acc` and 2 pi u rounded once from the exact
+  product, within 2e-6 of glibc.
+
+Measured with `--bench-conv` (FP16, batch 1; GB/s of the minimum traffic,
+each input read once and each output written once; GroupNorm reads its input
+twice, so its actual traffic is 1.5x the figure; inputs of 32 MB and less
+partly stay in the 32 MB Infinity Cache, hence figures above the 256 GB/s
+peak):
+
+| Op | Vulkan ms / GB/s | HIP ms / GB/s |
+|---|---|---|
+| GroupNorm 32 groups, 256 ch 256x256 (32 MB) | 0.519 / 129 (194 actual) | 1.847 / 36 |
+| GroupNorm, 128 ch 512x512 (64 MB) | 0.995 / 135 (202 actual) | 4.074 / 33 |
+| upsample_nearest_2x, 512 ch 128 -> 256 | 0.415 / 202 | 0.655 / 128 |
+| upsample_nearest_2x, 256 ch 256 -> 512 | 0.902 / 186 | 1.303 / 129 |
+| bilinear, 512 ch 64 -> 128 | 0.116 / 181 | 0.871 / 24 |
+| bilinear, 256 ch 100 -> 333 | 0.408 / 152 | 2.975 / 21 |
+| bicubic (torch), 64 ch 512 -> 224 | 0.153 / 261 | FP32 only |
+
 ## Dtype policy
 
 - **FP32**: native.
@@ -386,6 +533,8 @@ keys take 0.50-0.61 ms (HIP 4.9-20.7 ms).
   Q / K / V to FP16 as it stages them (a BF16 value beyond ±65504 becomes inf)
   and writes O back as BF16; `fa_rows.comp` computes BF16 in FP32, and the
   dense path keeps its scores in FP32 while its P V GEMM follows the GEMM's rule.
+  `conv_cm.comp` does the same as it stages A and B; the SIMT and direct
+  convolutions and every spatial kernel compute BF16 in FP32.
 - **INT8 / INT32**: storage carriers only (8-bit storage is enabled). There is
   no FP8.
 
@@ -447,6 +596,7 @@ to divide 64; the dispatcher checks).
 | `BROTENSOR_VK_FA_CFG=bc,nsg` | force the `fa_cm` tile: bc in {16, 32, 64} keys, nsg in {1, 2, 4} subgroups, 16 nsg <= 2 bc |
 | `BROTENSOR_VK_FA_WGS=n` | workgroups `fa_rows` splits keys up to (default 80) |
 | `BROTENSOR_VK_FA_PATH=rows\|cm\|dense` | force an attention path where it applies (benchmarking) |
+| `BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn` | force the `conv_cm` tile (one of the six in `ops_conv.cpp`) |
 
 Vulkan validation layers were not installed on the development machine, so
 the backend has not been run under them.

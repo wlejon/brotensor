@@ -1,0 +1,81 @@
+#version 460
+// Counter-based noise: Philox 4x32-10, the construction of src/cpu/noise.cpp
+// (and the CUDA / Metal kernels), so a (key, counter) gives the same draws on
+// every backend. Element i of Y (FP32) draws from substream counter + i.
+// Spec constant 0 = RNG_*:
+//   RNG_NORMAL     Box-Muller on (ctr0, ctr1): sqrt(-2 ln(1 - u0)) cos(2 pi u1)
+//   RNG_UNIFORM    u0 = (ctr0 >> 8) / 2^24
+//   RNG_BERNOULLI  u0 < p
+//   RNG_TRUNCATED  normal redrawn from substream counter + i + r n (r < 64)
+//                  until it lands in [lo, hi], then clamped
+// The uniforms are exact; the normal goes through log_acc / sincos_acc
+// (math_acc.glsl), within a few ulp of glibc, and 2 pi u1 is rounded once
+// from the exact product as the reference does in double.
+#include "common.glsl"
+#include "op_codes.h"
+#include "math_acc.glsl"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+
+layout(push_constant) uniform PC {
+    uint64_t y, key, counter;
+    uint n_lo, n_hi;          // element count (64-bit)
+    float p, lo, hi;
+} pc;
+
+uvec4 philox(uint64_t sub) {
+    uint k0 = uint(pc.key), k1 = uint(pc.key >> 32);
+    uvec4 c = uvec4(uint(sub), uint(sub >> 32), 0u, 0u);
+    for (int r = 0; r < 10; ++r) {
+        uint hi0, lo0, hi1, lo1;
+        umulExtended(0xD2511F53u, c.x, hi0, lo0);
+        umulExtended(0xCD9E8D57u, c.z, hi1, lo1);
+        c = uvec4(hi1 ^ c.y ^ k0, lo1, hi0 ^ c.w ^ k1, lo0);
+        k0 += 0x9E3779B9u;
+        k1 += 0xBB67AE85u;
+    }
+    return c;
+}
+
+float u01(uint w) { return float(w >> 8) * (1.0 / 16777216.0); }
+
+float normal(uint64_t sub) {
+    const uvec4 c = philox(sub);
+    const float u1 = 1.0 - u01(c.x);
+    const float u2 = u01(c.y);
+    const float radius = sqrt(-2.0 * log_acc(u1));
+    // float(2 pi * u2) from the exact product: hi part, its rounding error,
+    // and the low part of 2 pi.
+    const float h = 6.28318548202514648;          // float(2 pi)
+    const float l = -1.7484555314695172e-07;      // 2 pi - h
+    const float ph = u2 * h;
+    const float theta = ph + (fma(u2, h, -ph) + u2 * l);
+    float s, co;
+    sincos_acc(theta, s, co);
+    return radius * co;
+}
+
+void main() {
+    const uint64_t n = uint64_t(pc.n_lo) | (uint64_t(pc.n_hi) << 32);
+    const uint64_t stride = uint64_t(GRID_STRIDE_X);
+    for (uint64_t i = uint64_t(gl_GlobalInvocationID.x); i < n; i += stride) {
+        const uint64_t sub = pc.counter + i;
+        float v;
+        if (MODE == RNG_NORMAL) {
+            v = normal(sub);
+        } else if (MODE == RNG_UNIFORM) {
+            v = u01(philox(sub).x);
+        } else if (MODE == RNG_BERNOULLI) {
+            v = u01(philox(sub).x) < pc.p ? 1.0 : 0.0;
+        } else {
+            v = 0.0;
+            for (int r = 0; r < 64; ++r) {
+                v = normal(sub + uint64_t(r) * n);
+                if (v >= pc.lo && v <= pc.hi) break;
+            }
+            v = clamp(v, pc.lo, pc.hi);
+        }
+        F32Buf(pc.y).v[uint(i)] = v;
+    }
+}

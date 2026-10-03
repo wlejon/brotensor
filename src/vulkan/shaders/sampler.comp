@@ -1,0 +1,68 @@
+#version 460
+// Diffusion sampler steps, the timestep embedding and the image preprocessing
+// helpers: elementwise, grid-stride, FP32 arithmetic, tensors in -DDT.
+// Spec constant 0 = SMP_* (op_codes.h); the scalar coefficients are computed
+// on the host exactly as the CPU reference computes them, and the steps are
+// `precise`: evaluated as written, never contracted into FMAs, so a result
+// does not depend on the compiler (the CPU build's -mfma contraction moves
+// it by an ulp).
+//
+//   SMP_DDIM          y = sa_prev * ((x - s1m_a * e) * inv_sa) + dir * e
+//   SMP_EULER         y = x + dsigma * e
+//   SMP_DPMPP_2M      x0 = x - sigma * e; y = c_xt x + c_x0t x0 + c_x0p x0_prev; z = x0
+//   SMP_TIMESTEP_EMB  Y[i, j] = cos / sin(t[i] exp(-ln(max_period) k / half)) (flip_sin_to_cos)
+//                     t in spec constant 1's dtype, odd dim's last column 0
+//   SMP_IMAGE_NORM    y = (x - mean[c]) * (1 / std[c])       (mean / std FP32)
+//   SMP_U8_NHWC       Y[n, c, h, w] = u8[((n H + h) W + w) C + c] * scale + bias
+#include "common.glsl"
+#include "op_codes.h"
+#include "math_acc.glsl"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+layout(constant_id = 1) const int DTI = 0;   // SMP_TIMESTEP_EMB: timesteps dtype
+
+layout(push_constant) uniform PC {
+    uint64_t x, e, p, y, z;
+    uint n, dim, half_, hw, c;
+    float k0, k1, k2, k3;
+} pc;
+
+void main() {
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += GRID_STRIDE_X) {
+        if (MODE == SMP_DDIM) {
+            const float x = load_elem(DT, pc.x, i), e = load_elem(DT, pc.e, i);
+            precise float x0 = (x - pc.k2 * e) * pc.k1;
+            precise float r = pc.k0 * x0 + pc.k3 * e;
+            store_elem(DT, pc.y, i, r);
+        } else if (MODE == SMP_EULER) {
+            precise float r = load_elem(DT, pc.x, i) + pc.k0 * load_elem(DT, pc.e, i);
+            store_elem(DT, pc.y, i, r);
+        } else if (MODE == SMP_DPMPP_2M) {
+            const float x = load_elem(DT, pc.x, i), e = load_elem(DT, pc.e, i), xp = load_elem(DT, pc.p, i);
+            precise float x0 = x - pc.k0 * e;
+            precise float r = pc.k1 * x + pc.k2 * x0 + pc.k3 * xp;
+            store_elem(DT, pc.y, i, r);
+            store_elem(DT, pc.z, i, x0);
+        } else if (MODE == SMP_TIMESTEP_EMB) {   // n = rows * dim
+            const uint r = i / pc.dim, j = i % pc.dim;
+            float v = 0.0;
+            if (j < 2u * pc.half_) {
+                const uint k = j < pc.half_ ? j : j - pc.half_;
+                const float freq = exp_acc(div_rn(-pc.k0 * float(k), float(pc.half_)));
+                float s, co;
+                sincos_acc(load_elem(DTI, pc.x, r) * freq, s, co);
+                v = j < pc.half_ ? co : s;
+            }
+            store_elem(DT, pc.y, i, v);
+        } else if (MODE == SMP_IMAGE_NORM) {
+            const uint ch = (i / pc.hw) % pc.c;
+            const float inv = div_rn(1.0, F32Buf(pc.p).v[ch]);
+            store_elem(DT, pc.y, i, (load_elem(DT, pc.x, i) - F32Buf(pc.e).v[ch]) * inv);
+        } else if (MODE == SMP_U8_NHWC) {
+            const uint ch = (i / pc.hw) % pc.c, img = i / (pc.hw * pc.c), px = i % pc.hw;
+            const float v = float(uint(U8Buf(pc.x).v[(img * pc.hw + px) * pc.c + ch]));
+            store_elem(DT, pc.y, i, v * pc.k0 + pc.k1);
+        }
+    }
+}

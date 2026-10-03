@@ -30,6 +30,10 @@ void fill_vulkan_vtable_attention(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_attention_proj(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_topk(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_xent(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_conv(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_gnorm(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_spatial(::brotensor::detail::OpsVTable& v);
+void fill_vulkan_vtable_diffusion(::brotensor::detail::OpsVTable& v);
 
 namespace {
 
@@ -89,6 +93,10 @@ void probe_and_register() {
     dv::fill_vulkan_vtable_attention_proj(ops);
     dv::fill_vulkan_vtable_topk(ops);
     dv::fill_vulkan_vtable_xent(ops);
+    dv::fill_vulkan_vtable_conv(ops);
+    dv::fill_vulkan_vtable_gnorm(ops);
+    dv::fill_vulkan_vtable_spatial(ops);
+    dv::fill_vulkan_vtable_diffusion(ops);
     ::brotensor::detail::register_backend(::brotensor::DeviceType::VULKAN, ops,
                                           dv::vulkan_alloc_table());
     if (vk_verbose()) {

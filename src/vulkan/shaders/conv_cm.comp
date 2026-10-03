@@ -1,0 +1,371 @@
+#version 460
+// 2D convolution as an implicit GEMM on 16x16x16 FP16 cooperative-matrix
+// fragments (FP32 accumulation, subgroup 32), the conv2d_forward fast path.
+// -DDT=1 (FP16) or -DDT=2 (BF16 storage, converted to FP16 on its way into
+// shared memory: the dtype policy in docs/vulkan.md).
+//
+// Per image n and group g (workgroup z = n * groups + g):
+//   Y[oc, p] = sum_k W[oc, k] * col[k, p] + bias[oc]
+//   oc < Cg_out (M), p = oh * W_out + ow < H_out * W_out (N),
+//   k = (ic * KH + kh) * KW + kw < Cg_in * KH * KW (K, the OIHW weight order),
+//   col[k, p] = X[ic, oh * SH - PH + kh * DH, ow * SW - PW + kw * DW] (0 outside).
+// A is the weight matrix as stored (row-major, ld = K); B = col is never
+// materialised: the B-tile loader computes each element's input address
+// (the "address arithmetic" form of implicit GEMM). Y is written NCHW, which
+// is C (M, N) row-major with ld = H_out * W_out.
+//
+// The kernel is gemm_cm.comp's with the B operand replaced (NB layout: tile
+// rows are k, 8-pixel chunks along n) and the epilogue's bias indexed by row.
+// The geometry (kernel, stride, padding, dilation) is specialised, so the
+// k -> (ic, kh, kw) split divides by constants.
+//
+// B loads follow the GEMM's first rule (docs/vulkan.md): every element is
+// loaded unconditionally from a clamped index into a register with a validity
+// bit, and the zeroing, packing and BF16 conversion wait until the chunk is
+// stored to shared memory, after the fragment math. Each thread's chunk
+// columns are fixed for the whole K loop, so the output pixel of each of its
+// elements is decoded once, before the loop.
+#include "common.glsl"
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint BM = 128;
+layout(constant_id = 1) const uint BN = 128;
+layout(constant_id = 2) const uint BK = 32;
+layout(constant_id = 3) const uint WM = 64;
+layout(constant_id = 4) const uint WN = 64;
+layout(constant_id = 5) const uint WG = 128;
+layout(constant_id = 6) const uint ACT = 0;
+layout(constant_id = 7) const uint AVEC = 1;     // A rows 16-byte loadable (K % 8 == 0, aligned W)
+layout(constant_id = 8) const uint DIRECT = 0;   // fragment-form epilogue (see gemm_cm.comp)
+layout(constant_id = 9) const uint BIAS = 0;
+layout(constant_id = 10) const int KH = 3;
+layout(constant_id = 11) const int KW = 3;
+layout(constant_id = 12) const int SH = 1;
+layout(constant_id = 13) const int SW = 1;
+layout(constant_id = 14) const int PH = 1;
+layout(constant_id = 15) const int PW = 1;
+layout(constant_id = 16) const int DH = 1;
+layout(constant_id = 17) const int DW = 1;
+layout(constant_id = 18) const uint ROWCH = 1;   // W_out % 8 == 0: a chunk's 8 pixels share a row
+layout(constant_id = 19) const uint ACCUM = 0;   // Y += conv instead of Y = conv
+layout(constant_id = 20) const uint BVEC = 0;    // B chunk loads: 0 = eight 2-byte loads;
+                                                 // 1 = 1x1 / stride 1 / no padding, H W % 8 == 0:
+                                                 //     one aligned 16-byte load;
+                                                 // 2 = stride 1, W % 8 == 0, ROWCH: two aligned
+                                                 //     16-byte loads, shifted into place at the store
+layout(local_size_x_id = 5) in;
+
+layout(push_constant) uniform PC {
+    uint64_t x, w, y, bias;
+    uint m, n, k;            // Cg_out, H_out * W_out, Cg_in * KH * KW
+    uint h, wd, wo;          // input H, W; output W
+    uint cin, cout, groups;  // totals (batch offsets)
+    uint tm0, tn0;           // tile origin of this dispatch (edge strips)
+} pc;
+
+#include "op_codes.h"
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer U4Buf { uvec4 v[]; };
+
+const uint TM = WM / 16;
+const uint TN = WN / 16;
+const uint LA = (BM * BK / 8) / WG;
+const uint LB = (BN * BK / 8) / WG;
+const uint CA = BK / 8;                  // A: k contiguous
+const uint CB = BN / 8;                  // B: n contiguous
+const uint SKA = CA + 1;
+const uint SKB = CB + 1;
+const uint ASZ = BM * BK / 8 + BM;
+const uint BSZ = BN * BK / 8 + BK;
+const int KHW = KH * KW;
+
+shared uvec4 As[2 * ASZ];
+shared uvec4 Bs[2 * BSZ];
+
+uvec4 ra[LA];
+uint16_t rb[LB * 8];
+uvec4 rbv[LB], rbv2[LB]; // BVEC 1 / 2 (vb then also holds the shift in bits 8..10)
+uint va;                 // A chunk validity (AVEC)
+uint vb[LB];             // B element validity, 8 bits per chunk
+
+// Per B chunk, fixed for the whole K loop: input row / column of the
+// chunk's first pixel at kh = kw = 0, and which of its 8 pixels exist.
+int cb_ih[LB], cb_iw[LB];
+uint cb_ok[LB], cb_p0[LB];
+
+float gemm_act_c(float v) {
+    if (ACT == LACT_RELU) return max(v, 0.0);
+    if (ACT == LACT_SILU) return v / (1.0 + exp(-v));
+    return v;
+}
+
+uvec4 bf16x8_to_f16x8(uvec4 w) {
+    uvec4 o;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const vec2 f = vec2(uintBitsToFloat(w[i] << 16), uintBitsToFloat(w[i] & 0xffff0000u));
+        o[i] = packFloat2x16(f16vec2(f));
+    }
+    return o;
+}
+
+uint bf16_to_f16_bits(uint b) {
+    return uint(float16BitsToUint16(float16_t(uintBitsToFloat(b << 16))));
+}
+
+uvec4 load8_scalar(uint64_t base, uint row, bool row_ok, uint col) {
+    if (!row_ok || col >= pc.k) return uvec4(0);
+    const uint idx = row * pc.k + col;
+    float v[8];
+    [[unroll]] for (uint e = 0; e < 8; ++e) v[e] = (col + e < pc.k) ? load_elem(DT, base, idx + e) : 0.0;
+    return uvec4(packFloat2x16(f16vec2(v[0], v[1])), packFloat2x16(f16vec2(v[2], v[3])),
+                 packFloat2x16(f16vec2(v[4], v[5])), packFloat2x16(f16vec2(v[6], v[7])));
+}
+
+void init_b_pixels(uint n0) {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint j = 0; j < LB; ++j) {
+        const uint i = tid + j * WG, q = i % CB;
+        const uint p0 = n0 + q * 8u;
+        cb_p0[j] = p0;
+        const uint oh = p0 / pc.wo, ow = p0 % pc.wo;
+        cb_ih[j] = int(oh) * SH - PH;
+        cb_iw[j] = int(ow) * SW - PW;
+        uint ok = 0u;
+        [[unroll]] for (uint e = 0; e < 8; ++e) ok |= (p0 + e < pc.n) ? (1u << e) : 0u;
+        cb_ok[j] = ok;
+    }
+}
+
+void load_tiles(uint64_t A, uint64_t X, uint m0, uint k0) {
+    const uint tid = gl_LocalInvocationID.x;
+    va = 0u;
+    [[unroll]] for (uint j = 0; j < LA; ++j) {
+        const uint i = tid + j * WG, r = i / CA, q = i % CA;
+        const uint row = m0 + r, col = k0 + q * 8u;
+        if (AVEC != 0) {
+            const bool ok = row < pc.m && col < pc.k;
+            ra[j] = U4Buf(A).v[ok ? (row * pc.k + col) / 8u : 0u];
+            va |= ok ? (1u << j) : 0u;
+        } else {
+            ra[j] = load8_scalar(A, row, row < pc.m, col);
+        }
+    }
+    const int H = int(pc.h), W = int(pc.wd), WO = int(pc.wo);
+    if (BVEC == 1) {
+        [[unroll]] for (uint j = 0; j < LB; ++j) {
+            const uint kk = k0 + (tid + j * WG) / CB;
+            const bool v = kk < pc.k && cb_ok[j] != 0u;
+            rbv[j] = U4Buf(X).v[v ? (kk * pc.n + cb_p0[j]) / 8u : 0u];
+            vb[j] = v ? 0xffu : 0u;
+        }
+        return;
+    }
+    if (BVEC == 2) {
+        const int W8 = W / 8;
+        [[unroll]] for (uint j = 0; j < LB; ++j) {
+            const uint kk = k0 + (tid + j * WG) / CB;
+            const int ic = int(kk) / KHW, t = int(kk) % KHW;
+            const int ih = cb_ih[j] + (t / KW) * DH;
+            const int iw0 = cb_iw[j] + (t % KW) * DW;
+            const bool rok = kk < pc.k && ih >= 0 && ih < H && cb_ok[j] != 0u;
+            const int sft = iw0 & 7;
+            const int q0 = (iw0 - sft) / 8;
+            const uint rowq = (uint(ic) * pc.h + uint(max(ih, 0))) * uint(W8);
+            const bool v0 = rok && q0 >= 0 && q0 < W8, v1 = rok && q0 + 1 >= 0 && q0 + 1 < W8;
+            rbv[j] = U4Buf(X).v[v0 ? rowq + uint(q0) : 0u];
+            rbv2[j] = U4Buf(X).v[v1 ? rowq + uint(q0 + 1) : 0u];
+            const int lo = clamp(-iw0, 0, 8), hi = clamp(W - iw0, 0, 8);
+            const uint m = (rok && hi > lo) ? (((1u << uint(hi)) - 1u) & ~((1u << uint(lo)) - 1u)) : 0u;
+            vb[j] = m | (uint(sft) << 8);
+        }
+        return;
+    }
+    [[unroll]] for (uint j = 0; j < LB; ++j) {
+        const uint i = tid + j * WG, r = i / CB;
+        const uint kk = k0 + r;
+        const bool kok = kk < pc.k;
+        const int ic = int(kk) / KHW, t = int(kk) % KHW;
+        const int kh = t / KW, kw = t % KW;
+        const int ihb = cb_ih[j] + kh * DH;
+        const int iwb = cb_iw[j] + kw * DW;
+        const uint cbase = uint(ic) * pc.h;
+        uint ok = 0u;
+        if (ROWCH != 0) {
+            const bool rok = kok && ihb >= 0 && ihb < H && cb_ok[j] != 0u;
+            const uint rowbase = (cbase + uint(ihb)) * pc.wd;
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                const int iw = iwb + int(e) * SW;
+                const bool v = rok && iw >= 0 && iw < W;
+                rb[j * 8u + e] = U16Buf(X).v[v ? rowbase + uint(iw) : 0u];
+                ok |= v ? (1u << e) : 0u;
+            }
+        } else {
+            // The chunk may wrap onto following output rows (W_out % 8 != 0).
+            int ih = ihb, iw = iwb, ow = (cb_iw[j] + PW) / SW;
+            [[unroll]] for (uint e = 0; e < 8; ++e) {
+                const bool v = kok && (cb_ok[j] & (1u << e)) != 0u && ih >= 0 && ih < H && iw >= 0 && iw < W;
+                rb[j * 8u + e] = U16Buf(X).v[v ? (cbase + uint(ih)) * pc.wd + uint(iw) : 0u];
+                ok |= v ? (1u << e) : 0u;
+                ++ow;
+                iw += SW;
+                while (ow >= WO) { ow -= WO; iw -= WO * SW; ih += SH; }
+            }
+        }
+        vb[j] = ok;
+    }
+}
+
+void store_tiles(uint buf) {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint j = 0; j < LA; ++j) {
+        const uint i = tid + j * WG;
+        uvec4 h = ra[j];
+        if (AVEC != 0) {
+            if (DT == DT_BF16) h = bf16x8_to_f16x8(h);
+            if ((va & (1u << j)) == 0u) h = uvec4(0);
+        }
+        As[buf * ASZ + (i / CA) * SKA + i % CA] = h;
+    }
+    if (BVEC == 1) {
+        [[unroll]] for (uint j = 0; j < LB; ++j) {
+            const uint i = tid + j * WG;
+            const uvec4 h = DT == DT_BF16 ? bf16x8_to_f16x8(rbv[j]) : rbv[j];
+            Bs[buf * BSZ + (i / CB) * SKB + i % CB] = vb[j] != 0u ? h : uvec4(0);
+        }
+        return;
+    }
+    if (BVEC == 2) {
+        [[unroll]] for (uint j = 0; j < LB; ++j) {
+            const uint i = tid + j * WG;
+            const uint u[8] = uint[8](rbv[j].x, rbv[j].y, rbv[j].z, rbv[j].w,
+                                      rbv2[j].x, rbv2[j].y, rbv2[j].z, rbv2[j].w);
+            const uint sft = (vb[j] >> 8) & 7u, a = sft >> 1;
+            uvec4 h;
+            [[unroll]] for (uint q = 0; q < 4u; ++q) {
+                const uint w0 = a == 0u ? u[q] : (a == 1u ? u[q + 1u] : (a == 2u ? u[q + 2u] : u[q + 3u]));
+                const uint w1 = a == 0u ? u[q + 1u] : (a == 1u ? u[q + 2u] : (a == 2u ? u[q + 3u] : u[q + 4u]));
+                h[q] = (sft & 1u) != 0u ? (w0 >> 16) | (w1 << 16) : w0;
+            }
+            if (DT == DT_BF16) h = bf16x8_to_f16x8(h);
+            [[unroll]] for (uint q = 0; q < 4u; ++q) {
+                const uint mm = ((vb[j] >> (2u * q)) & 1u) * 0xffffu | ((vb[j] >> (2u * q + 1u)) & 1u) * 0xffff0000u;
+                h[q] &= mm;
+            }
+            Bs[buf * BSZ + (i / CB) * SKB + i % CB] = h;
+        }
+        return;
+    }
+    [[unroll]] for (uint j = 0; j < LB; ++j) {
+        const uint i = tid + j * WG;
+        uint w4[4];
+        [[unroll]] for (uint e = 0; e < 8; e += 2) {
+            uint lo = uint(rb[j * 8u + e]), hi = uint(rb[j * 8u + e + 1u]);
+            if (DT == DT_BF16) { lo = bf16_to_f16_bits(lo); hi = bf16_to_f16_bits(hi); }
+            lo = (vb[j] & (1u << e)) != 0u ? lo : 0u;
+            hi = (vb[j] & (2u << e)) != 0u ? hi : 0u;
+            w4[e / 2u] = lo | (hi << 16);
+        }
+        Bs[buf * BSZ + (i / CB) * SKB + i % CB] = uvec4(w4[0], w4[1], w4[2], w4[3]);
+    }
+}
+
+float scratch(uint base, uint e) { return uintBitsToFloat(As[base + e / 4u][e % 4u]); }
+
+void main() {
+    const uint z = gl_WorkGroupID.z;
+    const uint img = z / pc.groups, g = z % pc.groups;
+    const uint P = pc.n;
+    const uint64_t X = pc.x + 2ul * (uint64_t(img) * uint64_t(pc.cin) + uint64_t(g) * uint64_t(pc.cin / pc.groups)) *
+                                  uint64_t(pc.h) * uint64_t(pc.wd);
+    const uint64_t A = pc.w + 2ul * uint64_t(g) * uint64_t(pc.m) * uint64_t(pc.k);
+    const uint64_t C = pc.y + 2ul * (uint64_t(img) * uint64_t(pc.cout) + uint64_t(g) * uint64_t(pc.m)) * uint64_t(P);
+    const uint64_t BIASP = pc.bias + 2ul * uint64_t(g) * uint64_t(pc.m);
+    const uint m0 = (gl_WorkGroupID.y + pc.tm0) * BM;
+    const uint n0 = (gl_WorkGroupID.x + pc.tn0) * BN;
+    const uint sg = gl_SubgroupID;
+    const uint wm0 = (sg % (BM / WM)) * WM, wn0 = (sg / (BM / WM)) * WN;
+    const uint nk = (pc.k + BK - 1u) / BK;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[TM * TN];
+    [[unroll]] for (uint i = 0; i < TM * TN; ++i)
+        acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    init_b_pixels(n0);
+    load_tiles(A, X, m0, 0u);
+    store_tiles(0u);
+    barrier();
+
+    for (uint kt = 0; kt < nk; ++kt) {
+        const uint cur = kt & 1u;
+        if (kt + 1u < nk) load_tiles(A, X, m0, (kt + 1u) * BK);
+        [[unroll]] for (uint kk = 0; kk < BK / 16u; ++kk) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa[TM];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb[TN];
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                coopMatLoad(fa[i], As, cur * ASZ + (wm0 + i * 16u) * SKA + kk * 2u, SKA,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint j = 0; j < TN; ++j)
+                coopMatLoad(fb[j], Bs, cur * BSZ + kk * 16u * SKB + (wn0 + j * 16u) / 8u, SKB,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                [[unroll]] for (uint j = 0; j < TN; ++j)
+                    acc[i * TN + j] = coopMatMulAdd(fa[i], fb[j], acc[i * TN + j]);
+        }
+        if (kt + 1u < nk) store_tiles(cur ^ 1u);
+        barrier();
+    }
+
+    // Fragment-form epilogue: FP16 output, interior tiles, aligned Y rows.
+    // The bias is a fragment loaded column-major with stride 0, so every
+    // column holds bias[m .. m + 16) (the per-row bias of a convolution).
+    if (DIRECT != 0) {
+        [[unroll]] for (uint i = 0; i < TM; ++i) {
+            [[unroll]] for (uint j = 0; j < TN; ++j) {
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> r = acc[i * TN + j];
+                const uint row = m0 + wm0 + i * 16u, col = n0 + wn0 + j * 16u;
+                if (BIAS != 0) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> bb;
+                    coopMatLoad(bb, F16Buf(BIASP).v, row, 0u, gl_CooperativeMatrixLayoutColumnMajor);
+                    r += coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(bb);
+                }
+                if (ACT != LACT_NONE) {
+                    for (int e = 0; e < r.length(); ++e) r[e] = gemm_act_c(r[e]);
+                }
+                if (ACCUM != 0) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> old;
+                    coopMatLoad(old, F16Buf(C).v, row * P + col, P, gl_CooperativeMatrixLayoutRowMajor);
+                    r += coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(old);
+                }
+                coopMatStore(coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(r),
+                             F16Buf(C).v, row * P + col, P, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        return;
+    }
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sbase = sg * 128u;
+    [[unroll]] for (uint i = 0; i < TM; ++i) {
+        [[unroll]] for (uint j = 0; j < TN; ++j) {
+            coopMatStore(acc[i * TN + j], As, sbase, 4u, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            const uint gm0 = m0 + wm0 + i * 16u;
+            for (uint e = lane; e < 256u; e += gl_SubgroupSize) {
+                const uint gm = gm0 + e / 16u, gn = n0 + wn0 + j * 16u + e % 16u;
+                if (gm < pc.m && gn < P) {
+                    float v = scratch(sbase, e);
+                    if (BIAS != 0) v += load_elem(DT, BIASP, gm);
+                    v = gemm_act_c(v);
+                    if (ACCUM != 0) v += load_elem(DT, C, gm * P + gn);
+                    store_elem(DT, C, gm * P + gn, v);
+                }
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+    }
+}

@@ -1,0 +1,212 @@
+#version 460
+// NCHW resampling and pooling, FP32 arithmetic, X / Y in -DDT. Spec
+// constant 0 = RS_* (op_codes.h). Invocation x is one output position of a
+// plane (oh, ow); it walks CPT channels of image z starting at channel
+// y * CPT, so the per-position work (source coordinates, tap weights, the
+// convex softmax) is done once and reused across channels.
+//
+// Source coordinates are exact rationals, not floating point: half-pixel
+// (align_corners = false) is src = ((2 o + 1) in - out) / (2 out), corner-
+// aligned is src = o (in - 1) / (out - 1). floor and round-half-to-even are
+// taken on the rational in 64-bit integers, which is what the CPU / HIP
+// reference computes in double for every shape where the double rounding
+// does not land on the wrong side of a tie (the fraction is FP32 either way).
+#include "common.glsl"
+#include "op_codes.h"
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+layout(constant_id = 1) const uint CPT = 16;
+layout(constant_id = 2) const uint ALIGN = 0;   // RS_INTERP: corner-aligned coordinates
+layout(constant_id = 3) const uint IMODE = 0;   // RS_INTERP: 0 nearest, 1 bilinear, 2 / 3 bicubic
+
+layout(push_constant) uniform PC {
+    uint64_t x, y, aux;      // aux: max-pool Idx (INT32) / convex Mask
+    uint c, hi, wi, ho, wo;
+    uint kh, kw;             // max pool kernel; convex: scale
+    int sh, sw, ph, pw;
+} pc;
+
+// floor(num / den) and the remainder in [0, den), den > 0.
+int64_t floor_div(int64_t num, int64_t den, out int64_t rem) {
+    int64_t q = num / den;
+    int64_t r = num - q * den;
+    if (r < 0) { q -= 1; r += den; }
+    rem = r;
+    return q;
+}
+
+// Source coordinate of output index o along an axis as num / den.
+void src_rational(uint o, uint in_dim, uint out_dim, out int64_t num, out int64_t den) {
+    if (ALIGN != 0) {
+        num = out_dim > 1u ? int64_t(o) * int64_t(in_dim - 1u) : 0l;
+        den = out_dim > 1u ? int64_t(out_dim - 1u) : 1l;
+    } else {
+        num = int64_t(2u * o + 1u) * int64_t(in_dim) - int64_t(out_dim);
+        den = 2l * int64_t(out_dim);
+    }
+}
+
+int clampi(int v, int hi) { return clamp(v, 0, hi); }
+
+// Taps along one axis: up to 4 clamped indices and weights. nearest: one
+// tap; bilinear: i0, i1 and the fraction in w[0]; bicubic: Keys kernel.
+void axis_taps(uint o, uint in_dim, uint out_dim, out int idx[4], out float w[4]) {
+    int64_t num, den, rem;
+    src_rational(o, in_dim, out_dim, num, den);
+    const int i0 = int(floor_div(num, den, rem));
+    const int last = int(in_dim) - 1;
+    if (IMODE == 0) {
+        const int64_t twice = 2l * rem;
+        const int r = twice > den ? i0 + 1 : (twice < den ? i0 : i0 + (i0 & 1));
+        idx[0] = clampi(r, last);
+        idx[1] = idx[2] = idx[3] = idx[0];
+        w[0] = 1.0; w[1] = w[2] = w[3] = 0.0;
+        return;
+    }
+    const float f = float(rem) / float(den);
+    if (IMODE == 1) {
+        idx[0] = clampi(i0, last);
+        idx[1] = clampi(i0 + 1, last);
+        idx[2] = idx[3] = idx[1];
+        w[0] = f; w[1] = w[2] = w[3] = 0.0;
+        return;
+    }
+    const float a = IMODE == 3 ? -0.75 : -0.5;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        const float t = abs(f - float(k - 1));
+        w[k] = t < 1.0 ? ((a + 2.0) * t - (a + 3.0)) * t * t + 1.0
+             : (t < 2.0 ? ((a * t - 5.0 * a) * t + 8.0 * a) * t - 4.0 * a : 0.0);
+        idx[k] = clampi(i0 + k - 1, last);
+    }
+}
+
+// PyTorch's adaptive window [floor(o in / out), ceil((o + 1) in / out)).
+void adaptive(uint o, uint in_dim, uint out_dim, out uint a, out uint b) {
+    a = (o * in_dim) / out_dim;
+    b = ((o + 1u) * in_dim + out_dim - 1u) / out_dim;
+}
+
+void main() {
+    const uint plane_o = pc.ho * pc.wo, plane_i = pc.hi * pc.wi;
+    const uint img = gl_WorkGroupID.z;
+    const uint c0 = gl_WorkGroupID.y * CPT;
+    const uint c1 = min(c0 + CPT, pc.c);
+    for (uint p = gl_GlobalInvocationID.x; p < plane_o; p += GRID_STRIDE_X) {
+        const uint oh = p / pc.wo, ow = p % pc.wo;
+        if (MODE == RS_INTERP) {
+            int iy[4], ix[4];
+            float wy[4], wx[4];
+            axis_taps(oh, pc.hi, pc.ho, iy, wy);
+            axis_taps(ow, pc.wi, pc.wo, ix, wx);
+            for (uint c = c0; c < c1; ++c) {
+                const uint xb = (img * pc.c + c) * plane_i;
+                float v;
+                if (IMODE == 0) {
+                    v = load_elem(DT, pc.x, xb + uint(iy[0]) * pc.wi + uint(ix[0]));
+                } else if (IMODE == 1) {
+                    const float v00 = load_elem(DT, pc.x, xb + uint(iy[0]) * pc.wi + uint(ix[0]));
+                    const float v01 = load_elem(DT, pc.x, xb + uint(iy[0]) * pc.wi + uint(ix[1]));
+                    const float v10 = load_elem(DT, pc.x, xb + uint(iy[1]) * pc.wi + uint(ix[0]));
+                    const float v11 = load_elem(DT, pc.x, xb + uint(iy[1]) * pc.wi + uint(ix[1]));
+                    const float top = v00 + (v01 - v00) * wx[0];
+                    const float bot = v10 + (v11 - v10) * wx[0];
+                    v = top + (bot - top) * wy[0];
+                } else {
+                    v = 0.0;
+                    [[unroll]] for (int j = 0; j < 4; ++j) {
+                        float row = 0.0;
+                        [[unroll]] for (int i = 0; i < 4; ++i)
+                            row += wx[i] * load_elem(DT, pc.x, xb + uint(iy[j]) * pc.wi + uint(ix[i]));
+                        v += wy[j] * row;
+                    }
+                }
+                store_elem(DT, pc.y, (img * pc.c + c) * plane_o + p, v);
+            }
+        } else if (MODE == RS_DOWN_AVG2) {
+            for (uint c = c0; c < c1; ++c) {
+                const uint b = (img * pc.c + c) * plane_i + (2u * oh) * pc.wi + 2u * ow;
+                const float s = load_elem(DT, pc.x, b) + load_elem(DT, pc.x, b + 1u) +
+                                load_elem(DT, pc.x, b + pc.wi) + load_elem(DT, pc.x, b + pc.wi + 1u);
+                store_elem(DT, pc.y, (img * pc.c + c) * plane_o + p, 0.25 * s);
+            }
+        } else if (MODE == RS_UP_NEAREST2_BWD) {   // y = dX (H, W), x = dY (2H, 2W)
+            for (uint c = c0; c < c1; ++c) {
+                const uint b = (img * pc.c + c) * plane_i + (2u * oh) * pc.wi + 2u * ow;
+                float s = 0.0;
+                s += load_elem(DT, pc.x, b);
+                s += load_elem(DT, pc.x, b + 1u);
+                s += load_elem(DT, pc.x, b + pc.wi);
+                s += load_elem(DT, pc.x, b + pc.wi + 1u);
+                store_elem(DT, pc.y, (img * pc.c + c) * plane_o + p, s);
+            }
+        } else if (MODE == RS_DOWN_AVG2_BWD) {     // y = dX (2H, 2W), x = dY (H, W)
+            for (uint c = c0; c < c1; ++c) {
+                const float g = load_elem(DT, pc.x, (img * pc.c + c) * plane_i + (oh / 2u) * pc.wi + ow / 2u);
+                store_elem(DT, pc.y, (img * pc.c + c) * plane_o + p, 0.25 * g);
+            }
+        } else if (MODE == RS_ADAPTIVE_AVG) {
+            uint h0, h1, w0, w1;
+            adaptive(oh, pc.hi, pc.ho, h0, h1);
+            adaptive(ow, pc.wi, pc.wo, w0, w1);
+            const float inv_area = 1.0 / float((h1 - h0) * (w1 - w0));
+            for (uint c = c0; c < c1; ++c) {
+                const uint xb = (img * pc.c + c) * plane_i;
+                float s = 0.0;
+                for (uint h = h0; h < h1; ++h)
+                    for (uint w = w0; w < w1; ++w) s += load_elem(DT, pc.x, xb + h * pc.wi + w);
+                store_elem(DT, pc.y, (img * pc.c + c) * plane_o + p, s * inv_area);
+            }
+        } else if (MODE == RS_MAXPOOL) {
+            const int hb = int(oh) * pc.sh - pc.ph, wb = int(ow) * pc.sw - pc.pw;
+            for (uint c = c0; c < c1; ++c) {
+                const uint xb = (img * pc.c + c) * plane_i;
+                float best = uintBitsToFloat(0xff800000u);
+                int bi = -1;
+                for (uint a = 0; a < pc.kh; ++a) {
+                    const int ih = hb + int(a);
+                    if (ih < 0 || ih >= int(pc.hi)) continue;
+                    for (uint b = 0; b < pc.kw; ++b) {
+                        const int iw = wb + int(b);
+                        if (iw < 0 || iw >= int(pc.wi)) continue;
+                        const float v = load_elem(DT, pc.x, xb + uint(ih) * pc.wi + uint(iw));
+                        if (v > best) { best = v; bi = ih * int(pc.wi) + iw; }
+                    }
+                }
+                const uint o = (img * pc.c + c) * plane_o + p;
+                store_elem(DT, pc.y, o, best);
+                I32Buf(pc.aux).v[o] = bi;
+            }
+        } else if (MODE == RS_CONVEX) {
+            // Fine pixel (oh, ow) = (s y + sy, s x + sx); softmax over the 9
+            // neighbours of the mask channel (m s^2 + sy s + sx).
+            const uint s = pc.kh, kk = s * s;
+            const uint y = oh / s, sy = oh % s, x = ow / s, sx = ow % s;
+            const uint pix = y * pc.wi + x, sub = sy * s + sx;
+            const uint mb = img * 9u * kk * plane_i;
+            float m[9];
+            float mx = uintBitsToFloat(0xff800000u);
+            [[unroll]] for (uint j = 0; j < 9u; ++j) {
+                m[j] = load_elem(DT, pc.aux, mb + (j * kk + sub) * plane_i + pix);
+                mx = max(mx, m[j]);
+            }
+            float sum = 0.0;
+            [[unroll]] for (uint j = 0; j < 9u; ++j) { m[j] = exp(m[j] - mx); sum += m[j]; }
+            const float inv = 1.0 / sum;
+            uint nb[9];
+            [[unroll]] for (uint j = 0; j < 9u; ++j) {
+                const int ny = clampi(int(y) - 1 + int(j / 3u), int(pc.hi) - 1);
+                const int nx = clampi(int(x) - 1 + int(j % 3u), int(pc.wi) - 1);
+                nb[j] = uint(ny) * pc.wi + uint(nx);
+                m[j] *= inv;
+            }
+            for (uint c = c0; c < c1; ++c) {
+                const uint xb = (img * pc.c + c) * plane_i;
+                float acc = 0.0;
+                [[unroll]] for (uint j = 0; j < 9u; ++j) acc += m[j] * load_elem(DT, pc.x, xb + nb[j]);
+                store_elem(DT, pc.y, (img * pc.c + c) * plane_o + p, acc);
+            }
+        }
+    }
+}

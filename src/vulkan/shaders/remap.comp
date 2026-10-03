@@ -1,0 +1,133 @@
+#version 460
+// Pure gathers on NCHW tensors: every output element copies one input element
+// (or writes zero), bit for bit, so one kernel per element size (-DES=2 / 4)
+// serves every dtype. Spec constant 0 = RM_* (op_codes.h).
+//
+// Invocation x is one position (oh, ow) of an output plane (ho x wo); it
+// walks CPT output channels of output image z starting at channel y * CPT,
+// so the position's decode (pad source, window, block) is done once. What a
+// plane, a channel and an image are for each mode is in the switch below.
+#include "common.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+layout(constant_id = 1) const uint CPT = 16;
+
+layout(push_constant) uniform PC {
+    uint64_t x, y, idx;      // idx: INT32 row indices (RM_GATHER_ROWS / RM_SCATTER_ROWS)
+    uint c, cin;             // output / input channels per image
+    uint hi, wi, ho, wo;     // input / output plane
+    int a0, a1, a2, a3, a4, a5, a6;
+} pc;
+
+#if ES == 2
+#define ELEM uint16_t
+#define LOAD(I_) U16Buf(pc.x).v[I_]
+#define STORE(I_, V_) U16Buf(pc.y).v[I_] = (V_)
+#else
+#define ELEM uint
+#define LOAD(I_) U32Buf(pc.x).v[I_]
+#define STORE(I_, V_) U32Buf(pc.y).v[I_] = (V_)
+#endif
+
+// Source index along one axis for output coordinate p of a padded axis:
+// -1 for a zero slot. 0 zero, 1 reflect (no edge repeat), 2 replicate.
+int pad_src(int rel, int L, int mode) {
+    if (rel >= 0 && rel < L) return rel;
+    if (mode == 0) return -1;
+    if (mode == 2) return rel < 0 ? 0 : L - 1;
+    if (L == 1) return 0;
+    const int period = 2 * (L - 1);
+    int q = rel % period;
+    if (q < 0) q += period;
+    return q < L ? q : period - q;
+}
+
+void main() {
+    const uint plane_o = pc.ho * pc.wo, plane_i = pc.hi * pc.wi;
+    const uint img = gl_WorkGroupID.z;
+    const uint c0 = gl_WorkGroupID.y * CPT;
+    const uint c1 = min(c0 + CPT, pc.c);
+    for (uint p = gl_GlobalInvocationID.x; p < plane_o; p += GRID_STRIDE_X) {
+        const int oh = int(p / pc.wo), ow = int(p % pc.wo);
+        const uint obase = img * pc.c * plane_o + p;
+        if (MODE == RM_PAD || MODE == RM_SLICE || MODE == RM_UP2 || MODE == RM_WIN_PART || MODE == RM_WIN_REV) {
+            // Same channel in and out; the source plane position is fixed.
+            int sh, sw;
+            uint ibase;
+            if (MODE == RM_PAD) {
+                sh = pad_src(oh - pc.a0, int(pc.hi), pc.a2);
+                sw = pad_src(ow - pc.a1, int(pc.wi), pc.a2);
+                ibase = img * pc.cin * plane_i;
+            } else if (MODE == RM_SLICE) {
+                sh = oh + pc.a0;
+                sw = ow + pc.a1;
+                ibase = img * pc.cin * plane_i;
+            } else if (MODE == RM_UP2) {
+                sh = oh / 2;
+                sw = ow / 2;
+                ibase = img * pc.cin * plane_i;
+            } else if (MODE == RM_WIN_PART) {   // image = window b = (n, wh, ww), plane = win x win
+                const uint per = uint(pc.a1 * pc.a2);
+                const uint n = img / per, r = img % per;
+                sh = int(r / uint(pc.a2)) * pc.a0 + oh;
+                sw = int(r % uint(pc.a2)) * pc.a0 + ow;
+                ibase = n * pc.cin * plane_i;
+            } else {                            // RM_WIN_REV: image n, plane H x W, input rows = windows
+                const int win = pc.a0;
+                const uint b = (img * uint(pc.a1) + uint(oh / win)) * uint(pc.a2) + uint(ow / win);
+                sh = oh % win;
+                sw = ow % win;
+                ibase = b * pc.cin * plane_i;
+            }
+            const bool ok = sh >= 0 && sw >= 0;
+            const uint ip = ok ? uint(sh) * pc.wi + uint(sw) : 0u;
+            for (uint c = c0; c < c1; ++c) {
+                ELEM v = ELEM(0);
+                if (ok) v = LOAD(ibase + c * plane_i + ip);
+                STORE(obase + c * plane_o, v);
+            }
+        } else if (MODE == RM_UNFOLD) {   // output channel = c * kK + (ky * kW + kx)
+            const int kH = pc.a0, kW = pc.a1, kK = kH * kW;
+            const int yb = oh * pc.a2 - pc.a4, xb = ow * pc.a3 - pc.a5;
+            for (uint c = c0; c < c1; ++c) {
+                const int ci = int(c) / kK, k = int(c) % kK;
+                const int sy = pad_src(yb + k / kW, int(pc.hi), pc.a6);
+                const int sx = pad_src(xb + k % kW, int(pc.wi), pc.a6);
+                ELEM v = ELEM(0);
+                if (sy >= 0 && sx >= 0) v = LOAD((img * pc.cin + uint(ci)) * plane_i + uint(sy) * pc.wi + uint(sx));
+                STORE(obase + c * plane_o, v);
+            }
+        } else if (MODE == RM_MERGE2) {   // a0 = channel_major
+            for (uint c = c0; c < c1; ++c) {
+                uint blk, ci;
+                if (pc.a0 != 0) { ci = c / 4u; blk = c % 4u; } else { blk = c / pc.cin; ci = c % pc.cin; }
+                const uint ih = 2u * uint(oh) + blk / 2u, iw = 2u * uint(ow) + blk % 2u;
+                STORE(obase + c * plane_o, LOAD((img * pc.cin + ci) * plane_i + ih * pc.wi + iw));
+            }
+        } else if (MODE == RM_PSHUF) {    // a0 = repeats
+            const uint i = uint(oh) % 2u, j = uint(ow) % 2u;
+            const uint ip = (uint(oh) / 2u) * pc.wi + uint(ow) / 2u;
+            for (uint c = c0; c < c1; ++c) {
+                const uint sc = (4u * c + 2u * i + j) / uint(pc.a0);
+                STORE(obase + c * plane_o, LOAD((img * pc.cin + sc) * plane_i + ip));
+            }
+        } else if (MODE == RM_GATHER_ROWS) {   // image = output row m, plane = 1 x cols; a0 = rows of X
+            const int r = clamp(I32Buf(pc.idx).v[img], 0, pc.a0 - 1);
+            STORE(img * pc.wo + p, LOAD(uint(r) * pc.wo + p));
+        } else if (MODE == RM_SCATTER_ROWS) {  // image = source row m; rows outside [0, a0) are skipped
+            const int r = I32Buf(pc.idx).v[img];
+            if (r >= 0 && r < pc.a0) STORE(uint(r) * pc.wo + p, LOAD(img * pc.wo + p));
+        } else if (MODE == RM_PATCH) {    // a0 = P, a1 = C_total, a2 = channel_major, a3 = wp
+            const uint P = uint(pc.a0), PP = P * P;
+            const uint tok = (uint(oh) / P) * uint(pc.a3) + uint(ow) / P;
+            const uint blk = (uint(oh) % P) * P + uint(ow) % P;
+            const uint row = tok * PP * uint(pc.a1);
+            for (uint c = c0; c < c1; ++c) {
+                const uint col = pc.a2 != 0 ? c * PP + blk : blk * uint(pc.a1) + c;
+                STORE(obase + c * plane_o, LOAD(row + col));
+            }
+        }
+    }
+}

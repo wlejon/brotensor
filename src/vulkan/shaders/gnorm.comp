@@ -1,0 +1,190 @@
+#version 460
+// NCHW normalisations: GroupNorm (two kernels), BatchNorm with running
+// statistics, the per-pixel L2 normalise over channels, and the per-channel
+// sum a convolution's bias gradient is. FP32 arithmetic,
+// X / Y and the per-channel parameters in -DDT. Spec constant 0 = GN_*.
+//
+// GroupNorm splits each (sample, group) tile, which is contiguous in NCHW
+// (cpg channels x H W), into chunks so that even one sample fills the GPU:
+//   GN_STATS  workgroup (s, t) reduces chunk s of tile t to (count, mean, M2)
+//             in one pass of sums shifted by the chunk's first element,
+//             written as 3 floats.
+//   GN_APPLY  workgroup (x, t) combines tile t's partials with Chan's
+//             formula (a tree in shared memory), then normalises its share of
+//             the tile: y = (x - mean) rstd gamma[c] + beta[c], optionally
+//             followed by SiLU (spec constant 1; the ResBlock's GN + SiLU).
+// Never E[x^2] - E[x]^2: the per-chunk sums are shifted by a sample of the
+// data and the chunks combine through their own means, so a tile whose mean
+// dwarfs its spread keeps its variance (the CPU reference's two passes).
+#include "common.glsl"
+#include "op_codes.h"
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+layout(constant_id = 1) const uint SILU = 0;
+layout(constant_id = 2) const uint V4 = 0;   // GroupNorm: 4-element loads / stores (tile, hw % 4 == 0,
+                                             // 16-byte aligned x / y)
+
+layout(push_constant) uniform PC {
+    uint64_t x, y, g, b, part, rm, rv;
+    uint tile, hw, cpg, groups;   // GroupNorm: tile = cpg * hw elements
+    uint splits, chunk;           // GN_STATS: chunks per tile and their length
+    uint total, c;                // BN / L2: element count, channels
+    float eps;
+} pc;
+
+shared float s_n[256], s_m[256], s_q[256];
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer F4Buf { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer H4Buf { f16vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer B4Buf { u16vec4 v[]; };
+
+// Elements 4 i .. 4 i + 3 (V4 kernels only).
+vec4 load4(uint64_t base, uint i) {
+    if (DT == DT_F32) return F4Buf(base).v[i];
+    if (DT == DT_F16) return vec4(H4Buf(base).v[i]);
+    const u16vec4 b = B4Buf(base).v[i];
+    return vec4(bf16_to_f32(b.x), bf16_to_f32(b.y), bf16_to_f32(b.z), bf16_to_f32(b.w));
+}
+
+void store4(uint64_t base, uint i, vec4 v) {
+    if (DT == DT_F32) { F4Buf(base).v[i] = v; return; }
+    if (DT == DT_F16) { H4Buf(base).v[i] = f16vec4(v); return; }
+    B4Buf(base).v[i] = u16vec4(f32_to_bf16(v.x), f32_to_bf16(v.y), f32_to_bf16(v.z), f32_to_bf16(v.w));
+}
+
+// (na, ma, qa) <- (na, ma, qa) + (nb, mb, qb), Chan et al.
+void chan(inout float na, inout float ma, inout float qa, float nb, float mb, float qb) {
+    const float n = na + nb;
+    if (nb == 0.0) return;
+    if (na == 0.0) { na = nb; ma = mb; qa = qb; return; }
+    const float d = mb - ma;
+    const float f = nb / n;
+    ma += d * f;
+    qa += qb + d * d * na * f;
+    na = n;
+}
+
+float wg_sum(float v) {
+    const uint t = gl_LocalInvocationID.x;
+    s_m[t] = v;
+    barrier();
+    [[unroll]] for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) s_m[t] += s_m[t + s];
+        barrier();
+    }
+    const float r = s_m[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    if (MODE == GN_STATS) {
+        const uint tile = gl_WorkGroupID.y, s = gl_WorkGroupID.x;
+        const uint base = tile * pc.tile;
+        const uint lo = s * pc.chunk, hi = min(lo + pc.chunk, pc.tile);
+        // One pass, shifted by the chunk's first element K: s1 = sum(x - K),
+        // s2 = sum((x - K)^2), M2 = s2 - s1^2 / n. K is within the data's
+        // spread of the mean, so the subtraction does not cancel the way
+        // E[x^2] - E[x]^2 does on a tile whose mean dwarfs its spread.
+        const float K = load_elem(DT, pc.x, base + lo);
+        float s1 = 0.0, s2 = 0.0;
+        if (V4 != 0) {   // lo, hi, base are multiples of 4
+            for (uint i = lo / 4u + t; i < hi / 4u; i += 256u) {
+                const vec4 d = load4(pc.x, base / 4u + i) - K;
+                s1 += (d.x + d.y) + (d.z + d.w);
+                s2 += dot(d, d);
+            }
+        } else {
+            for (uint i = lo + t; i < hi; i += 256u) {
+                const float d = load_elem(DT, pc.x, base + i) - K;
+                s1 += d;
+                s2 += d * d;
+            }
+        }
+        const float cnt = float(hi - lo);
+        s1 = wg_sum(s1);
+        s2 = wg_sum(s2);
+        const float mean = K + s1 / cnt;
+        const float q = max(s2 - s1 * (s1 / cnt), 0.0);
+        if (t == 0u) {
+            const uint o = (tile * pc.splits + s) * 3u;
+            F32Buf(pc.part).v[o] = cnt;
+            F32Buf(pc.part).v[o + 1u] = mean;
+            F32Buf(pc.part).v[o + 2u] = q;
+        }
+    } else if (MODE == GN_APPLY) {
+        const uint tile = gl_WorkGroupID.y;
+        float n = 0.0, m = 0.0, q = 0.0;
+        for (uint s = t; s < pc.splits; s += 256u) {
+            const uint o = (tile * pc.splits + s) * 3u;
+            chan(n, m, q, F32Buf(pc.part).v[o], F32Buf(pc.part).v[o + 1u], F32Buf(pc.part).v[o + 2u]);
+        }
+        s_n[t] = n; s_m[t] = m; s_q[t] = q;
+        barrier();
+        [[unroll]] for (uint s = 128u; s > 0u; s >>= 1) {
+            if (t < s) {
+                float a = s_n[t], am = s_m[t], aq = s_q[t];
+                chan(a, am, aq, s_n[t + s], s_m[t + s], s_q[t + s]);
+                s_n[t] = a; s_m[t] = am; s_q[t] = aq;
+            }
+            barrier();
+        }
+        const float mean = s_m[0];
+        const float rstd = 1.0 / sqrt(s_q[0] / s_n[0] + pc.eps);
+        const uint base = tile * pc.tile;
+        const uint c0 = (tile % pc.groups) * pc.cpg;
+        if (V4 != 0) {   // a group of 4 lies in one channel (hw % 4 == 0)
+            const uint hw4 = pc.hw / 4u;
+            for (uint i = gl_GlobalInvocationID.x; i < pc.tile / 4u; i += gl_NumWorkGroups.x * 256u) {
+                const uint ch = c0 + i / hw4;
+                const float ga = load_elem(DT, pc.g, ch) * rstd;
+                vec4 v = (load4(pc.x, base / 4u + i) - mean) * ga + load_elem(DT, pc.b, ch);
+                if (SILU != 0) v = v / (1.0 + exp(-v));
+                store4(pc.y, base / 4u + i, v);
+            }
+            return;
+        }
+        for (uint i = gl_GlobalInvocationID.x; i < pc.tile; i += gl_NumWorkGroups.x * 256u) {
+            const uint ch = c0 + i / pc.hw;
+            float v = (load_elem(DT, pc.x, base + i) - mean) * rstd;
+            v = v * load_elem(DT, pc.g, ch) + load_elem(DT, pc.b, ch);
+            if (SILU != 0) v = v / (1.0 + exp(-v));
+            store_elem(DT, pc.y, base + i, v);
+        }
+    } else if (MODE == GN_BN_INFER) {
+        for (uint i = gl_GlobalInvocationID.x; i < pc.total; i += GRID_STRIDE_X) {
+            const uint ch = (i / pc.hw) % pc.c;
+            const float a = load_elem(DT, pc.g, ch) / sqrt(load_elem(DT, pc.rv, ch) + pc.eps);
+            const float bb = load_elem(DT, pc.b, ch) - load_elem(DT, pc.rm, ch) * a;
+            store_elem(DT, pc.y, i, load_elem(DT, pc.x, i) * a + bb);
+        }
+    } else if (MODE == GN_BIAS_GRAD) {   // workgroup per channel; total = N
+        const uint ch = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+        if (ch >= pc.c) return;
+        float s = 0.0;
+        for (uint img = 0; img < pc.total; ++img) {
+            const uint base = (img * pc.c + ch) * pc.hw;
+            for (uint i = t; i < pc.hw; i += 256u) s += load_elem(DT, pc.x, base + i);
+        }
+        s = wg_sum(s);
+        if (t == 0u) store_elem(DT, pc.y, ch, load_elem(DT, pc.y, ch) + s);
+    } else if (MODE == GN_L2_NCHW) {   // total = N * hw pixels
+        for (uint i = gl_GlobalInvocationID.x; i < pc.total; i += GRID_STRIDE_X) {
+            const uint img = i / pc.hw, px = i % pc.hw;
+            const uint base = img * pc.c * pc.hw + px;
+            float ss = 0.0;
+            for (uint ch = 0; ch < pc.c; ++ch) {
+                const float v = load_elem(DT, pc.x, base + ch * pc.hw);
+                ss += v * v;
+            }
+            const float inv = 1.0 / max(sqrt(ss), pc.eps);
+            for (uint ch = 0; ch < pc.c; ++ch) {
+                const uint o = base + ch * pc.hw;
+                store_elem(DT, pc.y, o, load_elem(DT, pc.x, o) * inv);
+            }
+        }
+    }
+}

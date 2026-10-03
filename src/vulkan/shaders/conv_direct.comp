@@ -1,0 +1,85 @@
+#version 460
+// Direct convolutions, one output element per invocation (grid-stride),
+// FP32 sums, X / W / bias / Y in -DDT. The path for the shapes an implicit
+// GEMM does not suit: depthwise and narrow grouped convolutions (a handful of
+// multiply-adds per output), conv3d with a spatial output, and the transposed
+// convolution in its gather form. Spec constant 0 selects:
+//
+//   CONVD_FWD   conv2d / conv3d, NC(T)HW, OI(T)HW grouped weights:
+//               Y[n, oc, o] = bias[oc] + sum_{icl, kt, kh, kw} X[n, g Cg_in + icl, o s - p + k d]
+//                             * W[oc, icl, kt, kh, kw]
+//   CONVD_TRANS conv_transpose2d (T = 1), weights (C_in, Cg_out, kH, kW):
+//               Y[n, oc, oh, ow] = bias[oc] + sum_{icl, kh, kw : (oh + ph - kh dh) = ih sh, ih in [0, H)
+//                             (and likewise for w)} X[n, g Cg_in + icl, ih, iw] * W[g Cg_in + icl, ocl, kh, kw]
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+
+layout(push_constant) uniform PC {
+    uint64_t x, w, y, bias;
+    uint n, cin, t, h, wd, cout, to, ho, wo;
+    uint kt, kh, kw;
+    int st, sh, sw, pt, ph, pw, dt, dh, dw;
+    uint groups;
+} pc;
+
+#define CONVD_FWD   0
+#define CONVD_TRANS 1
+
+void main() {
+    const uint plane = pc.to * pc.ho * pc.wo;
+    const uint total = pc.n * pc.cout * plane;
+    const uint cgi = pc.cin / pc.groups, cgo = pc.cout / pc.groups;
+    const uint khw = pc.kh * pc.kw, kvol = pc.kt * khw;
+    const uint ivol = pc.t * pc.h * pc.wd;
+    for (uint idx = gl_GlobalInvocationID.x; idx < total; idx += GRID_STRIDE_X) {
+        const uint o = idx % plane, rest = idx / plane;
+        const uint oc = rest % pc.cout, img = rest / pc.cout;
+        const uint ow = o % pc.wo, oh = (o / pc.wo) % pc.ho, ot = o / (pc.wo * pc.ho);
+        const uint g = oc / cgo, ocl = oc % cgo;
+        float acc = pc.bias != 0 ? load_elem(DT, pc.bias, oc) : 0.0;
+        const uint xbase = (img * pc.cin + g * cgi) * ivol;
+        if (MODE == CONVD_FWD) {
+            const int t0 = int(ot) * pc.st - pc.pt, h0 = int(oh) * pc.sh - pc.ph, w0 = int(ow) * pc.sw - pc.pw;
+            for (uint icl = 0; icl < cgi; ++icl) {
+                const uint wb = (oc * cgi + icl) * kvol;
+                const uint xb = xbase + icl * ivol;
+                for (uint a = 0; a < pc.kt; ++a) {
+                    const int it = t0 + int(a) * pc.dt;
+                    if (it < 0 || it >= int(pc.t)) continue;
+                    for (uint b = 0; b < pc.kh; ++b) {
+                        const int ih = h0 + int(b) * pc.dh;
+                        if (ih < 0 || ih >= int(pc.h)) continue;
+                        const uint xr = xb + (uint(it) * pc.h + uint(ih)) * pc.wd;
+                        const uint wr = wb + a * khw + b * pc.kw;
+                        for (uint c = 0; c < pc.kw; ++c) {
+                            const int iw = w0 + int(c) * pc.dw;
+                            if (iw < 0 || iw >= int(pc.wd)) continue;
+                            acc += load_elem(DT, pc.x, xr + uint(iw)) * load_elem(DT, pc.w, wr + c);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (uint b = 0; b < pc.kh; ++b) {
+                const int nh = int(oh) + pc.ph - int(b) * pc.dh;
+                if (nh < 0 || nh % pc.sh != 0) continue;
+                const int ih = nh / pc.sh;
+                if (ih >= int(pc.h)) continue;
+                for (uint c = 0; c < pc.kw; ++c) {
+                    const int nw = int(ow) + pc.pw - int(c) * pc.dw;
+                    if (nw < 0 || nw % pc.sw != 0) continue;
+                    const int iw = nw / pc.sw;
+                    if (iw >= int(pc.wd)) continue;
+                    const uint xo = xbase + uint(ih) * pc.wd + uint(iw);
+                    for (uint icl = 0; icl < cgi; ++icl) {
+                        const uint wi = ((g * cgi + icl) * cgo + ocl) * khw + b * pc.kw + c;
+                        acc += load_elem(DT, pc.x, xo + icl * ivol) * load_elem(DT, pc.w, wi);
+                    }
+                }
+            }
+        }
+        store_elem(DT, pc.y, idx, acc);
+    }
+}

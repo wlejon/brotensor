@@ -110,4 +110,47 @@
 #define AUX_ROW_GATE    0    // y[r, c] = mask[r] >= 0.5 ? x[r, c] : 0 (FP32 x, y in DT)
 #define AUX_HEAD_MEAN   1    // y[i] = mean_h x[h * n + i]
 
+// resample.comp (spec constant 0)
+#define RS_INTERP           0    // nearest / bilinear / bicubic, half-pixel or corner-aligned
+#define RS_DOWN_AVG2        1    // 2x2 average
+#define RS_UP_NEAREST2_BWD  2    // dX = sum of the 2x2 dY block
+#define RS_DOWN_AVG2_BWD    3    // dX = dY / 4
+#define RS_ADAPTIVE_AVG     4    // adaptive average pool
+#define RS_MAXPOOL          5    // max pool + INT32 flat-spatial argmax
+#define RS_CONVEX           6    // RAFT convex upsample (softmax over 9 neighbours)
+
+// remap.comp: pure gathers (spec constant 0), bit-exact for any element size
+#define RM_PAD              0    // zero / reflect / replicate padding (and slice2d_backward)
+#define RM_SLICE            1    // crop
+#define RM_UP2              2    // nearest 2x upsample
+#define RM_UNFOLD           3    // spatial-preserving im2col
+#define RM_MERGE2           4    // 2x2 pixel-unshuffle into channels
+#define RM_PSHUF            5    // DC-AE repeat_interleave + 2x pixel shuffle
+#define RM_PATCH            6    // DiT unpatchify
+#define RM_WIN_PART         7    // SAM window partition
+#define RM_WIN_REV          8    // SAM window reverse
+#define RM_GATHER_ROWS      9    // Y[m, :] = X[clamp(Idx[m]), :]
+#define RM_SCATTER_ROWS     10   // X[Idx[m], :] = Y[m, :] (out-of-range rows skipped)
+
+// gnorm.comp (spec constant 0)
+#define GN_STATS            0    // partial (count, mean, M2) per (sample, group, split)
+#define GN_APPLY            1    // combine the partials, normalise, affine (+ SiLU)
+#define GN_BN_INFER         2    // BatchNorm with running statistics
+#define GN_L2_NCHW          3    // per-pixel L2 normalise over channels
+#define GN_BIAS_GRAD        4    // dB[c] += sum over (n, hw) of dY (conv bias gradient)
+
+// sampler.comp (spec constant 0)
+#define SMP_DDIM            0
+#define SMP_EULER           1
+#define SMP_DPMPP_2M        2
+#define SMP_TIMESTEP_EMB    3
+#define SMP_IMAGE_NORM      4    // (x - mean[c]) / std[c]
+#define SMP_U8_NHWC         5    // u8 NHWC -> NCHW, x * scale + bias
+
+// philox.comp (spec constant 0)
+#define RNG_NORMAL          0
+#define RNG_UNIFORM         1
+#define RNG_BERNOULLI       2
+#define RNG_TRUNCATED       3
+
 #endif

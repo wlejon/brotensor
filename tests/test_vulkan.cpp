@@ -336,12 +336,13 @@ void test_graph() {
 }  // namespace vkt
 
 int main(int argc, char** argv) {
-    bool expect_default_vulkan = false, bench = false, bench_attn = false, only = false;
+    bool expect_default_vulkan = false, bench = false, bench_attn = false, bench_conv = false, only = false;
     std::string filter;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--expect-default-vulkan") == 0) expect_default_vulkan = true;
         if (std::strcmp(argv[i], "--bench-gemm") == 0) bench = true;
         if (std::strcmp(argv[i], "--bench-attention") == 0) bench_attn = true;
+        if (std::strcmp(argv[i], "--bench-conv") == 0) bench_conv = true;
         if (std::strncmp(argv[i], "--only=", 7) == 0) { only = true; filter = argv[i] + 7; }
     }
     brotensor::init();
@@ -358,11 +359,17 @@ int main(int argc, char** argv) {
             vkt::run_attention_bench();
             return 0;
         }
-        if (only) {   // --only=ops|gemm|norm|attention: one op group, for iterating on a kernel
+        if (bench_conv) {
+            vkt::run_conv_bench();
+            return 0;
+        }
+        if (only) {   // --only=ops|gemm|norm|attention|conv|spatial: one op group, for iterating on a kernel
             if (filter == "ops") vkt::run_op_tests();
             if (filter == "gemm") vkt::run_gemm_tests();
             if (filter == "norm") vkt::run_norm_tests();
             if (filter == "attention") vkt::run_attention_tests();
+            if (filter == "conv") vkt::run_conv_tests();
+            if (filter == "spatial") vkt::run_spatial_tests();
             std::printf("%s: %d failure(s)\n", vkt::failures() ? "FAILED" : "OK", vkt::failures());
             return vkt::failures() ? 1 : 0;
         }
@@ -377,6 +384,8 @@ int main(int argc, char** argv) {
             vkt::run_gemm_tests();
             vkt::run_norm_tests();
             vkt::run_attention_tests();
+            vkt::run_conv_tests();
+            vkt::run_spatial_tests();
         }
     } catch (const std::exception& e) {
         std::printf("  FAIL  uncaught exception: %s\n", e.what());
