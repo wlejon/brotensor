@@ -33,6 +33,7 @@ void fill_hip_vtable_norms(::brotensor::detail::OpsVTable& v);
 void fill_hip_vtable_elementwise(::brotensor::detail::OpsVTable& v);
 void fill_hip_vtable_audio(::brotensor::detail::OpsVTable& v);
 void fill_hip_vtable_quant(::brotensor::detail::OpsVTable& v);
+void register_hip_graph_backend();
 
 } // namespace brotensor::detail::hip
 
@@ -206,4 +207,5 @@ extern "C" void brotensor_probe_and_register_hip() {
     dh::fill_hip_vtable_quant(ops);
 
     ::brotensor::detail::register_backend(DeviceType::HIP, ops, dh::hip_alloc_table());
+    dh::register_hip_graph_backend();
 }

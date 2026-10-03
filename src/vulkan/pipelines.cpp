@@ -41,13 +41,29 @@ std::size_t Pipelines::size() const {
 
 const Kernel& Pipelines::get(ShaderId id, const std::uint32_t* spec, std::uint32_t nspec,
                              std::uint32_t subgroup) {
-    Key key{static_cast<std::uint32_t>(id), subgroup,
-            std::vector<std::uint32_t>(spec, spec + nspec)};
+    return get_blob(static_cast<std::uint32_t>(id), shader_blob(id), spec, nspec, subgroup);
+}
+
+const Kernel& Pipelines::get_custom(std::uint32_t handle, const std::uint32_t* spec,
+                                    std::uint32_t nspec, std::uint32_t subgroup) {
+    {
+        // Fast path without building the blob (custom_shader_blob locks too).
+        Key key{kCustomKeyBase | handle, subgroup, std::vector<std::uint32_t>(spec, spec + nspec)};
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = kernels_.find(key);
+        if (it != kernels_.end()) return *it->second;
+    }
+    return get_blob(kCustomKeyBase | handle, custom_shader_blob(handle), spec, nspec, subgroup);
+}
+
+const Kernel& Pipelines::get_blob(std::uint32_t key_id, const ShaderBlob& blob,
+                                  const std::uint32_t* spec, std::uint32_t nspec,
+                                  std::uint32_t subgroup) {
+    Key key{key_id, subgroup, std::vector<std::uint32_t>(spec, spec + nspec)};
     std::lock_guard<std::mutex> lk(mu_);
     auto it = kernels_.find(key);
     if (it != kernels_.end()) return *it->second;
 
-    const ShaderBlob& blob = shader_blob(id);
     const PhysInfo& info = dev_.info();
     const VkPhysicalDeviceLimits& lim = info.props.limits;
 

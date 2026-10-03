@@ -38,7 +38,20 @@
 // by the graph until it is destroyed, so a replay never touches memory that
 // has been handed to someone else; allocations made while capturing come from
 // the ordinary pool. A capture covers one device and records every op issued
-// on it from any thread.
+// on it from any thread. The device-neutral CudaGraphCapture (cuda_graph.h)
+// is this capture when its device is a Vulkan one.
+//
+// Custom kernels. A library built on brotensor can ship its own compute
+// shaders for a Vulkan device, as it can MSL for Metal (metal_interop.h):
+// GLSL compiled to SPIR-V at build time by brotensor_vulkan_add_shaders()
+// (cmake/BrotensorVulkan.cmake), registered once with register_shader(), and
+// dispatched with dispatch() on the device's stream, so they order with
+// brotensor's ops and land in a graph capture like them. The contract is the
+// backend's own (docs/vulkan.md, "Dispatch model"): no descriptor sets, a
+// push-constant block of at most 128 bytes carrying tensors as 64-bit device
+// addresses (address(t)) read through GL_EXT_buffer_reference, a workgroup
+// size fixed in the shader (or by specialisation constants 0..n), and
+// shared memory within the device limit (checked before pipeline creation).
 
 #include "tensor.h"
 
@@ -109,8 +122,43 @@ struct DeviceInfo {
     bool graphics_queue = false;       // ops are submitted on a graphics+compute queue
     bool cooperative_matrix = false;   // VK_KHR_cooperative_matrix enabled
     bool subgroup_size_control = false;
+    bool shader_float64 = false;       // shaderFloat64 enabled (double in custom kernels)
 };
 DeviceInfo device_info(Device d);
+
+// ─── custom kernels ────────────────────────────────────────────────────────
+
+// A registered shader; 0 is never a valid handle.
+using ShaderHandle = std::uint32_t;
+
+// Register SPIR-V once per process (any thread). `words` must outlive the
+// process's use of the handle (embedded static data); `name` is copied and
+// appears in errors. Registering the same `words` pointer again returns the
+// existing handle. Does not need a device: pipelines are created per device
+// on first dispatch.
+ShaderHandle register_shader(const char* name, const std::uint32_t* words, std::size_t nwords);
+
+// The workgroup size of `shader` with the given specialisation constants
+// (bound to constant_id 0..n-1), creating its pipeline on `d` if needed.
+struct KernelInfo {
+    std::uint32_t local[3] = {1, 1, 1};
+    std::uint32_t shared_bytes = 0;
+};
+KernelInfo kernel_info(Device d, ShaderHandle shader, const std::uint32_t* spec = nullptr,
+                       std::uint32_t nspec = 0, std::uint32_t subgroup = 0);
+
+// Record one dispatch of `shader` on `d`'s stream with `push_bytes` (<= 128)
+// of push constants and gx * gy * gz workgroups (each <= 65535).
+// `subgroup` != 0 requires that subgroup size (see device_info()).
+void dispatch(Device d, ShaderHandle shader, const void* push, std::size_t push_bytes,
+              std::uint32_t gx, std::uint32_t gy = 1, std::uint32_t gz = 1,
+              const std::uint32_t* spec = nullptr, std::uint32_t nspec = 0,
+              std::uint32_t subgroup = 0);
+
+// A Vulkan tensor's device address (its `data`), for a push block.
+inline std::uint64_t address(const Tensor& t) {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(t.data));
+}
 
 }  // namespace vulkan
 

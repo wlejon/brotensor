@@ -1,0 +1,27 @@
+#version 460
+// Test kernel for brotensor_vulkan_add_shaders / vulkan::dispatch:
+// y[i] = a * x[i] + y[i] over n FP32 elements, in float or (F64) double.
+#ifdef F64
+#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
+#endif
+#include "common.glsl"
+
+layout(local_size_x_id = 0) in;   // workgroup size by specialisation
+
+layout(push_constant) uniform Push {
+    uint64_t x;
+    uint64_t y;
+    uint n;
+    float a;
+} pc;
+
+void main() {
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += GRID_STRIDE_X) {
+#ifdef F64
+        const double r = double(pc.a) * double(F32Buf(pc.x).v[i]) + double(F32Buf(pc.y).v[i]);
+        F32Buf(pc.y).v[i] = float(r);
+#else
+        F32Buf(pc.y).v[i] = pc.a * F32Buf(pc.x).v[i] + F32Buf(pc.y).v[i];
+#endif
+    }
+}

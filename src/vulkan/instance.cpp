@@ -89,6 +89,7 @@ bool probe_physical(const LoaderFns& f, VkPhysicalDevice pd, PhysInfo& info, std
             return false;
         }
     }
+    info.shader_float64 = f2.features.shaderFloat64 == VK_TRUE;
     info.subgroup_size_control = v13 && f13.subgroupSizeControl == VK_TRUE &&
                                  f13.computeFullSubgroups == VK_TRUE;
 
@@ -251,6 +252,9 @@ DeviceCtx::DeviceCtx(int index, const PhysInfo& info) : index_(index), info_(inf
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.shaderInt64 = VK_TRUE;
     f2.features.shaderInt16 = VK_TRUE;
+    // Not used by brotensor's kernels; enabled for custom kernels that
+    // compute in double (vulkan::register_shader, DeviceInfo::shader_float64).
+    f2.features.shaderFloat64 = info.shader_float64 ? VK_TRUE : VK_FALSE;
     f2.pNext = &f11;
 
     std::vector<const char*> exts;

@@ -186,6 +186,7 @@ add_library(brotensor_core STATIC
     src/filtered_lrelu.cpp
     src/safetensors.cpp
     src/gguf.cpp
+    src/graph.cpp
 )
 target_include_directories(brotensor_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

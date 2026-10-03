@@ -1,10 +1,34 @@
 # BrotensorVulkan.cmake — the Vulkan compute backend's build: headers, the
 # GLSL -> SPIR-V step, the embedded shader table and the brotensor_vulkan
 # static library. Included by the top-level CMakeLists.txt when
-# BROTENSOR_WITH_VULKAN is ON (it coexists with BROTENSOR_WITH_HIP).
+# BROTENSOR_WITH_VULKAN is ON (it coexists with BROTENSOR_WITH_HIP), and by
+# siblings that ship their own Vulkan kernels, the way they include
+# BrotensorHip.cmake:
 #
+#   brotensor_vulkan_prepare([REQUIRE_HEADERS])
+#                                    finds glslc (BROTENSOR_GLSLC) and the Vulkan
+#                                    headers (BROTENSOR_VULKAN_HEADERS_TARGET or
+#                                    BROTENSOR_VULKAN_INCLUDE_DIR; required only
+#                                    with REQUIRE_HEADERS: a consumer's C++ never
+#                                    needs them), and sets
+#                                    BROTENSOR_VULKAN_SHADER_INCLUDE_DIR, brotensor's
+#                                    shader directory (common.glsl & co.) for
+#                                    #include in a consumer's GLSL.
+#   brotensor_vulkan_add_shaders(<target> NAMESPACE <c++ ns> HEADER <file.h>
+#                                SOURCE_DIR <dir> SHADERS "name|file.comp|-Ddefs" ...)
+#                                    compiles a consumer's GLSL (same glslc flags as
+#                                    brotensor's, brotensor's shader dir on the include
+#                                    path) into SPIR-V embedded in <target>, with a
+#                                    generated <file.h>: `enum class Shader` and
+#                                    `brotensor::vulkan::ShaderHandle handle(Shader)`
+#                                    (registered on first use). Dispatch with
+#                                    brotensor::vulkan::dispatch (include/brotensor/vulkan.h).
 #   brotensor_vulkan_add_backend()   defines the brotensor_vulkan target and
 #                                    the defines brotensor_core needs.
+#
+# A consumer learns whether the backend is in the build from BROTENSOR_WITH_VULKAN
+# (brotensor's option, visible after add_subdirectory) or, in C++, from
+# BROTENSOR_HAS_VULKAN, which the brotensor target propagates.
 #
 # What it needs at build time:
 #   * Vulkan headers (find_package(Vulkan) -> Vulkan::Headers; any recent
@@ -24,33 +48,131 @@
 
 include_guard(GLOBAL)
 
+set(_BROTENSOR_VULKAN_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
+set(BROTENSOR_VULKAN_SHADER_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../src/vulkan/shaders")
+
+macro(brotensor_vulkan_prepare)
+    cmake_parse_arguments(_btvp "REQUIRE_HEADERS" "" "" ${ARGN})
+    if(NOT BROTENSOR_GLSLC)
+        find_program(BROTENSOR_GLSLC NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
+    endif()
+    if(NOT BROTENSOR_GLSLC)
+        message(FATAL_ERROR
+            "The Vulkan backend needs glslc (shaderc) to compile GLSL kernels to SPIR-V: "
+            "install shaderc, or pass -DBROTENSOR_GLSLC=<path to glslc>.")
+    endif()
+    set(BROTENSOR_VULKAN_HEADERS_TARGET "")
+    find_package(Vulkan QUIET)
+    if(TARGET Vulkan::Headers)
+        set(BROTENSOR_VULKAN_HEADERS_TARGET Vulkan::Headers)
+    else()
+        find_path(BROTENSOR_VULKAN_INCLUDE_DIR vulkan/vulkan.h HINTS "$ENV{VULKAN_SDK}/include")
+        if(NOT BROTENSOR_VULKAN_INCLUDE_DIR AND _btvp_REQUIRE_HEADERS)
+            message(FATAL_ERROR
+                "BROTENSOR_WITH_VULKAN needs the Vulkan headers (vulkan/vulkan.h): install "
+                "vulkan-headers (or the LunarG SDK and set VULKAN_SDK).")
+        endif()
+    endif()
+    set(BROTENSOR_VULKAN_SHADER_INCLUDE_DIR "${_BROTENSOR_VULKAN_ROOT}/src/vulkan/shaders")
+endmacro()
+
+function(brotensor_vulkan_add_shaders target)
+    cmake_parse_arguments(_a "" "NAMESPACE;HEADER;SOURCE_DIR" "SHADERS;DEPENDS" ${ARGN})
+    if(NOT _a_NAMESPACE OR NOT _a_HEADER OR NOT _a_SHADERS)
+        message(FATAL_ERROR "brotensor_vulkan_add_shaders(${target}): NAMESPACE, HEADER and SHADERS are required")
+    endif()
+    if(NOT BROTENSOR_GLSLC)
+        brotensor_vulkan_prepare()
+    endif()
+    if(NOT _a_SOURCE_DIR)
+        set(_a_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+    set(_gen "${CMAKE_CURRENT_BINARY_DIR}/${target}_vk_shaders")
+    file(MAKE_DIRECTORY "${_gen}")
+    file(GLOB _deps CONFIGURE_DEPENDS
+        "${_a_SOURCE_DIR}/*.comp" "${_a_SOURCE_DIR}/*.glsl" "${_a_SOURCE_DIR}/*.h"
+        "${BROTENSOR_VULKAN_SHADER_INCLUDE_DIR}/*.glsl" "${BROTENSOR_VULKAN_SHADER_INCLUDE_DIR}/*.h")
+    set(_incs "")
+    set(_enum "")
+    set(_blobs "")
+    set(_cases "")
+    foreach(_entry IN LISTS _a_SHADERS)
+        string(REPLACE "|" ";" _parts "${_entry}")
+        list(GET _parts 0 _name)
+        list(GET _parts 1 _file)
+        list(LENGTH _parts _np)
+        set(_defs "")
+        if(_np GREATER 2)
+            list(GET _parts 2 _defstr)
+            separate_arguments(_defs UNIX_COMMAND "${_defstr}")
+        endif()
+        set(_out "${_gen}/${_name}.inc")
+        add_custom_command(
+            OUTPUT "${_out}"
+            COMMAND "${BROTENSOR_GLSLC}" --target-env=vulkan1.2 -O -mfmt=c ${_defs}
+                    -I "${_a_SOURCE_DIR}" -I "${BROTENSOR_VULKAN_SHADER_INCLUDE_DIR}"
+                    "${_a_SOURCE_DIR}/${_file}" -o "${_out}"
+            DEPENDS ${_deps} ${_a_DEPENDS}
+            COMMENT "glslc ${target}/${_name}"
+            VERBATIM)
+        list(APPEND _incs "${_out}")
+        string(APPEND _enum "    ${_name},\n")
+        string(APPEND _blobs "const std::uint32_t k_${_name}[] =\n#include \"${_name}.inc\"\n;\n")
+        string(APPEND _cases "        case Shader::${_name}: {\n            static const auto h = reg(\"${target}/${_name}\", k_${_name}, sizeof(k_${_name}) / 4);\n            return h;\n        }\n")
+    endforeach()
+    file(CONFIGURE OUTPUT "${_gen}/${_a_HEADER}" CONTENT
+"// Generated by brotensor_vulkan_add_shaders(${target}) (brotensor's cmake/BrotensorVulkan.cmake).
+#pragma once
+#include <brotensor/vulkan.h>
+#include <cstdint>
+
+namespace @_a_NAMESPACE@ {
+
+enum class Shader : std::uint32_t {
+@_enum@};
+
+// The shader's handle for brotensor::vulkan::dispatch / kernel_info,
+// registered with brotensor on first use (thread-safe).
+brotensor::vulkan::ShaderHandle handle(Shader s);
+
+}  // namespace @_a_NAMESPACE@
+" @ONLY)
+    file(CONFIGURE OUTPUT "${_gen}/${target}_vk_shaders.cpp" CONTENT
+"// Generated by brotensor_vulkan_add_shaders(${target}): the embedded SPIR-V.
+#include \"@_a_HEADER@\"
+
+#include <cstddef>
+
+namespace @_a_NAMESPACE@ {
+
+namespace {
+@_blobs@
+brotensor::vulkan::ShaderHandle reg(const char* name, const std::uint32_t* w, std::size_t n) {
+    // register_shader returns the existing handle for the same words.
+    return brotensor::vulkan::register_shader(name, w, n);
+}
+}  // namespace
+
+brotensor::vulkan::ShaderHandle handle(Shader s) {
+    switch (s) {
+@_cases@    }
+    return 0;
+}
+
+}  // namespace @_a_NAMESPACE@
+" @ONLY)
+    target_sources(${target} PRIVATE "${_gen}/${target}_vk_shaders.cpp" ${_incs})
+    target_include_directories(${target} PRIVATE "${_gen}")
+endfunction()
+
 function(brotensor_vulkan_add_backend)
     set(_src "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan")
     set(_shader_dir "${_src}/shaders")
     set(_gen "${CMAKE_CURRENT_BINARY_DIR}/vulkan_shaders")
     file(MAKE_DIRECTORY "${_gen}")
 
-    find_package(Vulkan QUIET)
-    if(TARGET Vulkan::Headers)
-        set(_vk_headers Vulkan::Headers)
-    else()
-        find_path(BROTENSOR_VULKAN_INCLUDE_DIR vulkan/vulkan.h HINTS "$ENV{VULKAN_SDK}/include")
-        if(NOT BROTENSOR_VULKAN_INCLUDE_DIR)
-            message(FATAL_ERROR
-                "BROTENSOR_WITH_VULKAN needs the Vulkan headers (vulkan/vulkan.h): install "
-                "vulkan-headers (or the LunarG SDK and set VULKAN_SDK).")
-        endif()
-        set(_vk_headers "")
-    endif()
-
-    if(NOT BROTENSOR_GLSLC)
-        find_program(BROTENSOR_GLSLC NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
-    endif()
-    if(NOT BROTENSOR_GLSLC)
-        message(FATAL_ERROR
-            "BROTENSOR_WITH_VULKAN needs glslc (shaderc) to compile the GLSL kernels to SPIR-V: "
-            "install shaderc, or pass -DBROTENSOR_GLSLC=<path to glslc>.")
-    endif()
+    brotensor_vulkan_prepare(REQUIRE_HEADERS)
+    set(_vk_headers "${BROTENSOR_VULKAN_HEADERS_TARGET}")
 
     include("${_shader_dir}/shaders.cmake")
     file(GLOB _shader_deps CONFIGURE_DEPENDS
@@ -130,6 +252,7 @@ const ShaderBlob& shader_blob(ShaderId id) { return k_table[static_cast<std::uin
         ${_src}/spirv_reflect.cpp
         ${_src}/tensor.cpp
         ${_src}/graph.cpp
+        ${_src}/custom.cpp
         ${_src}/register.cpp
         ${_src}/ops_elementwise.cpp
         ${_src}/ops_copy.cpp

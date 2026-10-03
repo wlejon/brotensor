@@ -36,6 +36,11 @@ namespace brotensor::detail::vulkan {
 
 class DeviceCtx;
 
+// The SPIR-V of a custom kernel (custom.cpp); throws for an unknown handle.
+ShaderBlob custom_shader_blob(std::uint32_t handle);
+// Custom kernels' cache keys sit above every ShaderId.
+inline constexpr std::uint32_t kCustomKeyBase = 0x80000000u;
+
 struct Kernel {
     VkPipeline    pipe = VK_NULL_HANDLE;
     std::uint32_t local[3] = {1, 1, 1};   // workgroup size after specialisation
@@ -62,11 +67,19 @@ public:
         return get(id, spec.begin(), static_cast<std::uint32_t>(spec.size()), subgroup);
     }
 
+    // A custom kernel registered through vulkan::register_shader (custom.cpp),
+    // cached alongside the built-in ones.
+    const Kernel& get_custom(std::uint32_t handle, const std::uint32_t* spec = nullptr,
+                             std::uint32_t nspec = 0, std::uint32_t subgroup = 0);
+
     VkPipelineLayout layout() const { return layout_; }
     std::uint32_t push_bytes() const { return push_bytes_; }
     std::size_t size() const;
 
 private:
+    const Kernel& get_blob(std::uint32_t key_id, const ShaderBlob& blob, const std::uint32_t* spec,
+                           std::uint32_t nspec, std::uint32_t subgroup);
+
     struct Key {
         std::uint32_t id;
         std::uint32_t subgroup;

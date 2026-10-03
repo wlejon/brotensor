@@ -169,10 +169,16 @@ if(BROTENSOR_WITH_VULKAN)
                        test_vulkan_norm.cpp test_vulkan_attention.cpp test_vulkan_attention_ops.cpp
                        test_vulkan_conv.cpp test_vulkan_spatial.cpp test_vulkan_quant.cpp
                        test_vulkan_quant_attention.cpp test_vulkan_audio.cpp test_vulkan_sampling.cpp
-                       test_vulkan_misc.cpp test_vulkan_vision.cpp
+                       test_vulkan_misc.cpp test_vulkan_vision.cpp test_vulkan_capture.cpp
                        test_vulkan_bench.cpp test_vulkan_bench_attention.cpp test_vulkan_bench_conv.cpp
                        test_vulkan_bench_quant.cpp)
     target_link_libraries(brotensor_test_vulkan PRIVATE brotensor_vulkan_internal)
+    # Custom kernels the way a sibling ships them (cmake/BrotensorVulkan.cmake).
+    brotensor_vulkan_add_shaders(brotensor_test_vulkan
+        NAMESPACE brotensor_test_vk HEADER brotensor_test_vk_shaders.h
+        SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_shaders"
+        SHADERS "custom_axpy|custom_axpy.comp"
+                "custom_axpy_f64|custom_axpy.comp|-DF64")
     target_compile_options(brotensor_test_vulkan PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-missing-field-initializers>)
     # Device::CUDA -> Vulkan when no HIP device is visible.
     add_test(NAME brotensor_test_vulkan_cuda_alias COMMAND brotensor_test_vulkan --only=alias)
@@ -181,6 +187,10 @@ if(BROTENSOR_WITH_VULKAN)
              COMMAND brotensor_test_vulkan --expect-default-vulkan)
     set_tests_properties(brotensor_test_vulkan_default_device PROPERTIES
         ENVIRONMENT "BROTENSOR_DEFAULT_DEVICE=vulkan")
+    # The device-neutral capture with no HIP device visible (Vulkan is then the
+    # only GPU, and Device::CUDA its alias).
+    add_test(NAME brotensor_test_vulkan_capture_only COMMAND brotensor_test_vulkan --only=capture)
+    set_tests_properties(brotensor_test_vulkan_capture_only PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
 endif()
 
 if(BROTENSOR_WITH_HIP)
@@ -396,10 +406,18 @@ if(BROTENSOR_HAS_GPU)
             brotensor_add_test(brotensor_test_jit_trace_dtypes test_jit_trace_dtypes.cpp)
         endif()
     endif()
-    # Graph capture/replay: the CudaGraph API is provided by the CUDA and HIP
-    # backends (Metal has none).
-    if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_HIP)
+    # Graph capture/replay: the device-neutral CudaGraph API records on CUDA,
+    # HIP and Vulkan (Metal has none). The _vulkan registrations run the same
+    # tests with Vulkan as both the test GPU and the default device.
+    if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_HIP OR BROTENSOR_WITH_VULKAN)
         brotensor_add_test(brotensor_test_cuda_graph test_cuda_graph.cpp)
         brotensor_add_test(brotensor_test_graph_capture_alloc test_graph_capture_alloc.cpp)
+    endif()
+    if(BROTENSOR_WITH_VULKAN)
+        foreach(_t brotensor_test_cuda_graph brotensor_test_graph_capture_alloc)
+            add_test(NAME ${_t}_vulkan COMMAND ${_t})
+            set_tests_properties(${_t}_vulkan PROPERTIES
+                ENVIRONMENT "BROTENSOR_TEST_GPU=vulkan;BROTENSOR_DEFAULT_DEVICE=vulkan")
+        endforeach()
     endif()
 endif()

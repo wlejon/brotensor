@@ -42,6 +42,7 @@ void fill_vulkan_vtable_sampling(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_misc(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_delta(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_vision(::brotensor::detail::OpsVTable& v);
+void register_vulkan_graph_backend();
 
 namespace {
 
@@ -115,6 +116,7 @@ void probe_and_register() {
     dv::fill_vulkan_vtable_vision(ops);
     ::brotensor::detail::register_backend(::brotensor::DeviceType::VULKAN, ops,
                                           dv::vulkan_alloc_table());
+    dv::register_vulkan_graph_backend();
     if (vk_verbose()) {
         for (int i = 0; i < inst.count(); ++i) {
             std::fprintf(stderr, "brotensor: vulkan:%d = %s (%s)\n", i, inst.phys(i).name.c_str(),
@@ -202,6 +204,7 @@ DeviceInfo device_info(Device d) {
     info.graphics_queue = p.graphics_queue;
     info.cooperative_matrix = p.cooperative_matrix;
     info.subgroup_size_control = p.subgroup_size_control;
+    info.shader_float64 = p.shader_float64;
     return info;
 }
 

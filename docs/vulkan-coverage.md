@@ -127,9 +127,10 @@ op gap in brotensor.
   graph capture. A tensor created through the `Device::CUDA` alias is tagged
   `vulkan`, so these tests are false on Vulkan and the code takes its
   CPU-style / ungraphed path (correct, slower). They should test
-  `!device.is_cpu()` or add `Device::VULKAN`, and use `VulkanGraphCapture` /
-  `VulkanGraph` (`<brotensor/vulkan.h>`, the same shape as `CudaGraphCapture`)
-  where they capture.
+  `!device.is_cpu()` or add `Device::VULKAN`. Capture sites need no rewrite:
+  `CudaGraphCapture` is device-neutral since chunk 7a (it records on the
+  default device, Vulkan included; `graph_capture_available(Device)` is the
+  gate, docs/vulkan.md "Device-neutral capture"). Done for brodiffusion in 7a.
 * **Device parsing.** The JS hosts map `"cuda"` / `"hip"` / `"rocm"` strings to
   devices (brolm `api/host_lm_internal.h`, brosoundml
   `api/host_soundml_internal.h`, brodiffusion `native_diffusion_triposplat.cpp`,
@@ -137,10 +138,13 @@ op gap in brotensor.
   only; `"vulkan"` / `"vk"` needs adding (brotensor's own
   `BROTENSOR_DEFAULT_DEVICE` parser already accepts both).
 * **T5 on Vulkan.** brolm's T5 re-casts to BF16 only on CUDA / HIP and keeps
-  FP16 + the residual clamp elsewhere, which is the right choice on Vulkan:
-  the cooperative-matrix GEMM converts BF16 operands to FP16 as it stages them
-  (the dtype policy), so a BF16 activation beyond 65504 would become inf
-  there. Leave T5 on its FP16 path for Vulkan (or force FP32).
+  FP16 + the residual clamp elsewhere. BF16 would not help on Vulkan (the
+  cooperative-matrix GEMM converts BF16 operands to FP16 as it stages them, so
+  a BF16 activation beyond 65504 becomes inf there), but the FP16 path is not
+  usable either: chunk 7a ran PixArt-Sigma with T5-XXL on Vulkan and got noise,
+  while the same DiT and VAE on Vulkan with the T5 encoding computed on HIP
+  produced the HIP image. T5 on Vulkan needs FP32 activations through the
+  matrix ops (the SIMT GEMM) or a range-safe BF16 GEMM.
 * **Sibling GPU kernels: must be fixed before Vulkan tensors reach them.**
   brodiffusion `fused_resblock.cu`, `fused_transformer.cu` (fused linear +
   GeGLU, row-bias / vector adds) and `triposplat/flow_rope.cu`, brovisionml
@@ -151,10 +155,18 @@ op gap in brotensor.
   addresses in a HIP + Vulkan build, and the host CPU implementation
   dereferencing them in a Vulkan-only build: a fault either way. Each needs a
   Vulkan branch: the brodiffusion fusions can compose brotensor ops Vulkan has
-  (`resblock_forward`, `linear_forward_batched_ex` with the GeGLU epilogue,
-  `add_row_bias_inplace`, `add_inplace`, `rope_apply*`); dsine's two ops and
-  DPT's preprocessing need small GLSL kernels (or a download / CPU / upload
-  fallback).
+  (`resblock_forward`, a linear then `geglu_exact_forward` — not the GEMM's
+  GeGLU epilogue, which wants interleaved rows where brodiffusion stacks the
+  halves — `add_row_bias_inplace`, `add_inplace`); dsine's two ops, DPT's
+  preprocessing and TripoSplat's RoPE tables (whose host fallback syncs, which
+  a capture forbids) need small GLSL kernels. Done in 7a (custom kernels:
+  docs/vulkan.md "Custom kernels").
+* **BF16 activations past FP16's range.** Not an op gap, a dtype-policy one:
+  Sana's linear attention sums N products into its (hd, hd) summaries in BF16
+  on CUDA / HIP; on Vulkan the next GEMM stages them as FP16 and they become
+  inf (all-NaN output). 7a runs that core in FP32 on Vulkan. Flux / Krea2 /
+  Qwen-Image (BF16 on every GPU, `flux_compute_dtype`) pass their fixture
+  tests but were not run with real weights on Vulkan.
 * **BF16 checkpoints.** `safetensors::upload_compute(_checked)` / `upload_as`
   already do the policy's cast at load on Vulkan (raw BF16 bits up, device
   cast to FP16; tested). `safetensors::upload` and `gguf::upload_raw` keep the

@@ -125,8 +125,15 @@ CmCfg pick_cm(const AttnProblem& p) {
     if (c.bc == 0) c = forced;
     if (c.bc == 0) {
         // Measured (docs/vulkan.md "Attention"): heads up to 96 wide run best
-        // with 16-key blocks and 32 query rows, 128-wide ones with 32 x 64.
-        if (p.hd <= 96) c = {16, 2};
+        // with 16-key blocks and 32 query rows, 128-wide ones with 32 x 64 —
+        // while K and V stay in the last-level cache. Every query block streams
+        // its head's whole K / V, so once they outgrow it (24 MiB of K + V, the
+        // 32 MB Infinity Cache of the RDNA 3.5 part this was measured on) the
+        // 32-key blocks win: hd 64 x 16 heads at 7k-16k keys ran 8.5 -> 10.0,
+        // 8.0 -> 10.2, 7.2 -> 10.3 and 3.0 -> 10.0 TF/s (TripoSplat's flow DiT
+        // attends over 8-13k rows).
+        const double kv_bytes = 2.0 * p.lk * p.hkv * p.hd * 2.0;
+        if (p.hd <= 96) c = kv_bytes > 24.0 * 1024 * 1024 ? CmCfg{32, 2} : CmCfg{16, 2};
         else if (p.hd <= 128) c = {32, 4};
         else c = {16, 2};
     }

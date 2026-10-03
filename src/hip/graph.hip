@@ -1,4 +1,5 @@
-// HIP graph capture / replay (public API in include/brotensor/cuda_graph.h).
+// HIP graph capture / replay (public API in include/brotensor/cuda_graph.h,
+// device-neutral front in src/graph.cpp, which calls the recorder below).
 //
 // The HIP counterpart of src/cuda/cuda_graph.cu: CudaGraphCapture brackets a
 // fixed-shape op sequence on a dedicated non-blocking capture stream (made the
@@ -11,6 +12,7 @@
 // through a window that bounds the graph work in flight (see LaunchWindow).
 
 #include <brotensor/cuda_graph.h>
+#include <brotensor/detail/graph_backend.h>
 
 #include "detail/capture_arena.h"
 #include "detail/hip_check.h"
@@ -24,6 +26,7 @@
 #include <deque>
 #include <string>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -308,77 +311,83 @@ LaunchWindow g_windows[kMaxDevices];
 
 }  // namespace
 
-// ─── CudaGraph ──────────────────────────────────────────────────────────────
+// ─── Recorder / executable graph ───────────────────────────────────────────
+//
+// The HIP half of the neutral CudaGraphCapture / CudaGraph (src/graph.cpp):
+// HipRecorder is what CudaGraphCapture's constructor, finish() and destructor
+// did before the capture became device-neutral, unchanged.
 
-struct CudaGraph::Impl {
+namespace {
+
+struct HipGraphExec final : detail::GraphExec {
     hipGraphExec_t exec = nullptr;
     int dev = 0;
     std::size_t nodes = 0;
     std::shared_ptr<dh::CaptureArena> arena;  // outlives exec (member order)
-    ~Impl() {
+    ~HipGraphExec() override {
         if (exec) (void)hipGraphExecDestroy(exec);
+    }
+    void launch() override {
+        auto stream = reinterpret_cast<hipStream_t>(hip_current_stream(dev));
+        g_windows[dev % kMaxDevices].launch(exec, nodes, stream);
     }
 };
 
-CudaGraph::CudaGraph() = default;
-CudaGraph::~CudaGraph() = default;
-CudaGraph::CudaGraph(CudaGraph&&) noexcept = default;
-CudaGraph& CudaGraph::operator=(CudaGraph&&) noexcept = default;
-
-bool CudaGraph::valid() const { return impl_ && impl_->exec != nullptr; }
-
-void CudaGraph::reset() { impl_.reset(); }
-
-void CudaGraph::launch() {
-    if (!valid()) {
-        throw std::runtime_error("brotensor: CudaGraph::launch: no captured graph");
-    }
-    auto stream = reinterpret_cast<hipStream_t>(hip_current_stream(impl_->dev));
-    g_windows[impl_->dev % kMaxDevices].launch(impl_->exec, impl_->nodes, stream);
-}
-
-// ─── CudaGraphCapture ───────────────────────────────────────────────────────
-
-struct CudaGraphCapture::Impl {
+struct HipRecorder final : detail::GraphRecorder {
     hipStream_t stream = nullptr;
     void* prev_stream = nullptr;
     int dev = 0;
     bool capturing = false;
     std::shared_ptr<dh::CaptureArena> arena;
+
+    explicit HipRecorder(int device_index);
+    ~HipRecorder() override;
+    std::unique_ptr<detail::GraphExec> finish() override;
+    int device_index() const override { return dev; }
 };
 
-CudaGraphCapture::CudaGraphCapture() : impl_(new Impl) {
-    BROTENSOR_HIP_CHECK(hipGetDevice(&impl_->dev));
+HipRecorder::HipRecorder(int device_index) {
+    // -1: the thread's current HIP device (the capture's behaviour before it
+    // became neutral). A named device is made current for the capture's
+    // stream; ops on it activate it themselves.
+    if (device_index < 0) {
+        BROTENSOR_HIP_CHECK(hipGetDevice(&dev));
+    } else {
+        dev = device_index;
+        int cur = 0;
+        BROTENSOR_HIP_CHECK(hipGetDevice(&cur));
+        if (cur != dev) BROTENSOR_HIP_CHECK(hipSetDevice(dev));
+    }
     // Non-blocking, as on CUDA: a blocking stream may not capture while another
     // thread works on the legacy stream.
-    BROTENSOR_HIP_CHECK(hipStreamCreateWithFlags(&impl_->stream, hipStreamNonBlocking));
-    impl_->prev_stream = hip_current_stream(impl_->dev);
+    BROTENSOR_HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+    prev_stream = hip_current_stream(dev);
     // Route subsequent ops (and allocations) onto the capture stream.
-    hip_set_stream(impl_->stream, impl_->dev);
-    impl_->arena = dh::capture_arena_begin(impl_->dev);
+    hip_set_stream(stream, dev);
+    arena = dh::capture_arena_begin(dev);
     // ThreadLocal mode: only this thread's work is captured, so unrelated host
     // threads issuing HIP work don't poison the capture.
-    hipError_t err = hipStreamBeginCapture(impl_->stream, hipStreamCaptureModeThreadLocal);
+    hipError_t err = hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal);
     if (err != hipSuccess) {
-        dh::capture_arena_end(impl_->arena);
-        impl_->arena.reset();
-        hip_set_stream(impl_->prev_stream, impl_->dev);
-        (void)hipStreamDestroy(impl_->stream);
-        impl_->stream = nullptr;
+        dh::capture_arena_end(arena);
+        arena.reset();
+        hip_set_stream(prev_stream, dev);
+        (void)hipStreamDestroy(stream);
+        stream = nullptr;
         BROTENSOR_HIP_CHECK(err);
     }
-    impl_->capturing = true;
+    capturing = true;
 }
 
-CudaGraph CudaGraphCapture::finish() {
-    if (!impl_ || !impl_->capturing) {
+std::unique_ptr<detail::GraphExec> HipRecorder::finish() {
+    if (!capturing) {
         throw std::runtime_error("brotensor: CudaGraphCapture::finish: not capturing");
     }
     hipGraph_t graph = nullptr;
-    hipError_t end_err = hipStreamEndCapture(impl_->stream, &graph);
-    impl_->capturing = false;
-    dh::capture_arena_end(impl_->arena);
-    hip_set_stream(impl_->prev_stream, impl_->dev);
+    hipError_t end_err = hipStreamEndCapture(stream, &graph);
+    capturing = false;
+    dh::capture_arena_end(arena);
+    hip_set_stream(prev_stream, dev);
     BROTENSOR_HIP_CHECK(end_err);
 
     std::size_t nodes = 0;
@@ -403,28 +412,38 @@ CudaGraph CudaGraphCapture::finish() {
     (void)hipGraphDestroy(graph);
     BROTENSOR_HIP_CHECK(err);
 
-    CudaGraph g;
-    g.impl_.reset(new CudaGraph::Impl);
-    g.impl_->exec = exec;
-    g.impl_->dev = impl_->dev;
-    g.impl_->nodes = nodes;
-    g.impl_->arena = std::move(impl_->arena);
+    auto g = std::make_unique<HipGraphExec>();
+    g->exec = exec;
+    g->dev = dev;
+    g->nodes = nodes;
+    g->arena = std::move(arena);
     return g;
 }
 
-CudaGraphCapture::~CudaGraphCapture() {
-    if (!impl_) return;
-    if (impl_->capturing) {
+HipRecorder::~HipRecorder() {
+    if (capturing) {
         // Abort: drain the in-flight capture and discard the graph.
         hipGraph_t graph = nullptr;
-        (void)hipStreamEndCapture(impl_->stream, &graph);
+        (void)hipStreamEndCapture(stream, &graph);
         if (graph) (void)hipGraphDestroy(graph);
-        dh::capture_arena_end(impl_->arena);
-        hip_set_stream(impl_->prev_stream, impl_->dev);
+        dh::capture_arena_end(arena);
+        hip_set_stream(prev_stream, dev);
         (void)hipGetLastError();
     }
-    impl_->arena.reset();
-    if (impl_->stream) (void)hipStreamDestroy(impl_->stream);
+    arena.reset();
+    if (stream) (void)hipStreamDestroy(stream);
 }
+
+std::unique_ptr<detail::GraphRecorder> make_hip_recorder(int device_index) {
+    return std::make_unique<HipRecorder>(device_index);
+}
+
+}  // namespace
+
+namespace detail::hip {
+void register_hip_graph_backend() {
+    ::brotensor::detail::register_graph_backend(DeviceType::HIP, &make_hip_recorder);
+}
+}  // namespace detail::hip
 
 }  // namespace brotensor

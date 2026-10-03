@@ -104,7 +104,8 @@ src/vulkan/
   detail/spirv_reflect.h, .cpp  shared-memory / workgroup-size reflection for the guard
   detail/kernels.h              what an op file uses: device_of, addr, dt_variant, launch
   tensor.cpp                    AllocVTable: alloc/free/transfers/memset/sync/mem queries
-  graph.cpp                     VulkanGraph / VulkanGraphCapture, Event
+  graph.cpp                     VulkanGraph / VulkanGraphCapture, Event, the neutral capture's recorder
+  custom.cpp                    custom kernels: register_shader / kernel_info / dispatch
   register.cpp                  probe + vtable fill + public stats
   detail/gemm.h, gemm.cpp       the GEMM dispatcher every matrix op goes through
   detail/attention.h            the attention dispatcher (ops_attention.cpp) and dense path
@@ -141,6 +142,8 @@ tests/test_vulkan_misc.cpp      embedding, pooling / masks, thresholds, init / o
                                 bias_act / upfirdn2d / filtered_lrelu, gated delta rule, BF16 checkpoint load
 tests/test_vulkan_vision.cpp    SAM rel-pos attention, deform / modulated conv (+ backward),
                                 conv2d_backward_weight, attention_forward, cross_attention_forward_train
+tests/test_vulkan_capture.cpp   the device-neutral CudaGraphCapture on Vulkan, custom kernels
+                                (--only=capture; shaders in tests/vulkan_shaders/)
 tests/test_vulkan_common.h
 ```
 
@@ -226,8 +229,49 @@ Keep every file under 1000 lines: a new op family gets its own `ops_<family>.cpp
   dependent kernel for replay, against 1.9 µs for HIP and its graphs. The
   chunk-1 test reports wall time including the sync. For a 301-command chain
   of 4096-element elementwise ops and copies, that was about 1.1 µs per command
-  replayed and 1.4 µs per command eager. Siblings can treat the two graph
-  classes as interchangeable shapes.
+  replayed and 1.4 µs per command eager.
+- **Device-neutral capture.** `CudaGraphCapture` / `CudaGraph` (`cuda_graph.h`)
+  are defined once in the core (`src/graph.cpp`) and forward to a recorder
+  each backend registers at probe time (`detail/graph_backend.h`): CUDA's and
+  HIP's are what those classes used to be (unchanged), Vulkan's is a
+  `VulkanGraphCapture`. `CudaGraphCapture()` records on the default device
+  when it is a GPU with capture (so `BROTENSOR_DEFAULT_DEVICE=vulkan` or a
+  `DeviceScope` makes an unchanged `bt::CudaGraphCapture cap; ...;
+  g = cap.finish(); g.launch();` site record on Vulkan); with a CPU / Metal
+  default device it falls back to CUDA's / HIP's current device as before, then
+  Vulkan 0. `CudaGraphCapture(Device)` names the device and
+  `graph_capture_available(Device)` is the gate a caller checks instead of
+  `device == CUDA || device == HIP`. What still differs per backend: a Vulkan
+  capture records every thread's ops on its device (CUDA / HIP: the
+  capturing thread's), and sync, uploads and downloads on it throw while it
+  records. Tested by `brotensor_test_cuda_graph_vulkan`,
+  `brotensor_test_graph_capture_alloc_vulkan` (the CUDA / HIP tests with Vulkan
+  as the default device) and `brotensor_test_vulkan --only=capture`.
+
+## Custom kernels
+
+A sibling ships GLSL for a Vulkan device the way it ships MSL for Metal
+(`metal_interop.h`). CMake, after including `cmake/BrotensorVulkan.cmake`:
+
+```cmake
+brotensor_vulkan_prepare()            # glslc, brotensor's shader include dir
+brotensor_vulkan_add_shaders(mylib NAMESPACE mylib::vk HEADER mylib_vk_shaders.h
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan"
+    SHADERS "my_op_f32|my_op.comp|-DDT=0" "my_op_f16|my_op.comp|-DDT=1")
+```
+
+compiles each entry with brotensor's glslc flags, brotensor's shader directory
+on the include path (`common.glsl`, `math_acc.glsl`), embeds the SPIR-V in
+`mylib` and generates `mylib_vk_shaders.h` with `enum class Shader` and
+`handle(Shader)`, which registers the SPIR-V with `vulkan::register_shader`
+on first use. The host side fills a push block (`vulkan::address(t)` per
+tensor, scalars after the 64-bit fields, <= 128 bytes) and calls
+`vulkan::dispatch(device, handle(Shader::my_op_f32), &pc, sizeof pc, gx, gy, gz,
+spec, nspec)`; the dispatch goes on the device's stream (ordered with
+brotensor's ops, recorded by a capture) through the same pipeline cache and
+limit guard as the built-in kernels. `DeviceInfo::shader_float64` says
+whether `double` is available (the device enables `shaderFloat64` when
+present; brovisionml's DSINE kernels use it, as their CPU / CUDA twins do).
 
 ## Matrix multiply
 
@@ -375,7 +419,12 @@ query blocks with FP16 output and hd % 16 == 0 store straight from the
 accumulator (`DIRECT`, a specialisation, as in the GEMM); the last partial
 block, BF16 and odd widths use a per-subgroup scratch aliasing S.
 Tiles (BC keys x NSG subgroups): (16, 2) for hd <= 96 and > 128, (32, 4) for
-hd 128, measured; `BROTENSOR_VK_FA_CFG=bc,nsg` forces one. Shared memory is
+hd 128, measured; for hd <= 96, (32, 2) once K and V together pass 24 MiB
+(each query block streams its head's whole K / V, so past the 32 MB
+Infinity Cache the bigger key block halves the passes: 16 heads x 64 at 8192 /
+12288 keys went from 34.6 / 205 ms to 27.1 / 60.2 ms, 8.0 / 3.0 -> 10.1 / 10.3
+TF/s; TripoSplat's flow DiT, 8-13k rows, sampled 2.5x faster);
+`BROTENSOR_VK_FA_CFG=bc,nsg` forces one. Shared memory is
 8-31 KiB at those tiles, and every array length is a specialisation-constant
 expression the pipeline guard checks (a forced 64-key tile at hd 256 is
 refused there, not in the driver).

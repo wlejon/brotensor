@@ -416,7 +416,7 @@ int main(int argc, char** argv) {
             vkt::run_audio_bench();
             return 0;
         }
-        if (only) {   // --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision: one op group
+        if (only) {   // --only=ops|gemm|norm|attention|conv|spatial|quant|audio|misc|vision|capture: one group
             if (filter == "ops") vkt::run_op_tests();
             if (filter == "gemm") vkt::run_gemm_tests();
             if (filter == "norm") vkt::run_norm_tests();
@@ -428,6 +428,7 @@ int main(int argc, char** argv) {
             if (filter == "misc") vkt::run_misc_tests();
             if (filter == "alias") vkt::test_cuda_alias();
             if (filter == "vision") vkt::run_vision_tests();
+            if (filter == "capture") vkt::run_capture_tests();
             std::printf("%s: %d failure(s)\n", vkt::failures() ? "FAILED" : "OK", vkt::failures());
             return vkt::failures() ? 1 : 0;
         }
@@ -438,6 +439,7 @@ int main(int argc, char** argv) {
             vkt::test_pipeline_guard();
             vkt::test_events_and_batching();
             vkt::test_graph();
+            vkt::run_capture_tests();
             vkt::test_cuda_alias();
             vkt::run_op_tests();
             vkt::run_gemm_tests();

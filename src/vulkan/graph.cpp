@@ -3,12 +3,15 @@
 // records into a dedicated command buffer while capturing
 // (Stream::begin_capture), the allocator hands every free during the capture
 // to the graph instead of releasing it (Allocator::set_hold), and launch()
-// resubmits the finished command buffer.
+// resubmits the finished command buffer. The device-neutral CudaGraphCapture
+// (src/graph.cpp) records on Vulkan through the recorder at the end of this
+// file, which is a VulkanGraphCapture.
 
 #include "detail/device.h"
 
 #include <brotensor/vulkan.h>
 #include <brotensor/detail/dispatch.h>
+#include <brotensor/detail/graph_backend.h>
 
 #include <stdexcept>
 #include <string>
@@ -141,5 +144,38 @@ VulkanGraph VulkanGraphCapture::finish() {
     g.impl_->cb = ctx.stream().end_capture();
     return g;
 }
+
+// ─── neutral capture (CudaGraphCapture on a Vulkan device) ─────────────────
+
+namespace {
+
+struct VulkanGraphExec final : detail::GraphExec {
+    VulkanGraph graph;
+    void launch() override { graph.launch(); }
+};
+
+struct VulkanRecorder final : detail::GraphRecorder {
+    VulkanGraphCapture cap;
+    int dev;
+    explicit VulkanRecorder(int d) : cap(Device::vulkan(d)), dev(d) {}
+    std::unique_ptr<detail::GraphExec> finish() override {
+        auto g = std::make_unique<VulkanGraphExec>();
+        g->graph = cap.finish();
+        return g;
+    }
+    int device_index() const override { return dev; }
+};
+
+std::unique_ptr<detail::GraphRecorder> make_vulkan_recorder(int device_index) {
+    return std::make_unique<VulkanRecorder>(device_index < 0 ? 0 : device_index);
+}
+
+}  // namespace
+
+namespace detail::vulkan {
+void register_vulkan_graph_backend() {
+    ::brotensor::detail::register_graph_backend(DeviceType::VULKAN, &make_vulkan_recorder);
+}
+}  // namespace detail::vulkan
 
 }  // namespace brotensor
