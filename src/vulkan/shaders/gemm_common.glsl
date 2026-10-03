@@ -19,6 +19,7 @@
 layout(push_constant) uniform PC {
     uint64_t a, b, c, bias;
     uint64_t scale;        // gemm_cm with a quantised B (QB): INT8 per-row scales
+    uint64_t ascale;       // gemm_cm with SCALE_A: int exponent per (z, row of A), gemm_rowscale.comp
     uint m, n, k;          // n: columns of r (rows of B), 2 * half for the GLUs
     uint lda, ldb, ldc;    // gemm_cm with QB: ldb is B's row pitch in bytes
     uint sa, sb, sc;       // batch strides in elements

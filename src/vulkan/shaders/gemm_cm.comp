@@ -1,12 +1,25 @@
 #version 460
 // Tensor-core GEMM through VK_KHR_cooperative_matrix: 16x16x16 FP16 fragments
 // with FP32 accumulation, subgroup size pinned to 32 by the host. Contract and
-// epilogues: gemm_common.glsl. -DDT=1 (FP16) or -DDT=2 (BF16 storage, each
-// element converted to FP16 on its way into shared memory, the dtype policy
-// in docs/vulkan.md); C and bias share the dtype. QB != 0: B is a quantised
+// epilogues: gemm_common.glsl. Dtypes (0 FP32, 1 FP16, 2 BF16): -DDT is B's
+// and, by default, A's, C's and the bias's; -DDTA, -DDTC, -DDTBI override A,
+// C and the bias. BF16 and FP32 operands are converted to FP16 on their way
+// into shared memory (the dtype policy in docs/vulkan.md); an FP32 A only
+// with SCALE_A. C may be FP32 (the 16-bit-operand, FP32-result form whose
+// bias is in the operands' dtype, as gemm_simt's _c32). QB != 0: B is a quantised
 // weight (INT8 + per-row scale or a GGUF block format, quant_decode.glsl) in
 // the NT layout, one batch, decoded to FP16 as each chunk is stored to shared
 // memory, so the dequantised weight never exists outside the tile.
+//
+// SCALE_A (BF16 or FP32 A): A is range-safe. gemm_rowscale.comp has written one
+// power-of-two exponent e per row of A (pc.ascale, per batch slice unless A
+// is broadcast); each row is multiplied by 2^-e as it is converted to FP16,
+// which puts its largest element in [2^14, 2^15) whatever its magnitude, and
+// the epilogue multiplies the FP32 accumulator by 2^e. Both are exact, so a
+// BF16 A (8 significant bits) reaches the fragments unrounded unless an
+// element is 2^31 times smaller than its row's maximum; an FP32 A is rounded
+// to FP16's 11 bits at that per-row scale. B is converted unscaled and must
+// lie in FP16's range (docs/vulkan-bf16.md).
 //
 // Workgroup tile BM x BN (r columns), K step BK, double-buffered in shared
 // memory, filled with 8-element chunks (16-byte loads when VEC = 1, see
@@ -27,6 +40,15 @@
 // fragment layout stay opaque (KHR coopmat does not say which lane holds
 // which element).
 #include "common.glsl"
+#ifndef DTA
+#define DTA DT
+#endif
+#ifndef DTC
+#define DTC DT
+#endif
+#ifndef DTBI
+#define DTBI DTC
+#endif
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -46,6 +68,7 @@ layout(constant_id = 10) const uint VEC = 1;
 layout(constant_id = 11) const uint DIRECT = 0;   // fragment-form epilogue, see main()
 layout(constant_id = 12) const uint BIAS = 0;     // pc.bias is set
 layout(constant_id = 13) const uint QB = 0;       // B quantised (quant_decode.glsl QF_*), NT only
+layout(constant_id = 14) const uint SCALE_A = 0;  // A rows scaled into FP16 range (see above)
 layout(local_size_x_id = 5) in;
 
 #include "gemm_common.glsl"
@@ -71,14 +94,66 @@ shared uvec4 As[2 * ASZ];
 shared uvec4 Bs[2 * BSZ];
 
 uvec4 ra[LA], rb[LB];
+#if DTA == DT_F32
+uvec4 ra2[LA];   // FP32 A: the second 16 bytes of each 8-element chunk
+#endif
 QRaw rq[LB];   // QB: raw B chunks, decoded to FP16 at the store
 uint qk[LB];   // ... and the element offset of each within its row
+
+// SCALE_A: the multiplier 2^-e of each A element this invocation stages, one
+// per chunk (TA = 0: a chunk is 8 k of one row) or 8 per chunk (TA = 1: 8 rows).
+float amul[LA * (1u + 7u * TA)];
+uint64_t AS;   // this batch slice's exponents
+
+float a_mul(uint j, uint e) { return SCALE_A == 0 ? 1.0 : amul[TA != 0 ? j * 8u + e : j]; }
+
+// The rows an invocation stages are the same at every K step: read their
+// exponents once.
+void load_amul(uint m0) {
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint j = 0; j < LA; ++j) {
+        const uint i = tid + j * WG;
+        if (TA == 0) {
+            const uint m = m0 + i / CA;
+            amul[j] = ldexp(1.0, -(m < pc.m ? I32Buf(AS).v[m] : 0));
+        } else {
+            const uint mb = m0 + (i % CA) * 8u;
+            [[unroll]] for (uint e = 0; e < 8u; ++e)
+                amul[j * 8u + e] = ldexp(1.0, -(mb + e < pc.m ? I32Buf(AS).v[mb + e] : 0));
+        }
+    }
+}
+
+// The FP32 result's multiplier for row gm (< M): 2^e.
+float row_mul(uint gm) { return SCALE_A != 0 ? ldexp(1.0, I32Buf(AS).v[gm]) : 1.0; }
 
 uvec4 bf16x8_to_f16x8(uvec4 w) {
     uvec4 o;
     [[unroll]] for (uint i = 0; i < 4; ++i) {
         const vec2 f = vec2(uintBitsToFloat(w[i] << 16), uintBitsToFloat(w[i] & 0xffff0000u));
         o[i] = packFloat2x16(f16vec2(f));   // RNE conversion, then a bit pack
+    }
+    return o;
+}
+
+uvec4 bf16x8_to_f16x8_scaled(uvec4 w, uint j) {
+    uvec4 o;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const vec2 f = vec2(uintBitsToFloat(w[i] << 16), uintBitsToFloat(w[i] & 0xffff0000u)) *
+                       vec2(a_mul(j, 2u * i), a_mul(j, 2u * i + 1u));
+        o[i] = packFloat2x16(f16vec2(f));
+    }
+    return o;
+}
+
+// 8 FP32 (w0: elements 0-3, w1: 4-7) times their row multipliers, as FP16.
+uvec4 f32x8_to_f16x8_scaled(uvec4 w0, uvec4 w1, uint j) {
+    uvec4 o;
+    [[unroll]] for (uint i = 0; i < 2; ++i) {
+        o[i] = packFloat2x16(f16vec2(vec2(uintBitsToFloat(w0[2u * i]), uintBitsToFloat(w0[2u * i + 1u])) *
+                                     vec2(a_mul(j, 2u * i), a_mul(j, 2u * i + 1u))));
+        o[i + 2u] = packFloat2x16(f16vec2(vec2(uintBitsToFloat(w1[2u * i]), uintBitsToFloat(w1[2u * i + 1u])) *
+                                          vec2(a_mul(j, 4u + 2u * i), a_mul(j, 5u + 2u * i))));
     }
     return o;
 }
@@ -90,37 +165,64 @@ uvec4 bf16x8_to_f16x8(uvec4 w) {
 // strides, and contiguous extents that are multiples of 8) means a chunk is
 // wholly inside or wholly outside. The load is then unconditional, at a
 // clamped index, and the raw 16 bytes go to registers with a validity bit;
-// the zeroing select and the BF16 -> FP16 conversion wait until the chunk is
+// the zeroing select and the conversion to FP16 wait until the chunk is
 // stored to shared memory. Anything that consumes the loaded value at the
 // load (a branch, a select, a conversion) makes the compiler wait for it
 // there instead of behind the fragment math, which cost half the K loop's
 // throughput on RADV.
-uvec4 load8_scalar(uint64_t base, uint ld, uint row, bool row_ok, uint col, uint ncols) {
+uvec4 load8_scalar(const int dt, uint64_t base, uint ld, uint row, bool row_ok, uint col, uint ncols,
+                   const bool is_a, uint j) {
     if (!row_ok || col >= ncols) return uvec4(0);
     const uint idx = row * ld + col;
     float h[8];
-    [[unroll]] for (uint e = 0; e < 8; ++e) h[e] = (col + e < ncols) ? load_elem(DT, base, idx + e) : 0.0;
+    [[unroll]] for (uint e = 0; e < 8; ++e) h[e] = (col + e < ncols) ? load_elem(dt, base, idx + e) : 0.0;
+    if (is_a && SCALE_A != 0) [[unroll]] for (uint e = 0; e < 8; ++e) h[e] *= a_mul(j, e);
     return uvec4(packFloat2x16(f16vec2(h[0], h[1])), packFloat2x16(f16vec2(h[2], h[3])),
                  packFloat2x16(f16vec2(h[4], h[5])), packFloat2x16(f16vec2(h[6], h[7])));
 }
 
 uint va, vb;   // VEC: validity bit per chunk in ra / rb
 
-void load_chunk(uint64_t base, uint ld, uint row, bool row_ok, uint col, uint ncols, uint bit,
-                inout uint valid, out uvec4 dst) {
+void load_a(uint j, uint64_t base, uint ld, uint row, bool row_ok, uint col, uint ncols) {
     if (VEC != 0) {
         const bool ok = row_ok && col < ncols;
-        dst = U4Buf(base).v[ok ? (row * ld + col) / 8u : 0u];
-        valid |= ok ? (1u << bit) : 0u;
+        const uint idx = ok ? row * ld + col : 0u;
+#if DTA == DT_F32
+        ra[j] = U4Buf(base).v[idx / 4u];
+        ra2[j] = U4Buf(base).v[idx / 4u + 1u];
+#else
+        ra[j] = U4Buf(base).v[idx / 8u];
+#endif
+        va |= ok ? (1u << j) : 0u;
     } else {
-        dst = load8_scalar(base, ld, row, row_ok, col, ncols);
+        ra[j] = load8_scalar(DTA, base, ld, row, row_ok, col, ncols, true, j);
     }
 }
 
-uvec4 finish_chunk(uvec4 w, uint valid, uint bit) {
-    if (VEC == 0) return w;
-    const uvec4 h = DT == DT_BF16 ? bf16x8_to_f16x8(w) : w;
-    return (valid & (1u << bit)) != 0u ? h : uvec4(0);
+void load_b(uint j, uint64_t base, uint ld, uint row, bool row_ok, uint col, uint ncols) {
+    if (VEC != 0) {
+        const bool ok = row_ok && col < ncols;
+        rb[j] = U4Buf(base).v[ok ? (row * ld + col) / 8u : 0u];
+        vb |= ok ? (1u << j) : 0u;
+    } else {
+        rb[j] = load8_scalar(DT, base, ld, row, row_ok, col, ncols, false, j);
+    }
+}
+
+uvec4 finish_a(uint j) {
+    if (VEC == 0) return ra[j];
+#if DTA == DT_F32
+    const uvec4 h = f32x8_to_f16x8_scaled(ra[j], ra2[j], j);
+#else
+    const uvec4 h = DTA != DT_BF16 ? ra[j] : SCALE_A != 0 ? bf16x8_to_f16x8_scaled(ra[j], j) : bf16x8_to_f16x8(ra[j]);
+#endif
+    return (va & (1u << j)) != 0u ? h : uvec4(0);
+}
+
+uvec4 finish_b(uint j) {
+    if (VEC == 0) return rb[j];
+    const uvec4 h = DT == DT_BF16 ? bf16x8_to_f16x8(rb[j]) : rb[j];
+    return (vb & (1u << j)) != 0u ? h : uvec4(0);
 }
 
 // Global row of B behind B-tile row rr (NT layout), and whether it exists.
@@ -140,8 +242,8 @@ void load_tiles(uint64_t A, uint64_t B, uint m0, uint n0, uint k0) {
     vb = 0u;
     [[unroll]] for (uint j = 0; j < LA; ++j) {
         const uint i = tid + j * WG, r = i / CA, q = i % CA;
-        if (TA == 0) load_chunk(A, pc.lda, m0 + r, m0 + r < pc.m, k0 + q * 8u, pc.k, j, va, ra[j]);
-        else         load_chunk(A, pc.lda, k0 + r, k0 + r < pc.k, m0 + q * 8u, pc.m, j, va, ra[j]);
+        if (TA == 0) load_a(j, A, pc.lda, m0 + r, m0 + r < pc.m, k0 + q * 8u, pc.k);
+        else         load_a(j, A, pc.lda, k0 + r, k0 + r < pc.k, m0 + q * 8u, pc.m);
     }
     if (QB != 0) {
         // Quantised NT B: ldb is the row pitch in bytes; a chunk of a row
@@ -162,9 +264,9 @@ void load_tiles(uint64_t A, uint64_t B, uint m0, uint n0, uint k0) {
         if (NB == 0) {
             bool ok;
             const uint row = b_row(n0, r, ok);
-            load_chunk(B, pc.ldb, row, ok, k0 + q * 8u, pc.k, j, vb, rb[j]);
+            load_b(j, B, pc.ldb, row, ok, k0 + q * 8u, pc.k);
         } else {
-            load_chunk(B, pc.ldb, k0 + r, k0 + r < pc.k, n0 + q * 8u, pc.n, j, vb, rb[j]);
+            load_b(j, B, pc.ldb, k0 + r, k0 + r < pc.k, n0 + q * 8u, pc.n);
         }
     }
 }
@@ -173,30 +275,34 @@ void store_tiles(uint buf) {
     const uint tid = gl_LocalInvocationID.x;
     [[unroll]] for (uint j = 0; j < LA; ++j) {
         const uint i = tid + j * WG;
-        As[buf * ASZ + (i / CA) * SKA + i % CA] = finish_chunk(ra[j], va, j);
+        As[buf * ASZ + (i / CA) * SKA + i % CA] = finish_a(j);
     }
     [[unroll]] for (uint j = 0; j < LB; ++j) {
         const uint i = tid + j * WG;
         if (QB != 0)
             Bs[buf * BSZ + (i / CB) * SKB + i % CB] = (vb & (1u << j)) != 0u ? qdecode8_f16(QB, rq[j], qk[j]) : uvec4(0);
         else
-            Bs[buf * BSZ + (i / CB) * SKB + i % CB] = finish_chunk(rb[j], vb, j);
+            Bs[buf * BSZ + (i / CB) * SKB + i % CB] = finish_b(j);
     }
 }
 
 float scratch(uint base, uint e) { return uintBitsToFloat(As[base + e / 4u][e % 4u]); }
-float bias_at(uint n) { return BIAS != 0 ? load_elem(DT, pc.bias, n) : 0.0; }
+float bias_at(uint n) { return BIAS != 0 ? load_elem(DTBI, pc.bias, n) : 0.0; }
 
 void main() {
     const uint z = gl_WorkGroupID.z;
-    const uint64_t A = batch_base(pc.a, pc.sa, z, 2u);
+    const uint64_t A = batch_base(pc.a, pc.sa, z, DTA == DT_F32 ? 4u : 2u);
     const uint64_t B = QB != 0 ? pc.b : batch_base(pc.b, pc.sb, z, 2u);
-    const uint64_t C = batch_base(pc.c, pc.sc, z, 2u);
+    const uint64_t C = batch_base(pc.c, pc.sc, z, DTC == DT_F32 ? 4u : 2u);
     const uint m0 = (gl_WorkGroupID.y + pc.tm0) * BM;
     const uint n0 = (gl_WorkGroupID.x + pc.tn0) * (EPI == EPI_SWIGLU ? BN / 2u : BN);
     const uint sg = gl_SubgroupID;
     const uint wm0 = (sg % (BM / WM)) * WM, wn0 = (sg / (BM / WM)) * WN;
     const uint nk = (pc.k + BK - 1u) / BK;
+    if (SCALE_A != 0) {
+        AS = pc.ascale + uint64_t(pc.sa != 0u ? z * pc.m : 0u) * 4u;
+        load_amul(m0);
+    }
 
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[TM * TN];
     [[unroll]] for (uint i = 0; i < TM * TN; ++i)
@@ -301,9 +407,10 @@ void main() {
                     const uint rr = e / 8u, p = e % 8u, gm = gm0 + rr;
                     const uint nr = n0 + wn0 + j * 16u + 2u * p;    // r column of the pair
                     if (gm < pc.m && nr + 1u < pc.n) {
-                        const float a = scratch(sbase, rr * 16u + 2u * p) + bias_at(nr);
-                        const float g = scratch(sbase, rr * 16u + 2u * p + 1u) + bias_at(nr + 1u);
-                        store_elem(DT, C, gm * pc.ldc + nr / 2u, a * gelu_exact(g));
+                        const float s = row_mul(gm);
+                        const float a = scratch(sbase, rr * 16u + 2u * p) * s + bias_at(nr);
+                        const float g = scratch(sbase, rr * 16u + 2u * p + 1u) * s + bias_at(nr + 1u);
+                        store_elem(DTC, C, gm * pc.ldc + nr / 2u, a * gelu_exact(g));
                     }
                 }
             } else if (EPI == EPI_SWIGLU) {
@@ -311,19 +418,20 @@ void main() {
                 for (uint e = lane; e < 256u; e += gl_SubgroupSize) {
                     const uint gm = gm0 + e / 16u, oc = n0 + ob * 16u + e % 16u;
                     if (gm < pc.m && oc < pc.half_n) {
-                        const float g = scratch(sbase, e) + bias_at(oc);
-                        const float u = scratch(sbase + 64u, e) + bias_at(pc.half_n + oc);
-                        store_elem(DT, C, gm * pc.ldc + oc, silu(g) * u);
+                        const float s = row_mul(gm);
+                        const float g = scratch(sbase, e) * s + bias_at(oc);
+                        const float u = scratch(sbase + 64u, e) * s + bias_at(pc.half_n + oc);
+                        store_elem(DTC, C, gm * pc.ldc + oc, silu(g) * u);
                     }
                 }
             } else {
                 for (uint e = lane; e < 256u; e += gl_SubgroupSize) {
                     const uint gm = gm0 + e / 16u, nc = n0 + wn0 + j * 16u + e % 16u;
                     if (gm < pc.m && nc < pc.n) {
-                        float v = gemm_act(ACT, scratch(sbase, e) + bias_at(nc));
+                        float v = gemm_act(ACT, scratch(sbase, e) * row_mul(gm) + bias_at(nc));
                         const uint o = gm * pc.ldc + nc;
-                        if (EPI == EPI_ACCUM) v += load_elem(DT, C, o);
-                        store_elem(DT, C, o, v);
+                        if (EPI == EPI_ACCUM) v += load_elem(DTC, C, o);
+                        store_elem(DTC, C, o, v);
                     }
                 }
             }

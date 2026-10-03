@@ -172,6 +172,7 @@ void proj_attention(const ProjSpec& s) {
     g.op = op;
     g.a = addr(Yc.data); g.b = addr(s.Wo->data); g.c = addr(O32.data);
     g.da = Dtype::FP32; g.db = dt; g.dc = Dtype::FP32;
+    g.round_a = true;   // Yc is ours: a 16-bit Wo takes it at FP16 with a per-row scale (matrix cores)
     if (present(s.bo)) {
         if (s.bo->dtype != dt || s.bo->size() != D) fail(op, "bo must have D elements of X's dtype");
         if (dt == Dtype::FP32) {

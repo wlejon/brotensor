@@ -5,7 +5,8 @@ Arch Linux, Mesa RADV 26.2.3 (ACO), ROCm 7.2.4. Both backends in one build
 (`build_vk`); "HIP" is brotensor's HIP backend (hipBLAS for dense FP16 GEMM),
 "Vulkan" its Vulkan backend (docs/vulkan.md). Ratios are HIP time / Vulkan
 time, or Vulkan / HIP throughput: above 1, Vulkan is faster. Chunk 8,
-2026-10-03.
+2026-10-03; the T5 / PixArt / Sana rows and the BF16 GEMM figures updated by
+the range-safe BF16 GEMM (docs/vulkan-bf16.md).
 
 ## Models (end to end, sibling code, same weights)
 
@@ -14,17 +15,20 @@ time, or Vulkan / HIP throughput: above 1, Vulkan is faster. Chunk 8,
 | Qwen3-0.6B Q8_0 decode (brolm) | 97 tok/s | 192 tok/s | 1.98 |
 | Qwen3-0.6B Q8_0 prefill (brolm) | 1.3k tok/s | 15.9k tok/s | 12.2 |
 | SD 1.5 UNet step (brodiffusion) | 0.186 s | 0.062 s | 3.00 |
-| PixArt-Sigma, 20 steps | 49.1 s | 19.6 s | 2.51 |
-| Sana step | 0.173 s | 0.153 s | 1.13 |
+| PixArt-Sigma, 20 steps | 49.4 s | 18.5 s | 2.67 |
+| PixArt-Sigma step | 2.34 s | 0.848 s | 2.76 |
+| Sana step | 0.173 s | 0.148 s | 1.17 |
 | TripoSplat (image to splat) | 86 s | 52 s | 1.65 |
 | Depth-Anything-V2 small (brovisionml) | 47 ms | 23 ms | 2.04 |
 | SAM-B mask decode | 11.4 ms | 4.0 ms | 2.85 |
 | Qwen3-TTS (brosoundml) | 17.6 s | 5.7 s | 3.09 |
 | Whisper-tiny transcription | 0.90 s | 0.31 s | 2.90 |
 | Qwen3-ASR | 7.7 s | 2.3 s | 3.35 |
-| T5-XXL encode (brolm, PixArt's text encoder) | 0.93 s | 1.9 s | **0.49** |
+| T5-XXL encode (brolm, PixArt's text encoder, 2 passes) | 1.00 s | 0.51 s | 1.98 |
 
-Measured in chunks 6-7b on the siblings' own benchmarks / tests; the STFT
+Measured in chunks 6-7b on the siblings' own benchmarks / tests (T5, PixArt
+and Sana re-measured with the range-safe BF16 GEMM: T5 was 0.49x of HIP,
+1.9 s, while it ran FP32 activations on the SIMT GEMM); the STFT
 change of chunk 8 (below) adds ~3.4 ms per 30 s of audio to the Whisper /
 Qwen3-ASR front ends (~1% of those rows).
 
@@ -50,7 +54,8 @@ vk-spike run 2 (brotensor's HIP backend calls hipBLAS for that op).
 | DiT MLP, L4096 | 4096 x 12288 x 3072 | 32.5 | 32.8 | 1.01 |
 
 Other Vulkan GEMM paths (TF/s, square4k / DiT 3072): BF16 cooperative matrix
-26.9 / 30.6, FP16 SIMT 7.9 / 8.1, FP32 SIMT 6.7 / 8.3. FP16 GEMV (decode, W
+(range-safe, A scaled per row) 27.8 / 29.6 (17.7-29.6 over the shapes, -12%
+to +12% against unscaled staging), FP16 SIMT 7.9 / 8.1, FP32 SIMT 6.7 / 8.3. FP16 GEMV (decode, W
 read): 195-239 GB/s at B = 1-8 on 4096-12288-wide weights (peak 256).
 
 **Flash attention, FP16** (`--bench-attention`, ms)
@@ -143,7 +148,6 @@ llama.cpp Vulkan 282 (0.68x); prefill 15.9k vs 14.6k tok/s (1.09x).
 
 | Where | HIP | Vulkan | Why |
 |---|---:|---:|---|
-| T5-XXL encode | 0.93 s | 1.9 s | T5's activations exceed FP16; RADV has no BF16 cooperative matrix, so Vulkan runs T5 with FP32 activations on the SIMT GEMM (docs/vulkan.md "Dtype policy") |
 | STFT / iSTFT, 30 s Whisper front end | 53 / 124 ms | 3.6 / 4.6 ms | not a loss against HIP; against the FP32 basis GEMM (0.20 / 0.23 ms) the FP64 direct DFT is 18-20x slower, the price of CPU-exact spectra (log-mel 0.025 -> 1e-6 vs the CPU) |
-| BF16 operands in matrix ops | | | staged as FP16 (range 65504) by the matrix-core kernels; FP32 fallbacks where a model needs the range (T5, Sana's linear attention) |
+| BF16 operands in matrix ops | | | the GEMM stages a BF16 A at a per-row power-of-two scale (range-safe, exact; docs/vulkan-bf16.md); B, flash attention's Q / K / V and the convolution's operands are still staged as plain FP16 (range 65504) |
 | Training backwards | | | 21 op-table slots still null on Vulkan (docs/vulkan-coverage.md); those paths have no Vulkan timing |

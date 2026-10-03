@@ -1,11 +1,13 @@
 # Removing the HIP backend: inventory
 
-A write-up, not a plan of record (§2, §4 and §5 updated for chunk 9): what deleting brotensor's HIP backend
+A write-up, not a plan of record (§2, §4 and §5 updated for chunk 9, §2 and
+§5 again for the range-safe BF16 GEMM): what deleting brotensor's HIP backend
 (`BROTENSOR_WITH_HIP`, `src/hip/`) would remove, what the siblings would lose,
 what stays, and what it costs. Line counts are `wc -l` on the tree as of
 chunk 8 (2026-10-03). Vulkan is already the default device in a HIP + Vulkan
-build and is faster on every sibling model measured except the T5-XXL encode
-(docs/vulkan-perf.md).
+build and is faster on every sibling model measured, the T5-XXL encode
+included since the range-safe BF16 GEMM (docs/vulkan-perf.md,
+docs/vulkan-bf16.md).
 
 ## 1. What would be deleted
 
@@ -99,11 +101,16 @@ docs/vulkan.md "Quantised weights"), so no op is lost; the HIP kernels stay as
 CUDA kernels. `brotensor_test_int8_conv_wmma` / `_int8_linear_wmma` test the
 public ops and run on Vulkan too since chunk 9 (`*_vulkan`).
 
-**Performance.** One model is slower on Vulkan: the T5-XXL encode (1.9 s vs
-0.93 s), because brolm's T5 recasts to BF16 only on CUDA / HIP and runs FP32
-activations through the SIMT GEMM on Vulkan (the matrix-core GEMM stages BF16 as
-FP16, which overflows T5's activations). Removing HIP makes that 2x the only
-choice on AMD unless Vulkan gets a range-safe BF16 GEMM.
+**Performance.** No model is slower on Vulkan any more. The one that was, the
+T5-XXL encode (1.9 s on Vulkan vs 1.0 s on HIP, two passes in PixArt), ran
+FP32 activations through the SIMT GEMM because the matrix-core GEMM staged
+BF16 as FP16, which overflows T5's activations. The GEMM now stages a BF16 A at
+a per-row power-of-two scale (exact for BF16, docs/vulkan-bf16.md; RADV
+exposes no BF16 cooperative matrix without `RADV_EXPERIMENTAL=bfloat16`), and
+16-bit operands with an FP32 result, the attention ops' projections, run on
+the matrix cores too: brolm's T5 takes its BF16 path on Vulkan and encodes in
+0.51 s, 2x faster than HIP; Sana's linear-attention core is back in BF16
+(0.148 s per step, HIP 0.173).
 
 **Training backwards: none missing since chunk 9.** Chunk 8 filled 7 slots
 (the attention / MHA / self / cross attention backwards, training BatchNorm,
@@ -176,10 +183,11 @@ conv, norms, audio and quant). Nothing in `src/cuda/` exists solely for HIP.
 Steps (1) and (2) of the sequence below are done (chunk 9): every op-table
 slot a sibling can reach runs on Vulkan, training included, and the generic
 CPU↔GPU suite runs on Vulkan (and is the whole GPU suite of a Vulkan-only
-build). What remains before deleting HIP: (3) a range-safe BF16 (or
-FP32-accumulate split) GEMM so the T5-XXL encode stops being 2x slower; the
-flash-attention backward on cooperative-matrix fragments if training
-throughput matters (2.5 TF/s now, against the forward's 15); then (4) delete
+build), and so is step (3): the range-safe BF16 GEMM (docs/vulkan-bf16.md)
+made the T5-XXL encode 2x faster than HIP instead of 2x slower. What remains
+before deleting HIP: the flash-attention backward on cooperative-matrix
+fragments if training throughput matters (2.5 TF/s now, against the forward's
+15); then (4) delete
 `src/hip/` and the ~185 + ~350 lines of CMake / plumbing listed above. One
 HIP-side wart found while re-gating, moot after removal: in a HIP + Vulkan
 build where Vulkan is the alias target, a HIP op called explicitly allocates

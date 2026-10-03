@@ -1,0 +1,97 @@
+#version 460
+// Per-row power-of-two scales for the cooperative-matrix GEMM's range-safe
+// staging of a BF16 (or FP32) A operand (gemm_cm.comp SCALE_A,
+// docs/vulkan-bf16.md):
+//
+//   out[z * M + m] = e  with  max_k |A[z](m, k)| * 2^-e  in [2^14, 2^15)
+//
+// so the row, multiplied by 2^-e as it is converted to FP16, sits at the top
+// of FP16's range whatever its magnitude, and the GEMM's epilogue multiplies
+// the FP32 result back by 2^e. Both multiplications are exact (powers of two).
+// The maximum is over the finite elements: an inf or NaN stays one after
+// scaling and propagates as in exact arithmetic, while the row's finite
+// values are still brought into range. An all-zero row gets e = 0; e is
+// clamped to [-100, 100]. DT: A's dtype. TA = 1: A stored (K, M), one
+// invocation per m; TA = 0: 64 invocations per row, four rows per
+// workgroup. The maximum is
+// taken over the absolute value's bit pattern, which orders non-negative
+// floats without a float compare (inf / NaN are the patterns >= 0x7f800000).
+#include "common.glsl"
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint TA = 0;
+layout(constant_id = 1) const uint VEC = 0;   // TA = 0: 16-byte aligned rows, K % 8 == 0
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint64_t a, out_;
+    uint m, k, lda, sa;   // sa: batch stride of A in elements
+} pc;
+
+shared uint red[256];
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer U4Buf { uvec4 v[]; };
+
+uint finite_or_0(uint u) { return u < 0x7f800000u ? u : 0u; }
+
+// max of |x| bits over the 8 BF16 or 4 FP32 in a uvec4, 0 for inf / NaN.
+uint abs_bits_vec(uvec4 w) {
+    uint mx = 0u;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        if (DT == DT_BF16) {
+            mx = max(mx, max(finite_or_0((w[i] << 16) & 0x7fffffffu), finite_or_0(w[i] & 0x7fff0000u)));
+        } else {
+            mx = max(mx, finite_or_0(w[i] & 0x7fffffffu));
+        }
+    }
+    return mx;
+}
+
+// |x| as bits, 0 for inf / NaN.
+uint abs_bits(uint64_t base, uint i) {
+    uint u;
+    if (DT == DT_BF16) u = (uint(U16Buf(base).v[i]) << 16) & 0x7fffffffu;
+    else if (DT == DT_F32) u = U32Buf(base).v[i] & 0x7fffffffu;
+    else u = floatBitsToUint(abs(float(F16Buf(base).v[i])));
+    return finite_or_0(u);
+}
+
+int exponent_for(uint u) {
+    if (u == 0u) return 0;
+    // u = |max| with biased exponent E: max in [2^(E-127), 2^(E-126)), so
+    // max * 2^-(E-141) is in [2^14, 2^15).
+    return clamp(int(u >> 23) - 141, -100, 100);
+}
+
+void main() {
+    const uint z = gl_WorkGroupID.z;
+    const uint64_t A = pc.a + uint64_t(z) * uint64_t(pc.sa) * uint64_t(DT == DT_F32 ? 4u : 2u);
+    const uint t = gl_LocalInvocationID.x;
+    const uint g = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (TA == 0) {
+        const uint row = g * 4u + t / 64u, lane = t % 64u;
+        uint mx = 0u;
+        if (row < pc.m) {
+            if (VEC != 0 && DT != DT_F16) {
+                const uint per = DT == DT_BF16 ? 8u : 4u;   // elements per uvec4
+                const uint base = row * pc.lda / per;
+                for (uint c = lane; c < pc.k / per; c += 64u) mx = max(mx, abs_bits_vec(U4Buf(A).v[base + c]));
+            } else {
+                for (uint k = lane; k < pc.k; k += 64u) mx = max(mx, abs_bits(A, row * pc.lda + k));
+            }
+        }
+        red[t] = mx;
+        barrier();
+        [[unroll]] for (uint s = 32u; s > 0u; s >>= 1) {
+            if (lane < s) red[t] = max(red[t], red[t + s]);
+            barrier();
+        }
+        if (lane == 0u && row < pc.m) I32Buf(pc.out_).v[z * pc.m + row] = exponent_for(red[t]);
+    } else {
+        const uint m = g * 256u + t;
+        if (m >= pc.m) return;
+        uint mx = 0u;
+        for (uint k = 0u; k < pc.k; ++k) mx = max(mx, abs_bits(A, k * pc.lda + m));
+        I32Buf(pc.out_).v[z * pc.m + m] = exponent_for(mx);
+    }
+}

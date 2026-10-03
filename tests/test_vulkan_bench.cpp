@@ -1,7 +1,8 @@
 // `brotensor_test_vulkan --bench-gemm`: GEMM throughput on the vk-spike's
 // shapes (../vk-spike/RESULTS.md), through the public matmul_abt (FP16, the
 // linear-layer NT layout), next to the spike's hipBLAS and coopmat figures;
-// then each tile configuration, BF16 (converted at load), the SIMT fallback,
+// then each tile configuration, BF16 (converted at load, with the range-safe
+// per-row scaling of A and, for comparison, without it), the SIMT fallback,
 // FP32, and the GEMV kernel's bandwidth on decode shapes. Not part of ctest.
 //
 // Timing: wall clock around a batch of back-to-back launches with one device
@@ -165,18 +166,21 @@ void run_gemm_bench() {
         dv::set_gemm_cm_config(-1);
     }
 
-    std::printf("\nother paths (TF/s)\n%-22s %10s %10s %10s %10s\n", "shape", "bf16-cm", "f16-simt", "f32-simt",
-                "nn-f16");
+    std::printf("\nother paths (TF/s; bf16-cm: range-safe scaled A, the default; bf16-raw: unscaled)\n"
+                "%-22s %10s %10s %10s %10s %10s\n", "shape", "bf16-cm", "bf16-raw", "f16-simt", "f32-simt", "nn-f16");
     for (const Shape& s : kShapes) {
         if (s.M == 8192 || (quick && s.M == 4096 && s.N == 12288)) continue;
         const double flop = 2.0 * s.M * s.N * double(s.K);
         const auto av = random_values(std::size_t(s.M) * s.K, 1, -0.5f, 0.5f, Dtype::FP16);
         const auto bv = random_values(std::size_t(s.N) * s.K, 2, -0.5f, 0.5f, Dtype::FP16);
-        double r[4];
+        double r[5];
         {
             Tensor A = upload(av, s.M, s.K, Dtype::BF16), B = upload(bv, s.N, s.K, Dtype::BF16);
             Tensor C = Tensor::empty_on(vk(), s.M, s.N, Dtype::BF16);
             r[0] = flop / (run_abt(A, B, C, s.M, s.N, s.K) * 1e9);
+            dv::set_gemm_scaling(0);
+            r[4] = flop / (run_abt(A, B, C, s.M, s.N, s.K) * 1e9);
+            dv::set_gemm_scaling(1);
         }
         {
             dv::set_gemm_override(2);
@@ -195,7 +199,7 @@ void run_gemm_bench() {
             Tensor A = upload(av, s.M, s.K, Dtype::FP16), B = upload(bv, s.K, s.N, Dtype::FP16), C;
             r[3] = flop / (median_ms([&] { brotensor::matmul(A, B, C); }) * 1e9);
         }
-        std::printf("%-22s %10.1f %10.1f %10.1f %10.1f\n", s.tag, r[0], r[1], r[2], r[3]);
+        std::printf("%-22s %10.1f %10.1f %10.1f %10.1f %10.1f\n", s.tag, r[0], r[4], r[1], r[2], r[3]);
     }
 
     bench_gemv();

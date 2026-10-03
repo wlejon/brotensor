@@ -220,6 +220,40 @@ void matmul_case(Dtype dt, int M, int K, int N, std::uint64_t seed) {
           0, dt == Dtype::FP32 ? 2e-5 : 2 * kF16);
 }
 
+// BF16 activations far outside FP16's range (rows 1e-4 .. 1e6, T5-XXL's FFN
+// and Sana's linear-attention summaries): HIP's rocBLAS BF16 against Vulkan's
+// range-safe staging (per-row power-of-two scale, docs/vulkan-bf16.md). Each
+// row is divided by its own max|y|, so small rows are checked as tightly as
+// the large ones; one or two BF16 ulps of the row maximum.
+void gemm_wide_bf16(int N, int K, int B, bool abt, std::uint64_t seed) {
+    auto x = rnd(std::size_t(B) * K, seed, -1.0f, 1.0f, Dtype::FP32);
+    for (int r = 0; r < B; ++r) {
+        const float s = std::pow(10.0f, float((r * 3) % 11 - 4));
+        for (int k = 0; k < K; ++k) {
+            float& v = x[std::size_t(r) * K + k];
+            v = vkt::round_to(Dtype::BF16, (k % 97 == 5 ? 40.0f : 1.0f) * s * v);
+        }
+    }
+    const auto w = rnd(std::size_t(N) * K, seed + 1, -0.05f, 0.05f, Dtype::BF16);
+    auto per_row = [N, B](std::vector<float> y) {
+        for (int r = 0; r < B; ++r) {
+            float m = 0;
+            for (int n = 0; n < N; ++n) m = std::max(m, std::fabs(y[std::size_t(r) * N + n]));
+            for (int n = 0; n < N; ++n) y[std::size_t(r) * N + n] /= (m > 0 ? m : 1.0f);
+        }
+        return y;
+    };
+    check(abt ? "matmul_abt bf16 wide range (row-normalised)" : "linear_batched bf16 wide range (row-normalised)",
+          shp("N%d K%d B%d max|x| %.0e", N, K, B, 4e7),
+          [&](Device d) {
+              Tensor Y, X = up(x, B, K, Dtype::BF16, d), W = up(w, N, K, Dtype::BF16, d);
+              if (abt) brotensor::matmul_abt(X, W, Y, 1, B, N, K, 0, 0, 0, nullptr, 0);
+              else brotensor::linear_forward_batched_fp16(W, nullptr, X, Y);
+              return per_row(down(Y));
+          },
+          [&] { return per_row(cpu_linear(w, nullptr, x, N, K, B)); }, 0, 2 * kBF16);
+}
+
 // The GEMM's fused epilogues (brodiffusion GeGLU, brolm SwiGLU / residual).
 void gemm_epilogue(int epi, int N, int K, int B, std::uint64_t seed) {
     const auto w = rnd(std::size_t(N) * K, seed, -0.05f, 0.05f, Dtype::FP16);
@@ -258,6 +292,8 @@ void run_gemm() {
     gemm_epilogue(brotensor::kLinearEpiGeglu, 2560, 320, 1024, 22);
     gemm_epilogue(brotensor::kLinearEpiSwiglu, 6144, 1024, 64, 23);
     gemm_epilogue(brotensor::kLinearEpiAccumulate, 1024, 1024, 64, 24);
+    gemm_wide_bf16(4096, 1024, 120, false, 25);   // T5-XXL-like: d_ff 10240 -> d_model 4096, scaled down
+    gemm_wide_bf16(256, 512, 300, true, 26);
 }
 
 // ─── quantised weights ──────────────────────────────────────────────────────

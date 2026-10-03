@@ -20,11 +20,14 @@ namespace {
 
 struct GemmPush {
     std::uint64_t a, b, c, bias, scale;
+    std::uint64_t ascale;     // gemm_cm SCALE_A: per-row exponents of A (gemm_rowscale.comp)
     std::uint32_t m, n, k, lda, ldb, ldc, sa, sb, sc, half_n;
     std::uint32_t tm0, tn0;   // gemm_cm: tile origin of the dispatch
 };
 
 struct GluPush { std::uint64_t x, dy, y; std::uint32_t n, d; };
+
+struct RowScalePush { std::uint64_t a, out; std::uint32_t m, k, lda, sa; };
 
 // Cooperative-matrix tiles: BM x BN workgroup tile, K step BK, WM x WN per
 // subgroup of 32. Every entry must satisfy the shader's assumptions: chunk
@@ -47,6 +50,7 @@ constexpr SimtCfg kSimtCfgs[] = {
 
 std::atomic<int> g_override{0};
 std::atomic<int> g_cm_cfg{-1};
+std::atomic<int> g_noscale{-1};   // -1: read BROTENSOR_VK_GEMM_NOSCALE on first use
 
 std::uint32_t cm_wg(const CmCfg& c) { return (c.bm / c.wm) * (c.bn / c.wn) * 32u; }
 
@@ -87,8 +91,17 @@ bool gemv_eligible(DeviceCtx& d, const GemmArgs& g) {
 }
 
 bool coopmat_eligible(DeviceCtx& d, const GemmArgs& g) {
-    if (g.qb != 0) return d.info().coopmat_f16 && is16(g.da) && g.dc == g.da;
-    return g_override.load(std::memory_order_relaxed) != 2 && d.info().coopmat_f16 && is16(g.da) && g.db == g.da && g.dc == g.da;
+    if (!d.info().coopmat_f16) return false;
+    if (g.qb != 0) return is16(g.da) && g.dc == g.da;
+    if (g_override.load(std::memory_order_relaxed) == 2) return false;
+    if (is16(g.da)) return g.db == g.da && (g.dc == g.da || g.dc == Dtype::FP32);
+    return g.round_a && g.da == Dtype::FP32 && is16(g.db) && g.dc == Dtype::FP32;
+}
+
+ShaderId cm_shader(const GemmArgs& g) {
+    if (g.da == Dtype::FP32) return g.db == Dtype::FP16 ? ShaderId::gemm_cm_f32a_w16 : ShaderId::gemm_cm_f32a_wbf16;
+    if (g.dc == Dtype::FP32) return g.da == Dtype::FP16 ? ShaderId::gemm_cm_f16_c32 : ShaderId::gemm_cm_bf16_c32;
+    return g.da == Dtype::FP16 ? ShaderId::gemm_cm_f16 : ShaderId::gemm_cm_bf16;
 }
 
 // The SIMT shader for (A, B, C) dtypes, or kCount when there is none.
@@ -142,6 +155,7 @@ void launch_batched(DeviceCtx& d, const Kernel& k, GemmPush pc, const GemmArgs& 
         p.a += static_cast<std::uint64_t>(z0) * g.sa * esize(g.da);
         p.b += static_cast<std::uint64_t>(z0) * g.sb * esize(g.db);
         p.c += static_cast<std::uint64_t>(z0) * g.sc * esize(g.dc);
+        if (p.ascale && g.sa != 0) p.ascale += static_cast<std::uint64_t>(z0) * static_cast<std::uint64_t>(g.m) * 4u;
         launch(d, k, p, gx, gy, static_cast<std::uint32_t>(nz));
     }
 }
@@ -189,7 +203,48 @@ void glu_pass(DeviceCtx& d, std::uint32_t op, std::uint64_t x, std::uint64_t y, 
     launch(d, k, pc, groups_1d(pc.n, k));
 }
 
+// A BF16 A on the cooperative-matrix kernel is staged with per-row
+// power-of-two scales (docs/vulkan-bf16.md) unless BROTENSOR_VK_GEMM_NOSCALE=1
+// or the test hook turned it off; an FP32 A always is.
+bool scale_a(const GemmArgs& g) {
+    if (g.da == Dtype::FP32) return true;
+    if (g.da != Dtype::BF16) return false;
+    int v = g_noscale.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("BROTENSOR_VK_GEMM_NOSCALE");
+        v = (e && *e && std::string(e) != "0") ? 1 : 0;
+        g_noscale.store(v, std::memory_order_relaxed);
+    }
+    return v == 0;
+}
+
+// Writes the exponent of every row of A (per batch slice, or once when A is
+// broadcast) into `out` (INT32): gemm_rowscale.comp.
+void row_scales(DeviceCtx& d, const GemmArgs& g, std::uint64_t out) {
+    const bool vec = !g.ta && g.a % 16 == 0 && g.lda % 8 == 0 && g.k % 8 == 0 && g.sa % 8 == 0;
+    const ShaderId id = g.da == Dtype::FP32 ? ShaderId::gemm_rowscale_f32 : ShaderId::gemm_rowscale_bf16;
+    const Kernel& k = d.pipelines().get(id, {g.ta ? 1u : 0u, vec ? 1u : 0u});
+    const std::uint64_t groups = g.ta ? cdiv(g.m, 256) : cdiv(g.m, 4);
+    const std::uint32_t gx = static_cast<std::uint32_t>(std::min<std::uint64_t>(groups, 65535));
+    const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(groups, gx));
+    if (gy > 65535) fail(g, "matrix too large for one dispatch");
+    const int nb = g.sa != 0 ? g.batch : 1;
+    for (int z0 = 0; z0 < nb; z0 += 65535) {
+        const int nz = std::min(65535, nb - z0);
+        RowScalePush p{};
+        p.a = g.a + static_cast<std::uint64_t>(z0) * g.sa * esize(g.da);
+        p.out = out + static_cast<std::uint64_t>(z0) * static_cast<std::uint64_t>(g.m) * 4u;
+        p.m = static_cast<std::uint32_t>(g.m);
+        p.k = static_cast<std::uint32_t>(g.k);
+        p.lda = static_cast<std::uint32_t>(g.lda);
+        p.sa = static_cast<std::uint32_t>(g.sa);
+        launch(d, k, p, gx, gy, static_cast<std::uint32_t>(nz));
+    }
+}
+
 }  // namespace
+
+void set_gemm_scaling(int mode) { g_noscale.store(mode == 0 ? 1 : 0, std::memory_order_relaxed); }
 
 void set_gemm_override(int mode) { g_override.store(mode, std::memory_order_relaxed); }
 
@@ -220,7 +275,7 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
     check_args(g);
     const std::uint32_t nout = g.epi == EPI_SWIGLU || g.epi == EPI_GEGLU ? g.n / 2 : g.n;
     if (g.m == 0 || nout == 0) return;
-    const GemmPush pc = make_push(g);
+    GemmPush pc = make_push(g);
 
     if (gemv_eligible(d, g)) {
         ShaderId id;
@@ -243,20 +298,33 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
         const std::uint32_t gx = static_cast<std::uint32_t>(
             g.epi == EPI_SWIGLU ? cdiv(nout, wout) : cdiv(static_cast<std::uint64_t>(g.n), c.bn));
         const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(g.m, c.bm));
-        const ShaderId id = g.da == Dtype::FP16 ? ShaderId::gemm_cm_f16 : ShaderId::gemm_cm_bf16;
+        const ShaderId id = cm_shader(g);
+        // Range-safe BF16 / FP32: the per-row exponents of A, in a stream-ordered
+        // scratch (freed here, reused only by later work on the stream).
+        const bool scaled = scale_a(g);
+        ::brotensor::Tensor exps;
+        if (scaled) {
+            const long long rows = static_cast<long long>(g.m) * (g.sa != 0 ? g.batch : 1);
+            if (rows > 0x7fffffffLL) fail(g, "too many rows to scale");
+            exps = ::brotensor::Tensor::empty_on(::brotensor::Device::vulkan(d.index()), static_cast<int>(rows), 1,
+                                                 Dtype::INT32);
+            row_scales(d, g, addr(exps.data));
+            pc.ascale = addr(exps.data);
+        }
         auto kernel = [&](bool direct) -> const Kernel& {
             const std::uint32_t spec[] = {c.bm, c.bn, c.bk, c.wm, c.wn, cm_wg(c),
                                           static_cast<std::uint32_t>(g.epi), static_cast<std::uint32_t>(g.act),
                                           g.ta ? 1u : 0u, g.nb ? 1u : 0u, cm_vec_ok(g) ? 1u : 0u,
                                           direct ? 1u : 0u, g.bias ? 1u : 0u,
-                                          static_cast<std::uint32_t>(g.qb)};
+                                          static_cast<std::uint32_t>(g.qb), scaled ? 1u : 0u};
             return d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)), 32);
         };
         // The fragment-form epilogue (stores straight from the accumulator)
-        // needs FP16 output, an aligned C, and tiles wholly inside the
-        // matrix: the full tiles go in one dispatch, the right and bottom
-        // edge strips (if any) in up to two more with the general epilogue.
-        const bool direct = g.da == Dtype::FP16 && g.epi != EPI_GEGLU && g.c % 16 == 0 && g.ldc % 8 == 0 &&
+        // needs FP16 operands and output, an aligned C, and tiles wholly
+        // inside the matrix: the full tiles go in one dispatch, the right and
+        // bottom edge strips (if any) in up to two more with the general
+        // epilogue.
+        const bool direct = g.da == Dtype::FP16 && g.dc == Dtype::FP16 && g.epi != EPI_GEGLU && g.c % 16 == 0 && g.ldc % 8 == 0 &&
                             g.sc % 8 == 0 && (g.bias == 0 || g.bias % 16 == 0);
         const std::uint32_t fx = direct ? static_cast<std::uint32_t>((g.epi == EPI_SWIGLU ? nout : g.n) / wout) : 0;
         const std::uint32_t fy = direct ? static_cast<std::uint32_t>(g.m / c.bm) : 0;

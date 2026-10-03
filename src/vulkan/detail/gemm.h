@@ -3,9 +3,12 @@
 // The one GEMM entry point every matrix op goes through (gemm.cpp). It picks
 //   * gemv.comp       NT layout, at most 8 rows of A, one batch: the decode
 //                     regime, bound by reading B once;
-//   * gemm_cm.comp    FP16 / BF16 operands on a device with 16x16x16
-//                     cooperative-matrix fragments (BF16 converted to FP16 at
-//                     load, docs/vulkan.md "Dtype policy");
+//   * gemm_cm.comp    FP16 / BF16 operands, C in their dtype or FP32, on a
+//                     device with 16x16x16 cooperative-matrix fragments (BF16
+//                     converted to FP16 at load, A with a per-row power-of-two
+//                     scale computed by gemm_rowscale.comp first:
+//                     docs/vulkan-bf16.md); also an FP32 A against 16-bit B
+//                     when the caller sets round_a;
 //   * gemm_simt.comp  everything else: FP32, FP32 activations against 16-bit
 //                     weights, and 16-bit operands without cooperative matrix.
 // C[z](M, N) = op(A[z]) op(B[z]) + epilogue, see shaders/gemm_common.glsl.
@@ -37,6 +40,11 @@ struct GemmArgs {
     int qb = 0;
     std::uint64_t scale = 0;
     int act = 0;                 // LACT_*
+    // An FP32 A (against 16-bit B, FP32 C) may be rounded to FP16 at a
+    // per-row power-of-two scale and run on the cooperative-matrix kernel.
+    // Only for A that is an op's own intermediate: the public FP32-activation
+    // ops promise unrounded activations and leave it false.
+    bool round_a = false;
     const char* op = "gemm";     // for error messages
 };
 
@@ -51,6 +59,12 @@ const char* gemm_path(DeviceCtx& d, const GemmArgs& g);
 // Test / benchmark hook, process-wide: 0 = automatic choice, 1 = never the
 // GEMV kernel, 2 = SIMT only (as on a device without cooperative matrix).
 void set_gemm_override(int mode);
+
+// Test / benchmark hook, process-wide: 0 = stage a BF16 A as plain FP16 (the
+// pre-scaling behaviour, out of range becomes inf), 1 = per-row power-of-two
+// scaling (the default; docs/vulkan-bf16.md). Overrides
+// BROTENSOR_VK_GEMM_NOSCALE.
+void set_gemm_scaling(int mode);
 
 // Benchmark hook: force cooperative-matrix tile configuration `index` (see
 // gemm_cm_config_name), or -1 for the automatic choice. Returns the number of

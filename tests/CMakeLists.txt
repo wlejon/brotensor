@@ -166,6 +166,7 @@ brotensor_add_test(brotensor_test_tensor_errors test_tensor_errors.cpp)
 # without a Vulkan device.
 if(BROTENSOR_WITH_VULKAN)
     brotensor_add_test(brotensor_test_vulkan test_vulkan.cpp test_vulkan_ops.cpp test_vulkan_gemm.cpp
+                       test_vulkan_gemm_range.cpp
                        test_vulkan_norm.cpp test_vulkan_attention.cpp test_vulkan_attention_ops.cpp
                        test_vulkan_conv.cpp test_vulkan_spatial.cpp test_vulkan_quant.cpp
                        test_vulkan_quant_attention.cpp test_vulkan_audio.cpp test_vulkan_sampling.cpp

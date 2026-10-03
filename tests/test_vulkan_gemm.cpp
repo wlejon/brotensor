@@ -380,14 +380,23 @@ void test_paths() {
     const bool cm = brotensor::vulkan::device_info(vk()).cooperative_matrix && d.info().coopmat_f16;
     VKT_CHECK(std::string(dv::gemm_path(d, g)) == (cm ? "coopmat" : "simt"));
     std::printf("  coopmat GEMM: %s\n", cm ? "yes" : "no (SIMT fallback)");
+    g.dc = Dtype::FP32;   // 16-bit operands, FP32 result
+    VKT_CHECK(std::string(dv::gemm_path(d, g)) == (cm ? "coopmat" : "simt"));
     g.da = g.db = g.dc = Dtype::FP32;
     VKT_CHECK(std::string(dv::gemm_path(d, g)) == "simt");
+    g.db = Dtype::FP16;   // FP32 activations: SIMT unless the caller allows rounding A
+    VKT_CHECK(std::string(dv::gemm_path(d, g)) == "simt");
+    g.round_a = true;
+    VKT_CHECK(std::string(dv::gemm_path(d, g)) == (cm ? "coopmat" : "simt"));
+    g.round_a = false;
     g.db = Dtype::BF16;
     g.m = 3;
     VKT_CHECK(std::string(dv::gemm_path(d, g)) == "gemv");
 }
 
 }  // namespace
+
+void run_gemm_range_tests();   // test_vulkan_gemm_range.cpp
 
 void run_gemm_tests() {
     test_paths();
@@ -396,6 +405,7 @@ void run_gemm_tests() {
     test_linear_ex();
     test_linear_batched();
     test_backwards();
+    run_gemm_range_tests();
 }
 
 }  // namespace vkt

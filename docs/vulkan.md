@@ -311,7 +311,7 @@ three kernels:
 | Kernel | When | What |
 |---|---|---|
 | `gemv.comp` | NT layout, M <= 8, one batch | 64 invocations per output column, 4 chunks of 16 bytes in flight each, all epilogues fused. 235 GB/s of FP16 weights at B = 1-2, 200-215 GB/s at B = 4-8 (256 GB/s peak) |
-| `gemm_cm.comp` | FP16 / BF16 operands, `coopmat_f16` device | 16x16x16 FP16 fragments, FP32 accumulation, subgroup 32, double-buffered shared tiles |
+| `gemm_cm.comp` | FP16 / BF16 operands (C in their dtype or FP32), `coopmat_f16` device | 16x16x16 FP16 fragments, FP32 accumulation, subgroup 32, double-buffered shared tiles; a BF16 A staged at a per-row power-of-two scale (docs/vulkan-bf16.md) |
 | `gemm_simt.comp` | everything else | FP32 FMA, 128x128 or 64x64 tile, 8x8 or 4x4 per invocation |
 
 **Cooperative-matrix kernel.** Tiles (BM x BN x BK / subgroup tile) are
@@ -371,8 +371,9 @@ figures from `../vk-spike/RESULTS.md`):
 (Chunk-5 figures, with the K rotation; chunk 2 measured 23.8 / 29.8 / 19.6 /
 23.1 / 24.8 / 20.3 / 16.3 / 16.2 / 34.0 / 32.6.)
 
-BF16 operands (converted at load, fallback epilogue) run at 10.7-31.9 TF/s on
-the same shapes, the SIMT kernel at 3-8 TF/s in FP16 or FP32, and `matmul`'s
+BF16 operands (converted at load, A at a per-row scale, fallback epilogue;
+docs/vulkan-bf16.md) run at 17.9-29.6 TF/s on the same shapes, the SIMT
+kernel at 3-8 TF/s in FP16 or FP32, and `matmul`'s
 NN layout at the NT figures. `brotensor_test_vulkan --bench-gemm` reproduces
 the table (`BROTENSOR_VK_BENCH_TILES=1` adds one column per tile,
 `BROTENSOR_VK_BENCH_SHAPE=<tag>` runs one shape, `BROTENSOR_VK_BENCH_GEMV=1`
@@ -382,7 +383,8 @@ throttle, so compare configurations in separate short processes.
 **Contracts.** As the HIP backend where it is wider than the CPU's: FP32 /
 FP16 / BF16 throughout; `linear_forward_batched` takes FP32 activations against
 FP32 / FP16 / BF16 weights and accumulates in FP32 without rounding the
-activations; `matmul_abt` resizes C only when it cannot hold the batch, and
+activations (SIMT; only an op's own FP32 intermediates may take the scaled
+cooperative-matrix path, `GemmArgs::round_a`); `matmul_abt` resizes C only when it cannot hold the batch, and
 throws when a stride reaches past an operand (a device fault on Vulkan is a
 lost device). The SIMT path has no GLU epilogue: it writes an unrounded FP32 r
 and gates it in a second pass, so the result matches the fused kernels.
@@ -841,19 +843,22 @@ measured errors against the CPU and the flash backward's speed against HIP.
   `packHalf2x16`, which rounds toward zero on RADV. Casts are bit-identical to
   `brotensor::fp32_to_fp16_bits`, and the tests check this, including 65520 →
   inf.
-- **BF16**: RADV has no BF16 shader type (no `VK_KHR_shader_bfloat16`, no BF16
-  cooperative matrix). BF16 is therefore carried as `uint16` bits and
+- **BF16**: RADV has no BF16 shader type by default (no
+  `VK_KHR_shader_bfloat16`, no BF16 cooperative matrix; both exist behind
+  `RADV_EXPERIMENTAL=bfloat16`, docs/vulkan-bf16.md). BF16 is therefore carried as `uint16` bits and
   converted in registers (`bf16_to_f32` / `f32_to_bf16` in `common.glsl`,
   RNE, NaN kept quiet, bit-identical to the host helpers). This runs at full
   bandwidth for memory-bound ops, so the elementwise, reduction and norm
   families take BF16 directly. **The policy for matrix-core ops (GEMM,
   attention) is decided here:** `compute_dtype(Device::vulkan(i))` is FP16, so
   a loader holding BF16 weights converts them **once at upload** with
-  `cast(…, Dtype::FP16)`, and the coopmat kernels then see only FP16. A BF16
-  activation that reaches a GEMM goes through the same `cast` first. The GEMM
-  chunk may add an FP32 SIMT path for BF16 values outside FP16's range (±65504).
-  It must not grow a native BF16 coopmat path, because the hardware has none.
-  Attention follows the same rule inside the kernel: `fa_cm.comp` converts BF16
+  `cast(…, Dtype::FP16)`, and the coopmat kernels then see FP16 weights. A
+  BF16 *activation* is range-safe in the GEMM: the cooperative-matrix kernel
+  stages a BF16 A operand into FP16 at a per-row power-of-two scale (exact for
+  BF16's 8-bit significand, undone in the FP32 epilogue; docs/vulkan-bf16.md),
+  so models that need BF16's range (T5-XXL, Sana) run their BF16 forward as
+  on CUDA / HIP. The B operand is converted unscaled and must lie within
+  ±65504. Attention stages unscaled too: `fa_cm.comp` converts BF16
   Q / K / V to FP16 as it stages them (a BF16 value beyond ±65504 becomes inf)
   and writes O back as BF16; `fa_rows.comp` computes BF16 in FP32, and the
   dense path keeps its scores in FP32 while its P V GEMM follows the GEMM's rule.
@@ -864,9 +869,7 @@ measured errors against the CPU and the flash backward's speed against HIP.
   dtype, FP16, on the device; `test_vulkan_misc.cpp` pins it bit for bit).
   `safetensors::upload`, `gguf::upload_raw` and `Tensor::to` keep the source
   dtype by contract, so a BF16 weight that arrives through them stays BF16 and
-  the matrix kernels convert it per load (correct, slower). A BF16 *activation*
-  beyond FP16's range becomes inf in the cooperative-matrix GEMM: models that
-  rely on BF16's range (brolm's T5 on CUDA / HIP) should not take that path.
+  the matrix kernels convert it per load (correct, slower).
 - **INT8 / INT32**: storage carriers only (8-bit storage is enabled): INT8
   weights with FP32 scales, INT32 indices / levels / tokens. The GGUF block
   dtypes (Q8_0, Q4_K, Q6_K) are opaque byte carriers decoded by the quantised
@@ -934,6 +937,7 @@ to divide 64; the dispatcher checks).
 | `BROTENSOR_VK_MAPPED=0` | do not map device memory even when possible |
 | `BROTENSOR_VK_ALLOW_OVERSIZE=1` | allow tensors over the per-buffer limit (out of spec) |
 | `BROTENSOR_VK_NO_COOPMAT=1` | do not use cooperative matrix (the GEMMs run the SIMT kernel) |
+| `BROTENSOR_VK_GEMM_NOSCALE=1` | stage a BF16 A as plain FP16 (the pre-scaling behaviour: past ±65504 becomes inf; comparison only) |
 | `BROTENSOR_VK_GEMM_CFG=bm,bn,bk,wm,wn` | force one cooperative-matrix tile (one of the four in `gemm.cpp`) |
 | `BROTENSOR_VK_FA_CFG=bc,nsg` | force the `fa_cm` tile: bc in {16, 32, 64} keys, nsg in {1, 2, 4} subgroups, 16 nsg <= 2 bc |
 | `BROTENSOR_VK_FA_WGS=n` | workgroups `fa_rows` splits keys up to (default 80) |

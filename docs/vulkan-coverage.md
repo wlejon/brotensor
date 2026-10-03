@@ -155,7 +155,9 @@ op gap in brotensor.
   usable either: chunk 7a ran PixArt-Sigma with T5-XXL on Vulkan and got noise,
   while the same DiT and VAE on Vulkan with the T5 encoding computed on HIP
   produced the HIP image. T5 on Vulkan needs FP32 activations through the
-  matrix ops (the SIMT GEMM) or a range-safe BF16 GEMM.
+  matrix ops (the SIMT GEMM) or a range-safe BF16 GEMM. *Resolved:* chunk 7b
+  took the FP32 route; the range-safe BF16 GEMM (docs/vulkan-bf16.md) then
+  let T5 take its BF16 path on Vulkan too, 2x faster than HIP.
 * **Sibling GPU kernels: must be fixed before Vulkan tensors reach them.**
   brodiffusion `fused_resblock.cu`, `fused_transformer.cu` (fused linear +
   GeGLU, row-bias / vector adds) and `triposplat/flow_rope.cu`, brovisionml
