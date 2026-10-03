@@ -111,5 +111,13 @@ set(BROTENSOR_VK_SHADERS
     "sampler_f16|sampler.comp|-DDT=1"
     "sampler_bf16|sampler.comp|-DDT=2"
     "philox|philox.comp|"
+    "gemv_q_f16|gemv_q.comp|-DDT=1"
+    "gemv_q_bf16|gemv_q.comp|-DDT=2"
+    "dequant|dequant.comp|"
+    "audio_f32|audio.comp|-DDT=0"
+    "audio_f16|audio.comp|-DDT=1"
+    "audio_bf16|audio.comp|-DDT=2"
+    "dft|dft.comp|-DDT=0"
+    "select|select.comp|-DDT=0"
     "test_shared_overflow|test_shared_overflow.comp|"
 )

@@ -20,6 +20,7 @@ struct Conv2dArgs {
     int n = 1, cin = 0, h = 0, wd = 0, cout = 0, kh = 1, kw = 1;
     int sh = 1, sw = 1, ph = 0, pw = 0, dh = 1, dw = 1, groups = 1;
     bool accum = false;
+    std::uint64_t scale = 0;   // nonzero: w is INT8 (C_out, K) with these per-channel FP32 scales (dt FP16)
     const char* op = "conv2d_forward";
 };
 

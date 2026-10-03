@@ -1,0 +1,34 @@
+#version 460
+// Dequantise a quantised weight matrix to FP16: W16(rows, K) = decode(W).
+// One invocation per 8-element chunk, grid-stride; FMT (quant_decode.glsl's
+// QF_*) is specialised. VEC: K a multiple of 8 (always for GGUF); INT8
+// rows of any other length take one element per invocation.
+#include "common.glsl"
+#include "quant_decode.glsl"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint FMT = QF_Q8_0;
+layout(constant_id = 1) const uint VEC = 1;   // 0: INT8 rows of any length, one element per invocation
+
+layout(push_constant) uniform PC {
+    uint64_t w, y, scale;
+    uint rows, k, rowbytes;
+} pc;
+
+void main() {
+    if (VEC == 0u) {
+        const uint total = pc.rows * pc.k;
+        for (uint i = gl_GlobalInvocationID.x; i < total; i += GRID_STRIDE_X) {
+            const uint r = i / pc.k, c = i % pc.k;
+            const float s = F32Buf(pc.scale).v[r];
+            F16Buf(pc.y).v[i] = float16_t(float(int8_t(U8Buf(pc.w).v[r * pc.rowbytes + c])) * s);
+        }
+        return;
+    }
+    const uint per = pc.k / 8u, total = pc.rows * per;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += GRID_STRIDE_X) {
+        const uint r = i / per, k = (i % per) * 8u;
+        const QRaw o = qload8(FMT, true, pc.w + uint64_t(r) * pc.rowbytes, pc.scale, r, k, pc.k);
+        QU4Buf(pc.y).v[i] = qdecode8_f16(FMT, o, k);
+    }
+}

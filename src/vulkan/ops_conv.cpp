@@ -11,6 +11,7 @@
 
 #include "detail/gemm.h"
 #include "detail/kernels.h"
+#include "detail/quant.h"
 #include "detail/spatial.h"
 
 #include <brotensor/detail/dispatch.h>
@@ -30,7 +31,7 @@ using ::brotensor::Tensor;
 namespace {
 
 struct ConvPush {
-    std::uint64_t x, w, y, bias;
+    std::uint64_t x, w, y, bias, scale;
     std::uint32_t m, n, k, h, wd, wo, cin, cout, groups, tm0, tn0;
 };
 
@@ -149,7 +150,7 @@ void conv_coopmat(DeviceCtx& d, const Conv2dArgs& a, const Geo& g) {
     const std::uint32_t K = static_cast<std::uint32_t>(g.k);
     const CmCfg& c = pick_cm(M, P, std::uint64_t(a.n) * a.groups);
     const std::uint32_t wg = (c.bm / c.wm) * (c.bn / c.wn) * 32u;
-    const bool avec = a.w % 16 == 0 && K % 8 == 0;
+    const bool avec = a.scale ? a.w % 8 == 0 && K % 8 == 0 : a.w % 16 == 0 && K % 8 == 0;
     const bool rowch = g.wo % 8 == 0;
     // B chunk loads (conv_cm.comp BVEC): one aligned 16-byte load for a
     // plain 1x1, two shifted ones for any stride-1 kernel over rows of whole
@@ -171,7 +172,8 @@ void conv_coopmat(DeviceCtx& d, const Conv2dArgs& a, const Geo& g) {
                                       static_cast<std::uint32_t>(a.sh), static_cast<std::uint32_t>(a.sw),
                                       static_cast<std::uint32_t>(a.ph), static_cast<std::uint32_t>(a.pw),
                                       static_cast<std::uint32_t>(a.dh), static_cast<std::uint32_t>(a.dw),
-                                      rowch ? 1u : 0u, a.accum ? 1u : 0u, bvec};
+                                      rowch ? 1u : 0u, a.accum ? 1u : 0u, bvec,
+                                      a.scale ? static_cast<std::uint32_t>(QF_INT8) : 0u};
         return d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)), 32);
     };
     const std::uint32_t gx = static_cast<std::uint32_t>(cdiv(P, c.bn));
@@ -187,6 +189,7 @@ void conv_coopmat(DeviceCtx& d, const Conv2dArgs& a, const Geo& g) {
         pc.w = a.w;
         pc.y = a.y + std::uint64_t(i0) * a.cout * P * 2u;
         pc.bias = a.bias;
+        pc.scale = a.scale;
         pc.m = M; pc.n = P; pc.k = K;
         pc.h = static_cast<std::uint32_t>(a.h);
         pc.wd = static_cast<std::uint32_t>(a.wd);
@@ -274,6 +277,20 @@ const char* conv2d_path(DeviceCtx& d, const Conv2dArgs& a) {
 void conv2d(DeviceCtx& d, const Conv2dArgs& a) {
     const Geo g = geometry(a);
     if (a.n == 0) return;
+    if (a.scale != 0) {
+        // INT8 weights: decoded in the cooperative-matrix kernel's A tiles;
+        // any other path runs on an FP16 copy of the (small) weight.
+        if (a.dt == Dtype::FP16 && coopmat_ok(d, a, g)) return conv_coopmat(d, a, g);
+        QuantW q;
+        q.fmt = QF_INT8; q.w = a.w; q.scale = a.scale; q.rows = a.cout; q.k = g.k;
+        q.rowbytes = static_cast<std::uint32_t>(g.k);
+        Tensor w16 = Tensor::empty_on(Device::vulkan(d.index()), a.cout, g.k, Dtype::FP16);
+        dequant(d, q, addr(w16.data));
+        Conv2dArgs b = a;
+        b.w = addr(w16.data);
+        b.scale = 0;
+        return conv2d(d, b);
+    }
     if (coopmat_ok(d, a, g)) return conv_coopmat(d, a, g);
     if (implicit_gemm_ok(a, g)) return conv_simt(d, a, g);
     if (a.accum) fail(a.op, "accumulating direct convolution");

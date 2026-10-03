@@ -14,6 +14,11 @@
 // (the "address arithmetic" form of implicit GEMM). Y is written NCHW, which
 // is C (M, N) row-major with ld = H_out * W_out.
 //
+// QA = QF_INT8: the weights are INT8 rows with per-output-channel FP32 scales
+// (conv2d_int8w_fp16_forward), decoded to FP16 (q * scale, RNE) as each
+// chunk is stored to shared memory; AVEC then means K % 8 == 0 with an
+// 8-byte-aligned weight.
+//
 // The kernel is gemm_cm.comp's with the B operand replaced (NB layout: tile
 // rows are k, 8-pixel chunks along n) and the epilogue's bias indexed by row.
 // The geometry (kernel, stride, padding, dilation) is specialised, so the
@@ -56,10 +61,12 @@ layout(constant_id = 20) const uint BVEC = 0;    // B chunk loads: 0 = eight 2-b
                                                  //     one aligned 16-byte load;
                                                  // 2 = stride 1, W % 8 == 0, ROWCH: two aligned
                                                  //     16-byte loads, shifted into place at the store
+layout(constant_id = 21) const uint QA = 0;      // A (the weights) is INT8 with per-row FP32
+                                                 // scales (QF_INT8), decoded to FP16 at the store
 layout(local_size_x_id = 5) in;
 
 layout(push_constant) uniform PC {
-    uint64_t x, w, y, bias;
+    uint64_t x, w, y, bias, scale;
     uint m, n, k;            // Cg_out, H_out * W_out, Cg_in * KH * KW
     uint h, wd, wo;          // input H, W; output W
     uint cin, cout, groups;  // totals (batch offsets)
@@ -67,6 +74,7 @@ layout(push_constant) uniform PC {
 } pc;
 
 #include "op_codes.h"
+#include "quant_decode.glsl"
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer U4Buf { uvec4 v[]; };
 
@@ -86,6 +94,8 @@ shared uvec4 As[2 * ASZ];
 shared uvec4 Bs[2 * BSZ];
 
 uvec4 ra[LA];
+QRaw rqa[LA];            // QA: raw INT8 chunks
+uint qka[LA];
 uint16_t rb[LB * 8];
 uvec4 rbv[LB], rbv2[LB]; // BVEC 1 / 2 (vb then also holds the shift in bits 8..10)
 uint va;                 // A chunk validity (AVEC)
@@ -145,7 +155,14 @@ void load_tiles(uint64_t A, uint64_t X, uint m0, uint k0) {
     [[unroll]] for (uint j = 0; j < LA; ++j) {
         const uint i = tid + j * WG, r = i / CA, q = i % CA;
         const uint row = m0 + r, col = k0 + q * 8u;
-        if (AVEC != 0) {
+        if (QA != 0) {
+            const bool ok = row < pc.m && col < pc.k;
+            qka[j] = ok ? col : 0u;
+            rqa[j] = qload8(QF_INT8, AVEC != 0, A + uint64_t(ok ? row : 0u) * pc.k, pc.scale,
+                            (gl_WorkGroupID.z % pc.groups) * pc.m + (ok ? row : 0u),
+                            qka[j], pc.k);
+            va |= ok ? (1u << j) : 0u;
+        } else if (AVEC != 0) {
             const bool ok = row < pc.m && col < pc.k;
             ra[j] = U4Buf(A).v[ok ? (row * pc.k + col) / 8u : 0u];
             va |= ok ? (1u << j) : 0u;
@@ -223,7 +240,9 @@ void store_tiles(uint buf) {
     [[unroll]] for (uint j = 0; j < LA; ++j) {
         const uint i = tid + j * WG;
         uvec4 h = ra[j];
-        if (AVEC != 0) {
+        if (QA != 0) {
+            h = (va & (1u << j)) != 0u ? qdecode8_f16(QF_INT8, rqa[j], qka[j]) : uvec4(0);
+        } else if (AVEC != 0) {
             if (DT == DT_BF16) h = bf16x8_to_f16x8(h);
             if ((va & (1u << j)) == 0u) h = uvec4(0);
         }
@@ -280,7 +299,7 @@ void main() {
     const uint P = pc.n;
     const uint64_t X = pc.x + 2ul * (uint64_t(img) * uint64_t(pc.cin) + uint64_t(g) * uint64_t(pc.cin / pc.groups)) *
                                   uint64_t(pc.h) * uint64_t(pc.wd);
-    const uint64_t A = pc.w + 2ul * uint64_t(g) * uint64_t(pc.m) * uint64_t(pc.k);
+    const uint64_t A = pc.w + (QA != 0 ? 1ul : 2ul) * uint64_t(g) * uint64_t(pc.m) * uint64_t(pc.k);
     const uint64_t C = pc.y + 2ul * (uint64_t(img) * uint64_t(pc.cout) + uint64_t(g) * uint64_t(pc.m)) * uint64_t(P);
     const uint64_t BIASP = pc.bias + 2ul * uint64_t(g) * uint64_t(pc.m);
     const uint m0 = (gl_WorkGroupID.y + pc.tm0) * BM;

@@ -1,0 +1,210 @@
+#version 460
+// The spectral family's kernels (ops_spectral.cpp), FP32, one per
+// specialisation constant 0 (SP_* in op_codes.h). Every transform (fft,
+// ifft, rfft, irfft, their adjoints, and the STFT / iSTFT pair with theirs)
+// is a matrix product against a DFT basis this kernel writes (SP_BASIS), so
+// the arithmetic runs in the GEMM (gemm.cpp); the rest are the framing
+// gathers around it and the complex elementwise ops.
+//
+// SP_BASIS writes B (rows x cols, row-major) for Y = X B^T, X one signal per
+// row, with e^{i s 2 pi m / L}, m = (frequency index * time index) mod L
+// reduced exactly in integers, the angle folded into [0, pi / 4] before
+// sincos_acc (absolute error ~1e-7 at any L), times scale, the Hermitian
+// weight w_k (1 for k = 0 and the Nyquist bin, else 2) when asked, and a
+// window sample at the time index when one is given:
+//   BASIS_R2C  real input (time n = i + tofs) -> interleaved bins
+//              (o = 2k + re/im): coefficients cos, s sin
+//   BASIS_C2R  interleaved bins in (i = 2k + re/im) -> the real part of the
+//              time signal (n = o + tofs): cos, -s sin
+//   BASIS_C2C  interleaved in and out: the complex multiply's four terms
+// SP_OLA          istft's overlap-add of windowed frames and COLA division
+// SP_STFT_ADJ     stft_backward's scatter of frame gradients onto the signal,
+//                 as a gather (reflect-padding images included)
+// SP_ISTFT_ADJ    istft_backward's padded, COLA-divided gradient (gacc)
+// SP_CX_*         complex_mul (+ backward), complex_abs (+ backward),
+//                 complex_angle, complex_from_polar
+#include "common.glsl"
+#include "math_acc.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint OP = SP_BASIS;
+
+layout(push_constant) uniform PC {
+    uint64_t a, b, c, d, e;
+    uint u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10;
+    int sgn;
+    float scale;
+} pc;
+
+// cos and sin of 2 pi m / L, m in [0, L): quadrant from 4m / L, the
+// remainder folded to at most an eighth of a turn.
+void twiddle(uint m, uint L, out float c, out float s) {
+    const uint64_t m4 = uint64_t(m) * 4u;
+    const uint q = uint(m4 / L);
+    uint r = uint(m4 - uint64_t(q) * L);          // angle within the quadrant: (pi / 2) r / L
+    const bool swp = 2u * r > L;
+    if (swp) r = L - r;                           // pi / 2 - angle
+    const float x = float(r) * (1.57079632679489662 / float(L));
+    float sx, cx;
+    sincos_acc(x, sx, cx);
+    float cq = swp ? sx : cx, sq = swp ? cx : sx; // cos / sin of the in-quadrant angle
+    if (q == 0u)      { c = cq;  s = sq;  }
+    else if (q == 1u) { c = -sq; s = cq;  }
+    else if (q == 2u) { c = -cq; s = -sq; }
+    else              { c = sq;  s = -cq; }
+}
+
+// atan2 to about 2 ulp (Cephes atanf on [0, 1], octant folding).
+float atan2_acc(float y, float x) {
+    const float ax = abs(x), ay = abs(y);
+    if (ax == 0.0 && ay == 0.0) {
+        const float r = (floatBitsToUint(x) >> 31) != 0u ? 3.14159265358979324 : 0.0;
+        return (floatBitsToUint(y) >> 31) != 0u ? -r : r;
+    }
+    const bool sw = ay > ax;
+    float a = sw ? div_rn(ax, ay) : div_rn(ay, ax);
+    float off = 0.0;
+    if (a > 0.414213562373095) { a = div_rn(a - 1.0, a + 1.0); off = 0.785398163397448310; }
+    const float z = a * a;
+    float r = (((8.05374449538e-2 * z - 1.38776856032e-1) * z + 1.99777106478e-1) * z - 3.33329491539e-1) * z * a + a;
+    r += off;
+    if (sw) r = 1.57079632679489662 - r;
+    if ((floatBitsToUint(x) >> 31) != 0u) r = 3.14159265358979324 - r;
+    return (floatBitsToUint(y) >> 31) != 0u ? -r : r;
+}
+
+float wk(uint k, uint L) { return (k == 0u || (L % 2u == 0u && 2u * k == L)) ? 1.0 : 2.0; }
+
+// Frames f with f hop + pad_lo <= p < f hop + pad_lo + win: [f0, f1].
+void cover(int p, int hop, int pad_lo, int win, int frames, out int f0, out int f1) {
+    const int t = p - pad_lo;
+    f1 = t < 0 ? -1 : min(t / hop, frames - 1);
+    const int lo = t - win + 1;
+    f0 = lo <= 0 ? 0 : (lo + hop - 1) / hop;
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    if (OP == SP_BASIS) {
+        // d B; c window (0 none); u0 rows, u1 cols, u2 L, u3 mode, u4 tofs,
+        // u5 weights, u6 row0 (absolute output index of row 0); sgn; scale
+        const uint total = pc.u0 * pc.u1, L = pc.u2;
+        const float sg = float(pc.sgn);
+        for (uint t = gid; t < total; t += GRID_STRIDE_X) {
+            const uint o = t / pc.u1 + pc.u6, i = t % pc.u1;
+            uint k, n, widx, oc, ic;
+            if (pc.u3 == BASIS_R2C)      { k = o >> 1; oc = o & 1u; n = i + pc.u4; widx = i; ic = 0u; }
+            else if (pc.u3 == BASIS_C2R) { k = i >> 1; ic = i & 1u; n = o + pc.u4; widx = o; oc = 0u; }
+            else                         { k = o >> 1; oc = o & 1u; n = i >> 1; ic = i & 1u; widx = 0u; }
+            const uint m = uint((uint64_t(k % L) * uint64_t(n % L)) % L);
+            float c, s;
+            twiddle(m, L, c, s);
+            float v;
+            if (oc == 0u) v = ic == 0u ? c : -sg * s;
+            else          v = ic == 0u ? sg * s : c;
+            v *= pc.scale;
+            if (pc.u5 != 0u) v *= wk(k, L);
+            if (pc.c != 0) v *= F32Buf(pc.c).v[widx];
+            F32Buf(pc.d).v[t] = v;
+        }
+    } else if (OP == SP_OLA || OP == SP_ISTFT_ADJ) {
+        // OLA:  a F (N frames, win) -> d y (N, sig);  ISTFT_ADJ: a dSignal (N, sig) -> d gacc (N, padded)
+        // c window; u0 N, u1 signal_len, u2 frames, u3 hop, u4 pad_lo, u5 win, u6 shift, u7 padded_len
+        const uint per = OP == SP_OLA ? pc.u1 : pc.u7;
+        const uint total = pc.u0 * per;
+        for (uint t = gid; t < total; t += GRID_STRIDE_X) {
+            const uint b = t / per;
+            const int p = OP == SP_OLA ? int(t % per) + int(pc.u6) : int(t % per);
+            const int n = p - int(pc.u6);
+            if (OP == SP_ISTFT_ADJ && (n < 0 || n >= int(pc.u1))) { F32Buf(pc.d).v[t] = 0.0; continue; }
+            int f0, f1;
+            cover(p, int(pc.u3), int(pc.u4), int(pc.u5), int(pc.u2), f0, f1);
+            float env = 0.0, acc = 0.0;
+            for (int f = f0; f <= f1; ++f) {
+                const uint j = uint(p - f * int(pc.u3) - int(pc.u4));
+                const float w = F32Buf(pc.c).v[j];
+                env += w * w;
+                if (OP == SP_OLA) acc += F32Buf(pc.a).v[(b * pc.u2 + uint(f)) * pc.u5 + j];
+            }
+            if (OP == SP_OLA) F32Buf(pc.d).v[t] = env > 1e-10 ? div_rn(acc, env) : 0.0;
+            else F32Buf(pc.d).v[t] = env > 1e-10 ? div_rn(F32Buf(pc.a).v[b * pc.u1 + uint(n)], env) : 0.0;
+        }
+    } else if (OP == SP_STFT_ADJ) {
+        // a G (N frames, win) -> d dSignal (N, sig); u0 N, u1 signal_len, u2 frames,
+        // u3 hop, u4 pad_lo, u5 win, u6 center, u7 n_fft / 2, u8 padded_len
+        const uint total = pc.u0 * pc.u1;
+        const int L = int(pc.u1);
+        for (uint t = gid; t < total; t += GRID_STRIDE_X) {
+            const uint b = t / pc.u1;
+            const int s = int(t % pc.u1);
+            // Padded positions whose source is s: p = q + n_fft / 2 for every
+            // reflection image q of s inside the padded range (q = +-s + k
+            // 2 (L - 1)), or p = s without centring.
+            int imgs[6];
+            int ni = 0;
+            if (pc.u6 == 0u) {
+                imgs[ni++] = s;
+            } else {
+                const int h = int(pc.u7), per = 2 * (L - 1);
+                for (int k = -1; k <= 2; ++k) {
+                    for (int sg = 0; sg < 2; ++sg) {
+                        if (L == 1 && (k != 0 || sg != 0)) continue;
+                        const int q = (sg == 0 ? s : -s) + k * per;
+                        const int p = q + h;
+                        if (p < 0 || p >= int(pc.u8)) continue;
+                        bool dup = false;
+                        for (int u = 0; u < ni; ++u) dup = dup || imgs[u] == p;
+                        if (!dup && ni < 6) imgs[ni++] = p;
+                    }
+                }
+            }
+            float acc = 0.0;
+            for (int u = 0; u < ni; ++u) {
+                const int p = imgs[u];
+                int f0, f1;
+                cover(p, int(pc.u3), int(pc.u4), int(pc.u5), int(pc.u2), f0, f1);
+                for (int f = f0; f <= f1; ++f) {
+                    acc += F32Buf(pc.a).v[(b * pc.u2 + uint(f)) * pc.u5 + uint(p - f * int(pc.u3) - int(pc.u4))];
+                }
+            }
+            F32Buf(pc.d).v[t] = acc;
+        }
+    } else {
+        // Complex elementwise over u0 pairs (interleaved [re, im]).
+        for (uint i = gid; i < pc.u0; i += GRID_STRIDE_X) {
+            if (OP == SP_CX_MUL) {
+                const float ar = F32Buf(pc.a).v[2u * i], ai = F32Buf(pc.a).v[2u * i + 1u];
+                const float br = F32Buf(pc.b).v[2u * i], bi = F32Buf(pc.b).v[2u * i + 1u];
+                F32Buf(pc.d).v[2u * i] = ar * br - ai * bi;
+                F32Buf(pc.d).v[2u * i + 1u] = ar * bi + ai * br;
+            } else if (OP == SP_CX_MUL_BWD) {
+                // a, b, c dY; dA (d) += dY conj(b), dB (e) += dY conj(a)
+                const float ar = F32Buf(pc.a).v[2u * i], ai = F32Buf(pc.a).v[2u * i + 1u];
+                const float br = F32Buf(pc.b).v[2u * i], bi = F32Buf(pc.b).v[2u * i + 1u];
+                const float gr = F32Buf(pc.c).v[2u * i], gi = F32Buf(pc.c).v[2u * i + 1u];
+                F32Buf(pc.d).v[2u * i] += gr * br + gi * bi;
+                F32Buf(pc.d).v[2u * i + 1u] += gi * br - gr * bi;
+                F32Buf(pc.e).v[2u * i] += gr * ar + gi * ai;
+                F32Buf(pc.e).v[2u * i + 1u] += gi * ar - gr * ai;
+            } else if (OP == SP_CX_ABS) {
+                const float re = F32Buf(pc.a).v[2u * i], im = F32Buf(pc.a).v[2u * i + 1u];
+                F32Buf(pc.d).v[i] = sqrt(re * re + im * im);
+            } else if (OP == SP_CX_ABS_BWD) {
+                const float re = F32Buf(pc.a).v[2u * i], im = F32Buf(pc.a).v[2u * i + 1u];
+                const float mag = sqrt(re * re + im * im);
+                const float inv = mag > 0.0 ? div_rn(F32Buf(pc.b).v[i], mag) : 0.0;
+                F32Buf(pc.d).v[2u * i] = mag > 0.0 ? re * inv : 0.0;
+                F32Buf(pc.d).v[2u * i + 1u] = mag > 0.0 ? im * inv : 0.0;
+            } else if (OP == SP_CX_ANGLE) {
+                F32Buf(pc.d).v[i] = atan2_acc(F32Buf(pc.a).v[2u * i + 1u], F32Buf(pc.a).v[2u * i]);
+            } else {   // SP_CX_POLAR: a mag, b phase
+                const float m = F32Buf(pc.a).v[i];
+                float s, c;
+                sincos_acc(F32Buf(pc.b).v[i], s, c);
+                F32Buf(pc.d).v[2u * i] = m * c;
+                F32Buf(pc.d).v[2u * i + 1u] = m * s;
+            }
+        }
+    }
+}

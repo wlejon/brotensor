@@ -180,5 +180,9 @@ void run_attention_bench();
 void run_conv_tests();      // test_vulkan_conv.cpp
 void run_spatial_tests();   // test_vulkan_spatial.cpp
 void run_conv_bench();      // test_vulkan_bench_conv.cpp
+void run_quant_tests();     // test_vulkan_quant.cpp
+void run_audio_tests();     // test_vulkan_audio.cpp
+void run_quant_bench();     // test_vulkan_bench_quant.cpp
+void run_audio_bench();     // test_vulkan_bench_quant.cpp
 
 }  // namespace vkt

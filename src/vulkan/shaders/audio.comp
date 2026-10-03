@@ -1,0 +1,332 @@
+#version 460
+// The audio family's small kernels (ops_audio.cpp), one per specialisation
+// constant 0 (AU_* in op_codes.h). -DDT: storage of the signal tensors
+// (FP32 / FP16 / BF16); per-channel parameters (Snake alpha / beta, the
+// gradients of them) are FP32; FP32 arithmetic throughout. Contracts and the
+// order of operations follow the CPU backend (src/cpu/vocoder_activations.cpp,
+// conv1d.cpp, resample1d.cpp, codec_quant.cpp).
+//
+//   AU_SNAKE        y = x + sin^2(alpha x) / guard(beta or alpha), per element
+//   AU_SNAKE_BWD    one workgroup per channel: dX, and dAlpha / dBeta += the
+//                   channel's sums (workgroup reduction)
+//   AU_PAD          pad1d (zero / reflect / replicate), per output element
+//   AU_PAD_BWD      its adjoint as a gather, per input element
+//   AU_RESAMPLE     resample1d (nearest round-half-even / linear, half-pixel),
+//                   source positions as exact rationals
+//   AU_RESAMPLE_BWD its adjoint as a gather over the outputs that read each
+//                   input, in output order (the CPU's accumulation order)
+//   AU_CAUSAL       causal_conv1d_update: one invocation per (n, c) row: the
+//                   L_step outputs over [state ++ x], then the state rolled
+//   AU_CONVT_BWD_W  conv_transpose1d_backward_weight: one workgroup per
+//                   weight element, a reduction over (n, l)
+//   AU_FSQ          fsq_quantize_forward, one invocation per row
+//   AU_VQ           vq_encode_forward, one workgroup per row: squared
+//                   distances to every codeword, the first minimum, the copy
+//   AU_COL2IM       conv_transpose1d's overlap-add: y[oc, lo] = bias[oc] +
+//                   the column products cols[(g, oc, k), l] with
+//                   l stride - padding + k dilation = lo, per output element
+#include "common.glsl"
+#include "math_acc.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint OP = AU_SNAKE;
+
+layout(push_constant) uniform PC {
+    uint64_t a, b, c, d, e, f, g;
+    uint u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11;
+    float f0, f1;
+} pc;
+
+float guard_denom(float d) {
+    const float kMin = 1e-9;
+    if (d >= 0.0) return d < kMin ? kMin : d;
+    return d > -kMin ? -kMin : d;
+}
+
+uint wg_linear() { return gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x; }
+
+shared float s_r0[256], s_r1[256];
+shared uint s_i0[256];
+
+// Sums of two values over the workgroup, returned to every invocation.
+void wg_sum2(inout float x, inout float y) {
+    const uint t = gl_LocalInvocationID.x;
+    s_r0[t] = x;
+    s_r1[t] = y;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) { s_r0[t] += s_r0[t + s]; s_r1[t] += s_r1[t + s]; }
+        barrier();
+    }
+    x = s_r0[0];
+    y = s_r1[0];
+    barrier();
+}
+
+// numpy 'reflect' / replicate / zero source of padded position p, -1 = zero.
+int pad_src(int p, int L, int left, uint mode) {
+    const int rel = p - left;
+    if (rel >= 0 && rel < L) return rel;
+    if (mode == 0u) return -1;
+    if (mode == 2u) return rel < 0 ? 0 : L - 1;
+    if (L == 1) return 0;
+    const int period = 2 * (L - 1);
+    int q = rel % period;
+    if (q < 0) q += period;
+    return q < L ? q : period - q;
+}
+
+// resample1d's source of output dst: src = ((2 dst + 1) L_in - L_out) / (2 L_out).
+// Nearest: round half to even, clamped. Linear: s clamped to [0, L_in - 1],
+// x0 = floor(s), x1 = min(x0 + 1, L_in - 1), f = s - x0.
+void resample_src(uint dst, uint lin, uint lout, uint mode, out int x0, out int x1, out float f) {
+    const int64_t num = int64_t(2u * dst + 1u) * int64_t(lin) - int64_t(lout);
+    const int64_t den = 2 * int64_t(lout);
+    if (mode == 0u) {
+        int64_t q = num >= 0 ? num / den : -((-num + den - 1) / den);   // floor
+        const int64_t r2 = 2 * (num - q * den);                          // 2 * remainder in [0, 2 den)
+        if (r2 > den || (r2 == den && (q & 1) != 0)) q += 1;             // half to even
+        x0 = int(clamp(q, int64_t(0), int64_t(lin) - 1));
+        x1 = x0;
+        f = 0.0;
+        return;
+    }
+    if (num <= 0) { x0 = 0; x1 = min(1, int(lin) - 1); f = 0.0; return; }
+    const int64_t q = num / den;
+    if (q >= int64_t(lin) - 1) { x0 = int(lin) - 1; x1 = x0; f = 0.0; return; }
+    x0 = int(q);
+    x1 = x0 + 1;
+    f = div_rn(float(num - q * den), float(den));
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    if (OP == AU_SNAKE) {
+        for (uint i = gid; i < pc.u2; i += GRID_STRIDE_X) {
+            const uint ch = (i / pc.u1) % pc.u0;
+            const float al = F32Buf(pc.b).v[ch];
+            const float r = 1.0 / guard_denom(pc.c != 0 ? F32Buf(pc.c).v[ch] : al);
+            const float x = load_elem(DT, pc.a, i);
+            float s, co;
+            sincos_acc(al * x, s, co);
+            store_elem(DT, pc.d, i, x + r * s * s);
+        }
+    } else if (OP == AU_SNAKE_BWD) {
+        // a X, b alpha, c beta, d dY, e dX, f dAlpha, g dBeta; u0 C, u1 L, u2 N
+        const uint ch = wg_linear();
+        if (ch >= pc.u0) return;
+        const float al = F32Buf(pc.b).v[ch];
+        const float r = 1.0 / guard_denom(pc.c != 0 ? F32Buf(pc.c).v[ch] : al);
+        float da = 0.0, db = 0.0;
+        const uint per = pc.u2 * pc.u1;
+        for (uint j = gl_LocalInvocationID.x; j < per; j += 256u) {
+            const uint n = j / pc.u1, l = j % pc.u1;
+            const uint i = (n * pc.u0 + ch) * pc.u1 + l;
+            const float x = load_elem(DT, pc.a, i), dy = load_elem(DT, pc.d, i);
+            float s, co;
+            sincos_acc(al * x, s, co);
+            const float sc = s * co;
+            store_elem(DT, pc.e, i, dy * (1.0 + 2.0 * al * r * sc));
+            da += dy * (2.0 * r * x * sc);
+            const float t = dy * (-r * r * s * s);
+            if (pc.c != 0) db += t; else da += t;
+        }
+        wg_sum2(da, db);
+        if (gl_LocalInvocationID.x == 0u) {
+            F32Buf(pc.f).v[ch] += da;
+            if (pc.c != 0) F32Buf(pc.g).v[ch] += db;
+        }
+    } else if (OP == AU_PAD) {
+        // a X, d Y; u0 L, u1 left, u2 L_pad, u3 rows, u4 mode
+        const uint total = pc.u3 * pc.u2;
+        for (uint i = gid; i < total; i += GRID_STRIDE_X) {
+            const uint row = i / pc.u2, p = i % pc.u2;
+            const int s = pad_src(int(p), int(pc.u0), int(pc.u1), pc.u4);
+            store_elem(DT, pc.d, i, s < 0 ? 0.0 : load_elem(DT, pc.a, row * pc.u0 + uint(s)));
+        }
+    } else if (OP == AU_PAD_BWD) {
+        // a dY, d dX; u0 L, u1 left, u2 L_pad, u3 rows, u4 mode. The padded
+        // positions that read input l, in increasing p (the CPU's order).
+        const uint total = pc.u3 * pc.u0;
+        const int L = int(pc.u0), left = int(pc.u1), lpad = int(pc.u2);
+        for (uint i = gid; i < total; i += GRID_STRIDE_X) {
+            const uint row = i / pc.u0;
+            const int l = int(i % pc.u0);
+            const uint base = row * pc.u2;
+            float acc = 0.0;
+            if (pc.u4 == 1u) {
+                // reflect (pads < L): p = left - l (l in [1, left]), left + l, left + 2 (L - 1) - l
+                if (l >= 1 && l <= left) acc += load_elem(DT, pc.a, base + uint(left - l));
+                acc += load_elem(DT, pc.a, base + uint(left + l));
+                const int pr = left + 2 * (L - 1) - l;
+                if (L > 1 && pr >= left + L && pr < lpad) acc += load_elem(DT, pc.a, base + uint(pr));
+            } else if (pc.u4 == 2u) {
+                if (l == 0) for (int p = 0; p < left; ++p) acc += load_elem(DT, pc.a, base + uint(p));
+                acc += load_elem(DT, pc.a, base + uint(left + l));
+                if (l == L - 1) for (int p = left + L; p < lpad; ++p) acc += load_elem(DT, pc.a, base + uint(p));
+            } else {
+                acc = load_elem(DT, pc.a, base + uint(left + l));
+            }
+            store_elem(DT, pc.d, i, acc);
+        }
+    } else if (OP == AU_RESAMPLE) {
+        // a X, d Y; u0 L_in, u1 L_out, u2 rows, u3 mode
+        const uint total = pc.u2 * pc.u1;
+        for (uint i = gid; i < total; i += GRID_STRIDE_X) {
+            const uint row = i / pc.u1, dst = i % pc.u1;
+            int x0, x1;
+            float f;
+            resample_src(dst, pc.u0, pc.u1, pc.u3, x0, x1, f);
+            const uint xb = row * pc.u0;
+            float y;
+            if (pc.u3 == 0u) y = load_elem(DT, pc.a, xb + uint(x0));
+            else y = (1.0 - f) * load_elem(DT, pc.a, xb + uint(x0)) + f * load_elem(DT, pc.a, xb + uint(x1));
+            store_elem(DT, pc.d, i, y);
+        }
+    } else if (OP == AU_RESAMPLE_BWD) {
+        // a dY, d dX; u0 L_in, u1 L_out, u2 rows, u3 mode. The outputs whose
+        // taps reach input i lie in [dlo, dhi]: for s(dst) in [i - 1, i + 1].
+        const uint total = pc.u2 * pc.u0;
+        const int lin = int(pc.u0), lout = int(pc.u1);
+        for (uint t = gid; t < total; t += GRID_STRIDE_X) {
+            const uint row = t / pc.u0;
+            const int i = int(t % pc.u0);
+            // dst = (2 L_out s + L_out - L_in) / (2 L_in) for s = i -/+ 1, widened by one.
+            const int64_t lo_num = int64_t(2 * lout) * int64_t(i - 1) + lout - lin;
+            const int64_t hi_num = int64_t(2 * lout) * int64_t(i + 1) + lout - lin;
+            int dlo = int(lo_num / int64_t(2 * lin)) - 1, dhi = int(hi_num / int64_t(2 * lin)) + 1;
+            if (i == 0) dlo = 0;
+            if (i == lin - 1) dhi = lout - 1;
+            dlo = max(dlo, 0);
+            dhi = min(dhi, lout - 1);
+            float acc = 0.0;
+            const uint yb = row * pc.u1;
+            for (int dst = dlo; dst <= dhi; ++dst) {
+                int x0, x1;
+                float f;
+                resample_src(uint(dst), pc.u0, pc.u1, pc.u3, x0, x1, f);
+                const float g = load_elem(DT, pc.a, yb + uint(dst));
+                if (pc.u3 == 0u) {
+                    if (x0 == i) acc += g;
+                } else {
+                    if (x0 == i) acc += (1.0 - f) * g;
+                    if (x1 == i) acc += f * g;
+                }
+            }
+            store_elem(DT, pc.d, t, acc);
+        }
+    } else if (OP == AU_CAUSAL) {
+        // a X, b W (C, kL), c bias, e state (rows, hist), d Y; u0 C, u1 L_step, u2 kL, u3 dil, u4 rows
+        for (uint row = gid; row < pc.u4; row += GRID_STRIDE_X) {
+            const uint ch = row % pc.u0, L = pc.u1, kl = pc.u2, dil = pc.u3;
+            const uint hist = (kl - 1u) * dil;
+            const uint sb = row * hist, xb = row * L;
+            const float bv = pc.c != 0 ? load_elem(DT, pc.c, ch) : 0.0;
+            for (uint t = 0; t < L; ++t) {
+                float acc = bv;
+                for (uint k = 0; k < kl; ++k) {
+                    const uint idx = t + k * dil;
+                    const float v = idx < hist ? load_elem(DT, pc.e, sb + idx) : load_elem(DT, pc.a, xb + idx - hist);
+                    acc += load_elem(DT, pc.b, ch * kl + k) * v;
+                }
+                store_elem(DT, pc.d, xb + t, acc);
+            }
+            // Roll: new state = the last `hist` samples of [state ++ x], in
+            // increasing order, so a slot is read before it is overwritten.
+            for (uint s = 0; s < hist; ++s) {
+                const uint idx = L + s;
+                const float v = idx < hist ? load_elem(DT, pc.e, sb + idx) : load_elem(DT, pc.a, xb + idx - hist);
+                store_elem(DT, pc.e, sb + s, v);
+            }
+        }
+    } else if (OP == AU_CONVT_BWD_W) {
+        // a X, b dY, d dW; u0 N, u1 C_in, u2 L, u3 C_out, u4 kL, u5 stride,
+        // u6 padding, u7 dilation, u8 Cg_in, u9 Cg_out, u10 L_out
+        const uint w = wg_linear();
+        const uint total = pc.u1 * pc.u9 * pc.u4;
+        if (w >= total) return;
+        const uint k = w % pc.u4, ocl = (w / pc.u4) % pc.u9, cin = w / (pc.u4 * pc.u9);
+        const uint oc = (cin / pc.u8) * pc.u9 + ocl;
+        float acc = 0.0, unused = 0.0;
+        const uint per = pc.u0 * pc.u2;
+        for (uint j = gl_LocalInvocationID.x; j < per; j += 256u) {
+            const uint n = j / pc.u2, l = j % pc.u2;
+            const int lo = int(l * pc.u5) - int(pc.u6) + int(k * pc.u7);
+            if (lo < 0 || lo >= int(pc.u10)) continue;
+            acc += load_elem(DT, pc.a, (n * pc.u1 + cin) * pc.u2 + l) *
+                   load_elem(DT, pc.b, (n * pc.u3 + oc) * pc.u10 + uint(lo));
+        }
+        wg_sum2(acc, unused);
+        if (gl_LocalInvocationID.x == 0u) store_elem(DT, pc.d, w, load_elem(DT, pc.d, w) + acc);
+    } else if (OP == AU_FSQ) {
+        // a x, b levels (int32), d quantized, e packed (int32); u0 N, u1 D
+        for (uint n = gid; n < pc.u0; n += GRID_STRIDE_X) {
+            int64_t packed = 0;
+            for (int dd = int(pc.u1) - 1; dd >= 0; --dd) {
+                const uint i = n * pc.u1 + uint(dd);
+                const int L = I32Buf(pc.b).v[dd];
+                const float h = float(L - 1) * 0.5;
+                const float v = clamp(load_elem(DT, pc.a, i), -1.0, 1.0);
+                const float t = (v + 1.0) * 0.5 * float(L - 1);
+                // std::round: half away from zero (t >= 0 here; t - floor(t) is exact)
+                const float fl = floor(t);
+                const int idx = clamp(int(fl) + (t - fl >= 0.5 ? 1 : 0), 0, L - 1);
+                precise const float qv = div_rn_precise(float(idx), h);
+                precise const float qo = qv - 1.0;
+                store_elem(DT, pc.d, i, qo);
+                packed = packed * int64_t(L) + int64_t(idx);
+            }
+            I32Buf(pc.e).v[n] = int(packed);
+        }
+    } else if (OP == AU_COL2IM) {
+        // a cols (N, groups, Cg_out kL, L), c bias, d Y (N, C_out, L_out); u0 N,
+        // u1 C_out, u2 L, u3 kL, u4 stride, u5 padding, u6 dilation, u7 Cg_out,
+        // u8 L_out, u9 cols are FP32 (BF16 signals)
+        const uint total = pc.u0 * pc.u1 * pc.u8;
+        const int L = int(pc.u2), kl = int(pc.u3), st = int(pc.u4), pd = int(pc.u5), dl = int(pc.u6);
+        for (uint i = gid; i < total; i += GRID_STRIDE_X) {
+            const uint lo = i % pc.u8, noc = i / pc.u8, oc = noc % pc.u1, n = noc / pc.u1;
+            const uint g = oc / pc.u7, ocl = oc % pc.u7;
+            const uint rowb = ((n * (pc.u1 / pc.u7) + g) * pc.u7 + ocl) * uint(kl);
+            float acc = pc.c != 0 ? load_elem(DT, pc.c, oc) : 0.0;
+            for (int k = 0; k < kl; ++k) {
+                const int t = int(lo) + pd - k * dl;
+                if (t < 0 || t % st != 0) continue;
+                const int l = t / st;
+                const uint ci = (rowb + uint(k)) * uint(L) + uint(l);
+                if (l < L) acc += pc.u9 != 0u ? F32Buf(pc.a).v[ci] : load_elem(DT, pc.a, ci);
+            }
+            store_elem(DT, pc.d, i, acc);
+        }
+    } else if (OP == AU_VQ) {
+        // a x (N, D), b codebook (K, D), d quantized, e indices (int32); u0 N, u1 D, u2 K
+        const uint n = wg_linear();
+        if (n >= pc.u0) return;
+        const uint t = gl_LocalInvocationID.x, D = pc.u1;
+        float best = 3.4028235e38;
+        uint bk = 0xffffffffu;
+        for (uint k = t; k < pc.u2; k += 256u) {
+            float d2 = 0.0;
+            for (uint j = 0; j < D; ++j) {
+                const float df = load_elem(DT, pc.a, n * D + j) - load_elem(DT, pc.b, k * D + j);
+                d2 += df * df;
+            }
+            if (d2 < best) { best = d2; bk = k; }   // k ascending: the first minimum of this lane
+        }
+        s_r0[t] = best;
+        s_i0[t] = bk;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (t < s) {
+                const float o = s_r0[t + s];
+                const uint ok = s_i0[t + s];
+                if (o < s_r0[t] || (o == s_r0[t] && ok < s_i0[t])) { s_r0[t] = o; s_i0[t] = ok; }
+            }
+            barrier();
+        }
+        const uint kb = s_i0[0] == 0xffffffffu ? 0u : s_i0[0];
+        if (t == 0u) I32Buf(pc.e).v[n] = int(kb);
+        for (uint j = t; j < D; j += 256u) store_elem(DT, pc.d, n * D + j, load_elem(DT, pc.b, kb * D + j));
+    }
+}

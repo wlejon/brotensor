@@ -3,7 +3,10 @@
 // with FP32 accumulation, subgroup size pinned to 32 by the host. Contract and
 // epilogues: gemm_common.glsl. -DDT=1 (FP16) or -DDT=2 (BF16 storage, each
 // element converted to FP16 on its way into shared memory, the dtype policy
-// in docs/vulkan.md); C and bias share the dtype.
+// in docs/vulkan.md); C and bias share the dtype. QB != 0: B is a quantised
+// weight (INT8 + per-row scale or a GGUF block format, quant_decode.glsl) in
+// the NT layout, one batch, decoded to FP16 as each chunk is stored to shared
+// memory, so the dequantised weight never exists outside the tile.
 //
 // Workgroup tile BM x BN (r columns), K step BK, double-buffered in shared
 // memory, filled with 8-element chunks (16-byte loads when VEC = 1, see
@@ -42,9 +45,11 @@ layout(constant_id = 9) const uint NB = 0;
 layout(constant_id = 10) const uint VEC = 1;
 layout(constant_id = 11) const uint DIRECT = 0;   // fragment-form epilogue, see main()
 layout(constant_id = 12) const uint BIAS = 0;     // pc.bias is set
+layout(constant_id = 13) const uint QB = 0;       // B quantised (quant_decode.glsl QF_*), NT only
 layout(local_size_x_id = 5) in;
 
 #include "gemm_common.glsl"
+#include "quant_decode.glsl"
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer U4Buf { uvec4 v[]; };
 
@@ -66,6 +71,8 @@ shared uvec4 As[2 * ASZ];
 shared uvec4 Bs[2 * BSZ];
 
 uvec4 ra[LA], rb[LB];
+QRaw rq[LB];   // QB: raw B chunks, decoded to FP16 at the store
+uint qk[LB];   // ... and the element offset of each within its row
 
 uvec4 bf16x8_to_f16x8(uvec4 w) {
     uvec4 o;
@@ -136,6 +143,20 @@ void load_tiles(uint64_t A, uint64_t B, uint m0, uint n0, uint k0) {
         if (TA == 0) load_chunk(A, pc.lda, m0 + r, m0 + r < pc.m, k0 + q * 8u, pc.k, j, va, ra[j]);
         else         load_chunk(A, pc.lda, k0 + r, k0 + r < pc.k, m0 + q * 8u, pc.m, j, va, ra[j]);
     }
+    if (QB != 0) {
+        // Quantised NT B: ldb is the row pitch in bytes; a chunk of a row
+        // that does not exist is loaded from row 0, a chunk past K from k = 0.
+        [[unroll]] for (uint j = 0; j < LB; ++j) {
+            const uint i = tid + j * WG, r = i / CB, q = i % CB;
+            bool ok;
+            const uint row = b_row(n0, r, ok), col = k0 + q * 8u;
+            ok = ok && col < pc.k;
+            vb |= ok ? (1u << j) : 0u;
+            qk[j] = ok ? col : 0u;
+            rq[j] = qload8(QB, VEC != 0, B + uint64_t(ok ? row : 0u) * pc.ldb, pc.scale, ok ? row : 0u, qk[j], pc.k);
+        }
+        return;
+    }
     [[unroll]] for (uint j = 0; j < LB; ++j) {
         const uint i = tid + j * WG, r = i / CB, q = i % CB;
         if (NB == 0) {
@@ -156,7 +177,10 @@ void store_tiles(uint buf) {
     }
     [[unroll]] for (uint j = 0; j < LB; ++j) {
         const uint i = tid + j * WG;
-        Bs[buf * BSZ + (i / CB) * SKB + i % CB] = finish_chunk(rb[j], vb, j);
+        if (QB != 0)
+            Bs[buf * BSZ + (i / CB) * SKB + i % CB] = (vb & (1u << j)) != 0u ? qdecode8_f16(QB, rq[j], qk[j]) : uvec4(0);
+        else
+            Bs[buf * BSZ + (i / CB) * SKB + i % CB] = finish_chunk(rb[j], vb, j);
     }
 }
 
@@ -166,7 +190,7 @@ float bias_at(uint n) { return BIAS != 0 ? load_elem(DT, pc.bias, n) : 0.0; }
 void main() {
     const uint z = gl_WorkGroupID.z;
     const uint64_t A = batch_base(pc.a, pc.sa, z, 2u);
-    const uint64_t B = batch_base(pc.b, pc.sb, z, 2u);
+    const uint64_t B = QB != 0 ? pc.b : batch_base(pc.b, pc.sb, z, 2u);
     const uint64_t C = batch_base(pc.c, pc.sc, z, 2u);
     const uint m0 = (gl_WorkGroupID.y + pc.tm0) * BM;
     const uint n0 = (gl_WorkGroupID.x + pc.tn0) * (EPI == EPI_SWIGLU ? BN / 2u : BN);
@@ -178,13 +202,19 @@ void main() {
     [[unroll]] for (uint i = 0; i < TM * TN; ++i)
         acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
-    load_tiles(A, B, m0, n0, 0u);
+    // Each workgroup starts its K walk at its own block (the sum is the
+    // same, in another order): with every workgroup at the same K the rows
+    // of a tile, a row pitch apart, all hit one memory channel when the
+    // pitch is a multiple of 4 KiB times 3 (K = 12288 INT8 or FP16 ran at a
+    // third of the speed of K = 12352).
+    const uint krot = ((gl_WorkGroupID.x + gl_WorkGroupID.y * 5u) * 37u) % nk;
+    load_tiles(A, B, m0, n0, krot * BK);
     store_tiles(0u);
     barrier();
 
     for (uint kt = 0; kt < nk; ++kt) {
         const uint cur = kt & 1u;
-        if (kt + 1u < nk) load_tiles(A, B, m0, n0, (kt + 1u) * BK);
+        if (kt + 1u < nk) load_tiles(A, B, m0, n0, ((kt + 1u + krot) % nk) * BK);
         [[unroll]] for (uint kk = 0; kk < BK / 16u; ++kk) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa[TM];
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb[TN];

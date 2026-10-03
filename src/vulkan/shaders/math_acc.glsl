@@ -12,6 +12,21 @@ float div_rn(float a, float b) {
     return fma(fma(-q, b, a), r, q);
 }
 
+// The same with every step `precise`, for a caller whose next operation must
+// round on its own (FSQ's idx / h - 1): without it NIR reassociated the
+// subtraction into the correction and the level came out an ulp or two off.
+// Not a drop-in for div_rn: image_normalize's (x - mean) * div_rn(1, std)
+// matches the CPU's (x - mean) * (1 / std) bit for bit only with the plain
+// form (the compiler's exact-mode reciprocal differs there), so each kernel
+// keeps the form its parity test pins.
+float div_rn_precise(float a, float b) {
+    precise const float r = 1.0 / b;
+    precise const float q = a * r;
+    precise const float e = fma(-q, b, a);
+    precise const float res = fma(e, r, q);
+    return res;
+}
+
 // exp(t) for t <= 0, about 1 ulp: t = n ln2 + r, |r| <= ln2 / 2.
 float exp_acc(float t) {
     const float n = round(t * 1.44269504088896341);

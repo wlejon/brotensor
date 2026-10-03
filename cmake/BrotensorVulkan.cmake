@@ -148,6 +148,11 @@ const ShaderBlob& shader_blob(ShaderId id) { return k_table[static_cast<std::uin
         ${_src}/ops_gnorm.cpp
         ${_src}/ops_spatial.cpp
         ${_src}/ops_diffusion.cpp
+        ${_src}/ops_quant.cpp
+        ${_src}/ops_quant_attention.cpp
+        ${_src}/ops_audio.cpp
+        ${_src}/ops_spectral.cpp
+        ${_src}/ops_sampling.cpp
         "${_gen}/shader_table.cpp"
         ${_incs}
     )

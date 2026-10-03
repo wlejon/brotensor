@@ -1,0 +1,344 @@
+#version 460
+// Token selection (ops_sampling.cpp), FP32 logits, one workgroup per row
+// (spec constant 0: SEL_* in op_codes.h). Contracts and order of operations
+// follow the CPU backend (src/cpu/sample_logits.cpp, masked_diffusion.cpp).
+//
+// SEL_SAMPLE   sample_logits(_into): greedy (first maximum) at temperature 0;
+//              otherwise softmax(logits / T), keep the top_k, then the top_p
+//              nucleus, and draw with Philox 4x32-10 (key, counter + row) as
+//              the CPU does. The CPU sorts; here the ordering (probability
+//              descending, index ascending) is a 64-bit key per token and
+//              every "first r in sorted order such that ..." is a binary
+//              search over the key space, each step one pass over the row.
+//              Probability masses are summed in 64-bit fixed point (2^-56),
+//              exact and order-independent, where the CPU sums in FP64.
+// SEL_COUNTER  sample_logits_into: counter[0] += rows.
+// SEL_MD       masked_diffusion_scores: one workgroup per (codebook, frame)
+//              cell; log-softmax (guided or not), the class top-k filter
+//              (the k-th largest value by binary search over the ordered
+//              bits, ties kept lowest index first), Gumbel noise from the
+//              splitmix64 hash (detail/hash_rng.h), the position score.
+// SEL_COMMIT   masked_diffusion_commit.
+#include "common.glsl"
+#include "math_acc.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint OP = SEL_SAMPLE;
+
+layout(push_constant) uniform PC {
+    uint64_t a, b, c, d, e, f;
+    uint64_t key;           // Philox key / hash seed
+    uint u0, u1, u2, u3, u4, u5;
+    float f0, f1, f2, f3, f4, f5;
+} pc;
+
+#define kNegInf (uintBitsToFloat(0xff800000u))
+const uint WG = 256u;
+
+shared float s_f[WG];
+shared uint s_u[WG];
+shared uint64_t s_q[WG];
+
+float wg_max(float v) {
+    const uint t = gl_LocalInvocationID.x;
+    s_f[t] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (t < s) s_f[t] = max(s_f[t], s_f[t + s]);
+        barrier();
+    }
+    const float r = s_f[0];
+    barrier();
+    return r;
+}
+
+uint64_t wg_sum64(uint64_t v) {
+    const uint t = gl_LocalInvocationID.x;
+    s_q[t] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (t < s) s_q[t] += s_q[t + s];
+        barrier();
+    }
+    const uint64_t r = s_q[0];
+    barrier();
+    return r;
+}
+
+// The first maximum (lowest index among equal values; NaN never wins).
+uint wg_argmax(float v, uint i) {
+    const uint t = gl_LocalInvocationID.x;
+    s_f[t] = v;
+    s_u[t] = i;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            const float o = s_f[t + s];
+            const uint oi = s_u[t + s];
+            if (o > s_f[t] || (o == s_f[t] && oi < s_u[t])) { s_f[t] = o; s_u[t] = oi; }
+        }
+        barrier();
+    }
+    const uint r = s_u[0];
+    barrier();
+    return r;
+}
+
+// ─── Philox 4x32-10, the CPU's sample_logits draw ───────────────────────────
+uint philox_top24(uint64_t key64, uint64_t sub) {
+    uvec2 k = uvec2(uint(key64), uint(key64 >> 32));
+    uvec4 c = uvec4(uint(sub), uint(sub >> 32), 0u, 0u);
+    for (int r = 0; r < 10; ++r) {
+        uint hi0, lo0, hi1, lo1;
+        umulExtended(0xD2511F53u, c.x, hi0, lo0);
+        umulExtended(0xCD9E8D57u, c.z, hi1, lo1);
+        c = uvec4(hi1 ^ c.y ^ k.x, lo1, hi0 ^ c.w ^ k.y, lo0);
+        if (r < 9) k += uvec2(0x9E3779B9u, 0xBB67AE85u);
+    }
+    return c.x >> 8;
+}
+
+// ─── splitmix64 hash (detail/hash_rng.h) ────────────────────────────────────
+float hash_uniform(uint64_t seed, uint64_t domain, uint64_t index) {
+    uint64_t x = seed ^ (domain + index);
+    x += 0x9E3779B97F4A7C15ul;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ul;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBul;
+    x = x ^ (x >> 31);
+    return float(uint(x >> 40)) * (1.0 / 16777216.0);
+}
+
+float gumbel(float u) {
+    precise const float a = u + 1e-10;
+    precise const float b = -log_acc(a) + 1e-10;
+    return -log_acc(b);
+}
+
+// ─── sample_logits ──────────────────────────────────────────────────────────
+// a logits (rows, V), b probabilities scratch (rows, V), d indices (int32),
+// e counter (int32, sample_logits_into; 0 = use u1:u2 as the base counter);
+// u0 V, u1 / u2 counter lo / hi, u3 top_k; f0 temperature, f1 top_p.
+
+const float kFix = 72057594037927936.0;   // 2^56
+
+uint64_t fixp(float p) { return uint64_t(p * kFix); }
+uint64_t sort_key(float p, uint v) { return (uint64_t(0x7fffffffu - floatBitsToUint(p)) << 32) | uint64_t(v); }
+
+// Count (mode 0) or probability mass (mode 1) of the tokens with key <= k.
+uint64_t below(uint64_t prow, uint V, uint64_t k, uint mode) {
+    uint64_t acc = 0;
+    for (uint v = gl_LocalInvocationID.x; v < V; v += WG) {
+        const float p = F32Buf(prow).v[v];
+        if (sort_key(p, v) <= k) acc += mode == 0u ? 1ul : fixp(p);
+    }
+    return wg_sum64(acc);
+}
+
+// The smallest key in [0, hi] with below(key) >= target (strict: > target),
+// or hi when there is none.
+uint64_t search(uint64_t prow, uint V, uint64_t hi, uint mode, uint64_t target, bool strict) {
+    uint64_t lo = 0;
+    uint64_t top = hi;
+    while (lo < top) {
+        const uint64_t mid = lo + (top - lo) / 2;
+        const uint64_t b = below(prow, V, mid, mode);
+        const bool ok = strict ? b > target : b >= target;
+        if (ok) top = mid; else lo = mid + 1;
+    }
+    return lo;
+}
+
+void sample_row(uint row) {
+    const uint V = pc.u0, t = gl_LocalInvocationID.x;
+    const uint64_t lrow = pc.a + uint64_t(row) * V * 4u;
+    const uint64_t prow = pc.b + uint64_t(row) * V * 4u;
+    const float T = pc.f0;
+    if (T == 0.0) {
+        float bv = -3.4028235e38;
+        uint bi = 0xffffffffu;
+        for (uint v = t; v < V; v += WG) {
+            const float x = F32Buf(lrow).v[v];
+            if (x > bv) { bv = x; bi = v; }
+        }
+        const uint r = wg_argmax(bv, bi == 0xffffffffu ? 0xfffffffeu : bi);
+        if (t == 0u) I32Buf(pc.d).v[row] = int(r >= V ? 0u : r);
+        return;
+    }
+    float m = -3.4028235e38;
+    for (uint v = t; v < V; v += WG) m = max(m, div_rn(F32Buf(lrow).v[v], T));
+    m = wg_max(m);
+    uint64_t es = 0;
+    for (uint v = t; v < V; v += WG) {
+        const float e = exp_acc(div_rn(F32Buf(lrow).v[v], T) - m);
+        F32Buf(prow).v[v] = e;
+        es += uint64_t(e * 1099511627776.0);   // 2^40
+    }
+    es = wg_sum64(es);
+    const float sum = float(es) * (1.0 / 1099511627776.0);
+    const float inv = sum > 0.0 ? div_rn(1.0, sum) : 0.0;
+    for (uint v = t; v < V; v += WG) F32Buf(prow).v[v] = F32Buf(prow).v[v] * inv;
+    barrier();
+    memoryBarrierBuffer();
+    barrier();
+
+    const uint64_t kmax = 0x7ffffffffffffffful;
+    const uint bound = (pc.u3 > 0u && pc.u3 < V) ? pc.u3 : V;
+    uint64_t kk = bound < V ? search(prow, V, kmax, 0u, uint64_t(bound), false) : kmax;
+    if (pc.f1 < 1.0) {
+        const uint64_t tp = fixp(pc.f1);
+        if (below(prow, V, kk, 1u) >= tp) kk = search(prow, V, kk, 1u, tp, false);
+    }
+    const uint64_t kept = below(prow, V, kk, 1u);
+    const uint64_t base = pc.e != 0 ? uint64_t(uint(I32Buf(pc.e).v[0])) : (uint64_t(pc.u2) << 32 | uint64_t(pc.u1));
+    const uint u24 = philox_top24(pc.key, base + uint64_t(row));
+    uint64_t chosen;
+    if (kept > 0) {
+        // target = u kept (u = u24 / 2^24), floor, without overflow.
+        const uint64_t target = (kept >> 24) * uint64_t(u24) + (((kept & 0xfffffful) * uint64_t(u24)) >> 24);
+        chosen = below(prow, V, kk, 1u) > target ? search(prow, V, kk, 1u, target, true) : kk;
+    } else {
+        chosen = search(prow, V, kmax, 0u, 1ul, false);   // the first token in order
+    }
+    if (t == 0u) I32Buf(pc.d).v[row] = int(uint(chosen & 0xfffffffful));
+}
+
+// ─── masked_diffusion_scores ────────────────────────────────────────────────
+// a logits (R, C V), b tokens (C, T) int32, c lp scratch (C T, V), d pred
+// (int32), e scores, f confidence; u0 T, u1 C, u2 V, u3 mask_id, u4 guided,
+// u5 k_keep; f0 guidance, f1 layer_penalty, f2 position_t, f3 class_t; key seed.
+
+// max + log(sum exp(x - max)) of a row.
+float row_lse(uint64_t row, uint V) {
+    float m = kNegInf;
+    for (uint v = gl_LocalInvocationID.x; v < V; v += WG) m = max(m, F32Buf(row).v[v]);
+    m = wg_max(m);
+    uint64_t s = 0;
+    for (uint v = gl_LocalInvocationID.x; v < V; v += WG) s += uint64_t(exp_acc(F32Buf(row).v[v] - m) * 1099511627776.0);
+    s = wg_sum64(s);
+    return m + log_acc(float(s) * (1.0 / 1099511627776.0));
+}
+
+// Order-preserving bits of a float: larger values give larger keys.
+uint okey(float x) { const uint b = floatBitsToUint(x); return (b >> 31) != 0u ? ~b : b | 0x80000000u; }
+
+void md_cell(uint p) {
+    const uint T = pc.u0, C = pc.u1, V = pc.u2, t = gl_LocalInvocationID.x;
+    const uint ch = p / T, fr = p % T;
+    const uint64_t stride = uint64_t(C) * V * 4u;
+    const uint64_t cond = pc.a + uint64_t(fr) * stride + uint64_t(ch) * V * 4u;
+    const uint64_t lp = pc.c + uint64_t(p) * V * 4u;
+    if (pc.u4 != 0u) {
+        const uint64_t unc = pc.a + uint64_t(T + fr) * stride + uint64_t(ch) * V * 4u;
+        const float lc = row_lse(cond, V), lu = row_lse(unc, V);
+        for (uint v = t; v < V; v += WG) {
+            precise const float a = F32Buf(cond).v[v] - lc;
+            precise const float b = F32Buf(unc).v[v] - lu;
+            precise const float g = a + pc.f0 * (a - b);
+            F32Buf(lp).v[v] = g;
+        }
+        barrier();
+        memoryBarrierBuffer();
+        barrier();
+        const float lg = row_lse(lp, V);
+        for (uint v = t; v < V; v += WG) F32Buf(lp).v[v] = F32Buf(lp).v[v] - lg;
+    } else {
+        const float l = row_lse(cond, V);
+        for (uint v = t; v < V; v += WG) F32Buf(lp).v[v] = F32Buf(cond).v[v] - l;
+    }
+    if (t == 0u) F32Buf(lp).v[pc.u3] = kNegInf;
+    barrier();
+    memoryBarrierBuffer();
+    barrier();
+
+    float conf = kNegInf;
+    for (uint v = t; v < V; v += WG) conf = max(conf, F32Buf(lp).v[v]);
+    conf = wg_max(conf);
+
+    uint best;
+    if (pc.f3 > 0.0) {
+        // thr = the k-th largest value: the largest okey with count(okey >= k') >= k.
+        const uint k = pc.u5;
+        uint64_t lo = 0, hi = 0xfffffffful;
+        while (lo < hi) {
+            const uint64_t mid = lo + (hi - lo + 1) / 2;
+            uint64_t n = 0;
+            for (uint v = t; v < V; v += WG) n += uint64_t(okey(F32Buf(lp).v[v])) >= mid ? 1ul : 0ul;
+            if (wg_sum64(n) >= uint64_t(k)) lo = mid; else hi = mid - 1;
+        }
+        const uint thr = uint(lo);
+        uint64_t ng = 0;
+        for (uint v = t; v < V; v += WG) ng += okey(F32Buf(lp).v[v]) > thr ? 1ul : 0ul;
+        const uint m = k - uint(wg_sum64(ng));   // slots for values equal to thr, lowest index first
+        // Equal values before each thread's contiguous chunk: an exclusive scan.
+        const uint chunk = (V + WG - 1u) / WG, v0 = min(t * chunk, V), v1 = min(v0 + chunk, V);
+        uint eq = 0u;
+        for (uint v = v0; v < v1; ++v) eq += okey(F32Buf(lp).v[v]) == thr ? 1u : 0u;
+        s_u[t] = eq;
+        barrier();
+        uint before = 0u;
+        for (uint i = 0u; i < t; ++i) before += s_u[i];
+        barrier();
+        float bs = kNegInf;
+        uint bi = 0xffffffffu;
+        const uint64_t base = uint64_t(p) * uint64_t(V);
+        for (uint v = v0; v < v1; ++v) {
+            const float x = F32Buf(lp).v[v];
+            const uint kx = okey(x);
+            bool kept = kx > thr;
+            if (!kept && kx == thr) { kept = before < m; ++before; }
+            float s = kNegInf;
+            if (kept) {
+                const float u = hash_uniform(pc.key, 0x14057B7EF767814Ful, base + uint64_t(v));
+                precise const float q = div_rn(x, pc.f3);
+                precise const float sv = q + gumbel(u);
+                s = sv;
+            }
+            if (bi == 0xffffffffu || s > bs) { bs = s; bi = v; }
+        }
+        best = wg_argmax(bs, bi == 0xffffffffu ? 0xfffffffeu : bi);
+    } else {
+        float bv = kNegInf;
+        uint bi = 0xffffffffu;
+        for (uint v = t; v < V; v += WG) {
+            const float x = F32Buf(lp).v[v];
+            if (bi == 0xffffffffu || x > bv) { bv = x; bi = v; }
+        }
+        best = wg_argmax(bv, bi == 0xffffffffu ? 0xfffffffeu : bi);
+    }
+    if (t != 0u) return;
+    I32Buf(pc.d).v[p] = int(best >= V ? 0u : best);
+    F32Buf(pc.f).v[p] = conf;
+    float s = kNegInf;
+    if (I32Buf(pc.b).v[p] == int(pc.u3)) {
+        precise float sv = conf - float(ch) * pc.f1;
+        if (pc.f2 > 0.0) {
+            const float u = hash_uniform(pc.key, 0x5851F42D4C957F2Dul, uint64_t(p));
+            sv = div_rn(sv, pc.f2) + gumbel(u);
+        }
+        s = sv;
+    }
+    F32Buf(pc.e).v[p] = s;
+}
+
+void main() {
+    const uint w = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    if (OP == SEL_SAMPLE) {
+        // u4 rows
+        if (w < pc.u4) sample_row(w);
+    } else if (OP == SEL_COUNTER) {
+        if (gl_GlobalInvocationID.x == 0u) I32Buf(pc.e).v[0] = int(uint(I32Buf(pc.e).v[0]) + pc.u4);
+    } else if (OP == SEL_MD) {
+        if (w < pc.u0 * pc.u1) md_cell(w);
+    } else {
+        // SEL_COMMIT: a pred, b idx, c tokens, d unmask_step; u0 k, u1 n, u2 step
+        const uint i = gl_GlobalInvocationID.x;
+        if (i < pc.u0) {
+            const int p = I32Buf(pc.b).v[i];
+            if (p >= 0 && p < int(pc.u1)) {
+                I32Buf(pc.c).v[p] = I32Buf(pc.a).v[p];
+                I32Buf(pc.d).v[p] = int(pc.u2);
+            }
+        }
+    }
+}

@@ -18,8 +18,9 @@
 
 layout(push_constant) uniform PC {
     uint64_t a, b, c, bias;
+    uint64_t scale;        // gemm_cm with a quantised B (QB): INT8 per-row scales
     uint m, n, k;          // n: columns of r (rows of B), 2 * half for the GLUs
-    uint lda, ldb, ldc;
+    uint lda, ldb, ldc;    // gemm_cm with QB: ldb is B's row pitch in bytes
     uint sa, sb, sc;       // batch strides in elements
     uint half_n;           // EPI_SWIGLU: offset of the up rows (= output width)
     uint tm0, tn0;         // gemm_cm: tile origin of this dispatch (edge strips)

@@ -31,11 +31,17 @@ struct GemmArgs {
     int batch = 1;
     long long sa = 0, sb = 0, sc = 0;   // batch strides in elements; 0 broadcasts
     int epi = 0;                 // EPI_* (op_codes.h); GLUs need the NT layout
+    // Quantised B (QF_* of shaders/quant_decode.glsl, 0 = none): the
+    // cooperative-matrix kernel only, NT layout, one batch, db ignored; ldb
+    // is then B's row pitch in bytes and `scale` the INT8 per-row scales.
+    int qb = 0;
+    std::uint64_t scale = 0;
     int act = 0;                 // LACT_*
     const char* op = "gemm";     // for error messages
 };
 
-// Records the GEMM on `d`'s stream. Throws for an unsupported dtype mix.
+// Records the GEMM on `d`'s stream. Throws for an unsupported dtype mix (and,
+// with qb set, on a device without cooperative matrix).
 void gemm(DeviceCtx& d, const GemmArgs& g);
 
 // Which kernel gemm() would use, for the tests and the benchmark: "gemv",

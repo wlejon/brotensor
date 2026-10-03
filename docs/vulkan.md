@@ -39,10 +39,21 @@ bicubics), `adaptive_avg_pool2d_forward`, `max_pool2d_forward`,
 `concat_batched_rows`, `gather_rows`, `scatter_rows`, the sampler steps
 (`ddim_step`, `euler_step`, `dpmpp_2m_step`), `timestep_embedding`,
 `image_normalize`, `image_u8_to_f32_nhwc_to_nchw` and the Philox noise ops
-(`randn`, `rand_uniform`, `rand_bernoulli`, `randn_truncated`): 161 slots.
-Attention backwards, the INT8-weight variants (attention, `conv2d_int8w_fp16`,
-`conv3d_int8w_fp16`, `resblock_forward_int8w_fp16`) and the spatial backwards
-other than the ones named are not implemented yet.
+(`randn`, `rand_uniform`, `rand_bernoulli`, `randn_truncated`), then the
+quantised weights and the audio family (chunk 5): the GGUF linears
+(`linear_forward_{q8_0,q4k,q6k}_fp16`, their `_batched` forms, `dequant_*_to_fp16`),
+the INT8 W8A16 family (`linear_forward_batched_int8w_fp16`, `matmul_int8w_fp16`,
+`conv2d_int8w_fp16_forward`, `conv3d_int8w_fp16_forward`,
+`resblock_forward_int8w_fp16`, `flash_attention_project_kv_int8w_fp16`,
+`_q_with_kv_cached_int8w_fp16`, `_qkvo_int8w_fp16`, `self_attention_bias_int8w_fp16`),
+`conv_transpose1d_forward` and its three backwards, `causal_conv1d_update`,
+`pad1d_forward` / `_backward`, `snake_forward` / `_backward`,
+`resample1d_forward` / `_backward`, `vq_encode_*`, `fsq_quantize_*`, the complex
+ops, `fft` / `ifft` / `rfft` / `irfft` (+ adjoints), `stft` / `istft` (+
+adjoints), `sample_logits(_into)` and `masked_diffusion_scores` / `_commit`:
+214 slots. Attention backwards, `conv2d_backward_weight`, the spatial
+backwards other than the ones named and the rest of the inference table
+(chunk 6) are not implemented yet.
 The backend is never the default device. To select it, use
 `set_default_device(Device::vulkan(i))`, a `DeviceScope`, or
 `BROTENSOR_DEFAULT_DEVICE=vulkan` (also `vk`, `vulkan:1`). Any other op throws
@@ -81,14 +92,17 @@ src/vulkan/
   detail/gemm.h, gemm.cpp       the GEMM dispatcher every matrix op goes through
   detail/attention.h            the attention dispatcher (ops_attention.cpp) and dense path
   detail/spatial.h              conv2d() / group_norm() entry points the spatial files share
+  detail/quant.h                quant_weight() / quant_linear() / dequant(): the quantised-weight core
   ops_*.cpp                     ops, one file per family, each with a fill_vulkan_vtable_<family>
                                 (elementwise, copy, reduce, linear, norm, rope, glu, attention,
-                                attention_proj, topk, xent, conv, gnorm, spatial, diffusion;
+                                attention_proj, topk, xent, conv, gnorm, spatial, diffusion,
+                                quant, quant_attention, audio, spectral, sampling;
                                 ops_attention_dense.cpp is the materialised path the others call)
   shaders/                      *.comp kernels, common.glsl, gemm_common.glsl, math_acc.glsl
-                                (accurate exp / log / sincos), op_codes.h, shaders.cmake (the list)
-tests/test_vulkan.cpp           runtime; main(), --only=ops|gemm|norm|attention|conv|spatial,
-                                --bench-gemm, --bench-attention, --bench-conv
+                                (accurate exp / log / sincos), quant_decode.glsl (the quantised
+                                chunk loads / decodes), op_codes.h, shaders.cmake (the list)
+tests/test_vulkan.cpp           runtime; main(), --only=ops|gemm|norm|attention|conv|spatial|quant|audio,
+                                --bench-gemm, --bench-attention, --bench-conv, --bench-quant, --bench-audio
 tests/test_vulkan_ops.cpp       chunk-1 op parity
 tests/test_vulkan_gemm.cpp      matmul / linear parity, every kernel path
 tests/test_vulkan_norm.cpp      norms, softmax, RoPE, GLUs parity
@@ -99,6 +113,11 @@ tests/test_vulkan_spatial.cpp   resamples, pooling, gathers, NCHW norms, sampler
 tests/test_vulkan_bench.cpp     GEMM / GEMV throughput (not in ctest)
 tests/test_vulkan_bench_attention.cpp  attention throughput (not in ctest)
 tests/test_vulkan_bench_conv.cpp       conv TF/s, GroupNorm / resample GB/s (not in ctest)
+tests/test_vulkan_quant.cpp     GGUF / INT8 linears on both paths, dequantise, INT8 convolutions
+tests/test_vulkan_quant_attention.cpp  INT8-weight attentions and ResBlock
+tests/test_vulkan_audio.cpp     1D convs, Snake, pad / resample, codec quantisers, complex, FFT, STFT
+tests/test_vulkan_sampling.cpp  sample_logits(_into), masked diffusion
+tests/test_vulkan_bench_quant.cpp      quantised linears GB/s / TF/s, audio ops (not in ctest)
 tests/test_vulkan_common.h
 ```
 
@@ -229,6 +248,15 @@ three things decide the speed, all learned the hard way on RADV / ACO:
   time inside one kernel cost 20% even when the slow branch was never taken.
 * **Shared memory per workgroup sets occupancy.** 128x128 uses exactly 40 KiB
   (three workgroups per WGP); a few hundred bytes more drops it to two.
+* **Workgroups start their K walk at different blocks** (chunk 5): block
+  `((x + 5 y) * 37) mod nk`, then around. With every workgroup at the same K,
+  the rows of a tile (a row pitch apart) and of the concurrent tiles fall on
+  the same memory channels when the pitch is a multiple of 4 KiB (8B's
+  K = 12288 and 14336 rows): INT8 512 x 4096 x 12288 ran at 8.6 TF/s against
+  24.9 for K = 12352. The rotation took it to 19.7; in one session, A / B
+  with and without it, FP16 8B-up went 15.0 -> 22.0 TF/s, DiT 4096 x 3072 x
+  3072 27.1 -> 32.5 and square2k 25.6 -> 29.0 (no shape measured slower). The
+  sum is the same in another order, deterministic per tile.
 
 Measured through the public `matmul_abt` (FP16, NT, wall clock around 200
 back-to-back launches with one sync, median of 7 batches; hipBLAS and spike
@@ -236,16 +264,19 @@ figures from `../vk-spike/RESULTS.md`):
 
 | Shape (M x N x K) | hipBLAS | spike | Vulkan backend | vs hipBLAS |
 |---|---|---|---|---|
-| 4096 x 4096 x 4096 | 22.7 | 24.9 | 23.8 | 1.05 |
-| 2048 x 2048 x 2048 | 38.8 | 30.4 | 29.8 | 0.77 |
-| 8192 x 8192 x 8192 | 25.2 | 21.2 | 19.6 | 0.78 |
-| 512 x 3072 x 1024 | 28.8 | 25.2 | 23.1 | 0.80 |
-| 512 x 1024 x 3072 | 33.8 | 26.2 | 24.8 | 0.73 |
-| 512 x 4096 x 4096 | 20.6 | 21.0 | 20.3 | 0.98 |
-| 512 x 12288 x 4096 | 21.6 | 17.7 | 16.3 | 0.75 |
-| 512 x 4096 x 12288 | 16.2 | 17.5 | 16.2 | 1.00 |
-| 4096 x 3072 x 3072 | 36.4 | 32.1 | 34.0 | 0.93 |
-| 4096 x 12288 x 3072 | 32.5 | 31.7 | 32.6 | 1.00 |
+| 4096 x 4096 x 4096 | 22.7 | 24.9 | 26.9 | 1.18 |
+| 2048 x 2048 x 2048 | 38.8 | 30.4 | 28.7 | 0.74 |
+| 8192 x 8192 x 8192 | 25.2 | 21.2 | 19.4 | 0.77 |
+| 512 x 3072 x 1024 | 28.8 | 25.2 | 23.7 | 0.82 |
+| 512 x 1024 x 3072 | 33.8 | 26.2 | 24.5 | 0.72 |
+| 512 x 4096 x 4096 | 20.6 | 21.0 | 22.6 | 1.09 |
+| 512 x 12288 x 4096 | 21.6 | 17.7 | 22.0 | 1.02 |
+| 512 x 4096 x 12288 | 16.2 | 17.5 | 18.8 | 1.16 |
+| 4096 x 3072 x 3072 | 36.4 | 32.1 | 31.6 | 0.87 |
+| 4096 x 12288 x 3072 | 32.5 | 31.7 | 32.2 | 0.99 |
+
+(Chunk-5 figures, with the K rotation; chunk 2 measured 23.8 / 29.8 / 19.6 /
+23.1 / 24.8 / 20.3 / 16.3 / 16.2 / 34.0 / 32.6.)
 
 BF16 operands (converted at load, fallback epilogue) run at 10.7-31.9 TF/s on
 the same shapes, the SIMT kernel at 3-8 TF/s in FP16 or FP32, and `matmul`'s
@@ -509,6 +540,135 @@ peak):
 | bilinear, 256 ch 100 -> 333 | 0.408 / 152 | 2.975 / 21 |
 | bicubic (torch), 64 ch 512 -> 224 | 0.153 / 261 | FP32 only |
 
+## Quantised weights
+
+`detail/quant.h` describes a quantised weight (`quant_weight()`: INT8 with
+per-row FP32 scales, or the GGUF block formats Q8_0, Q4_K and Q6_K, the ones
+brolm's GGUF loader keeps) and `quant_linear()` computes Y(B, N) = X(B, K)
+W^T + bias for FP16 (or, INT8 only, BF16) activations. A weight is never
+expanded to FP16 on the matrix paths:
+
+| Path | When | What |
+|---|---|---|
+| `gemv_q.comp` | B <= 8 rows (decode) | each W row read once, decoded in registers, all B rows of X against it |
+| `gemm_cm.comp` with `QB` | B > 8 (prefill), cooperative matrix | the B tile's chunks decoded to FP16 as they are stored to shared memory |
+| `dequant.comp`, then the dense GEMM | B > 8 without cooperative matrix; conv3d's direct geometry | an FP16 copy of the weight |
+
+**Decode GEMV.** A lane group of LPR lanes (16 / 32 / 64) walks NR rows of
+W together (1, 2 or 4), so every X chunk it loads serves NR rows. A lane's
+unit is an *item*: 16 weights for INT8 and Q8_0 (one 16-byte load, half a
+Q8_0 block), 32 for the K-quants (16 bytes of Q4_K nibbles = two
+sub-blocks' halves; 24 bytes of Q6_K = 8 values of each of the four quads of
+a 128-element half), with UNR items per lane loaded before any is decoded.
+Each item is decoded once into FP32 weights with the block scales and
+minimums folded in (Q4_K: w = d sc q - dmin m), so the inner loop over the B
+rows of X is one multiply-add per weight, which ACO emits as `v_fma_mix_f32`
+reading the FP16 X directly. Folding the minimum per weight instead of
+subtracting dmin m sum(x) per sub-block, and NR > 1 (X loaded once per NR rows:
+at B = 8 the X re-reads otherwise saturate the L0 cache), took Q4_K at B = 8
+from 100 to 160-206 GB/s. 2-byte-aligned data (Q8_0's 34-byte and Q6_K's
+210-byte blocks) is loaded as 16-bit vectors (`u16vec4`; an `Aligned 2`
+8-byte load is invalid SPIR-V) and packed by the decode. Configuration
+(`gemv_cfg`, measured): wave64; INT8 / Q8_0 rows of K >= 4096 one row per
+group with four items in flight, shorter rows two per group; Q4_K LPR 32 /
+NR 4; Q6_K NR 2 (4 at B = 8). `BROTENSOR_VK_QGEMV=lpr,unr,sg,nr` forces one.
+
+**Prefill GEMM.** `gemm_cm.comp`'s B loader takes `QB` (`QF_*`): a chunk is
+8 weights of one row (one K step of 32 is a Q8_0 block, a Q4_K sub-block,
+half a Q6_K quad pair), loaded raw (`qload8`, `quant_decode.glsl`) at the
+GEMM's load point and decoded to FP16 (`qdecode8_f16`: d sc q - dmin m in
+FP32, one RNE rounding) when the tile is stored to shared memory, so the
+decode overlaps the fragment math like the BF16 conversion does. INT8 scales
+are applied there too (q scale rounded once to FP16), so the result equals
+the FP16 GEMM on the dequantised weight up to summation order.
+`matmul_int8w_fp16` is the linear on X^T, transposed back.
+`conv2d_int8w_fp16_forward` (and the ResBlock's) decode INT8 A tiles the same
+way in `conv_cm.comp` (`QA`, per-output-channel scale); other conv paths
+dequantise the (small) weight first. The INT8 attentions are the projections
+through `quant_linear()` around the FP16 attention core
+(`ops_quant_attention.cpp`).
+
+Measured with `brotensor_test_vulkan --bench-quant` (wall clock around
+back-to-back calls, median of 7 batches, one format per process:
+`BROTENSOR_VK_BENCH_FMT=int8|q8_0|q4k|q6k`, `BROTENSOR_VK_BENCH_PART=decode|prefill`;
+HIP is its same public op in the same process). Decode, GB/s of the stored
+weight bytes at B = 1 / 2 / 4 / 8; shapes over 32 MB (the Infinity Cache)
+are DRAM-bound, smaller ones read partly from the cache:
+
+| Format, shape (N x K, MB) | Vulkan | HIP |
+|---|---|---|
+| Q8_0 151936 x 1024 (165) | 237 / 236 / 232 / 224 | 233 / 117 / 59 / 30 |
+| Q8_0 12288 x 4096 (53) | 226 / 228 / 220 / 202 | 224 / 114 / 58 / 29 |
+| Q8_0 4096 x 12288 (53) | 226 / 225 / 220 / 193 | 209 / 112 / 57 / 29 |
+| INT8 151936 x 1024 (156) | 239 / 239 / 236 / 232 | 47 / 47 / 48 / 47 |
+| INT8 12288 x 4096 (50) | 234 / 229 / 229 / 203 | 29 / 29 / 27 / 21 |
+| INT8 4096 x 12288 (50) | 232 / 227 / 227 / 208 | 17 / 17 / 16 / 17 |
+| Q4_K 151936 x 1024 (88) | 235 / 233 / 225 / 163 | 122 / 61 / 31 / 15 |
+| Q4_K 12288 x 4096 (28) | 515 / 417 / 308 / 206 | 217 / 109 / 54 / 27 |
+| Q6_K 151936 x 1024 (128) | 237 / 235 / 228 / 204 | 181 / 91 / 46 / 23 |
+| Q6_K 12288 x 4096 (41) | 268 / 262 / 244 / 206 | 197 / 100 / 50 / 25 |
+
+HIP's batched GGUF linear launches its GEMV once per activation row, hence
+its 1/B scaling. Prefill, TF/s:
+
+| Shape (M x N x K) | INT8 | Q8_0 | Q4_K | Q6_K | HIP (INT8 / GGUF) |
+|---|---|---|---|---|---|
+| 512 x 4096 x 4096 | 22.4 | 21.6 | 18.6 | 17.7 | 1.76 / 0.7-1.5 |
+| 512 x 12288 x 4096 | 23.3 | 26.9 | 27.8 | 24.2 | 1.48 / 0.4-0.8 |
+| 512 x 4096 x 12288 | 19.8 | 22.8 | 22.9 | 20.9 | 1.45 / 0.4-0.8 |
+| 4096 x 3072 x 3072 | 28.2 | - | - | - | 1.76 |
+| 4096 x 4096 x 4096 | 26.9 | - | - | - | 1.76 |
+
+## Audio, spectral ops, sampling
+
+* **1D convolutions** (`ops_audio.cpp`): conv1d is conv2d with H = 1 (the
+  public wrapper). `conv_transpose1d_forward` is a GEMM, cols (C_out / g kL,
+  L) = Wt_g^T X_g per image and group (TA + NB layouts, cooperative matrix
+  for FP16; FP32 cols for BF16 signals, rounding each product to BF16 cost a
+  few ulp), then an overlap-add gather (`AU_COL2IM`): 512 -> 256 channels,
+  k16 s8 at L = 1000 takes 0.42 ms in FP16, 0.81 ms in FP32, against 55 ms
+  for the direct gather kernel and 64 ms on HIP. Its input gradient is a
+  strided, dilated, grouped conv1d of dY with the same weights through
+  `conv2d()`; the weight gradient is one workgroup per weight element
+  reducing over (n, l) (correct, slow: a GEMM over im2col'd dY is the fix
+  when training needs it); the bias gradient is conv2d's.
+* **`audio.comp`** (FP32 / FP16 / BF16 signals, FP32 per-channel parameters):
+  Snake / SnakeBeta (`sincos_acc`; the backward one workgroup per channel),
+  pad1d and its adjoint as a gather (reflect images enumerated), resample1d
+  with exact rational source positions (round-half-even nearest as the
+  CPU's `nearbyint`) and its adjoint as a gather in output order,
+  `causal_conv1d_update` (one invocation per (n, c) row, state rolled in
+  increasing order), VQ (one workgroup per row, first minimum), FSQ.
+* **Spectral** (`ops_spectral.cpp`, `dft.comp`, FP32): every transform is a
+  matrix product against a DFT basis built on the device per call (angle
+  index (k n) mod L in integers, folded to [0, pi / 4] before `sincos_acc`,
+  so a twiddle is good to ~1e-7 at any L; rows in chunks of <= 16 Mi
+  elements), through the FP32 GEMM. O(L^2) per row at GEMM speed: the right
+  trade for n_fft 400-2048 over thousands of frames, and any length works,
+  primes included. The STFT reads its frames in place (the reflect-padded
+  signal with a row pitch of hop_length), the window and normalisation folded
+  into the basis; the inverse's overlap-add and COLA division, and the two
+  adjoints' scatters, are gathers. Whisper's front end (30 s, n_fft 400,
+  hop 160) takes 0.20 ms for the STFT and 0.21 ms for the iSTFT, against
+  53 / 123 ms on HIP (an O(L^2) DFT kernel).
+* **Sampling** (`select.comp`, one workgroup per row): the CPU sorts the
+  vocabulary; here (probability descending, index ascending) is a 64-bit key
+  per token and each "first rank such that" (top-k, the top-p nucleus, the
+  draw's cumulative mass) is a binary search over the key space, one pass
+  per step, with masses in 64-bit fixed point (2^-56, exact and
+  order-independent where the CPU sums in FP64). The draw is the CPU's
+  Philox stream; the masked-diffusion class filter finds the k-th value the
+  same way over order-preserving float bits and ranks ties by index with a
+  workgroup scan. Tokens match the CPU exactly in the tests (V up to 151936);
+  a draw can only differ when the uniform lands within a few ulp of a
+  probability boundary. At V = 151936 a row costs ~1-2 ms (up to ~190 passes
+  over the row); a radix select would cut that if LLM sampling moves here.
+
+Measured with `brotensor_test_vulkan --bench-audio` (GB/s of minimum traffic):
+Snake 512 x 24000 234 (FP32) / 209 (FP16) GB/s (HIP 214, FP32 only), pad1d
+230 (HIP 228), resample1d 113 (HIP 110, the per-output 64-bit rational
+arithmetic bounds it), complex_abs 685 (cache-resident).
+
 ## Dtype policy
 
 - **FP32**: native.
@@ -535,10 +695,19 @@ peak):
   dense path keeps its scores in FP32 while its P V GEMM follows the GEMM's rule.
   `conv_cm.comp` does the same as it stages A and B; the SIMT and direct
   convolutions and every spatial kernel compute BF16 in FP32.
-- **INT8 / INT32**: storage carriers only (8-bit storage is enabled). There is
-  no FP8.
+- **INT8 / INT32**: storage carriers only (8-bit storage is enabled): INT8
+  weights with FP32 scales, INT32 indices / levels / tokens. The GGUF block
+  dtypes (Q8_0, Q4_K, Q6_K) are opaque byte carriers decoded by the quantised
+  kernels. There is no FP8.
 
-GLSL built-ins are not IEEE-exact: `exp` is about 3 ulp plus |x|·ulp, and
+GLSL built-ins are not IEEE-exact. Neither is the optimiser: NIR reassociates
+a floating-point expression across a function boundary unless it is
+`precise`, so FSQ's `div_rn(idx, h) - 1.0` came out an ulp or two off the
+CPU's (chunk 5); `math_acc.glsl` now has `div_rn_precise` for callers whose
+next operation must round on its own. It is not a drop-in replacement:
+image_normalize's `(x - mean) * div_rn(1, std)` matches the CPU bit for bit
+with the plain `div_rn` and is an ulp off with the precise one, so each
+kernel keeps the form its exact-parity test pins. Also: `exp` is about 3 ulp plus |x|·ulp, and
 `sin`/`cos` have an absolute error bound. `tanh` and `erf` are written out in
 `common.glsl` (finite for large |x|, accurate near 0). Tanh-GELU and its
 gradient use the identity 0.5(1 + tanh u) = sigmoid(2u), which avoids the
@@ -597,6 +766,7 @@ to divide 64; the dispatcher checks).
 | `BROTENSOR_VK_FA_WGS=n` | workgroups `fa_rows` splits keys up to (default 80) |
 | `BROTENSOR_VK_FA_PATH=rows\|cm\|dense` | force an attention path where it applies (benchmarking) |
 | `BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn` | force the `conv_cm` tile (one of the six in `ops_conv.cpp`) |
+| `BROTENSOR_VK_QGEMV=lpr,unr,sg,nr` | force the quantised GEMV's lanes per row group, items in flight, subgroup size and rows per group |
 
 Vulkan validation layers were not installed on the development machine, so
 the backend has not been run under them.

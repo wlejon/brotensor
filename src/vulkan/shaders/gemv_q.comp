@@ -1,0 +1,275 @@
+#version 460
+// Quantised-weight linear for the decode regime: Y(MB, N) = X(MB, K) W(N, K)^T
+// (+ bias), MB <= 8 rows of X, W in one of four storage formats, decoded in
+// registers and never materialised. Memory-bound on reading W once.
+// FMT is a QF_* code (op_codes.h):
+//   QF_INT8  INT8, per-row FP32 scale (W8A16): w = q * scale[n]
+//   QF_Q8_0  GGUF Q8_0: 34-byte blocks of 32 {fp16 d; int8 q[32]}, w = d q
+//   QF_Q4K   GGUF Q4_K: 144-byte super-blocks of 256 {fp16 d, dmin; 12 bytes
+//          of packed 6-bit (scale, min) pairs for 8 sub-blocks of 32; 128
+//          bytes of nibbles}, w = d sc q - dmin m
+//   QF_Q6K   GGUF Q6_K: 210-byte super-blocks of 256 {ql[128] low nibbles,
+//          qh[64] high 2-bit pairs, int8 sc[16] per 16 elements, fp16 d},
+//          w = d sc (q - 32)
+// -DDT: X, Y and bias storage (1 = FP16, 2 = BF16); FP32 arithmetic.
+//
+// A lane group of LPR lanes (16, 32 or 64, chosen by the host so that short
+// rows still keep every lane busy) walks NR consecutive rows of W together,
+// so each X chunk it loads serves NR rows; a workgroup of 256 has 256 / LPR
+// groups. Each W item is decoded once into FP32 weights with its block
+// scales and minimums folded in, and the loop over the MB rows of X is then
+// one fused multiply-add per weight (ACO's v_fma_mix takes the FP16 X
+// directly). A lane's unit of work is an "item": 16 weights for INT8 and
+// Q8_0 (one 16-byte load; half a Q8_0 block), 32 for the K-quants (16 bytes
+// of Q4_K nibbles = 32 values of two sub-blocks; 24 bytes of Q6_K = 8 values
+// of each of the four quads of a 128-element half). Consecutive lanes take
+// consecutive items, so a step of the LPR lanes reads one contiguous stretch
+// of the row. UNR items per lane are loaded before any is used (docs/vulkan.md,
+// the GEMM's first rule: a load consumed where it is issued stalls there).
+// Lanes reduce with a subgroup butterfly, and through shared memory when a
+// row spans several subgroups (the host pins the subgroup size, SG).
+#include "common.glsl"
+#include "op_codes.h"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint FMT = QF_INT8;
+layout(constant_id = 1) const uint MB = 1;      // rows of X, 1..8
+layout(constant_id = 2) const uint LPR = 64;    // lanes per W row: 16, 32, 64
+layout(constant_id = 3) const uint VEC = 1;     // INT8: K % 16 == 0 and W 16-byte aligned
+layout(constant_id = 4) const uint BIAS = 0;
+layout(constant_id = 5) const uint UNR = 2;     // items in flight per lane
+layout(constant_id = 6) const uint SG = 32;     // the subgroup size the host pinned
+layout(constant_id = 7) const uint NR = 1;      // W rows per lane group (1, 2, 4): X loaded once for all
+
+layout(push_constant) uniform PC {
+    uint64_t x, w, y, bias, scale;
+    uint n, k, ldx, ldy;
+    uint rowbytes;          // bytes per W row
+} pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer U4Buf { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16x4 { u16vec4 v; };   // 8 bytes, 2-aligned
+
+const uint RPW = 256u / LPR;                    // lane groups per workgroup (NR rows each)
+const uint IE = (FMT <= QF_Q8_0) ? 16u : 32u;        // elements per item
+const uint CL = LPR < SG ? LPR : SG;           // lanes of one row inside one subgroup
+shared float s_part[256 / 16 * 8 * NR];         // [subgroup][W row][row of X]
+
+// Raw words of one item, as loaded (decoded after all UNR items are issued).
+// Data that is only 2-byte aligned (Q8_0, Q6_K) is loaded as 16-bit words and
+// packed into 32-bit ones by the decode.
+struct Item {
+    uvec4 q;            // INT8: 16 quants; Q4_K: 16 bytes of nibbles
+    uvec4 h;            // Q4_K: the 16-byte header
+    u16vec4 s0, s1;     // Q8_0: the 16 quants; Q6_K: ql of quads 0 / 2 (s0), 1 / 3 (s1)
+    u16vec4 s2, s3;     // Q6_K: qh (s2), the 8 scales of the half (s3)
+    uint d;             // Q8_0 / Q6_K: fp16 d
+};
+
+uvec2 pk16(u16vec4 v) { return uvec2(uint(v.x) | (uint(v.y) << 16), uint(v.z) | (uint(v.w) << 16)); }
+
+// Eight X values of row r from element e (16-byte aligned: e % 8 == 0 and
+// ldx % 8 == 0, host-checked), as floats.
+void load_x8(uint r, uint e, out vec4 a, out vec4 b) {
+    const uvec4 w = U4Buf(pc.x).v[(r * pc.ldx + e) / 8u];
+    if (DT == DT_F16) {
+        a = vec4(vec2(unpackFloat2x16(w.x)), vec2(unpackFloat2x16(w.y)));
+        b = vec4(vec2(unpackFloat2x16(w.z)), vec2(unpackFloat2x16(w.w)));
+    } else {
+        a = vec4(uintBitsToFloat(w.x << 16), uintBitsToFloat(w.x & 0xffff0000u),
+                 uintBitsToFloat(w.y << 16), uintBitsToFloat(w.y & 0xffff0000u));
+        b = vec4(uintBitsToFloat(w.z << 16), uintBitsToFloat(w.z & 0xffff0000u),
+                 uintBitsToFloat(w.w << 16), uintBitsToFloat(w.w & 0xffff0000u));
+    }
+}
+
+vec4 s8x4(uint w) { return vec4(unpack8(int(w))); }
+vec4 u8x4(uint w) { return vec4(unpack8(w)); }
+float h2f(uint b) { return float(uint16BitsToHalf(uint16_t(b & 0xffffu))); }
+uint byte_of(uvec4 v, uint i) { return (v[i >> 2] >> ((i & 3u) * 8u)) & 0xffu; }
+
+Item load_item(uint64_t row, uint it) {
+    Item o;
+    o.q = uvec4(0);
+    o.h = uvec4(0);
+    o.s0 = o.s1 = o.s2 = o.s3 = u16vec4(0);
+    o.d = 0u;
+    if (FMT == QF_INT8) {
+        o.q = U4Buf(row).v[it];
+    } else if (FMT == QF_Q8_0) {
+        const uint64_t blk = row + uint64_t(it / 2u) * 34u;
+        o.s0 = U16x4(blk + 2u + (it & 1u) * 16u).v;
+        o.s1 = U16x4(blk + 10u + (it & 1u) * 16u).v;
+        o.d = uint(U16Buf(blk).v[0]);
+    } else if (FMT == QF_Q4K) {
+        const uint64_t blk = row + uint64_t(it / 8u) * 144u;
+        const uint s = it % 8u;                  // pair s / 2, half s % 2
+        o.h = U4Buf(blk).v[0];
+        o.q = U4Buf(blk).v[1u + (s / 2u) * 2u + (s & 1u)];
+    } else {
+        const uint64_t blk = row + uint64_t(it / 8u) * 210u;
+        const uint s = it % 8u, g = s / 4u, l0 = (s % 4u) * 8u;
+        o.s0 = U16x4(blk + g * 64u + l0).v;
+        o.s1 = U16x4(blk + g * 64u + 32u + l0).v;
+        o.s2 = U16x4(blk + 128u + g * 32u + l0).v;
+        o.s3 = U16x4(blk + 192u + g * 8u).v;
+        o.d = uint(U16Buf(blk + 208u).v[0]);
+    }
+    return o;
+}
+
+// Q4_K (scale, min) of sub-block j from the header's 12 packed bytes.
+void q4k_scale_min(uvec4 h, uint j, out float sc, out float mn) {
+    const uvec4 s = uvec4(h.y, h.z, h.w, 0u);
+    if (j < 4u) {
+        sc = float(byte_of(s, j) & 63u);
+        mn = float(byte_of(s, j + 4u) & 63u);
+    } else {
+        sc = float((byte_of(s, j + 4u) & 15u) | ((byte_of(s, j - 4u) >> 6) << 4));
+        mn = float((byte_of(s, j + 4u) >> 4) | ((byte_of(s, j) >> 6) << 4));
+    }
+}
+
+// The item's weights as floats with every block scale and minimum folded in
+// (the INT8 row scale is applied to the finished sum), in the order of the
+// X chunks xpos() names: once per W row, so the inner loop over the MB rows
+// of X is one fused FP16 x FP32 multiply-add per weight.
+void decode(const Item o, uint it, out float w[32]) {
+    if (FMT <= QF_Q8_0) {
+        const uvec4 qq = FMT == QF_INT8 ? o.q : uvec4(pk16(o.s0), pk16(o.s1));
+        const float d = FMT == QF_Q8_0 ? h2f(o.d) : 1.0;
+        [[unroll]] for (uint i = 0; i < 4u; ++i) {
+            const vec4 v = s8x4(qq[i]) * d;
+            [[unroll]] for (uint e = 0; e < 4u; ++e) w[4u * i + e] = v[e];
+        }
+        [[unroll]] for (uint e = 16u; e < 32u; ++e) w[e] = 0.0;
+    } else if (FMT == QF_Q4K) {
+        const uint p = (it % 8u) / 2u;
+        float sc0, mn0, sc1, mn1;
+        q4k_scale_min(o.h, 2u * p, sc0, mn0);
+        q4k_scale_min(o.h, 2u * p + 1u, sc1, mn1);
+        const float d = h2f(o.h.x), dmin = h2f(o.h.x >> 16);
+        const float ws0 = d * sc0, wm0 = dmin * mn0, ws1 = d * sc1, wm1 = dmin * mn1;
+        [[unroll]] for (uint i = 0; i < 4u; ++i) {
+            const vec4 lo = u8x4(o.q[i] & 0x0f0f0f0fu), hi = u8x4((o.q[i] >> 4) & 0x0f0f0f0fu);
+            [[unroll]] for (uint e = 0; e < 4u; ++e) {
+                w[4u * i + e] = ws0 * lo[e] - wm0;
+                w[16u + 4u * i + e] = ws1 * hi[e] - wm1;
+            }
+        }
+    } else {
+        const uint l0 = (it % 4u) * 8u;
+        const float d = h2f(o.d);
+        const uvec4 ql = uvec4(pk16(o.s0), pk16(o.s1));   // quads 0 / 2 in xy, 1 / 3 in zw
+        const uvec2 qh = pk16(o.s2), scw = pk16(o.s3);
+        [[unroll]] for (uint q = 0; q < 4u; ++q) {
+            const uint si = (l0 / 16u) + 2u * q;   // byte of the 8 scales of the half
+            const float sc = d * float(int(byte_of(uvec4(scw, 0u, 0u), si) << 24) >> 24);
+            [[unroll]] for (uint h = 0; h < 2u; ++h) {
+                const uint src = (q & 1u) != 0u ? ql[2u + h] : ql[h];
+                const uint nib = q >= 2u ? (src >> 4) & 0x0f0f0f0fu : src & 0x0f0f0f0fu;
+                const uint hb = ((qh[h] >> (2u * q)) & 0x03030303u) << 4;
+                const vec4 v = (u8x4(nib | hb) - vec4(32.0)) * sc;
+                [[unroll]] for (uint e = 0; e < 4u; ++e) w[8u * q + 4u * h + e] = v[e];
+            }
+        }
+    }
+}
+
+// First element of X chunk c (8 elements) of item `it`.
+uint xpos(uint it, uint c) {
+    if (FMT <= QF_Q8_0) return it * 16u + c * 8u;
+    const uint sb = it / 8u, s = it % 8u;
+    if (FMT == QF_Q4K) return sb * 256u + (s / 2u) * 64u + (s & 1u) * 16u + (c / 2u) * 32u + (c & 1u) * 8u;
+    return sb * 256u + (s / 4u) * 128u + (s % 4u) * 8u + c * 32u;
+}
+
+// One item index of NR consecutive W rows against the MB rows of X: X is
+// loaded once for all NR rows.
+Item g_it[UNR][NR];     // the items in flight (private; spec-sized arrays stay out of signatures)
+float acc[NR * 8];      // [W row][row of X]
+
+void consume(uint u, uint it) {
+    float w[NR][32];
+    [[unroll]] for (uint r = 0; r < NR; ++r) decode(g_it[u][r], it, w[r]);
+    [[unroll]] for (uint b = 0; b < MB; ++b) {
+        [[unroll]] for (uint c = 0; c < IE / 8u; ++c) {
+            vec4 x0, x1;
+            load_x8(b, xpos(it, c), x0, x1);
+            [[unroll]] for (uint r = 0; r < NR; ++r) {
+                float t = acc[r * 8u + b];
+                [[unroll]] for (uint e = 0; e < 4u; ++e) t = fma(x0[e], w[r][8u * c + e], t);
+                [[unroll]] for (uint e = 0; e < 4u; ++e) t = fma(x1[e], w[r][8u * c + 4u + e], t);
+                acc[r * 8u + b] = t;
+            }
+        }
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint lane = tid % LPR;
+    const uint n0 = (((gl_WorkGroupID.y * gl_NumWorkGroups.x) + gl_WorkGroupID.x) * RPW + tid / LPR) * NR;
+    uint64_t row[NR];
+    [[unroll]] for (uint r = 0; r < NR; ++r) row[r] = pc.w + uint64_t(min(n0 + r, pc.n - 1u)) * uint64_t(pc.rowbytes);
+
+    [[unroll]] for (uint q = 0; q < NR * 8u; ++q) acc[q] = 0.0;
+    if (n0 < pc.n) {
+        if (FMT == QF_INT8 && VEC == 0u) {
+            // INT8 rows of any length / alignment: one weight per lane per step.
+            for (uint e = lane; e < pc.k; e += LPR) {
+                [[unroll]] for (uint r = 0; r < NR; ++r) {
+                    const float wv = float(int8_t(U8Buf(row[r]).v[e]));
+                    [[unroll]] for (uint b = 0; b < MB; ++b) acc[r * 8u + b] += wv * load_elem(DT, pc.x, b * pc.ldx + e);
+                }
+            }
+        } else {
+            const uint nit = pc.k / IE;
+            for (uint i0 = lane; i0 < nit; i0 += LPR * UNR) {
+                uint ix[UNR];
+                [[unroll]] for (uint u = 0; u < UNR; ++u) {
+                    const uint i = i0 + u * LPR;
+                    ix[u] = i < nit ? i : i0;            // clamped: loaded, then skipped
+                    [[unroll]] for (uint r = 0; r < NR; ++r) g_it[u][r] = load_item(row[r], ix[u]);
+                }
+                [[unroll]] for (uint u = 0; u < UNR; ++u) {
+                    if (i0 + u * LPR < nit) consume(u, ix[u]);
+                }
+            }
+        }
+    }
+
+    // Reduce over the row group's LPR lanes: a butterfly over the CL lanes
+    // inside one subgroup, then the subgroups of one group through shared
+    // memory (LPR > SG).
+    [[unroll]] for (uint off = 1u; off < CL; off *= 2u) {
+        [[unroll]] for (uint r = 0; r < NR; ++r)
+            [[unroll]] for (uint b = 0; b < MB; ++b) acc[r * 8u + b] += subgroupShuffleXor(acc[r * 8u + b], off);
+    }
+    if (LPR > SG) {
+        if (gl_SubgroupInvocationID == 0u) {
+            [[unroll]] for (uint q = 0; q < NR * 8u; ++q) s_part[gl_SubgroupID * NR * 8u + q] = acc[q];
+        }
+        barrier();
+        if (lane != 0u) return;
+        const uint per = LPR / SG, c0 = tid / SG;
+        [[unroll]] for (uint q = 0; q < NR * 8u; ++q) {
+            float s = 0.0;
+            for (uint c = 0; c < per; ++c) s += s_part[(c0 + c) * NR * 8u + q];
+            acc[q] = s;
+        }
+    } else if (lane != 0u) {
+        return;
+    }
+    [[unroll]] for (uint r = 0; r < NR; ++r) {
+        const uint n = n0 + r;
+        if (n >= pc.n) return;
+        const float sc = FMT == QF_INT8 ? F32Buf(pc.scale).v[n] : 1.0;
+        const float bv = BIAS != 0u ? load_elem(DT, pc.bias, n) : 0.0;
+        [[unroll]] for (uint b = 0; b < MB; ++b) store_elem(DT, pc.y, b * pc.ldy + n, acc[r * 8u + b] * sc + bv);
+    }
+}

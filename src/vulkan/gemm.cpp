@@ -19,7 +19,7 @@ using ::brotensor::Dtype;
 namespace {
 
 struct GemmPush {
-    std::uint64_t a, b, c, bias;
+    std::uint64_t a, b, c, bias, scale;
     std::uint32_t m, n, k, lda, ldb, ldc, sa, sb, sc, half_n;
     std::uint32_t tm0, tn0;   // gemm_cm: tile origin of the dispatch
 };
@@ -70,11 +70,15 @@ bool vec_ok(const GemmArgs& g) {
 
 bool cm_vec_ok(const GemmArgs& g) {
     const int ea = g.ta ? g.m : g.k, eb = g.nb ? g.n : g.k;
+    if (g.qb != 0) {   // A as usual; an INT8 B row in 8-byte chunks (the GGUF formats have no scalar form)
+        return g.a % 16 == 0 && g.lda % 8 == 0 && g.k > 0 && g.k % 8 == 0 &&
+               (g.qb != QF_INT8 || (g.b % 8 == 0 && g.ldb % 8 == 0));
+    }
     return vec_ok(g) && g.k > 0 && ea % 8 == 0 && eb % 8 == 0;
 }
 
 bool gemv_eligible(DeviceCtx& d, const GemmArgs& g) {
-    if (g_override.load(std::memory_order_relaxed) != 0) return false;
+    if (g_override.load(std::memory_order_relaxed) != 0 || g.qb != 0) return false;
     const std::uint32_t sgs = d.info().subgroup_size;
     if (sgs < 4 || sgs > 64 || 64 % sgs != 0) return false;
     if (g.ta || g.nb || g.batch != 1 || g.m > 8) return false;
@@ -83,6 +87,7 @@ bool gemv_eligible(DeviceCtx& d, const GemmArgs& g) {
 }
 
 bool coopmat_eligible(DeviceCtx& d, const GemmArgs& g) {
+    if (g.qb != 0) return d.info().coopmat_f16 && is16(g.da) && g.dc == g.da;
     return g_override.load(std::memory_order_relaxed) != 2 && d.info().coopmat_f16 && is16(g.da) && g.db == g.da && g.dc == g.da;
 }
 
@@ -143,7 +148,7 @@ void launch_batched(DeviceCtx& d, const Kernel& k, GemmPush pc, const GemmArgs& 
 
 GemmPush make_push(const GemmArgs& g) {
     GemmPush pc{};
-    pc.a = g.a; pc.b = g.b; pc.c = g.c; pc.bias = g.bias;
+    pc.a = g.a; pc.b = g.b; pc.c = g.c; pc.bias = g.bias; pc.scale = g.scale;
     pc.m = static_cast<std::uint32_t>(g.m);
     pc.n = static_cast<std::uint32_t>(g.n);
     pc.k = static_cast<std::uint32_t>(g.k);
@@ -165,9 +170,10 @@ void check_args(const GemmArgs& g) {
     if ((g.epi == EPI_GEGLU || g.epi == EPI_SWIGLU) && (g.ta || g.nb || g.n % 2 != 0 || g.act != 0)) {
         fail(g, "the GeGLU / SwiGLU epilogues need the linear (NT) layout, an even width and act 0");
     }
+    if (g.qb != 0 && (g.ta || g.nb || g.batch != 1)) fail(g, "a quantised B needs the NT layout and one batch");
     // Element indices are 32-bit in the kernels (no buffer exceeds 4 GiB).
     auto fits = [](long long rows, long long ld) { return rows * ld < (1LL << 32); };
-    if (!fits(g.ta ? g.k : g.m, g.lda) || !fits(g.nb ? g.k : g.n, g.ldb) || !fits(g.m, g.ldc)) {
+    if (!fits(g.ta ? g.k : g.m, g.lda) || (g.qb == 0 && !fits(g.nb ? g.k : g.n, g.ldb)) || !fits(g.m, g.ldc)) {
         fail(g, "operand larger than the 4 GiB buffer limit");
     }
 }
@@ -242,7 +248,8 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
             const std::uint32_t spec[] = {c.bm, c.bn, c.bk, c.wm, c.wn, cm_wg(c),
                                           static_cast<std::uint32_t>(g.epi), static_cast<std::uint32_t>(g.act),
                                           g.ta ? 1u : 0u, g.nb ? 1u : 0u, cm_vec_ok(g) ? 1u : 0u,
-                                          direct ? 1u : 0u, g.bias ? 1u : 0u};
+                                          direct ? 1u : 0u, g.bias ? 1u : 0u,
+                                          static_cast<std::uint32_t>(g.qb)};
             return d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)), 32);
         };
         // The fragment-form epilogue (stores straight from the accumulator)
@@ -270,6 +277,8 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
         }
         return;
     }
+
+    if (g.qb != 0) fail(g, "a quantised B needs cooperative matrix and 16-bit A / C");
 
     // The SIMT kernel has no GLU epilogue: it writes r (bias included) to an
     // FP32 scratch, unrounded, and a separate pass gates it into C.

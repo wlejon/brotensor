@@ -153,4 +153,45 @@
 #define RNG_BERNOULLI       2
 #define RNG_TRUNCATED       3
 
+// Quantised weight formats (quant_decode.glsl, gemv_q.comp, gemm_cm.comp's QB,
+// conv_cm.comp's QA, dequant.comp); 0 means not quantised.
+#define QF_INT8             1    // int8, per-row FP32 scale
+#define QF_Q8_0             2    // GGUF Q8_0
+#define QF_Q4K              3    // GGUF Q4_K
+#define QF_Q6K              4    // GGUF Q6_K
+
+// audio.comp (spec constant 0)
+#define AU_SNAKE            0
+#define AU_SNAKE_BWD        1
+#define AU_PAD              2
+#define AU_PAD_BWD          3
+#define AU_RESAMPLE         4
+#define AU_RESAMPLE_BWD     5
+#define AU_CAUSAL           6
+#define AU_CONVT_BWD_W      7
+#define AU_FSQ              8
+#define AU_VQ               9
+#define AU_COL2IM           10
+
+// dft.comp (spec constant 0) and SP_BASIS's modes
+#define SP_BASIS            0
+#define SP_OLA              1
+#define SP_STFT_ADJ         2
+#define SP_ISTFT_ADJ        3
+#define SP_CX_MUL           4
+#define SP_CX_MUL_BWD       5
+#define SP_CX_ABS           6
+#define SP_CX_ABS_BWD       7
+#define SP_CX_ANGLE         8
+#define SP_CX_POLAR         9
+#define BASIS_R2C           0
+#define BASIS_C2R           1
+#define BASIS_C2C           2
+
+// select.comp (spec constant 0)
+#define SEL_SAMPLE          0
+#define SEL_COUNTER         1
+#define SEL_MD              2
+#define SEL_COMMIT          3
+
 #endif

@@ -31,7 +31,7 @@ layout(constant_id = 14) const uint ACCUM = 0;   // Y += conv
 layout(local_size_x_id = 5) in;
 
 layout(push_constant) uniform PC {
-    uint64_t x, w, y, bias;
+    uint64_t x, w, y, bias, scale;   // scale: conv_cm.comp's INT8 weights (unused here, shared layout)
     uint m, n, k;            // Cg_out, H_out * W_out, Cg_in * KH * KW
     uint h, wd, wo;
     uint cin, cout, groups;

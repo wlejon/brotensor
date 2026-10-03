@@ -223,18 +223,35 @@ void randn_truncated(float lo, float hi, std::uint64_t key, std::uint64_t counte
 // one fused pass; a per-channel t_emb shift (or a per-sample one with N = 1)
 // is folded into conv1's bias; the skip is written to Y first and conv2
 // accumulates onto it, so no pass re-reads Y.
-void resblock_forward(const Tensor& X, const Tensor& gamma1, const Tensor& beta1, const Tensor& W1, const Tensor* b1,
-                      const Tensor* t_emb_shift, const Tensor& gamma2, const Tensor& beta2, const Tensor& W2,
-                      const Tensor* b2, const Tensor* Wskip, const Tensor* bskip, int N, int C_in, int C_out, int H,
-                      int W, int num_groups, float eps, Tensor& Y) {
-    const char* op = "resblock_forward";
+namespace {
+
+// The ResBlock, with FP16 / BF16 / FP32 weights (scales null) or INT8 ones
+// with per-output-channel FP32 scales (resblock_forward_int8w_fp16: X FP16).
+void resblock(const char* op, const Tensor& X, const Tensor& gamma1, const Tensor& beta1, const Tensor& W1,
+              const Tensor* s1, const Tensor* b1, const Tensor* t_emb_shift, const Tensor& gamma2,
+              const Tensor& beta2, const Tensor& W2, const Tensor* s2, const Tensor* b2, const Tensor* Wskip,
+              const Tensor* sskip, const Tensor* bskip, int N, int C_in, int C_out, int H, int W, int num_groups,
+              float eps, Tensor& Y) {
     const Dtype dt = X.dtype;
     dt_code(dt, op);
+    const bool q8 = s1 != nullptr;
     need(op, num_groups > 0 && C_in % num_groups == 0 && C_out % num_groups == 0,
          "num_groups must divide C_in and C_out");
     need(op, Wskip != nullptr || C_in == C_out, "Wskip required when C_in != C_out");
-    for (const Tensor* t : {&gamma1, &beta1, &W1, &gamma2, &beta2, &W2, b1, b2, Wskip, bskip, t_emb_shift}) {
+    for (const Tensor* t : {&gamma1, &beta1, &gamma2, &beta2, b1, b2, bskip, t_emb_shift}) {
         need(op, t == nullptr || t->dtype == dt, "all parameters must share X's dtype");
+    }
+    for (const Tensor* t : {&W1, &W2, Wskip}) {
+        need(op, t == nullptr || t->dtype == (q8 ? Dtype::INT8 : dt),
+             q8 ? "W1 / W2 / Wskip must be INT8" : "all parameters must share X's dtype");
+    }
+    if (q8) {
+        need(op, dt == Dtype::FP16, "X must be FP16");
+        need(op, s2 != nullptr && (!Wskip || sskip != nullptr), "every INT8 weight needs its scales");
+        for (const Tensor* t : {s1, s2, Wskip ? sskip : nullptr}) {
+            need(op, t == nullptr || (t->dtype == Dtype::FP32 && t->size() == C_out),
+                 "scales must be FP32 with C_out elements");
+        }
     }
     need(op, gamma1.size() == C_in && beta1.size() == C_in, "gamma1/beta1 must have C_in elements");
     need(op, gamma2.size() == C_out && beta2.size() == C_out, "gamma2/beta2 must have C_out elements");
@@ -278,6 +295,7 @@ void resblock_forward(const Tensor& X, const Tensor& gamma1, const Tensor& beta1
     Tensor h2 = Tensor::empty_on(dev, N, static_cast<int>(C_out * hw), dt);
     Conv2dArgs c1;
     c1.x = addr(h1.data); c1.w = addr(W1.data); c1.bias = b1a; c1.y = addr(h2.data); c1.dt = dt;
+    c1.scale = s1 ? addr(s1->data) : 0;
     c1.n = N; c1.cin = C_in; c1.h = H; c1.wd = W; c1.cout = C_out; c1.kh = c1.kw = 3; c1.ph = c1.pw = 1;
     c1.op = op;
     conv2d(d, c1);
@@ -291,6 +309,7 @@ void resblock_forward(const Tensor& X, const Tensor& gamma1, const Tensor& beta1
         Conv2dArgs cs;
         cs.x = addr(X.data); cs.w = addr(Wskip->data); cs.bias = bskip ? addr(bskip->data) : 0;
         cs.y = addr(Y.data); cs.dt = dt;
+        cs.scale = sskip ? addr(sskip->data) : 0;
         cs.n = N; cs.cin = C_in; cs.h = H; cs.wd = W; cs.cout = C_out;
         cs.op = op;
         conv2d(d, cs);
@@ -299,6 +318,7 @@ void resblock_forward(const Tensor& X, const Tensor& gamma1, const Tensor& beta1
     }
     Conv2dArgs c2;
     c2.x = addr(h2.data); c2.w = addr(W2.data); c2.bias = b2 ? addr(b2->data) : 0; c2.y = addr(Y.data); c2.dt = dt;
+    c2.scale = s2 ? addr(s2->data) : 0;
     c2.n = N; c2.cin = C_out; c2.h = H; c2.wd = W; c2.cout = C_out; c2.kh = c2.kw = 3; c2.ph = c2.pw = 1;
     c2.op = op;
     if (std::string(conv2d_path(d, c2)) == "direct") {   // narrow blocks: no accumulating kernel
@@ -310,6 +330,25 @@ void resblock_forward(const Tensor& X, const Tensor& gamma1, const Tensor& beta1
     }
     c2.accum = true;
     conv2d(d, c2);
+}
+
+}  // namespace
+
+void resblock_forward(const Tensor& X, const Tensor& gamma1, const Tensor& beta1, const Tensor& W1, const Tensor* b1,
+                      const Tensor* t_emb_shift, const Tensor& gamma2, const Tensor& beta2, const Tensor& W2,
+                      const Tensor* b2, const Tensor* Wskip, const Tensor* bskip, int N, int C_in, int C_out, int H,
+                      int W, int num_groups, float eps, Tensor& Y) {
+    resblock("resblock_forward", X, gamma1, beta1, W1, nullptr, b1, t_emb_shift, gamma2, beta2, W2, nullptr, b2,
+             Wskip, nullptr, bskip, N, C_in, C_out, H, W, num_groups, eps, Y);
+}
+
+void resblock_forward_int8w_fp16(const Tensor& X, const Tensor& gamma1, const Tensor& beta1, const Tensor& W1,
+                                 const Tensor& s1, const Tensor* b1, const Tensor* t_emb_shift, const Tensor& gamma2,
+                                 const Tensor& beta2, const Tensor& W2, const Tensor& s2, const Tensor* b2,
+                                 const Tensor* Wskip, const Tensor* sskip, const Tensor* bskip, int N, int C_in,
+                                 int C_out, int H, int W, int num_groups, float eps, Tensor& Y) {
+    resblock("resblock_forward_int8w_fp16", X, gamma1, beta1, W1, &s1, b1, t_emb_shift, gamma2, beta2, W2, &s2, b2,
+             Wskip, sskip, bskip, N, C_in, C_out, H, W, num_groups, eps, Y);
 }
 
 void fill_vulkan_vtable_diffusion(::brotensor::detail::OpsVTable& v) {
@@ -324,6 +363,7 @@ void fill_vulkan_vtable_diffusion(::brotensor::detail::OpsVTable& v) {
     v.rand_bernoulli = &rand_bernoulli;
     v.randn_truncated = &randn_truncated;
     v.resblock_forward = &resblock_forward;
+    v.resblock_forward_int8w_fp16 = &resblock_forward_int8w_fp16;
 }
 
 }  // namespace brotensor::detail::vulkan
