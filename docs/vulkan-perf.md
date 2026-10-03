@@ -157,7 +157,8 @@ cache-resident.
 
 The fused kernels sit at 81-91% of nominal bandwidth on cache-cold shapes,
 level with brass's own SPIR-V kernels against hand-written GLSL (~230 GB/s);
-BF16 matches FP16 (its shared-memory bit reinterpretation costs nothing).
+BF16 matches FP16 (its bit reinterpretation, an `OpBitcast` each way, costs
+nothing).
 The replay's FP32 rows are slow mostly from its per-execute scratch
 intermediates.
 

@@ -56,7 +56,6 @@ public:
         const std::vector<Value*> p = entry_params(c, fn);
         out_ptr_.assign(p.begin(), p.begin() + static_cast<std::ptrdiff_t>(n_out));
         in_ptr_.assign(p.begin() + static_cast<std::ptrdiff_t>(n_out), p.end());
-        if (any_bf16(ew_)) alloc_bitcast_slot(c, static_cast<std::uint32_t>(tpr_ * rpb_));
 
         // Shared partials, one array per reduction so no barrier is needed
         // between them.

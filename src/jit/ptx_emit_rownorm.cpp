@@ -20,17 +20,29 @@ namespace {
 // row per block, narrow ones pack several rows into a block instead of idling
 // most of it.
 //
-//   pass 1   evaluate the pre chain (the nodes the reduction depends on) and
-//            accumulate sum and sum-of-squares; reduce across the block with a
-//            warp butterfly plus one shared-memory round.
-//   pass 2   evaluate the pre chain again — the reduction consumed it, and
-//            holding a whole row in registers would cap D — then the
-//            normalisation, then the post chain, then the stores.
+//   RMS    pass 1   pre chain (the nodes the reduction depends on), sum of
+//                   squares, pass-one outputs stored
+//          pass 2   x (read back, or the pre chain again — holding a whole
+//                   row in registers would cap D), * rstd, gamma, post
+//                   chain, stores
+//   Mean   pass 1   pre chain, sum, pass-one outputs stored
+//          pass 1b  x again, sum of squared deviations from the mean
+//          pass 2   as above with (x - mean) * rstd, gamma, beta
+//
+// Each reduction is a warp butterfly plus, when a row spans several warps,
+// one shared-memory round across that row's warps.
+//
+// LayerNorm's variance is the two-pass sum of squared deviations, never
+// E[x^2] - E[x]^2 (which cancels catastrophically once a row's mean dwarfs
+// its spread — the rule in CLAUDE.md), with the same structure as the Vulkan
+// emitter (spirv_emit_rownorm.cpp). The extra pass re-reads a row the block
+// just touched, out of L2.
 //
 // The pre chain is what lets `x += p; rms_norm(x)` fuse: the reduction needs
 // the updated x that this same kernel writes. It also means the row is read
-// twice, but the second read is the same 8-64 KB the block just touched, so
-// it comes out of L2 rather than HBM.
+// more than once (twice for RMSNorm, three times for LayerNorm), but every
+// read after the first is the same 8-64 KB the block just touched, so it
+// comes out of L2 rather than HBM.
 //
 // D, the row count and eps are baked in as immediates. The trace signature
 // already carries the shape, so a different shape is a different trace and a
@@ -172,10 +184,84 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
         return vals;
     };
 
-    // ── pass 1: the pre chain, then sum and sum of squares ──────────────────
-    const std::string f_sum = a.F(), f_sq = a.F();
-    b << "    mov.f32 " << f_sum << ", 0f00000000;\n";
-    b << "    mov.f32 " << f_sq << ", 0f00000000;\n";
+    // x at the column in `r_c` after pass one: read back from the output
+    // pass one wrote, or (no pre output) the pre chain replayed from the
+    // inputs. With `vals`, also loads what pass two needs and leaves it there.
+    auto reload_x = [&](Offsets& o, const std::string& r_c,
+                        ValueMap* vals) -> std::vector<std::string> {
+        ValueMap local;
+        ValueMap& v = vals ? *vals : local;
+        if (plan.x_output >= 0) {
+            if (vals) v = emit_inputs(o, r_c, plan.post_input);
+            const BufferSpec& xs = ew.outputs[static_cast<std::size_t>(plan.x_output)];
+            const std::string off = full_off(o, r_c, xs.dtype);
+            const std::string addr = a.RD();
+            b << "    add.u64 " << addr << ", " << out_ptr[static_cast<std::size_t>(plan.x_output)]
+              << ", " << off << ";\n";
+            std::vector<std::string> x = emit_load(b, a, xs.dtype, lanes, addr);
+            v[plan.x_node] = x;
+            return x;
+        }
+        // Without the reload the plan guarantees pass one stored nothing, so
+        // the inputs are still what pass one read.
+        v = emit_inputs(o, r_c, vals ? plan.post_input : plan.pre_input);
+        v = emit_chain(b, a, dag, lanes, std::move(v), &plan.pre_ids);
+        return v.at(plan.x_node);
+    };
+
+    // The row total of `acc` in every thread of the row: a warp butterfly,
+    // then, when the row spans several warps, one shared-memory round across
+    // ITS warps. `region` picks the slot set (one entry per warp of the
+    // block, at most eight): squares at 0, sums after them, so the two
+    // LayerNorm rounds touch different words and need no barrier between
+    // them.
+    auto block_reduce = [&](const std::string& acc, int region, const char* tag) {
+        const std::string rb = a.R();
+        for (int m = 16; m >= 1; m >>= 1) {
+            const std::string t = a.F();
+            b << "    mov.b32 " << rb << ", " << acc << ";\n";
+            b << "    shfl.sync.bfly.b32 " << rb << ", " << rb << ", " << m << ", 31, -1;\n";
+            b << "    mov.b32 " << t << ", " << rb << ";\n";
+            b << "    add.f32 " << acc << ", " << acc << ", " << t << ";\n";
+        }
+        if (warps == 1) return;
+        const int off = region * (kRowThreads / 32) * 4;
+        const std::string r_warp = a.R(), r_lane = a.R(), r_sb = a.R(), r_sa = a.R();
+        const std::string p_lane0 = a.P(), rt = a.R();
+        b << "    shr.u32 " << r_warp << ", " << r_tid << ", 5;\n";
+        b << "    and.b32 " << r_lane << ", " << r_tid << ", 31;\n";
+        b << "    mov.u32 " << r_sb << ", rn_red;\n";
+        if (off) b << "    add.u32 " << r_sb << ", " << r_sb << ", " << off << ";\n";
+        b << "    setp.eq.u32 " << p_lane0 << ", " << r_lane << ", 0;\n";
+        b << "    @!" << p_lane0 << " bra $L_" << name << "_" << tag << "_nostore;\n";
+        b << "    mad.lo.u32 " << r_sa << ", " << r_warp << ", 4, " << r_sb << ";\n";
+        b << "    mov.b32 " << rt << ", " << acc << ";\n";
+        b << "    st.shared.b32 [" << r_sa << "], " << rt << ";\n";
+        b << "$L_" << name << "_" << tag << "_nostore:\n";
+        b << "    bar.sync 0;\n";
+
+        // This row's warps start at (row within block) * warps. Every thread
+        // folds them itself, so the result needs no second broadcast.
+        const std::string r_base = a.R();
+        if (rpb == 1) {
+            b << "    mov.u32 " << r_base << ", " << r_sb << ";\n";
+        } else {
+            b << "    mad.lo.u32 " << r_base << ", " << r_local << ", " << (warps * 4)
+              << ", " << r_sb << ";\n";
+        }
+        b << "    mov.f32 " << acc << ", 0f00000000;\n";
+        for (int w = 0; w < warps; ++w) {
+            const std::string ra = a.R(), rv = a.R(), fv = a.F();
+            b << "    add.u32 " << ra << ", " << r_base << ", " << (w * 4) << ";\n";
+            b << "    ld.shared.b32 " << rv << ", [" << ra << "];\n";
+            b << "    mov.b32 " << fv << ", " << rv << ";\n";
+            b << "    add.f32 " << acc << ", " << acc << ", " << fv << ";\n";
+        }
+    };
+
+    // ── pass 1: the pre chain, then the sum (Mean) or sum of squares (RMS) ──
+    const std::string f_acc = a.F();
+    b << "    mov.f32 " << f_acc << ", 0f00000000;\n";
     {
         const std::string r_c = a.R(), p = a.P();
         b << "    mov.u32 " << r_c << ", " << r_c0 << ";\n";
@@ -189,8 +275,11 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
         const std::vector<std::string> x = vals.at(plan.x_node);
         for (int j = 0; j < lanes; ++j) {
             const std::string& xj = x[static_cast<std::size_t>(j)];
-            if (mean) b << "    add.f32 " << f_sum << ", " << f_sum << ", " << xj << ";\n";
-            b << "    fma.rn.f32 " << f_sq << ", " << xj << ", " << xj << ", " << f_sq << ";\n";
+            if (mean) {
+                b << "    add.f32 " << f_acc << ", " << f_acc << ", " << xj << ";\n";
+            } else {
+                b << "    fma.rn.f32 " << f_acc << ", " << xj << ", " << xj << ", " << f_acc << ";\n";
+            }
         }
         // Outputs the pre chain produced are final here — writing them now is
         // what lets pass two read the value back instead of recomputing it.
@@ -208,91 +297,41 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
         b << "$L_" << name << "_sum_end:\n";
     }
 
-    // ── block reduction ─────────────────────────────────────────────────────
-    auto warp_reduce = [&](const std::string& acc) {
-        const std::string rb = a.R();
-        for (int m = 16; m >= 1; m >>= 1) {
-            const std::string t = a.F();
-            b << "    mov.b32 " << rb << ", " << acc << ";\n";
-            b << "    shfl.sync.bfly.b32 " << rb << ", " << rb << ", " << m << ", 31, -1;\n";
-            b << "    mov.b32 " << t << ", " << rb << ";\n";
-            b << "    add.f32 " << acc << ", " << acc << ", " << t << ";\n";
-        }
-    };
-    if (mean) warp_reduce(f_sum);
-    warp_reduce(f_sq);
-
-    // With one warp per row the butterfly already produced the row total in
-    // every lane; only a row spanning several warps needs the shared round,
-    // and then only across ITS warps. Slot layout is one entry per warp of
-    // the block (at most eight), sums after squares.
-    if (warps > 1) {
-        const int slots = kRowThreads / 32;
-        const std::string r_warp = a.R(), r_lane = a.R(), r_sb = a.R(), r_sa = a.R();
-        const std::string p_lane0 = a.P();
-        b << "    shr.u32 " << r_warp << ", " << r_tid << ", 5;\n";
-        b << "    and.b32 " << r_lane << ", " << r_tid << ", 31;\n";
-        b << "    mov.u32 " << r_sb << ", rn_red;\n";
-        b << "    setp.eq.u32 " << p_lane0 << ", " << r_lane << ", 0;\n";
-        b << "    @!" << p_lane0 << " bra $L_" << name << "_nostore;\n";
-        {
-            const std::string rt = a.R();
-            b << "    mad.lo.u32 " << r_sa << ", " << r_warp << ", 4, " << r_sb << ";\n";
-            b << "    mov.b32 " << rt << ", " << f_sq << ";\n";
-            b << "    st.shared.b32 [" << r_sa << "], " << rt << ";\n";
-            if (mean) {
-                const std::string rt2 = a.R(), ra2 = a.R();
-                b << "    add.u32 " << ra2 << ", " << r_sa << ", " << (slots * 4) << ";\n";
-                b << "    mov.b32 " << rt2 << ", " << f_sum << ";\n";
-                b << "    st.shared.b32 [" << ra2 << "], " << rt2 << ";\n";
-            }
-        }
-        b << "$L_" << name << "_nostore:\n";
-        b << "    bar.sync 0;\n";
-
-        // This row's warps start at (row within block) * warps. Every thread
-        // folds them itself, so the result needs no second broadcast.
-        const std::string r_base = a.R();
-        if (rpb == 1) {
-            b << "    mov.u32 " << r_base << ", " << r_sb << ";\n";
-        } else {
-            b << "    mad.lo.u32 " << r_base << ", " << r_local << ", " << (warps * 4)
-              << ", " << r_sb << ";\n";
-        }
-        b << "    mov.f32 " << f_sq << ", 0f00000000;\n";
-        if (mean) b << "    mov.f32 " << f_sum << ", 0f00000000;\n";
-        for (int w = 0; w < warps; ++w) {
-            const std::string ra = a.R(), rv = a.R(), fv = a.F();
-            b << "    add.u32 " << ra << ", " << r_base << ", " << (w * 4) << ";\n";
-            b << "    ld.shared.b32 " << rv << ", [" << ra << "];\n";
-            b << "    mov.b32 " << fv << ", " << rv << ";\n";
-            b << "    add.f32 " << f_sq << ", " << f_sq << ", " << fv << ";\n";
-            if (mean) {
-                const std::string ra2 = a.R(), rv2 = a.R(), fv2 = a.F();
-                b << "    add.u32 " << ra2 << ", " << r_base << ", "
-                  << (slots * 4 + w * 4) << ";\n";
-                b << "    ld.shared.b32 " << rv2 << ", [" << ra2 << "];\n";
-                b << "    mov.b32 " << fv2 << ", " << rv2 << ";\n";
-                b << "    add.f32 " << f_sum << ", " << f_sum << ", " << fv2 << ";\n";
-            }
-        }
-    }
-
-    // ── scale and, for LayerNorm, the mean to subtract ──────────────────────
+    // ── reductions; for LayerNorm, pass 1b over the deviations ──────────────
     const std::string f_mean = a.F(), f_rstd = a.F();
     const float inv_d = 1.0f / static_cast<float>(D);
     if (mean) {
-        const std::string var = a.F(), t = a.F();
-        b << "    mul.f32 " << f_mean << ", " << f_sum << ", " << fhex(inv_d) << ";\n";
-        b << "    mul.f32 " << t << ", " << f_mean << ", " << f_mean << ";\n";
-        b << "    mul.f32 " << var << ", " << f_sq << ", " << fhex(inv_d) << ";\n";
-        b << "    sub.f32 " << var << ", " << var << ", " << t << ";\n";
+        block_reduce(f_acc, 1, "sum");
+        b << "    mul.f32 " << f_mean << ", " << f_acc << ", " << fhex(inv_d) << ";\n";
+
+        const std::string f_dev = a.F();
+        b << "    mov.f32 " << f_dev << ", 0f00000000;\n";
+        const std::string r_c = a.R(), p = a.P();
+        b << "    mov.u32 " << r_c << ", " << r_c0 << ";\n";
+        b << "$L_" << name << "_dev:\n";
+        b << "    setp.ge.u32 " << p << ", " << r_c << ", " << D << ";\n";
+        b << "    @" << p << " bra $L_" << name << "_dev_end;\n";
+        Offsets o1b;
+        const std::vector<std::string> x = reload_x(o1b, r_c, nullptr);
+        for (int j = 0; j < lanes; ++j) {
+            const std::string d = a.F();
+            b << "    sub.f32 " << d << ", " << x[static_cast<std::size_t>(j)] << ", " << f_mean << ";\n";
+            b << "    fma.rn.f32 " << f_dev << ", " << d << ", " << d << ", " << f_dev << ";\n";
+        }
+        b << "    add.u32 " << r_c << ", " << r_c << ", " << step << ";\n";
+        b << "    bra $L_" << name << "_dev;\n";
+        b << "$L_" << name << "_dev_end:\n";
+
+        block_reduce(f_dev, 0, "dev");
+        const std::string var = a.F();
+        b << "    mul.f32 " << var << ", " << f_dev << ", " << fhex(inv_d) << ";\n";
         b << "    add.f32 " << var << ", " << var << ", " << fhex(plan.eps) << ";\n";
         b << "    rsqrt.approx.f32 " << f_rstd << ", " << var << ";\n";
     } else {
+        block_reduce(f_acc, 0, "sq");
         const std::string ms = a.F();
         b << "    mov.f32 " << f_mean << ", 0f00000000;\n";
-        b << "    mul.f32 " << ms << ", " << f_sq << ", " << fhex(inv_d) << ";\n";
+        b << "    mul.f32 " << ms << ", " << f_acc << ", " << fhex(inv_d) << ";\n";
         b << "    add.f32 " << ms << ", " << ms << ", " << fhex(plan.eps) << ";\n";
         b << "    rsqrt.approx.f32 " << f_rstd << ", " << ms << ";\n";
     }
@@ -306,23 +345,8 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
         b << "    @" << p << " bra $L_" << name << "_apply_end;\n";
 
         Offsets o2;
-        const bool reload = (plan.x_output >= 0);
-        ValueMap vals = emit_inputs(o2, r_c, plan.post_input);
-        std::vector<std::string> x;
-        if (reload) {
-            // Pass one already wrote this; read it back rather than replaying
-            // the chain and every input feeding it.
-            const BufferSpec& xs = ew.outputs[static_cast<std::size_t>(plan.x_output)];
-            const std::string off = full_off(o2, r_c, xs.dtype);
-            const std::string addr = a.RD();
-            b << "    add.u64 " << addr << ", " << out_ptr[static_cast<std::size_t>(plan.x_output)]
-              << ", " << off << ";\n";
-            x = emit_load(b, a, xs.dtype, lanes, addr);
-            vals[plan.x_node] = x;
-        } else {
-            vals = emit_chain(b, a, dag, lanes, std::move(vals), &plan.pre_ids);
-            x = vals.at(plan.x_node);
-        }
+        ValueMap vals;
+        const std::vector<std::string> x = reload_x(o2, r_c, &vals);
         std::vector<std::string> gam, bet;
         if (plan.gamma_input >= 0) {
             gam = vals.at(ew.inputs[static_cast<std::size_t>(plan.gamma_input)].node_id);
@@ -398,8 +422,9 @@ std::string emit_row_norm(const TraceDAG& dag, const RowNormPlan& plan,
     ss << ".version 7.8\n";
     ss << ".target " << arch << "\n";
     ss << ".address_size 64\n\n";
-    // Per-CTA partials: one slot per warp for the sum of squares, and for
-    // LayerNorm one more set for the plain sum. Shared by both entries.
+    // Per-CTA partials: one slot per warp for the sum of squares (RMS) or of
+    // squared deviations (LayerNorm), and for LayerNorm one more set for the
+    // plain sum. Shared by both entries.
     ss << ".shared .align 4 .b32 rn_red[" << (2 * (kRowThreads / 32)) << "];\n\n";
     ss << emit_rn_entry(dag, plan, plan.ew.vec, kEntryRowNorm);
     ss << emit_rn_entry(dag, plan, 1, kEntryRowNormScalar);

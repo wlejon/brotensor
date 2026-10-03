@@ -40,29 +40,9 @@ std::vector<Value*> entry_params(Ctx& c, Function* fn) {
     return out;
 }
 
-void alloc_bitcast_slot(Ctx& c, std::uint32_t threads) {
-    Value* smem = c.kb.shared_alloc_f32(threads);
-    Value* tid = c.kb.tid_x();
-    c.slot = c.b.build_add(smem, c.b.build_shl(c.b.build_zext_i64(tid), c.kb.const_i64(2)));
-}
+Value* bits_to_f32(Ctx& c, Value* bits) { return c.b.build_bitcast_f32_i32(bits); }
 
-bool any_bf16(const plan::ElementwisePlan& p) {
-    for (const auto& s : p.inputs) if (s.dtype == Dtype::BF16) return true;
-    for (const auto& s : p.outputs) if (s.dtype == Dtype::BF16) return true;
-    return false;
-}
-
-Value* bits_to_f32(Ctx& c, Value* bits) {
-    if (!c.slot) throw std::logic_error("brotensor::jit: BF16 kernel without a bitcast slot");
-    c.kb.shared_store_i32(c.slot, bits);
-    return c.kb.shared_load_f32(c.slot);
-}
-
-Value* f32_to_bits(Ctx& c, Value* x) {
-    if (!c.slot) throw std::logic_error("brotensor::jit: BF16 kernel without a bitcast slot");
-    c.kb.shared_store_f32(c.slot, x);
-    return c.kb.shared_load_i32(c.slot);
-}
+Value* f32_to_bits(Ctx& c, Value* x) { return c.b.build_bitcast_i32_f32(x); }
 
 Value* byte_offset(Ctx& c, Value* elem, int esz) {
     Value* e = c.b.build_zext_i64(elem);

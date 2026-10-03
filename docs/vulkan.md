@@ -856,8 +856,8 @@ from the CUDA compiler's plans (`src/jit/trace_plan.h`, shared): **elementwise**
 per-buffer FP32/FP16/BF16, FP32 math) and **row-norm** (one RMSNorm /
 LayerNorm with the chain before and after it, row groups of 32-256 threads, a
 32-lane subgroup butterfly plus one shared round, a 2-D grid past 65535
-groups; LayerNorm's variance two-pass, not the PTX emitter's
-`E[x^2] - E[x]^2`). Each plan is brass MIR through `KernelBuilder`
+groups; LayerNorm's variance two-pass, the sum of squared deviations, as in
+the PTX emitter). Each plan is brass MIR through `KernelBuilder`
 (`src/jit/spirv_emit*.cpp`), a vector and a scalar entry lowered by
 `SpirvTarget::compile`; bind picks the vector entry when every pointer is
 aligned for it and packs the push block once, so a replay is one dispatch on
@@ -869,11 +869,10 @@ Pipelines' descriptor-free layout, workgroup size as spec constants 0..2,
 subgroup 32 required when possible: `src/vulkan/vulkan_jit.cpp`). Modules are
 interned by their SPIR-V words (a recompiled trace reuses its pipelines) and
 their capabilities checked once per device (`jit_missing_for` lists every
-missing feature). BF16 is a shift plus a bit reinterpretation, which MIR
-lacks; brass lowers an `i32` access of an `f32` Workgroup array as
-`OpBitcast`, so each thread reinterprets through its own shared word, at no
-measurable cost (BF16 runs at the FP16 bandwidth); rounding is RNE with quiet
-NaNs, as `common.glsl`. A DAG with no plan (two reductions, an op with no
+missing feature). BF16 is a shift plus a bit reinterpretation, MIR's
+`bitcast.i32` / `bitcast.f32` (one `OpBitcast` each), at no measurable cost
+(BF16 runs at the FP16 bandwidth); rounding is RNE with quiet NaNs, as
+`common.glsl`. A DAG with no plan (two reductions, an op with no
 elementwise form, too many buffers for the push block, >= 2^31 elements) or a
 compile failure is replayed op by op (`trace_eager.cpp`; a failure's reason
 is printed once, `BROTENSOR_JIT_STRICT=1` throws instead,

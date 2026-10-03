@@ -15,8 +15,9 @@
 //   row-norm — a row reduction (RMSNorm or LayerNorm) followed by an
 //     elementwise chain, as one block per row. This is the LN-modulate and
 //     the VAE's norm+silu seam: the eager form is two kernels with a full
-//     (rows, cols) round trip between them, the fused form reads the row
-//     twice and writes once.
+//     (rows, cols) round trip between them, the fused form writes the row
+//     once and reads it from HBM once (its further passes over the row, one
+//     for RMSNorm and two for LayerNorm, hit L2).
 //
 // Both emit a single module carrying a vector entry and a scalar entry; the
 // launcher picks between them from the bound pointers' alignment and the

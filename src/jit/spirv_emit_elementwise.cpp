@@ -29,7 +29,6 @@ brass::target::SpirvKernel build_entry(const TraceDAG& dag, const plan::Elementw
     Builder& b = c.b;
     const std::vector<Value*> p = entry_params(c, fn);
     Value* n = p.back();
-    if (any_bf16(plan)) alloc_bitcast_slot(c, kEwBlock);
 
     Value* i0 = kb.global_tid_x();
     Value* stride = b.build_mul(kb.ntid_x(), kb.nctaid_x());

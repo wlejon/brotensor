@@ -28,6 +28,14 @@ function(brotensor_add_test name)
 endfunction()
 
 # --- CPU tests (always built) ---
+# The CUDA trace JIT's PTX emitters are plain C++ writing text, so their output
+# is checked here on every build; a CUDA build already links them in.
+brotensor_add_test(brotensor_test_ptx_emit_rownorm test_ptx_emit_rownorm.cpp)
+if(NOT BROTENSOR_WITH_CUDA)
+    target_sources(brotensor_test_ptx_emit_rownorm PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_elementwise.cpp
+        ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_rownorm.cpp)
+endif()
 if(BROTENSOR_HAS_BRASS_JIT)
     brotensor_add_test(brotensor_test_jit_trace test_jit_trace.cpp)
     brotensor_add_test(brotensor_test_cpu_jit test_cpu_jit.cpp)

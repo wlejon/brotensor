@@ -9,12 +9,8 @@
 // per lane, and a store packs the lanes back. The driver's compiler (ACO on
 // RADV) keeps the vector loads and stores 128-bit.
 //
-// BF16 needs the bits of an FP32 value and an FP32 value from bits. MIR has
-// no 32-bit bitcast, but brass's SPIR-V target lowers an i32 access of an f32
-// shared array as an OpBitcast (spirv_backend_design.md, "Shared memory"), so
-// each thread owns one word of a Workgroup array and reinterprets through it:
-// store the i32, load the f32 (or the reverse). The slot is the thread's own,
-// so no barrier is involved, and the driver forwards the store to the load.
+// BF16 needs the bits of an FP32 value and an FP32 value from bits: MIR's
+// bitcast.i32 / bitcast.f32 (brass docs/mir_reference.md), one OpBitcast each.
 
 #include "spirv_emit.h"
 
@@ -40,9 +36,6 @@ using ValueMap = std::unordered_map<int, std::vector<Value*>>;
 struct Ctx {
     KernelBuilder& kb;
     Builder& b;
-    // This thread's word of the reinterpretation array, or null when no
-    // buffer of the kernel is BF16.
-    Value* slot = nullptr;
 
     explicit Ctx(KernelBuilder& k) : kb(k), b(k.builder()) {}
 
@@ -53,14 +46,7 @@ struct Ctx {
 // Creates `fn`'s entry block with one block parameter per kernel parameter.
 std::vector<Value*> entry_params(Ctx& c, Function* fn);
 
-// Allocates the reinterpretation array (`threads` words, one per thread of
-// the workgroup) and points c.slot at this thread's word. Call in the entry
-// block, before any branch.
-void alloc_bitcast_slot(Ctx& c, std::uint32_t threads);
-
-bool any_bf16(const plan::ElementwisePlan& p);
-
-// Bit reinterpretation through c.slot.
+// Bit reinterpretation (bitcast.f32 / bitcast.i32).
 Value* bits_to_f32(Ctx& c, Value* bits_i32);
 Value* f32_to_bits(Ctx& c, Value* x);
 
