@@ -70,10 +70,10 @@ bool dtype_is_quant(Dtype);
 // ─── Device ────────────────────────────────────────────────────────────────
 //
 // Runtime backend tag carried on every Tensor. CPU is always available;
-// CUDA / Metal are registered at runtime by `brotensor::init()` if the
-// corresponding backend was compiled into this binary. Supports multi-GPU
-// device indexing (e.g. Device::cuda(0), Device::cuda(1)).
-enum class DeviceType : int { CPU = 0, CUDA = 1, Metal = 2, HIP = 3 };
+// CUDA / Metal / HIP / Vulkan are registered at runtime by `brotensor::init()`
+// if the corresponding backend was compiled into this binary. Supports
+// multi-GPU device indexing (e.g. Device::cuda(0), Device::cuda(1)).
+enum class DeviceType : int { CPU = 0, CUDA = 1, Metal = 2, HIP = 3, VULKAN = 4 };
 
 struct Device {
     DeviceType type  = DeviceType::CPU;
@@ -86,12 +86,14 @@ struct Device {
     static constexpr Device cuda(int idx = 0)  { return Device(DeviceType::CUDA, idx); }
     static constexpr Device metal(int idx = 0) { return Device(DeviceType::Metal, idx); }
     static constexpr Device hip(int idx = 0)   { return Device(DeviceType::HIP, idx); }
+    static constexpr Device vulkan(int idx = 0) { return Device(DeviceType::VULKAN, idx); }
 
-    // Legacy enum compatibility constants so `Device::CPU`, `Device::CUDA`, `Device::Metal`, `Device::HIP` work verbatim.
+    // Legacy enum compatibility constants so `Device::CPU`, `Device::CUDA`, `Device::Metal`, `Device::HIP`, `Device::VULKAN` work verbatim.
     static const Device CPU;
     static const Device CUDA;
     static const Device Metal;
     static const Device HIP;
+    static const Device VULKAN;
 
     constexpr bool operator==(const Device& o) const {
         return type == o.type && index == o.index;
@@ -108,6 +110,7 @@ struct Device {
     constexpr bool is_cuda()  const { return type == DeviceType::CUDA; }
     constexpr bool is_metal() const { return type == DeviceType::Metal; }
     constexpr bool is_hip()   const { return type == DeviceType::HIP; }
+    constexpr bool is_vulkan() const { return type == DeviceType::VULKAN; }
     constexpr bool is_gpu()   const { return type != DeviceType::CPU; }
 };
 

@@ -1,0 +1,67 @@
+#version 460
+// Per-row reduction of a row-major (M, N) tensor of dtype DT, one workgroup per
+// row (grid-stride over rows). Built twice:
+//   -DREDUCE_SUM     Y[m] = sum_n X[m, n], FP32 accumulation, Y in dtype DT
+//   -DREDUCE_ARGMAX  Idx[m] = first n with the largest X[m, n], written as
+//                    INT32 (spec constant 0 = 1) or FP32; ties keep the
+//                    lowest index and NaNs are never chosen, like the CPU
+//                    loop (strict > against -FLT_MAX)
+// Subgroup-size agnostic: lanes reduce with subgroup ops, subgroups through
+// shared memory.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint OUT_I32 = 0;
+layout(push_constant) uniform PC {
+    uint64_t x;
+    uint64_t y;
+    uint m;
+    uint n;
+} pc;
+
+shared float s_val[64];
+shared uint  s_idx[64];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint row = gl_WorkGroupID.x; row < pc.m; row += gl_NumWorkGroups.x) {
+        const uint base = row * pc.n;
+#ifdef REDUCE_SUM
+        float acc = 0.0;
+        for (uint c = tid; c < pc.n; c += gl_WorkGroupSize.x) acc += load_elem(DT, pc.x, base + c);
+        acc = subgroupAdd(acc);
+        if (subgroupElect()) s_val[gl_SubgroupID] = acc;
+        barrier();
+        if (tid == 0) {
+            float t = 0.0;
+            for (uint s = 0; s < gl_NumSubgroups; ++s) t += s_val[s];
+            store_elem(DT, pc.y, row, t);
+        }
+#else
+        float best = -3.4028234663852886e38;
+        uint bi = 0;
+        for (uint c = tid; c < pc.n; c += gl_WorkGroupSize.x) {
+            const float v = load_elem(DT, pc.x, base + c);
+            if (v > best) { best = v; bi = c; }
+        }
+        // A lane that never beat the sentinel keeps index 0, which is what the
+        // CPU reports for such a row too; among equal maxima the lowest wins.
+        const float sm = subgroupMax(best);
+        const uint si = subgroupMin(best == sm ? bi : 0xffffffffu);
+        if (subgroupElect()) { s_val[gl_SubgroupID] = sm; s_idx[gl_SubgroupID] = si; }
+        barrier();
+        if (tid == 0) {
+            float bv = s_val[0];
+            uint b = s_idx[0];
+            for (uint s = 1; s < gl_NumSubgroups; ++s) {
+                if (s_val[s] > bv || (s_val[s] == bv && s_idx[s] < b)) { bv = s_val[s]; b = s_idx[s]; }
+            }
+            if (OUT_I32 != 0) I32Buf(pc.y).v[row] = int(b);
+            else              F32Buf(pc.y).v[row] = float(b);
+        }
+#endif
+        barrier();   // s_val is reused by the next row
+    }
+}

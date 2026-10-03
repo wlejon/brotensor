@@ -1,0 +1,24 @@
+#version 460
+// In-place broadcast add of a bias vector, dtype DT for both:
+//   BIAS_ROW      y[i] += bias[i % D]          (row-major (R, D), bias over columns)
+//   BIAS_CHANNEL  y[i] += bias[(i / L) % C]    (NCL layout, bias over channels)
+#include "common.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint MODE = 0;
+layout(push_constant) uniform PC {
+    uint64_t y;
+    uint64_t bias;
+    uint n;
+    uint d;     // D (row) or C (channel)
+    uint l;     // L (channel mode)
+} pc;
+
+void main() {
+    const uint stride = GRID_STRIDE_X;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride) {
+        const uint j = (MODE == BIAS_ROW) ? (i % pc.d) : ((i / pc.l) % pc.d);
+        store_elem(DT, pc.y, i, load_elem(DT, pc.y, i) + load_elem(DT, pc.bias, j));
+    }
+}

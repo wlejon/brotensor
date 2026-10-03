@@ -124,6 +124,9 @@ endif()
 option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
 option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
 option(BROTENSOR_WITH_HIP   "Build GPU backend (HIP/ROCm)" OFF)
+# Vulkan compute (hand-written GLSL, any GPU with a stock Vulkan 1.2+ driver).
+# Independent of the others; builds alongside HIP. See docs/vulkan.md.
+option(BROTENSOR_WITH_VULKAN "Build GPU backend (Vulkan compute)" OFF)
 if(BROTENSOR_WITH_CUDA AND BROTENSOR_WITH_HIP)
     message(FATAL_ERROR "BROTENSOR_WITH_CUDA and BROTENSOR_WITH_HIP are mutually exclusive.")
 endif()
@@ -872,6 +875,13 @@ if(BROTENSOR_WITH_HIP)
     )
 endif()
 
+# --- brotensor_vulkan: Vulkan compute backend (optional) ---
+# Target, shader compilation and embedding: cmake/BrotensorVulkan.cmake.
+if(BROTENSOR_WITH_VULKAN)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BrotensorVulkan.cmake")
+    brotensor_vulkan_add_backend()
+endif()
+
 # --- brotensor: final consumed target (INTERFACE) ---
 # Links the core + always-on CPU backend + whichever GPU backends are enabled.
 # Consumers (brogameagent, brodiffusion, tests) link this one target.
@@ -894,6 +904,7 @@ target_link_libraries(brotensor INTERFACE
     "$<$<BOOL:${BROTENSOR_WITH_CUDA}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_cuda>>"
     "$<$<BOOL:${BROTENSOR_WITH_METAL}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_metal>>"
     "$<$<BOOL:${BROTENSOR_WITH_HIP}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_hip>>"
+    "$<$<BOOL:${BROTENSOR_WITH_VULKAN}>:$<LINK_LIBRARY:WHOLE_ARCHIVE,brotensor_vulkan>>"
 )
 
 add_subdirectory(src/api)
@@ -913,6 +924,9 @@ if(BROTENSOR_INSTALL)
     endif()
     if(BROTENSOR_WITH_HIP)
         list(APPEND _brotensor_install_targets brotensor_hip)
+    endif()
+    if(BROTENSOR_WITH_VULKAN)
+        list(APPEND _brotensor_install_targets brotensor_vulkan)
     endif()
 
     install(TARGETS ${_brotensor_install_targets}
@@ -971,5 +985,8 @@ if(BROTENSOR_WITH_METAL)
 endif()
 if(BROTENSOR_WITH_HIP)
     set(_brotensor_backends "${_brotensor_backends} + HIP")
+endif()
+if(BROTENSOR_WITH_VULKAN)
+    set(_brotensor_backends "${_brotensor_backends} + Vulkan")
 endif()
 message(STATUS "brotensor: building with backends: ${_brotensor_backends}")

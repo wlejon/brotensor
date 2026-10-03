@@ -1,0 +1,56 @@
+#version 460
+// Batched transpose of ES-byte elements (-DES=2/4):
+//   out[b][c][r] = in[b][r][c] for in of shape (batch, R, C).
+// 32x32 tiles staged through shared memory (padded to dodge bank conflicts)
+// so both the read and the write are coalesced. Workgroups grid-stride over
+// column tiles (x), row tiles (y) and the batch (z), so any shape fits the
+// dispatch limits. The loops are uniform across a workgroup, which keeps the
+// barriers legal.
+#include "common.glsl"
+
+layout(local_size_x = 32, local_size_y = 8) in;
+layout(push_constant) uniform PC {
+    uint64_t src;
+    uint64_t dst;
+    uint batch;
+    uint rows;    // R
+    uint cols;    // C
+} pc;
+
+shared uint tile[32][33];
+
+void main() {
+    const uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    const uint plane = pc.rows * pc.cols;
+    const uint tiles_c = (pc.cols + 31u) / 32u, tiles_r = (pc.rows + 31u) / 32u;
+    for (uint b = gl_WorkGroupID.z; b < pc.batch; b += gl_NumWorkGroups.z) {
+        const uint base = b * plane;
+        for (uint trow = gl_WorkGroupID.y; trow < tiles_r; trow += gl_NumWorkGroups.y) {
+            for (uint tcol = gl_WorkGroupID.x; tcol < tiles_c; tcol += gl_NumWorkGroups.x) {
+                const uint r0 = trow * 32u, c0 = tcol * 32u;
+                for (uint k = 0; k < 32u; k += 8u) {
+                    const uint r = r0 + ty + k, c = c0 + tx;
+                    if (r < pc.rows && c < pc.cols) {
+#if ES == 4
+                        tile[ty + k][tx] = U32Buf(pc.src).v[base + r * pc.cols + c];
+#else
+                        tile[ty + k][tx] = uint(U16Buf(pc.src).v[base + r * pc.cols + c]);
+#endif
+                    }
+                }
+                barrier();
+                for (uint k = 0; k < 32u; k += 8u) {
+                    const uint c = c0 + ty + k, r = r0 + tx;
+                    if (r < pc.rows && c < pc.cols) {
+#if ES == 4
+                        U32Buf(pc.dst).v[base + c * pc.rows + r] = tile[tx][ty + k];
+#else
+                        U16Buf(pc.dst).v[base + c * pc.rows + r] = uint16_t(tile[tx][ty + k]);
+#endif
+                    }
+                }
+                barrier();
+            }
+        }
+    }
+}

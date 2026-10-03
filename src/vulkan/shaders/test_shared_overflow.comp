@@ -1,0 +1,18 @@
+#version 460
+// Not an op: exists so tests/test_vulkan.cpp can check that the pipeline
+// limit guard rejects a shader whose shared memory exceeds the device limit
+// (spec constant 0 = number of floats) before vkCreateComputePipelines sees
+// it. RADV raises SIGFPE inside the driver for > 64 KiB instead of failing.
+// The array is written and read back so the optimiser keeps it.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint N_FLOATS = 256;
+shared float big[N_FLOATS];
+layout(push_constant) uniform PC { uint64_t out_addr; uint n; } pc;
+void main() {
+    for (uint i = gl_LocalInvocationID.x; i < N_FLOATS; i += 64u) big[i] = float(i + pc.n);
+    barrier();
+    float acc = 0.0;
+    for (uint i = 0; i < N_FLOATS; i += 97u) acc += big[i];
+    if (pc.out_addr != 0ul) F32Buf(pc.out_addr).v[gl_LocalInvocationID.x] = acc;
+}

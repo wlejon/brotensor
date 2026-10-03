@@ -1,0 +1,22 @@
+#version 460
+// Y[c] = sum_m X[m, c] for a row-major (M, N) tensor of dtype DT; one thread
+// per column (grid-stride), FP32 accumulation, rows walked in order so
+// neighbouring threads read neighbouring addresses.
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t x;
+    uint64_t y;
+    uint m;
+    uint n;
+} pc;
+
+void main() {
+    const uint stride = GRID_STRIDE_X;
+    for (uint c = gl_GlobalInvocationID.x; c < pc.n; c += stride) {
+        float acc = 0.0;
+        for (uint r = 0; r < pc.m; ++r) acc += load_elem(DT, pc.x, r * pc.n + c);
+        store_elem(DT, pc.y, c, acc);
+    }
+}

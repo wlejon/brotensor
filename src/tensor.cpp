@@ -137,6 +137,7 @@ const Device Device::CPU{DeviceType::CPU, 0};
 const Device Device::CUDA{DeviceType::CUDA, 0};
 const Device Device::Metal{DeviceType::Metal, 0};
 const Device Device::HIP{DeviceType::HIP, 0};
+const Device Device::VULKAN{DeviceType::VULKAN, 0};
 
 const char* device_name(Device d) {
     if (d.is_cpu()) return "CPU";
@@ -156,6 +157,12 @@ const char* device_name(Device d) {
         if (d.index == 0) return "hip";
         static thread_local char buf[32];
         std::snprintf(buf, sizeof(buf), "hip:%d", d.index);
+        return buf;
+    }
+    if (d.is_vulkan()) {
+        if (d.index == 0) return "vulkan";
+        static thread_local char buf[32];
+        std::snprintf(buf, sizeof(buf), "vulkan:%d", d.index);
         return buf;
     }
     return "?";

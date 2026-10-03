@@ -160,6 +160,20 @@ brotensor_add_test(brotensor_test_gguf_extra test_gguf_extra.cpp)
 brotensor_add_test(brotensor_test_matmul_abt_cpu test_matmul_abt_cpu.cpp)
 brotensor_add_test(brotensor_test_tensor_errors test_tensor_errors.cpp)
 
+# Vulkan backend: runtime, allocator, replay and op parity against the CPU
+# backend (test_vulkan.cpp + test_vulkan_ops.cpp). The second registration
+# checks that BROTENSOR_DEFAULT_DEVICE=vulkan selects it. Both skip cleanly
+# without a Vulkan device.
+if(BROTENSOR_WITH_VULKAN)
+    brotensor_add_test(brotensor_test_vulkan test_vulkan.cpp test_vulkan_ops.cpp)
+    target_link_libraries(brotensor_test_vulkan PRIVATE brotensor_vulkan_internal)
+    target_compile_options(brotensor_test_vulkan PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-missing-field-initializers>)
+    add_test(NAME brotensor_test_vulkan_default_device
+             COMMAND brotensor_test_vulkan --expect-default-vulkan)
+    set_tests_properties(brotensor_test_vulkan_default_device PROPERTIES
+        ENVIRONMENT "BROTENSOR_DEFAULT_DEVICE=vulkan")
+endif()
+
 if(BROTENSOR_WITH_HIP)
     brotensor_add_test(brotensor_test_hip test_hip.cpp)
     # Needs a golden file generated on NVIDIA (BROTENSOR_CUDA_ROCM_GOLDEN);

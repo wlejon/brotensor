@@ -1,0 +1,48 @@
+#version 460
+// y[i] = f(x[i]) over n elements of dtype DT (-DDT=0/1/2). OP (spec constant 0)
+// selects f from op_codes.h; a / b are its scalar parameters. x and y may be
+// the same address (the in-place ops: add_scalar, scale, clamp).
+#include "common.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint OP = 0;
+layout(push_constant) uniform PC {
+    uint64_t x;
+    uint64_t y;
+    uint n;
+    float a;
+    float b;
+} pc;
+
+float apply(float v) {
+    switch (OP) {
+        case UOP_COPY:       return v;
+        case UOP_RELU:       return v > 0.0 ? v : 0.0;
+        case UOP_TANH:       return bt_tanh(v);
+        case UOP_SIGMOID:    return bt_sigmoid(v);
+        case UOP_SILU:       return v / (1.0 + exp(-v));
+        case UOP_GELU_TANH:  return bt_gelu_tanh(v);
+        case UOP_GELU_EXACT: return 0.5 * v * (1.0 + bt_erf(v * 0.7071067811865475));
+        case UOP_QUICK_GELU: return v / (1.0 + exp(-1.702 * v));
+        case UOP_EXP:        return exp(v);
+        case UOP_LOG:        return log(v);
+        case UOP_SIN:        return sin(v);
+        case UOP_COS:        return cos(v);
+        case UOP_RSQRT:      return 1.0 / sqrt(v);
+        case UOP_ROUND:      return roundEven(v);
+        case UOP_ELU:        return v > 0.0 ? v : pc.a * (exp(v) - 1.0);
+        case UOP_LEAKY_RELU: return v > 0.0 ? v : pc.a * v;
+        case UOP_ADD_SCALAR: return v + pc.a;
+        case UOP_SCALE:      return v * pc.a;
+        case UOP_CLAMP:      return min(max(v, pc.a), pc.b);
+    }
+    return v;
+}
+
+void main() {
+    const uint stride = GRID_STRIDE_X;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride) {
+        store_elem(DT, pc.y, i, apply(load_elem(DT, pc.x, i)));
+    }
+}

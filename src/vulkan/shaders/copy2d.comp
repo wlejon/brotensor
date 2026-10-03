@@ -1,0 +1,33 @@
+#version 460
+// Strided 2D copy of `height` rows of `width` elements of ES bytes
+// (-DES=1/2/4): dst[r * dst_pitch + c] = src[r * src_pitch + c]. Addresses
+// already include the element offsets. Threads stride over columns, workgroup
+// y over rows, so each row is a coalesced run.
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t src;
+    uint64_t dst;
+    uint src_pitch;
+    uint dst_pitch;
+    uint width;
+    uint height;
+} pc;
+
+void main() {
+    const uint stride = GRID_STRIDE_X;
+    for (uint r = gl_WorkGroupID.y; r < pc.height; r += gl_NumWorkGroups.y) {
+        const uint so = r * pc.src_pitch;
+        const uint dof = r * pc.dst_pitch;
+        for (uint c = gl_GlobalInvocationID.x; c < pc.width; c += stride) {
+#if ES == 4
+            U32Buf(pc.dst).v[dof + c] = U32Buf(pc.src).v[so + c];
+#elif ES == 2
+            U16Buf(pc.dst).v[dof + c] = U16Buf(pc.src).v[so + c];
+#else
+            U8Buf(pc.dst).v[dof + c] = U8Buf(pc.src).v[so + c];
+#endif
+        }
+    }
+}

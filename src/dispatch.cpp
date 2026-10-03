@@ -27,7 +27,7 @@ namespace brotensor::detail {
 
 namespace {
 
-constexpr int kNumDevices = 4; // CPU, CUDA, Metal, HIP
+constexpr int kNumDevices = 5; // CPU, CUDA, Metal, HIP, VULKAN
 
 // Upper bound on operands a single dispatch call inspects. The widest op is
 // resblock_backward (25 operands); 32 leaves headroom. dispatch_with_opts
@@ -152,6 +152,7 @@ const OpsVTable& resolve_over(const Tensor* const* all, std::size_t count) {
 
 static int g_cuda_device_count = 0;
 static int g_hip_device_count  = 0;
+static int g_vulkan_device_count = 0;
 
 void set_cuda_device_count(int count) {
     g_cuda_device_count = count;
@@ -159,6 +160,10 @@ void set_cuda_device_count(int count) {
 
 void set_hip_device_count(int count) {
     g_hip_device_count = count;
+}
+
+void set_vulkan_device_count(int count) {
+    g_vulkan_device_count = count;
 }
 
 void register_backend(DeviceType dt, const OpsVTable& ops, const AllocVTable& alloc) {
@@ -188,6 +193,10 @@ bool is_registered(Device d) {
     }
     if (d.is_metal()) {
         return slots()[static_cast<int>(DeviceType::Metal)].registered && d.index == 0;
+    }
+    if (d.is_vulkan()) {
+        if (!slots()[static_cast<int>(DeviceType::VULKAN)].registered) return false;
+        return d.index >= 0 && d.index < ::brotensor::vulkan_device_count();
     }
     return false;
 }
@@ -306,5 +315,8 @@ int cuda_device_count() {
 }
 int hip_device_count() {
     return detail::g_hip_device_count;
+}
+int vulkan_device_count() {
+    return detail::g_vulkan_device_count;
 }
 }

@@ -32,9 +32,11 @@ void shutdown();
 // ─── Default-device policy ─────────────────────────────────────────────────
 
 // Returns the device the next zeros/empty/from_host call will land on.
-// Default policy: best available — CUDA > Metal > CPU. Overridable via
-// set_default_device() or the BROTENSOR_DEFAULT_DEVICE environment variable
-// (one of "cpu", "cuda", "metal").
+// Default policy: best available — HIP > CUDA > Metal > CPU. The Vulkan
+// backend is never picked by default (its op coverage is still partial); select
+// it with set_default_device(Device::vulkan(i)), a DeviceScope, or the
+// BROTENSOR_DEFAULT_DEVICE environment variable ("cpu", "cuda", "metal",
+// "hip", "vulkan" / "vk", each optionally ":<index>").
 Device default_device();
 
 // Globally override the default device. Throws std::runtime_error if `d` is
@@ -47,6 +49,10 @@ int cuda_device_count();
 
 // Number of probed HIP devices (0 if HIP not compiled in or no HIP GPU found).
 int hip_device_count();
+
+// Number of probed Vulkan devices (0 if the Vulkan backend is not compiled in,
+// there is no Vulkan loader, or no device qualifies; see docs/vulkan.md).
+int vulkan_device_count();
 
 // Backends actually registered in this binary at runtime. CPU is always
 // present; CUDA / HIP / Metal appear only if their backend was both compiled

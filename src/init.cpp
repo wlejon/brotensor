@@ -1,8 +1,8 @@
 // brotensor runtime: init(), default-device policy, DeviceScope, sync.
 //
 // The CPU backend self-registers from a static-init object in
-// src/cpu/register.cpp. init() probes CUDA / Metal if the corresponding
-// backend was compiled in. When a backend isn't built,
+// src/cpu/register.cpp. init() probes HIP / CUDA / Metal / Vulkan if the
+// corresponding backend was compiled in. When a backend isn't built,
 // BROTENSOR_HAS_CUDA / BROTENSOR_HAS_METAL are not defined so the probe
 // branches compile out.
 
@@ -12,6 +12,7 @@
 #include <brotensor/detail/cpu/thread_pool.h>
 
 #include <atomic>
+#include <initializer_list>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -23,6 +24,11 @@
 #if defined(BROTENSOR_HAS_HIP)
 // Defined in src/hip/register.hip.
 extern "C" void brotensor_probe_and_register_hip();
+#endif
+
+#if defined(BROTENSOR_HAS_VULKAN)
+// Defined in src/vulkan/register.cpp.
+extern "C" void brotensor_probe_and_register_vulkan();
 #endif
 
 #if defined(BROTENSOR_HAS_CUDA)
@@ -64,6 +70,9 @@ std::atomic<bool>& global_default_set_flag() {
 // since DeviceScope ctor saves the previous on the local stack frame.
 thread_local std::optional<Device> tls_scope_override;
 
+// Vulkan is deliberately absent: its op coverage is still partial, so it is
+// only ever the default when asked for (set_default_device, DeviceScope,
+// BROTENSOR_DEFAULT_DEVICE=vulkan).
 Device pick_default_from_available() {
     if (detail::is_registered(Device::HIP))   return Device::HIP;
     if (detail::is_registered(Device::CUDA))  return Device::CUDA;
@@ -93,6 +102,11 @@ std::optional<Device> parse_env_device() {
         int idx = std::atoi(s.c_str() + 5);
         return Device::cuda(idx);
     }
+    for (const char* pfx : {"vulkan", "vk"}) {
+        const std::string p(pfx);
+        if (s == p) return Device::vulkan(0);
+        if (s.rfind(p + ":", 0) == 0) return Device::vulkan(std::atoi(s.c_str() + p.size() + 1));
+    }
     if (s == "metal" || s == "metal:0") return Device::metal(0);
     if (s.rfind("metal:", 0) == 0) {
         int idx = std::atoi(s.c_str() + 6);
@@ -116,6 +130,9 @@ void init() {
 #endif
 #if defined(BROTENSOR_HAS_METAL)
     try { brotensor_probe_and_register_metal(); } catch (...) { /* no Metal */ }
+#endif
+#if defined(BROTENSOR_HAS_VULKAN)
+    try { brotensor_probe_and_register_vulkan(); } catch (...) { /* no Vulkan */ }
 #endif
 
     // Determine default device once.
@@ -192,6 +209,9 @@ std::vector<Device> available_devices() {
     }
     if (detail::is_registered(Device::Metal)) {
         out.push_back(Device::Metal);
+    }
+    for (int i = 0; i < vulkan_device_count(); ++i) {
+        if (detail::is_registered(Device::vulkan(i))) out.push_back(Device::vulkan(i));
     }
     return out;
 }

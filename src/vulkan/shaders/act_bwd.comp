@@ -1,0 +1,55 @@
+#version 460
+// Activation backward: dX[i] = g(p[i], dY[i]) over n elements of dtype DT.
+// p is the forward input x or output y, as each op's contract says
+// (op_codes.h). dX may alias dY: every element reads both inputs before it
+// writes. Overwrites dX (activations have no parameters to accumulate).
+#include "common.glsl"
+#include "op_codes.h"
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint OP = 0;
+layout(push_constant) uniform PC {
+    uint64_t p;
+    uint64_t dy;
+    uint64_t dx;
+    uint n;
+    float a;
+} pc;
+
+float grad(float v, float g) {
+    switch (OP) {
+        case GOP_RELU:       return v > 0.0 ? g : 0.0 * g;
+        case GOP_TANH:       return g * (1.0 - v * v);
+        case GOP_SIGMOID:    return g * (v * (1.0 - v));
+        case GOP_SILU: {
+            const float s = 1.0 / (1.0 + exp(-v));
+            return g * (s * (1.0 + v * (1.0 - s)));
+        }
+        case GOP_GELU_TANH:  return g * bt_gelu_tanh_grad(v);
+        case GOP_GELU_EXACT:
+            return g * (0.5 * (1.0 + bt_erf(v * 0.7071067811865475)) +
+                        v * 0.3989422804014327 * exp(-0.5 * v * v));
+        case GOP_QUICK_GELU: {
+            const float s = 1.0 / (1.0 + exp(-1.702 * v));
+            return g * (s + 1.702 * v * s * (1.0 - s));
+        }
+        case GOP_EXP:        return g * exp(v);
+        case GOP_LOG:        return g / v;
+        case GOP_SIN:        return g * cos(v);
+        case GOP_COS:        return -g * sin(v);
+        case GOP_RSQRT:      return -0.5 * g * v * v * v;
+        case GOP_ELU:        return g * (v > 0.0 ? 1.0 : pc.a * exp(v));
+        case GOP_LEAKY_RELU: return g * (v > 0.0 ? 1.0 : pc.a);
+        case GOP_PASS:       return g;
+    }
+    return g;
+}
+
+void main() {
+    const uint stride = GRID_STRIDE_X;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride) {
+        const float g = load_elem(DT, pc.dy, i);
+        const float v = (OP == GOP_PASS) ? 0.0 : load_elem(DT, pc.p, i);
+        store_elem(DT, pc.dx, i, grad(v, g));
+    }
+}

@@ -1,0 +1,19 @@
+#version 460
+// dst[i] = convert(src[i]) between FP32 / FP16 / BF16 (-DSDT / -DDDT), going
+// through FP32: FP16 -> BF16 is exact to FP32 then RNE to BF16, the same two
+// steps as the CPU / HIP casts.
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t src;
+    uint64_t dst;
+    uint n;
+} pc;
+
+void main() {
+    const uint stride = GRID_STRIDE_X;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride) {
+        store_elem(DDT, pc.dst, i, load_elem(SDT, pc.src, i));
+    }
+}
