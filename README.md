@@ -12,7 +12,16 @@ brotensor::linear_forward(W, b, x, y);
 
 once, and it runs on whichever device the tensors live on. No `_cpu` / `_gpu` suffixes, no separate host/device tensor types, no template parameters — a `Tensor` carries a runtime `Device` tag and ops dispatch on it.
 
-brotensor is the shared tensor layer for a family of sibling projects (`brodiffusion`, `brolm`, `brosoundml`, `brovisionml`, `brogameagent`, …). Each vendors it via CMake `add_subdirectory`. There are no third-party library dependencies to install — the CPU backend is scalar C++, and the GPU backends use the SDKs that ship with their own toolchains.
+brotensor is the shared tensor layer of the [bro ecosystem](https://github.com/wlejon/bro/blob/main/docs/ecosystem.md): brolm, brodiffusion, brosoundml, brovisionml, brogameagent and broimage build on it, and [bro](https://github.com/wlejon/bro) exposes it to apps as `bro.tensor` through the JavaScript binding in `src/api/` (`brotensor_api`). It depends on no other library repository; the binding needs bronze (the JavaScript compiler and runtime) and brass (its code generator) checked out beside it, and brass also gives the CPU backend a JIT for fused elementwise and row-norm traces. There are no third-party libraries to install — the CPU backend is plain C++ (AVX2 on x86-64), and the GPU backends use the SDKs that ship with their own toolchains.
+
+## Platforms and backends
+
+| Backend | Where | Status in CI |
+|---------|-------|--------------|
+| CPU | Windows, Linux, macOS (x86-64 and arm64) | built and tested on every push |
+| CUDA | Windows, Linux (NVIDIA) | compiled on Linux; tests run on real hardware off CI |
+| Metal | macOS 15+ (Apple silicon) | built and tested on the hosted macOS runner, CPU↔Metal parity included |
+| Vulkan | any GPU with a Vulkan 1.2+ driver (the AMD path) | not in CI; tested on hardware |
 
 ## What's inside
 
@@ -30,10 +39,9 @@ See [docs/op-coverage.md](docs/op-coverage.md) for the full per-op coverage tabl
 
 ## Quick start
 
-Vendor it and link the interface target:
+Consumers resolve brotensor the way every repo in the ecosystem resolves a sibling: an existing `brotensor` target wins, then a checkout beside the top-level project at `../brotensor`, then the top-level project's `third_party/brotensor` submodule. Then link the interface target:
 
 ```cmake
-add_subdirectory(brotensor)
 target_link_libraries(my_app PRIVATE brotensor::brotensor)
 ```
 
@@ -66,7 +74,7 @@ int main() {
 
 ## Build
 
-Requires CMake ≥ 3.24 and a C++20 compiler. CUDA additionally needs the CUDA Toolkit (nvcc); Vulkan needs `glslc` (shaderc) plus the Vulkan headers and loader; Metal needs the Apple toolchain and **macOS 15 or newer** — the backend builds offset-backed `MPSGraphTensorData` via `-[MPSNDArray initWithBuffer:offset:descriptor:]`, which the macOS 14 SDK does not declare.
+Requires CMake ≥ 3.24, a C++20 compiler, and [bronze](https://github.com/wlejon/bronze) and [brass](https://github.com/wlejon/brass) checked out beside this repository (or `-DBRONZE_DIR=<path>`); they compile inside the build tree. CUDA additionally needs the CUDA Toolkit (nvcc); Vulkan needs `glslc` (shaderc) plus the Vulkan headers and loader; Metal needs the Apple toolchain and **macOS 15 or newer** — the backend builds offset-backed `MPSGraphTensorData` via `-[MPSNDArray initWithBuffer:offset:descriptor:]`, which the macOS 14 SDK does not declare.
 
 ```bash
 # CPU-only (any OS)

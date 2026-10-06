@@ -51,6 +51,10 @@ if(NOT TARGET bronze_runtime_shared)
         # Explicit BRONZE_DIR supplied
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
         set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/../bronze/CMakeLists.txt")
+        # Beside the top-level project: brotensor is a third_party/ submodule
+        # of the project being built, which carries no bronze of its own.
+        set(BRONZE_DIR "${CMAKE_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
     endif()
 
     if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")
