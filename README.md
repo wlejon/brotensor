@@ -12,7 +12,7 @@ brotensor::linear_forward(W, b, x, y);
 
 once, and it runs on whichever device the tensors live on. No `_cpu` / `_gpu` suffixes, no separate host/device tensor types, no template parameters — a `Tensor` carries a runtime `Device` tag and ops dispatch on it.
 
-brotensor is the shared tensor layer of the [bro ecosystem](https://github.com/wlejon/bro/blob/main/docs/ecosystem.md): brolm, brodiffusion, brosoundml, brovisionml, brogameagent and broimage build on it, and [bro](https://github.com/wlejon/bro) exposes it to apps as `bro.tensor` through the JavaScript binding in `src/api/` (`brotensor_api`). It depends on no other library repository; the binding needs bronze (the JavaScript compiler and runtime) and brass (its code generator) checked out beside it, and brass also gives the CPU backend a JIT for fused elementwise and row-norm traces. There are no third-party libraries to install — the CPU backend is plain C++ (AVX2 on x86-64), and the GPU backends use the SDKs that ship with their own toolchains.
+brotensor is the shared tensor layer of the [bro ecosystem](https://github.com/wlejon/bro/blob/main/docs/ecosystem.md): brolm, brodiffusion, brosoundml, brovisionml, brogameagent and broimage build on it, and [bro](https://github.com/wlejon/bro) exposes it to apps as `bro.tensor` through the JavaScript binding in `src/api/` (`brotensor_api`). It depends on no other library repository; the binding needs bronze (the JavaScript compiler and runtime) and brass (its code generator), pinned dependencies fetched at configure, and brass also gives the CPU backend a JIT for fused elementwise and row-norm traces. There are no third-party libraries to install — the CPU backend is plain C++ (AVX2 on x86-64), and the GPU backends use the SDKs that ship with their own toolchains.
 
 ## Platforms and backends
 
@@ -39,7 +39,7 @@ See [docs/op-coverage.md](docs/op-coverage.md) for the full per-op coverage tabl
 
 ## Quick start
 
-Consumers resolve brotensor the way every repo in the ecosystem resolves a sibling: an existing `brotensor` target wins, then a checkout beside the top-level project at `../brotensor`, then the top-level project's `third_party/brotensor` submodule. Then link the interface target:
+Consumers resolve brotensor the way every repo in the ecosystem resolves a sibling: an existing `brotensor` target wins, then a working tree beside the top-level project at `../brotensor`, then the commit the consumer pins with `bro_dependency(brotensor GITHUB wlejon/brotensor REF <sha>)` (`cmake/bro_deps.cmake`), fetched at configure. Then link the interface target:
 
 ```cmake
 target_link_libraries(my_app PRIVATE brotensor::brotensor)
@@ -74,7 +74,7 @@ int main() {
 
 ## Build
 
-Requires CMake ≥ 3.24, a C++20 compiler, and [bronze](https://github.com/wlejon/bronze) and [brass](https://github.com/wlejon/brass) checked out beside this repository (or `-DBRONZE_DIR=<path>`); they compile inside the build tree. CUDA additionally needs the CUDA Toolkit (nvcc); Vulkan needs `glslc` (shaderc) plus the Vulkan headers and loader; Metal needs the Apple toolchain and **macOS 15 or newer** — the backend builds offset-backed `MPSGraphTensorData` via `-[MPSNDArray initWithBuffer:offset:descriptor:]`, which the macOS 14 SDK does not declare.
+Requires CMake ≥ 3.24 and a C++20 compiler; a plain `git clone` is enough, there are no submodules. [bronze](https://github.com/wlejon/bronze) and, through it, [brass](https://github.com/wlejon/brass) are dependencies resolved by `cmake/bro_deps.cmake`: a working tree at `../bronze` / `../brass` when there is one, otherwise the commit `CMakeLists.txt` pins, fetched at configure (override with `-DFETCHCONTENT_SOURCE_DIR_BRONZE=<path>`). They compile inside the build tree. CUDA additionally needs the CUDA Toolkit (nvcc); Vulkan needs `glslc` (shaderc) plus the Vulkan headers and loader; Metal needs the Apple toolchain and **macOS 15 or newer** — the backend builds offset-backed `MPSGraphTensorData` via `-[MPSNDArray initWithBuffer:offset:descriptor:]`, which the macOS 14 SDK does not declare.
 
 ```bash
 # CPU-only (any OS)

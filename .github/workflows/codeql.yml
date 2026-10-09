@@ -40,17 +40,16 @@ jobs:
       contents: read
       actions: read
 
-    # Same checkout layout as ci.yml: this repo under brotensor/, with bronze
-    # and brass beside it, because the api (src/api) does not configure
-    # without them. They are compiled in the same tree and CodeQL traces
+    # Same checkout layout as ci.yml: this repo under brotensor/; bronze and
+    # brass, which the api (src/api) does not configure without, are fetched
+    # at configure from the pinned commits (cmake/bro_deps.cmake), into
+    # build/_deps. They are compiled in the same tree and CodeQL traces
     # them along with everything else; source-root keeps their files out of
     # the database, so the findings are this repo's own and not bronze's.
     steps:
       - uses: actions/checkout@v7
         with:
           path: brotensor
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build

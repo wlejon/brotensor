@@ -30,41 +30,18 @@ if(MSVC AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# Dependencies (cmake/bro_deps.cmake): an outer project's target wins (under bro
+# these are all bro's), else the ../<name> working tree beside the top-level
+# project, else the pinned commit, fetched at configure.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/bro_deps.cmake)
+
 # bronze, the JavaScript runtime brotensor_api binds and the compiler that
-# builds src/api/js/tensor.js. A checkout beside this one (../bronze), the
-# layout of a bro development tree and of CI (bronze's
-# .github/actions/checkout-toolchain lays bronze and brass out that way), or
-# an explicit -DBRONZE_DIR. There is no vendored fallback: the api is bound
-# across bronze's C++ embed boundary, so it has to build against the bronze
-# the surrounding tree builds against, never a pinned copy of its own.
-#
-# bronze resolves brass, its code generator, by itself (BRASS_ROOT, then
-# <bronze>/../brass) and add_subdirectory()s it, which is where the `brass`
-# target the kernel JIT block below picks up comes from.
-#
-# Under bro, bro's third_party/CMakeLists.txt has already added bronze and
-# this block is skipped.
-if(NOT TARGET bronze_runtime_shared)
-    set(BRONZE_BUILD_SHARED_RUNTIME ON CACHE BOOL "" FORCE)
-    set(BRONZE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    if(DEFINED BRONZE_DIR AND EXISTS "${BRONZE_DIR}/CMakeLists.txt")
-        # Explicit BRONZE_DIR supplied
-    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
-        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/../bronze/CMakeLists.txt")
-        # Beside the top-level project: brotensor is a third_party/ submodule
-        # of the project being built, which carries no bronze of its own.
-        set(BRONZE_DIR "${CMAKE_SOURCE_DIR}/../bronze" CACHE PATH "bronze source tree")
-    endif()
-
-    if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")
-        message(FATAL_ERROR
-            "bronze not found: check it out beside this repository (../bronze, with ../brass beside it) "
-            "or pass -DBRONZE_DIR=<path>.")
-    endif()
-
-    add_subdirectory("${BRONZE_DIR}" "${CMAKE_BINARY_DIR}/bronze-build" EXCLUDE_FROM_ALL)
-endif()
+# builds src/api/js/tensor.js. It brings brass, its code generator, which is
+# where the `brass` target the kernel JIT block below picks up comes from. The
+# api is bound across bronze's C++ embed boundary, so it has to build against
+# the bronze the surrounding tree builds against.
+bro_dependency(bronze GITHUB wlejon/bronze REF 15ce4cf5fc25d8afe03882985ae95adcba46a6a9 TARGET bronze_runtime_shared
+               OPTIONS BRONZE_BUILD_SHARED_RUNTIME=ON BRONZE_BUILD_TESTS=OFF)
 
 if(MSVC)
     add_compile_options(
@@ -272,25 +249,7 @@ else()
 endif()
 target_compile_options(brotensor_cpu PRIVATE ${BROTENSOR_CPU_SIMD_FLAGS})
 
-# --- Brass JIT acceleration (optional, enabled if Brass is found) ---
-if(NOT TARGET brass)
-    if(NOT BRASS_ROOT)
-        if(DEFINED ENV{BRASS_ROOT} AND NOT "$ENV{BRASS_ROOT}" STREQUAL "")
-            set(BRASS_ROOT "$ENV{BRASS_ROOT}")
-        elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../brass/include/brass/codegen/kernel_jit.hpp")
-            get_filename_component(BRASS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../brass" ABSOLUTE)
-        endif()
-    endif()
-
-    if(BRASS_ROOT)
-        file(TO_CMAKE_PATH "${BRASS_ROOT}" BRASS_ROOT)
-    endif()
-
-    if(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/CMakeLists.txt")
-        add_subdirectory("${BRASS_ROOT}" "${CMAKE_BINARY_DIR}/brass-build" EXCLUDE_FROM_ALL)
-    endif()
-endif()
-
+# --- Brass JIT acceleration (brass arrives with bronze, above) ---
 # A brass with no code generator for this target (BRASS_HOST_BACKEND OFF) is
 # no JIT: brotensor_cpu would compile every trace it is handed into bytes the
 # CPU cannot execute, and the first op through it is SIGBUS. Such a build
@@ -320,33 +279,6 @@ elseif(TARGET brass)
     # the install tree links brass itself.
     set(BROTENSOR_BRASS_LIB "$<BUILD_INTERFACE:brass>")
     target_link_libraries(brotensor_cpu PRIVATE ${BROTENSOR_BRASS_LIB})
-    target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_BRASS_JIT=1)
-    set(BROTENSOR_HAS_BRASS_JIT 1)
-elseif(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")
-    message(STATUS "brotensor: found Brass at ${BRASS_ROOT}")
-    target_include_directories(brotensor_cpu PRIVATE "${BRASS_ROOT}/include")
-    if(MSVC)
-        if(EXISTS "${BRASS_ROOT}/build_msvc/brass.lib")
-            set(BROTENSOR_BRASS_LIB "${BRASS_ROOT}/build_msvc/brass.lib")
-        elseif(EXISTS "${BRASS_ROOT}/build/Release/brass.lib")
-            set(BROTENSOR_BRASS_LIB "${BRASS_ROOT}/build/Release/brass.lib")
-        elseif(EXISTS "${BRASS_ROOT}/build/brass.lib")
-            set(BROTENSOR_BRASS_LIB "${BRASS_ROOT}/build/brass.lib")
-        else()
-            set(BROTENSOR_BRASS_LIB "${BRASS_ROOT}/build/libbrass.a")
-        endif()
-    else()
-        if(EXISTS "${BRASS_ROOT}/build/Release/libbrass.a")
-            set(BROTENSOR_BRASS_LIB "${BRASS_ROOT}/build/Release/libbrass.a")
-        elseif(EXISTS "${BRASS_ROOT}/build/libbrass.a")
-            set(BROTENSOR_BRASS_LIB "${BRASS_ROOT}/build/libbrass.a")
-        else()
-            set(BROTENSOR_BRASS_LIB "${BRASS_ROOT}/build/brass.a")
-        endif()
-    endif()
-    if(BROTENSOR_BRASS_LIB)
-        target_link_libraries(brotensor_cpu PUBLIC "${BROTENSOR_BRASS_LIB}")
-    endif()
     target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_BRASS_JIT=1)
     set(BROTENSOR_HAS_BRASS_JIT 1)
 else()
@@ -475,10 +407,7 @@ if(BROTENSOR_WITH_CUDA)
     # src/cuda/cuda_driver.cpp, resolved via cudaGetDriverEntryPoint.
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart_static)
     target_include_directories(brotensor_cuda PUBLIC /usr/local/cuda-12.6/targets/x86_64-linux/include)
-    if(TARGET brass OR (BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include"))
-        if(BRASS_ROOT AND EXISTS "${BRASS_ROOT}/include")
-            target_include_directories(brotensor_cuda PRIVATE "${BRASS_ROOT}/include")
-        endif()
+    if(TARGET brass)
         if(BROTENSOR_BRASS_LIB)
             target_link_libraries(brotensor_cuda PUBLIC "${BROTENSOR_BRASS_LIB}")
         endif()

@@ -14,16 +14,14 @@ concurrency:
 # Checkout layout, every job below:
 #
 #   $GITHUB_WORKSPACE/
-#     brotensor/   <- this repo
-#     bronze/      <- sibling: the JavaScript runtime brotensor_api binds and
-#                     the compiler that builds src/api/js/tensor.js
-#     brass/       <- sibling: bronze's code generator (and the kernel JIT)
+#     brotensor/   <- this repo, a plain clone
 #
-# which is the layout of a bro development tree (D:/projects/<name>), so the
-# CMake here resolves ../bronze exactly as it does on a developer's machine,
-# and bronze resolves ../brass the same way and add_subdirectory()s it. Both
-# are laid out by bronze's checkout-toolchain action and compiled inside this
-# build tree, with this job's compiler, generator and CRT — the api is bound
+# bronze (the JavaScript runtime brotensor_api binds and the compiler that
+# builds src/api/js/tensor.js) and brass (bronze's code generator, and the
+# kernel JIT) are fetched at configure from the commits CMakeLists.txt pins
+# (cmake/bro_deps.cmake), with no sibling checkout and no submodule. Both are
+# compiled inside this build tree, with this job's compiler, generator and
+# CRT — the api is bound
 # across bronze's C++ embed boundary, which a prebuilt bronze from elsewhere
 # could not honour. That also makes brotensor_test_api the check that this
 # library works the way bro uses it: a bronze realm, installTensor(), and
@@ -72,8 +70,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: brotensor
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
@@ -131,8 +127,6 @@ jobs:
         with:
           path: brotensor
 
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
-
       - name: Install Ninja
         run: brew install ninja
 
@@ -172,8 +166,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: brotensor
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
@@ -245,8 +237,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: brotensor
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - name: Install gcovr + Ninja
         run: brew install gcovr ninja
