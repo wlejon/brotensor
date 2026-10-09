@@ -32,7 +32,7 @@ endif()
 
 # Dependencies (cmake/bro_deps.cmake): an outer project's target wins (under bro
 # these are all bro's), else the ../<name> working tree beside the top-level
-# project, else the pinned commit, fetched at configure.
+# project, else the head of its main, fetched at configure.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/bro_deps.cmake)
 
 # bronze, the JavaScript runtime brotensor_api binds and the compiler that

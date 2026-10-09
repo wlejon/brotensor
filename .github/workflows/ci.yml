@@ -18,7 +18,7 @@ concurrency:
 #
 # bronze (the JavaScript runtime brotensor_api binds and the compiler that
 # builds src/api/js/tensor.js) and brass (bronze's code generator, and the
-# kernel JIT) are fetched at configure from the commits CMakeLists.txt pins
+# kernel JIT) are fetched at configure from the heads of their main branches
 # (cmake/bro_deps.cmake), with no sibling checkout and no submodule. Both are
 # compiled inside this build tree, with this job's compiler, generator and
 # CRT — the api is bound

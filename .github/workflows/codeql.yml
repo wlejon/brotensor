@@ -42,7 +42,7 @@ jobs:
 
     # Same checkout layout as ci.yml: this repo under brotensor/; bronze and
     # brass, which the api (src/api) does not configure without, are fetched
-    # at configure from the pinned commits (cmake/bro_deps.cmake), into
+    # at configure from the heads of their main branches (cmake/bro_deps.cmake), into
     # build/_deps. They are compiled in the same tree and CodeQL traces
     # them along with everything else; source-root keeps their files out of
     # the database, so the findings are this repo's own and not bronze's.

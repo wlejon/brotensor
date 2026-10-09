@@ -39,7 +39,7 @@ See [docs/op-coverage.md](docs/op-coverage.md) for the full per-op coverage tabl
 
 ## Quick start
 
-Consumers resolve brotensor the way every repo in the ecosystem resolves a sibling: an existing `brotensor` target wins, then a working tree beside the top-level project at `../brotensor`, then the commit the consumer pins with `bro_dependency(brotensor GITHUB wlejon/brotensor REF <sha>)` (`cmake/bro_deps.cmake`), fetched at configure. Then link the interface target:
+Consumers resolve brotensor the way every repo in the ecosystem resolves a sibling: an existing `brotensor` target wins, then a working tree beside the top-level project at `../brotensor`, then the head of brotensor's main branch (or the commit a `cmake/bro_lock.cmake` names), fetched at configure. The consumer declares it with `bro_dependency(brotensor)` (`cmake/bro_deps.cmake`). Then link the interface target:
 
 ```cmake
 target_link_libraries(my_app PRIVATE brotensor::brotensor)
