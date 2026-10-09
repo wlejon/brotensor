@@ -456,6 +456,15 @@ __global__ void axpby_inplace_kernel(T* __restrict__ y,
     }
 }
 
+// FP32 y += FP16 x: a half-precision branch re-entering an FP32 residual.
+__global__ void add_inplace_f32_f16_kernel(float* __restrict__ y,
+                                           const __half* __restrict__ x, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        y[i] += __half2float(x[i]);
+    }
+}
+
 __global__ void add_inplace_fp16_kernel(__half* __restrict__ y,
                                         const __half* __restrict__ x, int n) {
     vec_apply_inplace2<__half, HalfCvt>(y, x, n, AddOp{});
@@ -1169,7 +1178,15 @@ void add_inplace(Tensor& y, const Tensor& x) {
         add_inplace_bf16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<__nv_bfloat16*>(y.data),
             static_cast<const __nv_bfloat16*>(x.data), n);
+    } else if (x.dtype == Dtype::FP16) {
+        // FP32 y += FP16 x (as the Vulkan backend allows).
+        add_inplace_f32_f16_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
+            static_cast<float*>(y.data),
+            static_cast<const __half*>(x.data), n);
     } else {
+        if (x.dtype != Dtype::FP32) {
+            throw std::runtime_error("add_inplace: dtype mismatch");
+        }
         add_inplace_kernel<<<grid_for(n), EW_BLOCK, 0, cur_stream()>>>(
             static_cast<float*>(y.data),
             static_cast<const float*>(x.data), n);

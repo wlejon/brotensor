@@ -458,11 +458,17 @@ void layernorm_forward(const ::brotensor::Tensor& x,
 // no host syncs. Use when caches/backward aren't needed (e.g., inference
 // pipeline through a TransformerEncoder).
 namespace {
+__device__ __forceinline__ void ln_store(float* p, float v) { *p = v; }
+__device__ __forceinline__ void ln_store(__half* p, float v) { *p = __float2half_rn(v); }
+
+// FP32 X; Y is FP32, or FP16 (a mixed-precision model feeding half GEMMs
+// straight from an FP32 residual stream, one rounding at the store).
+template <typename OutT>
 __global__ void layernorm_forward_inference_batched_kernel(
         const float* __restrict__ x,
         const float* __restrict__ gamma,
         const float* __restrict__ beta,
-        float* __restrict__ y,
+        OutT* __restrict__ y,
         int R, int D, float eps) {
     extern __shared__ float sdata[];
     const int row = blockIdx.x;
@@ -470,7 +476,7 @@ __global__ void layernorm_forward_inference_batched_kernel(
     if (row >= R) return;
 
     const float* xrow = x + static_cast<size_t>(row) * D;
-    float*       yrow = y + static_cast<size_t>(row) * D;
+    OutT*        yrow = y + static_cast<size_t>(row) * D;
 
     // Mean.
     float local = 0.0f;
@@ -506,7 +512,7 @@ __global__ void layernorm_forward_inference_batched_kernel(
 
     for (int i = tid; i < D; i += blockDim.x) {
         const float xh = (xrow[i] - mean) * rstd;
-        yrow[i] = beta ? (xh * gamma[i] + beta[i]) : (xh * gamma[i]);
+        ln_store(yrow + i, beta ? (xh * gamma[i] + beta[i]) : (xh * gamma[i]));
     }
 }
 } // namespace
@@ -651,13 +657,23 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
     }
     const int R = X_RD.rows;
     const int D = X_RD.cols;
-    if (Y_RD.rows != R || Y_RD.cols != D || Y_RD.dtype != X_RD.dtype) {
+    // FP32 X may write a pre-typed FP16 Y (as the Vulkan backend does);
+    // anything else gets X's dtype.
+    const bool mixed = X_RD.dtype == Dtype::FP32 && Y_RD.dtype == Dtype::FP16;
+    if (Y_RD.rows != R || Y_RD.cols != D || (Y_RD.dtype != X_RD.dtype && !mixed)) {
         Y_RD.resize(R, D, X_RD.dtype);
     }
     if (R == 0 || D == 0) return;
     const int block = LN_BLOCK;
     const size_t shmem = static_cast<size_t>(block) * sizeof(float);
-    if (X_RD.dtype == Dtype::FP16) {
+    if (X_RD.dtype == Dtype::FP32 && Y_RD.dtype == Dtype::FP16) {
+        layernorm_forward_inference_batched_kernel<__half><<<R, block, shmem, cur_stream()>>>(
+            reinterpret_cast<const float*>(X_RD.data),
+            reinterpret_cast<const float*>(gamma.data),
+            beta ? reinterpret_cast<const float*>(beta->data) : nullptr,
+            reinterpret_cast<__half*>(Y_RD.data),
+            R, D, eps);
+    } else if (X_RD.dtype == Dtype::FP16) {
         layernorm_forward_inference_batched_fp16_kernel<<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const __half*>(X_RD.data),
             reinterpret_cast<const __half*>(gamma.data),
@@ -672,7 +688,7 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
             reinterpret_cast<__nv_bfloat16*>(Y_RD.data),
             R, D, eps);
     } else {
-        layernorm_forward_inference_batched_kernel<<<R, block, shmem, cur_stream()>>>(
+        layernorm_forward_inference_batched_kernel<float><<<R, block, shmem, cur_stream()>>>(
             reinterpret_cast<const float*>(X_RD.data),
             reinterpret_cast<const float*>(gamma.data),
             beta ? reinterpret_cast<const float*>(beta->data) : nullptr,
