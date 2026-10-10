@@ -176,9 +176,8 @@ static void run_js(const char* name, const std::string& script) {
     }
 }
 
-// The methods the port had stubbed or narrowed (bro/docs/transition-drift.md
-// H1, H2 and the tensor rows of the static handler diff), each against the
-// old binding's contract.
+// The methods the port had stubbed or narrowed (the tensor rows of the static
+// handler diff), each against the old binding's contract.
 
 static long current_pid() {
 #ifdef _WIN32
