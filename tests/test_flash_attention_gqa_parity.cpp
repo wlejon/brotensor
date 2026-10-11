@@ -208,5 +208,18 @@ BT_PARITY_TEST(gqa_gpu_fp16_bidir_gqa_L12_q8_kv4_hd32_mask) {
     auto m = partial_mask(12);
     run_gpu_fp16(12, 12, 8, 4, 32, false, &m, 0x732ull);
 }
+// The fused tensor-core kernel's GQA (head_dim 128, 16 q / 8 kv heads: the
+// Qwen3 / YuE2 shape): a causal prefill spanning several query and key tiles,
+// and NAR-style queries over a longer key set with a key mask.
+BT_PARITY_TEST(gqa_gpu_fp16_causal_gqa_L200_q16_kv8_hd128) {
+    run_gpu_fp16(200, 200, 16, 8, 128, true, nullptr, 0x733ull);
+}
+BT_PARITY_TEST(gqa_gpu_fp16_bidir_gqa_Lq70_Lk300_q16_kv8_hd128_mask) {
+    auto m = partial_mask(300);
+    run_gpu_fp16(70, 300, 16, 8, 128, false, &m, 0x734ull);
+}
+BT_PARITY_TEST(gqa_gpu_fp16_bidir_gqa_L40_q8_kv1_hd64) {
+    run_gpu_fp16(40, 40, 8, 1, 64, false, nullptr, 0x735ull);
+}
 
 int main() { return run_all("flash_attention_gqa correctness + parity"); }

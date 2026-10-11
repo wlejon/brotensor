@@ -1819,6 +1819,22 @@ void flash_attention_gqa_forward(const Tensor& Q,
     const size_t shmem  = (static_cast<size_t>(FA_KTILE) + FA_BLOCK) * sizeof(float);
     dim3 grid(Lq, num_q_heads, 1);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    // FP16/BF16 at an instantiated head_dim take the fused tensor-core kernel,
+    // which reads the shared K/V head of each query group in place.
+    if (dt != Dtype::FP32 && flash_fused::supported(head_dim)) {
+        if (dt == Dtype::BF16)
+            flash_fused::launch(reinterpret_cast<const __nv_bfloat16*>(Q.data),
+                                reinterpret_cast<const __nv_bfloat16*>(K.data),
+                                reinterpret_cast<const __nv_bfloat16*>(V.data), d_mask,
+                                reinterpret_cast<__nv_bfloat16*>(O.data), Lq, Lk, Dq, num_q_heads, head_dim,
+                                causal, stream, /*batch=*/1, num_kv_heads);
+        else
+            flash_fused::launch(reinterpret_cast<const __half*>(Q.data), reinterpret_cast<const __half*>(K.data),
+                                reinterpret_cast<const __half*>(V.data), d_mask,
+                                reinterpret_cast<__half*>(O.data), Lq, Lk, Dq, num_q_heads, head_dim, causal,
+                                stream, /*batch=*/1, num_kv_heads);
+        return;
+    }
     if (dt == Dtype::BF16) {
         flash_attention_windowed_kernel<__nv_bfloat16><<<grid, FA_BLOCK, shmem, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(Q.data),

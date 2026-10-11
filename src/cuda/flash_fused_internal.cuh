@@ -30,15 +30,19 @@ bool supported(int head_dim);
 // `batch` > 1 runs that many independent problems packed back to back:
 // Q/O are (batch*Lq, D), K/V (batch*Lk, D), and a mask holds batch*Lk
 // entries — the equal-length case of packed varlen attention.
+//
+// `num_kv_heads` > 0 (dividing num_heads) is grouped-query attention: K/V are
+// (Lk, num_kv_heads*head_dim) and query head h reads K/V head
+// h / (num_heads / num_kv_heads). 0 = num_heads (plain MHA).
 void launch(const __half* Q, const __half* K, const __half* V,
             const float* mask, __half* O,
             int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
-            cudaStream_t stream, int batch = 1);
+            cudaStream_t stream, int batch = 1, int num_kv_heads = 0);
 void launch(const __nv_bfloat16* Q, const __nv_bfloat16* K,
             const __nv_bfloat16* V,
             const float* mask, __nv_bfloat16* O,
             int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
-            cudaStream_t stream, int batch = 1);
+            cudaStream_t stream, int batch = 1, int num_kv_heads = 0);
 
 }  // namespace flash_fused
 }  // namespace brotensor
