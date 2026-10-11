@@ -14,6 +14,7 @@
 #include <brotensor/ops/linear.h>
 #include <brotensor/tensor.h>
 
+#include "detail/activations.cuh"
 #include "detail/cuda_check.h"
 #include "gemm_mma.cuh"
 #include "gemm_skinny.cuh"
@@ -73,6 +74,50 @@ __global__ void epilogue_kernel(const T* __restrict__ r, T* __restrict__ y, long
         const float g = to_f<T>(r[m * N + 2 * j + 1]);
         y[i] = from_f<T>(a * 0.5f * g * (1.0f + erff(g * 0.70710678118f)));
     }
+}
+
+// FP32 operands: r = X·Wᵀ + bias (the FP32 batched linear) then one pass for
+// the activation and the epilogue. Store applies act in place (r is Y).
+__global__ void epilogue_f32_kernel(const float* r, float* y, long long count,
+                                    int N, int act, int epi) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    if (epi == 0) {
+        y[i] = apply_linear_act(act, r[i]);
+    } else if (epi == 1) {
+        y[i] += apply_linear_act(act, r[i]);
+    } else {
+        const int half = N / 2;
+        const long long m = i / half;
+        const int j = static_cast<int>(i - m * half);
+        if (epi == 3) {
+            const float g = r[m * N + j], u = r[m * N + half + j];
+            y[i] = g / (1.0f + __expf(-g)) * u;
+        } else {
+            const float a = r[m * N + 2 * j], g = r[m * N + 2 * j + 1];
+            y[i] = a * 0.5f * g * (1.0f + erff(g * 0.70710678118f));
+        }
+    }
+}
+
+void run_f32(const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X,
+             int act, int epi, ::brotensor::Tensor& Y) {
+    const int N = W.rows, M = X.rows;
+    const ::brotensor::Tensor zero = bias ? ::brotensor::Tensor() : ::brotensor::Tensor::zeros_on(W.device, N, 1);
+    const ::brotensor::Tensor& b = bias ? *bias : zero;
+    if (epi == 0) {
+        ::brotensor::linear_forward_batched(W, b, X, Y);
+        if (act == 0) return;
+    }
+    ::brotensor::Tensor r;
+    if (epi != 0) ::brotensor::linear_forward_batched(W, b, X, r);
+    const long long count = epi <= 1 ? static_cast<long long>(M) * N : static_cast<long long>(M) * (N / 2);
+    if (count == 0) return;
+    const int threads = 256;
+    const unsigned blocks = static_cast<unsigned>((count + threads - 1) / threads);
+    epilogue_f32_kernel<<<blocks, threads, 0, cur_stream()>>>(static_cast<const float*>(epi == 0 ? Y.data : r.data),
+                                                             static_cast<float*>(Y.data), count, N, act, epi);
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
 // ── Skinny rows (M <= 8): one weight pass for every row ─────────────────────
@@ -287,7 +332,8 @@ void linear_forward_batched_ex(const ::brotensor::Tensor& W, const ::brotensor::
                                ::brotensor::Tensor* workspace, ::brotensor::Tensor& Y) {
     const int acc_mode = (epilogue_flags & kLinearEpiFastAccum) ? mma_gemm::kAccHybrid : mma_gemm::kAccF32;
     const int epilogue = epilogue_flags & ~kLinearEpiFastAccum;
-    if (W.dtype != Dtype::FP16 && W.dtype != Dtype::BF16) fail("W must be FP16 or BF16 on CUDA");
+    if (W.dtype != Dtype::FP16 && W.dtype != Dtype::BF16 && W.dtype != Dtype::FP32)
+        fail("W must be FP32, FP16 or BF16 on CUDA");
     if (X.dtype != W.dtype) fail("X must share W's dtype");
     if (bias && bias->dtype != W.dtype) fail("bias must share W's dtype");
     const int N = W.rows, K = W.cols, M = X.rows;
@@ -302,7 +348,9 @@ void linear_forward_batched_ex(const ::brotensor::Tensor& W, const ::brotensor::
         Y.resize(M, out_cols, W.dtype);
     }
     if (M == 0 || N == 0) return;
-    if (W.dtype == Dtype::FP16)
+    if (W.dtype == Dtype::FP32)
+        run_f32(W, bias, X, act, epilogue, Y);
+    else if (W.dtype == Dtype::FP16)
         run<__half>(W, bias, X, act, epilogue, acc_mode, workspace, Y);
     else
         run<__nv_bfloat16>(W, bias, X, act, epilogue, acc_mode, workspace, Y);

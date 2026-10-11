@@ -29,15 +29,17 @@ Tensor rnd(int r, int c, SplitMix64& rng, float scale, Dtype dt) {
     Tensor t = Tensor::mat(r, c);
     for (int i = 0; i < t.size(); ++i) {
         const float x = (rng.next_unit() * 2.0f - 1.0f) * scale;
-        t.ptr()[i] = dt == Dtype::FP16 ? q16(x) : qbf(x);
+        t.ptr()[i] = dt == Dtype::FP16 ? q16(x) : dt == Dtype::BF16 ? qbf(x) : x;
     }
     return t;
 }
 
-Tensor up(const Tensor& t, Dtype dt) { return dt == Dtype::FP16 ? to_fp16_gpu(t) : to_bf16_gpu(t); }
+Tensor up(const Tensor& t, Dtype dt) {
+    return dt == Dtype::FP16 ? to_fp16_gpu(t) : dt == Dtype::BF16 ? to_bf16_gpu(t) : t.to(gpu_device());
+}
 Tensor down(const Tensor& g, Dtype dt) {
     const Tensor h = download_to_host(g);
-    return dt == Dtype::FP16 ? fp16_host_to_f32(h) : bf16_host_to_f32(h);
+    return dt == Dtype::FP16 ? fp16_host_to_f32(h) : dt == Dtype::BF16 ? bf16_host_to_f32(h) : h;
 }
 
 void check(int M, int N, int K, int act, int epi, bool use_ws, bool use_bias, Dtype dt, uint64_t seed) {
@@ -56,7 +58,7 @@ void check(int M, int N, int K, int act, int epi, bool use_ws, bool use_bias, Dt
     Tensor ws;
     brotensor::linear_forward_batched_ex(gW, use_bias ? &gb : nullptr, gX, act, epi, use_ws ? &ws : nullptr, gY);
     const Tensor got = down(gY, dt);
-    const float tol = dt == Dtype::FP16 ? 1.5e-2f : 6e-2f;
+    const float tol = dt == Dtype::FP16 ? 1.5e-2f : dt == Dtype::BF16 ? 6e-2f : 1e-3f;
     compare_tensors(yc, got, "linear_ex", tol, tol);
 
     if (use_ws) {  // split-K reduces in a fixed order: bitwise stable.
@@ -163,6 +165,18 @@ BT_PARITY_TEST(short_m_rows) {
 
 // M = 1..8 take the skinny one-pass GEMV: every epilogue, bias and activation,
 // K a multiple of the kernel's two-quad stride (2048) and not (1032, 6152).
+// FP32 operands (detection heads and other FP32 models): every epilogue and
+// activation, with and without bias, skinny and tiled row counts.
+BT_PARITY_TEST(fp32_operands) {
+    check(1, 64, 96, 0, kStore, false, false, Dtype::FP32, 0x71);
+    check(5, 128, 200, 3, kStore, false, true, Dtype::FP32, 0x72);
+    check(300, 768, 768, 2, kStore, true, true, Dtype::FP32, 0x73);
+    check(37, 256, 512, 4, kAcc, true, true, Dtype::FP32, 0x74);
+    check(64, 256, 128, 0, kAcc, false, false, Dtype::FP32, 0x75);
+    check(21, 128, 100, 0, kGeglu, false, true, Dtype::FP32, 0x76);
+    check(9, 256, 128, 0, kSwiglu, false, false, Dtype::FP32, 0x77);
+}
+
 BT_PARITY_TEST(skinny_rows) {
     uint64_t seed = 0x80;
     for (int M = 1; M <= 4; ++M) {

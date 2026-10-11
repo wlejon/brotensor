@@ -97,7 +97,8 @@ enum LinearEpilogue {
 
 // Batched linear with the epilogue fused into the GEMM's output store — no
 // separate residual-add / GeGLU pass over the output. FP16/BF16 on the GPU
-// (FP32 accumulation), FP32 on the CPU.
+// (FP32 accumulation), FP32 everywhere (on CUDA the FP32 batched linear plus
+// one pass for the activation and epilogue).
 //   W: (out, in).  bias: (out, 1) or null.  X_BD: (B, in).  act: LinearActivation.
 //   workspace: optional FP32 scratch. Given one, the GPU may split K across
 //     more CTAs when B is too short to fill the device, reducing the partials
