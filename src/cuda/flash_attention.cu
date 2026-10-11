@@ -1489,6 +1489,33 @@ void flash_attention_varlen_forward(const Tensor& Q,
         return;
     }
 
+    // Equal-length sequences (windowed vision attention: Swin / Hiera / ViTDet
+    // windows, Qwen-VL windows of one size): when the totals are exactly
+    // batch * max, every sequence has the max length (each is at most max and
+    // they sum to batch * max), so the batch is a grid dimension of the fused
+    // kernel — no read of cu_seqlens needed.
+    if (batch_size > 1 && (dt == Dtype::FP16 || dt == Dtype::BF16) &&
+        flash_fused::supported(head_dim) && max_seqlen_q > 0 && max_seqlen_k > 0 &&
+        static_cast<long long>(total_q) == static_cast<long long>(batch_size) * max_seqlen_q &&
+        static_cast<long long>(total_k) == static_cast<long long>(batch_size) * max_seqlen_k &&
+        batch_size <= 65535 && (!causal || max_seqlen_q == max_seqlen_k)) {
+        cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+        if (dt == Dtype::BF16) {
+            flash_fused::launch(reinterpret_cast<const __nv_bfloat16*>(Q.data),
+                                reinterpret_cast<const __nv_bfloat16*>(K.data),
+                                reinterpret_cast<const __nv_bfloat16*>(V.data), nullptr,
+                                reinterpret_cast<__nv_bfloat16*>(O.data), max_seqlen_q,
+                                max_seqlen_k, D, num_heads, head_dim, causal, stream, batch_size);
+        } else {
+            flash_fused::launch(reinterpret_cast<const __half*>(Q.data),
+                                reinterpret_cast<const __half*>(K.data),
+                                reinterpret_cast<const __half*>(V.data), nullptr,
+                                reinterpret_cast<__half*>(O.data), max_seqlen_q, max_seqlen_k, D,
+                                num_heads, head_dim, causal, stream, batch_size);
+        }
+        return;
+    }
+
     const size_t shmem = (static_cast<size_t>(FA_KTILE) + FA_BLOCK) * sizeof(float);
     dim3 grid(total_q, num_heads, 1);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());

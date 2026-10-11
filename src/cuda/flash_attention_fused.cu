@@ -232,6 +232,19 @@ flash_fused_kernel(const T* __restrict__ Q,
     extern __shared__ __align__(32) char smem_raw[];
     Smem<T, HD, BR, BC> sm(smem_raw);
 
+    // A batch of equal-length sequences packed back to back (varlen attention
+    // whose sequences all have the same length): blockIdx.z picks the
+    // sequence, each an independent (Lq, Lk) problem; the key mask, if any,
+    // carries Lk entries per sequence.
+    {
+        const size_t b = blockIdx.z;
+        Q += b * size_t(Lq) * D;
+        K += b * size_t(Lk) * D;
+        V += b * size_t(Lk) * D;
+        O += b * size_t(Lq) * D;
+        if (mask) mask += b * size_t(Lk);
+    }
+
     const int head = blockIdx.y;
     const int head_off = head * HD;
     // Causal CTAs do work proportional to their query tile index: tile 0 walks
@@ -460,7 +473,7 @@ flash_fused_kernel(const T* __restrict__ Q,
 
 template <typename T, int HD, int BR, int BC, bool CAUSAL>
 void launch_impl(const T* Q, const T* K, const T* V, const float* mask, T* O,
-                 int Lq, int Lk, int D, int num_heads, cudaStream_t stream) {
+                 int Lq, int Lk, int D, int num_heads, int batch, cudaStream_t stream) {
     constexpr int NTHREADS = (BR / 16) * 32;
     const size_t shmem = smem_bytes_host<T, HD, BR, BC>();
     static std::atomic<std::uint32_t> attr_set{0};  // opt-in past the 48KB default, per device
@@ -472,7 +485,7 @@ void launch_impl(const T* Q, const T* K, const T* V, const float* mask, T* O,
     // correction stays consistent. The kernel applies it to the FP32 scores
     // inside the FFMA that also subtracts the max, so it costs nothing.
     const float scale = 1.4426950408889634f / sqrtf(static_cast<float>(HD));
-    dim3 grid((Lq + BR - 1) / BR, num_heads);
+    dim3 grid((Lq + BR - 1) / BR, num_heads, batch);
     flash_fused_kernel<T, HD, BR, BC, CAUSAL><<<grid, NTHREADS, shmem, stream>>>(
         Q, K, V, mask, O, Lq, Lk, D, scale);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
@@ -480,23 +493,31 @@ void launch_impl(const T* Q, const T* K, const T* V, const float* mask, T* O,
 
 template <typename T, bool CAUSAL>
 void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O,
-                     int Lq, int Lk, int D, int num_heads, int head_dim,
+                     int Lq, int Lk, int D, int num_heads, int head_dim, int batch,
                      cudaStream_t stream) {
     switch (head_dim) {
+        case 56:
+            // PAD 64, the head_dim 64 tiling. SAM 2 Hiera-B+ (every stage).
+            launch_impl<T, 56, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
+            return;
+        case 96:
+            // PAD 96, between 80 and 112; the 112 tiling. SAM 2 Hiera-T/S.
+            launch_impl<T, 96, 128, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
+            return;
         case 16:
-            launch_impl<T, 16, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 16, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
             return;
         case 32:
-            launch_impl<T, 32, 128, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 32, 128, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
             return;
         case 80:
-            launch_impl<T, 80, 64, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 80, 64, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
             return;
         case 112:
-            launch_impl<T, 112, 128, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 112, 128, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
             return;
         case 160:
-            launch_impl<T, 160, 64, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 160, 64, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
             return;
         case 40:
             // PAD = round16(40) = 48, smaller than head_dim 64's PAD (64), so
@@ -504,13 +525,13 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
             // BR=128 fits comfortably. SD1.5-class self-attention (Lq=Lk=4096,
             // head_dim=40) is the motivating shape: previously fell through to
             // the O(Lq*Lk) scalar path since this switch had no case for it.
-            launch_impl<T, 40, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 40, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
             return;
         case 64:
-            launch_impl<T, 64, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 64, 128, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
             return;
         case 72:
-            launch_impl<T, 72, 64, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 72, 64, 64, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
             return;
         case 128:
             // The wide head doubles the Q footprint per query row, so the key
@@ -521,7 +542,7 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
             // BR = 48 / 3 warps / 1 CTA per SM (~32 TFLOPS). Krea 2 /
             // Flux-class DiT self-attention (head_dim 128) is the motivating
             // shape.
-            launch_impl<T, 128, 128, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, stream);
+            launch_impl<T, 128, 128, 32, CAUSAL>(Q, K, V, mask, O, Lq, Lk, D, num_heads, batch, stream);
             return;
         default:
             return;  // guarded by supported(); unreachable
@@ -532,7 +553,8 @@ void launch_dispatch(const T* Q, const T* K, const T* V, const float* mask, T* O
 
 bool supported(int head_dim) {
     switch (head_dim) {
-        case 16: case 32: case 40: case 64: case 72: case 80: case 112: case 128: case 160:
+        case 16: case 32: case 40: case 56: case 64: case 72: case 80: case 96: case 112:
+        case 128: case 160:
             return true;
         default:
             return false;
@@ -542,11 +564,11 @@ bool supported(int head_dim) {
 void launch(const __half* Q, const __half* K, const __half* V,
             const float* mask, __half* O,
             int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
-            cudaStream_t stream) {
+            cudaStream_t stream, int batch) {
     if (causal) {
-        launch_dispatch<__half, true>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, stream);
+        launch_dispatch<__half, true>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, batch, stream);
     } else {
-        launch_dispatch<__half, false>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, stream);
+        launch_dispatch<__half, false>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, batch, stream);
     }
 }
 
@@ -554,11 +576,11 @@ void launch(const __nv_bfloat16* Q, const __nv_bfloat16* K,
             const __nv_bfloat16* V,
             const float* mask, __nv_bfloat16* O,
             int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
-            cudaStream_t stream) {
+            cudaStream_t stream, int batch) {
     if (causal) {
-        launch_dispatch<__nv_bfloat16, true>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, stream);
+        launch_dispatch<__nv_bfloat16, true>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, batch, stream);
     } else {
-        launch_dispatch<__nv_bfloat16, false>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, stream);
+        launch_dispatch<__nv_bfloat16, false>(Q, K, V, mask, O, Lq, Lk, D, num_heads, head_dim, batch, stream);
     }
 }
 

@@ -26,15 +26,19 @@ bool supported(int head_dim);
 // `causal` selects a separate kernel instantiation rather than branching at
 // run time, so the non-causal path keeps exactly the codegen it had before
 // causal existed.
+//
+// `batch` > 1 runs that many independent problems packed back to back:
+// Q/O are (batch*Lq, D), K/V (batch*Lk, D), and a mask holds batch*Lk
+// entries — the equal-length case of packed varlen attention.
 void launch(const __half* Q, const __half* K, const __half* V,
             const float* mask, __half* O,
             int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
-            cudaStream_t stream);
+            cudaStream_t stream, int batch = 1);
 void launch(const __nv_bfloat16* Q, const __nv_bfloat16* K,
             const __nv_bfloat16* V,
             const float* mask, __nv_bfloat16* O,
             int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
-            cudaStream_t stream);
+            cudaStream_t stream, int batch = 1);
 
 }  // namespace flash_fused
 }  // namespace brotensor

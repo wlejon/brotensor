@@ -115,6 +115,29 @@ BT_PARITY_TEST(varlen_larger_head_dim) {
     run_varlen({16, 16}, {16, 16}, 4, 16, false, 0xA7);
 }
 
+// Equal-length batches at a fused-kernel head_dim take the batched tensor-core
+// path (batch as a grid dimension): windowed vision attention — SAM 2 Hiera
+// windows (head_dim 56 / 96), its query-pooled first block of a stage (16
+// queries per 64-key window), and a causal batch.
+BT_PARITY_TEST(varlen_equal_windows_hd56) {
+    run_varlen(std::vector<int>(9, 49), std::vector<int>(9, 49), 2, 56, false, 0xB1);
+}
+BT_PARITY_TEST(varlen_equal_windows_pooled_q_hd56) {
+    run_varlen(std::vector<int>(6, 16), std::vector<int>(6, 64), 4, 56, false, 0xB2);
+}
+BT_PARITY_TEST(varlen_equal_windows_hd96) {
+    run_varlen(std::vector<int>(5, 64), std::vector<int>(5, 64), 3, 96, false, 0xB3);
+}
+BT_PARITY_TEST(varlen_equal_causal_hd64) {
+    run_varlen(std::vector<int>(4, 40), std::vector<int>(4, 40), 2, 64, true, 0xB4);
+}
+BT_PARITY_TEST(varlen_one_seq_hd56) {
+    run_varlen({300}, {300}, 2, 56, false, 0xB5);
+}
+BT_PARITY_TEST(varlen_one_seq_hd96) {
+    run_varlen({130}, {200}, 2, 96, false, 0xB6);
+}
+
 // ─── FP32 path (CPU and GPU both FP32 — tight tolerance) ──────────────────
 
 void run_varlen_fp32(const std::vector<int>& seq_lens_q,
