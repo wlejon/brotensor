@@ -195,7 +195,62 @@ void run_decode_masked(int cap, int valid_len, int num_q_heads,
     }
 }
 
+// flash_attention_decode_len with R query rows (a draft block): rows are the
+// last R positions of `valid_len` keys, causal among themselves. CPU twin vs
+// GPU over a NaN-poisoned tail, and each GPU row against the single-row op at
+// its own length.
+void run_decode_len_rows(int cap, int valid_len, int R, int num_q_heads, int num_kv_heads, int head_dim,
+                         uint64_t seed) {
+    SplitMix64 rng(seed);
+    const int Dq = num_q_heads * head_dim, Dkv = num_kv_heads * head_dim;
+    Tensor Q = make_q16_cpu(R, Dq, rng, 0.4f);
+    Tensor Kc = make_q16_cpu(cap, Dkv, rng, 0.4f);
+    Tensor Vc = make_q16_cpu(cap, Dkv, rng, 0.4f);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    for (int r = valid_len; r < cap; ++r)
+        for (int c = 0; c < Dkv; ++c) {
+            Kc.host_f32_mut()[static_cast<size_t>(r) * Dkv + c] = nan;
+            Vc.host_f32_mut()[static_cast<size_t>(r) * Dkv + c] = nan;
+        }
+    const int32_t len = valid_len;
+    Tensor cpu_O;
+    brotensor::flash_attention_decode_len(Q, Kc, Vc, &len, num_q_heads, num_kv_heads, cpu_O);
+    Tensor gQ = to_fp16_cuda(Q), gKc = to_fp16_cuda(Kc), gVc = to_fp16_cuda(Vc);
+    const Tensor glen = upload_indices({len});
+    Tensor gO;
+    brotensor::flash_attention_decode_len(gQ, gKc, gVc, static_cast<const int32_t*>(glen.data), num_q_heads,
+                                          num_kv_heads, gO);
+    BT_CHECK(gO.rows == R && gO.cols == Dq);
+    const Tensor got = fp16_cuda_to_cpu(gO);
+    compare_tensors(cpu_O, got, "decode_len_rows_parity", 5e-2f, 5e-2f);
+    for (int r = 0; r < R; ++r) {
+        Tensor q1 = Tensor::view(gQ.device, static_cast<char*>(gQ.data) + static_cast<size_t>(r) * Dq * 2, 1, Dq,
+                                 gQ.dtype);
+        const Tensor l1 = upload_indices({valid_len - R + 1 + r});
+        Tensor o1;
+        brotensor::flash_attention_decode_len(q1, gKc, gVc, static_cast<const int32_t*>(l1.data), num_q_heads,
+                                              num_kv_heads, o1);
+        const Tensor h1 = fp16_cuda_to_cpu(o1);
+        Tensor row = Tensor::mat(1, Dq);
+        for (int c = 0; c < Dq; ++c) row.host_f32_mut()[c] = got.host_f32()[static_cast<size_t>(r) * Dq + c];
+        compare_tensors(h1, row, "decode_len_rows_vs_single", 2e-3f, 2e-3f);
+    }
+}
+
 } // namespace
+
+// Draft blocks: YuE2's 16 q / 8 kv at head_dim 128 (group 2: four rows a
+// launch, so R = 5 and 8 take two), a group-1 and a group-8 shape.
+BT_PARITY_TEST(kv_decode_len_rows_gqa2) {
+    run_decode_len_rows(4096, 700, 2, 16, 8, 128, 0x7330ull);
+    run_decode_len_rows(4096, 700, 5, 16, 8, 128, 0x7331ull);
+    run_decode_len_rows(2048, 1999, 8, 16, 8, 128, 0x7332ull);
+    run_decode_len_rows(64, 8, 8, 16, 8, 128, 0x7333ull);
+}
+BT_PARITY_TEST(kv_decode_len_rows_other_groups) {
+    run_decode_len_rows(512, 300, 3, 4, 4, 64, 0x7334ull);
+    run_decode_len_rows(512, 300, 3, 16, 2, 64, 0x7335ull);
+}
 
 // ─── kv_cache_append ───────────────────────────────────────────────────────
 BT_PARITY_TEST(kv_cache_append_small)  { run_append(8,  4,  3, 2, 0x7300ull); }

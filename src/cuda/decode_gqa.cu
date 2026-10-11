@@ -83,10 +83,15 @@ struct State {
     }
 };
 
-template <typename T, int HD, int G>
+// One CTA serves query rows [r0, r0 + RC) of R (consecutive positions: row rr
+// sees the first len - R + 1 + rr keys) for its KV head's G query heads, as
+// NG = G * RC softmax states; rows past R are skipped.
+template <typename T, int HD, int G, int RC>
 __global__ void __launch_bounds__(BLOCK)
 partials_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __restrict__ V,
-                const int32_t* __restrict__ d_len, float* __restrict__ ws, int cap, int Dkv, int n_splits) {
+                const int32_t* __restrict__ d_len, float* __restrict__ ws, int cap, int Dkv, int n_splits, int nq,
+                int R, int r0) {
+    constexpr int NG = G * RC;
     constexpr int LPK = HD / 8;         // lanes per key row
     constexpr int KPS = 32 / LPK;       // keys per warp per step
     constexpr int STRIDE = WARPS * KPS; // keys per CTA per step
@@ -101,14 +106,23 @@ partials_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __res
     const int k_end = min(len, k_begin + chunk);
 
     const float inv_sqrt = rsqrtf(static_cast<float>(HD));
-    float q[G][8];
+    float q[NG][8];
+    int lim[NG];
 #pragma unroll
-    for (int g = 0; g < G; ++g) {
-        load8<T>(Q + static_cast<size_t>(kvh * G + g) * HD + sl * 8, q[g]);
+    for (int gi = 0; gi < NG; ++gi) {
+        const int rr = r0 + gi / G;
+        lim[gi] = rr < R ? len - R + 1 + rr : 0;
+        if (rr < R) {
+            load8<T>(Q + static_cast<size_t>(rr) * nq * HD + static_cast<size_t>(kvh * G + gi % G) * HD + sl * 8,
+                     q[gi]);
+        } else {
 #pragma unroll
-        for (int i = 0; i < 8; ++i) q[g][i] *= inv_sqrt;
+            for (int i = 0; i < 8; ++i) q[gi][i] = 0.0f;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) q[gi][i] *= inv_sqrt;
     }
-    State<G> st;
+    State<NG> st;
     st.init();
 
     const size_t col = static_cast<size_t>(kvh) * HD + sl * 8;
@@ -130,8 +144,9 @@ partials_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __res
             const bool valid = step == 0 ? v0 : v1;
             const float(&kk)[8] = step == 0 ? ka : kb;
             const float(&vv)[8] = step == 0 ? va : vb;
+            const int kidx = (step == 0 ? base : base + STRIDE) + sub;
 #pragma unroll
-            for (int g = 0; g < G; ++g) {
+            for (int g = 0; g < NG; ++g) {
                 float s = 0.0f;
                 if (valid) {
 #pragma unroll
@@ -139,7 +154,7 @@ partials_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __res
                 }
 #pragma unroll
                 for (int off = LPK / 2; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
-                if (valid) {
+                if (valid && kidx < lim[g]) {
                     const float mn = fmaxf(st.m[g], s);
                     const float c = __expf(st.m[g] - mn), p = __expf(s - mn);
                     st.l[g] = st.l[g] * c + p;
@@ -155,7 +170,7 @@ partials_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __res
 #pragma unroll
     for (int off = LPK; off < 32; off <<= 1) {
 #pragma unroll
-        for (int g = 0; g < G; ++g) {
+        for (int g = 0; g < NG; ++g) {
             const float m2 = __shfl_xor_sync(0xffffffffu, st.m[g], off);
             const float l2 = __shfl_xor_sync(0xffffffffu, st.l[g], off);
             float a2[8];
@@ -167,11 +182,11 @@ partials_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __res
 
     // Merge the warps through shared memory, then write the split record
     // [m, l, acc[HD]] per query head (fad_split_reduce's layout).
-    __shared__ float s_ml[WARPS][G][2];
-    __shared__ float s_acc[WARPS][G][HD];
+    __shared__ float s_ml[WARPS][NG][2];
+    __shared__ float s_acc[WARPS][NG][HD];
     if (sub == 0) {
 #pragma unroll
-        for (int g = 0; g < G; ++g) {
+        for (int g = 0; g < NG; ++g) {
             if (sl == 0) {
                 s_ml[warp][g][0] = st.m[g];
                 s_ml[warp][g][1] = st.l[g];
@@ -181,8 +196,10 @@ partials_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __res
         }
     }
     __syncthreads();
-    for (int idx = threadIdx.x; idx < G * (HD + 2); idx += BLOCK) {
+    for (int idx = threadIdx.x; idx < NG * (HD + 2); idx += BLOCK) {
         const int g = idx / (HD + 2), e = idx % (HD + 2);
+        const int rr = r0 + g / G;
+        if (rr >= R) continue;
         float m = -1e30f;
 #pragma unroll
         for (int w = 0; w < WARPS; ++w) m = fmaxf(m, s_ml[w][g][0]);
@@ -193,7 +210,7 @@ partials_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __res
             out += c * (e == 0 ? 0.0f : e == 1 ? s_ml[w][g][1] : s_acc[w][g][e - 2]);
         }
         if (e == 0) out = m;
-        const int h = kvh * G + g;
+        const int h = rr * nq + kvh * G + g % G;
         ws[(static_cast<size_t>(h) * n_splits + spl) * (HD + 2) + e] = out;
     }
 }
@@ -229,8 +246,9 @@ __global__ void reduce_kernel(const float* __restrict__ ws, T* __restrict__ O, i
     }
 }
 
-// Grow-only per-device record scratch (never freed); growth is refused
-// during a graph capture (warm up eagerly first).
+// Grow-only per-device record scratch (never freed, outgrown buffers
+// included); growth is refused during a graph capture (warm up eagerly
+// first).
 float* workspace(size_t floats, cudaStream_t stream) {
     constexpr int MAX_DEVICES = 16;
     static float* buf[MAX_DEVICES] = {};
@@ -244,8 +262,8 @@ float* workspace(size_t floats, cudaStream_t stream) {
     if (cs != cudaStreamCaptureStatusNone)
         throw std::runtime_error(
             "flash_attention_decode_len: workspace cannot grow during graph capture; run the op once eagerly first");
-    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (buf[dev]) BROTENSOR_CUDA_CHECK(cudaFree(buf[dev]));
+    // The old buffer is kept, not freed: a graph captured over it (a decode
+    // step of fewer query rows) still replays into it.
     buf[dev] = nullptr;
     capf[dev] = 0;
     BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buf[dev]), floats * sizeof(float)));
@@ -263,39 +281,51 @@ int sm_count() {
     return n[dev];
 }
 
+// R query rows: one launch for a single row; more rows go RC = 8 / G at a
+// time (each launch streams the cache once for all of its rows).
 template <typename T, int HD, int G>
-void run(const T* Q, const T* K, const T* V, const int32_t* d_len, T* O, int cap, int nq, int nkv,
+void run(const T* Q, const T* K, const T* V, const int32_t* d_len, T* O, int cap, int nq, int nkv, int R,
          cudaStream_t stream) {
     // Splits: about two CTAs per SM over the KV heads, at most one per 32
     // cache rows; fixed by the capacity so a captured launch stays valid.
     int n_splits = (2 * sm_count() + nkv - 1) / nkv;
     n_splits = std::max(1, std::min({n_splits, MAX_SPLITS, (cap + 31) / 32}));
-    float* ws = workspace(static_cast<size_t>(nq) * n_splits * (HD + 2), stream);
-    partials_kernel<T, HD, G><<<dim3(n_splits, nkv), BLOCK, 0, stream>>>(Q, K, V, d_len, ws, cap, nkv * HD,
-                                                                         n_splits);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    reduce_kernel<T><<<nq, BLOCK, 0, stream>>>(ws, O, HD, n_splits);
+    float* ws = workspace(static_cast<size_t>(R) * nq * n_splits * (HD + 2), stream);
+    const dim3 grid(n_splits, nkv);
+    if (R == 1) {
+        partials_kernel<T, HD, G, 1><<<grid, BLOCK, 0, stream>>>(Q, K, V, d_len, ws, cap, nkv * HD, n_splits, nq, 1,
+                                                                 0);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    } else {
+        constexpr int RC = 8 / G;
+        for (int r0 = 0; r0 < R; r0 += RC) {
+            partials_kernel<T, HD, G, RC><<<grid, BLOCK, 0, stream>>>(Q, K, V, d_len, ws, cap, nkv * HD, n_splits,
+                                                                      nq, R, r0);
+            BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    reduce_kernel<T><<<R * nq, BLOCK, 0, stream>>>(ws, O, HD, n_splits);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
 template <typename T, int HD>
-void by_group(const T* Q, const T* K, const T* V, const int32_t* d_len, T* O, int cap, int nq, int nkv,
+void by_group(const T* Q, const T* K, const T* V, const int32_t* d_len, T* O, int cap, int nq, int nkv, int R,
               cudaStream_t s) {
     switch (nq / nkv) {
-        case 1: run<T, HD, 1>(Q, K, V, d_len, O, cap, nq, nkv, s); break;
-        case 2: run<T, HD, 2>(Q, K, V, d_len, O, cap, nq, nkv, s); break;
-        case 4: run<T, HD, 4>(Q, K, V, d_len, O, cap, nq, nkv, s); break;
-        default: run<T, HD, 8>(Q, K, V, d_len, O, cap, nq, nkv, s); break;
+        case 1: run<T, HD, 1>(Q, K, V, d_len, O, cap, nq, nkv, R, s); break;
+        case 2: run<T, HD, 2>(Q, K, V, d_len, O, cap, nq, nkv, R, s); break;
+        case 4: run<T, HD, 4>(Q, K, V, d_len, O, cap, nq, nkv, R, s); break;
+        default: run<T, HD, 8>(Q, K, V, d_len, O, cap, nq, nkv, R, s); break;
     }
 }
 
 template <typename T>
-void by_hd(const T* Q, const T* K, const T* V, const int32_t* d_len, T* O, int cap, int nq, int nkv, int hd,
+void by_hd(const T* Q, const T* K, const T* V, const int32_t* d_len, T* O, int cap, int nq, int nkv, int hd, int R,
            cudaStream_t s) {
     switch (hd) {
-        case 64: by_group<T, 64>(Q, K, V, d_len, O, cap, nq, nkv, s); break;
-        case 128: by_group<T, 128>(Q, K, V, d_len, O, cap, nq, nkv, s); break;
-        default: by_group<T, 256>(Q, K, V, d_len, O, cap, nq, nkv, s); break;
+        case 64: by_group<T, 64>(Q, K, V, d_len, O, cap, nq, nkv, R, s); break;
+        case 128: by_group<T, 128>(Q, K, V, d_len, O, cap, nq, nkv, R, s); break;
+        default: by_group<T, 256>(Q, K, V, d_len, O, cap, nq, nkv, R, s); break;
     }
 }
 
@@ -307,13 +337,14 @@ bool supported(int head_dim, int group) {
 }
 
 void launch(const void* Q, const void* K, const void* V, const int32_t* d_len, void* O, int cap, int nq, int nkv,
-            int hd, bool bf16, cudaStream_t stream) {
+            int hd, int rows, bool bf16, cudaStream_t stream) {
     if (bf16)
         by_hd(static_cast<const __nv_bfloat16*>(Q), static_cast<const __nv_bfloat16*>(K),
-              static_cast<const __nv_bfloat16*>(V), d_len, static_cast<__nv_bfloat16*>(O), cap, nq, nkv, hd, stream);
+              static_cast<const __nv_bfloat16*>(V), d_len, static_cast<__nv_bfloat16*>(O), cap, nq, nkv, hd, rows,
+              stream);
     else
         by_hd(static_cast<const __half*>(Q), static_cast<const __half*>(K), static_cast<const __half*>(V), d_len,
-              static_cast<__half*>(O), cap, nq, nkv, hd, stream);
+              static_cast<__half*>(O), cap, nq, nkv, hd, rows, stream);
 }
 
 }  // namespace brotensor::detail::cuda::decode_gqa

@@ -385,7 +385,13 @@ void flash_attention_decode_masked(const Tensor& Q,
 // cache sized for a long generation costs nothing for its unused rows.
 // Results agree with flash_attention_decode(.., *d_len, ..) to rounding (the
 // split points differ, so not bit for bit).
-//   Q: (1, num_q_heads*head_dim); K_cache, V_cache: (L_max, num_kv_heads*head_dim)
+// Q may carry R > 1 rows: consecutive positions whose K/V are already the
+// last R of the *d_len valid rows, row r attending causally to the first
+// *d_len - R + 1 + r keys (flash_attention_decode's L_q > 1 rule) — a block
+// of draft tokens verified in one pass, each cache row read once for all R.
+// On CUDA that needs the grouped kernel's shapes (head_dim 64/128/256,
+// group 1/2/4/8); *d_len >= R.
+//   Q: (R, num_q_heads*head_dim); K_cache, V_cache: (L_max, num_kv_heads*head_dim)
 //       FP16/BF16 on CUDA (head_dim a multiple of 32, at most 256), FP32 on CPU.
 //   d_len: device INT32 (a raw host pointer on CPU), 0 <= *d_len <= L_max;
 //       a length of 0 writes zeros.

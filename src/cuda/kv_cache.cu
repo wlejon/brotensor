@@ -980,7 +980,8 @@ void flash_attention_decode_len(const Tensor& Q, const Tensor& K_cache, const Te
     if (Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) fail("tensors must be FP16 or BF16");
     if (K_cache.dtype != Q.dtype || V_cache.dtype != Q.dtype) fail("all tensors must share the same dtype");
     if (d_len == nullptr) fail("d_len must not be null");
-    if (Q.rows != 1) fail("Q must be a single row (L_q == 1)");
+    if (Q.rows < 1) fail("Q needs at least one row");
+    const int R = Q.rows;
     const int Dq = Q.cols, Dkv = K_cache.cols, cap = K_cache.rows;
     if (V_cache.cols != Dkv || V_cache.rows != cap) fail("K_cache / V_cache shape mismatch");
     if (num_q_heads <= 0 || num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0)
@@ -988,16 +989,17 @@ void flash_attention_decode_len(const Tensor& Q, const Tensor& K_cache, const Te
     if (Dq % num_q_heads != 0 || Dkv != (Dq / num_q_heads) * num_kv_heads) fail("head layout mismatch");
     const int head_dim = Dq / num_q_heads;
     if (!fad_split_eligible(head_dim)) fail("head_dim must be a multiple of 32, at most 256");
-    if (O.rows != 1 || O.cols != Dq || O.dtype != Q.dtype) O.resize(1, Dq, Q.dtype);
+    if (O.rows != R || O.cols != Dq || O.dtype != Q.dtype) O.resize(R, Dq, Q.dtype);
     if (Dq == 0 || cap == 0) return;
     const int group = num_q_heads / num_kv_heads;
     // The grouped kernel (one CTA per KV head and split, 16-byte rows) covers
     // the common shapes; the split-K kernel the rest.
     if (decode_gqa::supported(head_dim, group)) {
         decode_gqa::launch(Q.data, K_cache.data, V_cache.data, d_len, O.data, cap, num_q_heads, num_kv_heads,
-                           head_dim, Q.dtype == Dtype::BF16, cur_stream());
+                           head_dim, R, Q.dtype == Dtype::BF16, cur_stream());
         return;
     }
+    if (R != 1) fail("several query rows need head_dim 64/128/256 and a group of 1, 2, 4 or 8");
     int n_splits = 0, tps = 0;
     fad_split_dims(cap, n_splits, tps);
     float* ws = fad_split_workspace(static_cast<size_t>(num_q_heads) * n_splits * (head_dim + 2));
