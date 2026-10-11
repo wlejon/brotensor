@@ -1,6 +1,6 @@
 // linear_forward_batched_ex — 16-bit batched linear with a fused epilogue
 // (store / residual accumulate / GeGLU / SwiGLU) and optional split-K
-// workspace. One to four rows take the skinny GEMV below (decode); wider
+// workspace. One to eight rows take the skinny GEMV below (decode); wider
 // batches run on the mma.sync GEMM in gemm_mma.cu; shapes that kernel refuses
 // (K or N not a multiple of 8, pre-sm_80) and SwiGLU fall back to a stored
 // result plus an elementwise epilogue pass. CPU twin in
@@ -73,11 +73,11 @@ __global__ void epilogue_kernel(const T* __restrict__ r, T* __restrict__ y, long
     }
 }
 
-// ── Skinny rows (M <= 4): one weight pass for every row ─────────────────────
+// ── Skinny rows (M <= 8): one weight pass for every row ─────────────────────
 // Decode-shaped linears are weight-bandwidth bound. One CTA per output column
 // reads its weight row (two rows for a gated epilogue) once with 16-byte
 // loads and dots it against all M input rows, FP32 accumulation, the epilogue
-// fused into the store — where the tile GEMM at M = 1..4 wastes most of each
+// fused into the store — where the tile GEMM at M = 1..8 wastes most of each
 // tile and re-reads nothing better, and the block-per-(row, batch) GEMV reads
 // the weights M times.
 constexpr int GV_BLOCK = 128;
@@ -203,7 +203,7 @@ void gemv_launch_m(const T* W, const T* b, const T* X, T* Y, int N, int K, int a
 
 template <typename T>
 bool gemv_ex(const T* W, const T* b, const T* X, T* Y, int M, int N, int K, int act, int epi, cudaStream_t st) {
-    if (M < 1 || M > 4 || (K & 7)) return false;
+    if (M < 1 || M > 8 || (K & 7)) return false;
     auto al = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; };
     if (!al(W) || !al(X)) return false;
     using T2 = std::conditional_t<std::is_same_v<T, __half>, __half2, __nv_bfloat162>;
@@ -211,7 +211,11 @@ bool gemv_ex(const T* W, const T* b, const T* X, T* Y, int M, int N, int K, int 
         case 1: gemv_launch_m<T, T2, 1>(W, b, X, Y, N, K, act, epi, st); break;
         case 2: gemv_launch_m<T, T2, 2>(W, b, X, Y, N, K, act, epi, st); break;
         case 3: gemv_launch_m<T, T2, 3>(W, b, X, Y, N, K, act, epi, st); break;
-        default: gemv_launch_m<T, T2, 4>(W, b, X, Y, N, K, act, epi, st); break;
+        case 4: gemv_launch_m<T, T2, 4>(W, b, X, Y, N, K, act, epi, st); break;
+        case 5: gemv_launch_m<T, T2, 5>(W, b, X, Y, N, K, act, epi, st); break;
+        case 6: gemv_launch_m<T, T2, 6>(W, b, X, Y, N, K, act, epi, st); break;
+        case 7: gemv_launch_m<T, T2, 7>(W, b, X, Y, N, K, act, epi, st); break;
+        default: gemv_launch_m<T, T2, 8>(W, b, X, Y, N, K, act, epi, st); break;
     }
     return true;
 }

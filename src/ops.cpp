@@ -2138,6 +2138,23 @@ void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
     v.linear_forward_batched_int8w_fp16(W_int8, scales, bias, X_BD, Y_BD);
 }
 
+void quantize_rows(const Tensor& W, Dtype fmt, Tensor& Wq, Tensor& scales) {
+    const auto& v = detail::dispatch_with_opts(W, {&Wq, &scales});
+    if (!v.quantize_rows) detail::throw_not_implemented("quantize_rows", W.device);
+    detail::adopt_output(Wq, W.device);
+    detail::adopt_output(scales, W.device);
+    v.quantize_rows(W, fmt, Wq, scales);
+}
+
+void linear_forward_batched_wq_ex(const Tensor& Wq, const Tensor& scales, const Tensor* bias,
+                                  const Tensor& X_BD, int act, int epilogue, Tensor& Y_BD) {
+    const auto& v = detail::dispatch_with_opts(Wq, scales, {bias, &X_BD, &Y_BD});
+    if (!v.linear_forward_batched_wq_ex)
+        detail::throw_not_implemented("linear_forward_batched_wq_ex", Wq.device);
+    detail::adopt_output(Y_BD, Wq.device);
+    v.linear_forward_batched_wq_ex(Wq, scales, bias, X_BD, act, epilogue, Y_BD);
+}
+
 void dequant_q4k_to_fp16(const Tensor& W_q4k, Tensor& W_fp16) {
     const auto& v = detail::dispatch(W_q4k, W_fp16);
     if (!v.dequant_q4k_to_fp16)

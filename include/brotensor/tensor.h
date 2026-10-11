@@ -30,6 +30,10 @@ enum class Dtype : int {
     INT32 = 3,
     BF16  = 4,
     F64   = 5,
+    // FP8 E4M3 (OCP "e4m3fn": 1 sign, 4 exponent bits bias 7, 3 mantissa
+    // bits, max 448, no infinities), 1 byte. Like INT8 a storage carrier for
+    // weight-only quantised ops (linear_forward_batched_wq_ex).
+    FP8_E4M3 = 6,
     // GGUF legacy quants — 32-element blocks, opaque storage carriers only.
     Q4_0  = 10,
     Q4_1  = 11,
@@ -362,6 +366,10 @@ uint16_t fp32_to_fp16_bits(float v);
 float    fp16_bits_to_fp32(uint16_t bits);
 uint16_t fp32_to_bf16_bits(float v);
 float    bf16_bits_to_fp32(uint16_t bits);
+// FP8 E4M3 (Dtype::FP8_E4M3): round to nearest even, saturating to +-448
+// (NaN stays NaN, 0x7f); decode is exact.
+uint8_t  fp32_to_fp8_e4m3_bits(float v);
+float    fp8_e4m3_bits_to_fp32(uint8_t bits);
 
 } // namespace brotensor
 

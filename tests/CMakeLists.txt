@@ -297,7 +297,7 @@ if(BROTENSOR_HAS_GPU)
         batch_norm image_preproc
         softmax_rows add_channel_bias pixel_shuffle_upsample
         masked_mean_pool
-        packed_encoder linear_ex
+        packed_encoder linear_ex linear_wq
     )
     foreach(_name IN LISTS _brotensor_parity_tests)
         brotensor_add_test(brotensor_test_${_name}_parity test_${_name}_parity.cpp)

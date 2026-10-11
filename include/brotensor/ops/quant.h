@@ -32,6 +32,30 @@ void matmul_int8w_fp16(const Tensor& W_int8,
                        Tensor& Y);
 
 
+// ─── Per-row weight-only quantisation (INT8 / FP8 E4M3) ────────────────────
+//
+// Symmetric per-output-row quantisation of a weight W (out, in): scale[r] =
+// max|W[r, :]| / qmax (qmax 127 for INT8, 448 for FP8_E4M3; 0 for an all-zero
+// row) and Wq[r, k] = W[r, k] / scale[r] rounded to the format (INT8: round
+// half to even, clamped to +-127; E4M3: round to nearest even, saturating).
+//   W: (out, in) FP16 / BF16 / FP32 (CUDA), FP32 (CPU).  fmt: INT8 or FP8_E4M3.
+//   Wq: (out, in) fmt, resized.  scales: (out, 1) FP32, resized.
+void quantize_rows(const Tensor& W, Dtype fmt, Tensor& Wq, Tensor& scales);
+
+// Y = X @ (scale * Wq)^T + bias, with linear_forward_batched_ex's activation
+// and epilogues (kLinearEpiStore / Accumulate / Geglu / Swiglu; the gated
+// ones read rows as that op does). FP32 accumulation; the row scale multiplies
+// the dot product before bias and activation. Decode-shaped: CUDA reads each
+// weight row once for up to eight input rows (larger batches run in slices of
+// eight), at one byte per weight.
+//   Wq: (out, in) INT8 or FP8_E4M3 (from quantize_rows).  scales: (out, 1) FP32.
+//   bias: (out, 1) in X's dtype, or null.  X_BD: (B, in) FP16 / BF16 (CUDA),
+//   FP32 (CPU).  Y_BD: (B, out) or (B, out/2) gated, X's dtype; accumulate
+//   needs it sized.
+void linear_forward_batched_wq_ex(const Tensor& Wq, const Tensor& scales, const Tensor* bias,
+                                  const Tensor& X_BD, int act, int epilogue, Tensor& Y_BD);
+
+
 // ─── GGUF Q4_K (W4A16) ─────────────────────────────────────────────────────
 //
 // Q4_K is a 256-element block quantization: 144 bytes per block, with

@@ -73,6 +73,8 @@ void fill_cuda_vtable_filtered_lrelu (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_packed_encoder (::brotensor::detail::OpsVTable&);
 // ── fused-epilogue / split-K linear (linear_ex.cu, gemm_mma.cu) ──
 void fill_cuda_vtable_linear_ex (::brotensor::detail::OpsVTable&);
+// ── weight-only quantised linear (linear_wq.cu) ──
+void fill_cuda_vtable_linear_wq (::brotensor::detail::OpsVTable&);
 
 // ── alloc table (defined in tensor.cu) ──
 const ::brotensor::detail::AllocVTable& cuda_alloc_table();
@@ -161,6 +163,7 @@ extern "C" void brotensor_probe_and_register_cuda() {
     dc::fill_cuda_vtable_filtered_lrelu(ops);
     dc::fill_cuda_vtable_packed_encoder(ops);
     dc::fill_cuda_vtable_linear_ex(ops);
+    dc::fill_cuda_vtable_linear_wq(ops);
 
     ::brotensor::detail::register_backend(DeviceType::CUDA, ops, dc::cuda_alloc_table());
     dc::register_cuda_graph_backend();

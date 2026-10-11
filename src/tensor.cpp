@@ -10,7 +10,9 @@
 #include <brotensor/detail/dispatch.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -54,6 +56,7 @@ int dtype_size_bytes(Dtype dt) {
         case Dtype::FP16:  return 2;
         case Dtype::BF16:  return 2;
         case Dtype::INT8:  return 1;
+        case Dtype::FP8_E4M3: return 1;
         case Dtype::INT32: return 4;
         case Dtype::F64:   return 8;
         // Quant dtypes are block-addressed; no per-element size.
@@ -249,6 +252,33 @@ float bf16_bits_to_fp32(uint16_t bits) {
     float f;
     std::memcpy(&f, &x, 4);
     return f;
+}
+
+float fp8_e4m3_bits_to_fp32(uint8_t bits) {
+    const int s = bits >> 7, e = (bits >> 3) & 15, m = bits & 7;
+    if (e == 15 && m == 7) return std::numeric_limits<float>::quiet_NaN();
+    const float mag = e == 0 ? std::ldexp(static_cast<float>(m), -9)   // m/8 * 2^-6
+                             : std::ldexp(1.0f + m / 8.0f, e - 7);
+    return s ? -mag : mag;
+}
+
+uint8_t fp32_to_fp8_e4m3_bits(float v) {
+    if (std::isnan(v)) return 0x7f;
+    const uint8_t sign = std::signbit(v) ? 0x80 : 0x00;
+    const float a = std::fabs(v);
+    if (a >= 448.0f) return sign | 0x7e;
+    // Magnitude codes 0..126 ascend with their value: binary search the
+    // bracket, then round to the nearer, ties to the even code.
+    int lo = 0, hi = 126;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) / 2;
+        if (fp8_e4m3_bits_to_fp32(static_cast<uint8_t>(mid)) <= a) lo = mid;
+        else hi = mid;
+    }
+    const float dl = a - fp8_e4m3_bits_to_fp32(static_cast<uint8_t>(lo));
+    const float dh = fp8_e4m3_bits_to_fp32(static_cast<uint8_t>(hi)) - a;
+    const int code = dl < dh ? lo : dh < dl ? hi : ((lo & 1) ? hi : lo);
+    return sign | static_cast<uint8_t>(code);
 }
 
 // ─── internal helpers ──────────────────────────────────────────────────────

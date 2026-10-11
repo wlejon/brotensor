@@ -60,6 +60,7 @@ inline const char* dtypeToString(brotensor::Dtype dt) {
         case brotensor::Dtype::INT8: return "int8";
         case brotensor::Dtype::INT32: return "int32";
         case brotensor::Dtype::F64: return "f64";
+        case brotensor::Dtype::FP8_E4M3: return "fp8_e4m3";
         default: return "unknown";
     }
 }
