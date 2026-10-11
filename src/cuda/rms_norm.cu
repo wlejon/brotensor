@@ -11,6 +11,7 @@
 #include <cuda_bf16.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 
 namespace brotensor { void* cuda_current_stream(); }
@@ -40,14 +41,16 @@ __device__ inline float block_sum(float v, float* sdata) {
     // warp finishes reading the previous reduction's result — a data race whose
     // corruption surfaces as a bogus rrms (huge dX) once enough blocks are in
     // flight (large batch). Harmless on the first call (sdata not yet read).
+    // Warp shuffles, then one shared slot per warp (blockDim is RMS_BLOCK, a
+    // multiple of 32): two barriers instead of a log2(blockDim) tree.
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     __syncthreads();
-    sdata[tid] = v;
+    if ((tid & 31) == 0) sdata[tid >> 5] = v;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    return sdata[0];
+    const int nw = blockDim.x >> 5;
+    float t = (tid & 31) < nw ? sdata[tid & 31] : 0.0f;
+    for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+    return t;
 }
 
 __global__ void rms_forward_fp32_kernel(const float* __restrict__ X,
@@ -241,6 +244,61 @@ __global__ void rms_forward_bf16_kernel(const __nv_bfloat16* __restrict__ X,
     }
 }
 
+// D % 8 == 0 and D <= RMS_BLOCK * 8 * RMS_VEC: each thread holds its row
+// slice as 16-byte vectors in registers, so X is read once. A decode step's
+// one 2048-wide row is a single vector per thread.
+constexpr int RMS_VEC = 4;
+
+template <typename GT>
+__global__ void rms_forward_bf16_vec_kernel(const __nv_bfloat16* __restrict__ X,
+                                            const GT* __restrict__ gamma,
+                                            __nv_bfloat16* __restrict__ Y,
+                                            int B, int D, float eps) {
+    extern __shared__ float sdata[];
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    const int tid = threadIdx.x;
+    const int nvec = D / 8;
+    const uint4* xrow = reinterpret_cast<const uint4*>(X + static_cast<size_t>(b) * D);
+    uint4* yrow = reinterpret_cast<uint4*>(Y + static_cast<size_t>(b) * D);
+
+    uint4 v[RMS_VEC];
+    float local = 0.0f;
+#pragma unroll
+    for (int i = 0; i < RMS_VEC; ++i) {
+        const int c = tid + i * RMS_BLOCK;
+        if (c < nvec) {
+            v[i] = xrow[c];
+            const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&v[i]);
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+                const float2 f = __bfloat1622float2(p[h]);
+                local += f.x * f.x + f.y * f.y;
+            }
+        }
+    }
+    const float sum = block_sum(local, sdata);
+    const float rrms = rsqrtf(sum / static_cast<float>(D) + eps);
+
+#pragma unroll
+    for (int i = 0; i < RMS_VEC; ++i) {
+        const int c = tid + i * RMS_BLOCK;
+        if (c < nvec) {
+            const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&v[i]);
+            uint4 o;
+            __nv_bfloat162* q = reinterpret_cast<__nv_bfloat162*>(&o);
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+                const float2 f = __bfloat1622float2(p[h]);
+                const int j = c * 8 + 2 * h;
+                q[h] = __floats2bfloat162_rn(f.x * gamma_to_f32(gamma[j]) * rrms,
+                                             f.y * gamma_to_f32(gamma[j + 1]) * rrms);
+            }
+            yrow[c] = o;
+        }
+    }
+}
+
 __global__ void rms_backward_bf16_kernel(const __nv_bfloat16* __restrict__ X,
                                          const __nv_bfloat16* __restrict__ gamma,
                                          const __nv_bfloat16* __restrict__ dY,
@@ -326,7 +384,18 @@ void rms_norm_forward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& g
                 B, D, eps);
         }
     } else if (X.dtype == ::brotensor::Dtype::BF16) {
-        if (gamma_f32) {
+        const bool vec = D % 8 == 0 && D <= RMS_BLOCK * 8 * RMS_VEC &&
+                         (reinterpret_cast<uintptr_t>(X.data) & 15) == 0 &&
+                         (reinterpret_cast<uintptr_t>(Y.data) & 15) == 0;
+        if (vec && gamma_f32) {
+            rms_forward_bf16_vec_kernel<<<B, block, shmem, cur_stream()>>>(
+                static_cast<const __nv_bfloat16*>(X.data), static_cast<const float*>(gamma.data),
+                static_cast<__nv_bfloat16*>(Y.data), B, D, eps);
+        } else if (vec) {
+            rms_forward_bf16_vec_kernel<<<B, block, shmem, cur_stream()>>>(
+                static_cast<const __nv_bfloat16*>(X.data), static_cast<const __nv_bfloat16*>(gamma.data),
+                static_cast<__nv_bfloat16*>(Y.data), B, D, eps);
+        } else if (gamma_f32) {
             rms_forward_bf16_kernel<<<B, block, shmem, cur_stream()>>>(
                 static_cast<const __nv_bfloat16*>(X.data),
                 static_cast<const float*>(gamma.data),

@@ -203,15 +203,26 @@ __global__ void reduce_kernel(const float* __restrict__ ws, T* __restrict__ O, i
     const int h = blockIdx.x;
     const int rec = hd + 2;
     const float* base = ws + static_cast<size_t>(h) * n_splits * rec;
+    // Each split's (max, sum) is loaded once, in parallel, and its rescale
+    // weight computed once; only the O columns are read per thread.
+    __shared__ float sm[MAX_SPLITS], sl[MAX_SPLITS], sw[MAX_SPLITS];
+    for (int s = threadIdx.x; s < n_splits; s += blockDim.x) {
+        sm[s] = base[s * rec];
+        sl[s] = base[s * rec + 1];
+    }
+    __syncthreads();
     float m = -1e30f;
-    for (int s = 0; s < n_splits; ++s) m = fmaxf(m, base[s * rec]);
+    for (int s = 0; s < n_splits; ++s) m = fmaxf(m, sm[s]);
+    for (int s = threadIdx.x; s < n_splits; s += blockDim.x) sw[s] = __expf(sm[s] - m);
+    __syncthreads();
     float den = 0.0f;
-    for (int s = 0; s < n_splits; ++s) den += __expf(base[s * rec] - m) * base[s * rec + 1];
+    for (int s = 0; s < n_splits; ++s) den += sw[s] * sl[s];
     const float inv = den > 0.0f ? 1.0f / den : 0.0f;
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float num = 0.0f;
+#pragma unroll 8
         for (int s = 0; s < n_splits; ++s) {
-            const float w = __expf(base[s * rec] - m);
+            const float w = sw[s];
             if (w != 0.0f) num += w * base[s * rec + 2 + d];
         }
         O[static_cast<size_t>(h) * hd + d] = from_f<T>(num * inv);

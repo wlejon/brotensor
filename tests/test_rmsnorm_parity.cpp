@@ -164,6 +164,13 @@ void run_bwd_bf16(int B, int D, float eps, uint64_t seed) {
 BT_PARITY_TEST(rms_norm_bf16_fwd_8x32)  { run_fwd_bf16(8, 32, 1e-5f,  0x7080ull); }
 BT_PARITY_TEST(rms_norm_bf16_fwd_5x7)   { run_fwd_bf16(5, 7, 1e-6f,   0x7081ull); }
 BT_PARITY_TEST(rms_norm_bf16_fwd_wide)  { run_fwd_bf16(3, 257, 1e-5f, 0x7082ull); }
+// D % 8 == 0 takes the register-vector kernel: one vector per thread (a
+// decode row), a partial last pass, the 8192 cap, and past it (fallback).
+BT_PARITY_TEST(rms_norm_bf16_fwd_vec_2048)  { run_fwd_bf16(1, 2048, 1e-6f, 0x7083ull); }
+BT_PARITY_TEST(rms_norm_bf16_fwd_vec_16x128) { run_fwd_bf16(16, 128, 1e-6f, 0x7084ull); }
+BT_PARITY_TEST(rms_norm_bf16_fwd_vec_3000)  { run_fwd_bf16(4, 3000, 1e-5f, 0x7085ull); }
+BT_PARITY_TEST(rms_norm_bf16_fwd_vec_8192)  { run_fwd_bf16(2, 8192, 1e-5f, 0x7086ull); }
+BT_PARITY_TEST(rms_norm_bf16_fwd_vec_8200)  { run_fwd_bf16(2, 8200, 1e-5f, 0x7087ull); }
 
 BT_PARITY_TEST(rms_norm_bf16_bwd_8x32)  { run_bwd_bf16(8, 32, 1e-5f,  0x7090ull); }
 BT_PARITY_TEST(rms_norm_bf16_bwd_5x7)   { run_bwd_bf16(5, 7, 1e-6f,   0x7091ull); }
