@@ -448,6 +448,8 @@
     X(flash_attention_decode_masked,           void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K_cache, const ::brotensor::Tensor& V_cache,            \
                                                        const float* d_mask, int num_q_heads, int num_kv_heads, ::brotensor::Tensor& O,                                  \
                                                        float attn_softcap, int window))                                                                                 \
+    X(flash_attention_decode_len,              void,  (const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K_cache, const ::brotensor::Tensor& V_cache,            \
+                                                       const int32_t* d_len, int num_q_heads, int num_kv_heads, ::brotensor::Tensor& O))                                \
     /* ─── Public reductions ─── */                                                                                                                                     \
     X(sum_rows,                                void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y))                                                           \
     X(sum_cols,                                void,  (const ::brotensor::Tensor& X, ::brotensor::Tensor& Y))                                                           \

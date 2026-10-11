@@ -377,6 +377,23 @@ void flash_attention_decode_masked(const Tensor& Q,
                                    float attn_softcap = 0.0f, int window = 0);
 
 
+// Single-token decode attention over the first *d_len keys of a
+// fixed-capacity KV cache, the length read on the device at run time. Like
+// the masked op, the launch shape never changes as generation advances, so a
+// CUDA graph captured once replays for every step (the caller writes the new
+// length between replays); unlike it, the work divides the VALID keys, so a
+// cache sized for a long generation costs nothing for its unused rows.
+// Results agree with flash_attention_decode(.., *d_len, ..) to rounding (the
+// split points differ, so not bit for bit).
+//   Q: (1, num_q_heads*head_dim); K_cache, V_cache: (L_max, num_kv_heads*head_dim)
+//       FP16/BF16 on CUDA (head_dim a multiple of 32, at most 256), FP32 on CPU.
+//   d_len: device INT32 (a raw host pointer on CPU), 0 <= *d_len <= L_max;
+//       a length of 0 writes zeros.
+//   O: (1, num_q_heads*head_dim), resized as needed.
+void flash_attention_decode_len(const Tensor& Q, const Tensor& K_cache, const Tensor& V_cache,
+                                const int32_t* d_len, int num_q_heads, int num_kv_heads, Tensor& O);
+
+
 // Back-compat overload: num_kv_heads defaults to num_heads (plain MHA).
 inline void flash_attention_decode(const Tensor& Q,
                                    const Tensor& K_cache, const Tensor& V_cache,

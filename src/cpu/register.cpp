@@ -511,6 +511,9 @@ void flash_attention_decode_masked(const ::brotensor::Tensor& Q,
                                    int num_q_heads, int num_kv_heads,
                                    ::brotensor::Tensor& O,
                                    float attn_softcap, int window);
+void flash_attention_decode_len(const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K_cache,
+                                const ::brotensor::Tensor& V_cache, const int32_t* d_len, int num_q_heads,
+                                int num_kv_heads, ::brotensor::Tensor& O);
 
 // ── CHUNK 5 — cross_attention.cpp / self_attention.cpp /
 //    attention_moments.cpp ──
@@ -1311,6 +1314,7 @@ struct CpuStaticRegistrar {
         ops.flash_attention_decode       = &detail::cpu::flash_attention_decode;
         ops.flash_attention_decode_masked
                                          = &detail::cpu::flash_attention_decode_masked;
+        ops.flash_attention_decode_len   = &detail::cpu::flash_attention_decode_len;
 
         // ── CHUNK 5 ──
         ops.cross_attention_forward      = &detail::cpu::cross_attention_forward;

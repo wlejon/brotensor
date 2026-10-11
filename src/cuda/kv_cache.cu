@@ -490,7 +490,7 @@ constexpr int FAD_SPLIT_BLOCK  = 128;
 constexpr int FAD_MAX_SPLITS   = 16;
 constexpr int FAD_SPLIT_MAX_HD = 256;
 
-template <typename T, bool MASKED>
+template <typename T, bool MASKED, bool DEVLEN = false>
 __global__ void fad_split_partials_kernel(
         const T* __restrict__ Q,
         const T* __restrict__ K,
@@ -500,9 +500,22 @@ __global__ void fad_split_partials_kernel(
         int cap, int valid_len,           // valid_len used when !MASKED
         int Dq, int Dkv, int head_dim, int group,
         int tiles_per_split, int n_splits,
-        float softcap, int window) {
+        float softcap, int window,
+        const int* __restrict__ d_len = nullptr) {   // DEVLEN: valid length on the device
     __shared__ float scores[FAD_KTILE];
     __shared__ float bcast[2];
+
+    // DEVLEN: the valid length is read here, so a captured launch follows the
+    // cursor, and the splits divide the VALID keys rather than the capacity —
+    // a long cache early in generation keeps every split busy and walks no
+    // dead tiles.
+    if constexpr (DEVLEN) {
+        valid_len = *d_len;
+        if (valid_len > cap) valid_len = cap;
+        const int n_tiles = (valid_len + FAD_KTILE - 1) / FAD_KTILE;
+        tiles_per_split = (n_tiles + n_splits - 1) / n_splits;
+        if (tiles_per_split < 1) tiles_per_split = 1;
+    }
 
     const int h    = blockIdx.y;
     const int spl  = blockIdx.x;
@@ -568,6 +581,7 @@ __global__ void fad_split_partials_kernel(
     const int k_begin = spl * tiles_per_split * FAD_KTILE;
     int k_end = k_begin + tiles_per_split * FAD_KTILE;
     if (k_end > cap) k_end = cap;
+    if (DEVLEN && k_end > valid_len) k_end = valid_len;
 
     for (int k0 = k_begin; k0 < k_end; k0 += FAD_KTILE) {
         if (!MASKED && k0 >= valid_len) break;
@@ -954,6 +968,46 @@ void flash_attention_decode_masked(const Tensor& Q,
             d_mask,
             static_cast<__nv_bfloat16*>(O.data),
             cap, Dq, Dkv, head_dim, group, attn_softcap, window);
+    }
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
+
+void flash_attention_decode_len(const Tensor& Q, const Tensor& K_cache, const Tensor& V_cache,
+                                const int32_t* d_len, int num_q_heads, int num_kv_heads, Tensor& O) {
+    constexpr const char* op = "flash_attention_decode_len";
+    auto fail = [&](const char* m) { throw std::runtime_error(std::string(op) + ": " + m); };
+    if (Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) fail("tensors must be FP16 or BF16");
+    if (K_cache.dtype != Q.dtype || V_cache.dtype != Q.dtype) fail("all tensors must share the same dtype");
+    if (d_len == nullptr) fail("d_len must not be null");
+    if (Q.rows != 1) fail("Q must be a single row (L_q == 1)");
+    const int Dq = Q.cols, Dkv = K_cache.cols, cap = K_cache.rows;
+    if (V_cache.cols != Dkv || V_cache.rows != cap) fail("K_cache / V_cache shape mismatch");
+    if (num_q_heads <= 0 || num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0)
+        fail("num_kv_heads must be positive and divide num_q_heads");
+    if (Dq % num_q_heads != 0 || Dkv != (Dq / num_q_heads) * num_kv_heads) fail("head layout mismatch");
+    const int head_dim = Dq / num_q_heads;
+    if (!fad_split_eligible(head_dim)) fail("head_dim must be a multiple of 32, at most 256");
+    if (O.rows != 1 || O.cols != Dq || O.dtype != Q.dtype) O.resize(1, Dq, Q.dtype);
+    if (Dq == 0 || cap == 0) return;
+    int n_splits = 0, tps = 0;
+    fad_split_dims(cap, n_splits, tps);
+    float* ws = fad_split_workspace(static_cast<size_t>(num_q_heads) * n_splits * (head_dim + 2));
+    const dim3 g1(n_splits, num_q_heads, 1);
+    const int group = num_q_heads / num_kv_heads;
+    if (Q.dtype == Dtype::FP16) {
+        fad_split_partials_kernel<__half, false, true><<<g1, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __half*>(Q.data), static_cast<const __half*>(K_cache.data),
+            static_cast<const __half*>(V_cache.data), nullptr, ws, cap, cap, Dq, Dkv, head_dim, group, tps,
+            n_splits, 0.0f, 0, d_len);
+        fad_split_reduce_kernel<__half><<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
+            ws, static_cast<__half*>(O.data), head_dim, n_splits);
+    } else {
+        fad_split_partials_kernel<__nv_bfloat16, false, true><<<g1, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
+            static_cast<const __nv_bfloat16*>(Q.data), static_cast<const __nv_bfloat16*>(K_cache.data),
+            static_cast<const __nv_bfloat16*>(V_cache.data), nullptr, ws, cap, cap, Dq, Dkv, head_dim, group, tps,
+            n_splits, 0.0f, 0, d_len);
+        fad_split_reduce_kernel<__nv_bfloat16><<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
+            ws, static_cast<__nv_bfloat16*>(O.data), head_dim, n_splits);
     }
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }

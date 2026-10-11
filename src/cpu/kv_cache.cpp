@@ -26,6 +26,7 @@
 
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -276,6 +277,21 @@ void flash_attention_decode_masked(const ::brotensor::Tensor& Q,
         attend_head(Qp + q_head_off, Kp, Vp, Dkv, kv_head_off, head_dim, cap, d_mask, lo,
                     inv_sqrt, attn_softcap, scores, Op + q_head_off);
     }
+}
+
+// Device-length decode — on the CPU the length pointer is a host pointer, so
+// this is flash_attention_decode at *d_len (zeros for an empty cache).
+void flash_attention_decode_len(const ::brotensor::Tensor& Q, const ::brotensor::Tensor& K_cache,
+                                const ::brotensor::Tensor& V_cache, const int32_t* d_len, int num_q_heads,
+                                int num_kv_heads, ::brotensor::Tensor& O) {
+    if (d_len == nullptr) throw std::runtime_error("flash_attention_decode_len: d_len must not be null");
+    if (*d_len < 0 || *d_len > K_cache.rows) throw std::runtime_error("flash_attention_decode_len: bad length");
+    if (*d_len == 0) {
+        if (O.rows != Q.rows || O.cols != Q.cols || O.dtype != Q.dtype) O.resize(Q.rows, Q.cols, Q.dtype);
+        std::fill(O.ptr(), O.ptr() + O.size(), 0.0f);
+        return;
+    }
+    flash_attention_decode(Q, K_cache, V_cache, *d_len, num_q_heads, num_kv_heads, O, 0.0f, 0);
 }
 
 } // namespace brotensor::detail::cpu

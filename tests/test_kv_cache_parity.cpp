@@ -178,6 +178,21 @@ void run_decode_masked(int cap, int valid_len, int num_q_heads,
     // And the usual CPU-vs-GPU parity for the masked op itself.
     compare_tensors(cpu_O_masked, fp16_cuda_to_cpu(gpu_O_masked),
                     "decode_masked_parity", 5e-2f, 5e-2f);
+
+    // flash_attention_decode_len over the same poisoned cache: the CPU twin is
+    // the truncated op exactly; the GPU one (split head_dims) agrees to
+    // rounding and never reads a row past the length.
+    const int32_t len = valid_len;
+    Tensor cpu_O_len;
+    brotensor::flash_attention_decode_len(Q, Kc, Vc, &len, num_q_heads, num_kv_heads, cpu_O_len);
+    compare_tensors(cpu_O_ref, cpu_O_len, "decode_len_cpu_exact", 0.0f, 0.0f);
+    if (head_dim % 32 == 0) {
+        const Tensor glen = upload_indices({len});
+        Tensor gpu_O_len;
+        brotensor::flash_attention_decode_len(gQ, gKc, gVc, static_cast<const int32_t*>(glen.data), num_q_heads,
+                                              num_kv_heads, gpu_O_len);
+        compare_tensors(fp16_cuda_to_cpu(gpu_O_ref), fp16_cuda_to_cpu(gpu_O_len), "decode_len_gpu", 2e-3f, 2e-3f);
+    }
 }
 
 } // namespace
@@ -210,6 +225,10 @@ BT_PARITY_TEST(kv_decode_masked_gqa)       { run_decode_masked(96,  41, 8, 2, 16
 BT_PARITY_TEST(kv_decode_masked_multitile) { run_decode_masked(256, 130, 4, 2, 32, 0x7322ull); }
 BT_PARITY_TEST(kv_decode_masked_tile_edge) { run_decode_masked(192, 64,  4, 4, 16, 0x7323ull); }
 BT_PARITY_TEST(kv_decode_masked_one_key)   { run_decode_masked(128, 1,   8, 2, 64, 0x7324ull); }
+// decode_len at head_dim 128, 16 q / 8 kv: a long cache barely used (every
+// split shares 70 keys), and one used across many tiles.
+BT_PARITY_TEST(kv_decode_len_short_in_long) { run_decode_masked(4096, 70,  16, 8, 128, 0x7325ull); }
+BT_PARITY_TEST(kv_decode_len_long)          { run_decode_masked(2048, 1999, 16, 8, 128, 0x7326ull); }
 
 // ─── BF16: BF16-on-CUDA vs FP32 CPU reference ─────────────────────────────
 // Same harness as FP16 but quantise through BF16 (7-bit mantissa).
