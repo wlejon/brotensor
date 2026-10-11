@@ -143,6 +143,19 @@ BT_PARITY_TEST(swiglu_parity) {
     check(32, 256, 128, 0, kSwiglu, false, false, Dtype::FP16, 0x64);
 }
 
+// M = 1..4 take the skinny one-pass GEMV: every epilogue, bias and activation,
+// K a multiple of the kernel's two-quad stride (2048) and not (1032, 6152).
+BT_PARITY_TEST(skinny_rows) {
+    uint64_t seed = 0x80;
+    for (int M = 1; M <= 4; ++M) {
+        check(M, 384, 2048, 4, kStore, true, true, Dtype::BF16, seed++);
+        check(M, 256, 6152, 0, kAcc, true, true, Dtype::BF16, seed++);
+        check(M, 256, 1032, 0, kGeglu, false, true, Dtype::FP16, seed++);
+        check(M, 512, 2048, 0, kSwiglu, true, false, Dtype::BF16, seed++);
+        check(M, 128, 1032, 2, kStore, false, false, Dtype::FP16, seed++);
+    }
+}
+
 }  // namespace
 
 int main() { return run_all("linear_forward_batched_ex (fused epilogue / split-K) CPU<->GPU parity"); }
