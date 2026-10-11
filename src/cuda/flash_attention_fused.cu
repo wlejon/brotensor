@@ -69,6 +69,7 @@
 #include <math_constants.h>
 #include <mma.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -212,7 +213,8 @@ flash_fused_kernel(const T* __restrict__ Q,
                    const T* __restrict__ V,
                    const float* __restrict__ mask,
                    T* __restrict__ O,
-                   int Lq, int Lk, int D, int Dkv, int group, float scale) {
+                   int Lq, int Lk, int D, int Dkv, int group, float scale,
+                   int splits, float* __restrict__ part_o, float* __restrict__ part_ml) {
     using DM = hd_dims<HD, BC>;
     constexpr int WARPS    = BR / 16;
     constexpr int NTHREADS = WARPS * 32;
@@ -236,8 +238,14 @@ flash_fused_kernel(const T* __restrict__ Q,
     // whose sequences all have the same length): blockIdx.z picks the
     // sequence, each an independent (Lq, Lk) problem; the key mask, if any,
     // carries Lk entries per sequence.
+    //
+    // Split-KV (splits > 1, few query tiles over many keys): blockIdx.z also
+    // picks a contiguous slice of the key tiles, and the CTA writes its
+    // unnormalised FP32 O rows plus (max, sum) to part_o / part_ml for
+    // combine_kernel instead of O.
+    const int split = blockIdx.z % splits;
     {
-        const size_t b = blockIdx.z;
+        const size_t b = blockIdx.z / splits;
         Q += b * size_t(Lq) * D;
         K += b * size_t(Lk) * Dkv;
         V += b * size_t(Lk) * Dkv;
@@ -318,16 +326,25 @@ flash_fused_kernel(const T* __restrict__ Q,
     // them outright is where the ~2x arithmetic saving comes from — the
     // partially-masked tile straddling the diagonal is still computed in full
     // and masked per element below.
-    const int kv_end = CAUSAL ? min(Lk, q0 + BR) : Lk;
+    int kv_end = CAUSAL ? min(Lk, q0 + BR) : Lk;
+    int kv_begin = 0;
+    if (splits > 1) {
+        const int n_tiles = (kv_end + BC - 1) / BC;
+        const int tps = (n_tiles + splits - 1) / splits;
+        kv_begin = split * tps * BC;
+        kv_end = min(kv_end, kv_begin + tps * BC);
+    }
 
     // Tile 0's reads are the only ones that cannot be hidden: there is no
     // preceding tile to hide them behind.
     using KVS = kv_stage<HD, BR, BC>;
     int4 kreg[KVS::PER], vreg[KVS::PER];
-    load_kv_regs<T, HD, BR, BC>(K, kreg, 0, Lk, Dkv, kv_off);
-    load_kv_regs<T, HD, BR, BC>(V, vreg, 0, Lk, Dkv, kv_off);
+    if (kv_begin < kv_end) {
+        load_kv_regs<T, HD, BR, BC>(K, kreg, kv_begin, Lk, Dkv, kv_off);
+        load_kv_regs<T, HD, BR, BC>(V, vreg, kv_begin, Lk, Dkv, kv_off);
+    }
 
-    for (int j0 = 0; j0 < kv_end; j0 += BC) {
+    for (int j0 = kv_begin; j0 < kv_end; j0 += BC) {
         __syncthreads();  // everyone done with the previous K/V tile
         store_kv_regs<T, HD, BR, BC>(kreg, sm.k);
         store_kv_regs<T, HD, BR, BC>(vreg, sm.v);
@@ -451,6 +468,33 @@ flash_fused_kernel(const T* __restrict__ Q,
     // The probe recovered rows, not columns, so the write-back still ferries
     // each output fragment through the warp's slot in the (now free) S buffer
     // — but KT times for the whole CTA rather than KT times per key tile.
+    if (splits > 1) {
+        // Partial record of this key slice: O unnormalised, (m, l) per row.
+        float* slot = sm.s + size_t(wrow0) * LDS;
+        const float* slot_rd = sm.s + size_t(wrow0 + trow) * LDS + half_o;
+        const size_t prow = (size_t(blockIdx.z) * Lq + orow);   // (batch*split, row)
+        float* out = part_o + prow * D + head_off;
+#pragma unroll
+        for (int t = 0; t < KT; ++t) {
+            __syncwarp();
+            wmma::store_matrix_sync(slot, o_frag[t], LDS, wmma::mem_row_major);
+            __syncwarp();
+            if (orow < Lq) {
+#pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                    const int col = t * 16 + half_o + c;
+                    if (col < HD) out[col] = slot_rd[c];
+                }
+            }
+        }
+        if (orow < Lq && (lane & 1) == 0) {
+            const int heads = D / HD;
+            float* ml = part_ml + (prow * heads + head) * 2;
+            ml[0] = m_run;
+            ml[1] = l_run;
+        }
+        return;
+    }
     {
         const float inv_l = l_run > 0.0f ? 1.0f / l_run : 0.0f;
         float* slot = sm.s + size_t(wrow0) * LDS;
@@ -473,6 +517,65 @@ flash_fused_kernel(const T* __restrict__ Q,
     }
 }
 
+// Merge the split-KV partials: per (row, head), rescale each slice's O and sum
+// to the global max (the flash-decoding combine), normalise, store.
+template <typename T>
+__global__ void combine_kernel(const float* __restrict__ part_o, const float* __restrict__ part_ml,
+                               T* __restrict__ O, int Lq, int D, int heads, int hd, int splits) {
+    const int row = blockIdx.x, head = blockIdx.y, b = blockIdx.z;
+    float m = -1e30f;
+    for (int s = 0; s < splits; ++s)
+        m = fmaxf(m, part_ml[((size_t(b * splits + s) * Lq + row) * heads + head) * 2]);
+    float l = 0.0f;
+    for (int s = 0; s < splits; ++s) {
+        const float* ml = part_ml + ((size_t(b * splits + s) * Lq + row) * heads + head) * 2;
+        l += exp2f(ml[0] - m) * ml[1];
+    }
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    for (int c = threadIdx.x; c < hd; c += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < splits; ++s) {
+            const size_t pr = size_t(b * splits + s) * Lq + row;
+            const float w = exp2f(part_ml[(pr * heads + head) * 2] - m);
+            if (w != 0.0f) acc += w * part_o[pr * D + head * hd + c];
+        }
+        O[(size_t(b) * Lq + row) * D + head * hd + c] = ff_traits<T>::from_f32(acc * inv);
+    }
+}
+
+// Grow-only per-device scratch for the split partials (never freed). Growing
+// needs cudaMalloc, which a graph capture forbids: a capture that arrives
+// with too small a buffer runs unsplit instead (returns null).
+float* split_workspace(size_t floats, cudaStream_t stream) {
+    constexpr int MAX_DEVICES = 16;
+    static float* buf[MAX_DEVICES] = {};
+    static size_t cap[MAX_DEVICES] = {};
+    int dev = 0;
+    BROTENSOR_CUDA_CHECK(cudaGetDevice(&dev));
+    if (dev < 0 || dev >= MAX_DEVICES) return nullptr;
+    if (cap[dev] >= floats) return buf[dev];
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    BROTENSOR_CUDA_CHECK(cudaStreamIsCapturing(stream, &st));
+    if (st != cudaStreamCaptureStatusNone) return nullptr;
+    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(stream));   // the old buffer may be in use
+    if (buf[dev]) BROTENSOR_CUDA_CHECK(cudaFree(buf[dev]));
+    buf[dev] = nullptr;
+    cap[dev] = 0;
+    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buf[dev]), floats * sizeof(float)));
+    cap[dev] = floats;
+    return buf[dev];
+}
+
+int sm_count() {
+    constexpr int MAX_DEVICES = 16;
+    static int n[MAX_DEVICES] = {};
+    int dev = 0;
+    BROTENSOR_CUDA_CHECK(cudaGetDevice(&dev));
+    if (dev < 0 || dev >= MAX_DEVICES) return 80;
+    if (!n[dev]) BROTENSOR_CUDA_CHECK(cudaDeviceGetAttribute(&n[dev], cudaDevAttrMultiProcessorCount, dev));
+    return n[dev];
+}
+
 template <typename T, int HD, int BR, int BC, bool CAUSAL>
 void launch_impl(const T* Q, const T* K, const T* V, const float* mask, T* O,
                  int Lq, int Lk, int D, int num_heads, int num_kv_heads, int batch,
@@ -488,10 +591,40 @@ void launch_impl(const T* Q, const T* K, const T* V, const float* mask, T* O,
     // correction stays consistent. The kernel applies it to the FP32 scores
     // inside the FFMA that also subtracts the max, so it costs nothing.
     const float scale = 1.4426950408889634f / sqrtf(static_cast<float>(HD));
-    dim3 grid((Lq + BR - 1) / BR, num_heads, batch);
+    const int qtiles = (Lq + BR - 1) / BR;
+    // Split the keys when the (query tile, head, batch) grid cannot fill the
+    // GPU and each slice still gets several key tiles: a NAR window of 52 rows
+    // over 3000 keys is 16 CTAs on a 128-SM part without it.
+    int splits = 1;
+    const long long ctas = static_cast<long long>(qtiles) * num_heads * batch;
+    const int n_tiles = (Lk + BC - 1) / BC;
+    const int want = 2 * sm_count();
+    if (ctas < want && n_tiles >= 8) {
+        splits = static_cast<int>((want + ctas - 1) / ctas);
+        splits = std::min(splits, std::min(n_tiles / 4, 32));
+    }
+    float* part_o = nullptr;
+    float* part_ml = nullptr;
+    if (splits > 1) {
+        const size_t rows = static_cast<size_t>(batch) * splits * Lq;
+        float* ws = split_workspace(rows * D + rows * num_heads * 2, stream);
+        if (ws) {
+            part_o = ws;
+            part_ml = ws + rows * D;
+        } else {
+            splits = 1;
+        }
+    }
+    dim3 grid(qtiles, num_heads, batch * splits);
     flash_fused_kernel<T, HD, BR, BC, CAUSAL><<<grid, NTHREADS, shmem, stream>>>(
-        Q, K, V, mask, O, Lq, Lk, D, num_kv_heads * HD, num_heads / num_kv_heads, scale);
+        Q, K, V, mask, O, Lq, Lk, D, num_kv_heads * HD, num_heads / num_kv_heads, scale, splits, part_o,
+        part_ml);
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    if (splits > 1) {
+        combine_kernel<T><<<dim3(Lq, num_heads, batch), 128, 0, stream>>>(part_o, part_ml, O, Lq, D, num_heads, HD,
+                                                                          splits);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 template <typename T, bool CAUSAL>

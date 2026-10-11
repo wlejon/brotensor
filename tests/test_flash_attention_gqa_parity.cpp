@@ -218,6 +218,15 @@ BT_PARITY_TEST(gqa_gpu_fp16_bidir_gqa_Lq70_Lk300_q16_kv8_hd128_mask) {
     auto m = partial_mask(300);
     run_gpu_fp16(70, 300, 16, 8, 128, false, &m, 0x734ull);
 }
+// Few query tiles over many keys split the keys across CTAs (split-KV) and
+// merge the slices: a NAR-window shape, masked, and a causal prefill.
+BT_PARITY_TEST(gqa_gpu_fp16_splitkv_Lq52_Lk3000_q16_kv8_hd128_mask) {
+    auto m = partial_mask(3000);
+    run_gpu_fp16(52, 3000, 16, 8, 128, false, &m, 0x736ull);
+}
+BT_PARITY_TEST(gqa_gpu_fp16_splitkv_causal_L600_q16_kv8_hd128) {
+    run_gpu_fp16(600, 600, 16, 8, 128, true, nullptr, 0x737ull);
+}
 BT_PARITY_TEST(gqa_gpu_fp16_bidir_gqa_L40_q8_kv1_hd64) {
     run_gpu_fp16(40, 40, 8, 1, 64, false, nullptr, 0x735ull);
 }
