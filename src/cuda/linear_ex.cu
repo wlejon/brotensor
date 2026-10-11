@@ -1,7 +1,8 @@
 // linear_forward_batched_ex — 16-bit batched linear with a fused epilogue
 // (store / residual accumulate / GeGLU / SwiGLU) and optional split-K
-// workspace. One to eight rows take the skinny GEMV below (decode); wider
-// batches run on the mma.sync GEMM in gemm_mma.cu; shapes that kernel refuses
+// workspace. One to eight rows take the skinny GEMV below (decode); 9..64 rows
+// the weight-streaming tensor-core kernel in gemm_skinny.cu (every epilogue
+// fused); wider batches run on the mma.sync GEMM in gemm_mma.cu; shapes that kernel refuses
 // (K or N not a multiple of 8, pre-sm_80) and SwiGLU fall back to a stored
 // result plus an elementwise epilogue pass. CPU twin in
 // src/cpu/packed_encoder.cpp.
@@ -15,6 +16,7 @@
 
 #include "detail/cuda_check.h"
 #include "gemm_mma.cuh"
+#include "gemm_skinny.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -228,6 +230,21 @@ void run(const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::
     if (gemv_ex<T>(static_cast<const T*>(W.data), bp0, static_cast<const T*>(X.data), static_cast<T*>(Y.data), M, N,
                    K, act, epi, cur_stream()))
         return;
+    const T* bp = bias ? static_cast<const T*>(bias->data) : nullptr;
+    if (M <= 64) {
+        float* sp = nullptr;
+        std::size_t sn = 0;
+        const std::size_t need = gemm_skinny::workspace_floats(M, N, K, epi);
+        if (ws && need > 0) {
+            if (ws->dtype != Dtype::FP32 || static_cast<std::size_t>(ws->rows) * ws->cols < need)
+                ws->resize(1, static_cast<int>(need), Dtype::FP32);
+            sp = static_cast<float*>(ws->data);
+            sn = static_cast<std::size_t>(ws->rows) * ws->cols;
+        }
+        if (gemm_skinny::launch(static_cast<const T*>(X.data), static_cast<const T*>(W.data),
+                                static_cast<T*>(Y.data), M, N, K, bp, act, epi, sp, sn, cur_stream()))
+            return;
+    }
     float* wsp = nullptr;
     std::size_t ws_n = 0;
     if (ws) {
@@ -239,7 +256,6 @@ void run(const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::
             ws_n = static_cast<std::size_t>(ws->rows) * ws->cols;
         }
     }
-    const T* bp = bias ? static_cast<const T*>(bias->data) : nullptr;
     // The tile GEMM has no SwiGLU epilogue: wider batches store r and run the
     // epilogue pass below.
     if (epi != 3 && mma_gemm::launch(static_cast<const T*>(X.data), static_cast<const T*>(W.data),

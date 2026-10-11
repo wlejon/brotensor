@@ -143,7 +143,25 @@ BT_PARITY_TEST(swiglu_parity) {
     check(32, 256, 128, 0, kSwiglu, false, false, Dtype::FP16, 0x64);
 }
 
-// M = 1..4 take the skinny one-pass GEMV: every epilogue, bias and activation,
+// M = 9..64 take the weight-streaming tensor-core kernel (gemm_skinny.cu):
+// every row-tile count, every epilogue, N past a 128-column block edge (and a
+// SwiGLU half past a 64-row one), K off the 128 chunk and the 32 step, split
+// and unsplit, both 16-bit types.
+BT_PARITY_TEST(short_m_rows) {
+    uint64_t seed = 0xa0;
+    for (int M : {9, 15, 16, 17, 31, 40, 52, 57, 64}) {
+        const Dtype dt = (M & 1) ? Dtype::BF16 : Dtype::FP16;
+        check(M, 200, 1000, 4, kStore, true, true, dt, seed++);
+        check(M, 2048, 2048, 0, kStore, true, false, dt, seed++);
+        check(M, 384, 6152, 0, kAcc, true, true, dt, seed++);
+        check(M, 384, 6152, 0, kAcc, false, true, dt, seed++);
+        check(M, 264, 520, 0, kGeglu, true, true, dt, seed++);
+        check(M, 144, 2056, 0, kSwiglu, true, true, dt, seed++);
+        check(M, 1024, 512, 0, kSwiglu, false, false, dt, seed++);
+    }
+}
+
+// M = 1..8 take the skinny one-pass GEMV: every epilogue, bias and activation,
 // K a multiple of the kernel's two-quad stride (2048) and not (1032, 6152).
 BT_PARITY_TEST(skinny_rows) {
     uint64_t seed = 0x80;
