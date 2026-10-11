@@ -1,6 +1,7 @@
 // KV-cache append + causal flash-attention decode.
 
 #include "detail/cuda_check.h"
+#include "decode_gqa.cuh"
 
 #include <brotensor/tensor.h>
 
@@ -989,11 +990,18 @@ void flash_attention_decode_len(const Tensor& Q, const Tensor& K_cache, const Te
     if (!fad_split_eligible(head_dim)) fail("head_dim must be a multiple of 32, at most 256");
     if (O.rows != 1 || O.cols != Dq || O.dtype != Q.dtype) O.resize(1, Dq, Q.dtype);
     if (Dq == 0 || cap == 0) return;
+    const int group = num_q_heads / num_kv_heads;
+    // The grouped kernel (one CTA per KV head and split, 16-byte rows) covers
+    // the common shapes; the split-K kernel the rest.
+    if (decode_gqa::supported(head_dim, group)) {
+        decode_gqa::launch(Q.data, K_cache.data, V_cache.data, d_len, O.data, cap, num_q_heads, num_kv_heads,
+                           head_dim, Q.dtype == Dtype::BF16, cur_stream());
+        return;
+    }
     int n_splits = 0, tps = 0;
     fad_split_dims(cap, n_splits, tps);
     float* ws = fad_split_workspace(static_cast<size_t>(num_q_heads) * n_splits * (head_dim + 2));
     const dim3 g1(n_splits, num_q_heads, 1);
-    const int group = num_q_heads / num_kv_heads;
     if (Q.dtype == Dtype::FP16) {
         fad_split_partials_kernel<__half, false, true><<<g1, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
             static_cast<const __half*>(Q.data), static_cast<const __half*>(K_cache.data),

@@ -351,6 +351,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/rms_norm.cu
         src/cuda/swiglu.cu
         src/cuda/kv_cache.cu
+        src/cuda/decode_gqa.cu
         src/cuda/public_reductions.cu
         src/cuda/ddim_step.cu
         src/cuda/euler_step.cu
