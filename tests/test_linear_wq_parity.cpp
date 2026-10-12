@@ -148,6 +148,8 @@ BT_PARITY_TEST(slices_and_fallback) {
     check(20, 256, 512, 0, kSwiglu, false, Dtype::FP8_E4M3, Dtype::BF16, 0x402);
     check(3, 64, 1000, 0, kStore, true, Dtype::INT8, Dtype::FP16, 0x403);    // K % 16 != 0
     check(2, 64, 200, 0, kSwiglu, false, Dtype::FP8_E4M3, Dtype::BF16, 0x404);
+    check(3, 64, 1003, 0, kStore, true, Dtype::INT8, Dtype::FP16, 0x405);    // K % 8 != 0: no 8-wide loads
+    check(2, 64, 1003, 0, kSwiglu, false, Dtype::FP8_E4M3, Dtype::FP32, 0x406);
 }
 
 int main() { return run_all("linear_forward_batched_wq_ex parity"); }

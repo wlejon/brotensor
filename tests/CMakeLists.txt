@@ -256,6 +256,8 @@ if(BROTENSOR_HAS_GPU)
     # Hand-run microbench for the FP16 GEMM (NN / NT / ABT / TN / FP16-weight).
     brotensor_add_executable(brotensor_bench_gemm_fp16 bench_gemm_fp16.cpp)
     brotensor_add_executable(brotensor_bench_quant_matmul bench_quant_matmul.cpp)
+    # Hand-run microbench: weight-only INT8 / FP8 linear vs FP16 at decode shapes.
+    brotensor_add_executable(brotensor_bench_wq_linear bench_wq_linear.cpp)
     brotensor_add_executable(brotensor_bench_elementwise bench_elementwise.cpp)
     brotensor_add_test(brotensor_test_int8_attention test_int8_attention.cpp)
     if(BROTENSOR_WITH_CUDA)

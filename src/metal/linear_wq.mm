@@ -113,6 +113,7 @@ struct WqParams {
     uint M, N, K, out_cols;
     uint fp8, has_bias;
     int  act, epi;   // epi: 0 store, 1 accumulate, 2 GeGLU, 3 SwiGLU
+    uint vec;        // K % 8 == 0 and Wq / X aligned: 8 weights a lane a step
 };
 
 // A & S 7.1.26, |err| < 1.5e-7 (as gemm_fp32.mm).
@@ -137,6 +138,12 @@ inline float w_act(int act, float v) {
     }
 }
 inline float w_decode(uchar b, uint fp8) { return fp8 ? e4m3_decode(uint(b)) : float(char(b)); }
+// Four codes packed in a uint (little-endian: the first code lowest).
+inline float4 w_decode4(uint b, uint fp8) {
+    if (!fp8) return float4(as_type<char4>(b));
+    return float4(e4m3_decode(b & 255u), e4m3_decode((b >> 8) & 255u), e4m3_decode((b >> 16) & 255u),
+                  e4m3_decode(b >> 24));
+}
 
 constant constexpr uint ROWS = 8;   // input rows a weight row is read for at once
 
@@ -154,7 +161,28 @@ void wq_gemv(device const uchar* Wq, device const float* scales, device const T*
         const uint rows = min(ROWS, p.M - m0);
         float a0[ROWS], a1[ROWS];
         for (uint r = 0; r < ROWS; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; }
-        for (uint k = lane; k < p.K; k += 32u) {
+        // Eight weights a lane a step (one 8-byte load, the simdgroup a
+        // 256-byte run of the row) and the eight inputs under them in two
+        // 4-wide loads; what K leaves past the last multiple of 8 a weight a
+        // lane, as before.
+        const uint K8 = p.vec ? (p.K & ~7u) : 0u;
+        for (uint k = lane * 8u; k < K8; k += 256u) {
+            const uint2 b0 = *reinterpret_cast<device const uint2*>(w0 + k);
+            const float4 w0a = w_decode4(b0.x, p.fp8), w0b = w_decode4(b0.y, p.fp8);
+            float4 w1a = 0.0f, w1b = 0.0f;
+            if (gated) {
+                const uint2 b1 = *reinterpret_cast<device const uint2*>(w1 + k);
+                w1a = w_decode4(b1.x, p.fp8);
+                w1b = w_decode4(b1.y, p.fp8);
+            }
+            for (uint r = 0; r < rows; ++r) {
+                device const vec<T, 4>* x4 = reinterpret_cast<device const vec<T, 4>*>(X + ulong(m0 + r) * p.K + k);
+                const float4 xa = float4(x4[0]), xb = float4(x4[1]);
+                a0[r] += dot(w0a, xa) + dot(w0b, xb);
+                if (gated) a1[r] += dot(w1a, xa) + dot(w1b, xb);
+            }
+        }
+        for (uint k = K8 + lane; k < p.K; k += 32u) {
             const float wv0 = w_decode(w0[k], p.fp8);
             const float wv1 = gated ? w_decode(w1[k], p.fp8) : 0.0f;
             for (uint r = 0; r < rows; ++r) {
@@ -220,6 +248,7 @@ struct WqParams {
     uint32_t M, N, K, out_cols;
     uint32_t fp8, has_bias;
     int32_t act, epi;
+    uint32_t vec;
 };
 
 }  // namespace
@@ -287,6 +316,10 @@ void linear_forward_batched_wq_ex(const Tensor& Wq, const Tensor& scales, const 
     p.has_bias = bias ? 1u : 0u;
     p.act = act;
     p.epi = epi;
+    // The 8-wide loads: every Wq row and X row starts 8-byte / 4-element
+    // aligned when K is a multiple of 8 and the buffers' offsets are.
+    const NSUInteger xAlign = 4 * static_cast<NSUInteger>(dtype_size_bytes(dt));
+    p.vec = K % 8 == 0 && buffer_offset_for(Wq) % 8 == 0 && buffer_offset_for(X) % xAlign == 0 ? 1u : 0u;
     id<MTLComputePipelineState> pso = dt == Dtype::FP16 ? pso_wq_fp16() : dt == Dtype::BF16 ? pso_wq_bf16()
                                                                                           : pso_wq_fp32();
     const NSUInteger tgs = (static_cast<NSUInteger>(out_cols) + kColsPerTg - 1) / kColsPerTg;
