@@ -190,7 +190,9 @@ uint16_t fp32_to_fp16_bits(float v) {
         if (exp < -10) return static_cast<uint16_t>(sign);
         mant |= 0x800000u;
         const int shift = 14 - exp;
-        const uint32_t round = 1u << (shift - 1);
+        // Round to nearest, ties to even, as the normal path and the device's
+        // __float2half do (half up made a tie one subnormal ulp off).
+        const uint32_t round = (1u << (shift - 1)) - 1u + ((mant >> shift) & 1u);
         uint32_t r = (mant + round) >> shift;
         return static_cast<uint16_t>(sign | r);
     }
