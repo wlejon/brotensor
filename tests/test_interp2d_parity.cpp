@@ -7,7 +7,8 @@
 // mode 2 = bicubic Keys/Catmull-Rom (a = -0.5). Bicubic backward is not
 // implemented (forward-only — checked elsewhere).
 //
-// FP32-only here (CPU is FP32-only). NCHW flat layout.
+// FP32 against the CPU (which is FP32-only), and the GPU forward on 16-bit X
+// against the CPU's FP32 resample of the same rounded input. NCHW flat layout.
 
 #include "parity_helpers.h"
 
@@ -75,7 +76,48 @@ void run_fwd_ac(int N, int C, int H_in, int W_in,
                     kAtol, kRtol);
 }
 
+// A 16-bit X (FP16 or BF16) on the GPU, nearest or bilinear, either sampling
+// convention: Y keeps X's dtype, and matches the CPU's FP32 resample of the
+// same rounded input to the output's rounding (a mixed-precision head, e.g.
+// brovisionml's FP16 DPT, resamples its 16-bit features).
+void run_fwd16(int N, int C, int H_in, int W_in, int H_out, int W_out, int mode, bool align,
+               brotensor::Dtype dt, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor X = Tensor::mat(N, C * H_in * W_in);
+    fill_random(X, rng, 1.0f);
+    Tensor gX = X.to(gpu_device()), g16, back;
+    brotensor::cast(gX, g16, dt);
+    brotensor::cast(g16, back, brotensor::Dtype::FP32);
+    Tensor X_rounded = download_to_host(back);
+
+    Tensor cpu_Y, gpu_Y;
+    if (align) {
+        brotensor::interp2d_align_corners_forward(X_rounded, N, C, H_in, W_in, H_out, W_out, mode, cpu_Y);
+        brotensor::interp2d_align_corners_forward(g16, N, C, H_in, W_in, H_out, W_out, mode, gpu_Y);
+    } else {
+        brotensor::interp2d_forward(X_rounded, N, C, H_in, W_in, H_out, W_out, mode, cpu_Y);
+        brotensor::interp2d_forward(g16, N, C, H_in, W_in, H_out, W_out, mode, gpu_Y);
+    }
+    if (gpu_Y.dtype != dt) {
+        std::printf("    [interp2d 16-bit] Y lost X's dtype\n");
+        throw 0;
+    }
+    Tensor y32;
+    brotensor::cast(gpu_Y, y32, brotensor::Dtype::FP32);
+    const float tol = dt == brotensor::Dtype::BF16 ? 1e-2f : 2e-3f;
+    compare_tensors(cpu_Y, download_to_host(y32), "interp2d_fwd 16-bit", tol, tol);
+}
+
 } // namespace
+
+// ─── 16-bit forward (nearest / bilinear) ───────────────────────────────────
+BT_PARITY_TEST(i2d_fwd16_near_up)    { run_fwd16(2, 3, 4, 5, 8, 10, 0, false, brotensor::Dtype::FP16, 0xB240ull); }
+BT_PARITY_TEST(i2d_fwd16_bil_down)   { run_fwd16(2, 3, 20, 24, 7, 9, 1, false, brotensor::Dtype::FP16, 0xB241ull); }
+BT_PARITY_TEST(i2d_ac_fwd16_bil_up)  { run_fwd16(2, 3, 4, 5, 11, 13, 1, true, brotensor::Dtype::FP16, 0xB242ull); }
+BT_PARITY_TEST(i2d_ac_fwd_bf16_bil)  { run_fwd16(1, 4, 5, 6, 10, 12, 1, true, brotensor::Dtype::BF16, 0xB243ull); }
+// (Nearest shapes with no source coordinate on a .5 tie, where CPU and GPU
+// float arithmetic may round to different rows.)
+BT_PARITY_TEST(i2d_fwd_bf16_near)    { run_fwd16(2, 3, 16, 16, 5, 5, 0, false, brotensor::Dtype::BF16, 0xB244ull); }
 
 // ─── nearest (mode 0) ──────────────────────────────────────────────────────
 BT_PARITY_TEST(i2d_fwd_near_up)     { run_fwd(2, 3, 4, 5, 8, 10, 0, 0xB200ull); }

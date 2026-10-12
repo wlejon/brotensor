@@ -1,8 +1,8 @@
 // ─── Metal arbitrary-scale 2D resample ──────────────────────────────────────
 //
-// Metal counterpart of src/cpu/interp2d.cpp. FP32-only on this backend (first
-// pass — FP16/BF16 dispatch can be added later if vision inference workloads
-// land on Metal hosts). Arbitrary-scale resampling on an NCHW tensor with
+// Metal counterpart of src/cpu/interp2d.cpp. The forward takes FP32, or FP16 /
+// BF16 for nearest and bilinear (as CUDA); the backward is FP32-only on this
+// backend. Arbitrary-scale resampling on an NCHW tensor with
 // nearest / bilinear forward and backward, plus bicubic forward (mode 2 =
 // Catmull-Rom a=-0.5 / PIL; mode 3 = a=-0.75 / torch); bicubic backward throws.
 //
@@ -112,10 +112,10 @@ static inline float cubic_keys(float t, float a) {
 }
 
 // ── forward: one thread per output element (n, c, oh, ow) ────────────────────
-kernel void k_interp2d_forward(device const float* X [[buffer(0)]],
-                               device float*       Y [[buffer(1)]],
-                               constant I2dParams& P [[buffer(2)]],
-                               uint gid [[thread_position_in_grid]]) {
+// T is the storage type (float, half, bfloat): FP32 arithmetic, one rounding
+// at the store. Bicubic is FP32-only (the host refuses it otherwise, as CUDA).
+template <typename T>
+void interp2d_forward_at(device const T* X, device T* Y, constant I2dParams& P, uint gid) {
     if (gid >= P.total) return;
     uint ow   = gid % P.W_out;
     uint t1   = gid / P.W_out;
@@ -150,13 +150,13 @@ kernel void k_interp2d_forward(device const float* X [[buffer(0)]],
         int y1c = max(0, min(y0 + 1, Hi - 1));
         int x0c = max(0, min(x0,     Wi - 1));
         int x1c = max(0, min(x0 + 1, Wi - 1));
-        float v00 = X[xbase + uint(y0c) * P.W_in + uint(x0c)];
-        float v01 = X[xbase + uint(y0c) * P.W_in + uint(x1c)];
-        float v10 = X[xbase + uint(y1c) * P.W_in + uint(x0c)];
-        float v11 = X[xbase + uint(y1c) * P.W_in + uint(x1c)];
+        float v00 = float(X[xbase + uint(y0c) * P.W_in + uint(x0c)]);
+        float v01 = float(X[xbase + uint(y0c) * P.W_in + uint(x1c)]);
+        float v10 = float(X[xbase + uint(y1c) * P.W_in + uint(x0c)]);
+        float v11 = float(X[xbase + uint(y1c) * P.W_in + uint(x1c)]);
         float top = v00 + (v01 - v00) * fx;
         float bot = v10 + (v11 - v10) * fx;
-        Y[gid] = top + (bot - top) * fy;
+        Y[gid] = T(top + (bot - top) * fy);
     } else {
         // bicubic — mode 2: a=-0.5 (PIL); mode 3: a=-0.75 (torch/OpenCV).
         float a = (P.mode == 3u) ? -0.75f : -0.5f;
@@ -175,12 +175,31 @@ kernel void k_interp2d_forward(device const float* X [[buffer(0)]],
             float row = 0.0f;
             for (int i = 0; i < 4; ++i) {
                 int ix = max(0, min(x0 + i - 1, Wi - 1));
-                row += wx[i] * X[xbase + uint(iy) * P.W_in + uint(ix)];
+                row += wx[i] * float(X[xbase + uint(iy) * P.W_in + uint(ix)]);
             }
             acc += wy[j] * row;
         }
-        Y[gid] = acc;
+        Y[gid] = T(acc);
     }
+}
+
+kernel void k_interp2d_forward(device const float* X [[buffer(0)]],
+                               device float*       Y [[buffer(1)]],
+                               constant I2dParams& P [[buffer(2)]],
+                               uint gid [[thread_position_in_grid]]) {
+    interp2d_forward_at<float>(X, Y, P, gid);
+}
+kernel void k_interp2d_forward_fp16(device const half* X [[buffer(0)]],
+                                    device half*       Y [[buffer(1)]],
+                                    constant I2dParams& P [[buffer(2)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    interp2d_forward_at<half>(X, Y, P, gid);
+}
+kernel void k_interp2d_forward_bf16(device const bfloat* X [[buffer(0)]],
+                                    device bfloat*       Y [[buffer(1)]],
+                                    constant I2dParams& P [[buffer(2)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    interp2d_forward_at<bfloat>(X, Y, P, gid);
 }
 
 // ── backward: one thread per input element (n, c, iy, ix) — gather adjoint ──
@@ -247,6 +266,8 @@ kernel void k_interp2d_backward(device const float* dY [[buffer(0)]],
         return pso;                                                            \
     }
 DEF_PSO(pso_interp2d_forward,  @"k_interp2d_forward")
+DEF_PSO(pso_interp2d_forward_fp16, @"k_interp2d_forward_fp16")
+DEF_PSO(pso_interp2d_forward_bf16, @"k_interp2d_forward_bf16")
 DEF_PSO(pso_interp2d_backward, @"k_interp2d_backward")
 #undef DEF_PSO
 
@@ -269,17 +290,21 @@ void dispatch1d(id<MTLComputePipelineState> pso, NSUInteger total,
 } // namespace
 
 // ─── Forward ─────────────────────────────────────────────────────────────────
-void interp2d_forward(const Tensor& X,
-                      int N, int C, int H_in, int W_in,
-                      int H_out, int W_out, int mode, Tensor& Y) {
-    const char* op = "interp2d_forward";
-    req_fp32(op, X, "X");
+// Both forwards, half-pixel (align 0) or corner-aligned (align 1, the
+// inference resample of DPT / seg heads): FP32, or FP16 / BF16 for nearest
+// and bilinear (bicubic is FP32-only), as on CUDA. Y takes X's dtype.
+namespace {
+void run_forward(const char* op, const Tensor& X, int N, int C, int H_in, int W_in, int H_out, int W_out,
+                 int mode, uint32_t align, Tensor& Y) {
+    const bool half16 = X.dtype == Dtype::FP16 || X.dtype == Dtype::BF16;
+    if (X.dtype != Dtype::FP32 && !half16) fail(op, "X must be FP32, FP16 or BF16");
+    if (half16 && mode != 0 && mode != 1) fail(op, "bicubic (mode 2/3) requires FP32 X");
     check_args(op, N, C, H_in, W_in, H_out, W_out, mode,
                /*allow_bicubic=*/true);
 
     const int cols = C * H_out * W_out;
-    if (Y.rows != N || Y.cols != cols || Y.dtype != Dtype::FP32) {
-        Y.resize(N, cols, Dtype::FP32);
+    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) {
+        Y.resize(N, cols, X.dtype);
     }
     if (N == 0 || cols == 0) return;
 
@@ -291,49 +316,31 @@ void interp2d_forward(const Tensor& X,
     p.H_out = static_cast<uint32_t>(H_out);
     p.W_out = static_cast<uint32_t>(W_out);
     p.mode = static_cast<uint32_t>(mode);
+    p.align = align;
     p.total = static_cast<uint32_t>(N) * static_cast<uint32_t>(cols);
 
-    dispatch1d(pso_interp2d_forward(), p.total,
+    id<MTLComputePipelineState> pso = X.dtype == Dtype::FP16   ? pso_interp2d_forward_fp16()
+                                      : X.dtype == Dtype::BF16 ? pso_interp2d_forward_bf16()
+                                                               : pso_interp2d_forward();
+    dispatch1d(pso, p.total,
                ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:buffer_for(X) offset:buffer_offset_for(X) atIndex:0];
         [enc setBuffer:buffer_for(Y) offset:buffer_offset_for(Y) atIndex:1];
         [enc setBytes:&p length:sizeof(I2dParams) atIndex:2];
     });
 }
+} // namespace
 
-// ─── Forward, align_corners=True (inference resample for DPT / seg heads) ─────
-// Reuses the forward kernel; only the source-coordinate map differs (align=1).
+void interp2d_forward(const Tensor& X,
+                      int N, int C, int H_in, int W_in,
+                      int H_out, int W_out, int mode, Tensor& Y) {
+    run_forward("interp2d_forward", X, N, C, H_in, W_in, H_out, W_out, mode, 0u, Y);
+}
+
 void interp2d_align_corners_forward(const Tensor& X,
                                     int N, int C, int H_in, int W_in,
                                     int H_out, int W_out, int mode, Tensor& Y) {
-    const char* op = "interp2d_align_corners_forward";
-    req_fp32(op, X, "X");
-    check_args(op, N, C, H_in, W_in, H_out, W_out, mode,
-               /*allow_bicubic=*/true);
-
-    const int cols = C * H_out * W_out;
-    if (Y.rows != N || Y.cols != cols || Y.dtype != Dtype::FP32) {
-        Y.resize(N, cols, Dtype::FP32);
-    }
-    if (N == 0 || cols == 0) return;
-
-    I2dParams p{};
-    p.N = static_cast<uint32_t>(N);
-    p.C = static_cast<uint32_t>(C);
-    p.H_in = static_cast<uint32_t>(H_in);
-    p.W_in = static_cast<uint32_t>(W_in);
-    p.H_out = static_cast<uint32_t>(H_out);
-    p.W_out = static_cast<uint32_t>(W_out);
-    p.mode = static_cast<uint32_t>(mode);
-    p.align = 1u;
-    p.total = static_cast<uint32_t>(N) * static_cast<uint32_t>(cols);
-
-    dispatch1d(pso_interp2d_forward(), p.total,
-               ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:buffer_for(X) offset:buffer_offset_for(X) atIndex:0];
-        [enc setBuffer:buffer_for(Y) offset:buffer_offset_for(Y) atIndex:1];
-        [enc setBytes:&p length:sizeof(I2dParams) atIndex:2];
-    });
+    run_forward("interp2d_align_corners_forward", X, N, C, H_in, W_in, H_out, W_out, mode, 1u, Y);
 }
 
 // ─── Backward ────────────────────────────────────────────────────────────────

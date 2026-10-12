@@ -18,6 +18,7 @@ using metal_impl::new_command_buffer;
 // add_inplace forward decls (FP16 dispatcher lives further down with the
 // other FP16-extension kernels).
 namespace { void launch_fp16_add_inplace(Tensor&, const Tensor&, uint32_t);
+             void launch_f32_f16_add_inplace(Tensor&, const Tensor&, uint32_t);
              void launch_fp16_scale_inplace(Tensor&, float, uint32_t);
              void launch_bf16_add_inplace(Tensor&, const Tensor&, uint32_t);
              void launch_bf16_scale_inplace(Tensor&, float, uint32_t); }
@@ -38,6 +39,14 @@ void add_inplace(Tensor& y, const Tensor& x) {
         }
         launch_bf16_add_inplace(y, x, n);
         return;
+    }
+    if (y.dtype == Dtype::FP32 && x.dtype == Dtype::FP16) {
+        // FP32 y += FP16 x (as on CUDA and Vulkan).
+        launch_f32_f16_add_inplace(y, x, n);
+        return;
+    }
+    if (y.dtype != Dtype::FP32 || x.dtype != Dtype::FP32) {
+        throw std::runtime_error("add_inplace_gpu: dtype mismatch");
     }
     id<MTLBuffer> by = buffer_for(y);
     id<MTLBuffer> bx = buffer_for(x);
@@ -786,6 +795,14 @@ kernel void k_add_inplace_fp16(device half*       y [[buffer(0)]],
     if (i >= n) return;
     y[i] = half(float(y[i]) + float(x[i]));
 }
+// FP32 y += FP16 x: a half-precision branch re-entering an FP32 residual.
+kernel void k_add_inplace_f32_f16(device float*      y [[buffer(0)]],
+                                  device const half* x [[buffer(1)]],
+                                  constant uint& n     [[buffer(2)]],
+                                  uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    y[i] += float(x[i]);
+}
 kernel void k_add_inplace_bf16(device bfloat*       y [[buffer(0)]],
                                device const bfloat* x [[buffer(1)]],
                                constant uint& n       [[buffer(2)]],
@@ -1048,6 +1065,7 @@ kernel void k_causal_mask_row(device float* mask  [[buffer(0)]],
     }
 DEF_PSO(pso_add_inplace_fp16,   @"k_add_inplace_fp16")
 DEF_PSO(pso_add_inplace_bf16,   @"k_add_inplace_bf16")
+DEF_PSO(pso_add_inplace_f32_f16, @"k_add_inplace_f32_f16")
 DEF_PSO(pso_scale_inplace_fp16, @"k_scale_inplace_fp16")
 DEF_PSO(pso_scale_inplace_bf16, @"k_scale_inplace_bf16")
 DEF_PSO(pso_mul_inplace_fp32,   @"k_mul_inplace_fp32")
@@ -1091,6 +1109,18 @@ void launch_fp16_add_inplace(Tensor& y, const Tensor& x, uint32_t n) {
     const NSUInteger oy = buffer_offset_for(y);
     const NSUInteger ox = buffer_offset_for(x);
     launch_1d(pso_add_inplace_fp16(), n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:by offset:oy atIndex:0];
+        [enc setBuffer:bx offset:ox atIndex:1];
+        [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
+    });
+}
+
+void launch_f32_f16_add_inplace(Tensor& y, const Tensor& x, uint32_t n) {
+    id<MTLBuffer> by = buffer_for(y);
+    id<MTLBuffer> bx = buffer_for(x);
+    const NSUInteger oy = buffer_offset_for(y);
+    const NSUInteger ox = buffer_offset_for(x);
+    launch_1d(pso_add_inplace_f32_f16(), n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:by offset:oy atIndex:0];
         [enc setBuffer:bx offset:ox atIndex:1];
         [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];

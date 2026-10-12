@@ -234,21 +234,15 @@ kernel void k_ln_add_fp32_into_bf16(device const float* src [[buffer(0)]],
     dst[i] = bfloat(float(dst[i]) + src[i]);
 }
 
-kernel void k_ln_forward_inference_batched(device const float* x      [[buffer(0)]],
-                                           device const float* gamma  [[buffer(1)]],
-                                           device const float* beta   [[buffer(2)]],
-                                           device float*       y      [[buffer(3)]],
-                                           constant uint& R           [[buffer(4)]],
-                                           constant uint& D           [[buffer(5)]],
-                                           constant float& eps        [[buffer(6)]],
-                                           constant uint& has_beta    [[buffer(7)]],
-                                           uint row [[threadgroup_position_in_grid]],
-                                           uint tid [[thread_position_in_threadgroup]],
-                                           uint tg_size [[threads_per_threadgroup]]) {
-    threadgroup float sdata[LN_BLOCK];
+// FP32 X; Y FP32, or FP16 (a mixed-precision model feeding half GEMMs
+// straight from an FP32 residual stream: one rounding, at the store).
+template <typename OutT>
+void ln_forward_inference_row(device const float* x, device const float* gamma, device const float* beta,
+                              device OutT* y, uint R, uint D, float eps, uint has_beta, uint row, uint tid,
+                              uint tg_size, threadgroup float* sdata) {
     if (row >= R) return;
     device const float* xrow = x + row * D;
-    device float*       yrow = y + row * D;
+    device OutT*        yrow = y + row * D;
     float local = 0.0f;
     for (uint i = tid; i < D; i += tg_size) local += xrow[i];
     sdata[tid] = local;
@@ -275,8 +269,38 @@ kernel void k_ln_forward_inference_batched(device const float* x      [[buffer(0
     for (uint i = tid; i < D; i += tg_size) {
         float xh = (xrow[i] - mean) * rstd;
         float b = (has_beta != 0u) ? beta[i] : 0.0f;
-        yrow[i] = xh * gamma[i] + b;
+        yrow[i] = OutT(xh * gamma[i] + b);
     }
+}
+
+kernel void k_ln_forward_inference_batched(device const float* x      [[buffer(0)]],
+                                           device const float* gamma  [[buffer(1)]],
+                                           device const float* beta   [[buffer(2)]],
+                                           device float*       y      [[buffer(3)]],
+                                           constant uint& R           [[buffer(4)]],
+                                           constant uint& D           [[buffer(5)]],
+                                           constant float& eps        [[buffer(6)]],
+                                           constant uint& has_beta    [[buffer(7)]],
+                                           uint row [[threadgroup_position_in_grid]],
+                                           uint tid [[thread_position_in_threadgroup]],
+                                           uint tg_size [[threads_per_threadgroup]]) {
+    threadgroup float sdata[LN_BLOCK];
+    ln_forward_inference_row<float>(x, gamma, beta, y, R, D, eps, has_beta, row, tid, tg_size, sdata);
+}
+
+kernel void k_ln_forward_inference_batched_to_fp16(device const float* x      [[buffer(0)]],
+                                                   device const float* gamma  [[buffer(1)]],
+                                                   device const float* beta   [[buffer(2)]],
+                                                   device half*        y      [[buffer(3)]],
+                                                   constant uint& R           [[buffer(4)]],
+                                                   constant uint& D           [[buffer(5)]],
+                                                   constant float& eps        [[buffer(6)]],
+                                                   constant uint& has_beta    [[buffer(7)]],
+                                                   uint row [[threadgroup_position_in_grid]],
+                                                   uint tid [[thread_position_in_threadgroup]],
+                                                   uint tg_size [[threads_per_threadgroup]]) {
+    threadgroup float sdata[LN_BLOCK];
+    ln_forward_inference_row<half>(x, gamma, beta, y, R, D, eps, has_beta, row, tid, tg_size, sdata);
 }
 )msl";
 
@@ -294,6 +318,7 @@ DEF_PSO(pso_ln_add_fp16, @"k_ln_add_fp32_into_fp16")
 DEF_PSO(pso_bw_bf16, @"k_ln_backward_bf16")
 DEF_PSO(pso_ln_add_bf16, @"k_ln_add_fp32_into_bf16")
 DEF_PSO(pso_fw_inf, @"k_ln_forward_inference_batched")
+DEF_PSO(pso_fw_inf_to_fp16, @"k_ln_forward_inference_batched_to_fp16")
 #undef DEF_PSO
 
 } // namespace
@@ -489,16 +514,37 @@ void layernorm_backward(const Tensor& dY, const Tensor& xhat,
     }
 }
 
+void layernorm_forward_inference_batched_fp16(const Tensor& X_RD, const Tensor& gamma, const Tensor* beta,
+                                              Tensor& Y_RD, float eps);  // below
+
 void layernorm_forward_inference_batched(const Tensor& X_RD,
                                          const Tensor& gamma,
                                          const Tensor* beta,
                                          Tensor& Y_RD,
                                          float eps) {
+    // By X's dtype, as on CUDA: FP16 X takes the FP16 kernel; FP32 X writes
+    // FP32, or a pre-typed FP16 Y (a mixed-precision model's half GEMM
+    // input, one rounding at the store). Anything else is refused rather
+    // than read as float.
+    if (X_RD.dtype == Dtype::FP16) {
+        layernorm_forward_inference_batched_fp16(X_RD, gamma, beta, Y_RD, eps);
+        return;
+    }
+    if (X_RD.dtype != Dtype::FP32) {
+        throw std::runtime_error("layernorm_forward_inference_batched: X must be FP32 or FP16 on Metal");
+    }
+    if (gamma.dtype != Dtype::FP32 || (beta && beta->dtype != Dtype::FP32)) {
+        throw std::runtime_error("layernorm_forward_inference_batched: gamma/beta dtype must match X.dtype");
+    }
     const int R = X_RD.rows;
     const int D = X_RD.cols;
-    if (Y_RD.rows != R || Y_RD.cols != D || Y_RD.dtype != Dtype::FP32) Y_RD.resize(R, D, Dtype::FP32);
+    const bool mixed = Y_RD.dtype == Dtype::FP16;
+    if (Y_RD.rows != R || Y_RD.cols != D || (Y_RD.dtype != Dtype::FP32 && !mixed)) {
+        Y_RD.resize(R, D, Dtype::FP32);
+    }
+    const bool to_fp16 = Y_RD.dtype == Dtype::FP16;
     if (R == 0 || D == 0) return;
-    id<MTLComputePipelineState> pso = pso_fw_inf();
+    id<MTLComputePipelineState> pso = to_fp16 ? pso_fw_inf_to_fp16() : pso_fw_inf();
     id<MTLBuffer> bx = buffer_for(X_RD);
     NSUInteger ox = buffer_offset_for(X_RD);
     id<MTLBuffer> bg = buffer_for(gamma);

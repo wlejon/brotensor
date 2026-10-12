@@ -39,12 +39,8 @@ void run_ln_inf(int R, int D, float eps, uint64_t seed) {
 // Mixed precision (a ViT's FP32 residual stream feeding FP16 GEMMs, e.g.
 // brovisionml's DINOv2): FP32 X into a pre-typed FP16 Y keeps Y FP16, and
 // the FP16 branch output re-enters the FP32 residual with add_inplace.
-// CUDA and Vulkan; the Metal backend has neither form yet.
+// Every GPU backend.
 void run_ln_inf_mixed(int R, int D, uint64_t seed) {
-    if (gpu_device().type == brotensor::DeviceType::Metal) {
-        std::printf("    (Metal: no FP32->FP16 layernorm / mixed add_inplace; skipped)\n");
-        return;
-    }
     SplitMix64 rng(seed);
     Tensor X = Tensor::mat(R, D);
     Tensor gamma = Tensor::vec(D), beta = Tensor::vec(D);
