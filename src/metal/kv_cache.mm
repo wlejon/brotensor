@@ -53,27 +53,13 @@ kernel void k_kv_append_copy_bf16(device const bfloat* src [[buffer(0)]],
     dst[dst_off + i] = src[i];
 }
 
-// Causal flash-attention decode kernel. One threadgroup per (q, head).
-kernel void k_flash_attention_decode(
-        device const half* Q       [[buffer(0)]],   // (Lq, D)
-        device const half* Kk      [[buffer(1)]],   // (L_max, D), valid_len valid
-        device const half* V       [[buffer(2)]],   // (L_max, D)
-        device half*       Out     [[buffer(3)]],   // (Lq, D)
-        constant uint& Lq          [[buffer(4)]],
-        constant uint& valid_len   [[buffer(5)]],
-        constant uint& Dq          [[buffer(6)]],
-        constant uint& head_dim    [[buffer(7)]],
-        constant uint& seq_offset  [[buffer(8)]],
-        constant uint& Dkv         [[buffer(9)]],
-        constant uint& group       [[buffer(10)]],
-        constant float& softcap    [[buffer(11)]],
-        constant int& window       [[buffer(12)]],
-        threadgroup float* scratch [[threadgroup(0)]],
-        uint3 gid    [[threadgroup_position_in_grid]],
-        uint3 tid3   [[thread_position_in_threadgroup]],
-        uint3 tgs3   [[threads_per_threadgroup]]) {
-    uint tid = tid3.x;
-    uint tg_size = tgs3.x;
+// Causal flash-attention decode. One threadgroup per (q, head); T the
+// storage type (half, bfloat), float accumulators. Row q sits at position
+// seq_offset + q and attends to keys 0..that position of the valid_len.
+template <typename T>
+void fad_decode(device const T* Q, device const T* Kk, device const T* V, device T* Out, uint Lq,
+                uint valid_len, uint Dq, uint head_dim, uint seq_offset, uint Dkv, uint group, float softcap,
+                int window, threadgroup float* scratch, uint3 gid, uint tid, uint tg_size) {
     threadgroup float* scores = scratch;
     threadgroup float* red    = scratch + FAD_KTILE;
 
@@ -173,128 +159,65 @@ kernel void k_flash_attention_decode(
     uint slot = 0;
     for (uint d = tid; d < head_dim; d += tg_size) {
         if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q * Dq + q_head_off + d] = half(partial[slot] * inv);
+        Out[q * Dq + q_head_off + d] = T(partial[slot] * inv);
         ++slot;
     }
 }
 
-// BF16 variant — identical logic, all float accumulators.
-kernel void k_flash_attention_decode_bf16(
-        device const bfloat* Q       [[buffer(0)]],
-        device const bfloat* Kk      [[buffer(1)]],
-        device const bfloat* V       [[buffer(2)]],
-        device bfloat*       Out     [[buffer(3)]],
+#define FAD_DECODE_ARGS(T)                                                    \
+        device const T* Q          [[buffer(0)]],   /* (Lq, Dq) */             \
+        device const T* Kk         [[buffer(1)]],   /* (L_max, Dkv) */         \
+        device const T* V          [[buffer(2)]],   /* (L_max, Dkv) */         \
+        device T*       Out        [[buffer(3)]],   /* (Lq, Dq) */             \
         constant uint& Lq          [[buffer(4)]],
+#define FAD_DECODE_REST                                                       \
+        constant uint& Dq          [[buffer(6)]],                              \
+        constant uint& head_dim    [[buffer(7)]],                              \
+        constant uint& Dkv         [[buffer(9)]],                              \
+        constant uint& group       [[buffer(10)]],                             \
+        constant float& softcap    [[buffer(11)]],                             \
+        constant int& window       [[buffer(12)]],                             \
+        threadgroup float* scratch [[threadgroup(0)]],                         \
+        uint3 gid    [[threadgroup_position_in_grid]],                         \
+        uint3 tid3   [[thread_position_in_threadgroup]],                       \
+        uint3 tgs3   [[threads_per_threadgroup]]
+
+// The length from the host (valid_len, and the first row's position).
+kernel void k_flash_attention_decode(FAD_DECODE_ARGS(half)
         constant uint& valid_len   [[buffer(5)]],
-        constant uint& Dq          [[buffer(6)]],
-        constant uint& head_dim    [[buffer(7)]],
         constant uint& seq_offset  [[buffer(8)]],
-        constant uint& Dkv         [[buffer(9)]],
-        constant uint& group       [[buffer(10)]],
-        constant float& softcap    [[buffer(11)]],
-        constant int& window       [[buffer(12)]],
-        threadgroup float* scratch [[threadgroup(0)]],
-        uint3 gid    [[threadgroup_position_in_grid]],
-        uint3 tid3   [[thread_position_in_threadgroup]],
-        uint3 tgs3   [[threads_per_threadgroup]]) {
-    uint tid = tid3.x;
-    uint tg_size = tgs3.x;
-    threadgroup float* scores = scratch;
-    threadgroup float* red    = scratch + FAD_KTILE;
-
-    uint q = gid.x;
-    uint h = gid.y;
-    uint q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
-    uint kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
-    float inv_sqrt = rsqrt(float(head_dim));
-    int p_q = int(seq_offset + q);
-    int lo = (window > 0) ? max(0, p_q - window + 1) : 0;
-
-    float run_max = -1e30f;
-    float run_sum = 0.0f;
-    float partial[MAX_HD_PER_THREAD];
-    for (uint i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
-
-    for (uint k0 = 0; k0 < valid_len; k0 += FAD_KTILE) {
-        if (int(k0) > p_q) break;
-        uint klen = (valid_len - k0) < FAD_KTILE ? (valid_len - k0) : FAD_KTILE;
-        if (k0 + klen - 1u > uint(p_q)) klen = uint(p_q) - k0 + 1u;
-
-        for (uint t = tid; t < klen; t += tg_size) {
-            uint kg = k0 + t;
-            if (int(kg) < lo) { scores[t] = -1e30f; continue; }   // out of window
-            float dot = 0.0f;
-            for (uint d = 0; d < head_dim; ++d) {
-                dot += float(Q[q * Dq + q_head_off + d]) *
-                       float(Kk[kg * Dkv + kv_head_off + d]);
-            }
-            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float local_max = -1e30f;
-        for (uint t = tid; t < klen; t += tg_size) {
-            if (scores[t] > local_max) local_max = scores[t];
-        }
-        red[tid] = local_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) {
-                float other = red[tid + s];
-                if (other > red[tid]) red[tid] = other;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float tile_max = red[0];
-        float m_new = (tile_max > run_max) ? tile_max : run_max;
-        bool tile_empty = (m_new <= -1e29f);
-
-        for (uint t = tid; t < klen; t += tg_size) {
-            float e = tile_empty ? 0.0f : exp(scores[t] - m_new);
-            scores[t] = e;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float local_sum = 0.0f;
-        for (uint t = tid; t < klen; t += tg_size) local_sum += scores[t];
-        red[tid] = local_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float tile_sum = red[0];
-
-        float alpha;
-        if (run_max <= -1e29f) {
-            alpha = 0.0f;
-        } else {
-            alpha = exp(run_max - m_new);
-        }
-
-        uint slot = 0;
-        for (uint d = tid; d < head_dim; d += tg_size) {
-            if (slot >= MAX_HD_PER_THREAD) break;
-            float acc = alpha * partial[slot];
-            for (uint t = 0; t < klen; ++t) {
-                acc += scores[t] * float(V[(k0 + t) * Dkv + kv_head_off + d]);
-            }
-            partial[slot] = acc;
-            ++slot;
-        }
-
-        run_max = m_new;
-        run_sum = alpha * run_sum + tile_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
-    uint slot = 0;
-    for (uint d = tid; d < head_dim; d += tg_size) {
-        if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q * Dq + q_head_off + d] = bfloat(partial[slot] * inv);
-        ++slot;
-    }
+        FAD_DECODE_REST) {
+    fad_decode<half>(Q, Kk, V, Out, Lq, valid_len, Dq, head_dim, seq_offset, Dkv, group, softcap, window,
+                     scratch, gid, tid3.x, tgs3.x);
 }
+kernel void k_flash_attention_decode_bf16(FAD_DECODE_ARGS(bfloat)
+        constant uint& valid_len   [[buffer(5)]],
+        constant uint& seq_offset  [[buffer(8)]],
+        FAD_DECODE_REST) {
+    fad_decode<bfloat>(Q, Kk, V, Out, Lq, valid_len, Dq, head_dim, seq_offset, Dkv, group, softcap, window,
+                       scratch, gid, tid3.x, tgs3.x);
+}
+
+// The length read on the device (flash_attention_decode_len): the launch
+// does not change as it grows. Rows are the last Lq of the valid ones
+// (*len >= Lq, as the op requires); a length of 0 writes zeros.
+kernel void k_flash_attention_decode_len(FAD_DECODE_ARGS(half)
+        device const int* len      [[buffer(5)]],
+        FAD_DECODE_REST) {
+    const uint valid_len = uint(max(len[0], 0));
+    fad_decode<half>(Q, Kk, V, Out, Lq, valid_len, Dq, head_dim, valid_len - Lq, Dkv, group, softcap, window,
+                     scratch, gid, tid3.x, tgs3.x);
+}
+kernel void k_flash_attention_decode_len_bf16(FAD_DECODE_ARGS(bfloat)
+        device const int* len      [[buffer(5)]],
+        FAD_DECODE_REST) {
+    const uint valid_len = uint(max(len[0], 0));
+    fad_decode<bfloat>(Q, Kk, V, Out, Lq, valid_len, Dq, head_dim, valid_len - Lq, Dkv, group, softcap,
+                       window, scratch, gid, tid3.x, tgs3.x);
+}
+#undef FAD_DECODE_ARGS
+#undef FAD_DECODE_REST
+
 // Masked decode: single query row (Lq == 1), mask (cap,) FP32 selects valid
 // keys instead of a contiguous valid_len/seq_offset causal prefix. One
 // threadgroup per head; loops the full cap. Mirrors the CUDA non-split-K
@@ -611,6 +534,18 @@ id<MTLComputePipelineState> pso_decode_bf16() {
     return pso;
 }
 
+id<MTLComputePipelineState> pso_decode_len() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_decode_len"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_decode_len_bf16() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_decode_len_bf16"); });
+    return pso;
+}
 id<MTLComputePipelineState> pso_decode_masked() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -693,10 +628,14 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
     run_copy(copy_pso, bV_new, oV_new, bV_c, oV_c, n_halves, dst_extra_halves);
 }
 
-void flash_attention_decode(const Tensor& Q,
-                            const Tensor& K_cache, const Tensor& V_cache,
-                            int valid_len, int num_q_heads, int num_kv_heads,
-                            Tensor& O, float attn_softcap, int window) {
+namespace {
+
+// flash_attention_decode, with the valid length given (valid_len >= 0), or
+// read on the device from d_len (valid_len < 0: flash_attention_decode_len).
+void decode_impl(const Tensor& Q, const Tensor& K_cache, const Tensor& V_cache, int valid_len,
+                 const int32_t* d_len, int num_q_heads, int num_kv_heads, Tensor& O, float attn_softcap,
+                 int window) {
+    const bool on_device = valid_len < 0;
     const bool is_bf16 = (Q.dtype == Dtype::BF16);
     if ((Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) ||
         K_cache.dtype != Q.dtype || V_cache.dtype != Q.dtype) {
@@ -708,11 +647,19 @@ void flash_attention_decode(const Tensor& Q,
     if (V_cache.cols != Dkv) {
         throw std::runtime_error("flash_attention_decode_gpu: K_cache.cols != V_cache.cols");
     }
-    if (valid_len < 0 || valid_len > K_cache.rows || valid_len > V_cache.rows) {
-        throw std::runtime_error("flash_attention_decode_gpu: invalid valid_len");
-    }
-    if (valid_len < Lq) {
-        throw std::runtime_error("flash_attention_decode_gpu: valid_len must be >= Lq");
+    if (on_device) {
+        if (d_len == nullptr) throw std::runtime_error("flash_attention_decode_len: d_len must not be null");
+        if (V_cache.rows != K_cache.rows) {
+            throw std::runtime_error("flash_attention_decode_len: K_cache/V_cache row mismatch");
+        }
+        if (Lq > K_cache.rows) throw std::runtime_error("flash_attention_decode_len: more Q rows than the cache holds");
+    } else {
+        if (valid_len > K_cache.rows || valid_len > V_cache.rows) {
+            throw std::runtime_error("flash_attention_decode_gpu: invalid valid_len");
+        }
+        if (valid_len < Lq) {
+            throw std::runtime_error("flash_attention_decode_gpu: valid_len must be >= Lq");
+        }
     }
     if (num_q_heads <= 0 || num_kv_heads <= 0) {
         throw std::runtime_error("flash_attention_decode_gpu: num_q_heads / num_kv_heads must be positive");
@@ -737,9 +684,11 @@ void flash_attention_decode(const Tensor& Q,
     }
     if (Lq == 0 || Dq == 0 || valid_len == 0) return;
 
-    const uint32_t seq_offset = static_cast<uint32_t>(valid_len - Lq);
+    const uint32_t seq_offset = on_device ? 0u : static_cast<uint32_t>(valid_len - Lq);
     const uint32_t uLq = static_cast<uint32_t>(Lq);
-    const uint32_t uValid = static_cast<uint32_t>(valid_len);
+    const uint32_t uValid = on_device ? 0u : static_cast<uint32_t>(valid_len);
+    NSUInteger oLen = 0;
+    id<MTLBuffer> bLen = on_device ? pool_require(d_len, oLen, "flash_attention_decode_len", "d_len") : nil;
     const uint32_t uDq = static_cast<uint32_t>(Dq);
     const uint32_t uDkv = static_cast<uint32_t>(Dkv);
     const uint32_t uHd = static_cast<uint32_t>(head_dim);
@@ -747,7 +696,8 @@ void flash_attention_decode(const Tensor& Q,
     const float    fSoftcap = attn_softcap;
     const int32_t  iWindow = static_cast<int32_t>(window);
 
-    id<MTLComputePipelineState> pso = is_bf16 ? pso_decode_bf16() : pso_decode();
+    id<MTLComputePipelineState> pso = on_device ? (is_bf16 ? pso_decode_len_bf16() : pso_decode_len())
+                                                : (is_bf16 ? pso_decode_bf16() : pso_decode());
     id<MTLBuffer> bQ = buffer_for(Q);
     id<MTLBuffer> bK = buffer_for(K_cache);
     id<MTLBuffer> bV = buffer_for(V_cache);
@@ -768,10 +718,14 @@ void flash_attention_decode(const Tensor& Q,
         [enc setBuffer:bV offset:oV atIndex:2];
         [enc setBuffer:bO offset:oO atIndex:3];
         [enc setBytes:&uLq      length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&uValid   length:sizeof(uint32_t) atIndex:5];
+        if (on_device) {
+            [enc setBuffer:bLen offset:oLen atIndex:5];
+        } else {
+            [enc setBytes:&uValid   length:sizeof(uint32_t) atIndex:5];
+            [enc setBytes:&seq_offset length:sizeof(uint32_t) atIndex:8];
+        }
         [enc setBytes:&uDq      length:sizeof(uint32_t) atIndex:6];
         [enc setBytes:&uHd      length:sizeof(uint32_t) atIndex:7];
-        [enc setBytes:&seq_offset length:sizeof(uint32_t) atIndex:8];
         [enc setBytes:&uDkv     length:sizeof(uint32_t) atIndex:9];
         [enc setBytes:&uGroup   length:sizeof(uint32_t) atIndex:10];
         [enc setBytes:&fSoftcap length:sizeof(float)    atIndex:11];
@@ -783,6 +737,23 @@ void flash_attention_decode(const Tensor& Q,
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
     }
+}
+
+} // namespace
+
+void flash_attention_decode(const Tensor& Q,
+                            const Tensor& K_cache, const Tensor& V_cache,
+                            int valid_len, int num_q_heads, int num_kv_heads,
+                            Tensor& O, float attn_softcap, int window) {
+    if (valid_len < 0) throw std::runtime_error("flash_attention_decode_gpu: invalid valid_len");
+    decode_impl(Q, K_cache, V_cache, valid_len, nullptr, num_q_heads, num_kv_heads, O, attn_softcap, window);
+}
+
+// The length read on the device: one launch shape whatever the length (no
+// host read, no wait), the kernel walking the first *d_len keys.
+void flash_attention_decode_len(const Tensor& Q, const Tensor& K_cache, const Tensor& V_cache,
+                                const int32_t* d_len, int num_q_heads, int num_kv_heads, Tensor& O) {
+    decode_impl(Q, K_cache, V_cache, -1, d_len, num_q_heads, num_kv_heads, O, 0.0f, 0);
 }
 
 void flash_attention_decode_masked(const Tensor& Q,

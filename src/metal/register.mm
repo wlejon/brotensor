@@ -57,6 +57,8 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.flash_attention_packed_qkv_backward         = &dm::flash_attention_packed_qkv_backward;
     ops.flash_attention_packed_qkv_forward          = &dm::flash_attention_packed_qkv_forward;
     ops.linear_forward_batched_ex                   = &dm::linear_forward_batched_ex;
+    ops.quantize_rows                               = &dm::quantize_rows;
+    ops.linear_forward_batched_wq_ex                = &dm::linear_forward_batched_wq_ex;
     ops.rope_qkv_packed_inplace                     = &dm::rope_qkv_packed_inplace;
     ops.segment_softmax_stats                       = &dm::segment_softmax_stats;
     ops.adaptive_avg_pool2d_backward                = &dm::adaptive_avg_pool2d_backward;
@@ -130,6 +132,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.flash_attention_backward                    = &dm::flash_attention_backward;
     ops.flash_attention_decode                      = &dm::flash_attention_decode;
     ops.flash_attention_decode_masked               = &dm::flash_attention_decode_masked;
+    ops.flash_attention_decode_len                  = &dm::flash_attention_decode_len;
     ops.flash_attention_forward                     = &dm::flash_attention_forward;
     ops.flash_attention_project_kv                  = &dm::flash_attention_project_kv;
     ops.flash_attention_project_kv_int8w_fp16       = &dm::flash_attention_project_kv_int8w_fp16;
