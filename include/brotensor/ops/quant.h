@@ -42,6 +42,15 @@ void matmul_int8w_fp16(const Tensor& W_int8,
 //   Wq: (out, in) fmt, resized.  scales: (out, 1) FP32, resized.
 void quantize_rows(const Tensor& W, Dtype fmt, Tensor& Wq, Tensor& scales);
 
+// W = scale * Wq, row by row: quantize_rows's inverse, for a prefill that
+// runs a GEMM over the quantised weights without keeping the originals (the
+// caller dequantises a layer into one shared scratch, uses it, moves on).
+//   Wq: (out, in) INT8 or FP8_E4M3.  scales: (out, 1) FP32.
+//   out: FP16 / BF16 / FP32 (CUDA), FP32 (CPU).  W: (out, in) out; a W that
+//   already has that shape and dtype (a view into a scratch) is written in
+//   place, otherwise it is resized.
+void dequantize_rows(const Tensor& Wq, const Tensor& scales, Dtype out, Tensor& W);
+
 // Y = X @ (scale * Wq)^T + bias, with linear_forward_batched_ex's activation
 // and epilogues (kLinearEpiStore / Accumulate / Geglu / Swiglu; the gated
 // ones read rows as that op does). FP32 accumulation; the row scale multiplies

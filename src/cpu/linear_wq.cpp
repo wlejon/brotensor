@@ -57,6 +57,25 @@ void quantize_rows(const ::brotensor::Tensor& W, Dtype fmt, ::brotensor::Tensor&
     }
 }
 
+void dequantize_rows(const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& scales, Dtype out,
+                     ::brotensor::Tensor& W) {
+    constexpr const char* op = "dequantize_rows";
+    if (Wq.dtype != Dtype::INT8 && Wq.dtype != Dtype::FP8_E4M3) fail(op, "Wq must be INT8 or FP8_E4M3");
+    if (scales.dtype != Dtype::FP32 || static_cast<long long>(scales.rows) * scales.cols != Wq.rows)
+        fail(op, "scales must be (out,1) FP32");
+    if (out != Dtype::FP32) fail(op, "out must be FP32 on the CPU");
+    const int N = Wq.rows, K = Wq.cols;
+    if (W.rows != N || W.cols != K || W.dtype != Dtype::FP32) W.resize(N, K, Dtype::FP32);
+    const auto* q = static_cast<const uint8_t*>(Wq.data);
+    const float* s = scales.host_f32();
+    float* w = W.host_f32_mut();
+    for (int r = 0; r < N; ++r)
+        for (int k = 0; k < K; ++k) {
+            const std::size_t i = static_cast<std::size_t>(r) * K + k;
+            w[i] = decode(Wq.dtype, q[i]) * s[r];
+        }
+}
+
 void linear_forward_batched_wq_ex(const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& scales,
                                   const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X, int act,
                                   int epilogue, ::brotensor::Tensor& Y) {

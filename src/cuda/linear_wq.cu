@@ -315,7 +315,60 @@ __global__ void quantize_rows_kernel(const T* __restrict__ W, int K, int fmt, ui
     }
 }
 
+// ── dequantize_rows ────────────────────────────────────────────────────────
+// Four weights a thread (one 32-bit load), each decoded and scaled by its
+// row's scale in FP32, then one rounding to the output type.
+template <int FMT, typename T>
+__global__ void dequantize_rows_kernel(const uint8_t* __restrict__ Q, const float* __restrict__ scales, int K,
+                                       size_t n, T* __restrict__ W) {
+    const size_t i0 = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    for (int j = 0; j < 4; ++j) {
+        const size_t i = i0 + j;
+        if (i >= n) return;
+        const uint8_t b = Q[i];
+        float v;
+        if (FMT == 0) {
+            v = static_cast<float>(static_cast<int8_t>(b));
+        } else {
+            const __half_raw h = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(b), __NV_E4M3);
+            v = __half2float(__half(h));
+        }
+        v *= scales[i / static_cast<size_t>(K)];
+        if constexpr (std::is_same_v<T, float>) W[i] = v;
+        else W[i] = from_f<T>(v);
+    }
+}
+
+template <int FMT>
+void launch_dequant(const uint8_t* q, const float* s, int K, size_t n, Dtype out, void* w, cudaStream_t st) {
+    const unsigned grid = static_cast<unsigned>((n + 1023) / 1024);
+    if (out == Dtype::BF16)
+        dequantize_rows_kernel<FMT, __nv_bfloat16><<<grid, 256, 0, st>>>(q, s, K, n, static_cast<__nv_bfloat16*>(w));
+    else if (out == Dtype::FP16)
+        dequantize_rows_kernel<FMT, __half><<<grid, 256, 0, st>>>(q, s, K, n, static_cast<__half*>(w));
+    else
+        dequantize_rows_kernel<FMT, float><<<grid, 256, 0, st>>>(q, s, K, n, static_cast<float*>(w));
+}
+
 }  // namespace
+
+void dequantize_rows(const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& scales, Dtype out,
+                     ::brotensor::Tensor& W) {
+    constexpr const char* op = "dequantize_rows";
+    if (Wq.dtype != Dtype::INT8 && Wq.dtype != Dtype::FP8_E4M3) fail(op, "Wq must be INT8 or FP8_E4M3");
+    if (scales.dtype != Dtype::FP32 || static_cast<long long>(scales.rows) * scales.cols != Wq.rows)
+        fail(op, "scales must be (out,1) FP32");
+    if (out != Dtype::FP16 && out != Dtype::BF16 && out != Dtype::FP32) fail(op, "out must be FP16, BF16 or FP32");
+    const int N = Wq.rows, K = Wq.cols;
+    if (W.rows != N || W.cols != K || W.dtype != out) W.resize(N, K, out);
+    const size_t n = static_cast<size_t>(N) * K;
+    if (n == 0) return;
+    const auto* q = static_cast<const uint8_t*>(Wq.data);
+    const auto* s = static_cast<const float*>(scales.data);
+    if (Wq.dtype == Dtype::INT8) launch_dequant<0>(q, s, K, n, out, W.data, cur_stream());
+    else launch_dequant<1>(q, s, K, n, out, W.data, cur_stream());
+    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+}
 
 void linear_forward_batched_wq_ex(const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& scales,
                                   const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X, int act,
@@ -381,6 +434,7 @@ void quantize_rows(const ::brotensor::Tensor& W, Dtype fmt, ::brotensor::Tensor&
 void fill_cuda_vtable_linear_wq(::brotensor::detail::OpsVTable& v) {
     v.linear_forward_batched_wq_ex = &linear_forward_batched_wq_ex;
     v.quantize_rows = &quantize_rows;
+    v.dequantize_rows = &dequantize_rows;
 }
 
 }  // namespace brotensor::detail::cuda

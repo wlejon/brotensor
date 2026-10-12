@@ -232,6 +232,8 @@ void quantize_rows(const ::brotensor::Tensor& W, ::brotensor::Dtype fmt, ::brote
 void linear_forward_batched_wq_ex(const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& scales,
                                   const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X, int act,
                                   int epilogue, ::brotensor::Tensor& Y);
+void dequantize_rows(const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& scales, ::brotensor::Dtype out,
+                     ::brotensor::Tensor& W);
 void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
                                          const ::brotensor::Tensor& gamma,
                                          const ::brotensor::Tensor* beta,
@@ -1349,6 +1351,7 @@ struct CpuStaticRegistrar {
         ops.segment_softmax_stats        = &detail::cpu::segment_softmax_stats;
         ops.linear_forward_batched_ex    = &detail::cpu::linear_forward_batched_ex;
         ops.quantize_rows                = &detail::cpu::quantize_rows;
+        ops.dequantize_rows              = &detail::cpu::dequantize_rows;
         ops.linear_forward_batched_wq_ex = &detail::cpu::linear_forward_batched_wq_ex;
         ops.flash_attention_qkvo_forward = &detail::cpu::flash_attention_qkvo_forward;
         ops.flash_attention_qkvo_backward

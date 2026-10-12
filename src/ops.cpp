@@ -2146,6 +2146,13 @@ void quantize_rows(const Tensor& W, Dtype fmt, Tensor& Wq, Tensor& scales) {
     v.quantize_rows(W, fmt, Wq, scales);
 }
 
+void dequantize_rows(const Tensor& Wq, const Tensor& scales, Dtype out, Tensor& W) {
+    const auto& v = detail::dispatch_with_opts(Wq, {&W});
+    if (!v.dequantize_rows) detail::throw_not_implemented("dequantize_rows", Wq.device);
+    detail::adopt_output(W, Wq.device);
+    v.dequantize_rows(Wq, scales, out, W);
+}
+
 void linear_forward_batched_wq_ex(const Tensor& Wq, const Tensor& scales, const Tensor* bias,
                                   const Tensor& X_BD, int act, int epilogue, Tensor& Y_BD) {
     const auto& v = detail::dispatch_with_opts(Wq, scales, {bias, &X_BD, &Y_BD});

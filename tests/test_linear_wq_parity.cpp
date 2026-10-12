@@ -152,4 +152,45 @@ BT_PARITY_TEST(slices_and_fallback) {
     check(2, 64, 1003, 0, kSwiglu, false, Dtype::FP8_E4M3, Dtype::FP32, 0x406);
 }
 
+// dequantize_rows: the GPU's FP32 output is the CPU's bit for bit (one FP32
+// multiply each), its BF16 / FP16 outputs that value rounded once, and a W
+// already of the right shape (a view into a scratch) is written in place.
+BT_PARITY_TEST(dequantize_rows) {
+    for (Dtype fmt : {Dtype::INT8, Dtype::FP8_E4M3}) {
+        SplitMix64 rng(0x501);
+        const int N = 97, K = 1003;   // n % 4 != 0: the last thread's tail
+        const Tensor W = rnd(N, K, rng, 0.08f, Dtype::BF16);
+        Tensor cq, cs;
+        brotensor::quantize_rows(W, fmt, cq, cs);
+        Tensor cw;
+        brotensor::dequantize_rows(cq, cs, Dtype::FP32, cw);
+        BT_CHECK(cw.rows == N && cw.cols == K && cw.dtype == Dtype::FP32);
+        Tensor gW = up(W, Dtype::BF16), gq, gs;
+        brotensor::quantize_rows(gW, fmt, gq, gs);
+        Tensor g32;
+        brotensor::dequantize_rows(gq, gs, Dtype::FP32, g32);
+        const Tensor h32 = download_to_host(g32);
+        BT_CHECK(std::memcmp(h32.data, cw.data, sizeof(float) * N * K) == 0);
+        for (Dtype dt : {Dtype::BF16, Dtype::FP16}) {
+            Tensor g16 = up(Tensor::mat(N, K), dt);   // pre-shaped: written in place
+            void* before = g16.data;
+            brotensor::dequantize_rows(gq, gs, dt, g16);
+            BT_CHECK(g16.data == before);
+            const Tensor h = down(g16, dt);
+            int bad = 0;
+            for (int i = 0; i < N * K; ++i) {
+                const float want = dt == Dtype::FP16 ? q16(cw.ptr()[i]) : qbf(cw.ptr()[i]);
+                if (h.ptr()[i] != want) {
+                    if (bad < 3)
+                        std::printf("        %s->%s [%d]: %.9g want %.9g (fp32 %.9g)\n",
+                                    fmt == Dtype::INT8 ? "int8" : "fp8", dt == Dtype::FP16 ? "fp16" : "bf16", i,
+                                    h.ptr()[i], want, cw.ptr()[i]);
+                    ++bad;
+                }
+            }
+            BT_CHECK(bad == 0);
+        }
+    }
+}
+
 int main() { return run_all("linear_forward_batched_wq_ex parity"); }

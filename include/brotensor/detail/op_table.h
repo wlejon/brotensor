@@ -478,6 +478,7 @@
     X(linear_forward_batched_int8w_fp16,       void,  (const ::brotensor::Tensor& W_int8, const ::brotensor::Tensor& scales,                                            \
                                                        const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD, ::brotensor::Tensor& Y_BD))                    \
     X(quantize_rows,                           void,  (const ::brotensor::Tensor& W, ::brotensor::Dtype fmt, ::brotensor::Tensor& Wq, ::brotensor::Tensor& scales))     \
+    X(dequantize_rows,                         void,  (const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& scales, ::brotensor::Dtype out, ::brotensor::Tensor& W)) \
     X(linear_forward_batched_wq_ex,            void,  (const ::brotensor::Tensor& Wq, const ::brotensor::Tensor& scales, const ::brotensor::Tensor* bias,                \
                                                        const ::brotensor::Tensor& X_BD, int act, int epilogue, ::brotensor::Tensor& Y_BD))                              \
     X(dequant_q4k_to_fp16,                    void,  (const ::brotensor::Tensor& W_q4k, ::brotensor::Tensor& W_fp16))                                                  \
