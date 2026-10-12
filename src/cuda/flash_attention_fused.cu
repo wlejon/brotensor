@@ -557,12 +557,16 @@ float* split_workspace(size_t floats, cudaStream_t stream) {
     cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
     BROTENSOR_CUDA_CHECK(cudaStreamIsCapturing(stream, &st));
     if (st != cudaStreamCaptureStatusNone) return nullptr;
-    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(stream));   // the old buffer may be in use
-    if (buf[dev]) BROTENSOR_CUDA_CHECK(cudaFree(buf[dev]));
+    // The old buffer is kept, not freed: a graph captured over it (a split
+    // launch of a smaller shape) still replays into it, and freeing it let a
+    // later allocation take the memory the graph writes (CUDA error 700, two
+    // stages after the capture). Growth is geometric, so what is kept stays
+    // under the current size.
+    const size_t want = floats > 2 * cap[dev] ? floats : 2 * cap[dev];
     buf[dev] = nullptr;
     cap[dev] = 0;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buf[dev]), floats * sizeof(float)));
-    cap[dev] = floats;
+    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buf[dev]), want * sizeof(float)));
+    cap[dev] = want;
     return buf[dev];
 }
 

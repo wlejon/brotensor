@@ -741,12 +741,16 @@ float* fad_split_workspace(size_t need_floats) {
                 "grow during CUDA graph capture — run the op once eagerly "
                 "(warm-up) before capturing");
         }
-        if (buf[dev] != nullptr) BROTENSOR_CUDA_CHECK(cudaFree(buf[dev]));
+        // The old buffer is kept, not freed: a graph captured over it (a
+        // decode step of a smaller cache) still replays into it; freeing it
+        // let a later allocation take memory the graph writes (CUDA error
+        // 700). Geometric growth keeps what is retired under the current size.
+        const size_t want = need_floats > 2 * cap_f[dev] ? need_floats : 2 * cap_f[dev];
         buf[dev]   = nullptr;
         cap_f[dev] = 0;
         BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buf[dev]),
-                                        need_floats * sizeof(float)));
-        cap_f[dev] = need_floats;
+                                        want * sizeof(float)));
+        cap_f[dev] = want;
     }
     return buf[dev];
 }
