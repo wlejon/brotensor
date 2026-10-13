@@ -248,6 +248,15 @@ void sync_all() {
     }
 }
 
+bool idle(Device d) {
+    d = detail::resolve_device_alias(d);
+    if (!detail::is_registered(d)) return true;
+    const auto& t = detail::alloc_for(d);
+    if (t.idle) return t.idle(d.index);
+    t.sync(d.index);
+    return true;
+}
+
 // ─── memory ────────────────────────────────────────────────────────────────
 
 bool device_mem_info(Device d, std::size_t& free_bytes,

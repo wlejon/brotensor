@@ -380,6 +380,7 @@ if(BROTENSOR_HAS_GPU)
     # tests with Vulkan as both the test GPU and the default device.
     if(BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_VULKAN)
         brotensor_add_test(brotensor_test_cuda_graph test_cuda_graph.cpp)
+        brotensor_add_test(brotensor_test_idle test_idle.cpp)
         brotensor_add_test(brotensor_test_graph_capture_alloc test_graph_capture_alloc.cpp)
         # Its last check compares device-wide free memory before and after
         # ten capture/destroy cycles, which another GPU test running at the
@@ -387,7 +388,7 @@ if(BROTENSOR_HAS_GPU)
         set_tests_properties(brotensor_test_graph_capture_alloc PROPERTIES RUN_SERIAL TRUE)
     endif()
     if(BROTENSOR_WITH_VULKAN)
-        foreach(_t brotensor_test_cuda_graph brotensor_test_graph_capture_alloc)
+        foreach(_t brotensor_test_cuda_graph brotensor_test_idle brotensor_test_graph_capture_alloc)
             add_test(NAME ${_t}_vulkan COMMAND ${_t})
             set_tests_properties(${_t}_vulkan PROPERTIES
                 ENVIRONMENT "BROTENSOR_TEST_GPU=vulkan;BROTENSOR_DEFAULT_DEVICE=vulkan")
@@ -405,7 +406,7 @@ endif()
 get_property(_bt_tests_after_gpu DIRECTORY PROPERTY TESTS)
 if(BROTENSOR_WITH_VULKAN AND (BROTENSOR_WITH_CUDA OR BROTENSOR_WITH_METAL))
     set(_bt_no_vulkan_rerun
-        brotensor_test_cuda_graph brotensor_test_graph_capture_alloc brotensor_test_ops_fused
+        brotensor_test_cuda_graph brotensor_test_idle brotensor_test_graph_capture_alloc brotensor_test_ops_fused
         brotensor_test_jit_trace_dtypes brotensor_test_streams brotensor_test_linear_rounding
         brotensor_test_linear_rounding_wmma brotensor_test_multigpu brotensor_test_cuda_jit
         brotensor_test_cuda_jit_gemv brotensor_test_cuda_graph_jit brotensor_test_cuda_jit_quant)

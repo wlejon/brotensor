@@ -97,6 +97,12 @@ void sync(Device d);
 // Sync every registered backend.
 void sync_all();
 
+// True when the work queued on `d`'s current stream has finished; never
+// waits. A host loop that must keep doing small host work (feeding audio)
+// while a long evaluation runs polls this instead of blocking in sync(). A
+// backend that cannot ask syncs and answers true; CPU is always idle.
+bool idle(Device d);
+
 // ─── Memory ────────────────────────────────────────────────────────────────
 //
 // Device-wide free/total memory in bytes for `d` (e.g. cudaMemGetInfo).

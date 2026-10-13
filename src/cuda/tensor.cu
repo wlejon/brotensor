@@ -268,6 +268,19 @@ bool cuda_mem_trim(std::size_t keep_bytes, int dev) {
     return true;
 }
 
+bool cuda_idle(int dev) {
+    dev = resolve_device_index(dev);
+    int prior = 0;
+    cudaGetDevice(&prior);
+    if (prior != dev) cudaSetDevice(dev);
+    auto s = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream(dev));
+    const cudaError_t e = cudaStreamQuery(s);
+    if (prior != dev) cudaSetDevice(prior);
+    if (e == cudaErrorNotReady) return false;
+    BROTENSOR_CUDA_CHECK(e);
+    return true;
+}
+
 const ::brotensor::detail::AllocVTable& cuda_alloc_table() {
     static const ::brotensor::detail::AllocVTable t = {
         &cuda_alloc,
@@ -281,6 +294,7 @@ const ::brotensor::detail::AllocVTable& cuda_alloc_table() {
         &cuda_mem_info,
         &cuda_mem_trim,
         &cuda_device_name,
+        &cuda_idle,
     };
     return t;
 }

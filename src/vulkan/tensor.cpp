@@ -250,6 +250,16 @@ bool vk_device_name(char* out, std::size_t cap, int dev) {
     return true;
 }
 
+bool vk_idle(int dev) {
+    if (dev < 0 || dev >= vulkan_device_count()) return true;
+    DeviceCtx* dp = device_if_created(dev);
+    if (!dp) return true;
+    auto& s = dp->stream();
+    if (s.capturing()) return true;
+    s.flush();   // an open batch would never finish unsubmitted
+    return s.completed() >= s.work_serial();
+}
+
 const ::brotensor::detail::AllocVTable& vulkan_alloc_table() {
     static const ::brotensor::detail::AllocVTable t = {
         &vk_alloc,
@@ -263,6 +273,7 @@ const ::brotensor::detail::AllocVTable& vulkan_alloc_table() {
         &vk_mem_info,
         &vk_mem_trim,
         &vk_device_name,
+        &vk_idle,
     };
     return t;
 }

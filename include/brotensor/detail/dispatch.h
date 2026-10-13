@@ -63,6 +63,10 @@ struct AllocVTable {
     // to `cap`). Serves brotensor::device_name(). Null when the backend can't
     // report (leaves the field null via aggregate value-init).
     bool  (*device_name)(char* out, std::size_t cap, int device_index);
+    // Optional: true when the work queued on the device's current stream has
+    // finished, without waiting (e.g. cudaStreamQuery). Serves
+    // brotensor::idle(); null makes idle() sync and answer true.
+    bool  (*idle)(int device_index);
 };
 
 // ─── Backend registration ──────────────────────────────────────────────────
