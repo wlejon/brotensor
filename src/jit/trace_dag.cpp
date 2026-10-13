@@ -27,6 +27,9 @@ const char* op_kind_name(TraceOpKind op) {
         case TraceOpKind::Tanh: return "Tanh";
         case TraceOpKind::Sigmoid: return "Sigmoid";
         case TraceOpKind::Copy: return "Copy";
+        case TraceOpKind::Where: return "Where";
+        case TraceOpKind::Clamp: return "Clamp";
+        case TraceOpKind::Cast: return "Cast";
     }
     return "Unknown";
 }
@@ -37,6 +40,9 @@ BroadcastKind broadcast_of(int node_rows, int node_cols, int rows, int cols) {
     }
     if (node_rows == 1 && node_cols == cols && rows != 1) {
         return BroadcastKind::Row;
+    }
+    if (node_rows == rows && node_cols == 1 && cols != 1) {
+        return BroadcastKind::Col;
     }
     // Anything else is addressed linearly. A node whose element count does not
     // match the dominant shape is rejected by the compiler before it gets
@@ -75,13 +81,15 @@ int TraceDAG::register_input(const Tensor& t) {
 }
 
 int TraceDAG::add_node(TraceOpKind op, const std::vector<int>& inputs, float scalar,
-                       void* buffer, const Device& dev, Dtype dt, int rows, int cols) {
+                       void* buffer, const Device& dev, Dtype dt, int rows, int cols,
+                       float scalar2) {
     int id = static_cast<int>(nodes_.size());
     TraceNode node;
     node.id = id;
     node.op = op;
     node.inputs = inputs;
     node.scalar = scalar;
+    node.scalar2 = scalar2;
     node.buffer = buffer;
     node.device = dev;
     node.dtype = dt;
@@ -95,15 +103,20 @@ int TraceDAG::add_node(TraceOpKind op, const std::vector<int>& inputs, float sca
 }
 
 int TraceDAG::add_inplace_node(TraceOpKind op, int target_slot, int arg_slot,
-                               void* buffer, float scalar) {
+                               void* buffer, float scalar, float scalar2) {
     int id = static_cast<int>(nodes_.size());
     const auto& target_node = nodes_.at(target_slot);
 
     TraceNode node;
     node.id = id;
     node.op = op;
-    node.inputs = {target_slot, arg_slot};
+    if (arg_slot >= 0) {
+        node.inputs = {target_slot, arg_slot};
+    } else {
+        node.inputs = {target_slot};
+    }
     node.scalar = scalar;
+    node.scalar2 = scalar2;
     node.buffer = buffer;
     node.device = target_node.device;
     node.dtype = target_node.dtype;
@@ -178,6 +191,10 @@ uint64_t TraceDAG::compute_hash() const {
         std::memcpy(&scalar_bits, &n.scalar, sizeof(float));
         hash_val(scalar_bits);
 
+        uint32_t scalar2_bits = 0;
+        std::memcpy(&scalar2_bits, &n.scalar2, sizeof(float));
+        hash_val(scalar2_bits);
+
         hash_val(n.inputs.size());
         for (int in_id : n.inputs) {
             hash_val(static_cast<uint64_t>(in_id));
@@ -203,6 +220,22 @@ namespace {
 // tensor can exist, so there is no static-initialisation order to get wrong.
 void slot_retarget(int slot, const Tensor* from, Tensor* to) {
     TraceContext::current().retarget(slot, from, to);
+}
+
+bool clamp_inplace_hook(Tensor& y, float lo, float hi) {
+    auto& ctx = TraceContext::current();
+    if (!ctx.is_active()) return false;
+    const int slot_y = ctx.get_or_register_slot(y);
+    ctx.record_inplace_op(TraceOpKind::Clamp, slot_y, -1, lo, y, hi);
+    return true;
+}
+
+bool cast_out_hook(const Tensor& src, Tensor& dst, Dtype out_dtype) {
+    auto& ctx = TraceContext::current();
+    if (!ctx.is_active()) return false;
+    const int slot_src = ctx.get_or_register_slot(src);
+    ctx.record_cast_out(slot_src, src, dst, out_dtype);
+    return true;
 }
 
 }  // namespace
@@ -238,6 +271,8 @@ void TraceContext::begin() {
         throw std::runtime_error("brotensor::jit: Nested begin_trace() calls are not permitted");
     }
     detail::jit_slot_retarget = &slot_retarget;
+    detail::jit_clamp_inplace_hook = &clamp_inplace_hook;
+    detail::jit_cast_out_hook = &cast_out_hook;
     dag_.reset();
     active_ptr_to_slot_.clear();
     release_tracked_();
@@ -330,9 +365,9 @@ int TraceContext::get_or_register_slot(const Tensor& t) {
 
 Tensor TraceContext::record_op(TraceOpKind op, const std::vector<int>& in_slots,
                                float scalar, const Device& dev, Dtype dt,
-                               int rows, int cols) {
+                               int rows, int cols, float scalar2) {
     const int slot = dag_.add_node(op, in_slots, scalar, /*buffer=*/nullptr,
-                                   dev, dt, rows, cols);
+                                   dev, dt, rows, cols, scalar2);
     Tensor out;
     out.device = dev;
     out.dtype = dt;
@@ -356,9 +391,23 @@ void TraceContext::record_store(int src_slot, const Tensor& dst) {
     active_ptr_to_slot_[dst.data] = slot;
 }
 
+void TraceContext::record_cast_out(int src_slot, const Tensor& src, Tensor& dst, Dtype out_dtype) {
+    if (dst.jit_slot < 0 && dst.data != nullptr && dst.device == src.device &&
+        dst.rows == src.rows && dst.cols == src.cols && dst.dtype == out_dtype) {
+        const int slot = dag_.add_node(TraceOpKind::Cast, {src_slot}, 0.0f, dst.data,
+                                       dst.device, out_dtype, dst.rows, dst.cols);
+        active_ptr_to_slot_[dst.data] = slot;
+        return;
+    }
+    dst = record_op(TraceOpKind::Cast, {src_slot}, 0.0f, src.device, out_dtype,
+                    src.rows, src.cols);
+}
+
 int TraceContext::record_inplace_op(TraceOpKind op, int target_slot, int arg_slot,
-                                    float scalar, Tensor& target_tensor) {
-    int slot = dag_.add_inplace_node(op, target_slot, arg_slot, target_tensor.data, scalar);
+                                    float scalar, Tensor& target_tensor,
+                                    float scalar2) {
+    int slot = dag_.add_inplace_node(op, target_slot, arg_slot, target_tensor.data,
+                                     scalar, scalar2);
     if (target_tensor.jit_slot >= 0) {
         // In-place on a traced intermediate: it has no buffer, and from here
         // on it stands for the node this op just produced.

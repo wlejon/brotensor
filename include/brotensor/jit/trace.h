@@ -167,6 +167,22 @@ Tensor rms_norm(const Tensor& x, const Tensor& gamma = Tensor(), float eps = 1e-
 Tensor layernorm(const Tensor& x, const Tensor& gamma = Tensor(), const Tensor& beta = Tensor(), float eps = 1e-5f);
 Tensor modulate(const Tensor& x, const Tensor& scale, const Tensor& shift);
 
+// Elementwise conditional selection: cond != 0 ? a : b (supports full, row,
+// col, and scalar broadcast operands in trace mode).
+Tensor where(const Tensor& cond, const Tensor& a, const Tensor& b);
+inline Tensor select(const Tensor& cond, const Tensor& a, const Tensor& b) {
+    return where(cond, a, b);
+}
+
+// Functional elementwise clamp to [lo, hi]. Note: in-place `clamp(Tensor& y, lo, hi)`
+// from <brotensor/ops/elementwise.h> also records a Clamp node when tracing is active.
+Tensor clamp(const Tensor& x, float lo, float hi);
+inline Tensor clip(const Tensor& x, float lo, float hi) { return clamp(x, lo, hi); }
+
+// Functional dtype conversion to `out_dtype` (FP32 / FP16 / BF16). Note: 3-arg
+// `cast(src, dst, out_dtype)` also records a Cast + store when tracing is active.
+Tensor cast(const Tensor& x, Dtype out_dtype);
+
 // Writes `src` into `dst`'s existing buffer. Under a trace this is what makes
 // an expression land somewhere the caller already owns — a preallocated
 // scratch tensor, or a row view into a larger one — instead of in a buffer the
@@ -200,4 +216,9 @@ using jit::sigmoid;
 using jit::rms_norm;
 using jit::layernorm;
 using jit::modulate;
+using jit::where;
+using jit::select;
+using jit::clamp;
+using jit::clip;
+using jit::cast;
 } // namespace brotensor

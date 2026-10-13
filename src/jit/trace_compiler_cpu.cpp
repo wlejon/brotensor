@@ -137,7 +137,9 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
     // one fused call through brass's host codegen.
     if (handle->launch_count == 0) handle->launch_count = 1;
     if (!is_cuda && !is_vulkan) {
-        handle->fusion_name = "cpu-avx2-fused";
+        if (handle->fusion_name == nullptr || handle->fusion_name[0] == '\0') {
+            handle->fusion_name = "cpu-avx2-fused";
+        }
         handle->compile_us = std::chrono::duration<double, std::micro>(
                                  std::chrono::steady_clock::now() - compile_t0).count();
     }
@@ -172,15 +174,23 @@ using ElementwiseFn = void (*)(float* const* out_ptrs, const float* const* in_pt
 static void require_cpu_fusable(const TraceDAG& dag) {
     int rows = 0, cols = 0;
     dag.dominant_shape(rows, cols);
+    const int64_t dom_numel = static_cast<int64_t>(rows) * cols;
     for (const TraceNode& n : dag.nodes()) {
         if (n.dtype != Dtype::FP32) {
             throw std::runtime_error(
                 "brotensor::jit: the CPU trace compiler is FP32 only");
         }
-        if (n.rows != rows || n.cols != cols) {
+        const BroadcastKind bk = broadcast_of(n.rows, n.cols, rows, cols);
+        const int64_t numel = static_cast<int64_t>(n.rows) * n.cols;
+        if (bk == BroadcastKind::Full && numel != dom_numel) {
             throw std::runtime_error(
-                "brotensor::jit: the CPU trace compiler has no broadcast form — "
-                "every operand must be the trace's full (rows, cols) shape");
+                "brotensor::jit: operand shape (" + std::to_string(n.rows) + ", " +
+                std::to_string(n.cols) + ") cannot broadcast to dominant shape (" +
+                std::to_string(rows) + ", " + std::to_string(cols) + ")");
+        }
+        if (n.is_live_at_end && bk != BroadcastKind::Full) {
+            throw std::runtime_error(
+                "brotensor::jit: a traced output must have the trace's full (rows, cols) shape");
         }
     }
 }
@@ -204,15 +214,32 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
     require_cpu_fusable(dag);
     const auto& nodes = dag.nodes();
 
+    int dom_rows = 0, dom_cols = 0;
+    dag.dominant_shape(dom_rows, dom_cols);
+
     std::vector<int> input_node_ids;
+    std::vector<BroadcastKind> input_bcast;
     std::vector<int> output_node_ids;
     std::unordered_map<int, int> node_to_in_idx;
     std::unordered_map<int, int> node_to_out_idx;
+
+    bool any_bcast = false;
+    bool any_row_bcast = false;
+    bool any_col_bcast = false;
+    bool has_where = false;
 
     for (const auto& n : nodes) {
         if (n.op == TraceOpKind::Input) {
             node_to_in_idx[n.id] = static_cast<int>(input_node_ids.size());
             input_node_ids.push_back(n.id);
+            const BroadcastKind bk = broadcast_of(n.rows, n.cols, dom_rows, dom_cols);
+            input_bcast.push_back(bk);
+            if (bk != BroadcastKind::Full) any_bcast = true;
+            if (bk == BroadcastKind::Row) any_row_bcast = true;
+            if (bk == BroadcastKind::Col) any_col_bcast = true;
+        }
+        if (n.op == TraceOpKind::Where) {
+            has_where = true;
         }
         if (n.is_live_at_end) {
             node_to_out_idx[n.id] = static_cast<int>(output_node_ids.size());
@@ -220,14 +247,8 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
         }
     }
 
-    int64_t total_numel = 0;
-    if (!output_node_ids.empty()) {
-        const auto& out_node = nodes[output_node_ids[0]];
-        total_numel = static_cast<int64_t>(out_node.rows) * static_cast<int64_t>(out_node.cols);
-    } else if (!input_node_ids.empty()) {
-        const auto& in_node = nodes[input_node_ids[0]];
-        total_numel = static_cast<int64_t>(in_node.rows) * static_cast<int64_t>(in_node.cols);
-    }
+    const int64_t total_numel = static_cast<int64_t>(dom_rows) * static_cast<int64_t>(dom_cols);
+    const bool use_vec_loop = !any_row_bcast && !any_col_bcast && !has_where;
 
     using namespace brass;
     using namespace brass::codegen;
@@ -249,8 +270,6 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
     Value* p_in_ptrs = tb.builder().add_block_param(entry, Type::ptr());
     Value* n_val = tb.builder().add_block_param(entry, Type::i64());
 
-    BasicBlock* vhead = tb.builder().create_block("vhead");
-    BasicBlock* vbody = tb.builder().create_block("vbody");
     BasicBlock* shead = tb.builder().create_block("shead");
     BasicBlock* sbody = tb.builder().create_block("sbody");
     BasicBlock* exit_bb = tb.builder().create_block("exit");
@@ -271,96 +290,114 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
 
     Value* zero_i64 = tb.builder().build_iconst_i64(0);
     Value* one_i64 = tb.builder().build_iconst_i64(1);
-    Value* two_i64 = tb.builder().build_iconst_i64(2);
-    Value* eight_i64 = tb.builder().build_iconst_i64(8);
-    Value* mask_eight = tb.builder().build_iconst_i64(~int64_t(7));
-    Value* vec_n = tb.builder().build_and(n_val, mask_eight);
-    Value* has_vec = tb.builder().build_sge(n_val, eight_i64);
 
-    tb.builder().build_br_if(has_vec, vhead, {zero_i64}, shead, {zero_i64});
+    if (use_vec_loop) {
+        BasicBlock* vhead = tb.builder().create_block("vhead");
+        BasicBlock* vbody = tb.builder().create_block("vbody");
 
-    // ── Vector AVX2 Loop (8-wide) ─────────────────────────────────────────────
-    fn->append_block(vhead);
-    Value* iv_v = tb.builder().add_block_param(vhead, Type::i64());
-    tb.position_at_end(vhead);
-    Value* cond_v = tb.builder().build_slt(iv_v, vec_n);
-    tb.builder().build_br_if(cond_v, vbody, {}, shead, {iv_v});
+        Value* two_i64 = tb.builder().build_iconst_i64(2);
+        Value* eight_i64 = tb.builder().build_iconst_i64(8);
+        Value* mask_eight = tb.builder().build_iconst_i64(~int64_t(7));
+        Value* vec_n = tb.builder().build_and(n_val, mask_eight);
+        Value* has_vec = tb.builder().build_sge(n_val, eight_i64);
 
-    fn->append_block(vbody);
-    tb.position_at_end(vbody);
-    Value* byte_off_v = tb.builder().build_shl(iv_v, two_i64);
+        tb.builder().build_br_if(has_vec, vhead, {zero_i64}, shead, {zero_i64});
 
-    std::unordered_map<int, Value*> v_node_vals;
-    for (size_t k = 0; k < input_node_ids.size(); ++k) {
-        int nid = input_node_ids[k];
-        Value* addr = tb.builder().build_add(in_ptrs_val[k], byte_off_v);
-        v_node_vals[nid] = tb.vload_f32x8(addr);
+        // ── Vector AVX2 Loop (8-wide) ─────────────────────────────────────────
+        fn->append_block(vhead);
+        Value* iv_v = tb.builder().add_block_param(vhead, Type::i64());
+        tb.position_at_end(vhead);
+        Value* cond_v = tb.builder().build_slt(iv_v, vec_n);
+        tb.builder().build_br_if(cond_v, vbody, {}, shead, {iv_v});
+
+        fn->append_block(vbody);
+        tb.position_at_end(vbody);
+        Value* byte_off_v = tb.builder().build_shl(iv_v, two_i64);
+
+        std::unordered_map<int, Value*> v_node_vals;
+        for (size_t k = 0; k < input_node_ids.size(); ++k) {
+            int nid = input_node_ids[k];
+            if (input_bcast[k] == BroadcastKind::Scalar) {
+                Value* sv = tb.load_f32(in_ptrs_val[k], 0);
+                v_node_vals[nid] = tb.vbroadcast(Type::f32x8(), sv);
+            } else {
+                Value* addr = tb.builder().build_add(in_ptrs_val[k], byte_off_v);
+                v_node_vals[nid] = tb.vload_f32x8(addr);
+            }
+        }
+
+        for (const auto& n : nodes) {
+            if (n.op == TraceOpKind::Input) continue;
+
+            Value* res = nullptr;
+            if (n.op == TraceOpKind::Add) {
+                res = tb.vadd(v_node_vals[n.inputs[0]], v_node_vals[n.inputs[1]]);
+            } else if (n.op == TraceOpKind::Sub) {
+                res = tb.vsub(v_node_vals[n.inputs[0]], v_node_vals[n.inputs[1]]);
+            } else if (n.op == TraceOpKind::Mul) {
+                res = tb.vmul(v_node_vals[n.inputs[0]], v_node_vals[n.inputs[1]]);
+            } else if (n.op == TraceOpKind::Div) {
+                res = tb.vdiv(v_node_vals[n.inputs[0]], v_node_vals[n.inputs[1]]);
+            } else if (n.op == TraceOpKind::AddScalar) {
+                Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
+                res = tb.vadd(v_node_vals[n.inputs[0]], c);
+            } else if (n.op == TraceOpKind::SubScalar) {
+                Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
+                res = tb.vsub(v_node_vals[n.inputs[0]], c);
+            } else if (n.op == TraceOpKind::MulScalar) {
+                Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
+                res = tb.vmul(v_node_vals[n.inputs[0]], c);
+            } else if (n.op == TraceOpKind::DivScalar) {
+                Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
+                res = tb.vdiv(v_node_vals[n.inputs[0]], c);
+            } else if (n.op == TraceOpKind::ScalarSub) {
+                Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
+                res = tb.vsub(c, v_node_vals[n.inputs[0]]);
+            } else if (n.op == TraceOpKind::ScalarDiv) {
+                Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
+                res = tb.vdiv(c, v_node_vals[n.inputs[0]]);
+            } else if (n.op == TraceOpKind::FMA) {
+                res = tb.vfma(v_node_vals[n.inputs[0]], v_node_vals[n.inputs[1]], v_node_vals[n.inputs[2]]);
+            } else if (n.op == TraceOpKind::Modulate) {
+                Value* c1 = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(1.0f));
+                res = tb.vfma(v_node_vals[n.inputs[0]], tb.vadd(v_node_vals[n.inputs[1]], c1), v_node_vals[n.inputs[2]]);
+            } else if (n.op == TraceOpKind::Clamp) {
+                Value* lo_v = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
+                Value* hi_v = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar2));
+                res = tb.vmin(tb.vmax(v_node_vals[n.inputs[0]], lo_v), hi_v);
+            } else if (n.op == TraceOpKind::SiLU) {
+                res = tb.vsilu_f32x8(v_node_vals[n.inputs[0]]);
+            } else if (n.op == TraceOpKind::GELU) {
+                res = tb.vgelu_f32x8(v_node_vals[n.inputs[0]]);
+            } else if (n.op == TraceOpKind::ReLU) {
+                res = tb.vrelu_f32x8(v_node_vals[n.inputs[0]]);
+            } else if (n.op == TraceOpKind::Tanh) {
+                res = tb.vtanh_f32x8(v_node_vals[n.inputs[0]]);
+            } else if (n.op == TraceOpKind::Sigmoid) {
+                res = tb.vsigmoid_f32x8(v_node_vals[n.inputs[0]]);
+            } else if (n.op == TraceOpKind::Copy || n.op == TraceOpKind::Cast) {
+                res = v_node_vals[n.inputs[0]];
+            } else {
+                throw std::runtime_error(
+                    std::string("brotensor::jit: op '") + op_kind_name(n.op) +
+                    "' has no CPU elementwise form");
+            }
+            v_node_vals[n.id] = res;
+
+            if (n.is_live_at_end) {
+                int out_idx = node_to_out_idx[n.id];
+                Value* addr = tb.builder().build_add(out_ptrs_val[out_idx], byte_off_v);
+                tb.vstore_f32x8(addr, res);
+            }
+        }
+
+        Value* next_iv_v = tb.builder().build_add(iv_v, eight_i64);
+        tb.builder().build_br(vhead, {next_iv_v});
+    } else {
+        tb.builder().build_br(shead, {zero_i64});
     }
 
-    for (const auto& n : nodes) {
-        if (n.op == TraceOpKind::Input) continue;
-
-        Value* res = nullptr;
-        if (n.op == TraceOpKind::Add) {
-            res = tb.vadd(v_node_vals[n.inputs[0]], v_node_vals[n.inputs[1]]);
-        } else if (n.op == TraceOpKind::Sub) {
-            res = tb.vsub(v_node_vals[n.inputs[0]], v_node_vals[n.inputs[1]]);
-        } else if (n.op == TraceOpKind::Mul) {
-            res = tb.vmul(v_node_vals[n.inputs[0]], v_node_vals[n.inputs[1]]);
-        } else if (n.op == TraceOpKind::Div) {
-            res = tb.vdiv(v_node_vals[n.inputs[0]], v_node_vals[n.inputs[1]]);
-        } else if (n.op == TraceOpKind::AddScalar) {
-            Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
-            res = tb.vadd(v_node_vals[n.inputs[0]], c);
-        } else if (n.op == TraceOpKind::SubScalar) {
-            Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
-            res = tb.vsub(v_node_vals[n.inputs[0]], c);
-        } else if (n.op == TraceOpKind::MulScalar) {
-            Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
-            res = tb.vmul(v_node_vals[n.inputs[0]], c);
-        } else if (n.op == TraceOpKind::DivScalar) {
-            Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
-            res = tb.vdiv(v_node_vals[n.inputs[0]], c);
-        } else if (n.op == TraceOpKind::ScalarSub) {
-            Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
-            res = tb.vsub(c, v_node_vals[n.inputs[0]]);
-        } else if (n.op == TraceOpKind::ScalarDiv) {
-            Value* c = tb.vbroadcast(Type::f32x8(), tb.builder().build_fconst_f32(n.scalar));
-            res = tb.vdiv(c, v_node_vals[n.inputs[0]]);
-        } else if (n.op == TraceOpKind::FMA) {
-            res = tb.vfma(v_node_vals[n.inputs[0]], v_node_vals[n.inputs[1]], v_node_vals[n.inputs[2]]);
-        } else if (n.op == TraceOpKind::SiLU) {
-            res = tb.vsilu_f32x8(v_node_vals[n.inputs[0]]);
-        } else if (n.op == TraceOpKind::GELU) {
-            res = tb.vgelu_f32x8(v_node_vals[n.inputs[0]]);
-        } else if (n.op == TraceOpKind::ReLU) {
-            res = tb.vrelu_f32x8(v_node_vals[n.inputs[0]]);
-        } else if (n.op == TraceOpKind::Tanh) {
-            res = tb.vtanh_f32x8(v_node_vals[n.inputs[0]]);
-        } else if (n.op == TraceOpKind::Sigmoid) {
-            res = tb.vsigmoid_f32x8(v_node_vals[n.inputs[0]]);
-        } else if (n.op == TraceOpKind::Copy) {
-            // The node exists so the store lands in the caller's buffer; the
-            // value is already the one to write.
-            res = v_node_vals[n.inputs[0]];
-        } else {
-            throw std::runtime_error(
-                std::string("brotensor::jit: op '") + op_kind_name(n.op) +
-                "' has no CPU elementwise form");
-        }
-        v_node_vals[n.id] = res;
-
-        if (n.is_live_at_end) {
-            int out_idx = node_to_out_idx[n.id];
-            Value* addr = tb.builder().build_add(out_ptrs_val[out_idx], byte_off_v);
-            tb.vstore_f32x8(addr, res);
-        }
-    }
-
-    Value* next_iv_v = tb.builder().build_add(iv_v, eight_i64);
-    tb.builder().build_br(vhead, {next_iv_v});
-
-    // ── Scalar Remainder Loop ────────────────────────────────────────────────
+    // ── Scalar Loop ──────────────────────────────────────────────────────────
     fn->append_block(shead);
     Value* iv_s = tb.builder().add_block_param(shead, Type::i64());
     tb.position_at_end(shead);
@@ -370,10 +407,24 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
     fn->append_block(sbody);
     tb.position_at_end(sbody);
 
+    Value* cols_i64 = (any_row_bcast || any_col_bcast)
+                          ? tb.builder().build_iconst_i64(dom_cols)
+                          : nullptr;
+    Value* col_s = any_row_bcast ? tb.builder().build_umod(iv_s, cols_i64) : nullptr;
+    Value* row_s = any_col_bcast ? tb.builder().build_udiv(iv_s, cols_i64) : nullptr;
+
     std::unordered_map<int, Value*> s_node_vals;
     for (size_t k = 0; k < input_node_ids.size(); ++k) {
         int nid = input_node_ids[k];
-        s_node_vals[nid] = tb.load_f32_indexed(in_ptrs_val[k], iv_s, 4, 0);
+        if (input_bcast[k] == BroadcastKind::Scalar) {
+            s_node_vals[nid] = tb.load_f32(in_ptrs_val[k], 0);
+        } else if (input_bcast[k] == BroadcastKind::Row) {
+            s_node_vals[nid] = tb.load_f32_indexed(in_ptrs_val[k], col_s, 4, 0);
+        } else if (input_bcast[k] == BroadcastKind::Col) {
+            s_node_vals[nid] = tb.load_f32_indexed(in_ptrs_val[k], row_s, 4, 0);
+        } else {
+            s_node_vals[nid] = tb.load_f32_indexed(in_ptrs_val[k], iv_s, 4, 0);
+        }
     }
 
     for (const auto& n : nodes) {
@@ -408,6 +459,19 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
             res = tb.div(c, s_node_vals[n.inputs[0]]);
         } else if (n.op == TraceOpKind::FMA) {
             res = tb.fma(s_node_vals[n.inputs[0]], s_node_vals[n.inputs[1]], s_node_vals[n.inputs[2]]);
+        } else if (n.op == TraceOpKind::Modulate) {
+            Value* c1 = tb.builder().build_fconst_f32(1.0f);
+            res = tb.fma(s_node_vals[n.inputs[0]], tb.add(s_node_vals[n.inputs[1]], c1), s_node_vals[n.inputs[2]]);
+        } else if (n.op == TraceOpKind::Clamp) {
+            Value* lo_c = tb.builder().build_fconst_f32(n.scalar);
+            Value* hi_c = tb.builder().build_fconst_f32(n.scalar2);
+            res = tb.builder().build_fmin_f32(
+                tb.builder().build_fmax_f32(s_node_vals[n.inputs[0]], lo_c), hi_c);
+        } else if (n.op == TraceOpKind::Where) {
+            Value* c_bits = tb.builder().build_bitcast_i32_f32(s_node_vals[n.inputs[0]]);
+            Value* mag_bits = tb.builder().build_and(c_bits, tb.builder().build_iconst_i32(0x7FFFFFFF));
+            Value* nz = tb.builder().build_ne(mag_bits, tb.builder().build_iconst_i32(0));
+            res = tb.builder().build_select(nz, s_node_vals[n.inputs[1]], s_node_vals[n.inputs[2]]);
         } else if (n.op == TraceOpKind::SiLU) {
             res = tb.silu_f32(s_node_vals[n.inputs[0]]);
         } else if (n.op == TraceOpKind::GELU) {
@@ -418,7 +482,7 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
             res = tb.tanh_f32(s_node_vals[n.inputs[0]]);
         } else if (n.op == TraceOpKind::Sigmoid) {
             res = tb.sigmoid_f32(s_node_vals[n.inputs[0]]);
-        } else if (n.op == TraceOpKind::Copy) {
+        } else if (n.op == TraceOpKind::Copy || n.op == TraceOpKind::Cast) {
             res = s_node_vals[n.inputs[0]];
         } else {
             throw std::runtime_error(
@@ -455,7 +519,7 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
     auto kernel_ptr = kfn.as<ElementwiseFn>();
     auto engine_ref = kfn.engine();
 
-    auto make_bound_handle = [kernel_ptr, engine_ref, total_numel, input_node_ids, output_node_ids]
+    auto make_bound_handle = [kernel_ptr, engine_ref, total_numel, any_bcast, input_node_ids, output_node_ids]
                              (const std::vector<void*>& in_buffers, const std::vector<void*>& out_buffers) {
         auto h = std::make_shared<TraceHandleImpl>();
 
@@ -464,8 +528,8 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
         std::vector<float*> out_f(out_buffers.size());
         for (size_t m = 0; m < out_buffers.size(); ++m) out_f[m] = static_cast<float*>(out_buffers[m]);
 
-        h->execute_fn = [kernel_ptr, engine_ref, total_numel, in_f, out_f]() {
-            if (total_numel >= 262144) {
+        h->execute_fn = [kernel_ptr, engine_ref, total_numel, any_bcast, in_f, out_f]() {
+            if (!any_bcast && total_numel >= 262144) {
                 auto& pool = detail::cpu::ThreadPool::instance();
                 int n_threads = pool.num_threads();
                 int64_t chunk = (total_numel + n_threads - 1) / n_threads;
@@ -511,6 +575,12 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
     const auto& nodes = dag.nodes();
     require_host_addressable(dag);
 
+    for (const auto& n : nodes) {
+        if (n.dtype != Dtype::FP32) {
+            return eager::compile_eager(dag);
+        }
+    }
+
     if (pattern == FusionPattern::ResidualRMSNorm) {
         const TraceNode* node_rms = nullptr;
         const TraceNode* node_add = nullptr;
@@ -521,10 +591,10 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
             if (n.op != TraceOpKind::RMSNorm || n.inputs.empty()) continue;
             const TraceNode& add = nodes[n.inputs[0]];
             // The hand kernel below is exactly `x += res; rms_norm(x, gamma)`.
-            // Anything else — no residual, no gain — is not this pattern, and
-            // reading its operands as if it were would be a crash.
+            // Anything else — no residual, no gain, or downstream ops — is not
+            // this pattern.
             if (add.op != TraceOpKind::Add || add.inputs.size() < 2) continue;
-            if (n.inputs.size() < 2) continue;
+            if (n.inputs.size() < 2 || !n.outputs.empty()) continue;
             node_rms = &n;
             node_add = &add;
             node_res = &nodes[add.inputs[1]];
@@ -649,6 +719,12 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
                 return make_handle(x, g, b, sc, sh, y);
             };
             return handle;
+        }
+    }
+
+    for (const auto& n : nodes) {
+        if (n.op == TraceOpKind::RMSNorm || n.op == TraceOpKind::LayerNorm) {
+            return eager::compile_eager(dag);
         }
     }
 

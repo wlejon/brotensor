@@ -30,19 +30,22 @@ enum class TraceOpKind : uint8_t {
     Modulate,
     Tanh,
     Sigmoid,
-    Copy
+    Copy,
+    Where,
+    Clamp,
+    Cast
 };
 
 const char* op_kind_name(TraceOpKind op);
 
 // How a node's buffer maps onto the trace's dominant (rows, cols) shape.
 //
-// Row and Scalar are the broadcast forms the DiT modulation surfaces need: a
-// (1, D) gate or scale row multiplied against an (N, D) activation, and a
-// (1, 1) scalar. The emitters turn these into a different address computation
-// for that operand, not into a materialised expansion — a broadcast operand
-// contributes D (or 1) elements of traffic, not N*D.
-enum class BroadcastKind : uint8_t { Full = 0, Row = 1, Scalar = 2 };
+// Row, Col and Scalar are the broadcast forms: a (1, D) row, a (R, 1) column,
+// or a (1, 1) scalar combined against an (R, D) activation. The emitters turn
+// these into a different address computation for that operand, not into a
+// materialised expansion — a broadcast operand contributes D, R, or 1 elements
+// of traffic, not R*D.
+enum class BroadcastKind : uint8_t { Full = 0, Row = 1, Scalar = 2, Col = 3 };
 
 BroadcastKind broadcast_of(int node_rows, int node_cols, int rows, int cols);
 
@@ -52,6 +55,7 @@ struct TraceNode {
     std::vector<int> inputs;
     std::vector<int> outputs; // consumer node indices
     float scalar = 0.0f;
+    float scalar2 = 0.0f;
     // Destination or input data pointer — and null for every node the fused
     // kernel evaluates in registers and never spills.
     //
@@ -81,16 +85,17 @@ public:
     int register_input(const Tensor& t);
     int add_node(TraceOpKind op, const std::vector<int>& inputs, float scalar = 0.0f,
                  void* buffer = nullptr, const Device& dev = Device::CPU,
-                 Dtype dt = Dtype::FP32, int rows = 0, int cols = 0);
+                 Dtype dt = Dtype::FP32, int rows = 0, int cols = 0,
+                 float scalar2 = 0.0f);
     int add_inplace_node(TraceOpKind op, int target_slot, int arg_slot,
-                         void* buffer, float scalar = 0.0f);
+                         void* buffer, float scalar = 0.0f, float scalar2 = 0.0f);
 
     void analyze_liveness();
     uint64_t compute_hash() const;
 
     // The trace's dominant shape: the largest (rows * cols) any node carries.
-    // Every non-broadcast node must match it; (1, cols) and (1, 1) nodes are
-    // broadcast operands.
+    // Every non-broadcast node must match it; (1, cols), (rows, 1), and (1, 1)
+    // nodes are broadcast operands.
     void dominant_shape(int& rows, int& cols) const;
 
     const std::vector<TraceNode>& nodes() const noexcept { return nodes_; }
@@ -145,13 +150,17 @@ public:
 
     // Records `op` and returns the symbolic Tensor standing for its result.
     Tensor record_op(TraceOpKind op, const std::vector<int>& in_slots, float scalar,
-                     const Device& dev, Dtype dt, int rows, int cols);
+                     const Device& dev, Dtype dt, int rows, int cols,
+                     float scalar2 = 0.0f);
 
     // Records a Copy into `dst`, a buffer the caller already owns.
     void record_store(int src_slot, const Tensor& dst);
 
+    // Records a 3-arg cast(src, dst, out_dtype) into `dst`.
+    void record_cast_out(int src_slot, const Tensor& src, Tensor& dst, Dtype out_dtype);
+
     int record_inplace_op(TraceOpKind op, int target_slot, int arg_slot, float scalar,
-                          Tensor& target_tensor);
+                          Tensor& target_tensor, float scalar2 = 0.0f);
 
     // Tensor lifetime callback: the symbolic Tensor for `slot` moved from
     // `from` to `to`, or was destroyed (`to` == nullptr). Never throws and

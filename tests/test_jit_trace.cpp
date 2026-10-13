@@ -610,9 +610,103 @@ void test_eager_div_modulate(Device dev) {
     (void)h;
 }
 
+// ── Test 8: where / select, clamp / clip, (R, 1) column broadcast, and cast ─
+void test_where_clamp_col_bcast_cast(Device dev) {
+    const std::string dn = device_label(dev);
+    std::printf("\n--- Test 8: where / clamp / col-broadcast / cast on %s ---\n", dn.c_str());
+
+    const int R = 64;
+    const int C = 128;
+    const int N = R * C;
+
+    std::vector<float> h_a(N), h_b(N), h_cond(N), h_col(R), h_row(C);
+    fill_random(h_a, 8001, 2.0f);
+    fill_random(h_b, 8002, 2.0f);
+    fill_random(h_cond, 8003, 1.0f);
+    fill_random(h_col, 8004, 0.5f);
+    fill_random(h_row, 8005, 0.5f);
+    // Make h_cond cleanly non-zero or zero
+    for (int i = 0; i < N; ++i) h_cond[i] = (i % 3 == 0) ? 0.0f : 1.0f;
+
+    Tensor a = Tensor::from_host_on(dev, h_a.data(), R, C);
+    Tensor b = Tensor::from_host_on(dev, h_b.data(), R, C);
+    Tensor cond = Tensor::from_host_on(dev, h_cond.data(), R, C);
+    Tensor col_bias = Tensor::from_host_on(dev, h_col.data(), R, 1);
+    Tensor row_scale = Tensor::from_host_on(dev, h_row.data(), 1, C);
+
+    const float lo = -0.8f;
+    const float hi = 0.9f;
+
+    std::vector<float> ref(N);
+    for (int r = 0; r < R; ++r) {
+        for (int c = 0; c < C; ++c) {
+            int idx = r * C + c;
+            float v = h_a[idx] * h_row[c] + h_col[r];
+            float cl = std::fmin(std::fmax(v, lo), hi);
+            ref[idx] = (h_cond[idx] != 0.0f) ? cl : h_b[idx];
+        }
+    }
+
+    begin_trace();
+    Tensor out = select(cond, clamp(a * row_scale + col_bias, lo, hi), b);
+    TraceHandle h = end_trace();
+    brotensor::sync(dev);
+
+    CHECK_PARITY(max_abs_diff(out.to_host_vector(), ref), 1e-5f,
+                 (dn + " traced select(cond, clamp(a*row + col, lo, hi), b)").c_str());
+    check_one_launch(dev, h, dn + " select+clamp+col_bcast");
+
+    // In-place brotensor::clamp(y, lo, hi) inside a trace
+    Tensor y = a.clone();
+    begin_trace();
+    y += col_bias;
+    brotensor::clamp(y, lo, hi);
+    TraceHandle h_inplace = end_trace();
+    brotensor::sync(dev);
+
+    std::vector<float> ref_y(N);
+    for (int r = 0; r < R; ++r) {
+        for (int c = 0; c < C; ++c) {
+            float v = h_a[r * C + c] + h_col[r];
+            ref_y[r * C + c] = std::fmin(std::fmax(v, lo), hi);
+        }
+    }
+    CHECK_PARITY(max_abs_diff(y.to_host_vector(), ref_y), 1e-5f,
+                 (dn + " traced in-place clamp(y, lo, hi)").c_str());
+    check_one_launch(dev, h_inplace, dn + " in-place clamp");
+
+    // Traced cast: FP32 -> BF16 (functional jit::cast) and BF16 -> FP32 (3-arg brotensor::cast)
+    begin_trace();
+    Tensor as_bf16 = jit::cast(a + col_bias, Dtype::BF16);
+    TraceHandle h_cast_to = end_trace();
+    brotensor::sync(dev);
+    CHECK_TRUE(as_bf16.dtype == Dtype::BF16, (dn + " jit::cast output dtype is BF16").c_str());
+
+    Tensor back_f32;
+    begin_trace();
+    brotensor::cast(as_bf16, back_f32, Dtype::FP32);
+    TraceHandle h_cast_back = end_trace();
+    brotensor::sync(dev);
+
+    std::vector<float> ref_cast(N);
+    for (int r = 0; r < R; ++r) {
+        for (int c = 0; c < C; ++c) {
+            float v = h_a[r * C + c] + h_col[r];
+            ref_cast[r * C + c] = bf16_bits_to_fp32(fp32_to_bf16_bits(v));
+        }
+    }
+    CHECK_PARITY(max_abs_diff(back_f32.to_host_vector(), ref_cast), 1e-4f,
+                 (dn + " traced cast FP32 -> BF16 -> FP32").c_str());
+    if (!dev.is_cpu()) {
+        check_one_launch(dev, h_cast_to, dn + " cast FP32->BF16");
+        check_one_launch(dev, h_cast_back, dn + " cast BF16->FP32");
+    }
+}
+
 } // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     brotensor::init();
 
     std::printf("================================================================================\n");
@@ -630,6 +724,7 @@ int main() {
     test_layernorm_modulate(Device::cpu());
     test_cache_hit_and_speedup(Device::cpu());
     test_trace_allocates_nothing(Device::cpu());
+    test_where_clamp_col_bcast_cast(Device::cpu());
 
     // Run CUDA test suite if CUDA device is available
     if (brotensor::is_available(Device::cuda())) {
@@ -639,6 +734,7 @@ int main() {
         test_layernorm_modulate(Device::cuda());
         test_cache_hit_and_speedup(Device::cuda());
         test_trace_allocates_nothing(Device::cuda());
+        test_where_clamp_col_bcast_cast(Device::cuda());
     } else {
         std::printf("\n[SKIP] CUDA device not available or not detected; skipping CUDA tests.\n");
     }
@@ -655,6 +751,7 @@ int main() {
         if (fuses(Device::vulkan())) test_trace_allocates_nothing(Device::vulkan());
         test_trace_stays_on_device(Device::vulkan());
         test_eager_div_modulate(Device::vulkan());
+        test_where_clamp_col_bcast_cast(Device::vulkan());
     }
 
     std::printf("\n================================================================================\n");

@@ -63,6 +63,7 @@ bool build_plan(const TraceDAG& dag, ElementwisePlan& plan) {
 
         lanes = std::min(lanes, vec_width_for(n.dtype));
         if (bk == BroadcastKind::Row) plan.any_row_bcast = true;
+        if (bk == BroadcastKind::Col) plan.any_col_bcast = true;
 
         const BufferSpec spec{n.id, n.dtype, bk};
         if (is_in) plan.inputs.push_back(spec);
@@ -71,7 +72,7 @@ bool build_plan(const TraceDAG& dag, ElementwisePlan& plan) {
     if (plan.outputs.empty()) return false;
 
     if (plan.numel % lanes != 0) lanes = 1;
-    if (plan.any_row_bcast && cols % lanes != 0) lanes = 1;
+    if ((plan.any_row_bcast || plan.any_col_bcast) && cols % lanes != 0) lanes = 1;
     plan.vec = lanes;
     return true;
 }

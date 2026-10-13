@@ -161,7 +161,8 @@ bool has_lane_form(TraceOpKind op) {
         case TraceOpKind::DivScalar: case TraceOpKind::ScalarSub: case TraceOpKind::ScalarDiv:
         case TraceOpKind::FMA: case TraceOpKind::SiLU: case TraceOpKind::GELU: case TraceOpKind::ReLU:
         case TraceOpKind::Tanh: case TraceOpKind::Sigmoid: case TraceOpKind::Modulate:
-        case TraceOpKind::Copy:
+        case TraceOpKind::Copy: case TraceOpKind::Where: case TraceOpKind::Clamp:
+        case TraceOpKind::Cast:
             return true;
         default:
             return false;
@@ -189,6 +190,20 @@ Value* lane_op(Ctx& c, const TraceNode& n, const std::vector<Value*>& in) {
         case TraceOpKind::ScalarDiv: need(1); return b.build_sdiv(c.f32(n.scalar), in[0]);
         case TraceOpKind::FMA: need(3); return b.build_fma_f32(in[0], in[1], in[2]);
         case TraceOpKind::ReLU: need(1); return c.kb.fmax(in[0], c.f32(0.0f));
+        case TraceOpKind::Clamp: need(1); return c.kb.fmin(c.kb.fmax(in[0], c.f32(n.scalar)), c.f32(n.scalar2));
+        case TraceOpKind::Where: {
+            need(3);
+            Value* bits = b.build_and(f32_to_bits(c, in[0]), c.i32(0x7FFFFFFF));
+            return b.build_select(b.build_ne(bits, c.i32(0)), in[1], in[2]);
+        }
+        case TraceOpKind::Cast: {
+            need(1);
+            if (n.dtype == Dtype::FP16) return c.kb.f16_to_f32(c.kb.f32_to_f16(in[0]));
+            if (n.dtype == Dtype::BF16) {
+                return bits_to_f32(c, b.build_shl(pack_half(c, Dtype::BF16, in[0]), c.i32(16)));
+            }
+            return in[0];
+        }
         case TraceOpKind::Sigmoid: need(1); return sigmoid(c, in[0]);
         case TraceOpKind::SiLU: need(1); return b.build_mul(in[0], sigmoid(c, in[0]));
         case TraceOpKind::Tanh: need(1); return tanh_(c, in[0]);

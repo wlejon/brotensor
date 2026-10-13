@@ -80,15 +80,6 @@ std::vector<float> read(const Tensor& t) {
     return out;
 }
 
-const char* dtype_name(Dtype d) {
-    switch (d) {
-        case Dtype::FP32: return "fp32";
-        case Dtype::BF16: return "bf16";
-        case Dtype::FP16: return "fp16";
-        default: return "?";
-    }
-}
-
 // One BF16 rounding step is 2^-8 = 3.9e-3 relative; FP16 is 2^-11 = 4.9e-4.
 // The eager sequence rounds each intermediate back to the storage dtype where
 // the fused kernel keeps it in an FP32 register, so the two differ by a small
@@ -532,6 +523,118 @@ void test_scalar_entry_fallback(Device dev) {
                h.fusion_name());
 }
 
+void test_where_clamp_col_broadcast(Device dev, Dtype dt) {
+    const int N = 128, D = 256;
+    SplitMix64 rng(0x1122);
+    const std::vector<float> hx = random_rows(rng, N, D, 2.0f);
+    const std::vector<float> hy = random_rows(rng, N, D, 1.5f);
+    const std::vector<float> hrow = random_rows(rng, 1, D, 0.8f);
+    const std::vector<float> hcol = random_rows(rng, N, 1, 0.6f);
+    std::vector<float> hmask(static_cast<std::size_t>(N));
+    for (int r = 0; r < N; ++r) hmask[r] = (r % 2 == 0) ? 1.0f : 0.0f;
+
+    Tensor x = make(dev, hx, N, D, dt);
+    Tensor y = make(dev, hy, N, D, dt);
+    Tensor row_s = make(dev, hrow, 1, D, dt);
+    Tensor col_b = make(dev, hcol, N, 1, dt);
+    Tensor mask_col = make(dev, hmask, N, 1, dt);
+
+    const float lo = -0.75f;
+    const float hi = 0.75f;
+
+    begin_trace();
+    Tensor out = jit::where(mask_col, jit::clamp(x * row_s + col_b, lo, hi), y);
+    TraceHandle h = end_trace();
+    sync_all();
+
+    const std::vector<float> rx = read(x);
+    const std::vector<float> ry = read(y);
+    const std::vector<float> rrow = read(row_s);
+    const std::vector<float> rcol = read(col_b);
+    const std::vector<float> rmask = read(mask_col);
+    std::vector<float> want(rx.size());
+    for (int r = 0; r < N; ++r) {
+        for (int c = 0; c < D; ++c) {
+            std::size_t i = static_cast<std::size_t>(r) * D + c;
+            float v = rx[i] * rrow[c] + rcol[r];
+            float cl = std::fmin(std::fmax(v, lo), hi);
+            want[i] = (rmask[r] != 0.0f) ? cl : ry[i];
+        }
+    }
+
+    const std::string tag = std::string("where(col_mask, clamp(x*row+col), y) [") + dtype_name(dt) + "]";
+    check(tag, read(out), want, tol_for(dt));
+    check_true(tag + " is one launch", h.launch_count() == 1, h.fusion_name());
+}
+
+void test_rmsnorm_with_col_broadcast(Device dev, Dtype dt) {
+    const int N = 128, D = 256;
+    SplitMix64 rng(0x3344);
+    const std::vector<float> hx = random_rows(rng, N, D, 1.5f);
+    std::vector<float> hg = random_rows(rng, 1, D, 0.3f);
+    for (auto& v : hg) v += 1.0f;
+    std::vector<float> hcol = random_rows(rng, N, 1, 0.5f);
+    for (auto& v : hcol) v += 1.0f;
+
+    Tensor x = make(dev, hx, N, D, dt);
+    Tensor gamma = make(dev, hg, 1, D, dt);
+    Tensor col_scale = make(dev, hcol, N, 1, dt);
+
+    begin_trace();
+    Tensor out = jit::clip(jit::rms_norm(x, gamma, 1e-6f) * col_scale, -1.5f, 1.5f);
+    TraceHandle h = end_trace();
+    sync_all();
+
+    Tensor en = Tensor::empty_on(dev, N, D, dt);
+    rms_norm_forward(x, gamma, 1e-6f, en);
+    const std::vector<float> ren = read(en);
+    const std::vector<float> rcol = read(col_scale);
+    std::vector<float> want(ren.size());
+    for (int r = 0; r < N; ++r) {
+        for (int c = 0; c < D; ++c) {
+            std::size_t i = static_cast<std::size_t>(r) * D + c;
+            float v = ren[i] * rcol[r];
+            want[i] = std::fmin(std::fmax(v, -1.5f), 1.5f);
+        }
+    }
+
+    const std::string tag = std::string("rms_norm * col_scale + clip [") + dtype_name(dt) + "]";
+    check(tag, read(out), want, tol_for(dt));
+    check_true(tag + " is one launch", h.launch_count() == 1, h.fusion_name());
+}
+
+void test_cast_fusion(Device dev, Dtype dt) {
+    const int N = 128, D = 256;
+    SplitMix64 rng(0x5566);
+    const std::vector<float> hx = random_rows(rng, N, D, 1.5f);
+    const std::vector<float> hrow = random_rows(rng, 1, D, 0.8f);
+
+    Tensor x = make(dev, hx, N, D, dt);
+    Tensor row_s = make(dev, hrow, 1, D, dt);
+
+    Dtype dst_dt = (dt == Dtype::FP32) ? Dtype::BF16 : Dtype::FP32;
+
+    begin_trace();
+    Tensor out = jit::cast(jit::silu(x) * row_s, dst_dt);
+    TraceHandle h = end_trace();
+    sync_all();
+
+    const std::vector<float> rx = read(x);
+    const std::vector<float> rrow = read(row_s);
+    std::vector<float> want(rx.size());
+    for (int r = 0; r < N; ++r) {
+        for (int c = 0; c < D; ++c) {
+            std::size_t i = static_cast<std::size_t>(r) * D + c;
+            float s = rx[i] / (1.0f + std::exp(-rx[i]));
+            want[i] = s * rrow[c];
+        }
+    }
+
+    const std::string tag = std::string("cast(silu(x)*row) [") + dtype_name(dt) + "->" + dtype_name(dst_dt) + "]";
+    check(tag, read(out), want, std::fmax(tol_for(dt), tol_for(dst_dt)));
+    check_true(tag + " is one launch", h.launch_count() == 1, h.fusion_name());
+}
+
 void run_suite(Device dev, const char* label) {
     std::printf("\n=== %s ===\n", label);
     const bool gpu = !dev.is_cpu();
@@ -557,6 +660,9 @@ void run_suite(Device dev, const char* label) {
         test_store_into_row_views(dev, dt);
         test_narrow_rows(dev, dt);
         test_narrow_layernorm(dev, dt);
+        test_where_clamp_col_broadcast(dev, dt);
+        test_rmsnorm_with_col_broadcast(dev, dt);
+        test_cast_fusion(dev, dt);
     }
     if (g_expect_fused) test_scalar_entry_fallback(dev);
 }

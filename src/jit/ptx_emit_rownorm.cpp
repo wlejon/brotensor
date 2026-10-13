@@ -113,7 +113,7 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
     const std::string r_rowbase = a.R();
     b << "    mul.lo.u32 " << r_rowbase << ", " << r_row << ", " << D << ";\n";
 
-    std::unordered_map<int, std::string> rowbyte;
+    std::unordered_map<int, std::string> rowbyte, colbcastbyte;
     auto row_bytes = [&](Dtype dt) -> std::string {
         const int e = elem_bytes(dt);
         auto it = rowbyte.find(e);
@@ -123,9 +123,21 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
         rowbyte[e] = rd;
         return rd;
     };
+    auto colbcast_bytes = [&](Dtype dt) -> std::string {
+        const int e = elem_bytes(dt);
+        auto it = colbcastbyte.find(e);
+        if (it != colbcastbyte.end()) return it->second;
+        const std::string rd = a.RD();
+        b << "    mul.wide.u32 " << rd << ", " << r_row << ", " << e << ";\n";
+        colbcastbyte[e] = rd;
+        return rd;
+    };
     // Every element size the trace touches, resolved before either loop so the
     // stride loops do not recompute a loop-invariant address.
-    for (const BufferSpec& s : ew.inputs) row_bytes(s.dtype);
+    for (const BufferSpec& s : ew.inputs) {
+        row_bytes(s.dtype);
+        if (s.bcast == BroadcastKind::Col) colbcast_bytes(s.dtype);
+    }
     for (const BufferSpec& s : ew.outputs) row_bytes(s.dtype);
 
     // Per-pass cache of the byte offsets materialised for the column the
@@ -163,19 +175,22 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
         for (std::size_t k = 0; k < n_in; ++k) {
             if (!want.empty() && !want[k]) continue;
             const BufferSpec& s = ew.inputs[k];
-            const int ln = (s.bcast == BroadcastKind::Scalar) ? 1 : lanes;
+            const bool single_lane = (s.bcast == BroadcastKind::Scalar || s.bcast == BroadcastKind::Col);
+            const int ln = single_lane ? 1 : lanes;
             std::string addr;
             if (s.bcast == BroadcastKind::Scalar) {
                 addr = in_ptr[k];
             } else {
                 const std::string off = (s.bcast == BroadcastKind::Row)
                                             ? col_off(o, r_c, s.dtype)
-                                            : full_off(o, r_c, s.dtype);
+                                            : (s.bcast == BroadcastKind::Col)
+                                                  ? colbcast_bytes(s.dtype)
+                                                  : full_off(o, r_c, s.dtype);
                 addr = a.RD();
                 b << "    add.u64 " << addr << ", " << in_ptr[k] << ", " << off << ";\n";
             }
             std::vector<std::string> v = emit_load(b, a, s.dtype, ln, addr);
-            if (s.bcast == BroadcastKind::Scalar) {
+            if (single_lane) {
                 const std::string only = v[0];
                 v.assign(static_cast<std::size_t>(lanes), only);
             }

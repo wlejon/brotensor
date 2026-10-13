@@ -34,22 +34,31 @@ brass::target::SpirvKernel build_entry(const TraceDAG& dag, const plan::Elementw
     Value* stride = b.build_mul(kb.ntid_x(), kb.nctaid_x());
 
     kb.for_range(i0, n, stride, [&](Value* i) {
-        // Element index of this thread's first lane, and its column when some
-        // operand broadcasts across rows.
+        // Element index of this thread's first lane, its column when some
+        // operand broadcasts across rows, and its row when some operand
+        // broadcasts across columns.
         Value* base = lanes > 1 ? b.build_shl(i, c.i32(log2_exact(lanes))) : i;
         Value* col = nullptr;
         if (plan.any_row_bcast) {
             col = is_pow2(plan.cols) ? b.build_and(base, c.i32(plan.cols - 1))
                                      : b.build_umod(base, c.i32(plan.cols));
         }
+        Value* row = nullptr;
+        if (plan.any_col_bcast) {
+            row = is_pow2(plan.cols) ? b.build_lshr(base, c.i32(log2_exact(plan.cols)))
+                                     : b.build_udiv(base, c.i32(plan.cols));
+        }
         // Byte offsets, one per (broadcast kind, element size) actually used.
-        std::unordered_map<int, Value*> full_off, row_off;
+        std::unordered_map<int, Value*> full_off, row_off, col_off;
         auto offset_for = [&](BroadcastKind bk, Dtype dt) -> Value* {
             const int esz = plan::elem_bytes(dt);
-            auto& tbl = (bk == BroadcastKind::Row) ? row_off : full_off;
+            auto& tbl = (bk == BroadcastKind::Row) ? row_off
+                      : (bk == BroadcastKind::Col) ? col_off : full_off;
             auto it = tbl.find(esz);
             if (it != tbl.end()) return it->second;
-            Value* off = byte_offset(c, bk == BroadcastKind::Row ? col : base, esz);
+            Value* idx = (bk == BroadcastKind::Row) ? col
+                       : (bk == BroadcastKind::Col) ? row : base;
+            Value* off = byte_offset(c, idx, esz);
             tbl[esz] = off;
             return off;
         };
@@ -61,6 +70,11 @@ brass::target::SpirvKernel build_entry(const TraceDAG& dag, const plan::Elementw
             if (s.bcast == BroadcastKind::Scalar) {
                 // One load feeds every lane.
                 Value* v = load_lanes(c, s.dtype, 1, ptr)[0];
+                vals[s.node_id] = std::vector<Value*>(static_cast<std::size_t>(lanes), v);
+            } else if (s.bcast == BroadcastKind::Col) {
+                // All lanes of this thread sit in the same row (build_plan
+                // requires cols % lanes == 0 when any_col_bcast is true).
+                Value* v = load_lanes(c, s.dtype, 1, b.build_add(ptr, offset_for(s.bcast, s.dtype)))[0];
                 vals[s.node_id] = std::vector<Value*>(static_cast<std::size_t>(lanes), v);
             } else {
                 vals[s.node_id] = load_lanes(c, s.dtype, lanes, b.build_add(ptr, offset_for(s.bcast, s.dtype)));

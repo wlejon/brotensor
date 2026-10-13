@@ -27,6 +27,36 @@ const Tensor& binary_shape(const Tensor& a, const Tensor& b) {
                : a;
 }
 
+void broadcast_shape(const Tensor& a, const Tensor& b, int& rows, int& cols) {
+    const bool ok_r = (a.rows == b.rows || a.rows == 1 || b.rows == 1);
+    const bool ok_c = (a.cols == b.cols || a.cols == 1 || b.cols == 1);
+    if (ok_r && ok_c) {
+        rows = std::max(a.rows, b.rows);
+        cols = std::max(a.cols, b.cols);
+    } else {
+        const Tensor& r = binary_shape(a, b);
+        rows = r.rows;
+        cols = r.cols;
+    }
+}
+
+void broadcast_shape3(const Tensor& c, const Tensor& a, const Tensor& b, int& rows, int& cols) {
+    int ab_r = 0, ab_c = 0;
+    broadcast_shape(a, b, ab_r, ab_c);
+    const bool ok_r = (c.rows == ab_r || c.rows == 1 || ab_r == 1) &&
+                      (a.rows == b.rows || a.rows == 1 || b.rows == 1);
+    const bool ok_c = (c.cols == ab_c || c.cols == 1 || ab_c == 1) &&
+                      (a.cols == b.cols || a.cols == 1 || b.cols == 1);
+    if (ok_r && ok_c) {
+        rows = std::max(c.rows, ab_r);
+        cols = std::max(c.cols, ab_c);
+    } else {
+        const Tensor& r = binary_shape(c, binary_shape(a, b));
+        rows = r.rows;
+        cols = r.cols;
+    }
+}
+
 bool same_shape(const Tensor& a, const Tensor& b) {
     return a.rows == b.rows && a.cols == b.cols;
 }
@@ -53,8 +83,10 @@ Tensor operator+(const Tensor& a, const Tensor& b) {
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
         const Tensor& r = binary_shape(a, b);
+        int rows = r.rows, cols = r.cols;
+        broadcast_shape(a, b, rows, cols);
         return ctx.record_op(TraceOpKind::Add, {slot_a, slot_b}, 0.0f,
-                             r.device, r.dtype, r.rows, r.cols);
+                             r.device, r.dtype, rows, cols);
     }
     if (!same_shape(a, b)) no_eager_broadcast("+");
     Tensor out = a.clone();
@@ -80,8 +112,10 @@ Tensor operator-(const Tensor& a, const Tensor& b) {
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
         const Tensor& r = binary_shape(a, b);
+        int rows = r.rows, cols = r.cols;
+        broadcast_shape(a, b, rows, cols);
         return ctx.record_op(TraceOpKind::Sub, {slot_a, slot_b}, 0.0f,
-                             r.device, r.dtype, r.rows, r.cols);
+                             r.device, r.dtype, rows, cols);
     }
     if (!same_shape(a, b)) no_eager_broadcast("-");
     Tensor out = a.clone();
@@ -112,8 +146,10 @@ Tensor operator*(const Tensor& a, const Tensor& b) {
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
         const Tensor& r = binary_shape(a, b);
+        int rows = r.rows, cols = r.cols;
+        broadcast_shape(a, b, rows, cols);
         return ctx.record_op(TraceOpKind::Mul, {slot_a, slot_b}, 0.0f,
-                             r.device, r.dtype, r.rows, r.cols);
+                             r.device, r.dtype, rows, cols);
     }
     if (!same_shape(a, b)) {
         // The one eager broadcast brotensor already has a kernel for: a
@@ -153,8 +189,10 @@ Tensor operator/(const Tensor& a, const Tensor& b) {
         int slot_a = ctx.get_or_register_slot(a);
         int slot_b = ctx.get_or_register_slot(b);
         const Tensor& r = binary_shape(a, b);
+        int rows = r.rows, cols = r.cols;
+        broadcast_shape(a, b, rows, cols);
         return ctx.record_op(TraceOpKind::Div, {slot_a, slot_b}, 0.0f,
-                             r.device, r.dtype, r.rows, r.cols);
+                             r.device, r.dtype, rows, cols);
     }
     if (!same_shape(a, b)) no_eager_broadcast("/");
     Tensor out = a.clone();
@@ -382,6 +420,96 @@ Tensor modulate(const Tensor& x, const Tensor& scale, const Tensor& shift) {
         throw std::runtime_error("brotensor: modulate on GPU requires CUDA backend");
 #endif
     }
+    return out;
+}
+
+Tensor where(const Tensor& cond, const Tensor& a, const Tensor& b) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_c = ctx.get_or_register_slot(cond);
+        int slot_a = ctx.get_or_register_slot(a);
+        int slot_b = ctx.get_or_register_slot(b);
+        const Tensor& r = binary_shape(a, b);
+        int rows = r.rows, cols = r.cols;
+        broadcast_shape3(cond, a, b, rows, cols);
+        return ctx.record_op(TraceOpKind::Where, {slot_c, slot_a, slot_b}, 0.0f,
+                             r.device, r.dtype, rows, cols);
+    }
+
+    if (cond.device != a.device || a.device != b.device) {
+        throw std::runtime_error("brotensor::jit::where: device mismatch between operands");
+    }
+    int rows = 0, cols = 0;
+    broadcast_shape3(cond, a, b, rows, cols);
+    auto valid_bcast = [&](const Tensor& t) {
+        if (t.rows == rows && t.cols == cols) return true;
+        const BroadcastKind bk = broadcast_of(t.rows, t.cols, rows, cols);
+        return bk != BroadcastKind::Full;
+    };
+    if (!valid_bcast(cond) || !valid_bcast(a) || !valid_bcast(b)) {
+        throw std::runtime_error("brotensor::jit::where: incompatible operand shapes");
+    }
+
+    const Tensor& r = binary_shape(a, b);
+    auto to_host_f32 = [](const Tensor& t) -> std::vector<float> {
+        Tensor h = t.is_host() ? Tensor::view(Device::CPU, const_cast<void*>(t.data), t.rows, t.cols, t.dtype)
+                               : t.to(Device::CPU);
+        if (h.dtype != Dtype::FP32) {
+            Tensor c;
+            brotensor::cast(h, c, Dtype::FP32);
+            return c.to_host_vector();
+        }
+        return h.to_host_vector();
+    };
+    const std::vector<float> vc = to_host_f32(cond);
+    const std::vector<float> va = to_host_f32(a);
+    const std::vector<float> vb = to_host_f32(b);
+
+    auto idx_of = [cols](const Tensor& t, int row, int col) -> std::size_t {
+        if (t.rows == 1 && t.cols == 1) return 0;
+        if (t.rows == 1) return static_cast<std::size_t>(col);
+        if (t.cols == 1) return static_cast<std::size_t>(row);
+        return static_cast<std::size_t>(row) * cols + col;
+    };
+
+    std::vector<float> vout(static_cast<std::size_t>(rows) * cols);
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            const float c_val = vc[idx_of(cond, row, col)];
+            const float a_val = va[idx_of(a, row, col)];
+            const float b_val = vb[idx_of(b, row, col)];
+            vout[static_cast<std::size_t>(row) * cols + col] = (c_val != 0.0f) ? a_val : b_val;
+        }
+    }
+
+    Tensor out_f32 = Tensor::from_host_on(r.device, vout.data(), rows, cols);
+    if (r.dtype == Dtype::FP32) return out_f32;
+    Tensor out;
+    brotensor::cast(out_f32, out, r.dtype);
+    return out;
+}
+
+Tensor clamp(const Tensor& x, float lo, float hi) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_x = ctx.get_or_register_slot(x);
+        return ctx.record_op(TraceOpKind::Clamp, {slot_x}, lo,
+                             x.device, x.dtype, x.rows, x.cols, hi);
+    }
+    Tensor out = x.clone();
+    brotensor::clamp(out, lo, hi);
+    return out;
+}
+
+Tensor cast(const Tensor& x, Dtype out_dtype) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_x = ctx.get_or_register_slot(x);
+        return ctx.record_op(TraceOpKind::Cast, {slot_x}, 0.0f,
+                             x.device, out_dtype, x.rows, x.cols);
+    }
+    Tensor out;
+    brotensor::cast(x, out, out_dtype);
     return out;
 }
 

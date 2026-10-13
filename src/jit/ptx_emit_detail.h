@@ -106,6 +106,34 @@ inline void emit_lane_op(std::ostream& o, Alloc& a, const TraceNode& n,
         case TraceOpKind::ReLU:
             o << "    max.f32 " << d << ", " << in[0] << ", 0f00000000;\n";
             break;
+        case TraceOpKind::Clamp: {
+            const std::string t = a.F();
+            o << "    max.f32 " << t << ", " << in[0] << ", " << fhex(n.scalar) << ";\n";
+            o << "    min.f32 " << d << ", " << t << ", " << fhex(n.scalar2) << ";\n";
+            break;
+        }
+        case TraceOpKind::Where: {
+            const std::string p = a.P();
+            o << "    setp.ne.f32 " << p << ", " << in[0] << ", 0f00000000;\n";
+            o << "    selp.f32 " << d << ", " << in[1] << ", " << in[2] << ", " << p << ";\n";
+            break;
+        }
+        case TraceOpKind::Cast: {
+            if (n.dtype == Dtype::FP16) {
+                const std::string h = a.H();
+                o << "    cvt.rn.f16.f32 " << h << ", " << in[0] << ";\n";
+                o << "    cvt.f32.f16 " << d << ", " << h << ";\n";
+            } else if (n.dtype == Dtype::BF16) {
+                const std::string h = a.H(), t = a.R();
+                o << "    cvt.rn.bf16.f32 " << h << ", " << in[0] << ";\n";
+                o << "    cvt.u32.u16 " << t << ", " << h << ";\n";
+                o << "    shl.b32 " << t << ", " << t << ", 16;\n";
+                o << "    mov.b32 " << d << ", " << t << ";\n";
+            } else {
+                o << "    mov.f32 " << d << ", " << in[0] << ";\n";
+            }
+            break;
+        }
         case TraceOpKind::Sigmoid:
             emit_sigmoid(o, a, in[0], d);
             break;

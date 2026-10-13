@@ -82,8 +82,12 @@ public:
         kb.if_then(b.build_uge(row, c.i32(ew_.rows)), [&] { b.build_ret_void(); });
 
         c0_ = lanes_ > 1 ? b.build_mul(sub, c.i32(lanes_)) : sub;
+        row_ = row;
         rowbase_ = b.build_mul(row, c.i32(ew_.cols));
-        for (const auto& s : ew_.inputs) row_bytes(s.dtype);
+        for (const auto& s : ew_.inputs) {
+            row_bytes(s.dtype);
+            if (s.bcast == BroadcastKind::Col) col_bcast_bytes(s.dtype);
+        }
         for (const auto& s : ew_.outputs) row_bytes(s.dtype);
         Value* D = c.i32(ew_.cols);
         const float inv_d = 1.0f / static_cast<float>(ew_.cols);
@@ -169,6 +173,15 @@ private:
         return v;
     }
 
+    Value* col_bcast_bytes(Dtype dt) {
+        const int e = plan::elem_bytes(dt);
+        auto it = colbcastbyte_.find(e);
+        if (it != colbcastbyte_.end()) return it->second;
+        Value* v = byte_offset(*c_, row_, e);
+        colbcastbyte_[e] = v;
+        return v;
+    }
+
     Value* col_off(Offsets& o, Value* col, Dtype dt) {
         const int e = plan::elem_bytes(dt);
         auto it = o.col.find(e);
@@ -195,6 +208,11 @@ private:
             const plan::BufferSpec& s = ew_.inputs[k];
             if (s.bcast == BroadcastKind::Scalar) {
                 Value* v = load_lanes(*c_, s.dtype, 1, in_ptr_[k])[0];
+                vals[s.node_id] = std::vector<Value*>(static_cast<std::size_t>(lanes_), v);
+                continue;
+            }
+            if (s.bcast == BroadcastKind::Col) {
+                Value* v = load_lanes(*c_, s.dtype, 1, c_->b.build_add(in_ptr_[k], col_bcast_bytes(s.dtype)))[0];
                 vals[s.node_id] = std::vector<Value*>(static_cast<std::size_t>(lanes_), v);
                 continue;
             }
@@ -270,8 +288,10 @@ private:
     Value* tid_ = nullptr;
     Value* local_ = nullptr;
     Value* c0_ = nullptr;
+    Value* row_ = nullptr;
     Value* rowbase_ = nullptr;
     std::unordered_map<int, Value*> rowbyte_;
+    std::unordered_map<int, Value*> colbcastbyte_;
 };
 
 }  // namespace

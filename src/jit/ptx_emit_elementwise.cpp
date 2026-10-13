@@ -66,17 +66,32 @@ std::string emit_ew_entry(const TraceDAG& dag, const ElementwisePlan& plan, int 
         }
     }
 
+    // Row index, only when some operand broadcasts across columns.
+    std::string r_row;
+    if (plan.any_col_bcast) {
+        r_row = a.R();
+        if (is_pow2(plan.cols)) {
+            int sh = 0;
+            while ((1 << sh) < plan.cols) ++sh;
+            b << "    shr.u32 " << r_row << ", " << r_base << ", " << sh << ";\n";
+        } else {
+            b << "    div.u32 " << r_row << ", " << r_base << ", " << plan.cols << ";\n";
+        }
+    }
+
     // Byte offsets, one per (broadcast kind, element size) actually used.
-    std::unordered_map<int, std::string> full_off, row_off;
+    std::unordered_map<int, std::string> full_off, row_off, col_off;
     auto offset_for = [&](BroadcastKind bk, Dtype dt) -> std::string {
         const int esz = elem_bytes(dt);
         if (bk == BroadcastKind::Scalar) return std::string();
-        auto& tbl = (bk == BroadcastKind::Row) ? row_off : full_off;
+        auto& tbl = (bk == BroadcastKind::Row) ? row_off
+                  : (bk == BroadcastKind::Col) ? col_off : full_off;
         auto it = tbl.find(esz);
         if (it != tbl.end()) return it->second;
         const std::string rd = a.RD();
-        b << "    mul.wide.u32 " << rd << ", "
-          << (bk == BroadcastKind::Row ? r_col : r_base) << ", " << esz << ";\n";
+        const std::string& idx = (bk == BroadcastKind::Row) ? r_col
+                               : (bk == BroadcastKind::Col) ? r_row : r_base;
+        b << "    mul.wide.u32 " << rd << ", " << idx << ", " << esz << ";\n";
         tbl[esz] = rd;
         return rd;
     };
@@ -84,7 +99,8 @@ std::string emit_ew_entry(const TraceDAG& dag, const ElementwisePlan& plan, int 
     ValueMap vals;
     for (std::size_t k = 0; k < n_in; ++k) {
         const BufferSpec& s = plan.inputs[k];
-        const int ln = (s.bcast == BroadcastKind::Scalar) ? 1 : lanes;
+        const bool single_lane = (s.bcast == BroadcastKind::Scalar || s.bcast == BroadcastKind::Col);
+        const int ln = single_lane ? 1 : lanes;
         std::string addr;
         if (s.bcast == BroadcastKind::Scalar) {
             addr = in_ptr[k];
@@ -94,7 +110,7 @@ std::string emit_ew_entry(const TraceDAG& dag, const ElementwisePlan& plan, int 
             b << "    add.u64 " << addr << ", " << in_ptr[k] << ", " << off << ";\n";
         }
         std::vector<std::string> v = emit_load(b, a, s.dtype, ln, addr);
-        if (s.bcast == BroadcastKind::Scalar) {
+        if (single_lane) {
             // One load feeds every lane. Copy the name out first: assign()
             // would clear the vector the reference points into.
             const std::string only = v[0];

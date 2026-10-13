@@ -18,14 +18,35 @@
 namespace brotensor::detail::cpu {
 
 void clamp(::brotensor::Tensor& y, float lo, float hi) {
+    using ::brotensor::Dtype;
     const int n = y.size();
     if (n == 0) return;
-    float* yp = y.host_f32_mut();
-    for (int i = 0; i < n; ++i) {
-        float v = yp[i];
-        if (v < lo) v = lo;
-        if (v > hi) v = hi;
-        yp[i] = v;
+    if (y.dtype == Dtype::FP32) {
+        float* yp = y.host_f32_mut();
+        for (int i = 0; i < n; ++i) {
+            float v = yp[i];
+            if (v < lo) v = lo;
+            if (v > hi) v = hi;
+            yp[i] = v;
+        }
+    } else if (y.dtype == Dtype::FP16) {
+        std::uint16_t* yp = y.host_fp16_mut();
+        for (int i = 0; i < n; ++i) {
+            float v = ::brotensor::fp16_bits_to_fp32(yp[i]);
+            if (v < lo) v = lo;
+            if (v > hi) v = hi;
+            yp[i] = ::brotensor::fp32_to_fp16_bits(v);
+        }
+    } else if (y.dtype == Dtype::BF16) {
+        std::uint16_t* yp = y.host_bf16_mut();
+        for (int i = 0; i < n; ++i) {
+            float v = ::brotensor::bf16_bits_to_fp32(yp[i]);
+            if (v < lo) v = lo;
+            if (v > hi) v = hi;
+            yp[i] = ::brotensor::fp32_to_bf16_bits(v);
+        }
+    } else {
+        throw std::runtime_error("clamp: unsupported dtype");
     }
 }
 
@@ -140,10 +161,22 @@ void cast(const ::brotensor::Tensor& src, ::brotensor::Tensor& dst,
         const std::uint16_t* s = src.host_bf16();
         float* d = dst.host_f32_mut();
         for (int i = 0; i < n; ++i) d[i] = ::brotensor::bf16_bits_to_fp32(s[i]);
+    } else if (src.dtype == Dtype::FP16 && out_dtype == Dtype::BF16) {
+        const std::uint16_t* s = src.host_fp16();
+        std::uint16_t* d = dst.host_bf16_mut();
+        for (int i = 0; i < n; ++i) {
+            d[i] = ::brotensor::fp32_to_bf16_bits(::brotensor::fp16_bits_to_fp32(s[i]));
+        }
+    } else if (src.dtype == Dtype::BF16 && out_dtype == Dtype::FP16) {
+        const std::uint16_t* s = src.host_bf16();
+        std::uint16_t* d = dst.host_fp16_mut();
+        for (int i = 0; i < n; ++i) {
+            d[i] = ::brotensor::fp32_to_fp16_bits(::brotensor::bf16_bits_to_fp32(s[i]));
+        }
     } else {
         throw std::runtime_error(
             "brotensor: cast: unsupported dtype pair "
-            "(CPU supports FP32<->FP16 and FP32<->BF16)");
+            "(CPU supports FP32, FP16, and BF16 conversions)");
     }
 }
 

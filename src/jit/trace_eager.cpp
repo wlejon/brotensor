@@ -31,6 +31,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -52,7 +53,8 @@ bool is_unary(TraceOpKind op) {
         case TraceOpKind::ScalarSub: case TraceOpKind::SiLU:
         case TraceOpKind::GELU: case TraceOpKind::ReLU:
         case TraceOpKind::Tanh: case TraceOpKind::Sigmoid:
-        case TraceOpKind::Copy:
+        case TraceOpKind::Copy: case TraceOpKind::Clamp:
+        case TraceOpKind::Cast:
             return true;
         default:
             return false;
@@ -96,7 +98,15 @@ void validate(const TraceDAG& dag) {
                 const TraceNode& a = operand(k);
                 const BroadcastKind bk = broadcast_of(a.rows, a.cols, n.rows, n.cols);
                 if (bk == BroadcastKind::Full && numel(a.rows, a.cols) != numel(n.rows, n.cols)) {
-                    reject(n, "operand is neither the full shape, a row nor a scalar");
+                    reject(n, "operand is neither the full shape, a row, a column nor a scalar");
+                }
+            }
+        } else if (n.op == TraceOpKind::Where) {
+            for (std::size_t k = 0; k < 3; ++k) {
+                const TraceNode& a = operand(k);
+                const BroadcastKind bk = broadcast_of(a.rows, a.cols, n.rows, n.cols);
+                if (bk == BroadcastKind::Full && numel(a.rows, a.cols) != numel(n.rows, n.cols)) {
+                    reject(n, "Where operand is neither the full shape, a row, a column nor a scalar");
                 }
             }
         } else if (n.op == TraceOpKind::FMA) {
@@ -129,30 +139,43 @@ Tensor reshaped(const Tensor& t, int rows, int cols) {
     return Tensor::view(t.device, t.data, rows, cols, t.dtype);
 }
 
-Tensor as_dtype(const Tensor& t, Dtype dt) {
-    if (t.dtype == dt) return reshaped(t, t.rows, t.cols);
+Tensor as_dtype(const Tensor& t, Dtype dt, int rows, int cols) {
+    if (t.dtype == dt) return reshaped(t, rows, cols);
     Tensor out;
     brotensor::cast(t, out, dt);
+    out.rows = rows;
+    out.cols = cols;
     return out;
+}
+
+Tensor as_dtype(const Tensor& t, Dtype dt) {
+    return as_dtype(t, dt, t.rows, t.cols);
 }
 
 // Copies `src` into `dst` unless they already are the same storage.
 void assign(Tensor& dst, const Tensor& src) {
     if (dst.data == src.data) return;
+    if (dst.device.is_cpu() && src.device.is_cpu() && dst.dtype == src.dtype) {
+        std::memcpy(dst.host_raw_mut(), src.host_raw(), dst.bytes());
+        return;
+    }
     brotensor::copy_d2d(src, 0, dst, 0, static_cast<int>(dst.size()));
 }
 
-// A (1, cols) row or (1, 1) scalar operand spread to the full (rows, cols).
+// A (1, cols) row, (rows, 1) column, or (1, 1) scalar operand spread to the full (rows, cols).
 Tensor expand(const Tensor& small, int rows, int cols, Dtype dt) {
-    Tensor full = Tensor::zeros_on(small.device, rows, cols, dt);
-    Tensor s = as_dtype(small, dt);
+    const Dtype work_dt = small.device.is_cpu() ? Dtype::FP32 : dt;
+    Tensor full = Tensor::zeros_on(small.device, rows, cols, work_dt);
+    Tensor s = as_dtype(small, work_dt);
     if (small.size() == 1) {
         Tensor col = reshaped(full, rows * cols, 1);
         brotensor::add_row_bias_inplace(col, reshaped(s, 1, 1));
+    } else if (small.rows == rows && small.cols == 1) {
+        brotensor::add_channel_bias_inplace(full, reshaped(s, rows, 1), rows, cols);
     } else {
         brotensor::add_row_bias_inplace(full, reshaped(s, 1, cols));
     }
-    return full;
+    return work_dt == dt ? full : as_dtype(full, dt);
 }
 
 class Program {
@@ -203,7 +226,16 @@ public:
 
             Tensor dst = n.buffer ? view_of(n, n.buffer)
                                   : Tensor::empty_on(n.device, n.rows, n.cols, n.dtype);
-            evaluate(n, vals, dst);
+            if (n.device.is_cpu() && n.dtype != Dtype::FP32 &&
+                n.op != TraceOpKind::Copy && n.op != TraceOpKind::Cast) {
+                TraceNode fp32_node = n;
+                fp32_node.dtype = Dtype::FP32;
+                Tensor tmp = Tensor::empty_on(n.device, n.rows, n.cols, Dtype::FP32);
+                evaluate(fp32_node, vals, tmp);
+                brotensor::cast(tmp, dst, n.dtype);
+            } else {
+                evaluate(n, vals, dst);
+            }
             vals[id] = std::move(dst);
 
             for (int in : n.inputs) {
@@ -223,19 +255,31 @@ private:
     Tensor full_arg(const TraceNode& n, std::size_t k, const std::vector<Tensor>& vals) const {
         const Tensor& a = arg(n, k, vals);
         if (numel(a.rows, a.cols) != numel(n.rows, n.cols)) return expand(a, n.rows, n.cols, n.dtype);
-        return reshaped(as_dtype(a, n.dtype), n.rows, n.cols);
+        return as_dtype(a, n.dtype, n.rows, n.cols);
     }
 
     // A gain / shift vector as (1, cols) in the node's dtype.
     Tensor row_arg(const TraceNode& n, std::size_t k, const std::vector<Tensor>& vals) const {
-        return reshaped(as_dtype(arg(n, k, vals), n.dtype), 1, n.cols);
+        return as_dtype(arg(n, k, vals), n.dtype, 1, n.cols);
     }
 
     void evaluate(const TraceNode& n, const std::vector<Tensor>& vals, Tensor& dst) const {
         switch (n.op) {
             case TraceOpKind::Copy:
+            case TraceOpKind::Cast:
                 assign(dst, full_arg(n, 0, vals));
                 return;
+            case TraceOpKind::Clamp:
+                assign(dst, full_arg(n, 0, vals));
+                brotensor::clamp(dst, n.scalar, n.scalar2);
+                return;
+            case TraceOpKind::Where: {
+                Tensor res = brotensor::jit::where(arg(n, 0, vals),
+                                                   full_arg(n, 1, vals),
+                                                   full_arg(n, 2, vals));
+                assign(dst, res);
+                return;
+            }
             case TraceOpKind::AddScalar:
             case TraceOpKind::SubScalar:
                 assign(dst, full_arg(n, 0, vals));
@@ -327,20 +371,22 @@ private:
             const bool a_small = numel(ra.rows, ra.cols) != numel(n.rows, n.cols);
             const bool b_small = numel(rb.rows, rb.cols) != numel(n.rows, n.cols);
             if (a_small != b_small) {
-                const Tensor big = full_arg(n, a_small ? 1 : 0, vals);
                 const Tensor& small = a_small ? ra : rb;
-                const Tensor v = as_dtype(small, n.dtype);
-                Tensor tmp = dst.data == big.data
-                                 ? Tensor::empty_on(n.device, n.rows, n.cols, n.dtype)
-                                 : reshaped(dst, n.rows, n.cols);
-                if (small.size() == 1) {
-                    Tensor y = reshaped(tmp, n.rows * n.cols, 1);
-                    brotensor::broadcast_mul(reshaped(big, n.rows * n.cols, 1), reshaped(v, 1, 1), y);
-                } else {
-                    brotensor::broadcast_mul(big, reshaped(v, 1, n.cols), tmp);
+                if (small.size() == 1 || (small.rows == 1 && small.cols == n.cols)) {
+                    const Tensor big = full_arg(n, a_small ? 1 : 0, vals);
+                    const Tensor v = as_dtype(small, n.dtype);
+                    Tensor tmp = dst.data == big.data
+                                     ? Tensor::empty_on(n.device, n.rows, n.cols, n.dtype)
+                                     : reshaped(dst, n.rows, n.cols);
+                    if (small.size() == 1) {
+                        Tensor y = reshaped(tmp, n.rows * n.cols, 1);
+                        brotensor::broadcast_mul(reshaped(big, n.rows * n.cols, 1), reshaped(v, 1, 1), y);
+                    } else {
+                        brotensor::broadcast_mul(big, reshaped(v, 1, n.cols), tmp);
+                    }
+                    assign(dst, tmp);
+                    return;
                 }
-                assign(dst, tmp);
-                return;
             }
         }
         Tensor a = full_arg(n, 0, vals);

@@ -39,6 +39,7 @@ struct ElementwisePlan {
     std::int64_t numel = 0;
     int vec = 1;              // elements per thread in the vector entry
     bool any_row_bcast = false;
+    bool any_col_bcast = false;
 };
 
 // Reduction at the head of a row-norm kernel.
