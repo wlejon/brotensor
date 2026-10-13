@@ -175,4 +175,62 @@ void set_vulkan_device_count(int count);
 // by the public wrapper when the chosen vtable slot is null.
 [[noreturn]] void throw_not_implemented(const char* op_name, Device d);
 
+// ─── Spatial & block-quant dimension validation guards ─────────────────────
+//
+// Inline hot-path checks (a few integer comparisons + 64-bit multiply) that
+// delegate formatting + throwing to cold [[noreturn]] helpers in dispatch.cpp.
+[[noreturn]] void throw_spatial_1d_error(const char* op, const char* tensor_name,
+                                         int N, int C, int L, int rows, int cols);
+[[noreturn]] void throw_spatial_2d_error(const char* op, const char* tensor_name,
+                                         int N, int C, int H, int W, int rows, int cols);
+[[noreturn]] void throw_spatial_3d_error(const char* op, const char* tensor_name,
+                                         int N, int C, int T, int H, int W, int rows, int cols);
+[[noreturn]] void throw_quant_cols_error(const char* op, const char* tensor_name,
+                                         Dtype dt, int rows, int cols);
+
+inline void check_spatial_1d(const char* op, const Tensor& t, const char* name,
+                             int N, int C, int L) {
+    const std::int64_t expected_cols = static_cast<std::int64_t>(C) * L;
+    if (N <= 0 || C <= 0 || L <= 0 ||
+        t.rows != N || static_cast<std::int64_t>(t.cols) != expected_cols) {
+        throw_spatial_1d_error(op, name, N, C, L, t.rows, t.cols);
+    }
+}
+
+inline void check_spatial_2d(const char* op, const Tensor& t, const char* name,
+                             int N, int C, int H, int W) {
+    const std::int64_t expected_cols = static_cast<std::int64_t>(C) * H * W;
+    if (N <= 0 || C <= 0 || H <= 0 || W <= 0 ||
+        t.rows != N || static_cast<std::int64_t>(t.cols) != expected_cols) {
+        throw_spatial_2d_error(op, name, N, C, H, W, t.rows, t.cols);
+    }
+}
+
+inline void check_spatial_3d(const char* op, const Tensor& t, const char* name,
+                             int N, int C, int T, int H, int W) {
+    const std::int64_t expected_cols = static_cast<std::int64_t>(C) * T * H * W;
+    if (N <= 0 || C <= 0 || T <= 0 || H <= 0 || W <= 0 ||
+        t.rows != N || static_cast<std::int64_t>(t.cols) != expected_cols) {
+        throw_spatial_3d_error(op, name, N, C, T, H, W, t.rows, t.cols);
+    }
+}
+
+inline void check_quant_cols(const char* op, const Tensor& t, const char* name) {
+    if (dtype_is_quant(t.dtype)) {
+        const int bs = dtype_block_size(t.dtype);
+        if (t.rows <= 0 || t.cols <= 0 || (t.cols % bs) != 0) {
+            throw_quant_cols_error(op, name, t.dtype, t.rows, t.cols);
+        }
+    }
+}
+
+#define BROTENSOR_CHECK_SPATIAL_1D(op, t, N, C, L) \
+    ::brotensor::detail::check_spatial_1d((op), (t), #t, (N), (C), (L))
+#define BROTENSOR_CHECK_SPATIAL_2D(op, t, N, C, H, W) \
+    ::brotensor::detail::check_spatial_2d((op), (t), #t, (N), (C), (H), (W))
+#define BROTENSOR_CHECK_SPATIAL_3D(op, t, N, C, T, H, W) \
+    ::brotensor::detail::check_spatial_3d((op), (t), #t, (N), (C), (T), (H), (W))
+#define BROTENSOR_CHECK_QUANT_COLS(op, t) \
+    ::brotensor::detail::check_quant_cols((op), (t), #t)
+
 } // namespace brotensor::detail

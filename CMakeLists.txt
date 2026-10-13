@@ -140,6 +140,9 @@ add_library(brotensor_core STATIC
     src/dispatch.cpp
     src/init.cpp
     src/ops.cpp
+    src/ops_spatial.cpp
+    src/ops_attention.cpp
+    src/ops_quant_audio.cpp
     src/ops/fused.cpp
     src/filtered_lrelu.cpp
     src/safetensors.cpp

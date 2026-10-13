@@ -294,6 +294,153 @@ void adopt_output(Tensor& t, Device d) {
     throw std::runtime_error(msg);
 }
 
+[[noreturn]] void throw_spatial_1d_error(const char* op, const char* tensor_name,
+                                         int N, int C, int L, int rows, int cols) {
+    std::string msg = "brotensor: ";
+    msg += op;
+    if (N <= 0 || C <= 0 || L <= 0) {
+        msg += ": non-positive spatial dimensions (N=";
+        msg += std::to_string(N);
+        msg += ", C=";
+        msg += std::to_string(C);
+        msg += ", L=";
+        msg += std::to_string(L);
+        msg += ") for ";
+        msg += tensor_name;
+        msg += " (rows=";
+        msg += std::to_string(rows);
+        msg += ", cols=";
+        msg += std::to_string(cols);
+        msg += ")";
+    } else {
+        const std::int64_t expected_cols = static_cast<std::int64_t>(C) * L;
+        msg += ": shape mismatch for ";
+        msg += tensor_name;
+        msg += ": expected (N=";
+        msg += std::to_string(N);
+        msg += ", C*L=";
+        msg += std::to_string(C);
+        msg += "*";
+        msg += std::to_string(L);
+        msg += "=";
+        msg += std::to_string(expected_cols);
+        msg += "), got (rows=";
+        msg += std::to_string(rows);
+        msg += ", cols=";
+        msg += std::to_string(cols);
+        msg += ")";
+    }
+    throw std::runtime_error(msg);
+}
+
+[[noreturn]] void throw_spatial_2d_error(const char* op, const char* tensor_name,
+                                         int N, int C, int H, int W, int rows, int cols) {
+    std::string msg = "brotensor: ";
+    msg += op;
+    if (N <= 0 || C <= 0 || H <= 0 || W <= 0) {
+        msg += ": non-positive spatial dimensions (N=";
+        msg += std::to_string(N);
+        msg += ", C=";
+        msg += std::to_string(C);
+        msg += ", H=";
+        msg += std::to_string(H);
+        msg += ", W=";
+        msg += std::to_string(W);
+        msg += ") for ";
+        msg += tensor_name;
+        msg += " (rows=";
+        msg += std::to_string(rows);
+        msg += ", cols=";
+        msg += std::to_string(cols);
+        msg += ")";
+    } else {
+        const std::int64_t expected_cols = static_cast<std::int64_t>(C) * H * W;
+        msg += ": shape mismatch for ";
+        msg += tensor_name;
+        msg += ": expected (N=";
+        msg += std::to_string(N);
+        msg += ", C*H*W=";
+        msg += std::to_string(C);
+        msg += "*";
+        msg += std::to_string(H);
+        msg += "*";
+        msg += std::to_string(W);
+        msg += "=";
+        msg += std::to_string(expected_cols);
+        msg += "), got (rows=";
+        msg += std::to_string(rows);
+        msg += ", cols=";
+        msg += std::to_string(cols);
+        msg += ")";
+    }
+    throw std::runtime_error(msg);
+}
+
+[[noreturn]] void throw_spatial_3d_error(const char* op, const char* tensor_name,
+                                         int N, int C, int T, int H, int W, int rows, int cols) {
+    std::string msg = "brotensor: ";
+    msg += op;
+    if (N <= 0 || C <= 0 || T <= 0 || H <= 0 || W <= 0) {
+        msg += ": non-positive spatial dimensions (N=";
+        msg += std::to_string(N);
+        msg += ", C=";
+        msg += std::to_string(C);
+        msg += ", T=";
+        msg += std::to_string(T);
+        msg += ", H=";
+        msg += std::to_string(H);
+        msg += ", W=";
+        msg += std::to_string(W);
+        msg += ") for ";
+        msg += tensor_name;
+        msg += " (rows=";
+        msg += std::to_string(rows);
+        msg += ", cols=";
+        msg += std::to_string(cols);
+        msg += ")";
+    } else {
+        const std::int64_t expected_cols = static_cast<std::int64_t>(C) * T * H * W;
+        msg += ": shape mismatch for ";
+        msg += tensor_name;
+        msg += ": expected (N=";
+        msg += std::to_string(N);
+        msg += ", C*T*H*W=";
+        msg += std::to_string(C);
+        msg += "*";
+        msg += std::to_string(T);
+        msg += "*";
+        msg += std::to_string(H);
+        msg += "*";
+        msg += std::to_string(W);
+        msg += "=";
+        msg += std::to_string(expected_cols);
+        msg += "), got (rows=";
+        msg += std::to_string(rows);
+        msg += ", cols=";
+        msg += std::to_string(cols);
+        msg += ")";
+    }
+    throw std::runtime_error(msg);
+}
+
+[[noreturn]] void throw_quant_cols_error(const char* op, const char* tensor_name,
+                                         Dtype dt, int rows, int cols) {
+    std::string msg = "brotensor: ";
+    msg += op;
+    msg += ": block-quant tensor ";
+    msg += tensor_name;
+    msg += " (";
+    msg += dtype_name(dt);
+    msg += ", rows=";
+    msg += std::to_string(rows);
+    msg += ", cols=";
+    msg += std::to_string(cols);
+    msg += ") requires positive rows and cols with cols a multiple of block size (";
+    msg += std::to_string(dtype_block_size(dt));
+    msg += ")";
+    throw std::runtime_error(msg);
+}
+
 } // namespace brotensor::detail
 
 namespace brotensor {

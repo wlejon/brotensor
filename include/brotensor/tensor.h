@@ -71,6 +71,9 @@ std::size_t dtype_storage_bytes(Dtype d, std::int64_t numel);
 // True iff `d` is a quant block carrier (Q*_*).
 bool dtype_is_quant(Dtype);
 
+// Human-readable name for a Dtype (e.g. "FP32", "Q4_K").
+const char* dtype_name(Dtype);
+
 // ─── Device ────────────────────────────────────────────────────────────────
 //
 // Runtime backend tag carried on every Tensor. CPU is always available;
@@ -260,9 +263,10 @@ struct Tensor {
 
     // ─── Accessors ─────────────────────────────────────────────────────────
 
-    int          size()  const { return rows * cols; }
-    std::size_t  bytes() const;
-    bool         is_host() const { return device == Device::CPU; }
+    int          size()      const { return rows * cols; }
+    std::size_t  bytes()     const;
+    std::size_t  row_bytes() const;
+    bool         is_host()   const { return device == Device::CPU; }
     bool         empty() const   { return data == nullptr || size() == 0; }
 
     // Host-side typed accessors. Throw std::runtime_error if device != CPU.
@@ -337,7 +341,11 @@ private:
 // symbolic tensor at `from` is gone; otherwise it moved from `from` to `to`.
 namespace detail {
 using JitSlotRetargetHook = void (*)(int slot, const Tensor* from, Tensor* to);
+using JitClampInplaceHook = bool (*)(Tensor& y, float lo, float hi);
+using JitCastOutHook      = bool (*)(const Tensor& src, Tensor& dst, Dtype out_dtype);
 extern JitSlotRetargetHook jit_slot_retarget;
+extern JitClampInplaceHook jit_clamp_inplace_hook;
+extern JitCastOutHook      jit_cast_out_hook;
 }  // namespace detail
 
 // ─── Allocation accounting ─────────────────────────────────────────────────

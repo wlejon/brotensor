@@ -85,6 +85,31 @@ bool dtype_is_quant(Dtype dt) {
     }
 }
 
+const char* dtype_name(Dtype dt) {
+    switch (dt) {
+        case Dtype::FP32:     return "FP32";
+        case Dtype::FP16:     return "FP16";
+        case Dtype::BF16:     return "BF16";
+        case Dtype::INT8:     return "INT8";
+        case Dtype::INT32:    return "INT32";
+        case Dtype::F64:      return "F64";
+        case Dtype::FP8_E4M3: return "FP8_E4M3";
+        case Dtype::Q4_0:     return "Q4_0";
+        case Dtype::Q4_1:     return "Q4_1";
+        case Dtype::Q5_0:     return "Q5_0";
+        case Dtype::Q5_1:     return "Q5_1";
+        case Dtype::Q8_0:     return "Q8_0";
+        case Dtype::Q8_1:     return "Q8_1";
+        case Dtype::Q2_K:     return "Q2_K";
+        case Dtype::Q3_K:     return "Q3_K";
+        case Dtype::Q4_K:     return "Q4_K";
+        case Dtype::Q5_K:     return "Q5_K";
+        case Dtype::Q6_K:     return "Q6_K";
+        case Dtype::Q8_K:     return "Q8_K";
+    }
+    return "?";
+}
+
 int dtype_block_size(Dtype dt) {
     switch (dt) {
         case Dtype::Q4_0: case Dtype::Q4_1:
@@ -314,6 +339,23 @@ void check_dims(int r, int c, const char* who) {
     }
 }
 
+void check_quant_cols(Dtype dt, int c, const char* who) {
+    if (!dtype_is_quant(dt) || c <= 0) return;
+    const int bs = dtype_block_size(dt);
+    if (c % bs != 0) {
+        std::string m = "brotensor: ";
+        m += who;
+        m += ": ";
+        m += dtype_name(dt);
+        m += " cols (";
+        m += std::to_string(c);
+        m += ") is not a multiple of block size (";
+        m += std::to_string(bs);
+        m += ")";
+        throw_msg(m);
+    }
+}
+
 void check_dtype(const Tensor& t, Dtype expected, const char* who) {
     if (t.dtype != expected) {
         std::string m = "brotensor: ";
@@ -353,6 +395,8 @@ void backend_zero(Device d, void* p, std::size_t bytes) {
 namespace detail {
 // Null until brotensor::jit starts a trace. See tensor.h.
 JitSlotRetargetHook jit_slot_retarget = nullptr;
+JitClampInplaceHook jit_clamp_inplace_hook = nullptr;
+JitCastOutHook      jit_cast_out_hook = nullptr;
 }  // namespace detail
 
 namespace {
@@ -468,15 +512,26 @@ Tensor& Tensor::operator=(const Tensor& o) {
 }
 
 std::size_t Tensor::bytes() const {
+    check_dims(rows, cols, "bytes");
+    if (rows > 0 && cols > 0) {
+        check_quant_cols(dtype, cols, "Tensor::bytes");
+    }
     return dtype_storage_bytes(
         dtype,
         static_cast<std::int64_t>(rows) * static_cast<std::int64_t>(cols));
+}
+
+std::size_t Tensor::row_bytes() const {
+    check_dims(rows, cols, "row_bytes");
+    check_quant_cols(dtype, cols, "Tensor::row_bytes");
+    return dtype_storage_bytes(dtype, static_cast<std::int64_t>(cols));
 }
 
 // ─── Factories ─────────────────────────────────────────────────────────────
 
 Tensor Tensor::empty_on(Device d, int r, int c, Dtype dt) {
     check_dims(r, c, "empty_on");
+    check_quant_cols(dt, c, "Tensor::empty_on");
     d = detail::resolve_device_alias(d);
     Tensor t;
     t.device = d;
@@ -587,6 +642,8 @@ Tensor Tensor::from_host_int8(const int8_t* src, int r, int c) {
 }
 
 Tensor Tensor::view(Device d, void* data, int r, int c, Dtype dt) {
+    check_dims(r, c, "view");
+    check_quant_cols(dt, c, "Tensor::view");
     d = detail::resolve_device_alias(d);
     Tensor t;
     t.device = d;
@@ -655,6 +712,7 @@ void Tensor::zero() {
 void Tensor::resize(int r, int c, Dtype dt) {
     check_not_symbolic(*this, "resize");
     check_dims(r, c, "resize");
+    check_quant_cols(dt, c, "Tensor::resize");
     if (r == rows && c == cols && dt == dtype && data != nullptr) return;
     const std::size_t new_bytes = dtype_storage_bytes(
         dt,

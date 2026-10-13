@@ -615,6 +615,166 @@ static void test_null_cpu_slot_throws() {
     }, "matmul_int8w_fp16: not implemented on CPU"));
 }
 
+// ─── 10. spatial 1D / 2D / 3D dimension guards at dispatch ─────────────────
+static void test_spatial_dimension_guards() {
+    std::printf("test_spatial_dimension_guards\n");
+
+    // Valid 2D call succeeds: N=1, C_in=4, H=2, W=2, C_out=1 -> cols=16
+    Tensor x2d_ok = Tensor::zeros_on(Device::CPU, 1, 16);
+    Tensor y2d_ok;
+    CHECK(!throws_runtime_error([&] {
+        brotensor::pixel_shuffle_upsample_2x_forward(x2d_ok, 1, 4, 2, 2, 1, y2d_ok);
+    }));
+    CHECK(y2d_ok.rows == 1 && y2d_ok.cols == 16);
+
+    // Valid 2D pad succeeds: N=1, C=2, H=2, W=2 -> cols=8
+    Tensor xpad_ok = Tensor::zeros_on(Device::CPU, 1, 8);
+    Tensor ypad_ok;
+    CHECK(!throws_runtime_error([&] {
+        brotensor::pad2d_forward(xpad_ok, 1, 2, 2, 2, 1, 1, 1, 1, 0, ypad_ok);
+    }));
+    CHECK(ypad_ok.rows == 1 && ypad_ok.cols == 32);
+
+    // Valid 1D call succeeds: N=1, C=2, L=4 -> cols=8
+    Tensor x1d_ok = Tensor::zeros_on(Device::CPU, 1, 8);
+    Tensor y1d_ok;
+    CHECK(!throws_runtime_error([&] {
+        brotensor::pad1d_forward(x1d_ok, 1, 2, 4, 1, 1, 0, y1d_ok);
+    }));
+    CHECK(y1d_ok.rows == 1 && y1d_ok.cols == 12);
+
+    // Mismatched 2D (cols != C * H * W) throws naming op and C*H*W product.
+    Tensor bad2d = Tensor::zeros_on(Device::CPU, 2, 10); // cols=10, but C*H*W = 3*4*4 = 48
+    Tensor w2d = Tensor::zeros_on(Device::CPU, 4, 27);
+    Tensor b2d = Tensor::zeros_on(Device::CPU, 1, 4);
+    Tensor out2d, ws2d, sign2d;
+    CHECK(throws_with([&] {
+        brotensor::conv2d_forward(bad2d, w2d, &b2d, 2, 3, 4, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1, 1, out2d);
+    }, "conv2d_forward: shape mismatch for X: expected (N=2, C*H*W=3*4*4=48), got (rows=2, cols=10)"));
+
+    CHECK(throws_with([&] {
+        brotensor::group_norm_forward(bad2d, b2d, b2d, 2, 3, 4, 4, 1, 1e-5f, out2d);
+    }, "group_norm_forward: shape mismatch for X: expected (N=2, C*H*W=3*4*4=48), got (rows=2, cols=10)"));
+
+    CHECK(throws_with([&] {
+        brotensor::upsample_nearest_2x(bad2d, 2, 3, 4, 4, out2d);
+    }, "upsample_nearest_2x"));
+
+    CHECK(throws_with([&] {
+        brotensor::downsample_avg_2x(bad2d, 2, 3, 4, 4, out2d);
+    }, "downsample_avg_2x"));
+
+    CHECK(throws_with([&] {
+        brotensor::pixel_shuffle_upsample_2x_forward(bad2d, 2, 3, 4, 4, 1, out2d);
+    }, "pixel_shuffle_upsample_2x_forward"));
+
+    CHECK(throws_with([&] {
+        brotensor::pad2d_forward(bad2d, 2, 3, 4, 4, 1, 1, 1, 1, 0, out2d);
+    }, "pad2d_forward"));
+
+    CHECK(throws_with([&] {
+        brotensor::filtered_lrelu_forward(bad2d, b2d, b2d, &b2d,
+                                          2, 3, 4, 4, 1, 1, 0, 0, 0, 0, 0.2f, 1.0f, 1.0f,
+                                          out2d, ws2d, sign2d);
+    }, "filtered_lrelu_forward"));
+
+    // Non-positive 2D spatial dims throw naming op and "non-positive spatial dimensions".
+    CHECK(throws_with([&] {
+        brotensor::upsample_nearest_2x(bad2d, 2, 0, 4, 4, out2d);
+    }, "non-positive spatial dimensions (N=2, C=0, H=4, W=4)"));
+    CHECK(throws_with([&] {
+        brotensor::upsample_nearest_2x(bad2d, 2, 3, -1, 4, out2d);
+    }, "non-positive spatial dimensions"));
+
+    // Mismatched 3D (cols != C * T * H * W) throws naming op and C*T*H*W product.
+    Tensor bad3d = Tensor::zeros_on(Device::CPU, 1, 20); // C*T*H*W = 2*3*4*4 = 96 != 20
+    Tensor w3d = Tensor::zeros_on(Device::CPU, 2, 54);
+    Tensor b3d = Tensor::zeros_on(Device::CPU, 1, 2);
+    Tensor out3d;
+    CHECK(throws_with([&] {
+        brotensor::conv3d_forward(bad3d, w3d, &b3d, 1, 2, 3, 4, 4, 2, 3, 3, 3,
+                                  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, out3d);
+    }, "conv3d_forward: shape mismatch for X: expected (N=1, C*T*H*W=2*3*4*4=96), got (rows=1, cols=20)"));
+
+    CHECK(throws_with([&] {
+        brotensor::conv3d_int8w_fp16_forward(bad3d, w3d, b3d, &b3d, 1, 2, 3, 4, 4, 2, 3, 3, 3,
+                                             1, 1, 1, 1, 1, 1, 1, 1, 1, 1, out3d);
+    }, "conv3d_int8w_fp16_forward"));
+
+    // Non-positive 3D spatial dims throw.
+    CHECK(throws_with([&] {
+        brotensor::conv3d_forward(bad3d, w3d, &b3d, 1, 2, 0, 4, 4, 2, 3, 3, 3,
+                                  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, out3d);
+    }, "non-positive spatial dimensions (N=1, C=2, T=0, H=4, W=4)"));
+
+    // Mismatched 1D (cols != C * L) throws naming op and C*L product.
+    Tensor bad1d = Tensor::zeros_on(Device::CPU, 2, 15); // C*L = 4*8 = 32 != 15
+    Tensor out1d;
+    CHECK(throws_with([&] {
+        brotensor::conv_transpose1d_forward(bad1d, w3d, &b3d, 2, 4, 8, 2, 3, 1, 1, 0, 1, 1, out1d);
+    }, "conv_transpose1d_forward: shape mismatch for X: expected (N=2, C*L=4*8=32), got (rows=2, cols=15)"));
+
+    CHECK(throws_with([&] {
+        brotensor::snake_forward(bad1d, b3d, nullptr, 2, 4, 8, out1d);
+    }, "snake_forward"));
+}
+
+// ─── 11. block-quant column alignment guards ───────────────────────────────
+static void test_block_quant_cols_guards() {
+    std::printf("test_block_quant_cols_guards\n");
+
+    // Even when rows * cols is a multiple of 256 (e.g. 256 * 100), each row's
+    // cols (100) is not divisible by 256 for Q4_K, so allocation, view, and
+    // resize must reject it immediately.
+    CHECK(throws_with([] {
+        (void)Tensor::empty_on(Device::CPU, 256, 100, Dtype::Q4_K);
+    }, "cols (100) is not a multiple of block size (256)"));
+
+    CHECK(throws_with([] {
+        (void)Tensor::zeros_on(Device::CPU, 32, 50, Dtype::Q8_0);
+    }, "cols (50) is not a multiple of block size (32)"));
+
+    std::vector<uint8_t> dummy(1024, 0);
+    CHECK(throws_with([&] {
+        (void)Tensor::view(Device::CPU, dummy.data(), 256, 100, Dtype::Q4_K);
+    }, "Tensor::view: Q4_K cols (100) is not a multiple of block size (256)"));
+
+    Tensor t = Tensor::zeros_on(Device::CPU, 2, 256, Dtype::Q4_K);
+    CHECK(t.row_bytes() == 144u);
+    CHECK(t.bytes() == 288u);
+    CHECK(throws_with([&] {
+        t.resize(256, 100, Dtype::Q4_K);
+    }, "Tensor::resize: Q4_K cols (100) is not a multiple of block size (256)"));
+
+    // Dense tensor row_bytes().
+    Tensor dense = Tensor::zeros_on(Device::CPU, 3, 10, Dtype::FP16);
+    CHECK(dense.row_bytes() == 20u);
+
+    // If a caller mutates a tensor's public `cols` field after construction,
+    // both row_bytes() and the quantized dispatch entrypoints catch it.
+    Tensor corrupt_q4 = Tensor::view(Device::CPU, dummy.data(), 1, 256, Dtype::Q4_K);
+    corrupt_q4.cols = 100;
+    CHECK(throws_with([&] { (void)corrupt_q4.row_bytes(); },
+                      "Tensor::row_bytes: Q4_K cols (100)"));
+
+    Tensor x_f16 = Tensor::zeros_on(Device::CPU, 2, 100, Dtype::FP16);
+    Tensor y_f16;
+    CHECK(throws_with([&] {
+        brotensor::linear_forward_batched_q4k_fp16(corrupt_q4, nullptr, x_f16, y_f16);
+    }, "linear_forward_batched_q4k_fp16: block-quant tensor W_q4k (Q4_K, rows=1, cols=100) requires positive rows and cols with cols a multiple of block size (256)"));
+
+    CHECK(throws_with([&] {
+        brotensor::dequant_q4k_to_fp16(corrupt_q4, y_f16);
+    }, "dequant_q4k_to_fp16: block-quant tensor W_q4k (Q4_K, rows=1, cols=100)"));
+
+    Tensor corrupt_q8 = Tensor::view(Device::CPU, dummy.data(), 1, 64, Dtype::Q8_0);
+    corrupt_q8.cols = 50;
+    Tensor x_f16_50 = Tensor::zeros_on(Device::CPU, 2, 50, Dtype::FP16);
+    CHECK(throws_with([&] {
+        brotensor::linear_forward_batched_q8_0_fp16(corrupt_q8, nullptr, x_f16_50, y_f16);
+    }, "linear_forward_batched_q8_0_fp16: block-quant tensor W_q8 (Q8_0, rows=1, cols=50) requires positive rows and cols with cols a multiple of block size (32)"));
+}
+
 int main() {
     brotensor::init();
     brotensor::DeviceScope cpu_only(Device::CPU);
@@ -633,6 +793,8 @@ int main() {
     test_dispatch_resolution();
     test_dispatch_device_mismatch();
     test_null_cpu_slot_throws();
+    test_spatial_dimension_guards();
+    test_block_quant_cols_guards();
 
     if (g_failures > 0) {
         std::printf("\nFAILED: %d check(s)\n", g_failures);
