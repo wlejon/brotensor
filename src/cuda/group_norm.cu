@@ -26,6 +26,11 @@ static inline cudaStream_t cur_stream() {
 void* cuda_alloc(std::size_t bytes);
 void  cuda_free(void* ptr);
 
+// group_norm_split.cu: the FP32 forward over few, large tiles.
+bool group_norm_forward_fp32_split(const float* X, const float* gamma, const float* beta,
+                                   float* Y, int N, int C, int spatial, int groups,
+                                   float eps, cudaStream_t stream);
+
 namespace {
 
 constexpr int GN_BLOCK = 256;
@@ -672,7 +677,12 @@ void group_norm_forward(const ::brotensor::Tensor& X,
             reinterpret_cast<const __nv_bfloat16*>(beta.data),
             reinterpret_cast<__nv_bfloat16*>(Y.data),
             C, spatial, channels_per_group, eps);
-    } else {
+    } else if (!group_norm_forward_fp32_split(
+                   reinterpret_cast<const float*>(X.data),
+                   reinterpret_cast<const float*>(gamma.data),
+                   reinterpret_cast<const float*>(beta.data),
+                   reinterpret_cast<float*>(Y.data), N, C, spatial, num_groups, eps,
+                   cur_stream())) {
         group_norm_forward_kernel_fp32<<<grid, GN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const float*>(X.data),
             reinterpret_cast<const float*>(gamma.data),

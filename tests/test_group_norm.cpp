@@ -452,6 +452,9 @@ int main() {
     run_fwd_fp32("groups=1",   1, 6,  3, 3, 1);
     run_fwd_fp32("groups=C",   1, 4,  5, 5, 4);
     run_fwd_fp32("SD-ish",     1, 32, 8, 8, 8);
+    // Few large tiles: the split (chunked-reduction) path.
+    run_fwd_fp32("split 1D",   2, 12, 1, 40000, 1);
+    run_fwd_fp32("split grp",  1, 8, 3, 9001, 2);
 
     // FP32 backward.
     run_bwd_fp32("tiny",       1, 4,  2, 2, 2);

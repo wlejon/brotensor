@@ -36,6 +36,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -185,10 +186,13 @@ __global__ void bn_inference_kernel(const T* __restrict__ X,
     const float inv = rsqrtf(bn_load_f32<T>(&running_var[c]) + eps);
     const float a = bn_load_f32<T>(&gamma[c]) * inv;
     const float b = bn_load_f32<T>(&beta[c]) - bn_load_f32<T>(&running_mean[c]) * a;
+    // blockIdx.y splits a channel's spatial range when there are few channels.
+    const int s0 = blockIdx.y * blockDim.x + tid;
+    const int sstride = blockDim.x * gridDim.y;
     for (int n = 0; n < N; ++n) {
-        const T* x_chan = X + (n * C + c) * spatial;
-        T*       y_chan = Y + (n * C + c) * spatial;
-        for (int s = tid; s < spatial; s += blockDim.x) {
+        const T* x_chan = X + ((long long)n * C + c) * spatial;
+        T*       y_chan = Y + ((long long)n * C + c) * spatial;
+        for (int s = s0; s < spatial; s += sstride) {
             bn_store_f32<T>(&y_chan[s], bn_load_f32<T>(&x_chan[s]) * a + b);
         }
     }
@@ -347,8 +351,17 @@ void batch_norm_inference(const ::brotensor::Tensor& X,
     }
     if (N == 0 || cols == 0) return;
 
+    // One block row per channel; with few channels, split each channel's
+    // spatial range so the grid still fills the GPU.
+    int split = 1;
+    if (C < 1024) {
+        const int want = (1024 + C - 1) / C;
+        const int most = (spatial + BN_BLOCK * 4 - 1) / (BN_BLOCK * 4);
+        split = std::max(1, std::min({want, most, 65535}));
+    }
+    const dim3 grid(static_cast<unsigned>(C), static_cast<unsigned>(split));
     if (X.dtype == Dtype::FP16) {
-        bn_inference_kernel<__half><<<C, BN_BLOCK, 0, cur_stream()>>>(
+        bn_inference_kernel<__half><<<grid, BN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __half*>(X.data),
             reinterpret_cast<const __half*>(gamma.data),
             reinterpret_cast<const __half*>(beta.data),
@@ -357,7 +370,7 @@ void batch_norm_inference(const ::brotensor::Tensor& X,
             reinterpret_cast<__half*>(Y.data),
             N, C, spatial, eps);
     } else if (X.dtype == Dtype::BF16) {
-        bn_inference_kernel<__nv_bfloat16><<<C, BN_BLOCK, 0, cur_stream()>>>(
+        bn_inference_kernel<__nv_bfloat16><<<grid, BN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const __nv_bfloat16*>(X.data),
             reinterpret_cast<const __nv_bfloat16*>(gamma.data),
             reinterpret_cast<const __nv_bfloat16*>(beta.data),
@@ -366,7 +379,7 @@ void batch_norm_inference(const ::brotensor::Tensor& X,
             reinterpret_cast<__nv_bfloat16*>(Y.data),
             N, C, spatial, eps);
     } else {
-        bn_inference_kernel<float><<<C, BN_BLOCK, 0, cur_stream()>>>(
+        bn_inference_kernel<float><<<grid, BN_BLOCK, 0, cur_stream()>>>(
             reinterpret_cast<const float*>(X.data),
             reinterpret_cast<const float*>(gamma.data),
             reinterpret_cast<const float*>(beta.data),

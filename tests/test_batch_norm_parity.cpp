@@ -192,6 +192,8 @@ BT_PARITY_TEST(bn_fwd_small)      { run_bn_forward(2, 4, 5, 6, 0xBA00ull); }
 BT_PARITY_TEST(bn_fwd_singleton)  { run_bn_forward(1, 3, 4, 4, 0xBA01ull); }
 BT_PARITY_TEST(bn_inf_small)      { run_bn_inference(2, 4, 5, 6, 0xBA10ull); }
 BT_PARITY_TEST(bn_inf_singleton)  { run_bn_inference(1, 3, 4, 4, 0xBA11ull); }
+// Few channels over a long spatial range: the split grid.
+BT_PARITY_TEST(bn_inf_split)      { run_bn_inference(2, 3, 1, 70001, 0xBA12ull); }
 BT_PARITY_TEST(bn_bwd_small)      { run_bn_backward(2, 4, 5, 6, 0xBA20ull); }
 BT_PARITY_TEST(bn_bwd_bigger)     { run_bn_backward(3, 8, 7, 9, 0xBA21ull); }
 BT_PARITY_TEST(bn_inf_fp16)       { run_bn_inference_16(2, 4, 5, 6, false, 0xBA30ull); }

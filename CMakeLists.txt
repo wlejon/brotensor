@@ -324,6 +324,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/q6k.cu
         src/cuda/q6k_wmma.cu
         src/cuda/group_norm.cu
+        src/cuda/group_norm_split.cu
         src/cuda/resample.cu
         src/cuda/interp2d.cu
         src/cuda/pool2d.cu
