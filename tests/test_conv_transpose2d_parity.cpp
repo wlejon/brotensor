@@ -222,6 +222,14 @@ BT_PARITY_TEST(ct2d_fwd_outpad) {
 BT_PARITY_TEST(ct2d_fwd_dil) {
     run_fwd({1, 2, 6, 6, 2, 3, 3, 1, 1, 1, 1, 0, 0, 2, 2, 1}, false, 0xC603ull);
 }
+// FP32 GEMM + col2im: overlapping taps (k 8, stride 4) on each axis, tiles
+// with tails.
+BT_PARITY_TEST(ct2d_fwd_gemm_freq) {
+    run_fwd({2, 70, 9, 21, 33, 8, 1, 4, 1, 0, 0, 0, 0, 1, 1, 1}, true, 0xC605ull);
+}
+BT_PARITY_TEST(ct2d_fwd_gemm_1d) {
+    run_fwd({2, 24, 1, 301, 5, 1, 8, 1, 4, 0, 2, 0, 1, 1, 1, 1}, true, 0xC606ull);
+}
 BT_PARITY_TEST(ct2d_fwd_groups) {
     run_fwd({1, 4, 4, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0, 1, 1, 2}, true, 0xC604ull);
 }

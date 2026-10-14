@@ -326,6 +326,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/group_norm.cu
         src/cuda/group_norm_split.cu
         src/cuda/flash_attention_varlen_f32.cu
+        src/cuda/conv2d_igemm_f32.cu
         src/cuda/resample.cu
         src/cuda/interp2d.cu
         src/cuda/pool2d.cu

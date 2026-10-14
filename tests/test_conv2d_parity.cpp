@@ -280,6 +280,12 @@ const ConvCfg kBigW    {1, 64, 6, 6,  128, 3, 3,  1,1, 1,1, 1,1, 1};
 // rides the WMMA implicit-GEMM path (3x3 pad 0 and 7x7 pad 3 branches).
 const ConvCfg kWmma3x3p0 {1, 32, 25, 27, 48, 3, 3,  1,1, 0,0, 1,1, 1};
 const ConvCfg kWmma7x7p3 {1, 64, 13, 15, 64, 7, 7,  1,1, 3,3, 1,1, 1};
+// FP32 implicit GEMM: several M and Cout tiles with tails, K tails, a 1D
+// strided conv, a dilated 1D conv, and an output size off the float4 store.
+const ConvCfg kIgemmFreq {2, 12, 64, 37, 70, 8, 1,  4,1, 2,0, 1,1, 1};
+const ConvCfg kIgemm1D   {2, 5, 1, 1001, 33, 1, 8,  1,4, 0,0, 1,1, 1};
+const ConvCfg kIgemmDil  {3, 24, 1, 333, 3, 1, 3,  1,1, 0,4, 1,4, 1};
+const ConvCfg kIgemm3x3  {2, 40, 9, 30, 130, 3, 3,  1,1, 1,1, 1,1, 1};
 
 } // namespace
 
@@ -292,6 +298,10 @@ BT_PARITY_TEST(conv2d_fwd_dilated)       { run_fwd(kDilated,  false, 0x6004ull);
 BT_PARITY_TEST(conv2d_fwd_grouped)       { run_fwd(kGrouped,  true,  0x6005ull); }
 BT_PARITY_TEST(conv2d_fwd_depthwise)     { run_fwd(kDepthw,   true,  0x6006ull); }
 BT_PARITY_TEST(conv2d_fwd_asym)          { run_fwd(kAsym,     false, 0x6007ull); }
+BT_PARITY_TEST(conv2d_fwd_igemm_freq)    { run_fwd(kIgemmFreq, true,  0x6008ull); }
+BT_PARITY_TEST(conv2d_fwd_igemm_1d)      { run_fwd(kIgemm1D,   true,  0x6009ull); }
+BT_PARITY_TEST(conv2d_fwd_igemm_dil)     { run_fwd(kIgemmDil,  false, 0x600Aull); }
+BT_PARITY_TEST(conv2d_fwd_igemm_3x3)     { run_fwd(kIgemm3x3,  true,  0x600Bull); }
 
 // ─── backward input ────────────────────────────────────────────────────────
 BT_PARITY_TEST(conv2d_bwd_input_1x1)     { run_bwd_input(k1x1,      0x6010ull); }

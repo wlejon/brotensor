@@ -378,6 +378,11 @@ namespace detail::cuda {
 void* cuda_alloc(std::size_t bytes);
 void  cuda_free(void* ptr);
 
+// conv2d_igemm_f32.cu: the FP32 implicit GEMM (groups == 1).
+bool conv2d_igemm_f32(const float* X, const float* Wt, const float* bias, float* Y, int N,
+                      int Cin, int H, int W, int Cout, int kH, int kW, int sh, int sw, int ph,
+                      int pw, int dh, int dw, int Ho, int Wo, cudaStream_t stream);
+
 void conv2d_forward(const ::brotensor::Tensor& X,
                     const ::brotensor::Tensor& Wt,
                     const ::brotensor::Tensor* bias,
@@ -533,6 +538,12 @@ void conv2d_forward(const ::brotensor::Tensor& X,
         const float* w_p = static_cast<const float*>(Wt.data);
         const float* b_p = bias ? static_cast<const float*>(bias->data) : nullptr;
         float* y_p       = static_cast<float*>(Y.data);
+        if (groups == 1 &&
+            conv2d_igemm_f32(x_p, w_p, b_p, y_p, N, C_in, H, W, C_out, kH, kW,
+                             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                             H_out, W_out, stream)) {
+            return;
+        }
         conv2d_forward_kernel<float><<<blocks, CONV_BLOCK, 0, stream>>>(
             x_p, w_p, b_p, y_p,
             N, C_in, H, W, C_out, kH, kW, H_out, W_out,

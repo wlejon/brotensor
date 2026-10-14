@@ -296,6 +296,12 @@ __global__ void convt2d_bwd_bias_kernel(const float* __restrict__ dY,
 
 } // namespace
 
+// conv2d_igemm_f32.cu: FP32 groups-1 transposed conv as GEMM + col2im.
+bool conv_transpose2d_f32_gemm(const float* X, const float* Wt, const float* bias, float* Y,
+                               int N, int Cin, int H, int W, int Cout, int kH, int kW, int sh,
+                               int sw, int ph, int pw, int dh, int dw, int Ho, int Wo,
+                               cudaStream_t stream);
+
 // ════════════════════════════════════════════════════════════════════════════
 //  Wrappers
 // ════════════════════════════════════════════════════════════════════════════
@@ -365,6 +371,14 @@ void conv_transpose2d_forward(const ::brotensor::Tensor& X,
             N, C_in, H, W, C_out, kH, kW,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             Cg_in, Cg_out, H_out, W_out);
+    } else if (groups == 1 &&
+               conv_transpose2d_f32_gemm(static_cast<const float*>(X.data),
+                                         static_cast<const float*>(Wt.data),
+                                         bias ? static_cast<const float*>(bias->data) : nullptr,
+                                         static_cast<float*>(Y.data), N, C_in, H, W, C_out,
+                                         kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h,
+                                         dil_w, H_out, W_out, cur_stream())) {
+        return;
     } else {
         convt2d_forward_kernel<float><<<ct2d_grid(total), CT2D_BLOCK, 0, cur_stream()>>>(
             static_cast<const float*>(X.data),
