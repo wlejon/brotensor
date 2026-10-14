@@ -21,6 +21,7 @@
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
+#include "detail/block_fft.cuh"
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
@@ -279,6 +280,104 @@ __global__ void istft_kernel(const float* __restrict__ spec,
     }
 }
 
+// ─── FFT paths (power-of-two n_fft) ─────────────────────────────────────────
+// The direct kernels above cost O(n_fft) per output value, which is nothing at
+// Whisper's 400 and seconds at a source separator's 4096. For a power-of-two
+// n_fft up to kFftMax, one block per frame runs a shared-memory FFT instead.
+// Same maps, same conventions: the inverse reads only the real part of the DC
+// and Nyquist bins, as the direct kernel's sum does.
+
+constexpr int kFftMax = 4096;      // n_fft * 8 bytes of shared memory
+constexpr int kFftThreads = 256;
+
+inline bool use_fft(int n_fft) {
+    return blockfft::is_pow2(n_fft) && n_fft >= 2 && n_fft <= kFftMax;
+}
+
+// One block per (b, f) frame.
+__global__ void stft_fft_kernel(const float* __restrict__ signal,
+                                const float* __restrict__ window,
+                                float* __restrict__ spec,
+                                int signal_len, int n_fft, int logn, int hop,
+                                int win_length, int pad_lo, int bins, int frames,
+                                int center, float norm) {
+    extern __shared__ float2 s[];
+    const int f = blockIdx.x % frames;
+    const int b = blockIdx.x / frames;
+    const float* srow = signal + (long long)b * signal_len;
+    const int base = f * hop;
+    for (int i = threadIdx.x; i < n_fft; i += blockDim.x) {
+        const int j = i - pad_lo;
+        float v = 0.0f;
+        if (j >= 0 && j < win_length)
+            v = srow[padded_index(base + i, signal_len, n_fft, center)] * window[j];
+        blockfft::block_fft_store(s, i, logn, make_float2(v, 0.0f));
+    }
+    blockfft::block_fft(s, n_fft, -1);
+    float* dst = spec + (long long)blockIdx.x * (2 * bins);
+    for (int k = threadIdx.x; k < bins; k += blockDim.x) {
+        dst[2 * k]     = s[k].x * norm;
+        dst[2 * k + 1] = s[k].y * norm;
+    }
+}
+
+// One block per (b, f) frame: the windowed inverse transform of the frame,
+// win_length samples into frames_out (N*frames, win_length).
+__global__ void istft_frame_kernel(const float* __restrict__ spec,
+                                   const float* __restrict__ window,
+                                   float* __restrict__ frames_out,
+                                   int n_fft, int logn, int win_length, int pad_lo,
+                                   int bins, float scale) {
+    extern __shared__ float2 s[];
+    const float* srow = spec + (long long)blockIdx.x * (2 * bins);
+    const int nyq = (n_fft % 2 == 0) ? n_fft / 2 : -1;
+    for (int k = threadIdx.x; k < n_fft; k += blockDim.x) {
+        float re, im;
+        if (k < bins) {
+            re = srow[2 * k];
+            im = (k == 0 || k == nyq) ? 0.0f : srow[2 * k + 1];
+        } else {                                    // Hermitian mirror
+            re = srow[2 * (n_fft - k)];
+            im = -srow[2 * (n_fft - k) + 1];
+        }
+        blockfft::block_fft_store(s, k, logn, make_float2(re, im));
+    }
+    blockfft::block_fft(s, n_fft, +1);
+    float* dst = frames_out + (long long)blockIdx.x * win_length;
+    for (int j = threadIdx.x; j < win_length; j += blockDim.x)
+        dst[j] = s[pad_lo + j].x * scale * window[j];
+}
+
+// One thread per (b, n) output sample: overlap-add of the covering frames,
+// COLA-divided.
+__global__ void istft_ola_kernel(const float* __restrict__ frames_in,
+                                 const float* __restrict__ env,
+                                 float* __restrict__ signal,
+                                 int N, int signal_len, int n_fft, int hop,
+                                 int win_length, int pad_lo, int frames, int center) {
+    const long long total = (long long)N * signal_len;
+    const int shift = center ? n_fft / 2 : 0;
+    for (long long g = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         g < total; g += (long long)blockDim.x * gridDim.x) {
+        const int n = static_cast<int>(g % signal_len);
+        const int b = static_cast<int>(g / signal_len);
+        const int p = n + shift;
+        const float e = env[p];
+        if (!(e > 1e-10f)) {
+            signal[g] = 0.0f;
+            continue;
+        }
+        const int rel  = p - pad_lo;
+        const int f_hi = min(frames - 1, rel >= 0 ? rel / hop : -1);
+        const int f_lo = max(0, rel - win_length + hop >= 0
+                                    ? (rel - win_length + hop) / hop : 0);
+        float acc = 0.0f;
+        for (int f = f_lo; f <= f_hi; ++f)
+            acc += frames_in[((long long)b * frames + f) * win_length + (rel - f * hop)];
+        signal[g] = acc / e;
+    }
+}
+
 // ─── istft_backward ─────────────────────────────────────────────────────────
 // One thread per (b, f, k) output bin. dSpec overwritten.
 __global__ void istft_backward_kernel(const float* __restrict__ dSignal,
@@ -357,6 +456,16 @@ void stft(const ::brotensor::Tensor& signal, const ::brotensor::Tensor& window,
     const double norm = normalized
                             ? 1.0 / std::sqrt(static_cast<double>(n_fft))
                             : 1.0;
+    if (use_fft(n_fft)) {
+        stft_fft_kernel<<<N * g.frames, kFftThreads, n_fft * sizeof(float2), cur_stream()>>>(
+            static_cast<const float*>(signal.data),
+            static_cast<const float*>(window.data),
+            static_cast<float*>(spec.data),
+            signal_len, n_fft, blockfft::log2_pow2(n_fft), hop_length, win_length,
+            g.pad_lo, g.bins, g.frames, center ? 1 : 0, static_cast<float>(norm));
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const long long total = (long long)N * g.frames * g.bins;
     stft_kernel<<<stft_grid(total), STFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(signal.data),
@@ -440,6 +549,24 @@ void istft(const ::brotensor::Tensor& spec, const ::brotensor::Tensor& window,
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     const long long total = (long long)N * signal_len;
+    if (use_fft(n_fft)) {
+        float* fr = static_cast<float*>(cuda_alloc(
+            static_cast<size_t>(exp_rows) * win_length * sizeof(float)));
+        istft_frame_kernel<<<exp_rows, kFftThreads, n_fft * sizeof(float2), cur_stream()>>>(
+            static_cast<const float*>(spec.data),
+            static_cast<const float*>(window.data), fr,
+            n_fft, blockfft::log2_pow2(n_fft), win_length, g.pad_lo, g.bins,
+            static_cast<float>(norm * invN));
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        istft_ola_kernel<<<stft_grid(total), STFT_BLOCK, 0, cur_stream()>>>(
+            fr, env, static_cast<float*>(signal.data),
+            N, signal_len, n_fft, hop_length, win_length, g.pad_lo, g.frames,
+            center ? 1 : 0);
+        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+        cuda_free(fr);
+        cuda_free(env);
+        return;
+    }
     istft_kernel<<<stft_grid(total), STFT_BLOCK, 0, cur_stream()>>>(
         static_cast<const float*>(spec.data),
         static_cast<const float*>(window.data), env,
