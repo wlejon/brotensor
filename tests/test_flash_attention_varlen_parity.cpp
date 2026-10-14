@@ -197,6 +197,17 @@ BT_PARITY_TEST(varlen_fp32_three_seq_varying_causal) {
 BT_PARITY_TEST(varlen_fp32_larger_head_dim) {
     run_varlen_fp32({16, 16}, {16, 16}, 4, 16, false, 0xAA);
 }
+// head_dim 64 non-causal takes the tiled kernel: query blocks that straddle
+// sequences, key counts off the 64 tile, cross lengths.
+BT_PARITY_TEST(varlen_fp32_hd64_straddle) {
+    run_varlen_fp32({37, 100, 5, 70}, {37, 100, 5, 70}, 3, 64, false, 0xAB);
+}
+BT_PARITY_TEST(varlen_fp32_hd64_cross) {
+    run_varlen_fp32({200, 130}, {90, 301}, 2, 64, false, 0xAC);
+}
+BT_PARITY_TEST(varlen_fp32_hd64_causal_fallback) {
+    run_varlen_fp32({70, 33}, {70, 33}, 2, 64, true, 0xAD);
+}
 
 } // namespace
 

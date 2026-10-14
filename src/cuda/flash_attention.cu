@@ -1281,6 +1281,12 @@ void flash_attention_varlen_backward(const ::brotensor::Tensor& Q,
                                      ::brotensor::Tensor& dK,
                                      ::brotensor::Tensor& dV);
 
+// flash_attention_varlen_f32.cu: the tiled FP32 head_dim-64 kernel.
+bool flash_attention_varlen_f32_hd64(const float* Q, const float* K, const float* V,
+                                     const int* cu_q, const int* cu_k, float* O,
+                                     int total_q, int batch, int num_heads, int head_dim,
+                                     bool causal, cudaStream_t stream);
+
 // ─── flash_attention_varlen_forward ────────────────────────────────────────
 //
 // Packed variable-length flash attention (Qwen3-VL window attention). Q/K/V
@@ -1513,6 +1519,17 @@ void flash_attention_varlen_forward(const Tensor& Q,
                                 reinterpret_cast<__half*>(O.data), max_seqlen_q, max_seqlen_k, D,
                                 num_heads, head_dim, causal, stream, batch_size);
         }
+        return;
+    }
+
+    // FP32 at head_dim 64: the tiled kernel (flash_attention_varlen_f32.cu).
+    if (dt == Dtype::FP32 &&
+        flash_attention_varlen_f32_hd64(
+            static_cast<const float*>(Q.data), static_cast<const float*>(K.data),
+            static_cast<const float*>(V.data), reinterpret_cast<const int*>(cu_seqlens_q),
+            reinterpret_cast<const int*>(cu_seqlens_k), static_cast<float*>(O.data), total_q,
+            batch_size, num_heads, head_dim, causal,
+            reinterpret_cast<cudaStream_t>(cuda_current_stream()))) {
         return;
     }
 
