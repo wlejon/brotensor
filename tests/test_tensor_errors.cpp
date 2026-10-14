@@ -643,6 +643,15 @@ static void test_spatial_dimension_guards() {
     }));
     CHECK(y1d_ok.rows == 1 && y1d_ok.cols == 12);
 
+    // The guard checks the element count: the same N*C*H*W floats as one row,
+    // or as a matrix being transposed, are accepted (CLAP, Whisper).
+    Tensor flat = Tensor::zeros_on(Device::CPU, 1, 4 * 3 * 1 * 5);
+    Tensor seq;
+    CHECK(!throws_runtime_error([&] { brotensor::nchw_to_sequence(flat, 4, 3, 1, 5, seq); }));
+    Tensor mat = Tensor::zeros_on(Device::CPU, 6, 5);
+    CHECK(!throws_runtime_error([&] { brotensor::nchw_to_sequence(mat, 1, 6, 1, 5, seq); }));
+    CHECK(seq.rows == 5 && seq.cols == 6);
+
     // Mismatched 2D (cols != C * H * W) throws naming op and C*H*W product.
     Tensor bad2d = Tensor::zeros_on(Device::CPU, 2, 10); // cols=10, but C*H*W = 3*4*4 = 48
     Tensor w2d = Tensor::zeros_on(Device::CPU, 4, 27);

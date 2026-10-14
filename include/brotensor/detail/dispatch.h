@@ -179,6 +179,10 @@ void set_vulkan_device_count(int count);
 //
 // Inline hot-path checks (a few integer comparisons + 64-bit multiply) that
 // delegate formatting + throwing to cold [[noreturn]] helpers in dispatch.cpp.
+// The spatial ops index their input as contiguous N*C*H*W floats, and
+// callers hand the same storage over as (N, C*H*W), (1, N*C*H*W) or a matrix
+// they are transposing (CLAP's mel image, Whisper's embedding), so a spatial
+// guard checks the element count, not the row split.
 [[noreturn]] void throw_spatial_1d_error(const char* op, const char* tensor_name,
                                          int N, int C, int L, int rows, int cols);
 [[noreturn]] void throw_spatial_2d_error(const char* op, const char* tensor_name,
@@ -190,27 +194,24 @@ void set_vulkan_device_count(int count);
 
 inline void check_spatial_1d(const char* op, const Tensor& t, const char* name,
                              int N, int C, int L) {
-    const std::int64_t expected_cols = static_cast<std::int64_t>(C) * L;
     if (N <= 0 || C <= 0 || L <= 0 ||
-        t.rows != N || static_cast<std::int64_t>(t.cols) != expected_cols) {
+        static_cast<std::int64_t>(t.rows) * t.cols != static_cast<std::int64_t>(N) * C * L) {
         throw_spatial_1d_error(op, name, N, C, L, t.rows, t.cols);
     }
 }
 
 inline void check_spatial_2d(const char* op, const Tensor& t, const char* name,
                              int N, int C, int H, int W) {
-    const std::int64_t expected_cols = static_cast<std::int64_t>(C) * H * W;
     if (N <= 0 || C <= 0 || H <= 0 || W <= 0 ||
-        t.rows != N || static_cast<std::int64_t>(t.cols) != expected_cols) {
+        static_cast<std::int64_t>(t.rows) * t.cols != static_cast<std::int64_t>(N) * C * H * W) {
         throw_spatial_2d_error(op, name, N, C, H, W, t.rows, t.cols);
     }
 }
 
 inline void check_spatial_3d(const char* op, const Tensor& t, const char* name,
                              int N, int C, int T, int H, int W) {
-    const std::int64_t expected_cols = static_cast<std::int64_t>(C) * T * H * W;
     if (N <= 0 || C <= 0 || T <= 0 || H <= 0 || W <= 0 ||
-        t.rows != N || static_cast<std::int64_t>(t.cols) != expected_cols) {
+        static_cast<std::int64_t>(t.rows) * t.cols != static_cast<std::int64_t>(N) * C * T * H * W) {
         throw_spatial_3d_error(op, name, N, C, T, H, W, t.rows, t.cols);
     }
 }
