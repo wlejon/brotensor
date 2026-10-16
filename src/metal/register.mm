@@ -58,6 +58,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.flash_attention_packed_qkv_forward          = &dm::flash_attention_packed_qkv_forward;
     ops.linear_forward_batched_ex                   = &dm::linear_forward_batched_ex;
     ops.quantize_rows                               = &dm::quantize_rows;
+    ops.dequantize_rows                             = &dm::dequantize_rows;
     ops.linear_forward_batched_wq_ex                = &dm::linear_forward_batched_wq_ex;
     ops.rope_qkv_packed_inplace                     = &dm::rope_qkv_packed_inplace;
     ops.segment_softmax_stats                       = &dm::segment_softmax_stats;

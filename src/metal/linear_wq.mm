@@ -226,6 +226,33 @@ kernel void NAME(device const uchar* Wq [[buffer(0)]], device const float* scale
 WQ_KERNEL(k_linear_wq_fp32, float)
 WQ_KERNEL(k_linear_wq_fp16, half)
 WQ_KERNEL(k_linear_wq_bf16, bfloat)
+
+// ── dequantize_rows: four weights a thread ──────────────────────────────────
+template <typename T>
+void dequantize_rows_impl(device const uchar* Q, device const float* scales, uint K, ulong n, uint fp8,
+                          device T* W, uint tid) {
+    const ulong i0 = ulong(tid) * 4ul;
+    for (uint j = 0; j < 4u; ++j) {
+        const ulong i = i0 + j;
+        if (i >= n) return;
+        const float v = w_decode(Q[i], fp8) * scales[i / ulong(K)];
+        W[i] = T(v);
+    }
+}
+
+#define DEQUANT_KERNEL(NAME, T)                                                   \
+kernel void NAME(device const uchar* Q [[buffer(0)]],                             \
+                 device const float* scales [[buffer(1)]],                        \
+                 device T* W [[buffer(2)]],                                       \
+                 constant uint& K [[buffer(3)]],                                  \
+                 constant ulong& n [[buffer(4)]],                                 \
+                 constant uint& fp8 [[buffer(5)]],                                \
+                 uint tid [[thread_position_in_grid]]) {                          \
+    dequantize_rows_impl<T>(Q, scales, K, n, fp8, W, tid);                        \
+}
+DEQUANT_KERNEL(k_dequantize_rows_fp32, float)
+DEQUANT_KERNEL(k_dequantize_rows_fp16, half)
+DEQUANT_KERNEL(k_dequantize_rows_bf16, bfloat)
 )msl";
 
 #define DEF_PSO(NAME, FN)                                                      \
@@ -238,6 +265,9 @@ WQ_KERNEL(k_linear_wq_bf16, bfloat)
 DEF_PSO(pso_quant_fp32, @"k_quantize_rows_fp32")
 DEF_PSO(pso_quant_fp16, @"k_quantize_rows_fp16")
 DEF_PSO(pso_quant_bf16, @"k_quantize_rows_bf16")
+DEF_PSO(pso_dequant_fp32, @"k_dequantize_rows_fp32")
+DEF_PSO(pso_dequant_fp16, @"k_dequantize_rows_fp16")
+DEF_PSO(pso_dequant_bf16, @"k_dequantize_rows_bf16")
 DEF_PSO(pso_wq_fp32, @"k_linear_wq_fp32")
 DEF_PSO(pso_wq_fp16, @"k_linear_wq_fp16")
 DEF_PSO(pso_wq_bf16, @"k_linear_wq_bf16")
@@ -277,6 +307,39 @@ void quantize_rows(const Tensor& W, Dtype fmt, Tensor& Wq, Tensor& scales) {
         [enc setBytes:&uK length:sizeof(uint32_t) atIndex:3];
         [enc setBytes:&fp8 length:sizeof(uint32_t) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(N), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(kQuantBlock, 1, 1)];
+        [enc endEncoding];
+        ::brotensor::metal_impl::submit(cmd);
+    }
+}
+
+void dequantize_rows(const Tensor& Wq, const Tensor& scales, Dtype out, Tensor& W) {
+    constexpr const char* op = "dequantize_rows";
+    if (Wq.dtype != Dtype::INT8 && Wq.dtype != Dtype::FP8_E4M3) fail(op, "Wq must be INT8 or FP8_E4M3");
+    if (scales.dtype != Dtype::FP32 || static_cast<long long>(scales.rows) * scales.cols != Wq.rows)
+        fail(op, "scales must be (out,1) FP32");
+    if (out != Dtype::FP16 && out != Dtype::BF16 && out != Dtype::FP32) fail(op, "out must be FP16, BF16 or FP32");
+    const int N = Wq.rows, K = Wq.cols;
+    if (W.rows != N || W.cols != K || W.dtype != out) W.resize(N, K, out);
+    const uint64_t n = static_cast<uint64_t>(N) * static_cast<uint64_t>(K);
+    if (n == 0) return;
+    const uint32_t uK = static_cast<uint32_t>(K);
+    const uint32_t fp8 = Wq.dtype == Dtype::FP8_E4M3 ? 1u : 0u;
+    id<MTLComputePipelineState> pso = out == Dtype::FP16   ? pso_dequant_fp16()
+                                      : out == Dtype::BF16 ? pso_dequant_bf16()
+                                                           : pso_dequant_fp32();
+    const NSUInteger tgs = static_cast<NSUInteger>((n + 1023) / 1024);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:buffer_for(Wq) offset:buffer_offset_for(Wq) atIndex:0];
+        [enc setBuffer:buffer_for(scales) offset:buffer_offset_for(scales) atIndex:1];
+        [enc setBuffer:buffer_for(W) offset:buffer_offset_for(W) atIndex:2];
+        [enc setBytes:&uK length:sizeof(uint32_t) atIndex:3];
+        [enc setBytes:&n length:sizeof(uint64_t) atIndex:4];
+        [enc setBytes:&fp8 length:sizeof(uint32_t) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(kQuantBlock, 1, 1)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
