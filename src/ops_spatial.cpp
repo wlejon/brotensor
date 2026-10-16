@@ -608,7 +608,9 @@ void spatial_merge_2x2_forward(const Tensor& X, int N, int C, int H, int W,
 
 void pixel_shuffle_upsample_2x_forward(const Tensor& X, int N, int C_in,
                                        int H, int W, int C_out, Tensor& Y) {
-    BROTENSOR_CHECK_SPATIAL_2D("pixel_shuffle_upsample_2x_forward", X, N, C_in, H, W);
+    if (N > 0 && C_in > 0 && H > 0 && W > 0) {
+        BROTENSOR_CHECK_SPATIAL_2D("pixel_shuffle_upsample_2x_forward", X, N, C_in, H, W);
+    }
     const auto& v = detail::dispatch(X, Y);
     if (!v.pixel_shuffle_upsample_2x_forward)
         detail::throw_not_implemented("pixel_shuffle_upsample_2x_forward", X.device);
