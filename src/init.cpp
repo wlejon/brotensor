@@ -137,7 +137,7 @@ void init() {
 }
 
 void shutdown() {
-    detail::cpu::ThreadPool::instance().shutdown();
+    if (auto* pool = detail::cpu::ThreadPool::existing()) pool->shutdown();
 }
 
 Device default_device() {

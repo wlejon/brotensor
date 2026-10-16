@@ -40,9 +40,18 @@ void ThreadPool::shutdown() {
     workers_.clear();
 }
 
+namespace {
+std::atomic<ThreadPool*> g_made{nullptr};
+}  // namespace
+
 ThreadPool& ThreadPool::instance() {
     static ThreadPool pool;
+    g_made.store(&pool, std::memory_order_release);
     return pool;
+}
+
+ThreadPool* ThreadPool::existing() {
+    return g_made.load(std::memory_order_acquire);
 }
 
 void ThreadPool::worker_loop() {

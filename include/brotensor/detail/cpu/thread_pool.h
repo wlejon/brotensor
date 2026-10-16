@@ -39,6 +39,10 @@ namespace brotensor::detail::cpu {
 class ThreadPool {
 public:
     static ThreadPool& instance();
+    // The pool if instance() has made it, else null: shutdown asks this, so
+    // a process that never ran a CPU kernel does not start a thread per core
+    // only to join them.
+    static ThreadPool* existing();
 
     void run(std::size_t n, const std::function<void(std::size_t)>& fn);
 
