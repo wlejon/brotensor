@@ -60,15 +60,36 @@ else()
         )
     endif()
 
+    # Written to a scratch name and copied over only when its content changed,
+    # so the modules recompile when a native moved, not whenever the tool
+    # relinked. Under Visual Studio the rule lives in a target of its own with
+    # a stamp for its output: MSBuild runs every custom build of a project
+    # that depends on one it just ran, whatever their timestamps, so a
+    # manifest rule in brotensor_api that re-ran (and copied nothing)
+    # recompiled every module and relinked everything downstream on each
+    # build. Ninja and Make restat the output and need it declared.
     set(TENSOR_NATIVE_MANIFEST "${GEN_DIR}/tensor_natives.json")
-    add_custom_command(
-        OUTPUT "${TENSOR_NATIVE_MANIFEST}"
-        COMMAND $<TARGET_FILE:brotensor-native-manifest> "${TENSOR_NATIVE_MANIFEST}.new"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TENSOR_NATIVE_MANIFEST}.new" "${TENSOR_NATIVE_MANIFEST}"
-        DEPENDS brotensor-native-manifest
-        COMMENT "brotensor-native-manifest -> generated/tensor_natives.json"
-        VERBATIM
-    )
+    if(CMAKE_GENERATOR MATCHES "^Visual Studio")
+        add_custom_command(
+            OUTPUT "${TENSOR_NATIVE_MANIFEST}.stamp"
+            COMMAND $<TARGET_FILE:brotensor-native-manifest> "${TENSOR_NATIVE_MANIFEST}.new"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TENSOR_NATIVE_MANIFEST}.new" "${TENSOR_NATIVE_MANIFEST}"
+            COMMAND ${CMAKE_COMMAND} -E touch "${TENSOR_NATIVE_MANIFEST}.stamp"
+            DEPENDS brotensor-native-manifest
+            COMMENT "brotensor-native-manifest -> generated/tensor_natives.json"
+            VERBATIM
+        )
+        add_custom_target(brotensor_native_manifest_json DEPENDS "${TENSOR_NATIVE_MANIFEST}.stamp")
+    else()
+        add_custom_command(
+            OUTPUT "${TENSOR_NATIVE_MANIFEST}"
+            COMMAND $<TARGET_FILE:brotensor-native-manifest> "${TENSOR_NATIVE_MANIFEST}.new"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${TENSOR_NATIVE_MANIFEST}.new" "${TENSOR_NATIVE_MANIFEST}"
+            DEPENDS brotensor-native-manifest
+            COMMENT "brotensor-native-manifest -> generated/tensor_natives.json"
+            VERBATIM
+        )
+    endif()
 
     set(BROTENSOR_GLOBALS "${CMAKE_CURRENT_SOURCE_DIR}/tensor.globals")
 
@@ -117,3 +138,6 @@ target_link_libraries(brotensor_api PUBLIC
     brotensor
     bronze::runtime_shared
 )
+if(TARGET brotensor_native_manifest_json)
+    add_dependencies(brotensor_api brotensor_native_manifest_json)
+endif()
