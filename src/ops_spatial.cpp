@@ -477,6 +477,7 @@ void scatter_rows_add(const Tensor& dY, const Tensor& Idx, int R, Tensor& dX) {
 void scatter_rows(const Tensor& Y, const Tensor& Idx, Tensor& X) {
     const auto& v = detail::dispatch(Y, Idx, X);
     if (!v.scatter_rows) detail::throw_not_implemented("scatter_rows", Y.device);
+    detail::adopt_output(X, Y.device);
     v.scatter_rows(Y, Idx, X);
 }
 
@@ -490,7 +491,7 @@ void conv_transpose2d_forward(const Tensor& X, const Tensor& Wt,
                               int dil_h, int dil_w, int groups,
                               Tensor& Y) {
     BROTENSOR_CHECK_SPATIAL_2D("conv_transpose2d_forward", X, N, C_in, H, W);
-    const auto& v = detail::dispatch(X, Wt, Y);
+    const auto& v = detail::dispatch_with_opts(X, Wt, {bias, &Y});
     if (!v.conv_transpose2d_forward)
         detail::throw_not_implemented("conv_transpose2d_forward", X.device);
     detail::adopt_output(Y, X.device);

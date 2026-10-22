@@ -70,7 +70,8 @@ void filtered_lrelu_forward(const Tensor& X, const Tensor& fu, const Tensor& fd,
                             float clamp, Tensor& up_buf, Tensor& act_buf,
                             Tensor& Y) {
     BROTENSOR_CHECK_SPATIAL_2D("filtered_lrelu_forward", X, N, C, H, W);
-    const auto& v = detail::dispatch(X, fu, fd, up_buf, act_buf, Y);
+    const auto& v = detail::dispatch_with_opts(
+        X, fu, {&fd, b, &up_buf, &act_buf, &Y});
     if (v.filtered_lrelu_forward) {
         detail::adopt_output(up_buf, X.device);
         detail::adopt_output(act_buf, X.device);
@@ -93,7 +94,8 @@ void filtered_lrelu_backward(const Tensor& dY, const Tensor& X,
                              float clamp, const Tensor& up_buf,
                              Tensor& dX, Tensor* dB) {
     BROTENSOR_CHECK_SPATIAL_2D("filtered_lrelu_backward", X, N, C, H, W);
-    const auto& v = detail::dispatch(dY, X, fu, fd, up_buf, dX);
+    const auto& v = detail::dispatch_with_opts(
+        dY, X, {&fu, &fd, b, &up_buf, &dX, dB});
     if (v.filtered_lrelu_backward) {
         detail::adopt_output(dX, X.device);
         if (dB) detail::adopt_output(*dB, X.device);

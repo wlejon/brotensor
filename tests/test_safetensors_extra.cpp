@@ -237,6 +237,51 @@ static void test_open_errors() {
     CHECK(open_throws(
         R"({"t":{"dtype":"F32","shape":[-1],"data_offsets":[0,0]}})",
         std::vector<uint8_t>(4, 0)));
+
+    // 0-byte file.
+    {
+        const fs::path p = tmp_path("brotensor_stx_zero.safetensors");
+        { std::ofstream f(p, std::ios::binary | std::ios::trunc); }
+        threw = false;
+        try { st::File f = st::File::open(p.string()); (void)f; }
+        catch (const std::runtime_error&) { threw = true; }
+        CHECK(threw);
+        remove_quiet(p);
+    }
+
+    // Missing required fields in entry (dtype, shape, data_offsets).
+    CHECK(open_throws(
+        R"({"t":{"shape":[2],"data_offsets":[0,0]}})",
+        std::vector<uint8_t>(8, 0)));
+    CHECK(open_throws(
+        R"({"t":{"dtype":"F32","data_offsets":[0,4]}})",
+        std::vector<uint8_t>(4, 0)));
+    CHECK(open_throws(
+        R"({"t":{"dtype":"F32","shape":[0]}})",
+        {}));
+
+    // Negative data_offsets.
+    CHECK(open_throws(
+        R"({"t":{"dtype":"F32","shape":[1],"data_offsets":[-4,0]}})",
+        std::vector<uint8_t>(4, 0)));
+
+    // Duplicate tensor names in header.
+    CHECK(open_throws(
+        R"({"t":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"t":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}})",
+        std::vector<uint8_t>(8, 0)));
+
+    // Duplicate field keys inside an entry.
+    CHECK(open_throws(
+        R"({"t":{"dtype":"F32","dtype":"F32","shape":[1],"data_offsets":[0,4]}})",
+        std::vector<uint8_t>(4, 0)));
+
+    // Trailing non-whitespace garbage after root '}'.
+    CHECK(open_throws(
+        R"({"t":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}garbage)",
+        std::vector<uint8_t>(4, 0)));
+
+    // Unterminated container in __metadata__.
+    CHECK(open_throws(R"({"__metadata__":{"a":"b")", {}));
 }
 
 // ── 4. header oddities the parser must tolerate ───────────────────────────

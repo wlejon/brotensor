@@ -74,6 +74,10 @@ Mapping map_file(const std::string& path) {
         ::close(fd);
         fail("fstat failed for '" + path + "'");
     }
+    if (st.st_size <= 0) {
+        ::close(fd);
+        return m;
+    }
     void* base = ::mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (base == MAP_FAILED) {
         ::close(fd);

@@ -127,7 +127,7 @@ void add_scalar_inplace(Tensor& y, float s) {
 }
 
 void add_channel_bias_inplace(Tensor& y, const Tensor& bias, int C, int L) {
-    const auto& v = detail::dispatch(y);
+    const auto& v = detail::dispatch(y, bias);
     if (!v.add_channel_bias_inplace)
         detail::throw_not_implemented("add_channel_bias_inplace", y.device);
     detail::adopt_output(y, y.device);
@@ -245,7 +245,8 @@ void attention_forward(const Tensor& X,
                        const float* d_mask,
                        Tensor& Q, Tensor& K, Tensor& V,
                        Tensor& Attn, Tensor& Y_pre_Wo, Tensor& O) {
-    const auto& v = detail::dispatch(X, Wq, Wk, Wv, Wo, Q, K, V);
+    const auto& v = detail::dispatch_with_opts(
+        X, Wq, {&Wk, &Wv, &Wo, &Q, &K, &V, &Attn, &Y_pre_Wo, &O});
     if (!v.attention_forward) detail::throw_not_implemented("attention_forward", X.device);
     detail::adopt_output(Q, X.device);
     detail::adopt_output(K, X.device);
@@ -266,7 +267,9 @@ void attention_backward(const Tensor& dO, const Tensor& X,
                         Tensor& dX,
                         Tensor& dWq, Tensor& dWk,
                         Tensor& dWv, Tensor& dWo) {
-    const auto& v = detail::dispatch(dO, X, Q, K, V, Attn, Y_pre_Wo);
+    const auto& v = detail::dispatch_with_opts(
+        dO, X, {&Q, &K, &V, &Attn, &Y_pre_Wo, &Wq, &Wk, &Wv, &Wo,
+                &dX, &dWq, &dWk, &dWv, &dWo});
     if (!v.attention_backward) detail::throw_not_implemented("attention_backward", dO.device);
     detail::adopt_output(dX, dO.device);
     detail::adopt_output(dWq, dO.device);
@@ -287,7 +290,7 @@ void mha_forward(const Tensor& X,
                  Tensor& Qh, Tensor& Kh, Tensor& Vh,
                  Tensor& Attnh, Tensor& Yconcat, Tensor& O) {
     const auto& v = detail::dispatch_with_opts(
-        X, Wq, {&Wk, &Wv, &Wo, bq, bk, bv, bo, &Qh, &Kh, &Vh});
+        X, Wq, {&Wk, &Wv, &Wo, bq, bk, bv, bo, &Qh, &Kh, &Vh, &Attnh, &Yconcat, &O});
     if (!v.mha_forward) detail::throw_not_implemented("mha_forward", X.device);
     detail::adopt_output(Qh, X.device);
     detail::adopt_output(Kh, X.device);
@@ -312,7 +315,8 @@ void mha_backward(const Tensor& dO, const Tensor& X,
                   Tensor* dbq, Tensor* dbk,
                   Tensor* dbv, Tensor* dbo) {
     const auto& v = detail::dispatch_with_opts(
-        dO, X, {&Qh, &Kh, &Vh, &Attnh, &Yconcat, dbq, dbk, dbv, dbo});
+        dO, X, {&Qh, &Kh, &Vh, &Attnh, &Yconcat, &Wq, &Wk, &Wv, &Wo,
+                &dX, &dWq, &dWk, &dWv, &dWo, dbq, dbk, dbv, dbo});
     if (!v.mha_backward) detail::throw_not_implemented("mha_backward", dO.device);
     detail::adopt_output(dX, dO.device);
     detail::adopt_output(dWq, dO.device);

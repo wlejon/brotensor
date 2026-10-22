@@ -229,6 +229,7 @@ struct Parser {
                 else if (*p == close) --depth;
                 ++p;
             }
+            if (depth > 0) fail("unterminated container");
             return;
         }
         // number / true / false / null
@@ -248,6 +249,9 @@ Entry parse_entry(Parser& ps) {
     Entry e;
     ps.expect('{');
     bool first = true;
+    bool seen_dtype = false;
+    bool seen_shape = false;
+    bool seen_offsets = false;
     while (true) {
         ps.skip_ws();
         if (ps.eat('}')) break;
@@ -256,12 +260,16 @@ Entry parse_entry(Parser& ps) {
         std::string key = ps.parse_string();
         ps.expect(':');
         if (key == "dtype") {
+            if (seen_dtype) throw std::runtime_error("safetensors: duplicate 'dtype' in entry");
+            seen_dtype = true;
             std::string v = ps.parse_string();
             e.dtype = parse_dtype(v);
             if (e.dtype == Dtype::Unknown) {
                 throw std::runtime_error("safetensors: unsupported dtype '" + v + "'");
             }
         } else if (key == "shape") {
+            if (seen_shape) throw std::runtime_error("safetensors: duplicate 'shape' in entry");
+            seen_shape = true;
             ps.expect('[');
             bool sfirst = true;
             while (true) {
@@ -272,15 +280,26 @@ Entry parse_entry(Parser& ps) {
                 e.shape.push_back(ps.parse_int());
             }
         } else if (key == "data_offsets") {
+            if (seen_offsets) throw std::runtime_error("safetensors: duplicate 'data_offsets' in entry");
+            seen_offsets = true;
             ps.expect('[');
-            e.off_start = static_cast<uint64_t>(ps.parse_int());
+            int64_t off_s = ps.parse_int();
             ps.expect(',');
-            e.off_end   = static_cast<uint64_t>(ps.parse_int());
+            int64_t off_e = ps.parse_int();
             ps.expect(']');
+            if (off_s < 0 || off_e < 0) {
+                throw std::runtime_error("safetensors: negative data_offsets");
+            }
+            e.off_start = static_cast<uint64_t>(off_s);
+            e.off_end   = static_cast<uint64_t>(off_e);
         } else {
             // Unknown field — skip its value defensively.
             ps.skip_value();
         }
+    }
+    if (!seen_dtype || !seen_shape || !seen_offsets) {
+        throw std::runtime_error(
+            "safetensors: entry missing required field (dtype, shape, or data_offsets)");
     }
     return e;
 }
@@ -333,6 +352,10 @@ Mapping map_file(const std::string& path) {
     if (fstat(fd, &st) != 0) {
         ::close(fd);
         throw std::runtime_error("safetensors: fstat failed for '" + path + "'");
+    }
+    if (st.st_size <= 0) {
+        ::close(fd);
+        return m;
     }
     void* base = ::mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (base == MAP_FAILED) {
@@ -425,6 +448,7 @@ File File::open(const std::string& path) {
     try {
         ps.expect('{');
         bool first = true;
+        bool seen_metadata = false;
         while (true) {
             ps.skip_ws();
             if (ps.eat('}')) break;
@@ -433,6 +457,10 @@ File File::open(const std::string& path) {
             std::string name = ps.parse_string();
             ps.expect(':');
             if (name == "__metadata__") {
+                if (seen_metadata) {
+                    throw std::runtime_error("safetensors: duplicate '__metadata__' key");
+                }
+                seen_metadata = true;
                 ps.skip_value();
                 continue;
             }
@@ -454,8 +482,15 @@ File File::open(const std::string& path) {
                     "safetensors: tensor '" + name +
                     "' nbytes/shape mismatch");
             }
-            f.index_.emplace(tv.name, f.tensors_.size());
+            if (!f.index_.emplace(tv.name, f.tensors_.size()).second) {
+                throw std::runtime_error(
+                    "safetensors: duplicate tensor name '" + name + "'");
+            }
             f.tensors_.push_back(std::move(tv));
+        }
+        ps.skip_ws();
+        if (ps.p != ps.end) {
+            ps.fail("unexpected trailing data after header object");
         }
     } catch (...) {
         // f's destructor will unmap.

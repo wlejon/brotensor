@@ -134,31 +134,46 @@ static void test_cpu_op_through_dispatch() {
     CHECK(y.host_f32()[4] == 7.0f);
 }
 
-// 7. Mixed-device operands passed to one op must throw. Only meaningful when
-//    CUDA is available (we need a second, distinct device to mix).
+// 7. Mixed-device operands passed to one op must throw. Uses a non-owning
+//    view tagged with Device::Metal so it always runs even on CPU-only builds.
 static void test_mixed_device_misuse() {
     std::printf("test_mixed_device_misuse\n");
-    if (!brotensor::is_available(Device::CUDA)) {
-        std::printf("  CUDA not available - skipping mixed-device sub-case\n");
-        return;
-    }
+    float buf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    Tensor x_cpu   = Tensor::zeros_on(Device::CPU, 2, 2);
+    Tensor y_other = Tensor::view(Device::Metal, buf, 2, 2);
 
-    Tensor x_cpu  = Tensor::zeros_on(Device::CPU,  4, 1);
-    Tensor y_cuda = Tensor::zeros_on(Device::CUDA, 4, 1);
+    auto expect_throws = [](auto&& fn) {
+        bool threw = false;
+        try {
+            fn();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+    };
 
-    bool threw = false;
-    try {
-        // relu_forward dispatches on its operands' device; a CPU input with a
-        // CUDA output is an operand-consistency violation.
-        brotensor::relu_forward(x_cpu, y_cuda);
-    } catch (const std::runtime_error&) {
-        threw = true;
-    } catch (const std::exception&) {
-        // Any std::exception subtype is acceptable evidence the op rejected
-        // the mismatch rather than corrupting memory.
-        threw = true;
-    }
-    CHECK(threw);
+    expect_throws([&]() { brotensor::relu_forward(x_cpu, y_other); });
+    expect_throws([&]() { brotensor::add_channel_bias_inplace(x_cpu, y_other, 2, 2); });
+    expect_throws([&]() {
+        Tensor c_cpu = Tensor::zeros_on(Device::CPU, 2, 2);
+        brotensor::matmul_abt(x_cpu, x_cpu, c_cpu, 1, 2, 2, 2, 4, 4, 4, &y_other, 0);
+    });
+    expect_throws([&]() {
+        Tensor y_out;
+        brotensor::conv_transpose2d_forward(
+            x_cpu, x_cpu, &y_other, 1, 1, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, y_out);
+    });
+    expect_throws([&]() {
+        Tensor u;
+        brotensor::lstm_forward_train(x_cpu, x_cpu, x_cpu, &y_other, nullptr, nullptr, nullptr,
+                                      1, 2, u, u, u, nullptr, nullptr);
+    });
+    expect_throws([&]() {
+        Tensor u;
+        brotensor::filtered_lrelu_forward(x_cpu, x_cpu, x_cpu, &y_other,
+                                          1, 1, 2, 2, 1, 1, 0, 0, 0, 0, 1.0f, 0.2f, -1.0f,
+                                          u, u, u);
+    });
 }
 
 // 8. If CUDA is available, set_default_device(CUDA) lands a tensor on CUDA.

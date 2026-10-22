@@ -105,7 +105,8 @@ void self_attention_forward_train(const Tensor& X,
                                   const float* d_mask, int num_heads,
                                   Tensor& Qh, Tensor& Kh, Tensor& Vh,
                                   Tensor& Attnh, Tensor& Yconcat, Tensor& O) {
-    const auto& v = detail::dispatch(X, Wq, Wk, Wv, Wo, Qh, Kh, Vh);
+    const auto& v = detail::dispatch_with_opts(
+        X, Wq, {&Wk, &Wv, &Wo, &Qh, &Kh, &Vh, &Attnh, &Yconcat, &O});
     if (!v.self_attention_forward_train)
         detail::throw_not_implemented("self_attention_forward_train", X.device);
     detail::adopt_output(Qh, X.device);
@@ -128,7 +129,9 @@ void self_attention_backward(const Tensor& dO, const Tensor& X,
                              Tensor& dX,
                              Tensor& dWq, Tensor& dWk,
                              Tensor& dWv, Tensor& dWo) {
-    const auto& v = detail::dispatch(dO, X, Qh, Kh, Vh, Attnh, Yconcat);
+    const auto& v = detail::dispatch_with_opts(
+        dO, X, {&Qh, &Kh, &Vh, &Attnh, &Yconcat, &Wq, &Wk, &Wv, &Wo,
+                &dX, &dWq, &dWk, &dWv, &dWo});
     if (!v.self_attention_backward)
         detail::throw_not_implemented("self_attention_backward", dO.device);
     detail::adopt_output(dX, dO.device);
@@ -161,7 +164,8 @@ void cross_attention_forward_train(const Tensor& X, const Tensor& Ctx,
                                    const float* d_mask, int num_heads,
                                    Tensor& Qh, Tensor& Kh, Tensor& Vh,
                                    Tensor& Attnh, Tensor& Yconcat, Tensor& O) {
-    const auto& v = detail::dispatch(X, Ctx, Wq, Wk, Wv, Wo, Qh, Kh);
+    const auto& v = detail::dispatch_with_opts(
+        X, Ctx, {&Wq, &Wk, &Wv, &Wo, &Qh, &Kh, &Vh, &Attnh, &Yconcat, &O});
     if (!v.cross_attention_forward_train)
         detail::throw_not_implemented("cross_attention_forward_train", X.device);
     detail::adopt_output(Qh, X.device);
@@ -184,7 +188,9 @@ void cross_attention_backward(const Tensor& dO, const Tensor& X, const Tensor& C
                               Tensor& dX, Tensor& dCtx,
                               Tensor& dWq, Tensor& dWk,
                               Tensor& dWv, Tensor& dWo) {
-    const auto& v = detail::dispatch(dO, X, Ctx, Qh, Kh, Vh, Attnh, Yconcat);
+    const auto& v = detail::dispatch_with_opts(
+        dO, X, {&Ctx, &Qh, &Kh, &Vh, &Attnh, &Yconcat, &Wq, &Wk, &Wv, &Wo,
+                &dX, &dCtx, &dWq, &dWk, &dWv, &dWo});
     if (!v.cross_attention_backward)
         detail::throw_not_implemented("cross_attention_backward", dO.device);
     detail::adopt_output(dX, dO.device);
@@ -492,7 +498,7 @@ void matmul_abt(const Tensor& A, const Tensor& B, Tensor& C,
                 int batch, int M, int N, int K,
                 long long strideA, long long strideB, long long strideC,
                 const Tensor* bias, int act) {
-    const auto& v = detail::dispatch(A, B, C);
+    const auto& v = detail::dispatch_with_opts(A, B, {bias, &C});
     if (!v.matmul_abt) detail::throw_not_implemented("matmul_abt", A.device);
     detail::adopt_output(C, A.device);
     v.matmul_abt(A, B, C, batch, M, N, K, strideA, strideB, strideC, bias, act);
@@ -512,7 +518,8 @@ void lstm_forward_train(const Tensor& X, const Tensor& W_ih, const Tensor& W_hh,
                         const Tensor* h0, const Tensor* c0, int T, int B,
                         Tensor& Y, Tensor& gates, Tensor& C,
                         Tensor* hT, Tensor* cT) {
-    const auto& v = detail::dispatch(X);
+    const auto& v = detail::dispatch_with_opts(
+        X, W_ih, {&W_hh, b_ih, b_hh, h0, c0, &Y, &gates, &C, hT, cT});
     if (!v.lstm_forward_train) detail::throw_not_implemented("lstm_forward_train", X.device);
     detail::adopt_output(Y, X.device);
     detail::adopt_output(gates, X.device);
@@ -529,7 +536,9 @@ void lstm_backward(const Tensor& X, const Tensor& W_ih, const Tensor& W_hh,
                    Tensor& dX, Tensor& dW_ih, Tensor& dW_hh,
                    Tensor* db_ih, Tensor* db_hh,
                    Tensor* dh0, Tensor* dc0) {
-    const auto& v = detail::dispatch(X);
+    const auto& v = detail::dispatch_with_opts(
+        X, W_ih, {&W_hh, h0, c0, &Y, &gates, &C, &dY,
+                  &dX, &dW_ih, &dW_hh, db_ih, db_hh, dh0, dc0});
     if (!v.lstm_backward) detail::throw_not_implemented("lstm_backward", X.device);
     detail::adopt_output(dX, X.device);
     detail::adopt_output(dW_ih, X.device);
