@@ -85,6 +85,8 @@ void modulated_conv2d_forward(const ::brotensor::Tensor& X,
     check_fp32(X, "modulated_conv2d_forward", "X");
     check_fp32(W, "modulated_conv2d_forward", "W");
     check_fp32(s, "modulated_conv2d_forward", "s");
+    if (N < 0 || C_in < 1 || H < 1 || Wd < 1 || C_out < 1 || kH < 1 || kW < 1)
+        throw std::runtime_error("modulated_conv2d_forward: invalid dimensions");
     const int wk = C_in * kH * kW;
     if (X.rows != N || X.cols != C_in * H * Wd)
         throw std::runtime_error("modulated_conv2d_forward: X shape mismatch");
@@ -154,11 +156,24 @@ void modulated_conv2d_backward(const ::brotensor::Tensor& X,
     check_fp32(dcoef, "modulated_conv2d_backward", "dcoef");
     check_fp32(dY, "modulated_conv2d_backward", "dY");
     (void)eps;  // demod coefficient is precomputed (passed in as dcoef)
+    if (N < 0 || C_in < 1 || H < 1 || Wd < 1 || C_out < 1 || kH < 1 || kW < 1)
+        throw std::runtime_error("modulated_conv2d_backward: invalid dimensions");
     const int wk = C_in * kH * kW;
     const int H_out = H + 2 * pad_h - (kH - 1);
     const int W_out = Wd + 2 * pad_w - (kW - 1);
+    if (H_out <= 0 || W_out <= 0)
+        throw std::runtime_error("modulated_conv2d_backward: non-positive output shape");
+    const int out_cols = C_out * H_out * W_out;
+    if (X.rows != N || X.cols != C_in * H * Wd)
+        throw std::runtime_error("modulated_conv2d_backward: X shape mismatch");
     if (W.rows != C_out || W.cols != wk)
         throw std::runtime_error("modulated_conv2d_backward: W shape mismatch");
+    if (s.rows != N || s.cols != C_in)
+        throw std::runtime_error("modulated_conv2d_backward: s shape mismatch");
+    if (dcoef.rows != N || dcoef.cols != C_out)
+        throw std::runtime_error("modulated_conv2d_backward: dcoef shape mismatch");
+    if (dY.rows != N || dY.cols != out_cols)
+        throw std::runtime_error("modulated_conv2d_backward: dY shape mismatch");
     // dW is an optional output: an uncommitted (data == nullptr) dW means
     // "skip the weight gradient" (mirrors the CUDA backend — used by inversion,
     // which freezes the weights). When committed it must be FP32 and shaped.
@@ -180,7 +195,6 @@ void modulated_conv2d_backward(const ::brotensor::Tensor& X,
     float* dWp = want_dW ? dW.host_f32_mut() : nullptr;   // accumulate (optional)
     float* dsp = ds.host_f32_mut();   // overwrite
 
-    const int out_cols = C_out * H_out * W_out;
     ::brotensor::Tensor Wpp = ::brotensor::Tensor::zeros_on(Device::CPU, C_out, wk); // w''
     ::brotensor::Tensor Wpr = ::brotensor::Tensor::zeros_on(Device::CPU, C_out, wk); // w'
     ::brotensor::Tensor dWpp = ::brotensor::Tensor::zeros_on(Device::CPU, C_out, wk);

@@ -881,7 +881,13 @@ void modulated_conv2d_backward(const Tensor& X, const Tensor& W, const Tensor& s
                                int pad_h, int pad_w, bool demodulate, float eps,
                                Tensor& dX, Tensor& dW, Tensor& ds) {
     BROTENSOR_CHECK_SPATIAL_2D("modulated_conv2d_backward", X, N, C_in, H, Wd);
-    BROTENSOR_CHECK_SPATIAL_2D("modulated_conv2d_backward", dY, N, C_out, H, Wd);
+    if (kH > 0 && kW > 0) {
+        const int H_out = H + 2 * pad_h - (kH - 1);
+        const int W_out = Wd + 2 * pad_w - (kW - 1);
+        if (H_out > 0 && W_out > 0) {
+            BROTENSOR_CHECK_SPATIAL_2D("modulated_conv2d_backward", dY, N, C_out, H_out, W_out);
+        }
+    }
     const auto& v = detail::dispatch(X, W, s, dcoef, dY, dX, dW, ds);
     if (!v.modulated_conv2d_backward)
         detail::throw_not_implemented("modulated_conv2d_backward", X.device);

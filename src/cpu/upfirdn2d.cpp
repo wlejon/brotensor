@@ -56,7 +56,7 @@ void upfirdn2d_run(const ::brotensor::Tensor& In, int N, int C, int Hin, int Win
         throw std::runtime_error(std::string("brotensor: ") + op +
                                  ": input shape mismatch");
     }
-    if (f.rows != fH || f.cols != fW) {
+    if (fH < 1 || fW < 1 || f.rows != fH || f.cols != fW) {
         throw std::runtime_error(std::string("brotensor: ") + op +
                                  ": filter shape mismatch");
     }
@@ -134,6 +134,15 @@ void upfirdn2d_backward(const ::brotensor::Tensor& dY, const ::brotensor::Tensor
                         int up_x, int up_y, int down_x, int down_y,
                         int pad_x0, int pad_x1, int pad_y0, int pad_y1,
                         bool flip_filter, float gain, ::brotensor::Tensor& dX) {
+    if (up_x < 1 || up_y < 1 || down_x < 1 || down_y < 1) {
+        throw std::runtime_error("brotensor: upfirdn2d_backward: up/down factors must be >= 1");
+    }
+    if (fH < 1 || fW < 1 || f.rows != fH || f.cols != fW) {
+        throw std::runtime_error("brotensor: upfirdn2d_backward: filter shape mismatch");
+    }
+    if (H * up_y + pad_y0 + pad_y1 < fH || Wd * up_x + pad_x0 + pad_x1 < fW) {
+        throw std::runtime_error("brotensor: upfirdn2d_backward: padded input smaller than filter");
+    }
     // Forward output dims (dY's spatial extent).
     const int Hout = out_dim(H,  up_y, down_y, pad_y0, pad_y1, fH);
     const int Wout = out_dim(Wd, up_x, down_x, pad_x0, pad_x1, fW);

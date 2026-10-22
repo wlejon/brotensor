@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 using brotensor::Tensor;
@@ -200,11 +201,61 @@ static void run_case(const Dims& d, bool demod) {
 
 int main() {
     brotensor::init();   // register CUDA backend (if compiled) for the parity check
-    // 1x1 (config-R) and 3x3, demod on/off.
+    // 1x1 (config-R) and 3x3 (same-padded and valid-padded where H_out != H), demod on/off.
     for (bool demod : {true, false}) {
         run_case({2, 3, 4, 5, 4, 1, 1, 0}, demod);
         run_case({2, 3, 4, 5, 4, 3, 3, 1}, demod);
+        run_case({2, 3, 5, 6, 4, 3, 3, 0}, demod);  // valid pad=0, k=3 => H_out=H-2, W_out=W-2
     }
+
+    // Shape and parameter validation on modulated_conv2d_backward.
+    {
+        const int N = 2, Cin = 2, H = 5, Wd = 5, Cout = 3, kH = 3, kW = 3, pad = 0;
+        const int Hout = H - 2, Wout = Wd - 2;
+        Tensor X = Tensor::zeros_on(brotensor::Device::CPU, N, Cin * H * Wd);
+        Tensor W = Tensor::zeros_on(brotensor::Device::CPU, Cout, Cin * kH * kW);
+        Tensor s = Tensor::zeros_on(brotensor::Device::CPU, N, Cin);
+        Tensor dcoef = Tensor::zeros_on(brotensor::Device::CPU, N, Cout);
+        Tensor dY_valid = Tensor::zeros_on(brotensor::Device::CPU, N, Cout * Hout * Wout);
+        Tensor dX, dW, ds;
+
+        // Wrong dY shape (sized to input H*Wd instead of Hout*Wout) must throw.
+        Tensor dY_bad = Tensor::zeros_on(brotensor::Device::CPU, N, Cout * H * Wd);
+        bool threw_dy = false;
+        try {
+            brotensor::modulated_conv2d_backward(X, W, s, dcoef, dY_bad, N, Cin, H, Wd,
+                                                 Cout, kH, kW, pad, pad, true, 1e-8f, dX, dW, ds);
+        } catch (const std::exception&) { threw_dy = true; }
+        CHECK(threw_dy);
+
+        // Wrong s shape must throw.
+        Tensor s_bad = Tensor::zeros_on(brotensor::Device::CPU, N, Cin + 1);
+        bool threw_s = false;
+        try {
+            brotensor::modulated_conv2d_backward(X, W, s_bad, dcoef, dY_valid, N, Cin, H, Wd,
+                                                 Cout, kH, kW, pad, pad, true, 1e-8f, dX, dW, ds);
+        } catch (const std::exception&) { threw_s = true; }
+        CHECK(threw_s);
+
+        // Wrong dcoef shape must throw.
+        Tensor dcoef_bad = Tensor::zeros_on(brotensor::Device::CPU, N, Cout + 1);
+        bool threw_dcoef = false;
+        try {
+            brotensor::modulated_conv2d_backward(X, W, s, dcoef_bad, dY_valid, N, Cin, H, Wd,
+                                                 Cout, kH, kW, pad, pad, true, 1e-8f, dX, dW, ds);
+        } catch (const std::exception&) { threw_dcoef = true; }
+        CHECK(threw_dcoef);
+
+        // Non-positive output extent (H=2, k=3, pad=0 => H_out=0) must throw.
+        Tensor X_small = Tensor::zeros_on(brotensor::Device::CPU, N, Cin * 2 * 2);
+        bool threw_small = false;
+        try {
+            brotensor::modulated_conv2d_backward(X_small, W, s, dcoef, dY_valid, N, Cin, 2, 2,
+                                                 Cout, kH, kW, 0, 0, true, 1e-8f, dX, dW, ds);
+        } catch (const std::exception&) { threw_small = true; }
+        CHECK(threw_small);
+    }
+
     if (g_failures) {
         std::printf("modulated_conv2d: %d FAILED\n", g_failures);
         return 1;

@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 using brotensor::Tensor;
@@ -163,6 +164,24 @@ int main() {
     run_case({2, 1, 1, 1, 1, 1, 0, 0, 1, 3, false, 2.0f}, 2, 2, 4, 5);
     // combined up=2 down=2 (net identity scale), 3x3 filter.
     run_case({2, 2, 2, 2, 1, 1, 1, 1, 3, 3, false, 1.0f}, 1, 3, 6, 6);
+
+    // Reject padded input smaller than filter in backward when (H*up + pad - fH) == -1 and down == 2.
+    {
+        Tensor dY = Tensor::zeros_on(brotensor::Device::CPU, 1, 1);
+        Tensor F = Tensor::zeros_on(brotensor::Device::CPU, 4, 4);
+        Tensor dX;
+        bool threw = false;
+        try {
+            // H=3, up=1, pad=0, fH=4, down=2 => Hp - fH = -1 (previously -1 / 2 == 0 => Hout = 1)
+            brotensor::upfirdn2d_backward(dY, F, 1, 1, 3, 3, 4, 4,
+                                          1, 1, 2, 2, 0, 0, 0, 0,
+                                          false, 1.0f, dX);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+
     if (g_failures) {
         std::printf("upfirdn2d: %d FAILED\n", g_failures);
         return 1;
