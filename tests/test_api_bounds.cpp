@@ -207,5 +207,13 @@ int run_api_bounds_tests() {
             throws("concatBatchedRows rows", () => T.concatBatchedRows([mk(2, 2), mk(3, 2)], mk(1, 1)), "row count"));
     )JS"));
 
+    failures += runJs("bounds: handle branding between GpuTensor and SafetensorsFile", block(R"JS(
+        const a = mk(2, 1, [1, 2]);
+        return firstFail(
+            throws("SafetensorsFile.close on GpuTensor", () => T.SafetensorsFile.prototype.close.call(a), "SafetensorsFile"),
+            throws("SafetensorsFile.names on GpuTensor", () => T.SafetensorsFile.prototype.names.call(a), "SafetensorsFile"),
+            throws("SafetensorsFile.header on GpuTensor", () => T.SafetensorsFile.prototype.header.call(a), "SafetensorsFile"));
+    )JS"));
+
     return failures;
 }

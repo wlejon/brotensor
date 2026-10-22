@@ -17,7 +17,7 @@ void* bro_tensor_GpuTensor_ctor(void) {
 }
 
 void bro_tensor_GpuTensor_dtor(void* self) {
-    delete static_cast<GpuTensorHandle*>(self);
+    delete toHandle(self);
 }
 
 void* bro_tensor_createTensor(int32_t rows, int32_t cols, const char* dtype) {
@@ -57,7 +57,11 @@ int32_t bro_tensor_GpuTensor_bytes_get(void* self) {
 
 void bro_tensor_GpuTensor_zero(void* self) {
     auto* t = toTensor(self);
-    if (t && !t->empty()) {
+    if (!t) {
+        setError("zero: not a GpuTensor");
+        return;
+    }
+    if (!t->empty()) {
         BROTENSOR_API_TRY
             t->zero();
         BROTENSOR_API_CATCH("zero")
@@ -66,7 +70,10 @@ void bro_tensor_GpuTensor_zero(void* self) {
 
 void bro_tensor_GpuTensor_resize(void* self, int32_t rows, int32_t cols, const char* dtype) {
     auto* t = toTensor(self);
-    if (!t) return;
+    if (!t) {
+        setError("resize: not a GpuTensor");
+        return;
+    }
     auto dt = parseDtype(dtype);
     if (rows < 0 || cols < 0) {
         setError("resize: negative dimension");
@@ -83,18 +90,24 @@ void bro_tensor_GpuTensor_resize(void* self, int32_t rows, int32_t cols, const c
 
 const char* bro_tensor_GpuTensor_dtype(void* self) {
     auto* t = toTensor(self);
-    return t ? dtypeToString(t->dtype) : "fp32";
+    if (!t) {
+        setError("dtype: not a GpuTensor");
+        return "fp32";
+    }
+    return dtypeToString(t->dtype);
 }
 
 void* bro_tensor_GpuTensor_clone(void* self) {
     auto* h = new GpuTensorHandle();
     auto* src = toHandle(self);
-    if (src) {
-        BROTENSOR_API_TRY
-            h->tensor = src->tensor.clone();
-            h->shape = src->shape;
-        BROTENSOR_API_CATCH("clone")
+    if (!src) {
+        setError("clone: not a GpuTensor");
+        return h;
     }
+    BROTENSOR_API_TRY
+        h->tensor = src->tensor.clone();
+        h->shape = src->shape;
+    BROTENSOR_API_CATCH("clone")
     return h;
 }
 
@@ -116,7 +129,10 @@ static bool uploadShape(const char* label, const brotensor::Tensor* t, uint32_t 
 
 void bro_tensor_GpuTensor_upload(void* self, const float* data, uint32_t data_len) {
     auto* t = toTensor(self);
-    if (!t || !data) return;
+    if (!t || !data) {
+        if (!t) setError("upload: not a GpuTensor");
+        return;
+    }
     int r = 0, c = 0;
     if (!uploadShape("upload", t, data_len, r, c)) return;
     BROTENSOR_API_TRY
@@ -128,6 +144,7 @@ void bro_tensor_GpuTensor_download(void* self, bronze_native_buffer* out) {
     if (!out) return;
     auto* t = toTensor(self);
     if (!t || t->empty()) {
+        if (!t) setError("download: not a GpuTensor");
         out->data = nullptr;
         out->length = 0;
         out->release = nullptr;
@@ -162,7 +179,10 @@ void bro_tensor_GpuTensor_download(void* self, bronze_native_buffer* out) {
 
 void bro_tensor_GpuTensor_uploadFp16(void* self, const uint16_t* data, uint32_t data_len) {
     auto* t = toTensor(self);
-    if (!t || !data) return;
+    if (!t || !data) {
+        if (!t) setError("uploadFp16: not a GpuTensor");
+        return;
+    }
     int r = 0, c = 0;
     if (!uploadShape("uploadFp16", t, data_len, r, c)) return;
     BROTENSOR_API_TRY
@@ -174,6 +194,7 @@ void bro_tensor_GpuTensor_downloadFp16(void* self, bronze_native_buffer* out) {
     if (!out) return;
     auto* t = toTensor(self);
     if (!t || t->empty()) {
+        if (!t) setError("downloadFp16: not a GpuTensor");
         out->data = nullptr;
         out->length = 0;
         out->release = nullptr;
@@ -205,7 +226,10 @@ void bro_tensor_GpuTensor_downloadFp16(void* self, bronze_native_buffer* out) {
 
 void bro_tensor_GpuTensor_uploadInt8(void* self, const int8_t* data, uint32_t data_len) {
     auto* t = toTensor(self);
-    if (!t || !data) return;
+    if (!t || !data) {
+        if (!t) setError("uploadInt8: not a GpuTensor");
+        return;
+    }
     int r = 0, c = 0;
     if (!uploadShape("uploadInt8", t, data_len, r, c)) return;
     BROTENSOR_API_TRY
@@ -217,6 +241,7 @@ void bro_tensor_GpuTensor_downloadInt8(void* self, bronze_native_buffer* out) {
     if (!out) return;
     auto* t = toTensor(self);
     if (!t || t->empty()) {
+        if (!t) setError("downloadInt8: not a GpuTensor");
         out->data = nullptr;
         out->length = 0;
         out->release = nullptr;

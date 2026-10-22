@@ -5,6 +5,7 @@
 #include "brotensor/runtime.h"
 #include "embed/embed.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -14,29 +15,53 @@
 
 namespace brotensor::api {
 
+enum class HandleBrand : uint8_t {
+    GpuTensor = 1,
+    SafetensorsFile = 2,
+};
+
+void registerBrand(const void* ptr, HandleBrand brand);
+void unregisterBrand(const void* ptr);
+bool hasBrand(const void* ptr, HandleBrand brand);
+
 struct GpuTensorHandle {
     brotensor::Tensor tensor;
     std::vector<int64_t> shape;
+
+    GpuTensorHandle() {
+        registerBrand(this, HandleBrand::GpuTensor);
+        if (static_cast<const void*>(&tensor) != static_cast<const void*>(this)) {
+            registerBrand(&tensor, HandleBrand::GpuTensor);
+        }
+    }
+    ~GpuTensorHandle() {
+        if (static_cast<const void*>(&tensor) != static_cast<const void*>(this)) {
+            unregisterBrand(&tensor);
+        }
+        unregisterBrand(this);
+    }
+    GpuTensorHandle(const GpuTensorHandle&) = delete;
+    GpuTensorHandle& operator=(const GpuTensorHandle&) = delete;
 };
 
 inline GpuTensorHandle* toHandle(void* ptr) {
-    if (!ptr) return nullptr;
+    if (!ptr || !hasBrand(ptr, HandleBrand::GpuTensor)) return nullptr;
     return static_cast<GpuTensorHandle*>(ptr);
 }
 
 inline const GpuTensorHandle* constHandle(const void* ptr) {
-    if (!ptr) return nullptr;
+    if (!ptr || !hasBrand(ptr, HandleBrand::GpuTensor)) return nullptr;
     return static_cast<const GpuTensorHandle*>(ptr);
 }
 
 inline brotensor::Tensor* toTensor(void* ptr) {
-    if (!ptr) return nullptr;
-    return &static_cast<GpuTensorHandle*>(ptr)->tensor;
+    auto* h = toHandle(ptr);
+    return h ? &h->tensor : nullptr;
 }
 
 inline const brotensor::Tensor* constTensor(const void* ptr) {
-    if (!ptr) return nullptr;
-    return &static_cast<const GpuTensorHandle*>(ptr)->tensor;
+    auto* h = constHandle(ptr);
+    return h ? &h->tensor : nullptr;
 }
 
 // The old QuickJS binding accepted "fp32"/"f32", "fp16"/"f16", "bf16",
@@ -100,7 +125,7 @@ bool readTensorArray(uint64_t bits, std::vector<brotensor::Tensor*>& out, const 
 // argument missing" and answers false, so a body can `if (!need(...)) return;`.
 inline bool need(const char* label, std::initializer_list<const void*> ptrs) {
     for (const void* p : ptrs) {
-        if (!p) {
+        if (!p || !hasBrand(p, HandleBrand::GpuTensor)) {
             setError(std::string(label) + ": GpuTensor argument missing");
             return false;
         }

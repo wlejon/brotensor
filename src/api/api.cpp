@@ -10,7 +10,9 @@
 #include "native_tensor_extra_decl.h"
 
 #include <initializer_list>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 extern "C" void bronze_tensor_main(void);
 extern "C" void bronze_tensor_ext_main(void);
@@ -73,7 +75,37 @@ void publishPrototype(const char* ns, const char* className, const char* protoNa
 template <typename F>
 void* p(F* f) { return reinterpret_cast<void*>(f); }
 
+std::mutex& brandMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<const void*, HandleBrand>& brandMap() {
+    static auto* m = new std::unordered_map<const void*, HandleBrand>();
+    return *m;
+}
+
 } // namespace
+
+void registerBrand(const void* ptr, HandleBrand brand) {
+    if (!ptr) return;
+    std::lock_guard<std::mutex> lk(brandMutex());
+    brandMap()[ptr] = brand;
+}
+
+void unregisterBrand(const void* ptr) {
+    if (!ptr) return;
+    std::lock_guard<std::mutex> lk(brandMutex());
+    brandMap().erase(ptr);
+}
+
+bool hasBrand(const void* ptr, HandleBrand brand) {
+    if (!ptr) return false;
+    std::lock_guard<std::mutex> lk(brandMutex());
+    auto& m = brandMap();
+    auto it = m.find(ptr);
+    return it != m.end() && it->second == brand;
+}
 
 std::string& lastErrorSlot() {
     static thread_local std::string slot;

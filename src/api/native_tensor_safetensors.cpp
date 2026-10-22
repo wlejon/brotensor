@@ -30,9 +30,15 @@ namespace {
 
 struct SafetensorsFileHandle {
     std::unique_ptr<stns::File> file;
+
+    SafetensorsFileHandle() { registerBrand(this, HandleBrand::SafetensorsFile); }
+    ~SafetensorsFileHandle() { unregisterBrand(this); }
+    SafetensorsFileHandle(const SafetensorsFileHandle&) = delete;
+    SafetensorsFileHandle& operator=(const SafetensorsFileHandle&) = delete;
 };
 
 SafetensorsFileHandle* asFile(void* self) {
+    if (!self || !hasBrand(self, HandleBrand::SafetensorsFile)) return nullptr;
     return static_cast<SafetensorsFileHandle*>(self);
 }
 
@@ -165,7 +171,11 @@ void* bro_tensor_SafetensorsFile_get(void* self, const char* name, int32_t rows,
 
 void bro_tensor_SafetensorsFile_close(void* self) {
     auto* h = asFile(self);
-    if (h) h->file.reset();
+    if (!h) {
+        setError("close() on a non-SafetensorsFile receiver");
+        return;
+    }
+    h->file.reset();
 }
 
 bool bro_tensor_saveSafetensors(const char* path, uint64_t names_bits, uint64_t tensors_bits) {

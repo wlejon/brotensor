@@ -41,6 +41,10 @@ static void test_native_handles() {
     CHECK(unwrapped->rows == 3);
     CHECK(unwrapped->cols == 4);
     CHECK(unwrapped->size() == 12);
+
+    int dummy = 7;
+    bronze::Value foreign = bronze::embed::makeHandle(&dummy, [](void*) {});
+    CHECK(brotensor::api::getTensorFromHandle(foreign) == nullptr);
 }
 
 static void test_js_api() {
@@ -310,6 +314,16 @@ static void test_js_safetensors() {
         threw = false;
         try { tensor.saveSafetensors(savedPath, { w: 5 }); } catch (e) { threw = e instanceof TypeError; }
         if (!threw) throw new Error("saveSafetensors with a non-tensor did not throw");
+
+        // Cross-class handle branding checks
+        const g4 = tensor.openSafetensors(savedPath);
+        threw = false;
+        try { tensor.GpuTensor.prototype.zero.call(g4); } catch (e) { threw = true; }
+        if (!threw) throw new Error("GpuTensor.zero on SafetensorsFile did not throw");
+        threw = false;
+        try { tensor.SafetensorsFile.prototype.close.call(w); } catch (e) { threw = true; }
+        if (!threw) throw new Error("SafetensorsFile.close on GpuTensor did not throw");
+        g4.close();
         return "OK";
     })();
     )JS";
