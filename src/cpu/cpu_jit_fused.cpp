@@ -816,7 +816,7 @@ static const JitFusedKernels& get_fused_kernels() {
 
 void fused_residual_rmsnorm(float* X, const float* res, const float* gamma, float eps, float* Y, int B, int D) {
     const auto& k = get_fused_kernels();
-    if (!k.available || k.fused_residual_rmsnorm_row_fn == nullptr) {
+    if (!k.available || k.fused_residual_rmsnorm_row_fn == nullptr || X == Y || gamma == nullptr || B <= 0 || D <= 0) {
         ref::fused_residual_rmsnorm(X, res, gamma, eps, Y, B, D);
         return;
     }
@@ -844,7 +844,7 @@ void fused_residual_rmsnorm(float* X, const float* res, const float* gamma, floa
 void fused_residual_layernorm(float* X, const float* res, const float* gamma, const float* beta,
                               float eps, float* Y, int B, int D) {
     const auto& k = get_fused_kernels();
-    if (!k.available || k.fused_residual_layernorm_row_fn == nullptr) {
+    if (!k.available || k.fused_residual_layernorm_row_fn == nullptr || X == Y || gamma == nullptr || beta == nullptr || B <= 0 || D <= 0) {
         ref::fused_residual_layernorm(X, res, gamma, beta, eps, Y, B, D);
         return;
     }
@@ -872,7 +872,7 @@ void fused_residual_layernorm(float* X, const float* res, const float* gamma, co
 void fused_layernorm_modulate(const float* X, const float* gamma, const float* beta,
                               const float* scale, const float* shift, float eps, float* Y, int R, int D) {
     const auto& k = get_fused_kernels();
-    if (!k.available || k.fused_layernorm_modulate_row_fn == nullptr) {
+    if (!k.available || k.fused_layernorm_modulate_row_fn == nullptr || X == Y || gamma == nullptr || beta == nullptr || scale == nullptr || shift == nullptr || R <= 0 || D <= 0) {
         ref::fused_layernorm_modulate(X, gamma, beta, scale, shift, eps, Y, R, D);
         return;
     }

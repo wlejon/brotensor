@@ -703,6 +703,136 @@ void test_where_clamp_col_bcast_cast(Device dev) {
     }
 }
 
+// ── Test 9: Differential Equivalence Oracle (Activations, Tail Loops, Rebind & Fused Guards) ──
+void test_differential_equivalence_oracle(Device dev) {
+    const std::string dn = device_label(dev);
+    std::printf("\n--- Test 9: Differential Equivalence Oracle on %s ---\n", dn.c_str());
+
+    // Non-multiple-of-8 shape (R=7, C=37 -> N=259) exercises both the 8-wide
+    // AVX2 vector loop (0..255) and the scalar remainder loop (256..258).
+    const int R = 7;
+    const int C = 37;
+    const int N = R * C;
+    const float eps = 1e-5f;
+
+    std::vector<float> h_a(N), h_b(N), h_c(N), h_d(N), h_s(1, 0.35f);
+    fill_random(h_a, 9001, 1.5f);
+    fill_random(h_b, 9002, 1.2f);
+    fill_random(h_c, 9003, 0.8f);
+    fill_random(h_d, 9004, 1.1f);
+
+    Tensor a = Tensor::from_host_on(dev, h_a.data(), R, C);
+    Tensor b = Tensor::from_host_on(dev, h_b.data(), R, C);
+    Tensor c = Tensor::from_host_on(dev, h_c.data(), R, C);
+    Tensor d = Tensor::from_host_on(dev, h_d.data(), R, C);
+    Tensor s_scalar = Tensor::from_host_on(dev, h_s.data(), 1, 1);
+
+    // 1. All unary activations + scalar broadcast + scalar sub/div on unaligned tail N=259
+    std::vector<float> ref_act(N);
+    constexpr float kSqrt2OverPi = 0.7978845608028654f;
+    for (int i = 0; i < N; ++i) {
+        float x = h_a[i];
+        float y = h_b[i];
+        float z = h_c[i];
+        float w = h_d[i];
+        float v_silu = x / (1.0f + std::exp(-x));
+        float v_gelu = 0.5f * y * (1.0f + std::tanh(kSqrt2OverPi * (y + 0.044715f * y * y * y)));
+        float v_relu = std::fmax(z, 0.0f);
+        float v_tanh = std::tanh(w);
+        float v_sig  = 1.0f / (1.0f + std::exp(-x));
+        ref_act[i] = ((v_silu + v_gelu) - v_relu) * v_tanh + v_sig * h_s[0] + (2.5f - y) / 1.25f;
+    }
+
+    begin_trace();
+    Tensor out_act = ((silu(a) + gelu(b)) - relu(c)) * jit::tanh(d) + sigmoid(a) * s_scalar + (2.5f - b) / 1.25f;
+    TraceHandle h_act = end_trace();
+    brotensor::sync(dev);
+
+    CHECK_PARITY(max_abs_diff(out_act.to_host_vector(), ref_act), 2e-3f,
+                 (dn + " unaligned tail N=259 (silu+gelu-relu)*tanh+sigmoid*s+(2.5-b)/1.25").c_str());
+    check_one_launch(dev, h_act, dn + " unaligned activations");
+
+    // 2. Commutative LayerNorm + Modulate with reordered inputs on cache miss AND cache hit:
+    //    out = shift + (1.0f + scale) * layernorm(x, gamma, beta, eps)
+    //    Here `shift` and `scale` are registered as DAG inputs BEFORE `x, gamma, beta`.
+    std::vector<float> h_gamma(C), h_beta(C), h_scale(C), h_shift(C);
+    fill_random(h_gamma, 9010, 1.0f);
+    fill_random(h_beta, 9011, 0.5f);
+    fill_random(h_scale, 9012, 0.5f);
+    fill_random(h_shift, 9013, 0.5f);
+
+    Tensor gamma = Tensor::from_host_on(dev, h_gamma.data(), 1, C);
+    Tensor beta  = Tensor::from_host_on(dev, h_beta.data(), 1, C);
+    Tensor scale = Tensor::from_host_on(dev, h_scale.data(), 1, C);
+    Tensor shift = Tensor::from_host_on(dev, h_shift.data(), 1, C);
+
+    auto compute_ln_mod_ref = [&](const std::vector<float>& x_in,
+                                  const std::vector<float>& g_in,
+                                  const std::vector<float>& b_in,
+                                  const std::vector<float>& sc_in,
+                                  const std::vector<float>& sh_in,
+                                  float add_const,
+                                  float post_mul) {
+        std::vector<float> res(N);
+        for (int r = 0; r < R; ++r) {
+            float mean = 0.0f;
+            for (int col = 0; col < C; ++col) mean += x_in[r * C + col];
+            mean /= static_cast<float>(C);
+            float var = 0.0f;
+            for (int col = 0; col < C; ++col) {
+                float df = x_in[r * C + col] - mean;
+                var += df * df;
+            }
+            float rstd = 1.0f / std::sqrt(var / static_cast<float>(C) + eps);
+            for (int col = 0; col < C; ++col) {
+                int idx = r * C + col;
+                float ln_v = (x_in[idx] - mean) * rstd * g_in[col] + b_in[col];
+                res[idx] = (ln_v * (add_const + sc_in[col]) + sh_in[col]) * post_mul;
+            }
+        }
+        return res;
+    };
+
+    std::vector<float> ref_comm1 = compute_ln_mod_ref(h_a, h_gamma, h_beta, h_scale, h_shift, 1.0f, 1.0f);
+    begin_trace();
+    Tensor out_comm1 = shift + (1.0f + scale) * layernorm(a, gamma, beta, eps);
+    TraceHandle h_comm1 = end_trace();
+    brotensor::sync(dev);
+    CHECK_PARITY(max_abs_diff(out_comm1.to_host_vector(), ref_comm1), 1e-4f,
+                 (dn + " commutative shift + (1+scale)*layernorm(a) cache miss").c_str());
+
+    // Cache hit with distinct input tensors b, gamma2, beta2, scale2, shift2
+    std::vector<float> h_gamma2(C), h_beta2(C), h_scale2(C), h_shift2(C);
+    fill_random(h_gamma2, 9020, 0.9f);
+    fill_random(h_beta2, 9021, 0.4f);
+    fill_random(h_scale2, 9022, 0.6f);
+    fill_random(h_shift2, 9023, 0.3f);
+    Tensor gamma2 = Tensor::from_host_on(dev, h_gamma2.data(), 1, C);
+    Tensor beta2  = Tensor::from_host_on(dev, h_beta2.data(), 1, C);
+    Tensor scale2 = Tensor::from_host_on(dev, h_scale2.data(), 1, C);
+    Tensor shift2 = Tensor::from_host_on(dev, h_shift2.data(), 1, C);
+
+    std::vector<float> ref_comm2 = compute_ln_mod_ref(h_b, h_gamma2, h_beta2, h_scale2, h_shift2, 1.0f, 1.0f);
+    begin_trace();
+    Tensor out_comm2 = shift2 + (1.0f + scale2) * layernorm(b, gamma2, beta2, eps);
+    TraceHandle h_comm2 = end_trace();
+    brotensor::sync(dev);
+    CHECK_TRUE(h_comm2.is_cache_hit(), (dn + " commutative layernorm+modulate 2nd trace is cache hit").c_str());
+    CHECK_PARITY(max_abs_diff(out_comm2.to_host_vector(), ref_comm2), 1e-4f,
+                 (dn + " commutative shift2 + (1+scale2)*layernorm(b) cache hit rebind").c_str());
+
+    // 3. Non-1.0f constant `(2.0f + scale)` and downstream op `* 0.5f` must NOT mis-dispatch
+    //    to hardcoded (1.0f + scale) fused_layernorm_modulate:
+    std::vector<float> ref_nonunit = compute_ln_mod_ref(h_a, h_gamma, h_beta, h_scale, h_shift, 2.0f, 0.5f);
+    begin_trace();
+    Tensor out_nonunit = (layernorm(a, gamma, beta, eps) * (2.0f + scale) + shift) * 0.5f;
+    TraceHandle h_nonunit = end_trace();
+    brotensor::sync(dev);
+    CHECK_PARITY(max_abs_diff(out_nonunit.to_host_vector(), ref_nonunit), 1e-4f,
+                 (dn + " (layernorm(a)*(2+scale)+shift)*0.5 exact parity").c_str());
+    (void)h_nonunit;
+}
+
 } // namespace
 
 int main() {
@@ -725,6 +855,7 @@ int main() {
     test_cache_hit_and_speedup(Device::cpu());
     test_trace_allocates_nothing(Device::cpu());
     test_where_clamp_col_bcast_cast(Device::cpu());
+    test_differential_equivalence_oracle(Device::cpu());
 
     // Run CUDA test suite if CUDA device is available
     if (brotensor::is_available(Device::cuda())) {
@@ -735,6 +866,7 @@ int main() {
         test_cache_hit_and_speedup(Device::cuda());
         test_trace_allocates_nothing(Device::cuda());
         test_where_clamp_col_bcast_cast(Device::cuda());
+        test_differential_equivalence_oracle(Device::cuda());
     } else {
         std::printf("\n[SKIP] CUDA device not available or not detected; skipping CUDA tests.\n");
     }
@@ -752,6 +884,7 @@ int main() {
         test_trace_stays_on_device(Device::vulkan());
         test_eager_div_modulate(Device::vulkan());
         test_where_clamp_col_bcast_cast(Device::vulkan());
+        test_differential_equivalence_oracle(Device::vulkan());
     }
 
     std::printf("\n================================================================================\n");

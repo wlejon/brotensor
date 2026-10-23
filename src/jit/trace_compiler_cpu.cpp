@@ -370,7 +370,7 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
             } else if (n.op == TraceOpKind::GELU) {
                 res = tb.vgelu_f32x8(v_node_vals[n.inputs[0]]);
             } else if (n.op == TraceOpKind::ReLU) {
-                res = tb.vrelu_f32x8(v_node_vals[n.inputs[0]]);
+                res = tb.vmax(v_node_vals[n.inputs[0]], tb.vzero(Type::f32x8()));
             } else if (n.op == TraceOpKind::Tanh) {
                 res = tb.vtanh_f32x8(v_node_vals[n.inputs[0]]);
             } else if (n.op == TraceOpKind::Sigmoid) {
@@ -477,7 +477,7 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
         } else if (n.op == TraceOpKind::GELU) {
             res = tb.gelu_f32(s_node_vals[n.inputs[0]]);
         } else if (n.op == TraceOpKind::ReLU) {
-            res = tb.relu_f32(s_node_vals[n.inputs[0]]);
+            res = tb.builder().build_fmax_f32(s_node_vals[n.inputs[0]], tb.builder().build_fconst_f32(0.0f));
         } else if (n.op == TraceOpKind::Tanh) {
             res = tb.tanh_f32(s_node_vals[n.inputs[0]]);
         } else if (n.op == TraceOpKind::Sigmoid) {
@@ -581,7 +581,28 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
         }
     }
 
-    if (pattern == FusionPattern::ResidualRMSNorm) {
+    auto in_idx_of = [&nodes](int node_id) -> int {
+        int idx = 0;
+        for (const auto& n : nodes) {
+            if (n.op == TraceOpKind::Input) {
+                if (n.id == node_id) return idx;
+                ++idx;
+            }
+        }
+        return -1;
+    };
+    auto out_idx_of = [&nodes](int node_id) -> int {
+        int idx = 0;
+        for (const auto& n : nodes) {
+            if (n.is_live_at_end) {
+                if (n.id == node_id) return idx;
+                ++idx;
+            }
+        }
+        return -1;
+    };
+
+    if (pattern == FusionPattern::ResidualRMSNorm && nodes.size() == 5) {
         const TraceNode* node_rms = nullptr;
         const TraceNode* node_add = nullptr;
         const TraceNode* node_res = nullptr;
@@ -593,8 +614,11 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
             // The hand kernel below is exactly `x += res; rms_norm(x, gamma)`.
             // Anything else — no residual, no gain, or downstream ops — is not
             // this pattern.
-            if (add.op != TraceOpKind::Add || add.inputs.size() < 2) continue;
-            if (n.inputs.size() < 2 || !n.outputs.empty()) continue;
+            if (add.op != TraceOpKind::Add || !add.is_inplace || add.inputs.size() < 2) continue;
+            if (n.inputs.size() < 2 || !n.outputs.empty() || !n.is_live_at_end || !add.is_live_at_end) continue;
+            if (nodes[add.inputs[0]].op != TraceOpKind::Input ||
+                nodes[add.inputs[1]].op != TraceOpKind::Input ||
+                nodes[n.inputs[1]].op != TraceOpKind::Input) continue;
             node_rms = &n;
             node_add = &add;
             node_res = &nodes[add.inputs[1]];
@@ -624,21 +648,28 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
 
             void* x_buf = node_add->buffer;
             const void* res_buf = node_res->buffer;
-            const void* gamma_buf = node_gamma ? node_gamma->buffer : nullptr;
+            const void* gamma_buf = node_gamma->buffer;
             void* y_buf = node_rms->buffer;
 
+            const int in_res = in_idx_of(node_res->id);
+            const int in_gamma = in_idx_of(node_gamma->id);
+            const int out_x = out_idx_of(node_add->id);
+            const int out_y = out_idx_of(node_rms->id);
+
             auto handle = make_handle(x_buf, res_buf, gamma_buf, y_buf);
-            handle->rebind_fn = [make_handle](const std::vector<void*>& in_b, const std::vector<void*>& out_b) {
-                const void* res_p = in_b.size() > 1 ? in_b[1] : nullptr;
-                const void* gamma_p = in_b.size() > 2 ? in_b[2] : nullptr;
-                void* x_p = out_b.size() > 0 ? out_b[0] : in_b[0];
-                void* y_p = out_b.size() > 1 ? out_b[1] : (out_b.size() > 0 ? out_b[0] : nullptr);
+            handle->rebind_fn = [make_handle, in_res, in_gamma, out_x, out_y](
+                                    const std::vector<void*>& in_b, const std::vector<void*>& out_b) {
+                const void* res_p = (in_res >= 0 && static_cast<size_t>(in_res) < in_b.size()) ? in_b[in_res] : nullptr;
+                const void* gamma_p = (in_gamma >= 0 && static_cast<size_t>(in_gamma) < in_b.size()) ? in_b[in_gamma] : nullptr;
+                void* x_p = (out_x >= 0 && static_cast<size_t>(out_x) < out_b.size()) ? out_b[out_x] : nullptr;
+                void* y_p = (out_y >= 0 && static_cast<size_t>(out_y) < out_b.size()) ? out_b[out_y] : nullptr;
                 return make_handle(x_p, res_p, gamma_p, y_p);
             };
             return handle;
         }
     } else if (pattern == FusionPattern::LayerNormModulate) {
         const TraceNode* node_ln = nullptr;
+        const TraceNode* node_x = nullptr;
         const TraceNode* node_gamma = nullptr;
         const TraceNode* node_beta = nullptr;
         const TraceNode* node_scale = nullptr;
@@ -646,30 +677,44 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
         const TraceNode* node_out = nullptr;
 
         for (const auto& n : nodes) {
-            if (n.op == TraceOpKind::LayerNorm) {
-                node_ln = &n;
-                if (n.inputs.size() > 1) node_gamma = &nodes[n.inputs[1]];
-                if (n.inputs.size() > 2) node_beta = &nodes[n.inputs[2]];
-            }
-            if (n.is_live_at_end && n.op != TraceOpKind::LayerNorm) {
-                node_out = &n;
-            }
-            if (n.op == TraceOpKind::Modulate) {
-                if (n.inputs.size() > 1) node_scale = &nodes[n.inputs[1]];
-                if (n.inputs.size() > 2) node_shift = &nodes[n.inputs[2]];
+            if (n.op == TraceOpKind::LayerNorm && !n.is_live_at_end && n.outputs.size() == 1 && n.inputs.size() >= 3) {
+                if (nodes[n.inputs[0]].op == TraceOpKind::Input &&
+                    nodes[n.inputs[1]].op == TraceOpKind::Input &&
+                    nodes[n.inputs[2]].op == TraceOpKind::Input) {
+                    node_ln = &n;
+                    node_x = &nodes[n.inputs[0]];
+                    node_gamma = &nodes[n.inputs[1]];
+                    node_beta = &nodes[n.inputs[2]];
+                }
             }
         }
 
-        // Find scale/shift from expression ln * (1 + scale) + shift if not directly Modulate op
-        if (!node_scale || !node_shift) {
-            for (const auto& n : nodes) {
-                if (n.op == TraceOpKind::AddScalar && n.inputs.size() > 0) {
-                    node_scale = &nodes[n.inputs[0]];
-                }
-                if (n.op == TraceOpKind::Add && n.inputs.size() > 1) {
-                    int rhs = n.inputs[1];
-                    if (nodes[rhs].op == TraceOpKind::Input) {
-                        node_shift = &nodes[rhs];
+        if (node_ln && nodes.size() == 7) {
+            const TraceNode& mod = nodes[node_ln->outputs[0]];
+            if (mod.op == TraceOpKind::Modulate && mod.is_live_at_end && mod.outputs.empty() &&
+                mod.inputs.size() >= 3 && mod.inputs[0] == node_ln->id &&
+                nodes[mod.inputs[1]].op == TraceOpKind::Input &&
+                nodes[mod.inputs[2]].op == TraceOpKind::Input) {
+                node_scale = &nodes[mod.inputs[1]];
+                node_shift = &nodes[mod.inputs[2]];
+                node_out = &mod;
+            }
+        } else if (node_ln && nodes.size() == 9) {
+            const TraceNode& mul = nodes[node_ln->outputs[0]];
+            if (mul.op == TraceOpKind::Mul && !mul.is_live_at_end && mul.outputs.size() == 1 && mul.inputs.size() == 2) {
+                int other_mul_in = (mul.inputs[0] == node_ln->id) ? mul.inputs[1] : mul.inputs[0];
+                const TraceNode& add_sc = nodes[other_mul_in];
+                const TraceNode& add_sh = nodes[mul.outputs[0]];
+                if (add_sc.op == TraceOpKind::AddScalar && !add_sc.is_live_at_end &&
+                    add_sc.scalar == 1.0f && add_sc.inputs.size() == 1 &&
+                    nodes[add_sc.inputs[0]].op == TraceOpKind::Input &&
+                    add_sh.op == TraceOpKind::Add && add_sh.is_live_at_end &&
+                    add_sh.outputs.empty() && add_sh.inputs.size() == 2) {
+                    int shift_in = (add_sh.inputs[0] == mul.id) ? add_sh.inputs[1] : add_sh.inputs[0];
+                    if (nodes[shift_in].op == TraceOpKind::Input) {
+                        node_scale = &nodes[add_sc.inputs[0]];
+                        node_shift = &nodes[shift_in];
+                        node_out = &add_sh;
                     }
                 }
             }
@@ -678,7 +723,7 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
         // The hand kernel dereferences all five operands, so a trace missing
         // any of them (a non-affine LayerNorm, a modulate with no shift) is
         // not this pattern and falls through to the generic path.
-        if (node_ln && node_out && node_gamma && node_beta && node_scale && node_shift) {
+        if (node_ln && node_x && node_out && node_gamma && node_beta && node_scale && node_shift) {
             int R = node_ln->rows;
             int D = node_ln->cols;
             float eps = node_ln->scalar > 0.0f ? node_ln->scalar : 1e-5f;
@@ -701,21 +746,29 @@ std::shared_ptr<TraceHandleImpl> compile_cpu(const TraceDAG& dag, FusionPattern 
                 return h;
             };
 
-            const void* x_buf = nodes[node_ln->inputs[0]].buffer;
-            const void* g_buf = node_gamma ? node_gamma->buffer : nullptr;
-            const void* b_buf = node_beta ? node_beta->buffer : nullptr;
-            const void* s_buf = node_scale ? node_scale->buffer : nullptr;
-            const void* sh_buf = node_shift ? node_shift->buffer : nullptr;
+            const void* x_buf = node_x->buffer;
+            const void* g_buf = node_gamma->buffer;
+            const void* b_buf = node_beta->buffer;
+            const void* s_buf = node_scale->buffer;
+            const void* sh_buf = node_shift->buffer;
             void* y_buf = node_out->buffer;
 
+            const int in_x = in_idx_of(node_x->id);
+            const int in_g = in_idx_of(node_gamma->id);
+            const int in_b_idx = in_idx_of(node_beta->id);
+            const int in_s = in_idx_of(node_scale->id);
+            const int in_sh = in_idx_of(node_shift->id);
+            const int out_y = out_idx_of(node_out->id);
+
             auto handle = make_handle(x_buf, g_buf, b_buf, s_buf, sh_buf, y_buf);
-            handle->rebind_fn = [make_handle](const std::vector<void*>& in_b, const std::vector<void*>& out_b) {
-                const void* x = in_b.size() > 0 ? in_b[0] : nullptr;
-                const void* g = in_b.size() > 1 ? in_b[1] : nullptr;
-                const void* b = in_b.size() > 2 ? in_b[2] : nullptr;
-                const void* sc = in_b.size() > 3 ? in_b[3] : nullptr;
-                const void* sh = in_b.size() > 4 ? in_b[4] : nullptr;
-                void* y = out_b.size() > 0 ? out_b[0] : nullptr;
+            handle->rebind_fn = [make_handle, in_x, in_g, in_b_idx, in_s, in_sh, out_y](
+                                    const std::vector<void*>& in_b, const std::vector<void*>& out_b) {
+                const void* x = (in_x >= 0 && static_cast<size_t>(in_x) < in_b.size()) ? in_b[in_x] : nullptr;
+                const void* g = (in_g >= 0 && static_cast<size_t>(in_g) < in_b.size()) ? in_b[in_g] : nullptr;
+                const void* b = (in_b_idx >= 0 && static_cast<size_t>(in_b_idx) < in_b.size()) ? in_b[in_b_idx] : nullptr;
+                const void* sc = (in_s >= 0 && static_cast<size_t>(in_s) < in_b.size()) ? in_b[in_s] : nullptr;
+                const void* sh = (in_sh >= 0 && static_cast<size_t>(in_sh) < in_b.size()) ? in_b[in_sh] : nullptr;
+                void* y = (out_y >= 0 && static_cast<size_t>(out_y) < out_b.size()) ? out_b[out_y] : nullptr;
                 return make_handle(x, g, b, sc, sh, y);
             };
             return handle;

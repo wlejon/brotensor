@@ -486,7 +486,9 @@ int main() {
         {1, 4096},
         {4, 1152},
         {8, 128},
-        {32, 4096}
+        {32, 4096},
+        {3, 5},
+        {5, 37}
     };
 
     uint64_t seed = 42;
@@ -498,6 +500,53 @@ int main() {
         test_layernorm(b, d, seed++);
         test_fused_residual_rmsnorm(b, d, seed++);
         test_fused_layernorm_modulate(b, d, seed++);
+    }
+
+    // Also verify Fused-ResLN and in-place (X == Y) safety on unaligned D=37
+    {
+        const int B = 4, D = 37;
+        SplitMix64 rng(999);
+        Tensor X = Tensor::mat(B, D);
+        Tensor res = Tensor::mat(B, D);
+        Tensor gamma = Tensor::vec(D);
+        Tensor beta = Tensor::vec(D);
+        fill_random(X, rng);
+        fill_random(res, rng);
+        fill_random(gamma, rng);
+        fill_random(beta, rng);
+        const float eps = 1e-5f;
+
+        Tensor ref_X = X.clone();
+        Tensor ref_Y = Tensor::mat(B, D);
+        for (int i = 0; i < B * D; ++i) ref_X.host_f32_mut()[i] += res.host_f32()[i];
+        scalar_layernorm(ref_X.host_f32(), gamma.host_f32(), beta.host_f32(), eps, ref_Y.host_f32_mut(), B, D);
+
+        Tensor jit_X = X.clone();
+        Tensor jit_Y = Tensor::mat(B, D);
+        brotensor::detail::cpu::jit::fused_residual_layernorm(
+            jit_X.host_f32_mut(), res.host_f32(), gamma.host_f32(), beta.host_f32(), eps, jit_Y.host_f32_mut(), B, D);
+
+        float diff_y = max_abs_diff(jit_Y.host_f32(), ref_Y.host_f32(), B * D);
+        float diff_x = max_abs_diff(jit_X.host_f32(), ref_X.host_f32(), B * D);
+
+        // In-place X == Y rms_norm_forward and layernorm_forward_inference_batched
+        Tensor ip_rms = ref_X.clone();
+        Tensor exp_rms = Tensor::mat(B, D);
+        scalar_rmsnorm(ref_X.host_f32(), gamma.host_f32(), eps, exp_rms.host_f32_mut(), B, D);
+        brotensor::detail::cpu::jit::rms_norm_forward(ip_rms.host_f32(), gamma.host_f32(), eps, ip_rms.host_f32_mut(), B, D);
+        float diff_ip_rms = max_abs_diff(ip_rms.host_f32(), exp_rms.host_f32(), B * D);
+
+        Tensor ip_ln = ref_X.clone();
+        brotensor::detail::cpu::jit::layernorm_forward_inference_batched(
+            ip_ln.host_f32(), gamma.host_f32(), beta.host_f32(), eps, ip_ln.host_f32_mut(), B, D);
+        float diff_ip_ln = max_abs_diff(ip_ln.host_f32(), ref_Y.host_f32(), B * D);
+
+        float max_d = std::max({diff_y, diff_x, diff_ip_rms, diff_ip_ln});
+        g_results.push_back({
+            "FusedResLN+IP",
+            "B=4, D=37",
+            1.0, 1.0, 1.0, max_d, max_d, max_d < 1e-4f
+        });
     }
 
     std::cout << "\n### Performance Benchmark & Oracle Parity Results:\n\n";

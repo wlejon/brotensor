@@ -740,7 +740,7 @@ bool is_jit_available() {
 
 void rms_norm_forward(const float* X, const float* gamma, float eps, float* Y, int B, int D) {
     const auto& k = get_kernels();
-    if (!k.available || k.rms_norm_row_fn == nullptr) {
+    if (!k.available || k.rms_norm_row_fn == nullptr || X == Y || gamma == nullptr || B <= 0 || D <= 0) {
         ref::rms_norm(X, gamma, eps, Y, B, D);
         return;
     }
@@ -835,7 +835,7 @@ void broadcast_mul(const float* X, const float* v, float* Y, int L, int D) {
 
 void layernorm_forward_inference_batched(const float* X, const float* gamma, const float* beta, float eps, float* Y, int R, int D) {
     const auto& k = get_kernels();
-    if (!k.available || k.layernorm_row_fn == nullptr) {
+    if (!k.available || k.layernorm_row_fn == nullptr || X == Y || gamma == nullptr || beta == nullptr || R <= 0 || D <= 0) {
         ref::layernorm_forward_inference_batched(X, gamma, beta, eps, Y, R, D);
         return;
     }
