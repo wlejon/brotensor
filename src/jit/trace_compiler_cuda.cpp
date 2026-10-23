@@ -2,6 +2,7 @@
 #include "trace_dag.h"
 #include "trace_cache.h"
 #include "ptx_emit.h"
+#include "kernel_disk_cache.h"
 
 #if BROTENSOR_HAS_CUDA
 
@@ -89,8 +90,12 @@ using plan::all_fp32;
 std::shared_ptr<TraceHandleImpl> compile_elementwise(const TraceDAG& dag,
                                                      const ptx::ElementwisePlan& plan) {
     const std::string arch = query_cuda_arch();
-    const std::string ptx_src = ptx::emit_elementwise(dag, plan, arch);
     const std::string key = "trace_ew_" + arch + "_" + std::to_string(dag.compute_hash());
+    std::string ptx_src;
+    if (!KernelDiskCache::instance().load_ptx(key, ptx_src)) {
+        ptx_src = ptx::emit_elementwise(dag, plan, arch);
+        KernelDiskCache::instance().store_ptx(key, ptx_src);
+    }
 
     // One key per entry: the engine caches CUfunctions, not modules.
     CUfunction fn_vec =
@@ -160,8 +165,12 @@ std::shared_ptr<TraceHandleImpl> compile_elementwise(const TraceDAG& dag,
 std::shared_ptr<TraceHandleImpl> compile_row_norm(const TraceDAG& dag,
                                                   const ptx::RowNormPlan& plan) {
     const std::string arch = query_cuda_arch();
-    const std::string ptx_src = ptx::emit_row_norm(dag, plan, arch);
     const std::string key = "trace_rn_" + arch + "_" + std::to_string(dag.compute_hash());
+    std::string ptx_src;
+    if (!KernelDiskCache::instance().load_ptx(key, ptx_src)) {
+        ptx_src = ptx::emit_row_norm(dag, plan, arch);
+        KernelDiskCache::instance().store_ptx(key, ptx_src);
+    }
 
     CUfunction fn_vec =
         CudaJitEngine::instance().get_function(key + ":v", ptx_src, ptx::kEntryRowNorm);

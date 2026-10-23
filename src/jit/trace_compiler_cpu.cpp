@@ -1,6 +1,7 @@
 #include "trace_compiler.h"
 #include "trace_dag.h"
 #include "trace_cache.h"
+#include "kernel_disk_cache.h"
 #include "../cpu/cpu_jit.h"
 #include <brotensor/detail/cpu/thread_pool.h>
 
@@ -253,10 +254,7 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
     using namespace brass;
     using namespace brass::codegen;
 
-    static uint64_t kernel_id_counter = 0;
-    std::string mod_name = "mod_trace_cpu_" + std::to_string(++kernel_id_counter);
-    Module mod(mod_name);
-
+    auto build_fn = [&](Module& mod) {
     Function* fn = mod.create_function("trace_elementwise_kernel", Type::void_type(), {
         Type::ptr(), // float* const* out_ptrs
         Type::ptr(), // const float* const* in_ptrs
@@ -503,23 +501,20 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
     fn->append_block(exit_bb);
     tb.position_at_end(exit_bb);
     tb.builder().build_ret_void();
+    };
 
-    KernelOptions opts;
-    opts.enable_optimizations = true;
-    opts.enable_avx2 = true;
-    opts.enable_fma = true;
-    opts.enable_vectorize = true;
+    const std::string sig_key = "cpu_trace_ew_" + std::to_string(dag.compute_hash());
+    KernelDiskCache::CpuCompileOptions c_opts;
+    c_opts.enable_unroll = false;
+    c_opts.enable_fp_reassociation = false;
 
-    auto jit = std::make_shared<KernelJit>(opts);
-    KernelFunction kfn = jit->compile(*fn);
-    if (!kfn.is_valid()) {
+    auto kernel_ptr = KernelDiskCache::instance().compile_or_load_cpu_fn<ElementwiseFn>(
+        sig_key, "trace_elementwise_kernel", build_fn, c_opts);
+    if (!kernel_ptr) {
         throw std::runtime_error("brotensor::jit: Failed to JIT compile CPU elementwise trace kernel");
     }
 
-    auto kernel_ptr = kfn.as<ElementwiseFn>();
-    auto engine_ref = kfn.engine();
-
-    auto make_bound_handle = [kernel_ptr, engine_ref, total_numel, any_bcast, input_node_ids, output_node_ids]
+    auto make_bound_handle = [kernel_ptr, total_numel, any_bcast, input_node_ids, output_node_ids]
                              (const std::vector<void*>& in_buffers, const std::vector<void*>& out_buffers) {
         auto h = std::make_shared<TraceHandleImpl>();
 
@@ -528,7 +523,7 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
         std::vector<float*> out_f(out_buffers.size());
         for (size_t m = 0; m < out_buffers.size(); ++m) out_f[m] = static_cast<float*>(out_buffers[m]);
 
-        h->execute_fn = [kernel_ptr, engine_ref, total_numel, any_bcast, in_f, out_f]() {
+        h->execute_fn = [kernel_ptr, total_numel, any_bcast, in_f, out_f]() {
             if (!any_bcast && total_numel >= 262144) {
                 auto& pool = detail::cpu::ThreadPool::instance();
                 int n_threads = pool.num_threads();

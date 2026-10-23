@@ -28,6 +28,7 @@
 #include "trace_cache.h"
 #include "trace_plan.h"
 #include "spirv_emit.h"
+#include "kernel_disk_cache.h"
 
 #include "../vulkan/vulkan_jit.h"
 
@@ -128,11 +129,33 @@ std::vector<void*> buffers(const TraceDAG& dag, const std::vector<plan::BufferSp
     return out;
 }
 
+template <typename EmitFn>
+spirv::Kernels emit_or_load_spirv(const char* tag, const TraceDAG& dag, int lanes, EmitFn&& emit_fn) {
+    auto& cache = KernelDiskCache::instance();
+    const std::string base = std::string(tag) + "_" + std::to_string(dag.compute_hash()) + "_v" + std::to_string(lanes);
+    spirv::Kernels k;
+    if (lanes > 1) {
+        brass::target::SpirvKernel vk;
+        if (cache.load_spirv_kernel(base + ":s", k.scalar) && cache.load_spirv_kernel(base + ":v", vk)) {
+            k.vec = std::move(vk);
+            return k;
+        }
+    } else if (cache.load_spirv_kernel(base + ":s", k.scalar)) {
+        return k;
+    }
+    k = emit_fn();
+    cache.store_spirv_kernel(base + ":s", k.scalar);
+    if (k.vec) cache.store_spirv_kernel(base + ":v", *k.vec);
+    return k;
+}
+
 // ── elementwise ─────────────────────────────────────────────────────────────
 
 std::shared_ptr<TraceHandleImpl> compile_elementwise(const TraceDAG& dag, const plan::ElementwisePlan& ew,
                                                      std::shared_ptr<Compiled> cc) {
-    spirv::Kernels k = spirv::emit_elementwise(dag, ew);
+    spirv::Kernels k = emit_or_load_spirv("vk_trace_ew", dag, ew.vec, [&] {
+        return spirv::emit_elementwise(dag, ew);
+    });
     cc->vec = std::move(k.vec);
     cc->scalar = std::move(k.scalar);
     if (cc->vec) cc->vec_pipe = dv::jit_pipeline(*cc->ctx, *cc->vec, spirv::kEwBlock);
@@ -168,7 +191,9 @@ std::shared_ptr<TraceHandleImpl> compile_elementwise(const TraceDAG& dag, const 
 std::shared_ptr<TraceHandleImpl> compile_row_norm(const TraceDAG& dag, const plan::RowNormPlan& rn,
                                                   std::shared_ptr<Compiled> cc) {
     const plan::ElementwisePlan& ew = rn.ew;
-    spirv::Kernels k = spirv::emit_row_norm(dag, rn);
+    spirv::Kernels k = emit_or_load_spirv("vk_trace_rn", dag, ew.vec, [&] {
+        return spirv::emit_row_norm(dag, rn);
+    });
     cc->vec = std::move(k.vec);
     cc->scalar = std::move(k.scalar);
 

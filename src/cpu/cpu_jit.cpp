@@ -126,6 +126,8 @@ inline void layernorm_forward_inference_batched(const float* X, const float* gam
 #include <brass/mir/builder.hpp>
 #include <brass/mir/module.hpp>
 #include <brass/mir/function.hpp>
+#include "../jit/kernel_disk_cache.h"
+#include <atomic>
 #include <cmath>
 #include <mutex>
 #include <vector>
@@ -154,8 +156,6 @@ struct JitKernels {
 
     using LayerNormRowFn = void (*)(const float* x, const float* gamma, const float* beta, float* y, uint64_t d, float eps, float inv_d);
     LayerNormRowFn layernorm_row_fn = nullptr;
-
-    std::vector<std::shared_ptr<JitExecutionEngine>> engines;
 };
 
 // Horizontal sum of an 8-wide float vector using destination scratch buffer
@@ -171,8 +171,7 @@ static Value* reduce_vsum8(KernelBuilder& kb, Value* scratch, Value* vsum) {
 }
 
 // ── 1. Vectorized Broadcast Mul (AVX2 8-wide + scalar remainder) ────────────
-static KernelFunction build_broadcast_mul(KernelJit& jit) {
-    Module mod("mod_broadcast_mul");
+static void populate_broadcast_mul(Module& mod) {
     Function* fn = mod.create_function("broadcast_mul", Type::void_type(), {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::i64()
     });
@@ -238,13 +237,10 @@ static KernelFunction build_broadcast_mul(KernelJit& jit) {
     fn->append_block(exit);
     kb.position_at_end(exit);
     kb.builder().build_ret_void();
-
-    return jit.compile(mod, "broadcast_mul");
 }
 
 // ── 2. Vectorized AdaLN Modulate (AVX2 8-wide + FMA + scalar remainder) ─────
-static KernelFunction build_adaln_modulate(KernelJit& jit) {
-    Module mod("mod_adaln_modulate");
+static void populate_adaln_modulate(Module& mod) {
     Function* fn = mod.create_function("fused_adaln_modulate", Type::void_type(), {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::i64()
     });
@@ -318,14 +314,10 @@ static KernelFunction build_adaln_modulate(KernelJit& jit) {
     fn->append_block(exit);
     kb.position_at_end(exit);
     kb.builder().build_ret_void();
-
-    return jit.compile(mod, "fused_adaln_modulate");
 }
 
 // ── 3. Vectorized RMSNorm Row (AVX2 FMA reduction + AVX2 affine scale) ─────
-static KernelFunction build_rms_norm_row(KernelJit& jit) {
-    Module mod("mod_rms_norm_row");
-    mod.add_external_symbol("rsqrtf");
+static void populate_rms_norm_row(Module& mod) {
     Function* fn = mod.create_function("rms_norm_row", Type::void_type(), {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::i64(), Type::f32(), Type::f32()
     });
@@ -406,13 +398,13 @@ static KernelFunction build_rms_norm_row(KernelJit& jit) {
     Value* next_iv1_s = kb.builder().build_add(iv1_s, one_i64);
     kb.builder().build_br(l1_shead, {next_iv1_s, next_sum});
 
-    // Pass 1 exit -> compute rrms = rsqrtf(mean_sq + eps)
+    // Pass 1 exit -> compute rrms = 1.0f / sqrt(mean_sq + eps)
     fn->append_block(l1_exit);
     Value* final_sum = kb.builder().add_block_param(l1_exit, Type::f32());
     kb.position_at_end(l1_exit);
     Value* mean_sq = kb.mul(final_sum, inv_d);
     Value* denom = kb.add(mean_sq, eps);
-    Value* rrms = kb.builder().build_call("rsqrtf", Type::f32(), {denom});
+    Value* rrms = kb.div(kb.builder().build_fconst_f32(1.0f), kb.builder().build_sqrt_f32(denom));
     Value* vrrms = kb.vbroadcast(Type::f32x8(), rrms);
     kb.builder().build_br(l2_vhead, {zero_i64, rrms, vrrms});
 
@@ -460,14 +452,10 @@ static KernelFunction build_rms_norm_row(KernelJit& jit) {
     fn->append_block(l2_exit);
     kb.position_at_end(l2_exit);
     kb.builder().build_ret_void();
-
-    return jit.compile(mod, "rms_norm_row");
 }
 
 // ── 4. Vectorized LayerNorm Row (AVX2 mean + var + affine) ──────────────────
-static KernelFunction build_layernorm_row(KernelJit& jit) {
-    Module mod("mod_layernorm_row");
-    mod.add_external_symbol("rsqrtf");
+static void populate_layernorm_row(Module& mod) {
     Function* fn = mod.create_function("layernorm_row", Type::void_type(), {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::i64(), Type::f32(), Type::f32()
     });
@@ -620,7 +608,7 @@ static KernelFunction build_layernorm_row(KernelJit& jit) {
     kb.position_at_end(l2_exit);
     Value* var = kb.mul(final_sumsq, inv_d);
     Value* var_eps = kb.add(var, eps);
-    Value* rstd = kb.builder().build_call("rsqrtf", Type::f32(), {var_eps});
+    Value* rstd = kb.div(kb.builder().build_fconst_f32(1.0f), kb.builder().build_sqrt_f32(var_eps));
     Value* vmean3 = kb.vbroadcast(Type::f32x8(), final_mean);
     Value* vrstd3 = kb.vbroadcast(Type::f32x8(), rstd);
     kb.builder().build_br(l3_vhead, {zero_i64, final_mean, rstd, vmean3, vrstd3});
@@ -677,65 +665,66 @@ static KernelFunction build_layernorm_row(KernelJit& jit) {
     fn->append_block(l3_exit);
     kb.position_at_end(l3_exit);
     kb.builder().build_ret_void();
-
-    return jit.compile(mod, "layernorm_row");
 }
 
-// ── Kernel Initialization & JIT Engine Management ───────────────────────────
+// ── Kernel Initialization & AOT Disk Cache Management ───────────────────────
+static std::mutex s_core_jit_mu;
+static std::atomic<bool> s_core_jit_ready{false};
+static JitKernels s_core_kernels;
+
 static const JitKernels& get_kernels() {
-    static JitKernels kernels;
-    static std::once_flag init_flag;
-    std::call_once(init_flag, [] {
+    if (s_core_jit_ready.load(std::memory_order_acquire)) {
+        return s_core_kernels;
+    }
+    std::lock_guard<std::mutex> lk(s_core_jit_mu);
+    if (!s_core_jit_ready.load(std::memory_order_relaxed)) {
         try {
-            KernelOptions opts;
-            opts.enable_optimizations = true;
-            opts.enable_avx2 = true;
-            opts.enable_fma = true;
-            opts.enable_vectorize = true;
-            opts.enable_unroll = true;
-            opts.unroll_factor = 4;
-            opts.enable_fp_reassociation = true;
+            auto& cache = brotensor::jit::KernelDiskCache::instance();
+            brotensor::jit::KernelDiskCache::CpuCompileOptions opts;
 
-            KernelJit jit(opts);
+            s_core_kernels.adaln_fn = cache.compile_or_load_cpu_fn<JitKernels::AdaLNModulateFn>(
+                "cpu_core_adaln_modulate_v1", "fused_adaln_modulate", populate_adaln_modulate, opts);
+            s_core_kernels.broadcast_mul_fn = cache.compile_or_load_cpu_fn<JitKernels::BroadcastMulFn>(
+                "cpu_core_broadcast_mul_v1", "broadcast_mul", populate_broadcast_mul, opts);
+            s_core_kernels.rms_norm_row_fn = cache.compile_or_load_cpu_fn<JitKernels::RmsNormRowFn>(
+                "cpu_core_rms_norm_row_v1", "rms_norm_row", populate_rms_norm_row, opts);
+            s_core_kernels.layernorm_row_fn = cache.compile_or_load_cpu_fn<JitKernels::LayerNormRowFn>(
+                "cpu_core_layernorm_row_v1", "layernorm_row", populate_layernorm_row, opts);
 
-            // (1. SwiGLU runs the reference loop; see swiglu_forward below.)
-
-            // 2. Vectorized AdaLN Modulate
-            KernelFunction k_adaln = build_adaln_modulate(jit);
-            kernels.adaln_fn = k_adaln.as<JitKernels::AdaLNModulateFn>();
-            kernels.engines.push_back(k_adaln.engine());
-
-            // 3. Vectorized Broadcast Mul
-            KernelFunction k_bmul = build_broadcast_mul(jit);
-            kernels.broadcast_mul_fn = k_bmul.as<JitKernels::BroadcastMulFn>();
-            kernels.engines.push_back(k_bmul.engine());
-
-            // 4. Vectorized RMSNorm row
-            KernelFunction k_rmsnorm = build_rms_norm_row(jit);
-            kernels.rms_norm_row_fn = k_rmsnorm.as<JitKernels::RmsNormRowFn>();
-            kernels.engines.push_back(k_rmsnorm.engine());
-
-            // 5. Vectorized LayerNorm row
-            KernelFunction k_ln = build_layernorm_row(jit);
-            kernels.layernorm_row_fn = k_ln.as<JitKernels::LayerNormRowFn>();
-            kernels.engines.push_back(k_ln.engine());
-
-            kernels.available = (kernels.adaln_fn != nullptr &&
-                                 kernels.broadcast_mul_fn != nullptr &&
-                                 kernels.rms_norm_row_fn != nullptr &&
-                                 kernels.layernorm_row_fn != nullptr);
+            s_core_kernels.available = (s_core_kernels.adaln_fn != nullptr &&
+                                        s_core_kernels.broadcast_mul_fn != nullptr &&
+                                        s_core_kernels.rms_norm_row_fn != nullptr &&
+                                        s_core_kernels.layernorm_row_fn != nullptr);
         } catch (const std::exception& e) {
             std::cerr << "brotensor: Brass JIT initialization failed: " << e.what() << "\n";
-            kernels.available = false;
+            s_core_kernels.available = false;
         }
-    });
-    return kernels;
+        s_core_jit_ready.store(true, std::memory_order_release);
+    }
+    return s_core_kernels;
 }
 
 } // namespace
 
 bool is_jit_available() {
     return get_kernels().available;
+}
+
+void prewarm_cpu_jit_kernels() {
+    (void)get_kernels();
+    prewarm_fused_jit_kernels();
+    prewarm_quant_jit_kernels();
+}
+
+void reset_cpu_jit_caches_for_testing() {
+    {
+        std::lock_guard<std::mutex> lk(s_core_jit_mu);
+        s_core_jit_ready.store(false, std::memory_order_relaxed);
+        s_core_kernels = JitKernels{};
+    }
+    reset_fused_jit_caches_for_testing();
+    reset_quant_jit_caches_for_testing();
+    brotensor::jit::KernelDiskCache::instance().clear_loaded_libraries();
 }
 
 void rms_norm_forward(const float* X, const float* gamma, float eps, float* Y, int B, int D) {
@@ -773,6 +762,7 @@ void rms_norm_forward(const float* X, const float* gamma, float eps, float* Y, i
 // element measured ~4x slower than this loop (MSVC vectorizes std::exp), so
 // the row-parallel reference is the kernel.
 void swiglu_forward(const float* X, float* Y, int B, int D) {
+    (void)get_kernels();
     ref::swiglu(X, Y, B, D);
 }
 
@@ -865,10 +855,13 @@ void layernorm_forward_inference_batched(const float* X, const float* gamma, con
 namespace brotensor::detail::cpu::jit {
 
 bool is_jit_available() { return false; }
+void prewarm_cpu_jit_kernels() {}
+void reset_cpu_jit_caches_for_testing() {}
 void rms_norm_forward(const float* X, const float* gamma, float eps, float* Y, int B, int D) {
     ref::rms_norm(X, gamma, eps, Y, B, D);
 }
 void swiglu_forward(const float* X, float* Y, int B, int D) {
+    (void)get_kernels();
     ref::swiglu(X, Y, B, D);
 }
 void modulate(const float* X, const float* scale, const float* shift, float* Y, int L, int D) {

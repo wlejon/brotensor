@@ -53,6 +53,19 @@ if(BROTENSOR_HAS_BRASS_JIT)
     brotensor_add_test(brotensor_test_jit_trace test_jit_trace.cpp)
     brotensor_add_test(brotensor_test_cpu_jit test_cpu_jit.cpp)
     brotensor_add_test(brotensor_test_cpu_jit_quant test_cpu_jit_quant.cpp)
+    brotensor_add_test(brotensor_test_kernel_disk_cache test_kernel_disk_cache.cpp)
+    target_link_libraries(brotensor_test_kernel_disk_cache PRIVATE ${BROTENSOR_BRASS_LIB})
+    if(NOT BROTENSOR_WITH_CUDA)
+        target_sources(brotensor_test_kernel_disk_cache PRIVATE
+            ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_elementwise.cpp
+            ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_rownorm.cpp)
+    endif()
+    if(NOT BROTENSOR_VULKAN_TRACE_JIT)
+        target_sources(brotensor_test_kernel_disk_cache PRIVATE
+            ${PROJECT_SOURCE_DIR}/src/jit/spirv_emit_common.cpp
+            ${PROJECT_SOURCE_DIR}/src/jit/spirv_emit_elementwise.cpp
+            ${PROJECT_SOURCE_DIR}/src/jit/spirv_emit_rownorm.cpp)
+    endif()
 endif()
 # --- Bronze API test ---
 #

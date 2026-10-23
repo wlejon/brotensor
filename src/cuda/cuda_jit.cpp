@@ -1,5 +1,6 @@
 #include "cuda_jit.h"
 #include "cuda_jit_engine.h"
+#include "../jit/kernel_disk_cache.h"
 #include <brotensor/tensor.h>
 
 #include <cuda.h>
@@ -25,6 +26,22 @@ bool is_cuda_jit_available() {
 
 #if BROTENSOR_HAS_BRASS_CUDA_JIT
 
+namespace {
+
+template <typename EmitFn>
+std::string load_or_emit_ptx(const char* sig, EmitFn&& emit_fn) {
+    auto& cache = brotensor::jit::KernelDiskCache::instance();
+    std::string ptx;
+    if (cache.load_ptx(sig, ptx)) {
+        return ptx;
+    }
+    ptx = emit_fn();
+    cache.store_ptx(sig, ptx);
+    return ptx;
+}
+
+} // namespace
+
 void launch_fused_residual_rmsnorm_ptx(
     float* X,
     const float* res,
@@ -37,10 +54,10 @@ void launch_fused_residual_rmsnorm_ptx(
 ) {
     if (B <= 0 || D <= 0) return;
 
-    static const std::string ptx = []() {
+    static const std::string ptx = load_or_emit_ptx("cuda_fused_residual_rms_norm_v1", []() {
         brass::codegen::MlFusionCompiler comp;
         return comp.emit_ptx_fused_residual_rms_norm(make_ptx_opts());
-    }();
+    });
 
     CUfunction fn = CudaJitEngine::instance().get_function(
         "fused_residual_rms_norm",
@@ -95,10 +112,10 @@ void launch_fused_residual_layernorm_ptx(
 ) {
     if (B <= 0 || D <= 0) return;
 
-    static const std::string ptx = []() {
+    static const std::string ptx = load_or_emit_ptx("cuda_fused_residual_layernorm_v1", []() {
         brass::codegen::MlFusionCompiler comp;
         return comp.emit_ptx_fused_residual_layernorm(make_ptx_opts());
-    }();
+    });
 
     CUfunction fn = CudaJitEngine::instance().get_function(
         "fused_residual_layernorm",
@@ -156,10 +173,10 @@ void launch_fused_layernorm_modulate_ptx(
 ) {
     if (R <= 0 || D <= 0) return;
 
-    static const std::string ptx = []() {
+    static const std::string ptx = load_or_emit_ptx("cuda_fused_layernorm_modulate_v1", []() {
         brass::codegen::MlFusionCompiler comp;
         return comp.emit_ptx_fused_layernorm_modulate(make_ptx_opts());
-    }();
+    });
 
     CUfunction fn = CudaJitEngine::instance().get_function(
         "fused_layernorm_modulate",
@@ -217,10 +234,10 @@ void launch_swiglu_ptx(
     // X is one packed gate|up projection, [B, 2D] — the layout swiglu_forward
     // is defined on — so this is brass's packed kernel, not
     // fused_swiglu_kernel(gate, up, out, n), which wants two flat buffers.
-    static const std::string ptx = []() {
+    static const std::string ptx = load_or_emit_ptx("cuda_swiglu_packed_v1", []() {
         brass::codegen::MlFusionCompiler comp;
         return comp.emit_ptx_swiglu_packed(make_ptx_opts());
-    }();
+    });
 
     CUfunction fn = CudaJitEngine::instance().get_function(
         "swiglu_packed",
@@ -271,10 +288,10 @@ void launch_modulate_ptx(
 ) {
     if (L <= 0 || D <= 0) return;
 
-    static const std::string ptx = []() {
+    static const std::string ptx = load_or_emit_ptx("cuda_adaln_modulate_v1", []() {
         brass::codegen::MlFusionCompiler comp;
         return comp.emit_ptx_adaln_modulate(false, make_ptx_opts());
-    }();
+    });
 
     CUfunction fn = CudaJitEngine::instance().get_function(
         "adaln_modulate",

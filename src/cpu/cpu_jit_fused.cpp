@@ -111,6 +111,8 @@ inline void fused_layernorm_modulate(const float* X, const float* gamma, const f
 #include <brass/mir/builder.hpp>
 #include <brass/mir/module.hpp>
 #include <brass/mir/function.hpp>
+#include "../jit/kernel_disk_cache.h"
+#include <atomic>
 #include <cmath>
 #include <mutex>
 #include <vector>
@@ -136,8 +138,6 @@ struct JitFusedKernels {
 
     using FusedLayerNormModulateRowFn = void (*)(const float* x, const float* gamma, const float* beta, const float* scale, const float* shift, float* y, uint64_t d, float eps, float inv_d);
     FusedLayerNormModulateRowFn fused_layernorm_modulate_row_fn = nullptr;
-
-    std::vector<std::shared_ptr<JitExecutionEngine>> engines;
 };
 
 // Horizontal sum of an 8-wide float vector using destination scratch buffer
@@ -156,9 +156,7 @@ static Value* reduce_vsum8(KernelBuilder& kb, Value* scratch, Value* vsum) {
 //
 // Computes in-place residual addition X += res, writes X, and accumulates sum_sq
 // in the EXACT same vector register pass, eliminating a full memory read/write pass.
-static KernelFunction build_fused_residual_rmsnorm_row(KernelJit& jit) {
-    Module mod("mod_fused_residual_rmsnorm_row");
-    mod.add_external_symbol("rsqrtf");
+static void populate_fused_residual_rmsnorm_row(Module& mod) {
     Function* fn = mod.create_function("fused_residual_rmsnorm_row", Type::void_type(), {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::i64(), Type::f32(), Type::f32()
     });
@@ -253,7 +251,7 @@ static KernelFunction build_fused_residual_rmsnorm_row(KernelJit& jit) {
     kb.position_at_end(l1_exit);
     Value* mean_sq = kb.mul(final_sum, inv_d);
     Value* denom = kb.add(mean_sq, eps);
-    Value* rrms = kb.builder().build_call("rsqrtf", Type::f32(), {denom});
+    Value* rrms = kb.div(kb.builder().build_fconst_f32(1.0f), kb.builder().build_sqrt_f32(denom));
     Value* vrrms = kb.vbroadcast(Type::f32x8(), rrms);
     kb.builder().build_br(l2_vhead, {zero_i64, rrms, vrrms});
 
@@ -301,8 +299,6 @@ static KernelFunction build_fused_residual_rmsnorm_row(KernelJit& jit) {
     fn->append_block(l2_exit);
     kb.position_at_end(l2_exit);
     kb.builder().build_ret_void();
-
-    return jit.compile(mod, "fused_residual_rmsnorm_row");
 }
 
 // ── 2. Fused Residual LayerNorm Row (X += res in-place + LayerNorm) ─────────
@@ -310,9 +306,7 @@ static KernelFunction build_fused_residual_rmsnorm_row(KernelJit& jit) {
 // Computes in-place residual addition X += res, writes X, and computes mean and
 // variance across vector registers, writing Y = gamma * (X - mean) * rstd + beta
 // directly in registers without intermediate buffers.
-static KernelFunction build_fused_residual_layernorm_row(KernelJit& jit) {
-    Module mod("mod_fused_residual_layernorm_row");
-    mod.add_external_symbol("rsqrtf");
+static void populate_fused_residual_layernorm_row(Module& mod) {
     Function* fn = mod.create_function("fused_residual_layernorm_row", Type::void_type(), {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::i64(), Type::f32(), Type::f32()
     });
@@ -473,7 +467,7 @@ static KernelFunction build_fused_residual_layernorm_row(KernelJit& jit) {
     kb.position_at_end(l2_exit);
     Value* var = kb.mul(final_sumsq, inv_d);
     Value* var_eps = kb.add(var, eps);
-    Value* rstd = kb.builder().build_call("rsqrtf", Type::f32(), {var_eps});
+    Value* rstd = kb.div(kb.builder().build_fconst_f32(1.0f), kb.builder().build_sqrt_f32(var_eps));
     Value* vmean3 = kb.vbroadcast(Type::f32x8(), final_mean);
     Value* vrstd3 = kb.vbroadcast(Type::f32x8(), rstd);
     kb.builder().build_br(l3_vhead, {zero_i64, final_mean, rstd, vmean3, vrstd3});
@@ -530,8 +524,6 @@ static KernelFunction build_fused_residual_layernorm_row(KernelJit& jit) {
     fn->append_block(l3_exit);
     kb.position_at_end(l3_exit);
     kb.builder().build_ret_void();
-
-    return jit.compile(mod, "fused_residual_layernorm_row");
 }
 
 // ── 3. Fused LayerNorm + Modulate Row (Option B: Zero Intermediate Memory) ──
@@ -539,9 +531,7 @@ static KernelFunction build_fused_residual_layernorm_row(KernelJit& jit) {
 // Computes LayerNorm directly into registers and immediately applies AdaLN
 // modulation by (1 + scale) + shift into output Y, writing zero intermediate
 // tensors to memory.
-static KernelFunction build_fused_layernorm_modulate_row(KernelJit& jit) {
-    Module mod("mod_fused_layernorm_modulate_row");
-    mod.add_external_symbol("rsqrtf");
+static void populate_fused_layernorm_modulate_row(Module& mod) {
     Function* fn = mod.create_function("fused_layernorm_modulate_row", Type::void_type(), {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::i64(), Type::f32(), Type::f32()
     });
@@ -698,7 +688,7 @@ static KernelFunction build_fused_layernorm_modulate_row(KernelJit& jit) {
     kb.position_at_end(l2_exit);
     Value* var = kb.mul(final_sumsq, inv_d);
     Value* var_eps = kb.add(var, eps);
-    Value* rstd = kb.builder().build_call("rsqrtf", Type::f32(), {var_eps});
+    Value* rstd = kb.div(kb.builder().build_fconst_f32(1.0f), kb.builder().build_sqrt_f32(var_eps));
     Value* vmean3 = kb.vbroadcast(Type::f32x8(), final_mean);
     Value* vrstd3 = kb.vbroadcast(Type::f32x8(), rstd);
     kb.builder().build_br(l3_vhead, {zero_i64, final_mean, rstd, vmean3, vrstd3});
@@ -765,54 +755,61 @@ static KernelFunction build_fused_layernorm_modulate_row(KernelJit& jit) {
     fn->append_block(l3_exit);
     kb.position_at_end(l3_exit);
     kb.builder().build_ret_void();
-
-    return jit.compile(mod, "fused_layernorm_modulate_row");
 }
 
-// ── Kernel Initialization & JIT Engine Management ───────────────────────────
+// ── Kernel Initialization & AOT Disk Cache Management ───────────────────────
+static std::mutex s_fused_jit_mu;
+static std::atomic<bool> s_fused_jit_ready{false};
+static JitFusedKernels s_fused_kernels;
+
 static const JitFusedKernels& get_fused_kernels() {
-    static JitFusedKernels kernels;
-    static std::once_flag init_flag;
-    std::call_once(init_flag, [] {
+    if (s_fused_jit_ready.load(std::memory_order_acquire)) {
+        return s_fused_kernels;
+    }
+    std::lock_guard<std::mutex> lk(s_fused_jit_mu);
+    if (!s_fused_jit_ready.load(std::memory_order_relaxed)) {
         try {
-            KernelOptions opts;
-            opts.enable_optimizations = true;
-            opts.enable_avx2 = true;
-            opts.enable_fma = true;
-            opts.enable_vectorize = true;
-            opts.enable_unroll = true;
-            opts.unroll_factor = 4;
-            opts.enable_fp_reassociation = true;
+            auto& cache = brotensor::jit::KernelDiskCache::instance();
+            brotensor::jit::KernelDiskCache::CpuCompileOptions opts;
 
-            KernelJit jit(opts);
+            s_fused_kernels.fused_residual_rmsnorm_row_fn =
+                cache.compile_or_load_cpu_fn<JitFusedKernels::FusedResidualRmsNormRowFn>(
+                    "cpu_fused_residual_rmsnorm_row_v1", "fused_residual_rmsnorm_row",
+                    populate_fused_residual_rmsnorm_row, opts);
 
-            // 1. Fused Residual RMSNorm row (Option B)
-            KernelFunction k_fused_res_rms = build_fused_residual_rmsnorm_row(jit);
-            kernels.fused_residual_rmsnorm_row_fn = k_fused_res_rms.as<JitFusedKernels::FusedResidualRmsNormRowFn>();
-            kernels.engines.push_back(k_fused_res_rms.engine());
+            s_fused_kernels.fused_residual_layernorm_row_fn =
+                cache.compile_or_load_cpu_fn<JitFusedKernels::FusedResidualLayerNormRowFn>(
+                    "cpu_fused_residual_layernorm_row_v1", "fused_residual_layernorm_row",
+                    populate_fused_residual_layernorm_row, opts);
 
-            // 2. Fused Residual LayerNorm row
-            KernelFunction k_fused_res_ln = build_fused_residual_layernorm_row(jit);
-            kernels.fused_residual_layernorm_row_fn = k_fused_res_ln.as<JitFusedKernels::FusedResidualLayerNormRowFn>();
-            kernels.engines.push_back(k_fused_res_ln.engine());
+            s_fused_kernels.fused_layernorm_modulate_row_fn =
+                cache.compile_or_load_cpu_fn<JitFusedKernels::FusedLayerNormModulateRowFn>(
+                    "cpu_fused_layernorm_modulate_row_v1", "fused_layernorm_modulate_row",
+                    populate_fused_layernorm_modulate_row, opts);
 
-            // 3. Fused LayerNorm Modulate row (Option B)
-            KernelFunction k_fused_ln_mod = build_fused_layernorm_modulate_row(jit);
-            kernels.fused_layernorm_modulate_row_fn = k_fused_ln_mod.as<JitFusedKernels::FusedLayerNormModulateRowFn>();
-            kernels.engines.push_back(k_fused_ln_mod.engine());
-
-            kernels.available = (kernels.fused_residual_rmsnorm_row_fn != nullptr &&
-                                 kernels.fused_residual_layernorm_row_fn != nullptr &&
-                                 kernels.fused_layernorm_modulate_row_fn != nullptr);
+            s_fused_kernels.available = (s_fused_kernels.fused_residual_rmsnorm_row_fn != nullptr &&
+                                         s_fused_kernels.fused_residual_layernorm_row_fn != nullptr &&
+                                         s_fused_kernels.fused_layernorm_modulate_row_fn != nullptr);
         } catch (const std::exception& e) {
             std::cerr << "brotensor: Brass JIT fused kernels initialization failed: " << e.what() << "\n";
-            kernels.available = false;
+            s_fused_kernels.available = false;
         }
-    });
-    return kernels;
+        s_fused_jit_ready.store(true, std::memory_order_release);
+    }
+    return s_fused_kernels;
 }
 
 } // namespace
+
+void prewarm_fused_jit_kernels() {
+    (void)get_fused_kernels();
+}
+
+void reset_fused_jit_caches_for_testing() {
+    std::lock_guard<std::mutex> lk(s_fused_jit_mu);
+    s_fused_jit_ready.store(false, std::memory_order_relaxed);
+    s_fused_kernels = JitFusedKernels{};
+}
 
 void fused_residual_rmsnorm(float* X, const float* res, const float* gamma, float eps, float* Y, int B, int D) {
     const auto& k = get_fused_kernels();
@@ -900,6 +897,9 @@ void fused_layernorm_modulate(const float* X, const float* gamma, const float* b
 #else // !BROTENSOR_HAS_BRASS_JIT
 
 namespace brotensor::detail::cpu::jit {
+
+void prewarm_fused_jit_kernels() {}
+void reset_fused_jit_caches_for_testing() {}
 
 void fused_residual_rmsnorm(float* X, const float* res, const float* gamma, float eps, float* Y, int B, int D) {
     ref::fused_residual_rmsnorm(X, res, gamma, eps, Y, B, D);

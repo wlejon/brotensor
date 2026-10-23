@@ -109,56 +109,180 @@ static void ref_gemv_q4k(const void* W, const float* X, float* Y, int N, int K) 
 
 #include <brass/codegen/ml_fusion.hpp>
 #include <brass/codegen/kernel_jit.hpp>
+#include <brass/mir/builder.hpp>
+#include <brass/mir/module.hpp>
+#include <brass/mir/function.hpp>
+#include "../jit/kernel_disk_cache.h"
+#include <atomic>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 
 namespace brotensor::detail::cpu::jit {
 
 namespace {
 
+using namespace brass;
 using namespace brass::codegen;
+
+using BlockAccFn = void (*)(const float* w_blk, const float* x_blk, float* acc8);
+
+static void populate_gemv_q8_0_acc_block(Module& mod) {
+    Function* fn = mod.create_function(
+        "gemv_q8_0_acc_block",
+        Type::void_type(),
+        {Type::ptr(), Type::ptr(), Type::ptr()});
+    KernelBuilder kb(mod, fn);
+    BasicBlock* entry = kb.builder().append_block("entry");
+    kb.position_at_end(entry);
+    Value* w_blk = kb.builder().add_block_param(entry, Type::ptr());
+    Value* x_blk = kb.builder().add_block_param(entry, Type::ptr());
+    Value* acc8  = kb.builder().add_block_param(entry, Type::ptr());
+
+    Value* vsum = kb.vload_f32x8(acc8, 0);
+    for (int c = 0; c < 4; ++c) {
+        Value* vw = kb.vload_f32x8(w_blk, c * 32);
+        Value* vx = kb.vload_f32x8(x_blk, c * 32);
+        vsum = kb.vfma(vw, vx, vsum);
+    }
+    kb.vstore_f32x8(acc8, vsum, 0);
+    kb.builder().build_ret_void();
+}
+
+static void populate_gemv_q4_k_acc_block(Module& mod) {
+    Function* fn = mod.create_function(
+        "gemv_q4_k_acc_block",
+        Type::void_type(),
+        {Type::ptr(), Type::ptr(), Type::ptr()});
+    KernelBuilder kb(mod, fn);
+    BasicBlock* entry = kb.builder().append_block("entry");
+    kb.position_at_end(entry);
+    Value* w_blk = kb.builder().add_block_param(entry, Type::ptr());
+    Value* x_blk = kb.builder().add_block_param(entry, Type::ptr());
+    Value* acc8  = kb.builder().add_block_param(entry, Type::ptr());
+
+    Value* vsum = kb.vload_f32x8(acc8, 0);
+    for (int c = 0; c < 32; ++c) {
+        Value* vw = kb.vload_f32x8(w_blk, c * 32);
+        Value* vx = kb.vload_f32x8(x_blk, c * 32);
+        vsum = kb.vfma(vw, vx, vsum);
+    }
+    kb.vstore_f32x8(acc8, vsum, 0);
+    kb.builder().build_ret_void();
+}
+
+static inline void fast_dequant_q8_0_block(const void* blk_ptr, float* out32) {
+#if defined(__AVX2__)
+    uint16_t d_raw;
+    std::memcpy(&d_raw, blk_ptr, 2);
+    const float d = fp16_bits_to_fp32(d_raw);
+    const int8_t* qs = reinterpret_cast<const int8_t*>(static_cast<const char*>(blk_ptr) + 2);
+    __m256 d_vec = _mm256_set1_ps(d);
+    for (int i = 0; i < 4; ++i) {
+        __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + i * 8));
+        __m256i q32 = _mm256_cvtepi8_epi32(q8);
+        __m256 qf = _mm256_cvtepi32_ps(q32);
+        __m256 w = _mm256_mul_ps(qf, d_vec);
+        _mm256_storeu_ps(out32 + i * 8, w);
+    }
+#else
+    ref_dequant_q8_0_block(blk_ptr, out32);
+#endif
+}
 
 struct QuantJitKernels {
     bool available = false;
-    MlFusionCompiler::GemvQ8_0Fn gemv_q8_0_fn = nullptr;
-    MlFusionCompiler::GemvQ4_KFn gemv_q4_k_fn = nullptr;
-    std::unique_ptr<MlFusionCompiler> compiler;
-    KernelFunction kfn_q8_0;
-    KernelFunction kfn_q4_k;
+    BlockAccFn q8_0_acc_fn = nullptr;
+    BlockAccFn q4_k_acc_fn = nullptr;
 };
 
+static std::mutex s_quant_jit_mu;
+static std::atomic<bool> s_quant_jit_ready{false};
+static QuantJitKernels s_quant_kernels;
+
 static const QuantJitKernels& get_quant_kernels() {
-    static QuantJitKernels kernels = []() {
-        QuantJitKernels k;
+    if (s_quant_jit_ready.load(std::memory_order_acquire)) {
+        return s_quant_kernels;
+    }
+    std::lock_guard<std::mutex> lk(s_quant_jit_mu);
+    if (!s_quant_jit_ready.load(std::memory_order_relaxed)) {
         try {
-            k.compiler = std::make_unique<MlFusionCompiler>();
-            k.kfn_q8_0 = k.compiler->compile_gemv_q8_0();
-            k.kfn_q4_k = k.compiler->compile_gemv_q4_k();
-            if (k.kfn_q8_0.is_valid()) {
-                k.gemv_q8_0_fn = k.kfn_q8_0.as<MlFusionCompiler::GemvQ8_0Fn>();
-            }
-            if (k.kfn_q4_k.is_valid()) {
-                k.gemv_q4_k_fn = k.kfn_q4_k.as<MlFusionCompiler::GemvQ4_KFn>();
-            }
-            k.available = (k.gemv_q8_0_fn != nullptr && k.gemv_q4_k_fn != nullptr);
+            auto& cache = brotensor::jit::KernelDiskCache::instance();
+            brotensor::jit::KernelDiskCache::CpuCompileOptions opts;
+
+            s_quant_kernels.q8_0_acc_fn = cache.compile_or_load_cpu_fn<BlockAccFn>(
+                "cpu_quant_gemv_q8_0_v1", "gemv_q8_0_acc_block",
+                populate_gemv_q8_0_acc_block, opts);
+            s_quant_kernels.q4_k_acc_fn = cache.compile_or_load_cpu_fn<BlockAccFn>(
+                "cpu_quant_gemv_q4_k_v1", "gemv_q4_k_acc_block",
+                populate_gemv_q4_k_acc_block, opts);
+
+            s_quant_kernels.available =
+                (s_quant_kernels.q8_0_acc_fn != nullptr && s_quant_kernels.q4_k_acc_fn != nullptr);
         } catch (const std::exception& e) {
             std::cerr << "brotensor: Brass JIT quant kernels initialization failed: " << e.what() << "\n";
-            k.available = false;
+            s_quant_kernels.available = false;
         }
-        return k;
-    }();
-    return kernels;
+        s_quant_jit_ready.store(true, std::memory_order_release);
+    }
+    return s_quant_kernels;
+}
+
+static void run_q8_0_rows(BlockAccFn acc_fn, const void* W, const float* X, float* Y, int N, int K) {
+    const int bpr = K / 32;
+    const char* W_bytes = static_cast<const char*>(W);
+    alignas(32) float blk_buf[32];
+    alignas(32) float acc8[8];
+    for (int r = 0; r < N; ++r) {
+        std::memset(acc8, 0, sizeof(acc8));
+        const char* row_ptr = W_bytes + static_cast<size_t>(r) * bpr * 34;
+        for (int b = 0; b < bpr; ++b) {
+            fast_dequant_q8_0_block(row_ptr + b * 34, blk_buf);
+            acc_fn(blk_buf, X + b * 32, acc8);
+        }
+        Y[r] = ((acc8[0] + acc8[1]) + (acc8[2] + acc8[3])) +
+               ((acc8[4] + acc8[5]) + (acc8[6] + acc8[7]));
+    }
+}
+
+static void run_q4_k_rows(BlockAccFn acc_fn, const void* W, const float* X, float* Y, int N, int K) {
+    const int bpr = K / 256;
+    const char* W_bytes = static_cast<const char*>(W);
+    alignas(32) float blk_buf[256];
+    alignas(32) float acc8[8];
+    for (int r = 0; r < N; ++r) {
+        std::memset(acc8, 0, sizeof(acc8));
+        const char* row_ptr = W_bytes + static_cast<size_t>(r) * bpr * 144;
+        for (int b = 0; b < bpr; ++b) {
+            ref_dequant_q4k_block(row_ptr + b * 144, blk_buf);
+            acc_fn(blk_buf, X + b * 256, acc8);
+        }
+        Y[r] = ((acc8[0] + acc8[1]) + (acc8[2] + acc8[3])) +
+               ((acc8[4] + acc8[5]) + (acc8[6] + acc8[7]));
+    }
 }
 
 } // namespace
 
+void prewarm_quant_jit_kernels() {
+    (void)get_quant_kernels();
+}
+
+void reset_quant_jit_caches_for_testing() {
+    std::lock_guard<std::mutex> lk(s_quant_jit_mu);
+    s_quant_jit_ready.store(false, std::memory_order_relaxed);
+    s_quant_kernels = QuantJitKernels{};
+}
+
 void gemv_q8_0(const void* W, const float* X, float* Y, int N, int K) {
     if (N <= 0 || K <= 0) return;
     const auto& k = get_quant_kernels();
-    if (k.available && k.gemv_q8_0_fn != nullptr) {
+    if (k.available && k.q8_0_acc_fn != nullptr) {
         if (N >= 8) {
             const size_t row_bytes = static_cast<size_t>(K / 32) * 34;
             int n_threads = std::min<int>(detail::cpu::ThreadPool::instance().num_threads(), N);
             if (n_threads <= 1) {
-                k.gemv_q8_0_fn(W, X, Y, static_cast<uint64_t>(N), static_cast<uint64_t>(K));
+                run_q8_0_rows(k.q8_0_acc_fn, W, X, Y, N, K);
             } else {
                 int chunk_size = (N + n_threads - 1) / n_threads;
                 int num_chunks = (N + chunk_size - 1) / chunk_size;
@@ -169,11 +293,11 @@ void gemv_q8_0(const void* W, const float* X, float* Y, int N, int K) {
                     const char* W_bytes = static_cast<const char*>(W);
                     const void* W_slice = W_bytes + static_cast<size_t>(r_start) * row_bytes;
                     float* Y_slice = Y + r_start;
-                    k.gemv_q8_0_fn(W_slice, X, Y_slice, static_cast<uint64_t>(r_end - r_start), static_cast<uint64_t>(K));
+                    run_q8_0_rows(k.q8_0_acc_fn, W_slice, X, Y_slice, r_end - r_start, K);
                 });
             }
         } else {
-            k.gemv_q8_0_fn(W, X, Y, static_cast<uint64_t>(N), static_cast<uint64_t>(K));
+            run_q8_0_rows(k.q8_0_acc_fn, W, X, Y, N, K);
         }
         return;
     }
@@ -183,12 +307,12 @@ void gemv_q8_0(const void* W, const float* X, float* Y, int N, int K) {
 void gemv_q4_k(const void* W, const float* X, float* Y, int N, int K) {
     if (N <= 0 || K <= 0) return;
     const auto& k = get_quant_kernels();
-    if (k.available && k.gemv_q4_k_fn != nullptr) {
+    if (k.available && k.q4_k_acc_fn != nullptr) {
         if (N >= 8) {
             const size_t row_bytes = static_cast<size_t>(K / 256) * 144;
             int n_threads = std::min<int>(detail::cpu::ThreadPool::instance().num_threads(), N);
             if (n_threads <= 1) {
-                k.gemv_q4_k_fn(W, X, Y, static_cast<uint64_t>(N), static_cast<uint64_t>(K));
+                run_q4_k_rows(k.q4_k_acc_fn, W, X, Y, N, K);
             } else {
                 int chunk_size = (N + n_threads - 1) / n_threads;
                 int num_chunks = (N + chunk_size - 1) / chunk_size;
@@ -199,11 +323,11 @@ void gemv_q4_k(const void* W, const float* X, float* Y, int N, int K) {
                     const char* W_bytes = static_cast<const char*>(W);
                     const void* W_slice = W_bytes + static_cast<size_t>(r_start) * row_bytes;
                     float* Y_slice = Y + r_start;
-                    k.gemv_q4_k_fn(W_slice, X, Y_slice, static_cast<uint64_t>(r_end - r_start), static_cast<uint64_t>(K));
+                    run_q4_k_rows(k.q4_k_acc_fn, W_slice, X, Y_slice, r_end - r_start, K);
                 });
             }
         } else {
-            k.gemv_q4_k_fn(W, X, Y, static_cast<uint64_t>(N), static_cast<uint64_t>(K));
+            run_q4_k_rows(k.q4_k_acc_fn, W, X, Y, N, K);
         }
         return;
     }
@@ -215,6 +339,9 @@ void gemv_q4_k(const void* W, const float* X, float* Y, int N, int K) {
 #else // !BROTENSOR_HAS_BRASS_JIT
 
 namespace brotensor::detail::cpu::jit {
+
+void prewarm_quant_jit_kernels() {}
+void reset_quant_jit_caches_for_testing() {}
 
 void gemv_q8_0(const void* W, const float* X, float* Y, int N, int K) {
     if (N <= 0 || K <= 0) return;
