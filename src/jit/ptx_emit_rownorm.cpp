@@ -106,12 +106,16 @@ std::string emit_rn_entry(const TraceDAG& dag, const RowNormPlan& plan, int lane
     if (lanes == 1) {
         b << "    mov.u32 " << r_c0 << ", " << r_sub << ";\n";
     } else {
-        b << "    mul.lo.u32 " << r_c0 << ", " << r_sub << ", " << lanes << ";\n";
+        b << "    shl.b32 " << r_c0 << ", " << r_sub << ", " << log2_exact(lanes) << ";\n";
     }
 
     // Element index of column 0 of this row, and its byte offset per dtype.
     const std::string r_rowbase = a.R();
-    b << "    mul.lo.u32 " << r_rowbase << ", " << r_row << ", " << D << ";\n";
+    if (is_pow2(D)) {
+        b << "    shl.b32 " << r_rowbase << ", " << r_row << ", " << log2_exact(D) << ";\n";
+    } else {
+        b << "    mul.lo.u32 " << r_rowbase << ", " << r_row << ", " << D << ";\n";
+    }
 
     std::unordered_map<int, std::string> rowbyte, colbcastbyte;
     auto row_bytes = [&](Dtype dt) -> std::string {

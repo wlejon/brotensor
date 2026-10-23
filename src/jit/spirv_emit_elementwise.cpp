@@ -39,14 +39,18 @@ brass::target::SpirvKernel build_entry(const TraceDAG& dag, const plan::Elementw
         // broadcasts across columns.
         Value* base = lanes > 1 ? b.build_shl(i, c.i32(log2_exact(lanes))) : i;
         Value* col = nullptr;
-        if (plan.any_row_bcast) {
-            col = is_pow2(plan.cols) ? b.build_and(base, c.i32(plan.cols - 1))
-                                     : b.build_umod(base, c.i32(plan.cols));
-        }
         Value* row = nullptr;
-        if (plan.any_col_bcast) {
-            row = is_pow2(plan.cols) ? b.build_lshr(base, c.i32(log2_exact(plan.cols)))
-                                     : b.build_udiv(base, c.i32(plan.cols));
+        if (plan.any_row_bcast && plan.any_col_bcast) {
+            udiv_urem_const(c, base, plan.cols, row, col);
+        } else if (plan.any_row_bcast) {
+            if (is_pow2(plan.cols)) {
+                col = b.build_and(base, c.i32(plan.cols - 1));
+            } else {
+                Value* q = nullptr;
+                udiv_urem_const(c, base, plan.cols, q, col);
+            }
+        } else if (plan.any_col_bcast) {
+            row = udiv_const(c, base, plan.cols);
         }
         // Byte offsets, one per (broadcast kind, element size) actually used.
         std::unordered_map<int, Value*> full_off, row_off, col_off;

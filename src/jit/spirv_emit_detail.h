@@ -67,8 +67,15 @@ bool has_lane_form(TraceOpKind op);
 ValueMap eval_chain(Ctx& c, const TraceDAG& dag, int lanes, ValueMap vals,
                     const std::vector<int>* order = nullptr);
 
+// Runs the brass MIR optimization pipeline (constant folding, dominator CSE,
+// GVN, FMA fusion, SMT guard simplification, MIR superoptimizer, and scalar
+// cleanup) in place on `fn` while preserving structured-CFG invariants.
+void optimize_function(Function& fn);
+
 // brass::target::SpirvTarget::compile with a 1-D workgroup of `block` threads
-// (the default the specialisation constants carry).
+// (the default the specialisation constants carry). When `optimize` is true,
+// runs `optimize_function(fn)` prior to SPIR-V instruction selection.
+brass::target::SpirvKernel compile(Function& fn, std::uint32_t block, bool optimize = true);
 brass::target::SpirvKernel compile(const Function& fn, std::uint32_t block);
 
 inline int log2_exact(int v) {
@@ -77,5 +84,52 @@ inline int log2_exact(int v) {
     return l;
 }
 inline bool is_pow2(int v) { return v > 0 && (v & (v - 1)) == 0; }
+
+// Unsigned 32-bit Granlund-Montgomery magic-multiplier parameters for exact
+// division by a runtime-constant divisor `d >= 1`:
+//   xp = x >> pre_shift
+//   if (!add) q = mul_hi_u32(xp, mul) >> post_shift
+//   else      q = (((xp - mul_hi_u32(xp, mul)) >> 1) + mul_hi_u32(xp, mul)) >> (post_shift - 1)
+struct MagicU32 {
+    std::uint32_t mul = 1;
+    std::uint32_t pre_shift = 0;
+    std::uint32_t post_shift = 0;
+    bool add = false;
+};
+
+inline MagicU32 magic_u32(std::uint32_t d) {
+    MagicU32 m;
+    if (d <= 1u) return m;
+    while ((d & 1u) == 0u) {
+        d >>= 1u;
+        ++m.pre_shift;
+    }
+    if (d == 1u) return m;
+    std::uint32_t l = 0;
+    while ((1ULL << l) < d) ++l;
+    const std::uint64_t p_lo = 1ULL << (32 + l - 1);
+    const std::uint64_t m_lo = (p_lo + d - 1ULL) / d;
+    const std::uint64_t e_lo = m_lo * d - p_lo;
+    const std::uint64_t max_v = 0xFFFFFFFFULL >> m.pre_shift;
+    const std::uint64_t nc = (max_v / d) * d - 1ULL;
+    if (nc * e_lo < p_lo) {
+        m.mul = static_cast<std::uint32_t>(m_lo);
+        m.post_shift = l - 1u;
+        m.add = false;
+    } else {
+        const std::uint64_t p_hi = 1ULL << (32 + l);
+        const std::uint64_t m_hi = (p_hi + d - 1ULL) / d;
+        m.mul = static_cast<std::uint32_t>(m_hi - (1ULL << 32));
+        m.post_shift = l;
+        m.add = true;
+    }
+    return m;
+}
+
+// Fast unsigned 32-bit division and quotient+remainder by compile-time constant
+// `d >= 1` using bitwise shifts/masks for powers of two and 64-bit magic
+// multiply-shift otherwise (zero OpUDiv / OpUMod instructions).
+Value* udiv_const(Ctx& c, Value* x, int d);
+void udiv_urem_const(Ctx& c, Value* x, int d, Value*& q, Value*& r);
 
 }  // namespace brotensor::jit::spirv::detail

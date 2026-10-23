@@ -75,15 +75,16 @@ public:
         if (rpb_ > 1) {
             local_ = b.build_lshr(tid_, c.i32(log2_exact(tpr_)));
             sub = b.build_and(tid_, c.i32(tpr_ - 1));
-            row = b.build_add(b.build_mul(group, c.i32(rpb_)), local_);
+            row = b.build_add(b.build_shl(group, c.i32(log2_exact(rpb_))), local_);
         }
         // rpb divides the row count, so this exit is uniform across the
         // workgroup and the barriers below stay safe.
         kb.if_then(b.build_uge(row, c.i32(ew_.rows)), [&] { b.build_ret_void(); });
 
-        c0_ = lanes_ > 1 ? b.build_mul(sub, c.i32(lanes_)) : sub;
+        c0_ = lanes_ > 1 ? b.build_shl(sub, c.i32(log2_exact(lanes_))) : sub;
         row_ = row;
-        rowbase_ = b.build_mul(row, c.i32(ew_.cols));
+        rowbase_ = is_pow2(ew_.cols) ? b.build_shl(row, c.i32(log2_exact(ew_.cols)))
+                                     : b.build_mul(row, c.i32(ew_.cols));
         for (const auto& s : ew_.inputs) {
             row_bytes(s.dtype);
             if (s.bcast == BroadcastKind::Col) col_bcast_bytes(s.dtype);
@@ -267,7 +268,7 @@ private:
         Value* warp = b.build_lshr(tid_, c_->i32(5));
         kb.if_then(b.build_eq(lane, c_->i32(0)), [&] { kb.shared_store_f32_indexed(red, warp, v); });
         kb.sync();
-        Value* base = rpb_ == 1 ? c_->i32(0) : b.build_mul(local_, c_->i32(warps_));
+        Value* base = rpb_ == 1 ? c_->i32(0) : b.build_shl(local_, c_->i32(log2_exact(warps_)));
         Value* total = nullptr;
         for (int w = 0; w < warps_; ++w) {
             Value* x = kb.shared_load_f32_indexed(red, b.build_add(base, c_->i32(w)));

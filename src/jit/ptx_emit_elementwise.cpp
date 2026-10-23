@@ -55,28 +55,22 @@ std::string emit_ew_entry(const TraceDAG& dag, const ElementwisePlan& plan, int 
           << (lanes == 2 ? 1 : (lanes == 4 ? 2 : 3)) << ";\n";
     }
 
-    // Column index, only when some operand broadcasts across rows.
-    std::string r_col;
-    if (plan.any_row_bcast) {
-        r_col = a.R();
+    // Column and row indices for broadcast operands (using bitwise shifts/masks
+    // for power-of-two `cols` and 32-bit unsigned magic-multiplier `mul.hi.u32`
+    // otherwise; shares `r_row` when both row and col broadcasts are active).
+    std::string r_col, r_row;
+    if (plan.any_row_bcast && plan.any_col_bcast) {
+        emit_udiv_urem_const(b, a, r_base, plan.cols, r_row, r_col);
+    } else if (plan.any_row_bcast) {
         if (is_pow2(plan.cols)) {
+            r_col = a.R();
             b << "    and.b32 " << r_col << ", " << r_base << ", " << (plan.cols - 1) << ";\n";
         } else {
-            b << "    rem.u32 " << r_col << ", " << r_base << ", " << plan.cols << ";\n";
+            std::string r_q;
+            emit_udiv_urem_const(b, a, r_base, plan.cols, r_q, r_col);
         }
-    }
-
-    // Row index, only when some operand broadcasts across columns.
-    std::string r_row;
-    if (plan.any_col_bcast) {
-        r_row = a.R();
-        if (is_pow2(plan.cols)) {
-            int sh = 0;
-            while ((1 << sh) < plan.cols) ++sh;
-            b << "    shr.u32 " << r_row << ", " << r_base << ", " << sh << ";\n";
-        } else {
-            b << "    div.u32 " << r_row << ", " << r_base << ", " << plan.cols << ";\n";
-        }
+    } else if (plan.any_col_bcast) {
+        r_row = emit_udiv_const(b, a, r_base, plan.cols);
     }
 
     // Byte offsets, one per (broadcast kind, element size) actually used.
