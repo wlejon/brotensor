@@ -37,6 +37,12 @@
 #include <string_view>
 #include <vector>
 
+#if defined(BROTENSOR_HAS_BRASS_JIT) || defined(BROTENSOR_HAS_VULKAN_TRACE_JIT) || defined(BRASS_HOST_BACKEND)
+#ifndef BROTENSOR_HAS_BRASS_JIT
+#define BROTENSOR_HAS_BRASS_JIT 1
+#endif
+#endif
+
 #if BROTENSOR_HAS_BRASS_JIT
 #include <brass/mir/module.hpp>
 #include <brass/target/dynamic_library.hpp>
