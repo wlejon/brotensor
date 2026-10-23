@@ -299,8 +299,10 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/gemm.cu
         src/cuda/fp16_matmul.cu
         src/cuda/elementwise.cu
+        src/cuda/elementwise_activations.cu
         src/cuda/softmax.cu
         src/cuda/layernorm.cu
+        src/cuda/layernorm_batched.cu
         src/cuda/attention.cu
         src/cuda/optim.cu
         src/cuda/adam.cu
@@ -342,6 +344,8 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/cross_attention_with_attn.cu
         src/cuda/attention_moments.cu
         src/cuda/flash_attention.cu
+        src/cuda/flash_attention_qkvo.cu
+        src/cuda/flash_attention_varlen_windowed.cu
         src/cuda/flash_attention_fused.cu
         src/cuda/flash_attention_backward.cu
         src/cuda/flash_attention_packed.cu

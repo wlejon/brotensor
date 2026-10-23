@@ -144,20 +144,32 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
     int  row_xbase[kElemsPerThr];   // n * C_in * H * W, or -1 when the row is OOB
     int  row_ih[kElemsPerThr];      // oh * STRIDE_H - PAD_H
     int  row_iw[kElemsPerThr];      // ow * STRIDE_W - PAD_W
+    int  row_fast_off[kElemsPerThr]; // row_xbase + row_ih * W + row_iw
     const int M_total = N * HW_out;
+    const bool m_interior = (block_m + BM <= M_total);
+    const bool n_interior = (block_n + BN <= C_out);
+    bool all_rows_interior = m_interior;
     #pragma unroll
     for (int li = 0; li < kElemsPerThr; ++li) {
         const int m_g = block_m + a_row0 + 4 * li;
-        if (m_g < M_total) {
+        if (m_interior || m_g < M_total) {
             const int n  = m_g / HW_out;
             const int sp = m_g - n * HW_out;
             const int oh = sp / W_out;
             const int ow = sp - oh * W_out;
-            row_xbase[li] = n * C_in * H * W;
-            row_ih[li]    = oh * STRIDE_H - PAD_H;
-            row_iw[li]    = ow * STRIDE_W - PAD_W;
+            const int ih = oh * STRIDE_H - PAD_H;
+            const int iw = ow * STRIDE_W - PAD_W;
+            row_xbase[li]    = n * C_in * H * W;
+            row_ih[li]       = ih;
+            row_iw[li]       = iw;
+            row_fast_off[li] = row_xbase[li] + ih * W + iw;
+            if (ih < 0 || ih + KH > H || iw < 0 || iw + KW > W) {
+                all_rows_interior = false;
+            }
         } else {
-            row_xbase[li] = -1;
+            row_xbase[li]    = -1;
+            row_fast_off[li] = 0;
+            all_rows_interior = false;
         }
     }
 
@@ -199,8 +211,17 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
         const int kh  = khw / KW;
         const int kw  = khw - kh * KW;
         const int ic_off = ic * H * W;
-        const bool k_ok  = gk < K_total;
 
+        if (all_rows_interior && k0 + BK <= K_total) {
+            const int k_off = ic_off + kh * W + kw;
+            #pragma unroll
+            for (int li = 0; li < kElemsPerThr; ++li) {
+                a_reg[li] = X[row_fast_off[li] + k_off];
+            }
+            return;
+        }
+
+        const bool k_ok = gk < K_total;
         #pragma unroll
         for (int li = 0; li < kElemsPerThr; ++li) {
             T v = TR::from_f32(0.0f);
@@ -216,6 +237,15 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
     };
 
     auto load_b = [&](int k0) {
+        if (n_interior && k_aligned8 && k0 + BK <= K_total) {
+            #pragma unroll
+            for (int li = 0; li < kLoadsPerThr; ++li) {
+                const int grow = block_n + b_row[li];
+                const int gk   = k0 + b_gcol[li];
+                b_reg[li] = *reinterpret_cast<const int4*>(&Wt[grow * K_total + gk]);
+            }
+            return;
+        }
         #pragma unroll
         for (int li = 0; li < kLoadsPerThr; ++li) {
             const int grow = block_n + b_row[li];
@@ -317,23 +347,39 @@ __global__ void conv2d_implicit_gemm_wmma_kernel(
         constexpr int kElemsTotal  = BM * BN;
         constexpr int kElemsPerThr = kElemsTotal / THREADS_PER_CTA;  // 32
 
-        #pragma unroll
-        for (int si = 0; si < kElemsPerThr; ++si) {
-            const int lin = tid + si * THREADS_PER_CTA;
-            const int row = lin / kElemsPerCol;        // 0..BM-1, output-pixel index within tile
-            const int col = lin - row * kElemsPerCol;  // 0..BN-1, oc within tile
+        if (m_interior && n_interior) {
+            #pragma unroll
+            for (int si = 0; si < kElemsPerThr; ++si) {
+                const int lin = tid + si * THREADS_PER_CTA;
+                const int row = lin / kElemsPerCol;
+                const int col = lin - row * kElemsPerCol;
+                const int m_g = block_m + row;
+                const int oc  = block_n + col;
+                const int n   = m_g / HW_out;
+                const int sp  = m_g - n * HW_out;
+                float v = Cs[row][col];
+                if (bias) v += TR::to_f32(bias[oc]);
+                Y[(n * C_out + oc) * HW_out + sp] = TR::from_f32(v);
+            }
+        } else {
+            #pragma unroll
+            for (int si = 0; si < kElemsPerThr; ++si) {
+                const int lin = tid + si * THREADS_PER_CTA;
+                const int row = lin / kElemsPerCol;        // 0..BM-1, output-pixel index within tile
+                const int col = lin - row * kElemsPerCol;  // 0..BN-1, oc within tile
 
-            const int m_g = block_m + row;
-            const int oc  = block_n + col;
-            if (oc >= C_out) continue;
-            if (m_g >= N * HW_out) continue;
+                const int m_g = block_m + row;
+                const int oc  = block_n + col;
+                if (oc >= C_out) continue;
+                if (m_g >= M_total) continue;
 
-            const int n   = m_g / HW_out;
-            const int sp  = m_g - n * HW_out;
-            // sp = oh * W_out + ow, so Y index = ((n * C_out + oc) * HW_out + sp).
-            float v = Cs[row][col];
-            if (bias) v += TR::to_f32(bias[oc]);
-            Y[(n * C_out + oc) * HW_out + sp] = TR::from_f32(v);
+                const int n   = m_g / HW_out;
+                const int sp  = m_g - n * HW_out;
+                // sp = oh * W_out + ow, so Y index = ((n * C_out + oc) * HW_out + sp).
+                float v = Cs[row][col];
+                if (bias) v += TR::to_f32(bias[oc]);
+                Y[(n * C_out + oc) * HW_out + sp] = TR::from_f32(v);
+            }
         }
     }
 }
