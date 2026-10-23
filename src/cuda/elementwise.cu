@@ -546,6 +546,14 @@ void build_slot_mask(const Tensor& x, int offset, int K, int stride,
 // ─── Vtable contribution ───────────────────────────────────────────────────
 namespace {
 
+__device__ __forceinline__ float to_f32(float v) { return v; }
+__device__ __forceinline__ float to_f32(__half v) { return __half2float(v); }
+__device__ __forceinline__ float to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+template <typename T> __device__ __forceinline__ T from_f32(float v);
+template <> __device__ __forceinline__ float from_f32<float>(float v) { return v; }
+template <> __device__ __forceinline__ __half from_f32<__half>(float v) { return __float2half(v); }
+template <> __device__ __forceinline__ __nv_bfloat16 from_f32<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+
 __device__ inline float sigmoid_scalar(float v) {
     return 1.0f / (1.0f + expf(-v));
 }

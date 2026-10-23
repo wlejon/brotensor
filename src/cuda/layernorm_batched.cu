@@ -13,6 +13,10 @@ namespace brotensor { void* cuda_current_stream(); }
 
 namespace brotensor::detail::cuda {
 
+// Defined in runtime.cu / tensor.cu (same namespace): the stream-ordered pool.
+void* cuda_alloc(std::size_t bytes);
+void  cuda_free(void* ptr);
+
 namespace {
 
 constexpr int LN_BLOCK = 256;
