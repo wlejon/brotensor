@@ -185,7 +185,11 @@ bool bro_tensor_saveSafetensors(const char* path, uint64_t names_bits, uint64_t 
         setError("saveSafetensors(path, {name: tensor, ...})");
         return false;
     }
-    const auto n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(names.get(), "length")));
+    Value lenV = ev::getProperty(names.get(), "length");
+    const double lenD = ev::isNumber(lenV) ? ev::toDouble(lenV) : 0.0;
+    const auto n = (std::isfinite(lenD) && lenD > 0.0)
+        ? static_cast<uint32_t>(std::min(lenD, 4294967295.0))
+        : 0u;
 
     std::vector<stns::WriteEntry> entries;
     // Backing host buffers, alive until write_file() returns; reserved so
@@ -220,13 +224,21 @@ bool bro_tensor_saveSafetensors(const char* path, uint64_t names_bits, uint64_t 
             if (ev::isObject(shapeProp.get())) {
                 Value lenVal = ev::getProperty(shapeProp.get(), "length");
                 if (ev::isNumber(lenVal)) {
-                    uint32_t shapeLen = static_cast<uint32_t>(ev::toDouble(lenVal));
+                    const double slD = ev::toDouble(lenVal);
+                    uint32_t shapeLen = (std::isfinite(slD) && slD > 0.0)
+                        ? static_cast<uint32_t>(std::min(slD, 64.0))
+                        : 0u;
                     if (shapeLen > 0) {
                         std::vector<int64_t> customShape;
                         customShape.reserve(shapeLen);
                         int64_t numel = 1;
                         for (uint32_t s = 0; s < shapeLen; ++s) {
-                            int64_t dim = static_cast<int64_t>(ev::toDouble(ev::getElement(shapeProp.get(), s)));
+                            const double dimD = ev::toDouble(ev::getElement(shapeProp.get(), s));
+                            if (!std::isfinite(dimD) || dimD < 0.0 || dimD > 2147483647.0 || dimD != std::floor(dimD)) {
+                                numel = -1;
+                                break;
+                            }
+                            int64_t dim = static_cast<int64_t>(dimD);
                             customShape.push_back(dim);
                             // A negative dim can multiply back to rows*cols
                             // ([-2, -3] for 6); never let it reach the header.

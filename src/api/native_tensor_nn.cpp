@@ -715,7 +715,11 @@ bool readTensorArray(uint64_t bits, std::vector<brotensor::Tensor*>& out, const 
         setError(std::string(label) + ": expected an array of GpuTensors");
         return false;
     }
-    const auto n = static_cast<uint32_t>(ev::toDouble(ev::getProperty(arr.get(), "length")));
+    ev::Value lenV = ev::getProperty(arr.get(), "length");
+    const double lenD = ev::isNumber(lenV) ? ev::toDouble(lenV) : 0.0;
+    const auto n = (std::isfinite(lenD) && lenD > 0.0)
+        ? static_cast<uint32_t>(std::min(lenD, 4294967295.0))
+        : 0u;
     out.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
         void* d = ev::handleData(ev::getElement(arr.get(), i));
