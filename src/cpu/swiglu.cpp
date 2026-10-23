@@ -14,6 +14,7 @@
 #include <brotensor/tensor.h>
 #include "cpu_jit.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -22,7 +23,8 @@ namespace brotensor::detail::cpu {
 namespace {
 
 inline float silu_scalar(float v) {
-    return v / (1.0f + std::exp(-v));
+    const float vc = std::clamp(v, -88.0f, 88.0f);
+    return v / (1.0f + std::exp(-vc));
 }
 
 // Backward needs both silu(v) and silu'(v) for the same v; both derive from
@@ -30,9 +32,10 @@ inline float silu_scalar(float v) {
 // it once here instead of calling silu_scalar plus a separate gradient
 // function (which would redo the std::exp).
 inline void silu_value_grad(float v, float& s_out, float& sprime_out) {
-    const float s = 1.0f / (1.0f + std::exp(-v));
+    const float vc = std::clamp(v, -88.0f, 88.0f);
+    const float s  = 1.0f / (1.0f + std::exp(-vc));
     s_out = v * s;
-    sprime_out = s * (1.0f + v * (1.0f - s));
+    sprime_out = s * (1.0f + vc * (1.0f - s));
 }
 
 } // namespace

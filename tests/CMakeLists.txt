@@ -54,6 +54,19 @@ if(BROTENSOR_HAS_BRASS_JIT)
             ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_elementwise.cpp
             ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_rownorm.cpp)
     endif()
+
+    brotensor_add_test(brotensor_test_backward_index_proofs test_backward_index_proofs.cpp)
+    target_link_libraries(brotensor_test_backward_index_proofs PRIVATE ${BROTENSOR_BRASS_LIB})
+    add_test(NAME test_backward_index_proofs COMMAND brotensor_test_backward_index_proofs)
+
+    brotensor_add_test(brotensor_test_backward_shader_audit test_backward_shader_audit.cpp)
+    target_link_libraries(brotensor_test_backward_shader_audit PRIVATE ${BROTENSOR_BRASS_LIB})
+    add_test(NAME test_backward_shader_audit COMMAND brotensor_test_backward_shader_audit)
+
+    brotensor_add_test(brotensor_test_backward_nan_freedom test_backward_nan_freedom.cpp)
+    target_link_libraries(brotensor_test_backward_nan_freedom PRIVATE ${BROTENSOR_BRASS_LIB})
+    add_test(NAME test_backward_nan_freedom COMMAND brotensor_test_backward_nan_freedom)
+
     brotensor_add_test(brotensor_test_trace_autodiff_jit test_trace_autodiff_jit.cpp)
     target_link_libraries(brotensor_test_trace_autodiff_jit PRIVATE ${BROTENSOR_BRASS_LIB})
     add_test(NAME test_trace_autodiff_jit COMMAND brotensor_test_trace_autodiff_jit)

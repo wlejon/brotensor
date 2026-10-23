@@ -51,6 +51,7 @@
 #include <brotensor/tensor.h>
 #include <brotensor/detail/cpu/thread_pool.h>
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <vector>
@@ -283,7 +284,7 @@ void attention_core_backward(const float* Q, const float* K, const float* V,
                 const float* kr = K + static_cast<std::size_t>(k) * D + off;
                 float dot = 0.0f;
                 for (int d = 0; d < hd; ++d) dot += qr[d] * kr[d];
-                prow[k] = dot * inv_sqrt;
+                prow[k] = std::clamp(dot * inv_sqrt, -1e29f, 1e29f);
                 if (prow[k] > m) m = prow[k];
             }
             const bool empty = (m <= -1e29f);
@@ -323,9 +324,9 @@ void attention_core_backward(const float* Q, const float* K, const float* V,
             const float* dpr  = dP + static_cast<std::size_t>(q) * Lk;
             float* dsr = dS + static_cast<std::size_t>(q) * Lk;
             float Dq = 0.0f;
-            for (int k = 0; k < Lk; ++k) Dq += prow[k] * dpr[k];
+            for (int k = 0; k < Lk; ++k) if (prow[k] > 0.0f && std::isfinite(dpr[k])) Dq += prow[k] * dpr[k];
             for (int k = 0; k < Lk; ++k)
-                dsr[k] = prow[k] * (dpr[k] - Dq) * inv_sqrt;
+                dsr[k] = (prow[k] > 0.0f && std::isfinite(dpr[k])) ? (prow[k] * (dpr[k] - Dq) * inv_sqrt) : 0.0f;
         }
         // dQ[q, off+d] = sum_k dS[q,k] * K[k, off+d].
         for (int q = 0; q < Lq; ++q) {

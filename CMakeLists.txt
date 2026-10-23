@@ -169,6 +169,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/alloc.cpp
     src/cpu/thread_pool.cpp
     src/cpu/ops_impl.cpp
+    src/cpu/ops_mha_batched.cpp
     src/cpu/register.cpp
     src/cpu/elementwise.cpp
     src/cpu/loss.cpp
@@ -287,6 +288,11 @@ elseif(TARGET brass)
     target_link_libraries(brotensor_cpu PRIVATE ${BROTENSOR_BRASS_LIB})
     target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_BRASS_JIT=1)
     set(BROTENSOR_HAS_BRASS_JIT 1)
+    target_sources(brotensor_cpu PRIVATE
+        src/backward_index_verify.cpp
+        src/backward_shader_audit.cpp
+        src/backward_nan_verify.cpp
+    )
     if(BRASS_WITH_SPIRV AND NOT BROTENSOR_WITH_VULKAN)
         target_sources(brotensor_cpu PRIVATE
             src/jit/spirv_emit_common.cpp
@@ -659,6 +665,9 @@ endif()
 if(BROTENSOR_WITH_VULKAN)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BrotensorVulkan.cmake")
     brotensor_vulkan_add_backend()
+    target_include_directories(brotensor_cpu PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vulkan_shaders")
+    target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_VULKAN=1 BROTENSOR_HAS_SHADER_TABLE=1)
+    add_dependencies(brotensor_cpu brotensor_vulkan)
 endif()
 
 # --- brotensor: final consumed target (INTERFACE) ---

@@ -29,6 +29,7 @@ float block_sum(float v) {
     barrier();
     float t = 0.0;
     for (uint i = 0; i < gl_NumSubgroups; ++i) t += red[i];
+    barrier();
     return t;
 }
 

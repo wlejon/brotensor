@@ -18,27 +18,37 @@ layout(push_constant) uniform PC {
 
 float grad(float v, float g) {
     switch (OP) {
-        case GOP_RELU:       return v > 0.0 ? g : 0.0 * g;
-        case GOP_TANH:       return g * (1.0 - v * v);
-        case GOP_SIGMOID:    return g * (v * (1.0 - v));
+        case GOP_RELU:       return v > 0.0 ? g : 0.0;
+        case GOP_TANH: {
+            const float vc = clamp(v, -1.0, 1.0);
+            return g * (1.0 - vc * vc);
+        }
+        case GOP_SIGMOID: {
+            const float vc = clamp(v, 0.0, 1.0);
+            return g * (vc * (1.0 - vc));
+        }
         case GOP_SILU: {
-            const float s = 1.0 / (1.0 + exp(-v));
-            return g * (s * (1.0 + v * (1.0 - s)));
+            const float vc = clamp(v, -88.0, 88.0);
+            const float s = bt_sigmoid(vc);
+            return g * (s * (1.0 + vc * (1.0 - s)));
         }
         case GOP_GELU_TANH:  return g * bt_gelu_tanh_grad(v);
-        case GOP_GELU_EXACT:
-            return g * (0.5 * (1.0 + bt_erf(v * 0.7071067811865475)) +
-                        v * 0.3989422804014327 * exp(-0.5 * v * v));
-        case GOP_QUICK_GELU: {
-            const float s = 1.0 / (1.0 + exp(-1.702 * v));
-            return g * (s + 1.702 * v * s * (1.0 - s));
+        case GOP_GELU_EXACT: {
+            const float vc = clamp(v, -20.0, 20.0);
+            return g * (0.5 * (1.0 + bt_erf(vc * 0.7071067811865475)) +
+                        vc * 0.3989422804014327 * exp(-0.5 * vc * vc));
         }
-        case GOP_EXP:        return g * exp(v);
-        case GOP_LOG:        return g / v;
+        case GOP_QUICK_GELU: {
+            const float vc = clamp(v, -50.0, 50.0);
+            const float s = bt_sigmoid(1.702 * vc);
+            return g * (s + 1.702 * vc * s * (1.0 - s));
+        }
+        case GOP_EXP:        return g * exp(clamp(v, -88.0, 88.0));
+        case GOP_LOG:        return g / max(v, 1e-37);
         case GOP_SIN:        return g * cos(v);
         case GOP_COS:        return -g * sin(v);
         case GOP_RSQRT:      return -0.5 * g * v * v * v;
-        case GOP_ELU:        return g * (v > 0.0 ? 1.0 : pc.a * exp(v));
+        case GOP_ELU:        return g * (v > 0.0 ? 1.0 : pc.a * exp(clamp(v, -88.0, 0.0)));
         case GOP_LEAKY_RELU: return g * (v > 0.0 ? 1.0 : pc.a);
         case GOP_PASS:       return g;
     }

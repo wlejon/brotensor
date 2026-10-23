@@ -31,6 +31,7 @@
 #include <brotensor/tensor.h>
 #include <brotensor/detail/cpu/thread_pool.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
@@ -97,7 +98,8 @@ void group_norm_forward(const ::brotensor::Tensor& X,
                 sumsq += d * d;
             }
             const float var  = sumsq * inv_M;
-            const float rstd = 1.0f / std::sqrt(var + eps);
+            const float eps_safe = std::max(eps, 1e-12f);
+            const float rstd = 1.0f / std::sqrt(std::max(var + eps_safe, 1e-12f));
 
             for (int i = 0; i < tile_size; ++i) {
                 const int local_c = i / spatial;
@@ -201,7 +203,8 @@ void group_norm_backward(const ::brotensor::Tensor& X,
                 sumsq += d * d;
             }
             const float var  = sumsq * inv_M;
-            const float rstd = 1.0f / std::sqrt(var + eps);
+            const float eps_safe = std::max(eps, 1e-12f);
+            const float rstd = 1.0f / std::sqrt(std::max(var + eps_safe, 1e-12f));
 
             // Pass 2: sum1 = Σ dx̂, sum2 = Σ dx̂·x̂; stash this n's per-channel
             // dg/db into the partial buffers; cache x̂ into xhat_buf for

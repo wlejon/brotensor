@@ -14,6 +14,7 @@
 
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <cmath>
 
 namespace brotensor::detail::cpu {
@@ -21,29 +22,33 @@ namespace brotensor::detail::cpu {
 namespace {
 
 inline float silu_scalar(float v) {
-    return v / (1.0f + std::exp(-v));
+    const float vc = std::clamp(v, -88.0f, 88.0f);
+    return v / (1.0f + std::exp(-vc));
 }
 
 inline float silu_grad_scalar(float v) {
     // d/dx [x * sigmoid(x)] = sigmoid(x) * (1 + x * (1 - sigmoid(x))).
-    const float s = 1.0f / (1.0f + std::exp(-v));
-    return s * (1.0f + v * (1.0f - s));
+    const float vc = std::clamp(v, -88.0f, 88.0f);
+    const float s  = 1.0f / (1.0f + std::exp(-vc));
+    return s * (1.0f + vc * (1.0f - s));
 }
 
 inline float gelu_tanh_scalar(float v) {
     // GELU with tanh approximation (matches PyTorch's approximate="tanh").
     constexpr float kSqrt2OverPi = 0.7978845608f;
-    const float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
+    const float vc = std::clamp(v, -20.0f, 20.0f);
+    const float u  = kSqrt2OverPi * (vc + 0.044715f * vc * vc * vc);
     return 0.5f * v * (1.0f + std::tanh(u));
 }
 
 inline float gelu_tanh_grad_scalar(float v) {
     // Derivative of gelu_tanh_scalar w.r.t. v.
     constexpr float kSqrt2OverPi = 0.7978845608f;
-    const float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
-    const float t = std::tanh(u);
-    const float dudx = kSqrt2OverPi * (1.0f + 3.0f * 0.044715f * v * v);
-    return 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * dudx;
+    const float vc   = std::clamp(v, -20.0f, 20.0f);
+    const float u    = kSqrt2OverPi * (vc + 0.044715f * vc * vc * vc);
+    const float t    = std::tanh(u);
+    const float dudx = kSqrt2OverPi * (1.0f + 3.0f * 0.044715f * vc * vc);
+    return 0.5f * (1.0f + t) + 0.5f * vc * (1.0f - t * t) * dudx;
 }
 
 inline float gelu_exact_scalar(float v) {
@@ -56,20 +61,23 @@ inline float gelu_exact_grad_scalar(float v) {
     // d/dx [0.5*x*(1+erf(x/√2))] = 0.5*(1+erf(x/√2)) + x*φ(x).
     constexpr float kInvSqrt2   = 0.70710678118654752440f;
     constexpr float kInvSqrt2Pi = 0.39894228040143267794f; // 1/sqrt(2π)
-    const float cdf_term = 0.5f * (1.0f + std::erf(v * kInvSqrt2));
-    const float pdf      = kInvSqrt2Pi * std::exp(-0.5f * v * v);
-    return cdf_term + v * pdf;
+    const float vc       = std::clamp(v, -20.0f, 20.0f);
+    const float cdf_term = 0.5f * (1.0f + std::erf(vc * kInvSqrt2));
+    const float pdf      = kInvSqrt2Pi * std::exp(-0.5f * vc * vc);
+    return cdf_term + vc * pdf;
 }
 
 inline float quick_gelu_scalar(float v) {
     // OpenAI CLIP's QuickGELU: x * sigmoid(1.702 * x).
-    return v / (1.0f + std::exp(-1.702f * v));
+    const float vc = std::clamp(v, -50.0f, 50.0f);
+    return v / (1.0f + std::exp(-1.702f * vc));
 }
 
 inline float quick_gelu_grad_scalar(float v) {
     // d/dx [x * sigmoid(1.702*x)] = s + x * 1.702 * s * (1 - s).
-    const float s = 1.0f / (1.0f + std::exp(-1.702f * v));
-    return s + v * 1.702f * s * (1.0f - s);
+    const float vc = std::clamp(v, -50.0f, 50.0f);
+    const float s  = 1.0f / (1.0f + std::exp(-1.702f * vc));
+    return s + vc * 1.702f * s * (1.0f - s);
 }
 
 } // namespace

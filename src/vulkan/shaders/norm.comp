@@ -114,7 +114,8 @@ void main() {
                 const float e = load_elem(DTX, pc.x, base + i) - mean;
                 q += e * e;
             }
-            const float rstd = 1.0 / sqrt(block_sum(q) * invd + pc.eps);
+            const float eps_safe = max(pc.eps, 1e-12);
+            const float rstd = 1.0 / sqrt(max(block_sum(q) * invd + eps_safe, 1e-12));
             if (tid == 0u) {
                 if (pc.s0 != 0) F32Buf(pc.s0).v[row] = mean;
                 if (pc.s1 != 0) F32Buf(pc.s1).v[row] = rstd;
@@ -133,7 +134,9 @@ void main() {
                 q += v * v;
             }
             q = block_sum(q);
-            const float r = MODE == NORM_RMS ? 1.0 / sqrt(q * invd + pc.eps) : 1.0 / sqrt(q + pc.eps);
+            const float eps_safe = max(pc.eps, 1e-12);
+            const float r = MODE == NORM_RMS ? 1.0 / sqrt(max(q * invd + eps_safe, 1e-12))
+                                             : 1.0 / sqrt(max(q + eps_safe, 1e-12));
             if (MODE == NORM_RMS && tid == 0u && pc.s1 != 0) F32Buf(pc.s1).v[row] = r;
             for (uint i = tid; i < pc.d; i += nt) {
                 const float v = load_elem(DTX, pc.x, base + i);
@@ -164,8 +167,9 @@ void main() {
             }
             q = block_sum(q);
             p = block_sum(p);
+            const float eps_safe = max(pc.eps, 1e-12);
             if (MODE == NORM_RMS_BWD) {
-                const float r = 1.0 / sqrt(q * invd + pc.eps);
+                const float r = 1.0 / sqrt(max(q * invd + eps_safe, 1e-12));
                 if (tid == 0u && pc.s1 != 0) F32Buf(pc.s1).v[row] = r;
                 const float coeff = invd * r * r * p;
                 for (uint i = tid; i < pc.d; i += nt) {
@@ -174,7 +178,7 @@ void main() {
                     store_elem(DTX, pc.y, base + i, r * (gamma_at(i) * dy - v * coeff));
                 }
             } else {
-                const float n = 1.0 / sqrt(q + pc.eps);
+                const float n = 1.0 / sqrt(max(q + eps_safe, 1e-12));
                 for (uint i = tid; i < pc.d; i += nt) {
                     const float v = load_elem(DTX, pc.x, base + i);
                     const float dy = load_elem(DTX, pc.xh, base + i);

@@ -42,17 +42,19 @@ void main() {
             const float g = load_elem(DT, pc.dy, i);
             float da, db;
             if (OP == GLU_SWIGLU_BWD) {
-                const float s = bt_sigmoid(a);
-                da = g * b * s * (1.0 + a * (1.0 - s));
+                const float ac = clamp(a, -88.0, 88.0);
+                const float s = bt_sigmoid(ac);
+                da = g * b * s * (1.0 + ac * (1.0 - s));
                 db = g * a * s;
             } else if (OP == GLU_GEGLU_TANH_BWD) {
                 da = g * bt_gelu_tanh(b);
                 db = g * a * bt_gelu_tanh_grad(b);
             } else {   // GLU_GEGLU_EXACT_BWD
-                const float cdf = 0.5 * (1.0 + bt_erf(b * 0.70710678118654752440));
-                const float pdf = 0.39894228040143267794 * exp(-0.5 * b * b);
+                const float bc = clamp(b, -20.0, 20.0);
+                const float cdf = 0.5 * (1.0 + bt_erf(bc * 0.70710678118654752440));
+                const float pdf = 0.39894228040143267794 * exp(-0.5 * bc * bc);
                 da = g * b * cdf;
-                db = g * a * (cdf + b * pdf);
+                db = g * a * (cdf + bc * pdf);
             }
             store_elem(DTY, pc.y, ia, da);
             store_elem(DTY, pc.y, ib, db);

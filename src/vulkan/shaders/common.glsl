@@ -86,10 +86,10 @@ float bt_tanh(float x) {
 // relative accuracy near 0), so use the Maclaurin series near 0 and a
 // rational (Numerical Recipes erfcc, fractional error < 1.2e-7) for the rest.
 float bt_erf(float x) {
-    const float ax = abs(x);
+    const float ax = min(abs(x), 20.0);
     float r;
     if (ax < 0.5) {
-        const float x2 = x * x;
+        const float x2 = ax * ax;
         // 2/sqrt(pi) * (x - x^3/3 + x^5/10 - x^7/42 + x^9/216 - x^11/1320)
         r = 1.1283791670955126 * ax *
             (1.0 + x2 * (-1.0 / 3.0 + x2 * (0.1 + x2 * (-1.0 / 42.0 + x2 * (1.0 / 216.0 +
@@ -105,20 +105,22 @@ float bt_erf(float x) {
     return x < 0.0 ? -r : r;
 }
 
-float bt_sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
+float bt_sigmoid(float x) { return 1.0 / (1.0 + exp(clamp(-x, -88.0, 88.0))); }
 
 // tanh-approximation GELU, written through the identity 0.5 * (1 + tanh(u)) =
 // sigmoid(2u): the same function as the CPU's 0.5*x*(1 + tanh(u)) without the
 // cancellation in 1 + tanh(u) for negative x.
 const float kGeluC = 0.7978845608028654;   // sqrt(2 / pi)
 float bt_gelu_tanh(float x) {
-    const float u = kGeluC * (x + 0.044715 * x * x * x);
-    return x / (1.0 + exp(-2.0 * u));
+    const float xc = clamp(x, -20.0, 20.0);
+    const float u = kGeluC * (xc + 0.044715 * xc * xc * xc);
+    return x * bt_sigmoid(2.0 * u);
 }
 float bt_gelu_tanh_grad(float x) {
-    const float x2 = x * x;
-    const float s = bt_sigmoid(2.0 * kGeluC * (x + 0.044715 * x2 * x));   // 0.5 * (1 + tanh u)
+    const float xc = clamp(x, -20.0, 20.0);
+    const float x2 = xc * xc;
+    const float s = bt_sigmoid(2.0 * kGeluC * (xc + 0.044715 * x2 * xc));   // 0.5 * (1 + tanh u)
     const float d_inner = kGeluC * (1.0 + 3.0 * 0.044715 * x2);
     // 0.5 (1 + t) + 0.5 x (1 - t^2) u' with 1 + t = 2s, 1 - t^2 = 4 s (1 - s)
-    return s + 2.0 * x * s * (1.0 - s) * d_inner;
+    return s + 2.0 * xc * s * (1.0 - s) * d_inner;
 }

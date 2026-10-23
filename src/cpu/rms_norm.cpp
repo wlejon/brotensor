@@ -20,6 +20,7 @@
 #include <brotensor/detail/cpu/thread_pool.h>
 #include "cpu_jit.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
@@ -43,9 +44,10 @@ void rms_norm_forward(const ::brotensor::Tensor& X,
     const float* Xp = X.host_f32();
     const float* gp = gamma.host_f32();
     float* Yp = Y.host_f32_mut();
+    const float eps_safe = std::max(eps, 1e-12f);
 
     if (jit::is_jit_available()) {
-        jit::rms_norm_forward(Xp, gp, eps, Yp, B, D);
+        jit::rms_norm_forward(Xp, gp, eps_safe, Yp, B, D);
         return;
     }
     // Each row b owns Y's row b exclusively (X/gamma are read-only shared
@@ -59,9 +61,10 @@ void rms_norm_forward(const ::brotensor::Tensor& X,
             const float v = xrow[j];
             sum += v * v;
         }
-        const float rrms = 1.0f / std::sqrt(sum / static_cast<float>(D) + eps);
+        const float denom = std::max(sum / static_cast<float>(D) + eps_safe, 1e-12f);
+        const float rrms = std::isfinite(denom) ? (1.0f / std::sqrt(denom)) : 0.0f;
         for (int j = 0; j < D; ++j) {
-            yrow[j] = xrow[j] * gp[j] * rrms;
+            yrow[j] = (rrms > 0.0f) ? (xrow[j] * gp[j] * rrms) : 0.0f;
         }
     });
 }
@@ -90,6 +93,7 @@ void rms_norm_backward(const ::brotensor::Tensor& X,
     float* dXp = dX.host_f32_mut();
     float* dGp = dGamma.host_f32_mut();
     const float inv_D = 1.0f / static_cast<float>(D);
+    const float eps_safe = std::max(eps, 1e-12f);
 
     // dGamma accumulates dGp[j] += ... summed over every row b — a shared
     // reduction across the batch axis, not disjoint per b. So the dX pass
@@ -111,20 +115,21 @@ void rms_norm_backward(const ::brotensor::Tensor& X,
             const float v = xrow[j];
             sum_xx += v * v;
         }
-        const float rrms = 1.0f / std::sqrt(sum_xx * inv_D + eps);
+        const float denom = std::max(sum_xx * inv_D + eps_safe, 1e-12f);
+        const float rrms = std::isfinite(denom) ? (1.0f / std::sqrt(denom)) : 0.0f;
         rrms_cache[b] = rrms;   // disjoint per-b write
 
         float sum_xdy = 0.0f;
         for (int j = 0; j < D; ++j) {
             sum_xdy += xrow[j] * dyrow[j] * gp[j];
         }
-        const float coeff = inv_D * rrms * rrms * sum_xdy;
+        const float coeff = std::isfinite(sum_xdy) ? (inv_D * rrms * rrms * sum_xdy) : 0.0f;
 
         for (int j = 0; j < D; ++j) {
             const float g  = gp[j];
             const float dy = dyrow[j];
             const float x  = xrow[j];
-            dxrow[j] = rrms * (g * dy - x * coeff);   // overwrite dX
+            dxrow[j] = (rrms > 0.0f) ? (rrms * (g * dy - x * coeff)) : 0.0f;   // overwrite dX
         }
     });
 
@@ -134,8 +139,10 @@ void rms_norm_backward(const ::brotensor::Tensor& X,
         const float* xrow  = Xp  + static_cast<size_t>(b) * D;
         const float* dyrow = dYp + static_cast<size_t>(b) * D;
         const float rrms = rrms_cache[b];
+        if (rrms <= 0.0f) continue;
         for (int j = 0; j < D; ++j) {
-            dGp[j] += dyrow[j] * xrow[j] * rrms;   // accumulate dGamma
+            const float prod = dyrow[j] * xrow[j] * rrms;
+            if (std::isfinite(prod)) dGp[j] += prod;   // accumulate dGamma
         }
     }
 }

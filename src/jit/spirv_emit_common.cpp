@@ -24,7 +24,7 @@ constexpr float kLog2e = 1.4426950408889634f;
 // module does not declare SignedZeroInfNanPreserve, so an infinity in the
 // middle of the expression is undefined rather than "rounds to 0".
 Value* sigmoid(Ctx& c, Value* x) {
-    Value* t = c.kb.fmin(c.b.build_mul(x, c.f32(-kLog2e)), c.f32(88.0f));
+    Value* t = c.kb.fmin(c.kb.fmax(c.b.build_mul(x, c.f32(-kLog2e)), c.f32(-88.0f)), c.f32(88.0f));
     Value* e = c.kb.ex2_approx(t);
     return c.kb.rcp_approx(c.b.build_add(e, c.f32(1.0f)));
 }
@@ -262,9 +262,10 @@ Value* lane_op(Ctx& c, const TraceNode& n, const std::vector<Value*>& in) {
             // approximation nn.GELU(approximate="tanh") uses, as the PTX form.
             need(1);
             Value* x = in[0];
-            Value* x2 = b.build_mul(x, x);
+            Value* xc = c.kb.fmin(c.kb.fmax(x, c.f32(-20.0f)), c.f32(20.0f));
+            Value* x2 = b.build_mul(xc, xc);
             Value* inner = b.build_fma_f32(x2, c.f32(0.044715f), c.f32(1.0f));
-            Value* arg = b.build_mul(b.build_mul(inner, x), c.f32(0.7978845608f));
+            Value* arg = b.build_mul(b.build_mul(inner, xc), c.f32(0.7978845608f));
             Value* t1 = b.build_add(tanh_(c, arg), c.f32(1.0f));
             return b.build_mul(b.build_mul(x, c.f32(0.5f)), t1);
         }

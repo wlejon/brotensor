@@ -14,6 +14,7 @@
 
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -23,7 +24,8 @@ namespace {
 
 inline float gelu_tanh_scalar(float v) {
     constexpr float kSqrt2OverPi = 0.7978845608f;
-    const float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
+    const float vc = std::clamp(v, -20.0f, 20.0f);
+    const float u  = kSqrt2OverPi * (vc + 0.044715f * vc * vc * vc);
     return 0.5f * v * (1.0f + std::tanh(u));
 }
 
@@ -33,11 +35,12 @@ inline float gelu_tanh_scalar(float v) {
 // function (which would redo the tanh).
 inline void gelu_tanh_value_grad(float v, float& g, float& gprime) {
     constexpr float kSqrt2OverPi = 0.7978845608f;
-    const float u = kSqrt2OverPi * (v + 0.044715f * v * v * v);
-    const float t = std::tanh(u);
-    const float dudx = kSqrt2OverPi * (1.0f + 3.0f * 0.044715f * v * v);
+    const float vc   = std::clamp(v, -20.0f, 20.0f);
+    const float u    = kSqrt2OverPi * (vc + 0.044715f * vc * vc * vc);
+    const float t    = std::tanh(u);
+    const float dudx = kSqrt2OverPi * (1.0f + 3.0f * 0.044715f * vc * vc);
     g = 0.5f * v * (1.0f + t);
-    gprime = 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * dudx;
+    gprime = 0.5f * (1.0f + t) + 0.5f * vc * (1.0f - t * t) * dudx;
 }
 
 inline float gelu_exact_scalar(float v) {
@@ -51,10 +54,11 @@ inline float gelu_exact_scalar(float v) {
 inline void gelu_exact_value_grad(float v, float& g, float& gprime) {
     constexpr float kInvSqrt2   = 0.70710678118654752440f;
     constexpr float kInvSqrt2Pi = 0.39894228040143267794f;
-    const float cdf_term = 0.5f * (1.0f + std::erf(v * kInvSqrt2));
+    const float vc       = std::clamp(v, -20.0f, 20.0f);
+    const float cdf_term = 0.5f * (1.0f + std::erf(vc * kInvSqrt2));
     g = v * cdf_term;
-    const float pdf = kInvSqrt2Pi * std::exp(-0.5f * v * v);
-    gprime = cdf_term + v * pdf;
+    const float pdf = kInvSqrt2Pi * std::exp(-0.5f * vc * vc);
+    gprime = cdf_term + vc * pdf;
 }
 
 template <typename GeluFn>

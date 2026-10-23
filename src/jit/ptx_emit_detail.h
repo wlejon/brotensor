@@ -160,6 +160,7 @@ inline void emit_sigmoid(std::ostream& o, Alloc& a, const std::string& x,
     const std::string t0 = a.F(), t1 = a.F(), t2 = a.F();
     o << "    neg.f32 " << t0 << ", " << x << ";\n";
     o << "    mul.f32 " << t0 << ", " << t0 << ", 0f3FB8AA3B;\n";  // * log2(e)
+    o << "    min.f32 " << t0 << ", " << t0 << ", 0f42B00000;\n";  // clamp <= 88.0f
     o << "    ex2.approx.f32 " << t1 << ", " << t0 << ";\n";
     o << "    add.f32 " << t2 << ", " << t1 << ", 0f3F800000;\n";
     o << "    rcp.approx.f32 " << d << ", " << t2 << ";\n";

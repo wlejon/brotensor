@@ -16,6 +16,7 @@
 #include <brotensor/detail/cpu/thread_pool.h>
 #include "cpu_jit.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 
@@ -68,7 +69,8 @@ void layernorm_forward_inference_batched(const ::brotensor::Tensor& X_RD,
             sumsq += d * d;
         }
         const float var  = sumsq * invD;
-        const float rstd = 1.0f / std::sqrt(var + eps);
+        const float eps_safe = std::max(eps, 1e-12f);
+        const float rstd = 1.0f / std::sqrt(std::max(var + eps_safe, 1e-12f));
 
         for (int i = 0; i < D; ++i) {
             const float xh = (xr[i] - mean) * rstd;
@@ -111,7 +113,8 @@ void layernorm_forward_inference_batched_fp16(const ::brotensor::Tensor& X_RD,
             sumsq += d * d;
         }
         const float var  = sumsq * invD;
-        const float rstd = 1.0f / std::sqrt(var + eps);
+        const float eps_safe = std::max(eps, 1e-12f);
+        const float rstd = 1.0f / std::sqrt(std::max(var + eps_safe, 1e-12f));
 
         for (int i = 0; i < D; ++i) {
             const float xh = (::brotensor::fp16_bits_to_fp32(xr[i]) - mean) * rstd;
@@ -179,7 +182,8 @@ void layernorm_forward_batched_with_caches(const ::brotensor::Tensor& X_RD,
             sumsq += d * d;
         }
         const float var  = sumsq * invD;
-        const float rstd = 1.0f / std::sqrt(var + eps);
+        const float eps_safe = std::max(eps, 1e-12f);
+        const float rstd = 1.0f / std::sqrt(std::max(var + eps_safe, 1e-12f));
 
         mp[row] = mean;
         sp[row] = rstd;

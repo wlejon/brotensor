@@ -9,6 +9,7 @@
 
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -56,6 +57,7 @@ void l2_norm_forward(const ::brotensor::Tensor& X,
 
     const float* xp = X.host_f32();
     float* yp = Y.host_f32_mut();
+    const float eps_safe = std::max(eps, 1e-12f);
 
     for (int r = 0; r < L; ++r) {
         for (int h = 0; h < num_heads; ++h) {
@@ -66,9 +68,10 @@ void l2_norm_forward(const ::brotensor::Tensor& X,
                 const float v = xp[off + d];
                 sumsq += v * v;
             }
-            const float inv = 1.0f / std::sqrt(sumsq + eps);
+            const float denom = std::max(sumsq + eps_safe, 1e-12f);
+            const float inv = std::isfinite(denom) ? (1.0f / std::sqrt(denom)) : 0.0f;
             for (int d = 0; d < head_dim; ++d) {
-                yp[off + d] = xp[off + d] * inv;
+                yp[off + d] = (inv > 0.0f) ? (xp[off + d] * inv) : 0.0f;
             }
         }
     }
@@ -95,6 +98,7 @@ void l2_norm_backward(const ::brotensor::Tensor& X,
     const float* xp  = X.host_f32();
     const float* gp  = dY.host_f32();
     float* dxp = dX.host_f32_mut();
+    const float eps_safe = std::max(eps, 1e-12f);
 
     // dX_d = n * dY_d - x_d * n^3 * sum_d' (x_d' * dY_d')
     //      = n * (dY_d - x_d * n^2 * dot(x, dY))
@@ -109,11 +113,12 @@ void l2_norm_backward(const ::brotensor::Tensor& X,
                 sumsq += v * v;
                 dot   += v * gv;
             }
-            const float n2 = 1.0f / (sumsq + eps);     // n^2
-            const float n  = std::sqrt(n2);            // n
-            const float c  = dot * n2;                  // x . dY / (||x||^2 + eps)
+            const float denom = std::max(sumsq + eps_safe, 1e-12f);
+            const float n2 = std::isfinite(denom) ? (1.0f / denom) : 0.0f;   // n^2
+            const float n  = std::sqrt(n2);                                  // n
+            const float c  = std::isfinite(dot) ? (dot * n2) : 0.0f;         // x . dY / (||x||^2 + eps)
             for (int d = 0; d < head_dim; ++d) {
-                dxp[off + d] = n * (gp[off + d] - xp[off + d] * c);
+                dxp[off + d] = (n > 0.0f) ? (n * (gp[off + d] - xp[off + d] * c)) : 0.0f;
             }
         }
     }

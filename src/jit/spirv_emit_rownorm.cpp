@@ -72,14 +72,16 @@ public:
         Value* sub = tid_;
         local_ = c.i32(0);
         Value* row = group;
+        Value* group_row = group;
         if (rpb_ > 1) {
             local_ = b.build_lshr(tid_, c.i32(log2_exact(tpr_)));
             sub = b.build_and(tid_, c.i32(tpr_ - 1));
-            row = b.build_add(b.build_shl(group, c.i32(log2_exact(rpb_))), local_);
+            group_row = b.build_shl(group, c.i32(log2_exact(rpb_)));
+            row = b.build_add(group_row, local_);
         }
-        // rpb divides the row count, so this exit is uniform across the
-        // workgroup and the barriers below stay safe.
-        kb.if_then(b.build_uge(row, c.i32(ew_.rows)), [&] { b.build_ret_void(); });
+        // rpb divides the row count, so testing group_row makes this exit
+        // manifestly workgroup-uniform across all subgroup sizes.
+        kb.if_then(b.build_uge(group_row, c.i32(ew_.rows)), [&] { b.build_ret_void(); });
 
         c0_ = lanes_ > 1 ? b.build_shl(sub, c.i32(log2_exact(lanes_))) : sub;
         row_ = row;
@@ -92,6 +94,7 @@ public:
         for (const auto& s : ew_.outputs) row_bytes(s.dtype);
         Value* D = c.i32(ew_.cols);
         const float inv_d = 1.0f / static_cast<float>(ew_.cols);
+        const float eps_safe = plan_.eps >= 1e-12f ? plan_.eps : 1e-12f;
 
         Value* mean = nullptr;
         Value* rstd = nullptr;
@@ -114,7 +117,7 @@ public:
                 return acc;
             });
             Value* var = b.build_mul(reduce(sq, red.empty() ? nullptr : red[1]), c.f32(inv_d));
-            rstd = kb.rsqrt_approx(b.build_add(var, c.f32(plan_.eps)));
+            rstd = kb.rsqrt_approx(b.build_add(var, c.f32(eps_safe)));
         } else {
             Value* sq = kb.for_range_reduce(c0_, D, c.i32(step_), c.f32(0.0f), [&](Value* col, Value* acc) {
                 Offsets o;
@@ -122,7 +125,7 @@ public:
                 return acc;
             });
             Value* ms = b.build_mul(reduce(sq, red.empty() ? nullptr : red[0]), c.f32(inv_d));
-            rstd = kb.rsqrt_approx(b.build_add(ms, c.f32(plan_.eps)));
+            rstd = kb.rsqrt_approx(b.build_add(ms, c.f32(eps_safe)));
         }
 
         // pass 2: normalise, post chain, store
