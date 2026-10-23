@@ -123,6 +123,15 @@ void bro_tensor_pixelShuffleUpsample2xForward(void* X, int32_t N, int32_t Cin, i
 void bro_tensor_patchUnpackForward(void* tokens, int32_t hp, int32_t wp, int32_t P, int32_t Ctotal, int32_t Ckeep,
                                    bool channelMajor, void* Y);
 
+// --- verified fused backward trace JIT (native_tensor_extra.cpp) ------------
+int32_t bro_tensor_compileJitBackward(const int32_t* ops, uint32_t ops_len,
+                                      const float* scalars, uint32_t scalars_len,
+                                      int32_t num_inputs, int32_t rows, int32_t cols);
+void bro_tensor_getJitBackwardReport(int32_t handle_id, bronze_native_buffer* out);
+void bro_tensor_runJitBackwardInput(int32_t handle_id, int32_t input_idx,
+                                    void* x0, uint64_t x1_bits, uint64_t x2_bits, uint64_t x3_bits,
+                                    void* grad_out, void* dx_out);
+
 #ifdef __cplusplus
 }
 #endif

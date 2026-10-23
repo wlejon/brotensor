@@ -13,10 +13,14 @@
 #include "native_tensor_extra_util.h"
 #include "api_internal.h"
 #include "native_register.h"
+#include <brotensor/trace_autodiff.h>
+#include "../jit/trace_dag.h"
 
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace brotensor::api;
@@ -435,6 +439,119 @@ void bro_tensor_maskedDiffusionCommit(void* pred, void* idx, int32_t k, int32_t 
     BROTENSOR_API_CATCH(lb)
 }
 
+// ---- verified fused backward trace JIT --------------------------------------
+
+namespace {
+std::mutex g_jit_bwd_mu;
+int32_t g_next_jit_bwd_id = 1;
+std::unordered_map<int32_t, brotensor::jit::VerifiedBackwardTrace> g_jit_bwd_table;
+} // namespace
+
+int32_t bro_tensor_compileJitBackward(const int32_t* ops, uint32_t ops_len,
+                                      const float* scalars, uint32_t scalars_len,
+                                      int32_t num_inputs, int32_t rows, int32_t cols) {
+    constexpr const char* lb = "compileJitBackward";
+    if (!ops || ops_len == 0 || (ops_len % 5) != 0) {
+        setError(std::string(lb) + ": invalid ops table");
+        return -1;
+    }
+    const uint32_t n_nodes = ops_len / 5;
+    if (!scalars || scalars_len < n_nodes * 2) {
+        setError(std::string(lb) + ": invalid scalars table");
+        return -1;
+    }
+    if (num_inputs < 1 || rows < 1 || cols < 1) {
+        setError(std::string(lb) + ": num_inputs, rows, and cols must be >= 1");
+        return -1;
+    }
+    BROTENSOR_API_TRY
+        static float dummy_buf[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        brotensor::jit::TraceDAG fwd;
+        for (uint32_t i = 0; i < n_nodes; ++i) {
+            const int32_t op_code = ops[i * 5 + 0];
+            const int32_t arity = ops[i * 5 + 1];
+            std::vector<int> ins;
+            for (int32_t k = 0; k < arity && k < 3; ++k) {
+                ins.push_back(ops[i * 5 + 2 + k]);
+            }
+            const float sc1 = scalars[i * 2 + 0];
+            const float sc2 = scalars[i * 2 + 1];
+            const auto kind = static_cast<brotensor::jit::TraceOpKind>(op_code);
+            void* buf = (kind == brotensor::jit::TraceOpKind::Input) ? dummy_buf : nullptr;
+            fwd.add_node(kind, ins, sc1, buf, brotensor::default_device(),
+                         brotensor::Dtype::FP32, rows, cols, sc2);
+        }
+        fwd.nodes().back().is_live_at_end = true;
+
+        brotensor::jit::VerifiedBackwardTrace compiled =
+            brotensor::jit::build_verified_backward_trace(fwd);
+        std::lock_guard<std::mutex> lock(g_jit_bwd_mu);
+        const int32_t id = g_next_jit_bwd_id++;
+        g_jit_bwd_table[id] = std::move(compiled);
+        return id;
+    BROTENSOR_API_CATCH(lb)
+    return -1;
+}
+
+void bro_tensor_getJitBackwardReport(int32_t handle_id, bronze_native_buffer* out) {
+    if (!out) return;
+    emptyBuffer(out);
+    std::lock_guard<std::mutex> lock(g_jit_bwd_mu);
+    auto it = g_jit_bwd_table.find(handle_id);
+    if (it == g_jit_bwd_table.end()) {
+        setError("getJitBackwardReport: invalid handle_id");
+        return;
+    }
+    const auto& v = it->second.verification;
+    tl_download_i32.assign({
+        v.mirEquivProven ? 1 : 0,
+        v.spirvPtxEquivProven ? 1 : 0,
+        v.nanSafeProven ? 1 : 0,
+        static_cast<int32_t>(v.forwardNodeCount),
+        static_cast<int32_t>(v.rawBackwardNodeCount),
+        static_cast<int32_t>(v.loweredBackwardNodeCount),
+        static_cast<int32_t>(v.unoptimizedMirInsts),
+        static_cast<int32_t>(v.optimizedMirInsts),
+        static_cast<int32_t>(v.spirvWordCount),
+        static_cast<int32_t>(v.ptxByteCount),
+    });
+    out->data = tl_download_i32.data();
+    out->length = static_cast<uint32_t>(tl_download_i32.size());
+}
+
+void bro_tensor_runJitBackwardInput(int32_t handle_id, int32_t input_idx,
+                                    void* x0, uint64_t x1_bits, uint64_t x2_bits, uint64_t x3_bits,
+                                    void* grad_out, void* dx_out) {
+    constexpr const char* lb = "runJitBackwardInput";
+    if (!need(lb, {x0, grad_out, dx_out})) return;
+    brotensor::jit::VerifiedBackwardTrace trace_copy;
+    {
+        std::lock_guard<std::mutex> lock(g_jit_bwd_mu);
+        auto it = g_jit_bwd_table.find(handle_id);
+        if (it == g_jit_bwd_table.end()) {
+            setError(std::string(lb) + ": invalid handle_id");
+            return;
+        }
+        trace_copy = it->second;
+    }
+    std::vector<brotensor::Tensor> primals;
+    primals.push_back(brotensor::Tensor::view(
+        toTensor(x0)->device, toTensor(x0)->data, toTensor(x0)->rows, toTensor(x0)->cols, toTensor(x0)->dtype));
+    const uint64_t opt_bits[3] = {x1_bits, x2_bits, x3_bits};
+    for (size_t i = 0; i < 3 && primals.size() < trace_copy.num_inputs; ++i) {
+        auto* ti = tensorFromValue(opt_bits[i]);
+        if (!ti) {
+            setError(std::string(lb) + ": missing primal input tensor");
+            return;
+        }
+        primals.push_back(brotensor::Tensor::view(ti->device, ti->data, ti->rows, ti->cols, ti->dtype));
+    }
+    BROTENSOR_API_TRY
+        brotensor::Tensor g = trace_copy.execute_for_input(input_idx, primals, *toTensor(grad_out));
+        brotensor::copy_d2d(g, 0, *toTensor(dx_out), 0, g.size());
+    BROTENSOR_API_CATCH(lb)
+}
+
 } // extern "C"
 
 namespace brotensor::api {
@@ -484,6 +601,12 @@ bool registerTensorNatives_extra(std::string* error) {
             kTensorCls, kTensorCls, kTensorCls}, error) &&
         fn("__bro_native.tensor.maskedDiffusionCommit", p(&bro_tensor_maskedDiffusionCommit), "void",
            {kTensorCls, kTensorCls, "i32", "i32", kTensorCls, kTensorCls}, error) &&
+        fn("__bro_native.tensor.compileJitBackward", p(&bro_tensor_compileJitBackward), "i32",
+           {"i32[]", "f32[]", "i32", "i32", "i32"}, error) &&
+        fn("__bro_native.tensor.getJitBackwardReport", p(&bro_tensor_getJitBackwardReport), "i32[]",
+           {"i32"}, error) &&
+        fn("__bro_native.tensor.runJitBackwardInput", p(&bro_tensor_runJitBackwardInput), "void",
+           {"i32", "i32", kTensorCls, kDyn, kDyn, kDyn, kTensorCls, kTensorCls}, error) &&
         registerTensorNatives_extra_nn(error) &&
         registerTensorNatives_extra_conv(error);
 }

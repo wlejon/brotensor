@@ -33,7 +33,14 @@ enum class TraceOpKind : uint8_t {
     Copy,
     Where,
     Clamp,
-    Cast
+    Cast,
+    Const,
+    Neg,
+    Exp,
+    Log,
+    Sqrt,
+    Rsqrt,
+    Abs
 };
 
 const char* op_kind_name(TraceOpKind op);
@@ -106,6 +113,16 @@ public:
     // True when `slot` still describes `t` (same buffer, shape, dtype, device).
     bool slot_matches(int slot, const Tensor& t) const;
     void reset();
+
+    // Builds the reverse-mode automatic differentiation (VJP) TraceDAG for this
+    // forward TraceDAG.
+    // - If `target_input_idx >= 0`, returns a single-output backward TraceDAG
+    //   computing d(loss)/d(input[target_input_idx]).
+    // - If `target_input_idx < 0`, returns a fused multi-output backward TraceDAG
+    //   computing d(loss)/d(input[i]) for every primal Input node in order.
+    // The returned backward TraceDAG has the same primal Input nodes in slots
+    // [0..num_inputs-1], followed by an Input node for `grad_output` (`dL/dy`).
+    TraceDAG backward(int target_input_idx = -1) const;
 
 private:
     std::vector<TraceNode> nodes_;

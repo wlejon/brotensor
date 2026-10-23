@@ -363,4 +363,109 @@
             bool(channelMajor, false), T(Y, Lb, "Y"));
         chk();
     });
+
+    // ---- verified fused backward trace JIT (TraceDAG::backward()) ---------------
+    fn(ns_tensor, "jitBackward", function jitBackward(traceFn, opts) {
+        if (typeof traceFn !== "function") {
+            throw new TypeError("jitBackward(traceFn, opts): traceFn must be a function");
+        }
+        const o = opts && typeof opts === "object" ? opts : {};
+        const numInputs = int(o.numInputs !== undefined ? o.numInputs : (traceFn.length > 0 ? traceFn.length : 1), 1);
+        const rows = int(o.rows, 16);
+        const cols = int(o.cols, 64);
+
+        const ops = [];
+        const scalars = [];
+        const addNode = (opKind, ins, sc1, sc2) => {
+            const id = (ops.length / 5) | 0;
+            ops.push(opKind | 0, ins.length | 0, ins[0] ?? -1, ins[1] ?? -1, ins[2] ?? -1);
+            scalars.push(sc1 !== undefined ? +sc1 : 0.0, sc2 !== undefined ? +sc2 : 0.0);
+            return id;
+        };
+
+        const symInputs = [];
+        for (let i = 0; i < numInputs; ++i) {
+            symInputs.push(addNode(0, [], 0, 0)); // TraceOpKind::Input = 0
+        }
+
+        const builder = {
+            input: () => { const id = addNode(0, [], 0, 0); symInputs.push(id); return id; },
+            add: (a, b) => typeof b === "number" ? addNode(5, [a], b, 0) : addNode(1, [a, b], 0, 0),
+            sub: (a, b) => typeof b === "number" ? addNode(6, [a], b, 0) : (typeof a === "number" ? addNode(9, [b], a, 0) : addNode(2, [a, b], 0, 0)),
+            mul: (a, b) => typeof b === "number" ? addNode(7, [a], b, 0) : addNode(3, [a, b], 0, 0),
+            div: (a, b) => typeof b === "number" ? addNode(8, [a], b, 0) : (typeof a === "number" ? addNode(10, [b], a, 0) : addNode(4, [a, b], 0, 0)),
+            addScalar: (a, s) => addNode(5, [a], s, 0),
+            subScalar: (a, s) => addNode(6, [a], s, 0),
+            mulScalar: (a, s) => addNode(7, [a], s, 0),
+            divScalar: (a, s) => addNode(8, [a], s, 0),
+            scalarSub: (s, a) => addNode(9, [a], s, 0),
+            scalarDiv: (s, a) => addNode(10, [a], s, 0),
+            fma: (a, b, c) => addNode(11, [a, b, c], 0, 0),
+            silu: (a) => addNode(12, [a], 0, 0),
+            gelu: (a) => addNode(13, [a], 0, 0),
+            relu: (a) => addNode(14, [a], 0, 0),
+            modulate: (x, s, sh) => addNode(17, [x, s, sh], 0, 0),
+            tanh: (a) => addNode(18, [a], 0, 0),
+            sigmoid: (a) => addNode(19, [a], 0, 0),
+            where: (c, a, b) => addNode(21, [c, a, b], 0, 0),
+            clamp: (a, lo, hi) => addNode(22, [a], lo, hi),
+            constVal: (s) => addNode(24, [], s, 0),
+            neg: (a) => addNode(25, [a], 0, 0),
+            exp: (a) => addNode(26, [a], 0, 0),
+            log: (a) => addNode(27, [a], 0, 0),
+            sqrt: (a) => addNode(28, [a], 0, 0),
+            rsqrt: (a) => addNode(29, [a], 0, 0),
+            abs: (a) => addNode(30, [a], 0, 0)
+        };
+
+        const args = symInputs.slice();
+        args.push(builder);
+        traceFn.apply(builder, args);
+
+        const handleId = __bro_native.tensor.compileJitBackward(
+            Int32Array.from(ops), Float32Array.from(scalars), symInputs.length, rows, cols);
+        chk();
+        const repArr = __bro_native.tensor.getJitBackwardReport(handleId);
+        chk();
+
+        const verification = Object.freeze({
+            mirEquivProven: repArr[0] === 1,
+            spirvPtxEquivProven: repArr[1] === 1,
+            nanSafeProven: repArr[2] === 1,
+            allProven: repArr[0] === 1 && repArr[1] === 1 && repArr[2] === 1,
+            forwardNodeCount: repArr[3] | 0,
+            rawBackwardNodeCount: repArr[4] | 0,
+            loweredBackwardNodeCount: repArr[5] | 0,
+            unoptimizedMirInsts: repArr[6] | 0,
+            optimizedMirInsts: repArr[7] | 0,
+            spirvWordCount: repArr[8] | 0,
+            ptxByteCount: repArr[9] | 0
+        });
+
+        const runBackward = function runBackward(primals, gradOut, gradInputsOut) {
+            const Lb = "jitBackward.execute(primals, gradOut)";
+            const pList = Array.isArray(primals) ? primals : [primals];
+            if (pList.length < symInputs.length) {
+                throw new RangeError(Lb + ": expected " + symInputs.length + " primal input(s)");
+            }
+            const x0 = T(pList[0], Lb, "primals[0]");
+            const x1 = pList.length > 1 ? T(pList[1], Lb, "primals[1]") : null;
+            const x2 = pList.length > 2 ? T(pList[2], Lb, "primals[2]") : null;
+            const x3 = pList.length > 3 ? T(pList[3], Lb, "primals[3]") : null;
+            const dY = T(gradOut, Lb, "gradOut");
+            const outs = [];
+            for (let i = 0; i < symInputs.length; ++i) {
+                const dx = (Array.isArray(gradInputsOut) && gradInputsOut[i] instanceof GpuTensor)
+                    ? gradInputsOut[i]
+                    : ns_tensor.createTensor(dY.rows, dY.cols, "fp32");
+                __bro_native.tensor.runJitBackwardInput(handleId, i, x0, x1, x2, x3, dY, dx);
+                chk();
+                outs.push(dx);
+            }
+            return outs;
+        };
+        fn(runBackward, "verification", verification);
+        fn(runBackward, "handleId", handleId);
+        return runBackward;
+    });
 })();

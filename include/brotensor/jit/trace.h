@@ -134,6 +134,7 @@ inline Tensor operator+(int s, const Tensor& a) { return a + static_cast<float>(
 Tensor operator-(const Tensor& a, const Tensor& b);
 Tensor operator-(const Tensor& a, float s);
 Tensor operator-(float s, const Tensor& a);
+Tensor operator-(const Tensor& a);
 inline Tensor operator-(const Tensor& a, int s) { return a - static_cast<float>(s); }
 inline Tensor operator-(int s, const Tensor& a) { return static_cast<float>(s) - a; }
 
@@ -145,7 +146,9 @@ inline Tensor operator*(int s, const Tensor& a) { return a * static_cast<float>(
 
 Tensor operator/(const Tensor& a, const Tensor& b);
 Tensor operator/(const Tensor& a, float s);
+Tensor operator/(float s, const Tensor& a);
 inline Tensor operator/(const Tensor& a, int s) { return a / static_cast<float>(s); }
+inline Tensor operator/(int s, const Tensor& a) { return static_cast<float>(s) / a; }
 
 Tensor& operator+=(Tensor& a, const Tensor& b);
 Tensor& operator+=(Tensor& a, float s);
@@ -157,6 +160,12 @@ inline Tensor& operator*=(Tensor& a, int s) { return a *= static_cast<float>(s);
 
 // ── Functional Activations & Normalizations ───────────────────────────────────
 
+Tensor neg(const Tensor& a);
+Tensor abs(const Tensor& a);
+Tensor exp(const Tensor& a);
+Tensor log(const Tensor& a);
+Tensor sqrt(const Tensor& a);
+Tensor rsqrt(const Tensor& a);
 Tensor silu(const Tensor& a);
 Tensor gelu(const Tensor& a);
 Tensor relu(const Tensor& a);
@@ -208,6 +217,12 @@ using jit::operator/;
 using jit::operator+=;
 using jit::operator*=;
 
+using jit::neg;
+using jit::abs;
+using jit::exp;
+using jit::log;
+using jit::sqrt;
+using jit::rsqrt;
 using jit::silu;
 using jit::gelu;
 using jit::relu;
@@ -222,3 +237,5 @@ using jit::clamp;
 using jit::clip;
 using jit::cast;
 } // namespace brotensor
+
+#include <brotensor/trace_autodiff.h>

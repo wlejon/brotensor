@@ -2,6 +2,7 @@
 #include "trace_dag.h"
 #include "trace_cache.h"
 #include "kernel_disk_cache.h"
+#include <brotensor/trace_autodiff.h>
 #include "../cpu/cpu_jit.h"
 #include <brotensor/detail/cpu/thread_pool.h>
 
@@ -76,7 +77,22 @@ void register_vulkan_trace_compiler(VulkanTraceCompilerFn fn) {
     s_vulkan_trace_compiler_fn = fn;
 }
 
-TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& dag) {
+TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& raw_dag) {
+    bool has_ext_ops = false;
+    for (const auto& n : raw_dag.nodes()) {
+        if (n.op == TraceOpKind::Const || n.op == TraceOpKind::Neg ||
+            n.op == TraceOpKind::Abs || n.op == TraceOpKind::Exp ||
+            n.op == TraceOpKind::Log || n.op == TraceOpKind::Sqrt ||
+            n.op == TraceOpKind::Rsqrt) {
+            has_ext_ops = true;
+            break;
+        }
+    }
+    TraceDAG lowered_holder;
+    if (has_ext_ops) {
+        lowered_holder = canonicalize_trace_dag_for_codegen(raw_dag);
+    }
+    const TraceDAG& dag = has_ext_ops ? lowered_holder : raw_dag;
     uint64_t hash = dag.compute_hash();
 
     // Check trace cache for previously compiled kernel

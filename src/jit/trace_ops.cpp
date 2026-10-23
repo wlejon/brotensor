@@ -7,6 +7,7 @@
 #include "../cuda/cuda_jit.h"
 #endif
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -140,6 +141,10 @@ Tensor operator-(float s, const Tensor& a) {
     return out;
 }
 
+Tensor operator-(const Tensor& a) {
+    return neg(a);
+}
+
 Tensor operator*(const Tensor& a, const Tensor& b) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
@@ -225,6 +230,19 @@ Tensor operator/(const Tensor& a, float s) {
     return a * (1.0f / s);
 }
 
+Tensor operator/(float s, const Tensor& a) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_a = ctx.get_or_register_slot(a);
+        return ctx.record_op(TraceOpKind::ScalarDiv, {slot_a}, s,
+                             a.device, a.dtype, a.rows, a.cols);
+    }
+    Tensor h = a.is_host() ? a.clone() : a.to(Device::CPU);
+    std::vector<float> v = h.to_host_vector();
+    for (float& x : v) x = s / x;
+    return Tensor::from_host_on(a.device, v.data(), a.rows, a.cols);
+}
+
 Tensor& operator+=(Tensor& a, const Tensor& b) {
     if (is_tracing()) {
         auto& ctx = TraceContext::current();
@@ -269,6 +287,78 @@ Tensor& operator*=(Tensor& a, float s) {
     }
     brotensor::scale_inplace(a, s);
     return a;
+}
+
+Tensor neg(const Tensor& a) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_a = ctx.get_or_register_slot(a);
+        return ctx.record_op(TraceOpKind::Neg, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
+    }
+    Tensor out = a.clone();
+    brotensor::scale_inplace(out, -1.0f);
+    return out;
+}
+
+Tensor abs(const Tensor& a) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_a = ctx.get_or_register_slot(a);
+        return ctx.record_op(TraceOpKind::Abs, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
+    }
+    std::vector<float> v = (a.is_host() ? a : a.to(Device::CPU)).to_host_vector();
+    for (float& x : v) x = std::fabs(x);
+    return Tensor::from_host_on(a.device, v.data(), a.rows, a.cols);
+}
+
+Tensor exp(const Tensor& a) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_a = ctx.get_or_register_slot(a);
+        return ctx.record_op(TraceOpKind::Exp, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
+    }
+    std::vector<float> v = (a.is_host() ? a : a.to(Device::CPU)).to_host_vector();
+    for (float& x : v) x = std::exp(x);
+    return Tensor::from_host_on(a.device, v.data(), a.rows, a.cols);
+}
+
+Tensor log(const Tensor& a) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_a = ctx.get_or_register_slot(a);
+        return ctx.record_op(TraceOpKind::Log, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
+    }
+    std::vector<float> v = (a.is_host() ? a : a.to(Device::CPU)).to_host_vector();
+    for (float& x : v) x = std::log(std::max(x, 1e-12f));
+    return Tensor::from_host_on(a.device, v.data(), a.rows, a.cols);
+}
+
+Tensor sqrt(const Tensor& a) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_a = ctx.get_or_register_slot(a);
+        return ctx.record_op(TraceOpKind::Sqrt, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
+    }
+    std::vector<float> v = (a.is_host() ? a : a.to(Device::CPU)).to_host_vector();
+    for (float& x : v) x = std::sqrt(std::max(x, 0.0f));
+    return Tensor::from_host_on(a.device, v.data(), a.rows, a.cols);
+}
+
+Tensor rsqrt(const Tensor& a) {
+    if (is_tracing()) {
+        auto& ctx = TraceContext::current();
+        int slot_a = ctx.get_or_register_slot(a);
+        return ctx.record_op(TraceOpKind::Rsqrt, {slot_a}, 0.0f,
+                             a.device, a.dtype, a.rows, a.cols);
+    }
+    std::vector<float> v = (a.is_host() ? a : a.to(Device::CPU)).to_host_vector();
+    for (float& x : v) x = 1.0f / std::sqrt(std::max(x, 1e-12f));
+    return Tensor::from_host_on(a.device, v.data(), a.rows, a.cols);
 }
 
 Tensor silu(const Tensor& a) {

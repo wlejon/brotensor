@@ -30,6 +30,13 @@ const char* op_kind_name(TraceOpKind op) {
         case TraceOpKind::Where: return "Where";
         case TraceOpKind::Clamp: return "Clamp";
         case TraceOpKind::Cast: return "Cast";
+        case TraceOpKind::Const: return "Const";
+        case TraceOpKind::Neg: return "Neg";
+        case TraceOpKind::Exp: return "Exp";
+        case TraceOpKind::Log: return "Log";
+        case TraceOpKind::Sqrt: return "Sqrt";
+        case TraceOpKind::Rsqrt: return "Rsqrt";
+        case TraceOpKind::Abs: return "Abs";
     }
     return "Unknown";
 }

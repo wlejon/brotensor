@@ -243,6 +243,7 @@ add_library(brotensor_cpu STATIC
     src/jit/trace_plan.cpp
     src/jit/trace_eager.cpp
     src/jit/trace_ops.cpp
+    src/jit/trace_autodiff.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core Threads::Threads)
 if(MSVC)
@@ -286,6 +287,13 @@ elseif(TARGET brass)
     target_link_libraries(brotensor_cpu PRIVATE ${BROTENSOR_BRASS_LIB})
     target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_BRASS_JIT=1)
     set(BROTENSOR_HAS_BRASS_JIT 1)
+    if(BRASS_WITH_SPIRV AND NOT BROTENSOR_WITH_VULKAN)
+        target_sources(brotensor_cpu PRIVATE
+            src/jit/spirv_emit_common.cpp
+            src/jit/spirv_emit_elementwise.cpp
+            src/jit/spirv_emit_rownorm.cpp
+        )
+    endif()
 else()
     message(STATUS "brotensor: Brass not found; Brass CPU JIT disabled")
 endif()
