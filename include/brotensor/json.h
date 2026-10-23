@@ -148,6 +148,16 @@ private:
     const char* begin_;
     const char* p_;
     const char* end_;
+    int depth_ = 0;
+    static constexpr int kMaxDepth = 256;
+
+    struct DepthGuard {
+        int& d;
+        explicit DepthGuard(Parser& ps) : d(ps.depth_) {
+            if (++d > kMaxDepth) ps.fail("maximum nesting depth exceeded");
+        }
+        ~DepthGuard() { --d; }
+    };
 
     [[noreturn]] void fail(const std::string& msg) const {
         throw std::runtime_error("json: " + msg + " at offset "
@@ -192,6 +202,7 @@ private:
     }
 
     Value parse_object() {
+        DepthGuard guard(*this);
         ++p_;  // consume '{'
         Value::Object members;
         skip_ws();
@@ -215,6 +226,7 @@ private:
     }
 
     Value parse_array() {
+        DepthGuard guard(*this);
         ++p_;  // consume '['
         Value::Array elems;
         skip_ws();

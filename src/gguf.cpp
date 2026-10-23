@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -187,14 +188,14 @@ struct Reader {
     }
     std::string read_str() {
         uint64_t len = read_u64();
-        need(static_cast<std::size_t>(len));
+        if (len > size - pos) fail("unexpected EOF");
         std::string s(reinterpret_cast<const char*>(base + pos), static_cast<std::size_t>(len));
         pos += static_cast<std::size_t>(len);
         return s;
     }
 };
 
-Value parse_value(Reader& r, ValueType type);
+Value parse_value(Reader& r, ValueType type, int depth = 0);
 
 Value parse_scalar(Reader& r, ValueType type) {
     Value v;
@@ -221,7 +222,10 @@ Value parse_scalar(Reader& r, ValueType type) {
     return v;
 }
 
-Value parse_value(Reader& r, ValueType type) {
+Value parse_value(Reader& r, ValueType type, int depth) {
+    if (depth > 32) {
+        fail("nested array depth exceeds limit");
+    }
     if (type != ValueType::Array) {
         return parse_scalar(r, type);
     }
@@ -231,16 +235,21 @@ Value parse_value(Reader& r, ValueType type) {
     if (elem_raw > 12) fail("array element type out of range");
     v.array_elem_type = static_cast<ValueType>(elem_raw);
     uint64_t len = r.read_u64();
+    if (len > r.size - r.pos) fail("unexpected EOF");
     v.array.reserve(static_cast<std::size_t>(len));
     for (uint64_t i = 0; i < len; ++i) {
-        v.array.push_back(parse_value(r, v.array_elem_type));
+        v.array.push_back(parse_value(r, v.array_elem_type, depth + 1));
     }
     return v;
 }
 
 std::size_t align_up(std::size_t x, std::size_t a) {
-    if (a == 0) return x;
-    return (x + (a - 1)) & ~(a - 1);
+    if (a <= 1) return x;
+    const std::size_t mask = a - 1;
+    if (x > std::numeric_limits<std::size_t>::max() - mask) {
+        fail("alignment rounding overflows size_t");
+    }
+    return (x + mask) & ~mask;
 }
 
 }  // namespace
@@ -347,6 +356,7 @@ File File::open(const std::string& path) {
     uint64_t tensor_count = r.read_u64();
     uint64_t meta_count   = r.read_u64();
 
+    if (meta_count > (r.size - r.pos) / 13) fail("unexpected EOF");
     f.metadata_.reserve(static_cast<std::size_t>(meta_count));
     for (uint64_t i = 0; i < meta_count; ++i) {
         std::string key = r.read_str();
@@ -374,6 +384,7 @@ File File::open(const std::string& path) {
         uint64_t                offset    = 0;
     };
     std::vector<PendingTensor> pending;
+    if (tensor_count > (r.size - r.pos) / 32) fail("unexpected EOF");
     pending.reserve(static_cast<std::size_t>(tensor_count));
     for (uint64_t i = 0; i < tensor_count; ++i) {
         PendingTensor pt;
@@ -420,9 +431,13 @@ File File::open(const std::string& path) {
             if (gt.block_size > 1 && (numel % gt.block_size) != 0) {
                 fail("tensor '" + info.name + "' numel not multiple of block size");
             }
-            nbytes = (static_cast<std::size_t>(numel) /
-                      static_cast<std::size_t>(gt.block_size)) *
-                     static_cast<std::size_t>(gt.type_size);
+            const std::size_t blocks =
+                static_cast<std::size_t>(numel) / static_cast<std::size_t>(gt.block_size);
+            const std::size_t tsize = static_cast<std::size_t>(gt.type_size);
+            if (tsize != 0 && blocks > std::numeric_limits<std::size_t>::max() / tsize) {
+                fail("tensor '" + info.name + "' byte size overflows size_t");
+            }
+            nbytes = blocks * tsize;
         }
         info.nbytes = nbytes;
 

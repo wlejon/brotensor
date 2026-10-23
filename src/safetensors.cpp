@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -476,8 +477,15 @@ File File::open(const std::string& path) {
             tv.data   = payload_base + e.off_start;
             tv.nbytes = static_cast<std::size_t>(e.off_end - e.off_start);
 
-            int64_t expected = tv.numel() * dtype_size_bytes(tv.dtype);
-            if (expected != static_cast<int64_t>(tv.nbytes)) {
+            const uint64_t numel_u = static_cast<uint64_t>(tv.numel());
+            const uint64_t dsz_u = static_cast<uint64_t>(dtype_size_bytes(tv.dtype));
+            if (dsz_u == 0 || numel_u > std::numeric_limits<std::size_t>::max() / dsz_u) {
+                throw std::runtime_error(
+                    "safetensors: tensor '" + name +
+                    "' byte size overflows size_t");
+            }
+            const std::size_t expected = static_cast<std::size_t>(numel_u * dsz_u);
+            if (expected != tv.nbytes) {
                 throw std::runtime_error(
                     "safetensors: tensor '" + name +
                     "' nbytes/shape mismatch");
@@ -759,11 +767,19 @@ void write_file(const std::string& path, const std::vector<WriteEntry>& entries)
                 throw std::runtime_error("safetensors::write: '" + e.name + "' element count overflows int64");
             n *= d;
         }
-        std::size_t expected = static_cast<std::size_t>(n) * static_cast<std::size_t>(dsz);
+        const uint64_t n_u = static_cast<uint64_t>(n);
+        const uint64_t dsz_u = static_cast<uint64_t>(dsz);
+        if (n_u > std::numeric_limits<std::size_t>::max() / dsz_u) {
+            throw std::runtime_error("safetensors::write: '" + e.name + "' byte count overflows size_t");
+        }
+        std::size_t expected = static_cast<std::size_t>(n_u * dsz_u);
         if (expected != e.bytes) {
             throw std::runtime_error("safetensors::write: '" + e.name +
                 "' byte count mismatch (shape=" + std::to_string(expected) +
                 " bytes=" + std::to_string(e.bytes) + ")");
+        }
+        if (e.bytes > UINT64_MAX - cursor) {
+            throw std::runtime_error("safetensors::write: '" + e.name + "' offset overflows uint64");
         }
         off_start[i] = cursor;
         cursor += e.bytes;

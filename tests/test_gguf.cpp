@@ -10,6 +10,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -209,6 +211,140 @@ int main() {
     try { (void)gg::File::open(bad.string()); }
     catch (const std::runtime_error&) { bad_threw = true; }
     CHECK(bad_threw);
+
+    auto expect_gguf_throws = [&](const std::vector<uint8_t>& raw) {
+        std::ofstream bf(bad, std::ios::binary | std::ios::trunc);
+        if (!raw.empty()) {
+            bf.write(reinterpret_cast<const char*>(raw.data()),
+                     static_cast<std::streamsize>(raw.size()));
+        }
+        bf.close();
+        bool threw = false;
+        try { (void)gg::File::open(bad.string()); }
+        catch (const std::runtime_error&) { threw = true; }
+        CHECK(threw);
+    };
+
+    // Symbolic / adversarial GGUF parser verification:
+    // 1. Huge 64-bit tensor_count / meta_count (UINT64_MAX) must fail cleanly without OOM reserve().
+    {
+        std::vector<uint8_t> b;
+        put_u32(b, 0x46554747u);
+        put_u32(b, 3);
+        put_u64(b, UINT64_MAX);
+        put_u64(b, 0);
+        expect_gguf_throws(b);
+    }
+    {
+        std::vector<uint8_t> b;
+        put_u32(b, 0x46554747u);
+        put_u32(b, 3);
+        put_u64(b, 0);
+        put_u64(b, UINT64_MAX);
+        expect_gguf_throws(b);
+    }
+
+    // 2. Huge 64-bit string length and array count (UINT64_MAX, SIZE_MAX - 8) must fail without OOB/OOM.
+    {
+        std::vector<uint8_t> b;
+        put_u32(b, 0x46554747u);
+        put_u32(b, 3);
+        put_u64(b, 0);
+        put_u64(b, 1);            // 1 metadata kv
+        put_u64(b, UINT64_MAX);   // key string length = UINT64_MAX
+        expect_gguf_throws(b);
+    }
+    {
+        std::vector<uint8_t> b;
+        put_u32(b, 0x46554747u);
+        put_u32(b, 3);
+        put_u64(b, 0);
+        put_u64(b, 1);
+        put_str(b, "arr");
+        put_u32(b, 9);            // ValueType::Array
+        put_u32(b, 0);            // elem_type = U8
+        put_u64(b, UINT64_MAX);   // array length = UINT64_MAX
+        expect_gguf_throws(b);
+    }
+
+    // 3. Deeply nested ValueType::Array (> 32 levels) must fail deterministically without stack overflow.
+    {
+        std::vector<uint8_t> b;
+        put_u32(b, 0x46554747u);
+        put_u32(b, 3);
+        put_u64(b, 0);
+        put_u64(b, 1);
+        put_str(b, "deep");
+        for (int d = 0; d < 40; ++d) {
+            put_u32(b, 9);  // Array
+            if (d < 39) {
+                put_u64(b, 1);
+            }
+        }
+        put_u32(b, 0);  // innermost elem_type = U8
+        put_u64(b, 1);
+        put_u8(b, 42);
+        expect_gguf_throws(b);
+    }
+
+    // 4. Tensor nbytes 64-bit multiplication wraparound (`numel * type_size` wraps modulo 2^64 to 4):
+    //    dim = 0x4000000000000001 (< INT64_MAX), ggml_type = 0 (FP32, 4 bytes).
+    {
+        std::vector<uint8_t> b;
+        put_u32(b, 0x46554747u);
+        put_u32(b, 3);
+        put_u64(b, 1);  // 1 tensor
+        put_u64(b, 0);  // 0 meta
+        put_str(b, "wrap");
+        put_u32(b, 1);  // n_dims = 1
+        put_u64(b, 0x4000000000000001ull);
+        put_u32(b, 0);  // F32 (4 bytes)
+        put_u64(b, 0);  // offset = 0
+        while (b.size() % 32 != 0) put_u8(b, 0);
+        put_u32(b, 0);  // 4 bytes of data
+        expect_gguf_throws(b);
+    }
+
+    // 5. Tensor offset wraparound (offset = UINT64_MAX, UINT64_MAX - 16) and non-power-of-two alignment:
+    for (uint64_t bad_off : {uint64_t(UINT64_MAX), uint64_t(UINT64_MAX) - 16, uint64_t(1ull << 62)}) {
+        std::vector<uint8_t> b;
+        put_u32(b, 0x46554747u);
+        put_u32(b, 3);
+        put_u64(b, 1);
+        put_u64(b, 0);
+        put_str(b, "t");
+        put_u32(b, 1);
+        put_u64(b, 1);
+        put_u32(b, 0);
+        put_u64(b, bad_off);
+        while (b.size() % 32 != 0) put_u8(b, 0);
+        put_u32(b, 0);
+        expect_gguf_throws(b);
+    }
+    for (uint32_t bad_align : {0u, 3u, 6u, 24u, 0xFFFFFFFFu}) {
+        std::vector<uint8_t> b;
+        put_u32(b, 0x46554747u);
+        put_u32(b, 3);
+        put_u64(b, 0);
+        put_u64(b, 1);
+        put_str(b, "general.alignment");
+        put_u32(b, 4);  // U32
+        put_u32(b, bad_align);
+        expect_gguf_throws(b);
+    }
+
+    // 6. Truncated GGUF fixture at every byte offset [0 .. full.size() - 1] must never read OOB or succeed:
+    {
+        std::ifstream in(path, std::ios::binary);
+        std::vector<uint8_t> full((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+        in.close();
+        CHECK(full.size() > 64);
+        for (std::size_t cut = 0; cut < full.size(); ++cut) {
+            std::vector<uint8_t> prefix(full.begin(), full.begin() + static_cast<std::ptrdiff_t>(cut));
+            expect_gguf_throws(prefix);
+        }
+    }
 
     std::error_code ec;
     std::filesystem::remove(path, ec);
