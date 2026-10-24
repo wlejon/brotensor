@@ -87,8 +87,9 @@ static void test_backward_shader_audit_suite() {
     CHECK(seen.count("jit_spirv_layernorm_4096_vec") == 1);
     CHECK(seen.count("ptx_bwd_reduce_sm80") == 1);
 
-#if defined(BROTENSOR_HAS_VULKAN)
+#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
     // Production Vulkan backward shaders from shader_table.h
+    CHECK(report.shaders.size() >= 136);
     const char* required_vk_shaders[] = {
         "act_bwd_f32",
         "act_bwd_f16",

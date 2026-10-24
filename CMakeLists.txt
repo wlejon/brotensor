@@ -668,6 +668,13 @@ if(BROTENSOR_WITH_VULKAN)
     target_include_directories(brotensor_cpu PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vulkan_shaders")
     target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_VULKAN=1 BROTENSOR_HAS_SHADER_TABLE=1)
     add_dependencies(brotensor_cpu brotensor_vulkan)
+elseif(BROTENSOR_HAS_BRASS_JIT)
+    find_program(_brotensor_audit_glslc NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
+    if(_brotensor_audit_glslc)
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BrotensorVulkan.cmake")
+        brotensor_vulkan_add_shader_table_to_target(brotensor_cpu)
+        target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_SHADER_TABLE=1)
+    endif()
 endif()
 
 # --- brotensor: final consumed target (INTERFACE) ---

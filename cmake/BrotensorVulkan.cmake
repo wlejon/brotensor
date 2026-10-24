@@ -188,14 +188,11 @@ brotensor::vulkan::ShaderHandle handle(Shader s) {
     target_include_directories(${target} PRIVATE "${_gen}")
 endfunction()
 
-function(brotensor_vulkan_add_backend)
+function(brotensor_vulkan_generate_shader_table out_gen out_incs out_nshaders)
     set(_src "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan")
     set(_shader_dir "${_src}/shaders")
     set(_gen "${CMAKE_CURRENT_BINARY_DIR}/vulkan_shaders")
     file(MAKE_DIRECTORY "${_gen}")
-
-    brotensor_vulkan_prepare(REQUIRE_HEADERS)
-    set(_vk_headers "${BROTENSOR_VULKAN_HEADERS_TARGET}")
 
     include("${_shader_dir}/shaders.cmake")
     file(GLOB _shader_deps CONFIGURE_DEPENDS
@@ -265,6 +262,28 @@ const ShaderBlob& shader_blob(ShaderId id) { return k_table[static_cast<std::uin
 
 }  // namespace brotensor::detail::vulkan
 " @ONLY)
+
+    list(LENGTH BROTENSOR_VK_SHADERS _nshaders)
+    set(${out_gen} "${_gen}" PARENT_SCOPE)
+    set(${out_incs} "${_incs}" PARENT_SCOPE)
+    set(${out_nshaders} "${_nshaders}" PARENT_SCOPE)
+endfunction()
+
+function(brotensor_vulkan_add_shader_table_to_target target)
+    brotensor_vulkan_prepare()
+    brotensor_vulkan_generate_shader_table(_gen _incs _nshaders)
+    target_sources(${target} PRIVATE "${_gen}/shader_table.cpp" ${_incs})
+    target_include_directories(${target} PRIVATE "${_gen}")
+    message(STATUS "brotensor: embedded ${_nshaders} SPIR-V shaders into ${target} for static audit (glslc: ${BROTENSOR_GLSLC})")
+endfunction()
+
+function(brotensor_vulkan_add_backend)
+    set(_src "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan")
+    set(_shader_dir "${_src}/shaders")
+
+    brotensor_vulkan_prepare(REQUIRE_HEADERS)
+    set(_vk_headers "${BROTENSOR_VULKAN_HEADERS_TARGET}")
+    brotensor_vulkan_generate_shader_table(_gen _incs _nshaders)
 
     add_library(brotensor_vulkan STATIC
         ${_src}/loader.cpp
@@ -356,6 +375,5 @@ const ShaderBlob& shader_blob(ShaderId id) { return k_table[static_cast<std::uin
     add_dependencies(brotensor_vulkan_internal brotensor_vulkan)
     # init.cpp probes + registers the backend, so core needs the define too.
     target_compile_definitions(brotensor_core PRIVATE BROTENSOR_HAS_VULKAN=1 BROTENSOR_HAS_GPU=1)
-    list(LENGTH BROTENSOR_VK_SHADERS _nshaders)
     message(STATUS "brotensor: Vulkan backend ON (glslc: ${BROTENSOR_GLSLC}, ${_nshaders} shaders)")
 endfunction()
