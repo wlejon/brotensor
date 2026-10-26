@@ -694,6 +694,7 @@ int main() {
     g_failures += run_api_misc_tests();
     g_failures += run_api_extra_tests();
     g_failures += run_api_bounds_tests();
+    g_failures += run_api_gate_tests();
 
     if (g_failures > 0) {
         std::printf("FAILED: %d assertions failed\n", g_failures);

@@ -9,14 +9,17 @@
 // after close(), and the class destructor unmaps on GC. names()/header() are
 // assembled in js/tensor.js from the per-index natives here (nameAt /
 // dtypeAt / shapeAt / nbytesAt): a native returns scalars, typed arrays or
-// handles, never a JS object. Paths go through api.h's path resolver.
+// handles, never a JS object. Paths go through api.h's path resolver, then
+// the host's access gate (gatedPath; api.h, "Access").
 
 #include "native_tensor_decl.h"
 #include "api_internal.h"
+#include "embed/embed_access.h"
 
 #include <brotensor/safetensors.h>
 
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -25,6 +28,36 @@ namespace stns = brotensor::safetensors;
 namespace ev = bronze::embed;
 using namespace brotensor::api;
 using Value = bronze::Value;
+
+namespace {
+
+// The gate's last refusal on this thread, for bro_tensor_takeAccessError.
+struct AccessRefusal {
+    std::string message;  // empty: nothing refused
+    std::string path;
+};
+AccessRefusal& accessRefusalSlot() {
+    static thread_local AccessRefusal slot;
+    return slot;
+}
+
+} // namespace
+
+bool brotensor::api::gatedPath(const char* path, bool write, std::string& resolved) {
+    resolved = resolvePath(path ? path : "");
+    if (!ev::accessGateActive()) return true;
+    namespace fs = std::filesystem;
+    fs::path p(std::u8string(resolved.begin(), resolved.end()));
+    std::error_code ec;
+    fs::path abs = fs::absolute(p, ec);
+    if (ec) abs = p;
+    const std::u8string u8 = abs.lexically_normal().u8string();
+    std::string subject(u8.begin(), u8.end());
+    std::string refused = ev::checkAccess(write ? ev::AccessKind::Write : ev::AccessKind::Read, subject);
+    if (refused.empty()) return true;
+    accessRefusalSlot() = {std::move(refused), std::move(subject)};
+    return false;
+}
 
 namespace {
 
@@ -71,10 +104,19 @@ void bro_tensor_SafetensorsFile_dtor(void* self) {
     delete asFile(self);
 }
 
+uint64_t bro_tensor_takeAccessError(void) {
+    AccessRefusal r = std::move(accessRefusalSlot());
+    accessRefusalSlot() = {};
+    if (r.message.empty()) return ev::toBits(ev::null());
+    return ev::toBits(ev::newAccessError(r.message, "EACCES", r.path));
+}
+
 void* bro_tensor_openSafetensors(const char* path) {
+    std::string resolved;
+    if (!gatedPath(path, false, resolved)) return nullptr;
     auto* h = new SafetensorsFileHandle();
     try {
-        h->file = std::make_unique<stns::File>(stns::File::open(resolvePath(path ? path : "")));
+        h->file = std::make_unique<stns::File>(stns::File::open(resolved));
     } catch (const std::exception& e) {
         delete h;
         setError(std::string("openSafetensors: ") + e.what());
@@ -179,8 +221,12 @@ void bro_tensor_SafetensorsFile_close(void* self) {
 }
 
 bool bro_tensor_saveSafetensors(const char* path, uint64_t names_bits, uint64_t tensors_bits) {
+    // Asked first: nothing downloaded or written for a refused path. The
+    // args are raw bits, so they are rooted before the gate can allocate.
     ev::Persistent names(bronze::Value{names_bits});
     ev::Persistent tensors(bronze::Value{tensors_bits});
+    std::string resolved;
+    if (!gatedPath(path, true, resolved)) return false;
     if (!ev::isObject(names.get()) || !ev::isObject(tensors.get())) {
         setError("saveSafetensors(path, {name: tensor, ...})");
         return false;
@@ -282,7 +328,7 @@ bool bro_tensor_saveSafetensors(const char* path, uint64_t names_bits, uint64_t 
             }
             entries.push_back(std::move(e));
         }
-        stns::write_file(resolvePath(path ? path : ""), entries);
+        stns::write_file(resolved, entries);
     } catch (const std::exception& e) {
         setError(std::string("saveSafetensors: ") + e.what());
         return false;

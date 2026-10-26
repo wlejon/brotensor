@@ -94,6 +94,7 @@ add_executable(brotensor_test_api
     test_api_misc.cpp
     test_api_extra.cpp
     test_api_bounds.cpp
+    test_api_gate.cpp
 )
 # brass FIRST, and /INCLUDE a symbol only brass's GC object defines: both
 # brass.lib and bronze_runtime_shared.dll define brass_gc_write_barrier, and

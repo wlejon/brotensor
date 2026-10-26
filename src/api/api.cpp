@@ -130,6 +130,7 @@ bool registerTensorNatives(std::string* error) {
         ctor(kTensorCls, p(&bro_tensor_GpuTensor_ctor), &bro_tensor_GpuTensor_dtor, bronze::runtime::Finalize::InSweep, {}, error) &&
         ctor(kStCls, p(&bro_tensor_SafetensorsFile_ctor), &bro_tensor_SafetensorsFile_dtor, bronze::runtime::Finalize::InSweep, {}, error) &&
         fn("__bro_native.tensor.takeError", p(&bro_tensor_takeError), "str", {}, error) &&
+        fn("__bro_native.tensor.takeAccessError", p(&bro_tensor_takeAccessError), dyn, {}, error) &&
         fn("__bro_native.tensor.GpuTensor_downloadInto", p(&bro_tensor_GpuTensor_downloadInto), "bool", {kTensorCls, "f32[]"}, error) &&
         // safetensors
         fn("__bro_native.tensor.openSafetensors", p(&bro_tensor_openSafetensors), kStCls, {"str"}, error) &&

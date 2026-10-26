@@ -37,6 +37,10 @@ void bro_tensor_sync(void);
 // The message of the last failed native on this thread, cleared by the read
 // ("" when nothing failed). js/tensor*.js throws it after each call.
 const char* bro_tensor_takeError(void);
+// The access gate's refusal of the last path native on this thread, as an
+// Error (code EACCES, path; embed/embed_access.h newAccessError), cleared by
+// the read; null when nothing was refused. Raw Value bits ("dynamic").
+uint64_t bro_tensor_takeAccessError(void);
 
 // --- Safetensors (native_tensor_safetensors.cpp) ---
 void* bro_tensor_SafetensorsFile_ctor(void);

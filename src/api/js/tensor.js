@@ -920,7 +920,11 @@
     fn(ns_tensor, "openSafetensors", function openSafetensors(path) {
         if (typeof path !== "string") throw new TypeError("openSafetensors(path) — expected a string path");
         const f = __bro_native.tensor.openSafetensors(path);
-        if (f === null) throw new TypeError(__bro_native.tensor.takeError() || ("openSafetensors: cannot open " + path));
+        if (f === null) {
+            const denied = __bro_native.tensor.takeAccessError();  // the host's access gate refused it
+            if (denied !== null) throw denied;
+            throw new TypeError(__bro_native.tensor.takeError() || ("openSafetensors: cannot open " + path));
+        }
         return f;
     });
     // saveSafetensors(path, { name: GpuTensor, ... }): FP32 and FP16 tensors,
@@ -937,6 +941,8 @@
             values[i] = v;
         }
         if (!__bro_native.tensor.saveSafetensors(path, names, values)) {
+            const denied = __bro_native.tensor.takeAccessError();  // the host's access gate refused it
+            if (denied !== null) throw denied;
             throw new TypeError(__bro_native.tensor.takeError() || "saveSafetensors: failed");
         }
     });

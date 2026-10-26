@@ -301,6 +301,13 @@ inline bool needHeads(const char* label, int64_t D, int64_t numHeads) {
 // Path resolution for the file loaders (api.h setPathResolver).
 std::string resolvePath(const std::string& path);
 
+// `path` resolved (resolvePath) into `resolved`, then asked of the host's
+// access gate (embed/embed_access.h; api.h, "Access") with it absolute and
+// lexically normal: Read, or Write when `write`. False when refused: the
+// refusal is kept for bro_tensor_takeAccessError, which js/tensor.js throws,
+// and the native touches nothing.
+bool gatedPath(const char* path, bool write, std::string& resolved);
+
 } // namespace brotensor::api
 
 // Guard a native body that calls into brotensor: the ops throw
