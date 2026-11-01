@@ -294,14 +294,8 @@ std::shared_ptr<TraceHandleImpl> compile_cuda(const TraceDAG& dag, FusionPattern
     std::shared_ptr<TraceHandleImpl> h;
 
     // `x += p; rms_norm(x)` at FP32 keeps brass's hand-written kernel, which
-    // is a single-pass form the generic emitter does not match. BROTENSOR_JIT_
-    // PREFER=generic forces the emitted kernel instead, which is how the
-    // benchmark puts the two side by side.
-    static const bool prefer_generic = []() {
-        const char* v = std::getenv("BROTENSOR_JIT_PREFER");
-        return v && std::string(v) == "generic";
-    }();
-    if (!prefer_generic && pattern == FusionPattern::ResidualRMSNorm && all_fp32(dag)) {
+    // is a single-pass form the generic emitter does not match.
+    if (pattern == FusionPattern::ResidualRMSNorm && all_fp32(dag)) {
         h = compile_residual_rmsnorm(dag);
     }
 

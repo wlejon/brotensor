@@ -12,8 +12,7 @@
 // BROTENSOR_VK_BENCH_FMT=int8|q8_0|q4k|q6k runs one format,
 // BROTENSOR_VK_BENCH_PART=decode|prefill one table,
 // BROTENSOR_VK_BENCH_SHAPE=<tag> one shape (BROTENSOR_VK_BENCH_MNK=m,n,k a
-// custom prefill shape); BROTENSOR_VK_QGEMV=lpr,unr,sg forces the GEMV
-// configuration and BROTENSOR_VK_GEMM_CFG the prefill tile.
+// custom prefill shape).
 //
 // `--bench-audio` (run_audio_bench) times the main audio ops the same way:
 // GB/s of minimum traffic for the bandwidth-bound ones, GFLOP/s of the dense

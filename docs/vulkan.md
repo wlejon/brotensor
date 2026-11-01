@@ -246,7 +246,7 @@ Keep every file under 1000 lines: a new op family gets its own `ops_<family>.cpp
   simple integer arithmetic on them; anything else is reported as unverifiable.
 - **Streams.** Each device has one in-order stream. Commands go into an open
   command buffer, which is submitted to the **graphics** queue when it reaches
-  `BROTENSOR_VK_BATCH` commands (default 128), on `sync`, before a host access,
+  128 commands, on `sync`, before a host access,
   or on `vulkan::flush(d)`. Up to four batches are in flight. Each submission
   signals a timeline semaphore with a new serial, and an `Event` is just such a
   serial. The graphics queue is used, not the compute-only queue, because on
@@ -259,7 +259,7 @@ Keep every file under 1000 lines: a new op family gets its own `ops_<family>.cpp
   `CudaGraphCapture` / `CudaGraph` contract and are built on what Vulkan does
   cheapest: the captured ops are recorded once into a command buffer with
   `SIMULTANEOUS_USE`, and `launch()` resubmits it unchanged. The recording
-  is cut into segments of `BROTENSOR_VK_BATCH` commands, each launched as its
+  is cut into segments of 128 commands, each launched as its
   own queue submission (in order, barrier-separated like eager batches): the
   amdgpu driver resets the GPU when one submission runs past ~10 s, which a
   whole captured TripoSplat step (two 3.6 s flow forwards) did in one. While a capture is
@@ -331,7 +331,7 @@ three kernels:
 256x128x32/64x64, 128x128x32/64x64, 128x64x32/64x32 and 64x64x32/32x32. The
 choice (`pick_cm`) was measured on the spike's shapes: 256x128 when M >= 512
 and there are >= 150 tiles (or K >= 8192), 128x128 down to 24 tiles, 64x64 for
-M <= 64. `BROTENSOR_VK_GEMM_CFG=256,128,32,64,64` forces one. Any M, N, K works;
+M <= 64. Any M, N, K works;
 three things decide the speed, all learned the hard way on RADV / ACO:
 
 * **Never consume a load where it is issued.** A bounds branch, a zeroing
@@ -464,8 +464,8 @@ hd 128, measured; for hd <= 96, (32, 2) once K and V together pass 24 MiB
 (each query block streams its head's whole K / V, so past the 32 MB
 Infinity Cache the bigger key block halves the passes: 16 heads x 64 at 8192 /
 12288 keys went from 34.6 / 205 ms to 27.1 / 60.2 ms, 8.0 / 3.0 -> 10.1 / 10.3
-TF/s; TripoSplat's flow DiT, 8-13k rows, sampled 2.5x faster);
-`BROTENSOR_VK_FA_CFG=bc,nsg` forces one. Shared memory is
+TF/s; TripoSplat's flow DiT, 8-13k rows, sampled 2.5x faster).
+Shared memory is
 8-31 KiB at those tiles, and every array length is a specialisation-constant
 expression the pipeline guard checks (a forced 64-key tile at hd 256 is
 refused there, not in the driver).
@@ -476,7 +476,7 @@ GQA group; tile maxima go through subgroup ops and shared memory, the
 running sums stay per thread until the end, and P V streams V rows 16 at a
 time per thread (all loads issued before use; consuming each load where it
 was issued made the loop latency-bound, 2-4x slower). Keys are split across
-workgroups until the grid has `BROTENSOR_VK_FA_WGS` (default 80) workgroups:
+workgroups until the grid has 80 workgroups:
 a long cache streams best in a few long splits (160 and more lost 5-30% at
 16k-32k keys). A key whose weight is zero contributes nothing even when its V
 row is NaN (masked decode over a fixed-capacity cache).
@@ -560,7 +560,7 @@ per-element for edges and BF16) with an optional accumulate (`ACCUM`, used by
 the ResBlock to add conv2 onto the skip path without another pass). Tiles
 (`pick_cm`, measured): 256x128 (8 subgroups of 64x64) when C_out fills
 256-row tiles and there are >= 48 of them, 128x64 (4 of 64x32) when it fills
-128-row tiles, else 64x64; `BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn` forces one.
+128-row tiles, else 64x64.
 
 Measured with `brotensor_test_vulkan --bench-conv` (FP16, batch 1 unless
 noted, 3x3 stride 1 same padding unless noted, wall clock around
@@ -684,7 +684,7 @@ from 100 to 160-206 GB/s. 2-byte-aligned data (Q8_0's 34-byte and Q6_K's
 8-byte load is invalid SPIR-V) and packed by the decode. Configuration
 (`gemv_cfg`, measured): wave64; INT8 / Q8_0 rows of K >= 4096 one row per
 group with four items in flight, shorter rows two per group; Q4_K LPR 32 /
-NR 4; Q6_K NR 2 (4 at B = 8). `BROTENSOR_VK_QGEMV=lpr,unr,sg,nr` forces one.
+NR 4; Q6_K NR 2 (4 at B = 8).
 
 **Prefill GEMM.** `gemm_cm.comp`'s B loader takes `QB` (`QF_*`): a chunk is
 8 weights of one row (one K step of 32 is a Q8_0 block, a Q4_K sub-block,
@@ -762,7 +762,7 @@ its 1/B scaling. Prefill, TF/s:
   FP32 at the store, which is what the CPU (FP64 FFT) and CUDA / HIP (FP64
   direct DFT) references do. A frame's result depends only on its samples,
   so streaming == offline bit for bit. Longer transforms (and devices without
-  FP64, or `BROTENSOR_VK_DFT_GEMM=1`) are a matrix product against a DFT
+  FP64) are a matrix product against a DFT
   basis built on the device per call (same twiddle reduction, `sincos_acc`,
   ~1e-7 per coefficient; rows in chunks of <= 16 Mi elements) through the FP32
   GEMM: any length, primes included, but its 400-2048-term FP32 sums carry
@@ -982,22 +982,10 @@ to divide 64; the dispatcher checks).
 | `BROTENSOR_DISABLE_VULKAN=1` | do not probe Vulkan at all |
 | `BROTENSOR_VK_VERBOSE=1` | print why the backend did or did not register |
 | `BROTENSOR_VK_ALLOW_CPU=1` | accept CPU implementations (lavapipe) |
-| `BROTENSOR_VK_BATCH=n` | commands per submitted batch (default 128) |
-| `BROTENSOR_VK_BLOCK_MB=n` | sub-allocation block size (default 256) |
 | `BROTENSOR_VK_MAPPED=0` | do not map device memory even when possible |
 | `BROTENSOR_VK_ALLOW_OVERSIZE=1` | allow tensors over the per-buffer limit (out of spec) |
 | `BROTENSOR_VK_NO_COOPMAT=1` | do not use cooperative matrix (the GEMMs run the SIMT kernel, attention and its backward the FMA kernels) |
-| `BROTENSOR_VK_GEMM_NOSCALE=1` | stage a BF16 A as plain FP16 (the pre-scaling behaviour: past ±65504 becomes inf; comparison only) |
-| `BROTENSOR_VK_GEMM_CFG=bm,bn,bk,wm,wn` | force one cooperative-matrix tile (one of the four in `gemm.cpp`) |
-| `BROTENSOR_VK_FA_CFG=bc,nsg` | force the `fa_cm` tile: bc in {16, 32, 64} keys, nsg in {1, 2, 4} subgroups, 16 nsg <= 2 bc |
-| `BROTENSOR_VK_FA_WGS=n` | workgroups `fa_rows` splits keys up to (default 80) |
-| `BROTENSOR_VK_FA_PATH=rows\|cm\|dense` | force an attention path where it applies (benchmarking) |
-| `BROTENSOR_VK_FA_BWD_PATH=fma\|cm` | force the flash-attention backward's kernel (`cm` where eligible: FP16 / BF16, hd <= 128) |
-| `BROTENSOR_VK_FA_BWD_CFG=nsg,bn,areg,...` | force the `fa_bwd_cm` tiles: three (subgroups, streamed rows, A fragments in registers) triples for the statistics, dQ and dK / dV dispatches |
-| `BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn` | force the `conv_cm` tile (one of the six in `ops_conv.cpp`) |
-| `BROTENSOR_VK_QGEMV=lpr,unr,sg,nr` | force the quantised GEMV's lanes per row group, items in flight, subgroup size and rows per group |
 | `BROTENSOR_JIT_VULKAN=eager` / `BROTENSOR_JIT_STRICT=1` | replay traces op by op / make a trace-compiler failure throw (see Trace JIT) |
-| `BROTENSOR_VK_DFT_GEMM=1` | run every spectral transform through the FP32 basis GEMM instead of the FP64 direct DFT (benchmarking; less accurate) |
 
 Vulkan validation layers were not installed on the development machine, so
 the backend has not been run under them.

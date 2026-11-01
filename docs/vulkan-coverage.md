@@ -127,7 +127,7 @@ OmniVoice precision default, brogameagent's JS device names, bro's
 * **Long graph submissions.** A captured TripoSplat step (two 3.6 s flow
   forwards at 512 px, 8 steps) was one command buffer past the amdgpu ~10 s
   job limit: device lost. Graph captures are now cut into
-  `BROTENSOR_VK_BATCH`-command segments, each its own submission (docs/vulkan.md,
+  128-command segments, each its own submission (docs/vulkan.md,
   "Graphs").
 
 The original list:

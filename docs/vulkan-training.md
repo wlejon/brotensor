@@ -96,9 +96,7 @@ Vulkan as the `*_vulkan` ctest registrations.
   streamed rows; statistics / dQ / dK-dV): hd <= 64 (2 x 16) / (2 x 16) /
   (4 x 16); wider (4 x 32) / (4 x 16) / (4 x 16) with dQ's and dK-dV's A
   fragments read from shared memory (in registers next to 128-wide
-  accumulators they spill); shared memory 9-54 KiB.
-  `BROTENSOR_VK_FA_BWD_CFG=nsg,bn,areg x 3` forces them,
-  `BROTENSOR_VK_FA_BWD_PATH=fma|cm` picks a kernel. Head widths 129-256 stay on
+  accumulators they spill); shared memory 9-54 KiB. Head widths 129-256 stay on
   FMA: the dK and dV accumulators alone would be 256 VGPRs. BF16 is staged as
   FP16 unscaled like the forward's Q / K / V (docs/vulkan-bf16.md: inputs
   past +-65504 become inf), and P and dS are rounded to FP16 as A operands

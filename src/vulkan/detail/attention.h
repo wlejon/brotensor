@@ -59,8 +59,7 @@ void set_attention_cm_config(int bc, int nsg);
 // (cooperative matrix: FP16 / BF16, `coopmat_f16`, head width <= 128) or
 // fa_bwd.comp (FMA, everything else). Test / benchmark hooks: the override
 // (0 = automatic, 1 = FMA, 2 = coopmat when eligible, 3 = coopmat without its
-// clustered-layout fast path; process-wide, ahead of
-// BROTENSOR_VK_FA_BWD_PATH=fma|cm) and the kernel the calling thread's last
+// clustered-layout fast path; process-wide) and the kernel the calling thread's last
 // backward core ran: "coopmat", "fma" or "" (none yet / empty problem).
 void set_fa_backward_override(int mode);
 const char* fa_backward_last_path();

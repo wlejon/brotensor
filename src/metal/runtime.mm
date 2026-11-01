@@ -129,17 +129,8 @@ thread_local int   g_op_count  = 0;
 
 // Ops per command buffer. Large enough that the per-batch commit+wait stall
 // amortizes to nothing; small enough to bound encoded-command memory and the
-// number of resources a single buffer pins until it completes. Overridable
-// with BROTENSOR_METAL_BATCH (1 = one command buffer per op, the old
-// fully-synchronous behavior — useful for A/B debugging).
-int batch_size() {
-    static const int n = [] {
-        const char* e = getenv("BROTENSOR_METAL_BATCH");
-        const int v = e ? atoi(e) : 256;
-        return v > 0 ? v : 256;
-    }();
-    return n;
-}
+// number of resources a single buffer pins until it completes.
+int batch_size() { return 256; }
 
 // Wait on (and release) the previously committed batch, if any.
 void wait_committed() {

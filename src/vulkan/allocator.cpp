@@ -71,10 +71,6 @@ Allocator::Allocator(DeviceCtx& dev) : dev_(dev) {
     mapped_ = mappable;
     if (const char* m = env("BROTENSOR_VK_MAPPED")) mapped_ = mappable && std::strcmp(m, "0") != 0;
 
-    if (const char* b = env("BROTENSOR_VK_BLOCK_MB")) {
-        const long long mb = std::atoll(b);
-        if (mb > 0) block_bytes_ = VkDeviceSize(mb) << 20;
-    }
     block_bytes_ = std::min(block_bytes_, round_up(max_buffer_ / 2, kAlign));
     block_bytes_ = std::max(block_bytes_, kSubAllocMax);
 }

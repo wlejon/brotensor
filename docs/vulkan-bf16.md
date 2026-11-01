@@ -111,7 +111,7 @@ T5 encode then showed where its time went:
 **Cost.** One extra dispatch (and barrier) per GEMM, reading A once
 (16-byte loads, 64 invocations per row). On the `--bench-gemm` shapes the
 BF16 GEMM moves by -12% to +12% against the unscaled staging
-(`BROTENSOR_VK_GEMM_NOSCALE=1`), the loss on the small 512-row shapes where
+(the bench's `set_gemm_scaling(0)` rows), the loss on the small 512-row shapes where
 the dispatch is a larger share; the FP16 GEMM is unchanged (table below).
 
 ## Consumers switched back

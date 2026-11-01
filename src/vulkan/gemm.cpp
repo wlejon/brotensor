@@ -50,7 +50,7 @@ constexpr SimtCfg kSimtCfgs[] = {
 
 std::atomic<int> g_override{0};
 std::atomic<int> g_cm_cfg{-1};
-std::atomic<int> g_noscale{-1};   // -1: read BROTENSOR_VK_GEMM_NOSCALE on first use
+std::atomic<int> g_noscale{0};    // 1: set_gemm_scaling(0) turned the scaling off
 
 std::uint32_t cm_wg(const CmCfg& c) { return (c.bm / c.wm) * (c.bn / c.wn) * 32u; }
 
@@ -118,17 +118,6 @@ ShaderId simt_shader(const GemmArgs& g) {
 }
 
 const CmCfg& pick_cm(const GemmArgs& g, std::uint32_t nout) {
-    static const CmCfg* forced = []() -> const CmCfg* {
-        const char* e = std::getenv("BROTENSOR_VK_GEMM_CFG");
-        if (!e || !*e) return nullptr;
-        for (const CmCfg& c : kCmCfgs) {
-            char buf[64];
-            std::snprintf(buf, sizeof buf, "%u,%u,%u,%u,%u", c.bm, c.bn, c.bk, c.wm, c.wn);
-            if (std::string(buf) == e) return &c;
-        }
-        return nullptr;
-    }();
-    if (forced) return *forced;
     const int ci = g_cm_cfg.load(std::memory_order_relaxed);
     if (ci >= 0 && ci < static_cast<int>(std::size(kCmCfgs))) return kCmCfgs[ci];
     // Measured on the spike's shapes (Radeon 8060S, 40 CUs, docs/vulkan.md):
@@ -204,18 +193,12 @@ void glu_pass(DeviceCtx& d, std::uint32_t op, std::uint64_t x, std::uint64_t y, 
 }
 
 // A BF16 A on the cooperative-matrix kernel is staged with per-row
-// power-of-two scales (docs/vulkan-bf16.md) unless BROTENSOR_VK_GEMM_NOSCALE=1
-// or the test hook turned it off; an FP32 A always is.
+// power-of-two scales (docs/vulkan-bf16.md) unless the test hook turned it
+// off; an FP32 A always is.
 bool scale_a(const GemmArgs& g) {
     if (g.da == Dtype::FP32) return true;
     if (g.da != Dtype::BF16) return false;
-    int v = g_noscale.load(std::memory_order_relaxed);
-    if (v < 0) {
-        const char* e = std::getenv("BROTENSOR_VK_GEMM_NOSCALE");
-        v = (e && *e && std::string(e) != "0") ? 1 : 0;
-        g_noscale.store(v, std::memory_order_relaxed);
-    }
-    return v == 0;
+    return g_noscale.load(std::memory_order_relaxed) != 1;
 }
 
 // Writes the exponent of every row of A (per batch slice, or once when A is

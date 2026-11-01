@@ -6,8 +6,7 @@
 // Timing: wall clock around back-to-back launches with one device sync,
 // median of 7 batches after warm-up (test_vulkan_bench.cpp's method). TF/s
 // counts 4 L^2 hd H flops (2 for Q K^T, 2 for P V), halved for causal.
-// BROTENSOR_VK_BENCH_SHAPE=<tag> runs one shape; BROTENSOR_VK_FA_CFG=bc,nsg
-// forces the fa_cm tile; BROTENSOR_VK_BENCH_PART=prefill|causal|decode|bwd
+// BROTENSOR_VK_BENCH_SHAPE=<tag> runs one shape; BROTENSOR_VK_BENCH_PART=prefill|causal|decode|bwd
 // runs one part.
 
 #include "test_vulkan_common.h"

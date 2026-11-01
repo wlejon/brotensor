@@ -90,13 +90,7 @@ enum class Path { Rows, Cm, Dense };
 
 Path choose(DeviceCtx& d, const AttnProblem& p) {
     if (p.nan_safe) return Path::Rows;
-    static const int env_ov = [] {   // BROTENSOR_VK_FA_PATH=rows|cm|dense (benchmarking)
-        const char* e = std::getenv("BROTENSOR_VK_FA_PATH");
-        const std::string s = e ? e : "";
-        return s == "rows" ? 1 : s == "cm" ? 2 : s == "dense" ? 3 : 0;
-    }();
-    int ov = g_override.load(std::memory_order_relaxed);
-    if (ov == 0) ov = env_ov;
+    const int ov = g_override.load(std::memory_order_relaxed);
     if (ov == 1) return Path::Rows;
     if (ov == 2 && cm_eligible(d, p)) return Path::Cm;
     if (ov == 3 && dense_eligible(p)) return Path::Dense;
@@ -113,16 +107,7 @@ Path choose(DeviceCtx& d, const AttnProblem& p) {
 struct CmCfg { std::uint32_t bc, nsg; };
 
 CmCfg pick_cm(const AttnProblem& p) {
-    static const CmCfg forced = [] {
-        CmCfg c{0, 0};
-        if (const char* e = std::getenv("BROTENSOR_VK_FA_CFG")) {
-            unsigned bc = 0, ns = 0;
-            if (std::sscanf(e, "%u,%u", &bc, &ns) == 2) c = {bc, ns};
-        }
-        return c;
-    }();
     CmCfg c{static_cast<std::uint32_t>(g_cm_bc.load()), static_cast<std::uint32_t>(g_cm_nsg.load())};
-    if (c.bc == 0) c = forced;
     if (c.bc == 0) {
         // Measured (docs/vulkan.md "Attention"): heads up to 96 wide run best
         // with 16-key blocks and 32 query rows, 128-wide ones with 32 x 64 —
@@ -139,7 +124,7 @@ CmCfg pick_cm(const AttnProblem& p) {
     }
     if ((c.bc != 16 && c.bc != 32 && c.bc != 64) || (c.nsg != 1 && c.nsg != 2 && c.nsg != 4) ||
         c.nsg * 16 > 2 * c.bc) {
-        fail(p.op, "BROTENSOR_VK_FA_CFG: bc in {16, 32, 64}, nsg in {1, 2, 4}, 16 nsg <= 2 bc");
+        fail(p.op, "fa_cm tile: bc in {16, 32, 64}, nsg in {1, 2, 4}, 16 nsg <= 2 bc");
     }
     return c;
 }
@@ -217,14 +202,10 @@ void run_rows(DeviceCtx& d, const AttnProblem& p) {
     }
     if (p.hd > 8192) fail(p.op, "head_dim above 8192");
     const std::uint64_t entries = static_cast<std::uint64_t>(p.lq) * (p.hq / G);
-    // Split the keys until the grid has BROTENSOR_VK_FA_WGS workgroups
-    // (default 80: a long cache streams best in a few long splits; 160 and
-    // up lost 5-30% on the 16k-32k decode shapes), at least one 128-key tile
-    // per split.
-    static const std::uint64_t target = [] {
-        const char* e = std::getenv("BROTENSOR_VK_FA_WGS");
-        return static_cast<std::uint64_t>(e && std::atoi(e) > 0 ? std::atoi(e) : 80);
-    }();
+    // Split the keys until the grid has 80 workgroups (a long cache streams
+    // best in a few long splits; 160 and up lost 5-30% on the 16k-32k decode
+    // shapes), at least one 128-key tile per split.
+    constexpr std::uint64_t target = 80;
     std::uint64_t nsplit = 1;
     if (entries < target && p.lk > 128) {
         nsplit = std::min<std::uint64_t>({cdiv(target, entries), cdiv(p.lk, 128), 64});

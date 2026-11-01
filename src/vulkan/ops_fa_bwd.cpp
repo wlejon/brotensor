@@ -103,14 +103,7 @@ std::uint64_t cdiv(std::uint64_t a, std::uint64_t b) { return (a + b - 1) / b; }
 
 bool use_cm(DeviceCtx& d, const BwdProblem& p) {
     const bool eligible = d.info().coopmat_f16 && p.dt != Dtype::FP32 && p.hd <= kCmMaxHd;
-    static const int env_ov = [] {   // BROTENSOR_VK_FA_BWD_PATH=fma|cm (benchmarking)
-        const char* e = std::getenv("BROTENSOR_VK_FA_BWD_PATH");
-        const std::string s = e ? e : "";
-        return s == "fma" ? 1 : s == "cm" ? 2 : 0;
-    }();
-    int ov = g_override.load(std::memory_order_relaxed);
-    if (ov == 0) ov = env_ov;
-    return ov != 1 && eligible;
+    return g_override.load(std::memory_order_relaxed) != 1 && eligible;
 }
 
 // Override 3: the coopmat kernel without its clustered-layout fast path.
@@ -118,37 +111,15 @@ bool cm_agnostic() { return g_override.load(std::memory_order_relaxed) == 3; }
 
 // fa_bwd_cm.comp tiles per dispatch (statistics, dQ, dK / dV): subgroups
 // (16 own rows each), streamed rows per block, and whether the own rows' A
-// fragments stay in registers (areg 0 / 1, or 2 = automatic).
-// BROTENSOR_VK_FA_BWD_CFG=nsg,bn,areg x 3 (statistics, dQ, dK / dV) forces them.
+// fragments stay in registers (areg 0 / 1).
 struct CmCfg { std::uint32_t nsg[3], bn[3], areg[3]; };
 
 CmCfg pick_cm(const BwdProblem& p) {
-    static const CmCfg forced = [] {
-        CmCfg c{{0, 0, 0}, {0, 0, 0}, {2, 2, 2}};
-        if (const char* e = std::getenv("BROTENSOR_VK_FA_BWD_CFG")) {
-            unsigned v[9] = {0, 0, 2, 0, 0, 2, 0, 0, 2};
-            if (std::sscanf(e, "%u,%u,%u,%u,%u,%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7],
-                            &v[8]) == 9)
-                c = {{v[0], v[3], v[6]}, {v[1], v[4], v[7]}, {v[2], v[5], v[8]}};
-        }
-        return c;
-    }();
-    CmCfg c = forced;
     // Measured (docs/vulkan-training.md): 16-key / 16-query blocks; heads
     // wider than 64 take 4 subgroups everywhere, 32-key blocks for the
     // statistics and A fragments from shared memory for dQ and dK / dV (in
     // registers next to the 128-wide accumulators they spill).
-    if (c.nsg[0] == 0) {
-        c = p.hd <= 64 ? CmCfg{{2, 2, 4}, {16, 16, 16}, {1, 1, 1}} : CmCfg{{4, 4, 4}, {32, 16, 16}, {1, 0, 0}};
-    }
-    for (int i = 0; i < 3; ++i) {
-        if (c.areg[i] == 2) c.areg[i] = p.hd <= 64 ? 1 : 0;
-        if ((c.nsg[i] != 1 && c.nsg[i] != 2 && c.nsg[i] != 4) || (c.bn[i] != 16 && c.bn[i] != 32 && c.bn[i] != 64) ||
-            c.bn[i] > 32 * c.nsg[i] || c.areg[i] > 1) {
-            fail(p.op, "BROTENSOR_VK_FA_BWD_CFG: nsg in {1, 2, 4}, bn in {16, 32, 64}, bn <= 32 nsg, areg 0 / 1 / 2");
-        }
-    }
-    return c;
+    return p.hd <= 64 ? CmCfg{{2, 2, 4}, {16, 16, 16}, {1, 1, 1}} : CmCfg{{4, 4, 4}, {32, 16, 16}, {1, 0, 0}};
 }
 
 BwdPush make_push(const BwdProblem& p, const Tensor& stats) {

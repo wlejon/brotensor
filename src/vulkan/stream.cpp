@@ -42,11 +42,6 @@ Stream::Stream(DeviceCtx& dev) : dev_(dev) {
     VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     sci.pNext = &st;
     BT_VK_CHECK(f.vkCreateSemaphore(d, &sci, nullptr, &timeline_));
-
-    if (const char* b = std::getenv("BROTENSOR_VK_BATCH")) {
-        const long v = std::atol(b);
-        if (v > 0) batch_limit_ = static_cast<std::uint32_t>(v);
-    }
     stats_.batch_limit = batch_limit_;
 }
 

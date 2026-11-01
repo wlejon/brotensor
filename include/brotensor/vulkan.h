@@ -106,7 +106,7 @@ struct StreamStats {
     std::uint64_t submits = 0;
     std::uint64_t commands = 0;
     std::uint64_t launches = 0;        // graph launches
-    std::uint32_t batch_limit = 0;     // commands per batch (BROTENSOR_VK_BATCH)
+    std::uint32_t batch_limit = 0;     // commands per batch
     std::size_t pipelines = 0;         // pipelines created so far
 };
 StreamStats stream_stats(Device d);

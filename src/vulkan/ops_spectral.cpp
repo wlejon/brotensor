@@ -83,14 +83,9 @@ struct Dft64Push {
 
 // The FP64 direct DFT (dft64.comp) takes frame-sized transforms on a device
 // with shaderFloat64: L <= 2048 (C2C <= 1024, its shared-memory row). Longer
-// transforms keep the FP32 basis GEMM. BROTENSOR_VK_DFT_GEMM=1 forces the GEMM
-// (the benchmark's before / after).
+// transforms keep the FP32 basis GEMM.
 bool use_dft64(DeviceCtx& d, const Basis& bs, int cols, long long span) {
-    static const bool force_gemm = [] {
-        const char* e = std::getenv("BROTENSOR_VK_DFT_GEMM");
-        return e && *e && *e != '0';
-    }();
-    if (force_gemm || !d.info().shader_float64) return false;
+    if (!d.info().shader_float64) return false;
     if (bs.L > (bs.mode == BASIS_C2C ? 1024 : 2048) || cols > 2050) return false;
     return span < 0xffffffffLL;
 }

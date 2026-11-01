@@ -214,7 +214,7 @@ Peak VRAM does not move, and should not: the fusion removes *traffic*, not
 residency — the store destination is still a materialised feature map. What the
 symbolic tracer changes is that building the trace costs nothing. The first
 decode allocates **72 allocations / 9725 MiB at 1024² with the JIT on and
-exactly the same 72 / 9725 MiB with `BRODIFFUSION_JIT=0`**: the tracer adds not
+exactly the same 72 / 9725 MiB with brodiffusion's `--no-jit`**: the tracer adds not
 one byte. Under the old tracer those 35 seams would each have bought two
 full-size buffers at trace time.
 

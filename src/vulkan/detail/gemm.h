@@ -62,8 +62,7 @@ void set_gemm_override(int mode);
 
 // Test / benchmark hook, process-wide: 0 = stage a BF16 A as plain FP16 (the
 // pre-scaling behaviour, out of range becomes inf), 1 = per-row power-of-two
-// scaling (the default; docs/vulkan-bf16.md). Overrides
-// BROTENSOR_VK_GEMM_NOSCALE.
+// scaling (the default; docs/vulkan-bf16.md).
 void set_gemm_scaling(int mode);
 
 // Benchmark hook: force cooperative-matrix tile configuration `index` (see

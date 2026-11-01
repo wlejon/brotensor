@@ -58,9 +58,6 @@ constexpr CmCfg kCmCfgs[] = {
     {256, 128, 32, 64, 64},
     {128, 64, 32, 64, 32},
     {64, 64, 32, 32, 32},
-    {128, 128, 32, 64, 64},   // the rest only by BROTENSOR_VK_CONV_CFG
-    {128, 128, 32, 64, 32},
-    {256, 64, 32, 64, 32},
 };
 struct SimtCfg { std::uint32_t bm, bn, bk, tm, tn; };
 constexpr SimtCfg kSimtCfgs[] = {
@@ -80,20 +77,6 @@ std::uint32_t esize(Dtype t) { return t == Dtype::FP32 ? 4u : 2u; }
 
 int out_dim(int in, int pad, int dil, int k, int stride) { return (in + 2 * pad - dil * (k - 1) - 1) / stride + 1; }
 
-const CmCfg* forced_cm() {
-    static const CmCfg* f = []() -> const CmCfg* {
-        const char* e = std::getenv("BROTENSOR_VK_CONV_CFG");
-        if (!e || !*e) return nullptr;
-        for (const CmCfg& c : kCmCfgs) {
-            char buf[64];
-            std::snprintf(buf, sizeof buf, "%u,%u,%u,%u,%u", c.bm, c.bn, c.bk, c.wm, c.wn);
-            if (std::string(buf) == e) return &c;
-        }
-        return nullptr;
-    }();
-    return f;
-}
-
 // Tile choice on (M = Cg_out, N = H_out W_out, Z = images * groups),
 // measured on the VAE / U-Net shapes (docs/vulkan.md "Convolution"): the
 // implicit GEMM is bound by gathering B, so the winners are the tiles with
@@ -102,7 +85,6 @@ const CmCfg* forced_cm() {
 // 64x32, 20-22 TF/s) when M fills 128-row tiles, else 64x64. A tile row
 // more than 10% empty loses more than the bigger tile gains.
 const CmCfg& pick_cm(std::uint64_t m, std::uint64_t n, std::uint64_t z) {
-    if (const CmCfg* f = forced_cm()) return *f;
     auto fill = [&](std::uint64_t bm) { return double(m) / double(cdiv(m, bm) * bm); };
     if (m >= 256 && fill(256) >= 0.9 && cdiv(m, 256) * cdiv(n, 128) * z >= 48) return kCmCfgs[0];
     if (m >= 128 && fill(128) >= 0.9) return kCmCfgs[1];

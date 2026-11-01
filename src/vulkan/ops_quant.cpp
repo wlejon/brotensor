@@ -58,8 +58,7 @@ struct TransposePush { std::uint64_t src, dst; std::uint32_t batch, rows, cols; 
 std::uint64_t cdiv(std::uint64_t a, std::uint64_t b) { return (a + b - 1) / b; }
 
 // gemv_q.comp's lanes per row group, items in flight per lane, subgroup
-// size and W rows per group. BROTENSOR_VK_QGEMV=lpr,unr,sg,nr overrides
-// (benchmarking).
+// size and W rows per group.
 struct GemvCfg { std::uint32_t lpr, unr, sg, nr; };
 
 // Measured on the Radeon 8060S (docs/vulkan.md "Quantised weights"): wave64,
@@ -68,12 +67,6 @@ struct GemvCfg { std::uint32_t lpr, unr, sg, nr; };
 // INT8 / Q8_0 rows (K >= 4096) stream best one row per group with four items
 // in flight; with short rows two rows per group keep more bytes in flight.
 GemvCfg gemv_cfg(DeviceCtx& d, int fmt, int k, int B) {
-    static const GemvCfg forced = [] {
-        GemvCfg c{0, 0, 0, 0};
-        if (const char* e = std::getenv("BROTENSOR_VK_QGEMV"))
-            std::sscanf(e, "%u,%u,%u,%u", &c.lpr, &c.unr, &c.sg, &c.nr);
-        return c;
-    }();
     const auto& info = d.info();
     std::uint32_t sg = 0;   // 0: the device's default, not pinned
     if (info.subgroup_size_control) {
@@ -92,10 +85,6 @@ GemvCfg gemv_cfg(DeviceCtx& d, int fmt, int k, int B) {
         c = {32, 1, sg, B >= 8 ? 4u : 2u};
     }
     if (items < 32) c.lpr = 16;
-    if (forced.lpr) c.lpr = forced.lpr;
-    if (forced.unr) c.unr = forced.unr;
-    if (forced.sg) c.sg = forced.sg;
-    if (forced.nr) c.nr = forced.nr;
     return c;
 }
 

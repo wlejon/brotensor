@@ -138,8 +138,8 @@ of executed matrix work (docs/vulkan-training.md). FP32 and heads wider than
 | conv_transpose1d 512 -> 256 k16 s8 L1000, FP32 | 63.7 | 0.835 | 76.3 |
 | STFT n_fft 400 hop 160, 30 s (FP64 DFT, default) | 52.8 | 3.69 | 14.3 |
 | iSTFT, same (FP64 DFT, default) | 122.6 | 4.59 | 26.7 |
-| STFT, same (`BROTENSOR_VK_DFT_GEMM=1`, FP32 GEMM) | 52.8 | 0.198 | 267 |
-| iSTFT, same (`BROTENSOR_VK_DFT_GEMM=1`) | 122.6 | 0.212 | 578 |
+| STFT, same (FP32 basis GEMM, what devices without FP64 run) | 52.8 | 0.198 | 267 |
+| iSTFT, same (FP32 basis GEMM) | 122.6 | 0.212 | 578 |
 | complex_abs 3001 x 201 | 0.010 | 0.010 | 0.94 |
 
 `sample_logits_into` with no top-k / top-p at V = 151936 (found by the
@@ -182,7 +182,7 @@ intermediates.
 8 steps, `BRODIFFUSION_TIME=1`; the DiT's AdaLN / gate / SwiGLU seams, the
 VAE norms and the Euler update are traced): denoise 3.509 s/step fused,
 3.752 s/step with the op-by-op replay (-6.5%), 3.597 s/step with every trace
-site off (`BRODIFFUSION_JIT=0`, the hand-written eager path; -2.4%). VAE
+site off (brodiffusion's `--no-jit`, the hand-written eager path; -2.4%). VAE
 decode 1.47 / 1.51 / 1.49 s. The step is GEMM-bound; the images are
 visually identical.
 

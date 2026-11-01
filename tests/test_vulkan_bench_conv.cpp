@@ -8,7 +8,7 @@
 // counts 2 C_out C_in kH kW H_out W_out N flops. GB/s counts the minimum
 // traffic (each input read once, each output written once); GroupNorm
 // actually reads X twice. BROTENSOR_VK_BENCH_SHAPE=<tag> runs one shape,
-// BROTENSOR_VK_BENCH_PART=conv|band runs one table, BROTENSOR_VK_CONV_CFG=bm,bn,bk,wm,wn forces a tile,
+// BROTENSOR_VK_BENCH_PART=conv|band runs one table,
 // BROTENSOR_VK_BENCH_DTYPE=f32|bf16 changes the conv dtype and
 // BROTENSOR_VK_BENCH_CONV_PATH=simt|direct forces a Vulkan conv path.
 
