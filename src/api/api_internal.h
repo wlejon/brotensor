@@ -64,9 +64,8 @@ inline const brotensor::Tensor* constTensor(const void* ptr) {
     return h ? &h->tensor : nullptr;
 }
 
-// The old QuickJS binding accepted "fp32"/"f32", "fp16"/"f16", "bf16",
-// "int8"/"i8" (and the numeric Dtype enum, which js/tensor.js maps to the
-// string before the call).
+// Accepts "fp32"/"f32", "fp16"/"f16", "bf16", "int8"/"i8" (js/tensor.js maps
+// the numeric Dtype enum to the string before the call).
 inline brotensor::Dtype parseDtype(const char* dt) {
     if (!dt) return brotensor::Dtype::FP32;
     if (std::strcmp(dt, "fp16") == 0 || std::strcmp(dt, "f16") == 0) return brotensor::Dtype::FP16;

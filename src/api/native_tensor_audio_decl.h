@@ -1,6 +1,6 @@
 #pragma once
 
-// native_tensor_audio_decl.h — the C entry points of the restored audio group
+// native_tensor_audio_decl.h — the C entry points of the audio group
 // of bro.tensor: the spectral / FFT core, STFT / iSTFT, the 1D convolution
 // family, the vocoder + codec activations, codec quantization, 1D resampling,
 // the log / exp / round elementwise maps and the autoregressive logit sampler.
@@ -16,7 +16,7 @@
 //   native_tensor_audio_b.cpp  pad1d + conv1d family, activations,
 //                              quantization, resampling, elementwise, sampling.
 //
-// Conventions shared with the other restored groups (see api_internal.h):
+// Conventions shared with the other free-function groups (see api_internal.h):
 //   *_bits      a nullable GpuTensor slot crossing as raw Value bits
 //               (tensorFromValue -> Tensor* or nullptr).
 //   key/counter a counter-based RNG seed: Number or BigInt, read with

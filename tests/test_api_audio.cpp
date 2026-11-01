@@ -1,4 +1,4 @@
-// test_api_audio.cpp — JS-level checks for the restored audio group of
+// test_api_audio.cpp — JS-level checks for the audio group of
 // bro.tensor (src/api/js/tensor_audio.js over src/api/native_tensor_audio*.cpp):
 // the spectral / FFT core, STFT / iSTFT, the 1D convolution family, the
 // vocoder / codec activations, codec quantization, 1D resampling, the log /

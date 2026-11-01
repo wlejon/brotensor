@@ -1,11 +1,10 @@
-// native_tensor_audio_b.cpp — the second half of the restored audio group
+// native_tensor_audio_b.cpp — the second half of the audio group
 // (see native_tensor_audio.cpp for the first half and the registration table
 // that covers both): 1D padding, the conv1d / conv_transpose1d / causal-conv
 // family, the vocoder + codec activations, codec quantization, 1D resampling,
 // the log / exp / round elementwise maps and the autoregressive logit sampler.
 //
-// Restored from the QuickJS binding (src/js/tensor_bindings_audio.cpp). NCL
-// layout throughout the conv family: an activation is (N, C*L), conv weights
+// NCL layout throughout the conv family: an activation is (N, C*L), conv weights
 // are OIL, conv-transpose weights are input-channel-major.
 
 #include "native_tensor_audio_decl.h"
@@ -368,9 +367,7 @@ void bro_tensor_roundBackward(void* dY, void* dX) {
 
 // ─── Autoregressive logit sampling ─────────────────────────────────────────
 //
-// The old binding refused sampleLogits on a CUDA build (no kernel then);
-// brotensor carries src/cuda/sample_logits.cu today, so this dispatches on
-// every backend. key / counter are counter-based RNG seeds: Number or BigInt,
+// Dispatches on every backend (CUDA: src/cuda/sample_logits.cu). key / counter are counter-based RNG seeds: Number or BigInt,
 // read the same way as randUniform's.
 
 void bro_tensor_sampleLogits(void* logits, double temperature, int32_t topK, double topP,

@@ -6,8 +6,7 @@
 // module (bronze_tensor_attn2_main) that api.cpp mounts after them, so
 // `bro.tensor` and `bro.tensor.GpuTensor` already exist here.
 //
-// Signatures are the QuickJS binding's (tensor_bindings_attention.cpp), same
-// argument order and the same optional slots: `bq|null` and friends take a
+// Optional slots: `bq|null` and friends take a
 // GpuTensor or null, and the index streams (cuSeqQ / cuSeqK, posT / posH /
 // posW) are an INT32 or whole-number FP32 GpuTensor, or null. The wrappers
 // check argument types here, because the natives receive the nullable slots

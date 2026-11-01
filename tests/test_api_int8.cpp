@@ -1,8 +1,8 @@
-// test_api_int8.cpp — checks for the restored INT8 / GGUF-quant group of
+// test_api_int8.cpp — checks for the INT8 / GGUF-quant group of
 // bro.tensor (src/api/native_tensor_int8.cpp + src/api/js/tensor_int8.js).
 //
 // Two blocks:
-//   1. Backend-independent: every restored name is a function, the JS wrappers
+//   1. Backend-independent: every name in the group is a function, the JS wrappers
 //      reject wrong argument types with a TypeError before touching a native,
 //      and quantizeInt8PerRowHost — the one host-only helper in the group —
 //      produces the documented weights / scales.
@@ -30,7 +30,7 @@ int run_api_int8_tests() {
             "flashAttentionProjectKvInt8wFp16", "flashAttentionQWithKvCachedInt8wFp16",
             "flashAttentionQkvoInt8wFp16", "selfAttentionBiasInt8wFp16"
         ];
-        if (names.length !== 19) throw new Error("expected 19 restored names, listed " + names.length);
+        if (names.length !== 19) throw new Error("expected 19 names, listed " + names.length);
         for (let i = 0; i < names.length; i++) {
             if (typeof tensor[names[i]] !== "function") throw new Error("bro.tensor." + names[i] + " is not a function");
         }

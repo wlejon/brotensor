@@ -1,5 +1,5 @@
-// native_tensor_int8.cpp — bodies for the INT8 / GGUF-quant group, restored
-// from the QuickJS binding (src/js/tensor_bindings_int8.cpp).
+// native_tensor_int8.cpp — bodies for the INT8 / GGUF-quant group of
+// bro.tensor.
 //
 // Every op except quantizeInt8PerRowHost is GPU-only (see the header): on a
 // CPU-only build the dispatcher throws "not implemented on CPU", the
@@ -20,7 +20,8 @@ namespace {
 
 // The last quantizeInt8PerRowHost result on this thread. The weights cross as
 // the native's `i8[]` return, the scales through the companion native — one
-// quantise pass, two typed arrays, as the old `{ weights, scales }` object.
+// quantise pass, two typed arrays, which the wrapper returns as
+// `{ weights, scales }`.
 // Both are copied out by the runtime (release == nullptr), so the vectors may
 // be reused by the next call.
 thread_local std::vector<int8_t> tl_quant_weights;

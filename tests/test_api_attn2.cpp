@@ -8,8 +8,8 @@
 // kernels take FP32 alongside FP16/BF16), so none of these blocks needs a
 // backend gate — the numbers below are the same on every backend.
 //
-// The INT32 streams (cu_seqlens, M-RoPE position ids) keep the old binding's
-// "GpuTensor viewed as INT32 storage" convention, so the helper builds them by
+// The INT32 streams (cu_seqlens, M-RoPE position ids) are a GpuTensor viewed
+// as INT32 storage, so the helper builds them by
 // uploading the little-endian bytes through uploadInt8 — the storage lands on
 // the default device, which is exactly what the ops want (device pointer on
 // CUDA/Metal, host pointer on CPU).

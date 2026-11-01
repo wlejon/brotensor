@@ -2,9 +2,7 @@
 // pair, the three loss entry points the fused-loss family in tensor_ext.js left
 // behind, and the diffusion sampler steps + sinusoidal timestep embedding.
 //
-// Signatures are the QuickJS binding's (tensor_bindings_activations.cpp,
-// tensor_bindings_diffusion.cpp): same argument order, same optional arguments
-// and defaults. `mask|null` slots take a length-N FP32 GpuTensor or null;
+// `mask|null` slots take a length-N FP32 GpuTensor or null;
 // softmaxXentSegment keeps its host Float32Array form (the op takes raw host
 // pointers and writes probs/dLogits in place); mseScalar keeps its
 // [loss, dPred] array result.

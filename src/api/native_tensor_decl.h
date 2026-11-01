@@ -65,7 +65,7 @@ void bro_tensor_randBernoulli(double p, uint64_t key_bits, uint64_t counter_bits
 void bro_tensor_randnTruncated(double lo, double hi, uint64_t key_bits, uint64_t counter_bits, void* Y);
 double bro_tensor_xavierInit(void* W, uint64_t state_bits);            // returns the advanced state
 
-// --- Restored dense / loss / concat ops (native_tensor_nn.cpp) ---
+// --- Dense / loss / concat ops (native_tensor_nn.cpp) ---
 void bro_tensor_cast(void* src, void* dst, const char* outDtype);
 void bro_tensor_softmaxForwardMasked(void* logits, void* probs, uint64_t mask_bits);
 void bro_tensor_layernormForward(void* x, void* gamma, void* beta, void* y, void* xhat, double eps, bronze_native_buffer* out);  // f64[] {mean, rstd}
@@ -171,9 +171,7 @@ void bro_tensor_ropeForward(void* X, int32_t headDim, int32_t numHeads, int32_t 
 void bro_tensor_ropeBackward(void* dY, int32_t headDim, int32_t numHeads, int32_t seqOffset, double thetaBase, void* dX);
 void bro_tensor_ropeApply(void* X, void* cosTbl, void* sinTbl, int32_t headDim, int32_t numHeads, void* Y);
 // ropeApplyBackward(dY, cosTbl, sinTbl, headDim, numHeads, dX): the adjoint of
-// ropeApply against the SAME tables (the QuickJS binding's signature; the
-// bronze port had dropped the tables and silently ran the standard-RoPE
-// backward at offset 0 instead).
+// ropeApply against the SAME tables (not the standard-RoPE backward).
 void bro_tensor_ropeApplyBackward(void* dY, void* cosTbl, void* sinTbl, int32_t headDim, int32_t numHeads, void* dX);
 void bro_tensor_modulate(void* X, void* scale, void* shift, void* Y);
 void bro_tensor_broadcastMul(void* X, void* v, void* Y);

@@ -1,8 +1,7 @@
 #pragma once
 
-// native_tensor_int8_decl.h — the INT8 / GGUF-quant group of the restored
-// `bro.tensor.*` free-function surface (the QuickJS binding's
-// tensor_bindings_int8.cpp).
+// native_tensor_int8_decl.h — the INT8 / GGUF-quant group of the
+// `bro.tensor.*` free-function surface.
 //
 // Two families live here:
 //   * W8A16 — an INT8 weight matrix paired with a per-output-row FP32 dequant
@@ -54,7 +53,7 @@ void bro_tensor_linearForwardBatchedQ8_0Fp16(void* W_q, uint64_t bias_bits, void
 // quantizeInt8PerRowHost(W_fp16:Uint16Array, out, in) -> Int8Array weights.
 // The matching FP32 per-row scales stay in a thread-local slot the JS wrapper
 // reads back with the call below, so one quantise pass answers both halves of
-// the old `{ weights, scales }` object.
+// the wrapper's `{ weights, scales }` result.
 void bro_tensor_quantizeInt8PerRowHost(const uint16_t* W_fp16, uint32_t W_fp16_len,
                                        int32_t out, int32_t in, bronze_native_buffer* weights_out);
 // The scales of the last quantizeInt8PerRowHost on this thread, as Float32Array.

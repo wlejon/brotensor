@@ -1,7 +1,6 @@
-// native_tensor_conv.cpp — the restored `conv` group, ported from the QuickJS
-// binding (bro's old src/js/tensor_bindings_conv.cpp). Argument order, optional
-// arguments and defaults are the old ones; the brotensor call each body makes
-// is today's `brotensor::` signature, not the old `nngpu::` one.
+// native_tensor_conv.cpp — the `conv` group of bro.tensor: bodies for the 2-D
+// spatial family declared in native_tensor_conv_decl.h, each calling the
+// matching `brotensor::` op.
 //
 // Everything here is a free function on `bro.tensor`; js/tensor_conv.js is the
 // wrapper half that validates arguments and reads the error slot back.
@@ -298,7 +297,7 @@ void bro_tensor_windowReverseForward(void* X, int32_t N, int32_t C, int32_t H, i
     BROTENSOR_API_CATCH("windowReverseForward")
 }
 
-// channelMajor false (the old binding's default) = block-major
+// channelMajor false (the default) = block-major
 // c_out = block*C + c_in (Qwen-VL); true = torch pixel_unshuffle ordering.
 void bro_tensor_spatialMerge2x2Forward(void* X, int32_t N, int32_t C, int32_t H, int32_t W,
                                        void* Y, bool channelMajor) {

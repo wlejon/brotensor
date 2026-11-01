@@ -1,18 +1,12 @@
 #pragma once
 
-// native_tensor_misc_decl.h — the "misc" group of the restored QuickJS
-// `bro.tensor.*` free-function surface: the gated-deltanet L2 norm pair, three
-// loss entry points that the fused-loss family in native_tensor_nn.cpp left
-// behind, and the diffusion sampler steps + sinusoidal timestep embedding.
-//
-// Ported from the old bindings in
-//   src/js/tensor_bindings_activations.cpp  (l2Norm*, bceWithLogitsFusedBatched,
-//                                             softmaxXentSegment, mseScalar)
-//   src/js/tensor_bindings_diffusion.cpp    (ddimStep, eulerStep, dpmpp2mStep,
-//                                             timestepEmbedding)
-// keeping the old argument order, optional arguments and defaults. The old
-// `nngpu::` ops are today's `brotensor::` ops in ops/norm.h, ops/loss.h and
-// ops/diffusion.h.
+// native_tensor_misc_decl.h — the "misc" group of the `bro.tensor.*`
+// free-function surface: the gated-deltanet L2 norm pair (l2Norm*), three
+// loss entry points that the fused-loss family in native_tensor_nn.cpp does
+// not cover (bceWithLogitsFusedBatched, softmaxXentSegment, mseScalar), and
+// the diffusion sampler steps + sinusoidal timestep embedding (ddimStep,
+// eulerStep, dpmpp2mStep, timestepEmbedding). The bodies call the
+// `brotensor::` ops in ops/norm.h, ops/loss.h and ops/diffusion.h.
 
 #include <stdbool.h>
 #include <stdint.h>

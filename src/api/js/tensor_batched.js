@@ -1,4 +1,4 @@
-// tensor_batched.js — the restored "batched" slice of bro.tensor: the B-row
+// tensor_batched.js — the "batched" slice of bro.tensor: the B-row
 // batched dense / activation forwards (linearForwardBatched,
 // linearForwardBatchedFp16, reluForwardBatched, tanhForwardBatched,
 // addInplaceBatched), their training backwards (linearBackwardBatched,
@@ -7,8 +7,7 @@
 // its training caches (layernormForwardBatchedWithCaches,
 // layernormBackwardBatchedWithCaches).
 //
-// Signatures are the QuickJS binding's (tensor_bindings.cpp): same argument
-// order, same optionality — `bias|null` on linearForwardBatchedFp16 is the one
+// `bias|null` on linearForwardBatchedFp16 is the one
 // nullable slot, and it crosses to the native as a raw value, so every
 // argument is checked here. Hand-written like js/tensor.js and js/tensor_ext.js
 // and compiled into its own module (bronze_tensor_batched_main), mounted by

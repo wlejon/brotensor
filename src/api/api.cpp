@@ -149,7 +149,7 @@ bool registerTensorNatives(std::string* error) {
         fn("__bro_native.tensor.randBernoulli", p(&bro_tensor_randBernoulli), "void", {"f64", dyn, dyn, kTensorCls}, error) &&
         fn("__bro_native.tensor.randnTruncated", p(&bro_tensor_randnTruncated), "void", {"f64", "f64", dyn, dyn, kTensorCls}, error) &&
         fn("__bro_native.tensor.xavierInit", p(&bro_tensor_xavierInit), "f64", {kTensorCls, dyn}, error) &&
-        // restored dense / loss / concat
+        // dense / loss / concat (native_tensor_nn.cpp)
         fn("__bro_native.tensor.cast", p(&bro_tensor_cast), "void", {kTensorCls, kTensorCls, "str"}, error) &&
         fn("__bro_native.tensor.softmaxForwardMasked", p(&bro_tensor_softmaxForwardMasked), "void", {kTensorCls, kTensorCls, dyn}, error) &&
         fn("__bro_native.tensor.layernormForward", p(&bro_tensor_layernormForward), "f64[]", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, kTensorCls, "f64"}, error) &&
@@ -283,7 +283,7 @@ bool registerTensorNatives(std::string* error) {
         fn("__bro_native.tensor.sgdStep", p(&bro_tensor_sgdStep), "void", {kTensorCls, kTensorCls, kTensorCls, "f64", "f64"}, error) &&
         fn("__bro_native.tensor.adamStep", p(&bro_tensor_adamStep), "void", {kTensorCls, kTensorCls, kTensorCls, kTensorCls, "f64", "f64", "f64", "f64", "i32"}, error);
 
-    // The restored free-function groups: each native file owns its own table
+    // The free-function groups: each native file owns its own table
     // so the files stay readable (see native_register.h).
     ok = ok &&
         registerTensorNatives_batched(error) &&
@@ -306,7 +306,7 @@ void installTensorJS() {
     // loss / concat family and reads GpuTensor for its argument checks.
     ev::runEntry(bronze_tensor_main);
     ev::runEntry(bronze_tensor_ext_main);
-    // The restored groups decorate the same namespace and read GpuTensor for
+    // The per-group modules decorate the same namespace and read GpuTensor for
     // their argument checks, so they all run after those two.
     ev::runEntry(bronze_tensor_batched_main);
     ev::runEntry(bronze_tensor_attn2_main);

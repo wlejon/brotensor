@@ -96,12 +96,12 @@ else()
     # One compiled module per file, one entry symbol each, mounted in this
     # order by installTensorJS: js/tensor.js (bro.tensor, GpuTensor, the dense
     # / elementwise / conv surface, safetensors, RNG), js/tensor_ext.js (the
-    # attention family, losses, pooling, concat), then the restored groups —
+    # attention family, losses, pooling, concat), then the per-group modules —
     # batched dense + gather/scatter/topK, the second attention family
     # (decomposed rel-pos, varlen flash, gated delta rule, mrope), the audio /
     # 1-D / spectral family, the 2-D conv + pooling + batch-norm family, the
     # GGUF-quant + INT8-W8A16 family and the l2/bce/diffusion-sampler
-    # leftovers, and last the ops that never had a binding (js/tensor_extra.js).
+    # leftovers, and last the remaining ops (js/tensor_extra.js).
     # Split so each file stays readable; they all read the same host
     # globals and the same native manifest.
     set(BROTENSOR_COMPILED_JS_OBJECTS "")

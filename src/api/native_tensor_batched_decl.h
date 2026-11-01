@@ -1,14 +1,12 @@
 #pragma once
 
-// native_tensor_batched_decl.h — the C entry points of the restored "batched"
+// native_tensor_batched_decl.h — the C entry points of the "batched"
 // group: the B-row batched dense / activation forwards and backwards, the row
 // gather / scatter / top-k primitives, and batched LayerNorm with its training
 // caches. Bodies in native_tensor_batched.cpp, JS wrappers in
 // js/tensor_batched.js, registration table at the bottom of the .cpp.
 //
-// The JS signatures in the comments are the QuickJS binding's
-// (bro-quickjs-oracle src/js/tensor_bindings.cpp) — same argument order, same
-// optionality. A `|null` slot crosses as `dynamic` (the raw Value bits).
+// The comments give each entry point's JS signature. A `|null` slot crosses as `dynamic` (the raw Value bits).
 
 #include <stdbool.h>
 #include <stdint.h>

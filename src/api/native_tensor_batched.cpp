@@ -1,8 +1,7 @@
-// native_tensor_batched.cpp — bodies for the restored "batched" group.
+// native_tensor_batched.cpp — bodies for the "batched" group, each calling
+// the matching op under include/brotensor/ops/.
 //
-// Ported from the QuickJS binding (bro-quickjs-oracle
-// src/js/tensor_bindings.cpp, `nngpu::` namespace) onto the op signatures that
-// exist today under include/brotensor/ops/. A native is called straight from
+// A native is called straight from
 // generated code, so nothing may unwind out of one: every body that reaches
 // into brotensor is wrapped in BROTENSOR_API_TRY / BROTENSOR_API_CATCH, which
 // records the message for js/tensor_batched.js to throw after the call.

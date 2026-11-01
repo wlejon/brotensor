@@ -180,8 +180,8 @@ static void run_js(const char* name, const std::string& script) {
     }
 }
 
-// The methods the port had stubbed or narrowed (the tensor rows of the static
-// handler diff), each against the old binding's contract.
+// Contract checks for safetensors IO, the RNG family, download / dtype
+// overloads and the dense / loss / concat ops.
 
 static long current_pid() {
 #ifdef _WIN32
@@ -334,7 +334,7 @@ static void test_js_safetensors() {
 }
 
 // randn / randUniform / randBernoulli / randnTruncated / xavierInit: the
-// counter-based RNG family (randn was a stub that only threw).
+// counter-based RNG family.
 static void test_js_rng() {
     run_js("test_js_rng", R"JS(
     (function() {
@@ -441,8 +441,7 @@ static void test_js_download_and_dtypes() {
     )JS");
 }
 
-// layernormForward's {mean, rstd} (was a constant stub), softmaxForward's
-// mask argument (the port had replaced it with a temperature), masked
+// layernormForward's {mean, rstd}, softmaxForward's mask argument, masked
 // mean-pool, the fused softmax + cross-entropy loss, concat / split.
 static void test_js_restored_ops() {
     run_js("test_js_restored_ops", R"JS(
@@ -685,7 +684,7 @@ int main() {
     test_js_restored_ops();
     test_js_attention();
 
-    // The restored free-function groups keep their checks beside themselves.
+    // The free-function groups keep their checks beside themselves.
     g_failures += run_api_batched_tests();
     g_failures += run_api_attn2_tests();
     g_failures += run_api_audio_tests();

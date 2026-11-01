@@ -1,7 +1,7 @@
 #pragma once
 
-// native_tensor_extra_decl.h — the brotensor ops that had no JS binding at all
-// (neither in the QuickJS binding nor in the bronze port). Bodies in
+// native_tensor_extra_decl.h — the brotensor ops outside the other groups.
+// Bodies in
 // native_tensor_extra.cpp (elementwise / reduction / index + the INT32
 // upload/download pair), native_tensor_extra_nn.cpp (dense, LSTM, attention,
 // RoPE) and native_tensor_extra_conv.cpp (StyleGAN3-R, deformable conv,

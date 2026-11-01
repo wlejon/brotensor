@@ -7,9 +7,9 @@
 // identifiers are listed in module.globals beside it.
 //
 // Errors: a native cannot throw, so one that fails records a message the
-// wrapper reads back with __bro_native.tensor.takeError() and throws. The
-// wrappers written since the port do that after every call (`chk()`); the
-// older ones below still trust their natives.
+// wrapper reads back with __bro_native.tensor.takeError() and throws. Most
+// wrappers do that after every call (`chk()`); the ones below without a
+// `chk()` trust their natives.
 //
 // The attention family, losses, pooling and concat live in js/tensor_ext.js,
 // a second compiled module mounted right after this one (api.cpp
@@ -47,7 +47,7 @@
         undefined);
     const DTYPES = { fp32: 0, fp16: 1, int8: 2, int32: 3, bf16: 4, f64: 5 };
     fn(ns_tensor, "dtype", DTYPES);
-    // A dtype argument the way the old binding took it: a name ("fp32"/"f32",
+    // A dtype argument: a name ("fp32"/"f32",
     // "fp16"/"f16", "bf16", "int8"/"i8", ...), a bro.tensor.dtype enum value,
     // or nothing (the default). Numbers map back to the name the native reads.
     const DTYPE_NAMES = ["fp32", "fp16", "int8", "int32", "bf16", "f64"];
@@ -258,9 +258,9 @@
         if (dX === undefined) throw new TypeError("bro.tensor.gegluExactBackward: dX is required");
         __bro_native.tensor.gegluExactBackward(X, dY, dX); chk();
     });
-    // softmaxForward(logits, probs, mask|null): the old third argument is a
-    // length-N FP32 GpuTensor key mask (1 valid / 0 invalid). A number there
-    // is the temperature the port introduced, kept for callers of that form.
+    // softmaxForward(logits, probs, mask|null): the third argument is a
+    // length-N FP32 GpuTensor key mask (1 valid / 0 invalid), or a number,
+    // which is a softmax temperature.
     fn(ns_tensor, "softmaxForward", function softmaxForward(logits, probs, maskOrTemp) {
         if (logits === undefined || probs === undefined) throw new TypeError("bro.tensor.softmaxForward: logits, probs required");
         if (typeof maskOrTemp === "number") {
@@ -778,8 +778,7 @@
     });
     // download()    -> a fresh Float32Array (any dtype, converted to FP32).
     // download(dst) -> fills the Float32Array `dst` in place and returns it;
-    //                  dst.length must be >= size. The old binding's dst was a
-    //                  bro.ai host tensor, a type this runtime no longer has.
+    //                  dst.length must be >= size.
     fn(GpuTensor.prototype, "download", function download(dst) {
         if (dst === undefined || dst === null) {
             const out = __bro_native.tensor.GpuTensor_download(this);
@@ -834,8 +833,8 @@
         __bro_native.tensor.randnTruncated(+lo, +hi, seed(key, "randnTruncated"), seed(counter, "randnTruncated"), Y);
         chk();
     });
-    // xavierInit(W, rngState) -> the advanced state (a Number; the old binding
-    // answered a BigInt). Thread it through successive inits.
+    // xavierInit(W, rngState) -> the advanced state (a Number). Thread it
+    // through successive inits.
     fn(ns_tensor, "xavierInit", function xavierInit(W, rngState) {
         if (!(W instanceof GpuTensor)) throw new TypeError("xavierInit(W, rngState): W must be a GpuTensor");
         const next = __bro_native.tensor.xavierInit(W, seed(rngState, "xavierInit"));

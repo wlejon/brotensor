@@ -2,7 +2,7 @@
 
 // Shared harness for the bro.tensor JS API tests.
 //
-// test_api.cpp owns main() and the realm; each restored group keeps its own
+// test_api.cpp owns main() and the realm; each free-function group keeps its own
 // checks in tests/test_api_<group>.cpp, exposing one
 // `int run_api_<group>_tests()` that answers the number of failed assertions.
 // main() sums them. The group files link into the same brotensor_test_api
@@ -34,7 +34,7 @@ inline int runJs(const char* name, const std::string& script) {
 
 } // namespace brotensor_api_test
 
-// Every restored group's entry point (defined in tests/test_api_<group>.cpp).
+// Every group's entry point (defined in tests/test_api_<group>.cpp).
 int run_api_batched_tests();
 int run_api_attn2_tests();
 int run_api_audio_tests();

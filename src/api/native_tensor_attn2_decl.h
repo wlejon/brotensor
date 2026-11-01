@@ -1,7 +1,6 @@
 #pragma once
 
-// The second attention family of bro.tensor, restored from the QuickJS
-// binding (tensor_bindings_attention.cpp): the SAM / ViTDet decomposed 2D
+// The second attention family of bro.tensor: the SAM / ViTDet decomposed 2D
 // rel-pos self-attention (global + windowed), packed variable-length flash
 // attention (forward + backward), the Qwen3-Next gated delta rule (chunked +
 // step) and Qwen-VL M-RoPE.
@@ -11,8 +10,8 @@
 //   - a nullable GpuTensor crosses as `uint64_t <name>_bits` (registered
 //     "dynamic") and resolves with tensorFromValue() / the file-local
 //     idxPtr() for the INT32 index buffers,
-//   - the cu_seqlens / M-RoPE position streams keep the old binding's
-//     "GpuTensor viewed as INT32 device storage" convention (the ops take a
+//   - the cu_seqlens / M-RoPE position streams are a GpuTensor viewed as
+//     INT32 device storage (the ops take a
 //     `const int32_t*` that is a device pointer on CUDA/Metal and a host
 //     pointer on CPU), exactly like embeddingLookupForward's idx.
 

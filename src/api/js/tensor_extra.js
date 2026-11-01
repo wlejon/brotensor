@@ -1,5 +1,5 @@
-// tensor_extra.js — the brotensor ops that never had a JS binding (neither in
-// the QuickJS binding nor in the bronze port). Compiled into its own module
+// tensor_extra.js — the brotensor ops outside the other slices. Compiled into
+// its own module
 // (bronze_tensor_extra_main) that api.cpp mounts last, so `bro.tensor` and
 // `bro.tensor.GpuTensor` already exist here. Every wrapper checks its own
 // arguments and reads the native's error back after the call.

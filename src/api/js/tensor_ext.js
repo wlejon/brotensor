@@ -5,12 +5,11 @@
 // module (bronze_tensor_ext_main) that api.cpp mounts right after it, so
 // `bro.tensor` and `bro.tensor.GpuTensor` already exist here.
 //
-// Signatures are the QuickJS binding's (tensor_bindings.cpp,
-// tensor_bindings_attention.cpp): `mask|null` slots take a length-N FP32
+// `mask|null` slots take a length-N FP32
 // GpuTensor or null, the projection biases and the optional gradient outputs
 // take a GpuTensor or null, and the three options-object entry points
-// (flashAttentionQkvoBackward, resblockForward, resblockBackward) keep their
-// object form. Every wrapper checks its arguments here, because the natives
+// (flashAttentionQkvoBackward, resblockForward, resblockBackward) take an
+// options object. Every wrapper checks its arguments here, because the natives
 // receive nullable slots as raw values, and reads back the native's error
 // after the call (native_tensor_decl.h takeError).
 (function () {

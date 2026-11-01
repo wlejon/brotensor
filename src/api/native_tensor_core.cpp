@@ -301,8 +301,8 @@ bool bro_tensor_available_get(void) {
     return true;
 }
 
-// The old binding published a lowercase identifier ("cuda" | "metal" |
-// "unknown"), and everything written against bro.tensor compares against one:
+// bro.tensor.backend is a lowercase identifier ("cuda" | "metal" | ...), and
+// everything written against bro.tensor compares against one:
 // js/tensor.js falls back to "cpu", the docs spell the values lowercase and
 // every caller gates with `backend === "cpu"` / `!== "cpu"`. device_name()
 // answers a display name ("CPU", "CUDA", "Metal", "CUDA:1"), so lower-case it

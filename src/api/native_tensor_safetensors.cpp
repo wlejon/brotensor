@@ -1,5 +1,5 @@
 // bro.tensor.openSafetensors / saveSafetensors and the SafetensorsFile
-// handle, ported from the QuickJS binding (tensor_bindings_safetensors.cpp):
+// handle:
 //
 //   openSafetensors(path) -> handle        (mmap; header only, no payload read)
 //     handle.count / names() / header() / get(name, rows?, cols?, dtype?) / close()
@@ -165,8 +165,8 @@ double bro_tensor_SafetensorsFile_nbytesAt(void* self, int32_t i) {
     return tv ? static_cast<double>(tv->nbytes) : 0.0;
 }
 
-// get(name, rows, cols, mode): the old body's shape rule — an explicit
-// (rows, cols) pair when both were numbers, else (shape[0], numel/shape[0]);
+// get(name, rows, cols, mode): the shape is an explicit (rows, cols) pair
+// when both are numbers, else (shape[0], numel/shape[0]);
 // mode "compute" -> upload_compute, "fp16" -> upload_fp16, anything else ->
 // upload (the file's own dtype).
 void* bro_tensor_SafetensorsFile_get(void* self, const char* name, int32_t rows, int32_t cols, const char* mode) {

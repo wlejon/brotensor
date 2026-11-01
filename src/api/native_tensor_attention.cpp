@@ -1,6 +1,5 @@
-// The attention family of bro.tensor, ported from the QuickJS binding
-// (tensor_bindings.cpp: attention/mha; tensor_bindings_attention.cpp: self /
-// cross / bias attention, the flash-attention family, resblock). Every
+// The attention family of bro.tensor: attention / mha, self / cross / bias
+// attention, the flash-attention family, resblock. Every
 // nullable tensor (mask|null, the projection biases, Ctx|null, the optional
 // gradient outputs) crosses as `dynamic`; js/tensor_ext.js has already
 // checked each one is null or a GpuTensor, and unpacks the options-object

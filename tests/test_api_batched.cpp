@@ -1,4 +1,4 @@
-// test_api_batched.cpp — JS-level checks for the restored "batched" group of
+// test_api_batched.cpp — JS-level checks for the "batched" group of
 // bro.tensor (src/api/js/tensor_batched.js over
 // src/api/native_tensor_batched.cpp).
 //

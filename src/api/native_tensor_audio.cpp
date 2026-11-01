@@ -1,5 +1,5 @@
-// native_tensor_audio.cpp — restored from the QuickJS binding
-// (src/js/tensor_bindings_audio.cpp): the spectral / FFT core, the complex
+// native_tensor_audio.cpp — the first half of bro.tensor's audio group: the
+// spectral / FFT core, the complex
 // helpers and STFT / iSTFT. The rest of the group's bodies live in
 // native_tensor_audio_b.cpp; the registration table at the bottom of this file
 // registers both halves.

@@ -1,7 +1,7 @@
-// test_api_conv.cpp — the restored `conv` group of bro.tensor, exercised
+// test_api_conv.cpp — the `conv` group of bro.tensor, exercised
 // through the JS surface (js/tensor_conv.js -> native_tensor_conv.cpp).
 //
-// Every restored function is called; where a numeric answer is cheap to write
+// Every function in the group is called; where a numeric answer is cheap to write
 // down by hand (a padded 2x2 map, a max over a known 2x2, an adaptive pool to
 // 1x1 = the mean, a unit-scale batch-norm inference, a 1x1 conv3d) the test
 // pins the values, not just the shape. Nothing here is FP16 / INT8, and all 22

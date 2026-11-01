@@ -1,12 +1,11 @@
-// tensor_conv.js — the restored 2-D spatial family of bro.tensor: interp2d
+// tensor_conv.js — the 2-D spatial family of bro.tensor: interp2d
 // backward, pad2d / slice2d, max-pool + adaptive-avg-pool, transposed conv,
 // conv3d, the Swin/SAM/Qwen-VL window + patch-merge gathers, batch-norm
 // (train / backward / inference) and the two image-preprocessing helpers.
 //
-// Signatures are the QuickJS binding's (tensor_bindings_conv.cpp): the same
-// positional order, the same `bias|null` slots and the same defaults for the
-// stride / pad / dilation / groups tail (stride 1, pad 0, output-pad 0,
-// dilation 1, groups 1). Compiled into its own module
+// Positional arguments; `bias|null` slots take a GpuTensor or null, and the
+// stride / pad / dilation / groups tail defaults to stride 1, pad 0,
+// output-pad 0, dilation 1, groups 1. Compiled into its own module
 // (bronze_tensor_conv_main) and mounted after js/tensor.js + js/tensor_ext.js,
 // so `bro.tensor` and `bro.tensor.GpuTensor` already exist here.
 //
@@ -37,7 +36,7 @@
         return v;
     };
     // A Uint8Array of packed image bytes (a plain array of byte values is
-    // accepted and copied, the way the old binding's typed-array read was).
+    // accepted and copied).
     const u8 = (v, label, name) => {
         if (v instanceof Uint8Array) return v;
         if (Array.isArray(v)) return Uint8Array.from(v);

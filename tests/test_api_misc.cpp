@@ -1,4 +1,4 @@
-// test_api_misc.cpp — JS-level checks for the "misc" restored group:
+// test_api_misc.cpp — JS-level checks for the "misc" group:
 // l2NormForward / l2NormBackward, bceWithLogitsFusedBatched,
 // softmaxXentSegment, mseScalar, ddimStep, eulerStep, dpmpp2mStep and
 // timestepEmbedding. All nine are cheap to pin down numerically, so each is

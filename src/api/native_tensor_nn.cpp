@@ -430,7 +430,7 @@ void bro_tensor_adamStep(void* param, void* grad, void* m, void* v, double lr, d
     BROTENSOR_API_CATCH(L)
 }
 
-// ---- restored from the QuickJS binding (tensor_bindings.cpp) ---------------
+// ---- dense / loss / concat --------------------------------------------------
 
 void bro_tensor_cast(void* src, void* dst, const char* outDtype) {
     auto* st = toTensor(src);
@@ -441,7 +441,7 @@ void bro_tensor_cast(void* src, void* dst, const char* outDtype) {
     BROTENSOR_API_CATCH("cast")
 }
 
-// softmaxForward(logits, probs, mask|null): the old third argument.
+// softmaxForward(logits, probs, mask|null): the GpuTensor-mask form.
 void bro_tensor_softmaxForwardMasked(void* logits, void* probs, uint64_t mask_bits) {
     auto* lt = toTensor(logits);
     auto* pt = toTensor(probs);
@@ -516,8 +516,7 @@ double bro_tensor_softmaxXentFused(void* logits, void* target, uint64_t mask_bit
     return 0.0;
 }
 
-// The head_offsets GpuTensor is a device INT32 buffer (cumulative, n_heads+1),
-// the old binding's convention.
+// The head_offsets GpuTensor is a device INT32 buffer (cumulative, n_heads+1).
 void bro_tensor_softmaxXentFusedBatched(void* logits_BL, void* target_BL, uint64_t mask_bits, void* headOffsets, int32_t nHeads, void* probs_BL, void* dLogits_BL, void* lossPerSample) {
     const char* L = "softmaxXentFusedBatched";
     if (!need(L, {logits_BL, target_BL, headOffsets, probs_BL, dLogits_BL, lossPerSample})) return;
@@ -690,9 +689,9 @@ void bro_tensor_randnTruncated(double lo, double hi, uint64_t key_bits, uint64_t
     BROTENSOR_API_CATCH("randnTruncated")
 }
 
-// xavierInit(W, rngState) -> advanced state. The old binding returned a
-// BigInt; the embed API mints no BigInt, so the state comes back as a Number
-// (exact below 2^53 — thread it through successive inits as before).
+// xavierInit(W, rngState) -> advanced state. The embed API mints no BigInt,
+// so the state comes back as a Number (exact below 2^53 — thread it through
+// successive inits).
 double bro_tensor_xavierInit(void* W, uint64_t state_bits) {
     uint64_t state = bronze::embed::toUint64(bronze::Value{state_bits});
     auto* wt = toTensor(W);

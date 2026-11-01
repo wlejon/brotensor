@@ -5,10 +5,8 @@
 // (bronze_tensor_int8_main) that api.cpp mounts after js/tensor.js, so
 // `bro.tensor` and `bro.tensor.GpuTensor` already exist here.
 //
-// Signatures are the QuickJS binding's (tensor_bindings_int8.cpp): the
-// argument order, the optional slots and their defaults are unchanged, and the
-// two entry points that took an options object (resblockForwardInt8wFp16,
-// flashAttentionQkvoInt8wFp16) keep that object form. Every wrapper checks its
+// Two entry points take an options object (resblockForwardInt8wFp16,
+// flashAttentionQkvoInt8wFp16); the rest are positional. Every wrapper checks its
 // arguments here — the natives receive the nullable slots as raw values — and
 // reads back the native's error after the call.
 //

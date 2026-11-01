@@ -2,7 +2,7 @@
 
 // Shared registration helpers for the per-group native files.
 //
-// api.cpp registers the core surface itself; each restored group
+// api.cpp registers the core surface itself; each free-function group
 // (native_tensor_batched.cpp, native_tensor_audio*.cpp, native_tensor_conv.cpp,
 // native_tensor_int8.cpp, native_tensor_misc.cpp, native_tensor_attention2.cpp)
 // owns a `registerTensorNatives_<group>()` that api.cpp chains onto the core

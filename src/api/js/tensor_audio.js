@@ -10,10 +10,9 @@
 // stored interleaved [re, im, re, im, ...] — an (R, 2*C) tensor — so no new
 // dtype is involved. Activations in the conv family are NCL: (N, C*L).
 //
-// Signatures are the QuickJS binding's (tensor_bindings_audio.cpp) — same
-// argument order, same `bias|null` / `beta|null` slots, same defaults for the
-// hyperparameters the old bodies initialised (stride 1, padding 0, dilation 1,
-// groups 1, output padding 0, mode 0, elu alpha 1, leaky slope 0.01). Compiled
+// `bias|null` / `beta|null` slots take a GpuTensor or null, and the
+// hyperparameters default to stride 1, padding 0, dilation 1, groups 1,
+// output padding 0, mode 0, elu alpha 1, leaky slope 0.01. Compiled
 // into its own module (bronze_tensor_audio_main) that api.cpp mounts after
 // js/tensor.js and js/tensor_ext.js, so bro.tensor and bro.tensor.GpuTensor
 // already exist here. Every wrapper checks its arguments (the natives receive

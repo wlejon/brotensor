@@ -1,8 +1,7 @@
 #pragma once
 
-// native_tensor_conv_decl.h — the restored `conv` group: the 2-D spatial
-// family the QuickJS binding exposed under bro.tensor (tensor_bindings_conv.cpp)
-// and the bronze port had not carried over yet — interp2d backward, pad2d /
+// native_tensor_conv_decl.h — the `conv` group: the 2-D spatial family of
+// bro.tensor — interp2d backward, pad2d /
 // slice2d, max-pool / adaptive-avg-pool, transposed conv, conv3d, the
 // Swin/SAM/Qwen-VL window + patch-merge gathers, batch-norm (train / backward /
 // inference) and the two image-preprocessing helpers.

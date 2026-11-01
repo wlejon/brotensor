@@ -1,7 +1,7 @@
-// native_tensor_misc.cpp — bodies for the "misc" restored group: the
+// native_tensor_misc.cpp — bodies for the "misc" group: the
 // gated-deltanet L2 norm pair, three remaining loss entry points and the
 // diffusion sampler steps + timestep embedding. See native_tensor_misc_decl.h
-// for the provenance of each function and native_tensor_nn.cpp for the
+// for the ops each function calls and native_tensor_nn.cpp for the
 // mechanism these bodies copy (need() / BROTENSOR_API_TRY / the error slot).
 
 #include "native_tensor_misc_decl.h"
@@ -65,7 +65,7 @@ void bro_tensor_bceWithLogitsFusedBatched(void* logits_BL, void* target_BL, uint
 
 // Host buffers: the op takes raw `const float*` / `float*` (CPU-only), so the
 // four arrays cross as f32[] pairs and probs / dLogits are written in place.
-// An empty mask array is "no mask" — the old binding's `mask|null`.
+// An empty mask array is "no mask" (the wrapper's `mask|null`).
 double bro_tensor_softmaxXentSegment(const float* logits, uint32_t logits_len,
                                      const float* target, uint32_t target_len,
                                      float* probs, uint32_t probs_len,
