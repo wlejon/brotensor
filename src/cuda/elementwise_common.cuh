@@ -58,22 +58,19 @@ struct FastDivmodU32 {
             is_pow2 = 1u;
             return;
         }
-        const int prec = (pre_shift > 0u) ? 31 : 32;
-        const std::uint64_t two_n_m1 = 1ULL << (prec - 1);
-        const std::uint64_t nc = ((two_n_m1 + ((std::uint64_t(u) - 1ULL) & 1ULL)) / u) * u - 1ULL;
-        for (int p = 0; p <= 32; ++p) {
-            const std::uint64_t pow_p = 1ULL << p;
-            if (two_n_m1 * pow_p > nc * (u - 1ULL - (two_n_m1 * pow_p - 1ULL) % u)) {
-                const std::uint64_t e = u - 1ULL - (two_n_m1 * pow_p - 1ULL) % u;
-                const std::uint64_t m_full = (two_n_m1 * pow_p + e) / u;
-                if (m_full < (1ULL << 32)) {
-                    mul = static_cast<std::uint32_t>(m_full);
-                    post_shift = static_cast<std::uint32_t>(p);
-                } else {
-                    mul = 0u;
-                }
-                return;
-            }
+        // Round-up multiplier (Granlund & Montgomery 1994, thm 4.2): with
+        // m = ceil(2^(32+l) / u), floor(n / u) == (n * m) >> (32 + l) for every
+        // 32-bit n when m * u - 2^(32+l) <= 2^l. l = floor(log2 u) keeps m under
+        // 2^32 so __umulhi takes it; an odd u failing the bound divides plainly.
+        std::uint32_t l = 0u;
+        while ((2u << l) <= u) ++l;
+        const std::uint64_t two = 1ULL << (32u + l);
+        const std::uint64_t m = (two + u - 1ULL) / u;
+        if (m < (1ULL << 32) && m * u - two <= (1ULL << l)) {
+            mul = static_cast<std::uint32_t>(m);
+            post_shift = l;
+        } else {
+            mul = 0u;
         }
     }
 
