@@ -436,7 +436,6 @@ if(BROTENSOR_WITH_CUDA)
     # run at build time). The JIT's driver-API calls go through
     # src/cuda/cuda_driver.cpp, resolved via cudaGetDriverEntryPoint.
     target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart_static)
-    target_include_directories(brotensor_cuda PUBLIC /usr/local/cuda-12.6/targets/x86_64-linux/include)
     if(TARGET brass)
         if(BROTENSOR_BRASS_LIB)
             target_link_libraries(brotensor_cuda PUBLIC "${BROTENSOR_BRASS_LIB}")
