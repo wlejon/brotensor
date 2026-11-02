@@ -171,6 +171,7 @@ add_library(brotensor_cpu STATIC
     src/cpu/ops_impl.cpp
     src/cpu/ops_mha_batched.cpp
     src/cpu/register.cpp
+    src/cpu/register_nn.cpp
     src/cpu/elementwise.cpp
     src/cpu/loss.cpp
     src/cpu/embedding.cpp

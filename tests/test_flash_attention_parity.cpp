@@ -1,6 +1,4 @@
-// CPU<->GPU parity for the flash-attention family + self_attention_forward
-// (CHUNK 6).
-//
+// CPU<->GPU parity for the flash-attention family + self_attention_forward (CHUNK 6).
 //   flash_attention_forward                  — SDPA over pre-projected QKV.
 //   flash_attention_qkvo_forward             — fused QKVO projections + SDPA.
 //   flash_attention_qkvo_backward            — full backward of the above.
@@ -8,22 +6,6 @@
 //   flash_attention_project_kv               — project ctx → K_out, V_out.
 //   flash_attention_q_with_kv_cached_forward — Q projection + cached-KV attn.
 //   self_attention_forward                   — forward-only self-attention.
-//
-// DTYPE NOTES
-//   Every op in this family runs FP16 internally on the GPU and FP32 on the
-//   CPU. We quantise all inputs through FP16 so both backends start from
-//   identical values, feed FP16 to the GPU and FP32 to the CPU, and compare
-//   with a loose FP16-scale tolerance — the same envelope test_flash_attention.cpp
-//   uses (atol 1e-2, rtol 1e-2; relaxed to 2e-2/3e-2 for qkvo, which chains
-//   three FP16 matmuls + softmax).
-//
-// ACCUMULATION
-//   * flash_attention_backward:      dQ/dK/dV OVERWRITTEN.
-//   * flash_attention_qkvo_backward: dX/dCtx OVERWRITTEN; dWq/dWk/dWv/dWo and
-//                                    dbq/dbk/dbv/dbo ACCUMULATE (+=). The
-//                                    weight/bias grad buffers are pre-filled
-//                                    with a non-zero baseline (identical on
-//                                    both backends) to verify accumulation.
 
 #include "parity_helpers.h"
 
@@ -44,14 +26,12 @@ inline float q16(float v) {
     return brotensor::fp16_bits_to_fp32(brotensor::fp32_to_fp16_bits(v));
 }
 
-// CPU FP32 tensor with FP16-quantised random values.
 Tensor make_q16_cpu(int rows, int cols, SplitMix64& rng, float scale) {
     Tensor t = Tensor::mat(rows, cols);
     for (int i = 0; i < t.size(); ++i) t.ptr()[i] = q16(rng.next_unit() * scale);
     return t;
 }
 
-// Upload a CPU FP32 tensor as an FP16 CUDA tensor of the same shape.
 Tensor to_fp16_cuda(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
@@ -59,7 +39,6 @@ Tensor to_fp16_cuda(const Tensor& cpu) {
     return Tensor::from_host_fp16_on(gpu_device(), h.data(), cpu.rows, cpu.cols);
 }
 
-// Download an FP16 CUDA tensor into a CPU FP32 tensor.
 Tensor fp16_cuda_to_cpu(const Tensor& g) {
     brotensor::sync_all();
     std::vector<uint16_t> h = g.to_host_vector_fp16();
@@ -81,15 +60,12 @@ inline float qbf(float v) {
     return brotensor::bf16_bits_to_fp32(brotensor::fp32_to_bf16_bits(v));
 }
 
-// CPU FP32 tensor with BF16-quantised random values (so CPU and GPU start
-// from identical values).
 Tensor make_qbf_cpu(int rows, int cols, SplitMix64& rng, float scale) {
     Tensor t = Tensor::mat(rows, cols);
     for (int i = 0; i < t.size(); ++i) t.ptr()[i] = qbf(rng.next_unit() * scale);
     return t;
 }
 
-// Upload a CPU FP32 tensor as a BF16 CUDA tensor of the same shape.
 Tensor to_bf16_gpu_t(const Tensor& cpu) {
     const int n = cpu.size();
     std::vector<uint16_t> h(static_cast<size_t>(n));
@@ -97,7 +73,6 @@ Tensor to_bf16_gpu_t(const Tensor& cpu) {
     return Tensor::from_host_bf16_on(gpu_device(), h.data(), cpu.rows, cpu.cols);
 }
 
-// Download a BF16 CUDA tensor into a CPU FP32 tensor.
 Tensor bf16_cuda_to_cpu(const Tensor& g) {
     brotensor::sync_all();
     std::vector<uint16_t> h = g.to_host_vector_bf16();
@@ -121,8 +96,7 @@ void run_flash_forward(int Lq, int Lk, int D, int num_heads, uint64_t seed,
     if (use_mask) { mask_host = key_mask(Lk); host_mask = mask_host.data(); }
 
     Tensor O_c;
-    brotensor::flash_attention_forward(Q, K, V, host_mask, num_heads, causal,
-                                       O_c);
+    brotensor::flash_attention_forward(Q, K, V, host_mask, num_heads, causal, O_c);
 
     Tensor gQ = to_fp16_cuda(Q), gK = to_fp16_cuda(K), gV = to_fp16_cuda(V);
     Tensor mg;
@@ -132,24 +106,12 @@ void run_flash_forward(int Lq, int Lk, int D, int num_heads, uint64_t seed,
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO;
-    brotensor::flash_attention_forward(gQ, gK, gV, d_mask, num_heads, causal,
-                                       gO);
+    brotensor::flash_attention_forward(gQ, gK, gV, d_mask, num_heads, causal, gO);
 
     compare_tensors(O_c, fp16_cuda_to_cpu(gO), "flash_fwd.O", 1e-2f, 1e-2f);
 }
 
-// Same op, but with inputs built to exercise the online-softmax rescale.
-//
-// The uniform-random inputs above leave every query row with nearly the same
-// running maximum, and that maximum barely moves after the first key tile — so
-// the per-row correction factor is ~1 everywhere and a kernel that applied one
-// row's correction to every row would still pass. (Confirmed by poisoning the
-// fused kernel's accumulator row map: the whole parity suite stayed green.)
-//
-// Here each query row gets its own magnitude and the keys grow along the
-// sequence, so the running max climbs tile after tile at a rate that differs
-// per row. That makes the correction both materially below 1 and row-specific,
-// which is the only condition under which a wrong row mapping shows up.
+// Exercises online-softmax rescale with per-row magnitudes and growing keys.
 void run_flash_forward_skewed(int Lq, int Lk, int D, int num_heads,
                               uint64_t seed, bool causal) {
     SplitMix64 rng(seed);
@@ -162,8 +124,7 @@ void run_flash_forward_skewed(int Lq, int Lk, int D, int num_heads,
         for (int c = 0; c < D; ++c) Q.ptr()[size_t(i) * D + c] = q16(Q[i * D + c] * s);
     }
     for (int j = 0; j < Lk; ++j) {
-        const float s = q16(0.4f + 3.6f * static_cast<float>(j) /
-                                   static_cast<float>(Lk - 1));
+        const float s = q16(0.4f + 3.6f * static_cast<float>(j) / static_cast<float>(Lk - 1));
         for (int c = 0; c < D; ++c) K.ptr()[size_t(j) * D + c] = q16(K[j * D + c] * s);
     }
 
@@ -172,8 +133,7 @@ void run_flash_forward_skewed(int Lq, int Lk, int D, int num_heads,
 
     Tensor gQ = to_fp16_cuda(Q), gK = to_fp16_cuda(K), gV = to_fp16_cuda(V);
     Tensor gO;
-    brotensor::flash_attention_forward(gQ, gK, gV, nullptr, num_heads, causal,
-                                       gO);
+    brotensor::flash_attention_forward(gQ, gK, gV, nullptr, num_heads, causal, gO);
 
     compare_tensors(O_c, fp16_cuda_to_cpu(gO), "flash_fwd_skewed.O", 1e-2f, 1e-2f);
 }
@@ -194,28 +154,24 @@ void run_qkvo_forward(int Lq, int Lk, int D, int D_ctx, int num_heads,
 
     Tensor bq, bk, bv, bo;
     if (use_bias) {
-        bq = make_q16_cpu(D, 1, rng, 0.2f);
-        bk = make_q16_cpu(D, 1, rng, 0.2f);
-        bv = make_q16_cpu(D, 1, rng, 0.2f);
-        bo = make_q16_cpu(D, 1, rng, 0.2f);
+        bq = make_q16_cpu(D, 1, rng, 0.2f); bk = make_q16_cpu(D, 1, rng, 0.2f);
+        bv = make_q16_cpu(D, 1, rng, 0.2f); bo = make_q16_cpu(D, 1, rng, 0.2f);
     }
 
     std::vector<float> mask_host;
     const float* host_mask = nullptr;
     if (use_mask) { mask_host = key_mask(Lk); host_mask = mask_host.data(); }
 
-    // CPU path.
-    const Tensor* Cx_c  = cross ? &Cx : nullptr;
-    const Tensor* bq_c  = use_bias ? &bq : nullptr;
-    const Tensor* bk_c  = use_bias ? &bk : nullptr;
-    const Tensor* bv_c  = use_bias ? &bv : nullptr;
-    const Tensor* bo_c  = use_bias ? &bo : nullptr;
+    const Tensor* Cx_c = cross ? &Cx : nullptr;
+    const Tensor* bq_c = use_bias ? &bq : nullptr;
+    const Tensor* bk_c = use_bias ? &bk : nullptr;
+    const Tensor* bv_c = use_bias ? &bv : nullptr;
+    const Tensor* bo_c = use_bias ? &bo : nullptr;
     Tensor O_c;
     brotensor::flash_attention_qkvo_forward(
         X, Cx_c, Wq, bq_c, Wk, bk_c, Wv, bv_c, Wo, bo_c,
         host_mask, num_heads, causal, O_c);
 
-    // GPU path.
     Tensor gX = to_fp16_cuda(X);
     Tensor gCx; if (cross) gCx = to_fp16_cuda(Cx);
     Tensor gWq = to_fp16_cuda(Wq), gWk = to_fp16_cuda(Wk),
@@ -269,8 +225,7 @@ void run_project_kv(int Lk, int D, int D_ctx, uint64_t seed, bool use_bias) {
     const Tensor* gbk_p = use_bias ? &gbk : nullptr;
     const Tensor* gbv_p = use_bias ? &gbv : nullptr;
     Tensor gK, gV;
-    brotensor::flash_attention_project_kv(gctx, gWk, gbk_p, gWv, gbv_p,
-                                          gK, gV);
+    brotensor::flash_attention_project_kv(gctx, gWk, gbk_p, gWv, gbv_p, gK, gV);
 
     compare_tensors(K_c, fp16_cuda_to_cpu(gK), "project_kv.K", 1e-2f, 1e-2f);
     compare_tensors(V_c, fp16_cuda_to_cpu(gV), "project_kv.V", 1e-2f, 1e-2f);
@@ -300,8 +255,7 @@ void run_q_cached(int Lq, int Lk, int D, int num_heads, uint64_t seed,
 
     Tensor O_c;
     brotensor::flash_attention_q_with_kv_cached_forward(
-        X, K, V, Wq, bq_c, Wo, bo_c, host_mask, num_heads,
-        /*causal=*/false, O_c);
+        X, K, V, Wq, bq_c, Wo, bo_c, host_mask, num_heads, false, O_c);
 
     Tensor gX = to_fp16_cuda(X), gK = to_fp16_cuda(K), gV = to_fp16_cuda(V);
     Tensor gWq = to_fp16_cuda(Wq), gWo = to_fp16_cuda(Wo);
@@ -317,16 +271,14 @@ void run_q_cached(int Lq, int Lk, int D, int num_heads, uint64_t seed,
     }
     Tensor gO;
     brotensor::flash_attention_q_with_kv_cached_forward(
-        gX, gK, gV, gWq, gbq_p, gWo, gbo_p, d_mask, num_heads,
-        /*causal=*/false, gO);
+        gX, gK, gV, gWq, gbq_p, gWo, gbo_p, d_mask, num_heads, false, gO);
 
     compare_tensors(O_c, fp16_cuda_to_cpu(gO), "q_cached.O", 2e-2f, 3e-2f);
 }
 
 // ─── self_attention_forward parity ────────────────────────────────────────
 
-void run_self_attention(int L, int D, int num_heads, uint64_t seed,
-                        bool use_mask) {
+void run_self_attention(int L, int D, int num_heads, uint64_t seed, bool use_mask) {
     SplitMix64 rng(seed);
     Tensor X  = make_q16_cpu(L, D, rng, 0.3f);
     Tensor Wq = make_q16_cpu(D, D, rng, 0.3f);
@@ -339,14 +291,8 @@ void run_self_attention(int L, int D, int num_heads, uint64_t seed,
     if (use_mask) { mask_host = key_mask(L); host_mask = mask_host.data(); }
 
     Tensor O_c;
-    brotensor::self_attention_forward(X, Wq, Wk, Wv, Wo, host_mask, num_heads,
-                                      O_c);
+    brotensor::self_attention_forward(X, Wq, Wk, Wv, Wo, host_mask, num_heads, O_c);
 
-    // self_attention_forward is the one flash-family op with an FP32 GPU
-    // path: for FP32 input it falls back to mha_forward (which gates masked
-    // query rows), whereas the FP16 path takes the flash route that masks
-    // keys only. The FP32-only CPU op delegates to mha_forward, so parity is
-    // compared FP32<->FP32 — both backends then run the identical mha path.
     Tensor gX = X.to(gpu_device());
     Tensor gWq = Wq.to(gpu_device()), gWk = Wk.to(gpu_device()),
            gWv = Wv.to(gpu_device()), gWo = Wo.to(gpu_device());
@@ -357,8 +303,7 @@ void run_self_attention(int L, int D, int num_heads, uint64_t seed,
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO = Tensor::zeros_on(gpu_device(), L, D);
-    brotensor::self_attention_forward(gX, gWq, gWk, gWv, gWo, d_mask,
-                                      num_heads, gO);
+    brotensor::self_attention_forward(gX, gWq, gWk, gWv, gWo, d_mask, num_heads, gO);
 
     compare_tensors(O_c, download_to_host(gO), "self_attn.O", 1e-4f, 1e-3f);
 }
@@ -377,13 +322,10 @@ void run_flash_backward(int Lq, int Lk, int D, int num_heads, uint64_t seed,
     const float* host_mask = nullptr;
     if (use_mask) { mask_host = key_mask(Lk); host_mask = mask_host.data(); }
 
-    // CPU path. O is recompute-based — pass an empty tensor.
-    Tensor O_dummy;
-    Tensor dQ_c, dK_c, dV_c;
+    Tensor O_dummy, dQ_c, dK_c, dV_c;
     brotensor::flash_attention_backward(Q, K, V, O_dummy, dO, host_mask,
                                         num_heads, causal, dQ_c, dK_c, dV_c);
 
-    // GPU path.
     Tensor gQ = to_fp16_cuda(Q), gK = to_fp16_cuda(K), gV = to_fp16_cuda(V);
     Tensor gdO = to_fp16_cuda(dO);
     Tensor gO_dummy = Tensor::empty_on(gpu_device(), 0, 0, Dtype::FP16);
@@ -421,23 +363,18 @@ void run_qkvo_backward(int Lq, int Lk, int D, int D_ctx, int num_heads,
 
     Tensor bq, bk, bv, bo;
     if (use_bias) {
-        bq = make_q16_cpu(D, 1, rng, 0.2f);
-        bk = make_q16_cpu(D, 1, rng, 0.2f);
-        bv = make_q16_cpu(D, 1, rng, 0.2f);
-        bo = make_q16_cpu(D, 1, rng, 0.2f);
+        bq = make_q16_cpu(D, 1, rng, 0.2f); bk = make_q16_cpu(D, 1, rng, 0.2f);
+        bv = make_q16_cpu(D, 1, rng, 0.2f); bo = make_q16_cpu(D, 1, rng, 0.2f);
     }
 
-    // Non-zero gradient baselines (accumulation contract for weight/bias grads).
     Tensor dWq_init = make_q16_cpu(D, D, rng, 0.1f);
     Tensor dWk_init = make_q16_cpu(D, kv_cols, rng, 0.1f);
     Tensor dWv_init = make_q16_cpu(D, kv_cols, rng, 0.1f);
     Tensor dWo_init = make_q16_cpu(D, D, rng, 0.1f);
     Tensor dbq_init, dbk_init, dbv_init, dbo_init;
     if (use_bias) {
-        dbq_init = make_q16_cpu(D, 1, rng, 0.1f);
-        dbk_init = make_q16_cpu(D, 1, rng, 0.1f);
-        dbv_init = make_q16_cpu(D, 1, rng, 0.1f);
-        dbo_init = make_q16_cpu(D, 1, rng, 0.1f);
+        dbq_init = make_q16_cpu(D, 1, rng, 0.1f); dbk_init = make_q16_cpu(D, 1, rng, 0.1f);
+        dbv_init = make_q16_cpu(D, 1, rng, 0.1f); dbo_init = make_q16_cpu(D, 1, rng, 0.1f);
     }
 
     std::vector<float> mask_host;
@@ -450,20 +387,15 @@ void run_qkvo_backward(int Lq, int Lk, int D, int D_ctx, int num_heads,
     const Tensor* bv_c = use_bias ? &bv : nullptr;
     const Tensor* bo_c = use_bias ? &bo : nullptr;
 
-    // CPU path.
     Tensor dX_c = Tensor::mat(Lq, D);
     Tensor dCtx_c = cross ? Tensor::mat(Lk, D_ctx) : Tensor{};
     Tensor* dCtx_c_p = cross ? &dCtx_c : nullptr;
-    Tensor dWq_c = dWq_init, dWk_c = dWk_init,
-           dWv_c = dWv_init, dWo_c = dWo_init;
+    Tensor dWq_c = dWq_init, dWk_c = dWk_init, dWv_c = dWv_init, dWo_c = dWo_init;
     Tensor dbq_c, dbk_c, dbv_c, dbo_c;
-    Tensor *dbq_cp = nullptr, *dbk_cp = nullptr,
-           *dbv_cp = nullptr, *dbo_cp = nullptr;
+    Tensor *dbq_cp = nullptr, *dbk_cp = nullptr, *dbv_cp = nullptr, *dbo_cp = nullptr;
     if (use_bias) {
-        dbq_c = dbq_init; dbk_c = dbk_init;
-        dbv_c = dbv_init; dbo_c = dbo_init;
-        dbq_cp = &dbq_c; dbk_cp = &dbk_c;
-        dbv_cp = &dbv_c; dbo_cp = &dbo_c;
+        dbq_c = dbq_init; dbk_c = dbk_init; dbv_c = dbv_init; dbo_c = dbo_init;
+        dbq_cp = &dbq_c; dbk_cp = &dbk_c; dbv_cp = &dbv_c; dbo_cp = &dbo_c;
     }
     brotensor::flash_attention_qkvo_backward(
         X, Cx_c, Wq, bq_c, Wk, bk_c, Wv, bv_c, Wo, bo_c,
@@ -471,7 +403,6 @@ void run_qkvo_backward(int Lq, int Lk, int D, int D_ctx, int num_heads,
         dX_c, dCtx_c_p,
         dWq_c, dbq_cp, dWk_c, dbk_cp, dWv_c, dbv_cp, dWo_c, dbo_cp);
 
-    // GPU path.
     Tensor gX = to_fp16_cuda(X);
     Tensor gCx; if (cross) gCx = to_fp16_cuda(Cx);
     Tensor gWq = to_fp16_cuda(Wq), gWk = to_fp16_cuda(Wk),
@@ -500,13 +431,10 @@ void run_qkvo_backward(int Lq, int Lk, int D, int D_ctx, int num_heads,
         gdCtx = Tensor::empty_on(gpu_device(), Lk, D_ctx, Dtype::FP16);
         gdCtx_p = &gdCtx;
     }
-    Tensor gdWq = to_fp16_cuda(dWq_init);
-    Tensor gdWk = to_fp16_cuda(dWk_init);
-    Tensor gdWv = to_fp16_cuda(dWv_init);
-    Tensor gdWo = to_fp16_cuda(dWo_init);
+    Tensor gdWq = to_fp16_cuda(dWq_init), gdWk = to_fp16_cuda(dWk_init),
+           gdWv = to_fp16_cuda(dWv_init), gdWo = to_fp16_cuda(dWo_init);
     Tensor gdbq, gdbk, gdbv, gdbo;
-    Tensor *gdbq_p = nullptr, *gdbk_p = nullptr,
-           *gdbv_p = nullptr, *gdbo_p = nullptr;
+    Tensor *gdbq_p = nullptr, *gdbk_p = nullptr, *gdbv_p = nullptr, *gdbo_p = nullptr;
     if (use_bias) {
         gdbq = to_fp16_cuda(dbq_init); gdbk = to_fp16_cuda(dbk_init);
         gdbv = to_fp16_cuda(dbv_init); gdbo = to_fp16_cuda(dbo_init);
@@ -520,22 +448,16 @@ void run_qkvo_backward(int Lq, int Lk, int D, int D_ctx, int num_heads,
 
     const float atol = 2e-2f, rtol = 3e-2f;
     compare_tensors(dX_c,  fp16_cuda_to_cpu(gdX),  "qkvo_bwd.dX",  atol, rtol);
-    if (cross)
-        compare_tensors(dCtx_c, fp16_cuda_to_cpu(gdCtx),
-                        "qkvo_bwd.dCtx", atol, rtol);
+    if (cross) compare_tensors(dCtx_c, fp16_cuda_to_cpu(gdCtx), "qkvo_bwd.dCtx", atol, rtol);
     compare_tensors(dWq_c, fp16_cuda_to_cpu(gdWq), "qkvo_bwd.dWq", atol, rtol);
     compare_tensors(dWk_c, fp16_cuda_to_cpu(gdWk), "qkvo_bwd.dWk", atol, rtol);
     compare_tensors(dWv_c, fp16_cuda_to_cpu(gdWv), "qkvo_bwd.dWv", atol, rtol);
     compare_tensors(dWo_c, fp16_cuda_to_cpu(gdWo), "qkvo_bwd.dWo", atol, rtol);
     if (use_bias) {
-        compare_tensors(dbq_c, fp16_cuda_to_cpu(gdbq),
-                        "qkvo_bwd.dbq", atol, rtol);
-        compare_tensors(dbk_c, fp16_cuda_to_cpu(gdbk),
-                        "qkvo_bwd.dbk", atol, rtol);
-        compare_tensors(dbv_c, fp16_cuda_to_cpu(gdbv),
-                        "qkvo_bwd.dbv", atol, rtol);
-        compare_tensors(dbo_c, fp16_cuda_to_cpu(gdbo),
-                        "qkvo_bwd.dbo", atol, rtol);
+        compare_tensors(dbq_c, fp16_cuda_to_cpu(gdbq), "qkvo_bwd.dbq", atol, rtol);
+        compare_tensors(dbk_c, fp16_cuda_to_cpu(gdbk), "qkvo_bwd.dbk", atol, rtol);
+        compare_tensors(dbv_c, fp16_cuda_to_cpu(gdbv), "qkvo_bwd.dbv", atol, rtol);
+        compare_tensors(dbo_c, fp16_cuda_to_cpu(gdbo), "qkvo_bwd.dbo", atol, rtol);
     }
 }
 
@@ -553,8 +475,7 @@ void run_flash_forward_bf16(int Lq, int Lk, int D, int num_heads, uint64_t seed,
     if (use_mask) { mask_host = key_mask(Lk); host_mask = mask_host.data(); }
 
     Tensor O_c;
-    brotensor::flash_attention_forward(Q, K, V, host_mask, num_heads, causal,
-                                       O_c);
+    brotensor::flash_attention_forward(Q, K, V, host_mask, num_heads, causal, O_c);
 
     Tensor gQ = to_bf16_gpu_t(Q), gK = to_bf16_gpu_t(K), gV = to_bf16_gpu_t(V);
     Tensor mg;
@@ -564,8 +485,7 @@ void run_flash_forward_bf16(int Lq, int Lk, int D, int num_heads, uint64_t seed,
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO;
-    brotensor::flash_attention_forward(gQ, gK, gV, d_mask, num_heads, causal,
-                                       gO);
+    brotensor::flash_attention_forward(gQ, gK, gV, d_mask, num_heads, causal, gO);
 
     compare_tensors(O_c, bf16_cuda_to_cpu(gO), "flash_fwd.O.bf16", 5e-2f, 5e-2f);
 }
@@ -584,21 +504,19 @@ void run_qkvo_forward_bf16(int Lq, int Lk, int D, int D_ctx, int num_heads,
 
     Tensor bq, bk, bv, bo;
     if (use_bias) {
-        bq = make_qbf_cpu(D, 1, rng, 0.2f);
-        bk = make_qbf_cpu(D, 1, rng, 0.2f);
-        bv = make_qbf_cpu(D, 1, rng, 0.2f);
-        bo = make_qbf_cpu(D, 1, rng, 0.2f);
+        bq = make_qbf_cpu(D, 1, rng, 0.2f); bk = make_qbf_cpu(D, 1, rng, 0.2f);
+        bv = make_qbf_cpu(D, 1, rng, 0.2f); bo = make_qbf_cpu(D, 1, rng, 0.2f);
     }
 
     std::vector<float> mask_host;
     const float* host_mask = nullptr;
     if (use_mask) { mask_host = key_mask(Lk); host_mask = mask_host.data(); }
 
-    const Tensor* Cx_c  = cross ? &Cx : nullptr;
-    const Tensor* bq_c  = use_bias ? &bq : nullptr;
-    const Tensor* bk_c  = use_bias ? &bk : nullptr;
-    const Tensor* bv_c  = use_bias ? &bv : nullptr;
-    const Tensor* bo_c  = use_bias ? &bo : nullptr;
+    const Tensor* Cx_c = cross ? &Cx : nullptr;
+    const Tensor* bq_c = use_bias ? &bq : nullptr;
+    const Tensor* bk_c = use_bias ? &bk : nullptr;
+    const Tensor* bv_c = use_bias ? &bv : nullptr;
+    const Tensor* bo_c = use_bias ? &bo : nullptr;
     Tensor O_c;
     brotensor::flash_attention_qkvo_forward(
         X, Cx_c, Wq, bq_c, Wk, bk_c, Wv, bv_c, Wo, bo_c,
@@ -655,8 +573,7 @@ void run_project_kv_bf16(int Lk, int D, int D_ctx, uint64_t seed, bool use_bias)
     const Tensor* gbk_p = use_bias ? &gbk : nullptr;
     const Tensor* gbv_p = use_bias ? &gbv : nullptr;
     Tensor gK, gV;
-    brotensor::flash_attention_project_kv(gctx, gWk, gbk_p, gWv, gbv_p,
-                                          gK, gV);
+    brotensor::flash_attention_project_kv(gctx, gWk, gbk_p, gWv, gbv_p, gK, gV);
 
     compare_tensors(K_c, bf16_cuda_to_cpu(gK), "project_kv.K.bf16", 5e-2f, 5e-2f);
     compare_tensors(V_c, bf16_cuda_to_cpu(gV), "project_kv.V.bf16", 5e-2f, 5e-2f);
@@ -684,8 +601,7 @@ void run_q_cached_bf16(int Lq, int Lk, int D, int num_heads, uint64_t seed,
 
     Tensor O_c;
     brotensor::flash_attention_q_with_kv_cached_forward(
-        X, K, V, Wq, bq_c, Wo, bo_c, host_mask, num_heads,
-        /*causal=*/false, O_c);
+        X, K, V, Wq, bq_c, Wo, bo_c, host_mask, num_heads, false, O_c);
 
     Tensor gX = to_bf16_gpu_t(X), gK = to_bf16_gpu_t(K), gV = to_bf16_gpu_t(V);
     Tensor gWq = to_bf16_gpu_t(Wq), gWo = to_bf16_gpu_t(Wo);
@@ -701,14 +617,12 @@ void run_q_cached_bf16(int Lq, int Lk, int D, int num_heads, uint64_t seed,
     }
     Tensor gO;
     brotensor::flash_attention_q_with_kv_cached_forward(
-        gX, gK, gV, gWq, gbq_p, gWo, gbo_p, d_mask, num_heads,
-        /*causal=*/false, gO);
+        gX, gK, gV, gWq, gbq_p, gWo, gbo_p, d_mask, num_heads, false, gO);
 
     compare_tensors(O_c, bf16_cuda_to_cpu(gO), "q_cached.O.bf16", 8e-2f, 8e-2f);
 }
 
-void run_self_attention_bf16(int L, int D, int num_heads, uint64_t seed,
-                             bool use_mask) {
+void run_self_attention_bf16(int L, int D, int num_heads, uint64_t seed, bool use_mask) {
     SplitMix64 rng(seed);
     Tensor X  = make_qbf_cpu(L, D, rng, 0.3f);
     Tensor Wq = make_qbf_cpu(D, D, rng, 0.3f);
@@ -720,14 +634,10 @@ void run_self_attention_bf16(int L, int D, int num_heads, uint64_t seed,
     const float* host_mask = nullptr;
     if (use_mask) { mask_host = key_mask(L); host_mask = mask_host.data(); }
 
-    // self_attention_forward FP32 path delegates to mha_forward (gates masked
-    // query rows). The BF16 path takes the flash route (keys only), so we
-    // compare BF16-on-CUDA against the FP32 flash composition by driving the
-    // CPU reference through flash_attention_qkvo_forward (self-attention).
     Tensor O_c;
     brotensor::flash_attention_qkvo_forward(
         X, nullptr, Wq, nullptr, Wk, nullptr, Wv, nullptr, Wo, nullptr,
-        host_mask, num_heads, /*causal=*/false, O_c);
+        host_mask, num_heads, false, O_c);
 
     Tensor gX = to_bf16_gpu_t(X);
     Tensor gWq = to_bf16_gpu_t(Wq), gWk = to_bf16_gpu_t(Wk),
@@ -739,8 +649,7 @@ void run_self_attention_bf16(int L, int D, int num_heads, uint64_t seed,
         d_mask = static_cast<const float*>(mg.data);
     }
     Tensor gO;
-    brotensor::self_attention_forward(gX, gWq, gWk, gWv, gWo, d_mask,
-                                      num_heads, gO);
+    brotensor::self_attention_forward(gX, gWq, gWk, gWv, gWo, d_mask, num_heads, gO);
 
     compare_tensors(O_c, bf16_cuda_to_cpu(gO), "self_attn.O.bf16", 8e-2f, 8e-2f);
 }
@@ -757,8 +666,7 @@ void run_flash_backward_bf16(int Lq, int Lk, int D, int num_heads, uint64_t seed
     const float* host_mask = nullptr;
     if (use_mask) { mask_host = key_mask(Lk); host_mask = mask_host.data(); }
 
-    Tensor O_dummy;
-    Tensor dQ_c, dK_c, dV_c;
+    Tensor O_dummy, dQ_c, dK_c, dV_c;
     brotensor::flash_attention_backward(Q, K, V, O_dummy, dO, host_mask,
                                         num_heads, causal, dQ_c, dK_c, dV_c);
 
@@ -797,10 +705,8 @@ void run_qkvo_backward_bf16(int Lq, int Lk, int D, int D_ctx, int num_heads,
 
     Tensor bq, bk, bv, bo;
     if (use_bias) {
-        bq = make_qbf_cpu(D, 1, rng, 0.2f);
-        bk = make_qbf_cpu(D, 1, rng, 0.2f);
-        bv = make_qbf_cpu(D, 1, rng, 0.2f);
-        bo = make_qbf_cpu(D, 1, rng, 0.2f);
+        bq = make_qbf_cpu(D, 1, rng, 0.2f); bk = make_qbf_cpu(D, 1, rng, 0.2f);
+        bv = make_qbf_cpu(D, 1, rng, 0.2f); bo = make_qbf_cpu(D, 1, rng, 0.2f);
     }
 
     Tensor dWq_init = make_qbf_cpu(D, D, rng, 0.1f);
@@ -809,10 +715,8 @@ void run_qkvo_backward_bf16(int Lq, int Lk, int D, int D_ctx, int num_heads,
     Tensor dWo_init = make_qbf_cpu(D, D, rng, 0.1f);
     Tensor dbq_init, dbk_init, dbv_init, dbo_init;
     if (use_bias) {
-        dbq_init = make_qbf_cpu(D, 1, rng, 0.1f);
-        dbk_init = make_qbf_cpu(D, 1, rng, 0.1f);
-        dbv_init = make_qbf_cpu(D, 1, rng, 0.1f);
-        dbo_init = make_qbf_cpu(D, 1, rng, 0.1f);
+        dbq_init = make_qbf_cpu(D, 1, rng, 0.1f); dbk_init = make_qbf_cpu(D, 1, rng, 0.1f);
+        dbv_init = make_qbf_cpu(D, 1, rng, 0.1f); dbo_init = make_qbf_cpu(D, 1, rng, 0.1f);
     }
 
     std::vector<float> mask_host;
@@ -825,20 +729,15 @@ void run_qkvo_backward_bf16(int Lq, int Lk, int D, int D_ctx, int num_heads,
     const Tensor* bv_c = use_bias ? &bv : nullptr;
     const Tensor* bo_c = use_bias ? &bo : nullptr;
 
-    // CPU reference (FP32).
     Tensor dX_c = Tensor::mat(Lq, D);
     Tensor dCtx_c = cross ? Tensor::mat(Lk, D_ctx) : Tensor{};
     Tensor* dCtx_c_p = cross ? &dCtx_c : nullptr;
-    Tensor dWq_c = dWq_init, dWk_c = dWk_init,
-           dWv_c = dWv_init, dWo_c = dWo_init;
+    Tensor dWq_c = dWq_init, dWk_c = dWk_init, dWv_c = dWv_init, dWo_c = dWo_init;
     Tensor dbq_c, dbk_c, dbv_c, dbo_c;
-    Tensor *dbq_cp = nullptr, *dbk_cp = nullptr,
-           *dbv_cp = nullptr, *dbo_cp = nullptr;
+    Tensor *dbq_cp = nullptr, *dbk_cp = nullptr, *dbv_cp = nullptr, *dbo_cp = nullptr;
     if (use_bias) {
-        dbq_c = dbq_init; dbk_c = dbk_init;
-        dbv_c = dbv_init; dbo_c = dbo_init;
-        dbq_cp = &dbq_c; dbk_cp = &dbk_c;
-        dbv_cp = &dbv_c; dbo_cp = &dbo_c;
+        dbq_c = dbq_init; dbk_c = dbk_init; dbv_c = dbv_init; dbo_c = dbo_init;
+        dbq_cp = &dbq_c; dbk_cp = &dbk_c; dbv_cp = &dbv_c; dbo_cp = &dbo_c;
     }
     brotensor::flash_attention_qkvo_backward(
         X, Cx_c, Wq, bq_c, Wk, bk_c, Wv, bv_c, Wo, bo_c,
@@ -846,7 +745,6 @@ void run_qkvo_backward_bf16(int Lq, int Lk, int D, int D_ctx, int num_heads,
         dX_c, dCtx_c_p,
         dWq_c, dbq_cp, dWk_c, dbk_cp, dWv_c, dbv_cp, dWo_c, dbo_cp);
 
-    // GPU BF16 path.
     Tensor gX = to_bf16_gpu_t(X);
     Tensor gCx; if (cross) gCx = to_bf16_gpu_t(Cx);
     Tensor gWq = to_bf16_gpu_t(Wq), gWk = to_bf16_gpu_t(Wk),
@@ -875,13 +773,10 @@ void run_qkvo_backward_bf16(int Lq, int Lk, int D, int D_ctx, int num_heads,
         gdCtx = Tensor::empty_on(gpu_device(), Lk, D_ctx, Dtype::BF16);
         gdCtx_p = &gdCtx;
     }
-    Tensor gdWq = to_bf16_gpu_t(dWq_init);
-    Tensor gdWk = to_bf16_gpu_t(dWk_init);
-    Tensor gdWv = to_bf16_gpu_t(dWv_init);
-    Tensor gdWo = to_bf16_gpu_t(dWo_init);
+    Tensor gdWq = to_bf16_gpu_t(dWq_init), gdWk = to_bf16_gpu_t(dWk_init),
+           gdWv = to_bf16_gpu_t(dWv_init), gdWo = to_bf16_gpu_t(dWo_init);
     Tensor gdbq, gdbk, gdbv, gdbo;
-    Tensor *gdbq_p = nullptr, *gdbk_p = nullptr,
-           *gdbv_p = nullptr, *gdbo_p = nullptr;
+    Tensor *gdbq_p = nullptr, *gdbk_p = nullptr, *gdbv_p = nullptr, *gdbo_p = nullptr;
     if (use_bias) {
         gdbq = to_bf16_gpu_t(dbq_init); gdbk = to_bf16_gpu_t(dbk_init);
         gdbv = to_bf16_gpu_t(dbv_init); gdbo = to_bf16_gpu_t(dbo_init);
@@ -895,9 +790,7 @@ void run_qkvo_backward_bf16(int Lq, int Lk, int D, int D_ctx, int num_heads,
 
     const float atol = 1e-1f, rtol = 1.5e-1f;
     compare_tensors(dX_c,  bf16_cuda_to_cpu(gdX),  "qkvo_bwd.dX.bf16",  atol, rtol);
-    if (cross)
-        compare_tensors(dCtx_c, bf16_cuda_to_cpu(gdCtx),
-                        "qkvo_bwd.dCtx.bf16", atol, rtol);
+    if (cross) compare_tensors(dCtx_c, bf16_cuda_to_cpu(gdCtx), "qkvo_bwd.dCtx.bf16", atol, rtol);
     compare_tensors(dWq_c, bf16_cuda_to_cpu(gdWq), "qkvo_bwd.dWq.bf16", atol, rtol);
     compare_tensors(dWk_c, bf16_cuda_to_cpu(gdWk), "qkvo_bwd.dWk.bf16", atol, rtol);
     compare_tensors(dWv_c, bf16_cuda_to_cpu(gdWv), "qkvo_bwd.dWv.bf16", atol, rtol);
@@ -918,46 +811,19 @@ BT_PARITY_TEST(flash_fwd_6x10_D48_h6)  { run_flash_forward(6,  10, 48, 6, 0x701u
 BT_PARITY_TEST(flash_fwd_12x20_D64_h8) { run_flash_forward(12, 20, 64, 8, 0x702ull, false, false); }
 BT_PARITY_TEST(flash_fwd_8x8_D32_h4_mask)   { run_flash_forward(8, 8, 32, 4, 0x703ull, true,  false); }
 BT_PARITY_TEST(flash_fwd_10x10_D32_h2_causal){ run_flash_forward(10, 10, 32, 2, 0x704ull, false, true); }
-// head_dim=40 (D=80, h=2): exercises the fused WMMA path's head_dim=40
-// instantiation (SD1.5-class self-attention shape) added this session —
-// non-causal so it actually routes through flash_fused rather than the
-// per-head GEMM fallback; Lk=96 spans two BC=64 K-tiles (one partial) and
-// Lq=200 spans two BR=128 query tiles (one partial), exercising both
-// tile-boundary paths.
 BT_PARITY_TEST(flash_fwd_200x96_D80_h2_hd40) { run_flash_forward(200, 96, 80, 2, 0x705ull, false, false); }
 BT_PARITY_TEST(flash_fwd_200x96_D80_h2_hd40_mask) { run_flash_forward(200, 96, 80, 2, 0x706ull, true, false); }
 
 // ─── causal on the fused WMMA path ────────────────────────────────────────
-// The causal cases above use D=32/h=2 -> head_dim 16, which flash_fused
-// doesn't instantiate, so they route to the scalar fallback and cover none of
-// the fused kernel's causal logic. These pin every instantiated head_dim with
-// its own (BR, BC) tiling:
-//
-//   hd 40 -> BR 128, BC 64      hd 72  -> BR 64,  BC 64
-//   hd 64 -> BR 128, BC 64      hd 128 -> BR 128, BC 32
-//
-// Lq = Lk = 200 is deliberately not a multiple of any BR or BC: it spans
-// several query tiles with a partial last one, and the diagonal key tile is
-// partial too. That covers the three things the causal path adds — the
-// per-element j <= i mask, the kv_end tile-skip clamp, and the reversed query
-// tile ordering — including the CTA whose diagonal tile is also the tile
-// truncated by Lk. The mask variants check causal composes with a key mask
-// rather than one silently overriding the other.
 BT_PARITY_TEST(flash_fwd_200x200_D80_h2_hd40_causal)   { run_flash_forward(200, 200, 80,  2, 0x707ull, false, true); }
 BT_PARITY_TEST(flash_fwd_200x200_D128_h2_hd64_causal)  { run_flash_forward(200, 200, 128, 2, 0x708ull, false, true); }
 BT_PARITY_TEST(flash_fwd_200x200_D144_h2_hd72_causal)  { run_flash_forward(200, 200, 144, 2, 0x709ull, false, true); }
 BT_PARITY_TEST(flash_fwd_200x200_D256_h2_hd128_causal) { run_flash_forward(200, 200, 256, 2, 0x70Aull, false, true); }
 BT_PARITY_TEST(flash_fwd_200x200_D128_h2_hd64_causal_mask)  { run_flash_forward(200, 200, 128, 2, 0x70Bull, true, true); }
 BT_PARITY_TEST(flash_fwd_200x200_D256_h2_hd128_causal_mask) { run_flash_forward(200, 200, 256, 2, 0x70Cull, true, true); }
-// Single query tile, exactly one key tile: the kv_end clamp lands on the
-// loop's first iteration, so tile 0 must still mask per element.
 BT_PARITY_TEST(flash_fwd_64x64_D128_h2_hd64_causal)    { run_flash_forward(64, 64, 128, 2, 0x70Dull, false, true); }
 
-// Divergent per-row running maxima across many key tiles — pins the fused
-// kernel's per-row online-softmax rescale. Lq = Lk = 320 spans 5 key tiles at
-// BC 64 and 10 at BC 32, so the correction is applied repeatedly rather than
-// once. One case per instantiated head_dim (each has its own BR/BC tiling and
-// therefore its own number of rescale steps), causal and not.
+// Divergent per-row running maxima across many key tiles.
 BT_PARITY_TEST(flash_fwd_skew_320_D80_h2_hd40)          { run_flash_forward_skewed(320, 320, 80,  2, 0x7B0ull, false); }
 BT_PARITY_TEST(flash_fwd_skew_320_D128_h2_hd64)         { run_flash_forward_skewed(320, 320, 128, 2, 0x7B1ull, false); }
 BT_PARITY_TEST(flash_fwd_skew_320_D144_h2_hd72)         { run_flash_forward_skewed(320, 320, 144, 2, 0x7B2ull, false); }
@@ -966,21 +832,11 @@ BT_PARITY_TEST(flash_fwd_skew_320_D128_h2_hd64_causal)  { run_flash_forward_skew
 BT_PARITY_TEST(flash_fwd_skew_320_D256_h2_hd128_causal) { run_flash_forward_skewed(320, 320, 256, 2, 0x7B5ull, true); }
 
 // ─── flash_attention_qkvo_forward (self + cross, bias, mask, causal) ──────
-BT_PARITY_TEST(qkvo_fwd_self_8x8_D32_h4) {
-    run_qkvo_forward(8, 8, 32, 32, 4, 0x710ull, false, false, false, false);
-}
-BT_PARITY_TEST(qkvo_fwd_self_8x8_D32_h4_bias) {
-    run_qkvo_forward(8, 8, 32, 32, 4, 0x711ull, false, true, false, false);
-}
-BT_PARITY_TEST(qkvo_fwd_cross_6x10_D48_Dctx24_h6) {
-    run_qkvo_forward(6, 10, 48, 24, 6, 0x712ull, true, false, false, false);
-}
-BT_PARITY_TEST(qkvo_fwd_cross_6x10_D48_Dctx24_h6_bias_mask) {
-    run_qkvo_forward(6, 10, 48, 24, 6, 0x713ull, true, true, true, false);
-}
-BT_PARITY_TEST(qkvo_fwd_self_10x10_D32_h2_causal) {
-    run_qkvo_forward(10, 10, 32, 32, 2, 0x714ull, false, true, false, true);
-}
+BT_PARITY_TEST(qkvo_fwd_self_8x8_D32_h4) { run_qkvo_forward(8, 8, 32, 32, 4, 0x710ull, false, false, false, false); }
+BT_PARITY_TEST(qkvo_fwd_self_8x8_D32_h4_bias) { run_qkvo_forward(8, 8, 32, 32, 4, 0x711ull, false, true, false, false); }
+BT_PARITY_TEST(qkvo_fwd_cross_6x10_D48_Dctx24_h6) { run_qkvo_forward(6, 10, 48, 24, 6, 0x712ull, true, false, false, false); }
+BT_PARITY_TEST(qkvo_fwd_cross_6x10_D48_Dctx24_h6_bias_mask) { run_qkvo_forward(6, 10, 48, 24, 6, 0x713ull, true, true, true, false); }
+BT_PARITY_TEST(qkvo_fwd_self_10x10_D32_h2_causal) { run_qkvo_forward(10, 10, 32, 32, 2, 0x714ull, false, true, false, true); }
 
 // ─── flash_attention_project_kv ───────────────────────────────────────────
 BT_PARITY_TEST(project_kv_10_D32_Dctx24)      { run_project_kv(10, 32, 24, 0x720ull, false); }
@@ -1003,51 +859,29 @@ BT_PARITY_TEST(flash_bwd_8x8_D32_h4_mask)    { run_flash_backward(8, 8, 32, 4, 0
 BT_PARITY_TEST(flash_bwd_10x10_D32_h2_causal){ run_flash_backward(10, 10, 32, 2, 0x753ull, false, true); }
 
 // ─── flash_attention_qkvo_backward (self + cross, bias, mask, causal) ─────
-BT_PARITY_TEST(qkvo_bwd_self_8x8_D32_h4) {
-    run_qkvo_backward(8, 8, 32, 32, 4, 0x760ull, false, false, false, false);
-}
-BT_PARITY_TEST(qkvo_bwd_self_8x8_D32_h4_bias) {
-    run_qkvo_backward(8, 8, 32, 32, 4, 0x761ull, false, true, false, false);
-}
-BT_PARITY_TEST(qkvo_bwd_cross_6x10_D48_Dctx24_h6) {
-    run_qkvo_backward(6, 10, 48, 24, 6, 0x762ull, true, false, false, false);
-}
-BT_PARITY_TEST(qkvo_bwd_cross_6x10_D48_Dctx24_h6_bias_mask) {
-    run_qkvo_backward(6, 10, 48, 24, 6, 0x763ull, true, true, true, false);
-}
-BT_PARITY_TEST(qkvo_bwd_self_10x10_D32_h2_causal) {
-    run_qkvo_backward(10, 10, 32, 32, 2, 0x764ull, false, true, false, true);
-}
+BT_PARITY_TEST(qkvo_bwd_self_8x8_D32_h4) { run_qkvo_backward(8, 8, 32, 32, 4, 0x760ull, false, false, false, false); }
+BT_PARITY_TEST(qkvo_bwd_self_8x8_D32_h4_bias) { run_qkvo_backward(8, 8, 32, 32, 4, 0x761ull, false, true, false, false); }
+BT_PARITY_TEST(qkvo_bwd_cross_6x10_D48_Dctx24_h6) { run_qkvo_backward(6, 10, 48, 24, 6, 0x762ull, true, false, false, false); }
+BT_PARITY_TEST(qkvo_bwd_cross_6x10_D48_Dctx24_h6_bias_mask) { run_qkvo_backward(6, 10, 48, 24, 6, 0x763ull, true, true, true, false); }
+BT_PARITY_TEST(qkvo_bwd_self_10x10_D32_h2_causal) { run_qkvo_backward(10, 10, 32, 32, 2, 0x764ull, false, true, false, true); }
 
 // ─── BF16 parity (BF16-on-CUDA vs FP32 CPU reference) ─────────────────────
 BT_PARITY_TEST(flash_fwd_bf16_8x8_D32_h4)    { run_flash_forward_bf16(8,  8,  32, 4, 0x7A0ull, false, false); }
 BT_PARITY_TEST(flash_fwd_bf16_12x20_D64_h8)  { run_flash_forward_bf16(12, 20, 64, 8, 0x7A1ull, false, false); }
 BT_PARITY_TEST(flash_fwd_bf16_8x8_D32_h4_mask)    { run_flash_forward_bf16(8, 8, 32, 4, 0x7A2ull, true,  false); }
 BT_PARITY_TEST(flash_fwd_bf16_10x10_D32_h2_causal){ run_flash_forward_bf16(10, 10, 32, 2, 0x7A3ull, false, true); }
-// head_dim=40 (D=80, h=2), same tile-boundary coverage as the FP16 case above.
 BT_PARITY_TEST(flash_fwd_bf16_200x96_D80_h2_hd40) { run_flash_forward_bf16(200, 96, 80, 2, 0x7A4ull, false, false); }
 BT_PARITY_TEST(flash_fwd_bf16_200x96_D80_h2_hd40_mask) { run_flash_forward_bf16(200, 96, 80, 2, 0x7A5ull, true, false); }
-// Causal on the fused path in BF16 — same instantiations as the FP16 block
-// above. BF16 shares the one templated kernel, so this guards the dtype
-// dispatch rather than the masking arithmetic.
 BT_PARITY_TEST(flash_fwd_bf16_200x200_D80_h2_hd40_causal)   { run_flash_forward_bf16(200, 200, 80,  2, 0x7A6ull, false, true); }
 BT_PARITY_TEST(flash_fwd_bf16_200x200_D128_h2_hd64_causal)  { run_flash_forward_bf16(200, 200, 128, 2, 0x7A7ull, false, true); }
 BT_PARITY_TEST(flash_fwd_bf16_200x200_D144_h2_hd72_causal)  { run_flash_forward_bf16(200, 200, 144, 2, 0x7A8ull, false, true); }
 BT_PARITY_TEST(flash_fwd_bf16_200x200_D256_h2_hd128_causal) { run_flash_forward_bf16(200, 200, 256, 2, 0x7A9ull, false, true); }
 BT_PARITY_TEST(flash_fwd_bf16_200x200_D128_h2_hd64_causal_mask) { run_flash_forward_bf16(200, 200, 128, 2, 0x7AAull, true, true); }
 
-BT_PARITY_TEST(qkvo_fwd_bf16_self_8x8_D32_h4) {
-    run_qkvo_forward_bf16(8, 8, 32, 32, 4, 0x7B0ull, false, false, false, false);
-}
-BT_PARITY_TEST(qkvo_fwd_bf16_self_8x8_D32_h4_bias) {
-    run_qkvo_forward_bf16(8, 8, 32, 32, 4, 0x7B1ull, false, true, false, false);
-}
-BT_PARITY_TEST(qkvo_fwd_bf16_cross_6x10_D48_Dctx24_h6_bias_mask) {
-    run_qkvo_forward_bf16(6, 10, 48, 24, 6, 0x7B2ull, true, true, true, false);
-}
-BT_PARITY_TEST(qkvo_fwd_bf16_self_10x10_D32_h2_causal) {
-    run_qkvo_forward_bf16(10, 10, 32, 32, 2, 0x7B3ull, false, true, false, true);
-}
+BT_PARITY_TEST(qkvo_fwd_bf16_self_8x8_D32_h4) { run_qkvo_forward_bf16(8, 8, 32, 32, 4, 0x7B0ull, false, false, false, false); }
+BT_PARITY_TEST(qkvo_fwd_bf16_self_8x8_D32_h4_bias) { run_qkvo_forward_bf16(8, 8, 32, 32, 4, 0x7B1ull, false, true, false, false); }
+BT_PARITY_TEST(qkvo_fwd_bf16_cross_6x10_D48_Dctx24_h6_bias_mask) { run_qkvo_forward_bf16(6, 10, 48, 24, 6, 0x7B2ull, true, true, true, false); }
+BT_PARITY_TEST(qkvo_fwd_bf16_self_10x10_D32_h2_causal) { run_qkvo_forward_bf16(10, 10, 32, 32, 2, 0x7B3ull, false, true, false, true); }
 
 BT_PARITY_TEST(project_kv_bf16_10_D32_Dctx24)      { run_project_kv_bf16(10, 32, 24, 0x7C0ull, false); }
 BT_PARITY_TEST(project_kv_bf16_16_D48_Dctx48_bias) { run_project_kv_bf16(16, 48, 48, 0x7C1ull, true); }
@@ -1065,17 +899,9 @@ BT_PARITY_TEST(flash_bwd_bf16_6x10_D48_h6)   { run_flash_backward_bf16(6,  10, 4
 BT_PARITY_TEST(flash_bwd_bf16_8x8_D32_h4_mask)     { run_flash_backward_bf16(8, 8, 32, 4, 0x7F2ull, true,  false); }
 BT_PARITY_TEST(flash_bwd_bf16_10x10_D32_h2_causal) { run_flash_backward_bf16(10, 10, 32, 2, 0x7F3ull, false, true); }
 
-BT_PARITY_TEST(qkvo_bwd_bf16_self_8x8_D32_h4) {
-    run_qkvo_backward_bf16(8, 8, 32, 32, 4, 0x800ull, false, false, false, false);
-}
-BT_PARITY_TEST(qkvo_bwd_bf16_self_8x8_D32_h4_bias) {
-    run_qkvo_backward_bf16(8, 8, 32, 32, 4, 0x801ull, false, true, false, false);
-}
-BT_PARITY_TEST(qkvo_bwd_bf16_cross_6x10_D48_Dctx24_h6_bias_mask) {
-    run_qkvo_backward_bf16(6, 10, 48, 24, 6, 0x802ull, true, true, true, false);
-}
-BT_PARITY_TEST(qkvo_bwd_bf16_self_10x10_D32_h2_causal) {
-    run_qkvo_backward_bf16(10, 10, 32, 32, 2, 0x803ull, false, true, false, true);
-}
+BT_PARITY_TEST(qkvo_bwd_bf16_self_8x8_D32_h4) { run_qkvo_backward_bf16(8, 8, 32, 32, 4, 0x800ull, false, false, false, false); }
+BT_PARITY_TEST(qkvo_bwd_bf16_self_8x8_D32_h4_bias) { run_qkvo_backward_bf16(8, 8, 32, 32, 4, 0x801ull, false, true, false, false); }
+BT_PARITY_TEST(qkvo_bwd_bf16_cross_6x10_D48_Dctx24_h6_bias_mask) { run_qkvo_backward_bf16(6, 10, 48, 24, 6, 0x802ull, true, true, true, false); }
+BT_PARITY_TEST(qkvo_bwd_bf16_self_10x10_D32_h2_causal) { run_qkvo_backward_bf16(10, 10, 32, 32, 2, 0x803ull, false, true, false, true); }
 
 int main() { return run_all("flash_attention cpu/gpu parity"); }
