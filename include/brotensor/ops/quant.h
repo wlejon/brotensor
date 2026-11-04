@@ -24,8 +24,8 @@ void quantize_int8_per_row_host(const uint16_t* W_fp16,
 
 // W8A16 matmul: Y = dequant(W_int8, scales) @ X.
 //   W_int8: (out,in) INT8.  scales: (out,1) FP32 per-row dequant scales.
-//   X: (in,B) FP16.  Y: (out,B) FP16, resized as needed.
-// Same (M,K)@(K,N) shape convention as matmul.
+//   X: (in,B) FP16 (or FP32 on CPU).  Y: (out,B) FP16/FP32, resized as needed.
+// Supported on both CPU and GPU. Same (M,K)@(K,N) shape convention as matmul.
 void matmul_int8w_fp16(const Tensor& W_int8,
                        const Tensor& scales,
                        const Tensor& X,
@@ -79,18 +79,16 @@ void dequant_q4k_to_fp16(const Tensor& W_q4k, Tensor& W_fp16);
 
 
 // GEMV: y(out, 1) = W_q4k(out, in) @ x(in, 1) + bias(out, 1)?
-// x and y are FP16 (Dtype::FP16). bias is optional. FP32 accumulation. The
-// kernel fuses the Q4_K dequant into the matmul — no temporary FP16 weight
-// is materialized.
+// x and y are FP16 (or FP32 on CPU). bias is optional. FP32 accumulation. Supported
+// on both CPU (Brass AVX2/FMA JIT + reference fallback) and GPU (fused dequant).
 void linear_forward_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
                              const Tensor& x, Tensor& y);
 
 
 // Batched form: Y(B, out) = X(B, in) @ W_q4k(out, in)^T + bias(out)? Same
-// (B, in) -> (B, out) row layout as linear_forward_batched_fp16. Small B is
-// GEMV-optimized (one decode of the weight per output token); large B (prefill)
-// takes a tensor-core GEMM path — CUDA a fused-dequant WMMA kernel, Metal a
-// dequant-once + simdgroup matmul — so the weight decode is amortized across B.
+// (B, in) -> (B, out) row layout as linear_forward_batched_fp16. Supported on
+// both CPU (FP16 or FP32 activations) and GPU (GEMV for small B; tensor-core
+// GEMM for large B).
 void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
                                      const Tensor& X_BD, Tensor& Y_BD);
 
@@ -103,20 +101,20 @@ void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
 // runs along the inner / contiguous axis).
 
 // W_q8: (out, in) Dtype::Q8_0. W_fp16: (out, in) Dtype::FP16, resized.
+// Supported on both CPU and GPU.
 void dequant_q8_0_to_fp16(const Tensor& W_q8, Tensor& W_fp16);
 
 
 // GEMV: y(out, 1) = W_q8(out, in) @ x(in, 1) + bias(out, 1)?
-// x and y are FP16. bias is optional. FP32 accumulation. The kernel fuses the
-// Q8_0 dequant into the matmul — no temporary FP16 weight is materialized.
+// x and y are FP16 (or FP32 on CPU). bias is optional. FP32 accumulation. Supported
+// on both CPU (Brass AVX2/FMA JIT + reference fallback) and GPU (fused dequant).
 void linear_forward_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
                               const Tensor& x, Tensor& y);
 
 
-// Batched form: Y(B, out) = X(B, in) @ W_q8(out, in)^T + bias(out)?. Large B
-// (prefill) uses a tensor-core GEMM — a fused-dequant WMMA kernel on CUDA, a
-// dequant-once + simdgroup matmul on Metal; small B falls back to a per-token
-// GEMV that re-decodes the weight.
+// Batched form: Y(B, out) = X(B, in) @ W_q8(out, in)^T + bias(out)?. Supported
+// on both CPU (FP16 or FP32 activations) and GPU (tensor-core GEMM for large B,
+// per-token GEMV for small B).
 void linear_forward_batched_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
                                       const Tensor& X_BD, Tensor& Y_BD);
 
@@ -130,17 +128,20 @@ void linear_forward_batched_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
 // inner / contiguous axis).
 
 // W_q6k: (out, in) Dtype::Q6_K. W_fp16: (out, in) Dtype::FP16, resized.
+// Supported on both CPU and GPU.
 void dequant_q6k_to_fp16(const Tensor& W_q6k, Tensor& W_fp16);
 
 
 // GEMV: y(out, 1) = W_q6k(out, in) @ x(in, 1) + bias(out, 1)?
-// x and y are FP16. bias is optional. FP32 accumulation, fused dequant.
+// x and y are FP16 (or FP32 on CPU). bias is optional. FP32 accumulation. Supported
+// on both CPU (Brass AVX2/FMA JIT + reference fallback) and GPU (fused dequant).
 void linear_forward_q6k_fp16(const Tensor& W_q6k, const Tensor* bias,
                              const Tensor& x, Tensor& y);
 
 
-// Batched form. WMMA path when B >= 4 and K is aligned; GEMV-loop fallback
-// otherwise. Same (B, in) -> (B, out) layout as the FP16 batched linear.
+// Batched form. Supported on both CPU (FP16 or FP32 activations) and GPU
+// (WMMA path when B >= 4 and K is aligned; GEMV-loop fallback otherwise).
+// Same (B, in) -> (B, out) layout as the FP16 batched linear.
 void linear_forward_batched_q6k_fp16(const Tensor& W_q6k, const Tensor* bias,
                                      const Tensor& X_BD, Tensor& Y_BD);
 

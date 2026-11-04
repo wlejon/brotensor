@@ -654,7 +654,7 @@ void modulated_conv2d_backward(const ::brotensor::Tensor& X,
                                ::brotensor::Tensor& dX, ::brotensor::Tensor& dW,
                                ::brotensor::Tensor& ds);
 
-// ── Quantized linear forward & dequant (Q8_0 & Q4_K) via Brass AVX2/FMA JIT ──
+// ── Quantized linear forward & dequant (Q8_0, Q4_K, Q6_K & INT8) via Brass AVX2/FMA JIT ──
 void dequant_q8_0_to_fp16(const ::brotensor::Tensor& W_q8, ::brotensor::Tensor& W_fp16);
 void linear_forward_q8_0_fp16(const ::brotensor::Tensor& W_q8, const ::brotensor::Tensor* bias,
                               const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
@@ -665,6 +665,16 @@ void linear_forward_q4k_fp16(const ::brotensor::Tensor& W_q4k, const ::brotensor
                              const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
 void linear_forward_batched_q4k_fp16(const ::brotensor::Tensor& W_q4k, const ::brotensor::Tensor* bias,
                                      const ::brotensor::Tensor& X_BD, ::brotensor::Tensor& Y_BD);
+void dequant_q6k_to_fp16(const ::brotensor::Tensor& W_q6k, ::brotensor::Tensor& W_fp16);
+void linear_forward_q6k_fp16(const ::brotensor::Tensor& W_q6k, const ::brotensor::Tensor* bias,
+                             const ::brotensor::Tensor& x, ::brotensor::Tensor& y);
+void linear_forward_batched_q6k_fp16(const ::brotensor::Tensor& W_q6k, const ::brotensor::Tensor* bias,
+                                     const ::brotensor::Tensor& X_BD, ::brotensor::Tensor& Y_BD);
+void matmul_int8w_fp16(const ::brotensor::Tensor& W_int8, const ::brotensor::Tensor& scales,
+                       const ::brotensor::Tensor& X, ::brotensor::Tensor& Y);
+void linear_forward_batched_int8w_fp16(const ::brotensor::Tensor& W_int8, const ::brotensor::Tensor& scales,
+                                       const ::brotensor::Tensor* bias, const ::brotensor::Tensor& X_BD,
+                                       ::brotensor::Tensor& Y_BD);
 
 void register_cpu_nn_ops(::brotensor::detail::OpsVTable& ops) {
     // ── LSTM ──
@@ -834,13 +844,18 @@ void register_cpu_nn_ops(::brotensor::detail::OpsVTable& ops) {
     ops.modulated_conv2d_forward     = &modulated_conv2d_forward;
     ops.modulated_conv2d_backward    = &modulated_conv2d_backward;
 
-    // ── Quantized linear forward & dequant (Q8_0 & Q4_K) via Brass AVX2/FMA JIT ──
+    // ── Quantized linear forward & dequant (Q8_0, Q4_K, Q6_K & INT8) via Brass AVX2/FMA JIT ──
     ops.dequant_q8_0_to_fp16         = &dequant_q8_0_to_fp16;
     ops.linear_forward_q8_0_fp16     = &linear_forward_q8_0_fp16;
     ops.linear_forward_batched_q8_0_fp16 = &linear_forward_batched_q8_0_fp16;
     ops.dequant_q4k_to_fp16          = &dequant_q4k_to_fp16;
     ops.linear_forward_q4k_fp16      = &linear_forward_q4k_fp16;
     ops.linear_forward_batched_q4k_fp16 = &linear_forward_batched_q4k_fp16;
+    ops.dequant_q6k_to_fp16          = &dequant_q6k_to_fp16;
+    ops.linear_forward_q6k_fp16      = &linear_forward_q6k_fp16;
+    ops.linear_forward_batched_q6k_fp16 = &linear_forward_batched_q6k_fp16;
+    ops.matmul_int8w_fp16            = &matmul_int8w_fp16;
+    ops.linear_forward_batched_int8w_fp16 = &linear_forward_batched_int8w_fp16;
 }
 
 } // namespace brotensor::detail::cpu

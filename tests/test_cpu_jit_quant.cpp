@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <random>
 
 using brotensor::Tensor;
 using brotensor::Device;
@@ -483,7 +484,271 @@ void test_dequant_cpu() {
         }
         std::cout << "  dequant_q4k_to_fp16: max error = " << max_err << "\n";
         CHECK_PARITY(max_err, 1e-3f, "dequant_q4k_to_fp16");
+
+        // Also test FP32 activations & default output dtype on resize for Q4_K and Q8_0
+        std::vector<float> h_x(K);
+        fill_random(h_x, 3001, 0.25f);
+        Tensor x_f32 = Tensor::from_host_on(Device::CPU, h_x.data(), K, 1);
+        Tensor y_f32;
+        brotensor::linear_forward_q4k_fp16(W_q4k, nullptr, x_f32, y_f32);
+        if (y_f32.dtype != Dtype::FP32 || y_f32.rows != N || y_f32.cols != 1) {
+            std::cerr << "  [FAIL] linear_forward_q4k_fp16 did not resize y to FP32\n";
+            ++g_failures;
+        }
+        Tensor X_bd_f32 = Tensor::from_host_on(Device::CPU, h_x.data(), 1, K);
+        Tensor Y_bd_f32;
+        brotensor::linear_forward_batched_q4k_fp16(W_q4k, nullptr, X_bd_f32, Y_bd_f32);
+        if (Y_bd_f32.dtype != Dtype::FP32 || Y_bd_f32.rows != 1 || Y_bd_f32.cols != N) {
+            std::cerr << "  [FAIL] linear_forward_batched_q4k_fp16 did not resize Y_BD to FP32\n";
+            ++g_failures;
+        }
+        std::vector<float> h_y1 = y_f32.to_host_vector();
+        std::vector<float> h_y2 = Y_bd_f32.to_host_vector();
+        CHECK_PARITY(max_abs_error(h_y1.data(), h_y2.data(), N), 1e-5f, "q4k_fp32_vec_vs_batched");
     }
+}
+
+// ─── Q6_K Reference Helpers & Tests ──────────────────────────────────────────
+
+constexpr int Q6K_BLOCK = 256;
+constexpr int Q6K_BYTES = 210;
+
+struct Q6KBlock {
+    uint8_t  ql[128];
+    uint8_t  qh[64];
+    int8_t   scales[16];
+    uint16_t d;
+};
+static_assert(sizeof(Q6KBlock) == Q6K_BYTES, "Q6KBlock size must be 210 bytes");
+
+void pack_q6k_block(float d_f32, const int8_t sc[16], const int q[256], Q6KBlock& out) {
+    std::memset(&out, 0, sizeof(out));
+    out.d = brotensor::fp32_to_fp16_bits(d_f32);
+    std::memcpy(out.scales, sc, 16);
+    for (int e = 0; e < 256; ++e) {
+        int val6 = std::clamp(q[e], -32, 31) + 32;
+        int raw4 = val6 & 0x0F;
+        int high2 = (val6 >> 4) & 0x03;
+
+        int group = e >> 7;
+        int local = e & 127;
+        int quad  = local >> 5;
+        int l     = local & 31;
+
+        int ql_idx = group * 64 + (quad & 1) * 32 + l;
+        if (quad < 2) {
+            out.ql[ql_idx] |= static_cast<uint8_t>(raw4);
+        } else {
+            out.ql[ql_idx] |= static_cast<uint8_t>(raw4 << 4);
+        }
+        int qh_idx = group * 32 + l;
+        out.qh[qh_idx] |= static_cast<uint8_t>(high2 << (quad * 2));
+    }
+}
+
+void dequant_q6k_block(const Q6KBlock& blk, float* dst) {
+    const float d = brotensor::fp16_bits_to_fp32(blk.d);
+    for (int e = 0; e < 256; ++e) {
+        const int group = e >> 7;
+        const int local = e & 127;
+        const int quad  = local >> 5;
+        const int l     = local & 31;
+        const int sb    = (group << 3) + (quad << 1) + (l >> 4);
+
+        const uint8_t ql_b = blk.ql[group * 64 + (quad & 1) * 32 + l];
+        const uint8_t qh_b = blk.qh[group * 32 + l];
+        const int raw4  = (quad < 2) ? (ql_b & 0x0F) : (ql_b >> 4);
+        const int high2 = (qh_b >> (quad * 2)) & 0x03;
+        const int val6  = (raw4 | (high2 << 4)) - 32;
+        dst[e] = d * static_cast<float>(blk.scales[sb]) * static_cast<float>(val6);
+    }
+}
+
+void test_q6_k_cpu() {
+    std::cout << "\n================================================================================\n";
+    std::cout << "  4. BRASS JIT CPU QUANTIZED (Q6_K) DEQUANT & LINEAR TESTS\n";
+    std::cout << "================================================================================\n";
+
+    const int N = 16;
+    const int K = 512;
+    const int BPR = K / Q6K_BLOCK;
+
+    std::mt19937 rng(4242);
+    std::uniform_int_distribution<int> q_dist(-32, 31);
+    std::uniform_int_distribution<int> sc_dist(-12, 12);
+
+    std::vector<Q6KBlock> h_wq(static_cast<size_t>(N) * BPR);
+    std::vector<float> h_wd(static_cast<size_t>(N) * K);
+
+    for (int r = 0; r < N; ++r) {
+        for (int b = 0; b < BPR; ++b) {
+            int8_t sc[16];
+            int q[256];
+            for (int i = 0; i < 16; ++i) sc[i] = static_cast<int8_t>(sc_dist(rng));
+            for (int i = 0; i < 256; ++i) q[i] = q_dist(rng);
+            const size_t blk_off = static_cast<size_t>(r) * BPR + b;
+            pack_q6k_block(0.015625f, sc, q, h_wq[blk_off]);
+            dequant_q6k_block(h_wq[blk_off], &h_wd[static_cast<size_t>(r) * K + b * Q6K_BLOCK]);
+        }
+    }
+
+    Tensor W_q6k = Tensor::empty_on(Device::CPU, N, K, Dtype::Q6_K);
+    std::memcpy(W_q6k.data, h_wq.data(), static_cast<size_t>(N) * BPR * Q6K_BYTES);
+
+    // 1. dequant_q6k_to_fp16
+    Tensor W_fp16;
+    brotensor::dequant_q6k_to_fp16(W_q6k, W_fp16);
+    const uint16_t* w_fp16_ptr = static_cast<const uint16_t*>(W_fp16.data);
+    float deq_err = 0.0f;
+    for (int i = 0; i < N * K; ++i) {
+        float diff = std::fabs(brotensor::fp16_bits_to_fp32(w_fp16_ptr[i]) - h_wd[i]);
+        if (diff > deq_err) deq_err = diff;
+    }
+    std::cout << "  dequant_q6k_to_fp16: max error = " << deq_err << "\n";
+    CHECK_PARITY(deq_err, 1e-3f, "dequant_q6k_to_fp16");
+
+    // 2. gemv_q6_k + linear_forward_q6k_fp16 (FP32 & FP16) + linear_forward_batched_q6k_fp16 (FP32 & FP16)
+    std::vector<float> h_x(K);
+    fill_random(h_x, 5001, 0.5f);
+    std::vector<float> h_bias(N);
+    fill_random(h_bias, 5002, 0.2f);
+
+    std::vector<float> h_ref_nobias(N, 0.0f);
+    std::vector<float> h_ref_bias(N, 0.0f);
+    for (int r = 0; r < N; ++r) {
+        double acc = 0.0;
+        for (int k = 0; k < K; ++k) {
+            acc += static_cast<double>(h_wd[static_cast<size_t>(r) * K + k]) * static_cast<double>(h_x[k]);
+        }
+        h_ref_nobias[r] = static_cast<float>(acc);
+        h_ref_bias[r] = static_cast<float>(acc) + h_bias[r];
+    }
+
+    std::vector<float> h_jit(N, 0.0f);
+    brotensor::detail::cpu::jit::gemv_q6_k(h_wq.data(), h_x.data(), h_jit.data(), N, K);
+    CHECK_PARITY(max_abs_error(h_ref_nobias.data(), h_jit.data(), N), 1e-4f, "gemv_q6_k");
+
+    // FP32 activations + bias
+    Tensor x_f32 = Tensor::from_host_on(Device::CPU, h_x.data(), K, 1);
+    Tensor bias_f32 = Tensor::from_host_on(Device::CPU, h_bias.data(), N, 1);
+    Tensor y_f32;
+    brotensor::linear_forward_q6k_fp16(W_q6k, &bias_f32, x_f32, y_f32);
+    if (y_f32.dtype != Dtype::FP32) {
+        std::cerr << "  [FAIL] linear_forward_q6k_fp16 did not default y.dtype to FP32\n";
+        ++g_failures;
+    }
+    std::vector<float> h_y_f32 = y_f32.to_host_vector();
+    CHECK_PARITY(max_abs_error(h_ref_bias.data(), h_y_f32.data(), N), 1e-4f, "linear_forward_q6k_fp16 (FP32)");
+
+    // Batched FP32 (B=2)
+    std::vector<float> h_X_bd(2 * K);
+    std::memcpy(h_X_bd.data(), h_x.data(), K * sizeof(float));
+    std::memcpy(h_X_bd.data() + K, h_x.data(), K * sizeof(float));
+    Tensor X_bd_f32 = Tensor::from_host_on(Device::CPU, h_X_bd.data(), 2, K);
+    Tensor Y_bd_f32;
+    brotensor::linear_forward_batched_q6k_fp16(W_q6k, &bias_f32, X_bd_f32, Y_bd_f32);
+    if (Y_bd_f32.dtype != Dtype::FP32 || Y_bd_f32.rows != 2 || Y_bd_f32.cols != N) {
+        std::cerr << "  [FAIL] linear_forward_batched_q6k_fp16 did not default Y_BD.dtype to FP32\n";
+        ++g_failures;
+    }
+    std::vector<float> h_Y_bd = Y_bd_f32.to_host_vector();
+    CHECK_PARITY(max_abs_error(h_ref_bias.data(), h_Y_bd.data(), N), 1e-4f, "linear_forward_batched_q6k_fp16 (FP32 row 0)");
+    CHECK_PARITY(max_abs_error(h_ref_bias.data(), h_Y_bd.data() + N, N), 1e-4f, "linear_forward_batched_q6k_fp16 (FP32 row 1)");
+
+    // FP16 activations
+    std::vector<uint16_t> h_x_fp16(K);
+    for (int i = 0; i < K; ++i) h_x_fp16[i] = brotensor::fp32_to_fp16_bits(h_x[i]);
+    Tensor x_fp16 = Tensor::from_host_fp16_on(Device::CPU, h_x_fp16.data(), K, 1);
+    Tensor y_fp16;
+    brotensor::linear_forward_q6k_fp16(W_q6k, nullptr, x_fp16, y_fp16);
+    if (y_fp16.dtype != Dtype::FP16) {
+        std::cerr << "  [FAIL] linear_forward_q6k_fp16 did not default y.dtype to FP16\n";
+        ++g_failures;
+    }
+    const uint16_t* yp16 = static_cast<const uint16_t*>(y_fp16.data);
+    std::vector<float> h_y_fp16(N);
+    for (int i = 0; i < N; ++i) h_y_fp16[i] = brotensor::fp16_bits_to_fp32(yp16[i]);
+    CHECK_PARITY(max_abs_error(h_ref_nobias.data(), h_y_fp16.data(), N), 5e-2f, "linear_forward_q6k_fp16 (FP16)");
+}
+
+// ─── W8A16 (int8w_fp16) CPU Tests ────────────────────────────────────────────
+
+void test_int8w_fp16_cpu() {
+    std::cout << "\n================================================================================\n";
+    std::cout << "  5. CPU W8A16 (matmul_int8w_fp16 & linear_forward_batched_int8w_fp16) TESTS\n";
+    std::cout << "================================================================================\n";
+
+    const int N = 16;
+    const int K = 128;
+
+    std::vector<float> h_wf(N * K);
+    fill_random(h_wf, 6001, 0.5f);
+    std::vector<uint16_t> h_wf16(N * K);
+    for (int i = 0; i < N * K; ++i) h_wf16[i] = brotensor::fp32_to_fp16_bits(h_wf[i]);
+
+    std::vector<int8_t> h_wi8(N * K);
+    std::vector<float> h_scales(N);
+    brotensor::quantize_int8_per_row_host(h_wf16.data(), N, K, h_wi8.data(), h_scales.data());
+
+    Tensor W_int8 = Tensor::empty_on(Device::CPU, N, K, Dtype::INT8);
+    std::memcpy(W_int8.data, h_wi8.data(), N * K * sizeof(int8_t));
+    Tensor scales = Tensor::from_host_on(Device::CPU, h_scales.data(), N, 1);
+
+    std::vector<float> h_x(K);
+    fill_random(h_x, 6002, 0.5f);
+    std::vector<float> h_bias(N);
+    fill_random(h_bias, 6003, 0.1f);
+
+    std::vector<float> h_ref_nobias(N, 0.0f);
+    std::vector<float> h_ref_bias(N, 0.0f);
+    for (int r = 0; r < N; ++r) {
+        double acc = 0.0;
+        for (int k = 0; k < K; ++k) {
+            acc += static_cast<double>(h_wi8[r * K + k]) * static_cast<double>(h_x[k]);
+        }
+        float v = static_cast<float>(acc) * h_scales[r];
+        h_ref_nobias[r] = v;
+        h_ref_bias[r] = v + h_bias[r];
+    }
+
+    // 1. matmul_int8w_fp16 (FP32)
+    Tensor x_f32 = Tensor::from_host_on(Device::CPU, h_x.data(), K, 1);
+    Tensor y_f32;
+    brotensor::matmul_int8w_fp16(W_int8, scales, x_f32, y_f32);
+    if (y_f32.dtype != Dtype::FP32 || y_f32.rows != N || y_f32.cols != 1) {
+        std::cerr << "  [FAIL] matmul_int8w_fp16 did not default Y.dtype to FP32\n";
+        ++g_failures;
+    }
+    std::vector<float> h_y_f32 = y_f32.to_host_vector();
+    CHECK_PARITY(max_abs_error(h_ref_nobias.data(), h_y_f32.data(), N), 1e-4f, "matmul_int8w_fp16 (FP32)");
+
+    // 2. matmul_int8w_fp16 (FP16)
+    std::vector<uint16_t> h_x16(K);
+    for (int i = 0; i < K; ++i) h_x16[i] = brotensor::fp32_to_fp16_bits(h_x[i]);
+    Tensor x_fp16 = Tensor::from_host_fp16_on(Device::CPU, h_x16.data(), K, 1);
+    Tensor y_fp16;
+    brotensor::matmul_int8w_fp16(W_int8, scales, x_fp16, y_fp16);
+    if (y_fp16.dtype != Dtype::FP16) {
+        std::cerr << "  [FAIL] matmul_int8w_fp16 did not default Y.dtype to FP16\n";
+        ++g_failures;
+    }
+    const uint16_t* yp16 = static_cast<const uint16_t*>(y_fp16.data);
+    std::vector<float> h_y_fp16(N);
+    for (int i = 0; i < N; ++i) h_y_fp16[i] = brotensor::fp16_bits_to_fp32(yp16[i]);
+    CHECK_PARITY(max_abs_error(h_ref_nobias.data(), h_y_fp16.data(), N), 2e-2f, "matmul_int8w_fp16 (FP16)");
+
+    // 3. linear_forward_batched_int8w_fp16 (FP32 with bias)
+    Tensor X_bd_f32 = Tensor::from_host_on(Device::CPU, h_x.data(), 1, K);
+    Tensor bias_f32 = Tensor::from_host_on(Device::CPU, h_bias.data(), N, 1);
+    Tensor Y_bd_f32;
+    brotensor::linear_forward_batched_int8w_fp16(W_int8, scales, &bias_f32, X_bd_f32, Y_bd_f32);
+    if (Y_bd_f32.dtype != Dtype::FP32 || Y_bd_f32.rows != 1 || Y_bd_f32.cols != N) {
+        std::cerr << "  [FAIL] linear_forward_batched_int8w_fp16 did not default Y_BD.dtype to FP32\n";
+        ++g_failures;
+    }
+    std::vector<float> h_Y_bd = Y_bd_f32.to_host_vector();
+    CHECK_PARITY(max_abs_error(h_ref_bias.data(), h_Y_bd.data(), N), 1e-4f, "linear_forward_batched_int8w_fp16 (FP32)");
+    std::cout << "  matmul_int8w_fp16 & linear_forward_batched_int8w_fp16: PASS\n";
 }
 
 } // namespace
@@ -493,7 +758,7 @@ int main() {
     brotensor::set_default_device(Device::CPU);
 
     std::cout << "================================================================================\n";
-    std::cout << "  BRASS JIT CPU QUANTIZED GEMV (Q8_0 & Q4_K) TEST & BENCHMARK SUITE\n";
+    std::cout << "  BRASS JIT CPU QUANTIZED GEMV (Q8_0, Q4_K, Q6_K, INT8) TEST & BENCHMARK SUITE\n";
     std::cout << "  Threads: " << brotensor::detail::cpu::ThreadPool::instance().num_threads() << "\n";
     std::cout << "================================================================================\n";
 
@@ -504,10 +769,12 @@ int main() {
     test_q8_0_cpu();
     test_q4_k_cpu();
     test_dequant_cpu();
+    test_q6_k_cpu();
+    test_int8w_fp16_cpu();
 
     std::cout << "\n================================================================================\n";
     if (g_failures == 0) {
-        std::cout << "  [SUCCESS] All Quantized CPU JIT (Q8_0 & Q4_K) tests PASSED with exact parity!\n";
+        std::cout << "  [SUCCESS] All Quantized CPU JIT (Q8_0, Q4_K, Q6_K, INT8) tests PASSED!\n";
     } else {
         std::cout << "  [FAILURE] " << g_failures << " tests failed!\n";
     }

@@ -66,6 +66,30 @@ static inline void ref_dequant_q4k_block(const void* blk_ptr, float* out256) {
     }
 }
 
+static inline void ref_dequant_q6k_block(const void* blk_ptr, float* out256) {
+    const uint8_t* p = static_cast<const uint8_t*>(blk_ptr);
+    const uint8_t* ql = p;
+    const uint8_t* qh = p + 128;
+    const int8_t* scales = reinterpret_cast<const int8_t*>(p + 192);
+    uint16_t d_raw;
+    std::memcpy(&d_raw, p + 208, 2);
+    const float d = fp16_bits_to_fp32(d_raw);
+
+    for (int e = 0; e < 256; ++e) {
+        const int group = e >> 7;
+        const int local = e & 127;
+        const int quad  = local >> 5;
+        const int l     = local & 31;
+        const int sb    = (group << 3) + (quad << 1) + (l >> 4);
+        const uint8_t ql_b = ql[group * 64 + (quad & 1) * 32 + l];
+        const uint8_t qh_b = qh[group * 32 + l];
+        const int raw4  = (quad < 2) ? (ql_b & 0x0F) : (ql_b >> 4);
+        const int high2 = (qh_b >> (quad * 2)) & 0x03;
+        const int val6  = (raw4 | (high2 << 4)) - 32;
+        out256[e] = d * static_cast<float>(scales[sb]) * static_cast<float>(val6);
+    }
+}
+
 static void ref_gemv_q8_0(const void* W, const float* X, float* Y, int N, int K) {
     const int bpr = K / 32;
     const char* W_bytes = static_cast<const char*>(W);
@@ -93,6 +117,24 @@ static void ref_gemv_q4k(const void* W, const float* X, float* Y, int N, int K) 
         const char* row_ptr = W_bytes + static_cast<size_t>(r) * bpr * 144;
         for (int b = 0; b < bpr; ++b) {
             ref_dequant_q4k_block(row_ptr + b * 144, blk_buf);
+            const float* x_sub = X + b * 256;
+            for (int i = 0; i < 256; ++i) {
+                acc += static_cast<double>(blk_buf[i]) * static_cast<double>(x_sub[i]);
+            }
+        }
+        Y[r] = static_cast<float>(acc);
+    }
+}
+
+static void ref_gemv_q6k(const void* W, const float* X, float* Y, int N, int K) {
+    const int bpr = K / 256;
+    const char* W_bytes = static_cast<const char*>(W);
+    float blk_buf[256];
+    for (int r = 0; r < N; ++r) {
+        double acc = 0.0;
+        const char* row_ptr = W_bytes + static_cast<size_t>(r) * bpr * 210;
+        for (int b = 0; b < bpr; ++b) {
+            ref_dequant_q6k_block(row_ptr + b * 210, blk_buf);
             const float* x_sub = X + b * 256;
             for (int i = 0; i < 256; ++i) {
                 acc += static_cast<double>(blk_buf[i]) * static_cast<double>(x_sub[i]);
@@ -262,6 +304,23 @@ static void run_q4_k_rows(BlockAccFn acc_fn, const void* W, const float* X, floa
     }
 }
 
+static void run_q6_k_rows(BlockAccFn acc_fn, const void* W, const float* X, float* Y, int N, int K) {
+    const int bpr = K / 256;
+    const char* W_bytes = static_cast<const char*>(W);
+    alignas(32) float blk_buf[256];
+    alignas(32) float acc8[8];
+    for (int r = 0; r < N; ++r) {
+        std::memset(acc8, 0, sizeof(acc8));
+        const char* row_ptr = W_bytes + static_cast<size_t>(r) * bpr * 210;
+        for (int b = 0; b < bpr; ++b) {
+            ref_dequant_q6k_block(row_ptr + b * 210, blk_buf);
+            acc_fn(blk_buf, X + b * 256, acc8);
+        }
+        Y[r] = ((acc8[0] + acc8[1]) + (acc8[2] + acc8[3])) +
+               ((acc8[4] + acc8[5]) + (acc8[6] + acc8[7]));
+    }
+}
+
 } // namespace
 
 void prewarm_quant_jit_kernels() {
@@ -334,6 +393,36 @@ void gemv_q4_k(const void* W, const float* X, float* Y, int N, int K) {
     ref_gemv_q4k(W, X, Y, N, K);
 }
 
+void gemv_q6_k(const void* W, const float* X, float* Y, int N, int K) {
+    if (N <= 0 || K <= 0) return;
+    const auto& k = get_quant_kernels();
+    if (k.available && k.q4_k_acc_fn != nullptr) {
+        if (N >= 8) {
+            const size_t row_bytes = static_cast<size_t>(K / 256) * 210;
+            int n_threads = std::min<int>(detail::cpu::ThreadPool::instance().num_threads(), N);
+            if (n_threads <= 1) {
+                run_q6_k_rows(k.q4_k_acc_fn, W, X, Y, N, K);
+            } else {
+                int chunk_size = (N + n_threads - 1) / n_threads;
+                int num_chunks = (N + chunk_size - 1) / chunk_size;
+                detail::cpu::parallel_for(static_cast<std::size_t>(num_chunks), [&](std::size_t c) {
+                    int r_start = static_cast<int>(c) * chunk_size;
+                    int r_end = std::min(r_start + chunk_size, N);
+                    if (r_start >= r_end) return;
+                    const char* W_bytes = static_cast<const char*>(W);
+                    const void* W_slice = W_bytes + static_cast<size_t>(r_start) * row_bytes;
+                    float* Y_slice = Y + r_start;
+                    run_q6_k_rows(k.q4_k_acc_fn, W_slice, X, Y_slice, r_end - r_start, K);
+                });
+            }
+        } else {
+            run_q6_k_rows(k.q4_k_acc_fn, W, X, Y, N, K);
+        }
+        return;
+    }
+    ref_gemv_q6k(W, X, Y, N, K);
+}
+
 } // namespace brotensor::detail::cpu::jit
 
 #else // !BROTENSOR_HAS_BRASS_JIT
@@ -351,6 +440,11 @@ void gemv_q8_0(const void* W, const float* X, float* Y, int N, int K) {
 void gemv_q4_k(const void* W, const float* X, float* Y, int N, int K) {
     if (N <= 0 || K <= 0) return;
     ref_gemv_q4k(W, X, Y, N, K);
+}
+
+void gemv_q6_k(const void* W, const float* X, float* Y, int N, int K) {
+    if (N <= 0 || K <= 0) return;
+    ref_gemv_q6k(W, X, Y, N, K);
 }
 
 } // namespace brotensor::detail::cpu::jit
@@ -511,7 +605,7 @@ void linear_forward_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
         throw std::runtime_error("brotensor: linear_forward_q8_0_fp16: bias size mismatch");
     }
     if (y.rows != out || y.cols != 1 || (y.dtype != Dtype::FP16 && y.dtype != Dtype::FP32)) {
-        y.resize(out, 1, Dtype::FP16);
+        y.resize(out, 1, x.dtype == Dtype::FP32 ? Dtype::FP32 : Dtype::FP16);
     }
     if (out == 0) return;
 
@@ -559,7 +653,7 @@ void linear_forward_batched_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
         throw std::runtime_error("brotensor: linear_forward_batched_q8_0_fp16: bias size mismatch");
     }
     if (Y_BD.rows != B || Y_BD.cols != out || (Y_BD.dtype != Dtype::FP16 && Y_BD.dtype != Dtype::FP32)) {
-        Y_BD.resize(B, out, Dtype::FP16);
+        Y_BD.resize(B, out, X_BD.dtype == Dtype::FP32 ? Dtype::FP32 : Dtype::FP16);
     }
     if (B == 0 || out == 0) return;
 
@@ -610,7 +704,7 @@ void linear_forward_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
         throw std::runtime_error("brotensor: linear_forward_q4k_fp16: bias size mismatch");
     }
     if (y.rows != out || y.cols != 1 || (y.dtype != Dtype::FP16 && y.dtype != Dtype::FP32)) {
-        y.resize(out, 1, Dtype::FP16);
+        y.resize(out, 1, x.dtype == Dtype::FP32 ? Dtype::FP32 : Dtype::FP16);
     }
     if (out == 0) return;
 
@@ -658,7 +752,7 @@ void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,
         throw std::runtime_error("brotensor: linear_forward_batched_q4k_fp16: bias size mismatch");
     }
     if (Y_BD.rows != B || Y_BD.cols != out || (Y_BD.dtype != Dtype::FP16 && Y_BD.dtype != Dtype::FP32)) {
-        Y_BD.resize(B, out, Dtype::FP16);
+        Y_BD.resize(B, out, X_BD.dtype == Dtype::FP32 ? Dtype::FP32 : Dtype::FP16);
     }
     if (B == 0 || out == 0) return;
 

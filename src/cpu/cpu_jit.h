@@ -42,6 +42,9 @@ void gemv_q8_0(const void* W, const float* X, float* Y, int N, int K);
 // Quantized GEMV Q4_K: Y = W_q4_k @ X
 void gemv_q4_k(const void* W, const float* X, float* Y, int N, int K);
 
+// Quantized GEMV Q6_K: Y = W_q6_k @ X
+void gemv_q6_k(const void* W, const float* X, float* Y, int N, int K);
+
 // Pre-warms all fixed CPU SIMD kernels (core, fused, and quantized) into the
 // persistent on-disk superoptimized kernel cache and in-memory dispatch tables.
 void prewarm_cpu_jit_kernels();

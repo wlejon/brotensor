@@ -605,14 +605,15 @@ static void test_dispatch_device_mismatch() {
 // ─── 9d. a null CPU vtable slot surfaces as "not implemented on CPU" ───────
 static void test_null_cpu_slot_throws() {
     std::printf("test_null_cpu_slot_throws\n");
-    // The CPU backend deliberately leaves the W8A16 slots null.
-    Tensor w_i8 = Tensor::zeros_on(Device::CPU, 4, 4, Dtype::INT8);
+    // The CPU backend deliberately leaves the W8A16 conv2d slot null.
+    Tensor w_i8 = Tensor::zeros_on(Device::CPU, 4, 9, Dtype::INT8);
     Tensor scales = Tensor::zeros_on(Device::CPU, 4, 1, Dtype::FP32);
-    Tensor x = Tensor::zeros_on(Device::CPU, 4, 2, Dtype::FP16);
-    Tensor y = Tensor::zeros_on(Device::CPU, 4, 2, Dtype::FP16);
+    Tensor x = Tensor::zeros_on(Device::CPU, 1, 16, Dtype::FP16);
+    Tensor y = Tensor::zeros_on(Device::CPU, 1, 64, Dtype::FP16);
     CHECK(throws_with([&] {
-        brotensor::matmul_int8w_fp16(w_i8, scales, x, y);
-    }, "matmul_int8w_fp16: not implemented on CPU"));
+        brotensor::conv2d_int8w_fp16_forward(x, w_i8, scales, nullptr,
+                                             1, 1, 4, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1, 1, y);
+    }, "conv2d_int8w_fp16_forward: not implemented on CPU"));
 }
 
 // ─── 10. spatial 1D / 2D / 3D dimension guards at dispatch ─────────────────
