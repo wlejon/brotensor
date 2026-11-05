@@ -54,7 +54,7 @@ void launch_fused_residual_rmsnorm_ptx(
 ) {
     if (B <= 0 || D <= 0) return;
 
-    static const std::string ptx = load_or_emit_ptx("cuda_fused_residual_rms_norm_v1", []() {
+    static const std::string ptx = load_or_emit_ptx("cuda_fused_residual_rms_norm_v2", []() {
         brass::codegen::MlFusionCompiler comp;
         return comp.emit_ptx_fused_residual_rms_norm(make_ptx_opts());
     });
@@ -112,7 +112,7 @@ void launch_fused_residual_layernorm_ptx(
 ) {
     if (B <= 0 || D <= 0) return;
 
-    static const std::string ptx = load_or_emit_ptx("cuda_fused_residual_layernorm_v1", []() {
+    static const std::string ptx = load_or_emit_ptx("cuda_fused_residual_layernorm_v2", []() {
         brass::codegen::MlFusionCompiler comp;
         return comp.emit_ptx_fused_residual_layernorm(make_ptx_opts());
     });
@@ -173,7 +173,7 @@ void launch_fused_layernorm_modulate_ptx(
 ) {
     if (R <= 0 || D <= 0) return;
 
-    static const std::string ptx = load_or_emit_ptx("cuda_fused_layernorm_modulate_v1", []() {
+    static const std::string ptx = load_or_emit_ptx("cuda_fused_layernorm_modulate_v2", []() {
         brass::codegen::MlFusionCompiler comp;
         return comp.emit_ptx_fused_layernorm_modulate(make_ptx_opts());
     });
@@ -234,7 +234,7 @@ void launch_swiglu_ptx(
     // X is one packed gate|up projection, [B, 2D] — the layout swiglu_forward
     // is defined on — so this is brass's packed kernel, not
     // fused_swiglu_kernel(gate, up, out, n), which wants two flat buffers.
-    static const std::string ptx = load_or_emit_ptx("cuda_swiglu_packed_v1", []() {
+    static const std::string ptx = load_or_emit_ptx("cuda_swiglu_packed_v2", []() {
         brass::codegen::MlFusionCompiler comp;
         return comp.emit_ptx_swiglu_packed(make_ptx_opts());
     });
@@ -288,7 +288,7 @@ void launch_modulate_ptx(
 ) {
     if (L <= 0 || D <= 0) return;
 
-    static const std::string ptx = load_or_emit_ptx("cuda_adaln_modulate_v1", []() {
+    static const std::string ptx = load_or_emit_ptx("cuda_adaln_modulate_v2", []() {
         brass::codegen::MlFusionCompiler comp;
         return comp.emit_ptx_adaln_modulate(false, make_ptx_opts());
     });
@@ -344,7 +344,7 @@ void launch_elementwise_div_ptx(
 
     static const std::string ptx = R"(
 .version 7.8
-.target sm_89
+.target sm_80
 .address_size 64
 
 .visible .entry elementwise_div_kernel(

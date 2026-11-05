@@ -225,7 +225,12 @@ inline CUstream resolve_stream(void* stream) {
 #if BROTENSOR_HAS_BRASS_CUDA_JIT
 inline brass::target::PtxOptions make_ptx_opts() {
     brass::target::PtxOptions opts;
-    opts.sm_arch = "sm_89";
+    // The oldest architecture brotensor builds for (Ampere): the driver JITs
+    // PTX forward to the GPU it runs on, never back, so a newer .target fails
+    // to load on an older card (sm_89 PTX on an RTX 3060, sm_86: "SM version
+    // specified by .target is higher than default"). These kernels use
+    // nothing past sm_80.
+    opts.sm_arch = "sm_80";
     opts.ptx_version_major = 7;
     opts.ptx_version_minor = 8;
     return opts;
