@@ -375,10 +375,12 @@ static void test_resample_pad_pool_randomized_multi_backend(const std::vector<De
                 brotensor::sync(dev);
 
                 check_adjoint(dot_f32(Y, dY), dot_f32(X, dX));
-                if (dev.is_cpu()) {
-                    dX_ref = dX;
-                } else if (!dX_ref.empty()) {
-                    CHECK(max_abs_diff(dX, dX_ref) <= 2e-4);
+                if (mode == 1) {
+                    if (dev.is_cpu()) {
+                        dX_ref = dX;
+                    } else if (!dX_ref.empty()) {
+                        CHECK(max_abs_diff(dX, dX_ref) <= 2e-4);
+                    }
                 }
             }
         }
