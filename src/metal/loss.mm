@@ -82,6 +82,7 @@ kernel void k_softmax_xent_fused(device const float* logits [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float m = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sum = 0.0f;
     for (uint i = tid; i < n; i += tg_size) {
@@ -100,6 +101,7 @@ kernel void k_softmax_xent_fused(device const float* logits [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float sum = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
 
     float local_loss = 0.0f;
@@ -185,6 +187,7 @@ kernel void k_softmax_xent_fused_batched(device const float* logits        [[buf
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float m = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sum = 0.0f;
     for (int i = int(tid); i < len; i += int(tg_size)) {
@@ -203,6 +206,7 @@ kernel void k_softmax_xent_fused_batched(device const float* logits        [[buf
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float sum = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
 
     float local_loss = 0.0f;

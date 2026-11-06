@@ -11,6 +11,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
 # Checkout layout, every job below:
 #
 #   $GITHUB_WORKSPACE/
@@ -79,25 +83,50 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
 
-      # Windows keeps the Visual Studio generator: MSBuild's /m is already
-      # bounded, and the CPU tier is only 35 test targets there.
+      - name: MSVC developer command prompt (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: sccache (Windows)
+        if: runner.os == 'Windows'
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: ccache (Linux / macOS)
+        if: runner.os != 'Windows'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: cpu-${{ matrix.name }}
+          max-size: 500M
+
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
+          SCCACHE_GHA_ENABLED: "true"
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cmake -S brotensor -B build -DCMAKE_BUILD_TYPE=Release
+            cmake -S brotensor -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=cl \
+              -DCMAKE_CXX_COMPILER=cl \
+              -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+              -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
           else
-            cmake -S brotensor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+            cmake -S brotensor -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           fi
         shell: bash
 
       - name: Build
+        env:
+          SCCACHE_GHA_ENABLED: "true"
         run: cmake --build build --config Release --parallel 4
 
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure --parallel 4
 
   # ── Metal ─────────────────────────────────────────────────────────────────
   #
@@ -148,7 +177,7 @@ jobs:
         run: cmake --build build --parallel 3
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --parallel 2
 
   # ── CUDA ──────────────────────────────────────────────────────────────────
   #
@@ -224,8 +253,10 @@ jobs:
   # this tree but added before the --coverage flags, so they are not
   # instrumented; the filters keep them out of the report either way.
   #
-  # No ccache: it interacts badly with --coverage (the .gcno sidecars are
-  # compile-time artifacts, and a cache hit skips emitting them).
+  # ccache is used ONLY for Objective-C++ (`CMAKE_OBJCXX_COMPILER_LAUNCHER`):
+  # `BROTENSOR_COVERAGE` scopes `--coverage` to `COMPILE_LANGUAGE:CXX`, so
+  # `src/metal/*.mm` TUs are uninstrumented and safe to cache, while C++ TUs
+  # compile uncached so their `.gcno` sidecars are always emitted.
   #
   # This job reports; it does not gate. gcovr's --fail-under-line would turn a
   # coverage dip into a red build, which is a policy choice worth making only
@@ -241,18 +272,25 @@ jobs:
       - name: Install gcovr + Ninja
         run: brew install gcovr ninja
 
+      - name: ccache (Objective-C++ Metal backend only)
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: coverage-objcxx-macos-15
+          max-size: 500M
+
       - name: Configure (instrumented)
         run: |
           cmake -S brotensor -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DBROTENSOR_COVERAGE=ON \
-            -DBROTENSOR_WITH_METAL=ON
+            -DBROTENSOR_WITH_METAL=ON \
+            -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: cmake --build build --parallel 3
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --parallel 2 --parallel 2
 
       # pipefail matters here: piping gcovr into tee otherwise hands the step
       # tee's exit status, so a gcovr crash produces no report and the job still

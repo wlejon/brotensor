@@ -102,6 +102,7 @@ kernel void k_cx_row_softmax(device const float* scores [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float m = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_sum = 0.0f;
     for (uint j = tid; j < Lk; j += tg_size) {

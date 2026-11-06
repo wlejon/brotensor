@@ -31,6 +31,7 @@ kernel void k_ln_forward(device const float* x       [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float mean = sdata[0] / float(n);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_v = 0.0f;
     for (uint i = tid; i < n; i += tg_size) {
@@ -83,6 +84,7 @@ kernel void k_ln_backward(device const float* dY     [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float sum_dxh = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local2 = 0.0f;
     for (uint i = tid; i < n; i += tg_size) {
@@ -134,6 +136,7 @@ kernel void k_ln_backward_fp16(device const half*  dY     [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float sum_dxh = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local2 = 0.0f;
     for (uint i = tid; i < n; i += tg_size) {
@@ -194,6 +197,7 @@ kernel void k_ln_backward_bf16(device const bfloat* dY     [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float sum_dxh = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local2 = 0.0f;
     for (uint i = tid; i < n; i += tg_size) {
@@ -242,6 +246,7 @@ void ln_forward_inference_row(device const float* x, device const float* gamma, 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float mean = sdata[0] / float(D);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_v = 0.0f;
     for (uint i = tid; i < D; i += tg_size) {
@@ -325,6 +330,7 @@ kernel void k_ln_forward_inference_batched_fp16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float mean = sdata[0] / float(D);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_v = 0.0f;
     for (uint i = tid; i < D; i += tg_size) {
@@ -384,6 +390,7 @@ kernel void k_ln_fwd_batched_caches_##SUFFIX(                                   
         threadgroup_barrier(mem_flags::mem_threadgroup);                            \
     }                                                                               \
     float mean = sdata[0] / float(D);                                               \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                \
     float local_v = 0.0f;                                                           \
     for (uint i = tid; i < D; i += tg_size) {                                       \
         float d = float(xrow[i]) - mean;                                            \
@@ -445,6 +452,7 @@ kernel void k_ln_bwd_dx_batched_##SUFFIX(                                       
         threadgroup_barrier(mem_flags::mem_threadgroup);                           \
     }                                                                              \
     float sum_dxh = sdata[0];                                                      \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                               \
     float local2 = 0.0f;                                                           \
     for (uint i = tid; i < D; i += tg_size) {                                      \
         local2 += float(dyr[i]) * float(gamma[i]) * float(hr[i]);                  \

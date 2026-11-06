@@ -149,6 +149,7 @@ kernel void k_rms_bw_fp32(device const float* X     [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float rrms = rsqrt(sdata[0] / float(D) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local2 = 0.0f;
     for (uint j = tid; j < D; j += tgs) {
@@ -202,6 +203,7 @@ kernel void k_rms_bw_fp16(device const half* X     [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float rrms = rsqrt(sdata[0] / float(D) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local2 = 0.0f;
     for (uint j = tid; j < D; j += tgs) {
@@ -327,6 +329,7 @@ kernel void k_rms_bw_bf16(device const bfloat* X     [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float rrms = rsqrt(sdata[0] / float(D) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local2 = 0.0f;
     for (uint j = tid; j < D; j += tgs) {

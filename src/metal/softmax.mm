@@ -46,6 +46,7 @@ kernel void k_softmax_fw(device const float* logits [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float m = sdata[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 2: exp(x - m), zero on masked.
     float local_sum = 0.0f;
