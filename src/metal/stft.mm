@@ -50,6 +50,7 @@ struct StftParams {
     uint32_t N;
     uint32_t signal_len;
     uint32_t n_fft;
+    uint32_t logn;
     uint32_t hop;
     uint32_t win_length;
     uint32_t pad_lo;
@@ -60,6 +61,21 @@ struct StftParams {
     float    norm;
     float    invN;
 };
+
+constexpr int kFftMax = 4096;      // n_fft * 8 bytes of threadgroup memory (32 KB)
+constexpr NSUInteger kFftThreads = 256;
+
+inline bool is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
+
+inline uint32_t log2_pow2(int n) {
+    uint32_t l = 0;
+    while ((1 << l) < n) ++l;
+    return l;
+}
+
+inline bool use_fft(int n_fft) {
+    return is_pow2(n_fft) && n_fft >= 2 && n_fft <= kFftMax;
+}
 
 // Geometry — mirrors check_geom() in src/cpu/stft.cpp.
 struct StftGeom {
@@ -100,6 +116,7 @@ StftParams make_params(const StftGeom& g, int N, int signal_len, int n_fft,
     p.N          = static_cast<uint32_t>(N);
     p.signal_len = static_cast<uint32_t>(signal_len);
     p.n_fft      = static_cast<uint32_t>(n_fft);
+    p.logn       = use_fft(n_fft) ? log2_pow2(n_fft) : 0u;
     p.hop        = static_cast<uint32_t>(hop_length);
     p.win_length = static_cast<uint32_t>(win_length);
     p.pad_lo     = static_cast<uint32_t>((n_fft - win_length) / 2);
@@ -122,6 +139,7 @@ struct StftParams {
     uint  N;
     uint  signal_len;
     uint  n_fft;
+    uint  logn;
     uint  hop;
     uint  win_length;
     uint  pad_lo;
@@ -166,6 +184,39 @@ inline float env_at(int p, device const float* window,
     return e;
 }
 
+// ── Threadgroup radix-2 Cooley-Tukey FFT (power-of-two n_fft) ───────────────
+inline uint bitrev(uint i, uint logn) {
+    return (logn == 0u) ? 0u : (reverse_bits(i) >> (32u - logn));
+}
+
+inline void block_fft_store(threadgroup float2* s, uint i, uint logn, float2 v) {
+    s[bitrev(i, logn)] = v;
+}
+
+inline void block_fft(threadgroup float2* s, uint n, int sign,
+                      uint tid, uint tpt) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint half_n = n >> 1u;
+    for (uint len = 2u; len <= n; len <<= 1u) {
+        uint half_len = len >> 1u;
+        float step = kTwoPi * float(sign) / float(len);
+        for (uint t = tid; t < half_n; t += tpt) {
+            uint j  = t & (half_len - 1u);
+            uint i0 = (t - j) * 2u + j;
+            uint i1 = i0 + half_len;
+            float ang = step * float(j);
+            float cs = precise::cos(ang);
+            float sn = precise::sin(ang);
+            float2 a = s[i0];
+            float2 b = s[i1];
+            float2 bw = float2(b.x * cs - b.y * sn, b.x * sn + b.y * cs);
+            s[i0] = a + bw;
+            s[i1] = a - bw;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // ── stft: real signal -> complex spectrogram ────────────────────────────────
 // One thread per (output frame row, bin k).
 kernel void k_stft(device const float* signal [[buffer(0)]],
@@ -194,6 +245,39 @@ kernel void k_stft(device const float* signal [[buffer(0)]],
     uint si = out_row * 2u * P.bins + 2u * k;
     spec[si]      = accr * P.norm;
     spec[si + 1u] = acci * P.norm;
+}
+
+// One threadgroup per (b, f) frame for power-of-two n_fft <= 4096.
+kernel void k_stft_fft(device const float* signal [[buffer(0)]],
+                       device const float* window [[buffer(1)]],
+                       device float*       spec   [[buffer(2)]],
+                       constant StftParams& P     [[buffer(3)]],
+                       threadgroup float2* s      [[threadgroup(0)]],
+                       uint out_row [[threadgroup_position_in_grid]],
+                       uint tid     [[thread_index_in_threadgroup]],
+                       uint tpt     [[threads_per_threadgroup]]) {
+    if (out_row >= P.N * P.frames) return;
+    uint b     = out_row / P.frames;
+    uint f     = out_row - b * P.frames;
+    uint base  = f * P.hop;
+    uint sbase = b * P.signal_len;
+    for (uint i = tid; i < P.n_fft; i += tpt) {
+        int j = int(i) - int(P.pad_lo);
+        float v = 0.0f;
+        if (j >= 0 && j < int(P.win_length)) {
+            int p = int(base) + int(i);
+            int si = padded_index(p, int(P.signal_len), int(P.n_fft),
+                                  P.center != 0u);
+            v = signal[sbase + uint(si)] * window[uint(j)];
+        }
+        block_fft_store(s, i, P.logn, float2(v, 0.0f));
+    }
+    block_fft(s, P.n_fft, -1, tid, tpt);
+    uint dbase = out_row * 2u * P.bins;
+    for (uint k = tid; k < P.bins; k += tpt) {
+        spec[dbase + 2u * k]      = s[k].x * P.norm;
+        spec[dbase + 2u * k + 1u] = s[k].y * P.norm;
+    }
 }
 
 // ── stft_backward: adjoint of stft ──────────────────────────────────────────
@@ -269,6 +353,60 @@ kernel void k_istft(device const float* spec   [[buffer(0)]],
     signal[gid] = (env > 1e-10f) ? (acc / env) : 0.0f;
 }
 
+// One threadgroup per (b, f) frame: windowed iFFT into frames_out (N*frames, win_length).
+kernel void k_istft_frame(device const float* spec       [[buffer(0)]],
+                          device const float* window     [[buffer(1)]],
+                          device float*       frames_out [[buffer(2)]],
+                          constant StftParams& P         [[buffer(3)]],
+                          threadgroup float2* s          [[threadgroup(0)]],
+                          uint out_row [[threadgroup_position_in_grid]],
+                          uint tid     [[thread_index_in_threadgroup]],
+                          uint tpt     [[threads_per_threadgroup]]) {
+    if (out_row >= P.N * P.frames) return;
+    uint sbase = out_row * 2u * P.bins;
+    uint nyq   = (P.even != 0u) ? (P.n_fft / 2u) : P.n_fft;
+    for (uint k = tid; k < P.n_fft; k += tpt) {
+        float re, im;
+        if (k < P.bins) {
+            re = spec[sbase + 2u * k];
+            im = (k == 0u || k == nyq) ? 0.0f : spec[sbase + 2u * k + 1u];
+        } else {
+            uint mk = P.n_fft - k;
+            re = spec[sbase + 2u * mk];
+            im = -spec[sbase + 2u * mk + 1u];
+        }
+        block_fft_store(s, k, P.logn, float2(re, im));
+    }
+    block_fft(s, P.n_fft, +1, tid, tpt);
+    float scale = P.norm * P.invN;
+    uint fbase = out_row * P.win_length;
+    for (uint j = tid; j < P.win_length; j += tpt) {
+        frames_out[fbase + j] = s[P.pad_lo + j].x * scale * window[j];
+    }
+}
+
+// One thread per (b, n) output sample: overlap-add of covering frames, COLA-divided.
+kernel void k_istft_ola(device const float* frames_in [[buffer(0)]],
+                        device const float* window    [[buffer(1)]],
+                        device float*       signal    [[buffer(2)]],
+                        constant StftParams& P        [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= P.N * P.signal_len) return;
+    uint b = gid / P.signal_len;
+    uint n = gid - b * P.signal_len;
+    int shift = (P.center != 0u) ? int(P.n_fft / 2u) : 0;
+    int p = int(n) + shift;
+    float env = 0.0f, acc = 0.0f;
+    for (uint f = 0u; f < P.frames; ++f) {
+        int jj = p - int(f * P.hop) - int(P.pad_lo);
+        if (jj < 0 || jj >= int(P.win_length)) continue;
+        float w = window[uint(jj)];
+        env += w * w;
+        acc += frames_in[(b * P.frames + f) * P.win_length + uint(jj)];
+    }
+    signal[gid] = (env > 1e-10f) ? (acc / env) : 0.0f;
+}
+
 // ── istft_backward: adjoint of istft ────────────────────────────────────────
 // One thread per (output frame row, bin k).
 kernel void k_istft_backward(device const float* dSignal [[buffer(0)]],
@@ -319,8 +457,11 @@ kernel void k_istft_backward(device const float* dSignal [[buffer(0)]],
         return pso;                                                            \
     }
 DEF_PSO(pso_stft,           @"k_stft")
+DEF_PSO(pso_stft_fft,       @"k_stft_fft")
 DEF_PSO(pso_stft_backward,  @"k_stft_backward")
 DEF_PSO(pso_istft,          @"k_istft")
+DEF_PSO(pso_istft_frame,    @"k_istft_frame")
+DEF_PSO(pso_istft_ola,      @"k_istft_ola")
 DEF_PSO(pso_istft_backward, @"k_istft_backward")
 #undef DEF_PSO
 
@@ -339,6 +480,27 @@ void launch(id<MTLComputePipelineState> pso, NSUInteger total,
         NSUInteger tpt = [pso maxTotalThreadsPerThreadgroup];
         if (tpt > 256) tpt = 256;
         [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+        [enc endEncoding];
+        ::brotensor::metal_impl::submit(cmd);
+    }
+}
+
+void launch_fft(id<MTLComputePipelineState> pso, NSUInteger num_groups,
+                NSUInteger tg_bytes, const Tensor& in, const Tensor& window,
+                const Tensor& out, const StftParams& params) {
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:buffer_for(in)     offset:buffer_offset_for(in)     atIndex:0];
+        [enc setBuffer:buffer_for(window) offset:buffer_offset_for(window) atIndex:1];
+        [enc setBuffer:buffer_for(out)    offset:buffer_offset_for(out)    atIndex:2];
+        [enc setBytes:&params length:sizeof(StftParams) atIndex:3];
+        [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
+        NSUInteger tpt = [pso maxTotalThreadsPerThreadgroup];
+        if (tpt > kFftThreads) tpt = kFftThreads;
+        [enc dispatchThreadgroups:MTLSizeMake(num_groups, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
@@ -374,6 +536,12 @@ void stft(const Tensor& signal, const Tensor& window,
                            : 1.0f;
     const StftParams p = make_params(g, N, signal_len, n_fft, hop_length,
                                      win_length, center, norm);
+    if (use_fft(n_fft)) {
+        launch_fft(pso_stft_fft(), static_cast<NSUInteger>(out_rows),
+                   static_cast<NSUInteger>(n_fft) * sizeof(float) * 2,
+                   signal, window, spec, p);
+        return;
+    }
     const NSUInteger total =
         static_cast<NSUInteger>(N) * g.frames * g.bins;
     launch(pso_stft(), total, signal, window, spec, p);
@@ -441,6 +609,46 @@ void istft(const Tensor& spec, const Tensor& window,
     const StftParams p = make_params(g, N, signal_len, n_fft, hop_length,
                                      win_length, center, norm);
     const NSUInteger total = static_cast<NSUInteger>(N) * signal_len;
+    if (use_fft(n_fft)) {
+        @autoreleasepool {
+            const NSUInteger fr_bytes =
+                static_cast<NSUInteger>(exp_rows) * win_length * sizeof(float);
+            id<MTLBuffer> fr_buf =
+                [::brotensor::metal_impl::device()
+                    newBufferWithLength:fr_bytes
+                                options:MTLResourceStorageModePrivate];
+            id<MTLCommandBuffer> cmd = new_command_buffer();
+            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+            id<MTLComputePipelineState> pso_fr = pso_istft_frame();
+            [enc setComputePipelineState:pso_fr];
+            [enc setBuffer:buffer_for(spec)   offset:buffer_offset_for(spec)   atIndex:0];
+            [enc setBuffer:buffer_for(window) offset:buffer_offset_for(window) atIndex:1];
+            [enc setBuffer:fr_buf             offset:0                         atIndex:2];
+            [enc setBytes:&p length:sizeof(StftParams) atIndex:3];
+            [enc setThreadgroupMemoryLength:static_cast<NSUInteger>(n_fft) * sizeof(float) * 2
+                                    atIndex:0];
+            NSUInteger tpt_fr = [pso_fr maxTotalThreadsPerThreadgroup];
+            if (tpt_fr > kFftThreads) tpt_fr = kFftThreads;
+            [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(exp_rows), 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tpt_fr, 1, 1)];
+
+            id<MTLComputePipelineState> pso_ola = pso_istft_ola();
+            [enc setComputePipelineState:pso_ola];
+            [enc setBuffer:fr_buf             offset:0                         atIndex:0];
+            [enc setBuffer:buffer_for(window) offset:buffer_offset_for(window) atIndex:1];
+            [enc setBuffer:buffer_for(signal) offset:buffer_offset_for(signal) atIndex:2];
+            [enc setBytes:&p length:sizeof(StftParams) atIndex:3];
+            NSUInteger tpt_ola = [pso_ola maxTotalThreadsPerThreadgroup];
+            if (tpt_ola > 256) tpt_ola = 256;
+            [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tpt_ola, 1, 1)];
+
+            [enc endEncoding];
+            ::brotensor::metal_impl::submit(cmd);
+        }
+        return;
+    }
     launch(pso_istft(), total, spec, window, signal, p);
 }
 
