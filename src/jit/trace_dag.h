@@ -98,7 +98,12 @@ public:
                          void* buffer, float scalar = 0.0f, float scalar2 = 0.0f);
 
     void analyze_liveness();
+    // A 64-bit digest for the in-process TraceCache (compute_hash) — and, for
+    // a key that must never be a wrong hit (the on-disk kernel cache), every
+    // field a compiler reads from the DAG, in full (key_material: one fixed-
+    // width little-endian record per node; never a buffer address).
     uint64_t compute_hash() const;
+    std::string key_material() const;
 
     // The trace's dominant shape: the largest (rows * cols) any node carries.
     // Every non-broadcast node must match it; (1, cols), (rows, 1), and (1, 1)

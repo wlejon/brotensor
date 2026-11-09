@@ -210,6 +210,39 @@ uint64_t TraceDAG::compute_hash() const {
     return hash;
 }
 
+std::string TraceDAG::key_material() const {
+    std::string out;
+    out.reserve(16 + nodes_.size() * 64);
+    auto put = [&out](uint64_t v, int bytes) {
+        for (int i = 0; i < bytes; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xFFu));
+    };
+    auto put_f32 = [&put](float f) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &f, sizeof(bits));
+        put(bits, 4);
+    };
+    put(nodes_.size(), 8);
+    for (const auto& n : nodes_) {
+        put(static_cast<uint32_t>(n.id), 4);
+        put(static_cast<uint64_t>(n.op), 1);
+        put(static_cast<uint64_t>(n.device.type), 4);
+        put(static_cast<uint32_t>(n.device.index), 4);
+        put(static_cast<uint64_t>(n.dtype), 4);
+        put(static_cast<uint32_t>(n.rows), 4);
+        put(static_cast<uint32_t>(n.cols), 4);
+        put(n.is_inplace ? 1u : 0u, 1);
+        put(static_cast<uint32_t>(n.inplace_target_slot), 4);
+        put(n.is_live_at_end ? 1u : 0u, 1);
+        put_f32(n.scalar);
+        put_f32(n.scalar2);
+        put(n.inputs.size(), 4);
+        for (int in_id : n.inputs) put(static_cast<uint32_t>(in_id), 4);
+        put(n.outputs.size(), 4);
+        for (int out_id : n.outputs) put(static_cast<uint32_t>(out_id), 4);
+    }
+    return out;
+}
+
 void TraceDAG::reset() {
     nodes_.clear();
     input_ptr_to_slot_.clear();

@@ -132,20 +132,22 @@ std::vector<void*> buffers(const TraceDAG& dag, const std::vector<plan::BufferSp
 template <typename EmitFn>
 spirv::Kernels emit_or_load_spirv(const char* tag, const TraceDAG& dag, int lanes, EmitFn&& emit_fn) {
     auto& cache = KernelDiskCache::instance();
-    const std::string base = std::string(tag) + "_" + std::to_string(dag.compute_hash()) + "_v" + std::to_string(lanes);
+    // Everything the emitters read: the plan kind, its vector width and the
+    // whole DAG (not its 64-bit digest, whose collision would be a wrong hit).
+    const std::string base = std::string(tag) + "/v" + std::to_string(lanes) + "/" + dag.key_material();
     spirv::Kernels k;
     if (lanes > 1) {
         brass::target::SpirvKernel vk;
-        if (cache.load_spirv_kernel(base + ":s", k.scalar) && cache.load_spirv_kernel(base + ":v", vk)) {
+        if (cache.load_spirv_kernel(base + "/s", k.scalar) && cache.load_spirv_kernel(base + "/v", vk)) {
             k.vec = std::move(vk);
             return k;
         }
-    } else if (cache.load_spirv_kernel(base + ":s", k.scalar)) {
+    } else if (cache.load_spirv_kernel(base + "/s", k.scalar)) {
         return k;
     }
     k = emit_fn();
-    cache.store_spirv_kernel(base + ":s", k.scalar);
-    if (k.vec) cache.store_spirv_kernel(base + ":v", *k.vec);
+    cache.store_spirv_kernel(base + "/s", k.scalar);
+    if (k.vec) cache.store_spirv_kernel(base + "/v", *k.vec);
     return k;
 }
 

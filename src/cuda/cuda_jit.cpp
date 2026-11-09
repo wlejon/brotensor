@@ -28,9 +28,15 @@ bool is_cuda_jit_available() {
 
 namespace {
 
+// `name` names the kernel; the PTX options every emitter here is handed
+// (make_ptx_opts) complete what the disk key must cover.
 template <typename EmitFn>
-std::string load_or_emit_ptx(const char* sig, EmitFn&& emit_fn) {
+std::string load_or_emit_ptx(const char* name, EmitFn&& emit_fn) {
     auto& cache = brotensor::jit::KernelDiskCache::instance();
+    const brass::target::PtxOptions o = make_ptx_opts();
+    const std::string sig = std::string(name) + "/" + o.sm_arch + "/ptx" +
+                            std::to_string(o.ptx_version_major) + "." + std::to_string(o.ptx_version_minor) +
+                            (o.cleanup ? "/cleanup" : "/raw");
     std::string ptx;
     if (cache.load_ptx(sig, ptx)) {
         return ptx;

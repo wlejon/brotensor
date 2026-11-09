@@ -519,7 +519,9 @@ static std::shared_ptr<TraceHandleImpl> compile_cpu_elementwise(const TraceDAG& 
     tb.builder().build_ret_void();
     };
 
-    const std::string sig_key = "cpu_trace_ew_" + std::to_string(dag.compute_hash());
+    // The whole DAG, not its 64-bit digest: a digest collision on disk would
+    // be another trace's kernel.
+    const std::string sig_key = "cpu_trace_ew/" + dag.key_material();
     KernelDiskCache::CpuCompileOptions c_opts;
     c_opts.enable_unroll = false;
     c_opts.enable_fp_reassociation = false;

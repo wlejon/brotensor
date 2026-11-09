@@ -91,10 +91,13 @@ std::shared_ptr<TraceHandleImpl> compile_elementwise(const TraceDAG& dag,
                                                      const ptx::ElementwisePlan& plan) {
     const std::string arch = query_cuda_arch();
     const std::string key = "trace_ew_" + arch + "_" + std::to_string(dag.compute_hash());
+    // On disk the whole DAG, not its digest: a collision there would be
+    // another trace's kernel in every later process.
+    const std::string disk_sig = "trace_ew/" + arch + "/" + dag.key_material();
     std::string ptx_src;
-    if (!KernelDiskCache::instance().load_ptx(key, ptx_src)) {
+    if (!KernelDiskCache::instance().load_ptx(disk_sig, ptx_src)) {
         ptx_src = ptx::emit_elementwise(dag, plan, arch);
-        KernelDiskCache::instance().store_ptx(key, ptx_src);
+        KernelDiskCache::instance().store_ptx(disk_sig, ptx_src);
     }
 
     // One key per entry: the engine caches CUfunctions, not modules.
@@ -166,10 +169,11 @@ std::shared_ptr<TraceHandleImpl> compile_row_norm(const TraceDAG& dag,
                                                   const ptx::RowNormPlan& plan) {
     const std::string arch = query_cuda_arch();
     const std::string key = "trace_rn_" + arch + "_" + std::to_string(dag.compute_hash());
+    const std::string disk_sig = "trace_rn/" + arch + "/" + dag.key_material();
     std::string ptx_src;
-    if (!KernelDiskCache::instance().load_ptx(key, ptx_src)) {
+    if (!KernelDiskCache::instance().load_ptx(disk_sig, ptx_src)) {
         ptx_src = ptx::emit_row_norm(dag, plan, arch);
-        KernelDiskCache::instance().store_ptx(key, ptx_src);
+        KernelDiskCache::instance().store_ptx(disk_sig, ptx_src);
     }
 
     CUfunction fn_vec =

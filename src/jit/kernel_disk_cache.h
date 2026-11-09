@@ -1,32 +1,37 @@
 #pragma once
 
-// ─── Persistent On-Disk Superoptimized ML Kernel Cache ───────────────────────
+// ─── brotensor's On-Disk Kernel Cache ────────────────────────────────────────
 //
-// Caches compiled and superoptimized ML kernels on disk across:
-//   - CPU SIMD (x86_64 AVX2/FMA and AArch64 NEON via brass::target::AotLinker
-//     and brass::target::DynamicLibrary)
-//   - Vulkan SPIR-V 1.5 compute shader binaries & push-constant layouts
-//   - CUDA PTX assembly modules
+// What brotensor compiles — CPU kernels (MIR -> a linked, loadable image),
+// Vulkan SPIR-V kernels with their launch metadata, CUDA PTX — kept across
+// processes in brass's artifact cache (brass docs/artifact_cache.md). brass
+// owns the file format, the keys' hashing, atomic stores, the byte budget and
+// "MIR -> cached loadable native module"; this file owns only brotensor's
+// policy: where the directory is, its budget, what goes into each key, and the
+// SpirvKernel encoding.
 //
-// Cache directory resolution:
-//   1. Explicit override via set_cache_dir() (if non-empty)
-//   2. $BRO_ML_CACHE_DIR environment variable
+// Directory (first that applies):
+//   1. set_cache_dir() (tests)
+//   2. $BRO_ML_CACHE_DIR
 //   3. $XDG_CACHE_HOME/brotensor/kernels
 //   4. $HOME/.cache/brotensor/kernels
 //   5. <temp_directory_path>/brotensor_kernel_cache
+// Budget: set_max_bytes(), else $BRO_ML_CACHE_MAX_MB, else 256 MiB; the
+// least recently used entries go first. BRO_ML_CACHE_DISABLE=1 turns the
+// cache off (CPU kernels are then compiled in memory by brass's KernelJit).
 //
-// Disable caching at runtime by setting BRO_ML_CACHE_DISABLE=1.
+// Every key is KeyBuilder(kKeyDomain) + add_brass_build() (brass's version,
+// the binary holding brass — so any rebuild of brotensor is a new key space —
+// the target and the host CPU's AVX/AVX2/FMA) + the kind ("cpu", "spirv",
+// "ptx") + the caller's `signature`, hashed in full. A signature must name
+// everything the build reads that the binary does not fix: the trace
+// compilers pass TraceDAG::key_material() and their plan parameters, never a
+// digest. CPU keys add the entry name, every CpuCompileOptions field and the
+// pass budgets the build runs with.
 //
-// Binary container format (.btkc):
-//   [0..4)   Magic: "BTKC" (0x434B5442 little-endian)
-//   [4..8)   Version: uint32_t (1)
-//   [8..12)  BackendKind: uint32_t (1=CpuNative, 2=VulkanSpirv, 3=CudaPtx, 4=VulkanSpirvMeta)
-//   [12..16) Reserved: uint32_t (0)
-//   [16..24) Payload byte length: uint64_t
-//   [24..32) Payload 64-bit FNV-1a checksum: uint64_t
-//   [32..N)  Payload bytes
+// Files of the old format (*.btkc, the .rt/ load copies) are never read; they
+// are deleted the first time a directory is opened.
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -44,8 +49,8 @@
 #endif
 
 #if BROTENSOR_HAS_BRASS_JIT
+#include <brass/cache/artifact_cache.hpp>
 #include <brass/mir/module.hpp>
-#include <brass/target/dynamic_library.hpp>
 #include <brass/target/spirv_target.hpp>
 #endif
 
@@ -53,20 +58,18 @@ namespace brotensor::jit {
 
 class KernelDiskCache {
 public:
-    enum class BackendKind : uint32_t {
-        CpuNative       = 1,
-        VulkanSpirv     = 2,
-        CudaPtx         = 3,
-        VulkanSpirvMeta = 4,
-    };
+    // The key schema. Bump the suffix when what a key covers changes.
+    static constexpr std::string_view kKeyDomain = "brotensor.kernel/2";
+    static constexpr uint64_t kDefaultMaxBytes = uint64_t{256} << 20;
 
     struct Stats {
-        size_t hits        = 0;
-        size_t misses      = 0;
-        size_t writes      = 0;
-        size_t corruptions = 0;
+        size_t hits        = 0;   // loaded from disk
+        size_t misses      = 0;   // compiled
+        size_t writes      = 0;   // stored after a compile
+        size_t corruptions = 0;   // an entry that was there but could not be used
     };
 
+    // Everything here reaches the CPU kernel's code, so all of it is in the key.
     struct CpuCompileOptions {
         bool enable_loop_opt         = true;
         bool enable_avx2             = true;
@@ -81,51 +84,47 @@ public:
 
     static KernelDiskCache& instance();
 
-    // Returns false when BRO_ML_CACHE_DISABLE=1 is set in the environment.
+    // False when BRO_ML_CACHE_DISABLE=1 (or true), or when brotensor was built
+    // without brass.
     bool is_enabled() const noexcept;
 
-    // Resolves the active cache directory on disk.
     std::filesystem::path cache_dir() const;
-
-    // Sets or clears an explicit directory override (useful for isolated tests).
     void set_cache_dir(std::filesystem::path dir);
     void clear_cache_dir_override();
 
-    // Computes the 32-character hex 128-bit FNV-1a cache key for (backend_tag, signature, abi_stamp).
-    std::string compute_key(std::string_view backend_tag, std::string_view signature) const;
+    uint64_t max_bytes() const;
+    // 0 restores the default (the environment, else kDefaultMaxBytes).
+    void set_max_bytes(uint64_t bytes);
 
-    // Returns the host CPU backend tag ("cpu_x64", "cpu_arm64", or "cpu_generic").
-    static std::string_view host_cpu_backend_tag() noexcept;
-
-    // Returns the path to the .btkc file for a given 128-bit hex key.
-    std::filesystem::path entry_path_for_key(std::string_view key_hex) const;
-
-    // Raw binary blob load/store with BTKC header and 64-bit FNV-1a verification.
-    bool store_raw(BackendKind kind, std::string_view backend_tag, std::string_view signature,
-                   const void* data, size_t size_bytes);
-    bool load_raw(BackendKind kind, std::string_view backend_tag, std::string_view signature,
-                  std::vector<uint8_t>& out_bytes);
-
-    // Vulkan SPIR-V words load/store.
-    bool store_spirv(std::string_view signature, const std::vector<uint32_t>& words);
-    bool load_spirv(std::string_view signature, std::vector<uint32_t>& out_words);
-
-    // CUDA PTX string load/store.
+    // CUDA PTX text.
     bool store_ptx(std::string_view signature, std::string_view ptx);
     bool load_ptx(std::string_view signature, std::string& out_ptx);
 
 #if BROTENSOR_HAS_BRASS_JIT
-    // Full SpirvKernel metadata + SPIR-V words load/store for Vulkan trace compiler.
+    // The key a PTX / SPIR-V blob of `kind` is stored under.
+    static brass::cache::CacheKey blob_key(std::string_view kind, std::string_view signature);
+    // The key a CPU kernel is stored under (NativeModuleCache adds the link
+    // options to it): what compile_or_load_cpu_kernel builds from.
+    static brass::cache::CacheKey cpu_key(std::string_view signature, std::string_view entry_name,
+                                          const CpuCompileOptions& opts);
+    // Where those live (tests).
+    std::filesystem::path blob_entry_path(std::string_view kind, std::string_view signature) const;
+    std::filesystem::path cpu_entry_path(std::string_view signature, std::string_view entry_name,
+                                         const CpuCompileOptions& opts) const;
+
+    // A SPIR-V kernel and everything needed to launch it.
     bool store_spirv_kernel(std::string_view signature, const brass::target::SpirvKernel& kernel);
     bool load_spirv_kernel(std::string_view signature, brass::target::SpirvKernel& out_kernel);
 
-    // Compiles or loads a superoptimized CPU SIMD kernel via brass::target::AotLinker
-    // and brass::target::DynamicLibrary.
-    // On cache hit: validates the .btkc file, loads the shared object via DynamicLibrary::open,
-    // and returns the resolved symbol pointer without building or compiling MIR.
-    // On cache miss (or corruption): invokes build_fn(mod), runs loop optimization,
-    // SMT guard elimination, and MIR superoptimization, links an AOT shared library,
-    // atomically writes the .btkc file, and loads the symbol via DynamicLibrary::open.
+    // A CPU kernel: loaded from the cache, or built — build_fn fills the
+    // module, then brotensor's passes run (SMT guard elimination, MIR
+    // superoptimization, loop optimization, per `opts`) — compiled, linked,
+    // stored and loaded by brass's NativeModuleCache. A module that calls
+    // functions it does not define cannot be a cached image; it is compiled
+    // in memory by KernelJit instead (also when the cache is disabled). The
+    // code stays loaded until clear_loaded_libraries(), whatever happens to
+    // its cache entry. Null when the kernel cannot be had; an exception from
+    // build_fn propagates.
     void* compile_or_load_cpu_kernel(
         std::string_view signature,
         std::string_view entry_name,
@@ -159,29 +158,32 @@ public:
         return compile_or_load_cpu_fn<FnPtr>(signature, entry_name, std::forward<BuildFn>(build_fn),
                                              CpuCompileOptions{});
     }
+
+    // Walks the directory now, evicting down to the budget (tests,
+    // maintenance); returns what the entries take afterwards.
+    uint64_t trim();
 #endif
 
     Stats stats() const noexcept;
     void reset_stats() noexcept;
 
-    // Releases in-memory loaded DynamicLibrary handles (only call in single-threaded test resets
-    // after clearing cached function pointers).
+    // Unloads every CPU kernel this cache handed out (only after the callers'
+    // function pointers are gone: single-threaded test resets).
     void clear_loaded_libraries();
 
 private:
     KernelDiskCache() = default;
 
+    struct Stores;
+    std::shared_ptr<Stores> stores() const;   // null when disabled
+
     mutable std::mutex mutex_;
     std::filesystem::path override_dir_;
-#if BROTENSOR_HAS_BRASS_JIT
-    std::vector<std::unique_ptr<brass::target::DynamicLibrary>> loaded_libs_;
-    std::vector<std::shared_ptr<void>> fallback_engines_;
-#endif
+    uint64_t override_max_bytes_ = 0;
+    mutable std::shared_ptr<Stores> stores_;
+    std::vector<std::shared_ptr<const void>> loaded_;   // NativeModules and KernelJit engines
 
-    mutable std::atomic<size_t> hits_{0};
-    mutable std::atomic<size_t> misses_{0};
-    mutable std::atomic<size_t> writes_{0};
-    mutable std::atomic<size_t> corruptions_{0};
+    mutable Stats stats_;
 };
 
 using MlKernelDiskCache = KernelDiskCache;
