@@ -87,9 +87,24 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Seed sccache tool cache (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARCH="x64"; ASSET="sccache-v0.19.0-x86_64-pc-windows-msvc.tar.gz"
+          DEST="$RUNNER_TOOL_CACHE/sccache/0.19.0/$ARCH"
+          mkdir -p "$DEST"
+          if (cd "$DEST" && gh release download v0.19.0 -R mozilla/sccache -p "$ASSET" -O "$ASSET" && tar -xzf "$ASSET" --strip-components=1 && rm -f "$ASSET"); then
+            touch "${DEST}.complete"
+          fi
+
       - name: sccache (Windows)
         if: runner.os == 'Windows'
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.19.0"
 
       - name: ccache (Linux / macOS)
         if: runner.os != 'Windows'
@@ -335,23 +350,25 @@ jobs:
       - name: Job summary
         if: always()
         run: |
-          {
-            echo '## Coverage — core + CPU backend'
-            echo
-            echo 'Measured on the macOS runner with Metal enabled, so the CPU↔GPU'
-            echo 'parity suite runs — it is the biggest exerciser of `src/cpu/`, since'
-            echo 'every parity test calls the CPU op as its reference, and it does not'
-            echo 'build at all without a GPU backend.'
-            echo
-            echo 'Scope: `src/` + `include/brotensor/`. The CUDA and Metal backends are'
-            echo 'compiled by nvcc / the Apple toolchain, are not gcov-instrumented, and'
-            echo 'are excluded rather than counted as 0%. bronze and brass, built'
-            echo 'in-tree, are not instrumented and are filtered out.'
-            echo
-            echo '```'
-            cat coverage-summary.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f coverage-summary.txt ]; then
+            {
+              echo '## Coverage — core + CPU backend'
+              echo
+              echo 'Measured on the macOS runner with Metal enabled, so the CPU↔GPU'
+              echo 'parity suite runs — it is the biggest exerciser of `src/cpu/`, since'
+              echo 'every parity test calls the CPU op as its reference, and it does not'
+              echo 'build at all without a GPU backend.'
+              echo
+              echo 'Scope: `src/` + `include/brotensor/`. The CUDA and Metal backends are'
+              echo 'compiled by nvcc / the Apple toolchain, are not gcov-instrumented, and'
+              echo 'are excluded rather than counted as 0%. bronze and brass, built'
+              echo 'in-tree, are not instrumented and are filtered out.'
+              echo
+              echo '```'
+              cat coverage-summary.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # Coverage lives entirely inside GitHub: the headline numbers land in the
       # run's job summary (above) and the full line-by-line drill-down is this
