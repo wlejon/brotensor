@@ -97,6 +97,9 @@ add_executable(brotensor_test_api
     test_api_gate.cpp
 )
 target_link_libraries(brotensor_test_api PRIVATE brotensor_api bronze::runtime_shared)
+if(MSVC)
+    target_link_options(brotensor_test_api PRIVATE /DEBUG)
+endif()
 # bronze's shared runtime is built into BRONZE_SHARED_RUNTIME_DIR, not beside
 # this executable, and the PE loader only looks beside the .exe (0xc0000135 +
 # a modal "dll was not found" otherwise). Stage it next to the test as a
