@@ -669,139 +669,14 @@ static void test_js_attention() {
     )JS");
 }
 
-#if defined(_WIN32) && defined(_M_X64)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <dbghelp.h>
-#pragma comment(lib, "dbghelp.lib")
-
-static volatile long g_win_stage = 0;
-
-static bool win_readable(uintptr_t addr, size_t len) {
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi))) return false;
-    if (mbi.State != MEM_COMMIT) return false;
-    const DWORD prot = mbi.Protect & 0xFFu;
-    if (prot == PAGE_NOACCESS || prot == 0) return false;
-    if (mbi.Protect & PAGE_GUARD) return false;
-    const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    return addr + len <= region_end;
-}
-
-static void win_dump_frame(HANDLE proc, DWORD64 pc, int idx, DWORD64 sp, DWORD64 bp) {
-    HMODULE mod = nullptr;
-    char mod_path[MAX_PATH] = "?";
-    DWORD64 base = 0;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(pc)), &mod) &&
-        mod != nullptr) {
-        base = reinterpret_cast<DWORD64>(mod);
-        GetModuleFileNameA(mod, mod_path, MAX_PATH);
-    }
-    const char* mname = mod_path;
-    for (const char* p = mod_path; *p; ++p) {
-        if (*p == '\\' || *p == '/') mname = p + 1;
-    }
-    DWORD64 img_base = 0;
-    PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(pc, &img_base, nullptr);
-    alignas(SYMBOL_INFO) char sym_buf[sizeof(SYMBOL_INFO) + 256] = {};
-    auto* sym = reinterpret_cast<SYMBOL_INFO*>(sym_buf);
-    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-    sym->MaxNameLen = 255;
-    DWORD64 disp = 0;
-    const char* sname = SymFromAddr(proc, pc, &disp, sym) ? sym->Name : "?";
-    std::fprintf(stderr, "  #%02d pc=0x%llX sp=0x%llX bp=0x%llX %s+0x%llX rf=[0x%lX..0x%lX] %s+0x%llX\n",
-                 idx, static_cast<unsigned long long>(pc), static_cast<unsigned long long>(sp),
-                 static_cast<unsigned long long>(bp), mname,
-                 static_cast<unsigned long long>(base ? pc - base : 0),
-                 rf ? rf->BeginAddress : 0ul, rf ? rf->EndAddress : 0ul,
-                 sname, static_cast<unsigned long long>(disp));
-}
-
-static LONG WINAPI win_crash_veh(EXCEPTION_POINTERS* ep) {
-    const DWORD code = ep->ExceptionRecord->ExceptionCode;
-    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW &&
-        code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_DATATYPE_MISALIGNMENT &&
-        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != 0xC0000409u) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    static volatile long in_handler = 0;
-    if (InterlockedCompareExchange(&in_handler, 1, 0) != 0) return EXCEPTION_CONTINUE_SEARCH;
-
-    HANDLE proc = GetCurrentProcess();
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-    SymInitialize(proc, nullptr, TRUE);
-
-    const auto* er = ep->ExceptionRecord;
-    const CONTEXT* ctx = ep->ContextRecord;
-    std::fprintf(stderr, "\n=== WIN64 CRASH stage=%ld code=0x%08lX addr=%p info0=%llu info1=0x%llX ===\n",
-                 g_win_stage, static_cast<unsigned long>(code), er->ExceptionAddress,
-                 er->NumberParameters > 0 ? static_cast<unsigned long long>(er->ExceptionInformation[0]) : 0ull,
-                 er->NumberParameters > 1 ? static_cast<unsigned long long>(er->ExceptionInformation[1]) : 0ull);
-    std::fprintf(stderr, "RIP=0x%llX RSP=0x%llX RBP=0x%llX RAX=0x%llX RBX=0x%llX RCX=0x%llX RDX=0x%llX\n",
-                 static_cast<unsigned long long>(ctx->Rip), static_cast<unsigned long long>(ctx->Rsp),
-                 static_cast<unsigned long long>(ctx->Rbp), static_cast<unsigned long long>(ctx->Rax),
-                 static_cast<unsigned long long>(ctx->Rbx), static_cast<unsigned long long>(ctx->Rcx),
-                 static_cast<unsigned long long>(ctx->Rdx));
-    std::fprintf(stderr, "RSI=0x%llX RDI=0x%llX R8=0x%llX R9=0x%llX R12=0x%llX R13=0x%llX R14=0x%llX R15=0x%llX\n",
-                 static_cast<unsigned long long>(ctx->Rsi), static_cast<unsigned long long>(ctx->Rdi),
-                 static_cast<unsigned long long>(ctx->R8), static_cast<unsigned long long>(ctx->R9),
-                 static_cast<unsigned long long>(ctx->R12), static_cast<unsigned long long>(ctx->R13),
-                 static_cast<unsigned long long>(ctx->R14), static_cast<unsigned long long>(ctx->R15));
-    if (ctx->Rip >= 16 && win_readable(static_cast<uintptr_t>(ctx->Rip - 16), 32)) {
-        const auto* bytes = reinterpret_cast<const unsigned char*>(static_cast<uintptr_t>(ctx->Rip - 16));
-        std::fprintf(stderr, "code[-16..+16]:");
-        for (int i = 0; i < 32; ++i) std::fprintf(stderr, "%s%02X", i == 16 ? " *" : " ", bytes[i]);
-        std::fprintf(stderr, "\n");
-    }
-    CONTEXT uctx = *ctx;
-    win_dump_frame(proc, uctx.Rip, 0, uctx.Rsp, uctx.Rbp);
-    for (int i = 1; i < 24; ++i) {
-        DWORD64 img_base = 0;
-        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(uctx.Rip, &img_base, nullptr);
-        if (rf != nullptr) {
-            PVOID hdata = nullptr;
-            DWORD64 estab = 0;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, img_base, uctx.Rip, rf, &uctx, &hdata, &estab, nullptr);
-        } else if (i == 1 && win_readable(static_cast<uintptr_t>(uctx.Rsp), 8)) {
-            uctx.Rip = *reinterpret_cast<const DWORD64*>(static_cast<uintptr_t>(uctx.Rsp));
-            uctx.Rsp += 8;
-        } else {
-            break;
-        }
-        if (uctx.Rip == 0) break;
-        win_dump_frame(proc, uctx.Rip, i, uctx.Rsp, uctx.Rbp);
-    }
-    std::fflush(stderr);
-    std::fflush(stdout);
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-#define WIN_STAGE(n) (g_win_stage = (n))
-#else
-#define WIN_STAGE(n) ((void)0)
-#endif
-
 int main() {
     // Unbuffered, so a crash inside a native still shows how far the run got
     // when stdout is a pipe (ctest, a shell capture).
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-#if defined(_WIN32) && defined(_M_X64)
-    AddVectoredExceptionHandler(1, win_crash_veh);
-#endif
-    WIN_STAGE(1);
     brotensor::init();
-    WIN_STAGE(2);
     brotensor::api::installTensor();
-    WIN_STAGE(3);
 
     test_native_handles();
-    WIN_STAGE(4);
     test_js_api();
     test_js_safetensors();
     test_js_rng();
