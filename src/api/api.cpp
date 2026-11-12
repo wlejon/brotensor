@@ -63,9 +63,9 @@ bool ctor(const char* path, void* f, ev::HandleDestructor dtor, bronze::runtime:
 void publishPrototype(const char* ns, const char* className, const char* protoName) {
     ev::GlobalValue root = ev::globalValue("__bro_native");
     if (!root.found || !ev::isObject(root.value)) return;
+    ev::Persistent rootSlot(root.value);
     ev::GlobalValue proto = ev::nativeClassPrototype(className);
     if (!proto.found) return;
-    ev::Persistent rootSlot(root.value);
     ev::Persistent protoSlot(proto.value);
     ev::Persistent nsSlot(ev::getProperty(rootSlot.get(), ns));
     if (!ev::isObject(nsSlot.get())) return;
@@ -320,17 +320,17 @@ void installTensorJS() {
 void installTensor() {
     auto g = ev::globalValue("__bro_native");
     if (!g.found || !ev::isObject(g.value)) {
-        ev::Value obj = ev::createObject();
-        ev::registerGlobal("__bro_native", obj);
+        ev::Persistent objSlot(ev::createObject());
+        ev::registerGlobal("__bro_native", objSlot.get());
     }
-    auto bn = ev::globalValue("__bro_native").value;
-    ev::Persistent bnSlot(bn);
+    ev::Persistent bnSlot(ev::globalValue("__bro_native").value);
     ev::Persistent tensorSlot(ev::createObject());
     ev::setProperty(bnSlot.get(), "tensor", tensorSlot.get());
 
     auto gt = ev::globalValue("globalThis");
     if (gt.found && ev::isObject(gt.value)) {
-        ev::setProperty(gt.value, "__bro_native", bnSlot.get());
+        ev::Persistent gtSlot(gt.value);
+        ev::setProperty(gtSlot.get(), "__bro_native", bnSlot.get());
     }
 
     registerTensorNatives();

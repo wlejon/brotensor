@@ -32,19 +32,19 @@ static int g_failures = 0;
 static void test_native_handles() {
     std::printf("test_native_handles...\n");
     brotensor::Tensor t = brotensor::Tensor::zeros(3, 4, brotensor::Dtype::FP32);
-    bronze::Value val = brotensor::api::createGpuTensorValue(std::move(t));
-    CHECK(!bronze::embed::isUndefined(val));
-    CHECK(!bronze::embed::isNull(val));
+    bronze::embed::Persistent val(brotensor::api::createGpuTensorValue(std::move(t)));
+    CHECK(!bronze::embed::isUndefined(val.get()));
+    CHECK(!bronze::embed::isNull(val.get()));
 
-    brotensor::Tensor* unwrapped = brotensor::api::getTensorFromHandle(val);
+    brotensor::Tensor* unwrapped = brotensor::api::getTensorFromHandle(val.get());
     CHECK(unwrapped != nullptr);
     CHECK(unwrapped->rows == 3);
     CHECK(unwrapped->cols == 4);
     CHECK(unwrapped->size() == 12);
 
     int dummy = 7;
-    bronze::Value foreign = bronze::embed::makeHandle(&dummy, [](void*) {});
-    CHECK(brotensor::api::getTensorFromHandle(foreign) == nullptr);
+    bronze::embed::Persistent foreign(bronze::embed::makeHandle(&dummy, [](void*) {}));
+    CHECK(brotensor::api::getTensorFromHandle(foreign.get()) == nullptr);
 }
 
 static void test_js_api() {

@@ -96,21 +96,11 @@ add_executable(brotensor_test_api
     test_api_bounds.cpp
     test_api_gate.cpp
 )
-# brass FIRST, and /INCLUDE a symbol only brass's GC object defines: both
-# brass.lib and bronze_runtime_shared.dll define brass_gc_write_barrier, and
-# the bronze-compiled tensor.o inside brotensor_api references it the way a
-# loaded module would. Naming brass first and forcing its GC object in before
-# any static reference exists makes MSVC resolve the barrier against brass
-# and never pull the DLL's member — LNK2005 otherwise. Same recipe as bro's
-# bronze_host (BRO_BRASS_LIB + /INCLUDE:brass_gc_card_table_base).
-target_link_libraries(brotensor_test_api PRIVATE ${BROTENSOR_BRASS_LIB} brotensor_api bronze::runtime_shared)
-if(MSVC)
-    target_link_options(brotensor_test_api PRIVATE "/INCLUDE:brass_gc_card_table_base")
-endif()
+target_link_libraries(brotensor_test_api PRIVATE brotensor_api bronze::runtime_shared)
 # bronze's shared runtime is built into BRONZE_SHARED_RUNTIME_DIR, not beside
 # this executable, and the PE loader only looks beside the .exe (0xc0000135 +
 # a modal "dll was not found" otherwise). Stage it next to the test as a
-# post-build step and put both dirs on ctest's PATH.
+# post-build step and prepend both dirs to ctest's PATH.
 if(WIN32)
     add_custom_command(TARGET brotensor_test_api POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -126,16 +116,13 @@ add_test(NAME brotensor_test_api COMMAND brotensor_test_api)
 # poisoned: a binding that holds a raw Value across an allocating call reads
 # garbage here instead of passing by luck. `ctest -LE gcstress` skips it.
 add_test(NAME brotensor_test_api_gcstress COMMAND brotensor_test_api)
+set_tests_properties(brotensor_test_api_gcstress PROPERTIES
+    ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1"
+    LABELS gcstress)
 if(WIN32)
-    set_tests_properties(brotensor_test_api PROPERTIES
-        ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brotensor_test_api>;$ENV{PATH}")
-    set_tests_properties(brotensor_test_api_gcstress PROPERTIES
-        ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1;PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brotensor_test_api>;$ENV{PATH}"
-        LABELS gcstress)
-else()
-    set_tests_properties(brotensor_test_api_gcstress PROPERTIES
-        ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1"
-        LABELS gcstress)
+    set_tests_properties(brotensor_test_api brotensor_test_api_gcstress PROPERTIES
+        ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:bronze_runtime_shared>;PATH=path_list_prepend:$<TARGET_FILE_DIR:brotensor_test_api>")
 endif()
 endif() # BROTENSOR_API_COMPILED_JS
 
