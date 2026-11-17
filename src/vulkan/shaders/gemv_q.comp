@@ -1,9 +1,11 @@
 #version 460
-// Quantised-weight linear for the decode regime: Y(MB, N) = X(MB, K) W(N, K)^T
-// (+ bias), MB <= 8 rows of X, W in one of four storage formats, decoded in
-// registers and never materialised. Memory-bound on reading W once.
-// FMT is a QF_* code (op_codes.h):
+// Quantised-weight linear for the decode regime: Y(MB, *) from X(MB, K) and
+// W(N, K) with the linear epilogues (gemm_common.glsl: bias, ACT, store /
+// accumulate / GeGLU / SwiGLU), MB <= 8 rows of X, W in one of five storage
+// formats, decoded in registers and never materialised. Memory-bound on
+// reading W once. FMT is a QF_* code (op_codes.h):
 //   QF_INT8  INT8, per-row FP32 scale (W8A16): w = q * scale[n]
+//   QF_FP8   FP8 E4M3, per-row FP32 scale: w = e4m3(q) * scale[n]
 //   QF_Q8_0  GGUF Q8_0: 34-byte blocks of 32 {fp16 d; int8 q[32]}, w = d q
 //   QF_Q4K   GGUF Q4_K: 144-byte super-blocks of 256 {fp16 d, dmin; 12 bytes
 //          of packed 6-bit (scale, min) pairs for 8 sub-blocks of 32; 128
@@ -28,8 +30,15 @@
 // the GEMM's first rule: a load consumed where it is issued stalls there).
 // Lanes reduce with a subgroup butterfly, and through shared memory when a
 // row spans several subgroups (the host pins the subgroup size, SG).
+//
+// The GLUs pair two W rows into one output column: a lane group's NR rows
+// (NR even, host-checked) are taken in the order gate, up, gate, up, so
+// logical row l is W row l for GeGLU (2j, 2j + 1) and, for SwiGLU, row l / 2
+// (even l) or N / 2 + l / 2 (odd l); both rows of a pair end in one lane.
 #include "common.glsl"
 #include "op_codes.h"
+#include "fp8.glsl"
+#include "gemm_act.glsl"
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -44,6 +53,8 @@ layout(constant_id = 4) const uint BIAS = 0;
 layout(constant_id = 5) const uint UNR = 2;     // items in flight per lane
 layout(constant_id = 6) const uint SG = 32;     // the subgroup size the host pinned
 layout(constant_id = 7) const uint NR = 1;      // W rows per lane group (1, 2, 4): X loaded once for all
+layout(constant_id = 8) const uint ACT = 0;     // LACT_*
+layout(constant_id = 9) const uint EPI = 0;     // EPI_*; pc.ldy is the pitch of the output Y
 
 layout(push_constant) uniform PC {
     uint64_t x, w, y, bias, scale;
@@ -55,7 +66,9 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer U4Buf { uve
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16x4 { u16vec4 v; };   // 8 bytes, 2-aligned
 
 const uint RPW = 256u / LPR;                    // lane groups per workgroup (NR rows each)
-const uint IE = (FMT <= QF_Q8_0) ? 16u : 32u;        // elements per item
+const bool BYTEQ = FMT == QF_INT8 || FMT == QF_FP8;  // one byte per weight, a row scale
+const uint IE = (BYTEQ || FMT == QF_Q8_0) ? 16u : 32u;   // elements per item
+const bool GLU = EPI == EPI_GEGLU || EPI == EPI_SWIGLU;
 const uint CL = LPR < SG ? LPR : SG;           // lanes of one row inside one subgroup
 shared float s_part[256 / 16 * 8 * NR];         // [subgroup][W row][row of X]
 
@@ -63,7 +76,7 @@ shared float s_part[256 / 16 * 8 * NR];         // [subgroup][W row][row of X]
 // Data that is only 2-byte aligned (Q8_0, Q6_K) is loaded as 16-bit words and
 // packed into 32-bit ones by the decode.
 struct Item {
-    uvec4 q;            // INT8: 16 quants; Q4_K: 16 bytes of nibbles
+    uvec4 q;            // INT8 / FP8: 16 quants; Q4_K: 16 bytes of nibbles
     uvec4 h;            // Q4_K: the 16-byte header
     u16vec4 s0, s1;     // Q8_0: the 16 quants; Q6_K: ql of quads 0 / 2 (s0), 1 / 3 (s1)
     u16vec4 s2, s3;     // Q6_K: qh (s2), the 8 scales of the half (s3)
@@ -98,7 +111,7 @@ Item load_item(uint64_t row, uint it) {
     o.h = uvec4(0);
     o.s0 = o.s1 = o.s2 = o.s3 = u16vec4(0);
     o.d = 0u;
-    if (FMT == QF_INT8) {
+    if (BYTEQ) {
         o.q = U4Buf(row).v[it];
     } else if (FMT == QF_Q8_0) {
         const uint64_t blk = row + uint64_t(it / 2u) * 34u;
@@ -135,11 +148,17 @@ void q4k_scale_min(uvec4 h, uint j, out float sc, out float mn) {
 }
 
 // The item's weights as floats with every block scale and minimum folded in
-// (the INT8 row scale is applied to the finished sum), in the order of the
+// (the INT8 / FP8 row scale is applied to the finished sum), in the order of the
 // X chunks xpos() names: once per W row, so the inner loop over the MB rows
 // of X is one fused FP16 x FP32 multiply-add per weight.
 void decode(const Item o, uint it, out float w[32]) {
-    if (FMT <= QF_Q8_0) {
+    if (FMT == QF_FP8) {
+        [[unroll]] for (uint i = 0; i < 4u; ++i) {
+            const vec4 v = fp8x4(o.q[i]);
+            [[unroll]] for (uint e = 0; e < 4u; ++e) w[4u * i + e] = v[e];
+        }
+        [[unroll]] for (uint e = 16u; e < 32u; ++e) w[e] = 0.0;
+    } else if (FMT == QF_INT8 || FMT == QF_Q8_0) {
         const uvec4 qq = FMT == QF_INT8 ? o.q : uvec4(pk16(o.s0), pk16(o.s1));
         const float d = FMT == QF_Q8_0 ? h2f(o.d) : 1.0;
         [[unroll]] for (uint i = 0; i < 4u; ++i) {
@@ -182,7 +201,7 @@ void decode(const Item o, uint it, out float w[32]) {
 
 // First element of X chunk c (8 elements) of item `it`.
 uint xpos(uint it, uint c) {
-    if (FMT <= QF_Q8_0) return it * 16u + c * 8u;
+    if (IE == 16u) return it * 16u + c * 8u;
     const uint sb = it / 8u, s = it % 8u;
     if (FMT == QF_Q4K) return sb * 256u + (s / 2u) * 64u + (s & 1u) * 16u + (c / 2u) * 32u + (c & 1u) * 8u;
     return sb * 256u + (s / 4u) * 128u + (s % 4u) * 8u + c * 32u;
@@ -210,20 +229,27 @@ void consume(uint u, uint it) {
     }
 }
 
+// The W row of logical row l (the GLU pairing above).
+uint wrow(uint l) {
+    if (EPI == EPI_SWIGLU) return (l & 1u) != 0u ? pc.n / 2u + l / 2u : l / 2u;
+    return l;
+}
+
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint lane = tid % LPR;
     const uint n0 = (((gl_WorkGroupID.y * gl_NumWorkGroups.x) + gl_WorkGroupID.x) * RPW + tid / LPR) * NR;
     uint64_t row[NR];
-    [[unroll]] for (uint r = 0; r < NR; ++r) row[r] = pc.w + uint64_t(min(n0 + r, pc.n - 1u)) * uint64_t(pc.rowbytes);
+    [[unroll]] for (uint r = 0; r < NR; ++r) row[r] = pc.w + uint64_t(wrow(min(n0 + r, pc.n - 1u))) * uint64_t(pc.rowbytes);
 
     [[unroll]] for (uint q = 0; q < NR * 8u; ++q) acc[q] = 0.0;
     if (n0 < pc.n) {
-        if (FMT == QF_INT8 && VEC == 0u) {
-            // INT8 rows of any length / alignment: one weight per lane per step.
+        if (BYTEQ && VEC == 0u) {
+            // Byte-format rows of any length / alignment: one weight per lane per step.
             for (uint e = lane; e < pc.k; e += LPR) {
                 [[unroll]] for (uint r = 0; r < NR; ++r) {
-                    const float wv = float(int8_t(U8Buf(row[r]).v[e]));
+                    const uint qb = uint(U8Buf(row[r]).v[e]);
+                    const float wv = FMT == QF_FP8 ? fp8_decode(qb) : float(int(qb << 24) >> 24);
                     [[unroll]] for (uint b = 0; b < MB; ++b) acc[r * 8u + b] += wv * load_elem(DT, pc.x, b * pc.ldx + e);
                 }
             }
@@ -265,11 +291,31 @@ void main() {
     } else if (lane != 0u) {
         return;
     }
+    // r = acc * scale + bias, then the epilogue.
+    [[unroll]] for (uint r = 0; r < NR; ++r) {
+        const uint n = wrow(min(n0 + r, pc.n - 1u));
+        const float sc = BYTEQ ? F32Buf(pc.scale).v[n] : 1.0;
+        const float bv = BIAS != 0u ? load_elem(DT, pc.bias, n) : 0.0;
+        [[unroll]] for (uint b = 0; b < MB; ++b) acc[r * 8u + b] = gemm_act(ACT, acc[r * 8u + b] * sc + bv);
+    }
+    if (GLU) {
+        [[unroll]] for (uint r = 0; r < NR; r += 2u) {
+            if (n0 + r >= pc.n) return;
+            const uint j = (n0 + r) / 2u;
+            [[unroll]] for (uint b = 0; b < MB; ++b) {
+                const float g = acc[r * 8u + b], u = acc[(r + 1u) * 8u + b];
+                store_elem(DT, pc.y, b * pc.ldy + j, EPI == EPI_GEGLU ? g * gelu_exact(u) : silu(g) * u);
+            }
+        }
+        return;
+    }
     [[unroll]] for (uint r = 0; r < NR; ++r) {
         const uint n = n0 + r;
         if (n >= pc.n) return;
-        const float sc = FMT == QF_INT8 ? F32Buf(pc.scale).v[n] : 1.0;
-        const float bv = BIAS != 0u ? load_elem(DT, pc.bias, n) : 0.0;
-        [[unroll]] for (uint b = 0; b < MB; ++b) store_elem(DT, pc.y, b * pc.ldy + n, acc[r * 8u + b] * sc + bv);
+        [[unroll]] for (uint b = 0; b < MB; ++b) {
+            float v = acc[r * 8u + b];
+            if (EPI == EPI_ACCUM) v += load_elem(DT, pc.y, b * pc.ldy + n);
+            store_elem(DT, pc.y, b * pc.ldy + n, v);
+        }
     }
 }

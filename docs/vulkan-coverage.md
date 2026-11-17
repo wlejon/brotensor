@@ -3,7 +3,7 @@
 Generated for chunk 6 of the Vulkan backend (docs/vulkan.md). What runs on
 `Device::vulkan(i)` today, slot by slot, and what each sibling's code calls.
 
-**Op table: 266 of 270 slots implemented, 4 null, all by design** (chunk 9 filled the 17 training slots that remained: the four flash-attention backwards, `group_norm_backward`, `resblock_backward`, `embedding_lookup_backward`, `scatter_rows_add`, the two `conv_transpose2d` backwards, `upsample_bilinear_2x_backward`, `interp2d_backward`, `pad2d_backward`, `adaptive_avg_pool2d_backward`, `max_pool2d_backward`, `lstm_forward_train` and `lstm_backward`; chunk 8 the attention / BatchNorm / BCE ones). A null slot
+**Op table: 270 of 274 slots implemented, 4 null, all by design** (the per-row INT8 / FP8 family `quantize_rows`, `dequantize_rows`, `linear_forward_batched_wq_ex` and `flash_attention_decode_len` came later; chunk 9 filled the 17 training slots that remained: the four flash-attention backwards, `group_norm_backward`, `resblock_backward`, `embedding_lookup_backward`, `scatter_rows_add`, the two `conv_transpose2d` backwards, `upsample_bilinear_2x_backward`, `interp2d_backward`, `pad2d_backward`, `adaptive_avg_pool2d_backward`, `max_pool2d_backward`, `lstm_forward_train` and `lstm_backward`; chunk 8 the attention / BatchNorm / BCE ones). A null slot
 throws "not implemented on vulkan" when dispatched; none of the four is ever
 dispatched to Vulkan: two are host-only ops that always run on the CPU table,
 and filtered_lrelu's public entry points fall back to a composite of two ops
@@ -59,9 +59,9 @@ Training: 1 ops, all implemented.
 
 ### brosoundml
 
-Inference: 76 ops, all implemented.
+Inference: 80 ops, all implemented.
 
-`linear_forward`, `relu_forward`, `tanh_forward`, `sigmoid_forward`, `add_inplace`, `axpby_inplace`, `add_scalar_inplace`, `scale_inplace`, `clamp`, `mul_inplace`, `embedding_lookup_forward`*, `concat_rows`, `concat_batched_rows`, `concat_nchw_channels`, `copy_d2d`, `copy_d2d_strided`, `cast`, `layernorm_forward_inference_batched`, `linear_forward_batched`, `relu_forward_batched`, `add_inplace_batched`, `conv2d_forward`, `group_norm_forward`, `silu_forward`, `gelu_forward`, `gelu_exact_forward`, `interp2d_align_corners_forward`, `pad2d_forward`, `slice2d_forward`, `top_k_rows`, `gather_rows`, `scatter_rows`, `linear_forward_batched_fp16`, `linear_forward_batched_ex`, `flash_attention_forward`, `flash_attention_gqa_forward`, `flash_attention_windowed_forward`, `flash_attention_varlen_forward`, `nchw_to_sequence`, `sequence_to_nchw`, `matmul`, `rms_norm_forward`, `sum_cols`, `argmax_rows`, `modulate`, `broadcast_mul`, `rope_apply`, `self_attention_bias_forward`, `rel_pos_bias_xl_forward`, `complex_mul`, `complex_abs`, `complex_angle`, `complex_from_polar`, `rfft`, `irfft`, `stft`, `istft`, `conv_transpose1d_forward`, `pad1d_forward`, `snake_forward`, `elu_forward`, `leaky_relu_forward`, `vq_encode_forward`, `resample1d_forward`, `log_forward`, `exp_forward`, `sample_logits_into`, `masked_diffusion_scores`, `masked_diffusion_commit`, `batch_norm_inference`, `randn`, `rand_uniform`, `sin_forward`, `add_channel_bias_inplace`, `add_row_bias_inplace`, `softmax_rows_forward`
+`linear_forward`, `relu_forward`, `tanh_forward`, `sigmoid_forward`, `add_inplace`, `axpby_inplace`, `add_scalar_inplace`, `scale_inplace`, `clamp`, `mul_inplace`, `embedding_lookup_forward`*, `concat_rows`, `concat_batched_rows`, `concat_nchw_channels`, `copy_d2d`, `copy_d2d_strided`, `cast`, `layernorm_forward_inference_batched`, `linear_forward_batched`, `relu_forward_batched`, `add_inplace_batched`, `conv2d_forward`, `group_norm_forward`, `silu_forward`, `gelu_forward`, `gelu_exact_forward`, `interp2d_align_corners_forward`, `pad2d_forward`, `slice2d_forward`, `top_k_rows`, `gather_rows`, `scatter_rows`, `linear_forward_batched_fp16`, `linear_forward_batched_ex`, `flash_attention_forward`, `flash_attention_gqa_forward`, `flash_attention_windowed_forward`, `flash_attention_varlen_forward`, `nchw_to_sequence`, `sequence_to_nchw`, `matmul`, `rms_norm_forward`, `sum_cols`, `argmax_rows`, `modulate`, `broadcast_mul`, `rope_apply`, `self_attention_bias_forward`, `rel_pos_bias_xl_forward`, `complex_mul`, `complex_abs`, `complex_angle`, `complex_from_polar`, `rfft`, `irfft`, `stft`, `istft`, `conv_transpose1d_forward`, `pad1d_forward`, `snake_forward`, `elu_forward`, `leaky_relu_forward`, `vq_encode_forward`, `resample1d_forward`, `log_forward`, `exp_forward`, `sample_logits_into`, `masked_diffusion_scores`, `masked_diffusion_commit`, `batch_norm_inference`, `randn`, `rand_uniform`, `sin_forward`, `add_channel_bias_inplace`, `add_row_bias_inplace`, `softmax_rows_forward`, `flash_attention_decode_len`, `quantize_rows`, `dequantize_rows`, `linear_forward_batched_wq_ex`
 
 Training: 19 ops, all implemented (`group_norm_backward` in chunk 9; `batch_norm_forward` / `_backward` and `bce_with_logits_fused_batched` in chunk 8).
 
@@ -534,6 +534,7 @@ that registers the slot.
 | `kv_cache_append` | implemented | ops_attention.cpp |
 | `flash_attention_decode` | implemented | ops_attention.cpp |
 | `flash_attention_decode_masked` | implemented | ops_attention.cpp |
+| `flash_attention_decode_len` | implemented | ops_attention.cpp |
 
 **Public reductions**
 
@@ -555,13 +556,16 @@ that registers the slot.
 | `dpmpp_2m_step` | implemented | ops_diffusion.cpp |
 | `timestep_embedding` | implemented | ops_diffusion.cpp |
 
-**INT8 weight-only quantisation (W8A16)**
+**INT8 weight-only quantisation (W8A16) and the per-row INT8 / FP8 E4M3 family**
 
 | Slot | Vulkan | File |
 |---|---|---|
 | `matmul_int8w_fp16` | implemented | ops_quant.cpp |
 | `conv2d_int8w_fp16_forward` | implemented | ops_quant.cpp |
 | `linear_forward_batched_int8w_fp16` | implemented | ops_quant.cpp |
+| `quantize_rows` | implemented | ops_quant.cpp |
+| `dequantize_rows` | implemented | ops_quant.cpp |
+| `linear_forward_batched_wq_ex` | implemented | ops_quant.cpp |
 | `dequant_q4k_to_fp16` | implemented | ops_quant.cpp |
 | `linear_forward_q4k_fp16` | implemented | ops_quant.cpp |
 | `linear_forward_batched_q4k_fp16` | implemented | ops_quant.cpp |

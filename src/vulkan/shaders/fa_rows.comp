@@ -15,7 +15,8 @@
 // writes the unnormalised partial and its (max, sum) for fa_combine.comp.
 //
 // A key whose weight is zero contributes nothing even if its V row holds
-// NaN (masked cache slots may be uninitialised). MASKPOS: masked decode with a
+// NaN (masked cache slots may be uninitialised); no key past a row's interval
+// is read (LEN: the cache rows past the device length). MASKPOS: masked decode with a
 // window, where the query sits at the highest valid key of the mask.
 #include "common.glsl"
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -119,8 +120,11 @@ void main() {
         lo = pm >= 0 ? uint(max(0, pm - int(pc.window) + 1)) : 0u;
         hi = pc.lk;
     }
-    const uint a = lo + s * pc.chunk;
-    const uint b = min(hi, a + pc.chunk);
+    // LEN: the splits divide the valid keys, whole tiles each (the host sized
+    // the grid for the capacity; splits past the length see no key).
+    const uint chunk = MODE == FA_MODE_LEN ? ((uint(fa_len()) + nsplit - 1u) / nsplit + TK - 1u) / TK * TK : pc.chunk;
+    const uint a = lo + s * chunk;
+    const uint b = min(hi, a + chunk);
 
     for (uint i = tid; i < G * HD; i += WG) {
         Qs[i] = load_elem(DT, pc.q, row * pc.ldq + (h0 + i / HD) * HD + i % HD);

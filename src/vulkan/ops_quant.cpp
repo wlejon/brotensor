@@ -1,14 +1,17 @@
 // Vulkan quantised-weight linears: the GGUF formats (Q8_0, Q4_K, Q6_K: GEMV,
-// batched linear, dequantise), the INT8 W8A16 linear and matmul, and the
-// INT8 convolutions. Contracts: FP16 activations for GGUF (FP16 or BF16 for the INT8
-// linear), FP32 accumulation, outputs resized.
+// batched linear, dequantise), the INT8 W8A16 linear and matmul, the INT8
+// convolutions, and the per-row weight-only INT8 / FP8 E4M3 family
+// (quantize_rows, dequantize_rows, linear_forward_batched_wq_ex with the
+// linear epilogues). Contracts: FP16 activations for GGUF (FP16 or BF16 for
+// the byte formats), FP32 accumulation, outputs resized.
 //
 // Kernels (detail/quant.h, docs/vulkan.md "Quantised weights"):
 //   <= 8 activation rows   gemv_q.comp: each W row read once, decoded in
 //                          registers, MB rows of X against it;
 //   more rows (prefill)    gemm_cm.comp with QB: the weight decoded to FP16
 //                          as each B chunk is stored to the shared tile;
-//   no cooperative matrix  dequant.comp to an FP16 copy, then the dense GEMM.
+//   no cooperative matrix  dequant.comp to an FP16 copy, then the dense GEMM;
+//   quantize / dequantize  wq_rows.comp.
 
 #include "detail/gemm.h"
 #include "detail/kernels.h"
@@ -55,6 +58,13 @@ struct DequantPush {
 
 struct TransposePush { std::uint64_t src, dst; std::uint32_t batch, rows, cols; };
 
+struct WqRowsPush {
+    std::uint64_t w, q, scale;
+    std::uint32_t rows, k;
+};
+
+bool byte_fmt(int fmt) { return fmt == QF_INT8 || fmt == QF_FP8; }
+
 std::uint64_t cdiv(std::uint64_t a, std::uint64_t b) { return (a + b - 1) / b; }
 
 // gemv_q.comp's lanes per row group, items in flight per lane, subgroup
@@ -73,10 +83,10 @@ GemvCfg gemv_cfg(DeviceCtx& d, int fmt, int k, int B) {
         if (info.min_subgroup <= 64 && info.max_subgroup >= 64) sg = 64;
         else if (info.min_subgroup <= 32 && info.max_subgroup >= 32) sg = 32;
     }
-    const std::uint32_t ie = fmt == QF_INT8 || fmt == QF_Q8_0 ? 16u : 32u;
+    const std::uint32_t ie = byte_fmt(fmt) || fmt == QF_Q8_0 ? 16u : 32u;
     const std::uint64_t items = static_cast<std::uint64_t>(k) / ie;
     GemvCfg c{32, 1, sg, 1};
-    if (fmt == QF_INT8 || fmt == QF_Q8_0) {
+    if (byte_fmt(fmt) || fmt == QF_Q8_0) {
         if (k >= 4096) c = {64, 4, sg, 1};
         else c = {32, 2, sg, 2};
     } else if (fmt == QF_Q4K) {
@@ -91,6 +101,7 @@ GemvCfg gemv_cfg(DeviceCtx& d, int fmt, int k, int B) {
 const char* fmt_name(int fmt) {
     switch (fmt) {
         case QF_INT8: return "INT8";
+        case QF_FP8: return "FP8_E4M3";
         case QF_Q8_0: return "Q8_0";
         case QF_Q4K: return "Q4_K";
         default: return "Q6_K";
@@ -98,12 +109,15 @@ const char* fmt_name(int fmt) {
 }
 
 void gemv_q(DeviceCtx& d, const QuantW& q, std::uint64_t x, Dtype dt, int B, int ldx, std::uint64_t bias,
-            std::uint64_t y, int ldy) {
-    const bool vec = q.fmt != QF_INT8 || (q.k % 16 == 0 && q.w % 16 == 0);
-    const GemvCfg c = gemv_cfg(d, q.fmt, q.k, B);
+            std::uint64_t y, int ldy, int act, int epi) {
+    const bool vec = !byte_fmt(q.fmt) || (q.k % 16 == 0 && q.w % 16 == 0);
+    GemvCfg c = gemv_cfg(d, q.fmt, q.k, B);
+    // A GLU pair (gate, up) is two consecutive logical rows of one lane group.
+    if ((epi == EPI_GEGLU || epi == EPI_SWIGLU) && c.nr < 2) c.nr = 2;
     const std::uint32_t sg = c.sg ? c.sg : d.info().subgroup_size;
     const std::uint32_t spec[] = {static_cast<std::uint32_t>(q.fmt), static_cast<std::uint32_t>(B), c.lpr,
-                                  vec ? 1u : 0u, bias ? 1u : 0u, c.unr, sg, c.nr};
+                                  vec ? 1u : 0u, bias ? 1u : 0u, c.unr, sg, c.nr,
+                                  static_cast<std::uint32_t>(act), static_cast<std::uint32_t>(epi)};
     const ShaderId id = dt == Dtype::FP16 ? ShaderId::gemv_q_f16 : ShaderId::gemv_q_bf16;
     const Kernel& k = d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)), c.sg);
     GemvQPush pc{x, q.w, y, bias, q.scale, static_cast<std::uint32_t>(q.rows), static_cast<std::uint32_t>(q.k),
@@ -120,18 +134,19 @@ QuantW quant_weight(const Tensor& W, const Tensor* scales, const char* op) {
     QuantW q;
     switch (W.dtype) {
         case Dtype::INT8: q.fmt = QF_INT8; break;
+        case Dtype::FP8_E4M3: q.fmt = QF_FP8; break;
         case Dtype::Q8_0: q.fmt = QF_Q8_0; break;
         case Dtype::Q4_K: q.fmt = QF_Q4K; break;
         case Dtype::Q6_K: q.fmt = QF_Q6K; break;
-        default: fail(op, "W must be INT8, Q8_0, Q4_K or Q6_K");
+        default: fail(op, "W must be INT8, FP8_E4M3, Q8_0, Q4_K or Q6_K");
     }
     need(op, W.rows > 0 && W.cols > 0, "W has a non-positive shape");
     q.rows = W.rows;
     q.k = W.cols;
     q.w = addr(W.data);
-    if (q.fmt == QF_INT8) {
+    if (byte_fmt(q.fmt)) {
         need(op, scales != nullptr && scales->dtype == Dtype::FP32, "scales must be FP32");
-        need(op, scales->rows == W.rows && scales->cols == 1, "scales shape must be (out, 1)");
+        need(op, static_cast<long long>(scales->rows) * scales->cols == W.rows, "scales shape must be (out, 1)");
         q.scale = addr(scales->data);
         q.rowbytes = static_cast<std::uint32_t>(W.cols);
     } else {
@@ -148,8 +163,8 @@ QuantW quant_weight(const Tensor& W, const Tensor* scales, const char* op) {
 
 void dequant(DeviceCtx& d, const QuantW& q, std::uint64_t y) {
     // 8-element chunks when rows are whole chunks (always for GGUF); single
-    // elements for INT8 rows of any other length (a depthwise kernel's 9).
-    const bool vec = q.k % 8 == 0 && (q.fmt != QF_INT8 || q.w % 8 == 0);
+    // elements for byte-format rows of any other length (a depthwise kernel's 9).
+    const bool vec = q.k % 8 == 0 && (!byte_fmt(q.fmt) || q.w % 8 == 0);
     const Kernel& k = d.pipelines().get(ShaderId::dequant, {static_cast<std::uint32_t>(q.fmt), vec ? 1u : 0u});
     const DequantPush pc{q.w, y, q.scale, static_cast<std::uint32_t>(q.rows), static_cast<std::uint32_t>(q.k),
                          q.rowbytes};
@@ -162,25 +177,33 @@ const char* quant_linear_path(DeviceCtx& d, int B) {
 }
 
 void quant_linear(DeviceCtx& d, const QuantW& q, std::uint64_t x, Dtype dt, int B, int ldx, std::uint64_t bias,
-                  std::uint64_t y, int ldy, const char* op) {
+                  std::uint64_t y, int ldy, const char* op, int act, int epi) {
     if (dt != Dtype::FP16 && dt != Dtype::BF16) fail(op, "activations must be FP16 or BF16");
     if (B <= 0 || q.rows == 0) return;
+    const bool glu = epi == EPI_GEGLU || epi == EPI_SWIGLU;
+    if (glu && q.rows % 2 != 0) fail(op, "a GLU epilogue needs an even number of weight rows");
+    const int out = glu ? q.rows / 2 : q.rows;
     const Device dev = Device::vulkan(d.index());
+    // Rows [0, rows) of `cols` 16-bit elements at pitch `ld` copied between
+    // a strided operand and a contiguous one.
+    auto copy_rows = [&](std::uint64_t src, int lds, std::uint64_t dst, int ldd, int rows, int cols) {
+        for (int r = 0; r < rows; ++r) {
+            const Span a = d.allocator().resolve(src + std::uint64_t(r) * lds * 2u, std::size_t(cols) * 2u);
+            const Span b = d.allocator().resolve(dst + std::uint64_t(r) * ldd * 2u, std::size_t(cols) * 2u);
+            d.stream().copy(a.buf, a.offset, b.buf, b.offset, std::size_t(cols) * 2u);
+        }
+    };
     if (B <= 8) {
         // The vector paths read X in 16-byte words; a view that is not
         // aligned is copied (B x K elements, small next to W).
-        const bool scalar = q.fmt == QF_INT8 && !(q.k % 16 == 0 && q.w % 16 == 0);
+        const bool scalar = byte_fmt(q.fmt) && !(q.k % 16 == 0 && q.w % 16 == 0);
         if (!scalar && (x % 16 != 0 || ldx % 8 != 0)) {
             Tensor xa = Tensor::empty_on(dev, B, q.k, dt);
-            for (int r = 0; r < B; ++r) {
-                const Span a = d.allocator().resolve(x + std::uint64_t(r) * ldx * 2u, std::size_t(q.k) * 2u);
-                const Span b = d.allocator().resolve(addr(xa.data) + std::uint64_t(r) * q.k * 2u, std::size_t(q.k) * 2u);
-                d.stream().copy(a.buf, a.offset, b.buf, b.offset, std::size_t(q.k) * 2u);
-            }
-            gemv_q(d, q, addr(xa.data), dt, B, q.k, bias, y, ldy);
+            copy_rows(x, ldx, addr(xa.data), q.k, B, q.k);
+            gemv_q(d, q, addr(xa.data), dt, B, q.k, bias, y, ldy, act, epi);
             return;
         }
-        gemv_q(d, q, x, dt, B, ldx, bias, y, ldy);
+        gemv_q(d, q, x, dt, B, ldx, bias, y, ldy, act, epi);
         return;
     }
     GemmArgs g;
@@ -194,6 +217,8 @@ void quant_linear(DeviceCtx& d, const QuantW& q, std::uint64_t x, Dtype dt, int 
     g.k = q.k;
     g.lda = ldx;
     g.ldc = ldy;
+    g.act = act;
+    g.epi = epi;
     if (d.info().coopmat_f16) {
         g.b = q.w;
         g.db = dt;
@@ -214,36 +239,24 @@ void quant_linear(DeviceCtx& d, const QuantW& q, std::uint64_t x, Dtype dt, int 
     }
     // BF16 activations: an FP32 GEMM against the FP16 weight (rounding the
     // weight to BF16 would cost 2^-8 per weight), cast back once.
-    auto view = [&](std::uint64_t a, int rows, int cols, int ld) {
-        Tensor t = Tensor::empty_on(dev, rows, cols, Dtype::BF16);
-        for (int r = 0; r < rows; ++r) {
-            const Span sa = d.allocator().resolve(a + std::uint64_t(r) * ld * 2u, std::size_t(cols) * 2u);
-            const Span sb = d.allocator().resolve(addr(t.data) + std::uint64_t(r) * cols * 2u, std::size_t(cols) * 2u);
-            d.stream().copy(sa.buf, sa.offset, sb.buf, sb.offset, std::size_t(cols) * 2u);
-        }
-        return t;
+    auto to_f32 = [&](std::uint64_t a, int rows, int cols, int ld) {
+        Tensor t = Tensor::empty_on(dev, rows, cols, Dtype::BF16), f = Tensor::empty_on(dev, rows, cols, Dtype::FP32);
+        copy_rows(a, ld, addr(t.data), cols, rows, cols);
+        cast(t, f, Dtype::FP32);
+        return f;
     };
-    Tensor x16 = view(x, B, q.k, ldx), x32 = Tensor::empty_on(dev, B, q.k, Dtype::FP32);
-    cast(x16, x32, Dtype::FP32);
-    Tensor b32, y32 = Tensor::empty_on(dev, B, q.rows, Dtype::FP32);
-    if (bias) {
-        Tensor b16 = view(bias, 1, q.rows, q.rows);
-        b32 = Tensor::empty_on(dev, 1, q.rows, Dtype::FP32);
-        cast(b16, b32, Dtype::FP32);
-    }
+    Tensor x32 = to_f32(x, B, q.k, ldx);
+    Tensor b32 = bias ? to_f32(bias, 1, q.rows, q.rows) : Tensor();
+    Tensor y32 = epi == EPI_ACCUM ? to_f32(y, B, out, ldy) : Tensor::empty_on(dev, B, out, Dtype::FP32);
     g.a = addr(x32.data); g.lda = q.k;
-    g.c = addr(y32.data); g.ldc = q.rows;
+    g.c = addr(y32.data); g.ldc = out;
     g.bias = bias ? addr(b32.data) : 0;
     g.da = g.dc = Dtype::FP32;
     g.db = Dtype::FP16;
     gemm(d, g);
-    Tensor yb = Tensor::empty_on(dev, B, q.rows, Dtype::BF16);
+    Tensor yb = Tensor::empty_on(dev, B, out, Dtype::BF16);
     cast(y32, yb, Dtype::BF16);
-    for (int r = 0; r < B; ++r) {
-        const Span sa = d.allocator().resolve(addr(yb.data) + std::uint64_t(r) * q.rows * 2u, std::size_t(q.rows) * 2u);
-        const Span sb = d.allocator().resolve(y + std::uint64_t(r) * ldy * 2u, std::size_t(q.rows) * 2u);
-        d.stream().copy(sa.buf, sa.offset, sb.buf, sb.offset, std::size_t(q.rows) * 2u);
-    }
+    copy_rows(addr(yb.data), out, y, ldy, B, out);
 }
 
 namespace {
@@ -428,6 +441,74 @@ void conv3d_int8w_fp16_forward(const Tensor& X, const Tensor& W, const Tensor& s
                    pad_w, dil_t, dil_h, dil_w, groups, Y);
 }
 
+// ─── per-row INT8 / FP8 E4M3 (quantize_rows family) ─────────────────────────
+
+int byte_code(Dtype fmt, const char* op) {
+    if (fmt == Dtype::INT8) return QF_INT8;
+    if (fmt == Dtype::FP8_E4M3) return QF_FP8;
+    fail(op, "fmt must be INT8 or FP8_E4M3");
+}
+
+void quantize_rows(const Tensor& W, Dtype fmt, Tensor& Wq, Tensor& scales) {
+    constexpr const char* op = "quantize_rows";
+    const int qf = byte_code(fmt, op);
+    DeviceCtx& d = device_of(W);
+    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::wq_rows_f32, W.dtype, op), {0u, qf == QF_FP8 ? 1u : 0u});
+    const int N = W.rows, K = W.cols;
+    count32(W, op);
+    if (Wq.rows != N || Wq.cols != K || Wq.dtype != fmt) Wq.resize(N, K, fmt);
+    if (scales.rows != N || scales.cols != 1 || scales.dtype != Dtype::FP32) scales.resize(N, 1, Dtype::FP32);
+    if (N == 0) return;
+    const WqRowsPush pc{addr(W.data), addr(Wq.data), addr(scales.data), static_cast<std::uint32_t>(N),
+                        static_cast<std::uint32_t>(K)};
+    const std::uint32_t gx = static_cast<std::uint32_t>(std::min(N, 65535));
+    launch(d, k, pc, gx, static_cast<std::uint32_t>(cdiv(N, gx)));
+}
+
+void dequantize_rows(const Tensor& Wq, const Tensor& scales, Dtype out, Tensor& W) {
+    constexpr const char* op = "dequantize_rows";
+    if (Wq.dtype != Dtype::INT8 && Wq.dtype != Dtype::FP8_E4M3) fail(op, "Wq must be INT8 or FP8_E4M3");
+    need(op, scales.dtype == Dtype::FP32 && static_cast<long long>(scales.rows) * scales.cols == Wq.rows,
+         "scales must be (out, 1) FP32");
+    DeviceCtx& d = device_of(Wq);
+    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::wq_rows_f32, out, op),
+                                        {1u, Wq.dtype == Dtype::FP8_E4M3 ? 1u : 0u});
+    const int N = Wq.rows, K = Wq.cols;
+    const std::uint32_t n = count32(Wq, op);
+    if (W.rows != N || W.cols != K || W.dtype != out) W.resize(N, K, out);
+    if (n == 0) return;
+    const WqRowsPush pc{addr(W.data), addr(Wq.data), addr(scales.data), static_cast<std::uint32_t>(N),
+                        static_cast<std::uint32_t>(K)};
+    launch(d, k, pc, groups_1d(n, k));
+}
+
+void linear_forward_batched_wq_ex(const Tensor& Wq, const Tensor& scales, const Tensor* bias, const Tensor& X,
+                                  int act, int epilogue, Tensor& Y) {
+    constexpr const char* op = "linear_forward_batched_wq_ex";
+    const int epi = epilogue & ~16;   // kLinearEpiFastAccum: accumulation is FP32 regardless
+    if (Wq.dtype != Dtype::INT8 && Wq.dtype != Dtype::FP8_E4M3) fail(op, "Wq must be INT8 or FP8_E4M3");
+    const QuantW q = quant_weight(Wq, &scales, op);
+    need(op, X.dtype == Dtype::FP16 || X.dtype == Dtype::BF16, "X must be FP16 or BF16");
+    need(op, X.cols == q.k, "X.cols must equal Wq.cols");
+    need(op, act >= LACT_NONE && act <= LACT_QUICK_GELU, "unknown activation");
+    need(op, epi >= EPI_STORE && epi <= EPI_SWIGLU, "unknown epilogue");
+    const bool glu = epi == EPI_GEGLU || epi == EPI_SWIGLU;
+    need(op, !glu || (act == 0 && q.rows % 2 == 0), "geglu/swiglu needs act 0 and even Wq.rows");
+    std::uint64_t b = 0;
+    if (bias && bias->size() > 0) {
+        need(op, bias->dtype == X.dtype && bias->size() == q.rows, "bias must be (out, 1) in X's dtype");
+        b = addr(bias->data);
+    }
+    const int B = X.rows, out = glu ? q.rows / 2 : q.rows;
+    if (epi == EPI_ACCUM) {
+        need(op, Y.rows == B && Y.cols == out && Y.dtype == X.dtype, "accumulate needs Y (B, out) in X's dtype");
+    } else if (Y.rows != B || Y.cols != out || Y.dtype != X.dtype) {
+        Y.resize(B, out, X.dtype);
+    }
+    if (B == 0) return;
+    quant_linear(device_of(Wq), q, addr(X.data), X.dtype, B, q.k, b, addr(Y.data), out, op, act, epi);
+}
+
 }  // namespace
 
 void fill_vulkan_vtable_quant(::brotensor::detail::OpsVTable& v) {
@@ -441,6 +522,9 @@ void fill_vulkan_vtable_quant(::brotensor::detail::OpsVTable& v) {
     v.linear_forward_batched_q8_0_fp16 = &linear_forward_batched_q8_0_fp16;
     v.linear_forward_batched_q6k_fp16 = &linear_forward_batched_q6k_fp16;
     v.linear_forward_batched_int8w_fp16 = &linear_forward_batched_int8w_fp16;
+    v.quantize_rows = &quantize_rows;
+    v.dequantize_rows = &dequantize_rows;
+    v.linear_forward_batched_wq_ex = &linear_forward_batched_wq_ex;
     v.matmul_int8w_fp16 = &matmul_int8w_fp16;
     v.conv2d_int8w_fp16_forward = &conv2d_int8w_fp16_forward;
     v.conv3d_int8w_fp16_forward = &conv3d_int8w_fp16_forward;

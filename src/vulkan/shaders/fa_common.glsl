@@ -10,7 +10,7 @@
 layout(push_constant) uniform PC {
     uint64_t q, k, v, o;
     uint64_t mask;     // FP32 key-validity vector (> 0.5 = valid), MASK = 1
-    uint64_t aux;      // VARLEN: cu_seqlens_q (INT32, nseq + 1); PACKED: seq_bounds (INT32, lq x 2)
+    uint64_t aux;      // VARLEN: cu_seqlens_q (INT32, nseq + 1); PACKED: seq_bounds (INT32, lq x 2); LEN: the length (INT32)
     uint64_t aux2;     // VARLEN: cu_seqlens_k
     uint64_t part;     // fa_rows SPLIT: FP32 partials, (rows * hq * nsplit) x (HD + 2)
     uint lq, lk, ldq, ldk, ldo;
@@ -18,13 +18,16 @@ layout(push_constant) uniform PC {
     uint window;       // 0 = none
     uint causal;
     uint nseq;         // VARLEN: number of sequences
-    uint chunk;        // fa_rows: keys per split
+    uint chunk;        // fa_rows: keys per split (LEN: computed from the length on the device)
     uint hq;           // query heads
     uint qb0;          // first query block (fa_cm) / row (fa_rows) of this dispatch
     int q_offset;      // ROWS: absolute position of query row 0
     float scale;       // fa_cm: log2(e) / sqrt(HD); fa_rows: 1 / sqrt(HD)
     float softcap;     // fa_rows SOFTCAP: s = softcap * tanh(s / softcap)
 } pc;
+
+// LEN: the valid keys, read from the device (aux, INT32) and clamped to [0, lk].
+int fa_len() { return clamp(I32Buf(pc.aux).v[0], 0, int(pc.lk)); }
 
 // Keys [lo, hi) of query row qi, empty past lq. Device-resident sequence
 // tables are clamped to [0, lk] so a malformed table cannot read outside K.
@@ -55,6 +58,8 @@ void fa_interval(uint qi, out uint lo, out uint hi) {
         a = I32Buf(pc.aux2).v[s0];
         b = I32Buf(pc.aux2).v[s0 + 1u];
         if (pc.causal != 0u) b = min(b, a + q - I32Buf(pc.aux).v[s0] + 1);
+    } else if (MODE == FA_MODE_LEN) {
+        b = fa_len() - int(pc.lq) + 1 + int(qi);
     } else if (MODE == FA_MODE_PACKED) {
         a = I32Buf(pc.aux).v[2u * qi];
         b = I32Buf(pc.aux).v[2u * qi + 1u];

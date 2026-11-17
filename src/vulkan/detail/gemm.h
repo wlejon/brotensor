@@ -36,7 +36,7 @@ struct GemmArgs {
     int epi = 0;                 // EPI_* (op_codes.h); GLUs need the NT layout
     // Quantised B (QF_* of shaders/quant_decode.glsl, 0 = none): the
     // cooperative-matrix kernel only, NT layout, one batch, db ignored; ldb
-    // is then B's row pitch in bytes and `scale` the INT8 per-row scales.
+    // is then B's row pitch in bytes and `scale` the INT8 / FP8 per-row scales.
     int qb = 0;
     std::uint64_t scale = 0;
     int act = 0;                 // LACT_*

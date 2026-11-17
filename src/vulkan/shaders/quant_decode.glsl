@@ -4,16 +4,19 @@
 // qdecode8() (the GEMM's first rule, docs/vulkan.md: the decode waits until
 // the chunk is stored, after the fragment math). Include after common.glsl.
 //   QF_INT8  int8 with a per-row FP32 scale: w = q * scale[row]
+//   QF_FP8   FP8 E4M3 with a per-row FP32 scale: w = e4m3(q) * scale[row]
 //   QF_Q8_0  GGUF Q8_0, 34-byte blocks of 32: w = d q
 //   QF_Q4K   GGUF Q4_K, 144-byte super-blocks of 256: w = d sc q - dmin m
 //   QF_Q6K   GGUF Q6_K, 210-byte super-blocks of 256: w = d sc (q - 32)
 // `row` is the address of the row's first byte; `k` (a multiple of 8) the
-// chunk's first element (INT8 bytes at kmax and beyond read as zero). INT8 with vec = false takes any row length and
-// alignment (byte loads); everything else needs the alignments the host
-// checks (16-byte aligned Q4_K rows, even addresses for Q8_0 / Q6_K, 8-byte
-// aligned INT8 rows when vec).
+// chunk's first element (INT8 / FP8 bytes at kmax and beyond read as zero).
+// The byte formats with vec = false take any row length and alignment (byte
+// loads); everything else needs the alignments the host checks (16-byte
+// aligned Q4_K rows, even addresses for Q8_0 / Q6_K, 8-byte aligned
+// byte-format rows when vec).
 
 #include "op_codes.h"   // QF_*
+#include "fp8.glsl"
 #extension GL_EXT_control_flow_attributes : enable
 
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer QU16x4 { u16vec4 v; };   // 8 bytes, 2-aligned
@@ -21,11 +24,11 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer QU2Buf { uve
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer QU4Buf { uvec4 v[]; };
 
 struct QRaw {
-    uvec4 a;     // INT8: a.xy quants; Q4_K: the header
+    uvec4 a;     // INT8 / FP8: a.xy quants; Q4_K: the header
     uvec2 b;     // Q4_K: 8 bytes of nibbles; Q6_K: the scale pair (x), d (y)
     u16vec4 s0;  // Q8_0: the quants; Q6_K: ql (2-byte aligned data stays in 16-bit words
     u16vec4 s1;  // Q6_K: qh       until the decode packs them)
-    uint c;      // INT8: scale bits; Q8_0: d
+    uint c;      // INT8 / FP8: scale bits; Q8_0: d
 };
 
 uvec2 pk16(u16vec4 v) { return uvec2(uint(v.x) | (uint(v.y) << 16), uint(v.z) | (uint(v.w) << 16)); }
@@ -37,7 +40,7 @@ QRaw qload8(const uint fmt, const bool vec, uint64_t row, uint64_t scale, uint r
     o.s0 = u16vec4(0);
     o.s1 = u16vec4(0);
     o.c = 0u;
-    if (fmt == QF_INT8) {
+    if (fmt == QF_INT8 || fmt == QF_FP8) {
         if (vec) {
             o.a.xy = QU2Buf(row).v[k / 8u];
         } else {
@@ -72,7 +75,11 @@ uint qbyte(uvec4 v, uint i) { return (v[i >> 2] >> ((i & 3u) * 8u)) & 0xffu; }
 
 // The eight weights of a chunk as floats.
 void qdecode8(const uint fmt, QRaw o, uint k, out float w[8]) {
-    if (fmt == QF_INT8 || fmt == QF_Q8_0) {
+    if (fmt == QF_FP8) {
+        const float s = uintBitsToFloat(o.c);
+        const vec4 lo = fp8x4(o.a.x), hi = fp8x4(o.a.y);
+        [[unroll]] for (uint e = 0; e < 4u; ++e) { w[e] = lo[e] * s; w[4u + e] = hi[e] * s; }
+    } else if (fmt == QF_INT8 || fmt == QF_Q8_0) {
         const float s = fmt == QF_INT8 ? uintBitsToFloat(o.c) : float(uint16BitsToHalf(uint16_t(o.c)));
         const uvec2 q = fmt == QF_INT8 ? o.a.xy : pk16(o.s0);
         const vec4 lo = vec4(unpack8(int(q.x))), hi = vec4(unpack8(int(q.y)));

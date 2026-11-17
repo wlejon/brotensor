@@ -1,8 +1,8 @@
 // Vulkan attention: the kernel dispatcher (detail/attention.h) and the flash
 // family — flash_attention_forward / _gqa / _windowed / _varlen /
-// _packed_qkv, the decode ops over a KV cache, kv_cache_append, and the
-// projection-fused flash_attention_qkvo_forward / _project_kv /
-// _q_with_kv_cached_forward. Contracts follow the CUDA backend
+// _packed_qkv, the decode ops over a KV cache (_decode, _masked, _len),
+// kv_cache_append, and the projection-fused flash_attention_qkvo_forward /
+// _project_kv / _q_with_kv_cached_forward. Contracts follow the CUDA backend
 // (src/cuda/flash_attention*.cu) and the CPU reference: Q, K, V and O share
 // one dtype (FP32 / FP16 / BF16), O is resized to (Lq, Dq) in that dtype,
 // scale 1 / sqrt(head_dim), a key mask is valid where > 0.5, and a query row
@@ -79,7 +79,8 @@ constexpr int kCmMaxHd = 256;
 constexpr int kRowsMaxLq = 4;   // at or below this many query rows the decode kernel wins
 
 bool cm_eligible(DeviceCtx& d, const AttnProblem& p) {
-    return d.info().coopmat_f16 && is16(p.dt) && p.hd <= kCmMaxHd && p.softcap <= 0.0f && !p.maskpos;
+    return d.info().coopmat_f16 && is16(p.dt) && p.hd <= kCmMaxHd && p.softcap <= 0.0f && !p.maskpos &&
+           p.mode != FA_MODE_LEN;
 }
 
 bool dense_eligible(const AttnProblem& p) {
@@ -493,6 +494,25 @@ void flash_attention_decode_masked(const Tensor& Q, const Tensor& K_cache, const
     attention(device_of(Q), p);
 }
 
+// The length lives on the device, so the launch shape depends only on the
+// capacity: fa_rows sizes its splits from the length it reads (the grid is
+// sized for the full cache; splits past the length see no key), and no cache
+// row past the length is read.
+void flash_attention_decode_len(const Tensor& Q, const Tensor& K_cache, const Tensor& V_cache, const int32_t* d_len,
+                                int num_q_heads, int num_kv_heads, Tensor& O) {
+    constexpr const char* op = "flash_attention_decode_len";
+    check_decode_heads(Q, K_cache, V_cache, num_q_heads, num_kv_heads, op);
+    if (!d_len) fail(op, "d_len must not be null");
+    if (V_cache.rows != K_cache.rows) fail(op, "K_cache/V_cache row mismatch");
+    ensure_out(O, Q.rows, Q.cols, Q.dtype);
+    if (Q.rows == 0 || Q.cols == 0) return;
+    if (K_cache.rows == 0) return zero_rows(O);
+    AttnProblem p = base(op, Q, K_cache, V_cache, O, num_q_heads, num_kv_heads);
+    p.mode = FA_MODE_LEN;
+    p.aux = addr(d_len);
+    attention(device_of(Q), p);
+}
+
 // ─── projection-fused ──────────────────────────────────────────────────────
 
 namespace {
@@ -560,6 +580,7 @@ void fill_vulkan_vtable_attention(::brotensor::detail::OpsVTable& v) {
     v.kv_cache_append = &kv_cache_append;
     v.flash_attention_decode = &flash_attention_decode;
     v.flash_attention_decode_masked = &flash_attention_decode_masked;
+    v.flash_attention_decode_len = &flash_attention_decode_len;
     v.flash_attention_project_kv = &flash_attention_project_kv;
     v.flash_attention_q_with_kv_cached_forward = &flash_attention_q_with_kv_cached_forward;
     v.flash_attention_qkvo_forward = &flash_attention_qkvo_forward;

@@ -35,7 +35,7 @@ pixel norm, softmax (masked vector, rows, backward), every RoPE variant
 backward, `modulate` and `broadcast_mul`, and the attention family (chunk 3):
 `flash_attention_forward`, `_gqa`, `_windowed`, `_varlen`, `_packed_qkv`, the
 decode ops over a KV cache (`flash_attention_decode`, `_decode_masked`,
-`kv_cache_append`), the projection-fused `flash_attention_qkvo_forward`,
+`_decode_len`, `kv_cache_append`), the projection-fused `flash_attention_qkvo_forward`,
 `_project_kv`, `_q_with_kv_cached_forward`, the materialised-probability
 attentions (`self_attention_bias_forward`, `cross_attention_forward`,
 `_with_attn`, `mha_forward`, `self_attention_forward(_train)`),
@@ -58,6 +58,8 @@ bicubics), `adaptive_avg_pool2d_forward`, `max_pool2d_forward`,
 (`randn`, `rand_uniform`, `rand_bernoulli`, `randn_truncated`), then the
 quantised weights and the audio family (chunk 5): the GGUF linears
 (`linear_forward_{q8_0,q4k,q6k}_fp16`, their `_batched` forms, `dequant_*_to_fp16`),
+the per-row INT8 / FP8 E4M3 family (`quantize_rows`, `dequantize_rows`,
+`linear_forward_batched_wq_ex`; added later),
 the INT8 W8A16 family (`linear_forward_batched_int8w_fp16`, `matmul_int8w_fp16`,
 `conv2d_int8w_fp16_forward`, `conv3d_int8w_fp16_forward`,
 `resblock_forward_int8w_fp16`, `flash_attention_project_kv_int8w_fp16`,
@@ -480,6 +482,11 @@ workgroups until the grid has 80 workgroups:
 a long cache streams best in a few long splits (160 and more lost 5-30% at
 16k-32k keys). A key whose weight is zero contributes nothing even when its V
 row is NaN (masked decode over a fixed-capacity cache).
+`flash_attention_decode_len` (`FA_MODE_LEN`) reads its length from the
+device: the grid is sized for the cache's capacity, each workgroup derives
+its split of the valid keys from the length it reads (splits past it see no
+key), and no row past the length is read, so the launch shape never changes
+as generation advances.
 
 **Dense path.** Q, K, V and O are addressed in place through the GEMM's
 leading dimensions and batch strides (head h is a batch stride of hd), GQA
@@ -655,10 +662,11 @@ peak):
 
 ## Quantised weights
 
-`detail/quant.h` describes a quantised weight (`quant_weight()`: INT8 with
-per-row FP32 scales, or the GGUF block formats Q8_0, Q4_K and Q6_K, the ones
-brolm's GGUF loader keeps) and `quant_linear()` computes Y(B, N) = X(B, K)
-W^T + bias for FP16 (or, INT8 only, BF16) activations. A weight is never
+`detail/quant.h` describes a quantised weight (`quant_weight()`: INT8 or FP8
+E4M3 with per-row FP32 scales, or the GGUF block formats Q8_0, Q4_K and Q6_K,
+the ones brolm's GGUF loader keeps) and `quant_linear()` computes Y(B, N) =
+X(B, K) W^T + bias, then the linear epilogue, for FP16 (or, byte formats
+only, BF16) activations. A weight is never
 expanded to FP16 on the matrix paths:
 
 | Path | When | What |
@@ -700,6 +708,21 @@ way in `conv_cm.comp` (`QA`, per-output-channel scale); other conv paths
 dequantise the (small) weight first. The INT8 attentions are the projections
 through `quant_linear()` around the FP16 attention core
 (`ops_quant_attention.cpp`).
+
+**Per-row INT8 / FP8 E4M3.** `QF_FP8` is a byte format like `QF_INT8`
+(per-row FP32 scale, the same loads and kernel configuration), decoded by
+`fp8.glsl` bit for bit as the host's codec without forming an FP32
+subnormal. `linear_forward_batched_wq_ex` is `quant_linear()` with the
+linear epilogue: `gemv_q.comp` applies the scale, bias, activation and
+store / accumulate / GeGLU / SwiGLU itself (a GLU's gate and up rows are
+consecutive logical rows of one lane group, NR >= 2), and the prefill GEMM
+takes them through `gemm_cm.comp`'s epilogue. `wq_rows.comp` quantises (one
+workgroup a row: max, scale, codes) and dequantises; the CPU's codes and
+scales come out byte for byte because both divisions are correctly rounded
+from an exact remainder (Dekker's product, every step `precise`: RADV does
+not fuse a `precise` `fma()`, so an fma-based remainder is not exact
+there). Decode, one 2048-wide decoder layer (`brotensor_bench_wq_linear`):
+INT8 and FP8 both 0.36-0.42 ms at M = 1-8 against FP16's 0.52-0.69 ms.
 
 Measured with `brotensor_test_vulkan --bench-quant` (wall clock around
 back-to-back calls, median of 7 batches, one format per process:

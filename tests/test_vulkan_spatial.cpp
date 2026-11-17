@@ -102,8 +102,9 @@ void test_resample_2x() {
         brotensor::upsample_nearest_2x_backward(dc, N, C, H, W, yc);
         brotensor::upsample_nearest_2x_backward(dg, N, C, H, W, yg);
         close_for(dt, download(yg), yc.to_host_vector(), 0, 0, tg("upsample_nearest_2x_backward", dt, ""));
-        brotensor::downsample_avg_2x_backward(xc, N, C, H, W, yc);
-        brotensor::downsample_avg_2x_backward(xg, N, C, H, W, yg);
+        // x as the gradient of a downsample from (2H, 2W): N, C, H, W are the input dims.
+        brotensor::downsample_avg_2x_backward(xc, N, C, 2 * H, 2 * W, yc);
+        brotensor::downsample_avg_2x_backward(xg, N, C, 2 * H, 2 * W, yg);
         close_for(dt, download(yg), yc.to_host_vector(), 0, 0, tg("downsample_avg_2x_backward", dt, ""));
     }
 }

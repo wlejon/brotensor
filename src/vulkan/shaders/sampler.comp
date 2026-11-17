@@ -62,7 +62,8 @@ void main() {
         } else if (MODE == SMP_U8_NHWC) {
             const uint ch = (i / pc.hw) % pc.c, img = i / (pc.hw * pc.c), px = i % pc.hw;
             const float v = float(uint(U8Buf(pc.x).v[(img * pc.hw + px) * pc.c + ch]));
-            store_elem(DT, pc.y, i, v * pc.k0 + pc.k1);
+            precise const float y = v * pc.k0 + pc.k1;   // rounded twice, as the CPU: never an fma
+            store_elem(DT, pc.y, i, y);
         }
     }
 }

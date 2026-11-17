@@ -105,6 +105,7 @@
 #define FA_MODE_ROWS    0    // q_offset + causal / window over [0, lk)
 #define FA_MODE_VARLEN  1    // cu_seqlens_q / cu_seqlens_k (+ causal within the sequence)
 #define FA_MODE_PACKED  2    // per-row seq_bounds (+ |q - k| <= window / 2)
+#define FA_MODE_LEN     3    // device length n = aux[0] clamped to [0, lk]: row qi causal over [0, n - lq + qi]
 
 // attn_aux.comp
 #define AUX_ROW_GATE    0    // y[r, c] = mask[r] >= 0.5 ? x[r, c] : 0 (FP32 x, y in DT)
@@ -177,11 +178,13 @@
 #define RNG_TRUNCATED       3
 
 // Quantised weight formats (quant_decode.glsl, gemv_q.comp, gemm_cm.comp's QB,
-// conv_cm.comp's QA, dequant.comp); 0 means not quantised.
+// conv_cm.comp's QA, dequant.comp); 0 means not quantised. INT8 and FP8 are
+// the byte formats: one byte per weight, the row scale applied to the code.
 #define QF_INT8             1    // int8, per-row FP32 scale
 #define QF_Q8_0             2    // GGUF Q8_0
 #define QF_Q4K              3    // GGUF Q4_K
 #define QF_Q6K              4    // GGUF Q6_K
+#define QF_FP8              5    // FP8 E4M3 (OCP e4m3fn), per-row FP32 scale
 
 // audio.comp (spec constant 0)
 #define AU_SNAKE            0

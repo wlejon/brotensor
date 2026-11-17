@@ -74,9 +74,9 @@ bool vec_ok(const GemmArgs& g) {
 
 bool cm_vec_ok(const GemmArgs& g) {
     const int ea = g.ta ? g.m : g.k, eb = g.nb ? g.n : g.k;
-    if (g.qb != 0) {   // A as usual; an INT8 B row in 8-byte chunks (the GGUF formats have no scalar form)
+    if (g.qb != 0) {   // A as usual; a byte-format (INT8 / FP8) B row in 8-byte chunks (the GGUF formats have no scalar form)
         return g.a % 16 == 0 && g.lda % 8 == 0 && g.k > 0 && g.k % 8 == 0 &&
-               (g.qb != QF_INT8 || (g.b % 8 == 0 && g.ldb % 8 == 0));
+               ((g.qb != QF_INT8 && g.qb != QF_FP8) || (g.b % 8 == 0 && g.ldb % 8 == 0));
     }
     return vec_ok(g) && g.k > 0 && ea % 8 == 0 && eb % 8 == 0;
 }

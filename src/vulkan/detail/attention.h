@@ -8,6 +8,8 @@
 //   FA_MODE_ROWS    q_offset + causal / window, keys [0, lk), optional mask
 //   FA_MODE_VARLEN  cu_seqlens_q / cu_seqlens_k (device INT32), causal per sequence
 //   FA_MODE_PACKED  per-row seq_bounds (device INT32, lq x 2), window
+//   FA_MODE_LEN     device INT32 length n (aux), row qi causal over the first
+//                   n - lq + 1 + qi keys (fa_rows only)
 // attention() picks
 //   * fa_cm.comp    FP16 / BF16, cooperative matrix, more than a few query rows;
 //   * fa_rows.comp  one query row per workgroup with split keys: decode, FP32,
@@ -28,7 +30,7 @@ struct AttnProblem {
     ::brotensor::Dtype dt = ::brotensor::Dtype::FP16;   // Q, K, V and O
     std::uint64_t q = 0, k = 0, v = 0, o = 0;           // device addresses (head 0, row 0)
     std::uint64_t mask = 0;                              // FP32 key mask (lk), 0 = none
-    std::uint64_t aux = 0, aux2 = 0;                     // VARLEN / PACKED tables
+    std::uint64_t aux = 0, aux2 = 0;                     // VARLEN / PACKED tables, LEN length
     int lq = 0, lk = 0;
     int ldq = 0, ldk = 0, ldo = 0;                       // row strides in elements (V shares ldk)
     int hd = 0, hq = 0, hkv = 0;
