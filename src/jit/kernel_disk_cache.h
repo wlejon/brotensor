@@ -20,7 +20,7 @@
 // least recently used entries go first. BRO_ML_CACHE_DISABLE=1 turns the
 // cache off (CPU kernels are then compiled in memory by brass's KernelJit).
 //
-// Every key is KeyBuilder(kKeyDomain) + add_brass_build() (brass's version,
+// Every key is KeyBuilder(kKeyDomain) + add_brass_build() (brass's codegen fingerprint,
 // the binary holding brass — so any rebuild of brotensor is a new key space —
 // the target and the host CPU's AVX/AVX2/FMA) + the kind ("cpu", "spirv",
 // "ptx") + the caller's `signature`, hashed in full. A signature must name
