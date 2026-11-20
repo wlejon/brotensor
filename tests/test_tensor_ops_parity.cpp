@@ -153,6 +153,58 @@ void run_cast_bf16_to_fp32(int r, int c, uint64_t seed) {
                     0.0f, 0.0f);
 }
 
+void run_cast_fp16_to_bf16(int r, int c, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor src_fp32 = Tensor::mat(r, c);
+    fill_random(src_fp32, rng);
+    Tensor src_fp16;
+    brotensor::cast(src_fp32, src_fp16, Dtype::FP16);
+
+    Tensor dst_cpu;
+    brotensor::cast(src_fp16, dst_cpu, Dtype::BF16);
+    BT_CHECK(dst_cpu.dtype == Dtype::BF16);
+
+    Tensor gsrc = src_fp16.to(gpu_device());
+    Tensor gdst;
+    brotensor::cast(gsrc, gdst, Dtype::BF16);
+    BT_CHECK(gdst.dtype == Dtype::BF16);
+
+    std::vector<uint16_t> cpu_bits = dst_cpu.to_host_vector_bf16();
+    std::vector<uint16_t> gpu_bits = gdst.to_host_vector_bf16();
+    BT_CHECK(cpu_bits.size() == gpu_bits.size());
+    for (size_t i = 0; i < cpu_bits.size(); ++i) {
+        const float a = brotensor::bf16_bits_to_fp32(cpu_bits[i]);
+        const float b = brotensor::bf16_bits_to_fp32(gpu_bits[i]);
+        BT_CHECK(std::fabs(a - b) <= 1e-2f + 1e-2f * std::fabs(a));
+    }
+}
+
+void run_cast_bf16_to_fp16(int r, int c, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor src_fp32 = Tensor::mat(r, c);
+    fill_random(src_fp32, rng);
+    Tensor src_bf16;
+    brotensor::cast(src_fp32, src_bf16, Dtype::BF16);
+
+    Tensor dst_cpu;
+    brotensor::cast(src_bf16, dst_cpu, Dtype::FP16);
+    BT_CHECK(dst_cpu.dtype == Dtype::FP16);
+
+    Tensor gsrc = src_bf16.to(gpu_device());
+    Tensor gdst;
+    brotensor::cast(gsrc, gdst, Dtype::FP16);
+    BT_CHECK(gdst.dtype == Dtype::FP16);
+
+    std::vector<uint16_t> cpu_bits = dst_cpu.to_host_vector_fp16();
+    std::vector<uint16_t> gpu_bits = gdst.to_host_vector_fp16();
+    BT_CHECK(cpu_bits.size() == gpu_bits.size());
+    for (size_t i = 0; i < cpu_bits.size(); ++i) {
+        const float a = brotensor::fp16_bits_to_fp32(cpu_bits[i]);
+        const float b = brotensor::fp16_bits_to_fp32(gpu_bits[i]);
+        BT_CHECK(std::fabs(a - b) <= 2e-3f + 2e-3f * std::fabs(a));
+    }
+}
+
 // ─── copy_d2d ──────────────────────────────────────────────────────────────
 //
 // Flat-buffer sub-range copy. Verify a partial copy leaves the untouched
@@ -237,6 +289,10 @@ BT_PARITY_TEST(cast_fp32_to_bf16_small)  { run_cast_fp32_to_bf16(4, 8, 0x216ull)
 BT_PARITY_TEST(cast_fp32_to_bf16_medium) { run_cast_fp32_to_bf16(16, 64, 0x217ull); }
 BT_PARITY_TEST(cast_bf16_to_fp32_small)  { run_cast_bf16_to_fp32(4, 8, 0x218ull); }
 BT_PARITY_TEST(cast_bf16_to_fp32_medium) { run_cast_bf16_to_fp32(16, 64, 0x219ull); }
+BT_PARITY_TEST(cast_fp16_to_bf16_small)  { run_cast_fp16_to_bf16(4, 8, 0x21aull); }
+BT_PARITY_TEST(cast_fp16_to_bf16_medium) { run_cast_fp16_to_bf16(16, 64, 0x21bull); }
+BT_PARITY_TEST(cast_bf16_to_fp16_small)  { run_cast_bf16_to_fp16(4, 8, 0x21cull); }
+BT_PARITY_TEST(cast_bf16_to_fp16_medium) { run_cast_bf16_to_fp16(16, 64, 0x21dull); }
 
 // ─── copy_d2d ──────────────────────────────────────────────────────────────
 BT_PARITY_TEST(copy_d2d_partial)  { run_copy_d2d(16, 16, 3, 5, 6, 0x220ull); }

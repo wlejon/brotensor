@@ -703,6 +703,22 @@ kernel void k_cast_b2f(device const bfloat* s [[buffer(0)]],
     if (i >= n) return;
     d[i] = float(s[i]);
 }
+
+kernel void k_cast_h2b(device const half* s [[buffer(0)]],
+                       device bfloat*     d [[buffer(1)]],
+                       constant uint&     n [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    d[i] = bfloat(float(s[i]));
+}
+
+kernel void k_cast_b2h(device const bfloat* s [[buffer(0)]],
+                       device half*         d [[buffer(1)]],
+                       constant uint&       n [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    d[i] = half(float(s[i]));
+}
 )msl";
 
 NSString* const kExtra2Src = @R"msl(

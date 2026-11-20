@@ -684,6 +684,18 @@ id<MTLComputePipelineState> pso_cast_b2f() {
     dispatch_once(&once, ^{ pso = compile_pipeline(kCastSrc, @"k_cast_b2f"); });
     return pso;
 }
+id<MTLComputePipelineState> pso_cast_h2b() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kCastSrc, @"k_cast_h2b"); });
+    return pso;
+}
+id<MTLComputePipelineState> pso_cast_b2h() {
+    static dispatch_once_t once;
+    static id<MTLComputePipelineState> pso;
+    dispatch_once(&once, ^{ pso = compile_pipeline(kCastSrc, @"k_cast_b2h"); });
+    return pso;
+}
 
 } // namespace
 
@@ -722,9 +734,13 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
         pso = pso_cast_f2b();
     } else if (src.dtype == Dtype::BF16 && out_dtype == Dtype::FP32) {
         pso = pso_cast_b2f();
+    } else if (src.dtype == Dtype::FP16 && out_dtype == Dtype::BF16) {
+        pso = pso_cast_h2b();
+    } else if (src.dtype == Dtype::BF16 && out_dtype == Dtype::FP16) {
+        pso = pso_cast_b2h();
     } else {
         throw std::runtime_error(
-            "cast: unsupported dtype pair (Metal supports FP32<->FP16, FP32<->BF16)");
+            "cast: unsupported dtype pair (Metal supports FP32<->FP16, FP32<->BF16, and FP16<->BF16)");
     }
     launch_1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:bs offset:os atIndex:0];
