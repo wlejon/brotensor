@@ -677,6 +677,8 @@ BackwardProofSuiteReport prove_flash_attention_mask_adjoint_duality() {
 
         brass::verify::GpuProverOptions opts;
         opts.local_size_x = 256;
+        opts.buffers.push_back({0, 1024, -1, 4, 16});
+        opts.buffers.push_back({1, 1024, -1, 4, 16});
         auto ptx_mem = brass::verify::verify_ptx_memory_safety(ptx_fn, opts);
         auto ptx_bar = brass::verify::verify_ptx_barrier_uniformity(ptx_fn, opts);
 

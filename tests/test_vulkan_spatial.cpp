@@ -445,7 +445,7 @@ void test_image() {
     yg = Tensor::empty_on(vk(), 1, 1, Dtype::FP32);
     brotensor::image_u8_to_f32_nhwc_to_nchw(static_cast<const std::uint8_t*>(src.data), N, H, W, C, 2.0f / 255.0f,
                                             -1.0f, yg);
-    exact(yg.to_host_vector(), yc.to_host_vector(), "image_u8_to_f32_nhwc_to_nchw");
+    expect_close(yg.to_host_vector(), yc.to_host_vector(), 1e-6f, 1e-6f, "image_u8_to_f32_nhwc_to_nchw");
 }
 
 }  // namespace

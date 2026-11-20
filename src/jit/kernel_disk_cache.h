@@ -59,7 +59,7 @@ namespace brotensor::jit {
 class KernelDiskCache {
 public:
     // The key schema. Bump the suffix when what a key covers changes.
-    static constexpr std::string_view kKeyDomain = "brotensor.kernel/2";
+    static constexpr std::string_view kKeyDomain = "brotensor.kernel/3";
     static constexpr uint64_t kDefaultMaxBytes = uint64_t{256} << 20;
 
     struct Stats {

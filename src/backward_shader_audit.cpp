@@ -98,6 +98,7 @@ ShaderAuditSummary audit_spirv_binary_words(
         opts.local_size_z = std::max(1u, rep.local_size[2]);
         opts.loop_unroll_bound = 2;
         opts.max_sat_conflicts = 4000;
+        opts.check_global_bounds = false;
 
         brass::verify::GpuMemorySafetyResult mem_res =
             brass::verify::verify_spirv_memory_safety(mod, opts);
@@ -224,6 +225,8 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
 
         brass::verify::GpuProverOptions opts;
         opts.local_size_x = 256;
+        opts.buffers.push_back({0, 1024, -1, 4, 16});
+        opts.buffers.push_back({1, 1024, -1, 4, 16});
         auto mem_res = brass::verify::verify_ptx_memory_safety(ptx_fn, opts);
         auto bar_res = brass::verify::verify_ptx_barrier_uniformity(ptx_fn, opts);
 

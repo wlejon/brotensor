@@ -10,9 +10,7 @@
 #include <brass/cache/native_module_cache.hpp>
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/function.hpp>
-#include <brass/mir/loop_opt.hpp>
-#include <brass/mir/smt_guard_elim.hpp>
-#include <brass/mir/superopt.hpp>
+#include <brass/target/spirv_target.hpp>
 #endif
 
 namespace brotensor::jit {
@@ -67,174 +65,42 @@ void remove_old_format(const std::filesystem::path& dir) {
     std::filesystem::remove_all(dir / ".rt", ec);
 }
 
-// The pass budgets compile_or_load_cpu_kernel runs with: part of every CPU key.
-constexpr uint32_t kGuardMaxSatConflicts = 256;
-constexpr uint32_t kGuardMaxSliceDepth   = 8;
-constexpr uint32_t kSuperoptMaxSatConflicts = 256;
-constexpr uint32_t kSuperoptMaxWindowDepth  = 3;
-
 bool is_damage(brass::cache::Miss why) {
     using brass::cache::Miss;
     return why == Miss::Unreadable || why == Miss::Foreign || why == Miss::KeyMismatch ||
            why == Miss::Truncated || why == Miss::Corrupt;
 }
 
-// ── SpirvKernel metadata (everything but the words) ─────────────────────────
-
-void put_u32(std::string& b, uint32_t v) {
-    for (int i = 0; i < 4; ++i) b.push_back(static_cast<char>((v >> (8 * i)) & 0xFFu));
-}
-
-void put_str(std::string& b, const std::string& s) {
-    put_u32(b, static_cast<uint32_t>(s.size()));
-    b.append(s);
-}
-
-struct Reader {
-    const uint8_t* cur;
-    const uint8_t* end;
-    bool ok = true;
-
-    uint32_t u32() {
-        if (!ok || end - cur < 4) { ok = false; return 0; }
-        const uint32_t v = static_cast<uint32_t>(cur[0]) | (static_cast<uint32_t>(cur[1]) << 8) |
-                           (static_cast<uint32_t>(cur[2]) << 16) | (static_cast<uint32_t>(cur[3]) << 24);
-        cur += 4;
-        return v;
-    }
-    std::string str() {
-        const uint32_t n = u32();
-        if (!ok || static_cast<size_t>(end - cur) < n) { ok = false; return {}; }
-        std::string s(reinterpret_cast<const char*>(cur), n);
-        cur += n;
-        return s;
-    }
-    // A count of records at least `min_bytes` each that must fit what is left.
-    uint32_t count(size_t min_bytes) {
-        const uint32_t n = u32();
-        if (ok && static_cast<size_t>(end - cur) / min_bytes < n) ok = false;
-        return ok ? n : 0;
-    }
-};
-
-std::string encode_spirv_meta(const brass::target::SpirvKernel& k) {
-    std::string b;
-    put_str(b, k.entry);
-    put_u32(b, static_cast<uint32_t>(k.stage));
-    put_u32(b, k.push_constant_bytes);
-    put_u32(b, k.shared_bytes);
-    for (uint32_t s : k.local_size) put_u32(b, s);
-    put_u32(b, k.local_size_spec_constants ? 1u : 0u);
-    put_u32(b, static_cast<uint32_t>(k.params.size()));
-    for (const auto& p : k.params) {
-        put_u32(b, static_cast<uint32_t>(p.type.kind()));
-        put_u32(b, p.offset);
-        put_u32(b, p.size);
-    }
-    put_u32(b, static_cast<uint32_t>(k.descriptors.size()));
-    for (const auto& d : k.descriptors) {
-        put_u32(b, d.set);
-        put_u32(b, d.binding);
-        put_u32(b, static_cast<uint32_t>(d.kind));
-        put_u32(b, static_cast<uint32_t>(d.dim));
-        put_u32(b, d.arrayed ? 1u : 0u);
-        put_u32(b, d.depth ? 1u : 0u);
-        put_u32(b, static_cast<uint32_t>(d.scalar));
-        put_u32(b, d.format);
-        put_u32(b, d.bytes);
-    }
-    put_u32(b, static_cast<uint32_t>(k.capabilities.size()));
-    for (const auto& c : k.capabilities) put_str(b, c);
-    put_u32(b, static_cast<uint32_t>(k.extensions.size()));
-    for (const auto& e : k.extensions) put_str(b, e);
-    return b;
-}
-
-bool decode_spirv_meta(std::span<const uint8_t> bytes, brass::target::SpirvKernel& k) {
-    Reader r{bytes.data(), bytes.data() + bytes.size()};
-    k.entry = r.str();
-    k.stage = static_cast<brass::target::SpirvStage>(r.u32());
-    k.push_constant_bytes = r.u32();
-    k.shared_bytes = r.u32();
-    for (uint32_t& s : k.local_size) s = r.u32();
-    k.local_size_spec_constants = r.u32() != 0;
-    k.params.resize(r.count(12));
-    for (auto& p : k.params) {
-        p.type = brass::Type(static_cast<brass::TypeKind>(r.u32()));
-        p.offset = r.u32();
-        p.size = r.u32();
-    }
-    k.descriptors.resize(r.count(36));
-    for (auto& d : k.descriptors) {
-        d.set = r.u32();
-        d.binding = r.u32();
-        d.kind = static_cast<brass::target::SpirvDescriptorKind>(r.u32());
-        d.dim = static_cast<brass::target::SpirvImageDim>(r.u32());
-        d.arrayed = r.u32() != 0;
-        d.depth = r.u32() != 0;
-        d.scalar = static_cast<brass::target::SpirvImageScalar>(r.u32());
-        d.format = r.u32();
-        d.bytes = r.u32();
-    }
-    k.capabilities.resize(r.count(4));
-    for (auto& c : k.capabilities) c = r.str();
-    k.extensions.resize(r.count(4));
-    for (auto& e : k.extensions) e = r.str();
-    return r.ok && r.cur == r.end;
+brass::codegen::KernelOptions to_kernel_options(const KernelDiskCache::CpuCompileOptions& opts,
+                                                bool enable_optimizations) {
+    brass::codegen::KernelOptions k;
+    k.opt_level               = 2;
+    k.enable_optimizations    = enable_optimizations;
+    k.enable_sroa             = true;
+    k.enable_bce              = true;
+    k.enable_smt_guard_elim   = opts.enable_smt_guard_elim;
+    k.enable_superopt         = opts.enable_mir_superopt;
+    k.enable_avx2             = opts.enable_avx2;
+    k.enable_fma              = opts.enable_fma;
+    k.enable_vectorize        = opts.enable_vectorize;
+    k.enable_slp              = true;
+    k.enable_unroll           = opts.enable_unroll;
+    k.unroll_factor           = opts.unroll_factor;
+    k.enable_fp_reassociation = opts.enable_fp_reassociation;
+    return k;
 }
 
 brass::codegen::KernelFunction jit_compile(brass::Module& mod, std::string_view entry,
                                            const KernelDiskCache::CpuCompileOptions& opts) {
-    brass::codegen::KernelOptions k;
-    k.enable_optimizations    = false;   // the passes already ran
-    k.enable_avx2             = opts.enable_avx2;
-    k.enable_fma              = opts.enable_fma;
-    k.enable_vectorize        = opts.enable_vectorize;
-    k.enable_unroll           = opts.enable_unroll;
-    k.unroll_factor           = opts.unroll_factor;
-    k.enable_fp_reassociation = opts.enable_fp_reassociation;
-    brass::codegen::KernelJit jit(k);
+    brass::codegen::KernelJit jit(to_kernel_options(opts, /*enable_optimizations=*/false));
     return jit.compile(mod, entry);
 }
 
-// build_fn, then brotensor's passes over what it built.
+// build_fn, then Brass's KernelJit optimization & verification pipeline.
 void build_kernel_module(brass::Module& mod, const std::function<void(brass::Module&)>& build_fn,
                          const KernelDiskCache::CpuCompileOptions& opts) {
-    mod.set_allow_fp_reassociation(opts.enable_fp_reassociation);
     build_fn(mod);
-    for (brass::Function* fn : mod.functions()) {
-        if (!fn) continue;
-        fn->rebuild_cfg_predecessors();
-        if (opts.enable_smt_guard_elim) {
-            brass::SmtGuardElimOptions g;
-            g.max_sat_conflicts = kGuardMaxSatConflicts;
-            g.max_slice_depth   = kGuardMaxSliceDepth;
-            brass::run_smt_guard_elimination(*fn, mod, g);
-        }
-        if (opts.enable_mir_superopt) {
-            brass::SuperoptOptions s;
-            s.max_sat_conflicts = kSuperoptMaxSatConflicts;
-            s.max_window_depth  = kSuperoptMaxWindowDepth;
-            brass::run_mir_superopt(*fn, mod, s);
-        }
-        fn->rebuild_cfg_predecessors();
-    }
-    if (opts.enable_loop_opt) {
-        brass::LoopOptOptions l;
-        l.enable_avx2             = opts.enable_avx2;
-        l.enable_fma              = opts.enable_fma;
-        l.enable_fp_reassociation = opts.enable_fp_reassociation;
-        l.enable_vectorize        = opts.enable_vectorize;
-        l.enable_unroll           = opts.enable_unroll;
-        l.unroll_factor           = opts.unroll_factor;
-        l.enable_f64_demote       = false;
-        l.enable_parallel_loops   = false;
-        for (brass::Function* fn : mod.functions()) {
-            if (!fn) continue;
-            brass::optimize_function(*fn, l);
-            fn->rebuild_cfg_predecessors();
-        }
-    }
+    brass::codegen::KernelJit::prepare_module(mod, to_kernel_options(opts, opts.enable_loop_opt));
 }
 
 #endif // BROTENSOR_HAS_BRASS_JIT
@@ -378,10 +244,6 @@ brass::cache::CacheKey KernelDiskCache::cpu_key(std::string_view signature, std:
         .add_bool("opt.fp_reassociation", o.enable_fp_reassociation)
         .add_bool("opt.smt_guard_elim", o.enable_smt_guard_elim)
         .add_bool("opt.mir_superopt", o.enable_mir_superopt)
-        .add_u64("pass.guard.max_sat_conflicts", kGuardMaxSatConflicts)
-        .add_u64("pass.guard.max_slice_depth", kGuardMaxSliceDepth)
-        .add_u64("pass.superopt.max_sat_conflicts", kSuperoptMaxSatConflicts)
-        .add_u64("pass.superopt.max_window_depth", kSuperoptMaxWindowDepth)
         .finish();
 }
 
@@ -406,10 +268,9 @@ bool KernelDiskCache::store_spirv_kernel(std::string_view signature, const brass
     if (k.words.empty()) return false;
     auto st = stores();
     if (!st) return false;
-    const std::string meta = encode_spirv_meta(k);
+    const std::vector<uint8_t> encoded = brass::target::serialize_spirv_kernel(k);
     const bool ok = st->store.put(blob_key("spirv", signature),
-                                  {brass::cache::BlobRef("meta", meta),
-                                   brass::cache::BlobRef::of<uint32_t>("spirv", std::span<const uint32_t>(k.words))});
+                                  {brass::cache::BlobRef("spirv_kernel", encoded)});
     if (!ok) return false;
     std::lock_guard<std::mutex> lk(mutex_);
     ++stats_.writes;
@@ -423,9 +284,8 @@ bool KernelDiskCache::load_spirv_kernel(std::string_view signature, brass::targe
     bool damaged = is_damage(why);
     if (art) {
         brass::target::SpirvKernel k;
-        const std::span<const uint32_t> words = art->as<uint32_t>("spirv");
-        if (words.size() >= 5 && words[0] == 0x07230203u && decode_spirv_meta(art->bytes("meta"), k)) {
-            k.words.assign(words.begin(), words.end());
+        if (brass::target::deserialize_spirv_kernel(art->bytes("spirv_kernel"), k) &&
+            k.words.size() >= 5 && k.words[0] == 0x07230203u) {
             out = std::move(k);
             std::lock_guard<std::mutex> lk(mutex_);
             ++stats_.hits;

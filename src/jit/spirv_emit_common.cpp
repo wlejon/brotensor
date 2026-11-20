@@ -4,10 +4,7 @@
 #include "spirv_emit_detail.h"
 
 #include <brass/mir/fma_opt.hpp>
-#include <brass/mir/gvn.hpp>
-#include <brass/mir/scalar_opt.hpp>
-#include <brass/mir/smt_guard_elim.hpp>
-#include <brass/mir/superopt.hpp>
+#include <brass/mir/gpu_opt.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -418,20 +415,10 @@ ValueMap eval_chain(Ctx& c, const TraceDAG& dag, int lanes, ValueMap vals,
 }
 
 void optimize_function(Function& fn) {
-    brass::fold_constants(fn);
-    brass::dominator_cse(fn);
-    brass::GvnOptions gvn_opts;
-    gvn_opts.enable_cse = true;
-    gvn_opts.enable_rle = true;
-    gvn_opts.enable_dse = true;
-    brass::gvn_function(fn, gvn_opts);
     if (fn.parent()) {
-        brass::SmtGuardElimOptions ge_opts;
-        ge_opts.fold_branches = false;
-        brass::run_smt_guard_elimination(fn, *fn.parent(), ge_opts);
-        brass::run_mir_superopt(fn, *fn.parent());
+        brass::GpuOptOptions gpu_opts;
+        brass::optimize_gpu_function(fn, *fn.parent(), gpu_opts);
     }
-    brass::scalar_cleanup(fn);
 }
 
 brass::target::SpirvKernel compile(Function& fn, std::uint32_t block, bool optimize) {
