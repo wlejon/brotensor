@@ -83,14 +83,35 @@ struct BwdProblem {
 
 struct Cfg { std::uint32_t nt, br, bc; };
 
-// Tiles that keep Q, dO (br rows), K, V (bc rows), P and dS under the 64 KiB
-// of shared memory (the pipeline guard checks): the inputs are staged in
+std::uint32_t fa_bwd_shared_bytes(Dtype dt, int hdp, Cfg c) {
+    const std::uint32_t st4 = dt == Dtype::FP32 ? 16u : 8u;
+    const std::uint32_t hs4 = static_cast<std::uint32_t>(hdp / 4 + 1);
+    // Qs/Gs (BR*HS4), Ks/Vs (BC*HS4), Ps/Ds (2*BR*BC*4), kval (BC*4), scalars + alignment slack.
+    return 2u * (c.br + c.bc) * hs4 * st4 + 8u * c.br * c.bc + 4u * c.bc + 64u;
+}
+
+// Tiles that keep Q, dO (br rows), K, V (bc rows), P and dS under the device's
+// shared memory budget (the pipeline guard checks): the inputs are staged in
 // their own encoding, so 16-bit tiles take half the room of FP32 ones.
-Cfg pick(Dtype dt, int hdp) {
-    if (dt != Dtype::FP32) return hdp <= 128 ? Cfg{128, 32, 32} : Cfg{128, 32, 16};
-    if (hdp <= 64) return {128, 32, 32};
-    if (hdp <= 128) return {128, 32, 16};
-    return {32, 16, 8};
+Cfg pick(Dtype dt, int hdp, std::uint32_t max_shared) {
+    // Every entry satisfies BC%4==0, BR%4==0, CG=BC/4 pow2, RG=NT/CG | BR,
+    // DGK=RG | HDP, and DGQ=NT/(BR/4) | HDP for all HDP multiples of 32.
+    static constexpr Cfg kConfigs[] = {
+        {128, 32, 32},
+        {128, 32, 16},
+        {32,  16,  8},
+        {8,    8,  4},
+    };
+    std::size_t start = 0;
+    if (dt != Dtype::FP32) {
+        start = hdp <= 128 ? 0 : 1;
+    } else {
+        start = hdp <= 64 ? 0 : (hdp <= 128 ? 1 : 2);
+    }
+    for (std::size_t i = start; i < std::size(kConfigs); ++i) {
+        if (fa_bwd_shared_bytes(dt, hdp, kConfigs[i]) <= max_shared) return kConfigs[i];
+    }
+    return kConfigs[std::size(kConfigs) - 1];
 }
 
 constexpr int kMaxHd = 256;
@@ -185,7 +206,7 @@ void core(DeviceCtx& d, const BwdProblem& p) {
     }
     t_last_path = "fma";
     const int hdp = (p.hd + 31) / 32 * 32;
-    const Cfg c = pick(p.dt, hdp);
+    const Cfg c = pick(p.dt, hdp, d.info().props.limits.maxComputeSharedMemorySize);
     const ShaderId id = dt_variant(ShaderId::fa_bwd_f32, p.dt, p.op);
     auto kernel = [&](std::uint32_t pass) -> const Kernel& {
         return d.pipelines().get(id, {c.nt, static_cast<std::uint32_t>(p.hd), static_cast<std::uint32_t>(hdp), c.br,

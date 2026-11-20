@@ -118,6 +118,7 @@ bool probe_physical(const LoaderFns& f, VkPhysicalDevice pd, PhysInfo& info, std
     std::vector<VkExtensionProperties> exts(ne);
     f.vkEnumerateDeviceExtensionProperties(pd, nullptr, &ne, exts.data());
     info.memory_budget = has_extension(exts, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    info.portability_subset = has_extension(exts, "VK_KHR_portability_subset");
     info.cooperative_matrix = has_extension(exts, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     info.memory_model = f12.vulkanMemoryModel == VK_TRUE && f12.vulkanMemoryModelDeviceScope == VK_TRUE;
 
@@ -182,6 +183,18 @@ Instance::Instance() {
     app.apiVersion = api_;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    const char* portability = "VK_KHR_portability_enumeration";
+    if (fns_.vkEnumerateInstanceExtensionProperties) {
+        std::uint32_t ne = 0;
+        fns_.vkEnumerateInstanceExtensionProperties(nullptr, &ne, nullptr);
+        std::vector<VkExtensionProperties> iexts(ne);
+        fns_.vkEnumerateInstanceExtensionProperties(nullptr, &ne, iexts.data());
+        if (has_extension(iexts, portability)) {
+            ici.enabledExtensionCount = 1;
+            ici.ppEnabledExtensionNames = &portability;
+            ici.flags |= 0x00000001u;  // VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+        }
+    }
     const VkResult r = fns_.vkCreateInstance(&ici, nullptr, &inst_);
     if (r != VK_SUCCESS) {
         why_ = std::string("vkCreateInstance failed: ") + vk_result_name(r);
@@ -261,6 +274,7 @@ DeviceCtx::DeviceCtx(int index, const PhysInfo& info) : index_(index), info_(inf
     std::vector<const char*> exts;
     if (info.memory_budget) exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (info.cooperative_matrix) exts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    if (info.portability_subset) exts.push_back("VK_KHR_portability_subset");
 
     const float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

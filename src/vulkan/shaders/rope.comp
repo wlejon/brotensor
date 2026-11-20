@@ -27,12 +27,24 @@ layout(push_constant) uniform PC {
 
 #include "op_codes.h"
 #include "math_acc.glsl"
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer F32PairBuf { vec2 v[]; };
 
 void rotate(uint64_t src, uint64_t dst, uint o, float c, float s) {
-    const float x0 = load_elem(DT, src, o), x1 = load_elem(DT, src, o + 1u);
     if (BWD != 0) s = -s;
-    store_elem(DT, dst, o, x0 * c - x1 * s);
-    store_elem(DT, dst, o + 1u, x0 * s + x1 * c);
+#if DT == DT_F32
+    // o is always even (head_dim is even and rows are multiples of head_dim),
+    // so each interleaved pair is 8-byte aligned. A single vec2 load/store
+    // avoids SPIRV-Cross forwarding a scalar OpLoad across an in-place OpStore.
+    const uint pair = o >> 1u;
+    const vec2 x = F32PairBuf(src).v[pair];
+    F32PairBuf(dst).v[pair] = vec2(x.x * c - x.y * s, x.x * s + x.y * c);
+#else
+    const float x0 = load_elem(DT, src, o), x1 = load_elem(DT, src, o + 1u);
+    const float y0 = x0 * c - x1 * s;
+    const float y1 = x0 * s + x1 * c;
+    store_elem(DT, dst, o, y0);
+    store_elem(DT, dst, o + 1u, y1);
+#endif
 }
 
 void main() {

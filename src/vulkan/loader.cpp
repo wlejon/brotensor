@@ -26,7 +26,8 @@ void* open_loader() {
 #if defined(_WIN32)
     return reinterpret_cast<void*>(LoadLibraryA("vulkan-1.dll"));
 #elif defined(__APPLE__)
-    const char* names[] = {"libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib"};
+    const char* names[] = {"libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib",
+                           "/opt/homebrew/lib/libvulkan.1.dylib", "/usr/local/lib/libvulkan.1.dylib"};
     for (const char* n : names) {
         if (void* h = dlopen(n, RTLD_NOW | RTLD_LOCAL)) return h;
     }

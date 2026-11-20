@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace brotensor::detail::vulkan {
 
@@ -26,7 +27,7 @@ using ::brotensor::Tensor;
 namespace {
 
 struct SaPush {
-    std::uint64_t idx, keys, src, dst;
+    std::uint64_t idx, keys, keys_out, src, dst;
     std::uint32_t m, r, c, p, k, j;
 };
 
@@ -44,20 +45,24 @@ void scatter_add(DeviceCtx& d, std::uint64_t idx, int M, int R, int C, std::uint
     std::uint32_t P = 1;
     while (P < static_cast<std::uint32_t>(M)) P <<= 1;
     Tensor keys = Tensor::empty_on(::brotensor::Device::vulkan(d.index()), static_cast<int>(P), 2, Dtype::FP32);
+    Tensor keys2;
     const ShaderId id = dt_variant(ShaderId::scatter_add_f32, dt, op);
-    SaPush pc{idx, addr(keys.data), src, dst, static_cast<std::uint32_t>(M), static_cast<std::uint32_t>(R),
+    SaPush pc{idx, addr(keys.data), 0, src, dst, static_cast<std::uint32_t>(M), static_cast<std::uint32_t>(R),
               static_cast<std::uint32_t>(C), P, 0, 0};
     const Kernel& kk = d.pipelines().get(id, {std::uint32_t(SA_KEYS)});
     launch(d, kk, pc, groups_1d(P, kk));
     if (P <= 512) {
         launch(d, d.pipelines().get(id, {std::uint32_t(SA_LOCAL)}), pc, 1);
     } else {
+        keys2 = Tensor::empty_on(::brotensor::Device::vulkan(d.index()), static_cast<int>(P), 2, Dtype::FP32);
+        pc.keys_out = addr(keys2.data);
         const Kernel& ks = d.pipelines().get(id, {std::uint32_t(SA_STEP)});
         for (std::uint32_t k = 2; k <= P; k <<= 1) {
             for (std::uint32_t j = k >> 1; j > 0; j >>= 1) {
                 pc.k = k;
                 pc.j = j;
                 launch(d, ks, pc, groups_1d(P, ks));
+                std::swap(pc.keys, pc.keys_out);
             }
         }
     }

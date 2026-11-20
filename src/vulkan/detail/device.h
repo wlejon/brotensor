@@ -44,6 +44,7 @@ struct PhysInfo {
     std::uint32_t subgroup_ops = 0;      // VkSubgroupFeatureFlags (compute is checked at eligibility)
     bool subgroup_size_control = false;  // pipelines may require a size
     bool memory_budget = false;          // VK_EXT_memory_budget
+    bool portability_subset = false;     // VK_KHR_portability_subset (required by MoltenVK)
     bool cooperative_matrix = false;     // VK_KHR_cooperative_matrix (enabled when present)
     bool memory_model = false;           // vulkanMemoryModel (+ device scope), enabled when present
     bool shader_float64 = false;         // shaderFloat64, enabled when present (custom kernels)
