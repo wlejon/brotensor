@@ -81,7 +81,11 @@ static void test_backward_shader_audit_suite() {
                 total_global_accesses,
                 total_barriers,
                 total_collectives);
+#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
+    CHECK(total_global_accesses >= 100);
+#else
     CHECK(total_global_accesses > 0);
+#endif
     std::printf("  Negative shared-overflow shader caught: %s\n",
                 report.negative_test_detail.c_str());
 

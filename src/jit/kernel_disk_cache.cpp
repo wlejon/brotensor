@@ -93,7 +93,7 @@ brass::codegen::KernelOptions to_kernel_options(const KernelDiskCache::CpuCompil
 
 brass::codegen::KernelFunction jit_compile(brass::Module& mod, std::string_view entry,
                                            const KernelDiskCache::CpuCompileOptions& opts) {
-    brass::codegen::KernelJit jit(to_kernel_options(opts, /*enable_optimizations=*/false));
+    brass::codegen::KernelJit jit(to_kernel_options(opts, opts.enable_loop_opt));
     return jit.compile(mod, entry);
 }
 
@@ -406,7 +406,8 @@ void* KernelDiskCache::compile_or_load_cpu_kernel(
     brass::codegen::KernelFunction jitted;
     if (auto st = stores()) {
         std::exception_ptr thrown;
-        const auto build = [&](brass::Module& mod, std::string& error) {
+        const auto build_obj = [&](brass::object::ObjectFile& obj, std::string& error) {
+            brass::Module mod("brotensor_" + std::string(entry_name));
             try {
                 build_kernel_module(mod, build_fn, opts);
             } catch (...) {
@@ -421,11 +422,21 @@ void* KernelDiskCache::compile_or_load_cpu_kernel(
                 error = "the kernel calls functions it does not define";
                 return false;
             }
+            try {
+                brass::codegen::KernelJit jit(to_kernel_options(opts, opts.enable_loop_opt));
+                obj = jit.compile_object(mod);
+            } catch (const std::exception& e) {
+                error = e.what();
+                return false;
+            } catch (...) {
+                error = "KernelJit::compile_object threw";
+                return false;
+            }
             return true;
         };
         std::string error;
         std::shared_ptr<const brass::cache::NativeModule> m =
-            st->natives.get_or_build(cpu_key(signature, entry_name, opts), build, {}, &error);
+            st->natives.get_or_build_object(cpu_key(signature, entry_name, opts), build_obj, {}, &error);
         if (thrown) std::rethrow_exception(thrown);
         if (m) {
             if (void* sym = m->symbol(entry_name)) {

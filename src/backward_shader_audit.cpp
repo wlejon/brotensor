@@ -80,6 +80,59 @@ std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::str
     if (name == "jit_spirv_elementwise_scalar") {
         return {{0, 0, 3, 4, 4}, {1, 0, 3, 4, 4}, {2, 0, 3, 4, 4}};
     }
+    if (name == "bias_f32" || name == "bias_f16" || name == "bias_bf16") {
+        const std::uint32_t eb = (name == "bias_f32") ? 4u : 2u;
+        return {{0, 0, 2, eb, 16}, {1, 0, 3, eb, 16}};
+    }
+    if (name == "rowvec_f32" || name == "rowvec_f16" || name == "rowvec_bf16") {
+        const std::uint32_t eb = (name == "rowvec_f32") ? 4u : 2u;
+        return {{0, 0, 4, eb, 16}, {1, 0, 5, eb, 16}, {2, 0, 5, eb, 16}, {3, 0, 4, eb, 16}};
+    }
+    if (name == "sum_cols_f32" || name == "sum_cols_f16" || name == "sum_cols_bf16") {
+        const std::uint32_t eb = (name == "sum_cols_f32") ? 4u : 2u;
+        return {{0, 0, 2, eb, 16, 3, -1, 1}, {1, 0, 3, eb, 16}};
+    }
+    if (name == "sum_rows_f32" || name == "sum_rows_f16" || name == "sum_rows_bf16") {
+        const std::uint32_t eb = (name == "sum_rows_f32") ? 4u : 2u;
+        return {{0, 0, 2, eb, 16, 3, -1, 1}, {1, 0, 2, eb, 16}};
+    }
+    if (name == "argmax_rows_f32" || name == "argmax_rows_f16" || name == "argmax_rows_bf16") {
+        const std::uint32_t eb = (name == "argmax_rows_f32") ? 4u : 2u;
+        return {{0, 0, 2, eb, 16, 3, -1, 1}, {1, 0, 2, 4, 16}};
+    }
+    if (name == "copy2d_b1" || name == "copy2d_b2" || name == "copy2d_b4") {
+        const std::uint32_t eb = (name == "copy2d_b4") ? 4u : (name == "copy2d_b2") ? 2u : 1u;
+        return {{0, 0, 5, eb, eb, 2, -1, 1}, {1, 0, 5, eb, eb, 3, -1, 1}};
+    }
+    if (name == "transpose_b2" || name == "transpose_b4") {
+        const std::uint32_t eb = (name == "transpose_b4") ? 4u : 2u;
+        return {{0, 0, 2, eb, eb, 3, 4, 1}, {1, 0, 2, eb, eb, 3, 4, 1}};
+    }
+    if (name == "jit_spirv_rmsnorm_64_vec" || name == "jit_spirv_rmsnorm_64_scalar") {
+        return {{0, 4096, -1, 4, 16}, {1, 4096, -1, 4, 16}, {2, 256, -1, 4, 16}};
+    }
+    if (name == "jit_spirv_rmsnorm_4096_vec" || name == "jit_spirv_rmsnorm_4096_scalar") {
+        return {{0, 262144, -1, 4, 16}, {1, 262144, -1, 4, 16}, {2, 16384, -1, 4, 16}};
+    }
+    if (name == "jit_spirv_layernorm_64_vec" || name == "jit_spirv_layernorm_64_scalar") {
+        return {{0, 4096, -1, 4, 16}, {1, 4096, -1, 4, 16}, {2, 256, -1, 4, 16}, {3, 256, -1, 4, 16}};
+    }
+    if (name == "jit_spirv_layernorm_4096_vec" || name == "jit_spirv_layernorm_4096_scalar") {
+        return {{0, 262144, -1, 4, 16}, {1, 262144, -1, 4, 16}, {2, 16384, -1, 4, 16}, {3, 16384, -1, 4, 16}};
+    }
+    return {};
+}
+
+std::vector<brass::verify::GpuParamConstraint> param_constraints_for_shader(const std::string& name) {
+    if (name == "bias_f32" || name == "bias_f16" || name == "bias_bf16") {
+        return {{3, UINT32_MAX, 1, 0}, {4, UINT32_MAX, 1, 0}};
+    }
+    if (name == "rowvec_f32" || name == "rowvec_f16" || name == "rowvec_bf16") {
+        return {{5, UINT32_MAX, 1, 0}};
+    }
+    if (name == "copy2d_b1" || name == "copy2d_b2" || name == "copy2d_b4") {
+        return {{4, 2, 0, 0}, {4, 3, 0, 0}};
+    }
     return {};
 }
 
@@ -142,6 +195,7 @@ ShaderAuditSummary audit_spirv_binary_words(
         opts.max_sat_conflicts = 4000;
         opts.check_global_bounds = !specs.empty();
         opts.buffers = specs;
+        opts.param_constraints = param_constraints_for_shader(name);
 
         brass::verify::GpuMemorySafetyResult mem_res =
             brass::verify::verify_spirv_memory_safety(mod, opts);
