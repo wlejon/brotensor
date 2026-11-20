@@ -1,7 +1,7 @@
-// Shared MIR helpers for the Vulkan trace emitters: typed lane loads and
-// stores, BF16/FP16 packing, the per-lane op table. Notes: spirv_emit_detail.h.
+// Shared MIR helpers for GPU trace emitters (SPIR-V, PTX, MSL): typed lane loads
+// and stores, BF16/FP16 packing, the per-lane op table. Notes: gpu_mir_emit_detail.h.
 
-#include "spirv_emit_detail.h"
+#include "gpu_mir_emit_detail.h"
 
 #include <brass/mir/fma_opt.hpp>
 #include <brass/mir/gpu_opt.hpp>
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <unordered_set>
 
-namespace brotensor::jit::spirv::detail {
+namespace brotensor::jit::gpu_mir {
 
 namespace {
 
@@ -29,10 +29,7 @@ Value* sigmoid(Ctx& c, Value* x) {
 // tanh(x) = sign(x) (1 - e) / (1 + e), e = 2^(-2|x| log2 e) in (0, 1]: no
 // overflow anywhere, and no cancellation worse than the absolute error of e.
 Value* tanh_(Ctx& c, Value* x) {
-    Builder& b = c.b;
-    Value* e = c.kb.ex2_approx(b.build_mul(c.kb.fabs(x), c.f32(-2.0f * kLog2e)));
-    Value* t = c.kb.div_approx(b.build_sub(c.f32(1.0f), e), b.build_add(c.f32(1.0f), e));
-    return b.build_select(b.build_slt(x, c.f32(0.0f)), b.build_neg(t), t);
+    return c.kb.tanh_approx(x);
 }
 
 }  // namespace
@@ -60,15 +57,13 @@ Value* udiv_const(Ctx& c, Value* x, int d) {
     if (is_pow2(d)) return b.build_lshr(x, c.i32(log2_exact(d)));
     const MagicU32 m = magic_u32(static_cast<std::uint32_t>(d));
     Value* xp = m.pre_shift ? b.build_lshr(x, c.i32(static_cast<int>(m.pre_shift))) : x;
-    Value* prod64 = b.build_mul(b.build_zext_i64(xp), c.kb.const_i64(static_cast<std::int64_t>(m.mul)));
+    Value* mh = c.kb.mul_hi_u32(xp, c.i32(static_cast<int32_t>(m.mul)));
     if (!m.add) {
-        Value* sh = b.build_lshr(prod64, c.kb.const_i64(static_cast<std::int64_t>(32u + m.post_shift)));
-        return b.build_trunc_i32(sh);
+        return m.post_shift ? b.build_lshr(mh, c.i32(static_cast<int>(m.post_shift))) : mh;
     }
-    Value* q = b.build_trunc_i32(b.build_lshr(prod64, c.kb.const_i64(32)));
-    Value* diff = b.build_sub(xp, q);
+    Value* diff = b.build_sub(xp, mh);
     Value* half = b.build_lshr(diff, c.i32(1));
-    Value* sum = b.build_add(half, q);
+    Value* sum = b.build_add(half, mh);
     return m.post_shift > 1 ? b.build_lshr(sum, c.i32(static_cast<int>(m.post_shift - 1))) : sum;
 }
 
@@ -111,17 +106,8 @@ void unpack_word(Ctx& c, Dtype dt, Value* w, std::vector<Value*>& out) {
 // above). BF16 rounds to nearest even and keeps NaNs quiet — bit-identical to
 // f32_to_bf16 in shaders/common.glsl and to brotensor::fp32_to_bf16_bits.
 Value* pack_half(Ctx& c, Dtype dt, Value* x) {
-    Builder& b = c.b;
     if (dt == Dtype::FP16) return c.kb.f32_to_f16(x);
-    Value* u = f32_to_bits(c, x);
-    Value* hi = b.build_lshr(u, c.i32(16));
-    Value* rounded = b.build_lshr(
-        b.build_add(b.build_add(u, c.i32(0x7FFF)), b.build_and(hi, c.i32(1))), c.i32(16));
-    Value* is_nan = b.build_and(
-        b.build_eq(b.build_and(u, c.i32(0x7F800000)), c.i32(0x7F800000)),
-        b.build_ne(b.build_and(u, c.i32(0x007FFFFF)), c.i32(0)));
-    Value* quiet = b.build_or(hi, c.i32(0x40));
-    return b.build_select(b.build_ne(is_nan, c.i32(0)), quiet, rounded);
+    return c.kb.f32_to_bf16(x);
 }
 
 }  // namespace
@@ -421,17 +407,4 @@ void optimize_function(Function& fn) {
     }
 }
 
-brass::target::SpirvKernel compile(Function& fn, std::uint32_t block, bool optimize) {
-    if (optimize) optimize_function(fn);
-    brass::target::SpirvOptions opts;
-    opts.local_size_x = block;
-    return brass::target::SpirvTarget::compile(fn, opts);
-}
-
-brass::target::SpirvKernel compile(const Function& fn, std::uint32_t block) {
-    brass::target::SpirvOptions opts;
-    opts.local_size_x = block;
-    return brass::target::SpirvTarget::compile(fn, opts);
-}
-
-}  // namespace brotensor::jit::spirv::detail
+}  // namespace brotensor::jit::gpu_mir

@@ -51,6 +51,7 @@
 #if BROTENSOR_HAS_BRASS_JIT
 #include <brass/cache/artifact_cache.hpp>
 #include <brass/mir/module.hpp>
+#include <brass/target/msl_target.hpp>
 #include <brass/target/spirv_target.hpp>
 #endif
 
@@ -115,6 +116,10 @@ public:
     // A SPIR-V kernel and everything needed to launch it.
     bool store_spirv_kernel(std::string_view signature, const brass::target::SpirvKernel& kernel);
     bool load_spirv_kernel(std::string_view signature, brass::target::SpirvKernel& out_kernel);
+
+    // A Metal (MSL) kernel and its dispatch/parameter metadata.
+    bool store_msl_kernel(std::string_view signature, const brass::target::MslKernel& kernel);
+    bool load_msl_kernel(std::string_view signature, brass::target::MslKernel& out_kernel);
 
     // A CPU kernel: loaded from the cache, or built — build_fn fills the
     // module, then brotensor's passes run (SMT guard elimination, MIR

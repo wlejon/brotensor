@@ -12,7 +12,7 @@
 // BF16 needs the bits of an FP32 value and an FP32 value from bits: MIR's
 // bitcast.i32 / bitcast.f32 (brass docs/mir_reference.md), one OpBitcast each.
 
-#include "spirv_emit.h"
+#include "trace_plan.h"
 
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/builder.hpp>
@@ -23,7 +23,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace brotensor::jit::spirv::detail {
+namespace brotensor::jit::gpu_mir {
 
 using brass::Builder;
 using brass::Function;
@@ -72,11 +72,15 @@ ValueMap eval_chain(Ctx& c, const TraceDAG& dag, int lanes, ValueMap vals,
 // cleanup) in place on `fn` while preserving structured-CFG invariants.
 void optimize_function(Function& fn);
 
-// brass::target::SpirvTarget::compile with a 1-D workgroup of `block` threads
-// (the default the specialisation constants carry). When `optimize` is true,
-// runs `optimize_function(fn)` prior to SPIR-V instruction selection.
-brass::target::SpirvKernel compile(Function& fn, std::uint32_t block, bool optimize = true);
-brass::target::SpirvKernel compile(const Function& fn, std::uint32_t block);
+inline constexpr std::uint32_t kEwBlock = 256;
+
+bool ops_supported(const TraceDAG& dag);
+brass::Function* build_elementwise_fn(brass::Module& mod, const TraceDAG& dag,
+                                      const plan::ElementwisePlan& plan, int lanes,
+                                      const char* name, bool optimize = true);
+brass::Function* build_row_norm_fn(brass::Module& mod, const TraceDAG& dag,
+                                   const plan::RowNormPlan& plan, int lanes,
+                                   const char* name, bool optimize = true);
 
 inline int log2_exact(int v) {
     int l = 0;
@@ -132,4 +136,4 @@ inline MagicU32 magic_u32(std::uint32_t d) {
 Value* udiv_const(Ctx& c, Value* x, int d);
 void udiv_urem_const(Ctx& c, Value* x, int d, Value*& q, Value*& r);
 
-}  // namespace brotensor::jit::spirv::detail
+}  // namespace brotensor::jit::gpu_mir

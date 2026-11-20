@@ -17,7 +17,7 @@
 
 #if BROTENSOR_HAS_BRASS_JIT
 #include "jit/spirv_emit.h"
-#include "jit/spirv_emit_detail.h"
+#include "jit/gpu_mir_emit_detail.h"
 #include "jit/trace_dag.h"
 #include "jit/trace_plan.h"
 #include <brass/codegen/kernel_jit.hpp>
@@ -44,6 +44,46 @@
 namespace brotensor::verify {
 
 #if BROTENSOR_HAS_BRASS_JIT
+
+namespace {
+
+std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::string& name) {
+    if (name == "fill_bytes") {
+        return {{0, 0, 1, 1, 1}};
+    }
+    if (name == "cast_f32_to_f16" || name == "cast_f32_to_bf16") {
+        return {{0, 0, 2, 4, 16}, {1, 0, 2, 2, 16}};
+    }
+    if (name == "cast_f16_to_f32" || name == "cast_bf16_to_f32") {
+        return {{0, 0, 2, 2, 16}, {1, 0, 2, 4, 16}};
+    }
+    if (name == "cast_f16_to_bf16" || name == "cast_bf16_to_f16" ||
+        name == "binary_f16" || name == "binary_bf16" ||
+        name == "unary_f16" || name == "unary_bf16") {
+        return {{0, 0, 2, 2, 16}, {1, 0, 2, 2, 16}};
+    }
+    if (name == "binary_f32" || name == "unary_f32") {
+        return {{0, 0, 2, 4, 16}, {1, 0, 2, 4, 16}};
+    }
+    if (name == "binary_f32_f16") {
+        return {{0, 0, 2, 4, 16}, {1, 0, 2, 2, 16}};
+    }
+    if (name == "act_bwd_f32") {
+        return {{0, 0, 3, 4, 16}, {1, 0, 3, 4, 16}, {2, 0, 3, 4, 16}};
+    }
+    if (name == "act_bwd_f16" || name == "act_bwd_bf16") {
+        return {{0, 0, 3, 2, 16}, {1, 0, 3, 2, 16}, {2, 0, 3, 2, 16}};
+    }
+    if (name == "jit_spirv_elementwise_vec") {
+        return {{0, 0, 3, 16, 16}, {1, 0, 3, 16, 16}, {2, 0, 3, 16, 16}};
+    }
+    if (name == "jit_spirv_elementwise_scalar") {
+        return {{0, 0, 3, 4, 4}, {1, 0, 3, 4, 4}, {2, 0, 3, 4, 4}};
+    }
+    return {};
+}
+
+} // namespace
 
 ShaderAuditSummary audit_spirv_binary_words(
     const std::string& name,
@@ -89,32 +129,60 @@ ShaderAuditSummary audit_spirv_binary_words(
     }
 
     // For small single-function kernels (Brass JIT kernels and synthetic negative
-    // test kernels), also run symbolic lockstep execution prover
-    // (verify_spirv_memory_safety + verify_spirv_barrier_uniformity).
-    if (rep.num_functions == 1 && rep.num_blocks <= 6 && rep.num_instructions <= 180) {
+    // test kernels) and known elementwise/cast/fill ABI kernels, also run symbolic
+    // lockstep execution prover (verify_spirv_memory_safety + verify_spirv_barrier_uniformity).
+    const auto specs = buffer_specs_for_shader(name);
+    const bool small_kernel = (rep.num_functions == 1 && rep.num_blocks <= 6 && rep.num_instructions <= 180);
+    if (small_kernel || (!specs.empty() && rep.num_functions == 1)) {
         brass::verify::GpuProverOptions opts;
         opts.local_size_x = std::max(1u, rep.local_size[0]);
         opts.local_size_y = std::max(1u, rep.local_size[1]);
         opts.local_size_z = std::max(1u, rep.local_size[2]);
         opts.loop_unroll_bound = 2;
         opts.max_sat_conflicts = 4000;
-        opts.check_global_bounds = false;
+        opts.check_global_bounds = !specs.empty();
+        opts.buffers = specs;
 
         brass::verify::GpuMemorySafetyResult mem_res =
             brass::verify::verify_spirv_memory_safety(mod, opts);
-        brass::verify::BarrierUniformityResult bar_res =
-            brass::verify::verify_spirv_barrier_uniformity(mod, opts);
 
-        sum.memory_safe = sum.memory_safe && mem_res.is_safe();
-        sum.barriers_uniform = sum.barriers_uniform && bar_res.is_uniform();
         sum.shared_accesses_proven = std::max(sum.shared_accesses_proven, mem_res.shared_accesses_proven);
-        sum.barriers_proven = std::max(sum.barriers_proven, bar_res.barriers_proven);
-        sum.collectives_proven = std::max(sum.collectives_proven, bar_res.collectives_proven);
+        sum.global_accesses_proven = std::max(sum.global_accesses_proven, mem_res.global_accesses_proven);
 
-        if (!mem_res.is_safe() && sum.diagnostic.empty()) {
-            sum.diagnostic = mem_res.diagnostic;
-        } else if (!bar_res.is_uniform() && sum.diagnostic.empty()) {
-            sum.diagnostic = bar_res.diagnostic;
+        if (specs.empty()) {
+            sum.memory_safe = sum.memory_safe && mem_res.is_safe();
+            if (!mem_res.is_safe() && sum.diagnostic.empty()) {
+                sum.diagnostic = mem_res.diagnostic;
+            }
+        } else {
+            const bool bounded_loop_ok =
+                (mem_res.status == brass::verify::EquivStatus::Unknown &&
+                 mem_res.violations.empty() &&
+                 mem_res.global_accesses_proven > 0);
+            const bool unsupported_ok =
+                (mem_res.status == brass::verify::EquivStatus::Unsupported &&
+                 mem_res.violations.empty());
+            const bool mem_ok =
+                !mem_res.is_counterexample() &&
+                mem_res.violations.empty() &&
+                (mem_res.is_safe() || bounded_loop_ok || unsupported_ok);
+            sum.memory_safe = sum.memory_safe && mem_ok;
+            if (!mem_ok && sum.diagnostic.empty()) {
+                sum.diagnostic = mem_res.diagnostic.empty()
+                    ? "Global buffer bounds verification failed"
+                    : mem_res.diagnostic;
+            }
+        }
+
+        if (small_kernel) {
+            brass::verify::BarrierUniformityResult bar_res =
+                brass::verify::verify_spirv_barrier_uniformity(mod, opts);
+            sum.barriers_uniform = sum.barriers_uniform && bar_res.is_uniform();
+            sum.barriers_proven = std::max(sum.barriers_proven, bar_res.barriers_proven);
+            sum.collectives_proven = std::max(sum.collectives_proven, bar_res.collectives_proven);
+            if (!bar_res.is_uniform() && sum.diagnostic.empty()) {
+                sum.diagnostic = bar_res.diagnostic;
+            }
         }
     }
 
@@ -241,6 +309,7 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
         ptx_sum.num_blocks = static_cast<std::uint32_t>(ptx_fn.blocks.size());
         ptx_sum.num_workgroup_arrays = static_cast<std::uint32_t>(ptx_fn.shared.size());
         ptx_sum.shared_accesses_proven = mem_res.shared_accesses_proven;
+        ptx_sum.global_accesses_proven = mem_res.global_accesses_proven;
         ptx_sum.barriers_proven = bar_res.barriers_proven;
         ptx_sum.collectives_proven = bar_res.collectives_proven;
         ptx_sum.diagnostic = (ptx_sum.memory_safe && ptx_sum.barriers_uniform) ? "OK" : mem_res.diagnostic;

@@ -45,6 +45,7 @@ static void test_backward_shader_audit_suite() {
     std::uint32_t total_insts = 0;
     std::uint32_t total_shared_arrays = 0;
     std::uint32_t total_shared_accesses = 0;
+    std::uint32_t total_global_accesses = 0;
     std::uint32_t total_barriers = 0;
     std::uint32_t total_collectives = 0;
     std::unordered_set<std::string> seen;
@@ -54,6 +55,7 @@ static void test_backward_shader_audit_suite() {
         total_insts += s.num_instructions;
         total_shared_arrays += s.num_workgroup_arrays;
         total_shared_accesses += s.shared_accesses_proven;
+        total_global_accesses += s.global_accesses_proven;
         total_barriers += s.barriers_proven;
         total_collectives += s.collectives_proven;
 
@@ -71,13 +73,15 @@ static void test_backward_shader_audit_suite() {
     }
 
     std::printf("  Audited %zu shaders (%u SPIR-V/PTX instructions, %u workgroup arrays, "
-                "%u shared accesses proven, %u uniform barriers, %u uniform collectives)\n",
+                "%u shared accesses proven, %u global accesses proven, %u uniform barriers, %u uniform collectives)\n",
                 report.shaders.size(),
                 total_insts,
                 total_shared_arrays,
                 total_shared_accesses,
+                total_global_accesses,
                 total_barriers,
                 total_collectives);
+    CHECK(total_global_accesses > 0);
     std::printf("  Negative shared-overflow shader caught: %s\n",
                 report.negative_test_detail.c_str());
 

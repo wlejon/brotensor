@@ -328,3 +328,15 @@ extern "C" void brotensor_probe_and_register_metal() {
     ::brotensor::detail::register_backend(Device::Metal, ops,
                                           dm::metal_alloc_table());
 }
+
+#if BROTENSOR_HAS_BRASS_JIT
+namespace brotensor::jit::metal_trace {
+void register_metal_trace_jit();
+}
+namespace {
+struct MetalTraceLinkAnchor {
+    MetalTraceLinkAnchor() { brotensor::jit::metal_trace::register_metal_trace_jit(); }
+};
+MetalTraceLinkAnchor s_metal_trace_anchor;
+}
+#endif

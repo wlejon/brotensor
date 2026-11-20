@@ -22,29 +22,28 @@
 // 32-thread groups, one shared-memory round across that row's groups. Every
 // thread folds the partials itself, so the statistic needs no broadcast.
 
-#include "spirv_emit.h"
-#include "spirv_emit_detail.h"
+#include "gpu_mir_emit_detail.h"
 
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-namespace brotensor::jit::spirv {
-
-using namespace detail;
+namespace brotensor::jit::gpu_mir {
 
 namespace {
 
 class RowNormBuilder {
 public:
-    RowNormBuilder(const TraceDAG& dag, const plan::RowNormPlan& plan, int lanes, const char* name)
-        : dag_(dag), plan_(plan), ew_(plan.ew), lanes_(lanes), name_(name), mod_(std::string("mod_") + name) {
+    RowNormBuilder(brass::Module& mod, const TraceDAG& dag, const plan::RowNormPlan& plan,
+                   int lanes, const char* name, bool optimize)
+        : dag_(dag), plan_(plan), ew_(plan.ew), lanes_(lanes), name_(name),
+          mod_(mod), optimize_(optimize) {
         plan::row_norm_geometry(ew_.cols, ew_.rows, lanes, tpr_, rpb_);
         warps_ = tpr_ / 32;
         step_ = tpr_ * lanes;
     }
 
-    brass::target::SpirvKernel build() {
+    brass::Function* build() {
         const std::size_t n_out = ew_.outputs.size();
         const std::size_t n_in = ew_.inputs.size();
         std::vector<Type> params(n_out + n_in, Type::ptr());
@@ -159,7 +158,8 @@ public:
             }
         });
         b.build_ret_void();
-        return compile(*fn, static_cast<std::uint32_t>(tpr_ * rpb_));
+        if (optimize_) optimize_function(*fn);
+        return fn;
     }
 
 private:
@@ -285,7 +285,8 @@ private:
     const plan::ElementwisePlan& ew_;
     int lanes_;
     const char* name_;
-    brass::Module mod_;
+    brass::Module& mod_;
+    bool optimize_ = true;
     int tpr_ = 32, rpb_ = 1, warps_ = 1, step_ = 32;
     Ctx* c_ = nullptr;
     std::vector<Value*> out_ptr_, in_ptr_;
@@ -300,11 +301,10 @@ private:
 
 }  // namespace
 
-Kernels emit_row_norm(const TraceDAG& dag, const plan::RowNormPlan& plan) {
-    Kernels k;
-    if (plan.ew.vec > 1) k.vec = RowNormBuilder(dag, plan, plan.ew.vec, kEntryRowNorm).build();
-    k.scalar = RowNormBuilder(dag, plan, 1, kEntryRowNormScalar).build();
-    return k;
+brass::Function* build_row_norm_fn(brass::Module& mod, const TraceDAG& dag,
+                                   const plan::RowNormPlan& plan, int lanes,
+                                   const char* name, bool optimize) {
+    return RowNormBuilder(mod, dag, plan, lanes, name, optimize).build();
 }
 
-}  // namespace brotensor::jit::spirv
+}  // namespace brotensor::jit::gpu_mir

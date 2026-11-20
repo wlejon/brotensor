@@ -28,32 +28,18 @@ function(brotensor_add_test name)
 endfunction()
 
 # --- CPU tests (always built) ---
-# The CUDA trace JIT's PTX emitters are plain C++ writing text, so their output
-# is checked here on every build; a CUDA build already links them in.
-brotensor_add_test(brotensor_test_ptx_emit_rownorm test_ptx_emit_rownorm.cpp)
-if(NOT BROTENSOR_WITH_CUDA)
-    target_sources(brotensor_test_ptx_emit_rownorm PRIVATE
-        ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_elementwise.cpp
-        ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_rownorm.cpp)
-endif()
-brotensor_add_test(brotensor_test_trace_jit_opt test_trace_jit_opt.cpp)
-if(NOT BROTENSOR_WITH_CUDA)
-    target_sources(brotensor_test_trace_jit_opt PRIVATE
-        ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_elementwise.cpp
-        ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_rownorm.cpp)
-endif()
 if(BROTENSOR_HAS_BRASS_JIT)
+    brotensor_add_test(brotensor_test_ptx_emit_rownorm test_ptx_emit_rownorm.cpp)
+    target_link_libraries(brotensor_test_ptx_emit_rownorm PRIVATE ${BROTENSOR_BRASS_LIB})
+    brotensor_add_test(brotensor_test_trace_jit_opt test_trace_jit_opt.cpp)
     target_link_libraries(brotensor_test_trace_jit_opt PRIVATE ${BROTENSOR_BRASS_LIB})
+    brotensor_add_test(brotensor_test_gpu_mir_emit test_gpu_mir_emit.cpp)
+    target_link_libraries(brotensor_test_gpu_mir_emit PRIVATE ${BROTENSOR_BRASS_LIB})
     brotensor_add_test(brotensor_test_jit_trace test_jit_trace.cpp)
     brotensor_add_test(brotensor_test_cpu_jit test_cpu_jit.cpp)
     brotensor_add_test(brotensor_test_cpu_jit_quant test_cpu_jit_quant.cpp)
     brotensor_add_test(brotensor_test_kernel_disk_cache test_kernel_disk_cache.cpp)
     target_link_libraries(brotensor_test_kernel_disk_cache PRIVATE ${BROTENSOR_BRASS_LIB})
-    if(NOT BROTENSOR_WITH_CUDA)
-        target_sources(brotensor_test_kernel_disk_cache PRIVATE
-            ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_elementwise.cpp
-            ${PROJECT_SOURCE_DIR}/src/jit/ptx_emit_rownorm.cpp)
-    endif()
 
     brotensor_add_test(brotensor_test_backward_index_proofs test_backward_index_proofs.cpp)
     target_link_libraries(brotensor_test_backward_index_proofs PRIVATE ${BROTENSOR_BRASS_LIB})

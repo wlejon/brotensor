@@ -16,13 +16,12 @@
 //      and power-of-two broadcast shapes across available backends.
 
 #include "../src/jit/ptx_emit.h"
-#include "../src/jit/ptx_emit_detail.h"
 #include "../src/jit/trace_dag.h"
 #include "../src/jit/trace_plan.h"
 
 #if BROTENSOR_HAS_BRASS_JIT
+#include "../src/jit/gpu_mir_emit_detail.h"
 #include "../src/jit/spirv_emit.h"
-#include "../src/jit/spirv_emit_detail.h"
 #include <brass/verify/smt_equiv.hpp>
 #endif
 
@@ -81,8 +80,9 @@ void test_magic_u32_exactness() {
     std::printf("\n--- Test 1: 32-bit Unsigned Magic-Multiplier Exactness ---\n");
     const std::uint32_t divisors[] = {3, 5, 7, 13, 64, 127, 128, 255, 256, 300, 384, 512, 768, 1000, 1536, 1920, 4095};
     bool all_ok = true;
+#if BROTENSOR_HAS_BRASS_JIT
     for (std::uint32_t d : divisors) {
-        const auto m = ptx::detail::magic_u32(d);
+        const auto m = gpu_mir::magic_u32(d);
         auto eval_div = [&](std::uint32_t v) -> std::uint32_t {
             if ((d & (d - 1u)) == 0u) {
                 unsigned sh = 0;
@@ -120,6 +120,7 @@ void test_magic_u32_exactness() {
         }
     }
     check(all_ok, "magic_u32 matches exact v / d and v % d across all test divisors and boundary inputs");
+#endif
 }
 
 // ── Test 2: PTX Broadcast Index Decomposition & Chain Optimizations ─────────
@@ -208,8 +209,8 @@ void test_spirv_and_smt_equivalence() {
                                                         brass::Span<const brass::Type>(params));
         {
             brass::codegen::KernelBuilder kb(mod_hw, fn_hw);
-            spirv::detail::Ctx c(kb);
-            const auto p = spirv::detail::entry_params(c, fn_hw);
+            gpu_mir::Ctx c(kb);
+            const auto p = gpu_mir::entry_params(c, fn_hw);
             brass::Value* v = p[0];
             brass::Value* d = c.i32(256);
             brass::Value* q = c.b.build_udiv(v, d);
@@ -222,12 +223,12 @@ void test_spirv_and_smt_equivalence() {
                                                             brass::Span<const brass::Type>(params));
         {
             brass::codegen::KernelBuilder kb(mod_fast, fn_fast);
-            spirv::detail::Ctx c(kb);
-            const auto p = spirv::detail::entry_params(c, fn_fast);
+            gpu_mir::Ctx c(kb);
+            const auto p = gpu_mir::entry_params(c, fn_fast);
             brass::Value* v = p[0];
             brass::Value* q = nullptr;
             brass::Value* r = nullptr;
-            spirv::detail::udiv_urem_const(c, v, 256, q, r);
+            gpu_mir::udiv_urem_const(c, v, 256, q, r);
             c.b.build_ret(c.b.build_add(c.b.build_mul(q, c.i32(1000)), r));
         }
 
@@ -267,12 +268,12 @@ void test_spirv_and_smt_equivalence() {
             brass::Function* fn = mod.create_function(
                 "trace_scalar_chain", brass::Type::f32(), brass::Span<const brass::Type>(params));
             brass::codegen::KernelBuilder kb(mod, fn);
-            spirv::detail::Ctx ctx(kb);
-            const auto p = spirv::detail::entry_params(ctx, fn);
+            gpu_mir::Ctx ctx(kb);
+            const auto p = gpu_mir::entry_params(ctx, fn);
             brass::Value* idx = p[0];
             brass::Value* row = nullptr;
             brass::Value* col = nullptr;
-            spirv::detail::udiv_urem_const(ctx, idx, 300, row, col);
+            gpu_mir::udiv_urem_const(ctx, idx, 300, row, col);
             // Duplicate integer index computation + redundant integer algebraic identity
             // (`col + (idx_check - dup_idx)`) that `optimize_function` folds and CSEs.
             brass::Value* idx_check = ctx.b.build_sub(
@@ -280,17 +281,17 @@ void test_spirv_and_smt_equivalence() {
             brass::Value* dup_idx = ctx.b.build_sub(
                 idx, ctx.b.build_add(ctx.b.build_mul(row, ctx.i32(300)), col));
             brass::Value* adj_idx = ctx.b.build_add(col, ctx.b.build_sub(idx_check, dup_idx));
-            brass::Value* z_f = spirv::detail::bits_to_f32(ctx, adj_idx);
+            brass::Value* z_f = gpu_mir::bits_to_f32(ctx, adj_idx);
 
             // Also include a duplicate FP subexpression that dominator_cse / GVN eliminates
             brass::Value* fp_dup1 = ctx.b.build_mul(p[1], z_f);
             brass::Value* fp_dup2 = ctx.b.build_mul(p[1], z_f);
 
-            spirv::detail::ValueMap vals;
+            gpu_mir::ValueMap vals;
             vals[x] = {ctx.b.build_add(fp_dup1, fp_dup2)};
             vals[r] = {p[2]};
             vals[c] = {p[3]};
-            vals = spirv::detail::eval_chain(ctx, dag, 1, std::move(vals));
+            vals = gpu_mir::eval_chain(ctx, dag, 1, std::move(vals));
             ctx.b.build_ret(vals.at(out)[0]);
             return fn;
         };
@@ -302,7 +303,7 @@ void test_spirv_and_smt_equivalence() {
         brass::Function* fn_opt = build_trace_fn(mod_opt);
 
         const std::size_t insts_before = fn_unopt->entry_block()->instruction_count();
-        spirv::detail::optimize_function(*fn_opt);
+        gpu_mir::optimize_function(*fn_opt);
         const std::size_t insts_after = fn_opt->entry_block()->instruction_count();
 
         std::printf("    MIR instructions before optimize_function: %zu, after: %zu\n",

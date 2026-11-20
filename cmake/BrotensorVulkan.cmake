@@ -345,9 +345,6 @@ function(brotensor_vulkan_add_backend)
         set(_jit "${_BROTENSOR_VULKAN_ROOT}/src/jit")
         target_sources(brotensor_vulkan PRIVATE
             ${_src}/vulkan_jit.cpp
-            ${_jit}/spirv_emit_common.cpp
-            ${_jit}/spirv_emit_elementwise.cpp
-            ${_jit}/spirv_emit_rownorm.cpp
             ${_jit}/trace_compiler_vulkan.cpp)
         target_link_libraries(brotensor_vulkan PRIVATE "$<BUILD_INTERFACE:brass>")
         target_compile_definitions(brotensor_vulkan PUBLIC BROTENSOR_HAS_VULKAN_TRACE_JIT=1)

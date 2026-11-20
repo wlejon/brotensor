@@ -2,22 +2,17 @@
 // over `n` slots of `lanes` elements; every operand addressed by its
 // broadcast kind, every buffer at its own dtype.
 
-#include "spirv_emit.h"
-#include "spirv_emit_detail.h"
+#include "gpu_mir_emit_detail.h"
 
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-namespace brotensor::jit::spirv {
+namespace brotensor::jit::gpu_mir {
 
-using namespace detail;
-
-namespace {
-
-brass::target::SpirvKernel build_entry(const TraceDAG& dag, const plan::ElementwisePlan& plan,
-                                       int lanes, const char* name) {
-    brass::Module mod(std::string("mod_") + name);
+brass::Function* build_elementwise_fn(brass::Module& mod, const TraceDAG& dag,
+                                      const plan::ElementwisePlan& plan, int lanes,
+                                      const char* name, bool optimize) {
     const std::size_t n_out = plan.outputs.size();
     const std::size_t n_in = plan.inputs.size();
     std::vector<Type> params(n_out + n_in, Type::ptr());
@@ -94,10 +89,9 @@ brass::target::SpirvKernel build_entry(const TraceDAG& dag, const plan::Elementw
         }
     });
     b.build_ret_void();
-    return compile(*fn, kEwBlock);
+    if (optimize) optimize_function(*fn);
+    return fn;
 }
-
-}  // namespace
 
 bool ops_supported(const TraceDAG& dag) {
     for (const auto& n : dag.nodes()) {
@@ -110,11 +104,4 @@ bool ops_supported(const TraceDAG& dag) {
     return true;
 }
 
-Kernels emit_elementwise(const TraceDAG& dag, const plan::ElementwisePlan& plan) {
-    Kernels k;
-    if (plan.vec > 1) k.vec = build_entry(dag, plan, plan.vec, kEntryVec);
-    k.scalar = build_entry(dag, plan, 1, kEntryScalar);
-    return k;
-}
-
-}  // namespace brotensor::jit::spirv
+}  // namespace brotensor::jit::gpu_mir

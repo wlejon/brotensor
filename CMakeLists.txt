@@ -294,12 +294,15 @@ elseif(TARGET brass)
         src/backward_index_verify.cpp
         src/backward_shader_audit.cpp
         src/backward_nan_verify.cpp
+        src/jit/gpu_mir_emit_common.cpp
+        src/jit/gpu_mir_emit_elementwise.cpp
+        src/jit/gpu_mir_emit_rownorm.cpp
+        src/jit/ptx_emit.cpp
+        src/jit/msl_emit.cpp
     )
-    if(BRASS_WITH_SPIRV AND NOT BROTENSOR_WITH_VULKAN)
+    if(BRASS_WITH_SPIRV)
         target_sources(brotensor_cpu PRIVATE
-            src/jit/spirv_emit_common.cpp
-            src/jit/spirv_emit_elementwise.cpp
-            src/jit/spirv_emit_rownorm.cpp
+            src/jit/spirv_emit.cpp
         )
     endif()
 else()
@@ -420,8 +423,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/cuda_jit_gemv.cpp
         src/cuda/cuda_graph_jit.cpp
         src/cuda/cuda_jit_quant.cpp
-        src/jit/ptx_emit_elementwise.cpp
-        src/jit/ptx_emit_rownorm.cpp
         src/jit/trace_compiler_cuda.cpp
     )
     # Static CUDA runtime: keeps the shipped binary self-contained. The tower
@@ -656,6 +657,18 @@ if(BROTENSOR_WITH_METAL)
     )
     target_compile_definitions(brotensor_metal PUBLIC
         BROTENSOR_HAS_METAL=1 BROTENSOR_HAS_GPU=1)
+    if(BROTENSOR_HAS_BRASS_JIT)
+        target_sources(brotensor_metal PRIVATE
+            src/jit/trace_compiler_metal.mm
+        )
+        set_source_files_properties(src/jit/trace_compiler_metal.mm PROPERTIES
+            COMPILE_FLAGS "-fobjc-arc"
+            LANGUAGE OBJCXX
+        )
+        target_link_libraries(brotensor_metal PUBLIC "${BROTENSOR_BRASS_LIB}")
+        target_compile_definitions(brotensor_metal PUBLIC
+            BROTENSOR_HAS_BRASS_JIT=1 BROTENSOR_HAS_METAL_TRACE_JIT=1)
+    endif()
     # brotensor_core's init.cpp must know whether to probe + register Metal.
     target_compile_definitions(brotensor_core PRIVATE
         BROTENSOR_HAS_METAL=1 BROTENSOR_HAS_GPU=1)

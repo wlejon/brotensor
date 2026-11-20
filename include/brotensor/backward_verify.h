@@ -65,6 +65,7 @@ struct ShaderAuditSummary {
     std::uint32_t num_instructions = 0;
     std::uint32_t num_workgroup_arrays = 0;
     std::uint32_t shared_accesses_proven = 0;
+    std::uint32_t global_accesses_proven = 0;
     std::uint32_t barriers_proven = 0;
     std::uint32_t collectives_proven = 0;
     std::string diagnostic;

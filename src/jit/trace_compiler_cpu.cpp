@@ -77,6 +77,16 @@ void register_vulkan_trace_compiler(VulkanTraceCompilerFn fn) {
     s_vulkan_trace_compiler_fn = fn;
 }
 
+static MetalTraceCompilerFn s_metal_trace_compiler_fn = nullptr;
+
+MetalTraceCompilerFn get_metal_trace_compiler_hook() {
+    return s_metal_trace_compiler_fn;
+}
+
+void register_metal_trace_compiler(MetalTraceCompilerFn fn) {
+    s_metal_trace_compiler_fn = fn;
+}
+
 TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& raw_dag) {
     bool has_ext_ops = false;
     for (const auto& n : raw_dag.nodes()) {
@@ -125,9 +135,11 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& raw_dag) {
     // instead. Everything else is the CPU compiler's.
     bool is_cuda = false;
     bool is_vulkan = false;
+    bool is_metal = false;
     for (const auto& n : dag.nodes()) {
         if (n.device.is_cuda()) is_cuda = true;
         if (n.device.is_vulkan()) is_vulkan = true;
+        if (n.device.is_metal()) is_metal = true;
     }
 
     const auto compile_t0 = std::chrono::steady_clock::now();
@@ -141,6 +153,9 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& raw_dag) {
     } else if (is_vulkan) {
         if (auto vk_fn = get_vulkan_trace_compiler_hook()) handle = vk_fn(dag, pattern);
         if (!handle) handle = eager::compile_eager(dag);
+    } else if (is_metal) {
+        if (auto mtl_fn = get_metal_trace_compiler_hook()) handle = mtl_fn(dag, pattern);
+        if (!handle) handle = eager::compile_eager(dag);
     } else {
         handle = cpu::compile_cpu(dag, pattern);
     }
@@ -149,11 +164,11 @@ TraceHandle TraceCompiler::compile_and_cache(const TraceDAG& raw_dag) {
     handle->is_cuda = is_cuda;
     handle->node_count = dag.node_count();
     handle->is_cache_hit = false;
-    // The CUDA and Vulkan compilers name their own fusion and time their own
-    // builds, the eager replay counts its own launches; the CPU path is always
-    // one fused call through brass's host codegen.
+    // The CUDA, Vulkan, and Metal compilers name their own fusion and time their
+    // own builds, the eager replay counts its own launches; the CPU path is
+    // always one fused call through brass's host codegen.
     if (handle->launch_count == 0) handle->launch_count = 1;
-    if (!is_cuda && !is_vulkan) {
+    if (!is_cuda && !is_vulkan && !is_metal) {
         if (handle->fusion_name == nullptr || handle->fusion_name[0] == '\0') {
             handle->fusion_name = "cpu-avx2-fused";
         }
@@ -219,7 +234,7 @@ static void require_cpu_fusable(const TraceDAG& dag) {
 // MTLResourceStorageModeShared, whose contents pointer is a host address.
 static void require_host_addressable(const TraceDAG& dag) {
     for (const TraceNode& n : dag.nodes()) {
-        if (n.device.is_cuda() || n.device.is_vulkan()) {
+        if (n.device.is_cuda() || n.device.is_vulkan() || n.device.is_metal()) {
             throw std::runtime_error(
                 "brotensor::jit: the CPU trace compiler was handed a " +
                 to_string(n.device) + " tensor; it only runs host-addressable memory");

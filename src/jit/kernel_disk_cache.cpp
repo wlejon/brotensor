@@ -10,6 +10,7 @@
 #include <brass/cache/native_module_cache.hpp>
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/function.hpp>
+#include <brass/target/msl_target.hpp>
 #include <brass/target/spirv_target.hpp>
 #endif
 
@@ -286,6 +287,103 @@ bool KernelDiskCache::load_spirv_kernel(std::string_view signature, brass::targe
         brass::target::SpirvKernel k;
         if (brass::target::deserialize_spirv_kernel(art->bytes("spirv_kernel"), k) &&
             k.words.size() >= 5 && k.words[0] == 0x07230203u) {
+            out = std::move(k);
+            std::lock_guard<std::mutex> lk(mutex_);
+            ++stats_.hits;
+            return true;
+        }
+        damaged = true;
+    }
+    std::lock_guard<std::mutex> lk(mutex_);
+    ++stats_.misses;
+    if (damaged) ++stats_.corruptions;
+    return false;
+}
+
+namespace {
+
+void append_u32(std::vector<uint8_t>& buf, uint32_t v) {
+    for (int i = 0; i < 4; ++i) buf.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFFu));
+}
+
+void append_str(std::vector<uint8_t>& buf, const std::string& s) {
+    append_u32(buf, static_cast<uint32_t>(s.size()));
+    buf.insert(buf.end(), reinterpret_cast<const uint8_t*>(s.data()),
+               reinterpret_cast<const uint8_t*>(s.data()) + s.size());
+}
+
+bool read_u32(std::span<const uint8_t> bytes, size_t& pos, uint32_t& out) {
+    if (pos + 4 > bytes.size()) return false;
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) v |= static_cast<uint32_t>(bytes[pos + static_cast<size_t>(i)]) << (i * 8);
+    pos += 4;
+    out = v;
+    return true;
+}
+
+bool read_str(std::span<const uint8_t> bytes, size_t& pos, std::string& out) {
+    uint32_t n = 0;
+    if (!read_u32(bytes, pos, n) || pos + n > bytes.size()) return false;
+    out.assign(reinterpret_cast<const char*>(bytes.data() + pos), n);
+    pos += n;
+    return true;
+}
+
+constexpr uint32_t kMslBlobMagic = 0x314C534Du; // "MSL1"
+
+} // namespace
+
+bool KernelDiskCache::store_msl_kernel(std::string_view signature, const brass::target::MslKernel& k) {
+    if (k.source.empty()) return false;
+    auto st = stores();
+    if (!st) return false;
+    std::vector<uint8_t> encoded;
+    encoded.reserve(64 + k.entry_name.size() + k.source.size() + k.scalar_param_offsets.size() * 4);
+    append_u32(encoded, kMslBlobMagic);
+    append_str(encoded, k.entry_name);
+    append_str(encoded, k.source);
+    append_u32(encoded, k.num_buffers);
+    append_u32(encoded, k.scalar_params_bytes);
+    append_u32(encoded, k.workgroup_x);
+    append_u32(encoded, k.workgroup_y);
+    append_u32(encoded, k.workgroup_z);
+    append_u32(encoded, k.uses_shared_memory ? 1u : 0u);
+    append_u32(encoded, k.shared_memory_bytes);
+    append_u32(encoded, static_cast<uint32_t>(k.scalar_param_offsets.size()));
+    for (uint32_t off : k.scalar_param_offsets) append_u32(encoded, off);
+
+    const bool ok = st->store.put(blob_key("msl", signature),
+                                  {brass::cache::BlobRef("msl_kernel", encoded)});
+    if (!ok) return false;
+    std::lock_guard<std::mutex> lk(mutex_);
+    ++stats_.writes;
+    return true;
+}
+
+bool KernelDiskCache::load_msl_kernel(std::string_view signature, brass::target::MslKernel& out) {
+    brass::cache::Miss why = brass::cache::Miss::None;
+    std::optional<brass::cache::Artifact> art;
+    if (auto st = stores()) art = st->store.get(blob_key("msl", signature), &why);
+    bool damaged = is_damage(why);
+    if (art) {
+        auto raw = art->bytes("msl_kernel");
+        size_t pos = 0;
+        uint32_t magic = 0, used_smem = 0, noff = 0;
+        brass::target::MslKernel k;
+        if (read_u32(raw, pos, magic) && magic == kMslBlobMagic &&
+            read_str(raw, pos, k.entry_name) &&
+            read_str(raw, pos, k.source) && !k.source.empty() &&
+            read_u32(raw, pos, k.num_buffers) &&
+            read_u32(raw, pos, k.scalar_params_bytes) &&
+            read_u32(raw, pos, k.workgroup_x) &&
+            read_u32(raw, pos, k.workgroup_y) &&
+            read_u32(raw, pos, k.workgroup_z) &&
+            read_u32(raw, pos, used_smem) &&
+            read_u32(raw, pos, k.shared_memory_bytes) &&
+            read_u32(raw, pos, noff) && pos + static_cast<size_t>(noff) * 4 == raw.size()) {
+            k.uses_shared_memory = (used_smem != 0);
+            k.scalar_param_offsets.resize(noff);
+            for (uint32_t i = 0; i < noff; ++i) read_u32(raw, pos, k.scalar_param_offsets[i]);
             out = std::move(k);
             std::lock_guard<std::mutex> lk(mutex_);
             ++stats_.hits;

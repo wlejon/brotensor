@@ -27,6 +27,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace brotensor;
@@ -130,7 +131,7 @@ void check_layernorm_entry(const std::vector<std::string>& e, const std::string&
     // a loop (a label after the mean, a branch back to it before rsqrt).
     const std::regex dev_sub("^\\s*sub\\.f32 (%f\\d+), (%f\\d+), " + mean_reg + ";");
     int devs = 0;
-    bool acc_feeds_var = true;
+    std::unordered_set<std::string> tainted;
     for (int i = mean_line + 1; i < var_line; ++i) {
         if (!std::regex_search(e[static_cast<std::size_t>(i)], m, dev_sub)) continue;
         const std::string d = m[1];
@@ -138,15 +139,43 @@ void check_layernorm_entry(const std::vector<std::string>& e, const std::string&
         std::smatch f;
         const bool ok = i + 1 < var_line && std::regex_search(e[static_cast<std::size_t>(i + 1)], f, sq) &&
                         f[1] == f[2];
-        if (!ok) {
-            acc_feeds_var = false;
+        if (!ok) continue;
+        ++devs;
+        tainted.insert(f[1].str());
+    }
+    // Propagate dataflow from accumulator registers through warp shuffle /
+    // shared memory / scalar reduction up to the variance 1/D scale (`var_src`).
+    bool shared_tainted = false;
+    const std::regex reg_re("%[fr]\\d+");
+    const std::regex st_shared_re("^\\s*(?:@!?%p\\d+\\s+)?st\\.shared\\.[^,]+,\\s*(%[fr]\\d+)");
+    const std::regex ld_shared_re("^\\s*(?:@!?%p\\d+\\s+)?ld\\.shared\\.\\S+\\s+(%[fr]\\d+)");
+    for (int i = mean_line + 1; i < var_line; ++i) {
+        const std::string& line = e[static_cast<std::size_t>(i)];
+        std::smatch sm;
+        if (std::regex_search(line, sm, st_shared_re)) {
+            if (tainted.count(sm[1].str())) shared_tainted = true;
             continue;
         }
-        ++devs;
-        // The accumulator is what the reduction folds and 1/D scales; the
-        // reduction reuses the register, so the variance reads it directly.
-        if (f[1] != var_src) acc_feeds_var = false;
+        if (std::regex_search(line, sm, ld_shared_re)) {
+            if (shared_tainted) tainted.insert(sm[1].str());
+            continue;
+        }
+        const std::size_t comma = line.find(',');
+        if (comma == std::string::npos) continue;
+        const std::string lhs = line.substr(0, comma);
+        const std::string rhs = line.substr(comma + 1);
+        std::smatch dst_m;
+        if (!std::regex_search(lhs, dst_m, reg_re)) continue;
+        bool rhs_tainted = false;
+        for (std::sregex_iterator it(rhs.begin(), rhs.end(), reg_re), end; it != end; ++it) {
+            if (tainted.count(it->str())) {
+                rhs_tainted = true;
+                break;
+            }
+        }
+        if (rhs_tainted) tainted.insert(dst_m.str());
     }
+    const bool acc_feeds_var = (tainted.count(var_src) > 0);
     check(devs >= 1 && acc_feeds_var,
           label + ": a pass accumulates (x - mean)^2 into the register the variance scales (" +
               std::to_string(devs) + " lanes)");

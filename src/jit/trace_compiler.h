@@ -45,4 +45,12 @@ using VulkanTraceCompilerFn = std::shared_ptr<TraceHandleImpl> (*)(const TraceDA
 VulkanTraceCompilerFn get_vulkan_trace_compiler_hook();
 void register_vulkan_trace_compiler(VulkanTraceCompilerFn fn);
 
+// The Metal compiler (trace_compiler_metal.mm, brass's MSL target), registered
+// by the Metal backend when it is built with brass. Returns nullptr when it
+// has no fusion for a DAG, falling back to eager replay.
+using MetalTraceCompilerFn = std::shared_ptr<TraceHandleImpl> (*)(const TraceDAG& dag, FusionPattern pattern);
+
+MetalTraceCompilerFn get_metal_trace_compiler_hook();
+void register_metal_trace_compiler(MetalTraceCompilerFn fn);
+
 } // namespace brotensor::jit

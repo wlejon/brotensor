@@ -16,7 +16,7 @@
 
 #if BROTENSOR_HAS_BRASS_JIT
 #include "spirv_emit.h"
-#include "spirv_emit_detail.h"
+#include "gpu_mir_emit_detail.h"
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/builder.hpp>
 #include <brass/mir/function.hpp>
@@ -694,15 +694,15 @@ brass::Function* build_scalar_backward_mir_fn(brass::Module& mod, const char* na
     std::vector<brass::Type> params(input_ids.size(), brass::Type::f32());
     auto* fn = mod.create_function(name, brass::Type::f32(), brass::Span<const brass::Type>(params));
     brass::codegen::KernelBuilder kb(mod, fn);
-    spirv::detail::Ctx c(kb);
-    std::vector<brass::Value*> param_vals = spirv::detail::entry_params(c, fn);
+    gpu_mir::Ctx c(kb);
+    std::vector<brass::Value*> param_vals = gpu_mir::entry_params(c, fn);
     std::unordered_map<int, brass::Value*> vals;
     for (size_t i = 0; i < input_ids.size(); ++i) vals[input_ids[i]] = param_vals[i];
     for (const auto& n : lowered_dag.nodes()) {
         if (n.op == TraceOpKind::Input) continue;
         std::vector<brass::Value*> ins;
         for (int in_id : n.inputs) ins.push_back(vals.at(in_id));
-        vals[n.id] = spirv::detail::lane_op(c, n, ins);
+        vals[n.id] = gpu_mir::lane_op(c, n, ins);
     }
     brass::Value* ret_val = output_ids.empty() ? kb.const_f32(0.0f) : vals.at(output_ids.front());
     for (size_t i = 1; i < output_ids.size(); ++i) ret_val = c.b.build_add(ret_val, vals.at(output_ids[i]));
@@ -719,8 +719,8 @@ brass::Function* build_gpu_equiv_kernel_fn(brass::Module& mod, const TraceDAG& l
     std::vector<brass::Type> params(input_ids.size() + output_ids.size(), brass::Type::ptr());
     auto* fn = mod.create_function("bwd_trace_gpu_equiv", brass::Type::void_type(), brass::Span<const brass::Type>(params));
     brass::codegen::KernelBuilder kb(mod, fn);
-    spirv::detail::Ctx c(kb);
-    std::vector<brass::Value*> buf_params = spirv::detail::entry_params(c, fn);
+    gpu_mir::Ctx c(kb);
+    std::vector<brass::Value*> buf_params = gpu_mir::entry_params(c, fn);
     brass::Value* tid = kb.global_tid_x();
     std::unordered_map<int, brass::Value*> vals;
     for (size_t i = 0; i < input_ids.size(); ++i) vals[input_ids[i]] = kb.load_f32_indexed(buf_params[i], tid);
@@ -728,7 +728,7 @@ brass::Function* build_gpu_equiv_kernel_fn(brass::Module& mod, const TraceDAG& l
         if (n.op == TraceOpKind::Input) continue;
         std::vector<brass::Value*> ins;
         for (int in_id : n.inputs) ins.push_back(vals.at(in_id));
-        vals[n.id] = spirv::detail::lane_op(c, n, ins);
+        vals[n.id] = gpu_mir::lane_op(c, n, ins);
     }
     for (size_t j = 0; j < output_ids.size(); ++j) {
         kb.store_f32_indexed(buf_params[input_ids.size() + j], tid, vals.at(output_ids[j]));
@@ -753,7 +753,7 @@ BackwardTraceVerificationReport verify_backward_trace_dag(const TraceDAG& bwd_da
         brass::Function* fn_unopt = build_scalar_backward_mir_fn(mod, "bwd_unopt", lowered);
         brass::Function* fn_opt = build_scalar_backward_mir_fn(mod, "bwd_opt", lowered);
         rep.unoptimizedMirInsts = count_mir_insts(*fn_unopt);
-        spirv::detail::optimize_function(*fn_opt);
+        gpu_mir::optimize_function(*fn_opt);
         rep.optimizedMirInsts = count_mir_insts(*fn_opt);
 
         brass::verify::EquivResult mir_res = brass::verify::verify_mir_equivalence(*fn_unopt, *fn_opt);
@@ -768,7 +768,7 @@ BackwardTraceVerificationReport verify_backward_trace_dag(const TraceDAG& bwd_da
     {
         brass::Module gpu_mod("bwd_gpu_equiv_mod");
         brass::Function* gpu_fn = build_gpu_equiv_kernel_fn(gpu_mod, lowered);
-        spirv::detail::optimize_function(*gpu_fn);
+        gpu_mir::optimize_function(*gpu_fn);
 
         ptx_src = brass::target::PtxTarget::emit_function(*gpu_fn);
         rep.ptxByteCount = ptx_src.size();
@@ -863,7 +863,7 @@ VerifiedBackwardTrace build_verified_backward_trace(const TraceDAG& forward_dag)
     {
         brass::Module gpu_mod("bwd_ptx_emit_mod");
         brass::Function* gpu_fn = build_gpu_equiv_kernel_fn(gpu_mod, res.impl->lowered_backward_dag);
-        spirv::detail::optimize_function(*gpu_fn);
+        gpu_mir::optimize_function(*gpu_fn);
         res.ptx_source = brass::target::PtxTarget::emit_function(*gpu_fn);
     }
     plan::ElementwisePlan ew;
