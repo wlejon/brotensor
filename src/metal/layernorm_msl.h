@@ -305,22 +305,18 @@ using namespace metal;
 
 constant uint LN_BLOCK = 256;
 
-kernel void k_ln_forward_inference_batched_fp16(
-        device const half* x      [[buffer(0)]],
-        device const half* gamma  [[buffer(1)]],
-        device const half* beta   [[buffer(2)]],
-        device half*       y      [[buffer(3)]],
-        constant uint& R          [[buffer(4)]],
-        constant uint& D          [[buffer(5)]],
-        constant float& eps       [[buffer(6)]],
-        constant uint& has_beta   [[buffer(7)]],
-        uint row [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]],
-        uint tg_size [[threads_per_threadgroup]]) {
-    threadgroup float sdata[LN_BLOCK];
+template <typename T>
+inline void ln_forward_inference_row_t(
+        device const T* x,
+        device const T* gamma,
+        device const T* beta,
+        device T*       y,
+        uint R, uint D, float eps, uint has_beta,
+        uint row, uint tid, uint tg_size,
+        threadgroup float* sdata) {
     if (row >= R) return;
-    device const half* xrow = x + (ulong)row * D;
-    device       half* yrow = y + (ulong)row * D;
+    device const T* xrow = x + (ulong)row * D;
+    device       T* yrow = y + (ulong)row * D;
     float local = 0.0f;
     for (uint i = tid; i < D; i += tg_size) local += float(xrow[i]);
     sdata[tid] = local;
@@ -349,8 +345,40 @@ kernel void k_ln_forward_inference_batched_fp16(
         float xh = (float(xrow[i]) - mean) * rstd;
         float g  = float(gamma[i]);
         float b  = (has_beta != 0u) ? float(beta[i]) : 0.0f;
-        yrow[i] = half(xh * g + b);
+        yrow[i] = T(xh * g + b);
     }
+}
+
+kernel void k_ln_forward_inference_batched_fp16(
+        device const half* x      [[buffer(0)]],
+        device const half* gamma  [[buffer(1)]],
+        device const half* beta   [[buffer(2)]],
+        device half*       y      [[buffer(3)]],
+        constant uint& R          [[buffer(4)]],
+        constant uint& D          [[buffer(5)]],
+        constant float& eps       [[buffer(6)]],
+        constant uint& has_beta   [[buffer(7)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tg_size [[threads_per_threadgroup]]) {
+    threadgroup float sdata[LN_BLOCK];
+    ln_forward_inference_row_t<half>(x, gamma, beta, y, R, D, eps, has_beta, row, tid, tg_size, sdata);
+}
+
+kernel void k_ln_forward_inference_batched_bf16(
+        device const bfloat* x    [[buffer(0)]],
+        device const bfloat* gamma [[buffer(1)]],
+        device const bfloat* beta [[buffer(2)]],
+        device bfloat*       y    [[buffer(3)]],
+        constant uint& R          [[buffer(4)]],
+        constant uint& D          [[buffer(5)]],
+        constant float& eps       [[buffer(6)]],
+        constant uint& has_beta   [[buffer(7)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tg_size [[threads_per_threadgroup]]) {
+    threadgroup float sdata[LN_BLOCK];
+    ln_forward_inference_row_t<bfloat>(x, gamma, beta, y, R, D, eps, has_beta, row, tid, tg_size, sdata);
 }
 )msl";
 

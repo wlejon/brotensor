@@ -118,10 +118,46 @@ void run_layernorm_bf16_bwd(int n, uint64_t seed) {
     compare_tensors(cpu_dBeta,  dBeta_h,  "layernorm_bf16_bwd.dBeta",  6e-2f, 6e-2f);
 }
 
+void run_layernorm_inf_batched_bf16(int R, int D, bool with_beta, uint64_t seed) {
+    SplitMix64 rng(seed);
+    Tensor x_f32 = Tensor::mat(R, D);
+    Tensor gamma_f32 = Tensor::vec(D), beta_f32 = Tensor::vec(D);
+    fill_random(x_f32, rng);
+    for (int i = 0; i < D; ++i) {
+        gamma_f32[i] = 0.5f + 0.5f * rng.next_f01();
+        beta_f32[i]  = rng.next_unit() * 0.25f;
+    }
+
+    Tensor cpu_y = Tensor::mat(R, D);
+    if (with_beta) {
+        brotensor::layernorm_forward_inference_batched(x_f32, gamma_f32, beta_f32, cpu_y, 1e-5f);
+    } else {
+        brotensor::layernorm_forward_inference_batched(x_f32, gamma_f32, cpu_y, 1e-5f);
+    }
+
+    Tensor gx     = to_bf16_gpu(x_f32);
+    Tensor ggamma = to_bf16_gpu(gamma_f32);
+    Tensor gbeta  = to_bf16_gpu(beta_f32);
+    Tensor gy     = Tensor::zeros_on(gpu_device(), R, D, brotensor::Dtype::BF16);
+    if (with_beta) {
+        brotensor::layernorm_forward_inference_batched(gx, ggamma, gbeta, gy, 1e-5f);
+    } else {
+        brotensor::layernorm_forward_inference_batched(gx, ggamma, gy, 1e-5f);
+    }
+    brotensor::sync_all();
+
+    Tensor y_h = bf16_host_to_f32(download_to_host(gy));
+    compare_tensors(cpu_y, y_h,
+                    with_beta ? "layernorm_inf_bf16.y" : "layernorm_inf_bf16_nobeta.y",
+                    3e-2f, 3e-2f);
+}
+
 } // namespace
 
 BT_PARITY_TEST(layernorm_bf16_bwd_n16)  { run_layernorm_bf16_bwd(16,  0x280ull); }
 BT_PARITY_TEST(layernorm_bf16_bwd_n64)  { run_layernorm_bf16_bwd(64,  0x281ull); }
 BT_PARITY_TEST(layernorm_bf16_bwd_n256) { run_layernorm_bf16_bwd(256, 0x282ull); }
+BT_PARITY_TEST(layernorm_inf_bf16_with_beta) { run_layernorm_inf_batched_bf16(8, 128, true,  0x290ull); }
+BT_PARITY_TEST(layernorm_inf_bf16_no_beta)   { run_layernorm_inf_batched_bf16(4, 256, false, 0x291ull); }
 
 int main() { return run_all("layernorm cpu/gpu parity"); }
