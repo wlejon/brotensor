@@ -114,6 +114,11 @@ endif() # BROTENSOR_API_COMPILED_JS
 
 brotensor_add_test(brotensor_test_cpu_ops test_cpu_ops.cpp)
 brotensor_add_test(brotensor_test_dispatch test_dispatch.cpp)
+brotensor_add_test(brotensor_test_kernel_interop test_kernel_interop.cpp)
+if(TARGET brass AND BRASS_WITH_SPIRV)
+    target_link_libraries(brotensor_test_kernel_interop PRIVATE "$<BUILD_INTERFACE:brass>")
+    target_compile_definitions(brotensor_test_kernel_interop PRIVATE BROTENSOR_TEST_HAS_BRASS_SPIRV=1)
+endif()
 brotensor_add_test(brotensor_test_vit_block_ops test_vit_block_ops.cpp)
 brotensor_add_test(brotensor_test_thread_pool test_thread_pool.cpp)
 brotensor_add_test(brotensor_test_safetensors test_safetensors.cpp)

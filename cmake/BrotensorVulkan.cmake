@@ -317,6 +317,7 @@ function(brotensor_vulkan_add_backend)
         ${_src}/tensor.cpp
         ${_src}/graph.cpp
         ${_src}/custom.cpp
+        ${_src}/kernel_interop_vk.cpp
         ${_src}/register.cpp
         ${_src}/ops_elementwise.cpp
         ${_src}/ops_copy.cpp
