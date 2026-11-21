@@ -120,6 +120,61 @@ std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::str
     if (name == "jit_spirv_layernorm_4096_vec" || name == "jit_spirv_layernorm_4096_scalar") {
         return {{0, 262144, -1, 4, 16}, {1, 262144, -1, 4, 16}, {2, 16384, -1, 4, 16}, {3, 16384, -1, 4, 16}};
     }
+    if (name == "glu_f32" || name == "glu_f16" || name == "glu_bf16" ||
+        name == "glu_f32_to_f16" || name == "glu_f32_to_bf16") {
+        const std::uint32_t eb_x = (name == "glu_f16" || name == "glu_bf16") ? 2u : 4u;
+        const std::uint32_t eb_y = (name == "glu_f32") ? 4u : 2u;
+        return {
+            {0, 0, 3, eb_x, 16, -1, -1, 2}, // x: 2 * n elements
+            {1, 0, 3, eb_x, 16, -1, -1, 1}, // dy: n elements
+            {2, 0, 3, eb_y, 16, -1, -1, 1}, // y: n elements
+        };
+    }
+    if (name == "rope_f32" || name == "rope_f16" || name == "rope_bf16") {
+        const std::uint32_t eb = (name == "rope_f32") ? 4u : 2u;
+        return {
+            {0, 0, 11, eb, 16, 12, 13, 1}, // x: rows * heads * hd elements
+            {1, 0, 11, eb, 16, 12, 13, 1}, // y: rows * heads * hd elements
+        };
+    }
+    if (name == "attn_aux_f32" || name == "attn_aux_f16" || name == "attn_aux_bf16") {
+        const std::uint32_t eb_y = (name == "attn_aux_f32") ? 4u : 2u;
+        return {
+            {0, 0, 3, 4, 16, 4, -1, 1},    // x: rows * n floats
+            {1, 0, 3, eb_y, 16, 4, -1, 1}, // y: rows * n elements
+            {2, 0, 3, 4, 16, -1, -1, 1},   // mask: rows floats (when non-null)
+        };
+    }
+    if (name == "norm_f32" || name == "norm_f16" || name == "norm_bf16" ||
+        name == "norm_f16_g32" || name == "norm_bf16_g32" || name == "norm_f32_y16") {
+        const std::uint32_t eb_x =
+            (name == "norm_f32" || name == "norm_f32_y16") ? 4u : 2u;
+        const std::uint32_t eb_y =
+            (name == "norm_f32") ? 4u : 2u;
+        const std::uint32_t eb_g =
+            (name == "norm_f16" || name == "norm_bf16") ? 2u : 4u;
+        return {
+            {0, 0, 7, eb_x, 16, 8, -1, 1}, // x: rows * d
+            {1, 0, 7, eb_y, 16, 8, -1, 1}, // y: rows * d
+            {2, 0, 8, eb_g, 16, -1, -1, 1}, // g: d
+            {3, 0, 8, eb_g, 16, -1, -1, 1}, // b: d
+            {4, 0, 7, eb_x, 16, 8, -1, 1}, // xh: rows * d
+            {5, 0, 7, 4, 16, -1, -1, 1},   // s0: rows floats
+            {6, 0, 7, 4, 16, -1, -1, 1},   // s1: rows floats
+        };
+    }
+    if (name == "bnorm") {
+        return {
+            {0, 0, 11, 4, 16, 12, 13, 1},  // x: n * c * hw floats
+            {1, 0, 11, 4, 16, 12, 13, 1},  // y: n * c * hw floats
+            {2, 0, 12, 4, 16, -1, -1, 1},  // g: c
+            {3, 0, 12, 4, 16, -1, -1, 1},  // b: c
+            {4, 0, 12, 4, 16, -1, -1, 1},  // rm: c
+            {5, 0, 12, 4, 16, -1, -1, 1},  // rv: c
+            {6, 0, 12, 4, 16, -1, -1, 1},  // sm: c
+            {7, 0, 12, 4, 16, -1, -1, 1},  // sr: c
+        };
+    }
     return {};
 }
 
@@ -132,6 +187,29 @@ std::vector<brass::verify::GpuParamConstraint> param_constraints_for_shader(cons
     }
     if (name == "copy2d_b1" || name == "copy2d_b2" || name == "copy2d_b4") {
         return {{4, 2, 0, 0}, {4, 3, 0, 0}};
+    }
+    if (name == "glu_f32" || name == "glu_f16" || name == "glu_bf16" ||
+        name == "glu_f32_to_f16" || name == "glu_f32_to_bf16") {
+        return {
+            {4, UINT32_MAX, 1, 0, UINT32_MAX, 0}, // d >= 1
+            {3, UINT32_MAX, 0, 0, 4, 0},          // n % d == 0
+        };
+    }
+    if (name == "rope_f32" || name == "rope_f16" || name == "rope_bf16") {
+        return {
+            {12, UINT32_MAX, 1, 0, UINT32_MAX, 0}, // heads >= 1
+            {13, UINT32_MAX, 2, 0, UINT32_MAX, 2}, // hd >= 2 && hd % 2 == 0
+        };
+    }
+    if (name == "attn_aux_f32" || name == "attn_aux_f16" || name == "attn_aux_bf16") {
+        return {{4, UINT32_MAX, 1, 0}}; // n >= 1
+    }
+    if (name == "norm_f32" || name == "norm_f16" || name == "norm_bf16" ||
+        name == "norm_f16_g32" || name == "norm_bf16_g32" || name == "norm_f32_y16") {
+        return {{7, UINT32_MAX, 1, 0}, {8, UINT32_MAX, 1, 0}};
+    }
+    if (name == "bnorm") {
+        return {{13, UINT32_MAX, 1, 0}}; // hw >= 1
     }
     return {};
 }
@@ -186,7 +264,7 @@ ShaderAuditSummary audit_spirv_binary_words(
     // lockstep execution prover (verify_spirv_memory_safety + verify_spirv_barrier_uniformity).
     const auto specs = buffer_specs_for_shader(name);
     const bool small_kernel = (rep.num_functions == 1 && rep.num_blocks <= 6 && rep.num_instructions <= 180);
-    if (small_kernel || (!specs.empty() && rep.num_functions == 1)) {
+    if (small_kernel || !specs.empty()) {
         brass::verify::GpuProverOptions opts;
         opts.local_size_x = std::max(1u, rep.local_size[0]);
         opts.local_size_y = std::max(1u, rep.local_size[1]);

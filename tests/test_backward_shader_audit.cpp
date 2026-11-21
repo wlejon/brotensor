@@ -82,7 +82,7 @@ static void test_backward_shader_audit_suite() {
                 total_barriers,
                 total_collectives);
 #if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-    CHECK(total_global_accesses >= 100);
+    CHECK(total_global_accesses >= 1200);
 #else
     CHECK(total_global_accesses > 0);
 #endif
@@ -97,7 +97,7 @@ static void test_backward_shader_audit_suite() {
 
 #if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
     // Production Vulkan backward shaders from shader_table.h
-    CHECK(report.shaders.size() >= 136);
+    CHECK(report.shaders.size() >= 149);
     const char* required_vk_shaders[] = {
         "act_bwd_f32",
         "act_bwd_f16",

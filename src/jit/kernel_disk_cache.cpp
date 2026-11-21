@@ -7,6 +7,7 @@
 #include <utility>
 
 #if BROTENSOR_HAS_BRASS_JIT
+#include <brass/cache/artifact_cache.hpp>
 #include <brass/cache/native_module_cache.hpp>
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/function.hpp>
@@ -24,6 +25,9 @@ namespace {
 }
 
 std::filesystem::path env_cache_dir() {
+#if BROTENSOR_HAS_BRASS_JIT
+    return brass::cache::default_cache_dir("brotensor", "kernels", "BRO_ML_CACHE_DIR");
+#else
     if (const char* env_dir = std::getenv("BRO_ML_CACHE_DIR")) {
         if (env_dir[0] != '\0') return std::filesystem::path(env_dir);
     }
@@ -37,6 +41,7 @@ std::filesystem::path env_cache_dir() {
     auto tmp = std::filesystem::temp_directory_path(ec);
     if (ec || tmp.empty()) tmp = "/tmp";
     return tmp / "brotensor_kernel_cache";
+#endif
 }
 
 uint64_t env_max_bytes() {
