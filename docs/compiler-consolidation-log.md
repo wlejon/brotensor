@@ -317,6 +317,35 @@ All `37/37` ops verified `ok` sequentially on an idle M2 Pro (19-core GPU, 16 Gi
 
 ---
 
+## Wave 2 (CUDA / NVIDIA RTX 4090): Normalization, Softmax, Row/Col Reductions, RoPE, Rowvec & Remaining Wave 1 Ops -> Single-Source Brass MIR
+
+Extended CUDA's runtime MIR cache (`src/cuda/cu_mir_cache.{h,cpp}`) to `MirKind::{Rowvec, SumRows, ArgmaxRows, SumCols, Norm, Rope}` (`kCapacity` `2048 -> 4096` in `cuda_jit_engine.h`, alignment-aware `mir_vec_lanes_norm` clamping max lanes to `4` whenever any active operand or `NORM_SOFTMAX` `s0_mask` is FP32, compile-time `NormMirFlags`), wired all Wave 2 CUDA ops plus the remaining separable Wave 1 CUDA ops (`exp`/`log`/`round` from `log_exp_round.cu`, `sin`/`cos`/`rsqrt` from `stylegan_elementwise.cu`, `elu`/`leaky_relu` from `vocoder_activations.cu`, the 5 batched elementwise ops from `batched_ops.cu`, `rope_qkv_packed_inplace` from `packed_encoder.cu`, and `modulate`/`broadcast_mul` via `MirKind::Rowvec`), moved `rows_count_above` into `src/cuda/elementwise_misc.cu`, and deleted 11 obsolete `.cu` files (`src/cuda/ops_{elementwise,norm,reduce,rope}.cpp`).
+
+### `brotensor_bench_elementwise` Normalization Gains (RTX 4090 CUDA, `CUDA_VISIBLE_DEVICES=0`, Wave 0 vs Wave 2)
+
+All `37/37` ops verified `ok` sequentially on an idle RTX 4090 (working sets > 72 MB L2, ~1008 GB/s peak HBM):
+
+| Op | Shape | Dtype | Wave 0 (ms / GB/s) | Wave 2 (ms / GB/s) | Speedup (vs Wave 0) |
+|---|---|---|---|---|---|
+| `rms_norm_forward` | `9217×4096` | `fp32` | `0.336 ms / 899.2` | `0.332 ms / 910.3` | `+1.2%` |
+| `rms_norm_forward` | `18433×4096` | `fp16` | `0.336 ms / 899.2` | `0.331 ms / 913.3` | `+1.6%` |
+| `layernorm_inf_fp16` | `18433×4096` | `fp16` | `0.346 ms / 872.6` | `0.331 ms / 913.1` | `+4.6%` |
+| `softmax_rows` | `9217×4096` | `fp32` | `0.429 ms / 703.9` | `0.332 ms / 910.7` | **`+29.4%`** |
+
+*(All 33 Wave 1 elementwise/gated rows in `brotensor_bench_elementwise` also verified `ok` at `895.7–927.6 GB/s`.)*
+
+### Wave 2 CUDA Verification & LOC Delta
+- **Correctness & Full `ctest` Suite:**
+  - Targeted Wave 1 + Wave 2 CUDA parity & unit suites (`gpu_mir_emit`, `elementwise*`, `activations*`, `geglu`, `swiglu*`, `log_exp_round`, `add_channel_bias`, `public_reductions`, `softmax*`, `layernorm*`, `rmsnorm`, `l2_norm`, `l2_normalize`, `rope*`, `reduce*`, `modulate`, `stylegan*`, `vocoder`, `packed_encoder`, `batched*`): **40/40 passed** (`0` failures, `16.42s`).
+  - Full CUDA `ctest` (`-C Release -LE gcstress -j 1`): **204/204 passed** (`0` failures).
+- **LOC Delta (CUDA Wave 2 + Remaining Wave 1):**
+  - Deleted 11 files (`-4,231` lines): `layernorm.cu` (`-875`), `rms_norm.cu` (`-483`), `softmax.cu` (`-478`), `rope.cu` (`-460`), `stylegan_elementwise.cu` (`-396`), `layernorm_batched.cu` (`-316`), `log_exp_round.cu` (`-295`), `public_reductions.cu` (`-275`), `l2_norm.cu` (`-255`), `rope_mrope.cu` (`-225`), `modulate.cu` (`-173`).
+  - Slimmed: `batched_ops.cu` (`-174`), `vocoder_activations.cu` (`-148`), `packed_encoder.cu` (`-63`).
+  - Added/extended: `src/cuda/cu_mir_cache.{h,cpp}` (`+220`), `src/cuda/ops_elementwise.cpp` (`+130` net -> `371`), `src/cuda/elementwise_misc.cu` (`+65` -> `172`), `src/cuda/ops_norm.cpp` (`+509`), `src/cuda/ops_reduce.cpp` (`+91`), `src/cuda/ops_rope.cpp` (`+213`) (all files `<= 509` LOC).
+  - **Total CUDA diff (Wave 2 + remaining Wave 1):** `1,184` lines added, `4,676` lines deleted (**`-3,492` net CUDA LOC**; cumulative CUDA Waves 1–2 net reduction: **`-4,723` net LOC**).
+
+---
+
 ## Wave 3: Vulkan GroupNorm, BatchNorm, Copy2D/Transpose/Fill & Scatter-Add -> Single-Source Brass MIR
 
 Replaced 6 GLSL shaders / 13 variants (`gnorm.comp`, `bnorm.comp`, `copy2d.comp`, `transpose.comp`, `fill_bytes.comp`, `scatter_add.comp`; `95 -> 82` compiled Vulkan shaders) with single-source `brass::Function` MIR builders in `src/kernels/{mir_copy.{h,cpp}, mir_scatter.{h,cpp}, mir_gnorm.{h,cpp}}`, dispatched via `src/vulkan/vk_mir_cache.{h,cpp}` across `ops_gnorm.cpp`, `ops_copy.cpp`, `ops_scatter.cpp`, `ops_quant.cpp`, `ops_conv.cpp`, and `tensor.cpp`. Also updated `brass` (`a370f6c`) to handle `vec2<f16>` `OpFConvert` + `OpBitcast` in `gpu_equiv_spirv.cpp`, fixing `brotensor_test_gpu_mir_emit` `f16` Z3 equivalence.

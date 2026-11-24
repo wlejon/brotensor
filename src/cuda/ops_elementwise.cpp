@@ -1,4 +1,4 @@
-// CUDA elementwise, activation, bias, cast, and GLU ops backed by Brass MIR -> PTX.
+// CUDA elementwise, activation, math, bias, cast, GLU, and rowvec ops backed by Brass MIR -> PTX.
 
 #include "cu_mir_cache.h"
 #include "detail/cuda_check.h"
@@ -75,20 +75,23 @@ void binary(const char* op, Tensor& y, const Tensor& x, std::uint32_t code,
     mir_dispatch_5(fn, mir_groups_1d(n, lanes), y.data, x.data, n, a, b);
 }
 
-void act_backward(const char* op, const Tensor& p, const Tensor& dY, Tensor& dX,
+void act_backward(const char* op, const Tensor* p, const Tensor& dY, Tensor& dX,
                   std::uint32_t code, float a = 0.0f) {
-    require_fp(op, p.dtype);
-    if (dY.dtype != p.dtype || dY.size() != p.size()) {
-        throw std::runtime_error(std::string(op) + ": dY shape/dtype mismatch");
+    require_fp(op, dY.dtype);
+    if (p) {
+        require_fp(op, p->dtype);
+        if (dY.dtype != p->dtype || dY.size() != p->size()) {
+            throw std::runtime_error(std::string(op) + ": dY shape/dtype mismatch");
+        }
     }
-    if (dX.rows != p.rows || dX.cols != p.cols || dX.dtype != p.dtype) {
-        dX.resize(p.rows, p.cols, p.dtype);
+    if (dX.rows != dY.rows || dX.cols != dY.cols || dX.dtype != dY.dtype) {
+        dX.resize(dY.rows, dY.cols, dY.dtype);
     }
-    const std::uint32_t n = count32(p, op);
+    const std::uint32_t n = count32(dY, op);
     if (n == 0) return;
-    const int lanes = mir_vec_lanes(p.dtype, n, addr(p.data), addr(dY.data), addr(dX.data));
-    CUfunction fn = mir_function({MirKind::ActBwd, code, p.dtype, p.dtype, static_cast<std::uint8_t>(lanes)});
-    mir_dispatch_act_bwd(fn, mir_groups_1d(n, lanes), p.data, dY.data, dX.data, n, a);
+    const int lanes = mir_vec_lanes(dY.dtype, n, addr(dY.data), addr(dX.data), p ? addr(p->data) : 0);
+    CUfunction fn = mir_function({MirKind::ActBwd, code, dY.dtype, dY.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_act_bwd(fn, mir_groups_1d(n, lanes), p ? p->data : nullptr, dY.data, dX.data, n, a);
 }
 
 void glu(const char* op, std::uint32_t code, const Tensor& X, const Tensor* dY, Tensor& out) {
@@ -120,9 +123,28 @@ void glu(const char* op, std::uint32_t code, const Tensor& X, const Tensor* dY, 
     mir_dispatch_glu(fn, mir_groups_1d(n, lanes), X.data, dY ? dY->data : nullptr, out.data, n, static_cast<std::uint32_t>(D));
 }
 
+void rowvec(const char* op, std::uint32_t code, const Tensor& X, const Tensor& v, const Tensor* w, Tensor& Y) {
+    require_fp(op, X.dtype);
+    if (v.dtype != X.dtype || (w && w->dtype != X.dtype)) {
+        throw std::runtime_error(std::string("brotensor: ") + op + ": vector operands must share X's dtype");
+    }
+    if (v.size() != X.cols || (w && w->size() != X.cols)) {
+        throw std::runtime_error(std::string("brotensor: ") + op + ": vector operands have wrong element count");
+    }
+    if (Y.rows != X.rows || Y.cols != X.cols || Y.dtype != X.dtype) {
+        Y.resize(X.rows, X.cols, X.dtype);
+    }
+    const std::uint32_t n = count32(X, op);
+    if (n == 0) return;
+    const std::uint32_t D = static_cast<std::uint32_t>(X.cols);
+    const int lanes = (D % 4u == 0u) ? mir_vec_lanes(X.dtype, D, addr(X.data), addr(v.data), w ? addr(w->data) : 0, addr(Y.data)) : 1;
+    CUfunction fn = mir_function({MirKind::Rowvec, code, X.dtype, X.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_rowvec(fn, mir_groups_1d(n, lanes), X.data, v.data, w ? w->data : nullptr, Y.data, n, D);
+}
+
 }  // namespace
 
-// ─── forward unary activations ─────────────────────────────────────────────
+// ─── forward unary activations & math ──────────────────────────────────────
 
 void relu_forward(const Tensor& x, Tensor& y)       { unary("relu_forward", x, y, UOP_RELU); }
 void tanh_forward(const Tensor& x, Tensor& y)       { unary("tanh_forward", x, y, UOP_TANH); }
@@ -131,16 +153,45 @@ void silu_forward(const Tensor& x, Tensor& y)       { unary("silu_forward", x, y
 void gelu_forward(const Tensor& x, Tensor& y)       { unary("gelu_forward", x, y, UOP_GELU_TANH); }
 void gelu_exact_forward(const Tensor& x, Tensor& y) { unary("gelu_exact_forward", x, y, UOP_GELU_EXACT); }
 void quick_gelu_forward(const Tensor& x, Tensor& y) { unary("quick_gelu_forward", x, y, UOP_QUICK_GELU); }
+void exp_forward(const Tensor& x, Tensor& y)        { unary("exp_forward", x, y, UOP_EXP); }
+void log_forward(const Tensor& x, Tensor& y)        { unary("log_forward", x, y, UOP_LOG); }
+void sin_forward(const Tensor& x, Tensor& y)        { unary("sin_forward", x, y, UOP_SIN); }
+void cos_forward(const Tensor& x, Tensor& y)        { unary("cos_forward", x, y, UOP_COS); }
+void rsqrt_forward(const Tensor& x, Tensor& y)      { unary("rsqrt_forward", x, y, UOP_RSQRT); }
+void round_forward(const Tensor& x, Tensor& y)      { unary("round_forward", x, y, UOP_ROUND); }
+void elu_forward(const Tensor& x, float alpha, Tensor& y)        { unary("elu_forward", x, y, UOP_ELU, alpha); }
+void leaky_relu_forward(const Tensor& x, float slope, Tensor& y) { unary("leaky_relu_forward", x, y, UOP_LEAKY_RELU, slope); }
 
-// ─── backward activations ──────────────────────────────────────────────────
+// ─── backward activations & math ───────────────────────────────────────────
 
-void relu_backward(const Tensor& x, const Tensor& dY, Tensor& dX)       { act_backward("relu_backward", x, dY, dX, GOP_RELU); }
-void tanh_backward(const Tensor& y, const Tensor& dY, Tensor& dX)       { act_backward("tanh_backward", y, dY, dX, GOP_TANH); }
-void sigmoid_backward(const Tensor& y, const Tensor& dY, Tensor& dX)    { act_backward("sigmoid_backward", y, dY, dX, GOP_SIGMOID); }
-void silu_backward(const Tensor& x, const Tensor& dY, Tensor& dX)       { act_backward("silu_backward", x, dY, dX, GOP_SILU); }
-void gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX)       { act_backward("gelu_backward", x, dY, dX, GOP_GELU_TANH); }
-void gelu_exact_backward(const Tensor& x, const Tensor& dY, Tensor& dX) { act_backward("gelu_exact_backward", x, dY, dX, GOP_GELU_EXACT); }
-void quick_gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) { act_backward("quick_gelu_backward", x, dY, dX, GOP_QUICK_GELU); }
+void relu_backward(const Tensor& x, const Tensor& dY, Tensor& dX)       { act_backward("relu_backward", &x, dY, dX, GOP_RELU); }
+void tanh_backward(const Tensor& y, const Tensor& dY, Tensor& dX)       { act_backward("tanh_backward", &y, dY, dX, GOP_TANH); }
+void sigmoid_backward(const Tensor& y, const Tensor& dY, Tensor& dX)    { act_backward("sigmoid_backward", &y, dY, dX, GOP_SIGMOID); }
+void silu_backward(const Tensor& x, const Tensor& dY, Tensor& dX)       { act_backward("silu_backward", &x, dY, dX, GOP_SILU); }
+void gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX)       { act_backward("gelu_backward", &x, dY, dX, GOP_GELU_TANH); }
+void gelu_exact_backward(const Tensor& x, const Tensor& dY, Tensor& dX) { act_backward("gelu_exact_backward", &x, dY, dX, GOP_GELU_EXACT); }
+void quick_gelu_backward(const Tensor& x, const Tensor& dY, Tensor& dX) { act_backward("quick_gelu_backward", &x, dY, dX, GOP_QUICK_GELU); }
+void exp_backward(const Tensor& x, const Tensor& dY, Tensor& dX)        { act_backward("exp_backward", &x, dY, dX, GOP_EXP); }
+void log_backward(const Tensor& x, const Tensor& dY, Tensor& dX)        { act_backward("log_backward", &x, dY, dX, GOP_LOG); }
+void sin_backward(const Tensor& x, const Tensor& dY, Tensor& dX)        { act_backward("sin_backward", &x, dY, dX, GOP_SIN); }
+void cos_backward(const Tensor& x, const Tensor& dY, Tensor& dX)        { act_backward("cos_backward", &x, dY, dX, GOP_COS); }
+void rsqrt_backward(const Tensor& y, const Tensor& dY, Tensor& dX)      { act_backward("rsqrt_backward", &y, dY, dX, GOP_RSQRT); }
+void round_backward(const Tensor& dY, Tensor& dX)                       { act_backward("round_backward", nullptr, dY, dX, GOP_PASS); }
+void elu_backward(const Tensor& x, const Tensor& dY, float alpha, Tensor& dX)        { act_backward("elu_backward", &x, dY, dX, GOP_ELU, alpha); }
+void leaky_relu_backward(const Tensor& x, const Tensor& dY, float slope, Tensor& dX) { act_backward("leaky_relu_backward", &x, dY, dX, GOP_LEAKY_RELU, slope); }
+
+// ─── batched elementwise delegates ─────────────────────────────────────────
+
+void add_inplace(Tensor& y, const Tensor& x);
+
+void relu_forward_batched(const Tensor& X_BD, Tensor& Y_BD) { cuda::relu_forward(X_BD, Y_BD); }
+void tanh_forward_batched(const Tensor& X_BD, Tensor& Y_BD) { cuda::tanh_forward(X_BD, Y_BD); }
+void add_inplace_batched(Tensor& Y_BD, const Tensor& X_BD) {
+    if (Y_BD.dtype != X_BD.dtype) throw std::runtime_error("add_inplace_batched: dtype mismatch");
+    cuda::add_inplace(Y_BD, X_BD);
+}
+void relu_backward_batched(const Tensor& X_BD, const Tensor& dY_BD, Tensor& dX_BD) { cuda::relu_backward(X_BD, dY_BD, dX_BD); }
+void tanh_backward_batched(const Tensor& Y_BD, const Tensor& dY_BD, Tensor& dX_BD) { cuda::tanh_backward(Y_BD, dY_BD, dX_BD); }
 
 // ─── in-place scalar & binary ──────────────────────────────────────────────
 
@@ -227,7 +278,7 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
     mir_dispatch_cast(fn, mir_groups_1d(n, lanes), src.data, dst.data, n);
 }
 
-// ─── gated linear units ────────────────────────────────────────────────────
+// ─── gated linear units & rowvec ───────────────────────────────────────────
 
 void swiglu_forward(const Tensor& X, Tensor& Y)       { glu("swiglu_forward", GLU_SWIGLU, X, nullptr, Y); }
 void swiglu_backward(const Tensor& X, const Tensor& dY, Tensor& dX) {
@@ -242,6 +293,13 @@ void geglu_exact_backward(const Tensor& X, const Tensor& dY, Tensor& dX) {
     glu("geglu_exact_backward", GLU_GEGLU_EXACT_BWD, X, &dY, dX);
 }
 
+void modulate(const Tensor& X, const Tensor& scale, const Tensor& shift, Tensor& Y) {
+    rowvec("modulate", ROWVEC_MODULATE, X, scale, &shift, Y);
+}
+void broadcast_mul(const Tensor& X, const Tensor& v, Tensor& Y) {
+    rowvec("broadcast_mul", ROWVEC_MUL, X, v, nullptr, Y);
+}
+
 // ─── vtable registration ───────────────────────────────────────────────────
 
 void threshold_u8(const Tensor& X, float t, Tensor& Y);
@@ -250,10 +308,8 @@ void build_slot_mask(const Tensor& x, int offset, int K, int stride, Tensor& mas
 void rms_norm_forward(const Tensor& X, const Tensor& gamma, float eps, Tensor& Y);
 void rms_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& dY,
                        float eps, Tensor& dX, Tensor& dGamma);
-void modulate(const ::brotensor::Tensor& X, const ::brotensor::Tensor& scale,
-              const ::brotensor::Tensor& shift, ::brotensor::Tensor& Y);
-void broadcast_mul(const ::brotensor::Tensor& X, const ::brotensor::Tensor& v,
-                   ::brotensor::Tensor& Y);
+void pixel_norm_forward(const Tensor& X, float eps, Tensor& Y);
+void pixel_norm_backward(const Tensor& X, const Tensor& dY, float eps, Tensor& dX);
 
 void fill_cuda_vtable_elementwise(::brotensor::detail::OpsVTable& v) {
     v.relu_forward             = &relu_forward;
@@ -292,6 +348,26 @@ void fill_cuda_vtable_elementwise(::brotensor::detail::OpsVTable& v) {
     v.rms_norm_backward        = &rms_norm_backward;
     v.swiglu_forward           = &swiglu_forward;
     v.swiglu_backward          = &swiglu_backward;
+}
+
+void fill_cuda_vtable_log_exp_round(::brotensor::detail::OpsVTable& v) {
+    v.log_forward    = &log_forward;
+    v.log_backward   = &log_backward;
+    v.exp_forward    = &exp_forward;
+    v.exp_backward   = &exp_backward;
+    v.round_forward  = &round_forward;
+    v.round_backward = &round_backward;
+}
+
+void fill_cuda_vtable_stylegan_elementwise(::brotensor::detail::OpsVTable& v) {
+    v.sin_forward         = &sin_forward;
+    v.sin_backward        = &sin_backward;
+    v.cos_forward         = &cos_forward;
+    v.cos_backward        = &cos_backward;
+    v.rsqrt_forward       = &rsqrt_forward;
+    v.rsqrt_backward      = &rsqrt_backward;
+    v.pixel_norm_forward  = &pixel_norm_forward;
+    v.pixel_norm_backward = &pixel_norm_backward;
 }
 
 }  // namespace brotensor::detail::cuda

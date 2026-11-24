@@ -333,10 +333,10 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/fp16_matmul.cu
         src/cuda/cu_mir_cache.cpp
         src/cuda/ops_elementwise.cpp
+        src/cuda/ops_norm.cpp
+        src/cuda/ops_reduce.cpp
+        src/cuda/ops_rope.cpp
         src/cuda/elementwise_misc.cu
-        src/cuda/softmax.cu
-        src/cuda/layernorm.cu
-        src/cuda/layernorm_batched.cu
         src/cuda/attention.cu
         src/cuda/optim.cu
         src/cuda/adam.cu
@@ -394,21 +394,16 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/matmul.cu
         src/cuda/matmul_backward.cu
         src/cuda/lstm.cu
-        src/cuda/rope.cu
-        src/cuda/rms_norm.cu
         src/cuda/kv_cache.cu
         src/cuda/decode_gqa.cu
-        src/cuda/public_reductions.cu
         src/cuda/ddim_step.cu
         src/cuda/euler_step.cu
         src/cuda/dpmpp_2m_step.cu
         src/cuda/timestep_embedding.cu
         src/cuda/int8_quant.cu
-        src/cuda/modulate.cu
         src/cuda/self_attention_bias.cu
         src/cuda/self_attention_rel_pos.cu
         src/cuda/vocoder_activations.cu
-        src/cuda/log_exp_round.cu
         src/cuda/fft.cu
         src/cuda/stft.cu
         src/cuda/conv1d.cu
@@ -417,15 +412,12 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/sample_logits.cu
         src/cuda/masked_diffusion.cu
         src/cuda/noise.cu
-        src/cuda/l2_norm.cu
         src/cuda/gated_delta_rule.cu
         src/cuda/spatial_merge.cu
-        src/cuda/rope_mrope.cu
         src/cuda/loss_legacy.cu
         src/cuda/xavier_init.cu
         src/cuda/batch_norm.cu
         src/cuda/image_preproc.cu
-        src/cuda/stylegan_elementwise.cu
         src/cuda/bias_act.cu
         src/cuda/upfirdn2d.cu
         src/cuda/modulated_conv2d.cu

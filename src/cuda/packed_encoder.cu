@@ -50,27 +50,6 @@ template <> __device__ __forceinline__ __nv_bfloat16 from_f32<__nv_bfloat16>(flo
     return __float2bfloat16(v);
 }
 
-// One thread per rotated pair of one row; blockIdx.y = row. pairs = H*hd
-// (H*hd/2 pairs in Q plus as many in K).
-template <typename T>
-__global__ void rope_qkv_packed_kernel(T* __restrict__ qkv, const float* __restrict__ cos_tbl,
-                                       const float* __restrict__ sin_tbl,
-                                       const int* __restrict__ pos, int D, int half) {
-    const int r = blockIdx.y;
-    const int pi = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pi >= D) return;  // D pairs per row across the Q and K sections
-    const int sec = pi / (D / 2);
-    const int pj = pi - sec * (D / 2);
-    const int head = pj / half;
-    const int i = pj - head * half;
-    T* v = qkv + static_cast<size_t>(r) * 3 * D + sec * D + head * 2 * half + 2 * i;
-    const size_t t = static_cast<size_t>(pos[r]) * half + i;
-    const float c = cos_tbl[t], s = sin_tbl[t];
-    const float x0 = ld_f32(v), x1 = ld_f32(v + 1);
-    v[0] = from_f32<T>(x0 * c - x1 * s);
-    v[1] = from_f32<T>(x0 * s + x1 * c);
-}
-
 // One warp per segment.
 template <typename T>
 __global__ void segment_softmax_stats_kernel(const T* __restrict__ logits,
@@ -121,43 +100,6 @@ __global__ void segment_softmax_stats_kernel(const T* __restrict__ logits,
     }
 }
 
-void rope_qkv_packed_inplace(::brotensor::Tensor& QKV, const ::brotensor::Tensor& cos_tbl,
-                             const ::brotensor::Tensor& sin_tbl, const ::brotensor::Tensor& pos,
-                             int num_heads, int head_dim) {
-    constexpr const char* op = "rope_qkv_packed_inplace";
-    if (cos_tbl.dtype != Dtype::FP32 || sin_tbl.dtype != Dtype::FP32) fail(op, "cos/sin tables must be FP32");
-    if (pos.dtype != Dtype::INT32 || pos.rows != QKV.rows) fail(op, "pos must be (L, 1) INT32");
-    if (head_dim <= 0 || (head_dim & 1) || num_heads <= 0 || QKV.cols != 3 * num_heads * head_dim) {
-        fail(op, "QKV.cols must be 3 * num_heads * head_dim with head_dim even");
-    }
-    const int half = head_dim / 2;
-    if (cos_tbl.cols != half || sin_tbl.cols != half) fail(op, "cos_tbl / sin_tbl must be (P, head_dim/2)");
-    const int L = QKV.rows;
-    const int D = num_heads * head_dim;
-    if (L == 0) return;
-    const dim3 grid((D + 255) / 256, L);
-    const float* c = static_cast<const float*>(cos_tbl.data);
-    const float* s = static_cast<const float*>(sin_tbl.data);
-    const int* p = static_cast<const int*>(pos.data);
-    switch (QKV.dtype) {
-        case Dtype::FP16:
-            rope_qkv_packed_kernel<__half><<<grid, 256, 0, cur_stream()>>>(
-                static_cast<__half*>(QKV.data), c, s, p, D, half);
-            break;
-        case Dtype::BF16:
-            rope_qkv_packed_kernel<__nv_bfloat16><<<grid, 256, 0, cur_stream()>>>(
-                static_cast<__nv_bfloat16*>(QKV.data), c, s, p, D, half);
-            break;
-        case Dtype::FP32:
-            rope_qkv_packed_kernel<float><<<grid, 256, 0, cur_stream()>>>(
-                static_cast<float*>(QKV.data), c, s, p, D, half);
-            break;
-        default:
-            fail(op, "QKV must be FP32/FP16/BF16");
-    }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-}
-
 void segment_softmax_stats(const ::brotensor::Tensor& logits, const ::brotensor::Tensor& seg_offsets,
                            ::brotensor::Tensor& out) {
     constexpr const char* op = "segment_softmax_stats";
@@ -190,6 +132,11 @@ void segment_softmax_stats(const ::brotensor::Tensor& logits, const ::brotensor:
 }
 
 }  // namespace
+
+// Defined in ops_rope.cpp.
+void rope_qkv_packed_inplace(::brotensor::Tensor& QKV, const ::brotensor::Tensor& cos_tbl,
+                             const ::brotensor::Tensor& sin_tbl, const ::brotensor::Tensor& pos,
+                             int num_heads, int head_dim);
 
 void fill_cuda_vtable_packed_encoder(::brotensor::detail::OpsVTable& v) {
     v.flash_attention_packed_qkv_forward = &flash_attention_packed_qkv_forward;

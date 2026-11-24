@@ -123,73 +123,6 @@ __global__ void snake_backward_kernel(const float* __restrict__ X,
     }
 }
 
-// ─── elu ────────────────────────────────────────────────────────────────────
-
-__global__ void elu_forward_kernel(const float* __restrict__ x, float alpha,
-                                   long long n, float* __restrict__ y) {
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         i < n; i += (long long)blockDim.x * gridDim.x) {
-        const float v = x[i];
-        y[i] = v > 0.0f ? v : alpha * (expf(v) - 1.0f);
-    }
-}
-
-__global__ void elu_backward_kernel(const float* __restrict__ x,
-                                    const float* __restrict__ dY, float alpha,
-                                    long long n, float* __restrict__ dX) {
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         i < n; i += (long long)blockDim.x * gridDim.x) {
-        const float v = x[i];
-        const float g = v > 0.0f ? 1.0f : alpha * expf(v);
-        dX[i] = dY[i] * g;
-    }
-}
-
-// ─── leaky_relu ─────────────────────────────────────────────────────────────
-
-__global__ void leaky_relu_forward_kernel(const float* __restrict__ x,
-                                          float slope, long long n,
-                                          float* __restrict__ y) {
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         i < n; i += (long long)blockDim.x * gridDim.x) {
-        const float v = x[i];
-        y[i] = v > 0.0f ? v : slope * v;
-    }
-}
-
-// FP16 / BF16 twins — same shape-agnostic elementwise map, FP32 math per
-// element (matches the relu/silu FP16 kernels in elementwise.cu).
-__global__ void leaky_relu_forward_fp16_kernel(const __half* __restrict__ x,
-                                               float slope, long long n,
-                                               __half* __restrict__ y) {
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         i < n; i += (long long)blockDim.x * gridDim.x) {
-        const float v = __half2float(x[i]);
-        y[i] = __float2half(v > 0.0f ? v : slope * v);
-    }
-}
-
-__global__ void leaky_relu_forward_bf16_kernel(const __nv_bfloat16* __restrict__ x,
-                                               float slope, long long n,
-                                               __nv_bfloat16* __restrict__ y) {
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         i < n; i += (long long)blockDim.x * gridDim.x) {
-        const float v = __bfloat162float(x[i]);
-        y[i] = __float2bfloat16(v > 0.0f ? v : slope * v);
-    }
-}
-
-__global__ void leaky_relu_backward_kernel(const float* __restrict__ x,
-                                           const float* __restrict__ dY,
-                                           float slope, long long n,
-                                           float* __restrict__ dX) {
-    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-         i < n; i += (long long)blockDim.x * gridDim.x) {
-        const float g = x[i] > 0.0f ? 1.0f : slope;
-        dX[i] = dY[i] * g;
-    }
-}
-
 } // namespace
 
 // ─── snake wrappers ─────────────────────────────────────────────────────────
@@ -258,84 +191,15 @@ void snake_backward(const ::brotensor::Tensor& X, const ::brotensor::Tensor& alp
     BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
-// ─── elu wrappers ───────────────────────────────────────────────────────────
+// ─── elu / leaky_relu (defined in ops_elementwise.cpp) ───────────────────────
 
-void elu_forward(const ::brotensor::Tensor& x, float alpha,
-                 ::brotensor::Tensor& y) {
-    require_fp32("elu_forward", x, "x");
-    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
-        y.resize(x.rows, x.cols, x.dtype);
-    }
-    const long long n = x.size();
-    if (n == 0) return;
-    elu_forward_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
-        static_cast<const float*>(x.data), alpha, n,
-        static_cast<float*>(y.data));
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-}
-
+void elu_forward(const ::brotensor::Tensor& x, float alpha, ::brotensor::Tensor& y);
 void elu_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
-                  float alpha, ::brotensor::Tensor& dX) {
-    require_fp32("elu_backward", x, "x");
-    require_fp32("elu_backward", dY, "dY");
-    if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
-        dX.resize(x.rows, x.cols, x.dtype);
-    }
-    const long long n = x.size();
-    if (n == 0) return;
-    elu_backward_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
-        static_cast<const float*>(x.data),
-        static_cast<const float*>(dY.data), alpha, n,
-        static_cast<float*>(dX.data));
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-}
-
-// ─── leaky_relu wrappers ────────────────────────────────────────────────────
-
+                  float alpha, ::brotensor::Tensor& dX);
 void leaky_relu_forward(const ::brotensor::Tensor& x, float negative_slope,
-                        ::brotensor::Tensor& y) {
-    using ::brotensor::Dtype;
-    if (x.dtype != Dtype::FP32 && x.dtype != Dtype::FP16 &&
-        x.dtype != Dtype::BF16) {
-        fail("leaky_relu_forward", "x must be FP32, FP16 or BF16");
-    }
-    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
-        y.resize(x.rows, x.cols, x.dtype);
-    }
-    const long long n = x.size();
-    if (n == 0) return;
-    if (x.dtype == Dtype::FP16) {
-        leaky_relu_forward_fp16_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
-            static_cast<const __half*>(x.data), negative_slope, n,
-            static_cast<__half*>(y.data));
-    } else if (x.dtype == Dtype::BF16) {
-        leaky_relu_forward_bf16_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
-            static_cast<const __nv_bfloat16*>(x.data), negative_slope, n,
-            static_cast<__nv_bfloat16*>(y.data));
-    } else {
-        leaky_relu_forward_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
-            static_cast<const float*>(x.data), negative_slope, n,
-            static_cast<float*>(y.data));
-    }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-}
-
-void leaky_relu_backward(const ::brotensor::Tensor& x,
-                         const ::brotensor::Tensor& dY, float negative_slope,
-                         ::brotensor::Tensor& dX) {
-    require_fp32("leaky_relu_backward", x, "x");
-    require_fp32("leaky_relu_backward", dY, "dY");
-    if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
-        dX.resize(x.rows, x.cols, x.dtype);
-    }
-    const long long n = x.size();
-    if (n == 0) return;
-    leaky_relu_backward_kernel<<<va_grid(n), VA_BLOCK, 0, cur_stream()>>>(
-        static_cast<const float*>(x.data),
-        static_cast<const float*>(dY.data), negative_slope, n,
-        static_cast<float*>(dX.data));
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-}
+                        ::brotensor::Tensor& y);
+void leaky_relu_backward(const ::brotensor::Tensor& x, const ::brotensor::Tensor& dY,
+                         float negative_slope, ::brotensor::Tensor& dX);
 
 // ─── vtable registration ────────────────────────────────────────────────────
 
