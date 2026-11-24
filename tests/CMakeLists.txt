@@ -196,6 +196,8 @@ if(BROTENSOR_WITH_VULKAN)
     if(BROTENSOR_VULKAN_TRACE_JIT)
         # test_vulkan_jit.cpp reaches src/vulkan/vulkan_jit.h, which names brass types.
         target_link_libraries(brotensor_test_vulkan PRIVATE "$<BUILD_INTERFACE:brass>")
+        brotensor_add_executable(brotensor_bench_brass_gpu_primitives bench_brass_gpu_primitives.cpp)
+        target_link_libraries(brotensor_bench_brass_gpu_primitives PRIVATE brotensor_vulkan_internal "$<BUILD_INTERFACE:brass>")
     endif()
     # Custom kernels the way a sibling ships them (cmake/BrotensorVulkan.cmake).
     brotensor_vulkan_add_shaders(brotensor_test_vulkan

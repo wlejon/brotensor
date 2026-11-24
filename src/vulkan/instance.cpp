@@ -93,6 +93,7 @@ bool probe_physical(const LoaderFns& f, VkPhysicalDevice pd, PhysInfo& info, std
     info.shader_float64 = f2.features.shaderFloat64 == VK_TRUE;
     info.subgroup_size_control = v13 && f13.subgroupSizeControl == VK_TRUE &&
                                  f13.computeFullSubgroups == VK_TRUE;
+    info.integer_dot_product = v13 && f13.shaderIntegerDotProduct == VK_TRUE;
 
     // Queue: graphics + compute (see detail/stream.h for why not compute-only).
     std::uint32_t nq = 0;
@@ -245,6 +246,7 @@ DeviceCtx::DeviceCtx(int index, const PhysInfo& info) : index_(index), info_(inf
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13.subgroupSizeControl = info.subgroup_size_control ? VK_TRUE : VK_FALSE;
     f13.computeFullSubgroups = info.subgroup_size_control ? VK_TRUE : VK_FALSE;
+    f13.shaderIntegerDotProduct = info.integer_dot_product ? VK_TRUE : VK_FALSE;
     if (info.cooperative_matrix) f13.pNext = &cmf;
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE;

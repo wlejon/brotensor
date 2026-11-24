@@ -87,9 +87,40 @@ std::string jit_missing_for(DeviceCtx& ctx, const brass::target::SpirvKernel& k)
             if (!info.shader_float64) out << "  capability Float64 needs shaderFloat64\n";
             continue;
         }
+        if (cap == "CooperativeMatrixKHR") {
+            if (!info.coopmat_f16) out << "  capability CooperativeMatrixKHR needs coopmat_f16\n";
+            continue;
+        }
+        if (cap == "VulkanMemoryModel" || cap == "VulkanMemoryModelDeviceScope") {
+            if (!info.memory_model) out << "  capability " << cap << " needs vulkanMemoryModel\n";
+            continue;
+        }
+        if (cap == "DotProduct" || cap == "DotProductKHR" ||
+            cap == "DotProductInput4x8BitPacked" || cap == "DotProductInput4x8BitPackedKHR") {
+            if (!info.integer_dot_product) out << "  capability " << cap << " needs shaderIntegerDotProduct\n";
+            continue;
+        }
         if (cap == "GroupNonUniformShuffle") {
             if (!(info.subgroup_ops & VK_SUBGROUP_FEATURE_SHUFFLE_BIT)) {
                 out << "  capability GroupNonUniformShuffle needs subgroup SHUFFLE operations in compute\n";
+            }
+            continue;
+        }
+        if (cap == "GroupNonUniformArithmetic") {
+            if (!(info.subgroup_ops & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)) {
+                out << "  capability GroupNonUniformArithmetic needs subgroup ARITHMETIC operations in compute\n";
+            }
+            continue;
+        }
+        if (cap == "GroupNonUniformBallot") {
+            if (!(info.subgroup_ops & VK_SUBGROUP_FEATURE_BALLOT_BIT)) {
+                out << "  capability GroupNonUniformBallot needs subgroup BALLOT operations in compute\n";
+            }
+            continue;
+        }
+        if (cap == "GroupNonUniformVote") {
+            if (!(info.subgroup_ops & VK_SUBGROUP_FEATURE_VOTE_BIT)) {
+                out << "  capability GroupNonUniformVote needs subgroup VOTE operations in compute\n";
             }
             continue;
         }
@@ -108,7 +139,8 @@ std::string jit_missing_for(DeviceCtx& ctx, const brass::target::SpirvKernel& k)
     return out.str();
 }
 
-JitPipeline jit_pipeline(DeviceCtx& ctx, const brass::target::SpirvKernel& k, std::uint32_t block_x) {
+JitPipeline jit_pipeline(DeviceCtx& ctx, const brass::target::SpirvKernel& k, std::uint32_t block_x,
+                         std::uint32_t req_subgroup) {
     if (k.words.empty()) {
         throw std::runtime_error("brotensor: vulkan: kernel '" + k.entry + "' has no SPIR-V words");
     }
@@ -131,9 +163,10 @@ JitPipeline jit_pipeline(DeviceCtx& ctx, const brass::target::SpirvKernel& k, st
 
     const PhysInfo& info = ctx.info();
     std::uint32_t subgroup = 0;
-    if (info.subgroup_size_control && info.min_subgroup <= 32 && info.max_subgroup >= 32 &&
-        block_x % 32 == 0) {
-        subgroup = 32;
+    if (req_subgroup != 0 && info.subgroup_size_control &&
+        info.min_subgroup <= req_subgroup && info.max_subgroup >= req_subgroup &&
+        block_x % req_subgroup == 0) {
+        subgroup = req_subgroup;
     }
     std::uint32_t spec[3] = {block_x, 1, 1};
     if (!k.local_size_spec_constants && k.local_size[0] != block_x) {

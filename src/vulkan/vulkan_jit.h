@@ -52,7 +52,8 @@ std::string jit_missing_for(DeviceCtx& ctx, const brass::target::SpirvKernel& k)
 // The pipeline for `k` at a (block_x, 1, 1) workgroup on `ctx`, created on
 // first use. Throws std::runtime_error when the device lacks a capability the
 // kernel declares, the push block exceeds the layout, or the driver rejects it.
-JitPipeline jit_pipeline(DeviceCtx& ctx, const brass::target::SpirvKernel& k, std::uint32_t block_x);
+JitPipeline jit_pipeline(DeviceCtx& ctx, const brass::target::SpirvKernel& k, std::uint32_t block_x,
+                         std::uint32_t req_subgroup = 32);
 
 // Records one dispatch on `ctx`'s stream: ordered after everything recorded
 // before it (the stream's compute->compute barrier), and captured into a

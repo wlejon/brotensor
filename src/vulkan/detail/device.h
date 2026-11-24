@@ -48,6 +48,7 @@ struct PhysInfo {
     bool cooperative_matrix = false;     // VK_KHR_cooperative_matrix (enabled when present)
     bool memory_model = false;           // vulkanMemoryModel (+ device scope), enabled when present
     bool shader_float64 = false;         // shaderFloat64, enabled when present (custom kernels)
+    bool integer_dot_product = false;    // shaderIntegerDotProduct (VK 1.3), enabled when present
     bool coopmat_f16 = false;            // 16x16x16 FP16 -> FP32 fragments at subgroup 32: the
                                          // GEMM kernels' tensor-core path (BROTENSOR_VK_NO_COOPMAT=1 off)
     std::string name;
