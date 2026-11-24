@@ -10,6 +10,11 @@
 #include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
 #include "../kernels/mir_elementwise.h"
+#include "../kernels/mir_fa_bwd.h"
+#include "../kernels/mir_fa_rows.h"
+#include "../kernels/mir_gemm_simt.h"
+#include "../kernels/mir_gemv.h"
+#include "../kernels/mir_gemv_q.h"
 #include "../kernels/mir_gnorm.h"
 #include "../kernels/mir_lstm.h"
 #include "../kernels/mir_misc.h"
@@ -26,6 +31,8 @@
 #include "../kernels/mir_topk.h"
 #include "../kernels/mir_vision.h"
 #include "../kernels/mir_xent.h"
+
+#include "../vulkan/shaders/op_codes.h"
 
 #include <brass/mir/module.hpp>
 #include <brass/target/msl_target.hpp>
@@ -62,6 +69,7 @@ struct MirKeyHash {
         h = (h * 1315423911u) ^ (static_cast<std::size_t>(k.dt0) << 16) ^
             (static_cast<std::size_t>(k.dt1) << 8) ^ static_cast<std::size_t>(k.dt2);
         h = (h * 1315423911u) ^ (static_cast<std::size_t>(k.lanes) << 8) ^ k.flags;
+        h = (h * 1315423911u) ^ static_cast<std::size_t>(k.aux ^ (k.aux >> 32));
         return h;
     }
 };
@@ -76,8 +84,11 @@ MirCache& mir_cache() {
     return *c;
 }
 
-std::uint32_t block_for(MirKind kind) {
-    return (kind == MirKind::FillBytes) ? kernels::kFillBlock : kernels::kEwBlock;
+std::uint32_t block_for(const MirKey& k) {
+    if (k.kind == MirKind::FillBytes) return kernels::kFillBlock;
+    if (k.kind == MirKind::FaRows) return kernels::kFaRowsBlock;
+    if (k.kind == MirKind::FaBwd) return static_cast<std::uint32_t>(k.lanes);
+    return kernels::kEwBlock;
 }
 
 const MirEntry* compile_mir(const MirKey& k) {
@@ -186,9 +197,60 @@ const MirEntry* compile_mir(const MirKey& k) {
         case MirKind::Dequant:
             fn = kernels::build_dequant_mir(mod, k.op, k.flags != 0);
             break;
+        case MirKind::Gemv:
+            fn = kernels::build_gemv_mir(
+                mod, k.dt0, k.dt1, k.dt2,
+                k.op & 0x0fu, (k.op >> 4) & 0x0fu, (k.op >> 8) & 0x0fu,
+                (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
+        case MirKind::GemmSimt: {
+            const auto dt_bias = static_cast<Dtype>((k.op >> 8) & 0xffu);
+            fn = kernels::build_gemm_simt_mir(
+                mod, k.dt0, k.dt1, k.dt2, dt_bias,
+                (k.flags & 1u) != 0, k.op & 0x0fu, (k.op >> 4) & 0x0fu,
+                (k.flags & 2u) != 0, (k.flags & 4u) != 0, (k.flags & 8u) != 0);
+            break;
+        }
+        case MirKind::ConvSimt: {
+            const auto byte = [&](int s) -> int { return static_cast<int>((k.aux >> (s * 8)) & 0xffu); };
+            fn = kernels::build_conv_simt_mir(
+                mod, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
+                byte(0), byte(1), byte(2), byte(3), byte(4), byte(5), byte(6), byte(7));
+            break;
+        }
+        case MirKind::GemvQ: {
+            const std::uint32_t fmt = k.op & 0x0fu;
+            const std::uint32_t mb = (k.op >> 4) & 0x0fu;
+            const std::uint32_t lpr = k.lanes;
+            const std::uint32_t unr = (k.op >> 8) & 0x0fu;
+            const std::uint32_t nr = (k.op >> 12) & 0x0fu;
+            const std::uint32_t act = (k.op >> 16) & 0x0fu;
+            const std::uint32_t epi = (k.op >> 20) & 0x0fu;
+            fn = kernels::build_gemv_q_mir(
+                mod, k.dt0, fmt, mb, lpr, (k.flags & 1u) != 0, (k.flags & 2u) != 0,
+                unr, nr, act, epi);
+            break;
+        }
+        case MirKind::FaRows:
+            fn = kernels::build_fa_rows_mir(
+                mod, k.dt0, k.op, k.lanes, static_cast<std::uint32_t>(k.aux),
+                (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
+                (k.flags & 8u) != 0, (k.flags & 16u) != 0);
+            break;
+        case MirKind::FaBwd: {
+            const std::uint32_t hd = k.op & 0xffffu;
+            const std::uint32_t hdp = (k.op >> 16) & 0xffffu;
+            const std::uint32_t br = static_cast<std::uint32_t>(k.aux & 0xffffu);
+            const std::uint32_t bc = static_cast<std::uint32_t>((k.aux >> 16) & 0xffffu);
+            const std::uint32_t mode = k.flags & 0x0fu;
+            const bool has_mask = (k.flags & 0x10u) != 0;
+            const std::uint32_t pass = (k.flags >> 5) & 0x01u;
+            fn = kernels::build_fa_bwd_mir(mod, k.dt0, k.lanes, hd, hdp, br, bc, mode, has_mask, pass);
+            break;
+        }
     }
     brass::target::MslOptions opts;
-    opts.workgroup_x = block_for(k.kind);
+    opts.workgroup_x = block_for(k);
     auto entry = std::make_unique<MirEntry>();
     entry->msl = brass::target::MslTarget::compile(*fn, opts);
     @autoreleasepool {
@@ -738,6 +800,49 @@ void mir_dispatch_args(const MirKernel& mk, std::uint32_t gx, const char* op,
                        std::span<const std::int32_t> ints,
                        std::span<const float> flts) {
     mir_dispatch_args_3d(mk, gx, 1u, 1u, op, ptrs, ints, flts);
+}
+
+void mir_dispatch_mtl_3d(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                         std::uint32_t gz,
+                         const void* const* mtl_bufs, const std::size_t* mtl_offs,
+                         std::size_t nbufs,
+                         std::span<const std::int32_t> ints,
+                         std::span<const float> flts) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    std::size_t s = 0;
+    for (std::int32_t v : ints) put_scalar(buf, e.msl, s++, v);
+    for (float f : flts) put_scalar(buf, e.msl, s++, f);
+    @autoreleasepool {
+        id<MTLBuffer> fb_buf = nil;
+        NSUInteger fb_ofs = 0;
+        for (std::size_t i = 0; i < nbufs; ++i) {
+            if (mtl_bufs[i]) {
+                fb_buf = (__bridge id<MTLBuffer>)mtl_bufs[i];
+                fb_ofs = static_cast<NSUInteger>(mtl_offs[i]);
+                break;
+            }
+        }
+        id<MTLCommandBuffer> cmd = new_command_buffer();
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:e.pso];
+        for (std::size_t i = 0; i < nbufs; ++i) {
+            id<MTLBuffer> b = mtl_bufs[i] ? (__bridge id<MTLBuffer>)mtl_bufs[i] : fb_buf;
+            NSUInteger o = mtl_bufs[i] ? static_cast<NSUInteger>(mtl_offs[i]) : fb_ofs;
+            [enc setBuffer:b offset:o atIndex:i];
+        }
+        if (e.msl.scalar_params_bytes > 0) {
+            [enc setBytes:buf.data()
+                   length:e.msl.scalar_params_bytes
+                  atIndex:e.msl.num_buffers];
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
+            threadsPerThreadgroup:MTLSizeMake(e.msl.workgroup_x,
+                                              e.msl.workgroup_y,
+                                              e.msl.workgroup_z)];
+        [enc endEncoding];
+        ::brotensor::metal_impl::submit(cmd);
+    }
 }
 
 void mir_dispatch_dequant(std::uint32_t fmt, const char* op,

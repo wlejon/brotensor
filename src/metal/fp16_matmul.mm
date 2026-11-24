@@ -1,24 +1,40 @@
-// The A @ B^T launchers behind matmul_abt and the batched linears / attention
-// GEMMs (see fp16_matmul.h). Every input type with K > 0 rides the simdgroup
-// GEMM in gemm_fp32.mm (half tiles for FP16 x FP16, float tiles otherwise,
-// FP32 accumulate throughout); small outputs and K == 0 take the
-// one-thread-per-output naive kernel below, which carries the same contract.
+// The A @ B^T launchers behind matmul_abt, batched linears, and attention GEMMs
+// (see fp16_matmul.h).
+//   - Decode GEMV (M in 1..8, NT, batch=1, alpha=1, matching A/C dtype):
+//     MirKind::Gemv (src/kernels/mir_gemv.h) via launch_gemm_fp32
+//   - Prefill / large GEMM (K > 0, M*N >= 1024 or alpha != 1):
+//     Metal simdgroup_matrix 64x64 tiled GEMM (src/metal/gemm_fp32.mm)
+//   - Small / K == 0 fallback:
+//     MirKind::GemmSimt (src/kernels/mir_gemm_simt.h), with GLU epilogues via
+//     FP32 scratch + MirKind::Glu preserving original dt_bias.
 
 #include "fp16_matmul.h"
+#include "mtl_mir_cache.h"
+
+#include "../vulkan/shaders/op_codes.h"
 
 #import "internal.h"
 
-#include <mutex>
+#include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 
 namespace brotensor::metal_impl {
 
 namespace {
 
-constexpr size_t kTiledMin = 1024;   // below this M*N (and M > 8), the naive path wins
+constexpr size_t kTiledMin = 1024;
 
-// The public matmul_abt contract (row-major A (M, K), B (N, K), C (M, N) per
-// batch matrix) as an AbtMixed.
+::brotensor::Dtype to_dtype(AbtType t) {
+    switch (t) {
+        case kAbtF16:  return ::brotensor::Dtype::FP16;
+        case kAbtBF16: return ::brotensor::Dtype::BF16;
+        default:       return ::brotensor::Dtype::FP32;
+    }
+}
+
+size_t elem_size(::brotensor::Dtype dt) { return dt == ::brotensor::Dtype::FP32 ? 4u : 2u; }
+
 AbtMixed abt_plain(AbtType t, id<MTLBuffer> A, NSUInteger ofs_A, id<MTLBuffer> B, NSUInteger ofs_B,
                    id<MTLBuffer> C, NSUInteger ofs_C, int batch, int M, int N, int K, uint64_t strideA,
                    uint64_t strideB, uint64_t strideC, id<MTLBuffer> bias, NSUInteger ofs_bias, bool has_bias,
@@ -39,7 +55,104 @@ AbtMixed abt_plain(AbtType t, id<MTLBuffer> A, NSUInteger ofs_A, id<MTLBuffer> B
     return g;
 }
 
-} // namespace
+void run_glu_mtl(std::uint32_t glu_op, ::brotensor::Dtype dt_out,
+                 id<MTLBuffer> bX, NSUInteger oX, id<MTLBuffer> bY, NSUInteger oY,
+                 int rows, int half_n) {
+    using namespace ::brotensor::detail::metal;
+    const std::uint32_t n = static_cast<std::uint32_t>(rows) * static_cast<std::uint32_t>(half_n);
+    const int lanes = (glu_op != GLU_GEGLU_PAIRS)
+                          ? mir_vec_lanes_mixed(::brotensor::Dtype::FP32, dt_out,
+                                                static_cast<std::uint32_t>(half_n), oX, oY)
+                          : 1;
+    const MirKernel mk = mir_kernel(
+        {MirKind::Glu, glu_op, ::brotensor::Dtype::FP32, dt_out, static_cast<std::uint8_t>(lanes)});
+    const void* bufs[3] = {(__bridge const void*)bX, (__bridge const void*)bX,
+                           (__bridge const void*)bY};
+    const std::size_t offs[3] = {oX, oX, oY};
+    const std::int32_t ints[2] = {static_cast<std::int32_t>(n), half_n};
+    mir_dispatch_mtl_3d(mk, mir_groups_1d(n, lanes), 1u, 1u, bufs, offs, 3, ints, {});
+}
+
+void run_gemm_simt(const AbtMixed& g) {
+    using namespace ::brotensor::detail::metal;
+    const ::brotensor::Dtype da = to_dtype(g.in);
+    const ::brotensor::Dtype db = to_dtype(g.in_B < 0 ? g.in : static_cast<AbtType>(g.in_B));
+    const ::brotensor::Dtype dc_orig = to_dtype(g.out);
+    const ::brotensor::Dtype dt_bias = da;  // AbtMixed contract: bias has A's dtype
+    const bool glu = (g.epilogue == kAbtGeglu || g.epilogue == kAbtSwiglu);
+
+    ::brotensor::Dtype dc = dc_orig;
+    id<MTLBuffer> bC = g.C;
+    NSUInteger oC = g.ofs_C;
+    uint64_t ldc = g.ldc;
+    uint64_t sc = g.strideC;
+    ::brotensor::Tensor scratch;
+    if (glu) {
+        scratch = ::brotensor::Tensor::empty_on(
+            ::brotensor::Device::Metal, g.batch * g.M, g.N, ::brotensor::Dtype::FP32);
+        dc = ::brotensor::Dtype::FP32;
+        bC = buffer_for(scratch);
+        oC = buffer_offset_for(scratch);
+        ldc = static_cast<uint64_t>(g.N);
+        sc = static_cast<uint64_t>(g.M) * static_cast<uint64_t>(g.N);
+    }
+
+    const std::uint32_t epi = static_cast<std::uint32_t>(glu ? EPI_STORE : g.epilogue);
+    const std::uint32_t op = epi | (static_cast<std::uint32_t>(g.act) << 4) |
+                             (static_cast<std::uint32_t>(dt_bias) << 8);
+    const std::uint8_t flags = static_cast<std::uint8_t>(
+        (g.transA ? 2u : 0u) | (g.transB ? 4u : 0u) | (g.bias ? 8u : 0u));
+    const MirKernel mk = mir_kernel({MirKind::GemmSimt, op, da, db, 1, dc, flags});
+    const std::uint32_t gx = static_cast<std::uint32_t>((g.N + 63) / 64);
+    const std::uint32_t gy = static_cast<std::uint32_t>((g.M + 63) / 64);
+    const size_t esa = elem_size(da), esb = elem_size(db), esc = elem_size(dc);
+    const int k_clamped = g.K < 0 ? 0 : g.K;
+    for (int z0 = 0; z0 < g.batch; z0 += 65535) {
+        const int nz = std::min(65535, g.batch - z0);
+        const void* bufs[4] = {
+            (__bridge const void*)g.A, (__bridge const void*)g.B,
+            (__bridge const void*)bC, (__bridge const void*)g.bias,
+        };
+        const std::size_t offs[4] = {
+            g.ofs_A + static_cast<std::size_t>(z0) * g.strideA * esa,
+            g.ofs_B + static_cast<std::size_t>(z0) * g.strideB * esb,
+            oC + static_cast<std::size_t>(z0) * sc * esc,
+            g.ofs_bias,
+        };
+        const std::int32_t ints[9] = {
+            g.M, g.N, k_clamped,
+            static_cast<std::int32_t>(g.lda), static_cast<std::int32_t>(g.ldb),
+            static_cast<std::int32_t>(ldc), static_cast<std::int32_t>(g.strideA),
+            static_cast<std::int32_t>(g.strideB), static_cast<std::int32_t>(sc),
+        };
+        mir_dispatch_mtl_3d(mk, gx, gy, static_cast<std::uint32_t>(nz), bufs, offs, 4, ints, {});
+    }
+
+    if (glu) {
+        const int half_n = g.N / 2;
+        const std::uint32_t glu_op = (g.epilogue == kAbtGeglu) ? GLU_GEGLU_PAIRS : GLU_SWIGLU;
+        const size_t es_out = elem_size(dc_orig);
+        for (int b = 0; b < g.batch; ++b) {
+            run_glu_mtl(glu_op, dc_orig,
+                        bC, oC + static_cast<NSUInteger>(b) * sc * sizeof(float),
+                        g.C, g.ofs_C + static_cast<NSUInteger>(b) * g.strideC * es_out,
+                        g.M, half_n);
+        }
+    }
+}
+
+bool gemv_mir_eligible(const AbtMixed& g) {
+    if (g.transA || g.transB || g.batch != 1 || g.M < 1 || g.M > 8 || g.K <= 0 || g.alpha != 1.0f)
+        return false;
+    if (g.epilogue < kAbtStore || g.epilogue > kAbtSwiglu) return false;
+    const ::brotensor::Dtype da = to_dtype(g.in);
+    const ::brotensor::Dtype db = to_dtype(g.in_B < 0 ? g.in : static_cast<AbtType>(g.in_B));
+    const ::brotensor::Dtype dc = to_dtype(g.out);
+    if (da != dc) return false;
+    return db == da || (da == ::brotensor::Dtype::FP32 && db != ::brotensor::Dtype::FP32);
+}
+
+}  // namespace
 
 void launch_matmul_abt_fp16_ex(id<MTLBuffer> A, NSUInteger ofs_A,
                                id<MTLBuffer> B, NSUInteger ofs_B,
@@ -63,122 +176,6 @@ void launch_matmul_abt_bf16_ex(id<MTLBuffer> A, NSUInteger ofs_A,
                                       strideC, bias, ofs_bias, has_bias, act));
 }
 
-// ─── Mixed-precision A @ B^T (see fp16_matmul.h) ────────────────────────────
-
-namespace {
-
-NSString* const kMixSrc = @R"msl(
-#include <metal_stdlib>
-using namespace metal;
-
-struct MixParams {
-    uint  M, N, K, has_bias;
-    int   act, epi;
-    float alpha;
-    uint  trans;     // bit 0: A stored (K, M); bit 1: B stored (K, N)
-    ulong lda, ldb, ldc, sA, sB, sC;
-};
-
-// Element (row, k) of an operand stored row-major, or transposed.
-inline ulong mix_at(bool t, uint row, uint k, ulong ld) { return t ? ulong(k) * ld + row : ulong(row) * ld + k; }
-
-// A & S 7.1.26, |err| < 1.5e-7 (MSL has no erf).
-inline float mix_erf(float x) {
-    const float t = 1.0f / (1.0f + 0.3275911f * fabs(x));
-    const float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t
-                             - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
-    return x < 0.0f ? -y : y;
-}
-inline float mix_gelu_erf(float v) { return 0.5f * v * (1.0f + mix_erf(v * 0.70710678118654752f)); }
-inline float mix_act(int act, float v) {
-    switch (act) {
-        case 1: return max(v, 0.0f);
-        case 2: {
-            const float u = 0.7978845608f * (v + 0.044715f * v * v * v);
-            return 0.5f * v * (1.0f + tanh(clamp(u, -9.0f, 9.0f)));
-        }
-        case 3: return mix_gelu_erf(v);
-        case 4: return v / (1.0f + exp(-v));
-        case 5: return v / (1.0f + exp(-1.702f * v));
-        default: return v;
-    }
-}
-
-// r = act(alpha * acc + bias[n]); the epilogue then stores / adds / gates it.
-template <typename TI>
-inline float mix_pre(float acc, uint n, device const TI* bias, constant MixParams& p) {
-    float v = acc * p.alpha;
-    if (p.has_bias) v += float(bias[n]);
-    return mix_act(p.act, v);
-}
-
-template <typename TI, typename TO>
-kernel void k_abt_mixed_naive(device const TI* A    [[buffer(0)]],
-                              device const TI* B    [[buffer(1)]],
-                              device TO*       C    [[buffer(2)]],
-                              device const TI* bias [[buffer(3)]],
-                              constant MixParams& p [[buffer(4)]],
-                              uint2 gid [[thread_position_in_grid]]) {
-    const bool geglu = p.epi == 2;
-    const uint cols = geglu ? p.N / 2 : p.N;
-    if (gid.x >= p.M * cols) return;
-    const uint m = gid.x / cols, j = gid.x % cols;
-    const bool ta = (p.trans & 1u) != 0u, tb = (p.trans & 2u) != 0u;
-    device const TI* Ab = A + (ulong)gid.y * p.sA;
-    device const TI* Bb = B + (ulong)gid.y * p.sB;
-    device TO* c = C + (ulong)gid.y * p.sC + (ulong)m * p.ldc + j;
-    if (geglu) {
-        const uint n0 = 2 * j;
-        float a0 = 0.0f, a1 = 0.0f;
-        for (uint k = 0; k < p.K; ++k) {
-            const float a = float(Ab[mix_at(ta, m, k, p.lda)]);
-            a0 += a * float(Bb[mix_at(tb, n0, k, p.ldb)]);
-            a1 += a * float(Bb[mix_at(tb, n0 + 1, k, p.ldb)]);
-        }
-        *c = TO(mix_pre(a0, n0, bias, p) * mix_gelu_erf(mix_pre(a1, n0 + 1, bias, p)));
-        return;
-    }
-    float acc = 0.0f;
-    for (uint k = 0; k < p.K; ++k) acc += float(Ab[mix_at(ta, m, k, p.lda)]) * float(Bb[mix_at(tb, j, k, p.ldb)]);
-    float v = mix_pre(acc, j, bias, p);
-    if (p.epi == 1) v += float(*c);
-    *c = TO(v);
-}
-
-#define MIX_INST(TI, TO, SUF)                                                                           \
-template [[host_name("k_abt_mixed_naive_" SUF)]] kernel void k_abt_mixed_naive<TI, TO>(                 \
-    device const TI*, device const TI*, device TO*, device const TI*, constant MixParams&, uint2);
-MIX_INST(half, half, "0_0")
-MIX_INST(half, bfloat, "0_1")
-MIX_INST(half, float, "0_2")
-MIX_INST(bfloat, half, "1_0")
-MIX_INST(bfloat, bfloat, "1_1")
-MIX_INST(bfloat, float, "1_2")
-MIX_INST(float, half, "2_0")
-MIX_INST(float, bfloat, "2_1")
-MIX_INST(float, float, "2_2")
-)msl";
-
-// Must match the MSL `MixParams` byte-for-byte.
-struct MixParams {
-    uint32_t M, N, K, has_bias;
-    int32_t  act, epi;
-    float    alpha;
-    uint32_t trans;
-    uint64_t lda, ldb, ldc, sA, sB, sC;
-};
-
-id<MTLComputePipelineState> pso_naive(int in, int out) {
-    static std::once_flag once[3][3];
-    static id<MTLComputePipelineState> pso[3][3];
-    std::call_once(once[in][out], [&] {
-        pso[in][out] = compile_pipeline(kMixSrc, [NSString stringWithFormat:@"k_abt_mixed_naive_%d_%d", in, out]);
-    });
-    return pso[in][out];
-}
-
-} // namespace
-
 AbtType abt_type(::brotensor::Dtype dt) {
     switch (dt) {
         case ::brotensor::Dtype::FP16: return kAbtF16;
@@ -190,54 +187,45 @@ AbtType abt_type(::brotensor::Dtype dt) {
 
 void launch_matmul_abt_mixed(const AbtMixed& g) {
     if (g.batch <= 0 || g.M <= 0 || g.N <= 0) return;
-    if (g.epilogue == kAbtGeglu && (g.N % 2) != 0)
-        throw std::runtime_error("brotensor (Metal): matmul_abt_mixed: GeGLU needs an even N");
-    MixParams p{};
-    p.M = static_cast<uint32_t>(g.M);
-    p.N = static_cast<uint32_t>(g.N);
-    p.K = static_cast<uint32_t>(g.K < 0 ? 0 : g.K);
-    p.has_bias = g.bias ? 1u : 0u;
-    p.act = g.act;
-    p.epi = g.epilogue;
-    p.alpha = g.alpha;
-    p.trans = (g.transA ? 1u : 0u) | (g.transB ? 2u : 0u);
-    p.lda = g.lda;
-    p.ldb = g.ldb;
-    p.ldc = g.ldc;
-    p.sA = g.strideA;
-    p.sB = g.strideB;
-    p.sC = g.strideC;
-    id<MTLBuffer> bBias = g.bias ? g.bias : g.A;
-    const NSUInteger oBias = g.bias ? g.ofs_bias : g.ofs_A;
+    if ((g.epilogue == kAbtGeglu || g.epilogue == kAbtSwiglu) && (g.N % 2) != 0)
+        throw std::runtime_error("brotensor (Metal): matmul_abt_mixed: GLU epilogue needs an even N");
 
-    // Every K > 0 product with M <= 8 (the skinny decode kernel) or a large
-    // enough output takes the simdgroup GEMM (gemm_fp32.mm), as does any B
-    // typed apart from A, which the naive kernel does not carry.
+    // SwiGLU epilogue: decode M <= 8 fuses into MirKind::Gemv; larger shapes
+    // compute into FP32 scratch (preserving original bias dtype) and gate once.
+    if (g.epilogue == kAbtSwiglu) {
+        if (gemv_mir_eligible(g)) {
+            launch_gemm_fp32(g);
+            return;
+        }
+        ::brotensor::Tensor scratch = ::brotensor::Tensor::empty_on(
+            ::brotensor::Device::Metal, g.batch * g.M, g.N, ::brotensor::Dtype::FP32);
+        AbtMixed s = g;
+        s.C = buffer_for(scratch);
+        s.ofs_C = buffer_offset_for(scratch);
+        s.ldc = static_cast<uint64_t>(g.N);
+        s.strideC = static_cast<uint64_t>(g.M) * static_cast<uint64_t>(g.N);
+        s.out = kAbtF32;
+        s.epilogue = kAbtStore;
+        launch_matmul_abt_mixed(s);
+        const ::brotensor::Dtype dc_orig = to_dtype(g.out);
+        const size_t es_out = elem_size(dc_orig);
+        for (int b = 0; b < g.batch; ++b) {
+            run_glu_mtl(GLU_SWIGLU, dc_orig,
+                        s.C, s.ofs_C + static_cast<NSUInteger>(b) * s.strideC * sizeof(float),
+                        g.C, g.ofs_C + static_cast<NSUInteger>(b) * g.strideC * es_out,
+                        g.M, g.N / 2);
+        }
+        return;
+    }
+
     const bool mixed_b = g.in_B >= 0 && g.in_B != g.in;
-    if (p.K > 0 &&
-        (mixed_b || g.M <= 8 || static_cast<size_t>(g.M) * static_cast<size_t>(g.N) >= kTiledMin)) {
+    if (g.K > 0 &&
+        (g.alpha != 1.0f || mixed_b || g.M <= 8 ||
+         static_cast<size_t>(g.M) * static_cast<size_t>(g.N) >= kTiledMin)) {
         launch_gemm_fp32(g);
         return;
     }
-    id<MTLComputePipelineState> pso = pso_naive(g.in, g.out);
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:g.A offset:g.ofs_A atIndex:0];
-        [enc setBuffer:g.B offset:g.ofs_B atIndex:1];
-        [enc setBuffer:g.C offset:g.ofs_C atIndex:2];
-        [enc setBuffer:bBias offset:oBias atIndex:3];
-        [enc setBytes:&p length:sizeof(MixParams) atIndex:4];
-        const NSUInteger cols = g.epilogue == kAbtGeglu ? static_cast<NSUInteger>(g.N / 2)
-                                                         : static_cast<NSUInteger>(g.N);
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > 256) tg = 256;
-        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(g.M) * cols, static_cast<NSUInteger>(g.batch), 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
+    run_gemm_simt(g);
 }
 
-} // namespace brotensor::metal_impl
+}  // namespace brotensor::metal_impl

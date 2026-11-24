@@ -2,66 +2,16 @@
 
 #include <cstdio>
 #include <stdexcept>
-#include <unordered_map>
 #include <string>
-
-// All in-process MSL kernel sources. Compiled once at first cuda_init().
-// Pipelines are cached in a name → MTLComputePipelineState map.
-//
-// We keep the source in one big string so newLibraryWithSource: only fires
-// once; individual kernels are looked up by function name.
-
-static NSString* const kKernelsMSL = @R"msl(
-#include <metal_stdlib>
-using namespace metal;
-
-// ── linear (small kernels for forward/backward; MPSGraph would also work) ──
-
-// dW[i, j] += dY[i] * x[j]. Threads cover (i, j) with i = tid.y, j = tid.x.
-kernel void k_linear_backward_dw(device const float* dY [[buffer(0)]],
-                                 device const float* x  [[buffer(1)]],
-                                 device float*       dW [[buffer(2)]],
-                                 constant uint& out_dim [[buffer(3)]],
-                                 constant uint& in_dim  [[buffer(4)]],
-                                 uint2 gid [[thread_position_in_grid]]) {
-    uint j = gid.x; uint i = gid.y;
-    if (i >= out_dim || j >= in_dim) return;
-    dW[(ulong)i * in_dim + j] += dY[i] * x[j];
-}
-
-// dB[i] += dY[i]
-kernel void k_linear_backward_db(device const float* dY [[buffer(0)]],
-                                 device float*       dB [[buffer(1)]],
-                                 constant uint& out_dim [[buffer(2)]],
-                                 uint i [[thread_position_in_grid]]) {
-    if (i >= out_dim) return;
-    dB[i] += dY[i];
-}
-
-)msl";
 
 namespace brotensor::metal_impl {
 
-namespace {
-struct PipelineCache {
-    std::unordered_map<std::string, void*> map; // void* holds +1 retain
-    id<MTLLibrary> lib = nil;
-};
-PipelineCache& cache() { static PipelineCache c; return c; }
-} // namespace
-
 id<MTLComputePipelineState> pipeline(NSString* name) {
-    auto& C = cache();
-    std::string key = [name UTF8String];
-    auto it = C.map.find(key);
-    if (it == C.map.end()) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-                      "Metal: unknown kernel `%s` (not in pipeline cache)",
-                      key.c_str());
-        throw std::runtime_error(buf);
-    }
-    return (__bridge id<MTLComputePipelineState>)it->second;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "Metal: unknown kernel `%s` (precompiled cache removed)",
+                  [name UTF8String]);
+    throw std::runtime_error(buf);
 }
 
 id<MTLComputePipelineState> compile_pipeline(NSString* msl_source,
@@ -110,56 +60,14 @@ void dispatch1d_sync(NSString* pipeline_name,
         bind(enc);
         NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
         if (tg > 256) tg = 256;
-        MTLSize grid = MTLSizeMake(n, 1, 1);
-        MTLSize tgsize = MTLSizeMake(tg, 1, 1);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tgsize];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
     }
 }
 
-} // namespace brotensor::metal_impl
+}  // namespace brotensor::metal_impl
 
-// Called once from cuda_init() (extern from runtime.mm).
 extern "C++" void metal_build_pipelines_();
-void metal_build_pipelines_() {
-    using namespace brotensor::metal_impl;
-    auto& C = cache();
-    if (C.lib != nil) return;
-    @autoreleasepool {
-        NSError* err = nil;
-        MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-        opts.languageVersion = MTLLanguageVersion3_1;
-        id<MTLLibrary> lib = [device() newLibraryWithSource:kKernelsMSL
-                                                    options:opts
-                                                      error:&err];
-        if (!lib) {
-            std::string m = "Metal: kernel library compile failed: ";
-            if (err) m += [[err localizedDescription] UTF8String];
-            throw std::runtime_error(m);
-        }
-        C.lib = lib;
-
-        NSArray<NSString*>* names = @[
-            @"k_linear_backward_dw", @"k_linear_backward_db",
-        ];
-        for (NSString* n in names) {
-            id<MTLFunction> fn = [lib newFunctionWithName:n];
-            if (!fn) {
-                std::string m = "Metal: kernel not found: ";
-                m += [n UTF8String];
-                throw std::runtime_error(m);
-            }
-            NSError* perr = nil;
-            id<MTLComputePipelineState> pso =
-                [device() newComputePipelineStateWithFunction:fn error:&perr];
-            if (!pso) {
-                std::string m = "Metal: pipeline build failed for ";
-                m += [n UTF8String];
-                if (perr) { m += ": "; m += [[perr localizedDescription] UTF8String]; }
-                throw std::runtime_error(m);
-            }
-            C.map.emplace([n UTF8String], (__bridge_retained void*)pso);
-        }
-    }
-}
+void metal_build_pipelines_() {}

@@ -38,9 +38,13 @@
 // by the caller (conv2d.mm) through the batch axis, then folded.
 
 #include "fp16_matmul.h"
+#include "mtl_mir_cache.h"
+
+#include "../vulkan/shaders/op_codes.h"
 
 #import "internal.h"
 
+#include <algorithm>
 #include <mutex>
 #include <unordered_map>
 
@@ -234,125 +238,6 @@ kernel void k_gemm_tiled(device const TIA* A    [[buffer(0)]],
         }
     }
 }
-
-// ---- Skinny M (decode rows): B streams once, all M rows ride in registers ----
-constant constexpr int SK_MAX_M = 8;
-constant constexpr int SK_NT = 256;
-constant constexpr int SK_COLS = 64;            // (K, N) B: columns per threadgroup
-constant constexpr int SK_KL = SK_NT / (SK_COLS / 4);   // 16 K lanes
-constant constexpr int SK_KC = 512;             // (N, K) B: A columns staged per step
-
-// src[0 .. 3] as floats, zeros past the first n (n may exceed 4).
-template <typename TX>
-inline float4 g_row4(device const TX* src, bool vec_ok, uint n) {
-    if (vec_ok && n >= 4) return float4(*reinterpret_cast<device const vec<TX, 4>*>(src));
-    float4 v = 0.0f;
-    G_UNROLL for (int i = 0; i < 4; ++i) if (uint(i) < n) v[i] = float(src[i]);
-    return v;
-}
-
-[[max_total_threads_per_threadgroup(SK_NT)]]
-kernel void k_gemm_skinny(device const TIA* A    [[buffer(0)]],
-                          device const TIB* B    [[buffer(1)]],
-                          device TO*        C    [[buffer(2)]],
-                          device const TIA* bias [[buffer(3)]],
-                          constant GemmParams& p [[buffer(4)]],
-                          uint3  tg_pos [[threadgroup_position_in_grid]],
-                          ushort tid    [[thread_index_in_threadgroup]],
-                          ushort sg_id  [[simdgroup_index_in_threadgroup]],
-                          ushort lane   [[thread_index_in_simdgroup]]) {
-    const uint M = p.M, N = p.N, K = p.K;
-    device const TIA* Ab = A + ulong(tg_pos.z) * p.sA;
-    device const TIB* Bb = B + ulong(tg_pos.z) * p.sB;
-    device TO*        Cb = C + ulong(tg_pos.z) * p.sC;
-    const bool va = (p.vec & 1u) != 0u, vb = (p.vec & 2u) != 0u;
-    if (TB) {
-        // B (K, N): thread (kl, cg) owns columns n0 .. n0 + 3 over the K rows
-        // kl, kl + 16, ...; a simdgroup reads two whole 256-byte row segments.
-        // The 16 K lanes then reduce through threadgroup memory.
-        threadgroup float red[SK_KL][SK_COLS];
-        const uint kl = tid / (SK_COLS / 4), cg = tid % (SK_COLS / 4);
-        const uint n0 = tg_pos.x * SK_COLS + cg * 4;
-        const uint nv = n0 < N ? N - n0 : 0u;
-        float4 acc[SK_MAX_M];
-        G_UNROLL for (int m = 0; m < SK_MAX_M; ++m) acc[m] = 0.0f;
-        // One K row per step: unrolling K here measured up to 2x slower.
-        for (uint k = kl; k < K; k += SK_KL) {
-            const float4 b = g_row4(Bb + ulong(k) * p.ldb + n0, vb, nv);
-            G_UNROLL for (int m = 0; m < SK_MAX_M; ++m)
-                if (uint(m) < M) acc[m] += float(Ab[G_AT(TA, uint(m), k, p.lda)]) * b;
-        }
-        for (uint m = 0; m < M; ++m) {
-            *reinterpret_cast<threadgroup float4*>(&red[kl][cg * 4]) = acc[m];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid < SK_COLS) {
-                float r = 0.0f;
-                G_UNROLL for (int l = 0; l < SK_KL; ++l) r += red[l][tid];
-                const uint n = tg_pos.x * SK_COLS + tid;
-                if (n < N) g_store1(Cb, m, n, r, bias, p);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        return;
-    }
-    // B (N, K): one simdgroup per column n; lanes take four K each, then
-    // reduce. A single row (decode GEMV) is read straight from device memory;
-    // several rows ride threadgroup memory SK_KC columns at a time, so the
-    // eight simdgroups share one read of them (1.6x at M = 8; for one row the
-    // barriers cost more than they save).
-    const uint n = tg_pos.x * (SK_NT / 32) + sg_id;
-    const bool live = n < N;
-    device const TIB* brow = Bb + ulong(live ? n : 0u) * p.ldb;
-    if (M == 1) {
-        if (!live) return;
-        float acc = 0.0f;
-        for (uint k = lane * 4; k < K; k += 128) {
-            float4 a;
-            if (TA) {
-                a = 0.0f;
-                G_UNROLL for (int i = 0; i < 4; ++i) if (k + uint(i) < K) a[i] = float(Ab[ulong(k + i) * p.lda]);
-            } else {
-                a = g_row4(Ab + k, va, K - k);
-            }
-            acc += dot(a, g_row4(brow + k, vb, K - k));
-        }
-        const float s = simd_sum(acc);
-        if (lane == 0) g_store1(Cb, 0, n, s, bias, p);
-        return;
-    }
-    threadgroup float4 As4[SK_MAX_M][SK_KC / 4];
-    float acc[SK_MAX_M];
-    G_UNROLL for (int m = 0; m < SK_MAX_M; ++m) acc[m] = 0.0f;
-    for (uint k0 = 0; k0 < K; k0 += SK_KC) {
-        for (uint i = tid; i < M * (SK_KC / 4); i += SK_NT) {
-            const uint m = i / (SK_KC / 4), k = k0 + (i % (SK_KC / 4)) * 4;
-            float4 a = 0.0f;
-            if (TA) {
-                G_UNROLL for (int j = 0; j < 4; ++j) if (k + uint(j) < K) a[j] = float(Ab[ulong(k + j) * p.lda + m]);
-            } else if (k < K) {
-                a = g_row4(Ab + ulong(m) * p.lda + k, va, K - k);
-            }
-            As4[m][i % (SK_KC / 4)] = a;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (live) {
-            G_UNROLL for (int s = 0; s < SK_KC / 128; ++s) {
-                const uint k = k0 + uint(s) * 128 + lane * 4;
-                if (k < K) {
-                    const float4 b = g_row4(brow + k, vb, K - k);
-                    G_UNROLL for (int m = 0; m < SK_MAX_M; ++m)
-                        if (uint(m) < M) acc[m] += dot(As4[m][s * 32 + lane], b);
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (!live) return;
-    for (uint m = 0; m < M; ++m) {
-        const float s = simd_sum(acc[m]);
-        if (lane == 0) g_store1(Cb, m, n, s, bias, p);
-    }
-}
 )msl";
 
 // Must match the MSL `GemmParams` byte-for-byte.
@@ -366,21 +251,25 @@ struct GemmParams {
 
 constexpr int kBM = 64, kBN = 64, kThreads = 128;
 constexpr size_t kBk32MinGroups = 192;
-constexpr int kSkinnyMaxM = 8, kSkinnyThreads = 256, kSkinnyCols = 64;
 
 const char* msl_type(AbtType t) {
     return t == kAbtF16 ? "half" : t == kAbtBF16 ? "bfloat" : "float";
 }
 
-// One pipeline per (kernel, layout, A / B / output type, K step) variant. bk
-// is 16 or 32 (32 only for half tiles in the tiled kernel).
-id<MTLComputePipelineState> pso_for(bool skinny, bool ta, bool tb, AbtType in_a, AbtType in_b, AbtType out,
-                                    int bk) {
+::brotensor::Dtype abt_to_dtype(AbtType t) {
+    return t == kAbtF16 ? ::brotensor::Dtype::FP16
+         : t == kAbtBF16 ? ::brotensor::Dtype::BF16
+         : ::brotensor::Dtype::FP32;
+}
+
+// One pipeline per (layout, A / B / output type, K step) variant. bk is 16 or
+// 32 (32 only for half tiles on a large grid).
+id<MTLComputePipelineState> pso_for(bool ta, bool tb, AbtType in_a, AbtType in_b, AbtType out, int bk) {
     const bool half_tiles = in_a == kAbtF16 && in_b == kAbtF16;
-    if (!half_tiles || skinny) bk = 16;
+    if (!half_tiles) bk = 16;
     static std::mutex mu;
     static std::unordered_map<int, id<MTLComputePipelineState>> cache;
-    const int key = (skinny ? 1 : 0) | (ta ? 2 : 0) | (tb ? 4 : 0) | (int(in_a) << 3) | (int(in_b) << 5) |
+    const int key = (ta ? 2 : 0) | (tb ? 4 : 0) | (int(in_a) << 3) | (int(in_b) << 5) |
                     (int(out) << 7) | (bk == 32 ? 512 : 0);
     std::lock_guard<std::mutex> lock(mu);
     auto it = cache.find(key);
@@ -389,13 +278,11 @@ id<MTLComputePipelineState> pso_for(bool skinny, bool ta, bool tb, AbtType in_a,
                                                @"#define TO %s\n#define TS %s\n#define BKV %d\n%@",
                                                ta ? 1 : 0, tb ? 1 : 0, msl_type(in_a), msl_type(in_b), msl_type(out),
                                                half_tiles ? "half" : "float", bk, kSrc];
-    id<MTLComputePipelineState> pso = compile_pipeline(src, skinny ? @"k_gemm_skinny" : @"k_gemm_tiled");
+    id<MTLComputePipelineState> pso = compile_pipeline(src, @"k_gemm_tiled");
     cache.emplace(key, pso);
     return pso;
 }
 
-// True when every batch slice's rows of an operand start on a 4-element
-// boundary, so the kernel may read it four elements at a time.
 bool rows_vec4(NSUInteger ofs_bytes, size_t esz, uint64_t ld, uint64_t stride, int batch) {
     if (ofs_bytes % (4 * esz) != 0 || ld % 4 != 0) return false;
     return batch <= 1 || stride % 4 == 0;
@@ -403,10 +290,53 @@ bool rows_vec4(NSUInteger ofs_bytes, size_t esz, uint64_t ld, uint64_t stride, i
 
 size_t type_size(AbtType t) { return t == kAbtF32 ? 4 : 2; }
 
+bool try_mir_gemv(const AbtMixed& g, AbtType in_b) {
+    if (g.transA || g.transB || g.batch != 1 || g.M < 1 || g.M > 8 || g.K <= 0 || g.alpha != 1.0f)
+        return false;
+    if (g.epilogue < kAbtStore || g.epilogue > kAbtSwiglu) return false;
+    const ::brotensor::Dtype da = abt_to_dtype(g.in);
+    const ::brotensor::Dtype db = abt_to_dtype(in_b);
+    const ::brotensor::Dtype dc = abt_to_dtype(g.out);
+    if (da != dc) return false;
+    if (db != da && !(da == ::brotensor::Dtype::FP32 && db != ::brotensor::Dtype::FP32)) return false;
+    if (g.lda > 0x7fffffffULL || g.ldb > 0x7fffffffULL || g.ldc > 0x7fffffffULL) return false;
+
+    using namespace ::brotensor::detail::metal;
+    const std::uint32_t nout =
+        static_cast<std::uint32_t>((g.epilogue == kAbtGeglu || g.epilogue == kAbtSwiglu) ? g.N / 2 : g.N);
+    if (nout == 0) return true;
+    const bool vec = (g.ofs_A % 16u == 0u) && (g.ofs_B % 16u == 0u) &&
+                     (g.lda % 8u == 0u) && (g.ldb % 8u == 0u) && (g.K % 8 == 0);
+    const std::uint32_t op = static_cast<std::uint32_t>(g.M) |
+                             (static_cast<std::uint32_t>(g.epilogue) << 4) |
+                             (static_cast<std::uint32_t>(g.act) << 8);
+    const std::uint8_t flags = static_cast<std::uint8_t>((vec ? 1u : 0u) | (g.bias ? 2u : 0u));
+    const MirKernel mk = mir_kernel({MirKind::Gemv, op, da, db, 1, dc, flags});
+    const std::uint64_t groups = (static_cast<std::uint64_t>(nout) + 3u) / 4u;
+    const std::uint32_t gx = static_cast<std::uint32_t>(
+        std::max<std::uint64_t>(1u, std::min<std::uint64_t>(groups, 65535u)));
+    const std::uint32_t gy = static_cast<std::uint32_t>((groups + gx - 1u) / gx);
+    const void* bufs[4] = {
+        (__bridge const void*)g.A, (__bridge const void*)g.B,
+        (__bridge const void*)g.C, (__bridge const void*)g.bias,
+    };
+    const std::size_t offs[4] = {g.ofs_A, g.ofs_B, g.ofs_C, g.ofs_bias};
+    const std::int32_t ints[7] = {
+        g.M, g.N, g.K,
+        static_cast<std::int32_t>(g.lda), static_cast<std::int32_t>(g.ldb),
+        static_cast<std::int32_t>(g.ldc), g.N / 2,
+    };
+    mir_dispatch_mtl_3d(mk, gx, gy, 1u, bufs, offs, 4, ints, {});
+    return true;
+}
+
 } // namespace
 
 void launch_gemm_fp32(const AbtMixed& g) {
     if (g.batch <= 0 || g.M <= 0 || g.N <= 0 || g.K <= 0) return;
+    const AbtType in_b = g.in_B < 0 ? g.in : static_cast<AbtType>(g.in_B);
+    if (try_mir_gemv(g, in_b)) return;
+
     GemmParams p{};
     p.M = static_cast<uint32_t>(g.M);
     p.N = static_cast<uint32_t>(g.N);
@@ -421,19 +351,14 @@ void launch_gemm_fp32(const AbtMixed& g) {
     p.sA = g.strideA;
     p.sB = g.strideB;
     p.sC = g.strideC;
-    const AbtType in_b = g.in_B < 0 ? g.in : static_cast<AbtType>(g.in_B);
     p.vec = (rows_vec4(g.ofs_A, type_size(g.in), g.lda, g.strideA, g.batch) ? 1u : 0u) |
             (rows_vec4(g.ofs_B, type_size(in_b), g.ldb, g.strideB, g.batch) ? 2u : 0u);
     id<MTLBuffer> bBias = g.bias ? g.bias : g.A;
     const NSUInteger oBias = g.bias ? g.ofs_bias : g.ofs_A;
 
-    const bool skinny = g.M <= kSkinnyMaxM && g.epilogue != kAbtGeglu;
-    // Half tiles step K by 32 (the same 64-byte tile rows as float's 16),
-    // ~3% faster at 1024^3 and up; a grid of few threadgroups (fewer than
-    // ~10 per GPU core) is latency-bound instead, and BK 16 wins there by ~15%.
     const size_t tgs = static_cast<size_t>((g.N + kBN - 1) / kBN) * ((g.M + kBM - 1) / kBM) * g.batch;
     const int bk = tgs >= kBk32MinGroups ? 32 : 16;
-    id<MTLComputePipelineState> pso = pso_for(skinny, g.transA, g.transB, g.in, in_b, g.out, bk);
+    id<MTLComputePipelineState> pso = pso_for(g.transA, g.transB, g.in, in_b, g.out, bk);
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = new_command_buffer();
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -444,15 +369,9 @@ void launch_gemm_fp32(const AbtMixed& g) {
         [enc setBuffer:bBias offset:oBias atIndex:3];
         [enc setBytes:&p length:sizeof(GemmParams) atIndex:4];
         const NSUInteger nb = static_cast<NSUInteger>(g.batch);
-        if (skinny) {
-            const int cols_per_tg = g.transB ? kSkinnyCols : kSkinnyThreads / 32;
-            const NSUInteger gx = static_cast<NSUInteger>((g.N + cols_per_tg - 1) / cols_per_tg);
-            [enc dispatchThreadgroups:MTLSizeMake(gx, 1, nb) threadsPerThreadgroup:MTLSizeMake(kSkinnyThreads, 1, 1)];
-        } else {
-            const NSUInteger gx = static_cast<NSUInteger>((g.N + kBN - 1) / kBN);
-            const NSUInteger gy = static_cast<NSUInteger>((g.M + kBM - 1) / kBM);
-            [enc dispatchThreadgroups:MTLSizeMake(gx, gy, nb) threadsPerThreadgroup:MTLSizeMake(kThreads, 1, 1)];
-        }
+        const NSUInteger gx = static_cast<NSUInteger>((g.N + kBN - 1) / kBN);
+        const NSUInteger gy = static_cast<NSUInteger>((g.M + kBM - 1) / kBM);
+        [enc dispatchThreadgroups:MTLSizeMake(gx, gy, nb) threadsPerThreadgroup:MTLSizeMake(kThreads, 1, 1)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
     }

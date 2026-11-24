@@ -48,19 +48,9 @@ void linear_forward_batched_ex(const Tensor& W, const Tensor* bias, const Tensor
     if (X.cols != K) fail("X.cols must equal W.cols");
     if (bias && static_cast<long long>(bias->rows) * bias->cols != N) fail("bias size must equal W.rows");
     if (epilogue < 0 || epilogue > 3) fail("unknown epilogue");
-    if (epilogue == 2 && (act != 0 || N % 2 != 0)) fail("geglu needs act 0 and even W.rows");
-    if (epilogue == 3) {
-        if (act != 0 || N % 2 != 0) fail("swiglu needs act 0 and even W.rows");
-        if (M == 0 || N == 0) {
-            Y.resize(M, N / 2, dt);
-            return;
-        }
-        Tensor r = Tensor::empty_on(Device::Metal, M, N, dt);
-        detail::metal::linear_forward_batched_ex(W, bias, X, 0, 0, nullptr, r);
-        detail::metal::swiglu_forward(r, Y);
-        return;
-    }
-    const int out_cols = epilogue == 2 ? N / 2 : N;
+    if ((epilogue == 2 || epilogue == 3) && (act != 0 || N % 2 != 0))
+        fail(epilogue == 2 ? "geglu needs act 0 and even W.rows" : "swiglu needs act 0 and even W.rows");
+    const int out_cols = (epilogue == 2 || epilogue == 3) ? N / 2 : N;
     if (epilogue == 1) {
         if (Y.rows != M || Y.cols != N || Y.dtype != dt) fail("accumulate needs Y (B, out) in W's dtype");
     } else if (Y.rows != M || Y.cols != out_cols || Y.dtype != dt) {

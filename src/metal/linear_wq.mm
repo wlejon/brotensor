@@ -1,27 +1,16 @@
-// Weight-only INT8 / FP8 E4M3 on Metal: quantize_rows and
-// linear_forward_batched_wq_ex. Mirrors src/cuda/linear_wq.cu's contract;
-// the CPU twin (src/cpu/linear_wq.cpp) is the parity oracle.
-//
-// quantize_rows: one threadgroup per weight row reduces max|W| and writes the
-// row's scale and codes. The codes must be the CPU's byte for byte, so the
-// division is IEEE (precise::divide: the library is built with fast math),
-// INT8 rounds half to even (rint), and FP8 E4M3 is the host encoder's
-// bracket-and-round, ported as is.
-//
-// linear_forward_batched_wq_ex: decode-shaped. One simdgroup per output
-// column reads its weight row once, a byte per weight, and dots it against up
-// to eight input rows at a time (more rows in slices of eight), FP32
-// accumulation; the row scale multiplies the dot product, then bias,
-// activation and the epilogue (store, accumulate, GeGLU over the interleaved
-// pair 2j / 2j + 1, SwiGLU over the stacked halves j / j + N/2), as
-// linear_forward_batched_ex has them.
+// Weight-only INT8 / FP8 E4M3 on Metal: quantize_rows, dequantize_rows, and
+// linear_forward_batched_wq_ex — all backed by single-source brass MIR
+// (MirKind::WqRows and MirKind::GemvQ). Mirrors src/cuda/linear_wq.cu.
 
 #include "mtl_mir_cache.h"
+
+#include "../vulkan/shaders/op_codes.h"
 
 #include <brotensor/ops/linear.h>
 #include <brotensor/tensor.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -29,10 +18,8 @@
 
 namespace brotensor::detail::metal {
 
-using metal_impl::buffer_for;
-using metal_impl::buffer_offset_for;
-using metal_impl::compile_pipeline;
-using metal_impl::new_command_buffer;
+void linear_forward_batched_ex(const Tensor& W, const Tensor* bias, const Tensor& X, int act,
+                               int epilogue_flags, Tensor* workspace, Tensor& Y);  // linear_ex.mm
 
 namespace {
 
@@ -40,162 +27,76 @@ namespace {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + reason);
 }
 
-constexpr NSUInteger kColsPerTg = 8;      // simdgroups (output columns) per GEMV threadgroup
-
-NSString* const kSrc = @R"msl(
-#include <metal_stdlib>
-using namespace metal;
-
-// ── FP8 E4M3 (OCP e4m3fn), as src/tensor.cpp's host codec ──────────────────
-inline float e4m3_decode(uint b) {
-    const uint s = b >> 7, e = (b >> 3) & 15u, m = b & 7u;
-    float mag;
-    if (e == 0u) mag = float(m) * 0.001953125f;                          // m/8 * 2^-6
-    else         mag = as_type<float>(((e + 120u) << 23) | (m << 20));   // (1 + m/8) * 2^(e-7)
-    return s ? -mag : mag;
-}
-
-// ── linear_forward_batched_wq_ex: one simdgroup per output column ──────────
-struct WqParams {
-    uint M, N, K, out_cols;
-    uint fp8, has_bias;
-    int  act, epi;   // epi: 0 store, 1 accumulate, 2 GeGLU, 3 SwiGLU
-    uint vec;        // K % 8 == 0 and Wq / X aligned: 8 weights a lane a step
-};
-
-// A & S 7.1.26, |err| < 1.5e-7 (as gemm_fp32.mm).
-inline float w_erf(float x) {
-    const float t = 1.0f / (1.0f + 0.3275911f * fabs(x));
-    const float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t
-                             - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
-    return x < 0.0f ? -y : y;
-}
-inline float w_gelu_erf(float v) { return 0.5f * v * (1.0f + w_erf(v * 0.70710678118654752f)); }
-inline float w_act(int act, float v) {
-    switch (act) {
-        case 1: return max(v, 0.0f);
-        case 2: {
-            const float u = 0.7978845608f * (v + 0.044715f * v * v * v);
-            return 0.5f * v * (1.0f + tanh(clamp(u, -9.0f, 9.0f)));
-        }
-        case 3: return w_gelu_erf(v);
-        case 4: return v / (1.0f + exp(-v));
-        case 5: return v / (1.0f + exp(-1.702f * v));
-        default: return v;
-    }
-}
-inline float w_decode(uchar b, uint fp8) { return fp8 ? e4m3_decode(uint(b)) : float(char(b)); }
-// Four codes packed in a uint (little-endian: the first code lowest).
-inline float4 w_decode4(uint b, uint fp8) {
-    if (!fp8) return float4(as_type<char4>(b));
-    return float4(e4m3_decode(b & 255u), e4m3_decode((b >> 8) & 255u), e4m3_decode((b >> 16) & 255u),
-                  e4m3_decode(b >> 24));
-}
-
-constant constexpr uint ROWS = 8;   // input rows a weight row is read for at once
-
-template <typename T>
-void wq_gemv(device const uchar* Wq, device const float* scales, device const T* bias, device const T* X,
-             device T* Y, constant WqParams& p, uint col, uint lane) {
-    if (col >= p.out_cols) return;
-    const bool gated = p.epi >= 2;
-    // The weight rows this column reads: one, or the gated pair.
-    const uint n0 = p.epi == 2 ? 2u * col : col;
-    const uint n1 = p.epi == 2 ? 2u * col + 1u : col + p.out_cols;
-    device const uchar* w0 = Wq + ulong(n0) * p.K;
-    device const uchar* w1 = Wq + ulong(n1) * p.K;
-    for (uint m0 = 0; m0 < p.M; m0 += ROWS) {
-        const uint rows = min(ROWS, p.M - m0);
-        float a0[ROWS], a1[ROWS];
-        for (uint r = 0; r < ROWS; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; }
-        // Eight weights a lane a step (one 8-byte load, the simdgroup a
-        // 256-byte run of the row) and the eight inputs under them in two
-        // 4-wide loads; what K leaves past the last multiple of 8 a weight a
-        // lane, as before.
-        const uint K8 = p.vec ? (p.K & ~7u) : 0u;
-        for (uint k = lane * 8u; k < K8; k += 256u) {
-            const uint2 b0 = *reinterpret_cast<device const uint2*>(w0 + k);
-            const float4 w0a = w_decode4(b0.x, p.fp8), w0b = w_decode4(b0.y, p.fp8);
-            float4 w1a = 0.0f, w1b = 0.0f;
-            if (gated) {
-                const uint2 b1 = *reinterpret_cast<device const uint2*>(w1 + k);
-                w1a = w_decode4(b1.x, p.fp8);
-                w1b = w_decode4(b1.y, p.fp8);
-            }
-            for (uint r = 0; r < rows; ++r) {
-                device const vec<T, 4>* x4 = reinterpret_cast<device const vec<T, 4>*>(X + ulong(m0 + r) * p.K + k);
-                const float4 xa = float4(x4[0]), xb = float4(x4[1]);
-                a0[r] += dot(w0a, xa) + dot(w0b, xb);
-                if (gated) a1[r] += dot(w1a, xa) + dot(w1b, xb);
-            }
-        }
-        for (uint k = K8 + lane; k < p.K; k += 32u) {
-            const float wv0 = w_decode(w0[k], p.fp8);
-            const float wv1 = gated ? w_decode(w1[k], p.fp8) : 0.0f;
-            for (uint r = 0; r < rows; ++r) {
-                const float x = float(X[ulong(m0 + r) * p.K + k]);
-                a0[r] += wv0 * x;
-                if (gated) a1[r] += wv1 * x;
-            }
-        }
-        for (uint r = 0; r < rows; ++r) {
-            const float d0 = simd_sum(a0[r]);
-            const float d1 = gated ? simd_sum(a1[r]) : 0.0f;
-            if (lane != 0) continue;
-            float v0 = d0 * scales[n0];
-            if (p.has_bias) v0 += float(bias[n0]);
-            v0 = w_act(p.act, v0);
-            device T* out = Y + ulong(m0 + r) * p.out_cols + col;
-            if (gated) {
-                float v1 = d1 * scales[n1];
-                if (p.has_bias) v1 += float(bias[n1]);
-                v1 = w_act(p.act, v1);
-                *out = T(p.epi == 2 ? v0 * w_gelu_erf(v1) : (v0 / (1.0f + exp(-v0))) * v1);
-            } else if (p.epi == 1) {
-                *out = T(float(*out) + v0);
-            } else {
-                *out = T(v0);
-            }
-        }
-    }
-}
-
-#define WQ_KERNEL(NAME, T)                                                      \
-kernel void NAME(device const uchar* Wq [[buffer(0)]], device const float* scales [[buffer(1)]], \
-                 device const T* bias [[buffer(2)]], device const T* X [[buffer(3)]],          \
-                 device T* Y [[buffer(4)]], constant WqParams& p [[buffer(5)]],               \
-                 uint tg [[threadgroup_position_in_grid]],                       \
-                 uint sg [[simdgroup_index_in_threadgroup]],                     \
-                 uint lane [[thread_index_in_simdgroup]],                        \
-                 uint sgs [[simdgroups_per_threadgroup]]) {                      \
-    wq_gemv<T>(Wq, scales, bias, X, Y, p, tg * sgs + sg, lane);                  \
-}
-WQ_KERNEL(k_linear_wq_fp32, float)
-WQ_KERNEL(k_linear_wq_fp16, half)
-WQ_KERNEL(k_linear_wq_bf16, bfloat)
-)msl";
-
-#define DEF_PSO(NAME, FN)                                                      \
-    id<MTLComputePipelineState> NAME() {                                       \
-        static dispatch_once_t once;                                           \
-        static id<MTLComputePipelineState> pso;                                \
-        dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, FN); });          \
-        return pso;                                                            \
-    }
-DEF_PSO(pso_wq_fp32, @"k_linear_wq_fp32")
-DEF_PSO(pso_wq_fp16, @"k_linear_wq_fp16")
-DEF_PSO(pso_wq_bf16, @"k_linear_wq_bf16")
-#undef DEF_PSO
-
-// Mirrors the MSL struct.
-struct WqParams {
-    uint32_t M, N, K, out_cols;
-    uint32_t fp8, has_bias;
-    int32_t act, epi;
-    uint32_t vec;
-};
-
 }  // namespace
+
+void mir_dispatch_gemv_q(std::uint32_t fmt, Dtype dt, const char* op,
+                         const void* x, const void* w, const void* y,
+                         const void* bias, const void* scale,
+                         int rows, int k, int B, int ldx, int ldy,
+                         int rowbytes, int act, int epi) {
+    if (rows <= 0 || k <= 0 || B <= 0) return;
+    const bool byte_fmt = (fmt == QF_INT8 || fmt == QF_FP8);
+    const bool glu = (epi == EPI_GEGLU || epi == EPI_SWIGLU);
+    const std::uint32_t ie = (byte_fmt || fmt == QF_Q8_0) ? 16u : 32u;
+    const std::uint64_t items = static_cast<std::uint64_t>(k) / ie;
+    const std::uint32_t lpr = (items < 32u) ? 16u : 32u;
+    const std::uint32_t unr = (byte_fmt || fmt == QF_Q8_0) ? (k >= 4096 ? 4u : 2u) : 1u;
+
+    for (int m0 = 0; m0 < B; m0 += 8) {
+        const int mb = std::min(8, B - m0);
+        std::uint32_t nr = 2u;
+        if (byte_fmt || fmt == QF_Q8_0) nr = (k >= 4096) ? 1u : 2u;
+        else if (fmt == QF_Q4K) nr = 4u;
+        else nr = (mb >= 8) ? 4u : 2u;
+        if (glu && (nr < 2u || (nr & 1u) != 0u)) nr = 2u;
+
+        const void* x_ptr = static_cast<const char*>(x) + static_cast<std::size_t>(m0) * ldx * 2u;
+        const void* y_ptr = static_cast<const char*>(y) + static_cast<std::size_t>(m0) * ldy * 2u;
+        int eff_ldx = ldx;
+        Tensor xa;
+        const bool w_vec = !byte_fmt ||
+            (k % 16 == 0 && (reinterpret_cast<std::uintptr_t>(w) % 16u == 0u));
+        bool vec = w_vec;
+        if (vec && (reinterpret_cast<std::uintptr_t>(x_ptr) % 16u != 0u || eff_ldx % 8 != 0)) {
+            if (byte_fmt) {
+                vec = false;
+            } else {
+                xa = Tensor::empty_on(Device::Metal, mb, k, dt);
+                const int cl = mir_copy2d_lanes(2, static_cast<std::uint32_t>(k),
+                    static_cast<std::uint32_t>(eff_ldx), static_cast<std::uint32_t>(k),
+                    reinterpret_cast<std::uintptr_t>(x_ptr), reinterpret_cast<std::uintptr_t>(xa.data));
+                const MirKernel ck = mir_kernel({MirKind::Copy2d, 2u, Dtype::FP32, Dtype::FP32,
+                                                 static_cast<std::uint8_t>(cl)});
+                const std::uint32_t cgx = static_cast<std::uint32_t>(
+                    ((static_cast<std::uint64_t>(k) / cl) + 255u) / 256u);
+                mir_dispatch_copy2d(ck, std::max<std::uint32_t>(1u, cgx), static_cast<std::uint32_t>(mb),
+                                    op, x_ptr, xa.data, static_cast<std::uint32_t>(eff_ldx),
+                                    static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(k),
+                                    static_cast<std::uint32_t>(mb));
+                x_ptr = xa.data;
+                eff_ldx = k;
+            }
+        }
+
+        const std::uint32_t op_code = (fmt & 0x0fu) |
+                                      ((static_cast<std::uint32_t>(mb) & 0x0fu) << 4) |
+                                      ((unr & 0x0fu) << 8) |
+                                      ((nr & 0x0fu) << 12) |
+                                      ((static_cast<std::uint32_t>(act) & 0x0fu) << 16) |
+                                      ((static_cast<std::uint32_t>(epi) & 0x0fu) << 20);
+        const std::uint8_t flags = static_cast<std::uint8_t>((vec ? 1u : 0u) | (bias ? 2u : 0u));
+        const MirKernel mk = mir_kernel(
+            {MirKind::GemvQ, op_code, dt, Dtype::FP32, static_cast<std::uint8_t>(lpr), Dtype::FP32, flags});
+        const std::uint64_t per_wg = static_cast<std::uint64_t>(256u / lpr) * nr;
+        const std::uint64_t groups = (static_cast<std::uint64_t>(rows) + per_wg - 1u) / per_wg;
+        const std::uint32_t gx = static_cast<std::uint32_t>(
+            std::max<std::uint64_t>(1u, std::min<std::uint64_t>(groups, 65535u)));
+        const std::uint32_t gy = static_cast<std::uint32_t>((groups + gx - 1u) / gx);
+        const void* ptrs[] = {x_ptr, w, y_ptr, bias, scale};
+        const std::int32_t ints[] = {rows, k, eff_ldx, ldy, rowbytes};
+        mir_dispatch_args_3d(mk, gx, gy, 1u, op, ptrs, ints, {});
+    }
+}
 
 void quantize_rows(const Tensor& W, Dtype fmt, Tensor& Wq, Tensor& scales) {
     constexpr const char* op = "quantize_rows";
@@ -239,7 +140,7 @@ void dequantize_rows(const Tensor& Wq, const Tensor& scales, Dtype out, Tensor& 
 void linear_forward_batched_wq_ex(const Tensor& Wq, const Tensor& scales, const Tensor* bias, const Tensor& X,
                                   int act, int epilogue_flags, Tensor& Y) {
     constexpr const char* op = "linear_forward_batched_wq_ex";
-    const int epi = epilogue_flags & ~kLinearEpiFastAccum;   // accumulation is FP32 regardless
+    const int epi = epilogue_flags & ~kLinearEpiFastAccum;
     if (Wq.dtype != Dtype::INT8 && Wq.dtype != Dtype::FP8_E4M3) fail(op, "Wq must be INT8 or FP8_E4M3");
     const int N = Wq.rows, K = Wq.cols, M = X.rows;
     if (scales.dtype != Dtype::FP32 || static_cast<long long>(scales.rows) * scales.cols != N)
@@ -260,37 +161,17 @@ void linear_forward_batched_wq_ex(const Tensor& Wq, const Tensor& scales, const 
     }
     if (M == 0 || out_cols == 0) return;
 
-    WqParams p{};
-    p.M = static_cast<uint32_t>(M);
-    p.N = static_cast<uint32_t>(N);
-    p.K = static_cast<uint32_t>(K);
-    p.out_cols = static_cast<uint32_t>(out_cols);
-    p.fp8 = Wq.dtype == Dtype::FP8_E4M3 ? 1u : 0u;
-    p.has_bias = bias ? 1u : 0u;
-    p.act = act;
-    p.epi = epi;
-    // The 8-wide loads: every Wq row and X row starts 8-byte / 4-element
-    // aligned when K is a multiple of 8 and the buffers' offsets are.
-    const NSUInteger xAlign = 4 * static_cast<NSUInteger>(dtype_size_bytes(dt));
-    p.vec = K % 8 == 0 && buffer_offset_for(Wq) % 8 == 0 && buffer_offset_for(X) % xAlign == 0 ? 1u : 0u;
-    id<MTLComputePipelineState> pso = dt == Dtype::FP16 ? pso_wq_fp16() : dt == Dtype::BF16 ? pso_wq_bf16()
-                                                                                          : pso_wq_fp32();
-    const NSUInteger tgs = (static_cast<NSUInteger>(out_cols) + kColsPerTg - 1) / kColsPerTg;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:buffer_for(Wq) offset:buffer_offset_for(Wq) atIndex:0];
-        [enc setBuffer:buffer_for(scales) offset:buffer_offset_for(scales) atIndex:1];
-        // No bias: X stands in at its index, never read (has_bias 0).
-        [enc setBuffer:buffer_for(bias ? *bias : X) offset:buffer_offset_for(bias ? *bias : X) atIndex:2];
-        [enc setBuffer:buffer_for(X) offset:buffer_offset_for(X) atIndex:3];
-        [enc setBuffer:buffer_for(Y) offset:buffer_offset_for(Y) atIndex:4];
-        [enc setBytes:&p length:sizeof(WqParams) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1) threadsPerThreadgroup:MTLSizeMake(32 * kColsPerTg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
+    if (dt == Dtype::FP32) {
+        Tensor Wf = Tensor::empty_on(Device::Metal, N, K, Dtype::FP32);
+        dequantize_rows(Wq, scales, Dtype::FP32, Wf);
+        metal::linear_forward_batched_ex(Wf, bias, X, act, epilogue_flags, nullptr, Y);
+        return;
     }
+
+    const std::uint32_t fmt = (Wq.dtype == Dtype::FP8_E4M3) ? QF_FP8 : QF_INT8;
+    mir_dispatch_gemv_q(fmt, dt, op, X.data, Wq.data, Y.data,
+                        bias ? bias->data : nullptr, scales.data,
+                        N, K, M, K, out_cols, K, act, epi);
 }
 
 }  // namespace brotensor::detail::metal

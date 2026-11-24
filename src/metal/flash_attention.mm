@@ -1,16 +1,18 @@
 #include "mtl_mir_cache.h"
 
+#include "../vulkan/shaders/op_codes.h"
+
 #include <brotensor/runtime.h>
 #include <brotensor/detail/op_table.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
-#include <vector>
+#include <string>
 
 #import "internal.h"
 #import "fp16_matmul.h"
-#import "flash_attention_msl.h"
 
 namespace brotensor::detail::metal {
 
@@ -20,110 +22,101 @@ namespace brotensor::detail::metal {
 BROTENSOR_FOR_EACH_OP(BROTENSOR_METAL_DECL)
 #undef BROTENSOR_METAL_DECL
 
-using metal_impl::buffer_for;
-using metal_impl::buffer_offset_for;
-using metal_impl::compile_pipeline;
-using metal_impl::new_command_buffer;
-using metal_impl::pool_require;
-
 namespace {
 
-constexpr NSUInteger FA_BLOCK = 128;
-constexpr NSUInteger FA_KTILE = 64;
+constexpr std::uint64_t kMetalMaxSharedBytes = 32768u;
 
-id<MTLComputePipelineState> pso_flash() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_flash_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_flash_varlen() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_varlen"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_flash_varlen_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_varlen_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_flash_varlen_fp32() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_varlen_fp32"); });
-    return pso;
+std::uint64_t cdiv_u64(std::uint64_t a, std::uint64_t b) { return (a + b - 1u) / b; }
+
+void fa_combine_metal(const FaRowsProblem& p, const void* part, std::uint64_t nsplit) {
+    const MirKernel mk = mir_kernel({MirKind::FaCombine, 0u, p.dt});
+    const std::uint32_t entries = static_cast<std::uint32_t>(static_cast<long long>(p.lq) * p.hq);
+    const void* ptrs[] = {part, p.o};
+    const std::int32_t ints[] = {
+        static_cast<std::int32_t>(entries), static_cast<std::int32_t>(nsplit),
+        p.hd, p.hq, p.ldo,
+    };
+    mir_dispatch_args(mk, std::max<std::uint32_t>(1u, std::min<std::uint32_t>(65535u, entries)),
+                      p.op, ptrs, ints, {});
 }
 
 // The BF16 projections' name for linear_forward_batched_fp16 (gemm.mm), which
-// takes BF16 too, with the bias fused and one rounding. Mirrors
-// src/cuda/flash_attention.cu's fa_linear_forward_batched_bf16.
+// takes BF16 too, with the bias fused and one rounding.
 void fa_linear_forward_batched_bf16(const Tensor& W, const Tensor* bias,
                                     const Tensor& X_BD, Tensor& Y_BD) {
     linear_forward_batched_fp16(W, bias, X_BD, Y_BD);
 }
 
-void run_causal_flash(const Tensor& Q,
-                      const Tensor& K,
-                      const Tensor& V,
-                      const float* d_mask,
-                      int num_heads,
-                      Tensor& O,
-                      int Lq, int Lk, int D, int head_dim) {
-    if ((head_dim + (int)FA_BLOCK - 1) / (int)FA_BLOCK > 8) {
-        throw std::runtime_error("flash_attention_forward: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
-    }
-    const bool bf16 = (Q.dtype == Dtype::BF16);
-    id<MTLComputePipelineState> pso = bf16 ? pso_flash_bf16() : pso_flash();
-    id<MTLBuffer> bQ = buffer_for(Q);
-    id<MTLBuffer> bK = buffer_for(K);
-    id<MTLBuffer> bV = buffer_for(V);
-    id<MTLBuffer> bO = buffer_for(O);
-    const NSUInteger oQ = buffer_offset_for(Q);
-    const NSUInteger oK = buffer_offset_for(K);
-    const NSUInteger oV = buffer_offset_for(V);
-    const NSUInteger oO = buffer_offset_for(O);
-    NSUInteger oM = 0;
-    id<MTLBuffer> bM = pool_require(d_mask, oM, "flash_attention_forward", "mask");
-    id<MTLBuffer> bM_arg = bM ? bM : bQ;
-    NSUInteger oM_arg = bM ? oM : oQ;
+}  // namespace
 
-    const uint32_t Lqu = Lq, Lku = Lk, Du = D, hdU = head_dim;
-    const uint32_t has_mask = d_mask ? 1u : 0u;
-    const uint32_t causal_u = 1u;
-    const NSUInteger shmem = (FA_KTILE + FA_BLOCK) * sizeof(float);
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bQ offset:oQ atIndex:0];
-        [enc setBuffer:bK offset:oK atIndex:1];
-        [enc setBuffer:bV offset:oV atIndex:2];
-        [enc setBuffer:bM_arg offset:oM_arg atIndex:3];
-        [enc setBuffer:bO offset:oO atIndex:4];
-        [enc setBytes:&Lqu length:sizeof(uint32_t) atIndex:5];
-        [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:6];
-        [enc setBytes:&Du  length:sizeof(uint32_t) atIndex:7];
-        [enc setBytes:&hdU length:sizeof(uint32_t) atIndex:8];
-        [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:9];
-        [enc setBytes:&causal_u length:sizeof(uint32_t) atIndex:10];
-        [enc setThreadgroupMemoryLength:shmem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(Lq, num_heads, 1)
-            threadsPerThreadgroup:MTLSizeMake(FA_BLOCK, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
+void fa_rows_metal(const FaRowsProblem& p) {
+    if (p.lq <= 0 || p.hq <= 0 || p.hd <= 0) return;
+    const int group = p.hq / p.hkv;
+    const int slots = (p.hd + 127) / 128;
+    // Cap threadgroup memory strictly <= 32 KiB on Apple Metal:
+    // (g * hd + g * 128 + 136) * 4 <= 32768 (and g * slots <= 16, g * hd <= 6144).
+    int G = 1;
+    for (int g = std::min(group, 16); g >= 1; --g) {
+        const std::uint64_t sh_bytes =
+            (static_cast<std::uint64_t>(g) * static_cast<std::uint64_t>(p.hd) +
+             static_cast<std::uint64_t>(g) * 128u + 136u) * 4u;
+        if (group % g == 0 && g * slots <= 16 && g * p.hd <= 6144 && sh_bytes <= kMetalMaxSharedBytes) {
+            G = g;
+            break;
+        }
     }
+    const std::uint64_t sh_bytes =
+        (static_cast<std::uint64_t>(G) * static_cast<std::uint64_t>(p.hd) +
+         static_cast<std::uint64_t>(G) * 128u + 136u) * 4u;
+    if (slots > 16 || sh_bytes > kMetalMaxSharedBytes) {
+        throw std::runtime_error(std::string("brotensor: ") + p.op +
+                                 ": head_dim exceeds Metal 32 KiB threadgroup memory limit");
+    }
+
+    const std::uint64_t entries = static_cast<std::uint64_t>(p.lq) * static_cast<std::uint64_t>(p.hq / G);
+    constexpr std::uint64_t kTarget = 80u;
+    std::uint64_t nsplit = 1u;
+    if (entries < kTarget && p.lk > 128) {
+        nsplit = std::min<std::uint64_t>({cdiv_u64(kTarget, entries), cdiv_u64(p.lk, 128u), 64u});
+    }
+    std::uint64_t chunk = cdiv_u64(cdiv_u64(static_cast<std::uint64_t>(std::max(0, p.lk)), nsplit), 128u) * 128u;
+    nsplit = std::max<std::uint64_t>(1u, cdiv_u64(static_cast<std::uint64_t>(std::max(0, p.lk)), std::max<std::uint64_t>(1u, chunk)));
+    if (p.lk == 0) chunk = 128u;
+
+    const bool vec = (p.hd % 8 == 0) &&
+                     (reinterpret_cast<std::uintptr_t>(p.k) % 16u == 0u) &&
+                     (p.ldk % 8 == 0);
+    const bool split = nsplit > 1u;
+    const std::uint8_t flags = static_cast<std::uint8_t>(
+        (p.mask != nullptr ? 1u : 0u) | (split ? 2u : 0u) | (p.softcap > 0.0f ? 4u : 0u) |
+        (vec ? 8u : 0u) | (p.maskpos ? 16u : 0u));
+    const MirKernel mk = mir_kernel(
+        {MirKind::FaRows, static_cast<std::uint32_t>(p.hd), p.dt, Dtype::FP32,
+         static_cast<std::uint8_t>(G), Dtype::FP32, flags, static_cast<std::uint64_t>(p.mode)});
+    Tensor part;
+    const void* part_ptr = nullptr;
+    if (split) {
+        const long long pn = static_cast<long long>(p.lq) * p.hq * static_cast<long long>(nsplit) * (p.hd + 2);
+        if (pn > 0x7fffffffLL) {
+            throw std::runtime_error(std::string("brotensor: ") + p.op + ": attention partials too large");
+        }
+        part = Tensor::empty_on(Device::Metal, static_cast<int>(pn), 1, Dtype::FP32);
+        part_ptr = part.data;
+    }
+    const void* ptrs[] = {p.q, p.k, p.v, p.o, p.mask, p.aux, p.aux2, part_ptr};
+    const float flts[] = {static_cast<float>(1.0 / std::sqrt(static_cast<double>(p.hd))), p.softcap};
+    for (int r0 = 0; r0 < p.lq; r0 += 65535) {
+        const std::int32_t ints[] = {
+            p.lq, p.lk, p.ldq, p.ldk, p.ldo, group, std::max(0, p.window),
+            p.causal ? 1 : 0, p.nseq, static_cast<std::int32_t>(chunk), p.hq, r0, p.q_offset,
+        };
+        mir_dispatch_args_3d(
+            mk, static_cast<std::uint32_t>(nsplit),
+            static_cast<std::uint32_t>(std::min(65535, p.lq - r0)),
+            static_cast<std::uint32_t>(p.hq / G), p.op, ptrs, ints, flts);
+    }
+    if (split) fa_combine_metal(p, part_ptr, nsplit);
 }
-
-} // namespace
 
 void flash_attention_forward(const Tensor& Q,
                              const Tensor& K,
@@ -155,10 +148,21 @@ void flash_attention_forward(const Tensor& Q,
     if (O.rows != Lq || O.cols != D || O.dtype != dt) {
         O.resize(Lq, D, dt);
     }
-    if (Lq == 0 || Lk == 0 || D == 0) return;
+    if (Lq == 0 || D == 0) return;
+    if (Lk == 0) { O.zero(); return; }
 
     if (causal) {
-        run_causal_flash(Q, K, V, d_mask, num_heads, O, Lq, Lk, D, head_dim);
+        FaRowsProblem p;
+        p.op = "flash_attention_forward";
+        p.dt = dt;
+        p.q = Q.data; p.k = K.data; p.v = V.data; p.o = O.data;
+        p.mask = d_mask;
+        p.lq = Lq; p.lk = Lk;
+        p.ldq = p.ldk = p.ldo = D;
+        p.hd = head_dim; p.hq = p.hkv = num_heads;
+        p.mode = FA_MODE_ROWS;
+        p.causal = true;
+        fa_rows_metal(p);
         return;
     }
 
@@ -217,50 +221,22 @@ void flash_attention_varlen_forward(const Tensor& Q,
     if (O.rows != total_q || O.cols != D || O.dtype != dt) {
         O.resize(total_q, D, dt);
     }
-    if (total_q == 0 || D == 0 || batch_size == 0) return;
+    if (total_q == 0 || D == 0) return;
+    if (batch_size == 0 || total_k == 0) { O.zero(); return; }
     (void)max_seqlen_q; (void)max_seqlen_k;
 
-    id<MTLComputePipelineState> pso =
-        (dt == Dtype::BF16) ? pso_flash_varlen_bf16()
-      : (dt == Dtype::FP32) ? pso_flash_varlen_fp32()
-                            : pso_flash_varlen();
-
-    id<MTLBuffer> bQ = buffer_for(Q); NSUInteger oQ = buffer_offset_for(Q);
-    id<MTLBuffer> bK = buffer_for(K); NSUInteger oK = buffer_offset_for(K);
-    id<MTLBuffer> bV = buffer_for(V); NSUInteger oV = buffer_offset_for(V);
-    id<MTLBuffer> bO = buffer_for(O); NSUInteger oO = buffer_offset_for(O);
-    NSUInteger oCQ = 0, oCK = 0;
-    id<MTLBuffer> bCQ = pool_require(cu_seqlens_q, oCQ, "flash_attention_varlen_forward",
-                                     "cu_seqlens_q");
-    id<MTLBuffer> bCK = pool_require(cu_seqlens_k, oCK, "flash_attention_varlen_forward",
-                                     "cu_seqlens_k");
-
-    const uint32_t Bu = (uint32_t)batch_size;
-    const uint32_t Du = (uint32_t)D;
-    const uint32_t hdU = (uint32_t)head_dim;
-    const uint32_t causal_u = causal ? 1u : 0u;
-    const NSUInteger shmem = (FA_KTILE + FA_BLOCK) * sizeof(float);
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bQ  offset:oQ  atIndex:0];
-        [enc setBuffer:bK  offset:oK  atIndex:1];
-        [enc setBuffer:bV  offset:oV  atIndex:2];
-        [enc setBuffer:bCQ offset:oCQ atIndex:3];
-        [enc setBuffer:bCK offset:oCK atIndex:4];
-        [enc setBuffer:bO  offset:oO  atIndex:5];
-        [enc setBytes:&Bu       length:sizeof(uint32_t) atIndex:6];
-        [enc setBytes:&Du       length:sizeof(uint32_t) atIndex:7];
-        [enc setBytes:&hdU      length:sizeof(uint32_t) atIndex:8];
-        [enc setBytes:&causal_u length:sizeof(uint32_t) atIndex:9];
-        [enc setThreadgroupMemoryLength:shmem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)total_q, (NSUInteger)num_heads, 1)
-            threadsPerThreadgroup:MTLSizeMake(FA_BLOCK, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
+    FaRowsProblem p;
+    p.op = "flash_attention_varlen_forward";
+    p.dt = dt;
+    p.q = Q.data; p.k = K.data; p.v = V.data; p.o = O.data;
+    p.aux = cu_seqlens_q; p.aux2 = cu_seqlens_k;
+    p.lq = total_q; p.lk = total_k;
+    p.ldq = p.ldk = p.ldo = D;
+    p.hd = head_dim; p.hq = p.hkv = num_heads;
+    p.mode = FA_MODE_VARLEN;
+    p.nseq = batch_size;
+    p.causal = causal;
+    fa_rows_metal(p);
 }
 
 void flash_attention_qkvo_forward(const Tensor& X,

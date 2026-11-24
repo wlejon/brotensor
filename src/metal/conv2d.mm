@@ -152,6 +152,59 @@ bool conv2d_is_pointwise(int kH, int kW, int stride_h, int stride_w,
            pad_h == 0 && pad_w == 0 && groups == 1;
 }
 
+bool conv2d_simt_eligible(int C_in, int C_out, int H_out, int W_out,
+                          int kH, int kW, int stride_h, int stride_w,
+                          int pad_h, int pad_w, int dil_h, int dil_w, int groups) {
+    const int cgo = C_out / groups;
+    const int k = (C_in / groups) * kH * kW;
+    if (cgo < 16 || k < 16) return false;
+    if (kH > 255 || kW > 255 || stride_h > 255 || stride_w > 255 ||
+        pad_h > 255 || pad_w > 255 || dil_h > 255 || dil_w > 255) return false;
+    const std::uint64_t P = static_cast<std::uint64_t>(H_out) * static_cast<std::uint64_t>(W_out);
+    return (P + 63u) / 64u <= 65535u && (static_cast<std::uint64_t>(cgo) + 63u) / 64u <= 65535u;
+}
+
+void run_conv_simt(Dtype dt, const char* op,
+                   const void* x, const void* w, const void* y, const void* bias,
+                   int n, int cin, int h, int wd, int cout, int ho, int wo,
+                   int kh, int kw, int sh, int sw, int ph, int pw,
+                   int dh, int dw, int groups, bool accum = false) {
+    const std::uint32_t P = static_cast<std::uint32_t>(ho * wo);
+    const std::uint32_t M = static_cast<std::uint32_t>(cout / groups);
+    const std::uint32_t K = static_cast<std::uint32_t>((cin / groups) * kh * kw);
+    const auto cdiv = [](std::uint64_t a, std::uint64_t b) { return (a + b - 1u) / b; };
+    const std::uint64_t tiles_big = cdiv(M, 128u) * cdiv(P, 128u) * std::uint64_t(n) * groups;
+    const bool big128 = tiles_big >= 160u;
+    const std::uint32_t bm = big128 ? 128u : 64u;
+    const std::uint32_t bn = big128 ? 128u : 64u;
+    const std::uint64_t aux =
+        (static_cast<std::uint64_t>(kh & 0xff) << 0) | (static_cast<std::uint64_t>(kw & 0xff) << 8) |
+        (static_cast<std::uint64_t>(sh & 0xff) << 16) | (static_cast<std::uint64_t>(sw & 0xff) << 24) |
+        (static_cast<std::uint64_t>(ph & 0xff) << 32) | (static_cast<std::uint64_t>(pw & 0xff) << 40) |
+        (static_cast<std::uint64_t>(dh & 0xff) << 48) | (static_cast<std::uint64_t>(dw & 0xff) << 56);
+    const std::uint8_t flags = static_cast<std::uint8_t>(
+        (big128 ? 1u : 0u) | (accum ? 2u : 0u) | (bias ? 4u : 0u));
+    const MirKernel mk = mir_kernel({MirKind::ConvSimt, 0u, dt, Dtype::FP32, 1, Dtype::FP32, flags, aux});
+    const std::uint32_t gx = static_cast<std::uint32_t>(cdiv(P, bn));
+    const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(M, bm));
+    const std::size_t es = dtype_size_bytes(dt);
+    const int per = std::max(1, 65535 / groups);
+    for (int i0 = 0; i0 < n; i0 += per) {
+        const int ni = std::min(per, n - i0);
+        const void* ptrs[] = {
+            static_cast<const char*>(x) + std::size_t(i0) * cin * h * wd * es,
+            w,
+            static_cast<const char*>(y) + std::size_t(i0) * cout * P * es,
+            bias,
+        };
+        const std::int32_t ints[] = {
+            static_cast<std::int32_t>(M), static_cast<std::int32_t>(P), static_cast<std::int32_t>(K),
+            h, wd, wo, cin, cout, groups,
+        };
+        mir_dispatch_args_3d(mk, gx, gy, static_cast<std::uint32_t>(ni * groups), op, ptrs, ints, {});
+    }
+}
+
 }  // namespace
 
 void conv2d_forward(const Tensor& X,
@@ -218,6 +271,16 @@ void conv2d_forward(const Tensor& X,
         g.strideB = static_cast<uint64_t>(C_in) * HW;
         g.strideC = static_cast<uint64_t>(C_out) * HW;
         metal_impl::launch_matmul_abt_mixed(g);
+        return;
+    }
+
+    // Fast path 3: tiled SIMT implicit-GEMM (64x64 or 128x128) via MirKind::ConvSimt.
+    if (conv2d_simt_eligible(C_in, C_out, H_out, W_out, kH, kW, stride_h, stride_w,
+                             pad_h, pad_w, dil_h, dil_w, groups)) {
+        run_conv_simt(X.dtype, "conv2d_forward",
+                      X.data, Wt.data, Y.data, bias ? bias->data : nullptr,
+                      N, C_in, H, W, C_out, H_out, W_out,
+                      kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups);
         return;
     }
 

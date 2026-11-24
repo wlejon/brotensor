@@ -55,7 +55,7 @@ void launch_matmul_abt_bf16_ex(id<MTLBuffer> A, NSUInteger ofs_A,
 //   kAbtGeglu       C[:, j] = r[:, 2j] * gelu_erf(r[:, 2j+1]); N even, C has
 //                   N/2 columns (ldc counts output columns).
 enum AbtType : int { kAbtF16 = 0, kAbtBF16 = 1, kAbtF32 = 2 };
-enum AbtEpilogue : int { kAbtStore = 0, kAbtAccumulate = 1, kAbtGeglu = 2 };
+enum AbtEpilogue : int { kAbtStore = 0, kAbtAccumulate = 1, kAbtGeglu = 2, kAbtSwiglu = 3 };
 
 struct AbtMixed {
     // A is (M, K) with row stride lda, or with transA (K, M) with row stride

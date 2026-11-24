@@ -1,8 +1,14 @@
-// Metal implementation of KV-cache append + causal flash-attention decode.
+// Metal implementation of KV-cache append (MTLBlitCommandEncoder) + causal /
+// masked / device-length flash-attention decode (MirKind::FaRows).
 // Mirrors src/cuda/kv_cache.cu.
+
+#include "mtl_mir_cache.h"
+
+#include "../vulkan/shaders/op_codes.h"
 
 #include <brotensor/runtime.h>
 
+#include <cstddef>
 #include <stdexcept>
 
 #import "internal.h"
@@ -11,587 +17,14 @@ namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
-using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
-using metal_impl::pool_require;
-
-namespace {
-
-constexpr NSUInteger FAD_BLOCK = 128;
-constexpr NSUInteger FAD_KTILE = 64;
-
-NSString* const kSrc = @R"msl(
-#include <metal_stdlib>
-using namespace metal;
-
-constant uint FAD_BLOCK = 128;
-constant uint FAD_KTILE = 64;
-constant uint MAX_HD_PER_THREAD = 8;
-
-// Gemma-2 tanh logit soft-cap on an already-scaled score. softcap <= 0 is a
-// no-op (returns s untouched), so the default path stays bit-identical.
-inline float fad_softcap(float s, float softcap) {
-    return softcap > 0.0f ? softcap * tanh(s / softcap) : s;
-}
-
-// Copy L_new * D halves from src into dst starting at dst_off_halves.
-kernel void k_kv_append_copy(device const half* src    [[buffer(0)]],
-                             device half*       dst    [[buffer(1)]],
-                             constant uint& n          [[buffer(2)]],
-                             constant uint& dst_off    [[buffer(3)]],
-                             uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    dst[dst_off + i] = src[i];
-}
-
-kernel void k_kv_append_copy_bf16(device const bfloat* src [[buffer(0)]],
-                                  device bfloat*       dst [[buffer(1)]],
-                                  constant uint& n         [[buffer(2)]],
-                                  constant uint& dst_off   [[buffer(3)]],
-                                  uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    dst[dst_off + i] = src[i];
-}
-
-// Causal flash-attention decode. One threadgroup per (q, head); T the
-// storage type (half, bfloat), float accumulators. Row q sits at position
-// seq_offset + q and attends to keys 0..that position of the valid_len.
-template <typename T>
-void fad_decode(device const T* Q, device const T* Kk, device const T* V, device T* Out, uint Lq,
-                uint valid_len, uint Dq, uint head_dim, uint seq_offset, uint Dkv, uint group, float softcap,
-                int window, threadgroup float* scratch, uint3 gid, uint tid, uint tg_size) {
-    threadgroup float* scores = scratch;
-    threadgroup float* red    = scratch + FAD_KTILE;
-
-    uint q = gid.x;
-    uint h = gid.y;
-    uint q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
-    uint kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
-    float inv_sqrt = rsqrt(float(head_dim));
-    int p_q = int(seq_offset + q);
-    // Sliding-window lower bound. window <= 0 leaves lo == 0 (unbounded causal),
-    // bit-identical to the pre-window path.
-    int lo = (window > 0) ? max(0, p_q - window + 1) : 0;
-
-    float run_max = -1e30f;
-    float run_sum = 0.0f;
-    float partial[MAX_HD_PER_THREAD];
-    for (uint i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
-
-    for (uint k0 = 0; k0 < valid_len; k0 += FAD_KTILE) {
-        if (int(k0) > p_q) break;
-        uint klen = (valid_len - k0) < FAD_KTILE ? (valid_len - k0) : FAD_KTILE;
-        if (k0 + klen - 1u > uint(p_q)) klen = uint(p_q) - k0 + 1u;
-
-        // 1. scores
-        for (uint t = tid; t < klen; t += tg_size) {
-            uint kg = k0 + t;
-            if (int(kg) < lo) { scores[t] = -1e30f; continue; }   // out of window
-            float dot = 0.0f;
-            for (uint d = 0; d < head_dim; ++d) {
-                dot += float(Q[q * Dq + q_head_off + d]) *
-                       float(Kk[kg * Dkv + kv_head_off + d]);
-            }
-            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // 2. tile max
-        float local_max = -1e30f;
-        for (uint t = tid; t < klen; t += tg_size) {
-            if (scores[t] > local_max) local_max = scores[t];
-        }
-        red[tid] = local_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) {
-                float other = red[tid + s];
-                if (other > red[tid]) red[tid] = other;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float tile_max = red[0];
-        float m_new = (tile_max > run_max) ? tile_max : run_max;
-        bool tile_empty = (m_new <= -1e29f);
-
-        // 3. exponentiate + sum
-        for (uint t = tid; t < klen; t += tg_size) {
-            float e = tile_empty ? 0.0f : exp(scores[t] - m_new);
-            scores[t] = e;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float local_sum = 0.0f;
-        for (uint t = tid; t < klen; t += tg_size) local_sum += scores[t];
-        red[tid] = local_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float tile_sum = red[0];
-
-        // 4. rescale
-        float alpha;
-        if (run_max <= -1e29f) {
-            alpha = 0.0f;
-        } else {
-            alpha = exp(run_max - m_new);
-        }
-
-        // 5. update partial output
-        uint slot = 0;
-        for (uint d = tid; d < head_dim; d += tg_size) {
-            if (slot >= MAX_HD_PER_THREAD) break;
-            float acc = alpha * partial[slot];
-            for (uint t = 0; t < klen; ++t) {
-                acc += scores[t] * float(V[(k0 + t) * Dkv + kv_head_off + d]);
-            }
-            partial[slot] = acc;
-            ++slot;
-        }
-
-        run_max = m_new;
-        run_sum = alpha * run_sum + tile_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
-    uint slot = 0;
-    for (uint d = tid; d < head_dim; d += tg_size) {
-        if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q * Dq + q_head_off + d] = T(partial[slot] * inv);
-        ++slot;
-    }
-}
-
-#define FAD_DECODE_ARGS(T)                                                    \
-        device const T* Q          [[buffer(0)]],   /* (Lq, Dq) */             \
-        device const T* Kk         [[buffer(1)]],   /* (L_max, Dkv) */         \
-        device const T* V          [[buffer(2)]],   /* (L_max, Dkv) */         \
-        device T*       Out        [[buffer(3)]],   /* (Lq, Dq) */             \
-        constant uint& Lq          [[buffer(4)]],
-#define FAD_DECODE_REST                                                       \
-        constant uint& Dq          [[buffer(6)]],                              \
-        constant uint& head_dim    [[buffer(7)]],                              \
-        constant uint& Dkv         [[buffer(9)]],                              \
-        constant uint& group       [[buffer(10)]],                             \
-        constant float& softcap    [[buffer(11)]],                             \
-        constant int& window       [[buffer(12)]],                             \
-        threadgroup float* scratch [[threadgroup(0)]],                         \
-        uint3 gid    [[threadgroup_position_in_grid]],                         \
-        uint3 tid3   [[thread_position_in_threadgroup]],                       \
-        uint3 tgs3   [[threads_per_threadgroup]]
-
-// The length from the host (valid_len, and the first row's position).
-kernel void k_flash_attention_decode(FAD_DECODE_ARGS(half)
-        constant uint& valid_len   [[buffer(5)]],
-        constant uint& seq_offset  [[buffer(8)]],
-        FAD_DECODE_REST) {
-    fad_decode<half>(Q, Kk, V, Out, Lq, valid_len, Dq, head_dim, seq_offset, Dkv, group, softcap, window,
-                     scratch, gid, tid3.x, tgs3.x);
-}
-kernel void k_flash_attention_decode_bf16(FAD_DECODE_ARGS(bfloat)
-        constant uint& valid_len   [[buffer(5)]],
-        constant uint& seq_offset  [[buffer(8)]],
-        FAD_DECODE_REST) {
-    fad_decode<bfloat>(Q, Kk, V, Out, Lq, valid_len, Dq, head_dim, seq_offset, Dkv, group, softcap, window,
-                       scratch, gid, tid3.x, tgs3.x);
-}
-
-// The length read on the device (flash_attention_decode_len): the launch
-// does not change as it grows. Rows are the last Lq of the valid ones
-// (*len >= Lq, as the op requires); a length of 0 writes zeros.
-kernel void k_flash_attention_decode_len(FAD_DECODE_ARGS(half)
-        device const int* len      [[buffer(5)]],
-        FAD_DECODE_REST) {
-    const uint valid_len = uint(max(len[0], 0));
-    fad_decode<half>(Q, Kk, V, Out, Lq, valid_len, Dq, head_dim, valid_len - Lq, Dkv, group, softcap, window,
-                     scratch, gid, tid3.x, tgs3.x);
-}
-kernel void k_flash_attention_decode_len_bf16(FAD_DECODE_ARGS(bfloat)
-        device const int* len      [[buffer(5)]],
-        FAD_DECODE_REST) {
-    const uint valid_len = uint(max(len[0], 0));
-    fad_decode<bfloat>(Q, Kk, V, Out, Lq, valid_len, Dq, head_dim, valid_len - Lq, Dkv, group, softcap,
-                       window, scratch, gid, tid3.x, tgs3.x);
-}
-#undef FAD_DECODE_ARGS
-#undef FAD_DECODE_REST
-
-// Masked decode: single query row (Lq == 1), mask (cap,) FP32 selects valid
-// keys instead of a contiguous valid_len/seq_offset causal prefix. One
-// threadgroup per head; loops the full cap. Mirrors the CUDA non-split-K
-// reference path (flash_attention_decode_masked_kernel) — correctness match,
-// not the CUDA split-K perf path.
-kernel void k_flash_attention_decode_masked(
-        device const half* Q       [[buffer(0)]],   // (1, Dq)
-        device const half* Kk      [[buffer(1)]],   // (cap, Dkv)
-        device const half* V       [[buffer(2)]],   // (cap, Dkv)
-        device const float* mask   [[buffer(3)]],   // (cap,)
-        device half*       Out     [[buffer(4)]],   // (1, Dq)
-        constant uint& cap          [[buffer(5)]],
-        constant uint& Dq           [[buffer(6)]],
-        constant uint& head_dim     [[buffer(7)]],
-        constant uint& Dkv          [[buffer(8)]],
-        constant uint& group        [[buffer(9)]],
-        constant float& softcap     [[buffer(10)]],
-        constant int& window        [[buffer(11)]],
-        threadgroup float* scratch [[threadgroup(0)]],
-        uint3 gid    [[threadgroup_position_in_grid]],
-        uint3 tid3   [[thread_position_in_threadgroup]],
-        uint3 tgs3   [[threads_per_threadgroup]]) {
-    uint tid = tid3.x;
-    uint tg_size = tgs3.x;
-    threadgroup float* scores = scratch;
-    threadgroup float* red    = scratch + FAD_KTILE;
-
-    uint h = gid.y;
-    uint q_head_off  = h * head_dim;
-    uint kv_head_off = (h / group) * head_dim;
-    float inv_sqrt = rsqrt(float(head_dim));
-
-    int lo = 0;
-    if (window > 0) {
-        float local_pmax = -1.0f;
-        for (uint kg = tid; kg < cap; kg += tg_size) {
-            if (mask[kg] > 0.5f) local_pmax = max(local_pmax, float(kg));
-        }
-        red[tid] = local_pmax;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] = max(red[tid], red[tid + s]);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        int p_max = int(red[0]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (p_max >= 0) { lo = max(0, p_max - window + 1); }
-    }
-
-    float run_max = -1e30f;
-    float run_sum = 0.0f;
-    float partial[MAX_HD_PER_THREAD];
-    for (uint i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
-
-    for (uint k0 = 0; k0 < cap; k0 += FAD_KTILE) {
-        uint klen = (cap - k0) < FAD_KTILE ? (cap - k0) : FAD_KTILE;
-
-        float any = 0.0f;
-        for (uint t = tid; t < klen; t += tg_size) {
-            if (mask[k0 + t] > 0.5f) any = 1.0f;
-        }
-        red[tid] = any;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        bool tile_any = red[0] > 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!tile_any) continue;
-
-        for (uint t = tid; t < klen; t += tg_size) {
-            uint kg = k0 + t;
-            if (mask[kg] <= 0.5f || int(kg) < lo) {
-                scores[t] = -1e30f;
-                continue;
-            }
-            float dot = 0.0f;
-            for (uint d = 0; d < head_dim; ++d) {
-                dot += float(Q[q_head_off + d]) *
-                       float(Kk[kg * Dkv + kv_head_off + d]);
-            }
-            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float local_max = -1e30f;
-        for (uint t = tid; t < klen; t += tg_size) {
-            if (scores[t] > local_max) local_max = scores[t];
-        }
-        red[tid] = local_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) {
-                float other = red[tid + s];
-                if (other > red[tid]) red[tid] = other;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float tile_max = red[0];
-        float m_new = (tile_max > run_max) ? tile_max : run_max;
-        bool tile_empty = (m_new <= -1e29f);
-
-        for (uint t = tid; t < klen; t += tg_size) {
-            float e = tile_empty ? 0.0f : exp(scores[t] - m_new);
-            scores[t] = e;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float local_sum = 0.0f;
-        for (uint t = tid; t < klen; t += tg_size) local_sum += scores[t];
-        red[tid] = local_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float tile_sum = red[0];
-
-        float alpha = (run_max <= -1e29f) ? 0.0f : exp(run_max - m_new);
-
-        uint slot = 0;
-        for (uint d = tid; d < head_dim; d += tg_size) {
-            if (slot >= MAX_HD_PER_THREAD) break;
-            float acc = alpha * partial[slot];
-            for (uint t = 0; t < klen; ++t) {
-                float s = scores[t];
-                if (s == 0.0f) continue;
-                acc += s * float(V[(k0 + t) * Dkv + kv_head_off + d]);
-            }
-            partial[slot] = acc;
-            ++slot;
-        }
-
-        run_max = m_new;
-        run_sum = alpha * run_sum + tile_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
-    uint slot = 0;
-    for (uint d = tid; d < head_dim; d += tg_size) {
-        if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q_head_off + d] = half(partial[slot] * inv);
-        ++slot;
-    }
-}
-
-kernel void k_flash_attention_decode_masked_bf16(
-        device const bfloat* Q       [[buffer(0)]],
-        device const bfloat* Kk      [[buffer(1)]],
-        device const bfloat* V       [[buffer(2)]],
-        device const float* mask     [[buffer(3)]],
-        device bfloat*       Out     [[buffer(4)]],
-        constant uint& cap          [[buffer(5)]],
-        constant uint& Dq           [[buffer(6)]],
-        constant uint& head_dim     [[buffer(7)]],
-        constant uint& Dkv          [[buffer(8)]],
-        constant uint& group        [[buffer(9)]],
-        constant float& softcap     [[buffer(10)]],
-        constant int& window        [[buffer(11)]],
-        threadgroup float* scratch [[threadgroup(0)]],
-        uint3 gid    [[threadgroup_position_in_grid]],
-        uint3 tid3   [[thread_position_in_threadgroup]],
-        uint3 tgs3   [[threads_per_threadgroup]]) {
-    uint tid = tid3.x;
-    uint tg_size = tgs3.x;
-    threadgroup float* scores = scratch;
-    threadgroup float* red    = scratch + FAD_KTILE;
-
-    uint h = gid.y;
-    uint q_head_off  = h * head_dim;
-    uint kv_head_off = (h / group) * head_dim;
-    float inv_sqrt = rsqrt(float(head_dim));
-
-    int lo = 0;
-    if (window > 0) {
-        float local_pmax = -1.0f;
-        for (uint kg = tid; kg < cap; kg += tg_size) {
-            if (mask[kg] > 0.5f) local_pmax = max(local_pmax, float(kg));
-        }
-        red[tid] = local_pmax;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] = max(red[tid], red[tid + s]);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        int p_max = int(red[0]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (p_max >= 0) { lo = max(0, p_max - window + 1); }
-    }
-
-    float run_max = -1e30f;
-    float run_sum = 0.0f;
-    float partial[MAX_HD_PER_THREAD];
-    for (uint i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
-
-    for (uint k0 = 0; k0 < cap; k0 += FAD_KTILE) {
-        uint klen = (cap - k0) < FAD_KTILE ? (cap - k0) : FAD_KTILE;
-
-        float any = 0.0f;
-        for (uint t = tid; t < klen; t += tg_size) {
-            if (mask[k0 + t] > 0.5f) any = 1.0f;
-        }
-        red[tid] = any;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        bool tile_any = red[0] > 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!tile_any) continue;
-
-        for (uint t = tid; t < klen; t += tg_size) {
-            uint kg = k0 + t;
-            if (mask[kg] <= 0.5f || int(kg) < lo) {
-                scores[t] = -1e30f;
-                continue;
-            }
-            float dot = 0.0f;
-            for (uint d = 0; d < head_dim; ++d) {
-                dot += float(Q[q_head_off + d]) *
-                       float(Kk[kg * Dkv + kv_head_off + d]);
-            }
-            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float local_max = -1e30f;
-        for (uint t = tid; t < klen; t += tg_size) {
-            if (scores[t] > local_max) local_max = scores[t];
-        }
-        red[tid] = local_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) {
-                float other = red[tid + s];
-                if (other > red[tid]) red[tid] = other;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float tile_max = red[0];
-        float m_new = (tile_max > run_max) ? tile_max : run_max;
-        bool tile_empty = (m_new <= -1e29f);
-
-        for (uint t = tid; t < klen; t += tg_size) {
-            float e = tile_empty ? 0.0f : exp(scores[t] - m_new);
-            scores[t] = e;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float local_sum = 0.0f;
-        for (uint t = tid; t < klen; t += tg_size) local_sum += scores[t];
-        red[tid] = local_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = tg_size / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] += red[tid + s];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float tile_sum = red[0];
-
-        float alpha = (run_max <= -1e29f) ? 0.0f : exp(run_max - m_new);
-
-        uint slot = 0;
-        for (uint d = tid; d < head_dim; d += tg_size) {
-            if (slot >= MAX_HD_PER_THREAD) break;
-            float acc = alpha * partial[slot];
-            for (uint t = 0; t < klen; ++t) {
-                float s = scores[t];
-                if (s == 0.0f) continue;
-                acc += s * float(V[(k0 + t) * Dkv + kv_head_off + d]);
-            }
-            partial[slot] = acc;
-            ++slot;
-        }
-
-        run_max = m_new;
-        run_sum = alpha * run_sum + tile_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
-    uint slot = 0;
-    for (uint d = tid; d < head_dim; d += tg_size) {
-        if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q_head_off + d] = bfloat(partial[slot] * inv);
-        ++slot;
-    }
-}
-)msl";
-
-id<MTLComputePipelineState> pso_append() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_kv_append_copy"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_append_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_kv_append_copy_bf16"); });
-    return pso;
-}
-
-id<MTLComputePipelineState> pso_decode() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_decode"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_decode_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_decode_bf16"); });
-    return pso;
-}
-
-id<MTLComputePipelineState> pso_decode_len() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_decode_len"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_decode_len_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_decode_len_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_decode_masked() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_decode_masked"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_decode_masked_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_decode_masked_bf16"); });
-    return pso;
-}
-
-void run_copy(id<MTLComputePipelineState> copy_pso,
-              id<MTLBuffer> src_buf, NSUInteger src_off_bytes,
-              id<MTLBuffer> dst_buf, NSUInteger dst_off_bytes,
-              uint32_t n_halves, uint32_t dst_extra_halves) {
-    // dst element index = dst_extra_halves + i; we already account for cur_len
-    // by passing dst_extra_halves.
-    id<MTLComputePipelineState> pso = copy_pso;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:src_buf offset:src_off_bytes atIndex:0];
-        [enc setBuffer:dst_buf offset:dst_off_bytes atIndex:1];
-        [enc setBytes:&n_halves length:sizeof(uint32_t) atIndex:2];
-        [enc setBytes:&dst_extra_halves length:sizeof(uint32_t) atIndex:3];
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > 256) tg = 256;
-        [enc dispatchThreads:MTLSizeMake(n_halves, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
-}
-
-} // namespace
 
 void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
                      int cur_len, Tensor& K_cache, Tensor& V_cache) {
-    const bool is_bf16 = (K_new.dtype == Dtype::BF16);
-    if ((K_new.dtype != Dtype::FP16 && K_new.dtype != Dtype::BF16) ||
+    if ((K_new.dtype != Dtype::FP16 && K_new.dtype != Dtype::BF16 && K_new.dtype != Dtype::FP32) ||
         V_new.dtype != K_new.dtype ||
         K_cache.dtype != K_new.dtype || V_cache.dtype != K_new.dtype) {
-        throw std::runtime_error("kv_cache_append_gpu: all tensors must be FP16 or all BF16");
+        throw std::runtime_error("kv_cache_append_gpu: all tensors must share one float dtype");
     }
     if (K_new.cols != V_new.cols || K_new.cols != K_cache.cols ||
         K_cache.cols != V_cache.cols) {
@@ -611,149 +44,113 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
     }
     if (L_new == 0 || D == 0) return;
 
-    const uint32_t n_halves = static_cast<uint32_t>(L_new) * static_cast<uint32_t>(D);
-    const uint32_t dst_extra_halves = static_cast<uint32_t>(cur_len) * static_cast<uint32_t>(D);
-
-    id<MTLBuffer> bK_new = buffer_for(K_new);
-    id<MTLBuffer> bV_new = buffer_for(V_new);
-    id<MTLBuffer> bK_c   = buffer_for(K_cache);
-    id<MTLBuffer> bV_c   = buffer_for(V_cache);
-    const NSUInteger oK_new = buffer_offset_for(K_new);
-    const NSUInteger oV_new = buffer_offset_for(V_new);
-    const NSUInteger oK_c   = buffer_offset_for(K_cache);
-    const NSUInteger oV_c   = buffer_offset_for(V_cache);
-
-    id<MTLComputePipelineState> copy_pso = is_bf16 ? pso_append_bf16() : pso_append();
-    run_copy(copy_pso, bK_new, oK_new, bK_c, oK_c, n_halves, dst_extra_halves);
-    run_copy(copy_pso, bV_new, oV_new, bV_c, oV_c, n_halves, dst_extra_halves);
-}
-
-namespace {
-
-// flash_attention_decode, with the valid length given (valid_len >= 0), or
-// read on the device from d_len (valid_len < 0: flash_attention_decode_len).
-void decode_impl(const Tensor& Q, const Tensor& K_cache, const Tensor& V_cache, int valid_len,
-                 const int32_t* d_len, int num_q_heads, int num_kv_heads, Tensor& O, float attn_softcap,
-                 int window) {
-    const bool on_device = valid_len < 0;
-    const bool is_bf16 = (Q.dtype == Dtype::BF16);
-    if ((Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) ||
-        K_cache.dtype != Q.dtype || V_cache.dtype != Q.dtype) {
-        throw std::runtime_error("flash_attention_decode_gpu: all tensors must be FP16 or all BF16");
-    }
-    const int Lq  = Q.rows;
-    const int Dq  = Q.cols;            // num_q_heads  * head_dim
-    const int Dkv = K_cache.cols;      // num_kv_heads * head_dim
-    if (V_cache.cols != Dkv) {
-        throw std::runtime_error("flash_attention_decode_gpu: K_cache.cols != V_cache.cols");
-    }
-    if (on_device) {
-        if (d_len == nullptr) throw std::runtime_error("flash_attention_decode_len: d_len must not be null");
-        if (V_cache.rows != K_cache.rows) {
-            throw std::runtime_error("flash_attention_decode_len: K_cache/V_cache row mismatch");
-        }
-        if (Lq > K_cache.rows) throw std::runtime_error("flash_attention_decode_len: more Q rows than the cache holds");
-    } else {
-        if (valid_len > K_cache.rows || valid_len > V_cache.rows) {
-            throw std::runtime_error("flash_attention_decode_gpu: invalid valid_len");
-        }
-        if (valid_len < Lq) {
-            throw std::runtime_error("flash_attention_decode_gpu: valid_len must be >= Lq");
-        }
-    }
-    if (num_q_heads <= 0 || num_kv_heads <= 0) {
-        throw std::runtime_error("flash_attention_decode_gpu: num_q_heads / num_kv_heads must be positive");
-    }
-    if (num_q_heads % num_kv_heads != 0) {
-        throw std::runtime_error("flash_attention_decode_gpu: num_kv_heads must divide num_q_heads");
-    }
-    if (Dq % num_q_heads != 0 || Dkv % num_kv_heads != 0) {
-        throw std::runtime_error("flash_attention_decode_gpu: head_dim does not divide cols cleanly");
-    }
-    const int head_dim = Dq / num_q_heads;
-    if (Dkv / num_kv_heads != head_dim) {
-        throw std::runtime_error("flash_attention_decode_gpu: head_dim mismatch between Q and K/V");
-    }
-    const int group = num_q_heads / num_kv_heads;   // q heads served per kv head
-    if ((head_dim + static_cast<int>(FAD_BLOCK) - 1) / static_cast<int>(FAD_BLOCK) > 8) {
-        throw std::runtime_error("flash_attention_decode_gpu: head_dim too large (max 8 * FAD_BLOCK = 1024)");
-    }
-    Dtype out_dtype = is_bf16 ? Dtype::BF16 : Dtype::FP16;
-    if (O.rows != Lq || O.cols != Dq || O.dtype != out_dtype) {
-        O.resize(Lq, Dq, out_dtype);
-    }
-    if (Lq == 0 || Dq == 0 || valid_len == 0) return;
-
-    const uint32_t seq_offset = on_device ? 0u : static_cast<uint32_t>(valid_len - Lq);
-    const uint32_t uLq = static_cast<uint32_t>(Lq);
-    const uint32_t uValid = on_device ? 0u : static_cast<uint32_t>(valid_len);
-    NSUInteger oLen = 0;
-    id<MTLBuffer> bLen = on_device ? pool_require(d_len, oLen, "flash_attention_decode_len", "d_len") : nil;
-    const uint32_t uDq = static_cast<uint32_t>(Dq);
-    const uint32_t uDkv = static_cast<uint32_t>(Dkv);
-    const uint32_t uHd = static_cast<uint32_t>(head_dim);
-    const uint32_t uGroup = static_cast<uint32_t>(group);
-    const float    fSoftcap = attn_softcap;
-    const int32_t  iWindow = static_cast<int32_t>(window);
-
-    id<MTLComputePipelineState> pso = on_device ? (is_bf16 ? pso_decode_len_bf16() : pso_decode_len())
-                                                : (is_bf16 ? pso_decode_bf16() : pso_decode());
-    id<MTLBuffer> bQ = buffer_for(Q);
-    id<MTLBuffer> bK = buffer_for(K_cache);
-    id<MTLBuffer> bV = buffer_for(V_cache);
-    id<MTLBuffer> bO = buffer_for(O);
-    const NSUInteger oQ = buffer_offset_for(Q);
-    const NSUInteger oK = buffer_offset_for(K_cache);
-    const NSUInteger oV = buffer_offset_for(V_cache);
-    const NSUInteger oO = buffer_offset_for(O);
-
-    const NSUInteger shmem_bytes = (FAD_KTILE + FAD_BLOCK) * sizeof(float);
-
+    const std::size_t esz = dtype_size_bytes(K_new.dtype);
+    const NSUInteger nbytes = static_cast<NSUInteger>(static_cast<std::size_t>(L_new) * D * esz);
+    const NSUInteger dst_off = static_cast<NSUInteger>(static_cast<std::size_t>(cur_len) * D * esz);
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bQ offset:oQ atIndex:0];
-        [enc setBuffer:bK offset:oK atIndex:1];
-        [enc setBuffer:bV offset:oV atIndex:2];
-        [enc setBuffer:bO offset:oO atIndex:3];
-        [enc setBytes:&uLq      length:sizeof(uint32_t) atIndex:4];
-        if (on_device) {
-            [enc setBuffer:bLen offset:oLen atIndex:5];
-        } else {
-            [enc setBytes:&uValid   length:sizeof(uint32_t) atIndex:5];
-            [enc setBytes:&seq_offset length:sizeof(uint32_t) atIndex:8];
-        }
-        [enc setBytes:&uDq      length:sizeof(uint32_t) atIndex:6];
-        [enc setBytes:&uHd      length:sizeof(uint32_t) atIndex:7];
-        [enc setBytes:&uDkv     length:sizeof(uint32_t) atIndex:9];
-        [enc setBytes:&uGroup   length:sizeof(uint32_t) atIndex:10];
-        [enc setBytes:&fSoftcap length:sizeof(float)    atIndex:11];
-        [enc setBytes:&iWindow  length:sizeof(int32_t)  atIndex:12];
-        [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(Lq),
-                                              static_cast<NSUInteger>(num_q_heads), 1)
-            threadsPerThreadgroup:MTLSizeMake(FAD_BLOCK, 1, 1)];
-        [enc endEncoding];
+        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+        [blit copyFromBuffer:buffer_for(K_new)
+                sourceOffset:buffer_offset_for(K_new)
+                    toBuffer:buffer_for(K_cache)
+           destinationOffset:buffer_offset_for(K_cache) + dst_off
+                        size:nbytes];
+        [blit copyFromBuffer:buffer_for(V_new)
+                sourceOffset:buffer_offset_for(V_new)
+                    toBuffer:buffer_for(V_cache)
+           destinationOffset:buffer_offset_for(V_cache) + dst_off
+                        size:nbytes];
+        [blit endEncoding];
         ::brotensor::metal_impl::submit(cmd);
     }
 }
 
-} // namespace
+namespace {
+
+void check_decode_heads(const Tensor& Q, const Tensor& K_cache, const Tensor& V_cache,
+                        int num_q_heads, int num_kv_heads, const char* op) {
+    if ((Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16 && Q.dtype != Dtype::FP32) ||
+        K_cache.dtype != Q.dtype || V_cache.dtype != Q.dtype) {
+        throw std::runtime_error(std::string(op) + ": all tensors must share one float dtype");
+    }
+    if (V_cache.cols != K_cache.cols) {
+        throw std::runtime_error(std::string(op) + ": K_cache.cols != V_cache.cols");
+    }
+    if (num_q_heads <= 0 || num_kv_heads <= 0) {
+        throw std::runtime_error(std::string(op) + ": num_q_heads / num_kv_heads must be positive");
+    }
+    if (num_q_heads % num_kv_heads != 0) {
+        throw std::runtime_error(std::string(op) + ": num_kv_heads must divide num_q_heads");
+    }
+    if (Q.cols % num_q_heads != 0 || K_cache.cols % num_kv_heads != 0) {
+        throw std::runtime_error(std::string(op) + ": head_dim does not divide cols cleanly");
+    }
+    if (K_cache.cols / num_kv_heads != Q.cols / num_q_heads) {
+        throw std::runtime_error(std::string(op) + ": head_dim mismatch between Q and K/V");
+    }
+}
+
+}  // namespace
 
 void flash_attention_decode(const Tensor& Q,
                             const Tensor& K_cache, const Tensor& V_cache,
                             int valid_len, int num_q_heads, int num_kv_heads,
                             Tensor& O, float attn_softcap, int window) {
+    constexpr const char* op = "flash_attention_decode_gpu";
     if (valid_len < 0) throw std::runtime_error("flash_attention_decode_gpu: invalid valid_len");
-    decode_impl(Q, K_cache, V_cache, valid_len, nullptr, num_q_heads, num_kv_heads, O, attn_softcap, window);
+    check_decode_heads(Q, K_cache, V_cache, num_q_heads, num_kv_heads, op);
+    const int Lq = Q.rows, Dq = Q.cols, Dkv = K_cache.cols;
+    if (valid_len > K_cache.rows || valid_len > V_cache.rows) {
+        throw std::runtime_error("flash_attention_decode_gpu: invalid valid_len");
+    }
+    if (valid_len < Lq) {
+        throw std::runtime_error("flash_attention_decode_gpu: valid_len must be >= Lq");
+    }
+    if (O.rows != Lq || O.cols != Dq || O.dtype != Q.dtype) O.resize(Lq, Dq, Q.dtype);
+    if (Lq == 0 || Dq == 0) return;
+    if (valid_len == 0) { O.zero(); return; }
+
+    FaRowsProblem p;
+    p.op = op;
+    p.dt = Q.dtype;
+    p.q = Q.data; p.k = K_cache.data; p.v = V_cache.data; p.o = O.data;
+    p.lq = Lq; p.lk = valid_len;
+    p.ldq = Dq; p.ldk = Dkv; p.ldo = Dq;
+    p.hd = Dq / num_q_heads; p.hq = num_q_heads; p.hkv = num_kv_heads;
+    p.mode = FA_MODE_ROWS;
+    p.causal = true;
+    p.window = window;
+    p.q_offset = valid_len - Lq;
+    p.softcap = attn_softcap;
+    fa_rows_metal(p);
 }
 
-// The length read on the device: one launch shape whatever the length (no
-// host read, no wait), the kernel walking the first *d_len keys.
 void flash_attention_decode_len(const Tensor& Q, const Tensor& K_cache, const Tensor& V_cache,
                                 const int32_t* d_len, int num_q_heads, int num_kv_heads, Tensor& O) {
-    decode_impl(Q, K_cache, V_cache, -1, d_len, num_q_heads, num_kv_heads, O, 0.0f, 0);
+    constexpr const char* op = "flash_attention_decode_len";
+    check_decode_heads(Q, K_cache, V_cache, num_q_heads, num_kv_heads, op);
+    if (d_len == nullptr) throw std::runtime_error("flash_attention_decode_len: d_len must not be null");
+    if (V_cache.rows != K_cache.rows) {
+        throw std::runtime_error("flash_attention_decode_len: K_cache/V_cache row mismatch");
+    }
+    const int Lq = Q.rows, Dq = Q.cols, Dkv = K_cache.cols;
+    if (Lq > K_cache.rows) {
+        throw std::runtime_error("flash_attention_decode_len: more Q rows than the cache holds");
+    }
+    if (O.rows != Lq || O.cols != Dq || O.dtype != Q.dtype) O.resize(Lq, Dq, Q.dtype);
+    if (Lq == 0 || Dq == 0) return;
+    if (K_cache.rows == 0) { O.zero(); return; }
+
+    FaRowsProblem p;
+    p.op = op;
+    p.dt = Q.dtype;
+    p.q = Q.data; p.k = K_cache.data; p.v = V_cache.data; p.o = O.data;
+    p.aux = d_len;
+    p.lq = Lq; p.lk = K_cache.rows;
+    p.ldq = Dq; p.ldk = Dkv; p.ldo = Dq;
+    p.hd = Dq / num_q_heads; p.hq = num_q_heads; p.hkv = num_kv_heads;
+    p.mode = FA_MODE_LEN;
+    fa_rows_metal(p);
 }
 
 void flash_attention_decode_masked(const Tensor& Q,
@@ -761,92 +158,35 @@ void flash_attention_decode_masked(const Tensor& Q,
                                    const float* d_mask,
                                    int num_q_heads, int num_kv_heads,
                                    Tensor& O, float attn_softcap, int window) {
-    const bool is_bf16 = (Q.dtype == Dtype::BF16);
-    if ((Q.dtype != Dtype::FP16 && Q.dtype != Dtype::BF16) ||
-        K_cache.dtype != Q.dtype || V_cache.dtype != Q.dtype) {
-        throw std::runtime_error("flash_attention_decode_masked: tensors must be FP16 or BF16");
-    }
+    constexpr const char* op = "flash_attention_decode_masked";
+    check_decode_heads(Q, K_cache, V_cache, num_q_heads, num_kv_heads, op);
     if (d_mask == nullptr) {
         throw std::runtime_error("flash_attention_decode_masked: d_mask must not be null");
     }
     if (Q.rows != 1) {
         throw std::runtime_error("flash_attention_decode_masked: Q must be a single row (L_q == 1)");
     }
-    const int Dq  = Q.cols;
-    const int Dkv = K_cache.cols;
-    const int cap = K_cache.rows;
-    if (V_cache.cols != Dkv) {
-        throw std::runtime_error("flash_attention_decode_masked: K_cache.cols != V_cache.cols");
-    }
+    const int Dq = Q.cols, Dkv = K_cache.cols, cap = K_cache.rows;
     if (V_cache.rows != cap) {
         throw std::runtime_error("flash_attention_decode_masked: K_cache/V_cache row mismatch");
     }
-    if (num_q_heads <= 0 || num_kv_heads <= 0) {
-        throw std::runtime_error("flash_attention_decode_masked: num_q_heads / num_kv_heads must be positive");
-    }
-    if (num_q_heads % num_kv_heads != 0) {
-        throw std::runtime_error("flash_attention_decode_masked: num_kv_heads must divide num_q_heads");
-    }
-    if (Dq % num_q_heads != 0 || Dkv % num_kv_heads != 0) {
-        throw std::runtime_error("flash_attention_decode_masked: head_dim does not divide cols cleanly");
-    }
-    const int head_dim = Dq / num_q_heads;
-    if (Dkv / num_kv_heads != head_dim) {
-        throw std::runtime_error("flash_attention_decode_masked: head_dim mismatch between Q and K/V");
-    }
-    const int group = num_q_heads / num_kv_heads;
-    if ((head_dim + static_cast<int>(FAD_BLOCK) - 1) / static_cast<int>(FAD_BLOCK) > 8) {
-        throw std::runtime_error("flash_attention_decode_masked: head_dim too large (max 8 * FAD_BLOCK = 1024)");
-    }
-    if (O.rows != 1 || O.cols != Dq || O.dtype != Q.dtype) {
-        O.resize(1, Dq, Q.dtype);
-    }
-    if (Dq == 0 || cap == 0) return;
+    if (O.rows != 1 || O.cols != Dq || O.dtype != Q.dtype) O.resize(1, Dq, Q.dtype);
+    if (Dq == 0) return;
+    if (cap == 0) { O.zero(); return; }
 
-    const uint32_t uCap = static_cast<uint32_t>(cap);
-    const uint32_t uDq = static_cast<uint32_t>(Dq);
-    const uint32_t uDkv = static_cast<uint32_t>(Dkv);
-    const uint32_t uHd = static_cast<uint32_t>(head_dim);
-    const uint32_t uGroup = static_cast<uint32_t>(group);
-    const float    fSoftcap = attn_softcap;
-    const int32_t  iWindow = static_cast<int32_t>(window);
-
-    id<MTLComputePipelineState> pso = is_bf16 ? pso_decode_masked_bf16() : pso_decode_masked();
-    id<MTLBuffer> bQ = buffer_for(Q);
-    id<MTLBuffer> bK = buffer_for(K_cache);
-    id<MTLBuffer> bV = buffer_for(V_cache);
-    NSUInteger oM = 0;
-    id<MTLBuffer> bM = pool_require(d_mask, oM, "flash_attention_decode_masked", "mask");
-    id<MTLBuffer> bO = buffer_for(O);
-    const NSUInteger oQ = buffer_offset_for(Q);
-    const NSUInteger oK = buffer_offset_for(K_cache);
-    const NSUInteger oV = buffer_offset_for(V_cache);
-    const NSUInteger oO = buffer_offset_for(O);
-
-    const NSUInteger shmem_bytes = (FAD_KTILE + FAD_BLOCK) * sizeof(float);
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bQ offset:oQ atIndex:0];
-        [enc setBuffer:bK offset:oK atIndex:1];
-        [enc setBuffer:bV offset:oV atIndex:2];
-        [enc setBuffer:bM offset:oM atIndex:3];
-        [enc setBuffer:bO offset:oO atIndex:4];
-        [enc setBytes:&uCap     length:sizeof(uint32_t) atIndex:5];
-        [enc setBytes:&uDq      length:sizeof(uint32_t) atIndex:6];
-        [enc setBytes:&uHd      length:sizeof(uint32_t) atIndex:7];
-        [enc setBytes:&uDkv     length:sizeof(uint32_t) atIndex:8];
-        [enc setBytes:&uGroup   length:sizeof(uint32_t) atIndex:9];
-        [enc setBytes:&fSoftcap length:sizeof(float)    atIndex:10];
-        [enc setBytes:&iWindow  length:sizeof(int32_t)  atIndex:11];
-        [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(1, static_cast<NSUInteger>(num_q_heads), 1)
-            threadsPerThreadgroup:MTLSizeMake(FAD_BLOCK, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
+    FaRowsProblem p;
+    p.op = op;
+    p.dt = Q.dtype;
+    p.q = Q.data; p.k = K_cache.data; p.v = V_cache.data; p.o = O.data;
+    p.mask = d_mask;
+    p.lq = 1; p.lk = cap;
+    p.ldq = Dq; p.ldk = Dkv; p.ldo = Dq;
+    p.hd = Dq / num_q_heads; p.hq = num_q_heads; p.hkv = num_kv_heads;
+    p.mode = FA_MODE_ROWS;
+    p.window = window;
+    p.softcap = attn_softcap;
+    p.maskpos = window > 0;
+    fa_rows_metal(p);
 }
 
-} // namespace brotensor::detail::metal
+}  // namespace brotensor::detail::metal

@@ -53,6 +53,12 @@ enum class MirKind : std::uint8_t {
     ConvDirect = 39,
     WqRows = 40,
     Dequant = 41,
+    Gemv = 42,
+    GemmSimt = 43,
+    ConvSimt = 44,
+    GemvQ = 45,
+    FaRows = 46,
+    FaBwd = 47,
 };
 
 struct MirKey {
@@ -63,6 +69,7 @@ struct MirKey {
     std::uint8_t lanes = 1;
     Dtype dt2 = Dtype::FP32;
     std::uint8_t flags = 0;
+    std::uint64_t aux = 0;
 
     bool operator==(const MirKey& o) const noexcept = default;
 };
@@ -228,9 +235,22 @@ void mir_dispatch_args_3d(const MirKernel& mk, std::uint32_t gx, std::uint32_t g
                           std::span<const void* const> ptrs,
                           std::span<const std::int32_t> ints,
                           std::span<const float> flts);
+// Direct MTLBuffer dispatch (each `mtl_bufs[i]` is `(__bridge const void*)id<MTLBuffer>`,
+// with `nullptr` falling back to the first non-null buffer).
+void mir_dispatch_mtl_3d(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                         std::uint32_t gz,
+                         const void* const* mtl_bufs, const std::size_t* mtl_offs,
+                         std::size_t nbufs,
+                         std::span<const std::int32_t> ints,
+                         std::span<const float> flts);
 void mir_dispatch_dequant(std::uint32_t fmt, const char* op,
                           const void* w, const void* y, const void* scale,
                           int rows, int k, int rowbytes, bool vec);
+void mir_dispatch_gemv_q(std::uint32_t fmt, Dtype dt, const char* op,
+                         const void* x, const void* w, const void* y,
+                         const void* bias, const void* scale,
+                         int rows, int k, int B, int ldx, int ldy,
+                         int rowbytes, int act, int epi);
 void mir_dispatch_conv_direct(std::uint32_t mode, Dtype dt, const char* op,
                               const void* x, const void* w, const void* y, const void* bias,
                               int n, int cin, int t, int h, int wd,
@@ -238,6 +258,52 @@ void mir_dispatch_conv_direct(std::uint32_t mode, Dtype dt, const char* op,
                               int kt, int kh, int kw,
                               int st, int sh, int sw, int pt, int ph, int pw,
                               int dt_d, int dh, int dw, int groups);
+
+struct FaRowsProblem {
+    const char* op = "flash_attention";
+    Dtype dt = Dtype::FP16;
+    const void* q = nullptr;
+    const void* k = nullptr;
+    const void* v = nullptr;
+    void* o = nullptr;
+    const void* mask = nullptr;
+    const void* aux = nullptr;
+    const void* aux2 = nullptr;
+    int lq = 0, lk = 0;
+    int ldq = 0, ldk = 0, ldo = 0;
+    int hd = 0, hq = 0, hkv = 0;
+    int mode = 0;
+    int window = 0;
+    int nseq = 0;
+    int q_offset = 0;
+    float softcap = 0.0f;
+    bool causal = false;
+    bool maskpos = false;
+};
+
+void fa_rows_metal(const FaRowsProblem& p);
+
+struct FaBwdProblem {
+    const char* op = "flash_attention_backward";
+    Dtype dt = Dtype::FP16;
+    const void* q = nullptr;
+    const void* k = nullptr;
+    const void* v = nullptr;
+    const void* g = nullptr;
+    void* dq = nullptr;
+    void* dk = nullptr;
+    void* dv = nullptr;
+    const void* mask = nullptr;
+    const void* aux = nullptr;
+    const void* aux2 = nullptr;
+    int lq = 0, lk = 0;
+    int ldq = 0, ldk = 0, ldg = 0, ldq_out = 0, ldk_out = 0;
+    int hd = 0, heads = 0;
+    int mode = 0, window = 0, nseq = 0;
+    bool causal = false;
+};
+
+void fa_bwd_metal(const FaBwdProblem& p);
 
 struct DenseAttnProblem {
     const char* op = "attention";
