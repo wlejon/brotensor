@@ -51,6 +51,8 @@ enum class MirKind : std::uint8_t {
     FaCombine = 37,
     AttnSoftmax = 38,
     ConvDirect = 39,
+    WqRows = 40,
+    Dequant = 41,
 };
 
 struct MirKey {
@@ -221,6 +223,14 @@ void mir_dispatch_args(const MirKernel& mk, std::uint32_t gx, const char* op,
                        std::span<const void* const> ptrs,
                        std::span<const std::int32_t> ints,
                        std::span<const float> flts);
+void mir_dispatch_args_3d(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                          std::uint32_t gz, const char* op,
+                          std::span<const void* const> ptrs,
+                          std::span<const std::int32_t> ints,
+                          std::span<const float> flts);
+void mir_dispatch_dequant(std::uint32_t fmt, const char* op,
+                          const void* w, const void* y, const void* scale,
+                          int rows, int k, int rowbytes, bool vec);
 void mir_dispatch_conv_direct(std::uint32_t mode, Dtype dt, const char* op,
                               const void* x, const void* w, const void* y, const void* bias,
                               int n, int cin, int t, int h, int wd,

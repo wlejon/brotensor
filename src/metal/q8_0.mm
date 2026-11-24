@@ -6,6 +6,10 @@
 // no Metal equivalent here), but the per-row kernel is parallelised over
 // batch so it matches the CUDA GEMV-loop fallback for B in a wide range.
 
+#include "mtl_mir_cache.h"
+
+#include "../vulkan/shaders/op_codes.h"
+
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
@@ -33,23 +37,6 @@ using namespace metal;
 
 constant uint Q8_BLOCK_ELEMS = 32;
 constant uint Q8_BLOCK_BYTES = 34;
-
-// One threadgroup per (row, super_block). 32 threads, one per element.
-kernel void k_dequant_q8_0_to_fp16(device const uchar* W                 [[buffer(0)]],
-                                   device half*        Wfp16             [[buffer(1)]],
-                                   constant uint&      blocks_per_row    [[buffer(2)]],
-                                   uint2 tg [[threadgroup_position_in_grid]],
-                                   uint2 li [[thread_position_in_threadgroup]]) {
-    uint row = tg.y;
-    uint sb  = tg.x;
-    uint t   = li.x;
-    device const uchar* blk = W + (uint(row) * blocks_per_row + sb) * Q8_BLOCK_BYTES;
-    half d_h = *((device const half*)blk);
-    float d_f = float(d_h);
-    int q = int(((device const char*)blk)[2 + t]);
-    Wfp16[uint(row) * (blocks_per_row * Q8_BLOCK_ELEMS) + sb * Q8_BLOCK_ELEMS + t] =
-        half(d_f * float(q));
-}
 
 // One threadgroup per (b, row); 32 threads (one simdgroup) loop blocks
 // along K. simd_sum collapses the 32 partials into y[b, row]. The single-
@@ -88,13 +75,6 @@ kernel void k_linear_q8_0_fp16_gemv(device const uchar* W                 [[buff
     }
 }
 )msl";
-
-id<MTLComputePipelineState> pso_dequant() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_dequant_q8_0_to_fp16"); });
-    return pso;
-}
 
 id<MTLComputePipelineState> pso_gemv() {
     static dispatch_once_t once;
@@ -162,28 +142,10 @@ void dequant_q8_0_to_fp16(const Tensor& W_q8, Tensor& W_fp16) {
     if (W_fp16.rows != rows || W_fp16.cols != K || W_fp16.dtype != Dtype::FP16) {
         W_fp16.resize(rows, K, Dtype::FP16);
     }
-    const uint32_t blocks_per_row = static_cast<uint32_t>(K / Q8_BLOCK_ELEMS);
-    if (rows == 0 || blocks_per_row == 0) return;
-
-    id<MTLComputePipelineState> pso = pso_dequant();
-    id<MTLBuffer> bW = buffer_for(W_q8);
-    id<MTLBuffer> bY = buffer_for(W_fp16);
-    const NSUInteger oW = buffer_offset_for(W_q8);
-    const NSUInteger oY = buffer_offset_for(W_fp16);
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bW offset:oW atIndex:0];
-        [enc setBuffer:bY offset:oY atIndex:1];
-        [enc setBytes:&blocks_per_row length:sizeof(uint32_t) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(blocks_per_row,
-                                              static_cast<NSUInteger>(rows), 1)
-            threadsPerThreadgroup:MTLSizeMake(Q8_BLOCK_ELEMS, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
+    if (rows == 0 || K == 0) return;
+    const int rowbytes = (K / Q8_BLOCK_ELEMS) * Q8_BLOCK_BYTES;
+    mir_dispatch_dequant(QF_Q8_0, "dequant_q8_0_to_fp16", W_q8.data, W_fp16.data,
+                         nullptr, rows, K, rowbytes, true);
 }
 
 void linear_forward_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,

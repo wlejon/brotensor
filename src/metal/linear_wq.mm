@@ -16,9 +16,12 @@
 // pair 2j / 2j + 1, SwiGLU over the stacked halves j / j + N/2), as
 // linear_forward_batched_ex has them.
 
+#include "mtl_mir_cache.h"
+
 #include <brotensor/ops/linear.h>
 #include <brotensor/tensor.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -37,14 +40,11 @@ namespace {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + reason);
 }
 
-constexpr NSUInteger kQuantBlock = 256;   // threads per quantize_rows row
 constexpr NSUInteger kColsPerTg = 8;      // simdgroups (output columns) per GEMV threadgroup
 
 NSString* const kSrc = @R"msl(
 #include <metal_stdlib>
 using namespace metal;
-
-constant uint QBLOCK = 256;
 
 // ── FP8 E4M3 (OCP e4m3fn), as src/tensor.cpp's host codec ──────────────────
 inline float e4m3_decode(uint b) {
@@ -54,59 +54,6 @@ inline float e4m3_decode(uint b) {
     else         mag = as_type<float>(((e + 120u) << 23) | (m << 20));   // (1 + m/8) * 2^(e-7)
     return s ? -mag : mag;
 }
-// Magnitude codes 0..126 ascend with their value: bracket by binary search,
-// round to the nearer, ties to the even code; saturate at 448.
-inline uchar e4m3_encode(float v) {
-    if (isnan(v)) return uchar(0x7f);
-    const uint sign = signbit(v) ? 0x80u : 0u;
-    const float a = fabs(v);
-    if (a >= 448.0f) return uchar(sign | 0x7eu);
-    int lo = 0, hi = 126;
-    while (hi - lo > 1) {
-        const int mid = (lo + hi) / 2;
-        if (e4m3_decode(uint(mid)) <= a) lo = mid;
-        else hi = mid;
-    }
-    const float dl = a - e4m3_decode(uint(lo));
-    const float dh = e4m3_decode(uint(hi)) - a;
-    const int code = dl < dh ? lo : dh < dl ? hi : ((lo & 1) ? hi : lo);
-    return uchar(sign | uint(code));
-}
-
-// ── quantize_rows: one threadgroup per row ──────────────────────────────────
-template <typename T>
-void quantize_row(device const T* W, device uchar* Wq, device float* scales, uint K, uint fp8, uint row,
-                  uint tid, threadgroup float* red) {
-    device const T* w = W + ulong(row) * K;
-    float mx = 0.0f;
-    for (uint k = tid; k < K; k += QBLOCK) mx = max(mx, fabs(float(w[k])));
-    red[tid] = mx;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = QBLOCK / 2; s > 0; s >>= 1) {
-        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float scale = precise::divide(red[0], fp8 ? 448.0f : 127.0f);
-    if (tid == 0) scales[row] = scale;
-    device uchar* q = Wq + ulong(row) * K;
-    for (uint k = tid; k < K; k += QBLOCK) {
-        const float v = scale > 0.0f ? precise::divide(float(w[k]), scale) : 0.0f;
-        q[k] = fp8 ? e4m3_encode(v) : uchar(char(clamp(rint(v), -127.0f, 127.0f)));
-    }
-}
-
-#define QUANT_KERNEL(NAME, T)                                                   \
-kernel void NAME(device const T* W [[buffer(0)]], device uchar* Wq [[buffer(1)]], \
-                 device float* scales [[buffer(2)]], constant uint& K [[buffer(3)]], \
-                 constant uint& fp8 [[buffer(4)]],                             \
-                 uint row [[threadgroup_position_in_grid]],                     \
-                 uint tid [[thread_position_in_threadgroup]]) {                \
-    threadgroup float red[QBLOCK];                                              \
-    quantize_row<T>(W, Wq, scales, K, fp8, row, tid, red);                      \
-}
-QUANT_KERNEL(k_quantize_rows_fp32, float)
-QUANT_KERNEL(k_quantize_rows_fp16, half)
-QUANT_KERNEL(k_quantize_rows_bf16, bfloat)
 
 // ── linear_forward_batched_wq_ex: one simdgroup per output column ──────────
 struct WqParams {
@@ -226,33 +173,6 @@ kernel void NAME(device const uchar* Wq [[buffer(0)]], device const float* scale
 WQ_KERNEL(k_linear_wq_fp32, float)
 WQ_KERNEL(k_linear_wq_fp16, half)
 WQ_KERNEL(k_linear_wq_bf16, bfloat)
-
-// ── dequantize_rows: four weights a thread ──────────────────────────────────
-template <typename T>
-void dequantize_rows_impl(device const uchar* Q, device const float* scales, uint K, ulong n, uint fp8,
-                          device T* W, uint tid) {
-    const ulong i0 = ulong(tid) * 4ul;
-    for (uint j = 0; j < 4u; ++j) {
-        const ulong i = i0 + j;
-        if (i >= n) return;
-        const float v = w_decode(Q[i], fp8) * scales[i / ulong(K)];
-        W[i] = T(v);
-    }
-}
-
-#define DEQUANT_KERNEL(NAME, T)                                                   \
-kernel void NAME(device const uchar* Q [[buffer(0)]],                             \
-                 device const float* scales [[buffer(1)]],                        \
-                 device T* W [[buffer(2)]],                                       \
-                 constant uint& K [[buffer(3)]],                                  \
-                 constant ulong& n [[buffer(4)]],                                 \
-                 constant uint& fp8 [[buffer(5)]],                                \
-                 uint tid [[thread_position_in_grid]]) {                          \
-    dequantize_rows_impl<T>(Q, scales, K, n, fp8, W, tid);                        \
-}
-DEQUANT_KERNEL(k_dequantize_rows_fp32, float)
-DEQUANT_KERNEL(k_dequantize_rows_fp16, half)
-DEQUANT_KERNEL(k_dequantize_rows_bf16, bfloat)
 )msl";
 
 #define DEF_PSO(NAME, FN)                                                      \
@@ -262,12 +182,6 @@ DEQUANT_KERNEL(k_dequantize_rows_bf16, bfloat)
         dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, FN); });          \
         return pso;                                                            \
     }
-DEF_PSO(pso_quant_fp32, @"k_quantize_rows_fp32")
-DEF_PSO(pso_quant_fp16, @"k_quantize_rows_fp16")
-DEF_PSO(pso_quant_bf16, @"k_quantize_rows_bf16")
-DEF_PSO(pso_dequant_fp32, @"k_dequantize_rows_fp32")
-DEF_PSO(pso_dequant_fp16, @"k_dequantize_rows_fp16")
-DEF_PSO(pso_dequant_bf16, @"k_dequantize_rows_bf16")
 DEF_PSO(pso_wq_fp32, @"k_linear_wq_fp32")
 DEF_PSO(pso_wq_fp16, @"k_linear_wq_fp16")
 DEF_PSO(pso_wq_bf16, @"k_linear_wq_bf16")
@@ -292,25 +206,14 @@ void quantize_rows(const Tensor& W, Dtype fmt, Tensor& Wq, Tensor& scales) {
     if (Wq.rows != N || Wq.cols != K || Wq.dtype != fmt) Wq.resize(N, K, fmt);
     if (scales.rows != N || scales.cols != 1 || scales.dtype != Dtype::FP32) scales.resize(N, 1, Dtype::FP32);
     if (N == 0) return;
-    const uint32_t uK = static_cast<uint32_t>(K);
-    const uint32_t fp8 = fmt == Dtype::FP8_E4M3 ? 1u : 0u;
-    id<MTLComputePipelineState> pso = W.dtype == Dtype::FP16   ? pso_quant_fp16()
-                                      : W.dtype == Dtype::BF16 ? pso_quant_bf16()
-                                                               : pso_quant_fp32();
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:buffer_for(W) offset:buffer_offset_for(W) atIndex:0];
-        [enc setBuffer:buffer_for(Wq) offset:buffer_offset_for(Wq) atIndex:1];
-        [enc setBuffer:buffer_for(scales) offset:buffer_offset_for(scales) atIndex:2];
-        [enc setBytes:&uK length:sizeof(uint32_t) atIndex:3];
-        [enc setBytes:&fp8 length:sizeof(uint32_t) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(N), 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(kQuantBlock, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
+    const MirKernel mk = mir_kernel(
+        {MirKind::WqRows, 0u, W.dtype, Dtype::FP32, 1, Dtype::FP32,
+         static_cast<std::uint8_t>(fmt == Dtype::FP8_E4M3 ? 1u : 0u)});
+    const std::uint32_t gx = static_cast<std::uint32_t>(std::min(N, 65535));
+    const std::uint32_t gy = static_cast<std::uint32_t>((static_cast<std::uint64_t>(N) + gx - 1u) / gx);
+    const void* ptrs[] = {W.data, Wq.data, scales.data};
+    const std::int32_t ints[] = {N, K};
+    mir_dispatch_args_3d(mk, gx, gy, 1u, op, ptrs, ints, {});
 }
 
 void dequantize_rows(const Tensor& Wq, const Tensor& scales, Dtype out, Tensor& W) {
@@ -321,29 +224,16 @@ void dequantize_rows(const Tensor& Wq, const Tensor& scales, Dtype out, Tensor& 
     if (out != Dtype::FP16 && out != Dtype::BF16 && out != Dtype::FP32) fail(op, "out must be FP16, BF16 or FP32");
     const int N = Wq.rows, K = Wq.cols;
     if (W.rows != N || W.cols != K || W.dtype != out) W.resize(N, K, out);
-    const uint64_t n = static_cast<uint64_t>(N) * static_cast<uint64_t>(K);
+    const std::uint64_t n = static_cast<std::uint64_t>(N) * static_cast<std::uint64_t>(K);
     if (n == 0) return;
-    const uint32_t uK = static_cast<uint32_t>(K);
-    const uint32_t fp8 = Wq.dtype == Dtype::FP8_E4M3 ? 1u : 0u;
-    id<MTLComputePipelineState> pso = out == Dtype::FP16   ? pso_dequant_fp16()
-                                      : out == Dtype::BF16 ? pso_dequant_bf16()
-                                                           : pso_dequant_fp32();
-    const NSUInteger tgs = static_cast<NSUInteger>((n + 1023) / 1024);
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:buffer_for(Wq) offset:buffer_offset_for(Wq) atIndex:0];
-        [enc setBuffer:buffer_for(scales) offset:buffer_offset_for(scales) atIndex:1];
-        [enc setBuffer:buffer_for(W) offset:buffer_offset_for(W) atIndex:2];
-        [enc setBytes:&uK length:sizeof(uint32_t) atIndex:3];
-        [enc setBytes:&n length:sizeof(uint64_t) atIndex:4];
-        [enc setBytes:&fp8 length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(kQuantBlock, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
+    const MirKernel mk = mir_kernel(
+        {MirKind::WqRows, 1u, out, Dtype::FP32, 1, Dtype::FP32,
+         static_cast<std::uint8_t>(Wq.dtype == Dtype::FP8_E4M3 ? 1u : 0u)});
+    const std::uint32_t gx = static_cast<std::uint32_t>(
+        std::clamp<std::uint64_t>((n + 255u) / 256u, 1u, 65535u));
+    const void* ptrs[] = {W.data, Wq.data, scales.data};
+    const std::int32_t ints[] = {N, K};
+    mir_dispatch_args(mk, gx, op, ptrs, ints, {});
 }
 
 void linear_forward_batched_wq_ex(const Tensor& Wq, const Tensor& scales, const Tensor* bias, const Tensor& X,

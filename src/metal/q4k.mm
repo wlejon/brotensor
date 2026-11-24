@@ -5,6 +5,10 @@
 // contract and accumulation (FP32 partials, FP16 store). 256 threads per
 // threadgroup; cross-simdgroup reduction via threadgroup scratch.
 
+#include "mtl_mir_cache.h"
+
+#include "../vulkan/shaders/op_codes.h"
+
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
@@ -64,48 +68,6 @@ inline float block_reduce_sum_256(float v,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     return scratch[0];
-}
-
-// One threadgroup per (row, super_block). 256 threads, one per element.
-kernel void k_dequant_q4k_to_fp16(device const uchar* W                 [[buffer(0)]],
-                                  device half*        Wfp16             [[buffer(1)]],
-                                  constant uint&      blocks_per_row    [[buffer(2)]],
-                                  uint2 tg [[threadgroup_position_in_grid]],
-                                  uint2 li [[thread_position_in_threadgroup]]) {
-    uint row = tg.y;
-    uint sb  = tg.x;
-    uint t   = li.x;
-    threadgroup uchar W_smem[Q4K_BLOCK_BYTES];
-    threadgroup float sc_f[8];
-    threadgroup float m_f [8];
-    threadgroup float d_f;
-    threadgroup float dmin_f;
-
-    device const uchar* blk = W + (uint(row) * blocks_per_row + sb) * Q4K_BLOCK_BYTES;
-    if (t < Q4K_BLOCK_BYTES) W_smem[t] = blk[t];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (t == 0u) {
-        d_f    = float(*((threadgroup const half*)W_smem));
-        dmin_f = float(*((threadgroup const half*)(W_smem + 2)));
-    }
-    if (t < 8u) {
-        uchar sc, m;
-        unpack_sc_m(t, W_smem + 4, sc, m);
-        sc_f[t] = float(sc);
-        m_f [t] = float(m);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint is   = t >> 5;
-    uint l    = t & 31u;
-    uint pair = is >> 1;
-    uchar qb  = W_smem[16u + pair * 32u + l];
-    int nib   = ((is & 1u) != 0u) ? int(qb >> 4) : int(qb & 0x0Fu);
-    float y   = d_f * sc_f[is] * float(nib) - dmin_f * m_f[is];
-
-    Wfp16[uint(row) * (blocks_per_row * Q4K_BLOCK_ELEMS) + sb * Q4K_BLOCK_ELEMS + t]
-        = half(y);
 }
 
 // One threadgroup per (b, row); 256 threads loop super-blocks along K.
@@ -179,13 +141,6 @@ kernel void k_linear_q4k_fp16_gemv(device const uchar* W                 [[buffe
 }
 )msl";
 
-id<MTLComputePipelineState> pso_dequant() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_dequant_q4k_to_fp16"); });
-    return pso;
-}
-
 id<MTLComputePipelineState> pso_gemv() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -252,28 +207,10 @@ void dequant_q4k_to_fp16(const Tensor& W_q4k, Tensor& W_fp16) {
     if (W_fp16.rows != rows || W_fp16.cols != K || W_fp16.dtype != Dtype::FP16) {
         W_fp16.resize(rows, K, Dtype::FP16);
     }
-    const uint32_t blocks_per_row = static_cast<uint32_t>(K / Q4K_BLOCK_ELEMS);
-    if (rows == 0 || blocks_per_row == 0) return;
-
-    id<MTLComputePipelineState> pso = pso_dequant();
-    id<MTLBuffer> bW = buffer_for(W_q4k);
-    id<MTLBuffer> bY = buffer_for(W_fp16);
-    const NSUInteger oW = buffer_offset_for(W_q4k);
-    const NSUInteger oY = buffer_offset_for(W_fp16);
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bW offset:oW atIndex:0];
-        [enc setBuffer:bY offset:oY atIndex:1];
-        [enc setBytes:&blocks_per_row length:sizeof(uint32_t) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(blocks_per_row,
-                                              static_cast<NSUInteger>(rows), 1)
-            threadsPerThreadgroup:MTLSizeMake(Q4K_BLOCK_ELEMS, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
+    if (rows == 0 || K == 0) return;
+    const int rowbytes = (K / Q4K_BLOCK_ELEMS) * Q4K_BLOCK_BYTES;
+    mir_dispatch_dequant(QF_Q4K, "dequant_q4k_to_fp16", W_q4k.data, W_fp16.data,
+                         nullptr, rows, K, rowbytes, true);
 }
 
 void linear_forward_q4k_fp16(const Tensor& W_q4k, const Tensor* bias,

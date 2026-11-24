@@ -321,9 +321,12 @@ brass::Function* build_dequant_mir(brass::Module& mod, std::uint32_t fmt, bool v
             Value* blk = c.b.build_add(row_ptr, c.b.build_mul(c.b.build_zext_i64(c.b.build_lshr(k, c.i32(5))),
                                                               kb.const_i64(34)));
             Value* d = kb.f16_to_f32(kb.load_u16(blk));
-            Value* q64 = kb.load_i64(c.b.build_add(blk, c.b.build_zext_i64(c.b.build_add(c.i32(2), c.b.build_and(k, c.i32(31))))));
-            Value* qlo = c.b.build_trunc_i32(q64);
-            Value* qhi = c.b.build_trunc_i32(c.b.build_lshr(q64, kb.const_i64(32)));
+            // 34-byte blocks are 2-byte aligned; load four u16s instead of an unaligned i64.
+            Value* qp = c.b.build_add(blk, c.b.build_zext_i64(c.b.build_add(c.i32(2), c.b.build_and(k, c.i32(31)))));
+            Value* qlo = c.b.build_or(kb.load_u16(qp),
+                                      c.b.build_shl(kb.load_u16(c.b.build_add(qp, kb.const_i64(2))), c.i32(16)));
+            Value* qhi = c.b.build_or(kb.load_u16(c.b.build_add(qp, kb.const_i64(4))),
+                                      c.b.build_shl(kb.load_u16(c.b.build_add(qp, kb.const_i64(6))), c.i32(16)));
             for (int e = 0; e < 8; ++e) {
                 Value* b = c.b.build_and(c.b.build_lshr(e < 4 ? qlo : qhi, c.i32((e & 3) * 8)), c.i32(0xff));
                 w[static_cast<std::size_t>(e)] = c.b.build_mul(s8_byte_to_f32(c, b), d);
@@ -379,8 +382,17 @@ brass::Function* build_dequant_mir(brass::Module& mod, std::uint32_t fmt, bool v
             Value* qh_off = c.b.build_add(c.i32(128), c.b.build_add(c.b.build_shl(g, c.i32(5)), l0));
             Value* sc_off = c.b.build_add(c.i32(192), c.b.build_add(c.b.build_shl(g, c.i32(3)),
                                                                     c.b.build_shl(quad, c.i32(1))));
-            Value* ql64 = kb.load_i64(c.b.build_add(blk, c.b.build_zext_i64(ql_off)));
-            Value* qh64 = kb.load_i64(c.b.build_add(blk, c.b.build_zext_i64(qh_off)));
+            // 210-byte blocks are 2-byte aligned; load four u16s per 8-byte slice.
+            Value* qlp = c.b.build_add(blk, c.b.build_zext_i64(ql_off));
+            Value* qhp = c.b.build_add(blk, c.b.build_zext_i64(qh_off));
+            Value* qlo = c.b.build_or(kb.load_u16(qlp),
+                                      c.b.build_shl(kb.load_u16(c.b.build_add(qlp, kb.const_i64(2))), c.i32(16)));
+            Value* qhi = c.b.build_or(kb.load_u16(c.b.build_add(qlp, kb.const_i64(4))),
+                                      c.b.build_shl(kb.load_u16(c.b.build_add(qlp, kb.const_i64(6))), c.i32(16)));
+            Value* hlo = c.b.build_or(kb.load_u16(qhp),
+                                      c.b.build_shl(kb.load_u16(c.b.build_add(qhp, kb.const_i64(2))), c.i32(16)));
+            Value* hhi = c.b.build_or(kb.load_u16(c.b.build_add(qhp, kb.const_i64(4))),
+                                      c.b.build_shl(kb.load_u16(c.b.build_add(qhp, kb.const_i64(6))), c.i32(16)));
             Value* bx = kb.load_u16(c.b.build_add(blk, c.b.build_zext_i64(sc_off)));
             Value* d = kb.f16_to_f32(kb.load_u16(c.b.build_add(blk, kb.const_i64(208))));
             Value* sbyte = c.b.build_and(c.b.build_lshr(bx, c.b.build_shl(c.b.build_lshr(l0, c.i32(4)), c.i32(3))),
@@ -388,10 +400,6 @@ brass::Function* build_dequant_mir(brass::Module& mod, std::uint32_t fmt, bool v
             Value* s = c.b.build_mul(d, s8_byte_to_f32(c, sbyte));
             Value* ql_sh = c.b.build_select(c.b.build_uge(quad, c.i32(2)), c.i32(4), c.i32(0));
             Value* qh_sh = c.b.build_shl(quad, c.i32(1));
-            Value* qlo = c.b.build_trunc_i32(ql64);
-            Value* qhi = c.b.build_trunc_i32(c.b.build_lshr(ql64, kb.const_i64(32)));
-            Value* hlo = c.b.build_trunc_i32(qh64);
-            Value* hhi = c.b.build_trunc_i32(c.b.build_lshr(qh64, kb.const_i64(32)));
             for (int e = 0; e < 8; ++e) {
                 Value* bw = e < 4 ? qlo : qhi;
                 Value* hw = e < 4 ? hlo : hhi;

@@ -632,3 +632,18 @@ Extended Metal's runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`, `261` / `7
   - Rewritten / slimmed / added files (all `<= 756` LOC; max file across all of `src/metal/` is `852` LOC): `mtl_mir_cache.{h,mm}` (`261` / `756`), `attention.mm` (`660 -> 717`), `attention_bwd.mm` (`280`, new), `conv2d.mm` (`625 -> 462`), `conv3d.mm` (`508 -> 262`), `conv_transpose2d.mm` (`495 -> 256`), `flash_attention.mm` (`820 -> 704`), `flash_attention_msl.h` (`742 -> 651`), `flash_attention_backward.mm` (`429 -> 421`).
   - **Net Metal LOC delta (Wave 8):** **`-4,373` net Metal LOC** (`src/metal/` `22,418 -> 18,045` LOC; **cumulative Waves 1–8: `-18,640` net Metal LOC** and 50 Metal files deleted).
 
+---
+
+## Wave 9 (Metal / Apple M2 Pro): Quantization Helpers (`WqRows` / `Dequant`) -> Single-Source Brass MIR
+
+Extended Metal's runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`, `271` / `787` LOC) with `MirKind::{WqRows, Dequant}` backed by `src/kernels/mir_quant_helpers.h` (`build_wq_rows_mir`, `build_dequant_mir`), added 3D grid dispatch (`mir_dispatch_args_3d`) and `mir_dispatch_dequant`, wired Metal's `quantize_rows` and `dequantize_rows` in `src/metal/linear_wq.mm` (`406 -> 296` LOC, preserving `wq_gemv` / `linear_forward_batched_wq_ex`) onto `MirKind::WqRows`, and wired `dequant_q4k_to_fp16`, `dequant_q6k_to_fp16`, and `dequant_q8_0_to_fp16` in `src/metal/{q4k,q6k,q8_0}.mm` (preserving Metal's GEMV and simdgroup prefill GEMM fast paths) onto `MirKind::Dequant`.
+- **Cross-backend alignment fix in `src/kernels/mir_quant_helpers.cpp` (`415 -> 423` LOC):** `QF_Q8_0` (`34`-byte blocks) and `QF_Q6K` (`210`-byte blocks) are 2-byte aligned on odd blocks (`34 % 8 == 2`, `210 % 8 == 2`); replaced unaligned 8-byte `kb.load_i64` in those two dequant paths with four aligned 16-bit `kb.load_u16` loads packed into `u32` words (avoiding silent MSL address truncation on Apple Silicon and misaligned load traps on PTX).
+
+### Wave 9 Metal Verification & LOC Delta
+- **Parity, Formal Audit & Full `ctest` Suite (Apple M2 Pro, Metal Release, `brass` `d5608f4`):**
+  - Targeted Wave 9 suites (`brotensor_test_q8_0_parity`, `brotensor_test_q6k_parity`, `brotensor_test_q4k_parity`, `brotensor_test_quant_prefill_parity`, `brotensor_test_linear_wq_parity`, `brotensor_test_int8_quant`, `brotensor_test_gpu_mir_emit`): **7/7 passed** (`2.89 s`, `0` failures).
+  - Full Metal `ctest` (`-LE gcstress -j2 --timeout 300`, including `backward_index_proofs` and `backward_shader_audit`): **190/190 passed** (`584.37 s`, `0` failures).
+- **LOC Delta (Metal Wave 9):**
+  - Modified files (all `<= 787` LOC; max file across all of `src/metal/` is `852` LOC): `mtl_mir_cache.{h,mm}` (`261 -> 271` / `756 -> 787`), `linear_wq.mm` (`406 -> 296`), `q4k.mm` (`345 -> 282`), `q6k.mm` (`328 -> 278`), `q8_0.mm` (`256 -> 218`), `src/kernels/mir_quant_helpers.cpp` (`415 -> 423`).
+  - **Net Metal LOC delta (Wave 9):** **`-220` net Metal LOC** (`src/metal/` `18,045 -> 17,825` LOC; **cumulative Waves 1–9: `-18,860` net Metal LOC** and 50 Metal files deleted).
+

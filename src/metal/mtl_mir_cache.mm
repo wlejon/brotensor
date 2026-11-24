@@ -14,6 +14,7 @@
 #include "../kernels/mir_lstm.h"
 #include "../kernels/mir_misc.h"
 #include "../kernels/mir_norm.h"
+#include "../kernels/mir_quant_helpers.h"
 #include "../kernels/mir_reduce.h"
 #include "../kernels/mir_remap.h"
 #include "../kernels/mir_resample.h"
@@ -178,6 +179,12 @@ const MirEntry* compile_mir(const MirKey& k) {
             break;
         case MirKind::ConvDirect:
             fn = kernels::build_conv_direct_mir(mod, k.op, k.dt0, k.flags != 0);
+            break;
+        case MirKind::WqRows:
+            fn = kernels::build_wq_rows_mir(mod, k.op, k.dt0, k.flags != 0);
+            break;
+        case MirKind::Dequant:
+            fn = kernels::build_dequant_mir(mod, k.op, k.flags != 0);
             break;
     }
     brass::target::MslOptions opts;
@@ -713,16 +720,40 @@ void mir_dispatch_topk(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
     submit_mir_ptrs(e, gx, gy, 1, op, ptrs, 4, buf);
 }
 
-void mir_dispatch_args(const MirKernel& mk, std::uint32_t gx, const char* op,
-                       std::span<const void* const> ptrs,
-                       std::span<const std::int32_t> ints,
-                       std::span<const float> flts) {
+void mir_dispatch_args_3d(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                          std::uint32_t gz, const char* op,
+                          std::span<const void* const> ptrs,
+                          std::span<const std::int32_t> ints,
+                          std::span<const float> flts) {
     const MirEntry& e = *mk.entry;
     std::array<std::uint8_t, 128> buf{};
     std::size_t s = 0;
     for (std::int32_t v : ints) put_scalar(buf, e.msl, s++, v);
     for (float f : flts) put_scalar(buf, e.msl, s++, f);
-    submit_mir_ptrs(e, gx, 1, 1, op, ptrs.data(), ptrs.size(), buf);
+    submit_mir_ptrs(e, gx, gy, gz, op, ptrs.data(), ptrs.size(), buf);
+}
+
+void mir_dispatch_args(const MirKernel& mk, std::uint32_t gx, const char* op,
+                       std::span<const void* const> ptrs,
+                       std::span<const std::int32_t> ints,
+                       std::span<const float> flts) {
+    mir_dispatch_args_3d(mk, gx, 1u, 1u, op, ptrs, ints, flts);
+}
+
+void mir_dispatch_dequant(std::uint32_t fmt, const char* op,
+                          const void* w, const void* y, const void* scale,
+                          int rows, int k, int rowbytes, bool vec) {
+    if (rows <= 0 || k <= 0) return;
+    const MirKernel mk = mir_kernel(
+        {MirKind::Dequant, fmt, Dtype::FP16, Dtype::FP32, 1, Dtype::FP32,
+         static_cast<std::uint8_t>(vec ? 1u : 0u)});
+    const std::uint64_t total = static_cast<std::uint64_t>(rows) *
+                                static_cast<std::uint64_t>(vec ? k / 8 : k);
+    const std::uint32_t gx = static_cast<std::uint32_t>(
+        std::clamp<std::uint64_t>((total + 255u) / 256u, 1u, 65535u));
+    const void* ptrs[] = {w, y, scale};
+    const std::int32_t ints[] = {rows, k, rowbytes};
+    mir_dispatch_args(mk, gx, op, ptrs, ints, {});
 }
 
 void mir_dispatch_conv_direct(std::uint32_t mode, Dtype dt, const char* op,
