@@ -42,52 +42,6 @@ using namespace metal;
 
 constant uint SG_BLOCK = 256;
 
-// ── elementwise unary fwd: one thread per element ──
-#define UNARY_FWD(NAME, T, EXPR)                                              \
-kernel void NAME(device const T* x [[buffer(0)]],                             \
-                 device T*       y [[buffer(1)]],                             \
-                 constant uint&  n [[buffer(2)]],                             \
-                 uint i [[thread_position_in_grid]]) {                        \
-    if (i >= n) return;                                                       \
-    float xv = float(x[i]);                                                   \
-    y[i] = T(EXPR);                                                           \
-}
-
-// ── elementwise unary bwd: reads x (or y) and dY, overwrites dX ──
-#define UNARY_BWD(NAME, T, EXPR)                                              \
-kernel void NAME(device const T* x  [[buffer(0)]],                            \
-                 device const T* dY [[buffer(1)]],                            \
-                 device T*       dX [[buffer(2)]],                            \
-                 constant uint&  n  [[buffer(3)]],                            \
-                 uint i [[thread_position_in_grid]]) {                        \
-    if (i >= n) return;                                                       \
-    float xv = float(x[i]);                                                   \
-    float gv = float(dY[i]);                                                  \
-    dX[i] = T(EXPR);                                                          \
-}
-
-UNARY_FWD(k_sin_fwd_fp32, float,  sin(xv))
-UNARY_FWD(k_sin_fwd_fp16, half,   sin(xv))
-UNARY_FWD(k_sin_fwd_bf16, bfloat, sin(xv))
-UNARY_BWD(k_sin_bwd_fp32, float,  gv * cos(xv))
-UNARY_BWD(k_sin_bwd_fp16, half,   gv * cos(xv))
-UNARY_BWD(k_sin_bwd_bf16, bfloat, gv * cos(xv))
-
-UNARY_FWD(k_cos_fwd_fp32, float,  cos(xv))
-UNARY_FWD(k_cos_fwd_fp16, half,   cos(xv))
-UNARY_FWD(k_cos_fwd_bf16, bfloat, cos(xv))
-UNARY_BWD(k_cos_bwd_fp32, float,  -gv * sin(xv))
-UNARY_BWD(k_cos_bwd_fp16, half,   -gv * sin(xv))
-UNARY_BWD(k_cos_bwd_bf16, bfloat, -gv * sin(xv))
-
-UNARY_FWD(k_rsqrt_fwd_fp32, float,  rsqrt(xv))
-UNARY_FWD(k_rsqrt_fwd_fp16, half,   rsqrt(xv))
-UNARY_FWD(k_rsqrt_fwd_bf16, bfloat, rsqrt(xv))
-// backward reads the OUTPUT y (bound at buffer 0): dy/dx = -1/2 y^3.
-UNARY_BWD(k_rsqrt_bwd_fp32, float,  -0.5f * gv * xv * xv * xv)
-UNARY_BWD(k_rsqrt_bwd_fp16, half,   -0.5f * gv * xv * xv * xv)
-UNARY_BWD(k_rsqrt_bwd_bf16, bfloat, -0.5f * gv * xv * xv * xv)
-
 // ── pixel_norm: one threadgroup per row, reduce over columns ──
 #define PIXEL_NORM_FWD(NAME, T)                                               \
 kernel void NAME(device const T* X    [[buffer(0)]],                          \
@@ -172,12 +126,6 @@ PIXEL_NORM_BWD(k_pixel_norm_bwd_bf16, bfloat)
         dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, FN); });          \
         return pso;                                                           \
     }
-DEF_PSO(pso_sin_fwd_fp32, @"k_sin_fwd_fp32") DEF_PSO(pso_sin_fwd_fp16, @"k_sin_fwd_fp16") DEF_PSO(pso_sin_fwd_bf16, @"k_sin_fwd_bf16")
-DEF_PSO(pso_sin_bwd_fp32, @"k_sin_bwd_fp32") DEF_PSO(pso_sin_bwd_fp16, @"k_sin_bwd_fp16") DEF_PSO(pso_sin_bwd_bf16, @"k_sin_bwd_bf16")
-DEF_PSO(pso_cos_fwd_fp32, @"k_cos_fwd_fp32") DEF_PSO(pso_cos_fwd_fp16, @"k_cos_fwd_fp16") DEF_PSO(pso_cos_fwd_bf16, @"k_cos_fwd_bf16")
-DEF_PSO(pso_cos_bwd_fp32, @"k_cos_bwd_fp32") DEF_PSO(pso_cos_bwd_fp16, @"k_cos_bwd_fp16") DEF_PSO(pso_cos_bwd_bf16, @"k_cos_bwd_bf16")
-DEF_PSO(pso_rsqrt_fwd_fp32, @"k_rsqrt_fwd_fp32") DEF_PSO(pso_rsqrt_fwd_fp16, @"k_rsqrt_fwd_fp16") DEF_PSO(pso_rsqrt_fwd_bf16, @"k_rsqrt_fwd_bf16")
-DEF_PSO(pso_rsqrt_bwd_fp32, @"k_rsqrt_bwd_fp32") DEF_PSO(pso_rsqrt_bwd_fp16, @"k_rsqrt_bwd_fp16") DEF_PSO(pso_rsqrt_bwd_bf16, @"k_rsqrt_bwd_bf16")
 DEF_PSO(pso_pn_fwd_fp32, @"k_pixel_norm_fwd_fp32") DEF_PSO(pso_pn_fwd_fp16, @"k_pixel_norm_fwd_fp16") DEF_PSO(pso_pn_fwd_bf16, @"k_pixel_norm_fwd_bf16")
 DEF_PSO(pso_pn_bwd_fp32, @"k_pixel_norm_bwd_fp32") DEF_PSO(pso_pn_bwd_fp16, @"k_pixel_norm_bwd_fp16") DEF_PSO(pso_pn_bwd_bf16, @"k_pixel_norm_bwd_bf16")
 #undef DEF_PSO
@@ -186,48 +134,6 @@ void require_fp(const char* op, const Tensor& t, const char* name) {
     if (t.dtype != Dtype::FP32 && t.dtype != Dtype::FP16 && t.dtype != Dtype::BF16) {
         throw std::runtime_error(std::string("brotensor: ") + op + ": " + name +
                                  " must be FP32/FP16/BF16");
-    }
-}
-
-// Run an elementwise unary: arg0=input, arg1=output, n at index 2.
-void run_unary(id<MTLComputePipelineState> pso, const Tensor& in, Tensor& out) {
-    const uint32_t n = static_cast<uint32_t>(in.size());
-    if (n == 0) return;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:buffer_for(in)  offset:buffer_offset_for(in)  atIndex:0];
-        [enc setBuffer:buffer_for(out) offset:buffer_offset_for(out) atIndex:1];
-        [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
-        NSUInteger tpt = [pso maxTotalThreadsPerThreadgroup];
-        if (tpt > 256) tpt = 256;
-        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
-}
-
-// Run an elementwise unary backward: arg0=x|y, arg1=dY, arg2=dX, n at index 3.
-void run_unary_bwd(id<MTLComputePipelineState> pso, const Tensor& a,
-                   const Tensor& dY, Tensor& dX) {
-    const uint32_t n = static_cast<uint32_t>(a.size());
-    if (n == 0) return;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:buffer_for(a)  offset:buffer_offset_for(a)  atIndex:0];
-        [enc setBuffer:buffer_for(dY) offset:buffer_offset_for(dY) atIndex:1];
-        [enc setBuffer:buffer_for(dX) offset:buffer_offset_for(dX) atIndex:2];
-        [enc setBytes:&n length:sizeof(uint32_t) atIndex:3];
-        NSUInteger tpt = [pso maxTotalThreadsPerThreadgroup];
-        if (tpt > 256) tpt = 256;
-        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
@@ -241,63 +147,6 @@ id<MTLComputePipelineState> pick(const Tensor& t,
 }
 
 } // namespace
-
-// ─── sin ────────────────────────────────────────────────────────────────────
-
-void sin_forward(const Tensor& x, Tensor& y) {
-    require_fp("sin_forward", x, "x");
-    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype)
-        y.resize(x.rows, x.cols, x.dtype);
-    run_unary(pick(x, pso_sin_fwd_fp32(), pso_sin_fwd_fp16(), pso_sin_fwd_bf16()), x, y);
-}
-
-void sin_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
-    require_fp("sin_backward", x, "x");
-    require_fp("sin_backward", dY, "dY");
-    if (dY.dtype != x.dtype)
-        throw std::runtime_error("brotensor: sin_backward: dY.dtype must match x.dtype");
-    if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype)
-        dX.resize(x.rows, x.cols, x.dtype);
-    run_unary_bwd(pick(x, pso_sin_bwd_fp32(), pso_sin_bwd_fp16(), pso_sin_bwd_bf16()), x, dY, dX);
-}
-
-// ─── cos ────────────────────────────────────────────────────────────────────
-
-void cos_forward(const Tensor& x, Tensor& y) {
-    require_fp("cos_forward", x, "x");
-    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype)
-        y.resize(x.rows, x.cols, x.dtype);
-    run_unary(pick(x, pso_cos_fwd_fp32(), pso_cos_fwd_fp16(), pso_cos_fwd_bf16()), x, y);
-}
-
-void cos_backward(const Tensor& x, const Tensor& dY, Tensor& dX) {
-    require_fp("cos_backward", x, "x");
-    require_fp("cos_backward", dY, "dY");
-    if (dY.dtype != x.dtype)
-        throw std::runtime_error("brotensor: cos_backward: dY.dtype must match x.dtype");
-    if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype)
-        dX.resize(x.rows, x.cols, x.dtype);
-    run_unary_bwd(pick(x, pso_cos_bwd_fp32(), pso_cos_bwd_fp16(), pso_cos_bwd_bf16()), x, dY, dX);
-}
-
-// ─── rsqrt ──────────────────────────────────────────────────────────────────
-
-void rsqrt_forward(const Tensor& x, Tensor& y) {
-    require_fp("rsqrt_forward", x, "x");
-    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype)
-        y.resize(x.rows, x.cols, x.dtype);
-    run_unary(pick(x, pso_rsqrt_fwd_fp32(), pso_rsqrt_fwd_fp16(), pso_rsqrt_fwd_bf16()), x, y);
-}
-
-void rsqrt_backward(const Tensor& y, const Tensor& dY, Tensor& dX) {
-    require_fp("rsqrt_backward", y, "y");
-    require_fp("rsqrt_backward", dY, "dY");
-    if (dY.dtype != y.dtype)
-        throw std::runtime_error("brotensor: rsqrt_backward: dY.dtype must match y.dtype");
-    if (dX.rows != y.rows || dX.cols != y.cols || dX.dtype != y.dtype)
-        dX.resize(y.rows, y.cols, y.dtype);
-    run_unary_bwd(pick(y, pso_rsqrt_bwd_fp32(), pso_rsqrt_bwd_fp16(), pso_rsqrt_bwd_bf16()), y, dY, dX);
-}
 
 // ─── pixel_norm ───────────────────────────────────────────────────────────────
 

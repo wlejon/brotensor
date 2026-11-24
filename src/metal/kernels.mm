@@ -15,87 +15,7 @@ static NSString* const kKernelsMSL = @R"msl(
 #include <metal_stdlib>
 using namespace metal;
 
-// ── elementwise ─────────────────────────────────────────────────────────
-
-kernel void k_relu_forward(device const float* x [[buffer(0)]],
-                           device float*       y [[buffer(1)]],
-                           constant uint& n      [[buffer(2)]],
-                           uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    float v = x[i];
-    y[i] = v > 0.0f ? v : 0.0f;
-}
-
-kernel void k_relu_backward(device const float* x  [[buffer(0)]],
-                            device const float* dY [[buffer(1)]],
-                            device float*       dX [[buffer(2)]],
-                            constant uint& n       [[buffer(3)]],
-                            uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    dX[i] = x[i] > 0.0f ? dY[i] : 0.0f;
-}
-
-kernel void k_tanh_forward(device const float* x [[buffer(0)]],
-                           device float*       y [[buffer(1)]],
-                           constant uint& n      [[buffer(2)]],
-                           uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    // Metal's tanh() can return NaN for x ≳ 45 (exp(2x) overflows). Clamp to
-    // ±9 where tanh saturates to ±1 within FP32 epsilon.
-    y[i] = tanh(clamp(x[i], -9.0f, 9.0f));
-}
-
-kernel void k_tanh_backward(device const float* y  [[buffer(0)]],
-                            device const float* dY [[buffer(1)]],
-                            device float*       dX [[buffer(2)]],
-                            constant uint& n       [[buffer(3)]],
-                            uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    float yv = y[i];
-    dX[i] = dY[i] * (1.0f - yv * yv);
-}
-
-kernel void k_sigmoid_forward(device const float* x [[buffer(0)]],
-                              device float*       y [[buffer(1)]],
-                              constant uint& n      [[buffer(2)]],
-                              uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    y[i] = 1.0f / (1.0f + exp(-x[i]));
-}
-
-kernel void k_sigmoid_backward(device const float* y  [[buffer(0)]],
-                               device const float* dY [[buffer(1)]],
-                               device float*       dX [[buffer(2)]],
-                               constant uint& n       [[buffer(3)]],
-                               uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    float yv = y[i];
-    dX[i] = dY[i] * yv * (1.0f - yv);
-}
-
-kernel void k_add_inplace(device float*       y [[buffer(0)]],
-                          device const float* x [[buffer(1)]],
-                          constant uint& n      [[buffer(2)]],
-                          uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    y[i] += x[i];
-}
-
-kernel void k_add_scalar_inplace(device float* y    [[buffer(0)]],
-                                 constant float& s  [[buffer(1)]],
-                                 constant uint& n   [[buffer(2)]],
-                                 uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    y[i] += s;
-}
-
-kernel void k_scale_inplace(device float* y    [[buffer(0)]],
-                            constant float& s  [[buffer(1)]],
-                            constant uint& n   [[buffer(2)]],
-                            uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    y[i] *= s;
-}
+// ── slot mask ───────────────────────────────────────────────────────────
 
 kernel void k_build_slot_mask(device const float* x   [[buffer(0)]],
                               device float* mask      [[buffer(1)]],
@@ -234,10 +154,6 @@ void metal_build_pipelines_() {
         C.lib = lib;
 
         NSArray<NSString*>* names = @[
-            @"k_relu_forward", @"k_relu_backward",
-            @"k_tanh_forward", @"k_tanh_backward",
-            @"k_sigmoid_forward", @"k_sigmoid_backward",
-            @"k_add_inplace", @"k_add_scalar_inplace", @"k_scale_inplace",
             @"k_build_slot_mask",
             @"k_linear_backward_dw", @"k_linear_backward_db",
         ];

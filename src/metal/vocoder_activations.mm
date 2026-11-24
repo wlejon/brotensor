@@ -61,11 +61,6 @@ struct SnakeParams {
     uint32_t total;
 };
 
-struct ActParams {
-    uint32_t total;
-    float    param;   // elu alpha / leaky_relu negative_slope
-};
-
 NSString* const kSrc = @R"msl(
 #include <metal_stdlib>
 using namespace metal;
@@ -74,11 +69,6 @@ struct SnakeParams {
     uint N, C, L;
     uint has_beta;
     uint total;
-};
-
-struct ActParams {
-    uint  total;
-    float param;
 };
 
 // Sign-preserving floor on a reciprocal denominator: keeps |d| >= 1e-9 so a
@@ -165,67 +155,6 @@ kernel void k_snake_backward_params(device const float* X      [[buffer(0)]],
     dAlpha[c] += dalpha_acc;                         // accumulate
     if (has_beta) dBeta[c] += dbeta_acc;             // accumulate
 }
-
-// ── elu ─────────────────────────────────────────────────────────────────────
-kernel void k_elu_forward(device const float* x   [[buffer(0)]],
-                          device float*       y   [[buffer(1)]],
-                          constant ActParams& P   [[buffer(2)]],
-                          uint gid [[thread_position_in_grid]]) {
-    if (gid >= P.total) return;
-    float v = x[gid];
-    y[gid] = v > 0.0f ? v : P.param * (precise::exp(v) - 1.0f);
-}
-
-kernel void k_elu_backward(device const float* x   [[buffer(0)]],
-                           device const float* dY  [[buffer(1)]],
-                           device float*       dX  [[buffer(2)]],
-                           constant ActParams& P   [[buffer(3)]],
-                           uint gid [[thread_position_in_grid]]) {
-    if (gid >= P.total) return;
-    float v = x[gid];
-    float g = v > 0.0f ? 1.0f : P.param * precise::exp(v);
-    dX[gid] = dY[gid] * g;
-}
-
-// ── leaky_relu ──────────────────────────────────────────────────────────────
-kernel void k_leaky_relu_forward(device const float* x  [[buffer(0)]],
-                                 device float*       y  [[buffer(1)]],
-                                 constant ActParams& P  [[buffer(2)]],
-                                 uint gid [[thread_position_in_grid]]) {
-    if (gid >= P.total) return;
-    float v = x[gid];
-    y[gid] = v > 0.0f ? v : P.param * v;
-}
-
-// FP16 / BF16 twins — same elementwise map, FP32 math per element, 16-bit IO
-// (the bf16 kernel is the fp16 one verbatim with half→bfloat).
-kernel void k_leaky_relu_forward_fp16(device const half*  x  [[buffer(0)]],
-                                      device half*        y  [[buffer(1)]],
-                                      constant ActParams& P  [[buffer(2)]],
-                                      uint gid [[thread_position_in_grid]]) {
-    if (gid >= P.total) return;
-    float v = float(x[gid]);
-    y[gid] = half(v > 0.0f ? v : P.param * v);
-}
-
-kernel void k_leaky_relu_forward_bf16(device const bfloat* x  [[buffer(0)]],
-                                      device bfloat*       y  [[buffer(1)]],
-                                      constant ActParams&  P  [[buffer(2)]],
-                                      uint gid [[thread_position_in_grid]]) {
-    if (gid >= P.total) return;
-    float v = float(x[gid]);
-    y[gid] = bfloat(v > 0.0f ? v : P.param * v);
-}
-
-kernel void k_leaky_relu_backward(device const float* x  [[buffer(0)]],
-                                  device const float* dY [[buffer(1)]],
-                                  device float*       dX [[buffer(2)]],
-                                  constant ActParams& P  [[buffer(3)]],
-                                  uint gid [[thread_position_in_grid]]) {
-    if (gid >= P.total) return;
-    float g = x[gid] > 0.0f ? 1.0f : P.param;
-    dX[gid] = dY[gid] * g;
-}
 )msl";
 
 #define DEF_PSO(NAME, FN)                                                      \
@@ -238,12 +167,6 @@ kernel void k_leaky_relu_backward(device const float* x  [[buffer(0)]],
 DEF_PSO(pso_snake_forward,         @"k_snake_forward")
 DEF_PSO(pso_snake_backward_dx,     @"k_snake_backward_dx")
 DEF_PSO(pso_snake_backward_params, @"k_snake_backward_params")
-DEF_PSO(pso_elu_forward,           @"k_elu_forward")
-DEF_PSO(pso_elu_backward,          @"k_elu_backward")
-DEF_PSO(pso_leaky_relu_forward,      @"k_leaky_relu_forward")
-DEF_PSO(pso_leaky_relu_forward_fp16, @"k_leaky_relu_forward_fp16")
-DEF_PSO(pso_leaky_relu_forward_bf16, @"k_leaky_relu_forward_bf16")
-DEF_PSO(pso_leaky_relu_backward,     @"k_leaky_relu_backward")
 #undef DEF_PSO
 
 // Encode + submit a 1-D-grid dispatch.
@@ -372,92 +295,6 @@ void snake_backward(const Tensor& X, const Tensor& alpha, const Tensor* beta,
         [enc setBuffer:buffer_for(dAlpha) offset:buffer_offset_for(dAlpha) atIndex:4];
         [enc setBuffer:bdbeta             offset:odbeta                    atIndex:5];
         [enc setBytes:&p length:sizeof(SnakeParams) atIndex:6];
-    });
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  elu
-// ════════════════════════════════════════════════════════════════════════════
-void elu_forward(const Tensor& x, float alpha, Tensor& y) {
-    req_fp32("elu_forward", x, "x");
-    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
-        y.resize(x.rows, x.cols, x.dtype);
-    }
-    const int n = x.size();
-    if (n == 0) return;
-    ActParams p{static_cast<uint32_t>(n), alpha};
-    dispatch1d(pso_elu_forward(), static_cast<NSUInteger>(n),
-               ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:buffer_for(x) offset:buffer_offset_for(x) atIndex:0];
-        [enc setBuffer:buffer_for(y) offset:buffer_offset_for(y) atIndex:1];
-        [enc setBytes:&p length:sizeof(ActParams) atIndex:2];
-    });
-}
-
-void elu_backward(const Tensor& x, const Tensor& dY, float alpha, Tensor& dX) {
-    req_fp32("elu_backward", x, "x");
-    req_fp32("elu_backward", dY, "dY");
-    if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
-        dX.resize(x.rows, x.cols, x.dtype);
-    }
-    const int n = x.size();
-    if (n == 0) return;
-    ActParams p{static_cast<uint32_t>(n), alpha};
-    dispatch1d(pso_elu_backward(), static_cast<NSUInteger>(n),
-               ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:buffer_for(x)  offset:buffer_offset_for(x)  atIndex:0];
-        [enc setBuffer:buffer_for(dY) offset:buffer_offset_for(dY) atIndex:1];
-        [enc setBuffer:buffer_for(dX) offset:buffer_offset_for(dX) atIndex:2];
-        [enc setBytes:&p length:sizeof(ActParams) atIndex:3];
-    });
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  leaky_relu
-// ════════════════════════════════════════════════════════════════════════════
-// The one dtype-dispatched op in this file: FP32 / FP16 / BF16 on x, y follows
-// x's dtype. Math is FP32 per element in every variant; only the load/store
-// width changes.
-void leaky_relu_forward(const Tensor& x, float negative_slope, Tensor& y) {
-    const char* op = "leaky_relu_forward";
-    if (x.dtype != Dtype::FP32 && x.dtype != Dtype::FP16 &&
-        x.dtype != Dtype::BF16) {
-        fail(op, "x must be FP32, FP16 or BF16");
-    }
-    if (y.rows != x.rows || y.cols != x.cols || y.dtype != x.dtype) {
-        y.resize(x.rows, x.cols, x.dtype);
-    }
-    const int n = x.size();
-    if (n == 0) return;
-    ActParams p{static_cast<uint32_t>(n), negative_slope};
-    id<MTLComputePipelineState> pso =
-        (x.dtype == Dtype::FP16) ? pso_leaky_relu_forward_fp16()
-      : (x.dtype == Dtype::BF16) ? pso_leaky_relu_forward_bf16()
-                                 : pso_leaky_relu_forward();
-    dispatch1d(pso, static_cast<NSUInteger>(n),
-               ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:buffer_for(x) offset:buffer_offset_for(x) atIndex:0];
-        [enc setBuffer:buffer_for(y) offset:buffer_offset_for(y) atIndex:1];
-        [enc setBytes:&p length:sizeof(ActParams) atIndex:2];
-    });
-}
-
-void leaky_relu_backward(const Tensor& x, const Tensor& dY,
-                         float negative_slope, Tensor& dX) {
-    req_fp32("leaky_relu_backward", x, "x");
-    req_fp32("leaky_relu_backward", dY, "dY");
-    if (dX.rows != x.rows || dX.cols != x.cols || dX.dtype != x.dtype) {
-        dX.resize(x.rows, x.cols, x.dtype);
-    }
-    const int n = x.size();
-    if (n == 0) return;
-    ActParams p{static_cast<uint32_t>(n), negative_slope};
-    dispatch1d(pso_leaky_relu_backward(), static_cast<NSUInteger>(n),
-               ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:buffer_for(x)  offset:buffer_offset_for(x)  atIndex:0];
-        [enc setBuffer:buffer_for(dY) offset:buffer_offset_for(dY) atIndex:1];
-        [enc setBuffer:buffer_for(dX) offset:buffer_offset_for(dX) atIndex:2];
-        [enc setBytes:&p length:sizeof(ActParams) atIndex:3];
     });
 }
 

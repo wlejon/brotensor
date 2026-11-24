@@ -476,6 +476,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/tensor.mm
         src/metal/kernels.mm
         src/metal/gemm.mm
+        src/metal/mtl_mir_cache.mm
         src/metal/elementwise.mm
         src/metal/fp16_matmul.mm
         src/metal/gemm_fp32.mm
@@ -511,7 +512,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/matmul_backward.mm
         src/metal/rope.mm
         src/metal/rms_norm.mm
-        src/metal/swiglu.mm
         src/metal/kv_cache.mm
         src/metal/public_reductions.mm
         src/metal/ddim_step.mm
@@ -527,7 +527,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/vocoder_activations.mm
         src/metal/codec_quant.mm
         src/metal/resample1d.mm
-        src/metal/log_exp_round.mm
         src/metal/sample_logits.mm
         src/metal/masked_diffusion.mm
         src/metal/noise.mm
@@ -565,6 +564,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/tensor.mm
         src/metal/kernels.mm
         src/metal/gemm.mm
+        src/metal/mtl_mir_cache.mm
         src/metal/elementwise.mm
         src/metal/fp16_matmul.mm
         src/metal/gemm_fp32.mm
@@ -600,7 +600,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/matmul_backward.mm
         src/metal/rope.mm
         src/metal/rms_norm.mm
-        src/metal/swiglu.mm
         src/metal/kv_cache.mm
         src/metal/public_reductions.mm
         src/metal/ddim_step.mm
@@ -616,7 +615,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/vocoder_activations.mm
         src/metal/codec_quant.mm
         src/metal/resample1d.mm
-        src/metal/log_exp_round.mm
         src/metal/sample_logits.mm
         src/metal/masked_diffusion.mm
         src/metal/noise.mm

@@ -134,4 +134,64 @@ All `37/37` ops verified `ok`.
 - **LOC Delta (Vulkan Wave 1):**
   - Deleted 6 GLSL shaders / 24 variants (`unary.comp`, `binary.comp`, `act_bwd.comp`, `bias.comp`, `glu.comp`, `cast.comp`): `src/vulkan/shaders` `8,235 -> 7,830` (**`-405` lines**)
   - Added backend-neutral shared MIR builders: `src/kernels/{mir_math,mir_elementwise}.{h,cpp}` (**`+515` lines**, reused across Metal + CUDA in Wave 1) + Vulkan runtime MIR cache `src/vulkan/vk_mir_cache.{h,cpp}` (**`+219` lines**)
-  - Pending Wave 1 cross-backend deletions once Metal & CUDA wire into `src/kernels/mir_elementwise`: `~1,934` Metal lines (`elementwise.mm`, `elementwise_msl.h`, `swiglu.mm`) and `~1,695` CUDA lines (`elementwise.cu`, `elementwise_activations.cu`, `swiglu.cu`)
+  - Wave 1 Metal consolidation completed below (`-2,016` net Metal LOC); pending Wave 1 CUDA deletion: `~1,695` CUDA lines (`elementwise.cu`, `elementwise_activations.cu`, `swiglu.cu`)
+
+---
+
+## Wave 1 (Metal / Apple M2 Pro): Elementwise, Cast, Bias & GLU -> Single-Source Brass MIR
+
+Added Metal runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`) compiling `brotensor::kernels::{build_unary_mir, build_binary_mir, build_act_bwd_mir, build_bias_mir, build_cast_mir, build_glu_mir}` via `brass::target::MslTarget::compile` (`kEwBlock = 256`, 128-bit `lanes = 8` for 16B-aligned FP16/BF16 and `lanes = 4` for 16B-aligned FP32, 64-bit `lanes = 4` for 8B-aligned 16-bit, else scalar `1`), wired all Metal Wave 1 elementwise / activation / bias / cast / GLU ops (`relu`, `tanh`, `sigmoid`, `silu`, `gelu`, `gelu_exact`, `quick_gelu`, `exp`, `log`, `sin`, `cos`, `rsqrt`, `round`, `elu`, `leaky_relu`, `add_scalar`, `scale`, `clamp`, `add`, `mul`, `axpby`, `add_row_bias`, `add_channel_bias`, `cast`, `swiglu`, `geglu`, `geglu_exact`, and batched `relu`/`tanh`/`add` delegates) through it, and deleted the duplicated hand-written MSL kernels.
+
+### `brotensor_bench_elementwise` (Apple M2 Pro Metal, Wave 0 vs Wave 1)
+
+All `37/37` ops verified `ok` sequentially on an idle M2 Pro (19-core GPU, 16 GiB unified RAM, ~200 GB/s theoretical bus).
+
+| Category | Op | Shape | Dtype | Wave 0 (ms / GB/s) | Wave 1 (ms / GB/s) | Speedup |
+|---|---|---|---|---|---|---|
+| Unary fwd | `silu_forward` | `9217×4096` | `fp32` | `1.743 ms / 173.3` | `1.745 ms / 173.1` | `-0.1%` |
+| Unary fwd | `gelu_forward` | `9217×4096` | `fp32` | `1.743 ms / 173.2` | `1.743 ms / 173.3` | `+0.1%` |
+| Unary fwd | `relu_forward` | `9217×4096` | `fp32` | `1.742 ms / 173.4` | `1.739 ms / 173.6` | `+0.1%` |
+| Unary fwd | `tanh_forward` | `9217×4096` | `fp32` | `1.741 ms / 173.5` | `1.741 ms / 173.4` | `-0.1%` |
+| Unary fwd | `sigmoid_forward` | `9217×4096` | `fp32` | `1.738 ms / 173.8` | `1.733 ms / 174.3` | `+0.3%` |
+| Unary fwd | `silu_forward` | `18433×4096` | `fp16` | `2.014 ms / 150.0` | `1.745 ms / 173.1` | **`+15.4%`** |
+| Unary fwd | `gelu_forward` | `18433×4096` | `fp16` | `2.017 ms / 149.7` | `1.735 ms / 174.0` | **`+16.3%`** |
+| Unary fwd | `relu_forward` | `18433×4096` | `fp16` | `2.010 ms / 150.3` | `1.743 ms / 173.3` | **`+15.3%`** |
+| Unary fwd | `tanh_forward` | `18433×4096` | `fp16` | `1.998 ms / 151.1` | `1.736 ms / 174.0` | **`+15.1%`** |
+| Unary fwd | `sigmoid_forward` | `18433×4096` | `fp16` | `2.011 ms / 150.2` | `1.739 ms / 173.7` | **`+15.6%`** |
+| Unary fwd | `silu_forward` | `18433×4096` | `bf16` | `2.016 ms / 149.8` | `1.731 ms / 174.5` | **`+16.5%`** |
+| Unary fwd | `gelu_forward` | `18433×4096` | `bf16` | `2.013 ms / 150.0` | `1.736 ms / 174.0` | **`+16.0%`** |
+| Unary fwd | `relu_forward` | `18433×4096` | `bf16` | `2.005 ms / 150.7` | `1.729 ms / 174.6` | **`+16.0%`** |
+| Unary fwd | `tanh_forward` | `18433×4096` | `bf16` | `2.013 ms / 150.0` | `1.724 ms / 175.2` | **`+16.8%`** |
+| Unary fwd | `sigmoid_forward` | `18433×4096` | `bf16` | `2.007 ms / 150.4` | `1.727 ms / 174.8` | **`+16.2%`** |
+| Unary bwd | `silu_backward` | `9217×4096` | `fp32` | `2.525 ms / 179.4` | `2.534 ms / 178.8` | `-0.4%` |
+| Unary bwd | `gelu_backward` | `9217×4096` | `fp32` | `2.528 ms / 179.2` | `2.527 ms / 179.3` | `+0.0%` |
+| Unary bwd | `silu_backward` | `18433×4096` | `fp16` | `2.519 ms / 179.9` | `2.530 ms / 179.0` | `-0.4%` |
+| Unary bwd | `gelu_backward` | `18433×4096` | `fp16` | `2.543 ms / 178.2` | `2.523 ms / 179.5` | `+0.8%` |
+| Unary bwd | `silu_backward` | `18433×4096` | `bf16` | `2.534 ms / 178.8` | `2.570 ms / 176.2` | `-1.4%` |
+| Unary bwd | `gelu_backward` | `18433×4096` | `bf16` | `3.836 ms / 118.1` | `2.513 ms / 180.3` | **`+52.6%`** |
+| Binary/scalar | `add_inplace` | `9217×4096` | `fp32` | `2.596 ms / 174.5` | `2.580 ms / 175.6` | `+0.6%` |
+| Binary/scalar | `mul_inplace` | `9217×4096` | `fp32` | `2.575 ms / 175.9` | `2.588 ms / 175.0` | `-0.5%` |
+| Binary/scalar | `scale_inplace` | `9217×4096` | `fp32` | `1.786 ms / 169.1` | `1.798 ms / 167.9` | `-0.7%` |
+| Binary/scalar | `add_inplace` | `18433×4096` | `fp16` | `2.571 ms / 176.2` | `2.616 ms / 173.2` | `-1.7%` |
+| Binary/scalar | `mul_inplace` | `18433×4096` | `fp16` | `2.538 ms / 178.5` | `2.596 ms / 174.5` | `-2.2%` |
+| Binary/scalar | `scale_inplace` | `18433×4096` | `fp16` | `2.058 ms / 146.8` | `1.776 ms / 170.0` | **`+15.9%`** |
+| Binary/scalar | `add_inplace` | `18433×4096` | `bf16` | `2.542 ms / 178.2` | `2.570 ms / 176.3` | `-1.1%` |
+| Binary/scalar | `mul_inplace` | `18433×4096` | `bf16` | `2.553 ms / 177.4` | `2.570 ms / 176.3` | `-0.7%` |
+| Binary/scalar | `scale_inplace` | `18433×4096` | `bf16` | `2.015 ms / 149.9` | `1.772 ms / 170.4` | **`+13.7%`** |
+| Gated | `geglu_forward` | `4609×8192` | `fp32` | `1.330 ms / 170.4` | `1.316 ms / 172.1` | `+1.1%` |
+| Gated | `geglu_forward` | `9217×8192` | `fp16` | `2.038 ms / 111.1` | `1.335 ms / 169.6` | **`+52.7%`** |
+| Gated | `geglu_forward` | `9217×8192` | `bf16` | `2.028 ms / 111.7` | `1.298 ms / 174.5` | **`+56.2%`** |
+| Norm *(Wave 2)* | `rms_norm_forward` | `9217×4096` | `fp32` | `1.894 ms / 159.5` | `1.872 ms / 161.4` | *unchanged* |
+| Norm *(Wave 2)* | `rms_norm_forward` | `18433×4096` | `fp16` | `1.775 ms / 170.1` | `1.752 ms / 172.4` | *unchanged* |
+| Norm *(Wave 2)* | `layernorm_inf_fp16` | `18433×4096` | `fp16` | `2.112 ms / 143.0` | `2.123 ms / 142.2` | *unchanged* |
+| Norm *(Wave 2)* | `softmax_rows` | `9217×4096` | `fp32` | `2.385 ms / 126.6` | `2.464 ms / 122.6` | *unchanged* |
+
+### Wave 1 Metal Verification & LOC Delta
+- **Parity & Full `ctest` Suite:**
+  - Targeted Wave 1 suites (`elementwise`, `elementwise_extra`, `large_elementwise`, `activations`, `geglu`, `swiglu`, `log_exp_round`, `add_channel_bias`, `stylegan`, `vocoder`, `batched`): **19/19 passed** (`0` failures).
+  - Full Metal `ctest` (`-LE gcstress -j2`): **189/190 passed** (100% of Metal parity, runtime, JIT, and audit tests passed; the single failure is `brotensor_test_gpu_mir_emit`'s SPIR-V vs PTX `f16` Z3 equivalence check, unrelated to Metal).
+- **LOC Delta (Metal Wave 1):**
+  - Deleted files: `src/metal/elementwise_msl.h` (`-825`), `src/metal/swiglu.mm` (`-229`), `src/metal/log_exp_round.mm` (`-223`) — **`-1,277` lines**.
+  - Slimmed files: `src/metal/elementwise.mm` (`880 -> 453`, keeping only `build_slot_mask`, `build_causal_mask_row`, `threshold_u8` outside Wave 1), `src/metal/batched_ops.mm` (`-193`), `src/metal/vocoder_activations.mm` (`-163`), `src/metal/stylegan_elementwise.mm` (`-151`), `src/metal/kernels.mm` (`-86`).
+  - Added Metal MIR runtime cache: `src/metal/mtl_mir_cache.{h,mm}` (`+72` / `+209` = **`+281` lines**).
+  - **Total Metal diff:** `2,628` lines deleted, `612` lines added (**`-2,016` net Metal LOC**; all modified/created files `< 500` LOC).
