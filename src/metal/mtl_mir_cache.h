@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <span>
 
 namespace brotensor::detail::metal {
 
@@ -37,6 +38,12 @@ enum class MirKind : std::uint8_t {
     DeltaRule = 24,
     Xent = 25,
     Topk = 26,
+    SelectSample = 27,
+    SelectCounter = 28,
+    SelectCommit = 29,
+    SelectMd = 30,
+    Misc = 31,
+    Vision = 32,
 };
 
 struct MirKey {
@@ -203,5 +210,9 @@ void mir_dispatch_topk(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
                        const void* idx, const void* off,
                        std::uint32_t rows, std::uint32_t cols,
                        std::uint32_t k, std::uint32_t nseg);
+void mir_dispatch_args(const MirKernel& mk, std::uint32_t gx, const char* op,
+                       std::span<const void* const> ptrs,
+                       std::span<const std::int32_t> ints,
+                       std::span<const float> flts);
 
 }  // namespace brotensor::detail::metal

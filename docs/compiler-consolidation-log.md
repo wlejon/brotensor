@@ -463,5 +463,20 @@ Replaced 2 GLSL shaders / 4 variants (`select.comp` `344`L, `misc.comp` `406`L; 
 - **LOC Delta (Vulkan Wave 6):**
   - `src/vulkan/shaders/*`: `5,499 -> 5,125` (**`-374` lines**; cumulative **`-3,110` lines** / 28 `.comp` files / 80 variants deleted across Waves 1–6, `140 -> 60` compiled Vulkan shaders)
   - Shared backend-neutral `src/kernels/*`: `5,252` lines across 39 files (`+1,441` lines in Wave 6, max file `535` lines); `src/vulkan/vk_mir_cache.{h,cpp}` `815` lines (`+45` lines, max file `637` lines)
-  - Pending cross-backend targets against `mir_select` / `mir_misc` / `mir_vision` (and Wave 4–5 CUDA): Mac Metal Wave 6 & Windows CUDA Waves 4–6.
+  - Wave 6 Metal consolidation completed below (`-2,007` net Metal LOC); pending cross-backend targets: Windows CUDA Waves 4–6.
+
+---
+
+## Wave 6 (Metal / Apple M2 Pro): Token Selection, Vision (`upfirdn2d`/`modulated_conv2d`/`deform_conv2d`/`col2im2d`) & Small Misc Ops -> Single-Source Brass MIR
+
+Extended Metal's runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`, `218` / `698` LOC) with `MirKind::{SelectSample, SelectCounter, SelectCommit, SelectMd, Misc, Vision}` and generic `mir_dispatch_args`, wired every Wave 6 Metal op onto `src/kernels/{mir_select,mir_misc,mir_vision}`, removed all remaining hand-written MSL from `elementwise.mm`, `public_reductions.mm`, `loss.mm`, `sample_logits.mm`, and `k_build_slot_mask` from `kernels.mm`, switched `deform_conv2d_forward`, `modulated_conv2d_{forward,backward}`, and `conv_transpose2d_forward` onto Metal's simdgroup GEMM + `MirKind::Vision`, and deleted 10 replaced `.mm` files.
+
+### Wave 6 Metal Verification & LOC Delta
+- **Parity & Full `ctest` Suite (Apple M2 Pro, Metal Release, `brass` `d5608f4`):**
+  - Targeted Wave 6 suites (`sample_logits`, `sample_logits_parity`, `masked_diffusion`, `masked_mean_pool_parity`, `public_reductions`, `optim_parity`, `adam_parity`, `loss_parity`, `loss_fused_parity`, `batched_backward_parity`, `attention_moments`, `attention_moments_parity`, `bias_act`, `upfirdn2d`, `modulated_conv2d`, `filtered_lrelu`, `stylegan_parity`, `stylegan_primitives`, `deform_conv2d_parity`, `conv_transpose2d`, `conv_transpose2d_parity`, `gpu_mir_emit`, plus resample/pixel-shuffle suites): **29/29 passed** (`56.50 s`, `0` failures).
+  - Full Metal `ctest` (`-LE gcstress -j2 --timeout 300`): **190/190 passed** (`341.10 s`, `0` failures; `backward_shader_audit` `60.27–60.49 s`).
+- **LOC Delta (Metal Wave 6):**
+  - Deleted 10 files (`-2,138` lines): `masked_diffusion.mm` (`-351`), `reduce.mm` (`-193`), `xavier_init.mm` (`-79`), `optim.mm` (`-72`), `adam.mm` (`-96`), `attention_moments.mm` (`-154`), `bias_act.mm` (`-298`), `upfirdn2d.mm` (`-210`), `modulated_conv2d.mm` (`-494`), `deform_conv2d.mm` (`-191`).
+  - Added / rewritten / slimmed files (all `< 700` LOC): `mtl_mir_cache.{h,mm}` (`218` / `698`), `sample_logits.mm` (`491 -> 184`, absorbing `masked_diffusion_*`), `misc.mm` (`348`, new), `vision.mm` (`469`, new), `loss.mm` (`328 -> 218`), `elementwise.mm` (`496 -> 367`), `public_reductions.mm` (`179 -> 75`), `conv_transpose2d.mm` (`563 -> 495`), `kernels.mm` (`179 -> 165`).
+  - **Net Metal LOC delta (Wave 6):** **`-2,007` net Metal LOC** (`src/metal/` `26,275 -> 24,268` LOC; **cumulative Waves 1–6: `-12,417` net Metal LOC** and 38 Metal files deleted).
 

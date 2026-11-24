@@ -1,8 +1,5 @@
-// Metal elementwise, activation, bias, cast, and GLU ops: single-source brass
-// MIR kernels compiled via MslTarget and cached in mtl_mir_cache.mm.
-//
-// Specialized non-Wave-1 ops (build_slot_mask, build_causal_mask_row,
-// threshold_u8) remain at the bottom of this file.
+// Metal elementwise, activation, bias, cast, GLU, and rowvec ops: single-source
+// brass MIR kernels compiled via MslTarget and cached in mtl_mir_cache.mm.
 
 #include "mtl_mir_cache.h"
 
@@ -20,8 +17,6 @@ namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
-using metal_impl::compile_pipeline;
-using metal_impl::dispatch1d_sync;
 using metal_impl::new_command_buffer;
 
 namespace {
@@ -160,68 +155,6 @@ void glu(const char* op, std::uint32_t code, const Tensor& X,
         {MirKind::Glu, code, X.dtype, X.dtype, static_cast<std::uint8_t>(lanes)});
     mir_dispatch_glu(mk, mir_groups_1d(n, lanes), X, dY, out, n,
                      static_cast<std::uint32_t>(D));
-}
-
-// ─── Specialized non-Wave-1 Metal kernels (mask / threshold_u8) ────────────
-
-NSString* const kMiscSrc = @R"msl(
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void k_causal_mask_row(device float* mask [[buffer(0)]],
-                              constant uint& L   [[buffer(1)]],
-                              constant uint& q   [[buffer(2)]],
-                              uint k [[thread_position_in_grid]]) {
-    if (k >= L) return;
-    mask[k] = (k <= q) ? 1.0f : 0.0f;
-}
-
-kernel void k_threshold_u8_fp32(device const float* x [[buffer(0)]],
-                                constant float& t     [[buffer(1)]],
-                                device char* y        [[buffer(2)]],
-                                constant uint& n      [[buffer(3)]],
-                                uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    y[i] = (x[i] > t) ? char(1) : char(0);
-}
-
-kernel void k_threshold_u8_fp16(device const half* x [[buffer(0)]],
-                                constant float& t    [[buffer(1)]],
-                                device char* y       [[buffer(2)]],
-                                constant uint& n     [[buffer(3)]],
-                                uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    y[i] = (float(x[i]) > t) ? char(1) : char(0);
-}
-)msl";
-
-#define DEF_MISC_PSO(NAME, FN)                                                 \
-    id<MTLComputePipelineState> NAME() {                                       \
-        static dispatch_once_t once;                                           \
-        static id<MTLComputePipelineState> pso;                                \
-        dispatch_once(&once, ^{ pso = compile_pipeline(kMiscSrc, FN); });      \
-        return pso;                                                            \
-    }
-DEF_MISC_PSO(pso_causal_mask_row, @"k_causal_mask_row")
-DEF_MISC_PSO(pso_threshold_u8_fp32, @"k_threshold_u8_fp32")
-DEF_MISC_PSO(pso_threshold_u8_fp16, @"k_threshold_u8_fp16")
-#undef DEF_MISC_PSO
-
-void launch_1d(id<MTLComputePipelineState> pso, std::uint32_t n,
-               void (^bind)(id<MTLComputeCommandEncoder>)) {
-    if (n == 0) return;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        bind(enc);
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > 256) tg = 256;
-        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
 }
 
 }  // namespace
@@ -429,68 +362,6 @@ void modulate(const Tensor& X, const Tensor& scale, const Tensor& shift, Tensor&
 }
 void broadcast_mul(const Tensor& X, const Tensor& v, Tensor& Y) {
     rowvec("broadcast_mul", ROWVEC_MUL, X, v, nullptr, Y);
-}
-
-// ─── Specialized non-Wave-1 ops ────────────────────────────────────────────
-
-void build_slot_mask(const Tensor& x, int offset, int K, int stride, Tensor& mask) {
-    if (mask.rows != K || mask.cols != 1 || mask.dtype != Dtype::FP32) {
-        mask.resize(K, 1, Dtype::FP32);
-    }
-    if (K <= 0) return;
-    id<MTLBuffer> bx = buffer_for(x);
-    id<MTLBuffer> bm = buffer_for(mask);
-    const NSUInteger off_x = buffer_offset_for(x);
-    const NSUInteger off_m = buffer_offset_for(mask);
-    const std::uint32_t uo = static_cast<std::uint32_t>(offset);
-    const std::uint32_t uK = static_cast<std::uint32_t>(K);
-    const std::uint32_t us = static_cast<std::uint32_t>(stride);
-    dispatch1d_sync(@"k_build_slot_mask", uK, ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:bx offset:off_x atIndex:0];
-        [enc setBuffer:bm offset:off_m atIndex:1];
-        [enc setBytes:&uo length:sizeof(std::uint32_t) atIndex:2];
-        [enc setBytes:&uK length:sizeof(std::uint32_t) atIndex:3];
-        [enc setBytes:&us length:sizeof(std::uint32_t) atIndex:4];
-    });
-}
-
-void build_causal_mask_row(int L, int q, Tensor& mask) {
-    if (mask.rows != L || mask.cols != 1 || mask.dtype != Dtype::FP32) {
-        mask.resize(L, 1, Dtype::FP32);
-    }
-    if (L <= 0) return;
-    id<MTLBuffer> bm = buffer_for(mask);
-    const NSUInteger om = buffer_offset_for(mask);
-    const std::uint32_t Lu = static_cast<std::uint32_t>(L);
-    const std::uint32_t qu = static_cast<std::uint32_t>(q);
-    launch_1d(pso_causal_mask_row(), Lu, ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:bm offset:om atIndex:0];
-        [enc setBytes:&Lu length:sizeof(std::uint32_t) atIndex:1];
-        [enc setBytes:&qu length:sizeof(std::uint32_t) atIndex:2];
-    });
-}
-
-void threshold_u8(const Tensor& X, float t, Tensor& Y) {
-    if (X.dtype != Dtype::FP32 && X.dtype != Dtype::FP16) {
-        throw std::runtime_error("threshold_u8: X must be FP32 or FP16");
-    }
-    if (Y.rows != X.rows || Y.cols != X.cols || Y.dtype != Dtype::INT8) {
-        Y.resize(X.rows, X.cols, Dtype::INT8);
-    }
-    const std::uint32_t n = count32(X, "threshold_u8");
-    if (n == 0) return;
-    id<MTLComputePipelineState> pso =
-        (X.dtype == Dtype::FP16) ? pso_threshold_u8_fp16() : pso_threshold_u8_fp32();
-    id<MTLBuffer> bx = buffer_for(X);
-    id<MTLBuffer> by = buffer_for(Y);
-    const NSUInteger ox = buffer_offset_for(X);
-    const NSUInteger oy = buffer_offset_for(Y);
-    launch_1d(pso, n, ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:bx offset:ox atIndex:0];
-        [enc setBytes:&t length:sizeof(float) atIndex:1];
-        [enc setBuffer:by offset:oy atIndex:2];
-        [enc setBytes:&n length:sizeof(std::uint32_t) atIndex:3];
-    });
 }
 
 }  // namespace brotensor::detail::metal

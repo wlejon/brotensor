@@ -9,6 +9,7 @@
 #include "../kernels/mir_elementwise.h"
 #include "../kernels/mir_gnorm.h"
 #include "../kernels/mir_lstm.h"
+#include "../kernels/mir_misc.h"
 #include "../kernels/mir_norm.h"
 #include "../kernels/mir_reduce.h"
 #include "../kernels/mir_remap.h"
@@ -16,7 +17,9 @@
 #include "../kernels/mir_resample_bwd.h"
 #include "../kernels/mir_rope.h"
 #include "../kernels/mir_scatter.h"
+#include "../kernels/mir_select.h"
 #include "../kernels/mir_topk.h"
+#include "../kernels/mir_vision.h"
 #include "../kernels/mir_xent.h"
 
 #include <brass/mir/module.hpp>
@@ -125,6 +128,26 @@ const MirEntry* compile_mir(const MirKey& k) {
             break;
         case MirKind::Topk:
             fn = kernels::build_topk_mir(mod, k.op, k.dt0);
+            break;
+        case MirKind::SelectSample:
+            fn = kernels::build_select_sample_mir(mod, k.flags != 0);
+            break;
+        case MirKind::SelectCounter:
+            fn = kernels::build_select_counter_mir(mod);
+            break;
+        case MirKind::SelectCommit:
+            fn = kernels::build_select_commit_mir(mod);
+            break;
+        case MirKind::SelectMd:
+            fn = kernels::build_select_md_mir(
+                mod, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0);
+            break;
+        case MirKind::Misc:
+            fn = kernels::build_misc_mir(mod, k.op, k.dt0, k.flags != 0);
+            break;
+        case MirKind::Vision:
+            fn = kernels::build_vision_mir(
+                mod, k.op, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
             break;
     }
     brass::target::MslOptions opts;
@@ -658,6 +681,18 @@ void mir_dispatch_topk(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
     put_scalar(buf, e.msl, 3, static_cast<std::int32_t>(nseg));
     const void* ptrs[4] = {x, vals, idx, off};
     submit_mir_ptrs(e, gx, gy, 1, op, ptrs, 4, buf);
+}
+
+void mir_dispatch_args(const MirKernel& mk, std::uint32_t gx, const char* op,
+                       std::span<const void* const> ptrs,
+                       std::span<const std::int32_t> ints,
+                       std::span<const float> flts) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    std::size_t s = 0;
+    for (std::int32_t v : ints) put_scalar(buf, e.msl, s++, v);
+    for (float f : flts) put_scalar(buf, e.msl, s++, f);
+    submit_mir_ptrs(e, gx, 1, 1, op, ptrs.data(), ptrs.size(), buf);
 }
 
 }  // namespace brotensor::detail::metal

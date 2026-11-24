@@ -35,6 +35,11 @@ using metal_impl::buffer_offset_for;
 using metal_impl::compile_pipeline;
 using metal_impl::new_command_buffer;
 
+bool conv_transpose2d_gemm(const Tensor& X, const Tensor& Wt, const Tensor* bias,
+                           int N, int C_in, int H, int W, int C_out,
+                           int kH, int kW, int sh, int sw, int ph, int pw,
+                           int dh, int dw, int groups, int Ho, int Wo, Tensor& Y);
+
 namespace {
 
 [[noreturn]] void fail(const char* op, const std::string& reason) {
@@ -97,57 +102,14 @@ struct CT2dParams {
     uint total;
 };
 
-// ── forward: one thread per output element (n, oc, ho, wo) ──────────────────
-// Input (n, c_in, h, w) reaches output ho = h*stride - pad + kh*dil, so
-//   h = (ho + pad - kh*dil) / stride  must be a non-negative integer in
-//   range. Same for w.
-kernel void k_ct2d_forward_fp32(device const float* X    [[buffer(0)]],
-                                device const float* Wt   [[buffer(1)]],
-                                device const float* bias [[buffer(2)]],
-                                device float*       Y    [[buffer(3)]],
-                                constant CT2dParams& P   [[buffer(4)]],
-                                uint gid [[thread_position_in_grid]]) {
-    if (gid >= P.total) return;
-    uint wo  = gid % P.W_out;
-    uint t1  = gid / P.W_out;
-    uint ho  = t1 % P.H_out;
-    uint t2  = t1 / P.H_out;
-    uint oc  = t2 % P.C_out;
-    uint n   = t2 / P.C_out;
-    uint g        = oc / P.Cg_out;
-    uint oc_local = oc - g * P.Cg_out;
-    uint ic_base  = g * P.Cg_in;
-    float acc = (P.has_bias != 0u) ? bias[oc] : 0.0f;
-    for (uint ci_local = 0u; ci_local < P.Cg_in; ++ci_local) {
-        uint c_in = ic_base + ci_local;
-        for (uint kh = 0u; kh < P.kH; ++kh) {
-            int num_h = int(ho) + P.pad_h - int(kh) * P.dil_h;
-            if (num_h < 0 || (num_h % P.stride_h) != 0) continue;
-            int h = num_h / P.stride_h;
-            if (h >= int(P.H)) continue;
-            for (uint kw = 0u; kw < P.kW; ++kw) {
-                int num_w = int(wo) + P.pad_w - int(kw) * P.dil_w;
-                if (num_w < 0 || (num_w % P.stride_w) != 0) continue;
-                int w = num_w / P.stride_w;
-                if (w >= int(P.W)) continue;
-                uint w_idx = (c_in * P.Cg_out + oc_local) * (P.kH * P.kW)
-                           + kh * P.kW + kw;
-                uint x_idx = (n * P.C_in + c_in) * P.H * P.W
-                           + uint(h) * P.W + uint(w);
-                acc += X[x_idx] * Wt[w_idx];
-            }
-        }
-    }
-    Y[gid] = acc;
-}
-
-// FP32 accumulation, FP16 IO — otherwise identical to the FP32 kernel above.
-kernel void k_ct2d_forward_fp16(device const half*  X    [[buffer(0)]],
-                                device const half*  Wt   [[buffer(1)]],
-                                device const half*  bias [[buffer(2)]],
-                                device half*        Y    [[buffer(3)]],
-                                constant CT2dParams& P   [[buffer(4)]],
-                                uint gid [[thread_position_in_grid]]) {
+// ── forward fallback (>256 MiB col budget): templated over FP32/FP16/BF16 ──
+template <typename T>
+kernel void k_ct2d_forward_t(device const T* X    [[buffer(0)]],
+                             device const T* Wt   [[buffer(1)]],
+                             device const T* bias [[buffer(2)]],
+                             device T*       Y    [[buffer(3)]],
+                             constant CT2dParams& P [[buffer(4)]],
+                             uint gid [[thread_position_in_grid]]) {
     if (gid >= P.total) return;
     uint wo  = gid % P.W_out;
     uint t1  = gid / P.W_out;
@@ -179,49 +141,14 @@ kernel void k_ct2d_forward_fp16(device const half*  X    [[buffer(0)]],
             }
         }
     }
-    Y[gid] = half(acc);
+    Y[gid] = T(acc);
 }
-
-// BF16: verbatim copy of the FP16 kernel with half→bfloat.
-kernel void k_ct2d_forward_bf16(device const bfloat* X    [[buffer(0)]],
-                                device const bfloat* Wt   [[buffer(1)]],
-                                device const bfloat* bias [[buffer(2)]],
-                                device bfloat*       Y    [[buffer(3)]],
-                                constant CT2dParams& P    [[buffer(4)]],
-                                uint gid [[thread_position_in_grid]]) {
-    if (gid >= P.total) return;
-    uint wo  = gid % P.W_out;
-    uint t1  = gid / P.W_out;
-    uint ho  = t1 % P.H_out;
-    uint t2  = t1 / P.H_out;
-    uint oc  = t2 % P.C_out;
-    uint n   = t2 / P.C_out;
-    uint g        = oc / P.Cg_out;
-    uint oc_local = oc - g * P.Cg_out;
-    uint ic_base  = g * P.Cg_in;
-    float acc = (P.has_bias != 0u) ? float(bias[oc]) : 0.0f;
-    for (uint ci_local = 0u; ci_local < P.Cg_in; ++ci_local) {
-        uint c_in = ic_base + ci_local;
-        for (uint kh = 0u; kh < P.kH; ++kh) {
-            int num_h = int(ho) + P.pad_h - int(kh) * P.dil_h;
-            if (num_h < 0 || (num_h % P.stride_h) != 0) continue;
-            int h = num_h / P.stride_h;
-            if (h >= int(P.H)) continue;
-            for (uint kw = 0u; kw < P.kW; ++kw) {
-                int num_w = int(wo) + P.pad_w - int(kw) * P.dil_w;
-                if (num_w < 0 || (num_w % P.stride_w) != 0) continue;
-                int w = num_w / P.stride_w;
-                if (w >= int(P.W)) continue;
-                uint w_idx = (c_in * P.Cg_out + oc_local) * (P.kH * P.kW)
-                           + kh * P.kW + kw;
-                uint x_idx = (n * P.C_in + c_in) * P.H * P.W
-                           + uint(h) * P.W + uint(w);
-                acc += float(X[x_idx]) * float(Wt[w_idx]);
-            }
-        }
-    }
-    Y[gid] = bfloat(acc);
-}
+template [[host_name("k_ct2d_forward_fp32")]] kernel void k_ct2d_forward_t<float>(
+    device const float*, device const float*, device const float*, device float*, constant CT2dParams&, uint);
+template [[host_name("k_ct2d_forward_fp16")]] kernel void k_ct2d_forward_t<half>(
+    device const half*, device const half*, device const half*, device half*, constant CT2dParams&, uint);
+template [[host_name("k_ct2d_forward_bf16")]] kernel void k_ct2d_forward_t<bfloat>(
+    device const bfloat*, device const bfloat*, device const bfloat*, device bfloat*, constant CT2dParams&, uint);
 
 // ── backward_input: one thread per input element (n, c_in, h, w) ────────────
 // Plain gather conv (the adjoint of the forward scatter).
@@ -407,6 +334,11 @@ void conv_transpose2d_forward(const Tensor& X, const Tensor& Wt,
         Y.resize(N, out_cols, X.dtype);
     }
     if (N == 0 || out_cols == 0) return;
+    if (conv_transpose2d_gemm(X, Wt, bias, N, C_in, H, W, C_out, kH, kW,
+                              stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                              groups, int(p.H_out), int(p.W_out), Y)) {
+        return;
+    }
     p.total = static_cast<uint32_t>(N) * static_cast<uint32_t>(out_cols);
 
     id<MTLComputePipelineState> pso = (X.dtype == Dtype::FP16) ? pso_fwd_fp16()

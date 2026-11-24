@@ -15,19 +15,6 @@ static NSString* const kKernelsMSL = @R"msl(
 #include <metal_stdlib>
 using namespace metal;
 
-// ── slot mask ───────────────────────────────────────────────────────────
-
-kernel void k_build_slot_mask(device const float* x   [[buffer(0)]],
-                              device float* mask      [[buffer(1)]],
-                              constant uint& offset   [[buffer(2)]],
-                              constant uint& K        [[buffer(3)]],
-                              constant uint& stride   [[buffer(4)]],
-                              uint k [[thread_position_in_grid]]) {
-    if (k >= K) return;
-    float v = x[offset + k * stride];
-    mask[k] = v > 0.5f ? 1.0f : 0.0f;
-}
-
 // ── linear (small kernels for forward/backward; MPSGraph would also work) ──
 
 // dW[i, j] += dY[i] * x[j]. Threads cover (i, j) with i = tid.y, j = tid.x.
@@ -154,7 +141,6 @@ void metal_build_pipelines_() {
         C.lib = lib;
 
         NSArray<NSString*>* names = @[
-            @"k_build_slot_mask",
             @"k_linear_backward_dw", @"k_linear_backward_db",
         ];
         for (NSString* n in names) {

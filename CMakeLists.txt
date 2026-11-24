@@ -490,14 +490,12 @@ if(BROTENSOR_WITH_METAL)
         src/metal/linear_ex.mm
         src/metal/linear_wq.mm
         src/metal/packed_encoder.mm
-        src/metal/xavier_init.mm
         src/metal/layernorm.mm
         src/metal/attention.mm
         src/metal/mha.mm
-        src/metal/optim.mm
-        src/metal/adam.mm
-        src/metal/reduce.mm
         src/metal/loss.mm
+        src/metal/misc.mm
+        src/metal/vision.mm
         src/metal/embedding.mm
         src/metal/concat.mm
         src/metal/batched_ops.mm
@@ -510,7 +508,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/diffusion.mm
         src/metal/cross_attention.mm
         src/metal/cross_attention_with_attn.mm
-        src/metal/attention_moments.mm
         src/metal/flash_attention.mm
         src/metal/flash_attention_backward.mm
         src/metal/resblock.mm
@@ -528,7 +525,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/codec_quant.mm
         src/metal/resample1d.mm
         src/metal/sample_logits.mm
-        src/metal/masked_diffusion.mm
         src/metal/flash_attention_windowed.mm
         src/metal/gated_delta_rule.mm
         src/metal/top_k.mm
@@ -536,11 +532,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/q4k.mm
         src/metal/q6k.mm
         src/metal/q8_0.mm
-        src/metal/bias_act.mm
-        src/metal/upfirdn2d.mm
         src/metal/filtered_lrelu.mm
-        src/metal/modulated_conv2d.mm
-        src/metal/deform_conv2d.mm
         src/metal/lstm.mm
         src/metal/register.mm
     )
