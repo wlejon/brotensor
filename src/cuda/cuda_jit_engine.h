@@ -41,7 +41,7 @@ namespace brotensor::detail::cuda::jit {
 // produces another probe, never a wrong kernel.
 class CudaJitEngine {
 public:
-    static constexpr std::size_t kCapacity = 512;  // power of two
+    static constexpr std::size_t kCapacity = 2048;  // power of two
 
     static CudaJitEngine& instance() {
         static CudaJitEngine engine;

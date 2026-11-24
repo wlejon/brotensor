@@ -327,8 +327,9 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/cuda_graph.cu
         src/cuda/gemm.cu
         src/cuda/fp16_matmul.cu
-        src/cuda/elementwise.cu
-        src/cuda/elementwise_activations.cu
+        src/cuda/cu_mir_cache.cpp
+        src/cuda/ops_elementwise.cpp
+        src/cuda/elementwise_misc.cu
         src/cuda/softmax.cu
         src/cuda/layernorm.cu
         src/cuda/layernorm_batched.cu
@@ -391,7 +392,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/lstm.cu
         src/cuda/rope.cu
         src/cuda/rms_norm.cu
-        src/cuda/swiglu.cu
         src/cuda/kv_cache.cu
         src/cuda/decode_gqa.cu
         src/cuda/public_reductions.cu

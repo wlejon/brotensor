@@ -198,6 +198,64 @@ All `37/37` ops verified `ok` sequentially on an idle M2 Pro (19-core GPU, 16 Gi
 
 ---
 
+## Wave 1 (CUDA / NVIDIA RTX 4090): Elementwise, Activation, Bias, Cast & GLU -> Single-Source Brass MIR
+
+Added CUDA runtime MIR cache (`src/cuda/cu_mir_cache.{h,cpp}`) lowering `brotensor::kernels::{build_unary_mir, build_binary_mir, build_act_bwd_mir, build_bias_mir, build_cast_mir, build_glu_mir}` through `brass::target::PtxTarget::emit_function` (`sm_80`, PTX 7.8, `kEwBlock = 256`, alignment-aware `lanes = 8` for 16B-aligned 16-bit, `lanes = 4` for 16B-aligned FP32 or 8B-aligned 16-bit, else `1`) and Driver-API `CudaJitEngine::get_function` (`kCapacity` bumped `512 -> 2048`), wired all Wave 1 CUDA elementwise, scalar, binary (`add`, `mul`, `axpby`), activation forward/backward, row/channel bias, cast, and GLU (SwiGLU / GeGLU / GeGLU-exact fwd/bwd) ops via `src/cuda/ops_elementwise.cpp` (`resblock.cu` direct symbols preserved), split the 3 non-MIR utilities (`threshold_u8`, `build_causal_mask_row`, `build_slot_mask`) into `src/cuda/elementwise_misc.cu`, and added `ptx_clamp` / `clampf` lowering to `brass` (`brass/src/target/ptx/ptx_isel_intrinsics.{hpp,cpp}`).
+
+### `brotensor_bench_elementwise` (RTX 4090 CUDA, `CUDA_VISIBLE_DEVICES=0`, Wave 0 vs Wave 1)
+
+Working sets sized past 72 MB L2 (~1008 GB/s peak HBM). Wave 1 figures reflect sustained `best of 20` timings observed on idle GPU 0 across two verification passes (one single-row Windows WDDM timer/scheduling spike seen once on `add_inplace` `bf16` `[458.4 -> 927.4 GB/s]` and once on `scale_inplace` `fp16` `[913.6 -> 455.9 GB/s]`):
+
+| Category | Op | Shape | Dtype | Wave 0 (ms / GB/s) | Wave 1 (ms / GB/s) | Speedup |
+|---|---|---|---|---|---|---|
+| Unary fwd | `silu_forward` | `9217×4096` | `fp32` | `0.321 ms / 942.3` | `0.330 ms / 916.0` | `-2.8%` |
+| Unary fwd | `gelu_forward` | `9217×4096` | `fp32` | `0.319 ms / 945.3` | `0.330 ms / 916.0` | `-3.1%` |
+| Unary fwd | `relu_forward` | `9217×4096` | `fp32` | `0.340 ms / 888.4` | `0.331 ms / 913.3` | `+2.8%` |
+| Unary fwd | `tanh_forward` | `9217×4096` | `fp32` | `0.341 ms / 885.7` | `0.330 ms / 914.0` | `+3.2%` |
+| Unary fwd | `sigmoid_forward` | `9217×4096` | `fp32` | `0.343 ms / 880.4` | `0.331 ms / 913.1` | `+3.7%` |
+| Unary fwd | `silu_forward` | `18433×4096` | `fp16` | `0.346 ms / 872.6` | `0.331 ms / 913.1` | `+4.6%` |
+| Unary fwd | `gelu_forward` | `18433×4096` | `fp16` | `0.348 ms / 867.4` | `0.331 ms / 913.1` | `+5.3%` |
+| Unary fwd | `relu_forward` | `18433×4096` | `fp16` | `0.348 ms / 867.4` | `0.329 ms / 918.8` | `+5.9%` |
+| Unary fwd | `tanh_forward` | `18433×4096` | `fp16` | `0.340 ms / 888.3` | `0.332 ms / 910.3` | `+2.5%` |
+| Unary fwd | `sigmoid_forward` | `18433×4096` | `fp16` | `0.349 ms / 864.9` | `0.330 ms / 915.9` | `+5.9%` |
+| Unary fwd | `silu_forward` | `18433×4096` | `bf16` | `0.348 ms / 867.4` | `0.330 ms / 915.9` | `+5.6%` |
+| Unary fwd | `gelu_forward` | `18433×4096` | `bf16` | `0.349 ms / 865.2` | `0.331 ms / 911.1` | `+5.3%` |
+| Unary fwd | `relu_forward` | `18433×4096` | `bf16` | `0.348 ms / 867.8` | `0.331 ms / 913.1` | `+5.2%` |
+| Unary fwd | `tanh_forward` | `18433×4096` | `bf16` | `0.349 ms / 865.8` | `0.330 ms / 915.7` | `+5.8%` |
+| Unary fwd | `sigmoid_forward` | `18433×4096` | `bf16` | `0.347 ms / 870.0` | `0.332 ms / 910.6` | `+4.7%` |
+| Unary bwd | `silu_backward` | `9217×4096` | `fp32` | `0.499 ms / 908.5` | `0.490 ms / 923.6` | `+1.7%` |
+| Unary bwd | `gelu_backward` | `9217×4096` | `fp32` | `0.501 ms / 904.7` | `0.492 ms / 921.7` | `+1.9%` |
+| Unary bwd | `silu_backward` | `18433×4096` | `fp16` | `0.507 ms / 894.1` | `0.491 ms / 921.8` | `+3.1%` |
+| Unary bwd | `gelu_backward` | `18433×4096` | `fp16` | `0.506 ms / 895.5` | `0.492 ms / 921.7` | `+2.9%` |
+| Unary bwd | `silu_backward` | `18433×4096` | `bf16` | `0.504 ms / 899.2` | `0.490 ms / 923.6` | `+2.7%` |
+| Unary bwd | `gelu_backward` | `18433×4096` | `bf16` | `1.000 ms / 452.8` | `0.492 ms / 921.7` | **`+103.6%`** |
+| Binary/scalar | `add_inplace` | `9217×4096` | `fp32` | `0.501 ms / 904.7` | `0.488 ms / 927.5` | `+2.5%` |
+| Binary/scalar | `mul_inplace` | `9217×4096` | `fp32` | `0.479 ms / 945.6` | `0.488 ms / 927.5` | `-1.9%` |
+| Binary/scalar | `scale_inplace` | `9217×4096` | `fp32` | `0.308 ms / 979.9` | `0.330 ms / 916.2` | `-6.5%` |
+| Binary/scalar | `add_inplace` | `18433×4096` | `fp16` | `0.996 ms / 454.7` | `0.489 ms / 927.3` | **`+103.9%`** |
+| Binary/scalar | `mul_inplace` | `18433×4096` | `fp16` | `0.496 ms / 912.6` | `0.488 ms / 927.4` | `+1.6%` |
+| Binary/scalar | `scale_inplace` | `18433×4096` | `fp16` | `0.337 ms / 896.4` | `0.331 ms / 913.6` | `+1.9%` |
+| Binary/scalar | `add_inplace` | `18433×4096` | `bf16` | `0.497 ms / 912.2` | `0.488 ms / 927.4` | `+1.7%` |
+| Binary/scalar | `mul_inplace` | `18433×4096` | `bf16` | `0.496 ms / 914.2` | `0.488 ms / 927.6` | `+1.5%` |
+| Binary/scalar | `scale_inplace` | `18433×4096` | `bf16` | `0.338 ms / 893.7` | `0.330 ms / 914.0` | `+2.3%` |
+| Gated | `geglu_forward` | `4609×8192` | `fp32` | `0.252 ms / 899.3` | `0.247 ms / 918.0` | `+2.1%` |
+| Gated | `geglu_forward` | `9217×8192` | `fp16` | `0.255 ms / 889.1` | `0.247 ms / 917.9` | `+3.2%` |
+| Gated | `geglu_forward` | `9217×8192` | `bf16` | `0.255 ms / 889.5` | `0.247 ms / 917.9` | `+3.2%` |
+
+*(Norm Wave 0/unchanged baseline on RTX 4090: `rms_norm_forward fp32 0.335 ms / 901.9 GB/s`, `fp16 0.335 ms / 901.6 GB/s`, `layernorm_inf_fp16 0.344 ms / 877.8 GB/s`, `softmax_rows 0.427 ms / 707.5 GB/s`; all `37/37` rows verified `ok`.)*
+
+### Wave 1 CUDA Verification & LOC Delta
+- **Correctness & Full `ctest` Suite:**
+  - `brass` PTX & GPU proof tests (`-R "^PTX |^GPU - "`): **82/82 passed** (`0` failures).
+  - Targeted Wave 1 CUDA parity suites (`elementwise`, `activations`, `geglu`, `swiglu`, `log_exp_round`, `add_channel_bias`, `vocoder_activations`, `large_elementwise`): **13/13 passed** (`0` failures).
+  - Full rebased CUDA `ctest` (`-C Release -j 1`): **205/205 passed** (`0` failures).
+- **LOC Delta (CUDA Wave 1):**
+  - Deleted files: `src/cuda/elementwise.cu` (`-730`), `src/cuda/elementwise_activations.cu` (`-759`), `src/cuda/swiglu.cu` (`-206`), `src/cuda/elementwise_common.cuh` (`-183`) — **`-1,878` lines**.
+  - Added CUDA files: `src/cuda/cu_mir_cache.{h,cpp}` (`+58` / `+185` = `+243`), `src/cuda/ops_elementwise.cpp` (`+297`), `src/cuda/elementwise_misc.cu` (`+107`) — **`+647` lines** (all files `< 300` LOC).
+  - **Total CUDA diff** (including `CMakeLists.txt` & `cuda_jit_engine.h` capacity bump): `651` insertions, `1,882` deletions (**`-1,231` net LOC**).
+
+---
+
 ## Wave 2: Vulkan Normalization, Softmax, Row/Col Reductions, RoPE & Rowvec -> Single-Source Brass MIR
 
 Replaced 5 GLSL shaders / 21 variants (`norm.comp`, `reduce_rows.comp`, `sum_cols.comp`, `rope.comp`, `rowvec.comp`; `116 -> 95` compiled Vulkan shaders) with single-source vectorized `brass::Function` MIR builders in `src/kernels/{mir_common.h, mir_math.{h,cpp}, mir_elementwise.{h,cpp}, mir_reduce.{h,cpp}, mir_rope.{h,cpp}, mir_norm.{h,cpp}}`, dispatched through `src/vulkan/vk_mir_cache.{h,cpp}`. Null-pointer runtime branches and scalar row loops in `norm.comp` were replaced by compile-time flag specialization (`NormMirFlags`), 128-bit `lanes=4/8` vectorization, and `BVSolver`-provable 8×32 block reductions.
