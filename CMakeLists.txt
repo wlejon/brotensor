@@ -342,15 +342,19 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/fp16_matmul.cu
         src/cuda/cu_mir_cache.cpp
         src/cuda/ops_copy.cpp
+        src/cuda/ops_delta.cpp
         src/cuda/ops_diffusion.cpp
         src/cuda/ops_elementwise.cpp
         src/cuda/ops_gnorm.cpp
+        src/cuda/ops_lstm.cpp
         src/cuda/ops_norm.cpp
         src/cuda/ops_reduce.cpp
         src/cuda/ops_rope.cpp
         src/cuda/ops_scatter.cpp
         src/cuda/ops_spatial.cpp
         src/cuda/ops_spatial_bwd.cpp
+        src/cuda/ops_topk.cpp
+        src/cuda/ops_xent.cpp
         src/cuda/elementwise_misc.cu
         src/cuda/attention.cu
         src/cuda/optim.cu
@@ -375,7 +379,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/q6k_wmma.cu
         src/cuda/flash_attention_varlen_f32.cu
         src/cuda/conv2d_igemm_f32.cu
-        src/cuda/top_k.cu
         src/cuda/cross_attention.cu
         src/cuda/cross_attention_with_attn.cu
         src/cuda/attention_moments.cu
@@ -390,11 +393,9 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/gemm_skinny.cu
         src/cuda/linear_ex.cu
         src/cuda/linear_wq.cu
-        src/cuda/packed_encoder.cu
         src/cuda/resblock.cu
         src/cuda/matmul.cu
         src/cuda/matmul_backward.cu
-        src/cuda/lstm.cu
         src/cuda/kv_cache.cu
         src/cuda/decode_gqa.cu
         src/cuda/int8_quant.cu
@@ -408,8 +409,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/resample1d.cu
         src/cuda/sample_logits.cu
         src/cuda/masked_diffusion.cu
-        src/cuda/gated_delta_rule.cu
-        src/cuda/loss_legacy.cu
         src/cuda/xavier_init.cu
         src/cuda/bias_act.cu
         src/cuda/upfirdn2d.cu

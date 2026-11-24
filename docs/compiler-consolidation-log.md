@@ -530,3 +530,17 @@ Extended `src/cuda/cu_mir_cache.{h,cpp}` (`144` / `496` LOC, using `fn->name()` 
 - **LOC Delta (CUDA Wave 4):**
   - Deleted 17 `.cu` files (`-3,788` lines): `resample.cu` (`-539`), `interp2d.cu` (`-441`), `pool2d.cu` (`-392`), `pad2d.cu` (`-280`), `spatial_merge.cu` (`-276`), `noise.cu` (`-213`), `slice2d.cu` (`-201`), `window_partition.cu` (`-191`), `convex_upsample.cu` (`-186`), `gather_scatter.cu` (`-184`), `image_preproc.cu` (`-171`), `unfold2d.cu` (`-169`), `dpmpp_2m_step.cu` (`-134`), `embedding.cu` (`-116`), `ddim_step.cu` (`-111`), `euler_step.cu` (`-98`), `timestep_embedding.cu` (`-86`).
   - Added `ops_diffusion.cpp` (`222`), `ops_spatial.cpp` (`394`), `ops_spatial_bwd.cpp` (`111`), `cu_mir_cache.{h,cpp}` (`+120` net). Net `src/cuda/` Wave 4 delta: **`-2,941` lines** (`+152 / -3,830` git diff + `727` new LOC; cumulative CUDA Waves 3–4: **`-4,249` net lines**, 22 `.cu` files deleted; all edited/created files `<= 496` LOC).
+
+---
+
+## Wave 5 (CUDA / RTX 4090): LSTM, Gated Delta Rule, Cross-Entropy (Softmax/BCE) & Top-K/Segment Stats -> Single-Source Brass MIR
+
+Extended `src/cuda/cu_mir_cache.{h,cpp}` (`167` / `589` LOC) with `MirKind::{Lstm, DeltaRule, Xent, Topk}` lowered via `PtxTarget::emit_function` (`sm_89`), moved LSTM pointwise forward/backward and `NORM_COL_SUM` bias grads onto `MirKind::Lstm` + CUDA `linear_forward_batched`/`linear_backward_batched`/`matmul`, wired `gated_delta_rule_{chunked,step}` to 32-lane warp register-resident `MirKind::DeltaRule` (`shfl.sync.bfly.b32`), moved `top_k_rows` + `segment_softmax_stats` onto `MirKind::Topk` (`ops_topk.cpp`), and replaced all softmax cross-entropy & BCE fused/legacy kernels with `MirKind::Xent` (`ops_xent.cpp`, retaining only `mse_vec_*` in `loss.cu`).
+
+### Wave 5 CUDA Verification & LOC Delta (RTX 4090 GPU 0, `CUDA_VISIBLE_DEVICES=0`, `brass@d5608f4`)
+- **Targeted Wave 5 Parity & Unit Suites:** `11/11` passed (`3.18 s`, `0` failures): `lstm`, `gated_delta_rule`, `top_k`, `bce_with_logits`, `loss_parity`, `loss_fused_parity`, `lstm_parity`, `batched_backward_parity`, `gated_delta_rule_parity`, `top_k_parity`, `packed_encoder_parity`.
+- **Full CUDA `ctest` (`-LE gcstress -j 1`):** **`204/204` passed** (`1190.96 s`, `0` failures).
+- **LOC Delta (CUDA Wave 5):**
+  - Deleted 5 `.cu` files (`-1,572` lines): `lstm.cu` (`-494`), `gated_delta_rule.cu` (`-475`), `top_k.cu` (`-248`), `loss_legacy.cu` (`-207`), `packed_encoder.cu` (`-148`).
+  - Slimmed `loss.cu` (`508 -> 155`, `-353` LOC, keeping `mse_vec_*` only); added `ops_lstm.cpp` (`167`), `ops_delta.cpp` (`63`), `ops_topk.cpp` (`80`), `ops_xent.cpp` (`130`), `cu_mir_cache.{h,cpp}` (`+121`).
+  - Net `src/cuda/` Wave 5 delta: **`-1,364` lines** (`+121 / -1,925` git diff on `src/cuda/` + `440` new LOC; **cumulative CUDA Waves 3–5: `-5,613` net lines and 27 `.cu` files deleted**, all modified/created files `<= 589` LOC).

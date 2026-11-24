@@ -3,9 +3,11 @@
 #include "cuda_driver.h"
 #include "cuda_jit_engine.h"
 #include "../kernels/mir_copy.h"
+#include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
 #include "../kernels/mir_elementwise.h"
 #include "../kernels/mir_gnorm.h"
+#include "../kernels/mir_lstm.h"
 #include "../kernels/mir_norm.h"
 #include "../kernels/mir_reduce.h"
 #include "../kernels/mir_remap.h"
@@ -13,6 +15,8 @@
 #include "../kernels/mir_resample_bwd.h"
 #include "../kernels/mir_rope.h"
 #include "../kernels/mir_scatter.h"
+#include "../kernels/mir_topk.h"
+#include "../kernels/mir_xent.h"
 
 #if BROTENSOR_HAS_BRASS_CUDA_JIT
 #include <brass/mir/module.hpp>
@@ -107,6 +111,18 @@ CUfunction compile_mir(const MirKey& k) {
         }
         case MirKind::ResampleBwd:
             fn = kernels::build_resample_bwd_mir(mod, k.op, k.dt0, static_cast<std::uint32_t>(k.flags));
+            break;
+        case MirKind::Lstm:
+            fn = kernels::build_lstm_mir(mod, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
+        case MirKind::DeltaRule:
+            fn = kernels::build_delta_rule_mir(mod, k.op, static_cast<std::uint32_t>(k.flags));
+            break;
+        case MirKind::Xent:
+            fn = kernels::build_xent_mir(mod, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
+        case MirKind::Topk:
+            fn = kernels::build_topk_mir(mod, k.op, k.dt0);
             break;
     }
     const std::string ptx = brass::target::PtxTarget::emit_function(*fn, jit::make_ptx_opts());
@@ -532,6 +548,87 @@ void mir_dispatch_resample_bwd(CUfunction fn, std::uint32_t gx,
     void* params[] = {
         &ady, &adx, &aaux, &aplanes, &ahi, &awi, &aho, &awo, &apt, &apl};
     launch_kernel(fn, gx, kernels::kEwBlock, params, "mir_resample_bwd");
+}
+
+void mir_dispatch_lstm(CUfunction fn, std::uint32_t gx,
+                       const void* gates, const void* c, const void* y,
+                       const void* bhh, const void* c0,
+                       const void* dy, void* dz, void* dh, void* dc,
+                       std::uint32_t b, std::uint32_t h, std::uint32_t row0) {
+    CUdeviceptr ag = reinterpret_cast<CUdeviceptr>(gates);
+    CUdeviceptr ac = reinterpret_cast<CUdeviceptr>(c);
+    CUdeviceptr ay = reinterpret_cast<CUdeviceptr>(y);
+    CUdeviceptr abhh = reinterpret_cast<CUdeviceptr>(bhh);
+    CUdeviceptr ac0 = reinterpret_cast<CUdeviceptr>(c0);
+    CUdeviceptr ady = reinterpret_cast<CUdeviceptr>(dy);
+    CUdeviceptr adz = reinterpret_cast<CUdeviceptr>(dz);
+    CUdeviceptr adh = reinterpret_cast<CUdeviceptr>(dh);
+    CUdeviceptr adc = reinterpret_cast<CUdeviceptr>(dc);
+    std::int32_t ab = static_cast<std::int32_t>(b);
+    std::int32_t ah = static_cast<std::int32_t>(h);
+    std::int32_t ar0 = static_cast<std::int32_t>(row0);
+    void* params[] = {&ag, &ac, &ay, &abhh, &ac0, &ady, &adz, &adh, &adc, &ab, &ah, &ar0};
+    launch_kernel(fn, gx, kernels::kEwBlock, params, "mir_lstm");
+}
+
+void mir_dispatch_delta(CUfunction fn, std::uint32_t gx,
+                        const void* q, const void* k, const void* v,
+                        const void* a, const void* b, const void* loga,
+                        void* s, void* o,
+                        std::uint32_t L, std::uint32_t H, std::uint32_t dk, std::uint32_t dv,
+                        std::uint32_t ldq, std::uint32_t ldv) {
+    CUdeviceptr aq = reinterpret_cast<CUdeviceptr>(q);
+    CUdeviceptr ak = reinterpret_cast<CUdeviceptr>(k);
+    CUdeviceptr av = reinterpret_cast<CUdeviceptr>(v);
+    CUdeviceptr aa = reinterpret_cast<CUdeviceptr>(a);
+    CUdeviceptr ab = reinterpret_cast<CUdeviceptr>(b);
+    CUdeviceptr aloga = reinterpret_cast<CUdeviceptr>(loga);
+    CUdeviceptr as = reinterpret_cast<CUdeviceptr>(s);
+    CUdeviceptr ao = reinterpret_cast<CUdeviceptr>(o);
+    std::int32_t aL = static_cast<std::int32_t>(L);
+    std::int32_t aH = static_cast<std::int32_t>(H);
+    std::int32_t adk = static_cast<std::int32_t>(dk);
+    std::int32_t adv = static_cast<std::int32_t>(dv);
+    std::int32_t aldq = static_cast<std::int32_t>(ldq);
+    std::int32_t aldv = static_cast<std::int32_t>(ldv);
+    void* params[] = {
+        &aq, &ak, &av, &aa, &ab, &aloga, &as, &ao,
+        &aL, &aH, &adk, &adv, &aldq, &aldv};
+    launch_kernel(fn, gx, kernels::kEwBlock, params, "mir_delta");
+}
+
+void mir_dispatch_xent(CUfunction fn, std::uint32_t gx,
+                       const void* logits, const void* target, const void* mask, const void* off,
+                       void* probs, void* dlog, void* loss,
+                       std::uint32_t rows, std::uint32_t n, std::uint32_t heads, float pos_weight) {
+    CUdeviceptr al = reinterpret_cast<CUdeviceptr>(logits);
+    CUdeviceptr at = reinterpret_cast<CUdeviceptr>(target);
+    CUdeviceptr am = reinterpret_cast<CUdeviceptr>(mask);
+    CUdeviceptr ao = reinterpret_cast<CUdeviceptr>(off);
+    CUdeviceptr ap = reinterpret_cast<CUdeviceptr>(probs);
+    CUdeviceptr ad = reinterpret_cast<CUdeviceptr>(dlog);
+    CUdeviceptr aloss = reinterpret_cast<CUdeviceptr>(loss);
+    std::int32_t arows = static_cast<std::int32_t>(rows);
+    std::int32_t an = static_cast<std::int32_t>(n);
+    std::int32_t aheads = static_cast<std::int32_t>(heads);
+    float apw = pos_weight;
+    void* params[] = {&al, &at, &am, &ao, &ap, &ad, &aloss, &arows, &an, &aheads, &apw};
+    launch_kernel(fn, gx, kernels::kEwBlock, params, "mir_xent");
+}
+
+void mir_dispatch_topk(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
+                       const void* x, void* vals, void* idx, const void* off,
+                       std::uint32_t rows, std::uint32_t cols, std::uint32_t k, std::uint32_t nseg) {
+    CUdeviceptr ax = reinterpret_cast<CUdeviceptr>(x);
+    CUdeviceptr av = reinterpret_cast<CUdeviceptr>(vals);
+    CUdeviceptr aidx = reinterpret_cast<CUdeviceptr>(idx);
+    CUdeviceptr aoff = reinterpret_cast<CUdeviceptr>(off);
+    std::int32_t arows = static_cast<std::int32_t>(rows);
+    std::int32_t acols = static_cast<std::int32_t>(cols);
+    std::int32_t ak = static_cast<std::int32_t>(k);
+    std::int32_t anseg = static_cast<std::int32_t>(nseg);
+    void* params[] = {&ax, &av, &aidx, &aoff, &arows, &acols, &ak, &anseg};
+    launch_kernel_3d(fn, gx, gy, 1, kernels::kEwBlock, params, "mir_topk");
 }
 
 }  // namespace brotensor::detail::cuda

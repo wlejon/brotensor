@@ -35,6 +35,10 @@ enum class MirKind : std::uint8_t {
     Remap = 20,
     Resample = 21,
     ResampleBwd = 22,
+    Lstm = 23,
+    DeltaRule = 24,
+    Xent = 25,
+    Topk = 26,
 };
 
 struct MirKey {
@@ -156,5 +160,25 @@ void mir_dispatch_resample_bwd(CUfunction fn, std::uint32_t gx,
                                std::uint32_t planes, std::uint32_t hi, std::uint32_t wi,
                                std::uint32_t ho, std::uint32_t wo,
                                std::int32_t pt, std::int32_t pl);
+
+// ── Wave 5: lstm / delta_rule / xent / topk ──
+void mir_dispatch_lstm(CUfunction fn, std::uint32_t gx,
+                       const void* gates, const void* c, const void* y,
+                       const void* bhh, const void* c0,
+                       const void* dy, void* dz, void* dh, void* dc,
+                       std::uint32_t b, std::uint32_t h, std::uint32_t row0);
+void mir_dispatch_delta(CUfunction fn, std::uint32_t gx,
+                        const void* q, const void* k, const void* v,
+                        const void* a, const void* b, const void* loga,
+                        void* s, void* o,
+                        std::uint32_t L, std::uint32_t H, std::uint32_t dk, std::uint32_t dv,
+                        std::uint32_t ldq, std::uint32_t ldv);
+void mir_dispatch_xent(CUfunction fn, std::uint32_t gx,
+                       const void* logits, const void* target, const void* mask, const void* off,
+                       void* probs, void* dlog, void* loss,
+                       std::uint32_t rows, std::uint32_t n, std::uint32_t heads, float pos_weight);
+void mir_dispatch_topk(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
+                       const void* x, void* vals, void* idx, const void* off,
+                       std::uint32_t rows, std::uint32_t cols, std::uint32_t k, std::uint32_t nseg);
 
 }  // namespace brotensor::detail::cuda
