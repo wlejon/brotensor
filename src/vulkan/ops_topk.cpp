@@ -5,6 +5,7 @@
 // the stats are FP32, Idx INT32; X may also be FP16 / BF16 here.
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -18,11 +19,6 @@ using ::brotensor::Dtype;
 using ::brotensor::Tensor;
 
 namespace {
-
-struct TopkPush {
-    std::uint64_t x, vals, idx, off;
-    std::uint32_t rows, cols, k, nseg;
-};
 
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
@@ -42,15 +38,16 @@ void top_k_rows(const Tensor& X, int k, Tensor& Vals, Tensor& Idx) {
     const std::uint64_t groups = (static_cast<std::uint64_t>(C) + 255) / 256;
     if (groups > 65535) fail(op, "rows longer than 16M elements");
     DeviceCtx& d = device_of(X);
-    const Kernel& kern = d.pipelines().get(dt_variant(ShaderId::topk_seg_f32, X.dtype, op), {0u});
+    const MirKernel mk = mir_kernel(d, {MirKind::Topk, 0u, X.dtype});
     const std::uint64_t es = X.dtype == Dtype::FP32 ? 4 : 2;
     for (int r0 = 0; r0 < R; r0 += 65535) {
         const int n = std::min(65535, R - r0);
-        const TopkPush pc{addr(X.data) + static_cast<std::uint64_t>(r0) * C * es,
+        mir_dispatch_topk(d, mk, static_cast<std::uint32_t>(groups), static_cast<std::uint32_t>(n),
+                          addr(X.data) + static_cast<std::uint64_t>(r0) * C * es,
                           addr(Vals.data) + static_cast<std::uint64_t>(r0) * k * 4,
                           addr(Idx.data) + static_cast<std::uint64_t>(r0) * k * 4, 0,
-                          static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(C), static_cast<std::uint32_t>(k), 0};
-        launch(d, kern, pc, static_cast<std::uint32_t>(groups), static_cast<std::uint32_t>(n));
+                          static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(C),
+                          static_cast<std::uint32_t>(k), 0);
     }
 }
 
@@ -65,12 +62,12 @@ void segment_softmax_stats(const Tensor& logits, const Tensor& seg_offsets, Tens
     // Offsets are device data: the kernel clamps them to the logits (the CPU
     // reference throws on a bad table instead).
     DeviceCtx& d = device_of(logits);
-    const Kernel& kern = d.pipelines().get(dt_variant(ShaderId::topk_seg_f32, logits.dtype, op), {1u});
+    const MirKernel mk = mir_kernel(d, {MirKind::Topk, 1u, logits.dtype});
     const long long total = logits.size();
     if (total > 0x7fffffffLL) fail(op, "logits too large");
-    const TopkPush pc{addr(logits.data), addr(out.data), 0, addr(seg_offsets.data), 0,
-                      static_cast<std::uint32_t>(total), 0, static_cast<std::uint32_t>(S)};
-    launch(d, kern, pc, static_cast<std::uint32_t>(std::min(S, 65535)));
+    mir_dispatch_topk(d, mk, static_cast<std::uint32_t>(std::min(S, 65535)), 1u,
+                      addr(logits.data), addr(out.data), 0, addr(seg_offsets.data), 0,
+                      static_cast<std::uint32_t>(total), 0, static_cast<std::uint32_t>(S));
 }
 
 void fill_vulkan_vtable_topk(::brotensor::detail::OpsVTable& v) {

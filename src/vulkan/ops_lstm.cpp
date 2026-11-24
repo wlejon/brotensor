@@ -14,6 +14,7 @@
 
 #include "detail/gemm.h"
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/ops.h>
@@ -29,11 +30,6 @@ using ::brotensor::Tensor;
 void column_sum_accumulate(const Tensor& X, Tensor& out);   // ops_norm.cpp
 
 namespace {
-
-struct LsPush {
-    std::uint64_t gates, c, y, bhh, c0, dy, dz, dh, dc;
-    std::uint32_t b, h, row0;
-};
 
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
@@ -103,19 +99,18 @@ void lstm_forward_train(const Tensor& X, const Tensor& W_ih, const Tensor& W_hh,
     // gates = X W_ih^T + b_ih for every step at once (pre-activations).
     mm(d, op, addr(X.data), I, false, addr(W_ih.data), I, false, addr(gates.data), G, T * B, G, I, false,
        bih ? addr(bih->data) : 0);
-    const Kernel& k = d.pipelines().get(ShaderId::lstm, {std::uint32_t(LS_FWD)});
-    LsPush pc{};
-    pc.gates = addr(gates.data); pc.c = addr(C.data); pc.y = addr(Y.data);
-    pc.bhh = bhh ? addr(bhh->data) : 0;
-    pc.c0 = c0p ? addr(c0p->data) : 0;
-    pc.b = static_cast<std::uint32_t>(B);
-    pc.h = static_cast<std::uint32_t>(H);
+    const std::uint8_t flags = static_cast<std::uint8_t>((bhh ? 1u : 0u) | (c0p ? 2u : 0u));
+    const MirKernel mk = mir_kernel(d, {MirKind::Lstm, std::uint32_t(LS_FWD), Dtype::FP32, Dtype::FP32, 1, Dtype::FP32, flags});
+    const std::uint32_t gx = mir_groups_1d(static_cast<std::uint32_t>(B * H), 1);
+    const std::uint64_t bhh_a = bhh ? addr(bhh->data) : 0;
+    const std::uint64_t c0_a = c0p ? addr(c0p->data) : 0;
     for (int t = 0; t < T; ++t) {
         const std::uint64_t hprev = t > 0 ? row_addr(Y, static_cast<long long>(t - 1) * B) : (h0p ? addr(h0p->data) : 0);
         if (hprev) mm(d, op, hprev, H, false, addr(W_hh.data), H, false, row_addr(gates, static_cast<long long>(t) * B), G,
                       B, G, H, true);
-        pc.row0 = static_cast<std::uint32_t>(t * B);
-        launch(d, k, pc, groups_1d(static_cast<std::uint64_t>(B) * H, k));
+        mir_dispatch_lstm(d, mk, gx, addr(gates.data), addr(C.data), addr(Y.data), bhh_a, c0_a,
+                          0, 0, 0, 0, static_cast<std::uint32_t>(B), static_cast<std::uint32_t>(H),
+                          static_cast<std::uint32_t>(t * B));
     }
     if (hT) ::brotensor::copy_d2d(Y, static_cast<long long>(T - 1) * B * H, *hT, 0, B * H);
     if (cT) ::brotensor::copy_d2d(C, static_cast<long long>(T - 1) * B * H, *cT, 0, B * H);
@@ -153,16 +148,15 @@ void lstm_backward(const Tensor& X, const Tensor& W_ih, const Tensor& W_hh, cons
     Tensor dZ = Tensor::empty_on(dev, T * B, G, Dtype::FP32);
     Tensor dh = Tensor::zeros_on(dev, B, H, Dtype::FP32);   // dL/dh_t arriving from step t + 1
     Tensor dc = Tensor::zeros_on(dev, B, H, Dtype::FP32);
-    const Kernel& k = d.pipelines().get(ShaderId::lstm, {std::uint32_t(LS_BWD)});
-    LsPush pc{};
-    pc.gates = addr(gates.data); pc.c = addr(C.data);
-    pc.c0 = c0p ? addr(c0p->data) : 0;
-    pc.dy = addr(dY.data); pc.dz = addr(dZ.data); pc.dh = addr(dh.data); pc.dc = addr(dc.data);
-    pc.b = static_cast<std::uint32_t>(B);
-    pc.h = static_cast<std::uint32_t>(H);
+    const std::uint8_t flags = static_cast<std::uint8_t>(c0p ? 2u : 0u);
+    const MirKernel mk = mir_kernel(d, {MirKind::Lstm, std::uint32_t(LS_BWD), Dtype::FP32, Dtype::FP32, 1, Dtype::FP32, flags});
+    const std::uint32_t gx = mir_groups_1d(static_cast<std::uint32_t>(B * H), 1);
+    const std::uint64_t c0_a = c0p ? addr(c0p->data) : 0;
     for (int t = T - 1; t >= 0; --t) {
-        pc.row0 = static_cast<std::uint32_t>(t * B);
-        launch(d, k, pc, groups_1d(static_cast<std::uint64_t>(B) * H, k));
+        mir_dispatch_lstm(d, mk, gx, addr(gates.data), addr(C.data), 0, 0, c0_a,
+                          addr(dY.data), addr(dZ.data), addr(dh.data), addr(dc.data),
+                          static_cast<std::uint32_t>(B), static_cast<std::uint32_t>(H),
+                          static_cast<std::uint32_t>(t * B));
         // dh_{t-1} = dZ_t W_hh: W_hh stored (K = 4H, N = H).
         mm(d, op, row_addr(dZ, static_cast<long long>(t) * B), G, false, addr(W_hh.data), H, true, addr(dh.data), H, B,
            H, G, false);

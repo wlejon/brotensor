@@ -6,6 +6,7 @@
 // on the CPU (src/ops.cpp routes it there).
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -19,12 +20,6 @@ using ::brotensor::Dtype;
 using ::brotensor::Tensor;
 
 namespace {
-
-struct XentPush {
-    std::uint64_t logits, target, mask, off, probs, dlog, loss;
-    std::uint32_t rows, n, heads;
-    float pos_weight;
-};
 
 void need_f32(const Tensor& t, const char* op, const char* what) {
     if (t.dtype != Dtype::FP32) throw std::runtime_error(std::string("brotensor: ") + op + ": " + what + " must be FP32");
@@ -40,11 +35,14 @@ void run(const char* op, const Tensor& logits, const Tensor& target, const float
     need_f32(target, op, "target");
     if (target.size() != logits.size()) throw std::runtime_error(std::string("brotensor: ") + op + ": target shape");
     DeviceCtx& d = device_of(logits);
-    const Kernel& k = d.pipelines().get(ShaderId::xent, {static_cast<std::uint32_t>(mode)});
-    const XentPush pc{addr(logits.data), addr(target.data), addr(mask), addr(off), addr(probs.data), addr(dlog.data),
-                      loss, static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(n),
-                      static_cast<std::uint32_t>(heads), pos_weight};
-    launch(d, k, pc, static_cast<std::uint32_t>(std::min(rows, 65535)));
+    const std::uint8_t flags = static_cast<std::uint8_t>((mask ? 1u : 0u) | (off ? 2u : 0u));
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::Xent, static_cast<std::uint32_t>(mode), Dtype::FP32, Dtype::FP32, 1, Dtype::FP32, flags});
+    mir_dispatch_xent(d, mk, static_cast<std::uint32_t>(std::min(rows, 65535)),
+                      addr(logits.data), addr(target.data), addr(mask), addr(off),
+                      addr(probs.data), addr(dlog.data), loss,
+                      static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(n),
+                      static_cast<std::uint32_t>(heads), pos_weight);
 }
 
 float single(const char* op, const Tensor& logits, const Tensor& target, const float* mask, Tensor& probs,

@@ -54,10 +54,10 @@ Function* build_rope_mir(Module& mod, std::uint32_t mode, bool bwd, Dtype dt) {
     Value* stride_d = c.b.build_mul(heads, hd);
 
     emit_vec_grid_stride(c, total, 1, kRopeBlock, [&](Value* idx) {
-        Value* i = c.b.build_umod(idx, hp);
         Value* rest = c.b.build_udiv(idx, hp);
-        Value* h = c.b.build_umod(rest, heads);
+        Value* i = c.b.build_sub(idx, c.b.build_mul(rest, hp));
         Value* row = c.b.build_udiv(rest, heads);
+        Value* h = c.b.build_sub(rest, c.b.build_mul(row, heads));
         Value* pair_off = c.b.build_add(c.b.build_mul(h, hd), c.b.build_shl(i, c.i32(1)));
 
         if (mode == ROPE_PACKED) {

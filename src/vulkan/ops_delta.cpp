@@ -8,6 +8,7 @@
 // d_v * d_k) updated in place, O resized to (L, num_heads * d_v).
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -22,11 +23,6 @@ using ::brotensor::Dtype;
 using ::brotensor::Tensor;
 
 namespace {
-
-struct DeltaPush {
-    std::uint64_t q, k, v, a, b, loga, s, o;
-    std::uint32_t L, H, dk, dv, ldq, ldv;
-};
 
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string(op) + ": " + why);
@@ -61,16 +57,17 @@ void scan(const char* op, const Tensor& Q, const Tensor& K, const Tensor& V, con
     }
     const std::uint32_t ne = (static_cast<std::uint32_t>(dk) + lpr - 1) / lpr;
     if (ne > 16) fail(op, "d_k is above 16 x the lanes per row (512 at subgroup 32) on Vulkan");
-    const Kernel& k = d.pipelines().get(ShaderId::delta_rule, {lpr, ne}, pin);
-    const DeltaPush pc{addr(Q.data), addr(K.data), addr(V.data), addr(a_raw.data), addr(beta.data),
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::DeltaRule, lpr, Dtype::FP32, Dtype::FP32, 1, Dtype::FP32, static_cast<std::uint8_t>(ne)}, pin);
+    const std::uint64_t lanes = static_cast<std::uint64_t>(H) * dv * lpr;
+    const std::uint64_t groups = (lanes + 255) / 256;
+    if (groups > 65535) fail(op, "too many state rows for one dispatch");
+    mir_dispatch_delta(d, mk, static_cast<std::uint32_t>(groups),
+                       addr(Q.data), addr(K.data), addr(V.data), addr(a_raw.data), addr(beta.data),
                        addr(log_A.data), addr(state.data), addr(O.data),
                        static_cast<std::uint32_t>(L), static_cast<std::uint32_t>(H), static_cast<std::uint32_t>(dk),
                        static_cast<std::uint32_t>(dv), static_cast<std::uint32_t>(Q.cols),
-                       static_cast<std::uint32_t>(V.cols)};
-    const std::uint64_t lanes = static_cast<std::uint64_t>(H) * dv * lpr;
-    const std::uint64_t groups = (lanes + k.local[0] - 1) / k.local[0];
-    if (groups > 65535) fail(op, "too many state rows for one dispatch");
-    launch(d, k, pc, static_cast<std::uint32_t>(groups));
+                       static_cast<std::uint32_t>(V.cols));
 }
 
 }  // namespace

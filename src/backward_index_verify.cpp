@@ -28,14 +28,17 @@
 #include <brotensor/backward_verify.h>
 
 #if BROTENSOR_HAS_BRASS_JIT
+#include "kernels/mir_delta.h"
 #include "kernels/mir_elementwise.h"
 #include "kernels/mir_gnorm.h"
+#include "kernels/mir_lstm.h"
 #include "kernels/mir_norm.h"
 #include "kernels/mir_remap.h"
 #include "kernels/mir_resample.h"
 #include "kernels/mir_resample_bwd.h"
 #include "kernels/mir_rope.h"
 #include "kernels/mir_scatter.h"
+#include "kernels/mir_xent.h"
 #include "vulkan/shaders/op_codes.h"
 
 #include <brass/codegen/kernel_jit.hpp>
@@ -676,15 +679,46 @@ BackwardProofSuiteReport prove_rope_adjoint_duality() {
         rep.entries.push_back({"act_bwd_mir_lifted_spirv_bounds_and_safety", all_ok, oss.str()});
     }
 
-    const ShaderId norm_recurrent_ids[] = {
-        ShaderId::lstm,
-        ShaderId::delta_rule,
-        ShaderId::xent,
-    };
-    add_shader_family_proof(
-        rep,
-        "norm_lstm_deltarule_xent_lifted_spirv_bounds_and_barrier_safety",
-        norm_recurrent_ids);
+#if BROTENSOR_HAS_BRASS_JIT
+    {
+        bool all_ok = true;
+        std::uint32_t total_insts = 0, total_writes = 0, total_guards = 0, count = 0;
+        std::string first_failure;
+        brass::target::SpirvOptions spv_opts;
+        spv_opts.stage = brass::target::SpirvStage::Compute;
+        spv_opts.local_size_x = kernels::kEwBlock;
+        spv_opts.local_size_spec_constants = true;
+        auto check_mir = [&](const char* nm, const auto& build_fn) {
+            brass::Module mod("verify_w5");
+            brass::Function* fn = build_fn(mod);
+            brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, spv_opts);
+            LiftedSpirvCfgMetrics m = audit_lifted_spirv_words(sk.words, nm);
+            total_insts += m.num_instructions;
+            total_writes += m.psb_stores_and_atomics;
+            total_guards += m.bounds_comparisons;
+            ++count;
+            if (!m.all_ok()) {
+                all_ok = false;
+                if (first_failure.empty()) first_failure = m.diagnostic;
+            }
+        };
+        check_mir("mir_lstm", [](brass::Module& m) { return kernels::build_lstm_mir(m, LS_FWD, true, true); });
+        check_mir("mir_lstm", [](brass::Module& m) { return kernels::build_lstm_mir(m, LS_BWD, false, true); });
+        check_mir("mir_delta", [](brass::Module& m) { return kernels::build_delta_rule_mir(m, 32u, 4u); });
+        check_mir("mir_xent", [](brass::Module& m) { return kernels::build_xent_mir(m, 0u, true, true); });
+        check_mir("mir_xent", [](brass::Module& m) { return kernels::build_xent_mir(m, 1u, true, false); });
+        std::ostringstream oss;
+        if (all_ok) {
+            oss << "Proven on " << count << " brass-MIR compiled recurrent/xent .spv binaries ("
+                << total_insts << " lifted SPIR-V insts, " << total_writes
+                << " guarded PhysicalStorageBuffer64 writes, " << total_guards
+                << " bounds comparisons, 0 hazards)";
+        } else {
+            oss << first_failure;
+        }
+        rep.entries.push_back({"norm_lstm_deltarule_xent_lifted_spirv_bounds_and_barrier_safety", all_ok, oss.str()});
+    }
+#endif
     {
         bool all_ok = true;
         std::uint32_t total_insts = 0, total_writes = 0, total_guards = 0, count = 0;

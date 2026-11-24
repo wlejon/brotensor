@@ -35,6 +35,10 @@ enum class MirKind : std::uint8_t {
     Remap = 20,
     Resample = 21,
     ResampleBwd = 22,
+    Lstm = 23,
+    DeltaRule = 24,
+    Xent = 25,
+    Topk = 26,
 };
 
 struct MirKey {
@@ -54,7 +58,7 @@ struct MirKernel {
     JitPipeline pipe{};
 };
 
-MirKernel mir_kernel(DeviceCtx& d, const MirKey& key);
+MirKernel mir_kernel(DeviceCtx& d, const MirKey& key, std::uint32_t req_subgroup = 0);
 
 int mir_vec_lanes(Dtype dt, std::uint32_t n, std::uint64_t a0, std::uint64_t a1 = 0,
                   std::uint64_t a2 = 0, std::uint64_t a3 = 0);
@@ -143,5 +147,21 @@ void mir_dispatch_resample_bwd(DeviceCtx& d, const MirKernel& mk, std::uint32_t 
                                std::uint64_t dy, std::uint64_t dx, std::uint64_t aux,
                                std::uint32_t planes, std::uint32_t hi, std::uint32_t wi,
                                std::uint32_t ho, std::uint32_t wo, std::int32_t pt, std::int32_t pl);
+void mir_dispatch_lstm(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                       std::uint64_t gates, std::uint64_t c, std::uint64_t y, std::uint64_t bhh,
+                       std::uint64_t c0, std::uint64_t dy, std::uint64_t dz, std::uint64_t dh, std::uint64_t dc,
+                       std::uint32_t b, std::uint32_t h, std::uint32_t row0);
+void mir_dispatch_delta(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                        std::uint64_t q, std::uint64_t k, std::uint64_t v, std::uint64_t a,
+                        std::uint64_t b, std::uint64_t loga, std::uint64_t s, std::uint64_t o,
+                        std::uint32_t L, std::uint32_t H, std::uint32_t dk, std::uint32_t dv,
+                        std::uint32_t ldq, std::uint32_t ldv);
+void mir_dispatch_xent(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                       std::uint64_t logits, std::uint64_t target, std::uint64_t mask, std::uint64_t off,
+                       std::uint64_t probs, std::uint64_t dlog, std::uint64_t loss,
+                       std::uint32_t rows, std::uint32_t n, std::uint32_t heads, float pos_weight);
+void mir_dispatch_topk(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                       std::uint64_t x, std::uint64_t vals, std::uint64_t idx, std::uint64_t off,
+                       std::uint32_t rows, std::uint32_t cols, std::uint32_t k, std::uint32_t nseg);
 
 }  // namespace brotensor::detail::vulkan

@@ -21,9 +21,11 @@
 #include "jit/trace_dag.h"
 #include "jit/trace_plan.h"
 #include "kernels/mir_copy.h"
+#include "kernels/mir_delta.h"
 #include "kernels/mir_diffusion.h"
 #include "kernels/mir_elementwise.h"
 #include "kernels/mir_gnorm.h"
+#include "kernels/mir_lstm.h"
 #include "kernels/mir_norm.h"
 #include "kernels/mir_reduce.h"
 #include "kernels/mir_remap.h"
@@ -31,6 +33,8 @@
 #include "kernels/mir_resample_bwd.h"
 #include "kernels/mir_rope.h"
 #include "kernels/mir_scatter.h"
+#include "kernels/mir_topk.h"
+#include "kernels/mir_xent.h"
 #include "vulkan/shaders/op_codes.h"
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/builder.hpp>
@@ -132,13 +136,6 @@ std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::str
             {2, 0, 3, eb, 16, -1, -1, 2}, // dx: 2 * n elements
         };
     }
-    if (name == "rope_f32" || name == "rope_f16" || name == "rope_bf16") {
-        const std::uint32_t eb = (name == "rope_f32") ? 4u : 2u;
-        return {
-            {0, 0, 11, eb, 16, 12, 13, 1}, // x: rows * heads * hd elements
-            {1, 0, 11, eb, 16, 12, 13, 1}, // y: rows * heads * hd elements
-        };
-    }
     if (name == "attn_aux_f32" || name == "attn_aux_f16" || name == "attn_aux_bf16") {
         const std::uint32_t eb_y = (name == "attn_aux_f32") ? 4u : 2u;
         return {
@@ -202,12 +199,6 @@ std::vector<brass::verify::GpuParamConstraint> param_constraints_for_shader(cons
         return {
             {4, UINT32_MAX, 1, 0, UINT32_MAX, 0}, // d >= 1
             {3, UINT32_MAX, 0, 0, 4, 0},          // n % d == 0
-        };
-    }
-    if (name == "rope_f32" || name == "rope_f16" || name == "rope_bf16") {
-        return {
-            {12, UINT32_MAX, 1, 0, UINT32_MAX, 0}, // heads >= 1
-            {13, UINT32_MAX, 2, 0, UINT32_MAX, 2}, // hd >= 2 && hd % 2 == 0
         };
     }
     if (name == "attn_aux_f32" || name == "attn_aux_f16" || name == "attn_aux_bf16") {
@@ -583,6 +574,16 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
         audit_mir("remap_b2", [](brass::Module& m) { return kernels::build_remap_mir(m, RM_PAD, 2); });
         audit_mir("remap_b4", [](brass::Module& m) { return kernels::build_remap_mir(m, RM_PAD, 4); });
         audit_mir("philox", [](brass::Module& m) { return kernels::build_philox_mir(m, RNG_NORMAL); });
+        audit_mir("lstm", [](brass::Module& m) { return kernels::build_lstm_mir(m, LS_BWD, false, true); });
+        audit_mir("lstm_fwd", [](brass::Module& m) { return kernels::build_lstm_mir(m, LS_FWD, true, true); });
+        audit_mir("delta_rule", [](brass::Module& m) { return kernels::build_delta_rule_mir(m, 32u, 4u); });
+        audit_mir("xent", [](brass::Module& m) { return kernels::build_xent_mir(m, 0u, true, true); });
+        audit_mir("xent_bce", [](brass::Module& m) { return kernels::build_xent_mir(m, 1u, true, false); });
+        for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
+                 {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
+            const std::string tk_name = std::string("topk_seg") + sfx;
+            audit_mir(tk_name.c_str(), [dt](brass::Module& m) { return kernels::build_topk_mir(m, 0u, dt); });
+        }
     }
 
     // 4. Synthetic negative test if not already covered by ShaderId::test_shared_overflow

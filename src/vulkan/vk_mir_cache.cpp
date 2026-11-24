@@ -1,9 +1,11 @@
 #include "vk_mir_cache.h"
 
 #include "../kernels/mir_copy.h"
+#include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
 #include "../kernels/mir_elementwise.h"
 #include "../kernels/mir_gnorm.h"
+#include "../kernels/mir_lstm.h"
 #include "../kernels/mir_norm.h"
 #include "../kernels/mir_reduce.h"
 #include "../kernels/mir_remap.h"
@@ -11,6 +13,8 @@
 #include "../kernels/mir_resample_bwd.h"
 #include "../kernels/mir_rope.h"
 #include "../kernels/mir_scatter.h"
+#include "../kernels/mir_topk.h"
+#include "../kernels/mir_xent.h"
 
 #include <brass/mir/module.hpp>
 #include <brass/target/spirv_target.hpp>
@@ -87,6 +91,18 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
         case MirKind::ResampleBwd:
             fn = kernels::build_resample_bwd_mir(mod, k.op, k.dt0, static_cast<std::uint32_t>(k.flags));
             break;
+        case MirKind::Lstm:
+            fn = kernels::build_lstm_mir(mod, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
+        case MirKind::DeltaRule:
+            fn = kernels::build_delta_rule_mir(mod, k.op, static_cast<std::uint32_t>(k.flags));
+            break;
+        case MirKind::Xent:
+            fn = kernels::build_xent_mir(mod, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
+        case MirKind::Topk:
+            fn = kernels::build_topk_mir(mod, k.op, k.dt0);
+            break;
     }
     brass::target::SpirvOptions opts;
     opts.stage = brass::target::SpirvStage::Compute;
@@ -113,7 +129,7 @@ bool ptr_ok(std::uint64_t p, Dtype dt, int lanes) {
 
 }  // namespace
 
-MirKernel mir_kernel(DeviceCtx& d, const MirKey& key) {
+MirKernel mir_kernel(DeviceCtx& d, const MirKey& key, std::uint32_t req_subgroup) {
     const brass::target::SpirvKernel* spv = nullptr;
     {
         MirCache& cache = mir_cache();
@@ -121,7 +137,7 @@ MirKernel mir_kernel(DeviceCtx& d, const MirKey& key) {
         if (auto it = cache.map.find(key); it != cache.map.end()) spv = it->second.get();
     }
     if (!spv) spv = compile_mir(key);
-    return MirKernel{spv, jit_pipeline(d, *spv, block_for(key.kind))};
+    return MirKernel{spv, jit_pipeline(d, *spv, block_for(key.kind), req_subgroup)};
 }
 
 int mir_vec_lanes(Dtype dt, std::uint32_t n, std::uint64_t a0, std::uint64_t a1,
@@ -505,6 +521,83 @@ void mir_dispatch_resample_bwd(DeviceCtx& d, const MirKernel& mk, std::uint32_t 
     put_param(buf, *mk.spv, 8, pt);
     put_param(buf, *mk.spv, 9, pl);
     jit_dispatch(d, mk.pipe, buf.data(), gx);
+}
+
+void mir_dispatch_lstm(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                       std::uint64_t gates, std::uint64_t c, std::uint64_t y, std::uint64_t bhh,
+                       std::uint64_t c0, std::uint64_t dy, std::uint64_t dz, std::uint64_t dh, std::uint64_t dc,
+                       std::uint32_t b, std::uint32_t h, std::uint32_t row0) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, gates);
+    put_param(buf, *mk.spv, 1, c);
+    put_param(buf, *mk.spv, 2, y);
+    put_param(buf, *mk.spv, 3, bhh);
+    put_param(buf, *mk.spv, 4, c0);
+    put_param(buf, *mk.spv, 5, dy);
+    put_param(buf, *mk.spv, 6, dz);
+    put_param(buf, *mk.spv, 7, dh);
+    put_param(buf, *mk.spv, 8, dc);
+    put_param(buf, *mk.spv, 9, static_cast<std::int32_t>(b));
+    put_param(buf, *mk.spv, 10, static_cast<std::int32_t>(h));
+    put_param(buf, *mk.spv, 11, static_cast<std::int32_t>(row0));
+    jit_dispatch(d, mk.pipe, buf.data(), gx);
+}
+
+void mir_dispatch_delta(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                        std::uint64_t q, std::uint64_t k, std::uint64_t v, std::uint64_t a,
+                        std::uint64_t b, std::uint64_t loga, std::uint64_t s, std::uint64_t o,
+                        std::uint32_t L, std::uint32_t H, std::uint32_t dk, std::uint32_t dv,
+                        std::uint32_t ldq, std::uint32_t ldv) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, q);
+    put_param(buf, *mk.spv, 1, k);
+    put_param(buf, *mk.spv, 2, v);
+    put_param(buf, *mk.spv, 3, a);
+    put_param(buf, *mk.spv, 4, b);
+    put_param(buf, *mk.spv, 5, loga);
+    put_param(buf, *mk.spv, 6, s);
+    put_param(buf, *mk.spv, 7, o);
+    put_param(buf, *mk.spv, 8, static_cast<std::int32_t>(L));
+    put_param(buf, *mk.spv, 9, static_cast<std::int32_t>(H));
+    put_param(buf, *mk.spv, 10, static_cast<std::int32_t>(dk));
+    put_param(buf, *mk.spv, 11, static_cast<std::int32_t>(dv));
+    put_param(buf, *mk.spv, 12, static_cast<std::int32_t>(ldq));
+    put_param(buf, *mk.spv, 13, static_cast<std::int32_t>(ldv));
+    jit_dispatch(d, mk.pipe, buf.data(), gx);
+}
+
+void mir_dispatch_xent(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                       std::uint64_t logits, std::uint64_t target, std::uint64_t mask, std::uint64_t off,
+                       std::uint64_t probs, std::uint64_t dlog, std::uint64_t loss,
+                       std::uint32_t rows, std::uint32_t n, std::uint32_t heads, float pos_weight) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, logits);
+    put_param(buf, *mk.spv, 1, target);
+    put_param(buf, *mk.spv, 2, mask);
+    put_param(buf, *mk.spv, 3, off);
+    put_param(buf, *mk.spv, 4, probs);
+    put_param(buf, *mk.spv, 5, dlog);
+    put_param(buf, *mk.spv, 6, loss);
+    put_param(buf, *mk.spv, 7, static_cast<std::int32_t>(rows));
+    put_param(buf, *mk.spv, 8, static_cast<std::int32_t>(n));
+    put_param(buf, *mk.spv, 9, static_cast<std::int32_t>(heads));
+    put_param(buf, *mk.spv, 10, pos_weight);
+    jit_dispatch(d, mk.pipe, buf.data(), gx);
+}
+
+void mir_dispatch_topk(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                       std::uint64_t x, std::uint64_t vals, std::uint64_t idx, std::uint64_t off,
+                       std::uint32_t rows, std::uint32_t cols, std::uint32_t k, std::uint32_t nseg) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, x);
+    put_param(buf, *mk.spv, 1, vals);
+    put_param(buf, *mk.spv, 2, idx);
+    put_param(buf, *mk.spv, 3, off);
+    put_param(buf, *mk.spv, 4, static_cast<std::int32_t>(rows));
+    put_param(buf, *mk.spv, 5, static_cast<std::int32_t>(cols));
+    put_param(buf, *mk.spv, 6, static_cast<std::int32_t>(k));
+    put_param(buf, *mk.spv, 7, static_cast<std::int32_t>(nseg));
+    jit_dispatch(d, mk.pipe, buf.data(), gx, gy);
 }
 
 }  // namespace brotensor::detail::vulkan
