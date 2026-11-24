@@ -71,130 +71,6 @@ template <> __device__ inline void store_f32<float>(float* p, float v)   { *p = 
 template <> __device__ inline void store_f32<__half>(__half* p, float v) { *p = __float2half(v); }
 template <> __device__ inline void store_f32<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 
-// One thread per output element. Naive direct-conv reduction over
-// (C_in, kH, kW). FP32 accumulator; storage dtype T (FP16 or FP32).
-template <typename T>
-__global__ void conv2d_forward_kernel(
-        const T* __restrict__ X,
-        const T* __restrict__ Wt,
-        const T* __restrict__ bias,   // may be null
-        T* __restrict__ Y,
-        int N, int C_in, int H, int W,
-        int C_out, int kH, int kW,
-        int H_out, int W_out,
-        int stride_h, int stride_w,
-        int pad_h, int pad_w,
-        int dil_h, int dil_w,
-        int groups, int Cg_in, int Cg_out,
-        int total) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-
-    // Unflatten idx → (n, oc, oh, ow).
-    const int ow = idx % W_out;
-    int t = idx / W_out;
-    const int oh = t % H_out;
-    t /= H_out;
-    const int oc = t % C_out;
-    const int n  = t / C_out;
-
-    const int in_h_origin = oh * stride_h - pad_h;
-    const int in_w_origin = ow * stride_w - pad_w;
-
-    float acc = 0.0f;
-    // Group this output channel belongs to.
-    const int g_out = oc / Cg_out;
-    const int ic_abs_base = g_out * Cg_in;
-    // Weight base for this output channel: (oc, 0, 0, 0) in OIHW, with the
-    // I-dim sized as Cg_in for grouped conv.
-    const int w_oc_base = oc * Cg_in * kH * kW;
-    // Input base for this sample.
-    const int x_n_base = n * C_in * H * W;
-
-    for (int ic_local = 0; ic_local < Cg_in; ++ic_local) {
-        const int ic = ic_abs_base + ic_local;
-        const int w_ic_base = w_oc_base + ic_local * kH * kW;
-        const int x_ic_base = x_n_base + ic * H * W;
-        for (int kh = 0; kh < kH; ++kh) {
-            const int in_h = in_h_origin + kh * dil_h;
-            if (in_h < 0 || in_h >= H) continue;
-            for (int kw = 0; kw < kW; ++kw) {
-                const int in_w = in_w_origin + kw * dil_w;
-                if (in_w < 0 || in_w >= W) continue;
-                const float x_v = load_f32<T>(&X[x_ic_base + in_h * W + in_w]);
-                const float w_v = load_f32<T>(&Wt[w_ic_base + kh * kW + kw]);
-                acc += x_v * w_v;
-            }
-        }
-    }
-    if (bias) {
-        acc += load_f32<T>(&bias[oc]);
-    }
-    store_f32<T>(&Y[idx], acc);
-}
-
-// One thread per input pixel. Gather form of backward-w.r.t.-input.
-// Templated on storage dtype T (FP16 or FP32); FP32 accumulator. No atomics.
-template <typename T>
-__global__ void conv2d_backward_input_kernel(
-        const T* __restrict__ Wt,
-        const T* __restrict__ dY,
-        T* __restrict__ dX,
-        int N, int C_in, int H, int W,
-        int C_out, int kH, int kW,
-        int H_out, int W_out,
-        int stride_h, int stride_w,
-        int pad_h, int pad_w,
-        int dil_h, int dil_w,
-        int groups, int Cg_in, int Cg_out,
-        int total) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-
-    // Unflatten idx → (n, c_in, i, j).
-    const int j = idx % W;
-    int t = idx / W;
-    const int i = t % H;
-    t /= H;
-    const int c_in = t % C_in;
-    const int n    = t / C_in;
-
-    // Which group does c_in belong to, and its local index within that group?
-    const int g = c_in / Cg_in;
-    const int c_in_local = c_in - g * Cg_in;
-    const int oc_lo = g * Cg_out;
-    const int oc_hi = oc_lo + Cg_out;
-
-    float acc = 0.0f;
-
-    // For each kernel tap (kh, kw), invert the forward index relation:
-    //   in_h = stride_h * i_out - pad_h + dil_h * kh = i
-    //   ⇒ i_out = (i + pad_h - dil_h * kh) / stride_h, must be exact + in [0, H_out)
-    for (int kh = 0; kh < kH; ++kh) {
-        const int num_h = i + pad_h - dil_h * kh;
-        if (num_h < 0) continue;
-        if (num_h % stride_h != 0) continue;
-        const int i_out = num_h / stride_h;
-        if (i_out < 0 || i_out >= H_out) continue;
-        for (int kw = 0; kw < kW; ++kw) {
-            const int num_w = j + pad_w - dil_w * kw;
-            if (num_w < 0) continue;
-            if (num_w % stride_w != 0) continue;
-            const int j_out = num_w / stride_w;
-            if (j_out < 0 || j_out >= W_out) continue;
-
-            // Sum over c_out in this group of
-            //   dY[n, c_out, i_out, j_out] * Wt[c_out, c_in_local, kh, kw].
-            for (int c_out = oc_lo; c_out < oc_hi; ++c_out) {
-                const int dy_idx = ((n * C_out + c_out) * H_out + i_out) * W_out + j_out;
-                const int w_idx  = ((c_out * Cg_in + c_in_local) * kH + kh) * kW + kw;
-                acc += load_f32<T>(&dY[dy_idx]) * load_f32<T>(&Wt[w_idx]);
-            }
-        }
-    }
-    store_f32<T>(&dX[idx], acc);
-}
-
 // One BLOCK per (c_out, c_in, kh, kw) element of dWt. Threads stride over
 // the M = N*H_out*W_out reduction domain and a shared-memory tree reduce
 // folds the partials; thread 0 writes the FP32 scratch slot. No atomics.
@@ -383,6 +259,16 @@ bool conv2d_igemm_f32(const float* X, const float* Wt, const float* bias, float*
                       int Cin, int H, int W, int Cout, int kH, int kW, int sh, int sw, int ph,
                       int pw, int dh, int dw, int Ho, int Wo, cudaStream_t stream);
 
+// ops_conv_direct.cpp: MirKind::ConvDirect fallback.
+void dispatch_conv_direct(std::uint32_t mode, Dtype dt,
+                          const void* x, const void* w, void* y, const void* bias,
+                          int N, int Cin, int T, int H, int Wd,
+                          int Cout, int To, int Ho, int Wo,
+                          int kT, int kH, int kW,
+                          int st, int sh, int sw,
+                          int pt, int ph, int pw,
+                          int dt_, int dh, int dw, int groups);
+
 void conv2d_forward(const ::brotensor::Tensor& X,
                     const ::brotensor::Tensor& Wt,
                     const ::brotensor::Tensor* bias,
@@ -421,7 +307,6 @@ void conv2d_forward(const ::brotensor::Tensor& X,
     const int total = N * out_cols;
     if (total == 0) return;
 
-    const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
 
     // ── 1x1 stride-1 pad-0: dispatch to the row-major GEMM ──
@@ -504,12 +389,6 @@ void conv2d_forward(const ::brotensor::Tensor& X,
             BROTENSOR_CUDA_CHECK(cudaGetLastError());
             return;
         }
-
-        conv2d_forward_kernel<__half><<<blocks, CONV_BLOCK, 0, stream>>>(
-            x_p, w_p, b_p, y_p,
-            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-            groups, Cg_in, Cg_out, total);
     } else if (X.dtype == Dtype::BF16) {
         const __nv_bfloat16* x_p = static_cast<const __nv_bfloat16*>(X.data);
         const __nv_bfloat16* w_p = static_cast<const __nv_bfloat16*>(Wt.data);
@@ -527,12 +406,6 @@ void conv2d_forward(const ::brotensor::Tensor& X,
             BROTENSOR_CUDA_CHECK(cudaGetLastError());
             return;
         }
-
-        conv2d_forward_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK, 0, stream>>>(
-            x_p, w_p, b_p, y_p,
-            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-            groups, Cg_in, Cg_out, total);
     } else {
         const float* x_p = static_cast<const float*>(X.data);
         const float* w_p = static_cast<const float*>(Wt.data);
@@ -544,13 +417,11 @@ void conv2d_forward(const ::brotensor::Tensor& X,
                              H_out, W_out, stream)) {
             return;
         }
-        conv2d_forward_kernel<float><<<blocks, CONV_BLOCK, 0, stream>>>(
-            x_p, w_p, b_p, y_p,
-            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-            groups, Cg_in, Cg_out, total);
     }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    dispatch_conv_direct(
+        0u, X.dtype, X.data, Wt.data, Y.data, bias ? bias->data : nullptr,
+        N, C_in, 1, H, W, C_out, 1, H_out, W_out, 1, kH, kW,
+        1, stride_h, stride_w, 0, pad_h, pad_w, 1, dil_h, dil_w, groups);
 }
 
 void conv2d_backward_input(const ::brotensor::Tensor& Wt,
@@ -573,8 +444,6 @@ void conv2d_backward_input(const ::brotensor::Tensor& Wt,
         throw std::runtime_error(
             "conv2d_backward_input: groups must be >=1 and divide both C_in and C_out");
     }
-    const int Cg_in  = C_in  / groups;
-    const int Cg_out = C_out / groups;
     const int H_out = (H + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
     const int W_out = (W + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
     if (H_out <= 0 || W_out <= 0) {
@@ -584,37 +453,12 @@ void conv2d_backward_input(const ::brotensor::Tensor& Wt,
     if (dX.rows != N || dX.cols != in_cols || dX.dtype != Wt.dtype) {
         dX.resize(N, in_cols, Wt.dtype);
     }
-    const int total = N * in_cols;
-    if (total == 0) return;
+    if (N == 0 || in_cols == 0) return;
 
-    const int blocks = (total + CONV_BLOCK - 1) / CONV_BLOCK;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
-    if (Wt.dtype == Dtype::FP16) {
-        conv2d_backward_input_kernel<__half><<<blocks, CONV_BLOCK, 0, stream>>>(
-            static_cast<const __half*>(Wt.data),
-            static_cast<const __half*>(dY.data),
-            static_cast<__half*>(dX.data),
-            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-            groups, Cg_in, Cg_out, total);
-    } else if (Wt.dtype == Dtype::BF16) {
-        conv2d_backward_input_kernel<__nv_bfloat16><<<blocks, CONV_BLOCK, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(Wt.data),
-            static_cast<const __nv_bfloat16*>(dY.data),
-            static_cast<__nv_bfloat16*>(dX.data),
-            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-            groups, Cg_in, Cg_out, total);
-    } else {
-        conv2d_backward_input_kernel<float><<<blocks, CONV_BLOCK, 0, stream>>>(
-            static_cast<const float*>(Wt.data),
-            static_cast<const float*>(dY.data),
-            static_cast<float*>(dX.data),
-            N, C_in, H, W, C_out, kH, kW, H_out, W_out,
-            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
-            groups, Cg_in, Cg_out, total);
-    }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    dispatch_conv_direct(
+        1u, Wt.dtype, dY.data, Wt.data, dX.data, nullptr,
+        N, C_out, 1, H_out, W_out, C_in, 1, H, W, 1, kH, kW,
+        1, stride_h, stride_w, 0, pad_h, pad_w, 1, dil_h, dil_w, groups);
 }
 
 void conv2d_backward_weight(const ::brotensor::Tensor& X,

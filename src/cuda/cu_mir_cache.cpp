@@ -2,7 +2,9 @@
 
 #include "cuda_driver.h"
 #include "cuda_jit_engine.h"
+#include "../kernels/mir_attn_small.h"
 #include "../kernels/mir_audio.h"
+#include "../kernels/mir_conv_direct.h"
 #include "../kernels/mir_copy.h"
 #include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
@@ -155,6 +157,22 @@ CUfunction compile_mir(const MirKey& k) {
         case MirKind::Spectral:
             fn = kernels::build_spectral_mir(
                 mod, k.op, k.flags & 0x03u, (k.flags & 0x04u) != 0, (k.flags & 0x08u) != 0);
+            break;
+        case MirKind::AttnAux:
+            fn = kernels::build_attn_aux_mir(mod, k.op, k.dt0, k.flags != 0);
+            break;
+        case MirKind::AttnBwd:
+            fn = kernels::build_attn_bwd_mir(mod, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
+        case MirKind::FaCombine:
+            fn = kernels::build_fa_combine_mir(mod, k.dt0);
+            break;
+        case MirKind::AttnSoftmax:
+            fn = kernels::build_attn_softmax_mir(
+                mod, k.dt0, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0);
+            break;
+        case MirKind::ConvDirect:
+            fn = kernels::build_conv_direct_mir(mod, k.op, k.dt0, k.flags != 0);
             break;
     }
     const std::string ptx = brass::target::PtxTarget::emit_function(*fn, jit::make_ptx_opts());

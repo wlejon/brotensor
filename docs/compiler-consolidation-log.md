@@ -668,3 +668,18 @@ Replaced 3 GLSL shaders / 15 compiled variants (`gemv.comp` `137`L × 5, `gemm_s
   - Shared backend-neutral `src/kernels/*`: `7,837` lines across 51 files (`+601` lines in Wave 10, max file `591` lines).
 
 
+---
+
+## Wave 8 (CUDA / RTX 4090): Direct Convolution & Attention Helpers -> Single-Source Brass MIR
+
+Extended `src/cuda/cu_mir_cache.{h,cpp}` (`186` / `667` LOC) with `MirKind::{AttnAux, AttnBwd, FaCombine, AttnSoftmax, ConvDirect}` lowered via `PtxTarget::emit_function` (`sm_89`):
+- **Direct Convolution (`MirKind::ConvDirect`):** Added `src/cuda/ops_conv_direct.cpp` (`42` LOC, `dispatch_conv_direct`) and replaced scalar `conv2d_forward_kernel`, `conv2d_backward_input_kernel`, `conv3d_forward_kernel`, and `convt2d_forward_kernel` across `conv2d.cu` (`612` LOC, `+19/-175`), `conv3d.cu` (`207` LOC, `+14/-121`), and `conv_transpose2d.cu` (`391` LOC, `+20/-108`), keeping WMMA / iGEMM / 1x1 GEMM / backward-weight/bias / INT8-weight fast paths.
+- **Attention Projections, Backward & Decomposed Rel-Pos (`MirKind::{AttnAux, AttnBwd, AttnSoftmax, FaCombine}`):** Added `src/cuda/ops_attention_proj.cpp` (`479` LOC), `src/cuda/ops_attention_bwd.cpp` (`281` LOC), and `src/cuda/ops_attention_relpos.cpp` (`262` LOC), retiring all 7 replaced `.cu`/`.cuh` files (retaining `flash_attention_fused.cu` untouched due to its 2-buffer `log2`-scaled `combine_kernel`).
+
+### Wave 8 CUDA Verification & LOC Delta (RTX 4090 GPU 0, `CUDA_VISIBLE_DEVICES=0`, `brass@d5608f4`)
+- **Targeted Wave 7 & Wave 8 Suites:** `42/42` passed (`439.60 s`, `0` failures): `gpu_mir_emit`, `conv2d*`, `conv3d*`, `conv_transpose2d*`, `modulated_conv2d`, `deform_conv2d_parity`, `vit_block_ops`, `batched_backward_parity`, all attention / MHA / cross-attention / self-attention / decomposed rel-pos / flash-attention / `int8_attention` tests, and all Wave 7 audio/spectral suites.
+- **Full CUDA `ctest` (`-LE gcstress -j 1`):** **`204/204` passed** (`2287.72 s`, `0` failures).
+- **LOC Delta (CUDA Wave 8):**
+  - Deleted 7 files (`-3,849` lines): `mha.cu` (`-854`), `cross_attention.cu` (`-803`), `attention.cu` (`-550`), `self_attention_rel_pos.cu` (`-548`), `self_attention_bias.cu` (`-541`), `cross_attention_with_attn.cu` (`-301`), `self_attention_internal.cuh` (`-252`).
+  - Added / extended / trimmed files (all `<= 667` LOC): `ops_conv_direct.cpp` (`42`), `ops_attention_proj.cpp` (`479`), `ops_attention_bwd.cpp` (`281`), `ops_attention_relpos.cpp` (`262`), `conv2d.cu` (`612`), `conv3d.cu` (`207`), `conv_transpose2d.cu` (`391`), `cu_mir_cache.{h,cpp}` (`186` / `667`, `+5` / `+18`).
+  - Net `src/cuda/` Wave 8 delta: **`-3,113` lines** (`+1,140` / `-4,253`; **cumulative CUDA Waves 3–8: `-12,206` net lines and 52 `.cu` files + `detail/block_fft.cuh` + `self_attention_internal.cuh` deleted**, all modified/created `src/cuda/` files `<= 667` LOC).

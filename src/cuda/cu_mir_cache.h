@@ -48,6 +48,11 @@ enum class MirKind : std::uint8_t {
     Vision = 32,
     Audio = 33,
     Spectral = 34,
+    AttnAux = 35,
+    AttnBwd = 36,
+    FaCombine = 37,
+    AttnSoftmax = 38,
+    ConvDirect = 39,
 };
 
 struct MirKey {

@@ -346,7 +346,11 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/gemm.cu
         src/cuda/fp16_matmul.cu
         src/cuda/cu_mir_cache.cpp
+        src/cuda/ops_attention_bwd.cpp
+        src/cuda/ops_attention_proj.cpp
+        src/cuda/ops_attention_relpos.cpp
         src/cuda/ops_audio.cpp
+        src/cuda/ops_conv_direct.cpp
         src/cuda/ops_copy.cpp
         src/cuda/ops_delta.cpp
         src/cuda/ops_diffusion.cpp
@@ -365,9 +369,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/ops_topk.cpp
         src/cuda/ops_vision.cpp
         src/cuda/ops_xent.cpp
-        src/cuda/attention.cu
         src/cuda/concat.cu
-        src/cuda/mha.cu
         src/cuda/batched_ops.cu
         src/cuda/conv2d.cu
         src/cuda/conv2d_wmma.cu
@@ -383,8 +385,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/q6k_wmma.cu
         src/cuda/flash_attention_varlen_f32.cu
         src/cuda/conv2d_igemm_f32.cu
-        src/cuda/cross_attention.cu
-        src/cuda/cross_attention_with_attn.cu
         src/cuda/flash_attention.cu
         src/cuda/flash_attention_qkvo.cu
         src/cuda/flash_attention_varlen_windowed.cu
@@ -402,8 +402,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/kv_cache.cu
         src/cuda/decode_gqa.cu
         src/cuda/int8_quant.cu
-        src/cuda/self_attention_bias.cu
-        src/cuda/self_attention_rel_pos.cu
         src/cuda/filtered_lrelu.cu
         src/cuda/register.cu
         src/cuda/cuda_driver.cpp
