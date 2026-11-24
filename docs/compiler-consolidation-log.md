@@ -195,3 +195,36 @@ All `37/37` ops verified `ok` sequentially on an idle M2 Pro (19-core GPU, 16 Gi
   - Slimmed files: `src/metal/elementwise.mm` (`880 -> 453`, keeping only `build_slot_mask`, `build_causal_mask_row`, `threshold_u8` outside Wave 1), `src/metal/batched_ops.mm` (`-193`), `src/metal/vocoder_activations.mm` (`-163`), `src/metal/stylegan_elementwise.mm` (`-151`), `src/metal/kernels.mm` (`-86`).
   - Added Metal MIR runtime cache: `src/metal/mtl_mir_cache.{h,mm}` (`+72` / `+209` = **`+281` lines**).
   - **Total Metal diff:** `2,628` lines deleted, `612` lines added (**`-2,016` net Metal LOC**; all modified/created files `< 500` LOC).
+
+---
+
+## Wave 2: Vulkan Normalization, Softmax, Row/Col Reductions, RoPE & Rowvec -> Single-Source Brass MIR
+
+Replaced 5 GLSL shaders / 21 variants (`norm.comp`, `reduce_rows.comp`, `sum_cols.comp`, `rope.comp`, `rowvec.comp`; `116 -> 95` compiled Vulkan shaders) with single-source vectorized `brass::Function` MIR builders in `src/kernels/{mir_common.h, mir_math.{h,cpp}, mir_elementwise.{h,cpp}, mir_reduce.{h,cpp}, mir_rope.{h,cpp}, mir_norm.{h,cpp}}`, dispatched through `src/vulkan/vk_mir_cache.{h,cpp}`. Null-pointer runtime branches and scalar row loops in `norm.comp` were replaced by compile-time flag specialization (`NormMirFlags`), 128-bit `lanes=4/8` vectorization, and `BVSolver`-provable 8×32 block reductions.
+
+### `brotensor_bench_elementwise` Normalization Gains (Radeon 8060S, Wave 0 vs Wave 2)
+
+| Op | Shape | Dtype | Wave 0 (ms / GB/s) | Wave 2 (ms / GB/s) | Speedup |
+|---|---|---|---|---|---|
+| `rms_norm_forward` | `9217×4096` | `fp32` | `1.543 ms / 195.7` | `1.488 ms / 202.9` | `+3.7%` |
+| `rms_norm_forward` | `18433×4096` | `fp16` | `1.669 ms / 181.0` | `1.402 ms / 215.4` | **`+19.0%`** |
+| `layernorm_inf_fp16` | `18433×4096` | `fp16` | `1.984 ms / 152.2` | `1.444 ms / 209.1` | **`+37.4%`** |
+| `softmax_rows` | `9217×4096` | `fp32` | `1.541 ms / 196.0` | `1.476 ms / 204.6` | `+4.4%` |
+
+*(All 33 Wave 1 elementwise/gated rows in `brotensor_bench_elementwise` also verified `ok` at `217.6–226.5 GB/s`.)*
+
+### Wave 2 Correctness, Proof Audit & LOC Delta
+- **Correctness & Formal Audits:**
+  - `brotensor_test_vulkan` `--only=ops`, `--only=train` (`brotensor_test_vulkan --only=gemm` passed prior to the 5-line masked-softmax predicate fix in `mir_norm.cpp`): passed (`0` failures)
+  - `brotensor_test_backward_index_proofs`: ALL PASSED (including `rope_lifted_spirv_bounds_and_safety` on 3 MIR binaries and `norm_mir_lifted_spirv_bounds_and_barrier_safety` on 9 MIR backward binaries)
+  - `brotensor_test_backward_shader_audit`: **141/141 shaders passed** (`123408` SPIR-V/PTX insts, `4603` shared accesses proven, `2262` global accesses proven, `616` uniform barriers, `541` uniform collectives, `0` failures)
+  - Reduction & Parity Suites: `public_reductions` (`0` failures), `softmax` (`10/10`), `layernorm` (`8/8`), `layernorm_inference` (`11/11`), `layernorm_batched_caches` (`8/8`), `rmsnorm` (`21/21`), `softmax_rows` (`17/17`), `l2_norm` (`11/11`), `l2_normalize` (`5/5`), `rope` (`20/20`), `rope_mrope` (`4/4`), `reduce` (`6/6`), `reduce_extra` (`23/23`), `modulate` (`11/11`)
+- **Real-Model Gate (Waves 1–2):**
+  - `brovisionml` Depth-Anything-V2-Small (`1024×768`, w2/r5): **23.85 ms** best / mean `24.70 ms` (Wave 0: `23.42 / 24.25 ms`)
+  - `brosoundml` Kokoro TTS (`155` phonemes -> `9.47 s` audio): **220.4 ms** mean / `42.98× RT` / best `217.4 ms` (Wave 0: `213.7 ms / 44.33× RT / 207.3 ms`)
+  - `brolm` Qwen3-0.6B-Q8_0 (prefill `256` / decode `128`, r3): **12403.5 tok/s** prefill / **192.5 tok/s** (`5.19 ms/tok`) decode, deterministic `ids 0bc3383515f9e203` (Wave 0: `12526.5 tok/s` / `193.6 tok/s`)
+- **LOC Delta (Vulkan Wave 2):**
+  - Deleted 5 GLSL shaders / 21 variants (`norm.comp`, `reduce_rows.comp`, `sum_cols.comp`, `rope.comp`, `rowvec.comp`): `src/vulkan/shaders` `7,830 -> 7,405` (**`-425` lines**; cumulative **`-830` lines** / 11 shaders / 45 variants deleted across Waves 1–2)
+  - Shared backend-neutral `src/kernels/*` now `1,445` lines total across Waves 1–2 (`+930` lines in Wave 2); `src/vulkan/vk_mir_cache.{h,cpp}` `356` lines (`+137` lines)
+  - Pending Wave 2 cross-backend deletions once Metal & CUDA wire into `src/kernels/{mir_norm,mir_reduce,mir_rope,mir_elementwise}`: `~3,087` Metal lines and `~3,874` CUDA lines (`layernorm*`, `rmsnorm*`, `softmax*`, `rope*`, `public_reductions*`, `reduce*`, `l2_norm*`, `l2_normalize*`)
+>>>>>>> 909a869 (feat(kernels,vulkan): replace norm/softmax/reduce/rope/rowvec GLSL shaders with single-source brass MIR (Wave 2))

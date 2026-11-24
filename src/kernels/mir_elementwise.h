@@ -38,4 +38,8 @@ brass::Function* build_cast_mir(brass::Module& mod, Dtype src_dt, Dtype dst_dt, 
 // `op_code` matches GLU_* from vulkan/shaders/op_codes.h.
 brass::Function* build_glu_mir(brass::Module& mod, std::uint32_t op_code, Dtype dt_in, Dtype dt_out, int lanes);
 
+// Builds `rowvec`: params (ptr x, ptr v, ptr w, ptr y, i32 n, i32 d).
+// `op_code` matches ROWVEC_MODULATE / ROWVEC_MUL from vulkan/shaders/op_codes.h.
+brass::Function* build_rowvec_mir(brass::Module& mod, std::uint32_t op_code, Dtype dt, int lanes);
+
 }  // namespace brotensor::kernels

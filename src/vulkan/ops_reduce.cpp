@@ -1,23 +1,20 @@
 // Vulkan public reductions: sum_rows, sum_cols, argmax_rows. GPU contract
 // (src/cuda/public_reductions.cu): sums are written in X's dtype with FP32
 // accumulation; argmax writes INT32 when Idx is INT32-typed, FP32 otherwise,
-// ties keep the lowest index. Kernels: shaders/reduce_rows.comp, sum_cols.comp.
+// ties keep the lowest index. Kernels: src/kernels/mir_reduce.{h,cpp}.
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
 #include <algorithm>
-#include <stdexcept>
+#include <cstdint>
 
 namespace brotensor::detail::vulkan {
 
 using ::brotensor::Dtype;
 using ::brotensor::Tensor;
-
-namespace {
-struct ReducePush { std::uint64_t x, y; std::uint32_t m, n; };
-}  // namespace
 
 void sum_rows(const Tensor& X, Tensor& Y) {
     dt_code(X.dtype, "sum_rows");
@@ -26,9 +23,11 @@ void sum_rows(const Tensor& X, Tensor& Y) {
     if (M == 0) return;
     if (N == 0) { Y.zero(); return; }
     DeviceCtx& d = device_of(X);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::sum_rows_f32, X.dtype));
-    const ReducePush pc{addr(X.data), addr(Y.data), static_cast<std::uint32_t>(M), static_cast<std::uint32_t>(N)};
-    launch(d, k, pc, std::min<std::uint32_t>(pc.m, 65535));
+    const std::uint64_t ax = addr(X.data), ay = addr(Y.data);
+    const std::uint32_t m = static_cast<std::uint32_t>(M), n = static_cast<std::uint32_t>(N);
+    const int lanes = mir_vec_lanes(X.dtype, n, ax);
+    const MirKernel mk = mir_kernel(d, {MirKind::SumRows, 0, X.dtype, X.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_reduce(d, mk, std::min<std::uint32_t>(m, 65535u), ax, ay, m, n);
 }
 
 void sum_cols(const Tensor& X, Tensor& Y) {
@@ -38,9 +37,11 @@ void sum_cols(const Tensor& X, Tensor& Y) {
     if (N == 0) return;
     if (M == 0) { Y.zero(); return; }
     DeviceCtx& d = device_of(X);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::sum_cols_f32, X.dtype));
-    const ReducePush pc{addr(X.data), addr(Y.data), static_cast<std::uint32_t>(M), static_cast<std::uint32_t>(N)};
-    launch(d, k, pc, groups_1d(pc.n, k));
+    const std::uint64_t ax = addr(X.data), ay = addr(Y.data);
+    const std::uint32_t m = static_cast<std::uint32_t>(M), n = static_cast<std::uint32_t>(N);
+    const int lanes = mir_vec_lanes(X.dtype, n, ax, ay);
+    const MirKernel mk = mir_kernel(d, {MirKind::SumCols, 0, X.dtype, X.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_reduce(d, mk, mir_groups_1d(n, lanes), ax, ay, m, n);
 }
 
 void argmax_rows(const Tensor& X, Tensor& Idx) {
@@ -51,10 +52,13 @@ void argmax_rows(const Tensor& X, Tensor& Idx) {
     if (M == 0) return;
     if (N == 0) { Idx.zero(); return; }
     DeviceCtx& d = device_of(X);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::argmax_rows_f32, X.dtype),
-                                        {out_dt == Dtype::INT32 ? 1u : 0u});
-    const ReducePush pc{addr(X.data), addr(Idx.data), static_cast<std::uint32_t>(M), static_cast<std::uint32_t>(N)};
-    launch(d, k, pc, std::min<std::uint32_t>(pc.m, 65535));
+    const std::uint64_t ax = addr(X.data), ay = addr(Idx.data);
+    const std::uint32_t m = static_cast<std::uint32_t>(M), n = static_cast<std::uint32_t>(N);
+    const int lanes = mir_vec_lanes(X.dtype, n, ax);
+    const std::uint8_t flags = (out_dt == Dtype::INT32) ? 1u : 0u;
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::ArgmaxRows, 0, X.dtype, out_dt, static_cast<std::uint8_t>(lanes), Dtype::FP32, flags});
+    mir_dispatch_reduce(d, mk, std::min<std::uint32_t>(m, 65535u), ax, ay, m, n);
 }
 
 void fill_vulkan_vtable_reduce(::brotensor::detail::OpsVTable& v) {

@@ -302,6 +302,9 @@ elseif(TARGET brass)
         src/jit/msl_emit.cpp
         src/kernels/mir_math.cpp
         src/kernels/mir_elementwise.cpp
+        src/kernels/mir_reduce.cpp
+        src/kernels/mir_norm.cpp
+        src/kernels/mir_rope.cpp
     )
     if(BRASS_WITH_SPIRV)
         target_sources(brotensor_cpu PRIVATE

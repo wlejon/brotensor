@@ -1,57 +1,19 @@
 #include "mir_elementwise.h"
+#include "mir_common.h"
 #include "mir_math.h"
 
 #include "../vulkan/shaders/op_codes.h"
 
-#include <brass/mir/gpu_opt.hpp>
-
-#include <functional>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 namespace brotensor::kernels {
 
 namespace {
 
-using namespace brotensor::jit::gpu_mir;
-using brass::Function;
-using brass::Module;
-using brass::Type;
-using brass::Value;
-
-int elem_bytes(Dtype dt) {
-    switch (dt) {
-        case Dtype::FP32: return 4;
-        case Dtype::FP16:
-        case Dtype::BF16: return 2;
-        default: throw std::runtime_error("brotensor: unsupported MIR elementwise dtype");
-    }
-}
-
-void emit_vec_grid_stride(Ctx& c, Value* n_elems, int lanes,
-                          const std::function<void(Value* vec_idx)>& body) {
-    Value* gid = c.kb.global_tid_x();
-    Value* stride = c.kb.mul(c.kb.nctaid_x(), c.i32(static_cast<int>(kEwBlock)));
-    Value* n_vecs = (lanes == 1) ? n_elems : c.b.build_lshr(n_elems, c.i32(log2_exact(lanes)));
-    c.kb.for_range(gid, n_vecs, stride, body);
-}
-
-Value* ptr_at(Ctx& c, Value* base, Value* elem_idx, int esz) {
-    return c.b.build_add(base, byte_offset(c, elem_idx, esz));
-}
-
-Value* vec_ptr_at(Ctx& c, Value* base, Value* vec_idx, int lanes, int esz) {
-    Value* idx64 = c.b.build_zext_i64(vec_idx);
-    const int bytes = lanes * esz;
-    Value* off = (bytes == 1) ? idx64 : c.b.build_shl(idx64, c.kb.const_i64(log2_exact(bytes)));
-    return c.b.build_add(base, off);
-}
-
-Function* finalize_fn(Function* fn) {
-    fn->rebuild_cfg_predecessors();
-    optimize_function(*fn);
-    return fn;
+void emit_vec_grid_stride_ew(Ctx& c, Value* n_elems, int lanes,
+                             const std::function<void(Value* vec_idx)>& body) {
+    emit_vec_grid_stride(c, n_elems, lanes, kEwBlock, body);
 }
 
 Value* unary_lane(Ctx& c, std::uint32_t op, Value* v, Value* a, Value* b_val) {
@@ -163,7 +125,7 @@ Function* build_unary_mir(Module& mod, std::uint32_t op_code, Dtype dt, int lane
     Ctx c(kb);
     auto p = entry_params(c, fn);
     const int esz = elem_bytes(dt);
-    emit_vec_grid_stride(c, p[2], lanes, [&](Value* k) {
+    emit_vec_grid_stride_ew(c, p[2], lanes, [&](Value* k) {
         Value* x_ptr = vec_ptr_at(c, p[0], k, lanes, esz);
         Value* y_ptr = vec_ptr_at(c, p[1], k, lanes, esz);
         auto xs = load_lanes(c, dt, lanes, x_ptr);
@@ -186,7 +148,7 @@ Function* build_binary_mir(Module& mod, std::uint32_t op_code, Dtype dt_y, Dtype
     auto p = entry_params(c, fn);
     const int esz_y = elem_bytes(dt_y);
     const int esz_x = elem_bytes(dt_x);
-    emit_vec_grid_stride(c, p[2], lanes, [&](Value* k) {
+    emit_vec_grid_stride_ew(c, p[2], lanes, [&](Value* k) {
         Value* y_ptr = vec_ptr_at(c, p[0], k, lanes, esz_y);
         Value* x_ptr = vec_ptr_at(c, p[1], k, lanes, esz_x);
         auto yv = load_lanes(c, dt_y, lanes, y_ptr);
@@ -210,7 +172,7 @@ Function* build_act_bwd_mir(Module& mod, std::uint32_t op_code, Dtype dt, int la
     Ctx c(kb);
     auto p = entry_params(c, fn);
     const int esz = elem_bytes(dt);
-    emit_vec_grid_stride(c, p[3], lanes, [&](Value* k) {
+    emit_vec_grid_stride_ew(c, p[3], lanes, [&](Value* k) {
         Value* dy_ptr = vec_ptr_at(c, p[1], k, lanes, esz);
         Value* dx_ptr = vec_ptr_at(c, p[2], k, lanes, esz);
         auto g = load_lanes(c, dt, lanes, dy_ptr);
@@ -238,7 +200,7 @@ Function* build_cast_mir(Module& mod, Dtype src_dt, Dtype dst_dt, int lanes) {
     auto p = entry_params(c, fn);
     const int esz_s = elem_bytes(src_dt);
     const int esz_d = elem_bytes(dst_dt);
-    emit_vec_grid_stride(c, p[2], lanes, [&](Value* k) {
+    emit_vec_grid_stride_ew(c, p[2], lanes, [&](Value* k) {
         auto vals = load_lanes(c, src_dt, lanes, vec_ptr_at(c, p[0], k, lanes, esz_s));
         store_lanes(c, dst_dt, lanes, vec_ptr_at(c, p[1], k, lanes, esz_d), vals);
     });
@@ -255,7 +217,7 @@ Function* build_bias_mir(Module& mod, std::uint32_t mode, Dtype dt, int lanes) {
     auto p = entry_params(c, fn);
     const int esz = elem_bytes(dt);
     const int l = (mode == BIAS_ROW) ? lanes : 1;
-    emit_vec_grid_stride(c, p[2], l, [&](Value* k) {
+    emit_vec_grid_stride_ew(c, p[2], l, [&](Value* k) {
         Value* elem_i = (l == 1) ? k : c.b.build_shl(k, c.i32(log2_exact(l)));
         Value* y_ptr = ptr_at(c, p[0], elem_i, esz);
         Value* j_idx = (mode == BIAS_ROW) ? c.b.build_umod(elem_i, p[3])
@@ -284,7 +246,7 @@ Function* build_glu_mir(Module& mod, std::uint32_t op_code, Dtype dt_in, Dtype d
     const int esz_out = elem_bytes(dt_out);
     const int l = (op_code == GLU_GEGLU_PAIRS) ? 1 : lanes;
 
-    emit_vec_grid_stride(c, p[3], l, [&](Value* k) {
+    emit_vec_grid_stride_ew(c, p[3], l, [&](Value* k) {
         Value* elem_i = (l == 1) ? k : c.b.build_shl(k, c.i32(log2_exact(l)));
         Value* d = p[4];
         Value* r = c.b.build_udiv(elem_i, d);
@@ -351,6 +313,39 @@ Function* build_glu_mir(Module& mod, std::uint32_t op_code, Dtype dt_in, Dtype d
             store_lanes(c, dt_out, l, ptr_at(c, p[2], ia, esz_out), da);
             store_lanes(c, dt_out, l, ptr_at(c, p[2], ib, esz_out), db);
         }
+    });
+    c.b.build_ret_void();
+    return finalize_fn(fn);
+}
+
+Function* build_rowvec_mir(Module& mod, std::uint32_t op_code, Dtype dt, int lanes) {
+    Function* fn = mod.create_function(
+        "mir_rowvec", Type::void_type(),
+        {Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::i32(), Type::i32()});
+    brass::codegen::KernelBuilder kb(mod, fn);
+    Ctx c(kb);
+    auto p = entry_params(c, fn);
+    const int esz = elem_bytes(dt);
+    emit_vec_grid_stride_ew(c, p[4], lanes, [&](Value* k) {
+        Value* elem_i = col_elem_idx(c, k, lanes);
+        Value* col = c.b.build_umod(elem_i, p[5]);
+        auto xv = load_lanes(c, dt, lanes, vec_ptr_at(c, p[0], k, lanes, esz));
+        auto vv = load_lanes(c, dt, lanes, ptr_at(c, p[1], col, esz));
+        std::vector<Value*> wv;
+        if (op_code == ROWVEC_MODULATE) {
+            wv = load_lanes(c, dt, lanes, ptr_at(c, p[2], col, esz));
+        }
+        std::vector<Value*> out(static_cast<std::size_t>(lanes));
+        for (int j = 0; j < lanes; ++j) {
+            const auto js = static_cast<std::size_t>(j);
+            if (op_code == ROWVEC_MODULATE) {
+                Value* scale = c.b.build_add(c.f32(1.0f), vv[js]);
+                out[js] = c.b.build_fma_f32(xv[js], scale, wv[js]);
+            } else {
+                out[js] = c.b.build_mul(xv[js], vv[js]);
+            }
+        }
+        store_lanes(c, dt, lanes, vec_ptr_at(c, p[3], k, lanes, esz), out);
     });
     c.b.build_ret_void();
     return finalize_fn(fn);

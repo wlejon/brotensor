@@ -7,6 +7,7 @@
 // src/cuda/rope.cu (output resized to X's shape and dtype).
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -58,8 +59,11 @@ void run(const Tensor& X, std::uint32_t mode, bool bwd, RopePush pc, int head_di
     if (total == 0) return;
     if (total > 0x7fffffffLL) fail("rope", "tensor too large");
     DeviceCtx& d = device_of(X);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::rope_f32, X.dtype), {mode, bwd ? 1u : 0u});
-    launch(d, k, pc, groups_1d(static_cast<std::uint64_t>(total), k));
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::Rope, mode, X.dtype, X.dtype, 1, Dtype::FP32, static_cast<std::uint8_t>(bwd ? 1u : 0u)});
+    mir_dispatch_rope(d, mk, mir_groups_1d(static_cast<std::uint32_t>(total), 1),
+                      pc.x, pc.y, pc.ct, pc.st, pc.ch, pc.sh, pc.cw, pc.sw, pc.pt, pc.ph, pc.pw,
+                      pc.rows, pc.heads, pc.hd, pc.dt, pc.dh, pc.dw, pc.offset, pc.ln_base);
 }
 
 void rope_theta(const char* op, const Tensor& X, int head_dim, int num_heads, int seq_offset, float theta_base,

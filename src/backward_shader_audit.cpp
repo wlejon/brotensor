@@ -21,6 +21,9 @@
 #include "jit/trace_dag.h"
 #include "jit/trace_plan.h"
 #include "kernels/mir_elementwise.h"
+#include "kernels/mir_norm.h"
+#include "kernels/mir_reduce.h"
+#include "kernels/mir_rope.h"
 #include "vulkan/shaders/op_codes.h"
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/builder.hpp>
@@ -38,9 +41,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <sstream>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace brotensor::verify {
@@ -135,13 +141,16 @@ std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::str
         };
     }
     if (name == "norm_f32" || name == "norm_f16" || name == "norm_bf16" ||
-        name == "norm_f16_g32" || name == "norm_bf16_g32" || name == "norm_f32_y16") {
+        name == "norm_f16_g32" || name == "norm_bf16_g32" || name == "norm_f32_y16" ||
+        name == "norm_bwd_f32" || name == "norm_bwd_f16" || name == "norm_bwd_bf16" ||
+        name == "norm_col_f32" || name == "norm_col_f16" || name == "norm_col_bf16") {
         const std::uint32_t eb_x =
-            (name == "norm_f32" || name == "norm_f32_y16") ? 4u : 2u;
+            (name == "norm_f32" || name == "norm_f32_y16" || name == "norm_bwd_f32" || name == "norm_col_f32") ? 4u : 2u;
         const std::uint32_t eb_y =
-            (name == "norm_f32") ? 4u : 2u;
+            (name == "norm_f32" || name == "norm_bwd_f32" || name == "norm_col_f32") ? 4u : 2u;
         const std::uint32_t eb_g =
-            (name == "norm_f16" || name == "norm_bf16") ? 2u : 4u;
+            (name == "norm_f16" || name == "norm_bf16" || name == "norm_bwd_f16" || name == "norm_bwd_bf16" ||
+             name == "norm_col_f16" || name == "norm_col_bf16") ? 2u : 4u;
         return {
             {0, 0, 7, eb_x, 16, 8, -1, 1}, // x: rows * d
             {1, 0, 7, eb_y, 16, 8, -1, 1}, // y: rows * d
@@ -192,7 +201,9 @@ std::vector<brass::verify::GpuParamConstraint> param_constraints_for_shader(cons
         return {{4, UINT32_MAX, 1, 0}}; // n >= 1
     }
     if (name == "norm_f32" || name == "norm_f16" || name == "norm_bf16" ||
-        name == "norm_f16_g32" || name == "norm_bf16_g32" || name == "norm_f32_y16") {
+        name == "norm_f16_g32" || name == "norm_bf16_g32" || name == "norm_f32_y16" ||
+        name == "norm_bwd_f32" || name == "norm_bwd_f16" || name == "norm_bwd_bf16" ||
+        name == "norm_col_f32" || name == "norm_col_f16" || name == "norm_col_bf16") {
         return {{7, UINT32_MAX, 1, 0}, {8, UINT32_MAX, 1, 0}};
     }
     if (name == "bnorm") {
@@ -435,31 +446,66 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
         report.shaders.push_back(std::move(ptx_sum));
     }
 
-    // 3b. Single-source brass-MIR act_bwd & glu forward/backward kernels
+    // 3b. Single-source brass-MIR Wave 1 & Wave 2 kernels
     {
-        struct MirAuditSpec { const char* name; bool is_glu; std::uint32_t op; Dtype dt; };
-        const MirAuditSpec mir_specs[] = {
-            {"act_bwd_f32",  false, GOP_RELU,       Dtype::FP32},
-            {"act_bwd_f16",  false, GOP_RELU,       Dtype::FP16},
-            {"act_bwd_bf16", false, GOP_RELU,       Dtype::BF16},
-            {"glu_f32",      true,  GLU_SWIGLU,     Dtype::FP32},
-            {"glu_f16",      true,  GLU_SWIGLU,     Dtype::FP16},
-            {"glu_bf16",     true,  GLU_SWIGLU,     Dtype::BF16},
-            {"glu_bwd_f32",  true,  GLU_SWIGLU_BWD, Dtype::FP32},
-            {"glu_bwd_f16",  true,  GLU_SWIGLU_BWD, Dtype::FP16},
-            {"glu_bwd_bf16", true,  GLU_SWIGLU_BWD, Dtype::BF16},
-        };
         brass::target::SpirvOptions spv_opts;
         spv_opts.stage = brass::target::SpirvStage::Compute;
         spv_opts.local_size_x = kernels::kEwBlock;
         spv_opts.local_size_spec_constants = true;
-        for (const auto& ms : mir_specs) {
-            brass::Module mir_mod(ms.name);
-            brass::Function* fn = ms.is_glu
-                ? kernels::build_glu_mir(mir_mod, ms.op, ms.dt, ms.dt, 1)
-                : kernels::build_act_bwd_mir(mir_mod, ms.op, ms.dt, 1);
+        auto audit_mir = [&](const char* name, const std::function<brass::Function*(brass::Module&)>& make) {
+            brass::Module mir_mod(name);
+            brass::Function* fn = make(mir_mod);
             brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, spv_opts);
-            report.shaders.push_back(audit_spirv_binary_words(ms.name, sk.words.data(), sk.words.size()));
+            report.shaders.push_back(audit_spirv_binary_words(name, sk.words.data(), sk.words.size()));
+        };
+        for (const auto& [name, dt] : std::vector<std::pair<const char*, Dtype>>{
+                 {"act_bwd_f32", Dtype::FP32}, {"act_bwd_f16", Dtype::FP16}, {"act_bwd_bf16", Dtype::BF16}}) {
+            audit_mir(name, [&](brass::Module& m) { return kernels::build_act_bwd_mir(m, GOP_RELU, dt, 1); });
+            (void)dt;
+        }
+        for (const auto& [name, op, dt] : std::vector<std::tuple<const char*, std::uint32_t, Dtype>>{
+                 {"glu_f32",      GLU_SWIGLU,     Dtype::FP32},
+                 {"glu_f16",      GLU_SWIGLU,     Dtype::FP16},
+                 {"glu_bf16",     GLU_SWIGLU,     Dtype::BF16},
+                 {"glu_bwd_f32",  GLU_SWIGLU_BWD, Dtype::FP32},
+                 {"glu_bwd_f16",  GLU_SWIGLU_BWD, Dtype::FP16},
+                 {"glu_bwd_bf16", GLU_SWIGLU_BWD, Dtype::BF16}}) {
+            audit_mir(name, [op, dt](brass::Module& m) { return kernels::build_glu_mir(m, op, dt, dt, 1); });
+        }
+        for (const auto& [prefix, kind] : std::vector<std::pair<const char*, int>>{
+                 {"rowvec", 0}, {"sum_rows", 1}, {"argmax_rows", 2}, {"sum_cols", 3}, {"rope", 4}}) {
+            for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
+                     {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
+                const std::string name = std::string(prefix) + sfx;
+                audit_mir(name.c_str(), [kind, dt](brass::Module& m) -> brass::Function* {
+                    switch (kind) {
+                        case 0: return kernels::build_rowvec_mir(m, ROWVEC_MODULATE, dt, 1);
+                        case 1: return kernels::build_sum_rows_mir(m, dt, 1);
+                        case 2: return kernels::build_argmax_rows_mir(m, dt, false, 1);
+                        case 3: return kernels::build_sum_cols_mir(m, dt, 1);
+                        default: return kernels::build_rope_mir(m, ROPE_THETA, true, dt);
+                    }
+                });
+            }
+        }
+        const kernels::NormMirFlags all_flags{true, true, true, true, true};
+        for (const auto& [name, mode, dtx, dty, dtg] :
+             std::vector<std::tuple<const char*, std::uint32_t, Dtype, Dtype, Dtype>>{
+                 {"norm_f32",      NORM_LN,      Dtype::FP32, Dtype::FP32, Dtype::FP32},
+                 {"norm_f16",      NORM_LN,      Dtype::FP16, Dtype::FP16, Dtype::FP16},
+                 {"norm_bf16",     NORM_LN,      Dtype::BF16, Dtype::BF16, Dtype::BF16},
+                 {"norm_f16_g32",  NORM_LN,      Dtype::FP16, Dtype::FP16, Dtype::FP32},
+                 {"norm_bf16_g32", NORM_LN,      Dtype::BF16, Dtype::BF16, Dtype::FP32},
+                 {"norm_f32_y16",  NORM_LN,      Dtype::FP32, Dtype::FP16, Dtype::FP32},
+                 {"norm_bwd_f32",  NORM_LN_BWD,  Dtype::FP32, Dtype::FP32, Dtype::FP32},
+                 {"norm_bwd_f16",  NORM_LN_BWD,  Dtype::FP16, Dtype::FP16, Dtype::FP16},
+                 {"norm_bwd_bf16", NORM_LN_BWD,  Dtype::BF16, Dtype::BF16, Dtype::BF16},
+                 {"norm_col_f32",  NORM_COL_LN,  Dtype::FP32, Dtype::FP32, Dtype::FP32},
+                 {"norm_col_f16",  NORM_COL_LN,  Dtype::FP16, Dtype::FP16, Dtype::FP16},
+                 {"norm_col_bf16", NORM_COL_LN,  Dtype::BF16, Dtype::BF16, Dtype::BF16}}) {
+            audit_mir(name, [=](brass::Module& m) {
+                return kernels::build_norm_mir(m, mode, dtx, dty, dtg, all_flags, 1);
+            });
         }
     }
 

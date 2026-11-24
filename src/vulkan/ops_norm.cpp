@@ -7,6 +7,8 @@
 // dtype or FP32, gradients of gamma / beta accumulated (+=).
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
+#include "../kernels/mir_norm.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -32,23 +34,34 @@ struct NormPush {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
 }
 
-// norm.comp variant for (X-side, gamma, forward output) dtypes.
-ShaderId norm_shader(Dtype dx, Dtype dg, Dtype dy, const char* op) {
+struct NormDtypes {
+    Dtype x, g, y;
+};
+
+NormDtypes norm_shader(Dtype dx, Dtype dg, Dtype dy, const char* op) {
     dt_code(dx, op);
-    if (dg == dx && dy == dx) return dt_variant(ShaderId::norm_f32, dx, op);
-    if (dg == Dtype::FP32 && dy == dx && dx == Dtype::FP16) return ShaderId::norm_f16_g32;
-    if (dg == Dtype::FP32 && dy == dx && dx == Dtype::BF16) return ShaderId::norm_bf16_g32;
-    if (dx == Dtype::FP32 && dg == Dtype::FP32 && dy == Dtype::FP16) return ShaderId::norm_f32_y16;
+    if ((dg == dx && dy == dx) ||
+        (dg == Dtype::FP32 && dy == dx && (dx == Dtype::FP16 || dx == Dtype::BF16)) ||
+        (dx == Dtype::FP32 && dg == Dtype::FP32 && dy == Dtype::FP16)) {
+        return {dx, dg, dy};
+    }
     fail(op, "unsupported dtype combination");
 }
 
-void run(const Tensor& on, ShaderId id, std::uint32_t mode, const NormPush& pc) {
+void run(const Tensor& on, NormDtypes dts, std::uint32_t mode, const NormPush& pc) {
     if (pc.rows == 0 || pc.d == 0) return;
     DeviceCtx& d = device_of(on);
-    const Kernel& k = d.pipelines().get(id, {mode});
     const bool cols = mode >= NORM_COL_LN;
+    const int lanes = cols ? 1
+                           : mir_vec_lanes_norm(dts.x, dts.y, dts.g, pc.d, pc.x, pc.y, pc.g, pc.b, pc.xh,
+                                                (mode == NORM_SOFTMAX) ? pc.s0 : 0u);
+    const kernels::NormMirFlags flags{pc.g != 0, pc.b != 0, pc.xh != 0, pc.s0 != 0, pc.s1 != 0};
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::Norm, mode, dts.x, dts.y, static_cast<std::uint8_t>(lanes), dts.g, flags.pack()});
     const std::uint32_t groups = cols ? (pc.d + 31) / 32 : pc.rows;
-    launch(d, k, pc, std::min<std::uint32_t>(groups, 65535));
+    mir_dispatch_norm(d, mk, std::min<std::uint32_t>(groups, 65535),
+                      pc.x, pc.y, pc.g, pc.b, pc.xh, pc.s0, pc.s1,
+                      pc.rows, pc.d, pc.eps, pc.rstd);
 }
 
 std::uint32_t u32(long long v, const char* op) {
@@ -69,8 +82,7 @@ void ensure_grad(Tensor& g, const Tensor& like, long long n, Dtype dt) {
     }
 }
 
-// Column pass: dGamma (and dBeta) += sums over rows.
-void column_grads(const Tensor& on, ShaderId id, std::uint32_t mode, std::uint64_t x, std::uint64_t xh,
+void column_grads(const Tensor& on, NormDtypes dts, std::uint32_t mode, std::uint64_t x, std::uint64_t xh,
                   std::uint64_t s1, Tensor& dG, Tensor* dB, std::uint32_t rows, std::uint32_t d) {
     NormPush pc{};
     pc.x = x;
@@ -80,7 +92,7 @@ void column_grads(const Tensor& on, ShaderId id, std::uint32_t mode, std::uint64
     pc.b = dB ? addr(dB->data) : 0;
     pc.rows = rows;
     pc.d = d;
-    run(on, id, mode, pc);
+    run(on, dts, mode, pc);
 }
 
 void layernorm_rows(const char* op, const Tensor& X, const Tensor& gamma, const Tensor* beta, Tensor& Y,
@@ -109,7 +121,7 @@ void layernorm_rows(const char* op, const Tensor& X, const Tensor& gamma, const 
 void column_sum_accumulate(const Tensor& X, Tensor& out) {
     constexpr const char* op = "column_sum";
     if (out.dtype != X.dtype || out.size() != X.cols) fail(op, "out must have X.cols elements of X's dtype");
-    const ShaderId id = norm_shader(X.dtype, X.dtype, X.dtype, op);
+    const NormDtypes id = norm_shader(X.dtype, X.dtype, X.dtype, op);
     column_grads(X, id, NORM_COL_SUM, addr(X.data), 0, 0, out, nullptr, u32(X.rows, op), u32(X.cols, op));
 }
 
@@ -178,7 +190,7 @@ void layernorm_backward_batched_with_caches(const Tensor& dY, const Tensor& Xhat
     ensure(dX, dY.rows, dY.cols, dY.dtype);
     ensure_grad(dGamma, gamma, D, dY.dtype);
     ensure_grad(dBeta, gamma, D, dY.dtype);
-    const ShaderId id = norm_shader(dY.dtype, dY.dtype, dY.dtype, op);
+    const NormDtypes id = norm_shader(dY.dtype, dY.dtype, dY.dtype, op);
     NormPush pc{};
     pc.x = addr(dY.data);
     pc.y = addr(dX.data);
@@ -201,7 +213,7 @@ void layernorm_backward(const Tensor& dY, const Tensor& xhat, const Tensor& gamm
     ensure(dX, dY.rows, dY.cols, dY.dtype);
     ensure_grad(dGamma, gamma, n, dY.dtype);
     ensure_grad(dBeta, gamma, n, dY.dtype);
-    const ShaderId id = norm_shader(dY.dtype, dY.dtype, dY.dtype, op);
+    const NormDtypes id = norm_shader(dY.dtype, dY.dtype, dY.dtype, op);
     NormPush pc{};
     pc.x = addr(dY.data);
     pc.y = addr(dX.data);
@@ -243,7 +255,7 @@ void rms_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& dY, f
     ensure(dX, X.rows, X.cols, X.dtype);
     ensure_grad(dGamma, gamma, X.cols, gamma.dtype);
     if (X.rows == 0 || X.cols == 0) return;
-    const ShaderId id = norm_shader(X.dtype, gamma.dtype, X.dtype, op);
+    const NormDtypes id = norm_shader(X.dtype, gamma.dtype, X.dtype, op);
     Tensor rr = Tensor::empty_on(X.device, X.rows, 1, Dtype::FP32);
     NormPush pc{};
     pc.x = addr(X.data);

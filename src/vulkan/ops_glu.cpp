@@ -19,8 +19,6 @@ using ::brotensor::Tensor;
 
 namespace {
 
-struct RowvecPush { std::uint64_t x, v, w, y; std::uint32_t n, d; };
-
 void glu(const char* op, std::uint32_t code, const Tensor& X, const Tensor* dY, Tensor& out) {
     dt_code(X.dtype, op);
     if (X.cols % 2 != 0) throw std::runtime_error(std::string("brotensor: ") + op + ": X.cols must be even (2*D)");
@@ -59,10 +57,15 @@ void rowvec(const char* op, std::uint32_t code, const Tensor& X, const Tensor& v
     const std::uint32_t n = count32(X, op);
     if (n == 0) return;
     DeviceCtx& d = device_of(X);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::rowvec_f32, X.dtype, op), {code});
-    const RowvecPush pc{addr(X.data), addr(v.data), w ? addr(w->data) : 0, addr(Y.data), n,
-                        static_cast<std::uint32_t>(X.cols)};
-    launch(d, k, pc, groups_1d(n, k));
+    const std::uint64_t ax = addr(X.data), av = addr(v.data), aw = w ? addr(w->data) : 0, ay = addr(Y.data);
+    int lanes = 1;
+    const std::uint32_t dim = static_cast<std::uint32_t>(X.cols);
+    const int max_l = mir_vec_lanes(X.dtype, dim, ax, av, aw, ay);
+    if (max_l > 1 && (dim % static_cast<std::uint32_t>(max_l) == 0u) && (n % static_cast<std::uint32_t>(max_l) == 0u)) {
+        lanes = max_l;
+    }
+    const MirKernel mk = mir_kernel(d, {MirKind::Rowvec, code, X.dtype, X.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_rowvec(d, mk, mir_groups_1d(n, lanes), ax, av, aw, ay, n, dim);
 }
 
 }  // namespace

@@ -87,4 +87,113 @@ Value* emit_gelu_exact(Ctx& c, Value* x) {
     return c.b.build_mul(c.b.build_mul(c.f32(0.5f), x), c.b.build_add(c.f32(1.0f), erf_v));
 }
 
+Value* emit_div_rn(Ctx& c, Value* a, Value* b_val) {
+    Value* r = c.b.build_sdiv(c.f32(1.0f), b_val);
+    Value* q = c.b.build_mul(a, r);
+    return c.b.build_fma_f32(c.b.build_fma_f32(c.b.build_neg(q), b_val, a), r, q);
+}
+
+Value* emit_exp_acc(Ctx& c, Value* t) {
+    Value* n = c.b.build_round_f32(c.b.build_mul(t, c.f32(1.44269504088896341f)));
+    Value* neg_n = c.b.build_neg(n);
+    Value* r = c.b.build_fma_f32(neg_n, c.f32(0.693145751953125f), t);
+    r = c.b.build_fma_f32(neg_n, c.f32(1.428606765330187045e-06f), r);
+    static constexpr float kExpPoly[] = {
+        1.0f, 1.0f, 0.5f, 1.0f / 6.0f, 1.0f / 24.0f, 1.0f / 120.0f, 1.0f / 720.0f, 1.0f / 5040.0f};
+    Value* p = horner(c, r, kExpPoly);
+    return c.kb.ldexp_f32(p, c.kb.f32_to_i32(n));
+}
+
+std::pair<Value*, Value*> emit_sincos_acc(Ctx& c, Value* x) {
+    Value* j = c.b.build_round_f32(c.b.build_mul(x, c.f32(0.636619772367581343f)));
+    Value* neg_j = c.b.build_neg(j);
+    Value* y = c.b.build_fma_f32(neg_j, c.f32(1.57079637050628662f), x);
+    y = c.b.build_fma_f32(neg_j, c.f32(-4.37113882867379e-08f), y);
+    y = c.b.build_fma_f32(neg_j, c.f32(-1.71512451e-15f), y);
+    Value* z = c.b.build_mul(y, y);
+    static constexpr float kSinPoly[] = {-1.6666654611e-1f, 8.3321608736e-3f, -1.9515295891e-4f};
+    static constexpr float kCosPoly[] = {4.166664568298827e-2f, -1.388731625493765e-3f, 2.443315711809948e-5f};
+    Value* sp = c.b.build_fma_f32(c.b.build_mul(y, z), horner(c, z, kSinPoly), y);
+    Value* cp = c.b.build_fma_f32(c.b.build_mul(z, z), horner(c, z, kCosPoly),
+                                  c.b.build_fma_f32(c.f32(-0.5f), z, c.f32(1.0f)));
+    Value* nsp = c.b.build_neg(sp);
+    Value* ncp = c.b.build_neg(cp);
+    Value* q = c.b.build_and(c.kb.f32_to_i32(j), c.i32(3));
+    Value* is0 = c.b.build_eq(q, c.i32(0));
+    Value* is1 = c.b.build_eq(q, c.i32(1));
+    Value* is2 = c.b.build_eq(q, c.i32(2));
+    Value* sin_v = c.b.build_select(is0, sp, c.b.build_select(is1, cp, c.b.build_select(is2, nsp, ncp)));
+    Value* cos_v = c.b.build_select(is0, cp, c.b.build_select(is1, nsp, c.b.build_select(is2, ncp, sp)));
+    return {sin_v, cos_v};
+}
+
+namespace {
+
+Value* emit_block_reduce_32x8(Ctx& c, Value* scratch8, Value* v, float ident, bool is_max) {
+    auto comb = [&](Value* a, Value* b_val) -> Value* {
+        return is_max ? c.kb.fmax(a, b_val) : c.b.build_add(a, b_val);
+    };
+    for (std::uint32_t m = 16; m >= 1; m >>= 1) {
+        v = comb(v, c.kb.shfl_bfly_f32(v, m));
+    }
+    Value* tid = c.kb.tid_x();
+    Value* lane = c.b.build_and(tid, c.i32(31));
+    Value* warp = c.b.build_and(c.b.build_lshr(tid, c.i32(5)), c.i32(7));
+    c.kb.if_then(c.b.build_eq(lane, c.i32(0)), [&] {
+        c.kb.shared_store_f32_indexed(scratch8, warp, v);
+    });
+    c.kb.sync();
+    Value* loaded = c.kb.shared_load_f32_indexed(scratch8, c.b.build_and(lane, c.i32(7)));
+    Value* mine = c.b.build_select(c.b.build_ult(lane, c.i32(8)), loaded, c.f32(ident));
+    for (std::uint32_t m = 16; m >= 1; m >>= 1) {
+        mine = comb(mine, c.kb.shfl_bfly_f32(mine, m));
+    }
+    c.kb.sync();
+    return mine;
+}
+
+}  // namespace
+
+Value* emit_block_sum_f32(Ctx& c, Value* scratch8, Value* v) {
+    return emit_block_reduce_32x8(c, scratch8, v, 0.0f, false);
+}
+
+Value* emit_block_max_f32(Ctx& c, Value* scratch8, Value* v) {
+    return emit_block_reduce_32x8(c, scratch8, v, -3.4028234663852886e38f, true);
+}
+
+Value* emit_block_argmax_f32(Ctx& c, Value* s_val8, Value* s_idx8, Value* best_v, Value* best_i) {
+    auto better = [&](Value* ov, Value* oi, Value* bv, Value* bi) -> Value* {
+        Value* gt = c.b.build_sgt(ov, bv);
+        Value* eq_tie = c.b.build_and(c.b.build_eq(ov, bv), c.b.build_ult(oi, bi));
+        return c.b.build_or(gt, eq_tie);
+    };
+    for (std::uint32_t m = 16; m >= 1; m >>= 1) {
+        Value* ov = c.kb.shfl_bfly_f32(best_v, m);
+        Value* oi = c.kb.shfl_bfly_i32(best_i, m);
+        Value* take = better(ov, oi, best_v, best_i);
+        best_v = c.b.build_select(take, ov, best_v);
+        best_i = c.b.build_select(take, oi, best_i);
+    }
+    Value* tid = c.kb.tid_x();
+    Value* lane = c.b.build_and(tid, c.i32(31));
+    Value* warp = c.b.build_and(c.b.build_lshr(tid, c.i32(5)), c.i32(7));
+    c.kb.if_then(c.b.build_eq(lane, c.i32(0)), [&] {
+        c.kb.shared_store_f32_indexed(s_val8, warp, best_v);
+        c.kb.shared_store_i32_indexed(s_idx8, warp, best_i);
+    });
+    c.kb.sync();
+    Value* bv = c.kb.shared_load_f32_indexed(s_val8, c.i32(0));
+    Value* bi = c.kb.shared_load_i32_indexed(s_idx8, c.i32(0));
+    for (int w = 1; w < 8; ++w) {
+        Value* wv = c.kb.shared_load_f32_indexed(s_val8, c.i32(w));
+        Value* wi = c.kb.shared_load_i32_indexed(s_idx8, c.i32(w));
+        Value* take = better(wv, wi, bv, bi);
+        bv = c.b.build_select(take, wv, bv);
+        bi = c.b.build_select(take, wi, bi);
+    }
+    c.kb.sync();
+    return bi;
+}
+
 }  // namespace brotensor::kernels
