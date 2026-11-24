@@ -20,6 +20,7 @@ namespace brotensor::detail::cuda {
 
 // ── per-cluster vtable-fill entry points ──
 void register_cuda_graph_backend();
+void register_cuda_interop_backend();
 void fill_cuda_vtable_flash_attention(::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_attention      (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_conv           (::brotensor::detail::OpsVTable&);
@@ -167,4 +168,5 @@ extern "C" void brotensor_probe_and_register_cuda() {
 
     ::brotensor::detail::register_backend(DeviceType::CUDA, ops, dc::cuda_alloc_table());
     dc::register_cuda_graph_backend();
+    dc::register_cuda_interop_backend();
 }

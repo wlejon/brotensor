@@ -12,6 +12,8 @@ namespace {
 
 std::atomic<detail::VulkanAvailableHook> g_vk_avail{nullptr};
 std::atomic<detail::VulkanDispatchHook> g_vk_dispatch{nullptr};
+std::atomic<detail::CudaAvailableHook> g_cuda_avail{nullptr};
+std::atomic<detail::CudaDispatchHook> g_cuda_dispatch{nullptr};
 
 } // namespace
 
@@ -20,6 +22,11 @@ namespace detail {
 void register_vulkan_interop_hooks(VulkanAvailableHook avail_fn, VulkanDispatchHook dispatch_fn) {
     g_vk_avail.store(avail_fn, std::memory_order_release);
     g_vk_dispatch.store(dispatch_fn, std::memory_order_release);
+}
+
+void register_cuda_interop_hooks(CudaAvailableHook avail_fn, CudaDispatchHook dispatch_fn) {
+    g_cuda_avail.store(avail_fn, std::memory_order_release);
+    g_cuda_dispatch.store(dispatch_fn, std::memory_order_release);
 }
 
 } // namespace detail
@@ -32,7 +39,7 @@ TensorBufferView view(const Tensor& t) {
     out.device = t.device;
     if (t.device.is_cpu()) {
         out.host_ptr = t.data;
-    } else if (t.device.is_vulkan()) {
+    } else if (t.device.is_vulkan() || t.device.is_cuda()) {
         out.device_address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(t.data));
     }
     return out;
@@ -123,6 +130,28 @@ bool dispatch_spirv(Device dev, const SpirvDispatchDesc& desc, std::string* err)
     const Device resolved = brotensor::detail::resolve_device_alias(dev);
     if (!resolved.is_vulkan()) {
         if (err) *err = "brotensor: dispatch_spirv requires a Vulkan-capable device";
+        return false;
+    }
+    return fn(resolved.index, desc, err);
+}
+
+bool cuda_ptx_dispatch_available(Device dev) {
+    auto fn = g_cuda_avail.load(std::memory_order_acquire);
+    if (!fn) return false;
+    const Device resolved = brotensor::detail::resolve_device_alias(dev);
+    if (!resolved.is_cuda()) return false;
+    return fn(resolved.index);
+}
+
+bool dispatch_ptx(Device dev, const PtxDispatchDesc& desc, std::string* err) {
+    auto fn = g_cuda_dispatch.load(std::memory_order_acquire);
+    if (!fn) {
+        if (err) *err = "brotensor: CUDA PTX interop backend is not available";
+        return false;
+    }
+    const Device resolved = brotensor::detail::resolve_device_alias(dev);
+    if (!resolved.is_cuda()) {
+        if (err) *err = "brotensor: dispatch_ptx requires a CUDA device";
         return false;
     }
     return fn(resolved.index, desc, err);

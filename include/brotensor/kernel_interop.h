@@ -23,6 +23,7 @@ struct TensorBufferView {
 
     bool is_gpu() const noexcept { return device.is_gpu(); }
     bool is_vulkan() const noexcept { return device.is_vulkan(); }
+    bool is_cuda() const noexcept { return device.is_cuda(); }
 };
 
 /// Returns a zero-copy buffer view of `t` on its owning device.
@@ -55,10 +56,31 @@ bool vulkan_spirv_dispatch_available(Device dev = Device::vulkan(0));
 /// brotensor Vulkan stream (ordered with preceding/subsequent brotensor ops).
 bool dispatch_spirv(Device dev, const SpirvDispatchDesc& desc, std::string* err = nullptr);
 
+struct PtxDispatchDesc {
+    const char* ptx = nullptr;
+    std::size_t ptx_bytes = 0;
+    const char* entry_name = nullptr;
+    std::uint32_t local_size[3] = {64, 1, 1};
+    std::uint32_t groups[3] = {1, 1, 1};
+    void** kernel_params = nullptr;
+    std::uint32_t shared_bytes = 0;
+};
+
+/// Returns true when `dev` is a CUDA device ready for zero-copy `dispatch_ptx`.
+bool cuda_ptx_dispatch_available(Device dev = Device::cuda(0));
+
+/// JIT-compiles (cached) and launches a PTX kernel directly on `dev`'s
+/// brotensor CUDA stream (ordered with preceding/subsequent brotensor ops).
+bool dispatch_ptx(Device dev, const PtxDispatchDesc& desc, std::string* err = nullptr);
+
 namespace detail {
 using VulkanDispatchHook = bool (*)(int device_index, const SpirvDispatchDesc& desc, std::string* err);
 using VulkanAvailableHook = bool (*)(int device_index);
 void register_vulkan_interop_hooks(VulkanAvailableHook avail_fn, VulkanDispatchHook dispatch_fn);
+
+using CudaDispatchHook = bool (*)(int device_index, const PtxDispatchDesc& desc, std::string* err);
+using CudaAvailableHook = bool (*)(int device_index);
+void register_cuda_interop_hooks(CudaAvailableHook avail_fn, CudaDispatchHook dispatch_fn);
 } // namespace detail
 
 } // namespace brotensor::interop
