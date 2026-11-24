@@ -21,10 +21,14 @@
 #include "jit/trace_dag.h"
 #include "jit/trace_plan.h"
 #include "kernels/mir_copy.h"
+#include "kernels/mir_diffusion.h"
 #include "kernels/mir_elementwise.h"
 #include "kernels/mir_gnorm.h"
 #include "kernels/mir_norm.h"
 #include "kernels/mir_reduce.h"
+#include "kernels/mir_remap.h"
+#include "kernels/mir_resample.h"
+#include "kernels/mir_resample_bwd.h"
 #include "kernels/mir_rope.h"
 #include "kernels/mir_scatter.h"
 #include "vulkan/shaders/op_codes.h"
@@ -561,6 +565,24 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
         audit_mir("bnorm_bwd", [](brass::Module& m) {
             return kernels::build_bnorm_mir(m, BN_TRAIN_BWD);
         });
+        for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
+                 {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
+            const std::string rb_name = std::string("resample_bwd") + sfx;
+            audit_mir(rb_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_resample_bwd_mir(m, RB_INTERP, dt, 1);
+            });
+            const std::string rs_name = std::string("resample") + sfx;
+            audit_mir(rs_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_resample_mir(m, RS_INTERP, dt, false, 1);
+            });
+            const std::string smp_name = std::string("sampler") + sfx;
+            audit_mir(smp_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_sampler_mir(m, SMP_DDIM, dt, dt, 1);
+            });
+        }
+        audit_mir("remap_b2", [](brass::Module& m) { return kernels::build_remap_mir(m, RM_PAD, 2); });
+        audit_mir("remap_b4", [](brass::Module& m) { return kernels::build_remap_mir(m, RM_PAD, 4); });
+        audit_mir("philox", [](brass::Module& m) { return kernels::build_philox_mir(m, RNG_NORMAL); });
     }
 
     // 4. Synthetic negative test if not already covered by ShaderId::test_shared_overflow

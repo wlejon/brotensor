@@ -331,3 +331,23 @@ Replaced 6 GLSL shaders / 13 variants (`gnorm.comp`, `bnorm.comp`, `copy2d.comp`
   - Deleted 6 GLSL shaders / 13 variants (`gnorm.comp`, `bnorm.comp`, `copy2d.comp`, `transpose.comp`, `fill_bytes.comp`, `scatter_add.comp`): `src/vulkan/shaders` `7,405 -> 6,849` (**`-556` lines**; cumulative **`-1,386` lines** / 17 shaders / 58 variants deleted, `140 -> 82` compiled Vulkan shaders)
   - Shared backend-neutral `src/kernels/*` now `2,217` lines total across Waves 1–3 (`+772` lines in Wave 3, max file `399` lines); `src/vulkan/vk_mir_cache.{h,cpp}` `508` lines (`+152` lines)
   - Pending Wave 3 cross-backend deletions once Metal & CUDA wire into `src/kernels/{mir_copy,mir_scatter,mir_gnorm}`: `~2,091` Metal lines and `~2,434` CUDA lines (`group_norm*`, `batch_norm*`, `transpose*`, `concat*`, `gather_scatter*`, `embedding*`)
+
+---
+
+## Wave 4: Vulkan Resample, ResampleBwd, Remap, Sampler & Philox -> Single-Source Brass MIR
+
+Replaced 5 GLSL shaders / 12 variants (`resample.comp`, `resample_bwd.comp`, `remap.comp`, `sampler.comp`, `philox.comp`; `82 -> 70` compiled Vulkan shaders, **50% of all 140 baseline shader variants removed across Waves 1–4**) with single-source `brass::Function` MIR builders in `src/kernels/{mir_diffusion.{h,cpp}, mir_remap.{h,cpp}, mir_resample.{h,cpp}, mir_resample_bwd.{h,cpp}}` and `emit_log_acc` + helpers in `mir_math` / `mir_common.h`, dispatched through `src/vulkan/vk_mir_cache.{h,cpp}` across `ops_spatial.cpp`, `ops_spatial_bwd.cpp`, and `ops_diffusion.cpp`. Sampler steps (`DDIM`, `Euler`, `DPM++ 2M`) support 128-bit vectorization with a tail loop, `remap` copies raw 16/32-bit patterns bit-for-bit, `resample`/`resample_bwd` preserve exact 64-bit rational coordinates and left-to-right 2×2 summation, and `philox` lowers `umulExtended` via `mul_hi_u32` + `log_acc`/`sincos_acc`.
+
+### Wave 4 Correctness, Proof Audit & LOC Delta
+- **Correctness & Formal Audits (Radeon 8060S):**
+  - `brotensor_test_backward_index_proofs`: **ALL PASSED** (`resample2d_lifted_spirv_resample_bwd_f32_f16_bf16_bounds_and_safety` on 18 MIR `.spv` binaries: `3788` insts, `21` guarded PSB64 writes, `337` bounds guards; `resample2d_lifted_spirv_resample_fwd_and_remap_bounds_and_safety` on 15 MIR `.spv` binaries: `3090` insts, `18` guarded PSB64 writes, `238` bounds guards)
+  - `brotensor_test_backward_shader_audit`: **149/149 shaders passed** (`119897` SPIR-V/PTX insts, `5810` shared accesses proven, `2687` global accesses proven, `643` uniform barriers, `752` uniform collectives, `0` failures)
+  - Unit & Parity Suites: `noise` (`OK`), `diffusion_primitives` (`All passed`), `diffusion_parity` (`23/23`), `image_preproc_parity` (`5/5`), `resample_parity` (`39/39`), `interp2d_parity` (`30/30`), `interp2d_align_corners` (`OK`), `pad2d_parity` (`11/11`), `slice2d_parity` (`5/5`), `pool2d_parity` (`17/17`), `unfold2d_parity` (`5/5`), `convex_upsample_parity` (`5/5`), `window_partition_parity` (`7/7`), `spatial_merge_parity` (`6/6`), `pixel_shuffle_upsample_parity` (`18/18`), `patch_unpack_parity` (`4/4`), `gather_rows_parity` (`8/8`), `resblock_parity` (`16/16`), `brotensor_test_vulkan` `--only=spatial`, `--only=ops`, and `--only=train` (`0` failures across all 3 suites)
+- **Real-Model Gate (Waves 1–4, Radeon 8060S Vulkan):**
+  - `brovisionml` Depth-Anything-V2-Small (`1024×768`, w2/r5): **23.43 ms** best / **24.43 ms** mean (Wave 0: `23.42 / 24.25 ms`)
+  - `brosoundml` Kokoro TTS (`155` phonemes -> `9.47 s` audio): **207.2 ms** mean / **45.74× RT** / **205.0 ms** best (Wave 0: `213.7 ms / 44.33× RT / 207.3 ms`)
+  - `brodiffusion` SD 1.5 (`lcm-dreamshaper`, 512×512, 20 steps) & `Sana-600M` (512×512, 20 steps): completed cleanly end-to-end
+- **LOC Delta (Vulkan Wave 4):**
+  - Deleted 5 GLSL shaders / 12 variants (`resample.comp`, `resample_bwd.comp`, `remap.comp`, `sampler.comp`, `philox.comp`): `src/vulkan/shaders/*` `6,849 -> 5,897` (**`-952` lines**; cumulative **`-2,338` lines** / 22 shaders / 70 variants deleted across Waves 1–4, `140 -> 70` compiled Vulkan shaders)
+  - Shared backend-neutral `src/kernels/*` now `3,232` lines across 25 files (`+1,015` lines in Wave 4, max file `399` lines); `src/vulkan/vk_mir_cache.{h,cpp}` `657` lines (`+149` lines)
+  - Pending Wave 4 cross-backend deletions once Metal & CUDA wire into `src/kernels/{mir_diffusion,mir_remap,mir_resample,mir_resample_bwd}`: **`3,663`** Metal lines and **`3,341`** CUDA lines (**`7,004`** combined lines across `resample`, `interp2d`, `pad2d`, `slice2d`, `pool2d`, `unfold2d`, `convex_upsample`, `window_partition`, `spatial_merge`, `pixel_shuffle_upsample`, `patch_unpack`, `gather_scatter`, `diffusion_samplers`, `noise`, `image_preproc`)

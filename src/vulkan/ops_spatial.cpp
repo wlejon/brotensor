@@ -12,6 +12,7 @@
 // op's shape in the input's dtype and overwritten.
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/ops.h>
@@ -27,18 +28,6 @@ using ::brotensor::Dtype;
 using ::brotensor::Tensor;
 
 namespace {
-
-struct ResamplePush {
-    std::uint64_t x, y, aux;
-    std::uint32_t c, hi, wi, ho, wo, kh, kw;
-    std::int32_t sh, sw, ph, pw;
-};
-
-struct RemapPush {
-    std::uint64_t x, y, idx;
-    std::uint32_t c, cin, hi, wi, ho, wo;
-    std::int32_t a0, a1, a2, a3, a4, a5, a6;
-};
 
 constexpr std::uint32_t kCpt = 16;   // channels per invocation (both kernels' CPT)
 
@@ -57,35 +46,28 @@ void ensure(Tensor& t, long long r, long long c, Dtype dt, const char* op) {
     if (t.rows != r || t.cols != c || t.dtype != dt) t.resize(static_cast<int>(r), static_cast<int>(c), dt);
 }
 
-// Grid for a plane-per-x, CPT-channels-per-y, image-per-z kernel.
-void plane_launch(DeviceCtx& d, const Kernel& k, const void* pc_ptr, std::uint32_t pc_size, std::uint64_t plane,
-                  std::uint64_t channels, std::uint64_t images, const char* op) {
-    if (plane == 0 || channels == 0 || images == 0) return;
-    const std::uint64_t gy = cdiv(channels, kCpt);
-    if (gy > 65535 || images > 65535) fail(op, "too many channels or images for one dispatch");
-    // Fill the GPU when the plane is small: more groups in x than the plane
-    // needs only idle, so x covers the plane once.
-    const std::uint64_t gx = std::min<std::uint64_t>(cdiv(plane, 256), 65535);
-    d.stream().dispatch(k.pipe, pc_ptr, pc_size, static_cast<std::uint32_t>(gx), static_cast<std::uint32_t>(gy),
-                        static_cast<std::uint32_t>(images));
+bool plane_dims(std::uint64_t plane, std::uint64_t channels, std::uint64_t images,
+                std::uint32_t& gx, std::uint32_t& gy, std::uint32_t& gz, const char* op) {
+    if (plane == 0 || channels == 0 || images == 0) return false;
+    const std::uint64_t gy64 = cdiv(channels, kCpt);
+    if (gy64 > 65535 || images > 65535) fail(op, "too many channels or images for one dispatch");
+    gx = static_cast<std::uint32_t>(std::min<std::uint64_t>(cdiv(plane, 256), 65535));
+    gy = static_cast<std::uint32_t>(gy64);
+    gz = static_cast<std::uint32_t>(images);
+    return true;
 }
 
-template <class Push>
-void plane_run(DeviceCtx& d, const Kernel& k, const Push& pc, std::uint64_t plane, std::uint64_t channels,
-               std::uint64_t images, const char* op) {
-    static_assert(sizeof(Push) <= Pipelines::kMaxPushBytes);
-    plane_launch(d, k, &pc, static_cast<std::uint32_t>(sizeof(Push)), plane, channels, images, op);
+MirKernel resample_kernel(DeviceCtx& d, Dtype dt, std::uint32_t mode, std::uint32_t align, std::uint32_t imode,
+                          const char* op) {
+    dt_code(dt, op);
+    const std::uint8_t flags = static_cast<std::uint8_t>(((imode & 3u) << 1) | (align & 1u));
+    return mir_kernel(d, {MirKind::Resample, mode, dt, dt, 1, Dtype::FP32, flags});
 }
 
-const Kernel& resample_kernel(DeviceCtx& d, Dtype dt, std::uint32_t mode, std::uint32_t align, std::uint32_t imode,
-                              const char* op) {
-    return d.pipelines().get(dt_variant(ShaderId::resample_f32, dt, op), {mode, kCpt, align, imode});
-}
-
-const Kernel& remap_kernel(DeviceCtx& d, Dtype dt, std::uint32_t mode, const char* op) {
+MirKernel remap_kernel(DeviceCtx& d, Dtype dt, std::uint32_t mode, const char* op) {
     const int es = ::brotensor::dtype_size_bytes(dt);
     if (es != 2 && es != 4) fail(op, "FP32 / FP16 / BF16 / INT32 only on Vulkan");
-    return d.pipelines().get(es == 4 ? ShaderId::remap_b4 : ShaderId::remap_b2, {mode, kCpt});
+    return mir_kernel(d, {MirKind::Remap, mode, Dtype::FP32, Dtype::FP32, static_cast<std::uint8_t>(es)});
 }
 
 void check_nchw(const char* op, const Tensor& X, int N, int C, int H, int W) {
@@ -93,34 +75,34 @@ void check_nchw(const char* op, const Tensor& X, int N, int C, int H, int W) {
     need(op, X.size() >= static_cast<long long>(N) * C * H * W, "X is smaller than N*C*H*W");
 }
 
-// Resample X (N, C, hi, wi) -> Y (N, C, ho, wo) with resample.comp.
+// Resample X (N, C, hi, wi) -> Y (N, C, ho, wo).
 void resample(const char* op, const Tensor& X, int N, int C, int hi, int wi, int ho, int wo, std::uint32_t mode,
               std::uint32_t align, std::uint32_t imode, Tensor& Y) {
     dt_code(X.dtype, op);
     check_nchw(op, X, N, C, hi, wi);
     ensure(Y, N, static_cast<long long>(C) * ho * wo, X.dtype, op);
-    if (N == 0 || C == 0 || ho == 0 || wo == 0) return;
+    std::uint32_t gx = 0, gy = 0, gz = 0;
+    if (!plane_dims(std::uint64_t(ho) * wo, C, N, gx, gy, gz, op)) return;
     DeviceCtx& d = device_of(X);
-    ResamplePush pc{};
-    pc.x = addr(X.data); pc.y = addr(Y.data);
-    pc.c = static_cast<std::uint32_t>(C);
-    pc.hi = static_cast<std::uint32_t>(hi); pc.wi = static_cast<std::uint32_t>(wi);
-    pc.ho = static_cast<std::uint32_t>(ho); pc.wo = static_cast<std::uint32_t>(wo);
-    plane_run(d, resample_kernel(d, X.dtype, mode, align, imode, op), pc, std::uint64_t(ho) * wo, C, N, op);
+    mir_dispatch_resample(d, resample_kernel(d, X.dtype, mode, align, imode, op), gx, gy, gz,
+                          addr(X.data), addr(Y.data), 0, static_cast<std::uint32_t>(C),
+                          static_cast<std::uint32_t>(hi), static_cast<std::uint32_t>(wi),
+                          static_cast<std::uint32_t>(ho), static_cast<std::uint32_t>(wo),
+                          0, 0, 0, 0, 0, 0);
 }
 
-// Remap X (N, cin, hi, wi) -> Y (N, c, ho, wo) with remap.comp.
+// Remap X (N, cin, hi, wi) -> Y (N, c, ho, wo).
 void remap(const char* op, const Tensor& X, std::uint32_t mode, int images, int c, int cin, int hi, int wi, int ho,
            int wo, const std::int32_t (&a)[7], Tensor& Y) {
-    if (images == 0 || c == 0 || ho == 0 || wo == 0) return;
+    std::uint32_t gx = 0, gy = 0, gz = 0;
+    if (!plane_dims(std::uint64_t(ho) * wo, c, images, gx, gy, gz, op)) return;
     DeviceCtx& d = device_of(X);
-    RemapPush pc{};
-    pc.x = addr(X.data); pc.y = addr(Y.data);
-    pc.c = static_cast<std::uint32_t>(c); pc.cin = static_cast<std::uint32_t>(cin);
-    pc.hi = static_cast<std::uint32_t>(hi); pc.wi = static_cast<std::uint32_t>(wi);
-    pc.ho = static_cast<std::uint32_t>(ho); pc.wo = static_cast<std::uint32_t>(wo);
-    pc.a0 = a[0]; pc.a1 = a[1]; pc.a2 = a[2]; pc.a3 = a[3]; pc.a4 = a[4]; pc.a5 = a[5]; pc.a6 = a[6];
-    plane_run(d, remap_kernel(d, X.dtype, mode, op), pc, std::uint64_t(ho) * wo, c, images, op);
+    mir_dispatch_remap(d, remap_kernel(d, X.dtype, mode, op), gx, gy, gz,
+                       addr(X.data), addr(Y.data), 0,
+                       static_cast<std::uint32_t>(c), static_cast<std::uint32_t>(cin),
+                       static_cast<std::uint32_t>(hi), static_cast<std::uint32_t>(wi),
+                       static_cast<std::uint32_t>(ho), static_cast<std::uint32_t>(wo),
+                       a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
 }
 
 void check_interp(const char* op, int N, int C, int H_in, int W_in, int H_out, int W_out, int mode) {
@@ -209,14 +191,14 @@ void max_pool2d_forward(const Tensor& X, int N, int C, int H, int W, int kH, int
     ensure(Idx, N, cols, Dtype::INT32, op);
     if (N == 0) return;
     DeviceCtx& d = device_of(X);
-    ResamplePush pc{};
-    pc.x = addr(X.data); pc.y = addr(Y.data); pc.aux = addr(Idx.data);
-    pc.c = static_cast<std::uint32_t>(C);
-    pc.hi = static_cast<std::uint32_t>(H); pc.wi = static_cast<std::uint32_t>(W);
-    pc.ho = static_cast<std::uint32_t>(Ho); pc.wo = static_cast<std::uint32_t>(Wo);
-    pc.kh = static_cast<std::uint32_t>(kH); pc.kw = static_cast<std::uint32_t>(kW);
-    pc.sh = stride_h; pc.sw = stride_w; pc.ph = pad_h; pc.pw = pad_w;
-    plane_run(d, resample_kernel(d, X.dtype, RS_MAXPOOL, 0, 0, op), pc, std::uint64_t(Ho) * Wo, C, N, op);
+    std::uint32_t gx = 0, gy = 0, gz = 0;
+    if (!plane_dims(std::uint64_t(Ho) * Wo, C, N, gx, gy, gz, op)) return;
+    mir_dispatch_resample(d, resample_kernel(d, X.dtype, RS_MAXPOOL, 0, 0, op), gx, gy, gz,
+                          addr(X.data), addr(Y.data), addr(Idx.data),
+                          static_cast<std::uint32_t>(C), static_cast<std::uint32_t>(H),
+                          static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(Ho),
+                          static_cast<std::uint32_t>(Wo), static_cast<std::uint32_t>(kH),
+                          static_cast<std::uint32_t>(kW), stride_h, stride_w, pad_h, pad_w);
 }
 
 void convex_upsample_forward(const Tensor& X, const Tensor& Mask, int N, int C, int H, int W, int scale, Tensor& Y) {
@@ -231,13 +213,14 @@ void convex_upsample_forward(const Tensor& X, const Tensor& Mask, int N, int C, 
     ensure(Y, N, static_cast<long long>(C) * Ho * Wo, X.dtype, op);
     if (N == 0) return;
     DeviceCtx& d = device_of(X);
-    ResamplePush pc{};
-    pc.x = addr(X.data); pc.y = addr(Y.data); pc.aux = addr(Mask.data);
-    pc.c = static_cast<std::uint32_t>(C);
-    pc.hi = static_cast<std::uint32_t>(H); pc.wi = static_cast<std::uint32_t>(W);
-    pc.ho = static_cast<std::uint32_t>(Ho); pc.wo = static_cast<std::uint32_t>(Wo);
-    pc.kh = static_cast<std::uint32_t>(scale);
-    plane_run(d, resample_kernel(d, X.dtype, RS_CONVEX, 0, 0, op), pc, std::uint64_t(Ho) * Wo, C, N, op);
+    std::uint32_t gx = 0, gy = 0, gz = 0;
+    if (!plane_dims(std::uint64_t(Ho) * Wo, C, N, gx, gy, gz, op)) return;
+    mir_dispatch_resample(d, resample_kernel(d, X.dtype, RS_CONVEX, 0, 0, op), gx, gy, gz,
+                          addr(X.data), addr(Y.data), addr(Mask.data),
+                          static_cast<std::uint32_t>(C), static_cast<std::uint32_t>(H),
+                          static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(Ho),
+                          static_cast<std::uint32_t>(Wo), static_cast<std::uint32_t>(scale),
+                          0, 0, 0, 0, 0);
 }
 
 // ─── gathers ───────────────────────────────────────────────────────────────
@@ -375,17 +358,16 @@ void gather_rows(const Tensor& X, const Tensor& Idx, Tensor& Y) {
     if (M == 0 || C == 0) return;
     need(op, X.rows > 0, "X has no rows");
     DeviceCtx& d = device_of(X);
-    const Kernel& k = remap_kernel(d, X.dtype, RM_GATHER_ROWS, op);
+    const MirKernel mk = remap_kernel(d, X.dtype, RM_GATHER_ROWS, op);
     const std::uint64_t es = static_cast<std::uint64_t>(::brotensor::dtype_size_bytes(X.dtype));
     for (int m0 = 0; m0 < M; m0 += 65535) {
-        RemapPush pc{};
-        pc.x = addr(X.data);
-        pc.y = addr(Y.data) + std::uint64_t(m0) * C * es;
-        pc.idx = addr(Idx.data) + std::uint64_t(m0) * 4u;
-        pc.c = 1; pc.cin = 1; pc.hi = 1; pc.wi = static_cast<std::uint32_t>(C);
-        pc.ho = 1; pc.wo = static_cast<std::uint32_t>(C);
-        pc.a0 = X.rows;
-        plane_run(d, k, pc, static_cast<std::uint64_t>(C), 1, std::min(65535, M - m0), op);
+        std::uint32_t gx = 0, gy = 0, gz = 0;
+        if (!plane_dims(static_cast<std::uint64_t>(C), 1, std::min(65535, M - m0), gx, gy, gz, op)) break;
+        mir_dispatch_remap(d, mk, gx, gy, gz,
+                           addr(X.data), addr(Y.data) + std::uint64_t(m0) * C * es,
+                           addr(Idx.data) + std::uint64_t(m0) * 4u,
+                           1, 1, 1, static_cast<std::uint32_t>(C), 1, static_cast<std::uint32_t>(C),
+                           X.rows, 0, 0, 0, 0, 0, 0);
     }
 }
 
@@ -400,17 +382,16 @@ void scatter_rows(const Tensor& Y, const Tensor& Idx, Tensor& X) {
     const int C = Y.cols;
     if (M == 0 || C == 0) return;
     DeviceCtx& d = device_of(Y);
-    const Kernel& k = remap_kernel(d, Y.dtype, RM_SCATTER_ROWS, op);
+    const MirKernel mk = remap_kernel(d, Y.dtype, RM_SCATTER_ROWS, op);
     const std::uint64_t es = static_cast<std::uint64_t>(::brotensor::dtype_size_bytes(Y.dtype));
     for (int m0 = 0; m0 < M; m0 += 65535) {
-        RemapPush pc{};
-        pc.x = addr(Y.data) + std::uint64_t(m0) * C * es;
-        pc.y = addr(X.data);
-        pc.idx = addr(Idx.data) + std::uint64_t(m0) * 4u;
-        pc.c = 1; pc.cin = 1; pc.hi = 1; pc.wi = static_cast<std::uint32_t>(C);
-        pc.ho = 1; pc.wo = static_cast<std::uint32_t>(C);
-        pc.a0 = X.rows;
-        plane_run(d, k, pc, static_cast<std::uint64_t>(C), 1, std::min(65535, M - m0), op);
+        std::uint32_t gx = 0, gy = 0, gz = 0;
+        if (!plane_dims(static_cast<std::uint64_t>(C), 1, std::min(65535, M - m0), gx, gy, gz, op)) break;
+        mir_dispatch_remap(d, mk, gx, gy, gz,
+                           addr(Y.data) + std::uint64_t(m0) * C * es, addr(X.data),
+                           addr(Idx.data) + std::uint64_t(m0) * 4u,
+                           1, 1, 1, static_cast<std::uint32_t>(C), 1, static_cast<std::uint32_t>(C),
+                           X.rows, 0, 0, 0, 0, 0, 0);
     }
 }
 

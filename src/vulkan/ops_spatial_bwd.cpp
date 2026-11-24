@@ -10,6 +10,7 @@
 // interp2d_backward throws, as on every backend.
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/ops.h>
@@ -23,12 +24,6 @@ using ::brotensor::Dtype;
 using ::brotensor::Tensor;
 
 namespace {
-
-struct RbPush {
-    std::uint64_t dy, dx, aux;
-    std::uint32_t planes, hi, wi, ho, wo;
-    std::int32_t pt, pl;
-};
 
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
@@ -52,11 +47,15 @@ bool prepare(const char* op, const Tensor& dY, int N, int C, int H, int W, int H
 
 void run(const char* op, std::uint32_t mode, std::uint32_t imode, const Tensor& dY, int N, int C, int H, int W, int Ho,
          int Wo, Tensor& dX, int pt = 0, int pl = 0) {
+    (void)op;
     DeviceCtx& d = device_of(dY);
-    RbPush pc{addr(dY.data), addr(dX.data), 0, static_cast<std::uint32_t>(N * C), static_cast<std::uint32_t>(H),
-              static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(Ho), static_cast<std::uint32_t>(Wo), pt, pl};
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::resample_bwd_f32, dY.dtype, op), {mode, imode});
-    launch(d, k, pc, groups_1d(static_cast<std::uint64_t>(N) * C * H * W, k));
+    const std::uint32_t planes = static_cast<std::uint32_t>(N * C);
+    const std::uint32_t total = planes * static_cast<std::uint32_t>(H) * static_cast<std::uint32_t>(W);
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::ResampleBwd, mode, dY.dtype, dY.dtype, 1, Dtype::FP32, static_cast<std::uint8_t>(imode)});
+    mir_dispatch_resample_bwd(d, mk, mir_groups_1d(total, 1), addr(dY.data), addr(dX.data), 0, planes,
+                              static_cast<std::uint32_t>(H), static_cast<std::uint32_t>(W),
+                              static_cast<std::uint32_t>(Ho), static_cast<std::uint32_t>(Wo), pt, pl);
 }
 
 }  // namespace
@@ -121,11 +120,11 @@ void max_pool2d_backward(const Tensor& dY, const Tensor& Idx, int N, int C, int 
     // The walk accumulates in FP32: dX itself, or a scratch cast into it.
     Tensor acc = dY.dtype == Dtype::FP32 ? Tensor() : Tensor::empty_on(dY.device, N, C * H * W, Dtype::FP32);
     Tensor& out = dY.dtype == Dtype::FP32 ? dX : acc;
-    RbPush pc{addr(dY.data), addr(out.data), addr(Idx.data), static_cast<std::uint32_t>(N * C),
-              static_cast<std::uint32_t>(H), static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(H_out),
-              static_cast<std::uint32_t>(W_out), 0, 0};
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::resample_bwd_f32, dY.dtype, op), {std::uint32_t(RB_MAXPOOL), 0u});
-    launch(d, k, pc, groups_1d(static_cast<std::uint64_t>(N) * C, k));
+    const std::uint32_t planes = static_cast<std::uint32_t>(N * C);
+    const MirKernel mk = mir_kernel(d, {MirKind::ResampleBwd, std::uint32_t(RB_MAXPOOL), dY.dtype, dY.dtype, 1});
+    mir_dispatch_resample_bwd(d, mk, mir_groups_1d(planes, 1), addr(dY.data), addr(out.data), addr(Idx.data), planes,
+                              static_cast<std::uint32_t>(H), static_cast<std::uint32_t>(W),
+                              static_cast<std::uint32_t>(H_out), static_cast<std::uint32_t>(W_out), 0, 0);
     if (dY.dtype != Dtype::FP32) ::brotensor::cast(acc, dX, dY.dtype);
 }
 

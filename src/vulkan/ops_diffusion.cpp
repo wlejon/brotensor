@@ -11,6 +11,7 @@
 
 #include "detail/kernels.h"
 #include "detail/spatial.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/ops.h>
@@ -33,12 +34,6 @@ struct SamplerPush {
     float k0, k1, k2, k3;
 };
 
-struct PhiloxPush {
-    std::uint64_t y, key, counter;
-    std::uint32_t n_lo, n_hi;
-    float p, lo, hi;
-};
-
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
 }
@@ -52,11 +47,21 @@ void ensure(Tensor& t, int r, int c, Dtype dt) {
 }
 
 void run_sampler(const char* op, const Tensor& on, Dtype dt, std::uint32_t mode, SamplerPush pc, int dti = 0) {
+    (void)op;
     if (pc.n == 0) return;
     DeviceCtx& d = device_of(on);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::sampler_f32, dt, op),
-                                        {mode, static_cast<std::uint32_t>(dti)});
-    launch(d, k, pc, groups_1d(pc.n, k));
+    const Dtype in_dt = static_cast<Dtype>(dti == 1 ? int(Dtype::FP16) : (dti == 2 ? int(Dtype::BF16) : int(Dtype::FP32)));
+    int lanes = 1;
+    if (mode == SMP_DDIM || mode == SMP_EULER || mode == SMP_DPMPP_2M) {
+        const std::uint32_t check_n = (pc.n >= 8u) ? 0u : pc.n;
+        lanes = mir_vec_lanes(dt, check_n, pc.x, pc.e, pc.p, pc.y);
+        if (mode == SMP_DPMPP_2M) lanes = std::min(lanes, mir_vec_lanes(dt, check_n, pc.z));
+    }
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::Sampler, mode, dt, in_dt, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_sampler(d, mk, mir_groups_1d(pc.n, lanes),
+                         pc.x, pc.e, pc.p, pc.y, pc.z,
+                         pc.n, pc.dim, pc.half_, pc.hw, pc.c, pc.k0, pc.k1, pc.k2, pc.k3);
 }
 
 void same_shape(const char* op, const Tensor& a, const Tensor& b) {
@@ -76,10 +81,9 @@ void run_philox(const char* op, std::uint32_t mode, std::uint64_t key, std::uint
     const std::size_t n = check_noise_y(op, Y);
     if (n == 0) return;
     DeviceCtx& d = device_of(Y);
-    const Kernel& k = d.pipelines().get(ShaderId::philox, {mode});
-    PhiloxPush pc{addr(Y.data), key, counter, static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(n >> 32),
-                  p, lo, hi};
-    launch(d, k, pc, groups_1d(n, k));
+    const std::uint64_t gx64 = std::min<std::uint64_t>((n + 255u) / 256u, 65535u);
+    const MirKernel mk = mir_kernel(d, {MirKind::Philox, mode});
+    mir_dispatch_philox(d, mk, static_cast<std::uint32_t>(gx64), addr(Y.data), key, counter, n, p, lo, hi);
 }
 
 }  // namespace

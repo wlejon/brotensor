@@ -46,6 +46,22 @@ inline Value* ptr_at(Ctx& c, Value* base, Value* elem_idx, int esz) {
     return c.b.build_add(base, byte_offset(c, elem_idx, esz));
 }
 
+inline Value* load_elem_dt(Ctx& c, Dtype dt, Value* base, Value* elem_idx) {
+    return load_lanes(c, dt, 1, ptr_at(c, base, elem_idx, elem_bytes(dt)))[0];
+}
+
+inline void store_elem_dt(Ctx& c, Dtype dt, Value* base, Value* elem_idx, Value* val) {
+    store_lanes(c, dt, 1, ptr_at(c, base, elem_idx, elem_bytes(dt)), {val});
+}
+
+inline Value* clamp_i32(Ctx& c, Value* v, Value* lo, Value* hi) {
+    return c.b.build_select(c.b.build_slt(v, lo), lo, c.b.build_select(c.b.build_sgt(v, hi), hi, v));
+}
+
+inline Value* grid_stride_ew(Ctx& c) {
+    return c.kb.mul(c.kb.nctaid_x(), c.i32(static_cast<int>(jit::gpu_mir::kEwBlock)));
+}
+
 inline Value* vec_ptr_at(Ctx& c, Value* base, Value* vec_idx, int lanes, int esz) {
     Value* idx64 = c.b.build_zext_i64(vec_idx);
     const int bytes = lanes * esz;

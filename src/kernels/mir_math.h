@@ -30,6 +30,7 @@ Value* emit_rsqrt(Ctx& c, Value* x);
 // High-accuracy math (within ~1 ulp of glibc expf/sinf/cosf across large ranges).
 Value* emit_div_rn(Ctx& c, Value* a, Value* b);
 Value* emit_exp_acc(Ctx& c, Value* t);
+Value* emit_log_acc(Ctx& c, Value* x);
 std::pair<Value*, Value*> emit_sincos_acc(Ctx& c, Value* x);
 
 // 256-thread block reductions (8x32 slices, safe across Wave32 & Wave64).

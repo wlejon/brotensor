@@ -105,6 +105,24 @@ Value* emit_exp_acc(Ctx& c, Value* t) {
     return c.kb.ldexp_f32(p, c.kb.f32_to_i32(n));
 }
 
+Value* emit_log_acc(Ctx& c, Value* x) {
+    Value* bits = jit::gpu_mir::f32_to_bits(c, x);
+    Value* exp_bits = c.b.build_and(c.b.build_lshr(bits, c.i32(23)), c.i32(0xff));
+    Value* e_raw = c.b.build_sub(exp_bits, c.i32(126));
+    Value* m_bits = c.b.build_or(c.b.build_and(bits, c.i32(0x007fffff)), c.i32(0x3f000000));
+    Value* m_raw = jit::gpu_mir::bits_to_f32(c, m_bits);
+    Value* low = c.b.build_slt(m_raw, c.f32(0.70710678118654752f));
+    Value* m = c.b.build_select(low, c.b.build_mul(m_raw, c.f32(2.0f)), m_raw);
+    Value* e = c.b.build_select(low, c.b.build_sub(e_raw, c.i32(1)), e_raw);
+    Value* s = emit_div_rn(c, c.b.build_sub(m, c.f32(1.0f)), c.b.build_add(m, c.f32(1.0f)));
+    Value* z = c.b.build_mul(s, s);
+    static constexpr float kLogPoly[] = {2.0f / 3.0f, 2.0f / 5.0f, 2.0f / 7.0f, 2.0f / 9.0f, 2.0f / 11.0f};
+    Value* lm = c.b.build_fma_f32(c.b.build_mul(s, z), horner(c, z, kLogPoly), c.b.build_mul(c.f32(2.0f), s));
+    Value* fe = c.kb.i32_to_f32(e);
+    return c.b.build_fma_f32(
+        fe, c.f32(0.693145751953125f), c.b.build_fma_f32(fe, c.f32(1.428606765330187045e-06f), lm));
+}
+
 std::pair<Value*, Value*> emit_sincos_acc(Ctx& c, Value* x) {
     Value* j = c.b.build_round_f32(c.b.build_mul(x, c.f32(0.636619772367581343f)));
     Value* neg_j = c.b.build_neg(j);

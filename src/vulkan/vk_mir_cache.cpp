@@ -1,10 +1,14 @@
 #include "vk_mir_cache.h"
 
 #include "../kernels/mir_copy.h"
+#include "../kernels/mir_diffusion.h"
 #include "../kernels/mir_elementwise.h"
 #include "../kernels/mir_gnorm.h"
 #include "../kernels/mir_norm.h"
 #include "../kernels/mir_reduce.h"
+#include "../kernels/mir_remap.h"
+#include "../kernels/mir_resample.h"
+#include "../kernels/mir_resample_bwd.h"
 #include "../kernels/mir_rope.h"
 #include "../kernels/mir_scatter.h"
 
@@ -71,6 +75,18 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
         case MirKind::ScatterAdd: fn = kernels::build_scatter_add_mir(mod, k.op, k.dt0); break;
         case MirKind::Gnorm:      fn = kernels::build_gnorm_mir(mod, k.op, k.dt0, k.flags != 0, k.lanes); break;
         case MirKind::Bnorm:      fn = kernels::build_bnorm_mir(mod, k.op); break;
+        case MirKind::Sampler:    fn = kernels::build_sampler_mir(mod, k.op, k.dt0, k.dt1, k.lanes); break;
+        case MirKind::Philox:     fn = kernels::build_philox_mir(mod, k.op); break;
+        case MirKind::Remap:      fn = kernels::build_remap_mir(mod, k.op, k.lanes); break;
+        case MirKind::Resample: {
+            const bool align = (k.flags & 1u) != 0;
+            const int imode = static_cast<int>(k.flags >> 1);
+            fn = kernels::build_resample_mir(mod, k.op, k.dt0, align, imode);
+            break;
+        }
+        case MirKind::ResampleBwd:
+            fn = kernels::build_resample_bwd_mir(mod, k.op, k.dt0, static_cast<std::uint32_t>(k.flags));
+            break;
     }
     brass::target::SpirvOptions opts;
     opts.stage = brass::target::SpirvStage::Compute;
@@ -382,6 +398,112 @@ void mir_dispatch_bnorm(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
     put_param(buf, *mk.spv, 13, static_cast<std::int32_t>(hw));
     put_param(buf, *mk.spv, 14, eps);
     put_param(buf, *mk.spv, 15, momentum);
+    jit_dispatch(d, mk.pipe, buf.data(), gx);
+}
+
+void mir_dispatch_sampler(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                          std::uint64_t x, std::uint64_t e, std::uint64_t p, std::uint64_t y, std::uint64_t z,
+                          std::uint32_t n, std::uint32_t dim, std::uint32_t half, std::uint32_t hw, std::uint32_t c,
+                          float k0, float k1, float k2, float k3) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, x);
+    put_param(buf, *mk.spv, 1, e);
+    put_param(buf, *mk.spv, 2, p);
+    put_param(buf, *mk.spv, 3, y);
+    put_param(buf, *mk.spv, 4, z);
+    put_param(buf, *mk.spv, 5, static_cast<std::int32_t>(n));
+    put_param(buf, *mk.spv, 6, static_cast<std::int32_t>(dim));
+    put_param(buf, *mk.spv, 7, static_cast<std::int32_t>(half));
+    put_param(buf, *mk.spv, 8, static_cast<std::int32_t>(hw));
+    put_param(buf, *mk.spv, 9, static_cast<std::int32_t>(c));
+    put_param(buf, *mk.spv, 10, k0);
+    put_param(buf, *mk.spv, 11, k1);
+    put_param(buf, *mk.spv, 12, k2);
+    put_param(buf, *mk.spv, 13, k3);
+    jit_dispatch(d, mk.pipe, buf.data(), gx);
+}
+
+void mir_dispatch_philox(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                         std::uint64_t y, std::uint64_t key, std::uint64_t counter, std::uint64_t n,
+                         float p, float lo, float hi) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, y);
+    put_param(buf, *mk.spv, 1, static_cast<std::int32_t>(key));
+    put_param(buf, *mk.spv, 2, static_cast<std::int32_t>(key >> 32));
+    put_param(buf, *mk.spv, 3, static_cast<std::int32_t>(counter));
+    put_param(buf, *mk.spv, 4, static_cast<std::int32_t>(counter >> 32));
+    put_param(buf, *mk.spv, 5, static_cast<std::int32_t>(n));
+    put_param(buf, *mk.spv, 6, static_cast<std::int32_t>(n >> 32));
+    put_param(buf, *mk.spv, 7, p);
+    put_param(buf, *mk.spv, 8, lo);
+    put_param(buf, *mk.spv, 9, hi);
+    jit_dispatch(d, mk.pipe, buf.data(), gx);
+}
+
+void mir_dispatch_remap(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                        std::uint64_t x, std::uint64_t y, std::uint64_t idx,
+                        std::uint32_t c, std::uint32_t cin, std::uint32_t hi, std::uint32_t wi,
+                        std::uint32_t ho, std::uint32_t wo,
+                        std::int32_t a0, std::int32_t a1, std::int32_t a2, std::int32_t a3,
+                        std::int32_t a4, std::int32_t a5, std::int32_t a6) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, x);
+    put_param(buf, *mk.spv, 1, y);
+    put_param(buf, *mk.spv, 2, idx);
+    put_param(buf, *mk.spv, 3, static_cast<std::int32_t>(c));
+    put_param(buf, *mk.spv, 4, static_cast<std::int32_t>(cin));
+    put_param(buf, *mk.spv, 5, static_cast<std::int32_t>(hi));
+    put_param(buf, *mk.spv, 6, static_cast<std::int32_t>(wi));
+    put_param(buf, *mk.spv, 7, static_cast<std::int32_t>(ho));
+    put_param(buf, *mk.spv, 8, static_cast<std::int32_t>(wo));
+    put_param(buf, *mk.spv, 9, a0);
+    put_param(buf, *mk.spv, 10, a1);
+    put_param(buf, *mk.spv, 11, a2);
+    put_param(buf, *mk.spv, 12, a3);
+    put_param(buf, *mk.spv, 13, a4);
+    put_param(buf, *mk.spv, 14, a5);
+    put_param(buf, *mk.spv, 15, a6);
+    jit_dispatch(d, mk.pipe, buf.data(), gx, gy, gz);
+}
+
+void mir_dispatch_resample(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                           std::uint64_t x, std::uint64_t y, std::uint64_t aux,
+                           std::uint32_t c, std::uint32_t hi, std::uint32_t wi, std::uint32_t ho, std::uint32_t wo,
+                           std::uint32_t kh, std::uint32_t kw,
+                           std::int32_t sh, std::int32_t sw, std::int32_t ph, std::int32_t pw) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, x);
+    put_param(buf, *mk.spv, 1, y);
+    put_param(buf, *mk.spv, 2, aux);
+    put_param(buf, *mk.spv, 3, static_cast<std::int32_t>(c));
+    put_param(buf, *mk.spv, 4, static_cast<std::int32_t>(hi));
+    put_param(buf, *mk.spv, 5, static_cast<std::int32_t>(wi));
+    put_param(buf, *mk.spv, 6, static_cast<std::int32_t>(ho));
+    put_param(buf, *mk.spv, 7, static_cast<std::int32_t>(wo));
+    put_param(buf, *mk.spv, 8, static_cast<std::int32_t>(kh));
+    put_param(buf, *mk.spv, 9, static_cast<std::int32_t>(kw));
+    put_param(buf, *mk.spv, 10, sh);
+    put_param(buf, *mk.spv, 11, sw);
+    put_param(buf, *mk.spv, 12, ph);
+    put_param(buf, *mk.spv, 13, pw);
+    jit_dispatch(d, mk.pipe, buf.data(), gx, gy, gz);
+}
+
+void mir_dispatch_resample_bwd(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                               std::uint64_t dy, std::uint64_t dx, std::uint64_t aux,
+                               std::uint32_t planes, std::uint32_t hi, std::uint32_t wi,
+                               std::uint32_t ho, std::uint32_t wo, std::int32_t pt, std::int32_t pl) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, dy);
+    put_param(buf, *mk.spv, 1, dx);
+    put_param(buf, *mk.spv, 2, aux);
+    put_param(buf, *mk.spv, 3, static_cast<std::int32_t>(planes));
+    put_param(buf, *mk.spv, 4, static_cast<std::int32_t>(hi));
+    put_param(buf, *mk.spv, 5, static_cast<std::int32_t>(wi));
+    put_param(buf, *mk.spv, 6, static_cast<std::int32_t>(ho));
+    put_param(buf, *mk.spv, 7, static_cast<std::int32_t>(wo));
+    put_param(buf, *mk.spv, 8, pt);
+    put_param(buf, *mk.spv, 9, pl);
     jit_dispatch(d, mk.pipe, buf.data(), gx);
 }
 

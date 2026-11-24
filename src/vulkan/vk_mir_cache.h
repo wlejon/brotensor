@@ -30,6 +30,11 @@ enum class MirKind : std::uint8_t {
     ScatterAdd = 15,
     Gnorm = 16,
     Bnorm = 17,
+    Sampler = 18,
+    Philox = 19,
+    Remap = 20,
+    Resample = 21,
+    ResampleBwd = 22,
 };
 
 struct MirKey {
@@ -116,5 +121,27 @@ void mir_dispatch_bnorm(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
                         std::uint64_t rm, std::uint64_t rv, std::uint64_t sm, std::uint64_t sr,
                         std::uint64_t dy, std::uint64_t dg, std::uint64_t db,
                         std::uint32_t n, std::uint32_t c, std::uint32_t hw, float eps, float momentum);
+void mir_dispatch_sampler(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                          std::uint64_t x, std::uint64_t e, std::uint64_t p, std::uint64_t y, std::uint64_t z,
+                          std::uint32_t n, std::uint32_t dim, std::uint32_t half, std::uint32_t hw, std::uint32_t c,
+                          float k0, float k1, float k2, float k3);
+void mir_dispatch_philox(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                         std::uint64_t y, std::uint64_t key, std::uint64_t counter, std::uint64_t n,
+                         float p, float lo, float hi);
+void mir_dispatch_remap(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                        std::uint64_t x, std::uint64_t y, std::uint64_t idx,
+                        std::uint32_t c, std::uint32_t cin, std::uint32_t hi, std::uint32_t wi,
+                        std::uint32_t ho, std::uint32_t wo,
+                        std::int32_t a0, std::int32_t a1, std::int32_t a2, std::int32_t a3,
+                        std::int32_t a4, std::int32_t a5, std::int32_t a6);
+void mir_dispatch_resample(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                           std::uint64_t x, std::uint64_t y, std::uint64_t aux,
+                           std::uint32_t c, std::uint32_t hi, std::uint32_t wi, std::uint32_t ho, std::uint32_t wo,
+                           std::uint32_t kh, std::uint32_t kw,
+                           std::int32_t sh, std::int32_t sw, std::int32_t ph, std::int32_t pw);
+void mir_dispatch_resample_bwd(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                               std::uint64_t dy, std::uint64_t dx, std::uint64_t aux,
+                               std::uint32_t planes, std::uint32_t hi, std::uint32_t wi,
+                               std::uint32_t ho, std::uint32_t wo, std::int32_t pt, std::int32_t pl);
 
 }  // namespace brotensor::detail::vulkan

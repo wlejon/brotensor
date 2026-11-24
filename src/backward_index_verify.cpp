@@ -31,6 +31,9 @@
 #include "kernels/mir_elementwise.h"
 #include "kernels/mir_gnorm.h"
 #include "kernels/mir_norm.h"
+#include "kernels/mir_remap.h"
+#include "kernels/mir_resample.h"
+#include "kernels/mir_resample_bwd.h"
 #include "kernels/mir_rope.h"
 #include "kernels/mir_scatter.h"
 #include "vulkan/shaders/op_codes.h"
@@ -531,29 +534,65 @@ BackwardProofSuiteReport refute_upfirdn2d_pre_995ac3c_bug() {
 BackwardProofSuiteReport prove_resample2d_adjoint_duality() {
     BackwardProofSuiteReport rep;
 
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-    using detail::vulkan::ShaderId;
-    const ShaderId bwd_ids[] = {
-        ShaderId::resample_bwd_f32,
-        ShaderId::resample_bwd_f16,
-        ShaderId::resample_bwd_bf16,
-    };
-    add_shader_family_proof(
-        rep,
-        "resample2d_lifted_spirv_resample_bwd_f32_f16_bf16_bounds_and_safety",
-        bwd_ids);
+#if BROTENSOR_HAS_BRASS_JIT
+    brass::target::SpirvOptions spv_opts;
+    spv_opts.stage = brass::target::SpirvStage::Compute;
+    spv_opts.local_size_x = kernels::kEwBlock;
+    spv_opts.local_size_spec_constants = true;
 
-    const ShaderId fwd_ids[] = {
-        ShaderId::resample_f32,
-        ShaderId::resample_f16,
-        ShaderId::resample_bf16,
-        ShaderId::remap_b2,
-        ShaderId::remap_b4,
+    auto audit_mir_family = [&](const std::string& label, const auto& build_all) {
+        std::size_t total_insts = 0, total_writes = 0, total_guards = 0, count = 0;
+        bool all_ok = true;
+        std::string first_failure;
+        build_all([&](const char* kname, brass::Function* fn) {
+            brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, spv_opts);
+            LiftedSpirvCfgMetrics m = audit_lifted_spirv_words(sk.words, kname);
+            total_insts += m.num_instructions;
+            total_writes += m.psb_stores_and_atomics;
+            total_guards += m.bounds_comparisons;
+            ++count;
+            if (!m.all_ok()) {
+                all_ok = false;
+                if (first_failure.empty()) first_failure = m.diagnostic;
+            }
+        });
+        std::ostringstream oss;
+        if (all_ok) {
+            oss << "Proven on " << count << " brass-MIR compiled .spv binaries (" << total_insts
+                << " lifted SPIR-V insts, " << total_writes << " guarded PhysicalStorageBuffer64 writes, "
+                << total_guards << " bounds guards)";
+        } else {
+            oss << first_failure;
+        }
+        rep.entries.push_back({label, all_ok, oss.str()});
     };
-    add_shader_family_proof(
-        rep,
-        "resample2d_lifted_spirv_resample_fwd_and_remap_bounds_and_safety",
-        fwd_ids);
+
+    audit_mir_family("resample2d_lifted_spirv_resample_bwd_f32_f16_bf16_bounds_and_safety", [&](const auto& emit) {
+        for (Dtype dt : {Dtype::FP32, Dtype::FP16, Dtype::BF16}) {
+            for (const auto& [m, im] : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
+                     {RB_INTERP, 0u}, {RB_INTERP, 1u}, {RB_ADAPTIVE, 0u}, {RB_PAD, 0u}, {RB_PAD, 1u}, {RB_MAXPOOL, 0u}}) {
+                brass::Module mod("verify_rb");
+                emit("mir_resample_bwd", kernels::build_resample_bwd_mir(mod, m, dt, im));
+            }
+        }
+    });
+
+    audit_mir_family("resample2d_lifted_spirv_resample_fwd_and_remap_bounds_and_safety", [&](const auto& emit) {
+        for (Dtype dt : {Dtype::FP32, Dtype::FP16, Dtype::BF16}) {
+            brass::Module r0("verify_rs");
+            emit("mir_resample", kernels::build_resample_mir(r0, RS_INTERP, dt, false, 1));
+            brass::Module r1("verify_rs_maxpool");
+            emit("mir_resample", kernels::build_resample_mir(r1, RS_MAXPOOL, dt, false, 0));
+            brass::Module r2("verify_rs_convex");
+            emit("mir_resample", kernels::build_resample_mir(r2, RS_CONVEX, dt, false, 0));
+        }
+        for (int es : {2, 4}) {
+            for (std::uint32_t m : {std::uint32_t(RM_PAD), std::uint32_t(RM_UNFOLD), std::uint32_t(RM_SCATTER_ROWS)}) {
+                brass::Module rm("verify_rm");
+                emit("mir_remap", kernels::build_remap_mir(rm, m, es));
+            }
+        }
+    });
 #endif
 
     return rep;
