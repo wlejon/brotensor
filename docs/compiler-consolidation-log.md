@@ -502,4 +502,15 @@ Replaced 2 GLSL shaders / 4 variants (`audio.comp` `332`L, `dft.comp` `210`L; `6
   - Shared backend-neutral `src/kernels/*`: `6,234` lines across 43 files (`+982` lines in Wave 7, max file `591` lines)
   - Pending cross-backend targets against `mir_audio` / `mir_spectral`: Mac Metal Wave 7 & Windows CUDA Wave 7.
 
+---
 
+## Wave 4 (CUDA / RTX 4090): Resample, ResampleBwd, Remap, Sampler & Philox -> Single-Source Brass MIR
+
+Extended `src/cuda/cu_mir_cache.{h,cpp}` (`144` / `496` LOC, using `fn->name()` directly for `cuModuleGetFunction` entry lookup) with `Sampler`, `Philox`, `Remap`, `Resample`, and `ResampleBwd`, and wired all Wave 4 CUDA ops across `ops_diffusion.cpp`, `ops_spatial.cpp`, and `ops_spatial_bwd.cpp` (also moving `embedding_lookup_forward` onto `RM_GATHER_ROWS` and retiring `embedding.cu` & `gather_scatter.cu`).
+
+### Wave 4 CUDA Verification & LOC Delta (RTX 4090 GPU 0, `CUDA_VISIBLE_DEVICES=0`, `brass@d5608f4`)
+- **Targeted Wave 4 Parity & Unit Suites:** `39/39` passed (`131.67 s`, `0` failures): `noise`, `diffusion_primitives`, `diffusion_parity`, `ddim_step`, `sdxl_schedulers`, `masked_diffusion`, `image_preproc`, `image_preproc_parity`, `resample`, `resample_parity`, `interp2d`, `interp2d_parity`, `interp2d_align_corners`, `pad2d`, `pad2d_parity`, `slice2d`, `slice2d_parity`, `pool2d`, `pool2d_parity`, `unfold2d_parity`, `convex_upsample_parity`, `window_partition`, `window_partition_parity`, `spatial_merge`, `spatial_merge_parity`, `pixel_shuffle_upsample`, `pixel_shuffle_upsample_parity`, `patch_unpack_parity`, `gather_rows`, `gather_rows_parity`, `embedding_parity`, `embedding_extra_parity`, `resblock`, `resblock_int8w`, `resblock_parity`, `conv2d_parity`, `deform_conv2d_parity`, `resample1d_parity`.
+- **Full CUDA `ctest` (`-LE gcstress -j 1`):** **`204/204` passed** (`1072.99 s`, `0` failures).
+- **LOC Delta (CUDA Wave 4):**
+  - Deleted 17 `.cu` files (`-3,788` lines): `resample.cu` (`-539`), `interp2d.cu` (`-441`), `pool2d.cu` (`-392`), `pad2d.cu` (`-280`), `spatial_merge.cu` (`-276`), `noise.cu` (`-213`), `slice2d.cu` (`-201`), `window_partition.cu` (`-191`), `convex_upsample.cu` (`-186`), `gather_scatter.cu` (`-184`), `image_preproc.cu` (`-171`), `unfold2d.cu` (`-169`), `dpmpp_2m_step.cu` (`-134`), `embedding.cu` (`-116`), `ddim_step.cu` (`-111`), `euler_step.cu` (`-98`), `timestep_embedding.cu` (`-86`).
+  - Added `ops_diffusion.cpp` (`222`), `ops_spatial.cpp` (`394`), `ops_spatial_bwd.cpp` (`111`), `cu_mir_cache.{h,cpp}` (`+120` net). Net `src/cuda/` Wave 4 delta: **`-2,941` lines** (`+152 / -3,830` git diff + `727` new LOC; cumulative CUDA Waves 3–4: **`-4,249` net lines**, 22 `.cu` files deleted; all edited/created files `<= 496` LOC).

@@ -342,19 +342,21 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/fp16_matmul.cu
         src/cuda/cu_mir_cache.cpp
         src/cuda/ops_copy.cpp
+        src/cuda/ops_diffusion.cpp
         src/cuda/ops_elementwise.cpp
         src/cuda/ops_gnorm.cpp
         src/cuda/ops_norm.cpp
         src/cuda/ops_reduce.cpp
         src/cuda/ops_rope.cpp
         src/cuda/ops_scatter.cpp
+        src/cuda/ops_spatial.cpp
+        src/cuda/ops_spatial_bwd.cpp
         src/cuda/elementwise_misc.cu
         src/cuda/attention.cu
         src/cuda/optim.cu
         src/cuda/adam.cu
         src/cuda/reduce.cu
         src/cuda/loss.cu
-        src/cuda/embedding.cu
         src/cuda/concat.cu
         src/cuda/mha.cu
         src/cuda/batched_ops.cu
@@ -373,16 +375,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/q6k_wmma.cu
         src/cuda/flash_attention_varlen_f32.cu
         src/cuda/conv2d_igemm_f32.cu
-        src/cuda/resample.cu
-        src/cuda/interp2d.cu
-        src/cuda/pool2d.cu
-        src/cuda/pad2d.cu
-        src/cuda/slice2d.cu
-        src/cuda/unfold2d.cu
-        src/cuda/convex_upsample.cu
-        src/cuda/gather_scatter.cu
         src/cuda/top_k.cu
-        src/cuda/window_partition.cu
         src/cuda/cross_attention.cu
         src/cuda/cross_attention_with_attn.cu
         src/cuda/attention_moments.cu
@@ -404,10 +397,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/lstm.cu
         src/cuda/kv_cache.cu
         src/cuda/decode_gqa.cu
-        src/cuda/ddim_step.cu
-        src/cuda/euler_step.cu
-        src/cuda/dpmpp_2m_step.cu
-        src/cuda/timestep_embedding.cu
         src/cuda/int8_quant.cu
         src/cuda/self_attention_bias.cu
         src/cuda/self_attention_rel_pos.cu
@@ -419,12 +408,9 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/resample1d.cu
         src/cuda/sample_logits.cu
         src/cuda/masked_diffusion.cu
-        src/cuda/noise.cu
         src/cuda/gated_delta_rule.cu
-        src/cuda/spatial_merge.cu
         src/cuda/loss_legacy.cu
         src/cuda/xavier_init.cu
-        src/cuda/image_preproc.cu
         src/cuda/bias_act.cu
         src/cuda/upfirdn2d.cu
         src/cuda/modulated_conv2d.cu
