@@ -359,7 +359,7 @@ Replaced 6 GLSL shaders / 13 variants (`gnorm.comp`, `bnorm.comp`, `copy2d.comp`
 - **LOC Delta (Vulkan Wave 3):**
   - Deleted 6 GLSL shaders / 13 variants (`gnorm.comp`, `bnorm.comp`, `copy2d.comp`, `transpose.comp`, `fill_bytes.comp`, `scatter_add.comp`): `src/vulkan/shaders` `7,405 -> 6,849` (**`-556` lines**; cumulative **`-1,386` lines** / 17 shaders / 58 variants deleted, `140 -> 82` compiled Vulkan shaders)
   - Shared backend-neutral `src/kernels/*` now `2,217` lines total across Waves 1–3 (`+772` lines in Wave 3, max file `399` lines); `src/vulkan/vk_mir_cache.{h,cpp}` `508` lines (`+152` lines)
-  - Pending Wave 3 cross-backend deletions once Metal & CUDA wire into `src/kernels/{mir_copy,mir_scatter,mir_gnorm}`: `~2,091` Metal lines and `~2,434` CUDA lines (`group_norm*`, `batch_norm*`, `transpose*`, `concat*`, `gather_scatter*`, `embedding*`)
+  - Wave 3 Metal consolidation completed below (`Waves 3–4 Metal`, `-5,257` combined net Metal LOC); pending Wave 3 CUDA deletion: `~2,434` CUDA lines (`group_norm*`, `batch_norm*`, `transpose*`, `concat*`, `gather_scatter*`, `embedding*`)
 
 ---
 
@@ -379,4 +379,19 @@ Replaced 5 GLSL shaders / 12 variants (`resample.comp`, `resample_bwd.comp`, `re
 - **LOC Delta (Vulkan Wave 4):**
   - Deleted 5 GLSL shaders / 12 variants (`resample.comp`, `resample_bwd.comp`, `remap.comp`, `sampler.comp`, `philox.comp`): `src/vulkan/shaders/*` `6,849 -> 5,897` (**`-952` lines**; cumulative **`-2,338` lines** / 22 shaders / 70 variants deleted across Waves 1–4, `140 -> 70` compiled Vulkan shaders)
   - Shared backend-neutral `src/kernels/*` now `3,232` lines across 25 files (`+1,015` lines in Wave 4, max file `399` lines); `src/vulkan/vk_mir_cache.{h,cpp}` `657` lines (`+149` lines)
-  - Pending Wave 4 cross-backend deletions once Metal & CUDA wire into `src/kernels/{mir_diffusion,mir_remap,mir_resample,mir_resample_bwd}`: **`3,663`** Metal lines and **`3,341`** CUDA lines (**`7,004`** combined lines across `resample`, `interp2d`, `pad2d`, `slice2d`, `pool2d`, `unfold2d`, `convex_upsample`, `window_partition`, `spatial_merge`, `pixel_shuffle_upsample`, `patch_unpack`, `gather_scatter`, `diffusion_samplers`, `noise`, `image_preproc`)
+  - Wave 4 Metal consolidation completed below; pending Wave 4 CUDA deletion: **`3,341`** CUDA lines across `resample`, `interp2d`, `pad2d`, `slice2d`, `pool2d`, `unfold2d`, `convex_upsample`, `window_partition`, `spatial_merge`, `pixel_shuffle_upsample`, `patch_unpack`, `gather_scatter`, `diffusion_samplers`, `noise`, `image_preproc`
+
+---
+
+## Waves 3 & 4 (Metal / Apple M2 Pro): GroupNorm, BatchNorm, Copy/Transpose/Fill, Scatter-Add, Resample/Bwd, Remap, Sampler & Philox -> Single-Source Brass MIR
+
+Extended Metal's runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`, now `764` LOC total with 2D/3D grid dispatch) with Wave 3 (`FillBytes` at `kFillBlock = 64`, `Copy2d`, `Transpose`, `ScatterAdd`, `Gnorm`, `Bnorm`) and Wave 4 (`Sampler`, `Philox`, `Remap`, `Resample`, `ResampleBwd`), wired every Metal Wave 3 & Wave 4 op through `MslTarget`, made Metal's `copy_d2d`/`copy_d2d_strided`/`concat_*`/`memset_zero` fully asynchronous on the GPU queue (eliminating `cuda_sync()` host-memcpy stalls), and deleted 19 replaced Metal files.
+
+### Waves 3 & 4 Metal Verification & LOC Delta
+- **Parity & Full `ctest` Suite (Apple M2 Pro, Metal Release, `brass` `d5608f4`):**
+  - Targeted Waves 3 & 4 suites (`group_norm`, `group_norm_parity`, `batch_norm`, `batch_norm_parity`, `l2_normalize_parity`, `resblock`, `resblock_int8w`, `resblock_parity`, `transpose`, `transpose_parity`, `concat_parity`, `concat_extra_parity`, `embedding_parity`, `embedding_extra_parity`, `gather_rows`, `gather_rows_parity`, `ddim_step`, `sdxl_schedulers`, `diffusion_primitives`, `diffusion_parity`, `masked_diffusion`, `noise`, `image_preproc`, `image_preproc_parity`, `pad2d`, `pad2d_parity`, `slice2d`, `slice2d_parity`, `unfold2d_parity`, `window_partition`, `window_partition_parity`, `spatial_merge`, `spatial_merge_parity`, `pixel_shuffle_upsample`, `pixel_shuffle_upsample_parity`, `patch_unpack_parity`, `resample`, `resample_parity`, `interp2d`, `interp2d_parity`, `interp2d_align_corners`, `pool2d`, `pool2d_parity`, `convex_upsample_parity`): **48/48 passed** (`44.65 s`, `0` failures).
+  - Full Metal `ctest` (`-LE gcstress -j2`): **188/190 passed** (100% of Metal parity, runtime, JIT, `backward_index_proofs`, and `gpu_mir_emit` tests passed; the only 2 failures are the duplicate CTest targets for the CPU-only SPIR-V/PTX `backward_shader_audit` binary timing out at 300s on M2 Pro).
+- **LOC Delta (Metal Waves 3 & 4):**
+  - Deleted 19 files: `layernorm_msl.h` (`-575`), `batch_norm.mm` (`-578`), `l2_normalize.mm` (`-123`), `transpose.mm` (`-199`), `ddim_step.mm` (`-127`), `euler_step.mm` (`-108`), `dpmpp_2m_step.mm` (`-138`), `timestep_embedding.mm` (`-100`), `image_preproc.mm` (`-238`), `noise.mm` (`-238`), `gather_rows.mm` (`-233`), `pad2d.mm` (`-281`), `slice2d.mm` (`-229`), `unfold2d.mm` (`-179`), `window_partition.mm` (`-202`), `spatial_merge.mm` (`-347`), `interp2d.mm` (`-383`), `pool2d.mm` (`-540`), `convex_upsample.mm` (`-162`) — **`-4,980` lines** in deleted files alone.
+  - Consolidated / rewritten files (all `< 600` LOC): `mtl_mir_cache.{h,mm}` (`182` / `582`), `group_norm.mm` (`320`), `concat.mm` (`253`), `embedding.mm` (`125`), `tensor.mm` (`262`), `diffusion.mm` (`265`), `resample.mm` (`447`), `resample_bwd.mm` (`160`).
+  - **Net Metal LOC delta (Waves 3 & 4):** **`-5,257` lines** (`src/metal/` `32,290 -> 27,033` LOC; **cumulative Waves 1–4: `-9,652` net Metal LOC** and 28 Metal files deleted).

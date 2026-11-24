@@ -3,10 +3,17 @@
 // Include Brass headers BEFORE Objective-C / Metal headers to avoid macro
 // collisions (Objective-C defines `NO`, <mach/machine.h> collides with enums).
 
+#include "../kernels/mir_copy.h"
+#include "../kernels/mir_diffusion.h"
 #include "../kernels/mir_elementwise.h"
+#include "../kernels/mir_gnorm.h"
 #include "../kernels/mir_norm.h"
 #include "../kernels/mir_reduce.h"
+#include "../kernels/mir_remap.h"
+#include "../kernels/mir_resample.h"
+#include "../kernels/mir_resample_bwd.h"
 #include "../kernels/mir_rope.h"
+#include "../kernels/mir_scatter.h"
 
 #include <brass/mir/module.hpp>
 #include <brass/target/msl_target.hpp>
@@ -58,14 +65,7 @@ MirCache& mir_cache() {
 }
 
 std::uint32_t block_for(MirKind kind) {
-    switch (kind) {
-        case MirKind::SumRows:
-        case MirKind::ArgmaxRows:
-        case MirKind::SumCols: return kernels::kReduceBlock;
-        case MirKind::Norm:    return kernels::kNormBlock;
-        case MirKind::Rope:    return kernels::kRopeBlock;
-        default:               return kernels::kEwBlock;
-    }
+    return (kind == MirKind::FillBytes) ? kernels::kFillBlock : kernels::kEwBlock;
 }
 
 const MirEntry* compile_mir(const MirKey& k) {
@@ -88,6 +88,25 @@ const MirEntry* compile_mir(const MirKey& k) {
                 kernels::NormMirFlags::unpack(k.flags), k.lanes);
             break;
         case MirKind::Rope:       fn = kernels::build_rope_mir(mod, k.op, k.flags != 0, k.dt0); break;
+        case MirKind::FillBytes:  fn = kernels::build_fill_bytes_mir(mod); break;
+        case MirKind::Copy2d:     fn = kernels::build_copy2d_mir(mod, static_cast<int>(k.op), k.lanes); break;
+        case MirKind::Transpose:  fn = kernels::build_transpose_mir(mod, static_cast<int>(k.op)); break;
+        case MirKind::ScatterAdd: fn = kernels::build_scatter_add_mir(mod, k.op, k.dt0); break;
+        case MirKind::Gnorm:      fn = kernels::build_gnorm_mir(mod, k.op, k.dt0, k.flags != 0, k.lanes); break;
+        case MirKind::Bnorm:      fn = kernels::build_bnorm_mir(mod, k.op); break;
+        case MirKind::Sampler:    fn = kernels::build_sampler_mir(mod, k.op, k.dt0, k.dt1, k.lanes); break;
+        case MirKind::Philox:     fn = kernels::build_philox_mir(mod, k.op); break;
+        case MirKind::Remap:      fn = kernels::build_remap_mir(mod, k.op, k.lanes); break;
+        case MirKind::Resample: {
+            const bool align = (k.flags & 1u) != 0;
+            const int imode = static_cast<int>(k.flags >> 1);
+            fn = kernels::build_resample_mir(mod, k.op, k.dt0, align, imode);
+            break;
+        }
+        case MirKind::ResampleBwd:
+            fn = kernels::build_resample_bwd_mir(
+                mod, k.op, k.dt0, static_cast<std::uint32_t>(k.flags));
+            break;
     }
     brass::target::MslOptions opts;
     opts.workgroup_x = block_for(k.kind);
@@ -144,12 +163,11 @@ void submit_mir(const MirEntry& e, std::uint32_t gx,
     }
 }
 
-void submit_mir_ptrs(const MirEntry& e, std::uint32_t gx, const char* op,
+void submit_mir_ptrs(const MirEntry& e, std::uint32_t gx, std::uint32_t gy,
+                     std::uint32_t gz, const char* op,
                      const void* const* ptrs, std::size_t nbufs,
                      const std::array<std::uint8_t, 128>& params) {
     @autoreleasepool {
-        // Resolve every buffer BEFORE opening a compute command encoder so any
-        // pool_require error throws cleanly without an un-ended encoder.
         std::array<id<MTLBuffer>, 16> bufs{};
         std::array<NSUInteger, 16> offs{};
         NSUInteger fb_ofs = 0;
@@ -173,8 +191,10 @@ void submit_mir_ptrs(const MirEntry& e, std::uint32_t gx, const char* op,
                    length:e.msl.scalar_params_bytes
                   atIndex:e.msl.num_buffers];
         }
-        [enc dispatchThreadgroups:MTLSizeMake(gx, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(e.msl.workgroup_x, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
+            threadsPerThreadgroup:MTLSizeMake(e.msl.workgroup_x,
+                                              e.msl.workgroup_y,
+                                              e.msl.workgroup_z)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
     }
@@ -231,6 +251,16 @@ int mir_vec_lanes_norm(Dtype dt_x, Dtype dt_y, Dtype dt_g, std::uint32_t d,
             return l;
         }
     }
+    return 1;
+}
+
+int mir_copy2d_lanes(int elem_bytes, std::uint32_t width,
+                     std::uint32_t src_pitch, std::uint32_t dst_pitch,
+                     std::uint64_t src, std::uint64_t dst) {
+    const std::uint32_t u = width | src_pitch | dst_pitch;
+    if (((src | dst) % 16u) != 0u) return 1;
+    if (elem_bytes == 4 && (u % 4u == 0u)) return 4;
+    if (elem_bytes == 2 && (u % 8u == 0u)) return 8;
     return 1;
 }
 
@@ -323,7 +353,7 @@ void mir_dispatch_norm(const MirKernel& mk, std::uint32_t gx, const char* op,
     put_scalar(buf, e.msl, 2, eps);
     put_scalar(buf, e.msl, 3, rstd);
     const void* ptrs[7] = {x, y, g, b, xh, s0, s1};
-    submit_mir_ptrs(e, gx, op, ptrs, 7, buf);
+    submit_mir_ptrs(e, gx, 1, 1, op, ptrs, 7, buf);
 }
 
 void mir_dispatch_rope(const MirKernel& mk, std::uint32_t gx, const char* op,
@@ -345,7 +375,208 @@ void mir_dispatch_rope(const MirKernel& mk, std::uint32_t gx, const char* op,
     put_scalar(buf, e.msl, 6, offset);
     put_scalar(buf, e.msl, 7, ln_base);
     const void* ptrs[11] = {x, y, ct, st, ch, sh, cw, sw, pt, ph, pw};
-    submit_mir_ptrs(e, gx, op, ptrs, 11, buf);
+    submit_mir_ptrs(e, gx, 1, 1, op, ptrs, 11, buf);
+}
+
+void mir_dispatch_fill(const MirKernel& mk, std::uint32_t gx, const char* op,
+                       const void* dst, std::uint32_t n, std::uint32_t val) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(n));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(val));
+    const void* ptrs[1] = {dst};
+    submit_mir_ptrs(e, gx, 1, 1, op, ptrs, 1, buf);
+}
+
+void mir_dispatch_copy2d(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                         const char* op, const void* src, const void* dst,
+                         std::uint32_t src_pitch, std::uint32_t dst_pitch,
+                         std::uint32_t width, std::uint32_t height) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(src_pitch));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(dst_pitch));
+    put_scalar(buf, e.msl, 2, static_cast<std::int32_t>(width));
+    put_scalar(buf, e.msl, 3, static_cast<std::int32_t>(height));
+    const void* ptrs[2] = {src, dst};
+    submit_mir_ptrs(e, gx, gy, 1, op, ptrs, 2, buf);
+}
+
+void mir_dispatch_transpose(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                            std::uint32_t gz, const char* op,
+                            const void* src, const void* dst,
+                            std::uint32_t batch, std::uint32_t rows, std::uint32_t cols) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(batch));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(rows));
+    put_scalar(buf, e.msl, 2, static_cast<std::int32_t>(cols));
+    const void* ptrs[2] = {src, dst};
+    submit_mir_ptrs(e, gx, gy, gz, op, ptrs, 2, buf);
+}
+
+void mir_dispatch_scatter(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                          const char* op, const void* idx, const void* keys,
+                          const void* keys_out, const void* src, const void* dst,
+                          std::uint32_t m, std::uint32_t r, std::uint32_t c,
+                          std::uint32_t p, std::uint32_t k, std::uint32_t j) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(m));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(r));
+    put_scalar(buf, e.msl, 2, static_cast<std::int32_t>(c));
+    put_scalar(buf, e.msl, 3, static_cast<std::int32_t>(p));
+    put_scalar(buf, e.msl, 4, static_cast<std::int32_t>(k));
+    put_scalar(buf, e.msl, 5, static_cast<std::int32_t>(j));
+    const void* ptrs[5] = {idx, keys, keys_out, src, dst};
+    submit_mir_ptrs(e, gx, gy, 1, op, ptrs, 5, buf);
+}
+
+void mir_dispatch_gnorm(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                        const char* op, const void* x, const void* y,
+                        const void* g, const void* b, const void* part,
+                        const void* rm, const void* rv,
+                        std::uint32_t tile, std::uint32_t hw, std::uint32_t cpg,
+                        std::uint32_t groups, std::uint32_t splits, std::uint32_t chunk,
+                        std::uint32_t total, std::uint32_t c, float eps) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(tile));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(hw));
+    put_scalar(buf, e.msl, 2, static_cast<std::int32_t>(cpg));
+    put_scalar(buf, e.msl, 3, static_cast<std::int32_t>(groups));
+    put_scalar(buf, e.msl, 4, static_cast<std::int32_t>(splits));
+    put_scalar(buf, e.msl, 5, static_cast<std::int32_t>(chunk));
+    put_scalar(buf, e.msl, 6, static_cast<std::int32_t>(total));
+    put_scalar(buf, e.msl, 7, static_cast<std::int32_t>(c));
+    put_scalar(buf, e.msl, 8, eps);
+    const void* ptrs[7] = {x, y, g, b, part, rm, rv};
+    submit_mir_ptrs(e, gx, gy, 1, op, ptrs, 7, buf);
+}
+
+void mir_dispatch_bnorm(const MirKernel& mk, std::uint32_t gx, const char* op,
+                        const void* x, const void* y, const void* g, const void* b,
+                        const void* rm, const void* rv, const void* sm, const void* sr,
+                        const void* dy, const void* dg, const void* db,
+                        std::uint32_t n, std::uint32_t c, std::uint32_t hw,
+                        float eps, float momentum) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(n));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(c));
+    put_scalar(buf, e.msl, 2, static_cast<std::int32_t>(hw));
+    put_scalar(buf, e.msl, 3, eps);
+    put_scalar(buf, e.msl, 4, momentum);
+    const void* ptrs[11] = {x, y, g, b, rm, rv, sm, sr, dy, dg, db};
+    submit_mir_ptrs(e, gx, 1, 1, op, ptrs, 11, buf);
+}
+
+void mir_dispatch_sampler(const MirKernel& mk, std::uint32_t gx, const char* op,
+                          const void* x, const void* e_ptr, const void* p,
+                          const void* y, const void* z,
+                          std::uint32_t n, std::uint32_t dim, std::uint32_t half,
+                          std::uint32_t hw, std::uint32_t c,
+                          float k0, float k1, float k2, float k3) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(n));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(dim));
+    put_scalar(buf, e.msl, 2, static_cast<std::int32_t>(half));
+    put_scalar(buf, e.msl, 3, static_cast<std::int32_t>(hw));
+    put_scalar(buf, e.msl, 4, static_cast<std::int32_t>(c));
+    put_scalar(buf, e.msl, 5, k0);
+    put_scalar(buf, e.msl, 6, k1);
+    put_scalar(buf, e.msl, 7, k2);
+    put_scalar(buf, e.msl, 8, k3);
+    const void* ptrs[5] = {x, e_ptr, p, y, z};
+    submit_mir_ptrs(e, gx, 1, 1, op, ptrs, 5, buf);
+}
+
+void mir_dispatch_philox(const MirKernel& mk, std::uint32_t gx, const char* op,
+                         const void* y, std::uint64_t key, std::uint64_t counter,
+                         std::uint64_t n, float p, float lo, float hi) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(key));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(key >> 32));
+    put_scalar(buf, e.msl, 2, static_cast<std::int32_t>(counter));
+    put_scalar(buf, e.msl, 3, static_cast<std::int32_t>(counter >> 32));
+    put_scalar(buf, e.msl, 4, static_cast<std::int32_t>(n));
+    put_scalar(buf, e.msl, 5, static_cast<std::int32_t>(n >> 32));
+    put_scalar(buf, e.msl, 6, p);
+    put_scalar(buf, e.msl, 7, lo);
+    put_scalar(buf, e.msl, 8, hi);
+    const void* ptrs[1] = {y};
+    submit_mir_ptrs(e, gx, 1, 1, op, ptrs, 1, buf);
+}
+
+void mir_dispatch_remap(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                        std::uint32_t gz, const char* op,
+                        const void* x, const void* y, const void* idx,
+                        std::uint32_t c, std::uint32_t cin, std::uint32_t hi,
+                        std::uint32_t wi, std::uint32_t ho, std::uint32_t wo,
+                        std::int32_t a0, std::int32_t a1, std::int32_t a2,
+                        std::int32_t a3, std::int32_t a4, std::int32_t a5,
+                        std::int32_t a6) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(c));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(cin));
+    put_scalar(buf, e.msl, 2, static_cast<std::int32_t>(hi));
+    put_scalar(buf, e.msl, 3, static_cast<std::int32_t>(wi));
+    put_scalar(buf, e.msl, 4, static_cast<std::int32_t>(ho));
+    put_scalar(buf, e.msl, 5, static_cast<std::int32_t>(wo));
+    put_scalar(buf, e.msl, 6, a0);
+    put_scalar(buf, e.msl, 7, a1);
+    put_scalar(buf, e.msl, 8, a2);
+    put_scalar(buf, e.msl, 9, a3);
+    put_scalar(buf, e.msl, 10, a4);
+    put_scalar(buf, e.msl, 11, a5);
+    put_scalar(buf, e.msl, 12, a6);
+    const void* ptrs[3] = {x, y, idx};
+    submit_mir_ptrs(e, gx, gy, gz, op, ptrs, 3, buf);
+}
+
+void mir_dispatch_resample(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                           std::uint32_t gz, const char* op,
+                           const void* x, const void* y, const void* aux,
+                           std::uint32_t c, std::uint32_t hi, std::uint32_t wi,
+                           std::uint32_t ho, std::uint32_t wo, std::uint32_t kh,
+                           std::uint32_t kw, std::int32_t sh, std::int32_t sw,
+                           std::int32_t ph, std::int32_t pw) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(c));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(hi));
+    put_scalar(buf, e.msl, 2, static_cast<std::int32_t>(wi));
+    put_scalar(buf, e.msl, 3, static_cast<std::int32_t>(ho));
+    put_scalar(buf, e.msl, 4, static_cast<std::int32_t>(wo));
+    put_scalar(buf, e.msl, 5, static_cast<std::int32_t>(kh));
+    put_scalar(buf, e.msl, 6, static_cast<std::int32_t>(kw));
+    put_scalar(buf, e.msl, 7, sh);
+    put_scalar(buf, e.msl, 8, sw);
+    put_scalar(buf, e.msl, 9, ph);
+    put_scalar(buf, e.msl, 10, pw);
+    const void* ptrs[3] = {x, y, aux};
+    submit_mir_ptrs(e, gx, gy, gz, op, ptrs, 3, buf);
+}
+
+void mir_dispatch_resample_bwd(const MirKernel& mk, std::uint32_t gx, const char* op,
+                               const void* dy, const void* dx, const void* aux,
+                               std::uint32_t planes, std::uint32_t hi, std::uint32_t wi,
+                               std::uint32_t ho, std::uint32_t wo,
+                               std::int32_t pt, std::int32_t pl) {
+    const MirEntry& e = *mk.entry;
+    std::array<std::uint8_t, 128> buf{};
+    put_scalar(buf, e.msl, 0, static_cast<std::int32_t>(planes));
+    put_scalar(buf, e.msl, 1, static_cast<std::int32_t>(hi));
+    put_scalar(buf, e.msl, 2, static_cast<std::int32_t>(wi));
+    put_scalar(buf, e.msl, 3, static_cast<std::int32_t>(ho));
+    put_scalar(buf, e.msl, 4, static_cast<std::int32_t>(wo));
+    put_scalar(buf, e.msl, 5, pt);
+    put_scalar(buf, e.msl, 6, pl);
+    const void* ptrs[3] = {dy, dx, aux};
+    submit_mir_ptrs(e, gx, 1, 1, op, ptrs, 3, buf);
 }
 
 }  // namespace brotensor::detail::metal

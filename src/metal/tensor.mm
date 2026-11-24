@@ -13,6 +13,8 @@
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/tensor.h>
 
+#include "mtl_mir_cache.h"
+
 #import "internal.h"
 
 #include <cstddef>
@@ -179,8 +181,35 @@ void metal_memcpy_peer(void* dst, int, const void* src, int, std::size_t n) {
 
 void metal_memset_zero(void* dst, std::size_t n, int) {
     if (!n) return;
-    metal_impl::flush();
-    std::memset(dst, 0, n);
+    @autoreleasepool {
+        NSUInteger ofs = 0;
+        id<MTLBuffer> buf = metal_impl::pool_lookup(dst);
+        if (!buf) {
+            metal_impl::flush();
+            std::memset(dst, 0, n);
+            return;
+        }
+        ofs = metal_impl::pool_lookup_offset(dst);
+        const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(dst);
+        const std::uintptr_t lo = std::min<std::uintptr_t>((a + 3u) & ~std::uintptr_t(3u), a + n);
+        const std::uintptr_t hi = std::max<std::uintptr_t>((a + n) & ~std::uintptr_t(3u), lo);
+        auto fill_edges = [&](std::uintptr_t from, std::uintptr_t to) {
+            if (to <= from) return;
+            const std::uint32_t len = static_cast<std::uint32_t>(to - from);
+            const MirKernel mk = mir_kernel({MirKind::FillBytes, 0});
+            mir_dispatch_fill(mk, mir_groups_1d(len, 1, 64), "memset_zero",
+                              reinterpret_cast<const void*>(from), len, 0u);
+        };
+        fill_edges(a, lo);
+        if (hi > lo) {
+            id<MTLCommandBuffer> cmd = metal_impl::new_command_buffer();
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            [blit fillBuffer:buf range:NSMakeRange(ofs + (lo - a), hi - lo) value:0];
+            [blit endEncoding];
+            metal_impl::submit(cmd);
+        }
+        fill_edges(hi, a + n);
+    }
 }
 
 // Drain the asynchronous submission queue — wait on the most recent pending

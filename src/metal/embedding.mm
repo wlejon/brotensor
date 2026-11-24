@@ -1,289 +1,125 @@
-#include <brotensor/runtime.h>
+// Metal embedding lookup (forward via MirKind::Remap gather_rows; backward
+// and scatter_rows_add via deterministic bitonic-sort MirKind::ScatterAdd).
 
-#include <cstring>
-#include <stdexcept>
+#include "mtl_mir_cache.h"
+
+#include "../vulkan/shaders/op_codes.h"
+
+#include <brotensor/runtime.h>
 
 #import "internal.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
 namespace brotensor::detail::metal {
 
-using metal_impl::buffer_for;
-using metal_impl::buffer_offset_for;
-using metal_impl::compile_pipeline;
-using metal_impl::new_command_buffer;
-using metal_impl::pool_require;
+// Defined in resample.mm (MirKind::Remap RM_GATHER_ROWS).
+void gather_rows(const Tensor& X, const Tensor& Idx, Tensor& Y);
 
 namespace {
 
-NSString* const kSrc = @R"msl(
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void k_emb_fw(device const float* table [[buffer(0)]],
-                     device const int*   idx   [[buffer(1)]],
-                     device float*       out   [[buffer(2)]],
-                     constant uint& B          [[buffer(3)]],
-                     constant uint& D          [[buffer(4)]],
-                     uint t [[thread_position_in_grid]]) {
-    uint total = B * D;
-    if (t >= total) return;
-    uint b = t / D;
-    uint j = t - b * D;
-    int row = idx[b];
-    out[t] = table[uint(row) * D + j];
+[[noreturn]] void fail(const char* op, const std::string& why) {
+    throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
 }
 
-kernel void k_emb_fw_fp16(device const half* table [[buffer(0)]],
-                          device const int*  idx   [[buffer(1)]],
-                          device half*       out   [[buffer(2)]],
-                          constant uint& B         [[buffer(3)]],
-                          constant uint& D         [[buffer(4)]],
-                          uint t [[thread_position_in_grid]]) {
-    uint total = B * D;
-    if (t >= total) return;
-    uint b = t / D;
-    uint j = t - b * D;
-    int row = idx[b];
-    out[t] = table[uint(row) * D + j];
-}
-
-kernel void k_emb_bw(device const float* dOut          [[buffer(0)]],
-                     device const int*   idx           [[buffer(1)]],
-                     device atomic_float* dTable        [[buffer(2)]],
-                     constant uint& B                  [[buffer(3)]],
-                     constant uint& D                  [[buffer(4)]],
-                     uint t [[thread_position_in_grid]]) {
-    uint total = B * D;
-    if (t >= total) return;
-    uint b = t / D;
-    uint j = t - b * D;
-    int row = idx[b];
-    atomic_fetch_add_explicit(&dTable[uint(row) * D + j],
-                              dOut[t], memory_order_relaxed);
-}
-
-// FP16 input: atomic-add into FP32 scratch (atomic on half is not portable).
-kernel void k_emb_bw_fp16(device const half* dOut          [[buffer(0)]],
-                          device const int*  idx           [[buffer(1)]],
-                          device atomic_float* dTable_scratch [[buffer(2)]],
-                          constant uint& B                 [[buffer(3)]],
-                          constant uint& D                 [[buffer(4)]],
-                          uint t [[thread_position_in_grid]]) {
-    uint total = B * D;
-    if (t >= total) return;
-    uint b = t / D;
-    uint j = t - b * D;
-    int row = idx[b];
-    atomic_fetch_add_explicit(&dTable_scratch[uint(row) * D + j],
-                              float(dOut[t]), memory_order_relaxed);
-}
-
-kernel void k_emb_add_fp32_into_fp16(device const float* src [[buffer(0)]],
-                                     device half*        dst [[buffer(1)]],
-                                     constant uint& n        [[buffer(2)]],
-                                     uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    dst[i] = half(float(dst[i]) + src[i]);
-}
-
-kernel void k_emb_fw_bf16(device const bfloat* table [[buffer(0)]],
-                          device const int*    idx   [[buffer(1)]],
-                          device bfloat*       out   [[buffer(2)]],
-                          constant uint& B            [[buffer(3)]],
-                          constant uint& D            [[buffer(4)]],
-                          uint t [[thread_position_in_grid]]) {
-    uint total = B * D;
-    if (t >= total) return;
-    uint b = t / D;
-    uint j = t - b * D;
-    int row = idx[b];
-    out[t] = table[uint(row) * D + j];
-}
-
-// BF16 input: atomic-add into FP32 scratch (atomic on bfloat is not portable).
-kernel void k_emb_bw_bf16(device const bfloat* dOut            [[buffer(0)]],
-                          device const int*    idx             [[buffer(1)]],
-                          device atomic_float* dTable_scratch  [[buffer(2)]],
-                          constant uint& B                     [[buffer(3)]],
-                          constant uint& D                     [[buffer(4)]],
-                          uint t [[thread_position_in_grid]]) {
-    uint total = B * D;
-    if (t >= total) return;
-    uint b = t / D;
-    uint j = t - b * D;
-    int row = idx[b];
-    atomic_fetch_add_explicit(&dTable_scratch[uint(row) * D + j],
-                              float(dOut[t]), memory_order_relaxed);
-}
-
-kernel void k_emb_add_fp32_into_bf16(device const float* src [[buffer(0)]],
-                                     device bfloat*      dst [[buffer(1)]],
-                                     constant uint& n        [[buffer(2)]],
-                                     uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    dst[i] = bfloat(float(dst[i]) + src[i]);
-}
-)msl";
-
-id<MTLComputePipelineState> fw_pso() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_fw"); });
-    return pso;
-}
-id<MTLComputePipelineState> fw_pso_fp16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_fw_fp16"); });
-    return pso;
-}
-id<MTLComputePipelineState> bw_pso() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_bw"); });
-    return pso;
-}
-id<MTLComputePipelineState> bw_pso_fp16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_bw_fp16"); });
-    return pso;
-}
-id<MTLComputePipelineState> add_pso_fp16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_add_fp32_into_fp16"); });
-    return pso;
-}
-id<MTLComputePipelineState> fw_pso_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_fw_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> bw_pso_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_bw_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> add_pso_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_emb_add_fp32_into_bf16"); });
-    return pso;
-}
-
-void dispatch1d(id<MTLComputePipelineState> pso, NSUInteger n,
-                void (^bind)(id<MTLComputeCommandEncoder>)) {
-    if (n == 0) return;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        bind(enc);
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > 256) tg = 256;
-        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
+void need_float(const Tensor& t, const char* op, const char* what) {
+    if (t.dtype != Dtype::FP32 && t.dtype != Dtype::FP16 && t.dtype != Dtype::BF16) {
+        fail(op, std::string(what) + " must be FP32, FP16 or BF16");
     }
 }
 
-} // namespace
+void scatter_add(const void* idx, ::brotensor::Device dev, int M, int R, int C,
+                 const void* src, const void* dst, Dtype dt, const char* op) {
+    if (M <= 0 || R <= 0 || C <= 0) return;
+    if (static_cast<long long>(R) * C > 0xffffffffLL ||
+        static_cast<long long>(M) * C > 0xffffffffLL) {
+        fail(op, "tensor too large");
+    }
+    std::uint32_t P = 1;
+    while (P < static_cast<std::uint32_t>(M)) P <<= 1;
+    Tensor keys = Tensor::empty_on(dev, static_cast<int>(P), 2, Dtype::FP32);
+    Tensor keys2;
+    const void* keys_a = keys.data;
+    const void* keys_b = nullptr;
+    const std::uint32_t m = static_cast<std::uint32_t>(M);
+    const std::uint32_t r = static_cast<std::uint32_t>(R);
+    const std::uint32_t c = static_cast<std::uint32_t>(C);
 
-void embedding_lookup_forward(const Tensor& table,
-                              const int32_t* d_idx, int B,
-                              Tensor& out) {
-    if (table.dtype != Dtype::FP32 && table.dtype != Dtype::FP16 &&
-        table.dtype != Dtype::BF16) {
-        throw std::runtime_error(
-            "brotensor: embedding_lookup_forward: table dtype must be "
-            "FP32, FP16, or BF16 (quantized tables must be dequantized first)");
-    }
-    const int D = table.cols;
-    if (out.rows != B || out.cols != D || out.dtype != table.dtype) {
-        out.resize(B, D, table.dtype);
-    }
-    const int total = B * D;
-    if (total == 0) return;
-    id<MTLBuffer> bT = buffer_for(table);
-    NSUInteger oT = buffer_offset_for(table);
-    id<MTLBuffer> bO = buffer_for(out);
-    NSUInteger oO = buffer_offset_for(out);
-    NSUInteger oI = 0;
-    id<MTLBuffer> bI = pool_require(d_idx, oI, "embedding_lookup_forward", "indices");
-    const uint32_t Bu = static_cast<uint32_t>(B);
-    const uint32_t Du = static_cast<uint32_t>(D);
-    id<MTLComputePipelineState> pso =
-        (table.dtype == Dtype::FP16) ? fw_pso_fp16()
-      : (table.dtype == Dtype::BF16) ? fw_pso_bf16()
-      : fw_pso();
-    dispatch1d(pso, total, ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:bT offset:oT atIndex:0];
-        [enc setBuffer:bI offset:oI atIndex:1];
-        [enc setBuffer:bO offset:oO atIndex:2];
-        [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:3];
-        [enc setBytes:&Du length:sizeof(uint32_t) atIndex:4];
-    });
-}
+    const MirKernel mk_keys = mir_kernel({MirKind::ScatterAdd, static_cast<std::uint32_t>(SA_KEYS), dt});
+    mir_dispatch_scatter(mk_keys, mir_groups_1d(P, 1), 1, op,
+                         idx, keys_a, keys_b, src, dst, m, r, c, P, 0, 0);
 
-void embedding_lookup_backward(const Tensor& dOut,
-                               const int32_t* d_idx, int B,
-                               Tensor& dTable) {
-    if (dTable.dtype != Dtype::FP16 && dTable.dtype != Dtype::FP32 &&
-        dTable.dtype != Dtype::BF16) {
-        throw std::runtime_error("embedding_lookup_backward_gpu: dTable must be FP16, BF16, or FP32");
-    }
-    if (dOut.dtype != dTable.dtype) {
-        throw std::runtime_error("embedding_lookup_backward_gpu: dOut/dTable dtype must match");
-    }
-    const int D = dTable.cols;
-    const int total = B * D;
-    if (total == 0) return;
-    id<MTLBuffer> bdO = buffer_for(dOut);
-    NSUInteger odO = buffer_offset_for(dOut);
-    id<MTLBuffer> bdT = buffer_for(dTable);
-    NSUInteger odT = buffer_offset_for(dTable);
-    NSUInteger oI = 0;
-    id<MTLBuffer> bI = pool_require(d_idx, oI, "embedding_lookup_backward", "indices");
-    const uint32_t Bu = static_cast<uint32_t>(B);
-    const uint32_t Du = static_cast<uint32_t>(D);
-
-    if (dTable.dtype == Dtype::FP32) {
-        dispatch1d(bw_pso(), total, ^(id<MTLComputeCommandEncoder> enc) {
-            [enc setBuffer:bdO offset:odO atIndex:0];
-            [enc setBuffer:bI  offset:oI atIndex:1];
-            [enc setBuffer:bdT offset:odT atIndex:2];
-            [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:3];
-            [enc setBytes:&Du length:sizeof(uint32_t) atIndex:4];
-        });
+    if (P <= 512) {
+        const MirKernel mk_local = mir_kernel({MirKind::ScatterAdd, static_cast<std::uint32_t>(SA_LOCAL), dt});
+        mir_dispatch_scatter(mk_local, 1, 1, op,
+                             idx, keys_a, keys_b, src, dst, m, r, c, P, 0, 0);
     } else {
-        const bool is_bf16 = (dTable.dtype == Dtype::BF16);
-        const NSUInteger table_n = static_cast<NSUInteger>(dTable.rows) * D;
-        @autoreleasepool {
-            id<MTLBuffer> scratch = [metal_impl::device()
-                newBufferWithLength:table_n * sizeof(float)
-                            options:MTLResourceStorageModeShared];
-            std::memset([scratch contents], 0, table_n * sizeof(float));
-            id<MTLComputePipelineState> scatter_pso = is_bf16 ? bw_pso_bf16() : bw_pso_fp16();
-            dispatch1d(scatter_pso, total, ^(id<MTLComputeCommandEncoder> enc) {
-                [enc setBuffer:bdO offset:odO atIndex:0];
-                [enc setBuffer:bI  offset:oI atIndex:1];
-                [enc setBuffer:scratch offset:0 atIndex:2];
-                [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:3];
-                [enc setBytes:&Du length:sizeof(uint32_t) atIndex:4];
-            });
-            const uint32_t n = static_cast<uint32_t>(table_n);
-            id<MTLComputePipelineState> add_pso = is_bf16 ? add_pso_bf16() : add_pso_fp16();
-            dispatch1d(add_pso, n, ^(id<MTLComputeCommandEncoder> enc) {
-                [enc setBuffer:scratch offset:0 atIndex:0];
-                [enc setBuffer:bdT offset:odT atIndex:1];
-                [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
-            });
+        keys2 = Tensor::empty_on(dev, static_cast<int>(P), 2, Dtype::FP32);
+        keys_b = keys2.data;
+        const MirKernel mk_step = mir_kernel({MirKind::ScatterAdd, static_cast<std::uint32_t>(SA_STEP), dt});
+        const std::uint32_t gs = mir_groups_1d(P, 1);
+        for (std::uint32_t k = 2; k <= P; k <<= 1) {
+            for (std::uint32_t j = k >> 1; j > 0; j >>= 1) {
+                mir_dispatch_scatter(mk_step, gs, 1, op,
+                                     idx, keys_a, keys_b, src, dst, m, r, c, P, k, j);
+                std::swap(keys_a, keys_b);
+            }
         }
     }
+    const std::uint32_t gx = static_cast<std::uint32_t>((C + 255) / 256);
+    const std::uint32_t gy = static_cast<std::uint32_t>(std::min(M, 65535));
+    const MirKernel mk_sum = mir_kernel({MirKind::ScatterAdd, static_cast<std::uint32_t>(SA_SUM), dt});
+    mir_dispatch_scatter(mk_sum, gx, gy, op,
+                         idx, keys_a, keys_b, src, dst, m, r, c, P, 0, 0);
 }
 
-} // namespace brotensor::detail::metal
+}  // namespace
+
+void embedding_lookup_forward(const Tensor& table, const int32_t* d_idx, int B, Tensor& out) {
+    constexpr const char* op = "embedding_lookup_forward";
+    need_float(table, op, "table");
+    if (B < 0) fail(op, "B must be >= 0");
+    if (out.rows != B || out.cols != table.cols || out.dtype != table.dtype) {
+        out.resize(B, table.cols, table.dtype);
+    }
+    if (B == 0 || table.cols == 0) return;
+    if (!d_idx) fail(op, "null index pointer");
+    NSUInteger ofs = 0;
+    metal_impl::pool_require(d_idx, ofs, op, "indices");
+    const Tensor idx = Tensor::view(table.device, const_cast<int32_t*>(d_idx), B, 1, Dtype::INT32);
+    metal::gather_rows(table, idx, out);
+}
+
+void embedding_lookup_backward(const Tensor& dOut, const int32_t* d_idx, int B, Tensor& dTable) {
+    constexpr const char* op = "embedding_lookup_backward";
+    need_float(dTable, op, "dTable");
+    if (dOut.dtype != dTable.dtype) fail(op, "dOut/dTable dtype must match");
+    const int D = dTable.cols;
+    if (B <= 0 || D == 0) return;
+    if (dOut.size() < static_cast<long long>(B) * D) fail(op, "dOut is smaller than B x D");
+    NSUInteger ofs = 0;
+    metal_impl::pool_require(d_idx, ofs, op, "indices");
+    scatter_add(d_idx, dTable.device, B, dTable.rows, D, dOut.data, dTable.data, dTable.dtype, op);
+}
+
+void scatter_rows_add(const Tensor& dY, const Tensor& Idx, int R, Tensor& dX) {
+    constexpr const char* op = "scatter_rows_add";
+    need_float(dY, op, "dY");
+    if (Idx.dtype != Dtype::INT32) fail(op, "Idx must be INT32");
+    if (Idx.cols != 1) fail(op, "Idx must be shaped (M, 1)");
+    if (R < 0) fail(op, "R must be >= 0");
+    const int M = Idx.rows;
+    if (dY.rows != M) fail(op, "dY.rows must equal Idx.rows");
+    const int C = dY.cols;
+    if (dX.data == nullptr) dX.device = dY.device;
+    if (dX.rows != R || dX.cols != C || dX.dtype != dY.dtype) dX.resize(R, C, dY.dtype);
+    if (R == 0 || C == 0) return;
+    dX.zero();
+    scatter_add(Idx.data, dY.device, M, R, C, dY.data, dX.data, dY.dtype, op);
+}
+
+}  // namespace brotensor::detail::metal

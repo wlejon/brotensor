@@ -473,7 +473,7 @@ endif()
 # --- brotensor_metal: Metal backend (optional) ---
 
 if(BROTENSOR_WITH_METAL)
-    add_library(brotensor_metal STATIC
+    set(_BROTENSOR_METAL_SRCS
         src/metal/runtime.mm
         src/metal/tensor.mm
         src/metal/kernels.mm
@@ -501,23 +501,19 @@ if(BROTENSOR_WITH_METAL)
         src/metal/conv3d.mm
         src/metal/group_norm.mm
         src/metal/resample.mm
-        src/metal/interp2d.mm
+        src/metal/resample_bwd.mm
+        src/metal/diffusion.mm
         src/metal/cross_attention.mm
         src/metal/cross_attention_with_attn.mm
         src/metal/attention_moments.mm
         src/metal/flash_attention.mm
         src/metal/flash_attention_backward.mm
         src/metal/resblock.mm
-        src/metal/transpose.mm
         src/metal/matmul.mm
         src/metal/matmul_backward.mm
         src/metal/rope.mm
         src/metal/kv_cache.mm
         src/metal/public_reductions.mm
-        src/metal/ddim_step.mm
-        src/metal/euler_step.mm
-        src/metal/dpmpp_2m_step.mm
-        src/metal/timestep_embedding.mm
         src/metal/int8_quant.mm
         src/metal/self_attention_bias.mm
         src/metal/fft.mm
@@ -528,22 +524,10 @@ if(BROTENSOR_WITH_METAL)
         src/metal/resample1d.mm
         src/metal/sample_logits.mm
         src/metal/masked_diffusion.mm
-        src/metal/noise.mm
-        src/metal/l2_normalize.mm
-        src/metal/convex_upsample.mm
-        src/metal/unfold2d.mm
         src/metal/flash_attention_windowed.mm
         src/metal/gated_delta_rule.mm
-        src/metal/spatial_merge.mm
-        src/metal/pad2d.mm
-        src/metal/slice2d.mm
         src/metal/top_k.mm
-        src/metal/pool2d.mm
-        src/metal/gather_rows.mm
         src/metal/conv_transpose2d.mm
-        src/metal/window_partition.mm
-        src/metal/batch_norm.mm
-        src/metal/image_preproc.mm
         src/metal/q4k.mm
         src/metal/q6k.mm
         src/metal/q8_0.mm
@@ -555,87 +539,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/lstm.mm
         src/metal/register.mm
     )
-    set_source_files_properties(
-        src/metal/runtime.mm
-        src/metal/tensor.mm
-        src/metal/kernels.mm
-        src/metal/gemm.mm
-        src/metal/mtl_mir_cache.mm
-        src/metal/elementwise.mm
-        src/metal/fp16_matmul.mm
-        src/metal/gemm_fp32.mm
-        src/metal/linear_ex.mm
-        src/metal/linear_wq.mm
-        src/metal/packed_encoder.mm
-        src/metal/xavier_init.mm
-        src/metal/layernorm.mm
-        src/metal/attention.mm
-        src/metal/mha.mm
-        src/metal/optim.mm
-        src/metal/adam.mm
-        src/metal/reduce.mm
-        src/metal/loss.mm
-        src/metal/embedding.mm
-        src/metal/concat.mm
-        src/metal/batched_ops.mm
-        src/metal/conv2d.mm
-        src/metal/conv2d_wmma.mm
-        src/metal/conv3d.mm
-        src/metal/group_norm.mm
-        src/metal/resample.mm
-        src/metal/interp2d.mm
-        src/metal/cross_attention.mm
-        src/metal/cross_attention_with_attn.mm
-        src/metal/attention_moments.mm
-        src/metal/flash_attention.mm
-        src/metal/flash_attention_backward.mm
-        src/metal/resblock.mm
-        src/metal/transpose.mm
-        src/metal/matmul.mm
-        src/metal/matmul_backward.mm
-        src/metal/rope.mm
-        src/metal/kv_cache.mm
-        src/metal/public_reductions.mm
-        src/metal/ddim_step.mm
-        src/metal/euler_step.mm
-        src/metal/dpmpp_2m_step.mm
-        src/metal/timestep_embedding.mm
-        src/metal/int8_quant.mm
-        src/metal/self_attention_bias.mm
-        src/metal/fft.mm
-        src/metal/stft.mm
-        src/metal/conv1d.mm
-        src/metal/vocoder_activations.mm
-        src/metal/codec_quant.mm
-        src/metal/resample1d.mm
-        src/metal/sample_logits.mm
-        src/metal/masked_diffusion.mm
-        src/metal/noise.mm
-        src/metal/l2_normalize.mm
-        src/metal/convex_upsample.mm
-        src/metal/unfold2d.mm
-        src/metal/flash_attention_windowed.mm
-        src/metal/gated_delta_rule.mm
-        src/metal/spatial_merge.mm
-        src/metal/pad2d.mm
-        src/metal/slice2d.mm
-        src/metal/top_k.mm
-        src/metal/pool2d.mm
-        src/metal/gather_rows.mm
-        src/metal/conv_transpose2d.mm
-        src/metal/window_partition.mm
-        src/metal/batch_norm.mm
-        src/metal/image_preproc.mm
-        src/metal/q4k.mm
-        src/metal/q6k.mm
-        src/metal/q8_0.mm
-        src/metal/bias_act.mm
-        src/metal/upfirdn2d.mm
-        src/metal/filtered_lrelu.mm
-        src/metal/modulated_conv2d.mm
-        src/metal/deform_conv2d.mm
-        src/metal/lstm.mm
-        src/metal/register.mm
+    add_library(brotensor_metal STATIC ${_BROTENSOR_METAL_SRCS})
+    set_source_files_properties(${_BROTENSOR_METAL_SRCS}
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"
             LANGUAGE OBJCXX
