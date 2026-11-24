@@ -500,7 +500,23 @@ Replaced 2 GLSL shaders / 4 variants (`audio.comp` `332`L, `dft.comp` `210`L; `6
 - **LOC Delta (Vulkan Wave 7):**
   - `src/vulkan/shaders/*`: `5,125 -> 4,579` (**`-546` lines**; cumulative **`-3,656` lines** / 30 `.comp` files / 84 variants deleted across Waves 1–7, `140 -> 56` compiled Vulkan shaders)
   - Shared backend-neutral `src/kernels/*`: `6,234` lines across 43 files (`+982` lines in Wave 7, max file `591` lines)
-  - Pending cross-backend targets against `mir_audio` / `mir_spectral`: Mac Metal Wave 7 & Windows CUDA Wave 7.
+  - Wave 7 Metal consolidation completed below (`-1,850` net Metal LOC); pending cross-backend target: Windows CUDA Wave 7.
+
+---
+
+## Wave 7 (Metal / Apple M2 Pro): Audio & Spectral Ops -> Single-Source Brass MIR
+
+Extended Metal's runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`, `220` / `710` LOC) with `MirKind::{Audio, Spectral}` (`build_audio_mir` with `aux0 = flags & 0x0f`, `aux1 = (flags & 0x10) != 0`; `build_spectral_mir` with `aux0 = flags & 0x03`, `aux1 = (flags & 0x04) != 0`, `aux2 = (flags & 0x08) != 0`), wired all 15 audio/codec ops (`conv_transpose1d_{forward,backward_input,backward_weight,backward_bias}`, `causal_conv1d_update`, `pad1d_{forward,backward}`, `snake_{forward,backward}`, `resample1d_{forward,backward}`, `vq_encode_{forward,backward}`, `fsq_quantize_{forward,backward}`) in `src/metal/audio.mm` (`457` LOC) and all 16 spectral ops (`complex_{mul,mul_backward,abs,abs_backward,angle,from_polar}`, `fft`, `ifft`, `rfft`, `irfft`, `rfft_backward`, `irfft_backward`, `stft`, `stft_backward`, `istft`, `istft_backward`) in `src/metal/spectral.mm` (`449` LOC) onto `src/kernels/{mir_audio,mir_spectral}` + Metal's simdgroup GEMM (`launch_matmul_abt_mixed`), guarded `conv2d.mm`'s FP16 WMMA fast path with `groups == 1`, and deleted all 6 replaced hand-written MSL `.mm` files.
+
+### Wave 7 Metal Verification & LOC Delta
+- **Parity & Full `ctest` Suite (Apple M2 Pro, Metal Release, `brass` `d5608f4`):**
+  - Targeted Wave 7 suites (`conv1d`, `conv1d_parity`, `vocoder_activations`, `vocoder_parity`, `resample1d`, `resample1d_parity`, `codec_quant`, `codec_quant_parity`, `fft`, `fft_parity`, `stft`, `stft_parity`, `gpu_mir_emit`): **13/13 passed** (`12.37 s`, `0` failures).
+  - Full Metal `ctest` (`-LE gcstress -j2 --timeout 300`): **190/190 passed** (`360.43 s`, `0` failures; `backward_shader_audit` `64.23–65.13 s`).
+- **LOC Delta (Metal Wave 7):**
+  - Deleted 6 files (`-2,770` lines): `conv1d.mm` (`-668`), `vocoder_activations.mm` (`-301`), `resample1d.mm` (`-229`), `codec_quant.mm` (`-286`), `fft.mm` (`-598`), `stft.mm` (`-688`).
+  - Added / extended files (all `< 720` LOC): `audio.mm` (`457`), `spectral.mm` (`449`), `mtl_mir_cache.{h,mm}` (`220` / `710`, `+14`), `conv2d.mm` (`+1/-1`).
+  - **Net Metal LOC delta (Wave 7):** **`-1,850` net Metal LOC** (`src/metal/` `24,268 -> 22,418` LOC; **cumulative Waves 1–7: `-14,267` net Metal LOC** and 44 Metal files deleted).
+
 
 ---
 

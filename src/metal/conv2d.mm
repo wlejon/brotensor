@@ -232,7 +232,7 @@ void conv2d_forward(const Tensor& X,
 
     // Fast path: tiled simdgroup-matrix implicit-GEMM for FP16 SD1.5 shapes.
     // BF16 uses the naive direct-conv path (no simdgroup fast path for BF16).
-    if (X.dtype == Dtype::FP16) {
+    if (X.dtype == Dtype::FP16 && groups == 1) {
         if (conv2d_wmma_internal::launch_conv2d_implicit_gemm_simdgroup(
                 bx, ox, bw, ow_, bb, ob, bias != nullptr,
                 by, oy,

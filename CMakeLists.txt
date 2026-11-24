@@ -506,12 +506,8 @@ if(BROTENSOR_WITH_METAL)
         src/metal/public_reductions.mm
         src/metal/int8_quant.mm
         src/metal/self_attention_bias.mm
-        src/metal/fft.mm
-        src/metal/stft.mm
-        src/metal/conv1d.mm
-        src/metal/vocoder_activations.mm
-        src/metal/codec_quant.mm
-        src/metal/resample1d.mm
+        src/metal/audio.mm
+        src/metal/spectral.mm
         src/metal/sample_logits.mm
         src/metal/flash_attention_windowed.mm
         src/metal/gated_delta_rule.mm
