@@ -24,6 +24,12 @@ enum class MirKind : std::uint8_t {
     SumCols = 9,
     Norm = 10,
     Rope = 11,
+    FillBytes = 12,
+    Copy2d = 13,
+    Transpose = 14,
+    ScatterAdd = 15,
+    Gnorm = 16,
+    Bnorm = 17,
 };
 
 struct MirKey {
@@ -38,7 +44,6 @@ struct MirKey {
     bool operator==(const MirKey& o) const noexcept = default;
 };
 
-// Compiles on first use (per key) and interns pipelines per device context.
 struct MirKernel {
     const brass::target::SpirvKernel* spv = nullptr;
     JitPipeline pipe{};
@@ -46,14 +51,14 @@ struct MirKernel {
 
 MirKernel mir_kernel(DeviceCtx& d, const MirKey& key);
 
-// Chooses 128-bit (lanes=4 f32 / lanes=8 f16,bf16), 64-bit (lanes=4 f16,bf16),
-// or scalar (lanes=1) based on element count and pointer alignment.
 int mir_vec_lanes(Dtype dt, std::uint32_t n, std::uint64_t a0, std::uint64_t a1 = 0,
                   std::uint64_t a2 = 0, std::uint64_t a3 = 0);
 int mir_vec_lanes_mixed(Dtype dt0, Dtype dt1, std::uint32_t n, std::uint64_t a0, std::uint64_t a1);
 int mir_vec_lanes_norm(Dtype dt_x, Dtype dt_y, Dtype dt_g, std::uint32_t d,
                        std::uint64_t x, std::uint64_t y, std::uint64_t g,
                        std::uint64_t b, std::uint64_t xh, std::uint64_t s0_mask);
+int mir_copy2d_lanes(int elem_bytes, std::uint32_t width, std::uint32_t src_pitch,
+                     std::uint32_t dst_pitch, std::uint64_t src, std::uint64_t dst);
 
 inline std::uint32_t mir_groups_1d(std::uint32_t n_elems, int lanes, std::uint32_t block_x = 256) {
     const std::uint64_t nv = static_cast<std::uint64_t>(n_elems) / static_cast<std::uint64_t>(lanes);
@@ -87,5 +92,29 @@ void mir_dispatch_rope(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
                        std::uint32_t rows, std::uint32_t heads, std::uint32_t hd,
                        std::uint32_t dt, std::uint32_t dh, std::uint32_t dw,
                        std::int32_t offset, float ln_base);
+void mir_dispatch_fill(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                       std::uint64_t dst, std::uint32_t n, std::uint32_t val);
+void mir_dispatch_copy2d(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                         std::uint64_t src, std::uint64_t dst,
+                         std::uint32_t src_pitch, std::uint32_t dst_pitch,
+                         std::uint32_t width, std::uint32_t height);
+void mir_dispatch_transpose(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                            std::uint64_t src, std::uint64_t dst,
+                            std::uint32_t batch, std::uint32_t rows, std::uint32_t cols);
+void mir_dispatch_scatter(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                          std::uint64_t idx, std::uint64_t keys, std::uint64_t keys_out,
+                          std::uint64_t src, std::uint64_t dst,
+                          std::uint32_t m, std::uint32_t r, std::uint32_t c,
+                          std::uint32_t p, std::uint32_t k, std::uint32_t j);
+void mir_dispatch_gnorm(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                        std::uint64_t x, std::uint64_t y, std::uint64_t g, std::uint64_t b,
+                        std::uint64_t part, std::uint64_t rm, std::uint64_t rv,
+                        std::uint32_t tile, std::uint32_t hw, std::uint32_t cpg, std::uint32_t groups,
+                        std::uint32_t splits, std::uint32_t chunk, std::uint32_t total, std::uint32_t c, float eps);
+void mir_dispatch_bnorm(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                        std::uint64_t x, std::uint64_t y, std::uint64_t g, std::uint64_t b,
+                        std::uint64_t rm, std::uint64_t rv, std::uint64_t sm, std::uint64_t sr,
+                        std::uint64_t dy, std::uint64_t dg, std::uint64_t db,
+                        std::uint32_t n, std::uint32_t c, std::uint32_t hw, float eps, float momentum);
 
 }  // namespace brotensor::detail::vulkan

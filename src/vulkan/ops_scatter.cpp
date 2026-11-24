@@ -1,16 +1,11 @@
 // Vulkan scatter-adds: scatter_rows_add (dX = 0, dX[Idx[m], :] += dY[m, :])
 // and embedding_lookup_backward (dTable[idx[b], :] += dOut[b, :]),
-// deterministic (shaders/scatter_add.comp): the (row, m) pairs are bitonic-
-// sorted on the device, then each destination row sums its run of source
-// rows in increasing m, in FP32 from the row's current value, with one
-// rounding into the dtype. No float atomics: VK_EXT_shader_atomic_float would
-// make the sum order (and the 16-bit results) vary from run to run, and
-// FP32 now matches the CPU reference bit for bit. Contracts follow CUDA
-// (src/cuda/gather_scatter.cu, embedding.cu): FP32 / FP16 / BF16, the
-// destination in the source's dtype; an index outside [0, R) is skipped
-// (a device fault would lose the device).
+// deterministic (src/kernels/mir_scatter.cpp): (row, m) pairs are bitonic-
+// sorted on the device, then each destination row sums its run in increasing m
+// in FP32 with one rounding into `dt`. Out-of-range indices are skipped.
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -26,16 +21,10 @@ using ::brotensor::Tensor;
 
 namespace {
 
-struct SaPush {
-    std::uint64_t idx, keys, keys_out, src, dst;
-    std::uint32_t m, r, c, p, k, j;
-};
-
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
 }
 
-// dst(R, C)[idx[m], :] += src(M, C)[m, :] in `dt`.
 void scatter_add(DeviceCtx& d, std::uint64_t idx, int M, int R, int C, std::uint64_t src, std::uint64_t dst, Dtype dt,
                  const char* op) {
     if (M <= 0 || R <= 0 || C <= 0) return;
@@ -46,28 +35,34 @@ void scatter_add(DeviceCtx& d, std::uint64_t idx, int M, int R, int C, std::uint
     while (P < static_cast<std::uint32_t>(M)) P <<= 1;
     Tensor keys = Tensor::empty_on(::brotensor::Device::vulkan(d.index()), static_cast<int>(P), 2, Dtype::FP32);
     Tensor keys2;
-    const ShaderId id = dt_variant(ShaderId::scatter_add_f32, dt, op);
-    SaPush pc{idx, addr(keys.data), 0, src, dst, static_cast<std::uint32_t>(M), static_cast<std::uint32_t>(R),
-              static_cast<std::uint32_t>(C), P, 0, 0};
-    const Kernel& kk = d.pipelines().get(id, {std::uint32_t(SA_KEYS)});
-    launch(d, kk, pc, groups_1d(P, kk));
+    std::uint64_t keys_a = addr(keys.data);
+    std::uint64_t keys_b = 0;
+    const std::uint32_t m = static_cast<std::uint32_t>(M);
+    const std::uint32_t r = static_cast<std::uint32_t>(R);
+    const std::uint32_t c = static_cast<std::uint32_t>(C);
+
+    const MirKernel mk_keys = mir_kernel(d, {MirKind::ScatterAdd, static_cast<std::uint32_t>(SA_KEYS), dt});
+    mir_dispatch_scatter(d, mk_keys, mir_groups_1d(P, 1), 1, idx, keys_a, keys_b, src, dst, m, r, c, P, 0, 0);
+
     if (P <= 512) {
-        launch(d, d.pipelines().get(id, {std::uint32_t(SA_LOCAL)}), pc, 1);
+        const MirKernel mk_local = mir_kernel(d, {MirKind::ScatterAdd, static_cast<std::uint32_t>(SA_LOCAL), dt});
+        mir_dispatch_scatter(d, mk_local, 1, 1, idx, keys_a, keys_b, src, dst, m, r, c, P, 0, 0);
     } else {
         keys2 = Tensor::empty_on(::brotensor::Device::vulkan(d.index()), static_cast<int>(P), 2, Dtype::FP32);
-        pc.keys_out = addr(keys2.data);
-        const Kernel& ks = d.pipelines().get(id, {std::uint32_t(SA_STEP)});
+        keys_b = addr(keys2.data);
+        const MirKernel mk_step = mir_kernel(d, {MirKind::ScatterAdd, static_cast<std::uint32_t>(SA_STEP), dt});
+        const std::uint32_t gs = mir_groups_1d(P, 1);
         for (std::uint32_t k = 2; k <= P; k <<= 1) {
             for (std::uint32_t j = k >> 1; j > 0; j >>= 1) {
-                pc.k = k;
-                pc.j = j;
-                launch(d, ks, pc, groups_1d(P, ks));
-                std::swap(pc.keys, pc.keys_out);
+                mir_dispatch_scatter(d, mk_step, gs, 1, idx, keys_a, keys_b, src, dst, m, r, c, P, k, j);
+                std::swap(keys_a, keys_b);
             }
         }
     }
     const std::uint32_t gx = static_cast<std::uint32_t>((C + 255) / 256);
-    launch(d, d.pipelines().get(id, {std::uint32_t(SA_SUM)}), pc, gx, static_cast<std::uint32_t>(std::min(M, 65535)));
+    const std::uint32_t gy = static_cast<std::uint32_t>(std::min(M, 65535));
+    const MirKernel mk_sum = mir_kernel(d, {MirKind::ScatterAdd, static_cast<std::uint32_t>(SA_SUM), dt});
+    mir_dispatch_scatter(d, mk_sum, gx, gy, idx, keys_a, keys_b, src, dst, m, r, c, P, 0, 0);
 }
 
 void need_float(const Tensor& t, const char* op, const char* what) {

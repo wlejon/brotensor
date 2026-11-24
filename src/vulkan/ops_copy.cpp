@@ -38,9 +38,6 @@ std::size_t elem_bytes(Dtype dt, const char* op) {
     return static_cast<std::size_t>(e);
 }
 
-struct Copy2dPush { std::uint64_t src, dst; std::uint32_t src_pitch, dst_pitch, width, height; };
-struct TransposePush { std::uint64_t src, dst; std::uint32_t batch, rows, cols; };
-
 // out[b][c][r] = in[b][r][c] for in of shape (batch, rows, cols).
 void transpose(const char* op, const Tensor& X, Tensor& Y, int batch, int rows, int cols) {
     const std::size_t es = elem_bytes(X.dtype, op);
@@ -52,13 +49,14 @@ void transpose(const char* op, const Tensor& X, Tensor& Y, int batch, int rows, 
         throw std::runtime_error(std::string("brotensor: ") + op + ": X is smaller than N*C*H*W");
     }
     DeviceCtx& d = device_of(X);
-    const Kernel& k = d.pipelines().get(es == 4 ? ShaderId::transpose_b4 : ShaderId::transpose_b2);
-    const TransposePush pc{addr(X.data), addr(Y.data), static_cast<std::uint32_t>(batch),
-                           static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(cols)};
-    const std::uint32_t gx = std::min<std::uint32_t>((pc.cols + 31) / 32, 65535);
-    const std::uint32_t gy = std::min<std::uint32_t>((pc.rows + 31) / 32, 65535);
-    const std::uint32_t gz = std::min<std::uint32_t>(pc.batch, 65535);
-    launch(d, k, pc, gx, gy, gz);
+    const MirKernel mk = mir_kernel(d, {MirKind::Transpose, static_cast<std::uint32_t>(es)});
+    const std::uint32_t ub = static_cast<std::uint32_t>(batch);
+    const std::uint32_t ur = static_cast<std::uint32_t>(rows);
+    const std::uint32_t uc = static_cast<std::uint32_t>(cols);
+    const std::uint32_t gx = std::min<std::uint32_t>((uc + 31) / 32, 65535);
+    const std::uint32_t gy = std::min<std::uint32_t>((ur + 31) / 32, 65535);
+    const std::uint32_t gz = std::min<std::uint32_t>(ub, 65535);
+    mir_dispatch_transpose(d, mk, gx, gy, gz, addr(X.data), addr(Y.data), ub, ur, uc);
 }
 
 }  // namespace
@@ -107,12 +105,16 @@ void copy_d2d_strided(const Tensor& src, int src_off, int src_pitch, Tensor& dst
     d.allocator().resolve(d0, span_d);
     std::uint32_t mult = 1;
     if (e == 8) { mult = 2; e = 4; }   // F64 moves as pairs of 32-bit words
-    const ShaderId id = e == 4 ? ShaderId::copy2d_b4 : (e == 2 ? ShaderId::copy2d_b2 : ShaderId::copy2d_b1);
-    const Kernel& k = d.pipelines().get(id);
-    const Copy2dPush pc{s0, d0, static_cast<std::uint32_t>(src_pitch) * mult,
-                        static_cast<std::uint32_t>(dst_pitch) * mult,
-                        static_cast<std::uint32_t>(width) * mult, static_cast<std::uint32_t>(height)};
-    launch(d, k, pc, groups_1d(pc.width, k, 64), std::min<std::uint32_t>(pc.height, 65535));
+    const std::uint32_t sp = static_cast<std::uint32_t>(src_pitch) * mult;
+    const std::uint32_t dp = static_cast<std::uint32_t>(dst_pitch) * mult;
+    const std::uint32_t w = static_cast<std::uint32_t>(width) * mult;
+    const std::uint32_t h = static_cast<std::uint32_t>(height);
+    const int lanes = mir_copy2d_lanes(static_cast<int>(e), w, sp, dp, s0, d0);
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::Copy2d, static_cast<std::uint32_t>(e), Dtype::FP32, Dtype::FP32, static_cast<std::uint8_t>(lanes)});
+    const std::uint32_t nv = w / static_cast<std::uint32_t>(lanes);
+    const std::uint32_t gx = std::max<std::uint32_t>(1u, std::min<std::uint32_t>((nv + 255u) / 256u, 64u));
+    mir_dispatch_copy2d(d, mk, gx, std::min<std::uint32_t>(h, 65535u), s0, d0, sp, dp, w, h);
 }
 
 void concat_rows(const std::vector<const Tensor*>& parts, Tensor& out) {

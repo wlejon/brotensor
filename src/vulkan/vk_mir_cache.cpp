@@ -1,9 +1,12 @@
 #include "vk_mir_cache.h"
 
+#include "../kernels/mir_copy.h"
 #include "../kernels/mir_elementwise.h"
+#include "../kernels/mir_gnorm.h"
 #include "../kernels/mir_norm.h"
 #include "../kernels/mir_reduce.h"
 #include "../kernels/mir_rope.h"
+#include "../kernels/mir_scatter.h"
 
 #include <brass/mir/module.hpp>
 #include <brass/target/spirv_target.hpp>
@@ -39,6 +42,10 @@ MirCache& mir_cache() {
     return *c;
 }
 
+std::uint32_t block_for(MirKind kind) {
+    return (kind == MirKind::FillBytes) ? kernels::kFillBlock : kernels::kEwBlock;
+}
+
 const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
     brass::Module mod("vk_mir");
     brass::Function* fn = nullptr;
@@ -57,13 +64,17 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
             fn = kernels::build_norm_mir(
                 mod, k.op, k.dt0, k.dt1, k.dt2, kernels::NormMirFlags::unpack(k.flags), k.lanes);
             break;
-        case MirKind::Rope:
-            fn = kernels::build_rope_mir(mod, k.op, k.flags != 0, k.dt0);
-            break;
+        case MirKind::Rope:       fn = kernels::build_rope_mir(mod, k.op, k.flags != 0, k.dt0); break;
+        case MirKind::FillBytes:  fn = kernels::build_fill_bytes_mir(mod); break;
+        case MirKind::Copy2d:     fn = kernels::build_copy2d_mir(mod, static_cast<int>(k.op), k.lanes); break;
+        case MirKind::Transpose:  fn = kernels::build_transpose_mir(mod, static_cast<int>(k.op)); break;
+        case MirKind::ScatterAdd: fn = kernels::build_scatter_add_mir(mod, k.op, k.dt0); break;
+        case MirKind::Gnorm:      fn = kernels::build_gnorm_mir(mod, k.op, k.dt0, k.flags != 0, k.lanes); break;
+        case MirKind::Bnorm:      fn = kernels::build_bnorm_mir(mod, k.op); break;
     }
     brass::target::SpirvOptions opts;
     opts.stage = brass::target::SpirvStage::Compute;
-    opts.local_size_x = kernels::kEwBlock;
+    opts.local_size_x = block_for(k.kind);
     opts.local_size_spec_constants = true;
     auto spv = std::make_unique<brass::target::SpirvKernel>(brass::target::SpirvTarget::compile(*fn, opts));
     MirCache& cache = mir_cache();
@@ -94,15 +105,13 @@ MirKernel mir_kernel(DeviceCtx& d, const MirKey& key) {
         if (auto it = cache.map.find(key); it != cache.map.end()) spv = it->second.get();
     }
     if (!spv) spv = compile_mir(key);
-    return MirKernel{spv, jit_pipeline(d, *spv, kernels::kEwBlock)};
+    return MirKernel{spv, jit_pipeline(d, *spv, block_for(key.kind))};
 }
 
 int mir_vec_lanes(Dtype dt, std::uint32_t n, std::uint64_t a0, std::uint64_t a1,
                   std::uint64_t a2, std::uint64_t a3) {
     const std::uint64_t m = a0 | a1 | a2 | a3;
-    if (dt == Dtype::FP32) {
-        return (n % 4u == 0u && (m % 16u == 0u)) ? 4 : 1;
-    }
+    if (dt == Dtype::FP32) return (n % 4u == 0u && (m % 16u == 0u)) ? 4 : 1;
     if (n % 8u == 0u && (m % 16u == 0u)) return 8;
     if (n % 4u == 0u && (m % 8u == 0u)) return 4;
     return 1;
@@ -134,6 +143,15 @@ int mir_vec_lanes_norm(Dtype dt_x, Dtype dt_y, Dtype dt_g, std::uint32_t d,
             return l;
         }
     }
+    return 1;
+}
+
+int mir_copy2d_lanes(int elem_bytes, std::uint32_t width, std::uint32_t src_pitch,
+                     std::uint32_t dst_pitch, std::uint64_t src, std::uint64_t dst) {
+    const std::uint32_t u = width | src_pitch | dst_pitch;
+    if (((src | dst) % 16u) != 0u) return 1;
+    if (elem_bytes == 4 && (u % 4u == 0u)) return 4;
+    if (elem_bytes == 2 && (u % 8u == 0u)) return 8;
     return 1;
 }
 
@@ -259,6 +277,111 @@ void mir_dispatch_rope(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
     put_param(buf, *mk.spv, 16, static_cast<std::int32_t>(dw));
     put_param(buf, *mk.spv, 17, offset);
     put_param(buf, *mk.spv, 18, ln_base);
+    jit_dispatch(d, mk.pipe, buf.data(), gx);
+}
+
+void mir_dispatch_fill(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                       std::uint64_t dst, std::uint32_t n, std::uint32_t val) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, dst);
+    put_param(buf, *mk.spv, 1, static_cast<std::int32_t>(n));
+    put_param(buf, *mk.spv, 2, static_cast<std::int32_t>(val));
+    jit_dispatch(d, mk.pipe, buf.data(), gx);
+}
+
+void mir_dispatch_copy2d(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                         std::uint64_t src, std::uint64_t dst,
+                         std::uint32_t src_pitch, std::uint32_t dst_pitch,
+                         std::uint32_t width, std::uint32_t height) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, src);
+    put_param(buf, *mk.spv, 1, dst);
+    put_param(buf, *mk.spv, 2, static_cast<std::int32_t>(src_pitch));
+    put_param(buf, *mk.spv, 3, static_cast<std::int32_t>(dst_pitch));
+    put_param(buf, *mk.spv, 4, static_cast<std::int32_t>(width));
+    put_param(buf, *mk.spv, 5, static_cast<std::int32_t>(height));
+    jit_dispatch(d, mk.pipe, buf.data(), gx, gy);
+}
+
+void mir_dispatch_transpose(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                            std::uint64_t src, std::uint64_t dst,
+                            std::uint32_t batch, std::uint32_t rows, std::uint32_t cols) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, src);
+    put_param(buf, *mk.spv, 1, dst);
+    put_param(buf, *mk.spv, 2, static_cast<std::int32_t>(batch));
+    put_param(buf, *mk.spv, 3, static_cast<std::int32_t>(rows));
+    put_param(buf, *mk.spv, 4, static_cast<std::int32_t>(cols));
+    jit_dispatch(d, mk.pipe, buf.data(), gx, gy, gz);
+}
+
+void mir_dispatch_scatter(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                          std::uint64_t idx, std::uint64_t keys, std::uint64_t keys_out,
+                          std::uint64_t src, std::uint64_t dst,
+                          std::uint32_t m, std::uint32_t r, std::uint32_t c,
+                          std::uint32_t p, std::uint32_t k, std::uint32_t j) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, idx);
+    put_param(buf, *mk.spv, 1, keys);
+    put_param(buf, *mk.spv, 2, keys_out);
+    put_param(buf, *mk.spv, 3, src);
+    put_param(buf, *mk.spv, 4, dst);
+    put_param(buf, *mk.spv, 5, static_cast<std::int32_t>(m));
+    put_param(buf, *mk.spv, 6, static_cast<std::int32_t>(r));
+    put_param(buf, *mk.spv, 7, static_cast<std::int32_t>(c));
+    put_param(buf, *mk.spv, 8, static_cast<std::int32_t>(p));
+    put_param(buf, *mk.spv, 9, static_cast<std::int32_t>(k));
+    put_param(buf, *mk.spv, 10, static_cast<std::int32_t>(j));
+    jit_dispatch(d, mk.pipe, buf.data(), gx, gy);
+}
+
+void mir_dispatch_gnorm(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                        std::uint64_t x, std::uint64_t y, std::uint64_t g, std::uint64_t b,
+                        std::uint64_t part, std::uint64_t rm, std::uint64_t rv,
+                        std::uint32_t tile, std::uint32_t hw, std::uint32_t cpg, std::uint32_t groups,
+                        std::uint32_t splits, std::uint32_t chunk, std::uint32_t total, std::uint32_t c, float eps) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, x);
+    put_param(buf, *mk.spv, 1, y);
+    put_param(buf, *mk.spv, 2, g);
+    put_param(buf, *mk.spv, 3, b);
+    put_param(buf, *mk.spv, 4, part);
+    put_param(buf, *mk.spv, 5, rm);
+    put_param(buf, *mk.spv, 6, rv);
+    put_param(buf, *mk.spv, 7, static_cast<std::int32_t>(tile));
+    put_param(buf, *mk.spv, 8, static_cast<std::int32_t>(hw));
+    put_param(buf, *mk.spv, 9, static_cast<std::int32_t>(cpg));
+    put_param(buf, *mk.spv, 10, static_cast<std::int32_t>(groups));
+    put_param(buf, *mk.spv, 11, static_cast<std::int32_t>(splits));
+    put_param(buf, *mk.spv, 12, static_cast<std::int32_t>(chunk));
+    put_param(buf, *mk.spv, 13, static_cast<std::int32_t>(total));
+    put_param(buf, *mk.spv, 14, static_cast<std::int32_t>(c));
+    put_param(buf, *mk.spv, 15, eps);
+    jit_dispatch(d, mk.pipe, buf.data(), gx, gy);
+}
+
+void mir_dispatch_bnorm(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                        std::uint64_t x, std::uint64_t y, std::uint64_t g, std::uint64_t b,
+                        std::uint64_t rm, std::uint64_t rv, std::uint64_t sm, std::uint64_t sr,
+                        std::uint64_t dy, std::uint64_t dg, std::uint64_t db,
+                        std::uint32_t n, std::uint32_t c, std::uint32_t hw, float eps, float momentum) {
+    std::array<std::uint8_t, 128> buf{};
+    put_param(buf, *mk.spv, 0, x);
+    put_param(buf, *mk.spv, 1, y);
+    put_param(buf, *mk.spv, 2, g);
+    put_param(buf, *mk.spv, 3, b);
+    put_param(buf, *mk.spv, 4, rm);
+    put_param(buf, *mk.spv, 5, rv);
+    put_param(buf, *mk.spv, 6, sm);
+    put_param(buf, *mk.spv, 7, sr);
+    put_param(buf, *mk.spv, 8, dy);
+    put_param(buf, *mk.spv, 9, dg);
+    put_param(buf, *mk.spv, 10, db);
+    put_param(buf, *mk.spv, 11, static_cast<std::int32_t>(n));
+    put_param(buf, *mk.spv, 12, static_cast<std::int32_t>(c));
+    put_param(buf, *mk.spv, 13, static_cast<std::int32_t>(hw));
+    put_param(buf, *mk.spv, 14, eps);
+    put_param(buf, *mk.spv, 15, momentum);
     jit_dispatch(d, mk.pipe, buf.data(), gx);
 }
 

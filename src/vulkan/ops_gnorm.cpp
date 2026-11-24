@@ -1,15 +1,12 @@
-// Vulkan NCHW normalisations: GroupNorm forward (split statistics + apply,
-// shaders/gnorm.comp) and backward (the same statistics, per-channel sums,
-// dX, then dGamma / dBeta summed over the batch: no atomics; dX overwritten,
-// dGamma / dBeta accumulated), BatchNorm inference with running statistics, the
-// per-pixel L2 normalise over channels, and training-mode BatchNorm forward /
-// backward (FP32, shaders/bnorm.comp). Contracts follow the CUDA backend
-// (src/cuda/group_norm.cu, batch_norm.cu, l2_normalize.cu): FP32 / FP16 /
-// BF16 with gamma / beta / running statistics in X's dtype, Y resized to X's
-// shape and dtype and overwritten.
+// Vulkan NCHW normalisations: GroupNorm forward (split statistics + apply)
+// and backward (stats, per-channel sums, dX, dGamma / dBeta summed over
+// the batch: no atomics; dX overwritten, dGamma / dBeta accumulated), BatchNorm
+// inference with running statistics, per-pixel L2 normalise over channels, and
+// training-mode BatchNorm forward / backward (FP32). Kernels: src/kernels/mir_gnorm.cpp.
 
 #include "detail/kernels.h"
 #include "detail/spatial.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -24,12 +21,6 @@ using ::brotensor::Dtype;
 using ::brotensor::Tensor;
 
 namespace {
-
-struct GnPush {
-    std::uint64_t x, y, g, b, part, rm, rv;
-    std::uint32_t tile, hw, cpg, groups, splits, chunk, total, c;
-    float eps;
-};
 
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
@@ -46,26 +37,41 @@ void check_param(const char* op, const Tensor& t, int C, Dtype dt, const char* n
     if (t.size() != C) fail(op, std::string(name) + " must have C elements");
 }
 
-}  // namespace
+struct GnArgs {
+    std::uint64_t x = 0, y = 0, g = 0, b = 0, part = 0, rm = 0, rv = 0;
+    std::uint32_t tile = 0, hw = 0, cpg = 0, groups = 0, splits = 0, chunk = 0, total = 0, c = 0;
+    float eps = 0.0f;
+};
 
-namespace {
+void dispatch_gn(DeviceCtx& d, std::uint32_t mode, Dtype dt, bool silu, int lanes,
+                 std::uint32_t gx, std::uint32_t gy, const GnArgs& a) {
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::Gnorm, mode, dt, dt, static_cast<std::uint8_t>(lanes), Dtype::FP32,
+            static_cast<std::uint8_t>(silu ? 1u : 0u)});
+    mir_dispatch_gnorm(d, mk, gx, gy, a.x, a.y, a.g, a.b, a.part, a.rm, a.rv,
+                       a.tile, a.hw, a.cpg, a.groups, a.splits, a.chunk, a.total, a.c, a.eps);
+}
 
-// GN_STATS over x's (n, group) tiles into `part`; returns the push block the
-// later passes share.
-GnPush gn_stats(DeviceCtx& d, std::uint64_t x, Dtype dt, int n, int c, int hw, int groups, float eps, Tensor& part,
+int gn_vec4_lanes(Dtype dt, std::uint32_t hw, std::uint32_t chunk, std::uint64_t x, std::uint64_t y = 0) {
+    const std::uint64_t req = (dt == Dtype::FP32) ? 16u : 8u;
+    if (hw % 4u != 0u || chunk % 4u != 0u) return 1;
+    if ((x % req) != 0u || (y != 0 && (y % req) != 0u)) return 1;
+    return 4;
+}
+
+GnArgs gn_stats(DeviceCtx& d, std::uint64_t x, Dtype dt, int n, int c, int hw, int groups, float eps, Tensor& part,
                 const char* op) {
     const std::uint64_t tiles = std::uint64_t(n) * groups;
     const std::uint64_t tile = std::uint64_t(c / groups) * hw;
     if (tiles > 65535) fail(op, "N * num_groups above 65535");
     if (tile * tiles > 0xffffffffULL) fail(op, "tensor too large");
-    // Chunks of ~8192 elements: enough workgroups that one sample fills the
-    // GPU, and short ones (the partials combine in the apply pass).
     const std::uint64_t splits = std::clamp<std::uint64_t>(cdiv(tile, 8192), 1, 65535);
-    const std::uint64_t chunk = (cdiv(tile, splits) + 3) / 4 * 4;   // whole 4-element groups
+    const std::uint64_t chunk = (cdiv(tile, splits) + 3) / 4 * 4;
     const std::uint64_t used = cdiv(tile, chunk);
     part = Tensor::empty_on(::brotensor::Device::vulkan(d.index()), static_cast<int>(tiles * used * 3), 1, Dtype::FP32);
-    GnPush pc{};
-    pc.x = x; pc.part = addr(part.data);
+    GnArgs pc{};
+    pc.x = x;
+    pc.part = addr(part.data);
     pc.tile = static_cast<std::uint32_t>(tile);
     pc.hw = static_cast<std::uint32_t>(hw);
     pc.cpg = static_cast<std::uint32_t>(c / groups);
@@ -73,11 +79,21 @@ GnPush gn_stats(DeviceCtx& d, std::uint64_t x, Dtype dt, int n, int c, int hw, i
     pc.splits = static_cast<std::uint32_t>(used);
     pc.chunk = static_cast<std::uint32_t>(chunk);
     pc.eps = eps;
-    const ShaderId id = dt_variant(ShaderId::gnorm_f32, dt, op);
-    const std::uint32_t v4 = hw % 4 == 0 && chunk % 4 == 0 && x % 16 == 0 ? 1u : 0u;
-    launch(d, d.pipelines().get(id, {GN_STATS, 0u, v4}), pc, pc.splits, static_cast<std::uint32_t>(tiles));
+    const int lanes = gn_vec4_lanes(dt, pc.hw, pc.chunk, x);
+    dispatch_gn(d, GN_STATS, dt, false, lanes, pc.splits, static_cast<std::uint32_t>(tiles), pc);
     return pc;
 }
+
+void need_f32(const char* op, const Tensor& t, const char* name) {
+    if (t.dtype != Dtype::FP32) fail(op, std::string(name) + " must be FP32");
+}
+
+void ensure_c1(Tensor& t, int C, ::brotensor::Device dev) {
+    if (t.data == nullptr) t.device = dev;
+    if (t.size() != C || t.dtype != Dtype::FP32) t.resize(C, 1, Dtype::FP32);
+}
+
+std::uint32_t bn_groups(int C) { return static_cast<std::uint32_t>(std::min(C, 65535)); }
 
 }  // namespace
 
@@ -87,12 +103,13 @@ void group_norm(DeviceCtx& d, std::uint64_t x, std::uint64_t gamma, std::uint64_
     const std::uint64_t tile = std::uint64_t(c / groups) * hw;
     if (tiles == 0 || tile == 0) return;
     Tensor part;
-    GnPush pc = gn_stats(d, x, dt, n, c, hw, groups, eps, part, "group_norm_forward");
-    pc.y = y; pc.g = gamma; pc.b = beta;
-    const ShaderId id = dt_variant(ShaderId::gnorm_f32, dt, "group_norm_forward");
-    const std::uint32_t v4 = hw % 4 == 0 && pc.chunk % 4 == 0 && x % 16 == 0 && y % 16 == 0 ? 1u : 0u;
+    GnArgs pc = gn_stats(d, x, dt, n, c, hw, groups, eps, part, "group_norm_forward");
+    pc.y = y;
+    pc.g = gamma;
+    pc.b = beta;
+    const int lanes = gn_vec4_lanes(dt, pc.hw, pc.chunk, x, y);
     const std::uint32_t gx = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(cdiv(tile, 256 * 16), 1, 1024));
-    launch(d, d.pipelines().get(id, {GN_APPLY, silu ? 1u : 0u, v4}), pc, gx, static_cast<std::uint32_t>(tiles));
+    dispatch_gn(d, GN_APPLY, dt, silu, lanes, gx, static_cast<std::uint32_t>(tiles), pc);
 }
 
 void group_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta, int N, int C, int H, int W,
@@ -133,21 +150,23 @@ void group_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& dY,
     DeviceCtx& d = device_of(X);
     const int hw = H * W;
     Tensor part;
-    GnPush pc = gn_stats(d, addr(X.data), dt, N, C, hw, num_groups, eps, part, op);
+    GnArgs pc = gn_stats(d, addr(X.data), dt, N, C, hw, num_groups, eps, part, op);
     const ::brotensor::Device dev = ::brotensor::Device::vulkan(d.index());
     Tensor sums = Tensor::empty_on(dev, N * C * 2, 1, Dtype::FP32);
     Tensor stats = Tensor::empty_on(dev, N * num_groups * 2, 1, Dtype::FP32);
-    pc.y = addr(dX.data); pc.g = addr(gamma.data); pc.b = addr(dY.data);
-    pc.rm = addr(sums.data); pc.rv = addr(stats.data);
+    pc.y = addr(dX.data);
+    pc.g = addr(gamma.data);
+    pc.b = addr(dY.data);
+    pc.rm = addr(sums.data);
+    pc.rv = addr(stats.data);
     pc.c = static_cast<std::uint32_t>(C);
     pc.total = static_cast<std::uint32_t>(N);
-    const ShaderId id = dt_variant(ShaderId::gnorm_f32, dt, op);
-    launch(d, d.pipelines().get(id, {GN_BWD_CH, 0u, 0u}), pc, static_cast<std::uint32_t>(C), static_cast<std::uint32_t>(N));
+    dispatch_gn(d, GN_BWD_CH, dt, false, 1, static_cast<std::uint32_t>(C), static_cast<std::uint32_t>(N), pc);
     const std::uint32_t gx = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(cdiv(pc.tile, 256 * 16), 1, 1024));
-    launch(d, d.pipelines().get(id, {GN_BWD_DX, 0u, 0u}), pc, gx, static_cast<std::uint32_t>(N * num_groups));
-    pc.y = addr(dGamma.data); pc.g = addr(dBeta.data);
-    const Kernel& kp = d.pipelines().get(id, {GN_BWD_PARAM, 0u, 0u});
-    launch(d, kp, pc, groups_1d(static_cast<std::uint64_t>(C), kp));
+    dispatch_gn(d, GN_BWD_DX, dt, false, 1, gx, static_cast<std::uint32_t>(N * num_groups), pc);
+    pc.y = addr(dGamma.data);
+    pc.g = addr(dBeta.data);
+    dispatch_gn(d, GN_BWD_PARAM, dt, false, 1, mir_groups_1d(static_cast<std::uint32_t>(C), 1), 1, pc);
 }
 
 void batch_norm_inference(const Tensor& X, const Tensor& gamma, const Tensor& beta, const Tensor& running_mean,
@@ -165,15 +184,14 @@ void batch_norm_inference(const Tensor& X, const Tensor& gamma, const Tensor& be
     if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) Y.resize(N, static_cast<int>(cols), X.dtype);
     if (N == 0 || cols == 0) return;
     DeviceCtx& d = device_of(X);
-    GnPush pc{};
+    GnArgs pc{};
     pc.x = addr(X.data); pc.y = addr(Y.data); pc.g = addr(gamma.data); pc.b = addr(beta.data);
     pc.rm = addr(running_mean.data); pc.rv = addr(running_var.data);
     pc.hw = static_cast<std::uint32_t>(H * W);
     pc.c = static_cast<std::uint32_t>(C);
     pc.total = static_cast<std::uint32_t>(N * cols);
     pc.eps = eps;
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::gnorm_f32, X.dtype, op), {GN_BN_INFER, 0u});
-    launch(d, k, pc, groups_1d(pc.total, k));
+    dispatch_gn(d, GN_BN_INFER, X.dtype, false, 1, mir_groups_1d(pc.total, 1), 1, pc);
 }
 
 void l2_normalize_nchw_forward(const Tensor& X, int N, int C, int H, int W, float eps, Tensor& Y) {
@@ -186,38 +204,15 @@ void l2_normalize_nchw_forward(const Tensor& X, int N, int C, int H, int W, floa
     if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) Y.resize(N, static_cast<int>(cols), X.dtype);
     if (N == 0) return;
     DeviceCtx& d = device_of(X);
-    GnPush pc{};
-    pc.x = addr(X.data); pc.y = addr(Y.data);
+    GnArgs pc{};
+    pc.x = addr(X.data);
+    pc.y = addr(Y.data);
     pc.hw = static_cast<std::uint32_t>(H * W);
     pc.c = static_cast<std::uint32_t>(C);
     pc.total = static_cast<std::uint32_t>(N * H * W);
     pc.eps = eps;
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::gnorm_f32, X.dtype, op), {GN_L2_NCHW, 0u});
-    launch(d, k, pc, groups_1d(pc.total, k));
+    dispatch_gn(d, GN_L2_NCHW, X.dtype, false, 1, mir_groups_1d(pc.total, 1), 1, pc);
 }
-
-// ─── Training-mode BatchNorm (bnorm.comp) ──────────────────────────────────
-
-namespace {
-
-struct BnPush {
-    std::uint64_t x, y, g, b, rm, rv, sm, sr, dy, dg, db;
-    std::uint32_t n, c, hw;
-    float eps, momentum;
-};
-
-void need_f32(const char* op, const Tensor& t, const char* name) {
-    if (t.dtype != Dtype::FP32) fail(op, std::string(name) + " must be FP32");
-}
-
-void ensure_c1(Tensor& t, int C, ::brotensor::Device dev) {
-    if (t.data == nullptr) t.device = dev;
-    if (t.size() != C || t.dtype != Dtype::FP32) t.resize(C, 1, Dtype::FP32);
-}
-
-std::uint32_t bn_groups(int C) { return static_cast<std::uint32_t>(std::min(C, 65535)); }
-
-}  // namespace
 
 void batch_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta, Tensor& running_mean,
                         Tensor& running_var, int N, int C, int H, int W, float eps, float momentum, Tensor& Y,
@@ -238,14 +233,14 @@ void batch_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta
     ensure_c1(saved_rstd, C, X.device);
     if (N == 0 || cols == 0) return;
     DeviceCtx& d = device_of(X);
-    BnPush pc{};
-    pc.x = addr(X.data); pc.y = addr(Y.data); pc.g = addr(gamma.data); pc.b = addr(beta.data);
-    pc.rm = addr(running_mean.data); pc.rv = addr(running_var.data);
-    pc.sm = addr(saved_mean.data); pc.sr = addr(saved_rstd.data);
-    pc.n = static_cast<std::uint32_t>(N); pc.c = static_cast<std::uint32_t>(C);
-    pc.hw = static_cast<std::uint32_t>(H * W);
-    pc.eps = eps; pc.momentum = momentum;
-    launch(d, d.pipelines().get(ShaderId::bnorm, {std::uint32_t(BN_TRAIN_FWD)}), pc, bn_groups(C));
+    const MirKernel mk = mir_kernel(d, {MirKind::Bnorm, static_cast<std::uint32_t>(BN_TRAIN_FWD)});
+    mir_dispatch_bnorm(d, mk, bn_groups(C),
+                       addr(X.data), addr(Y.data), addr(gamma.data), addr(beta.data),
+                       addr(running_mean.data), addr(running_var.data),
+                       addr(saved_mean.data), addr(saved_rstd.data),
+                       0, 0, 0,
+                       static_cast<std::uint32_t>(N), static_cast<std::uint32_t>(C),
+                       static_cast<std::uint32_t>(H * W), eps, momentum);
 }
 
 void batch_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& saved_mean, const Tensor& saved_rstd,
@@ -264,13 +259,13 @@ void batch_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& sav
     if (dX.rows != N || dX.cols != cols || dX.dtype != Dtype::FP32) dX.resize(N, static_cast<int>(cols), Dtype::FP32);
     if (N == 0 || cols == 0) return;
     DeviceCtx& d = device_of(X);
-    BnPush pc{};
-    pc.x = addr(X.data); pc.y = addr(dX.data); pc.g = addr(gamma.data);
-    pc.sm = addr(saved_mean.data); pc.sr = addr(saved_rstd.data); pc.dy = addr(dY.data);
-    pc.dg = addr(dGamma.data); pc.db = addr(dBeta.data);
-    pc.n = static_cast<std::uint32_t>(N); pc.c = static_cast<std::uint32_t>(C);
-    pc.hw = static_cast<std::uint32_t>(H * W);
-    launch(d, d.pipelines().get(ShaderId::bnorm, {std::uint32_t(BN_TRAIN_BWD)}), pc, bn_groups(C));
+    const MirKernel mk = mir_kernel(d, {MirKind::Bnorm, static_cast<std::uint32_t>(BN_TRAIN_BWD)});
+    mir_dispatch_bnorm(d, mk, bn_groups(C),
+                       addr(X.data), addr(dX.data), addr(gamma.data), 0,
+                       0, 0, addr(saved_mean.data), addr(saved_rstd.data),
+                       addr(dY.data), addr(dGamma.data), addr(dBeta.data),
+                       static_cast<std::uint32_t>(N), static_cast<std::uint32_t>(C),
+                       static_cast<std::uint32_t>(H * W), 0.0f, 0.0f);
 }
 
 void fill_vulkan_vtable_gnorm(::brotensor::detail::OpsVTable& v) {

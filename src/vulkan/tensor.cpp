@@ -19,6 +19,7 @@
 #include "detail/device.h"
 #include "detail/kernels.h"
 #include "detail/vk_check.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/runtime.h>
@@ -179,9 +180,9 @@ void vk_memset_zero(void* dst, std::size_t n, int dev) {
     const std::uint64_t hi = std::max<std::uint64_t>((a + n) & ~std::uint64_t(3), lo);
     auto bytes = [&](std::uint64_t from, std::uint64_t to) {
         if (to <= from) return;
-        struct Push { std::uint64_t dst; std::uint32_t n, value; } pc{from, static_cast<std::uint32_t>(to - from), 0};
-        const Kernel& k = d.pipelines().get(ShaderId::fill_bytes);
-        launch(d, k, pc, groups_1d(to - from, k));
+        const std::uint32_t len = static_cast<std::uint32_t>(to - from);
+        const MirKernel mk = mir_kernel(d, {MirKind::FillBytes, 0});
+        mir_dispatch_fill(d, mk, mir_groups_1d(len, 1, 64), from, len, 0);
     };
     bytes(a, lo);
     if (hi > lo) d.stream().fill(s.buf, s.offset + (lo - a), hi - lo, 0u);

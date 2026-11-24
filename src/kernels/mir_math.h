@@ -24,6 +24,7 @@ Value* emit_exp(Ctx& c, Value* x);
 Value* emit_log(Ctx& c, Value* x);
 Value* emit_sin(Ctx& c, Value* x);
 Value* emit_cos(Ctx& c, Value* x);
+Value* emit_sqrt(Ctx& c, Value* x);
 Value* emit_rsqrt(Ctx& c, Value* x);
 
 // High-accuracy math (within ~1 ulp of glibc expf/sinf/cosf across large ranges).

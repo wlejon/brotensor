@@ -20,10 +20,13 @@
 #include "jit/gpu_mir_emit_detail.h"
 #include "jit/trace_dag.h"
 #include "jit/trace_plan.h"
+#include "kernels/mir_copy.h"
 #include "kernels/mir_elementwise.h"
+#include "kernels/mir_gnorm.h"
 #include "kernels/mir_norm.h"
 #include "kernels/mir_reduce.h"
 #include "kernels/mir_rope.h"
+#include "kernels/mir_scatter.h"
 #include "vulkan/shaders/op_codes.h"
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/builder.hpp>
@@ -161,8 +164,8 @@ std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::str
             {6, 0, 7, 4, 16, -1, -1, 1},   // s1: rows floats
         };
     }
-    if (name == "bnorm") {
-        return {
+    if (name == "bnorm" || name == "bnorm_bwd") {
+        std::vector<brass::verify::GpuBufferSpec> specs = {
             {0, 0, 11, 4, 16, 12, 13, 1},  // x: n * c * hw floats
             {1, 0, 11, 4, 16, 12, 13, 1},  // y: n * c * hw floats
             {2, 0, 12, 4, 16, -1, -1, 1},  // g: c
@@ -172,6 +175,12 @@ std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::str
             {6, 0, 12, 4, 16, -1, -1, 1},  // sm: c
             {7, 0, 12, 4, 16, -1, -1, 1},  // sr: c
         };
+        if (name == "bnorm_bwd") {
+            specs.push_back({8, 0, 11, 4, 16, 12, 13, 1});  // dy
+            specs.push_back({9, 0, 12, 4, 16, -1, -1, 1});  // dg
+            specs.push_back({10, 0, 12, 4, 16, -1, -1, 1}); // db
+        }
+        return specs;
     }
     return {};
 }
@@ -206,7 +215,7 @@ std::vector<brass::verify::GpuParamConstraint> param_constraints_for_shader(cons
         name == "norm_col_f32" || name == "norm_col_f16" || name == "norm_col_bf16") {
         return {{7, UINT32_MAX, 1, 0}, {8, UINT32_MAX, 1, 0}};
     }
-    if (name == "bnorm") {
+    if (name == "bnorm" || name == "bnorm_bwd") {
         return {{13, UINT32_MAX, 1, 0}}; // hw >= 1
     }
     return {};
@@ -507,6 +516,51 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
                 return kernels::build_norm_mir(m, mode, dtx, dty, dtg, all_flags, 1);
             });
         }
+        // Wave 3 kernels
+        {
+            brass::target::SpirvOptions fill_opts = spv_opts;
+            fill_opts.local_size_x = kernels::kFillBlock;
+            brass::Module mir_mod("fill_bytes");
+            brass::Function* fn = kernels::build_fill_bytes_mir(mir_mod);
+            brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, fill_opts);
+            report.shaders.push_back(audit_spirv_binary_words("fill_bytes", sk.words.data(), sk.words.size()));
+        }
+        for (const auto& [name, eb] : std::vector<std::pair<const char*, int>>{
+                 {"copy2d_b1", 1}, {"copy2d_b2", 2}, {"copy2d_b4", 4}}) {
+            audit_mir(name, [eb](brass::Module& m) { return kernels::build_copy2d_mir(m, eb, 1); });
+        }
+        for (const auto& [name, eb] : std::vector<std::pair<const char*, int>>{
+                 {"transpose_b2", 2}, {"transpose_b4", 4}}) {
+            audit_mir(name, [eb](brass::Module& m) { return kernels::build_transpose_mir(m, eb); });
+        }
+        for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
+                 {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
+            const std::string sa_name = std::string("scatter_add") + sfx;
+            audit_mir(sa_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_scatter_add_mir(m, SA_SUM, dt);
+            });
+            const std::string gn_name = std::string("gnorm") + sfx;
+            audit_mir(gn_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_gnorm_mir(m, GN_BWD_DX, dt, false, 1);
+            });
+            const std::string gc_name = std::string("gnorm_ch") + sfx;
+            audit_mir(gc_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_gnorm_mir(m, GN_BWD_CH, dt, false, 1);
+            });
+            const std::string gs_name = std::string("gnorm_stats") + sfx;
+            audit_mir(gs_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_gnorm_mir(m, GN_STATS, dt, false, 1);
+            });
+        }
+        audit_mir("scatter_local", [](brass::Module& m) {
+            return kernels::build_scatter_add_mir(m, SA_LOCAL, Dtype::FP32);
+        });
+        audit_mir("bnorm", [](brass::Module& m) {
+            return kernels::build_bnorm_mir(m, BN_TRAIN_FWD);
+        });
+        audit_mir("bnorm_bwd", [](brass::Module& m) {
+            return kernels::build_bnorm_mir(m, BN_TRAIN_BWD);
+        });
     }
 
     // 4. Synthetic negative test if not already covered by ShaderId::test_shared_overflow

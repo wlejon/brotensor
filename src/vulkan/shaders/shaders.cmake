@@ -8,12 +8,6 @@
 # by offsetting from the _f32 id; register.cpp checks the order at start-up.
 
 set(BROTENSOR_VK_SHADERS
-    "copy2d_b1|copy2d.comp|-DES=1"
-    "copy2d_b2|copy2d.comp|-DES=2"
-    "copy2d_b4|copy2d.comp|-DES=4"
-    "transpose_b2|transpose.comp|-DES=2"
-    "transpose_b4|transpose.comp|-DES=4"
-    "fill_bytes|fill_bytes.comp|"
     "gemm_cm_f16|gemm_cm.comp|-DDT=1"
     "gemm_cm_bf16|gemm_cm.comp|-DDT=2"
     "gemm_cm_f16_c32|gemm_cm.comp|-DDT=1 -DDTC=0 -DDTBI=1"
@@ -65,9 +59,6 @@ set(BROTENSOR_VK_SHADERS
     "resample_bf16|resample.comp|-DDT=2"
     "remap_b2|remap.comp|-DES=2"
     "remap_b4|remap.comp|-DES=4"
-    "gnorm_f32|gnorm.comp|-DDT=0"
-    "gnorm_f16|gnorm.comp|-DDT=1"
-    "gnorm_bf16|gnorm.comp|-DDT=2"
     "sampler_f32|sampler.comp|-DDT=0"
     "sampler_f16|sampler.comp|-DDT=1"
     "sampler_bf16|sampler.comp|-DDT=2"
@@ -94,13 +85,9 @@ set(BROTENSOR_VK_SHADERS
     "fa_bwd_bf16|fa_bwd.comp|-DDT=2"
     "fa_bwd_cm_f16|fa_bwd_cm.comp|-DDT=1"
     "fa_bwd_cm_bf16|fa_bwd_cm.comp|-DDT=2"
-    "scatter_add_f32|scatter_add.comp|-DDT=0"
-    "scatter_add_f16|scatter_add.comp|-DDT=1"
-    "scatter_add_bf16|scatter_add.comp|-DDT=2"
     "resample_bwd_f32|resample_bwd.comp|-DDT=0"
     "resample_bwd_f16|resample_bwd.comp|-DDT=1"
     "resample_bwd_bf16|resample_bwd.comp|-DDT=2"
     "lstm|lstm.comp|"
-    "bnorm|bnorm.comp|"
     "test_shared_overflow|test_shared_overflow.comp|"
 )

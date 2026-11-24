@@ -21,6 +21,7 @@ Value* emit_exp(Ctx& c, Value* x) { return c.b.build_call("expf", brass::Type::f
 Value* emit_log(Ctx& c, Value* x) { return c.b.build_call("logf", brass::Type::f32(), {x}); }
 Value* emit_sin(Ctx& c, Value* x) { return c.b.build_call("sinf", brass::Type::f32(), {x}); }
 Value* emit_cos(Ctx& c, Value* x) { return c.b.build_call("cosf", brass::Type::f32(), {x}); }
+Value* emit_sqrt(Ctx& c, Value* x) { return c.b.build_call("sqrtf", brass::Type::f32(), {x}); }
 Value* emit_rsqrt(Ctx& c, Value* x) { return c.b.build_call("rsqrtf", brass::Type::f32(), {x}); }
 Value* emit_round_even(Ctx& c, Value* x) { return c.b.build_round_f32(x); }
 

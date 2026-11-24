@@ -227,4 +227,20 @@ Replaced 5 GLSL shaders / 21 variants (`norm.comp`, `reduce_rows.comp`, `sum_col
   - Deleted 5 GLSL shaders / 21 variants (`norm.comp`, `reduce_rows.comp`, `sum_cols.comp`, `rope.comp`, `rowvec.comp`): `src/vulkan/shaders` `7,830 -> 7,405` (**`-425` lines**; cumulative **`-830` lines** / 11 shaders / 45 variants deleted across Waves 1–2)
   - Shared backend-neutral `src/kernels/*` now `1,445` lines total across Waves 1–2 (`+930` lines in Wave 2); `src/vulkan/vk_mir_cache.{h,cpp}` `356` lines (`+137` lines)
   - Pending Wave 2 cross-backend deletions once Metal & CUDA wire into `src/kernels/{mir_norm,mir_reduce,mir_rope,mir_elementwise}`: `~3,087` Metal lines and `~3,874` CUDA lines (`layernorm*`, `rmsnorm*`, `softmax*`, `rope*`, `public_reductions*`, `reduce*`, `l2_norm*`, `l2_normalize*`)
->>>>>>> 909a869 (feat(kernels,vulkan): replace norm/softmax/reduce/rope/rowvec GLSL shaders with single-source brass MIR (Wave 2))
+
+---
+
+## Wave 3: Vulkan GroupNorm, BatchNorm, Copy2D/Transpose/Fill & Scatter-Add -> Single-Source Brass MIR
+
+Replaced 6 GLSL shaders / 13 variants (`gnorm.comp`, `bnorm.comp`, `copy2d.comp`, `transpose.comp`, `fill_bytes.comp`, `scatter_add.comp`; `95 -> 82` compiled Vulkan shaders) with single-source `brass::Function` MIR builders in `src/kernels/{mir_copy.{h,cpp}, mir_scatter.{h,cpp}, mir_gnorm.{h,cpp}}`, dispatched via `src/vulkan/vk_mir_cache.{h,cpp}` across `ops_gnorm.cpp`, `ops_copy.cpp`, `ops_scatter.cpp`, `ops_quant.cpp`, `ops_conv.cpp`, and `tensor.cpp`. Also updated `brass` (`a370f6c`) to handle `vec2<f16>` `OpFConvert` + `OpBitcast` in `gpu_equiv_spirv.cpp`, fixing `brotensor_test_gpu_mir_emit` `f16` Z3 equivalence.
+
+### Wave 3 Correctness, Proof Audit & LOC Delta
+- **Correctness & Formal Audits:**
+  - `brotensor_test_gpu_mir_emit`: ALL PASSED (including `f32`, `f16`, `bf16` SPIR-V == PTX equivalence + RowNorm)
+  - `brotensor_test_backward_index_proofs`: ALL PASSED (`scatter_add_mir_lifted_spirv_bounds_and_safety` on 3 MIR binaries, `norm_mir_lifted_spirv_bounds_and_barrier_safety` on 16 MIR norm/gnorm/bnorm backward binaries)
+  - `brotensor_test_backward_shader_audit`: **149/149 shaders passed** (`126722` SPIR-V/PTX insts, `5810` shared accesses proven, `2687` global accesses proven, `643` uniform barriers, `752` uniform collectives, `0` failures)
+  - Unit & Parity Suites: `group_norm` (ok), `group_norm_parity` (`18/18`), `batch_norm` (ok), `batch_norm_parity` (`10/10`), `l2_normalize_parity` (`5/5`), `transpose` (ok), `transpose_parity` (`19/19`), `concat_parity` (`13/13`), `concat_extra_parity` (`20/20`), `embedding_parity` (`8/8`), `embedding_extra_parity` (`8/8`), `conv2d_parity` (`47/47`), `linear_wq_parity` (`6/6`), `brotensor_test_vulkan` `--only=ops`, `--only=train`, `--only=quant` (`0` failures)
+- **LOC Delta (Vulkan Wave 3):**
+  - Deleted 6 GLSL shaders / 13 variants (`gnorm.comp`, `bnorm.comp`, `copy2d.comp`, `transpose.comp`, `fill_bytes.comp`, `scatter_add.comp`): `src/vulkan/shaders` `7,405 -> 6,849` (**`-556` lines**; cumulative **`-1,386` lines** / 17 shaders / 58 variants deleted, `140 -> 82` compiled Vulkan shaders)
+  - Shared backend-neutral `src/kernels/*` now `2,217` lines total across Waves 1–3 (`+772` lines in Wave 3, max file `399` lines); `src/vulkan/vk_mir_cache.{h,cpp}` `508` lines (`+152` lines)
+  - Pending Wave 3 cross-backend deletions once Metal & CUDA wire into `src/kernels/{mir_copy,mir_scatter,mir_gnorm}`: `~2,091` Metal lines and `~2,434` CUDA lines (`group_norm*`, `batch_norm*`, `transpose*`, `concat*`, `gather_scatter*`, `embedding*`)

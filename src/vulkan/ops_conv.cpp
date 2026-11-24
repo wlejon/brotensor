@@ -15,6 +15,7 @@
 #include "detail/kernels.h"
 #include "detail/quant.h"
 #include "detail/spatial.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/ops/spatial.h>
@@ -44,12 +45,6 @@ struct DirectPush {
     std::uint32_t kt, kh, kw;
     std::int32_t st, sh, sw, pt, ph, pw, dt, dh, dw;
     std::uint32_t groups;
-};
-
-struct GnPush {
-    std::uint64_t x, y, g, b, part, rm, rv;
-    std::uint32_t tile, hw, cpg, groups, splits, chunk, total, c;
-    float eps;
 };
 
 // Cooperative-matrix tiles (BM x BN x BK, WM x WN per subgroup).
@@ -494,14 +489,12 @@ void conv2d_backward_bias(const Tensor& dY, int N, int C_out, int H_out, int W_o
     }
     if (N == 0 || H_out * W_out == 0) return;
     DeviceCtx& d = device_of(dY);
-    GnPush pc{};
-    pc.x = addr(dY.data);
-    pc.y = addr(dB.data);
-    pc.hw = static_cast<std::uint32_t>(H_out * W_out);
-    pc.c = static_cast<std::uint32_t>(C_out);
-    pc.total = static_cast<std::uint32_t>(N);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::gnorm_f32, dY.dtype, op), {GN_BIAS_GRAD});
-    launch(d, k, pc, std::min<std::uint32_t>(pc.c, 65535), (pc.c + 65534) / 65535);
+    const MirKernel mk = mir_kernel(d, {MirKind::Gnorm, GN_BIAS_GRAD, dY.dtype, dY.dtype, 1});
+    const std::uint32_t uc = static_cast<std::uint32_t>(C_out);
+    mir_dispatch_gnorm(d, mk, std::min<std::uint32_t>(uc, 65535), (uc + 65534) / 65535,
+                       addr(dY.data), addr(dB.data), 0, 0, 0, 0, 0,
+                       0, static_cast<std::uint32_t>(H_out * W_out), 0, 0, 0, 0,
+                       static_cast<std::uint32_t>(N), uc, 0.0f);
 }
 
 void conv_transpose2d_backward_bias(const Tensor& dY, int N, int C_out, int H_out, int W_out, Tensor& dB) {

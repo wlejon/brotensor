@@ -17,6 +17,7 @@
 #include "detail/kernels.h"
 #include "detail/quant.h"
 #include "detail/spatial.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -55,8 +56,6 @@ struct DequantPush {
     std::uint64_t w, y, scale;
     std::uint32_t rows, k, rowbytes;
 };
-
-struct TransposePush { std::uint64_t src, dst; std::uint32_t batch, rows, cols; };
 
 struct WqRowsPush {
     std::uint64_t w, q, scale;
@@ -358,11 +357,12 @@ void matmul_int8w_fp16(const Tensor& W, const Tensor& scales, const Tensor& X, T
     if (Nb == 0) return;
     DeviceCtx& d = device_of(W);
     const Device dev = Device::vulkan(d.index());
-    const Kernel& tk = d.pipelines().get(ShaderId::transpose_b2);
+    const MirKernel tk = mir_kernel(d, {MirKind::Transpose, 2u});
     auto transpose = [&](std::uint64_t src, std::uint64_t dst, int rows, int cols) {
-        const TransposePush pc{src, dst, 1u, static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(cols)};
-        launch(d, tk, pc, std::min<std::uint32_t>((pc.cols + 31) / 32, 65535),
-               std::min<std::uint32_t>((pc.rows + 31) / 32, 65535), 1);
+        const std::uint32_t ur = static_cast<std::uint32_t>(rows), uc = static_cast<std::uint32_t>(cols);
+        mir_dispatch_transpose(d, tk, std::min<std::uint32_t>((uc + 31) / 32, 65535),
+                               std::min<std::uint32_t>((ur + 31) / 32, 65535), 1,
+                               src, dst, 1u, ur, uc);
     };
     need(op, (q.k + 31) / 32 <= 65535 && (Nb + 31) / 32 <= 65535 && (q.rows + 31) / 32 <= 65535,
          "matrix too large for one transpose");
