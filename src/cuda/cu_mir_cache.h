@@ -46,6 +46,8 @@ enum class MirKind : std::uint8_t {
     SelectCommit = 30,
     Misc = 31,
     Vision = 32,
+    Audio = 33,
+    Spectral = 34,
 };
 
 struct MirKey {

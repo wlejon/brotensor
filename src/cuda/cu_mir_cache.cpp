@@ -2,6 +2,7 @@
 
 #include "cuda_driver.h"
 #include "cuda_jit_engine.h"
+#include "../kernels/mir_audio.h"
 #include "../kernels/mir_copy.h"
 #include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
@@ -17,6 +18,7 @@
 #include "../kernels/mir_rope.h"
 #include "../kernels/mir_scatter.h"
 #include "../kernels/mir_select.h"
+#include "../kernels/mir_spectral.h"
 #include "../kernels/mir_topk.h"
 #include "../kernels/mir_vision.h"
 #include "../kernels/mir_xent.h"
@@ -146,6 +148,13 @@ CUfunction compile_mir(const MirKey& k) {
             break;
         case MirKind::Vision:
             fn = kernels::build_vision_mir(mod, k.op, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
+        case MirKind::Audio:
+            fn = kernels::build_audio_mir(mod, k.op, k.dt0, k.flags & 0x0fu, (k.flags & 0x10u) != 0);
+            break;
+        case MirKind::Spectral:
+            fn = kernels::build_spectral_mir(
+                mod, k.op, k.flags & 0x03u, (k.flags & 0x04u) != 0, (k.flags & 0x08u) != 0);
             break;
     }
     const std::string ptx = brass::target::PtxTarget::emit_function(*fn, jit::make_ptx_opts());

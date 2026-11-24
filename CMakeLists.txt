@@ -343,6 +343,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/gemm.cu
         src/cuda/fp16_matmul.cu
         src/cuda/cu_mir_cache.cpp
+        src/cuda/ops_audio.cpp
         src/cuda/ops_copy.cpp
         src/cuda/ops_delta.cpp
         src/cuda/ops_diffusion.cpp
@@ -357,6 +358,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/ops_scatter.cpp
         src/cuda/ops_spatial.cpp
         src/cuda/ops_spatial_bwd.cpp
+        src/cuda/ops_spectral.cpp
         src/cuda/ops_topk.cpp
         src/cuda/ops_vision.cpp
         src/cuda/ops_xent.cpp
@@ -399,12 +401,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/int8_quant.cu
         src/cuda/self_attention_bias.cu
         src/cuda/self_attention_rel_pos.cu
-        src/cuda/vocoder_activations.cu
-        src/cuda/fft.cu
-        src/cuda/stft.cu
-        src/cuda/conv1d.cu
-        src/cuda/codec_quant.cu
-        src/cuda/resample1d.cu
         src/cuda/filtered_lrelu.cu
         src/cuda/register.cu
         src/cuda/cuda_driver.cpp

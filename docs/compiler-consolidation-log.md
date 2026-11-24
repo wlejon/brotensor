@@ -581,3 +581,16 @@ Replaced 5 GLSL shaders / 13 variants (`attn_aux.comp` `34`L × 3, `attn_bwd.com
   - `src/vulkan/shaders/*`: `4,579 -> 4,202` (**`-377` lines**; cumulative **`-4,033` lines** / 35 `.comp` files / 97 variants deleted across Waves 1–8, `140 -> 43` compiled Vulkan shaders).
   - Shared backend-neutral `src/kernels/*`: `6,796` lines across 47 files (`+562` lines in Wave 8, max file `591` lines).
 
+---
+
+## Wave 7 (CUDA / RTX 4090): Audio & Spectral Ops -> Single-Source Brass MIR
+
+Extended `src/cuda/cu_mir_cache.{h,cpp}` (`181` / `649` LOC) with `MirKind::{Audio, Spectral}` lowered via `PtxTarget::emit_function` (`sm_89`), implemented all 15 audio/codec ops (`conv_transpose1d_{forward,backward_input,backward_weight,backward_bias}`, `causal_conv1d_update`, `pad1d_{forward,backward}`, `snake_{forward,backward}`, `resample1d_{forward,backward}`, `vq_encode_{forward,backward}`, `fsq_quantize_{forward,backward}`) in `src/cuda/ops_audio.cpp` (`453` LOC) onto `MirKind::Audio` + `MirKind::Transpose` + `detail::cuda::{matmul, conv2d_forward, conv2d_backward_bias, copy_d2d, copy_d2d_strided}` (plus `fill_cuda_vtable_vocoder` forwarding `elu_*`/`leaky_relu_*`), and implemented all 16 spectral ops (`complex_{mul,mul_backward,abs,abs_backward,angle,from_polar}`, `fft`, `ifft`, `rfft`, `irfft`, `rfft_backward`, `irfft_backward`, `stft`, `stft_backward`, `istft`, `istft_backward`) in `src/cuda/ops_spectral.cpp` (`484` LOC) onto `MirKind::Spectral` + `MirKind::Copy2d` + `linear_forward_batched`, deleting all 6 replaced `.cu` files plus `detail/block_fft.cuh`.
+
+### Wave 7 CUDA Verification & LOC Delta (RTX 4090 GPU 0, `CUDA_VISIBLE_DEVICES=0`, `brass@d5608f4`)
+- **Targeted Wave 7 Parity & Unit Suites:** `13/13` passed (`40.86 s`, `0` failures): `gpu_mir_emit`, `fft`, `stft`, `conv1d`, `vocoder_activations`, `codec_quant`, `resample1d`, `fft_parity`, `stft_parity`, `conv1d_parity`, `vocoder_parity`, `codec_quant_parity`, `resample1d_parity`.
+- **Full CUDA `ctest` (`-LE gcstress -j 1`):** **`204/204` passed** (`1541.63 s`, `0` failures).
+- **LOC Delta (CUDA Wave 7):**
+  - Deleted 7 files (`-2,485` lines): `stft.cu` (`-633`), `conv1d.cu` (`-576`), `fft.cu` (`-556`), `codec_quant.cu` (`-250`), `vocoder_activations.cu` (`-215`), `resample1d.cu` (`-194`), `detail/block_fft.cuh` (`-61`).
+  - Added / extended files (all `<= 649` LOC): `ops_audio.cpp` (`453`), `ops_spectral.cpp` (`484`), `cu_mir_cache.{h,cpp}` (`181` / `649`, `+11`).
+  - Net `src/cuda/` Wave 7 delta: **`-1,537` lines** (**cumulative CUDA Waves 3–7: `-9,093` net lines and 46 `.cu` files + `detail/block_fft.cuh` deleted**, all modified/created files `<= 649` LOC).
