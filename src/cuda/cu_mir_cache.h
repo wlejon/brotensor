@@ -24,6 +24,12 @@ enum class MirKind : std::uint8_t {
     SumCols = 9,
     Norm = 10,
     Rope = 11,
+    FillBytes = 12,
+    Copy2d = 13,
+    Transpose = 14,
+    ScatterAdd = 15,
+    Gnorm = 16,
+    Bnorm = 17,
 };
 
 struct MirKey {
@@ -90,5 +96,33 @@ void mir_dispatch_rope(CUfunction fn, std::uint32_t gx,
                        std::uint32_t rows, std::uint32_t heads, std::uint32_t hd,
                        std::uint32_t dt, std::uint32_t dh, std::uint32_t dw,
                        std::int32_t offset, float ln_base);
+
+// ── Wave 3: copy / transpose / fill / scatter / gnorm / bnorm ──
+int mir_copy2d_lanes(std::uint32_t elem_bytes, std::uint32_t src_pitch, std::uint32_t dst_pitch,
+                     std::uint32_t width, std::uintptr_t src_addr, std::uintptr_t dst_addr);
+void mir_dispatch_fill(CUfunction fn, std::uint32_t gx, void* dst, std::uint32_t n, std::uint32_t val);
+void mir_dispatch_copy2d(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
+                         const void* src, void* dst, std::uint32_t src_pitch, std::uint32_t dst_pitch,
+                         std::uint32_t width, std::uint32_t height);
+void mir_dispatch_transpose(CUfunction fn, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                            const void* src, void* dst,
+                            std::uint32_t batch, std::uint32_t rows, std::uint32_t cols);
+void mir_dispatch_scatter(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
+                          const void* idx, const void* keys, const void* keys_out,
+                          const void* src, void* dst,
+                          std::uint32_t m, std::uint32_t r, std::uint32_t c,
+                          std::uint32_t p, std::uint32_t k, std::uint32_t j);
+void mir_dispatch_gnorm(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
+                        const void* x, void* y, const void* g, const void* b,
+                        const void* part, const void* rm, const void* rv,
+                        std::uint32_t tile, std::uint32_t hw, std::uint32_t cpg,
+                        std::uint32_t groups, std::uint32_t splits, std::uint32_t chunk,
+                        std::uint32_t total, std::uint32_t c, float eps);
+void mir_dispatch_bnorm(CUfunction fn, std::uint32_t gx,
+                        const void* x, void* y, const void* g, const void* b,
+                        void* rm, void* rv, void* sm, void* sr,
+                        const void* dy, void* dg, void* db,
+                        std::uint32_t n, std::uint32_t c, std::uint32_t hw,
+                        float eps, float momentum);
 
 }  // namespace brotensor::detail::cuda

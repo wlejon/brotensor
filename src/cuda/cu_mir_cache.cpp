@@ -2,10 +2,13 @@
 
 #include "cuda_driver.h"
 #include "cuda_jit_engine.h"
+#include "../kernels/mir_copy.h"
 #include "../kernels/mir_elementwise.h"
+#include "../kernels/mir_gnorm.h"
 #include "../kernels/mir_norm.h"
 #include "../kernels/mir_reduce.h"
 #include "../kernels/mir_rope.h"
+#include "../kernels/mir_scatter.h"
 
 #if BROTENSOR_HAS_BRASS_CUDA_JIT
 #include <brass/mir/module.hpp>
@@ -56,6 +59,12 @@ const char* entry_name_for(MirKind kind) {
         case MirKind::SumCols:    return "mir_sum_cols";
         case MirKind::Norm:       return "mir_norm";
         case MirKind::Rope:       return "mir_rope";
+        case MirKind::FillBytes:  return "mir_fill_bytes";
+        case MirKind::Copy2d:     return "mir_copy2d";
+        case MirKind::Transpose:  return "mir_transpose";
+        case MirKind::ScatterAdd: return "mir_scatter_add";
+        case MirKind::Gnorm:      return "mir_gnorm";
+        case MirKind::Bnorm:      return "mir_bnorm";
     }
     throw std::runtime_error("cu_mir_cache: unknown MirKind");
 }
@@ -101,6 +110,12 @@ CUfunction compile_mir(const MirKey& k) {
                 kernels::NormMirFlags::unpack(k.flags), k.lanes);
             break;
         case MirKind::Rope:       fn = kernels::build_rope_mir(mod, k.op, k.flags != 0, k.dt0); break;
+        case MirKind::FillBytes:  fn = kernels::build_fill_bytes_mir(mod); break;
+        case MirKind::Copy2d:     fn = kernels::build_copy2d_mir(mod, static_cast<int>(k.op), k.lanes); break;
+        case MirKind::Transpose:  fn = kernels::build_transpose_mir(mod, static_cast<int>(k.op)); break;
+        case MirKind::ScatterAdd: fn = kernels::build_scatter_add_mir(mod, k.op, k.dt0); break;
+        case MirKind::Gnorm:      fn = kernels::build_gnorm_mir(mod, k.op, k.dt0, k.flags != 0, k.lanes); break;
+        case MirKind::Bnorm:      fn = kernels::build_bnorm_mir(mod, k.op); break;
     }
     const std::string ptx = brass::target::PtxTarget::emit_function(*fn, jit::make_ptx_opts());
     CUfunction cu_fn = jit::CudaJitEngine::instance().get_function(
@@ -114,13 +129,18 @@ CUfunction compile_mir(const MirKey& k) {
 #endif
 }
 
-void launch_kernel(CUfunction fn, std::uint32_t gx, std::uint32_t block_x, void** params, const char* what) {
+void launch_kernel_3d(CUfunction fn, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                      std::uint32_t block_x, void** params, const char* what) {
     const CUstream stream = jit::resolve_stream(nullptr);
     const CUresult res = drv::cuLaunchKernel(
-        fn, gx, 1, 1, block_x, 1, 1, 0, stream, params, nullptr);
+        fn, gx, gy, gz, block_x, 1, 1, 0, stream, params, nullptr);
     if (res != CUDA_SUCCESS) {
         throw std::runtime_error(std::string("cuLaunchKernel failed for ") + what);
     }
+}
+
+void launch_kernel(CUfunction fn, std::uint32_t gx, std::uint32_t block_x, void** params, const char* what) {
+    launch_kernel_3d(fn, gx, 1, 1, block_x, params, what);
 }
 
 }  // namespace
@@ -300,6 +320,126 @@ void mir_dispatch_rope(CUfunction fn, std::uint32_t gx,
         &ax, &ay, &act, &ast, &ach, &ash, &acw, &asw, &apt, &aph, &apw,
         &arows, &aheads, &ahd, &adt, &adh, &adw, &aoffset, &aln_base};
     launch_kernel(fn, gx, kernels::kRopeBlock, params, "mir_rope");
+}
+
+int mir_copy2d_lanes(std::uint32_t esz, std::uint32_t sp, std::uint32_t dp,
+                     std::uint32_t w, std::uintptr_t sa, std::uintptr_t da) {
+    if (esz != 2u && esz != 4u) return 1;
+    const int lanes = static_cast<int>(16u / esz);
+    if ((w % static_cast<std::uint32_t>(lanes)) != 0u) return 1;
+    if ((sp % static_cast<std::uint32_t>(lanes)) != 0u ||
+        (dp % static_cast<std::uint32_t>(lanes)) != 0u) return 1;
+    if ((sa % 16u) != 0u || (da % 16u) != 0u) return 1;
+    return lanes;
+}
+
+void mir_dispatch_fill(CUfunction fn, std::uint32_t gx, void* dst, std::uint32_t n, std::uint32_t val) {
+    CUdeviceptr ad = reinterpret_cast<CUdeviceptr>(dst);
+    std::int32_t an = static_cast<std::int32_t>(n);
+    std::int32_t av = static_cast<std::int32_t>(val);
+    void* params[] = {&ad, &an, &av};
+    launch_kernel(fn, gx, kernels::kFillBlock, params, "mir_fill_bytes");
+}
+
+void mir_dispatch_copy2d(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
+                         const void* src, void* dst, std::uint32_t src_pitch, std::uint32_t dst_pitch,
+                         std::uint32_t width, std::uint32_t height) {
+    CUdeviceptr asrc = reinterpret_cast<CUdeviceptr>(src);
+    CUdeviceptr adst = reinterpret_cast<CUdeviceptr>(dst);
+    std::int32_t asp = static_cast<std::int32_t>(src_pitch);
+    std::int32_t adp = static_cast<std::int32_t>(dst_pitch);
+    std::int32_t aw = static_cast<std::int32_t>(width);
+    std::int32_t ah = static_cast<std::int32_t>(height);
+    void* params[] = {&asrc, &adst, &asp, &adp, &aw, &ah};
+    launch_kernel_3d(fn, gx, gy, 1, kernels::kCopyBlock, params, "mir_copy2d");
+}
+
+void mir_dispatch_transpose(CUfunction fn, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                            const void* src, void* dst,
+                            std::uint32_t batch, std::uint32_t rows, std::uint32_t cols) {
+    CUdeviceptr asrc = reinterpret_cast<CUdeviceptr>(src);
+    CUdeviceptr adst = reinterpret_cast<CUdeviceptr>(dst);
+    std::int32_t ab = static_cast<std::int32_t>(batch);
+    std::int32_t ar = static_cast<std::int32_t>(rows);
+    std::int32_t ac = static_cast<std::int32_t>(cols);
+    void* params[] = {&asrc, &adst, &ab, &ar, &ac};
+    launch_kernel_3d(fn, gx, gy, gz, kernels::kTransposeBlock, params, "mir_transpose");
+}
+
+void mir_dispatch_scatter(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
+                          const void* idx, const void* keys, const void* keys_out,
+                          const void* src, void* dst,
+                          std::uint32_t m, std::uint32_t r, std::uint32_t c,
+                          std::uint32_t p, std::uint32_t k, std::uint32_t j) {
+    CUdeviceptr aidx = reinterpret_cast<CUdeviceptr>(idx);
+    CUdeviceptr ak = reinterpret_cast<CUdeviceptr>(keys);
+    CUdeviceptr ako = reinterpret_cast<CUdeviceptr>(keys_out);
+    CUdeviceptr asrc = reinterpret_cast<CUdeviceptr>(src);
+    CUdeviceptr adst = reinterpret_cast<CUdeviceptr>(dst);
+    std::int32_t am = static_cast<std::int32_t>(m);
+    std::int32_t ar = static_cast<std::int32_t>(r);
+    std::int32_t ac = static_cast<std::int32_t>(c);
+    std::int32_t ap = static_cast<std::int32_t>(p);
+    std::int32_t a_k = static_cast<std::int32_t>(k);
+    std::int32_t aj = static_cast<std::int32_t>(j);
+    void* params[] = {&aidx, &ak, &ako, &asrc, &adst, &am, &ar, &ac, &ap, &a_k, &aj};
+    launch_kernel_3d(fn, gx, gy, 1, kernels::kScatterBlock, params, "mir_scatter_add");
+}
+
+void mir_dispatch_gnorm(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
+                        const void* x, void* y, const void* g, const void* b,
+                        const void* part, const void* rm, const void* rv,
+                        std::uint32_t tile, std::uint32_t hw, std::uint32_t cpg,
+                        std::uint32_t groups, std::uint32_t splits, std::uint32_t chunk,
+                        std::uint32_t total, std::uint32_t c, float eps) {
+    CUdeviceptr ax = reinterpret_cast<CUdeviceptr>(x);
+    CUdeviceptr ay = reinterpret_cast<CUdeviceptr>(y);
+    CUdeviceptr ag = reinterpret_cast<CUdeviceptr>(g);
+    CUdeviceptr ab = reinterpret_cast<CUdeviceptr>(b);
+    CUdeviceptr apart = reinterpret_cast<CUdeviceptr>(part);
+    CUdeviceptr arm = reinterpret_cast<CUdeviceptr>(rm);
+    CUdeviceptr arv = reinterpret_cast<CUdeviceptr>(rv);
+    std::int32_t atile = static_cast<std::int32_t>(tile);
+    std::int32_t ahw = static_cast<std::int32_t>(hw);
+    std::int32_t acpg = static_cast<std::int32_t>(cpg);
+    std::int32_t agroups = static_cast<std::int32_t>(groups);
+    std::int32_t asplits = static_cast<std::int32_t>(splits);
+    std::int32_t achunk = static_cast<std::int32_t>(chunk);
+    std::int32_t atotal = static_cast<std::int32_t>(total);
+    std::int32_t ac = static_cast<std::int32_t>(c);
+    float aeps = eps;
+    void* params[] = {
+        &ax, &ay, &ag, &ab, &apart, &arm, &arv,
+        &atile, &ahw, &acpg, &agroups, &asplits, &achunk, &atotal, &ac, &aeps};
+    launch_kernel_3d(fn, gx, gy, 1, kernels::kGnormBlock, params, "mir_gnorm");
+}
+
+void mir_dispatch_bnorm(CUfunction fn, std::uint32_t gx,
+                        const void* x, void* y, const void* g, const void* b,
+                        void* rm, void* rv, void* sm, void* sr,
+                        const void* dy, void* dg, void* db,
+                        std::uint32_t n, std::uint32_t c, std::uint32_t hw,
+                        float eps, float momentum) {
+    CUdeviceptr ax = reinterpret_cast<CUdeviceptr>(x);
+    CUdeviceptr ay = reinterpret_cast<CUdeviceptr>(y);
+    CUdeviceptr ag = reinterpret_cast<CUdeviceptr>(g);
+    CUdeviceptr ab = reinterpret_cast<CUdeviceptr>(b);
+    CUdeviceptr arm = reinterpret_cast<CUdeviceptr>(rm);
+    CUdeviceptr arv = reinterpret_cast<CUdeviceptr>(rv);
+    CUdeviceptr asm_p = reinterpret_cast<CUdeviceptr>(sm);
+    CUdeviceptr asr_p = reinterpret_cast<CUdeviceptr>(sr);
+    CUdeviceptr ady = reinterpret_cast<CUdeviceptr>(dy);
+    CUdeviceptr adg = reinterpret_cast<CUdeviceptr>(dg);
+    CUdeviceptr adb = reinterpret_cast<CUdeviceptr>(db);
+    std::int32_t an = static_cast<std::int32_t>(n);
+    std::int32_t ac = static_cast<std::int32_t>(c);
+    std::int32_t ahw = static_cast<std::int32_t>(hw);
+    float aeps = eps;
+    float amom = momentum;
+    void* params[] = {
+        &ax, &ay, &ag, &ab, &arm, &arv, &asm_p, &asr_p, &ady, &adg, &adb,
+        &an, &ac, &ahw, &aeps, &amom};
+    launch_kernel(fn, gx, kernels::kGnormBlock, params, "mir_bnorm");
 }
 
 }  // namespace brotensor::detail::cuda

@@ -425,3 +425,16 @@ Extended Metal's runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`, `207` / `6
 - **LOC Delta (Metal Wave 5):**
   - Slimmed / rewritten files (all `< 700` LOC): `lstm.mm` (`441 -> 245`), `gated_delta_rule.mm` (`241 -> 108`), `top_k.mm` (`220 -> 83`, absorbing `segment_softmax_stats`), `loss.mm` (`647 -> 328`), `packed_encoder.mm` (`452 -> 373`), `mtl_mir_cache.{h,mm}` (`182/582 -> 207/663`).
   - **Net Metal LOC delta (Wave 5):** `522` insertions, `1,280` deletions (**`-758` net Metal LOC**; `src/metal/` `27,033 -> 26,275` LOC; **cumulative Waves 1–5: `-10,410` net Metal LOC** and 28 Metal files deleted).
+
+---
+
+## Wave 3 (CUDA / RTX 4090): GroupNorm, BatchNorm, L2-Normalize, Transpose & Deterministic Scatter-Add -> Single-Source Brass MIR
+
+Extended CUDA's runtime MIR cache (`src/cuda/cu_mir_cache.{h,cpp}`, `113` / `408` LOC with 2D/3D `cuLaunchKernel` grid dispatch) with `FillBytes`, `Copy2d`, `Transpose`, `ScatterAdd`, `Gnorm`, and `Bnorm` lowered via `PtxTarget::emit_function` (`sm_89`), and wired GroupNorm fwd/bwd, BatchNorm fwd/inference/bwd, per-pixel NCHW L2-normalize, NCHW <-> sequence transpose (`ops_copy.cpp`), and deterministic bitonic-sort scatter-add (`ops_scatter.cpp`) through `cu_mir_cache` (`concat.cu` retains async CUDA DMA copies `cudaMemcpyAsync`/`cudaMemcpy2DAsync`).
+
+### Wave 3 CUDA Verification & LOC Delta (RTX 4090 GPU 0, `CUDA_VISIBLE_DEVICES=0`, `brass@d5608f4`)
+- **Targeted Wave 3 Parity & Unit Suites:** `18/18` passed (`16.74 s`, `0` failures): `gather_rows`, `conv_transpose2d`, `batch_norm`, `group_norm`, `resblock`, `resblock_int8w`, `transpose`, `embedding_parity`, `concat_parity`, `embedding_extra_parity`, `concat_extra_parity`, `group_norm_parity`, `transpose_parity`, `resblock_parity`, `l2_normalize_parity`, `gather_rows_parity`, `conv_transpose2d_parity`, `batch_norm_parity`.
+- **Full CUDA `ctest` (`-LE gcstress -j 1`):** **`204/204` passed** (`906.16 s`, `0` failures).
+- **LOC Delta (CUDA Wave 3):**
+  - Deleted 5 `.cu` files: `group_norm.cu` (`-789`), `group_norm_split.cu` (`-144`), `batch_norm.cu` (`-451`), `l2_normalize.cu` (`-126`), `transpose.cu` (`-156`) — **`-1,666` lines** deleted cleanly.
+  - Slimmed `embedding.cu` (`-119` net diff, now `99` LOC) & `gather_scatter.cu` (`-99` net diff, now `161` LOC); added `ops_gnorm.cpp` (`260`), `ops_scatter.cpp` (`87`), `ops_copy.cpp` (`54`), `cu_mir_cache.{h,cpp}` (`+178`). Net `src/cuda/` Wave 3 delta: **`-1,308` lines** (all edited/created files `<= 408` LOC).

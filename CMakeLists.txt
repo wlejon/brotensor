@@ -336,10 +336,13 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/gemm.cu
         src/cuda/fp16_matmul.cu
         src/cuda/cu_mir_cache.cpp
+        src/cuda/ops_copy.cpp
         src/cuda/ops_elementwise.cpp
+        src/cuda/ops_gnorm.cpp
         src/cuda/ops_norm.cpp
         src/cuda/ops_reduce.cpp
         src/cuda/ops_rope.cpp
+        src/cuda/ops_scatter.cpp
         src/cuda/elementwise_misc.cu
         src/cuda/attention.cu
         src/cuda/optim.cu
@@ -363,8 +366,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/q8_0_wmma.cu
         src/cuda/q6k.cu
         src/cuda/q6k_wmma.cu
-        src/cuda/group_norm.cu
-        src/cuda/group_norm_split.cu
         src/cuda/flash_attention_varlen_f32.cu
         src/cuda/conv2d_igemm_f32.cu
         src/cuda/resample.cu
@@ -373,7 +374,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/pad2d.cu
         src/cuda/slice2d.cu
         src/cuda/unfold2d.cu
-        src/cuda/l2_normalize.cu
         src/cuda/convex_upsample.cu
         src/cuda/gather_scatter.cu
         src/cuda/top_k.cu
@@ -394,7 +394,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/linear_wq.cu
         src/cuda/packed_encoder.cu
         src/cuda/resblock.cu
-        src/cuda/transpose.cu
         src/cuda/matmul.cu
         src/cuda/matmul_backward.cu
         src/cuda/lstm.cu
@@ -420,7 +419,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/spatial_merge.cu
         src/cuda/loss_legacy.cu
         src/cuda/xavier_init.cu
-        src/cuda/batch_norm.cu
         src/cuda/image_preproc.cu
         src/cuda/bias_act.cu
         src/cuda/upfirdn2d.cu
