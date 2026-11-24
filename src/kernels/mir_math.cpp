@@ -215,4 +215,14 @@ Value* emit_block_argmax_f32(Ctx& c, Value* s_val8, Value* s_idx8, Value* best_v
     return bi;
 }
 
+Value* emit_splitmix64_mix_u01(Ctx& c, Value* z64) {
+    Value* m1 = c.kb.const_i64(static_cast<std::int64_t>(0xBF58476D1CE4E5B9ULL));
+    Value* m2 = c.kb.const_i64(static_cast<std::int64_t>(0x94D049BB133111EBULL));
+    Value* z = c.b.build_mul(c.b.build_xor(z64, c.b.build_lshr(z64, c.kb.const_i64(30))), m1);
+    z = c.b.build_mul(c.b.build_xor(z, c.b.build_lshr(z, c.kb.const_i64(27))), m2);
+    z = c.b.build_xor(z, c.b.build_lshr(z, c.kb.const_i64(31)));
+    Value* top24 = c.b.build_trunc_i32(c.b.build_lshr(z, c.kb.const_i64(40)));
+    return c.b.build_mul(c.kb.u32_to_f32(top24), c.f32(1.0f / 16777216.0f));
+}
+
 }  // namespace brotensor::kernels

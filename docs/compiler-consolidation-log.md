@@ -438,3 +438,30 @@ Extended CUDA's runtime MIR cache (`src/cuda/cu_mir_cache.{h,cpp}`, `113` / `408
 - **LOC Delta (CUDA Wave 3):**
   - Deleted 5 `.cu` files: `group_norm.cu` (`-789`), `group_norm_split.cu` (`-144`), `batch_norm.cu` (`-451`), `l2_normalize.cu` (`-126`), `transpose.cu` (`-156`) — **`-1,666` lines** deleted cleanly.
   - Slimmed `embedding.cu` (`-119` net diff, now `99` LOC) & `gather_scatter.cu` (`-99` net diff, now `161` LOC); added `ops_gnorm.cpp` (`260`), `ops_scatter.cpp` (`87`), `ops_copy.cpp` (`54`), `cu_mir_cache.{h,cpp}` (`+178`). Net `src/cuda/` Wave 3 delta: **`-1,308` lines** (all edited/created files `<= 408` LOC).
+
+---
+
+## Wave 6: Vulkan Token Selection (`sample_logits` / `masked_diffusion`), Vision (`upfirdn2d` / `mod_conv` / `col2im2d` / `deform_conv2d`) & Small Misc Ops -> Single-Source Brass MIR
+
+Replaced 2 GLSL shaders / 4 variants (`select.comp` `344`L, `misc.comp` `406`L; `64 -> 60` compiled Vulkan shaders) with three focused backend-neutral `brass::Function` MIR modules:
+- `src/kernels/mir_select.{h,cpp}` (`561` LOC): `SEL_SAMPLE` (temperature softmax, 64-bit fixed-point top-k/top-p binary search, Philox 4x32-10 inverse-CDF draw, greedy argmax), `SEL_COUNTER`, `SEL_COMMIT`, and `SEL_MD` (guided/unguided log-softmax, 32-bit order-preserving top-k threshold search + rank scan, `splitmix64` Gumbel noise). Shared `philox_words` from `mir_diffusion.h` and added shared `emit_splitmix64_mix_u01` in `mir_math.{h,cpp}`.
+- `src/kernels/mir_misc.{h,cpp}` (`389` LOC): `MI_MEAN_POOL`, `MI_MEAN_POOL_BWD`, `MI_SLOT_MASK`, `MI_CAUSAL_ROW`, `MI_THRESHOLD_U8`, `MI_COUNT_ABOVE`, `MI_XAVIER`, `MI_SGD`, `MI_ADAM`, `MI_MSE_SAMPLE`, `MI_MSE_BWD`, `MI_MSE_SUM`, `MI_MOMENTS`, `MI_BIAS_ACT`, `MI_BIAS_ACT_BWD`, `MI_BIAS_ACT_DB`.
+- `src/kernels/mir_vision.{h,cpp}` (`476` LOC): `MI_UPFIRDN` (upfirdn2d fwd/bwd), `MI_MODW`, `MI_MODW_BWD`, `MI_MODW_DS`, `MI_MODW_DW`, `MI_COL2IM2D`, `MI_DEFORM_COL`.
+- Extended `src/vulkan/vk_mir_cache.{h,cpp}` (`815` LOC) with `SelectSample`, `SelectCounter`, `SelectCommit`, `SelectMd`, `Misc`, `Vision` and generic packed push-constant dispatcher `mir_dispatch_args`, wired `ops_sampling.cpp` (`177` LOC), `ops_misc.cpp` (`391` LOC), and `ops_vision.cpp` (`558` LOC).
+
+### Wave 6 Correctness, Proof Audit, Model Gate & LOC Delta (Radeon 8060S)
+- **Formal Audits:**
+  - `brotensor_test_backward_index_proofs`: **ALL PASSED** (including `upfirdn2d_lifted_spirv_bounds_and_safety` on 6 MIR `.spv` binaries: `972` lifted SPIR-V insts, `6` guarded PSB64 writes, `58` bounds checks, `0` hazards)
+  - `brotensor_test_backward_shader_audit`: **161/161 shaders passed** in **56.283 s** (`117425` SPIR-V/PTX insts, `6595` shared / `2675` global accesses proven, `661` uniform barriers, `810` uniform collectives, `0` failures)
+- **Unit, Parity & Vulkan Suites:** `brotensor_test_sample_logits`, `sample_logits_parity` (`16/16`), `masked_diffusion`, `masked_mean_pool_parity` (`10/10`), `attention_moments`, `attention_moments_parity` (`5/5`), `deform_conv2d_parity` (`7/7`), `bias_act`, `upfirdn2d`, `modulated_conv2d`, `filtered_lrelu`, `stylegan_parity`, `stylegan_primitives`, `conv_transpose2d_parity`, `elementwise_extra_parity`, `reduce_extra_parity`, plus `brotensor_test_vulkan` `--only={ops,train,sampling,misc,vision,capture}` — **all passed (`0` failures)**
+- **Downstream Real-Model Gate (`Vulkan`, Radeon 8060S):**
+  - `Depth-Anything-V2-Small` (`1024×768`): `23.48 ms` best / `25.74 ms` mean
+  - `SAM ViT-B` (`1024×768`): encode `126.74 ms` best / `127.54 ms` mean; decode `8.97 ms` best / `9.30 ms` mean
+  - `SAM AMG` (`1024×768`): `4852.54 ms` best / `4867.58 ms` mean
+  - `Kokoro TTS`: `214.5 ms` mean for `9.47 s` audio (`44.18× realtime`)
+  - `SD 1.5 (LCM-Dreamshaper)` & `Sana-600M` (`512×512`, `4` steps): clean generation
+- **LOC Delta (Vulkan Wave 6):**
+  - `src/vulkan/shaders/*`: `5,499 -> 5,125` (**`-374` lines**; cumulative **`-3,110` lines** / 28 `.comp` files / 80 variants deleted across Waves 1–6, `140 -> 60` compiled Vulkan shaders)
+  - Shared backend-neutral `src/kernels/*`: `5,252` lines across 39 files (`+1,441` lines in Wave 6, max file `535` lines); `src/vulkan/vk_mir_cache.{h,cpp}` `815` lines (`+45` lines, max file `637` lines)
+  - Pending cross-backend targets against `mir_select` / `mir_misc` / `mir_vision` (and Wave 4–5 CUDA): Mac Metal Wave 6 & Windows CUDA Waves 4–6.
+

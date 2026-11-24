@@ -33,6 +33,9 @@
 #include "kernels/mir_resample_bwd.h"
 #include "kernels/mir_rope.h"
 #include "kernels/mir_scatter.h"
+#include "kernels/mir_select.h"
+#include "kernels/mir_misc.h"
+#include "kernels/mir_vision.h"
 #include "kernels/mir_topk.h"
 #include "kernels/mir_xent.h"
 #include "vulkan/shaders/op_codes.h"
@@ -583,7 +586,19 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
                  {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
             const std::string tk_name = std::string("topk_seg") + sfx;
             audit_mir(tk_name.c_str(), [dt](brass::Module& m) { return kernels::build_topk_mir(m, 0u, dt); });
+            const std::string mi_name = std::string("misc") + sfx;
+            audit_mir(mi_name.c_str(), [dt](brass::Module& m) { return kernels::build_misc_mir(m, MI_BIAS_ACT_DB, dt, true); });
+            const std::string up_name = std::string("vision_upfirdn") + sfx;
+            audit_mir(up_name.c_str(), [dt](brass::Module& m) { return kernels::build_vision_mir(m, MI_UPFIRDN, dt, false, false); });
         }
+        audit_mir("misc_moments_f32", [](brass::Module& m) { return kernels::build_misc_mir(m, MI_MOMENTS, Dtype::FP32, false); });
+        audit_mir("misc_count_above_f32", [](brass::Module& m) { return kernels::build_misc_mir(m, MI_COUNT_ABOVE, Dtype::FP32, false); });
+        audit_mir("vision_modw_bwd_f32", [](brass::Module& m) { return kernels::build_vision_mir(m, MI_MODW_BWD, Dtype::FP32, false, false); });
+        audit_mir("vision_col2im2d_f32", [](brass::Module& m) { return kernels::build_vision_mir(m, MI_COL2IM2D, Dtype::FP32, true, false); });
+        audit_mir("vision_deform_col_f32", [](brass::Module& m) { return kernels::build_vision_mir(m, MI_DEFORM_COL, Dtype::FP32, true, true); });
+        audit_mir("select_sample", [](brass::Module& m) { return kernels::build_select_sample_mir(m, false); });
+        audit_mir("select_md", [](brass::Module& m) { return kernels::build_select_md_mir(m, true, true, true); });
+        audit_mir("select_commit", [](brass::Module& m) { return kernels::build_select_commit_mir(m); });
     }
 
     // 4. Synthetic negative test if not already covered by ShaderId::test_shared_overflow

@@ -9,6 +9,8 @@
 // there, so it records into a graph without a host round trip.
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
+#include "../kernels/mir_select.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -24,13 +26,6 @@ using ::brotensor::Tensor;
 
 namespace {
 
-struct SelPush {
-    std::uint64_t a, b, c, d, e, f;
-    std::uint64_t key;
-    std::uint32_t u[6];
-    float fl[6];
-};
-
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
 }
@@ -39,12 +34,9 @@ void need(const char* op, bool ok, const char* what) {
     if (!ok) fail(op, what);
 }
 
-void run_rows(DeviceCtx& d, std::uint32_t code, const SelPush& pc, std::uint64_t rows, const char* op) {
-    const Kernel& k = d.pipelines().get(ShaderId::select, {code});
-    const std::uint32_t gx = static_cast<std::uint32_t>(std::min<std::uint64_t>(rows, 65535));
-    const std::uint32_t gy = static_cast<std::uint32_t>((rows + gx - 1) / gx);
-    if (gy > 65535) fail(op, "too many rows");
-    launch(d, k, pc, gx, gy);
+std::uint32_t wg_rows(std::uint64_t rows, const char* op) {
+    if (rows > 0x7fffffffULL) fail(op, "too many rows");
+    return static_cast<std::uint32_t>(std::max<std::uint64_t>(1, std::min<std::uint64_t>(rows, 65535)));
 }
 
 void check_sampling(const char* op, const Tensor& logits, float temperature, int top_k, float top_p) {
@@ -64,20 +56,21 @@ void sample(const char* op, const Tensor& logits, float temperature, int top_k, 
         tmp = Tensor::empty_on(Device::vulkan(d.index()), N, V, Dtype::FP32);
         scratch = addr(tmp.data);
     }
-    SelPush pc{};
-    pc.a = addr(logits.data);
-    pc.b = scratch;
-    pc.d = addr(indices.data);
-    pc.e = counter_addr;
-    pc.key = key;
-    pc.u[0] = static_cast<std::uint32_t>(V);
-    pc.u[1] = static_cast<std::uint32_t>(counter);
-    pc.u[2] = static_cast<std::uint32_t>(counter >> 32);
-    pc.u[3] = static_cast<std::uint32_t>(top_k);
-    pc.u[4] = static_cast<std::uint32_t>(N);
-    pc.fl[0] = temperature;
-    pc.fl[1] = top_p;
-    run_rows(d, SEL_SAMPLE, pc, static_cast<std::uint64_t>(N), op);
+    const MirKernel mk = mir_kernel(
+        d, MirKey{MirKind::SelectSample, 0, Dtype::FP32, Dtype::FP32, 1, Dtype::FP32,
+                  static_cast<std::uint8_t>(counter_addr != 0 ? 1u : 0u)});
+    const std::uint64_t ptrs[] = {addr(logits.data), scratch, addr(indices.data), counter_addr};
+    const std::int32_t ints[] = {
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(key)),
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(key >> 32)),
+        static_cast<std::int32_t>(V),
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(counter)),
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(counter >> 32)),
+        static_cast<std::int32_t>(top_k),
+        static_cast<std::int32_t>(N),
+    };
+    const float flts[] = {temperature, top_p};
+    mir_dispatch_args(d, mk, wg_rows(static_cast<std::uint64_t>(N), op), ptrs, ints, flts);
 }
 
 void sample_logits(const Tensor& logits, float temperature, int top_k, float top_p, std::uint64_t key,
@@ -104,11 +97,11 @@ void sample_logits_into(const Tensor& logits, float temperature, int top_k, floa
     if (N == 0) return;
     sample(op, logits, temperature, top_k, top_p, key, 0, addr(counter.data), addr(scratch.data), indices);
     if (temperature != 0.0f) {   // greedy consumes no draws
-        SelPush pc{};
-        pc.e = addr(counter.data);
-        pc.u[4] = static_cast<std::uint32_t>(N);
         DeviceCtx& d = device_of(logits);
-        launch(d, d.pipelines().get(ShaderId::select, {SEL_COUNTER}), pc, 1);
+        const MirKernel mk = mir_kernel(d, MirKey{MirKind::SelectCounter});
+        const std::uint64_t ptrs[] = {addr(counter.data)};
+        const std::int32_t ints[] = {N};
+        mir_dispatch_args(d, mk, 1, ptrs, ints, {});
     }
 }
 
@@ -140,16 +133,19 @@ void masked_diffusion_scores(const Tensor& logits, const Tensor& tokens, int T, 
     }
     DeviceCtx& d = device_of(logits);
     Tensor lp = Tensor::empty_on(Device::vulkan(d.index()), C * T, V, Dtype::FP32);
-    SelPush pc{};
-    pc.a = addr(logits.data); pc.b = addr(tokens.data); pc.c = addr(lp.data); pc.d = addr(pred.data);
-    pc.e = addr(scores.data); pc.f = addr(confidence.data);
-    pc.key = seed;
-    pc.u[0] = static_cast<std::uint32_t>(T); pc.u[1] = static_cast<std::uint32_t>(C);
-    pc.u[2] = static_cast<std::uint32_t>(V); pc.u[3] = static_cast<std::uint32_t>(mask_id);
-    pc.u[4] = guided ? 1u : 0u; pc.u[5] = static_cast<std::uint32_t>(k_keep);
-    pc.fl[0] = guidance_scale; pc.fl[1] = layer_penalty; pc.fl[2] = position_temperature;
-    pc.fl[3] = class_temperature;
-    run_rows(d, SEL_MD, pc, static_cast<std::uint64_t>(C) * T, op);
+    const std::uint8_t flags = static_cast<std::uint8_t>(
+        (guided ? 1u : 0u) | (class_temperature > 0.0f ? 2u : 0u) | (position_temperature > 0.0f ? 4u : 0u));
+    const MirKernel mk = mir_kernel(
+        d, MirKey{MirKind::SelectMd, 0, Dtype::FP32, Dtype::FP32, 1, Dtype::FP32, flags});
+    const std::uint64_t ptrs[] = {addr(logits.data), addr(tokens.data), addr(lp.data),
+                                  addr(pred.data), addr(scores.data), addr(confidence.data)};
+    const std::int32_t ints[] = {
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(seed)),
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(seed >> 32)),
+        T, C, V, mask_id, k_keep,
+    };
+    const float flts[] = {guidance_scale, layer_penalty, position_temperature, class_temperature};
+    mir_dispatch_args(d, mk, wg_rows(static_cast<std::uint64_t>(C) * T, op), ptrs, ints, flts);
 }
 
 void masked_diffusion_commit(const Tensor& pred, const Tensor& idx, int k, int step, Tensor& tokens,
@@ -162,14 +158,11 @@ void masked_diffusion_commit(const Tensor& pred, const Tensor& idx, int k, int s
     need(op, k >= 0, "k must be >= 0");
     need(op, k <= idx.size(), "idx must hold at least k entries");
     if (k == 0) return;
-    SelPush pc{};
-    pc.a = addr(pred.data); pc.b = addr(idx.data); pc.c = addr(tokens.data); pc.d = addr(unmask_step.data);
-    pc.u[0] = static_cast<std::uint32_t>(k);
-    pc.u[1] = static_cast<std::uint32_t>(pred.size());
-    pc.u[2] = static_cast<std::uint32_t>(step);
     DeviceCtx& d = device_of(pred);
-    const Kernel& kk = d.pipelines().get(ShaderId::select, {SEL_COMMIT});
-    launch(d, kk, pc, groups_1d(static_cast<std::uint64_t>(k), kk));
+    const MirKernel mk = mir_kernel(d, MirKey{MirKind::SelectCommit});
+    const std::uint64_t ptrs[] = {addr(pred.data), addr(idx.data), addr(tokens.data), addr(unmask_step.data)};
+    const std::int32_t ints[] = {k, static_cast<std::int32_t>(pred.size()), step};
+    mir_dispatch_args(d, mk, mir_groups_1d(static_cast<std::uint32_t>(k), 1, kernels::kSelectBlock), ptrs, ints, {});
 }
 
 }  // namespace

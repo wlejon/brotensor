@@ -9,8 +9,6 @@
 
 namespace brotensor::kernels {
 
-namespace {
-
 std::pair<Value*, Value*> philox_words(Ctx& c, Value* k0, Value* k1, Value* sub64) {
     Value* c0 = c.b.build_trunc_i32(sub64);
     Value* c1 = c.b.build_trunc_i32(c.b.build_lshr(sub64, c.kb.const_i64(32)));
@@ -38,6 +36,8 @@ std::pair<Value*, Value*> philox_words(Ctx& c, Value* k0, Value* k1, Value* sub6
     }
     return {c0, c1};
 }
+
+namespace {
 
 Value* u32_to_u01(Ctx& c, Value* w) {
     Value* top24 = c.kb.u32_to_f32(c.b.build_lshr(w, c.i32(8)));

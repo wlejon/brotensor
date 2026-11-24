@@ -5,7 +5,11 @@
 
 #include "mir_common.h"
 
+#include <utility>
+
 namespace brotensor::kernels {
+
+std::pair<brass::Value*, brass::Value*> philox_words(Ctx& c, brass::Value* k0, brass::Value* k1, brass::Value* sub64);
 
 // Params: (x, e, p, y, z, n, dim, half, hw, c, k0, k1, k2, k3).
 brass::Function* build_sampler_mir(brass::Module& mod, std::uint32_t mode, Dtype dt, Dtype dti, int lanes = 1);

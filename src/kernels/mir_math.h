@@ -32,6 +32,7 @@ Value* emit_div_rn(Ctx& c, Value* a, Value* b);
 Value* emit_exp_acc(Ctx& c, Value* t);
 Value* emit_log_acc(Ctx& c, Value* x);
 std::pair<Value*, Value*> emit_sincos_acc(Ctx& c, Value* x);
+Value* emit_splitmix64_mix_u01(Ctx& c, Value* z64);
 
 // 256-thread block reductions (8x32 slices, safe across Wave32 & Wave64).
 // `scratch8` is `shared_alloc_f32(8)` (and `s_idx8` is `shared_alloc_i32(8)`).

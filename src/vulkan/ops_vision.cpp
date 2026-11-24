@@ -29,6 +29,9 @@
 #include "detail/gemm.h"
 #include "detail/kernels.h"
 #include "detail/spatial.h"
+#include "shaders/op_codes.h"
+#include "vk_mir_cache.h"
+#include "../kernels/mir_vision.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/ops.h>
@@ -52,12 +55,6 @@ void conv2d_backward_input(const Tensor& Wt, const Tensor& dY, int N, int C_in, 
 
 namespace {
 
-struct MiscPush {
-    std::uint64_t a, b, c, d, e;
-    std::uint32_t u[16];
-    float f[4];
-};
-
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
 }
@@ -66,20 +63,17 @@ void need(const char* op, bool ok, const char* what) {
     if (!ok) fail(op, what);
 }
 
-std::uint32_t u32(long long v) { return static_cast<std::uint32_t>(v); }
+std::int32_t i32(long long v) { return static_cast<std::int32_t>(v); }
 std::uint64_t esize(Dtype t) { return t == Dtype::FP32 ? 4u : 2u; }
 
-void run_misc(DeviceCtx& d, Dtype dt, std::uint32_t code, const MiscPush& pc, std::uint64_t items, bool per_group,
-              const char* op) {
+void run_vision(DeviceCtx& d, std::uint32_t code, Dtype dt, std::uint8_t flags, std::uint64_t items, bool per_group,
+                std::span<const std::uint64_t> ptrs, std::span<const std::int32_t> ints, std::span<const float> flts) {
     if (items == 0) return;
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::misc_f32, dt, op), {code});
-    if (per_group) {
-        const std::uint32_t gx = static_cast<std::uint32_t>(std::min<std::uint64_t>(items, 65535));
-        const std::uint32_t gy = static_cast<std::uint32_t>(std::min<std::uint64_t>((items + gx - 1) / gx, 65535));
-        launch(d, k, pc, gx, gy);
-    } else {
-        launch(d, k, pc, groups_1d(items, k));
-    }
+    const MirKernel mk = mir_kernel(d, MirKey{MirKind::Vision, code, dt, dt, 1, dt, flags});
+    const std::uint32_t gx = per_group
+        ? static_cast<std::uint32_t>(std::min<std::uint64_t>(items, 65535))
+        : mir_groups_1d(static_cast<std::uint32_t>(items), 1, kernels::kVisionBlock);
+    mir_dispatch_args(d, mk, gx, ptrs, ints, flts);
 }
 
 const void* opt(const Tensor* t) { return t && t->data && t->size() > 0 ? t->data : nullptr; }
@@ -276,17 +270,18 @@ void deform_conv2d_forward(const Tensor& X, const Tensor& offset, const Tensor* 
         for (int g = 0; g < groups; ++g) {
             for (int p0 = 0; p0 < P; p0 += static_cast<int>(pcn)) {
                 const int np = static_cast<int>(std::min<long long>(pcn, P - p0));
-                MiscPush pc{};
-                pc.a = addr(X.data) + std::uint64_t(n) * C_in * H * W * es;
-                pc.b = addr(offset.data) + std::uint64_t(n) * deform_groups * 2 * kk * P * es;
-                pc.c = opt(mask) ? addr(mask->data) + std::uint64_t(n) * deform_groups * kk * P * es : 0;
-                pc.d = addr(col.data);
-                const std::uint32_t u[] = {u32(Cgi), u32(H), u32(W), u32(Wo), u32(P), u32(kH), u32(kW),
-                                           u32(stride_h) | (u32(stride_w) << 16), u32(pad_h) | (u32(pad_w) << 16),
-                                           u32(dil_h) | (u32(dil_w) << 16), u32(C_in / deform_groups),
-                                           u32(g * Cgi), u32(p0), u32(np), 0, 0};
-                std::copy(std::begin(u), std::end(u), pc.u);
-                run_misc(d, dt, MI_DEFORM_COL, pc, std::uint64_t(Kd) * np, false, op);
+                const std::uint64_t off_ptr = addr(offset.data) + std::uint64_t(n) * deform_groups * 2 * kk * P * es;
+                const std::uint64_t mask_ptr = opt(mask) ? addr(mask->data) + std::uint64_t(n) * deform_groups * kk * P * es : 0;
+                const std::uint64_t ptrs[] = {
+                    addr(X.data) + std::uint64_t(n) * C_in * H * W * es, off_ptr, mask_ptr, addr(col.data)};
+                const std::int32_t ints[] = {
+                    i32(Cgi), i32(H), i32(W), i32(Wo), i32(P), i32(kH), i32(kW),
+                    static_cast<std::int32_t>(static_cast<std::uint32_t>(stride_h) | (static_cast<std::uint32_t>(stride_w) << 16)),
+                    static_cast<std::int32_t>(static_cast<std::uint32_t>(pad_h) | (static_cast<std::uint32_t>(pad_w) << 16)),
+                    static_cast<std::int32_t>(static_cast<std::uint32_t>(dil_h) | (static_cast<std::uint32_t>(dil_w) << 16)),
+                    i32(C_in / deform_groups), i32(g * Cgi), i32(p0), i32(np)};
+                const std::uint8_t flags = static_cast<std::uint8_t>(1u | (mask_ptr != 0 ? 2u : 0u));
+                run_vision(d, MI_DEFORM_COL, dt, flags, std::uint64_t(Kd) * np, false, ptrs, ints, {});
                 GemmArgs gm;
                 gm.op = op;
                 gm.a = addr(Wt.data) + std::uint64_t(g) * Cgo * Kd * es;
@@ -334,11 +329,11 @@ void modulated_conv2d_forward(const Tensor& X, const Tensor& W, const Tensor& s,
 
     DeviceCtx& d = device_of(X);
     Tensor Wn = Tensor::empty_on(X.device, N * C_out, static_cast<int>(wk), dt);
-    MiscPush pc{};
-    pc.a = addr(W.data); pc.b = addr(s.data); pc.c = addr(Wn.data); pc.d = addr(dcoef.data);
-    pc.u[0] = u32(N); pc.u[1] = u32(C_out); pc.u[2] = u32(C_in); pc.u[3] = u32(kH * kW); pc.u[4] = demodulate ? 1u : 0u;
-    pc.f[0] = eps;
-    run_misc(d, dt, MI_MODW, pc, std::uint64_t(N) * C_out, true, op);
+    const std::uint64_t ptrs[] = {addr(W.data), addr(s.data), addr(Wn.data), addr(dcoef.data)};
+    const std::int32_t ints[] = {i32(N), i32(C_out), i32(C_in), i32(kH * kW)};
+    const float flts[] = {eps};
+    run_vision(d, MI_MODW, dt, static_cast<std::uint8_t>(demodulate ? 1u : 0u),
+               std::uint64_t(N) * C_out, true, ptrs, ints, flts);
 
     Conv2dArgs a;
     a.op = op;
@@ -357,14 +352,15 @@ namespace {
 // col (Cgi kH kW, np) of image `x` (C_in, H, W), input channels from
 // ic_base, output pixels [p0, p0 + np): MI_DEFORM_COL without offsets.
 void im2col(DeviceCtx& d, Dtype dt, std::uint64_t x, std::uint64_t col, int Cgi, int H, int W, int Ho, int Wo, int kH,
-            int kW, int sh, int sw, int ph, int pw, int dh, int dw, int ic_base, int p0, int np, const char* op) {
-    MiscPush pc{};
-    pc.a = x; pc.d = col;
-    const std::uint32_t u[] = {u32(Cgi), u32(H), u32(W), u32(Wo), u32(static_cast<long long>(Ho) * Wo), u32(kH),
-                               u32(kW), u32(sh) | (u32(sw) << 16), u32(ph) | (u32(pw) << 16),
-                               u32(dh) | (u32(dw) << 16), 1u, u32(ic_base), u32(p0), u32(np), 0, 0};
-    std::copy(std::begin(u), std::end(u), pc.u);
-    run_misc(d, dt, MI_DEFORM_COL, pc, std::uint64_t(Cgi) * kH * kW * np, false, op);
+            int kW, int sh, int sw, int ph, int pw, int dh, int dw, int ic_base, int p0, int np, const char* /*op*/) {
+    const std::uint64_t ptrs[] = {x, 0, 0, col};
+    const std::int32_t ints[] = {
+        i32(Cgi), i32(H), i32(W), i32(Wo), i32(static_cast<long long>(Ho) * Wo), i32(kH), i32(kW),
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(sh) | (static_cast<std::uint32_t>(sw) << 16)),
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(ph) | (static_cast<std::uint32_t>(pw) << 16)),
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(dh) | (static_cast<std::uint32_t>(dw) << 16)),
+        1, i32(ic_base), i32(p0), i32(np)};
+    run_vision(d, MI_DEFORM_COL, dt, 0, std::uint64_t(Cgi) * kH * kW * np, false, ptrs, ints, {});
 }
 
 // Pixel slab for a col of `rows` rows: <= 32 Mi elements, a multiple of 64.
@@ -473,11 +469,11 @@ void modulated_conv2d_backward(const Tensor& X, const Tensor& W, const Tensor& s
 
     // w'' from the forward's coefficients, then dX = conv2d_backward_input.
     Tensor Wn = Tensor::empty_on(dev, N * C_out, static_cast<int>(wk), dt);
-    MiscPush pm{};
-    pm.a = addr(W.data); pm.b = addr(s.data); pm.c = addr(Wn.data); pm.d = addr(dcoef.data);
-    pm.u[0] = u32(N); pm.u[1] = u32(C_out); pm.u[2] = u32(C_in); pm.u[3] = u32(kH * kW);
-    pm.u[4] = demodulate ? 1u : 0u; pm.u[5] = 1u;
-    run_misc(d, dt, MI_MODW, pm, std::uint64_t(N) * C_out, true, op);
+    const std::uint64_t modw_ptrs[] = {addr(W.data), addr(s.data), addr(Wn.data), addr(dcoef.data)};
+    const std::int32_t mod_ints[] = {i32(N), i32(C_out), i32(C_in), i32(kH * kW)};
+    const float modw_flts[] = {0.0f};
+    const std::uint8_t modw_flags = static_cast<std::uint8_t>((demodulate ? 1u : 0u) | 2u);
+    run_vision(d, MI_MODW, dt, modw_flags, std::uint64_t(N) * C_out, true, modw_ptrs, mod_ints, modw_flts);
     Tensor dXv = Tensor::view(dev, dX.data, 1, static_cast<int>(static_cast<long long>(N) * C_in * H * Wd), dt);
     const Tensor dYv = Tensor::view(dev, dY.data, 1, static_cast<int>(static_cast<long long>(N) * C_out * Ho * Wo), dt);
     vulkan::conv2d_backward_input(Wn, dYv, 1, N * C_in, H, Wd, N * C_out, kH, kW, 1, 1, pad_h, pad_w, 1, 1, N, dXv);
@@ -487,15 +483,15 @@ void modulated_conv2d_backward(const Tensor& X, const Tensor& W, const Tensor& s
     weight_grad(d, dt, Dtype::FP32, addr(X.data), addr(dY.data), addr(dwp.data), N,
                 std::uint64_t(C_in) * H * Wd * es, std::uint64_t(C_out) * Ho * Wo * es,
                 std::uint64_t(C_out) * wk * 4u, C_in, H, Wd, C_out, kH, kW, 1, 1, pad_h, pad_w, 1, 1, 1, false, op);
-    pm.c = addr(dwp.data);
-    run_misc(d, dt, MI_MODW_BWD, pm, std::uint64_t(N) * C_out, true, op);   // dw'' -> dw'
-    MiscPush pd = pm;
-    pd.a = addr(W.data); pd.c = addr(dwp.data); pd.d = addr(ds.data);
-    run_misc(d, dt, MI_MODW_DS, pd, std::uint64_t(N) * C_in, false, op);
+    if (demodulate) {
+        const std::uint64_t bwd_ptrs[] = {addr(W.data), addr(s.data), addr(dwp.data), addr(dcoef.data)};
+        run_vision(d, MI_MODW_BWD, dt, 0, std::uint64_t(N) * C_out, true, bwd_ptrs, mod_ints, {});   // dw'' -> dw'
+    }
+    const std::uint64_t ds_ptrs[] = {addr(W.data), addr(dwp.data), addr(ds.data)};
+    run_vision(d, MI_MODW_DS, dt, 0, std::uint64_t(N) * C_in, false, ds_ptrs, mod_ints, {});
     if (want_dW) {
-        MiscPush pw = pm;
-        pw.b = addr(s.data); pw.c = addr(dwp.data); pw.e = addr(dW.data);
-        run_misc(d, dt, MI_MODW_DW, pw, std::uint64_t(C_out) * wk, false, op);
+        const std::uint64_t dw_ptrs[] = {addr(s.data), addr(dwp.data), addr(dW.data)};
+        run_vision(d, MI_MODW_DW, dt, 0, std::uint64_t(C_out) * wk, false, dw_ptrs, mod_ints, {});
     }
 }
 
@@ -540,13 +536,12 @@ bool conv_transpose2d_gemm(const Tensor& X, const Tensor& Wt, const Tensor* bias
             gm.sc = static_cast<long long>(per_image);
             gemm(d, gm);
         }
-        MiscPush pc{};
-        pc.a = addr(cols.data); pc.b = opt(bias) ? addr(bias->data) : 0;
-        pc.c = addr(Y.data) + std::uint64_t(n0) * C_out * Ho * Wo * es;
-        const std::uint32_t u[] = {u32(nn), u32(C_out), u32(H), u32(W), u32(kH), u32(kW), u32(sh), u32(sw), u32(ph),
-                                   u32(pw), u32(dh), u32(dw), u32(Cgo), u32(Ho), u32(Wo), cdt != dt ? 1u : 0u};
-        std::copy(std::begin(u), std::end(u), pc.u);
-        run_misc(d, dt, MI_COL2IM2D, pc, std::uint64_t(nn) * C_out * Ho * Wo, false, op);
+        const std::uint64_t bias_ptr = opt(bias) ? addr(bias->data) : 0;
+        const std::uint64_t ptrs[] = {addr(cols.data), bias_ptr, addr(Y.data) + std::uint64_t(n0) * C_out * Ho * Wo * es};
+        const std::int32_t ints[] = {i32(nn), i32(C_out), i32(H), i32(W), i32(kH), i32(kW), i32(sh), i32(sw),
+                                     i32(ph), i32(pw), i32(dh), i32(dw), i32(Ho), i32(Wo)};
+        const std::uint8_t flags = static_cast<std::uint8_t>((bias_ptr != 0 ? 1u : 0u) | (cdt != dt ? 2u : 0u));
+        run_vision(d, MI_COL2IM2D, dt, flags, std::uint64_t(nn) * C_out * Ho * Wo, false, ptrs, ints, {});
     }
     return true;
 }

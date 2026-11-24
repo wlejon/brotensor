@@ -38,6 +38,7 @@
 #include "kernels/mir_resample_bwd.h"
 #include "kernels/mir_rope.h"
 #include "kernels/mir_scatter.h"
+#include "kernels/mir_vision.h"
 #include "kernels/mir_xent.h"
 #include "vulkan/shaders/op_codes.h"
 
@@ -363,16 +364,40 @@ BackwardProofSuiteReport prove_upfirdn2d_adjoint_duality() {
     BackwardProofSuiteReport rep;
 
 #if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-    using detail::vulkan::ShaderId;
-    const ShaderId misc_ids[] = {
-        ShaderId::misc_f32,
-        ShaderId::misc_f16,
-        ShaderId::misc_bf16,
-    };
-    add_shader_family_proof(
-        rep,
-        "upfirdn2d_and_scatter_add_lifted_spirv_bounds_and_safety",
-        misc_ids);
+    {
+        bool all_ok = true;
+        std::uint32_t total_insts = 0, total_writes = 0, total_guards = 0, count = 0;
+        std::string first_failure;
+        brass::target::SpirvOptions spv_opts;
+        spv_opts.stage = brass::target::SpirvStage::Compute;
+        spv_opts.local_size_x = kernels::kVisionBlock;
+        spv_opts.local_size_spec_constants = true;
+        for (Dtype dt : {Dtype::FP32, Dtype::FP16, Dtype::BF16}) {
+            for (bool flip : {false, true}) {
+                brass::Module mir_mod("verify_upfirdn2d");
+                brass::Function* fn = kernels::build_vision_mir(mir_mod, MI_UPFIRDN, dt, flip, false);
+                brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, spv_opts);
+                LiftedSpirvCfgMetrics m = audit_lifted_spirv_words(sk.words, "mir_upfirdn2d");
+                total_insts += m.num_instructions;
+                total_writes += m.psb_stores_and_atomics;
+                total_guards += m.bounds_comparisons;
+                ++count;
+                if (!m.all_ok()) {
+                    all_ok = false;
+                    if (first_failure.empty()) first_failure = m.diagnostic;
+                }
+            }
+        }
+        std::ostringstream oss;
+        if (all_ok) {
+            oss << "Proven on " << count << " brass-MIR compiled upfirdn2d .spv binaries (" << total_insts
+                << " lifted SPIR-V insts, " << total_writes << " guarded PhysicalStorageBuffer64 writes, "
+                << total_guards << " bounds checks)";
+        } else {
+            oss << first_failure;
+        }
+        rep.entries.push_back({"upfirdn2d_lifted_spirv_bounds_and_safety", all_ok, oss.str()});
+    }
     {
         bool all_ok = true;
         std::uint32_t total_insts = 0, total_writes = 0, total_guards = 0, count = 0;

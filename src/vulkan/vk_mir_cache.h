@@ -8,6 +8,7 @@
 #include <brotensor/tensor.h>
 
 #include <cstdint>
+#include <span>
 
 namespace brotensor::detail::vulkan {
 
@@ -39,6 +40,12 @@ enum class MirKind : std::uint8_t {
     DeltaRule = 24,
     Xent = 25,
     Topk = 26,
+    SelectSample = 27,
+    SelectCounter = 28,
+    SelectCommit = 29,
+    SelectMd = 30,
+    Misc = 31,
+    Vision = 32,
 };
 
 struct MirKey {
@@ -163,5 +170,9 @@ void mir_dispatch_xent(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
 void mir_dispatch_topk(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
                        std::uint64_t x, std::uint64_t vals, std::uint64_t idx, std::uint64_t off,
                        std::uint32_t rows, std::uint32_t cols, std::uint32_t k, std::uint32_t nseg);
+void mir_dispatch_args(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                       std::span<const std::uint64_t> ptrs,
+                       std::span<const std::int32_t> ints,
+                       std::span<const float> flts);
 
 }  // namespace brotensor::detail::vulkan
