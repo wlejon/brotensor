@@ -8,6 +8,7 @@
 #include "../kernels/mir_elementwise.h"
 #include "../kernels/mir_gnorm.h"
 #include "../kernels/mir_lstm.h"
+#include "../kernels/mir_misc.h"
 #include "../kernels/mir_norm.h"
 #include "../kernels/mir_reduce.h"
 #include "../kernels/mir_remap.h"
@@ -15,7 +16,9 @@
 #include "../kernels/mir_resample_bwd.h"
 #include "../kernels/mir_rope.h"
 #include "../kernels/mir_scatter.h"
+#include "../kernels/mir_select.h"
 #include "../kernels/mir_topk.h"
+#include "../kernels/mir_vision.h"
 #include "../kernels/mir_xent.h"
 
 #if BROTENSOR_HAS_BRASS_CUDA_JIT
@@ -23,6 +26,7 @@
 #include <brass/target/ptx_target.hpp>
 #endif
 
+#include <array>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -123,6 +127,25 @@ CUfunction compile_mir(const MirKey& k) {
             break;
         case MirKind::Topk:
             fn = kernels::build_topk_mir(mod, k.op, k.dt0);
+            break;
+        case MirKind::SelectSample:
+            fn = kernels::build_select_sample_mir(mod, k.flags != 0);
+            break;
+        case MirKind::SelectCounter:
+            fn = kernels::build_select_counter_mir(mod);
+            break;
+        case MirKind::SelectCommit:
+            fn = kernels::build_select_commit_mir(mod);
+            break;
+        case MirKind::SelectMd:
+            fn = kernels::build_select_md_mir(
+                mod, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0);
+            break;
+        case MirKind::Misc:
+            fn = kernels::build_misc_mir(mod, k.op, k.dt0, k.flags != 0);
+            break;
+        case MirKind::Vision:
+            fn = kernels::build_vision_mir(mod, k.op, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
             break;
     }
     const std::string ptx = brass::target::PtxTarget::emit_function(*fn, jit::make_ptx_opts());
@@ -629,6 +652,35 @@ void mir_dispatch_topk(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
     std::int32_t anseg = static_cast<std::int32_t>(nseg);
     void* params[] = {&ax, &av, &aidx, &aoff, &arows, &acols, &ak, &anseg};
     launch_kernel_3d(fn, gx, gy, 1, kernels::kEwBlock, params, "mir_topk");
+}
+
+void mir_dispatch_args(CUfunction fn, std::uint32_t gx, std::uint32_t block_x,
+                       std::span<const std::uintptr_t> ptrs,
+                       std::span<const std::int32_t> ints,
+                       std::span<const float> flts) {
+    constexpr std::size_t kMaxArgs = 32;
+    const std::size_t total = ptrs.size() + ints.size() + flts.size();
+    if (total > kMaxArgs) {
+        throw std::runtime_error("mir_dispatch_args: too many kernel arguments");
+    }
+    std::array<CUdeviceptr, kMaxArgs> dptrs{};
+    std::array<std::int32_t, kMaxArgs> iargs{};
+    std::array<float, kMaxArgs> fargs{};
+    std::array<void*, kMaxArgs> params{};
+    std::size_t idx = 0;
+    for (std::size_t i = 0; i < ptrs.size(); ++i) {
+        dptrs[i] = static_cast<CUdeviceptr>(ptrs[i]);
+        params[idx++] = &dptrs[i];
+    }
+    for (std::size_t i = 0; i < ints.size(); ++i) {
+        iargs[i] = ints[i];
+        params[idx++] = &iargs[i];
+    }
+    for (std::size_t i = 0; i < flts.size(); ++i) {
+        fargs[i] = flts[i];
+        params[idx++] = &fargs[i];
+    }
+    launch_kernel(fn, gx, block_x, params.data(), "mir_args");
 }
 
 }  // namespace brotensor::detail::cuda

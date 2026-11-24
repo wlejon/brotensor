@@ -544,3 +544,18 @@ Extended `src/cuda/cu_mir_cache.{h,cpp}` (`167` / `589` LOC) with `MirKind::{Lst
   - Deleted 5 `.cu` files (`-1,572` lines): `lstm.cu` (`-494`), `gated_delta_rule.cu` (`-475`), `top_k.cu` (`-248`), `loss_legacy.cu` (`-207`), `packed_encoder.cu` (`-148`).
   - Slimmed `loss.cu` (`508 -> 155`, `-353` LOC, keeping `mse_vec_*` only); added `ops_lstm.cpp` (`167`), `ops_delta.cpp` (`63`), `ops_topk.cpp` (`80`), `ops_xent.cpp` (`130`), `cu_mir_cache.{h,cpp}` (`+121`).
   - Net `src/cuda/` Wave 5 delta: **`-1,364` lines** (`+121 / -1,925` git diff on `src/cuda/` + `440` new LOC; **cumulative CUDA Waves 3–5: `-5,613` net lines and 27 `.cu` files deleted**, all modified/created files `<= 589` LOC).
+
+---
+
+## Wave 6 (CUDA / RTX 4090): Token Selection, Vision (`upfirdn2d` / `modulated_conv2d` / `deform_conv2d`) & Small Misc Ops -> Single-Source Brass MIR
+
+Extended `src/cuda/cu_mir_cache.{h,cpp}` (`179` / `640` LOC) with `MirKind::{SelectSample, SelectCounter, SelectMd, SelectCommit, Misc, Vision}` and generic `mir_dispatch_args`, wired every Wave 6 op onto `src/kernels/{mir_select,mir_misc,mir_vision}` lowered via `PtxTarget::emit_function` (`sm_89`), added `ops_sampling.cpp` (`sample_logits`, `sample_logits_into`, `masked_diffusion_scores`, `masked_diffusion_commit`), `ops_misc.cpp` (`masked_mean_pool_*`, `build_slot_mask`, `build_causal_mask_row`, `threshold_u8`, `rows_count_above`, `xavier_init`, `sgd_step`, `adam_step`, `mse_vec_*`, `attention_token_moments`, `bias_act_*`, `upfirdn2d_*`), and `ops_vision.cpp` (`deform_conv2d_forward`, `modulated_conv2d_{forward,backward}` via `MI_DEFORM_COL` + `matmul` and `MI_MODW*` + `conv2d_*`), and deleted all 13 replaced `.cu` files (`conv_transpose2d.cu` 520 LOC & `filtered_lrelu.cu` 313 LOC kept intact for backward/fused polyphase synthesis).
+
+### Wave 6 CUDA Verification & LOC Delta (RTX 4090 GPU 0, `CUDA_VISIBLE_DEVICES=0`, `brass@d5608f4`)
+- **Targeted Wave 6 Part A Suites:** `19/19` passed (`95.53 s`, `0` failures): `api`, `api_gcstress`, `sample_logits`, `masked_diffusion`, `stylegan_primitives`, `bias_act`, `upfirdn2d`, `filtered_lrelu`, `stylegan_parity`, `attention_moments`, `public_reductions`, `optim_parity`, `adam_parity`, `loss_parity`, `loss_fused_parity`, `reduce_extra_parity`, `attention_moments_parity`, `sample_logits_parity`, `masked_mean_pool_parity`.
+- **Targeted Wave 6 Part B Suites:** `7/7` passed (`161.24 s`, `0` failures): `vit_block_ops`, `conv_transpose2d`, `stylegan_primitives`, `modulated_conv2d`, `stylegan_parity`, `deform_conv2d_parity`, `conv_transpose2d_parity`.
+- **Full CUDA `ctest` (`-LE gcstress -j 1`):** **`204/204` passed** (`1187.96 s`, `0` failures).
+- **LOC Delta (CUDA Wave 6):**
+  - Deleted 13 `.cu` files (`-2,877` lines): `sample_logits.cu` (`-470`), `modulated_conv2d.cu` (`-452`), `masked_diffusion.cu` (`-430`), `bias_act.cu` (`-261`), `deform_conv2d.cu` (`-203`), `upfirdn2d.cu` (`-200`), `reduce.cu` (`-197`), `loss.cu` (`-178`), `elementwise_misc.cu` (`-172`), `attention_moments.cu` (`-113`), `xavier_init.cu` (`-75`), `adam.cu` (`-66`), `optim.cu` (`-47`).
+  - Added / extended files (all `<= 640` LOC): `ops_sampling.cpp` (`166`), `ops_misc.cpp` (`360`), `ops_vision.cpp` (`343`), `cu_mir_cache.{h,cpp}` (`179` / `640`, `+65`).
+  - Net `src/cuda/` Wave 6 delta: **`-1,943` lines** (**cumulative CUDA Waves 3–6: `-7,556` net lines and 40 `.cu` files deleted**, all modified/created files `<= 640` LOC).

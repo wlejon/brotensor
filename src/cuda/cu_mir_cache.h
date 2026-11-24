@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <span>
 
 namespace brotensor::detail::cuda {
 
@@ -39,6 +40,12 @@ enum class MirKind : std::uint8_t {
     DeltaRule = 24,
     Xent = 25,
     Topk = 26,
+    SelectSample = 27,
+    SelectCounter = 28,
+    SelectMd = 29,
+    SelectCommit = 30,
+    Misc = 31,
+    Vision = 32,
 };
 
 struct MirKey {
@@ -180,5 +187,11 @@ void mir_dispatch_xent(CUfunction fn, std::uint32_t gx,
 void mir_dispatch_topk(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
                        const void* x, void* vals, void* idx, const void* off,
                        std::uint32_t rows, std::uint32_t cols, std::uint32_t k, std::uint32_t nseg);
+
+// ── Wave 6: select / misc / vision ──
+void mir_dispatch_args(CUfunction fn, std::uint32_t gx, std::uint32_t block_x,
+                       std::span<const std::uintptr_t> ptrs,
+                       std::span<const std::int32_t> ints,
+                       std::span<const float> flts);
 
 }  // namespace brotensor::detail::cuda

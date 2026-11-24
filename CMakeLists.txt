@@ -347,26 +347,23 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/ops_elementwise.cpp
         src/cuda/ops_gnorm.cpp
         src/cuda/ops_lstm.cpp
+        src/cuda/ops_misc.cpp
         src/cuda/ops_norm.cpp
         src/cuda/ops_reduce.cpp
         src/cuda/ops_rope.cpp
+        src/cuda/ops_sampling.cpp
         src/cuda/ops_scatter.cpp
         src/cuda/ops_spatial.cpp
         src/cuda/ops_spatial_bwd.cpp
         src/cuda/ops_topk.cpp
+        src/cuda/ops_vision.cpp
         src/cuda/ops_xent.cpp
-        src/cuda/elementwise_misc.cu
         src/cuda/attention.cu
-        src/cuda/optim.cu
-        src/cuda/adam.cu
-        src/cuda/reduce.cu
-        src/cuda/loss.cu
         src/cuda/concat.cu
         src/cuda/mha.cu
         src/cuda/batched_ops.cu
         src/cuda/conv2d.cu
         src/cuda/conv2d_wmma.cu
-        src/cuda/deform_conv2d.cu
         src/cuda/conv_transpose2d.cu
         src/cuda/conv3d.cu
         src/cuda/conv2d_int8w_wmma.cu
@@ -381,7 +378,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/conv2d_igemm_f32.cu
         src/cuda/cross_attention.cu
         src/cuda/cross_attention_with_attn.cu
-        src/cuda/attention_moments.cu
         src/cuda/flash_attention.cu
         src/cuda/flash_attention_qkvo.cu
         src/cuda/flash_attention_varlen_windowed.cu
@@ -407,12 +403,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/conv1d.cu
         src/cuda/codec_quant.cu
         src/cuda/resample1d.cu
-        src/cuda/sample_logits.cu
-        src/cuda/masked_diffusion.cu
-        src/cuda/xavier_init.cu
-        src/cuda/bias_act.cu
-        src/cuda/upfirdn2d.cu
-        src/cuda/modulated_conv2d.cu
         src/cuda/filtered_lrelu.cu
         src/cuda/register.cu
         src/cuda/cuda_driver.cpp
