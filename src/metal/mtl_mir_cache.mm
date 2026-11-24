@@ -3,7 +3,9 @@
 // Include Brass headers BEFORE Objective-C / Metal headers to avoid macro
 // collisions (Objective-C defines `NO`, <mach/machine.h> collides with enums).
 
+#include "../kernels/mir_attn_small.h"
 #include "../kernels/mir_audio.h"
+#include "../kernels/mir_conv_direct.h"
 #include "../kernels/mir_copy.h"
 #include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
@@ -160,6 +162,22 @@ const MirEntry* compile_mir(const MirKey& k) {
             fn = kernels::build_spectral_mir(
                 mod, k.op, static_cast<std::uint32_t>(k.flags & 0x03u),
                 (k.flags & 0x04u) != 0, (k.flags & 0x08u) != 0);
+            break;
+        case MirKind::AttnAux:
+            fn = kernels::build_attn_aux_mir(mod, k.op, k.dt0, k.flags != 0);
+            break;
+        case MirKind::AttnBwd:
+            fn = kernels::build_attn_bwd_mir(mod, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
+        case MirKind::FaCombine:
+            fn = kernels::build_fa_combine_mir(mod, k.dt0);
+            break;
+        case MirKind::AttnSoftmax:
+            fn = kernels::build_attn_softmax_mir(
+                mod, k.dt0, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0);
+            break;
+        case MirKind::ConvDirect:
+            fn = kernels::build_conv_direct_mir(mod, k.op, k.dt0, k.flags != 0);
             break;
     }
     brass::target::MslOptions opts;
@@ -705,6 +723,34 @@ void mir_dispatch_args(const MirKernel& mk, std::uint32_t gx, const char* op,
     for (std::int32_t v : ints) put_scalar(buf, e.msl, s++, v);
     for (float f : flts) put_scalar(buf, e.msl, s++, f);
     submit_mir_ptrs(e, gx, 1, 1, op, ptrs.data(), ptrs.size(), buf);
+}
+
+void mir_dispatch_conv_direct(std::uint32_t mode, Dtype dt, const char* op,
+                              const void* x, const void* w, const void* y, const void* bias,
+                              int n, int cin, int t, int h, int wd,
+                              int cout, int to, int ho, int wo,
+                              int kt, int kh, int kw,
+                              int st, int sh, int sw, int pt, int ph, int pw,
+                              int dt_d, int dh, int dw, int groups) {
+    const std::uint64_t total =
+        std::uint64_t(n) * std::uint64_t(cout) * std::uint64_t(to) *
+        std::uint64_t(ho) * std::uint64_t(wo);
+    if (total == 0) return;
+    if (total > 0xffffffffULL) {
+        throw std::runtime_error(std::string("brotensor: ") + op +
+                                 ": output too large for one dispatch");
+    }
+    const MirKernel mk = mir_kernel(
+        {MirKind::ConvDirect, mode, dt, Dtype::FP32, 1, Dtype::FP32,
+         static_cast<std::uint8_t>(bias != nullptr ? 1u : 0u)});
+    const std::uint32_t gx = static_cast<std::uint32_t>(
+        std::clamp<std::uint64_t>((total + 255u) / 256u, 1u, 65535u));
+    const void* ptrs[] = {x, w, y, bias};
+    const std::int32_t ints[] = {
+        n, cin, t, h, wd, cout, to, ho, wo, kt, kh, kw,
+        st, sh, sw, pt, ph, pw, dt_d, dh, dw, groups,
+    };
+    mir_dispatch_args(mk, gx, op, ptrs, ints, {});
 }
 
 }  // namespace brotensor::detail::metal

@@ -21,6 +21,8 @@
 // The query axis is chunked to hold P + dP under 256 MB; dK / dV accumulate
 // across chunks through the GEMM's accumulate epilogue.
 
+#include "mtl_mir_cache.h"
+
 #include <brotensor/runtime.h>
 #include <brotensor/detail/op_table.h>
 
@@ -102,37 +104,12 @@ kernel void k_fab_softmax_f32(device float*       S        [[buffer(0)]],
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
     for (uint k = tid; k < Lk; k += tg) s[k] *= inv;
 }
-
-// dS = P * (dP - D_q) * scale in place over P, D_q = sum_k P[q,k] dP[q,k].
-kernel void k_fab_dS_f32(device float*       P     [[buffer(0)]],
-                         device const float* dP    [[buffer(1)]],
-                         constant uint&      Lk    [[buffer(2)]],
-                         constant float&     scale [[buffer(3)]],
-                         threadgroup float*  red   [[threadgroup(0)]],
-                         uint row  [[threadgroup_position_in_grid]],
-                         uint tid  [[thread_index_in_threadgroup]],
-                         uint tg   [[threads_per_threadgroup]],
-                         uint sg   [[simdgroup_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-    device float* p = P + (ulong)row * Lk;
-    device const float* dp = dP + (ulong)row * Lk;
-    float acc = 0.0f;
-    for (uint k = tid; k < Lk; k += tg) acc += p[k] * dp[k];
-    const float Dq = tg_sum(acc, red, sg, lane, (tg + 31) / 32);
-    for (uint k = tid; k < Lk; k += tg) p[k] = p[k] * (dp[k] - Dq) * scale;
-}
 )msl";
 
 id<MTLComputePipelineState> pso_softmax() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_softmax_f32"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_dS() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kBwdSrc, @"k_fab_dS_f32"); });
     return pso;
 }
 
@@ -177,7 +154,7 @@ void run_rows(id<MTLComputePipelineState> pso, int rows, int Lk,
 // FP32 attention backward over one block; see the file comment. dQ / dK / dV
 // are overwritten on every head's columns.
 void backward_block_f32(Rows Q, Rows K, Rows V, Rows dO, Rows dQ, Rows dK, Rows dV, int Lq, int Lk, int D,
-                        int num_heads, int hd, id<MTLBuffer> bMask, NSUInteger oMask, bool causal) {
+                        int num_heads, int hd, const float* d_mask, id<MTLBuffer> bMask, NSUInteger oMask, bool causal) {
     const size_t kMaxScratchBytes = size_t(256) << 20;   // P + dP
     const int chunk = std::max(1, std::min(Lq, static_cast<int>(kMaxScratchBytes / (2 * sizeof(float) * size_t(Lk)))));
     thread_local static Tensor P = Tensor::empty_on(Device::Metal, 0, 0);
@@ -190,7 +167,12 @@ void backward_block_f32(Rows Q, Rows K, Rows V, Rows dO, Rows dQ, Rows dK, Rows 
     const uint32_t Lku = static_cast<uint32_t>(Lk), has_mask = bMask ? 1u : 0u, causal_u = causal ? 1u : 0u;
     id<MTLBuffer> mbuf = bMask ? bMask : rP.buf;
     const NSUInteger mofs = bMask ? oMask : rP.ofs;
-    id<MTLComputePipelineState> p_sm = pso_softmax(), p_ds = pso_dS();
+    id<MTLComputePipelineState> p_sm = causal ? pso_softmax() : nil;
+    const MirKernel mk_sm = causal
+        ? MirKernel{}
+        : mir_kernel({MirKind::AttnSoftmax, 0u, Dtype::FP32, Dtype::FP32, 1, Dtype::FP32,
+                      static_cast<std::uint8_t>(d_mask ? 1u : 0u)});
+    const MirKernel mk_bwd = mir_kernel({MirKind::AttnBwd, 0u, Dtype::FP32, Dtype::FP32, 1, Dtype::FP32, 0u});
 
     for (int h = 0; h < num_heads; ++h) {
         const size_t c0 = static_cast<size_t>(h) * hd;
@@ -199,27 +181,37 @@ void backward_block_f32(Rows Q, Rows K, Rows V, Rows dO, Rows dQ, Rows dK, Rows 
             const size_t qe = static_cast<size_t>(q0) * D + c0;
             const bool first = q0 == 0;
             gemm(advance(Q, qe), D, false, advance(K, c0), D, false, rP, Lk, rows, Lk, hd, false);
-            const uint32_t q0u = static_cast<uint32_t>(q0);
-            run_rows(p_sm, rows, Lk, ^(id<MTLComputeCommandEncoder> enc) {
-                [enc setBuffer:rP.buf offset:rP.ofs atIndex:0];
-                [enc setBuffer:mbuf offset:mofs atIndex:1];
-                [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:2];
-                [enc setBytes:&scale length:sizeof(float) atIndex:3];
-                [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:4];
-                [enc setBytes:&causal_u length:sizeof(uint32_t) atIndex:5];
-                [enc setBytes:&q0u length:sizeof(uint32_t) atIndex:6];
-            });
+            if (causal) {
+                const uint32_t q0u = static_cast<uint32_t>(q0);
+                run_rows(p_sm, rows, Lk, ^(id<MTLComputeCommandEncoder> enc) {
+                    [enc setBuffer:rP.buf offset:rP.ofs atIndex:0];
+                    [enc setBuffer:mbuf offset:mofs atIndex:1];
+                    [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:2];
+                    [enc setBytes:&scale length:sizeof(float) atIndex:3];
+                    [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:4];
+                    [enc setBytes:&causal_u length:sizeof(uint32_t) atIndex:5];
+                    [enc setBytes:&q0u length:sizeof(uint32_t) atIndex:6];
+                });
+            } else {
+                const void* sm_ptrs[] = {P.data, P.data, nullptr, d_mask, nullptr};
+                const std::int32_t sm_ints[] = {rows, Lk, rows, 0, Lk, Lk, 0, 0};
+                const float sm_flts[] = {scale};
+                mir_dispatch_args(mk_sm, static_cast<std::uint32_t>(std::clamp(rows, 1, 65535)),
+                                  "flash_attention_backward", sm_ptrs, sm_ints, sm_flts);
+            }
             gemm(advance(dO, qe), D, false, advance(V, c0), D, false, rdP, Lk, rows, Lk, hd, false);
             // dV_h (+)= P^T dO_h: A = P read transposed, B = dO_h read transposed.
             gemm(rP, Lk, true, advance(dO, qe), D, true, advance(dV, c0), D, Lk, hd, rows, !first);
-            run_rows(p_ds, rows, Lk, ^(id<MTLComputeCommandEncoder> enc) {
-                [enc setBuffer:rP.buf offset:rP.ofs atIndex:0];
-                [enc setBuffer:rdP.buf offset:rdP.ofs atIndex:1];
-                [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:2];
-                [enc setBytes:&scale length:sizeof(float) atIndex:3];
-            });
-            gemm(rP, Lk, false, advance(K, c0), D, true, advance(dQ, qe), D, rows, hd, Lk, false);
-            gemm(rP, Lk, true, advance(Q, qe), D, true, advance(dK, c0), D, Lk, hd, rows, !first);
+            {
+                // dS = P * (dP - rowsum(P * dP)) * scale, in place over dP.
+                const void* bwd_ptrs[] = {P.data, dP.data, nullptr, nullptr};
+                const std::int32_t bwd_ints[] = {rows, rows, Lk};
+                const float bwd_flts[] = {scale};
+                mir_dispatch_args(mk_bwd, static_cast<std::uint32_t>(std::clamp(rows, 1, 65535)),
+                                  "flash_attention_backward", bwd_ptrs, bwd_ints, bwd_flts);
+            }
+            gemm(rdP, Lk, false, advance(K, c0), D, true, advance(dQ, qe), D, rows, hd, Lk, false);
+            gemm(rdP, Lk, true, advance(Q, qe), D, true, advance(dK, c0), D, Lk, hd, rows, !first);
         }
     }
 }
@@ -310,7 +302,7 @@ void flash_attention_backward(const Tensor& Q,
     id<MTLBuffer> bMask = pool_require(d_mask, oMask, "flash_attention_backward", "mask");
     Fp32Io io(Q, K, V, dO, dQ, dK, dV);
     backward_block_f32(rows_of(*io.Q), rows_of(*io.K), rows_of(*io.V), rows_of(*io.dO), rows_of(*io.dQ),
-                       rows_of(*io.dK), rows_of(*io.dV), Lq, Lk, D, num_heads, hd, bMask, oMask, causal);
+                       rows_of(*io.dK), rows_of(*io.dV), Lq, Lk, D, num_heads, hd, d_mask, bMask, oMask, causal);
     io.finish(dQ, dK, dV);
 }
 
@@ -421,7 +413,7 @@ void flash_attention_varlen_backward(const Tensor& Q,
         if (Lq == 0 || Lk == 0) continue;
         const size_t qe = static_cast<size_t>(cq[b]) * D, ke = static_cast<size_t>(ck[b]) * D;
         backward_block_f32(advance(rQ, qe), advance(rK, ke), advance(rV, ke), advance(rdO, qe), advance(rdQ, qe),
-                           advance(rdK, ke), advance(rdV, ke), Lq, Lk, D, num_heads, head_dim, nil, 0, causal);
+                           advance(rdK, ke), advance(rdV, ke), Lq, Lk, D, num_heads, head_dim, nullptr, nil, 0, causal);
     }
     io.finish(dQ, dK, dV);
 }

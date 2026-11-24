@@ -1,3 +1,5 @@
+#include "mtl_mir_cache.h"
+
 #include <brotensor/runtime.h>
 #include <brotensor/detail/op_table.h>
 
@@ -29,16 +31,6 @@ namespace {
 constexpr NSUInteger FA_BLOCK = 128;
 constexpr NSUInteger FA_KTILE = 64;
 
-id<MTLComputePipelineState> pso_fa_softmax_f32(bool bf16) {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso[2];
-    dispatch_once(&once, ^{
-        pso[0] = compile_pipeline(kSrc, @"k_fa_softmax_f32_half");
-        pso[1] = compile_pipeline(kSrc, @"k_fa_softmax_f32_bf16");
-    });
-    return pso[bf16 ? 1 : 0];
-}
-
 id<MTLComputePipelineState> pso_flash() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
@@ -67,18 +59,6 @@ id<MTLComputePipelineState> pso_flash_varlen_fp32() {
     static dispatch_once_t once;
     static id<MTLComputePipelineState> pso;
     dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_flash_attention_varlen_fp32"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_extract_DL() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_extract_head_DL"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_extract_DL_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_extract_head_DL_bf16"); });
     return pso;
 }
 
@@ -143,26 +123,6 @@ void run_causal_flash(const Tensor& Q,
     }
 }
 
-// Encode an extract / pack kernel onto the given encoder. n_elems = L*head_dim.
-void encode_per_elem(id<MTLComputeCommandEncoder> enc,
-                     id<MTLComputePipelineState> pso,
-                     id<MTLBuffer> bIn,  NSUInteger oIn,
-                     id<MTLBuffer> bOut, NSUInteger oOut,
-                     uint32_t L, uint32_t D, uint32_t head_off, uint32_t head_dim) {
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:bIn  offset:oIn  atIndex:0];
-    [enc setBuffer:bOut offset:oOut atIndex:1];
-    [enc setBytes:&L        length:sizeof(uint32_t) atIndex:2];
-    [enc setBytes:&D        length:sizeof(uint32_t) atIndex:3];
-    [enc setBytes:&head_off length:sizeof(uint32_t) atIndex:4];
-    [enc setBytes:&head_dim length:sizeof(uint32_t) atIndex:5];
-    NSUInteger total = (NSUInteger)L * (NSUInteger)head_dim;
-    NSUInteger tg = 256;
-    NSUInteger grid = ((total + tg - 1) / tg) * tg;
-    [enc dispatchThreads:MTLSizeMake(grid, 1, 1)
-      threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-}
-
 } // namespace
 
 void flash_attention_forward(const Tensor& Q,
@@ -179,7 +139,6 @@ void flash_attention_forward(const Tensor& Q,
     if (K.dtype != dt || V.dtype != dt) {
         throw std::runtime_error("flash_attention_forward: Q, K, V dtype must match");
     }
-    const bool bf16 = (dt == Dtype::BF16);
     const int Lq = Q.rows;
     const int Lk = K.rows;
     if (causal && Lq != Lk) {
@@ -198,99 +157,24 @@ void flash_attention_forward(const Tensor& Q,
     }
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
-    // Causal path: keep existing online-softmax kernel. SD1.5 does not use
-    // causal here, so the per-head matmul fast path covers production.
     if (causal) {
         run_causal_flash(Q, K, V, d_mask, num_heads, O, Lq, Lk, D, head_dim);
         return;
     }
 
-    // ---- Per-head pipeline: FP32 scores, FP32 softmax, one narrowing of P ----
-    // S = Q_h @ K_h^T comes out of the mixed-precision GEMM in FP32, read
-    // straight from Q / K's head columns (lda = ldb = D). The softmax reads it
-    // in FP32 and writes P in the operand dtype, which the P @ V GEMM
-    // multiplies against V_h^T and stores into O's head columns (ldc = D).
-    // A 16-bit score ahead of the softmax costs 4-7e-3 (FP16) / 3-5e-2 (BF16)
-    // of the row max at peaked shapes; exact scores leave only the P and
-    // output rounding (the CUDA per-head path does the same). The query axis
-    // is chunked to hold the FP32 score buffer under 128 MB.
-    const size_t kMaxScoreBytes = size_t(128) << 20;
-    const int chunk = std::max(1, std::min(Lq, static_cast<int>(kMaxScoreBytes / (sizeof(float) * size_t(Lk)))));
-    thread_local static Tensor S32 = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor P = Tensor::empty_on(Device::Metal, 0, 0);
-    thread_local static Tensor Vth = Tensor::empty_on(Device::Metal, 0, 0);
-    if (S32.rows != chunk || S32.cols != Lk || S32.dtype != Dtype::FP32) S32.resize(chunk, Lk, Dtype::FP32);
-    if (P.rows != chunk || P.cols != Lk || P.dtype != dt) P.resize(chunk, Lk, dt);
-    if (Vth.rows != head_dim || Vth.cols != Lk || Vth.dtype != dt) Vth.resize(head_dim, Lk, dt);
-
-    id<MTLComputePipelineState> p_ext_DL = bf16 ? pso_extract_DL_bf16() : pso_extract_DL();
-    id<MTLComputePipelineState> p_sm = pso_fa_softmax_f32(bf16);
-
-    id<MTLBuffer> bQ = buffer_for(Q);    const NSUInteger oQ = buffer_offset_for(Q);
-    id<MTLBuffer> bK = buffer_for(K);    const NSUInteger oK = buffer_offset_for(K);
-    id<MTLBuffer> bV = buffer_for(V);    const NSUInteger oV = buffer_offset_for(V);
-    id<MTLBuffer> bO = buffer_for(O);    const NSUInteger oO = buffer_offset_for(O);
-    id<MTLBuffer> bS = buffer_for(S32);  const NSUInteger oS = buffer_offset_for(S32);
-    id<MTLBuffer> bP = buffer_for(P);    const NSUInteger oP = buffer_offset_for(P);
-    id<MTLBuffer> bVt = buffer_for(Vth); const NSUInteger oVt = buffer_offset_for(Vth);
-
-    NSUInteger oM = 0;
-    id<MTLBuffer> bM = pool_require(d_mask, oM, "flash_attention_forward", "mask");
-    const uint32_t has_mask = d_mask ? 1u : 0u;
-    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-    const NSUInteger esz = static_cast<NSUInteger>(dtype_size_bytes(dt));
-    const metal_impl::AbtType ty = metal_impl::abt_type(dt);
-
-    NSUInteger sm_tg = 32;
-    while ((int)sm_tg < Lk && sm_tg < 1024) sm_tg *= 2;
-    const uint32_t Lku = Lk, Du = D, hdU = head_dim;
-
-    for (int h = 0; h < num_heads; ++h) {
-        const uint32_t head_off = (uint32_t)h * (uint32_t)head_dim;
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = new_command_buffer();
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-            encode_per_elem(enc, p_ext_DL, bV, oV, bVt, oVt, Lku, Du, head_off, hdU);
-            [enc endEncoding];
-            ::brotensor::metal_impl::submit(cmd);
-        }
-        for (int q0 = 0; q0 < Lq; q0 += chunk) {
-            const int rows = std::min(chunk, Lq - q0);
-            const NSUInteger q_elem = static_cast<NSUInteger>(q0) * D + head_off;
-
-            metal_impl::AbtMixed qk;
-            qk.A = bQ; qk.ofs_A = oQ + q_elem * esz; qk.lda = D;
-            qk.B = bK; qk.ofs_B = oK + NSUInteger(head_off) * esz; qk.ldb = D;
-            qk.C = bS; qk.ofs_C = oS; qk.ldc = Lk;
-            qk.M = rows; qk.N = Lk; qk.K = head_dim;
-            qk.in = ty; qk.out = metal_impl::kAbtF32;
-            metal_impl::launch_matmul_abt_mixed(qk);
-
-            @autoreleasepool {
-                id<MTLCommandBuffer> cmd = new_command_buffer();
-                id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                [enc setComputePipelineState:p_sm];
-                [enc setBuffer:bS offset:oS atIndex:0];
-                [enc setBuffer:bP offset:oP atIndex:1];
-                [enc setBuffer:(bM ? bM : bS) offset:(bM ? oM : oS) atIndex:2];
-                [enc setBytes:&Lku length:sizeof(uint32_t) atIndex:3];
-                [enc setBytes:&scale length:sizeof(float) atIndex:4];
-                [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:5];
-                [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(sm_tg, 1, 1)];
-                [enc endEncoding];
-                ::brotensor::metal_impl::submit(cmd);
-            }
-
-            metal_impl::AbtMixed pv;
-            pv.A = bP; pv.ofs_A = oP; pv.lda = Lk;
-            pv.B = bVt; pv.ofs_B = oVt; pv.ldb = Lk;
-            pv.C = bO; pv.ofs_C = oO + q_elem * esz; pv.ldc = D;
-            pv.M = rows; pv.N = head_dim; pv.K = Lk;
-            pv.in = pv.out = ty;
-            metal_impl::launch_matmul_abt_mixed(pv);
-        }
-    }
+    DenseAttnProblem p;
+    p.op = "flash_attention_forward";
+    p.dev = Q.device;
+    p.dt = dt;
+    p.q = Q.data; p.k = K.data; p.v = V.data; p.o = O.data;
+    p.mask = d_mask;
+    p.lq = Lq; p.lk = Lk;
+    p.ldq = p.ldk = p.ldo = D;
+    p.hd = head_dim; p.hq = p.hkv = num_heads;
+    DenseAttnExtras x;
+    x.auto_scale = true;
+    x.mask_ge = false;
+    dense_attention_metal(p, x);
 }
 
 void flash_attention_varlen_forward(const Tensor& Q,

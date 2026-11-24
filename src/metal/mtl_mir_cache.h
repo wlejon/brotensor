@@ -46,6 +46,11 @@ enum class MirKind : std::uint8_t {
     Vision = 32,
     Audio = 33,
     Spectral = 34,
+    AttnAux = 35,
+    AttnBwd = 36,
+    FaCombine = 37,
+    AttnSoftmax = 38,
+    ConvDirect = 39,
 };
 
 struct MirKey {
@@ -216,5 +221,41 @@ void mir_dispatch_args(const MirKernel& mk, std::uint32_t gx, const char* op,
                        std::span<const void* const> ptrs,
                        std::span<const std::int32_t> ints,
                        std::span<const float> flts);
+void mir_dispatch_conv_direct(std::uint32_t mode, Dtype dt, const char* op,
+                              const void* x, const void* w, const void* y, const void* bias,
+                              int n, int cin, int t, int h, int wd,
+                              int cout, int to, int ho, int wo,
+                              int kt, int kh, int kw,
+                              int st, int sh, int sw, int pt, int ph, int pw,
+                              int dt_d, int dh, int dw, int groups);
+
+struct DenseAttnProblem {
+    const char* op = "attention";
+    Device dev = Device::Metal;
+    Dtype dt = Dtype::FP32;
+    const void* q = nullptr;
+    const void* k = nullptr;
+    const void* v = nullptr;
+    void* o = nullptr;
+    const void* mask = nullptr;
+    int lq = 0, lk = 0;
+    int ldq = 0, ldk = 0, ldo = 0;
+    int hd = 0, hq = 0, hkv = 0;
+};
+
+struct DenseAttnExtras {
+    float scale = 0.0f;
+    bool auto_scale = true;
+    const void* bias = nullptr;
+    long long bias_hs = -1;
+    const void* rel_h = nullptr;
+    const void* rel_w = nullptr;
+    int grid_h = 0, grid_w = 0;
+    const void* qmask = nullptr;
+    bool mask_ge = false;
+    void* probs = nullptr;
+};
+
+void dense_attention_metal(const DenseAttnProblem& p, const DenseAttnExtras& x);
 
 }  // namespace brotensor::detail::metal

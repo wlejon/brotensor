@@ -142,41 +142,6 @@ kernel void k_flash_attention(
 
 // ---- Per-head V transpose for the fallback's P @ V GEMM ----
 //
-// X is (L, D) with D = num_heads * head_dim. The GEMMs read Q / K / O's head
-// columns in place; only V is copied, transposed, so P @ V is an A @ B^T.
-
-// Extract a single head and TRANSPOSE: Y is (head_dim, L) with element
-// (d, l) = X[l, head_off + d]. Feeds the second matmul as B-operand.
-kernel void k_extract_head_DL(
-        device const half* X   [[buffer(0)]],     // (L, D)
-        device half*       Y   [[buffer(1)]],     // (head_dim, L)
-        constant uint& L         [[buffer(2)]],
-        constant uint& D         [[buffer(3)]],
-        constant uint& head_off  [[buffer(4)]],
-        constant uint& head_dim  [[buffer(5)]],
-        uint gid [[thread_position_in_grid]]) {
-    uint total = L * head_dim;
-    if (gid >= total) return;
-    uint l = gid / head_dim;
-    uint d = gid % head_dim;
-    Y[d * L + l] = X[l * D + head_off + d];
-}
-
-kernel void k_extract_head_DL_bf16(
-        device const bfloat* X   [[buffer(0)]],   // (L, D)
-        device bfloat*       Y   [[buffer(1)]],   // (head_dim, L)
-        constant uint& L         [[buffer(2)]],
-        constant uint& D         [[buffer(3)]],
-        constant uint& head_off  [[buffer(4)]],
-        constant uint& head_dim  [[buffer(5)]],
-        uint gid [[thread_position_in_grid]]) {
-    uint total = L * head_dim;
-    if (gid >= total) return;
-    uint l = gid / head_dim;
-    uint d = gid % head_dim;
-    Y[d * L + l] = X[l * D + head_off + d];
-}
-
 // BF16 online-softmax flash-attention kernel. Verbatim copy of
 // k_flash_attention with half -> bfloat.
 kernel void k_flash_attention_bf16(
@@ -680,62 +645,6 @@ kernel void k_flash_attention_varlen_fp32(
         ++slot;
     }
 }
-
-// Row softmax over FP32 scores S (rows, Lk) — the per-head fallback's scores
-// come out of the GEMM in FP32, so every exp() sees an exact score and only
-// the normalised probability is narrowed, once, for the P @ V GEMM. Scores
-// are scaled by `scale`; with a mask, key k is dropped where mask[k] <= 0.5.
-// One threadgroup per row.
-template <typename TO>
-kernel void k_fa_softmax_f32(device const float* S    [[buffer(0)]],
-                             device TO*          P    [[buffer(1)]],
-                             device const float* mask [[buffer(2)]],
-                             constant uint& Lk        [[buffer(3)]],
-                             constant float& scale    [[buffer(4)]],
-                             constant uint& has_mask  [[buffer(5)]],
-                             threadgroup float* red   [[threadgroup(0)]],
-                             uint row  [[threadgroup_position_in_grid]],
-                             uint tid  [[thread_index_in_threadgroup]],
-                             uint tg   [[threads_per_threadgroup]],
-                             uint sg   [[simdgroup_index_in_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]]) {
-    device const float* s = S + (ulong)row * Lk;
-    device TO* pr = P + (ulong)row * Lk;
-    const uint nsg = (tg + 31) / 32;
-    float mx = -1e30f;
-    for (uint k = tid; k < Lk; k += tg) {
-        const float v = (has_mask != 0u && mask[k] <= 0.5f) ? -1e30f : s[k] * scale;
-        mx = max(mx, v);
-    }
-    mx = simd_max(mx);
-    if (lane == 0) red[sg] = mx;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mx = lane < nsg ? red[lane] : -1e30f;
-    mx = simd_max(mx);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const bool empty = mx <= -1e29f;
-    float sum = 0.0f;
-    for (uint k = tid; k < Lk; k += tg) {
-        const bool drop = empty || (has_mask != 0u && mask[k] <= 0.5f);
-        sum += drop ? 0.0f : exp(s[k] * scale - mx);
-    }
-    sum = simd_sum(sum);
-    if (lane == 0) red[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    sum = lane < nsg ? red[lane] : 0.0f;
-    sum = simd_sum(sum);
-    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-    for (uint k = tid; k < Lk; k += tg) {
-        const bool drop = empty || (has_mask != 0u && mask[k] <= 0.5f);
-        pr[k] = TO(drop ? 0.0f : exp(s[k] * scale - mx) * inv);
-    }
-}
-template [[host_name("k_fa_softmax_f32_half")]] kernel void k_fa_softmax_f32<half>(
-    device const float*, device half*, device const float*, constant uint&, constant float&,
-    constant uint&, threadgroup float*, uint, uint, uint, uint, uint);
-template [[host_name("k_fa_softmax_f32_bf16")]] kernel void k_fa_softmax_f32<bfloat>(
-    device const float*, device bfloat*, device const float*, constant uint&, constant float&,
-    constant uint&, threadgroup float*, uint, uint, uint, uint, uint);
 )msl";
 
 } // namespace

@@ -468,7 +468,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/packed_encoder.mm
         src/metal/layernorm.mm
         src/metal/attention.mm
-        src/metal/mha.mm
+        src/metal/attention_bwd.mm
         src/metal/loss.mm
         src/metal/misc.mm
         src/metal/vision.mm
@@ -482,8 +482,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/resample.mm
         src/metal/resample_bwd.mm
         src/metal/diffusion.mm
-        src/metal/cross_attention.mm
-        src/metal/cross_attention_with_attn.mm
         src/metal/flash_attention.mm
         src/metal/flash_attention_backward.mm
         src/metal/resblock.mm
@@ -493,7 +491,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/kv_cache.mm
         src/metal/public_reductions.mm
         src/metal/int8_quant.mm
-        src/metal/self_attention_bias.mm
         src/metal/audio.mm
         src/metal/spectral.mm
         src/metal/sample_logits.mm
