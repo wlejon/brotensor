@@ -35,6 +35,8 @@
 #include "kernels/mir_attn_small.h"
 #include "kernels/mir_audio.h"
 #include "kernels/mir_conv_direct.h"
+#include "kernels/mir_gemm_simt.h"
+#include "kernels/mir_gemv.h"
 #include "kernels/mir_rope.h"
 #include "kernels/mir_scatter.h"
 #include "kernels/mir_select.h"
@@ -667,6 +669,21 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
         audit_mir("dequant", [](brass::Module& m) {
             return kernels::build_dequant_mir(m, QF_Q4K, true);
         });
+        for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
+                 {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
+            const std::string cs_name = std::string("conv_simt") + sfx;
+            audit_mir(cs_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_conv_simt_mir(m, dt, false, true, true, 3, 3, 1, 1, 1, 1, 1, 1);
+            });
+            const std::string gs_name = std::string("gemm_simt") + sfx;
+            audit_mir(gs_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_gemm_simt_mir(m, dt, dt, dt, dt, false, 1u, 1u, false, false, true);
+            });
+            const std::string gv_name = std::string("gemv") + sfx;
+            audit_mir(gv_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_gemv_mir(m, dt, dt, dt, 1u, 1u, 1u, true, true);
+            });
+        }
     }
 
     // 4. Synthetic negative test if not already covered by ShaderId::test_shared_overflow

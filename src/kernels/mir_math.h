@@ -19,6 +19,7 @@ Value* emit_gelu_tanh(Ctx& c, Value* x);
 Value* emit_gelu_tanh_grad(Ctx& c, Value* x);
 Value* emit_gelu_exact(Ctx& c, Value* x);
 Value* emit_round_even(Ctx& c, Value* x);
+Value* emit_gemm_act(Ctx& c, std::uint32_t act, Value* v);
 
 Value* emit_exp(Ctx& c, Value* x);
 Value* emit_log(Ctx& c, Value* x);

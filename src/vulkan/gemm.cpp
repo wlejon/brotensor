@@ -81,7 +81,7 @@ bool cm_vec_ok(const GemmArgs& g) {
 bool gemv_eligible(DeviceCtx& d, const GemmArgs& g) {
     if (g_override.load(std::memory_order_relaxed) != 0 || g.qb != 0) return false;
     const std::uint32_t sgs = d.info().subgroup_size;
-    if (sgs < 4 || sgs > 64 || 64 % sgs != 0) return false;
+    if (sgs < 32 || sgs > 64 || 64 % sgs != 0) return false;
     if (g.ta || g.nb || g.batch != 1 || g.m > 8) return false;
     if (g.da != g.dc) return false;
     return g.db == g.da || (g.da == Dtype::FP32 && is16(g.db));
@@ -99,19 +99,6 @@ ShaderId cm_shader(const GemmArgs& g) {
     if (g.da == Dtype::FP32) return g.db == Dtype::FP16 ? ShaderId::gemm_cm_f32a_w16 : ShaderId::gemm_cm_f32a_wbf16;
     if (g.dc == Dtype::FP32) return g.da == Dtype::FP16 ? ShaderId::gemm_cm_f16_c32 : ShaderId::gemm_cm_bf16_c32;
     return g.da == Dtype::FP16 ? ShaderId::gemm_cm_f16 : ShaderId::gemm_cm_bf16;
-}
-
-// The SIMT shader for (A, B, C) dtypes, or kCount when there is none.
-ShaderId simt_shader(const GemmArgs& g) {
-    if (g.da == g.db && g.dc == g.da) return dt_variant(ShaderId::gemm_simt_f32, g.da, g.op);
-    if (g.da == Dtype::FP32 && g.dc == Dtype::FP32 && g.db == Dtype::FP16) return ShaderId::gemm_simt_f32_w16;
-    if (g.da == Dtype::FP32 && g.dc == Dtype::FP32 && g.db == Dtype::BF16) return ShaderId::gemm_simt_f32_wbf16;
-    // 16-bit operands, FP32 result (attention scores, FP32 projections): the
-    // GLU pass's variants. Their bias is in the operands' dtype (gemm.h).
-    if (g.da == g.db && is16(g.da) && g.dc == Dtype::FP32) {
-        return g.da == Dtype::FP16 ? ShaderId::gemm_simt_f16_c32 : ShaderId::gemm_simt_bf16_c32;
-    }
-    return ShaderId::kCount;
 }
 
 const CmCfg& pick_cm(const GemmArgs& g, std::uint32_t nout) {
@@ -254,17 +241,19 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
     GemmPush pc = make_push(g);
 
     if (gemv_eligible(d, g)) {
-        ShaderId id;
-        if (g.db == g.da) id = dt_variant(ShaderId::gemv_f32, g.da, g.op);
-        else id = g.db == Dtype::FP16 ? ShaderId::gemv_f32_w16 : ShaderId::gemv_f32_wbf16;
-        const Kernel& k = d.pipelines().get(id, {static_cast<std::uint32_t>(g.m),
-                                                 static_cast<std::uint32_t>(g.epi),
-                                                 static_cast<std::uint32_t>(g.act),
-                                                 vec_ok(g) && g.k % 8 == 0 && g.k > 0 ? 1u : 0u});
+        const bool vec = vec_ok(g) && g.k % 8 == 0 && g.k > 0;
+        const std::uint32_t op = static_cast<std::uint32_t>(g.m) |
+                                 (static_cast<std::uint32_t>(g.epi) << 4) |
+                                 (static_cast<std::uint32_t>(g.act) << 8);
+        const std::uint8_t flags = static_cast<std::uint8_t>((vec ? 1u : 0u) | (g.bias ? 2u : 0u));
+        const MirKernel mk = mir_kernel(d, {MirKind::Gemv, op, g.da, g.db, 1, g.dc, flags});
         const std::uint64_t groups = cdiv(nout, 4);
-        const std::uint32_t gx = static_cast<std::uint32_t>(std::min<std::uint64_t>(groups, 65535));
+        const std::uint32_t gx = static_cast<std::uint32_t>(
+            std::max<std::uint64_t>(1, std::min<std::uint64_t>(groups, 65535)));
         const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(groups, gx));
-        launch(d, k, pc, gx, gy);
+        const std::uint64_t ptrs[] = {g.a, g.b, g.c, g.bias};
+        const std::int32_t ints[] = {g.m, g.n, g.k, g.lda, g.ldb, g.ldc, g.n / 2};
+        mir_dispatch_args_3d(d, mk, gx, gy, 1u, ptrs, ints, {});
         return;
     }
 
@@ -327,28 +316,46 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
     // The SIMT kernel has no GLU epilogue: it writes r (bias included) to an
     // FP32 scratch, unrounded, and a separate pass gates it into C.
     const bool glu = g.epi == EPI_GEGLU || g.epi == EPI_SWIGLU;
-    ShaderId id = simt_shader(g);
-    if (glu && g.da == g.db && g.dc == g.da && is16(g.da)) {
-        id = g.da == Dtype::FP16 ? ShaderId::gemm_simt_f16_c32 : ShaderId::gemm_simt_bf16_c32;
-    }
-    if (id == ShaderId::kCount) fail(g, "unsupported dtype combination on Vulkan");
+    const bool same_all = (g.da == g.db && g.dc == g.da);
+    const bool f32_w16 = (g.da == Dtype::FP32 && g.dc == Dtype::FP32 && is16(g.db));
+    const bool f16_c32 = (g.da == g.db && is16(g.da) && g.dc == Dtype::FP32);
+    if (!same_all && !f32_w16 && !f16_c32) fail(g, "unsupported dtype combination on Vulkan");
+    Dtype dc = g.dc;
+    std::uint64_t c_addr = g.c;
+    std::int32_t ldc = g.ldc;
     ::brotensor::Tensor r;
-    GemmPush p = pc;
     if (glu) {
         if (g.batch != 1) fail(g, "batched GLU epilogue");
         r = ::brotensor::Tensor::empty_on(::brotensor::Device::vulkan(d.index()), g.m, g.n, Dtype::FP32);
-        p.c = addr(r.data);
-        p.ldc = static_cast<std::uint32_t>(g.n);
+        dc = Dtype::FP32;
+        c_addr = addr(r.data);
+        ldc = g.n;
     }
+    const Dtype dt_bias = f16_c32 ? g.da : dc;
     const std::uint64_t tiles_big = cdiv(g.m, kSimtCfgs[0].bm) * cdiv(g.n, kSimtCfgs[0].bn) * g.batch;
     const SimtCfg& c = tiles_big >= 160 ? kSimtCfgs[0] : kSimtCfgs[1];
-    const std::uint32_t wg = (c.bm / c.tm) * (c.bn / c.tn);
-    const std::uint32_t spec[] = {c.bm, c.bn, c.bk, c.tm, c.tn, wg,
-                                  static_cast<std::uint32_t>(glu ? EPI_STORE : g.epi),
-                                  static_cast<std::uint32_t>(g.act), g.ta ? 1u : 0u, g.nb ? 1u : 0u};
-    const Kernel& k = d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)));
-    launch_batched(d, k, p, g, static_cast<std::uint32_t>(cdiv(g.n, c.bn)),
-                   static_cast<std::uint32_t>(cdiv(g.m, c.bm)));
+    const std::uint32_t epi = static_cast<std::uint32_t>(glu ? EPI_STORE : g.epi);
+    const std::uint32_t op = epi | (static_cast<std::uint32_t>(g.act) << 4) |
+                             (static_cast<std::uint32_t>(dt_code(dt_bias, g.op)) << 8);
+    const std::uint8_t flags = static_cast<std::uint8_t>(
+        ((c.bm == 128) ? 1u : 0u) | (g.ta ? 2u : 0u) | (g.nb ? 4u : 0u) | (g.bias ? 8u : 0u));
+    const MirKernel mk = mir_kernel(d, {MirKind::GemmSimt, op, g.da, g.db, 1, dc, flags});
+    const std::uint32_t gx = static_cast<std::uint32_t>(cdiv(g.n, c.bn));
+    const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(g.m, c.bm));
+    if (gx > 65535 || gy > 65535) fail(g, "matrix too large for one dispatch");
+    for (int z0 = 0; z0 < g.batch; z0 += 65535) {
+        const int nz = std::min(65535, g.batch - z0);
+        const std::uint64_t ptrs[] = {
+            g.a + static_cast<std::uint64_t>(z0) * g.sa * esize(g.da),
+            g.b + static_cast<std::uint64_t>(z0) * g.sb * esize(g.db),
+            c_addr + static_cast<std::uint64_t>(z0) * g.sc * esize(dc),
+            g.bias,
+        };
+        const std::int32_t ints[] = {g.m, g.n, g.k, g.lda, g.ldb, ldc,
+                                     static_cast<std::int32_t>(g.sa), static_cast<std::int32_t>(g.sb),
+                                     static_cast<std::int32_t>(g.sc)};
+        mir_dispatch_args_3d(d, mk, gx, gy, static_cast<std::uint32_t>(nz), ptrs, ints, {});
+    }
     if (glu) {
         if (g.ldc != static_cast<int>(nout)) fail(g, "GLU output must be contiguous");
         if (g.epi == EPI_GEGLU) {

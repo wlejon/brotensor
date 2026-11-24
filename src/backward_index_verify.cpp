@@ -31,6 +31,7 @@
 #include "kernels/mir_attn_small.h"
 #include "kernels/mir_conv_direct.h"
 #include "kernels/mir_delta.h"
+#include "kernels/mir_gemm_simt.h"
 #include "kernels/mir_elementwise.h"
 #include "kernels/mir_gnorm.h"
 #include "kernels/mir_lstm.h"
@@ -369,19 +370,27 @@ BackwardProofSuiteReport prove_conv2d_adjoint_duality() {
         acc.finish(rep, "conv2d_lifted_spirv_conv_direct_f32_f16_bf16_bounds_and_safety", "conv_direct");
     }
 #endif
+#if BROTENSOR_HAS_BRASS_JIT
+    {
+        MirAuditAccum acc(kernels::kEwBlock);
+        for (Dtype dt : {Dtype::FP32, Dtype::FP16, Dtype::BF16}) {
+            acc.check("mir_conv_simt", [dt](brass::Module& m) {
+                return kernels::build_conv_simt_mir(m, dt, false, true, true, 3, 3, 1, 1, 1, 1, 1, 1);
+            });
+        }
+        acc.finish(rep, "conv2d_lifted_spirv_conv_simt_bounds_and_barrier_safety", "conv_simt");
+    }
+#endif
 #if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
     using detail::vulkan::ShaderId;
-    const ShaderId simt_cm_ids[] = {
-        ShaderId::conv_simt_f32,
-        ShaderId::conv_simt_f16,
-        ShaderId::conv_simt_bf16,
+    const ShaderId cm_ids[] = {
         ShaderId::conv_cm_f16,
         ShaderId::conv_cm_bf16,
     };
     add_shader_family_proof(
         rep,
-        "conv2d_lifted_spirv_conv_simt_and_cm_bounds_and_barrier_safety",
-        simt_cm_ids);
+        "conv2d_lifted_spirv_conv_cm_bounds_and_barrier_safety",
+        cm_ids);
 #endif
 
     // Prove tile interior bounds elimination & symbolic lockstep global/shared bounds

@@ -88,6 +88,17 @@ Value* emit_gelu_exact(Ctx& c, Value* x) {
     return c.b.build_mul(c.b.build_mul(c.f32(0.5f), x), c.b.build_add(c.f32(1.0f), erf_v));
 }
 
+Value* emit_gemm_act(Ctx& c, std::uint32_t act, Value* v) {
+    switch (act) {
+        case 1: return c.kb.fmax(v, c.f32(0.0f));                                // LACT_RELU
+        case 2: return emit_gelu_tanh(c, v);                                     // LACT_GELU_TANH
+        case 3: return emit_gelu_exact(c, v);                                    // LACT_GELU_EXACT
+        case 4: return c.b.build_mul(v, emit_sigmoid(c, v));                     // LACT_SILU
+        case 5: return c.b.build_mul(v, emit_sigmoid(c, c.b.build_mul(v, c.f32(1.702f))));  // LACT_QUICK_GELU
+        default: return v;
+    }
+}
+
 Value* emit_div_rn(Ctx& c, Value* a, Value* b_val) {
     Value* r = c.b.build_sdiv(c.f32(1.0f), b_val);
     Value* q = c.b.build_mul(a, r);

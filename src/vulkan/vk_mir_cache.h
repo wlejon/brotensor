@@ -56,6 +56,9 @@ enum class MirKind : std::uint8_t {
     GemmRowscale = 40,
     WqRows = 41,
     Dequant = 42,
+    Gemv = 43,
+    GemmSimt = 44,
+    ConvSimt = 45,
 };
 
 struct MirKey {
@@ -66,6 +69,7 @@ struct MirKey {
     std::uint8_t lanes = 1;
     Dtype dt2 = Dtype::FP32;
     std::uint8_t flags = 0;
+    std::uint64_t aux = 0;
 
     bool operator==(const MirKey& o) const noexcept = default;
 };

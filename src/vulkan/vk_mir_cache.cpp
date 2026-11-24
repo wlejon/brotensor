@@ -7,6 +7,8 @@
 #include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
 #include "../kernels/mir_elementwise.h"
+#include "../kernels/mir_gemm_simt.h"
+#include "../kernels/mir_gemv.h"
 #include "../kernels/mir_gnorm.h"
 #include "../kernels/mir_lstm.h"
 #include "../kernels/mir_misc.h"
@@ -44,6 +46,7 @@ struct MirKeyHash {
         h = (h * 1315423911u) ^ (static_cast<std::size_t>(k.dt0) << 16) ^
             (static_cast<std::size_t>(k.dt1) << 8) ^ static_cast<std::size_t>(k.dt2);
         h = (h * 1315423911u) ^ (static_cast<std::size_t>(k.lanes) << 8) ^ k.flags;
+        h = (h * 1315423911u) ^ static_cast<std::size_t>(k.aux ^ (k.aux >> 32));
         return h;
     }
 };
@@ -162,6 +165,27 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
         case MirKind::Dequant:
             fn = kernels::build_dequant_mir(mod, k.op, k.flags != 0);
             break;
+        case MirKind::Gemv:
+            fn = kernels::build_gemv_mir(
+                mod, k.dt0, k.dt1, k.dt2,
+                k.op & 0x0fu, (k.op >> 4) & 0x0fu, (k.op >> 8) & 0x0fu,
+                (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
+        case MirKind::GemmSimt: {
+            const auto dt_bias = static_cast<Dtype>((k.op >> 8) & 0xffu);
+            fn = kernels::build_gemm_simt_mir(
+                mod, k.dt0, k.dt1, k.dt2, dt_bias,
+                (k.flags & 1u) != 0, k.op & 0x0fu, (k.op >> 4) & 0x0fu,
+                (k.flags & 2u) != 0, (k.flags & 4u) != 0, (k.flags & 8u) != 0);
+            break;
+        }
+        case MirKind::ConvSimt: {
+            const auto byte = [&](int s) -> int { return static_cast<int>((k.aux >> (s * 8)) & 0xffu); };
+            fn = kernels::build_conv_simt_mir(
+                mod, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
+                byte(0), byte(1), byte(2), byte(3), byte(4), byte(5), byte(6), byte(7));
+            break;
+        }
     }
     brass::target::SpirvOptions opts;
     opts.stage = brass::target::SpirvStage::Compute;

@@ -647,3 +647,24 @@ Extended Metal's runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`, `271` / `7
   - Modified files (all `<= 787` LOC; max file across all of `src/metal/` is `852` LOC): `mtl_mir_cache.{h,mm}` (`261 -> 271` / `756 -> 787`), `linear_wq.mm` (`406 -> 296`), `q4k.mm` (`345 -> 282`), `q6k.mm` (`328 -> 278`), `q8_0.mm` (`256 -> 218`), `src/kernels/mir_quant_helpers.cpp` (`415 -> 423`).
   - **Net Metal LOC delta (Wave 9):** **`-220` net Metal LOC** (`src/metal/` `18,045 -> 17,825` LOC; **cumulative Waves 1–9: `-18,860` net Metal LOC** and 50 Metal files deleted).
 
+---
+
+## Wave 10: Vulkan Decode GEMV, SIMT GEMM & Implicit-GEMM SIMT Conv (`gemv` / `gemm_simt` / `conv_simt`) -> Single-Source Brass MIR
+
+Replaced 3 GLSL shaders / 15 compiled variants (`gemv.comp` `137`L × 5, `gemm_simt.comp` `125`L × 7, `conv_simt.comp` `134`L × 3; `37 -> 22` compiled Vulkan shaders, leaving 9 `.comp` files total) with two backend-neutral `brass::Function` MIR modules:
+- `src/kernels/mir_gemv.{h,cpp}` (`18 + 192` LOC): `build_gemv_mir` supporting `MB in 1..8`, `EPI in {STORE, ACCUM, GEGLU, SWIGLU}`, `ACT in {NONE, RELU, GELU_TANH, GELU_EXACT, SILU, QUICK_GELU}`, mixed `FP32` activations × `FP16`/`BF16` weights, `UNR in {2, 4}` software-pipelined 16-byte `load_lanes` loads, and 32-lane `shfl_bfly_f32` + 2-slot shared Wave32/Wave64 reduction.
+- `src/kernels/mir_gemm_simt.{h,cpp}` (`24 + 355` LOC): shared `run_simt_k_loop` double-buffered register-prefetched `64x64/4x4` and `128x128/8x8` outer-product engine (`WG = 256`) backing both `build_gemm_simt_mir` (NT/TN/NN/TT layouts, batched z-dispatch, mixed/C32 bias dtype, fused activations & `ACCUM`) and `build_conv_simt_mir` (2D implicit GEMM grouped/dilated/strided convolution with compile-time geometry specialization via `MirKey::aux`).
+- Added `emit_gemm_act` to `src/kernels/mir_math.{h,cpp}`, added `std::uint64_t aux` + `MirKind::{Gemv, GemmSimt, ConvSimt}` to `src/vulkan/vk_mir_cache.{h,cpp}` (`206 / 706` LOC), wired `src/vulkan/gemm.cpp` (`369` LOC) & `src/vulkan/ops_conv.cpp` (`621` LOC), updated `CMakeLists.txt`, `detail/kernels.h`, `shaders/shaders.cmake`, `src/backward_index_verify.cpp` (`965` LOC), and `src/backward_shader_audit.cpp` (`743` LOC).
+
+### Wave 10 Correctness, Proof Audit & LOC Delta (Radeon 8060S)
+- **Formal Audits:**
+  - `brotensor_test_backward_index_proofs`: **20 / 20 ALL PASSED** (including `conv2d_lifted_spirv_conv_simt_bounds_and_barrier_safety` across 3 compiled MIR `conv_simt` `.spv` binaries: `5,793` insts, `48` writes, `320` cmp, `0` hazards).
+  - `brotensor_test_backward_shader_audit`: **160 / 160 ALL PASSED** (`115,287` SPIR-V/PTX insts, `187` workgroup arrays, `7,373` shared / `2,684` global accesses proven, `657` uniform barriers, `975` uniform collectives).
+- **Unit, Parity & Vulkan Suites (`0` failures after final edit):**
+  - `brotensor_test_vulkan --only={gemm,conv,linear,attention,ops,train}` (`OK: 0 failure(s)`)
+  - **50 / 50** `ctest -j 1` suites (`gemm|matmul|linear|lora|conv|resblock|attention|ops_fused`, `331.46 s`, `0` failures).
+- **LOC Delta (Vulkan Wave 10):**
+  - `src/vulkan/shaders/*`: `3,970 -> 3,574` (**`-396` lines**; cumulative **`-4,661` lines** / 41 `.comp` files / 118 variants deleted across Waves 1–10, **`140 -> 22` compiled Vulkan shaders**, `9` `.comp` files remaining: `conv_cm`, `gemm_cm`, `fa_cm`, `fa_bwd_cm`, `fa_rows`, `fa_bwd`, `gemv_q`, `dft64`, `test_shared_overflow`).
+  - Shared backend-neutral `src/kernels/*`: `7,837` lines across 51 files (`+601` lines in Wave 10, max file `591` lines).
+
+
