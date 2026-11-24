@@ -20,6 +20,8 @@
 #include "jit/gpu_mir_emit_detail.h"
 #include "jit/trace_dag.h"
 #include "jit/trace_plan.h"
+#include "kernels/mir_elementwise.h"
+#include "vulkan/shaders/op_codes.h"
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/builder.hpp>
 #include <brass/mir/module.hpp>
@@ -51,23 +53,6 @@ std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::str
     if (name == "fill_bytes") {
         return {{0, 0, 1, 1, 1}};
     }
-    if (name == "cast_f32_to_f16" || name == "cast_f32_to_bf16") {
-        return {{0, 0, 2, 4, 16}, {1, 0, 2, 2, 16}};
-    }
-    if (name == "cast_f16_to_f32" || name == "cast_bf16_to_f32") {
-        return {{0, 0, 2, 2, 16}, {1, 0, 2, 4, 16}};
-    }
-    if (name == "cast_f16_to_bf16" || name == "cast_bf16_to_f16" ||
-        name == "binary_f16" || name == "binary_bf16" ||
-        name == "unary_f16" || name == "unary_bf16") {
-        return {{0, 0, 2, 2, 16}, {1, 0, 2, 2, 16}};
-    }
-    if (name == "binary_f32" || name == "unary_f32") {
-        return {{0, 0, 2, 4, 16}, {1, 0, 2, 4, 16}};
-    }
-    if (name == "binary_f32_f16") {
-        return {{0, 0, 2, 4, 16}, {1, 0, 2, 2, 16}};
-    }
     if (name == "act_bwd_f32") {
         return {{0, 0, 3, 4, 16}, {1, 0, 3, 4, 16}, {2, 0, 3, 4, 16}};
     }
@@ -79,10 +64,6 @@ std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::str
     }
     if (name == "jit_spirv_elementwise_scalar") {
         return {{0, 0, 3, 4, 4}, {1, 0, 3, 4, 4}, {2, 0, 3, 4, 4}};
-    }
-    if (name == "bias_f32" || name == "bias_f16" || name == "bias_bf16") {
-        const std::uint32_t eb = (name == "bias_f32") ? 4u : 2u;
-        return {{0, 0, 2, eb, 16}, {1, 0, 3, eb, 16}};
     }
     if (name == "rowvec_f32" || name == "rowvec_f16" || name == "rowvec_bf16") {
         const std::uint32_t eb = (name == "rowvec_f32") ? 4u : 2u;
@@ -128,6 +109,14 @@ std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::str
             {0, 0, 3, eb_x, 16, -1, -1, 2}, // x: 2 * n elements
             {1, 0, 3, eb_x, 16, -1, -1, 1}, // dy: n elements
             {2, 0, 3, eb_y, 16, -1, -1, 1}, // y: n elements
+        };
+    }
+    if (name == "glu_bwd_f32" || name == "glu_bwd_f16" || name == "glu_bwd_bf16") {
+        const std::uint32_t eb = (name == "glu_bwd_f32") ? 4u : 2u;
+        return {
+            {0, 0, 3, eb, 16, -1, -1, 2}, // x: 2 * n elements
+            {1, 0, 3, eb, 16, -1, -1, 1}, // dy: n elements
+            {2, 0, 3, eb, 16, -1, -1, 2}, // dx: 2 * n elements
         };
     }
     if (name == "rope_f32" || name == "rope_f16" || name == "rope_bf16") {
@@ -179,9 +168,6 @@ std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::str
 }
 
 std::vector<brass::verify::GpuParamConstraint> param_constraints_for_shader(const std::string& name) {
-    if (name == "bias_f32" || name == "bias_f16" || name == "bias_bf16") {
-        return {{3, UINT32_MAX, 1, 0}, {4, UINT32_MAX, 1, 0}};
-    }
     if (name == "rowvec_f32" || name == "rowvec_f16" || name == "rowvec_bf16") {
         return {{5, UINT32_MAX, 1, 0}};
     }
@@ -189,7 +175,8 @@ std::vector<brass::verify::GpuParamConstraint> param_constraints_for_shader(cons
         return {{4, 2, 0, 0}, {4, 3, 0, 0}};
     }
     if (name == "glu_f32" || name == "glu_f16" || name == "glu_bf16" ||
-        name == "glu_f32_to_f16" || name == "glu_f32_to_bf16") {
+        name == "glu_f32_to_f16" || name == "glu_f32_to_bf16" ||
+        name == "glu_bwd_f32" || name == "glu_bwd_f16" || name == "glu_bwd_bf16") {
         return {
             {4, UINT32_MAX, 1, 0, UINT32_MAX, 0}, // d >= 1
             {3, UINT32_MAX, 0, 0, 4, 0},          // n % d == 0
@@ -446,6 +433,34 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
         ptx_sum.collectives_proven = bar_res.collectives_proven;
         ptx_sum.diagnostic = (ptx_sum.memory_safe && ptx_sum.barriers_uniform) ? "OK" : mem_res.diagnostic;
         report.shaders.push_back(std::move(ptx_sum));
+    }
+
+    // 3b. Single-source brass-MIR act_bwd & glu forward/backward kernels
+    {
+        struct MirAuditSpec { const char* name; bool is_glu; std::uint32_t op; Dtype dt; };
+        const MirAuditSpec mir_specs[] = {
+            {"act_bwd_f32",  false, GOP_RELU,       Dtype::FP32},
+            {"act_bwd_f16",  false, GOP_RELU,       Dtype::FP16},
+            {"act_bwd_bf16", false, GOP_RELU,       Dtype::BF16},
+            {"glu_f32",      true,  GLU_SWIGLU,     Dtype::FP32},
+            {"glu_f16",      true,  GLU_SWIGLU,     Dtype::FP16},
+            {"glu_bf16",     true,  GLU_SWIGLU,     Dtype::BF16},
+            {"glu_bwd_f32",  true,  GLU_SWIGLU_BWD, Dtype::FP32},
+            {"glu_bwd_f16",  true,  GLU_SWIGLU_BWD, Dtype::FP16},
+            {"glu_bwd_bf16", true,  GLU_SWIGLU_BWD, Dtype::BF16},
+        };
+        brass::target::SpirvOptions spv_opts;
+        spv_opts.stage = brass::target::SpirvStage::Compute;
+        spv_opts.local_size_x = kernels::kEwBlock;
+        spv_opts.local_size_spec_constants = true;
+        for (const auto& ms : mir_specs) {
+            brass::Module mir_mod(ms.name);
+            brass::Function* fn = ms.is_glu
+                ? kernels::build_glu_mir(mir_mod, ms.op, ms.dt, ms.dt, 1)
+                : kernels::build_act_bwd_mir(mir_mod, ms.op, ms.dt, 1);
+            brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, spv_opts);
+            report.shaders.push_back(audit_spirv_binary_words(ms.name, sk.words.data(), sk.words.size()));
+        }
     }
 
     // 4. Synthetic negative test if not already covered by ShaderId::test_shared_overflow

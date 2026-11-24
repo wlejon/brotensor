@@ -96,8 +96,8 @@ static void test_backward_shader_audit_suite() {
     CHECK(seen.count("ptx_bwd_reduce_sm80") == 1);
 
 #if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-    // Production Vulkan backward shaders from shader_table.h
-    CHECK(report.shaders.size() >= 149);
+    // Production Vulkan backward shaders from shader_table.h + brass MIR kernels
+    CHECK(report.shaders.size() >= 131);
     const char* required_vk_shaders[] = {
         "act_bwd_f32",
         "act_bwd_f16",

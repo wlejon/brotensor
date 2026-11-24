@@ -40,9 +40,8 @@ inline int dt_code(::brotensor::Dtype dt, const char* op) {
 // consecutive in shaders.cmake. A new family is added here too; register.cpp
 // checks the order of every one at start-up.
 inline constexpr ShaderId kDtypeFamilies[] = {
-    ShaderId::unary_f32,  ShaderId::binary_f32,   ShaderId::act_bwd_f32,     ShaderId::bias_f32,
     ShaderId::sum_rows_f32, ShaderId::argmax_rows_f32, ShaderId::sum_cols_f32,
-    ShaderId::gemm_simt_f32, ShaderId::gemv_f32, ShaderId::glu_f32, ShaderId::norm_f32,
+    ShaderId::gemm_simt_f32, ShaderId::gemv_f32, ShaderId::norm_f32,
     ShaderId::rope_f32, ShaderId::rowvec_f32, ShaderId::fa_rows_f32, ShaderId::fa_combine_f32,
     ShaderId::attn_softmax_f32, ShaderId::attn_aux_f32, ShaderId::topk_seg_f32,
     ShaderId::conv_simt_f32, ShaderId::conv_direct_f32, ShaderId::resample_f32, ShaderId::gnorm_f32,

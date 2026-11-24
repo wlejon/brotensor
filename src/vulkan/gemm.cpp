@@ -4,6 +4,7 @@
 
 #include "detail/gemm.h"
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <algorithm>
 #include <atomic>
@@ -24,8 +25,6 @@ struct GemmPush {
     std::uint32_t m, n, k, lda, ldb, ldc, sa, sb, sc, half_n;
     std::uint32_t tm0, tn0;   // gemm_cm: tile origin of the dispatch
 };
-
-struct GluPush { std::uint64_t x, dy, y; std::uint32_t n, d; };
 
 struct RowScalePush { std::uint64_t a, out; std::uint32_t m, k, lda, sa; };
 
@@ -184,12 +183,10 @@ void check_args(const GemmArgs& g) {
 // Gates an FP32 r (rows, 2 half) into y of dtype `dt`.
 void glu_pass(DeviceCtx& d, std::uint32_t op, std::uint64_t x, std::uint64_t y, Dtype dt,
               std::uint32_t rows, std::uint32_t half) {
-    const ShaderId id = dt == Dtype::FP32   ? ShaderId::glu_f32
-                        : dt == Dtype::FP16 ? ShaderId::glu_f32_to_f16
-                                            : ShaderId::glu_f32_to_bf16;
-    const Kernel& k = d.pipelines().get(id, {op});
-    const GluPush pc{x, 0, y, rows * half, half};
-    launch(d, k, pc, groups_1d(pc.n, k));
+    const std::uint32_t n = rows * half;
+    const int lanes = (op != GLU_GEGLU_PAIRS) ? mir_vec_lanes_mixed(Dtype::FP32, dt, half, x, y) : 1;
+    const MirKernel mk = mir_kernel(d, {MirKind::Glu, op, Dtype::FP32, dt, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_glu(d, mk, mir_groups_1d(n, lanes), x, 0, y, n, half);
 }
 
 // A BF16 A on the cooperative-matrix kernel is staged with per-row

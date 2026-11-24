@@ -5,6 +5,7 @@
 // shares X's dtype (the CUDA contract); outputs are resized.
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -18,19 +19,16 @@ using ::brotensor::Tensor;
 
 namespace {
 
-struct GluPush { std::uint64_t x, dy, y; std::uint32_t n, d; };
 struct RowvecPush { std::uint64_t x, v, w, y; std::uint32_t n, d; };
-
-[[noreturn]] void fail(const char* op, const std::string& why) {
-    throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
-}
 
 void glu(const char* op, std::uint32_t code, const Tensor& X, const Tensor* dY, Tensor& out) {
     dt_code(X.dtype, op);
-    if (X.cols % 2 != 0) fail(op, "X.cols must be even (2*D)");
+    if (X.cols % 2 != 0) throw std::runtime_error(std::string("brotensor: ") + op + ": X.cols must be even (2*D)");
     const int B = X.rows, D = X.cols / 2;
     if (dY) {
-        if (dY->dtype != X.dtype || dY->size() != static_cast<long long>(B) * D) fail(op, "dY must be (B, D) in X's dtype");
+        if (dY->dtype != X.dtype || dY->size() != static_cast<long long>(B) * D) {
+            throw std::runtime_error(std::string("brotensor: ") + op + ": dY must be (B, D) in X's dtype");
+        }
         if (out.rows != B || out.cols != 2 * D || out.dtype != X.dtype) out.resize(B, 2 * D, X.dtype);
     } else if (out.rows != B || out.cols != D || out.dtype != X.dtype) {
         out.resize(B, D, X.dtype);
@@ -38,15 +36,25 @@ void glu(const char* op, std::uint32_t code, const Tensor& X, const Tensor* dY, 
     const std::uint32_t n = count32(out, op) / (dY ? 2u : 1u);
     if (n == 0) return;
     DeviceCtx& d = device_of(X);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::glu_f32, X.dtype, op), {code});
-    const GluPush pc{addr(X.data), dY ? addr(dY->data) : 0, addr(out.data), n, static_cast<std::uint32_t>(D)};
-    launch(d, k, pc, groups_1d(n, k));
+    const std::uint64_t ax = addr(X.data), ady = dY ? addr(dY->data) : 0, aout = addr(out.data);
+    int lanes = 1;
+    if (code != GLU_GEGLU_PAIRS && (D % 4 == 0)) {
+        const std::uint32_t du = static_cast<std::uint32_t>(D);
+        const int max_l = mir_vec_lanes(X.dtype, du, ax, aout, ady);
+        if (du % static_cast<std::uint32_t>(max_l) == 0u) lanes = max_l;
+    }
+    const MirKernel mk = mir_kernel(d, {MirKind::Glu, code, X.dtype, X.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_glu(d, mk, mir_groups_1d(n, lanes), ax, ady, aout, n, static_cast<std::uint32_t>(D));
 }
 
 void rowvec(const char* op, std::uint32_t code, const Tensor& X, const Tensor& v, const Tensor* w, Tensor& Y) {
     dt_code(X.dtype, op);
-    if (v.dtype != X.dtype || (w && w->dtype != X.dtype)) fail(op, "vector operands must share X's dtype");
-    if (v.size() != X.cols || (w && w->size() != X.cols)) fail(op, "vector operands must have X.cols elements");
+    if (v.dtype != X.dtype || (w && w->dtype != X.dtype)) {
+        throw std::runtime_error(std::string("brotensor: ") + op + ": vector operands must share X's dtype");
+    }
+    if (v.size() != X.cols || (w && w->size() != X.cols)) {
+        throw std::runtime_error(std::string("brotensor: ") + op + ": vector operands have wrong element count");
+    }
     if (Y.rows != X.rows || Y.cols != X.cols || Y.dtype != X.dtype) Y.resize(X.rows, X.cols, X.dtype);
     const std::uint32_t n = count32(X, op);
     if (n == 0) return;

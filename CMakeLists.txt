@@ -300,6 +300,8 @@ elseif(TARGET brass)
         src/jit/gpu_mir_emit_rownorm.cpp
         src/jit/ptx_emit.cpp
         src/jit/msl_emit.cpp
+        src/kernels/mir_math.cpp
+        src/kernels/mir_elementwise.cpp
     )
     if(BRASS_WITH_SPIRV)
         target_sources(brotensor_cpu PRIVATE

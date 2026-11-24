@@ -6,6 +6,7 @@
 // plain copies are vkCmdCopyBuffer through the stream.
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -37,18 +38,6 @@ std::size_t elem_bytes(Dtype dt, const char* op) {
     return static_cast<std::size_t>(e);
 }
 
-ShaderId cast_shader(Dtype s, Dtype t) {
-    const int a = dt_code(s, "cast"), b = dt_code(t, "cast");
-    // shaders.cmake order: f32->f16, f32->bf16, f16->f32, f16->bf16, bf16->f32, bf16->f16
-    static const ShaderId table[3][3] = {
-        {ShaderId::kCount, ShaderId::cast_f32_to_f16, ShaderId::cast_f32_to_bf16},
-        {ShaderId::cast_f16_to_f32, ShaderId::kCount, ShaderId::cast_f16_to_bf16},
-        {ShaderId::cast_bf16_to_f32, ShaderId::cast_bf16_to_f16, ShaderId::kCount},
-    };
-    return table[a][b];
-}
-
-struct CastPush { std::uint64_t src, dst; std::uint32_t n; };
 struct Copy2dPush { std::uint64_t src, dst; std::uint32_t src_pitch, dst_pitch, width, height; };
 struct TransposePush { std::uint64_t src, dst; std::uint32_t batch, rows, cols; };
 
@@ -75,6 +64,8 @@ void transpose(const char* op, const Tensor& X, Tensor& Y, int batch, int rows, 
 }  // namespace
 
 void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
+    dt_code(src.dtype, "cast");
+    dt_code(out_dtype, "cast");
     if (dst.rows != src.rows || dst.cols != src.cols || dst.dtype != out_dtype) {
         dst.resize(src.rows, src.cols, out_dtype);
     }
@@ -85,10 +76,10 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
         copy_bytes(d, addr(src.data), addr(dst.data), src.bytes());
         return;
     }
-    const ShaderId id = cast_shader(src.dtype, out_dtype);
-    const Kernel& k = d.pipelines().get(id);
-    const CastPush pc{addr(src.data), addr(dst.data), n};
-    launch(d, k, pc, groups_1d(n, k));
+    const std::uint64_t asrc = addr(src.data), adst = addr(dst.data);
+    const int lanes = mir_vec_lanes_mixed(src.dtype, out_dtype, n, asrc, adst);
+    const MirKernel mk = mir_kernel(d, {MirKind::Cast, 0, src.dtype, out_dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_cast(d, mk, mir_groups_1d(n, lanes), asrc, adst, n);
 }
 
 void copy_d2d(const Tensor& src, int src_off, Tensor& dst, int dst_off, int n) {

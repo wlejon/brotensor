@@ -1,12 +1,11 @@
-// Vulkan elementwise ops: the unary activations and math functions, the
-// in-place binary / scalar family, the activation backwards and the bias adds.
-// FP32 / FP16 / BF16 storage, FP32 arithmetic; contracts follow the CUDA
-// backend (output resized to the input's shape and dtype, backwards overwrite
-// dX, binary ops require equal sizes and dtypes except FP32 += FP16 in
-// add_inplace). Kernels: shaders/unary.comp, binary.comp, act_bwd.comp,
-// bias.comp.
+// Vulkan elementwise ops: single-source brass MIR kernels for unary, binary,
+// activation backwards, and broadcast bias adds. FP32 / FP16 / BF16 storage,
+// FP32 arithmetic; contracts follow the CUDA backend (output resized to the
+// input's shape and dtype, backwards overwrite dX, binary ops require equal
+// sizes and dtypes except FP32 += FP16 in add_inplace).
 
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -20,11 +19,6 @@ using ::brotensor::Tensor;
 
 namespace {
 
-struct UnaryPush  { std::uint64_t x, y; std::uint32_t n; float a, b; };
-struct BinaryPush { std::uint64_t y, x; std::uint32_t n; float a, b; };
-struct GradPush   { std::uint64_t p, dy, dx; std::uint32_t n; float a; };
-struct BiasPush   { std::uint64_t y, bias; std::uint32_t n, d, l; };
-
 void unary(const char* op, const Tensor& x, Tensor& y, std::uint32_t code,
            float a = 0.0f, float b = 0.0f) {
     dt_code(x.dtype, op);
@@ -34,9 +28,10 @@ void unary(const char* op, const Tensor& x, Tensor& y, std::uint32_t code,
     const std::uint32_t n = count32(x, op);
     if (n == 0) return;
     DeviceCtx& d = device_of(x);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::unary_f32, x.dtype, op), {code});
-    const UnaryPush pc{addr(x.data), addr(y.data), n, a, b};
-    launch(d, k, pc, groups_1d(n, k));
+    const std::uint64_t ax = addr(x.data), ay = addr(y.data);
+    const int lanes = mir_vec_lanes(x.dtype, n, ax, ay);
+    const MirKernel mk = mir_kernel(d, {MirKind::Unary, code, x.dtype, x.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_5(d, mk, mir_groups_1d(n, lanes), ax, ay, n, a, b);
 }
 
 void inplace_scalar(const char* op, Tensor& y, std::uint32_t code, float a, float b = 0.0f) {
@@ -50,20 +45,18 @@ void binary(const char* op, Tensor& y, const Tensor& x, std::uint32_t code,
                                  std::to_string(y.rows) + "," + std::to_string(y.cols) + ") x=(" +
                                  std::to_string(x.rows) + "," + std::to_string(x.cols) + ")");
     }
-    ShaderId id;
-    if (y.dtype == x.dtype) {
-        id = dt_variant(ShaderId::binary_f32, y.dtype, op);
-    } else if (code == BOP_ADD && y.dtype == Dtype::FP32 && x.dtype == Dtype::FP16) {
-        id = ShaderId::binary_f32_f16;
-    } else {
+    dt_code(y.dtype, op);
+    dt_code(x.dtype, op);
+    if (y.dtype != x.dtype && !(code == BOP_ADD && y.dtype == Dtype::FP32 && x.dtype == Dtype::FP16)) {
         throw std::runtime_error(std::string("brotensor: ") + op + ": dtype mismatch");
     }
     const std::uint32_t n = count32(y, op);
     if (n == 0) return;
     DeviceCtx& d = device_of(y);
-    const Kernel& k = d.pipelines().get(id, {code});
-    const BinaryPush pc{addr(y.data), addr(x.data), n, a, b};
-    launch(d, k, pc, groups_1d(n, k));
+    const std::uint64_t ay = addr(y.data), ax = addr(x.data);
+    const int lanes = mir_vec_lanes_mixed(y.dtype, x.dtype, n, ay, ax);
+    const MirKernel mk = mir_kernel(d, {MirKind::Binary, code, y.dtype, x.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_5(d, mk, mir_groups_1d(n, lanes), ay, ax, n, a, b);
 }
 
 // dX = g(p, dY). `p` may be null (GOP_PASS).
@@ -84,19 +77,22 @@ void act_backward(const char* op, const Tensor* p, const Tensor& dY, Tensor& dX,
     const std::uint32_t n = count32(dY, op);
     if (n == 0) return;
     DeviceCtx& d = device_of(dY);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::act_bwd_f32, dY.dtype, op), {code});
-    const GradPush pc{p ? addr(p->data) : 0, addr(dY.data), addr(dX.data), n, a};
-    launch(d, k, pc, groups_1d(n, k));
+    const std::uint64_t ap = p ? addr(p->data) : 0, ady = addr(dY.data), adx = addr(dX.data);
+    const int lanes = mir_vec_lanes(dY.dtype, n, ady, adx, ap);
+    const MirKernel mk = mir_kernel(d, {MirKind::ActBwd, code, dY.dtype, dY.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_act_bwd(d, mk, mir_groups_1d(n, lanes), ap, ady, adx, n, a);
 }
 
 void bias_add(const char* op, Tensor& y, const Tensor& bias, std::uint32_t mode,
               std::uint32_t n, std::uint32_t dim, std::uint32_t l) {
+    dt_code(y.dtype, op);
     if (y.dtype != bias.dtype) throw std::runtime_error(std::string("brotensor: ") + op + ": dtype mismatch");
     if (n == 0 || dim == 0) return;
     DeviceCtx& d = device_of(y);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::bias_f32, y.dtype, op), {mode});
-    const BiasPush pc{addr(y.data), addr(bias.data), n, dim, l};
-    launch(d, k, pc, groups_1d(n, k));
+    const std::uint64_t ay = addr(y.data), ab = addr(bias.data);
+    const int lanes = (mode == BIAS_ROW && (dim % 4u == 0u)) ? mir_vec_lanes(y.dtype, dim, ay, ab) : 1;
+    const MirKernel mk = mir_kernel(d, {MirKind::Bias, mode, y.dtype, y.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_bias(d, mk, mir_groups_1d(n, lanes), ay, ab, n, dim, l);
 }
 
 }  // namespace

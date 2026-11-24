@@ -28,6 +28,9 @@
 #include <brotensor/backward_verify.h>
 
 #if BROTENSOR_HAS_BRASS_JIT
+#include "kernels/mir_elementwise.h"
+#include "vulkan/shaders/op_codes.h"
+
 #include <brass/codegen/kernel_jit.hpp>
 #include <brass/mir/builder.hpp>
 #include <brass/mir/module.hpp>
@@ -92,15 +95,12 @@ struct LiftedSpirvCfgMetrics {
 };
 
 #if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-LiftedSpirvCfgMetrics audit_lifted_shader_blob(detail::vulkan::ShaderId id) {
+LiftedSpirvCfgMetrics audit_lifted_spirv_words(std::span<const std::uint32_t> words, const char* label) {
     LiftedSpirvCfgMetrics m;
-    const auto& blob = detail::vulkan::shader_blob(id);
-    if (!blob.words || blob.nwords == 0) {
+    if (words.empty()) {
         m.diagnostic = "Empty SPIR-V binary";
         return m;
     }
-
-    std::span<const std::uint32_t> words(blob.words, blob.nwords);
     brass::spirv::Module mod;
     std::string err;
     m.parse_ok = brass::spirv::parse_binary(words, mod, &err);
@@ -240,7 +240,7 @@ LiftedSpirvCfgMetrics audit_lifted_shader_blob(detail::vulkan::ShaderId id) {
     }
 
     std::ostringstream oss;
-    oss << blob.name << ": local_size=(" << m.local_size_x << "," << m.local_size_y << ","
+    oss << label << ": local_size=(" << m.local_size_x << "," << m.local_size_y << ","
         << m.local_size_z << "), blocks=" << m.num_blocks
         << ", insts=" << m.num_instructions
         << ", push_consts=" << m.push_constant_accesses
@@ -255,6 +255,11 @@ LiftedSpirvCfgMetrics audit_lifted_shader_blob(detail::vulkan::ShaderId id) {
     }
     m.diagnostic = oss.str();
     return m;
+}
+
+LiftedSpirvCfgMetrics audit_lifted_shader_blob(detail::vulkan::ShaderId id) {
+    const auto& blob = detail::vulkan::shader_blob(id);
+    return audit_lifted_spirv_words(std::span<const std::uint32_t>(blob.words, blob.nwords), blob.name);
 }
 
 void add_shader_family_proof(
@@ -527,18 +532,52 @@ BackwardProofSuiteReport prove_rope_adjoint_duality() {
 
 #if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
     using detail::vulkan::ShaderId;
-    const ShaderId rope_act_ids[] = {
+    const ShaderId rope_ids[] = {
         ShaderId::rope_f32,
         ShaderId::rope_f16,
         ShaderId::rope_bf16,
-        ShaderId::act_bwd_f32,
-        ShaderId::act_bwd_f16,
-        ShaderId::act_bwd_bf16,
     };
     add_shader_family_proof(
         rep,
-        "rope_and_act_bwd_lifted_spirv_bounds_and_safety",
-        rope_act_ids);
+        "rope_lifted_spirv_bounds_and_safety",
+        rope_ids);
+
+    {
+        bool all_ok = true;
+        std::uint32_t total_insts = 0, total_writes = 0, total_guards = 0, count = 0;
+        std::string first_failure;
+        for (Dtype dt : {Dtype::FP32, Dtype::FP16, Dtype::BF16}) {
+            const int lanes = (dt == Dtype::FP32) ? 4 : 8;
+            for (std::uint32_t op : {std::uint32_t(GOP_RELU), std::uint32_t(GOP_SILU)}) {
+                brass::Module mir_mod("verify_act_bwd");
+                brass::Function* fn = kernels::build_act_bwd_mir(mir_mod, op, dt, lanes);
+                brass::target::SpirvOptions spv_opts;
+                spv_opts.stage = brass::target::SpirvStage::Compute;
+                spv_opts.local_size_x = kernels::kEwBlock;
+                spv_opts.local_size_spec_constants = true;
+                brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, spv_opts);
+                LiftedSpirvCfgMetrics m = audit_lifted_spirv_words(sk.words, "mir_act_bwd");
+                total_insts += m.num_instructions;
+                total_writes += m.psb_stores_and_atomics;
+                total_guards += m.bounds_comparisons;
+                ++count;
+                if (!m.all_ok()) {
+                    all_ok = false;
+                    if (first_failure.empty()) first_failure = m.diagnostic;
+                }
+            }
+        }
+        std::ostringstream oss;
+        if (all_ok) {
+            oss << "Proven on " << count << " brass-MIR compiled act_bwd .spv binaries ("
+                << total_insts << " lifted SPIR-V insts, " << total_writes
+                << " guarded PhysicalStorageBuffer64 writes, " << total_guards
+                << " bounds comparisons, 0 hazards)";
+        } else {
+            oss << "Lifted MIR act_bwd audit failure: " << first_failure;
+        }
+        rep.entries.push_back({"act_bwd_mir_lifted_spirv_bounds_and_safety", all_ok, oss.str()});
+    }
 
     const ShaderId norm_recurrent_ids[] = {
         ShaderId::norm_f32,
