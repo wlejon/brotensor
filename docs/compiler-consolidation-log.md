@@ -667,6 +667,27 @@ Replaced 3 GLSL shaders / 15 compiled variants (`gemv.comp` `137`L × 5, `gemm_s
   - `src/vulkan/shaders/*`: `3,970 -> 3,574` (**`-396` lines**; cumulative **`-4,661` lines** / 41 `.comp` files / 118 variants deleted across Waves 1–10, **`140 -> 22` compiled Vulkan shaders**, `9` `.comp` files remaining: `conv_cm`, `gemm_cm`, `fa_cm`, `fa_bwd_cm`, `fa_rows`, `fa_bwd`, `gemv_q`, `dft64`, `test_shared_overflow`).
   - Shared backend-neutral `src/kernels/*`: `7,837` lines across 51 files (`+601` lines in Wave 10, max file `591` lines).
 
+---
+
+## Wave 11: Vulkan Quantized GEMV & FlashAttention Row-Split Forward (`gemv_q` / `fa_rows`) -> Single-Source Brass MIR
+
+Replaced 2 GLSL shaders / 5 compiled variants (`gemv_q.comp` `321`L × 2, `fa_rows.comp` `227`L × 3; `22 -> 17` compiled Vulkan shaders, leaving 7 `.comp` files total) with two backend-neutral `brass::Function` MIR modules:
+- `src/kernels/mir_gemv_q.{h,cpp}` (`18 + 438` LOC): `build_gemv_q_mir` supporting `QF_INT8`, `QF_FP8`, `QF_Q8_0` (2-byte aligned `load_u16` half-blocks), `QF_Q4K` (144-byte super-blocks), and `QF_Q6K` (210-byte super-blocks via `load_u16`), scalar and 16-byte vectorized byte-format paths, `MB in 1..8`, `UNR in 1..4`, `LPR in {16, 32, 64}` (`shfl_bfly_f32` + 2-slot shared reduction at `lpr == 64`), `NR` row grouping, fused activations (`LACT_*`), bias, and epilogues (`STORE`, `ACCUM`, `GEGLU`, `SWIGLU`). Exported shared byte/quant helpers (`emit_s8_byte_to_f32`, `emit_fp8_e4m3_to_f32`, `emit_sel_word3`, `emit_extract_byte`) in `src/kernels/mir_quant_helpers.{h,cpp}`.
+- `src/kernels/mir_fa_rows.{h,cpp}` (`22 + 432` LOC): `build_fa_rows_mir` (`kFaRowsBlock = 128`) supporting `FP32`/`FP16`/`BF16`, GQA grouping (`gqa_g * HDS <= 16`, `gqa_g * hd <= 8192`), `FA_MODE_{ROWS, VARLEN, PACKED, LEN}` (counted 24-step binary search for `VARLEN`), `has_maskpos` masked sliding window scan via `shfl_bfly_i32` + 4-word scratch, `tanh` `softcap`, NaN-safe masked `V` skipping, online softmax with `ex2_approx`, and single-pass or split-K partial emission `(HD + 2)` matching `build_fa_combine_mir`.
+- Extended `src/vulkan/vk_mir_cache.{h,cpp}` (`MirKind::{GemvQ, FaRows}`, `block_for(const MirKey&)` returning `kFaRowsBlock = 128` for `FaRows`), wired `src/vulkan/ops_quant.cpp` (`gemv_q`) and `src/vulkan/ops_attention.cpp` (`run_rows`), updated `CMakeLists.txt`, `src/kernels/mir_common.h` (`smax_i32` / `smin_i32`), `detail/kernels.h`, `shaders/shaders.cmake`, `src/backward_index_verify.cpp` (`972` LOC), and `src/backward_shader_audit.cpp` (`765` LOC).
+
+### Wave 11 Correctness, Proof Audit & LOC Delta (Radeon 8060S)
+- **Formal Audits:**
+  - `brotensor_test_backward_index_proofs`: **ALL PASSED** (including `flash_attention_lifted_spirv_mir_fa_rows_safety` across `FP32`/`FP16`/`BF16` at `local_size_x = 128`).
+  - `brotensor_test_backward_shader_audit`: **160 / 160 ALL PASSED** (`112,228` SPIR-V/PTX insts, `193` workgroup arrays, `7,495` shared / `2,684` global accesses proven, `675` uniform barriers, `1,080` uniform collectives).
+- **Unit, Parity & Vulkan Suites (`0` failures after final edit):**
+  - `brotensor_test_vulkan --only=quant,attention,ops` (`OK: 0 failure(s)`)
+  - **30 / 30** `ctest -j 1` targeted suites (`q4k|q8_0|q6k|quant|linear_wq|int8|flash_attention|kv_cache|self_attention|cross_attention`, `89.01 s`, `0` failures).
+- **LOC Delta (Vulkan Wave 11):**
+  - `src/vulkan/shaders/*`: `3,574 -> 3,026` (**`-548` lines**; cumulative **`-5,209` lines** / 43 `.comp` files / 123 variants deleted across Waves 1–11, **`140 -> 17` compiled Vulkan shaders**, `7` `.comp` files remaining: `conv_cm`, `gemm_cm`, `fa_cm`, `fa_bwd_cm`, `fa_bwd`, `dft64`, `test_shared_overflow`).
+  - Shared backend-neutral `src/kernels/*`: `8,777` lines across 57 files (`+940` lines in Wave 11, max file `591` lines).
+
+
 
 ---
 

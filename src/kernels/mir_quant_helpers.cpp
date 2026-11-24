@@ -121,6 +121,13 @@ Value* extract_byte(Ctx& c, Value* word, Value* bidx) {
 
 }  // namespace
 
+Value* emit_s8_byte_to_f32(Ctx& c, Value* byte_u32) { return s8_byte_to_f32(c, byte_u32); }
+Value* emit_fp8_e4m3_to_f32(Ctx& c, Value* byte_u32) { return fp8_decode_u32(c, byte_u32); }
+Value* emit_sel_word3(Ctx& c, Value* widx, Value* w0, Value* w1, Value* w2) {
+    return sel_word3(c, widx, w0, w1, w2);
+}
+Value* emit_extract_byte(Ctx& c, Value* word, Value* bidx) { return extract_byte(c, word, bidx); }
+
 brass::Function* build_gemm_rowscale_mir(brass::Module& mod, Dtype dt, bool ta, bool vec) {
     const std::string name = std::string("mir_gemm_rowscale_") +
                              (dt == Dtype::FP32 ? "f32" : dt == Dtype::FP16 ? "f16" : "bf16") +

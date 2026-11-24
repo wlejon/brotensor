@@ -47,11 +47,6 @@ void need(const char* op, bool ok, const char* what) {
     if (!ok) fail(op, what);
 }
 
-struct GemvQPush {
-    std::uint64_t x, w, y, bias, scale;
-    std::uint32_t n, k, ldx, ldy, rowbytes;
-};
-
 bool byte_fmt(int fmt) { return fmt == QF_INT8 || fmt == QF_FP8; }
 
 std::uint64_t cdiv(std::uint64_t a, std::uint64_t b) { return (a + b - 1) / b; }
@@ -103,18 +98,21 @@ void gemv_q(DeviceCtx& d, const QuantW& q, std::uint64_t x, Dtype dt, int B, int
     GemvCfg c = gemv_cfg(d, q.fmt, q.k, B);
     // A GLU pair (gate, up) is two consecutive logical rows of one lane group.
     if ((epi == EPI_GEGLU || epi == EPI_SWIGLU) && c.nr < 2) c.nr = 2;
-    const std::uint32_t sg = c.sg ? c.sg : d.info().subgroup_size;
-    const std::uint32_t spec[] = {static_cast<std::uint32_t>(q.fmt), static_cast<std::uint32_t>(B), c.lpr,
-                                  vec ? 1u : 0u, bias ? 1u : 0u, c.unr, sg, c.nr,
-                                  static_cast<std::uint32_t>(act), static_cast<std::uint32_t>(epi)};
-    const ShaderId id = dt == Dtype::FP16 ? ShaderId::gemv_q_f16 : ShaderId::gemv_q_bf16;
-    const Kernel& k = d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)), c.sg);
-    GemvQPush pc{x, q.w, y, bias, q.scale, static_cast<std::uint32_t>(q.rows), static_cast<std::uint32_t>(q.k),
-                 static_cast<std::uint32_t>(ldx), static_cast<std::uint32_t>(ldy), q.rowbytes};
+    const std::uint32_t op = (static_cast<std::uint32_t>(q.fmt) & 0x0fu) |
+                             ((static_cast<std::uint32_t>(B) & 0x0fu) << 4) |
+                             ((c.unr & 0x0fu) << 8) |
+                             ((c.nr & 0x0fu) << 12) |
+                             ((static_cast<std::uint32_t>(act) & 0x0fu) << 16) |
+                             ((static_cast<std::uint32_t>(epi) & 0x0fu) << 20);
+    const std::uint8_t flags = static_cast<std::uint8_t>((vec ? 1u : 0u) | (bias ? 2u : 0u));
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::GemvQ, op, dt, Dtype::FP32, static_cast<std::uint8_t>(c.lpr), Dtype::FP32, flags}, c.sg);
     const std::uint64_t groups = cdiv(q.rows, 256u / c.lpr * c.nr);
     const std::uint32_t gx = static_cast<std::uint32_t>(std::min<std::uint64_t>(groups, 65535));
     const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(groups, gx));
-    launch(d, k, pc, gx, gy);
+    const std::uint64_t ptrs[] = {x, q.w, y, bias, q.scale};
+    const std::int32_t ints[] = {q.rows, q.k, ldx, ldy, static_cast<std::int32_t>(q.rowbytes)};
+    mir_dispatch_args_3d(d, mk, gx, gy, 1u, ptrs, ints, {});
 }
 
 }  // namespace

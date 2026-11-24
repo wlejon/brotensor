@@ -58,6 +58,14 @@ inline Value* clamp_i32(Ctx& c, Value* v, Value* lo, Value* hi) {
     return c.b.build_select(c.b.build_slt(v, lo), lo, c.b.build_select(c.b.build_sgt(v, hi), hi, v));
 }
 
+inline Value* smax_i32(Ctx& c, Value* a, Value* b) {
+    return c.b.build_select(c.b.build_sgt(a, b), a, b);
+}
+
+inline Value* smin_i32(Ctx& c, Value* a, Value* b) {
+    return c.b.build_select(c.b.build_slt(a, b), a, b);
+}
+
 inline Value* grid_stride_ew(Ctx& c) {
     return c.kb.mul(c.kb.nctaid_x(), c.i32(static_cast<int>(jit::gpu_mir::kEwBlock)));
 }

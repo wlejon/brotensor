@@ -214,27 +214,46 @@ void run_rows(DeviceCtx& d, const AttnProblem& p) {
     nsplit = std::max<std::uint64_t>(1, cdiv(p.lk, chunk));
     if (p.lk == 0) chunk = 128;
 
+    dt_code(p.dt, p.op);
     const bool vec = p.hd % 8 == 0 && p.k % 16 == 0 && p.ldk % 8 == 0 &&
                      (p.dt != Dtype::FP32 || p.ldk % 4 == 0);
-    const std::uint32_t spec[] = {static_cast<std::uint32_t>(p.hd), static_cast<std::uint32_t>(G),
-                                  static_cast<std::uint32_t>(p.mode), p.mask ? 1u : 0u, nsplit > 1 ? 1u : 0u,
-                                  p.softcap > 0.0f ? 1u : 0u, vec ? 1u : 0u, p.maskpos ? 1u : 0u};
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::fa_rows_f32, p.dt, p.op), spec,
-                                        static_cast<std::uint32_t>(std::size(spec)));
-    FaPush pc = make_push(p);
-    pc.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(p.hd)));
-    pc.chunk = static_cast<std::uint32_t>(chunk);
+    const bool split = nsplit > 1;
+    const std::uint8_t flags = static_cast<std::uint8_t>(
+        (p.mask != 0 ? 1u : 0u) | (split ? 2u : 0u) | (p.softcap > 0.0f ? 4u : 0u) |
+        (vec ? 8u : 0u) | (p.maskpos ? 16u : 0u));
+    const MirKernel mk = mir_kernel(
+        d, {MirKind::FaRows, static_cast<std::uint32_t>(p.hd), p.dt, Dtype::FP32,
+            static_cast<std::uint8_t>(G), Dtype::FP32, flags, static_cast<std::uint64_t>(p.mode)});
     Tensor part;
-    if (nsplit > 1) {
+    std::uint64_t part_addr = 0;
+    if (split) {
         part = partials(d, p, nsplit);
-        pc.part = addr(part.data);
+        part_addr = addr(part.data);
     }
+    const std::uint64_t ptrs[] = {p.q, p.k, p.v, p.o, p.mask, p.aux, p.aux2, part_addr};
+    const float flts[] = {static_cast<float>(1.0 / std::sqrt(static_cast<double>(p.hd))), p.softcap};
     for (int r0 = 0; r0 < p.lq; r0 += 65535) {
-        pc.qb0 = static_cast<std::uint32_t>(r0);
-        launch(d, k, pc, static_cast<std::uint32_t>(nsplit), static_cast<std::uint32_t>(std::min(65535, p.lq - r0)),
-               static_cast<std::uint32_t>(p.hq / G));
+        const std::int32_t ints[] = {
+            static_cast<std::int32_t>(p.lq),
+            static_cast<std::int32_t>(p.lk),
+            static_cast<std::int32_t>(p.ldq),
+            static_cast<std::int32_t>(p.ldk),
+            static_cast<std::int32_t>(p.ldo),
+            static_cast<std::int32_t>(group),
+            static_cast<std::int32_t>(std::max(0, p.window)),
+            p.causal ? 1 : 0,
+            static_cast<std::int32_t>(p.nseq),
+            static_cast<std::int32_t>(chunk),
+            static_cast<std::int32_t>(p.hq),
+            static_cast<std::int32_t>(r0),
+            p.q_offset,
+        };
+        mir_dispatch_args_3d(
+            d, mk, static_cast<std::uint32_t>(nsplit),
+            static_cast<std::uint32_t>(std::min(65535, p.lq - r0)),
+            static_cast<std::uint32_t>(p.hq / G), ptrs, ints, flts);
     }
-    if (nsplit > 1) combine(d, p, pc.part, nsplit);
+    if (split) combine(d, p, part_addr, nsplit);
 }
 
 }  // namespace

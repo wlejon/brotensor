@@ -7,8 +7,10 @@
 #include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
 #include "../kernels/mir_elementwise.h"
+#include "../kernels/mir_fa_rows.h"
 #include "../kernels/mir_gemm_simt.h"
 #include "../kernels/mir_gemv.h"
+#include "../kernels/mir_gemv_q.h"
 #include "../kernels/mir_gnorm.h"
 #include "../kernels/mir_lstm.h"
 #include "../kernels/mir_misc.h"
@@ -61,8 +63,10 @@ MirCache& mir_cache() {
     return *c;
 }
 
-std::uint32_t block_for(MirKind kind) {
-    return (kind == MirKind::FillBytes) ? kernels::kFillBlock : kernels::kEwBlock;
+std::uint32_t block_for(const MirKey& k) {
+    if (k.kind == MirKind::FillBytes) return kernels::kFillBlock;
+    if (k.kind == MirKind::FaRows) return kernels::kFaRowsBlock;
+    return kernels::kEwBlock;
 }
 
 const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
@@ -186,10 +190,29 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
                 byte(0), byte(1), byte(2), byte(3), byte(4), byte(5), byte(6), byte(7));
             break;
         }
+        case MirKind::GemvQ: {
+            const std::uint32_t fmt = k.op & 0x0fu;
+            const std::uint32_t mb = (k.op >> 4) & 0x0fu;
+            const std::uint32_t lpr = k.lanes;
+            const std::uint32_t unr = (k.op >> 8) & 0x0fu;
+            const std::uint32_t nr = (k.op >> 12) & 0x0fu;
+            const std::uint32_t act = (k.op >> 16) & 0x0fu;
+            const std::uint32_t epi = (k.op >> 20) & 0x0fu;
+            fn = kernels::build_gemv_q_mir(
+                mod, k.dt0, fmt, mb, lpr, (k.flags & 1u) != 0, (k.flags & 2u) != 0,
+                unr, nr, act, epi);
+            break;
+        }
+        case MirKind::FaRows:
+            fn = kernels::build_fa_rows_mir(
+                mod, k.dt0, k.op, k.lanes, static_cast<std::uint32_t>(k.aux),
+                (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
+                (k.flags & 8u) != 0, (k.flags & 16u) != 0);
+            break;
     }
     brass::target::SpirvOptions opts;
     opts.stage = brass::target::SpirvStage::Compute;
-    opts.local_size_x = block_for(k.kind);
+    opts.local_size_x = block_for(k);
     opts.local_size_spec_constants = true;
     auto spv = std::make_unique<brass::target::SpirvKernel>(brass::target::SpirvTarget::compile(*fn, opts));
     MirCache& cache = mir_cache();
@@ -220,7 +243,7 @@ MirKernel mir_kernel(DeviceCtx& d, const MirKey& key, std::uint32_t req_subgroup
         if (auto it = cache.map.find(key); it != cache.map.end()) spv = it->second.get();
     }
     if (!spv) spv = compile_mir(key);
-    return MirKernel{spv, jit_pipeline(d, *spv, block_for(key.kind), req_subgroup)};
+    return MirKernel{spv, jit_pipeline(d, *spv, block_for(key), req_subgroup)};
 }
 
 int mir_vec_lanes(Dtype dt, std::uint32_t n, std::uint64_t a0, std::uint64_t a1,

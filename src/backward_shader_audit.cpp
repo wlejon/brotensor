@@ -35,8 +35,10 @@
 #include "kernels/mir_attn_small.h"
 #include "kernels/mir_audio.h"
 #include "kernels/mir_conv_direct.h"
+#include "kernels/mir_fa_rows.h"
 #include "kernels/mir_gemm_simt.h"
 #include "kernels/mir_gemv.h"
+#include "kernels/mir_gemv_q.h"
 #include "kernels/mir_rope.h"
 #include "kernels/mir_scatter.h"
 #include "kernels/mir_select.h"
@@ -683,6 +685,26 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
             audit_mir(gv_name.c_str(), [dt](brass::Module& m) {
                 return kernels::build_gemv_mir(m, dt, dt, dt, 1u, 1u, 1u, true, true);
             });
+        }
+        for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
+                 {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
+            const std::string gq_name = std::string("gemv_q") + sfx;
+            audit_mir(gq_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_gemv_q_mir(m, dt, QF_Q4K, 1u, 64u, true, true, 1u, 2u, 0u, 0u);
+            });
+        }
+        {
+            brass::target::SpirvOptions fa_opts = spv_opts;
+            fa_opts.local_size_x = kernels::kFaRowsBlock;
+            for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
+                     {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
+                const std::string fa_name = std::string("fa_rows") + sfx;
+                brass::Module mir_mod(fa_name.c_str());
+                brass::Function* fn = kernels::build_fa_rows_mir(
+                    mir_mod, dt, 64u, 2u, 0u, true, true, true, true, true);
+                brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, fa_opts);
+                report.shaders.push_back(audit_spirv_binary_words(fa_name.c_str(), sk.words.data(), sk.words.size()));
+            }
         }
     }
 

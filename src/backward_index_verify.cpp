@@ -31,6 +31,7 @@
 #include "kernels/mir_attn_small.h"
 #include "kernels/mir_conv_direct.h"
 #include "kernels/mir_delta.h"
+#include "kernels/mir_fa_rows.h"
 #include "kernels/mir_gemm_simt.h"
 #include "kernels/mir_elementwise.h"
 #include "kernels/mir_gnorm.h"
@@ -854,15 +855,12 @@ BackwardProofSuiteReport prove_flash_attention_mask_adjoint_duality() {
         fa_bwd_ids);
 
     const ShaderId fa_fwd_ids[] = {
-        ShaderId::fa_rows_f32,
-        ShaderId::fa_rows_f16,
-        ShaderId::fa_rows_bf16,
         ShaderId::fa_cm_f16,
         ShaderId::fa_cm_bf16,
     };
     add_shader_family_proof(
         rep,
-        "flash_attention_lifted_spirv_fa_fwd_rows_cm_safety",
+        "flash_attention_lifted_spirv_fa_fwd_cm_safety",
         fa_fwd_ids);
 #endif
 #if BROTENSOR_HAS_BRASS_JIT
@@ -877,6 +875,15 @@ BackwardProofSuiteReport prove_flash_attention_mask_adjoint_duality() {
             });
         }
         acc.finish(rep, "flash_attention_lifted_spirv_mir_attn_bwd_combine_softmax_safety", "attention");
+    }
+    {
+        MirAuditAccum acc(kernels::kFaRowsBlock);
+        for (Dtype dt : {Dtype::FP32, Dtype::FP16, Dtype::BF16}) {
+            acc.check("mir_fa_rows", [dt](brass::Module& m) {
+                return kernels::build_fa_rows_mir(m, dt, 64u, 2u, 0u, true, true, true, true, true);
+            });
+        }
+        acc.finish(rep, "flash_attention_lifted_spirv_mir_fa_rows_safety", "fa_rows");
     }
 #endif
 

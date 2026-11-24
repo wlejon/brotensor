@@ -22,4 +22,11 @@ brass::Function* build_wq_rows_mir(brass::Module& mod, std::uint32_t mode, Dtype
 // Params: (ptr w, ptr y, ptr scale, i32 rows, i32 k, i32 rowbytes)
 brass::Function* build_dequant_mir(brass::Module& mod, std::uint32_t fmt, bool vec);
 
+// Shared byte/quant decoding helpers reused by mir_quant_helpers and mir_gemv_q.
+brass::Value* emit_s8_byte_to_f32(jit::gpu_mir::Ctx& c, brass::Value* byte_u32);
+brass::Value* emit_fp8_e4m3_to_f32(jit::gpu_mir::Ctx& c, brass::Value* byte_u32);
+brass::Value* emit_sel_word3(jit::gpu_mir::Ctx& c, brass::Value* widx,
+                             brass::Value* w0, brass::Value* w1, brass::Value* w2);
+brass::Value* emit_extract_byte(jit::gpu_mir::Ctx& c, brass::Value* word, brass::Value* bidx);
+
 }  // namespace brotensor::kernels
