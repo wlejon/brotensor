@@ -13,6 +13,9 @@
 #include "detail/attention.h"
 #include "detail/gemm.h"
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
+
+#include <brotensor/detail/dispatch.h>
 
 #include <algorithm>
 #include <cmath>
@@ -25,12 +28,6 @@ using ::brotensor::Dtype;
 using ::brotensor::Tensor;
 
 namespace {
-
-struct SoftmaxPush {
-    std::uint64_t s, p, bias, mask, qmask;
-    std::uint32_t rows, lk, lq, h0, lds, ldp, q0, bhs;
-    float scale;
-};
 
 std::uint32_t esize(Dtype t) { return t == Dtype::FP32 ? 4u : 2u; }
 
@@ -65,14 +62,16 @@ void dense_attention(DeviceCtx& d, const AttnProblem& p, const DenseExtras& x) {
         if (!f32) P = Tensor::empty_on(dev, static_cast<int>(n), 1, dt);
     }
 
-    const ShaderId sm_id = dt_variant(ShaderId::attn_softmax_f32, dt, p.op);
+    dt_code(dt, p.op);
     const bool rel = x.rel_h != 0;
     if (rel && (p.mask || x.bias || x.grid_h <= 0 || x.grid_w <= 0 || x.grid_h > 0xffff || x.grid_w > 0xffff ||
                 x.grid_h * x.grid_w != p.lq)) {
         throw std::runtime_error(std::string("brotensor: ") + p.op + ": bad decomposed rel-pos problem");
     }
-    const Kernel& ks = d.pipelines().get(sm_id, {rel ? 2u : x.bias ? 1u : 0u, p.mask ? 1u : 0u, x.qmask ? 1u : 0u,
-                                                 x.mask_ge ? 1u : 0u});
+    const std::uint32_t bias_mode = rel ? 2u : (x.bias ? 1u : 0u);
+    const std::uint8_t sm_flags = static_cast<std::uint8_t>(
+        (p.mask ? 1u : 0u) | (x.qmask ? 2u : 0u) | (x.mask_ge ? 4u : 0u));
+    const MirKernel ks = mir_kernel(d, {MirKind::AttnSoftmax, bias_mode, dt, Dtype::FP32, 1, Dtype::FP32, sm_flags});
     const std::uint64_t sm_bias = rel ? x.rel_h : x.bias, sm_mask = rel ? x.rel_w : p.mask;
     const std::uint32_t sm_bhs = rel ? static_cast<std::uint32_t>(x.grid_w) | (static_cast<std::uint32_t>(x.grid_h) << 16)
                                      : static_cast<std::uint32_t>(x.bias_hs < 0 ? static_cast<long long>(p.lq) * p.lk
@@ -100,13 +99,14 @@ void dense_attention(DeviceCtx& d, const AttnProblem& p, const DenseExtras& x) {
         g.sc = nrk;
         gemm(d, g);
 
-        const SoftmaxPush sp{s_addr, p_addr, sm_bias, sm_mask, x.qmask,
-                             static_cast<std::uint32_t>(nh * nr), static_cast<std::uint32_t>(p.lk),
-                             static_cast<std::uint32_t>(nr), static_cast<std::uint32_t>(h0),
-                             static_cast<std::uint32_t>(p.lk), static_cast<std::uint32_t>(p.lk),
-                             static_cast<std::uint32_t>(r0),
-                             sm_bhs, scale};
-        launch(d, ks, sp, std::min<std::uint32_t>(65535, sp.rows));
+        const std::uint32_t sm_rows = static_cast<std::uint32_t>(nh * nr);
+        const std::uint64_t ptrs[] = {s_addr, p_addr, sm_bias, sm_mask, x.qmask};
+        const std::int32_t ints[] = {static_cast<std::int32_t>(sm_rows), static_cast<std::int32_t>(p.lk),
+                                     static_cast<std::int32_t>(nr), static_cast<std::int32_t>(h0),
+                                     static_cast<std::int32_t>(p.lk), static_cast<std::int32_t>(p.lk),
+                                     static_cast<std::int32_t>(r0), static_cast<std::int32_t>(sm_bhs)};
+        const float flts[] = {scale};
+        mir_dispatch_args(d, ks, std::max<std::uint32_t>(1u, std::min<std::uint32_t>(65535u, sm_rows)), ptrs, ints, flts);
 
         GemmArgs o;
         o.op = p.op;

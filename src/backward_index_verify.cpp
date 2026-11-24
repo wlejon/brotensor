@@ -28,6 +28,8 @@
 #include <brotensor/backward_verify.h>
 
 #if BROTENSOR_HAS_BRASS_JIT
+#include "kernels/mir_attn_small.h"
+#include "kernels/mir_conv_direct.h"
 #include "kernels/mir_delta.h"
 #include "kernels/mir_elementwise.h"
 #include "kernels/mir_gnorm.h"
@@ -305,6 +307,46 @@ void add_shader_family_proof(
     }
     rep.entries.push_back({proof_name, all_ok, oss.str()});
 }
+
+struct MirAuditAccum {
+    bool ok = true;
+    std::uint32_t insts = 0, writes = 0, cmp = 0, count = 0;
+    std::string first_failure;
+    brass::target::SpirvOptions opts;
+
+    explicit MirAuditAccum(std::uint32_t local_size_x) {
+        opts.stage = brass::target::SpirvStage::Compute;
+        opts.local_size_x = local_size_x;
+        opts.local_size_spec_constants = true;
+    }
+
+    template <typename Fn>
+    void check(const char* label, Fn&& build_fn) {
+        brass::Module mod("verify_mir");
+        brass::Function* fn = build_fn(mod);
+        brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, opts);
+        LiftedSpirvCfgMetrics m = audit_lifted_spirv_words(sk.words, label);
+        insts += m.num_instructions;
+        writes += m.psb_stores_and_atomics;
+        cmp += m.bounds_comparisons;
+        ++count;
+        if (!m.all_ok()) {
+            ok = false;
+            if (first_failure.empty()) first_failure = m.diagnostic;
+        }
+    }
+
+    void finish(BackwardProofSuiteReport& rep, const std::string& name, const char* desc) const {
+        std::ostringstream oss;
+        if (ok) {
+            oss << "Proven on " << count << " compiled MIR " << desc << " .spv binaries ("
+                << insts << " insts, " << writes << " writes, " << cmp << " cmp, 0 hazards)";
+        } else {
+            oss << first_failure;
+        }
+        rep.entries.push_back({name, ok, oss.str()});
+    }
+};
 #endif
 
 } // namespace
@@ -314,18 +356,21 @@ void add_shader_family_proof(
 BackwardProofSuiteReport prove_conv2d_adjoint_duality() {
     BackwardProofSuiteReport rep;
 
+#if BROTENSOR_HAS_BRASS_JIT
+    {
+        MirAuditAccum acc(kernels::kEwBlock);
+        for (Dtype dt : {Dtype::FP32, Dtype::FP16, Dtype::BF16}) {
+            for (std::uint32_t mode : {0u, 1u}) {
+                acc.check("mir_conv_direct", [mode, dt](brass::Module& m) {
+                    return kernels::build_conv_direct_mir(m, mode, dt, true);
+                });
+            }
+        }
+        acc.finish(rep, "conv2d_lifted_spirv_conv_direct_f32_f16_bf16_bounds_and_safety", "conv_direct");
+    }
+#endif
 #if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
     using detail::vulkan::ShaderId;
-    const ShaderId direct_ids[] = {
-        ShaderId::conv_direct_f32,
-        ShaderId::conv_direct_f16,
-        ShaderId::conv_direct_bf16,
-    };
-    add_shader_family_proof(
-        rep,
-        "conv2d_lifted_spirv_conv_direct_f32_f16_bf16_bounds_and_safety",
-        direct_ids);
-
     const ShaderId simt_cm_ids[] = {
         ShaderId::conv_simt_f32,
         ShaderId::conv_simt_f16,
@@ -706,108 +751,32 @@ BackwardProofSuiteReport prove_rope_adjoint_duality() {
 
 #if BROTENSOR_HAS_BRASS_JIT
     {
-        bool all_ok = true;
-        std::uint32_t total_insts = 0, total_writes = 0, total_guards = 0, count = 0;
-        std::string first_failure;
-        brass::target::SpirvOptions spv_opts;
-        spv_opts.stage = brass::target::SpirvStage::Compute;
-        spv_opts.local_size_x = kernels::kEwBlock;
-        spv_opts.local_size_spec_constants = true;
-        auto check_mir = [&](const char* nm, const auto& build_fn) {
-            brass::Module mod("verify_w5");
-            brass::Function* fn = build_fn(mod);
-            brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, spv_opts);
-            LiftedSpirvCfgMetrics m = audit_lifted_spirv_words(sk.words, nm);
-            total_insts += m.num_instructions;
-            total_writes += m.psb_stores_and_atomics;
-            total_guards += m.bounds_comparisons;
-            ++count;
-            if (!m.all_ok()) {
-                all_ok = false;
-                if (first_failure.empty()) first_failure = m.diagnostic;
-            }
-        };
-        check_mir("mir_lstm", [](brass::Module& m) { return kernels::build_lstm_mir(m, LS_FWD, true, true); });
-        check_mir("mir_lstm", [](brass::Module& m) { return kernels::build_lstm_mir(m, LS_BWD, false, true); });
-        check_mir("mir_delta", [](brass::Module& m) { return kernels::build_delta_rule_mir(m, 32u, 4u); });
-        check_mir("mir_xent", [](brass::Module& m) { return kernels::build_xent_mir(m, 0u, true, true); });
-        check_mir("mir_xent", [](brass::Module& m) { return kernels::build_xent_mir(m, 1u, true, false); });
-        std::ostringstream oss;
-        if (all_ok) {
-            oss << "Proven on " << count << " brass-MIR compiled recurrent/xent .spv binaries ("
-                << total_insts << " lifted SPIR-V insts, " << total_writes
-                << " guarded PhysicalStorageBuffer64 writes, " << total_guards
-                << " bounds comparisons, 0 hazards)";
-        } else {
-            oss << first_failure;
-        }
-        rep.entries.push_back({"norm_lstm_deltarule_xent_lifted_spirv_bounds_and_barrier_safety", all_ok, oss.str()});
+        MirAuditAccum acc(kernels::kEwBlock);
+        acc.check("mir_lstm", [](brass::Module& m) { return kernels::build_lstm_mir(m, LS_FWD, true, true); });
+        acc.check("mir_lstm", [](brass::Module& m) { return kernels::build_lstm_mir(m, LS_BWD, false, true); });
+        acc.check("mir_delta", [](brass::Module& m) { return kernels::build_delta_rule_mir(m, 32u, 4u); });
+        acc.check("mir_xent", [](brass::Module& m) { return kernels::build_xent_mir(m, 0u, true, true); });
+        acc.check("mir_xent", [](brass::Module& m) { return kernels::build_xent_mir(m, 1u, true, false); });
+        acc.finish(rep, "norm_lstm_deltarule_xent_lifted_spirv_bounds_and_barrier_safety", "recurrent/xent");
     }
 #endif
     {
-        bool all_ok = true;
-        std::uint32_t total_insts = 0, total_writes = 0, total_guards = 0, count = 0;
-        std::string first_failure;
-        brass::target::SpirvOptions spv_opts;
-        spv_opts.stage = brass::target::SpirvStage::Compute;
-        spv_opts.local_size_x = kernels::kNormBlock;
-        spv_opts.local_size_spec_constants = true;
+        MirAuditAccum acc(kernels::kNormBlock);
         for (Dtype dt : {Dtype::FP32, Dtype::FP16, Dtype::BF16}) {
             const int lanes = (dt == Dtype::FP32) ? 4 : 8;
             for (std::uint32_t mode : {std::uint32_t(NORM_LN_BWD), std::uint32_t(NORM_RMS_BWD), std::uint32_t(NORM_SM_BWD)}) {
-                brass::Module mir_mod("verify_norm");
-                brass::Function* fn = kernels::build_norm_mir(
-                    mir_mod, mode, dt, dt, dt, {true, true, true, false, true}, lanes);
-                brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, spv_opts);
-                LiftedSpirvCfgMetrics m = audit_lifted_spirv_words(sk.words, "mir_norm");
-                total_insts += m.num_instructions;
-                total_writes += m.psb_stores_and_atomics;
-                total_guards += m.bounds_comparisons;
-                ++count;
-                if (!m.all_ok()) {
-                    all_ok = false;
-                    if (first_failure.empty()) first_failure = m.diagnostic;
-                }
+                acc.check("mir_norm", [mode, dt, lanes](brass::Module& m) {
+                    return kernels::build_norm_mir(m, mode, dt, dt, dt, {true, true, true, false, true}, lanes);
+                });
             }
             for (std::uint32_t mode : {std::uint32_t(GN_BWD_CH), std::uint32_t(GN_BWD_DX)}) {
-                brass::Module mir_mod("verify_gnorm");
-                brass::Function* fn = kernels::build_gnorm_mir(mir_mod, mode, dt, false, 1);
-                brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, spv_opts);
-                LiftedSpirvCfgMetrics m = audit_lifted_spirv_words(sk.words, "mir_gnorm");
-                total_insts += m.num_instructions;
-                total_writes += m.psb_stores_and_atomics;
-                total_guards += m.bounds_comparisons;
-                ++count;
-                if (!m.all_ok()) {
-                    all_ok = false;
-                    if (first_failure.empty()) first_failure = m.diagnostic;
-                }
+                acc.check("mir_gnorm", [mode, dt](brass::Module& m) {
+                    return kernels::build_gnorm_mir(m, mode, dt, false, 1);
+                });
             }
         }
-        {
-            brass::Module mir_mod("verify_bnorm");
-            brass::Function* fn = kernels::build_bnorm_mir(mir_mod, BN_TRAIN_BWD);
-            brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, spv_opts);
-            LiftedSpirvCfgMetrics m = audit_lifted_spirv_words(sk.words, "mir_bnorm");
-            total_insts += m.num_instructions;
-            total_writes += m.psb_stores_and_atomics;
-            total_guards += m.bounds_comparisons;
-            ++count;
-            if (!m.all_ok()) {
-                all_ok = false;
-                if (first_failure.empty()) first_failure = m.diagnostic;
-            }
-        }
-        std::ostringstream oss;
-        if (all_ok) {
-            oss << "Proven on " << count << " brass-MIR compiled norm/gnorm/bnorm backward .spv binaries ("
-                << total_insts << " lifted SPIR-V insts, " << total_writes
-                << " guarded PhysicalStorageBuffer64 writes, " << total_guards
-                << " bounds comparisons, 0 hazards)";
-        } else {
-            oss << "Lifted MIR norm/gnorm/bnorm audit failure: " << first_failure;
-        }
-        rep.entries.push_back({"norm_mir_lifted_spirv_bounds_and_barrier_safety", all_ok, oss.str()});
+        acc.check("mir_bnorm", [](brass::Module& m) { return kernels::build_bnorm_mir(m, BN_TRAIN_BWD); });
+        acc.finish(rep, "norm_mir_lifted_spirv_bounds_and_barrier_safety", "norm/gnorm/bnorm backward");
     }
 #endif
 
@@ -869,11 +838,10 @@ BackwardProofSuiteReport prove_flash_attention_mask_adjoint_duality() {
         ShaderId::fa_bwd_bf16,
         ShaderId::fa_bwd_cm_f16,
         ShaderId::fa_bwd_cm_bf16,
-        ShaderId::attn_bwd,
     };
     add_shader_family_proof(
         rep,
-        "flash_attention_lifted_spirv_fa_bwd_simt_cm_and_attn_bwd_safety",
+        "flash_attention_lifted_spirv_fa_bwd_simt_cm_safety",
         fa_bwd_ids);
 
     const ShaderId fa_fwd_ids[] = {
@@ -882,14 +850,25 @@ BackwardProofSuiteReport prove_flash_attention_mask_adjoint_duality() {
         ShaderId::fa_rows_bf16,
         ShaderId::fa_cm_f16,
         ShaderId::fa_cm_bf16,
-        ShaderId::fa_combine_f32,
-        ShaderId::fa_combine_f16,
-        ShaderId::fa_combine_bf16,
     };
     add_shader_family_proof(
         rep,
-        "flash_attention_lifted_spirv_fa_fwd_rows_cm_combine_safety",
+        "flash_attention_lifted_spirv_fa_fwd_rows_cm_safety",
         fa_fwd_ids);
+#endif
+#if BROTENSOR_HAS_BRASS_JIT
+    {
+        MirAuditAccum acc(kernels::kEwBlock);
+        acc.check("mir_attn_bwd", [](brass::Module& m) { return kernels::build_attn_bwd_mir(m, true, true); });
+        acc.check("mir_attn_aux", [](brass::Module& m) { return kernels::build_attn_aux_mir(m, 0u, Dtype::FP32, true); });
+        for (Dtype dt : {Dtype::FP32, Dtype::FP16, Dtype::BF16}) {
+            acc.check("mir_fa_combine", [dt](brass::Module& m) { return kernels::build_fa_combine_mir(m, dt); });
+            acc.check("mir_attn_sm", [dt](brass::Module& m) {
+                return kernels::build_attn_softmax_mir(m, dt, 2u, false, true, false);
+            });
+        }
+        acc.finish(rep, "flash_attention_lifted_spirv_mir_attn_bwd_combine_softmax_safety", "attention");
+    }
 #endif
 
     // Verify PTX equivalence (`verify_ptx_equivalence`), shared-memory bounds

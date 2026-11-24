@@ -41,9 +41,8 @@ inline int dt_code(::brotensor::Dtype dt, const char* op) {
 // checks the order of every one at start-up.
 inline constexpr ShaderId kDtypeFamilies[] = {
     ShaderId::gemm_simt_f32, ShaderId::gemv_f32,
-    ShaderId::fa_rows_f32, ShaderId::fa_combine_f32,
-    ShaderId::attn_softmax_f32, ShaderId::attn_aux_f32,
-    ShaderId::conv_simt_f32, ShaderId::conv_direct_f32,
+    ShaderId::fa_rows_f32,
+    ShaderId::conv_simt_f32,
     ShaderId::fa_bwd_f32,
     ShaderId::wq_rows_f32,
 };

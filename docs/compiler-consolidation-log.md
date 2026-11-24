@@ -559,3 +559,25 @@ Extended `src/cuda/cu_mir_cache.{h,cpp}` (`179` / `640` LOC) with `MirKind::{Sel
   - Deleted 13 `.cu` files (`-2,877` lines): `sample_logits.cu` (`-470`), `modulated_conv2d.cu` (`-452`), `masked_diffusion.cu` (`-430`), `bias_act.cu` (`-261`), `deform_conv2d.cu` (`-203`), `upfirdn2d.cu` (`-200`), `reduce.cu` (`-197`), `loss.cu` (`-178`), `elementwise_misc.cu` (`-172`), `attention_moments.cu` (`-113`), `xavier_init.cu` (`-75`), `adam.cu` (`-66`), `optim.cu` (`-47`).
   - Added / extended files (all `<= 640` LOC): `ops_sampling.cpp` (`166`), `ops_misc.cpp` (`360`), `ops_vision.cpp` (`343`), `cu_mir_cache.{h,cpp}` (`179` / `640`, `+65`).
   - Net `src/cuda/` Wave 6 delta: **`-1,943` lines** (**cumulative CUDA Waves 3–6: `-7,556` net lines and 40 `.cu` files deleted**, all modified/created files `<= 640` LOC).
+
+---
+
+## Wave 8: Vulkan Attention Helpers (`attn_aux` / `attn_bwd` / `fa_combine` / `attn_softmax`) & Direct Convolution (`conv_direct`) -> Single-Source Brass MIR
+
+Replaced 5 GLSL shaders / 13 variants (`attn_aux.comp` `34`L × 3, `attn_bwd.comp` `46`L × 1, `fa_combine.comp` `41`L × 3, `attn_softmax.comp` `104`L × 3, `conv_direct.comp` `85`L × 3; `56 -> 43` compiled Vulkan shaders) with two focused backend-neutral `brass::Function` MIR modules:
+- `src/kernels/mir_attn_small.{h,cpp}` (`31 + 329` LOC): `build_attn_aux_mir` (`AUX_ROW_GATE`, `AUX_HEAD_MEAN`), `build_attn_bwd_mir` (uniform workgroup `emit_block_sum_f32` row softmax backward with compile-time `has_kmask` / `has_qmask` specialization), `build_fa_combine_mir` (split-key flash-attention merge), and `build_attn_softmax_mir` (dense masked/biased/SAM decomposed relative-position softmax).
+- `src/kernels/mir_conv_direct.{h,cpp}` (`18 + 172` LOC): `build_conv_direct_mir` (`CONVD_FWD` for 2D/3D grouped/dilated forward conv; `CONVD_TRANS` for conv_transpose2d / conv2d backward input gather).
+- Extended `src/vulkan/vk_mir_cache.{h,cpp}` (`185 / 664` LOC) with `MirKind::{AttnAux, AttnBwd, FaCombine, AttnSoftmax, ConvDirect}`, wired `ops_attention.cpp` (`588` LOC), `ops_attention_dense.cpp` (`135` LOC), `ops_attention_proj.cpp` (`352` LOC), `ops_attention_bwd.cpp` (`274` LOC), and `ops_conv.cpp` (`624` LOC), and factored `MirAuditAccum` in `src/backward_index_verify.cpp` (`956` LOC).
+
+### Wave 8 Correctness, Proof Audit & LOC Delta (Radeon 8060S)
+- **Formal Audits:**
+  - `brotensor_test_backward_index_proofs`: **19 / 19 ALL PASSED** (including `conv2d_lifted_spirv_conv_direct_f32_f16_bf16_bounds_and_safety` across 6 compiled MIR `.spv` binaries: `1,404` insts, `6` writes, `82` cmp, `0` hazards; and `flash_attention_lifted_spirv_mir_attn_bwd_combine_softmax_safety` across 8 compiled MIR `.spv` binaries: `2,077` insts, `12` writes, `58` cmp, `0` hazards).
+  - `brotensor_test_backward_shader_audit`: **166 / 166 shaders passed** (`113,531` SPIR-V/PTX insts, `197` workgroup arrays, `6,576` shared / `2,684` global accesses proven, `654` uniform barriers, `946` uniform collectives, `0` failures).
+- **Unit, Parity, Graph-Capture & Vulkan Suites (`0` failures after final edit):**
+  - `brotensor_test_vulkan --only={attention,ops,train,conv,vision,capture,sampling,misc}`
+  - `brotensor_test_cuda_graph`, `brotensor_test_ops_fused`
+  - **31 / 31** `ctest -j 1` attention & conv suites (`vit_block_ops`, `conv3d`, `flash_attention_varlen`, `flash_attention_varlen_backward`, `conv_transpose2d`, `self_attention_decomposed_rel_pos`, `modulated_conv2d`, `conv2d`, `cross_attention`, `cross_attention_with_attn`, `attention_moments`, `flash_attention`, `flash_attention_backward`, `kv_cache`, `int8_attention`, `attention_parity`, `conv2d_parity`, `deform_conv2d_parity`, `conv3d_parity`, `kv_cache_parity`, `cross_attention_parity`, `self_attention_parity`, `self_attention_decomposed_rel_pos_parity`, `attention_moments_parity`, `flash_attention_parity`, `flash_attention_gqa_parity`, `flash_attention_varlen_parity`, `flash_attention_varlen_backward_parity`, `batched_backward_parity`, `conv_transpose2d_parity`, `flash_attention_head_dim_parity`).
+- **LOC Delta (Vulkan Wave 8):**
+  - `src/vulkan/shaders/*`: `4,579 -> 4,202` (**`-377` lines**; cumulative **`-4,033` lines** / 35 `.comp` files / 97 variants deleted across Waves 1–8, `140 -> 43` compiled Vulkan shaders).
+  - Shared backend-neutral `src/kernels/*`: `6,796` lines across 47 files (`+562` lines in Wave 8, max file `591` lines).
+

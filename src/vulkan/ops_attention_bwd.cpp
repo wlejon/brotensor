@@ -22,9 +22,11 @@
 
 #include "detail/gemm.h"
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
+#include <algorithm>
 #include <cmath>
 #include <initializer_list>
 #include <stdexcept>
@@ -38,17 +40,6 @@ using ::brotensor::Tensor;
 void column_sum_accumulate(const Tensor& X, Tensor& out);   // ops_norm.cpp
 
 namespace {
-
-struct AuxPush {
-    std::uint64_t x, y, mask;
-    std::uint32_t rows, n;
-};
-
-struct SmBwdPush {
-    std::uint64_t p, dp, kmask, qmask;
-    std::uint32_t rows, lq, lk;
-    float scale;
-};
 
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
@@ -149,10 +140,13 @@ void attention_bwd(const BwdSpec& s) {
     std::uint64_t dog = addr(s.dO->data);
     if (s.qmask) {
         dog_tmp = Tensor::empty_on(dev, Lq, D, Dtype::FP32);
-        const Kernel& k = d.pipelines().get(ShaderId::attn_aux_f32, {std::uint32_t(AUX_ROW_GATE)});
-        const AuxPush pc{dog, addr(dog_tmp.data), addr(s.qmask), static_cast<std::uint32_t>(Lq),
-                         static_cast<std::uint32_t>(D)};
-        launch(d, k, pc, groups_1d(std::uint64_t(Lq) * D, k));
+        const MirKernel mk = mir_kernel(d, {MirKind::AttnAux, 0u, Dtype::FP32, Dtype::FP32, 1, Dtype::FP32, 1u});
+        const std::uint64_t total = static_cast<std::uint64_t>(Lq) * D;
+        const std::uint32_t gx = static_cast<std::uint32_t>(
+            std::clamp<std::uint64_t>((total + 255u) / 256u, 1u, 65535u));
+        const std::uint64_t ptrs[] = {dog, addr(dog_tmp.data), addr(s.qmask)};
+        const std::int32_t ints[] = {static_cast<std::int32_t>(Lq), static_cast<std::int32_t>(D)};
+        mir_dispatch_args(d, mk, gx, ptrs, ints, {});
         dog = addr(dog_tmp.data);
     }
 
@@ -186,11 +180,14 @@ void attention_bwd(const BwdSpec& s) {
     }
     // dS = softmax backward, in place over dP
     {
-        const Kernel& k = d.pipelines().get(ShaderId::attn_bwd);
-        const SmBwdPush pc{addr(s.Attnh->data), addr(dP.data), addr(s.kmask), addr(s.qmask),
-                           static_cast<std::uint32_t>(H * Lq), static_cast<std::uint32_t>(Lq),
-                           static_cast<std::uint32_t>(Lk), 1.0f / std::sqrt(static_cast<float>(hd))};
-        launch(d, k, pc, static_cast<std::uint32_t>(std::min(H * Lq, 65535)));
+        const std::uint8_t flags =
+            static_cast<std::uint8_t>((s.kmask ? 1u : 0u) | (s.qmask ? 2u : 0u));
+        const MirKernel mk = mir_kernel(d, {MirKind::AttnBwd, 0u, Dtype::FP32, Dtype::FP32, 1, Dtype::FP32, flags});
+        const std::uint64_t ptrs[] = {addr(s.Attnh->data), addr(dP.data), addr(s.kmask), addr(s.qmask)};
+        const std::int32_t ints[] = {static_cast<std::int32_t>(H * Lq), static_cast<std::int32_t>(Lq),
+                                     static_cast<std::int32_t>(Lk)};
+        const float flts[] = {1.0f / std::sqrt(static_cast<float>(hd))};
+        mir_dispatch_args(d, mk, static_cast<std::uint32_t>(std::clamp(H * Lq, 1, 65535)), ptrs, ints, flts);
     }
     // dQ_h (Lq, hd) = dS_h Kh_h;  dK_h (Lk, hd) = dS_h^T Qh_h
     {

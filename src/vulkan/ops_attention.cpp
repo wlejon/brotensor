@@ -10,6 +10,7 @@
 
 #include "detail/attention.h"
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -36,11 +37,6 @@ struct FaPush {
     std::uint32_t lq, lk, ldq, ldk, ldo, group, window, causal, nseq, chunk, hq, qb0;
     std::int32_t q_offset;
     float scale, softcap;
-};
-
-struct CombinePush {
-    std::uint64_t part, o;
-    std::uint32_t entries, nsplit, hd, hq, ldo;
 };
 
 std::atomic<int> g_override{0};
@@ -131,11 +127,14 @@ CmCfg pick_cm(const AttnProblem& p) {
 }
 
 void combine(DeviceCtx& d, const AttnProblem& p, std::uint64_t part, std::uint64_t nsplit) {
-    const Kernel& kc = d.pipelines().get(dt_variant(ShaderId::fa_combine_f32, p.dt, p.op));
-    const CombinePush cp{part, p.o, static_cast<std::uint32_t>(static_cast<long long>(p.lq) * p.hq),
-                         static_cast<std::uint32_t>(nsplit), static_cast<std::uint32_t>(p.hd),
-                         static_cast<std::uint32_t>(p.hq), static_cast<std::uint32_t>(p.ldo)};
-    launch(d, kc, cp, static_cast<std::uint32_t>(std::min<long long>(65535, cp.entries)));
+    dt_code(p.dt, p.op);
+    const MirKernel mk = mir_kernel(d, {MirKind::FaCombine, 0u, p.dt});
+    const std::uint32_t entries = static_cast<std::uint32_t>(static_cast<long long>(p.lq) * p.hq);
+    const std::uint64_t ptrs[] = {part, p.o};
+    const std::int32_t ints[] = {static_cast<std::int32_t>(entries), static_cast<std::int32_t>(nsplit),
+                                 static_cast<std::int32_t>(p.hd), static_cast<std::int32_t>(p.hq),
+                                 static_cast<std::int32_t>(p.ldo)};
+    mir_dispatch_args(d, mk, std::max<std::uint32_t>(1u, std::min<std::uint32_t>(65535u, entries)), ptrs, ints, {});
 }
 
 // FP32 partials for `nsplit` key splits: (lq * hq * nsplit) x (hd + 2).

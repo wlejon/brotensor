@@ -117,11 +117,23 @@ bool coopmat_ok(DeviceCtx& d, const Conv2dArgs& a, const Geo& g) {
 }
 
 void conv_direct(DeviceCtx& d, std::uint32_t mode, Dtype dt, const DirectPush& pc) {
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::conv_direct_f32, dt), {mode});
     const std::uint64_t total = std::uint64_t(pc.n) * pc.cout * pc.to * pc.ho * pc.wo;
     if (total == 0) return;
     if (total > 0xffffffffULL) fail("conv", "output too large for one dispatch");
-    launch(d, k, pc, groups_1d(total, k));
+    const MirKernel mk = mir_kernel(d, {MirKind::ConvDirect, mode, dt, Dtype::FP32, 1, Dtype::FP32,
+                                        static_cast<std::uint8_t>(pc.bias != 0 ? 1u : 0u)});
+    const std::uint32_t gx = static_cast<std::uint32_t>(
+        std::clamp<std::uint64_t>((total + 255u) / 256u, 1u, 65535u));
+    const std::uint64_t ptrs[] = {pc.x, pc.w, pc.y, pc.bias};
+    const std::int32_t ints[] = {
+        static_cast<std::int32_t>(pc.n), static_cast<std::int32_t>(pc.cin), static_cast<std::int32_t>(pc.t),
+        static_cast<std::int32_t>(pc.h), static_cast<std::int32_t>(pc.wd), static_cast<std::int32_t>(pc.cout),
+        static_cast<std::int32_t>(pc.to), static_cast<std::int32_t>(pc.ho), static_cast<std::int32_t>(pc.wo),
+        static_cast<std::int32_t>(pc.kt), static_cast<std::int32_t>(pc.kh), static_cast<std::int32_t>(pc.kw),
+        pc.st, pc.sh, pc.sw, pc.pt, pc.ph, pc.pw, pc.dt, pc.dh, pc.dw,
+        static_cast<std::int32_t>(pc.groups),
+    };
+    mir_dispatch_args(d, mk, gx, ptrs, ints, {});
 }
 
 void conv_coopmat(DeviceCtx& d, const Conv2dArgs& a, const Geo& g) {

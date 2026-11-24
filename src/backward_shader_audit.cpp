@@ -31,7 +31,9 @@
 #include "kernels/mir_remap.h"
 #include "kernels/mir_resample.h"
 #include "kernels/mir_resample_bwd.h"
+#include "kernels/mir_attn_small.h"
 #include "kernels/mir_audio.h"
+#include "kernels/mir_conv_direct.h"
 #include "kernels/mir_rope.h"
 #include "kernels/mir_scatter.h"
 #include "kernels/mir_select.h"
@@ -625,6 +627,28 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
         });
         audit_mir("spectral_stft_adj", [](brass::Module& m) {
             return kernels::build_spectral_mir(m, SP_STFT_ADJ, 1u, false, false);
+        });
+        for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
+                 {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
+            const std::string ax_name = std::string("attn_aux") + sfx;
+            audit_mir(ax_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_attn_aux_mir(m, 0u, dt, true);
+            });
+            const std::string cd_name = std::string("conv_direct") + sfx;
+            audit_mir(cd_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_conv_direct_mir(m, 0u, dt, true);
+            });
+            const std::string fc_name = std::string("fa_combine") + sfx;
+            audit_mir(fc_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_fa_combine_mir(m, dt);
+            });
+            const std::string sm_name = std::string("attn_softmax") + sfx;
+            audit_mir(sm_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_attn_softmax_mir(m, dt, 1u, true, true, false);
+            });
+        }
+        audit_mir("attn_bwd", [](brass::Module& m) {
+            return kernels::build_attn_bwd_mir(m, true, true);
         });
     }
 

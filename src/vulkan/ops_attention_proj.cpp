@@ -16,9 +16,11 @@
 #include "detail/attention.h"
 #include "detail/gemm.h"
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -33,11 +35,6 @@ void copy_d2d_strided(const Tensor& src, int src_off, int src_pitch, Tensor& dst
                       int width, int height);                 // ops_copy.cpp
 
 namespace {
-
-struct AuxPush {
-    std::uint64_t x, y, mask;
-    std::uint32_t rows, n;
-};
 
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
@@ -68,10 +65,14 @@ void project32(const char* op, const Tensor& X, const Tensor& W, const Tensor* b
 
 void aux(DeviceCtx& d, std::uint32_t mode, std::uint64_t x, const Tensor& y, std::uint64_t mask, std::uint32_t rows,
          std::uint32_t n) {
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::attn_aux_f32, y.dtype), {mode});
-    const AuxPush pc{x, addr(y.data), mask, rows, n};
+    const MirKernel mk = mir_kernel(d, {MirKind::AttnAux, mode, y.dtype, Dtype::FP32, 1, Dtype::FP32,
+                                        static_cast<std::uint8_t>(mask != 0 ? 1u : 0u)});
     const std::uint64_t total = mode == AUX_ROW_GATE ? std::uint64_t(rows) * n : n;
-    launch(d, k, pc, groups_1d(total, k));
+    const std::uint32_t gx = static_cast<std::uint32_t>(
+        std::clamp<std::uint64_t>((total + 255u) / 256u, 1u, 65535u));
+    const std::uint64_t ptrs[] = {x, addr(y.data), mask};
+    const std::int32_t ints[] = {static_cast<std::int32_t>(rows), static_cast<std::int32_t>(n)};
+    mir_dispatch_args(d, mk, gx, ptrs, ints, {});
 }
 
 struct ProjSpec {
