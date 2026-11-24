@@ -410,4 +410,18 @@ Replaced 4 GLSL shaders / 6 variants (`lstm.comp`, `delta_rule.comp`, `xent.comp
 - **LOC Delta (Vulkan Wave 5):**
   - Deleted 4 GLSL shaders / 6 variants (`lstm.comp`, `delta_rule.comp`, `xent.comp`, `topk_seg.comp`): `src/vulkan/shaders/*` `5,897 -> 5,499` (**`-398` lines**; cumulative **`-2,736` lines** / 26 files / 76 variants deleted across Waves 1–5, `140 -> 64` compiled Vulkan shaders)
   - Shared backend-neutral `src/kernels/*` now `3,811` lines across 33 files (`+579` lines in Wave 5, max file `399` lines); `src/vulkan/vk_mir_cache.{h,cpp}` `770` lines (`+113` lines)
-  - Pending Wave 5 cross-backend deletions once Metal & CUDA wire into `src/kernels/{mir_lstm,mir_delta,mir_xent,mir_topk}`: `2,001` Metal lines (`lstm.mm` `441`, `gated_delta_rule.mm` `241`, `top_k.mm` `220`, `loss.mm` `647`, `packed_encoder.mm` `452`) and `1,896` CUDA lines (`lstm.cu` `494`, `gated_delta_rule.cu` `475`, `top_k.cu` `248`, `loss.cu` `531`, `packed_encoder.cu` `148`) — **`3,897`** combined LOC across both backends
+  - Wave 5 Metal consolidation completed below (`-758` net Metal LOC); pending Wave 5 CUDA deletion: `1,896` CUDA lines (`lstm.cu` `494`, `gated_delta_rule.cu` `475`, `top_k.cu` `248`, `loss.cu` `531`, `packed_encoder.cu` `148`)
+
+---
+
+## Wave 5 (Metal / Apple M2 Pro): LSTM, Gated Delta Rule, Cross-Entropy (Softmax/BCE) & Top-K/Segment Stats -> Single-Source Brass MIR
+
+Extended Metal's runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`, `207` / `663` LOC) with `MirKind::{Lstm, DeltaRule, Xent, Topk}`, wired every Wave 5 Metal op through `MslTarget`, moved `lstm_forward_train`/`lstm_backward` matrix products onto Metal's simdgroup GEMM (`launch_matmul_abt_mixed`) + `MirKind::Lstm` + `NORM_COL_SUM` (removing the old scalar MSL loops & CAS-atomic backward), switched `gated_delta_rule_{chunked,step}` to 32-lane simdgroup register-resident `MirKind::DeltaRule`, moved `segment_softmax_stats` into `top_k.mm` alongside `top_k_rows` (`MirKind::Topk` across FP32/FP16/BF16), and replaced all 3 hand-written softmax-xent / BCE MSL kernels in `loss.mm` with `MirKind::Xent` (leaving only small `mse_*` kernels for Wave 6+ misc).
+
+### Wave 5 Metal Verification & LOC Delta
+- **Parity & Full `ctest` Suite (Apple M2 Pro, Metal Release, `brass` `d5608f4`):**
+  - Targeted Wave 5 & audit suites (`lstm`, `lstm_parity`, `gated_delta_rule`, `gated_delta_rule_parity`, `top_k`, `top_k_parity`, `packed_encoder_parity`, `loss_parity`, `loss_fused_parity`, `bce_with_logits`, `batched_backward_parity`, `gpu_mir_emit`, `backward_shader_audit` ×2): **14/14 passed** (`53.19 s`, `0` failures).
+  - Full Metal `ctest` (`-LE gcstress -j2 --timeout 300`): **190/190 passed** (`285.34 s`, `0` failures; `backward_shader_audit` `47.54–47.60 s`).
+- **LOC Delta (Metal Wave 5):**
+  - Slimmed / rewritten files (all `< 700` LOC): `lstm.mm` (`441 -> 245`), `gated_delta_rule.mm` (`241 -> 108`), `top_k.mm` (`220 -> 83`, absorbing `segment_softmax_stats`), `loss.mm` (`647 -> 328`), `packed_encoder.mm` (`452 -> 373`), `mtl_mir_cache.{h,mm}` (`182/582 -> 207/663`).
+  - **Net Metal LOC delta (Wave 5):** `522` insertions, `1,280` deletions (**`-758` net Metal LOC**; `src/metal/` `27,033 -> 26,275` LOC; **cumulative Waves 1–5: `-10,410` net Metal LOC** and 28 Metal files deleted).

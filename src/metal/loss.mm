@@ -1,9 +1,20 @@
+// Metal loss ops:
+//   softmax_xent / softmax_xent_fused / softmax_xent_segment /
+//   softmax_xent_fused_batched / bce_with_logits_fused_batched
+//       -> single-source brass MIR kernel (src/kernels/mir_xent.cpp)
+//   mse_vec_forward / mse_vec_backward / mse_vec_per_sample / mse_scalar
+//       -> small MSE kernels (Wave 6+ misc)
+
+#include "mtl_mir_cache.h"
+
 #include <brotensor/runtime.h>
 
+#import "internal.h"
+
+#include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
-
-#import "internal.h"
 
 namespace brotensor::detail::metal {
 
@@ -17,7 +28,7 @@ namespace {
 
 constexpr NSUInteger LOSS_BLOCK = 256;
 
-NSString* const kSrc = @R"msl(
+NSString* const kMseSrc = @R"msl(
 #include <metal_stdlib>
 using namespace metal;
 
@@ -54,80 +65,6 @@ kernel void k_mse_backward(device const float* pred   [[buffer(0)]],
     dPred[i] = scale * (pred[i] - target[i]);
 }
 
-kernel void k_softmax_xent_fused(device const float* logits [[buffer(0)]],
-                                 device const float* target [[buffer(1)]],
-                                 device const float* mask   [[buffer(2)]],
-                                 constant uint& has_mask    [[buffer(3)]],
-                                 device float*       probs  [[buffer(4)]],
-                                 device float*       dLogits[[buffer(5)]],
-                                 device float*       out_loss[[buffer(6)]],
-                                 constant uint& n           [[buffer(7)]],
-                                 uint tid [[thread_position_in_threadgroup]],
-                                 uint tg_size [[threads_per_threadgroup]]) {
-    threadgroup float sdata[LOSS_BLOCK];
-
-    float local_max = -1e30f;
-    for (uint i = tid; i < n; i += tg_size) {
-        if (has_mask && mask[i] < 0.5f) continue;
-        float v = logits[i];
-        if (v > local_max) local_max = v;
-    }
-    sdata[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            float a = sdata[tid], b = sdata[tid + s];
-            sdata[tid] = a > b ? a : b;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float m = sdata[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float local_sum = 0.0f;
-    for (uint i = tid; i < n; i += tg_size) {
-        if (has_mask && mask[i] < 0.5f) {
-            probs[i] = 0.0f;
-            continue;
-        }
-        float e = exp(logits[i] - m);
-        probs[i] = e;
-        local_sum += e;
-    }
-    sdata[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float sum = sdata[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-
-    float local_loss = 0.0f;
-    for (uint i = tid; i < n; i += tg_size) {
-        if (has_mask && mask[i] < 0.5f) {
-            dLogits[i] = 0.0f;
-            continue;
-        }
-        float p = probs[i] * inv;
-        probs[i] = p;
-        float t = target[i];
-        if (t > 0.0f) {
-            float pc = p > 1e-12f ? p : 1e-12f;
-            local_loss -= t * log(pc);
-        }
-        dLogits[i] = p - t;
-    }
-    sdata[tid] = local_loss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (tid == 0) out_loss[0] = sdata[0];
-}
-
 kernel void k_mse_per_sample(device const float* pred   [[buffer(0)]],
                              device const float* target [[buffer(1)]],
                              device float*       dPred  [[buffer(2)]],
@@ -139,174 +76,76 @@ kernel void k_mse_per_sample(device const float* pred   [[buffer(0)]],
     dPred[b] = d;
     loss[b] = 0.5f * d * d;
 }
-
-// One threadgroup per (sample, head) tile. Slice is [off, end) of row b.
-kernel void k_softmax_xent_fused_batched(device const float* logits        [[buffer(0)]],
-                                         device const float* target        [[buffer(1)]],
-                                         device const float* mask          [[buffer(2)]],
-                                         constant uint& has_mask           [[buffer(3)]],
-                                         device const int*   head_offsets  [[buffer(4)]],
-                                         device float*       probs         [[buffer(5)]],
-                                         device float*       dLogits       [[buffer(6)]],
-                                         device atomic_float* loss_per_sample[[buffer(7)]],
-                                         constant uint& B                  [[buffer(8)]],
-                                         constant uint& n_act              [[buffer(9)]],
-                                         uint2 gid [[threadgroup_position_in_grid]],
-                                         uint2 tid2 [[thread_position_in_threadgroup]],
-                                         uint2 tgsz2 [[threads_per_threadgroup]]) {
-    uint tid = tid2.x;
-    uint tg_size = tgsz2.x;
-    threadgroup float sdata[LOSS_BLOCK];
-    uint h = gid.x;
-    uint b = gid.y;
-    if (b >= B) return;
-    int off = head_offsets[h];
-    int end = head_offsets[h + 1];
-    int len = end - off;
-    uint row_off = b * n_act + uint(off);
-
-    device const float* logits_row  = logits  + row_off;
-    device const float* target_row  = target  + row_off;
-    device const float* mask_row    = mask    + row_off;
-    device float*       probs_row   = probs   + row_off;
-    device float*       dLogits_row = dLogits + row_off;
-
-    float local_max = -1e30f;
-    for (int i = int(tid); i < len; i += int(tg_size)) {
-        if (has_mask && mask_row[i] == 0.0f) continue;
-        float v = logits_row[i];
-        if (v > local_max) local_max = v;
-    }
-    sdata[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            float a = sdata[tid], c = sdata[tid + s];
-            sdata[tid] = a > c ? a : c;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float m = sdata[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float local_sum = 0.0f;
-    for (int i = int(tid); i < len; i += int(tg_size)) {
-        if (has_mask && mask_row[i] == 0.0f) {
-            probs_row[i] = 0.0f;
-            continue;
-        }
-        float e = exp(logits_row[i] - m);
-        probs_row[i] = e;
-        local_sum += e;
-    }
-    sdata[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float sum = sdata[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-
-    float local_loss = 0.0f;
-    for (int i = int(tid); i < len; i += int(tg_size)) {
-        if (has_mask && mask_row[i] == 0.0f) {
-            dLogits_row[i] = 0.0f;
-            continue;
-        }
-        float p = probs_row[i] * inv;
-        probs_row[i] = p;
-        float t = target_row[i];
-        if (t > 0.0f) {
-            float pc = p > 1e-12f ? p : 1e-12f;
-            local_loss -= t * log(pc);
-        }
-        dLogits_row[i] = p - t;
-    }
-    sdata[tid] = local_loss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (tid == 0) {
-        atomic_fetch_add_explicit(&loss_per_sample[b], sdata[0], memory_order_relaxed);
-    }
-}
-
-// One threadgroup per sample b. Per-element fused sigmoid + BCE with stable
-// softplus, optional mask, and pos_weight on the positive class.
-kernel void k_bce_with_logits_fused_batched(device const float* logits     [[buffer(0)]],
-                                            device const float* target     [[buffer(1)]],
-                                            device const float* mask       [[buffer(2)]],
-                                            constant uint& has_mask        [[buffer(3)]],
-                                            constant float& pos_weight     [[buffer(4)]],
-                                            device float*       probs      [[buffer(5)]],
-                                            device float*       dLogits    [[buffer(6)]],
-                                            device float*       loss_per_sample [[buffer(7)]],
-                                            constant uint& B               [[buffer(8)]],
-                                            constant uint& L               [[buffer(9)]],
-                                            uint gid [[threadgroup_position_in_grid]],
-                                            uint tid [[thread_position_in_threadgroup]],
-                                            uint tg_size [[threads_per_threadgroup]]) {
-    threadgroup float sdata[LOSS_BLOCK];
-    uint b = gid;
-    if (b >= B) return;
-    uint row_off = b * L;
-    device const float* logits_row  = logits  + row_off;
-    device const float* target_row  = target  + row_off;
-    device const float* mask_row    = mask    + row_off;
-    device float*       probs_row   = probs   + row_off;
-    device float*       dLogits_row = dLogits + row_off;
-
-    float w = pos_weight;
-    float local_loss = 0.0f;
-    for (uint i = tid; i < L; i += tg_size) {
-        if (has_mask && mask_row[i] == 0.0f) {
-            probs_row[i] = 0.0f;
-            dLogits_row[i] = 0.0f;
-            continue;
-        }
-        float z = logits_row[i];
-        float y = target_row[i];
-        float az = fabs(z);
-        float l1p = log(1.0f + exp(-az));
-        float sp_neg = (z > 0.0f ? 0.0f : -z) + l1p;
-        float sp_pos = (z > 0.0f ? z    : 0.0f) + l1p;
-        local_loss += w * y * sp_neg + (1.0f - y) * sp_pos;
-        float s = z >= 0.0f
-            ? 1.0f / (1.0f + exp(-z))
-            : exp(z) / (1.0f + exp(z));
-        probs_row[i] = s;
-        dLogits_row[i] = s * (w * y + 1.0f - y) - w * y;
-    }
-    sdata[tid] = local_loss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (tid == 0) loss_per_sample[b] = sdata[0];
-}
 )msl";
 
-#define DEF_PSO(NAME, FN) \
-    id<MTLComputePipelineState> NAME() { \
-        static dispatch_once_t once; \
-        static id<MTLComputePipelineState> pso; \
-        dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, FN); }); \
-        return pso; \
+#define DEF_PSO(NAME, FN)                                                 \
+    id<MTLComputePipelineState> NAME() {                                  \
+        static dispatch_once_t once;                                      \
+        static id<MTLComputePipelineState> pso;                           \
+        dispatch_once(&once, ^{ pso = compile_pipeline(kMseSrc, FN); });  \
+        return pso;                                                       \
     }
 DEF_PSO(pso_mse_fw, @"k_mse_forward")
 DEF_PSO(pso_mse_bw, @"k_mse_backward")
-DEF_PSO(pso_xent, @"k_softmax_xent_fused")
 DEF_PSO(pso_mse_per_sample, @"k_mse_per_sample")
-DEF_PSO(pso_xent_batched, @"k_softmax_xent_fused_batched")
-DEF_PSO(pso_bce_batched,  @"k_bce_with_logits_fused_batched")
 #undef DEF_PSO
 
-} // namespace
+[[noreturn]] void fail(const char* op, const std::string& reason) {
+    throw std::runtime_error(std::string("brotensor: ") + op + ": " + reason);
+}
+
+void need_f32(const Tensor& t, const char* op, const char* what) {
+    if (t.dtype != Dtype::FP32) fail(op, std::string(what) + " must be FP32");
+}
+
+void ensure_f32_like(const Tensor& like, Tensor& t) {
+    if (t.rows != like.rows || t.cols != like.cols || t.dtype != Dtype::FP32) {
+        t.resize(like.rows, like.cols, Dtype::FP32);
+    }
+}
+
+void require_ptr(const void* p, const char* op, const char* name) {
+    if (!p) return;
+    NSUInteger ofs = 0;
+    pool_require(p, ofs, op, name);
+}
+
+void run_xent_mir(const char* op, const void* logits, const void* target,
+                  const float* mask, const int* off, int rows, int n, int heads,
+                  void* probs, void* dlog, void* loss, int mode = 0,
+                  float pos_weight = 1.0f) {
+    const std::uint8_t flags =
+        static_cast<std::uint8_t>((mask ? 1u : 0u) | (off ? 2u : 0u));
+    const MirKernel mk = mir_kernel(
+        {MirKind::Xent, static_cast<std::uint32_t>(mode), Dtype::FP32,
+         Dtype::FP32, 1, Dtype::FP32, flags});
+    mir_dispatch_xent(mk, static_cast<std::uint32_t>(std::min(rows, 65535)), op,
+                      logits, target, mask, off, probs, dlog, loss,
+                      static_cast<std::uint32_t>(rows),
+                      static_cast<std::uint32_t>(n),
+                      static_cast<std::uint32_t>(heads), pos_weight);
+}
+
+float run_xent_single(const char* op, const Tensor& logits, const Tensor& target,
+                      const float* mask, Tensor& probs, Tensor& dlog) {
+    need_f32(logits, op, "logits");
+    need_f32(target, op, "target");
+    if (target.size() != logits.size()) fail(op, "target shape mismatch");
+    ensure_f32_like(logits, probs);
+    ensure_f32_like(logits, dlog);
+    const long long n = logits.size();
+    if (n == 0) return 0.0f;
+    if (n > 0x7fffffffLL) fail(op, "too large");
+    require_ptr(mask, op, "mask");
+    Tensor loss = Tensor::empty_on(logits.device, 1, 1, Dtype::FP32);
+    run_xent_mir(op, logits.data, target.data, mask, nullptr, 1,
+                 static_cast<int>(n), 1, probs.data, dlog.data, loss.data);
+    float v = 0.0f;
+    loss.copy_to_host_raw(&v, sizeof v);
+    return v;
+}
+
+}  // namespace
 
 float mse_vec_forward(const Tensor& pred, const Tensor& target) {
     const int n = pred.size();
@@ -319,9 +158,9 @@ float mse_vec_forward(const Tensor& pred, const Tensor& target) {
         sptr[0] = 0.0f;
         id<MTLComputePipelineState> pso = pso_mse_fw();
         id<MTLBuffer> bp = buffer_for(pred);
-    NSUInteger op = buffer_offset_for(pred);
+        NSUInteger op = buffer_offset_for(pred);
         id<MTLBuffer> bt = buffer_for(target);
-    NSUInteger ot = buffer_offset_for(target);
+        NSUInteger ot = buffer_offset_for(target);
         id<MTLCommandBuffer> cmd = new_command_buffer();
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:pso];
@@ -333,26 +172,21 @@ float mse_vec_forward(const Tensor& pred, const Tensor& target) {
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(LOSS_BLOCK, 1, 1)];
         [enc endEncoding];
-        // `cmd` is the shared batched buffer — flush() commits + drains it.
         metal_impl::flush();
         return sptr[0] / static_cast<float>(n);
     }
 }
 
-void mse_vec_backward(const Tensor& pred, const Tensor& target,
-                      Tensor& dPred) {
+void mse_vec_backward(const Tensor& pred, const Tensor& target, Tensor& dPred) {
     const int n = pred.size();
-    if (dPred.rows != pred.rows || dPred.cols != pred.cols ||
-        dPred.dtype != Dtype::FP32) {
-        dPred.resize(pred.rows, pred.cols, Dtype::FP32);
-    }
+    ensure_f32_like(pred, dPred);
     if (n == 0) return;
     const float scale = 2.0f / static_cast<float>(n);
     const uint32_t nu = static_cast<uint32_t>(n);
     id<MTLComputePipelineState> pso = pso_mse_bw();
-    id<MTLBuffer> bp  = buffer_for(pred);
+    id<MTLBuffer> bp = buffer_for(pred);
     NSUInteger op = buffer_offset_for(pred);
-    id<MTLBuffer> bt  = buffer_for(target);
+    id<MTLBuffer> bt = buffer_for(target);
     NSUInteger ot = buffer_offset_for(target);
     id<MTLBuffer> bdp = buffer_for(dPred);
     NSUInteger odp = buffer_offset_for(dPred);
@@ -368,109 +202,12 @@ void mse_vec_backward(const Tensor& pred, const Tensor& target,
         NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
         if (tg > 256) tg = 256;
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        // `cmd` is the shared batched buffer — flush() commits + drains it.
-        metal_impl::flush();
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
-namespace {
-
-// One-threadgroup stable softmax + cross-entropy over a flat segment of n
-// FP32 values (k_softmax_xent_fused): probs = softmax(logits) over the
-// unmasked entries, dLogits = probs - target, returns
-// -sum(target * log(max(probs, 1e-12))). Masked entries (mask < 0.5) get
-// probs = dLogits = 0. Blocks until the loss is on the host.
-float run_xent(id<MTLBuffer> bL, NSUInteger oL, id<MTLBuffer> bT, NSUInteger oT,
-               id<MTLBuffer> bM, NSUInteger oM, id<MTLBuffer> bP, NSUInteger oP,
-               id<MTLBuffer> bdL, NSUInteger odL, int n) {
-    if (n <= 0) return 0.0f;
-    @autoreleasepool {
-        id<MTLBuffer> scratch = [metal_impl::device()
-            newBufferWithLength:sizeof(float)
-                        options:MTLResourceStorageModeShared];
-        float* sptr = static_cast<float*>([scratch contents]);
-        sptr[0] = 0.0f;
-        const uint32_t nu = static_cast<uint32_t>(n);
-        const uint32_t has_mask = bM ? 1u : 0u;
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso_xent()];
-        [enc setBuffer:bL offset:oL atIndex:0];
-        [enc setBuffer:bT offset:oT atIndex:1];
-        [enc setBuffer:(bM ? bM : bL) offset:(bM ? oM : oL) atIndex:2];
-        [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:3];
-        [enc setBuffer:bP offset:oP atIndex:4];
-        [enc setBuffer:bdL offset:odL atIndex:5];
-        [enc setBuffer:scratch offset:0 atIndex:6];
-        [enc setBytes:&nu length:sizeof(uint32_t) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(LOSS_BLOCK, 1, 1)];
-        [enc endEncoding];
-        // `cmd` is the shared batched buffer — flush() commits + drains it.
-        metal_impl::flush();
-        return sptr[0];
-    }
-}
-
-[[noreturn]] void fail(const char* op, const char* reason) {
-    throw std::runtime_error(std::string("brotensor: ") + op + ": " + reason);
-}
-
-// The (buffer, offset) a device pointer into the Metal pool lives at.
-id<MTLBuffer> pooled(const float* p, NSUInteger& ofs, const char* op, const char* name) {
-    return pool_require(p, ofs, op, name);
-}
-
-void ensure_f32_like(const Tensor& like, Tensor& t) {
-    if (t.rows != like.rows || t.cols != like.cols || t.dtype != Dtype::FP32) {
-        t.resize(like.rows, like.cols, Dtype::FP32);
-    }
-}
-
-} // namespace
-
-float softmax_xent_fused(const Tensor& logits, const Tensor& target,
-                         const float* d_mask,
-                         Tensor& probs, Tensor& dLogits) {
-    ensure_f32_like(logits, probs);
-    ensure_f32_like(logits, dLogits);
-    NSUInteger oM = 0;
-    id<MTLBuffer> bM = d_mask ? pooled(d_mask, oM, "softmax_xent_fused", "mask") : nil;
-    return run_xent(buffer_for(logits), buffer_offset_for(logits), buffer_for(target), buffer_offset_for(target),
-                    bM, oM, buffer_for(probs), buffer_offset_for(probs), buffer_for(dLogits),
-                    buffer_offset_for(dLogits), logits.size());
-}
-
-// The older Tensor-shaped softmax_xent: the same fused forward + gradient as
-// softmax_xent_fused (dLogits is the backward), FP32 by design like CUDA's.
-float softmax_xent(const Tensor& logits, const Tensor& target, Tensor& probs, Tensor& dLogits,
-                   const float* mask) {
-    constexpr const char* op = "softmax_xent";
-    if (logits.dtype != Dtype::FP32) fail(op, "logits must be FP32 (loss ops are FP32-by-design)");
-    if (target.dtype != Dtype::FP32) fail(op, "target must be FP32 (loss ops are FP32-by-design)");
-    if (target.size() != logits.size()) fail(op, "target size mismatch");
-    return softmax_xent_fused(logits, target, mask, probs, dLogits);
-}
-
-// Raw-pointer form: every pointer is a Metal device pointer (the dispatcher
-// only lands here for Device::Metal operands); mask may be null.
-float softmax_xent_segment(const float* logits, const float* target, float* probs, float* dLogits, int n,
-                           const float* mask) {
-    constexpr const char* op = "softmax_xent_segment";
-    if (n <= 0) return 0.0f;
-    NSUInteger oL = 0, oT = 0, oP = 0, odL = 0, oM = 0;
-    id<MTLBuffer> bL = pooled(logits, oL, op, "logits");
-    id<MTLBuffer> bT = pooled(target, oT, op, "target");
-    id<MTLBuffer> bP = pooled(probs, oP, op, "probs");
-    id<MTLBuffer> bdL = pooled(dLogits, odL, op, "dLogits");
-    id<MTLBuffer> bM = mask ? pooled(mask, oM, op, "mask") : nil;
-    return run_xent(bL, oL, bT, oT, bM, oM, bP, oP, bdL, odL, n);
-}
-
-// Pure host scalar math, as on the CPU and CUDA; registered so dispatch on
-// Device::Metal does not throw.
 float mse_scalar(float pred, float target, float& dPred) {
     const float d = pred - target;
     dPred = d;
@@ -480,12 +217,11 @@ float mse_scalar(float pred, float target, float& dPred) {
 void mse_vec_per_sample(const Tensor& pred, const Tensor& target,
                         Tensor& dPred, Tensor& loss_per_sample) {
     const int B = pred.size();
-    if (dPred.rows != pred.rows || dPred.cols != pred.cols ||
-        dPred.dtype != Dtype::FP32)
-        dPred.resize(pred.rows, pred.cols, Dtype::FP32);
+    ensure_f32_like(pred, dPred);
     if (loss_per_sample.rows != B || loss_per_sample.cols != 1 ||
-        loss_per_sample.dtype != Dtype::FP32)
+        loss_per_sample.dtype != Dtype::FP32) {
         loss_per_sample.resize(B, 1, Dtype::FP32);
+    }
     if (B == 0) return;
     id<MTLComputePipelineState> pso = pso_mse_per_sample();
     id<MTLBuffer> bp = buffer_for(pred);
@@ -509,139 +245,84 @@ void mse_vec_per_sample(const Tensor& pred, const Tensor& target,
         NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
         if (tg > 256) tg = 256;
         [enc dispatchThreads:MTLSizeMake(B, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
-        // `cmd` is the shared batched buffer — flush() commits + drains it.
-        metal_impl::flush();
+        ::brotensor::metal_impl::submit(cmd);
     }
 }
 
-void softmax_xent_fused_batched(const Tensor& logits_BL,
-                                const Tensor& target_BL,
+float softmax_xent_fused(const Tensor& logits, const Tensor& target,
+                         const float* d_mask, Tensor& probs, Tensor& dLogits) {
+    return run_xent_single("softmax_xent_fused", logits, target, d_mask, probs, dLogits);
+}
+
+float softmax_xent(const Tensor& logits, const Tensor& target, Tensor& probs,
+                   Tensor& dLogits, const float* mask) {
+    return run_xent_single("softmax_xent", logits, target, mask, probs, dLogits);
+}
+
+float softmax_xent_segment(const float* logits, const float* target,
+                           float* probs, float* dLogits, int n,
+                           const float* mask) {
+    constexpr const char* op = "softmax_xent_segment";
+    if (n <= 0) return 0.0f;
+    require_ptr(logits, op, "logits");
+    require_ptr(target, op, "target");
+    require_ptr(probs, op, "probs");
+    require_ptr(dLogits, op, "dLogits");
+    require_ptr(mask, op, "mask");
+    Tensor loss = Tensor::empty_on(Device::Metal, 1, 1, Dtype::FP32);
+    run_xent_mir(op, logits, target, mask, nullptr, 1, n, 1, probs, dLogits, loss.data);
+    float v = 0.0f;
+    loss.copy_to_host_raw(&v, sizeof v);
+    return v;
+}
+
+void softmax_xent_fused_batched(const Tensor& logits_BL, const Tensor& target_BL,
                                 const float* d_mask_BL,
-                                const int* d_head_offsets,
-                                int n_heads,
-                                Tensor& probs_BL,
-                                Tensor& dLogits_BL,
+                                const int* d_head_offsets, int n_heads,
+                                Tensor& probs_BL, Tensor& dLogits_BL,
                                 Tensor& loss_per_sample) {
-    const int B     = logits_BL.rows;
-    const int n_act = logits_BL.cols;
-    if (probs_BL.rows != B || probs_BL.cols != n_act ||
-        probs_BL.dtype != Dtype::FP32)
-        probs_BL.resize(B, n_act, Dtype::FP32);
-    if (dLogits_BL.rows != B || dLogits_BL.cols != n_act ||
-        dLogits_BL.dtype != Dtype::FP32)
-        dLogits_BL.resize(B, n_act, Dtype::FP32);
-    if (loss_per_sample.rows != B || loss_per_sample.cols != 1 ||
-        loss_per_sample.dtype != Dtype::FP32)
-        loss_per_sample.resize(B, 1, Dtype::FP32);
-    if (B == 0 || n_act == 0 || n_heads <= 0) return;
-
-    // Zero loss accumulator (unified memory).
-    for (int b = 0; b < B; ++b)
-        static_cast<float*>(loss_per_sample.data)[b] = 0.0f;
-
-    id<MTLComputePipelineState> pso = pso_xent_batched();
-    id<MTLBuffer> bL = buffer_for(logits_BL);
-    NSUInteger oL = buffer_offset_for(logits_BL);
-    id<MTLBuffer> bT = buffer_for(target_BL);
-    NSUInteger oT = buffer_offset_for(target_BL);
-    NSUInteger oM = 0;
-    id<MTLBuffer> bM = pool_require(d_mask_BL, oM, "softmax_xent_fused_batched", "mask");
-    id<MTLBuffer> bM_arg = bM ? bM : bL;
-    NSUInteger oM_arg = bM ? oM : oL;
-    NSUInteger oH = 0;
-    id<MTLBuffer> bH = pool_require(d_head_offsets, oH, "softmax_xent_fused_batched",
-                                    "head_offsets");
-    id<MTLBuffer> bP = buffer_for(probs_BL);
-    NSUInteger oP = buffer_offset_for(probs_BL);
-    id<MTLBuffer> bdL = buffer_for(dLogits_BL);
-    NSUInteger odL = buffer_offset_for(dLogits_BL);
-    id<MTLBuffer> bLoss = buffer_for(loss_per_sample);
-    NSUInteger oLoss = buffer_offset_for(loss_per_sample);
-    const uint32_t Bu = static_cast<uint32_t>(B);
-    const uint32_t Nu = static_cast<uint32_t>(n_act);
-    const uint32_t has_mask = d_mask_BL ? 1u : 0u;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bL offset:oL atIndex:0];
-        [enc setBuffer:bT offset:oT atIndex:1];
-        [enc setBuffer:bM_arg offset:oM_arg atIndex:2];
-        [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:3];
-        [enc setBuffer:bH offset:oH atIndex:4];
-        [enc setBuffer:bP offset:oP atIndex:5];
-        [enc setBuffer:bdL offset:odL atIndex:6];
-        [enc setBuffer:bLoss offset:oLoss atIndex:7];
-        [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:8];
-        [enc setBytes:&Nu length:sizeof(uint32_t) atIndex:9];
-        [enc dispatchThreadgroups:MTLSizeMake(n_heads, B, 1)
-            threadsPerThreadgroup:MTLSizeMake(LOSS_BLOCK, 1, 1)];
-        [enc endEncoding];
-        // `cmd` is the shared batched buffer — flush() commits + drains it.
-        metal_impl::flush();
+    constexpr const char* op = "softmax_xent_fused_batched";
+    need_f32(logits_BL, op, "logits");
+    need_f32(target_BL, op, "target");
+    if (target_BL.size() != logits_BL.size()) fail(op, "target shape mismatch");
+    ensure_f32_like(logits_BL, probs_BL);
+    ensure_f32_like(logits_BL, dLogits_BL);
+    if (loss_per_sample.rows != logits_BL.rows || loss_per_sample.cols != 1 ||
+        loss_per_sample.dtype != Dtype::FP32) {
+        loss_per_sample.resize(logits_BL.rows, 1, Dtype::FP32);
     }
+    if (logits_BL.rows == 0 || logits_BL.cols == 0 || n_heads <= 0) return;
+    if (!d_head_offsets) fail(op, "d_head_offsets is null");
+    require_ptr(d_mask_BL, op, "mask");
+    require_ptr(d_head_offsets, op, "head_offsets");
+    run_xent_mir(op, logits_BL.data, target_BL.data, d_mask_BL, d_head_offsets,
+                 logits_BL.rows, logits_BL.cols, n_heads,
+                 probs_BL.data, dLogits_BL.data, loss_per_sample.data);
 }
 
 void bce_with_logits_fused_batched(const Tensor& logits_BL,
                                    const Tensor& target_BL,
-                                   const float* d_mask_BL,
-                                   float pos_weight,
-                                   Tensor& probs_BL,
-                                   Tensor& dLogits_BL,
+                                   const float* d_mask_BL, float pos_weight,
+                                   Tensor& probs_BL, Tensor& dLogits_BL,
                                    Tensor& loss_per_sample) {
-    const int B = logits_BL.rows;
-    const int L = logits_BL.cols;
-    if (probs_BL.rows != B || probs_BL.cols != L ||
-        probs_BL.dtype != Dtype::FP32)
-        probs_BL.resize(B, L, Dtype::FP32);
-    if (dLogits_BL.rows != B || dLogits_BL.cols != L ||
-        dLogits_BL.dtype != Dtype::FP32)
-        dLogits_BL.resize(B, L, Dtype::FP32);
-    if (loss_per_sample.rows != B || loss_per_sample.cols != 1 ||
-        loss_per_sample.dtype != Dtype::FP32)
-        loss_per_sample.resize(B, 1, Dtype::FP32);
-    if (B == 0 || L == 0) return;
-
-    id<MTLComputePipelineState> pso = pso_bce_batched();
-    id<MTLBuffer> bL = buffer_for(logits_BL);
-    NSUInteger oL = buffer_offset_for(logits_BL);
-    id<MTLBuffer> bT = buffer_for(target_BL);
-    NSUInteger oT = buffer_offset_for(target_BL);
-    NSUInteger oM = 0;
-    id<MTLBuffer> bM = pool_require(d_mask_BL, oM, "bce_with_logits_fused_batched", "mask");
-    id<MTLBuffer> bM_arg = bM ? bM : bL;
-    NSUInteger oM_arg = bM ? oM : oL;
-    id<MTLBuffer> bP = buffer_for(probs_BL);
-    NSUInteger oP = buffer_offset_for(probs_BL);
-    id<MTLBuffer> bdL = buffer_for(dLogits_BL);
-    NSUInteger odL = buffer_offset_for(dLogits_BL);
-    id<MTLBuffer> bLoss = buffer_for(loss_per_sample);
-    NSUInteger oLoss = buffer_offset_for(loss_per_sample);
-    const uint32_t Bu = static_cast<uint32_t>(B);
-    const uint32_t Lu = static_cast<uint32_t>(L);
-    const uint32_t has_mask = d_mask_BL ? 1u : 0u;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bL offset:oL atIndex:0];
-        [enc setBuffer:bT offset:oT atIndex:1];
-        [enc setBuffer:bM_arg offset:oM_arg atIndex:2];
-        [enc setBytes:&has_mask length:sizeof(uint32_t) atIndex:3];
-        [enc setBytes:&pos_weight length:sizeof(float) atIndex:4];
-        [enc setBuffer:bP offset:oP atIndex:5];
-        [enc setBuffer:bdL offset:odL atIndex:6];
-        [enc setBuffer:bLoss offset:oLoss atIndex:7];
-        [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:8];
-        [enc setBytes:&Lu length:sizeof(uint32_t) atIndex:9];
-        [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(LOSS_BLOCK, 1, 1)];
-        [enc endEncoding];
-        // `cmd` is the shared batched buffer — flush() commits + drains it.
-        metal_impl::flush();
+    constexpr const char* op = "bce_with_logits_fused_batched";
+    need_f32(logits_BL, op, "logits");
+    need_f32(target_BL, op, "target");
+    if (target_BL.size() != logits_BL.size()) fail(op, "target shape mismatch");
+    ensure_f32_like(logits_BL, probs_BL);
+    ensure_f32_like(logits_BL, dLogits_BL);
+    if (loss_per_sample.rows != logits_BL.rows || loss_per_sample.cols != 1 ||
+        loss_per_sample.dtype != Dtype::FP32) {
+        loss_per_sample.resize(logits_BL.rows, 1, Dtype::FP32);
     }
+    if (logits_BL.rows == 0 || logits_BL.cols == 0) return;
+    require_ptr(d_mask_BL, op, "mask");
+    run_xent_mir(op, logits_BL.data, target_BL.data, d_mask_BL, nullptr,
+                 logits_BL.rows, logits_BL.cols, 1,
+                 probs_BL.data, dLogits_BL.data, loss_per_sample.data,
+                 /*mode=*/1, pos_weight);
 }
 
-} // namespace brotensor::detail::metal
+}  // namespace brotensor::detail::metal

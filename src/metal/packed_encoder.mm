@@ -5,8 +5,7 @@
 //   flash_attention_packed_qkv_forward  — bidirectional (optionally windowed)
 //       attention off a fused (L, 3*H*hd) QKV with per-row sequence bounds.
 //   flash_attention_packed_qkv_backward — its adjoint, recompute-based.
-//   rope_qkv_packed_inplace             — RoPE on the Q/K sections, per-row pos.
-//   segment_softmax_stats               — [top1, top1-top2, norm. entropy, k/255].
+// (rope_qkv_packed_inplace lives in rope.mm; segment_softmax_stats in top_k.mm.)
 //
 // FP16 / BF16 / FP32 storage, FP32 math throughout; each output rounds once.
 //
@@ -229,58 +228,6 @@ kernel void k_packed_bwd_grads(device const T*     qkv    [[buffer(0)]],
     }
 }
 
-// One simdgroup per segment.
-template <typename T>
-kernel void k_segment_softmax_stats(device const T*   logits [[buffer(0)]],
-                                    device const int* off    [[buffer(1)]],
-                                    device T*         out    [[buffer(2)]],
-                                    constant uint& S         [[buffer(3)]],
-                                    uint tg   [[threadgroup_position_in_grid]],
-                                    uint sg   [[simdgroup_index_in_threadgroup]],
-                                    uint sgs  [[simdgroups_per_threadgroup]],
-                                    uint lane [[thread_index_in_simdgroup]]) {
-    const uint s = tg * sgs + sg;
-    if (s >= S) return;
-    const int a = off[s], b = off[s + 1];
-    device T* row = out + ulong(s) * 4;
-    if (b <= a) {
-        if (lane < 4) row[lane] = T(0.0f);
-        return;
-    }
-    float mx = kNeg;
-    for (int i = a + int(lane); i < b; i += 32) mx = max(mx, float(logits[i]));
-    mx = simd_max(mx);
-    float sum = 0.0f;
-    for (int i = a + int(lane); i < b; i += 32) sum += exp(float(logits[i]) - mx);
-    sum = simd_sum(sum);
-    float ent = 0.0f, t1 = 0.0f, t2 = 0.0f;
-    for (int i = a + int(lane); i < b; i += 32) {
-        const float pv = exp(float(logits[i]) - mx) / sum;
-        ent -= pv * log(max(pv, 1e-9f));
-        if (pv > t1) {
-            t2 = t1;
-            t1 = pv;
-        } else if (pv > t2) {
-            t2 = pv;
-        }
-    }
-    ent = simd_sum(ent);
-    for (ushort o = 16; o > 0; o >>= 1) {   // merge (top1, top2) pairs
-        const float o1 = simd_shuffle_xor(t1, o), o2 = simd_shuffle_xor(t2, o);
-        const float hi = max(t1, o1);
-        const float lo = max(min(t1, o1), max(t2, o2));
-        t1 = hi;
-        t2 = lo;
-    }
-    if (lane == 0) {
-        const float k = max(2.0f, float(b - a));
-        row[0] = T(t1);
-        row[1] = T(t1 - t2);
-        row[2] = T(ent / log(k));
-        row[3] = T(k / 255.0f);
-    }
-}
-
 #define PACKED_INST(T, SUF)                                                                              \
 template [[host_name("k_packed_fwd_" SUF)]] kernel void k_packed_fwd<T>(                                 \
     device const T*, device const int*, device T*, constant PackedParams&, uint, uint);                  \
@@ -288,9 +235,7 @@ template [[host_name("k_packed_bwd_stats_" SUF)]] kernel void k_packed_bwd_stats
     device const T*, device const int*, device const T*, device float*, constant PackedParams&, uint, uint); \
 template [[host_name("k_packed_bwd_grads_" SUF)]] kernel void k_packed_bwd_grads<T>(                     \
     device const T*, device const int*, device const T*, device const float*, device T*,                 \
-    constant PackedParams&, uint, uint);                                                                 \
-template [[host_name("k_segment_softmax_stats_" SUF)]] kernel void k_segment_softmax_stats<T>(           \
-    device const T*, device const int*, device T*, constant uint&, uint, uint, uint, uint);
+    constant PackedParams&, uint, uint);
 PACKED_INST(half, "f16")
 PACKED_INST(bfloat, "bf16")
 PACKED_INST(float, "f32")
@@ -420,30 +365,6 @@ void flash_attention_packed_qkv_backward(const Tensor& QKV, const Tensor& dO, co
         bind(enc, dQKV, 4);
         [enc setBytes:&s.params length:sizeof(PackedParams) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
-}
-
-void segment_softmax_stats(const Tensor& logits, const Tensor& seg_offsets, Tensor& out) {
-    constexpr const char* op = "segment_softmax_stats";
-    if (seg_offsets.dtype != Dtype::INT32 || seg_offsets.rows < 1) fail(op, "seg_offsets must be (S+1, 1) INT32");
-    const uint32_t S = static_cast<uint32_t>(seg_offsets.rows - 1);
-    const Dtype dt = logits.dtype;
-    id<MTLComputePipelineState> p = pso("k_segment_softmax_stats", dt, op);
-    if (out.rows != static_cast<int>(S) || out.cols != 4 || out.dtype != dt) out.resize(static_cast<int>(S), 4, dt);
-    if (S == 0) return;
-    constexpr NSUInteger kWarps = 4;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:p];
-        bind(enc, logits, 0);
-        bind(enc, seg_offsets, 1);
-        bind(enc, out, 2);
-        [enc setBytes:&S length:sizeof(uint32_t) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake((S + kWarps - 1) / kWarps, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(32 * kWarps, 1, 1)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
     }

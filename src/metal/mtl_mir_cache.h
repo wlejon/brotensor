@@ -33,6 +33,10 @@ enum class MirKind : std::uint8_t {
     Remap = 20,
     Resample = 21,
     ResampleBwd = 22,
+    Lstm = 23,
+    DeltaRule = 24,
+    Xent = 25,
+    Topk = 26,
 };
 
 struct MirKey {
@@ -178,5 +182,26 @@ void mir_dispatch_resample_bwd(const MirKernel& mk, std::uint32_t gx, const char
                                std::uint32_t planes, std::uint32_t hi, std::uint32_t wi,
                                std::uint32_t ho, std::uint32_t wo,
                                std::int32_t pt, std::int32_t pl);
+void mir_dispatch_lstm(const MirKernel& mk, std::uint32_t gx, const char* op,
+                       const void* gates, const void* c, const void* y,
+                       const void* bhh, const void* c0, const void* dy,
+                       const void* dz, const void* dh, const void* dc,
+                       std::uint32_t b, std::uint32_t h, std::uint32_t row0);
+void mir_dispatch_delta(const MirKernel& mk, std::uint32_t gx, const char* op,
+                        const void* q, const void* k, const void* v,
+                        const void* a, const void* b, const void* loga,
+                        const void* s, const void* o,
+                        std::uint32_t L, std::uint32_t H, std::uint32_t dk,
+                        std::uint32_t dv, std::uint32_t ldq, std::uint32_t ldv);
+void mir_dispatch_xent(const MirKernel& mk, std::uint32_t gx, const char* op,
+                       const void* logits, const void* target, const void* mask,
+                       const void* off, const void* probs, const void* dlog,
+                       const void* loss, std::uint32_t rows, std::uint32_t n,
+                       std::uint32_t heads, float pos_weight);
+void mir_dispatch_topk(const MirKernel& mk, std::uint32_t gx, std::uint32_t gy,
+                       const char* op, const void* x, const void* vals,
+                       const void* idx, const void* off,
+                       std::uint32_t rows, std::uint32_t cols,
+                       std::uint32_t k, std::uint32_t nseg);
 
 }  // namespace brotensor::detail::metal
