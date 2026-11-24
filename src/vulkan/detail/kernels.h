@@ -1,12 +1,7 @@
 #pragma once
 
 // What an op file needs to launch a kernel: the tensor's device context, its
-// address, the dtype -> shader-variant mapping and a typed dispatch.
-//
-//   DeviceCtx& d = device_of(x);
-//   const Kernel& k = d.pipelines().get(dt_variant(ShaderId::unary_f32, x.dtype), {UOP_RELU});
-//   UnaryPush pc{addr(x.data), addr(y.data), n, 0.f, 0.f};
-//   launch(d, k, pc, groups_1d(n, k));
+// address and a typed dispatch.
 //
 // Push blocks are plain structs mirroring the shader's push_constant block
 // under std430 (uint64_t fields first, 8-byte aligned; sizeof rounds to 8).
@@ -34,19 +29,6 @@ inline int dt_code(::brotensor::Dtype dt, const char* op) {
             throw std::runtime_error(std::string("brotensor: ") + op +
                                      ": unsupported dtype on Vulkan (FP32 / FP16 / BF16)");
     }
-}
-
-// Shader families selected by dtype: <base>_f32, <base>_f16, <base>_bf16,
-// consecutive in shaders.cmake. A new family is added here too; register.cpp
-// checks the order of every one at start-up.
-inline constexpr ShaderId kDtypeFamilies[] = {
-    ShaderId::fa_bwd_f32,
-};
-
-// The <base>_f16 / <base>_bf16 sibling of a <base>_f32 family shader.
-inline ShaderId dt_variant(ShaderId f32_id, ::brotensor::Dtype dt, const char* op = "op") {
-    return static_cast<ShaderId>(static_cast<std::uint32_t>(f32_id) +
-                                 static_cast<std::uint32_t>(dt_code(dt, op)));
 }
 
 // Workgroups for a grid-stride kernel over n items, one item per invocation

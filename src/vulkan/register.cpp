@@ -12,7 +12,6 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -49,31 +48,6 @@ void fill_vulkan_vtable_delta(::brotensor::detail::OpsVTable& v);
 void fill_vulkan_vtable_vision(::brotensor::detail::OpsVTable& v);
 void register_vulkan_graph_backend();
 
-namespace {
-
-bool ends_with(const char* s, const char* suffix) {
-    const std::size_t a = std::strlen(s), b = std::strlen(suffix);
-    return a >= b && std::strcmp(s + a - b, suffix) == 0;
-}
-
-// dt_variant() offsets from a <base>_f32 id; every family in kDtypeFamilies
-// must be listed in shaders.cmake as _f32, _f16, _bf16 in that order.
-void check_shader_families() {
-    for (ShaderId f32 : kDtypeFamilies) {
-        const auto i = static_cast<std::uint32_t>(f32);
-        const char* name = shader_blob(f32).name;
-        const bool ok = ends_with(name, "_f32") && i + 2 < static_cast<std::uint32_t>(ShaderId::kCount);
-        const std::string base = ok ? std::string(name, std::strlen(name) - 4) : std::string(name);
-        if (!ok || shader_blob(static_cast<ShaderId>(i + 1)).name != base + "_f16" ||
-            shader_blob(static_cast<ShaderId>(i + 2)).name != base + "_bf16") {
-            throw std::logic_error("brotensor: vulkan: shader family " + base +
-                                   " is not listed as _f32, _f16, _bf16 in shaders.cmake");
-        }
-    }
-}
-
-}  // namespace
-
 }  // namespace brotensor::detail::vulkan
 
 namespace {
@@ -92,7 +66,6 @@ void probe_and_register() {
         }
         return;
     }
-    dv::check_shader_families();
     ::brotensor::detail::set_vulkan_device_count(inst.count());
 
     ::brotensor::detail::OpsVTable ops{};   // every slot starts null

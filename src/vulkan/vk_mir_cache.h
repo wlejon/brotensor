@@ -61,6 +61,7 @@ enum class MirKind : std::uint8_t {
     ConvSimt = 45,
     GemvQ = 46,
     FaRows = 47,
+    FaBwd = 48,
 };
 
 struct MirKey {

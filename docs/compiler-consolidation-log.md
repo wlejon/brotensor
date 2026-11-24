@@ -704,3 +704,27 @@ Extended `src/cuda/cu_mir_cache.{h,cpp}` (`186` / `667` LOC) with `MirKind::{Att
   - Deleted 7 files (`-3,849` lines): `mha.cu` (`-854`), `cross_attention.cu` (`-803`), `attention.cu` (`-550`), `self_attention_rel_pos.cu` (`-548`), `self_attention_bias.cu` (`-541`), `cross_attention_with_attn.cu` (`-301`), `self_attention_internal.cuh` (`-252`).
   - Added / extended / trimmed files (all `<= 667` LOC): `ops_conv_direct.cpp` (`42`), `ops_attention_proj.cpp` (`479`), `ops_attention_bwd.cpp` (`281`), `ops_attention_relpos.cpp` (`262`), `conv2d.cu` (`612`), `conv3d.cu` (`207`), `conv_transpose2d.cu` (`391`), `cu_mir_cache.{h,cpp}` (`186` / `667`, `+5` / `+18`).
   - Net `src/cuda/` Wave 8 delta: **`-3,113` lines** (`+1,140` / `-4,253`; **cumulative CUDA Waves 3–8: `-12,206` net lines and 52 `.cu` files + `detail/block_fft.cuh` + `self_attention_internal.cuh` deleted**, all modified/created `src/cuda/` files `<= 667` LOC).
+
+---
+
+## Wave 12: Vulkan FlashAttention FMA Backward (`fa_bwd`) -> Single-Source Brass MIR (Final Vulkan Non-CoopMat Wave)
+
+Replaced the final remaining general-purpose compute shader (`fa_bwd.comp` `334`L × 3 variants: `fa_bwd_f32`, `fa_bwd_f16`, `fa_bwd_bf16`; `17 -> 14` compiled Vulkan shaders, retiring `kDtypeFamilies[]`, `dt_variant()`, and `check_shader_families()` across `detail/kernels.h` and `register.cpp`) with a backend-neutral `brass::Function` MIR module:
+- `src/kernels/mir_fa_bwd.{h,cpp}` (`21 + 609` LOC): `build_fa_bwd_mir` (`nt in {128, 32, 8}`, `br in {32, 16, 8}`, `bc in {32, 16, 4}`, `hdp = align32(hd) <= 256`) supporting `FP32` (`shared_alloc_f32` staging) and `FP16`/`BF16` (`shared_alloc_u16` staging decoded via `f16_to_f32` / `bf16_to_f32` on read), `FA_MODE_{ROWS, VARLEN, PACKED}`, optional key masks, uniform shared-tree control reduction (`s_ctrl` instead of `atomicMin`/`atomicMax` or subgroup shuffles), PASS 0 (`stats` `(lse, D)` + `dQ` in two `K`-sweeps with `ex2_approx`), and PASS 1 (`dK` + `dV` with `s_any` workgroup-uniform empty-tile skipping).
+- Extended `src/vulkan/vk_mir_cache.{h,cpp}` (`200 / 742` LOC) with `MirKind::FaBwd` (`block_for` returns `k.lanes = nt`), wired `src/vulkan/ops_fa_bwd.cpp` (`447` LOC, updated `fa_bwd_shared_bytes` slack), retired `kDtypeFamilies[]` / `dt_variant()` / `check_shader_families()` in `src/vulkan/detail/kernels.h` & `src/vulkan/register.cpp` (`194` LOC), updated `CMakeLists.txt`, `shaders/shaders.cmake`, `src/backward_index_verify.cpp` (`981` LOC), and `src/backward_shader_audit.cpp` (`772` LOC).
+- Also resolved two pre-Wave-12 parity/dispatch bugs surfaced by full-suite `ctest`:
+  - `src/vulkan/gemm.cpp` (`369` LOC): passed raw `Dtype` enum `(uint32_t)dt_bias` instead of `dt_code(dt_bias)` in `MirKind::GemmSimt` key, and kept caller `g.dc` for `dt_bias` when `glu` redirects `dc` to `Dtype::FP32` scratch (fixing `BF16` SIMT exception and `FP16`/`BF16` `linear_ex` `geglu`/`swiglu` SIMT parity).
+  - `src/kernels/mir_elementwise.cpp` (`366` LOC): pinned both `a * y` and `b * x` products in `BOP_AXPBY` before addition so `axpby_inplace` matches host FP32 rounding bit-for-bit (`max_abs = 0` on `axpby_fp16_cpu_vs_gpu`).
+
+### Wave 12 & Full-Suite Verification & LOC Delta (Radeon 8060S)
+- **Standalone & Targeted Suites (`0` failures after final edit):**
+  - `brotensor_test_vulkan`: **`OK: 0 failure(s)`**
+  - `brotensor_test_cpu_gpu_parity`: **`All parity checks passed`** (`axpby_fp16_cpu_vs_gpu max_abs = 0`, `axpby_fp32_gpu_vs_host max_abs = 0`)
+- **Full `ctest` (`ctest --test-dir build_vk --output-on-failure -LE gcstress -j 1`):**
+  - **`202 / 202` PASSED** (`1815.85 s`, `0` failures), including `brotensor_test_backward_index_proofs`, `brotensor_test_backward_shader_audit`, `brotensor_test_vulkan`, `brotensor_test_cpu_gpu_parity`, and all attention/training/quant/GEMM/conv parity suites.
+  - *(Note: prior to the two 1–4 line fixes in `gemm.cpp`/`mir_elementwise.cpp`, direct `brotensor_test_backward_index_proofs` printed `ALL PASSED` including 6 `mir_fa_bwd` `.spv` binaries [`20,362` insts, `102` writes, `1,183` cmp, `0` hazards] and `brotensor_test_backward_shader_audit` printed `160 / 160 ALL PASSED` [`110,962` insts, `208` workgroup arrays, `7,918` shared / `2,684` global accesses proven, `678` uniform barriers, `1,071` uniform collectives]; both suites re-ran and passed under `ctest` #8–#11 after the final edits.)*
+- **LOC Delta (Vulkan Wave 12 & Cumulative Waves 1–12):**
+  - `src/vulkan/shaders/*`: `3,026 -> 2,692` (**`-334` lines**; cumulative **`-5,543` lines** / 44 `.comp` files / 126 compiled variants deleted across Waves 1–12, **`140 -> 14` compiled Vulkan shaders (`-90.0%`)**).
+  - Remaining `src/vulkan/shaders/*.comp` (6 files, intentionally specialized CoopMat/FP64/test kernels): `gemm_cm.comp` (6 variants), `fa_cm.comp` (2 variants), `conv_cm.comp` (2 variants), `fa_bwd_cm.comp` (2 variants), `dft64.comp` (1 FP64 variant), `test_shared_overflow.comp` (1 negative test shader).
+  - Shared backend-neutral `src/kernels/*`: `9,419` lines across 59 files (max file `609` lines, every file `< 1,000` LOC).
+

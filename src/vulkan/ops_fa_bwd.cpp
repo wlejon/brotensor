@@ -19,6 +19,7 @@
 
 #include "detail/attention.h"
 #include "detail/kernels.h"
+#include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -86,8 +87,9 @@ struct Cfg { std::uint32_t nt, br, bc; };
 std::uint32_t fa_bwd_shared_bytes(Dtype dt, int hdp, Cfg c) {
     const std::uint32_t st4 = dt == Dtype::FP32 ? 16u : 8u;
     const std::uint32_t hs4 = static_cast<std::uint32_t>(hdp / 4 + 1);
-    // Qs/Gs (BR*HS4), Ks/Vs (BC*HS4), Ps/Ds (2*BR*BC*4), kval (BC*4), scalars + alignment slack.
-    return 2u * (c.br + c.bc) * hs4 * st4 + 8u * c.br * c.bc + 4u * c.bc + 64u;
+    // Qs/Gs (BR*HS4), Ks/Vs (BC*HS4), Ps/Ds (2*BR*BC*4), kval (BC*4), s_ctrl + per-row scratch.
+    return 2u * (c.br + c.bc) * hs4 * st4 + 8u * c.br * c.bc + 4u * c.bc +
+           4u * (c.nt * 2u + c.br * 4u) + 64u;
 }
 
 // Tiles that keep Q, dO (br rows), K, V (bc rows), P and dS under the device's
@@ -207,24 +209,46 @@ void core(DeviceCtx& d, const BwdProblem& p) {
     t_last_path = "fma";
     const int hdp = (p.hd + 31) / 32 * 32;
     const Cfg c = pick(p.dt, hdp, d.info().props.limits.maxComputeSharedMemorySize);
-    const ShaderId id = dt_variant(ShaderId::fa_bwd_f32, p.dt, p.op);
-    auto kernel = [&](std::uint32_t pass) -> const Kernel& {
-        return d.pipelines().get(id, {c.nt, static_cast<std::uint32_t>(p.hd), static_cast<std::uint32_t>(hdp), c.br,
-                                      c.bc, static_cast<std::uint32_t>(p.mode), p.mask ? 1u : 0u, pass});
+    const std::uint32_t op = (static_cast<std::uint32_t>(p.hd) & 0xffffu) |
+                             ((static_cast<std::uint32_t>(hdp) & 0xffffu) << 16);
+    const std::uint64_t aux_geom = static_cast<std::uint64_t>(c.br & 0xffffu) |
+                                   (static_cast<std::uint64_t>(c.bc & 0xffffu) << 16);
+    auto kernel = [&](std::uint32_t pass) -> MirKernel {
+        const std::uint8_t flags = static_cast<std::uint8_t>(
+            (static_cast<std::uint32_t>(p.mode) & 0x0fu) |
+            (p.mask != 0 ? 0x10u : 0u) |
+            ((pass & 1u) << 5));
+        return mir_kernel(d, {MirKind::FaBwd, op, p.dt, Dtype::FP32,
+                              static_cast<std::uint8_t>(c.nt), Dtype::FP32, flags, aux_geom});
     };
-    BwdPush pc = make_push(p, stats);
     const std::uint64_t nqb = cdiv(p.lq, c.br);
     const std::uint64_t nkb = cdiv(p.lk, c.bc);
     if (nqb > 65535 || nkb > 65535) fail(p.op, "sequence too long for one dispatch");
+    const std::uint64_t stats_addr = addr(stats.data);
+    const float flts[] = {
+        static_cast<float>(1.4426950408889634 / std::sqrt(static_cast<double>(p.hd))),
+        static_cast<float>(1.0 / std::sqrt(static_cast<double>(p.hd))),
+    };
     // Pass 0: statistics + dQ, query-major.
-    pc.o0 = p.dq;
-    pc.ldo = static_cast<std::uint32_t>(p.ldq_out);
-    launch(d, kernel(0), pc, static_cast<std::uint32_t>(nqb), static_cast<std::uint32_t>(p.heads));
+    {
+        const std::uint64_t ptrs0[] = {p.q, p.k, p.v, p.g, p.mask, p.aux, p.aux2, stats_addr, p.dq, 0ull};
+        const std::int32_t ints0[] = {
+            p.lq, p.lk, p.ldq, p.ldk, p.ldg, p.ldq_out, std::max(0, p.window), p.causal ? 1 : 0, p.nseq,
+        };
+        mir_dispatch_args_3d(
+            d, kernel(0), static_cast<std::uint32_t>(nqb), static_cast<std::uint32_t>(p.heads), 1u,
+            ptrs0, ints0, flts);
+    }
     // Pass 1: dK, dV, key-major.
-    pc.o0 = p.dk;
-    pc.o1 = p.dv;
-    pc.ldo = static_cast<std::uint32_t>(p.ldk_out);
-    launch(d, kernel(1), pc, static_cast<std::uint32_t>(nkb), static_cast<std::uint32_t>(p.heads));
+    {
+        const std::uint64_t ptrs1[] = {p.q, p.k, p.v, p.g, p.mask, p.aux, p.aux2, stats_addr, p.dk, p.dv};
+        const std::int32_t ints1[] = {
+            p.lq, p.lk, p.ldq, p.ldk, p.ldg, p.ldk_out, std::max(0, p.window), p.causal ? 1 : 0, p.nseq,
+        };
+        mir_dispatch_args_3d(
+            d, kernel(1), static_cast<std::uint32_t>(nkb), static_cast<std::uint32_t>(p.heads), 1u,
+            ptrs1, ints1, flts);
+    }
 }
 
 void need_same(const char* op, Dtype dt, std::initializer_list<const Tensor*> ts) {

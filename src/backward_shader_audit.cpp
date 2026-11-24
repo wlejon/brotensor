@@ -35,6 +35,7 @@
 #include "kernels/mir_attn_small.h"
 #include "kernels/mir_audio.h"
 #include "kernels/mir_conv_direct.h"
+#include "kernels/mir_fa_bwd.h"
 #include "kernels/mir_fa_rows.h"
 #include "kernels/mir_gemm_simt.h"
 #include "kernels/mir_gemv.h"
@@ -704,6 +705,12 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
                     mir_mod, dt, 64u, 2u, 0u, true, true, true, true, true);
                 brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, fa_opts);
                 report.shaders.push_back(audit_spirv_binary_words(fa_name.c_str(), sk.words.data(), sk.words.size()));
+                const std::string fb_name = std::string("fa_bwd") + sfx;
+                brass::Module fb_mod(fb_name.c_str());
+                brass::Function* fbfn = kernels::build_fa_bwd_mir(
+                    fb_mod, dt, 128u, 64u, 64u, 32u, 16u, 0u, true, 1u);
+                brass::target::SpirvKernel fbsk = brass::target::SpirvTarget::compile(*fbfn, fa_opts);
+                report.shaders.push_back(audit_spirv_binary_words(fb_name.c_str(), fbsk.words.data(), fbsk.words.size()));
             }
         }
     }

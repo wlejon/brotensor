@@ -331,12 +331,12 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
         c_addr = addr(r.data);
         ldc = g.n;
     }
-    const Dtype dt_bias = f16_c32 ? g.da : dc;
+    const Dtype dt_bias = f16_c32 ? g.da : g.dc;
     const std::uint64_t tiles_big = cdiv(g.m, kSimtCfgs[0].bm) * cdiv(g.n, kSimtCfgs[0].bn) * g.batch;
     const SimtCfg& c = tiles_big >= 160 ? kSimtCfgs[0] : kSimtCfgs[1];
     const std::uint32_t epi = static_cast<std::uint32_t>(glu ? EPI_STORE : g.epi);
     const std::uint32_t op = epi | (static_cast<std::uint32_t>(g.act) << 4) |
-                             (static_cast<std::uint32_t>(dt_code(dt_bias, g.op)) << 8);
+                             (static_cast<std::uint32_t>(dt_bias) << 8);
     const std::uint8_t flags = static_cast<std::uint8_t>(
         ((c.bm == 128) ? 1u : 0u) | (g.ta ? 2u : 0u) | (g.nb ? 4u : 0u) | (g.bias ? 8u : 0u));
     const MirKernel mk = mir_kernel(d, {MirKind::GemmSimt, op, g.da, g.db, 1, dc, flags});

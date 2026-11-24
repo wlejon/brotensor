@@ -11,6 +11,9 @@ namespace brotensor::kernels {
 
 namespace {
 
+using jit::gpu_mir::bits_to_f32;
+using jit::gpu_mir::f32_to_bits;
+
 void emit_vec_grid_stride_ew(Ctx& c, Value* n_elems, int lanes,
                              const std::function<void(Value* vec_idx)>& body) {
     emit_vec_grid_stride(c, n_elems, lanes, kEwBlock, body);
@@ -45,12 +48,18 @@ Value* unary_lane(Ctx& c, std::uint32_t op, Value* v, Value* a, Value* b_val) {
     }
 }
 
-Value* binary_lane(Ctx& c, std::uint32_t op, Value* yv, Value* xv, Value* a, Value* b_val) {
+Value* binary_lane(Ctx& c, std::uint32_t op, Value* yv, Value* xv, Value* a, Value* b_val, Value* zero_mask) {
     switch (op) {
         case BOP_ADD:   return c.b.build_add(yv, xv);
         case BOP_MUL:   return c.b.build_mul(yv, xv);
         case BOP_DIV:   return c.b.build_sdiv(yv, xv);
-        case BOP_AXPBY: return c.b.build_add(c.b.build_mul(a, yv), c.b.build_mul(b_val, xv));
+        case BOP_AXPBY: {
+            // Pin both products so neither MIR nor driver FMA-contracts (a*y + b*x), matching CPU FP32.
+            auto pin = [&](Value* v) {
+                return bits_to_f32(c, c.b.build_xor(f32_to_bits(c, v), zero_mask));
+            };
+            return c.b.build_add(pin(c.b.build_mul(a, yv)), pin(c.b.build_mul(b_val, xv)));
+        }
         default: throw std::runtime_error("brotensor: unknown binary op");
     }
 }
@@ -148,6 +157,9 @@ Function* build_binary_mir(Module& mod, std::uint32_t op_code, Dtype dt_y, Dtype
     auto p = entry_params(c, fn);
     const int esz_y = elem_bytes(dt_y);
     const int esz_x = elem_bytes(dt_x);
+    Value* zero_mask = (op_code == BOP_AXPBY)
+                           ? c.b.build_select(c.b.build_eq(p[2], c.i32(0)), c.i32(1), c.i32(0))
+                           : nullptr;
     emit_vec_grid_stride_ew(c, p[2], lanes, [&](Value* k) {
         Value* y_ptr = vec_ptr_at(c, p[0], k, lanes, esz_y);
         Value* x_ptr = vec_ptr_at(c, p[1], k, lanes, esz_x);
@@ -156,7 +168,7 @@ Function* build_binary_mir(Module& mod, std::uint32_t op_code, Dtype dt_y, Dtype
         std::vector<Value*> out(static_cast<std::size_t>(lanes));
         for (int j = 0; j < lanes; ++j) {
             const auto js = static_cast<std::size_t>(j);
-            out[js] = binary_lane(c, op_code, yv[js], xv[js], p[3], p[4]);
+            out[js] = binary_lane(c, op_code, yv[js], xv[js], p[3], p[4], zero_mask);
         }
         store_lanes(c, dt_y, lanes, y_ptr, out);
     });

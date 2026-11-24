@@ -7,6 +7,7 @@
 #include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
 #include "../kernels/mir_elementwise.h"
+#include "../kernels/mir_fa_bwd.h"
 #include "../kernels/mir_fa_rows.h"
 #include "../kernels/mir_gemm_simt.h"
 #include "../kernels/mir_gemv.h"
@@ -66,6 +67,7 @@ MirCache& mir_cache() {
 std::uint32_t block_for(const MirKey& k) {
     if (k.kind == MirKind::FillBytes) return kernels::kFillBlock;
     if (k.kind == MirKind::FaRows) return kernels::kFaRowsBlock;
+    if (k.kind == MirKind::FaBwd) return static_cast<std::uint32_t>(k.lanes);
     return kernels::kEwBlock;
 }
 
@@ -209,6 +211,17 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
                 (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
                 (k.flags & 8u) != 0, (k.flags & 16u) != 0);
             break;
+        case MirKind::FaBwd: {
+            const std::uint32_t hd = k.op & 0xffffu;
+            const std::uint32_t hdp = (k.op >> 16) & 0xffffu;
+            const std::uint32_t br = static_cast<std::uint32_t>(k.aux & 0xffffu);
+            const std::uint32_t bc = static_cast<std::uint32_t>((k.aux >> 16) & 0xffffu);
+            const std::uint32_t mode = k.flags & 0x0fu;
+            const bool has_mask = (k.flags & 0x10u) != 0;
+            const std::uint32_t pass = (k.flags >> 5) & 0x01u;
+            fn = kernels::build_fa_bwd_mir(mod, k.dt0, k.lanes, hd, hdp, br, bc, mode, has_mask, pass);
+            break;
+        }
     }
     brass::target::SpirvOptions opts;
     opts.stage = brass::target::SpirvStage::Compute;
