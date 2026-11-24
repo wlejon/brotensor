@@ -594,3 +594,26 @@ Extended `src/cuda/cu_mir_cache.{h,cpp}` (`181` / `649` LOC) with `MirKind::{Aud
   - Deleted 7 files (`-2,485` lines): `stft.cu` (`-633`), `conv1d.cu` (`-576`), `fft.cu` (`-556`), `codec_quant.cu` (`-250`), `vocoder_activations.cu` (`-215`), `resample1d.cu` (`-194`), `detail/block_fft.cuh` (`-61`).
   - Added / extended files (all `<= 649` LOC): `ops_audio.cpp` (`453`), `ops_spectral.cpp` (`484`), `cu_mir_cache.{h,cpp}` (`181` / `649`, `+11`).
   - Net `src/cuda/` Wave 7 delta: **`-1,537` lines** (**cumulative CUDA Waves 3–7: `-9,093` net lines and 46 `.cu` files + `detail/block_fft.cuh` deleted**, all modified/created files `<= 649` LOC).
+
+---
+
+## Wave 9: Vulkan Quantization & Row-Scaling Helpers (`gemm_rowscale` / `wq_rows` / `dequant`) -> Single-Source Brass MIR
+
+Replaced 3 GLSL shaders / 6 variants (`gemm_rowscale.comp` `97`L × 2, `wq_rows.comp` `100`L × 3, `dequant.comp` `35`L × 1; `43 -> 37` compiled Vulkan shaders) with one focused backend-neutral `brass::Function` MIR module:
+- `src/kernels/mir_quant_helpers.{h,cpp}` (`25 + 408` LOC):
+  - `build_gemm_rowscale_mir`: per-row power-of-two exponent computation for CoopMat `BF16` / `FP32` `A` (`TA = 0` 64-lane shared tree max reduction with 16-byte `i32x4` vector loads, `TA = 1` per-column loop) dispatched across `(gx, gy, nz)`.
+  - `build_wq_rows_mir`: per-row `INT8` / `FP8 E4M3` quantization (`quantize_rows` via pinned multi-step NR + FMA exact remainder `div_cr_f32`, unrolled 7-step binary search `fp8_encode_f32`, and `emit_round_even`) and dequantization (`dequantize_rows`).
+  - `build_dequant_mir`: scalar byte and 8-element `i32x4` (`store_lanes(..., Dtype::FP16, 8, ...)`) block dequantization for `QF_INT8`, `QF_FP8`, `QF_Q8_0`, `QF_Q4K`, and `QF_Q6K`.
+- Extended `src/vulkan/vk_mir_cache.{h,cpp}` (`193 / 681` LOC) with `MirKind::{GemmRowscale, WqRows, Dequant}` and `mir_dispatch_args_3d`, wired `gemm.cpp` (`362` LOC) and `ops_quant.cpp` (`531` LOC), updated `CMakeLists.txt`, `detail/kernels.h`, `shaders/shaders.cmake`, and `src/backward_shader_audit.cpp` (`725` LOC).
+
+### Wave 9 Correctness, Proof Audit & LOC Delta (Radeon 8060S)
+- **Formal Audits:**
+  - `brotensor_test_backward_index_proofs`: **19 / 19 ALL PASSED**
+  - `brotensor_test_backward_shader_audit`: **166 / 166 ALL PASSED** (`112,934` SPIR-V/PTX insts, `197` workgroup arrays, `6,612` shared / `2,684` global accesses proven, `667` uniform barriers, `970` uniform collectives).
+- **Unit, Parity & Vulkan Suites (`0` failures after final edit):**
+  - `brotensor_test_vulkan --only={gemm,quant,linear,conv,ops}` (`OK: 0 failure(s)`)
+  - **25 / 25** `ctest -j 1` quant/GEMM suites (`brotensor_test_cpu_jit_quant`, `lora`, `codec_quant`, `conv3d`, `matmul_abt_cpu`, `resblock_int8w`, `matmul`, `matmul_abt`, `matmul_backward`, `int8_quant`, `int8_conv_wmma`, `int8_linear_wmma`, `quant_prefill_parity`, `int8_attention`, `matmul_parity`, `matmul_abt_parity`, `gemm_fp32_parity`, `gemm_fp16_parity`, `lora_parity`, `conv2d_parity`, `deform_conv2d_parity`, `conv3d_parity`, `codec_quant_parity`, `linear_ex_parity`, `linear_wq_parity` `6/6`).
+- **LOC Delta (Vulkan Wave 9):**
+  - `src/vulkan/shaders/*`: `4,202 -> 3,970` (**`-232` lines**; cumulative **`-4,265` lines** / 38 `.comp` files / 103 variants deleted across Waves 1–9, `140 -> 37` compiled Vulkan shaders, 12 `.comp` files remaining).
+  - Shared backend-neutral `src/kernels/*`: `7,236` lines across 49 files (`+440` lines in Wave 9, max file `591` lines).
+

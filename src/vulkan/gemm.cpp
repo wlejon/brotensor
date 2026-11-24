@@ -26,8 +26,6 @@ struct GemmPush {
     std::uint32_t tm0, tn0;   // gemm_cm: tile origin of the dispatch
 };
 
-struct RowScalePush { std::uint64_t a, out; std::uint32_t m, k, lda, sa; };
-
 // Cooperative-matrix tiles: BM x BN workgroup tile, K step BK, WM x WN per
 // subgroup of 32. Every entry must satisfy the shader's assumptions: chunk
 // counts divisible by the workgroup, WN a multiple of 32 (SwiGLU pairing),
@@ -202,23 +200,21 @@ bool scale_a(const GemmArgs& g) {
 // broadcast) into `out` (INT32): gemm_rowscale.comp.
 void row_scales(DeviceCtx& d, const GemmArgs& g, std::uint64_t out) {
     const bool vec = !g.ta && g.a % 16 == 0 && g.lda % 8 == 0 && g.k % 8 == 0 && g.sa % 8 == 0;
-    const ShaderId id = g.da == Dtype::FP32 ? ShaderId::gemm_rowscale_f32 : ShaderId::gemm_rowscale_bf16;
-    const Kernel& k = d.pipelines().get(id, {g.ta ? 1u : 0u, vec ? 1u : 0u});
+    const std::uint8_t flags = static_cast<std::uint8_t>((g.ta ? 1u : 0u) | (vec ? 2u : 0u));
+    const MirKernel mk = mir_kernel(d, {MirKind::GemmRowscale, 0u, g.da, Dtype::FP32, 1, Dtype::FP32, flags});
     const std::uint64_t groups = g.ta ? cdiv(g.m, 256) : cdiv(g.m, 4);
-    const std::uint32_t gx = static_cast<std::uint32_t>(std::min<std::uint64_t>(groups, 65535));
+    const std::uint32_t gx = static_cast<std::uint32_t>(std::max<std::uint64_t>(1, std::min<std::uint64_t>(groups, 65535)));
     const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(groups, gx));
     if (gy > 65535) fail(g, "matrix too large for one dispatch");
     const int nb = g.sa != 0 ? g.batch : 1;
     for (int z0 = 0; z0 < nb; z0 += 65535) {
         const int nz = std::min(65535, nb - z0);
-        RowScalePush p{};
-        p.a = g.a + static_cast<std::uint64_t>(z0) * g.sa * esize(g.da);
-        p.out = out + static_cast<std::uint64_t>(z0) * static_cast<std::uint64_t>(g.m) * 4u;
-        p.m = static_cast<std::uint32_t>(g.m);
-        p.k = static_cast<std::uint32_t>(g.k);
-        p.lda = static_cast<std::uint32_t>(g.lda);
-        p.sa = static_cast<std::uint32_t>(g.sa);
-        launch(d, k, p, gx, gy, static_cast<std::uint32_t>(nz));
+        const std::uint64_t ptrs[] = {
+            g.a + static_cast<std::uint64_t>(z0) * g.sa * esize(g.da),
+            out + static_cast<std::uint64_t>(z0) * static_cast<std::uint64_t>(g.m) * 4u,
+        };
+        const std::int32_t ints[] = {g.m, g.k, g.lda, static_cast<std::int32_t>(g.sa)};
+        mir_dispatch_args_3d(d, mk, gx, gy, static_cast<std::uint32_t>(nz), ptrs, ints, {});
     }
 }
 

@@ -53,6 +53,9 @@ enum class MirKind : std::uint8_t {
     FaCombine = 37,
     AttnSoftmax = 38,
     ConvDirect = 39,
+    GemmRowscale = 40,
+    WqRows = 41,
+    Dequant = 42,
 };
 
 struct MirKey {
@@ -181,5 +184,10 @@ void mir_dispatch_args(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
                        std::span<const std::uint64_t> ptrs,
                        std::span<const std::int32_t> ints,
                        std::span<const float> flts);
+void mir_dispatch_args_3d(DeviceCtx& d, const MirKernel& mk,
+                          std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                          std::span<const std::uint64_t> ptrs,
+                          std::span<const std::int32_t> ints,
+                          std::span<const float> flts);
 
 }  // namespace brotensor::detail::vulkan

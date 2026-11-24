@@ -52,16 +52,6 @@ struct GemvQPush {
     std::uint32_t n, k, ldx, ldy, rowbytes;
 };
 
-struct DequantPush {
-    std::uint64_t w, y, scale;
-    std::uint32_t rows, k, rowbytes;
-};
-
-struct WqRowsPush {
-    std::uint64_t w, q, scale;
-    std::uint32_t rows, k;
-};
-
 bool byte_fmt(int fmt) { return fmt == QF_INT8 || fmt == QF_FP8; }
 
 std::uint64_t cdiv(std::uint64_t a, std::uint64_t b) { return (a + b - 1) / b; }
@@ -164,10 +154,13 @@ void dequant(DeviceCtx& d, const QuantW& q, std::uint64_t y) {
     // 8-element chunks when rows are whole chunks (always for GGUF); single
     // elements for byte-format rows of any other length (a depthwise kernel's 9).
     const bool vec = q.k % 8 == 0 && (!byte_fmt(q.fmt) || q.w % 8 == 0);
-    const Kernel& k = d.pipelines().get(ShaderId::dequant, {static_cast<std::uint32_t>(q.fmt), vec ? 1u : 0u});
-    const DequantPush pc{q.w, y, q.scale, static_cast<std::uint32_t>(q.rows), static_cast<std::uint32_t>(q.k),
-                         q.rowbytes};
-    launch(d, k, pc, groups_1d(std::uint64_t(q.rows) * (vec ? q.k / 8 : q.k), k));
+    const MirKernel mk = mir_kernel(d, {MirKind::Dequant, static_cast<std::uint32_t>(q.fmt), Dtype::FP16, Dtype::FP32,
+                                        1, Dtype::FP32, static_cast<std::uint8_t>(vec ? 1u : 0u)});
+    const std::uint64_t total = std::uint64_t(q.rows) * (vec ? q.k / 8 : q.k);
+    const std::uint32_t gx = static_cast<std::uint32_t>(std::clamp<std::uint64_t>((total + 255u) / 256u, 1u, 65535u));
+    const std::uint64_t ptrs[] = {q.w, y, q.scale};
+    const std::int32_t ints[] = {q.rows, q.k, static_cast<std::int32_t>(q.rowbytes)};
+    mir_dispatch_args(d, mk, gx, ptrs, ints, {});
 }
 
 const char* quant_linear_path(DeviceCtx& d, int B) {
@@ -451,35 +444,40 @@ int byte_code(Dtype fmt, const char* op) {
 
 void quantize_rows(const Tensor& W, Dtype fmt, Tensor& Wq, Tensor& scales) {
     constexpr const char* op = "quantize_rows";
+    dt_code(W.dtype, op);
     const int qf = byte_code(fmt, op);
     DeviceCtx& d = device_of(W);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::wq_rows_f32, W.dtype, op), {0u, qf == QF_FP8 ? 1u : 0u});
+    const MirKernel mk = mir_kernel(d, {MirKind::WqRows, 0u, W.dtype, Dtype::FP32, 1, Dtype::FP32,
+                                        static_cast<std::uint8_t>(qf == QF_FP8 ? 1u : 0u)});
     const int N = W.rows, K = W.cols;
     count32(W, op);
     if (Wq.rows != N || Wq.cols != K || Wq.dtype != fmt) Wq.resize(N, K, fmt);
     if (scales.rows != N || scales.cols != 1 || scales.dtype != Dtype::FP32) scales.resize(N, 1, Dtype::FP32);
     if (N == 0) return;
-    const WqRowsPush pc{addr(W.data), addr(Wq.data), addr(scales.data), static_cast<std::uint32_t>(N),
-                        static_cast<std::uint32_t>(K)};
     const std::uint32_t gx = static_cast<std::uint32_t>(std::min(N, 65535));
-    launch(d, k, pc, gx, static_cast<std::uint32_t>(cdiv(N, gx)));
+    const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(N, gx));
+    const std::uint64_t ptrs[] = {addr(W.data), addr(Wq.data), addr(scales.data)};
+    const std::int32_t ints[] = {N, K};
+    mir_dispatch_args_3d(d, mk, gx, gy, 1u, ptrs, ints, {});
 }
 
 void dequantize_rows(const Tensor& Wq, const Tensor& scales, Dtype out, Tensor& W) {
     constexpr const char* op = "dequantize_rows";
+    dt_code(out, op);
     if (Wq.dtype != Dtype::INT8 && Wq.dtype != Dtype::FP8_E4M3) fail(op, "Wq must be INT8 or FP8_E4M3");
     need(op, scales.dtype == Dtype::FP32 && static_cast<long long>(scales.rows) * scales.cols == Wq.rows,
          "scales must be (out, 1) FP32");
     DeviceCtx& d = device_of(Wq);
-    const Kernel& k = d.pipelines().get(dt_variant(ShaderId::wq_rows_f32, out, op),
-                                        {1u, Wq.dtype == Dtype::FP8_E4M3 ? 1u : 0u});
+    const MirKernel mk = mir_kernel(d, {MirKind::WqRows, 1u, out, Dtype::FP32, 1, Dtype::FP32,
+                                        static_cast<std::uint8_t>(Wq.dtype == Dtype::FP8_E4M3 ? 1u : 0u)});
     const int N = Wq.rows, K = Wq.cols;
     const std::uint32_t n = count32(Wq, op);
     if (W.rows != N || W.cols != K || W.dtype != out) W.resize(N, K, out);
     if (n == 0) return;
-    const WqRowsPush pc{addr(W.data), addr(Wq.data), addr(scales.data), static_cast<std::uint32_t>(N),
-                        static_cast<std::uint32_t>(K)};
-    launch(d, k, pc, groups_1d(n, k));
+    const std::uint32_t gx = static_cast<std::uint32_t>(std::clamp<std::uint64_t>((n + 255u) / 256u, 1u, 65535u));
+    const std::uint64_t ptrs[] = {addr(W.data), addr(Wq.data), addr(scales.data)};
+    const std::int32_t ints[] = {N, K};
+    mir_dispatch_args(d, mk, gx, ptrs, ints, {});
 }
 
 void linear_forward_batched_wq_ex(const Tensor& Wq, const Tensor& scales, const Tensor* bias, const Tensor& X,

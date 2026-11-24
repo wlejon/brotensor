@@ -27,6 +27,7 @@
 #include "kernels/mir_gnorm.h"
 #include "kernels/mir_lstm.h"
 #include "kernels/mir_norm.h"
+#include "kernels/mir_quant_helpers.h"
 #include "kernels/mir_reduce.h"
 #include "kernels/mir_remap.h"
 #include "kernels/mir_resample.h"
@@ -649,6 +650,22 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
         }
         audit_mir("attn_bwd", [](brass::Module& m) {
             return kernels::build_attn_bwd_mir(m, true, true);
+        });
+        audit_mir("gemm_rowscale_f32", [](brass::Module& m) {
+            return kernels::build_gemm_rowscale_mir(m, Dtype::FP32, false, true);
+        });
+        audit_mir("gemm_rowscale_bf16", [](brass::Module& m) {
+            return kernels::build_gemm_rowscale_mir(m, Dtype::BF16, false, true);
+        });
+        for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
+                 {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
+            const std::string wq_name = std::string("wq_rows") + sfx;
+            audit_mir(wq_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_wq_rows_mir(m, 0u, dt, true);
+            });
+        }
+        audit_mir("dequant", [](brass::Module& m) {
+            return kernels::build_dequant_mir(m, QF_Q4K, true);
         });
     }
 

@@ -44,7 +44,6 @@ inline constexpr ShaderId kDtypeFamilies[] = {
     ShaderId::fa_rows_f32,
     ShaderId::conv_simt_f32,
     ShaderId::fa_bwd_f32,
-    ShaderId::wq_rows_f32,
 };
 
 // The <base>_f16 / <base>_bf16 sibling of a <base>_f32 family shader.

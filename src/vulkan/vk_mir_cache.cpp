@@ -11,6 +11,7 @@
 #include "../kernels/mir_lstm.h"
 #include "../kernels/mir_misc.h"
 #include "../kernels/mir_norm.h"
+#include "../kernels/mir_quant_helpers.h"
 #include "../kernels/mir_reduce.h"
 #include "../kernels/mir_remap.h"
 #include "../kernels/mir_resample.h"
@@ -151,6 +152,15 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
             break;
         case MirKind::ConvDirect:
             fn = kernels::build_conv_direct_mir(mod, k.op, k.dt0, k.flags != 0);
+            break;
+        case MirKind::GemmRowscale:
+            fn = kernels::build_gemm_rowscale_mir(mod, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
+        case MirKind::WqRows:
+            fn = kernels::build_wq_rows_mir(mod, k.op, k.dt0, k.flags != 0);
+            break;
+        case MirKind::Dequant:
+            fn = kernels::build_dequant_mir(mod, k.op, k.flags != 0);
             break;
     }
     brass::target::SpirvOptions opts;
@@ -649,16 +659,24 @@ void mir_dispatch_topk(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx, std:
     jit_dispatch(d, mk.pipe, buf.data(), gx, gy);
 }
 
-void mir_dispatch_args(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
-                       std::span<const std::uint64_t> ptrs,
-                       std::span<const std::int32_t> ints,
-                       std::span<const float> flts) {
+void mir_dispatch_args_3d(DeviceCtx& d, const MirKernel& mk,
+                          std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                          std::span<const std::uint64_t> ptrs,
+                          std::span<const std::int32_t> ints,
+                          std::span<const float> flts) {
     std::array<std::uint8_t, 128> buf{};
     std::size_t idx = 0;
     for (std::uint64_t p : ptrs) put_param(buf, *mk.spv, idx++, p);
     for (std::int32_t v : ints) put_param(buf, *mk.spv, idx++, v);
     for (float f : flts) put_param(buf, *mk.spv, idx++, f);
-    jit_dispatch(d, mk.pipe, buf.data(), gx);
+    jit_dispatch(d, mk.pipe, buf.data(), gx, gy, gz);
+}
+
+void mir_dispatch_args(DeviceCtx& d, const MirKernel& mk, std::uint32_t gx,
+                       std::span<const std::uint64_t> ptrs,
+                       std::span<const std::int32_t> ints,
+                       std::span<const float> flts) {
+    mir_dispatch_args_3d(d, mk, gx, 1u, 1u, ptrs, ints, flts);
 }
 
 }  // namespace brotensor::detail::vulkan
