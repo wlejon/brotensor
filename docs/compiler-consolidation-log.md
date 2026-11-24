@@ -39,3 +39,36 @@ Two-stage dispatch (`quant_x_q8` `785` words at `sg=32` + `gemv_q8_sdot4` `1601`
   - `q4k`: `4096×4096` `127.2 GB/s`, `12288×4096` `183.0 GB/s`
   - `q6k`: `4096×4096` `145.2 GB/s`, `12288×4096` `193.6 GB/s`
 - **Regression checks:** `brotensor_test_vulkan --only=jit`, `--only=quant`, and `--only=gemm` all passed with `OK: 0 failure(s)`.
+
+---
+
+## Wave 0 Radeon 8060S Op & Real-Model Baselines (vs M2 Pro & RTX 4090)
+
+### Op Microbenchmarks (`brotensor_bench_elementwise`, `gemm_fp32`, `wq_linear`)
+- **`brotensor_bench_elementwise` (`37/37` ops `ok`):**
+  - Unary forward FP32 (`9217×4096`): `silu 1.379 ms (219.0 GB/s)`, `gelu_tanh 1.687 ms (179.0 GB/s)`, `relu 1.367 ms (221.0 GB/s)`, `tanh 1.367 ms (220.9 GB/s)`, `sigmoid 1.366 ms (221.2 GB/s)`
+  - Unary forward FP16 (`18433×4096`): `silu 1.488 ms (203.0 GB/s)`, `gelu 1.492 ms (202.5 GB/s)`, `relu 1.459 ms (206.9 GB/s)`, `tanh 1.486 ms (203.2 GB/s)`, `sigmoid 1.480 ms (204.0 GB/s)`
+  - Unary forward BF16 (`18433×4096`): `silu 1.821 ms (165.8 GB/s)`, `gelu 1.805 ms (167.3 GB/s)`, `relu 1.503 ms (201.0 GB/s)`, `tanh 1.495 ms (202.1 GB/s)`, `sigmoid 1.484 ms (203.5 GB/s)`
+  - Unary backward (`9217×4096` fp32 / `18433×4096` fp16/bf16): `silu_bwd 2.122/2.329/2.291 ms (213.4/194.5/197.7 GB/s)`, `gelu_bwd 2.142/2.306/2.312 ms (211.5/196.4/196.0 GB/s)`
+  - Binary/scalar inplace: `add 2.175/2.224/2.237 ms (208.3/203.7/202.5 GB/s)`, `mul 2.416/2.230/2.246 ms (187.5/203.2/201.7 GB/s)`, `scale 1.527/1.500/1.493 ms (197.8/201.3/202.3 GB/s)`
+  - Gated/norm: `geglu_forward fp32/fp16/bf16` `0.990/1.095/1.095 ms (228.8/206.9/207.0 GB/s)`, `rms_norm fp32/fp16 1.543/1.669 ms (195.7/181.0 GB/s)`, `layernorm_inf_fp16 1.984 ms (152.2 GB/s)`, `softmax_rows 1.541 ms (196.0 GB/s)`
+- **`brotensor_bench_gemm_fp32` (`4096×4096×4096`):** NN `14.515 ms (9468.8 GFLOP/s)`, NT `19.675 ms (6985.4 GFLOP/s)` (TN 4096³ triggered amdgpu CS TDR timeout `VK_ERROR_DEVICE_LOST`)
+- **`brotensor_bench_wq_linear` (2048-wide decoder layer):**
+  - `M=1`: FP16 `0.514 ms (195.9 GB/s)`, INT8 `0.377 ms (133.6 GB/s)`, FP8 `0.356 ms (141.5 GB/s)`
+  - `M=2`: FP16 `0.524 ms (192.0 GB/s)`, INT8 `0.356 ms (141.5 GB/s)`, FP8 `0.372 ms (135.4 GB/s)`
+  - `M=8`: FP16 `0.692 ms (145.5 GB/s)`, INT8 `0.403 ms (124.7 GB/s)`, FP8 `0.409 ms (123.0 GB/s)`
+
+### Real-Model Vulkan Baselines (Radeon 8060S vs M2 Pro Metal / RTX 4090 CUDA)
+
+| Repo | Model | Workload | Radeon 8060S (Vulkan) | Apple M2 Pro (Metal) | RTX 4090 (CUDA) |
+|---|---|---|---|---|---|
+| `brovisionml` | Depth-Anything-V2-Small | 1024×768 (w2, r5) | **23.42 ms** best (mean 24.25 ms) | 991.50 ms best (mean 995.94 ms) | — |
+| `brovisionml` | Depth-Anything-V2-Large | 1024×768 (w2, r5) | **128.78 ms** best (mean 132.91 ms) | — | — |
+| `brovisionml` | SAM ViT-Base | 1024×768 encode / decode | **126.28 ms** / **9.17 ms** (mean 127.27 / 9.52 ms) | 4730.35 ms / 55.79 ms | — |
+| `brovisionml` | SegFormer-B0 | 1024×768 (w2, r5) | **28.52 ms** best (mean 29.69 ms) | — | — |
+| `brodiffusion` | SD 1.5 (`lcm-dreamshaper`) | 512×512, 20 steps, CFG 7.5 | **1.250 s** denoise (`0.063 s/step`), **0.155 s** VAE, `1.43 s` total (`2.64/47.23 GiB`) | 39.045 s denoise, 2.788 s VAE | — |
+| `brodiffusion` | Sana-600M | 512×512, 20 steps, CFG 4.5 | **1.055 s** denoise (`0.053 s/step`), **0.200 s** VAE, `1.35 s` total (`8.40/47.23 GiB`) | — | — |
+| `brodiffusion` | PixArt-Sigma + T5-XXL | 512×512, 10 steps, CFG 4.5 | **0.626 s** T5, **1.551 s** denoise, **0.153 s** VAE, `2.39 s` total (`12.72/47.23 GiB`) | skipped (>11.84 GiB) | — |
+| `brosoundml` | Kokoro TTS | 155 phonemes -> 9.47 s audio | **213.7 ms** mean (`44.33× RT`, best `207.3 ms`) | 3194.1 ms (`2.97× RT`) | 136.5 ms (`69.41× RT`) |
+| `brosoundml` | Supertonic-3 TTS | 5 steps -> 6.78 s audio (warm) | **276 ms** best (`24.55× RT`; 2nd run 277 ms) | 1624 ms (`4.17× RT`) | — |
+| `brolm` | Qwen3-0.6B-Q8_0 | prefill 256 / decode 128 | **12526.5 tok/s** prefill / **193.6 tok/s** (`5.16 ms/tok`) decode | — | 12897.3 / 374.4 tok/s |
