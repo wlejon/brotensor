@@ -14,6 +14,9 @@
 #include "detail/gemm.h"
 #include "detail/kernels.h"
 #include "detail/spatial.h"
+#include "shaders/op_codes.h"
+#include "vk_mir_cache.h"
+#include "../kernels/mir_audio.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/ops.h>
@@ -35,12 +38,6 @@ void copy_d2d_strided(const Tensor& src, int src_off, int src_pitch, Tensor& dst
 
 namespace {
 
-struct AudioPush {
-    std::uint64_t a, b, c, d, e, f, g;
-    std::uint32_t u[12];
-    float f0, f1;
-};
-
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
 }
@@ -53,27 +50,16 @@ void ensure(Tensor& t, int rows, int cols, Dtype dt) {
     if (t.rows != rows || t.cols != cols || t.dtype != dt) t.resize(rows, cols, dt);
 }
 
-std::uint32_t u32(long long v) { return static_cast<std::uint32_t>(v); }
+std::int32_t i32(long long v) { return static_cast<std::int32_t>(v); }
 
-const Kernel& audio_kernel(DeviceCtx& d, Dtype dt, std::uint32_t op, const char* name) {
-    return d.pipelines().get(dt_variant(ShaderId::audio_f32, dt, name), {op});
-}
-
-// One invocation per item, grid-stride.
-void run_items(DeviceCtx& d, Dtype dt, std::uint32_t op, const AudioPush& pc, std::uint64_t items,
-               const char* name) {
-    const Kernel& k = audio_kernel(d, dt, op, name);
-    launch(d, k, pc, groups_1d(items, k));
-}
-
-// One workgroup per item (2D grid past 65535).
-void run_groups(DeviceCtx& d, Dtype dt, std::uint32_t op, const AudioPush& pc, std::uint64_t groups,
-                const char* name) {
-    const Kernel& k = audio_kernel(d, dt, op, name);
-    const std::uint32_t gx = static_cast<std::uint32_t>(std::min<std::uint64_t>(groups, 65535));
-    const std::uint32_t gy = static_cast<std::uint32_t>((groups + gx - 1) / gx);
-    if (gy > 65535) fail(name, "too many workgroups");
-    launch(d, k, pc, gx, gy);
+void run_audio(DeviceCtx& d, std::uint32_t op, Dtype dt, std::uint8_t flags, std::uint64_t items, bool per_group,
+               std::span<const std::uint64_t> ptrs, std::span<const std::int32_t> ints) {
+    if (items == 0) return;
+    const MirKernel mk = mir_kernel(d, MirKey{MirKind::Audio, op, dt, dt, 1, dt, flags});
+    const std::uint32_t gx = per_group
+        ? static_cast<std::uint32_t>(std::min<std::uint64_t>(items, 65535))
+        : mir_groups_1d(static_cast<std::uint32_t>(items), 1, kernels::kAudioBlock);
+    mir_dispatch_args(d, mk, gx, ptrs, ints, {});
 }
 
 int convt1d_out_len(int L, int stride, int padding, int output_padding, int dilation, int kL) {
@@ -143,13 +129,13 @@ void conv_transpose1d_forward(const Tensor& X, const Tensor& Wt, const Tensor* b
             gm.sc = static_cast<long long>(per_image);
             gemm(d, gm);
         }
-        AudioPush pc{};
-        pc.a = addr(cols.data); pc.c = bias ? addr(bias->data) : 0;
-        pc.d = addr(Y.data) + std::uint64_t(n0) * C_out * L_out * es;
-        const std::uint32_t u[] = {u32(nn), u32(C_out), u32(L), u32(kL), u32(stride), u32(padding), u32(dilation),
-                                   u32(Cgo), u32(L_out), cdt != dt ? 1u : 0u, 0, 0};
-        std::copy(std::begin(u), std::end(u), pc.u);
-        run_items(d, dt, AU_COL2IM, pc, std::uint64_t(nn) * C_out * L_out, op);
+        const std::uint64_t bias_ptr = bias ? addr(bias->data) : 0;
+        const std::uint64_t ptrs[] = {
+            addr(cols.data), bias_ptr, addr(Y.data) + std::uint64_t(n0) * C_out * L_out * es};
+        const std::int32_t ints[] = {i32(nn), i32(C_out), i32(L), i32(kL), i32(stride),
+                                     i32(padding), i32(dilation), i32(Cgo), i32(L_out)};
+        const std::uint8_t flags = static_cast<std::uint8_t>((bias ? 1u : 0u) | (cdt != dt ? 0x10u : 0u));
+        run_audio(d, AU_COL2IM, dt, flags, std::uint64_t(nn) * C_out * L_out, false, ptrs, ints);
     }
 }
 
@@ -204,12 +190,10 @@ void conv_transpose1d_backward_weight(const Tensor& X, const Tensor& dY, int N, 
     need(op, X.rows == N && X.cols == C_in * L, "X shape must be (N, C_in*L)");
     need(op, dY.rows == N && dY.cols == C_out * L_out, "dY shape must be (N, C_out*L_out)");
     if (C_in == 0 || Cg_out == 0 || N == 0) return;
-    AudioPush pc{};
-    pc.a = addr(X.data); pc.b = addr(dY.data); pc.d = addr(dWt.data);
-    const std::uint32_t u[] = {u32(N), u32(C_in), u32(L), u32(C_out), u32(kL), u32(stride), u32(padding),
-                               u32(dilation), u32(C_in / groups), u32(Cg_out), u32(L_out), 0};
-    std::copy(std::begin(u), std::end(u), pc.u);
-    run_groups(device_of(X), X.dtype, AU_CONVT_BWD_W, pc, std::uint64_t(C_in) * Cg_out * kL, op);
+    const std::uint64_t ptrs[] = {addr(X.data), addr(dY.data), addr(dWt.data)};
+    const std::int32_t ints[] = {i32(N), i32(C_in), i32(L), i32(C_out), i32(kL), i32(stride),
+                                 i32(padding), i32(dilation), i32(C_in / groups), i32(Cg_out), i32(L_out)};
+    run_audio(device_of(X), AU_CONVT_BWD_W, X.dtype, 0, std::uint64_t(C_in) * Cg_out * kL, true, ptrs, ints);
 }
 
 void conv_transpose1d_backward_bias(const Tensor& dY, int N, int C_out, int L_out, Tensor& dB) {
@@ -232,11 +216,10 @@ void causal_conv1d_update(const Tensor& X, const Tensor& Wt, const Tensor* bias,
     need(op, X.size() >= static_cast<long long>(N) * C * L_step, "X is smaller than N*C*L_step");
     ensure(Y, N, C * L_step, X.dtype);
     if (N == 0) return;
-    AudioPush pc{};
-    pc.a = addr(X.data); pc.b = addr(Wt.data); pc.c = bias ? addr(bias->data) : 0; pc.e = addr(state.data);
-    pc.d = addr(Y.data);
-    pc.u[0] = u32(C); pc.u[1] = u32(L_step); pc.u[2] = u32(kL); pc.u[3] = u32(dilation); pc.u[4] = u32(N * C);
-    run_items(device_of(X), X.dtype, AU_CAUSAL, pc, std::uint64_t(N) * C, op);
+    const std::uint64_t ptrs[] = {addr(X.data), addr(Wt.data), bias ? addr(bias->data) : 0, addr(state.data), addr(Y.data)};
+    const std::int32_t ints[] = {i32(C), i32(L_step), i32(kL), i32(dilation), i32(N * C)};
+    run_audio(device_of(X), AU_CAUSAL, X.dtype, static_cast<std::uint8_t>(bias ? 1u : 0u),
+              std::uint64_t(N) * C, false, ptrs, ints);
 }
 
 void check_pad(const char* op, int N, int C, int L, int pad_left, int pad_right, int mode) {
@@ -246,13 +229,13 @@ void check_pad(const char* op, int N, int C, int L, int pad_left, int pad_right,
     need(op, mode != 1 || (pad_left < L && pad_right < L), "reflect padding requires pad_left and pad_right < L");
 }
 
-void pad1d(const char* op, std::uint32_t code, const Tensor& src, int N, int C, int L, int pad_left, int pad_right,
+void pad1d(const char* /*op*/, std::uint32_t code, const Tensor& src, int N, int C, int L, int pad_left, int pad_right,
            int mode, Tensor& dst) {
     const int L_pad = L + pad_left + pad_right;
-    AudioPush pc{};
-    pc.a = addr(src.data); pc.d = addr(dst.data);
-    pc.u[0] = u32(L); pc.u[1] = u32(pad_left); pc.u[2] = u32(L_pad); pc.u[3] = u32(N * C); pc.u[4] = u32(mode);
-    run_items(device_of(src), src.dtype, code, pc, std::uint64_t(N) * C * (code == AU_PAD ? L_pad : L), op);
+    const std::uint64_t ptrs[] = {addr(src.data), addr(dst.data)};
+    const std::int32_t ints[] = {i32(L), i32(pad_left), i32(L_pad), i32(N * C)};
+    run_audio(device_of(src), code, src.dtype, static_cast<std::uint8_t>(mode),
+              std::uint64_t(N) * C * (code == AU_PAD ? L_pad : L), false, ptrs, ints);
 }
 
 void pad1d_forward(const Tensor& X, int N, int C, int L, int pad_left, int pad_right, int mode, Tensor& Y) {
@@ -290,10 +273,10 @@ void snake_forward(const Tensor& X, const Tensor& alpha, const Tensor* beta, int
     check_snake(op, X, alpha, beta, N, C, L);
     ensure(Y, N, C * L, X.dtype);   // Y may be X (in place)
     if (N == 0 || C * L == 0) return;
-    AudioPush pc{};
-    pc.a = addr(X.data); pc.b = addr(alpha.data); pc.c = beta ? addr(beta->data) : 0; pc.d = addr(Y.data);
-    pc.u[0] = u32(C); pc.u[1] = u32(L); pc.u[2] = u32(static_cast<long long>(N) * C * L);
-    run_items(device_of(X), X.dtype, AU_SNAKE, pc, pc.u[2], op);
+    const std::uint32_t total = static_cast<std::uint32_t>(static_cast<long long>(N) * C * L);
+    const std::uint64_t ptrs[] = {addr(X.data), addr(alpha.data), beta ? addr(beta->data) : 0, addr(Y.data)};
+    const std::int32_t ints[] = {i32(C), i32(L), static_cast<std::int32_t>(total)};
+    run_audio(device_of(X), AU_SNAKE, X.dtype, static_cast<std::uint8_t>(beta ? 1u : 0u), total, false, ptrs, ints);
 }
 
 void snake_backward(const Tensor& X, const Tensor& alpha, const Tensor* beta, const Tensor& dY, int N, int C, int L,
@@ -308,11 +291,12 @@ void snake_backward(const Tensor& X, const Tensor& alpha, const Tensor* beta, co
          "dBeta must be (C, 1) FP32");
     ensure(dX, N, C * L, X.dtype);
     if (N == 0 || C * L == 0) return;
-    AudioPush pc{};
-    pc.a = addr(X.data); pc.b = addr(alpha.data); pc.c = beta ? addr(beta->data) : 0; pc.d = addr(dY.data);
-    pc.e = addr(dX.data); pc.f = addr(dAlpha.data); pc.g = dBeta ? addr(dBeta->data) : 0;
-    pc.u[0] = u32(C); pc.u[1] = u32(L); pc.u[2] = u32(N);
-    run_groups(device_of(X), X.dtype, AU_SNAKE_BWD, pc, u32(C), op);
+    const std::uint64_t ptrs[] = {
+        addr(X.data), addr(alpha.data), beta ? addr(beta->data) : 0, addr(dY.data),
+        addr(dX.data), addr(dAlpha.data), dBeta ? addr(dBeta->data) : 0};
+    const std::int32_t ints[] = {i32(C), i32(L), i32(N)};
+    run_audio(device_of(X), AU_SNAKE_BWD, X.dtype, static_cast<std::uint8_t>(beta ? 1u : 0u),
+              static_cast<std::uint64_t>(C), true, ptrs, ints);
 }
 
 // ─── resample1d ─────────────────────────────────────────────────────────────
@@ -330,10 +314,10 @@ void resample1d_forward(const Tensor& X, int N, int C, int L_in, int L_out, int 
     need(op, X.size() >= static_cast<long long>(N) * C * L_in, "X is smaller than N*C*L_in");
     ensure(Y, N, C * L_out, X.dtype);
     if (N == 0 || C * L_out == 0) return;
-    AudioPush pc{};
-    pc.a = addr(X.data); pc.d = addr(Y.data);
-    pc.u[0] = u32(L_in); pc.u[1] = u32(L_out); pc.u[2] = u32(N * C); pc.u[3] = u32(mode);
-    run_items(device_of(X), X.dtype, AU_RESAMPLE, pc, std::uint64_t(N) * C * L_out, op);
+    const std::uint64_t ptrs[] = {addr(X.data), addr(Y.data)};
+    const std::int32_t ints[] = {i32(L_in), i32(L_out), i32(N * C)};
+    run_audio(device_of(X), AU_RESAMPLE, X.dtype, static_cast<std::uint8_t>(mode),
+              std::uint64_t(N) * C * L_out, false, ptrs, ints);
 }
 
 void resample1d_backward(const Tensor& dY, int N, int C, int L_in, int L_out, int mode, Tensor& dX) {
@@ -344,10 +328,10 @@ void resample1d_backward(const Tensor& dY, int N, int C, int L_in, int L_out, in
     ensure(dX, N, C * L_in, dY.dtype);
     if (N == 0 || C * L_in == 0) return;
     if (L_out == 0) { dX.zero(); return; }
-    AudioPush pc{};
-    pc.a = addr(dY.data); pc.d = addr(dX.data);
-    pc.u[0] = u32(L_in); pc.u[1] = u32(L_out); pc.u[2] = u32(N * C); pc.u[3] = u32(mode);
-    run_items(device_of(dY), dY.dtype, AU_RESAMPLE_BWD, pc, std::uint64_t(N) * C * L_in, op);
+    const std::uint64_t ptrs[] = {addr(dY.data), addr(dX.data)};
+    const std::int32_t ints[] = {i32(L_in), i32(L_out), i32(N * C)};
+    run_audio(device_of(dY), AU_RESAMPLE_BWD, dY.dtype, static_cast<std::uint8_t>(mode),
+              std::uint64_t(N) * C * L_in, false, ptrs, ints);
 }
 
 // ─── codec quantisers ───────────────────────────────────────────────────────
@@ -361,10 +345,9 @@ void vq_encode_forward(const Tensor& x, const Tensor& codebook, Tensor& indices,
     ensure(indices, N, 1, Dtype::INT32);
     ensure(quantized, N, D, Dtype::FP32);
     if (N == 0) return;
-    AudioPush pc{};
-    pc.a = addr(x.data); pc.b = addr(codebook.data); pc.d = addr(quantized.data); pc.e = addr(indices.data);
-    pc.u[0] = u32(N); pc.u[1] = u32(D); pc.u[2] = u32(K);
-    run_groups(device_of(x), Dtype::FP32, AU_VQ, pc, u32(N), op);
+    const std::uint64_t ptrs[] = {addr(x.data), addr(codebook.data), addr(quantized.data), addr(indices.data)};
+    const std::int32_t ints[] = {i32(N), i32(D), i32(K)};
+    run_audio(device_of(x), AU_VQ, Dtype::FP32, 0, static_cast<std::uint64_t>(N), true, ptrs, ints);
 }
 
 void fsq_quantize_forward(const Tensor& x, const Tensor& levels, Tensor& quantized, Tensor& packed_indices) {
@@ -380,10 +363,9 @@ void fsq_quantize_forward(const Tensor& x, const Tensor& levels, Tensor& quantiz
     ensure(quantized, N, D, Dtype::FP32);
     ensure(packed_indices, N, 1, Dtype::INT32);
     if (N == 0 || D == 0) return;
-    AudioPush pc{};
-    pc.a = addr(x.data); pc.b = addr(levels.data); pc.d = addr(quantized.data); pc.e = addr(packed_indices.data);
-    pc.u[0] = u32(N); pc.u[1] = u32(D);
-    run_items(device_of(x), Dtype::FP32, AU_FSQ, pc, u32(N), op);
+    const std::uint64_t ptrs[] = {addr(x.data), addr(levels.data), addr(quantized.data), addr(packed_indices.data)};
+    const std::int32_t ints[] = {i32(N), i32(D)};
+    run_audio(device_of(x), AU_FSQ, Dtype::FP32, 0, static_cast<std::uint64_t>(N), false, ptrs, ints);
 }
 
 // The straight-through backwards: dX = dQuantized.

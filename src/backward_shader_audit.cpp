@@ -31,10 +31,12 @@
 #include "kernels/mir_remap.h"
 #include "kernels/mir_resample.h"
 #include "kernels/mir_resample_bwd.h"
+#include "kernels/mir_audio.h"
 #include "kernels/mir_rope.h"
 #include "kernels/mir_scatter.h"
 #include "kernels/mir_select.h"
 #include "kernels/mir_misc.h"
+#include "kernels/mir_spectral.h"
 #include "kernels/mir_vision.h"
 #include "kernels/mir_topk.h"
 #include "kernels/mir_xent.h"
@@ -599,6 +601,31 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
         audit_mir("select_sample", [](brass::Module& m) { return kernels::build_select_sample_mir(m, false); });
         audit_mir("select_md", [](brass::Module& m) { return kernels::build_select_md_mir(m, true, true, true); });
         audit_mir("select_commit", [](brass::Module& m) { return kernels::build_select_commit_mir(m); });
+        for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
+                 {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {
+            const std::string sn_name = std::string("audio_snake_bwd") + sfx;
+            audit_mir(sn_name.c_str(), [dt](brass::Module& m) {
+                return kernels::build_audio_mir(m, AU_SNAKE_BWD, dt, 1u, false);
+            });
+        }
+        audit_mir("audio_convt_bwd_w_f32", [](brass::Module& m) {
+            return kernels::build_audio_mir(m, AU_CONVT_BWD_W, Dtype::FP32, 0u, false);
+        });
+        audit_mir("audio_vq", [](brass::Module& m) {
+            return kernels::build_audio_mir(m, AU_VQ, Dtype::FP32, 0u, false);
+        });
+        audit_mir("audio_causal_f32", [](brass::Module& m) {
+            return kernels::build_audio_mir(m, AU_CAUSAL, Dtype::FP32, 1u, false);
+        });
+        audit_mir("spectral_basis", [](brass::Module& m) {
+            return kernels::build_spectral_mir(m, SP_BASIS, BASIS_R2C, true, true);
+        });
+        audit_mir("spectral_ola", [](brass::Module& m) {
+            return kernels::build_spectral_mir(m, SP_OLA, 0u, false, false);
+        });
+        audit_mir("spectral_stft_adj", [](brass::Module& m) {
+            return kernels::build_spectral_mir(m, SP_STFT_ADJ, 1u, false, false);
+        });
     }
 
     // 4. Synthetic negative test if not already covered by ShaderId::test_shared_overflow

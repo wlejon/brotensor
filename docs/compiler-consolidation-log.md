@@ -480,3 +480,26 @@ Extended Metal's runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`, `218` / `6
   - Added / rewritten / slimmed files (all `< 700` LOC): `mtl_mir_cache.{h,mm}` (`218` / `698`), `sample_logits.mm` (`491 -> 184`, absorbing `masked_diffusion_*`), `misc.mm` (`348`, new), `vision.mm` (`469`, new), `loss.mm` (`328 -> 218`), `elementwise.mm` (`496 -> 367`), `public_reductions.mm` (`179 -> 75`), `conv_transpose2d.mm` (`563 -> 495`), `kernels.mm` (`179 -> 165`).
   - **Net Metal LOC delta (Wave 6):** **`-2,007` net Metal LOC** (`src/metal/` `26,275 -> 24,268` LOC; **cumulative Waves 1–6: `-12,417` net Metal LOC** and 38 Metal files deleted).
 
+---
+
+## Wave 7: Vulkan Audio & Spectral (`audio.comp` / `dft.comp`) -> Single-Source Brass MIR
+
+Replaced 2 GLSL shaders / 4 variants (`audio.comp` `332`L, `dft.comp` `210`L; `60 -> 56` compiled Vulkan shaders, retaining `dft64.comp` for FP64-capable desktop GPUs) with two backend-neutral `brass::Function` MIR modules:
+- `src/kernels/mir_audio.{h,cpp}` (`611` LOC): `AU_SNAKE`, `AU_SNAKE_BWD`, `AU_PAD`, `AU_PAD_BWD`, `AU_RESAMPLE`, `AU_RESAMPLE_BWD`, `AU_CAUSAL`, `AU_CONVT_BWD_W`, `AU_FSQ` (with runtime-opaque NR rounding intermediate bits so Vulkan/RADV NIR preserves 0-ULP `idx / h - 1`), `AU_VQ` (shared-memory min-reduction reusing `emit_block_argmax_f32`), and `AU_COL2IM`.
+- `src/kernels/mir_spectral.{h,cpp}` (`371` LOC): `SP_BASIS` (`BASIS_R2C`, `BASIS_C2R`, `BASIS_C2C` with `emit_sincos_acc` quadrant folding & Hermitian weights), `SP_OLA`, `SP_ISTFT_ADJ`, `SP_STFT_ADJ` (pure-SSA reflection-image deduplication), `SP_CX_MUL`, `SP_CX_MUL_BWD`, `SP_CX_ABS`, `SP_CX_ABS_BWD`, `SP_CX_ANGLE` (`emit_atan2_acc`), and `SP_CX_POLAR`.
+- Extended `src/vulkan/vk_mir_cache.{h,cpp}` with `MirKind::{Audio, Spectral}` and wired `ops_audio.cpp` (`409` LOC) & `ops_spectral.cpp` (`415` LOC).
+
+### Wave 7 Correctness, Proof Audit, Model Gate & LOC Delta (Radeon 8060S)
+- **Formal Audits:**
+  - `brotensor_test_backward_index_proofs`: **ALL PASSED**
+  - `brotensor_test_backward_shader_audit`: **166/166 shaders passed** in **`60.446 s`** (`114010` SPIR-V/PTX insts, `6579` shared / `2675` global accesses proven, `654` uniform barriers, `890` uniform collectives, `0` failures)
+- **Unit, Parity & Vulkan Suites (`0` failures after final edit):**
+  - `brotensor_test_conv1d`, `conv1d_parity`, `vocoder_activations`, `vocoder_parity`, `resample1d`, `resample1d_parity`, `codec_quant`, `codec_quant_parity` (`10/10`), `fft`, `fft_parity`, `stft`, `stft_parity`, `brotensor_test_vulkan --only={audio,ops,train}`
+- **Downstream Audio Model Gate (`Vulkan`, Radeon 8060S):**
+  - `Kokoro TTS`: **`209.8 ms`** mean for `9.47 s` audio -> **`45.15× realtime`**
+- **LOC Delta (Vulkan Wave 7):**
+  - `src/vulkan/shaders/*`: `5,125 -> 4,579` (**`-546` lines**; cumulative **`-3,656` lines** / 30 `.comp` files / 84 variants deleted across Waves 1–7, `140 -> 56` compiled Vulkan shaders)
+  - Shared backend-neutral `src/kernels/*`: `6,234` lines across 43 files (`+982` lines in Wave 7, max file `591` lines)
+  - Pending cross-backend targets against `mir_audio` / `mir_spectral`: Mac Metal Wave 7 & Windows CUDA Wave 7.
+
+

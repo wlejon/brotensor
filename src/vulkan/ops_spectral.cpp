@@ -16,6 +16,9 @@
 
 #include "detail/gemm.h"
 #include "detail/kernels.h"
+#include "shaders/op_codes.h"
+#include "vk_mir_cache.h"
+#include "../kernels/mir_spectral.h"
 
 #include <brotensor/detail/dispatch.h>
 
@@ -36,13 +39,6 @@ void audio_pad1d(DeviceCtx& d, const Tensor& X, int rows, int L, int pad_left, i
 
 namespace {
 
-struct SpPush {
-    std::uint64_t a, b, c, d, e;
-    std::uint32_t u[11];
-    std::int32_t sgn;
-    float scale;
-};
-
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
 }
@@ -60,10 +56,15 @@ void ensure(Tensor& t, int rows, int cols) {
 }
 
 std::uint32_t u32(long long v) { return static_cast<std::uint32_t>(v); }
+std::int32_t i32(long long v) { return static_cast<std::int32_t>(v); }
 
-void run(DeviceCtx& d, std::uint32_t op, const SpPush& pc, std::uint64_t items) {
-    const Kernel& k = d.pipelines().get(ShaderId::dft, {op});
-    launch(d, k, pc, groups_1d(items, k));
+void run_spectral(DeviceCtx& d, std::uint32_t op, std::uint8_t flags, std::uint64_t items,
+                  std::span<const std::uint64_t> ptrs, std::span<const std::int32_t> ints,
+                  std::span<const float> flts = {}) {
+    if (items == 0) return;
+    const MirKernel mk = mir_kernel(d, MirKey{MirKind::Spectral, op, Dtype::FP32, Dtype::FP32, 1, Dtype::FP32, flags});
+    mir_dispatch_args(d, mk, mir_groups_1d(static_cast<std::uint32_t>(items), 1, kernels::kSpectralBlock),
+                      ptrs, ints, flts);
 }
 
 struct Basis {
@@ -116,14 +117,12 @@ void dft_gemm(DeviceCtx& d, const Basis& bs, std::uint64_t x, int R, int cols, i
     Tensor B = Tensor::empty_on(Device::vulkan(d.index()), chunk, cols, Dtype::FP32);
     for (int r0 = 0; r0 < rows; r0 += chunk) {
         const int nr = std::min(chunk, rows - r0);
-        SpPush pc{};
-        pc.c = bs.win;
-        pc.d = addr(B.data);
-        pc.u[0] = u32(nr); pc.u[1] = u32(cols); pc.u[2] = u32(bs.L); pc.u[3] = bs.mode; pc.u[4] = u32(bs.tofs);
-        pc.u[5] = bs.weights ? 1u : 0u; pc.u[6] = u32(r0);
-        pc.sgn = bs.sign;
-        pc.scale = bs.scale;
-        run(d, SP_BASIS, pc, std::uint64_t(nr) * cols);
+        const std::uint64_t ptrs[] = {bs.win, addr(B.data)};
+        const std::int32_t ints[] = {i32(nr), i32(cols), i32(bs.L), i32(bs.tofs), i32(r0), bs.sign};
+        const float flts[] = {bs.scale};
+        const std::uint8_t flags = static_cast<std::uint8_t>(
+            (bs.mode & 0x3u) | (bs.weights ? 4u : 0u) | (bs.win != 0 ? 8u : 0u));
+        run_spectral(d, SP_BASIS, flags, std::uint64_t(nr) * cols, ptrs, ints, flts);
         GemmArgs g;
         g.op = op;
         g.a = x; g.b = addr(B.data); g.c = y + std::uint64_t(r0) * 4u;
@@ -143,9 +142,9 @@ void complex_mul(const Tensor& a, const Tensor& b, Tensor& y) {
     need(op, a.cols % 2 == 0, "cols must be even (interleaved [re,im] layout)");
     ensure(y, a.rows, a.cols);
     if (a.size() == 0) return;
-    SpPush pc{};
-    pc.a = addr(a.data); pc.b = addr(b.data); pc.d = addr(y.data); pc.u[0] = u32(a.size() / 2);
-    run(device_of(a), SP_CX_MUL, pc, pc.u[0]);
+    const std::int32_t n = i32(a.size() / 2);
+    const std::uint64_t ptrs[] = {addr(a.data), addr(b.data), 0, addr(y.data), 0};
+    run_spectral(device_of(a), SP_CX_MUL, 0, static_cast<std::uint64_t>(n), ptrs, {&n, 1});
 }
 
 void complex_mul_backward(const Tensor& a, const Tensor& b, const Tensor& dY, Tensor& dA, Tensor& dB) {
@@ -156,10 +155,9 @@ void complex_mul_backward(const Tensor& a, const Tensor& b, const Tensor& dY, Te
     need(op, dA.rows == a.rows && dA.cols == a.cols, "dA must be pre-sized to a's shape");
     need(op, dB.rows == a.rows && dB.cols == a.cols, "dB must be pre-sized to b's shape");
     if (a.size() == 0) return;
-    SpPush pc{};
-    pc.a = addr(a.data); pc.b = addr(b.data); pc.c = addr(dY.data); pc.d = addr(dA.data); pc.e = addr(dB.data);
-    pc.u[0] = u32(a.size() / 2);
-    run(device_of(a), SP_CX_MUL_BWD, pc, pc.u[0]);
+    const std::int32_t n = i32(a.size() / 2);
+    const std::uint64_t ptrs[] = {addr(a.data), addr(b.data), addr(dY.data), addr(dA.data), addr(dB.data)};
+    run_spectral(device_of(a), SP_CX_MUL_BWD, 0, static_cast<std::uint64_t>(n), ptrs, {&n, 1});
 }
 
 void complex_unary(const char* op, std::uint32_t code, const Tensor& z, Tensor& y) {
@@ -167,9 +165,9 @@ void complex_unary(const char* op, std::uint32_t code, const Tensor& z, Tensor& 
     need(op, z.cols % 2 == 0, "z.cols must be even (interleaved [re,im] layout)");
     ensure(y, z.rows, z.cols / 2);
     if (z.size() == 0) return;
-    SpPush pc{};
-    pc.a = addr(z.data); pc.d = addr(y.data); pc.u[0] = u32(z.size() / 2);
-    run(device_of(z), code, pc, pc.u[0]);
+    const std::int32_t n = i32(z.size() / 2);
+    const std::uint64_t ptrs[] = {addr(z.data), 0, 0, addr(y.data), 0};
+    run_spectral(device_of(z), code, 0, static_cast<std::uint64_t>(n), ptrs, {&n, 1});
 }
 
 void complex_abs(const Tensor& z, Tensor& y) { complex_unary("complex_abs", SP_CX_ABS, z, y); }
@@ -182,9 +180,9 @@ void complex_abs_backward(const Tensor& z, const Tensor& dY, Tensor& dZ) {
     need(op, dY.rows == z.rows && dY.cols == z.cols / 2, "dY must be the real (R, C) magnitude grad");
     ensure(dZ, z.rows, z.cols);
     if (z.size() == 0) return;
-    SpPush pc{};
-    pc.a = addr(z.data); pc.b = addr(dY.data); pc.d = addr(dZ.data); pc.u[0] = u32(z.size() / 2);
-    run(device_of(z), SP_CX_ABS_BWD, pc, pc.u[0]);
+    const std::int32_t n = i32(z.size() / 2);
+    const std::uint64_t ptrs[] = {addr(z.data), addr(dY.data), 0, addr(dZ.data), 0};
+    run_spectral(device_of(z), SP_CX_ABS_BWD, 0, static_cast<std::uint64_t>(n), ptrs, {&n, 1});
 }
 
 void complex_from_polar(const Tensor& mag, const Tensor& phase, Tensor& y) {
@@ -193,9 +191,9 @@ void complex_from_polar(const Tensor& mag, const Tensor& phase, Tensor& y) {
     need(op, mag.rows == phase.rows && mag.cols == phase.cols, "mag and phase must have identical shape");
     ensure(y, mag.rows, 2 * mag.cols);
     if (mag.size() == 0) return;
-    SpPush pc{};
-    pc.a = addr(mag.data); pc.b = addr(phase.data); pc.d = addr(y.data); pc.u[0] = u32(mag.size());
-    run(device_of(mag), SP_CX_POLAR, pc, pc.u[0]);
+    const std::int32_t n = i32(mag.size());
+    const std::uint64_t ptrs[] = {addr(mag.data), addr(phase.data), 0, addr(y.data), 0};
+    run_spectral(device_of(mag), SP_CX_POLAR, 0, static_cast<std::uint64_t>(n), ptrs, {&n, 1});
 }
 
 // ─── fft family ─────────────────────────────────────────────────────────────
@@ -342,12 +340,11 @@ void stft_backward(const Tensor& dSpec, const Tensor& window, int N, int signal_
     b.mode = BASIS_C2R; b.L = n_fft; b.sign = +1; b.tofs = g.pad_lo; b.win = addr(window.data);
     b.scale = normalized ? static_cast<float>(1.0 / std::sqrt(static_cast<double>(n_fft))) : 1.0f;
     dft_gemm(d, b, addr(dSpec.data), N * g.frames, 2 * g.bins, 2 * g.bins, 0, 1, addr(G.data), win, win, 0, op);
-    SpPush pc{};
-    pc.a = addr(G.data); pc.d = addr(dSignal.data);
-    const std::uint32_t u[] = {u32(N), u32(signal_len), u32(g.frames), u32(hop), u32(g.pad_lo), u32(win),
-                               center ? 1u : 0u, u32(n_fft / 2), u32(g.padded_len), 0, 0};
-    std::copy(std::begin(u), std::end(u), pc.u);
-    run(d, SP_STFT_ADJ, pc, std::uint64_t(N) * signal_len);
+    const std::uint64_t ptrs[] = {addr(G.data), addr(dSignal.data)};
+    const std::int32_t ints[] = {i32(N), i32(signal_len), i32(g.frames), i32(hop), i32(g.pad_lo),
+                                 i32(win), i32(n_fft / 2), i32(g.padded_len)};
+    run_spectral(d, SP_STFT_ADJ, static_cast<std::uint8_t>(center ? 1u : 0u),
+                 std::uint64_t(N) * signal_len, ptrs, ints);
 }
 
 void istft(const Tensor& spec, const Tensor& window, int N, int signal_len, int n_fft, int hop, int win, bool center,
@@ -366,12 +363,10 @@ void istft(const Tensor& spec, const Tensor& window, int N, int signal_len, int 
     b.mode = BASIS_C2R; b.L = n_fft; b.sign = +1; b.tofs = g.pad_lo; b.win = addr(window.data); b.weights = true;
     b.scale = static_cast<float>((normalized ? std::sqrt(static_cast<double>(n_fft)) : 1.0) / n_fft);
     dft_gemm(d, b, addr(spec.data), N * g.frames, 2 * g.bins, 2 * g.bins, 0, 1, addr(F.data), win, win, 0, op);
-    SpPush pc{};
-    pc.a = addr(F.data); pc.c = addr(window.data); pc.d = addr(signal.data);
-    const std::uint32_t u[] = {u32(N), u32(signal_len), u32(g.frames), u32(hop), u32(g.pad_lo), u32(win),
-                               center ? u32(n_fft / 2) : 0u, u32(g.padded_len), 0, 0, 0};
-    std::copy(std::begin(u), std::end(u), pc.u);
-    run(d, SP_OLA, pc, std::uint64_t(N) * signal_len);
+    const std::uint64_t ptrs[] = {addr(F.data), addr(window.data), addr(signal.data)};
+    const std::int32_t ints[] = {i32(N), i32(signal_len), i32(g.frames), i32(hop), i32(g.pad_lo),
+                                 i32(win), center ? i32(n_fft / 2) : 0, i32(g.padded_len)};
+    run_spectral(d, SP_OLA, 0, std::uint64_t(N) * signal_len, ptrs, ints);
 }
 
 void istft_backward(const Tensor& dSignal, const Tensor& window, int N, int signal_len, int n_fft, int hop, int win,
@@ -385,12 +380,10 @@ void istft_backward(const Tensor& dSignal, const Tensor& window, int N, int sign
     if (N == 0) return;
     DeviceCtx& d = device_of(dSignal);
     Tensor gacc = Tensor::empty_on(Device::vulkan(d.index()), N, g.padded_len, Dtype::FP32);
-    SpPush pc{};
-    pc.a = addr(dSignal.data); pc.c = addr(window.data); pc.d = addr(gacc.data);
-    const std::uint32_t u[] = {u32(N), u32(signal_len), u32(g.frames), u32(hop), u32(g.pad_lo), u32(win),
-                               center ? u32(n_fft / 2) : 0u, u32(g.padded_len), 0, 0, 0};
-    std::copy(std::begin(u), std::end(u), pc.u);
-    run(d, SP_ISTFT_ADJ, pc, std::uint64_t(N) * g.padded_len);
+    const std::uint64_t ptrs[] = {addr(dSignal.data), addr(window.data), addr(gacc.data)};
+    const std::int32_t ints[] = {i32(N), i32(signal_len), i32(g.frames), i32(hop), i32(g.pad_lo),
+                                 i32(win), center ? i32(n_fft / 2) : 0, i32(g.padded_len)};
+    run_spectral(d, SP_ISTFT_ADJ, 0, std::uint64_t(N) * g.padded_len, ptrs, ints);
     Basis b;
     b.mode = BASIS_R2C; b.L = n_fft; b.sign = -1; b.tofs = g.pad_lo; b.win = addr(window.data); b.weights = true;
     b.scale = static_cast<float>((normalized ? std::sqrt(static_cast<double>(n_fft)) : 1.0) / n_fft);

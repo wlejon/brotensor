@@ -44,7 +44,7 @@ inline constexpr ShaderId kDtypeFamilies[] = {
     ShaderId::fa_rows_f32, ShaderId::fa_combine_f32,
     ShaderId::attn_softmax_f32, ShaderId::attn_aux_f32,
     ShaderId::conv_simt_f32, ShaderId::conv_direct_f32,
-    ShaderId::audio_f32, ShaderId::fa_bwd_f32,
+    ShaderId::fa_bwd_f32,
     ShaderId::wq_rows_f32,
 };
 
