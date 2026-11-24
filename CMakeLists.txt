@@ -490,7 +490,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/linear_wq.mm
         src/metal/packed_encoder.mm
         src/metal/xavier_init.mm
-        src/metal/softmax.mm
         src/metal/layernorm.mm
         src/metal/attention.mm
         src/metal/mha.mm
@@ -517,7 +516,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/matmul.mm
         src/metal/matmul_backward.mm
         src/metal/rope.mm
-        src/metal/rms_norm.mm
         src/metal/kv_cache.mm
         src/metal/public_reductions.mm
         src/metal/ddim_step.mm
@@ -525,7 +523,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/dpmpp_2m_step.mm
         src/metal/timestep_embedding.mm
         src/metal/int8_quant.mm
-        src/metal/modulate.mm
         src/metal/self_attention_bias.mm
         src/metal/fft.mm
         src/metal/stft.mm
@@ -536,14 +533,12 @@ if(BROTENSOR_WITH_METAL)
         src/metal/sample_logits.mm
         src/metal/masked_diffusion.mm
         src/metal/noise.mm
-        src/metal/l2_norm.mm
         src/metal/l2_normalize.mm
         src/metal/convex_upsample.mm
         src/metal/unfold2d.mm
         src/metal/flash_attention_windowed.mm
         src/metal/gated_delta_rule.mm
         src/metal/spatial_merge.mm
-        src/metal/rope_mrope.mm
         src/metal/pad2d.mm
         src/metal/slice2d.mm
         src/metal/top_k.mm
@@ -556,7 +551,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/q4k.mm
         src/metal/q6k.mm
         src/metal/q8_0.mm
-        src/metal/stylegan_elementwise.mm
         src/metal/bias_act.mm
         src/metal/upfirdn2d.mm
         src/metal/filtered_lrelu.mm
@@ -578,7 +572,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/linear_wq.mm
         src/metal/packed_encoder.mm
         src/metal/xavier_init.mm
-        src/metal/softmax.mm
         src/metal/layernorm.mm
         src/metal/attention.mm
         src/metal/mha.mm
@@ -605,7 +598,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/matmul.mm
         src/metal/matmul_backward.mm
         src/metal/rope.mm
-        src/metal/rms_norm.mm
         src/metal/kv_cache.mm
         src/metal/public_reductions.mm
         src/metal/ddim_step.mm
@@ -613,7 +605,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/dpmpp_2m_step.mm
         src/metal/timestep_embedding.mm
         src/metal/int8_quant.mm
-        src/metal/modulate.mm
         src/metal/self_attention_bias.mm
         src/metal/fft.mm
         src/metal/stft.mm
@@ -624,14 +615,12 @@ if(BROTENSOR_WITH_METAL)
         src/metal/sample_logits.mm
         src/metal/masked_diffusion.mm
         src/metal/noise.mm
-        src/metal/l2_norm.mm
         src/metal/l2_normalize.mm
         src/metal/convex_upsample.mm
         src/metal/unfold2d.mm
         src/metal/flash_attention_windowed.mm
         src/metal/gated_delta_rule.mm
         src/metal/spatial_merge.mm
-        src/metal/rope_mrope.mm
         src/metal/pad2d.mm
         src/metal/slice2d.mm
         src/metal/top_k.mm
@@ -644,7 +633,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/q4k.mm
         src/metal/q6k.mm
         src/metal/q8_0.mm
-        src/metal/stylegan_elementwise.mm
         src/metal/bias_act.mm
         src/metal/upfirdn2d.mm
         src/metal/filtered_lrelu.mm

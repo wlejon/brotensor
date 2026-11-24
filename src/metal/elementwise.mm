@@ -388,6 +388,49 @@ void geglu_exact_backward(const Tensor& X, const Tensor& dY, Tensor& dX) {
     glu("geglu_exact_backward", GLU_GEGLU_EXACT_BWD, X, &dY, dX);
 }
 
+// ─── Row-vector AdaLN / broadcast ops (modulate / broadcast_mul) ───────────
+
+namespace {
+
+void rowvec(const char* op, std::uint32_t code, const Tensor& X,
+            const Tensor& v, const Tensor* w, Tensor& Y) {
+    require_fp(X.dtype, op);
+    if (v.dtype != X.dtype || (w && w->dtype != X.dtype)) {
+        throw std::runtime_error(std::string("brotensor: ") + op +
+                                 ": vector operands must share X's dtype");
+    }
+    if (v.size() != X.cols || (w && w->size() != X.cols)) {
+        throw std::runtime_error(std::string("brotensor: ") + op +
+                                 ": vector operands have wrong element count");
+    }
+    if (Y.rows != X.rows || Y.cols != X.cols || Y.dtype != X.dtype) {
+        Y.resize(X.rows, X.cols, X.dtype);
+    }
+    const std::uint32_t n = count32(X, op);
+    if (n == 0) return;
+    const std::uint32_t dim = static_cast<std::uint32_t>(X.cols);
+    const std::uint64_t aw = w ? dev_addr(*w) : 0;
+    int lanes = 1;
+    const int max_l = mir_vec_lanes(X.dtype, dim, dev_addr(X), dev_addr(v), aw, dev_addr(Y));
+    if (max_l > 1 &&
+        (dim % static_cast<std::uint32_t>(max_l) == 0u) &&
+        (n % static_cast<std::uint32_t>(max_l) == 0u)) {
+        lanes = max_l;
+    }
+    const MirKernel mk = mir_kernel(
+        {MirKind::Rowvec, code, X.dtype, X.dtype, static_cast<std::uint8_t>(lanes)});
+    mir_dispatch_rowvec(mk, mir_groups_1d(n, lanes), X, v, w, Y, n, dim);
+}
+
+}  // namespace
+
+void modulate(const Tensor& X, const Tensor& scale, const Tensor& shift, Tensor& Y) {
+    rowvec("modulate", ROWVEC_MODULATE, X, scale, &shift, Y);
+}
+void broadcast_mul(const Tensor& X, const Tensor& v, Tensor& Y) {
+    rowvec("broadcast_mul", ROWVEC_MUL, X, v, nullptr, Y);
+}
+
 // ─── Specialized non-Wave-1 ops ────────────────────────────────────────────
 
 void build_slot_mask(const Tensor& x, int offset, int K, int stride, Tensor& mask) {

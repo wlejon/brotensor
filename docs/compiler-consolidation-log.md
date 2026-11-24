@@ -226,7 +226,36 @@ Replaced 5 GLSL shaders / 21 variants (`norm.comp`, `reduce_rows.comp`, `sum_col
 - **LOC Delta (Vulkan Wave 2):**
   - Deleted 5 GLSL shaders / 21 variants (`norm.comp`, `reduce_rows.comp`, `sum_cols.comp`, `rope.comp`, `rowvec.comp`): `src/vulkan/shaders` `7,830 -> 7,405` (**`-425` lines**; cumulative **`-830` lines** / 11 shaders / 45 variants deleted across Waves 1–2)
   - Shared backend-neutral `src/kernels/*` now `1,445` lines total across Waves 1–2 (`+930` lines in Wave 2); `src/vulkan/vk_mir_cache.{h,cpp}` `356` lines (`+137` lines)
-  - Pending Wave 2 cross-backend deletions once Metal & CUDA wire into `src/kernels/{mir_norm,mir_reduce,mir_rope,mir_elementwise}`: `~3,087` Metal lines and `~3,874` CUDA lines (`layernorm*`, `rmsnorm*`, `softmax*`, `rope*`, `public_reductions*`, `reduce*`, `l2_norm*`, `l2_normalize*`)
+  - Wave 2 Metal consolidation completed below (`-2,379` net Metal LOC); pending Wave 2 CUDA deletion: `~3,874` CUDA lines (`layernorm*`, `rmsnorm*`, `softmax*`, `rope*`, `public_reductions*`, `reduce*`, `l2_norm*`, `l2_normalize*`)
+
+---
+
+## Wave 2 (Metal / Apple M2 Pro): Normalization, Softmax, Row/Col Reductions, RoPE & Rowvec -> Single-Source Brass MIR
+
+Extended Metal's runtime MIR cache (`src/metal/mtl_mir_cache.{h,mm}`) with `Rowvec`, `SumRows`, `ArgmaxRows`, `SumCols`, `Norm` (`kNormBlock = 256`, compile-time `NormMirFlags`, `mir_vec_lanes_norm` clamping max lanes to `4` whenever any active tensor or softmax `s0_mask` is FP32), and `Rope` (`kRopeBlock = 256`), wired all Wave 2 Metal ops through it (`layernorm*`, `rms_norm*`, `pixel_norm*`, `l2_norm*`, `softmax*`, `rope*` including `rope_qkv_packed_inplace` and `rope_apply_mrope`, `sum_rows`, `sum_cols`, `argmax_rows`, `modulate`, `broadcast_mul`), and deleted the duplicated hand-written MSL kernels.
+
+### `brotensor_bench_elementwise` Normalization Gains (Apple M2 Pro Metal, Wave 0 / Wave 1 vs Wave 2)
+
+All `37/37` ops verified `ok` sequentially on an idle M2 Pro (19-core GPU, 16 GiB unified RAM, ~200 GB/s theoretical bus).
+
+| Op | Shape | Dtype | Wave 0 (ms / GB/s) | Wave 1 (ms / GB/s) | Wave 2 (ms / GB/s) | Speedup (vs Wave 0) |
+|---|---|---|---|---|---|---|
+| `rms_norm_forward` | `9217×4096` | `fp32` | `1.894 ms / 159.5` | `1.872 ms / 161.4` | `1.760 ms / 171.6` | **`+7.6%`** |
+| `rms_norm_forward` | `18433×4096` | `fp16` | `1.775 ms / 170.1` | `1.752 ms / 172.4` | `1.731 ms / 174.4` | **`+2.5%`** |
+| `layernorm_inf_fp16` | `18433×4096` | `fp16` | `2.112 ms / 143.0` | `2.123 ms / 142.2` | `1.746 ms / 172.9` | **`+21.0%`** |
+| `softmax_rows` | `9217×4096` | `fp32` | `2.385 ms / 126.6` | `2.464 ms / 122.6` | `1.781 ms / 169.6` | **`+33.9%`** |
+
+*(All 33 Wave 1 elementwise/gated rows in `brotensor_bench_elementwise` also verified `ok` at `170.4–179.8 GB/s`.)*
+
+### Wave 2 Metal Verification & LOC Delta
+- **Parity & Full `ctest` Suite:**
+  - Targeted Wave 2 suites (`public_reductions`, `softmax` `10/10` incl. host-mask rejection, `softmax_rows`, `layernorm`, `layernorm_inference`, `layernorm_batched_caches`, `layernorm_stability`, `rmsnorm`, `l2_norm`, `l2_normalize`, `rope`, `rope_perhead`, `rope_mrope`, `packed_encoder`, `reduce`, `reduce_extra`, `modulate`, `stylegan`): **23/23 passed** (`0` failures).
+  - Full Metal `ctest` (`-LE gcstress -j2`, with `brass` `d5608f4`): **188/190 passed** (100% of Metal parity, runtime, JIT, and `brotensor_test_gpu_mir_emit` tests passed; the only 2 failures are the duplicate CTest targets for the CPU-only SPIR-V/PTX `backward_shader_audit` binary timing out at 300s on M2 Pro).
+- **LOC Delta (Metal Wave 2):**
+  - Deleted files: `src/metal/rms_norm.mm` (`-559`), `src/metal/softmax.mm` (`-351`), `src/metal/l2_norm.mm` (`-237`), `src/metal/rope_mrope.mm` (`-232`), `src/metal/stylegan_elementwise.mm` (`-205`), `src/metal/modulate.mm` (`-178`) — **`-1,762` lines**.
+  - Slimmed files: `src/metal/layernorm.mm` (`525 -> 424`, absorbing `rms_norm`, `pixel_norm`, `l2_norm`, `softmax`), `src/metal/rope.mm` (`531 -> 222`, absorbing `rope_mrope` and `rope_qkv_packed_inplace`), `src/metal/public_reductions.mm` (`540 -> 179`, keeping only non-Wave-2 `rows_count_above`), `src/metal/packed_encoder.mm` (`-58`, removing duplicate `rope_qkv_packed_inplace`). Note: `src/metal/reduce.mm` (`masked_mean_pool`) and `src/metal/l2_normalize.mm` (`l2_normalize_nchw_forward`) remain outside Wave 2.
+  - Extended cache & rowvec: `src/metal/mtl_mir_cache.{h,mm}` (`+180` net lines -> `462` total), `src/metal/elementwise.mm` (`+43` lines -> `496` total for `modulate` / `broadcast_mul`).
+  - **Total Metal diff (Wave 2):** `3,292` lines deleted, `913` lines added (**`-2,379` net Metal LOC**; cumulative Waves 1–2: **`-4,395` net Metal LOC**; all modified/created files `< 500` LOC).
 
 ---
 

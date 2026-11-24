@@ -229,28 +229,6 @@ kernel void k_packed_bwd_grads(device const T*     qkv    [[buffer(0)]],
     }
 }
 
-// One thread per rotated pair of one row (gid.y): D pairs across Q and K.
-template <typename T>
-kernel void k_rope_qkv_packed(device T*           qkv [[buffer(0)]],
-                              device const float* ct  [[buffer(1)]],
-                              device const float* stb [[buffer(2)]],
-                              device const int*   pos [[buffer(3)]],
-                              constant uint& D        [[buffer(4)]],
-                              constant uint& half_hd  [[buffer(5)]],
-                              uint2 gid [[thread_position_in_grid]]) {
-    const uint pi = gid.x, r = gid.y;
-    if (pi >= D) return;
-    const uint sec = pi / (D / 2);
-    const uint pj = pi - sec * (D / 2);
-    const uint head = pj / half_hd, i = pj - head * half_hd;
-    device T* v = qkv + ulong(r) * 3 * D + sec * D + head * 2 * half_hd + 2 * i;
-    const ulong t = ulong(pos[r]) * half_hd + i;
-    const float c = ct[t], s = stb[t];
-    const float x0 = float(v[0]), x1 = float(v[1]);
-    v[0] = T(x0 * c - x1 * s);
-    v[1] = T(x0 * s + x1 * c);
-}
-
 // One simdgroup per segment.
 template <typename T>
 kernel void k_segment_softmax_stats(device const T*   logits [[buffer(0)]],
@@ -311,9 +289,6 @@ template [[host_name("k_packed_bwd_stats_" SUF)]] kernel void k_packed_bwd_stats
 template [[host_name("k_packed_bwd_grads_" SUF)]] kernel void k_packed_bwd_grads<T>(                     \
     device const T*, device const int*, device const T*, device const float*, device T*,                 \
     constant PackedParams&, uint, uint);                                                                 \
-template [[host_name("k_rope_qkv_packed_" SUF)]] kernel void k_rope_qkv_packed<T>(                       \
-    device T*, device const float*, device const float*, device const int*, constant uint&,             \
-    constant uint&, uint2);                                                                              \
 template [[host_name("k_segment_softmax_stats_" SUF)]] kernel void k_segment_softmax_stats<T>(           \
     device const T*, device const int*, device T*, constant uint&, uint, uint, uint, uint);
 PACKED_INST(half, "f16")
@@ -445,39 +420,6 @@ void flash_attention_packed_qkv_backward(const Tensor& QKV, const Tensor& dO, co
         bind(enc, dQKV, 4);
         [enc setBytes:&s.params length:sizeof(PackedParams) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
-}
-
-void rope_qkv_packed_inplace(Tensor& QKV, const Tensor& cos_tbl, const Tensor& sin_tbl, const Tensor& pos,
-                             int num_heads, int head_dim) {
-    constexpr const char* op = "rope_qkv_packed_inplace";
-    if (cos_tbl.dtype != Dtype::FP32 || sin_tbl.dtype != Dtype::FP32) fail(op, "cos/sin tables must be FP32");
-    if (pos.dtype != Dtype::INT32 || pos.rows != QKV.rows) fail(op, "pos must be (L, 1) INT32");
-    if (head_dim <= 0 || (head_dim & 1) || num_heads <= 0 || QKV.cols != 3 * num_heads * head_dim) {
-        fail(op, "QKV.cols must be 3 * num_heads * head_dim with head_dim even");
-    }
-    const uint32_t half_hd = static_cast<uint32_t>(head_dim / 2);
-    if (cos_tbl.cols != static_cast<int>(half_hd) || sin_tbl.cols != static_cast<int>(half_hd)) {
-        fail(op, "cos_tbl / sin_tbl must be (P, head_dim/2)");
-    }
-    id<MTLComputePipelineState> p = pso("k_rope_qkv_packed", QKV.dtype, op);
-    const int L = QKV.rows;
-    const uint32_t D = static_cast<uint32_t>(num_heads * head_dim);
-    if (L == 0) return;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:p];
-        bind(enc, QKV, 0);
-        bind(enc, cos_tbl, 1);
-        bind(enc, sin_tbl, 2);
-        bind(enc, pos, 3);
-        [enc setBytes:&D length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&half_hd length:sizeof(uint32_t) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(D, static_cast<NSUInteger>(L), 1)
-            threadsPerThreadgroup:MTLSizeMake(D < 256 ? D : 256, 1, 1)];
         [enc endEncoding];
         ::brotensor::metal_impl::submit(cmd);
     }
