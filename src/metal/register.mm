@@ -20,8 +20,6 @@
 
 namespace brotensor::detail::metal {
 
-void flush_pipeline_archive();
-
 // Forward-declare every public op in the Metal backend namespace. The op
 // table is the single source of truth for the signatures; the implementations
 // live one-per-cluster across the Metal .mm TUs.
@@ -333,7 +331,7 @@ extern "C" void brotensor_probe_and_register_metal() {
 
     dm::register_metal_interop_backend();
     ::brotensor::jit::register_pipeline_flush_hook(::brotensor::DeviceType::Metal, [](int) {
-        dm::flush_pipeline_archive();
+        ::brotensor::metal_impl::flush_pipeline_archive();
     });
     ::brotensor::detail::register_backend(Device::Metal, ops,
                                           dm::metal_alloc_table());

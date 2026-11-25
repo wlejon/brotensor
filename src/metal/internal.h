@@ -85,6 +85,9 @@ MPSGraphTensorData* tensor_data_for_offset(id<MTLBuffer> buf,
 // MSL-source compiler compile_pipeline() is in <brotensor/metal_interop.h>.)
 id<MTLComputePipelineState> pipeline(NSString* name);
 
+// Flush any newly compiled compute pipelines to the on-disk MTLBinaryArchive.
+void flush_pipeline_archive();
+
 // Helper to dispatch an in-process MSL kernel against a 1-D thread grid
 // covering n elements. Encodes onto a fresh command buffer and commits +
 // waits. For best latency, several launches in a row should batch onto one
