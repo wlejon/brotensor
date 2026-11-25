@@ -53,6 +53,15 @@ enum class MirKind : std::uint8_t {
     FaCombine = 37,
     AttnSoftmax = 38,
     ConvDirect = 39,
+    GemmRowscale = 40,
+    WqRows = 41,
+    Dequant = 42,
+    Gemv = 43,
+    GemmSimt = 44,
+    ConvSimt = 45,
+    GemvQ = 46,
+    FaRows = 47,
+    FaBwd = 48,
 };
 
 struct MirKey {
@@ -63,6 +72,7 @@ struct MirKey {
     std::uint8_t lanes = 1;
     Dtype dt2 = Dtype::FP32;
     std::uint8_t flags = 0;
+    std::uint64_t aux = 0;
 
     bool operator==(const MirKey& o) const noexcept = default;
 };
@@ -195,10 +205,15 @@ void mir_dispatch_topk(CUfunction fn, std::uint32_t gx, std::uint32_t gy,
                        const void* x, void* vals, void* idx, const void* off,
                        std::uint32_t rows, std::uint32_t cols, std::uint32_t k, std::uint32_t nseg);
 
-// ── Wave 6: select / misc / vision ──
+// ── Wave 6-12: generic argument dispatch ──
 void mir_dispatch_args(CUfunction fn, std::uint32_t gx, std::uint32_t block_x,
                        std::span<const std::uintptr_t> ptrs,
                        std::span<const std::int32_t> ints,
                        std::span<const float> flts);
+void mir_dispatch_args_3d(CUfunction fn, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
+                          std::uint32_t block_x,
+                          std::span<const std::uintptr_t> ptrs,
+                          std::span<const std::int32_t> ints,
+                          std::span<const float> flts);
 
 }  // namespace brotensor::detail::cuda

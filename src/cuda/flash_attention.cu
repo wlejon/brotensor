@@ -4,6 +4,7 @@
 #include "fp16_internal.cuh"
 #include "flash_fused_internal.cuh"
 #include "gemm_mma.cuh"
+#include "ops_fa_mir.h"
 #include "detail/cuda_check.h"
 
 #include <cuda_runtime.h>
@@ -18,10 +19,6 @@ namespace brotensor {
 void* cuda_current_stream();
 
 namespace {
-
-constexpr int FA_BLOCK = 128;
-constexpr int FA_KTILE = 64;
-constexpr int MAX_HD_PER_THREAD = 8;
 
 // ─── Per-head fallback kernels (flash_attention_forward, uncovered head_dim) ─
 
@@ -115,140 +112,6 @@ inline int grid_for(int n, int block) {
     int b = (n + block - 1) / block;
     if (b < 1) b = 1;
     return b;
-}
-
-template <typename T, bool IS_INTERIOR_TILE>
-__device__ __forceinline__ void fa_eval_tile(
-        const T* __restrict__ Q,
-        const T* __restrict__ K,
-        const T* __restrict__ V,
-        const float* __restrict__ mask,
-        float* scores, float* red, float* partial,
-        float& run_max, float& run_sum,
-        int q, int k0, int klen_runtime, int D, int head_off, int head_dim,
-        float inv_sqrt) {
-    const int tid = threadIdx.x;
-    const int klen = IS_INTERIOR_TILE ? FA_KTILE : klen_runtime;
-
-    for (int t = tid; t < klen; t += blockDim.x) {
-        const int kg = k0 + t;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            dot += fa_cvt<T>::to_f32(Q[q * D + head_off + d]) *
-                   fa_cvt<T>::to_f32(K[kg * D + head_off + d]);
-        }
-        float s = dot * inv_sqrt;
-        if constexpr (!IS_INTERIOR_TILE) {
-            if (mask && mask[kg] <= 0.5f) s = -1e30f;
-        }
-        scores[t] = s;
-    }
-    __syncthreads();
-
-    float local_max = -1e30f;
-    for (int t = tid; t < klen; t += blockDim.x) {
-        if (scores[t] > local_max) local_max = scores[t];
-    }
-    red[tid] = local_max;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            const float other = red[tid + stride];
-            if (other > red[tid]) red[tid] = other;
-        }
-        __syncthreads();
-    }
-    const float tile_max = red[0];
-    const float m_new = (tile_max > run_max) ? tile_max : run_max;
-
-    const bool tile_empty = (m_new <= -1e29f);
-    for (int t = tid; t < klen; t += blockDim.x) {
-        const float e = tile_empty ? 0.0f : __expf(scores[t] - m_new);
-        scores[t] = e;
-    }
-    __syncthreads();
-    float local_sum = 0.0f;
-    for (int t = tid; t < klen; t += blockDim.x) local_sum += scores[t];
-    red[tid] = local_sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) red[tid] += red[tid + stride];
-        __syncthreads();
-    }
-    const float tile_sum = red[0];
-    const float alpha = (run_max <= -1e29f) ? 0.0f : __expf(run_max - m_new);
-
-    int slot = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
-        if (slot >= MAX_HD_PER_THREAD) break;
-        float acc = alpha * partial[slot];
-        if constexpr (IS_INTERIOR_TILE) {
-            #pragma unroll 4
-            for (int t = 0; t < FA_KTILE; ++t) {
-                acc += scores[t] * fa_cvt<T>::to_f32(V[(k0 + t) * D + head_off + d]);
-            }
-        } else {
-            for (int t = 0; t < klen; ++t) {
-                acc += scores[t] * fa_cvt<T>::to_f32(V[(k0 + t) * D + head_off + d]);
-            }
-        }
-        partial[slot] = acc;
-    }
-
-    run_max = m_new;
-    run_sum = alpha * run_sum + tile_sum;
-    __syncthreads();
-}
-
-template <typename T>
-__global__ void flash_attention_typed_kernel(
-        const T* __restrict__ Q,
-        const T* __restrict__ K,
-        const T* __restrict__ V,
-        const float* __restrict__ mask,
-        T* __restrict__ Out,
-        int Lq, int Lk, int D, int head_dim,
-        int causal) {
-    (void)Lq;
-    extern __shared__ float s_smem[];
-    float* scores = s_smem;
-    float* red    = s_smem + FA_KTILE;
-
-    const int q = blockIdx.x;
-    const int h = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int head_off = h * head_dim;
-    const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
-
-    float run_max = -1e30f;
-    float run_sum = 0.0f;
-    float partial[MAX_HD_PER_THREAD];
-    #pragma unroll
-    for (int i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
-
-    for (int k0 = 0; k0 < Lk; k0 += FA_KTILE) {
-        if (causal && k0 > q) break;
-        int klen = (Lk - k0) < FA_KTILE ? (Lk - k0) : FA_KTILE;
-        if (causal && k0 + klen - 1 > q) klen = q - k0 + 1;
-
-        const bool is_interior = (klen == FA_KTILE) && (mask == nullptr);
-        if (is_interior) {
-            fa_eval_tile<T, true>(Q, K, V, nullptr, scores, red, partial,
-                                  run_max, run_sum, q, k0, FA_KTILE, D, head_off,
-                                  head_dim, inv_sqrt);
-        } else {
-            fa_eval_tile<T, false>(Q, K, V, mask, scores, red, partial,
-                                   run_max, run_sum, q, k0, klen, D, head_off,
-                                   head_dim, inv_sqrt);
-        }
-    }
-
-    const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
-    int slot = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
-        if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q * D + head_off + d] = fa_cvt<T>::from_f32(partial[slot] * inv);
-    }
 }
 
 } // namespace
@@ -391,34 +254,13 @@ void flash_attention_forward(const Tensor& Q,
         if (done) return;
     }
 
-    {
-        const size_t shmem = (static_cast<size_t>(FA_KTILE) + FA_BLOCK) * sizeof(float);
-        if ((head_dim + FA_BLOCK - 1) / FA_BLOCK > 8) {
-            throw std::runtime_error("flash_attention_forward: head_dim too large for register tile (max 8 * FA_BLOCK = 1024)");
-        }
-        dim3 grid(Lq, num_heads, 1);
-        cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
-        if (bf16) {
-            flash_attention_typed_kernel<__nv_bfloat16><<<grid, FA_BLOCK, shmem, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(Q.data),
-                reinterpret_cast<const __nv_bfloat16*>(K.data),
-                reinterpret_cast<const __nv_bfloat16*>(V.data),
-                d_mask,
-                reinterpret_cast<__nv_bfloat16*>(O.data),
-                Lq, Lk, D, head_dim,
-                causal ? 1 : 0);
-        } else {
-            flash_attention_typed_kernel<__half><<<grid, FA_BLOCK, shmem, stream>>>(
-                reinterpret_cast<const __half*>(Q.data),
-                reinterpret_cast<const __half*>(K.data),
-                reinterpret_cast<const __half*>(V.data),
-                d_mask,
-                reinterpret_cast<__half*>(O.data),
-                Lq, Lk, D, head_dim,
-                causal ? 1 : 0);
-        }
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    }
+    detail::cuda::dispatch_fa_rows(
+        detail::cuda::kFaModeRows, dt, Q.device,
+        Q.data, K.data, V.data, O.data,
+        d_mask, nullptr, nullptr,
+        Lq, Lk, D, D, D,
+        num_heads, num_heads, head_dim,
+        0, causal, false, 0, 0, 0.0f);
 }
 
 // Forward declarations of flash attention ops in sibling files.

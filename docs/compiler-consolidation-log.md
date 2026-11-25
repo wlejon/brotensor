@@ -753,4 +753,20 @@ Consolidated Metal's remaining non-WMMA/non-simdgroup GEMV, SIMT GEMM/Conv2D, qu
   - `src/metal/` total: `17,825 -> 14,997` LOC across `53` files (max file: `mtl_mir_cache.mm` at `892` LOC; every file strictly `< 1,000` LOC).
   - **Cumulative Metal Waves 1–12:** **`-21,688` net Metal LOC** and **51 Metal files deleted**.
 
+---
+
+## Waves 9–12 (CUDA / RTX 4090): Quant Helpers, GEMV/GEMM SIMT & FlashAttention Fwd/Bwd -> Single-Source Brass MIR
+
+Extended `src/cuda/cu_mir_cache.{h,cpp}` (`219` / `789` LOC) with `MirKind::{GemmRowscale, WqRows, Dequant, Gemv, GemmSimt, ConvSimt, GemvQ, FaRows, FaBwd}`, `MirKey::aux`, and `mir_dispatch_args_3d` lowered via `PtxTarget::emit_function` (`sm_89`):
+- **Waves 9 & 11 Quantization (`ops_quant.cpp` `402` LOC):** Wired `quantize_rows` / `dequantize_rows` onto `MirKind::WqRows`, GGUF `dequant_{q8_0,q4k,q6k}_to_fp16` onto `MirKind::Dequant`, and quantized decode GEMV (`linear_forward_batched_wq_ex`, GGUF decode GEMV, INT8/WMMA fallback in `int8_quant.cu` `342` LOC) onto `MirKind::GemvQ` while preserving `q*_wmma_internal` prefill fast paths, and deleted `linear_wq.cu`, `q4k.cu`, `q6k.cu`, and `q8_0.cu`.
+- **Wave 10 GEMV & SIMT Fallbacks (`ops_gemm_mir.{h,cpp}` `35` / `170` LOC):** Wired custom/scalar fallbacks in `matmul.cu` (`641` LOC), `fp16_matmul.cu` (`494` LOC), `gemm.cu` (`311` LOC), `batched_ops.cu` (`276` LOC), and `linear_ex.cu` (`148` LOC) onto `MirKind::{Gemv, GemmSimt, Glu}` (preserving `matmul_rm_wmma`, `mma_gemm`, `matmul_ABT_wmma`, and `gemm_skinny` TensorCore fast paths; keeping `mb <= 8` on `Gemv` and `B > 8` on `GemmSimt`, plus original `dt_bias` when GLU stages FP32 scratch).
+- **Waves 11 & 12 FlashAttention Fwd/Bwd (`ops_fa_mir.{h,cpp}` `35` / `199` LOC):** Wired row/decode/varlen/windowed/GQA/len/packed forward fallbacks across `kv_cache.cu` (`198` LOC), `flash_attention.cu` (`348` LOC), `flash_attention_varlen_windowed.cu` (`231` LOC), and `flash_attention_packed.cu` (`388` LOC) onto `MirKind::{FaRows, FaCombine}` (`smem <= 49152` bytes), wired scalar/row/packed backward across `flash_attention_backward.cu` (`632` LOC) and `flash_attention_packed_backward.cu` (`76` LOC) onto `MirKind::FaBwd` (`nt in {128, 32, 8}` with static shared `<= 49152` bytes, keeping `decode_gqa`, `flash_fused`, `fa_per_head_forward`, `flash_attention_varlen_f32_hd64`, `packed_attn_hd64`, and `tc_backward` fast paths), retired BF16/add custom kernels in `flash_attention_qkvo.cu` (`443` LOC) in favor of `linear_backward_batched` + `add_inplace`, and deleted `kv_cache_split.cuh`.
+
+### Waves 9–12 CUDA Verification & LOC Delta (RTX 4090 GPU 0, `CUDA_VISIBLE_DEVICES=0`, `brass@d5608f4`)
+- **Full CUDA `ctest` (`ctest --test-dir build-cuda -C Release --output-on-failure -LE gcstress -j 1`):** **`204 / 204` PASSED** (`3113.03 s`, `0` failures), including `gpu_mir_emit` (`0.62 s`), `backward_index_proofs` (`495.75 s`), `backward_shader_audit` (`349.58 s`), `vit_block_ops` (`476.27 s`), `cpu_gpu_parity` (`0.30 s`), `q4k_parity` (`0.35 s`), `q8_0_parity` (`0.30 s`), `q6k_parity` (`0.30 s`), `linear_wq_parity` (`4.81 s`), `linear_ex_parity` (`26.65 s`), `matmul_parity` (`6.12 s`), `matmul_abt_parity` (`8.13 s`), `gemm_fp32_parity` (`23.08 s`), `gemm_fp16_parity` (`44.32 s`), `flash_attention_parity` (`9.53 s`), `flash_attention_head_dim_parity` (`9.13 s`), `kv_cache_parity` (`18.52 s`), `packed_encoder_parity` (`16.38 s`), `cuda_graph` (`2.62 s`), `ops_fused` (`0.43 s`).
+- **LOC Delta (CUDA Waves 9–12):**
+  - Deleted 5 files (`-1,815` lines): `linear_wq.cu` (`-440`), `q4k.cu` (`-422`), `q6k.cu` (`-354`), `q8_0.cu` (`-316`), `kv_cache_split.cuh` (`-283`).
+  - Net `src/cuda/` Waves 9–12 delta: **`-3,643` lines** (`+294 / -4,778` diff across 20 files + `841` lines in `ops_quant.cpp`, `ops_gemm_mir.{h,cpp}`, `ops_fa_mir.{h,cpp}`; all modified/created files `<= 789` LOC, max across all of `src/cuda/` is `resblock.cu` at `869` LOC).
+  - **Cumulative CUDA Waves 3–12:** **`-15,849` net lines** and `56` `.cu` files + `3` `.cuh` headers deleted.
+
 

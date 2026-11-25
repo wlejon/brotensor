@@ -24,6 +24,7 @@ void linear_backward_batched(const ::brotensor::Tensor& W,
                              ::brotensor::Tensor& dX_BD,
                              ::brotensor::Tensor& dW,
                              ::brotensor::Tensor& dB);
+void add_inplace(::brotensor::Tensor& y, const ::brotensor::Tensor& x);
 void linear_forward_batched_int8w_fp16(const ::brotensor::Tensor& W_int8,
                                        const ::brotensor::Tensor& scales,
                                        const ::brotensor::Tensor* bias,
@@ -45,141 +46,6 @@ void flash_attention_backward(const ::brotensor::Tensor& Q,
                               ::brotensor::Tensor& dQ,
                               ::brotensor::Tensor& dK,
                               ::brotensor::Tensor& dV);
-
-namespace {
-
-__global__ void fa_fp16_add_inplace_kernel(__half* __restrict__ dst,
-                                           const __half* __restrict__ src,
-                                           int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = __float2half(__half2float(dst[i]) + __half2float(src[i]));
-}
-
-__global__ void fa_bf16_add_inplace_kernel(__nv_bfloat16* __restrict__ dst,
-                                           const __nv_bfloat16* __restrict__ src,
-                                           int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = __float2bfloat16(__bfloat162float(dst[i]) + __bfloat162float(src[i]));
-}
-
-__global__ void fa_lbb_dx_bf16_kernel(const __nv_bfloat16* __restrict__ W,
-                                      const __nv_bfloat16* __restrict__ dY,
-                                      __nv_bfloat16* __restrict__ dX,
-                                      int B, int out_dim, int in_dim) {
-    const int b = blockIdx.y;
-    const int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= B || j >= in_dim) return;
-    const __nv_bfloat16* dY_row = dY + static_cast<size_t>(b) * out_dim;
-    float acc = 0.0f;
-    for (int i = 0; i < out_dim; ++i) {
-        acc += __bfloat162float(W[static_cast<size_t>(i) * in_dim + j]) *
-               __bfloat162float(dY_row[i]);
-    }
-    dX[static_cast<size_t>(b) * in_dim + j] = __float2bfloat16(acc);
-}
-
-__global__ void fa_lbb_dw_bf16_kernel(const __nv_bfloat16* __restrict__ dY,
-                                      const __nv_bfloat16* __restrict__ X,
-                                      float* __restrict__ dW_scratch,
-                                      int B, int out_dim, int in_dim) {
-    const int j = blockIdx.x * blockDim.x + threadIdx.x;
-    const int i = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= out_dim || j >= in_dim) return;
-    float acc = 0.0f;
-    for (int b = 0; b < B; ++b) {
-        acc += __bfloat162float(dY[static_cast<size_t>(b) * out_dim + i]) *
-               __bfloat162float(X [static_cast<size_t>(b) * in_dim  + j]);
-    }
-    dW_scratch[static_cast<size_t>(i) * in_dim + j] = acc;
-}
-
-__global__ void fa_lbb_db_bf16_kernel(const __nv_bfloat16* __restrict__ dY,
-                                      float* __restrict__ dB_scratch,
-                                      int B, int out_dim) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= out_dim) return;
-    float acc = 0.0f;
-    for (int b = 0; b < B; ++b) {
-        acc += __bfloat162float(dY[static_cast<size_t>(b) * out_dim + i]);
-    }
-    dB_scratch[i] = acc;
-}
-
-__global__ void fa_add_fp32_into_bf16_kernel(const float* __restrict__ src,
-                                             __nv_bfloat16* __restrict__ dst,
-                                             int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = __float2bfloat16(__bfloat162float(dst[i]) + src[i]);
-}
-
-void fa_linear_backward_batched_bf16(const Tensor& W, const Tensor& X_BD,
-                                     const Tensor& dY_BD,
-                                     Tensor& dX_BD, Tensor& dW, Tensor& dB) {
-    const int out_dim = W.rows;
-    const int in_dim  = W.cols;
-    const int B       = X_BD.rows;
-    if (dX_BD.rows != B || dX_BD.cols != in_dim || dX_BD.dtype != Dtype::BF16) {
-        dX_BD.resize(B, in_dim, Dtype::BF16);
-    }
-    if (B == 0) return;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
-
-    if (in_dim > 0 && out_dim > 0) {
-        dim3 block(64, 1);
-        constexpr int kMaxGridY = 65535;
-        const int grid_x = (in_dim + 63) / 64;
-        const auto* dY_p = static_cast<const __nv_bfloat16*>(dY_BD.data);
-        auto*       dX_p = static_cast<__nv_bfloat16*>(dX_BD.data);
-        for (int b0 = 0; b0 < B; b0 += kMaxGridY) {
-            const int b_chunk = (B - b0) < kMaxGridY ? (B - b0) : kMaxGridY;
-            dim3 grid(grid_x, b_chunk);
-            fa_lbb_dx_bf16_kernel<<<grid, block, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(W.data),
-                dY_p + static_cast<size_t>(b0) * out_dim,
-                dX_p + static_cast<size_t>(b0) * in_dim,
-                b_chunk, out_dim, in_dim);
-        }
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    }
-    if (out_dim > 0 && in_dim > 0) {
-        const int dw_n = out_dim * in_dim;
-        float* d_dw_scratch = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_dw_scratch),
-                                        dw_n * sizeof(float)));
-        dim3 block(16, 16);
-        dim3 grid((in_dim + 15) / 16, (out_dim + 15) / 16);
-        fa_lbb_dw_bf16_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(dY_BD.data),
-            static_cast<const __nv_bfloat16*>(X_BD.data),
-            d_dw_scratch, B, out_dim, in_dim);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        const int blocks_fold = (dw_n + 255) / 256;
-        fa_add_fp32_into_bf16_kernel<<<blocks_fold, 256, 0, stream>>>(
-            d_dw_scratch, static_cast<__nv_bfloat16*>(dW.data), dw_n);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_dw_scratch);
-    }
-    if (out_dim > 0) {
-        float* d_db_scratch = nullptr;
-        BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_db_scratch),
-                                        out_dim * sizeof(float)));
-        const int blocks = (out_dim + 255) / 256;
-        fa_lbb_db_bf16_kernel<<<blocks, 256, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(dY_BD.data),
-            d_db_scratch, B, out_dim);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        const int blocks_fold = (out_dim + 255) / 256;
-        fa_add_fp32_into_bf16_kernel<<<blocks_fold, 256, 0, stream>>>(
-            d_db_scratch, static_cast<__nv_bfloat16*>(dB.data), out_dim);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        cudaFree(d_db_scratch);
-    }
-}
-
-} // namespace
 
 void flash_attention_project_kv(const Tensor& ctx,
                                 const Tensor& Wk, const Tensor* bk,
@@ -529,13 +395,8 @@ void flash_attention_qkvo_backward(
             scratch_db.resize(D, 1, dt);
             scratch_db.zero();
         }
-        if (bf16) {
-            fa_linear_backward_batched_bf16(Wo, O_attn, dO, dO_attn, dWo,
-                                            has_bo ? *dbo : scratch_db);
-        } else {
-            linear_backward_batched(Wo, O_attn, dO, dO_attn, dWo,
-                                    has_bo ? *dbo : scratch_db);
-        }
+        linear_backward_batched(Wo, O_attn, dO, dO_attn, dWo,
+                                has_bo ? *dbo : scratch_db);
     }
 
     Tensor dQ = Tensor::empty_on(Device::CUDA, Lq, D, dt);
@@ -553,13 +414,8 @@ void flash_attention_qkvo_backward(
             scratch_db.resize(W.rows, 1, dt);
             scratch_db.zero();
         }
-        if (bf16) {
-            fa_linear_backward_batched_bf16(W, In, dOut, dIn_out, dW_acc,
-                                            has_b ? *db_acc : scratch_db);
-        } else {
-            linear_backward_batched(W, In, dOut, dIn_out, dW_acc,
-                                    has_b ? *db_acc : scratch_db);
-        }
+        linear_backward_batched(W, In, dOut, dIn_out, dW_acc,
+                                has_b ? *db_acc : scratch_db);
     };
 
     Tensor dX_from_Q = Tensor::empty_on(Device::CUDA, Lq, D, dt);
@@ -570,27 +426,16 @@ void flash_attention_qkvo_backward(
     run_proj_back(Wk, kv_src, dK, dX_from_K, dWk, bk, dbk);
     run_proj_back(Wv, kv_src, dV, dX_from_V, dWv, bv, dbv);
 
-    auto add_into = [&](Tensor& dst, const Tensor& src, int n) {
-        const int blocks = (n + 255) / 256;
-        if (bf16) {
-            fa_bf16_add_inplace_kernel<<<blocks, 256, 0, stream>>>(
-                reinterpret_cast<__nv_bfloat16*>(dst.data),
-                reinterpret_cast<const __nv_bfloat16*>(src.data), n);
-        } else {
-            fa_fp16_add_inplace_kernel<<<blocks, 256, 0, stream>>>(
-                reinterpret_cast<__half*>(dst.data),
-                reinterpret_cast<const __half*>(src.data), n);
-        }
-    };
-    add_into(dX, dX_from_Q, Lq * D);
+    add_inplace(dX, dX_from_Q);
     if (self_attn) {
-        add_into(dX, dX_from_K, Lq * D);
-        add_into(dX, dX_from_V, Lq * D);
+        add_inplace(dX, dX_from_K);
+        add_inplace(dX, dX_from_V);
     } else {
-        add_into(*dCtx, dX_from_K, Lk * D_ctx);
-        add_into(*dCtx, dX_from_V, Lk * D_ctx);
+        add_inplace(*dCtx, dX_from_K);
+        add_inplace(*dCtx, dX_from_V);
     }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    (void)stream;
+    (void)bf16;
 }
 
 } // namespace detail::cuda

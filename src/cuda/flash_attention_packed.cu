@@ -26,6 +26,7 @@
 #include <brotensor/tensor.h>
 
 #include "detail/cuda_check.h"
+#include "ops_fa_mir.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -332,77 +333,34 @@ template <> __device__ __forceinline__ float from_f<float>(float v) { return v; 
 template <> __device__ __forceinline__ __half from_f<__half>(float v) { return __float2half(v); }
 template <> __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
 
-constexpr int GEN_MAX_PER_LANE = 8;  // head_dim <= 256
-
-template <typename T>
-__global__ void packed_attn_generic_kernel(const T* __restrict__ qkv, const int* __restrict__ bounds,
-                                           T* __restrict__ out, int L, int H, int hd, int hw, float scale) {
-    const int r = blockIdx.x;
-    const int h = blockIdx.y * (blockDim.x / 32) + threadIdx.x / 32;
-    const int lane = threadIdx.x & 31;
-    if (h >= H) return;
-    const int D = H * hd;
-    int lo, hi;
-    row_range(bounds, r, L, hw, lo, hi);
-    float q[GEN_MAX_PER_LANE], acc[GEN_MAX_PER_LANE];
-    const T* qp = qkv + static_cast<size_t>(r) * 3 * D + h * hd;
-#pragma unroll
-    for (int i = 0; i < GEN_MAX_PER_LANE; ++i) {
-        const int d = lane + 32 * i;
-        q[i] = d < hd ? to_f(qp[d]) * scale : 0.0f;
-        acc[i] = 0.0f;
-    }
-    float m = kNegInf, l = 0.0f;
-    for (int j = lo; j < hi; ++j) {
-        const T* kp = qkv + static_cast<size_t>(j) * 3 * D + D + h * hd;
-        float dot = 0.0f;
-#pragma unroll
-        for (int i = 0; i < GEN_MAX_PER_LANE; ++i) {
-            const int d = lane + 32 * i;
-            if (d < hd) dot += q[i] * to_f(kp[d]);
-        }
-#pragma unroll
-        for (int o = 16; o; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
-        const float mn = fmaxf(m, dot);
-        const float a = expf(m - mn), p = expf(dot - mn);
-        l = l * a + p;
-        m = mn;
-        const T* vp = kp + D;
-#pragma unroll
-        for (int i = 0; i < GEN_MAX_PER_LANE; ++i) {
-            const int d = lane + 32 * i;
-            if (d < hd) acc[i] = acc[i] * a + p * to_f(vp[d]);
-        }
-    }
-    T* op = out + static_cast<size_t>(r) * D + h * hd;
-    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
-#pragma unroll
-    for (int i = 0; i < GEN_MAX_PER_LANE; ++i) {
-        const int d = lane + 32 * i;
-        if (d < hd) op[d] = from_f<T>(acc[i] * inv);
-    }
-}
-
 template <typename T>
 void launch(const ::brotensor::Tensor& QKV, const int* bounds, ::brotensor::Tensor& O, int L, int H, int hd,
-            int hw) {
+            int window) {
     const T* qkv = static_cast<const T*>(QKV.data);
     T* out = static_cast<T*>(O.data);
     constexpr bool tc = !std::is_same<T, float>::value;
     if (tc && hd == PK_HD) {
         if constexpr (tc) {
             const dim3 grid((L + PK_BQ - 1) / PK_BQ, H);
+            const int hw = window > 0 ? window / 2 : -1;
             const float scale_log2 = kLog2e / sqrtf(static_cast<float>(hd));
             packed_attn_hd64_kernel<T><<<grid, PK_THREADS, 0, cur_stream()>>>(qkv, bounds, out, L, H, hw,
                                                                                scale_log2);
+            BROTENSOR_CUDA_CHECK(cudaGetLastError());
+            return;
         }
-    } else {
-        constexpr int warps = 4;
-        const dim3 grid(L, (H + warps - 1) / warps);
-        packed_attn_generic_kernel<T><<<grid, 32 * warps, 0, cur_stream()>>>(
-            qkv, bounds, out, L, H, hd, hw, 1.0f / sqrtf(static_cast<float>(hd)));
     }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    const auto dt = QKV.dtype;
+    const int D = H * hd;
+    const std::size_t esz = (dt == Dtype::FP32) ? 4u : 2u;
+    const char* base = static_cast<const char*>(QKV.data);
+    dispatch_fa_rows(kFaModePacked, dt, QKV.device,
+                     base, base + static_cast<std::size_t>(D) * esz,
+                     base + static_cast<std::size_t>(2 * D) * esz,
+                     O.data, nullptr, bounds, nullptr,
+                     L, L, 3 * D, 3 * D, D,
+                     H, H, hd,
+                     window > 0 ? window : 0, false, false, 0, 0, 0.0f);
 }
 
 }  // namespace
@@ -415,16 +373,14 @@ void flash_attention_packed_qkv_forward(const ::brotensor::Tensor& QKV, const ::
     if (seq_bounds.rows != L || seq_bounds.cols != 2) fail("seq_bounds must be (L, 2)");
     const int D = QKV.cols / 3;
     const int hd = D / num_heads;
-    if (hd > 32 * GEN_MAX_PER_LANE) fail("head_dim > 256 is not supported");
     const Dtype dt = QKV.dtype;
     if (O.rows != L || O.cols != D || O.dtype != dt) O.resize(L, D, dt);
     if (L == 0) return;
-    const int hw = window > 0 ? window / 2 : -1;
     const int* b = static_cast<const int*>(seq_bounds.data);
     switch (dt) {
-        case Dtype::FP16: launch<__half>(QKV, b, O, L, num_heads, hd, hw); break;
-        case Dtype::BF16: launch<__nv_bfloat16>(QKV, b, O, L, num_heads, hd, hw); break;
-        case Dtype::FP32: launch<float>(QKV, b, O, L, num_heads, hd, hw); break;
+        case Dtype::FP16: launch<__half>(QKV, b, O, L, num_heads, hd, window); break;
+        case Dtype::BF16: launch<__nv_bfloat16>(QKV, b, O, L, num_heads, hd, window); break;
+        case Dtype::FP32: launch<float>(QKV, b, O, L, num_heads, hd, window); break;
         default: fail("QKV must be FP32/FP16/BF16");
     }
 }

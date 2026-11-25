@@ -362,6 +362,9 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/ops_lstm.cpp
         src/cuda/ops_misc.cpp
         src/cuda/ops_norm.cpp
+        src/cuda/ops_quant.cpp
+        src/cuda/ops_gemm_mir.cpp
+        src/cuda/ops_fa_mir.cpp
         src/cuda/ops_reduce.cpp
         src/cuda/ops_rope.cpp
         src/cuda/ops_sampling.cpp
@@ -380,11 +383,8 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/conv3d.cu
         src/cuda/conv2d_int8w_wmma.cu
         src/cuda/linear_int8w_wmma.cu
-        src/cuda/q4k.cu
         src/cuda/q4k_wmma.cu
-        src/cuda/q8_0.cu
         src/cuda/q8_0_wmma.cu
-        src/cuda/q6k.cu
         src/cuda/q6k_wmma.cu
         src/cuda/flash_attention_varlen_f32.cu
         src/cuda/conv2d_igemm_f32.cu
@@ -398,7 +398,6 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/gemm_mma.cu
         src/cuda/gemm_skinny.cu
         src/cuda/linear_ex.cu
-        src/cuda/linear_wq.cu
         src/cuda/resblock.cu
         src/cuda/matmul.cu
         src/cuda/matmul_backward.cu

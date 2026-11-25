@@ -29,6 +29,7 @@
 
 #include "detail/activations.cuh"
 #include "gemm_mma.cuh"
+#include "ops_gemm_mir.h"
 
 #include <cstdlib>
 
@@ -406,32 +407,6 @@ __global__ void matmul_ABT_wmma_kernel(const T* __restrict__ A,
 // Naive fallback for tiny / unaligned problems. Batched via grid.y (the 1D
 // element grid stays in grid.x).
 template <typename T>
-__global__ void matmul_ABT_naive_kernel(const T* __restrict__ A,
-                                        const T* __restrict__ B,
-                                        T* __restrict__ C,
-                                        int M, int N, int K,
-                                        size_t strideA, size_t strideB,
-                                        size_t strideC,
-                                        const T* __restrict__ bias, int act) {
-    using TR = abt_traits<T>;
-    A += blockIdx.y * strideA;
-    B += blockIdx.y * strideB;
-    C += blockIdx.y * strideC;
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = M * N;
-    if (idx >= total) return;
-    const int m = idx / N;
-    const int n = idx % N;
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        acc += TR::to_f32(A[m * K + k]) * TR::to_f32(B[n * K + k]);
-    }
-    if (bias) acc += TR::to_f32(bias[n]);
-    acc = ::brotensor::detail::cuda::apply_linear_act(act, acc);
-    C[idx] = TR::from_f32(acc);
-}
-
-template <typename T>
 static void launch_abt(const T* A, const T* B, T* C,
                        int batch, int M, int N, int K,
                        size_t strideA, size_t strideB, size_t strideC,
@@ -452,38 +427,38 @@ static void launch_abt(const T* A, const T* B, T* C,
         return;
     }
 
-    // Use naive for very tiny problems, when K is too small for the WMMA
-    // kernel's tile shape (BK=32, WMMA_K=16), or when K/N is not a multiple
-    // of 8: the WMMA path's vectorised int4 loads of A/B (and the FP16 int4
-    // store of C) require an 8-element-aligned row stride along K (for A and B)
-    // and N (for C); the kernel does not currently emit a scalar-aligned-store
-    // fallback for those cases. Batched WMMA additionally needs 8-element-
-    // aligned batch strides so each z-slice keeps the int4 alignment.
+    // Use MIR SIMT fallback for very tiny problems, when K is too small for
+    // WMMA (BK=32, WMMA_K=16), or when K/N/batch-strides are not multiples of 8.
     const bool strides_aligned =
         batch == 1 || (((strideA | strideB | strideC) & 7) == 0);
     const bool use_naive =
         size_t(M) * size_t(N) < 256 || K < 16 ||
         (K & 7) != 0 || (N & 7) != 0 || !strides_aligned;
+    if (use_naive) {
+        const auto dt = std::is_same_v<T, __half>
+                            ? ::brotensor::Dtype::FP16
+                            : ::brotensor::Dtype::BF16;
+        ::brotensor::detail::cuda::dispatch_mir_gemm_simt(
+            A, dt, B, dt, C, dt, bias, dt,
+            batch, M, N, K, K, K, N,
+            static_cast<std::int64_t>(strideA),
+            static_cast<std::int64_t>(strideB),
+            static_cast<std::int64_t>(strideC),
+            false, false, 0, act, ::brotensor::Device::cuda(0));
+        return;
+    }
 
-    // grid.z (WMMA) / grid.y (naive) cap at 65535; chunk larger batches.
+    // grid.z caps at 65535; chunk larger batches.
     constexpr int kMaxZ = 65535;
     for (int b0 = 0; b0 < batch; b0 += kMaxZ) {
         const int nb = batch - b0 < kMaxZ ? batch - b0 : kMaxZ;
         const T* Ab = A + size_t(b0) * strideA;
         const T* Bb = B + size_t(b0) * strideB;
         T*       Cb = C + size_t(b0) * strideC;
-        if (use_naive) {
-            const int total = M * N;
-            const int block = 128;
-            dim3 grid((total + block - 1) / block, nb);
-            matmul_ABT_naive_kernel<T><<<grid, block, 0, stream>>>(
-                Ab, Bb, Cb, M, N, K, strideA, strideB, strideC, bias, act);
-        } else {
-            dim3 block(THREADS_PER_CTA);
-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, nb);
-            matmul_ABT_wmma_kernel<T><<<grid, block, 0, stream>>>(
-                Ab, Bb, Cb, M, N, K, strideA, strideB, strideC, bias, act);
-        }
+        dim3 block(THREADS_PER_CTA);
+        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM, nb);
+        matmul_ABT_wmma_kernel<T><<<grid, block, 0, stream>>>(
+            Ab, Bb, Cb, M, N, K, strideA, strideB, strideC, bias, act);
     }
 }
 

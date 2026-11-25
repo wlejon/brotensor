@@ -37,6 +37,9 @@ bool launch_linear_int8w_bf16_wmma(
         int B, int M, int K);
 }
 
+void gemv_int8w_cuda(const Tensor& W_int8, const Tensor& scales, const Tensor* bias,
+                     const Tensor& X, Tensor& Y);
+
 namespace conv2d_int8w_wmma_internal {
 bool launch_conv2d_int8w_implicit_gemm_wmma(
         const __half* X, const int8_t* W_int8, const float* scales,
@@ -55,54 +58,6 @@ void* cuda_current_stream();
 namespace {
 
 constexpr int MM_TILE = 16;
-
-// 16-bit activation load/store helpers so the fallback kernel can be a single
-// template over __half and __nv_bfloat16 (same pattern as gemm.cu's
-// g_load/g_store).
-template <typename T> __device__ inline float a16_load(const T* p);
-template <> __device__ inline float a16_load<__half>(const __half* p) { return __half2float(*p); }
-template <> __device__ inline float a16_load<__nv_bfloat16>(const __nv_bfloat16* p) { return __bfloat162float(*p); }
-template <typename T> __device__ inline void a16_store(T* p, float v);
-template <> __device__ inline void a16_store<__half>(__half* p, float v) { *p = __float2half(v); }
-template <> __device__ inline void a16_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
-
-template <typename T>
-__global__ void linear_batched_int8w_a16_kernel(const T*      __restrict__ X,
-                                                const int8_t* __restrict__ W,
-                                                const float*  __restrict__ scales,
-                                                const T*      __restrict__ bias,
-                                                T* __restrict__ Y,
-                                                int B, int M, int K) {
-    __shared__ float Xs[MM_TILE][MM_TILE];
-    __shared__ float Ws[MM_TILE][MM_TILE];
-
-    const int b = blockIdx.y * MM_TILE + threadIdx.y;
-    const int m = blockIdx.x * MM_TILE + threadIdx.x;
-    const float m_scale = (m < M) ? scales[m] : 0.0f;
-
-    float acc = 0.0f;
-    const int n_tiles = (K + MM_TILE - 1) / MM_TILE;
-    for (int t = 0; t < n_tiles; ++t) {
-        const int x_k = t * MM_TILE + threadIdx.x;
-        const int w_k = t * MM_TILE + threadIdx.y;
-
-        Xs[threadIdx.y][threadIdx.x] =
-            (b < B && x_k < K) ? a16_load<T>(&X[b * K + x_k]) : 0.0f;
-        Ws[threadIdx.y][threadIdx.x] =
-            (m < M && w_k < K) ? (static_cast<float>(W[m * K + w_k]) * m_scale)
-                               : 0.0f;
-        __syncthreads();
-        #pragma unroll
-        for (int k = 0; k < MM_TILE; ++k) {
-            acc += Xs[threadIdx.y][k] * Ws[k][threadIdx.x];
-        }
-        __syncthreads();
-    }
-    if (b < B && m < M) {
-        if (bias) acc += a16_load<T>(&bias[m]);
-        a16_store<T>(&Y[b * M + m], acc);
-    }
-}
 
 __global__ void matmul_int8w_fp16_kernel(const int8_t* __restrict__ W,
                                          const float*  __restrict__ scales,
@@ -304,22 +259,7 @@ void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
         return;
     }
 
-    dim3 block(MM_TILE, MM_TILE);
-    dim3 grid((out_dim + MM_TILE - 1) / MM_TILE, (B + MM_TILE - 1) / MM_TILE);
-    if (dt == Dtype::FP16) {
-        linear_batched_int8w_a16_kernel<__half><<<grid, block, 0, stream>>>(
-            static_cast<const __half*>(X_BD.data), w_p, s_p,
-            static_cast<const __half*>(b_p),
-            static_cast<__half*>(Y_BD.data),
-            B, out_dim, in_dim);
-    } else {  // BF16
-        linear_batched_int8w_a16_kernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(X_BD.data), w_p, s_p,
-            static_cast<const __nv_bfloat16*>(b_p),
-            static_cast<__nv_bfloat16*>(Y_BD.data),
-            B, out_dim, in_dim);
-    }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    gemv_int8w_cuda(W_int8, scales, bias, X_BD, Y_BD);
 }
 
 void conv2d_int8w_fp16_forward(const Tensor& X,

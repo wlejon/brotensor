@@ -36,6 +36,7 @@
 
 #include "detail/cuda_check.h"
 #include "gemm_mma.cuh"
+#include "ops_fa_mir.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -382,245 +383,6 @@ bool tc_backward(const T* Q, const T* K, const T* V, const T* dO, const float* m
     return true;
 }
 
-// ─── Row path (FP32 math, 3 floats of scratch per row and head) ─────────────
-//
-// One warp per (row, head), after flash_attention_packed_qkv_backward:
-//   rw_query_kernel  each query row re-runs its softmax online (max, normaliser
-//                    and its output O_r), stores (max, 1/l, D_r = dO_r . O_r),
-//                    then walks its keys again for dQ_r = scale sum_k dS_rk k_k.
-//   rw_key_kernel    each key row walks the queries attending it for
-//                    dK_k = scale sum_r dS_rk q_r and dV_k = sum_r P_rk dO_r.
-// Scores, P and dS live in FP32 registers; nothing is accumulated atomically,
-// so the result is deterministic. Two launches cover every head and every
-// varlen sequence, where the tensor-core pipeline launches per head and per
-// sequence: this path is the faster one until the per-sequence score matrix
-// is large (kRowsMaxScores). It is also the FP32 path, and the fallback
-// wherever the FP32-output GEMM does not run.
-
-// Warps per block. Consecutive warps take consecutive rows of one head, so a
-// block's warps walk the same keys (queries) together through L1.
-constexpr int kRowWarps = 8;
-
-// The sequence of packed row r under offsets cu[0..B]: the b with
-// cu[b] <= r < cu[b + 1] (an empty sequence shares its offset with the next).
-__device__ __forceinline__ int rw_seq_of(const int32_t* __restrict__ cu, int B, int r) {
-    int lo = 0, hi = B;
-    while (hi - lo > 1) {
-        const int mid = (lo + hi) >> 1;
-        if (cu[mid] <= r) lo = mid;
-        else hi = mid;
-    }
-    return lo;
-}
-
-__device__ __forceinline__ float rw_warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
-
-// Lane-strided slice of one head vector: element i of the lane is d = lane + 32 i.
-template <typename T, int NPL>
-__device__ __forceinline__ void rw_load(const T* __restrict__ p, int lane, int hd, float (&x)[NPL]) {
-#pragma unroll
-    for (int i = 0; i < NPL; ++i) {
-        const int d = lane + 32 * i;
-        x[i] = d < hd ? to_f32(p[d]) : 0.0f;
-    }
-}
-
-template <int NPL>
-__device__ __forceinline__ float rw_dot(const float (&a)[NPL], const float (&b)[NPL]) {
-    float s = 0.0f;
-#pragma unroll
-    for (int i = 0; i < NPL; ++i) s = fmaf(a[i], b[i], s);
-    return rw_warp_sum(s);
-}
-
-template <typename T, int NPL>
-__device__ __forceinline__ void rw_store(T* __restrict__ p, int lane, int hd, const float (&x)[NPL], float mul) {
-#pragma unroll
-    for (int i = 0; i < NPL; ++i) {
-        const int d = lane + 32 * i;
-        if (d < hd) p[d] = from_f32<T>(x[i] * mul);
-    }
-}
-
-// Rows [q0, q1) of the packed query axis attend keys [k0, k1). cu_q == nullptr
-// is the single block (0, nq) x (0, nk), where the key mask applies.
-struct RwSeg {
-    int q0, q1, k0, k1;
-};
-__device__ __forceinline__ RwSeg rw_seg(const int32_t* cu_q, const int32_t* cu_k, int b, int nq, int nk) {
-    if (!cu_q) return {0, nq, 0, nk};
-    return {cu_q[b], cu_q[b + 1], cu_k[b], cu_k[b + 1]};
-}
-
-template <typename T, int NPL>
-__global__ void rw_query_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __restrict__ V,
-                                const T* __restrict__ dO, int ld, int H, int hd, const int32_t* __restrict__ cu_q,
-                                const int32_t* __restrict__ cu_k, int B, int nq, int nk,
-                                const float* __restrict__ mask, int causal, float scale, float scale_log2,
-                                float* __restrict__ stats, T* __restrict__ dQ) {
-    const long long warp = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
-    const int lane = threadIdx.x & 31;
-    if (warp >= static_cast<long long>(nq) * H) return;
-    const int h = static_cast<int>(warp / nq), r = static_cast<int>(warp % nq);
-    const RwSeg sg = rw_seg(cu_q, cu_k, cu_q ? rw_seq_of(cu_q, B, r) : 0, nq, nk);
-    const int k1 = causal ? min(sg.k1, sg.k0 + (r - sg.q0) + 1) : sg.k1;
-    const int c0 = h * hd;
-
-    float q[NPL], g[NPL], kk[NPL], vv[NPL], acc[NPL];
-    rw_load<T, NPL>(Q + static_cast<size_t>(r) * ld + c0, lane, hd, q);
-    rw_load<T, NPL>(dO + static_cast<size_t>(r) * ld + c0, lane, hd, g);
-#pragma unroll
-    for (int i = 0; i < NPL; ++i) acc[i] = 0.0f;
-
-    // Pass 1: max (log2 domain), normaliser and O_r, online.
-    float m = neg_inf(), l = 0.0f;
-    for (int k = sg.k0; k < k1; ++k) {
-        if (mask && mask[k - sg.k0] <= 0.5f) continue;
-        const T* kr = K + static_cast<size_t>(k) * ld + c0;
-        rw_load<T, NPL>(kr, lane, hd, kk);
-        rw_load<T, NPL>(V + static_cast<size_t>(k) * ld + c0, lane, hd, vv);
-        const float s = rw_dot<NPL>(q, kk) * scale_log2;
-        if (s > m) {
-            const float f = exp2f(m - s);  // 0 on the first key
-            l = fmaf(l, f, 1.0f);
-#pragma unroll
-            for (int i = 0; i < NPL; ++i) acc[i] = fmaf(acc[i], f, vv[i]);
-            m = s;
-        } else {
-            const float e = exp2f(s - m);
-            l += e;
-#pragma unroll
-            for (int i = 0; i < NPL; ++i) acc[i] = fmaf(e, vv[i], acc[i]);
-        }
-    }
-    const bool any = l > 0.0f;
-    const float inv_l = any ? 1.0f / l : 0.0f;
-    const float D = rw_dot<NPL>(g, acc) * inv_l;
-    if (!any) m = 0.0f;
-    if (lane == 0) {
-        float* st = stats + 3 * static_cast<size_t>(warp);
-        st[0] = m;
-        st[1] = inv_l;
-        st[2] = D;
-    }
-
-    // Pass 2: dQ_r = scale * sum_k P (dP - D) k_k.
-#pragma unroll
-    for (int i = 0; i < NPL; ++i) acc[i] = 0.0f;
-    if (any) {
-        for (int k = sg.k0; k < k1; ++k) {
-            if (mask && mask[k - sg.k0] <= 0.5f) continue;
-            rw_load<T, NPL>(K + static_cast<size_t>(k) * ld + c0, lane, hd, kk);
-            rw_load<T, NPL>(V + static_cast<size_t>(k) * ld + c0, lane, hd, vv);
-            const float p = exp2f(fmaf(rw_dot<NPL>(q, kk), scale_log2, -m)) * inv_l;
-            const float ds = p * (rw_dot<NPL>(g, vv) - D);
-#pragma unroll
-            for (int i = 0; i < NPL; ++i) acc[i] = fmaf(ds, kk[i], acc[i]);
-        }
-    }
-    rw_store<T, NPL>(dQ + static_cast<size_t>(r) * ld + c0, lane, hd, acc, scale);
-}
-
-template <typename T, int NPL>
-__global__ void rw_key_kernel(const T* __restrict__ Q, const T* __restrict__ K, const T* __restrict__ V,
-                              const T* __restrict__ dO, int ld, int H, int hd, const int32_t* __restrict__ cu_q,
-                              const int32_t* __restrict__ cu_k, int B, int nq, int nk,
-                              const float* __restrict__ mask, int causal, float scale, float scale_log2,
-                              const float* __restrict__ stats, T* __restrict__ dK, T* __restrict__ dV) {
-    const long long warp = (static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
-    const int lane = threadIdx.x & 31;
-    if (warp >= static_cast<long long>(nk) * H) return;
-    const int h = static_cast<int>(warp / nk), j = static_cast<int>(warp % nk);
-    const RwSeg sg = rw_seg(cu_q, cu_k, cu_k ? rw_seq_of(cu_k, B, j) : 0, nq, nk);
-    const int kj = j - sg.k0;
-    const int c0 = h * hd;
-    const float* sth = stats + 3 * static_cast<size_t>(h) * nq;
-
-    float kk[NPL], vv[NPL], q[NPL], g[NPL], dk[NPL], dv[NPL];
-#pragma unroll
-    for (int i = 0; i < NPL; ++i) dk[i] = dv[i] = 0.0f;
-    if (!(mask && mask[kj] <= 0.5f)) {
-        rw_load<T, NPL>(K + static_cast<size_t>(j) * ld + c0, lane, hd, kk);
-        rw_load<T, NPL>(V + static_cast<size_t>(j) * ld + c0, lane, hd, vv);
-        for (int r = causal ? sg.q0 + kj : sg.q0; r < sg.q1; ++r) {
-            const float* st = sth + 3 * static_cast<size_t>(r);
-            rw_load<T, NPL>(Q + static_cast<size_t>(r) * ld + c0, lane, hd, q);
-            rw_load<T, NPL>(dO + static_cast<size_t>(r) * ld + c0, lane, hd, g);
-            const float p = exp2f(fmaf(rw_dot<NPL>(q, kk), scale_log2, -st[0])) * st[1];
-            const float ds = p * (rw_dot<NPL>(g, vv) - st[2]);
-#pragma unroll
-            for (int i = 0; i < NPL; ++i) {
-                dk[i] = fmaf(ds, q[i], dk[i]);
-                dv[i] = fmaf(p, g[i], dv[i]);
-            }
-        }
-    }
-    rw_store<T, NPL>(dK + static_cast<size_t>(j) * ld + c0, lane, hd, dk, scale);
-    rw_store<T, NPL>(dV + static_cast<size_t>(j) * ld + c0, lane, hd, dv, 1.0f);
-}
-
-template <typename T, int NPL>
-void rows_launch(const Tensor& Q, const Tensor& K, const Tensor& V, const Tensor& dO, const int32_t* cu_q,
-                 const int32_t* cu_k, int B, const float* mask, bool causal, int H, int hd, Tensor& dQ, Tensor& dK,
-                 Tensor& dV, cudaStream_t stream) {
-    const int nq = Q.rows, nk = K.rows, ld = Q.cols;
-    const float scale = 1.0f / sqrtf(static_cast<float>(hd));
-    const float scale_log2 = scale * 1.4426950408889634f;
-    Tensor stats = Tensor::empty_on(Device::CUDA, nq * H, 3, Dtype::FP32);
-    const T* q = static_cast<const T*>(Q.data);
-    const T* k = static_cast<const T*>(K.data);
-    const T* v = static_cast<const T*>(V.data);
-    const T* g = static_cast<const T*>(dO.data);
-    float* st = static_cast<float*>(stats.data);
-    constexpr int threads = 32 * kRowWarps;
-    const int cz = causal ? 1 : 0;
-    rw_query_kernel<T, NPL><<<grid_for(static_cast<long long>(nq) * H * 32, threads), threads, 0, stream>>>(
-        q, k, v, g, ld, H, hd, cu_q, cu_k, B, nq, nk, mask, cz, scale, scale_log2, st, static_cast<T*>(dQ.data));
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-    rw_key_kernel<T, NPL><<<grid_for(static_cast<long long>(nk) * H * 32, threads), threads, 0, stream>>>(
-        q, k, v, g, ld, H, hd, cu_q, cu_k, B, nq, nk, mask, cz, scale, scale_log2, st, static_cast<T*>(dK.data),
-        static_cast<T*>(dV.data));
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
-}
-
-template <typename T>
-void rows_backward_t(const Tensor& Q, const Tensor& K, const Tensor& V, const Tensor& dO, const int32_t* cu_q,
-                     const int32_t* cu_k, int B, const float* mask, bool causal, int H, int hd, Tensor& dQ,
-                     Tensor& dK, Tensor& dV, cudaStream_t stream) {
-#define BT_RW(N) rows_launch<T, N>(Q, K, V, dO, cu_q, cu_k, B, mask, causal, H, hd, dQ, dK, dV, stream)
-    switch ((hd + 31) / 32) {
-    case 1: BT_RW(1); break;
-    case 2: BT_RW(2); break;
-    case 3: BT_RW(3); break;
-    case 4: BT_RW(4); break;
-    case 5: BT_RW(5); break;
-    case 6: BT_RW(6); break;
-    case 7:
-    case 8: BT_RW(8); break;
-    default:
-        throw std::runtime_error("flash_attention_backward: head_dim above 256 needs the tensor-core path (sm_80+)");
-    }
-#undef BT_RW
-}
-
-// The row path over the whole call: Q / dO / dQ have Q.rows rows, K / V / dK /
-// dV K.rows, row stride Q.cols. cu_q / cu_k (device, B + 1 offsets) or, when
-// null, one block with the key mask.
-void rows_backward(Dtype dt, const Tensor& Q, const Tensor& K, const Tensor& V, const Tensor& dO,
-                   const int32_t* cu_q, const int32_t* cu_k, int B, const float* mask, bool causal, int H, int hd,
-                   Tensor& dQ, Tensor& dK, Tensor& dV, cudaStream_t stream) {
-    if (dt == Dtype::FP32)
-        rows_backward_t<float>(Q, K, V, dO, cu_q, cu_k, B, mask, causal, H, hd, dQ, dK, dV, stream);
-    else if (dt == Dtype::BF16)
-        rows_backward_t<__nv_bfloat16>(Q, K, V, dO, cu_q, cu_k, B, mask, causal, H, hd, dQ, dK, dV, stream);
-    else
-        rows_backward_t<__half>(Q, K, V, dO, cu_q, cu_k, B, mask, causal, H, hd, dQ, dK, dV, stream);
-}
-
 // One block of rows (query rows from q_row, key rows from k_row) through the
 // tensor-core pipeline; false, having written nothing, when it cannot run.
 bool tc_block(Dtype dt, const Tensor& Q, const Tensor& K, const Tensor& V, const Tensor& dO, const float* mask,
@@ -732,7 +494,12 @@ void flash_attention_backward(const Tensor& Q,
     if (!prefer_rows({0, Lq}, {0, Lk}, num_heads, hd, causal) &&
         tc_block(dt, Q, K, V, dO, d_mask, causal, dQ, dK, dV, 0, 0, Lq, Lk, D, num_heads, hd, stream))
         return;
-    rows_backward(dt, Q, K, V, dO, nullptr, nullptr, 1, d_mask, causal, num_heads, hd, dQ, dK, dV, stream);
+    dispatch_fa_bwd(kFaModeRows, dt, Q.device,
+                    Q.data, K.data, V.data, dO.data,
+                    d_mask, nullptr, nullptr,
+                    dQ.data, dK.data, dV.data,
+                    Lq, Lk, D, D, D, D,
+                    num_heads, hd, 0, causal, 0);
 }
 
 // ─── flash_attention_varlen_backward ────────────────────────────────────────
@@ -852,9 +619,12 @@ void flash_attention_varlen_backward(const Tensor& Q,
         if (!refused) return;
         if (ran) throw std::runtime_error("flash_attention_varlen_backward: tensor-core path refused mid-call");
     }
-    // Rows of a sequence with no keys (or no queries) write zeros here too.
-    rows_backward(dt, Q, K, V, dO, cu_seqlens_q, cu_seqlens_k, batch_size, nullptr, causal, num_heads, head_dim, dQ,
-                  dK, dV, stream);
+    dispatch_fa_bwd(kFaModeVarlen, dt, Q.device,
+                    Q.data, K.data, V.data, dO.data,
+                    nullptr, cu_seqlens_q, cu_seqlens_k,
+                    dQ.data, dK.data, dV.data,
+                    total_q, total_k, D, D, D, D,
+                    num_heads, head_dim, 0, causal, batch_size);
 }
 
 } // namespace detail::cuda

@@ -2,6 +2,7 @@
 
 #include "detail/cuda_check.h"
 #include "decode_gqa.cuh"
+#include "ops_fa_mir.h"
 
 #include <brotensor/tensor.h>
 
@@ -62,412 +63,6 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
         V_new.data, bytes, cudaMemcpyDeviceToDevice, cur_stream()));
 }
 
-namespace {
-
-constexpr int FAD_BLOCK = 128;
-constexpr int FAD_KTILE = 64;
-
-// Gemma-2 tanh logit soft-cap on an already-scaled score. softcap <= 0 is a
-// no-op (returns s untouched), so the default path stays bit-identical.
-__device__ __forceinline__ float fad_softcap(float s, float softcap) {
-    return softcap > 0.0f ? softcap * tanhf(s / softcap) : s;
-}
-
-__global__ void flash_attention_decode_kernel(
-        const __half* __restrict__ Q,
-        const __half* __restrict__ K,
-        const __half* __restrict__ V,
-        __half* __restrict__ Out,
-        int Lq, int valid_len, int Dq, int Dkv, int head_dim, int seq_offset,
-        int group, float softcap, int window) {
-    extern __shared__ float s_smem[];
-    float* scores = s_smem;
-    float* red    = s_smem + FAD_KTILE;
-
-    const int q   = blockIdx.x;
-    const int h   = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
-    const int kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
-    const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
-    const int p_q = seq_offset + q;
-    // Sliding-window lower bound: keys below `lo` are out of band. window <= 0
-    // leaves lo == 0 (unbounded causal) — bit-identical to the pre-window path.
-    const int lo = (window > 0) ? (p_q - window + 1 < 0 ? 0 : p_q - window + 1) : 0;
-
-    constexpr int MAX_HD_PER_THREAD = 8;
-    float partial[MAX_HD_PER_THREAD];
-    #pragma unroll
-    for (int i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
-
-    float run_max = -1e30f;
-    float run_sum = 0.0f;
-
-    for (int k0 = 0; k0 < valid_len; k0 += FAD_KTILE) {
-        if (k0 > p_q) break;
-        int klen = (valid_len - k0) < FAD_KTILE ? (valid_len - k0) : FAD_KTILE;
-        if (k0 + klen - 1 > p_q) klen = p_q - k0 + 1;
-
-        for (int t = tid; t < klen; t += blockDim.x) {
-            const int kg = k0 + t;
-            if (kg < lo) { scores[t] = -1e30f; continue; }   // out of window
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; ++d) {
-                dot += __half2float(Q[q * Dq + q_head_off + d]) *
-                       __half2float(K[kg * Dkv + kv_head_off + d]);
-            }
-            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
-        }
-        __syncthreads();
-
-        float local_max = -1e30f;
-        for (int t = tid; t < klen; t += blockDim.x) {
-            if (scores[t] > local_max) local_max = scores[t];
-        }
-        red[tid] = local_max;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                const float other = red[tid + stride];
-                if (other > red[tid]) red[tid] = other;
-            }
-            __syncthreads();
-        }
-        const float tile_max = red[0];
-        const float m_new = (tile_max > run_max) ? tile_max : run_max;
-        const bool tile_empty = (m_new <= -1e29f);
-
-        for (int t = tid; t < klen; t += blockDim.x) {
-            const float e = tile_empty ? 0.0f : __expf(scores[t] - m_new);
-            scores[t] = e;
-        }
-        __syncthreads();
-        float local_sum = 0.0f;
-        for (int t = tid; t < klen; t += blockDim.x) local_sum += scores[t];
-        red[tid] = local_sum;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) red[tid] += red[tid + stride];
-            __syncthreads();
-        }
-        const float tile_sum = red[0];
-
-        float alpha;
-        if (run_max <= -1e29f) {
-            alpha = 0.0f;
-        } else {
-            alpha = __expf(run_max - m_new);
-        }
-
-        int slot = 0;
-        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
-            if (slot >= MAX_HD_PER_THREAD) break;
-            float acc = alpha * partial[slot];
-            for (int t = 0; t < klen; ++t) {
-                acc += scores[t] *
-                       __half2float(V[(k0 + t) * Dkv + kv_head_off + d]);
-            }
-            partial[slot] = acc;
-        }
-
-        run_max = m_new;
-        run_sum = alpha * run_sum + tile_sum;
-        __syncthreads();
-    }
-
-    const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
-    int slot = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
-        if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q * Dq + q_head_off + d] = __float2half(partial[slot] * inv);
-    }
-}
-
-// Masked fixed-capacity single-query decode — the CUDA-graph-capturable twin
-// of the kernel above. Iterates every tile of the full (cap, ·) cache with NO
-// host-side length anywhere in the launch, so the captured launch replays
-// unchanged as generation advances; a device-resident FP32 key mask carries
-// validity instead. Masked keys score -1e30 (their softmax weights underflow
-// to exact 0.0f, and adding exact zeros leaves every reduction bit-identical
-// to the length-truncated kernel), and fully-masked tiles are skipped before
-// any K/V traffic. Templated over storage type instead of the twin-copy
-// pattern; numerics are unchanged — all math stays FP32.
-
-template <typename T> __device__ inline float fadm_ld(const T& v);
-template <> __device__ inline float fadm_ld<__half>(const __half& v) { return __half2float(v); }
-template <> __device__ inline float fadm_ld<__nv_bfloat16>(const __nv_bfloat16& v) { return __bfloat162float(v); }
-template <typename T> __device__ inline void fadm_st(T& dst, float v);
-template <> __device__ inline void fadm_st<__half>(__half& dst, float v) { dst = __float2half(v); }
-template <> __device__ inline void fadm_st<__nv_bfloat16>(__nv_bfloat16& dst, float v) { dst = __float2bfloat16(v); }
-template <typename T> struct FadmT2;
-template <> struct FadmT2<__half> { using type = __half2; };
-template <> struct FadmT2<__nv_bfloat16> { using type = __nv_bfloat162; };
-
-template <typename T>
-__global__ void flash_attention_decode_masked_kernel(
-        const T* __restrict__ Q,
-        const T* __restrict__ K,
-        const T* __restrict__ V,
-        const float* __restrict__ mask,
-        T* __restrict__ Out,
-        int cap, int Dq, int Dkv, int head_dim, int group,
-        float softcap, int window) {
-    extern __shared__ float s_smem[];
-    float* scores = s_smem;
-    float* red    = s_smem + FAD_KTILE;
-
-    const int h   = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
-    const int kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
-    const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
-
-    // Sliding-window lower bound. window <= 0 keeps the full valid set (lo == 0,
-    // bit-identical to the pre-window path). Otherwise the query sits at the
-    // highest valid key index p_max; keep keys in (p_max - window, p_max].
-    int lo = 0;
-    if (window > 0) {
-        float local_pmax = -1.0f;
-        for (int kg = tid; kg < cap; kg += blockDim.x) {
-            if (mask[kg] > 0.5f) local_pmax = fmaxf(local_pmax, static_cast<float>(kg));
-        }
-        red[tid] = local_pmax;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) red[tid] = fmaxf(red[tid], red[tid + stride]);
-            __syncthreads();
-        }
-        const int p_max = static_cast<int>(red[0]);
-        __syncthreads();
-        if (p_max >= 0) { lo = p_max - window + 1; if (lo < 0) lo = 0; }
-    }
-
-    constexpr int MAX_HD_PER_THREAD = 8;
-    float partial[MAX_HD_PER_THREAD];
-    #pragma unroll
-    for (int i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
-
-    float run_max = -1e30f;
-    float run_sum = 0.0f;
-
-    for (int k0 = 0; k0 < cap; k0 += FAD_KTILE) {
-        const int klen = (cap - k0) < FAD_KTILE ? (cap - k0) : FAD_KTILE;
-
-        // Tile skip: reduce "any valid key here?" before touching K/V. A
-        // generation cache is a valid prefix, so every tile past the cursor
-        // costs one strided mask scan and one block reduce, nothing more.
-        float any = 0.0f;
-        for (int t = tid; t < klen; t += blockDim.x) {
-            if (mask[k0 + t] > 0.5f) any = 1.0f;
-        }
-        red[tid] = any;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) red[tid] += red[tid + stride];
-            __syncthreads();
-        }
-        const bool tile_any = red[0] > 0.0f;
-        __syncthreads();   // red[] is reused below
-        if (!tile_any) continue;
-
-        for (int t = tid; t < klen; t += blockDim.x) {
-            const int kg = k0 + t;
-            if (mask[kg] <= 0.5f || kg < lo) {
-                scores[t] = -1e30f;   // dropped key — weight becomes exact 0
-                continue;
-            }
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; ++d) {
-                dot += fadm_ld(Q[q_head_off + d]) *
-                       fadm_ld(K[static_cast<size_t>(kg) * Dkv + kv_head_off + d]);
-            }
-            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
-        }
-        __syncthreads();
-
-        float local_max = -1e30f;
-        for (int t = tid; t < klen; t += blockDim.x) {
-            if (scores[t] > local_max) local_max = scores[t];
-        }
-        red[tid] = local_max;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                const float other = red[tid + stride];
-                if (other > red[tid]) red[tid] = other;
-            }
-            __syncthreads();
-        }
-        const float tile_max = red[0];
-        const float m_new = (tile_max > run_max) ? tile_max : run_max;
-        const bool tile_empty = (m_new <= -1e29f);
-
-        for (int t = tid; t < klen; t += blockDim.x) {
-            const float e = tile_empty ? 0.0f : __expf(scores[t] - m_new);
-            scores[t] = e;
-        }
-        __syncthreads();
-        float local_sum = 0.0f;
-        for (int t = tid; t < klen; t += blockDim.x) local_sum += scores[t];
-        red[tid] = local_sum;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) red[tid] += red[tid + stride];
-            __syncthreads();
-        }
-        const float tile_sum = red[0];
-
-        float alpha;
-        if (run_max <= -1e29f) {
-            alpha = 0.0f;
-        } else {
-            alpha = __expf(run_max - m_new);
-        }
-
-        int slot = 0;
-        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
-            if (slot >= MAX_HD_PER_THREAD) break;
-            float acc = alpha * partial[slot];
-            for (int t = 0; t < klen; ++t) {
-                const float s = scores[t];
-                // Zero-weight keys add exactly nothing for any finite V, and
-                // masked rows may hold garbage (even NaN bit patterns) that
-                // 0*v would otherwise propagate — skip the V read entirely.
-                if (s == 0.0f) continue;
-                acc += s *
-                       fadm_ld(V[static_cast<size_t>(k0 + t) * Dkv + kv_head_off + d]);
-            }
-            partial[slot] = acc;
-        }
-
-        run_max = m_new;
-        run_sum = alpha * run_sum + tile_sum;
-        __syncthreads();
-    }
-
-    const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
-    int slot = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
-        if (slot >= MAX_HD_PER_THREAD) break;
-        fadm_st(Out[q_head_off + d], partial[slot] * inv);
-    }
-}
-
-// BF16 twin: verbatim copy of flash_attention_decode_kernel with
-// __half -> __nv_bfloat16, __half2float -> __bfloat162float,
-// __float2half -> __float2bfloat16.
-__global__ void flash_attention_decode_bf16_kernel(
-        const __nv_bfloat16* __restrict__ Q,
-        const __nv_bfloat16* __restrict__ K,
-        const __nv_bfloat16* __restrict__ V,
-        __nv_bfloat16* __restrict__ Out,
-        int Lq, int valid_len, int Dq, int Dkv, int head_dim, int seq_offset,
-        int group, float softcap, int window) {
-    extern __shared__ float s_smem[];
-    float* scores = s_smem;
-    float* red    = s_smem + FAD_KTILE;
-
-    const int q   = blockIdx.x;
-    const int h   = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int q_head_off  = h * head_dim;             // Q/Out (Dq-wide)
-    const int kv_head_off = (h / group) * head_dim;   // K/V (Dkv-wide), GQA group
-    const float inv_sqrt = rsqrtf(static_cast<float>(head_dim));
-    const int p_q = seq_offset + q;
-    const int lo = (window > 0) ? (p_q - window + 1 < 0 ? 0 : p_q - window + 1) : 0;
-
-    constexpr int MAX_HD_PER_THREAD = 8;
-    float partial[MAX_HD_PER_THREAD];
-    #pragma unroll
-    for (int i = 0; i < MAX_HD_PER_THREAD; ++i) partial[i] = 0.0f;
-
-    float run_max = -1e30f;
-    float run_sum = 0.0f;
-
-    for (int k0 = 0; k0 < valid_len; k0 += FAD_KTILE) {
-        if (k0 > p_q) break;
-        int klen = (valid_len - k0) < FAD_KTILE ? (valid_len - k0) : FAD_KTILE;
-        if (k0 + klen - 1 > p_q) klen = p_q - k0 + 1;
-
-        for (int t = tid; t < klen; t += blockDim.x) {
-            const int kg = k0 + t;
-            if (kg < lo) { scores[t] = -1e30f; continue; }   // out of window
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; ++d) {
-                dot += __bfloat162float(Q[q * Dq + q_head_off + d]) *
-                       __bfloat162float(K[kg * Dkv + kv_head_off + d]);
-            }
-            scores[t] = fad_softcap(dot * inv_sqrt, softcap);
-        }
-        __syncthreads();
-
-        float local_max = -1e30f;
-        for (int t = tid; t < klen; t += blockDim.x) {
-            if (scores[t] > local_max) local_max = scores[t];
-        }
-        red[tid] = local_max;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                const float other = red[tid + stride];
-                if (other > red[tid]) red[tid] = other;
-            }
-            __syncthreads();
-        }
-        const float tile_max = red[0];
-        const float m_new = (tile_max > run_max) ? tile_max : run_max;
-        const bool tile_empty = (m_new <= -1e29f);
-
-        for (int t = tid; t < klen; t += blockDim.x) {
-            const float e = tile_empty ? 0.0f : __expf(scores[t] - m_new);
-            scores[t] = e;
-        }
-        __syncthreads();
-        float local_sum = 0.0f;
-        for (int t = tid; t < klen; t += blockDim.x) local_sum += scores[t];
-        red[tid] = local_sum;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) red[tid] += red[tid + stride];
-            __syncthreads();
-        }
-        const float tile_sum = red[0];
-
-        float alpha;
-        if (run_max <= -1e29f) {
-            alpha = 0.0f;
-        } else {
-            alpha = __expf(run_max - m_new);
-        }
-
-        int slot = 0;
-        for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
-            if (slot >= MAX_HD_PER_THREAD) break;
-            float acc = alpha * partial[slot];
-            for (int t = 0; t < klen; ++t) {
-                acc += scores[t] *
-                       __bfloat162float(V[(k0 + t) * Dkv + kv_head_off + d]);
-            }
-            partial[slot] = acc;
-        }
-
-        run_max = m_new;
-        run_sum = alpha * run_sum + tile_sum;
-        __syncthreads();
-    }
-
-    const float inv = (run_sum > 0.0f) ? (1.0f / run_sum) : 0.0f;
-    int slot = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++slot) {
-        if (slot >= MAX_HD_PER_THREAD) break;
-        Out[q * Dq + q_head_off + d] = __float2bfloat16(partial[slot] * inv);
-    }
-}
-
-#include "kv_cache_split.cuh"
-
-} // namespace
-
 void flash_attention_decode(const Tensor& Q,
                             const Tensor& K_cache, const Tensor& V_cache,
                             int valid_len, int num_q_heads, int num_kv_heads,
@@ -503,71 +98,17 @@ void flash_attention_decode(const Tensor& Q,
     if (Dkv / num_kv_heads != head_dim) {
         throw std::runtime_error("flash_attention_decode: head_dim mismatch between Q and K/V");
     }
-    const int group = num_q_heads / num_kv_heads;   // q heads served per kv head
-    if ((head_dim + FAD_BLOCK - 1) / FAD_BLOCK > 8) {
-        throw std::runtime_error("flash_attention_decode: head_dim too large (max 8 * FAD_BLOCK = 1024)");
-    }
     if (O.rows != Lq || O.cols != Dq || O.dtype != Q.dtype) {
         O.resize(Lq, Dq, Q.dtype);
     }
     if (Lq == 0 || Dq == 0 || valid_len == 0) return;
 
-    if (Lq == 1 && fad_split_eligible(head_dim)) {
-        const int cap = K_cache.rows;
-        int n_splits = 0, tps = 0;
-        fad_split_dims(cap, n_splits, tps);
-        float* ws = fad_split_workspace(static_cast<size_t>(num_q_heads) *
-                                        n_splits * (head_dim + 2));
-        const dim3 g1(n_splits, num_q_heads, 1);
-        if (Q.dtype == Dtype::FP16) {
-            fad_split_partials_kernel<__half, false>
-                <<<g1, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-                    static_cast<const __half*>(Q.data),
-                    static_cast<const __half*>(K_cache.data),
-                    static_cast<const __half*>(V_cache.data),
-                    nullptr, ws, cap, valid_len, Dq, Dkv, head_dim, group,
-                    tps, n_splits, attn_softcap, window);
-            fad_split_reduce_kernel<__half>
-                <<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-                    ws, static_cast<__half*>(O.data), head_dim, n_splits);
-        } else {
-            fad_split_partials_kernel<__nv_bfloat16, false>
-                <<<g1, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-                    static_cast<const __nv_bfloat16*>(Q.data),
-                    static_cast<const __nv_bfloat16*>(K_cache.data),
-                    static_cast<const __nv_bfloat16*>(V_cache.data),
-                    nullptr, ws, cap, valid_len, Dq, Dkv, head_dim, group,
-                    tps, n_splits, attn_softcap, window);
-            fad_split_reduce_kernel<__nv_bfloat16>
-                <<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-                    ws, static_cast<__nv_bfloat16*>(O.data), head_dim,
-                    n_splits);
-        }
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-
-    const int seq_offset = valid_len - Lq;
-    const size_t shmem = (static_cast<size_t>(FAD_KTILE) + FAD_BLOCK) * sizeof(float);
-    dim3 grid(Lq, num_q_heads, 1);
-    if (Q.dtype == Dtype::FP16) {
-        flash_attention_decode_kernel<<<grid, FAD_BLOCK, shmem, cur_stream()>>>(
-            static_cast<const __half*>(Q.data),
-            static_cast<const __half*>(K_cache.data),
-            static_cast<const __half*>(V_cache.data),
-            static_cast<__half*>(O.data),
-            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, group,
-            attn_softcap, window);
-    } else {
-        flash_attention_decode_bf16_kernel<<<grid, FAD_BLOCK, shmem, cur_stream()>>>(
-            static_cast<const __nv_bfloat16*>(Q.data),
-            static_cast<const __nv_bfloat16*>(K_cache.data),
-            static_cast<const __nv_bfloat16*>(V_cache.data),
-            static_cast<__nv_bfloat16*>(O.data),
-            Lq, valid_len, Dq, Dkv, head_dim, seq_offset, group,
-            attn_softcap, window);
-    }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    dispatch_fa_rows(kFaModeRows, Q.dtype, Q.device,
+                     Q.data, K_cache.data, V_cache.data, O.data,
+                     nullptr, nullptr, nullptr,
+                     Lq, valid_len, Dq, Dkv, Dq,
+                     num_q_heads, num_kv_heads, head_dim,
+                     window, true, false, 0, valid_len - Lq, attn_softcap);
 }
 
 void flash_attention_decode_masked(const Tensor& Q,
@@ -610,69 +151,17 @@ void flash_attention_decode_masked(const Tensor& Q,
     if (Dkv / num_kv_heads != head_dim) {
         throw std::runtime_error("flash_attention_decode_masked: head_dim mismatch between Q and K/V");
     }
-    const int group = num_q_heads / num_kv_heads;
-    if ((head_dim + FAD_BLOCK - 1) / FAD_BLOCK > 8) {
-        throw std::runtime_error("flash_attention_decode_masked: head_dim too large (max 8 * FAD_BLOCK = 1024)");
-    }
     if (O.rows != 1 || O.cols != Dq || O.dtype != Q.dtype) {
         O.resize(1, Dq, Q.dtype);
     }
     if (Dq == 0 || cap == 0) return;
 
-    if (fad_split_eligible(head_dim)) {
-        int n_splits = 0, tps = 0;
-        fad_split_dims(cap, n_splits, tps);
-        float* ws = fad_split_workspace(static_cast<size_t>(num_q_heads) *
-                                        n_splits * (head_dim + 2));
-        const dim3 g1(n_splits, num_q_heads, 1);
-        if (Q.dtype == Dtype::FP16) {
-            fad_split_partials_kernel<__half, true>
-                <<<g1, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-                    static_cast<const __half*>(Q.data),
-                    static_cast<const __half*>(K_cache.data),
-                    static_cast<const __half*>(V_cache.data),
-                    d_mask, ws, cap, /*valid_len=*/cap, Dq, Dkv, head_dim,
-                    group, tps, n_splits, attn_softcap, window);
-            fad_split_reduce_kernel<__half>
-                <<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-                    ws, static_cast<__half*>(O.data), head_dim, n_splits);
-        } else {
-            fad_split_partials_kernel<__nv_bfloat16, true>
-                <<<g1, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-                    static_cast<const __nv_bfloat16*>(Q.data),
-                    static_cast<const __nv_bfloat16*>(K_cache.data),
-                    static_cast<const __nv_bfloat16*>(V_cache.data),
-                    d_mask, ws, cap, /*valid_len=*/cap, Dq, Dkv, head_dim,
-                    group, tps, n_splits, attn_softcap, window);
-            fad_split_reduce_kernel<__nv_bfloat16>
-                <<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-                    ws, static_cast<__nv_bfloat16*>(O.data), head_dim,
-                    n_splits);
-        }
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-
-    const size_t shmem = (static_cast<size_t>(FAD_KTILE) + FAD_BLOCK) * sizeof(float);
-    dim3 grid(1, num_q_heads, 1);
-    if (Q.dtype == Dtype::FP16) {
-        flash_attention_decode_masked_kernel<__half><<<grid, FAD_BLOCK, shmem, cur_stream()>>>(
-            static_cast<const __half*>(Q.data),
-            static_cast<const __half*>(K_cache.data),
-            static_cast<const __half*>(V_cache.data),
-            d_mask,
-            static_cast<__half*>(O.data),
-            cap, Dq, Dkv, head_dim, group, attn_softcap, window);
-    } else {
-        flash_attention_decode_masked_kernel<__nv_bfloat16><<<grid, FAD_BLOCK, shmem, cur_stream()>>>(
-            static_cast<const __nv_bfloat16*>(Q.data),
-            static_cast<const __nv_bfloat16*>(K_cache.data),
-            static_cast<const __nv_bfloat16*>(V_cache.data),
-            d_mask,
-            static_cast<__nv_bfloat16*>(O.data),
-            cap, Dq, Dkv, head_dim, group, attn_softcap, window);
-    }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    dispatch_fa_rows(kFaModeRows, Q.dtype, Q.device,
+                     Q.data, K_cache.data, V_cache.data, O.data,
+                     d_mask, nullptr, nullptr,
+                     1, cap, Dq, Dkv, Dq,
+                     num_q_heads, num_kv_heads, head_dim,
+                     window, false, window > 0, 0, 0, attn_softcap);
 }
 
 void flash_attention_decode_len(const Tensor& Q, const Tensor& K_cache, const Tensor& V_cache,
@@ -690,38 +179,20 @@ void flash_attention_decode_len(const Tensor& Q, const Tensor& K_cache, const Te
         fail("num_kv_heads must be positive and divide num_q_heads");
     if (Dq % num_q_heads != 0 || Dkv != (Dq / num_q_heads) * num_kv_heads) fail("head layout mismatch");
     const int head_dim = Dq / num_q_heads;
-    if (!fad_split_eligible(head_dim)) fail("head_dim must be a multiple of 32, at most 256");
     if (O.rows != R || O.cols != Dq || O.dtype != Q.dtype) O.resize(R, Dq, Q.dtype);
     if (Dq == 0 || cap == 0) return;
     const int group = num_q_heads / num_kv_heads;
-    // The grouped kernel (one CTA per KV head and split, 16-byte rows) covers
-    // the common shapes; the split-K kernel the rest.
     if (decode_gqa::supported(head_dim, group)) {
         decode_gqa::launch(Q.data, K_cache.data, V_cache.data, d_len, O.data, cap, num_q_heads, num_kv_heads,
                            head_dim, R, Q.dtype == Dtype::BF16, cur_stream());
         return;
     }
-    if (R != 1) fail("several query rows need head_dim 64/128/256 and a group of 1, 2, 4 or 8");
-    int n_splits = 0, tps = 0;
-    fad_split_dims(cap, n_splits, tps);
-    float* ws = fad_split_workspace(static_cast<size_t>(num_q_heads) * n_splits * (head_dim + 2));
-    const dim3 g1(n_splits, num_q_heads, 1);
-    if (Q.dtype == Dtype::FP16) {
-        fad_split_partials_kernel<__half, false, true><<<g1, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-            static_cast<const __half*>(Q.data), static_cast<const __half*>(K_cache.data),
-            static_cast<const __half*>(V_cache.data), nullptr, ws, cap, cap, Dq, Dkv, head_dim, group, tps,
-            n_splits, 0.0f, 0, d_len);
-        fad_split_reduce_kernel<__half><<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-            ws, static_cast<__half*>(O.data), head_dim, n_splits);
-    } else {
-        fad_split_partials_kernel<__nv_bfloat16, false, true><<<g1, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-            static_cast<const __nv_bfloat16*>(Q.data), static_cast<const __nv_bfloat16*>(K_cache.data),
-            static_cast<const __nv_bfloat16*>(V_cache.data), nullptr, ws, cap, cap, Dq, Dkv, head_dim, group, tps,
-            n_splits, 0.0f, 0, d_len);
-        fad_split_reduce_kernel<__nv_bfloat16><<<num_q_heads, FAD_SPLIT_BLOCK, 0, cur_stream()>>>(
-            ws, static_cast<__nv_bfloat16*>(O.data), head_dim, n_splits);
-    }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    dispatch_fa_rows(kFaModeLen, Q.dtype, Q.device,
+                     Q.data, K_cache.data, V_cache.data, O.data,
+                     nullptr, d_len, nullptr,
+                     R, cap, Dq, Dkv, Dq,
+                     num_q_heads, num_kv_heads, head_dim,
+                     0, true, false, 0, 0, 0.0f);
 }
 
 } // namespace brotensor::detail::cuda

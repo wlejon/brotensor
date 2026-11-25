@@ -3,6 +3,7 @@
 #include "detail/activations.cuh"
 
 #include "fp16_internal.cuh"
+#include "ops_gemm_mir.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -29,218 +30,6 @@ template <typename T> __device__ inline void g_store(T* p, float v);
 template <> __device__ inline void g_store<float>(float* p, float v) { *p = v; }
 template <> __device__ inline void g_store<__half>(__half* p, float v) { *p = __float2half(v); }
 template <> __device__ inline void g_store<__nv_bfloat16>(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
-
-// Paired-word loads for the GEMV kernel: x/y components of a T2 vector in FP32.
-__device__ inline float g_load2_x(float2 v) { return v.x; }
-__device__ inline float g_load2_y(float2 v) { return v.y; }
-__device__ inline float g_load2_x(__half2 v) { return __low2float(v); }
-__device__ inline float g_load2_y(__half2 v) { return __high2float(v); }
-__device__ inline float g_load2_x(__nv_bfloat162 v) { return __low2float(v); }
-__device__ inline float g_load2_y(__nv_bfloat162 v) { return __high2float(v); }
-
-// y[i] = b[i] + sum_j W[i, j] * x[j]
-// One thread per output row. Uses shared memory to cache tiles of x (in FP32).
-constexpr int LF_BLOCK = 128;
-constexpr int LF_TILE  = 128;
-
-template <typename T>
-__global__ void linear_forward_kernel(const T* __restrict__ W,
-                                      const T* __restrict__ b,
-                                      const T* __restrict__ x,
-                                      T* __restrict__ y,
-                                      int out_dim, int in_dim) {
-    __shared__ float xtile[LF_TILE];
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    const int tid = threadIdx.x;
-
-    float acc = 0.0f;
-    for (int t0 = 0; t0 < in_dim; t0 += LF_TILE) {
-        const int t_len = (in_dim - t0) < LF_TILE ? (in_dim - t0) : LF_TILE;
-
-        // Cooperatively load tile of x into shared memory.
-        for (int k = tid; k < t_len; k += blockDim.x) {
-            xtile[k] = g_load<T>(&x[t0 + k]);
-        }
-        __syncthreads();
-
-        if (row < out_dim) {
-            const T* wrow = W + static_cast<size_t>(row) * in_dim + t0;
-            #pragma unroll 8
-            for (int k = 0; k < t_len; ++k) {
-                acc += g_load<T>(&wrow[k]) * xtile[k];
-            }
-        }
-        __syncthreads();
-    }
-
-    if (row < out_dim) {
-        g_store<T>(&y[row], g_load<T>(&b[row]) + acc);
-    }
-}
-
-// GEMV fast path: one WARP per output row, lanes striding K with vector loads
-// (consecutive lanes -> consecutive words, fully coalesced), shuffle-reduced.
-// The thread-per-row kernel above issues 32 weight rows per warp — at any k its
-// lanes hit addresses in_dim*sizeof(T) apart, wasting ~31/32 of each memory
-// transaction; per-token decode (LSTM steps, AR decode heads) lives or dies on
-// this. Requires in_dim % 4 == 0 (FP32: float4; FP16/BF16: two T2 words per
-// lane-iteration) so every row stays 16-/8-byte aligned.
-constexpr int LGV_BLOCK = 128;   // threads cooperating on one output row
-
-template <typename T, typename T2>
-__global__ void linear_gemv_kernel(const T* __restrict__ W,
-                                   const T* __restrict__ b,
-                                   const T* __restrict__ x,
-                                   T* __restrict__ y,
-                                   int out_dim, int in_dim) {
-    // One BLOCK per output row (split-K): out_dim blocks keep the SMs full of
-    // outstanding loads at decode widths, where a warp-per-row mapping leaves
-    // the GPU mostly idle on this bandwidth-bound shape.
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    const T2* w2 = reinterpret_cast<const T2*>(W + static_cast<size_t>(row) * in_dim);
-    const T2* x2 = reinterpret_cast<const T2*>(x);
-    const int n2 = in_dim / 2;          // T2 words per row
-
-    float acc = 0.0f;
-    for (int k = 2 * tid; k < n2; k += 2 * LGV_BLOCK) {  // two adjacent T2 words
-        #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const T2 wv = w2[k + i];
-            const T2 xv = x2[k + i];
-            acc += g_load2_x(wv) * g_load2_x(xv) + g_load2_y(wv) * g_load2_y(xv);
-        }
-    }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
-    }
-    __shared__ float red[LGV_BLOCK / 32];
-    if ((tid & 31) == 0) red[tid >> 5] = acc;
-    __syncthreads();
-    if (tid == 0) {
-        float s = red[0];
-        #pragma unroll
-        for (int w = 1; w < LGV_BLOCK / 32; ++w) s += red[w];
-        g_store<T>(&y[row], g_load<T>(&b[row]) + s);
-    }
-}
-
-// Batched skinny-B GEMV for the 16-bit-activation batched linear: one BLOCK
-// per (output row, batch row), the same split-K body as linear_gemv_kernel
-// above. AR decode hits the batched linear with B == 1 on every projection —
-// at that shape the WMMA tile kernel computes a 16-row tile to use one row
-// and its per-warp weight traffic is uncoalesced, so it runs at a fraction
-// of HBM bandwidth. bias may be null; `act` is the fused epilogue activation
-// (0 = identity). Requires in_dim % 4 == 0, which every transformer width
-// satisfies.
-template <typename T, typename T2>
-__global__ void linear_gemv_batched_w16_kernel(const T* __restrict__ W,
-                                               const T* __restrict__ bias,
-                                               const T* __restrict__ X,
-                                               T* __restrict__ Y,
-                                               int out_dim, int in_dim,
-                                               int act) {
-    const int row   = blockIdx.x;
-    const int batch = blockIdx.y;
-    const int tid   = threadIdx.x;
-
-    const T2* w2 = reinterpret_cast<const T2*>(W + static_cast<size_t>(row) * in_dim);
-    const T2* x2 = reinterpret_cast<const T2*>(X + static_cast<size_t>(batch) * in_dim);
-    const int n2 = in_dim / 2;          // T2 words per row
-
-    float acc = 0.0f;
-    for (int k = 2 * tid; k < n2; k += 2 * LGV_BLOCK) {  // two adjacent T2 words
-        #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const T2 wv = w2[k + i];
-            const T2 xv = x2[k + i];
-            acc += g_load2_x(wv) * g_load2_x(xv) + g_load2_y(wv) * g_load2_y(xv);
-        }
-    }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
-    }
-    __shared__ float red[LGV_BLOCK / 32];
-    if ((tid & 31) == 0) red[tid >> 5] = acc;
-    __syncthreads();
-    if (tid == 0) {
-        float s = red[0];
-        #pragma unroll
-        for (int w = 1; w < LGV_BLOCK / 32; ++w) s += red[w];
-        if (bias != nullptr) s += g_load<T>(&bias[row]);
-        g_store<T>(&Y[static_cast<size_t>(batch) * out_dim + row],
-                   apply_linear_act(act, s));
-    }
-}
-
-// 16-byte-load variant of the batched skinny GEMV above, for in_dim % 8 == 0
-// (every transformer width). The 8-byte loads of the base kernel leave the
-// LSU at half width and give long rows too little memory-level parallelism —
-// at in_dim 4096 the base kernel measures ~460 GB/s where this one reaches
-// ~930. Four independent accumulators keep 64 bytes of weight traffic in
-// flight per thread; FP32 accumulation and the fused bias/activation
-// epilogue are unchanged. (Very long rows — in_dim ~12k at small out_dim —
-// still plateau near 460; known headroom, cause not yet isolated.)
-template <typename T2>
-struct __align__(16) LgvQuad { T2 a, b, c, d; };
-
-template <typename T, typename T2>
-__device__ inline float lgv_dot8(const LgvQuad<T2>& w, const LgvQuad<T2>& x) {
-    return g_load2_x(w.a) * g_load2_x(x.a) + g_load2_y(w.a) * g_load2_y(x.a) +
-           g_load2_x(w.b) * g_load2_x(x.b) + g_load2_y(w.b) * g_load2_y(x.b) +
-           g_load2_x(w.c) * g_load2_x(x.c) + g_load2_y(w.c) * g_load2_y(x.c) +
-           g_load2_x(w.d) * g_load2_x(x.d) + g_load2_y(w.d) * g_load2_y(x.d);
-}
-
-template <typename T, typename T2>
-__global__ void linear_gemv_batched_w16_v8_kernel(const T* __restrict__ W,
-                                                  const T* __restrict__ bias,
-                                                  const T* __restrict__ X,
-                                                  T* __restrict__ Y,
-                                                  int out_dim, int in_dim,
-                                                  int act) {
-    const int row   = blockIdx.x;
-    const int batch = blockIdx.y;
-    const int tid   = threadIdx.x;
-
-    using Q = LgvQuad<T2>;
-    const Q* w8 = reinterpret_cast<const Q*>(W + static_cast<size_t>(row) * in_dim);
-    const Q* x8 = reinterpret_cast<const Q*>(X + static_cast<size_t>(batch) * in_dim);
-    const int n8 = in_dim / 8;          // 16-byte quads per row
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    float acc2 = 0.0f;
-    float acc3 = 0.0f;
-    int k = tid;
-    for (; k + 3 * LGV_BLOCK < n8; k += 4 * LGV_BLOCK) {
-        acc0 += lgv_dot8<T, T2>(w8[k], x8[k]);
-        acc1 += lgv_dot8<T, T2>(w8[k + LGV_BLOCK], x8[k + LGV_BLOCK]);
-        acc2 += lgv_dot8<T, T2>(w8[k + 2 * LGV_BLOCK], x8[k + 2 * LGV_BLOCK]);
-        acc3 += lgv_dot8<T, T2>(w8[k + 3 * LGV_BLOCK], x8[k + 3 * LGV_BLOCK]);
-    }
-    for (; k < n8; k += LGV_BLOCK) acc0 += lgv_dot8<T, T2>(w8[k], x8[k]);
-    float acc = (acc0 + acc1) + (acc2 + acc3);
-
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
-    }
-    __shared__ float red[LGV_BLOCK / 32];
-    if ((tid & 31) == 0) red[tid >> 5] = acc;
-    __syncthreads();
-    if (tid == 0) {
-        float s = red[0];
-        #pragma unroll
-        for (int w = 1; w < LGV_BLOCK / 32; ++w) s += red[w];
-        if (bias != nullptr) s += g_load<T>(&bias[row]);
-        g_store<T>(&Y[static_cast<size_t>(batch) * out_dim + row],
-                   apply_linear_act(act, s));
-    }
-}
 
 // dX[j] = sum_i W[i, j] * dY[i]
 // One thread per input column. Uses shared memory to cache tiles of dY (FP32).
@@ -336,60 +125,8 @@ void linear_forward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& b,
     }
     if (out_dim == 0) return;
 
-    // Coalesced warp-per-row GEMV whenever rows stay vector-aligned; the tiled
-    // thread-per-row kernel remains for odd in_dim.
-    if (in_dim % 4 == 0 && in_dim > 0) {
-        const int gblocks = out_dim;
-        if (W.dtype == Dtype::FP16) {
-            linear_gemv_kernel<__half, __half2><<<gblocks, LGV_BLOCK, 0, cur_stream()>>>(
-                static_cast<const __half*>(W.data),
-                static_cast<const __half*>(b.data),
-                static_cast<const __half*>(x.data),
-                static_cast<__half*>(y.data),
-                out_dim, in_dim);
-        } else if (W.dtype == Dtype::BF16) {
-            linear_gemv_kernel<__nv_bfloat16, __nv_bfloat162><<<gblocks, LGV_BLOCK, 0, cur_stream()>>>(
-                static_cast<const __nv_bfloat16*>(W.data),
-                static_cast<const __nv_bfloat16*>(b.data),
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<__nv_bfloat16*>(y.data),
-                out_dim, in_dim);
-        } else {
-            linear_gemv_kernel<float, float2><<<gblocks, LGV_BLOCK, 0, cur_stream()>>>(
-                static_cast<const float*>(W.data),
-                static_cast<const float*>(b.data),
-                static_cast<const float*>(x.data),
-                static_cast<float*>(y.data),
-                out_dim, in_dim);
-        }
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-
-    const int blocks = (out_dim + LF_BLOCK - 1) / LF_BLOCK;
-    if (W.dtype == Dtype::FP16) {
-        linear_forward_kernel<__half><<<blocks, LF_BLOCK, 0, cur_stream()>>>(
-            static_cast<const __half*>(W.data),
-            static_cast<const __half*>(b.data),
-            static_cast<const __half*>(x.data),
-            static_cast<__half*>(y.data),
-            out_dim, in_dim);
-    } else if (W.dtype == Dtype::BF16) {
-        linear_forward_kernel<__nv_bfloat16><<<blocks, LF_BLOCK, 0, cur_stream()>>>(
-            static_cast<const __nv_bfloat16*>(W.data),
-            static_cast<const __nv_bfloat16*>(b.data),
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<__nv_bfloat16*>(y.data),
-            out_dim, in_dim);
-    } else {
-        linear_forward_kernel<float><<<blocks, LF_BLOCK, 0, cur_stream()>>>(
-            static_cast<const float*>(W.data),
-            static_cast<const float*>(b.data),
-            static_cast<const float*>(x.data),
-            static_cast<float*>(y.data),
-            out_dim, in_dim);
-    }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    dispatch_mir_gemv(x.data, x.dtype, W.data, W.dtype, y.data, y.dtype, b.data,
+                      1, out_dim, in_dim, in_dim, in_dim, out_dim, 0, 0);
 }
 
 // 16-bit batched linear forward: Y(B, out_dim) = X(B, in_dim) @ W(out_dim, in_dim)^T
@@ -444,51 +181,10 @@ void linear_forward_batched_fp16_impl(const ::brotensor::Tensor& W,
     // that hit every short prompt / bidirectional-encoder forward. B <= 4 keeps
     // GEMV only where its coalesced single-pass-per-row actually beats WMMA
     // (decode's B == 1, and 2–4-row micro-batches).
-    if (B <= 4 && in_dim % 4 == 0 && in_dim > 0) {
-        dim3 grid(out_dim, B);
-        if (in_dim % 8 == 0) {   // 16-byte loads (every transformer width)
-            if (dt == Dtype::FP16) {
-                linear_gemv_batched_w16_v8_kernel<__half, __half2>
-                    <<<grid, LGV_BLOCK, 0, cur_stream()>>>(
-                        static_cast<const __half*>(W.data),
-                        has_bias ? static_cast<const __half*>(bias->data)
-                                 : nullptr,
-                        static_cast<const __half*>(X_BD.data),
-                        static_cast<__half*>(Y_BD.data),
-                        out_dim, in_dim, act);
-            } else {  // BF16
-                linear_gemv_batched_w16_v8_kernel<__nv_bfloat16, __nv_bfloat162>
-                    <<<grid, LGV_BLOCK, 0, cur_stream()>>>(
-                        static_cast<const __nv_bfloat16*>(W.data),
-                        has_bias
-                            ? static_cast<const __nv_bfloat16*>(bias->data)
-                            : nullptr,
-                        static_cast<const __nv_bfloat16*>(X_BD.data),
-                        static_cast<__nv_bfloat16*>(Y_BD.data),
-                        out_dim, in_dim, act);
-            }
-            BROTENSOR_CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        if (dt == Dtype::FP16) {
-            linear_gemv_batched_w16_kernel<__half, __half2>
-                <<<grid, LGV_BLOCK, 0, cur_stream()>>>(
-                    static_cast<const __half*>(W.data),
-                    has_bias ? static_cast<const __half*>(bias->data) : nullptr,
-                    static_cast<const __half*>(X_BD.data),
-                    static_cast<__half*>(Y_BD.data),
-                    out_dim, in_dim, act);
-        } else {  // BF16
-            linear_gemv_batched_w16_kernel<__nv_bfloat16, __nv_bfloat162>
-                <<<grid, LGV_BLOCK, 0, cur_stream()>>>(
-                    static_cast<const __nv_bfloat16*>(W.data),
-                    has_bias ? static_cast<const __nv_bfloat16*>(bias->data)
-                             : nullptr,
-                    static_cast<const __nv_bfloat16*>(X_BD.data),
-                    static_cast<__nv_bfloat16*>(Y_BD.data),
-                    out_dim, in_dim, act);
-        }
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+    if (B <= 4 && in_dim > 0) {
+        dispatch_mir_gemv(X_BD.data, dt, W.data, dt, Y_BD.data, dt,
+                          has_bias ? bias->data : nullptr,
+                          B, out_dim, in_dim, in_dim, in_dim, out_dim, 0, act);
         return;
     }
 
