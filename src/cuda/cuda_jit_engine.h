@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cuda_driver.h"
+#include "../jit/kernel_disk_cache.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -111,7 +112,7 @@ private:
         if (drv::cuDeviceGetCount(&dev_count) != CUDA_SUCCESS || dev_count <= 0) return;
 
         if (drv::cuCtxGetCurrent(&context_) != CUDA_SUCCESS || !context_) {
-            CUdevice dev;
+            CUdevice dev = 0;
             if (drv::cuDeviceGet(&dev, 0) == CUDA_SUCCESS) {
                 if (drv::cuDevicePrimaryCtxRetain(&context_, dev) == CUDA_SUCCESS) {
                     drv::cuCtxSetCurrent(context_);
@@ -119,6 +120,18 @@ private:
             }
         }
         available_ = (context_ != nullptr);
+        if (available_) {
+            CUdevice dev = 0;
+            int cc_major = 0, cc_minor = 0, drv_ver = 0;
+            if (drv::cuDeviceGet(&dev, 0) == CUDA_SUCCESS &&
+                drv::cuDeviceGetAttribute(&cc_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) == CUDA_SUCCESS &&
+                drv::cuDeviceGetAttribute(&cc_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) == CUDA_SUCCESS) {
+                (void)drv::cuDriverGetVersion(&drv_ver);
+                char abuf[64];
+                std::snprintf(abuf, sizeof(abuf), "sm_%d%d:drv%d", cc_major, cc_minor, drv_ver);
+                arch_sig_ = abuf;
+            }
+        }
     }
 
     ~CudaJitEngine() {
@@ -176,7 +189,45 @@ private:
         };
 
         CUmodule module = nullptr;
-        CUresult res = drv::cuModuleLoadDataEx(&module, ptx.c_str(), 5, options, option_values);
+        auto& disk = ::brotensor::jit::KernelDiskCache::instance();
+        std::string cubin_sig;
+        if (!arch_sig_.empty() && disk.is_enabled()) {
+            char hbuf[32];
+            std::snprintf(hbuf, sizeof(hbuf), "%016llx:%zu",
+                          static_cast<unsigned long long>(key_hash(ptx)), ptx.size());
+            cubin_sig = arch_sig_ + ":" + entry_name + ":" + hbuf;
+            std::vector<std::uint8_t> cached_cubin;
+            if (disk.load_blob("cuda_cubin", cubin_sig, cached_cubin) && !cached_cubin.empty()) {
+                if (drv::cuModuleLoadData(&module, cached_cubin.data()) != CUDA_SUCCESS) {
+                    module = nullptr;
+                }
+            }
+        }
+
+        if (!module && !cubin_sig.empty()) {
+            CUlinkState link = nullptr;
+            if (drv::cuLinkCreate(5, options, option_values, &link) == CUDA_SUCCESS && link) {
+                void* cubin_ptr = nullptr;
+                std::size_t cubin_size = 0;
+                const CUresult add_res = drv::cuLinkAddData(
+                    link, CU_JIT_INPUT_PTX, const_cast<char*>(ptx.c_str()),
+                    ptx.size() + 1, entry_name.c_str(), 0, nullptr, nullptr);
+                if (add_res == CUDA_SUCCESS &&
+                    drv::cuLinkComplete(link, &cubin_ptr, &cubin_size) == CUDA_SUCCESS &&
+                    cubin_ptr && cubin_size > 0) {
+                    if (drv::cuModuleLoadData(&module, cubin_ptr) == CUDA_SUCCESS) {
+                        (void)disk.store_blob("cuda_cubin", cubin_sig, cubin_ptr, cubin_size);
+                    } else {
+                        module = nullptr;
+                    }
+                }
+                drv::cuLinkDestroy(link);
+            }
+        }
+
+        CUresult res = module
+            ? CUDA_SUCCESS
+            : drv::cuModuleLoadDataEx(&module, ptx.c_str(), 5, options, option_values);
         if (res != CUDA_SUCCESS) {
             // A PTX that ptxas rejects is a code-generation bug, and the
             // exception that carries it is usually swallowed by a caller that
@@ -212,6 +263,7 @@ private:
 
     bool available_ = false;
     CUcontext context_ = nullptr;
+    std::string arch_sig_;
     Entry table_[kCapacity];
     std::array<CUmodule, kCapacity> modules_{};
     std::atomic<std::size_t> module_count_{0};

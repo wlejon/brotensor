@@ -108,9 +108,11 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipelineCache cache_ = VK_NULL_HANDLE;
     std::string cache_sig_;
-    bool cache_dirty_ = false;
+    std::uint32_t cache_dirty_count_ = 0;
     std::uint32_t push_bytes_ = 0;
     std::map<Key, std::unique_ptr<Kernel>> kernels_;
+
+    void flush_pipeline_cache_locked();
 };
 
 }  // namespace brotensor::detail::vulkan

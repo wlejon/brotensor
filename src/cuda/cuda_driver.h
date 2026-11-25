@@ -16,21 +16,33 @@
 // The wrappers carry the exact prototypes cuda.h declares, so a call site
 // reads as `drv::cuLaunchKernel(...)` and nothing else changes.
 
+#include <cstddef>
 #include <cuda.h>
 
 namespace brotensor::detail::cuda::drv {
 
 CUresult cuInit(unsigned int flags);
+CUresult cuDriverGetVersion(int* driverVersion);
 CUresult cuDeviceGetCount(int* count);
 CUresult cuDeviceGet(CUdevice* device, int ordinal);
+CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev);
 CUresult cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev);
 CUresult cuCtxGetCurrent(CUcontext* pctx);
 CUresult cuCtxSetCurrent(CUcontext ctx);
+CUresult cuModuleLoadData(CUmodule* module, const void* image);
 CUresult cuModuleLoadDataEx(CUmodule* module, const void* image,
                             unsigned int numOptions, CUjit_option* options,
                             void** optionValues);
 CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name);
 CUresult cuModuleUnload(CUmodule hmod);
+CUresult cuLinkCreate(unsigned int numOptions, CUjit_option* options,
+                      void** optionValues, CUlinkState* stateOut);
+CUresult cuLinkAddData(CUlinkState state, CUjitInputType type,
+                       void* data, std::size_t size, const char* name,
+                       unsigned int numOptions, CUjit_option* options,
+                       void** optionValues);
+CUresult cuLinkComplete(CUlinkState state, void** cubinOut, std::size_t* sizeOut);
+CUresult cuLinkDestroy(CUlinkState state);
 CUresult cuLaunchKernel(CUfunction f,
                         unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,

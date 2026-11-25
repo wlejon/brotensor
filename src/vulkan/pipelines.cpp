@@ -53,20 +53,27 @@ Pipelines::Pipelines(DeviceCtx& dev) : dev_(dev) {
     }
 }
 
-Pipelines::~Pipelines() {
+void Pipelines::flush_pipeline_cache_locked() {
+    if (cache_dirty_count_ == 0 || cache_ == VK_NULL_HANDLE || cache_sig_.empty()) return;
     const DeviceFns& f = dev_.fn();
-    if (cache_dirty_ && cache_ != VK_NULL_HANDLE && !cache_sig_.empty() && f.vkGetPipelineCacheData) {
-        try {
-            std::size_t bytes = 0;
-            if (f.vkGetPipelineCacheData(dev_.device(), cache_, &bytes, nullptr) == VK_SUCCESS && bytes > 0) {
-                std::vector<std::uint8_t> data(bytes);
-                if (f.vkGetPipelineCacheData(dev_.device(), cache_, &bytes, data.data()) == VK_SUCCESS && bytes > 0) {
-                    jit::KernelDiskCache::instance().store_blob("vk_pipe_cache", cache_sig_, data.data(), bytes);
+    if (!f.vkGetPipelineCacheData) return;
+    try {
+        std::size_t bytes = 0;
+        if (f.vkGetPipelineCacheData(dev_.device(), cache_, &bytes, nullptr) == VK_SUCCESS && bytes > 0) {
+            std::vector<std::uint8_t> data(bytes);
+            if (f.vkGetPipelineCacheData(dev_.device(), cache_, &bytes, data.data()) == VK_SUCCESS && bytes > 0) {
+                if (jit::KernelDiskCache::instance().store_blob("vk_pipe_cache", cache_sig_, data.data(), bytes)) {
+                    cache_dirty_count_ = 0;
                 }
             }
-        } catch (...) {
         }
+    } catch (...) {
     }
+}
+
+Pipelines::~Pipelines() {
+    const DeviceFns& f = dev_.fn();
+    flush_pipeline_cache_locked();
     for (auto& kv : kernels_) f.vkDestroyPipeline(dev_.device(), kv.second->pipe, nullptr);
     f.vkDestroyPipelineCache(dev_.device(), cache_, nullptr);
     f.vkDestroyPipelineLayout(dev_.device(), layout_, nullptr);
@@ -178,7 +185,10 @@ const Kernel& Pipelines::get_blob(std::uint32_t key_id, const ShaderBlob& blob,
     k->name = blob.name;
     const Kernel& ref = *k;
     kernels_.emplace(std::move(key), std::move(k));
-    cache_dirty_ = true;
+    ++cache_dirty_count_;
+    if (cache_dirty_count_ >= 16u) {
+        flush_pipeline_cache_locked();
+    }
     return ref;
 }
 
