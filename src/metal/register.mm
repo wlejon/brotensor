@@ -16,8 +16,11 @@
 #include <brotensor/tensor.h>
 
 #import "internal.h"
+#include "../jit/kernel_disk_cache.h"
 
 namespace brotensor::detail::metal {
+
+void flush_pipeline_archive();
 
 // Forward-declare every public op in the Metal backend namespace. The op
 // table is the single source of truth for the signatures; the implementations
@@ -329,6 +332,9 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.linear_forward_batched_fp16_act             = &dm::linear_forward_batched_fp16_act;
 
     dm::register_metal_interop_backend();
+    ::brotensor::jit::register_pipeline_flush_hook(::brotensor::DeviceType::Metal, [](int) {
+        dm::flush_pipeline_archive();
+    });
     ::brotensor::detail::register_backend(Device::Metal, ops,
                                           dm::metal_alloc_table());
 }

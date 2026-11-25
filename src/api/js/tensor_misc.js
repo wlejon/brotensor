@@ -148,4 +148,59 @@
             T(Y, L, "Y"));
         chk();
     });
+
+    // ---- kernel disk cache, warmup & bundles ----------------------------------
+    fn(ns_tensor, "cacheStats", function cacheStats() {
+        const dir = __bro_native.tensor.cacheDir();
+        chk();
+        const v = __bro_native.tensor.cacheStats();
+        chk();
+        return {
+            dir,
+            hits: v[0],
+            misses: v[1],
+            writes: v[2],
+            corruptions: v[3],
+            entries: v[4],
+        };
+    });
+
+    fn(ns_tensor, "setAutotune", function setAutotune(enabled) {
+        __bro_native.tensor.setAutotune(!!enabled);
+        chk();
+    });
+
+    fn(ns_tensor, "autotuneEnabled", function autotuneEnabled() {
+        const out = !!__bro_native.tensor.autotuneEnabled();
+        chk();
+        return out;
+    });
+
+    fn(ns_tensor, "warmupKernels", function warmupKernels(profile, autotune) {
+        const p = (profile === undefined || profile === null) ? "default" : String(profile);
+        const v = __bro_native.tensor.warmupKernels(p, !!autotune);
+        chk();
+        return { kernelsCompiled: v[0], autotuneEntries: v[1], elapsedMs: v[2] };
+    });
+
+    fn(ns_tensor, "exportKernelBundle", function exportKernelBundle(path) {
+        if (typeof path !== "string") throw new TypeError("exportKernelBundle(path): expected string path");
+        const ok = __bro_native.tensor.exportKernelBundle(path);
+        if (!ok) {
+            const denied = __bro_native.tensor.takeAccessError();
+            if (denied !== null) throw denied;
+            chk();
+            throw new Error("exportKernelBundle: failed");
+        }
+    });
+
+    fn(ns_tensor, "importKernelBundle", function importKernelBundle(path) {
+        if (typeof path !== "string") throw new TypeError("importKernelBundle(path): expected string path");
+        const v = __bro_native.tensor.importKernelBundle(path);
+        const denied = __bro_native.tensor.takeAccessError();
+        if (denied !== null) throw denied;
+        chk();
+        if (!v || v.length < 3) throw new Error("importKernelBundle: failed");
+        return { entriesImported: v[0], entriesSkipped: v[1], bytes: v[2] };
+    });
 })();

@@ -2,6 +2,7 @@
 
 #include "mir_common.h"
 #include "mir_coop_common.h"
+#include "mir_math.h"
 #include "../vulkan/shaders/op_codes.h"
 
 #include <array>
@@ -129,7 +130,8 @@ brass::Function* build_fa_cm_mir(brass::Module& mod, const FaCmSpec& s) {
                              "_hd" + std::to_string(HD) + "_bc" + std::to_string(s.bc) +
                              "_g" + std::to_string(s.nsg) + "_m" + std::to_string(s.mode) +
                              (s.has_mask ? "_mk" : "") + (s.vec ? "_v" : "_s") +
-                             (s.direct ? "_d" : "") + (s.split ? "_sp" : "");
+                             (s.direct ? "_d" : "") + (s.split ? "_sp" : "") +
+                             (s.has_softcap ? "_sc" : "") + (s.head_swizzle ? "_hs" : "");
 
     std::vector<Type> params = {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(),
@@ -137,7 +139,7 @@ brass::Function* build_fa_cm_mir(brass::Module& mod, const FaCmSpec& s) {
         Type::i32(), Type::i32(), Type::i32(), Type::i32(), Type::i32(),
         Type::i32(), Type::i32(), Type::i32(), Type::i32(), Type::i32(),
         Type::i32(), Type::i32(), Type::i32(),
-        Type::f32(),
+        Type::f32(), Type::f32(),
     };
     Function* fn = mod.create_function(name, Type::void_type(), brass::Span<const Type>(params));
     brass::codegen::KernelBuilder kb(mod, fn);
@@ -145,7 +147,7 @@ brass::Function* build_fa_cm_mir(brass::Module& mod, const FaCmSpec& s) {
     auto p = entry_params(c, fn);
     // ptrs: 0:q 1:k 2:v 3:o 4:mask 5:aux 6:aux2 7:part
     // ints: 8:lq 9:lk 10:ldq 11:ldk 12:ldo 13:group 14:window 15:causal 16:nseq 17:chunk 18:hq 19:qb0 20:q_offset
-    // flts: 21:scale
+    // flts: 21:scale, 22:softcap
 
     Value* KV = kb.shared_alloc_i32x4(Q_KV_SLOTS);
     Value* Ss = kb.shared_alloc_f32(std::max(256u, BR * s.bc));
@@ -159,8 +161,10 @@ brass::Function* build_fa_cm_mir(brass::Module& mod, const FaCmSpec& s) {
     Value* sg = c.b.build_and(kb.subgroup_id(), c.i32(static_cast<int>(s.nsg - 1u)));
     Value* lane = c.b.build_and(kb.lane_id(), c.i32(31));
 
-    Value* qb = c.b.build_add(p[19], c.b.build_sub(c.b.build_sub(kb.nctaid_x(), c.i32(1)), kb.ctaid_x()));
-    Value* h = kb.ctaid_y();
+    Value* qb = s.head_swizzle
+        ? c.b.build_add(p[19], c.b.build_sub(c.b.build_sub(kb.nctaid_y(), c.i32(1)), kb.ctaid_y()))
+        : c.b.build_add(p[19], c.b.build_sub(c.b.build_sub(kb.nctaid_x(), c.i32(1)), kb.ctaid_x()));
+    Value* h = s.head_swizzle ? kb.ctaid_x() : kb.ctaid_y();
     Value* hk = c.b.build_udiv(h, p[13]);
     Value* qoff = c.b.build_mul(h, c.i32(static_cast<int>(HD)));
     Value* koff = c.b.build_mul(hk, c.i32(static_cast<int>(HD)));
@@ -322,6 +326,8 @@ brass::Function* build_fa_cm_mir(brass::Module& mod, const FaCmSpec& s) {
     Value* c0_v4 = c.b.build_lshr(c0, c.i32(3));
     Value* sg_sbase = c.b.build_mul(c.b.build_shl(sg, c.i32(4)), c.i32(static_cast<int>(s.bc)));
     Value* sg_pbase_v4 = c.b.build_mul(c.b.build_shl(sg, c.i32(4)), c.i32(static_cast<int>(SPH_V4)));
+    Value* sc_nat_inv = s.has_softcap ? emit_div_rn(c, c.f32(0.69314718055994531f), p[22]) : nullptr;
+    Value* sc_log2_cap = s.has_softcap ? c.b.build_mul(p[22], c.f32(1.4426950408889634f)) : nullptr;
 
     auto ml = kb.for_range_reduce_n(
         kbeg, kend, c.i32(static_cast<int>(s.bc)), {c.f32(-1e30f), c.f32(0.0f)},
@@ -350,6 +356,9 @@ brass::Function* build_fa_cm_mir(brass::Module& mod, const FaCmSpec& s) {
                 Value* ok = c.b.build_and(c.b.build_uge(key, lo), c.b.build_ult(key, hi));
                 if (s.has_mask) ok = c.b.build_and(ok, c.b.build_sgt(kb.shared_load_f32_indexed(maskS, col), c.f32(0.5f)));
                 Value* sc = c.b.build_mul(kb.shared_load_f32_indexed(Ss, c.b.build_add(srow, col)), p[21]);
+                if (s.has_softcap) {
+                    sc = c.b.build_mul(sc_log2_cap, emit_tanh(c, c.b.build_mul(sc, sc_nat_inv)));
+                }
                 mx = c.b.build_select(ok, kb.fmax(mx, sc), mx);
             }
             mx = kb.fmax(mx, kb.shfl_bfly_f32(mx, 1u));
@@ -365,6 +374,9 @@ brass::Function* build_fa_cm_mir(brass::Module& mod, const FaCmSpec& s) {
                     Value* ok = c.b.build_and(c.b.build_uge(key, lo), c.b.build_ult(key, hi));
                     if (s.has_mask) ok = c.b.build_and(ok, c.b.build_sgt(kb.shared_load_f32_indexed(maskS, col), c.f32(0.5f)));
                     Value* sc = c.b.build_mul(kb.shared_load_f32_indexed(Ss, c.b.build_add(srow, col)), p[21]);
+                    if (s.has_softcap) {
+                        sc = c.b.build_mul(sc_log2_cap, emit_tanh(c, c.b.build_mul(sc, sc_nat_inv)));
+                    }
                     Value* pv_e = c.b.build_select(ok, kb.ex2_approx(c.b.build_sub(sc, mnew)), c.f32(0.0f));
                     pv[static_cast<std::size_t>(e)] = pv_e;
                     sum = c.b.build_add(sum, pv_e);

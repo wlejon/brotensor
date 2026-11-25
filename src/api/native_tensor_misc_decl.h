@@ -60,6 +60,15 @@ void bro_tensor_dpmpp2mStep(void* x_t, void* eps_pred, void* x0_prev, double sig
 // timestepEmbedding(timesteps, dim, maxPeriod, Y) — maxPeriod defaults to 10000
 void bro_tensor_timestepEmbedding(void* timesteps, int32_t dim, double maxPeriod, void* Y);
 
+// --- kernel disk cache, warmup & bundle management -------------------------
+const char* bro_tensor_cacheDir(void);
+void bro_tensor_cacheStats(bronze_native_buffer* out);
+void bro_tensor_setAutotune(bool enabled);
+bool bro_tensor_autotuneEnabled(void);
+void bro_tensor_warmupKernels(const char* profile, bool autotune, bronze_native_buffer* out);
+bool bro_tensor_exportKernelBundle(const char* path);
+void bro_tensor_importKernelBundle(const char* path, bronze_native_buffer* out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -34,6 +34,7 @@ struct GemmArgs {
     int batch = 1;
     long long sa = 0, sb = 0, sc = 0;   // batch strides in elements; 0 broadcasts
     int epi = 0;                 // EPI_* (op_codes.h); GLUs need the NT layout
+    std::uint64_t residual = 0;  // device address of residual tensor (same shape/ld/batch stride as C) for EPI_RESIDUAL_ADD
     // Quantised B (QF_* of shaders/quant_decode.glsl, 0 = none): the
     // cooperative-matrix kernel only, NT layout, one batch, db ignored; ldb
     // is then B's row pitch in bytes and `scale` the INT8 / FP8 per-row scales.

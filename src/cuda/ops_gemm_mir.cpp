@@ -51,8 +51,9 @@ void dispatch_mir_gemm_simt(const void* a, Dtype dt_a,
                             int epi, int act,
                             const Device& dev) {
     if (batch <= 0 || m <= 0 || n <= 0) return;
-    const bool glu = (epi == EPI_GEGLU || epi == EPI_SWIGLU);
-    if (glu && batch != 1) {
+    const bool geglu = (epi == EPI_GEGLU);
+    const bool swiglu = (epi == EPI_SWIGLU);
+    if ((geglu || swiglu) && batch != 1) {
         throw std::runtime_error("dispatch_mir_gemm_simt: batched GLU epilogue is unsupported");
     }
 
@@ -60,7 +61,7 @@ void dispatch_mir_gemm_simt(const void* a, Dtype dt_a,
     void* c_out = c;
     int ldc_run = ldc;
     Tensor scratch;
-    if (glu) {
+    if (geglu) {
         scratch = Tensor::empty_on(dev, m, n, Dtype::FP32);
         dc = Dtype::FP32;
         c_out = scratch.data;
@@ -68,16 +69,17 @@ void dispatch_mir_gemm_simt(const void* a, Dtype dt_a,
     }
 
     const std::uint64_t tiles_big = cdiv64(m, 128u) * cdiv64(n, 128u) * static_cast<std::uint64_t>(batch);
-    const bool big128 = (tiles_big >= 160u);
+    const bool big128 = (!swiglu && tiles_big >= 160u);
     const std::uint64_t tile = big128 ? 128u : 64u;
-    const std::uint32_t epi_run = static_cast<std::uint32_t>(glu ? EPI_STORE : epi);
+    const std::uint32_t epi_run = static_cast<std::uint32_t>(geglu ? EPI_STORE : epi);
     const std::uint32_t op = epi_run | (static_cast<std::uint32_t>(act) << 4) |
                              (static_cast<std::uint32_t>(dt_bias) << 8);
     const std::uint8_t flags = static_cast<std::uint8_t>(
         (big128 ? 1u : 0u) | (ta ? 2u : 0u) | (nb ? 4u : 0u) | (bias ? 8u : 0u));
 
     CUfunction fn = mir_function({MirKind::GemmSimt, op, dt_a, dt_b, 1u, dc, flags});
-    const std::uint32_t gx = static_cast<std::uint32_t>(cdiv64(n, tile));
+    const std::uint64_t n_grid = swiglu ? static_cast<std::uint64_t>(n / 2) : static_cast<std::uint64_t>(n);
+    const std::uint32_t gx = static_cast<std::uint32_t>(cdiv64(n_grid, tile));
     const std::uint32_t gy = static_cast<std::uint32_t>(cdiv64(m, tile));
     if (gy > 65535u) {
         throw std::runtime_error("dispatch_mir_gemm_simt: matrix M exceeds CUDA grid.y limit");
@@ -103,20 +105,14 @@ void dispatch_mir_gemm_simt(const void* a, Dtype dt_a,
         mir_dispatch_args_3d(fn, gx, gy, static_cast<std::uint32_t>(nz), 256u, ptrs, ints, {});
     }
 
-    if (glu) {
+    if (geglu) {
         const std::uint32_t half = static_cast<std::uint32_t>(n / 2);
         if (static_cast<std::uint32_t>(ldc) != half) {
             throw std::runtime_error("dispatch_mir_gemm_simt: GLU output must be contiguous");
         }
-        const std::uint32_t glu_op = (epi == EPI_GEGLU) ? GLU_GEGLU_PAIRS : GLU_SWIGLU;
-        int lanes = 1;
-        if (glu_op != GLU_GEGLU_PAIRS && (half % 4u) == 0u) {
-            const int ml = mir_vec_lanes_mixed(Dtype::FP32, dt_c, half, addr(scratch.data), addr(c));
-            if ((half % static_cast<std::uint32_t>(ml)) == 0u) lanes = ml;
-        }
         const std::uint32_t count = static_cast<std::uint32_t>(m) * half;
-        CUfunction glu_fn = mir_function({MirKind::Glu, glu_op, Dtype::FP32, dt_c, static_cast<std::uint8_t>(lanes)});
-        mir_dispatch_glu(glu_fn, mir_groups_1d(count, lanes), scratch.data, nullptr, c, count, half);
+        CUfunction glu_fn = mir_function({MirKind::Glu, GLU_GEGLU_PAIRS, Dtype::FP32, dt_c, 1u});
+        mir_dispatch_glu(glu_fn, mir_groups_1d(count, 1), scratch.data, nullptr, c, count, half);
     }
 }
 

@@ -323,6 +323,7 @@ function(brotensor_vulkan_add_backend)
         ${_src}/ops_copy.cpp
         ${_src}/ops_reduce.cpp
         ${_src}/gemm.cpp
+        ${_src}/vk_autotune.cpp
         ${_src}/ops_linear.cpp
         ${_src}/ops_norm.cpp
         ${_src}/ops_rope.cpp

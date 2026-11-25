@@ -10,7 +10,7 @@
 
 namespace brotensor::kernels {
 
-// Params: (ptr a, ptr b, ptr c, ptr bias,
+// Params: (ptr a, ptr b, ptr c, ptr bias, [ptr residual when epi==EPI_RESIDUAL_ADD],
 //          i32 m, i32 n, i32 k, i32 lda, i32 ldb, i32 ldc, i32 sa, i32 sb, i32 sc)
 brass::Function* build_gemm_simt_mir(brass::Module& mod, Dtype dt_a, Dtype dt_b, Dtype dt_c, Dtype dt_bias,
                                      bool big128, std::uint32_t epi, std::uint32_t act,
@@ -19,6 +19,7 @@ brass::Function* build_gemm_simt_mir(brass::Module& mod, Dtype dt_a, Dtype dt_b,
 // Params: (ptr x, ptr w, ptr y, ptr bias,
 //          i32 m, i32 n, i32 k, i32 h, i32 wd, i32 wo, i32 cin, i32 cout, i32 groups)
 brass::Function* build_conv_simt_mir(brass::Module& mod, Dtype dt, bool big128, bool accum, bool has_bias,
-                                     int kh, int kw, int sh, int sw, int ph, int pw, int dh, int dw);
+                                     int kh, int kw, int sh, int sw, int ph, int pw, int dh, int dw,
+                                     std::uint32_t act = 0);
 
 }  // namespace brotensor::kernels

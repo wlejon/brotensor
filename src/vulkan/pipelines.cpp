@@ -53,6 +53,11 @@ Pipelines::Pipelines(DeviceCtx& dev) : dev_(dev) {
     }
 }
 
+void Pipelines::flush_pipeline_cache() {
+    std::lock_guard<std::mutex> lk(mu_);
+    flush_pipeline_cache_locked();
+}
+
 void Pipelines::flush_pipeline_cache_locked() {
     if (cache_dirty_count_ == 0 || cache_ == VK_NULL_HANDLE || cache_sig_.empty()) return;
     const DeviceFns& f = dev_.fn();

@@ -1,6 +1,8 @@
 #include "mir_conv_direct.h"
 
 #include "mir_common.h"
+#include "mir_math.h"
+#include "../vulkan/shaders/op_codes.h"
 
 #include <string>
 
@@ -123,14 +125,17 @@ Value* conv_direct_trans(Ctx& c, Dtype dt, const std::vector<Value*>& p,
 
 }  // namespace
 
-brass::Function* build_conv_direct_mir(brass::Module& mod, std::uint32_t mode, Dtype dt, bool has_bias) {
+brass::Function* build_conv_direct_mir(brass::Module& mod, std::uint32_t mode_in, Dtype dt, bool has_bias) {
+    const std::uint32_t mode = mode_in & 0x0fu;
+    const std::uint32_t act = (mode_in >> 4) & 0x0fu;
     if (mode != kConvDirectFwd && mode != kConvDirectTrans) {
         throw std::runtime_error("brotensor: mir_conv_direct: unknown mode");
     }
     const std::string name = std::string("mir_conv_direct_") +
                              (mode == kConvDirectFwd ? "fwd_" : "trans_") +
                              (dt == Dtype::FP32 ? "f32" : dt == Dtype::FP16 ? "f16" : "bf16") +
-                             (has_bias ? "_b" : "");
+                             (has_bias ? "_b" : "") +
+                             (act != LACT_NONE ? ("_x" + std::to_string(act)) : std::string());
     std::vector<Type> params(26, Type::i32());
     params[0] = Type::ptr();
     params[1] = Type::ptr();
@@ -166,6 +171,7 @@ brass::Function* build_conv_direct_mir(brass::Module& mod, std::uint32_t mode, D
         Value* acc = (mode == kConvDirectFwd)
                          ? conv_direct_fwd(c, dt, p, ot, oh, ow, oc, cgi, khw, kvol, ivol, xbase, acc0)
                          : conv_direct_trans(c, dt, p, oh, ow, g, ocl, cgi, cgo, khw, ivol, xbase, acc0);
+        if (act != LACT_NONE) acc = emit_gemm_act(c, act, acc);
         store_elem_dt(c, dt, p[2], idx, acc);
     });
 

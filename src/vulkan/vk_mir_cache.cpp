@@ -226,7 +226,8 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
             const auto byte = [&](int s) -> int { return static_cast<int>((k.aux >> (s * 8)) & 0xffu); };
             fn = kernels::build_conv_simt_mir(
                 mod, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
-                byte(0), byte(1), byte(2), byte(3), byte(4), byte(5), byte(6), byte(7));
+                byte(0), byte(1), byte(2), byte(3), byte(4), byte(5), byte(6), byte(7),
+                k.op & 0x0fu);
             break;
         }
         case MirKind::GemvQ: {
@@ -277,6 +278,7 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
             s.direct = (k.flags & 8u) != 0;
             s.has_bias = (k.flags & 16u) != 0;
             s.scale_a = (k.flags & 32u) != 0;
+            s.swizzle = (k.flags & 64u) != 0;
             fn = kernels::build_gemm_cm_mir(mod, s);
             break;
         }
@@ -309,6 +311,8 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
             s.vec = (k.flags & 2u) != 0;
             s.direct = (k.flags & 4u) != 0;
             s.split = (k.flags & 8u) != 0;
+            s.head_swizzle = (k.flags & 16u) != 0;
+            s.has_softcap = (k.flags & 32u) != 0;
             fn = kernels::build_fa_cm_mir(mod, s);
             break;
         }

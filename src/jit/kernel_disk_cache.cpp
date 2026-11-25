@@ -3,8 +3,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <span>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 #if BROTENSOR_HAS_BRASS_JIT
@@ -279,7 +281,7 @@ bool KernelDiskCache::load_blob(std::string_view kind, std::string_view signatur
 
 brass::cache::CacheKey KernelDiskCache::blob_key(std::string_view kind, std::string_view signature) {
     return brass::cache::KeyBuilder(kKeyDomain)
-        .add_brass_build()
+        .add_brass_codegen()
         .add("kind", kind)
         .add("signature", signature)
         .finish();
@@ -540,6 +542,90 @@ void KernelDiskCache::clear_loaded_libraries() {
         std::lock_guard<std::mutex> lk(mutex_);
         dropped.swap(loaded_);
     }
+}
+
+std::size_t KernelDiskCache::entry_count() const {
+#if BROTENSOR_HAS_BRASS_JIT
+    if (auto st = stores()) return st->store.list_keys().size();
+#endif
+    return 0;
+}
+
+bool KernelDiskCache::export_bundle(const std::filesystem::path& out_path,
+                                    std::string_view metadata,
+                                    std::size_t* entries_written,
+                                    std::size_t* bytes_out,
+                                    std::string* error) const {
+#if BROTENSOR_HAS_BRASS_JIT
+    auto st = stores();
+    if (!st) {
+        if (error) *error = "kernel disk cache is disabled";
+        return false;
+    }
+    brass::cache::BundleStats bs;
+    const bool ok = st->store.export_bundle(out_path, metadata, &bs, error);
+    if (entries_written) *entries_written = bs.entries_written;
+    if (bytes_out) *bytes_out = bs.bytes;
+    return ok;
+#else
+    (void)out_path; (void)metadata; (void)entries_written; (void)bytes_out;
+    if (error) *error = "Brass JIT is disabled";
+    return false;
+#endif
+}
+
+bool KernelDiskCache::import_bundle(const std::filesystem::path& in_path,
+                                    std::string* metadata_out,
+                                    std::size_t* entries_imported,
+                                    std::size_t* entries_skipped,
+                                    std::size_t* bytes_out,
+                                    std::string* error) {
+#if BROTENSOR_HAS_BRASS_JIT
+    auto st = stores();
+    if (!st) {
+        if (error) *error = "kernel disk cache is disabled";
+        return false;
+    }
+    brass::cache::BundleStats bs;
+    const bool ok = st->store.import_bundle(in_path, metadata_out, &bs, error);
+    if (entries_imported) *entries_imported = bs.entries_imported;
+    if (entries_skipped) *entries_skipped = bs.entries_skipped;
+    if (bytes_out) *bytes_out = bs.bytes;
+    return ok;
+#else
+    (void)in_path; (void)metadata_out; (void)entries_imported; (void)entries_skipped; (void)bytes_out;
+    if (error) *error = "Brass JIT is disabled";
+    return false;
+#endif
+}
+
+namespace {
+struct FlushHookRegistry {
+    std::mutex mu;
+    std::unordered_map<int, PipelineCacheFlushFn> hooks;
+};
+FlushHookRegistry& flush_hooks() {
+    static auto* r = new FlushHookRegistry();
+    return *r;
+}
+} // namespace
+
+void register_pipeline_flush_hook(DeviceType type, PipelineCacheFlushFn fn) {
+    if (!fn) return;
+    auto& r = flush_hooks();
+    std::lock_guard<std::mutex> lk(r.mu);
+    r.hooks[static_cast<int>(type)] = fn;
+}
+
+void flush_pipeline_caches_for(Device dev) {
+    PipelineCacheFlushFn fn = nullptr;
+    {
+        auto& r = flush_hooks();
+        std::lock_guard<std::mutex> lk(r.mu);
+        auto it = r.hooks.find(static_cast<int>(dev.type));
+        if (it != r.hooks.end()) fn = it->second;
+    }
+    if (fn) fn(dev.index);
 }
 
 } // namespace brotensor::jit

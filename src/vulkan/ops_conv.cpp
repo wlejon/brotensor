@@ -153,7 +153,9 @@ void conv_coopmat(DeviceCtx& d, const Conv2dArgs& a, const Geo& g) {
         (static_cast<std::uint64_t>(a.ph & 0xff) << 32) | (static_cast<std::uint64_t>(a.pw & 0xff) << 40) |
         (static_cast<std::uint64_t>(a.dh & 0xff) << 48) | (static_cast<std::uint64_t>(a.dw & 0xff) << 56);
     const std::uint32_t qa = a.scale ? static_cast<std::uint32_t>(QF_INT8) : 0u;
-    const std::uint32_t op = (c.cfg_idx & 3u) | ((bvec & 3u) << 8) | ((qa & 0x0fu) << 12);
+    const std::uint32_t op = (c.cfg_idx & 3u) |
+                             ((static_cast<std::uint32_t>(a.act) & 0x0fu) << 4) |
+                             ((bvec & 3u) << 8) | ((qa & 0x0fu) << 12);
     const std::uint8_t base_flags = static_cast<std::uint8_t>(
         (avec ? 1u : 0u) | (a.bias ? 4u : 0u) | (rowch ? 8u : 0u) | (a.accum ? 16u : 0u));
     auto kernel = [&](bool direct) -> MirKernel {
@@ -205,7 +207,8 @@ void conv_simt(DeviceCtx& d, const Conv2dArgs& a, const Geo& g) {
         (static_cast<std::uint64_t>(a.dh & 0xff) << 48) | (static_cast<std::uint64_t>(a.dw & 0xff) << 56);
     const std::uint8_t flags = static_cast<std::uint8_t>(
         ((c.bm == 128) ? 1u : 0u) | (a.accum ? 2u : 0u) | (a.bias ? 4u : 0u));
-    const MirKernel mk = mir_kernel(d, {MirKind::ConvSimt, 0u, a.dt, Dtype::FP32, 1, Dtype::FP32, flags, aux});
+    const MirKernel mk = mir_kernel(d, {MirKind::ConvSimt, static_cast<std::uint32_t>(a.act) & 0x0fu,
+                                        a.dt, Dtype::FP32, 1, Dtype::FP32, flags, aux});
     const std::uint32_t gx = static_cast<std::uint32_t>(cdiv(P, c.bn));
     const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(M, c.bm));
     if (gx > 65535 || gy > 65535) fail(a.op, "image too large for one dispatch");
@@ -286,7 +289,7 @@ void conv2d(DeviceCtx& d, const Conv2dArgs& a) {
     pc.pt = 0; pc.ph = a.ph; pc.pw = a.pw;
     pc.dt = 1; pc.dh = a.dh; pc.dw = a.dw;
     pc.groups = static_cast<std::uint32_t>(a.groups);
-    conv_direct(d, 0, a.dt, pc);
+    conv_direct(d, static_cast<std::uint32_t>(a.act & 0x0f) << 4, a.dt, pc);
 }
 
 void conv2d_forward(const Tensor& X, const Tensor& Wt, const Tensor* bias, int N, int C_in, int H, int W,

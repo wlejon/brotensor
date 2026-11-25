@@ -6,6 +6,8 @@
 
 #include "detail/device.h"
 #include "detail/kernels.h"
+#include "detail/pipelines.h"
+#include "../jit/kernel_disk_cache.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/vulkan.h>
@@ -100,6 +102,11 @@ void probe_and_register() {
     ::brotensor::detail::register_backend(::brotensor::DeviceType::VULKAN, ops,
                                           dv::vulkan_alloc_table());
     dv::register_vulkan_graph_backend();
+    ::brotensor::jit::register_pipeline_flush_hook(::brotensor::DeviceType::VULKAN, [](int idx) {
+        if (idx >= 0 && idx < dv::Instance::get().count()) {
+            dv::device(idx).pipelines().flush_pipeline_cache();
+        }
+    });
     if (vk_verbose()) {
         for (int i = 0; i < inst.count(); ++i) {
             std::fprintf(stderr, "brotensor: vulkan:%d = %s (%s)\n", i, inst.phys(i).name.c_str(),

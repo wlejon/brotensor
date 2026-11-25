@@ -30,8 +30,7 @@ std::uint64_t fnv1a_u64(std::uint64_t h, const void* data, std::size_t n) noexce
     return h;
 }
 
-API_AVAILABLE(macos(11.0))
-class MtlBinaryArchiveStore {
+class API_AVAILABLE(macos(11.0)) MtlBinaryArchiveStore {
 public:
     static MtlBinaryArchiveStore& instance() {
         static MtlBinaryArchiveStore s;
@@ -70,6 +69,10 @@ public:
     }
 
     ~MtlBinaryArchiveStore() {
+        flush();
+    }
+
+    void flush() {
         std::lock_guard<std::mutex> lk(mu_);
         flush_locked();
     }
@@ -153,6 +156,12 @@ private:
 };
 
 } // namespace
+
+void flush_pipeline_archive() {
+    if (@available(macOS 11.0, *)) {
+        MtlBinaryArchiveStore::instance().flush();
+    }
+}
 
 id<MTLComputePipelineState> pipeline(NSString* name) {
     char buf[256];

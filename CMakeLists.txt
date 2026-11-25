@@ -243,11 +243,13 @@ add_library(brotensor_cpu STATIC
     src/jit/trace_dag.cpp
     src/jit/trace_cache.cpp
     src/jit/kernel_disk_cache.cpp
+    src/jit/kernel_cache_api.cpp
     src/jit/trace_compiler_cpu.cpp
     src/jit/trace_plan.cpp
     src/jit/trace_eager.cpp
     src/jit/trace_ops.cpp
     src/jit/trace_autodiff.cpp
+    src/jit/trace_autodiff_exec.cpp
 )
 target_link_libraries(brotensor_cpu PUBLIC brotensor_core Threads::Threads)
 if(MSVC)
@@ -294,6 +296,7 @@ elseif(TARGET brass)
     target_sources(brotensor_cpu PRIVATE
         src/backward_index_verify.cpp
         src/backward_shader_audit.cpp
+        src/backward_shader_audit_extra.cpp
         src/backward_nan_verify.cpp
         src/jit/gpu_mir_emit_common.cpp
         src/jit/gpu_mir_emit_elementwise.cpp

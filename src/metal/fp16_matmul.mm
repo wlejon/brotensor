@@ -79,7 +79,8 @@ void run_gemm_simt(const AbtMixed& g) {
     const ::brotensor::Dtype db = to_dtype(g.in_B < 0 ? g.in : static_cast<AbtType>(g.in_B));
     const ::brotensor::Dtype dc_orig = to_dtype(g.out);
     const ::brotensor::Dtype dt_bias = da;  // AbtMixed contract: bias has A's dtype
-    const bool glu = (g.epilogue == kAbtGeglu || g.epilogue == kAbtSwiglu);
+    const bool geglu = (g.epilogue == kAbtGeglu);
+    const bool swiglu = (g.epilogue == kAbtSwiglu);
 
     ::brotensor::Dtype dc = dc_orig;
     id<MTLBuffer> bC = g.C;
@@ -87,7 +88,7 @@ void run_gemm_simt(const AbtMixed& g) {
     uint64_t ldc = g.ldc;
     uint64_t sc = g.strideC;
     ::brotensor::Tensor scratch;
-    if (glu) {
+    if (geglu) {
         scratch = ::brotensor::Tensor::empty_on(
             ::brotensor::Device::Metal, g.batch * g.M, g.N, ::brotensor::Dtype::FP32);
         dc = ::brotensor::Dtype::FP32;
@@ -97,13 +98,14 @@ void run_gemm_simt(const AbtMixed& g) {
         sc = static_cast<uint64_t>(g.M) * static_cast<uint64_t>(g.N);
     }
 
-    const std::uint32_t epi = static_cast<std::uint32_t>(glu ? EPI_STORE : g.epilogue);
+    const std::uint32_t epi = static_cast<std::uint32_t>(geglu ? EPI_STORE : g.epilogue);
     const std::uint32_t op = epi | (static_cast<std::uint32_t>(g.act) << 4) |
                              (static_cast<std::uint32_t>(dt_bias) << 8);
     const std::uint8_t flags = static_cast<std::uint8_t>(
         (g.transA ? 2u : 0u) | (g.transB ? 4u : 0u) | (g.bias ? 8u : 0u));
     const MirKernel mk = mir_kernel({MirKind::GemmSimt, op, da, db, 1, dc, flags});
-    const std::uint32_t gx = static_cast<std::uint32_t>((g.N + 63) / 64);
+    const int n_out = swiglu ? (g.N / 2) : g.N;
+    const std::uint32_t gx = static_cast<std::uint32_t>((n_out + 63) / 64);
     const std::uint32_t gy = static_cast<std::uint32_t>((g.M + 63) / 64);
     const size_t esa = elem_size(da), esb = elem_size(db), esc = elem_size(dc);
     const int k_clamped = g.K < 0 ? 0 : g.K;
@@ -128,12 +130,11 @@ void run_gemm_simt(const AbtMixed& g) {
         mir_dispatch_mtl_3d(mk, gx, gy, static_cast<std::uint32_t>(nz), bufs, offs, 4, ints, {});
     }
 
-    if (glu) {
+    if (geglu) {
         const int half_n = g.N / 2;
-        const std::uint32_t glu_op = (g.epilogue == kAbtGeglu) ? GLU_GEGLU_PAIRS : GLU_SWIGLU;
         const size_t es_out = elem_size(dc_orig);
         for (int b = 0; b < g.batch; ++b) {
-            run_glu_mtl(glu_op, dc_orig,
+            run_glu_mtl(GLU_GEGLU_PAIRS, dc_orig,
                         bC, oC + static_cast<NSUInteger>(b) * sc * sizeof(float),
                         g.C, g.ofs_C + static_cast<NSUInteger>(b) * g.strideC * es_out,
                         g.M, half_n);

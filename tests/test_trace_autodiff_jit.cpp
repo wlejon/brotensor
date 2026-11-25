@@ -352,6 +352,183 @@ void test_extreme_boundary_nan_freedom() {
     }
 }
 
+// ─── Test 3: `silu(rms_norm(x, gamma))` & `modulate(layer_norm(...))` ──────
+void test_rmsnorm_silu_autodiff() {
+    constexpr int R = 6, C = 32;
+    Tensor x = make_host_tensor(R, C, [](int i) { return -1.3f + 0.07f * (i % 37); });
+    Tensor gamma = make_host_tensor(1, C, [](int i) { return 0.75f + 0.02f * (i % 19); });
+    Tensor dy = make_host_tensor(R, C, [](int i) { return 0.6f - 0.03f * (i % 23); });
+
+    VerifiedBackwardTrace bwd = trace_and_verify_backward(
+        {x, gamma},
+        [](const std::vector<Tensor>& ins) {
+            return silu(rms_norm(ins[0], ins[1], 1e-5f));
+        });
+
+    check_verification_certificates(bwd, "silu(rms_norm(x, gamma))");
+
+    const std::vector<float> hx = x.to_host_vector();
+    const std::vector<float> hg = gamma.to_host_vector();
+    const std::vector<float> hdy = dy.to_host_vector();
+
+    auto loss_fn = [&](const std::vector<double>& xv, const std::vector<double>& gv) {
+        double tot = 0.0;
+        for (int r = 0; r < R; ++r) {
+            double ss = 0.0;
+            for (int c = 0; c < C; ++c) {
+                double v = xv[static_cast<size_t>(r * C + c)];
+                ss += v * v;
+            }
+            double rstd = 1.0 / std::sqrt(ss / C + 1e-5);
+            for (int c = 0; c < C; ++c) {
+                size_t idx = static_cast<size_t>(r * C + c);
+                double u = xv[idx] * rstd * gv[static_cast<size_t>(c)];
+                double sig = 1.0 / (1.0 + std::exp(-u));
+                tot += (u * sig) * static_cast<double>(hdy[idx]);
+            }
+        }
+        return tot;
+    };
+
+    std::vector<double> dx_v(hx.begin(), hx.end()), dg_v(hg.begin(), hg.end());
+    std::vector<float> ref_dx(R * C), ref_dg(C);
+    constexpr double h = 1e-5;
+    for (int i = 0; i < R * C; ++i) {
+        double o = dx_v[static_cast<size_t>(i)];
+        dx_v[static_cast<size_t>(i)] = o + h;
+        double fp = loss_fn(dx_v, dg_v);
+        dx_v[static_cast<size_t>(i)] = o - h;
+        double fm = loss_fn(dx_v, dg_v);
+        dx_v[static_cast<size_t>(i)] = o;
+        ref_dx[static_cast<size_t>(i)] = static_cast<float>((fp - fm) / (2.0 * h));
+    }
+    for (int c = 0; c < C; ++c) {
+        double o = dg_v[static_cast<size_t>(c)];
+        dg_v[static_cast<size_t>(c)] = o + h;
+        double fp = loss_fn(dx_v, dg_v);
+        dg_v[static_cast<size_t>(c)] = o - h;
+        double fm = loss_fn(dx_v, dg_v);
+        dg_v[static_cast<size_t>(c)] = o;
+        ref_dg[static_cast<size_t>(c)] = static_cast<float>((fp - fm) / (2.0 * h));
+    }
+
+    std::vector<Tensor> grads_cpu = bwd.execute({x, gamma}, dy);
+    CHECK(grads_cpu.size() == 2, "Expected 2 gradients for rms_norm");
+    CHECK(grads_cpu[0].rows == R && grads_cpu[0].cols == C, "grad_x shape mismatch");
+    CHECK(grads_cpu[1].rows == 1 && grads_cpu[1].cols == C, "grad_gamma shape mismatch");
+    CHECK(max_abs_diff(grads_cpu[0].to_host_vector(), ref_dx) < 1e-4f,
+          "CPU rms_norm grad_x mismatch");
+    CHECK(max_abs_diff(grads_cpu[1].to_host_vector(), ref_dg) < 1e-4f,
+          "CPU rms_norm grad_gamma mismatch");
+
+    if (is_available(Device::VULKAN)) {
+        Device vk = Device::VULKAN;
+        std::vector<Tensor> grads_vk = bwd.execute({x.to(vk), gamma.to(vk)}, dy.to(vk));
+        CHECK(grads_vk[1].rows == 1 && grads_vk[1].cols == C, "Vulkan grad_gamma shape mismatch");
+        CHECK(max_abs_diff(grads_vk[0].to(Device::CPU).to_host_vector(), ref_dx) < 1e-4f,
+              "Vulkan rms_norm grad_x mismatch");
+        CHECK(max_abs_diff(grads_vk[1].to(Device::CPU).to_host_vector(), ref_dg) < 1e-4f,
+              "Vulkan rms_norm grad_gamma mismatch");
+    }
+}
+
+void test_layernorm_modulate_autodiff() {
+    constexpr int R = 6, C = 32;
+    Tensor x = make_host_tensor(R, C, [](int i) { return -0.9f + 0.05f * (i % 41); });
+    Tensor gamma = make_host_tensor(1, C, [](int i) { return 0.8f + 0.015f * (i % 17); });
+    Tensor beta = make_host_tensor(1, C, [](int i) { return -0.2f + 0.01f * (i % 13); });
+    Tensor scale = make_host_tensor(1, C, [](int i) { return 0.1f + 0.005f * (i % 11); });
+    Tensor shift = make_host_tensor(1, C, [](int i) { return -0.15f + 0.008f * (i % 7); });
+    Tensor dy = make_host_tensor(R, C, [](int i) { return 0.55f + 0.02f * (i % 19); });
+
+    VerifiedBackwardTrace bwd = trace_and_verify_backward(
+        {x, gamma, beta, scale, shift},
+        [](const std::vector<Tensor>& ins) {
+            return modulate(layernorm(ins[0], ins[1], ins[2], 1e-5f), ins[3], ins[4]);
+        });
+
+    check_verification_certificates(bwd, "modulate(layer_norm(x, gamma, beta), scale, shift)");
+
+    const std::vector<float> hx = x.to_host_vector();
+    const std::vector<float> hg = gamma.to_host_vector();
+    const std::vector<float> hb = beta.to_host_vector();
+    const std::vector<float> hsc = scale.to_host_vector();
+    const std::vector<float> hsh = shift.to_host_vector();
+    const std::vector<float> hdy = dy.to_host_vector();
+
+    auto loss_fn = [&](const std::vector<double>& xv, const std::vector<double>& gv,
+                       const std::vector<double>& bv, const std::vector<double>& sv,
+                       const std::vector<double>& zv) {
+        double tot = 0.0;
+        for (int r = 0; r < R; ++r) {
+            double sum = 0.0;
+            for (int c = 0; c < C; ++c) sum += xv[static_cast<size_t>(r * C + c)];
+            double mean = sum / C;
+            double var = 0.0;
+            for (int c = 0; c < C; ++c) {
+                double d = xv[static_cast<size_t>(r * C + c)] - mean;
+                var += d * d;
+            }
+            double rstd = 1.0 / std::sqrt(var / C + 1e-5);
+            for (int c = 0; c < C; ++c) {
+                size_t idx = static_cast<size_t>(r * C + c);
+                size_t cs = static_cast<size_t>(c);
+                double ln = ((xv[idx] - mean) * rstd) * gv[cs] + bv[cs];
+                double y = ln * (1.0 + sv[cs]) + zv[cs];
+                tot += y * static_cast<double>(hdy[idx]);
+            }
+        }
+        return tot;
+    };
+
+    std::vector<double> dxv(hx.begin(), hx.end()), dgv(hg.begin(), hg.end()),
+        dbv(hb.begin(), hb.end()), dsv(hsc.begin(), hsc.end()), dzv(hsh.begin(), hsh.end());
+    std::vector<float> ref_dx(R * C), ref_dg(C), ref_db(C);
+    constexpr double h = 1e-5;
+    for (int i = 0; i < R * C; ++i) {
+        double o = dxv[static_cast<size_t>(i)];
+        dxv[static_cast<size_t>(i)] = o + h; double fp = loss_fn(dxv, dgv, dbv, dsv, dzv);
+        dxv[static_cast<size_t>(i)] = o - h; double fm = loss_fn(dxv, dgv, dbv, dsv, dzv);
+        dxv[static_cast<size_t>(i)] = o;
+        ref_dx[static_cast<size_t>(i)] = static_cast<float>((fp - fm) / (2.0 * h));
+    }
+    for (int c = 0; c < C; ++c) {
+        size_t cs = static_cast<size_t>(c);
+        double og = dgv[cs];
+        dgv[cs] = og + h; double fpg = loss_fn(dxv, dgv, dbv, dsv, dzv);
+        dgv[cs] = og - h; double fmg = loss_fn(dxv, dgv, dbv, dsv, dzv);
+        dgv[cs] = og;
+        ref_dg[cs] = static_cast<float>((fpg - fmg) / (2.0 * h));
+
+        double ob = dbv[cs];
+        dbv[cs] = ob + h; double fpb = loss_fn(dxv, dgv, dbv, dsv, dzv);
+        dbv[cs] = ob - h; double fmb = loss_fn(dxv, dgv, dbv, dsv, dzv);
+        dbv[cs] = ob;
+        ref_db[cs] = static_cast<float>((fpb - fmb) / (2.0 * h));
+    }
+
+    std::vector<Tensor> grads_cpu = bwd.execute({x, gamma, beta, scale, shift}, dy);
+    CHECK(grads_cpu.size() == 5, "Expected 5 gradients for layernorm modulate");
+    CHECK(max_abs_diff(grads_cpu[0].to_host_vector(), ref_dx) < 1e-4f,
+          "CPU layernorm grad_x mismatch");
+    CHECK(max_abs_diff(grads_cpu[1].to_host_vector(), ref_dg) < 1e-4f,
+          "CPU layernorm grad_gamma mismatch");
+    CHECK(max_abs_diff(grads_cpu[2].to_host_vector(), ref_db) < 1e-4f,
+          "CPU layernorm grad_beta mismatch");
+
+    if (is_available(Device::VULKAN)) {
+        Device vk = Device::VULKAN;
+        std::vector<Tensor> grads_vk = bwd.execute(
+            {x.to(vk), gamma.to(vk), beta.to(vk), scale.to(vk), shift.to(vk)}, dy.to(vk));
+        CHECK(max_abs_diff(grads_vk[0].to(Device::CPU).to_host_vector(), ref_dx) < 1e-4f,
+              "Vulkan layernorm grad_x mismatch");
+        CHECK(max_abs_diff(grads_vk[1].to(Device::CPU).to_host_vector(), ref_dg) < 1e-4f,
+              "Vulkan layernorm grad_gamma mismatch");
+        CHECK(max_abs_diff(grads_vk[2].to(Device::CPU).to_host_vector(), ref_db) < 1e-4f,
+              "Vulkan layernorm grad_beta mismatch");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -361,6 +538,8 @@ int main() {
     test_composite_expr_relu_div_sqrt();
     test_transcendental_and_select_autodiff();
     test_extreme_boundary_nan_freedom();
+    test_rmsnorm_silu_autodiff();
+    test_layernorm_modulate_autodiff();
 
     if (g_failures == 0) {
         std::cout << "[PASS] All TraceDAG::backward() verified autodiff JIT tests passed.\n";

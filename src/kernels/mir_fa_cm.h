@@ -20,12 +20,14 @@ struct FaCmSpec {
     bool vec = true;
     bool direct = false;
     bool split = false;
+    bool has_softcap = false;
+    bool head_swizzle = false; // Launch with ctaid_x = head, ctaid_y = qb (breaks PoT L1/L2 set aliasing)
 };
 
-// Params (22):
+// Params (23):
 //   ptrs[0..7]: q, k, v, o, mask, aux, aux2, part
 //   ints[8..20]: lq, lk, ldq, ldk, ldo, group, window, causal, nseq, chunk, hq, qb0, q_offset
-//   flts[21]: scale (log2(e) / sqrt(HD))
+//   flts[21..22]: scale (log2(e) / sqrt(HD)), softcap
 brass::Function* build_fa_cm_mir(brass::Module& mod, const FaCmSpec& spec);
 
 }  // namespace brotensor::kernels

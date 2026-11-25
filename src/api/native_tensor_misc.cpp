@@ -7,6 +7,7 @@
 #include "native_tensor_misc_decl.h"
 #include "api_internal.h"
 #include "native_register.h"
+#include <brotensor/kernel_cache.h>
 
 #include <string>
 
@@ -156,6 +157,103 @@ void bro_tensor_timestepEmbedding(void* timesteps, int32_t dim, double maxPeriod
     BROTENSOR_API_CATCH("timestepEmbedding")
 }
 
+const char* bro_tensor_cacheDir(void) {
+    static thread_local std::string dir;
+    BROTENSOR_API_TRY
+        dir = brotensor::kernel_cache_dir();
+        return dir.c_str();
+    BROTENSOR_API_CATCH("cacheDir")
+    return "";
+}
+
+void bro_tensor_cacheStats(bronze_native_buffer* out) {
+    static thread_local double vals[5];
+    if (!out) return;
+    out->data = nullptr;
+    out->length = 0;
+    out->release = nullptr;
+    out->ctx = nullptr;
+    BROTENSOR_API_TRY
+        const brotensor::KernelCacheStats s = brotensor::kernel_cache_stats();
+        vals[0] = static_cast<double>(s.hits);
+        vals[1] = static_cast<double>(s.misses);
+        vals[2] = static_cast<double>(s.writes);
+        vals[3] = static_cast<double>(s.corruptions);
+        vals[4] = static_cast<double>(s.entries);
+        out->data = vals;
+        out->length = 5;
+    BROTENSOR_API_CATCH("cacheStats")
+}
+
+void bro_tensor_setAutotune(bool enabled) {
+    brotensor::set_autotune_enabled(enabled);
+}
+
+bool bro_tensor_autotuneEnabled(void) {
+    return brotensor::autotune_enabled();
+}
+
+void bro_tensor_warmupKernels(const char* profile, bool autotune, bronze_native_buffer* out) {
+    static thread_local double vals[3];
+    if (!out) return;
+    out->data = nullptr;
+    out->length = 0;
+    out->release = nullptr;
+    out->ctx = nullptr;
+    BROTENSOR_API_TRY
+        brotensor::WarmupOptions opts;
+        if (profile && profile[0] != '\0') opts.profile = profile;
+        opts.autotune = autotune;
+        const brotensor::WarmupStats w = brotensor::warmup_kernels(brotensor::default_device(), opts);
+        vals[0] = static_cast<double>(w.kernels_compiled);
+        vals[1] = static_cast<double>(w.autotune_entries);
+        vals[2] = w.elapsed_ms;
+        out->data = vals;
+        out->length = 3;
+    BROTENSOR_API_CATCH("warmupKernels")
+}
+
+bool bro_tensor_exportKernelBundle(const char* path) {
+    std::string resolved;
+    if (!gatedPath(path, /*write=*/true, resolved)) return false;
+    BROTENSOR_API_TRY
+        std::string err;
+        if (!brotensor::export_kernel_bundle(resolved, brotensor::default_device(), &err)) {
+            setError("exportKernelBundle: " + (err.empty() ? "failed" : err));
+            return false;
+        }
+        return true;
+    BROTENSOR_API_CATCH("exportKernelBundle")
+    return false;
+}
+
+void bro_tensor_importKernelBundle(const char* path, bronze_native_buffer* out) {
+    static thread_local double vals[3];
+    if (out) {
+        out->data = nullptr;
+        out->length = 0;
+        out->release = nullptr;
+        out->ctx = nullptr;
+    }
+    std::string resolved;
+    if (!gatedPath(path, /*write=*/false, resolved)) return;
+    BROTENSOR_API_TRY
+        brotensor::BundleImportReport rep;
+        std::string err;
+        if (!brotensor::import_kernel_bundle(resolved, &rep, &err)) {
+            setError("importKernelBundle: " + (err.empty() ? "failed" : err));
+            return;
+        }
+        if (out) {
+            vals[0] = static_cast<double>(rep.entries_imported);
+            vals[1] = static_cast<double>(rep.entries_skipped);
+            vals[2] = static_cast<double>(rep.bytes);
+            out->data = vals;
+            out->length = 3;
+        }
+    BROTENSOR_API_CATCH("importKernelBundle")
+}
+
 } // extern "C"
 
 namespace brotensor::api {
@@ -180,7 +278,14 @@ bool registerTensorNatives_misc(std::string* error) {
         fn("__bro_native.tensor.dpmpp2mStep", p(&bro_tensor_dpmpp2mStep), "void",
            {kTensorCls, kTensorCls, kTensorCls, "f64", "f64", "f64", "f64", kTensorCls, kTensorCls}, error) &&
         fn("__bro_native.tensor.timestepEmbedding", p(&bro_tensor_timestepEmbedding), "void",
-           {kTensorCls, "i32", "f64", kTensorCls}, error);
+           {kTensorCls, "i32", "f64", kTensorCls}, error) &&
+        fn("__bro_native.tensor.cacheDir", p(&bro_tensor_cacheDir), "str", {}, error) &&
+        fn("__bro_native.tensor.cacheStats", p(&bro_tensor_cacheStats), "f64[]", {}, error) &&
+        fn("__bro_native.tensor.setAutotune", p(&bro_tensor_setAutotune), "void", {"bool"}, error) &&
+        fn("__bro_native.tensor.autotuneEnabled", p(&bro_tensor_autotuneEnabled), "bool", {}, error) &&
+        fn("__bro_native.tensor.warmupKernels", p(&bro_tensor_warmupKernels), "f64[]", {"str", "bool"}, error) &&
+        fn("__bro_native.tensor.exportKernelBundle", p(&bro_tensor_exportKernelBundle), "bool", {"str"}, error) &&
+        fn("__bro_native.tensor.importKernelBundle", p(&bro_tensor_importKernelBundle), "f64[]", {"str"}, error);
 }
 
 } // namespace brotensor::api

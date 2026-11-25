@@ -32,6 +32,8 @@
 // Files of the old format (*.btkc, the .rt/ load copies) are never read; they
 // are deleted the first time a directory is opened.
 
+#include <brotensor/tensor.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -180,6 +182,19 @@ public:
     // function pointers are gone: single-threaded test resets).
     void clear_loaded_libraries();
 
+    std::size_t entry_count() const;
+    bool export_bundle(const std::filesystem::path& out_path,
+                       std::string_view metadata,
+                       std::size_t* entries_written = nullptr,
+                       std::size_t* bytes_out = nullptr,
+                       std::string* error = nullptr) const;
+    bool import_bundle(const std::filesystem::path& in_path,
+                       std::string* metadata_out = nullptr,
+                       std::size_t* entries_imported = nullptr,
+                       std::size_t* entries_skipped = nullptr,
+                       std::size_t* bytes_out = nullptr,
+                       std::string* error = nullptr);
+
 private:
     KernelDiskCache() = default;
 
@@ -196,5 +211,9 @@ private:
 };
 
 using MlKernelDiskCache = KernelDiskCache;
+
+using PipelineCacheFlushFn = void (*)(int device_index);
+void register_pipeline_flush_hook(DeviceType type, PipelineCacheFlushFn fn);
+void flush_pipeline_caches_for(Device dev);
 
 } // namespace brotensor::jit

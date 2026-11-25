@@ -41,6 +41,9 @@ if(BROTENSOR_HAS_BRASS_JIT)
     brotensor_add_test(brotensor_test_kernel_disk_cache test_kernel_disk_cache.cpp)
     target_link_libraries(brotensor_test_kernel_disk_cache PRIVATE ${BROTENSOR_BRASS_LIB})
 
+    brotensor_add_test(brotensor_test_kernel_bundle_autotune test_kernel_bundle_autotune.cpp)
+    target_link_libraries(brotensor_test_kernel_bundle_autotune PRIVATE ${BROTENSOR_BRASS_LIB})
+
     brotensor_add_test(brotensor_test_backward_index_proofs test_backward_index_proofs.cpp)
     target_link_libraries(brotensor_test_backward_index_proofs PRIVATE ${BROTENSOR_BRASS_LIB})
 

@@ -253,5 +253,40 @@ int run_api_misc_tests() {
     })();
     )JS");
 
+    // ---- kernelCache / warmup / autotune / bundles -------------------------
+    f += runJs("test_api_misc.kernelCache", R"JS(
+    (function () {
+        const tensor = globalThis.bro.tensor;
+        const prevAt = tensor.autotuneEnabled();
+        tensor.setAutotune(true);
+        if (!tensor.autotuneEnabled()) throw new Error("setAutotune(true) did not enable");
+        tensor.setAutotune(false);
+        if (tensor.autotuneEnabled()) throw new Error("setAutotune(false) did not disable");
+        tensor.setAutotune(prevAt);
+
+        const st0 = tensor.cacheStats();
+        if (typeof st0.dir !== "string" || st0.dir.length === 0) {
+            throw new Error("cacheStats().dir missing: " + JSON.stringify(st0));
+        }
+        const wu = tensor.warmupKernels("minimal", false);
+        if (typeof wu.kernelsCompiled !== "number" || typeof wu.elapsedMs !== "number") {
+            throw new Error("warmupKernels stats shape invalid: " + JSON.stringify(wu));
+        }
+        const st1 = tensor.cacheStats();
+        if (typeof st1.entries !== "number" || st1.entries <= 0) {
+            throw new Error("cacheStats().entries should be > 0 after warmup: " + JSON.stringify(st1));
+        }
+
+        const bundlePath = st1.dir + "/_test_js_bundle.bacb";
+        tensor.exportKernelBundle(bundlePath);
+        const imp = tensor.importKernelBundle(bundlePath);
+        if (typeof imp.entriesImported !== "number" || imp.bytes <= 0) {
+            throw new Error("importKernelBundle result invalid: " + JSON.stringify(imp));
+        }
+
+        return "OK";
+    })();
+    )JS");
+
     return f;
 }

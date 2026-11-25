@@ -66,6 +66,7 @@
 #define EPI_ACCUM       1
 #define EPI_GEGLU       2
 #define EPI_SWIGLU      3
+#define EPI_RESIDUAL_ADD 4
 
 // glu.comp
 #define GLU_SWIGLU          0

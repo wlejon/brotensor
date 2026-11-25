@@ -4,6 +4,7 @@
 
 #include "detail/gemm.h"
 #include "detail/kernels.h"
+#include "vk_autotune.h"
 #include "vk_mir_cache.h"
 
 #include <algorithm>
@@ -67,7 +68,7 @@ bool cm_vec_ok(const GemmArgs& g) {
 }
 
 bool gemv_eligible(DeviceCtx& d, const GemmArgs& g) {
-    if (g_override.load(std::memory_order_relaxed) != 0 || g.qb != 0) return false;
+    if (g_override.load(std::memory_order_relaxed) != 0 || g.qb != 0 || g.epi == EPI_RESIDUAL_ADD) return false;
     const std::uint32_t sgs = d.info().subgroup_size;
     if (sgs < 32 || sgs > 64 || 64 % sgs != 0) return false;
     if (g.ta || g.nb || g.batch != 1 || g.m > 8) return false;
@@ -117,8 +118,13 @@ void launch_cm_batched(DeviceCtx& d, const MirKernel& mk, const GemmArgs& g, std
             g.bias,
             g.scale,
             as,
+            g.epi == EPI_RESIDUAL_ADD
+                ? (g.residual + static_cast<std::uint64_t>(z0) * g.sc * esize(g.dc))
+                : 0u,
         };
-        mir_dispatch_args_3d(d, mk, gx, gy, static_cast<std::uint32_t>(nz), ptrs, ints, {});
+        const std::span<const std::uint64_t> ptr_span(
+            ptrs, g.epi == EPI_RESIDUAL_ADD ? 7u : 6u);
+        mir_dispatch_args_3d(d, mk, gx, gy, static_cast<std::uint32_t>(nz), ptr_span, ints, {});
     }
 }
 
@@ -129,6 +135,9 @@ void check_args(const GemmArgs& g) {
     }
     if ((g.epi == EPI_GEGLU || g.epi == EPI_SWIGLU) && (g.ta || g.nb || g.n % 2 != 0 || g.act != 0)) {
         fail(g, "the GeGLU / SwiGLU epilogues need the linear (NT) layout, an even width and act 0");
+    }
+    if (g.epi == EPI_RESIDUAL_ADD && g.residual == 0) {
+        fail(g, "EPI_RESIDUAL_ADD requires a residual device address");
     }
     if (g.qb != 0 && (g.ta || g.nb || g.batch != 1)) fail(g, "a quantised B needs the NT layout and one batch");
     // Element indices are 32-bit in the kernels (no buffer exceeds 4 GiB).
@@ -230,7 +239,13 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
     }
 
     if (coopmat_eligible(d, g)) {
-        const std::uint32_t cfg_idx = pick_cm_idx(g, nout);
+        const std::uint32_t heur_idx = pick_cm_idx(g, nout);
+        const std::uint32_t heur_sw = 0u;
+        GemmTuneCfg tuned{heur_idx, heur_sw, true};
+        if (g_cm_cfg.load(std::memory_order_relaxed) < 0) {
+            tuned = autotune_gemm_cm(d, g, nout, tuned);
+        }
+        const std::uint32_t cfg_idx = tuned.cfg_idx;
         const CmCfg& c = kCmCfgs[cfg_idx];
         const std::uint32_t wout = g.epi == EPI_SWIGLU ? c.bn / 2 : c.bn;
         const std::uint32_t gx = static_cast<std::uint32_t>(
@@ -256,29 +271,32 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
         const std::uint8_t base_flags = static_cast<std::uint8_t>(
             (g.ta ? 1u : 0u) | (g.nb ? 2u : 0u) | (cm_vec_ok(g) ? 4u : 0u) |
             (g.bias ? 16u : 0u) | (scaled ? 32u : 0u));
-        auto kernel = [&](bool direct) -> MirKernel {
-            const std::uint8_t flags = static_cast<std::uint8_t>(base_flags | (direct ? 8u : 0u));
+        auto kernel = [&](bool direct, bool swizzle) -> MirKernel {
+            const std::uint8_t flags = static_cast<std::uint8_t>(
+                base_flags | (direct ? 8u : 0u) | (swizzle ? 64u : 0u));
             return mir_kernel(d, {MirKind::GemmCm, op, g.da, g.db, 1, g.dc, flags}, 32u);
         };
         const bool direct = g.da == Dtype::FP16 && g.dc == Dtype::FP16 && g.epi != EPI_GEGLU && g.c % 16 == 0 && g.ldc % 8 == 0 &&
-                            g.sc % 8 == 0 && (g.bias == 0 || g.bias % 16 == 0);
+                            g.sc % 8 == 0 && (g.bias == 0 || g.bias % 16 == 0) &&
+                            (g.epi != EPI_RESIDUAL_ADD || g.residual % 16 == 0);
         const std::uint32_t fx = direct ? static_cast<std::uint32_t>((g.epi == EPI_SWIGLU ? nout : g.n) / wout) : 0;
         const std::uint32_t fy = direct ? static_cast<std::uint32_t>(g.m / c.bm) : 0;
+        const bool use_swizzle = (tuned.swizzle_group > 0u);
         if (fx > 0 && fy > 0) {
-            launch_cm_batched(d, kernel(true), g, ascale, 0u, 0u, fx, fy);
-            if (fx < gx) launch_cm_batched(d, kernel(false), g, ascale, 0u, fx, gx - fx, gy);
-            if (fy < gy) launch_cm_batched(d, kernel(false), g, ascale, fy, 0u, fx, gy - fy);
+            launch_cm_batched(d, kernel(true, use_swizzle), g, ascale, 0u, 0u, fx, fy);
+            if (fx < gx) launch_cm_batched(d, kernel(false, false), g, ascale, 0u, fx, gx - fx, gy);
+            if (fy < gy) launch_cm_batched(d, kernel(false, false), g, ascale, fy, 0u, fx, gy - fy);
         } else {
-            launch_cm_batched(d, kernel(false), g, ascale, 0u, 0u, gx, gy);
+            launch_cm_batched(d, kernel(false, use_swizzle), g, ascale, 0u, 0u, gx, gy);
         }
         return;
     }
 
     if (g.qb != 0) fail(g, "a quantised B needs cooperative matrix and 16-bit A / C");
 
-    // The SIMT kernel has no GLU epilogue: it writes r (bias included) to an
-    // FP32 scratch, unrounded, and a separate pass gates it into C.
-    const bool glu = g.epi == EPI_GEGLU || g.epi == EPI_SWIGLU;
+    // The SIMT kernel runs GeGLU through an FP32 scratch + Glu pass, while
+    // SwiGLU and EPI_RESIDUAL_ADD execute directly in registers in a single pass.
+    const bool geglu = g.epi == EPI_GEGLU;
     const bool same_all = (g.da == g.db && g.dc == g.da);
     const bool f32_w16 = (g.da == Dtype::FP32 && g.dc == Dtype::FP32 && is16(g.db));
     const bool f16_c32 = (g.da == g.db && is16(g.da) && g.dc == Dtype::FP32);
@@ -287,7 +305,7 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
     std::uint64_t c_addr = g.c;
     std::int32_t ldc = g.ldc;
     ::brotensor::Tensor r;
-    if (glu) {
+    if (geglu) {
         if (g.batch != 1) fail(g, "batched GLU epilogue");
         r = ::brotensor::Tensor::empty_on(::brotensor::Device::vulkan(d.index()), g.m, g.n, Dtype::FP32);
         dc = Dtype::FP32;
@@ -296,14 +314,14 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
     }
     const Dtype dt_bias = f16_c32 ? g.da : g.dc;
     const std::uint64_t tiles_big = cdiv(g.m, kSimtCfgs[0].bm) * cdiv(g.n, kSimtCfgs[0].bn) * g.batch;
-    const SimtCfg& c = tiles_big >= 160 ? kSimtCfgs[0] : kSimtCfgs[1];
-    const std::uint32_t epi = static_cast<std::uint32_t>(glu ? EPI_STORE : g.epi);
+    const SimtCfg& c = (g.epi != EPI_SWIGLU && tiles_big >= 160) ? kSimtCfgs[0] : kSimtCfgs[1];
+    const std::uint32_t epi = static_cast<std::uint32_t>(geglu ? EPI_STORE : g.epi);
     const std::uint32_t op = epi | (static_cast<std::uint32_t>(g.act) << 4) |
                              (static_cast<std::uint32_t>(dt_bias) << 8);
     const std::uint8_t flags = static_cast<std::uint8_t>(
         ((c.bm == 128) ? 1u : 0u) | (g.ta ? 2u : 0u) | (g.nb ? 4u : 0u) | (g.bias ? 8u : 0u));
     const MirKernel mk = mir_kernel(d, {MirKind::GemmSimt, op, g.da, g.db, 1, dc, flags});
-    const std::uint32_t gx = static_cast<std::uint32_t>(cdiv(g.n, c.bn));
+    const std::uint32_t gx = static_cast<std::uint32_t>(cdiv(g.epi == EPI_SWIGLU ? nout : static_cast<std::uint32_t>(g.n), c.bn));
     const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(g.m, c.bm));
     if (gx > 65535 || gy > 65535) fail(g, "matrix too large for one dispatch");
     for (int z0 = 0; z0 < g.batch; z0 += 65535) {
@@ -313,19 +331,20 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
             g.b + static_cast<std::uint64_t>(z0) * g.sb * esize(g.db),
             c_addr + static_cast<std::uint64_t>(z0) * g.sc * esize(dc),
             g.bias,
+            g.epi == EPI_RESIDUAL_ADD
+                ? (g.residual + static_cast<std::uint64_t>(z0) * g.sc * esize(dc))
+                : 0u,
         };
+        const std::span<const std::uint64_t> ptr_span(
+            ptrs, g.epi == EPI_RESIDUAL_ADD ? 5u : 4u);
         const std::int32_t ints[] = {g.m, g.n, g.k, g.lda, g.ldb, ldc,
                                      static_cast<std::int32_t>(g.sa), static_cast<std::int32_t>(g.sb),
                                      static_cast<std::int32_t>(g.sc)};
-        mir_dispatch_args_3d(d, mk, gx, gy, static_cast<std::uint32_t>(nz), ptrs, ints, {});
+        mir_dispatch_args_3d(d, mk, gx, gy, static_cast<std::uint32_t>(nz), ptr_span, ints, {});
     }
-    if (glu) {
+    if (geglu) {
         if (g.ldc != static_cast<int>(nout)) fail(g, "GLU output must be contiguous");
-        if (g.epi == EPI_GEGLU) {
-            glu_pass(d, GLU_GEGLU_PAIRS, addr(r.data), g.c, g.dc, static_cast<std::uint32_t>(g.m), nout);
-        } else {
-            glu_pass(d, GLU_SWIGLU, addr(r.data), g.c, g.dc, static_cast<std::uint32_t>(g.m), nout);
-        }
+        glu_pass(d, GLU_GEGLU_PAIRS, addr(r.data), g.c, g.dc, static_cast<std::uint32_t>(g.m), nout);
     }
 }
 

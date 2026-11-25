@@ -17,9 +17,7 @@ namespace {
 using jit::gpu_mir::bits_to_f32;
 
 Value* conv_act(Ctx& c, std::uint32_t act, Value* v) {
-    if (act == LACT_RELU) return c.kb.fmax(v, c.f32(0.0f));
-    if (act == LACT_SILU) return c.b.build_mul(v, emit_sigmoid(c, v));
-    return v;
+    return emit_gemm_act(c, act, v);
 }
 
 Value* bf16_bits_to_f16_bits(Ctx& c, Value* b16) {

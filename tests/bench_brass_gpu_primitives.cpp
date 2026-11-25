@@ -108,14 +108,23 @@ void set_push(std::vector<std::uint8_t>& buf, const SpirvKernel& sk, std::size_t
 // Kernel 1: Double-buffered 128x128x32 FP16 cooperative-matrix NT GEMM
 // C(M, N) = A(M, K) @ B(N, K)^T with bank-conflict padded shared tiles and K-rot.
 // ---------------------------------------------------------------------------
-SpirvKernel build_coopmat_gemm_nt_f16() {
-    constexpr std::uint32_t kWg = 128;
-    constexpr std::int32_t kSk = 5;    // BK / 8 + 1 = 5 i32x4 (40 fp16) per row
-    constexpr std::int32_t kSz = 640;  // 128 * 5 i32x4 per tile buffer
+SpirvKernel build_coopmat_gemm_nt_f16(bool tile_256x128 = false, bool swizzle = false) {
+    const std::uint32_t kBm = tile_256x128 ? 256u : 128u;
+    const std::uint32_t kBn = 128u;
+    const std::uint32_t kBk = 32u;
+    const std::uint32_t kWm = 64u;
+    const std::uint32_t kWn = 64u;
+    const std::uint32_t kWg = tile_256x128 ? 256u : 128u;
+    const std::int32_t kSk = static_cast<std::int32_t>(kBk / 8u + 1u); // 5 i32x4 per row
+    const std::int32_t kSza = static_cast<std::int32_t>(kBm) * kSk;
+    const std::int32_t kSzb = static_cast<std::int32_t>(kBn) * kSk;
+    const std::uint32_t kLa = (kBm * kBk / 8u) / kWg;
+    const std::uint32_t kLb = (kBn * kBk / 8u) / kWg;
 
     Module mod("brass_coopmat_gemm_nt_f16");
     Function* fn = mod.create_function(
-        "brass_coopmat_gemm_nt_f16", Type::void_type(),
+        tile_256x128 ? "brass_coopmat_gemm_nt_f16_256" : "brass_coopmat_gemm_nt_f16",
+        Type::void_type(),
         {Type::ptr(), Type::ptr(), Type::ptr(), Type::i32(), Type::i32(), Type::i32()});
 
     Builder b(mod);
@@ -131,22 +140,44 @@ SpirvKernel build_coopmat_gemm_nt_f16() {
     (void)M;
 
     KernelBuilder kb(b);
-    Value* As = kb.shared_alloc_i32x4(2 * kSz);
-    Value* Bs = kb.shared_alloc_i32x4(2 * kSz);
+    Value* As = kb.shared_alloc_i32x4(static_cast<std::uint32_t>(2 * kSza));
+    Value* Bs = kb.shared_alloc_i32x4(static_cast<std::uint32_t>(2 * kSzb));
 
     Value* tid = kb.tid_x();
     Value* wgx = kb.ctaid_x();
     Value* wgy = kb.ctaid_y();
+    if (swizzle) {
+        Value* num_n = kb.nctaid_x();
+        Value* num_m = kb.nctaid_y();
+        Value* flat = kb.add(kb.mul(wgy, num_n), wgx);
+        Value* c1 = kb.const_i32(1);
+        Value* c4 = kb.const_i32(4);
+        Value* s_stride = b.build_shl(num_n, kb.const_i32(2));
+        s_stride = b.build_select(b.build_sgt(s_stride, c1), s_stride, c1);
+        Value* slab_idx = b.build_udiv(flat, s_stride);
+        Value* slab_m0 = b.build_shl(slab_idx, kb.const_i32(2));
+        Value* rem = b.build_umod(flat, s_stride);
+        Value* left = kb.sub(num_m, slab_m0);
+        Value* slab_h = b.build_select(b.build_slt(left, c4), left, c4);
+        slab_h = b.build_select(b.build_sgt(slab_h, c1), slab_h, c1);
+        wgy = kb.add(slab_m0, b.build_umod(rem, slab_h));
+        wgx = b.build_udiv(rem, slab_h);
+    }
     Value* sg = kb.subgroup_id();
 
-    Value* m0 = b.build_shl(wgy, kb.const_i32(7));  // wgy * 128
-    Value* n0 = b.build_shl(wgx, kb.const_i32(7));  // wgx * 128
-    Value* wm0 = b.build_shl(b.build_and(sg, kb.const_i32(1)), kb.const_i32(6));
-    Value* wn0 = b.build_shl(b.build_lshr(sg, kb.const_i32(1)), kb.const_i32(6));
+    Value* m0 = kb.mul(wgy, kb.const_i32(static_cast<std::int32_t>(kBm)));
+    Value* n0 = kb.mul(wgx, kb.const_i32(static_cast<std::int32_t>(kBn)));
+    Value* wm0 = kb.mul(b.build_umod(sg, kb.const_i32(static_cast<std::int32_t>(kBm / kWm))),
+                        kb.const_i32(static_cast<std::int32_t>(kWm)));
+    Value* wn0 = kb.mul(b.build_udiv(sg, kb.const_i32(static_cast<std::int32_t>(kBm / kWm))),
+                        kb.const_i32(static_cast<std::int32_t>(kWn)));
 
     Value* nk = b.build_lshr(K, kb.const_i32(5));  // K / 32
-    Value* krot_raw = kb.mul(kb.add(wgx, kb.mul(wgy, kb.const_i32(5))), kb.const_i32(37));
-    Value* krot = b.build_umod(krot_raw, nk);
+    Value* krot = kb.const_i32(0);
+    if (!swizzle) {
+        Value* krot_raw = kb.mul(kb.add(wgx, kb.mul(wgy, kb.const_i32(5))), kb.const_i32(37));
+        krot = b.build_umod(krot_raw, nk);
+    }
 
     Value* fa[4];
     Value* fb[4];
@@ -161,57 +192,70 @@ SpirvKernel build_coopmat_gemm_nt_f16() {
         kb.coop_fill_acc(acc[i], zero_f);
     }
 
-    Value* base_ptr_A[4];
-    Value* base_ptr_B[4];
-    Value* smem_off[4];
+    std::vector<Value*> base_ptr_A(kLa), smem_off_A(kLa);
+    std::vector<Value*> base_ptr_B(kLb), smem_off_B(kLb);
     Value* c_two_64 = kb.const_i64(2);
-    for (int j = 0; j < 4; ++j) {
-        Value* idx = kb.add(tid, kb.const_i32(j * 128));
+    for (std::uint32_t j = 0; j < kLa; ++j) {
+        Value* idx = kb.add(tid, kb.const_i32(static_cast<std::int32_t>(j * kWg)));
         Value* r = b.build_lshr(idx, kb.const_i32(2));
         Value* q = b.build_and(idx, kb.const_i32(3));
         Value* col_k = b.build_shl(q, kb.const_i32(3));
         Value* a_elems = kb.add(kb.mul(kb.add(m0, r), K), col_k);
-        Value* b_elems = kb.add(kb.mul(kb.add(n0, r), K), col_k);
         base_ptr_A[j] = kb.add(A, b.build_mul(b.build_sext_i64(a_elems), c_two_64));
+        smem_off_A[j] = kb.add(kb.mul(r, kb.const_i32(kSk)), q);
+    }
+    for (std::uint32_t j = 0; j < kLb; ++j) {
+        Value* idx = kb.add(tid, kb.const_i32(static_cast<std::int32_t>(j * kWg)));
+        Value* r = b.build_lshr(idx, kb.const_i32(2));
+        Value* q = b.build_and(idx, kb.const_i32(3));
+        Value* col_k = b.build_shl(q, kb.const_i32(3));
+        Value* b_elems = kb.add(kb.mul(kb.add(n0, r), K), col_k);
         base_ptr_B[j] = kb.add(B, b.build_mul(b.build_sext_i64(b_elems), c_two_64));
-        smem_off[j] = kb.add(kb.mul(r, kb.const_i32(kSk)), q);
+        smem_off_B[j] = kb.add(kb.mul(r, kb.const_i32(kSk)), q);
     }
 
     struct LoadedTiles {
-        Value* ra[4];
-        Value* rb[4];
+        std::vector<Value*> ra;
+        std::vector<Value*> rb;
     };
     auto load_tiles = [&](Value* k0) {
-        LoadedTiles t{};
+        LoadedTiles t;
+        t.ra.resize(kLa);
+        t.rb.resize(kLb);
         Value* k0_bytes = b.build_shl(b.build_sext_i64(k0), kb.const_i64(1));
-        for (int j = 0; j < 4; ++j) {
+        for (std::uint32_t j = 0; j < kLa; ++j) {
             t.ra[j] = b.build_vload(Type::i32x4(), kb.add(base_ptr_A[j], k0_bytes));
+        }
+        for (std::uint32_t j = 0; j < kLb; ++j) {
             t.rb[j] = b.build_vload(Type::i32x4(), kb.add(base_ptr_B[j], k0_bytes));
         }
         return t;
     };
     auto store_tiles = [&](Value* buf, const LoadedTiles& t) {
-        Value* base = kb.mul(buf, kb.const_i32(kSz));
-        for (int j = 0; j < 4; ++j) {
-            Value* off = kb.add(base, smem_off[j]);
-            kb.shared_store_i32x4_indexed(As, off, t.ra[j]);
-            kb.shared_store_i32x4_indexed(Bs, off, t.rb[j]);
+        Value* base_a = kb.mul(buf, kb.const_i32(kSza));
+        Value* base_b = kb.mul(buf, kb.const_i32(kSzb));
+        for (std::uint32_t j = 0; j < kLa; ++j) {
+            kb.shared_store_i32x4_indexed(As, kb.add(base_a, smem_off_A[j]), t.ra[j]);
+        }
+        for (std::uint32_t j = 0; j < kLb; ++j) {
+            kb.shared_store_i32x4_indexed(Bs, kb.add(base_b, smem_off_B[j]), t.rb[j]);
         }
     };
     Value* c_stride_40 = kb.const_i32(kSk * 8);
-    Value* c4_shift = kb.const_i32(4);  // i32x4 element index -> byte offset for add(shared_ptr, off)
+    Value* c4_shift = kb.const_i32(4);
     auto mma_tile = [&](Value* buf) {
-        Value* base = kb.mul(buf, kb.const_i32(kSz));
+        Value* base_a = kb.mul(buf, kb.const_i32(kSza));
+        Value* base_b = kb.mul(buf, kb.const_i32(kSzb));
         for (int kk = 0; kk < 2; ++kk) {
             Value* kk_off = kb.const_i32(kk * 2);
             for (int i = 0; i < 4; ++i) {
                 Value* row_off = kb.mul(kb.add(wm0, kb.const_i32(i * 16)), kb.const_i32(kSk));
-                Value* a_off = b.build_shl(kb.add(base, kb.add(row_off, kk_off)), c4_shift);
+                Value* a_off = b.build_shl(kb.add(base_a, kb.add(row_off, kk_off)), c4_shift);
                 kb.coop_load_a(fa[i], kb.add(As, a_off), c_stride_40, false);
             }
             for (int j = 0; j < 4; ++j) {
                 Value* row_off = kb.mul(kb.add(wn0, kb.const_i32(j * 16)), kb.const_i32(kSk));
-                Value* b_off = b.build_shl(kb.add(base, kb.add(row_off, kk_off)), c4_shift);
+                Value* b_off = b.build_shl(kb.add(base_b, kb.add(row_off, kk_off)), c4_shift);
                 kb.coop_load_b(fb[j], kb.add(Bs, b_off), c_stride_40, true);
             }
             for (int i = 0; i < 4; ++i) {
@@ -222,7 +266,6 @@ SpirvKernel build_coopmat_gemm_nt_f16() {
         }
     };
 
-    // Initial prefetch into shared buffer 0.
     store_tiles(kb.const_i32(0), load_tiles(b.build_shl(krot, kb.const_i32(5))));
     kb.sync();
 
@@ -238,10 +281,8 @@ SpirvKernel build_coopmat_gemm_nt_f16() {
         kb.sync();
     });
 
-    // Final tile.
     mma_tile(b.build_and(nk_m1, kb.const_i32(1)));
 
-    // Epilogue: store 16x16 FP16 tiles directly to C(M, N) with stride N.
     for (int i = 0; i < 4; ++i) {
         Value* gm = kb.add(kb.add(m0, wm0), kb.const_i32(i * 16));
         Value* row_bytes = b.build_shl(b.build_sext_i64(kb.mul(gm, N)), kb.const_i64(1));
@@ -421,16 +462,24 @@ SpirvKernel build_gemv_q8_sdot4() {
 }
 
 void run_coopmat_proof(dv::DeviceCtx& ctx, brotensor::Device vk) {
-    std::printf("=== 1. Brass SPIR-V Cooperative-Matrix FP16 NT GEMM (128x128x32) ===\n");
-    const SpirvKernel sk = build_coopmat_gemm_nt_f16();
-    const dv::JitPipeline pipe = dv::jit_pipeline(ctx, sk, 128, /*req_subgroup=*/32);
-    std::printf("  compiled %zu SPIR-V words, shared=%u B, subgroup=%u\n",
-                sk.words.size(), sk.shared_bytes, pipe.subgroup);
+    std::printf("=== 1. Brass SPIR-V Cooperative-Matrix FP16 NT GEMM (128x128x32 / 256x128x32) ===\n");
+    const SpirvKernel sk128 = build_coopmat_gemm_nt_f16(false, false);
+    const dv::JitPipeline pipe128 = dv::jit_pipeline(ctx, sk128, 128, /*req_subgroup=*/32);
+    const SpirvKernel sk256 = build_coopmat_gemm_nt_f16(true, false);
+    const dv::JitPipeline pipe256 = dv::jit_pipeline(ctx, sk256, 256, /*req_subgroup=*/32);
+    std::printf("  128x128x32: compiled %zu SPIR-V words, shared=%u B, subgroup=%u\n",
+                sk128.words.size(), sk128.shared_bytes, pipe128.subgroup);
+    std::printf("  256x128x32 (L2 swizzle): compiled %zu SPIR-V words, shared=%u B, subgroup=%u\n",
+                sk256.words.size(), sk256.shared_bytes, pipe256.subgroup);
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
 
     for (int sz : {512, 1024, 2048, 4096}) {
+        const bool use256 = (sz >= 4096);
+        const SpirvKernel& sk = use256 ? sk256 : sk128;
+        const dv::JitPipeline& pipe = use256 ? pipe256 : pipe128;
+        const int bm = use256 ? 256 : 128;
         const int M = sz, N = sz, K = sz;
         std::vector<std::uint16_t> hA(static_cast<std::size_t>(M) * K);
         std::vector<std::uint16_t> hB(static_cast<std::size_t>(N) * K);
@@ -459,7 +508,7 @@ void run_coopmat_proof(dv::DeviceCtx& ctx, brotensor::Device vk) {
         set_push(push, sk, 5, static_cast<std::int32_t>(K));
 
         const std::uint32_t gx = static_cast<std::uint32_t>(N / 128);
-        const std::uint32_t gy = static_cast<std::uint32_t>(M / 128);
+        const std::uint32_t gy = static_cast<std::uint32_t>(M / bm);
 
         brotensor::linear_forward_batched_ex(B, nullptr, A, 0, brotensor::kLinearEpiStore, nullptr, C_ref);
         dv::jit_dispatch(ctx, pipe, push.data(), gx, gy, 1);

@@ -86,6 +86,13 @@ namespace brotensor::verify {
 
 #if BROTENSOR_HAS_BRASS_JIT
 
+namespace extra_audit {
+void audit_extra_mir_kernels(
+    const brass::target::SpirvOptions& spv_opts,
+    const std::function<void(const char*, const brass::target::SpirvOptions&,
+                             const std::function<brass::Function*(brass::Module&)>&, bool)>& audit_mir_opts);
+} // namespace extra_audit
+
 namespace {
 
 std::vector<brass::verify::GpuBufferSpec> buffer_specs_for_shader(const std::string& name) {
@@ -805,6 +812,7 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
                     return kernels::build_fa_bwd_cm_mir(m, s);
                 });
             }
+            extra_audit::audit_extra_mir_kernels(spv_opts, audit_mir_opts);
         }
     }
 

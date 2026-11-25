@@ -389,6 +389,48 @@ TraceDAG TraceDAG::backward(int target_input_idx) const {
         return bwd.add_node(op, ins, s, nullptr, m.dev, Dtype::FP32, m.rows, m.cols, s2);
     };
 
+    struct NormBwdAux {
+        bool is_ln = false;
+        int rstd_slot = -1;
+        int mean_slot = -1;
+        int c0_slot = -1;
+        int c1_slot = -1;
+        int xhat_node = -1;
+    };
+    std::unordered_map<int, NormBwdAux> norm_aux;
+    for (const auto& n : nodes_) {
+        if (n.op != TraceOpKind::RMSNorm && n.op != TraceOpKind::LayerNorm) continue;
+        NormBwdAux aux;
+        aux.is_ln = (n.op == TraceOpKind::LayerNorm);
+        if (aux.is_ln) {
+            aux.mean_slot = bwd.add_node(TraceOpKind::Input, {}, 0.0f, nullptr, m.dev, Dtype::FP32, n.rows, 1);
+        }
+        aux.rstd_slot = bwd.add_node(TraceOpKind::Input, {}, 0.0f, nullptr, m.dev, Dtype::FP32, n.rows, 1);
+        if (aux.is_ln) {
+            aux.c0_slot = bwd.add_node(TraceOpKind::Input, {}, 0.0f, nullptr, m.dev, Dtype::FP32, n.rows, 1);
+        }
+        aux.c1_slot = bwd.add_node(TraceOpKind::Input, {}, 0.0f, nullptr, m.dev, Dtype::FP32, n.rows, 1);
+
+        const int x_bwd = fwd_to_bwd.at(n.inputs[0]);
+        const int centered = aux.is_ln ? add_op(TraceOpKind::Sub, {x_bwd, aux.mean_slot}) : x_bwd;
+        aux.xhat_node = add_op(TraceOpKind::Mul, {centered, aux.rstd_slot});
+        int y_bwd = aux.xhat_node;
+        if (n.inputs.size() > 1 && n.inputs[1] >= 0) {
+            y_bwd = add_op(TraceOpKind::Mul, {y_bwd, fwd_to_bwd.at(n.inputs[1])});
+        }
+        if (n.inputs.size() > 2 && n.inputs[2] >= 0) {
+            y_bwd = add_op(TraceOpKind::Add, {y_bwd, fwd_to_bwd.at(n.inputs[2])});
+        }
+        const int old_norm_bwd = fwd_to_bwd.at(n.id);
+        for (auto& bn : bwd.nodes()) {
+            for (int& inp : bn.inputs) {
+                if (inp == old_norm_bwd) inp = y_bwd;
+            }
+        }
+        fwd_to_bwd[n.id] = y_bwd;
+        norm_aux[n.id] = aux;
+    }
+
     // 5. Reverse-mode traversal from last node to first
     for (int idx = static_cast<int>(nodes_.size()) - 1; idx >= 0; --idx) {
         const TraceNode& n = nodes_[static_cast<size_t>(idx)];
@@ -620,6 +662,26 @@ TraceDAG TraceDAG::backward(int target_input_idx) const {
                 break;
             }
 
+            case TraceOpKind::RMSNorm:
+            case TraceOpKind::LayerNorm: {
+                const NormBwdAux& aux = norm_aux.at(n.id);
+                const bool has_gamma = (n.inputs.size() > 1 && n.inputs[1] >= 0);
+                const bool has_beta = (n.inputs.size() > 2 && n.inputs[2] >= 0);
+                int g_dy = has_gamma ? add_op(TraceOpKind::Mul, {dy, fwd_to_bwd.at(n.inputs[1])}) : dy;
+                int xhat_c1 = add_op(TraceOpKind::Mul, {aux.xhat_node, aux.c1_slot});
+                int inner = aux.is_ln
+                    ? add_op(TraceOpKind::Sub, {add_op(TraceOpKind::Sub, {g_dy, aux.c0_slot}), xhat_c1})
+                    : add_op(TraceOpKind::Sub, {g_dy, xhat_c1});
+                accum_grad(n.inputs[0], add_op(TraceOpKind::Mul, {aux.rstd_slot, inner}));
+                if (has_gamma) {
+                    accum_grad(n.inputs[1], add_op(TraceOpKind::Mul, {dy, aux.xhat_node}));
+                }
+                if (has_beta) {
+                    accum_grad(n.inputs[2], dy);
+                }
+                break;
+            }
+
             default:
                 throw std::runtime_error(std::string("TraceDAG::backward: unsupported op ") +
                                          op_kind_name(n.op));
@@ -672,308 +734,6 @@ TraceDAG TraceDAG::backward(int target_input_idx) const {
     }
     for (int os : out_slots) pruned.nodes()[static_cast<size_t>(prune_map.at(os))].is_live_at_end = true;
     return pruned;
-}
-
-#if BROTENSOR_HAS_BRASS_JIT
-namespace {
-
-size_t count_mir_insts(const brass::Function& fn) {
-    size_t n = 0;
-    for (const auto* bb : fn.blocks()) {
-        for (const auto* inst : *bb) { (void)inst; ++n; }
-    }
-    return n;
-}
-
-brass::Function* build_scalar_backward_mir_fn(brass::Module& mod, const char* name, const TraceDAG& lowered_dag) {
-    std::vector<int> input_ids, output_ids;
-    for (const auto& n : lowered_dag.nodes()) {
-        if (n.op == TraceOpKind::Input) input_ids.push_back(n.id);
-        if (n.is_live_at_end) output_ids.push_back(n.id);
-    }
-    std::vector<brass::Type> params(input_ids.size(), brass::Type::f32());
-    auto* fn = mod.create_function(name, brass::Type::f32(), brass::Span<const brass::Type>(params));
-    brass::codegen::KernelBuilder kb(mod, fn);
-    gpu_mir::Ctx c(kb);
-    std::vector<brass::Value*> param_vals = gpu_mir::entry_params(c, fn);
-    std::unordered_map<int, brass::Value*> vals;
-    for (size_t i = 0; i < input_ids.size(); ++i) vals[input_ids[i]] = param_vals[i];
-    for (const auto& n : lowered_dag.nodes()) {
-        if (n.op == TraceOpKind::Input) continue;
-        std::vector<brass::Value*> ins;
-        for (int in_id : n.inputs) ins.push_back(vals.at(in_id));
-        vals[n.id] = gpu_mir::lane_op(c, n, ins);
-    }
-    brass::Value* ret_val = output_ids.empty() ? kb.const_f32(0.0f) : vals.at(output_ids.front());
-    for (size_t i = 1; i < output_ids.size(); ++i) ret_val = c.b.build_add(ret_val, vals.at(output_ids[i]));
-    c.b.build_ret(ret_val);
-    return fn;
-}
-
-brass::Function* build_gpu_equiv_kernel_fn(brass::Module& mod, const TraceDAG& lowered_dag) {
-    std::vector<int> input_ids, output_ids;
-    for (const auto& n : lowered_dag.nodes()) {
-        if (n.op == TraceOpKind::Input) input_ids.push_back(n.id);
-        if (n.is_live_at_end) output_ids.push_back(n.id);
-    }
-    std::vector<brass::Type> params(input_ids.size() + output_ids.size(), brass::Type::ptr());
-    auto* fn = mod.create_function("bwd_trace_gpu_equiv", brass::Type::void_type(), brass::Span<const brass::Type>(params));
-    brass::codegen::KernelBuilder kb(mod, fn);
-    gpu_mir::Ctx c(kb);
-    std::vector<brass::Value*> buf_params = gpu_mir::entry_params(c, fn);
-    brass::Value* tid = kb.global_tid_x();
-    std::unordered_map<int, brass::Value*> vals;
-    for (size_t i = 0; i < input_ids.size(); ++i) vals[input_ids[i]] = kb.load_f32_indexed(buf_params[i], tid);
-    for (const auto& n : lowered_dag.nodes()) {
-        if (n.op == TraceOpKind::Input) continue;
-        std::vector<brass::Value*> ins;
-        for (int in_id : n.inputs) ins.push_back(vals.at(in_id));
-        vals[n.id] = gpu_mir::lane_op(c, n, ins);
-    }
-    for (size_t j = 0; j < output_ids.size(); ++j) {
-        kb.store_f32_indexed(buf_params[input_ids.size() + j], tid, vals.at(output_ids[j]));
-    }
-    c.b.build_ret_void();
-    return fn;
-}
-
-} // namespace
-#endif // BROTENSOR_HAS_BRASS_JIT
-
-BackwardTraceVerificationReport verify_backward_trace_dag(const TraceDAG& bwd_dag) {
-    BackwardTraceVerificationReport rep;
-    rep.rawBackwardNodeCount = bwd_dag.node_count();
-    TraceDAG lowered = canonicalize_trace_dag_for_codegen(bwd_dag);
-    rep.loweredBackwardNodeCount = lowered.node_count();
-
-#if BROTENSOR_HAS_BRASS_JIT
-    // 1. MIR optimization equivalence proof (`verify_mir_equivalence`)
-    {
-        brass::Module mod("bwd_mir_equiv_mod");
-        brass::Function* fn_unopt = build_scalar_backward_mir_fn(mod, "bwd_unopt", lowered);
-        brass::Function* fn_opt = build_scalar_backward_mir_fn(mod, "bwd_opt", lowered);
-        rep.unoptimizedMirInsts = count_mir_insts(*fn_unopt);
-        gpu_mir::optimize_function(*fn_opt);
-        rep.optimizedMirInsts = count_mir_insts(*fn_opt);
-
-        brass::verify::EquivResult mir_res = brass::verify::verify_mir_equivalence(*fn_unopt, *fn_opt);
-        rep.mirEquivProven = mir_res.is_equivalent();
-        if (!rep.mirEquivProven && rep.diagnostic.empty()) {
-            rep.diagnostic = "MIR equivalence failed: " + mir_res.diagnostic;
-        }
-    }
-
-    // 2. Cross-ISA SPIR-V <-> PTX equivalence proof (`verify_spirv_ptx_equivalence`)
-    std::string ptx_src;
-    {
-        brass::Module gpu_mod("bwd_gpu_equiv_mod");
-        brass::Function* gpu_fn = build_gpu_equiv_kernel_fn(gpu_mod, lowered);
-        gpu_mir::optimize_function(*gpu_fn);
-
-        ptx_src = brass::target::PtxTarget::emit_function(*gpu_fn);
-        rep.ptxByteCount = ptx_src.size();
-
-        brass::verify::EquivResult gpu_res = brass::verify::verify_spirv_ptx_equivalence(*gpu_fn);
-        rep.spirvPtxEquivProven = gpu_res.is_equivalent();
-        if (!rep.spirvPtxEquivProven && rep.diagnostic.empty()) {
-            rep.diagnostic = "SPIR-V/PTX equivalence failed: " + gpu_res.diagnostic;
-        }
-    }
-
-    // 3. Static compute shader safety & NaN/division-by-zero proof (`prove_spirv_shader_safety`)
-    {
-        plan::ElementwisePlan ew;
-        if (plan::build_plan(lowered, ew)) {
-            spirv::Kernels spv = spirv::emit_elementwise(lowered, ew);
-            rep.spirvWordCount = spv.scalar.words.size();
-
-            auto audit_words = [](const std::vector<uint32_t>& words, std::string& diag) -> bool {
-                if (words.empty()) return false;
-                brass::spirv::ComputeShaderAuditReport audit =
-                    brass::spirv::prove_spirv_shader_safety(
-                        std::span<const uint32_t>(words.data(), words.size()));
-                if (!audit.ok()) {
-                    if (!audit.hazards.empty()) diag = audit.hazards.front().message;
-                    else diag = "SPIR-V audit failed";
-                    return false;
-                }
-                for (const auto& d : audit.divisions) {
-                    if (!d.proven_safe) {
-                        diag = "Unguarded division/sqrt in SPIR-V backward shader: " + d.guard_reason;
-                        return false;
-                    }
-                }
-                return true;
-            };
-
-            std::string audit_diag;
-            bool scalar_ok = audit_words(spv.scalar.words, audit_diag);
-            bool vec_ok = !spv.vec.has_value() || audit_words(spv.vec->words, audit_diag);
-            rep.nanSafeProven = scalar_ok && vec_ok && !ptx_src.empty();
-            if (!rep.nanSafeProven && rep.diagnostic.empty()) {
-                rep.diagnostic = audit_diag;
-            }
-        } else if (rep.diagnostic.empty()) {
-            rep.diagnostic = "Failed to build ElementwisePlan for lowered backward TraceDAG";
-        }
-    }
-#endif
-
-    if (rep.all_proven() && rep.diagnostic.empty()) {
-        rep.diagnostic = "OK";
-    }
-    return rep;
-}
-
-struct VerifiedBackwardTrace::Impl {
-    TraceDAG forward_dag;
-    TraceDAG raw_backward_dag;
-    TraceDAG lowered_backward_dag;
-    std::vector<TraceDAG> per_input_lowered_dags;
-};
-
-VerifiedBackwardTrace build_verified_backward_trace(const TraceDAG& forward_dag) {
-    VerifiedBackwardTrace res;
-    res.impl = std::make_shared<VerifiedBackwardTrace::Impl>();
-    res.impl->forward_dag = forward_dag;
-    res.impl->raw_backward_dag = forward_dag.backward(-1);
-    res.impl->lowered_backward_dag = canonicalize_trace_dag_for_codegen(res.impl->raw_backward_dag);
-
-    const ShapeMeta m = dominant_meta(forward_dag);
-    res.rows = m.rows;
-    res.cols = m.cols;
-    res.device = m.dev;
-    res.dtype = Dtype::FP32;
-
-    size_t n_in = 0;
-    for (const auto& n : forward_dag.nodes()) {
-        if (n.op == TraceOpKind::Input) ++n_in;
-    }
-    res.num_inputs = n_in;
-
-    for (size_t i = 0; i < n_in; ++i) {
-        TraceDAG single_raw = forward_dag.backward(static_cast<int>(i));
-        res.impl->per_input_lowered_dags.push_back(canonicalize_trace_dag_for_codegen(single_raw));
-    }
-
-    res.verification = verify_backward_trace_dag(res.impl->raw_backward_dag);
-    res.verification.forwardNodeCount = forward_dag.node_count();
-
-#if BROTENSOR_HAS_BRASS_JIT
-    {
-        brass::Module gpu_mod("bwd_ptx_emit_mod");
-        brass::Function* gpu_fn = build_gpu_equiv_kernel_fn(gpu_mod, res.impl->lowered_backward_dag);
-        gpu_mir::optimize_function(*gpu_fn);
-        res.ptx_source = brass::target::PtxTarget::emit_function(*gpu_fn);
-    }
-    plan::ElementwisePlan ew;
-    if (plan::build_plan(res.impl->lowered_backward_dag, ew)) {
-        spirv::Kernels spv = spirv::emit_elementwise(res.impl->lowered_backward_dag, ew);
-        res.spirv_words = std::move(spv.scalar.words);
-    }
-#endif
-    return res;
-}
-
-VerifiedBackwardTrace trace_and_verify_backward(
-    const std::vector<Tensor>& example_inputs,
-    const std::function<Tensor(const std::vector<Tensor>&)>& fn) {
-    if (example_inputs.empty()) {
-        throw std::invalid_argument("trace_and_verify_backward: example_inputs must not be empty");
-    }
-    if (is_tracing()) {
-        abort_trace();
-    }
-    begin_trace();
-    TraceDAG fwd_dag;
-    try {
-        for (const auto& in_t : example_inputs) {
-            TraceContext::current().get_or_register_slot(in_t);
-        }
-        Tensor out = fn(example_inputs);
-        fwd_dag = TraceContext::current().end();
-        (void)out;
-    } catch (...) {
-        if (is_tracing()) abort_trace();
-        throw;
-    }
-    return build_verified_backward_trace(fwd_dag);
-}
-
-namespace {
-
-void bind_and_run_dag(const TraceDAG& template_dag,
-                      const std::vector<Tensor>& primal_inputs,
-                      const Tensor& grad_output,
-                      std::vector<Tensor>& grad_inputs) {
-    TraceDAG dag = template_dag;
-    const Device target_dev = grad_output.device;
-
-    size_t in_cursor = 0;
-    size_t out_cursor = 0;
-    for (auto& n : dag.nodes()) {
-        n.device = target_dev;
-        if (n.op == TraceOpKind::Input) {
-            if (in_cursor < primal_inputs.size()) {
-                const Tensor& p = primal_inputs[in_cursor++];
-                n.buffer = p.data;
-                n.rows = p.rows;
-                n.cols = p.cols;
-                n.dtype = p.dtype;
-            } else {
-                n.buffer = grad_output.data;
-                n.rows = grad_output.rows;
-                n.cols = grad_output.cols;
-                n.dtype = grad_output.dtype;
-            }
-        } else {
-            n.rows = grad_output.rows;
-            n.cols = grad_output.cols;
-        }
-        if (n.is_live_at_end) {
-            if (out_cursor >= grad_inputs.size()) {
-                throw std::runtime_error("VerifiedBackwardTrace::execute: output buffer count mismatch");
-            }
-            n.buffer = grad_inputs[out_cursor++].data;
-        }
-    }
-
-    TraceHandle h = TraceCompiler::compile_and_cache(dag);
-    (void)h;
-}
-
-} // namespace
-
-std::vector<Tensor> VerifiedBackwardTrace::execute(
-    const std::vector<Tensor>& primal_inputs,
-    const Tensor& grad_output) const {
-    if (!impl) {
-        throw std::runtime_error("VerifiedBackwardTrace::execute: uninitialized backward trace");
-    }
-    if (primal_inputs.size() != num_inputs) {
-        throw std::invalid_argument("VerifiedBackwardTrace::execute: primal_inputs count mismatch");
-    }
-    std::vector<Tensor> grads;
-    grads.reserve(num_inputs);
-    for (size_t i = 0; i < num_inputs; ++i) {
-        grads.push_back(Tensor::empty_on(grad_output.device, grad_output.rows, grad_output.cols, Dtype::FP32));
-    }
-    bind_and_run_dag(impl->lowered_backward_dag, primal_inputs, grad_output, grads);
-    return grads;
-}
-
-Tensor VerifiedBackwardTrace::execute_for_input(
-    int input_idx,
-    const std::vector<Tensor>& primal_inputs,
-    const Tensor& grad_output) const {
-    if (!impl || input_idx < 0 || static_cast<size_t>(input_idx) >= impl->per_input_lowered_dags.size()) {
-        throw std::out_of_range("VerifiedBackwardTrace::execute_for_input: input_idx out of range");
-    }
-    std::vector<Tensor> grads;
-    grads.push_back(Tensor::empty_on(grad_output.device, grad_output.rows, grad_output.cols, Dtype::FP32));
-    bind_and_run_dag(impl->per_input_lowered_dags[static_cast<size_t>(input_idx)],
-                     primal_inputs, grad_output, grads);
-    return std::move(grads[0]);
 }
 
 } // namespace brotensor::jit

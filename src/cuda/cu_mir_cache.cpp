@@ -217,7 +217,8 @@ CUfunction compile_mir(const MirKey& k) {
             const auto byte = [&](int s) -> int { return static_cast<int>((k.aux >> (s * 8)) & 0xffu); };
             fn = kernels::build_conv_simt_mir(
                 mod, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
-                byte(0), byte(1), byte(2), byte(3), byte(4), byte(5), byte(6), byte(7));
+                byte(0), byte(1), byte(2), byte(3), byte(4), byte(5), byte(6), byte(7),
+                k.op & 0x0fu);
             break;
         }
         case MirKind::GemvQ: {

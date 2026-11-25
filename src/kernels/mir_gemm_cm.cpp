@@ -71,18 +71,25 @@ brass::Function* build_gemm_cm_mir(brass::Module& mod, const GemmCmSpec& s) {
                              "_e" + std::to_string(s.epi) + "_x" + std::to_string(s.act) +
                              "_q" + std::to_string(s.qb) + (s.ta ? "_ta" : "") + (s.nb ? "_nb" : "") +
                              (s.vec ? "_v" : "_s") + (s.direct ? "_d" : "") +
-                             (s.has_bias ? "_bi" : "") + (s.scale_a ? "_sc" : "");
+                             (s.has_bias ? "_bi" : "") + (s.scale_a ? "_sc" : "") +
+                             (s.swizzle ? "_sw" : "");
 
+    const bool has_res = (s.epi == EPI_RESIDUAL_ADD);
     std::vector<Type> params = {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(),
-        Type::i32(), Type::i32(), Type::i32(), Type::i32(), Type::i32(), Type::i32(),
-        Type::i32(), Type::i32(), Type::i32(), Type::i32(), Type::i32(), Type::i32(),
     };
+    if (has_res) params.push_back(Type::ptr());
+    for (int i = 0; i < 12; ++i) params.push_back(Type::i32());
     Function* fn = mod.create_function(name, Type::void_type(), brass::Span<const Type>(params));
     brass::codegen::KernelBuilder kb(mod, fn);
     Ctx c(kb);
-    auto p = entry_params(c, fn);
-    // ptrs: 0:a 1:b 2:c 3:bias 4:scale 5:ascale
+    auto raw_p = entry_params(c, fn);
+    std::vector<Value*> p;
+    p.reserve(18);
+    for (int i = 0; i < 6; ++i) p.push_back(raw_p[static_cast<std::size_t>(i)]);
+    Value* residual_ptr = has_res ? raw_p[6] : nullptr;
+    for (int i = 0; i < 12; ++i) p.push_back(raw_p[static_cast<std::size_t>(6 + (has_res ? 1 : 0) + i)]);
+    // ptrs: 0:a 1:b 2:c 3:bias 4:scale 5:ascale [, residual_ptr]
     // ints: 6:m 7:n 8:k 9:lda 10:ldb 11:ldc 12:sa 13:sb 14:sc 15:half_n 16:tm0 17:tn0
 
     Value* As = kb.shared_alloc_i32x4(2u * ASZ);
@@ -101,13 +108,29 @@ brass::Function* build_gemm_cm_mir(brass::Module& mod, const GemmCmSpec& s) {
         kb.sync();
     }
 
+    Value* tx = kb.ctaid_x();
+    Value* ty = kb.ctaid_y();
+    if (s.swizzle) {
+        Value* num_n = kb.nctaid_x();
+        Value* num_m = kb.nctaid_y();
+        Value* flat = c.b.build_add(c.b.build_mul(ty, num_n), tx);
+        Value* slab_stride = smax_i32(c, c.i32(1), c.b.build_shl(num_n, c.i32(2)));
+        Value* slab_idx = c.b.build_udiv(flat, slab_stride);
+        Value* slab_m0 = c.b.build_shl(slab_idx, c.i32(2));
+        Value* rem = c.b.build_umod(flat, slab_stride);
+        Value* slab_h = smax_i32(c, c.i32(1), smin_i32(c, c.i32(4), c.b.build_sub(num_m, slab_m0)));
+        ty = c.b.build_add(slab_m0, c.b.build_umod(rem, slab_h));
+        tx = c.b.build_udiv(rem, slab_h);
+    }
+
     Value* z = kb.ctaid_z();
     Value* A = batch_base(c, p[0], p[12], z, dt_eb(s.dt_a));
     Value* B = (s.qb != 0u) ? p[1] : batch_base(c, p[1], p[13], z, 2);
     Value* C = batch_base(c, p[2], p[14], z, dt_eb(s.dt_c));
-    Value* m0 = c.b.build_mul(c.b.build_add(kb.ctaid_y(), p[16]), c.i32(static_cast<int>(BM)));
+    Value* R = has_res ? batch_base(c, residual_ptr, p[14], z, dt_eb(s.dt_c)) : nullptr;
+    Value* m0 = c.b.build_mul(c.b.build_add(ty, p[16]), c.i32(static_cast<int>(BM)));
     const std::uint32_t bn_step = (s.epi == EPI_SWIGLU) ? (BN / 2u) : BN;
-    Value* n0 = c.b.build_mul(c.b.build_add(kb.ctaid_x(), p[17]), c.i32(static_cast<int>(bn_step)));
+    Value* n0 = c.b.build_mul(c.b.build_add(tx, p[17]), c.i32(static_cast<int>(bn_step)));
     Value* wm0 = c.b.build_mul(c.b.build_umod(sg, c.i32(static_cast<int>(BM / WM))), c.i32(static_cast<int>(WM)));
     Value* wn0 = c.b.build_mul(c.b.build_udiv(sg, c.i32(static_cast<int>(BM / WM))), c.i32(static_cast<int>(WN)));
 
@@ -315,9 +338,12 @@ brass::Function* build_gemm_cm_mir(brass::Module& mod, const GemmCmSpec& s) {
 
     Value* nk = c.b.build_lshr(c.b.build_add(p[8], c.i32(static_cast<int>(BK - 1u))), c.i32(5));
     kb.if_then(c.b.build_ugt(nk, c.i32(0)), [&] {
-        Value* krot_raw = c.b.build_mul(
-            c.b.build_add(kb.ctaid_x(), c.b.build_mul(kb.ctaid_y(), c.i32(5))), c.i32(37));
-        Value* krot = c.b.build_umod(krot_raw, nk);
+        Value* krot = c.i32(0);
+        if (!s.swizzle) {
+            Value* krot_raw = c.b.build_mul(
+                c.b.build_add(tx, c.b.build_mul(ty, c.i32(5))), c.i32(37));
+            krot = c.b.build_umod(krot_raw, nk);
+        }
         store_tiles(c.i32(0), load_tiles(c.b.build_shl(krot, c.i32(5))));
         kb.sync();
 
@@ -338,7 +364,7 @@ brass::Function* build_gemm_cm_mir(brass::Module& mod, const GemmCmSpec& s) {
     const std::uint32_t step = (s.epi == EPI_SWIGLU) ? 2u : 1u;
 
     if (s.direct) {
-        Value* tmp_acc = (s.has_bias || s.epi == EPI_ACCUM) ? kb.coop_alloc_acc() : nullptr;
+        Value* tmp_acc = (s.has_bias || s.epi == EPI_ACCUM || s.epi == EPI_RESIDUAL_ADD) ? kb.coop_alloc_acc() : nullptr;
         for (std::uint32_t i = 0; i < TM; ++i) {
             Value* gm = c.b.build_add(c.b.build_add(m0, wm0), c.i32(static_cast<int>(i * 16u)));
             Value* row_off = c.b.build_mul(gm, p[11]);
@@ -367,8 +393,11 @@ brass::Function* build_gemm_cm_mir(brass::Module& mod, const GemmCmSpec& s) {
                 } else if (s.act != LACT_NONE) {
                     emit_coop_acc_map(c, r, [&](Value*, Value* rv) { return emit_gemm_act(c, s.act, rv); });
                 }
-                if (s.epi == EPI_ACCUM) {
-                    kb.coop_load_acc(tmp_acc, c_ptr, p[11], false, true);
+                if (s.epi == EPI_ACCUM || s.epi == EPI_RESIDUAL_ADD) {
+                    Value* add_ptr = (s.epi == EPI_RESIDUAL_ADD)
+                        ? ptr_at(c, R, c.b.build_add(row_off, col), 2)
+                        : c_ptr;
+                    kb.coop_load_acc(tmp_acc, add_ptr, p[11], false, true);
                     kb.coop_add_acc(r, tmp_acc);
                 }
                 kb.coop_store_acc(r, c_ptr, p[11], false, true);
@@ -458,6 +487,7 @@ brass::Function* build_gemm_cm_mir(brass::Module& mod, const GemmCmSpec& s) {
                         if (s.act != LACT_NONE) v = emit_gemm_act(c, s.act, v);
                         Value* o = c.b.build_add(c.b.build_mul(gm, p[11]), nc);
                         if (s.epi == EPI_ACCUM) v = c.b.build_add(v, load_elem_dt(c, s.dt_c, C, o));
+                        else if (s.epi == EPI_RESIDUAL_ADD) v = c.b.build_add(v, load_elem_dt(c, s.dt_c, R, o));
                         store_elem_dt(c, s.dt_c, C, o, v);
                     });
                 }

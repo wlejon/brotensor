@@ -46,10 +46,11 @@ Value* batch_base_ptr(Ctx& c, Value* base, Value* z, Value* stride, int esz) {
 
 template <typename LoadFn, typename StoreFn>
 std::vector<Value*> run_simt_k_loop(Ctx& c, const TileDims& d, Value* k_dim,
-                                    Value* As, Value* Bs,
+                                    Value* As, Value* Bs, Value* Bs_up,
                                     LoadFn&& load_tiles, StoreFn&& store_tiles) {
     const std::size_t n_acc = static_cast<std::size_t>(d.tm) * d.tn;
-    const std::size_t n_reg = static_cast<std::size_t>(d.la) + d.lb;
+    const std::size_t k_accs = Bs_up ? (2u * n_acc) : n_acc;
+    const std::size_t n_reg = static_cast<std::size_t>(d.la) + d.lb * (Bs_up ? 2u : 1u);
     Value* nk = c.b.build_lshr(c.b.build_add(k_dim, c.i32(static_cast<int>(kSimtBk - 1u))), c.i32(4));
     Value* tid = c.kb.tid_x();
     Value* tx = c.b.build_umod(tid, c.i32(static_cast<int>(d.ntx)));
@@ -64,7 +65,7 @@ std::vector<Value*> run_simt_k_loop(Ctx& c, const TileDims& d, Value* k_dim,
         [&]() -> std::vector<Value*> { return std::vector<Value*>(n_reg, c.f32(0.0f)); });
 
     std::vector<Value*> init = std::move(reg0);
-    init.resize(n_reg + n_acc, c.f32(0.0f));
+    init.resize(n_reg + k_accs, c.f32(0.0f));
 
     std::vector<Value*> fin = c.kb.for_range_reduce_n(
         c.i32(0), nk, c.i32(1), init,
@@ -82,17 +83,26 @@ std::vector<Value*> run_simt_k_loop(Ctx& c, const TileDims& d, Value* k_dim,
             for (std::uint32_t kk = 0; kk < kSimtBk; ++kk) {
                 Value* a_base = c.b.build_add(c.i32(static_cast<int>(kk * d.pa)), ty_tm);
                 Value* b_base = c.b.build_add(c.i32(static_cast<int>(kk * d.pb)), tx_tn);
-                std::vector<Value*> av(d.tm), bv(d.tn);
+                std::vector<Value*> av(d.tm), bv(d.tn), buv;
                 for (std::uint32_t i = 0; i < d.tm; ++i) {
                     av[i] = c.kb.shared_load_f32_indexed(As, c.b.build_add(a_base, c.i32(static_cast<int>(i))));
                 }
                 for (std::uint32_t j = 0; j < d.tn; ++j) {
                     bv[j] = c.kb.shared_load_f32_indexed(Bs, c.b.build_add(b_base, c.i32(static_cast<int>(j))));
                 }
+                if (Bs_up) {
+                    buv.resize(d.tn);
+                    for (std::uint32_t j = 0; j < d.tn; ++j) {
+                        buv[j] = c.kb.shared_load_f32_indexed(Bs_up, c.b.build_add(b_base, c.i32(static_cast<int>(j))));
+                    }
+                }
                 for (std::uint32_t i = 0; i < d.tm; ++i) {
                     for (std::uint32_t j = 0; j < d.tn; ++j) {
                         std::size_t idx = static_cast<std::size_t>(i) * d.tn + j;
                         acc[idx] = c.b.build_fma_f32(av[i], bv[j], acc[idx]);
+                        if (Bs_up) {
+                            acc[n_acc + idx] = c.b.build_fma_f32(av[i], buv[j], acc[n_acc + idx]);
+                        }
                     }
                 }
             }
@@ -112,32 +122,43 @@ brass::Function* build_gemm_simt_mir(brass::Module& mod, Dtype dt_a, Dtype dt_b,
                                      bool big128, std::uint32_t epi, std::uint32_t act,
                                      bool ta, bool nb, bool has_bias) {
     const TileDims d = make_tile_dims(big128);
+    const bool has_res = (epi == EPI_RESIDUAL_ADD);
+    const bool is_swiglu = (epi == EPI_SWIGLU);
     const std::string name = std::string("mir_gemm_simt_") + (big128 ? "128_" : "64_") +
                              (ta ? "t" : "n") + (nb ? "t" : "n") + "_e" + std::to_string(epi) +
                              "_a" + std::to_string(act) + (has_bias ? "_b" : "");
     std::vector<Type> params = {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(),
-        Type::i32(), Type::i32(), Type::i32(), Type::i32(), Type::i32(), Type::i32(),
-        Type::i32(), Type::i32(), Type::i32(),
     };
+    if (has_res) params.push_back(Type::ptr());
+    for (int i = 0; i < 9; ++i) params.push_back(Type::i32());
     Function* fn = mod.create_function(name, Type::void_type(), brass::Span<const Type>(params));
     brass::codegen::KernelBuilder kb(mod, fn);
     Ctx c(kb);
-    auto p = entry_params(c, fn);
+    auto raw_p = entry_params(c, fn);
+    std::vector<Value*> p;
+    p.reserve(13);
+    for (int i = 0; i < 4; ++i) p.push_back(raw_p[static_cast<std::size_t>(i)]);
+    Value* residual_ptr = has_res ? raw_p[4] : nullptr;
+    for (int i = 0; i < 9; ++i) p.push_back(raw_p[static_cast<std::size_t>(4 + (has_res ? 1 : 0) + i)]);
     // p: a(0) b(1) c(2) bias(3) m(4) n(5) k(6) lda(7) ldb(8) ldc(9) sa(10) sb(11) sc(12)
 
     Value* As = kb.shared_alloc_f32(kSimtBk * d.pa);
     Value* Bs = kb.shared_alloc_f32(kSimtBk * d.pb);
+    Value* Bs_up = is_swiglu ? kb.shared_alloc_f32(kSimtBk * d.pb) : nullptr;
     Value* z = kb.ctaid_z();
     Value* A = batch_base_ptr(c, p[0], z, p[10], elem_bytes(dt_a));
     Value* B = batch_base_ptr(c, p[1], z, p[11], elem_bytes(dt_b));
     Value* C = batch_base_ptr(c, p[2], z, p[12], elem_bytes(dt_c));
+    Value* R = has_res ? batch_base_ptr(c, residual_ptr, z, p[12], elem_bytes(dt_c)) : nullptr;
+    Value* half_n = is_swiglu ? c.b.build_lshr(p[5], c.i32(1)) : p[5];
+    Value* n_limit = is_swiglu ? half_n : p[5];
     Value* m0 = c.b.build_mul(kb.ctaid_y(), c.i32(static_cast<int>(d.bm)));
     Value* n0 = c.b.build_mul(kb.ctaid_x(), c.i32(static_cast<int>(d.bn)));
     Value* tid = kb.tid_x();
 
     auto load_tiles = [&](Value* k0) -> std::vector<Value*> {
-        std::vector<Value*> regs(d.la + d.lb);
+        std::vector<Value*> regs(d.la + d.lb * (is_swiglu ? 2u : 1u));
         for (std::uint32_t j = 0; j < d.la; ++j) {
             Value* e = c.b.build_add(tid, c.i32(static_cast<int>(j * kSimtWg)));
             Value* m = ta ? c.b.build_umod(e, c.i32(static_cast<int>(d.bm)))
@@ -164,7 +185,7 @@ brass::Function* build_gemm_simt_mir(brass::Module& mod, Dtype dt_a, Dtype dt_b,
                           : c.b.build_and(e, c.i32(15));
             Value* gn = c.b.build_add(n0, n);
             Value* gk = c.b.build_add(k0, k);
-            Value* ok = c.b.build_and(c.b.build_ult(gn, p[5]), c.b.build_ult(gk, p[6]));
+            Value* ok = c.b.build_and(c.b.build_ult(gn, n_limit), c.b.build_ult(gk, p[6]));
             regs[d.la + j] = emit_if_else_values(
                 c, ok, {Type::f32()},
                 [&]() -> std::vector<Value*> {
@@ -173,6 +194,16 @@ brass::Function* build_gemm_simt_mir(brass::Module& mod, Dtype dt_a, Dtype dt_b,
                     return {load_elem_dt(c, dt_b, B, idx)};
                 },
                 [&]() -> std::vector<Value*> { return {c.f32(0.0f)}; })[0];
+            if (is_swiglu) {
+                Value* gn_u = c.b.build_add(half_n, gn);
+                regs[d.la + d.lb + j] = emit_if_else_values(
+                    c, ok, {Type::f32()},
+                    [&]() -> std::vector<Value*> {
+                        Value* idx = c.b.build_add(c.b.build_mul(gn_u, p[8]), gk);
+                        return {load_elem_dt(c, dt_b, B, idx)};
+                    },
+                    [&]() -> std::vector<Value*> { return {c.f32(0.0f)}; })[0];
+            }
         }
         return regs;
     };
@@ -195,12 +226,14 @@ brass::Function* build_gemm_simt_mir(brass::Module& mod, Dtype dt_a, Dtype dt_b,
                             : c.b.build_add(c.b.build_mul(c.b.build_and(e, c.i32(15)), c.i32(static_cast<int>(d.pb))),
                                             c.b.build_lshr(e, c.i32(4)));
             kb.shared_store_f32_indexed(Bs, idx, regs[d.la + j]);
+            if (is_swiglu) kb.shared_store_f32_indexed(Bs_up, idx, regs[d.la + d.lb + j]);
         }
     };
 
-    std::vector<Value*> acc = run_simt_k_loop(c, d, p[6], As, Bs, load_tiles, store_tiles);
+    std::vector<Value*> acc = run_simt_k_loop(c, d, p[6], As, Bs, Bs_up, load_tiles, store_tiles);
     Value* tx = c.b.build_umod(tid, c.i32(static_cast<int>(d.ntx)));
     Value* ty = c.b.build_udiv(tid, c.i32(static_cast<int>(d.ntx)));
+    const std::size_t n_acc = static_cast<std::size_t>(d.tm) * d.tn;
 
     for (std::uint32_t i = 0; i < d.tm; ++i) {
         Value* gm = c.b.build_add(m0, c.b.build_add(c.b.build_mul(ty, c.i32(static_cast<int>(d.tm))),
@@ -209,12 +242,21 @@ brass::Function* build_gemm_simt_mir(brass::Module& mod, Dtype dt_a, Dtype dt_b,
             for (std::uint32_t j = 0; j < d.tn; ++j) {
                 Value* gn = c.b.build_add(n0, c.b.build_add(c.b.build_mul(tx, c.i32(static_cast<int>(d.tn))),
                                                             c.i32(static_cast<int>(j))));
-                kb.if_then(c.b.build_ult(gn, p[5]), [&] {
-                    Value* v = acc[static_cast<std::size_t>(i) * d.tn + j];
-                    if (has_bias) v = c.b.build_add(v, load_elem_dt(c, dt_bias, p[3], gn));
-                    v = emit_gemm_act(c, act, v);
+                kb.if_then(c.b.build_ult(gn, n_limit), [&] {
+                    const std::size_t idx = static_cast<std::size_t>(i) * d.tn + j;
+                    Value* v = acc[idx];
+                    if (is_swiglu) {
+                        if (has_bias) v = c.b.build_add(v, load_elem_dt(c, dt_bias, p[3], gn));
+                        Value* u = acc[n_acc + idx];
+                        if (has_bias) u = c.b.build_add(u, load_elem_dt(c, dt_bias, p[3], c.b.build_add(half_n, gn)));
+                        v = c.b.build_mul(c.b.build_mul(v, emit_sigmoid(c, v)), u);
+                    } else {
+                        if (has_bias) v = c.b.build_add(v, load_elem_dt(c, dt_bias, p[3], gn));
+                        v = emit_gemm_act(c, act, v);
+                    }
                     Value* o = c.b.build_add(c.b.build_mul(gm, p[9]), gn);
                     if (epi == EPI_ACCUM) v = c.b.build_add(v, load_elem_dt(c, dt_c, C, o));
+                    else if (epi == EPI_RESIDUAL_ADD) v = c.b.build_add(v, load_elem_dt(c, dt_c, R, o));
                     store_elem_dt(c, dt_c, C, o, v);
                 });
             }
@@ -226,7 +268,8 @@ brass::Function* build_gemm_simt_mir(brass::Module& mod, Dtype dt_a, Dtype dt_b,
 }
 
 brass::Function* build_conv_simt_mir(brass::Module& mod, Dtype dt, bool big128, bool accum, bool has_bias,
-                                     int kh, int kw, int sh, int sw, int ph, int pw, int dh, int dw) {
+                                     int kh, int kw, int sh, int sw, int ph, int pw, int dh, int dw,
+                                     std::uint32_t act) {
     const TileDims d = make_tile_dims(big128);
     const int khw = kh * kw;
     const std::string name = std::string("mir_conv_simt_") + (big128 ? "128_" : "64_") +
@@ -234,7 +277,8 @@ brass::Function* build_conv_simt_mir(brass::Module& mod, Dtype dt, bool big128, 
                              "_s" + std::to_string(sh) + "x" + std::to_string(sw) +
                              "_p" + std::to_string(ph) + "x" + std::to_string(pw) +
                              "_d" + std::to_string(dh) + "x" + std::to_string(dw) +
-                             (accum ? "_ac" : "") + (has_bias ? "_b" : "");
+                             (accum ? "_ac" : "") + (has_bias ? "_b" : "") +
+                             (act != LACT_NONE ? ("_x" + std::to_string(act)) : std::string());
     std::vector<Type> params = {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(),
         Type::i32(), Type::i32(), Type::i32(), Type::i32(), Type::i32(), Type::i32(),
@@ -325,7 +369,7 @@ brass::Function* build_conv_simt_mir(brass::Module& mod, Dtype dt, bool big128, 
         }
     };
 
-    std::vector<Value*> acc = run_simt_k_loop(c, d, p[6], As, Bs, load_tiles, store_tiles);
+    std::vector<Value*> acc = run_simt_k_loop(c, d, p[6], As, Bs, nullptr, load_tiles, store_tiles);
     Value* tx = c.b.build_umod(tid, c.i32(static_cast<int>(d.ntx)));
     Value* ty = c.b.build_udiv(tid, c.i32(static_cast<int>(d.ntx)));
     Value* gm_bias = c.b.build_mul(g, p[4]);
@@ -340,6 +384,7 @@ brass::Function* build_conv_simt_mir(brass::Module& mod, Dtype dt, bool big128, 
                                                             c.i32(static_cast<int>(j))));
                 kb.if_then(c.b.build_ult(gn, p[5]), [&] {
                     Value* v = c.b.build_add(acc[static_cast<std::size_t>(i) * d.tn + j], bv);
+                    if (act != LACT_NONE) v = emit_gemm_act(c, act, v);
                     Value* o = c.b.build_add(c.b.build_mul(gm, p[5]), gn);
                     if (accum) v = c.b.build_add(v, load_elem_dt(c, dt, C, o));
                     store_elem_dt(c, dt, C, o, v);

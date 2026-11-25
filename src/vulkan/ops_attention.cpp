@@ -10,6 +10,7 @@
 
 #include "detail/attention.h"
 #include "detail/kernels.h"
+#include "vk_autotune.h"
 #include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
@@ -46,10 +47,10 @@ bool is16(Dtype t) { return t == Dtype::FP16 || t == Dtype::BF16; }
 // ─── kernel choice ──────────────────────────────────────────────────────────
 
 constexpr int kCmMaxHd = 256;
-constexpr int kRowsMaxLq = 4;   // at or below this many query rows the decode kernel wins
+constexpr int kRowsMaxLq = 1;   // decode rows kernel wins at Lq=1; coopmat shares K/V across Lq>=2
 
 bool cm_eligible(DeviceCtx& d, const AttnProblem& p) {
-    return d.info().coopmat_f16 && is16(p.dt) && p.hd <= kCmMaxHd && p.softcap <= 0.0f && !p.maskpos &&
+    return d.info().coopmat_f16 && is16(p.dt) && p.hd <= kCmMaxHd && !p.maskpos &&
            p.mode != FA_MODE_LEN;
 }
 
@@ -59,6 +60,80 @@ bool dense_eligible(const AttnProblem& p) {
 
 enum class Path { Rows, Cm, Dense };
 
+bool is_po2_cache_aliasing(const AttnProblem& p) noexcept {
+    const std::size_t row_bytes = static_cast<std::size_t>(p.ldk) * esize(p.dt);
+    return row_bytes >= 2048u && (row_bytes & (row_bytes - 1u)) == 0u && p.hq >= 8 && p.lq >= 2048;
+}
+
+struct CmCfg { std::uint32_t bc, nsg; };
+
+CmCfg default_cm_cfg(const AttnProblem& p) {
+    CmCfg c{static_cast<std::uint32_t>(g_cm_bc.load()), static_cast<std::uint32_t>(g_cm_nsg.load())};
+    if (c.bc == 0) {
+        if (p.lq <= 4 && p.hd <= 128) {
+            c = {32, 1};
+        } else {
+            const double kv_bytes = 2.0 * p.lk * p.hkv * p.hd * 2.0;
+            if (p.hd <= 96) {
+                if (is_po2_cache_aliasing(p) || kv_bytes > 24.0 * 1024 * 1024) c = {32, 4};
+                else c = {16, 2};
+            } else if (p.hd <= 128) {
+                c = {32, 4};
+            } else {
+                c = {16, 2};
+            }
+        }
+    }
+    if ((c.bc != 16 && c.bc != 32 && c.bc != 64) || (c.nsg != 1 && c.nsg != 2 && c.nsg != 4) ||
+        c.nsg * 16 > 2 * c.bc) {
+        fail(p.op, "fa_cm tile: bc in {16, 32, 64}, nsg in {1, 2, 4}, 16 nsg <= 2 bc");
+    }
+    return c;
+}
+
+AttnTuneCfg resolve_config(DeviceCtx& d, const AttnProblem& p) {
+    AttnTuneCfg fb{};
+    fb.nsplit_target = 80;
+    if (p.nan_safe) {
+        fb.path = 0;
+        return fb;
+    }
+    const int ov = g_override.load(std::memory_order_relaxed);
+    const bool cm_ok = cm_eligible(d, p);
+    const bool dense_ok = dense_eligible(p);
+    if (ov == 1) {
+        fb.path = 0;
+        return fb;
+    }
+    if (ov == 3 && dense_ok) {
+        fb.path = 2;
+        return fb;
+    }
+    if (ov == 2 && cm_ok) {
+        const CmCfg c = default_cm_cfg(p);
+        fb.path = 1; fb.bc = c.bc; fb.nsg = c.nsg;
+        fb.head_swizzle = (g_cm_bc.load() == 0 && is_po2_cache_aliasing(p)) ? 1u : 0u;
+        fb.nsplit_target = 160;
+        return fb;
+    }
+    if (cm_ok && p.lq > kRowsMaxLq) {
+        const CmCfg c = default_cm_cfg(p);
+        fb.path = 1; fb.bc = c.bc; fb.nsg = c.nsg;
+        fb.head_swizzle = (g_cm_bc.load() == 0 && is_po2_cache_aliasing(p)) ? 1u : 0u;
+        fb.nsplit_target = 160;
+    } else if (dense_ok && ((p.lq >= 64 && p.lk >= 64) || (p.hd > kCmMaxHd && p.lq > kRowsMaxLq))) {
+        fb.path = 2;
+        return fb;
+    } else {
+        fb.path = 0;
+        fb.nsplit_target = 80;
+    }
+    if (ov == 0 && g_cm_bc.load() == 0 && fb.path != 2) {
+        return autotune_attention(d, p, true, cm_ok, fb);
+    }
+    return fb;
+}
+
 Path choose(DeviceCtx& d, const AttnProblem& p) {
     if (p.nan_safe) return Path::Rows;
     const int ov = g_override.load(std::memory_order_relaxed);
@@ -66,38 +141,9 @@ Path choose(DeviceCtx& d, const AttnProblem& p) {
     if (ov == 2 && cm_eligible(d, p)) return Path::Cm;
     if (ov == 3 && dense_eligible(p)) return Path::Dense;
     if (cm_eligible(d, p) && p.lq > kRowsMaxLq) return Path::Cm;
-    // FP32 (and 16-bit without cooperative matrix, or heads too wide for
-    // fa_cm): big bidirectional problems are GEMM-shaped.
     if (dense_eligible(p) && p.lq >= 64 && p.lk >= 64) return Path::Dense;
     if (dense_eligible(p) && p.hd > kCmMaxHd && p.lq > kRowsMaxLq) return Path::Dense;
     return Path::Rows;
-}
-
-// ─── fa_cm.comp ─────────────────────────────────────────────────────────────
-
-struct CmCfg { std::uint32_t bc, nsg; };
-
-CmCfg pick_cm(const AttnProblem& p) {
-    CmCfg c{static_cast<std::uint32_t>(g_cm_bc.load()), static_cast<std::uint32_t>(g_cm_nsg.load())};
-    if (c.bc == 0) {
-        // Measured (docs/vulkan.md "Attention"): heads up to 96 wide run best
-        // with 16-key blocks and 32 query rows, 128-wide ones with 32 x 64 —
-        // while K and V stay in the last-level cache. Every query block streams
-        // its head's whole K / V, so once they outgrow it (24 MiB of K + V, the
-        // 32 MB Infinity Cache of the RDNA 3.5 part this was measured on) the
-        // 32-key blocks win: hd 64 x 16 heads at 7k-16k keys ran 8.5 -> 10.0,
-        // 8.0 -> 10.2, 7.2 -> 10.3 and 3.0 -> 10.0 TF/s (TripoSplat's flow DiT
-        // attends over 8-13k rows).
-        const double kv_bytes = 2.0 * p.lk * p.hkv * p.hd * 2.0;
-        if (p.hd <= 96) c = kv_bytes > 24.0 * 1024 * 1024 ? CmCfg{32, 2} : CmCfg{16, 2};
-        else if (p.hd <= 128) c = {32, 4};
-        else c = {16, 2};
-    }
-    if ((c.bc != 16 && c.bc != 32 && c.bc != 64) || (c.nsg != 1 && c.nsg != 2 && c.nsg != 4) ||
-        c.nsg * 16 > 2 * c.bc) {
-        fail(p.op, "fa_cm tile: bc in {16, 32, 64}, nsg in {1, 2, 4}, 16 nsg <= 2 bc");
-    }
-    return c;
 }
 
 void combine(DeviceCtx& d, const AttnProblem& p, std::uint64_t part, std::uint64_t nsplit) {
@@ -118,26 +164,29 @@ Tensor partials(DeviceCtx& d, const AttnProblem& p, std::uint64_t nsplit) {
     return Tensor::empty_on(::brotensor::Device::vulkan(d.index()), static_cast<int>(n), 1, Dtype::FP32);
 }
 
-void run_cm(DeviceCtx& d, const AttnProblem& p) {
-    const CmCfg c = pick_cm(p);
+void run_cm(DeviceCtx& d, const AttnProblem& p, const AttnTuneCfg& cfg) {
+    const CmCfg c{cfg.bc, cfg.nsg};
     const std::uint32_t br = c.nsg * 16;
     const bool vec = p.hd % 8 == 0 && p.q % 16 == 0 && p.k % 16 == 0 && p.v % 16 == 0 && p.ldq % 8 == 0 &&
                      p.ldk % 8 == 0;
     const std::uint32_t nqb = static_cast<std::uint32_t>(cdiv(p.lq, br));
     const std::uint64_t wgs = static_cast<std::uint64_t>(nqb) * p.hq;
+    const std::uint64_t nsplit_target = cfg.nsplit_target ? cfg.nsplit_target : 160u;
     std::uint64_t nsplit = 1;
-    if (wgs < 160 && p.lk > 16 * static_cast<int>(c.bc)) {
-        nsplit = std::min<std::uint64_t>({cdiv(160, wgs), cdiv(p.lk, 8 * c.bc), 64});
+    if (wgs < nsplit_target && p.lk > 16 * static_cast<int>(c.bc)) {
+        nsplit = std::min<std::uint64_t>({cdiv(nsplit_target, wgs), cdiv(p.lk, 8 * c.bc), 64});
     }
     const std::uint64_t chunk = cdiv(cdiv(p.lk, nsplit), c.bc) * c.bc;
     nsplit = cdiv(p.lk, chunk);
     const bool split = nsplit > 1;
     const bool direct = !split && p.dt == Dtype::FP16 && p.hd % 16 == 0 && p.o % 16 == 0 && p.ldo % 8 == 0;
+    const bool hsw = cfg.head_swizzle != 0u;
     const std::uint32_t op = (static_cast<std::uint32_t>(p.hd) & 0xffffu) |
                              ((c.bc & 0xffu) << 16) |
                              ((static_cast<std::uint32_t>(p.mode) & 0x0fu) << 24);
     const std::uint8_t base_flags = static_cast<std::uint8_t>(
-        (p.mask ? 1u : 0u) | (vec ? 2u : 0u) | (split ? 8u : 0u));
+        (p.mask ? 1u : 0u) | (vec ? 2u : 0u) | (split ? 8u : 0u) |
+        (hsw ? 16u : 0u) | (p.softcap > 0.0f ? 32u : 0u));
     auto kernel = [&](bool dir) -> MirKernel {
         const std::uint8_t flags = static_cast<std::uint8_t>(base_flags | (dir ? 4u : 0u));
         return mir_kernel(d, {MirKind::FaCm, op, p.dt, Dtype::FP32, static_cast<std::uint8_t>(c.nsg), Dtype::FP32, flags}, 32u);
@@ -149,18 +198,22 @@ void run_cm(DeviceCtx& d, const AttnProblem& p) {
         part_addr = addr(part.data);
     }
     const std::uint64_t ptrs[] = {p.q, p.k, p.v, p.o, p.mask, p.aux, p.aux2, part_addr};
-    const float flts[] = {static_cast<float>(1.4426950408889634 / std::sqrt(static_cast<double>(p.hd)))};
+    const float flts[] = {
+        static_cast<float>(1.4426950408889634 / std::sqrt(static_cast<double>(p.hd))),
+        p.softcap,
+    };
     const std::uint32_t full = direct ? static_cast<std::uint32_t>(p.lq) / br : 0;
     auto dispatch = [&](const MirKernel& mk, std::uint32_t b0, std::uint32_t n) {
         for (std::uint32_t s = 0; s < n; s += 65535) {
+            const std::uint32_t nb = std::min<std::uint32_t>(65535, n - s);
             const std::int32_t ints[] = {
                 p.lq, p.lk, p.ldq, p.ldk, p.ldo, p.hq / p.hkv, std::max(0, p.window),
                 p.causal ? 1 : 0, p.nseq, static_cast<std::int32_t>(chunk), p.hq,
                 static_cast<std::int32_t>(b0 + s), p.q_offset,
             };
-            mir_dispatch_args_3d(d, mk, std::min<std::uint32_t>(65535, n - s),
-                                 static_cast<std::uint32_t>(p.hq), static_cast<std::uint32_t>(nsplit),
-                                 ptrs, ints, flts);
+            const std::uint32_t gx = hsw ? static_cast<std::uint32_t>(p.hq) : nb;
+            const std::uint32_t gy = hsw ? nb : static_cast<std::uint32_t>(p.hq);
+            mir_dispatch_args_3d(d, mk, gx, gy, static_cast<std::uint32_t>(nsplit), ptrs, ints, flts);
         }
     };
     if (full > 0) dispatch(kernel(true), 0, full);
@@ -170,7 +223,7 @@ void run_cm(DeviceCtx& d, const AttnProblem& p) {
 
 // ─── fa_rows.comp (+ fa_combine.comp) ──────────────────────────────────────
 
-void run_rows(DeviceCtx& d, const AttnProblem& p) {
+void run_rows(DeviceCtx& d, const AttnProblem& p, std::uint64_t nsplit_target = 80) {
     const int group = p.hq / p.hkv;
     const int slots = (p.hd + 127) / 128;
     // Query heads per workgroup: the largest divisor of the group whose
@@ -181,10 +234,7 @@ void run_rows(DeviceCtx& d, const AttnProblem& p) {
     }
     if (p.hd > 8192) fail(p.op, "head_dim above 8192");
     const std::uint64_t entries = static_cast<std::uint64_t>(p.lq) * (p.hq / G);
-    // Split the keys until the grid has 80 workgroups (a long cache streams
-    // best in a few long splits; 160 and up lost 5-30% on the 16k-32k decode
-    // shapes), at least one 128-key tile per split.
-    constexpr std::uint64_t target = 80;
+    const std::uint64_t target = nsplit_target ? nsplit_target : 80u;
     std::uint64_t nsplit = 1;
     if (entries < target && p.lk > 128) {
         nsplit = std::min<std::uint64_t>({cdiv(target, entries), cdiv(p.lk, 128), 64});
@@ -258,10 +308,11 @@ void attention(DeviceCtx& d, const AttnProblem& p) {
     // 32-bit element indices in the kernels (no buffer exceeds 4 GiB).
     auto fits = [](long long rows, long long ld) { return rows * ld < (1LL << 32); };
     if (!fits(p.lq, p.ldq) || !fits(p.lk, p.ldk) || !fits(p.lq, p.ldo)) fail(p.op, "operand above 4 GiB");
-    switch (choose(d, p)) {
-        case Path::Cm: run_cm(d, p); break;
-        case Path::Dense: dense_attention(d, p); break;
-        default: run_rows(d, p); break;
+    const AttnTuneCfg cfg = resolve_config(d, p);
+    switch (cfg.path) {
+        case 1u: run_cm(d, p, cfg); break;
+        case 2u: dense_attention(d, p); break;
+        default: run_rows(d, p, cfg.nsplit_target); break;
     }
 }
 

@@ -37,11 +37,12 @@ struct GemmCmSpec {
     bool direct = false;
     bool has_bias = false;
     bool scale_a = false;
+    bool swizzle = false;       // 2D L2 slab swizzle (group_m = 4, disables krot; requires tm0==tn0==0)
 };
 
-// Params (18):
-//   ptrs[0..5]: a, b, c, bias, scale, ascale
-//   ints[6..17]: m, n, k, lda, ldb, ldc, sa, sb, sc, half_n, tm0, tn0
+// Params (18, or 19 with residual ptr at [6] when epi==EPI_RESIDUAL_ADD):
+//   ptrs[0..5]: a, b, c, bias, scale, ascale [, residual]
+//   ints[...]: m, n, k, lda, ldb, ldc, sa, sb, sc, half_n, tm0, tn0
 brass::Function* build_gemm_cm_mir(brass::Module& mod, const GemmCmSpec& spec);
 
 }  // namespace brotensor::kernels

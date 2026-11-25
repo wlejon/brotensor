@@ -87,6 +87,7 @@ public:
     VkPipelineLayout layout() const { return layout_; }
     std::uint32_t push_bytes() const { return push_bytes_; }
     std::size_t size() const;
+    void flush_pipeline_cache();
 
 private:
     const Kernel& get_blob(std::uint32_t key_id, const ShaderBlob& blob, const std::uint32_t* spec,
