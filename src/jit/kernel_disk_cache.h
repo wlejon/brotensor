@@ -60,7 +60,7 @@ namespace brotensor::jit {
 class KernelDiskCache {
 public:
     // The key schema. Bump the suffix when what a key covers changes.
-    static constexpr std::string_view kKeyDomain = "brotensor.kernel/3";
+    static constexpr std::string_view kKeyDomain = "brotensor.kernel/4";
     static constexpr uint64_t kDefaultMaxBytes = uint64_t{256} << 20;
 
     struct Stats {
@@ -100,6 +100,10 @@ public:
     // CUDA PTX text.
     bool store_ptx(std::string_view signature, std::string_view ptx);
     bool load_ptx(std::string_view signature, std::string& out_ptx);
+
+    // Generic raw binary artifact (e.g. Vulkan pipeline cache, sibling MIR caches).
+    bool store_blob(std::string_view kind, std::string_view signature, const void* data, std::size_t size);
+    bool load_blob(std::string_view kind, std::string_view signature, std::vector<uint8_t>& out);
 
 #if BROTENSOR_HAS_BRASS_JIT
     // The key a PTX / SPIR-V blob of `kind` is stored under.

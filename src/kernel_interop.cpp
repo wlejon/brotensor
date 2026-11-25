@@ -1,6 +1,7 @@
 #include "brotensor/kernel_interop.h"
 #include "brotensor/detail/dispatch.h"
 #include "brotensor/runtime.h"
+#include "jit/kernel_disk_cache.h"
 
 #include <atomic>
 #include <cstring>
@@ -201,6 +202,16 @@ bool dispatch_msl(Device dev, const MslDispatchDesc& desc, std::string* err) {
         return false;
     }
     return fn(resolved.index, desc, err);
+}
+
+bool store_cached_blob(const char* kind, const char* signature, const void* data, std::size_t bytes) {
+    if (!kind || !signature) return false;
+    return jit::KernelDiskCache::instance().store_blob(kind, signature, data, bytes);
+}
+
+bool load_cached_blob(const char* kind, const char* signature, std::vector<std::uint8_t>& out) {
+    if (!kind || !signature) return false;
+    return jit::KernelDiskCache::instance().load_blob(kind, signature, out);
 }
 
 } // namespace brotensor::interop

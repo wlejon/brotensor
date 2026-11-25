@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace brotensor::interop {
 
@@ -98,6 +99,14 @@ bool metal_msl_dispatch_available(Device dev = Device::Metal);
 /// Compiles (cached) and dispatches an MSL compute kernel directly on `dev`'s
 /// brotensor Metal command queue (ordered with preceding/subsequent brotensor ops).
 bool dispatch_msl(Device dev, const MslDispatchDesc& desc, std::string* err = nullptr);
+
+/// Stores a raw binary artifact under `(kind, signature)` in brotensor's
+/// persistent on-disk kernel cache (returns false when the cache is disabled).
+bool store_cached_blob(const char* kind, const char* signature, const void* data, std::size_t bytes);
+
+/// Loads a raw binary artifact under `(kind, signature)` from brotensor's
+/// persistent on-disk kernel cache (returns false on miss or when disabled).
+bool load_cached_blob(const char* kind, const char* signature, std::vector<std::uint8_t>& out);
 
 namespace detail {
 using VulkanDispatchHook = bool (*)(int device_index, const SpirvDispatchDesc& desc, std::string* err);

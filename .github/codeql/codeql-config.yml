@@ -1,0 +1,10 @@
+name: brotensor CodeQL config
+
+queries:
+  - uses: security-extended
+
+# Dependency libraries (brass, bronze) are pre-built before `init` so CodeQL
+# never traces them, and paths-ignore drops any finding originating in dependency
+# headers under build/_deps/.
+paths-ignore:
+  - build/_deps

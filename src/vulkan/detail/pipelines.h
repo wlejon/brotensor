@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace brotensor::detail::vulkan {
@@ -106,6 +107,8 @@ private:
     mutable std::mutex mu_;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipelineCache cache_ = VK_NULL_HANDLE;
+    std::string cache_sig_;
+    bool cache_dirty_ = false;
     std::uint32_t push_bytes_ = 0;
     std::map<Key, std::unique_ptr<Kernel>> kernels_;
 };

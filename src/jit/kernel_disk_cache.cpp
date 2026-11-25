@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <span>
 #include <system_error>
 #include <utility>
 
@@ -220,6 +221,56 @@ bool KernelDiskCache::load_ptx(std::string_view signature, std::string& out_ptx)
 #else
     (void)signature;
     (void)out_ptx;
+    return false;
+#endif
+}
+
+bool KernelDiskCache::store_blob(std::string_view kind, std::string_view signature,
+                                 const void* data, std::size_t size) {
+#if BROTENSOR_HAS_BRASS_JIT
+    if (kind.empty() || !data || size == 0) return false;
+    auto st = stores();
+    if (!st) return false;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    if (!st->store.put(blob_key(kind, signature),
+                       {brass::cache::BlobRef("blob", std::span<const uint8_t>(bytes, size))})) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(mutex_);
+    ++stats_.writes;
+    return true;
+#else
+    (void)kind;
+    (void)signature;
+    (void)data;
+    (void)size;
+    return false;
+#endif
+}
+
+bool KernelDiskCache::load_blob(std::string_view kind, std::string_view signature,
+                                std::vector<uint8_t>& out) {
+#if BROTENSOR_HAS_BRASS_JIT
+    if (kind.empty()) return false;
+    brass::cache::Miss why = brass::cache::Miss::None;
+    std::optional<brass::cache::Artifact> art;
+    if (auto st = stores()) art = st->store.get(blob_key(kind, signature), &why);
+    const bool damaged = is_damage(why);
+    if (art) {
+        const auto bytes = art->bytes("blob");
+        out.assign(bytes.begin(), bytes.end());
+        std::lock_guard<std::mutex> lk(mutex_);
+        ++stats_.hits;
+        return true;
+    }
+    std::lock_guard<std::mutex> lk(mutex_);
+    ++stats_.misses;
+    if (damaged) ++stats_.corruptions;
+    return false;
+#else
+    (void)kind;
+    (void)signature;
+    (void)out;
     return false;
 #endif
 }

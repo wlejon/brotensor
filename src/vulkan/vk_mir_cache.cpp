@@ -35,6 +35,7 @@
 #include "../kernels/mir_vision.h"
 #include "../kernels/mir_xent.h"
 
+#include <brass/mir/gpu_opt.hpp>
 #include <brass/mir/module.hpp>
 #include <brass/target/spirv_target.hpp>
 
@@ -326,6 +327,11 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
             fn = kernels::build_fa_bwd_cm_mir(mod, s);
             break;
         }
+    }
+    {
+        brass::GpuOptOptions gopt;
+        gopt.opt_level = 1;
+        brass::optimize_gpu_function(*fn, mod, gopt);
     }
     brass::target::SpirvOptions opts;
     opts.stage = brass::target::SpirvStage::Compute;

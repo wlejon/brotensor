@@ -5,12 +5,31 @@
 #include "detail/pipelines.h"
 #include "detail/spirv_reflect.h"
 #include "detail/vk_check.h"
+#include "../jit/kernel_disk_cache.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
 namespace brotensor::detail::vulkan {
+
+namespace {
+
+std::string build_vk_pipe_cache_sig(const VkPhysicalDeviceProperties& p) {
+    char buf[128];
+    const int n = std::snprintf(buf, sizeof(buf), "vkpc:%04x:%04x:%08x:",
+                                p.vendorID, p.deviceID, p.driverVersion);
+    std::string out(buf, n > 0 ? static_cast<std::size_t>(n) : 0u);
+    for (unsigned b : p.pipelineCacheUUID) {
+        char hx[3];
+        std::snprintf(hx, sizeof(hx), "%02x", b & 0xffu);
+        out.append(hx, 2);
+    }
+    return out;
+}
+
+}  // namespace
 
 Pipelines::Pipelines(DeviceCtx& dev) : dev_(dev) {
     const DeviceFns& f = dev.fn();
@@ -20,15 +39,34 @@ Pipelines::Pipelines(DeviceCtx& dev) : dev_(dev) {
     pl.pushConstantRangeCount = 1;
     pl.pPushConstantRanges = &pcr;
     BT_VK_CHECK(f.vkCreatePipelineLayout(dev.device(), &pl, nullptr, &layout_));
-    // In-memory cache only: the driver keeps its own on-disk shader cache
-    // (Mesa: ~/.cache/mesa_shader_cache), so a warm process start is already
-    // ~0 ms per pipeline (vk-spike RESULTS.md).
+
+    cache_sig_ = build_vk_pipe_cache_sig(dev.info().props);
+    std::vector<std::uint8_t> init_data;
+    (void)jit::KernelDiskCache::instance().load_blob("vk_pipe_cache", cache_sig_, init_data);
     VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    BT_VK_CHECK(f.vkCreatePipelineCache(dev.device(), &pci, nullptr, &cache_));
+    pci.initialDataSize = init_data.size();
+    pci.pInitialData = init_data.empty() ? nullptr : init_data.data();
+    if (f.vkCreatePipelineCache(dev.device(), &pci, nullptr, &cache_) != VK_SUCCESS) {
+        pci.initialDataSize = 0;
+        pci.pInitialData = nullptr;
+        BT_VK_CHECK(f.vkCreatePipelineCache(dev.device(), &pci, nullptr, &cache_));
+    }
 }
 
 Pipelines::~Pipelines() {
     const DeviceFns& f = dev_.fn();
+    if (cache_dirty_ && cache_ != VK_NULL_HANDLE && !cache_sig_.empty() && f.vkGetPipelineCacheData) {
+        try {
+            std::size_t bytes = 0;
+            if (f.vkGetPipelineCacheData(dev_.device(), cache_, &bytes, nullptr) == VK_SUCCESS && bytes > 0) {
+                std::vector<std::uint8_t> data(bytes);
+                if (f.vkGetPipelineCacheData(dev_.device(), cache_, &bytes, data.data()) == VK_SUCCESS && bytes > 0) {
+                    jit::KernelDiskCache::instance().store_blob("vk_pipe_cache", cache_sig_, data.data(), bytes);
+                }
+            }
+        } catch (...) {
+        }
+    }
     for (auto& kv : kernels_) f.vkDestroyPipeline(dev_.device(), kv.second->pipe, nullptr);
     f.vkDestroyPipelineCache(dev_.device(), cache_, nullptr);
     f.vkDestroyPipelineLayout(dev_.device(), layout_, nullptr);
@@ -140,6 +178,7 @@ const Kernel& Pipelines::get_blob(std::uint32_t key_id, const ShaderBlob& blob,
     k->name = blob.name;
     const Kernel& ref = *k;
     kernels_.emplace(std::move(key), std::move(k));
+    cache_dirty_ = true;
     return ref;
 }
 

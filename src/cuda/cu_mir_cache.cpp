@@ -2,6 +2,7 @@
 
 #include "cuda_driver.h"
 #include "cuda_jit_engine.h"
+#include "../jit/kernel_disk_cache.h"
 #include "../kernels/mir_attn_small.h"
 #include "../kernels/mir_audio.h"
 #include "../kernels/mir_conv_direct.h"
@@ -32,6 +33,7 @@
 #include "../kernels/mir_xent.h"
 
 #if BROTENSOR_HAS_BRASS_CUDA_JIT
+#include <brass/mir/gpu_opt.hpp>
 #include <brass/mir/module.hpp>
 #include <brass/target/ptx_target.hpp>
 #endif
@@ -91,6 +93,12 @@ CUfunction compile_mir(const MirKey& k) {
     (void)k;
     throw std::runtime_error("brotensor: Brass CUDA JIT is required for CUDA MIR kernels");
 #else
+    const brass::target::PtxOptions ptx_opts = jit::make_ptx_opts();
+    const std::string mem_key = key_string_for(k);
+    const std::string disk_sig = mem_key + ":" + ptx_opts.sm_arch + ":opt1";
+    std::string ptx;
+    std::string fn_name = mem_key;
+    if (!jit::KernelDiskCache::instance().load_ptx(disk_sig, ptx)) {
     brass::Module mod("cu_mir");
     brass::Function* fn = nullptr;
     switch (k.kind) {
@@ -243,9 +251,26 @@ CUfunction compile_mir(const MirKey& k) {
             break;
         }
     }
-    const std::string ptx = brass::target::PtxTarget::emit_function(*fn, jit::make_ptx_opts());
+    {
+        brass::GpuOptOptions gopt;
+        gopt.opt_level = 1;
+        brass::optimize_gpu_function(*fn, mod, gopt);
+    }
+    fn_name = std::string(fn->name());
+    ptx = brass::target::PtxTarget::emit_function(*fn, ptx_opts);
+    jit::KernelDiskCache::instance().store_ptx(disk_sig, ptx);
+    } else {
+        const std::size_t pos = ptx.find(".visible .entry ");
+        if (pos != std::string::npos) {
+            const std::size_t start = pos + 16;
+            const std::size_t end = ptx.find('(', start);
+            if (end != std::string::npos && end > start) {
+                fn_name = ptx.substr(start, end - start);
+            }
+        }
+    }
     CUfunction cu_fn = jit::CudaJitEngine::instance().get_function(
-        key_string_for(k), ptx, std::string(fn->name()));
+        mem_key, ptx, fn_name);
 
     MirCache& cache = mir_cache();
     std::lock_guard<std::mutex> lk(cache.mu);

@@ -19,6 +19,7 @@
 
 #include "../src/cpu/cpu_jit.h"
 #include "../src/jit/kernel_disk_cache.h"
+#include <brotensor/kernel_interop.h>
 #include "../src/jit/ptx_emit.h"
 #include "../src/jit/spirv_emit.h"
 #include "../src/jit/trace_cache.h"
@@ -429,6 +430,18 @@ void test_spirv_and_ptx(const fs::path& dir) {
     cache.reset_stats();
     CHECK(!cache.load_ptx(sig, ptx), "a damaged PTX entry misses");
     CHECK(cache.stats().corruptions == 1, "and is counted");
+
+    // Generic raw binary blob cache (used by Vulkan pipeline cache & interop siblings).
+    const std::vector<uint8_t> raw_blob = {0x42, 0x52, 0x4f, 0x01, 0xfe, 0xca};
+    CHECK(cache.store_blob("vk_pipe_cache", "dev_0", raw_blob.data(), raw_blob.size()), "store_blob");
+    std::vector<uint8_t> loaded_blob;
+    CHECK(cache.load_blob("vk_pipe_cache", "dev_0", loaded_blob) && loaded_blob == raw_blob,
+          "load_blob round-trips bytes");
+    CHECK(brotensor::interop::store_cached_blob("sibling_mir", "k0", raw_blob.data(), raw_blob.size()),
+          "interop::store_cached_blob");
+    loaded_blob.clear();
+    CHECK(brotensor::interop::load_cached_blob("sibling_mir", "k0", loaded_blob) && loaded_blob == raw_blob,
+          "interop::load_cached_blob round-trips bytes");
 }
 
 } // namespace

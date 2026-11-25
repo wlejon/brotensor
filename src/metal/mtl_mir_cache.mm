@@ -32,8 +32,10 @@
 #include "../kernels/mir_vision.h"
 #include "../kernels/mir_xent.h"
 
+#include "../jit/kernel_disk_cache.h"
 #include "../vulkan/shaders/op_codes.h"
 
+#include <brass/mir/gpu_opt.hpp>
 #include <brass/mir/module.hpp>
 #include <brass/target/msl_target.hpp>
 
@@ -42,6 +44,7 @@
 #import "internal.h"
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -91,7 +94,23 @@ std::uint32_t block_for(const MirKey& k) {
     return kernels::kEwBlock;
 }
 
+std::string mtl_disk_signature(const MirKey& k, std::uint32_t block) {
+    char buf[128];
+    const int n = std::snprintf(
+        buf, sizeof(buf), "mtl_mir:%u:%u:%u:%u:%u:%u:%u:%llx:%u:opt1",
+        static_cast<unsigned>(k.kind), static_cast<unsigned>(k.op),
+        static_cast<unsigned>(k.dt0), static_cast<unsigned>(k.dt1),
+        static_cast<unsigned>(k.dt2), static_cast<unsigned>(k.lanes),
+        static_cast<unsigned>(k.flags), static_cast<unsigned long long>(k.aux),
+        static_cast<unsigned>(block));
+    return std::string(buf, n > 0 ? static_cast<std::size_t>(n) : 0u);
+}
+
 const MirEntry* compile_mir(const MirKey& k) {
+    const std::uint32_t blk = block_for(k);
+    const std::string disk_sig = mtl_disk_signature(k, blk);
+    auto entry = std::make_unique<MirEntry>();
+    if (!jit::KernelDiskCache::instance().load_msl_kernel(disk_sig, entry->msl)) {
     brass::Module mod("mtl_mir");
     brass::Function* fn = nullptr;
     switch (k.kind) {
@@ -249,10 +268,16 @@ const MirEntry* compile_mir(const MirKey& k) {
             break;
         }
     }
+    {
+        brass::GpuOptOptions gopt;
+        gopt.opt_level = 1;
+        brass::optimize_gpu_function(*fn, mod, gopt);
+    }
     brass::target::MslOptions opts;
-    opts.workgroup_x = block_for(k);
-    auto entry = std::make_unique<MirEntry>();
+    opts.workgroup_x = blk;
     entry->msl = brass::target::MslTarget::compile(*fn, opts);
+    jit::KernelDiskCache::instance().store_msl_kernel(disk_sig, entry->msl);
+    }
     @autoreleasepool {
         NSString* src = [NSString stringWithUTF8String:entry->msl.source.c_str()];
         NSString* name = [NSString stringWithUTF8String:entry->msl.entry_name.c_str()];

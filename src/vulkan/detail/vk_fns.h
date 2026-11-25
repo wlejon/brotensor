@@ -72,6 +72,7 @@
     X(vkCreateComputePipelines)                 \
     X(vkDestroyPipeline)                        \
     X(vkCreatePipelineCache)                    \
+    X(vkGetPipelineCacheData)                   \
     X(vkDestroyPipelineCache)                   \
     X(vkCmdBindPipeline)                        \
     X(vkCmdPushConstants)                       \

@@ -14,6 +14,7 @@ concurrency:
 env:
   HOMEBREW_NO_AUTO_UPDATE: "1"
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  SCCACHE_GHA_ENABLED: "true"
 
 # Checkout layout, every job below:
 #
@@ -293,10 +294,12 @@ jobs:
           key: coverage-objcxx-macos-15
           max-size: 500M
 
+      # Build deps (bronze/brass) at Release -O3 while brotensor core/CPU are
+      # instrumented (-O0 -g --coverage), keeping parity/JIT execution fast.
       - name: Configure (instrumented)
         run: |
           cmake -S brotensor -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_BUILD_TYPE=Release \
             -DBROTENSOR_COVERAGE=ON \
             -DBROTENSOR_WITH_METAL=ON \
             -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache
@@ -305,7 +308,7 @@ jobs:
         run: cmake --build build --parallel 3
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure --parallel 2 --parallel 2
+        run: ctest --test-dir build --output-on-failure --parallel 3
 
       # pipefail matters here: piping gcovr into tee otherwise hands the step
       # tee's exit status, so a gcovr crash produces no report and the job still
