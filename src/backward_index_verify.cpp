@@ -61,10 +61,6 @@
 #include <brass/verify/gpu_kernel_prover.hpp>
 #endif
 
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-#include "shader_table.h"
-#endif
-
 #include <cstdint>
 #include <span>
 #include <sstream>
@@ -113,7 +109,6 @@ struct LiftedSpirvCfgMetrics {
     }
 };
 
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
 LiftedSpirvCfgMetrics audit_lifted_spirv_words(std::span<const std::uint32_t> words, const char* label) {
     LiftedSpirvCfgMetrics m;
     if (words.empty()) {
@@ -315,7 +310,6 @@ struct MirAuditAccum {
         rep.entries.push_back({name, ok, oss.str()});
     }
 };
-#endif
 
 } // namespace
 
@@ -384,7 +378,6 @@ BackwardProofSuiteReport prove_conv2d_adjoint_duality() {
 BackwardProofSuiteReport prove_upfirdn2d_adjoint_duality() {
     BackwardProofSuiteReport rep;
 
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
     {
         bool all_ok = true;
         std::uint32_t total_insts = 0, total_writes = 0, total_guards = 0, count = 0;
@@ -452,7 +445,6 @@ BackwardProofSuiteReport prove_upfirdn2d_adjoint_duality() {
         }
         rep.entries.push_back({"scatter_add_mir_lifted_spirv_bounds_and_safety", all_ok, oss.str()});
     }
-#endif
 
     // Lower a guarded backward tap accumulation kernel to both SPIR-V and PTX
     // and prove MIR == SPIR-V == PTX equivalence + global/shared memory safety.
@@ -652,8 +644,6 @@ BackwardProofSuiteReport prove_resample2d_adjoint_duality() {
 BackwardProofSuiteReport prove_rope_adjoint_duality() {
     BackwardProofSuiteReport rep;
 
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-    using detail::vulkan::ShaderId;
     {
         bool all_ok = true;
         std::uint32_t total_insts = 0, total_writes = 0, total_guards = 0, count = 0;
@@ -725,7 +715,6 @@ BackwardProofSuiteReport prove_rope_adjoint_duality() {
         rep.entries.push_back({"act_bwd_mir_lifted_spirv_bounds_and_safety", all_ok, oss.str()});
     }
 
-#if BROTENSOR_HAS_BRASS_JIT
     {
         MirAuditAccum acc(kernels::kEwBlock);
         acc.check("mir_lstm", [](brass::Module& m) { return kernels::build_lstm_mir(m, LS_FWD, true, true); });
@@ -735,7 +724,6 @@ BackwardProofSuiteReport prove_rope_adjoint_duality() {
         acc.check("mir_xent", [](brass::Module& m) { return kernels::build_xent_mir(m, 1u, true, false); });
         acc.finish(rep, "norm_lstm_deltarule_xent_lifted_spirv_bounds_and_barrier_safety", "recurrent/xent");
     }
-#endif
     {
         MirAuditAccum acc(kernels::kNormBlock);
         for (Dtype dt : {Dtype::FP32, Dtype::FP16, Dtype::BF16}) {
@@ -754,7 +742,6 @@ BackwardProofSuiteReport prove_rope_adjoint_duality() {
         acc.check("mir_bnorm", [](brass::Module& m) { return kernels::build_bnorm_mir(m, BN_TRAIN_BWD); });
         acc.finish(rep, "norm_mir_lifted_spirv_bounds_and_barrier_safety", "norm/gnorm/bnorm backward");
     }
-#endif
 
     // Prove MIR == SPIR-V == PTX equivalence on a lowered RoPE pair-index kernel
     // using brass::verify::verify_spirv_ptx_equivalence (gpu_equiv.hpp).
