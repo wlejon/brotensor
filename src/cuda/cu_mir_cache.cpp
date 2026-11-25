@@ -98,7 +98,7 @@ CUfunction compile_mir(const MirKey& k) {
     const std::string disk_sig = mem_key + ":" + ptx_opts.sm_arch + ":opt1";
     std::string ptx;
     std::string fn_name = mem_key;
-    if (!jit::KernelDiskCache::instance().load_ptx(disk_sig, ptx)) {
+    if (!brotensor::jit::KernelDiskCache::instance().load_ptx(disk_sig, ptx)) {
     brass::Module mod("cu_mir");
     brass::Function* fn = nullptr;
     switch (k.kind) {
@@ -254,11 +254,12 @@ CUfunction compile_mir(const MirKey& k) {
     {
         brass::GpuOptOptions gopt;
         gopt.opt_level = 1;
+        gopt.enable_fma = true;
         brass::optimize_gpu_function(*fn, mod, gopt);
     }
     fn_name = std::string(fn->name());
     ptx = brass::target::PtxTarget::emit_function(*fn, ptx_opts);
-    jit::KernelDiskCache::instance().store_ptx(disk_sig, ptx);
+    brotensor::jit::KernelDiskCache::instance().store_ptx(disk_sig, ptx);
     } else {
         const std::size_t pos = ptx.find(".visible .entry ");
         if (pos != std::string::npos) {

@@ -52,7 +52,6 @@ if(BROTENSOR_HAS_BRASS_JIT)
 
     brotensor_add_test(brotensor_test_trace_autodiff_jit test_trace_autodiff_jit.cpp)
     target_link_libraries(brotensor_test_trace_autodiff_jit PRIVATE ${BROTENSOR_BRASS_LIB})
-    add_test(NAME test_trace_autodiff_jit COMMAND brotensor_test_trace_autodiff_jit)
 endif()
 # --- Bronze API test ---
 #

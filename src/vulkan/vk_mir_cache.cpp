@@ -331,6 +331,7 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
     {
         brass::GpuOptOptions gopt;
         gopt.opt_level = 1;
+        gopt.enable_fma = true;
         brass::optimize_gpu_function(*fn, mod, gopt);
     }
     brass::target::SpirvOptions opts;
