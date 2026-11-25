@@ -11,6 +11,7 @@
 #include "../kernels/mir_elementwise.h"
 #include "../kernels/mir_fa_bwd.h"
 #include "../kernels/mir_fa_rows.h"
+#include "../kernels/mir_gemm_cm.h"
 #include "../kernels/mir_gemm_simt.h"
 #include "../kernels/mir_gemv.h"
 #include "../kernels/mir_gemv_q.h"
@@ -72,6 +73,7 @@ std::uint32_t block_for(const MirKey& k) {
     if (k.kind == MirKind::FillBytes) return kernels::kFillBlock;
     if (k.kind == MirKind::FaRows) return kernels::kFaRowsBlock;
     if (k.kind == MirKind::FaBwd) return static_cast<std::uint32_t>(k.lanes);
+    if (k.kind == MirKind::GemmCm) return kernels::kGemmCmTiles[k.op & 3u].wg;
     return kernels::kEwBlock;
 }
 
@@ -255,6 +257,24 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
         case MirKind::Dft64:
             fn = kernels::build_dft64_mir(mod, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
             break;
+        case MirKind::GemmCm: {
+            kernels::GemmCmSpec s;
+            s.dt_a = k.dt0;
+            s.dt_b = k.dt1;
+            s.dt_c = k.dt2;
+            s.cfg_idx = k.op & 3u;
+            s.epi = (k.op >> 4) & 0x0fu;
+            s.act = (k.op >> 8) & 0x0fu;
+            s.qb = (k.op >> 12) & 0x0fu;
+            s.ta = (k.flags & 1u) != 0;
+            s.nb = (k.flags & 2u) != 0;
+            s.vec = (k.flags & 4u) != 0;
+            s.direct = (k.flags & 8u) != 0;
+            s.has_bias = (k.flags & 16u) != 0;
+            s.scale_a = (k.flags & 32u) != 0;
+            fn = kernels::build_gemm_cm_mir(mod, s);
+            break;
+        }
     }
     brass::target::SpirvOptions opts;
     opts.stage = brass::target::SpirvStage::Compute;

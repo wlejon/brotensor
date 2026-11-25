@@ -19,18 +19,8 @@ using ::brotensor::Dtype;
 
 namespace {
 
-struct GemmPush {
-    std::uint64_t a, b, c, bias, scale;
-    std::uint64_t ascale;     // gemm_cm SCALE_A: per-row exponents of A (gemm_rowscale.comp)
-    std::uint32_t m, n, k, lda, ldb, ldc, sa, sb, sc, half_n;
-    std::uint32_t tm0, tn0;   // gemm_cm: tile origin of the dispatch
-};
-
 // Cooperative-matrix tiles: BM x BN workgroup tile, K step BK, WM x WN per
-// subgroup of 32. Every entry must satisfy the shader's assumptions: chunk
-// counts divisible by the workgroup, WN a multiple of 32 (SwiGLU pairing),
-// the epilogue scratch (WG * 4 uvec4) inside As, and <= 64 KiB of shared
-// memory (the pipeline guard checks the last one too).
+// subgroup of 32.
 struct CmCfg { std::uint32_t bm, bn, bk, wm, wn; };
 constexpr CmCfg kCmCfgs[] = {
     {256, 128, 32, 64, 64},
@@ -48,8 +38,6 @@ constexpr SimtCfg kSimtCfgs[] = {
 std::atomic<int> g_override{0};
 std::atomic<int> g_cm_cfg{-1};
 std::atomic<int> g_noscale{0};    // 1: set_gemm_scaling(0) turned the scaling off
-
-std::uint32_t cm_wg(const CmCfg& c) { return (c.bm / c.wm) * (c.bn / c.wn) * 32u; }
 
 bool is16(Dtype t) { return t == Dtype::FP16 || t == Dtype::BF16; }
 
@@ -95,58 +83,43 @@ bool coopmat_eligible(DeviceCtx& d, const GemmArgs& g) {
     return g.round_a && g.da == Dtype::FP32 && is16(g.db) && g.dc == Dtype::FP32;
 }
 
-ShaderId cm_shader(const GemmArgs& g) {
-    if (g.da == Dtype::FP32) return g.db == Dtype::FP16 ? ShaderId::gemm_cm_f32a_w16 : ShaderId::gemm_cm_f32a_wbf16;
-    if (g.dc == Dtype::FP32) return g.da == Dtype::FP16 ? ShaderId::gemm_cm_f16_c32 : ShaderId::gemm_cm_bf16_c32;
-    return g.da == Dtype::FP16 ? ShaderId::gemm_cm_f16 : ShaderId::gemm_cm_bf16;
-}
-
-const CmCfg& pick_cm(const GemmArgs& g, std::uint32_t nout) {
+std::uint32_t pick_cm_idx(const GemmArgs& g, std::uint32_t nout) {
     const int ci = g_cm_cfg.load(std::memory_order_relaxed);
-    if (ci >= 0 && ci < static_cast<int>(std::size(kCmCfgs))) return kCmCfgs[ci];
-    // Measured on the spike's shapes (Radeon 8060S, 40 CUs, docs/vulkan.md):
-    // 256x128 pays off once there are ~150 tiles or K is long enough to
-    // amortise a thinner grid; 128x128 down to ~24 tiles (512x1024 runs best
-    // on 32 of them); 64x64 for short M, where a 128-row tile is half empty.
+    if (ci >= 0 && ci < static_cast<int>(std::size(kCmCfgs))) return static_cast<std::uint32_t>(ci);
     auto tiles = [&](const CmCfg& c) {
         const std::uint32_t wout = g.epi == EPI_SWIGLU ? c.bn / 2 : c.bn;
         return cdiv(static_cast<std::uint64_t>(g.m), c.bm) * cdiv(nout, wout) * static_cast<std::uint64_t>(g.batch);
     };
-    if (g.m >= 512 && (tiles(kCmCfgs[0]) >= 150 || (g.k >= 8192 && tiles(kCmCfgs[0]) >= 32))) return kCmCfgs[0];
-    if (g.m > 64 && tiles(kCmCfgs[1]) >= 24) return kCmCfgs[1];
-    if (g.m > 64 && tiles(kCmCfgs[2]) >= 24) return kCmCfgs[2];
-    return kCmCfgs[3];
+    if (g.m >= 512 && (tiles(kCmCfgs[0]) >= 150 || (g.k >= 8192 && tiles(kCmCfgs[0]) >= 32))) return 0u;
+    if (g.m > 64 && tiles(kCmCfgs[1]) >= 24) return 1u;
+    if (g.m > 64 && tiles(kCmCfgs[2]) >= 24) return 2u;
+    return 3u;
 }
 
-// Launches `k` over the batch in chunks of at most 65535 workgroups in z.
-void launch_batched(DeviceCtx& d, const Kernel& k, GemmPush pc, const GemmArgs& g,
-                    std::uint32_t gx, std::uint32_t gy) {
+// Launches `mk` over the batch in chunks of at most 65535 workgroups in z.
+void launch_cm_batched(DeviceCtx& d, const MirKernel& mk, const GemmArgs& g, std::uint64_t ascale,
+                       std::uint32_t tm0, std::uint32_t tn0, std::uint32_t gx, std::uint32_t gy) {
     if (gx > 65535 || gy > 65535) fail(g, "matrix too large for one dispatch");
+    const std::int32_t ints[] = {
+        g.m, g.n, g.k, g.lda, g.ldb, g.ldc,
+        static_cast<std::int32_t>(g.sa), static_cast<std::int32_t>(g.sb), static_cast<std::int32_t>(g.sc),
+        g.n / 2, static_cast<std::int32_t>(tm0), static_cast<std::int32_t>(tn0),
+    };
     for (int z0 = 0; z0 < g.batch; z0 += 65535) {
         const int nz = std::min(65535, g.batch - z0);
-        GemmPush p = pc;
-        p.a += static_cast<std::uint64_t>(z0) * g.sa * esize(g.da);
-        p.b += static_cast<std::uint64_t>(z0) * g.sb * esize(g.db);
-        p.c += static_cast<std::uint64_t>(z0) * g.sc * esize(g.dc);
-        if (p.ascale && g.sa != 0) p.ascale += static_cast<std::uint64_t>(z0) * static_cast<std::uint64_t>(g.m) * 4u;
-        launch(d, k, p, gx, gy, static_cast<std::uint32_t>(nz));
+        const std::uint64_t as = (ascale && g.sa != 0)
+            ? ascale + static_cast<std::uint64_t>(z0) * static_cast<std::uint64_t>(g.m) * 4u
+            : ascale;
+        const std::uint64_t ptrs[] = {
+            g.a + static_cast<std::uint64_t>(z0) * g.sa * esize(g.da),
+            g.b + static_cast<std::uint64_t>(z0) * g.sb * esize(g.db),
+            g.c + static_cast<std::uint64_t>(z0) * g.sc * esize(g.dc),
+            g.bias,
+            g.scale,
+            as,
+        };
+        mir_dispatch_args_3d(d, mk, gx, gy, static_cast<std::uint32_t>(nz), ptrs, ints, {});
     }
-}
-
-GemmPush make_push(const GemmArgs& g) {
-    GemmPush pc{};
-    pc.a = g.a; pc.b = g.b; pc.c = g.c; pc.bias = g.bias; pc.scale = g.scale;
-    pc.m = static_cast<std::uint32_t>(g.m);
-    pc.n = static_cast<std::uint32_t>(g.n);
-    pc.k = static_cast<std::uint32_t>(g.k);
-    pc.lda = static_cast<std::uint32_t>(g.lda);
-    pc.ldb = static_cast<std::uint32_t>(g.ldb);
-    pc.ldc = static_cast<std::uint32_t>(g.ldc);
-    pc.sa = static_cast<std::uint32_t>(g.sa);
-    pc.sb = static_cast<std::uint32_t>(g.sb);
-    pc.sc = static_cast<std::uint32_t>(g.sc);
-    pc.half_n = static_cast<std::uint32_t>(g.n / 2);
-    return pc;
 }
 
 void check_args(const GemmArgs& g) {
@@ -238,7 +211,6 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
     check_args(g);
     const std::uint32_t nout = g.epi == EPI_SWIGLU || g.epi == EPI_GEGLU ? g.n / 2 : g.n;
     if (g.m == 0 || nout == 0) return;
-    GemmPush pc = make_push(g);
 
     if (gemv_eligible(d, g)) {
         const bool vec = vec_ok(g) && g.k % 8 == 0 && g.k > 0;
@@ -258,55 +230,46 @@ void gemm(DeviceCtx& d, const GemmArgs& g) {
     }
 
     if (coopmat_eligible(d, g)) {
-        const CmCfg& c = pick_cm(g, nout);
+        const std::uint32_t cfg_idx = pick_cm_idx(g, nout);
+        const CmCfg& c = kCmCfgs[cfg_idx];
         const std::uint32_t wout = g.epi == EPI_SWIGLU ? c.bn / 2 : c.bn;
         const std::uint32_t gx = static_cast<std::uint32_t>(
             g.epi == EPI_SWIGLU ? cdiv(nout, wout) : cdiv(static_cast<std::uint64_t>(g.n), c.bn));
         const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(g.m, c.bm));
-        const ShaderId id = cm_shader(g);
         // Range-safe BF16 / FP32: the per-row exponents of A, in a stream-ordered
         // scratch (freed here, reused only by later work on the stream).
         const bool scaled = scale_a(g);
         ::brotensor::Tensor exps;
+        std::uint64_t ascale = 0;
         if (scaled) {
             const long long rows = static_cast<long long>(g.m) * (g.sa != 0 ? g.batch : 1);
             if (rows > 0x7fffffffLL) fail(g, "too many rows to scale");
             exps = ::brotensor::Tensor::empty_on(::brotensor::Device::vulkan(d.index()), static_cast<int>(rows), 1,
                                                  Dtype::INT32);
             row_scales(d, g, addr(exps.data));
-            pc.ascale = addr(exps.data);
+            ascale = addr(exps.data);
         }
-        auto kernel = [&](bool direct) -> const Kernel& {
-            const std::uint32_t spec[] = {c.bm, c.bn, c.bk, c.wm, c.wn, cm_wg(c),
-                                          static_cast<std::uint32_t>(g.epi), static_cast<std::uint32_t>(g.act),
-                                          g.ta ? 1u : 0u, g.nb ? 1u : 0u, cm_vec_ok(g) ? 1u : 0u,
-                                          direct ? 1u : 0u, g.bias ? 1u : 0u,
-                                          static_cast<std::uint32_t>(g.qb), scaled ? 1u : 0u};
-            return d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)), 32);
+        const std::uint32_t op = (cfg_idx & 3u) |
+                                 ((static_cast<std::uint32_t>(g.epi) & 0x0fu) << 4) |
+                                 ((static_cast<std::uint32_t>(g.act) & 0x0fu) << 8) |
+                                 ((static_cast<std::uint32_t>(g.qb) & 0x0fu) << 12);
+        const std::uint8_t base_flags = static_cast<std::uint8_t>(
+            (g.ta ? 1u : 0u) | (g.nb ? 2u : 0u) | (cm_vec_ok(g) ? 4u : 0u) |
+            (g.bias ? 16u : 0u) | (scaled ? 32u : 0u));
+        auto kernel = [&](bool direct) -> MirKernel {
+            const std::uint8_t flags = static_cast<std::uint8_t>(base_flags | (direct ? 8u : 0u));
+            return mir_kernel(d, {MirKind::GemmCm, op, g.da, g.db, 1, g.dc, flags}, 32u);
         };
-        // The fragment-form epilogue (stores straight from the accumulator)
-        // needs FP16 operands and output, an aligned C, and tiles wholly
-        // inside the matrix: the full tiles go in one dispatch, the right and
-        // bottom edge strips (if any) in up to two more with the general
-        // epilogue.
         const bool direct = g.da == Dtype::FP16 && g.dc == Dtype::FP16 && g.epi != EPI_GEGLU && g.c % 16 == 0 && g.ldc % 8 == 0 &&
                             g.sc % 8 == 0 && (g.bias == 0 || g.bias % 16 == 0);
         const std::uint32_t fx = direct ? static_cast<std::uint32_t>((g.epi == EPI_SWIGLU ? nout : g.n) / wout) : 0;
         const std::uint32_t fy = direct ? static_cast<std::uint32_t>(g.m / c.bm) : 0;
         if (fx > 0 && fy > 0) {
-            launch_batched(d, kernel(true), pc, g, fx, fy);
-            if (fx < gx) {
-                GemmPush p = pc;
-                p.tn0 = fx;
-                launch_batched(d, kernel(false), p, g, gx - fx, gy);
-            }
-            if (fy < gy) {
-                GemmPush p = pc;
-                p.tm0 = fy;
-                launch_batched(d, kernel(false), p, g, fx, gy - fy);
-            }
+            launch_cm_batched(d, kernel(true), g, ascale, 0u, 0u, fx, fy);
+            if (fx < gx) launch_cm_batched(d, kernel(false), g, ascale, 0u, fx, gx - fx, gy);
+            if (fy < gy) launch_cm_batched(d, kernel(false), g, ascale, fy, 0u, fx, gy - fy);
         } else {
-            launch_batched(d, kernel(false), pc, g, gx, gy);
+            launch_cm_batched(d, kernel(false), g, ascale, 0u, 0u, gx, gy);
         }
         return;
     }

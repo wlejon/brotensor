@@ -38,6 +38,7 @@
 #include "kernels/mir_conv_direct.h"
 #include "kernels/mir_fa_bwd.h"
 #include "kernels/mir_fa_rows.h"
+#include "kernels/mir_gemm_cm.h"
 #include "kernels/mir_gemm_simt.h"
 #include "kernels/mir_gemv.h"
 #include "kernels/mir_gemv_q.h"
@@ -718,6 +719,19 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
                     fb_mod, dt, 128u, 64u, 64u, 32u, 16u, 0u, true, 1u);
                 brass::target::SpirvKernel fbsk = brass::target::SpirvTarget::compile(*fbfn, fa_opts);
                 report.shaders.push_back(audit_spirv_binary_words(fb_name.c_str(), fbsk.words.data(), fbsk.words.size()));
+            }
+            for (const auto& [cm_name, dt_a, dt_b, qb, direct] :
+                 std::vector<std::tuple<const char*, Dtype, Dtype, std::uint32_t, bool>>{
+                     {"gemm_cm_f16", Dtype::FP16, Dtype::FP16, 0u, true},
+                     {"gemm_cm_bf16", Dtype::BF16, Dtype::BF16, 0u, false},
+                     {"gemm_cm_q4k", Dtype::FP16, Dtype::FP16, QF_Q4K, false}}) {
+                kernels::GemmCmSpec s;
+                s.dt_a = dt_a; s.dt_b = dt_b; s.dt_c = dt_a; s.cfg_idx = 1u;
+                s.qb = qb; s.direct = direct; s.has_bias = true; s.scale_a = (dt_a == Dtype::BF16);
+                brass::Module cm_mod(cm_name);
+                brass::Function* cmfn = kernels::build_gemm_cm_mir(cm_mod, s);
+                brass::target::SpirvKernel cmsk = brass::target::SpirvTarget::compile(*cmfn, fa_opts);
+                report.shaders.push_back(audit_spirv_binary_words(cm_name, cmsk.words.data(), cmsk.words.size()));
             }
         }
     }
