@@ -14,7 +14,6 @@ set(BROTENSOR_VK_SHADERS
     "fa_cm_bf16|fa_cm.comp|-DDT=2"
     "conv_cm_f16|conv_cm.comp|-DDT=1"
     "conv_cm_bf16|conv_cm.comp|-DDT=2"
-    "dft64|dft64.comp|"
     "fa_bwd_cm_f16|fa_bwd_cm.comp|-DDT=1"
     "fa_bwd_cm_bf16|fa_bwd_cm.comp|-DDT=2"
     "test_shared_overflow|test_shared_overflow.comp|"

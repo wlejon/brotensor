@@ -76,7 +76,16 @@ brass::Function* build_gemv_q_mir(brass::Module& mod, Dtype dt, std::uint32_t fm
 
     const std::uint32_t ng = 256u / lpr;
     Value* s_part = (lpr == 64u) ? kb.shared_alloc_f32(ng * 2u * nr * mb) : nullptr;
+    Value* s_fp8 = (fmt == QF_FP8) ? kb.shared_alloc_f32(256u) : nullptr;
     Value* tid = kb.tid_x();
+    if (s_fp8) {
+        kb.shared_store_f32_indexed(s_fp8, tid, emit_fp8_e4m3_to_f32(c, tid));
+        kb.sync();
+    }
+    auto decode_byte = [&](Value* qb) -> Value* {
+        if (s_fp8) return kb.shared_load_f32_indexed(s_fp8, c.b.build_and(qb, c.i32(0xff)));
+        return emit_s8_byte_to_f32(c, qb);
+    };
     Value* unit = c.b.build_udiv(tid, c.i32(static_cast<int>(lpr)));
     Value* lane = c.b.build_umod(tid, c.i32(static_cast<int>(lpr)));
     Value* wg = c.b.build_add(kb.ctaid_x(), c.b.build_mul(kb.ctaid_y(), kb.nctaid_x()));
@@ -125,7 +134,7 @@ brass::Function* build_gemv_q_mir(brass::Module& mod, Dtype dt, std::uint32_t fm
                         }
                         for (std::uint32_t r = 0; r < nr; ++r) {
                             Value* qb = kb.load_u8(c.b.build_add(row_ptrs[r], c.b.build_zext_i64(col)));
-                            Value* wv = (fmt == QF_FP8) ? emit_fp8_e4m3_to_f32(c, qb) : emit_s8_byte_to_f32(c, qb);
+                            Value* wv = decode_byte(qb);
                             for (std::uint32_t b = 0; b < mb; ++b) {
                                 std::size_t idx = r * mb + b;
                                 next[idx] = c.b.build_fma_f32(xv[b], wv, next[idx]);
@@ -150,24 +159,33 @@ brass::Function* build_gemv_q_mir(brass::Module& mod, Dtype dt, std::uint32_t fm
                 lane, nitems, c.i32(static_cast<int>(lpr * eff_unr)), acc_init,
                 [&](Value* c0, const std::vector<Value*>& cur) -> std::vector<Value*> {
                     std::vector<Value*> next = cur;
-                    for (std::uint32_t u = 0; u < eff_unr; ++u) {
-                        Value* col_u = (u == 0) ? c0 : c.b.build_add(c0, c.i32(static_cast<int>(u * lpr)));
-                        Value* in_k = (u == 0) ? c.i32(1) : c.b.build_ult(col_u, nitems);
-                        Value* cc = (u == 0) ? c0 : c.b.build_select(in_k, col_u, c0);
-                        Value* ok_f = (u == 0) ? c.f32(1.0f) : c.b.build_select(in_k, c.f32(1.0f), c.f32(0.0f));
-                        Value* col_elem = c.b.build_shl(cc, c.i32(ie_shift));
-
-                        if (byte_fmt) {
+                    if (byte_fmt) {
+                        std::vector<Value*> ok_fs(eff_unr);
+                        std::vector<Value*> col_elems(eff_unr);
+                        std::vector<Value*> wv_all(eff_unr * nr);
+                        // Issue all eff_unr * nr weight vector loads up front so they overlap in flight.
+                        for (std::uint32_t u = 0; u < eff_unr; ++u) {
+                            Value* col_u = (u == 0) ? c0 : c.b.build_add(c0, c.i32(static_cast<int>(u * lpr)));
+                            Value* in_k = (u == 0) ? c.i32(1) : c.b.build_ult(col_u, nitems);
+                            Value* cc = (u == 0) ? c0 : c.b.build_select(in_k, col_u, c0);
+                            ok_fs[u] = (u == 0) ? c.f32(1.0f) : c.b.build_select(in_k, c.f32(1.0f), c.f32(0.0f));
+                            col_elems[u] = c.b.build_shl(cc, c.i32(ie_shift));
+                            Value* col_off64 = c.b.build_zext_i64(col_elems[u]);
+                            for (std::uint32_t r = 0; r < nr; ++r) {
+                                wv_all[u * nr + r] = kb.vload(Type::i32x4(), c.b.build_add(row_ptrs[r], col_off64));
+                            }
+                        }
+                        for (std::uint32_t u = 0; u < eff_unr; ++u) {
                             std::vector<std::vector<Value*>> xs(mb);
                             for (std::uint32_t b = 0; b < mb; ++b) {
-                                Value* xi = c.b.build_add(c.b.build_mul(c.i32(static_cast<int>(b)), p[7]), col_elem);
+                                Value* xi = c.b.build_add(c.b.build_mul(c.i32(static_cast<int>(b)), p[7]), col_elems[u]);
                                 auto lo = load_x_slice8(c, dt, p[0], xi, 8, true);
                                 auto hi = load_x_slice8(c, dt, p[0], c.b.build_add(xi, c.i32(8)), 8, true);
                                 lo.insert(lo.end(), hi.begin(), hi.end());
                                 xs[b] = std::move(lo);
                             }
                             for (std::uint32_t r = 0; r < nr; ++r) {
-                                Value* wv128 = kb.vload(Type::i32x4(), c.b.build_add(row_ptrs[r], c.b.build_zext_i64(col_elem)));
+                                Value* wv128 = wv_all[u * nr + r];
                                 Value* w4[4] = {
                                     c.b.build_vextract_lane(wv128, 0), c.b.build_vextract_lane(wv128, 1),
                                     c.b.build_vextract_lane(wv128, 2), c.b.build_vextract_lane(wv128, 3),
@@ -175,16 +193,27 @@ brass::Function* build_gemv_q_mir(brass::Module& mod, Dtype dt, std::uint32_t fm
                                 Value* wvals[16];
                                 for (int e = 0; e < 16; ++e) {
                                     Value* qb = c.b.build_and(c.b.build_lshr(w4[e >> 2], c.i32((e & 3) * 8)), c.i32(0xff));
-                                    wvals[e] = (fmt == QF_FP8) ? emit_fp8_e4m3_to_f32(c, qb) : emit_s8_byte_to_f32(c, qb);
+                                    wvals[e] = decode_byte(qb);
                                 }
                                 for (std::uint32_t b = 0; b < mb; ++b) {
                                     Value* dot = c.f32(0.0f);
                                     for (int e = 0; e < 16; ++e) dot = c.b.build_fma_f32(xs[b][e], wvals[e], dot);
                                     std::size_t idx = r * mb + b;
-                                    next[idx] = c.b.build_fma_f32(dot, ok_f, next[idx]);
+                                    next[idx] = (u == 0) ? c.b.build_add(next[idx], dot)
+                                                         : c.b.build_fma_f32(dot, ok_fs[u], next[idx]);
                                 }
                             }
-                        } else if (fmt == QF_Q8_0) {
+                        }
+                        return next;
+                    }
+                    for (std::uint32_t u = 0; u < eff_unr; ++u) {
+                        Value* col_u = (u == 0) ? c0 : c.b.build_add(c0, c.i32(static_cast<int>(u * lpr)));
+                        Value* in_k = (u == 0) ? c.i32(1) : c.b.build_ult(col_u, nitems);
+                        Value* cc = (u == 0) ? c0 : c.b.build_select(in_k, col_u, c0);
+                        Value* ok_f = (u == 0) ? c.f32(1.0f) : c.b.build_select(in_k, c.f32(1.0f), c.f32(0.0f));
+                        Value* col_elem = c.b.build_shl(cc, c.i32(ie_shift));
+
+                        if (fmt == QF_Q8_0) {
                             std::vector<std::vector<Value*>> xs(mb);
                             for (std::uint32_t b = 0; b < mb; ++b) {
                                 Value* xi = c.b.build_add(c.b.build_mul(c.i32(static_cast<int>(b)), p[7]), col_elem);

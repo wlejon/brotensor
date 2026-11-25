@@ -72,8 +72,6 @@ void run(DeviceCtx& d, const char* op, const G& x) {
     gemm(d, g);
 }
 
-std::uint64_t at(const Tensor& t, long long elems = 0) { return addr(t.data) + std::uint64_t(elems) * 4u; }
-
 struct BwdSpec {
     const char* op;
     const Tensor *dO, *X, *C;                 // C: key / value source (X for self-attention)

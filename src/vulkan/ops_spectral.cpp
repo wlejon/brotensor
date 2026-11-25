@@ -55,7 +55,6 @@ void ensure(Tensor& t, int rows, int cols) {
     if (t.rows != rows || t.cols != cols || t.dtype != Dtype::FP32) t.resize(rows, cols, Dtype::FP32);
 }
 
-std::uint32_t u32(long long v) { return static_cast<std::uint32_t>(v); }
 std::int32_t i32(long long v) { return static_cast<std::int32_t>(v); }
 
 void run_spectral(DeviceCtx& d, std::uint32_t op, std::uint8_t flags, std::uint64_t items,
@@ -75,14 +74,7 @@ struct Basis {
     std::uint64_t win = 0;
 };
 
-struct Dft64Push {
-    std::uint64_t x, y, win;
-    std::uint32_t sa, sc, R, batch, cols, lda, rows, ldc, L, mode, tofs, weights;
-    std::int32_t sgn;
-    float scale;
-};
-
-// The FP64 direct DFT (dft64.comp) takes frame-sized transforms on a device
+// The FP64 direct DFT (mir_dft64) takes frame-sized transforms on a device
 // with shaderFloat64: L <= 2048 (C2C <= 1024, its shared-memory row). Longer
 // transforms keep the FP32 basis GEMM.
 bool use_dft64(DeviceCtx& d, const Basis& bs, int cols, long long span) {
@@ -100,16 +92,16 @@ void dft_gemm(DeviceCtx& d, const Basis& bs, std::uint64_t x, int R, int cols, i
     const long long span = std::max(sa * (batch - 1) + static_cast<long long>(lda) * (R - 1) + cols,
                                     sc * (batch - 1) + static_cast<long long>(ldc) * (R - 1) + rows);
     if (use_dft64(d, bs, cols, span)) {
-        Dft64Push pc{};
-        pc.x = x; pc.y = y; pc.win = bs.win;
-        pc.sa = u32(sa); pc.sc = u32(sc); pc.R = u32(R); pc.batch = u32(batch);
-        pc.cols = u32(cols); pc.lda = u32(lda); pc.rows = u32(rows); pc.ldc = u32(ldc);
-        pc.L = u32(bs.L); pc.mode = bs.mode; pc.tofs = u32(bs.tofs); pc.weights = bs.weights ? 1u : 0u;
-        pc.sgn = bs.sign;
-        pc.scale = bs.scale;
-        const Kernel& k = d.pipelines().get(ShaderId::dft64);
+        const std::uint8_t flags = static_cast<std::uint8_t>((bs.win != 0 ? 1u : 0u) | (bs.weights ? 2u : 0u));
+        const MirKernel mk = mir_kernel(
+            d, MirKey{MirKind::Dft64, bs.mode, Dtype::FP32, Dtype::FP32, 1, Dtype::FP32, flags});
+        const std::uint64_t ptrs[] = {x, y, bs.win};
+        const std::int32_t ints[] = {
+            i32(sa), i32(sc), i32(R), i32(batch), i32(cols), i32(lda),
+            i32(rows), i32(ldc), i32(bs.L), i32(bs.tofs), bs.sign};
+        const float flts[] = {bs.scale};
         const long long total = static_cast<long long>(R) * batch;
-        launch(d, k, pc, static_cast<std::uint32_t>(std::min<long long>(total, 65535)));
+        mir_dispatch_args(d, mk, static_cast<std::uint32_t>(std::min<long long>(total, 65535)), ptrs, ints, flts);
         return;
     }
     const long long kMaxBasis = 16LL << 20;

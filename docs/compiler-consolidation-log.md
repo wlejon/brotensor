@@ -769,4 +769,27 @@ Extended `src/cuda/cu_mir_cache.{h,cpp}` (`219` / `789` LOC) with `MirKind::{Gem
   - Net `src/cuda/` Waves 9–12 delta: **`-3,643` lines** (`+294 / -4,778` diff across 20 files + `841` lines in `ops_quant.cpp`, `ops_gemm_mir.{h,cpp}`, `ops_fa_mir.{h,cpp}`; all modified/created files `<= 789` LOC, max across all of `src/cuda/` is `resblock.cu` at `869` LOC).
   - **Cumulative CUDA Waves 3–12:** **`-15,849` net lines** and `56` `.cu` files + `3` `.cuh` headers deleted.
 
+---
+
+## Milestones 1 & 2 (Vulkan / Radeon 8060S): Cross-Backend Waves 1–12 Sign-Off, Persistent SPIR-V Disk Cache, `mir_gemv_q` Tuning & FP64 DFT Straggler (`dft64`) -> Single-Source Brass MIR
+
+Signed off cross-backend Waves 1–12 across Vulkan (`0797f77`), Metal (`8c21892`), and CUDA (`ed46d81`), wired persistent `KernelDiskCache` caching into Vulkan's runtime MIR compiler, tuned quantized decode GEMV, and replaced the FP64 direct DFT shader (`dft64.comp`, `155` LOC):
+- **`src/kernels/mir_dft64.{h,cpp}` (`19 + 228` LOC):** Replaced `src/vulkan/shaders/dft64.comp` (`14 -> 13` compiled Vulkan shaders, leaving only the 4 CoopMat shaders + `test_shared_overflow.comp`) with a single-source Brass FP64 direct DFT builder (`BASIS_R2C`, `BASIS_C2R`, `BASIS_C2C`) using `ptx_shared_{alloc,load,store}_f64[_indexed]`, `fma_f64`, `fpext_f64_f32`, `fptrunc_f32_f64`, and clamped shared-memory indices. Wired `MirKind::Dft64` in `vk_mir_cache.{h,cpp}` (`201 / 777` LOC), `ops_spectral.cpp` (`407` LOC), and `backward_shader_audit.cpp` (`779` LOC).
+- **Persistent SPIR-V MIR Disk Cache (`src/vulkan/vk_mir_cache.cpp`):** Wired `jit::KernelDiskCache::instance().load_spirv_kernel` / `store_spirv_kernel` around `SpirvTarget::compile` in `compile_mir`, keyed by all `MirKey` fields + `block_for(k)` plus Brass's automatic binary build fingerprint.
+- **`src/kernels/mir_gemv_q.cpp` (`467` LOC):** Added a 256-entry shared-memory FP8 E4M3 decode LUT (`s_fp8[256]`) and hoisted all `eff_unr * nr` byte-format `i32x4` weight loads ahead of `X` loads and FMA loops so memory requests overlap in flight.
+- **Warning cleanup (`src/vulkan/ops_attention_bwd.cpp`):** Removed unused `at()` helper.
+
+### Milestone 1 & 2 Verification & Benchmarks (Radeon 8060S, Release + Vulkan, `brass@d5608f4`)
+- **Formal Audits & Targeted Suites (`0` failures):**
+  - `brotensor_test_backward_shader_audit`: **`161 / 161` ALL PASSED** (`111,010` SPIR-V/PTX insts, `212` workgroup arrays, `7,921` shared / `2,684` global accesses proven, `680` uniform barriers, `1,071` uniform collectives), including `dft64_r2c` and `dft64_c2r`.
+  - `brotensor_test_vulkan --only=spectral,quant`: **`OK: 0 failure(s)`**.
+  - `ctest -j 1 -R "fft|stft|q4k|q8_0|q6k|linear_wq|kernel_disk_cache"`: **`9 / 9` PASSED** (`8.28 s`).
+- **Radeon 8060S Microbenchmarks (vs Wave 0 GLSL baselines):**
+  - `brotensor_bench_elementwise` (`37/37` ok): matches or beats Wave 0 (`silu` bf16 `221.2` vs `165.8 GB/s`, `layernorm_inf_fp16` `204.3` vs `152.2 GB/s`, `rms_norm` fp16 `202.1` vs `181.0 GB/s`, `softmax_rows` `200.7` vs `196.0 GB/s`).
+  - `brotensor_bench_wq_linear` (`2048`-wide decoder layer): `M=1` FP16 `190.4 GB/s`, **INT8 `142.3 GB/s`** (+6.5% vs Wave 0 `133.6`), **FP8 `143.7 GB/s`** (+1.6% vs Wave 0 `141.5`, +33.3% over pre-LUT `107.8`); `M=2` INT8 `124.1` / FP8 `125.4 GB/s`; `M=8` INT8 `103.8` / FP8 `103.0 GB/s`.
+  - `brotensor_bench_quant_matmul --device=vulkan` (decode `B=1`): `q4k` `gate/up` `174.6 GB/s`, `q6k` `gate/up` `189.7 GB/s`, `q8_0` `gate/up` `196.7 GB/s` (all rows verified).
+  - `brotensor_bench_gemm_fp16 --device=vulkan` (pre-Phase 2 CoopMat baseline): `NN 4096^3` `32.68 TF/s`, `NT 4096^3` `26.77 TF/s`, `ABT 4096^3` `27.15 TF/s`.
+- **LOC Delta:** `src/vulkan/shaders/*`: `2,692 -> 2,537` (`-155` lines; **`140 -> 13` compiled Vulkan shaders**, cumulative **`-5,698` shader LOC** / `45` `.comp` files deleted).
+
+
 

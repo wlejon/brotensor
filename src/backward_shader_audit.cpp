@@ -22,6 +22,7 @@
 #include "jit/trace_plan.h"
 #include "kernels/mir_copy.h"
 #include "kernels/mir_delta.h"
+#include "kernels/mir_dft64.h"
 #include "kernels/mir_diffusion.h"
 #include "kernels/mir_elementwise.h"
 #include "kernels/mir_gnorm.h"
@@ -633,6 +634,12 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
         });
         audit_mir("spectral_stft_adj", [](brass::Module& m) {
             return kernels::build_spectral_mir(m, SP_STFT_ADJ, 1u, false, false);
+        });
+        audit_mir("dft64_r2c", [](brass::Module& m) {
+            return kernels::build_dft64_mir(m, BASIS_R2C, true, true);
+        });
+        audit_mir("dft64_c2r", [](brass::Module& m) {
+            return kernels::build_dft64_mir(m, BASIS_C2R, true, true);
         });
         for (const auto& [sfx, dt] : std::vector<std::pair<const char*, Dtype>>{
                  {"_f32", Dtype::FP32}, {"_f16", Dtype::FP16}, {"_bf16", Dtype::BF16}}) {

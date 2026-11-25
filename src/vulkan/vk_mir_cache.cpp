@@ -5,7 +5,9 @@
 #include "../kernels/mir_conv_direct.h"
 #include "../kernels/mir_copy.h"
 #include "../kernels/mir_delta.h"
+#include "../kernels/mir_dft64.h"
 #include "../kernels/mir_diffusion.h"
+#include "../jit/kernel_disk_cache.h"
 #include "../kernels/mir_elementwise.h"
 #include "../kernels/mir_fa_bwd.h"
 #include "../kernels/mir_fa_rows.h"
@@ -33,9 +35,11 @@
 #include <brass/target/spirv_target.hpp>
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 namespace brotensor::detail::vulkan {
@@ -71,7 +75,33 @@ std::uint32_t block_for(const MirKey& k) {
     return kernels::kEwBlock;
 }
 
+std::string mir_disk_signature(const MirKey& k, std::uint32_t block) {
+    char buf[128];
+    const int n = std::snprintf(
+        buf, sizeof(buf), "vk_mir:%u:%u:%u:%u:%u:%u:%u:%llx:%u",
+        static_cast<unsigned>(k.kind), static_cast<unsigned>(k.op),
+        static_cast<unsigned>(k.dt0), static_cast<unsigned>(k.dt1),
+        static_cast<unsigned>(k.dt2), static_cast<unsigned>(k.lanes),
+        static_cast<unsigned>(k.flags), static_cast<unsigned long long>(k.aux),
+        static_cast<unsigned>(block));
+    return std::string(buf, n > 0 ? static_cast<std::size_t>(n) : 0u);
+}
+
 const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
+    const std::uint32_t blk = block_for(k);
+#if BROTENSOR_HAS_BRASS_JIT
+    const std::string sig = mir_disk_signature(k, blk);
+    {
+        auto cached = std::make_unique<brass::target::SpirvKernel>();
+        if (jit::KernelDiskCache::instance().load_spirv_kernel(sig, *cached)) {
+            MirCache& cache = mir_cache();
+            std::lock_guard<std::mutex> lk(cache.mu);
+            auto [it, inserted] = cache.map.emplace(k, std::move(cached));
+            (void)inserted;
+            return it->second.get();
+        }
+    }
+#endif
     brass::Module mod("vk_mir");
     brass::Function* fn = nullptr;
     switch (k.kind) {
@@ -222,12 +252,18 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
             fn = kernels::build_fa_bwd_mir(mod, k.dt0, k.lanes, hd, hdp, br, bc, mode, has_mask, pass);
             break;
         }
+        case MirKind::Dft64:
+            fn = kernels::build_dft64_mir(mod, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+            break;
     }
     brass::target::SpirvOptions opts;
     opts.stage = brass::target::SpirvStage::Compute;
-    opts.local_size_x = block_for(k);
+    opts.local_size_x = blk;
     opts.local_size_spec_constants = true;
     auto spv = std::make_unique<brass::target::SpirvKernel>(brass::target::SpirvTarget::compile(*fn, opts));
+#if BROTENSOR_HAS_BRASS_JIT
+    jit::KernelDiskCache::instance().store_spirv_kernel(sig, *spv);
+#endif
     MirCache& cache = mir_cache();
     std::lock_guard<std::mutex> lk(cache.mu);
     auto [it, inserted] = cache.map.emplace(k, std::move(spv));

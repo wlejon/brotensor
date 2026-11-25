@@ -329,6 +329,7 @@ elseif(TARGET brass)
         src/kernels/mir_gemm_simt.cpp
         src/kernels/mir_fa_rows.cpp
         src/kernels/mir_fa_bwd.cpp
+        src/kernels/mir_dft64.cpp
     )
     if(BRASS_WITH_SPIRV)
         target_sources(brotensor_cpu PRIVATE
