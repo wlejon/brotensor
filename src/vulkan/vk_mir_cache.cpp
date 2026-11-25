@@ -2,6 +2,7 @@
 
 #include "../kernels/mir_attn_small.h"
 #include "../kernels/mir_audio.h"
+#include "../kernels/mir_conv_cm.h"
 #include "../kernels/mir_conv_direct.h"
 #include "../kernels/mir_copy.h"
 #include "../kernels/mir_delta.h"
@@ -10,6 +11,8 @@
 #include "../jit/kernel_disk_cache.h"
 #include "../kernels/mir_elementwise.h"
 #include "../kernels/mir_fa_bwd.h"
+#include "../kernels/mir_fa_bwd_cm.h"
+#include "../kernels/mir_fa_cm.h"
 #include "../kernels/mir_fa_rows.h"
 #include "../kernels/mir_gemm_cm.h"
 #include "../kernels/mir_gemm_simt.h"
@@ -73,7 +76,8 @@ std::uint32_t block_for(const MirKey& k) {
     if (k.kind == MirKind::FillBytes) return kernels::kFillBlock;
     if (k.kind == MirKind::FaRows) return kernels::kFaRowsBlock;
     if (k.kind == MirKind::FaBwd) return static_cast<std::uint32_t>(k.lanes);
-    if (k.kind == MirKind::GemmCm) return kernels::kGemmCmTiles[k.op & 3u].wg;
+    if (k.kind == MirKind::GemmCm || k.kind == MirKind::ConvCm) return kernels::kGemmCmTiles[k.op & 3u].wg;
+    if (k.kind == MirKind::FaCm || k.kind == MirKind::FaBwdCm) return static_cast<std::uint32_t>(k.lanes) * 32u;
     return kernels::kEwBlock;
 }
 
@@ -273,6 +277,53 @@ const brass::target::SpirvKernel* compile_mir(const MirKey& k) {
             s.has_bias = (k.flags & 16u) != 0;
             s.scale_a = (k.flags & 32u) != 0;
             fn = kernels::build_gemm_cm_mir(mod, s);
+            break;
+        }
+        case MirKind::ConvCm: {
+            const auto byte = [&](int sh) -> int { return static_cast<int>((k.aux >> (sh * 8)) & 0xffu); };
+            kernels::ConvCmSpec s;
+            s.dt = k.dt0;
+            s.cfg_idx = k.op & 3u;
+            s.act = (k.op >> 4) & 0x0fu;
+            s.bvec = (k.op >> 8) & 0x03u;
+            s.qa = (k.op >> 12) & 0x0fu;
+            s.avec = (k.flags & 1u) != 0;
+            s.direct = (k.flags & 2u) != 0;
+            s.has_bias = (k.flags & 4u) != 0;
+            s.rowch = (k.flags & 8u) != 0;
+            s.accum = (k.flags & 16u) != 0;
+            s.kh = byte(0); s.kw = byte(1); s.sh = byte(2); s.sw = byte(3);
+            s.ph = byte(4); s.pw = byte(5); s.dh = byte(6); s.dw = byte(7);
+            fn = kernels::build_conv_cm_mir(mod, s);
+            break;
+        }
+        case MirKind::FaCm: {
+            kernels::FaCmSpec s;
+            s.dt = k.dt0;
+            s.hd = k.op & 0xffffu;
+            s.bc = (k.op >> 16) & 0xffu;
+            s.mode = (k.op >> 24) & 0x0fu;
+            s.nsg = k.lanes;
+            s.has_mask = (k.flags & 1u) != 0;
+            s.vec = (k.flags & 2u) != 0;
+            s.direct = (k.flags & 4u) != 0;
+            s.split = (k.flags & 8u) != 0;
+            fn = kernels::build_fa_cm_mir(mod, s);
+            break;
+        }
+        case MirKind::FaBwdCm: {
+            kernels::FaBwdCmSpec s;
+            s.dt = k.dt0;
+            s.hd = k.op & 0xffffu;
+            s.bn = (k.op >> 16) & 0xffu;
+            s.mode = (k.op >> 24) & 0x0fu;
+            s.pass = (k.op >> 28) & 0x03u;
+            s.nsg = k.lanes;
+            s.has_mask = (k.flags & 1u) != 0;
+            s.vec = (k.flags & 2u) != 0;
+            s.areg = (k.flags & 4u) != 0;
+            s.agnostic = (k.flags & 8u) != 0;
+            fn = kernels::build_fa_bwd_cm_mir(mod, s);
             break;
         }
     }

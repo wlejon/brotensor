@@ -32,13 +32,6 @@ void linear_forward_batched_ex(const Tensor& W, const Tensor* bias, const Tensor
 
 namespace {
 
-struct FaPush {
-    std::uint64_t q, k, v, o, mask, aux, aux2, part;
-    std::uint32_t lq, lk, ldq, ldk, ldo, group, window, causal, nseq, chunk, hq, qb0;
-    std::int32_t q_offset;
-    float scale, softcap;
-};
-
 std::atomic<int> g_override{0};
 std::atomic<int> g_cm_bc{0}, g_cm_nsg{0};
 
@@ -49,25 +42,6 @@ std::atomic<int> g_cm_bc{0}, g_cm_nsg{0};
 std::uint64_t cdiv(std::uint64_t a, std::uint64_t b) { return (a + b - 1) / b; }
 std::uint32_t esize(Dtype t) { return t == Dtype::FP32 ? 4u : 2u; }
 bool is16(Dtype t) { return t == Dtype::FP16 || t == Dtype::BF16; }
-
-FaPush make_push(const AttnProblem& p) {
-    FaPush pc{};
-    pc.q = p.q; pc.k = p.k; pc.v = p.v; pc.o = p.o;
-    pc.mask = p.mask; pc.aux = p.aux; pc.aux2 = p.aux2;
-    pc.lq = static_cast<std::uint32_t>(p.lq);
-    pc.lk = static_cast<std::uint32_t>(p.lk);
-    pc.ldq = static_cast<std::uint32_t>(p.ldq);
-    pc.ldk = static_cast<std::uint32_t>(p.ldk);
-    pc.ldo = static_cast<std::uint32_t>(p.ldo);
-    pc.group = static_cast<std::uint32_t>(p.hq / p.hkv);
-    pc.window = static_cast<std::uint32_t>(std::max(0, p.window));
-    pc.causal = p.causal ? 1u : 0u;
-    pc.nseq = static_cast<std::uint32_t>(p.nseq);
-    pc.hq = static_cast<std::uint32_t>(p.hq);
-    pc.q_offset = p.q_offset;
-    pc.softcap = p.softcap;
-    return pc;
-}
 
 // ─── kernel choice ──────────────────────────────────────────────────────────
 
@@ -149,10 +123,7 @@ void run_cm(DeviceCtx& d, const AttnProblem& p) {
     const std::uint32_t br = c.nsg * 16;
     const bool vec = p.hd % 8 == 0 && p.q % 16 == 0 && p.k % 16 == 0 && p.v % 16 == 0 && p.ldq % 8 == 0 &&
                      p.ldk % 8 == 0;
-    const ShaderId id = p.dt == Dtype::FP16 ? ShaderId::fa_cm_f16 : ShaderId::fa_cm_bf16;
     const std::uint32_t nqb = static_cast<std::uint32_t>(cdiv(p.lq, br));
-    // Split the keys when the query blocks alone would not fill the GPU
-    // (~160 workgroups) and each split keeps at least 8 key blocks.
     const std::uint64_t wgs = static_cast<std::uint64_t>(nqb) * p.hq;
     std::uint64_t nsplit = 1;
     if (wgs < 160 && p.lk > 16 * static_cast<int>(c.bc)) {
@@ -162,31 +133,39 @@ void run_cm(DeviceCtx& d, const AttnProblem& p) {
     nsplit = cdiv(p.lk, chunk);
     const bool split = nsplit > 1;
     const bool direct = !split && p.dt == Dtype::FP16 && p.hd % 16 == 0 && p.o % 16 == 0 && p.ldo % 8 == 0;
-    auto kernel = [&](bool dir) -> const Kernel& {
-        const std::uint32_t spec[] = {static_cast<std::uint32_t>(p.hd), c.bc, c.nsg, c.nsg * 32,
-                                      static_cast<std::uint32_t>(p.mode), p.mask ? 1u : 0u, vec ? 1u : 0u,
-                                      dir ? 1u : 0u, split ? 1u : 0u};
-        return d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)), 32);
+    const std::uint32_t op = (static_cast<std::uint32_t>(p.hd) & 0xffffu) |
+                             ((c.bc & 0xffu) << 16) |
+                             ((static_cast<std::uint32_t>(p.mode) & 0x0fu) << 24);
+    const std::uint8_t base_flags = static_cast<std::uint8_t>(
+        (p.mask ? 1u : 0u) | (vec ? 2u : 0u) | (split ? 8u : 0u));
+    auto kernel = [&](bool dir) -> MirKernel {
+        const std::uint8_t flags = static_cast<std::uint8_t>(base_flags | (dir ? 4u : 0u));
+        return mir_kernel(d, {MirKind::FaCm, op, p.dt, Dtype::FP32, static_cast<std::uint8_t>(c.nsg), Dtype::FP32, flags}, 32u);
     };
-    FaPush pc = make_push(p);
-    pc.scale = static_cast<float>(1.4426950408889634 / std::sqrt(static_cast<double>(p.hd)));
-    pc.chunk = static_cast<std::uint32_t>(chunk);
     Tensor part;
+    std::uint64_t part_addr = 0;
     if (split) {
         part = partials(d, p, nsplit);
-        pc.part = addr(part.data);
+        part_addr = addr(part.data);
     }
+    const std::uint64_t ptrs[] = {p.q, p.k, p.v, p.o, p.mask, p.aux, p.aux2, part_addr};
+    const float flts[] = {static_cast<float>(1.4426950408889634 / std::sqrt(static_cast<double>(p.hd)))};
     const std::uint32_t full = direct ? static_cast<std::uint32_t>(p.lq) / br : 0;
-    auto dispatch = [&](const Kernel& k, std::uint32_t b0, std::uint32_t n) {
+    auto dispatch = [&](const MirKernel& mk, std::uint32_t b0, std::uint32_t n) {
         for (std::uint32_t s = 0; s < n; s += 65535) {
-            pc.qb0 = b0 + s;
-            launch(d, k, pc, std::min<std::uint32_t>(65535, n - s), static_cast<std::uint32_t>(p.hq),
-                   static_cast<std::uint32_t>(nsplit));
+            const std::int32_t ints[] = {
+                p.lq, p.lk, p.ldq, p.ldk, p.ldo, p.hq / p.hkv, std::max(0, p.window),
+                p.causal ? 1 : 0, p.nseq, static_cast<std::int32_t>(chunk), p.hq,
+                static_cast<std::int32_t>(b0 + s), p.q_offset,
+            };
+            mir_dispatch_args_3d(d, mk, std::min<std::uint32_t>(65535, n - s),
+                                 static_cast<std::uint32_t>(p.hq), static_cast<std::uint32_t>(nsplit),
+                                 ptrs, ints, flts);
         }
     };
     if (full > 0) dispatch(kernel(true), 0, full);
     if (full < nqb) dispatch(kernel(false), full, nqb - full);
-    if (split) combine(d, p, pc.part, nsplit);
+    if (split) combine(d, p, part_addr, nsplit);
 }
 
 // ─── fa_rows.comp (+ fa_combine.comp) ──────────────────────────────────────

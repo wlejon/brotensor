@@ -29,9 +29,12 @@
 
 #if BROTENSOR_HAS_BRASS_JIT
 #include "kernels/mir_attn_small.h"
+#include "kernels/mir_conv_cm.h"
 #include "kernels/mir_conv_direct.h"
 #include "kernels/mir_delta.h"
 #include "kernels/mir_fa_bwd.h"
+#include "kernels/mir_fa_bwd_cm.h"
+#include "kernels/mir_fa_cm.h"
 #include "kernels/mir_fa_rows.h"
 #include "kernels/mir_gemm_simt.h"
 #include "kernels/mir_elementwise.h"
@@ -273,44 +276,6 @@ LiftedSpirvCfgMetrics audit_lifted_spirv_words(std::span<const std::uint32_t> wo
     return m;
 }
 
-LiftedSpirvCfgMetrics audit_lifted_shader_blob(detail::vulkan::ShaderId id) {
-    const auto& blob = detail::vulkan::shader_blob(id);
-    return audit_lifted_spirv_words(std::span<const std::uint32_t>(blob.words, blob.nwords), blob.name);
-}
-
-void add_shader_family_proof(
-    BackwardProofSuiteReport& rep,
-    const std::string& proof_name,
-    std::span<const detail::vulkan::ShaderId> ids) {
-    bool all_ok = !ids.empty();
-    std::uint32_t total_insts = 0;
-    std::uint32_t total_writes = 0;
-    std::uint32_t total_guards = 0;
-    std::string first_failure;
-
-    for (auto id : ids) {
-        LiftedSpirvCfgMetrics m = audit_lifted_shader_blob(id);
-        total_insts += m.num_instructions;
-        total_writes += m.psb_stores_and_atomics;
-        total_guards += m.bounds_comparisons;
-        if (!m.all_ok()) {
-            all_ok = false;
-            if (first_failure.empty()) first_failure = m.diagnostic;
-        }
-    }
-
-    std::ostringstream oss;
-    if (all_ok) {
-        oss << "Proven on " << ids.size() << " shipped .spv binaries ("
-            << total_insts << " lifted SPIR-V insts, "
-            << total_writes << " guarded PhysicalStorageBuffer64 writes, "
-            << total_guards << " bounds comparisons, 0 hazards)";
-    } else {
-        oss << "Lifted .spv audit failure: " << first_failure;
-    }
-    rep.entries.push_back({proof_name, all_ok, oss.str()});
-}
-
 struct MirAuditAccum {
     bool ok = true;
     std::uint32_t insts = 0, writes = 0, cmp = 0, count = 0;
@@ -382,17 +347,17 @@ BackwardProofSuiteReport prove_conv2d_adjoint_duality() {
         }
         acc.finish(rep, "conv2d_lifted_spirv_conv_simt_bounds_and_barrier_safety", "conv_simt");
     }
-#endif
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-    using detail::vulkan::ShaderId;
-    const ShaderId cm_ids[] = {
-        ShaderId::conv_cm_f16,
-        ShaderId::conv_cm_bf16,
-    };
-    add_shader_family_proof(
-        rep,
-        "conv2d_lifted_spirv_conv_cm_bounds_and_barrier_safety",
-        cm_ids);
+    {
+        MirAuditAccum acc(128u);
+        for (Dtype dt : {Dtype::FP16, Dtype::BF16}) {
+            acc.check("mir_conv_cm", [dt](brass::Module& m) {
+                kernels::ConvCmSpec s;
+                s.dt = dt; s.cfg_idx = 2u; s.has_bias = true;
+                return kernels::build_conv_cm_mir(m, s);
+            });
+        }
+        acc.finish(rep, "conv2d_lifted_spirv_conv_cm_bounds_and_barrier_safety", "conv_cm");
+    }
 #endif
 
     // Prove tile interior bounds elimination & symbolic lockstep global/shared bounds
@@ -841,27 +806,31 @@ BackwardProofSuiteReport prove_rope_adjoint_duality() {
 BackwardProofSuiteReport prove_flash_attention_mask_adjoint_duality() {
     BackwardProofSuiteReport rep;
 
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-    using detail::vulkan::ShaderId;
-    const ShaderId fa_bwd_ids[] = {
-        ShaderId::fa_bwd_cm_f16,
-        ShaderId::fa_bwd_cm_bf16,
-    };
-    add_shader_family_proof(
-        rep,
-        "flash_attention_lifted_spirv_fa_bwd_cm_safety",
-        fa_bwd_ids);
-
-    const ShaderId fa_fwd_ids[] = {
-        ShaderId::fa_cm_f16,
-        ShaderId::fa_cm_bf16,
-    };
-    add_shader_family_proof(
-        rep,
-        "flash_attention_lifted_spirv_fa_fwd_cm_safety",
-        fa_fwd_ids);
-#endif
 #if BROTENSOR_HAS_BRASS_JIT
+    {
+        MirAuditAccum acc(64u);
+        for (Dtype dt : {Dtype::FP16, Dtype::BF16}) {
+            for (std::uint32_t pass : {0u, 1u, 2u}) {
+                acc.check("mir_fa_bwd_cm", [dt, pass](brass::Module& m) {
+                    kernels::FaBwdCmSpec s;
+                    s.dt = dt; s.hd = 64u; s.nsg = 2u; s.bn = 16u; s.pass = pass; s.has_mask = true;
+                    return kernels::build_fa_bwd_cm_mir(m, s);
+                });
+            }
+        }
+        acc.finish(rep, "flash_attention_lifted_spirv_fa_bwd_cm_safety", "fa_bwd_cm");
+    }
+    {
+        MirAuditAccum acc(64u);
+        for (Dtype dt : {Dtype::FP16, Dtype::BF16}) {
+            acc.check("mir_fa_cm", [dt](brass::Module& m) {
+                kernels::FaCmSpec s;
+                s.dt = dt; s.hd = 64u; s.bc = 16u; s.nsg = 2u; s.has_mask = true;
+                return kernels::build_fa_cm_mir(m, s);
+            });
+        }
+        acc.finish(rep, "flash_attention_lifted_spirv_fa_fwd_cm_safety", "fa_cm");
+    }
     {
         MirAuditAccum acc(kernels::kEwBlock);
         acc.check("mir_attn_bwd", [](brass::Module& m) { return kernels::build_attn_bwd_mir(m, true, true); });

@@ -35,8 +35,11 @@
 #include "kernels/mir_resample_bwd.h"
 #include "kernels/mir_attn_small.h"
 #include "kernels/mir_audio.h"
+#include "kernels/mir_conv_cm.h"
 #include "kernels/mir_conv_direct.h"
 #include "kernels/mir_fa_bwd.h"
+#include "kernels/mir_fa_bwd_cm.h"
+#include "kernels/mir_fa_cm.h"
 #include "kernels/mir_fa_rows.h"
 #include "kernels/mir_gemm_cm.h"
 #include "kernels/mir_gemm_simt.h"
@@ -732,6 +735,36 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
                 brass::Function* cmfn = kernels::build_gemm_cm_mir(cm_mod, s);
                 brass::target::SpirvKernel cmsk = brass::target::SpirvTarget::compile(*cmfn, fa_opts);
                 report.shaders.push_back(audit_spirv_binary_words(cm_name, cmsk.words.data(), cmsk.words.size()));
+            }
+            for (const auto& [cn, dt] : std::vector<std::pair<const char*, Dtype>>{
+                     {"conv_cm_f16", Dtype::FP16}, {"conv_cm_bf16", Dtype::BF16}}) {
+                kernels::ConvCmSpec s;
+                s.dt = dt; s.cfg_idx = 2u; s.has_bias = true;
+                brass::Module cm_mod(cn);
+                brass::Function* fn = kernels::build_conv_cm_mir(cm_mod, s);
+                brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, fa_opts);
+                report.shaders.push_back(audit_spirv_binary_words(cn, sk.words.data(), sk.words.size()));
+            }
+            brass::target::SpirvOptions cm64_opts = fa_opts;
+            cm64_opts.local_size_x = 64u;
+            for (const auto& [fn_name, dt] : std::vector<std::pair<const char*, Dtype>>{
+                     {"fa_cm_f16", Dtype::FP16}, {"fa_cm_bf16", Dtype::BF16}}) {
+                kernels::FaCmSpec s;
+                s.dt = dt; s.hd = 64u; s.bc = 16u; s.nsg = 2u; s.has_mask = true;
+                brass::Module cm_mod(fn_name);
+                brass::Function* fn = kernels::build_fa_cm_mir(cm_mod, s);
+                brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, cm64_opts);
+                report.shaders.push_back(audit_spirv_binary_words(fn_name, sk.words.data(), sk.words.size()));
+            }
+            for (std::uint32_t pass : {0u, 1u, 2u}) {
+                const std::string bn = (pass == 0u) ? std::string("fa_bwd_cm_f16")
+                                                    : (std::string("fa_bwd_cm_f16_p") + std::to_string(pass));
+                kernels::FaBwdCmSpec s;
+                s.dt = Dtype::FP16; s.hd = 64u; s.nsg = 2u; s.bn = 16u; s.pass = pass; s.has_mask = true;
+                brass::Module cm_mod(bn.c_str());
+                brass::Function* fn = kernels::build_fa_bwd_cm_mir(cm_mod, s);
+                brass::target::SpirvKernel sk = brass::target::SpirvTarget::compile(*fn, cm64_opts);
+                report.shaders.push_back(audit_spirv_binary_words(bn.c_str(), sk.words.data(), sk.words.size()));
             }
         }
     }

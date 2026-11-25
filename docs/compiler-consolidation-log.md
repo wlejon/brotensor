@@ -791,5 +791,36 @@ Signed off cross-backend Waves 1–12 across Vulkan (`0797f77`), Metal (`8c21892
   - `brotensor_bench_gemm_fp16 --device=vulkan` (pre-Phase 2 CoopMat baseline): `NN 4096^3` `32.68 TF/s`, `NT 4096^3` `26.77 TF/s`, `ABT 4096^3` `27.15 TF/s`.
 - **LOC Delta:** `src/vulkan/shaders/*`: `2,692 -> 2,537` (`-155` lines; **`140 -> 13` compiled Vulkan shaders**, cumulative **`-5,698` shader LOC** / `45` `.comp` files deleted).
 
+---
+
+## Phase 2 (Waves 13–15, Vulkan / Radeon 8060S): Cooperative Matrix (`gemm_cm`, `conv_cm`, `fa_cm`, `fa_bwd_cm`) -> Single-Source Brass MIR (Zero Production GLSL Shaders)
+
+Replaced all four remaining Vulkan `VK_KHR_cooperative_matrix` production shaders (`gemm_cm.comp` × 6, `conv_cm.comp` × 2, `fa_cm.comp` × 2, `fa_bwd_cm.comp` × 2) and all five remaining GLSL helper headers (`gemm_common.glsl`, `gemm_act.glsl`, `fa_common.glsl`, `fa_bwd_common.glsl`, `quant_decode.glsl`, `fp8.glsl`, `math_acc.glsl`) with five backend-neutral Brass MIR modules (backed by `brass@c561950` adding `coop_acc_len`, `coop_get_acc`, `coop_set_acc`, and `f32` shared CoopMat load/store):
+- **Wave 13 (`b8db7ba`) — `mir_coop_common.{h,cpp}` (`55 + 259` LOC) & `mir_gemm_cm.{h,cpp}` (`47 + 473` LOC):**
+  - Replaced `gemm_cm.comp` (6 variants), `gemm_common.glsl`, `gemm_act.glsl` (`13 -> 7` compiled shaders).
+  - Double-buffered `128x128` / `64x64` / `64x128` / `128x64` cooperative matrix GEMM with `4x4`/`2x2`/`2x4`/`4x2` `16x16` MMA accumulators, FP16/BF16/INT8/FP8/Q8_0/Q4_K/Q6_K `B`-tile decode, per-row power-of-two exponent scaling, fused bias + activations + `ACCUM` epilogue.
+  - **Radeon 8060S FP16 GEMM (`brotensor_bench_gemm_fp16 --device=vulkan`) — beat hand-tuned GLSL by +6.9% to +15.0%:**
+    - `NN 4096^3`: `32.68 TF/s` (GLSL) -> **`34.94 TF/s` (+6.9%)**
+    - `NT 4096^3`: `26.77 TF/s` (GLSL) -> **`30.79 TF/s` (+15.0%)**
+    - `ABT 4096^3`: `27.15 TF/s` (GLSL) -> **`31.04 TF/s` (+14.3%)**
+  - Verified: `backward_shader_audit` `158/158`, `brotensor_test_vulkan --only=gemm,quant,linear` `0 failures`, `14/14` `ctest -j 1` GEMM/quant/linear suites (`913.89 s`).
+- **Waves 14 & 15 — `mir_conv_cm.{h,cpp}` (`32 + 464` LOC), `mir_fa_cm.{h,cpp}` (`31 + 486` LOC), `mir_fa_bwd_cm.{h,cpp}` (`33 + 871` LOC):**
+  - `build_conv_cm_mir`: `128x128` cooperative matrix 2D implicit-GEMM convolution (`FP16`/`BF16`, grouped/strided/dilated, fused bias + activation, `WG=256`).
+  - `build_fa_cm_mir`: cooperative matrix FlashAttention forward (`FP16`/`BF16`, `Q[64,hdp]`, `KV[64,hdp]`, causal/varlen/windowed/GQA/softcap/mask/split-K, `WG=128`).
+  - `build_fa_bwd_cm_mir`: 3-pass cooperative matrix FlashAttention backward (`PASS 0` stats + `dQ`, `PASS 1` `dK` + `dV`, `PASS 2` `dQ` reduction; uniform shared `s_fast[0]` control broadcast so `spirv_shader_prover` proves all subgroup collectives uniform with `0` hazards).
+  - Wired `MirKind::{GemmCm, ConvCm, FaCm, FaBwdCm}` in `vk_mir_cache.{h,cpp}` (`205 / 849` LOC), `gemm.cpp`, `ops_conv.cpp`, `ops_attention.cpp`, `ops_fa_bwd.cpp`; updated `src/backward_index_verify.cpp` (`950` LOC) and `src/backward_shader_audit.cpp` (`826` LOC).
+
+### Phase 2 (Waves 14–15) Verification & Final Vulkan Shader Count (Radeon 8060S, `brass@c561950`)
+- **Formal Audits (`0` hazards):**
+  - `brotensor_test_backward_index_proofs`: **ALL PASSED** (`conv_cm`: `9,346` insts / `128` writes / `884` cmp; `fa_cm`: `4,310` insts / `64` writes / `230` cmp; `fa_bwd_cm`: `18,550` insts / `196` writes / `1,196` cmp; `0` hazards).
+  - `brotensor_test_backward_shader_audit`: **`159 / 159` ALL PASSED** (`98,100` SPIR-V/PTX insts, `221` workgroup arrays, `8,951` shared / `2,684` global accesses proven, `791` uniform barriers, `1,300` uniform collectives).
+- **Correctness & Parity Suites (`0` failures):**
+  - `brotensor_test_vulkan` (all suites): **`OK: 0 failure(s)`**.
+  - `ctest -j 1 -R "conv2d|int8_conv|resblock|flash_attention|packed_encoder|kv_cache"`: **`20 / 20` PASSED** (`627.22 s`).
+- **LOC & Shader Count Delta:**
+  - `src/vulkan/shaders/*`: `2,537 -> 401` LOC (**`140 -> 1` compiled Vulkan shaders (`-99.3%`)**, **`0` production GLSL shaders remaining**; only `test_shared_overflow.comp` (`18`L) remains for the pipeline shared-memory guard negative test, alongside `common.glsl`, `op_codes.h`, and `shaders.cmake`).
+  - Shared backend-neutral `src/kernels/*`: `12,446` lines across `71` files (max file `871` lines, every file `< 1,000` LOC).
+
+
 
 

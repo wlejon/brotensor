@@ -34,11 +34,6 @@ using ::brotensor::Tensor;
 
 namespace {
 
-struct ConvPush {
-    std::uint64_t x, w, y, bias, scale;
-    std::uint32_t m, n, k, h, wd, wo, cin, cout, groups, tm0, tn0;
-};
-
 struct DirectPush {
     std::uint64_t x, w, y, bias;
     std::uint32_t n, cin, t, h, wd, cout, to, ho, wo;
@@ -47,12 +42,12 @@ struct DirectPush {
     std::uint32_t groups;
 };
 
-// Cooperative-matrix tiles (BM x BN x BK, WM x WN per subgroup).
-struct CmCfg { std::uint32_t bm, bn, bk, wm, wn; };
+// Cooperative-matrix tiles (indices into kernels::kGemmCmTiles: 0=256x128, 2=128x64, 3=64x64).
+struct CmCfg { std::uint32_t cfg_idx, bm, bn; };
 constexpr CmCfg kCmCfgs[] = {
-    {256, 128, 32, 64, 64},
-    {128, 64, 32, 64, 32},
-    {64, 64, 32, 32, 32},
+    {0u, 256, 128},
+    {2u, 128, 64},
+    {3u, 64, 64},
 };
 struct SimtCfg { std::uint32_t bm, bn, bk, tm, tn; };
 constexpr SimtCfg kSimtCfgs[] = {
@@ -141,12 +136,8 @@ void conv_coopmat(DeviceCtx& d, const Conv2dArgs& a, const Geo& g) {
     const std::uint32_t M = static_cast<std::uint32_t>(g.cgo);
     const std::uint32_t K = static_cast<std::uint32_t>(g.k);
     const CmCfg& c = pick_cm(M, P, std::uint64_t(a.n) * a.groups);
-    const std::uint32_t wg = (c.bm / c.wm) * (c.bn / c.wn) * 32u;
     const bool avec = a.scale ? a.w % 8 == 0 && K % 8 == 0 : a.w % 16 == 0 && K % 8 == 0;
     const bool rowch = g.wo % 8 == 0;
-    // B chunk loads (conv_cm.comp BVEC): one aligned 16-byte load for a
-    // plain 1x1, two shifted ones for any stride-1 kernel over rows of whole
-    // 16-byte chunks, eight 2-byte loads otherwise.
     std::uint32_t bvec = 0;
     if (a.kh == 1 && a.kw == 1 && a.sh == 1 && a.sw == 1 && a.ph == 0 && a.pw == 0 && (a.h * a.wd) % 8 == 0 &&
         a.x % 16 == 0) {
@@ -156,54 +147,48 @@ void conv_coopmat(DeviceCtx& d, const Conv2dArgs& a, const Geo& g) {
     }
     const bool direct_ok = a.dt == Dtype::FP16 && P % 8 == 0 && a.y % 16 == 0 &&
                            (a.bias == 0 || (a.bias % 16 == 0 && (a.groups == 1 || M % 8 == 0)));
-    const ShaderId id = a.dt == Dtype::FP16 ? ShaderId::conv_cm_f16 : ShaderId::conv_cm_bf16;
-    auto kernel = [&](bool direct) -> const Kernel& {
-        const std::uint32_t spec[] = {c.bm, c.bn, c.bk, c.wm, c.wn, wg, 0u, avec ? 1u : 0u, direct ? 1u : 0u,
-                                      a.bias ? 1u : 0u,
-                                      static_cast<std::uint32_t>(a.kh), static_cast<std::uint32_t>(a.kw),
-                                      static_cast<std::uint32_t>(a.sh), static_cast<std::uint32_t>(a.sw),
-                                      static_cast<std::uint32_t>(a.ph), static_cast<std::uint32_t>(a.pw),
-                                      static_cast<std::uint32_t>(a.dh), static_cast<std::uint32_t>(a.dw),
-                                      rowch ? 1u : 0u, a.accum ? 1u : 0u, bvec,
-                                      a.scale ? static_cast<std::uint32_t>(QF_INT8) : 0u};
-        return d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)), 32);
+    const std::uint64_t aux =
+        (static_cast<std::uint64_t>(a.kh & 0xff) << 0) | (static_cast<std::uint64_t>(a.kw & 0xff) << 8) |
+        (static_cast<std::uint64_t>(a.sh & 0xff) << 16) | (static_cast<std::uint64_t>(a.sw & 0xff) << 24) |
+        (static_cast<std::uint64_t>(a.ph & 0xff) << 32) | (static_cast<std::uint64_t>(a.pw & 0xff) << 40) |
+        (static_cast<std::uint64_t>(a.dh & 0xff) << 48) | (static_cast<std::uint64_t>(a.dw & 0xff) << 56);
+    const std::uint32_t qa = a.scale ? static_cast<std::uint32_t>(QF_INT8) : 0u;
+    const std::uint32_t op = (c.cfg_idx & 3u) | ((bvec & 3u) << 8) | ((qa & 0x0fu) << 12);
+    const std::uint8_t base_flags = static_cast<std::uint8_t>(
+        (avec ? 1u : 0u) | (a.bias ? 4u : 0u) | (rowch ? 8u : 0u) | (a.accum ? 16u : 0u));
+    auto kernel = [&](bool direct) -> MirKernel {
+        const std::uint8_t flags = static_cast<std::uint8_t>(base_flags | (direct ? 2u : 0u));
+        return mir_kernel(d, {MirKind::ConvCm, op, a.dt, Dtype::FP32, 1, Dtype::FP32, flags, aux}, 32u);
     };
     const std::uint32_t gx = static_cast<std::uint32_t>(cdiv(P, c.bn));
     const std::uint32_t gy = static_cast<std::uint32_t>(cdiv(M, c.bm));
     if (gx > 65535 || gy > 65535) fail(a.op, "image too large for one dispatch");
     const std::uint32_t fx = direct_ok ? P / c.bn : 0, fy = direct_ok ? M / c.bm : 0;
-    // z = image * groups + group, in chunks of whole images.
     const int per = std::max(1, 65535 / a.groups);
     for (int i0 = 0; i0 < a.n; i0 += per) {
         const int ni = std::min(per, a.n - i0);
-        ConvPush pc{};
-        pc.x = a.x + std::uint64_t(i0) * a.cin * a.h * a.wd * 2u;
-        pc.w = a.w;
-        pc.y = a.y + std::uint64_t(i0) * a.cout * P * 2u;
-        pc.bias = a.bias;
-        pc.scale = a.scale;
-        pc.m = M; pc.n = P; pc.k = K;
-        pc.h = static_cast<std::uint32_t>(a.h);
-        pc.wd = static_cast<std::uint32_t>(a.wd);
-        pc.wo = static_cast<std::uint32_t>(g.wo);
-        pc.cin = static_cast<std::uint32_t>(a.cin);
-        pc.cout = static_cast<std::uint32_t>(a.cout);
-        pc.groups = static_cast<std::uint32_t>(a.groups);
+        const std::uint64_t ptrs[] = {
+            a.x + std::uint64_t(i0) * a.cin * a.h * a.wd * 2u,
+            a.w,
+            a.y + std::uint64_t(i0) * a.cout * P * 2u,
+            a.bias,
+            a.scale,
+        };
         const std::uint32_t gz = static_cast<std::uint32_t>(ni * a.groups);
+        auto run = [&](const MirKernel& mk, std::uint32_t tm0, std::uint32_t tn0, std::uint32_t dx, std::uint32_t dy) {
+            const std::int32_t ints[] = {
+                static_cast<std::int32_t>(M), static_cast<std::int32_t>(P), static_cast<std::int32_t>(K),
+                a.h, a.wd, g.wo, a.cin, a.cout, a.groups,
+                static_cast<std::int32_t>(tm0), static_cast<std::int32_t>(tn0),
+            };
+            mir_dispatch_args_3d(d, mk, dx, dy, gz, ptrs, ints, {});
+        };
         if (fx > 0 && fy > 0) {
-            launch(d, kernel(true), pc, fx, fy, gz);
-            if (fx < gx) {
-                ConvPush p = pc;
-                p.tn0 = fx;
-                launch(d, kernel(false), p, gx - fx, gy, gz);
-            }
-            if (fy < gy) {
-                ConvPush p = pc;
-                p.tm0 = fy;
-                launch(d, kernel(false), p, fx, gy - fy, gz);
-            }
+            run(kernel(true), 0u, 0u, fx, fy);
+            if (fx < gx) run(kernel(false), 0u, fx, gx - fx, gy);
+            if (fy < gy) run(kernel(false), fy, 0u, fx, gy - fy);
         } else {
-            launch(d, kernel(false), pc, gx, gy, gz);
+            run(kernel(false), 0u, 0u, gx, gy);
         }
     }
 }

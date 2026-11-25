@@ -48,12 +48,6 @@ void add_inplace(Tensor& a, const Tensor& b);                                   
 
 namespace {
 
-struct BwdPush {
-    std::uint64_t q, k, v, g, mask, aux, aux2, stats, o0, o1;
-    std::uint32_t lq, lk, ldq, ldk, ldg, ldo, window, causal, nseq;
-    float scale, oscale;
-};
-
 [[noreturn]] void fail(const char* op, const std::string& why) {
     throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
 }
@@ -145,51 +139,41 @@ CmCfg pick_cm(const BwdProblem& p) {
     return p.hd <= 64 ? CmCfg{{2, 2, 4}, {16, 16, 16}, {1, 1, 1}} : CmCfg{{4, 4, 4}, {32, 16, 16}, {1, 0, 0}};
 }
 
-BwdPush make_push(const BwdProblem& p, const Tensor& stats) {
-    BwdPush pc{};
-    pc.q = p.q; pc.k = p.k; pc.v = p.v; pc.g = p.g;
-    pc.mask = p.mask; pc.aux = p.aux; pc.aux2 = p.aux2;
-    pc.stats = addr(stats.data);
-    pc.lq = static_cast<std::uint32_t>(p.lq);
-    pc.lk = static_cast<std::uint32_t>(p.lk);
-    pc.ldq = static_cast<std::uint32_t>(p.ldq);
-    pc.ldk = static_cast<std::uint32_t>(p.ldk);
-    pc.ldg = static_cast<std::uint32_t>(p.ldg);
-    pc.window = static_cast<std::uint32_t>(std::max(0, p.window));
-    pc.causal = p.causal ? 1u : 0u;
-    pc.nseq = static_cast<std::uint32_t>(p.nseq);
-    pc.oscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(p.hd)));
-    pc.scale = static_cast<float>(1.4426950408889634 / std::sqrt(static_cast<double>(p.hd)));
-    return pc;
-}
-
 // The statistics (pass 0), then dQ (pass 2, query-major) and dK / dV (pass
 // 1, key-major), both reading them.
 void run_cm(DeviceCtx& d, const BwdProblem& p, const Tensor& stats) {
     const CmCfg c = pick_cm(p);
     const bool vec = p.hd % 8 == 0 && p.q % 16 == 0 && p.k % 16 == 0 && p.v % 16 == 0 && p.g % 16 == 0 &&
                      p.ldq % 8 == 0 && p.ldk % 8 == 0 && p.ldg % 8 == 0;
-    const ShaderId id = p.dt == Dtype::FP16 ? ShaderId::fa_bwd_cm_f16 : ShaderId::fa_bwd_cm_bf16;
-    const std::uint32_t sd = static_cast<std::uint32_t>((p.hd + 15) / 16 * 2 + 1);   // staged row, uvec4
-    BwdPush pc = make_push(p, stats);
+    const std::uint64_t stats_addr = addr(stats.data);
+    const float flts[] = {
+        static_cast<float>(1.4426950408889634 / std::sqrt(static_cast<double>(p.hd))),
+        static_cast<float>(1.0 / std::sqrt(static_cast<double>(p.hd))),
+    };
     for (std::uint32_t pass : {0u, 2u, 1u}) {
         const std::uint32_t i = pass == 0 ? 0 : pass == 2 ? 1 : 2;
         const std::uint32_t nsg = c.nsg[i], bn = c.bn[i], bo = 16 * nsg;
         const bool areg = c.areg[i] != 0;
-        // The shader's shared array lengths (SM uvec4, SF floats, SH halves).
-        const std::uint32_t nsm = 2 * (areg ? std::max(bo, bn) : bo + bn) * sd;
-        const std::uint32_t nsf = pass == 0 ? std::max(256 * nsg, 2 * bo * (bn + 4)) : 256 * nsg;
-        const std::uint32_t nsh = pass == 0 ? 1 : (pass == 1 ? 2 : 1) * bo * (bn + 8);
-        const std::uint32_t spec[] = {static_cast<std::uint32_t>(p.hd), nsg, 32 * nsg, bn,
-                                      static_cast<std::uint32_t>(p.mode), p.mask ? 1u : 0u, vec ? 1u : 0u, pass,
-                                      areg ? 1u : 0u, cm_agnostic() ? 1u : 0u, nsm, nsf, nsh};
-        const Kernel& k = d.pipelines().get(id, spec, static_cast<std::uint32_t>(std::size(spec)), 32);
+        const std::uint32_t op = (static_cast<std::uint32_t>(p.hd) & 0xffffu) |
+                                 ((bn & 0xffu) << 16) |
+                                 ((static_cast<std::uint32_t>(p.mode) & 0x0fu) << 24) |
+                                 ((pass & 0x03u) << 28);
+        const std::uint8_t flags = static_cast<std::uint8_t>(
+            (p.mask ? 1u : 0u) | (vec ? 2u : 0u) | (areg ? 4u : 0u) | (cm_agnostic() ? 8u : 0u));
+        const MirKernel mk = mir_kernel(
+            d, {MirKind::FaBwdCm, op, p.dt, Dtype::FP32, static_cast<std::uint8_t>(nsg), Dtype::FP32, flags}, 32u);
         const std::uint64_t n = cdiv(pass == 1 ? p.lk : p.lq, bo);
         if (n > 65535) fail(p.op, "sequence too long for one dispatch");
-        pc.o0 = pass == 2 ? p.dq : p.dk;
-        pc.o1 = p.dv;
-        pc.ldo = static_cast<std::uint32_t>(pass == 1 ? p.ldk_out : p.ldq_out);
-        launch(d, k, pc, static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(p.heads));
+        const std::uint64_t ptrs[] = {
+            p.q, p.k, p.v, p.g, p.mask, p.aux, p.aux2, stats_addr,
+            pass == 2 ? p.dq : p.dk, p.dv,
+        };
+        const std::int32_t ints[] = {
+            p.lq, p.lk, p.ldq, p.ldk, p.ldg, pass == 1 ? p.ldk_out : p.ldq_out,
+            std::max(0, p.window), p.causal ? 1 : 0, p.nseq,
+        };
+        mir_dispatch_args_3d(d, mk, static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(p.heads), 1u,
+                             ptrs, ints, flts);
     }
 }
 
