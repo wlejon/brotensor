@@ -511,6 +511,7 @@ if(BROTENSOR_WITH_METAL)
         src/metal/q8_0.mm
         src/metal/filtered_lrelu.mm
         src/metal/lstm.mm
+        src/metal/kernel_interop_mtl.mm
         src/metal/register.mm
     )
     add_library(brotensor_metal STATIC ${_BROTENSOR_METAL_SRCS})

@@ -134,9 +134,16 @@ bool vk_interop_dispatch(int device_index, const brotensor::interop::SpirvDispat
     }
 }
 
+bool vk_interop_float64(int device_index) {
+    const Instance& inst = Instance::get();
+    return device_index >= 0 && device_index < inst.count() &&
+           inst.phys(device_index).shader_float64;
+}
+
 struct VulkanInteropRegistrar {
     VulkanInteropRegistrar() {
         brotensor::interop::detail::register_vulkan_interop_hooks(vk_interop_available, vk_interop_dispatch);
+        brotensor::interop::detail::register_vulkan_float64_hook(vk_interop_float64);
     }
 } g_vulkan_interop_registrar;
 

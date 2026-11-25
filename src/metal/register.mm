@@ -29,6 +29,9 @@ BROTENSOR_FOR_EACH_OP(BROTENSOR_METAL_DECL)
 // Defined in tensor.mm.
 const ::brotensor::detail::AllocVTable& metal_alloc_table();
 
+// Defined in kernel_interop_mtl.mm.
+void register_metal_interop_backend();
+
 } // namespace brotensor::detail::metal
 
 extern "C" void brotensor_probe_and_register_metal() {
@@ -325,6 +328,7 @@ extern "C" void brotensor_probe_and_register_metal() {
     ops.lstm_backward                               = &dm::lstm_backward;
     ops.linear_forward_batched_fp16_act             = &dm::linear_forward_batched_fp16_act;
 
+    dm::register_metal_interop_backend();
     ::brotensor::detail::register_backend(Device::Metal, ops,
                                           dm::metal_alloc_table());
 }

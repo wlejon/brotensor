@@ -56,6 +56,8 @@ void test_cpu_interop() {
     // Overflow / null errors fail cleanly without crashing.
     CHECK(!brotensor::interop::copy_bytes_to_tensor(nullptr, 4, t, &err));
     CHECK(!brotensor::interop::copy_bytes_to_tensor(input.data(), 1024, t, &err));
+    CHECK(brotensor::interop::device_has_float64(brotensor::Device::CPU));
+    CHECK(!brotensor::interop::metal_msl_dispatch_available(brotensor::Device::CPU));
     std::printf("brotensor::interop CPU: OK\n");
 }
 
