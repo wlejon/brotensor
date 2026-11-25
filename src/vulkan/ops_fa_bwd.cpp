@@ -1,10 +1,10 @@
 // Vulkan flash-attention backwards: flash_attention_backward,
 // flash_attention_varlen_backward, flash_attention_packed_qkv_backward and
 // the projection-fused flash_attention_qkvo_backward. Two kernels do the
-// attention core of all four (docs/vulkan-training.md), both recompute-based
+// attention core of all four (docs/vulkan.md), both recompute-based
 // (O is not read) with FP32 scores, softmax statistics, dP and dS and no
-// atomics: fa_bwd_cm.comp (cooperative matrix; FP16 / BF16, BF16 staged as
-// FP16 as in the forward, head width up to 128) and fa_bwd.comp (FMA; FP32,
+// atomics: `MirKind::FaBwdCm` (cooperative matrix; FP16 / BF16, BF16 staged as
+// FP16 as in the forward, head width up to 128) and `MirKind::FaBwd` (FMA; FP32,
 // wider heads, devices without cooperative matrix, BROTENSOR_VK_NO_COOPMAT=1).
 //
 // Contracts follow the CUDA backend (src/cuda/flash_attention_backward.cu,
@@ -132,7 +132,7 @@ bool cm_agnostic() { return g_override.load(std::memory_order_relaxed) == 3; }
 struct CmCfg { std::uint32_t nsg[3], bn[3], areg[3]; };
 
 CmCfg pick_cm(const BwdProblem& p) {
-    // Measured (docs/vulkan-training.md): 16-key / 16-query blocks; heads
+    // Measured (docs/vulkan.md): 16-key / 16-query blocks; heads
     // wider than 64 take 4 subgroups everywhere, 32-key blocks for the
     // statistics and A fragments from shared memory for dQ and dK / dV (in
     // registers next to the 128-wide accumulators they spill).

@@ -1,22 +1,23 @@
 # API reference
 
-The portable public surface lives in five headers:
+The portable public surface lives in six headers:
 
 | Header | Contents |
 |---|---|
 | `<brotensor/tensor.h>` | `Tensor`, `Dtype`, `Device`, factories, migration, host accessors, dtype + bit-conversion helpers |
 | `<brotensor/runtime.h>` | `init()` / `shutdown()`, device policy, `compute_dtype()`, device memory, `sync` |
 | `<brotensor/ops.h>` | The device-neutral op surface — an umbrella over the per-category headers in `<brotensor/ops/>` (see [op-coverage.md](op-coverage.md)) |
+| `<brotensor/kernel_interop.h>` | Zero-copy tensor buffer views (`TensorBufferView`), byte H2D/D2H helpers, `device_has_float64()`, and stream-ordered kernel dispatch (`dispatch_spirv`, `dispatch_ptx`, `dispatch_msl`) |
 | `<brotensor/safetensors.h>` | safetensors reader + writer |
 | `<brotensor/gguf.h>` | GGUF reader |
 
-Two further headers are backend-specific and compile only in a build that enables that backend:
+Three further headers expose backend-specific extensions:
 
 | Header | Contents |
 |---|---|
 | `<brotensor/cuda_graph.h>` | Device-neutral graph capture / replay (`CudaGraph`, `CudaGraphCapture`) on CUDA / Vulkan — gate on `graph_capture_available(Device)` |
-| `<brotensor/vulkan.h>` | Vulkan batching control, `VulkanGraph`, custom GLSL kernels — gate on `BROTENSOR_HAS_VULKAN` ([vulkan.md](vulkan.md)) |
-| `<brotensor/metal_interop.h>` | Metal custom-kernel surface — Obj-C++ / `.mm` consumers only |
+| `<brotensor/vulkan.h>` | Vulkan batching control, `VulkanGraph`, stats, `device_info` — gate on `BROTENSOR_HAS_VULKAN` ([vulkan.md](vulkan.md)) |
+| `<brotensor/metal_interop.h>` | Legacy Metal custom-kernel surface — Obj-C++ / `.mm` consumers only (pure C++20 code should prefer `<brotensor/kernel_interop.h>`) |
 
 All preconditions and dispatch failures throw `std::runtime_error` with a `"brotensor: <op>: <reason>"` message.
 

@@ -1,7 +1,6 @@
 # Vulkan backend: range-safe BF16 (and FP32) operands in the matrix-core GEMM
 
-The cooperative-matrix GEMM (`gemm_cm.comp`, docs/vulkan.md "Matrix
-multiply") multiplies 16x16x16 **FP16** fragments. Until this change a BF16
+The cooperative-matrix GEMM (`mir_gemm_cm.cpp`, docs/vulkan.md "Matrix-Core & Cooperative Matrix Kernels") multiplies 16x16x16 **FP16** fragments. Until this change a BF16
 operand was converted to FP16 as it was staged into shared memory, so any
 BF16 value beyond FP16's ±65504 became inf. T5-XXL's FFN activations and
 Sana's linear-attention summaries live out there, so brolm's T5 and
@@ -28,16 +27,15 @@ driver adds `VK_KHR_shader_bfloat16` (`shaderBFloat16Type` and
 `shaderBFloat16CooperativeMatrix` true, `shaderBFloat16DotProduct` false) and
 two more 16x16x16 subgroup entries: BF16 x BF16 -> BF16 and BF16 x BF16 ->
 FP32. Because it is opt-in per process and marked experimental, brotensor does
-not build on it (a native BF16 variant of `gemm_cm.comp` is the natural
-follow-up once RADV enables it by default; `glslc` 2026.3 accepts
-`GL_EXT_bfloat16`). The probe: `vulkaninfo`, or the 30-line
+not build on it (a native BF16 variant of `mir_gemm_cm.cpp` is the natural
+follow-up once RADV enables it by default). The probe: `vulkaninfo`, or the 30-line
 `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` dump this was measured
 with.
 
 ## The scaled-FP16 path
 
 **Per-row power-of-two scaling of A.** Before a GEMM whose A operand is BF16
-(or FP32, below), `gemm_rowscale.comp` writes one int32 exponent per row of A
+(or FP32, below), `build_gemm_rowscale_mir` (`src/kernels/mir_quant_helpers.cpp`) writes one int32 exponent per row of A
 (per batch slice, once when A is broadcast with stride 0):
 
     e(m) = E - 141,  E = biased FP32 exponent of max_k |A(m, k)|
@@ -104,9 +102,7 @@ T5 encode then showed where its time went:
 * **FP32 A against 16-bit B, opt-in** (`gemm_cm_f32a_w16`,
   `gemm_cm_f32a_wbf16`, `GemmArgs::round_a`): an FP32 A staged as scaled
   FP16 (above). Only for an A that is the op's own intermediate, today the
-  attention ops' FP32 head output against Wo. The public FP32-activation ops
-  (`linear_forward_batched` with FP32 X against 16-bit W) keep their
-  "activations never rounded" contract and stay on SIMT.
+  attention ops' FP32 head output against Wo. The public FP32-activation ops (`linear_forward_batched` with FP32 X against 16-bit W) keep their "activations never rounded" contract and stay on SIMT (`mir_gemm_simt.cpp`).
 
 **Cost.** One extra dispatch (and barrier) per GEMM, reading A once
 (16-byte loads, 64 invocations per row). On the `--bench-gemm` shapes the
@@ -152,13 +148,13 @@ lies outside the linear-attention core.
 
 ## Files
 
-| File | Lines | What |
-|---|---:|---|
-| `src/vulkan/shaders/gemm_rowscale.comp` | 97 | the per-row exponent pre-pass (BF16 / FP32, plain or transposed A) |
-| `src/vulkan/shaders/gemm_cm.comp` | 442 | `SCALE_A`; separate A / B / C / bias dtypes (`-DDTA/-DDTC/-DDTBI`); FP32 A loads (two 16-byte loads per chunk) |
-| `src/vulkan/gemm.cpp` | 386 | kernel choice (`cm_shader`), the pre-pass, `round_a`, `set_gemm_scaling` |
-| `src/vulkan/ops_attention_proj.cpp` | 351 | sets `round_a` on the Wo GEMM |
-| `tests/test_vulkan_gemm_range.cpp` | 387 | the range tests (below) |
+| File | What |
+|---|---|
+| `src/kernels/mir_quant_helpers.cpp` | `build_gemm_rowscale_mir` per-row exponent pre-pass (BF16 / FP32, plain or transposed A) |
+| `src/kernels/mir_gemm_cm.cpp` | `scale_a`; separate A / B / C / bias dtypes; FP32 A loads (two 16-byte loads per chunk) |
+| `src/vulkan/gemm.cpp` | kernel choice (`MirKind::GemmCm`), the pre-pass, `round_a`, `set_gemm_scaling` |
+| `src/vulkan/ops_attention_proj.cpp` | sets `round_a` on the Wo GEMM |
+| `tests/test_vulkan_gemm_range.cpp` | the range tests (below) |
 
 ## Tests
 

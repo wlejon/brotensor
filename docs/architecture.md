@@ -1,6 +1,6 @@
 # Architecture
 
-How brotensor is put together: one tensor type, a runtime dispatch layer, and three backends behind a single vtable.
+How brotensor is put together: one tensor type, a runtime dispatch layer, and four backends behind a single vtable.
 
 ## One tensor, runtime tags
 
@@ -50,9 +50,11 @@ The vtable slot signature *is* the public signature: same argument order, same s
 ## Backends
 
 - **CPU** — scalar FP32, always compiled. It implements essentially the entire FP32 surface, forward *and* backward — including the diffusion samplers, flash attention, the audio family, and the vision primitives. It is the simple, correct, autovectorize-friendly reference that the parity tests measure the GPU backends against. By design it leaves the FP16 / BF16 / INT8-W8A16 / GGUF-quant slots null.
-- **CUDA** (`BROTENSOR_WITH_CUDA=ON`) — mirrors the FP32 surface and adds the FP16/BF16 precision paths, batched-inference variants, W8A16 WMMA kernels, GGUF block-quant kernels, and fused inference kernels.
-- **Metal** (`BROTENSOR_WITH_METAL=ON`) — same role as CUDA on Apple GPUs, and at near-total parity with it: of the 260 slots Metal leaves six null (three host-scalar loss/RNG ops, `xavier_init`, and the CUDA-only fused `filtered_lrelu` pair). See the [coverage tables](op-coverage.md#backend-coverage).
-- **Vulkan** (`BROTENSOR_WITH_VULKAN=ON`) — hand-written GLSL compute kernels on any GPU with a stock Vulkan 1.2+ driver, the AMD GPU path. It fills 266 of 270 op-table slots (the 4 null ones are host-only or composite by design) and is the default device when there is no CUDA or Metal backend. Design, memory and dispatch model, dtype policy and how to add an op: [vulkan.md](vulkan.md).
+- **CUDA** (`BROTENSOR_WITH_CUDA=ON`) — mirrors the FP32 surface and adds FP16/BF16/INT8-W8A16/GGUF-quant paths via single-source Brass MIR kernels (`src/kernels/`, `cu_mir_cache` -> `PtxTarget`) alongside native TensorCore WMMA/MMA GEMM & FlashAttention fast paths.
+- **Metal** (`BROTENSOR_WITH_METAL=ON`) — same role as CUDA on Apple GPUs, via `src/kernels/` Brass MIR (`mtl_mir_cache` -> `MslTarget`) alongside native `simdgroup_matrix` GEMM, quantized prefill GEMM, and dense FlashAttention fast paths. Every Metal vtable slot is populated, leaving only `filtered_lrelu` to fall back when outside its fused Metal config. See [op-coverage.md](op-coverage.md#backend-coverage).
+- **Vulkan** (`BROTENSOR_WITH_VULKAN=ON`) — runs 100% of production GPU kernels from single-source Brass MIR (`src/kernels/`, `vk_mir_cache` -> `SpirvTarget`, `0` production GLSL shaders, with persistent SPIR-V disk caching via `KernelDiskCache`), including `VK_KHR_cooperative_matrix` GEMM, implicit-GEMM Conv2D, FlashAttention forward/backward, and FP64 DFT. It fills 270 of 274 op-table slots (the 4 null slots are host-only or composite by design) and is the default device when no CUDA or Metal backend is present. See [vulkan.md](vulkan.md).
+
+Downstream libraries and apps can also compile and launch their own Brass MIR (or raw SPIR-V / PTX / MSL) kernels in pure C++20 via `<brotensor/kernel_interop.h>` without enabling CUDA, Objective-C++, or `glslc`.
 
 A handful of "ops" are not vtable entries at all but device-agnostic compositions of public ops — LoRA (`ops/lora.h`, header-only) and the `filtered_lrelu` composite — so they run on any backend automatically.
 
@@ -99,8 +101,8 @@ The interface target **whole-archives** the backend libraries so their self-regi
 
 1. Declare it in the matching `include/brotensor/ops/<category>.h` (the umbrella `ops.h` re-includes every category header — don't add declarations to `ops.h` directly).
 2. Add one row to `BROTENSOR_FOR_EACH_OP` in `include/brotensor/detail/op_table.h`.
-3. Implement it in `src/cpu/`, `src/cuda/`, `src/metal/` — matching the shape contract exactly across backends. A backend that genuinely can't support the op registers a null slot; the dispatcher throws on lookup.
-4. Register the slot in each backend's registration file (`src/cpu/register.cpp`, `src/cuda/register.cu` via a `fill_cuda_vtable_*` function, `src/metal/register.mm`).
+3. Implement CPU in `src/cpu/`, and implement GPU paths as single-source Brass MIR builders under `src/kernels/mir_*.{h,cpp}` wired into `vk_mir_cache`, `cu_mir_cache`, and `mtl_mir_cache` (keeping native backend code only when hardware-specific intrinsics require it). Match the shape contract across all backends; a backend that genuinely can't support the op registers a null slot.
+4. Register the slot in each backend's registration file (`src/cpu/register.cpp`, `src/cuda/register.cu`, `src/metal/register.mm`, `src/vulkan/register.cpp`).
 5. List any new source file under that backend's target in `CMakeLists.txt`, and add a test (parity test if the op exists on CPU and GPU).
 
 FP32 ops should land on CPU too — it's the parity reference. FP16/BF16/INT8/GGUF-quant variants are GPU-only by design.

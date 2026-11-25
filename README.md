@@ -32,6 +32,7 @@ brotensor is the shared tensor layer of the [bro ecosystem](https://github.com/w
   - **Vision** — SAM/ViTDet decomposed-rel-pos attention, window partition, Qwen-VL spatial merge, deformable conv2d, interp2d, image preprocessing
   - **Training building blocks** — flash attention with backward, LSTM with full BPTT, LoRA adapters, StyleGAN3 generator primitives (modulated conv, upfirdn2d, filtered lrelu), SGD/Adam
 - **Precision & quantization** — the CPU backend is the complete FP32 reference; the GPU backends add FP16/BF16 paths, INT8 weight-only matmul/conv (W8A16), and GGUF block-quant kernels (Q4_K / Q6_K / Q8_0)
+- **Single-source GPU kernels & interop** — shared GPU ops under `src/kernels/` are authored once in [brass](https://github.com/wlejon/brass) MIR and lowered to SPIR-V (Vulkan, with persistent disk caching), PTX (CUDA), or MSL (Metal); downstream libraries use `<brotensor/kernel_interop.h>` (`dispatch_spirv`, `dispatch_ptx`, `dispatch_msl`, `device_has_float64`) in pure C++20 without custom `.cu` / `.mm` / `.comp` toolchains
 - **Model loading** — mmap'd zero-copy readers for **safetensors** (also writes) and **GGUF**
 - **Graph capture** (`<brotensor/cuda_graph.h>`, device-neutral: CUDA graphs, Vulkan re-submitted command buffers; gate on `graph_capture_available()`) — capture a fixed-shape step once and replay it with a single launch, amortising per-kernel launch overhead in tight decode loops. `Tensor::resize` keeps device pointers stable across shape cycles so captured buffers stay valid
 
@@ -74,7 +75,7 @@ int main() {
 
 ## Build
 
-Requires CMake ≥ 3.24 and a C++20 compiler; a plain `git clone` is enough, there are no submodules. [bronze](https://github.com/wlejon/bronze) and, through it, [brass](https://github.com/wlejon/brass) are dependencies resolved by `cmake/bro_deps.cmake`: a working tree at `../bronze` / `../brass` when there is one, otherwise the commit `CMakeLists.txt` pins, fetched at configure (override with `-DFETCHCONTENT_SOURCE_DIR_BRONZE=<path>`). They compile inside the build tree. CUDA additionally needs the CUDA Toolkit (nvcc); Vulkan needs `glslc` (shaderc) plus the Vulkan headers and loader; Metal needs the Apple toolchain and **macOS 15 or newer** — the backend builds offset-backed `MPSGraphTensorData` via `-[MPSNDArray initWithBuffer:offset:descriptor:]`, which the macOS 14 SDK does not declare.
+Requires CMake ≥ 3.24 and a C++20 compiler; a plain `git clone` is enough, there are no submodules. [bronze](https://github.com/wlejon/bronze) and, through it, [brass](https://github.com/wlejon/brass) are dependencies resolved by `cmake/bro_deps.cmake`: a working tree at `../bronze` / `../brass` when there is one, otherwise the commit `CMakeLists.txt` pins, fetched at configure (override with `-DFETCHCONTENT_SOURCE_DIR_BRONZE=<path>`). They compile inside the build tree. CUDA additionally needs the CUDA Toolkit (nvcc); Vulkan compiles all production kernels directly from Brass MIR (`0` production GLSL shaders) and needs the Vulkan headers and loader (plus `glslc` if building the negative overflow test shader); Metal needs the Apple toolchain and **macOS 15 or newer** — the backend builds offset-backed `MPSGraphTensorData` via `-[MPSNDArray initWithBuffer:offset:descriptor:]`, which the macOS 14 SDK does not declare.
 
 ```bash
 # CPU-only (any OS)
@@ -94,7 +95,7 @@ cmake -B build_vk -DCMAKE_BUILD_TYPE=Release -DBROTENSOR_WITH_VULKAN=ON
 cmake --build build_vk
 ```
 
-CPU is always built; the GPU backends are additive. CUDA / Metal don't share a host; Vulkan sits beside either. Without CUDA or Metal, Vulkan is the default device. Without CUDA, `Device::CUDA` aliases to the GPU that is there: Metal, else Vulkan (`detail::resolve_device_alias`). Vulkan design and coverage: [docs/vulkan.md](docs/vulkan.md), [docs/vulkan-coverage.md](docs/vulkan-coverage.md), performance: [docs/vulkan-perf.md](docs/vulkan-perf.md). Build internals (library targets, preprocessor defines, backend registration) are covered in [docs/architecture.md](docs/architecture.md#build-internals).
+CPU is always built; the GPU backends are additive. CUDA / Metal don't share a host; Vulkan sits beside either. Without CUDA or Metal, Vulkan is the default device. Without CUDA, `Device::CUDA` aliases to the GPU that is there: Metal, else Vulkan (`detail::resolve_device_alias`). Vulkan design and BF16 range scaling: [docs/vulkan.md](docs/vulkan.md), [docs/vulkan-bf16.md](docs/vulkan-bf16.md). Build internals (library targets, preprocessor defines, backend registration) are covered in [docs/architecture.md](docs/architecture.md#build-internals).
 
 ## Tests
 

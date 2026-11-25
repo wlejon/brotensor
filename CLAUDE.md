@@ -27,8 +27,11 @@ include/brotensor/
   cuda_graph.h      Device-neutral graph capture/replay (CudaGraph,
                     CudaGraphCapture) on CUDA / Vulkan — gate on
                     graph_capture_available(Device)
-  metal_interop.h   Public Metal custom-kernel surface (Obj-C++ / .mm only)
-  vulkan.h          Vulkan batching, VulkanGraph, custom GLSL kernels
+  kernel_interop.h  Device-neutral custom kernel interop (TensorBufferView,
+                    copy_bytes_*, device_has_float64, dispatch_spirv,
+                    dispatch_ptx, dispatch_msl)
+  metal_interop.h   Legacy Metal custom-kernel surface (Obj-C++ / .mm only)
+  vulkan.h          Vulkan batching, VulkanGraph, device_info / stats
                     (gate on BROTENSOR_HAS_VULKAN; docs/vulkan.md)
   detail/op_table.h  X-macro: the single canonical op list
   detail/dispatch.h  OpsVTable / AllocVTable + register_backend + dispatch()
@@ -47,11 +50,15 @@ src/
                     essentially the whole FP32 fwd+bwd surface (audio, vision,
                     diffusion samplers, flash attention, …); leaves FP16/BF16/
                     INT8/GGUF-quant slots null
-  cuda/             *.cu  — CUDA backend (gated on BROTENSOR_WITH_CUDA);
+  kernels/          mir_*.{h,cpp} — single-source Brass MIR kernel builders
+                    shared across Vulkan (SPIR-V), CUDA (PTX), and Metal (MSL)
+  jit/              Trace JIT compilers + persistent SPIR-V/PTX disk cache
+  cuda/             *.cu + *.cpp (cu_mir_cache) — CUDA backend (BROTENSOR_WITH_CUDA);
                     detail/ holds CUDA-internal helpers (cuda_check.h, …)
-  metal/            *.mm  — Metal backend (gated on BROTENSOR_WITH_METAL)
-  vulkan/           *.cpp + shaders/*.comp — Vulkan backend, hand-written
-                    GLSL (gated on BROTENSOR_WITH_VULKAN; docs/vulkan.md)
+  metal/            *.mm (mtl_mir_cache + simdgroup/FA fast paths) — Metal
+                    backend (BROTENSOR_WITH_METAL)
+  vulkan/           *.cpp (vk_mir_cache) — Vulkan backend (BROTENSOR_WITH_VULKAN;
+                    0 production GLSL shaders, only shaders/test_shared_overflow.comp)
 ```
 
 ## Build
@@ -66,7 +73,7 @@ cmake -S . -B build -DBROTENSOR_WITH_CUDA=ON && cmake --build build --config Rel
 # CPU + Metal (Apple only)
 cmake -S . -B build -DBROTENSOR_WITH_METAL=ON && cmake --build build --config Release
 
-# AMD (or any Vulkan 1.2+ GPU): CPU + Vulkan (needs glslc + Vulkan headers/loader)
+# AMD (or any Vulkan 1.2+ GPU): CPU + Vulkan (0 production GLSL shaders; needs Vulkan headers/loader + glslc for overflow test shader)
 cmake -S . -B build_vk -DBROTENSOR_WITH_VULKAN=ON && cmake --build build_vk
 ```
 
@@ -95,7 +102,7 @@ Tests live under `tests/`, enabled by `BROTENSOR_TESTS=ON` (default ON when stan
 - **Porting a kernel means porting its arithmetic, not just its signature.** A CPU op can match the GPU slot's arguments, shapes and accumulation semantics exactly and still be wrong, because the numerics differ. Reductions are where this bites: compute a variance as the sum of squared deviations from the mean (two passes), never as `E[x^2] - E[x]^2`. The one-pass form cancels catastrophically as soon as a row's mean dwarfs its spread — both terms land on the same large value, their FP32 difference is rounding noise, and a negative variance makes `rstd` NaN. A CLIP text row sitting near 395 is enough to trigger it. `tests/test_layernorm_stability.cpp` pins this down for layernorm; the same rule holds for group_norm, batch_norm and the fused resblock norms. If a comment says a kernel "ports" its counterpart in another backend, the formula has to match too.
 - **CPU is FP32-only, but covers the whole FP32 surface.** The CPU backend implements essentially every op's FP32 forward *and* backward — the dense/attention/loss/optim core, the audio family, the vision primitives, the diffusion samplers, flash attention. It is **not** a thin subset; it's the simple, correct reference. What it doesn't do: FP16 / BF16 / INT8-W8A16 / GGUF-quant paths — those exist on the GPU because they pay for themselves there. Don't add them to the CPU side; the CPU backend leaves those vtable slots null and the dispatcher throws "not implemented on CPU".
 - **GPU dtype dispatch is on `Tensor::dtype`.** Ops select FP32 vs FP16 vs BF16 (vs INT8 for W8A16) internally; the public surface takes a single `Tensor&` per arg. `Dtype` is `FP32 / FP16 / BF16 / INT8 / INT32 / F64` plus the GGUF block-quant carriers (`Q4_0 … Q8_K`). FP32/FP16/BF16 are the arithmetic dtypes (BF16 GPU-only; FP16/BF16 are `uint16_t` bit patterns on the host). INT8/INT32 are storage carriers for quantised weights and index/offset buffers; the GGUF quant dtypes are non-element-addressable block carriers consumed only by the GGUF dequant / fused-matmul ops — no general arithmetic op dispatches on any of them. Element/block sizing goes through `dtype_size_bytes` / `dtype_block_size` / `dtype_block_bytes` / `dtype_storage_bytes` / `dtype_is_quant` (quant dtypes return 0 from `dtype_size_bytes` — use `dtype_storage_bytes`).
-- **Backend-resident storage stays opaque.** GPU `.cu` / `.mm` files include `<brotensor/tensor.h>` and treat `Tensor::data` as a raw device pointer (CUDA) or resolve it to its `MTLBuffer` via `metal_interop.h` (Metal). Use `from_host` / `to` / `copy_to_host` for host transfers.
+- **Backend-resident storage stays opaque.** Backend internals (and Brass MIR kernels via `brotensor::interop::view`) read `Tensor::data` as raw device pointers (CUDA / Vulkan BDA) or resolve `MTLBuffer` handles (Metal). Use `from_host` / `to` / `copy_to_host` / `interop::copy_bytes_*` for host transfers.
 - **Backend registration.** CPU self-registers from a static-init object (`src/cpu/register.cpp`), so CPU tensors work without a prior `init()` call. CUDA / Metal / Vulkan are probed and registered by `brotensor::init()`.
 - **Default device.** `default_device()` picks the best available (CUDA > Metal > Vulkan > CPU). Override globally with `set_default_device()`, per-scope with `DeviceScope`, or via the `BROTENSOR_DEFAULT_DEVICE` env var (`cpu` / `cuda` / `metal` / `vulkan` (`vk`), optionally `:N`). `zeros` / `empty` / `from_host` land on the default; `*_on` variants pin to an explicit device.
 - **Streams / async.** CUDA hot ops launch on the current stream. Vulkan records into a command buffer submitted when full, on a host read or on `flush()` (`vulkan.h`). Metal batches command buffers and submits asynchronously (`submit` / `flush` — see `metal_interop.h`). `sync(Device)` / `sync_all()` drain pending work; call before reading GPU results back to host.
@@ -103,6 +110,6 @@ Tests live under `tests/`, enabled by `BROTENSOR_TESTS=ON` (default ON when stan
 
 ## When extending
 
-- **Adding a new op:** declare it in the matching `include/brotensor/ops/<category>.h` (and rely on `ops.h` re-including it — don't add declarations to `ops.h` directly); add one row to `BROTENSOR_FOR_EACH_OP` in `detail/op_table.h`; implement it in `src/cpu/`, `src/cuda/`, `src/metal/`; register the slot in each backend's registration file (`src/cpu/register.cpp`, `src/cuda/register*.cu`, `src/metal/register*.mm`); list any new source file under that backend's target in `CMakeLists.txt`. Match the shape contract across all three (a backend may register a null slot if it genuinely can't support the op — the dispatcher throws on null lookups). FP32 ops should land on CPU too (it's the parity reference); FP16/BF16/INT8/GGUF-quant variants are GPU-only.
+- **Adding a new op:** declare it in the matching `include/brotensor/ops/<category>.h` (and rely on `ops.h` re-including it — don't add declarations to `ops.h` directly); add one row to `BROTENSOR_FOR_EACH_OP` in `detail/op_table.h`; implement CPU in `src/cpu/`, and prefer writing the GPU kernel once as Brass MIR under `src/kernels/mir_*.{h,cpp}` dispatched via `vk_mir_cache` / `cu_mir_cache` / `mtl_mir_cache` rather than duplicating `.cu` / `.mm` / GLSL code; register the slot in each backend's registration file (`src/cpu/register.cpp`, `src/cuda/register*.cu`, `src/metal/register*.mm`, `src/vulkan/register.cpp`); list new sources in `CMakeLists.txt`. Match the shape contract across all backends (a backend may register a null slot if it genuinely can't support the op — the dispatcher throws on null lookups). FP32 ops should land on CPU too (it's the parity reference); FP16/BF16/INT8/GGUF-quant variants are GPU-only.
 - **Adding a new dtype path:** extend `Dtype`, update `dtype_size_bytes` (and `dtype_block_size` / `dtype_block_bytes` for a block-quant carrier), and add the path inside the relevant GPU op kernel — don't add per-dtype public entry points.
 - **ABI:** the sibling projects vendor brotensor via `add_subdirectory` and build it from source, so a change here reaches every consumer as soon as they update their checkout. Don't break the public ABI casually.
