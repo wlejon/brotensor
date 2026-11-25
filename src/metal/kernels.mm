@@ -1,18 +1,21 @@
 #import "internal.h"
 
 #include "../jit/kernel_disk_cache.h"
-#if BROTENSOR_HAS_BRASS_JIT
-#include <brass/brass.hpp>
-#endif
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <unistd.h>
+
+#if BROTENSOR_HAS_BRASS_JIT
+namespace brass { std::string_view codegen_fingerprint() noexcept; }
+#endif
 
 namespace brotensor::metal_impl {
 
