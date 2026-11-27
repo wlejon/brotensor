@@ -63,6 +63,11 @@ enum class MirKind : std::uint8_t {
     FaRows = 47,
     FaBwd = 48,
     FilteredLrelu = 49,
+    GemmMma = 50,
+    GemmSplitkReduce = 51,
+    GemmSkinny = 52,
+    LinearBwd = 53,
+    GemmMmaNn = 54,
 };
 
 struct MirKey {
@@ -215,6 +220,7 @@ void mir_dispatch_args_3d(CUfunction fn, std::uint32_t gx, std::uint32_t gy, std
                           std::uint32_t block_x,
                           std::span<const std::uintptr_t> ptrs,
                           std::span<const std::int32_t> ints,
-                          std::span<const float> flts);
+                          std::span<const float> flts,
+                          std::uint32_t smem_bytes = 0);
 
 }  // namespace brotensor::detail::cuda

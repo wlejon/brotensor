@@ -35,6 +35,7 @@ CUresult cuModuleLoadDataEx(CUmodule* module, const void* image,
                             void** optionValues);
 CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name);
 CUresult cuModuleUnload(CUmodule hmod);
+CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value);
 CUresult cuLinkCreate(unsigned int numOptions, CUjit_option* options,
                       void** optionValues, CUlinkState* stateOut);
 CUresult cuLinkAddData(CUlinkState state, CUjitInputType type,

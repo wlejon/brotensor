@@ -25,6 +25,7 @@ struct Table {
     decltype(&::cuModuleLoadDataEx)         cuModuleLoadDataEx = nullptr;
     decltype(&::cuModuleGetFunction)        cuModuleGetFunction = nullptr;
     decltype(&::cuModuleUnload)             cuModuleUnload = nullptr;
+    decltype(&::cuFuncSetAttribute)         cuFuncSetAttribute = nullptr;
     decltype(&::cuLinkCreate)               cuLinkCreate = nullptr;
     decltype(&::cuLinkAddData)              cuLinkAddData = nullptr;
     decltype(&::cuLinkComplete)             cuLinkComplete = nullptr;
@@ -66,6 +67,7 @@ const Table& table() {
         resolve("cuModuleLoadDataEx", t.cuModuleLoadDataEx);
         resolve("cuModuleGetFunction", t.cuModuleGetFunction);
         resolve("cuModuleUnload", t.cuModuleUnload);
+        resolve("cuFuncSetAttribute", t.cuFuncSetAttribute);
         resolve("cuLinkCreate", t.cuLinkCreate);
         resolve("cuLinkAddData", t.cuLinkAddData);
         resolve("cuLinkComplete", t.cuLinkComplete);
@@ -144,6 +146,12 @@ CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name)
 CUresult cuModuleUnload(CUmodule hmod) {
     const auto& t = table();
     return t.cuModuleUnload ? t.cuModuleUnload(hmod) : CUDA_ERROR_NOT_INITIALIZED;
+}
+
+CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) {
+    const auto& t = table();
+    return t.cuFuncSetAttribute ? t.cuFuncSetAttribute(hfunc, attrib, value)
+                                : CUDA_ERROR_NOT_INITIALIZED;
 }
 
 CUresult cuLinkCreate(unsigned int numOptions, CUjit_option* options,

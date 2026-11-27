@@ -1,37 +1,16 @@
 #include "cu_mir_cache.h"
 
+#include "cu_mir_builders.h"
 #include "cuda_driver.h"
 #include "cuda_jit_engine.h"
 #include "../jit/kernel_disk_cache.h"
-#include "../kernels/mir_attn_small.h"
-#include "../kernels/mir_audio.h"
-#include "../kernels/mir_conv_direct.h"
 #include "../kernels/mir_copy.h"
-#include "../kernels/mir_delta.h"
-#include "../kernels/mir_diffusion.h"
 #include "../kernels/mir_elementwise.h"
-#include "../kernels/mir_fa_bwd.h"
-#include "../kernels/mir_fa_rows.h"
-#include "../kernels/mir_filtered_lrelu.h"
-#include "../kernels/mir_gemm_simt.h"
-#include "../kernels/mir_gemv.h"
-#include "../kernels/mir_gemv_q.h"
 #include "../kernels/mir_gnorm.h"
-#include "../kernels/mir_lstm.h"
-#include "../kernels/mir_misc.h"
 #include "../kernels/mir_norm.h"
-#include "../kernels/mir_quant_helpers.h"
 #include "../kernels/mir_reduce.h"
-#include "../kernels/mir_remap.h"
-#include "../kernels/mir_resample.h"
-#include "../kernels/mir_resample_bwd.h"
 #include "../kernels/mir_rope.h"
 #include "../kernels/mir_scatter.h"
-#include "../kernels/mir_select.h"
-#include "../kernels/mir_spectral.h"
-#include "../kernels/mir_topk.h"
-#include "../kernels/mir_vision.h"
-#include "../kernels/mir_xent.h"
 
 #if BROTENSOR_HAS_BRASS_CUDA_JIT
 #include <brass/mir/gpu_opt.hpp>
@@ -64,6 +43,7 @@ struct MirKeyHash {
 struct MirCache {
     std::mutex mu;
     std::unordered_map<MirKey, CUfunction, MirKeyHash> map;
+    std::unordered_map<CUfunction, std::uint32_t> dyn_smem;
 };
 
 MirCache& mir_cache() {
@@ -94,176 +74,31 @@ CUfunction compile_mir(const MirKey& k) {
     (void)k;
     throw std::runtime_error("brotensor: Brass CUDA JIT is required for CUDA MIR kernels");
 #else
-    const brass::target::PtxOptions ptx_opts = jit::make_ptx_opts();
+    brass::target::PtxOptions ptx_opts = jit::make_ptx_opts();
+    configure_mir_ptx_options(k, ptx_opts);
     const std::string mem_key = key_string_for(k);
-    const std::string disk_sig = mem_key + ":" + ptx_opts.sm_arch + ":opt1";
+    std::string disk_sig = mem_key + ":" + ptx_opts.sm_arch + ":opt1";
+    if (ptx_opts.maxntid[0] > 0) {
+        disk_sig += ":nt" + std::to_string(ptx_opts.maxntid[0]) +
+                    "_mc" + std::to_string(ptx_opts.minnctapersm);
+    }
+    if (k.kind >= MirKind::GemmMma) {
+        disk_sig += ":v7";
+    }
     std::string ptx;
     std::string fn_name = mem_key;
     if (!brotensor::jit::KernelDiskCache::instance().load_ptx(disk_sig, ptx)) {
     brass::Module mod("cu_mir");
-    brass::Function* fn = nullptr;
-    switch (k.kind) {
-        case MirKind::Unary:      fn = kernels::build_unary_mir(mod, k.op, k.dt0, k.lanes); break;
-        case MirKind::Binary:     fn = kernels::build_binary_mir(mod, k.op, k.dt0, k.dt1, k.lanes); break;
-        case MirKind::ActBwd:     fn = kernels::build_act_bwd_mir(mod, k.op, k.dt0, k.lanes); break;
-        case MirKind::Bias:       fn = kernels::build_bias_mir(mod, k.op, k.dt0, k.lanes); break;
-        case MirKind::Cast:       fn = kernels::build_cast_mir(mod, k.dt0, k.dt1, k.lanes); break;
-        case MirKind::Glu:        fn = kernels::build_glu_mir(mod, k.op, k.dt0, k.dt1, k.lanes); break;
-        case MirKind::Rowvec:     fn = kernels::build_rowvec_mir(mod, k.op, k.dt0, k.lanes); break;
-        case MirKind::SumRows:    fn = kernels::build_sum_rows_mir(mod, k.dt0, k.lanes); break;
-        case MirKind::ArgmaxRows: fn = kernels::build_argmax_rows_mir(mod, k.dt0, k.flags != 0, k.lanes); break;
-        case MirKind::SumCols:    fn = kernels::build_sum_cols_mir(mod, k.dt0, k.lanes); break;
-        case MirKind::Norm:
-            fn = kernels::build_norm_mir(
-                mod, k.op, k.dt0, k.dt1, k.dt2,
-                kernels::NormMirFlags::unpack(k.flags), k.lanes);
-            break;
-        case MirKind::Rope:       fn = kernels::build_rope_mir(mod, k.op, k.flags != 0, k.dt0); break;
-        case MirKind::FillBytes:  fn = kernels::build_fill_bytes_mir(mod); break;
-        case MirKind::Copy2d:     fn = kernels::build_copy2d_mir(mod, static_cast<int>(k.op), k.lanes); break;
-        case MirKind::Transpose:  fn = kernels::build_transpose_mir(mod, static_cast<int>(k.op)); break;
-        case MirKind::ScatterAdd: fn = kernels::build_scatter_add_mir(mod, k.op, k.dt0); break;
-        case MirKind::Gnorm:      fn = kernels::build_gnorm_mir(mod, k.op, k.dt0, k.flags != 0, k.lanes); break;
-        case MirKind::Bnorm:      fn = kernels::build_bnorm_mir(mod, k.op); break;
-        case MirKind::Sampler:    fn = kernels::build_sampler_mir(mod, k.op, k.dt0, k.dt1, k.lanes); break;
-        case MirKind::Philox:     fn = kernels::build_philox_mir(mod, k.op); break;
-        case MirKind::Remap:      fn = kernels::build_remap_mir(mod, k.op, k.lanes); break;
-        case MirKind::Resample: {
-            const bool align = (k.flags & 1u) != 0;
-            const int imode = static_cast<int>(k.flags >> 1);
-            fn = kernels::build_resample_mir(mod, k.op, k.dt0, align, imode);
-            break;
-        }
-        case MirKind::ResampleBwd:
-            fn = kernels::build_resample_bwd_mir(mod, k.op, k.dt0, static_cast<std::uint32_t>(k.flags));
-            break;
-        case MirKind::Lstm:
-            fn = kernels::build_lstm_mir(mod, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::DeltaRule:
-            fn = kernels::build_delta_rule_mir(mod, k.op, static_cast<std::uint32_t>(k.flags));
-            break;
-        case MirKind::Xent:
-            fn = kernels::build_xent_mir(mod, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::Topk:
-            fn = kernels::build_topk_mir(mod, k.op, k.dt0);
-            break;
-        case MirKind::SelectSample:
-            fn = kernels::build_select_sample_mir(mod, k.flags != 0);
-            break;
-        case MirKind::SelectCounter:
-            fn = kernels::build_select_counter_mir(mod);
-            break;
-        case MirKind::SelectCommit:
-            fn = kernels::build_select_commit_mir(mod);
-            break;
-        case MirKind::SelectMd:
-            fn = kernels::build_select_md_mir(
-                mod, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0);
-            break;
-        case MirKind::Misc:
-            fn = kernels::build_misc_mir(mod, k.op, k.dt0, k.flags != 0);
-            break;
-        case MirKind::Vision:
-            fn = kernels::build_vision_mir(mod, k.op, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::Audio:
-            fn = kernels::build_audio_mir(mod, k.op, k.dt0, k.flags & 0x0fu, (k.flags & 0x10u) != 0);
-            break;
-        case MirKind::Spectral:
-            fn = kernels::build_spectral_mir(
-                mod, k.op, k.flags & 0x03u, (k.flags & 0x04u) != 0, (k.flags & 0x08u) != 0);
-            break;
-        case MirKind::AttnAux:
-            fn = kernels::build_attn_aux_mir(mod, k.op, k.dt0, k.flags != 0);
-            break;
-        case MirKind::AttnBwd:
-            fn = kernels::build_attn_bwd_mir(mod, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::FaCombine:
-            fn = kernels::build_fa_combine_mir(mod, k.dt0);
-            break;
-        case MirKind::AttnSoftmax:
-            fn = kernels::build_attn_softmax_mir(
-                mod, k.dt0, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0);
-            break;
-        case MirKind::ConvDirect:
-            fn = kernels::build_conv_direct_mir(mod, k.op, k.dt0, k.flags != 0);
-            break;
-        case MirKind::GemmRowscale:
-            fn = kernels::build_gemm_rowscale_mir(mod, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::WqRows:
-            fn = kernels::build_wq_rows_mir(mod, k.op, k.dt0, k.flags != 0);
-            break;
-        case MirKind::Dequant:
-            fn = kernels::build_dequant_mir(mod, k.op, k.flags != 0);
-            break;
-        case MirKind::Gemv:
-            fn = kernels::build_gemv_mir(
-                mod, k.dt0, k.dt1, k.dt2,
-                k.op & 0x0fu, (k.op >> 4) & 0x0fu, (k.op >> 8) & 0x0fu,
-                (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::GemmSimt: {
-            const auto dt_bias = static_cast<Dtype>((k.op >> 8) & 0xffu);
-            fn = kernels::build_gemm_simt_mir(
-                mod, k.dt0, k.dt1, k.dt2, dt_bias,
-                (k.flags & 1u) != 0, k.op & 0x0fu, (k.op >> 4) & 0x0fu,
-                (k.flags & 2u) != 0, (k.flags & 4u) != 0, (k.flags & 8u) != 0);
-            break;
-        }
-        case MirKind::ConvSimt: {
-            const auto byte = [&](int s) -> int { return static_cast<int>((k.aux >> (s * 8)) & 0xffu); };
-            fn = kernels::build_conv_simt_mir(
-                mod, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
-                byte(0), byte(1), byte(2), byte(3), byte(4), byte(5), byte(6), byte(7),
-                k.op & 0x0fu);
-            break;
-        }
-        case MirKind::GemvQ: {
-            const std::uint32_t fmt = k.op & 0x0fu;
-            const std::uint32_t mb = (k.op >> 4) & 0x0fu;
-            const std::uint32_t lpr = k.lanes;
-            const std::uint32_t unr = (k.op >> 8) & 0x0fu;
-            const std::uint32_t nr = (k.op >> 12) & 0x0fu;
-            const std::uint32_t act = (k.op >> 16) & 0x0fu;
-            const std::uint32_t epi = (k.op >> 20) & 0x0fu;
-            fn = kernels::build_gemv_q_mir(
-                mod, k.dt0, fmt, mb, lpr, (k.flags & 1u) != 0, (k.flags & 2u) != 0,
-                unr, nr, act, epi);
-            break;
-        }
-        case MirKind::FaRows:
-            fn = kernels::build_fa_rows_mir(
-                mod, k.dt0, k.op, k.lanes, static_cast<std::uint32_t>(k.aux),
-                (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
-                (k.flags & 8u) != 0, (k.flags & 16u) != 0);
-            break;
-        case MirKind::FaBwd: {
-            const std::uint32_t hd = k.op & 0xffffu;
-            const std::uint32_t hdp = (k.op >> 16) & 0xffffu;
-            const std::uint32_t br = static_cast<std::uint32_t>(k.aux & 0xffffu);
-            const std::uint32_t bc = static_cast<std::uint32_t>((k.aux >> 16) & 0xffffu);
-            const std::uint32_t mode = k.flags & 0x0fu;
-            const bool has_mask = (k.flags & 0x10u) != 0;
-            const std::uint32_t pass = (k.flags >> 5) & 0x01u;
-            fn = kernels::build_fa_bwd_mir(mod, k.dt0, k.lanes, hd, hdp, br, bc, mode, has_mask, pass);
-            break;
-        }
-        case MirKind::FilteredLrelu:
-            fn = kernels::build_filtered_lrelu_mir(
-                mod, k.op, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0, k.aux);
-            break;
-    }
+    brass::Function* fn = build_mir_kernel(mod, k);
     {
         brass::GpuOptOptions gopt;
         gopt.opt_level = 2;
         gopt.enable_fma = true;
         gopt.enable_gpu_superopt = true;
-        gopt.enable_small_loop_unroll = true;
-        gopt.enable_load_coalesce = true;
+        const bool mma_loop = (k.kind == MirKind::GemmMma || k.kind == MirKind::GemmMmaNn ||
+                               k.kind == MirKind::GemmSkinny);
+        gopt.enable_small_loop_unroll = !mma_loop;
+        gopt.enable_load_coalesce = !mma_loop;
         brass::optimize_gpu_function(*fn, mod, gopt);
     }
     fn_name = std::string(fn->name());
@@ -290,11 +125,27 @@ CUfunction compile_mir(const MirKey& k) {
 #endif
 }
 
+void ensure_dynamic_smem(CUfunction fn, std::uint32_t smem_bytes) {
+    if (smem_bytes <= 49152u) return;
+    MirCache& cache = mir_cache();
+    std::lock_guard<std::mutex> lk(cache.mu);
+    auto& recorded = cache.dyn_smem[fn];
+    if (recorded >= smem_bytes) return;
+    const CUresult res = drv::cuFuncSetAttribute(
+        fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, static_cast<int>(smem_bytes));
+    if (res != CUDA_SUCCESS) {
+        throw std::runtime_error("cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) failed");
+    }
+    recorded = smem_bytes;
+}
+
 void launch_kernel_3d(CUfunction fn, std::uint32_t gx, std::uint32_t gy, std::uint32_t gz,
-                      std::uint32_t block_x, void** params, const char* what) {
+                      std::uint32_t block_x, void** params, const char* what,
+                      std::uint32_t smem_bytes = 0) {
+    ensure_dynamic_smem(fn, smem_bytes);
     const CUstream stream = jit::resolve_stream(nullptr);
     const CUresult res = drv::cuLaunchKernel(
-        fn, gx, gy, gz, block_x, 1, 1, 0, stream, params, nullptr);
+        fn, gx, gy, gz, block_x, 1, 1, smem_bytes, stream, params, nullptr);
     if (res != CUDA_SUCCESS) {
         throw std::runtime_error(std::string("cuLaunchKernel failed for ") + what);
     }
@@ -788,7 +639,8 @@ void mir_dispatch_args_3d(CUfunction fn, std::uint32_t gx, std::uint32_t gy, std
                           std::uint32_t block_x,
                           std::span<const std::uintptr_t> ptrs,
                           std::span<const std::int32_t> ints,
-                          std::span<const float> flts) {
+                          std::span<const float> flts,
+                          std::uint32_t smem_bytes) {
     constexpr std::size_t kMaxArgs = 32;
     const std::size_t total = ptrs.size() + ints.size() + flts.size();
     if (total > kMaxArgs) {
@@ -811,14 +663,14 @@ void mir_dispatch_args_3d(CUfunction fn, std::uint32_t gx, std::uint32_t gy, std
         fargs[i] = flts[i];
         params[idx++] = &fargs[i];
     }
-    launch_kernel_3d(fn, gx, gy, gz, block_x, params.data(), "mir_args");
+    launch_kernel_3d(fn, gx, gy, gz, block_x, params.data(), "mir_args", smem_bytes);
 }
 
 void mir_dispatch_args(CUfunction fn, std::uint32_t gx, std::uint32_t block_x,
                        std::span<const std::uintptr_t> ptrs,
                        std::span<const std::int32_t> ints,
                        std::span<const float> flts) {
-    mir_dispatch_args_3d(fn, gx, 1u, 1u, block_x, ptrs, ints, flts);
+    mir_dispatch_args_3d(fn, gx, 1u, 1u, block_x, ptrs, ints, flts, 0);
 }
 
 }  // namespace brotensor::detail::cuda

@@ -327,6 +327,11 @@ elseif(TARGET brass)
         src/kernels/mir_attn_small.cpp
         src/kernels/mir_conv_direct.cpp
         src/kernels/mir_filtered_lrelu.cpp
+        src/kernels/mir_gemm_mma.cpp
+        src/kernels/mir_gemm_mma_nn.cpp
+        src/kernels/mir_gemm_skinny.cpp
+        src/kernels/mir_gemm_splitk.cpp
+        src/kernels/mir_linear_bwd.cpp
         src/kernels/mir_quant_helpers.cpp
         src/kernels/mir_gemv.cpp
         src/kernels/mir_gemv_q.cpp
@@ -356,9 +361,10 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/runtime.cu
         src/cuda/tensor.cu
         src/cuda/cuda_graph.cu
-        src/cuda/gemm.cu
-        src/cuda/fp16_matmul.cu
+        src/cuda/gemm.cpp
+        src/cuda/fp16_matmul.cpp
         src/cuda/cu_mir_cache.cpp
+        src/cuda/cu_mir_builders.cpp
         src/cuda/ops_attention_bwd.cpp
         src/cuda/ops_attention_proj.cpp
         src/cuda/ops_attention_relpos.cpp
@@ -374,6 +380,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/ops_norm.cpp
         src/cuda/ops_quant.cpp
         src/cuda/ops_gemm_mir.cpp
+        src/cuda/ops_gemm_mma_mir.cpp
         src/cuda/ops_fa_mir.cpp
         src/cuda/ops_reduce.cpp
         src/cuda/ops_rope.cpp
@@ -405,11 +412,11 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/flash_attention_backward.cu
         src/cuda/flash_attention_packed.cu
         src/cuda/ops_fa_packed_bwd.cpp
-        src/cuda/gemm_mma.cu
-        src/cuda/gemm_skinny.cu
+        src/cuda/gemm_mma.cpp
+        src/cuda/gemm_skinny.cpp
         src/cuda/ops_linear_ex.cpp
         src/cuda/resblock.cu
-        src/cuda/matmul.cu
+        src/cuda/matmul.cpp
         src/cuda/ops_matmul_bwd.cpp
         src/cuda/ops_kv_cache.cpp
         src/cuda/decode_gqa.cu
