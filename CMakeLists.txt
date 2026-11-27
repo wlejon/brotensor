@@ -329,6 +329,8 @@ elseif(TARGET brass)
         src/kernels/mir_filtered_lrelu.cpp
         src/kernels/mir_gemm_mma.cpp
         src/kernels/mir_gemm_mma_nn.cpp
+        src/kernels/mir_gemm_quant_mma.cpp
+        src/kernels/mir_conv_int8w.cpp
         src/kernels/mir_gemm_skinny.cpp
         src/kernels/mir_gemm_splitk.cpp
         src/kernels/mir_linear_bwd.cpp
@@ -398,11 +400,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/conv2d_wmma.cu
         src/cuda/ops_conv_transpose2d.cpp
         src/cuda/conv3d.cu
-        src/cuda/conv2d_int8w_wmma.cu
-        src/cuda/linear_int8w_wmma.cu
-        src/cuda/q4k_wmma.cu
-        src/cuda/q8_0_wmma.cu
-        src/cuda/q6k_wmma.cu
+        src/cuda/ops_quant_mma.cpp
         src/cuda/flash_attention_varlen_f32.cu
         src/cuda/conv2d_igemm_f32.cu
         src/cuda/flash_attention.cu
@@ -420,7 +418,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/ops_matmul_bwd.cpp
         src/cuda/ops_kv_cache.cpp
         src/cuda/decode_gqa.cu
-        src/cuda/int8_quant.cu
+        src/cuda/int8_quant.cpp
         src/cuda/ops_filtered_lrelu.cpp
         src/cuda/register.cu
         src/cuda/cuda_driver.cpp
