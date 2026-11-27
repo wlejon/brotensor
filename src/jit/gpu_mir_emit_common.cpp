@@ -403,6 +403,10 @@ ValueMap eval_chain(Ctx& c, const TraceDAG& dag, int lanes, ValueMap vals,
 void optimize_function(Function& fn) {
     if (fn.parent()) {
         brass::GpuOptOptions gpu_opts;
+        gpu_opts.opt_level = 2;
+        gpu_opts.enable_gpu_superopt = true;
+        gpu_opts.enable_small_loop_unroll = true;
+        gpu_opts.enable_load_coalesce = true;
         brass::optimize_gpu_function(fn, *fn.parent(), gpu_opts);
     }
 }

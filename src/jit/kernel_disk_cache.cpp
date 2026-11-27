@@ -93,9 +93,12 @@ brass::codegen::KernelOptions to_kernel_options(const KernelDiskCache::CpuCompil
     k.enable_fma              = opts.enable_fma;
     k.enable_vectorize        = opts.enable_vectorize;
     k.enable_slp              = true;
-    k.enable_unroll           = opts.enable_unroll;
-    k.unroll_factor           = opts.unroll_factor;
-    k.enable_fp_reassociation = opts.enable_fp_reassociation;
+    k.enable_unroll             = opts.enable_unroll;
+    k.unroll_factor             = opts.unroll_factor;
+    k.enable_fp_reassociation   = opts.enable_fp_reassociation;
+    k.enable_trace_layout       = opts.enable_trace_layout;
+    k.enable_post_ra_schedule   = opts.enable_post_ra_schedule;
+    k.enable_software_pipelining = opts.enable_software_pipelining;
     return k;
 }
 
@@ -303,6 +306,9 @@ brass::cache::CacheKey KernelDiskCache::cpu_key(std::string_view signature, std:
         .add_bool("opt.fp_reassociation", o.enable_fp_reassociation)
         .add_bool("opt.smt_guard_elim", o.enable_smt_guard_elim)
         .add_bool("opt.mir_superopt", o.enable_mir_superopt)
+        .add_bool("opt.trace_layout", o.enable_trace_layout)
+        .add_bool("opt.post_ra_schedule", o.enable_post_ra_schedule)
+        .add_bool("opt.software_pipelining", o.enable_software_pipelining)
         .finish();
 }
 

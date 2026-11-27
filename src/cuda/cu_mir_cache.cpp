@@ -254,8 +254,11 @@ CUfunction compile_mir(const MirKey& k) {
     }
     {
         brass::GpuOptOptions gopt;
-        gopt.opt_level = 1;
+        gopt.opt_level = 2;
         gopt.enable_fma = true;
+        gopt.enable_gpu_superopt = true;
+        gopt.enable_small_loop_unroll = true;
+        gopt.enable_load_coalesce = true;
         brass::optimize_gpu_function(*fn, mod, gopt);
     }
     fn_name = std::string(fn->name());

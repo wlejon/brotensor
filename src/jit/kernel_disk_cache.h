@@ -62,7 +62,7 @@ namespace brotensor::jit {
 class KernelDiskCache {
 public:
     // The key schema. Bump the suffix when what a key covers changes.
-    static constexpr std::string_view kKeyDomain = "brotensor.kernel/4";
+    static constexpr std::string_view kKeyDomain = "brotensor.kernel/5";
     static constexpr uint64_t kDefaultMaxBytes = uint64_t{256} << 20;
 
     struct Stats {
@@ -74,15 +74,18 @@ public:
 
     // Everything here reaches the CPU kernel's code, so all of it is in the key.
     struct CpuCompileOptions {
-        bool enable_loop_opt         = true;
-        bool enable_avx2             = true;
-        bool enable_fma              = true;
-        bool enable_vectorize        = true;
-        bool enable_unroll           = true;
-        uint32_t unroll_factor       = 4;
-        bool enable_fp_reassociation = true;
-        bool enable_smt_guard_elim   = true;
-        bool enable_mir_superopt     = true;
+        bool enable_loop_opt            = true;
+        bool enable_avx2                = true;
+        bool enable_fma                 = true;
+        bool enable_vectorize           = true;
+        bool enable_unroll              = true;
+        uint32_t unroll_factor          = 4;
+        bool enable_fp_reassociation    = true;
+        bool enable_smt_guard_elim      = true;
+        bool enable_mir_superopt        = true;
+        bool enable_trace_layout        = true;
+        bool enable_post_ra_schedule    = true;
+        bool enable_software_pipelining = true;
     };
 
     static KernelDiskCache& instance();
