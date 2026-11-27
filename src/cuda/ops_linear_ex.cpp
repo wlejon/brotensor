@@ -14,7 +14,6 @@
 #include <brotensor/ops/linear.h>
 #include <brotensor/tensor.h>
 
-#include "detail/activations.cuh"
 #include "detail/cuda_check.h"
 #include "gemm_mma.cuh"
 #include "gemm_skinny.cuh"

@@ -12,6 +12,7 @@
 #include "../kernels/mir_elementwise.h"
 #include "../kernels/mir_fa_bwd.h"
 #include "../kernels/mir_fa_rows.h"
+#include "../kernels/mir_filtered_lrelu.h"
 #include "../kernels/mir_gemm_simt.h"
 #include "../kernels/mir_gemv.h"
 #include "../kernels/mir_gemv_q.h"
@@ -251,6 +252,10 @@ CUfunction compile_mir(const MirKey& k) {
             fn = kernels::build_fa_bwd_mir(mod, k.dt0, k.lanes, hd, hdp, br, bc, mode, has_mask, pass);
             break;
         }
+        case MirKind::FilteredLrelu:
+            fn = kernels::build_filtered_lrelu_mir(
+                mod, k.op, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0, k.aux);
+            break;
     }
     {
         brass::GpuOptOptions gopt;
