@@ -8,11 +8,16 @@
 #include "../kernels/mir_conv_int8w.h"
 #include "../kernels/mir_conv_mma.h"
 #include "../kernels/mir_copy.h"
+#include "../kernels/mir_decode_gqa.h"
 #include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
 #include "../kernels/mir_elementwise.h"
+#include "../kernels/mir_fa_aux.h"
 #include "../kernels/mir_fa_bwd.h"
+#include "../kernels/mir_fa_fused_mma.h"
+#include "../kernels/mir_fa_packed_mma.h"
 #include "../kernels/mir_fa_rows.h"
+#include "../kernels/mir_fa_varlen_f32.h"
 #include "../kernels/mir_filtered_lrelu.h"
 #include "../kernels/mir_gemm_mma.h"
 #include "../kernels/mir_gemm_mma_nn.h"
@@ -71,6 +76,19 @@ void configure_mir_ptx_options(const MirKey& k, brass::target::PtxOptions& opts)
     } else if (k.kind == MirKind::Conv2dIgemmF32) {
         opts.maxntid[0] = 256u;
         opts.minnctapersm = 2u;
+    } else if (k.kind == MirKind::DecodeGqa) {
+        opts.maxntid[0] = 128u;
+        opts.minnctapersm = 2u;
+    } else if (k.kind == MirKind::FaFusedMma) {
+        const std::uint32_t pad = kernels::fa_fused_pad_hd(k.op);
+        opts.maxntid[0] = kernels::kFaFusedThreads;
+        opts.minnctapersm = (pad <= 96u) ? 2u : 1u;
+    } else if (k.kind == MirKind::FaPackedMma) {
+        opts.maxntid[0] = 128u;
+        opts.minnctapersm = 2u;
+    } else if (k.kind == MirKind::FaVarlenF32) {
+        opts.maxntid[0] = 256u;
+        opts.minnctapersm = 1u;
     }
 }
 
@@ -273,6 +291,23 @@ brass::Function* build_mir_kernel(brass::Module& mod, const MirKey& k) {
                 mod, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
         case MirKind::ConvAux:
             return kernels::build_conv_aux_mir(mod, k.op, k.dt0, k.flags);
+        case MirKind::DecodeGqa:
+            return kernels::build_decode_gqa_mir(mod, k.op, k.dt0, k.flags);
+        case MirKind::FaFusedMma: {
+            kernels::FaFusedMmaSpec spec;
+            spec.dt = k.dt0;
+            spec.hd = k.op;
+            spec.causal = (k.flags & 1u) != 0;
+            spec.has_mask = (k.flags & 2u) != 0;
+            spec.is_split = (k.flags & 4u) != 0;
+            return kernels::build_fa_fused_mma_mir(mod, spec);
+        }
+        case MirKind::FaPackedMma:
+            return kernels::build_fa_packed_mma_mir(mod, k.dt0);
+        case MirKind::FaVarlenF32:
+            return kernels::build_fa_varlen_f32_mir(mod);
+        case MirKind::FaAux:
+            return kernels::build_fa_aux_mir(mod, k.op, k.dt0, k.flags);
         default:
             throw std::runtime_error("build_mir_kernel: unhandled MirKind");
     }

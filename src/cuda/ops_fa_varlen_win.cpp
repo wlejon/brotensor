@@ -1,7 +1,7 @@
 #include <brotensor/runtime.h>
 #include <brotensor/detail/dispatch.h>
 
-#include "flash_fused_internal.cuh"
+#include "flash_fused_internal.h"
 #include "ops_fa_mir.h"
 #include "detail/cuda_check.h"
 

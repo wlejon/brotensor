@@ -82,7 +82,9 @@ CUfunction compile_mir(const MirKey& k) {
         disk_sig += ":nt" + std::to_string(ptx_opts.maxntid[0]) +
                     "_mc" + std::to_string(ptx_opts.minnctapersm);
     }
-    if (k.kind >= MirKind::Conv2dMma) {
+    if (k.kind >= MirKind::DecodeGqa) {
+        disk_sig += ":v14";
+    } else if (k.kind >= MirKind::Conv2dMma) {
         disk_sig += ":v11";
     } else if (k.kind >= MirKind::GemmQuantMma) {
         disk_sig += ":v9";
@@ -102,7 +104,9 @@ CUfunction compile_mir(const MirKey& k) {
         const bool mma_loop = (k.kind == MirKind::GemmMma || k.kind == MirKind::GemmMmaNn ||
                                k.kind == MirKind::GemmSkinny || k.kind == MirKind::GemmQuantMma ||
                                k.kind == MirKind::Conv2dInt8wMma || k.kind == MirKind::Conv2dMma ||
-                               k.kind == MirKind::Conv2dIgemmF32);
+                               k.kind == MirKind::Conv2dIgemmF32 || k.kind == MirKind::DecodeGqa ||
+                               k.kind == MirKind::FaFusedMma || k.kind == MirKind::FaPackedMma ||
+                               k.kind == MirKind::FaVarlenF32);
         gopt.enable_small_loop_unroll = !mma_loop;
         gopt.enable_load_coalesce = !mma_loop;
         brass::optimize_gpu_function(*fn, mod, gopt);

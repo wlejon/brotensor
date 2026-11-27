@@ -74,6 +74,11 @@ enum class MirKind : std::uint8_t {
     Conv2dMma = 58,
     Conv2dIgemmF32 = 59,
     ConvAux = 60,
+    DecodeGqa = 61,
+    FaFusedMma = 62,
+    FaPackedMma = 63,
+    FaVarlenF32 = 64,
+    FaAux = 65,
 };
 
 struct MirKey {

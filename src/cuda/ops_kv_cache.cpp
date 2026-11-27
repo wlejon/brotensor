@@ -1,7 +1,7 @@
 // KV-cache append + causal flash-attention decode.
 
 #include "detail/cuda_check.h"
-#include "decode_gqa.cuh"
+#include "decode_gqa.h"
 #include "ops_fa_mir.h"
 
 #include <brotensor/tensor.h>
