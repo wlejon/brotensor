@@ -82,7 +82,9 @@ CUfunction compile_mir(const MirKey& k) {
         disk_sig += ":nt" + std::to_string(ptx_opts.maxntid[0]) +
                     "_mc" + std::to_string(ptx_opts.minnctapersm);
     }
-    if (k.kind >= MirKind::GemmQuantMma) {
+    if (k.kind >= MirKind::Conv2dMma) {
+        disk_sig += ":v11";
+    } else if (k.kind >= MirKind::GemmQuantMma) {
         disk_sig += ":v9";
     } else if (k.kind >= MirKind::GemmMma) {
         disk_sig += ":v7";
@@ -99,7 +101,8 @@ CUfunction compile_mir(const MirKey& k) {
         gopt.enable_gpu_superopt = true;
         const bool mma_loop = (k.kind == MirKind::GemmMma || k.kind == MirKind::GemmMmaNn ||
                                k.kind == MirKind::GemmSkinny || k.kind == MirKind::GemmQuantMma ||
-                               k.kind == MirKind::Conv2dInt8wMma);
+                               k.kind == MirKind::Conv2dInt8wMma || k.kind == MirKind::Conv2dMma ||
+                               k.kind == MirKind::Conv2dIgemmF32);
         gopt.enable_small_loop_unroll = !mma_loop;
         gopt.enable_load_coalesce = !mma_loop;
         brass::optimize_gpu_function(*fn, mod, gopt);

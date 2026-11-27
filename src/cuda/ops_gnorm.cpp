@@ -135,6 +135,32 @@ void group_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta
     dispatch_gn(GN_APPLY, X.dtype, false, lanes, gx, static_cast<std::uint32_t>(N * num_groups), pc);
 }
 
+void group_norm_silu_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta, int N, int C, int H, int W,
+                             int num_groups, float eps, Tensor& Y) {
+    constexpr const char* op = "group_norm_silu_forward";
+    require_fp(X.dtype, op);
+    need(op, N >= 0 && C > 0 && H >= 0 && W >= 0, "bad dimension");
+    need(op, num_groups > 0 && C % num_groups == 0, "num_groups must divide C");
+    check_param(op, gamma, C, X.dtype, "gamma");
+    check_param(op, beta, C, X.dtype, "beta");
+    const long long cols = static_cast<long long>(C) * H * W;
+    need(op, X.size() >= N * cols, "X is smaller than N*C*H*W");
+    need(op, cols <= 0x7fffffffLL, "tensor too large");
+    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) Y.resize(N, static_cast<int>(cols), X.dtype);
+    if (N == 0 || cols == 0) return;
+
+    const int hw = H * W;
+    Tensor part;
+    GnArgs pc = gn_stats(X, N, C, hw, num_groups, eps, part, op);
+    pc.y = Y.data;
+    pc.g = gamma.data;
+    pc.b = beta.data;
+    const int lanes = gn_vec4_lanes(X.dtype, pc.hw, pc.chunk, X.data, Y.data);
+    const std::uint64_t tile = static_cast<std::uint64_t>(C / num_groups) * hw;
+    const std::uint32_t gx = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(cdiv(tile, 256 * 16), 1, 1024));
+    dispatch_gn(GN_APPLY, X.dtype, true, lanes, gx, static_cast<std::uint32_t>(N * num_groups), pc);
+}
+
 void group_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& dY, int N, int C, int H, int W,
                          int num_groups, float eps, Tensor& dX, Tensor& dGamma, Tensor& dBeta) {
     constexpr const char* op = "group_norm_backward";

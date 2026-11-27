@@ -2,8 +2,11 @@
 
 #include "../kernels/mir_attn_small.h"
 #include "../kernels/mir_audio.h"
+#include "../kernels/mir_conv_aux.h"
 #include "../kernels/mir_conv_direct.h"
+#include "../kernels/mir_conv_igemm_f32.h"
 #include "../kernels/mir_conv_int8w.h"
+#include "../kernels/mir_conv_mma.h"
 #include "../kernels/mir_copy.h"
 #include "../kernels/mir_delta.h"
 #include "../kernels/mir_diffusion.h"
@@ -60,6 +63,14 @@ void configure_mir_ptx_options(const MirKey& k, brass::target::PtxOptions& opts)
     } else if (k.kind == MirKind::Conv2dInt8wMma) {
         opts.maxntid[0] = 128u;
         opts.minnctapersm = 3u;
+    } else if (k.kind == MirKind::Conv2dMma) {
+        const auto cfg = static_cast<std::size_t>((k.op >> 4) & 0x0fu);
+        const kernels::Conv2dMmaCfg& tc = kernels::kConv2dMmaCfgs[cfg < 2u ? cfg : 0u];
+        opts.maxntid[0] = tc.threads;
+        opts.minnctapersm = tc.min_ctas_per_sm;
+    } else if (k.kind == MirKind::Conv2dIgemmF32) {
+        opts.maxntid[0] = 256u;
+        opts.minnctapersm = 2u;
     }
 }
 
@@ -248,6 +259,20 @@ brass::Function* build_mir_kernel(brass::Module& mod, const MirKey& k) {
             return (k.op == 0u)
                 ? kernels::build_matmul_int8w_fp16_mir(mod)
                 : kernels::build_conv2d_int8w_fallback_mir(mod, (k.flags & 1u) != 0);
+        case MirKind::Conv2dMma: {
+            kernels::Conv2dMmaSpec spec;
+            spec.dt = k.dt0;
+            spec.shape_id = static_cast<std::uint8_t>(k.op & 0x0fu);
+            spec.cfg = static_cast<std::uint8_t>((k.op >> 4) & 0x0fu);
+            spec.has_bias = (k.flags & 1u) != 0;
+            spec.aligned_k8 = (k.flags & 2u) != 0;
+            return kernels::build_conv2d_mma_mir(mod, spec);
+        }
+        case MirKind::Conv2dIgemmF32:
+            return kernels::build_conv2d_igemm_f32_mir(
+                mod, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
+        case MirKind::ConvAux:
+            return kernels::build_conv_aux_mir(mod, k.op, k.dt0, k.flags);
         default:
             throw std::runtime_error("build_mir_kernel: unhandled MirKind");
     }

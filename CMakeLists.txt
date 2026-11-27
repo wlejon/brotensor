@@ -326,11 +326,14 @@ elseif(TARGET brass)
         src/kernels/mir_spectral.cpp
         src/kernels/mir_attn_small.cpp
         src/kernels/mir_conv_direct.cpp
+        src/kernels/mir_conv_aux.cpp
+        src/kernels/mir_conv_igemm_f32.cpp
+        src/kernels/mir_conv_int8w.cpp
+        src/kernels/mir_conv_mma.cpp
         src/kernels/mir_filtered_lrelu.cpp
         src/kernels/mir_gemm_mma.cpp
         src/kernels/mir_gemm_mma_nn.cpp
         src/kernels/mir_gemm_quant_mma.cpp
-        src/kernels/mir_conv_int8w.cpp
         src/kernels/mir_gemm_skinny.cpp
         src/kernels/mir_gemm_splitk.cpp
         src/kernels/mir_linear_bwd.cpp
@@ -396,13 +399,13 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/ops_xent.cpp
         src/cuda/ops_concat.cpp
         src/cuda/ops_batched.cpp
-        src/cuda/conv2d.cu
-        src/cuda/conv2d_wmma.cu
+        src/cuda/conv2d.cpp
+        src/cuda/conv2d_wmma.cpp
         src/cuda/ops_conv_transpose2d.cpp
-        src/cuda/conv3d.cu
+        src/cuda/conv3d.cpp
         src/cuda/ops_quant_mma.cpp
         src/cuda/flash_attention_varlen_f32.cu
-        src/cuda/conv2d_igemm_f32.cu
+        src/cuda/conv2d_igemm_f32.cpp
         src/cuda/flash_attention.cu
         src/cuda/ops_fa_qkvo.cpp
         src/cuda/ops_fa_varlen_win.cpp
@@ -413,7 +416,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/gemm_mma.cpp
         src/cuda/gemm_skinny.cpp
         src/cuda/ops_linear_ex.cpp
-        src/cuda/resblock.cu
+        src/cuda/resblock.cpp
         src/cuda/matmul.cpp
         src/cuda/ops_matmul_bwd.cpp
         src/cuda/ops_kv_cache.cpp

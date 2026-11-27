@@ -71,6 +71,9 @@ enum class MirKind : std::uint8_t {
     GemmQuantMma = 55,
     Conv2dInt8wMma = 56,
     Int8QuantAux = 57,
+    Conv2dMma = 58,
+    Conv2dIgemmF32 = 59,
+    ConvAux = 60,
 };
 
 struct MirKey {
