@@ -53,8 +53,12 @@ if(BROTENSOR_HAS_BRASS_JIT)
     brotensor_add_test(brotensor_test_trace_autodiff_jit test_trace_autodiff_jit.cpp)
     target_link_libraries(brotensor_test_trace_autodiff_jit PRIVATE ${BROTENSOR_BRASS_LIB})
 
-    brotensor_add_test(brotensor_test_metal_mir_msl_emit
-        test_metal_mir_msl_emit.cpp ../src/metal/mtl_mir_builders.cpp)
+    if(TARGET brotensor_metal)
+        brotensor_add_test(brotensor_test_metal_mir_msl_emit test_metal_mir_msl_emit.cpp)
+    else()
+        brotensor_add_test(brotensor_test_metal_mir_msl_emit
+            test_metal_mir_msl_emit.cpp ../src/metal/mtl_mir_builders.cpp)
+    endif()
     target_link_libraries(brotensor_test_metal_mir_msl_emit PRIVATE ${BROTENSOR_BRASS_LIB})
 endif()
 # --- Bronze API test ---
