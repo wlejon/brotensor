@@ -1,10 +1,10 @@
-// Issue #139: Lifter Audit of Vulkan .comp & PTX Backward Shaders
+// Issue #139: Lifter Audit of Brass SPIR-V & PTX Backward Shaders
 // (Shared-Memory Bounds & Barrier Uniformity).
 //
 // Exercises:
-//   1. Full static lifter audit of compiled Vulkan SPIR-V shaders (all 137
-//      production shaders when built with Vulkan + all runtime-emitted Brass
-//      SPIR-V & PTX kernels on every build):
+//   1. Full static lifter audit of compiled Brass MIR SPIR-V & PTX shaders
+//      (all 131+ production Brass MIR SPIR-V kernels + runtime-emitted
+//       `jit::spirv` & PTX kernels):
 //        - brass::spirv::verify_spirv_structural
 //        - brass::verify::verify_spirv_memory_safety (BVSolver workgroup bounds)
 //        - brass::verify::verify_spirv_barrier_uniformity (uniform barriers & subgroup ops)
@@ -81,7 +81,7 @@ static void test_backward_shader_audit_suite() {
                 total_global_accesses,
                 total_barriers,
                 total_collectives);
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
+#if BROTENSOR_HAS_BRASS_JIT
     CHECK(total_global_accesses >= 1200);
 #else
     CHECK(total_global_accesses > 0);
@@ -95,8 +95,8 @@ static void test_backward_shader_audit_suite() {
     CHECK(seen.count("jit_spirv_layernorm_4096_vec") == 1);
     CHECK(seen.count("ptx_bwd_reduce_sm80") == 1);
 
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-    // Production Vulkan backward shaders from shader_table.h + brass MIR kernels
+#if BROTENSOR_HAS_BRASS_JIT
+    // Production Brass MIR Vulkan shaders + runtime JIT kernels
     CHECK(report.shaders.size() >= 131);
     const char* required_vk_shaders[] = {
         "act_bwd_f32",

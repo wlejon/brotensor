@@ -1,8 +1,8 @@
-// ─── Issue #139: Lifter Audit of Vulkan .comp & PTX Backward Shaders ────────
+// ─── Issue #139: Lifter Audit of Brass SPIR-V & PTX Backward Shaders ─────────
 //
-// Lifts compiled Vulkan SPIR-V binaries (`shader_table.h` and runtime-emitted
-// `jit::spirv` kernels) via `brass::spirv::parse_binary` into `spirv::Module`
-// and verifies:
+// Lifts compiled Brass SPIR-V binaries (all production Brass MIR kernels +
+// runtime-emitted `jit::spirv` kernels) via `brass::spirv::parse_binary` into
+// `spirv::Module` and verifies:
 //   1. `brass::spirv::verify_spirv_structural` (SSA dominance & CFG invariants)
 //   2. `brass::verify::verify_spirv_memory_safety` (workgroup `shared` memory
 //      bounds `0 <= idx < array_length` via `BVSolver`)
@@ -66,10 +66,6 @@
 #include <brass/target/spirv/spirv_ir.hpp>
 #include <brass/target/spirv_target.hpp>
 #include <brass/verify/gpu_kernel_prover.hpp>
-#endif
-
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-#include "shader_table.h"
 #endif
 
 #include <algorithm>
@@ -847,23 +843,6 @@ void audit_jit_spirv_and_ptx_kernels(BackwardShaderAuditReport& report) {
 
 BackwardShaderAuditReport run_backward_shader_audit() {
     BackwardShaderAuditReport report;
-
-#if defined(BROTENSOR_HAS_VULKAN) || defined(BROTENSOR_HAS_SHADER_TABLE)
-    const auto count = static_cast<std::uint32_t>(detail::vulkan::ShaderId::kCount);
-    for (std::uint32_t i = 0; i < count; ++i) {
-        const auto id = static_cast<detail::vulkan::ShaderId>(i);
-        const auto& blob = detail::vulkan::shader_blob(id);
-        ShaderAuditSummary s = audit_spirv_binary_words(blob.name, blob.words, blob.nwords);
-        if (std::string(blob.name) == "test_shared_overflow") {
-            // Intentional negative test shader: must be flagged as a shared-memory OOB hazard!
-            report.negative_overflow_shader_caught = !s.memory_safe;
-            report.negative_test_detail = s.diagnostic;
-        } else {
-            report.shaders.push_back(std::move(s));
-        }
-    }
-#endif
-
     audit_jit_spirv_and_ptx_kernels(report);
     return report;
 }

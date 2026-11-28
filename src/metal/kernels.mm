@@ -163,14 +163,6 @@ void flush_pipeline_archive() {
     }
 }
 
-id<MTLComputePipelineState> pipeline(NSString* name) {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-                  "Metal: unknown kernel `%s` (precompiled cache removed)",
-                  [name UTF8String]);
-    throw std::runtime_error(buf);
-}
-
 id<MTLComputePipelineState> compile_pipeline(NSString* msl_source,
                                              NSString* function_name) {
     @autoreleasepool {
@@ -223,26 +215,4 @@ id<MTLComputePipelineState> compile_pipeline(NSString* msl_source,
     }
 }
 
-void dispatch1d_sync(NSString* pipeline_name,
-                     NSUInteger n,
-                     void (^bind)(id<MTLComputeCommandEncoder>)) {
-    if (n == 0) return;
-    @autoreleasepool {
-        id<MTLComputePipelineState> pso = pipeline(pipeline_name);
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        bind(enc);
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > 256) tg = 256;
-        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
-       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
-}
-
 }  // namespace brotensor::metal_impl
-
-extern "C++" void metal_build_pipelines_();
-void metal_build_pipelines_() {}

@@ -100,7 +100,7 @@ endif()
 # driver loading) with no CUDA Toolkit. CPU has no opt-out.
 option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
 option(BROTENSOR_WITH_METAL "Build GPU backend (Metal)" OFF)
-# Vulkan compute (hand-written GLSL, any GPU with a stock Vulkan 1.2+ driver).
+# Vulkan compute (Brass MIR -> SPIR-V, any GPU with a stock Vulkan 1.2+ driver).
 # Independent of the others; the AMD GPU path. See docs/vulkan.md.
 option(BROTENSOR_WITH_VULKAN "Build GPU backend (Vulkan compute)" OFF)
 # The HIP (ROCm) backend was removed on 2026-10-03 (docs/vulkan.md): a stale
@@ -130,7 +130,10 @@ file(GLOB_RECURSE _brotensor_kernel_fp_inputs CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/jit/spirv_emit*"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/jit/msl_emit*"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cu_mir_builders.*"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cu_mir_cache.*")
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cu_mir_cache.*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/mtl_mir_builders.*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/mtl_mir_cache.*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/vk_mir_cache.*")
 set(_brotensor_kernel_fp_cpp "${CMAKE_CURRENT_BINARY_DIR}/generated/brotensor_kernel_fingerprint.cpp")
 add_custom_command(
     OUTPUT "${_brotensor_kernel_fp_cpp}"
@@ -494,7 +497,6 @@ if(BROTENSOR_WITH_METAL)
         src/metal/concat.mm
         src/metal/batched_ops.mm
         src/metal/conv2d.mm
-        src/metal/conv2d_wmma.mm
         src/metal/conv3d.mm
         src/metal/group_norm.mm
         src/metal/resample.mm
@@ -524,7 +526,10 @@ if(BROTENSOR_WITH_METAL)
         src/metal/kernel_interop_mtl.mm
         src/metal/register.mm
     )
-    add_library(brotensor_metal STATIC ${_BROTENSOR_METAL_SRCS})
+    add_library(brotensor_metal STATIC
+        ${_BROTENSOR_METAL_SRCS}
+        src/metal/mtl_mir_builders.cpp
+    )
     set_source_files_properties(${_BROTENSOR_METAL_SRCS}
         PROPERTIES
             COMPILE_FLAGS "-fobjc-arc"
@@ -534,8 +539,6 @@ if(BROTENSOR_WITH_METAL)
         brotensor_core
         "-framework Foundation"
         "-framework Metal"
-        "-framework MetalPerformanceShaders"
-        "-framework MetalPerformanceShadersGraph"
     )
     target_compile_definitions(brotensor_metal PUBLIC
         BROTENSOR_HAS_METAL=1 BROTENSOR_HAS_GPU=1)
@@ -557,20 +560,12 @@ if(BROTENSOR_WITH_METAL)
 endif()
 
 # --- brotensor_vulkan: Vulkan compute backend (optional) ---
-# Target, shader compilation and embedding: cmake/BrotensorVulkan.cmake.
+# Target and Brass MIR -> SPIR-V wiring: cmake/BrotensorVulkan.cmake.
 if(BROTENSOR_WITH_VULKAN)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BrotensorVulkan.cmake")
     brotensor_vulkan_add_backend()
-    target_include_directories(brotensor_cpu PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vulkan_shaders")
-    target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_VULKAN=1 BROTENSOR_HAS_SHADER_TABLE=1)
+    target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_VULKAN=1)
     add_dependencies(brotensor_cpu brotensor_vulkan)
-elseif(BROTENSOR_HAS_BRASS_JIT)
-    find_program(_brotensor_audit_glslc NAMES glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
-    if(_brotensor_audit_glslc)
-        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BrotensorVulkan.cmake")
-        brotensor_vulkan_add_shader_table_to_target(brotensor_cpu)
-        target_compile_definitions(brotensor_cpu PUBLIC BROTENSOR_HAS_SHADER_TABLE=1)
-    endif()
 endif()
 
 # --- brotensor: final consumed target (INTERFACE) ---

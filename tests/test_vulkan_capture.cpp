@@ -1,19 +1,22 @@
 // The device-neutral graph capture on Vulkan (CudaGraphCapture / CudaGraph,
 // cuda_graph.h) and custom kernels (vulkan::register_shader / dispatch, built
-// by brotensor_vulkan_add_shaders from tests/vulkan_shaders/).
-// `brotensor_test_vulkan --only=capture`.
+// with Brass MIR -> SPIR-V). `brotensor_test_vulkan --only=capture`.
 
 #include "test_vulkan_common.h"
-
-#include "brotensor_test_vk_shaders.h"   // generated: brotensor_test_vk::Shader
 
 #include <brotensor/cuda_graph.h>
 #include <brotensor/runtime.h>
 #include <brotensor/vulkan.h>
 
+#include <brass/codegen/kernel_jit.hpp>
+#include <brass/mir/builder.hpp>
+#include <brass/mir/module.hpp>
+#include <brass/target/spirv_target.hpp>
+
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace vkt {
 
@@ -124,13 +127,57 @@ void test_neutral_capture() {
     }
 }
 
+std::vector<std::uint32_t> build_custom_axpy_spirv(bool f64) {
+    brass::Module mod("custom_axpy");
+    brass::Function* fn = mod.create_function(
+        "main", brass::Type::void_type(),
+        {brass::Type::ptr(), brass::Type::ptr(), brass::Type::i32(), brass::Type::f32()});
+    brass::codegen::KernelBuilder kb(mod, fn);
+    brass::Builder& b = kb.builder();
+    brass::BasicBlock* entry = b.append_block("entry");
+    b.position_at_end(entry);
+    brass::Value* x_ptr = b.add_block_param(entry, brass::Type::ptr());
+    brass::Value* y_ptr = b.add_block_param(entry, brass::Type::ptr());
+    brass::Value* n = b.add_block_param(entry, brass::Type::i32());
+    brass::Value* a = b.add_block_param(entry, brass::Type::f32());
+
+    brass::Value* gid = kb.global_tid_x();
+    brass::Value* stride = b.build_mul(kb.nctaid_x(), kb.ntid_x());
+    kb.for_range(gid, n, stride, [&](brass::Value* i) {
+        brass::Value* off = b.build_shl(b.build_zext_i64(i), b.build_iconst_i64(2));
+        brass::Value* xp = b.build_add(x_ptr, off);
+        brass::Value* yp = b.build_add(y_ptr, off);
+        brass::Value* xv = kb.load_f32(xp);
+        brass::Value* yv = kb.load_f32(yp);
+        brass::Value* out = nullptr;
+        if (f64) {
+            brass::Value* ad = b.build_fpext_f64_f32(a);
+            brass::Value* xd = b.build_fpext_f64_f32(xv);
+            brass::Value* yd = b.build_fpext_f64_f32(yv);
+            out = b.build_fptrunc_f32_f64(b.build_add(b.build_mul(ad, xd), yd));
+        } else {
+            out = b.build_add(b.build_mul(a, xv), yv);
+        }
+        kb.store_f32(yp, out);
+    });
+    b.build_ret_void();
+
+    brass::target::SpirvOptions opts;
+    opts.stage = brass::target::SpirvStage::Compute;
+    opts.local_size_x = 64;
+    opts.local_size_spec_constants = true;
+    return brass::target::SpirvTarget::compile(*fn, opts).words;
+}
+
 void test_custom_kernels() {
     std::printf("custom kernels (register_shader / dispatch)\n");
-    namespace sh = ::brotensor_test_vk;
-    const auto h = sh::handle(sh::Shader::custom_axpy);
+    static const std::vector<std::uint32_t> k_axpy = build_custom_axpy_spirv(false);
+    static const std::vector<std::uint32_t> k_axpy_f64 = build_custom_axpy_spirv(true);
+    const auto h = bt::vulkan::register_shader("custom_axpy", k_axpy.data(), k_axpy.size());
     VKT_CHECK(h != 0);
-    VKT_CHECK(sh::handle(sh::Shader::custom_axpy) == h);
-    VKT_CHECK(sh::handle(sh::Shader::custom_axpy_f64) != h);
+    VKT_CHECK(bt::vulkan::register_shader("custom_axpy", k_axpy.data(), k_axpy.size()) == h);
+    const auto h64 = bt::vulkan::register_shader("custom_axpy_f64", k_axpy_f64.data(), k_axpy_f64.size());
+    VKT_CHECK(h64 != h);
 
     const std::uint32_t spec[] = {128};
     const auto ki = bt::vulkan::kernel_info(vk(), h, spec, 1);
@@ -168,7 +215,6 @@ void test_custom_kernels() {
     }
 
     if (bt::vulkan::device_info(vk()).shader_float64) {
-        const auto h64 = sh::handle(sh::Shader::custom_axpy_f64);
         Tensor y3 = upload(yv, n, 1, Dtype::FP32);
         AxpyPush p3{bt::vulkan::address(x), bt::vulkan::address(y3), static_cast<std::uint32_t>(n), a};
         bt::vulkan::dispatch(vk(), h64, &p3, sizeof p3, 64, 1, 1, spec, 1);

@@ -3,7 +3,7 @@
 //   - Decode GEMV (M in 1..8, NT, batch=1, alpha=1, matching A/C dtype):
 //     MirKind::Gemv (src/kernels/mir_gemv.h) via launch_gemm_fp32
 //   - Prefill / large GEMM (K > 0, M*N >= 1024 or alpha != 1):
-//     Metal simdgroup_matrix 64x64 tiled GEMM (src/metal/gemm_fp32.mm)
+//     MirKind::GemmCm / MirKind::GemmSimt (src/metal/gemm_fp32.mm)
 //   - Small / K == 0 fallback:
 //     MirKind::GemmSimt (src/kernels/mir_gemm_simt.h), with GLU epilogues via
 //     FP32 scratch + MirKind::Glu preserving original dt_bias.
@@ -153,6 +153,37 @@ bool gemv_mir_eligible(const AbtMixed& g) {
     return db == da || (da == ::brotensor::Dtype::FP32 && db != ::brotensor::Dtype::FP32);
 }
 
+bool gemm_cm_eligible(const AbtMixed& g) {
+    const AbtType in_b = g.in_B < 0 ? g.in : static_cast<AbtType>(g.in_B);
+    return g.K > 0 && g.alpha == 1.0f && g.in == kAbtF16 && in_b == kAbtF16 &&
+           (g.out == kAbtF16 || g.out == kAbtF32) &&
+           g.lda <= 0x7fffffffULL && g.ldb <= 0x7fffffffULL && g.ldc <= 0x7fffffffULL &&
+           g.strideA <= 0x7fffffffULL && g.strideB <= 0x7fffffffULL && g.strideC <= 0x7fffffffULL &&
+           ((static_cast<std::uint64_t>(g.N) + 63u) / 64u <= 65535u) &&
+           ((static_cast<std::uint64_t>(g.M) + 63u) / 64u <= 65535u);
+}
+
+void run_glu_via_scratch(const AbtMixed& g, std::uint32_t glu_op) {
+    ::brotensor::Tensor scratch = ::brotensor::Tensor::empty_on(
+        ::brotensor::Device::Metal, g.batch * g.M, g.N, ::brotensor::Dtype::FP32);
+    AbtMixed s = g;
+    s.C = buffer_for(scratch);
+    s.ofs_C = buffer_offset_for(scratch);
+    s.ldc = static_cast<uint64_t>(g.N);
+    s.strideC = static_cast<uint64_t>(g.M) * static_cast<uint64_t>(g.N);
+    s.out = kAbtF32;
+    s.epilogue = kAbtStore;
+    launch_matmul_abt_mixed(s);
+    const ::brotensor::Dtype dc_orig = to_dtype(g.out);
+    const size_t es_out = elem_size(dc_orig);
+    for (int b = 0; b < g.batch; ++b) {
+        run_glu_mtl(glu_op, dc_orig,
+                    s.C, s.ofs_C + static_cast<NSUInteger>(b) * s.strideC * sizeof(float),
+                    g.C, g.ofs_C + static_cast<NSUInteger>(b) * g.strideC * es_out,
+                    g.M, g.N / 2);
+    }
+}
+
 }  // namespace
 
 void launch_matmul_abt_fp16_ex(id<MTLBuffer> A, NSUInteger ofs_A,
@@ -191,38 +222,29 @@ void launch_matmul_abt_mixed(const AbtMixed& g) {
     if ((g.epilogue == kAbtGeglu || g.epilogue == kAbtSwiglu) && (g.N % 2) != 0)
         throw std::runtime_error("brotensor (Metal): matmul_abt_mixed: GLU epilogue needs an even N");
 
-    // SwiGLU epilogue: decode M <= 8 fuses into MirKind::Gemv; larger shapes
-    // compute into FP32 scratch (preserving original bias dtype) and gate once.
+    // SwiGLU / GeGLU epilogues: route directly to MirKind::Gemv (M <= 8) or
+    // MirKind::GemmCm (GeGLU, FP16xFP16) when supported; otherwise compute into
+    // FP32 scratch (preserving original bias dtype) and apply MirKind::Glu once.
     if (g.epilogue == kAbtSwiglu) {
         if (gemv_mir_eligible(g)) {
             launch_gemm_fp32(g);
             return;
         }
-        ::brotensor::Tensor scratch = ::brotensor::Tensor::empty_on(
-            ::brotensor::Device::Metal, g.batch * g.M, g.N, ::brotensor::Dtype::FP32);
-        AbtMixed s = g;
-        s.C = buffer_for(scratch);
-        s.ofs_C = buffer_offset_for(scratch);
-        s.ldc = static_cast<uint64_t>(g.N);
-        s.strideC = static_cast<uint64_t>(g.M) * static_cast<uint64_t>(g.N);
-        s.out = kAbtF32;
-        s.epilogue = kAbtStore;
-        launch_matmul_abt_mixed(s);
-        const ::brotensor::Dtype dc_orig = to_dtype(g.out);
-        const size_t es_out = elem_size(dc_orig);
-        for (int b = 0; b < g.batch; ++b) {
-            run_glu_mtl(GLU_SWIGLU, dc_orig,
-                        s.C, s.ofs_C + static_cast<NSUInteger>(b) * s.strideC * sizeof(float),
-                        g.C, g.ofs_C + static_cast<NSUInteger>(b) * g.strideC * es_out,
-                        g.M, g.N / 2);
+        run_glu_via_scratch(g, GLU_SWIGLU);
+        return;
+    }
+    if (g.epilogue == kAbtGeglu) {
+        if (gemv_mir_eligible(g) || gemm_cm_eligible(g)) {
+            launch_gemm_fp32(g);
+            return;
         }
+        run_glu_via_scratch(g, GLU_GEGLU_PAIRS);
         return;
     }
 
     const bool mixed_b = g.in_B >= 0 && g.in_B != g.in;
-    if (g.K > 0 &&
-        (g.alpha != 1.0f || mixed_b || g.M <= 8 ||
-         static_cast<size_t>(g.M) * static_cast<size_t>(g.N) >= kTiledMin)) {
+    if (g.alpha != 1.0f || mixed_b || g.M <= 8 ||
+        (g.K > 0 && static_cast<size_t>(g.M) * static_cast<size_t>(g.N) >= kTiledMin)) {
         launch_gemm_fp32(g);
         return;
     }

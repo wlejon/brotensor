@@ -2,7 +2,7 @@
 //
 // Called from `brotensor::init()` (src/init.cpp) when BROTENSOR_HAS_METAL is
 // defined. Probes for a Metal device; on success initialises the runtime
-// (MTLDevice + command queue + precompiled MSL pipelines), builds the
+// (MTLDevice + command queue + on-demand Brass MIR -> MSL pipelines), builds the
 // OpsVTable from the per-op implementations across the Metal TUs, pairs it
 // with the Metal AllocVTable, and hands the pair to the dispatcher.
 //

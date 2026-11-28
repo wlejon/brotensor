@@ -1,6 +1,6 @@
 # Vulkan backend
 
-`BROTENSOR_WITH_VULKAN=ON` builds a Vulkan 1.2+ compute backend whose kernels compile from **single-source Brass MIR** (`src/kernels/mir_*.{h,cpp}`) through `brass::target::SpirvTarget` (`0` production GLSL shaders; only `src/vulkan/shaders/test_shared_overflow.comp` remains to exercise the pipeline shared-memory overflow guard). It runs on any GPU with a stock Vulkan 1.2+ driver and serves as brotensor's AMD GPU path (verified on Radeon 8060S / Mesa RADV).
+`BROTENSOR_WITH_VULKAN=ON` builds a Vulkan 1.2+ compute backend whose kernels compile from **single-source Brass MIR** (`src/kernels/mir_*.{h,cpp}`) through `brass::target::SpirvTarget` (`0` GLSL shaders; zero `glslc` / shaderc dependency). It runs on any GPU with a stock Vulkan 1.2+ driver and serves as brotensor's AMD GPU path (verified on Radeon 8060S / Mesa RADV).
 
 ## Architecture & Single-Source Brass MIR
 
@@ -78,7 +78,7 @@ src/vulkan/
   vk_mir_cache.{h,cpp}              SpirvTarget compiler cache + KernelDiskCache integration
   kernel_interop_vk.cpp             dispatch_spirv & shader_float64 interop hooks
   detail/                           dlopen loader, Instance/DeviceCtx, Allocator, Stream, Pipelines, SPIR-V reflect
-  shaders/                          shaders.cmake + test_shared_overflow.comp (overflow negative test only)
+  shaders/op_codes.h                Canonical C/C++ op-code definitions shared across backends (0 GLSL shaders)
   ops_*.cpp, gemm.cpp, register.cpp Op dispatchers & vtable registration
 ```
 

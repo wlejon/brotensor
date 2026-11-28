@@ -1,11 +1,12 @@
-// Metal 2D transposed convolution:
+// Metal 2D transposed convolution backed by Brass MIR kernels:
 //   conv_transpose2d_forward         — GEMM + MI_COL2IM2D (vision.mm), fallback MirKind::ConvDirect (mode 1)
 //   conv_transpose2d_backward_input  — MirKind::ConvDirect (mode 0)
-//   conv_transpose2d_backward_weight — direct accumulating weight-grad kernel
+//   conv_transpose2d_backward_weight — ordinary conv2d_backward_weight (+ bottom/right X pad when cropped)
 //   conv_transpose2d_backward_bias   — conv2d_backward_bias (MirKind::Gnorm GN_BIAS_GRAD)
 
 #include "mtl_mir_cache.h"
 
+#include <brotensor/ops/spatial.h>
 #include <brotensor/runtime.h>
 
 #include <stdexcept>
@@ -15,15 +16,17 @@
 
 namespace brotensor::detail::metal {
 
-using metal_impl::buffer_for;
-using metal_impl::buffer_offset_for;
-using metal_impl::compile_pipeline;
-using metal_impl::new_command_buffer;
-
 bool conv_transpose2d_gemm(const Tensor& X, const Tensor& Wt, const Tensor* bias,
                            int N, int C_in, int H, int W, int C_out,
                            int kH, int kW, int sh, int sw, int ph, int pw,
                            int dh, int dw, int groups, int Ho, int Wo, Tensor& Y);
+void conv2d_backward_weight(const Tensor& X, const Tensor& dY,
+                            int N, int C_in, int H, int W,
+                            int C_out, int kH, int kW,
+                            int stride_h, int stride_w,
+                            int pad_h, int pad_w,
+                            int dil_h, int dil_w,
+                            int groups, Tensor& dWt);
 void conv2d_backward_bias(const Tensor& dY, int N, int C_out, int H_out, int W_out, Tensor& dB);
 
 namespace {
@@ -59,62 +62,6 @@ void check_geometry(const char* op, int kH, int kW,
 
 inline int convt2d_out(int L, int stride, int padding, int output_padding, int dilation, int kL) {
     return (L - 1) * stride - 2 * padding + dilation * (kL - 1) + output_padding + 1;
-}
-
-struct CT2dWParams {
-    uint32_t N, C_in, H, W, C_out, kH, kW, H_out, W_out;
-    int32_t  stride_h, stride_w, pad_h, pad_w, dil_h, dil_w;
-    uint32_t Cg_in, Cg_out, total;
-};
-
-NSString* const kSrc = @R"msl(
-#include <metal_stdlib>
-using namespace metal;
-
-struct CT2dWParams {
-    uint N, C_in, H, W, C_out, kH, kW, H_out, W_out;
-    int  stride_h, stride_w, pad_h, pad_w, dil_h, dil_w;
-    uint Cg_in, Cg_out, total;
-};
-
-kernel void k_ct2d_backward_weight(device const float* X   [[buffer(0)]],
-                                   device const float* dY  [[buffer(1)]],
-                                   device float*       dWt [[buffer(2)]],
-                                   constant CT2dWParams& P [[buffer(3)]],
-                                   uint gid [[thread_position_in_grid]]) {
-    if (gid >= P.total) return;
-    uint kHW = P.kH * P.kW;
-    uint kw       = gid % P.kW;
-    uint t1       = gid / P.kW;
-    uint kh       = t1 % P.kH;
-    uint t2       = t1 / P.kH;
-    uint oc_local = t2 % P.Cg_out;
-    uint c_in     = t2 / P.Cg_out;
-    uint g  = c_in / P.Cg_in;
-    uint oc = g * P.Cg_out + oc_local;
-    float acc = 0.0f;
-    for (uint n = 0u; n < P.N; ++n) {
-        uint x_base  = (n * P.C_in  + c_in) * P.H * P.W;
-        uint dy_base = (n * P.C_out + oc)   * P.H_out * P.W_out;
-        for (uint h = 0u; h < P.H; ++h) {
-            int ho = int(h) * P.stride_h - P.pad_h + int(kh) * P.dil_h;
-            if (ho < 0 || ho >= int(P.H_out)) continue;
-            for (uint w = 0u; w < P.W; ++w) {
-                int wo = int(w) * P.stride_w - P.pad_w + int(kw) * P.dil_w;
-                if (wo < 0 || wo >= int(P.W_out)) continue;
-                acc += X[x_base + h * P.W + w] * dY[dy_base + uint(ho) * P.W_out + uint(wo)];
-            }
-        }
-    }
-    dWt[(c_in * P.Cg_out + oc_local) * kHW + kh * P.kW + kw] += acc;
-}
-)msl";
-
-id<MTLComputePipelineState> pso_bwd_weight() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_ct2d_backward_weight"); });
-    return pso;
 }
 
 }  // namespace
@@ -204,7 +151,6 @@ void conv_transpose2d_backward_weight(const Tensor& X, const Tensor& dY,
     const int Ho = convt2d_out(H, stride_h, pad_h, output_padding_h, dil_h, kH);
     const int Wo = convt2d_out(W, stride_w, pad_w, output_padding_w, dil_w, kW);
     if (Ho <= 0 || Wo <= 0) fail(op, "non-positive output spatial size");
-    const int Cg_in = C_in / groups;
     const int Cg_out = C_out / groups;
     const int kHW = kH * kW;
     if (dWt.rows != C_in || dWt.cols != Cg_out * kHW)
@@ -215,31 +161,17 @@ void conv_transpose2d_backward_weight(const Tensor& X, const Tensor& dY,
         fail(op, "dY shape must be (N, C_out*H_out*W_out)");
     if (C_in == 0 || Cg_out == 0 || kHW == 0 || N == 0) return;
 
-    CT2dWParams p{};
-    p.N = N; p.C_in = C_in; p.H = H; p.W = W;
-    p.C_out = C_out; p.kH = kH; p.kW = kW; p.H_out = Ho; p.W_out = Wo;
-    p.stride_h = stride_h; p.stride_w = stride_w;
-    p.pad_h = pad_h; p.pad_w = pad_w;
-    p.dil_h = dil_h; p.dil_w = dil_w;
-    p.Cg_in = Cg_in; p.Cg_out = Cg_out;
-    p.total = static_cast<uint32_t>(C_in) * Cg_out * static_cast<uint32_t>(kHW);
-
-    id<MTLComputePipelineState> pso = pso_bwd_weight();
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:buffer_for(X)   offset:buffer_offset_for(X)   atIndex:0];
-        [enc setBuffer:buffer_for(dY)  offset:buffer_offset_for(dY)  atIndex:1];
-        [enc setBuffer:buffer_for(dWt) offset:buffer_offset_for(dWt) atIndex:2];
-        [enc setBytes:&p length:sizeof(CT2dWParams) atIndex:3];
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > 256) tg = 256;
-        [enc dispatchThreads:MTLSizeMake(p.total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
+    const int Hc = (Ho + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1;
+    const int Wc = (Wo + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1;
+    if (Hc == H && Wc == W) {
+        conv2d_backward_weight(dY, X, N, C_out, Ho, Wo, C_in, kH, kW,
+                               stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups, dWt);
+        return;
     }
+    Tensor Xp = Tensor::empty_on(X.device, N, C_in * Hc * Wc, X.dtype);
+    ::brotensor::pad2d_forward(X, N, C_in, H, W, 0, Hc - H, 0, Wc - W, 0, Xp);
+    conv2d_backward_weight(dY, Xp, N, C_out, Ho, Wo, C_in, kH, kW,
+                           stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups, dWt);
 }
 
 void conv_transpose2d_backward_bias(const Tensor& dY, int N, int C_out,

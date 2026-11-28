@@ -12,6 +12,11 @@
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/vulkan.h>
 
+#include <brass/codegen/kernel_jit.hpp>
+#include <brass/mir/builder.hpp>
+#include <brass/mir/module.hpp>
+#include <brass/target/spirv_target.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -255,18 +260,46 @@ void test_allocator() {
     std::printf("  trim: %zu -> %zu sub-allocation blocks\n", before.blocks, after.blocks);
 }
 
+brass::target::SpirvKernel make_shared_test_spirv(std::uint32_t n_floats) {
+    brass::Module mod("shared_limit_test");
+    brass::Function* fn = mod.create_function("shared_limit_test", brass::Type::void_type(), {brass::Type::ptr()});
+    brass::codegen::KernelBuilder kb(mod, fn);
+    brass::Builder& b = kb.builder();
+    brass::BasicBlock* entry = b.append_block("entry");
+    b.position_at_end(entry);
+    brass::Value* out_ptr = b.add_block_param(entry, brass::Type::ptr());
+    brass::Value* smem = kb.shared_alloc_f32(n_floats);
+    brass::Value* tid = kb.tid_x();
+    kb.shared_store_f32_indexed(smem, tid, b.build_fconst_f32(1.0f));
+    kb.sync();
+    kb.if_then(b.build_and(b.build_eq(tid, b.build_iconst_i32(0)),
+                           b.build_ne(out_ptr, b.build_iconst_i64(0))),
+               [&] { kb.store_f32(out_ptr, kb.shared_load_f32_indexed(smem, b.build_iconst_i32(0))); });
+    b.build_ret_void();
+    brass::target::SpirvOptions opts;
+    opts.stage = brass::target::SpirvStage::Compute;
+    opts.local_size_x = 64;
+    return brass::target::SpirvTarget::compile(*fn, opts);
+}
+
 void test_pipeline_guard() {
     std::printf("pipeline limit guard\n");
     namespace dv = brotensor::detail::vulkan;
     auto& pipes = dv::device(0).pipelines();
     const std::uint32_t limit = brotensor::vulkan::device_info(vk()).max_shared_bytes;
-    const dv::Kernel& ok = pipes.get(dv::ShaderId::test_shared_overflow, {1024});
+    const auto sk_ok = make_shared_test_spirv(1024);
+    const dv::ShaderBlob blob_ok{"test_shared_ok", sk_ok.words.data(), sk_ok.words.size()};
+    const dv::Kernel& ok = pipes.get_jit(dv::kJitKeyBase | 0x3fffffe0u, blob_ok, "shared_limit_test",
+                                        nullptr, 0, 0);
     VKT_CHECK(ok.pipe != VK_NULL_HANDLE && ok.shared_bytes == 4096 && ok.local[0] == 64);
     // One float past the device limit: rejected before the driver sees it
     // (RADV would raise SIGFPE inside vkCreateComputePipelines).
+    const auto sk_bad = make_shared_test_spirv(limit / 4 + 1);
+    const dv::ShaderBlob blob_bad{"test_shared_overflow", sk_bad.words.data(), sk_bad.words.size()};
     std::string msg;
     try {
-        pipes.get(dv::ShaderId::test_shared_overflow, {limit / 4 + 1});
+        pipes.get_jit(dv::kJitKeyBase | 0x3fffffe1u, blob_bad, "shared_limit_test",
+                      nullptr, 0, 0);
     } catch (const std::exception& e) {
         msg = e.what();
     }

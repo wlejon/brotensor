@@ -53,12 +53,12 @@ src/
   kernels/          mir_*.{h,cpp} — single-source Brass MIR kernel builders
                     shared across Vulkan (SPIR-V), CUDA (PTX), and Metal (MSL)
   jit/              Trace JIT compilers + persistent SPIR-V/PTX disk cache
-  cuda/             *.cu + *.cpp (cu_mir_cache) — CUDA backend (BROTENSOR_WITH_CUDA);
-                    detail/ holds CUDA-internal helpers (cuda_check.h, …)
-  metal/            *.mm (mtl_mir_cache + simdgroup/FA fast paths) — Metal
-                    backend (BROTENSOR_WITH_METAL)
+  cuda/             *.cpp (cu_mir_cache + pure-C++ driver loader) — CUDA backend
+                    (BROTENSOR_WITH_CUDA; 0 .cu files, compiles MIR -> PTX)
+  metal/            *.mm + mtl_mir_builders.cpp — Metal backend
+                    (BROTENSOR_WITH_METAL; 0 raw MSL shaders, compiles MIR -> MSL)
   vulkan/           *.cpp (vk_mir_cache) — Vulkan backend (BROTENSOR_WITH_VULKAN;
-                    0 production GLSL shaders, only shaders/test_shared_overflow.comp)
+                    0 GLSL shaders, compiles MIR -> SPIR-V)
 ```
 
 ## Build
@@ -67,13 +67,13 @@ src/
 # CPU-only
 cmake -S . -B build && cmake --build build --config Release
 
-# CPU + CUDA
+# CPU + CUDA (NVIDIA, zero CUDA Toolkit / nvcc needed)
 cmake -S . -B build -DBROTENSOR_WITH_CUDA=ON && cmake --build build --config Release
 
-# CPU + Metal (Apple only)
+# CPU + Metal (Apple only, zero raw MSL / MPSGraph)
 cmake -S . -B build -DBROTENSOR_WITH_METAL=ON && cmake --build build --config Release
 
-# AMD (or any Vulkan 1.2+ GPU): CPU + Vulkan (0 production GLSL shaders; needs Vulkan headers/loader + glslc for overflow test shader)
+# AMD (or any Vulkan 1.2+ GPU): CPU + Vulkan (0 GLSL shaders; needs only Vulkan headers + loader)
 cmake -S . -B build_vk -DBROTENSOR_WITH_VULKAN=ON && cmake --build build_vk
 ```
 

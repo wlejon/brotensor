@@ -89,11 +89,6 @@ std::size_t Pipelines::size() const {
     return kernels_.size();
 }
 
-const Kernel& Pipelines::get(ShaderId id, const std::uint32_t* spec, std::uint32_t nspec,
-                             std::uint32_t subgroup) {
-    return get_blob(static_cast<std::uint32_t>(id), shader_blob(id), spec, nspec, subgroup);
-}
-
 const Kernel& Pipelines::get_custom(std::uint32_t handle, const std::uint32_t* spec,
                                     std::uint32_t nspec, std::uint32_t subgroup) {
     {

@@ -1,14 +1,14 @@
 // ─── Issues #138 & #157: Direct Lifted SPIR-V & PTX Backward Shader Bounds,
 //     Barrier Uniformity & Cross-Backend Equivalence Proofs ──────────────────
 //
-// Directly lifts the shipped Vulkan SPIR-V binaries in `shader_table.h` via
+// Directly lifts compiled Brass SPIR-V binaries via
 // `brass::spirv::parse_binary` and verifies:
 //   1. Structural SSA & CFG invariants (`brass::spirv::verify_spirv_structural`)
 //   2. Static compute-shader safety (`brass::verify::prove_spirv_shader_safety`:
 //      workgroup shared-memory bounds, control-barrier & subgroup uniformity,
 //      and division/sqrt hazard freedom)
 //   3. Lifted `PhysicalStorageBuffer64` & `PushConstant` CFG bounds-guard audit:
-//      verifies that every shipped backward shader loads runtime bounds/pointers
+//      verifies that every backward shader loads runtime bounds/pointers
 //      from `StorageClassPushConstant`, guards global buffer writes (`OpStore` /
 //      `OpAtomic*` into `StorageClassPhysicalStorageBuffer`) behind conditional
 //      bounds comparisons (`OpULessThan` / `OpUGreaterThanEqual` / `OpSLessThan`
@@ -18,12 +18,10 @@
 //      `verify_spirv_ptx_equivalence` in `<brass/verify/gpu_equiv.hpp>`), plus
 //      negative lifted SPIR-V & PTX out-of-bounds refutation.
 //
-// Note on non-SPIR-V hand-written backends:
-//   Hand-written CUDA (`.cu` in `src/cuda/`) and Metal (`.mm` in `src/metal/`)
-//   kernels are not SPIR-V binaries. Forward/backward adjoint correspondence
-//   (`<F(X), dY> == <X, dX>` and `<F(X, W), dY> == <W, dW>`) across CPU and all
-//   active GPU backends is verified by the randomized multi-backend numerical
-//   adjoint dot-product oracle in `tests/test_backward_index_proofs.cpp`.
+// All three GPU backends (CUDA PTX, Vulkan SPIR-V, Metal MSL) share the same
+// single-source Brass MIR builders in `src/kernels/`. Forward/backward adjoint
+// correspondence across CPU and all active GPU backends is verified by the
+// randomized numerical adjoint oracle in `tests/test_backward_index_proofs.cpp`.
 
 #include <brotensor/backward_verify.h>
 

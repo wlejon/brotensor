@@ -1,8 +1,13 @@
+// Metal ResBlock forward (FP16/BF16 & INT8W) and backward backed by Brass MIR
+// (group_norm_silu_forward + MirKind::ConvAux), with zero raw MSL shaders.
+
+#include "mtl_mir_cache.h"
+
 #include <brotensor/runtime.h>
 #include <brotensor/detail/op_table.h>
 
+#include <cstdint>
 #include <stdexcept>
-#include <vector>
 
 #import "internal.h"
 
@@ -13,6 +18,10 @@ namespace brotensor::detail::metal {
 #define BROTENSOR_METAL_DECL(name, ret, params) ret name params;
 BROTENSOR_FOR_EACH_OP(BROTENSOR_METAL_DECL)
 #undef BROTENSOR_METAL_DECL
+
+void group_norm_silu_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta,
+                             int N, int C, int H, int W, int num_groups, float eps,
+                             Tensor& Y);
 
 // The resblock body predates the grouped-conv API. These no-groups overloads
 // forward to the canonical ops with groups = 1 (resblock convs are dense).
@@ -40,387 +49,30 @@ inline void conv2d_backward_weight(const Tensor& X, const Tensor& dY,
                            stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, 1, dWt);
 }
 
-using metal_impl::buffer_for;
-using metal_impl::buffer_offset_for;
-using metal_impl::compile_pipeline;
-using metal_impl::new_command_buffer;
-
 namespace {
 
-constexpr NSUInteger RB_GN_BLOCK   = 256;
-constexpr NSUInteger RB_CONV_BLOCK = 256;
-
-NSString* const kSrc = @R"msl(
-#include <metal_stdlib>
-using namespace metal;
-
-constant uint RB_GN_BLOCK = 256;
-
-// Fused GroupNorm + SiLU. One threadgroup per (sample, group).
-kernel void k_gn_silu_fused(
-        device const half* X     [[buffer(0)]],
-        device const half* gamma [[buffer(1)]],
-        device const half* beta  [[buffer(2)]],
-        device half*       Y     [[buffer(3)]],
-        constant uint& C                  [[buffer(4)]],
-        constant uint& spatial            [[buffer(5)]],
-        constant uint& channels_per_group [[buffer(6)]],
-        constant float& eps               [[buffer(7)]],
-        uint3 gid    [[threadgroup_position_in_grid]],
-        uint3 tid3   [[thread_position_in_threadgroup]],
-        uint3 tgs3   [[threads_per_threadgroup]]) {
-    threadgroup float s_sum[RB_GN_BLOCK];
-    threadgroup float s_sumsq[RB_GN_BLOCK];
-    uint tid = tid3.x;
-    uint tg_size = tgs3.x;
-    uint g = gid.x;
-    uint n = gid.y;
-    uint tile_size = channels_per_group * spatial;
-    uint chan_base = g * channels_per_group;
-    uint sample_stride = C * spatial;
-    device const half* x_tile = X + n * sample_stride + chan_base * spatial;
-    device       half* y_tile = Y + n * sample_stride + chan_base * spatial;
-
-    // Two reduction passes: the mean, then the sum of squared deviations from
-    // it. Fusing them — E[x^2] - E[x]^2 — cancels catastrophically once a
-    // tile's mean dwarfs its spread, because both terms land on the same large
-    // value and their FP32 difference is rounding noise that can come out
-    // negative, making rstd NaN. Deviations are non-negative by construction.
-    float sum = 0.0f;
-    for (uint i = tid; i < tile_size; i += tg_size) {
-        sum += float(x_tile[i]);
-    }
-    s_sum[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) s_sum[tid] += s_sum[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float inv_n = 1.0f / float(tile_size);
-    float mean  = s_sum[0] * inv_n;
-
-    float sumsq = 0.0f;
-    for (uint i = tid; i < tile_size; i += tg_size) {
-        float d = float(x_tile[i]) - mean;
-        sumsq += d * d;
-    }
-    s_sumsq[tid] = sumsq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) s_sumsq[tid] += s_sumsq[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rstd = rsqrt(s_sumsq[0] * inv_n + eps);
-
-    for (uint i = tid; i < tile_size; i += tg_size) {
-        uint local_c = i / spatial;
-        uint channel = chan_base + local_c;
-        float gv = float(gamma[channel]);
-        float bv = float(beta[channel]);
-        float v  = float(x_tile[i]);
-        float yn = (v - mean) * rstd * gv + bv;
-        float silu = yn / (1.0f + exp(-yn));
-        y_tile[i] = half(silu);
-    }
-}
-
-struct ShiftParams {
-    uint N, C, spatial, has_N, total;
-};
-
-kernel void k_add_NC_shift(device half*       Y     [[buffer(0)]],
-                           device const half* shift [[buffer(1)]],
-                           constant ShiftParams& p  [[buffer(2)]],
-                           uint idx [[thread_position_in_grid]]) {
-    if (idx >= p.total) return;
-    uint t = idx / p.spatial;
-    uint c = t % p.C;
-    uint n = t / p.C;
-    uint sidx = (p.has_N != 0u) ? (n * p.C + c) : c;
-    Y[idx] = half(float(Y[idx]) + float(shift[sidx]));
-}
-
-// Per-(n, c) HW reduction of an NCHW FP16 tensor, accumulated (folded) into
-// d_shift[n, c]. One threadgroup per (n, c); RB_GN_BLOCK threads reduce.
-struct ReduceNCParams { uint N, C, spatial; };
-
-kernel void k_sum_hw_per_NC(
-        device const half* dh2     [[buffer(0)]],
-        device half*       d_shift [[buffer(1)]],
-        constant ReduceNCParams& p [[buffer(2)]],
-        uint3 gid  [[threadgroup_position_in_grid]],
-        uint3 tid3 [[thread_position_in_threadgroup]],
-        uint3 tgs3 [[threads_per_threadgroup]]) {
-    threadgroup float s_buf[RB_GN_BLOCK];
-    uint nc = gid.x;
-    if (nc >= p.N * p.C) return;
-    uint tid = tid3.x;
-    uint tg_size = tgs3.x;
-    device const half* row = dh2 + nc * p.spatial;
-    float acc = 0.0f;
-    for (uint i = tid; i < p.spatial; i += tg_size) {
-        acc += float(row[i]);
-    }
-    s_buf[tid] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) s_buf[tid] += s_buf[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (tid == 0) {
-        float prev = float(d_shift[nc]);
-        d_shift[nc] = half(prev + s_buf[0]);
-    }
-}
-
-// ─── BF16 kernel twins (verbatim copies of the FP16 kernels above, with ──────
-//     half→bfloat). All math stays in float. ─────────────────────────────────
-
-kernel void k_gn_silu_fused_bf16(
-        device const bfloat* X     [[buffer(0)]],
-        device const bfloat* gamma [[buffer(1)]],
-        device const bfloat* beta  [[buffer(2)]],
-        device bfloat*       Y     [[buffer(3)]],
-        constant uint& C                  [[buffer(4)]],
-        constant uint& spatial            [[buffer(5)]],
-        constant uint& channels_per_group [[buffer(6)]],
-        constant float& eps               [[buffer(7)]],
-        uint3 gid    [[threadgroup_position_in_grid]],
-        uint3 tid3   [[thread_position_in_threadgroup]],
-        uint3 tgs3   [[threads_per_threadgroup]]) {
-    threadgroup float s_sum[RB_GN_BLOCK];
-    threadgroup float s_sumsq[RB_GN_BLOCK];
-    uint tid = tid3.x;
-    uint tg_size = tgs3.x;
-    uint g = gid.x;
-    uint n = gid.y;
-    uint tile_size = channels_per_group * spatial;
-    uint chan_base = g * channels_per_group;
-    uint sample_stride = C * spatial;
-    device const bfloat* x_tile = X + n * sample_stride + chan_base * spatial;
-    device       bfloat* y_tile = Y + n * sample_stride + chan_base * spatial;
-
-    // Two reduction passes: the mean, then the sum of squared deviations from
-    // it. Fusing them — E[x^2] - E[x]^2 — cancels catastrophically once a
-    // tile's mean dwarfs its spread, because both terms land on the same large
-    // value and their FP32 difference is rounding noise that can come out
-    // negative, making rstd NaN. Deviations are non-negative by construction.
-    float sum = 0.0f;
-    for (uint i = tid; i < tile_size; i += tg_size) {
-        sum += float(x_tile[i]);
-    }
-    s_sum[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) s_sum[tid] += s_sum[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float inv_n = 1.0f / float(tile_size);
-    float mean  = s_sum[0] * inv_n;
-
-    float sumsq = 0.0f;
-    for (uint i = tid; i < tile_size; i += tg_size) {
-        float d = float(x_tile[i]) - mean;
-        sumsq += d * d;
-    }
-    s_sumsq[tid] = sumsq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) s_sumsq[tid] += s_sumsq[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rstd = rsqrt(s_sumsq[0] * inv_n + eps);
-
-    for (uint i = tid; i < tile_size; i += tg_size) {
-        uint local_c = i / spatial;
-        uint channel = chan_base + local_c;
-        float gv = float(gamma[channel]);
-        float bv = float(beta[channel]);
-        float v  = float(x_tile[i]);
-        float yn = (v - mean) * rstd * gv + bv;
-        float silu = yn / (1.0f + exp(-yn));
-        y_tile[i] = bfloat(silu);
-    }
-}
-
-kernel void k_add_NC_shift_bf16(device bfloat*       Y     [[buffer(0)]],
-                                device const bfloat* shift [[buffer(1)]],
-                                constant ShiftParams& p    [[buffer(2)]],
-                                uint idx [[thread_position_in_grid]]) {
-    if (idx >= p.total) return;
-    uint t = idx / p.spatial;
-    uint c = t % p.C;
-    uint n = t / p.C;
-    uint sidx = (p.has_N != 0u) ? (n * p.C + c) : c;
-    Y[idx] = bfloat(float(Y[idx]) + float(shift[sidx]));
-}
-
-// BF16 twin of k_sum_hw_per_NC.
-kernel void k_sum_hw_per_NC_bf16(
-        device const bfloat* dh2   [[buffer(0)]],
-        device bfloat*     d_shift [[buffer(1)]],
-        constant ReduceNCParams& p [[buffer(2)]],
-        uint3 gid  [[threadgroup_position_in_grid]],
-        uint3 tid3 [[thread_position_in_threadgroup]],
-        uint3 tgs3 [[threads_per_threadgroup]]) {
-    threadgroup float s_buf[RB_GN_BLOCK];
-    uint nc = gid.x;
-    if (nc >= p.N * p.C) return;
-    uint tid = tid3.x;
-    uint tg_size = tgs3.x;
-    device const bfloat* row = dh2 + nc * p.spatial;
-    float acc = 0.0f;
-    for (uint i = tid; i < p.spatial; i += tg_size) {
-        acc += float(row[i]);
-    }
-    s_buf[tid] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tg_size / 2; s > 0; s >>= 1) {
-        if (tid < s) s_buf[tid] += s_buf[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (tid == 0) {
-        float prev = float(d_shift[nc]);
-        d_shift[nc] = bfloat(prev + s_buf[0]);
-    }
-}
-)msl";
-
-id<MTLComputePipelineState> pso_gn_silu() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_gn_silu_fused"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_add_shift() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_add_NC_shift"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_sum_hw_per_NC() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_sum_hw_per_NC"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_gn_silu_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_gn_silu_fused_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_add_shift_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_add_NC_shift_bf16"); });
-    return pso;
-}
-id<MTLComputePipelineState> pso_sum_hw_per_NC_bf16() {
-    static dispatch_once_t once;
-    static id<MTLComputePipelineState> pso;
-    dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, @"k_sum_hw_per_NC_bf16"); });
-    return pso;
-}
-
-struct ShiftParams {
-    uint32_t N, C, spatial, has_N, total;
-};
-struct ReduceNCParams {
-    uint32_t N, C, spatial;
-};
-
-void launch_gn_silu(bool is_bf16,
-                    const Tensor& X,
-                    const Tensor& gamma, const Tensor& beta,
-                    Tensor& Y,
-                    int N, int C, int spatial, int channels_per_group, float eps) {
-    id<MTLComputePipelineState> pso = is_bf16 ? pso_gn_silu_bf16() : pso_gn_silu();
-    id<MTLBuffer> bx = buffer_for(X);
-    id<MTLBuffer> bg = buffer_for(gamma);
-    id<MTLBuffer> bb = buffer_for(beta);
-    id<MTLBuffer> by = buffer_for(Y);
-    const NSUInteger ox = buffer_offset_for(X);
-    const NSUInteger og = buffer_offset_for(gamma);
-    const NSUInteger ob = buffer_offset_for(beta);
-    const NSUInteger oy = buffer_offset_for(Y);
-    const uint32_t Cu = C, Su = spatial, cpg = channels_per_group;
-    const int num_groups = C / channels_per_group;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bx offset:ox atIndex:0];
-        [enc setBuffer:bg offset:og atIndex:1];
-        [enc setBuffer:bb offset:ob atIndex:2];
-        [enc setBuffer:by offset:oy atIndex:3];
-        [enc setBytes:&Cu  length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&Su  length:sizeof(uint32_t) atIndex:5];
-        [enc setBytes:&cpg length:sizeof(uint32_t) atIndex:6];
-        [enc setBytes:&eps length:sizeof(float)    atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(num_groups, N, 1)
-            threadsPerThreadgroup:MTLSizeMake(RB_GN_BLOCK, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
-}
-
-void launch_add_shift(bool is_bf16, Tensor& Y, const Tensor& shift,
+void launch_add_shift(Dtype dt, Tensor& Y, const Tensor& shift,
                       int N, int C, int spatial, int has_N) {
-    id<MTLComputePipelineState> pso = is_bf16 ? pso_add_shift_bf16() : pso_add_shift();
-    id<MTLBuffer> by = buffer_for(Y);
-    id<MTLBuffer> bs = buffer_for(shift);
-    const NSUInteger oy = buffer_offset_for(Y);
-    const NSUInteger os = buffer_offset_for(shift);
-
-    ShiftParams p{};
-    p.N = N; p.C = C; p.spatial = spatial;
-    p.has_N = static_cast<uint32_t>(has_N);
-    p.total = static_cast<uint32_t>(N) * static_cast<uint32_t>(C) *
-              static_cast<uint32_t>(spatial);
-    if (p.total == 0) return;
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:by offset:oy atIndex:0];
-        [enc setBuffer:bs offset:os atIndex:1];
-        [enc setBytes:&p length:sizeof(ShiftParams) atIndex:2];
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > RB_CONV_BLOCK) tg = RB_CONV_BLOCK;
-        [enc dispatchThreads:MTLSizeMake(p.total, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
+    const int total = N * C * spatial;
+    if (total <= 0) return;
+    const MirKernel mk = mir_kernel(
+        {MirKind::ConvAux, 5u, dt, Dtype::FP32, 1, Dtype::FP32,
+         static_cast<std::uint8_t>(has_N ? 1u : 0u)});
+    const void* ptrs[] = {Y.data, shift.data};
+    const std::int32_t ints[] = {N, C, spatial};
+    const std::uint32_t gx = static_cast<std::uint32_t>((static_cast<std::uint64_t>(total) + 255u) / 256u);
+    mir_dispatch_args_3d(mk, gx, 1u, 1u, "resblock_add_shift", ptrs, ints, {});
 }
 
-void launch_sum_hw_per_NC(bool is_bf16, const Tensor& dh2, Tensor& d_shift,
+void launch_sum_hw_per_NC(Dtype dt, const Tensor& dh2, Tensor& d_shift,
                           int N, int C, int spatial) {
-    id<MTLComputePipelineState> pso = is_bf16 ? pso_sum_hw_per_NC_bf16() : pso_sum_hw_per_NC();
-    id<MTLBuffer> bx = buffer_for(dh2);
-    id<MTLBuffer> bs = buffer_for(d_shift);
-    const NSUInteger ox = buffer_offset_for(dh2);
-    const NSUInteger os = buffer_offset_for(d_shift);
-
-    ReduceNCParams p{};
-    p.N = N; p.C = C; p.spatial = spatial;
-    const uint32_t blocks = static_cast<uint32_t>(N) * static_cast<uint32_t>(C);
-    if (blocks == 0 || spatial == 0) return;
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:bx offset:ox atIndex:0];
-        [enc setBuffer:bs offset:os atIndex:1];
-        [enc setBytes:&p length:sizeof(ReduceNCParams) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(blocks, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(RB_GN_BLOCK, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
+    const int blocks = N * C;
+    if (blocks <= 0 || spatial <= 0) return;
+    const MirKernel mk = mir_kernel({MirKind::ConvAux, 6u, dt});
+    const void* ptrs[] = {dh2.data, d_shift.data};
+    const std::int32_t ints[] = {N, C, spatial};
+    mir_dispatch_args_3d(mk, static_cast<std::uint32_t>(blocks), 1u, 1u,
+                         "resblock_sum_hw", ptrs, ints, {});
 }
 
 } // namespace
@@ -443,7 +95,6 @@ void resblock_forward(const Tensor& X,
         gamma2.dtype != dt || beta2.dtype != dt || W2.dtype != dt) {
         throw std::runtime_error("resblock_forward_gpu: all required tensors must share X's dtype (FP16 or BF16)");
     }
-    const bool is_bf16 = (dt == Dtype::BF16);
     if (num_groups <= 0 || C_in % num_groups != 0 || C_out % num_groups != 0) {
         throw std::runtime_error("resblock_forward_gpu: num_groups must divide C_in and C_out");
     }
@@ -457,10 +108,6 @@ void resblock_forward(const Tensor& X,
     }
     if (N == 0 || spatial == 0) return;
 
-    // Reuse scratch across calls. SD1.5 invokes ~30 resblocks per UNet step,
-    // so a fresh allocation per call burns Metal heap traffic; Tensor::resize
-    // is a no-op when shape/dtype already match (tensor.mm:180). Inference is
-    // single-threaded against the device, so thread_local lifetime is fine.
     thread_local Tensor h1 = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local Tensor h2 = Tensor::empty_on(Device::Metal, 0, 0);
     thread_local Tensor h3 = Tensor::empty_on(Device::Metal, 0, 0);
@@ -468,10 +115,8 @@ void resblock_forward(const Tensor& X,
     h2.resize(N, C_out * spatial, dt);
     h3.resize(N, C_out * spatial, dt);
 
-    launch_gn_silu(is_bf16, X, gamma1, beta1, h1, N, C_in, spatial,
-                   C_in / num_groups, eps);
+    group_norm_silu_forward(X, gamma1, beta1, N, C_in, H, Wd, num_groups, eps, h1);
 
-    // Conv1: 3x3 same. Dispatch through the public conv2d (simdgroup fast path).
     conv2d_forward(h1, W1, b1,
                        N, C_in, H, Wd,
                        C_out, 3, 3,
@@ -494,19 +139,16 @@ void resblock_forward(const Tensor& X,
         } else {
             throw std::runtime_error("resblock_forward_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
-        launch_add_shift(is_bf16, h2, *t_emb_shift, N, C_out, spatial, has_N);
+        launch_add_shift(dt, h2, *t_emb_shift, N, C_out, spatial, has_N);
     }
 
-    launch_gn_silu(is_bf16, h2, gamma2, beta2, h3, N, C_out, spatial,
-                   C_out / num_groups, eps);
+    group_norm_silu_forward(h2, gamma2, beta2, N, C_out, H, Wd, num_groups, eps, h3);
 
-    // Prepare the skip tensor for the conv2 epilogue (post-conv2 add).
     thread_local Tensor skip_scratch = Tensor::empty_on(Device::Metal, 0, 0);
     if (Wskip != nullptr) {
         if (Wskip->dtype != dt) {
             throw std::runtime_error("resblock_forward_gpu: Wskip dtype must match X");
         }
-        // 1x1 conv through the public path.
         conv2d_forward(X, *Wskip, bskip,
                            N, C_in, H, Wd,
                            C_out, 1, 1,
@@ -516,7 +158,6 @@ void resblock_forward(const Tensor& X,
                            skip_scratch);
     }
 
-    // Conv2 (3x3 same) → Y, then fuse-in the skip via add_inplace_gpu.
     conv2d_forward(h3, W2, b2,
                        N, C_out, H, Wd,
                        C_out, 3, 3,
@@ -525,7 +166,6 @@ void resblock_forward(const Tensor& X,
                        /*dil*/1, 1,
                        Y);
     if (Wskip == nullptr) {
-        // skip is X itself (C_in == C_out so shapes match).
         add_inplace(Y, X);
     } else {
         add_inplace(Y, skip_scratch);
@@ -607,8 +247,7 @@ void resblock_forward_int8w_fp16(const Tensor& X,
     h2.resize(N, C_out * spatial, Dtype::FP16);
     h3.resize(N, C_out * spatial, Dtype::FP16);
 
-    launch_gn_silu(/*is_bf16*/false, X, gamma1, beta1, h1, N, C_in, spatial,
-                   C_in / num_groups, eps);
+    group_norm_silu_forward(X, gamma1, beta1, N, C_in, H, Wd, num_groups, eps, h1);
 
     conv2d_int8w_fp16_forward(h1, W1_int8, s1, b1,
                                   N, C_in, H, Wd,
@@ -630,11 +269,10 @@ void resblock_forward_int8w_fp16(const Tensor& X,
         } else {
             throw std::runtime_error("resblock_forward_int8w_fp16_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
-        launch_add_shift(/*is_bf16*/false, h2, *t_emb_shift, N, C_out, spatial, has_N);
+        launch_add_shift(Dtype::FP16, h2, *t_emb_shift, N, C_out, spatial, has_N);
     }
 
-    launch_gn_silu(/*is_bf16*/false, h2, gamma2, beta2, h3, N, C_out, spatial,
-                   C_out / num_groups, eps);
+    group_norm_silu_forward(h2, gamma2, beta2, N, C_out, H, Wd, num_groups, eps, h3);
 
     thread_local Tensor skip_scratch = Tensor::empty_on(Device::Metal, 0, 0);
     if (Wskip_int8 != nullptr) {
@@ -683,7 +321,6 @@ void resblock_backward(const Tensor& X,
         W2.dtype != dt) {
         throw std::runtime_error("resblock_backward_gpu: all required tensors must share X's dtype (FP16 or BF16)");
     }
-    const bool is_bf16 = (dt == Dtype::BF16);
     if (Wskip == nullptr && C_in != C_out) {
         throw std::runtime_error("resblock_backward_gpu: Wskip required when C_in != C_out");
     }
@@ -696,7 +333,6 @@ void resblock_backward(const Tensor& X,
     }
     if (N == 0 || spatial == 0) return;
 
-    // Recompute forward intermediates via public ops.
     Tensor h1_pre_silu = Tensor::empty_on(Device::Metal, 0, 0);
     Tensor h1 = Tensor::empty_on(Device::Metal, 0, 0);
     group_norm_forward(X, gamma1, beta1, N, C_in, H, Wd, num_groups, eps,
@@ -720,7 +356,7 @@ void resblock_backward(const Tensor& X,
         } else {
             throw std::runtime_error("resblock_backward_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
         }
-        launch_add_shift(is_bf16, h2, *t_emb_shift, N, C_out, spatial, has_N);
+        launch_add_shift(dt, h2, *t_emb_shift, N, C_out, spatial, has_N);
     }
 
     Tensor h3_pre_silu = Tensor::empty_on(Device::Metal, 0, 0);
@@ -729,7 +365,6 @@ void resblock_backward(const Tensor& X,
                            h3_pre_silu);
     silu_forward(h3_pre_silu, h3);
 
-    // Conv2 backward.
     Tensor dh3 = Tensor::empty_on(Device::Metal, N, C_out * spatial, dt);
     conv2d_backward_input(W2, dY, N, C_out, H, Wd,
                               C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh3);
@@ -739,29 +374,25 @@ void resblock_backward(const Tensor& X,
         conv2d_backward_bias(dY, N, C_out, H, Wd, *db2);
     }
 
-    // SiLU2 backward.
     Tensor dh3_pre_silu = Tensor::empty_on(Device::Metal, 0, 0);
     silu_backward(h3_pre_silu, dh3, dh3_pre_silu);
 
-    // GN2 backward.
     Tensor dh2 = Tensor::empty_on(Device::Metal, 0, 0);
     group_norm_backward(h2, gamma2, dh3_pre_silu, N, C_out, H, Wd,
                             num_groups, eps, dh2, dGamma2, dBeta2);
 
-    // t_emb_shift backward.
     if (t_emb_shift && dt_emb_shift) {
         if (dt_emb_shift->dtype != dt) {
             throw std::runtime_error("resblock_backward_gpu: dt_emb_shift dtype must match X");
         }
         const bool has_N = (t_emb_shift->rows == N && t_emb_shift->cols == C_out);
         if (has_N) {
-            launch_sum_hw_per_NC(is_bf16, dh2, *dt_emb_shift, N, C_out, spatial);
+            launch_sum_hw_per_NC(dt, dh2, *dt_emb_shift, N, C_out, spatial);
         } else {
             conv2d_backward_bias(dh2, N, C_out, H, Wd, *dt_emb_shift);
         }
     }
 
-    // Conv1 backward.
     Tensor dh1 = Tensor::empty_on(Device::Metal, N, C_in * spatial, dt);
     conv2d_backward_input(W1, dh2, N, C_in, H, Wd,
                               C_out, 3, 3, 1, 1, 1, 1, 1, 1, dh1);
@@ -771,15 +402,12 @@ void resblock_backward(const Tensor& X,
         conv2d_backward_bias(dh2, N, C_out, H, Wd, *db1);
     }
 
-    // SiLU1 backward.
     Tensor dh1_pre_silu = Tensor::empty_on(Device::Metal, 0, 0);
     silu_backward(h1_pre_silu, dh1, dh1_pre_silu);
 
-    // GN1 backward (writes dX).
     group_norm_backward(X, gamma1, dh1_pre_silu, N, C_in, H, Wd,
                             num_groups, eps, dX, dGamma1, dBeta1);
 
-    // Skip path backward, then sum into dX.
     if (Wskip == nullptr) {
         add_inplace(dX, dY);
     } else {

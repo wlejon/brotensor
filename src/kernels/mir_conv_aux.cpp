@@ -424,6 +424,30 @@ Function* build_resblock_sum_hw(Module& mod, Dtype dt) {
     return finalize_fn(fn);
 }
 
+Function* build_splitk_fold(Module& mod, Dtype dt) {
+    std::vector<Type> params = {Type::ptr(), Type::ptr(), Type::i32(), Type::i32()};
+    Function* fn = mod.create_function("mir_conv2d_splitk_fold", Type::void_type(), params);
+    brass::codegen::KernelBuilder kb(mod, fn);
+    Ctx c(kb);
+    auto p = entry_params(c, fn);
+    // 0:part(f32) 1:dst(dt) | 2:n 3:S
+    Value* idx = kb.global_tid_x();
+    kb.if_then(c.b.build_slt(idx, p[2]), [&] {
+        Value* n64 = c.b.build_zext_i64(p[2]);
+        Value* idx64 = c.b.build_zext_i64(idx);
+        Value* acc = kb.for_range_reduce(
+            c.i32(0), p[3], c.i32(1), c.f32(0.0f),
+            [&](Value* s, Value* cur) -> Value* {
+                Value* off = c.b.build_add(c.b.build_mul(c.b.build_zext_i64(s), n64), idx64);
+                Value* v = kb.load_f32(c.b.build_add(p[0], c.b.build_shl(off, kb.const_i64(2))));
+                return c.b.build_add(cur, v);
+            });
+        accum_elem_dt_i64(c, dt, p[1], idx64, acc);
+    });
+    c.b.build_ret_void();
+    return finalize_fn(fn);
+}
+
 }  // namespace
 
 Function* build_conv_aux_mir(Module& mod, std::uint32_t op, Dtype dt, std::uint8_t flags) {
@@ -435,6 +459,7 @@ Function* build_conv_aux_mir(Module& mod, std::uint32_t op, Dtype dt, std::uint8
         case 4u: return build_col2im_f32(mod, (flags & 1u) != 0);
         case 5u: return build_resblock_shift(mod, dt, (flags & 1u) != 0);
         case 6u: return build_resblock_sum_hw(mod, dt);
+        case 7u: return build_splitk_fold(mod, dt);
         default: throw std::runtime_error("build_conv_aux_mir: unknown op");
     }
 }

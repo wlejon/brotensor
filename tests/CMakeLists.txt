@@ -52,6 +52,10 @@ if(BROTENSOR_HAS_BRASS_JIT)
 
     brotensor_add_test(brotensor_test_trace_autodiff_jit test_trace_autodiff_jit.cpp)
     target_link_libraries(brotensor_test_trace_autodiff_jit PRIVATE ${BROTENSOR_BRASS_LIB})
+
+    brotensor_add_test(brotensor_test_metal_mir_msl_emit
+        test_metal_mir_msl_emit.cpp ../src/metal/mtl_mir_builders.cpp)
+    target_link_libraries(brotensor_test_metal_mir_msl_emit PRIVATE ${BROTENSOR_BRASS_LIB})
 endif()
 # --- Bronze API test ---
 #
@@ -195,12 +199,6 @@ if(BROTENSOR_WITH_VULKAN)
         brotensor_add_executable(brotensor_bench_brass_gpu_primitives bench_brass_gpu_primitives.cpp)
         target_link_libraries(brotensor_bench_brass_gpu_primitives PRIVATE brotensor_vulkan_internal "$<BUILD_INTERFACE:brass>")
     endif()
-    # Custom kernels the way a sibling ships them (cmake/BrotensorVulkan.cmake).
-    brotensor_vulkan_add_shaders(brotensor_test_vulkan
-        NAMESPACE brotensor_test_vk HEADER brotensor_test_vk_shaders.h
-        SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_shaders"
-        SHADERS "custom_axpy|custom_axpy.comp"
-                "custom_axpy_f64|custom_axpy.comp|-DF64")
     target_compile_options(brotensor_test_vulkan PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wno-missing-field-initializers>)
     add_test(NAME brotensor_test_vulkan_default_device
              COMMAND brotensor_test_vulkan --expect-default-vulkan)

@@ -5,9 +5,6 @@
 #include <cstdlib>
 #include <stdexcept>
 
-// Declared at global scope; implemented in kernels.mm.
-extern void metal_build_pipelines_();
-
 namespace brotensor {
 
 namespace {
@@ -41,7 +38,6 @@ void cuda_init() {
         return;
     }
     init_runtime_once();
-    ::metal_build_pipelines_();
     g_initialized.store(true, std::memory_order_release);
     in_progress.store(false, std::memory_order_release);
 }
@@ -173,62 +169,6 @@ void submit(id<MTLCommandBuffer> /*cmd*/) {
 void flush() {
     commit_open();     // commit whatever is still open
     wait_committed();  // drain the GPU
-}
-
-void run_graph_sync_off(MPSGraph* g,
-                        NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds,
-                        MPSGraphTensor* result,
-                        id<MTLBuffer> result_buffer,
-                        NSUInteger result_offset_bytes,
-                        NSArray<NSNumber*>* result_shape) {
-    @autoreleasepool {
-        MPSGraphTensorData* result_td = tensor_data_for_offset(
-            result_buffer, result_offset_bytes, result_shape, MPSDataTypeFloat32);
-        MPSCommandBuffer* mps_cmd =
-            [MPSCommandBuffer commandBufferFromCommandQueue:queue()];
-        NSDictionary* results = @{ result : result_td };
-        [g encodeToCommandBuffer:mps_cmd
-                           feeds:feeds
-                targetOperations:nil
-               resultsDictionary:results
-             executionDescriptor:nil];
-        [mps_cmd commit];
-        [mps_cmd waitUntilCompleted];
-    }
-}
-
-void run_graph_sync(MPSGraph* g,
-                    NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds,
-                    MPSGraphTensor* result,
-                    id<MTLBuffer> result_buffer,
-                    NSArray<NSNumber*>* result_shape) {
-    run_graph_sync_off(g, feeds, result, result_buffer, 0, result_shape);
-}
-
-MPSGraphTensorData* tensor_data_for(id<MTLBuffer> buf,
-                                    NSArray<NSNumber*>* shape,
-                                    MPSDataType dt) {
-    return [[MPSGraphTensorData alloc] initWithMTLBuffer:buf
-                                                   shape:shape
-                                                dataType:dt];
-}
-
-MPSGraphTensorData* tensor_data_for_offset(id<MTLBuffer> buf,
-                                           NSUInteger offset_bytes,
-                                           NSArray<NSNumber*>* shape,
-                                           MPSDataType dt) {
-    if (offset_bytes == 0) {
-        return [[MPSGraphTensorData alloc] initWithMTLBuffer:buf
-                                                       shape:shape
-                                                    dataType:dt];
-    }
-    MPSShape* mpsShape = shape;
-    MPSNDArrayDescriptor* desc =
-        [MPSNDArrayDescriptor descriptorWithDataType:dt shape:mpsShape];
-    MPSNDArray* nd = [[MPSNDArray alloc] initWithBuffer:buf
-                                                 offset:offset_bytes
-                                             descriptor:desc];
-    return [[MPSGraphTensorData alloc] initWithMPSNDArray:nd];
 }
 
 } // namespace metal_impl

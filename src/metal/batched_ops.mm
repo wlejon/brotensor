@@ -1,224 +1,22 @@
+// Batched linear forward & backward on Metal backed by Brass MIR kernels
+// (Gemm/GEMV via launch_matmul_abt_mixed and NORM_COL_SUM for dB).
+
+#include "mtl_mir_cache.h"
+#include "../vulkan/shaders/op_codes.h"
+
 #include <brotensor/runtime.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 
-#import "internal.h"
 #import "fp16_matmul.h"
+#import "internal.h"
 
 namespace brotensor::detail::metal {
 
 using metal_impl::buffer_for;
 using metal_impl::buffer_offset_for;
-using metal_impl::compile_pipeline;
-using metal_impl::new_command_buffer;
-
-namespace {
-
-NSString* const kSrc = @R"msl(
-#include <metal_stdlib>
-using namespace metal;
-
-// Y[b, i] = bias[i] + sum_k W[i, k] * X[b, k]
-kernel void k_linear_fw_batched(device const float* W    [[buffer(0)]],
-                                device const float* bias [[buffer(1)]],
-                                device const float* X    [[buffer(2)]],
-                                device float*       Y    [[buffer(3)]],
-                                constant uint& B         [[buffer(4)]],
-                                constant uint& out_dim   [[buffer(5)]],
-                                constant uint& in_dim    [[buffer(6)]],
-                                uint2 gid [[thread_position_in_grid]]) {
-    uint i = gid.x; // out
-    uint b = gid.y;
-    if (b >= B || i >= out_dim) return;
-    device const float* xrow = X + b * in_dim;
-    device const float* wrow = W + i * in_dim;
-    float acc = 0.0f;
-    for (uint k = 0; k < in_dim; ++k) acc += wrow[k] * xrow[k];
-    Y[b * out_dim + i] = bias[i] + acc;
-}
-
-// dX[b, j] = sum_i W[i, j] * dY[b, i]
-kernel void k_linear_bw_batched_dx(device const float* W   [[buffer(0)]],
-                                   device const float* dY  [[buffer(1)]],
-                                   device float*       dX  [[buffer(2)]],
-                                   constant uint& B        [[buffer(3)]],
-                                   constant uint& out_dim  [[buffer(4)]],
-                                   constant uint& in_dim   [[buffer(5)]],
-                                   uint2 gid [[thread_position_in_grid]]) {
-    uint j = gid.x;
-    uint b = gid.y;
-    if (b >= B || j >= in_dim) return;
-    device const float* dY_row = dY + b * out_dim;
-    float acc = 0.0f;
-    for (uint i = 0; i < out_dim; ++i) acc += W[i * in_dim + j] * dY_row[i];
-    dX[b * in_dim + j] = acc;
-}
-
-// dW[i, j] += sum_b dY[b, i] * X[b, j]
-kernel void k_linear_bw_batched_dw(device const float* dY  [[buffer(0)]],
-                                   device const float* X   [[buffer(1)]],
-                                   device float*       dW  [[buffer(2)]],
-                                   constant uint& B        [[buffer(3)]],
-                                   constant uint& out_dim  [[buffer(4)]],
-                                   constant uint& in_dim   [[buffer(5)]],
-                                   uint2 gid [[thread_position_in_grid]]) {
-    uint j = gid.x;
-    uint i = gid.y;
-    if (i >= out_dim || j >= in_dim) return;
-    float acc = 0.0f;
-    for (uint b = 0; b < B; ++b) {
-        acc += dY[b * out_dim + i] * X[b * in_dim + j];
-    }
-    dW[i * in_dim + j] += acc;
-}
-
-// dB[i] += sum_b dY[b, i]
-kernel void k_linear_bw_batched_db(device const float* dY  [[buffer(0)]],
-                                   device float*       dB  [[buffer(1)]],
-                                   constant uint& B        [[buffer(2)]],
-                                   constant uint& out_dim  [[buffer(3)]],
-                                   uint i [[thread_position_in_grid]]) {
-    if (i >= out_dim) return;
-    float acc = 0.0f;
-    for (uint b = 0; b < B; ++b) acc += dY[b * out_dim + i];
-    dB[i] += acc;
-}
-
-// ─── FP16 variants ────────────────────────────────────────────────────────
-
-kernel void k_linear_bw_batched_dw_fp32_to_scratch(
-        device const float* dY [[buffer(0)]],
-        device const float* X  [[buffer(1)]],
-        device float*       dW_scratch [[buffer(2)]],
-        constant uint& B       [[buffer(3)]],
-        constant uint& out_dim [[buffer(4)]],
-        constant uint& in_dim  [[buffer(5)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    uint j = gid.x;
-    uint i = gid.y;
-    if (i >= out_dim || j >= in_dim) return;
-    float acc = 0.0f;
-    for (uint b = 0; b < B; ++b) {
-        acc += dY[b * out_dim + i] * X[b * in_dim + j];
-    }
-    dW_scratch[i * in_dim + j] = acc;
-}
-
-kernel void k_linear_bw_batched_db_fp16(device const half*  dY [[buffer(0)]],
-                                        device float*       dB_scratch [[buffer(1)]],
-                                        constant uint& B       [[buffer(2)]],
-                                        constant uint& out_dim [[buffer(3)]],
-                                        uint i [[thread_position_in_grid]]) {
-    if (i >= out_dim) return;
-    float acc = 0.0f;
-    for (uint b = 0; b < B; ++b) acc += float(dY[b * out_dim + i]);
-    dB_scratch[i] = acc;
-}
-
-kernel void k_linear_bw_batched_db_fp32_to_scratch(
-        device const float* dY [[buffer(0)]],
-        device float*       dB_scratch [[buffer(1)]],
-        constant uint& B       [[buffer(2)]],
-        constant uint& out_dim [[buffer(3)]],
-        uint i [[thread_position_in_grid]]) {
-    if (i >= out_dim) return;
-    float acc = 0.0f;
-    for (uint b = 0; b < B; ++b) acc += dY[b * out_dim + i];
-    dB_scratch[i] = acc;
-}
-
-kernel void k_lbb_add_fp32_into_fp16(device const float* src [[buffer(0)]],
-                                     device half*        dst [[buffer(1)]],
-                                     constant uint& n        [[buffer(2)]],
-                                     uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    dst[i] = half(float(dst[i]) + src[i]);
-}
-kernel void k_lbb_add_fp32_into_fp32(device const float* src [[buffer(0)]],
-                                     device float*       dst [[buffer(1)]],
-                                     constant uint& n        [[buffer(2)]],
-                                     uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    dst[i] += src[i];
-}
-
-// ─── BF16 variants ────────────────────────────────────────────────────────
-
-kernel void k_linear_bw_batched_db_bf16(device const bfloat* dY [[buffer(0)]],
-                                        device float*       dB_scratch [[buffer(1)]],
-                                        constant uint& B        [[buffer(2)]],
-                                        constant uint& out_dim  [[buffer(3)]],
-                                        uint i [[thread_position_in_grid]]) {
-    if (i >= out_dim) return;
-    float acc = 0.0f;
-    for (uint b = 0; b < B; ++b) acc += float(dY[b * out_dim + i]);
-    dB_scratch[i] = acc;
-}
-
-kernel void k_lbb_add_fp32_into_bf16(device const float* src [[buffer(0)]],
-                                     device bfloat*      dst [[buffer(1)]],
-                                     constant uint& n        [[buffer(2)]],
-                                     uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
-    dst[i] = bfloat(float(dst[i]) + src[i]);
-}
-)msl";
-
-#define DEF_PSO(NAME, FN) \
-    id<MTLComputePipelineState> NAME() { \
-        static dispatch_once_t once; \
-        static id<MTLComputePipelineState> pso; \
-        dispatch_once(&once, ^{ pso = compile_pipeline(kSrc, FN); }); \
-        return pso; \
-    }
-DEF_PSO(pso_lin_fw, @"k_linear_fw_batched")
-DEF_PSO(pso_lin_bw_dx, @"k_linear_bw_batched_dx")
-DEF_PSO(pso_lin_bw_dw, @"k_linear_bw_batched_dw")
-DEF_PSO(pso_lin_bw_db, @"k_linear_bw_batched_db")
-DEF_PSO(pso_lin_bw_dw_fp32_scratch, @"k_linear_bw_batched_dw_fp32_to_scratch")
-DEF_PSO(pso_lin_bw_db_fp16,  @"k_linear_bw_batched_db_fp16")
-DEF_PSO(pso_lin_bw_db_fp32_scratch, @"k_linear_bw_batched_db_fp32_to_scratch")
-DEF_PSO(pso_lbb_add_fp16,    @"k_lbb_add_fp32_into_fp16")
-DEF_PSO(pso_lbb_add_fp32,    @"k_lbb_add_fp32_into_fp32")
-DEF_PSO(pso_lin_bw_db_bf16,  @"k_linear_bw_batched_db_bf16")
-DEF_PSO(pso_lbb_add_bf16,    @"k_lbb_add_fp32_into_bf16")
-#undef DEF_PSO
-
-void dispatch1d(id<MTLComputePipelineState> pso, NSUInteger n,
-                void (^bind)(id<MTLComputeCommandEncoder>)) {
-    if (n == 0) return;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        bind(enc);
-        NSUInteger tg = [pso maxTotalThreadsPerThreadgroup];
-        if (tg > 256) tg = 256;
-        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
-}
-
-void dispatch2d(id<MTLComputePipelineState> pso, NSUInteger nx, NSUInteger ny,
-                void (^bind)(id<MTLComputeCommandEncoder>)) {
-    if (nx == 0 || ny == 0) return;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = new_command_buffer();
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        bind(enc);
-        NSUInteger w = 16, h = 16;
-        if (w > [pso threadExecutionWidth]) w = [pso threadExecutionWidth];
-        [enc dispatchThreads:MTLSizeMake(nx, ny, 1)
-        threadsPerThreadgroup:MTLSizeMake(w, h, 1)];
-        [enc endEncoding];
-        ::brotensor::metal_impl::submit(cmd);
-    }
-}
-
-} // namespace
 
 void linear_forward_batched(const Tensor& W, const Tensor& bias,
                             const Tensor& X_BD, Tensor& Y_BD) {
@@ -232,49 +30,23 @@ void linear_forward_batched(const Tensor& W, const Tensor& bias,
     const int out_dim = W.rows;
     const int in_dim  = W.cols;
     const int B       = X_BD.rows;
-    // The dtype check matters: a shape-matched Y arriving FP16 (a scratch
-    // tensor last used by a 16-bit op) must be retyped, or the FP32 kernel
-    // writes past the half-sized allocation.
     if (Y_BD.rows != B || Y_BD.cols != out_dim || Y_BD.dtype != Dtype::FP32) {
         Y_BD.resize(B, out_dim, Dtype::FP32);
     }
     if (B == 0 || out_dim == 0) return;
-    if (in_dim > 0) {
-        // Y = X @ W^T + bias on the simdgroup GEMM (gemm_fp32.mm); a 16-bit W
-        // widens to FP32 on load, so the product and sum stay FP32.
-        metal_impl::AbtMixed g;
-        g.A = buffer_for(X_BD); g.ofs_A = buffer_offset_for(X_BD); g.lda = static_cast<uint64_t>(in_dim);
-        g.B = buffer_for(W);    g.ofs_B = buffer_offset_for(W);    g.ldb = static_cast<uint64_t>(in_dim);
-        g.C = buffer_for(Y_BD); g.ofs_C = buffer_offset_for(Y_BD); g.ldc = static_cast<uint64_t>(out_dim);
-        g.bias = buffer_for(bias); g.ofs_bias = buffer_offset_for(bias);
-        g.M = B; g.N = out_dim; g.K = in_dim;
-        g.in = g.out = metal_impl::kAbtF32;
-        g.in_B = metal_impl::abt_type(W.dtype);
-        metal_impl::launch_matmul_abt_mixed(g);
-        return;
+
+    metal_impl::AbtMixed g;
+    g.A = buffer_for(X_BD); g.ofs_A = buffer_offset_for(X_BD); g.lda = static_cast<uint64_t>(in_dim);
+    g.B = buffer_for(W);    g.ofs_B = buffer_offset_for(W);    g.ldb = static_cast<uint64_t>(in_dim);
+    g.C = buffer_for(Y_BD); g.ofs_C = buffer_offset_for(Y_BD); g.ldc = static_cast<uint64_t>(out_dim);
+    if (bias.size() > 0) {
+        g.bias = buffer_for(bias);
+        g.ofs_bias = buffer_offset_for(bias);
     }
-    // in_dim == 0: Y = bias (W is never read, whatever its type).
-    id<MTLComputePipelineState> pso = pso_lin_fw();
-    id<MTLBuffer> bw = buffer_for(W);
-    NSUInteger ow = buffer_offset_for(W);
-    id<MTLBuffer> bb = buffer_for(bias);
-    NSUInteger ob = buffer_offset_for(bias);
-    id<MTLBuffer> bx = buffer_for(X_BD);
-    NSUInteger ox = buffer_offset_for(X_BD);
-    id<MTLBuffer> by = buffer_for(Y_BD);
-    NSUInteger oy = buffer_offset_for(Y_BD);
-    const uint32_t Bu = static_cast<uint32_t>(B);
-    const uint32_t Ou = static_cast<uint32_t>(out_dim);
-    const uint32_t Iu = static_cast<uint32_t>(in_dim);
-    dispatch2d(pso, out_dim, B, ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:bw offset:ow atIndex:0];
-        [enc setBuffer:bb offset:ob atIndex:1];
-        [enc setBuffer:bx offset:ox atIndex:2];
-        [enc setBuffer:by offset:oy atIndex:3];
-        [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:4];
-        [enc setBytes:&Ou length:sizeof(uint32_t) atIndex:5];
-        [enc setBytes:&Iu length:sizeof(uint32_t) atIndex:6];
-    });
+    g.M = B; g.N = out_dim; g.K = in_dim;
+    g.in = g.out = metal_impl::kAbtF32;
+    g.in_B = metal_impl::abt_type(W.dtype);
+    metal_impl::launch_matmul_abt_mixed(g);
 }
 
 void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
@@ -295,68 +67,36 @@ void linear_backward_batched(const Tensor& W, const Tensor& X_BD,
         dX_BD.resize(B, in_dim, W.dtype);
     }
     if (B == 0) return;
-    const bool is_fp16 = (W.dtype == Dtype::FP16);
-    const bool is_bf16 = (W.dtype == Dtype::BF16);
-
-    id<MTLBuffer> bw  = buffer_for(W);
-    NSUInteger ow = buffer_offset_for(W);
-    id<MTLBuffer> bx  = buffer_for(X_BD);
-    NSUInteger ox = buffer_offset_for(X_BD);
-    id<MTLBuffer> bdy = buffer_for(dY_BD);
-    NSUInteger ody = buffer_offset_for(dY_BD);
-    id<MTLBuffer> bdx = buffer_for(dX_BD);
-    NSUInteger odx = buffer_offset_for(dX_BD);
-    id<MTLBuffer> bdw = buffer_for(dW);
-    NSUInteger odw = buffer_offset_for(dW);
-    id<MTLBuffer> bdb = buffer_for(dB);
-    NSUInteger odb = buffer_offset_for(dB);
-    const uint32_t Bu = static_cast<uint32_t>(B);
-    const uint32_t Ou = static_cast<uint32_t>(out_dim);
-    const uint32_t Iu = static_cast<uint32_t>(in_dim);
 
     if (in_dim > 0 && out_dim > 0) {
-        // The simdgroup GEMM (gemm_fp32.mm): dX(B, in) = dY(B, out) @ W(out, in),
-        // then dW(out, in) += dY^T @ X (both operands read transposed), each
-        // accumulated in FP32 and rounded once into the tensor's dtype.
         const metal_impl::AbtType ty = metal_impl::abt_type(W.dtype);
         metal_impl::AbtMixed g;
-        g.A = bdy; g.ofs_A = ody; g.lda = static_cast<uint64_t>(out_dim);
-        g.B = bw;  g.ofs_B = ow;  g.ldb = static_cast<uint64_t>(in_dim); g.transB = true;
-        g.C = bdx; g.ofs_C = odx; g.ldc = static_cast<uint64_t>(in_dim);
+        g.A = buffer_for(dY_BD); g.ofs_A = buffer_offset_for(dY_BD); g.lda = static_cast<uint64_t>(out_dim);
+        g.B = buffer_for(W);     g.ofs_B = buffer_offset_for(W);     g.ldb = static_cast<uint64_t>(in_dim);
+        g.transB = true;
+        g.C = buffer_for(dX_BD); g.ofs_C = buffer_offset_for(dX_BD); g.ldc = static_cast<uint64_t>(in_dim);
         g.M = B; g.N = in_dim; g.K = out_dim;
         g.in = g.out = ty;
         metal_impl::launch_matmul_abt_mixed(g);
-        g.A = bdy; g.ofs_A = ody; g.lda = static_cast<uint64_t>(out_dim); g.transA = true;
-        g.B = bx;  g.ofs_B = ox;  g.ldb = static_cast<uint64_t>(in_dim);  g.transB = true;
-        g.C = bdw; g.ofs_C = odw; g.ldc = static_cast<uint64_t>(in_dim);
+
+        g.A = buffer_for(dY_BD); g.ofs_A = buffer_offset_for(dY_BD); g.lda = static_cast<uint64_t>(out_dim);
+        g.transA = true;
+        g.B = buffer_for(X_BD);  g.ofs_B = buffer_offset_for(X_BD);  g.ldb = static_cast<uint64_t>(in_dim);
+        g.transB = true;
+        g.C = buffer_for(dW);    g.ofs_C = buffer_offset_for(dW);    g.ldc = static_cast<uint64_t>(in_dim);
         g.M = out_dim; g.N = in_dim; g.K = B;
         g.epilogue = metal_impl::kAbtAccumulate;
         metal_impl::launch_matmul_abt_mixed(g);
     }
     if (out_dim > 0) {
-        @autoreleasepool {
-            id<MTLBuffer> scratch = [metal_impl::device()
-                newBufferWithLength:out_dim * sizeof(float)
-                            options:MTLResourceStorageModeShared];
-            id<MTLComputePipelineState> pso = is_fp16
-                ? pso_lin_bw_db_fp16()
-                : is_bf16 ? pso_lin_bw_db_bf16() : pso_lin_bw_db_fp32_scratch();
-            dispatch1d(pso, out_dim, ^(id<MTLComputeCommandEncoder> enc) {
-                [enc setBuffer:bdy offset:ody atIndex:0];
-                [enc setBuffer:scratch offset:0 atIndex:1];
-                [enc setBytes:&Bu length:sizeof(uint32_t) atIndex:2];
-                [enc setBytes:&Ou length:sizeof(uint32_t) atIndex:3];
-            });
-            const uint32_t n = static_cast<uint32_t>(out_dim);
-            id<MTLComputePipelineState> add_pso = is_fp16
-                ? pso_lbb_add_fp16()
-                : is_bf16 ? pso_lbb_add_bf16() : pso_lbb_add_fp32();
-            dispatch1d(add_pso, n, ^(id<MTLComputeCommandEncoder> enc) {
-                [enc setBuffer:scratch offset:0 atIndex:0];
-                [enc setBuffer:bdb offset:odb atIndex:1];
-                [enc setBytes:&n length:sizeof(uint32_t) atIndex:2];
-            });
-        }
+        const std::uint8_t flags = pack_norm_flags(true, false, false, false, false);
+        const MirKernel mk = mir_kernel(
+            {MirKind::Norm, std::uint32_t(NORM_COL_SUM), W.dtype, W.dtype, 1, W.dtype, flags});
+        const std::uint32_t groups = std::min<std::uint32_t>(
+            (static_cast<std::uint32_t>(out_dim) + 31u) / 32u, 65535u);
+        mir_dispatch_norm(mk, groups, "linear_backward_batched",
+                          dY_BD.data, nullptr, dB.data, nullptr, nullptr, nullptr, nullptr,
+                          static_cast<std::uint32_t>(B), static_cast<std::uint32_t>(out_dim), 0.0f, 0.0f);
     }
 }
 

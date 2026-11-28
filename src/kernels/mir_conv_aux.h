@@ -9,6 +9,7 @@
 //   op 4: col2im_f32
 //   op 5: resblock_add_nc_shift
 //   op 6: resblock_sum_hw_per_nc
+//   op 7: conv2d_splitk_fold        (accumulates += sum_s part[s, i] into dst[i])
 
 #include <brotensor/tensor.h>
 

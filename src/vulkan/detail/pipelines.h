@@ -2,10 +2,10 @@
 
 // Compute pipelines, created on first use and cached per device.
 //
-// Shaders are GLSL under src/vulkan/shaders/, compiled to SPIR-V by glslc at
-// build time and embedded in the library (the generated shader_table.h /
-// shader_table.cpp in the build tree); nothing is read from disk at run time.
-// A pipeline is identified by (ShaderId, specialisation constants, required
+// Kernels compile on demand from single-source Brass MIR (src/kernels/mir_*.{h,cpp})
+// to SPIR-V via brass::target::SpirvTarget (cached in memory and on disk); no
+// external shader compiler (glslc) is used and no shaders are read from disk.
+// A pipeline is identified by (key_id, specialisation constants, required
 // subgroup size) and created once per device.
 //
 // Descriptor-free. Every pipeline shares one VkPipelineLayout that has no
@@ -23,8 +23,8 @@
 // than returning an error (vk-spike RESULTS.md).
 
 #include "vk_fns.h"
-#include "shader_table.h"   // generated: enum class ShaderId, shader_spirv()
 
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <map>
@@ -35,12 +35,18 @@
 
 namespace brotensor::detail::vulkan {
 
+struct ShaderBlob {
+    const char* name;
+    const std::uint32_t* words;
+    std::size_t nwords;
+};
+
 class DeviceCtx;
 
 // The SPIR-V of a custom kernel (custom.cpp); throws for an unknown handle.
 ShaderBlob custom_shader_blob(std::uint32_t handle);
-// Custom kernels' cache keys sit above every ShaderId, run-time compiled
-// (trace JIT) kernels' between the two.
+// Custom kernels' cache keys sit above run-time compiled (trace / MIR JIT)
+// kernel keys.
 inline constexpr std::uint32_t kCustomKeyBase = 0x80000000u;
 inline constexpr std::uint32_t kJitKeyBase = 0x40000000u;
 
@@ -60,18 +66,8 @@ public:
     Pipelines(const Pipelines&) = delete;
     Pipelines& operator=(const Pipelines&) = delete;
 
-    // The pipeline for `id` with specialisation constants spec[0..n) bound to
-    // constant_id 0..n-1. `subgroup` != 0 requests that exact subgroup size
-    // (VK_EXT_subgroup_size_control / Vulkan 1.3; throws if unsupported).
-    const Kernel& get(ShaderId id, const std::uint32_t* spec = nullptr,
-                      std::uint32_t nspec = 0, std::uint32_t subgroup = 0);
-    const Kernel& get(ShaderId id, std::initializer_list<std::uint32_t> spec,
-                      std::uint32_t subgroup = 0) {
-        return get(id, spec.begin(), static_cast<std::uint32_t>(spec.size()), subgroup);
-    }
-
     // A custom kernel registered through vulkan::register_shader (custom.cpp),
-    // cached alongside the built-in ones.
+    // cached alongside the JIT/MIR ones.
     const Kernel& get_custom(std::uint32_t handle, const std::uint32_t* spec = nullptr,
                              std::uint32_t nspec = 0, std::uint32_t subgroup = 0);
 

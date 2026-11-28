@@ -5,15 +5,14 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
 #include <brotensor/tensor.h>
 
 // The custom-kernel surface — device(), queue(), new_command_buffer(),
 // pool_lookup[_offset](), buffer_for(), buffer_offset_for(), set_tensor(),
 // compile_pipeline() — is the public, installed half of this header. The
-// declarations below are the internal-only remainder (pool mutation, MPSGraph
-// helpers, the precompiled-pipeline cache, the cuda_* lifecycle hooks).
+// declarations below are the internal-only remainder (pool mutation,
+// compile-pipeline archive flushing, the cuda_* lifecycle hooks).
 #include <brotensor/metal_interop.h>
 
 #include <cstddef>
@@ -55,46 +54,8 @@ void  pool_release(void* data_ptr);
 id<MTLBuffer> pool_require(const void* p, NSUInteger& ofs,
                            const char* op, const char* name);
 
-// Run a single-output MPSGraph synchronously: feed the named placeholders
-// from MTLBuffers, write the result to result_buffer. Synchronous — caller
-// does not need a separate cuda_sync.
-void run_graph_sync(MPSGraph* g,
-                    NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds,
-                    MPSGraphTensor* result,
-                    id<MTLBuffer> result_buffer,
-                    NSArray<NSNumber*>* result_shape);
-void run_graph_sync_off(MPSGraph* g,
-                        NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds,
-                        MPSGraphTensor* result,
-                        id<MTLBuffer> result_buffer,
-                        NSUInteger result_offset_bytes,
-                        NSArray<NSNumber*>* result_shape);
-
-// MTLBuffer wrapper for an existing host-shared region (no copy). Used to
-// build MPSGraphTensorData for tensors pulled from the pool.
-MPSGraphTensorData* tensor_data_for(id<MTLBuffer> buf,
-                                    NSArray<NSNumber*>* shape,
-                                    MPSDataType dt = MPSDataTypeFloat32);
-MPSGraphTensorData* tensor_data_for_offset(id<MTLBuffer> buf,
-                                           NSUInteger offset_bytes,
-                                           NSArray<NSNumber*>* shape,
-                                           MPSDataType dt = MPSDataTypeFloat32);
-
-// Return the cached compute pipeline for a named MSL kernel (precompiled in
-// kernels.mm at first cuda_init()). Throws if name is unknown. (The on-demand
-// MSL-source compiler compile_pipeline() is in <brotensor/metal_interop.h>.)
-id<MTLComputePipelineState> pipeline(NSString* name);
-
 // Flush any newly compiled compute pipelines to the on-disk MTLBinaryArchive.
 void flush_pipeline_archive();
-
-// Helper to dispatch an in-process MSL kernel against a 1-D thread grid
-// covering n elements. Encodes onto a fresh command buffer and commits +
-// waits. For best latency, several launches in a row should batch onto one
-// command buffer manually rather than going through this helper.
-void dispatch1d_sync(NSString* pipeline_name,
-                     NSUInteger n,
-                     void (^bind)(id<MTLComputeCommandEncoder>));
 
 } // namespace brotensor::metal_impl
 

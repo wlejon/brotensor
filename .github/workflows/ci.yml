@@ -146,24 +146,12 @@ jobs:
 
   # ── Metal ─────────────────────────────────────────────────────────────────
   #
-  # Builds the ~80 .mm backend TUs. This is the only Apple toolchain in the
-  # loop — no development machine here runs one, so without this job a Metal
-  # change lands on inspection alone.
+  # Builds the Metal backend (100% Brass MIR -> MSL, zero raw MSL shaders and
+  # zero MPSGraph dependency) and runs the 158-executable parity suite.
+  # No local dev machine runs macOS natively on CI push, so this job verifies
+  # Objective-C++ compilation and real Apple Silicon GPU parity end-to-end.
   #
-  # ctest runs too: the GPU suite guards on is_available() and skips cleanly
-  # when the runner exposes no Metal device, so this is a build check at
-  # minimum and a real parity run when the runner has a GPU. Either way a
-  # genuine Metal parity failure fails the job rather than being silently
-  # skipped.
-  #
-  # Runner must be macos-15 or newer: src/metal/runtime.mm builds an
-  # offset-backed MPSGraphTensorData via -[MPSNDArray initWithBuffer:offset:
-  # descriptor:], which is a macOS 15 API. Against the macOS 14 SDK that
-  # selector is not declared and the TU does not compile.
-  #
-  # This is the heaviest job: the Metal backend *and* the full 158-executable
-  # test tier, on a small runner (3 vCPU / 7 GB). Hence Ninja + a pinned job
-  # count + ccache.
+  # Small runner (3 vCPU / 7 GB), so Ninja + pinned job count + ccache.
   metal:
     name: Metal · macos-15
     runs-on: macos-15

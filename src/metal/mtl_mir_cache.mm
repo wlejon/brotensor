@@ -3,37 +3,8 @@
 // Include Brass headers BEFORE Objective-C / Metal headers to avoid macro
 // collisions (Objective-C defines `NO`, <mach/machine.h> collides with enums).
 
-#include "../kernels/mir_attn_small.h"
-#include "../kernels/mir_audio.h"
-#include "../kernels/mir_conv_direct.h"
-#include "../kernels/mir_copy.h"
-#include "../kernels/mir_delta.h"
-#include "../kernels/mir_diffusion.h"
-#include "../kernels/mir_elementwise.h"
-#include "../kernels/mir_fa_bwd.h"
-#include "../kernels/mir_fa_rows.h"
-#include "../kernels/mir_gemm_simt.h"
-#include "../kernels/mir_gemv.h"
-#include "../kernels/mir_gemv_q.h"
-#include "../kernels/mir_gnorm.h"
-#include "../kernels/mir_lstm.h"
-#include "../kernels/mir_misc.h"
-#include "../kernels/mir_norm.h"
-#include "../kernels/mir_quant_helpers.h"
-#include "../kernels/mir_reduce.h"
-#include "../kernels/mir_remap.h"
-#include "../kernels/mir_resample.h"
-#include "../kernels/mir_resample_bwd.h"
-#include "../kernels/mir_rope.h"
-#include "../kernels/mir_scatter.h"
-#include "../kernels/mir_select.h"
-#include "../kernels/mir_spectral.h"
-#include "../kernels/mir_topk.h"
-#include "../kernels/mir_vision.h"
-#include "../kernels/mir_xent.h"
-
+#include "mtl_mir_builders.h"
 #include "../jit/kernel_disk_cache.h"
-#include "../vulkan/shaders/op_codes.h"
 
 #include <brass/mir/gpu_opt.hpp>
 #include <brass/mir/module.hpp>
@@ -87,17 +58,10 @@ MirCache& mir_cache() {
     return *c;
 }
 
-std::uint32_t block_for(const MirKey& k) {
-    if (k.kind == MirKind::FillBytes) return kernels::kFillBlock;
-    if (k.kind == MirKind::FaRows) return kernels::kFaRowsBlock;
-    if (k.kind == MirKind::FaBwd) return static_cast<std::uint32_t>(k.lanes);
-    return kernels::kEwBlock;
-}
-
 std::string mtl_disk_signature(const MirKey& k, std::uint32_t block) {
     char buf[128];
     const int n = std::snprintf(
-        buf, sizeof(buf), "mtl_mir:%u:%u:%u:%u:%u:%u:%u:%llx:%u:opt1",
+        buf, sizeof(buf), "mtl_mir:%u:%u:%u:%u:%u:%u:%u:%llx:%u",
         static_cast<unsigned>(k.kind), static_cast<unsigned>(k.op),
         static_cast<unsigned>(k.dt0), static_cast<unsigned>(k.dt1),
         static_cast<unsigned>(k.dt2), static_cast<unsigned>(k.lanes),
@@ -107,181 +71,25 @@ std::string mtl_disk_signature(const MirKey& k, std::uint32_t block) {
 }
 
 const MirEntry* compile_mir(const MirKey& k) {
-    const std::uint32_t blk = block_for(k);
+    const std::uint32_t blk = metal_mir_block_size(k);
     const std::string disk_sig = mtl_disk_signature(k, blk);
     auto entry = std::make_unique<MirEntry>();
     if (!jit::KernelDiskCache::instance().load_msl_kernel(disk_sig, entry->msl)) {
-    brass::Module mod("mtl_mir");
-    brass::Function* fn = nullptr;
-    switch (k.kind) {
-        case MirKind::Unary:      fn = kernels::build_unary_mir(mod, k.op, k.dt0, k.lanes); break;
-        case MirKind::Binary:     fn = kernels::build_binary_mir(mod, k.op, k.dt0, k.dt1, k.lanes); break;
-        case MirKind::ActBwd:     fn = kernels::build_act_bwd_mir(mod, k.op, k.dt0, k.lanes); break;
-        case MirKind::Bias:       fn = kernels::build_bias_mir(mod, k.op, k.dt0, k.lanes); break;
-        case MirKind::Cast:       fn = kernels::build_cast_mir(mod, k.dt0, k.dt1, k.lanes); break;
-        case MirKind::Glu:        fn = kernels::build_glu_mir(mod, k.op, k.dt0, k.dt1, k.lanes); break;
-        case MirKind::Rowvec:     fn = kernels::build_rowvec_mir(mod, k.op, k.dt0, k.lanes); break;
-        case MirKind::SumRows:    fn = kernels::build_sum_rows_mir(mod, k.dt0, k.lanes); break;
-        case MirKind::ArgmaxRows: fn = kernels::build_argmax_rows_mir(mod, k.dt0, k.flags != 0, k.lanes); break;
-        case MirKind::SumCols:    fn = kernels::build_sum_cols_mir(mod, k.dt0, k.lanes); break;
-        case MirKind::Norm:
-            fn = kernels::build_norm_mir(
-                mod, k.op, k.dt0, k.dt1, k.dt2,
-                kernels::NormMirFlags::unpack(k.flags), k.lanes);
-            break;
-        case MirKind::Rope:       fn = kernels::build_rope_mir(mod, k.op, k.flags != 0, k.dt0); break;
-        case MirKind::FillBytes:  fn = kernels::build_fill_bytes_mir(mod); break;
-        case MirKind::Copy2d:     fn = kernels::build_copy2d_mir(mod, static_cast<int>(k.op), k.lanes); break;
-        case MirKind::Transpose:  fn = kernels::build_transpose_mir(mod, static_cast<int>(k.op)); break;
-        case MirKind::ScatterAdd: fn = kernels::build_scatter_add_mir(mod, k.op, k.dt0); break;
-        case MirKind::Gnorm:      fn = kernels::build_gnorm_mir(mod, k.op, k.dt0, k.flags != 0, k.lanes); break;
-        case MirKind::Bnorm:      fn = kernels::build_bnorm_mir(mod, k.op); break;
-        case MirKind::Sampler:    fn = kernels::build_sampler_mir(mod, k.op, k.dt0, k.dt1, k.lanes); break;
-        case MirKind::Philox:     fn = kernels::build_philox_mir(mod, k.op); break;
-        case MirKind::Remap:      fn = kernels::build_remap_mir(mod, k.op, k.lanes); break;
-        case MirKind::Resample: {
-            const bool align = (k.flags & 1u) != 0;
-            const int imode = static_cast<int>(k.flags >> 1);
-            fn = kernels::build_resample_mir(mod, k.op, k.dt0, align, imode);
-            break;
+        brass::Module mod("mtl_mir");
+        brass::Function* fn = build_metal_mir_function(mod, k);
+        {
+            brass::GpuOptOptions gopt;
+            gopt.opt_level = 2;
+            gopt.enable_fma = true;
+            gopt.enable_gpu_superopt = true;
+            gopt.enable_small_loop_unroll = true;
+            gopt.enable_load_coalesce = true;
+            brass::optimize_gpu_function(*fn, mod, gopt);
         }
-        case MirKind::ResampleBwd:
-            fn = kernels::build_resample_bwd_mir(
-                mod, k.op, k.dt0, static_cast<std::uint32_t>(k.flags));
-            break;
-        case MirKind::Lstm:
-            fn = kernels::build_lstm_mir(
-                mod, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::DeltaRule:
-            fn = kernels::build_delta_rule_mir(
-                mod, k.op, static_cast<std::uint32_t>(k.flags));
-            break;
-        case MirKind::Xent:
-            fn = kernels::build_xent_mir(
-                mod, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::Topk:
-            fn = kernels::build_topk_mir(mod, k.op, k.dt0);
-            break;
-        case MirKind::SelectSample:
-            fn = kernels::build_select_sample_mir(mod, k.flags != 0);
-            break;
-        case MirKind::SelectCounter:
-            fn = kernels::build_select_counter_mir(mod);
-            break;
-        case MirKind::SelectCommit:
-            fn = kernels::build_select_commit_mir(mod);
-            break;
-        case MirKind::SelectMd:
-            fn = kernels::build_select_md_mir(
-                mod, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0);
-            break;
-        case MirKind::Misc:
-            fn = kernels::build_misc_mir(mod, k.op, k.dt0, k.flags != 0);
-            break;
-        case MirKind::Vision:
-            fn = kernels::build_vision_mir(
-                mod, k.op, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::Audio:
-            fn = kernels::build_audio_mir(
-                mod, k.op, k.dt0, static_cast<std::uint32_t>(k.flags & 0x0fu),
-                (k.flags & 0x10u) != 0);
-            break;
-        case MirKind::Spectral:
-            fn = kernels::build_spectral_mir(
-                mod, k.op, static_cast<std::uint32_t>(k.flags & 0x03u),
-                (k.flags & 0x04u) != 0, (k.flags & 0x08u) != 0);
-            break;
-        case MirKind::AttnAux:
-            fn = kernels::build_attn_aux_mir(mod, k.op, k.dt0, k.flags != 0);
-            break;
-        case MirKind::AttnBwd:
-            fn = kernels::build_attn_bwd_mir(mod, (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::FaCombine:
-            fn = kernels::build_fa_combine_mir(mod, k.dt0);
-            break;
-        case MirKind::AttnSoftmax:
-            fn = kernels::build_attn_softmax_mir(
-                mod, k.dt0, k.op, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0);
-            break;
-        case MirKind::ConvDirect:
-            fn = kernels::build_conv_direct_mir(mod, k.op, k.dt0, k.flags != 0);
-            break;
-        case MirKind::WqRows:
-            fn = kernels::build_wq_rows_mir(mod, k.op, k.dt0, k.flags != 0);
-            break;
-        case MirKind::Dequant:
-            fn = kernels::build_dequant_mir(mod, k.op, k.flags != 0);
-            break;
-        case MirKind::Gemv:
-            fn = kernels::build_gemv_mir(
-                mod, k.dt0, k.dt1, k.dt2,
-                k.op & 0x0fu, (k.op >> 4) & 0x0fu, (k.op >> 8) & 0x0fu,
-                (k.flags & 1u) != 0, (k.flags & 2u) != 0);
-            break;
-        case MirKind::GemmSimt: {
-            const auto dt_bias = static_cast<Dtype>((k.op >> 8) & 0xffu);
-            fn = kernels::build_gemm_simt_mir(
-                mod, k.dt0, k.dt1, k.dt2, dt_bias,
-                (k.flags & 1u) != 0, k.op & 0x0fu, (k.op >> 4) & 0x0fu,
-                (k.flags & 2u) != 0, (k.flags & 4u) != 0, (k.flags & 8u) != 0);
-            break;
-        }
-        case MirKind::ConvSimt: {
-            const auto byte = [&](int s) -> int { return static_cast<int>((k.aux >> (s * 8)) & 0xffu); };
-            fn = kernels::build_conv_simt_mir(
-                mod, k.dt0, (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
-                byte(0), byte(1), byte(2), byte(3), byte(4), byte(5), byte(6), byte(7),
-                k.op & 0x0fu);
-            break;
-        }
-        case MirKind::GemvQ: {
-            const std::uint32_t fmt = k.op & 0x0fu;
-            const std::uint32_t mb = (k.op >> 4) & 0x0fu;
-            const std::uint32_t lpr = k.lanes;
-            const std::uint32_t unr = (k.op >> 8) & 0x0fu;
-            const std::uint32_t nr = (k.op >> 12) & 0x0fu;
-            const std::uint32_t act = (k.op >> 16) & 0x0fu;
-            const std::uint32_t epi = (k.op >> 20) & 0x0fu;
-            fn = kernels::build_gemv_q_mir(
-                mod, k.dt0, fmt, mb, lpr, (k.flags & 1u) != 0, (k.flags & 2u) != 0,
-                unr, nr, act, epi);
-            break;
-        }
-        case MirKind::FaRows:
-            fn = kernels::build_fa_rows_mir(
-                mod, k.dt0, k.op, k.lanes, static_cast<std::uint32_t>(k.aux),
-                (k.flags & 1u) != 0, (k.flags & 2u) != 0, (k.flags & 4u) != 0,
-                (k.flags & 8u) != 0, (k.flags & 16u) != 0);
-            break;
-        case MirKind::FaBwd: {
-            const std::uint32_t hd = k.op & 0xffffu;
-            const std::uint32_t hdp = (k.op >> 16) & 0xffffu;
-            const std::uint32_t br = static_cast<std::uint32_t>(k.aux & 0xffffu);
-            const std::uint32_t bc = static_cast<std::uint32_t>((k.aux >> 16) & 0xffffu);
-            const std::uint32_t mode = k.flags & 0x0fu;
-            const bool has_mask = (k.flags & 0x10u) != 0;
-            const std::uint32_t pass = (k.flags >> 5) & 0x01u;
-            fn = kernels::build_fa_bwd_mir(mod, k.dt0, k.lanes, hd, hdp, br, bc, mode, has_mask, pass);
-            break;
-        }
-    }
-    {
-        brass::GpuOptOptions gopt;
-        gopt.opt_level = 2;
-        gopt.enable_fma = true;
-        gopt.enable_gpu_superopt = true;
-        gopt.enable_small_loop_unroll = true;
-        gopt.enable_load_coalesce = true;
-        brass::optimize_gpu_function(*fn, mod, gopt);
-    }
-    brass::target::MslOptions opts;
-    opts.workgroup_x = blk;
-    entry->msl = brass::target::MslTarget::compile(*fn, opts);
-    jit::KernelDiskCache::instance().store_msl_kernel(disk_sig, entry->msl);
+        brass::target::MslOptions opts;
+        opts.workgroup_x = blk;
+        entry->msl = brass::target::MslTarget::compile(*fn, opts);
+        jit::KernelDiskCache::instance().store_msl_kernel(disk_sig, entry->msl);
     }
     @autoreleasepool {
         NSString* src = [NSString stringWithUTF8String:entry->msl.source.c_str()];

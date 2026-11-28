@@ -2,8 +2,8 @@
 // Multi-Backend Randomized Numerical Adjoint Dot-Product Oracle.
 //
 // Exercises:
-//   1. Direct static lifter proofs over the shipped Vulkan SPIR-V binaries in
-//      `shader_table.h` (`brass::spirv::parse_binary`, `verify_spirv_structural`,
+//   1. Direct static lifter proofs over Brass MIR SPIR-V binaries
+//      (`brass::spirv::parse_binary`, `verify_spirv_structural`,
 //      `prove_spirv_shader_safety`, `PhysicalStorageBuffer64` & `PushConstant`
 //      bounds-guard CFG inspection) plus lowered PTX equivalence & safety proofs
 //      (`verify_spirv_ptx_equivalence`, `verify_ptx_equivalence`,

@@ -119,10 +119,9 @@ std::uint32_t bn_groups(int C) {
 
 }  // namespace
 
-void group_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta,
-                        int N, int C, int H, int W, int num_groups, float eps,
-                        Tensor& Y) {
-    const char* op = "group_norm_forward";
+void group_norm_forward_impl(const Tensor& X, const Tensor& gamma, const Tensor& beta,
+                             int N, int C, int H, int W, int num_groups, float eps,
+                             bool silu, const char* op, Tensor& Y) {
     require_fp(X.dtype, op);
     need(op, N >= 0 && C > 0 && H >= 0 && W >= 0, "bad dimension");
     need(op, num_groups > 0 && C % num_groups == 0, "num_groups must divide C");
@@ -146,8 +145,22 @@ void group_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta
     const int lanes = gn_vec4_lanes(X.dtype, pc.hw, pc.chunk, X.data, Y.data);
     const std::uint32_t gx =
         static_cast<std::uint32_t>(std::clamp<std::uint64_t>(cdiv(tile, 256 * 16), 1, 1024));
-    dispatch_gn(op, GN_APPLY, X.dtype, false, lanes, gx,
+    dispatch_gn(op, GN_APPLY, X.dtype, silu, lanes, gx,
                 static_cast<std::uint32_t>(tiles), pc);
+}
+
+void group_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta,
+                        int N, int C, int H, int W, int num_groups, float eps,
+                        Tensor& Y) {
+    group_norm_forward_impl(X, gamma, beta, N, C, H, W, num_groups, eps, false,
+                            "group_norm_forward", Y);
+}
+
+void group_norm_silu_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta,
+                             int N, int C, int H, int W, int num_groups, float eps,
+                             Tensor& Y) {
+    group_norm_forward_impl(X, gamma, beta, N, C, H, W, num_groups, eps, true,
+                            "group_norm_silu_forward", Y);
 }
 
 void group_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& dY,

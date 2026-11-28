@@ -19,7 +19,10 @@ file(GLOB_RECURSE _files RELATIVE "${BROTENSOR_ROOT}"
     "${BROTENSOR_ROOT}/src/jit/spirv_emit*"
     "${BROTENSOR_ROOT}/src/jit/msl_emit*"
     "${BROTENSOR_ROOT}/src/cuda/cu_mir_builders.*"
-    "${BROTENSOR_ROOT}/src/cuda/cu_mir_cache.*")
+    "${BROTENSOR_ROOT}/src/cuda/cu_mir_cache.*"
+    "${BROTENSOR_ROOT}/src/metal/mtl_mir_builders.*"
+    "${BROTENSOR_ROOT}/src/metal/mtl_mir_cache.*"
+    "${BROTENSOR_ROOT}/src/vulkan/vk_mir_cache.*")
 list(SORT _files)
 set(_material "")
 foreach(_f IN LISTS _files)
