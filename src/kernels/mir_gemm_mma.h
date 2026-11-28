@@ -31,7 +31,7 @@ constexpr GemmMmaCfg kGemmMmaCfgs[4] = {
 struct GemmMmaSpec {
     Dtype dt = Dtype::FP16;
     std::uint8_t cfg = 0;       // 0..3
-    std::uint8_t epi = 0;       // 0=store, 1=accumulate, 2=geglu
+    std::uint8_t epi = 0;       // 0=store, 1=accumulate, 2=geglu, 3=swiglu
     std::uint8_t act = 0;       // 0..5 (LinearActivation)
     bool has_bias = false;
     bool has_partial = false;

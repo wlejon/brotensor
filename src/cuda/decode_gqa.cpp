@@ -70,6 +70,7 @@ std::uint8_t encode_g(int g) {
 }  // namespace
 
 bool supported(int head_dim, int group) {
+    if (!supports_sm80()) return false;
     return (head_dim == 64 || head_dim == 128 || head_dim == 256) &&
            (group == 1 || group == 2 || group == 4 || group == 8);
 }

@@ -134,8 +134,8 @@ void launch_mir_gemm_mma(Dtype dt, const void* a, const void* w, void* c,
                          int m, int n, int k, const void* bias,
                          int act, int epi, float* ws, std::size_t ws_floats,
                          int sms, bool fast_accum) {
-    if (m > 0 && m <= 8 && n > 0 && k > 0 && (epi == 0 || epi == 1 || epi == 2)) {
-        const int ldc = (epi == 2) ? (n / 2) : n;
+    if (m > 0 && m <= 8 && n > 0 && k > 0 && epi >= 0 && epi <= 3) {
+        const int ldc = (epi >= 2) ? (n / 2) : n;
         dispatch_mir_gemv(a, dt, w, dt, c, dt, bias, m, n, k, k, k, ldc, epi, act);
         return;
     }

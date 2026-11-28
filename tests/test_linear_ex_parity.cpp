@@ -138,11 +138,18 @@ BT_PARITY_TEST(fallback_odd_k) {
 }
 
 BT_PARITY_TEST(swiglu_parity) {
-    // Skinny GEMV SwiGLU (M <= 8) and general prefill SwiGLU
+    // Skinny GEMV SwiGLU (M <= 8), skinny MMA (9..64), and register-fused MMA (M > 64)
     check(1, 256, 128, 0, kSwiglu, false, false, Dtype::FP16, 0x61);
     check(2, 512, 256, 0, kSwiglu, false, false, Dtype::BF16, 0x62);
     check(8, 128, 64, 0, kSwiglu, false, false, Dtype::FP16, 0x63);
     check(32, 256, 128, 0, kSwiglu, false, false, Dtype::FP16, 0x64);
+    check(256, 1024, 512, 0, kSwiglu, true, false, Dtype::FP16, 0x65);
+    check(256, 1024, 512, 0, kSwiglu, true, true, Dtype::FP16, 0x66);
+    check(300, 776, 264, 0, kSwiglu, true, true, Dtype::FP16, 0x67);
+    check(700, 1536, 512, 0, kSwiglu, true, true, Dtype::BF16, 0x68);
+    check(2100, 1536, 256, 0, kSwiglu, true, false, Dtype::BF16, 0x69);
+    check(112, 1024, 2624, 0, kSwiglu, true, true, Dtype::FP16, 0x6a);
+    check(300, 1536, 1024, 0, kSwiglu | kFast, true, false, Dtype::FP16, 0x6b);
 }
 
 // M = 9..64 take the weight-streaming tensor-core kernel (gemm_skinny.cu):

@@ -109,6 +109,7 @@ void launch_common(Dtype dt, const void* Q, const void* K, const void* V, const 
 }  // namespace
 
 bool supported(int head_dim) {
+    if (!brotensor::detail::cuda::supports_sm80()) return false;
     switch (head_dim) {
         case 16: case 32: case 40: case 56: case 64: case 72: case 80: case 96: case 112:
         case 128: case 160:

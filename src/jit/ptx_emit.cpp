@@ -13,7 +13,7 @@ brass::target::PtxOptions ptx_opts_for(const std::string& arch) {
     brass::target::PtxOptions opts;
     opts.sm_arch = arch.empty() ? "sm_80" : arch;
     opts.ptx_version_major = 7;
-    opts.ptx_version_minor = 8;
+    opts.ptx_version_minor = (opts.sm_arch == "sm_80") ? 4u : 0u;
     opts.cleanup = true;
     return opts;
 }

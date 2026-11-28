@@ -68,6 +68,7 @@ Function* build_gemm_mma_mir(Module& mod, const GemmMmaSpec& spec) {
     const int num_accs = mt * nt;
     const int a_stage_bytes = bm * static_cast<int>(kMmaBk) * 2;
     const int b_stage_bytes = bn * static_cast<int>(kMmaBk) * 2;
+    const bool swiglu_inline = (spec.epi == 3u && !spec.has_partial);
 
     std::vector<Type> param_types = {
         Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(), Type::ptr(),
@@ -132,6 +133,11 @@ Function* build_gemm_mma_mir(Module& mod, const GemmMmaSpec& spec) {
     }
     Value* m0 = c.b.build_mul(tile_m, c.i32(bm));
     Value* n0 = c.b.build_mul(tile_n, c.i32(bn));
+    Value* N_half = (swiglu_inline || (spec.epi == 2 && !spec.has_partial))
+                        ? c.b.build_lshr(N, c.i32(1))
+                        : nullptr;
+    const int bn_half = bn / 2;
+    Value* n0_half = swiglu_inline ? c.b.build_mul(tile_n, c.i32(bn_half)) : nullptr;
 
     Value* kt_all = c.b.build_lshr(c.b.build_add(K, c.i32(31)), c.i32(5));
     Value* KT = kt_all;
@@ -177,11 +183,24 @@ Function* build_gemm_mma_mir(Module& mod, const GemmMmaSpec& spec) {
         Value* row = c.b.build_lshr(lin, c.i32(2));
         Value* ch = c.b.build_and(lin, c.i32(3));
         b_s_off[iu] = c.b.build_add(sB_base, swz_bytes(c, row, ch));
-        Value* gr = c.b.build_add(n0, row);
         Value* gk0 = c.b.build_shl(ch, c.i32(3));
+        Value* gr = nullptr;
+        Value* valid_lim_cond = nullptr;
+        if (swiglu_inline) {
+            Value* w_col = c.b.build_lshr(row, c.i32(5));
+            Value* in_w = c.b.build_and(row, c.i32(31));
+            Value* is_up = c.b.build_ne(c.b.build_and(in_w, c.i32(16)), c.i32(0));
+            Value* loc_out = c.b.build_or(c.b.build_shl(w_col, c.i32(4)), c.b.build_and(in_w, c.i32(15)));
+            Value* out_col = c.b.build_add(n0_half, loc_out);
+            gr = c.b.build_select(is_up, c.b.build_add(N_half, out_col), out_col);
+            if (!spec.aligned_mnk) valid_lim_cond = c.b.build_slt(out_col, N_half);
+        } else {
+            gr = c.b.build_add(n0, row);
+            if (!spec.aligned_mnk) valid_lim_cond = c.b.build_slt(gr, N);
+        }
         b_g_base[iu] = ptr_2d_i64(c, W_split, gr, K, gk0, 1);
         if (!spec.aligned_mnk) {
-            Value* bit = c.b.build_select(c.b.build_slt(gr, N), c.i32(1 << (a_chunks + i)), c.i32(0));
+            Value* bit = c.b.build_select(valid_lim_cond, c.i32(1 << (a_chunks + i)), c.i32(0));
             row_ok_mask = c.b.build_or(row_ok_mask, bit);
         }
     }
@@ -422,8 +441,54 @@ Function* build_gemm_mma_mir(Module& mod, const GemmMmaSpec& spec) {
         Value* mn64 = c.b.build_mul(c.b.build_zext_i64(M), c.b.build_zext_i64(N));
         p_base = c.b.build_add(p[4], c.b.build_shl(c.b.build_mul(z64, mn64), kb.const_i64(2)));
     }
-    Value* N_half = (spec.epi == 2 && !spec.has_partial) ? c.b.build_lshr(N, c.i32(1)) : nullptr;
 
+    if (swiglu_inline) {
+        const int wn_half = wn / 2;
+        Value* wn_half_base = c.b.build_mul(w_n, c.i32(wn_half));
+        for (int j = 0; j < nt / 2; ++j) {
+            Value* col = c.b.build_add(c.b.build_add(n0_half, wn_half_base), c.b.build_add(c.i32(j * 8), t2));
+            auto emit_col = [&] {
+                Value* bg0 = nullptr;
+                Value* bg1 = nullptr;
+                Value* bu0 = nullptr;
+                Value* bu1 = nullptr;
+                if (spec.has_bias) {
+                    Value* bgp = ptr_at(c, p[3], col, 2);
+                    Value* bup = ptr_at(c, p[3], c.b.build_add(N_half, col), 2);
+                    std::tie(bg0, bg1) = unpack_pair_f32(c, spec.dt, kb.load_i32(bgp));
+                    std::tie(bu0, bu1) = unpack_pair_f32(c, spec.dt, kb.load_i32(bup));
+                }
+                for (int i = 0; i < mt; ++i) {
+                    Value* frag_g = accs[static_cast<std::size_t>(i * nt + j)];
+                    Value* frag_u = accs[static_cast<std::size_t>(i * nt + j + nt / 2)];
+                    for (int h = 0; h < 2; ++h) {
+                        Value* row = c.b.build_add(c.b.build_add(m0, wm_base),
+                                                   c.b.build_add(c.i32(i * 16 + h * 8), g));
+                        Value* g0 = c.b.build_vextract_lane(frag_g, 2 * h);
+                        Value* g1 = c.b.build_vextract_lane(frag_g, 2 * h + 1);
+                        Value* u0 = c.b.build_vextract_lane(frag_u, 2 * h);
+                        Value* u1 = c.b.build_vextract_lane(frag_u, 2 * h + 1);
+                        auto emit_store = [&] {
+                            if (spec.has_bias) {
+                                g0 = c.b.build_add(g0, bg0);
+                                g1 = c.b.build_add(g1, bg1);
+                                u0 = c.b.build_add(u0, bu0);
+                                u1 = c.b.build_add(u1, bu1);
+                            }
+                            Value* y0 = c.b.build_mul(emit_gemm_act(c, 4, g0), u0);
+                            Value* y1 = c.b.build_mul(emit_gemm_act(c, 4, g1), u1);
+                            Value* dst_c = ptr_2d_i64(c, C_in, row, N_half, col, 1);
+                            kb.store_i32(dst_c, pack_pair_i32(c, spec.dt, y0, y1));
+                        };
+                        if (spec.aligned_mnk) emit_store();
+                        else kb.if_then(c.b.build_slt(row, M), emit_store);
+                    }
+                }
+            };
+            if (spec.aligned_mnk) emit_col();
+            else kb.if_then(c.b.build_slt(col, N_half), emit_col);
+        }
+    } else {
     for (int j = 0; j < nt; ++j) {
         Value* col = c.b.build_add(c.b.build_add(n0, wn_base), c.b.build_add(c.i32(j * 8), t2));
         auto emit_col = [&] {
@@ -477,6 +542,7 @@ Function* build_gemm_mma_mir(Module& mod, const GemmMmaSpec& spec) {
         };
         if (spec.aligned_mnk) emit_col();
         else kb.if_then(c.b.build_slt(col, N), emit_col);
+    }
     }
 
     c.b.build_ret_void();

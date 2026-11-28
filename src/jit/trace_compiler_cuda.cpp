@@ -95,11 +95,9 @@ std::shared_ptr<TraceHandleImpl> compile_elementwise(const TraceDAG& dag,
         KernelDiskCache::instance().store_ptx(disk_sig, ptx_src);
     }
 
-    // One key per entry: the engine caches CUfunctions, not modules.
-    CUfunction fn_vec =
-        CudaJitEngine::instance().get_function(key + ":v", ptx_src, ptx::kEntryVec);
-    CUfunction fn_sca =
-        CudaJitEngine::instance().get_function(key + ":s", ptx_src, ptx::kEntryScalar);
+    // One module compile for both vector and scalar entries.
+    auto [fn_vec, fn_sca] = CudaJitEngine::instance().get_function_pair(
+        key + ":v", ptx::kEntryVec, key + ":s", ptx::kEntryScalar, ptx_src);
 
     const int lanes = plan.vec;
     const std::int64_t numel = plan.numel;
@@ -171,10 +169,8 @@ std::shared_ptr<TraceHandleImpl> compile_row_norm(const TraceDAG& dag,
         KernelDiskCache::instance().store_ptx(disk_sig, ptx_src);
     }
 
-    CUfunction fn_vec =
-        CudaJitEngine::instance().get_function(key + ":v", ptx_src, ptx::kEntryRowNorm);
-    CUfunction fn_sca =
-        CudaJitEngine::instance().get_function(key + ":s", ptx_src, ptx::kEntryRowNormScalar);
+    auto [fn_vec, fn_sca] = CudaJitEngine::instance().get_function_pair(
+        key + ":v", ptx::kEntryRowNorm, key + ":s", ptx::kEntryRowNormScalar, ptx_src);
 
     const int rows = plan.ew.rows;
     const int cols = plan.ew.cols;

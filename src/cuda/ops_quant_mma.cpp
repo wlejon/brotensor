@@ -29,6 +29,7 @@ bool launch_quant_gemm_mma(std::uint8_t fmt, Dtype dt,
                            const void* X, const uint8_t* W, const float* scales,
                            const void* bias, void* Y,
                            int B, int M, int K, int row_bytes) {
+    if (!supports_sm80()) return false;
     const std::uint8_t cfg = (B > 64) ? 1u : 0u;
     const int bm = static_cast<int>(kernels::kGemmQuantMmaCfgs[cfg].bm);
     const int bn = static_cast<int>(kernels::kGemmQuantMmaCfgs[cfg].bn);

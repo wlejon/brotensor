@@ -1,10 +1,10 @@
 // linear_forward_batched_ex — 16-bit batched linear with a fused epilogue
 // (store / residual accumulate / GeGLU / SwiGLU) and optional split-K
-// workspace. One to eight rows take the skinny GEMV below (decode); 9..64 rows
-// the weight-streaming tensor-core kernel in gemm_skinny.cu (every epilogue
-// fused); wider batches run on the mma.sync GEMM in gemm_mma.cu; shapes that kernel refuses
-// (K or N not a multiple of 8, pre-sm_80) and SwiGLU fall back to a stored
-// result plus an elementwise epilogue pass. CPU twin in
+// workspace. One to eight rows take the skinny GEMV kernel (decode); 9..64 rows
+// the weight-streaming tensor-core kernel in mir_gemm_skinny (every epilogue
+// fused); wider batches run on the Brass MIR mma.sync GEMM (mir_gemm_mma) with
+// every epilogue fused in registers; shapes with K or N not a multiple of 8
+// or pre-sm_80 fall back to SIMT GEMM + optional epilogue. CPU twin in
 // src/cpu/packed_encoder.cpp.
 
 #include <cstdint>
@@ -88,19 +88,10 @@ void run(const ::brotensor::Tensor& W, const ::brotensor::Tensor* bias, const ::
             ws_n = static_cast<std::size_t>(ws->rows) * ws->cols;
         }
     }
-    if (epi != 3 && mma_gemm::launch(static_cast<const T*>(X.data), static_cast<const T*>(W.data),
-                                     static_cast<T*>(Y.data), M, N, K, bp, act, epi, wsp, ws_n, cur_stream(),
-                                     acc_mode))
+    if (mma_gemm::launch(static_cast<const T*>(X.data), static_cast<const T*>(W.data),
+                         static_cast<T*>(Y.data), M, N, K, bp, act, epi, wsp, ws_n, cur_stream(),
+                         acc_mode))
         return;
-    if (epi == 3) {
-        ::brotensor::Tensor r = ::brotensor::Tensor::empty_on(W.device, M, N, W.dtype);
-        if (mma_gemm::launch(static_cast<const T*>(X.data), static_cast<const T*>(W.data),
-                             static_cast<T*>(r.data), M, N, K, bp, act, 0, wsp, ws_n, cur_stream(),
-                             acc_mode)) {
-            dispatch_mir_swiglu(r, Y, M, N);
-            return;
-        }
-    }
     dispatch_mir_gemm_simt(X.data, W.dtype, W.data, W.dtype, Y.data, W.dtype, bp, W.dtype,
                            1, M, N, K, K, K, out_cols, 0, 0, 0,
                            false, false, epi, act, W.device);

@@ -142,6 +142,16 @@ void ensure_context(int dev = -1);
 int device_count();
 int device_attribute(int dev, CUdevice_attribute attr);
 
+inline bool supports_sm80(int dev = -1) {
+    static int cached_major[16] = {};
+    if (dev < 0) dev = current_device();
+    if (dev < 0 || dev >= 16) dev = 0;
+    if (cached_major[dev] == 0) {
+        cached_major[dev] = device_attribute(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
+    }
+    return cached_major[dev] >= 8;
+}
+
 CUresult memcpy_d2d_async(void* dst, const void* src, std::size_t bytes, CUstream stream);
 CUresult memcpy_d2h_async(void* dst, const void* src, std::size_t bytes, CUstream stream);
 CUresult memcpy_2d_d2d_async(void* dst, std::size_t dst_pitch,

@@ -82,7 +82,13 @@ CUfunction compile_mir(const MirKey& k, int dev) {
     (void)k;
     throw std::runtime_error("brotensor: Brass CUDA JIT is required for CUDA MIR kernels");
 #else
-    brass::target::PtxOptions ptx_opts = jit::make_ptx_opts();
+    const bool needs_sm80 =
+        k.kind == MirKind::GemmMma || k.kind == MirKind::GemmMmaNn ||
+        k.kind == MirKind::GemmSkinny || k.kind == MirKind::GemmQuantMma ||
+        k.kind == MirKind::Conv2dInt8wMma || k.kind == MirKind::Conv2dMma ||
+        k.kind == MirKind::DecodeGqa || k.kind == MirKind::FaFusedMma ||
+        k.kind == MirKind::FaPackedMma;
+    brass::target::PtxOptions ptx_opts = jit::make_ptx_opts(dev, needs_sm80);
     configure_mir_ptx_options(k, ptx_opts);
     const std::string mem_key = key_string_for(k);
     std::string disk_sig = mem_key + ":" + ptx_opts.sm_arch + ":opt1";
@@ -90,41 +96,45 @@ CUfunction compile_mir(const MirKey& k, int dev) {
         disk_sig += ":nt" + std::to_string(ptx_opts.maxntid[0]) +
                     "_mc" + std::to_string(ptx_opts.minnctapersm);
     }
-    std::string ptx;
-    std::string fn_name = mem_key;
-    if (!brotensor::jit::KernelDiskCache::instance().load_ptx(disk_sig, ptx)) {
-    brass::Module mod("cu_mir");
-    brass::Function* fn = build_mir_kernel(mod, k);
-    {
-        brass::GpuOptOptions gopt;
-        gopt.opt_level = 2;
-        gopt.enable_fma = true;
-        gopt.enable_gpu_superopt = true;
-        const bool mma_loop = (k.kind == MirKind::GemmMma || k.kind == MirKind::GemmMmaNn ||
-                               k.kind == MirKind::GemmSkinny || k.kind == MirKind::GemmQuantMma ||
-                               k.kind == MirKind::Conv2dInt8wMma || k.kind == MirKind::Conv2dMma ||
-                               k.kind == MirKind::Conv2dIgemmF32 || k.kind == MirKind::DecodeGqa ||
-                               k.kind == MirKind::FaFusedMma || k.kind == MirKind::FaPackedMma ||
-                               k.kind == MirKind::FaVarlenF32);
-        gopt.enable_small_loop_unroll = !mma_loop;
-        gopt.enable_load_coalesce = !mma_loop;
-        brass::optimize_gpu_function(*fn, mod, gopt);
-    }
-    fn_name = std::string(fn->name());
-    ptx = brass::target::PtxTarget::emit_function(*fn, ptx_opts);
-    brotensor::jit::KernelDiskCache::instance().store_ptx(disk_sig, ptx);
-    } else {
-        const std::size_t pos = ptx.find(".visible .entry ");
-        if (pos != std::string::npos) {
-            const std::size_t start = pos + 16;
-            const std::size_t end = ptx.find('(', start);
-            if (end != std::string::npos && end > start) {
-                fn_name = ptx.substr(start, end - start);
+    auto& jit_eng = jit::CudaJitEngine::for_device(dev);
+    CUfunction cu_fn = jit_eng.try_load_direct_cubin(mem_key, disk_sig);
+    if (!cu_fn) {
+        std::string ptx;
+        std::string fn_name = mem_key;
+        if (!brotensor::jit::KernelDiskCache::instance().load_ptx(disk_sig, ptx)) {
+            brass::Module mod("cu_mir");
+            brass::Function* fn = build_mir_kernel(mod, k);
+            {
+                brass::GpuOptOptions gopt;
+                gopt.opt_level = 2;
+                gopt.enable_fma = true;
+                gopt.enable_gpu_superopt = true;
+                const bool mma_loop =
+                    (k.kind == MirKind::GemmMma || k.kind == MirKind::GemmMmaNn ||
+                     k.kind == MirKind::GemmSkinny || k.kind == MirKind::GemmQuantMma ||
+                     k.kind == MirKind::Conv2dInt8wMma || k.kind == MirKind::Conv2dMma ||
+                     k.kind == MirKind::Conv2dIgemmF32 || k.kind == MirKind::DecodeGqa ||
+                     k.kind == MirKind::FaFusedMma || k.kind == MirKind::FaPackedMma ||
+                     k.kind == MirKind::FaVarlenF32);
+                gopt.enable_small_loop_unroll = !mma_loop;
+                gopt.enable_load_coalesce = !mma_loop;
+                brass::optimize_gpu_function(*fn, mod, gopt);
+            }
+            fn_name = std::string(fn->name());
+            ptx = brass::target::PtxTarget::emit_function(*fn, ptx_opts);
+            brotensor::jit::KernelDiskCache::instance().store_ptx(disk_sig, ptx);
+        } else {
+            const std::size_t pos = ptx.find(".visible .entry ");
+            if (pos != std::string::npos) {
+                const std::size_t start = pos + 16;
+                const std::size_t end = ptx.find('(', start);
+                if (end != std::string::npos && end > start) {
+                    fn_name = ptx.substr(start, end - start);
+                }
             }
         }
+        cu_fn = jit_eng.get_function_cached(mem_key, disk_sig, ptx, fn_name);
     }
-    CUfunction cu_fn = jit::CudaJitEngine::for_device(dev).get_function(
-        mem_key, ptx, fn_name);
 
     MirCache& cache = mir_cache(dev);
     std::lock_guard<std::mutex> lk(cache.mu);

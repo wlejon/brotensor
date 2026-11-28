@@ -1,6 +1,7 @@
 #include <brotensor/tensor.h>
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "ops_fa_mir.h"
 
 #include <array>
@@ -41,7 +42,7 @@ void flash_attention_packed_qkv_forward(const ::brotensor::Tensor& QKV, const ::
     if (O.rows != L || O.cols != D || O.dtype != dt) O.resize(L, D, dt);
     if (L == 0) return;
 
-    if ((dt == Dtype::FP16 || dt == Dtype::BF16) && hd == kPkHd) {
+    if ((dt == Dtype::FP16 || dt == Dtype::BF16) && hd == kPkHd && supports_sm80()) {
         CUfunction fn = mir_function({MirKind::FaPackedMma, 0u, dt, dt, 1u});
         const int hw = window > 0 ? window / 2 : -1;
         const float scale_log2 = kLog2e / std::sqrt(static_cast<float>(hd));
