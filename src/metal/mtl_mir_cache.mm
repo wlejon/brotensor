@@ -78,12 +78,19 @@ const MirEntry* compile_mir(const MirKey& k) {
         brass::Module mod("mtl_mir");
         brass::Function* fn = build_metal_mir_function(mod, k);
         {
+            // Apple's LLVM Metal compiler runs full optimization over emitted MSL;
+            // keep Brass deterministic MIR optimization (CSE, GVN, LICM, fdiv-pow2, FMA)
+            // at opt_level=1 to avoid multi-minute SMT/SAT superopt compile stalls on large kernels,
+            // and skip unroll/coalesce on already tiled/vectorized GEMM/Conv/Attention kernels.
+            const bool tiled =
+                (k.kind == MirKind::GemmCm || k.kind == MirKind::ConvCm ||
+                 k.kind == MirKind::GemmSimt || k.kind == MirKind::ConvSimt ||
+                 k.kind == MirKind::FaRows || k.kind == MirKind::FaBwd);
             brass::GpuOptOptions gopt;
-            gopt.opt_level = 2;
+            gopt.opt_level = 1;
             gopt.enable_fma = true;
-            gopt.enable_gpu_superopt = true;
-            gopt.enable_small_loop_unroll = true;
-            gopt.enable_load_coalesce = true;
+            gopt.enable_small_loop_unroll = !tiled;
+            gopt.enable_load_coalesce = !tiled;
             brass::optimize_gpu_function(*fn, mod, gopt);
         }
         brass::target::MslOptions opts;

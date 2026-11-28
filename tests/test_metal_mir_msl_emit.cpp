@@ -83,12 +83,15 @@ std::string emit_verified_msl(const std::string& label, const MirKey& k) {
     check(fn != nullptr, label + ": build_metal_mir_function returned null");
     if (!fn) return {};
 
+    const bool tiled =
+        (k.kind == MirKind::GemmCm || k.kind == MirKind::ConvCm ||
+         k.kind == MirKind::GemmSimt || k.kind == MirKind::ConvSimt ||
+         k.kind == MirKind::FaRows || k.kind == MirKind::FaBwd);
     brass::GpuOptOptions gopt;
-    gopt.opt_level = 2;
+    gopt.opt_level = 1;
     gopt.enable_fma = true;
-    gopt.enable_gpu_superopt = true;
-    gopt.enable_small_loop_unroll = true;
-    gopt.enable_load_coalesce = true;
+    gopt.enable_small_loop_unroll = !tiled;
+    gopt.enable_load_coalesce = !tiled;
     brass::optimize_gpu_function(*fn, mod, gopt);
 
     brass::target::MslOptions opts;
@@ -181,6 +184,30 @@ int main() {
          MirKey{MirKind::GemmCm, 2u | (EPI_STORE << 4), Dtype::FP16, Dtype::FP16, 1, Dtype::FP16,
                 4u | 16u, 0},
          "simdgroup_multiply_accumulate("},
+        {"GemmCm fp16 cfg2 direct swiglu",
+         MirKey{MirKind::GemmCm, 2u | (EPI_SWIGLU << 4), Dtype::FP16, Dtype::FP16, 1, Dtype::FP16,
+                4u | 8u | 16u, 0},
+         "simdgroup_store("},
+        {"GemmCm fp16 cfg2 int8 direct",
+         MirKey{MirKind::GemmCm, 2u | (EPI_STORE << 4) | (QF_INT8 << 12),
+                Dtype::FP16, Dtype::FP16, 1, Dtype::FP16, 4u | 8u | 16u, 0},
+         "simdgroup_multiply_accumulate("},
+        {"GemmCm fp16 cfg2 fp8",
+         MirKey{MirKind::GemmCm, 2u | (EPI_STORE << 4) | (QF_FP8 << 12),
+                Dtype::FP16, Dtype::FP16, 1, Dtype::FP16, 4u | 16u, 0},
+         "simdgroup_multiply_accumulate("},
+        {"GemmCm fp16 cfg3 q8_0",
+         MirKey{MirKind::GemmCm, 3u | (EPI_STORE << 4) | (QF_Q8_0 << 12),
+                Dtype::FP16, Dtype::FP16, 1, Dtype::FP16, 4u | 8u | 16u, 0},
+         "simdgroup_multiply_accumulate("},
+        {"GemmCm fp16 cfg3 q4k",
+         MirKey{MirKind::GemmCm, 3u | (EPI_STORE << 4) | (QF_Q4K << 12),
+                Dtype::FP16, Dtype::FP16, 1, Dtype::FP16, 4u | 8u | 16u, 0},
+         "simdgroup_multiply_accumulate("},
+        {"GemmCm fp16 cfg3 q6k",
+         MirKey{MirKind::GemmCm, 3u | (EPI_STORE << 4) | (QF_Q6K << 12),
+                Dtype::FP16, Dtype::FP16, 1, Dtype::FP16, 4u | 8u | 16u, 0},
+         "simdgroup_multiply_accumulate("},
         {"GemmCm fp16 cfg3 64x64 swiglu",
          MirKey{MirKind::GemmCm, 3u | (EPI_SWIGLU << 4), Dtype::FP16, Dtype::FP16, 1, Dtype::FP32,
                 2u | 4u | 16u, 0},
@@ -189,6 +216,10 @@ int main() {
          MirKey{MirKind::ConvCm, 2u | (2u << 8), Dtype::FP16, Dtype::FP32, 1, Dtype::FP32,
                 1u | 4u | 8u, conv_aux},
          "simdgroup_multiply_accumulate("},
+        {"ConvCm fp16 cfg2 direct qa=int8",
+         MirKey{MirKind::ConvCm, 2u | (2u << 8) | (QF_INT8 << 12), Dtype::FP16, Dtype::FP32, 1,
+                Dtype::FP32, 1u | 2u | 4u | 8u, conv_aux},
+         "simdgroup_store("},
         {"ConvCm fp16 cfg3 scalar",
          MirKey{MirKind::ConvCm, 3u, Dtype::FP16, Dtype::FP32, 1, Dtype::FP32,
                 1u | 4u, conv_aux},

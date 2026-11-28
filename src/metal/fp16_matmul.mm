@@ -223,10 +223,11 @@ void launch_matmul_abt_mixed(const AbtMixed& g) {
         throw std::runtime_error("brotensor (Metal): matmul_abt_mixed: GLU epilogue needs an even N");
 
     // SwiGLU / GeGLU epilogues: route directly to MirKind::Gemv (M <= 8) or
-    // MirKind::GemmCm (GeGLU, FP16xFP16) when supported; otherwise compute into
-    // FP32 scratch (preserving original bias dtype) and apply MirKind::Glu once.
+    // MirKind::GemmCm (FP16xFP16, NT linear layout) when supported; otherwise
+    // compute into FP32 scratch (preserving original bias dtype) and apply
+    // MirKind::Glu once.
     if (g.epilogue == kAbtSwiglu) {
-        if (gemv_mir_eligible(g)) {
+        if (gemv_mir_eligible(g) || (!g.transA && !g.transB && gemm_cm_eligible(g))) {
             launch_gemm_fp32(g);
             return;
         }
@@ -234,7 +235,7 @@ void launch_matmul_abt_mixed(const AbtMixed& g) {
         return;
     }
     if (g.epilogue == kAbtGeglu) {
-        if (gemv_mir_eligible(g) || gemm_cm_eligible(g)) {
+        if (gemv_mir_eligible(g) || (!g.transA && !g.transB && gemm_cm_eligible(g))) {
             launch_gemm_fp32(g);
             return;
         }

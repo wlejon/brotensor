@@ -55,6 +55,7 @@ bool conv2d_cm_eligible(int C_in, int C_out, int H_out, int W_out,
 }
 
 void run_conv_cm(const void* x, const void* w, const void* y, const void* bias,
+                 const void* scale, std::uint32_t qa, const char* op_name,
                  int n, int cin, int h, int wd, int cout, int ho, int wo,
                  int kh, int kw, int sh, int sw, int ph, int pw,
                  int dh, int dw, int groups, bool accum = false) {
@@ -72,7 +73,10 @@ void run_conv_cm(const void* x, const void* w, const void* y, const void* bias,
     const std::uint32_t bn = tile.bn;
     const auto x_addr = reinterpret_cast<std::uintptr_t>(x);
     const auto w_addr = reinterpret_cast<std::uintptr_t>(w);
-    const bool avec = (w_addr % 16u == 0u) && (K % 8u == 0u);
+    const auto y_addr = reinterpret_cast<std::uintptr_t>(y);
+    const auto b_addr = reinterpret_cast<std::uintptr_t>(bias);
+    const bool avec = (qa != 0u) ? ((w_addr % 8u == 0u) && (K % 8u == 0u))
+                                 : ((w_addr % 16u == 0u) && (K % 8u == 0u));
     const bool rowch = (wo % 8 == 0);
     std::uint32_t bvec = 0u;
     if (kh == 1 && kw == 1 && sh == 1 && sw == 1 && ph == 0 && pw == 0 &&
@@ -86,13 +90,18 @@ void run_conv_cm(const void* x, const void* w, const void* y, const void* bias,
         (static_cast<std::uint64_t>(sh & 0xff) << 16) | (static_cast<std::uint64_t>(sw & 0xff) << 24) |
         (static_cast<std::uint64_t>(ph & 0xff) << 32) | (static_cast<std::uint64_t>(pw & 0xff) << 40) |
         (static_cast<std::uint64_t>(dh & 0xff) << 48) | (static_cast<std::uint64_t>(dw & 0xff) << 56);
-    const std::uint32_t op = (cfg_idx & 3u) | ((bvec & 3u) << 8);
-    // direct=false uses the shared-scratch epilogue so any edge alignment and bias layout works.
-    const std::uint8_t flags = static_cast<std::uint8_t>(
+    const std::uint32_t op = (cfg_idx & 3u) | ((bvec & 3u) << 8) | ((qa & 0x0fu) << 12);
+    const std::uint8_t base_flags = static_cast<std::uint8_t>(
         (avec ? 1u : 0u) | (bias ? 4u : 0u) | (rowch ? 8u : 0u) | (accum ? 16u : 0u));
-    const MirKernel mk = mir_kernel({MirKind::ConvCm, op, Dtype::FP16, Dtype::FP32, 1, Dtype::FP32, flags, aux});
+    auto kernel = [&](bool direct) -> MirKernel {
+        const std::uint8_t flags = static_cast<std::uint8_t>(base_flags | (direct ? 2u : 0u));
+        return mir_kernel({MirKind::ConvCm, op, Dtype::FP16, Dtype::FP32, 1, Dtype::FP32, flags, aux});
+    };
+    const bool direct_ok = (P % 8u == 0u) && (y_addr % 16u == 0u) && (!bias || b_addr % 16u == 0u);
     const std::uint32_t gx = static_cast<std::uint32_t>(cdiv_u64(P, bn));
     const std::uint32_t gy = static_cast<std::uint32_t>(cdiv_u64(M, bm));
+    const std::uint32_t fx = direct_ok ? (P / bn) : 0u;
+    const std::uint32_t fy = direct_ok ? (M / bm) : 0u;
     const int per = std::max(1, 65535 / groups);
     for (int i0 = 0; i0 < n; i0 += per) {
         const int ni = std::min(per, n - i0);
@@ -101,14 +110,25 @@ void run_conv_cm(const void* x, const void* w, const void* y, const void* bias,
             w,
             static_cast<const char*>(y) + std::size_t(i0) * cout * P * 2u,
             bias,
-            nullptr,
+            scale,
         };
-        const std::int32_t ints[] = {
-            static_cast<std::int32_t>(M), static_cast<std::int32_t>(P), static_cast<std::int32_t>(K),
-            h, wd, wo, cin, cout, groups, 0, 0,
+        const std::uint32_t gz = static_cast<std::uint32_t>(ni * groups);
+        auto run = [&](const MirKernel& mk, std::uint32_t tm0, std::uint32_t tn0,
+                       std::uint32_t dx, std::uint32_t dy) {
+            const std::int32_t ints[] = {
+                static_cast<std::int32_t>(M), static_cast<std::int32_t>(P), static_cast<std::int32_t>(K),
+                h, wd, wo, cin, cout, groups,
+                static_cast<std::int32_t>(tm0), static_cast<std::int32_t>(tn0),
+            };
+            mir_dispatch_args_3d(mk, dx, dy, gz, op_name, ptrs, ints, {});
         };
-        mir_dispatch_args_3d(mk, gx, gy, static_cast<std::uint32_t>(ni * groups),
-                             "conv2d_forward", ptrs, ints, {});
+        if (fx > 0u && fy > 0u) {
+            run(kernel(true), 0u, 0u, fx, fy);
+            if (fx < gx) run(kernel(false), 0u, fx, gx - fx, gy);
+            if (fy < gy) run(kernel(false), fy, 0u, fx, gy - fy);
+        } else {
+            run(kernel(false), 0u, 0u, gx, gy);
+        }
     }
 }
 
@@ -221,8 +241,8 @@ void conv2d_forward(const Tensor& X,
     if (X.dtype == Dtype::FP16 &&
         conv2d_cm_eligible(C_in, C_out, H_out, W_out, kH, kW, stride_h, stride_w,
                            pad_h, pad_w, dil_h, dil_w, groups, N)) {
-        run_conv_cm(X.data, Wt.data, Y.data, bias ? bias->data : nullptr,
-                    N, C_in, H, W, C_out, H_out, W_out,
+        run_conv_cm(X.data, Wt.data, Y.data, bias ? bias->data : nullptr, nullptr, 0u,
+                    "conv2d_forward", N, C_in, H, W, C_out, H_out, W_out,
                     kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups);
         return;
     }
@@ -242,6 +262,30 @@ void conv2d_forward(const Tensor& X,
         X.data, Wt.data, Y.data, bias ? bias->data : nullptr,
         N, C_in, 1, H, W, C_out, 1, H_out, W_out,
         1, kH, kW, 1, stride_h, stride_w, 0, pad_h, pad_w, 1, dil_h, dil_w, groups);
+}
+
+bool try_conv2d_int8w_cm(const Tensor& X,
+                         const Tensor& W_int8,
+                         const Tensor& scales,
+                         const Tensor* bias,
+                         int N, int C_in, int H, int W,
+                         int C_out, int H_out, int W_out,
+                         int kH, int kW,
+                         int stride_h, int stride_w,
+                         int pad_h, int pad_w,
+                         int dil_h, int dil_w,
+                         int groups,
+                         Tensor& Y) {
+    if (X.dtype != Dtype::FP16) return false;
+    if (!conv2d_cm_eligible(C_in, C_out, H_out, W_out, kH, kW, stride_h, stride_w,
+                            pad_h, pad_w, dil_h, dil_w, groups, N)) {
+        return false;
+    }
+    run_conv_cm(X.data, W_int8.data, Y.data, (bias && bias->size() > 0) ? bias->data : nullptr,
+                scales.data, QF_INT8, "conv2d_int8w_fp16_forward",
+                N, C_in, H, W, C_out, H_out, W_out,
+                kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups);
+    return true;
 }
 
 void conv2d_backward_input(const Tensor& Wt,

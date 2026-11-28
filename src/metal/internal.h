@@ -78,4 +78,28 @@ void quant_prefill_gemm_fp16(const ::brotensor::Tensor& W_fp16,
 // dequant and using simdgroup matmul wins.
 inline constexpr int kQuantPrefillMinB = 8;
 
+// Fused quantized-weight MirKind::GemmCm prefill fast path (in gemm_fp32.mm)
+// for QF_INT8 / QF_FP8 / QF_Q8_0 / QF_Q4K / QF_Q6K with FP16 activations.
+bool try_mir_quant_gemm_cm(std::uint32_t qb,
+                             const void* a, const void* b, const void* c,
+                             const void* bias, const void* scale,
+                             ::brotensor::Dtype dt_out,
+                             int M, int N, int K,
+                             int lda, int ldb_bytes, int ldc,
+                             int act, int epi, const char* op);
+
+// Fused INT8-weight MirKind::ConvCm fast path (in conv2d.mm) for FP16 X.
+bool try_conv2d_int8w_cm(const ::brotensor::Tensor& X,
+                         const ::brotensor::Tensor& W_int8,
+                         const ::brotensor::Tensor& scales,
+                         const ::brotensor::Tensor* bias,
+                         int N, int C_in, int H, int W,
+                         int C_out, int H_out, int W_out,
+                         int kH, int kW,
+                         int stride_h, int stride_w,
+                         int pad_h, int pad_w,
+                         int dil_h, int dil_w,
+                         int groups,
+                         ::brotensor::Tensor& Y);
+
 } // namespace brotensor::detail::metal

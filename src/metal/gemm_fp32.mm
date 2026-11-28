@@ -72,6 +72,32 @@ bool try_mir_gemv(const AbtMixed& g, AbtType in_b) {
     return true;
 }
 
+std::uint32_t pick_cm_cfg(int M, std::uint32_t nout, int epi, int batch) {
+    // Select 128x64 (cfg_idx=2, ~30 KiB shared) or 64x64 (cfg_idx=3, ~20 KiB shared)
+    // so static threadgroup allocations stay strictly within Metal's 32 KiB cap.
+    const std::uint64_t tiles2 =
+        cdiv_u64(M, 128u) * cdiv_u64(nout, (epi == EPI_SWIGLU) ? 32u : 64u) *
+        static_cast<std::uint64_t>(batch);
+    return (M > 64 && tiles2 >= 24u) ? 2u : 3u;
+}
+
+template <typename EmitFn>
+void dispatch_cm_interior_and_edges(std::uint32_t M, std::uint32_t N, std::uint32_t nout,
+                                    int epi, const ::brotensor::detail::metal::MetalCmTile& cfg,
+                                    std::uint32_t gx, std::uint32_t gy, bool direct_ok,
+                                    EmitFn&& emit) {
+    const std::uint32_t wout = (epi == EPI_SWIGLU) ? cfg.bn / 2u : cfg.bn;
+    const std::uint32_t fx = direct_ok ? ((epi == EPI_SWIGLU ? nout : N) / wout) : 0u;
+    const std::uint32_t fy = direct_ok ? (M / cfg.bm) : 0u;
+    if (fx > 0u && fy > 0u) {
+        emit(true, 0u, 0u, fx, fy);
+        if (fx < gx) emit(false, 0u, fx, gx - fx, gy);
+        if (fy < gy) emit(false, fy, 0u, fx, gy - fy);
+    } else {
+        emit(false, 0u, 0u, gx, gy);
+    }
+}
+
 bool try_mir_gemm_cm(const AbtMixed& g, AbtType in_b) {
     if (g.K <= 0 || g.alpha != 1.0f) return false;
     if (g.in != kAbtF16 || in_b != kAbtF16) return false;
@@ -85,12 +111,7 @@ bool try_mir_gemm_cm(const AbtMixed& g, AbtType in_b) {
         static_cast<std::uint32_t>((g.epilogue == kAbtGeglu || g.epilogue == kAbtSwiglu) ? g.N / 2 : g.N);
     if (nout == 0) return true;
 
-    // Select 128x64 (cfg_idx=2, ~30 KiB shared) or 64x64 (cfg_idx=3, ~20 KiB shared)
-    // so static threadgroup allocations fit comfortably within Metal's 32 KiB cap.
-    const std::uint64_t tiles2 =
-        cdiv_u64(g.M, 128u) * cdiv_u64(nout, (g.epilogue == kAbtSwiglu) ? 32u : 64u) *
-        static_cast<std::uint64_t>(g.batch);
-    const std::uint32_t cfg_idx = (g.M > 64 && tiles2 >= 24u) ? 2u : 3u;
+    const std::uint32_t cfg_idx = pick_cm_cfg(g.M, nout, g.epilogue, g.batch);
     const MetalCmTile cfg = metal_cm_tile(cfg_idx);
     const std::uint32_t wout = (g.epilogue == kAbtSwiglu) ? cfg.bn / 2u : cfg.bn;
     const std::uint32_t gx = static_cast<std::uint32_t>(
@@ -110,34 +131,46 @@ bool try_mir_gemm_cm(const AbtMixed& g, AbtType in_b) {
                              ((static_cast<std::uint32_t>(g.epilogue) & 0x0fu) << 4) |
                              ((static_cast<std::uint32_t>(g.act) & 0x0fu) << 8);
     // mir_gemm_cm uses `nb` for B stored (K, N) — exact match for AbtMixed::transB.
-    // direct=false routes through the shared-scratch epilogue (supports arbitrary alignment & bias).
-    const std::uint8_t flags = static_cast<std::uint8_t>(
+    const std::uint8_t base_flags = static_cast<std::uint8_t>(
         (g.transA ? 1u : 0u) | (g.transB ? 2u : 0u) | (vec ? 4u : 0u) |
         (g.bias ? 16u : 0u));
-    const MirKernel mk = mir_kernel({MirKind::GemmCm, op, da, da, 1, dc, flags});
+    const bool direct_ok =
+        (dc == ::brotensor::Dtype::FP16) && (g.epilogue != EPI_GEGLU) &&
+        (g.ofs_C % 16u == 0u) && (g.ldc % 8u == 0u) && (g.strideC % 8u == 0u) &&
+        (!g.bias || g.ofs_bias % 16u == 0u);
     const std::size_t esc = abt_elem_size(dc);
-    const std::int32_t ints[12] = {
-        g.M, g.N, g.K,
-        static_cast<std::int32_t>(g.lda), static_cast<std::int32_t>(g.ldb),
-        static_cast<std::int32_t>(g.ldc),
-        static_cast<std::int32_t>(g.strideA), static_cast<std::int32_t>(g.strideB),
-        static_cast<std::int32_t>(g.strideC), g.N / 2, 0, 0,
+    const void* bufs[6] = {
+        (__bridge const void*)g.A, (__bridge const void*)g.B,
+        (__bridge const void*)g.C, (__bridge const void*)g.bias,
+        nullptr, nullptr,
     };
-    for (int z0 = 0; z0 < g.batch; z0 += 65535) {
-        const int nz = std::min(65535, g.batch - z0);
-        const void* bufs[6] = {
-            (__bridge const void*)g.A, (__bridge const void*)g.B,
-            (__bridge const void*)g.C, (__bridge const void*)g.bias,
-            nullptr, nullptr,
+
+    auto emit = [&](bool direct, std::uint32_t tm0, std::uint32_t tn0,
+                    std::uint32_t dx, std::uint32_t dy) {
+        const std::uint8_t flags = static_cast<std::uint8_t>(base_flags | (direct ? 8u : 0u));
+        const MirKernel mk = mir_kernel({MirKind::GemmCm, op, da, da, 1, dc, flags});
+        const std::int32_t ints[12] = {
+            g.M, g.N, g.K,
+            static_cast<std::int32_t>(g.lda), static_cast<std::int32_t>(g.ldb),
+            static_cast<std::int32_t>(g.ldc),
+            static_cast<std::int32_t>(g.strideA), static_cast<std::int32_t>(g.strideB),
+            static_cast<std::int32_t>(g.strideC), g.N / 2,
+            static_cast<std::int32_t>(tm0), static_cast<std::int32_t>(tn0),
         };
-        const std::size_t offs[6] = {
-            g.ofs_A + static_cast<std::size_t>(z0) * g.strideA * 2u,
-            g.ofs_B + static_cast<std::size_t>(z0) * g.strideB * 2u,
-            g.ofs_C + static_cast<std::size_t>(z0) * g.strideC * esc,
-            g.ofs_bias, 0u, 0u,
-        };
-        mir_dispatch_mtl_3d(mk, gx, gy, static_cast<std::uint32_t>(nz), bufs, offs, 6, ints, {});
-    }
+        for (int z0 = 0; z0 < g.batch; z0 += 65535) {
+            const int nz = std::min(65535, g.batch - z0);
+            const std::size_t offs[6] = {
+                g.ofs_A + static_cast<std::size_t>(z0) * g.strideA * 2u,
+                g.ofs_B + static_cast<std::size_t>(z0) * g.strideB * 2u,
+                g.ofs_C + static_cast<std::size_t>(z0) * g.strideC * esc,
+                g.ofs_bias, 0u, 0u,
+            };
+            mir_dispatch_mtl_3d(mk, dx, dy, static_cast<std::uint32_t>(nz), bufs, offs, 6, ints, {});
+        }
+    };
+    dispatch_cm_interior_and_edges(
+        static_cast<std::uint32_t>(g.M), static_cast<std::uint32_t>(g.N), nout,
+        g.epilogue, cfg, gx, gy, direct_ok, emit);
     return true;
 }
 
@@ -203,3 +236,66 @@ void launch_gemm_fp32(const AbtMixed& g) {
 }
 
 } // namespace brotensor::metal_impl
+
+namespace brotensor::detail::metal {
+
+bool try_mir_quant_gemm_cm(std::uint32_t qb,
+                             const void* a, const void* b, const void* c,
+                             const void* bias, const void* scale,
+                             ::brotensor::Dtype dt_out,
+                             int M, int N, int K,
+                             int lda, int ldb_bytes, int ldc,
+                             int act, int epi, const char* op_name) {
+    if (M <= 0 || N <= 0) return true;
+    if (K <= 0 || (dt_out != ::brotensor::Dtype::FP16 && dt_out != ::brotensor::Dtype::FP32)) {
+        return false;
+    }
+    if (epi < EPI_STORE || epi > EPI_SWIGLU || epi == EPI_RESIDUAL_ADD) return false;
+    const std::uint32_t nout =
+        static_cast<std::uint32_t>((epi == EPI_GEGLU || epi == EPI_SWIGLU) ? N / 2 : N);
+    if (nout == 0) return true;
+
+    const std::uint32_t cfg_idx = brotensor::metal_impl::pick_cm_cfg(M, nout, epi, 1);
+    const MetalCmTile cfg = metal_cm_tile(cfg_idx);
+    const std::uint32_t wout = (epi == EPI_SWIGLU) ? cfg.bn / 2u : cfg.bn;
+    const std::uint32_t gx = static_cast<std::uint32_t>(
+        (epi == EPI_SWIGLU) ? brotensor::metal_impl::cdiv_u64(nout, wout)
+                            : brotensor::metal_impl::cdiv_u64(N, cfg.bn));
+    const std::uint32_t gy = static_cast<std::uint32_t>(brotensor::metal_impl::cdiv_u64(M, cfg.bm));
+    if (gx > 65535u || gy > 65535u) return false;
+
+    const auto a_addr = reinterpret_cast<std::uintptr_t>(a);
+    const auto b_addr = reinterpret_cast<std::uintptr_t>(b);
+    const auto c_addr = reinterpret_cast<std::uintptr_t>(c);
+    const auto bi_addr = reinterpret_cast<std::uintptr_t>(bias);
+    const bool byte_fmt = (qb == QF_INT8 || qb == QF_FP8);
+    const bool vec = (a_addr % 16u == 0u) && (lda % 8 == 0) && (K % 8 == 0) &&
+                     (!byte_fmt || ((b_addr % 8u == 0u) && (ldb_bytes % 8 == 0)));
+    const std::uint32_t op = (cfg_idx & 3u) |
+                             ((static_cast<std::uint32_t>(epi) & 0x0fu) << 4) |
+                             ((static_cast<std::uint32_t>(act) & 0x0fu) << 8) |
+                             ((qb & 0x0fu) << 12);
+    const std::uint8_t base_flags = static_cast<std::uint8_t>((vec ? 4u : 0u) | (bias ? 16u : 0u));
+    const bool direct_ok = (dt_out == ::brotensor::Dtype::FP16) && (epi != EPI_GEGLU) &&
+                           (c_addr % 16u == 0u) && (ldc % 8 == 0) &&
+                           (!bias || bi_addr % 16u == 0u);
+    const void* ptrs[6] = {a, b, c, bias, scale, nullptr};
+
+    auto emit = [&](bool direct, std::uint32_t tm0, std::uint32_t tn0,
+                    std::uint32_t dx, std::uint32_t dy) {
+        const std::uint8_t flags = static_cast<std::uint8_t>(base_flags | (direct ? 8u : 0u));
+        const MirKernel mk = mir_kernel({MirKind::GemmCm, op, ::brotensor::Dtype::FP16,
+                                         ::brotensor::Dtype::FP16, 1, dt_out, flags});
+        const std::int32_t ints[12] = {
+            M, N, K, lda, ldb_bytes, ldc, 0, 0, 0, N / 2,
+            static_cast<std::int32_t>(tm0), static_cast<std::int32_t>(tn0),
+        };
+        mir_dispatch_args_3d(mk, dx, dy, 1u, op_name, ptrs, ints, {});
+    };
+    brotensor::metal_impl::dispatch_cm_interior_and_edges(
+        static_cast<std::uint32_t>(M), static_cast<std::uint32_t>(N), nout,
+        epi, cfg, gx, gy, direct_ok, emit);
+    return true;
+}
+
+} // namespace brotensor::detail::metal

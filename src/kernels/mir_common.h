@@ -36,9 +36,12 @@ inline int elem_bytes(Dtype dt) {
     }
 }
 
+// Finalizes a newly constructed MIR kernel before returning it to backend
+// caches (cu_mir_cache / vk_mir_cache / mtl_mir_cache) or audit passes, each
+// of which invokes brass::optimize_gpu_function once with backend-appropriate
+// options (avoids redundant O(minutes) opt_level=2 SAT superopt during construction).
 inline Function* finalize_fn(Function* fn) {
     fn->rebuild_cfg_predecessors();
-    jit::gpu_mir::optimize_function(*fn);
     return fn;
 }
 

@@ -145,6 +145,11 @@ void conv2d_int8w_fp16_forward(const Tensor& X,
     }
     if (N == 0 || out_cols == 0) return;
 
+    if (try_conv2d_int8w_cm(X, W_int8, scales, bias, N, C_in, H, W, C_out, H_out, W_out,
+                            kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups, Y)) {
+        return;
+    }
+
     Tensor Wf = Tensor::empty_on(Device::Metal, C_out, Cg_in * kH * kW, Dtype::FP16);
     dequantize_rows(W_int8, scales, Dtype::FP16, Wf);
     conv2d_forward(X, Wf, bias, N, C_in, H, W, C_out, kH, kW,
@@ -189,6 +194,14 @@ void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
                             X_BD.data, W_int8.data, Y_BD.data,
                             (bias && bias->size() > 0) ? bias->data : nullptr, scales.data,
                             out_dim, in_dim, B, in_dim, out_dim, in_dim, LACT_NONE, EPI_STORE);
+        return;
+    }
+
+    if (dt == Dtype::FP16 &&
+        try_mir_quant_gemm_cm(QF_INT8, X_BD.data, W_int8.data, Y_BD.data,
+                              (bias && bias->size() > 0) ? bias->data : nullptr, scales.data,
+                              Dtype::FP16, B, out_dim, in_dim, in_dim, in_dim, out_dim,
+                              LACT_NONE, EPI_STORE, "linear_forward_batched_int8w_fp16")) {
         return;
     }
 

@@ -3,6 +3,7 @@
 //   attention_backward, mha_backward, self_attention_backward, cross_attention_backward.
 
 #include "cu_mir_cache.h"
+#include "../gpu_common/attention_bwd.h"
 #include "../kernels/mir_elementwise.h"
 #include "../kernels/mir_norm.h"
 #include "../vulkan/shaders/op_codes.h"
@@ -30,17 +31,6 @@ void copy_d2d_strided(const Tensor& src, int src_off, int src_pitch,
                       Tensor& dst, int dst_off, int dst_pitch, int width, int height);
 
 namespace {
-
-[[noreturn]] void fail(const char* op, const std::string& why) {
-    throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
-}
-
-void ensure(Tensor& t, int rows, int cols, ::brotensor::Device dev) {
-    if (t.data == nullptr) t.device = dev;
-    if (t.rows != rows || t.cols != cols || t.dtype != Dtype::FP32) {
-        t.resize(rows, cols, Dtype::FP32);
-    }
-}
 
 std::uintptr_t addr(const void* p) noexcept {
     return reinterpret_cast<std::uintptr_t>(p);
@@ -110,66 +100,14 @@ void col_sum_accum(const Tensor& X, Tensor& out) {
                       nullptr, nullptr, rows, cols, 0.0f, 0.0f);
 }
 
-struct BwdSpec {
-    const char* op;
-    const Tensor *dO, *X, *C;
-    const Tensor *Qh, *Kh, *Vh, *Attnh, *Yc;
-    const Tensor *Wq, *Wk, *Wv, *Wo;
-    const float* kmask = nullptr;
-    const float* qmask = nullptr;
-    int H = 1;
-    Tensor* dX;
-    Tensor* dC = nullptr;
-    Tensor *dWq, *dWk, *dWv, *dWo;
-    Tensor *dbq = nullptr, *dbk = nullptr, *dbv = nullptr, *dbo = nullptr;
-};
-
-void check(const BwdSpec& s, int Lq, int Lk, int D, int Dx, int Dc, int hd) {
-    const char* op = s.op;
-    for (const Tensor* t : {s.dO, s.X, s.C, s.Qh, s.Kh, s.Vh, s.Attnh, s.Yc, s.Wq, s.Wk, s.Wv, s.Wo,
-                            static_cast<const Tensor*>(s.dWq), static_cast<const Tensor*>(s.dWk),
-                            static_cast<const Tensor*>(s.dWv), static_cast<const Tensor*>(s.dWo)}) {
-        if (t->dtype != Dtype::FP32) fail(op, "every operand must be FP32");
-    }
-    auto shape = [&](const Tensor& t, int r, int c, const char* what) {
-        if (t.rows != r || t.cols != c) fail(op, std::string(what) + " has the wrong shape");
-    };
-    shape(*s.dO, Lq, D, "dO");
-    shape(*s.Qh, s.H * Lq, hd, "Qh");
-    shape(*s.Kh, s.H * Lk, hd, "Kh");
-    shape(*s.Vh, s.H * Lk, hd, "Vh");
-    shape(*s.Attnh, s.H * Lq, Lk, "Attnh");
-    shape(*s.Yc, Lq, D, "Yconcat");
-    shape(*s.Wq, D, Dx, "Wq");
-    shape(*s.Wk, D, Dc, "Wk");
-    shape(*s.Wv, D, Dc, "Wv");
-    shape(*s.Wo, D, D, "Wo");
-    shape(*s.dWq, D, Dx, "dWq");
-    shape(*s.dWk, D, Dc, "dWk");
-    shape(*s.dWv, D, Dc, "dWv");
-    shape(*s.dWo, D, D, "dWo");
-    for (Tensor* b : {s.dbq, s.dbk, s.dbv, s.dbo}) {
-        if (b && (b->dtype != Dtype::FP32 || b->size() != D)) {
-            fail(op, "a bias gradient must have D FP32 elements");
-        }
-    }
-}
+using BwdSpec = gpu_common::AttentionBwdSpec;
 
 void attention_bwd(const BwdSpec& s) {
+    int Lq = 0, Lk = 0, D = 0, Dx = 0, Dc = 0, hd = 0;
+    if (!gpu_common::prepare_attention_bwd(s, Lq, Lk, D, Dx, Dc, hd)) return;
     const Tensor &X = *s.X, &C = *s.C;
-    const int Lq = X.rows, Lk = C.rows, Dx = X.cols, Dc = C.cols, D = s.Wq->rows, H = s.H;
+    const int H = s.H;
     const ::brotensor::Device dev = X.device;
-    ensure(*s.dX, Lq, Dx, dev);
-    if (s.dC) ensure(*s.dC, Lk, Dc, dev);
-    if (Lq == 0 || D == 0 || H == 0) return;
-    if (H < 0 || D % H != 0) fail(s.op, "num_heads must divide D");
-    const int hd = D / H;
-    if (Lk == 0) {
-        s.dX->zero();
-        if (s.dC && s.dC->size() > 0) s.dC->zero();
-        return;
-    }
-    check(s, Lq, Lk, D, Dx, Dc, hd);
 
     Tensor dog_tmp;
     const Tensor* dOg = s.dO;

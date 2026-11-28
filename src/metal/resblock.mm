@@ -2,6 +2,7 @@
 // (group_norm_silu_forward + MirKind::ConvAux), with zero raw MSL shaders.
 
 #include "mtl_mir_cache.h"
+#include "../gpu_common/resblock.h"
 
 #include <brotensor/runtime.h>
 #include <brotensor/detail/op_table.h>
@@ -88,19 +89,8 @@ void resblock_forward(const Tensor& X,
                           int num_groups, float eps,
                           Tensor& Y) {
     const Dtype dt = X.dtype;
-    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
-        throw std::runtime_error("resblock_forward_gpu: X must be FP16 or BF16");
-    }
-    if (gamma1.dtype != dt || beta1.dtype != dt || W1.dtype != dt ||
-        gamma2.dtype != dt || beta2.dtype != dt || W2.dtype != dt) {
-        throw std::runtime_error("resblock_forward_gpu: all required tensors must share X's dtype (FP16 or BF16)");
-    }
-    if (num_groups <= 0 || C_in % num_groups != 0 || C_out % num_groups != 0) {
-        throw std::runtime_error("resblock_forward_gpu: num_groups must divide C_in and C_out");
-    }
-    if (Wskip == nullptr && C_in != C_out) {
-        throw std::runtime_error("resblock_forward_gpu: Wskip required when C_in != C_out");
-    }
+    gpu_common::validate_resblock_fp16_bf16(
+        "resblock_forward_gpu", X, gamma1, beta1, W1, gamma2, beta2, W2, Wskip, C_in, C_out, num_groups);
     const int spatial = H * Wd;
     const int out_cols = C_out * spatial;
     if (Y.rows != N || Y.cols != out_cols || Y.dtype != dt) {
@@ -126,19 +116,7 @@ void resblock_forward(const Tensor& X,
                        h2);
 
     if (t_emb_shift) {
-        if (t_emb_shift->dtype != dt) {
-            throw std::runtime_error("resblock_forward_gpu: t_emb_shift dtype must match X");
-        }
-        int has_N = 0;
-        if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
-            has_N = 1;
-        } else if ((t_emb_shift->rows == C_out && t_emb_shift->cols == 1) ||
-                   (t_emb_shift->rows == 1 && t_emb_shift->cols == C_out) ||
-                   t_emb_shift->size() == C_out) {
-            has_N = 0;
-        } else {
-            throw std::runtime_error("resblock_forward_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
-        }
+        const int has_N = gpu_common::parse_shift_has_n(t_emb_shift, dt, N, C_out, "resblock_forward_gpu");
         launch_add_shift(dt, h2, *t_emb_shift, N, C_out, spatial, has_N);
     }
 
@@ -146,9 +124,6 @@ void resblock_forward(const Tensor& X,
 
     thread_local Tensor skip_scratch = Tensor::empty_on(Device::Metal, 0, 0);
     if (Wskip != nullptr) {
-        if (Wskip->dtype != dt) {
-            throw std::runtime_error("resblock_forward_gpu: Wskip dtype must match X");
-        }
         conv2d_forward(X, *Wskip, bskip,
                            N, C_in, H, Wd,
                            C_out, 1, 1,
@@ -185,54 +160,9 @@ void resblock_forward_int8w_fp16(const Tensor& X,
                                      int N, int C_in, int C_out, int H, int Wd,
                                      int num_groups, float eps,
                                      Tensor& Y) {
-    if (X.dtype != Dtype::FP16 || gamma1.dtype != Dtype::FP16 ||
-        beta1.dtype != Dtype::FP16 || gamma2.dtype != Dtype::FP16 ||
-        beta2.dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: activation/norm tensors must be FP16");
-    }
-    if (W1_int8.dtype != Dtype::INT8 || W2_int8.dtype != Dtype::INT8) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: W1/W2 must be INT8");
-    }
-    if (s1.dtype != Dtype::FP32 || s2.dtype != Dtype::FP32) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: scales s1/s2 must be FP32");
-    }
-    if (num_groups <= 0 || C_in % num_groups != 0 || C_out % num_groups != 0) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: num_groups must divide C_in and C_out");
-    }
-    if (W1_int8.rows != C_out || W1_int8.cols != C_in * 9) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: W1_int8 shape mismatch");
-    }
-    if (W2_int8.rows != C_out || W2_int8.cols != C_out * 9) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: W2_int8 shape mismatch");
-    }
-    if (s1.rows != C_out || s1.cols != 1 || s2.rows != C_out || s2.cols != 1) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: s1/s2 must be (C_out, 1)");
-    }
-    if (b1 && b1->dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: b1 must be FP16");
-    }
-    if (b2 && b2->dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_forward_int8w_fp16_gpu: b2 must be FP16");
-    }
-    if (Wskip_int8 == nullptr) {
-        if (C_in != C_out) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: Wskip required when C_in != C_out");
-        }
-    } else {
-        if (Wskip_int8->dtype != Dtype::INT8) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: Wskip_int8 must be INT8");
-        }
-        if (Wskip_int8->rows != C_out || Wskip_int8->cols != C_in) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: Wskip_int8 shape mismatch");
-        }
-        if (sskip == nullptr || sskip->dtype != Dtype::FP32 ||
-            sskip->rows != C_out || sskip->cols != 1) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: sskip must be FP32 (C_out, 1)");
-        }
-        if (bskip && bskip->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: bskip must be FP16");
-        }
-    }
+    gpu_common::validate_resblock_int8w(
+        "resblock_forward_int8w_fp16_gpu", X, gamma1, beta1, W1_int8, s1, b1,
+        gamma2, beta2, W2_int8, s2, b2, Wskip_int8, sskip, bskip, C_in, C_out, num_groups);
     const int spatial = H * Wd;
     const int out_cols = C_out * spatial;
     if (Y.rows != N || Y.cols != out_cols || Y.dtype != Dtype::FP16) {
@@ -256,19 +186,8 @@ void resblock_forward_int8w_fp16(const Tensor& X,
                                   h2);
 
     if (t_emb_shift) {
-        if (t_emb_shift->dtype != Dtype::FP16) {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: t_emb_shift must be FP16");
-        }
-        int has_N = 0;
-        if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
-            has_N = 1;
-        } else if ((t_emb_shift->rows == C_out && t_emb_shift->cols == 1) ||
-                   (t_emb_shift->rows == 1 && t_emb_shift->cols == C_out) ||
-                   t_emb_shift->size() == C_out) {
-            has_N = 0;
-        } else {
-            throw std::runtime_error("resblock_forward_int8w_fp16_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
-        }
+        const int has_N = gpu_common::parse_shift_has_n(
+            t_emb_shift, Dtype::FP16, N, C_out, "resblock_forward_int8w_fp16_gpu");
         launch_add_shift(Dtype::FP16, h2, *t_emb_shift, N, C_out, spatial, has_N);
     }
 
@@ -313,16 +232,10 @@ void resblock_backward(const Tensor& X,
                            Tensor& dW2, Tensor* db2,
                            Tensor* dWskip, Tensor* dbskip) {
     const Dtype dt = X.dtype;
-    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
-        throw std::runtime_error("resblock_backward_gpu: X must be FP16 or BF16");
-    }
-    if (dY.dtype != dt || gamma1.dtype != dt || beta1.dtype != dt ||
-        W1.dtype != dt || gamma2.dtype != dt || beta2.dtype != dt ||
-        W2.dtype != dt) {
-        throw std::runtime_error("resblock_backward_gpu: all required tensors must share X's dtype (FP16 or BF16)");
-    }
-    if (Wskip == nullptr && C_in != C_out) {
-        throw std::runtime_error("resblock_backward_gpu: Wskip required when C_in != C_out");
+    gpu_common::validate_resblock_fp16_bf16(
+        "resblock_backward_gpu", X, gamma1, beta1, W1, gamma2, beta2, W2, Wskip, C_in, C_out, num_groups);
+    if (dY.dtype != dt) {
+        throw std::runtime_error("resblock_backward_gpu: dY dtype must match X");
     }
     const int spatial = H * Wd;
     if (dY.rows != N || dY.cols != C_out * spatial) {
@@ -343,19 +256,7 @@ void resblock_backward(const Tensor& X,
     conv2d_forward(h1, W1, b1, N, C_in, H, Wd,
                        C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2);
     if (t_emb_shift) {
-        if (t_emb_shift->dtype != dt) {
-            throw std::runtime_error("resblock_backward_gpu: t_emb_shift dtype must match X");
-        }
-        int has_N = 0;
-        if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) {
-            has_N = 1;
-        } else if ((t_emb_shift->rows == C_out && t_emb_shift->cols == 1) ||
-                   (t_emb_shift->rows == 1 && t_emb_shift->cols == C_out) ||
-                   t_emb_shift->size() == C_out) {
-            has_N = 0;
-        } else {
-            throw std::runtime_error("resblock_backward_gpu: t_emb_shift shape must be (N, C_out) or (C_out,)");
-        }
+        const int has_N = gpu_common::parse_shift_has_n(t_emb_shift, dt, N, C_out, "resblock_backward_gpu");
         launch_add_shift(dt, h2, *t_emb_shift, N, C_out, spatial, has_N);
     }
 

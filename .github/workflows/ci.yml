@@ -169,6 +169,14 @@ jobs:
           key: metal-macos-15
           max-size: 500M
 
+      - name: Metal MIR/MSL + MTLBinaryArchive cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/brotensor-metal-cache
+          key: macos-15-metal-cache-${{ hashFiles('src/kernels/**', 'src/metal/**', 'cmake/brotensor_kernel_fingerprint.cmake') }}
+          restore-keys: |
+            macos-15-metal-cache-
+
       - name: Configure
         run: |
           cmake -S brotensor -B build -G Ninja \
@@ -181,6 +189,8 @@ jobs:
         run: cmake --build build --parallel 3
 
       - name: Test
+        env:
+          BRO_ML_CACHE_DIR: ${{ runner.temp }}/brotensor-metal-cache
         run: ctest --test-dir build --output-on-failure --parallel 2
 
   # ── CUDA ──────────────────────────────────────────────────────────────────

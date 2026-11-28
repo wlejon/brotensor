@@ -169,6 +169,12 @@ void linear_forward_batched_wq_ex(const Tensor& Wq, const Tensor& scales, const 
     }
 
     const std::uint32_t fmt = (Wq.dtype == Dtype::FP8_E4M3) ? QF_FP8 : QF_INT8;
+    if (dt == Dtype::FP16 && M > 8 &&
+        try_mir_quant_gemm_cm(fmt, X.data, Wq.data, Y.data,
+                              bias ? bias->data : nullptr, scales.data,
+                              Dtype::FP16, M, N, K, K, K, out_cols, act, epi, op)) {
+        return;
+    }
     mir_dispatch_gemv_q(fmt, dt, op, X.data, Wq.data, Y.data,
                         bias ? bias->data : nullptr, scales.data,
                         N, K, M, K, out_cols, K, act, epi);

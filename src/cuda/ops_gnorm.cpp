@@ -2,6 +2,7 @@
 // BatchNorm inference/training forward/backward, and per-pixel NCHW L2 normalize.
 
 #include "cu_mir_cache.h"
+#include "../gpu_common/gnorm.h"
 #include "../kernels/mir_gnorm.h"
 #include "../vulkan/shaders/op_codes.h"
 
@@ -20,31 +21,6 @@ using ::brotensor::Dtype;
 using ::brotensor::Tensor;
 
 namespace {
-
-[[noreturn]] void fail(const char* op, const std::string& why) {
-    throw std::runtime_error(std::string("brotensor: ") + op + ": " + why);
-}
-
-void need(const char* op, bool ok, const char* what) {
-    if (!ok) fail(op, what);
-}
-
-void require_fp(Dtype dt, const char* op) {
-    if (dt != Dtype::FP32 && dt != Dtype::FP16 && dt != Dtype::BF16) {
-        fail(op, "must be FP32, FP16, or BF16");
-    }
-}
-
-void require_f32(Dtype dt, const char* op, const char* what) {
-    if (dt != Dtype::FP32) fail(op, std::string(what) + " must be FP32");
-}
-
-void check_param(const char* op, const Tensor& t, int c, Dtype dt, const char* name) {
-    if (t.dtype != dt) fail(op, std::string(name) + " dtype must match X");
-    if (t.size() != c) fail(op, std::string(name) + " must have C elements");
-}
-
-std::uint64_t cdiv(std::uint64_t a, std::uint64_t b) { return (a + b - 1) / b; }
 
 struct GnArgs {
     const void* x = nullptr;
@@ -69,58 +45,34 @@ void dispatch_gn(std::uint32_t mode, Dtype dt, bool silu, int lanes,
 }
 
 int gn_vec4_lanes(Dtype dt, std::uint32_t hw, std::uint32_t chunk, const void* x, const void* y = nullptr) {
-    const std::uintptr_t req = (dt == Dtype::FP32) ? 16u : 8u;
-    if (hw % 4u != 0u || chunk % 4u != 0u) return 1;
-    if ((reinterpret_cast<std::uintptr_t>(x) % req) != 0u) return 1;
-    if (y != nullptr && (reinterpret_cast<std::uintptr_t>(y) % req) != 0u) return 1;
-    return 4;
+    return gpu_common::gn_vec4_lanes(
+        dt, hw, chunk, reinterpret_cast<std::uintptr_t>(x), reinterpret_cast<std::uintptr_t>(y));
 }
 
 GnArgs gn_stats(const Tensor& X, int n, int c, int hw, int groups, float eps, Tensor& part, const char* op) {
-    const std::uint64_t tiles = static_cast<std::uint64_t>(n) * groups;
-    const std::uint64_t tile = static_cast<std::uint64_t>(c / groups) * hw;
-    if (tiles > 65535) fail(op, "N * num_groups above 65535");
-    if (tile * tiles > 0xffffffffULL) fail(op, "tensor too large");
-    const std::uint64_t splits = std::clamp<std::uint64_t>(cdiv(tile, 8192), 1, 65535);
-    const std::uint64_t chunk = (cdiv(tile, splits) + 3) / 4 * 4;
-    const std::uint64_t used = cdiv(tile, chunk);
-    part = Tensor::empty_on(X.device, static_cast<int>(tiles * used * 3), 1, Dtype::FP32);
+    const gpu_common::GnStatsPlan sp = gpu_common::plan_gn_stats(op, n, c, hw, groups);
+    part = Tensor::empty_on(X.device, static_cast<int>(sp.tiles * sp.splits * 3u), 1, Dtype::FP32);
     GnArgs pc{};
     pc.x = X.data;
     pc.part = part.data;
-    pc.tile = static_cast<std::uint32_t>(tile);
-    pc.hw = static_cast<std::uint32_t>(hw);
-    pc.cpg = static_cast<std::uint32_t>(c / groups);
-    pc.groups = static_cast<std::uint32_t>(groups);
-    pc.splits = static_cast<std::uint32_t>(used);
-    pc.chunk = static_cast<std::uint32_t>(chunk);
+    pc.tile = sp.tile;
+    pc.hw = sp.hw;
+    pc.cpg = sp.cpg;
+    pc.groups = sp.groups;
+    pc.splits = sp.splits;
+    pc.chunk = sp.chunk;
     pc.eps = eps;
     const int lanes = gn_vec4_lanes(X.dtype, pc.hw, pc.chunk, X.data);
-    dispatch_gn(GN_STATS, X.dtype, false, lanes, pc.splits, static_cast<std::uint32_t>(tiles), pc);
+    dispatch_gn(GN_STATS, X.dtype, false, lanes, pc.splits, sp.tiles, pc);
     return pc;
 }
-
-void ensure_c1(Tensor& t, int c, ::brotensor::Device dev) {
-    if (t.data == nullptr) t.device = dev;
-    if (t.size() != c || t.dtype != Dtype::FP32) t.resize(c, 1, Dtype::FP32);
-}
-
-std::uint32_t bn_groups(int c) { return static_cast<std::uint32_t>((std::min)(c, 65535)); }
 
 }  // namespace
 
 void group_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta, int N, int C, int H, int W,
                         int num_groups, float eps, Tensor& Y) {
     constexpr const char* op = "group_norm_forward";
-    require_fp(X.dtype, op);
-    need(op, N >= 0 && C > 0 && H >= 0 && W >= 0, "bad dimension");
-    need(op, num_groups > 0 && C % num_groups == 0, "num_groups must divide C");
-    check_param(op, gamma, C, X.dtype, "gamma");
-    check_param(op, beta, C, X.dtype, "beta");
-    const long long cols = static_cast<long long>(C) * H * W;
-    need(op, X.size() >= N * cols, "X is smaller than N*C*H*W");
-    need(op, cols <= 0x7fffffffLL, "tensor too large");
-    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) Y.resize(N, static_cast<int>(cols), X.dtype);
+    const long long cols = gpu_common::check_group_norm_fwd(op, X, gamma, beta, N, C, H, W, num_groups, Y);
     if (N == 0 || cols == 0) return;
 
     const int hw = H * W;
@@ -130,23 +82,14 @@ void group_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta
     pc.g = gamma.data;
     pc.b = beta.data;
     const int lanes = gn_vec4_lanes(X.dtype, pc.hw, pc.chunk, X.data, Y.data);
-    const std::uint64_t tile = static_cast<std::uint64_t>(C / num_groups) * hw;
-    const std::uint32_t gx = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(cdiv(tile, 256 * 16), 1, 1024));
-    dispatch_gn(GN_APPLY, X.dtype, false, lanes, gx, static_cast<std::uint32_t>(N * num_groups), pc);
+    dispatch_gn(GN_APPLY, X.dtype, false, lanes, gpu_common::gn_apply_gx(pc.tile),
+                static_cast<std::uint32_t>(N * num_groups), pc);
 }
 
 void group_norm_silu_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta, int N, int C, int H, int W,
                              int num_groups, float eps, Tensor& Y) {
     constexpr const char* op = "group_norm_silu_forward";
-    require_fp(X.dtype, op);
-    need(op, N >= 0 && C > 0 && H >= 0 && W >= 0, "bad dimension");
-    need(op, num_groups > 0 && C % num_groups == 0, "num_groups must divide C");
-    check_param(op, gamma, C, X.dtype, "gamma");
-    check_param(op, beta, C, X.dtype, "beta");
-    const long long cols = static_cast<long long>(C) * H * W;
-    need(op, X.size() >= N * cols, "X is smaller than N*C*H*W");
-    need(op, cols <= 0x7fffffffLL, "tensor too large");
-    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) Y.resize(N, static_cast<int>(cols), X.dtype);
+    const long long cols = gpu_common::check_group_norm_fwd(op, X, gamma, beta, N, C, H, W, num_groups, Y);
     if (N == 0 || cols == 0) return;
 
     const int hw = H * W;
@@ -156,29 +99,15 @@ void group_norm_silu_forward(const Tensor& X, const Tensor& gamma, const Tensor&
     pc.g = gamma.data;
     pc.b = beta.data;
     const int lanes = gn_vec4_lanes(X.dtype, pc.hw, pc.chunk, X.data, Y.data);
-    const std::uint64_t tile = static_cast<std::uint64_t>(C / num_groups) * hw;
-    const std::uint32_t gx = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(cdiv(tile, 256 * 16), 1, 1024));
-    dispatch_gn(GN_APPLY, X.dtype, true, lanes, gx, static_cast<std::uint32_t>(N * num_groups), pc);
+    dispatch_gn(GN_APPLY, X.dtype, true, lanes, gpu_common::gn_apply_gx(pc.tile),
+                static_cast<std::uint32_t>(N * num_groups), pc);
 }
 
 void group_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& dY, int N, int C, int H, int W,
                          int num_groups, float eps, Tensor& dX, Tensor& dGamma, Tensor& dBeta) {
     constexpr const char* op = "group_norm_backward";
+    if (!gpu_common::prepare_group_norm_bwd(op, X, gamma, dY, N, C, H, W, num_groups, dX, dGamma, dBeta)) return;
     const Dtype dt = X.dtype;
-    require_fp(dt, op);
-    need(op, gamma.dtype == dt && dY.dtype == dt, "gamma/dY dtype must match X");
-    need(op, dGamma.dtype == dt && dBeta.dtype == dt, "dGamma/dBeta dtype must match X");
-    need(op, N >= 0 && C > 0 && H >= 0 && W >= 0, "bad dimension");
-    need(op, num_groups > 0 && C % num_groups == 0, "num_groups must divide C");
-    need(op, dGamma.rows == C && dGamma.cols == 1 && dBeta.rows == C && dBeta.cols == 1, "dGamma/dBeta must be (C,1)");
-    need(op, gamma.size() == C, "gamma must have C elements");
-    const long long cols = static_cast<long long>(C) * H * W;
-    need(op, cols <= 0x7fffffffLL, "tensor too large");
-    need(op, X.size() >= N * cols && dY.rows == N && dY.cols == cols, "X / dY shape mismatch");
-    if (dX.data == nullptr) dX.device = X.device;
-    if (dX.rows != N || dX.cols != cols || dX.dtype != dt) dX.resize(N, static_cast<int>(cols), dt);
-    if (N == 0 || cols == 0) return;
-    need(op, N <= 65535 && C <= 65535, "N and C must be at most 65535");
 
     const int hw = H * W;
     Tensor part;
@@ -193,8 +122,8 @@ void group_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& dY,
     pc.c = static_cast<std::uint32_t>(C);
     pc.total = static_cast<std::uint32_t>(N);
     dispatch_gn(GN_BWD_CH, dt, false, 1, static_cast<std::uint32_t>(C), static_cast<std::uint32_t>(N), pc);
-    const std::uint32_t gx = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(cdiv(pc.tile, 256 * 16), 1, 1024));
-    dispatch_gn(GN_BWD_DX, dt, false, 1, gx, static_cast<std::uint32_t>(N * num_groups), pc);
+    dispatch_gn(GN_BWD_DX, dt, false, 1, gpu_common::gn_apply_gx(pc.tile),
+                static_cast<std::uint32_t>(N * num_groups), pc);
     pc.y = dGamma.data;
     pc.g = dBeta.data;
     dispatch_gn(GN_BWD_PARAM, dt, false, 1, mir_groups_1d(static_cast<std::uint32_t>(C), 1), 1, pc);
@@ -203,16 +132,8 @@ void group_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& dY,
 void batch_norm_inference(const Tensor& X, const Tensor& gamma, const Tensor& beta, const Tensor& running_mean,
                           const Tensor& running_var, int N, int C, int H, int W, float eps, Tensor& Y) {
     constexpr const char* op = "batch_norm_inference";
-    require_fp(X.dtype, op);
-    need(op, N >= 0 && C > 0 && H >= 0 && W >= 0, "bad dimension");
-    check_param(op, gamma, C, X.dtype, "gamma");
-    check_param(op, beta, C, X.dtype, "beta");
-    check_param(op, running_mean, C, X.dtype, "running_mean");
-    check_param(op, running_var, C, X.dtype, "running_var");
-    const long long cols = static_cast<long long>(C) * H * W;
-    need(op, X.size() >= N * cols, "X is smaller than N*C*H*W");
-    need(op, N * cols <= 0xffffffffLL, "tensor too large");
-    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) Y.resize(N, static_cast<int>(cols), X.dtype);
+    const long long cols = gpu_common::prepare_batch_norm_infer(
+        op, X, gamma, beta, running_mean, running_var, N, C, H, W, Y);
     if (N == 0 || cols == 0) return;
 
     GnArgs pc{};
@@ -227,12 +148,7 @@ void batch_norm_inference(const Tensor& X, const Tensor& gamma, const Tensor& be
 
 void l2_normalize_nchw_forward(const Tensor& X, int N, int C, int H, int W, float eps, Tensor& Y) {
     constexpr const char* op = "l2_normalize_nchw_forward";
-    require_fp(X.dtype, op);
-    need(op, N >= 0 && C > 0 && H > 0 && W > 0, "C/H/W must be >= 1 and N >= 0");
-    const long long cols = static_cast<long long>(C) * H * W;
-    need(op, X.rows == N && X.cols == cols, "X shape must be (N, C*H*W)");
-    need(op, N * cols <= 0xffffffffLL, "tensor too large");
-    if (Y.rows != N || Y.cols != cols || Y.dtype != X.dtype) Y.resize(N, static_cast<int>(cols), X.dtype);
+    gpu_common::prepare_l2_norm_nchw(op, X, N, C, H, W, Y);
     if (N == 0) return;
 
     GnArgs pc{};
@@ -249,26 +165,13 @@ void batch_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta
                         Tensor& running_var, int N, int C, int H, int W, float eps, float momentum, Tensor& Y,
                         Tensor& saved_mean, Tensor& saved_rstd) {
     constexpr const char* op = "batch_norm_forward";
-    for (const Tensor* t : std::initializer_list<const Tensor*>{&X, &gamma, &beta, &running_mean, &running_var}) {
-        require_f32(t->dtype, op, "every operand");
-    }
-    need(op, N >= 0 && C > 0 && H >= 0 && W >= 0, "bad dimension");
-    check_param(op, gamma, C, Dtype::FP32, "gamma");
-    check_param(op, beta, C, Dtype::FP32, "beta");
-    check_param(op, running_mean, C, Dtype::FP32, "running_mean");
-    check_param(op, running_var, C, Dtype::FP32, "running_var");
-    const long long cols = static_cast<long long>(C) * H * W;
-    need(op, X.size() >= N * cols, "X is smaller than N*C*H*W");
-    need(op, N * cols <= 0xffffffffLL, "tensor too large");
-    if (Y.data == nullptr) Y.device = X.device;
-    if (Y.rows != N || Y.cols != cols || Y.dtype != Dtype::FP32) Y.resize(N, static_cast<int>(cols), Dtype::FP32);
-    ensure_c1(saved_mean, C, X.device);
-    ensure_c1(saved_rstd, C, X.device);
+    const long long cols = gpu_common::prepare_batch_norm_fwd(
+        op, X, gamma, beta, running_mean, running_var, N, C, H, W, Y, saved_mean, saved_rstd);
     if (N == 0 || cols == 0) return;
 
     CUfunction fn = mir_function({MirKind::Bnorm, static_cast<std::uint32_t>(BN_TRAIN_FWD)});
     mir_dispatch_bnorm(
-        fn, bn_groups(C),
+        fn, gpu_common::bn_groups(C),
         X.data, Y.data, gamma.data, beta.data,
         running_mean.data, running_var.data,
         saved_mean.data, saved_rstd.data,
@@ -280,25 +183,13 @@ void batch_norm_forward(const Tensor& X, const Tensor& gamma, const Tensor& beta
 void batch_norm_backward(const Tensor& X, const Tensor& gamma, const Tensor& saved_mean, const Tensor& saved_rstd,
                          const Tensor& dY, int N, int C, int H, int W, Tensor& dX, Tensor& dGamma, Tensor& dBeta) {
     constexpr const char* op = "batch_norm_backward";
-    for (const Tensor* t : std::initializer_list<const Tensor*>{
-             &X, &gamma, &saved_mean, &saved_rstd, &dY, &dGamma, &dBeta}) {
-        require_f32(t->dtype, op, "every operand");
-    }
-    need(op, N >= 0 && C > 0 && H >= 0 && W >= 0, "bad dimension");
-    check_param(op, gamma, C, Dtype::FP32, "gamma");
-    check_param(op, saved_mean, C, Dtype::FP32, "saved_mean");
-    check_param(op, saved_rstd, C, Dtype::FP32, "saved_rstd");
-    need(op, dGamma.rows == C && dGamma.cols == 1 && dBeta.rows == C && dBeta.cols == 1, "dGamma/dBeta must be (C,1)");
-    const long long cols = static_cast<long long>(C) * H * W;
-    need(op, X.rows == N && X.cols == cols && dY.rows == N && dY.cols == cols, "X / dY shape mismatch");
-    need(op, N * cols <= 0xffffffffLL, "tensor too large");
-    if (dX.data == nullptr) dX.device = X.device;
-    if (dX.rows != N || dX.cols != cols || dX.dtype != Dtype::FP32) dX.resize(N, static_cast<int>(cols), Dtype::FP32);
+    const long long cols = gpu_common::prepare_batch_norm_bwd(
+        op, X, gamma, saved_mean, saved_rstd, dY, N, C, H, W, dX, dGamma, dBeta);
     if (N == 0 || cols == 0) return;
 
     CUfunction fn = mir_function({MirKind::Bnorm, static_cast<std::uint32_t>(BN_TRAIN_BWD)});
     mir_dispatch_bnorm(
-        fn, bn_groups(C),
+        fn, gpu_common::bn_groups(C),
         X.data, dX.data, gamma.data, nullptr,
         nullptr, nullptr,
         saved_mean.data, saved_rstd.data,

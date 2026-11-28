@@ -15,6 +15,7 @@
 #include "detail/kernels.h"
 #include "detail/quant.h"
 #include "detail/spatial.h"
+#include "../gpu_common/conv_transpose2d.h"
 #include "vk_mir_cache.h"
 
 #include <brotensor/detail/dispatch.h>
@@ -384,26 +385,12 @@ void conv_transpose2d_forward(const Tensor& X, const Tensor& Wt, const Tensor* b
                               int output_padding_h, int output_padding_w, int dil_h, int dil_w, int groups,
                               Tensor& Y) {
     const char* op = "conv_transpose2d_forward";
-    check_same_dtype(op, X, Wt, bias);
     need(op, N >= 0 && C_in > 0 && H > 0 && W > 0 && C_out > 0, "bad dimension");
-    need(op, groups >= 1 && C_in % groups == 0 && C_out % groups == 0,
-         "groups must be >= 1 and divide both C_in and C_out");
-    need(op, kH >= 1 && kW >= 1 && stride_h >= 1 && stride_w >= 1 && dil_h >= 1 && dil_w >= 1 && pad_h >= 0 &&
-                 pad_w >= 0 && output_padding_h >= 0 && output_padding_w >= 0,
-         "kernel, stride and dilation must be >= 1, padding >= 0");
-    need(op, output_padding_h < std::max(stride_h, dil_h) && output_padding_w < std::max(stride_w, dil_w),
-         "output_padding must be smaller than stride or dilation");
-    const int Ho = (H - 1) * stride_h - 2 * pad_h + dil_h * (kH - 1) + output_padding_h + 1;
-    const int Wo = (W - 1) * stride_w - 2 * pad_w + dil_w * (kW - 1) + output_padding_w + 1;
-    need(op, Ho > 0 && Wo > 0, "non-positive output spatial size");
-    const int Cgo = C_out / groups;
-    need(op, Wt.rows == C_in && Wt.cols == Cgo * kH * kW, "Wt shape must be (C_in, (C_out/groups)*kH*kW)");
-    need(op, X.rows == N && X.cols == C_in * H * W, "X shape must be (N, C_in*H*W)");
-    need(op, !bias || bias->size() == C_out, "bias must have C_out elements");
-    const long long out_cols = static_cast<long long>(C_out) * Ho * Wo;
-    need(op, out_cols <= 0x7fffffffLL, "output too large");
-    if (Y.rows != N || Y.cols != out_cols || Y.dtype != X.dtype) Y.resize(N, static_cast<int>(out_cols), X.dtype);
-    if (N == 0) return;
+    const gpu_common::ConvT2dDims d = gpu_common::prepare_convt2d_forward(
+        op, X, Wt, bias, N, C_in, H, W, C_out, kH, kW, stride_h, stride_w,
+        pad_h, pad_w, output_padding_h, output_padding_w, dil_h, dil_w, groups, Y);
+    const int Ho = d.Ho, Wo = d.Wo;
+    if (N == 0 || d.out_cols == 0) return;
     if (g_override.load(std::memory_order_relaxed) != 2 &&
         conv_transpose2d_gemm(X, Wt, bias, N, C_in, H, W, C_out, kH, kW, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
                               groups, Ho, Wo, Y)) {

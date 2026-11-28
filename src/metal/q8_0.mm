@@ -107,13 +107,20 @@ void linear_forward_batched_q8_0_fp16(const Tensor& W_q8, const Tensor* bias,
         Y_BD.resize(B, out, Dtype::FP16);
     }
     if (B == 0 || out == 0) return;
+    const int rowbytes = (K / Q8_BLOCK_ELEMS) * Q8_BLOCK_BYTES;
+    if (B >= kQuantPrefillMinB &&
+        try_mir_quant_gemm_cm(QF_Q8_0, X_BD.data, W_q8.data, Y_BD.data,
+                              (bias && bias->size() > 0) ? bias->data : nullptr, nullptr,
+                              Dtype::FP16, B, out, K, K, rowbytes, out, LACT_NONE, EPI_STORE,
+                              "linear_forward_batched_q8_0_fp16")) {
+        return;
+    }
     if (B >= kQuantPrefillMinB) {
         Tensor Wf = Tensor::zeros_on(Device::Metal, out, K, Dtype::FP16);
         dequant_q8_0_to_fp16(W_q8, Wf);
         quant_prefill_gemm_fp16(Wf, bias, X_BD, Y_BD);
         return;
     }
-    const int rowbytes = (K / Q8_BLOCK_ELEMS) * Q8_BLOCK_BYTES;
     mir_dispatch_gemv_q(QF_Q8_0, Dtype::FP16, "linear_forward_batched_q8_0_fp16",
                         X_BD.data, W_q8.data, Y_BD.data,
                         (bias && bias->size() > 0) ? bias->data : nullptr, nullptr,

@@ -2,6 +2,7 @@
 // backed by Brass MIR (MirKind::Gnorm with silu + MirKind::ConvAux), replacing src/cuda/resblock.cu.
 
 #include "cu_mir_cache.h"
+#include "../gpu_common/resblock.h"
 
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
@@ -137,19 +138,6 @@ void dispatch_sum_hw_per_nc(Dtype dt, const void* dh2, void* d_shift, int N, int
     mir_dispatch_args_3d(fn, static_cast<std::uint32_t>(blocks), 1u, 1u, 256u, ptrs, ints, {});
 }
 
-int parse_shift_has_n(const ::brotensor::Tensor* t_emb_shift, Dtype dt, int N, int C_out, const char* op) {
-    if (t_emb_shift->dtype != dt) {
-        throw std::runtime_error(std::string(op) + ": t_emb_shift dtype must match X");
-    }
-    if (t_emb_shift->rows == N && t_emb_shift->cols == C_out) return 1;
-    if ((t_emb_shift->rows == C_out && t_emb_shift->cols == 1) ||
-        (t_emb_shift->rows == 1 && t_emb_shift->cols == C_out) ||
-        t_emb_shift->size() == C_out) {
-        return 0;
-    }
-    throw std::runtime_error(std::string(op) + ": t_emb_shift shape must be (N, C_out) or (C_out,)");
-}
-
 }  // namespace
 
 void resblock_forward(const ::brotensor::Tensor& X,
@@ -163,19 +151,8 @@ void resblock_forward(const ::brotensor::Tensor& X,
                       int num_groups, float eps,
                       ::brotensor::Tensor& Y) {
     const Dtype dt = X.dtype;
-    if (dt != Dtype::FP16 && dt != Dtype::BF16) {
-        throw std::runtime_error("resblock_forward: X must be FP16 or BF16");
-    }
-    if (gamma1.dtype != dt || beta1.dtype != dt || W1.dtype != dt ||
-        gamma2.dtype != dt || beta2.dtype != dt || W2.dtype != dt) {
-        throw std::runtime_error("resblock_forward: all required tensors must share X's dtype (FP16 or BF16)");
-    }
-    if (num_groups <= 0 || C_in % num_groups != 0 || C_out % num_groups != 0) {
-        throw std::runtime_error("resblock_forward: num_groups must divide C_in and C_out");
-    }
-    if (Wskip == nullptr && C_in != C_out) {
-        throw std::runtime_error("resblock_forward: Wskip required when C_in != C_out");
-    }
+    gpu_common::validate_resblock_fp16_bf16(
+        "resblock_forward", X, gamma1, beta1, W1, gamma2, beta2, W2, Wskip, C_in, C_out, num_groups);
     const int spatial = H * Wd;
     const int out_cols = C_out * spatial;
     if (Y.rows != N || Y.cols != out_cols || Y.dtype != dt) Y.resize(N, out_cols, dt);
@@ -190,13 +167,12 @@ void resblock_forward(const ::brotensor::Tensor& X,
     group_norm_silu_forward(X, gamma1, beta1, N, C_in, H, Wd, num_groups, eps, h1);
     conv2d_forward(h1, W1, b1, N, C_in, H, Wd, C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2);
     if (t_emb_shift) {
-        const int has_N = parse_shift_has_n(t_emb_shift, dt, N, C_out, "resblock_forward");
+        const int has_N = gpu_common::parse_shift_has_n(t_emb_shift, dt, N, C_out, "resblock_forward");
         dispatch_add_nc_shift(dt, h2.data, t_emb_shift->data, N, C_out, spatial, has_N);
     }
     group_norm_silu_forward(h2, gamma2, beta2, N, C_out, H, Wd, num_groups, eps, h3);
 
     if (Wskip != nullptr) {
-        if (Wskip->dtype != dt) throw std::runtime_error("resblock_forward: Wskip dtype must match X");
         conv2d_forward(X, *Wskip, bskip, N, C_in, H, Wd, C_out, 1, 1, 1, 1, 0, 0, 1, 1, skip_scratch);
     }
     conv2d_forward(h3, W2, b2, N, C_out, H, Wd, C_out, 3, 3, 1, 1, 1, 1, 1, 1, Y);
@@ -216,42 +192,9 @@ void resblock_forward_int8w_fp16(const ::brotensor::Tensor& X,
                                  int N, int C_in, int C_out, int H, int Wd,
                                  int num_groups, float eps,
                                  ::brotensor::Tensor& Y) {
-    if (X.dtype != Dtype::FP16 || gamma1.dtype != Dtype::FP16 ||
-        beta1.dtype != Dtype::FP16 || gamma2.dtype != Dtype::FP16 || beta2.dtype != Dtype::FP16) {
-        throw std::runtime_error("resblock_forward_int8w_fp16: activation/norm tensors must be FP16");
-    }
-    if (W1_int8.dtype != Dtype::INT8 || W2_int8.dtype != Dtype::INT8) {
-        throw std::runtime_error("resblock_forward_int8w_fp16: W1/W2 must be INT8");
-    }
-    if (s1.dtype != Dtype::FP32 || s2.dtype != Dtype::FP32) {
-        throw std::runtime_error("resblock_forward_int8w_fp16: scales s1/s2 must be FP32");
-    }
-    if (num_groups <= 0 || C_in % num_groups != 0 || C_out % num_groups != 0) {
-        throw std::runtime_error("resblock_forward_int8w_fp16: num_groups must divide C_in and C_out");
-    }
-    if (W1_int8.rows != C_out || W1_int8.cols != C_in * 9) {
-        throw std::runtime_error("resblock_forward_int8w_fp16: W1_int8 shape mismatch");
-    }
-    if (W2_int8.rows != C_out || W2_int8.cols != C_out * 9) {
-        throw std::runtime_error("resblock_forward_int8w_fp16: W2_int8 shape mismatch");
-    }
-    if (s1.rows != C_out || s1.cols != 1 || s2.rows != C_out || s2.cols != 1) {
-        throw std::runtime_error("resblock_forward_int8w_fp16: s1/s2 must be (C_out, 1)");
-    }
-    if (b1 && b1->dtype != Dtype::FP16) throw std::runtime_error("resblock_forward_int8w_fp16: b1 must be FP16");
-    if (b2 && b2->dtype != Dtype::FP16) throw std::runtime_error("resblock_forward_int8w_fp16: b2 must be FP16");
-    if (Wskip_int8 == nullptr) {
-        if (C_in != C_out) throw std::runtime_error("resblock_forward_int8w_fp16: Wskip required when C_in != C_out");
-    } else {
-        if (Wskip_int8->dtype != Dtype::INT8) throw std::runtime_error("resblock_forward_int8w_fp16: Wskip_int8 must be INT8");
-        if (Wskip_int8->rows != C_out || Wskip_int8->cols != C_in) {
-            throw std::runtime_error("resblock_forward_int8w_fp16: Wskip_int8 shape mismatch");
-        }
-        if (sskip == nullptr || sskip->dtype != Dtype::FP32 || sskip->rows != C_out || sskip->cols != 1) {
-            throw std::runtime_error("resblock_forward_int8w_fp16: sskip must be FP32 (C_out, 1)");
-        }
-        if (bskip && bskip->dtype != Dtype::FP16) throw std::runtime_error("resblock_forward_int8w_fp16: bskip must be FP16");
-    }
+    gpu_common::validate_resblock_int8w(
+        "resblock_forward_int8w_fp16", X, gamma1, beta1, W1_int8, s1, b1,
+        gamma2, beta2, W2_int8, s2, b2, Wskip_int8, sskip, bskip, C_in, C_out, num_groups);
     const int spatial = H * Wd;
     const int out_cols = C_out * spatial;
     if (Y.rows != N || Y.cols != out_cols || Y.dtype != Dtype::FP16) Y.resize(N, out_cols, Dtype::FP16);
@@ -266,7 +209,7 @@ void resblock_forward_int8w_fp16(const ::brotensor::Tensor& X,
     group_norm_silu_forward(X, gamma1, beta1, N, C_in, H, Wd, num_groups, eps, h1);
     conv2d_int8w_fp16_forward(h1, W1_int8, s1, b1, N, C_in, H, Wd, C_out, 3, 3, 1, 1, 1, 1, 1, 1, 1, h2);
     if (t_emb_shift) {
-        const int has_N = parse_shift_has_n(t_emb_shift, Dtype::FP16, N, C_out, "resblock_forward_int8w_fp16");
+        const int has_N = gpu_common::parse_shift_has_n(t_emb_shift, Dtype::FP16, N, C_out, "resblock_forward_int8w_fp16");
         dispatch_add_nc_shift(Dtype::FP16, h2.data, t_emb_shift->data, N, C_out, spatial, has_N);
     }
     group_norm_silu_forward(h2, gamma2, beta2, N, C_out, H, Wd, num_groups, eps, h3);
@@ -298,13 +241,10 @@ void resblock_backward(const ::brotensor::Tensor& X,
     (void)bskip;
     (void)b2;
     const Dtype dt = X.dtype;
-    if (dt != Dtype::FP16 && dt != Dtype::BF16) throw std::runtime_error("resblock_backward: X must be FP16 or BF16");
-    if (dY.dtype != dt || gamma1.dtype != dt || beta1.dtype != dt ||
-        W1.dtype != dt || gamma2.dtype != dt || beta2.dtype != dt || W2.dtype != dt) {
-        throw std::runtime_error("resblock_backward: all required tensors must share X's dtype (FP16 or BF16)");
-    }
-    if (Wskip == nullptr && C_in != C_out) throw std::runtime_error("resblock_backward: Wskip required when C_in != C_out");
+    gpu_common::validate_resblock_fp16_bf16(
+        "resblock_backward", X, gamma1, beta1, W1, gamma2, beta2, W2, Wskip, C_in, C_out, num_groups);
     const int spatial = H * Wd;
+    if (dY.dtype != dt) throw std::runtime_error("resblock_backward: dY dtype must match X");
     if (dY.rows != N || dY.cols != C_out * spatial) throw std::runtime_error("resblock_backward: dY shape mismatch");
     if (dX.rows != N || dX.cols != C_in * spatial || dX.dtype != dt) dX.resize(N, C_in * spatial, dt);
     if (N == 0 || spatial == 0) return;
@@ -318,7 +258,7 @@ void resblock_backward(const ::brotensor::Tensor& X,
     silu_forward(h1_pre_silu, h1);
     conv2d_forward(h1, W1, b1, N, C_in, H, Wd, C_out, 3, 3, 1, 1, 1, 1, 1, 1, h2);
     if (t_emb_shift) {
-        const int has_N = parse_shift_has_n(t_emb_shift, dt, N, C_out, "resblock_backward");
+        const int has_N = gpu_common::parse_shift_has_n(t_emb_shift, dt, N, C_out, "resblock_backward");
         dispatch_add_nc_shift(dt, h2.data, t_emb_shift->data, N, C_out, spatial, has_N);
     }
     group_norm_forward(h2, gamma2, beta2, N, C_out, H, Wd, num_groups, eps, h3_pre_silu);
