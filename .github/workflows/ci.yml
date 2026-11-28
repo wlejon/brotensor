@@ -43,10 +43,10 @@ env:
 #     its time swapping instead of compiling. Ninja bounds concurrency by
 #     default; the job counts below are pinned anyway.
 #
-#   * ccache on the two expensive jobs (Metal: ~80 Objective-C++ TUs; CUDA: ~90
-#     .cu TUs). Cold runs are unaffected; a push that doesn't touch a backend
-#     gets those TUs back for free. bronze and brass are built in-tree in
-#     every job, so they are cached by the same launcher.
+#   * ccache on the Metal job (~80 Objective-C++ TUs). Cold runs are unaffected;
+#     a push that doesn't touch Metal gets those TUs back for free. bronze and
+#     brass are built in-tree in every job, so they are cached by the same
+#     launcher.
 jobs:
   # ── CPU tier ──────────────────────────────────────────────────────────────
   #
@@ -198,12 +198,10 @@ jobs:
   # ── CUDA ──────────────────────────────────────────────────────────────────
   #
   # Compile-only: GitHub's hosted runners have no NVIDIA GPU, so nothing can be
-  # executed here. That still buys the thing that actually breaks — nvcc
-  # accepting all ~90 .cu TUs, and the device link (CUDA_RESOLVE_DEVICE_SYMBOLS)
-  # resolving. The parity *runs* stay on the local box / a self-hosted runner.
-  #
-  # CMAKE_CUDA_ARCHITECTURES must be pinned: the project defaults to `native`,
-  # which cannot be probed without a GPU present.
+  # executed here. That still verifies the pure-C++ CUDA backend (Brass MIR ->
+  # PTX JIT + dynamic nvcuda/libcuda driver loader, zero CUDA Toolkit headers
+  # or libraries) compiles and links cleanly. The parity *runs* stay on the
+  # local box / a self-hosted runner.
   cuda:
     name: CUDA build · ubuntu-24.04
     runs-on: ubuntu-24.04
@@ -214,14 +212,6 @@ jobs:
 
       - name: Install Ninja
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build
-
-      - name: Install CUDA toolkit (nvcc + cudart)
-        run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends cuda-nvcc-12-6 cuda-cudart-dev-12-6
-          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -234,9 +224,7 @@ jobs:
           cmake -S brotensor -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBROTENSOR_WITH_CUDA=ON \
-            -DCMAKE_CUDA_ARCHITECTURES=89 \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: cmake --build build --parallel 4
@@ -362,9 +350,9 @@ jobs:
               echo 'every parity test calls the CPU op as its reference, and it does not'
               echo 'build at all without a GPU backend.'
               echo
-              echo 'Scope: `src/` + `include/brotensor/`. The CUDA and Metal backends are'
-              echo 'compiled by nvcc / the Apple toolchain, are not gcov-instrumented, and'
-              echo 'are excluded rather than counted as 0%. bronze and brass, built'
+              echo 'Scope: `src/` + `include/brotensor/`. The Metal backend is'
+              echo 'compiled by the Apple toolchain, is not gcov-instrumented, and'
+              echo 'is excluded rather than counted as 0%. bronze and brass, built'
               echo 'in-tree, are not instrumented and are filtered out.'
               echo
               echo '```'

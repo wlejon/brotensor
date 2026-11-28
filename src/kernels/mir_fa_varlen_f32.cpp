@@ -37,24 +37,14 @@ Value* i32x4_to_f32x4(Ctx& c, Value* v) {
 Value* load_f32x4_masked(Ctx& c, Value* cond, Value* ptr, Value* safe_ptr, Value* scale_opt = nullptr) {
     Value* p = c.b.build_select(cond, ptr, safe_ptr);
     Value* v = c.kb.vload_f32x4(p);
-    Value* out = c.b.build_vzero(Type::f32x4());
-    for (std::uint32_t j = 0; j < 4u; ++j) {
-        Value* elem = c.b.build_vextract_lane(v, j);
-        if (scale_opt) elem = c.b.build_mul(elem, scale_opt);
-        out = c.b.build_vinsert_lane(out, c.b.build_select(cond, elem, c.f32(0.0f)), j);
-    }
-    return out;
+    if (scale_opt) v = c.kb.vmul(v, c.kb.vbroadcast(Type::f32x4(), scale_opt));
+    return c.b.build_select(cond, v, c.b.build_vzero(Type::f32x4()));
 }
 
 Value* load_i32x4_masked(Ctx& c, Value* cond, Value* ptr, Value* safe_ptr) {
     Value* p = c.b.build_select(cond, ptr, safe_ptr);
     Value* v = c.kb.vload(Type::i32x4(), p);
-    Value* out = c.b.build_vzero(Type::i32x4());
-    for (std::uint32_t j = 0; j < 4u; ++j) {
-        Value* elem = c.b.build_vextract_lane(v, j);
-        out = c.b.build_vinsert_lane(out, c.b.build_select(cond, elem, c.i32(0)), j);
-    }
-    return out;
+    return c.b.build_select(cond, v, c.b.build_vzero(Type::i32x4()));
 }
 
 Value* fma4_f32x4(Ctx& c, Value* a, Value* b, Value* acc) {

@@ -77,69 +77,80 @@ void stage_kval(Ctx& c, bool has_mask, Value* s_kval, Value* mask_ptr, Value* k0
     }
 }
 
-std::pair<Value*, Value*> emit_bw_interval(Ctx& c, std::uint32_t mode,
+std::pair<Value*, Value*> emit_bw_interval(Ctx& c, std::uint32_t mode, Value* in_q,
                                            Value* qi, Value* lk, Value* causal, Value* window,
                                            Value* nseq, Value* aux, Value* aux2) {
-    if (mode == FA_MODE_VARLEN) {
-        auto st = c.kb.for_range_reduce_n(
-            c.i32(0), c.i32(24), c.i32(1), {c.i32(0), nseq},
-            [&](Value* /*step*/, const std::vector<Value*>& cur) -> std::vector<Value*> {
-                Value* slo = cur[0];
-                Value* shi = cur[1];
-                Value* active = c.b.build_slt(slo, shi);
-                Value* mid = c.b.build_add(slo, c.b.build_ashr(c.b.build_sub(shi, slo), c.i32(1)));
-                Value* safe_mid = c.b.build_select(active, mid, c.i32(0));
-                Value* end_q = c.kb.load_i32(ptr_at(c, aux, c.b.build_add(safe_mid, c.i32(1)), 4));
-                Value* go_right = c.b.build_sle(end_q, qi);
-                Value* nlo = c.b.build_select(c.b.build_and(active, go_right), c.b.build_add(safe_mid, c.i32(1)), slo);
-                Value* nhi = c.b.build_select(c.b.build_and(active, c.b.build_not(go_right)), safe_mid, shi);
-                return {nlo, nhi};
-            });
-        Value* has_seq = c.b.build_sgt(nseq, c.i32(0));
-        Value* b = c.b.build_select(has_seq, clamp_i32(c, st[0], c.i32(0), c.b.build_sub(nseq, c.i32(1))), c.i32(0));
-        Value* qs = c.kb.load_i32(ptr_at(c, aux, b, 4));
-        Value* qe = c.kb.load_i32(ptr_at(c, aux, c.b.build_add(b, c.i32(1)), 4));
-        Value* ks = c.kb.load_i32(ptr_at(c, aux2, b, 4));
-        Value* ke = c.kb.load_i32(ptr_at(c, aux2, c.b.build_add(b, c.i32(1)), 4));
-        Value* in_seq = c.b.build_and(has_seq, c.b.build_and(c.b.build_sle(qs, qi), c.b.build_slt(qi, qe)));
-        Value* lo = smax_i32(c, c.i32(0), ks);
-        Value* hi_seq = smin_i32(c, lk, ke);
-        Value* is_c = c.b.build_ne(causal, c.i32(0));
-        Value* aq = c.b.build_add(ks, c.b.build_sub(qi, qs));
-        Value* hi = c.b.build_select(is_c, smin_i32(c, hi_seq, c.b.build_add(aq, c.i32(1))), hi_seq);
-        Value* has_win = c.b.build_sgt(window, c.i32(0));
-        Value* wlo_c = smax_i32(c, lo, c.b.build_add(c.b.build_sub(aq, window), c.i32(1)));
-        Value* hw = c.b.build_ashr(window, c.i32(1));
-        Value* wlo_b = smax_i32(c, lo, c.b.build_sub(aq, hw));
-        Value* whi_b = smin_i32(c, hi, c.b.build_add(c.b.build_add(aq, hw), c.i32(1)));
-        lo = c.b.build_select(has_win, c.b.build_select(is_c, wlo_c, wlo_b), lo);
-        hi = c.b.build_select(c.b.build_and(has_win, c.b.build_not(is_c)), whi_b, hi);
-        lo = c.b.build_select(in_seq, lo, c.i32(0));
-        hi = c.b.build_select(in_seq, smax_i32(c, lo, hi), c.i32(0));
-        return {lo, hi};
-    }
-    if (mode == FA_MODE_PACKED) {
-        Value* s0 = c.kb.load_i32(ptr_at(c, aux, c.b.build_shl(qi, c.i32(1)), 4));
-        Value* s1 = c.kb.load_i32(ptr_at(c, aux, c.b.build_add(c.b.build_shl(qi, c.i32(1)), c.i32(1)), 4));
-        Value* lo = smax_i32(c, c.i32(0), s0);
-        Value* hi = smin_i32(c, lk, s1);
-        Value* has_win = c.b.build_sgt(window, c.i32(0));
-        Value* hw = c.b.build_ashr(window, c.i32(1));
-        lo = c.b.build_select(has_win, smax_i32(c, lo, c.b.build_sub(qi, hw)), lo);
-        hi = c.b.build_select(has_win, smin_i32(c, hi, c.b.build_add(c.b.build_add(qi, hw), c.i32(1))), hi);
-        return {lo, smax_i32(c, lo, hi)};
-    }
-    // FA_MODE_ROWS
-    Value* is_c = c.b.build_ne(causal, c.i32(0));
-    Value* has_win = c.b.build_sgt(window, c.i32(0));
-    Value* hw = c.b.build_ashr(window, c.i32(1));
-    Value* hi_c = smin_i32(c, lk, c.b.build_add(qi, c.i32(1)));
-    Value* hi_nc = c.b.build_select(has_win, smin_i32(c, lk, c.b.build_add(c.b.build_add(qi, hw), c.i32(1))), lk);
-    Value* hi = c.b.build_select(is_c, hi_c, hi_nc);
-    Value* lo_c = c.b.build_select(has_win, smax_i32(c, c.i32(0), c.b.build_add(c.b.build_sub(qi, window), c.i32(1))), c.i32(0));
-    Value* lo_nc = c.b.build_select(has_win, smax_i32(c, c.i32(0), c.b.build_sub(qi, hw)), c.i32(0));
-    Value* lo = c.b.build_select(is_c, lo_c, lo_nc);
-    return {lo, smax_i32(c, lo, hi)};
+    auto res = emit_if_else_values(
+        c, in_q, {Type::i32(), Type::i32()},
+        [&]() -> std::vector<Value*> {
+            if (mode == FA_MODE_VARLEN) {
+                Value* has_seq = c.b.build_sgt(nseq, c.i32(0));
+                return emit_if_else_values(
+                    c, has_seq, {Type::i32(), Type::i32()},
+                    [&]() -> std::vector<Value*> {
+                        auto st = c.kb.for_range_reduce_n(
+                            c.i32(0), c.i32(24), c.i32(1), {c.i32(0), nseq},
+                            [&](Value* /*step*/, const std::vector<Value*>& cur) -> std::vector<Value*> {
+                                Value* slo = cur[0];
+                                Value* shi = cur[1];
+                                Value* active = c.b.build_slt(slo, shi);
+                                Value* mid = c.b.build_add(slo, c.b.build_ashr(c.b.build_sub(shi, slo), c.i32(1)));
+                                Value* safe_mid = c.b.build_select(active, mid, c.i32(0));
+                                Value* end_q = c.kb.load_i32(ptr_at(c, aux, c.b.build_add(safe_mid, c.i32(1)), 4));
+                                Value* go_right = c.b.build_sle(end_q, qi);
+                                Value* nlo = c.b.build_select(c.b.build_and(active, go_right), c.b.build_add(safe_mid, c.i32(1)), slo);
+                                Value* nhi = c.b.build_select(c.b.build_and(active, c.b.build_not(go_right)), safe_mid, shi);
+                                return {nlo, nhi};
+                            });
+                        Value* b = clamp_i32(c, st[0], c.i32(0), c.b.build_sub(nseq, c.i32(1)));
+                        Value* qs = c.kb.load_i32(ptr_at(c, aux, b, 4));
+                        Value* qe = c.kb.load_i32(ptr_at(c, aux, c.b.build_add(b, c.i32(1)), 4));
+                        Value* ks = c.kb.load_i32(ptr_at(c, aux2, b, 4));
+                        Value* ke = c.kb.load_i32(ptr_at(c, aux2, c.b.build_add(b, c.i32(1)), 4));
+                        Value* in_seq = c.b.build_and(c.b.build_sle(qs, qi), c.b.build_slt(qi, qe));
+                        Value* lo = smax_i32(c, c.i32(0), ks);
+                        Value* hi_seq = smin_i32(c, lk, ke);
+                        Value* is_c = c.b.build_ne(causal, c.i32(0));
+                        Value* aq = c.b.build_add(ks, c.b.build_sub(qi, qs));
+                        Value* hi = c.b.build_select(is_c, smin_i32(c, hi_seq, c.b.build_add(aq, c.i32(1))), hi_seq);
+                        Value* has_win = c.b.build_sgt(window, c.i32(0));
+                        Value* wlo_c = smax_i32(c, lo, c.b.build_add(c.b.build_sub(aq, window), c.i32(1)));
+                        Value* hw = c.b.build_ashr(window, c.i32(1));
+                        Value* wlo_b = smax_i32(c, lo, c.b.build_sub(aq, hw));
+                        Value* whi_b = smin_i32(c, hi, c.b.build_add(c.b.build_add(aq, hw), c.i32(1)));
+                        lo = c.b.build_select(has_win, c.b.build_select(is_c, wlo_c, wlo_b), lo);
+                        hi = c.b.build_select(c.b.build_and(has_win, c.b.build_not(is_c)), whi_b, hi);
+                        lo = c.b.build_select(in_seq, lo, c.i32(0));
+                        hi = c.b.build_select(in_seq, smax_i32(c, lo, hi), c.i32(0));
+                        return {lo, hi};
+                    },
+                    [&]() -> std::vector<Value*> { return {c.i32(0), c.i32(0)}; });
+            }
+            if (mode == FA_MODE_PACKED) {
+                Value* s0 = c.kb.load_i32(ptr_at(c, aux, c.b.build_shl(qi, c.i32(1)), 4));
+                Value* s1 = c.kb.load_i32(ptr_at(c, aux, c.b.build_add(c.b.build_shl(qi, c.i32(1)), c.i32(1)), 4));
+                Value* lo = smax_i32(c, c.i32(0), s0);
+                Value* hi = smin_i32(c, lk, s1);
+                Value* has_win = c.b.build_sgt(window, c.i32(0));
+                Value* hw = c.b.build_ashr(window, c.i32(1));
+                lo = c.b.build_select(has_win, smax_i32(c, lo, c.b.build_sub(qi, hw)), lo);
+                hi = c.b.build_select(has_win, smin_i32(c, hi, c.b.build_add(c.b.build_add(qi, hw), c.i32(1))), hi);
+                return {lo, smax_i32(c, lo, hi)};
+            }
+            // FA_MODE_ROWS
+            Value* is_c = c.b.build_ne(causal, c.i32(0));
+            Value* has_win = c.b.build_sgt(window, c.i32(0));
+            Value* hw = c.b.build_ashr(window, c.i32(1));
+            Value* hi_c = smin_i32(c, lk, c.b.build_add(qi, c.i32(1)));
+            Value* hi_nc = c.b.build_select(has_win, smin_i32(c, lk, c.b.build_add(c.b.build_add(qi, hw), c.i32(1))), lk);
+            Value* hi = c.b.build_select(is_c, hi_c, hi_nc);
+            Value* lo_c = c.b.build_select(has_win, smax_i32(c, c.i32(0), c.b.build_add(c.b.build_sub(qi, window), c.i32(1))), c.i32(0));
+            Value* lo_nc = c.b.build_select(has_win, smax_i32(c, c.i32(0), c.b.build_sub(qi, hw)), c.i32(0));
+            Value* lo = c.b.build_select(is_c, lo_c, lo_nc);
+            return {lo, smax_i32(c, lo, hi)};
+        },
+        [&]() -> std::vector<Value*> { return {c.i32(0), c.i32(0)}; });
+    return {res[0], res[1]};
 }
 
 std::pair<Value*, Value*> emit_bw_query_range(Ctx& c, std::uint32_t mode,
@@ -147,43 +158,49 @@ std::pair<Value*, Value*> emit_bw_query_range(Ctx& c, std::uint32_t mode,
                                               Value* causal, Value* window, Value* nseq,
                                               Value* aux, Value* aux2) {
     if (mode == FA_MODE_VARLEN) {
-        auto st0 = c.kb.for_range_reduce_n(
-            c.i32(0), c.i32(24), c.i32(1), {c.i32(0), nseq},
-            [&](Value* /*step*/, const std::vector<Value*>& cur) -> std::vector<Value*> {
-                Value* slo = cur[0];
-                Value* shi = cur[1];
-                Value* active = c.b.build_slt(slo, shi);
-                Value* mid = c.b.build_add(slo, c.b.build_ashr(c.b.build_sub(shi, slo), c.i32(1)));
-                Value* safe_mid = c.b.build_select(active, mid, c.i32(0));
-                Value* end_k = c.kb.load_i32(ptr_at(c, aux2, c.b.build_add(safe_mid, c.i32(1)), 4));
-                Value* go_right = c.b.build_sle(end_k, k0);
-                Value* nlo = c.b.build_select(c.b.build_and(active, go_right), c.b.build_add(safe_mid, c.i32(1)), slo);
-                Value* nhi = c.b.build_select(c.b.build_and(active, c.b.build_not(go_right)), safe_mid, shi);
-                return {nlo, nhi};
-            });
-        auto st1 = c.kb.for_range_reduce_n(
-            c.i32(0), c.i32(24), c.i32(1), {c.i32(0), nseq},
-            [&](Value* /*step*/, const std::vector<Value*>& cur) -> std::vector<Value*> {
-                Value* slo = cur[0];
-                Value* shi = cur[1];
-                Value* active = c.b.build_slt(slo, shi);
-                Value* mid = c.b.build_add(slo, c.b.build_ashr(c.b.build_sub(shi, slo), c.i32(1)));
-                Value* safe_mid = c.b.build_select(active, mid, c.i32(0));
-                Value* beg_k = c.kb.load_i32(ptr_at(c, aux2, safe_mid, 4));
-                Value* go_right = c.b.build_slt(beg_k, kend);
-                Value* nlo = c.b.build_select(c.b.build_and(active, go_right), c.b.build_add(safe_mid, c.i32(1)), slo);
-                Value* nhi = c.b.build_select(c.b.build_and(active, c.b.build_not(go_right)), safe_mid, shi);
-                return {nlo, nhi};
-            });
         Value* has_seq = c.b.build_sgt(nseq, c.i32(0));
-        Value* b0 = st0[0];
-        Value* b1 = c.b.build_sub(st1[0], c.i32(1));
-        Value* valid = c.b.build_and(has_seq, c.b.build_and(c.b.build_slt(b0, nseq), c.b.build_sle(b0, b1)));
-        Value* sb0 = clamp_i32(c, b0, c.i32(0), smax_i32(c, c.i32(0), c.b.build_sub(nseq, c.i32(1))));
-        Value* sb1 = clamp_i32(c, b1, c.i32(0), smax_i32(c, c.i32(0), c.b.build_sub(nseq, c.i32(1))));
-        Value* qlo = clamp_i32(c, c.kb.load_i32(ptr_at(c, aux, sb0, 4)), c.i32(0), lq);
-        Value* qhi = clamp_i32(c, c.kb.load_i32(ptr_at(c, aux, c.b.build_add(sb1, c.i32(1)), 4)), qlo, lq);
-        return {c.b.build_select(valid, qlo, c.i32(0)), c.b.build_select(valid, qhi, c.i32(0))};
+        auto res = emit_if_else_values(
+            c, has_seq, {Type::i32(), Type::i32()},
+            [&]() -> std::vector<Value*> {
+                auto st0 = c.kb.for_range_reduce_n(
+                    c.i32(0), c.i32(24), c.i32(1), {c.i32(0), nseq},
+                    [&](Value* /*step*/, const std::vector<Value*>& cur) -> std::vector<Value*> {
+                        Value* slo = cur[0];
+                        Value* shi = cur[1];
+                        Value* active = c.b.build_slt(slo, shi);
+                        Value* mid = c.b.build_add(slo, c.b.build_ashr(c.b.build_sub(shi, slo), c.i32(1)));
+                        Value* safe_mid = c.b.build_select(active, mid, c.i32(0));
+                        Value* end_k = c.kb.load_i32(ptr_at(c, aux2, c.b.build_add(safe_mid, c.i32(1)), 4));
+                        Value* go_right = c.b.build_sle(end_k, k0);
+                        Value* nlo = c.b.build_select(c.b.build_and(active, go_right), c.b.build_add(safe_mid, c.i32(1)), slo);
+                        Value* nhi = c.b.build_select(c.b.build_and(active, c.b.build_not(go_right)), safe_mid, shi);
+                        return {nlo, nhi};
+                    });
+                auto st1 = c.kb.for_range_reduce_n(
+                    c.i32(0), c.i32(24), c.i32(1), {c.i32(0), nseq},
+                    [&](Value* /*step*/, const std::vector<Value*>& cur) -> std::vector<Value*> {
+                        Value* slo = cur[0];
+                        Value* shi = cur[1];
+                        Value* active = c.b.build_slt(slo, shi);
+                        Value* mid = c.b.build_add(slo, c.b.build_ashr(c.b.build_sub(shi, slo), c.i32(1)));
+                        Value* safe_mid = c.b.build_select(active, mid, c.i32(0));
+                        Value* beg_k = c.kb.load_i32(ptr_at(c, aux2, safe_mid, 4));
+                        Value* go_right = c.b.build_slt(beg_k, kend);
+                        Value* nlo = c.b.build_select(c.b.build_and(active, go_right), c.b.build_add(safe_mid, c.i32(1)), slo);
+                        Value* nhi = c.b.build_select(c.b.build_and(active, c.b.build_not(go_right)), safe_mid, shi);
+                        return {nlo, nhi};
+                    });
+                Value* b0 = st0[0];
+                Value* b1 = c.b.build_sub(st1[0], c.i32(1));
+                Value* valid = c.b.build_and(c.b.build_slt(b0, nseq), c.b.build_sle(b0, b1));
+                Value* sb0 = clamp_i32(c, b0, c.i32(0), c.b.build_sub(nseq, c.i32(1)));
+                Value* sb1 = clamp_i32(c, b1, c.i32(0), c.b.build_sub(nseq, c.i32(1)));
+                Value* qlo = clamp_i32(c, c.kb.load_i32(ptr_at(c, aux, sb0, 4)), c.i32(0), lq);
+                Value* qhi = clamp_i32(c, c.kb.load_i32(ptr_at(c, aux, c.b.build_add(sb1, c.i32(1)), 4)), qlo, lq);
+                return {c.b.build_select(valid, qlo, c.i32(0)), c.b.build_select(valid, qhi, c.i32(0))};
+            },
+            [&]() -> std::vector<Value*> { return {c.i32(0), c.i32(0)}; });
+        return {res[0], res[1]};
     }
     if (mode == FA_MODE_PACKED) {
         return {c.i32(0), lq};
@@ -353,9 +370,7 @@ brass::Function* build_fa_bwd_mir(brass::Module& mod, Dtype dt,
         kb.if_then(c.b.build_ult(tid, c.i32(static_cast<int>(br))), [&] {
             Value* qi = c.b.build_add(q0, tid);
             Value* in_q = c.b.build_ult(qi, p[10]);
-            auto [iv_lo, iv_hi] = emit_bw_interval(c, mode, qi, p[11], p[17], p[16], p[18], p[5], p[6]);
-            Value* lo_r = c.b.build_select(in_q, iv_lo, c.i32(0));
-            Value* hi_r = c.b.build_select(in_q, iv_hi, c.i32(0));
+            auto [lo_r, hi_r] = emit_bw_interval(c, mode, in_q, qi, p[11], p[17], p[16], p[18], p[5], p[6]);
             kb.shared_store_i32_indexed(s_qlo, tid, lo_r);
             kb.shared_store_i32_indexed(s_qhi, tid, hi_r);
             Value* has_r = c.b.build_slt(lo_r, hi_r);
@@ -512,9 +527,7 @@ brass::Function* build_fa_bwd_mir(brass::Module& mod, Dtype dt,
             kb.if_then(c.b.build_ult(tid, c.i32(static_cast<int>(br))), [&] {
                 Value* qi = c.b.build_add(q0, tid);
                 Value* in_q = c.b.build_ult(qi, p[10]);
-                auto [iv_lo, iv_hi] = emit_bw_interval(c, mode, qi, p[11], p[17], p[16], p[18], p[5], p[6]);
-                Value* lo_r = c.b.build_select(in_q, iv_lo, c.i32(0));
-                Value* hi_r = c.b.build_select(in_q, iv_hi, c.i32(0));
+                auto [lo_r, hi_r] = emit_bw_interval(c, mode, in_q, qi, p[11], p[17], p[16], p[18], p[5], p[6]);
                 kb.shared_store_i32_indexed(s_qlo, tid, lo_r);
                 kb.shared_store_i32_indexed(s_qhi, tid, hi_r);
                 Value* ov = c.b.build_and(in_q, c.b.build_slt(smax_i32(c, k0, lo_r), smin_i32(c, kend, hi_r)));
