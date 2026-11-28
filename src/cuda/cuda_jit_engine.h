@@ -3,8 +3,6 @@
 #include "cuda_driver.h"
 #include "../jit/kernel_disk_cache.h"
 
-#include <cuda.h>
-#include <cuda_runtime.h>
 #if BROTENSOR_HAS_BRASS_CUDA_JIT
 #include <brass/target/ptx_target.hpp>
 #endif
@@ -15,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -43,10 +42,18 @@ namespace brotensor::detail::cuda::jit {
 class CudaJitEngine {
 public:
     static constexpr std::size_t kCapacity = 4096;  // power of two
+    static constexpr int kMaxDevices = 16;
+
+    static CudaJitEngine& for_device(int dev) {
+        static std::array<std::once_flag, kMaxDevices> flags;
+        static std::array<CudaJitEngine*, kMaxDevices> engines{};
+        const int idx = (dev >= 0 && dev < kMaxDevices) ? dev : 0;
+        std::call_once(flags[idx], [idx] { engines[idx] = new CudaJitEngine(idx); });
+        return *engines[idx];
+    }
 
     static CudaJitEngine& instance() {
-        static CudaJitEngine engine;
-        return engine;
+        return for_device(current_device());
     }
 
     bool is_available() const { return available_; }
@@ -103,29 +110,22 @@ private:
         std::string name;  // written before the key is published
     };
 
-    CudaJitEngine() {
+    explicit CudaJitEngine(int dev) {
         // Without a driver on the machine every drv:: call answers
         // CUDA_ERROR_NOT_INITIALIZED, so this is also the "no GPU" exit.
         if (drv::cuInit(0) != CUDA_SUCCESS) return;
 
         int dev_count = 0;
-        if (drv::cuDeviceGetCount(&dev_count) != CUDA_SUCCESS || dev_count <= 0) return;
+        if (drv::cuDeviceGetCount(&dev_count) != CUDA_SUCCESS || dev < 0 || dev >= dev_count) return;
 
-        if (drv::cuCtxGetCurrent(&context_) != CUDA_SUCCESS || !context_) {
-            CUdevice dev = 0;
-            if (drv::cuDeviceGet(&dev, 0) == CUDA_SUCCESS) {
-                if (drv::cuDevicePrimaryCtxRetain(&context_, dev) == CUDA_SUCCESS) {
-                    drv::cuCtxSetCurrent(context_);
-                }
-            }
-        }
+        context_ = primary_context(dev);
         available_ = (context_ != nullptr);
         if (available_) {
-            CUdevice dev = 0;
+            CUdevice cu_dev = 0;
             int cc_major = 0, cc_minor = 0, drv_ver = 0;
-            if (drv::cuDeviceGet(&dev, 0) == CUDA_SUCCESS &&
-                drv::cuDeviceGetAttribute(&cc_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) == CUDA_SUCCESS &&
-                drv::cuDeviceGetAttribute(&cc_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) == CUDA_SUCCESS) {
+            if (drv::cuDeviceGet(&cu_dev, dev) == CUDA_SUCCESS &&
+                drv::cuDeviceGetAttribute(&cc_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cu_dev) == CUDA_SUCCESS &&
+                drv::cuDeviceGetAttribute(&cc_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cu_dev) == CUDA_SUCCESS) {
                 (void)drv::cuDriverGetVersion(&drv_ver);
                 char abuf[64];
                 std::snprintf(abuf, sizeof(abuf), "sm_%d%d:drv%d", cc_major, cc_minor, drv_ver);
@@ -165,9 +165,21 @@ private:
     }
 
     CUfunction compile(const std::string& ptx, const std::string& entry_name) {
-        CUcontext current_ctx = nullptr;
-        drv::cuCtxGetCurrent(&current_ctx);
-        if (!current_ctx) drv::cuCtxSetCurrent(context_);
+        struct CtxGuard {
+            CUcontext prev = nullptr;
+            bool restore = false;
+            explicit CtxGuard(CUcontext target) {
+                drv::cuCtxGetCurrent(&prev);
+                if (prev != target) {
+                    drv::cuCtxSetCurrent(target);
+                    restore = (prev != nullptr);
+                }
+            }
+            ~CtxGuard() {
+                if (restore) drv::cuCtxSetCurrent(prev);
+            }
+        };
+        CtxGuard ctx_guard(context_);
 
         constexpr std::size_t LOG_SIZE = 8192;
         std::vector<char> error_log(LOG_SIZE, 0);

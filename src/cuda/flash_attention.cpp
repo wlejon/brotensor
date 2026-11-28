@@ -2,15 +2,12 @@
 #include <brotensor/detail/dispatch.h>
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 #include "flash_fused_internal.h"
-#include "fp16_internal.cuh"
-#include "gemm_mma.cuh"
+#include "fp16_internal.h"
+#include "gemm_mma.h"
 #include "ops_fa_mir.h"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #include <array>
 #include <cmath>
@@ -39,7 +36,7 @@ std::uint32_t grid_for(int n, int block) {
 
 bool fa_per_head_forward(const void* Q, const void* K, const void* V, const float* mask, void* O,
                          Dtype dt, int Lq, int Lk, int D, int num_heads, int hd,
-                         cudaStream_t stream) {
+                         CUstream stream) {
     const int hdp = (hd + 7) & ~7;
     const int Lk_pad = (Lk + 7) & ~7;
     const std::size_t esz = 2u;
@@ -50,12 +47,13 @@ bool fa_per_head_forward(const void* Q, const void* K, const void* V, const floa
         if (rows > Lq) rows = Lq;
     }
 
-    Tensor Qh  = Tensor::empty_on(Device::CUDA, Lq, hdp, dt);
-    Tensor Kh  = Tensor::empty_on(Device::CUDA, Lk_pad, hdp, dt);
-    Tensor Vth = Tensor::empty_on(Device::CUDA, hdp, Lk_pad, dt);
-    Tensor Oh  = Tensor::empty_on(Device::CUDA, Lq, hdp, dt);
-    Tensor S   = Tensor::empty_on(Device::CUDA, rows, Lk_pad, Dtype::FP32);
-    Tensor P   = Tensor::empty_on(Device::CUDA, rows, Lk_pad, dt);
+    const Device dev = Device::cuda(current_device());
+    Tensor Qh  = Tensor::empty_on(dev, Lq, hdp, dt);
+    Tensor Kh  = Tensor::empty_on(dev, Lk_pad, hdp, dt);
+    Tensor Vth = Tensor::empty_on(dev, hdp, Lk_pad, dt);
+    Tensor Oh  = Tensor::empty_on(dev, Lq, hdp, dt);
+    Tensor S   = Tensor::empty_on(dev, rows, Lk_pad, Dtype::FP32);
+    Tensor P   = Tensor::empty_on(dev, rows, Lk_pad, dt);
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     constexpr int CP = 256;
@@ -82,29 +80,29 @@ bool fa_per_head_forward(const void* Q, const void* K, const void* V, const floa
             void* o_slice = static_cast<char*>(Oh.data) + static_cast<std::size_t>(q0) * hdp * esz;
 
             if (dt == Dtype::BF16) {
-                if (!mma_gemm::launch_f32out(static_cast<const __nv_bfloat16*>(q_slice),
-                                             static_cast<const __nv_bfloat16*>(Kh.data),
+                if (!mma_gemm::launch_f32out(static_cast<const Bf16*>(q_slice),
+                                             static_cast<const Bf16*>(Kh.data),
                                              static_cast<float*>(S.data), m, Lk_pad, hdp, stream)) {
                     return false;
                 }
                 mir_dispatch_args(sm_fn, static_cast<std::uint32_t>(m), 256u,
                                   std::array<std::uintptr_t, 3>{addr(S.data), addr(P.data), addr(mask)},
                                   std::array<std::int32_t, 2>{Lk, Lk_pad}, std::array<float, 1>{scale});
-                fp16_internal::launch_matmul_ABT(static_cast<const __nv_bfloat16*>(P.data),
-                                                 static_cast<const __nv_bfloat16*>(Vth.data),
-                                                 static_cast<__nv_bfloat16*>(o_slice), m, hdp, Lk_pad);
+                fp16_internal::launch_matmul_ABT(static_cast<const Bf16*>(P.data),
+                                                 static_cast<const Bf16*>(Vth.data),
+                                                 static_cast<Bf16*>(o_slice), m, hdp, Lk_pad);
             } else {
-                if (!mma_gemm::launch_f32out(static_cast<const __half*>(q_slice),
-                                             static_cast<const __half*>(Kh.data),
+                if (!mma_gemm::launch_f32out(static_cast<const Fp16*>(q_slice),
+                                             static_cast<const Fp16*>(Kh.data),
                                              static_cast<float*>(S.data), m, Lk_pad, hdp, stream)) {
                     return false;
                 }
                 mir_dispatch_args(sm_fn, static_cast<std::uint32_t>(m), 256u,
                                   std::array<std::uintptr_t, 3>{addr(S.data), addr(P.data), addr(mask)},
                                   std::array<std::int32_t, 2>{Lk, Lk_pad}, std::array<float, 1>{scale});
-                fp16_internal::launch_matmul_ABT(static_cast<const __half*>(P.data),
-                                                 static_cast<const __half*>(Vth.data),
-                                                 static_cast<__half*>(o_slice), m, hdp, Lk_pad);
+                fp16_internal::launch_matmul_ABT(static_cast<const Fp16*>(P.data),
+                                                 static_cast<const Fp16*>(Vth.data),
+                                                 static_cast<Fp16*>(o_slice), m, hdp, Lk_pad);
             }
         }
         mir_dispatch_args(sc_fn, grid_for(Lq * hd, CP), CP,
@@ -145,27 +143,27 @@ void flash_attention_forward(const Tensor& Q, const Tensor& K, const Tensor& V,
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
     if (flash_fused::supported(head_dim)) {
-        cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+        CUstream stream = reinterpret_cast<CUstream>(cuda_current_stream());
         if (bf16) {
             flash_fused::launch(
-                reinterpret_cast<const __nv_bfloat16*>(Q.data),
-                reinterpret_cast<const __nv_bfloat16*>(K.data),
-                reinterpret_cast<const __nv_bfloat16*>(V.data),
-                d_mask, reinterpret_cast<__nv_bfloat16*>(O.data),
+                reinterpret_cast<const Bf16*>(Q.data),
+                reinterpret_cast<const Bf16*>(K.data),
+                reinterpret_cast<const Bf16*>(V.data),
+                d_mask, reinterpret_cast<Bf16*>(O.data),
                 Lq, Lk, D, num_heads, head_dim, causal, stream);
         } else {
             flash_fused::launch(
-                reinterpret_cast<const __half*>(Q.data),
-                reinterpret_cast<const __half*>(K.data),
-                reinterpret_cast<const __half*>(V.data),
-                d_mask, reinterpret_cast<__half*>(O.data),
+                reinterpret_cast<const Fp16*>(Q.data),
+                reinterpret_cast<const Fp16*>(K.data),
+                reinterpret_cast<const Fp16*>(V.data),
+                d_mask, reinterpret_cast<Fp16*>(O.data),
                 Lq, Lk, D, num_heads, head_dim, causal, stream);
         }
         return;
     }
 
     if (!causal) {
-        cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+        CUstream stream = reinterpret_cast<CUstream>(cuda_current_stream());
         if (fa_per_head_forward(Q.data, K.data, V.data, d_mask, O.data, dt, Lq, Lk, D, num_heads, head_dim, stream)) {
             return;
         }

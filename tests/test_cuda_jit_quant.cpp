@@ -7,9 +7,9 @@
 #include <brotensor/ops.h>
 #include <brotensor/tensor.h>
 #include <brotensor/runtime.h>
+#include "../src/cuda/cuda_driver.h"
 #include "../src/cuda/cuda_jit.h"
 
-#include <cuda_runtime.h>
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -69,27 +69,28 @@ float max_abs_error(const float* a, const float* b, size_t n) {
 
 template <typename Fn>
 double time_cuda_us(Fn&& fn, int warmup = 10, int iters = 50) {
+    using namespace brotensor::detail::cuda;
     for (int i = 0; i < warmup; ++i) {
         fn();
     }
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUevent start = nullptr, stop = nullptr;
+    drv::cuEventCreate(&start, 0);
+    drv::cuEventCreate(&stop, 0);
 
-    cudaEventRecord(start);
+    drv::cuEventRecord(start, nullptr);
     for (int i = 0; i < iters; ++i) {
         fn();
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    drv::cuEventRecord(stop, nullptr);
+    drv::cuEventSynchronize(stop);
 
     float ms = 0.0f;
-    cudaEventElapsedTime(&ms, start, stop);
+    drv::cuEventElapsedTime(&ms, start, stop);
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    drv::cuEventDestroy(start);
+    drv::cuEventDestroy(stop);
 
     return (static_cast<double>(ms) * 1000.0) / iters;
 }
@@ -302,23 +303,24 @@ void bench_q8_0_gemv() {
 
         // Allocate GPU memory
         const size_t w_bytes = static_cast<size_t>(N) * BPR * Q8_BYTES;
-        void* d_w = nullptr;
-        float* d_x = nullptr;
-        float* d_y = nullptr;
-        cudaMalloc(&d_w, w_bytes);
-        cudaMalloc(&d_x, K * sizeof(float));
-        cudaMalloc(&d_y, N * sizeof(float));
+        CUdeviceptr dp_w = 0, dp_x = 0, dp_y = 0;
+        brotensor::detail::cuda::drv::cuMemAlloc(&dp_w, w_bytes);
+        brotensor::detail::cuda::drv::cuMemAlloc(&dp_x, K * sizeof(float));
+        brotensor::detail::cuda::drv::cuMemAlloc(&dp_y, N * sizeof(float));
+        void* d_w = reinterpret_cast<void*>(static_cast<std::uintptr_t>(dp_w));
+        float* d_x = reinterpret_cast<float*>(static_cast<std::uintptr_t>(dp_x));
+        float* d_y = reinterpret_cast<float*>(static_cast<std::uintptr_t>(dp_y));
 
-        cudaMemcpy(d_w, h_wq.data(), w_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_x, h_x.data(), K * sizeof(float), cudaMemcpyHostToDevice);
+        brotensor::detail::cuda::drv::cuMemcpyHtoD(dp_w, h_wq.data(), w_bytes);
+        brotensor::detail::cuda::drv::cuMemcpyHtoD(dp_x, h_x.data(), K * sizeof(float));
 
         // Run JIT
         brotensor::detail::cuda::jit::launch_fused_gemv_q8_0_ptx(
             d_w, d_x, d_y, N, K, nullptr
         );
-        cudaDeviceSynchronize();
+        brotensor::sync_all();
 
-        cudaMemcpy(h_jit.data(), d_y, N * sizeof(float), cudaMemcpyDeviceToHost);
+        brotensor::detail::cuda::drv::cuMemcpyDtoH(h_jit.data(), dp_y, N * sizeof(float));
 
         float err = max_abs_error(h_ref.data(), h_jit.data(), N);
         CHECK_PARITY(err, 1e-4f, "fused_gemv_q8_0");
@@ -340,9 +342,9 @@ void bench_q8_0_gemv() {
                   << " | MaxErr: " << std::scientific << std::setprecision(2) << err
                   << std::endl;
 
-        cudaFree(d_w);
-        cudaFree(d_x);
-        cudaFree(d_y);
+        brotensor::detail::cuda::drv::cuMemFree(dp_w);
+        brotensor::detail::cuda::drv::cuMemFree(dp_x);
+        brotensor::detail::cuda::drv::cuMemFree(dp_y);
     }
 }
 
@@ -393,23 +395,24 @@ void bench_q4_k_gemv() {
 
         // Allocate GPU memory
         const size_t w_bytes = static_cast<size_t>(N) * BPR * Q4K_BYTES;
-        void* d_w = nullptr;
-        float* d_x = nullptr;
-        float* d_y = nullptr;
-        cudaMalloc(&d_w, w_bytes);
-        cudaMalloc(&d_x, K * sizeof(float));
-        cudaMalloc(&d_y, N * sizeof(float));
+        CUdeviceptr dp_w = 0, dp_x = 0, dp_y = 0;
+        brotensor::detail::cuda::drv::cuMemAlloc(&dp_w, w_bytes);
+        brotensor::detail::cuda::drv::cuMemAlloc(&dp_x, K * sizeof(float));
+        brotensor::detail::cuda::drv::cuMemAlloc(&dp_y, N * sizeof(float));
+        void* d_w = reinterpret_cast<void*>(static_cast<std::uintptr_t>(dp_w));
+        float* d_x = reinterpret_cast<float*>(static_cast<std::uintptr_t>(dp_x));
+        float* d_y = reinterpret_cast<float*>(static_cast<std::uintptr_t>(dp_y));
 
-        cudaMemcpy(d_w, h_wq.data(), w_bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_x, h_x.data(), K * sizeof(float), cudaMemcpyHostToDevice);
+        brotensor::detail::cuda::drv::cuMemcpyHtoD(dp_w, h_wq.data(), w_bytes);
+        brotensor::detail::cuda::drv::cuMemcpyHtoD(dp_x, h_x.data(), K * sizeof(float));
 
         // Run JIT
         brotensor::detail::cuda::jit::launch_fused_gemv_q4_k_ptx(
             d_w, d_x, d_y, N, K, nullptr
         );
-        cudaDeviceSynchronize();
+        brotensor::sync_all();
 
-        cudaMemcpy(h_jit.data(), d_y, N * sizeof(float), cudaMemcpyDeviceToHost);
+        brotensor::detail::cuda::drv::cuMemcpyDtoH(h_jit.data(), dp_y, N * sizeof(float));
 
         float err = max_abs_error(h_ref.data(), h_jit.data(), N);
         CHECK_PARITY(err, 1e-4f, "fused_gemv_q4_k");
@@ -431,9 +434,9 @@ void bench_q4_k_gemv() {
                   << " | MaxErr: " << std::scientific << std::setprecision(2) << err
                   << std::endl;
 
-        cudaFree(d_w);
-        cudaFree(d_x);
-        cudaFree(d_y);
+        brotensor::detail::cuda::drv::cuMemFree(dp_w);
+        brotensor::detail::cuda::drv::cuMemFree(dp_x);
+        brotensor::detail::cuda::drv::cuMemFree(dp_y);
     }
 }
 
@@ -454,11 +457,13 @@ int main() {
 
     std::cout << "================================================================================\n";
     std::cout << "  BRASS CUDA DRIVER JIT QUANTIZED GEMV (Q8_0 & Q4_K) BENCHMARK SUITE (RTX SM_89)\n";
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    std::cout << "  Device: " << prop.name
-              << " (SMs: " << prop.multiProcessorCount
-              << ", Global Mem: " << std::fixed << std::setprecision(1) << (prop.totalGlobalMem / 1e9) << " GB)\n";
+    std::size_t free_b = 0, total_b = 0;
+    brotensor::detail::cuda::ensure_context(0);
+    brotensor::detail::cuda::drv::cuMemGetInfo(&free_b, &total_b);
+    const int sms = brotensor::detail::cuda::device_attribute(0, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+    std::cout << "  Device: " << brotensor::device_name(Device::CUDA)
+              << " (SMs: " << sms
+              << ", Global Mem: " << std::fixed << std::setprecision(1) << (total_b / 1e9) << " GB)\n";
     std::cout << "================================================================================\n";
 
     // A kernel the JIT cannot find or launch (a brass launch contract that

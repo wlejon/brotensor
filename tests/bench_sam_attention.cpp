@@ -15,8 +15,6 @@
 
 #include "bench_helpers.h"
 
-#include <cuda_runtime.h>
-
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

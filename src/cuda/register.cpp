@@ -1,20 +1,10 @@
-// CUDA backend master registration.
-//
-// Called from `brotensor::init()` (src/init.cpp) when BROTENSOR_HAS_CUDA is
-// defined. Probes the driver via cudaGetDeviceCount(); on success, builds
-// the OpsVTable by calling each cluster's per-cluster fill function,
-// pairs it with the CUDA AllocVTable, and hands the pair to the registry.
-//
-// Every per-cluster fill function lives in `brotensor::detail::cuda` and is
-// defined in its own TU. A null slot in the vtable means "this op is not
-// implemented on CUDA" — the dispatcher throws on null lookups.
+// CUDA backend master registration (pure C++ via dynamic Driver API).
 
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/tensor.h>
-
-#include <cuda_runtime.h>
 
 namespace brotensor::detail::cuda {
 
@@ -30,7 +20,6 @@ void fill_cuda_vtable_elementwise    (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_norms          (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_utils          (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_specialised    (::brotensor::detail::OpsVTable&);
-// ── brosoundml audio-ML clusters (one fill fn per src/cuda/<family>.cu) ──
 void fill_cuda_vtable_vocoder        (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_log_exp_round  (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_fft            (::brotensor::detail::OpsVTable&);
@@ -40,12 +29,9 @@ void fill_cuda_vtable_codec_quant    (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_resample1d     (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_sample_logits  (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_masked_diffusion(::brotensor::detail::OpsVTable&);
-// ── linear-attention text-path clusters ──
 void fill_cuda_vtable_l2_norm        (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_gated_delta_rule(::brotensor::detail::OpsVTable&);
-// ── Qwen3-VL polish (spatial_merge_2x2 + M-RoPE) — rope_mrope.cu ──
 void fill_cuda_vtable_qwen3_vl_polish(::brotensor::detail::OpsVTable&);
-// ── Vision-encoder arbitrary-scale 2D resample (SAM / DPT / depth) ──
 void fill_cuda_vtable_interp2d       (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_pool2d         (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_pad2d          (::brotensor::detail::OpsVTable&);
@@ -63,62 +49,54 @@ void fill_cuda_vtable_batch_norm     (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_image_preproc  (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_noise          (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_lstm           (::brotensor::detail::OpsVTable&);
-// ── StyleGAN3-R synthesis ops (sin/cos/rsqrt/pixel_norm, bias_act,
-//    upfirdn2d, modulated_conv2d) ──
 void fill_cuda_vtable_stylegan_elementwise(::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_bias_act       (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_upfirdn2d      (::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_modulated_conv2d(::brotensor::detail::OpsVTable&);
 void fill_cuda_vtable_filtered_lrelu (::brotensor::detail::OpsVTable&);
-// ── packed variable-length encoder batching (flash_attention_packed.cu, packed_encoder.cu) ──
 void fill_cuda_vtable_packed_encoder (::brotensor::detail::OpsVTable&);
-// ── fused-epilogue / split-K linear (linear_ex.cu, gemm_mma.cu) ──
-void fill_cuda_vtable_linear_ex (::brotensor::detail::OpsVTable&);
-// ── weight-only quantised linear (linear_wq.cu) ──
-void fill_cuda_vtable_linear_wq (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_linear_ex      (::brotensor::detail::OpsVTable&);
+void fill_cuda_vtable_linear_wq      (::brotensor::detail::OpsVTable&);
 
-// ── alloc table (defined in tensor.cu) ──
 const ::brotensor::detail::AllocVTable& cuda_alloc_table();
 void init_async_pool_for_device(int dev);
 
-} // namespace brotensor::detail::cuda
+}  // namespace brotensor::detail::cuda
 
 extern "C" void brotensor_probe_and_register_cuda() {
-    // Probe: count CUDA devices. If the call fails or returns 0 the runtime
-    // / driver is missing — bail without registering. We intentionally do
-    // NOT throw here so a CPU-only host can still load a binary that was
-    // built with CUDA support.
-    int device_count = 0;
-    cudaError_t err = cudaGetDeviceCount(&device_count);
-    if (err != cudaSuccess || device_count == 0) {
+    namespace dc = ::brotensor::detail::cuda;
+    const int dev_count = dc::device_count();
+    if (dev_count <= 0) {
         return;
     }
 
-    ::brotensor::detail::set_cuda_device_count(device_count);
+    ::brotensor::detail::set_cuda_device_count(dev_count);
 
-    // Enable peer access between all GPU pairs and initialize async pools
-    for (int i = 0; i < device_count; ++i) {
-        if (cudaSetDevice(i) != cudaSuccess) continue;
-        brotensor::detail::cuda::init_async_pool_for_device(i);
-        for (int j = 0; j < device_count; ++j) {
-            if (i != j) {
-                int can = 0;
-                if (cudaDeviceCanAccessPeer(&can, i, j) == cudaSuccess && can) {
-                    cudaDeviceEnablePeerAccess(j, 0);
-                    cudaGetLastError(); // Clear any benign sticky error
+    for (int i = 0; i < dev_count; ++i) {
+        if (dc::set_device(i) != CUDA_SUCCESS) continue;
+        dc::init_async_pool_for_device(i);
+
+        CUdevice dev_i = 0;
+        if (dc::drv::cuDeviceGet(&dev_i, i) != CUDA_SUCCESS) continue;
+        for (int j = 0; j < dev_count; ++j) {
+            if (i == j) continue;
+            CUdevice dev_j = 0;
+            if (dc::drv::cuDeviceGet(&dev_j, j) != CUDA_SUCCESS) continue;
+            int can = 0;
+            if (dc::drv::cuDeviceCanAccessPeer(&can, dev_i, dev_j) == CUDA_SUCCESS && can) {
+                if (CUcontext peer_ctx = dc::primary_context(j)) {
+                    (void)dc::drv::cuCtxEnablePeerAccess(peer_ctx, 0);
                 }
             }
         }
     }
 
-    // Set default active device to 0
-    cudaSetDevice(0);
+    (void)dc::set_device(0);
 
     using ::brotensor::DeviceType;
     using ::brotensor::detail::OpsVTable;
-    namespace dc = ::brotensor::detail::cuda;
 
-    OpsVTable ops{};   // zero-init: every slot starts as nullptr
+    OpsVTable ops{};
     dc::fill_cuda_vtable_flash_attention(ops);
     dc::fill_cuda_vtable_attention(ops);
     dc::fill_cuda_vtable_conv(ops);

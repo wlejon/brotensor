@@ -12,9 +12,6 @@
 function(brotensor_add_executable name)
     add_executable(${name} ${ARGN})
     target_link_libraries(${name} PRIVATE brotensor)
-    if(BROTENSOR_WITH_CUDA)
-        target_include_directories(${name} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    endif()
     if(MSVC)
         target_compile_options(${name} PRIVATE /W4)
     else()
@@ -350,28 +347,18 @@ if(BROTENSOR_HAS_GPU)
         # not a ctest: invoke ./tests/Release/brotensor_bench_jit_fusion.
         brotensor_add_executable(brotensor_bench_jit_fusion bench_jit_fusion.cpp)
         brotensor_add_test(brotensor_test_cuda_jit test_cuda_jit.cpp)
-        target_include_directories(brotensor_test_cuda_jit PRIVATE /usr/local/cuda-12.6/targets/x86_64-linux/include)
-        target_link_libraries(brotensor_test_cuda_jit PRIVATE CUDA::cuda_driver)
 
         # Fused GEMV JIT benchmark & parity suite
         brotensor_add_test(brotensor_test_cuda_jit_gemv test_cuda_jit_gemv.cpp)
-        target_include_directories(brotensor_test_cuda_jit_gemv PRIVATE /usr/local/cuda-12.6/targets/x86_64-linux/include)
-        target_link_libraries(brotensor_test_cuda_jit_gemv PRIVATE CUDA::cuda_driver)
 
         # CUDA Graph Runner for JIT kernels suite
         brotensor_add_test(brotensor_test_cuda_graph_jit test_cuda_graph_jit.cpp)
-        target_include_directories(brotensor_test_cuda_graph_jit PRIVATE /usr/local/cuda-12.6/targets/x86_64-linux/include)
-        target_link_libraries(brotensor_test_cuda_graph_jit PRIVATE CUDA::cuda_driver)
 
         # Quantized GEMV (Q8_0 & Q4_K) JIT suite
         brotensor_add_test(brotensor_test_cuda_jit_quant test_cuda_jit_quant.cpp)
-        target_include_directories(brotensor_test_cuda_jit_quant PRIVATE /usr/local/cuda-12.6/targets/x86_64-linux/include)
-        target_link_libraries(brotensor_test_cuda_jit_quant PRIVATE CUDA::cuda_driver)
 
         # Public Fused Ops (CPU & GPU) parity test suite
         brotensor_add_test(brotensor_test_ops_fused test_ops_fused.cpp)
-        target_include_directories(brotensor_test_ops_fused PRIVATE /usr/local/cuda-12.6/targets/x86_64-linux/include)
-        target_link_libraries(brotensor_test_ops_fused PRIVATE CUDA::cuda_driver)
     endif()
     # The fused ops again on Vulkan (BROTENSOR_TEST_GPU picks it in
     # parity_helpers.h); the trace tests run their Vulkan suites themselves.

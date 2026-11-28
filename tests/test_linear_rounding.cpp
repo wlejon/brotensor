@@ -19,8 +19,6 @@
 #include <brotensor/runtime.h>
 #include <brotensor/tensor.h>
 
-#include <cuda_runtime.h>
-
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -196,7 +194,7 @@ Tensor make_quant_weight(int out, int in, Dtype dt, int block_bytes, int block_e
         else put(p, block_bytes - 2, 0.002f);   // Q6_K: d at the block's end
     }
     Tensor W = Tensor::empty_on(Device::CUDA, out, in, dt);
-    cudaMemcpy(W.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice);
+    W.copy_from_host_raw(bytes.data(), bytes.size());
     return W;
 }
 

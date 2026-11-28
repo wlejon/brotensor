@@ -1,11 +1,10 @@
-#include "fp16_internal.cuh"
+#include "fp16_internal.h"
 
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
-#include "gemm_mma.cuh"
+#include "gemm_mma.h"
 #include "ops_gemm_mir.h"
 #include "ops_gemm_mma_mir.h"
-
-#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -26,13 +25,13 @@ bool mma_gemm_enabled() {
 }
 
 int sm_count_and_major(int& major) {
+    using namespace ::brotensor::detail::cuda;
     static int cached_sms[16] = {0}, cached_major[16] = {0};
-    int dev = 0;
-    cudaGetDevice(&dev);
+    int dev = current_device();
     if (dev < 0 || dev >= 16) dev = 0;
     if (cached_sms[dev] == 0) {
-        cudaDeviceGetAttribute(&cached_sms[dev], cudaDevAttrMultiProcessorCount, dev);
-        cudaDeviceGetAttribute(&cached_major[dev], cudaDevAttrComputeCapabilityMajor, dev);
+        cached_sms[dev] = device_attribute(dev, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+        cached_major[dev] = device_attribute(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
         if (cached_sms[dev] <= 0) cached_sms[dev] = 1;
     }
     major = cached_major[dev];
@@ -45,8 +44,8 @@ void launch_abt(const T* A, const T* B, T* C,
                 std::size_t strideA, std::size_t strideB, std::size_t strideC,
                 const T* bias, int act) {
     if (batch <= 0 || M == 0 || N == 0) return;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
-    const Dtype dt = std::is_same_v<T, __half> ? Dtype::FP16 : Dtype::BF16;
+    CUstream stream = reinterpret_cast<CUstream>(::brotensor::cuda_current_stream());
+    const Dtype dt = std::is_same_v<T, Fp16> ? Dtype::FP16 : Dtype::BF16;
 
     if (batch == 1 && static_cast<std::size_t>(M) * static_cast<std::size_t>(N) >= 256 &&
         mma_gemm_enabled() &&
@@ -58,8 +57,9 @@ void launch_abt(const T* A, const T* B, T* C,
 
     if (K == 0) {
         for (int b = 0; b < batch; ++b) {
-            cudaMemsetAsync(const_cast<T*>(C) + static_cast<std::size_t>(b) * strideC, 0,
-                            sizeof(T) * static_cast<std::size_t>(M) * N, stream);
+            BROTENSOR_CUDA_CHECK(::brotensor::detail::cuda::memset_zero_async(
+                const_cast<T*>(C) + static_cast<std::size_t>(b) * strideC,
+                sizeof(T) * static_cast<std::size_t>(M) * N, stream));
         }
         return;
     }
@@ -88,37 +88,37 @@ void launch_abt(const T* A, const T* B, T* C,
         static_cast<std::int64_t>(strideA),
         static_cast<std::int64_t>(strideB),
         static_cast<std::int64_t>(strideC),
-        false, false, 0, act, ::brotensor::Device::cuda(0));
+        false, false, 0, act, ::brotensor::Device::cuda(::brotensor::detail::cuda::current_device()));
 }
 
 }  // namespace
 
-void launch_matmul_ABT_impl(const __half* A, const __half* B, __half* C,
+void launch_matmul_ABT_impl(const Fp16* A, const Fp16* B, Fp16* C,
                             int M, int N, int K,
-                            const __half* bias, int act) {
-    launch_abt<__half>(A, B, C, 1, M, N, K, 0, 0, 0, bias, act);
+                            const Fp16* bias, int act) {
+    launch_abt<Fp16>(A, B, C, 1, M, N, K, 0, 0, 0, bias, act);
 }
 
-void launch_matmul_ABT_impl(const __nv_bfloat16* A, const __nv_bfloat16* B,
-                            __nv_bfloat16* C,
+void launch_matmul_ABT_impl(const Bf16* A, const Bf16* B,
+                            Bf16* C,
                             int M, int N, int K,
-                            const __nv_bfloat16* bias, int act) {
-    launch_abt<__nv_bfloat16>(A, B, C, 1, M, N, K, 0, 0, 0, bias, act);
+                            const Bf16* bias, int act) {
+    launch_abt<Bf16>(A, B, C, 1, M, N, K, 0, 0, 0, bias, act);
 }
 
-void launch_matmul_ABT_batched_impl(const __half* A, const __half* B, __half* C,
+void launch_matmul_ABT_batched_impl(const Fp16* A, const Fp16* B, Fp16* C,
                                     int batch, int M, int N, int K,
                                     std::size_t strideA, std::size_t strideB, std::size_t strideC,
-                                    const __half* bias, int act) {
-    launch_abt<__half>(A, B, C, batch, M, N, K, strideA, strideB, strideC, bias, act);
+                                    const Fp16* bias, int act) {
+    launch_abt<Fp16>(A, B, C, batch, M, N, K, strideA, strideB, strideC, bias, act);
 }
 
-void launch_matmul_ABT_batched_impl(const __nv_bfloat16* A, const __nv_bfloat16* B,
-                                    __nv_bfloat16* C,
+void launch_matmul_ABT_batched_impl(const Bf16* A, const Bf16* B,
+                                    Bf16* C,
                                     int batch, int M, int N, int K,
                                     std::size_t strideA, std::size_t strideB, std::size_t strideC,
-                                    const __nv_bfloat16* bias, int act) {
-    launch_abt<__nv_bfloat16>(A, B, C, batch, M, N, K, strideA, strideB, strideC, bias, act);
+                                    const Bf16* bias, int act) {
+    launch_abt<Bf16>(A, B, C, batch, M, N, K, strideA, strideB, strideC, bias, act);
 }
 
 }  // namespace fp16_internal

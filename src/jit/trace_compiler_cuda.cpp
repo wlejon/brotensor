@@ -6,10 +6,9 @@
 
 #if BROTENSOR_HAS_CUDA
 
+#include "../cuda/cuda_driver.h"
 #include "../cuda/cuda_jit.h"
 #include "../cuda/cuda_jit_engine.h"
-#include <cuda.h>
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
@@ -28,15 +27,11 @@ using detail::cuda::jit::CudaJitEngine;
 namespace {
 
 std::string query_cuda_arch() {
-    int dev = 0;
-    if (cudaGetDevice(&dev) == cudaSuccess) {
-        int major = 0, minor = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess) {
-            const int sm = major * 10 + minor;
-            if (sm >= 75) return "sm_" + std::to_string(sm);
-        }
-    }
+    const int dev = detail::cuda::current_device();
+    const int major = detail::cuda::device_attribute(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
+    const int minor = detail::cuda::device_attribute(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
+    const int sm = major * 10 + minor;
+    if (sm >= 75) return "sm_" + std::to_string(sm);
     return "sm_75";
 }
 

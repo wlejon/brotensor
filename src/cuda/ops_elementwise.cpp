@@ -1,13 +1,12 @@
 // CUDA elementwise, activation, math, bias, cast, GLU, and rowvec ops backed by Brass MIR -> PTX.
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 #include "../vulkan/shaders/op_codes.h"
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
-
-#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <limits>
@@ -266,9 +265,9 @@ void cast(const Tensor& src, Tensor& dst, Dtype out_dtype) {
     const std::uint32_t n = count32(src, "cast");
     if (n == 0) return;
     if (src.dtype == out_dtype) {
-        BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(
-            dst.data, src.data, src.bytes(), cudaMemcpyDeviceToDevice,
-            reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream())));
+        BROTENSOR_CUDA_CHECK(memcpy_d2d_async(
+            dst.data, src.data, src.bytes(),
+            reinterpret_cast<CUstream>(::brotensor::cuda_current_stream())));
         return;
     }
     require_fp("cast", src.dtype);

@@ -1,13 +1,10 @@
 // CUDA INT8 weight-only quantisation (W8A16) — pure C++ MIR dispatcher.
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 
 #include <brotensor/tensor.h>
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -23,12 +20,12 @@ using ::brotensor::Dtype;
 
 namespace linear_int8w_wmma_internal {
 bool launch_linear_int8w_fp16_wmma(
-        const __half* X, const int8_t* W, const float* scales,
-        const __half* bias, __half* Y,
+        const Fp16* X, const int8_t* W, const float* scales,
+        const Fp16* bias, Fp16* Y,
         int B, int M, int K);
 bool launch_linear_int8w_bf16_wmma(
-        const __nv_bfloat16* X, const int8_t* W, const float* scales,
-        const __nv_bfloat16* bias, __nv_bfloat16* Y,
+        const Bf16* X, const int8_t* W, const float* scales,
+        const Bf16* bias, Bf16* Y,
         int B, int M, int K);
 }
 
@@ -37,8 +34,8 @@ void gemv_int8w_cuda(const Tensor& W_int8, const Tensor& scales, const Tensor* b
 
 namespace conv2d_int8w_wmma_internal {
 bool launch_conv2d_int8w_implicit_gemm_wmma(
-        const __half* X, const int8_t* W_int8, const float* scales,
-        const __half* bias, __half* Y,
+        const Fp16* X, const int8_t* W_int8, const float* scales,
+        const Fp16* bias, Fp16* Y,
         int N, int C_in, int H, int W,
         int C_out, int kH, int kW,
         int stride_h, int stride_w,
@@ -53,8 +50,8 @@ std::uintptr_t addr(const void* p) noexcept {
     return reinterpret_cast<std::uintptr_t>(p);
 }
 
-cudaStream_t cur_stream() {
-    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+CUstream cur_stream() {
+    return reinterpret_cast<CUstream>(::brotensor::cuda_current_stream());
 }
 
 }  // namespace
@@ -86,7 +83,7 @@ void matmul_int8w_fp16(const Tensor& W_int8,
     }
     if (M == 0 || Nb == 0) return;
     if (K == 0) {
-        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(Y.data, 0, Y.bytes(), cur_stream()));
+        BROTENSOR_CUDA_CHECK(memset_zero_async(Y.data, Y.bytes(), cur_stream()));
         return;
     }
 
@@ -130,7 +127,7 @@ void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
     }
     if (B == 0 || out_dim == 0) return;
     if (in_dim == 0) {
-        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(Y_BD.data, 0, Y_BD.bytes(), cur_stream()));
+        BROTENSOR_CUDA_CHECK(memset_zero_async(Y_BD.data, Y_BD.bytes(), cur_stream()));
         return;
     }
     const void* b_p = (bias && bias->size() > 0) ? bias->data : nullptr;
@@ -139,17 +136,16 @@ void linear_forward_batched_int8w_fp16(const Tensor& W_int8,
 
     const bool mma_hit = (dt == Dtype::FP16)
         ? linear_int8w_wmma_internal::launch_linear_int8w_fp16_wmma(
-              static_cast<const __half*>(X_BD.data), w_p, s_p,
-              static_cast<const __half*>(b_p),
-              static_cast<__half*>(Y_BD.data),
+              static_cast<const Fp16*>(X_BD.data), w_p, s_p,
+              static_cast<const Fp16*>(b_p),
+              static_cast<Fp16*>(Y_BD.data),
               B, out_dim, in_dim)
         : linear_int8w_wmma_internal::launch_linear_int8w_bf16_wmma(
-              static_cast<const __nv_bfloat16*>(X_BD.data), w_p, s_p,
-              static_cast<const __nv_bfloat16*>(b_p),
-              static_cast<__nv_bfloat16*>(Y_BD.data),
+              static_cast<const Bf16*>(X_BD.data), w_p, s_p,
+              static_cast<const Bf16*>(b_p),
+              static_cast<Bf16*>(Y_BD.data),
               B, out_dim, in_dim);
     if (mma_hit) {
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
         return;
     }
 
@@ -202,18 +198,17 @@ void conv2d_int8w_fp16_forward(const Tensor& X,
     const int total = N * out_cols;
     if (total == 0) return;
 
-    const __half* b_p = (bias && bias->size() > 0) ? static_cast<const __half*>(bias->data) : nullptr;
+    const Fp16* b_p = (bias && bias->size() > 0) ? static_cast<const Fp16*>(bias->data) : nullptr;
     if (groups == 1 && dil_h == 1 && dil_w == 1 &&
         conv2d_int8w_wmma_internal::launch_conv2d_int8w_implicit_gemm_wmma(
-            static_cast<const __half*>(X.data),
+            static_cast<const Fp16*>(X.data),
             static_cast<const int8_t*>(W_int8.data),
             static_cast<const float*>(scales.data),
             b_p,
-            static_cast<__half*>(Y.data),
+            static_cast<Fp16*>(Y.data),
             N, C_in, H, W, C_out, kH, kW,
             stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
             H_out, W_out)) {
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
         return;
     }
 

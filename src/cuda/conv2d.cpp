@@ -2,14 +2,11 @@
 // replacing src/cuda/conv2d.cu.
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/tensor.h>
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -18,9 +15,12 @@ namespace brotensor {
 
 void* cuda_current_stream();
 
+using detail::cuda::Fp16;
+using detail::cuda::Bf16;
+
 namespace conv2d_wmma_internal {
 bool launch_conv2d_implicit_gemm_wmma(
-        const __half* X, const __half* Wt, const __half* bias, __half* Y,
+        const Fp16* X, const Fp16* Wt, const Fp16* bias, Fp16* Y,
         int N, int C_in, int H, int W,
         int C_out, int kH, int kW,
         int stride_h, int stride_w,
@@ -28,8 +28,8 @@ bool launch_conv2d_implicit_gemm_wmma(
         int dil_h, int dil_w,
         int H_out, int W_out);
 bool launch_conv2d_implicit_gemm_wmma_bf16(
-        const __nv_bfloat16* X, const __nv_bfloat16* Wt,
-        const __nv_bfloat16* bias, __nv_bfloat16* Y,
+        const Bf16* X, const Bf16* Wt,
+        const Bf16* bias, Bf16* Y,
         int N, int C_in, int H, int W,
         int C_out, int kH, int kW,
         int stride_h, int stride_w,
@@ -39,10 +39,10 @@ bool launch_conv2d_implicit_gemm_wmma_bf16(
 }
 
 namespace detail::cuda::matmul_rm_internal {
-bool launch_matmul_rm_wmma(const __half* A, const __half* B, __half* C,
+bool launch_matmul_rm_wmma(const Fp16* A, const Fp16* B, Fp16* C,
                            int M, int N, int K);
-bool launch_matmul_rm_wmma_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B,
-                                __nv_bfloat16* C, int M, int N, int K);
+bool launch_matmul_rm_wmma_bf16(const Bf16* A, const Bf16* B,
+                                Bf16* C, int M, int N, int K);
 int rm_wmma_grid_ctas(int M, int N);
 }
 
@@ -50,7 +50,7 @@ namespace detail::cuda {
 
 bool conv2d_igemm_f32(const float* X, const float* Wt, const float* bias, float* Y, int N,
                       int Cin, int H, int W, int Cout, int kH, int kW, int sh, int sw, int ph,
-                      int pw, int dh, int dw, int Ho, int Wo, cudaStream_t stream);
+                      int pw, int dh, int dw, int Ho, int Wo, CUstream stream);
 
 void dispatch_conv_direct(std::uint32_t mode, Dtype dt,
                           const void* x, const void* w, void* y, const void* bias,
@@ -99,7 +99,7 @@ void conv2d_forward(const ::brotensor::Tensor& X,
     const int total = N * out_cols;
     if (total == 0) return;
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    CUstream stream = reinterpret_cast<CUstream>(cuda_current_stream());
 
     constexpr int kMinGemmCtas = 128;
     if (groups == 1 && bias == nullptr && kH == 1 && kW == 1 &&
@@ -114,45 +114,42 @@ void conv2d_forward(const ::brotensor::Tensor& X,
         for (int n = 0; n < N && taken; ++n) {
             if (X.dtype == Dtype::FP16) {
                 taken = detail::cuda::matmul_rm_internal::launch_matmul_rm_wmma(
-                    static_cast<const __half*>(Wt.data),
-                    static_cast<const __half*>(X.data) + n * x_stride,
-                    static_cast<__half*>(Y.data) + n * y_stride,
+                    static_cast<const Fp16*>(Wt.data),
+                    static_cast<const Fp16*>(X.data) + n * x_stride,
+                    static_cast<Fp16*>(Y.data) + n * y_stride,
                     C_out, HW, C_in);
             } else {
                 taken = detail::cuda::matmul_rm_internal::launch_matmul_rm_wmma_bf16(
-                    static_cast<const __nv_bfloat16*>(Wt.data),
-                    static_cast<const __nv_bfloat16*>(X.data) + n * x_stride,
-                    static_cast<__nv_bfloat16*>(Y.data) + n * y_stride,
+                    static_cast<const Bf16*>(Wt.data),
+                    static_cast<const Bf16*>(X.data) + n * x_stride,
+                    static_cast<Bf16*>(Y.data) + n * y_stride,
                     C_out, HW, C_in);
             }
         }
         if (taken) {
-            BROTENSOR_CUDA_CHECK(cudaGetLastError());
             return;
         }
     }
 
     if (X.dtype == Dtype::FP16) {
-        const __half* b_p = (bias && bias->size() > 0) ? static_cast<const __half*>(bias->data) : nullptr;
+        const Fp16* b_p = (bias && bias->size() > 0) ? static_cast<const Fp16*>(bias->data) : nullptr;
         if (groups == 1 &&
             conv2d_wmma_internal::launch_conv2d_implicit_gemm_wmma(
-                static_cast<const __half*>(X.data), static_cast<const __half*>(Wt.data),
-                b_p, static_cast<__half*>(Y.data),
+                static_cast<const Fp16*>(X.data), static_cast<const Fp16*>(Wt.data),
+                b_p, static_cast<Fp16*>(Y.data),
                 N, C_in, H, W, C_out, kH, kW,
                 stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, H_out, W_out)) {
-            BROTENSOR_CUDA_CHECK(cudaGetLastError());
             return;
         }
     } else if (X.dtype == Dtype::BF16) {
-        const __nv_bfloat16* b_p = (bias && bias->size() > 0)
-            ? static_cast<const __nv_bfloat16*>(bias->data) : nullptr;
+        const Bf16* b_p = (bias && bias->size() > 0)
+            ? static_cast<const Bf16*>(bias->data) : nullptr;
         if (groups == 1 &&
             conv2d_wmma_internal::launch_conv2d_implicit_gemm_wmma_bf16(
-                static_cast<const __nv_bfloat16*>(X.data), static_cast<const __nv_bfloat16*>(Wt.data),
-                b_p, static_cast<__nv_bfloat16*>(Y.data),
+                static_cast<const Bf16*>(X.data), static_cast<const Bf16*>(Wt.data),
+                b_p, static_cast<Bf16*>(Y.data),
                 N, C_in, H, W, C_out, kH, kW,
                 stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, H_out, W_out)) {
-            BROTENSOR_CUDA_CHECK(cudaGetLastError());
             return;
         }
     } else {

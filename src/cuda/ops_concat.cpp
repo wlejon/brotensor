@@ -2,12 +2,11 @@
 // Also hosts `fill_cuda_vtable_specialised` — the master vtable fill function
 // for this whole cluster.
 
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 
 #include <brotensor/tensor.h>
 #include <brotensor/detail/dispatch.h>
-
-#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -27,8 +26,8 @@ using ::brotensor::dtype_size_bytes;
 // default stream (which CUDA-graph capture rejects with "operation would make
 // the legacy stream depend on a capturing blocking stream"). Off-capture this
 // is null = the default stream, so there is no behavior change.
-static inline cudaStream_t cur_stream() {
-    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+static inline CUstream cur_stream() {
+    return reinterpret_cast<CUstream>(::brotensor::cuda_current_stream());
 }
 
 void concat_rows(const std::vector<const Tensor*>& parts, Tensor& out) {
@@ -52,9 +51,7 @@ void concat_rows(const std::vector<const Tensor*>& parts, Tensor& out) {
         if (!p) continue;
         const int n = p->size();
         if (n == 0) continue;
-        BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(dst_base + off_bytes, p->data,
-                                       elem * n,
-                                       cudaMemcpyDeviceToDevice, cur_stream()));
+        BROTENSOR_CUDA_CHECK(memcpy_d2d_async(dst_base + off_bytes, p->data, elem * n, cur_stream()));
         off_bytes += elem * n;
     }
 }
@@ -67,9 +64,8 @@ void split_rows(const Tensor& in, const std::vector<Tensor*>& parts) {
         if (!p) continue;
         const int n = p->size();
         if (n == 0) continue;
-        BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(p->data, src_base + off_bytes,
-                                       elem * static_cast<size_t>(n),
-                                       cudaMemcpyDeviceToDevice, cur_stream()));
+        BROTENSOR_CUDA_CHECK(memcpy_d2d_async(
+            p->data, src_base + off_bytes, elem * static_cast<size_t>(n), cur_stream()));
         off_bytes += elem * static_cast<size_t>(n);
     }
 }
@@ -100,11 +96,10 @@ void concat_batched_rows(const std::vector<const Tensor*>& parts,
         if (!p) continue;
         const int d = p->cols;
         if (d == 0) continue;
-        BROTENSOR_CUDA_CHECK(cudaMemcpy2DAsync(
+        BROTENSOR_CUDA_CHECK(memcpy_2d_d2d_async(
             dst_base + col_off_bytes, dst_pitch,
-            p->data,                  elem * d,
-            elem * d,                 B,
-            cudaMemcpyDeviceToDevice, cur_stream()));
+            p->data, elem * d,
+            elem * d, B, cur_stream()));
         col_off_bytes += elem * d;
     }
 }
@@ -147,11 +142,10 @@ void concat_nchw_channels(const std::vector<const Tensor*>& parts,
         const int Ci = C_per_part[i];
         if (Ci == 0) continue;
         const size_t width_bytes = elem * static_cast<size_t>(Ci) * HW;
-        BROTENSOR_CUDA_CHECK(cudaMemcpy2DAsync(
+        BROTENSOR_CUDA_CHECK(memcpy_2d_d2d_async(
             dst_base + c_off * HW * elem, dst_pitch,
-            parts[i]->data,                width_bytes,
-            width_bytes,                   static_cast<size_t>(N),
-            cudaMemcpyDeviceToDevice, cur_stream()));
+            parts[i]->data, width_bytes,
+            width_bytes, static_cast<size_t>(N), cur_stream()));
         c_off += static_cast<size_t>(Ci);
     }
 }
@@ -193,11 +187,10 @@ void concat_nchw_channels_backward(const Tensor& dY,
             continue;
         }
         const size_t width_bytes = elem * static_cast<size_t>(Ci) * HW;
-        BROTENSOR_CUDA_CHECK(cudaMemcpy2DAsync(
-            p->data,                          width_bytes,
-            src_base + c_off * HW * elem,     src_pitch,
-            width_bytes,                       static_cast<size_t>(N),
-            cudaMemcpyDeviceToDevice, cur_stream()));
+        BROTENSOR_CUDA_CHECK(memcpy_2d_d2d_async(
+            p->data, width_bytes,
+            src_base + c_off * HW * elem, src_pitch,
+            width_bytes, static_cast<size_t>(N), cur_stream()));
         c_off += static_cast<size_t>(Ci);
     }
 }
@@ -209,11 +202,10 @@ void copy_d2d(const Tensor& src, int src_off,
     const size_t elem = static_cast<size_t>(dtype_size_bytes(src.dtype));
     const char* src_base = reinterpret_cast<const char*>(src.data);
     char*       dst_base = reinterpret_cast<char*>(dst.data);
-    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(
+    BROTENSOR_CUDA_CHECK(memcpy_d2d_async(
         dst_base + static_cast<size_t>(dst_off) * elem,
         src_base + static_cast<size_t>(src_off) * elem,
-        elem * static_cast<size_t>(n),
-        cudaMemcpyDeviceToDevice, cur_stream()));
+        elem * static_cast<size_t>(n), cur_stream()));
 }
 
 void copy_d2d_strided(const Tensor& src, int src_off, int src_pitch,
@@ -225,11 +217,11 @@ void copy_d2d_strided(const Tensor& src, int src_off, int src_pitch,
                          + static_cast<size_t>(src_off) * elem;
     char*       dst_base = reinterpret_cast<char*>(dst.data)
                          + static_cast<size_t>(dst_off) * elem;
-    BROTENSOR_CUDA_CHECK(cudaMemcpy2DAsync(
+    BROTENSOR_CUDA_CHECK(memcpy_2d_d2d_async(
         dst_base, static_cast<size_t>(dst_pitch) * elem,
         src_base, static_cast<size_t>(src_pitch) * elem,
         static_cast<size_t>(width) * elem, static_cast<size_t>(height),
-        cudaMemcpyDeviceToDevice, cur_stream()));
+        cur_stream()));
 }
 
 // ─── Forward declarations for the rest of the specialised cluster ──────────

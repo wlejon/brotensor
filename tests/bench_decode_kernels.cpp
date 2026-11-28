@@ -22,8 +22,6 @@
 
 #include "bench_helpers.h"
 
-#include <cuda_runtime.h>
-
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -58,7 +56,7 @@ float time_graph_ms(int chunk, const std::function<void(int)>& body) {
         g = cap.finish();
     }
     g.launch();
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
     // One sample is a batch of REPLAYS launches: a single replay of these
     // kernels is a few microseconds, close enough to cudaEvent resolution to
     // be noise. The batch keeps that amortisation while time_min_ms adds the

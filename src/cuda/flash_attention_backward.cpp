@@ -2,13 +2,10 @@
 #include <brotensor/tensor.h>
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
-#include "gemm_mma.cuh"
+#include "gemm_mma.h"
 #include "ops_fa_mir.h"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
@@ -43,18 +40,18 @@ std::uint32_t grid_for(long long n, int block) {
 int round8(int n) { return (n + 7) & ~7; }
 
 template <typename T>
-bool run_f32_gemm(const void* a, const void* b, float* c, int m, int n, int k, cudaStream_t stream) {
+bool run_f32_gemm(const void* a, const void* b, float* c, int m, int n, int k, CUstream stream) {
     return mma_gemm::launch_f32out(static_cast<const T*>(a), static_cast<const T*>(b), c, m, n, k, stream);
 }
 
-bool launch_f32_gemm_dt(Dtype dt, const void* a, const void* b, float* c, int m, int n, int k, cudaStream_t stream) {
-    if (dt == Dtype::BF16) return run_f32_gemm<__nv_bfloat16>(a, b, c, m, n, k, stream);
-    return run_f32_gemm<__half>(a, b, c, m, n, k, stream);
+bool launch_f32_gemm_dt(Dtype dt, const void* a, const void* b, float* c, int m, int n, int k, CUstream stream) {
+    if (dt == Dtype::BF16) return run_f32_gemm<Bf16>(a, b, c, m, n, k, stream);
+    return run_f32_gemm<Fp16>(a, b, c, m, n, k, stream);
 }
 
 bool tc_backward_dt(Dtype dt, const char* Q, const char* K, const char* V, const char* dO,
                     const float* mask, bool causal, char* dQ, char* dK, char* dV,
-                    int Lq, int Lk, int ld, int nh, int hd, cudaStream_t stream) {
+                    int Lq, int Lk, int ld, int nh, int hd, CUstream stream) {
     const int hdp = round8(hd), Lk_pad = round8(Lk);
     int rows = Lq;
     if (static_cast<std::size_t>(Lq) * Lk_pad > kBwdScoreBudget) {
@@ -64,8 +61,9 @@ bool tc_backward_dt(Dtype dt, const char* Q, const char* K, const char* V, const
     }
     const int rows_pad = round8(rows);
 
+    const Device cur_dev = Device::cuda(current_device());
     auto buf = [&](std::size_t n, Dtype d) {
-        return Tensor::empty_on(Device::CUDA, static_cast<int>(n), 1, d);
+        return Tensor::empty_on(cur_dev, static_cast<int>(n), 1, d);
     };
     const std::size_t kd = static_cast<std::size_t>(Lk_pad) * hdp;
     const std::size_t qd = static_cast<std::size_t>(rows_pad) * hdp;
@@ -135,7 +133,7 @@ bool tc_backward_dt(Dtype dt, const char* Q, const char* K, const char* V, const
 
             if (!launch_f32_gemm_dt(dt, Qh.data, Kh.data, s, m, Lk_pad, hdp, stream)) return false;
             launch_f32_gemm_dt(dt, dOh.data, Vh.data, dp, m, Lk_pad, hdp, stream);
-            BROTENSOR_CUDA_CHECK(cudaMemsetAsync(bound.data, 0, sizeof(unsigned int), stream));
+            BROTENSOR_CUDA_CHECK(memset_zero_async(bound.data, sizeof(unsigned int), stream));
 
             mir_dispatch_args(rstat_fn, static_cast<std::uint32_t>(m), 256u,
                               std::array<std::uintptr_t, 5>{addr(s), addr(dp), addr(mask), addr(stats.data), addr(bound.data)},
@@ -180,7 +178,7 @@ bool tc_backward_dt(Dtype dt, const char* Q, const char* K, const char* V, const
 
 bool tc_block(Dtype dt, const Tensor& Q, const Tensor& K, const Tensor& V, const Tensor& dO, const float* mask,
               bool causal, Tensor& dQ, Tensor& dK, Tensor& dV, std::size_t q_row, std::size_t k_row, int Lq, int Lk,
-              int D, int nh, int hd, cudaStream_t stream) {
+              int D, int nh, int hd, CUstream stream) {
     if (dt != Dtype::BF16 && dt != Dtype::FP16) return false;
     const std::size_t qo = q_row * D * 2u;
     const std::size_t ko = k_row * D * 2u;
@@ -258,7 +256,7 @@ void flash_attention_backward(const Tensor& Q, const Tensor& K, const Tensor& V,
         return;
     }
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    CUstream stream = reinterpret_cast<CUstream>(cuda_current_stream());
     if (!prefer_rows({0, Lq}, {0, Lk}, num_heads, hd, causal) &&
         tc_block(dt, Q, K, V, dO, d_mask, causal, dQ, dK, dV, 0, 0, Lq, Lk, D, num_heads, hd, stream)) {
         return;
@@ -315,13 +313,11 @@ void flash_attention_varlen_backward(const Tensor& Q, const Tensor& K, const Ten
     if (D == 0 || batch_size == 0) return;
     if (total_q == 0 && total_k == 0) return;
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    CUstream stream = reinterpret_cast<CUstream>(cuda_current_stream());
     std::vector<std::int32_t> cq(batch_size + 1), ck(batch_size + 1);
-    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(cq.data(), cu_seqlens_q, sizeof(std::int32_t) * (batch_size + 1),
-                                         cudaMemcpyDeviceToHost, stream));
-    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(ck.data(), cu_seqlens_k, sizeof(std::int32_t) * (batch_size + 1),
-                                         cudaMemcpyDeviceToHost, stream));
-    BROTENSOR_CUDA_CHECK(cudaStreamSynchronize(stream));
+    BROTENSOR_CUDA_CHECK(memcpy_d2h_async(cq.data(), cu_seqlens_q, sizeof(std::int32_t) * (batch_size + 1), stream));
+    BROTENSOR_CUDA_CHECK(memcpy_d2h_async(ck.data(), cu_seqlens_k, sizeof(std::int32_t) * (batch_size + 1), stream));
+    BROTENSOR_CUDA_CHECK(drv::cuStreamSynchronize(stream));
 
     if (cq[0] != 0) throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_q[0] must be 0");
     if (ck[0] != 0) throw std::runtime_error("flash_attention_varlen_backward: cu_seqlens_k[0] must be 0");

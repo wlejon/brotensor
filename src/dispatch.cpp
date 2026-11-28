@@ -17,7 +17,7 @@
 #include <string>
 
 #if defined(BROTENSOR_HAS_CUDA)
-#include <cuda_runtime.h>
+extern "C" void brotensor_cuda_set_device(int dev_index);
 #endif
 
 namespace brotensor::detail {
@@ -74,7 +74,7 @@ inline void activate_device_context(Device dev) {
     dev = resolve_device_alias(dev);
 #if defined(BROTENSOR_HAS_CUDA)
     if (dev.is_cuda()) {
-        cudaSetDevice(dev.index);
+        brotensor_cuda_set_device(dev.index);
     }
 #endif
     (void)dev;

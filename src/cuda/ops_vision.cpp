@@ -2,14 +2,13 @@
 // deform_conv2d_forward and modulated_conv2d_{forward,backward}.
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 #include "../kernels/mir_vision.h"
 #include "../vulkan/shaders/op_codes.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/tensor.h>
-
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -146,7 +145,7 @@ void deform_conv2d_forward(const Tensor& X, const Tensor& offset, const Tensor* 
     if (pcn < P) {
         y_slab = Tensor::empty_on(X.device, Cgo, static_cast<int>(pcn), dt);
     }
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+    CUstream stream = reinterpret_cast<CUstream>(::brotensor::cuda_current_stream());
 
     for (int n = 0; n < N; ++n) {
         const std::size_t off_n_bytes =
@@ -190,11 +189,11 @@ void deform_conv2d_forward(const Tensor& X, const Tensor& offset, const Tensor* 
                 } else {
                     Tensor y_sub = Tensor::view(Y.device, y_slab.data, Cgo, np, dt);
                     matmul(wg, col_v, y_sub);
-                    BROTENSOR_CUDA_CHECK(cudaMemcpy2DAsync(
+                    BROTENSOR_CUDA_CHECK(memcpy_2d_d2d_async(
                         y_ng_p0, static_cast<std::size_t>(P) * es,
                         y_sub.data, static_cast<std::size_t>(np) * es,
                         static_cast<std::size_t>(np) * es, static_cast<std::size_t>(Cgo),
-                        cudaMemcpyDeviceToDevice, stream));
+                        stream));
                 }
             }
         }

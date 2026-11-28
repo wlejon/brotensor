@@ -2,9 +2,9 @@
 
 // CUDA runtime JIT cache for backend-neutral brass MIR kernels (Waves 1 & 2).
 
-#include <brotensor/tensor.h>
+#include "cuda_driver.h"
 
-#include <cuda.h>
+#include <brotensor/tensor.h>
 
 #include <algorithm>
 #include <cstdint>

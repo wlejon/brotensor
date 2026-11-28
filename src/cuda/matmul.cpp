@@ -2,13 +2,10 @@
 #include <brotensor/detail/dispatch.h>
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 #include "ops_gemm_mir.h"
 #include "../kernels/mir_gemm_mma.h"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -18,15 +15,16 @@ namespace brotensor {
 void* cuda_current_stream();
 
 namespace fp16_internal {
-void launch_matmul_ABT_batched_impl(const __half* A, const __half* B, __half* C,
+using Fp16 = ::brotensor::detail::cuda::Fp16;
+using Bf16 = ::brotensor::detail::cuda::Bf16;
+void launch_matmul_ABT_batched_impl(const Fp16* A, const Fp16* B, Fp16* C,
                                     int batch, int M, int N, int K,
                                     std::size_t strideA, std::size_t strideB, std::size_t strideC,
-                                    const __half* bias, int act);
-void launch_matmul_ABT_batched_impl(const __nv_bfloat16* A, const __nv_bfloat16* B,
-                                    __nv_bfloat16* C,
+                                    const Fp16* bias, int act);
+void launch_matmul_ABT_batched_impl(const Bf16* A, const Bf16* B, Bf16* C,
                                     int batch, int M, int N, int K,
                                     std::size_t strideA, std::size_t strideB, std::size_t strideC,
-                                    const __nv_bfloat16* bias, int act);
+                                    const Bf16* bias, int act);
 }  // namespace fp16_internal
 
 namespace detail::cuda {
@@ -39,12 +37,11 @@ int cdiv_i(int a, int b) {
 
 int sm_count_and_major(int& major) {
     static int cached_sms[16] = {0}, cached_major[16] = {0};
-    int dev = 0;
-    cudaGetDevice(&dev);
+    int dev = current_device();
     if (dev < 0 || dev >= 16) dev = 0;
     if (cached_sms[dev] == 0) {
-        cudaDeviceGetAttribute(&cached_sms[dev], cudaDevAttrMultiProcessorCount, dev);
-        cudaDeviceGetAttribute(&cached_major[dev], cudaDevAttrComputeCapabilityMajor, dev);
+        cached_sms[dev] = device_attribute(dev, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+        cached_major[dev] = device_attribute(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
         if (cached_sms[dev] <= 0) cached_sms[dev] = 1;
     }
     major = cached_major[dev];
@@ -115,9 +112,9 @@ void matmul(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
     }
     if (M == 0 || N == 0) return;
     if (K == 0) {
-        BROTENSOR_CUDA_CHECK(cudaMemsetAsync(
-            C.data, 0, C.bytes(),
-            reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream())));
+        BROTENSOR_CUDA_CHECK(memset_zero_async(
+            C.data, C.bytes(),
+            reinterpret_cast<CUstream>(::brotensor::cuda_current_stream())));
         return;
     }
 
@@ -135,13 +132,13 @@ int rm_wmma_grid_ctas(int M, int N) {
     return cdiv_i(N, 64) * cdiv_i(M, 64);
 }
 
-bool launch_matmul_rm_wmma(const __half* A, const __half* B, __half* C,
+bool launch_matmul_rm_wmma(const Fp16* A, const Fp16* B, Fp16* C,
                            int M, int N, int K) {
     return launch_nn_mma(Dtype::FP16, A, B, C, M, N, K);
 }
 
-bool launch_matmul_rm_wmma_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B,
-                                __nv_bfloat16* C, int M, int N, int K) {
+bool launch_matmul_rm_wmma_bf16(const Bf16* A, const Bf16* B,
+                                Bf16* C, int M, int N, int K) {
     return launch_nn_mma(Dtype::BF16, A, B, C, M, N, K);
 }
 
@@ -165,24 +162,23 @@ void matmul_abt(const ::brotensor::Tensor& A, const ::brotensor::Tensor& B,
 
     if (A.dtype == Dtype::FP16) {
         fp16_internal::launch_matmul_ABT_batched_impl(
-            static_cast<const __half*>(A.data),
-            static_cast<const __half*>(B.data),
-            static_cast<__half*>(C.data),
+            static_cast<const Fp16*>(A.data),
+            static_cast<const Fp16*>(B.data),
+            static_cast<Fp16*>(C.data),
             batch, M, N, K,
             static_cast<std::size_t>(strideA), static_cast<std::size_t>(strideB),
             static_cast<std::size_t>(strideC),
-            bias ? static_cast<const __half*>(bias->data) : nullptr, act);
+            bias ? static_cast<const Fp16*>(bias->data) : nullptr, act);
     } else {
         fp16_internal::launch_matmul_ABT_batched_impl(
-            static_cast<const __nv_bfloat16*>(A.data),
-            static_cast<const __nv_bfloat16*>(B.data),
-            static_cast<__nv_bfloat16*>(C.data),
+            static_cast<const Bf16*>(A.data),
+            static_cast<const Bf16*>(B.data),
+            static_cast<Bf16*>(C.data),
             batch, M, N, K,
             static_cast<std::size_t>(strideA), static_cast<std::size_t>(strideB),
             static_cast<std::size_t>(strideC),
-            bias ? static_cast<const __nv_bfloat16*>(bias->data) : nullptr, act);
+            bias ? static_cast<const Bf16*>(bias->data) : nullptr, act);
     }
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
 }
 
 void linear_forward(const ::brotensor::Tensor& W, const ::brotensor::Tensor& b,

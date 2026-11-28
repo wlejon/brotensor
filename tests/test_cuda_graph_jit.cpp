@@ -6,10 +6,10 @@
 #include <brotensor/ops.h>
 #include <brotensor/tensor.h>
 #include <brotensor/runtime.h>
+#include "../src/cuda/cuda_driver.h"
 #include "../src/cuda/cuda_jit.h"
 #include "../src/cuda/cuda_graph_jit.h"
 
-#include <cuda_runtime.h>
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -68,27 +68,28 @@ float max_abs_error(const float* a, const float* b, size_t n) {
 
 template <typename Fn>
 double time_cuda_us(Fn&& fn, int warmup = 20, int iters = 200) {
+    using namespace brotensor::detail::cuda;
     for (int i = 0; i < warmup; ++i) {
         fn();
     }
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUevent start = nullptr, stop = nullptr;
+    drv::cuEventCreate(&start, 0);
+    drv::cuEventCreate(&stop, 0);
 
-    cudaEventRecord(start);
+    drv::cuEventRecord(start, nullptr);
     for (int i = 0; i < iters; ++i) {
         fn();
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    drv::cuEventRecord(stop, nullptr);
+    drv::cuEventSynchronize(stop);
 
     float ms = 0.0f;
-    cudaEventElapsedTime(&ms, start, stop);
+    drv::cuEventElapsedTime(&ms, start, stop);
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    drv::cuEventDestroy(start);
+    drv::cuEventDestroy(stop);
 
     return (static_cast<double>(ms) * 1000.0) / iters;
 }
@@ -135,7 +136,7 @@ void test_graph_runner_lifecycle_and_parity() {
     brotensor::detail::cuda::jit::launch_fused_gemv_swiglu_ptx(
         d_w_gate, d_w_up, d_x, d_y, N, K, nullptr
     );
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
     // Test explicit lifecycle: begin_capture -> op -> end_capture -> instantiate -> launch
     CudaGraphRunner runner;
@@ -160,9 +161,9 @@ void test_graph_runner_lifecycle_and_parity() {
 
     // Execute via graph replay
     runner.launch();
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
-    cudaMemcpy(h_out.data(), d_y, N * sizeof(float), cudaMemcpyDeviceToHost);
+    t_y.copy_to_host_raw(h_out.data(), N * sizeof(float));
     float err = max_abs_error(h_ref.data(), h_out.data(), N);
     CHECK_PARITY(err, 1e-4f, "graph_runner_manual_lifecycle");
     std::cout << "  Explicit lifecycle capture & replay: PASSED (MaxErr: " << std::scientific << err << ")\n";
@@ -177,9 +178,9 @@ void test_graph_runner_lifecycle_and_parity() {
     assert(runner_raii.is_instantiated());
 
     runner_raii.launch();
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
-    cudaMemcpy(h_out.data(), d_y, N * sizeof(float), cudaMemcpyDeviceToHost);
+    t_y.copy_to_host_raw(h_out.data(), N * sizeof(float));
     float err_raii = max_abs_error(h_ref.data(), h_out.data(), N);
     CHECK_PARITY(err_raii, 1e-4f, "graph_runner_raii_capture");
     std::cout << "  RAII capture helper & replay: PASSED (MaxErr: " << std::scientific << err_raii << ")\n";
@@ -216,7 +217,7 @@ void bench_graph_launch_latency() {
         brotensor::detail::cuda::jit::launch_fused_residual_rmsnorm_ptx(
             d_x, d_res, d_gamma, d_y, tc.B, tc.D, 1e-5f, nullptr
         );
-        cudaDeviceSynchronize();
+        brotensor::sync_all();
 
         // 1. Uncaptured launches (driver submission + kernel execution)
         double t_uncaptured_us = time_cuda_us([&]() {
@@ -264,11 +265,13 @@ int main() {
 
     std::cout << "================================================================================\n";
     std::cout << "  CUDA GRAPH CAPTURE FOR BRASS JIT KERNELS BENCHMARK SUITE (RTX SM_89)\n";
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    std::cout << "  Device: " << prop.name
-              << " (SMs: " << prop.multiProcessorCount
-              << ", Global Mem: " << std::fixed << std::setprecision(1) << (prop.totalGlobalMem / 1e9) << " GB)\n";
+    std::size_t free_b = 0, total_b = 0;
+    brotensor::detail::cuda::ensure_context(0);
+    brotensor::detail::cuda::drv::cuMemGetInfo(&free_b, &total_b);
+    const int sms = brotensor::detail::cuda::device_attribute(0, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+    std::cout << "  Device: " << brotensor::device_name(Device::CUDA)
+              << " (SMs: " << sms
+              << ", Global Mem: " << std::fixed << std::setprecision(1) << (total_b / 1e9) << " GB)\n";
     std::cout << "================================================================================\n";
 
     // A kernel the JIT cannot find or launch (a brass launch contract that

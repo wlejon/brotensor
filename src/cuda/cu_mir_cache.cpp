@@ -46,9 +46,17 @@ struct MirCache {
     std::unordered_map<CUfunction, std::uint32_t> dyn_smem;
 };
 
-MirCache& mir_cache() {
-    static auto* c = new MirCache();
-    return *c;
+MirCache& mir_cache(int dev) {
+    constexpr int kMaxDevs = 16;
+    static std::array<std::once_flag, kMaxDevs> once;
+    static std::array<MirCache*, kMaxDevs> caches{};
+    const int idx = (dev >= 0 && dev < kMaxDevs) ? dev : 0;
+    std::call_once(once[idx], [idx] { caches[idx] = new MirCache(); });
+    return *caches[idx];
+}
+
+int clamp_dev(int dev) {
+    return (dev >= 0 && dev < 16) ? dev : 0;
 }
 
 std::string key_string_for(const MirKey& k) {
@@ -69,7 +77,7 @@ bool ptr_ok(std::uintptr_t p, Dtype dt, int lanes) {
     return (p % req) == 0u;
 }
 
-CUfunction compile_mir(const MirKey& k) {
+CUfunction compile_mir(const MirKey& k, int dev) {
 #if !BROTENSOR_HAS_BRASS_CUDA_JIT
     (void)k;
     throw std::runtime_error("brotensor: Brass CUDA JIT is required for CUDA MIR kernels");
@@ -124,10 +132,10 @@ CUfunction compile_mir(const MirKey& k) {
             }
         }
     }
-    CUfunction cu_fn = jit::CudaJitEngine::instance().get_function(
+    CUfunction cu_fn = jit::CudaJitEngine::for_device(dev).get_function(
         mem_key, ptx, fn_name);
 
-    MirCache& cache = mir_cache();
+    MirCache& cache = mir_cache(dev);
     std::lock_guard<std::mutex> lk(cache.mu);
     auto [it, inserted] = cache.map.emplace(k, cu_fn);
     (void)inserted;
@@ -137,7 +145,7 @@ CUfunction compile_mir(const MirKey& k) {
 
 void ensure_dynamic_smem(CUfunction fn, std::uint32_t smem_bytes) {
     if (smem_bytes <= 49152u) return;
-    MirCache& cache = mir_cache();
+    MirCache& cache = mir_cache(clamp_dev(current_device()));
     std::lock_guard<std::mutex> lk(cache.mu);
     auto& recorded = cache.dyn_smem[fn];
     if (recorded >= smem_bytes) return;
@@ -157,7 +165,8 @@ void launch_kernel_3d(CUfunction fn, std::uint32_t gx, std::uint32_t gy, std::ui
     const CUresult res = drv::cuLaunchKernel(
         fn, gx, gy, gz, block_x, 1, 1, smem_bytes, stream, params, nullptr);
     if (res != CUDA_SUCCESS) {
-        throw std::runtime_error(std::string("cuLaunchKernel failed for ") + what);
+        throw std::runtime_error(std::string("cuLaunchKernel failed for ") + what +
+                                 " (err=" + std::to_string(res) + ")");
     }
 }
 
@@ -168,12 +177,13 @@ void launch_kernel(CUfunction fn, std::uint32_t gx, std::uint32_t block_x, void*
 }  // namespace
 
 CUfunction mir_function(const MirKey& key) {
+    const int dev = clamp_dev(current_device());
     {
-        MirCache& cache = mir_cache();
+        MirCache& cache = mir_cache(dev);
         std::lock_guard<std::mutex> lk(cache.mu);
         if (auto it = cache.map.find(key); it != cache.map.end()) return it->second;
     }
-    return compile_mir(key);
+    return compile_mir(key, dev);
 }
 
 int mir_vec_lanes(Dtype dt, std::uint32_t n, std::uintptr_t a0,

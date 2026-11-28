@@ -1,11 +1,9 @@
 #include <brotensor/runtime.h>
 
 #include "cu_mir_cache.h"
-#include "fp16_internal.cuh"
+#include "cuda_driver.h"
+#include "fp16_internal.h"
 #include "ops_gemm_mir.h"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -68,18 +66,18 @@ void linear_forward_batched_fp16_impl(const ::brotensor::Tensor& W,
 
     if (dt == Dtype::FP16) {
         fp16_internal::launch_matmul_ABT_act(
-            static_cast<const __half*>(X_BD.data),
-            static_cast<const __half*>(W.data),
-            static_cast<__half*>(Y_BD.data),
+            static_cast<const Fp16*>(X_BD.data),
+            static_cast<const Fp16*>(W.data),
+            static_cast<Fp16*>(Y_BD.data),
             B, out_dim, in_dim,
-            has_bias ? static_cast<const __half*>(bias->data) : nullptr, act);
+            has_bias ? static_cast<const Fp16*>(bias->data) : nullptr, act);
     } else {
         fp16_internal::launch_matmul_ABT_act(
-            static_cast<const __nv_bfloat16*>(X_BD.data),
-            static_cast<const __nv_bfloat16*>(W.data),
-            static_cast<__nv_bfloat16*>(Y_BD.data),
+            static_cast<const Bf16*>(X_BD.data),
+            static_cast<const Bf16*>(W.data),
+            static_cast<Bf16*>(Y_BD.data),
             B, out_dim, in_dim,
-            has_bias ? static_cast<const __nv_bfloat16*>(bias->data) : nullptr, act);
+            has_bias ? static_cast<const Bf16*>(bias->data) : nullptr, act);
     }
 }
 

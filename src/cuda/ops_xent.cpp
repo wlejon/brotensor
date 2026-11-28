@@ -2,12 +2,11 @@
 // backed by Brass MIR -> PTX (MirKind::Xent).
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/tensor.h>
-
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -81,8 +80,7 @@ float single_tensor(const char* op, const Tensor& logits, const Tensor& target, 
 
 float softmax_xent_segment(const float* logits, const float* target, float* probs, float* dLogits,
                            int n, const float* mask) {
-    int dev_idx = 0;
-    BROTENSOR_CUDA_CHECK(cudaGetDevice(&dev_idx));
+    const int dev_idx = current_device();
     return run_single("softmax_xent_segment", ::brotensor::Device::cuda(dev_idx),
                       logits, target, mask, probs, dLogits, n);
 }

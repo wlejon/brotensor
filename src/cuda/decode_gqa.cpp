@@ -23,23 +23,24 @@ std::uintptr_t addr(const void* p) noexcept {
 
 // Grow-only per-device record scratch (never freed, outgrown buffers included);
 // growth is refused during a graph capture (warm up eagerly first).
-float* workspace(std::size_t floats, cudaStream_t stream) {
+float* workspace(std::size_t floats, CUstream stream) {
     constexpr int MAX_DEVICES = 16;
     static float* buf[MAX_DEVICES] = {};
     static std::size_t capf[MAX_DEVICES] = {};
-    int dev = 0;
-    BROTENSOR_CUDA_CHECK(cudaGetDevice(&dev));
+    const int dev = current_device();
     if (dev < 0 || dev >= MAX_DEVICES) throw std::runtime_error("flash_attention_decode_len: device out of range");
     if (capf[dev] >= floats) return buf[dev];
-    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-    BROTENSOR_CUDA_CHECK(cudaStreamIsCapturing(stream, &cs));
-    if (cs != cudaStreamCaptureStatusNone) {
+    CUstreamCaptureStatus cs = CU_STREAM_CAPTURE_STATUS_NONE;
+    BROTENSOR_CUDA_CHECK(drv::cuStreamIsCapturing(stream, &cs));
+    if (cs != CU_STREAM_CAPTURE_STATUS_NONE) {
         throw std::runtime_error(
             "flash_attention_decode_len: workspace cannot grow during graph capture; run the op once eagerly first");
     }
     buf[dev] = nullptr;
     capf[dev] = 0;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buf[dev]), floats * sizeof(float)));
+    CUdeviceptr dptr = 0;
+    BROTENSOR_CUDA_CHECK(drv::cuMemAlloc(&dptr, floats * sizeof(float)));
+    buf[dev] = reinterpret_cast<float*>(static_cast<std::uintptr_t>(dptr));
     capf[dev] = floats;
     return buf[dev];
 }
@@ -47,11 +48,10 @@ float* workspace(std::size_t floats, cudaStream_t stream) {
 int sm_count() {
     constexpr int MAX_DEVICES = 16;
     static int n[MAX_DEVICES] = {};
-    int dev = 0;
-    BROTENSOR_CUDA_CHECK(cudaGetDevice(&dev));
+    const int dev = current_device();
     if (dev < 0 || dev >= MAX_DEVICES) return 80;
-    if (!n[dev]) BROTENSOR_CUDA_CHECK(cudaDeviceGetAttribute(&n[dev], cudaDevAttrMultiProcessorCount, dev));
-    return n[dev];
+    if (!n[dev]) n[dev] = device_attribute(dev, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+    return n[dev] ? n[dev] : 80;
 }
 
 std::uint8_t encode_hd(int hd) {
@@ -75,7 +75,7 @@ bool supported(int head_dim, int group) {
 }
 
 void launch(const void* Q, const void* K, const void* V, const std::int32_t* d_len, void* O, int cap, int nq, int nkv,
-            int hd, int rows, bool bf16, cudaStream_t stream) {
+            int hd, int rows, bool bf16, CUstream stream) {
     const Dtype dt = bf16 ? Dtype::BF16 : Dtype::FP16;
     const int G = nq / nkv;
     int n_splits = (2 * sm_count() + nkv - 1) / nkv;

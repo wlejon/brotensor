@@ -40,7 +40,8 @@
 #include <brotensor/tensor.h>
 
 #if defined(BROTENSOR_HAS_CUDA)
-#include <cuda_runtime.h>
+#include "../src/cuda/cuda_driver.h"
+namespace brotensor { void* cuda_current_stream(); }
 #endif
 
 #include <chrono>
@@ -103,20 +104,23 @@ inline float time_min_ms(const std::function<void()>& body) {
 
     float best = 1e30f;
 #if defined(BROTENSOR_HAS_CUDA)
-    cudaEvent_t e0, e1;
-    cudaEventCreate(&e0);
-    cudaEventCreate(&e1);
+    using namespace brotensor::detail::cuda;
+    ensure_context(-1);
+    CUstream stream = reinterpret_cast<CUstream>(brotensor::cuda_current_stream());
+    CUevent e0 = nullptr, e1 = nullptr;
+    drv::cuEventCreate(&e0, 0);
+    drv::cuEventCreate(&e1, 0);
     for (int s = 0; s < kSamples; ++s) {
-        cudaEventRecord(e0);
+        drv::cuEventRecord(e0, stream);
         body();
-        cudaEventRecord(e1);
-        cudaEventSynchronize(e1);
+        drv::cuEventRecord(e1, stream);
+        drv::cuEventSynchronize(e1);
         float ms = 0.0f;
-        cudaEventElapsedTime(&ms, e0, e1);
+        drv::cuEventElapsedTime(&ms, e0, e1);
         if (ms < best) best = ms;
     }
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
+    drv::cuEventDestroy(e0);
+    drv::cuEventDestroy(e1);
 #else
     for (int s = 0; s < kSamples; ++s) {
         const auto s0 = std::chrono::steady_clock::now();

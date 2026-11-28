@@ -14,14 +14,11 @@
 #include <brotensor/ops/linear.h>
 #include <brotensor/tensor.h>
 
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
-#include "gemm_mma.cuh"
-#include "gemm_skinny.cuh"
+#include "gemm_mma.h"
+#include "gemm_skinny.h"
 #include "ops_gemm_mir.h"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #include <stdexcept>
 #include <string>
@@ -34,7 +31,7 @@ namespace brotensor::detail::cuda {
 
 namespace {
 
-cudaStream_t cur_stream() { return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream()); }
+CUstream cur_stream() { return reinterpret_cast<CUstream>(::brotensor::cuda_current_stream()); }
 
 [[noreturn]] void fail(const char* reason) {
     throw std::runtime_error(std::string("brotensor: linear_forward_batched_ex: ") + reason);
@@ -135,9 +132,9 @@ void linear_forward_batched_ex(const ::brotensor::Tensor& W, const ::brotensor::
     if (W.dtype == Dtype::FP32)
         run_f32(W, bias, X, act, epilogue, Y);
     else if (W.dtype == Dtype::FP16)
-        run<__half>(W, bias, X, act, epilogue, acc_mode, workspace, Y);
+        run<Fp16>(W, bias, X, act, epilogue, acc_mode, workspace, Y);
     else
-        run<__nv_bfloat16>(W, bias, X, act, epilogue, acc_mode, workspace, Y);
+        run<Bf16>(W, bias, X, act, epilogue, acc_mode, workspace, Y);
 }
 
 void fill_cuda_vtable_linear_ex(::brotensor::detail::OpsVTable& v) {

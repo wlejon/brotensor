@@ -7,9 +7,9 @@
 #include <brotensor/ops.h>
 #include <brotensor/tensor.h>
 #include <brotensor/runtime.h>
+#include "../src/cuda/cuda_driver.h"
 #include "../src/cuda/cuda_jit.h"
 
-#include <cuda_runtime.h>
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -68,27 +68,28 @@ float max_abs_error(const float* a, const float* b, size_t n) {
 
 template <typename Fn>
 double time_cuda_us(Fn&& fn, int warmup = 10, int iters = 50) {
+    using namespace brotensor::detail::cuda;
     for (int i = 0; i < warmup; ++i) {
         fn();
     }
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUevent start = nullptr, stop = nullptr;
+    drv::cuEventCreate(&start, 0);
+    drv::cuEventCreate(&stop, 0);
 
-    cudaEventRecord(start);
+    drv::cuEventRecord(start, nullptr);
     for (int i = 0; i < iters; ++i) {
         fn();
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    drv::cuEventRecord(stop, nullptr);
+    drv::cuEventSynchronize(stop);
 
     float ms = 0.0f;
-    cudaEventElapsedTime(&ms, start, stop);
+    drv::cuEventElapsedTime(&ms, start, stop);
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    drv::cuEventDestroy(start);
+    drv::cuEventDestroy(stop);
 
     return (static_cast<double>(ms) * 1000.0) / static_cast<double>(iters);
 }
@@ -118,7 +119,7 @@ void test_fused_residual_rmsnorm(int B, int D) {
 
     // Static CUDA baseline
     brotensor::rms_norm_forward(g_x_ref, g_gamma, eps, g_y_ref);
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
     // PTX JIT setup
     Tensor g_x_jit = Tensor::from_host_on(Device::CUDA, h_x.data(), B, D);
@@ -132,16 +133,16 @@ void test_fused_residual_rmsnorm(int B, int D) {
         static_cast<float*>(g_y_jit.data),
         B, D, eps
     );
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
     // Verify numerical parity
     std::vector<float> h_y_ref(total);
     std::vector<float> h_y_jit(total);
     std::vector<float> h_x_jit_out(total);
 
-    cudaMemcpy(h_y_ref.data(), g_y_ref.data, total * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_y_jit.data(), g_y_jit.data, total * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_x_jit_out.data(), g_x_jit.data, total * sizeof(float), cudaMemcpyDeviceToHost);
+    g_y_ref.copy_to_host_raw(h_y_ref.data(), total * sizeof(float));
+    g_y_jit.copy_to_host_raw(h_y_jit.data(), total * sizeof(float));
+    g_x_jit.copy_to_host_raw(h_x_jit_out.data(), total * sizeof(float));
 
     float err_x = max_abs_error(h_x_sum.data(), h_x_jit_out.data(), total);
     float err_y = max_abs_error(h_y_ref.data(), h_y_jit.data(), total);
@@ -199,7 +200,7 @@ void test_fused_layernorm_modulate(int R, int D) {
 
     brotensor::layernorm_forward_inference_batched(g_x, g_gamma, g_beta, g_normed, eps);
     brotensor::modulate(g_normed, g_scale, g_shift, g_y_ref);
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
     // PTX JIT: single pass directly into registers and output Y
     Tensor g_y_jit = Tensor::zeros_on(Device::CUDA, R, D);
@@ -213,13 +214,13 @@ void test_fused_layernorm_modulate(int R, int D) {
         static_cast<float*>(g_y_jit.data),
         R, D, eps
     );
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
     // Numerical parity
     std::vector<float> h_y_ref(total);
     std::vector<float> h_y_jit(total);
-    cudaMemcpy(h_y_ref.data(), g_y_ref.data, total * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_y_jit.data(), g_y_jit.data, total * sizeof(float), cudaMemcpyDeviceToHost);
+    g_y_ref.copy_to_host_raw(h_y_ref.data(), total * sizeof(float));
+    g_y_jit.copy_to_host_raw(h_y_jit.data(), total * sizeof(float));
 
     float err_y = max_abs_error(h_y_ref.data(), h_y_jit.data(), total);
     CHECK_PARITY(err_y, 1e-5f, "FusedLayerNormModulate Y");
@@ -262,7 +263,7 @@ void test_swiglu(int B, int D) {
 
     // Static baseline
     brotensor::swiglu_forward(g_x, g_y_ref);
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
     // PTX JIT
     brotensor::detail::cuda::jit::launch_swiglu_ptx(
@@ -270,13 +271,13 @@ void test_swiglu(int B, int D) {
         static_cast<float*>(g_y_jit.data),
         B, D
     );
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
     // Parity
     std::vector<float> h_y_ref(out_total);
     std::vector<float> h_y_jit(out_total);
-    cudaMemcpy(h_y_ref.data(), g_y_ref.data, out_total * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_y_jit.data(), g_y_jit.data, out_total * sizeof(float), cudaMemcpyDeviceToHost);
+    g_y_ref.copy_to_host_raw(h_y_ref.data(), out_total * sizeof(float));
+    g_y_jit.copy_to_host_raw(h_y_jit.data(), out_total * sizeof(float));
 
     float err_y = max_abs_error(h_y_ref.data(), h_y_jit.data(), out_total);
     CHECK_PARITY(err_y, 1e-5f, "SwiGLU Y");
@@ -321,7 +322,7 @@ void test_modulate(int L, int D) {
 
     // Static baseline
     brotensor::modulate(g_x, g_scale, g_shift, g_y_ref);
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
     // PTX JIT
     brotensor::detail::cuda::jit::launch_modulate_ptx(
@@ -331,13 +332,13 @@ void test_modulate(int L, int D) {
         static_cast<float*>(g_y_jit.data),
         L, D
     );
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
     // Parity
     std::vector<float> h_y_ref(total);
     std::vector<float> h_y_jit(total);
-    cudaMemcpy(h_y_ref.data(), g_y_ref.data, total * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_y_jit.data(), g_y_jit.data, total * sizeof(float), cudaMemcpyDeviceToHost);
+    g_y_ref.copy_to_host_raw(h_y_ref.data(), total * sizeof(float));
+    g_y_jit.copy_to_host_raw(h_y_jit.data(), total * sizeof(float));
 
     float err_y = max_abs_error(h_y_ref.data(), h_y_jit.data(), total);
     CHECK_PARITY(err_y, 1e-5f, "AdaLN Modulate Y");
@@ -377,13 +378,18 @@ int main() {
         return 0;
     }
 
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
+    std::size_t free_b = 0, total_b = 0;
+    brotensor::detail::cuda::ensure_context(0);
+    brotensor::detail::cuda::drv::cuMemGetInfo(&free_b, &total_b);
+    const int major = brotensor::detail::cuda::device_attribute(0, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
+    const int minor = brotensor::detail::cuda::device_attribute(0, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
+    const int sms = brotensor::detail::cuda::device_attribute(0, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+    const std::string dev_name = brotensor::device_name(Device::CUDA);
     std::printf("================================================================================\n");
     std::printf("  BRASS CUDA DRIVER JIT BENCHMARK & NUMERICAL PARITY SUITE (RTX SM_%d%d)\n",
-                prop.major, prop.minor);
+                major, minor);
     std::printf("  Device: %s (SMs: %d, Global Mem: %.1f GB)\n",
-                prop.name, prop.multiProcessorCount, static_cast<double>(prop.totalGlobalMem) / 1e9);
+                dev_name.c_str(), sms, static_cast<double>(total_b) / 1e9);
     std::printf("================================================================================\n\n");
 
     const std::vector<int> batches = {1, 8, 32, 64};

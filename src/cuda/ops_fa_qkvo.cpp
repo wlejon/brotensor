@@ -2,10 +2,6 @@
 #include <brotensor/detail/dispatch.h>
 #include "detail/cuda_check.h"
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-
 #include <stdexcept>
 
 namespace brotensor {
@@ -375,8 +371,6 @@ void flash_attention_qkvo_backward(
 
     if (Lq == 0 || Lk == 0 || D == 0) return;
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
-
     Tensor Q = Tensor::empty_on(Device::CUDA, Lq, D, dt);
     Tensor K = Tensor::empty_on(Device::CUDA, Lk, D, dt);
     Tensor V = Tensor::empty_on(Device::CUDA, Lk, D, dt);
@@ -434,7 +428,6 @@ void flash_attention_qkvo_backward(
         add_inplace(*dCtx, dX_from_K);
         add_inplace(*dCtx, dX_from_V);
     }
-    (void)stream;
     (void)bf16;
 }
 

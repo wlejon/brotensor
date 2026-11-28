@@ -113,18 +113,7 @@ if(BROTENSOR_WITH_HIP)
         "use -DBROTENSOR_WITH_VULKAN=ON for AMD GPUs and unset BROTENSOR_WITH_HIP.")
 endif()
 
-if(BROTENSOR_WITH_CUDA)
-    if(NOT CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES native)
-    endif()
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    find_package(CUDAToolkit REQUIRED)
-    if(MSVC AND DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
-        set(CMAKE_CUDA_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
-    endif()
-endif()
+# Backends follow above options; CUDA compiles as pure C++ against Brass MIR.
 if(BROTENSOR_WITH_METAL)
     if(NOT APPLE)
         message(FATAL_ERROR "BROTENSOR_WITH_METAL requires Apple platform.")
@@ -367,10 +356,14 @@ endif()
 # --- brotensor_cuda: CUDA backend (optional) ---
 
 if(BROTENSOR_WITH_CUDA)
+    if(NOT TARGET brass)
+        message(FATAL_ERROR
+            "BROTENSOR_WITH_CUDA=ON requires Brass (every CUDA kernel compiles from Brass MIR to PTX).")
+    endif()
     add_library(brotensor_cuda STATIC
-        src/cuda/runtime.cu
-        src/cuda/tensor.cu
-        src/cuda/cuda_graph.cu
+        src/cuda/runtime.cpp
+        src/cuda/tensor.cpp
+        src/cuda/cuda_graph.cpp
         src/cuda/gemm.cpp
         src/cuda/fp16_matmul.cpp
         src/cuda/cu_mir_cache.cpp
@@ -428,7 +421,7 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/decode_gqa.cpp
         src/cuda/int8_quant.cpp
         src/cuda/ops_filtered_lrelu.cpp
-        src/cuda/register.cu
+        src/cuda/register.cpp
         src/cuda/cuda_driver.cpp
         src/cuda/cuda_jit.cpp
         src/cuda/cuda_jit_gemv.cpp
@@ -437,19 +430,14 @@ if(BROTENSOR_WITH_CUDA)
         src/cuda/kernel_interop_cuda.cpp
         src/jit/trace_compiler_cuda.cpp
     )
-    # Static CUDA runtime: keeps the shipped binary self-contained. The tower
-    # links into a single executable, so there is exactly one cudart instance —
-    # no multi-module context split. On a machine with no NVIDIA driver the
-    # lazily-loaded driver stub simply reports no device and init.cpp falls back
-    # to CPU, so one build runs everywhere (GPU when present, CPU otherwise).
-    #
-    # Never CUDA::cuda_driver here: that is a hard link against libcuda.so.1 /
-    # nvcuda.dll, and the executable then does not load at all on a machine
-    # without the driver — which is exactly the case the paragraph above is
-    # about (and the hosted CI runner, where brotensor-native-manifest has to
-    # run at build time). The JIT's driver-API calls go through
-    # src/cuda/cuda_driver.cpp, resolved via cudaGetDriverEntryPoint.
-    target_link_libraries(brotensor_cuda PUBLIC brotensor_core CUDA::cudart_static)
+    # Dynamic CUDA Driver API: zero CUDA Toolkit headers, zero cudart_static,
+    # and zero hard DT_NEEDED / import on libcuda.so.1 / nvcuda.dll.
+    # src/cuda/cuda_driver.cpp opens the driver library lazily on first use so
+    # one binary runs on GPU machines and falls back cleanly on CPU-only hosts.
+    target_link_libraries(brotensor_cuda PUBLIC brotensor_core)
+    if(NOT WIN32)
+        target_link_libraries(brotensor_cuda PRIVATE ${CMAKE_DL_LIBS})
+    endif()
     if(TARGET brass)
         if(BROTENSOR_BRASS_LIB)
             target_link_libraries(brotensor_cuda PUBLIC "${BROTENSOR_BRASS_LIB}")
@@ -458,22 +446,10 @@ if(BROTENSOR_WITH_CUDA)
     endif()
     target_compile_definitions(brotensor_cuda PUBLIC
         BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
-    # brotensor_core's init.cpp must know whether to probe + register CUDA, and
-    # dispatch.cpp calls cudaSetDevice() directly to activate the resolved
-    # operand's device, so core needs the CUDA headers + cudart as well.
+    # brotensor_core's init.cpp probes + registers CUDA and dispatch.cpp calls
+    # brotensor_cuda_set_device() exported from brotensor_cuda.
     target_compile_definitions(brotensor_core PRIVATE
         BROTENSOR_HAS_CUDA=1 BROTENSOR_HAS_GPU=1)
-    target_link_libraries(brotensor_core PRIVATE CUDA::cudart_static)
-    set_target_properties(brotensor_cuda PROPERTIES
-        CUDA_STANDARD 17
-        CUDA_STANDARD_REQUIRED ON
-        CUDA_SEPARABLE_COMPILATION ON
-        # Run the CUDA device link when the static lib is built so that pure
-        # C++ consumers (tests, brogameagent, brodiffusion) do not need to
-        # invoke nvlink themselves — without this they fail to resolve
-        # __cudaRegisterLinkedBinary_* from the relocatable device code.
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    )
 endif()
 
 # --- brotensor_metal: Metal backend (optional) ---

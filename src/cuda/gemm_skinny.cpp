@@ -1,12 +1,12 @@
-#include "gemm_skinny.cuh"
+#include "gemm_skinny.h"
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 #include "ops_gemm_mma_mir.h"
 #include "../kernels/mir_gemm_skinny.h"
 
 #include <brotensor/tensor.h>
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -29,12 +29,11 @@ constexpr int kThreads = 256;
 
 int sm_count_and_major(int& major) {
     static int cached_sms[16] = {0}, cached_major[16] = {0};
-    int dev = 0;
-    cudaGetDevice(&dev);
+    int dev = current_device();
     if (dev < 0 || dev >= 16) dev = 0;
     if (cached_sms[dev] == 0) {
-        cudaDeviceGetAttribute(&cached_sms[dev], cudaDevAttrMultiProcessorCount, dev);
-        cudaDeviceGetAttribute(&cached_major[dev], cudaDevAttrComputeCapabilityMajor, dev);
+        cached_sms[dev] = device_attribute(dev, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+        cached_major[dev] = device_attribute(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
         if (cached_sms[dev] <= 0) cached_sms[dev] = 1;
     }
     major = cached_major[dev];
@@ -68,7 +67,7 @@ bool shape_ok(int M, int N, int K, int epi) {
 struct ScopedStream {
     void* prev = nullptr;
     bool swapped = false;
-    explicit ScopedStream(cudaStream_t stream) {
+    explicit ScopedStream(CUstream stream) {
         prev = ::brotensor::cuda_current_stream();
         if (reinterpret_cast<void*>(stream) != prev) {
             ::brotensor::detail::cuda::cuda_set_stream(reinterpret_cast<void*>(stream));
@@ -82,7 +81,7 @@ struct ScopedStream {
 
 template <typename T>
 bool launch_t(const T* X, const T* W, T* Y, int M, int N, int K, const T* bias, int act, int epi,
-              float* ws, std::size_t ws_floats, cudaStream_t stream) {
+              float* ws, std::size_t ws_floats, CUstream stream) {
     if (!shape_ok(M, N, K, epi)) return false;
     const auto misaligned = [](const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15u) != 0u; };
     if (misaligned(X) || misaligned(W)) return false;
@@ -98,7 +97,7 @@ bool launch_t(const T* X, const T* W, T* Y, int M, int N, int K, const T* bias, 
     }
     float* partial = (splits > 1) ? ws : nullptr;
     const std::uint8_t nt = static_cast<std::uint8_t>(std::clamp((M + 7) / 8, 2, 8));
-    const Dtype dt = std::is_same_v<T, __half> ? Dtype::FP16 : Dtype::BF16;
+    const Dtype dt = std::is_same_v<T, Fp16> ? Dtype::FP16 : Dtype::BF16;
     const bool has_bias = (bias != nullptr);
     const bool has_partial = (partial != nullptr);
 
@@ -123,11 +122,9 @@ bool launch_t(const T* X, const T* W, T* Y, int M, int N, int K, const T* bias, 
         fn, static_cast<std::uint32_t>(col_blocks(N, epi)),
         static_cast<std::uint32_t>(splits), 1u,
         kThreads, ptrs, ints, {}, smem);
-    BROTENSOR_CUDA_CHECK(cudaGetLastError());
 
     if (partial) {
         mma_gemm::launch_mir_splitk_reduce(dt, partial, splits, M, N, Y, bias, act, epi);
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
     }
     return true;
 }
@@ -141,14 +138,14 @@ std::size_t workspace_floats(int M, int N, int K, int epi) {
     return splits > 1 ? static_cast<std::size_t>(splits) * M * N : 0;
 }
 
-bool launch(const __half* X, const __half* W, __half* Y, int M, int N, int K, const __half* bias, int act, int epi,
-            float* ws, std::size_t ws_floats, cudaStream_t stream) {
-    return launch_t<__half>(X, W, Y, M, N, K, bias, act, epi, ws, ws_floats, stream);
+bool launch(const Fp16* X, const Fp16* W, Fp16* Y, int M, int N, int K, const Fp16* bias, int act, int epi,
+            float* ws, std::size_t ws_floats, CUstream stream) {
+    return launch_t<Fp16>(X, W, Y, M, N, K, bias, act, epi, ws, ws_floats, stream);
 }
 
-bool launch(const __nv_bfloat16* X, const __nv_bfloat16* W, __nv_bfloat16* Y, int M, int N, int K,
-            const __nv_bfloat16* bias, int act, int epi, float* ws, std::size_t ws_floats, cudaStream_t stream) {
-    return launch_t<__nv_bfloat16>(X, W, Y, M, N, K, bias, act, epi, ws, ws_floats, stream);
+bool launch(const Bf16* X, const Bf16* W, Bf16* Y, int M, int N, int K,
+            const Bf16* bias, int act, int epi, float* ws, std::size_t ws_floats, CUstream stream) {
+    return launch_t<Bf16>(X, W, Y, M, N, K, bias, act, epi, ws, ws_floats, stream);
 }
 
 }  // namespace brotensor::detail::cuda::gemm_skinny

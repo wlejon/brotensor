@@ -1,6 +1,5 @@
 #include "cu_mir_cache.h"
-
-#include <cuda_runtime.h>
+#include "cuda_driver.h"
 
 #include <array>
 #include <cmath>
@@ -23,7 +22,7 @@ std::uintptr_t addr(const void* p) noexcept {
 bool flash_attention_varlen_f32_hd64(const float* Q, const float* K, const float* V,
                                      const int* cu_q, const int* cu_k, float* O,
                                      int total_q, int batch, int num_heads, int head_dim,
-                                     bool causal, cudaStream_t /*stream*/) {
+                                     bool causal, CUstream /*stream*/) {
     const int D = num_heads * head_dim;
     if (head_dim != kHD || causal || batch < 1 || num_heads > 65535) return false;
     const auto aligned = [](const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0; };

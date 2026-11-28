@@ -3,9 +3,6 @@
 #include "cuda_driver.h"
 #include "cuda_jit_engine.h"
 
-#include <cuda.h>
-#include <cuda_runtime.h>
-
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -29,8 +26,7 @@ bool cuda_interop_available(int device_index) {
     if (device_index < 0 || !jit::CudaJitEngine::instance().is_available()) {
         return false;
     }
-    int count = 0;
-    return cudaGetDeviceCount(&count) == cudaSuccess && device_index < count;
+    return device_index < device_count();
 }
 
 bool cuda_interop_dispatch_ptx(int device_index, const interop::PtxDispatchDesc& desc, std::string* err) {
@@ -43,9 +39,11 @@ bool cuda_interop_dispatch_ptx(int device_index, const interop::PtxDispatchDesc&
         return false;
     }
 
-    const cudaError_t devErr = cudaSetDevice(device_index);
-    if (devErr != cudaSuccess) {
-        if (err) *err = std::string("dispatch_ptx: cudaSetDevice failed: ") + cudaGetErrorString(devErr);
+    const CUresult devErr = set_device(device_index);
+    if (devErr != CUDA_SUCCESS) {
+        const char* es = nullptr;
+        (void)drv::cuGetErrorString(devErr, &es);
+        if (err) *err = std::string("dispatch_ptx: set_device failed: ") + (es ? es : std::to_string(devErr));
         return false;
     }
 

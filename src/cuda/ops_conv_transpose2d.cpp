@@ -4,7 +4,7 @@
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/tensor.h>
 
-#include <cuda_runtime.h>
+#include "cuda_driver.h"
 
 #include <stdexcept>
 #include <string>
@@ -17,7 +17,7 @@ namespace brotensor::detail::cuda {
 bool conv_transpose2d_f32_gemm(const float* X, const float* Wt, const float* bias, float* Y,
                                int N, int Cin, int H, int W, int Cout, int kH, int kW, int sh,
                                int sw, int ph, int pw, int dh, int dw, int Ho, int Wo,
-                               cudaStream_t stream);
+                               CUstream stream);
 
 void dispatch_conv_direct(std::uint32_t mode, ::brotensor::Dtype dt,
                           const void* x, const void* w, void* y, const void* bias,
@@ -62,8 +62,8 @@ void slice2d_forward(const ::brotensor::Tensor& X, int N, int C, int H, int W,
 
 namespace {
 
-inline cudaStream_t cur_stream() {
-    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+inline CUstream cur_stream() {
+    return reinterpret_cast<CUstream>(::brotensor::cuda_current_stream());
 }
 
 [[noreturn]] inline void fail(const char* op, const std::string& reason) {

@@ -2,14 +2,15 @@
 // replacing src/cuda/conv2d_wmma.cu.
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "../kernels/mir_conv_mma.h"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 
 #include <cstdint>
 
 namespace brotensor::conv2d_wmma_internal {
+
+using ::brotensor::detail::cuda::Bf16;
+using ::brotensor::detail::cuda::Fp16;
 
 namespace {
 
@@ -71,7 +72,7 @@ bool launch_conv2d_mma_impl(
 }  // namespace
 
 bool launch_conv2d_implicit_gemm_wmma(
-        const __half* X, const __half* Wt, const __half* bias, __half* Y,
+        const Fp16* X, const Fp16* Wt, const Fp16* bias, Fp16* Y,
         int N, int C_in, int H, int W,
         int C_out, int kH, int kW,
         int stride_h, int stride_w,
@@ -84,8 +85,8 @@ bool launch_conv2d_implicit_gemm_wmma(
 }
 
 bool launch_conv2d_implicit_gemm_wmma_bf16(
-        const __nv_bfloat16* X, const __nv_bfloat16* Wt,
-        const __nv_bfloat16* bias, __nv_bfloat16* Y,
+        const Bf16* X, const Bf16* Wt,
+        const Bf16* bias, Bf16* Y,
         int N, int C_in, int H, int W,
         int C_out, int kH, int kW,
         int stride_h, int stride_w,

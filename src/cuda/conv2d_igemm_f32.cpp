@@ -2,8 +2,7 @@
 // replacing src/cuda/conv2d_igemm_f32.cu.
 
 #include "cu_mir_cache.h"
-
-#include <cuda_runtime.h>
+#include "cuda_driver.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -30,7 +29,7 @@ std::uint32_t grid1d_blocks(long long n, int block) {
 
 bool conv2d_igemm_f32(const float* X, const float* Wt, const float* bias, float* Y, int N,
                       int Cin, int H, int W, int Cout, int kH, int kW, int sh, int sw, int ph,
-                      int pw, int dh, int dw, int Ho, int Wo, cudaStream_t /*stream*/) {
+                      int pw, int dh, int dw, int Ho, int Wo, CUstream /*stream*/) {
     const long long M = static_cast<long long>(N) * Ho * Wo;
     const long long K = static_cast<long long>(Cin) * kH * kW;
     if (M <= 0 || K <= 0 || M > 0x7fffffffLL || K > 0x7fffffffLL) return false;
@@ -57,7 +56,7 @@ bool conv2d_igemm_f32(const float* X, const float* Wt, const float* bias, float*
 bool conv_transpose2d_f32_gemm(const float* X, const float* Wt, const float* bias, float* Y,
                                int N, int Cin, int H, int W, int Cout, int kH, int kW, int sh,
                                int sw, int ph, int pw, int dh, int dw, int Ho, int Wo,
-                               cudaStream_t stream) {
+                               CUstream stream) {
     const long long R = static_cast<long long>(Cout) * kH * kW;
     if (R > 0x7fffffffLL || static_cast<long long>(N) * R * H * W > 0x7fffffffLL * 4LL) return false;
     float* wT = static_cast<float*>(cuda_alloc(static_cast<std::size_t>(R) * Cin * sizeof(float)));

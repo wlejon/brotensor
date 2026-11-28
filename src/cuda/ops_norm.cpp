@@ -1,13 +1,12 @@
 // CUDA normalizations, L2/pixel norm, softmax, and column-sum ops backed by Brass MIR -> PTX.
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "../kernels/mir_norm.h"
 #include "../vulkan/shaders/op_codes.h"
 
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/tensor.h>
-
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -385,15 +384,8 @@ void l2_norm_backward(const Tensor& X, int head_dim, int num_heads, float eps,
 void softmax_forward(const Tensor& logits, Tensor& probs, const float* d_mask) {
     constexpr const char* op = "softmax_forward";
     require_fp(logits.dtype, op);
-    if (d_mask != nullptr) {
-        cudaPointerAttributes attr{};
-        if (cudaPointerGetAttributes(&attr, d_mask) != cudaSuccess) {
-            cudaGetLastError();
-            fail(op, "d_mask must be a device pointer");
-        }
-        if (attr.type != cudaMemoryTypeDevice && attr.type != cudaMemoryTypeManaged) {
-            fail(op, "d_mask must be a device pointer");
-        }
+    if (d_mask != nullptr && !is_device_or_managed_ptr(d_mask)) {
+        fail(op, "d_mask must be a device pointer");
     }
     ensure(probs, logits.rows, logits.cols, logits.dtype);
     NormLaunch nl{};

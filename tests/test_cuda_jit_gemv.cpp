@@ -7,9 +7,9 @@
 #include <brotensor/ops.h>
 #include <brotensor/tensor.h>
 #include <brotensor/runtime.h>
+#include "../src/cuda/cuda_driver.h"
 #include "../src/cuda/cuda_jit.h"
 
-#include <cuda_runtime.h>
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -67,27 +67,28 @@ float max_abs_error(const float* a, const float* b, size_t n) {
 
 template <typename Fn>
 double time_cuda_us(Fn&& fn, int warmup = 10, int iters = 50) {
+    using namespace brotensor::detail::cuda;
     for (int i = 0; i < warmup; ++i) {
         fn();
     }
-    cudaDeviceSynchronize();
+    brotensor::sync_all();
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUevent start = nullptr, stop = nullptr;
+    drv::cuEventCreate(&start, 0);
+    drv::cuEventCreate(&stop, 0);
 
-    cudaEventRecord(start);
+    drv::cuEventRecord(start, nullptr);
     for (int i = 0; i < iters; ++i) {
         fn();
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    drv::cuEventRecord(stop, nullptr);
+    drv::cuEventSynchronize(stop);
 
     float ms = 0.0f;
-    cudaEventElapsedTime(&ms, start, stop);
+    drv::cuEventElapsedTime(&ms, start, stop);
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    drv::cuEventDestroy(start);
+    drv::cuEventDestroy(stop);
 
     return (static_cast<double>(ms) * 1000.0) / iters;
 }
@@ -147,9 +148,9 @@ void bench_fused_gemv_swiglu() {
         brotensor::detail::cuda::jit::launch_fused_gemv_swiglu_ptx(
             d_w_gate, d_w_up, d_x, d_y_jit, N, K, nullptr
         );
-        cudaDeviceSynchronize();
+        brotensor::sync_all();
 
-        cudaMemcpy(h_jit.data(), d_y_jit, N * sizeof(float), cudaMemcpyDeviceToHost);
+        t_y_jit.copy_to_host_raw(h_jit.data(), N * sizeof(float));
 
         float err = max_abs_error(h_ref.data(), h_jit.data(), N);
         CHECK_PARITY(err, 1e-4f, "fused_gemv_swiglu");
@@ -229,9 +230,9 @@ void bench_fused_gemv_residual() {
         brotensor::detail::cuda::jit::launch_fused_gemv_residual_ptx(
             d_w_down, d_x, d_res, d_y_jit, N, K, nullptr
         );
-        cudaDeviceSynchronize();
+        brotensor::sync_all();
 
-        cudaMemcpy(h_jit.data(), d_y_jit, N * sizeof(float), cudaMemcpyDeviceToHost);
+        t_y_jit.copy_to_host_raw(h_jit.data(), N * sizeof(float));
 
         float err = max_abs_error(h_ref.data(), h_jit.data(), N);
         CHECK_PARITY(err, 1e-4f, "fused_gemv_residual");
@@ -277,11 +278,13 @@ int main() {
 
     std::cout << "================================================================================\n";
     std::cout << "  BRASS CUDA DRIVER JIT FUSED GEMV BENCHMARK & PARITY SUITE (RTX SM_89)\n";
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    std::cout << "  Device: " << prop.name
-              << " (SMs: " << prop.multiProcessorCount
-              << ", Global Mem: " << std::fixed << std::setprecision(1) << (prop.totalGlobalMem / 1e9) << " GB)\n";
+    std::size_t free_b = 0, total_b = 0;
+    brotensor::detail::cuda::ensure_context(0);
+    brotensor::detail::cuda::drv::cuMemGetInfo(&free_b, &total_b);
+    const int sms = brotensor::detail::cuda::device_attribute(0, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+    std::cout << "  Device: " << brotensor::device_name(Device::CUDA)
+              << " (SMs: " << sms
+              << ", Global Mem: " << std::fixed << std::setprecision(1) << (total_b / 1e9) << " GB)\n";
     std::cout << "================================================================================\n";
 
     // A kernel the JIT cannot find or launch (a brass launch contract that

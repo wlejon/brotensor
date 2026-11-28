@@ -19,38 +19,40 @@ std::uintptr_t addr(const void* p) noexcept {
 }
 
 // Grow-only per-device scratch for split partials (never freed; graph-capture safe).
-float* split_workspace(std::size_t floats, cudaStream_t stream) {
+float* split_workspace(std::size_t floats, CUstream stream) {
+    using namespace brotensor::detail::cuda;
     constexpr int MAX_DEVICES = 16;
     static float* buf[MAX_DEVICES] = {};
     static std::size_t cap[MAX_DEVICES] = {};
-    int dev = 0;
-    BROTENSOR_CUDA_CHECK(cudaGetDevice(&dev));
+    const int dev = current_device();
     if (dev < 0 || dev >= MAX_DEVICES) return nullptr;
     if (cap[dev] >= floats) return buf[dev];
-    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
-    BROTENSOR_CUDA_CHECK(cudaStreamIsCapturing(stream, &st));
-    if (st != cudaStreamCaptureStatusNone) return nullptr;
+    CUstreamCaptureStatus st = CU_STREAM_CAPTURE_STATUS_NONE;
+    BROTENSOR_CUDA_CHECK(drv::cuStreamIsCapturing(stream, &st));
+    if (st != CU_STREAM_CAPTURE_STATUS_NONE) return nullptr;
     const std::size_t want = floats > 2 * cap[dev] ? floats : 2 * cap[dev];
     buf[dev] = nullptr;
     cap[dev] = 0;
-    BROTENSOR_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buf[dev]), want * sizeof(float)));
+    CUdeviceptr dptr = 0;
+    BROTENSOR_CUDA_CHECK(drv::cuMemAlloc(&dptr, want * sizeof(float)));
+    buf[dev] = reinterpret_cast<float*>(static_cast<std::uintptr_t>(dptr));
     cap[dev] = want;
     return buf[dev];
 }
 
 int sm_count() {
+    using namespace brotensor::detail::cuda;
     constexpr int MAX_DEVICES = 16;
     static int n[MAX_DEVICES] = {};
-    int dev = 0;
-    BROTENSOR_CUDA_CHECK(cudaGetDevice(&dev));
+    const int dev = current_device();
     if (dev < 0 || dev >= MAX_DEVICES) return 80;
-    if (!n[dev]) BROTENSOR_CUDA_CHECK(cudaDeviceGetAttribute(&n[dev], cudaDevAttrMultiProcessorCount, dev));
-    return n[dev];
+    if (!n[dev]) n[dev] = device_attribute(dev, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT);
+    return n[dev] ? n[dev] : 80;
 }
 
 void launch_common(Dtype dt, const void* Q, const void* K, const void* V, const float* mask, void* O,
                    int Lq, int Lk, int D, int num_heads, int num_kv_heads, int head_dim,
-                   bool causal, int batch, cudaStream_t stream) {
+                   bool causal, int batch, CUstream stream) {
     using namespace brotensor::detail::cuda;
     const int br = static_cast<int>(kernels::kFaFusedBr);
     const int bc = static_cast<int>(kernels::fa_fused_bc(static_cast<std::uint32_t>(head_dim)));
@@ -116,19 +118,19 @@ bool supported(int head_dim) {
     }
 }
 
-void launch(const __half* Q, const __half* K, const __half* V,
-            const float* mask, __half* O,
+void launch(const Fp16* Q, const Fp16* K, const Fp16* V,
+            const float* mask, Fp16* O,
             int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
-            cudaStream_t stream, int batch, int num_kv_heads) {
+            CUstream stream, int batch, int num_kv_heads) {
     const int nkv = num_kv_heads > 0 ? num_kv_heads : num_heads;
     launch_common(Dtype::FP16, Q, K, V, mask, O, Lq, Lk, D, num_heads, nkv, head_dim, causal, batch, stream);
 }
 
-void launch(const __nv_bfloat16* Q, const __nv_bfloat16* K,
-            const __nv_bfloat16* V,
-            const float* mask, __nv_bfloat16* O,
+void launch(const Bf16* Q, const Bf16* K,
+            const Bf16* V,
+            const float* mask, Bf16* O,
             int Lq, int Lk, int D, int num_heads, int head_dim, bool causal,
-            cudaStream_t stream, int batch, int num_kv_heads) {
+            CUstream stream, int batch, int num_kv_heads) {
     const int nkv = num_kv_heads > 0 ? num_kv_heads : num_heads;
     launch_common(Dtype::BF16, Q, K, V, mask, O, Lq, Lk, D, num_heads, nkv, head_dim, causal, batch, stream);
 }

@@ -1,13 +1,10 @@
 #include <brotensor/runtime.h>
 #include <brotensor/detail/dispatch.h>
 
+#include "cuda_driver.h"
 #include "flash_fused_internal.h"
 #include "ops_fa_mir.h"
 #include "detail/cuda_check.h"
-
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
 
 #include <cmath>
 #include <stdexcept>
@@ -29,7 +26,7 @@ void flash_attention_forward(const Tensor& Q,
 bool flash_attention_varlen_f32_hd64(const float* Q, const float* K, const float* V,
                                      const int* cu_q, const int* cu_k, float* O,
                                      int total_q, int batch, int num_heads, int head_dim,
-                                     bool causal, cudaStream_t stream);
+                                     bool causal, CUstream stream);
 
 void flash_attention_varlen_forward(const Tensor& Q,
                                     const Tensor& K,
@@ -86,18 +83,18 @@ void flash_attention_varlen_forward(const Tensor& Q,
         static_cast<long long>(total_q) == static_cast<long long>(batch_size) * max_seqlen_q &&
         static_cast<long long>(total_k) == static_cast<long long>(batch_size) * max_seqlen_k &&
         batch_size <= 65535 && (!causal || max_seqlen_q == max_seqlen_k)) {
-        cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+        CUstream stream = reinterpret_cast<CUstream>(cuda_current_stream());
         if (dt == Dtype::BF16) {
-            flash_fused::launch(reinterpret_cast<const __nv_bfloat16*>(Q.data),
-                                reinterpret_cast<const __nv_bfloat16*>(K.data),
-                                reinterpret_cast<const __nv_bfloat16*>(V.data), nullptr,
-                                reinterpret_cast<__nv_bfloat16*>(O.data), max_seqlen_q,
+            flash_fused::launch(reinterpret_cast<const Bf16*>(Q.data),
+                                reinterpret_cast<const Bf16*>(K.data),
+                                reinterpret_cast<const Bf16*>(V.data), nullptr,
+                                reinterpret_cast<Bf16*>(O.data), max_seqlen_q,
                                 max_seqlen_k, D, num_heads, head_dim, causal, stream, batch_size);
         } else {
-            flash_fused::launch(reinterpret_cast<const __half*>(Q.data),
-                                reinterpret_cast<const __half*>(K.data),
-                                reinterpret_cast<const __half*>(V.data), nullptr,
-                                reinterpret_cast<__half*>(O.data), max_seqlen_q, max_seqlen_k, D,
+            flash_fused::launch(reinterpret_cast<const Fp16*>(Q.data),
+                                reinterpret_cast<const Fp16*>(K.data),
+                                reinterpret_cast<const Fp16*>(V.data), nullptr,
+                                reinterpret_cast<Fp16*>(O.data), max_seqlen_q, max_seqlen_k, D,
                                 num_heads, head_dim, causal, stream, batch_size);
         }
         return;
@@ -109,7 +106,7 @@ void flash_attention_varlen_forward(const Tensor& Q,
             static_cast<const float*>(V.data), reinterpret_cast<const int*>(cu_seqlens_q),
             reinterpret_cast<const int*>(cu_seqlens_k), static_cast<float*>(O.data), total_q,
             batch_size, num_heads, head_dim, causal,
-            reinterpret_cast<cudaStream_t>(cuda_current_stream()))) {
+            reinterpret_cast<CUstream>(cuda_current_stream()))) {
         return;
     }
 
@@ -202,18 +199,18 @@ void flash_attention_gqa_forward(const Tensor& Q,
         O.resize(Lq, Dq, dt);
     if (Lq == 0 || Lk == 0 || Dq == 0) return;
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_current_stream());
+    CUstream stream = reinterpret_cast<CUstream>(cuda_current_stream());
     if (dt != Dtype::FP32 && flash_fused::supported(head_dim)) {
         if (dt == Dtype::BF16)
-            flash_fused::launch(reinterpret_cast<const __nv_bfloat16*>(Q.data),
-                                reinterpret_cast<const __nv_bfloat16*>(K.data),
-                                reinterpret_cast<const __nv_bfloat16*>(V.data), d_mask,
-                                reinterpret_cast<__nv_bfloat16*>(O.data), Lq, Lk, Dq, num_q_heads, head_dim,
+            flash_fused::launch(reinterpret_cast<const Bf16*>(Q.data),
+                                reinterpret_cast<const Bf16*>(K.data),
+                                reinterpret_cast<const Bf16*>(V.data), d_mask,
+                                reinterpret_cast<Bf16*>(O.data), Lq, Lk, Dq, num_q_heads, head_dim,
                                 causal, stream, /*batch=*/1, num_kv_heads);
         else
-            flash_fused::launch(reinterpret_cast<const __half*>(Q.data), reinterpret_cast<const __half*>(K.data),
-                                reinterpret_cast<const __half*>(V.data), d_mask,
-                                reinterpret_cast<__half*>(O.data), Lq, Lk, Dq, num_q_heads, head_dim, causal,
+            flash_fused::launch(reinterpret_cast<const Fp16*>(Q.data), reinterpret_cast<const Fp16*>(K.data),
+                                reinterpret_cast<const Fp16*>(V.data), d_mask,
+                                reinterpret_cast<Fp16*>(O.data), Lq, Lk, Dq, num_q_heads, head_dim, causal,
                                 stream, /*batch=*/1, num_kv_heads);
         return;
     }

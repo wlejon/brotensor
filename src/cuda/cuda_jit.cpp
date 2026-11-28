@@ -1,10 +1,8 @@
+#include "cuda_driver.h"
 #include "cuda_jit.h"
 #include "cuda_jit_engine.h"
 #include "../jit/kernel_disk_cache.h"
 #include <brotensor/tensor.h>
-
-#include <cuda.h>
-#include <cuda_runtime.h>
 
 #if BROTENSOR_HAS_BRASS_CUDA_JIT
 #include <brass/codegen/ml_fusion.hpp>

@@ -2,12 +2,9 @@
 //   q4k_wmma.cu, q6k_wmma.cu, q8_0_wmma.cu, linear_int8w_wmma.cu, conv2d_int8w_wmma.cu.
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "../kernels/mir_gemm_quant_mma.h"
 #include "../vulkan/shaders/op_codes.h"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #include <atomic>
 #include <cstdint>
@@ -61,9 +58,9 @@ bool launch_quant_gemm_mma(std::uint8_t fmt, Dtype dt,
 
 namespace q4k_wmma_internal {
 
-bool launch_linear_q4k_fp16_wmma(const __half* X, const uint8_t* W_q4k,
-                                 const __half* bias, __half* Y,
-                                 int B, int M, int K, cudaStream_t /*stream*/) {
+bool launch_linear_q4k_fp16_wmma(const Fp16* X, const uint8_t* W_q4k,
+                                 const Fp16* bias, Fp16* Y,
+                                 int B, int M, int K, CUstream /*stream*/) {
     if (B <= 0 || M <= 0 || K <= 0) return false;
     if (K % 256 != 0) return false;
     if (B < 4) return false;
@@ -76,9 +73,9 @@ bool launch_linear_q4k_fp16_wmma(const __half* X, const uint8_t* W_q4k,
 
 namespace q6k_wmma_internal {
 
-bool launch_linear_q6k_fp16_wmma(const __half* X, const uint8_t* W_q6k,
-                                 const __half* bias, __half* Y,
-                                 int B, int M, int K, cudaStream_t /*stream*/) {
+bool launch_linear_q6k_fp16_wmma(const Fp16* X, const uint8_t* W_q6k,
+                                 const Fp16* bias, Fp16* Y,
+                                 int B, int M, int K, CUstream /*stream*/) {
     if (B <= 0 || M <= 0 || K <= 0) return false;
     if (K % 256 != 0) return false;
     if (B < 4) return false;
@@ -91,9 +88,9 @@ bool launch_linear_q6k_fp16_wmma(const __half* X, const uint8_t* W_q6k,
 
 namespace q8_0_wmma_internal {
 
-bool launch_linear_q8_0_fp16_wmma(const __half* X, const uint8_t* W_q8,
-                                  const __half* bias, __half* Y,
-                                  int B, int M, int K, cudaStream_t /*stream*/) {
+bool launch_linear_q8_0_fp16_wmma(const Fp16* X, const uint8_t* W_q8,
+                                  const Fp16* bias, Fp16* Y,
+                                  int B, int M, int K, CUstream /*stream*/) {
     if (B <= 0 || M <= 0 || K <= 0) return false;
     if (K % 32 != 0) return false;
     if (B < 4) return false;
@@ -107,8 +104,8 @@ bool launch_linear_q8_0_fp16_wmma(const __half* X, const uint8_t* W_q8,
 namespace linear_int8w_wmma_internal {
 
 bool launch_linear_int8w_fp16_wmma(
-        const __half* X, const int8_t* W, const float* scales,
-        const __half* bias, __half* Y,
+        const Fp16* X, const int8_t* W, const float* scales,
+        const Fp16* bias, Fp16* Y,
         int B, int M, int K) {
     if (B <= 0 || M <= 0 || K <= 0) return false;
     if ((K & 7) != 0) return false;
@@ -119,8 +116,8 @@ bool launch_linear_int8w_fp16_wmma(
 }
 
 bool launch_linear_int8w_bf16_wmma(
-        const __nv_bfloat16* X, const int8_t* W, const float* scales,
-        const __nv_bfloat16* bias, __nv_bfloat16* Y,
+        const Bf16* X, const int8_t* W, const float* scales,
+        const Bf16* bias, Bf16* Y,
         int B, int M, int K) {
     if (B <= 0 || M <= 0 || K <= 0) return false;
     if ((K & 7) != 0) return false;
@@ -135,8 +132,8 @@ bool launch_linear_int8w_bf16_wmma(
 namespace conv2d_int8w_wmma_internal {
 
 bool launch_conv2d_int8w_implicit_gemm_wmma(
-        const __half* X, const int8_t* W_int8, const float* scales,
-        const __half* bias, __half* Y,
+        const Fp16* X, const int8_t* W_int8, const float* scales,
+        const Fp16* bias, Fp16* Y,
         int N, int C_in, int H, int W,
         int C_out, int kH, int kW,
         int stride_h, int stride_w,

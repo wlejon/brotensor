@@ -1,8 +1,8 @@
 #include "cuda_graph_jit.h"
+#include "cuda_driver.h"
 #include "cuda_jit_engine.h"
 #include "detail/cuda_check.h"
 
-#include <cuda_runtime.h>
 #include <stdexcept>
 #include <utility>
 
@@ -56,10 +56,10 @@ CudaGraphRunner& CudaGraphRunner::operator=(CudaGraphRunner&& other) noexcept {
 
 void CudaGraphRunner::reset() noexcept {
     if (capturing_ && capture_stream_) {
-        cudaGraph_t discarded = nullptr;
-        cudaStreamEndCapture(capture_stream_, &discarded);
+        CUgraph discarded = nullptr;
+        (void)drv::cuStreamEndCapture(capture_stream_, &discarded);
         if (discarded) {
-            cudaGraphDestroy(discarded);
+            (void)drv::cuGraphDestroy(discarded);
         }
         capturing_ = false;
         if (prev_stream_) {
@@ -68,15 +68,15 @@ void CudaGraphRunner::reset() noexcept {
         }
     }
     if (graph_exec_) {
-        cudaGraphExecDestroy(graph_exec_);
+        (void)drv::cuGraphExecDestroy(graph_exec_);
         graph_exec_ = nullptr;
     }
     if (graph_) {
-        cudaGraphDestroy(graph_);
+        (void)drv::cuGraphDestroy(graph_);
         graph_ = nullptr;
     }
     if (owned_stream_) {
-        cudaStreamDestroy(owned_stream_);
+        (void)drv::cuStreamDestroy(owned_stream_);
         owned_stream_ = nullptr;
     }
     capture_stream_ = nullptr;
@@ -87,20 +87,21 @@ void CudaGraphRunner::begin_capture(void* stream) {
     if (capturing_) {
         throw std::runtime_error("CudaGraphRunner: already capturing");
     }
+    ensure_context(-1);
     if (graph_exec_) {
-        cudaGraphExecDestroy(graph_exec_);
+        (void)drv::cuGraphExecDestroy(graph_exec_);
         graph_exec_ = nullptr;
     }
     if (graph_) {
-        cudaGraphDestroy(graph_);
+        (void)drv::cuGraphDestroy(graph_);
         graph_ = nullptr;
     }
 
     if (stream) {
-        capture_stream_ = reinterpret_cast<cudaStream_t>(stream);
+        capture_stream_ = reinterpret_cast<CUstream>(stream);
     } else {
         if (!owned_stream_) {
-            BROTENSOR_CUDA_CHECK(cudaStreamCreateWithFlags(&owned_stream_, cudaStreamNonBlocking));
+            BROTENSOR_CUDA_CHECK(drv::cuStreamCreate(&owned_stream_, CU_STREAM_NON_BLOCKING));
         }
         capture_stream_ = owned_stream_;
     }
@@ -108,12 +109,12 @@ void CudaGraphRunner::begin_capture(void* stream) {
     prev_stream_ = ::brotensor::cuda_current_stream();
     ::brotensor::detail::cuda::cuda_set_stream(capture_stream_);
 
-    cudaError_t err = cudaStreamBeginCapture(capture_stream_, cudaStreamCaptureModeThreadLocal);
-    if (err != cudaSuccess) {
+    const CUresult err = drv::cuStreamBeginCapture(capture_stream_, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+    if (err != CUDA_SUCCESS) {
         ::brotensor::detail::cuda::cuda_set_stream(prev_stream_);
         prev_stream_ = nullptr;
         capture_stream_ = nullptr;
-        throw std::runtime_error(std::string("cudaStreamBeginCapture failed: ") + cudaGetErrorString(err));
+        BROTENSOR_CUDA_CHECK(err);
     }
     capturing_ = true;
 }
@@ -122,15 +123,13 @@ void CudaGraphRunner::end_capture(void* stream) {
     if (!capturing_) {
         throw std::runtime_error("CudaGraphRunner: end_capture called but not capturing");
     }
-    cudaStream_t s = stream ? reinterpret_cast<cudaStream_t>(stream) : capture_stream_;
-    cudaError_t err = cudaStreamEndCapture(s, &graph_);
+    CUstream s = stream ? reinterpret_cast<CUstream>(stream) : capture_stream_;
+    const CUresult err = drv::cuStreamEndCapture(s, &graph_);
     capturing_ = false;
     ::brotensor::detail::cuda::cuda_set_stream(prev_stream_);
     prev_stream_ = nullptr;
 
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("cudaStreamEndCapture failed: ") + cudaGetErrorString(err));
-    }
+    BROTENSOR_CUDA_CHECK(err);
 }
 
 void CudaGraphRunner::instantiate() {
@@ -138,24 +137,22 @@ void CudaGraphRunner::instantiate() {
         throw std::runtime_error("CudaGraphRunner: cannot instantiate before capture");
     }
     if (graph_exec_) {
-        cudaGraphExecDestroy(graph_exec_);
+        (void)drv::cuGraphExecDestroy(graph_exec_);
         graph_exec_ = nullptr;
     }
 
-    cudaError_t err = cudaGraphInstantiate(&graph_exec_, graph_, 0);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("cudaGraphInstantiate failed: ") + cudaGetErrorString(err));
-    }
+    BROTENSOR_CUDA_CHECK(drv::cuGraphInstantiate(&graph_exec_, graph_, 0));
 }
 
 void CudaGraphRunner::launch(void* stream) {
     if (!graph_exec_) {
         throw std::runtime_error("CudaGraphRunner: cannot launch before instantiation");
     }
-    cudaStream_t s = stream ? reinterpret_cast<cudaStream_t>(stream)
-                            : (capture_stream_ ? capture_stream_
-                                               : reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream()));
-    BROTENSOR_CUDA_CHECK(cudaGraphLaunch(graph_exec_, s));
+    ensure_context(-1);
+    CUstream s = stream ? reinterpret_cast<CUstream>(stream)
+                        : (capture_stream_ ? capture_stream_
+                                           : reinterpret_cast<CUstream>(::brotensor::cuda_current_stream()));
+    BROTENSOR_CUDA_CHECK(drv::cuGraphLaunch(graph_exec_, s));
 }
 
-} // namespace brotensor::detail::cuda::jit
+}  // namespace brotensor::detail::cuda::jit

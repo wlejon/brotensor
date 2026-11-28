@@ -5,6 +5,7 @@
 // Prefill GEMMs still dispatch to q*_wmma_internal WMMA kernels first.
 
 #include "cu_mir_cache.h"
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 
 #include "../jit/gpu_mir_emit_detail.h"
@@ -13,9 +14,6 @@
 #include <brotensor/detail/dispatch.h>
 #include <brotensor/ops/linear.h>
 #include <brotensor/tensor.h>
-
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -30,21 +28,21 @@ void* cuda_current_stream();
 namespace brotensor::detail::cuda {
 
 namespace q8_0_wmma_internal {
-bool launch_linear_q8_0_fp16_wmma(const __half* X, const uint8_t* W_q8,
-                                  const __half* bias, __half* Y,
-                                  int B, int M, int K, cudaStream_t stream);
+bool launch_linear_q8_0_fp16_wmma(const Fp16* X, const uint8_t* W_q8,
+                                  const Fp16* bias, Fp16* Y,
+                                  int B, int M, int K, CUstream stream);
 }
 
 namespace q4k_wmma_internal {
-bool launch_linear_q4k_fp16_wmma(const __half* X, const uint8_t* W_q4k,
-                                 const __half* bias, __half* Y,
-                                 int B, int M, int K, cudaStream_t stream);
+bool launch_linear_q4k_fp16_wmma(const Fp16* X, const uint8_t* W_q4k,
+                                 const Fp16* bias, Fp16* Y,
+                                 int B, int M, int K, CUstream stream);
 }
 
 namespace q6k_wmma_internal {
-bool launch_linear_q6k_fp16_wmma(const __half* X, const uint8_t* W_q6k,
-                                 const __half* bias, __half* Y,
-                                 int B, int M, int K, cudaStream_t stream);
+bool launch_linear_q6k_fp16_wmma(const Fp16* X, const uint8_t* W_q6k,
+                                 const Fp16* bias, Fp16* Y,
+                                 int B, int M, int K, CUstream stream);
 }
 
 namespace {
@@ -53,8 +51,8 @@ std::uintptr_t addr(const void* p) noexcept {
     return reinterpret_cast<std::uintptr_t>(p);
 }
 
-cudaStream_t cur_stream() {
-    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+CUstream cur_stream() {
+    return reinterpret_cast<CUstream>(::brotensor::cuda_current_stream());
 }
 
 [[noreturn]] void fail(const char* op, const std::string& reason) {
@@ -102,12 +100,14 @@ void dispatch_gemv_q_slice(const QuantDesc& q, std::uintptr_t x, Dtype dt, int m
         xa = Tensor::empty_on(Device::CUDA, mb, q.k, dt);
         const std::size_t row_bytes = static_cast<std::size_t>(q.k) * 2u;
         if (ldx == q.k) {
-            cudaMemcpyAsync(xa.data, reinterpret_cast<const void*>(x),
-                            static_cast<std::size_t>(mb) * row_bytes, cudaMemcpyDeviceToDevice, cur_stream());
+            BROTENSOR_CUDA_CHECK(memcpy_d2d_async(
+                xa.data, reinterpret_cast<const void*>(x),
+                static_cast<std::size_t>(mb) * row_bytes, cur_stream()));
         } else {
-            cudaMemcpy2DAsync(xa.data, row_bytes, reinterpret_cast<const void*>(x),
-                              static_cast<std::size_t>(ldx) * 2u, row_bytes, static_cast<std::size_t>(mb),
-                              cudaMemcpyDeviceToDevice, cur_stream());
+            BROTENSOR_CUDA_CHECK(memcpy_2d_d2d_async(
+                xa.data, row_bytes, reinterpret_cast<const void*>(x),
+                static_cast<std::size_t>(ldx) * 2u, row_bytes, static_cast<std::size_t>(mb),
+                cur_stream()));
         }
         x_use = addr(xa.data);
         ldx_use = q.k;
@@ -308,11 +308,10 @@ void linear_forward_batched_q8_0_fp16(const Tensor& W_q8, const Tensor* bias, co
     if (W_q8.cols != K) fail(op, "shape mismatch (W.cols != X.cols)");
     validate_gguf_bias_and_out(bias, out, B, Y_BD, op, true);
     if (B == 0 || out == 0) return;
-    const __half* b_h = (bias && bias->size() > 0) ? static_cast<const __half*>(bias->data) : nullptr;
+    const Fp16* b_h = (bias && bias->size() > 0) ? static_cast<const Fp16*>(bias->data) : nullptr;
     if (q8_0_wmma_internal::launch_linear_q8_0_fp16_wmma(
-            static_cast<const __half*>(X_BD.data), static_cast<const uint8_t*>(W_q8.data),
-            b_h, static_cast<__half*>(Y_BD.data), B, out, K, cur_stream())) {
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+            static_cast<const Fp16*>(X_BD.data), static_cast<const uint8_t*>(W_q8.data),
+            b_h, static_cast<Fp16*>(Y_BD.data), B, out, K, cur_stream())) {
         return;
     }
     QuantDesc q{QF_Q8_0, out, K, static_cast<std::uint32_t>((K / 32) * 34), addr(W_q8.data), 0u};
@@ -345,11 +344,10 @@ void linear_forward_batched_q4k_fp16(const Tensor& W_q4k, const Tensor* bias, co
     if (W_q4k.cols != K) fail(op, "shape mismatch (W.cols != X.cols)");
     validate_gguf_bias_and_out(bias, out, B, Y_BD, op, true);
     if (B == 0 || out == 0) return;
-    const __half* b_h = (bias && bias->size() > 0) ? static_cast<const __half*>(bias->data) : nullptr;
+    const Fp16* b_h = (bias && bias->size() > 0) ? static_cast<const Fp16*>(bias->data) : nullptr;
     if (q4k_wmma_internal::launch_linear_q4k_fp16_wmma(
-            static_cast<const __half*>(X_BD.data), static_cast<const uint8_t*>(W_q4k.data),
-            b_h, static_cast<__half*>(Y_BD.data), B, out, K, cur_stream())) {
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+            static_cast<const Fp16*>(X_BD.data), static_cast<const uint8_t*>(W_q4k.data),
+            b_h, static_cast<Fp16*>(Y_BD.data), B, out, K, cur_stream())) {
         return;
     }
     QuantDesc q{QF_Q4K, out, K, static_cast<std::uint32_t>((K / 256) * 144), addr(W_q4k.data), 0u};
@@ -382,11 +380,10 @@ void linear_forward_batched_q6k_fp16(const Tensor& W_q6k, const Tensor* bias, co
     if (W_q6k.cols != K) fail(op, "shape mismatch (W.cols != X.cols)");
     validate_gguf_bias_and_out(bias, out, B, Y_BD, op, true);
     if (B == 0 || out == 0) return;
-    const __half* b_h = (bias && bias->size() > 0) ? static_cast<const __half*>(bias->data) : nullptr;
+    const Fp16* b_h = (bias && bias->size() > 0) ? static_cast<const Fp16*>(bias->data) : nullptr;
     if (q6k_wmma_internal::launch_linear_q6k_fp16_wmma(
-            static_cast<const __half*>(X_BD.data), static_cast<const uint8_t*>(W_q6k.data),
-            b_h, static_cast<__half*>(Y_BD.data), B, out, K, cur_stream())) {
-        BROTENSOR_CUDA_CHECK(cudaGetLastError());
+            static_cast<const Fp16*>(X_BD.data), static_cast<const uint8_t*>(W_q6k.data),
+            b_h, static_cast<Fp16*>(Y_BD.data), B, out, K, cur_stream())) {
         return;
     }
     QuantDesc q{QF_Q6K, out, K, static_cast<std::uint32_t>((K / 256) * 210), addr(W_q6k.data), 0u};

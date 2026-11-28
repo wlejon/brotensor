@@ -1,14 +1,11 @@
 // KV-cache append + causal flash-attention decode.
 
+#include "cuda_driver.h"
 #include "detail/cuda_check.h"
 #include "decode_gqa.h"
 #include "ops_fa_mir.h"
 
 #include <brotensor/tensor.h>
-
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
 
 #include <cmath>
 #include <stdexcept>
@@ -20,8 +17,8 @@ namespace brotensor::detail::cuda {
 using ::brotensor::Tensor;
 using ::brotensor::Dtype;
 
-static inline cudaStream_t cur_stream() {
-    return reinterpret_cast<cudaStream_t>(::brotensor::cuda_current_stream());
+static inline CUstream cur_stream() {
+    return reinterpret_cast<CUstream>(::brotensor::cuda_current_stream());
 }
 
 void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
@@ -55,12 +52,12 @@ void kv_cache_append(const Tensor& K_new, const Tensor& V_new,
     const size_t bytes = static_cast<size_t>(L_new) * D * elem;
     const size_t dst_off = static_cast<size_t>(cur_len) * D * elem;
 
-    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(
+    BROTENSOR_CUDA_CHECK(memcpy_d2d_async(
         reinterpret_cast<char*>(K_cache.data) + dst_off,
-        K_new.data, bytes, cudaMemcpyDeviceToDevice, cur_stream()));
-    BROTENSOR_CUDA_CHECK(cudaMemcpyAsync(
+        K_new.data, bytes, cur_stream()));
+    BROTENSOR_CUDA_CHECK(memcpy_d2d_async(
         reinterpret_cast<char*>(V_cache.data) + dst_off,
-        V_new.data, bytes, cudaMemcpyDeviceToDevice, cur_stream()));
+        V_new.data, bytes, cur_stream()));
 }
 
 void flash_attention_decode(const Tensor& Q,

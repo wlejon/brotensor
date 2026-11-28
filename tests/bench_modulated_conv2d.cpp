@@ -13,8 +13,6 @@
 
 #include "bench_helpers.h"
 
-#include <cuda_runtime.h>
-
 #include <cstdint>
 #include <cstdio>
 #include <functional>
