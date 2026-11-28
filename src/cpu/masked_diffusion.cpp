@@ -6,14 +6,13 @@
 // port in brosoundml). See ops/sampling.h for the full contract and the
 // pseudocode this follows.
 //
-// This is the parity reference for the CUDA kernel in src/cuda/
-// masked_diffusion.cu, so the arithmetic is spelled out in the exact order the
-// kernel uses:
+// This is the parity reference for the Brass MIR CUDA kernel
+// (`build_select_md_mir` in src/kernels/mir_select.cpp), so the arithmetic is
+// spelled out in the exact order the kernel uses:
 //   * a row's log-sum-exp is max + (float)log(sum), the sum accumulated in
 //     FP64 from FP32 expf terms (order-independent to the last FP32 ulp);
 //   * the guided logit is a + gs * (a - b) with a = c - lse_c, b = u - lse_u,
-//     each operation rounded separately (the kernel uses __fadd_rn /
-//     __fmul_rn / __fsub_rn so nvcc cannot contract it into an FMA);
+//     each operation rounded separately (without FMA contraction);
 //   * the noise comes from detail/hash_rng.h, identical integer arithmetic on
 //     both backends.
 // The top-k class filter keeps the first k entries in (value desc, index asc)

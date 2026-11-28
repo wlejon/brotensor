@@ -59,6 +59,8 @@
 
 namespace brotensor::jit {
 
+std::string_view kernel_source_fingerprint() noexcept;
+
 class KernelDiskCache {
 public:
     // The key schema. Bump the suffix when what a key covers changes.

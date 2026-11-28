@@ -4,8 +4,8 @@
 //
 // The backend never links libvulkan: a binary built with BROTENSOR_WITH_VULKAN
 // has to start (and fall back to the CPU) on a machine with no Vulkan loader
-// at all, the same reason the CUDA backend links cudart statically and never
-// libcuda. So VK_NO_PROTOTYPES is set, the loader library is dlopen()ed once
+// at all, the same reason the CUDA backend loads libcuda.so.1 / nvcuda.dll
+// lazily with no link-time dependency. So VK_NO_PROTOTYPES is set, the loader library is dlopen()ed once
 // (loader.cpp), and every call goes through one of the tables below.
 //
 // Device-level functions are fetched per VkDevice with vkGetDeviceProcAddr,

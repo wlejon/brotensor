@@ -90,17 +90,6 @@ CUfunction compile_mir(const MirKey& k, int dev) {
         disk_sig += ":nt" + std::to_string(ptx_opts.maxntid[0]) +
                     "_mc" + std::to_string(ptx_opts.minnctapersm);
     }
-    if (k.kind >= MirKind::DecodeGqa) {
-        disk_sig += ":v15";
-    } else if (k.kind >= MirKind::Conv2dMma) {
-        disk_sig += ":v11";
-    } else if (k.kind >= MirKind::GemmQuantMma) {
-        disk_sig += ":v9";
-    } else if (k.kind >= MirKind::GemmMma) {
-        disk_sig += ":v7";
-    } else if (k.kind == MirKind::FaBwd) {
-        disk_sig += ":v15";
-    }
     std::string ptx;
     std::string fn_name = mem_key;
     if (!brotensor::jit::KernelDiskCache::instance().load_ptx(disk_sig, ptx)) {

@@ -8,8 +8,8 @@
 // the shared MTLDevice, a command-buffer factory, the Tensor -> MTLBuffer
 // mapping, and an MSL-source pipeline compiler.
 //
-// The CUDA backend needs no equivalent — a consumer's .cu file just includes
-// <cuda_runtime.h> and uses Tensor::data as a raw device pointer. On Metal a
+// The CUDA backend needs no equivalent — a custom CUDA kernel receives
+// Tensor::data directly as a raw CUdeviceptr device pointer. On Metal a
 // Tensor's `data` is the `contents` pointer of an MTLBuffer drawn from a
 // process-wide pool; a custom kernel must resolve that pointer back to its
 // MTLBuffer (+ view offset) to bind it. buffer_for / buffer_offset_for do

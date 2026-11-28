@@ -275,6 +275,10 @@ if(BROTENSOR_HAS_GPU)
         add_test(NAME brotensor_test_linear_rounding_wmma COMMAND brotensor_test_linear_rounding wmma)
         # Hand-run microbench for the plain FP16 matmul WMMA path (not a ctest).
         brotensor_add_executable(brotensor_bench_matmul_rm bench_matmul_rm.cpp)
+        if(BROTENSOR_HAS_BRASS_JIT)
+            brotensor_add_test(brotensor_test_cuda_mir_ptx_emit test_cuda_mir_ptx_emit.cpp)
+            target_link_libraries(brotensor_test_cuda_mir_ptx_emit PRIVATE brotensor_cuda ${BROTENSOR_BRASS_LIB})
+        endif()
     endif()
 
     # CPU↔GPU parity (GPU-only).

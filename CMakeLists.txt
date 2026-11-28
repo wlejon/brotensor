@@ -55,10 +55,9 @@ endif()
 #
 # Scoped to the CPU + core build: GPU Objective-C++ / JIT backends are not
 # gcov-instrumented, and CI has no GPU to run them on anyway. So a coverage run
-# on anyway. So a coverage run measures exactly what the CPU-only test tier
-# exercises — the dispatcher, Tensor, the safetensors/GGUF readers, and the
-# FP32 reference backend. Optimisation is dropped to -O0 so line attribution is
-# not scrambled by inlining.
+# measures what the CPU + parity tier reaches — the dispatcher, Tensor, the
+# safetensors/GGUF readers, and the FP32 reference backend. Optimisation is dropped
+# to -O0 so line attribution is not scrambled by inlining.
 option(BROTENSOR_COVERAGE "Instrument the core + CPU build for gcov coverage (GCC/Clang)" OFF)
 if(BROTENSOR_COVERAGE)
     if(MSVC)
@@ -96,7 +95,7 @@ endif()
 # brotensor is layered: a core dispatcher + always-on CPU backend, plus
 # optional GPU backends (CUDA, Metal, Vulkan) that compile as independent static
 # libraries and register themselves into the dispatcher at static-init.
-# CUDA and Metal are not rejected together at the CMake level — they stay
+# CUDA and Metal target different platforms (Linux/Windows vs. macOS);
 # Metal requires macOS; CUDA compiles as pure C++ (Brass MIR -> PTX + dynamic
 # driver loading) with no CUDA Toolkit. CPU has no opt-out.
 option(BROTENSOR_WITH_CUDA  "Build GPU backend (CUDA)"  OFF)
@@ -124,6 +123,23 @@ endif()
 # --- brotensor_core: dispatcher + public op wrappers + Tensor + runtime ---
 # Always built. Sources produced by Phase 1A.
 
+file(GLOB_RECURSE _brotensor_kernel_fp_inputs CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/jit/gpu_mir*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/jit/ptx_emit*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/jit/spirv_emit*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/jit/msl_emit*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cu_mir_builders.*"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cu_mir_cache.*")
+set(_brotensor_kernel_fp_cpp "${CMAKE_CURRENT_BINARY_DIR}/generated/brotensor_kernel_fingerprint.cpp")
+add_custom_command(
+    OUTPUT "${_brotensor_kernel_fp_cpp}"
+    COMMAND "${CMAKE_COMMAND}" "-DBROTENSOR_ROOT=${CMAKE_CURRENT_SOURCE_DIR}" "-DOUT=${_brotensor_kernel_fp_cpp}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/brotensor_kernel_fingerprint.cmake"
+    DEPENDS ${_brotensor_kernel_fp_inputs} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/brotensor_kernel_fingerprint.cmake"
+    COMMENT "Fingerprinting brotensor kernel sources"
+    VERBATIM)
+
 add_library(brotensor_core STATIC
     src/tensor.cpp
     src/dispatch.cpp
@@ -138,6 +154,7 @@ add_library(brotensor_core STATIC
     src/gguf.cpp
     src/graph.cpp
     src/kernel_interop.cpp
+    "${_brotensor_kernel_fp_cpp}"
 )
 target_include_directories(brotensor_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

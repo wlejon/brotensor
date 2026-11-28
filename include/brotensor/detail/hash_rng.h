@@ -17,10 +17,11 @@
 // same mapping the Philox ops use (rand_uniform, sample_logits), so the value
 // set is identical: multiples of 2^-24, never 1.0.
 //
-// Every function is `inline` and, under nvcc, `__host__ __device__`, so the
-// header compiles into both a .cpp and a .cu translation unit with identical
-// integer arithmetic. Metal cannot include this header (MSL is compiled from
-// source strings); src/metal/masked_diffusion.mm carries a verbatim copy.
+// Every function is `inline`, so CPU, test, and pure-C++ CUDA callers share
+// identical integer arithmetic (and `__CUDACC__` stays guarded if an external
+// CUDA translation unit includes it). Metal cannot include this header (MSL is
+// compiled from source strings); src/metal/masked_diffusion.mm carries a
+// verbatim copy.
 
 #include <cstdint>
 

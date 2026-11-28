@@ -285,6 +285,7 @@ bool KernelDiskCache::load_blob(std::string_view kind, std::string_view signatur
 brass::cache::CacheKey KernelDiskCache::blob_key(std::string_view kind, std::string_view signature) {
     return brass::cache::KeyBuilder(kKeyDomain)
         .add_brass_codegen()
+        .add("brotensor.kernels", kernel_source_fingerprint())
         .add("kind", kind)
         .add("signature", signature)
         .finish();
@@ -294,6 +295,7 @@ brass::cache::CacheKey KernelDiskCache::cpu_key(std::string_view signature, std:
                                                 const CpuCompileOptions& o) {
     return brass::cache::KeyBuilder(kKeyDomain)
         .add_brass_build()
+        .add("brotensor.kernels", kernel_source_fingerprint())
         .add("kind", "cpu")
         .add("signature", signature)
         .add("entry", entry_name)

@@ -197,11 +197,10 @@ jobs:
 
   # ── CUDA ──────────────────────────────────────────────────────────────────
   #
-  # Compile-only: GitHub's hosted runners have no NVIDIA GPU, so nothing can be
-  # executed here. That still verifies the pure-C++ CUDA backend (Brass MIR ->
-  # PTX JIT + dynamic nvcuda/libcuda driver loader, zero CUDA Toolkit headers
-  # or libraries) compiles and links cleanly. The parity *runs* stay on the
-  # local box / a self-hosted runner.
+  # Builds the pure-C++ CUDA backend (Brass MIR -> PTX JIT + dynamic
+  # nvcuda/libcuda driver loader, zero CUDA Toolkit headers or libraries) and
+  # runs GPU-less MIR -> PTX verification tests (including every Wave 1-5 CUDA
+  # kernel builder). On-GPU parity runs stay on local / self-hosted runners.
   cuda:
     name: CUDA build · ubuntu-24.04
     runs-on: ubuntu-24.04
@@ -228,6 +227,12 @@ jobs:
 
       - name: Build
         run: cmake --build build --parallel 4
+
+      - name: Test (GPU-less MIR -> PTX verification)
+        run: |
+          ctest --test-dir build \
+            -R "brotensor_test_cuda_mir_ptx_emit|brotensor_test_gpu_mir_emit|brotensor_test_kernel_disk_cache" \
+            --output-on-failure --parallel 2
 
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
