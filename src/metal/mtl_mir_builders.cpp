@@ -41,6 +41,11 @@
 
 namespace brotensor::detail::metal {
 
+MetalCmTile metal_cm_tile(std::uint32_t cfg_idx) noexcept {
+    const auto& t = kernels::kGemmCmTiles[cfg_idx & 3u];
+    return {t.bm, t.bn};
+}
+
 std::uint32_t metal_mir_block_size(const MirKey& k) {
     if (k.kind == MirKind::FillBytes) return kernels::kFillBlock;
     if (k.kind == MirKind::FaRows) return kernels::kFaRowsBlock;

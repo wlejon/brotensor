@@ -9,7 +9,6 @@
 
 #include "mtl_mir_cache.h"
 
-#include "../kernels/mir_gemm_cm.h"
 #include "../vulkan/shaders/op_codes.h"
 
 #include <brotensor/runtime.h>
@@ -68,8 +67,9 @@ void run_conv_cm(const void* x, const void* w, const void* y, const void* bias,
     const std::uint32_t cfg_idx = (M >= 128u && fill128 >= 0.9 &&
                                    cdiv_u64(M, 128u) * cdiv_u64(P, 64u) * std::uint64_t(n) * groups >= 24u)
                                   ? 2u : 3u;
-    const std::uint32_t bm = kernels::kGemmCmTiles[cfg_idx].bm;
-    const std::uint32_t bn = kernels::kGemmCmTiles[cfg_idx].bn;
+    const MetalCmTile tile = metal_cm_tile(cfg_idx);
+    const std::uint32_t bm = tile.bm;
+    const std::uint32_t bn = tile.bn;
     const auto x_addr = reinterpret_cast<std::uintptr_t>(x);
     const auto w_addr = reinterpret_cast<std::uintptr_t>(w);
     const bool avec = (w_addr % 16u == 0u) && (K % 8u == 0u);

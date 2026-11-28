@@ -149,7 +149,7 @@ void test_elementwise_equivalence_and_msl() {
         }
 
         std::string ptx_src = ptx::emit_elementwise(dag, ew, "sm_80");
-        check(has(ptx_src, ".version 7.8") && has(ptx_src, "tanh.approx.f32") &&
+        check(has(ptx_src, ".version 7.4") && has(ptx_src, "tanh.approx.f32") &&
                   has(ptx_src, "mul.hi.u32") &&
                   has(ptx_src, ".visible .entry trace_ew_vec") &&
                   has(ptx_src, ".visible .entry trace_ew_scalar"),

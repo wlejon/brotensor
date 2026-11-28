@@ -90,6 +90,11 @@ inline std::uint8_t pack_norm_flags(bool has_g, bool has_b, bool has_xh,
         (has_s0 ? 8 : 0) | (has_s1 ? 16 : 0));
 }
 
+struct MetalCmTile {
+    std::uint32_t bm, bn;
+};
+MetalCmTile metal_cm_tile(std::uint32_t cfg_idx) noexcept;
+
 std::uint32_t metal_mir_block_size(const MirKey& key);
 brass::Function* build_metal_mir_function(brass::Module& mod, const MirKey& key);
 

@@ -8,7 +8,6 @@
 #include "fp16_matmul.h"
 #include "mtl_mir_cache.h"
 
-#include "../kernels/mir_gemm_cm.h"
 #include "../vulkan/shaders/op_codes.h"
 
 #import "internal.h"
@@ -92,7 +91,7 @@ bool try_mir_gemm_cm(const AbtMixed& g, AbtType in_b) {
         cdiv_u64(g.M, 128u) * cdiv_u64(nout, (g.epilogue == kAbtSwiglu) ? 32u : 64u) *
         static_cast<std::uint64_t>(g.batch);
     const std::uint32_t cfg_idx = (g.M > 64 && tiles2 >= 24u) ? 2u : 3u;
-    const ::brotensor::kernels::GemmCmTile& cfg = ::brotensor::kernels::kGemmCmTiles[cfg_idx];
+    const MetalCmTile cfg = metal_cm_tile(cfg_idx);
     const std::uint32_t wout = (g.epilogue == kAbtSwiglu) ? cfg.bn / 2u : cfg.bn;
     const std::uint32_t gx = static_cast<std::uint32_t>(
         (g.epilogue == kAbtSwiglu) ? cdiv_u64(nout, wout) : cdiv_u64(g.N, cfg.bn));
