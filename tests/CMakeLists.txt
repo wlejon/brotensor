@@ -60,6 +60,11 @@ if(BROTENSOR_HAS_BRASS_JIT)
             test_metal_mir_msl_emit.cpp ../src/metal/mtl_mir_builders.cpp)
     endif()
     target_link_libraries(brotensor_test_metal_mir_msl_emit PRIVATE ${BROTENSOR_BRASS_LIB})
+
+    brotensor_add_executable(brotensor_train_inst_opt_model
+        ../tools/train_inst_opt_model.cpp
+        ../tools/inst_opt_dataset.cpp)
+    target_link_libraries(brotensor_train_inst_opt_model PRIVATE ${BROTENSOR_BRASS_LIB})
 endif()
 # --- Bronze API test ---
 #
